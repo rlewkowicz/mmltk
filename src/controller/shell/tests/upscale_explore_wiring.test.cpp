@@ -37,7 +37,9 @@ class ShellWarmAlgorithm final : public UpscaleAlgorithm {
         probe_->completed.set_value();
     }
     void Run(UpscaleKernel, mmltk::frameworks::gpu::ImagePlaneView, const mmltk::frameworks::gpu::ImagePlaneView target, std::uintptr_t stream,
-             const std::function<bool()>&, UpscalePurpose = UpscalePurpose::Normal) override { Semantics({}, target, stream); }
+             const std::function<bool()>&, UpscalePurpose = UpscalePurpose::Normal) override {
+        Semantics({}, target, stream);
+    }
 
    private:
     std::shared_ptr<ShellWarmProbe> probe_;

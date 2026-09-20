@@ -67,7 +67,6 @@ struct ReferenceEnvironment final {
             static_cast<void>(::unsetenv("MMLTK_UPSCALE_ONNX_REFERENCE"));
     }
 };
-
 class FailingUpscaleAlgorithm final : public UpscaleAlgorithm {
    public:
     void Semantics(mmltk::frameworks::gpu::ImagePlaneView, const mmltk::frameworks::gpu::ImagePlaneView target, std::uintptr_t) override {
@@ -187,7 +186,9 @@ class ReleaseFailingUpscaleAlgorithm final : public UpscaleAlgorithm {
     ~ReleaseFailingUpscaleAlgorithm() override { probe_->destroyed.store(true, std::memory_order_release); }
     void Warm() override { probe_->warmed.set_value(); }
     void Run(UpscaleKernel, mmltk::frameworks::gpu::ImagePlaneView, const mmltk::frameworks::gpu::ImagePlaneView target, std::uintptr_t,
-             const std::function<bool()>&, UpscalePurpose = UpscalePurpose::Normal) override { Fill(target, 0U); }
+             const std::function<bool()>&, UpscalePurpose = UpscalePurpose::Normal) override {
+        Fill(target, 0U);
+    }
     [[nodiscard]] Release ReleaseResources() noexcept override {
         probe_->releases.fetch_add(1U, std::memory_order_acq_rel);
         return {.all_released = false, .failure = failure_};
@@ -782,7 +783,8 @@ TEST_CASE("Upscale warm activates every mode once and repeated ready signals are
                           RuntimeFactory(
                               0, backend, mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic,
                               [activation] { return std::make_unique<ActivationUpscaleAlgorithm>(activation); }, 4U),
-                          [](const VisualFrame&) { return VisualDocumentRead{}; }, [&events](UpscaleSystem::event_type) { events.Advance(); }};
+                          [](const VisualFrame&) { return VisualDocumentRead{}; },
+                          [&events](UpscaleSystem::event_type) { events.Advance(); }};
     upscale.Warm(extent);
     upscale.Warm(extent);
     REQUIRE(completed.wait_for(2s) == std::future_status::ready);
@@ -962,8 +964,8 @@ void run_native_upscale(mmltk::frameworks::gpu::SystemImageRuntime& runtime, Ups
         const auto plane = read.plane(index).plane();
         REQUIRE(plane.valid());
         pixels[index].resize(plane.descriptor.row_bytes() * plane.descriptor.height);
-        REQUIRE(cudaMemcpy2D(pixels[index].data(), plane.descriptor.row_bytes(), reinterpret_cast<const void*>(plane.data),
-                             plane.descriptor.pitch_bytes, plane.descriptor.row_bytes(), plane.descriptor.height, cudaMemcpyDeviceToHost) == cudaSuccess);
+        REQUIRE(cudaMemcpy2D(pixels[index].data(), plane.descriptor.row_bytes(), reinterpret_cast<const void*>(plane.data), plane.descriptor.pitch_bytes,
+                             plane.descriptor.row_bytes(), plane.descriptor.height, cudaMemcpyDeviceToHost) == cudaSuccess);
     }
     return pixels;
 }
@@ -977,8 +979,8 @@ TEST_CASE("Native warm purpose retains full extent and provider readiness with o
     ReferenceEnvironment environment;
     REQUIRE(::setenv("MMLTK_UPSCALE_ONNX_REFERENCE", reference_run ? "1" : "0", 1) == 0);
     std::array<unsigned, static_cast<std::size_t>(Stage::Count)> counts{};
-    auto runtime = make_native_upscale_runtime_factory(kDevice, [&](Stage stage) { ++counts[static_cast<std::size_t>(stage)]; })(
-        std::make_shared<ImageProductRevisionSequence>());
+    auto runtime = make_native_upscale_runtime_factory(
+        kDevice, [&](Stage stage) { ++counts[static_cast<std::size_t>(stage)]; })(std::make_shared<ImageProductRevisionSequence>());
     const auto retire = mmltk::testsupport::ScopedTestCleanup{[&] { CHECK(runtime->Retire().safe_to_destroy); }};
     run_native_upscale(*runtime, method, {}, UpscalePurpose::Warm, extent);
     const auto expected = native_upscale_pixels(*runtime);
@@ -1097,8 +1099,7 @@ TEST_CASE("ONNX first-capture fallback keeps warm execution to one image and dis
         if (stage == Stage::BuffersAllocated) ++buffers;
         if (stage == Stage::WarmSubmitted) {
             ++inferences;
-            if (std::exchange(reject, false))
-                throw Ort::Exception("CUDA failure 900: injected first-capture restriction", ORT_FAIL);
+            if (std::exchange(reject, false)) throw Ort::Exception("CUDA failure 900: injected first-capture restriction", ORT_FAIL);
         }
     })(std::make_shared<ImageProductRevisionSequence>());
     const auto retire = mmltk::testsupport::ScopedTestCleanup{[&] { CHECK(runtime->Retire().safe_to_destroy); }};

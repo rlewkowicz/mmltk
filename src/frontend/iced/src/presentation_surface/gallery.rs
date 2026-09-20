@@ -184,7 +184,10 @@ mod tests {
         assert!(matching(Some(next)).is_none());
         metadata::install_explore(next, &snapshot);
         assert_eq!(matching(Some(next)).unwrap().metadata.viewport.rowcount, 5);
-        assert_eq!(image.content.gallery().unwrap().metadata.viewport.rowcount, 4);
+        assert_eq!(
+            image.content.gallery().unwrap().metadata.viewport.rowcount,
+            4
+        );
         super::super::retire_publication(frame);
         drop(image);
         assert!(super::super::test_releases().is_empty());
@@ -257,7 +260,10 @@ mod tests {
         metadata::install_explore(returned, &snapshot);
         let returned_facts = matching(Some(returned)).unwrap();
         assert_eq!(returned_facts.metadata.frame, original_facts.metadata.frame);
-        assert_eq!(returned_facts.metadata.gallery, original_facts.metadata.gallery);
+        assert_eq!(
+            returned_facts.metadata.gallery,
+            original_facts.metadata.gallery
+        );
         assert!(accept_publication(returned));
         let returned_read = SampleRead::acquire(returned).unwrap();
         drop(encoded_draw);
@@ -290,7 +296,12 @@ mod tests {
         replacement.revision += 1;
         replacement.gallery.layout.roworigin = 0;
         assert_eq!(
-            matching(Some(physical)).unwrap().metadata.gallery.layout.roworigin,
+            matching(Some(physical))
+                .unwrap()
+                .metadata
+                .gallery
+                .layout
+                .roworigin,
             7
         );
         replacement.frame.revision += 1;
@@ -302,7 +313,15 @@ mod tests {
             ..physical
         };
         metadata::install_explore(newer, &replacement);
-        assert_eq!(matching(Some(newer)).unwrap().metadata.gallery.layout.rowcount, 6);
+        assert_eq!(
+            matching(Some(newer))
+                .unwrap()
+                .metadata
+                .gallery
+                .layout
+                .rowcount,
+            6
+        );
         assert_eq!(retained.metadata.gallery.layout.rowcount, 5);
         assert_eq!(retained.metadata.gallery.layout.roworigin, 7);
     }

@@ -1632,8 +1632,7 @@ void WaylandSession::RunScenario(const std::string& viewer_scenario, const bool 
     CHECK(compiled.height == static_cast<std::uint32_t>(kCompiledResolution));
     CHECK(compiled.channels != 0U);
     CHECK_FALSE(compiled.class_names().empty());
-    CHECK(mmltk::backend::data::read_compiled_header(compiled_path.string()).resize_mode ==
-          mmltk::backend::imaging::resample::ImageResizeMode::Letterbox);
+    CHECK(mmltk::backend::data::read_compiled_header(compiled_path.string()).resize_mode == mmltk::backend::imaging::resample::ImageResizeMode::Letterbox);
     if (!last) AdvanceScenario();
 }
 void WaylandSession::AdvanceScenario() {

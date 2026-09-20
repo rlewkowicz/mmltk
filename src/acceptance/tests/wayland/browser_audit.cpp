@@ -832,8 +832,8 @@ auto BrowserAudit::consume(const nlohmann::json& record) -> void {
     } else if (event == "integration.compile_metrics") {
         const std::uint64_t elapsed = scalar(record, "a");
         const auto expected = mmltk::backend::data::estimate_progress(compile_completed, compile_total, elapsed);
-        compile_metrics = record.value("control", "") == COMPILE_PROGRESS && record.value("detail", "") == "elapsed-eta-throughput-dropped" &&
-                          progress && scalar(record, "b") == expected.remaining_seconds && scalar(record, "c") == expected.throughput_per_second &&
+        compile_metrics = record.value("control", "") == COMPILE_PROGRESS && record.value("detail", "") == "elapsed-eta-throughput-dropped" && progress &&
+                          scalar(record, "b") == expected.remaining_seconds && scalar(record, "c") == expected.throughput_per_second &&
                           scalar(record, "d") == compile_dropped;
     } else if (event == "integration.dataset_complete") {
         dataset_complete = true;

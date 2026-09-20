@@ -894,7 +894,11 @@ mod tests {
         for (bytes, message, expected_cursor) in [
             (&[0xa1, 0x01, 0xff][..], "CBOR map key is not text", 2),
             (&[0xa1, 0x61, 0xff, 0xff][..], "invalid UTF-8 text", 3),
-            (&[0xa1, 0x81, 0xff, 0xff][..], "unsupported CBOR simple value", 3),
+            (
+                &[0xa1, 0x81, 0xff, 0xff][..],
+                "unsupported CBOR simple value",
+                3,
+            ),
             (
                 &[0xa2, 0x61, b'x', 0x00, 0x61, b'x', 0xff][..],
                 "duplicate CBOR map key",

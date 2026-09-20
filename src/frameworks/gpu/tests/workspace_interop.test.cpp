@@ -1189,8 +1189,7 @@ TEST_CASE("Cross-device display damage copies cropped planes and matches complet
                 if (!plane.valid()) continue;
                 const auto index = plane.descriptor.kind == ImagePlaneKind::Clean ? 0U : 1U;
                 for (std::uint32_t y = 0; y != height; ++y)
-                    std::memcpy(reinterpret_cast<std::byte*>(plane.data) + y * plane.descriptor.pitch_bytes,
-                                pixels[index].data() + y * 16U, width * 4U);
+                    std::memcpy(reinterpret_cast<std::byte*>(plane.data) + y * plane.descriptor.pitch_bytes, pixels[index].data() + y * 16U, width * 4U);
             }
         });
     };
@@ -1219,13 +1218,13 @@ TEST_CASE("Cross-device display damage copies cropped planes and matches complet
         const auto* allocation = reinterpret_cast<const std::uint8_t*>(display.data - layout.offset_bytes);
         for (std::size_t offset = 0; offset != layout.required_allocation_bytes; ++offset) {
             if (offset >= layout.offset_bytes && offset < layout.offset_bytes + layout.pitch_bytes * 3U &&
-                (offset - layout.offset_bytes) % layout.pitch_bytes < 16U) continue;
+                (offset - layout.offset_bytes) % layout.pitch_bytes < 16U)
+                continue;
             CHECK(allocation[offset] == 219U);
         }
     };
     std::array<CUdeviceptr, 2U> receiver_bases{};
-    const auto finalize = [&](ImageWorkspaceCoverage coverage, const std::size_t expected_bytes,
-                              std::span<const ImageWorkspaceRegion> expected_regions = {}) {
+    const auto finalize = [&](ImageWorkspaceCoverage coverage, const std::size_t expected_bytes, std::span<const ImageWorkspaceRegion> expected_regions = {}) {
         std::array<ImagePlaneView, 2U> originals{};
         {
             const auto read = source.Borrow();
@@ -1352,8 +1351,7 @@ TEST_CASE("Alternating displays accumulate skipped damage and recover from histo
                 CHECK(*(reinterpret_cast<const std::uint8_t*>(plane.data) + y * plane.descriptor.pitch_bytes + x) == expected[y * 16U + x]);
     };
     product.Publish(stream, 4U, 3U, [](auto clean, auto semantic, auto) {
-        for (const auto plane : {clean, semantic})
-            std::memset(reinterpret_cast<void*>(plane.data), 0, plane.descriptor.pitch_bytes * plane.descriptor.height);
+        for (const auto plane : {clean, semantic}) std::memset(reinterpret_cast<void*>(plane.data), 0, plane.descriptor.pitch_bytes * plane.descriptor.height);
     });
     history.Record(content(), {});
     present(0U, true);
@@ -1362,9 +1360,8 @@ TEST_CASE("Alternating displays accumulate skipped damage and recover from histo
     const auto change = [&](std::uint8_t value) {
         const auto baseline = content();
         expected[20U] = value;
-        product.Publish(stream, 4U, 3U, [value](auto clean, auto, auto) {
-            *(reinterpret_cast<std::uint8_t*>(clean.data) + clean.descriptor.pitch_bytes + 4U) = value;
-        });
+        product.Publish(stream, 4U, 3U,
+                        [value](auto clean, auto, auto) { *(reinterpret_cast<std::uint8_t*>(clean.data) + clean.descriptor.pitch_bytes + 4U) = value; });
         history.Record(content(), {.regions = region, .full_image = false, .baseline = baseline});
     };
     change(37U);
@@ -1632,7 +1629,7 @@ TEST_CASE("Display damage transfers preserve complete pixels in both physical de
                 REQUIRE(cuMemsetD2D8Async(plane.data, plane.descriptor.pitch_bytes, base, 16U, 3U, reinterpret_cast<CUstream>(execution)) == CUDA_SUCCESS);
                 if (changed)
                     REQUIRE(cuMemsetD2D8Async(plane.data + plane.descriptor.pitch_bytes + 4U, plane.descriptor.pitch_bytes, 173U, 8U, 1U,
-                                             reinterpret_cast<CUstream>(execution)) == CUDA_SUCCESS);
+                                              reinterpret_cast<CUstream>(execution)) == CUDA_SUCCESS);
             }
         });
     };

@@ -151,13 +151,14 @@ void decode_images(const BenchmarkWriteRequest& request, const common_io::FileHa
                     } catch (const std::bad_alloc&) { throw; } catch (const BenchmarkImageReadError&) {
                         throw;
                     } catch (const std::exception& error) { throw BenchmarkImageReadError(image.source_index, image.source_image_id, error.what()); }
-                    resizer.resize_to_planar(
-                        {decoded.data(), {image.source_width, image.source_height, static_cast<std::size_t>(image.source_width) * 3U, 0U,
-                                          decoded.size(), mmltk::backend::imaging::resample::RgbPixelFormat::RGB8}},
-                        {output_pixels.image(image_index, image_stride),
-                         {request.resolution, request.resolution, static_cast<std::size_t>(request.resolution) * sizeof(float),
-                          static_cast<std::size_t>(request.resolution) * request.resolution * sizeof(float), image_stride,
-                          mmltk::backend::imaging::resample::RgbPixelFormat::PlanarUnitSrgbF32}}, request.resize_mode);
+                    resizer.resize_to_planar({decoded.data(),
+                                              {image.source_width, image.source_height, static_cast<std::size_t>(image.source_width) * 3U, 0U, decoded.size(),
+                                               mmltk::backend::imaging::resample::RgbPixelFormat::RGB8}},
+                                             {output_pixels.image(image_index, image_stride),
+                                              {request.resolution, request.resolution, static_cast<std::size_t>(request.resolution) * sizeof(float),
+                                               static_cast<std::size_t>(request.resolution) * request.resolution * sizeof(float), image_stride,
+                                               mmltk::backend::imaging::resample::RgbPixelFormat::PlanarUnitSrgbF32}},
+                                             request.resize_mode);
                     if (request.progress) { request.progress(); }
                 }
             } catch (...) {

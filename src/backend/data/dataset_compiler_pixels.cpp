@@ -52,11 +52,13 @@ void decode_pixel_image(const std::filesystem::path& split_dir, const WritablePi
     {
         mmltk::common::logging::ScopedProfile profile{"compiler.pixels.resize"};
         geometry = image_resizer.resize_to_planar(
-            {raw_pixels.get(), {source_width, source_height, static_cast<size_t>(source_width) * 3U, 0U,
-                                static_cast<size_t>(source_width) * source_height * 3U, mmltk::backend::imaging::resample::RgbPixelFormat::RGB8}},
-            {dst, {target_width, target_height, static_cast<size_t>(target_width) * sizeof(float),
-                   static_cast<size_t>(target_width) * target_height * sizeof(float), image_stride,
-                   mmltk::backend::imaging::resample::RgbPixelFormat::PlanarUnitSrgbF32}}, resize_mode);
+            {raw_pixels.get(),
+             {source_width, source_height, static_cast<size_t>(source_width) * 3U, 0U, static_cast<size_t>(source_width) * source_height * 3U,
+              mmltk::backend::imaging::resample::RgbPixelFormat::RGB8}},
+            {dst,
+             {target_width, target_height, static_cast<size_t>(target_width) * sizeof(float), static_cast<size_t>(target_width) * target_height * sizeof(float),
+              image_stride, mmltk::backend::imaging::resample::RgbPixelFormat::PlanarUnitSrgbF32}},
+            resize_mode);
     }
     if (source_width != geometry.resized_width || source_height != geometry.resized_height)
         mmltk::common::logging::profile_add_value("compiler.pixels.resize_count", 1);

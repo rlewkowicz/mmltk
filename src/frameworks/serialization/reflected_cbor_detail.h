@@ -670,8 +670,7 @@ template <class T>
 }
 template <class T>
     requires(!mmltk::frameworks::reflection::kOpaqueRelationStorage<T>)
-void decode_reflected_object_fields(T& result, const std::span<const NamedFieldMatch> matches, std::size_t& index,
-                                    std::optional<wire::DecodeError>& failure) {
+void decode_reflected_object_fields(T& result, const std::span<const NamedFieldMatch> matches, std::size_t& index, std::optional<wire::DecodeError>& failure) {
     visit_bases<T>([&]<class Base>() {
         if (!failure) { decode_reflected_object_fields(static_cast<Base&>(result), matches, index, failure); }
     });

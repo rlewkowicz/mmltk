@@ -154,9 +154,9 @@ void materialize_row_major_mask(const std::span<const RLEPair> pairs, const Mask
 EncodedRowMajorMask resize_row_major_mask(const std::span<const RLEPair> pairs, const MaskDimensions source_dimensions, const MaskDimensions target_dimensions,
                                           const mmltk::backend::imaging::resample::ImageResizeGeometry& letterbox, MaskResizeScratch* scratch,
                                           RowMajorMaskBounds* source_bounds) {
-    if (scratch == nullptr || letterbox.resized_width == 0U || letterbox.resized_height == 0U ||
-        letterbox.resized_width > target_dimensions.width || letterbox.resized_height > target_dimensions.height ||
-        letterbox.offset_x > target_dimensions.width - letterbox.resized_width || letterbox.offset_y > target_dimensions.height - letterbox.resized_height) {
+    if (scratch == nullptr || letterbox.resized_width == 0U || letterbox.resized_height == 0U || letterbox.resized_width > target_dimensions.width ||
+        letterbox.resized_height > target_dimensions.height || letterbox.offset_x > target_dimensions.width - letterbox.resized_width ||
+        letterbox.offset_y > target_dimensions.height - letterbox.resized_height) {
         throw std::invalid_argument("mask resize parameters are invalid");
     }
     if (pairs.empty()) { return {}; }

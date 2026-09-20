@@ -530,12 +530,12 @@ TEST_CASE("browser compile metrics accept zero drops and require consistent prog
     const auto dropped = GENERATE(0U, 3U);
     const auto completed = GENERATE(0U, 4U);
     const nlohmann::json metrics{{"event", "integration.compile_metrics"},
-                                  {"control", "train.compile_dataset.progress"},
-                                  {"detail", "elapsed-eta-throughput-dropped"},
-                                  {"a", 2U},
-                                  {"b", completed == 0U ? 0U : 8U},
-                                  {"c", completed == 0U ? 0U : 2U},
-                                  {"d", dropped}};
+                                 {"control", "train.compile_dataset.progress"},
+                                 {"detail", "elapsed-eta-throughput-dropped"},
+                                 {"a", 2U},
+                                 {"b", completed == 0U ? 0U : 8U},
+                                 {"c", completed == 0U ? 0U : 2U},
+                                 {"d", dropped}};
     BrowserAudit audit;
     audit.consume(metrics);
     CHECK_FALSE(audit.compile_metrics);

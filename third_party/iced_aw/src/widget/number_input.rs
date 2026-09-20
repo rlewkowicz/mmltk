@@ -1016,13 +1016,17 @@ fn sorted_range<T: PartialOrd>(a: T, b: T) -> std::ops::Range<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use iced_widget::graphics::text::Paragraph;
-    use iced_core::text::Paragraph as _;
     use crate::widget::test_support::Renderer;
+    use iced_core::text::Paragraph as _;
+    use iced_widget::graphics::text::Paragraph;
 
     fn layout(input: &mut TestNumberInput<'_>, tree: &mut Tree) -> Node {
         tree.diff(input as &mut dyn Widget<TestMessage, iced_widget::Theme, Renderer>);
-        let node = input.layout(tree, &Renderer, &Limits::new(Size::ZERO, Size::new(240.0, 100.0)));
+        let node = input.layout(
+            tree,
+            &Renderer,
+            &Limits::new(Size::ZERO, Size::new(240.0, 100.0)),
+        );
         assert_operation(input, tree, &node);
         node
     }
@@ -1089,24 +1093,43 @@ mod tests {
         assert_eq!(trace.0, expected);
     }
 
-    fn deliver(input: &mut TestNumberInput<'_>, tree: &mut Tree, node: &Node,
-        event: Event, cursor: Cursor) -> Vec<TestMessage> {
+    fn deliver(
+        input: &mut TestNumberInput<'_>,
+        tree: &mut Tree,
+        node: &Node,
+        event: Event,
+        cursor: Cursor,
+    ) -> Vec<TestMessage> {
         let mut messages = Vec::new();
-        let mut shell = Shell::new(&iced_core::window::Headless,
-            iced_core::shell::Waker::new(|| {}), &mut messages);
-        input.update(tree, &event, Layout::new(node), cursor, &Renderer, &mut shell,
-            &Rectangle::with_size(Size::new(240.0, 100.0)));
+        let mut shell = Shell::new(
+            &iced_core::window::Headless,
+            iced_core::shell::Waker::new(|| {}),
+            &mut messages,
+        );
+        input.update(
+            tree,
+            &event,
+            Layout::new(node),
+            cursor,
+            &Renderer,
+            &mut shell,
+            &Rectangle::with_size(Size::new(240.0, 100.0)),
+        );
         messages
     }
 
     fn key(named: keyboard::key::Named, text: Option<&str>, repeat: bool) -> Event {
         let key = keyboard::Key::Named(named);
         Event::Keyboard(keyboard::Event::KeyPressed {
-            modified_key: key.clone(), key,
-            physical_key: keyboard::key::Physical::Unidentified(keyboard::key::NativeCode::Unidentified),
+            modified_key: key.clone(),
+            key,
+            physical_key: keyboard::key::Physical::Unidentified(
+                keyboard::key::NativeCode::Unidentified,
+            ),
             location: keyboard::Location::Standard,
             modifiers: keyboard::Modifiers::default(),
-            text: text.map(Into::into), repeat,
+            text: text.map(Into::into),
+            repeat,
         })
     }
 
@@ -1117,7 +1140,9 @@ mod tests {
         let mut tree = Tree::new(&input as &dyn Widget<TestMessage, iced_widget::Theme, Renderer>);
         let first = layout(&mut input, &mut tree);
         assert_eq!(tree.children.len(), 2);
-        let text = tree.children[0].state.downcast_mut::<text_input::State<Paragraph>>();
+        let text = tree.children[0]
+            .state
+            .downcast_mut::<text_input::State<Paragraph>>();
         text.focus();
         text.move_cursor_to(1);
         // The modifier's child allocation holds the shaped icon subtrees.
@@ -1125,14 +1150,23 @@ mod tests {
         tree.state.downcast_mut::<ModifierState>().increase_pressed = true;
         for _ in 0..3 {
             input.diff(&mut tree);
-            assert_eq!(tree.children.len(), 2, "diff must preserve the modifier before layout");
+            assert_eq!(
+                tree.children.len(),
+                2,
+                "diff must preserve the modifier before layout"
+            );
             let node = layout(&mut input, &mut tree);
             assert_eq!(node.size(), first.size());
             assert_eq!(tree.children[1].children.as_ptr(), modifier_children);
             assert!(tree.state.downcast_ref::<ModifierState>().increase_pressed);
-            let text = tree.children[0].state.downcast_ref::<text_input::State<Paragraph>>();
+            let text = tree.children[0]
+                .state
+                .downcast_ref::<text_input::State<Paragraph>>();
             assert!(text.is_focused());
-            assert!(matches!(text.cursor().state(&Value::new("42")), cursor::State::Index(1)));
+            assert!(matches!(
+                text.cursor().state(&Value::new("42")),
+                cursor::State::Index(1)
+            ));
         }
         // Font/padding and orientation changes use the normal modifier diff.
         for (padding, size, icon_size, font) in [
@@ -1141,23 +1175,41 @@ mod tests {
             (1.0, 16.0, 10.0, iced_core::Font::MONOSPACE),
         ] {
             input = TestNumberInput::new(&value, 0..=100, TestMessage::Changed)
-                .width(200).padding(padding).set_size(size).font(font);
+                .width(200)
+                .padding(padding)
+                .set_size(size)
+                .font(font);
             let node = layout(&mut input, &mut tree);
             assert_eq!(tree.children.len(), 2);
-            let icon = tree.children[1].children[0].state
-                .downcast_ref::<iced_widget::text::State<Paragraph>>().raw();
+            let icon = tree.children[1].children[0]
+                .state
+                .downcast_ref::<iced_widget::text::State<Paragraph>>()
+                .raw();
             assert_eq!(icon.size(), iced_core::Pixels(icon_size));
             // The content font does not override the modifier's default font.
             assert_eq!(icon.font(), iced_core::Font::DEFAULT);
             assert_eq!(tree.children[1].children.as_ptr(), modifier_children);
             assert!(tree.state.downcast_ref::<ModifierState>().increase_pressed);
-            let text = tree.children[0].state.downcast_ref::<text_input::State<Paragraph>>();
+            let text = tree.children[0]
+                .state
+                .downcast_ref::<text_input::State<Paragraph>>();
             assert!(text.is_focused());
-            assert!(matches!(text.cursor().state(&Value::new("42")), cursor::State::Index(1)));
+            assert!(matches!(
+                text.cursor().state(&Value::new("42")),
+                cursor::State::Index(1)
+            ));
             let buttons = node.children()[1].children();
-            if padding == 1.0 { assert!(buttons[1].bounds().x > buttons[0].bounds().x); }
-            else { assert!(buttons[1].bounds().y > buttons[0].bounds().y); }
-            assert!(tree.children[0].state.downcast_ref::<text_input::State<Paragraph>>().is_focused());
+            if padding == 1.0 {
+                assert!(buttons[1].bounds().x > buttons[0].bounds().x);
+            } else {
+                assert!(buttons[1].bounds().y > buttons[0].bounds().y);
+            }
+            assert!(
+                tree.children[0]
+                    .state
+                    .downcast_ref::<text_input::State<Paragraph>>()
+                    .is_focused()
+            );
         }
         tree.children.push(Tree::empty());
         input.diff(&mut tree);
@@ -1172,14 +1224,20 @@ mod tests {
         for padding in [1.0, 10.0] {
             input = input.padding(padding);
             let node = layout(&mut input, &mut tree);
-            let text = tree.children[0].state.downcast_mut::<text_input::State<Paragraph>>();
+            let text = tree.children[0]
+                .state
+                .downcast_mut::<text_input::State<Paragraph>>();
             text.focus();
             text.move_cursor_to(1);
             tree.state.downcast_mut::<ModifierState>().decrease_pressed = true;
             tree.children.truncate(1);
             input = input.ignore_buttons(true);
             assert_operation(&mut input, &mut tree, &node);
-            assert_eq!(tree.children.len(), 1, "ignored modifiers must not be created");
+            assert_eq!(
+                tree.children.len(),
+                1,
+                "ignored modifiers must not be created"
+            );
             input = input.ignore_buttons(false);
             assert_operation(&mut input, &mut tree, &node);
             assert_eq!(tree.children.len(), 2);
@@ -1188,13 +1246,21 @@ mod tests {
             input = input.ignore_buttons(true);
             let ignored_node = layout(&mut input, &mut tree);
             assert_eq!(ignored_node.size(), node.size());
-            assert_eq!(ignored_node.children()[1].bounds(), node.children()[1].bounds());
+            assert_eq!(
+                ignored_node.children()[1].bounds(),
+                node.children()[1].bounds()
+            );
             input = input.ignore_buttons(false);
             assert_eq!(tree.children[1].children.as_ptr(), modifier_children);
             assert!(tree.state.downcast_ref::<ModifierState>().decrease_pressed);
-            let text = tree.children[0].state.downcast_ref::<text_input::State<Paragraph>>();
+            let text = tree.children[0]
+                .state
+                .downcast_ref::<text_input::State<Paragraph>>();
             assert!(text.is_focused());
-            assert!(matches!(text.cursor().state(&Value::new("42")), cursor::State::Index(1)));
+            assert!(matches!(
+                text.cursor().state(&Value::new("42")),
+                cursor::State::Index(1)
+            ));
         }
     }
 
@@ -1202,19 +1268,44 @@ mod tests {
     fn number_input_real_input_survives_diff_and_respects_controls() {
         let value = 42;
         let mut input = TestNumberInput::new(&value, 40..=50, TestMessage::Changed)
-            .step(5).width(200).on_submit(TestMessage::Submit);
+            .step(5)
+            .width(200)
+            .on_submit(TestMessage::Submit);
         let mut tree = Tree::new(&input as &dyn Widget<TestMessage, iced_widget::Theme, Renderer>);
         let node = layout(&mut input, &mut tree);
-        let inc = Layout::new(&node).children().nth(1).unwrap().children().next().unwrap().bounds().center();
-        assert!(matches!(deliver(&mut input, &mut tree, &node,
-            Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)), Cursor::Available(inc)).as_slice(),
-            [TestMessage::Changed(47)]));
+        let inc = Layout::new(&node)
+            .children()
+            .nth(1)
+            .unwrap()
+            .children()
+            .next()
+            .unwrap()
+            .bounds()
+            .center();
+        assert!(matches!(
+            deliver(
+                &mut input,
+                &mut tree,
+                &node,
+                Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+                Cursor::Available(inc)
+            )
+            .as_slice(),
+            [TestMessage::Changed(47)]
+        ));
         let node = layout(&mut input, &mut tree);
         assert!(tree.state.downcast_ref::<ModifierState>().increase_pressed);
-        let _ = deliver(&mut input, &mut tree, &node,
-            Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)), Cursor::Available(inc));
+        let _ = deliver(
+            &mut input,
+            &mut tree,
+            &node,
+            Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
+            Cursor::Available(inc),
+        );
         assert!(!tree.state.downcast_ref::<ModifierState>().increase_pressed);
-        let text = tree.children[0].state.downcast_mut::<text_input::State<Paragraph>>();
+        let text = tree.children[0]
+            .state
+            .downcast_mut::<text_input::State<Paragraph>>();
         text.focus();
         text.move_cursor_to(1);
         for (repeat, expected) in [(false, 42), (true, 40)] {
@@ -1222,33 +1313,92 @@ mod tests {
                 key(keyboard::key::Named::ArrowDown, None, repeat), Cursor::Unavailable).as_slice(),
                 [TestMessage::Changed(value)] if *value == expected));
         }
-        assert!(matches!(deliver(&mut input, &mut tree, &node,
-            key(keyboard::key::Named::Enter, None, false), Cursor::Unavailable).as_slice(),
-            [TestMessage::Submit]));
+        assert!(matches!(
+            deliver(
+                &mut input,
+                &mut tree,
+                &node,
+                key(keyboard::key::Named::Enter, None, false),
+                Cursor::Unavailable
+            )
+            .as_slice(),
+            [TestMessage::Submit]
+        ));
         input = TestNumberInput::new(&value, 0..=100, TestMessage::Changed)
-            .width(200).ignore_buttons(true).ignore_scroll(true);
+            .width(200)
+            .ignore_buttons(true)
+            .ignore_scroll(true);
         let node = layout(&mut input, &mut tree);
-        tree.children[0].state.downcast_mut::<text_input::State<Paragraph>>().select_all();
-        assert!(matches!(deliver(&mut input, &mut tree, &node,
-            key(keyboard::key::Named::Space, Some("7"), false), Cursor::Unavailable).as_slice(),
-            [TestMessage::Changed(7)]));
-        assert!(deliver(&mut input, &mut tree, &node, Event::Mouse(mouse::Event::WheelScrolled {
-            delta: mouse::ScrollDelta::Lines { x: 0.0, y: 1.0 },
-        }), Cursor::Available(inc)).is_empty());
-        assert!(deliver(&mut input, &mut tree, &node,
-            Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)), Cursor::Available(inc)).is_empty());
+        tree.children[0]
+            .state
+            .downcast_mut::<text_input::State<Paragraph>>()
+            .select_all();
+        assert!(matches!(
+            deliver(
+                &mut input,
+                &mut tree,
+                &node,
+                key(keyboard::key::Named::Space, Some("7"), false),
+                Cursor::Unavailable
+            )
+            .as_slice(),
+            [TestMessage::Changed(7)]
+        ));
+        assert!(
+            deliver(
+                &mut input,
+                &mut tree,
+                &node,
+                Event::Mouse(mouse::Event::WheelScrolled {
+                    delta: mouse::ScrollDelta::Lines { x: 0.0, y: 1.0 },
+                }),
+                Cursor::Available(inc)
+            )
+            .is_empty()
+        );
+        assert!(
+            deliver(
+                &mut input,
+                &mut tree,
+                &node,
+                Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+                Cursor::Available(inc)
+            )
+            .is_empty()
+        );
         input = TestNumberInput::new(&value, 42..=42, TestMessage::Changed).width(200);
         let node = layout(&mut input, &mut tree);
-        assert!(deliver(&mut input, &mut tree, &node,
-            key(keyboard::key::Named::ArrowUp, None, true), Cursor::Unavailable).is_empty());
+        assert!(
+            deliver(
+                &mut input,
+                &mut tree,
+                &node,
+                key(keyboard::key::Named::ArrowUp, None, true),
+                Cursor::Unavailable
+            )
+            .is_empty()
+        );
         input = TestNumberInput::new(&value, 0..=100, TestMessage::Changed)
-            .on_input_maybe(None::<fn(u32) -> TestMessage>).width(200);
+            .on_input_maybe(None::<fn(u32) -> TestMessage>)
+            .width(200);
         let node = layout(&mut input, &mut tree);
-        assert!(tree.children[0].state.downcast_ref::<text_input::State<Paragraph>>().is_focused());
-        assert!(deliver(&mut input, &mut tree, &node,
-            key(keyboard::key::Named::ArrowUp, None, false), Cursor::Unavailable).is_empty());
+        assert!(
+            tree.children[0]
+                .state
+                .downcast_ref::<text_input::State<Paragraph>>()
+                .is_focused()
+        );
+        assert!(
+            deliver(
+                &mut input,
+                &mut tree,
+                &node,
+                key(keyboard::key::Named::ArrowUp, None, false),
+                Cursor::Unavailable
+            )
+            .is_empty()
+        );
     }
-
 
     #[derive(Clone, Debug)]
     #[allow(dead_code)]

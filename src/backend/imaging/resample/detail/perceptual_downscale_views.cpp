@@ -36,7 +36,8 @@ std::size_t validate_view(const void* pointer, const RgbImageLayout& l) {
 ValidatedResize validate_pair(RgbConstImageView source, RgbMutableImageView destination, const bool quantized_planar) {
     const auto source_bytes = validate_view(source.data, source.layout), destination_bytes = validate_view(destination.data, destination.layout);
     if (quantized_planar ? (source.layout.format != RgbPixelFormat::RGB8 || destination.layout.format != RgbPixelFormat::PlanarUnitSrgbF32)
-                         : source.layout.format != destination.layout.format) throw std::invalid_argument("perceptual image formats must match");
+                         : source.layout.format != destination.layout.format)
+        throw std::invalid_argument("perceptual image formats must match");
     if (source.layout.width < destination.layout.width || source.layout.height < destination.layout.height)
         throw std::invalid_argument("perceptual resampling cannot enlarge images");
     const bool identity = !quantized_planar && source.layout.width == destination.layout.width && source.layout.height == destination.layout.height;

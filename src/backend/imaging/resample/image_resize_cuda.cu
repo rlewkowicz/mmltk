@@ -362,14 +362,13 @@ void GpuPerceptualDownscaler::downscale(RgbConstImageView source, RgbMutableImag
             }
             const Workspace work = bind_workspace(impl_->storage.active(), destination.layout.width, destination.layout.height, alpha);
             const bool prepare_axes = grow || impl_->sw != source.layout.width || impl_->sh != source.layout.height || impl_->dw != destination.layout.width ||
-                impl_->dh != destination.layout.height || impl_->alpha != alpha;
-            const bool prepare_transfer = source.layout.format != RgbPixelFormat::PlanarUnitSrgbF32 &&
-                                          !impl_->transfer_ready && !impl_->transfer_pending;
+                                      impl_->dh != destination.layout.height || impl_->alpha != alpha;
+            const bool prepare_transfer = source.layout.format != RgbPixelFormat::PlanarUnitSrgbF32 && !impl_->transfer_ready && !impl_->transfer_pending;
             if (prepare_axes || prepare_transfer) {
-                const auto count = std::max<std::size_t>({prepare_axes ? destination.layout.width : 0U,
-                                                         prepare_axes ? destination.layout.height : 0U, prepare_transfer ? 256U : 0U});
-                prepare_kernel<<<blocks(count), threads, 0, stream>>>(
-                    work, source.layout.width, source.layout.height, destination.layout.width, destination.layout.height, prepare_axes, prepare_transfer);
+                const auto count = std::max<std::size_t>(
+                    {prepare_axes ? destination.layout.width : 0U, prepare_axes ? destination.layout.height : 0U, prepare_transfer ? 256U : 0U});
+                prepare_kernel<<<blocks(count), threads, 0, stream>>>(work, source.layout.width, source.layout.height, destination.layout.width,
+                                                                      destination.layout.height, prepare_axes, prepare_transfer);
                 require_cuda(cudaGetLastError());
                 if (prepare_transfer) impl_->transfer_pending = &slot;
                 impl_->sw = source.layout.width;

@@ -51,5 +51,9 @@ iced_fonts_macros = { version = "0.3.0", features = [
 num-traits = { version = "0.2.19", optional = true }
 web-time = "1.1.0"
 
+[dev-dependencies]
+# Standalone widget tests still compile iced_widget's default renderer types.
+iced_widget = { path = "../iced/widget", features = ["wgpu"] }
+
 [lib]
 crate-type = ["cdylib", "rlib"]

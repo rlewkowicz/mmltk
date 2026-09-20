@@ -1062,8 +1062,8 @@ std::array<ImageCopyPath, 2U> ImageProductBuffer::CopyFrom(ImageStream& stream, 
     return CopyFromAs(stream, std::move(source), std::move(initialize_missing), 0U, preserve_clean);
 }
 std::array<ImageCopyPath, 2U> ImageProductBuffer::CopyFromAs(ImageStream& stream, BorrowedImageProductReadView source, MissingPlaneSubmit initialize_missing,
-                                                             const std::uint64_t revision, const bool preserve_clean,
-                                                             const ImagePlanePreservation preservation, const ImageWorkspaceCoverage* display_coverage) {
+                                                             const std::uint64_t revision, const bool preserve_clean, const ImagePlanePreservation preservation,
+                                                             const ImageWorkspaceCoverage* display_coverage) {
     if (!source.valid() || (source.plane_count() < state_->plane_count_ && !initialize_missing))
         throw std::invalid_argument("source image product lacks a receiver plane");
     if (source.lease_->product == state_) throw std::invalid_argument("an image product cannot copy from itself");
@@ -1156,8 +1156,8 @@ std::array<ImageCopyPath, 2U> ImageProductBuffer::CopyFromAs(ImageStream& stream
             visit([&](const ImagePlaneView& destination, const ImagePlaneView& input) {
                 reads_submitted = true;
                 if (receiver_device == source_device) {
-                    backend.CopySameDevice(state_->context_.state_->context, stream.native_handle(), destination,
-                                           source_product.context_.state_->context, input);
+                    backend.CopySameDevice(state_->context_.state_->context, stream.native_handle(), destination, source_product.context_.state_->context,
+                                           input);
                     paths[index] = ImageCopyPath::SameDevice;
                 } else if (!staged) {
                     backend.CopyPeer(state_->context_.state_->context, stream.native_handle(), receiver_device, destination,
@@ -1194,7 +1194,7 @@ std::array<ImageCopyPath, 2U> ImageProductBuffer::CopyFromAs(ImageStream& stream
     }
 }
 BorrowedImageProductReadView ImageProductBuffer::CopyDisplayFrom(ImageStream& stream, BorrowedImageProductReadView source,
-                                                                  const ImageWorkspaceCoverage coverage) {
+                                                                 const ImageWorkspaceCoverage coverage) {
     static_cast<void>(CopyFromAs(stream, std::move(source), {}, 0U, false, ImagePlanePreservation::All, &coverage));
     return Borrow();
 }

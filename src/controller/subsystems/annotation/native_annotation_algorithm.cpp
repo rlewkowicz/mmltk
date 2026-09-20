@@ -264,7 +264,10 @@ class NativeAnnotationAlgorithm final : public AnnotationAlgorithm {
             upload_valid_ = upload_pending_ = false;
             throw std::runtime_error("Annotation mask upload settlement failed");
         }
-        if (upload_pending_) { upload_valid_ = true; upload_pending_ = false; }
+        if (upload_pending_) {
+            upload_valid_ = true;
+            upload_pending_ = false;
+        }
         std::size_t run_count = 0U, total_words = 0U;
         try {
             for (std::size_t index = 0; index < description.ObjectCount(); ++index) {
@@ -359,7 +362,10 @@ class NativeAnnotationAlgorithm final : public AnnotationAlgorithm {
             for (std::size_t index = 0; index < description.ObjectCount(); ++index) {
                 const auto& object = description.DrawingObjectAt(index);
                 auto& geometry = geometry_[index];
-                if (!object.enabled) { geometry.enabled = false; continue; }
+                if (!object.enabled) {
+                    geometry.enabled = false;
+                    continue;
+                }
                 if (!reusable || !geometry.enabled || geometry.run_offset != run_offset || geometry.runs != object.mask.runs) {
                     auto word = run_offset * 2U;
                     for (const auto run : object.mask.runs) {
@@ -381,12 +387,15 @@ class NativeAnnotationAlgorithm final : public AnnotationAlgorithm {
                 run_offset += object.mask.runs.size();
             }
             upload_width_ = clean.descriptor.width;
-            if (grew || !reusable) { first = 0U; last = total_words; }
+            if (grew || !reusable) {
+                first = 0U;
+                last = total_words;
+            }
             if (last > first) {
                 auto* const pairs = static_cast<std::uint32_t*>(mask_host_->data());
                 std::copy(uploaded_words_.begin() + first, uploaded_words_.begin() + last, pairs + first);
-                if (cudaMemcpyAsync(static_cast<std::uint32_t*>(mask_device_.active()) + first, pairs + first,
-                                    (last - first) * sizeof(std::uint32_t), cudaMemcpyHostToDevice, stream) != cudaSuccess)
+                if (cudaMemcpyAsync(static_cast<std::uint32_t*>(mask_device_.active()) + first, pairs + first, (last - first) * sizeof(std::uint32_t),
+                                    cudaMemcpyHostToDevice, stream) != cudaSuccess)
                     throw std::runtime_error("Annotation changed geometry upload failed");
                 if (mask_upload_ == nullptr && cudaEventCreateWithFlags(&mask_upload_, cudaEventDisableTiming) != cudaSuccess)
                     throw std::runtime_error("Annotation mask upload event creation failed");
@@ -416,8 +425,8 @@ class NativeAnnotationAlgorithm final : public AnnotationAlgorithm {
                 offset += object.mask.runs.size();
                 continue;
             }
-            const raster::IntRect object_clip{std::max(clip.x1, bounds.x1), std::max(clip.y1, bounds.y1),
-                                                std::min(clip.x2, bounds.x2), std::min(clip.y2, bounds.y2)};
+            const raster::IntRect object_clip{std::max(clip.x1, bounds.x1), std::max(clip.y1, bounds.y1), std::min(clip.x2, bounds.x2),
+                                              std::min(clip.y2, bounds.y2)};
             const auto box = DrawingBox(description, index);
             const auto target = description.TransformsMask(index) ? description.TargetBox(index) : object.box;
             const auto color = palette_[object.category];

@@ -25,8 +25,7 @@ void compile_existing_fixture(const FixtureSpec& spec);
 void replace_synthetic_image(const FixtureSpec& spec, int image_index, int width, int height);
 std::vector<float> expected_nchw_stub(const std::string& path, int width, int height);
 // Retained compiler algorithm: RGB8 resize, then the public planar converter.
-std::vector<float> expected_resized_rgb(std::span<const std::uint8_t> rgb, std::uint32_t width, std::uint32_t height,
-                                       std::uint32_t target_width, std::uint32_t target_height,
-                                       mmltk::backend::imaging::resample::ImageResizeMode mode, bool perceptual);
+std::vector<float> expected_resized_rgb(std::span<const std::uint8_t> rgb, std::uint32_t width, std::uint32_t height, std::uint32_t target_width,
+                                        std::uint32_t target_height, mmltk::backend::imaging::resample::ImageResizeMode mode, bool perceptual);
 void assert_image_matches(const float* actual, const std::vector<float>& expected);
 }  // namespace mmltk::backend::data::testsupport

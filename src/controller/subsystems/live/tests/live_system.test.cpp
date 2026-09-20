@@ -136,12 +136,12 @@ class ControlledLiveAlgorithm final : public LiveAlgorithm {
         const auto value = ++state_->captures;
         for (std::uint32_t y = 0U; y != target.descriptor.height; ++y)
             for (std::uint32_t x = 0U; x != target.descriptor.row_bytes(); ++x)
-                *(reinterpret_cast<std::uint8_t*>(target.data) + y * target.descriptor.pitch_bytes + x) =
-                    static_cast<std::uint8_t>(value * 31U + y * 7U + x);
+                *(reinterpret_cast<std::uint8_t*>(target.data) + y * target.descriptor.pitch_bytes + x) = static_cast<std::uint8_t>(value * 31U + y * 7U + x);
         if (state_->after_capture) state_->after_capture();
         return state_->result;
     }
     void Stop() noexcept override {}
+
    private:
     std::shared_ptr<ControlledLiveCapture> state_;
 };
@@ -150,9 +150,11 @@ TEST_CASE("Live complete frames alternate native output slots without preparatio
     backend->pitch_padding_bytes = 17U;
     auto state = std::make_shared<ControlledLiveCapture>();
     EventGate events;
-    LiveSystem live{kDevice, RuntimeFactory(0, backend, mmltk::frameworks::gpu::ImageProductLayout::Clean,
-                                           [state] { return std::make_unique<ControlledLiveAlgorithm>(state); }, 2U),
-                    [&](LiveSystem::event_type) { events.Advance(); }};
+    LiveSystem live{
+        kDevice,
+        RuntimeFactory(
+            0, backend, mmltk::frameworks::gpu::ImageProductLayout::Clean, [state] { return std::make_unique<ControlledLiveAlgorithm>(state); }, 2U),
+        [&](LiveSystem::event_type) { events.Advance(); }};
     const auto check = [](const auto& read, const std::size_t value) {
         REQUIRE(read.valid());
         const auto plane = read.plane(0U).plane();
@@ -207,9 +209,11 @@ TEST_CASE("Live rejected or stopped complete captures never report frame progres
     auto state = std::make_shared<ControlledLiveCapture>();
     state->result = stop_after_capture;
     EventGate events;
-    LiveSystem live{kDevice, RuntimeFactory(0, backend, mmltk::frameworks::gpu::ImageProductLayout::Clean,
-                                           [state] { return std::make_unique<ControlledLiveAlgorithm>(state); }, 2U),
-                    [&](LiveSystem::event_type) { events.Advance(); }};
+    LiveSystem live{
+        kDevice,
+        RuntimeFactory(
+            0, backend, mmltk::frameworks::gpu::ImageProductLayout::Clean, [state] { return std::make_unique<ControlledLiveAlgorithm>(state); }, 2U),
+        [&](LiveSystem::event_type) { events.Advance(); }};
     if (stop_after_capture) state->after_capture = [&] { static_cast<void>(live.Stop()); };
     state->Offer();
     static_cast<void>(live.Start({.extent = {7U, 3U}, .frames_per_second = 240U}));
@@ -232,12 +236,14 @@ TEST_CASE("Live receiver publication failure does not commit a captured candidat
     state->after_capture = [backend, point] { backend->FailAfter(point); };
     EventGate events;
     std::atomic_bool failed{false};
-    LiveSystem live{kDevice, RuntimeFactory(0, backend, mmltk::frameworks::gpu::ImageProductLayout::Clean,
-                                           [state] { return std::make_unique<ControlledLiveAlgorithm>(state); }, 2U),
-                    [&](LiveSystem::event_type event) {
-                        if (std::holds_alternative<LiveFailed>(event)) failed = true;
-                        events.Advance();
-                    }};
+    LiveSystem live{
+        kDevice,
+        RuntimeFactory(
+            0, backend, mmltk::frameworks::gpu::ImageProductLayout::Clean, [state] { return std::make_unique<ControlledLiveAlgorithm>(state); }, 2U),
+        [&](LiveSystem::event_type event) {
+            if (std::holds_alternative<LiveFailed>(event)) failed = true;
+            events.Advance();
+        }};
     state->Offer();
     static_cast<void>(live.Start({.extent = {7U, 3U}, .frames_per_second = 240U}));
     REQUIRE(events.Wait([&] { return failed.load(); }));

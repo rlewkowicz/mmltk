@@ -259,7 +259,11 @@ impl Source {
                 for item in &snapshot.metadata.labels {
                     if let (Some(name), Some(color)) = (
                         snapshot.captions.get(item.category as usize),
-                        snapshot.metadata.dataset.palette.get(item.category as usize),
+                        snapshot
+                            .metadata
+                            .dataset
+                            .palette
+                            .get(item.category as usize),
                     ) {
                         label(
                             item.category,
@@ -540,7 +544,8 @@ impl<Message> Labelled<'_, Message> {
                         let Some(background) = rect.intersection(&label_clip) else {
                             return;
                         };
-                        let color = cached.background
+                        let color = cached
+                            .background
                             .map(|rgb| Color::from_rgb8(rgb[0], rgb[1], rgb[2]))
                             .unwrap_or_else(|| class_color(color));
                         renderer.fill_quad(
@@ -687,7 +692,6 @@ mod tests {
                 let mut paragraphs = Vec::new();
                 for layer in source.caption_layers() {
                     layer.visit(|_, _, _, _, _, _, cached| {
-
                         seen.push(cached.background.unwrap());
                         paragraphs.push(cached.text.as_ptr());
                     });
@@ -766,7 +770,11 @@ mod tests {
             &crate::view_model::test_support::explore_snapshot(),
         ));
         for visible in [false, true] {
-            let layers = Source::Gallery(std::sync::Arc::new(GalleryContent::new(explore.clone())), visible).caption_layers();
+            let layers = Source::Gallery(
+                std::sync::Arc::new(GalleryContent::new(explore.clone())),
+                visible,
+            )
+            .caption_layers();
             assert!(
                 matches!(&layers[0], Source::Gallery(value, labels) if std::sync::Arc::ptr_eq(&value.metadata, &explore) && *labels == visible)
             );
@@ -787,43 +795,74 @@ mod tests {
     fn explore_prepared_captions_follow_the_exact_paired_scene_and_unicode_width() {
         use std::sync::Arc;
         let (model, _) = crate::view_model::test_support::explore_presentation();
-        let mut native = crate::generated::ExploreImageMetadata::from(model.explore.snapshot.as_ref().unwrap());
-        native.scene.categories = vec![crate::generated::ClassName { value: "source".into() }];
-        native.scene.palette = vec![crate::generated::AnnotationColor { hue: 120.0, saturation: 0.7, value: 0.8 }];
+        let mut native =
+            crate::generated::ExploreImageMetadata::from(model.explore.snapshot.as_ref().unwrap());
+        native.scene.categories = vec![crate::generated::ClassName {
+            value: "source".into(),
+        }];
+        native.scene.palette = vec![crate::generated::AnnotationColor {
+            hue: 120.0,
+            saturation: 0.7,
+            value: 0.8,
+        }];
         native.scene.objects = vec![crate::view_model::test_support::annotation_object(0)];
         native.overlay.showlabels = true;
         native.overlay.classselection.mode = crate::generated::ExploreClassSelectionMode::All;
-        native.dataset.classnames = vec![crate::generated::ClassName { value: "人é🙂".into() }];
+        native.dataset.classnames = vec![crate::generated::ClassName {
+            value: "人é🙂".into(),
+        }];
         native.dataset.palette = native.scene.palette.clone();
         native.labels = vec![crate::generated::ExploreLabel {
-            box_: native.scene.objects[0].box_.clone(), category: 0, compiledindex: 0,
+            box_: native.scene.objects[0].box_.clone(),
+            category: 0,
+            compiledindex: 0,
         }];
         let gallery = Arc::new(GalleryContent::new(Arc::new(native.clone())));
         assert_eq!(gallery.captions.get(0).unwrap().text, "人é🙂");
         assert_eq!(gallery.captions.get(0).unwrap().width, 30.5);
         assert_eq!(CachedLabel::new(String::new()).width, 20.0);
         for _ in 0..3 {
-            Source::Gallery(gallery.clone(), true).visit(|category, _, name, color, _, _, cached| {
-                assert_eq!((category, name), (0, "人é🙂"));
-                assert_eq!(color, &native.dataset.palette[0]);
-                assert!(std::ptr::eq(cached, gallery.captions.get(0).unwrap()));
-                assert_eq!(cached.paragraph.compare(label_text((), 30.5)), text::Difference::None);
-            });
+            Source::Gallery(gallery.clone(), true).visit(
+                |category, _, name, color, _, _, cached| {
+                    assert_eq!((category, name), (0, "人é🙂"));
+                    assert_eq!(color, &native.dataset.palette[0]);
+                    assert!(std::ptr::eq(cached, gallery.captions.get(0).unwrap()));
+                    assert_eq!(
+                        cached.paragraph.compare(label_text((), 30.5)),
+                        text::Difference::None
+                    );
+                },
+            );
         }
         let native = Arc::new(native);
         let original = super::super::DetailContent::new(native.clone(), None);
         let mut derived = crate::generated::UpscaleImageMetadata {
-            input: native.frame.clone(), frame: native.frame.clone(), scene: native.scene.clone(),
+            input: native.frame.clone(),
+            frame: native.frame.clone(),
+            scene: native.scene.clone(),
         };
         derived.frame.source.kind = crate::generated::PresentationSourceKind::Upscale;
-        derived.frame.extent = native.frame.extent.checked_scale(
-            crate::generated::UpscaleImageMetadata::OUTPUT_SCALE,
-        ).unwrap();
-        derived.frame.content = native.frame.content.checked_scale(
-            crate::generated::UpscaleImageMetadata::OUTPUT_SCALE,
-        ).unwrap();
-        derived.scene.categories.push(crate::generated::ClassName { value: "人é🙂".into() });
-        derived.scene.palette.push(crate::generated::AnnotationColor { hue: 240.0, saturation: 1.0, value: 1.0 });
+        derived.frame.extent = native
+            .frame
+            .extent
+            .checked_scale(crate::generated::UpscaleImageMetadata::OUTPUT_SCALE)
+            .unwrap();
+        derived.frame.content = native
+            .frame
+            .content
+            .checked_scale(crate::generated::UpscaleImageMetadata::OUTPUT_SCALE)
+            .unwrap();
+        derived.scene.categories.push(crate::generated::ClassName {
+            value: "人é🙂".into(),
+        });
+        derived
+            .scene
+            .palette
+            .push(crate::generated::AnnotationColor {
+                hue: 240.0,
+                saturation: 1.0,
+                value: 1.0,
+            });
         derived.scene.objects[0].category = 1;
         derived.scene.objects[0].box_.first.x = 123.0;
         let derived = Arc::new(derived);
@@ -835,17 +874,22 @@ mod tests {
         assert!(Arc::ptr_eq(&prepared.clone().labels, &prepared.labels));
         for _ in 0..3 {
             let mut count = 0;
-            Source::Detail(prepared.clone(), true).visit(|category, bounds, name, color, categories, overlay, cached| {
-                count += 1;
-                assert_eq!((category, categories, name), (1, 2, "人é🙂"));
-                assert_eq!(bounds.first.x, 123.0);
-                assert_eq!(color, &derived.scene.palette[1]);
-                assert!(std::ptr::eq(overlay.unwrap(), &native.overlay));
+            Source::Detail(prepared.clone(), true).visit(
+                |category, bounds, name, color, categories, overlay, cached| {
+                    count += 1;
+                    assert_eq!((category, categories, name), (1, 2, "人é🙂"));
+                    assert_eq!(bounds.first.x, 123.0);
+                    assert_eq!(color, &derived.scene.palette[1]);
+                    assert!(std::ptr::eq(overlay.unwrap(), &native.overlay));
 
-                assert!(std::ptr::eq(cached, prepared.labels.get(1).unwrap()));
-                assert_eq!(cached.width, 30.5);
-                assert_eq!(cached.paragraph.compare(label_text((), cached.width)), text::Difference::None);
-            });
+                    assert!(std::ptr::eq(cached, prepared.labels.get(1).unwrap()));
+                    assert_eq!(cached.width, 30.5);
+                    assert_eq!(
+                        cached.paragraph.compare(label_text((), cached.width)),
+                        text::Difference::None
+                    );
+                },
+            );
             assert_eq!(count, 1);
         }
         // The same input frame does not give its source catalog authority over
@@ -859,25 +903,29 @@ mod tests {
         filtered.overlay.classselection.mode = crate::generated::ExploreClassSelectionMode::Subset;
         filtered.overlay.classselection.classes = vec![0];
         let hidden = super::super::DetailContent::new(Arc::new(filtered), Some(derived));
-        Source::Detail(hidden, true).visit(|_, _, _, _, _, _, _| panic!("paired source filter excludes derived category"));
+        Source::Detail(hidden, true)
+            .visit(|_, _, _, _, _, _, _| panic!("paired source filter excludes derived category"));
     }
 
     #[test]
     fn explore_prepares_only_referenced_categories_and_preserves_visit_order() {
         use crate::generated::*;
         use std::sync::Arc;
-        let mut native = ExploreImageMetadata::from(
-            &crate::view_model::test_support::explore_snapshot(),
-        );
+        let mut native =
+            ExploreImageMetadata::from(&crate::view_model::test_support::explore_snapshot());
         native.dataset.classnames = (0..256)
-            .map(|category| ClassName { value: format!("class {category}") })
+            .map(|category| ClassName {
+                value: format!("class {category}"),
+            })
             .collect();
         native.dataset.classnames[253].value = "人é🙂".into();
         native.dataset.classnames[7].value.clear();
         // Category 255 has a valid name but no palette entry.
         native.dataset.palette = (0..255)
             .map(|category| AnnotationColor {
-                hue: category as f32, saturation: 0.7, value: 0.8,
+                hue: category as f32,
+                saturation: 0.7,
+                value: 0.8,
             })
             .collect();
         native.scene.categories = native.dataset.classnames.clone();
@@ -887,13 +935,18 @@ mod tests {
         native.overlay.classselection.mode = ExploreClassSelectionMode::All;
         let empty = Arc::new(native.clone());
         assert_eq!(GalleryContent::new(empty.clone()).captions.len(), 0);
-        assert_eq!(super::super::DetailContent::new(empty, None).labels.len(), 0);
+        assert_eq!(
+            super::super::DetailContent::new(empty, None).labels.len(),
+            0
+        );
 
         for (position, category) in [253, 7, 253, 255, 256, u16::MAX].into_iter().enumerate() {
             let mut object = crate::view_model::test_support::annotation_object(category);
             object.box_.first.x = position as f32;
             native.labels.push(ExploreLabel {
-                box_: object.box_.clone(), category, compiledindex: 0,
+                box_: object.box_.clone(),
+                category,
+                compiledindex: 0,
             });
             native.scene.objects.push(object);
         }
@@ -910,7 +963,10 @@ mod tests {
         for visible in [true, false, true, true] {
             for (source, captions) in [
                 (Source::Gallery(gallery.clone(), visible), &gallery.captions),
-                (Source::Detail(detail.clone(), visible), detail.labels.as_ref()),
+                (
+                    Source::Detail(detail.clone(), visible),
+                    detail.labels.as_ref(),
+                ),
             ] {
                 let mut seen = Vec::new();
                 source.visit(|category, bounds, name, color, count, overlay, cached| {
@@ -918,13 +974,28 @@ mod tests {
                     assert_eq!(count, 256);
                     assert_eq!(color, &native.dataset.palette[usize::from(category)]);
                     assert_eq!(overlay.unwrap(), &native.overlay);
-                    assert!(std::ptr::eq(cached, captions.get(usize::from(category)).unwrap()));
+                    assert!(std::ptr::eq(
+                        cached,
+                        captions.get(usize::from(category)).unwrap()
+                    ));
                     assert_eq!(cached.width, if category == 7 { 20.0 } else { 30.5 });
-                    assert_eq!(cached.paragraph.compare(label_text((), cached.width)), text::Difference::None);
+                    assert_eq!(
+                        cached.paragraph.compare(label_text((), cached.width)),
+                        text::Difference::None
+                    );
                 });
-                assert_eq!(seen, if visible {
-                    vec![(253, 0.0, "人é🙂".into()), (7, 1.0, "".into()), (253, 2.0, "人é🙂".into())]
-                } else { Vec::new() });
+                assert_eq!(
+                    seen,
+                    if visible {
+                        vec![
+                            (253, 0.0, "人é🙂".into()),
+                            (7, 1.0, "".into()),
+                            (253, 2.0, "人é🙂".into()),
+                        ]
+                    } else {
+                        Vec::new()
+                    }
+                );
                 assert_eq!(captions.len(), 3);
             }
         }
@@ -937,7 +1008,10 @@ mod tests {
         let next_gallery = GalleryContent::new(replacement.clone());
         let next_detail = super::super::DetailContent::new(replacement, None);
         assert_eq!(next_gallery.captions.get(253).unwrap().text, "replacement");
-        assert_eq!(next_detail.labels.get(253).unwrap().text, "detail replacement");
+        assert_eq!(
+            next_detail.labels.get(253).unwrap().text,
+            "detail replacement"
+        );
         assert_eq!(gallery.captions.get(253).unwrap().text, "人é🙂");
         assert_eq!(detail.labels.get(253).unwrap().text, "人é🙂");
         assert!(!Arc::ptr_eq(&detail.labels, &next_detail.labels));
@@ -1057,9 +1131,10 @@ mod tests {
         super::super::complete_sample(frame);
         let surface = crate::view_model::test_support::physical_surface(frame);
         let source = Source::Detail(
-            super::super::DetailContent::new(std::sync::Arc::new(crate::generated::ExploreImageMetadata::from(
-                    &*snapshot,
-                )), None),
+            super::super::DetailContent::new(
+                std::sync::Arc::new(crate::generated::ExploreImageMetadata::from(&*snapshot)),
+                None,
+            ),
             true,
         );
         let program = |show_fps| Program::<()> {
@@ -1291,15 +1366,18 @@ mod tests {
             snapshot.scene = scene.clone();
             snapshot.overlay = overlay.clone();
             Source::Detail(
-                super::super::DetailContent::new(std::sync::Arc::new(crate::generated::ExploreImageMetadata::from(
-                        &snapshot,
-                    )), None),
+                super::super::DetailContent::new(
+                    std::sync::Arc::new(crate::generated::ExploreImageMetadata::from(&snapshot)),
+                    None,
+                ),
                 overlay.showlabels,
             )
         };
         assert!(
             collect(Source::Gallery(
-                std::sync::Arc::new(GalleryContent::new(std::sync::Arc::new(crate::generated::ExploreImageMetadata::from(&snapshot)))),
+                std::sync::Arc::new(GalleryContent::new(std::sync::Arc::new(
+                    crate::generated::ExploreImageMetadata::from(&snapshot)
+                ))),
                 snapshot.overlay.showlabels
             ))
             .is_empty()

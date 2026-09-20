@@ -811,8 +811,8 @@ TEST_CASE("categorical resize agrees exactly with dense nearest-center sampling"
     using namespace mmltk::backend::data::dataset;
     using namespace mmltk::backend::imaging::resample;
     const MaskDimensions source_size{11U, 7U};
-    const std::vector<std::vector<RLEPair>> masks{{}, {{0U, 77U}}, {{0U, 1U}, {76U, 1U}}, {{8U, 21U}, {31U, 9U}},
-                                               {{0U, 4U}, {4U, 7U}, {14U, 11U}, {25U, 3U}}, {{38U, 1U}}};
+    const std::vector<std::vector<RLEPair>> masks{
+        {}, {{0U, 77U}}, {{0U, 1U}, {76U, 1U}}, {{8U, 21U}, {31U, 9U}}, {{0U, 4U}, {4U, 7U}, {14U, 11U}, {25U, 3U}}, {{38U, 1U}}};
     MaskResizeScratch scratch;
     const auto check_bounds = [](const RowMajorMaskBounds& actual, const RowMajorMaskBounds& expected) {
         CHECK(actual.has_foreground == expected.has_foreground);
@@ -832,7 +832,8 @@ TEST_CASE("categorical resize agrees exactly with dense nearest-center sampling"
                 for (std::uint32_t y = 0U; y < geometry.resized_height; ++y) {
                     const auto sy = std::min<std::uint64_t>(source_size.height - 1U, ((2ULL * y + 1U) * source_size.height) / (2ULL * geometry.resized_height));
                     for (std::uint32_t x = 0U; x < geometry.resized_width; ++x) {
-                        const auto sx = std::min<std::uint64_t>(source_size.width - 1U, ((2ULL * x + 1U) * source_size.width) / (2ULL * geometry.resized_width));
+                        const auto sx =
+                            std::min<std::uint64_t>(source_size.width - 1U, ((2ULL * x + 1U) * source_size.width) / (2ULL * geometry.resized_width));
                         target[std::size_t(y + geometry.offset_y) * target_size.width + x + geometry.offset_x] = source[sy * source_size.width + sx];
                     }
                 }
@@ -847,11 +848,12 @@ TEST_CASE("categorical resize agrees exactly with dense nearest-center sampling"
                 check_bounds(actual_source, expected_source);
             }
     const auto geometry = compute_image_resize_geometry(11U, 7U, 1U, 1U, ImageResizeMode::Stretch);
-    for (const auto& invalid : std::vector<std::vector<RLEPair>>{{{0U, 1U}, {77U, 1U}}, {{0U, 1U}, {76U, 0U}}, {{0U, 5U}, {4U, 2U}},
-                                                               {{70U, 8U}}, {{std::numeric_limits<std::uint32_t>::max(), 2U}}})
+    for (const auto& invalid : std::vector<std::vector<RLEPair>>{
+             {{0U, 1U}, {77U, 1U}}, {{0U, 1U}, {76U, 0U}}, {{0U, 5U}, {4U, 2U}}, {{70U, 8U}}, {{std::numeric_limits<std::uint32_t>::max(), 2U}}})
         CHECK_THROWS_AS(resize_row_major_mask(invalid, source_size, {1U, 1U}, geometry, &scratch), std::runtime_error);
     const std::array<RLEPair, 1> valid{{{0U, 1U}}};
-    CHECK_THROWS_AS(resize_row_major_mask(valid, source_size, {1U, 1U}, {1U, 1U, std::numeric_limits<std::uint32_t>::max(), 0U}, &scratch), std::invalid_argument);
+    CHECK_THROWS_AS(resize_row_major_mask(valid, source_size, {1U, 1U}, {1U, 1U, std::numeric_limits<std::uint32_t>::max(), 0U}, &scratch),
+                    std::invalid_argument);
     RowMajorMaskBounds sentinel{1U, 2U, 3U, 4U, true};
     CHECK(resize_row_major_mask({}, {}, {1U, 1U}, geometry, &scratch, &sentinel).pairs.empty());
     CHECK(sentinel.min_x == 1U);

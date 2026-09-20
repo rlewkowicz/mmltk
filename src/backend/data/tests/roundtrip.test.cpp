@@ -172,13 +172,12 @@ void exercise_schedule_capacity(const std::string& path, const bool h2d) {
         std::uint32_t shards, rank;
         bool drop;
     };
-    const std::array cases{Schedule{32U, 8, 1U, 0U, false}, Schedule{7U, 8, 3U, 2U, false}, Schedule{7U, 8, 4U, 3U, false},
-                           Schedule{32U, 8, 1U, 0U, true}, Schedule{4U, 2, 1U, 0U, false}, Schedule{10U, 2, 1U, 0U, false},
-                           Schedule{7U, 8, 1U, 0U, true}};
+    const std::array cases{Schedule{32U, 8, 1U, 0U, false}, Schedule{7U, 8, 3U, 2U, false},  Schedule{7U, 8, 4U, 3U, false}, Schedule{32U, 8, 1U, 0U, true},
+                           Schedule{4U, 2, 1U, 0U, false},  Schedule{10U, 2, 1U, 0U, false}, Schedule{7U, 8, 1U, 0U, true}};
     for (const auto schedule : cases)
         for (const bool shuffle : {false, true}) {
-            INFO("batch " << schedule.batch << " prefetch " << schedule.prefetch << " shards " << schedule.shards << " rank " << schedule.rank
-                           << " drop " << schedule.drop << " shuffle " << shuffle << " H2D " << h2d);
+            INFO("batch " << schedule.batch << " prefetch " << schedule.prefetch << " shards " << schedule.shards << " rank " << schedule.rank << " drop "
+                          << schedule.drop << " shuffle " << shuffle << " H2D " << h2d);
             DatasetLoader::Config config;
             config.compiled_path = path;
             config.batch_size = schedule.batch;
@@ -210,7 +209,8 @@ void exercise_schedule_capacity(const std::string& path, const bool h2d) {
                     loader.wait_batch(batch);
                     const auto host = loader.host_images(batch);
                     std::vector<float> received(host.size());
-                    ensure_cuda_ok(cudaMemcpy(received.data(), batch.device_images, batch.image_capacity_bytes, cudaMemcpyDeviceToHost), "scheduled batch pixels");
+                    ensure_cuda_ok(cudaMemcpy(received.data(), batch.device_images, batch.image_capacity_bytes, cudaMemcpyDeviceToHost),
+                                   "scheduled batch pixels");
                     CHECK(std::memcmp(received.data(), host.data(), batch.image_capacity_bytes) == 0);
                     for (std::size_t image = 0U; image < batch.num_images; ++image) {
                         const auto index = batch.image_indices[image];
@@ -682,7 +682,6 @@ TEST_CASE("perceptual compiler changes shrinking RGB while preserving format cat
                 }
     }
 }
-
 TEST_CASE("empty compiled datasets retain their format admission failure", "[backend][data][roundtrip]") {
     mmltk::testsupport::ScopedTempDir root("empty-compiled");
     const auto path = root.path() / "empty.bin";

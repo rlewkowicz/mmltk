@@ -149,10 +149,11 @@ concept PublicRawCborAppend =
         mmltk::frameworks::serialization::implementation::detail::append_reflected_object_fields<Layout>(source, object, failure);
     };
 template <class Owner>
-concept PublicRawCborValueDecode = requires(Owner& destination, std::span<const mmltk::frameworks::serialization::implementation::detail::NamedFieldMatch> matches,
-                                          std::size_t& index, std::optional<wire::DecodeError>& failure) {
-    mmltk::frameworks::serialization::implementation::detail::decode_reflected_object_fields(destination, matches, index, failure);
-};
+concept PublicRawCborValueDecode =
+    requires(Owner& destination, std::span<const mmltk::frameworks::serialization::implementation::detail::NamedFieldMatch> matches, std::size_t& index,
+             std::optional<wire::DecodeError>& failure) {
+        mmltk::frameworks::serialization::implementation::detail::decode_reflected_object_fields(destination, matches, index, failure);
+    };
 template <class Owner>
 concept PublicRawCborProjectedDecode = requires(Owner& destination, wire::Reader& reader) {
     mmltk::frameworks::serialization::implementation::detail::decode_projected_member(destination, reader, 0U, std::string_view{});
@@ -339,8 +340,8 @@ TEST_CASE("named object validation retains declaration order across shuffled and
         CHECK(input == input_before);
     };
     const wire::Value::Object valid{{"optional_count", wire::Value(std::uint64_t{6})},
-                                  {"derived_count", wire::Value(std::uint64_t{5})},
-                                  {"inherited_limit", wire::Value(std::uint64_t{7})}};
+                                    {"derived_count", wire::Value(std::uint64_t{5})},
+                                    {"inherited_limit", wire::Value(std::uint64_t{7})}};
     for (const bool duplicate_first : {false, true}) {
         auto fields = valid;
         fields.insert(duplicate_first ? fields.begin() : fields.end(), {"derived_count", wire::Value{}});
@@ -373,8 +374,7 @@ TEST_CASE("opaque named values preserve ordered admission and nested error prece
         OpaqueFixtureOwner destination;
         destination.value = 73U;
         const auto before = destination;
-        const wire::Value input(wire::Value::Object{{"overrides", wire::Value(std::move(fields))},
-                                                   {"value", wire::Value(std::uint64_t{19})}});
+        const wire::Value input(wire::Value::Object{{"overrides", wire::Value(std::move(fields))}, {"value", wire::Value(std::uint64_t{19})}});
         const auto result = cbor::decode_into(destination, input);
         require_decode_error(result, wire::ErrorCode::UnknownKey);
         CHECK(result.error().path == (known_first ? "overrides.unknown" : "overrides.mask"));
@@ -651,9 +651,8 @@ TEST_CASE("owned scalar payloads survive every segmented split and input retirem
     for (const std::size_t length : {0U, 31U, 257U}) {
         const std::string text(length, 'x');
         const wire::ByteBuffer bytes(length, std::byte{0xa5});
-        for (const wire::Value& source : {wire::Value(text), wire::Value(bytes), wire::Value(std::string("a\xe2\x82\xac")),
-                                        wire::Value(wire::Value::Array{}),
-                                        wire::Value(wire::Value::Array{wire::Value(text), wire::Value(bytes), wire::Value(std::int64_t{-17})})}) {
+        for (const wire::Value& source : {wire::Value(text), wire::Value(bytes), wire::Value(std::string("a\xe2\x82\xac")), wire::Value(wire::Value::Array{}),
+                                          wire::Value(wire::Value::Array{wire::Value(text), wire::Value(bytes), wire::Value(std::int64_t{-17})})}) {
             wire::ByteBuffer encoded;
             REQUIRE(wire::encode(source, encoded, test_limits(2048U)));
             const auto limits = test_limits(encoded.size());
@@ -693,9 +692,9 @@ TEST_CASE("borrowed byte payloads alias separate live segments at every split", 
             } probe;
             auto limits = test_limits(encoded.size(), 3U, 0U);
             limits.allocation_policy = {.context = &probe, .allows = [](const void* context, const wire::AllocationRequest&) noexcept {
-                ++static_cast<const AllocationProbe*>(context)->calls;
-                return false;
-            }};
+                                            ++static_cast<const AllocationProbe*>(context)->calls;
+                                            return false;
+                                        }};
             wire::Reader reader(input, limits);
             REQUIRE(reader.read_scalar_item(0U));
             const auto payload = reader.borrow_bytes_item(0U);
@@ -708,8 +707,8 @@ TEST_CASE("borrowed byte payloads alias separate live segments at every split", 
             CHECK(std::ranges::equal(payload->first, expected.first(first_count)));
             CHECK(std::ranges::equal(payload->second, expected.subspan(first_count)));
             if (!payload->first.empty()) {
-                const auto* const backing = input.first.size() > payload_offset ? input.first.data() + payload_offset
-                                                                                 : input.second.data() + (payload_offset - input.first.size());
+                const auto* const backing =
+                    input.first.size() > payload_offset ? input.first.data() + payload_offset : input.second.data() + (payload_offset - input.first.size());
                 CHECK(payload->first.data() == backing);
             }
             if (!payload->second.empty()) CHECK(payload->second.data() == input.second.data());
@@ -724,8 +723,7 @@ TEST_CASE("borrowed byte payloads alias separate live segments at every split", 
 }
 TEST_CASE("segmented text choices consume exactly one complete item on match or unknown key", "[frameworks][serialization]") {
     // Unlike owned text materialization, text choices compare exact protocol bytes.
-    for (const std::string& text : {std::string{}, std::string{"ab"}, std::string{"a\xe2\x82\xac"},
-                                    std::string{"a\0b", 3U}, std::string{"\xc0\x80", 2U}}) {
+    for (const std::string& text : {std::string{}, std::string{"ab"}, std::string{"a\xe2\x82\xac"}, std::string{"a\0b", 3U}, std::string{"\xc0\x80", 2U}}) {
         wire::ByteBuffer encoded{std::byte(0x60U + text.size())};
         for (const unsigned char character : text) encoded.push_back(std::byte(character));
         const auto item_end = encoded.size();
@@ -782,9 +780,10 @@ TEST_CASE("borrowed strings preserve admission precedence and failure cursors ac
                     limits.allocation_policy.allows = [](const void*, const wire::AllocationRequest&) noexcept { return false; };
                     wire::Reader reader(input, limits);
                     auto scope = reader.enter_path("payload");
-                    const auto expected_code = (rejection & 1U) != 0U ? wire::ErrorCode::LimitExceeded
-                                             : (rejection & 2U) != 0U ? wire::ErrorCode::DepthExceeded
-                                             : (rejection & 4U) != 0U ? wire::ErrorCode::LimitExceeded : failure.code;
+                    const auto expected_code = (rejection & 1U) != 0U   ? wire::ErrorCode::LimitExceeded
+                                               : (rejection & 2U) != 0U ? wire::ErrorCode::DepthExceeded
+                                               : (rejection & 4U) != 0U ? wire::ErrorCode::LimitExceeded
+                                                                        : failure.code;
                     const auto expected_offset = rejection == 0U ? failure.offset : 0U;
                     const auto check = [&](const auto& result) {
                         require_decode_error(result, expected_code);
@@ -792,8 +791,10 @@ TEST_CASE("borrowed strings preserve admission precedence and failure cursors ac
                         CHECK(result.error().path == "payload");
                     };
                     const auto depth = (rejection & 2U) != 0U ? 1U : 0U;
-                    if (text) check(reader.read_text_choice(depth, {}));
-                    else check(reader.borrow_bytes_item(depth));
+                    if (text)
+                        check(reader.read_text_choice(depth, {}));
+                    else
+                        check(reader.borrow_bytes_item(depth));
                     CHECK(reader.offset() == expected_offset);
                     CHECK(reader.items_read() == (rejection == 0U ? 1U : 0U));
                 }
@@ -805,11 +806,13 @@ TEST_CASE("configured maximum scalar and flat array inputs retain independent ow
     constexpr wire::DynamicValueLimits admitted{.max_bytes = 65536U, .max_items = 256U, .max_depth = 1U};
     wire::Value::Array items;
     for (std::size_t index = 0U; index < admitted.max_items; ++index) {
-        if (index % 2U == 0U) items.emplace_back(std::string(257U, 'x'));
-        else items.emplace_back(wire::ByteBuffer(257U, std::byte{0xa5}));
+        if (index % 2U == 0U)
+            items.emplace_back(std::string(257U, 'x'));
+        else
+            items.emplace_back(wire::ByteBuffer(257U, std::byte{0xa5}));
     }
-    for (const wire::Value& source : {wire::Value(std::string(admitted.max_bytes, 'x')),
-                                     wire::Value(wire::ByteBuffer(admitted.max_bytes, std::byte{0xa5})), wire::Value(items)}) {
+    for (const wire::Value& source :
+         {wire::Value(std::string(admitted.max_bytes, 'x')), wire::Value(wire::ByteBuffer(admitted.max_bytes, std::byte{0xa5})), wire::Value(items)}) {
         const auto expected = wire::FlatValue::from_value(source, admitted);
         REQUIRE(expected);
         const bool array = std::holds_alternative<wire::Value::Array>(source.storage);
@@ -902,20 +905,21 @@ TEST_CASE("scalar allocation admission reports exact kind size path and cursor",
         mutable bool path_matches = false;
     };
     for (const auto kind : {wire::AllocationKind::Text, wire::AllocationKind::Bytes}) {
-        const std::array encoded{kind == wire::AllocationKind::Text ? std::byte{0x64} : std::byte{0x44},
-                                 std::byte{'a'}, std::byte{'b'}, std::byte{'c'}, std::byte{'d'}};
+        const std::array encoded{kind == wire::AllocationKind::Text ? std::byte{0x64} : std::byte{0x44}, std::byte{'a'}, std::byte{'b'}, std::byte{'c'},
+                                 std::byte{'d'}};
         for (std::size_t split = 0U; split <= encoded.size(); ++split) {
             Observation observed;
             auto limits = test_limits(encoded.size());
             limits.allocation_policy = {.context = &observed, .allows = [](const void* context, const wire::AllocationRequest& request) noexcept {
-                const auto& state = *static_cast<const Observation*>(context);
-                ++state.calls;
-                state.kind = request.kind;
-                state.size = request.size;
-                state.offset = state.reader->offset();
-                state.path_matches = request.path.size() == 2U && request.path[0].name == "outer" && request.path[1].name == "payload";
-                return false;
-            }};
+                                            const auto& state = *static_cast<const Observation*>(context);
+                                            ++state.calls;
+                                            state.kind = request.kind;
+                                            state.size = request.size;
+                                            state.offset = state.reader->offset();
+                                            state.path_matches =
+                                                request.path.size() == 2U && request.path[0].name == "outer" && request.path[1].name == "payload";
+                                            return false;
+                                        }};
             wire::Reader reader({std::span(encoded).first(split), std::span(encoded).subspan(split)}, limits);
             observed.reader = &reader;
             auto outer = reader.enter_path("outer");
@@ -935,10 +939,10 @@ TEST_CASE("scalar allocation admission reports exact kind size path and cursor",
 }
 TEST_CASE("malformed UTF8 categories consume complete segmented payloads before failure", "[frameworks][serialization]") {
     for (const wire::ByteBuffer& encoded : {
-             wire::ByteBuffer{std::byte{0x62}, std::byte{0xc2}, std::byte{'x'}}, // invalid continuation
-             wire::ByteBuffer{std::byte{0x62}, std::byte{0xc0}, std::byte{0x80}}, // overlong
-             wire::ByteBuffer{std::byte{0x63}, std::byte{0xed}, std::byte{0xa0}, std::byte{0x80}}, // surrogate
-             wire::ByteBuffer{std::byte{0x64}, std::byte{0xf4}, std::byte{0x90}, std::byte{0x80}, std::byte{0x80}}, // out of range
+             wire::ByteBuffer{std::byte{0x62}, std::byte{0xc2}, std::byte{'x'}},                                     // invalid continuation
+             wire::ByteBuffer{std::byte{0x62}, std::byte{0xc0}, std::byte{0x80}},                                    // overlong
+             wire::ByteBuffer{std::byte{0x63}, std::byte{0xed}, std::byte{0xa0}, std::byte{0x80}},                   // surrogate
+             wire::ByteBuffer{std::byte{0x64}, std::byte{0xf4}, std::byte{0x90}, std::byte{0x80}, std::byte{0x80}},  // out of range
          }) {
         for (std::size_t split = 0U; split <= encoded.size(); ++split) {
             wire::Reader reader({std::span(encoded).first(split), std::span(encoded).subspan(split)}, test_limits(encoded.size()));

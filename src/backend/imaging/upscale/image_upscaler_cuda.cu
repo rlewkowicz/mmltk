@@ -51,8 +51,7 @@ __global__ void stitch_tile_kernel(const float* output, const Tile tile, const b
     if (destination_x >= restored_width || destination_y >= restored_height) { return; }
     constexpr std::size_t kOutputPlane = static_cast<std::size_t>(kOutputExtent) * kOutputExtent;
     const std::size_t scaled_halo = static_cast<std::size_t>(halo) * 4U;
-    const std::size_t source = (static_cast<std::size_t>(local_y) + scaled_halo) * kOutputExtent +
-                               static_cast<std::size_t>(local_x) + scaled_halo;
+    const std::size_t source = (static_cast<std::size_t>(local_y) + scaled_halo) * kOutputExtent + static_cast<std::size_t>(local_x) + scaled_halo;
     const float scale = shift_lut ? (1.0F / 255.0F) : 1.0F;
     auto* rgba = restored + static_cast<std::size_t>(destination_y) * restored_pitch + static_cast<std::size_t>(destination_x) * 4U;
 #pragma unroll

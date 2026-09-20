@@ -477,7 +477,6 @@ class FakeImageBackend final : public ImageCopyBackend {
         transfers_.push_back(transfer);
     }
     std::vector<Transfer> transfers_;
-
     void CheckDeviceBinding(const std::uintptr_t context) {
         std::scoped_lock lock(mutex_);
         const auto found = devices_.find(context);

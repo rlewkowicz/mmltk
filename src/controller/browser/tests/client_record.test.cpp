@@ -384,10 +384,10 @@ TEST_CASE("consumed server records retain empty and large nested leaf ownership"
     for (const std::size_t size : {0U, 65535U, 65536U, 65537U}) {
         const wire::Value payload(wire::Value::Object{
             {"nested", wire::Value(wire::Value::Array{wire::Value(std::string(size, 'x')), wire::Value(wire::ByteBuffer(size, std::byte{0xa5}))})}});
-        for (const ServerRecord& source : std::array<ServerRecord, 3U>{
-                 SystemEvent{.system_id = 1U, .event_id = 2U, .state_revision = 7U, .value = payload},
-                 Bootstrap{.schema_fingerprint = {11U, 13U}, .input_epoch = 1U, .snapshots = {{.system_id = 1U, .value = payload}}},
-                 IntentReply{.correlation = 9U, .result = payload}}) {
+        for (const ServerRecord& source :
+             std::array<ServerRecord, 3U>{SystemEvent{.system_id = 1U, .event_id = 2U, .state_revision = 7U, .value = payload},
+                                          Bootstrap{.schema_fingerprint = {11U, 13U}, .input_epoch = 1U, .snapshots = {{.system_id = 1U, .value = payload}}},
+                                          IntentReply{.correlation = 9U, .result = payload}}) {
             auto owned = source;
             wire::ByteBuffer expected;
             REQUIRE(encode_server_record(source, expected));
@@ -408,8 +408,8 @@ TEST_CASE("consumed server records retain empty and large nested leaf ownership"
 TEST_CASE("complete server records preserve exact 64 KiB neighboring extents", "[controller][browser][protocol][limits]") {
     for (const std::size_t target : {65535U, 65536U, 65537U}) {
         const auto payload = [](std::size_t text_size) {
-            return wire::Value(wire::Value::Object{{"nested", wire::Value(wire::Value::Array{
-                wire::Value(std::string(text_size, 'x')), wire::Value(wire::ByteBuffer(31U, std::byte{0xa5}))})}});
+            return wire::Value(wire::Value::Object{
+                {"nested", wire::Value(wire::Value::Array{wire::Value(std::string(text_size, 'x')), wire::Value(wire::ByteBuffer(31U, std::byte{0xa5}))})}});
         };
         for (ServerRecord source : std::array<ServerRecord, 3U>{
                  SystemEvent{.system_id = 1U, .event_id = 2U, .state_revision = 7U, .value = payload(32768U)},
@@ -421,11 +421,16 @@ TEST_CASE("complete server records preserve exact 64 KiB neighboring extents", "
             const auto text_size = 32768U + target - expected.size();
             // Both text lengths retain the same canonical CBOR length-head width.
             REQUIRE(text_size <= 65535U);
-            std::visit([&]<class Record>(Record& record) {
-                if constexpr (std::is_same_v<Record, SystemEvent>) record.value = payload(text_size);
-                else if constexpr (std::is_same_v<Record, Bootstrap>) record.snapshots.front().value = payload(text_size);
-                else if constexpr (std::is_same_v<Record, IntentReply>) record.result = payload(text_size);
-            }, source);
+            std::visit(
+                [&]<class Record>(Record& record) {
+                    if constexpr (std::is_same_v<Record, SystemEvent>)
+                        record.value = payload(text_size);
+                    else if constexpr (std::is_same_v<Record, Bootstrap>)
+                        record.snapshots.front().value = payload(text_size);
+                    else if constexpr (std::is_same_v<Record, IntentReply>)
+                        record.result = payload(text_size);
+                },
+                source);
             REQUIRE(encode_server_record(source, expected));
             REQUIRE(expected.size() == target);
             auto owned = source;

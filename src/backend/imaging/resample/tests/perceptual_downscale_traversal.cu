@@ -11,8 +11,7 @@ __global__ void traversal_kernel(RgbConstImageView source, std::uint32_t width, 
     auto& transfer = *reinterpret_cast<TransferTable*>(table_storage);
     transfer.linear[threadIdx.x] = decode(float(threadIdx.x) * (1.0F / 255.0F));
     __syncthreads();
-    for (std::size_t i = blockIdx.x * std::size_t(blockDim.x) + threadIdx.x; i < std::size_t(width) * height;
-         i += std::size_t(blockDim.x) * gridDim.x) {
+    for (std::size_t i = blockIdx.x * std::size_t(blockDim.x) + threadIdx.x; i < std::size_t(width) * height; i += std::size_t(blockDim.x) * gridDim.x) {
         const auto fx = footprint(source.layout.width, width, static_cast<std::uint32_t>(i % width));
         const auto fy = footprint(source.layout.height, height, static_cast<std::uint32_t>(i / width));
         MomentAccumulator retained, serial;

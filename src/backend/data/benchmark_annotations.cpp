@@ -637,7 +637,8 @@ void rasterize_coco_polygons(const std::vector<std::vector<double>>& polygons, c
         }
     }
 }
-[[nodiscard]] std::vector<RLEPair> encode_segmentation(const ParsedAnnotation::Segmentation& segmentation, const ParsedImage& image, SegmentationScratch& scratch) {
+[[nodiscard]] std::vector<RLEPair> encode_segmentation(const ParsedAnnotation::Segmentation& segmentation, const ParsedImage& image,
+                                                       SegmentationScratch& scratch) {
     if (segmentation.polygons.empty() && segmentation.counts.empty() && segmentation.compressed_counts.empty()) { return {}; }
     const dataset::MaskDimensions dimensions{image.width, image.height};
     if (!segmentation.polygons.empty()) {
@@ -771,8 +772,9 @@ void rasterize_coco_polygons(const std::vector<std::vector<double>>& polygons, c
                           {"duplicates", index.rejected.duplicate_boxes}};
 }
 void compact_annotations(NormalizedAnnotationIndex* index, const std::vector<ParsedImage>& parsed_images, const std::vector<std::uint64_t>& offsets,
-                         const std::span<const std::uint64_t> accepted_ends, std::vector<NormalizedBox> boxes, std::optional<std::vector<std::vector<RLEPair>>> masks,
-                         const bool keep_empty, mmltk::common::concurrency::CancellationObservation cancel_requested) {
+                         const std::span<const std::uint64_t> accepted_ends, std::vector<NormalizedBox> boxes,
+                         std::optional<std::vector<std::vector<RLEPair>>> masks, const bool keep_empty,
+                         mmltk::common::concurrency::CancellationObservation cancel_requested) {
     if (offsets.size() != parsed_images.size() + 1U || accepted_ends.size() != parsed_images.size())
         throw std::runtime_error("accepted annotation image ranges are inconsistent");
     const auto accepted_range = [&](std::size_t image_index) {

@@ -184,15 +184,14 @@ TEST_CASE("CUDA perceptual serial traversal retains every accumulator bit", "[ba
     cudaDeviceProp properties{};
     cuda_check(cudaGetDeviceProperties(&properties, 0));
     INFO("CUDA device 0: " << properties.name << " CC " << properties.major << "." << properties.minor);
-    constexpr std::array cases{
-        std::array{1U, 19U, 1U, 7U}, std::array{19U, 1U, 7U, 1U}, std::array{17U, 13U, 7U, 5U},
-        std::array{32U, 24U, 8U, 6U}, std::array{14U, 14U, 2U, 2U}, std::array{15U, 14U, 2U, 2U},
-        std::array{16U, 16U, 2U, 2U}, std::array{257U, 5U, 19U, 3U}, std::array{67U, 61U, 1U, 1U}};
+    constexpr std::array cases{std::array{1U, 19U, 1U, 7U},  std::array{19U, 1U, 7U, 1U},   std::array{17U, 13U, 7U, 5U},
+                               std::array{32U, 24U, 8U, 6U}, std::array{14U, 14U, 2U, 2U},  std::array{15U, 14U, 2U, 2U},
+                               std::array{16U, 16U, 2U, 2U}, std::array{257U, 5U, 19U, 3U}, std::array{67U, 61U, 1U, 1U}};
     for (auto format : formats)
         for (const auto& dims : cases)
             for (unsigned pattern : {0U, 5U, 6U, 7U}) {
-                INFO("format " << static_cast<int>(format) << " source " << dims[0] << "x" << dims[1]
-                               << " destination " << dims[2] << "x" << dims[3] << " pattern " << pattern);
+                INFO("format " << static_cast<int>(format) << " source " << dims[0] << "x" << dims[1] << " destination " << dims[2] << "x" << dims[3]
+                               << " pattern " << pattern);
                 // Offset subview retains padded rows and independent plane slices.
                 Image source(dims[0] + 2, dims[1] + 2, format, 7);
                 source.fill(pattern);
@@ -229,10 +228,9 @@ TEST_CASE("CUDA perceptual allocation-local preparation matches fresh owners", "
     if (!has_cuda()) SKIP("CUDA unavailable; preparation reuse acceptance is not established");
     CudaFixture fixture(2);
     GpuPerceptualDownscaler retained(*fixture.context_owner, fixture.retirement);
-    constexpr std::array sequence{RgbPixelFormat::PlanarUnitSrgbF32, RgbPixelFormat::RGB8, RgbPixelFormat::RGBA8,
-                                  RgbPixelFormat::PlanarUnitSrgbF32, RgbPixelFormat::RGB8};
-    for (const auto& dims : {std::array{19U, 15U, 9U, 7U}, std::array{19U, 15U, 9U, 7U},
-                            std::array{7U, 5U, 3U, 2U}, std::array{129U, 127U, 65U, 63U}}) {
+    constexpr std::array sequence{RgbPixelFormat::PlanarUnitSrgbF32, RgbPixelFormat::RGB8, RgbPixelFormat::RGBA8, RgbPixelFormat::PlanarUnitSrgbF32,
+                                  RgbPixelFormat::RGB8};
+    for (const auto& dims : {std::array{19U, 15U, 9U, 7U}, std::array{19U, 15U, 9U, 7U}, std::array{7U, 5U, 3U, 2U}, std::array{129U, 127U, 65U, 63U}}) {
         struct PreparedCase {
             Image source;
             std::shared_ptr<DeviceImage> input, output, expected;

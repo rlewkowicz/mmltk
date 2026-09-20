@@ -7,8 +7,8 @@
 namespace mmltk::backend::imaging::upscale::tests {
 namespace {
 namespace device = image_upscaler_nis::device;
-using image_upscaler_nis::Configuration;
 using device::HalfRgba;
+using image_upscaler_nis::Configuration;
 __device__ __constant__ const device::DeviceCoefficientTable kReferenceUsm = image_upscaler_nis::coefficients::make_usm();
 __device__ std::uint32_t reference_phase(float coordinate) {
     const float fraction = coordinate - floorf(coordinate);
@@ -24,8 +24,8 @@ __global__ void fixture_pixels(HalfRgba* scaled, Configuration config, unsigned 
     if (pattern == 2U) value = static_cast<float>((x * 31U + y * 17U) % 1024U) / 1024.0F + 1.0F / 4096.0F;
     if (pattern == 3U) value = static_cast<float>((x + y) % 32U) / 32.0F;
     if (pattern == 4U) value = static_cast<float>((x % 2U == 0U ? y * 19U : x * 43U) % 256U) / 255.0F;
-    scaled[index] = HalfRgba{__float2half_rn(value), __float2half_rn(pattern == 0U ? value : 1.0F - value),
-                             __float2half_rn(value * 0.75F), __float2half_rn(0.25F)};
+    scaled[index] =
+        HalfRgba{__float2half_rn(value), __float2half_rn(pattern == 0U ? value : 1.0F - value), __float2half_rn(value * 0.75F), __float2half_rn(0.25F)};
 }
 // Independent numerical oracle: the reviewed six-tap chains are both
 // evaluated before gradient selection. Do not share production sharpening.
@@ -46,8 +46,8 @@ __device__ __forceinline__ HalfRgba load_clamped(const HalfRgba* pixels, const C
     const std::uint32_t clamped_y = static_cast<std::uint32_t>(max(0, min(static_cast<int>(config.output_height) - 1, y)));
     return pixels[static_cast<std::size_t>(clamped_y) * config.output_width + clamped_x];
 }
-__global__ void dual_direction_kernel(const void* source, const std::size_t source_pitch, const HalfRgba* scaled, std::uint8_t* target, const std::size_t target_pitch,
-                               const Configuration config) {
+__global__ void dual_direction_kernel(const void* source, const std::size_t source_pitch, const HalfRgba* scaled, std::uint8_t* target,
+                                      const std::size_t target_pitch, const Configuration config) {
     const std::uint64_t index = static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     const std::uint64_t total = static_cast<std::uint64_t>(config.output_width) * config.output_height;
     if (index >= total) return;
@@ -96,11 +96,11 @@ __global__ void dual_direction_kernel(const void* source, const std::size_t sour
     output[3] = source_alpha_byte(source, source_pitch, config, x, y);
 }
 }  // namespace
-cudaError_t sharpen_reference(const void* source, std::size_t source_pitch, const void* scaled, std::uint8_t* target,
-                              std::size_t target_pitch, const image_upscaler_nis::Configuration& config, cudaStream_t stream) {
+cudaError_t sharpen_reference(const void* source, std::size_t source_pitch, const void* scaled, std::uint8_t* target, std::size_t target_pitch,
+                              const image_upscaler_nis::Configuration& config, cudaStream_t stream) {
     const std::uint64_t count = static_cast<std::uint64_t>(config.output_width) * config.output_height;
-    dual_direction_kernel<<<static_cast<unsigned int>((count + 255U) / 256U), 256U, 0U, stream>>>(
-        source, source_pitch, static_cast<const HalfRgba*>(scaled), target, target_pitch, config);
+    dual_direction_kernel<<<static_cast<unsigned int>((count + 255U) / 256U), 256U, 0U, stream>>>(source, source_pitch, static_cast<const HalfRgba*>(scaled),
+                                                                                                  target, target_pitch, config);
     return cudaPeekAtLastError();
 }
 std::size_t scaled_pixel_bytes() noexcept { return sizeof(HalfRgba); }

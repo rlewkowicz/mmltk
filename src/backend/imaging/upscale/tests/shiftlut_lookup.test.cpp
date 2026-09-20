@@ -228,8 +228,8 @@ TEST_CASE("Direct neural tile preparation preserves FP32 lookup decisions and pi
     const auto crop_height = height - crop_y;
     const auto origin = crop_width > 192 ? 192U : 0U;
     const tiles::Tile tile{.origin_x = origin, .origin_y = 0, .core_width = std::min(192U, crop_width - origin), .core_height = crop_height};
-    tiles::prepare_tile(device_source.as<std::uint8_t>(), pitch, width, height, crop_x, crop_y, crop_width, crop_height, tile, lut, halo, device_tile.as<float>(),
-                        stream.get());
+    tiles::prepare_tile(device_source.as<std::uint8_t>(), pitch, width, height, crop_x, crop_y, crop_width, crop_height, tile, lut, halo,
+                        device_tile.as<float>(), stream.get());
     REQUIRE(cudaStreamSynchronize(stream.get()) == cudaSuccess);
     std::vector<float> actual(3U * 256U * 256U);
     REQUIRE(cudaMemcpy(actual.data(), device_tile.as<void>(), actual.size() * sizeof(float), cudaMemcpyDeviceToHost) == cudaSuccess);

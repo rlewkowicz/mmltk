@@ -393,8 +393,7 @@ __global__ void draw_manual_mask_runs_rgba_pitched_kernel(const draw_launch::Man
     // Flatten only the clipped rectangle. Clamping each endpoint also removes
     // a horizontally missed endpoint row without visiting any of its pixels.
     const auto first = min(max(start, first_row_left), first_row_left + clipped_width) - first_row_left;
-    const auto last = (last_row - first_row - 1U) * clipped_width +
-                      (min(max(end, last_row_left), last_row_left + clipped_width) - last_row_left);
+    const auto last = (last_row - first_row - 1U) * clipped_width + (min(max(end, last_row_left), last_row_left + clipped_width) - last_row_left);
     if (first >= last) return;
     for (auto pixel = first + threadIdx.x; pixel < last; pixel += blockDim.x) {
         const int x = left + static_cast<int>(pixel % clipped_width), y = static_cast<int>(first_row + pixel / clipped_width);

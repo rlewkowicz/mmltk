@@ -1171,10 +1171,7 @@ pub(crate) fn retained_surface() -> Option<Surface> {
 
 #[derive(Clone)]
 pub(crate) enum ExploreDisplay {
-    Gallery(
-        Surface,
-        std::sync::Arc<super::labels::GalleryContent>,
-    ),
+    Gallery(Surface, std::sync::Arc<super::labels::GalleryContent>),
     Detail(Surface, DetailContent),
 }
 
@@ -1390,12 +1387,18 @@ impl DetailContent {
         explore: std::sync::Arc<crate::generated::ExploreImageMetadata>,
         upscale: Option<std::sync::Arc<crate::generated::UpscaleImageMetadata>>,
     ) -> Self {
-        let scene = upscale.as_ref().map_or(&explore.scene, |value| &value.scene);
+        let scene = upscale
+            .as_ref()
+            .map_or(&explore.scene, |value| &value.scene);
         let labels = std::sync::Arc::new(super::labels::CategoryCaptions::new(
             &scene.categories,
             scene.objects.iter().map(|object| object.category),
         ));
-        Self { explore, upscale, labels }
+        Self {
+            explore,
+            upscale,
+            labels,
+        }
     }
 
     pub(crate) fn configure_surface(
@@ -2260,7 +2263,9 @@ pub(crate) fn reconcile_completed(surface: Surface, model: &crate::view_model::A
         let queue = renderer.queue.clone();
         let placement = gallery::matching(Some(frame))
             .as_ref()
-            .map_or(Placement::Contain, |snapshot| gallery::placement(&snapshot.metadata));
+            .map_or(Placement::Contain, |snapshot| {
+                gallery::placement(&snapshot.metadata)
+            });
         renderer.reconcile_sample(&device, &queue, surface, placement);
         for imported in [&mut renderer.imported, &mut renderer.pending]
             .into_iter()
@@ -2570,7 +2575,10 @@ impl Imported {
                 "",
                 self.image.surface,
                 self.image.surface,
-                self.image.content.gallery().map(|value| value.metadata.as_ref()),
+                self.image
+                    .content
+                    .gallery()
+                    .map(|value| value.metadata.as_ref()),
                 None,
                 0,
             );
@@ -2602,7 +2610,10 @@ impl Imported {
                 "",
                 sample.surface,
                 self.image.surface,
-                sample.content.gallery().map(|value| value.metadata.as_ref()),
+                sample
+                    .content
+                    .gallery()
+                    .map(|value| value.metadata.as_ref()),
                 None,
                 0,
             );
@@ -3228,9 +3239,10 @@ mod tests {
             assert!(state.detail_original(&old));
             state.settle_detail(true);
             logical.detail.showoriginaldimensions = true;
-            let paired = DetailContent::new(std::sync::Arc::new(crate::generated::ExploreImageMetadata::from(
-                    &logical,
-                )), None);
+            let paired = DetailContent::new(
+                std::sync::Arc::new(crate::generated::ExploreImageMetadata::from(&logical)),
+                None,
+            );
             if logical_first {
                 state.rebase(Some(&logical), false);
             }
@@ -3242,13 +3254,16 @@ mod tests {
             assert!(state.detail_original(&paired));
             let mut output = old.frame().clone();
             output.source.kind = crate::generated::PresentationSourceKind::Upscale;
-            let upscale = DetailContent::new(captured.clone(), Some(std::sync::Arc::new(
+            let upscale = DetailContent::new(
+                captured.clone(),
+                Some(std::sync::Arc::new(
                     crate::generated::UpscaleImageMetadata {
                         frame: output,
                         input: old.frame().clone(),
                         scene: captured.scene.clone(),
                     },
-                )));
+                )),
+            );
             assert!(!upscale.original_dimensions());
             assert!(state.detail_original(&upscale));
             assert!(!captured.detail.showoriginaldimensions);

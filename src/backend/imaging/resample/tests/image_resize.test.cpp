@@ -381,7 +381,7 @@ TEST_CASE("resize geometry explicitly chooses stretch or rounded letterbox", "[b
 }
 namespace {
 void check_compiler_projection(RgbImageResizer& resizer, const std::vector<std::uint8_t>& source, std::uint32_t width, std::uint32_t height,
-                                std::uint32_t target_width, std::uint32_t target_height, ImageResizeMode mode) {
+                               std::uint32_t target_width, std::uint32_t target_height, ImageResizeMode mode) {
     const auto geometry = compute_image_resize_geometry(width, height, target_width, target_height, mode);
     std::vector<std::uint8_t> bytes(std::size_t(geometry.resized_width) * geometry.resized_height * 3U);
     resizer.resize(source.data(), static_cast<int>(width), static_cast<int>(height), bytes.data(), static_cast<int>(geometry.resized_width),
@@ -389,24 +389,36 @@ void check_compiler_projection(RgbImageResizer& resizer, const std::vector<std::
     const auto plane = std::size_t(target_width) * target_height;
     std::vector<float> expected(plane * 3U + 8U, -17.0F), actual(expected);
     letterboxed_rgb_hwc_u8_to_nchw_f32(bytes.data(), expected.data(), geometry.resized_width, geometry.resized_height, target_width, target_height,
-                                      geometry.offset_x, geometry.offset_y);
+                                       geometry.offset_x, geometry.offset_y);
     resizer.resize_to_planar({source.data(), {width, height, std::size_t(width) * 3U, 0U, source.size(), RgbPixelFormat::RGB8}},
-                             {actual.data(), {target_width, target_height, std::size_t(target_width) * sizeof(float), plane * sizeof(float),
-                                              plane * 3U * sizeof(float), RgbPixelFormat::PlanarUnitSrgbF32}}, mode);
+                             {actual.data(),
+                              {target_width, target_height, std::size_t(target_width) * sizeof(float), plane * sizeof(float), plane * 3U * sizeof(float),
+                               RgbPixelFormat::PlanarUnitSrgbF32}},
+                             mode);
     REQUIRE(std::memcmp(actual.data(), expected.data(), expected.size() * sizeof(float)) == 0);
 }
 }  // namespace
 TEST_CASE("compiler planar projection preserves every quantized RGB8 bit", "[backend][data][image_resize][perceptual]") {
-    constexpr std::array<std::array<std::uint32_t, 4>, 13> sizes{{
-        {32, 18, 16, 9}, {34, 18, 17, 9}, {16, 10, 8, 5}, {14, 10, 7, 5}, {17, 13, 9, 7}, {17, 13, 17, 5}, {17, 13, 7, 13},
-        {17, 13, 1, 1}, {1, 17, 1, 7}, {31, 3, 9, 11}, {17, 13, 17, 13}, {17, 13, 23, 19}, {17, 13, 9, 19}}};
+    constexpr std::array<std::array<std::uint32_t, 4>, 13> sizes{{{32, 18, 16, 9},
+                                                                  {34, 18, 17, 9},
+                                                                  {16, 10, 8, 5},
+                                                                  {14, 10, 7, 5},
+                                                                  {17, 13, 9, 7},
+                                                                  {17, 13, 17, 5},
+                                                                  {17, 13, 7, 13},
+                                                                  {17, 13, 1, 1},
+                                                                  {1, 17, 1, 7},
+                                                                  {31, 3, 9, 11},
+                                                                  {17, 13, 17, 13},
+                                                                  {17, 13, 23, 19},
+                                                                  {17, 13, 9, 19}}};
     for (const bool enabled : {false, true}) {
         RgbImageResizer resizer(1, enabled);
         for (const auto& dims : sizes)
             for (const auto mode : {ImageResizeMode::Stretch, ImageResizeMode::Letterbox})
                 for (unsigned pattern = 0U; pattern < 4U; ++pattern) {
-                    INFO("enabled " << enabled << " source " << dims[0] << "x" << dims[1] << " target " << dims[2] << "x" << dims[3]
-                                     << " mode " << static_cast<int>(mode) << " pattern " << pattern);
+                    INFO("enabled " << enabled << " source " << dims[0] << "x" << dims[1] << " target " << dims[2] << "x" << dims[3] << " mode "
+                                    << static_cast<int>(mode) << " pattern " << pattern);
                     auto source = make_test_image(static_cast<int>(dims[0]), static_cast<int>(dims[1]));
                     std::uint32_t random = 0x792719U;
                     for (std::size_t i = 0; i < source.size(); ++i) {

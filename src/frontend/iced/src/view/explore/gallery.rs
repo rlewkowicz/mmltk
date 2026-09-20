@@ -164,7 +164,9 @@ fn local_gestures(
         hover
             .capture(
                 current.as_ref(),
-                shown.as_ref().map(|(_, snapshot)| snapshot.metadata.as_ref()),
+                shown
+                    .as_ref()
+                    .map(|(_, snapshot)| snapshot.metadata.as_ref()),
                 gesture,
                 focus_ready,
             )
@@ -370,7 +372,9 @@ fn gallery_viewport<'a>(
 ) -> Element<'a, Message> {
     let width = size.width.max(1.0);
     let height = size.height.max(1.0);
-    let presented = displayed.as_ref().map(|(_, snapshot)| snapshot.metadata.as_ref());
+    let presented = displayed
+        .as_ref()
+        .map(|(_, snapshot)| snapshot.metadata.as_ref());
     let matching = presented.map_or(0, |value| value.order.matchingcount);
     let first_row = presented.map_or(0, |value| value.viewport.firstrow);
     let display_columns = presented.map_or(columns, |value| value.viewport.columns);

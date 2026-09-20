@@ -647,8 +647,8 @@ TEST_CASE("direct host retains nested event bytes after publisher ownership ends
             .event_id = 2U,
             .delivery = contracts::reflection::EventDelivery::Critical,
             .state_revision = size + 1U,
-            .value = wire::Value(wire::Value::Object{{"nested", wire::Value(wire::Value::Array{
-                wire::Value(std::string(size, 'x')), wire::Value(wire::ByteBuffer(size, std::byte{0xa5}))})}}),
+            .value = wire::Value(wire::Value::Object{
+                {"nested", wire::Value(wire::Value::Array{wire::Value(std::string(size, 'x')), wire::Value(wire::ByteBuffer(size, std::byte{0xa5}))})}}),
         };
         wire::ByteBuffer expected;
         REQUIRE(encode_server_record(ServerRecord{event}, expected));
@@ -665,11 +665,10 @@ TEST_CASE("direct host queues exact 64 KiB neighboring records with retired publ
     REQUIRE(peer.receive());
     for (const std::size_t target : {65535U, 65536U, 65537U}) {
         const auto payload = [](std::size_t text_size) {
-            return wire::Value(wire::Value::Array{wire::Value(std::string(text_size, 'x')),
-                                                 wire::Value(wire::ByteBuffer(31U, std::byte{0xa5}))});
+            return wire::Value(wire::Value::Array{wire::Value(std::string(text_size, 'x')), wire::Value(wire::ByteBuffer(31U, std::byte{0xa5}))});
         };
-        SystemEvent event{.system_id = 1U, .event_id = 2U, .delivery = contracts::reflection::EventDelivery::Critical,
-                          .state_revision = 7U, .value = payload(32768U)};
+        SystemEvent event{
+            .system_id = 1U, .event_id = 2U, .delivery = contracts::reflection::EventDelivery::Critical, .state_revision = 7U, .value = payload(32768U)};
         wire::ByteBuffer expected;
         REQUIRE(encode_server_record(ServerRecord{event}, expected));
         REQUIRE(expected.size() < target);

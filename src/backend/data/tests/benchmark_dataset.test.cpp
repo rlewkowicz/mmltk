@@ -124,7 +124,8 @@ class HttpServer {
    public:
     explicit HttpServer(std::span<const std::uint8_t> payload) : HttpServer(payload, payload.size()) {}
     explicit HttpServer(std::size_t generated_bytes) : HttpServer({}, generated_bytes) {}
-    HttpServer(std::span<const std::uint8_t> payload, std::size_t bytes) : payload_(payload), payload_size_(bytes), listener_(::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0)) {
+    HttpServer(std::span<const std::uint8_t> payload, std::size_t bytes)
+        : payload_(payload), payload_size_(bytes), listener_(::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0)) {
         require_condition(listener_.get() >= 0, "failed to create benchmark HTTP socket");
         const int reuse = 1;
         require_condition(::setsockopt(listener_.get(), SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse)) == 0, "failed to configure benchmark HTTP socket");
@@ -260,10 +261,7 @@ class HttpServer {
         std::string header = std::string(ranged ? "HTTP/1.1 206 Partial Content\r\n" : "HTTP/1.1 200 OK\r\n") + "Content-Length: " + std::to_string(bytes) +
                              "\r\nAccept-Ranges: bytes\r\nETag: \"benchmark-test-etag\"\r\n"
                              "Last-Modified: Thu, 23 Jul 2026 12:00:00 GMT\r\n";
-        if (ranged) {
-            header +=
-                "Content-Range: bytes " + std::to_string(begin) + "-" + std::to_string(end) + "/" + std::to_string(payload_size_) + "\r\n";
-        }
+        if (ranged) { header += "Content-Range: bytes " + std::to_string(begin) + "-" + std::to_string(end) + "/" + std::to_string(payload_size_) + "\r\n"; }
         header += "Connection: close\r\n\r\n";
         if (!send_all(client, header.data(), header.size())) { return; }
         constexpr std::size_t chunk = std::size_t{16U} * 1024U;
@@ -1308,7 +1306,6 @@ TEST_CASE("segmented downloads retain durable ranges through failure cancellatio
     const auto first_ranges = server.ranges();
     REQUIRE(std::ranges::find(first_ranges, std::pair<std::size_t, std::size_t>{0U, bytes / 2U - 1U}) != first_ranges.end());
     REQUIRE(std::ranges::find(first_ranges, std::pair<std::size_t, std::size_t>{bytes / 2U, bytes - 1U}) != first_ranges.end());
-
     // The fixture gates physical response bytes, independently of progress callbacks.
     std::atomic<bool> cancel{false};
     server.GateNextTransfer();
@@ -1329,7 +1326,6 @@ TEST_CASE("segmented downloads retain durable ranges through failure cancellatio
     REQUIRE(fs::file_size(request.destination.string() + ".part") == bytes);
     REQUIRE(read_json_file(metadata_path).at("mode") == "segmented");
     server.ReleasePartial();
-
     request.maximum_attempts = 3U;
     server.TruncateNextTransfer();
     std::atomic<bool> traced_retry{false}, traced_complete{false};
@@ -1350,8 +1346,7 @@ TEST_CASE("segmented downloads retain durable ranges through failure cancellatio
     bool exact = true;
     for (std::size_t offset = 0U; offset < bytes; offset += block.size()) {
         file.pread_all(block.data(), block.size(), offset);
-        for (std::size_t i = 0U; i < block.size(); ++i)
-            exact &= block[i] == static_cast<std::uint8_t>(((offset + i) * 131U + 17U) & 0xFFU);
+        for (std::size_t i = 0U; i < block.size(); ++i) exact &= block[i] == static_cast<std::uint8_t>(((offset + i) * 131U + 17U) & 0xFFU);
     }
     CHECK(exact);
     server.Check();
@@ -1418,10 +1413,12 @@ TEST_CASE("transfer observers are independent of trace-only pixel observers", "[
 TEST_CASE("parser workers reset segmentation scratch across masks rejections and dimension changes", "[backend][data][benchmark][annotations]") {
     mmltk::testsupport::ScopedTempDir root("segmentation-scratch");
     const auto path = root.path() / "annotations.json";
-    nlohmann::json document{{"images", {{{"id", 1}, {"width", 16}, {"height", 8}, {"file_name", "patch0/1.jpg"}},
-                                      {{"id", 2}, {"width", 4}, {"height", 4}, {"file_name", "patch0/2.jpg"}},
-                                      {{"id", 3}, {"width", 4}, {"height", 4}, {"file_name", "patch0/3.jpg"}}}},
-                            {"categories", {{{"id", 1}, {"name", "person"}}}}, {"annotations", nlohmann::json::array()}};
+    nlohmann::json document{{"images",
+                             {{{"id", 1}, {"width", 16}, {"height", 8}, {"file_name", "patch0/1.jpg"}},
+                              {{"id", 2}, {"width", 4}, {"height", 4}, {"file_name", "patch0/2.jpg"}},
+                              {{"id", 3}, {"width", 4}, {"height", 4}, {"file_name", "patch0/3.jpg"}}}},
+                            {"categories", {{{"id", 1}, {"name", "person"}}}},
+                            {"annotations", nlohmann::json::array()}};
     for (unsigned cycle = 0U; cycle < 256U; ++cycle)
         for (unsigned kind = 0U; kind < 7U; ++kind) {
             const bool small = (cycle + kind) % 2U != 0U;

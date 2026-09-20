@@ -212,9 +212,8 @@ ImageResizeGeometry RgbImageResizer::resize_to_planar(RgbConstImageView source, 
     const auto destination_bytes = perceptual::validate_view(destination.data, destination.layout);
     const auto& input = source.layout;
     const auto& output = destination.layout;
-    if (input.format != RgbPixelFormat::RGB8 || output.format != RgbPixelFormat::PlanarUnitSrgbF32 ||
-        input.row_stride_bytes != std::size_t(input.width) * 3U || output.row_stride_bytes != std::size_t(output.width) * sizeof(float) ||
-        output.plane_stride_bytes != output.row_stride_bytes * output.height)
+    if (input.format != RgbPixelFormat::RGB8 || output.format != RgbPixelFormat::PlanarUnitSrgbF32 || input.row_stride_bytes != std::size_t(input.width) * 3U ||
+        output.row_stride_bytes != std::size_t(output.width) * sizeof(float) || output.plane_stride_bytes != output.row_stride_bytes * output.height)
         throw std::invalid_argument("compiler resize requires packed RGB8 and contiguous planar float storage");
     const auto a = reinterpret_cast<std::uintptr_t>(source.data), b = reinterpret_cast<std::uintptr_t>(destination.data);
     if (a < b + destination_bytes && b < a + source_bytes) throw std::invalid_argument("compiler resize input/output storage overlaps");
@@ -235,8 +234,8 @@ ImageResizeGeometry RgbImageResizer::resize_to_planar(RgbConstImageView source, 
         if (!impl_->perceptual) impl_->perceptual = std::make_unique<perceptual::CpuDownscaler>();
         impl_->perceptual->run_quantized_planar(source, content);
         for (unsigned plane = 0; plane < 3; ++plane)
-            clear_letterbox_padding(pixels + plane * (output.plane_stride_bytes / sizeof(float)), output.width, output.height,
-                                    geometry.resized_width, geometry.resized_height, geometry.offset_x, geometry.offset_y);
+            clear_letterbox_padding(pixels + plane * (output.plane_stride_bytes / sizeof(float)), output.width, output.height, geometry.resized_width,
+                                    geometry.resized_height, geometry.offset_x, geometry.offset_y);
         return geometry;
     }
     const auto* bytes = static_cast<const std::uint8_t*>(source.data);
@@ -249,8 +248,8 @@ ImageResizeGeometry RgbImageResizer::resize_to_planar(RgbConstImageView source, 
     if (geometry.resized_width == output.width && geometry.resized_height == output.height)
         rgb_hwc_u8_to_nchw_f32(bytes, pixels, output.width, output.height);
     else
-        letterboxed_rgb_hwc_u8_to_nchw_f32(bytes, pixels, geometry.resized_width, geometry.resized_height, output.width, output.height,
-                                          geometry.offset_x, geometry.offset_y);
+        letterboxed_rgb_hwc_u8_to_nchw_f32(bytes, pixels, geometry.resized_width, geometry.resized_height, output.width, output.height, geometry.offset_x,
+                                           geometry.offset_y);
     return geometry;
 }
 void RgbImageResizer::downscale(RgbConstImageView source, RgbMutableImageView destination) {

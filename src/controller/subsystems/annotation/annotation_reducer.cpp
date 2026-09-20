@@ -92,8 +92,14 @@ struct JournalView final {
     bool reverse = false;
     const AnnotationEditorFacts& before;
     [[nodiscard]] const AnnotationEditorFacts& after() const { return reverse ? entry.before : entry.after; }
-    template <class T> [[nodiscard]] const T& Before(const T& first, const T& second) const { return reverse ? second : first; }
-    template <class T> [[nodiscard]] const T& After(const T& first, const T& second) const { return reverse ? first : second; }
+    template <class T>
+    [[nodiscard]] const T& Before(const T& first, const T& second) const {
+        return reverse ? second : first;
+    }
+    template <class T>
+    [[nodiscard]] const T& After(const T& first, const T& second) const {
+        return reverse ? first : second;
+    }
 };
 struct DocumentState final {
     domain::AnnotationUiState ui{};
@@ -144,11 +150,14 @@ struct ObjectAfterView final {
     const AnnotationSceneContent& scene;
     const JournalView* entry = nullptr;
     [[nodiscard]] std::size_t size() const {
-        if (const auto* objects = entry ? std::get_if<JournalEntry::Objects>(&entry->entry.mutation) : nullptr) return entry->After(objects->before, objects->after).size();
+        if (const auto* objects = entry ? std::get_if<JournalEntry::Objects>(&entry->entry.mutation) : nullptr)
+            return entry->After(objects->before, objects->after).size();
         const auto* mutation = entry ? std::get_if<JournalEntry::Object>(&entry->entry.mutation) : nullptr;
         if (!mutation) return scene.objects.size();
-        if (!entry->Before(mutation->before_present, mutation->after_present) && entry->After(mutation->before_present, mutation->after_present)) return scene.objects.size() + 1U;
-        if (entry->Before(mutation->before_present, mutation->after_present) && !entry->After(mutation->before_present, mutation->after_present)) return scene.objects.size() - 1U;
+        if (!entry->Before(mutation->before_present, mutation->after_present) && entry->After(mutation->before_present, mutation->after_present))
+            return scene.objects.size() + 1U;
+        if (entry->Before(mutation->before_present, mutation->after_present) && !entry->After(mutation->before_present, mutation->after_present))
+            return scene.objects.size() - 1U;
         return scene.objects.size();
     }
     [[nodiscard]] const domain::AnnotationObject* at(const std::size_t index) const {
@@ -197,8 +206,14 @@ struct ObjectAfterView final {
     ObjectAfterView objects{.scene = scene, .entry = entry};
     if (facts.selected_object && *facts.selected_object >= objects.size()) return false;
     const auto* category = entry ? std::get_if<JournalEntry::Category>(&entry->entry.mutation) : nullptr;
-    const std::size_t category_count = scene.categories.size() + ((category && !entry->Before(category->before_present, category->after_present) && entry->After(category->before_present, category->after_present)) ? 1U : 0U) -
-                                       ((category && entry->Before(category->before_present, category->after_present) && !entry->After(category->before_present, category->after_present)) ? 1U : 0U);
+    const std::size_t category_count =
+        scene.categories.size() +
+        ((category && !entry->Before(category->before_present, category->after_present) && entry->After(category->before_present, category->after_present))
+             ? 1U
+             : 0U) -
+        ((category && entry->Before(category->before_present, category->after_present) && !entry->After(category->before_present, category->after_present))
+             ? 1U
+             : 0U);
     if (facts.selected_category && *facts.selected_category >= category_count) return false;
     if (facts.selected_spline_segment) {
         if (!facts.selected_object) return false;
@@ -226,63 +241,72 @@ struct ObjectAfterView final {
                 return true;
             } else if constexpr (std::same_as<Mutation, JournalEntry::Object>) {
                 if (entry.Before(mutation.before_present, mutation.after_present) == entry.After(mutation.before_present, mutation.after_present)) {
-                    if (!entry.Before(mutation.before_present, mutation.after_present) || mutation.index >= scene.objects.size() || scene.objects[mutation.index] != entry.Before(mutation.before, mutation.after)) return false;
+                    if (!entry.Before(mutation.before_present, mutation.after_present) || mutation.index >= scene.objects.size() ||
+                        scene.objects[mutation.index] != entry.Before(mutation.before, mutation.after))
+                        return false;
                 } else if (entry.Before(mutation.before_present, mutation.after_present)) {
                     if (mutation.index >= scene.objects.size() || scene.objects[mutation.index] != entry.Before(mutation.before, mutation.after)) return false;
                 } else if (mutation.index > scene.objects.size()) {
                     return false;
                 }
-                return !entry.After(mutation.before_present, mutation.after_present) || object_valid_for(entry.After(mutation.before, mutation.after), scene.categories.size(), scene);
+                return !entry.After(mutation.before_present, mutation.after_present) ||
+                       object_valid_for(entry.After(mutation.before, mutation.after), scene.categories.size(), scene);
             } else if constexpr (std::same_as<Mutation, JournalEntry::Category>) {
                 if (entry.Before(mutation.before_present, mutation.after_present) == entry.After(mutation.before_present, mutation.after_present)) return false;
                 if (entry.Before(mutation.before_present, mutation.after_present)) {
-                    return !scene.categories.empty() && mutation.index + 1U == scene.categories.size() && scene.categories[mutation.index] == entry.Before(mutation.before, mutation.after);
+                    return !scene.categories.empty() && mutation.index + 1U == scene.categories.size() &&
+                           scene.categories[mutation.index] == entry.Before(mutation.before, mutation.after);
                 }
                 return mutation.index == scene.categories.size() && entry.After(mutation.before, mutation.after).valid();
             } else if constexpr (std::same_as<Mutation, JournalEntry::Objects>) {
                 return entry.Before(mutation.before, mutation.after) == scene.objects;
             } else {
-                return entry.Before(mutation.before_index, mutation.after_index) == scene.frame_index && entry.Before(mutation.before_ready, mutation.after_ready) == scene.frame_ready;
+                return entry.Before(mutation.before_index, mutation.after_index) == scene.frame_index &&
+                       entry.Before(mutation.before_ready, mutation.after_ready) == scene.frame_ready;
             }
         },
         entry.entry.mutation);
     return mutation_valid && facts_valid_for(scene, entry.after(), &entry);
 }
-template <class T> void prepare_append(std::vector<T>& values) {
+template <class T>
+void prepare_append(std::vector<T>& values) {
     static_assert(std::is_nothrow_move_constructible_v<T> && std::is_nothrow_move_assignable_v<T>);
     if (values.size() == values.capacity()) values.reserve(values.size() + std::max(values.size(), std::size_t{1U}));
 }
 [[nodiscard]] JournalEntry prepare_application(DocumentState& state, const JournalView& view, std::vector<domain::AnnotationColor>& palette) {
     JournalEntry prepared{.after = view.after()};
-    std::visit([&](const auto& mutation) {
-        using Mutation = std::remove_cvref_t<decltype(mutation)>;
-        auto& payload = prepared.mutation.emplace<Mutation>();
-        if constexpr (std::same_as<Mutation, JournalEntry::Object>) {
-            payload.index = mutation.index;
-            payload.before_present = view.Before(mutation.before_present, mutation.after_present);
-            payload.after_present = view.After(mutation.before_present, mutation.after_present);
-            if (payload.after_present) {
-                payload.after = view.After(mutation.before, mutation.after);
-                payload.after_identity = view.After(mutation.before_identity, mutation.after_identity);
-                if (!payload.before_present) {
-                    prepare_append(state.ui.scene.objects);
-                    prepare_append(state.identities);
+    std::visit(
+        [&](const auto& mutation) {
+            using Mutation = std::remove_cvref_t<decltype(mutation)>;
+            auto& payload = prepared.mutation.emplace<Mutation>();
+            if constexpr (std::same_as<Mutation, JournalEntry::Object>) {
+                payload.index = mutation.index;
+                payload.before_present = view.Before(mutation.before_present, mutation.after_present);
+                payload.after_present = view.After(mutation.before_present, mutation.after_present);
+                if (payload.after_present) {
+                    payload.after = view.After(mutation.before, mutation.after);
+                    payload.after_identity = view.After(mutation.before_identity, mutation.after_identity);
+                    if (!payload.before_present) {
+                        prepare_append(state.ui.scene.objects);
+                        prepare_append(state.identities);
+                    }
                 }
+            } else if constexpr (std::same_as<Mutation, JournalEntry::Category>) {
+                payload.before_present = view.Before(mutation.before_present, mutation.after_present);
+                payload.after_present = view.After(mutation.before_present, mutation.after_present);
+                payload.after = view.After(mutation.before, mutation.after);
+                if (payload.after_present) prepare_append(state.ui.scene.categories);
+                palette = mmltk::controller::annotation_class_palette(state.ui.scene.categories.size() + (payload.after_present ? 1U : 0U) -
+                                                                      (payload.before_present ? 1U : 0U));
+            } else if constexpr (std::same_as<Mutation, JournalEntry::Objects>) {
+                payload.after = view.After(mutation.before, mutation.after);
+                payload.after_identities = view.After(mutation.before_identities, mutation.after_identities);
+            } else if constexpr (std::same_as<Mutation, JournalEntry::Frame>) {
+                payload.after_index = view.After(mutation.before_index, mutation.after_index);
+                payload.after_ready = view.After(mutation.before_ready, mutation.after_ready);
             }
-        } else if constexpr (std::same_as<Mutation, JournalEntry::Category>) {
-            payload.before_present = view.Before(mutation.before_present, mutation.after_present);
-            payload.after_present = view.After(mutation.before_present, mutation.after_present);
-            payload.after = view.After(mutation.before, mutation.after);
-            if (payload.after_present) prepare_append(state.ui.scene.categories);
-            palette = mmltk::controller::annotation_class_palette(state.ui.scene.categories.size() + (payload.after_present ? 1U : 0U) - (payload.before_present ? 1U : 0U));
-        } else if constexpr (std::same_as<Mutation, JournalEntry::Objects>) {
-            payload.after = view.After(mutation.before, mutation.after);
-            payload.after_identities = view.After(mutation.before_identities, mutation.after_identities);
-        } else if constexpr (std::same_as<Mutation, JournalEntry::Frame>) {
-            payload.after_index = view.After(mutation.before_index, mutation.after_index);
-            payload.after_ready = view.After(mutation.before_ready, mutation.after_ready);
-        }
-    }, view.entry.mutation);
+        },
+        view.entry.mutation);
     return prepared;
 }
 void apply_forward(DocumentState& state, const JournalView& retained, JournalEntry& entry, std::vector<domain::AnnotationColor>& palette) {

@@ -531,7 +531,7 @@ TEST_CASE("Annotation journal moves retain complete payloads and restore stored 
     d::AnnotationDocument editor;
     auto scene = c::test_scene("test://journal-owned-payloads");
     scene.objects = {{.name = domain::AnnotationText::From("attached mask"), .box = {{2, 2}, {24, 24}}, .mask = {.present = true}},
-                     {.name = domain::AnnotationText::From("second"), .box = {{30, 30}, {50, 50}}};
+                     {.name = domain::AnnotationText::From("second"), .box = {{30, 30}, {50, 50}}}};
     for (std::uint16_t row = 0; row != 64U; ++row)
         for (std::uint16_t x = 0; x != 64U; x += 2U) scene.objects[0].mask.runs.push_back({row, x, x});
     REQUIRE(editor.Open(scene).outcome == d::DocumentOutcome::Applied);
@@ -571,8 +571,8 @@ TEST_CASE("Annotation journal moves retain complete payloads and restore stored 
         edit({.value = c::AnnotationSidebarEdit{domain::AnnotationSidebarCommand::Delete}});
         edit({.value = c::AnnotationSceneEdit{}});
         const auto cleared = editor.ui();
-        for (auto action : {domain::AnnotationSetupAction::PreviousFrame, domain::AnnotationSetupAction::NextFrame,
-                           domain::AnnotationSetupAction::ReloadFrame}) {
+        for (auto action :
+             {domain::AnnotationSetupAction::PreviousFrame, domain::AnnotationSetupAction::NextFrame, domain::AnnotationSetupAction::ReloadFrame}) {
             CHECK(editor.Edit({.value = c::AnnotationSetupEdit{action}}).outcome == d::DocumentOutcome::Rejected);
             CHECK(editor.ui() == cleared);
         }
@@ -585,8 +585,7 @@ TEST_CASE("Annotation journal moves retain complete payloads and restore stored 
         const auto change_live_facts = [&] {
             REQUIRE(editor.Edit({.value = c::AnnotationHoldEdit{!editor.ui().editor.hold_save}}).outcome == d::DocumentOutcome::Applied);
             REQUIRE(editor.Edit({.value = c::AnnotationToolEdit{domain::AnnotationTool::Point}}).outcome == d::DocumentOutcome::Applied);
-            if (!editor.ui().scene.objects.empty())
-                REQUIRE(editor.Edit({.value = c::AnnotationObjectEdit{0U}}).outcome == d::DocumentOutcome::Applied);
+            if (!editor.ui().scene.objects.empty()) REQUIRE(editor.Edit({.value = c::AnnotationObjectEdit{0U}}).outcome == d::DocumentOutcome::Applied);
         };
         for (auto entry = history.rbegin(); entry != history.rend(); ++entry) {
             change_live_facts();
@@ -612,7 +611,8 @@ TEST_CASE("Annotation journal moves retain complete payloads and restore stored 
         std::ifstream file{path, std::ios::binary};
         const std::vector<char> characters{std::istreambuf_iterator<char>{file}, std::istreambuf_iterator<char>{}};
         const auto decoded = mmltk::frameworks::serialization::decode<domain::AnnotationUiState>(
-            {.first = std::as_bytes(std::span{characters})}, {.max_bytes = domain::kAnnotationUiStateByteBudget, .max_items = domain::kAnnotationUiStateByteBudget});
+            {.first = std::as_bytes(std::span{characters})},
+            {.max_bytes = domain::kAnnotationUiStateByteBudget, .max_items = domain::kAnnotationUiStateByteBudget});
         REQUIRE(decoded.has_value());
         CHECK(decoded->scene == saved);
         REQUIRE(editor.Edit({.value = c::AnnotationObjectEdit{0U}}).outcome == d::DocumentOutcome::Applied);
@@ -1274,12 +1274,15 @@ TEST_CASE("Native annotation raster retains allocation damage and exact mask-tra
             c::subsystems::annotation::AnnotationDocument history;
             auto packed = c::test_scene("test://packed-membership");
             packed.palette = {{0, 1, 1}};
-            packed.objects = {
-                {.name = c::contracts::AnnotationText::From("first point"), .shape = c::contracts::AnnotationShape::Point,
-                 .point = {20, 8}, .mask = {.runs = {{44U, 10U, 18U}}, .present = true}},
-                {.name = c::contracts::AnnotationText::From("middle point"), .shape = c::contracts::AnnotationShape::Point, .point = {12, 20}},
-                {.name = c::contracts::AnnotationText::From("trailing point"), .shape = c::contracts::AnnotationShape::Point,
-                 .point = {30, 30}, .mask = {.runs = {{48U, 40U, 50U}}, .present = true}}};
+            packed.objects = {{.name = c::contracts::AnnotationText::From("first point"),
+                               .shape = c::contracts::AnnotationShape::Point,
+                               .point = {20, 8},
+                               .mask = {.runs = {{44U, 10U, 18U}}, .present = true}},
+                              {.name = c::contracts::AnnotationText::From("middle point"), .shape = c::contracts::AnnotationShape::Point, .point = {12, 20}},
+                              {.name = c::contracts::AnnotationText::From("trailing point"),
+                               .shape = c::contracts::AnnotationShape::Point,
+                               .point = {30, 30},
+                               .mask = {.runs = {{48U, 40U, 50U}}, .present = true}}};
             REQUIRE(history.Open(packed).outcome == c::subsystems::annotation::DocumentOutcome::Applied);
             REQUIRE(history.Edit({.value = c::AnnotationObjectEdit{2U}}).outcome == c::subsystems::annotation::DocumentOutcome::Applied);
             std::array<c::AnnotationRenderState, 4U> layouts;

@@ -255,7 +255,6 @@ TEST_CASE("test_unencodable_terminal_notifies_without_later_submission", "[model
     test_unencodable_terminal_notifies_without_later_submission();
 }
 TEST_CASE("test_telemetry_distinct_heads_drain_by_sequence", "[model][rfdetr][training][telemetry]") { test_telemetry_distinct_heads_drain_by_sequence(); }
-
 TEST_CASE("telemetry retains complete history JSON through progress epoch and terminal projections", "[model][rfdetr][training][telemetry]") {
     namespace serial = mmltk::frameworks::serialization;
     mmltk::testsupport::ScopedTempDir temp{"mmltk-telemetry-projections"};
@@ -338,8 +337,8 @@ TEST_CASE("telemetry retains complete history JSON through progress epoch and te
     terminal["last_epoch"] = 0;
     terminal["history_size"] = 1U;
     terminal["dataset_max_instances"] = {{"train", 0U}, {"val", 0U}, {"test", nullptr}, {"largest", 0U}};
-    terminal["query_resolution"] = {{"source", ""}, {"resolved", 0U}, {"required", 0U}, {"automatic_query_cap", 0U},
-                                     {"automatic", false}, {"requested_override", false}};
+    terminal["query_resolution"] = {
+        {"source", ""}, {"resolved", 0U}, {"required", 0U}, {"automatic_query_cap", 0U}, {"automatic", false}, {"requested_override", false}};
     terminal["gpu_augmentation"] = serial::reflected_json(run.configuration.gpu_augmentation, scratch, limits);
     terminal["test"] = nullptr;
     CHECK(read_json("results.json") == terminal);

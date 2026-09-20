@@ -49,8 +49,7 @@ TEST_CASE("Basic selected sharpening matches independent dual-direction arithmet
     std::vector<std::uint8_t> source(source_pitch * config.source_height + 31U, 0xD7);
     for (std::uint32_t y = 0U; y < config.source_height; ++y)
         for (std::uint32_t x = 0U; x < config.source_width; ++x)
-            for (std::uint32_t c = 0U; c < 4U; ++c)
-                source[y * source_pitch + x * 4U + c] = static_cast<std::uint8_t>((x * 71U + y * 13U + c * 43U) % 256U);
+            for (std::uint32_t c = 0U; c < 4U; ++c) source[y * source_pitch + x * 4U + c] = static_cast<std::uint8_t>((x * 71U + y * 13U + c * 43U) % 256U);
     const auto scratch = nis::scratch_requirements(config);
     REQUIRE(scratch.has_value());
     REQUIRE(scratch->scaled_bytes == static_cast<std::size_t>(output_width) * output_height * reference::scaled_pixel_bytes());
@@ -68,10 +67,10 @@ TEST_CASE("Basic selected sharpening matches independent dual-direction arithmet
         REQUIRE(nis::launch_scale(input.get(), source_pitch, horizontal.get(), scaled.get(), config, stream.get()) == cudaSuccess);
     else
         REQUIRE(reference::prepare_sharpen_pixels(scaled.get(), config, pattern, stream.get()) == cudaSuccess);
-    REQUIRE(nis::launch_sharpen(input.get(), source_pitch, scaled.get(), static_cast<std::uint8_t*>(actual_device.get()), target_pitch, config,
-                                stream.get()) == cudaSuccess);
-    REQUIRE(reference::sharpen_reference(input.get(), source_pitch, scaled.get(), static_cast<std::uint8_t*>(expected_device.get()), target_pitch,
-                                         config, stream.get()) == cudaSuccess);
+    REQUIRE(nis::launch_sharpen(input.get(), source_pitch, scaled.get(), static_cast<std::uint8_t*>(actual_device.get()), target_pitch, config, stream.get()) ==
+            cudaSuccess);
+    REQUIRE(reference::sharpen_reference(input.get(), source_pitch, scaled.get(), static_cast<std::uint8_t*>(expected_device.get()), target_pitch, config,
+                                         stream.get()) == cudaSuccess);
     REQUIRE(cudaStreamSynchronize(stream.get()) == cudaSuccess);
     std::vector<std::uint8_t> actual(bytes), expected(bytes), unchanged(source.size());
     REQUIRE(cudaMemcpy(actual.data(), actual_device.get(), bytes, cudaMemcpyDeviceToHost) == cudaSuccess);

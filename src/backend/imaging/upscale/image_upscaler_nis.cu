@@ -127,8 +127,7 @@ __global__ void sharpen_kernel(const void* source, const std::size_t source_pitc
 #pragma unroll
     for (std::uint32_t tap = 0U; tap < device::kFilterTaps; ++tap) {
         const int offset = static_cast<int>(tap) - 2;
-        const HalfRgba sample = load_clamped(scaled, config, static_cast<int>(x) + (horizontal ? offset : 0),
-                                             static_cast<int>(y) + (horizontal ? 0 : offset));
+        const HalfRgba sample = load_clamped(scaled, config, static_cast<int>(x) + (horizontal ? offset : 0), static_cast<int>(y) + (horizontal ? 0 : offset));
         const float coefficient = device::kUsmCoefficients.values[selected_phase][tap];
         detail.x = fmaf(coefficient, __half2float(sample.red), detail.x);
         detail.y = fmaf(coefficient, __half2float(sample.green), detail.y);
