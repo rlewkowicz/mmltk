@@ -12,6 +12,7 @@
 #include <string>
 #include <string_view>
 #include <vector>
+#include "src/common/concurrency/cancellation_observation.h"
 #include "benchmark_cache.h"
 #include "benchmark_catalog.h"
 #include "src/backend/data/benchmark_dataset_compiler.h"
@@ -76,6 +77,16 @@ struct NormalizedAnnotationIndex {
     std::vector<RLEPair> mask_rle_pairs;
     AnnotationRejectCounts rejected;
 };
+// Source and destination must be distinct. Copies one complete slice, rebasing only
+// storage offsets; source IDs need not be sorted. Metadata belongs to the caller.
+void append_normalized_image_slice(NormalizedAnnotationIndex& destination, const NormalizedAnnotationIndex& source,
+                                   std::size_t image_position,
+                                   mmltk::common::concurrency::CancellationObservation cancellation = {});
+// Retains positions in the supplied order. Identity does not inspect mask payloads;
+// increasing subsets retain allocation capacity. On cancellation during in-place
+// compaction the owner must discard the index, never publish it.
+void retain_normalized_image_slices(NormalizedAnnotationIndex& index, std::span<const std::size_t> order,
+                                    mmltk::common::concurrency::CancellationObservation cancellation = {});
 struct AnnotationParseOptions {
     BenchmarkDatasetSource source = BenchmarkDatasetSource::kCoco2017;
     std::string split;

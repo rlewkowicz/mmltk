@@ -337,17 +337,41 @@ TEST_CASE("COCONut Large shapes and sorted XL masks retain complete rows with La
     CHECK(xl[0].index.boxes[0].source_ordinal == 0); CHECK(xl[0].index.boxes[1].source_ordinal == 1);
     components.push_back(std::move(xl[0]));
     const auto original=components;
+    const auto* retained_boxes = components[1].index.boxes.data();
+    const auto* retained_runs = components[1].index.mask_rle_pairs.data();
+    const auto* retained_inventory = components[1].inventory.data();
+    const auto box_capacity = components[1].index.boxes.capacity(), run_capacity = components[1].index.mask_rle_pairs.capacity();
+    const auto previous_identity = components[1].index.annotation_sha256;
     PollCancellation observed;
     CHECK(reconcile_coconut_extensions(components,mmltk::common::concurrency::CancellationObservation::Borrow(observed)) == 1);
     for (std::size_t cut=0; cut<observed.polls; ++cut) {
         auto interrupted=original;
         PollCancellation stop; stop.stop_at=cut;
         CHECK_THROWS(reconcile_coconut_extensions(interrupted,mmltk::common::concurrency::CancellationObservation::Borrow(stop)));
+        if (interrupted[1].index.annotation_sha256.empty()) {
+            const auto rejected_path = root.path() / "interrupted.bin";
+            CHECK_THROWS(store_coconut_component(rejected_path, interrupted[1]));
+            CHECK_FALSE(std::filesystem::exists(rejected_path));
+        }
     }
+    CHECK(components[1].index.boxes.data() == retained_boxes); CHECK(components[1].index.mask_rle_pairs.data() == retained_runs);
+    CHECK(components[1].inventory.data() == retained_inventory);
+    CHECK(components[1].index.boxes.capacity() == box_capacity); CHECK(components[1].index.mask_rle_pairs.capacity() == run_capacity);
+    CHECK(components[1].index.annotation_sha256 != previous_identity);
+    CHECK(components[1].inventory[0] == original[1].inventory[1]);
+    CHECK(components[1].index.mask_rle_pairs[0].start == 0); CHECK(components[1].index.mask_rle_pairs[0].length == 1);
     REQUIRE(components[1].index.images.size() == 1); CHECK(components[1].index.images[0].source_image_id == 3);
     CHECK(components[1].index.boxes[0].source_ordinal == 1); CHECK(components[1].index.images[0].first_box == 0);
     CHECK(components[1].index.boxes[0].mask_rle_offset == 0);
     CHECK(reconcile_coconut_extensions(components) == 0);
+    CHECK(components[1].index.boxes.data() == retained_boxes);
+    auto covered = original;
+    covered[0] = original[1]; covered[0].edition = CoconutEdition::Large;
+    CHECK(reconcile_coconut_extensions(covered) == 2);
+    CHECK(covered[1].inventory.empty()); CHECK(covered[1].index.images.empty());
+    CHECK(covered[1].index.boxes.empty()); CHECK(covered[1].index.mask_rle_pairs.empty());
+    CHECK(covered[0].inventory.size() == 2);
+
 }
 TEST_CASE("COCONut archives reject unresolved duplicate extra and unsafe offered members", "[coconut]") {
     ScopedTempDir root("coconut-archive-reject");
@@ -604,12 +628,19 @@ TEST_CASE("COCONut compact inventory is deterministic and jointly admitted under
     const auto rebuilt=import_coconut_annotations(input);
     REQUIRE(first.size()==1); REQUIRE(rebuilt.size()==1);
     CHECK(first[0].index.annotation_sha256==rebuilt[0].index.annotation_sha256);
+    REQUIRE(first[0].index.images.size() == 2); REQUIRE(first[0].index.boxes.size() == 2);
+    CHECK(first[0].index.images[0].source_image_id == 7); CHECK(first[0].index.images[1].source_image_id == 8);
+    CHECK(first[0].index.images[0].first_box == 0); CHECK(first[0].index.images[1].first_box == 1);
+    CHECK(first[0].index.boxes[0].source_ordinal == 1); CHECK(first[0].index.boxes[1].source_ordinal == 0);
+    CHECK(first[0].inventory[0].release_image_id == 7); CHECK(first[0].inventory[1].release_image_id == 8);
+
     const auto path=root.path()/"first.bin", second=root.path()/"second.bin";
     PollCancellation baseline;
     store_coconut_component(path,first[0],mmltk::common::concurrency::CancellationObservation::Borrow(baseline));
     store_coconut_component(second,rebuilt[0]);
     const auto original=file_bytes(path.string()+".inventory");
     CHECK(original==file_bytes(second.string()+".inventory"));
+    CHECK(file_bytes(path)==file_bytes(second));
     REQUIRE(original.size()>64); CHECK(original.substr(0,8)=="CNUTIVN1");
     const auto loaded=load_coconut_component(path,first[0].edition,first[0].source,input.input_identity);
     REQUIRE(loaded); CHECK(loaded->inventory==first[0].inventory);

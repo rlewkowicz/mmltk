@@ -262,7 +262,7 @@ void select_image(SourceSelection* source, const std::uint32_t image_index, std:
     if (!class_candidate_available(source, class_id)) { throw std::runtime_error("supplemental class candidate unexpectedly exhausted"); }
     return source->candidates[class_id][cursor++];
 }
-[[nodiscard]] NormalizedAnnotationIndex materialize_selection(const SourceSelection& source) {
+[[nodiscard]] NormalizedAnnotationIndex materialize_selection(const SourceSelection& source, mmltk::common::concurrency::CancellationObservation cancellation) {
     NormalizedAnnotationIndex result;
     result.source = source.source->source;
     result.split = source.source->split;
@@ -272,24 +272,7 @@ void select_image(SourceSelection* source, const std::uint32_t image_index, std:
     result.boxes.reserve(source.selected_boxes);
     for (std::size_t image_index = 0U; image_index < source.source->images.size(); ++image_index) {
         if (source.selected[image_index] == 0U) { continue; }
-        const NormalizedImage& input = source.source->images[image_index];
-        NormalizedImage output = input;
-        output.first_box = result.boxes.size();
-        result.images.push_back(output);
-        using BoxDifference = std::vector<NormalizedBox>::difference_type;
-        const auto first = source.source->boxes.begin() + checked_cast<BoxDifference>(input.first_box, "supplemental box offset exceeds iterator range");
-        const auto last = first + checked_cast<BoxDifference>(input.box_count, "supplemental box count exceeds iterator range");
-        for (auto box = first; box != last; ++box) {
-            if (box->mask_rle_offset > source.source->mask_rle_pairs.size() ||
-                box->mask_rle_pairs > source.source->mask_rle_pairs.size() - box->mask_rle_offset) {
-                throw std::runtime_error("supplemental mask range is invalid");
-            }
-            NormalizedBox output_box = *box;
-            output_box.mask_rle_offset = result.mask_rle_pairs.size();
-            const auto mask = std::span(source.source->mask_rle_pairs).subspan(static_cast<std::size_t>(box->mask_rle_offset), box->mask_rle_pairs);
-            result.mask_rle_pairs.insert(result.mask_rle_pairs.end(), mask.begin(), mask.end());
-            result.boxes.push_back(output_box);
-        }
+        append_normalized_image_slice(result, *source.source, image_index, cancellation);
     }
     return result;
 }
@@ -363,8 +346,8 @@ CombinedSupplementalSamplingResult sample_combined_supplemental_indices(const No
     open_selection.stats.selected_boxes = open_selection.selected_boxes;
     result.objects365.stats = object_selection.stats;
     result.open_images.stats = open_selection.stats;
-    result.objects365.index = materialize_selection(object_selection);
-    result.open_images.index = materialize_selection(open_selection);
+    result.objects365.index = materialize_selection(object_selection, cancel_requested);
+    result.open_images.index = materialize_selection(open_selection, cancel_requested);
     return result;
 }
 }  // namespace mmltk::backend::data::benchmark_internal

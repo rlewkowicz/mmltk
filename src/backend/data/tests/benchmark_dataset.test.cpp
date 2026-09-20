@@ -353,6 +353,21 @@ void test_benchmark_supplemental_sampling() {
         source.images.push_back(
             NormalizedImage{image_index, first_box, original_box_counts[image_index], 640U, 480U, static_cast<std::uint16_t>(image_index % 4U), 0U});
     }
+    source.rejected = {89, 7, 6, 5, 4, 3};
+    for (std::size_t i = 0; i < source.boxes.size(); ++i) {
+        auto& box = source.boxes[i];
+        box.mask_rle_offset = source.mask_rle_pairs.size();
+        box.mask_rle_pairs = i % 3 == 0 ? 0 : 2;
+        box.flags = kAnnotationMask | kAnnotationCategory | kAnnotationId | kAnnotationIgnore;
+        box.original_area = 3.25 + i;
+        box.annotation_id = 800 + i;
+        box.source_category_id = 30 + i;
+        box.source_ordinal = 900 - i;
+        if (box.mask_rle_pairs) {
+            source.mask_rle_pairs.push_back({static_cast<std::uint32_t>(i), 1});
+            source.mask_rle_pairs.push_back({static_cast<std::uint32_t>(i + 100), 2});
+        }
+    }
     NormalizedAnnotationIndex coco;
     coco.source = BenchmarkDatasetSource::kCoco2017;
     NormalizedAnnotationIndex open_images = source;
@@ -368,6 +383,29 @@ void test_benchmark_supplemental_sampling() {
     REQUIRE(first.stats.selected_images + first_combined.open_images.stats.selected_images == first_combined.target_images);
     REQUIRE(first_combined.open_images.stats.selected_images >= first_combined.open_images_floor);
     REQUIRE(first_combined.open_images.stats.selected_images <= first_combined.open_images_ceiling);
+    for (const auto* selected : {&first_combined.objects365.index, &first_combined.open_images.index}) {
+        CHECK(reject_json(selected->rejected) == reject_json(source.rejected));
+        std::size_t box_position = 0, run_position = 0;
+        for (const auto& image : selected->images) {
+            auto expected_image = source.images[image.source_image_id];
+            const auto source_first = expected_image.first_box;
+            expected_image.first_box = box_position;
+            CHECK(std::memcmp(&image, &expected_image, sizeof(NormalizedImage)) == 0);
+            for (std::size_t j = 0; j < image.box_count; ++j) {
+                auto expected = source.boxes[source_first + j];
+                const auto source_run = expected.mask_rle_offset;
+                expected.mask_rle_offset = run_position;
+                REQUIRE(box_position < selected->boxes.size());
+                CHECK(std::memcmp(&selected->boxes[box_position++], &expected, sizeof(NormalizedBox)) == 0);
+                for (std::size_t r = 0; r < expected.mask_rle_pairs; ++r) {
+                    REQUIRE(run_position < selected->mask_rle_pairs.size());
+                    CHECK(selected->mask_rle_pairs[run_position].start == source.mask_rle_pairs[source_run + r].start);
+                    CHECK(selected->mask_rle_pairs[run_position++].length == source.mask_rle_pairs[source_run + r].length);
+                }
+            }
+        }
+        CHECK(box_position == selected->boxes.size()); CHECK(run_position == selected->mask_rle_pairs.size());
+    }
     REQUIRE(!first.index.images.empty());
     REQUIRE(first.stats.selected_boxes == first.index.boxes.size());
     REQUIRE(first.index.images.size() == second.index.images.size());
@@ -1050,6 +1088,131 @@ TEST_CASE("benchmark destination preparation preserves parent and obstruction be
 }
 TEST_CASE("benchmark download cache lifecycle", "[backend][data][benchmark][download]") { test_benchmark_download_cache_lifecycle(); }
 TEST_CASE("benchmark annotation indexes", "[backend][data][benchmark][annotations]") { test_benchmark_annotation_indexes(); }
+TEST_CASE("normalized slices preserve exact fields and owned storage", "[backend][data][benchmark][annotations]") {
+    NormalizedAnnotationIndex input;
+    input.split = "unsorted";
+    input.annotation_sha256 = "identity";
+    input.rejected = {13, 2, 3, 4, 5, 6};
+    input.images = {{30, 0, 2, 8, 4, 7, 0}, {10, 2, 0, 9, 5, 8, 0}, {20, 2, 1, 10, 6, 9, 0}, {40, 3, 1, 11, 7, 10, 0}};
+    input.boxes = {
+        {0.1F, 0.2F, 0.8F, 0.9F, 0, 2, 2, kAnnotationMask | kAnnotationCategory | kAnnotationId, {}, 4.5, 101, 3, 19},
+        {0.2F, 0.3F, 0.7F, 0.8F, 2, 0, 3, kAnnotationMask | kAnnotationCategory, {}, 0, 0, 4, 23},
+        {0.3F, 0.4F, 0.6F, 0.7F, 2, 2, 4, kAnnotationMask | kAnnotationCrowd | kAnnotationCategory, {}, 8.25, 0, 5, 29},
+        {0.4F, 0.5F, 0.8F, 0.9F, 4, 1, 5, kAnnotationMask | kAnnotationIgnore | kAnnotationCategory, {}, 1, 0, 6, 31}};
+    input.mask_rle_pairs = {{0, 2}, {5, 1}, {2, 3}, {9, 2}, {7, 1}};
+    const auto original = input;
+    std::vector<std::size_t> order{0, 1, 2, 3};
+    SECTION("identity does not inspect boxes or runs") {
+        // Invalid payload metadata proves the identity path does not visit boxes.
+        input.boxes[0].mask_rle_offset = UINT64_MAX;
+        const auto* boxes = input.boxes.data(); const auto* runs = input.mask_rle_pairs.data();
+        const auto box_capacity = input.boxes.capacity(), run_capacity = input.mask_rle_pairs.capacity();
+        retain_normalized_image_slices(input, order);
+        CHECK(input.boxes.data() == boxes); CHECK(input.mask_rle_pairs.data() == runs);
+        CHECK(input.boxes.capacity() == box_capacity); CHECK(input.mask_rle_pairs.capacity() == run_capacity);
+        CHECK(input.boxes[0].mask_rle_offset == UINT64_MAX);
+        return;
+    }
+    SECTION("leading removal") { order = {1, 2, 3}; }
+    SECTION("middle removal and explicit empty mask") { order = {0, 3}; }
+    SECTION("trailing removal") { order = {0, 1, 2}; }
+    SECTION("empty foreground only") { order = {1}; }
+    SECTION("fully removed") { order.clear(); }
+    SECTION("genuine smaller permutation") { order = {2, 0}; }
+    SECTION("sort unsorted IDs including empty image") { order = {1, 2, 0, 3}; }
+    const auto* images = input.images.data(); const auto* boxes = input.boxes.data(); const auto* runs = input.mask_rle_pairs.data();
+    const auto image_capacity = input.images.capacity(), box_capacity = input.boxes.capacity(), run_capacity = input.mask_rle_pairs.capacity();
+    retain_normalized_image_slices(input, order);
+    if (std::ranges::is_sorted(order)) {
+        CHECK(input.images.data() == images); CHECK(input.boxes.data() == boxes); CHECK(input.mask_rle_pairs.data() == runs);
+        CHECK(input.images.capacity() == image_capacity); CHECK(input.boxes.capacity() == box_capacity); CHECK(input.mask_rle_pairs.capacity() == run_capacity);
+    }
+    CHECK(input.split == "unsorted"); CHECK(input.annotation_sha256 == "identity");
+    CHECK(reject_json(input.rejected) == reject_json(original.rejected));
+    std::size_t next_box = 0, next_run = 0;
+    REQUIRE(input.images.size() == order.size());
+    for (std::size_t i = 0; i < order.size(); ++i) {
+        auto expected_image = original.images[order[i]];
+        const auto first = expected_image.first_box;
+        expected_image.first_box = next_box;
+        CHECK(std::memcmp(&input.images[i], &expected_image, sizeof(NormalizedImage)) == 0);
+        for (std::size_t j = 0; j < expected_image.box_count; ++j) {
+            auto expected_box = original.boxes[first + j];
+            const auto run_start = expected_box.mask_rle_offset;
+            expected_box.mask_rle_offset = next_run;
+            REQUIRE(next_box < input.boxes.size());
+            CHECK(std::memcmp(&input.boxes[next_box++], &expected_box, sizeof(NormalizedBox)) == 0);
+            for (std::size_t r = 0; r < expected_box.mask_rle_pairs; ++r) {
+                REQUIRE(next_run < input.mask_rle_pairs.size());
+                CHECK(input.mask_rle_pairs[next_run].start == original.mask_rle_pairs[run_start + r].start);
+                CHECK(input.mask_rle_pairs[next_run++].length == original.mask_rle_pairs[run_start + r].length);
+            }
+        }
+    }
+    CHECK(input.boxes.size() == next_box); CHECK(input.mask_rle_pairs.size() == next_run);
+}
+TEST_CASE("normalized slice admission and cancellation cannot append partial data", "[backend][data][benchmark][annotations]") {
+    struct Cancellation {
+        mutable std::size_t polls = 0;
+        std::size_t stop = SIZE_MAX;
+        bool cancelled() const noexcept { return polls++ >= stop; }
+    };
+    NormalizedAnnotationIndex source, destination;
+    source.images = {{1, 0, 1, 8, 8, 0, 0}};
+    source.boxes.resize(1);
+    source.boxes[0].mask_rle_pairs = 131073;
+    source.mask_rle_pairs.resize(131073, RLEPair{1, 1});
+    SECTION("image position") { CHECK_THROWS(append_normalized_image_slice(destination, source, 1)); }
+    SECTION("box offset") { source.images[0].first_box = UINT64_MAX; CHECK_THROWS(append_normalized_image_slice(destination, source, 0)); }
+    SECTION("box count") { source.images[0].box_count = 2; CHECK_THROWS(append_normalized_image_slice(destination, source, 0)); }
+    SECTION("mask offset") { source.boxes[0].mask_rle_offset = UINT64_MAX; CHECK_THROWS(append_normalized_image_slice(destination, source, 0)); }
+    SECTION("mask count") { source.boxes[0].mask_rle_pairs++; CHECK_THROWS(append_normalized_image_slice(destination, source, 0)); }
+    SECTION("self append") { CHECK_THROWS(append_normalized_image_slice(source, source, 0)); }
+    SECTION("retention checks every span before compaction") {
+        source.images.push_back({2, 1, 1, 8, 8, 0, 0});
+        const std::array<std::size_t, 1> retained{1};
+        CHECK_THROWS(retain_normalized_image_slices(source, retained));
+        source.boxes.push_back(source.boxes[0]); source.boxes[1].mask_rle_offset = UINT64_MAX;
+        CHECK_THROWS(retain_normalized_image_slices(source, retained));
+        CHECK(source.images[0].source_image_id == 1);
+    }
+    SECTION("overlapping forward run moves retain exact content with bounded cancellation") {
+        source.images = {{1, 0, 1, 8, 8, 0, 0}, {2, 1, 1, 8, 8, 0, 0}};
+        source.boxes.insert(source.boxes.begin(), NormalizedBox{});
+        source.boxes[0].mask_rle_pairs = 1;
+        source.boxes[1].mask_rle_offset = 1;
+        source.mask_rle_pairs.resize(131074);
+        for (std::size_t i = 0; i < source.mask_rle_pairs.size(); ++i) source.mask_rle_pairs[i] = {static_cast<std::uint32_t>(i), 1};
+        const std::array<std::size_t, 1> retained{1};
+        Cancellation observed;
+        auto complete = source;
+        const auto* runs = complete.mask_rle_pairs.data();
+        retain_normalized_image_slices(complete, retained, mmltk::common::concurrency::CancellationObservation::Borrow(observed));
+        CHECK(complete.mask_rle_pairs.data() == runs);
+        REQUIRE(complete.mask_rle_pairs.size() == 131073);
+        for (std::size_t i = 0; i < complete.mask_rle_pairs.size(); ++i) {
+            CHECK(complete.mask_rle_pairs[i].start == i + 1); CHECK(complete.mask_rle_pairs[i].length == 1);
+        }
+        for (std::size_t cut = 0; cut < observed.polls; ++cut) {
+            auto interrupted = source;
+            Cancellation stop{0, cut};
+            CHECK_THROWS(retain_normalized_image_slices(interrupted, retained, mmltk::common::concurrency::CancellationObservation::Borrow(stop)));
+        }
+    }
+
+    SECTION("every transfer cancellation point") {
+        Cancellation observed;
+        auto complete = destination;
+        append_normalized_image_slice(complete, source, 0, mmltk::common::concurrency::CancellationObservation::Borrow(observed));
+        REQUIRE(observed.polls >= 5);
+        for (std::size_t cut = 0; cut < observed.polls; ++cut) {
+            Cancellation stop{0, cut};
+            CHECK_THROWS(append_normalized_image_slice(destination, source, 0, mmltk::common::concurrency::CancellationObservation::Borrow(stop)));
+            CHECK(destination.images.empty()); CHECK(destination.boxes.empty()); CHECK(destination.mask_rle_pairs.empty());
+        }
+    }
+    CHECK(destination.images.empty()); CHECK(destination.boxes.empty()); CHECK(destination.mask_rle_pairs.empty());
+}
 TEST_CASE("benchmark supplemental sampling", "[backend][data][benchmark][sampling]") { test_benchmark_supplemental_sampling(); }
 TEST_CASE("benchmark cached image writer and loader", "[backend][data][benchmark][writer]") { test_benchmark_cached_image_writer_and_loader(); }
 TEST_CASE("benchmark archive quarantine policy", "[backend][data][benchmark][images]") { test_benchmark_archive_quarantine_policy(); }

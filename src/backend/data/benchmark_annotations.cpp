@@ -2,6 +2,9 @@
 #include <nlohmann/json.hpp>
 #include <type_traits>
 #include <sys/mman.h>
+#include <algorithm>
+#include <limits>
+#include <stdexcept>
 #include <atomic>
 #include <charconv>
 #include <cmath>
@@ -1046,7 +1049,139 @@ void validate_normalized_records(const NormalizedAnnotationIndex& index, mmltk::
     if (expected_first != index.boxes.size()) { throw std::runtime_error("normalized benchmark box records are not fully referenced"); }
     if (expected_mask_offset != index.mask_rle_pairs.size()) { throw std::runtime_error("normalized benchmark mask records are not fully referenced"); }
 }
+// Slice admission deliberately does not require persisted sorted image IDs.
+std::span<const NormalizedBox> image_boxes(const NormalizedAnnotationIndex& index, std::size_t position) {
+    const auto& image = index.images.at(position);
+    if (image.first_box > index.boxes.size() || image.box_count > index.boxes.size() - image.first_box)
+        throw std::runtime_error("normalized image slice box range is invalid");
+    return std::span(index.boxes).subspan(static_cast<std::size_t>(image.first_box), image.box_count);
+}
+std::size_t slice_run_count(const NormalizedAnnotationIndex& index, std::span<const NormalizedBox> boxes,
+                            mmltk::common::concurrency::CancellationObservation cancellation) {
+    std::size_t count = 0;
+    for (std::size_t i = 0; i < boxes.size(); ++i) {
+        if ((i & 1023U) == 0) throw_if_benchmark_cancelled(cancellation);
+        const auto& box = boxes[i];
+        if (box.mask_rle_offset > index.mask_rle_pairs.size() || box.mask_rle_pairs > index.mask_rle_pairs.size() - box.mask_rle_offset)
+            throw std::runtime_error("normalized image slice mask range is invalid");
+        if (box.mask_rle_pairs > index.mask_rle_pairs.max_size() - count)
+            throw std::overflow_error("normalized image slice mask count overflow");
+        count += box.mask_rle_pairs;
+    }
+    return count;
+}
+// Append and forward compaction share the complete admitted slice transfer.
+// memmove handles overlapping runs, and each box is captured before overwriting it.
+void transfer_image_slice(NormalizedAnnotationIndex& destination, const NormalizedAnnotationIndex& source,
+                          std::size_t position, std::size_t image_destination, std::size_t box_destination,
+                          std::size_t& run_destination, mmltk::common::concurrency::CancellationObservation cancellation) {
+    auto image = source.images[position];
+    const auto first = image.first_box;
+    image.first_box = box_destination;
+    for (std::size_t i = 0; i < image.box_count; ++i) {
+        if ((i & 1023U) == 0) throw_if_benchmark_cancelled(cancellation);
+        auto box = source.boxes[first + i];
+        for (std::size_t offset = 0; offset < box.mask_rle_pairs;) {
+            throw_if_benchmark_cancelled(cancellation);
+            const auto count = std::min<std::size_t>(65536, box.mask_rle_pairs - offset);
+            const auto* input = source.mask_rle_pairs.data() + box.mask_rle_offset + offset;
+            if (&destination != &source) {
+                destination.mask_rle_pairs.insert(destination.mask_rle_pairs.end(), input, input + count);
+            } else {
+                auto* target = destination.mask_rle_pairs.data() + run_destination + offset;
+                if (target != input) std::memmove(target, input, count * sizeof(RLEPair));
+            }
+            offset += count;
+        }
+        box.mask_rle_offset = run_destination;
+        run_destination += box.mask_rle_pairs;
+        if (&destination != &source) destination.boxes.push_back(box);
+        else destination.boxes[box_destination + i] = box;
+    }
+    if (&destination != &source) destination.images.push_back(image);
+    else destination.images[image_destination] = image;
+}
 }  // namespace
+void append_normalized_image_slice(NormalizedAnnotationIndex& destination, const NormalizedAnnotationIndex& source,
+                                   std::size_t position, mmltk::common::concurrency::CancellationObservation cancellation) {
+    throw_if_benchmark_cancelled(cancellation);
+    if (&destination == &source) throw std::invalid_argument("normalized slice append requires distinct storage");
+    const auto boxes = image_boxes(source, position);
+    const auto runs = slice_run_count(source, boxes, cancellation);
+    if (destination.images.size() == destination.images.max_size() || boxes.size() > destination.boxes.max_size() - destination.boxes.size() ||
+        runs > destination.mask_rle_pairs.max_size() - destination.mask_rle_pairs.size())
+        throw std::overflow_error("normalized slice destination size overflow");
+    const auto image_start = destination.images.size(), box_start = destination.boxes.size(), run_start = destination.mask_rle_pairs.size();
+    try {
+        auto run_destination = run_start;
+        transfer_image_slice(destination, source, position, image_start, box_start, run_destination, cancellation);
+        throw_if_benchmark_cancelled(cancellation);
+    } catch (...) {
+        destination.images.resize(image_start);
+        destination.boxes.resize(box_start);
+        destination.mask_rle_pairs.resize(run_start);
+        throw;
+    }
+}
+void retain_normalized_image_slices(NormalizedAnnotationIndex& index, std::span<const std::size_t> order,
+                                    mmltk::common::concurrency::CancellationObservation cancellation) {
+    throw_if_benchmark_cancelled(cancellation);
+    bool identity = order.size() == index.images.size(), increasing = true;
+    for (std::size_t i = 0; i < order.size(); ++i) {
+        if ((i & 1023U) == 0) throw_if_benchmark_cancelled(cancellation);
+        (void)image_boxes(index, order[i]);
+        identity = identity && order[i] == i;
+        increasing = increasing && (i == 0 || order[i - 1] < order[i]);
+    }
+    if (identity) return;
+    std::size_t box_count = 0, run_count = 0;
+    std::uint64_t previous_box_end = 0, previous_run_end = 0;
+    for (const auto position : order) {
+        throw_if_benchmark_cancelled(cancellation);
+        const auto boxes = image_boxes(index, position);
+        const auto runs = slice_run_count(index, boxes, cancellation);
+        if (boxes.size() > index.boxes.max_size() - box_count || runs > index.mask_rle_pairs.max_size() - run_count)
+            throw std::overflow_error("normalized retained slice size overflow");
+        if (increasing) {
+            const auto& image = index.images[position];
+            if (image.first_box < previous_box_end) throw std::runtime_error("normalized retained box slices overlap");
+            previous_box_end = image.first_box + image.box_count;
+            for (std::size_t i = 0; i < boxes.size(); ++i) {
+                if ((i & 1023U) == 0) throw_if_benchmark_cancelled(cancellation);
+                const auto& box = boxes[i];
+                if (box.mask_rle_offset < previous_run_end) throw std::runtime_error("normalized retained mask slices overlap");
+                previous_run_end = box.mask_rle_offset + box.mask_rle_pairs;
+            }
+        }
+        box_count += boxes.size();
+        run_count += runs;
+    }
+    if (increasing) {
+        std::size_t box_destination = 0, run_destination = 0;
+        for (std::size_t i = 0; i < order.size(); ++i) {
+            throw_if_benchmark_cancelled(cancellation);
+            const auto count = index.images[order[i]].box_count;
+            transfer_image_slice(index, index, order[i], i, box_destination, run_destination, cancellation);
+            box_destination += count;
+        }
+        throw_if_benchmark_cancelled(cancellation);
+        index.images.resize(order.size());
+        index.boxes.resize(box_count);
+        index.mask_rle_pairs.resize(run_count);
+    } else {
+        NormalizedAnnotationIndex next;
+        next.source = index.source;
+        next.split = index.split;
+        next.annotation_sha256 = index.annotation_sha256;
+        next.rejected = index.rejected;
+        next.images.reserve(order.size());
+        next.boxes.reserve(box_count);
+        next.mask_rle_pairs.reserve(run_count);
+        for (const auto position : order) append_normalized_image_slice(next, index, position, cancellation);
+        throw_if_benchmark_cancelled(cancellation);
+        index = std::move(next);
+    }
+}
 NormalizedAnnotationIndex parse_coco_style_annotations(const std::filesystem::path& json_path, std::string annotation_sha256,
                                                        const std::span<const NumericCategoryMapping> mappings, const AnnotationParseOptions& options) {
     PaddedMappedFile file(json_path);

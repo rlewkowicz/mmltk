@@ -325,43 +325,42 @@ BenchmarkDatasetSource index_source(CoconutImageNamespace source) {
 std::string component_split(CoconutEdition edition, CoconutImageNamespace source) {
     return "coconut-" + std::to_string(static_cast<unsigned>(edition)) + "-" + std::to_string(static_cast<unsigned>(source));
 }
-// Compacts complete image slices, preserving source annotation order and run ownership.
+// Inventory owns physical joins; normalized storage owns slice movement.
 void retain_images(CoconutComponent& component, std::span<const std::size_t> order, Cancellation cancellation) {
     throw_if_benchmark_cancelled(cancellation);
-    NormalizedAnnotationIndex next;
-    next.source = component.index.source;
-    next.split = component.index.split;
-    next.rejected = component.index.rejected;
-    next.images.reserve(order.size());
-    next.boxes.reserve(component.index.boxes.size());
-    next.mask_rle_pairs.reserve(component.index.mask_rle_pairs.size());
-    std::vector<CoconutInventoryImage> inventory;
-    inventory.reserve(order.size());
-    for (const auto position : order) {
+    if (component.inventory.size() != component.index.images.size()) invalid("component inventory/image count mismatch");
+    bool increasing = true;
+    for (std::size_t i = 0; i < order.size(); ++i) {
         throw_if_benchmark_cancelled(cancellation);
-        auto image = component.index.images.at(position);
-        const auto first = image.first_box;
-        image.first_box = next.boxes.size();
-        for (std::uint64_t index = first; index < first + image.box_count; ++index) {
-            if (((index-first) & 1023U)==0) throw_if_benchmark_cancelled(cancellation);
-            auto box = component.index.boxes.at(index);
-            const auto runs = std::span(component.index.mask_rle_pairs).subspan(box.mask_rle_offset, box.mask_rle_pairs);
-            box.mask_rle_offset = next.mask_rle_pairs.size();
-            for (std::size_t offset=0; offset<runs.size();) {
-                throw_if_benchmark_cancelled(cancellation);
-                const auto count=std::min<std::size_t>(65536,runs.size()-offset);
-                next.mask_rle_pairs.insert(next.mask_rle_pairs.end(),runs.begin()+offset,runs.begin()+offset+count);
-                offset+=count;
-            }
-            next.boxes.push_back(box);
-        }
-        next.images.push_back(image);
-        inventory.push_back(std::move(component.inventory.at(position)));
+        if (order[i] >= component.inventory.size()) invalid("component retained image position is invalid");
+        increasing = increasing && (i == 0 || order[i - 1] < order[i]);
     }
-    component.inventory = std::move(inventory);
-    component.index = std::move(next);
-    component.index.annotation_sha256 = component_identity(component,cancellation);
+    // Invalidate admission before destructive compaction or identity settlement.
+    component.index.annotation_sha256.clear();
+    try {
+        std::vector<CoconutInventoryImage> inventory;
+        if (!increasing) {
+            inventory.reserve(order.size());
+            for (const auto position : order) {
+                throw_if_benchmark_cancelled(cancellation);
+                inventory.push_back(component.inventory[position]);
+            }
+        }
+        retain_normalized_image_slices(component.index, order, cancellation);
+        if (increasing) {
+            for (std::size_t i = 0; i < order.size(); ++i) {
+                throw_if_benchmark_cancelled(cancellation);
+                if (i != order[i]) component.inventory[i] = std::move(component.inventory[order[i]]);
+            }
+            component.inventory.resize(order.size());
+        } else component.inventory = std::move(inventory);
+        component.index.annotation_sha256 = component_identity(component, cancellation);
+    } catch (...) {
+        component.index.annotation_sha256.clear();
+        throw;
+    }
 }
+
 struct SegmentSupport {
     std::uint64_t area = 0;
     std::uint32_t min_x = UINT32_MAX, min_y = UINT32_MAX, max_x = 0, max_y = 0;
