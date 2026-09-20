@@ -405,10 +405,23 @@ TEST_CASE("bounded runtime projection escapes valid text and rejects malformed U
     REQUIRE(descriptor >= 0);
     DiagnosticsClient diagnostics{ScopedFd{descriptor}, DiagnosticsExecutionPolicy::CallerDriven};
     RuntimeDiagnostics runtime{diagnostics.producer()};
-    const std::string message{"quoted \"line\"\n\t\xc3\xa9"};
+    std::string message;
+    SECTION("JSON escapes and valid scalar limits") {
+        message = "quoted \"line\"\\\b\f\n\r\t\x01\x7f\xc3\xa9"
+                  "\xc2\x80\xdf\xbf\xe0\xa0\x80\xed\x9f\xbf\xee\x80\x80\xef\xbf\xbf"
+                  "\xf0\x90\x80\x80\xf4\x8f\xbf\xbf";
+    }
+    SECTION("empty text") { message.clear(); }
+    SECTION("embedded NUL") { message.assign("a\0b", 3U); }
     runtime.write({.event = "text", .message = message});
-    runtime.write({.event = "text", .message = "\xc0\x80"});
-    runtime.write({.event = "text", .message = "\xed\xa0\x80"});
+    for (const std::string_view malformed : {
+             "\x80", "\xbf", "\xc0\x80", "\xc1\xbf", "\xe0\x80\x80", "\xe0\x9f\xbf",
+             "\xf0\x80\x80\x80", "\xf0\x8f\xbf\xbf", "\xed\xa0\x80", "\xed\xbf\xbf",
+             "\xf4\x90\x80\x80", "\xf5\x80\x80\x80", "\xff", "\xc2x", "\xe1\x80x", "\xf1\x80\x80x",
+             "\xc2", "\xe0\xa0", "\xf0\x90\x80",
+         }) {
+        runtime.write({.event = "text", .message = malformed});
+    }
     CHECK(diagnostics.counters().accepted == 1U);
     diagnostics.close();
     const auto json = nlohmann::json::parse(read_file(path));

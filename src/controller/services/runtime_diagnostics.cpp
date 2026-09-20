@@ -1,4 +1,5 @@
 #include "src/controller/services/runtime_diagnostics.h"
+#include "src/common/types/utf8.h"
 #include <charconv>
 #include <chrono>
 #include <cmath>
@@ -122,32 +123,18 @@ class BoundedJsonWriter final {
         return true;
     }
     [[nodiscard]] bool field_prefix(const bool wrote_field) noexcept { return !wrote_field || append(","); }
-    [[nodiscard]] bool string(const std::string_view value) noexcept {
+    [[nodiscard]] bool string(std::string_view value) noexcept {
         static constexpr char hex[] = "0123456789abcdef";
         if (!character('"')) return false;
-        unsigned remaining = 0U;
-        std::uint32_t codepoint = 0U;
-        std::uint32_t minimum = 0U;
-        for (const unsigned char byte : value) {
-            if (remaining != 0U) {
-                if ((byte & 0xc0U) != 0x80U) return false;
-                codepoint = (codepoint << 6U) | (byte & 0x3fU);
-                if (--remaining == 0U && (codepoint < minimum || codepoint > 0x10ffffU || (codepoint >= 0xd800U && codepoint <= 0xdfffU))) return false;
-            } else if (byte >= 0x80U) {
-                if (byte >= 0xc2U && byte <= 0xdfU) {
-                    remaining = 1U;
-                    codepoint = byte & 0x1fU;
-                    minimum = 0x80U;
-                } else if (byte >= 0xe0U && byte <= 0xefU) {
-                    remaining = 2U;
-                    codepoint = byte & 0x0fU;
-                    minimum = 0x800U;
-                } else if (byte >= 0xf0U && byte <= 0xf4U) {
-                    remaining = 3U;
-                    codepoint = byte & 0x07U;
-                    minimum = 0x10000U;
-                } else
-                    return false;
+        while (!value.empty()) {
+            const auto length = mmltk::common::types::utf8_prefix_length(value);
+            if (length == 0U) return false;
+            const auto byte = static_cast<unsigned char>(value.front());
+            const auto scalar = value.substr(0U, length);
+            value.remove_prefix(length);
+            if (length > 1U) {
+                if (!append(scalar)) return false;
+                continue;
             }
             switch (byte) {
                 case '"':
@@ -180,7 +167,7 @@ class BoundedJsonWriter final {
                     break;
             }
         }
-        return remaining == 0U && character('"');
+        return character('"');
     }
     template <class Integer>
     [[nodiscard]] bool integer_value(const Integer value) noexcept {

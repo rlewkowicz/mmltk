@@ -8,6 +8,7 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <string_view>
 #include <type_traits>
 #include <utility>
 #include <variant>
@@ -937,13 +938,50 @@ TEST_CASE("scalar allocation admission reports exact kind size path and cursor",
         }
     }
 }
-TEST_CASE("malformed UTF8 categories consume complete segmented payloads before failure", "[frameworks][serialization]") {
-    for (const wire::ByteBuffer& encoded : {
-             wire::ByteBuffer{std::byte{0x62}, std::byte{0xc2}, std::byte{'x'}},                                     // invalid continuation
-             wire::ByteBuffer{std::byte{0x62}, std::byte{0xc0}, std::byte{0x80}},                                    // overlong
-             wire::ByteBuffer{std::byte{0x63}, std::byte{0xed}, std::byte{0xa0}, std::byte{0x80}},                   // surrogate
-             wire::ByteBuffer{std::byte{0x64}, std::byte{0xf4}, std::byte{0x90}, std::byte{0x80}, std::byte{0x80}},  // out of range
+TEST_CASE("UTF8 scalar limits preserve literal text across every segment split", "[frameworks][serialization]") {
+    for (const std::string_view text : {
+             std::string_view{}, std::string_view{"a\0b", 3U}, std::string_view{"\x01\x7f"},
+             std::string_view{"\xc2\x80"}, std::string_view{"\xdf\xbf"},
+             std::string_view{"\xe0\xa0\x80"}, std::string_view{"\xed\x9f\xbf"},
+             std::string_view{"\xee\x80\x80"}, std::string_view{"\xef\xbf\xbf"},
+             std::string_view{"\xf0\x90\x80\x80"}, std::string_view{"\xf4\x8f\xbf\xbf"},
          }) {
+        wire::ByteBuffer expected{std::byte(0x60U + text.size())};
+        for (const unsigned char byte : text) expected.push_back(std::byte{byte});
+        wire::ByteBuffer encoded;
+        REQUIRE(wire::encode(wire::Value(std::string{text}), encoded, test_limits(64U)).has_value());
+        CHECK(encoded == expected);
+        for (std::size_t split = 0U; split <= expected.size(); ++split) {
+            wire::Reader reader({std::span(expected).first(split), std::span(expected).subspan(split)}, test_limits(expected.size()));
+            const auto decoded = reader.read_flat();
+            REQUIRE(decoded.has_value());
+            CHECK(decoded->visit([&](const auto& value) {
+                if constexpr (std::is_same_v<std::remove_cvref_t<decltype(value)>, std::string>) return value == text;
+                else return false;
+            }));
+            CHECK(reader.offset() == expected.size());
+        }
+    }
+}
+TEST_CASE("malformed UTF8 categories consume complete segmented payloads before failure", "[frameworks][serialization]") {
+    for (const std::string_view malformed : {
+             "\x80", "\xbf",                              // stray continuations
+             "\xc0\x80", "\xc1\xbf",                    // overlong two-byte forms
+             "\xe0\x80\x80", "\xe0\x9f\xbf",          // overlong three-byte forms
+             "\xf0\x80\x80\x80", "\xf0\x8f\xbf\xbf", // overlong four-byte forms
+             "\xed\xa0\x80", "\xed\xbf\xbf",          // surrogate limits
+             "\xf4\x90\x80\x80", "\xf5\x80\x80\x80", "\xff", // out of range
+             "\xc2x", "\xe1\x80x", "\xf1\x80\x80x", // invalid continuations
+             "\xc2", "\xe0\xa0", "\xf0\x90\x80",    // truncated scalars
+         }) {
+        wire::ByteBuffer encoded{std::byte(0x60U + malformed.size())};
+        for (const unsigned char byte : malformed) encoded.push_back(std::byte{byte});
+        const wire::ByteBuffer retained{std::byte{0xaa}, std::byte{0xbb}};
+        wire::ByteBuffer destination = retained;
+        const auto rejected_encode = wire::encode(wire::Value(std::string{malformed}), destination, test_limits(64U));
+        REQUIRE_FALSE(rejected_encode.has_value());
+        CHECK(rejected_encode.error().code == wire::ErrorCode::InvalidUtf8);
+        CHECK(destination == retained);
         for (std::size_t split = 0U; split <= encoded.size(); ++split) {
             wire::Reader reader({std::span(encoded).first(split), std::span(encoded).subspan(split)}, test_limits(encoded.size()));
             auto scope = reader.enter_path("payload");

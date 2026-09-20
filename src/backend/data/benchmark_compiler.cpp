@@ -38,6 +38,7 @@
 #include "src/common/io/staging_directory.h"
 #include "src/common/math/checked_arithmetic.h"
 #include "src/common/system/cpu_affinity.h"
+#include "src/common/types/utf8.h"
 // CLEANUP-IGNORE: This benchmark compiler imports and includes the concrete owners directly used by its implementation.
 #include "benchmark_annotations.h"
 #include "benchmark_cache.h"
@@ -78,23 +79,8 @@ struct TracePath final {
     std::size_t offset = 0U;
     while (offset < path.size()) {
         const auto byte = static_cast<unsigned char>(path[offset]);
-        std::size_t length = 1U;
-        bool valid = true;
-        if (byte >= 0x80U) {
-            if (byte >= 0xc2U && byte <= 0xdfU) { length = 2U; }
-            else if (byte >= 0xe0U && byte <= 0xefU) { length = 3U; }
-            else if (byte >= 0xf0U && byte <= 0xf4U) { length = 4U; }
-            else { length = 0U; }
-            valid = length != 0U && length <= path.size() - offset;
-            for (std::size_t index = 1U; valid && index < length; ++index) {
-                const auto continuation = static_cast<unsigned char>(path[offset + index]);
-                valid = continuation >= 0x80U && continuation <= 0xbfU;
-                if (index == 1U) {
-                    valid = valid && !(byte == 0xe0U && continuation < 0xa0U) && !(byte == 0xedU && continuation > 0x9fU) &&
-                            !(byte == 0xf0U && continuation < 0x90U) && !(byte == 0xf4U && continuation > 0x8fU);
-                }
-            }
-        }
+        const auto length = mmltk::common::types::utf8_prefix_length(path.substr(offset));
+        const bool valid = length != 0U;
         // Invalid native bytes become U+FFFD; valid UTF-8 is kept whole. The
         // replacement flag distinguishes this lossy diagnostic from the path.
         const std::string_view token = valid ? path.substr(offset, length) : std::string_view{"\xef\xbf\xbd"};

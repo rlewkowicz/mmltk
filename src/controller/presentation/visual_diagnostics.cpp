@@ -1,4 +1,5 @@
 #include "src/controller/presentation/visual_diagnostics.h"
+#include "src/common/types/utf8.h"
 #include "src/frameworks/gpu/image_workspace.h"
 #include <array>
 #include <cstddef>
@@ -57,36 +58,8 @@ std::string visual_failure_detail(const std::exception_ptr failure, const std::s
     std::array<char, kVisualFailureByteCapacity> bounded;
     std::size_t size = 0U;
     while (!detail.empty() && size < bounded.size()) {
-        const auto first = static_cast<unsigned char>(detail.front());
-        std::size_t length = 1U;
-        std::uint32_t point = first;
-        std::uint32_t minimum = 0U;
-        bool valid = first < 0x80U;
-        if (first >= 0xc2U && first <= 0xdfU) {
-            length = 2U;
-            point = first & 0x1fU;
-            minimum = 0x80U;
-        } else if (first >= 0xe0U && first <= 0xefU) {
-            length = 3U;
-            point = first & 0x0fU;
-            minimum = 0x800U;
-        } else if (first >= 0xf0U && first <= 0xf4U) {
-            length = 4U;
-            point = first & 0x07U;
-            minimum = 0x10000U;
-        }
-        if (length > 1U && detail.size() >= length) {
-            valid = true;
-            for (std::size_t index = 1U; index < length; ++index) {
-                const auto continuation = static_cast<unsigned char>(detail[index]);
-                if ((continuation & 0xc0U) != 0x80U) {
-                    valid = false;
-                    break;
-                }
-                point = (point << 6U) | (continuation & 0x3fU);
-            }
-            valid = valid && point >= minimum && point <= 0x10ffffU && !(point >= 0xd800U && point <= 0xdfffU);
-        }
+        const auto length = mmltk::common::types::utf8_prefix_length(detail);
+        const bool valid = length != 0U;
         const auto next = valid ? detail.substr(0U, length) : std::string_view{"\xef\xbf\xbd"};
         if (next.size() > bounded.size() - size) break;
         std::memcpy(bounded.data() + size, next.data(), next.size());

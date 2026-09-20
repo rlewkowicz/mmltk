@@ -41,7 +41,9 @@ target_link_libraries(mmltk_controller_visual_runtime
         mmltk::controller::visual_contract
         mmltk::frameworks::gpu
         mmltk::frameworks::reflection)
-target_link_libraries(mmltk_controller_visual_runtime PRIVATE mmltk::backend::imaging::raster)
+target_link_libraries(mmltk_controller_visual_runtime PRIVATE
+    mmltk::backend::imaging::raster
+    mmltk::common::types)
 mmltk_link_declarations(mmltk_controller_visual_runtime PUBLIC
     mmltk::controller::direct_services)
 mmltk_register_header_isolation(mmltk_controller_visual_runtime)

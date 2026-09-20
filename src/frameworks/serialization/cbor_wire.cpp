@@ -1,4 +1,5 @@
 #include "src/frameworks/serialization/cbor_wire.h"
+#include "src/common/types/utf8.h"
 #include <algorithm>
 #include <array>
 #include <bit>
@@ -31,36 +32,6 @@ namespace {
         return object->size() <= limits.max_items && std::all_of(object->begin(), object->end(), [&](const auto& member) {
                    return member.first.size() <= limits.max_bytes && dynamic_value_within_limits(member.second, limits, depth + 1U);
                });
-    }
-    return true;
-}
-[[nodiscard]] bool valid_utf8(const std::string_view text) noexcept {
-    const auto* data = reinterpret_cast<const unsigned char*>(text.data());
-    for (std::size_t index = 0U; index < text.size();) {
-        const unsigned char first = data[index++];
-        if (first <= 0x7fU) { continue; }
-        std::size_t continuation_count = 0U;
-        std::uint32_t codepoint = 0U;
-        if ((first & 0xe0U) == 0xc0U) {
-            continuation_count = 1U;
-            codepoint = first & 0x1fU;
-        } else if ((first & 0xf0U) == 0xe0U) {
-            continuation_count = 2U;
-            codepoint = first & 0x0fU;
-        } else if ((first & 0xf8U) == 0xf0U) {
-            continuation_count = 3U;
-            codepoint = first & 0x07U;
-        } else {
-            return false;
-        }
-        if (continuation_count > text.size() - index) { return false; }
-        for (std::size_t part = 0U; part < continuation_count; ++part) {
-            const unsigned char next = data[index++];
-            if ((next & 0xc0U) != 0x80U) { return false; }
-            codepoint = (codepoint << 6U) | (next & 0x3fU);
-        }
-        const std::uint32_t minimum = continuation_count == 1U ? 0x80U : continuation_count == 2U ? 0x800U : 0x10000U;
-        if (codepoint < minimum || codepoint > 0x10ffffU || (codepoint >= 0xd800U && codepoint <= 0xdfffU)) { return false; }
     }
     return true;
 }
@@ -388,7 +359,7 @@ std::expected<std::string, DecodeError> Reader::text(const std::size_t count) {
     if (!ranges.first.empty()) result.append(reinterpret_cast<const char*>(ranges.first.data()), ranges.first.size());
     if (!ranges.second.empty()) result.append(reinterpret_cast<const char*>(ranges.second.data()), ranges.second.size());
     offset_ += count;
-    if (!valid_utf8(result)) { return std::unexpected(error(ErrorCode::InvalidUtf8)); }
+    if (!mmltk::common::types::valid_utf8(result)) { return std::unexpected(error(ErrorCode::InvalidUtf8)); }
     return result;
 }
 bool Reader::allocation_allowed(const AllocationKind kind, const std::size_t size) const noexcept {
@@ -464,7 +435,7 @@ std::expected<FlatValue, DecodeError> Reader::read_flat_scalar(const ItemHead he
         if (count > limits_.max_bytes - offset_) { return std::unexpected(error(ErrorCode::LimitExceeded)); }
         if (head.major == 3U) {
             const auto* data = reinterpret_cast<const char*>(input_.first.data() + offset_);
-            if (!valid_utf8(std::string_view{data, count})) { return std::unexpected(error(ErrorCode::InvalidUtf8)); }
+            if (!mmltk::common::types::valid_utf8(std::string_view{data, count})) { return std::unexpected(error(ErrorCode::InvalidUtf8)); }
         }
         offset_ += count;
         return FlatValue{};
@@ -551,7 +522,7 @@ std::expected<Reader::TextRange, DecodeError> Reader::read_structural_object_key
     if (offset_ > limits_.max_bytes || *count > limits_.max_bytes - offset_) { return std::unexpected(error(ErrorCode::LimitExceeded)); }
     const std::size_t data_offset = offset_;
     const auto* const data = reinterpret_cast<const char*>(input_.first.data() + data_offset);
-    if (!valid_utf8(std::string_view{data, *count})) { return std::unexpected(error(ErrorCode::InvalidUtf8)); }
+    if (!mmltk::common::types::valid_utf8(std::string_view{data, *count})) { return std::unexpected(error(ErrorCode::InvalidUtf8)); }
     offset_ += *count;
     return TextRange{.item_offset = item_offset, .data_offset = data_offset, .size = *count};
 }
@@ -779,7 +750,7 @@ std::expected<void, EncodeError> Writer::write_item(const Value& value, const st
                 }
                 return {};
             } else if constexpr (std::is_same_v<T, std::string>) {
-                if (!valid_utf8(item)) { return std::unexpected(encode_error(ErrorCode::InvalidUtf8)); }
+                if (!mmltk::common::types::valid_utf8(item)) { return std::unexpected(encode_error(ErrorCode::InvalidUtf8)); }
                 auto result = head(3U, item.size());
                 if (!result) { return result; }
                 return append(std::as_bytes(std::span<const char>{item.data(), item.size()}));

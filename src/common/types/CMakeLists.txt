@@ -12,5 +12,7 @@ mmltk_register_public_headers(mmltk_common_types
         stable_identity.h
         string_utils.h
         strong_id.h
+        utf8.h
 )
 set_target_properties(mmltk_common_types PROPERTIES LINKER_LANGUAGE CXX)
+mmltk_register_header_isolation(mmltk_common_types)
