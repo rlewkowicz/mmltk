@@ -13,6 +13,65 @@ ARG MMLTK_SIMDJSON_COMMIT=0c0ce1bd48baa0677dc7c0945ea7cd1e8b52b297
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
 # Build each static source dependency once with the application host compiler.
+# Private native Parquet import. Upstream Arrow and its pinned bundled dependencies
+# retain their own language policy; no allocator replacement or runtime DSO.
+ARG MMLTK_ARROW_VERSION=25.0.1
+ARG MMLTK_ARROW_SHA512=e75d384b4fdbdee29eb8ad29800c731843e7c43d90a43995dcc77390008723537791e212333178625345c718bdab15e0f3d8c12aa86b336918598c7d3fefc6e5
+RUN set -eux; \
+    curl -fsSL "https://downloads.apache.org/arrow/arrow-${MMLTK_ARROW_VERSION}/apache-arrow-${MMLTK_ARROW_VERSION}.tar.gz" -o /tmp/arrow.tar.gz; \
+    echo "${MMLTK_ARROW_SHA512}  /tmp/arrow.tar.gz" | sha512sum -c -; \
+    mkdir /tmp/arrow-src; \
+    tar -xzf /tmp/arrow.tar.gz --strip-components=1 -C /tmp/arrow-src; \
+    cmake -S /tmp/arrow-src/cpp -B /tmp/arrow-build -G Ninja \
+        -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/opt/arrow \
+        -DCMAKE_INSTALL_LIBDIR=lib -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+        -DCMAKE_C_COMPILER=/opt/gcc-16.2/bin/gcc \
+        -DCMAKE_CXX_COMPILER=/opt/gcc-16.2/bin/g++ \
+        -DCMAKE_CXX_STANDARD=20 -DCMAKE_CXX_STANDARD_REQUIRED=ON \
+        -DCMAKE_CXX_SCAN_FOR_MODULES=OFF -DBUILD_SHARED_LIBS=OFF \
+        -DARROW_DEPENDENCY_SOURCE=BUNDLED -DARROW_DEPENDENCY_USE_SHARED=OFF \
+        -DARROW_BUILD_SHARED=OFF -DARROW_BUILD_STATIC=ON \
+        -DARROW_PARQUET=ON -DARROW_IPC=ON \
+        -DARROW_WITH_SNAPPY=ON -DARROW_WITH_ZSTD=ON -DARROW_WITH_ZLIB=ON \
+        -DARROW_MIMALLOC=OFF -DARROW_JEMALLOC=OFF \
+        -DARROW_S3=OFF -DARROW_GCS=OFF -DARROW_AZURE=OFF -DARROW_HDFS=OFF \
+        -DARROW_FILESYSTEM=OFF -DARROW_COMPUTE=OFF -DARROW_ACERO=OFF \
+        -DARROW_DATASET=OFF -DARROW_FLIGHT=OFF -DARROW_FLIGHT_SQL=OFF \
+        -DARROW_CSV=OFF -DARROW_JSON=OFF -DARROW_ORC=OFF \
+        -DARROW_WITH_BROTLI=OFF -DARROW_WITH_BZ2=OFF -DARROW_WITH_LZ4=OFF \
+        -DARROW_WITH_RE2=OFF -DARROW_WITH_UTF8PROC=OFF -DARROW_WITH_BACKTRACE=OFF \
+        -DARROW_BUILD_UTILITIES=OFF -DARROW_BUILD_EXAMPLES=OFF \
+        -DARROW_BUILD_TESTS=OFF -DARROW_BUILD_BENCHMARKS=OFF \
+        -DARROW_BUILD_INTEGRATION=OFF -DARROW_PYTHON=OFF \
+        -DPARQUET_BUILD_EXECUTABLES=OFF -DPARQUET_BUILD_EXAMPLES=OFF \
+        -DPARQUET_REQUIRE_ENCRYPTION=OFF; \
+    cmake --build /tmp/arrow-build --parallel "$(nproc)"; \
+    cmake --install /tmp/arrow-build; \
+    install -Dm0644 /tmp/arrow-src/LICENSE.txt /opt/arrow/share/licenses/arrow/LICENSE.txt; \
+    install -Dm0644 /tmp/arrow-src/NOTICE.txt /opt/arrow/share/licenses/arrow/NOTICE.txt; \
+    for source in /tmp/arrow-src /tmp/arrow-build; do \
+        while IFS= read -r -d '' notice; do \
+            relative="${notice#${source}/}"; \
+            install -Dm0644 "${notice}" "/opt/arrow/share/licenses/arrow/$(basename "${source}")/${relative}"; \
+        done < <(find "${source}" -type f \( -iname 'license*' -o -iname 'notice*' -o -iname 'copying*' -o -iname 'copyright*' \) -print0); \
+    done; \
+    for dependency in snappy zstd zlib xsimd thrift rapidjson; do \
+        case "${dependency}" in \
+            thrift|rapidjson) dependency_source="/tmp/arrow-build/_deps/${dependency}-src" ;; \
+            xsimd) dependency_source=/tmp/arrow-build/src/xsimd_ep ;; \
+            *) dependency_source="/tmp/arrow-build/${dependency}_ep-prefix/src/${dependency}_ep" ;; \
+        esac; \
+        test -d "${dependency_source}"; \
+        mkdir -p "/opt/arrow/share/licenses/arrow/${dependency}"; \
+        find "${dependency_source}" -maxdepth 1 -type f \( -iname 'license*' -o -iname 'notice*' -o -iname 'copying*' -o -iname 'copyright*' -o -iname 'readme*' \) \
+            -exec cp -t "/opt/arrow/share/licenses/arrow/${dependency}" {} +; \
+        test -n "$(find "/opt/arrow/share/licenses/arrow/${dependency}" -type f -print -quit)"; \
+    done; \
+    test -f /opt/arrow/lib/libarrow.a; \
+    test -f /opt/arrow/lib/libparquet.a; \
+    test -f /opt/arrow/lib/libarrow_bundled_dependencies.a; \
+    rm -rf /tmp/arrow-src /tmp/arrow-build /tmp/arrow.tar.gz
+
 RUN set -eux; \
     git init /tmp/simdjson-src; \
     git -C /tmp/simdjson-src remote add origin https://github.com/simdjson/simdjson.git; \

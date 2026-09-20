@@ -764,6 +764,7 @@ void publish_benchmark_manifest(const BenchmarkCompilerConfig& config, const std
 }
 }  // namespace benchmark_internal
 void compile_benchmark_dataset(BenchmarkCompilerConfig config) {
+    if (!valid_benchmark_selection(config.selection)) throw std::invalid_argument("invalid benchmark dataset selection");
     using namespace benchmark_internal;
     if (config.resize_mode != mmltk::backend::imaging::resample::ImageResizeMode::Stretch &&
         config.resize_mode != mmltk::backend::imaging::resample::ImageResizeMode::Letterbox)

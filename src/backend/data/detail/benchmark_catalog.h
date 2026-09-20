@@ -5,6 +5,9 @@
 #include <string>
 #include <string_view>
 #include <vector>
+#include <optional>
+#include <unordered_map>
+#include <unordered_set>
 #include "src/backend/data/benchmark_dataset_compiler.h"
 namespace mmltk::backend::data::benchmark_internal {
 inline constexpr std::string_view kBenchmarkCatalogRevision = "benchmark-sources-v1";
@@ -20,6 +23,20 @@ struct NumericCategoryMapping {
     std::uint32_t source_id = 0U;
     std::uint8_t target_id = 0U;
     std::string_view expected_name;
+};
+struct CategoryLookup {
+    std::vector<std::int16_t> target_by_id;
+    std::unordered_map<std::uint32_t, std::string_view> expected_names;
+};
+[[nodiscard]] CategoryLookup make_numeric_lookup(std::span<const NumericCategoryMapping> mappings);
+class NumericCategoryAdmission final {
+ public:
+    explicit NumericCategoryAdmission(const CategoryLookup& lookup) : lookup_(lookup) {}
+    void observe(std::optional<std::uint32_t> id, std::optional<std::string_view> name);
+    void complete() const;
+ private:
+    const CategoryLookup& lookup_;
+    std::unordered_set<std::uint32_t> matched_;
 };
 struct StringCategoryMapping {
     std::string_view source_id;

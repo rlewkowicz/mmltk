@@ -13,6 +13,8 @@ runtime_package_inventory() {
         firefox firefox-bin libmozgtk.so libxul.so || return
     "$@" share/mmltk/licenses/gdrcopy /opt/mmltk/share/mmltk/licenses/gdrcopy repository \
         third_party/gdrcopy LICENSE UPSTREAM.md || return
+    "$@" share/mmltk/licenses/arrow /opt/mmltk/share/mmltk/licenses/arrow image . \
+        LICENSE.txt NOTICE.txt snappy zstd zlib xsimd thrift rapidjson || return
     "$@" models /opt/mmltk/models repository src/backend/imaging/upscale/assets \
         ShiftLUT_fp32.onnx RealPLKSR_fp16.onnx || return
     "$@" share/mmltk/python /opt/mmltk/share/mmltk/python repository \

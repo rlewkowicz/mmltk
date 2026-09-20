@@ -468,28 +468,9 @@ void parse_segmentation(simdjson::ondemand::value value, ParsedAnnotation::Segme
     parsed.complete = have_image && have_category;
     return parsed;
 }
-struct CategoryLookup {
-    std::vector<std::int16_t> target_by_id;
-    std::unordered_map<std::uint32_t, std::string_view> expected_names;
-};
-[[nodiscard]] CategoryLookup make_numeric_lookup(const std::span<const NumericCategoryMapping> mappings) {
-    std::uint32_t maximum = 0U;
-    for (const NumericCategoryMapping& mapping : mappings) { maximum = std::max(maximum, mapping.source_id); }
-    CategoryLookup lookup;
-    lookup.target_by_id.assign(static_cast<std::size_t>(maximum) + 1U, -1);
-    lookup.expected_names.reserve(mappings.size());
-    for (const NumericCategoryMapping& mapping : mappings) {
-        if (mapping.target_id >= coco80_class_names().size() || mapping.source_id == 0U || lookup.target_by_id[mapping.source_id] != -1 ||
-            !lookup.expected_names.emplace(mapping.source_id, mapping.expected_name).second) {
-            throw std::runtime_error("benchmark numeric category mapping is invalid");
-        }
-        lookup.target_by_id[mapping.source_id] = mapping.target_id;
-    }
-    return lookup;
-}
 void validate_numeric_categories(const PaddedMappedFile& file, const ByteRange categories, const CategoryLookup& lookup,
                                  mmltk::common::concurrency::CancellationObservation cancel_requested) {
-    std::unordered_set<std::uint32_t> matched;
+    NumericCategoryAdmission admission(lookup);
     simdjson::ondemand::parser parser;
     for_each_object(file, categories, parser, [&](simdjson::ondemand::object object, std::uint64_t) {
         std::uint32_t id = 0U;
@@ -506,17 +487,10 @@ void validate_numeric_categories(const PaddedMappedFile& file, const ByteRange c
                 have_name = true;
             }
         }
-        const auto expected = lookup.expected_names.find(id);
-        if (expected != lookup.expected_names.end()) {
-            if (!have_id || !have_name || name != expected->second) {
-                throw std::runtime_error("benchmark source category metadata disagrees with fixed mapping for id " + std::to_string(id) + ": expected '" +
-                                         std::string(expected->second) + "', found '" + std::string(name) + "'");
-            }
-            if (!matched.emplace(id).second) { throw std::runtime_error("benchmark source category metadata repeats mapped id " + std::to_string(id)); }
-        }
+        admission.observe(have_id ? std::optional(id) : std::nullopt, have_name ? std::optional(name) : std::nullopt);
         throw_if_benchmark_cancelled(cancel_requested);
     });
-    if (matched.size() != lookup.expected_names.size()) { throw std::runtime_error("benchmark source is missing required mapped categories"); }
+    admission.complete();
 }
 struct BoxCandidate {
     std::uint32_t image_index = 0U;

@@ -7,6 +7,15 @@ Vendored third-party code under third_party/ and bundled font assets under
 src/frontend/iced/assets/fonts/ retain their respective upstream licenses and
 notices.
 
+Apache Arrow / Parquet 25.0.1
+-----------------------------
+
+The native COCONut importer statically links Apache Arrow and Parquet, licensed
+under Apache-2.0, with pinned bundled Snappy, Zstandard, zlib, xsimd, Apache
+Thrift, and RapidJSON dependencies. Upstream licenses and notices, including
+Arrow vendored notices, are retained in share/mmltk/licenses/arrow in the
+packaged application. Source: https://arrow.apache.org/
+
 Explore upscaler model assets
 -----------------------------
 

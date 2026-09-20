@@ -1,4 +1,5 @@
 #pragma once
+#include "src/backend/data/benchmark_dataset_options.h"
 #include "src/backend/imaging/resample/image_resize.h"
 #include <atomic>
 #include <cstddef>
@@ -52,6 +53,7 @@ using BenchmarkProgressCallback = std::function<void(const BenchmarkCompileProgr
 using BenchmarkTraceCallback = std::function<void(std::string_view event, std::string_view json_fields)>;
 [[nodiscard]] std::string format_benchmark_source_status(const BenchmarkSourceProgress& progress, std::string_view default_status);
 struct BenchmarkCompilerConfig {
+    BenchmarkDatasetSelection selection;
     std::filesystem::path output_dir{"./compiled"};
     // Optional final destination for callers that publish output_dir elsewhere.
     // Used only for cache overlap admission; empty means output_dir.

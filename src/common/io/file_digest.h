@@ -5,10 +5,23 @@
 #include <filesystem>
 #include <functional>
 #include <optional>
+#include <memory>
 #include <span>
 #include <string>
 namespace mmltk::common::io {
 using Sha256Digest = std::array<std::uint8_t, 32>;
+class Sha256Hasher final {
+ public:
+    Sha256Hasher();
+    ~Sha256Hasher();
+    Sha256Hasher(const Sha256Hasher&) = delete;
+    Sha256Hasher& operator=(const Sha256Hasher&) = delete;
+    void Update(std::span<const std::uint8_t> bytes);
+    [[nodiscard]] Sha256Digest Finish();
+ private:
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+};
 struct FileSnapshot final {
     std::uint64_t device{}, inode{}, bytes{};
     std::int64_t modified_seconds{}, modified_nanoseconds{}, changed_seconds{}, changed_nanoseconds{};

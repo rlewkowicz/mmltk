@@ -46,6 +46,21 @@ FileSnapshot snapshot(int fd) {
     return snapshot(value);
 }
 }  // namespace
+struct Sha256Hasher::Impl {
+    DigestContext context = make_digest_context(EVP_sha256());
+};
+Sha256Hasher::Sha256Hasher() : impl_(std::make_unique<Impl>()) {}
+Sha256Hasher::~Sha256Hasher() = default;
+void Sha256Hasher::Update(std::span<const std::uint8_t> bytes) {
+    if (!impl_->context) throw std::logic_error("SHA-256 digest already finalized");
+    update_digest(impl_->context.get(), bytes.data(), bytes.size());
+}
+Sha256Digest Sha256Hasher::Finish() {
+    if (!impl_->context) throw std::logic_error("SHA-256 digest already finalized");
+    auto result = finish_digest(impl_->context.get());
+    impl_->context.reset();
+    return result;
+}
 FileSnapshot FileSnapshot::Read(int file_descriptor) { return snapshot(file_descriptor); }
 FileSnapshot FileSnapshot::Read(const std::filesystem::path& path) {
     const auto file = FileHandle::open_readonly(path.string());
@@ -59,21 +74,21 @@ std::optional<FileDigests> try_file_digests(const std::filesystem::path& path, b
     const auto file = FileHandle::open_readonly(path.string());
     FileDigests result;
     result.snapshot = snapshot(file.get());
-    auto sha = make_digest_context(EVP_sha256());
+    Sha256Hasher sha;
     auto md5 = include_md5 ? make_digest_context(EVP_md5()) : DigestContext{};
     std::vector<std::uint8_t> buffer(std::min<std::uint64_t>(kHashReadBytes, std::max<std::uint64_t>(result.snapshot.bytes, 1U)));
     for (std::uint64_t offset = 0; offset < result.snapshot.bytes;) {
         if (cancelled()) return std::nullopt;
         const auto count = std::min<std::uint64_t>(buffer.size(), result.snapshot.bytes - offset);
         file.pread_all(buffer.data(), count, offset);
-        update_digest(sha.get(), buffer.data(), count);
+        sha.Update(std::span(buffer.data(), count));
         if (md5) update_digest(md5.get(), buffer.data(), count);
         offset += count;
     }
     if (cancelled()) return std::nullopt;
     if (snapshot(file.get()) != result.snapshot) throw std::runtime_error("artifact changed while computing digest");
     result.snapshot.RequireUnchanged(path);
-    result.sha256 = finish_digest(sha.get());
+    result.sha256 = sha.Finish();
     if (md5) {
         std::array<std::uint8_t, 16> bytes{};
         unsigned int size = 0;
@@ -93,9 +108,9 @@ Sha256Digest sha256_file(const std::filesystem::path& path, std::function_ref<bo
     return *digest;
 }
 Sha256Digest sha256_bytes(const std::span<const std::uint8_t> bytes) {
-    DigestContext context = make_digest_context(EVP_sha256());
-    update_digest(context.get(), bytes.data(), bytes.size());
-    return finish_digest(context.get());
+    Sha256Hasher hash;
+    hash.Update(bytes);
+    return hash.Finish();
 }
 std::string sha256_hex(const Sha256Digest& digest) { return mmltk::common::types::hex_encode(digest); }
 Sha256Digest parse_sha256_hex(const std::string& value) {

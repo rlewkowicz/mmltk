@@ -1,6 +1,8 @@
 #include "detail/benchmark_catalog.h"
 #include "src/backend/data/catalog/coco_catalog.h"
 #include <cstdio>
+#include <algorithm>
+#include <stdexcept>
 #include <span>
 #include <string_view>
 #include "src/backend/data/benchmark_dataset_compiler.h"
@@ -349,5 +351,32 @@ std::string_view benchmark_source_name(const BenchmarkDatasetSource source) noex
 std::string_view benchmark_source_version(const BenchmarkDatasetSource source) noexcept {
     const BenchmarkSourceDescriptor* descriptor = benchmark_source_descriptor(source);
     return descriptor != nullptr ? descriptor->version : "unknown";
+}
+CategoryLookup make_numeric_lookup(const std::span<const NumericCategoryMapping> mappings) {
+    std::uint32_t maximum = 0U;
+    for (const NumericCategoryMapping& mapping : mappings) { maximum = std::max(maximum, mapping.source_id); }
+    CategoryLookup lookup;
+    lookup.target_by_id.assign(static_cast<std::size_t>(maximum) + 1U, -1);
+    lookup.expected_names.reserve(mappings.size());
+    for (const NumericCategoryMapping& mapping : mappings) {
+        if (mapping.target_id >= coco80_class_names().size() || mapping.source_id == 0U || lookup.target_by_id[mapping.source_id] != -1 ||
+            !lookup.expected_names.emplace(mapping.source_id, mapping.expected_name).second) {
+            throw std::runtime_error("benchmark numeric category mapping is invalid");
+        }
+        lookup.target_by_id[mapping.source_id] = mapping.target_id;
+    }
+    return lookup;
+}
+void NumericCategoryAdmission::observe(std::optional<std::uint32_t> id, std::optional<std::string_view> name) {
+    const auto expected = lookup_.expected_names.find(id.value_or(0U));
+    if (expected == lookup_.expected_names.end()) return;
+    if (!id || !name || *name != expected->second) {
+        throw std::runtime_error("benchmark source category metadata disagrees with fixed mapping for id " + std::to_string(id.value_or(0U)) + ": expected '" +
+                                 std::string(expected->second) + "', found '" + std::string(name.value_or(std::string_view{})) + "'");
+    }
+    if (!matched_.emplace(*id).second) throw std::runtime_error("benchmark source category metadata repeats mapped id " + std::to_string(*id));
+}
+void NumericCategoryAdmission::complete() const {
+    if (matched_.size() != lookup_.expected_names.size()) throw std::runtime_error("benchmark source is missing required mapped categories");
 }
 }  // namespace mmltk::backend::data::benchmark_internal

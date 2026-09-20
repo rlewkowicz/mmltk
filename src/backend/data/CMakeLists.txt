@@ -3,6 +3,12 @@ include(MmltkComponent)
 find_package(simdjson 3.13.0 EXACT CONFIG REQUIRED
     PATHS /opt/simdjson/lib/cmake/simdjson
     NO_DEFAULT_PATH)
+find_package(Arrow 25.0.1 EXACT CONFIG REQUIRED
+    PATHS /opt/arrow/lib/cmake/Arrow NO_DEFAULT_PATH)
+find_package(Parquet 25.0.1 EXACT CONFIG REQUIRED
+    PATHS /opt/arrow/lib/cmake/Parquet NO_DEFAULT_PATH)
+install(DIRECTORY /opt/arrow/share/licenses/arrow/
+    DESTINATION share/mmltk/licenses/arrow)
 find_package(CURL REQUIRED)
 find_package(LibArchive REQUIRED)
 
@@ -47,6 +53,7 @@ mmltk_register_public_headers(
     BASE_DIRS ${CMAKE_SOURCE_DIR}
     FILES
         benchmark_dataset_compiler.h
+        benchmark_dataset_options.h
         compiled_image_stream.h
         compiled_dataset.h
         compiled_file_layout.h
@@ -63,6 +70,9 @@ mmltk_register_ordinary_sources(mmltk_backend_data
     compiled_file_layout.cpp
     compiled_dataset.cpp
     benchmark_annotations.cpp
+    coconut_annotations.cpp
+    coconut_parquet.cpp
+    coconut_catalog.cpp
     benchmark_cache.cpp
     benchmark_catalog.cpp
     benchmark_compiler.cpp
@@ -90,6 +100,8 @@ mmltk_register_ordinary_sources(mmltk_backend_data
     writable_pixel_range.cpp)
 mmltk_register_private_headers(mmltk_backend_data
     detail/benchmark_annotations.h
+    detail/coconut_annotations.h
+    detail/coconut_catalog.h
     detail/benchmark_cache.h
     detail/benchmark_catalog.h
     detail/benchmark_compiler.h
@@ -133,10 +145,13 @@ target_link_libraries(mmltk_backend_data
         mmltk::common::types
         mmltk::frameworks::gpu
         mmltk::frameworks::process
+        mmltk::frameworks::serialization
         CURL::libcurl
         LibArchive::LibArchive
         rapidgzip::rapidgzip
         simdjson::simdjson
+        Arrow::arrow_static
+        Parquet::parquet_static
         stb
         CUDA::cuda_driver
         ${MMLTK_TURBOJPEG_LIBRARY}
@@ -168,6 +183,7 @@ function(mmltk_add_backend_data_tests)
         ${CMAKE_SOURCE_DIR}/src/backend/data/tests/roundtrip.test.cpp
         ${CMAKE_SOURCE_DIR}/src/backend/data/tests/benchmark_dataset.test.cpp)
     mmltk_register_ordinary_sources(mmltk_backend_data_tests
+        ${CMAKE_SOURCE_DIR}/src/backend/data/tests/coconut_dataset.test.cpp
         ${CMAKE_SOURCE_DIR}/src/backend/data/catalog/tests/class_catalog.test.cpp
         ${CMAKE_SOURCE_DIR}/src/common/io/tests/file_digest.test.cpp)
     mmltk_configure_component(
@@ -190,6 +206,9 @@ function(mmltk_add_backend_data_tests)
         CUDA::cudart
         CUDA::cuda_driver
         nlohmann_json
+        Arrow::arrow_static
+        Parquet::parquet_static
+        LibArchive::LibArchive
         stb
     )
     catch_discover_tests(
