@@ -209,6 +209,12 @@ struct BrowserAudit final {
     bool workspace_fps_text = false;
     bool workspace_fps_pixels = false;
     bool benchmark_round_trip = false;
+    bool benchmark_inactive = false;
+    std::optional<std::array<double, 4>> benchmark_baseline;
+    std::map<std::size_t, std::pair<std::string, std::array<double, 4>>> benchmark_choices;
+    std::map<std::size_t, std::string> benchmark_clicks;
+    std::map<std::pair<std::size_t, std::string>, std::array<double, 4>> benchmark_visibility;
+    [[nodiscard]] bool benchmark_choices_complete() const;
     bool bootstrap = false;
     bool dataset_configured = false;
     bool progress = false;

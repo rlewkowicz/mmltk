@@ -1,5 +1,5 @@
 use crate::fluent_theme::Element;
-use crate::generated::ImageResizeMode;
+use crate::generated::{BenchmarkDatasetVariant, CoconutValidation, ImageResizeMode};
 use crate::view::settings::{EditCadence, EditSchedule, SettingsModel};
 use iced::Fill;
 use iced::widget::{button, checkbox, column, container, radio, row, text};
@@ -8,6 +8,8 @@ use iced::widget::{button, checkbox, column, container, radio, row, text};
 pub enum Message {
     Ignore,
     BenchmarkChanged(bool),
+    DatasetChanged(BenchmarkDatasetVariant),
+    ValidationChanged(CoconutValidation),
     SourceChanged(String),
     CompiledDirectoryChanged(String),
     InferSplitsChanged(bool),
@@ -39,6 +41,12 @@ pub fn update(model: &mut SettingsModel, message: Message) -> Result<Outcome, St
         Message::Ignore => return Ok(Outcome::Ignored),
         Message::BenchmarkChanged(value) => model.edit(cadence, |draft| {
             crate::generated::edit_workflowstraincompilebenchmarkdatasetoverride(draft, value)
+        })?,
+        Message::DatasetChanged(value) => model.edit(cadence, |draft| {
+            crate::generated::edit_workflowstrainbenchmarkselectiondataset(draft, value)
+        })?,
+        Message::ValidationChanged(value) => model.edit(cadence, |draft| {
+            crate::generated::edit_workflowstrainbenchmarkselectionvalidation(draft, value)
         })?,
         Message::SourceChanged(value) => model.edit(cadence, |draft| {
             crate::generated::edit_workflowstraindatasetsourcedir(draft, value)
@@ -96,6 +104,7 @@ pub fn view<'a>(
             text("Dataset settings unavailable"),
         );
     };
+    let benchmark_selection_enabled = enabled && !model.workflow.dataset.as_ref().is_some_and(|state| state.active);
     let fields = column![
         container(
             checkbox(train.compilebenchmarkdatasetoverride)
@@ -104,6 +113,7 @@ pub fn view<'a>(
                 .style(crate::fluent_theme::checkbox_benchmark)
         )
         .id(super::BENCHMARK_OVERRIDE_ID),
+        benchmark_choices(train, benchmark_selection_enabled),
         container(crate::view::workflow::fields::text_field(
             "Dataset source",
             crate::generated::constraint_workflowstraindatasetsourcedir().stable_field_id,
@@ -277,10 +287,138 @@ pub fn view<'a>(
     )
 }
 
+fn benchmark_radio<'a, T: Copy + Eq + 'a>(
+    label: &'a str, id: &'static str, value: T, selected: T,
+    enabled: bool, message: fn(T) -> Message,
+) -> Element<'a, Message> {
+    container(radio(label, value, Some(selected), move |value| {
+        if enabled { message(value) } else { Message::Ignore }
+    }).style(move |theme, status| {
+        if enabled { iced_fluent_theme::radio::default(theme, status) }
+        else { iced_fluent_theme::radio::disabled(theme, status) }
+    })).id(id).into()
+}
+
+fn benchmark_choices(train: &crate::generated::TrainViewState, enabled: bool) -> Element<'_, Message> {
+    let mut choices = column![].spacing(crate::view::workflow::FIELD_SPACING);
+    if train.compilebenchmarkdatasetoverride {
+        for (label, id, value) in [
+            ("Coco custom", super::BENCHMARK_CUSTOM_ID, BenchmarkDatasetVariant::CocoCustom),
+            ("Coconut", super::BENCHMARK_COCONUT_ID, BenchmarkDatasetVariant::Coconut),
+        ] {
+            choices = choices.push(benchmark_radio(label, id, value, train.benchmarkselection.dataset, enabled, Message::DatasetChanged));
+        }
+        if train.benchmarkselection.dataset == BenchmarkDatasetVariant::Coconut {
+            for (label, description, id, value) in [
+                ("Coconut validation", "COCO val2017 and Objects365 validation with Coconut annotations.", super::COCONUT_VALIDATION_ID, CoconutValidation::Coconut),
+                ("Stock validation", "COCO val2017 with stock instance annotations.", super::STOCK_VALIDATION_ID, CoconutValidation::Stock),
+                ("Coconut stock", "COCO val2017 with Coconut enhanced annotations.", super::COCONUT_STOCK_ID, CoconutValidation::CoconutStock),
+            ] {
+                choices = choices.push(benchmark_radio(label, id, value, train.benchmarkselection.validation, enabled, Message::ValidationChanged)).push(text(description));
+            }
+        }
+    }
+    choices.into()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::view::settings::installed_settings_model;
+
+    #[test]
+    fn active_compilation_disables_only_new_selection_radios() {
+        use iced::advanced::{layout, renderer::Headless, widget, Layout, Shell};
+        use iced::{Event, Point, Rectangle, Size, mouse};
+        struct Bounds(std::collections::BTreeMap<String, Rectangle>);
+        impl widget::Operation for Bounds {
+            fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn widget::Operation)) { operate(self); }
+            fn container(&mut self, id: Option<&widget::Id>, bounds: Rectangle) {
+                for control in [super::super::BENCHMARK_CUSTOM_ID, super::super::BENCHMARK_COCONUT_ID,
+                    super::super::COCONUT_VALIDATION_ID, super::super::STOCK_VALIDATION_ID, super::super::COCONUT_STOCK_ID,
+                    "train.dataset.resize.letterbox"] {
+                    if id == Some(&widget::Id::from(control)) { self.0.insert(control.to_owned(), bounds); }
+                }
+            }
+        }
+        let renderer = iced::futures::executor::block_on(<iced::Renderer as Headless>::new(Default::default(), Some("wgpu")))
+            .expect("dataset interaction requires the container renderer");
+        let mut model = crate::view_model::test_support::bootstrapped();
+        model.workflow.dataset.as_mut().unwrap().active = true;
+        let settings = installed_settings_model();
+        let mut train = settings.draft.as_ref().unwrap().workflows.train.clone();
+        train.compilebenchmarkdatasetoverride = true;
+        train.benchmarkselection.dataset = BenchmarkDatasetVariant::Coconut;
+        let mut element = view(Some(&train), &model, true, true);
+        let mut tree = widget::Tree::new(&element);
+        let size = Size::new(1000.0, 4000.0);
+        let node = element.as_widget_mut().layout(&mut tree, &renderer, &layout::Limits::new(size, size));
+        let mut bounds = Bounds(Default::default());
+        element.as_widget_mut().operate(&mut tree, Layout::new(&node), &renderer, &mut bounds);
+        assert_eq!(bounds.0.len(), 6);
+        for (control, rectangle) in &bounds.0 {
+            let mut messages = Vec::new();
+            let mut shell = Shell::new(&iced::window::Headless, iced_runtime::core::shell::Waker::new(|| {}), &mut messages);
+            element.as_widget_mut().update(&mut tree, &Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+                Layout::new(&node), mouse::Cursor::Available(Point::new(rectangle.x + 8.0, rectangle.center_y())),
+                &renderer, &mut shell, &Rectangle::new(Point::ORIGIN, size));
+            assert_eq!(messages.len(), 1);
+            if control == "train.dataset.resize.letterbox" {
+                assert!(matches!(messages[0], Message::ResizeModeChanged(ImageResizeMode::Letterbox)));
+            } else {
+                assert!(matches!(messages[0], Message::Ignore));
+            }
+        }
+    }
+
+    #[test]
+    fn benchmark_choices_retain_hidden_settings_and_emit_only_debounced_edits() {
+        let mut model = installed_settings_model();
+        let train = &model.draft.as_ref().unwrap().workflows.train;
+        assert_eq!(train.benchmarkselection.dataset, BenchmarkDatasetVariant::CocoCustom);
+        assert_eq!(train.benchmarkselection.validation, CoconutValidation::Coconut);
+        for dataset in [BenchmarkDatasetVariant::Coconut, BenchmarkDatasetVariant::CocoCustom] {
+            assert!(matches!(update(&mut model, Message::DatasetChanged(dataset)), Ok(Outcome::SettingsEdited(EditSchedule::Debounce(_)))));
+            for validation in [CoconutValidation::Stock, CoconutValidation::CoconutStock, CoconutValidation::Coconut] {
+                assert!(matches!(update(&mut model, Message::ValidationChanged(validation)), Ok(Outcome::SettingsEdited(EditSchedule::Debounce(_)))));
+                for enabled in [true, false, true] {
+                    update(&mut model, Message::BenchmarkChanged(enabled)).unwrap();
+                    let train = &model.draft.as_ref().unwrap().workflows.train;
+                    assert_eq!(train.benchmarkselection.dataset, dataset);
+                    assert_eq!(train.benchmarkselection.validation, validation);
+                }
+            }
+        }
+        let before = model.draft.clone();
+        assert!(matches!(update(&mut model, Message::Ignore), Ok(Outcome::Ignored)));
+        assert_eq!(model.draft, before);
+        assert!(matches!(update(&mut model, Message::Compile), Ok(Outcome::Compile)));
+        assert_eq!(model.draft, before);
+    }
+
+    #[test]
+    fn benchmark_widget_tree_hides_only_inapplicable_children() {
+        fn nodes(tree: &iced::advanced::widget::Tree) -> usize {
+            1 + tree.children.iter().map(nodes).sum::<usize>()
+        }
+        let settings = installed_settings_model();
+        let mut train = settings.draft.as_ref().unwrap().workflows.train.clone();
+        let shape = |train: &crate::generated::TrainViewState, enabled| {
+            let view = benchmark_choices(train, enabled);
+            nodes(&iced::advanced::widget::Tree::new(&view))
+        };
+        train.compilebenchmarkdatasetoverride = false;
+        let hidden = shape(&train, true);
+        train.compilebenchmarkdatasetoverride = true;
+        let custom = shape(&train, true);
+        assert!(custom > hidden);
+        train.benchmarkselection.dataset = BenchmarkDatasetVariant::Coconut;
+        let coconut = shape(&train, true);
+        assert!(coconut > custom);
+        assert_eq!(shape(&train, false), coconut);
+        train.compilebenchmarkdatasetoverride = false;
+        assert_eq!(shape(&train, true), hidden);
+    }
 
     #[test]
     fn resize_radios_settle_independently_of_perceptual_choice() {

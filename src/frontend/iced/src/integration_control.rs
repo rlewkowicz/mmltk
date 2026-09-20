@@ -670,6 +670,8 @@ enum Phase {
     BenchmarkRestore,
     AwaitBenchmarkRestored,
     AwaitBenchmarkSnapshot,
+    BenchmarkChoice(usize),
+    AwaitBenchmarkChoice(usize),
     DatasetSource,
     AwaitDatasetSource,
     CompiledDirectory,
@@ -1553,6 +1555,7 @@ impl Controller {
             | Phase::DatasetBrowse
             | Phase::BenchmarkOverride
             | Phase::BenchmarkRestore
+            | Phase::BenchmarkChoice(..)
             | Phase::DatasetSource
             | Phase::CompiledDirectory
             | Phase::PerceptualControl(..)
@@ -2056,8 +2059,10 @@ impl Controller {
             | Phase::AwaitBenchmarkOverride
             | Phase::AwaitBenchmarkChangedSnapshot
             | Phase::BenchmarkRestore
+            | Phase::BenchmarkChoice(..)
             | Phase::AwaitBenchmarkRestored
             | Phase::AwaitBenchmarkSnapshot
+            | Phase::AwaitBenchmarkChoice(..)
             | Phase::PerceptualControl(..)
             | Phase::AwaitPerceptualControl(..)
             | Phase::DatasetSource

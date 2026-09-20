@@ -38,6 +38,7 @@ class UnusedWeightOperations final : public services::ArtifactWeightOperations {
 };
 class DiagnosticCompiler final : public services::ArtifactCompilerOperations {
    public:
+    mutable mmltk::backend::data::BenchmarkDatasetSelection selection;
     mutable std::filesystem::path physical_output;
     mutable std::filesystem::path publication_output;
     mutable bool observer_enabled = false;
@@ -47,10 +48,11 @@ class DiagnosticCompiler final : public services::ArtifactCompilerOperations {
    private:
     void compile_directory(const std::filesystem::path&, const std::filesystem::path&, std::uint32_t, bool, mmltk::backend::imaging::resample::ImageResizeMode,
                            mmltk::common::concurrency::CancellationObservation, services::ArtifactProgressObserver) const override {}
-    void compile_benchmark(const std::filesystem::path& output, const std::filesystem::path& publication, std::uint32_t, bool,
+    void compile_benchmark(mmltk::backend::data::BenchmarkDatasetSelection selected, const std::filesystem::path& output, const std::filesystem::path& publication, std::uint32_t, bool,
                            mmltk::backend::imaging::resample::ImageResizeMode, mmltk::common::concurrency::CancellationObservation cancellation,
                            services::ArtifactProgressObserver,
                            services::ArtifactBenchmarkTraceObserver trace) const override {
+        selection = selected;
         physical_output = output;
         publication_output = publication;
         observer_enabled = trace.report != nullptr;
@@ -94,7 +96,8 @@ TEST_CASE("artifact dataset runtime owns its diagnostic target and borrows only 
                                                    .output = root.path() / "output",
                                                    .preset = "rf-detr-base",
                                                    .resolution = 560U,
-                                                   .overwrite = true};
+                                                   .overwrite = true,
+                                                   .benchmark_selection = {mmltk::backend::data::BenchmarkDatasetVariant::Coconut, mmltk::backend::data::CoconutValidation::Stock}};
     {
         ArtifactDatasetRuntime runtime{services::ArtifactStore{root.path() / "cache", weights, compiler}, target};
         target = {};
@@ -104,6 +107,7 @@ TEST_CASE("artifact dataset runtime owns its diagnostic target and borrows only 
         CHECK(compiler.observer_enabled == enabled);
         CHECK(compiler.observer_context == enabled);
         CHECK(compiler.publication_output == request.output);
+        CHECK(compiler.selection == request.benchmark_selection);
         CHECK(compiler.physical_output != request.output);
         CHECK(compiler.physical_output.parent_path() == request.output.parent_path());
         CHECK_FALSE(std::filesystem::exists(compiler.physical_output));
@@ -396,5 +400,87 @@ TEST_CASE("dataset independently rejects each malformed progress invariant", "[c
     CHECK(result.snapshot.terminal.outcome == contracts::ArtifactTerminalOutcome::Failed);
     CHECK(result.snapshot.terminal.detail == "dataset compiler returned invalid progress");
 }
+TEST_CASE("dataset compile observes the settled benchmark selection and retains it while settings change", "[controller][systems][dataset][benchmark]") {
+    namespace data = mmltk::backend::data;
+    using mmltk::frameworks::serialization::wire::FlatValue;
+    const mmltk::testsupport::ScopedTempDir root{"dataset-selection-admission"};
+    SettingsSystem settings;
+    REQUIRE(settings.Load(install_settings(root.path())).applied());
+    contracts::SettingsUpdateRequest edit;
+    edit.updates = {
+        {.path = "workflows.train.compile_benchmark_dataset_override", .value = FlatValue{true}},
+        {.path = "workflows.train.benchmark_selection.dataset", .value = *FlatValue::text("Coconut", 7U)},
+        {.path = "workflows.train.benchmark_selection.validation", .value = *FlatValue::text("CoconutStock", 12U)},
+        {.path = "workflows.train.compiled_dataset_dir", .value = *FlatValue::text((root.path() / "output").string(), 4096U)}};
+    const auto settled = settings.Update(std::move(edit));
+    const data::BenchmarkDatasetSelection selected{data::BenchmarkDatasetVariant::Coconut, data::CoconutValidation::CoconutStock};
+    REQUIRE(settled.settings_state.workflows.train.benchmark_selection == selected);
+    UnusedWeightOperations weights;
+    DiagnosticCompiler compiler;
+    mmltk::testsupport::TestGate gate{"dataset selection"};
+    compiler.work = [receipt = gate.receipt()](auto) { receipt.ArriveAndWait(); };
+    DatasetSystem dataset{settings, [&] {
+        return std::make_unique<ArtifactDatasetRuntime>(services::ArtifactStore{root.path() / "cache", weights, compiler});
+    }};
+    mmltk::testsupport::ScopedTestCleanup cleanup{[&] { gate.Release(); dataset.Shutdown(); }};
+    CHECK_FALSE(dataset.snapshot().active);
+    static_cast<void>(dataset.Compile({}));
+    REQUIRE(gate.WaitEntered(std::chrono::seconds{2}));
+    CHECK(dataset.snapshot().active);
+    CHECK(compiler.selection == selected);
+    contracts::SettingsUpdateRequest later;
+    later.updates = {{.path = "workflows.train.benchmark_selection.validation", .value = *FlatValue::text("Stock", 5U)},
+                     {.path = "workflows.train.compile_benchmark_dataset_override", .value = FlatValue{false}}};
+    const auto changed = settings.Update(std::move(later));
+    CHECK(changed.settings_state.workflows.train.benchmark_selection.validation == data::CoconutValidation::Stock);
+    CHECK(compiler.selection == selected);
+    CHECK_THROWS_AS(dataset.Compile({}), contracts::BusyError);
+    static_cast<void>(dataset.Stop());
+    gate.Release();
+    dataset.Shutdown();
+    CHECK(compiler.selection == selected);
+}
+TEST_CASE("configured artifact compiler receives every benchmark selection without changing staging paths", "[controller][systems][dataset][benchmark]") {
+    namespace data = mmltk::backend::data;
+    const mmltk::testsupport::ScopedTempDir root{"benchmark-compiler-selection"};
+    UnusedWeightOperations weights;
+    DiagnosticCompiler compiler;
+    ArtifactDatasetRuntime runtime{services::ArtifactStore{root.path() / "cache", weights, compiler}};
+    services::ArtifactCompileRequest request{.kind = services::ArtifactCompileKind::Benchmark,
+        .output = root.path() / "output", .preset = "rf-detr-nano", .resolution = 384U};
+    for (const auto dataset : {data::BenchmarkDatasetVariant::CocoCustom, data::BenchmarkDatasetVariant::Coconut}) {
+        for (const auto validation : {data::CoconutValidation::Coconut, data::CoconutValidation::Stock, data::CoconutValidation::CoconutStock}) {
+            request.benchmark_selection = {dataset, validation};
+            static_cast<void>(runtime.Compile(request, {}, {}));
+            CHECK(compiler.selection == request.benchmark_selection);
+            CHECK(compiler.publication_output == request.output);
+            CHECK(compiler.physical_output != request.output);
+            CHECK_FALSE(std::filesystem::exists(compiler.physical_output));
+        }
+    }
+}
+TEST_CASE("benchmark materialization retains each admitted selection after later settings edits", "[controller][systems][dataset][benchmark]") {
+    namespace data = mmltk::backend::data;
+    auto settings = contracts::default_gui_settings_state();
+    settings.workflows.train.compile_benchmark_dataset_override = true;
+    for (const auto dataset : {data::BenchmarkDatasetVariant::CocoCustom, data::BenchmarkDatasetVariant::Coconut}) {
+        for (const auto validation : {data::CoconutValidation::Coconut, data::CoconutValidation::Stock, data::CoconutValidation::CoconutStock}) {
+            const data::BenchmarkDatasetSelection selected{dataset, validation};
+            settings.workflows.train.benchmark_selection = selected;
+            const auto captured = services::materialize_artifact_compile(settings);
+            REQUIRE(captured);
+            CHECK(captured->benchmark_selection == selected);
+            settings.workflows.train.benchmark_selection = {};
+            settings.workflows.train.compile_benchmark_dataset_override = false;
+            CHECK(captured->kind == services::ArtifactCompileKind::Benchmark);
+            CHECK(captured->benchmark_selection == selected);
+            const auto directory = services::materialize_artifact_compile(settings);
+            REQUIRE(directory);
+            CHECK(directory->kind == services::ArtifactCompileKind::Directory);
+            settings.workflows.train.compile_benchmark_dataset_override = true;
+        }
+    }
+}
+
 }  // namespace
 }  // namespace mmltk::controller

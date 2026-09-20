@@ -21,6 +21,11 @@ pub const COMPILE_DIMENSIONS_ID: &str = "train.dataset.compile_dimensions";
 pub const COMPILE_RESOLUTION_ID: &str = "train.dataset.resolution";
 pub const COMPILE_PROGRESS_ID: &str = "train.compile_dataset.progress";
 pub const BENCHMARK_OVERRIDE_ID: &str = "train.dataset.benchmark_override";
+pub const BENCHMARK_CUSTOM_ID: &str = "train.dataset.benchmark.custom";
+pub const BENCHMARK_COCONUT_ID: &str = "train.dataset.benchmark.coconut";
+pub const COCONUT_VALIDATION_ID: &str = "train.dataset.validation.coconut";
+pub const STOCK_VALIDATION_ID: &str = "train.dataset.validation.stock";
+pub const COCONUT_STOCK_ID: &str = "train.dataset.validation.coconut_stock";
 pub const MATCH_FREE_ASSIGNMENT_ID: &str = "train.advanced.assignment.match_free";
 
 #[derive(Debug, Clone)]

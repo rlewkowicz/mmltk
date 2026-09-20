@@ -1084,6 +1084,24 @@ TEST_CASE("Train observes persistence failure beyond bounded console output with
     CHECK(result.output.size() <= kTrainProcessReadBudget);
     CHECK_FALSE(result.terminal.final_progress->persistence.error.empty());
 }
+TEST_CASE("artifact benchmark requests admit canonical selections and Directory ignores retained choices", "[gui][services][benchmark]") {
+    namespace data = mmltk::backend::data;
+    ArtifactCompileRequest request{.kind = mmltk::controller::services::ArtifactCompileKind::Benchmark,
+        .source = "/source", .output = "/output", .preset = "rf-detr-nano", .resolution = 384U};
+    for (const auto dataset : {data::BenchmarkDatasetVariant::CocoCustom, data::BenchmarkDatasetVariant::Coconut}) {
+        for (const auto validation : {data::CoconutValidation::Coconut, data::CoconutValidation::Stock, data::CoconutValidation::CoconutStock}) {
+            request.benchmark_selection = {dataset, validation};
+            CHECK(request.valid());
+        }
+    }
+    request.benchmark_selection.dataset = static_cast<data::BenchmarkDatasetVariant>(255);
+    CHECK_FALSE(request.valid());
+    request.benchmark_selection = {data::BenchmarkDatasetVariant::Coconut, static_cast<data::CoconutValidation>(255)};
+    CHECK_FALSE(request.valid());
+    request.kind = mmltk::controller::services::ArtifactCompileKind::Directory;
+    CHECK(request.valid());
+}
+
 }  // namespace mmltk::controller::subsystems::system
 
 namespace mmltk::controller::subsystems::system {

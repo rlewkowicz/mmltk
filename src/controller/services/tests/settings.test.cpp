@@ -1812,3 +1812,57 @@ TEST_CASE("partial training settings retain an unspecified output policy", "[gui
         CHECK(settings == expected);
     }
 }
+
+TEST_CASE("benchmark selections persist as one canonical nested value and reject invalid numbers", "[gui][settings][benchmark]") {
+    namespace data = mmltk::backend::data;
+    auto state = default_gui_settings_state();
+    CHECK(state.workflows.train.benchmark_selection == data::BenchmarkDatasetSelection{});
+    mmltk::testsupport::ScopedTempDir root{"benchmark-settings"};
+    const auto path = root.path() / "gui.json";
+    for (const auto dataset : {data::BenchmarkDatasetVariant::CocoCustom, data::BenchmarkDatasetVariant::Coconut}) {
+        for (const auto validation : {data::CoconutValidation::Coconut, data::CoconutValidation::Stock, data::CoconutValidation::CoconutStock}) {
+            const auto dataset_name = mmltk::frameworks::reflection::enum_name(dataset);
+            const auto validation_name = mmltk::frameworks::reflection::enum_name(validation);
+            const std::array edits{
+                SettingsValueUpdate{.path = "workflows.train.benchmark_selection.dataset", .value = *mmltk::frameworks::serialization::wire::FlatValue::text(dataset_name, dataset_name.size())},
+                SettingsValueUpdate{.path = "workflows.train.benchmark_selection.validation", .value = *mmltk::frameworks::serialization::wire::FlatValue::text(validation_name, validation_name.size())}};
+            REQUIRE(apply_gui_settings_values(state, edits));
+            CHECK(state.workflows.train.benchmark_selection == data::BenchmarkDatasetSelection{dataset, validation});
+            for (const bool enabled : {false, true}) {
+                state.workflows.train.compile_benchmark_dataset_override = enabled;
+                auto restored = default_gui_settings_state();
+                apply_gui_settings(snapshot_gui_settings(state), restored);
+                CHECK(restored.workflows.train.benchmark_selection == state.workflows.train.benchmark_selection);
+                CHECK(restored.workflows.train.compile_benchmark_dataset_override == enabled);
+                mmltk::testsupport::write_text_file(path, snapshot_gui_settings(state).dump());
+                auto reloaded = default_gui_settings_state();
+                REQUIRE(load_settings(path, reloaded));
+                CHECK(reloaded.workflows.train.benchmark_selection == state.workflows.train.benchmark_selection);
+                const nlohmann::json flat = state.workflows.train;
+                auto flat_restored = flat.get<TrainViewState>();
+                CHECK(flat_restored.benchmark_selection == state.workflows.train.benchmark_selection);
+            }
+        }
+    }
+    auto old = snapshot_gui_settings(default_gui_settings_state());
+    old["workflows"]["train"]["dataset_paths"].erase("benchmark_selection");
+    auto loaded = default_gui_settings_state();
+    apply_gui_settings(old, loaded);
+    CHECK(loaded.workflows.train.benchmark_selection == data::BenchmarkDatasetSelection{});
+    for (const char* field : {"dataset", "validation"}) {
+        for (const std::int64_t invalid : {-1LL, 3LL, 255LL, 256LL, 257LL, 258LL, 512LL, 4294967296LL}) {
+            auto malformed = snapshot_gui_settings(state);
+            malformed["workflows"]["train"]["dataset_paths"]["benchmark_selection"][field] = invalid;
+            auto before = loaded;
+            CHECK_THROWS(apply_gui_settings(malformed, loaded));
+            CHECK(loaded == before);
+            const std::array edit{SettingsValueUpdate{.path = std::string{"workflows.train.benchmark_selection."} + field,
+                .value = mmltk::frameworks::serialization::wire::FlatValue{invalid}}};
+            CHECK_FALSE(apply_gui_settings_values(loaded, edit));
+            CHECK(loaded == before);
+            nlohmann::json flat = state.workflows.train;
+            flat["benchmark_selection"][field] = invalid;
+            CHECK_THROWS(flat.get<TrainViewState>());
+        }
+    }
+}

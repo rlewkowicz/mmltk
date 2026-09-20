@@ -18,6 +18,9 @@ pub(super) struct State {
     spinner_baseline: f64,
     show_fps_baseline: bool,
     benchmark_baseline: bool,
+    benchmark_selection: Option<crate::generated::BenchmarkDatasetSelection>,
+    benchmark_dialog: Option<crate::generated::FileDialogSnapshot>,
+    benchmark_source: String,
     perceptual_baseline: [bool; 3],
     settings_revision: u64,
     numeric_target: f64,
@@ -33,6 +36,9 @@ impl Default for State {
             spinner_baseline: 0.0,
             show_fps_baseline: false,
             benchmark_baseline: false,
+            benchmark_selection: None,
+            benchmark_dialog: None,
+            benchmark_source: String::new(),
             perceptual_baseline: [false; 3],
             settings_revision: 0,
             numeric_target: 0.0,
@@ -46,6 +52,31 @@ impl Default for State {
 }
 
 impl State {
+    fn benchmark_choice(&self, index: usize) -> (&'static str, bool, crate::generated::BenchmarkDatasetSelection) {
+        use crate::generated::{BenchmarkDatasetVariant as Dataset, CoconutValidation as Validation};
+        let mut selection = self.benchmark_selection.as_ref().expect("benchmark baseline captured").clone();
+        let mut enabled = true;
+        let control = match index {
+            0 => BENCHMARK_OVERRIDE,
+            1 => { selection.dataset = Dataset::Coconut; train::BENCHMARK_COCONUT_ID }
+            2 => { selection.dataset = Dataset::Coconut; selection.validation = Validation::Stock; train::STOCK_VALIDATION_ID }
+            3 => { selection.dataset = Dataset::Coconut; selection.validation = Validation::CoconutStock; train::COCONUT_STOCK_ID }
+            4 => { selection.dataset = Dataset::Coconut; selection.validation = Validation::Coconut; train::COCONUT_VALIDATION_ID }
+            5 => { selection.dataset = Dataset::CocoCustom; selection.validation = Validation::Coconut; train::BENCHMARK_CUSTOM_ID }
+            6 => { selection.dataset = Dataset::Coconut; selection.validation = Validation::Coconut; train::BENCHMARK_COCONUT_ID }
+            7 => { selection.dataset = Dataset::Coconut; selection.validation = Validation::Coconut; DATASET_BROWSE }
+            8 => { selection.dataset = Dataset::Coconut; match selection.validation {
+                Validation::Coconut => train::COCONUT_VALIDATION_ID,
+                Validation::Stock => train::STOCK_VALIDATION_ID,
+                Validation::CoconutStock => train::COCONUT_STOCK_ID,
+            } }
+            9 => match selection.dataset { Dataset::CocoCustom => train::BENCHMARK_CUSTOM_ID, Dataset::Coconut => train::BENCHMARK_COCONUT_ID },
+            10 => { enabled = self.benchmark_baseline; BENCHMARK_OVERRIDE }
+            _ => { enabled = false; BENCHMARK_OVERRIDE }
+        };
+        (control, enabled, selection)
+    }
+
     pub(super) fn primary_action_pixels(&mut self, control: &str, active: bool) {
         if !active && self.primary_pixels.len() < 6 {
             self.primary_pixels.insert(control.to_owned());
@@ -580,6 +611,9 @@ impl State {
             Phase::TrainCard => widgets.arm_scrolled(driver, TRAIN_CARD, RelativeOffset::START),
             Phase::DatasetBrowse => widgets.arm(driver, DATASET_BROWSE),
             Phase::BenchmarkOverride => {
+                if let Some(draft) = &settings.draft {
+                    self.benchmark_selection = Some(draft.workflows.train.benchmarkselection.clone());
+                }
                 self.benchmark_baseline = settings
                     .draft
                     .as_ref()
@@ -652,10 +686,50 @@ impl State {
                         ],
                     )
                 });
-                let train = &settings.draft.as_ref().unwrap().workflows.train;
-                self.perceptual_baseline = perceptual_control_values(train);
-                driver.phase = Phase::PerceptualControl(0);
-                self.arm_perceptual_control(driver, widgets, 0)
+                reporting::emit(|sink| sink.record("integration.benchmark_baseline", BENCHMARK_OVERRIDE, "native-settled",
+                    [self.benchmark_baseline as u8 as f64, self.benchmark_selection.as_ref().unwrap().dataset as u8 as f64,
+                     self.benchmark_selection.as_ref().unwrap().validation as u8 as f64, model.settings_snapshot.as_ref().unwrap().revision as f64]));
+                driver.phase = Phase::BenchmarkChoice(0);
+                Task::none()
+            }
+            Phase::BenchmarkChoice(index) => {
+                let Some(snapshot) = model.settings_snapshot.as_ref().filter(|_| !settings.has_local_edits()) else { return Task::none(); };
+                self.settings_revision = snapshot.revision;
+                if index == 7 {
+                    self.benchmark_dialog = model.file_dialog.clone();
+                    self.benchmark_source = snapshot.settingsstate.workflows.train.datasetsourcedir.clone();
+                }
+                let (control, enabled, _) = self.benchmark_choice(index);
+                // Parent states already matching need no synthetic toggle. Radio no-ops still receive real clicks.
+                if control == BENCHMARK_OVERRIDE && snapshot.settingsstate.workflows.train.compilebenchmarkdatasetoverride == enabled {
+                    driver.phase = Phase::AwaitBenchmarkChoice(index);
+                    return Task::none();
+                }
+                widget_ops::scroll_control_into_view(control.to_owned(), AnnotationReveal::Control)
+                    .chain(widgets.arm(driver, control))
+            }
+            Phase::AwaitBenchmarkChoice(index) => {
+                let Some(snapshot) = model.settings_snapshot.as_ref().filter(|snapshot| snapshot.revision >= self.settings_revision && !settings.has_local_edits()) else { return Task::none(); };
+                let (control, enabled, selection) = self.benchmark_choice(index);
+                let train = &snapshot.settingsstate.workflows.train;
+                if train.compilebenchmarkdatasetoverride != enabled || train.benchmarkselection != selection { return Task::none(); }
+                reporting::emit(|sink| sink.record("integration.benchmark_choice", control, "native-settled",
+                    [index as f64, selection.dataset as u8 as f64, selection.validation as u8 as f64, snapshot.revision as f64]));
+                if index == 7 {
+                    let unchanged = model.file_dialog == self.benchmark_dialog && train.datasetsourcedir == self.benchmark_source
+                        && snapshot.revision == self.settings_revision;
+                    if !unchanged { driver.fail("disabled benchmark source control changed state"); return Task::none(); }
+                    reporting::emit(|sink| sink.record("integration.benchmark_inactive", DATASET_BROWSE, "unchanged", [7.0, 1.0, snapshot.revision as f64, 0.0]));
+                }
+                let visibility = benchmark_visibility(index, enabled, selection.dataset, snapshot.revision);
+                if index == 11 {
+                    self.perceptual_baseline = perceptual_control_values(&settings.draft.as_ref().unwrap().workflows.train);
+                    driver.phase = Phase::PerceptualControl(0);
+                    visibility.chain(self.arm_perceptual_control(driver, widgets, 0))
+                } else {
+                    driver.phase = Phase::BenchmarkChoice(index + 1);
+                    visibility
+                }
             }
             Phase::PerceptualControl(index) => self.arm_perceptual_control(driver, widgets, index),
             Phase::AwaitPerceptualControl(index) => {
@@ -744,7 +818,8 @@ impl State {
                     return Task::none();
                 };
                 let train = &snapshot.settingsstate.workflows.train;
-                if train.datasetsourcedir != driver.dataset_source
+                if train.compilebenchmarkdatasetoverride
+                    || train.datasetsourcedir != driver.dataset_source
                     || train.compileddatasetdir != driver.compiled_directory
                     || train.request.resolution.to_string() != driver.resolution
                     || !train.compiledimensions
@@ -886,6 +961,7 @@ impl State {
             Phase::DatasetBrowse => DATASET_BROWSE.to_owned(),
             Phase::BenchmarkOverride => BENCHMARK_OVERRIDE.to_owned(),
             Phase::BenchmarkRestore => BENCHMARK_OVERRIDE.to_owned(),
+            Phase::BenchmarkChoice(index) => self.benchmark_choice(index).0.to_owned(),
             Phase::DatasetSource => DATASET_SOURCE.to_owned(),
             Phase::CompiledDirectory => COMPILED_DIRECTORY.to_owned(),
             Phase::PerceptualControl(index) => perceptual_control_id(index),
@@ -1153,6 +1229,12 @@ impl State {
                 if !click(input_bounds) {
                     driver.fail("Firefox benchmark override click dispatch failed");
                 }
+                None
+            }
+            Phase::BenchmarkChoice(index) => {
+                driver.phase = Phase::AwaitBenchmarkChoice(index);
+                if !click(input_bounds) { driver.fail("Firefox benchmark radio click dispatch failed"); }
+                reporting::emit(|sink| sink.record("integration.benchmark_click", self.benchmark_choice(index).0, "real-click", [index as f64, 1.0, 0.0, 0.0]));
                 None
             }
             Phase::BenchmarkRestore => {
@@ -1500,3 +1582,20 @@ pub(super) const ERROR_MODAL: &str = "error.modal";
 pub(super) const ERROR_COPY: &str = crate::view::error_modal::COPY_ID;
 
 pub(super) const ERROR_DISMISS: &str = crate::view::error_modal::DISMISS_ID;
+
+// Inspect the current widget tree: cumulative rendered-control observations cannot prove absence.
+fn benchmark_visibility(index: usize, enabled: bool, dataset: crate::generated::BenchmarkDatasetVariant, revision: u64) -> Task<RootMessage> {
+    let validation = enabled && dataset == crate::generated::BenchmarkDatasetVariant::Coconut;
+    Task::batch([
+        (train::BENCHMARK_CUSTOM_ID, enabled), (train::BENCHMARK_COCONUT_ID, enabled),
+        (train::COCONUT_VALIDATION_ID, validation), (train::STOCK_VALIDATION_ID, validation),
+        (train::COCONUT_STOCK_ID, validation),
+    ].into_iter().map(move |(control, expected)| {
+        widget_ops::measure_control(control.to_owned()).then(move |bounds| {
+            let present = bounds.target.width > 0.0 && bounds.target.height > 0.0;
+            reporting::emit(|sink| sink.record("integration.benchmark_visibility", control, "current-tree",
+                [index as f64, expected as u8 as f64, present as u8 as f64, revision as f64]));
+            Task::<RootMessage>::none()
+        })
+    }))
+}

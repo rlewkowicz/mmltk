@@ -251,6 +251,18 @@ struct JsonFieldReader {
             if (!mmltk::backend::models::rfdetr::training_supervision_config_valid(candidate))
                 throw std::runtime_error("training_supervision violates canonical constraints");
             value = candidate;
+        } else if constexpr (std::is_same_v<T, mmltk::backend::data::BenchmarkDatasetSelection>) {
+            if (found == json.end()) return;
+            if (!found->is_object()) throw std::runtime_error("benchmark_selection must be an object");
+            fields(value, [&]<class Enum>(const char* member, Enum& selection) {
+                const auto field = found->find(member);
+                if (field == found->end()) return;
+                std::underlying_type_t<Enum> index{};
+                mmltk::frameworks::serialization::decode_json_value_exact(*field, index);
+                const auto candidate = static_cast<Enum>(index);
+                if (!mmltk::frameworks::reflection::enum_contains(candidate)) throw std::runtime_error("benchmark selection is invalid");
+                selection = candidate;
+            });
         } else if constexpr (std::is_same_v<T, mmltk::backend::models::rfdetr::MatchFreeSupervisionConfig> ||
                              std::is_same_v<T, mmltk::backend::models::rfdetr::DenoisingSupervisionConfig>) {
             if (found == json.end()) return;
@@ -273,6 +285,9 @@ void visit_record_fields(State& state, const Visitor& visit) {
     mmltk::frameworks::reflection::visit_materialized_members<Record>(
         [&]<class Declaration>(const auto& field) { visit(field.member_name.data(), state.*Declaration::pointer); });
 }
+constexpr auto benchmark_selection_fields = [](auto& selection, const auto& fields) {
+    visit_record_fields<mmltk::backend::data::BenchmarkDatasetSelection>(selection, fields);
+};
 constexpr auto source_fields = [](auto& state, const auto& visit) { visit_record_fields<SourceSelectionState>(state, visit); };
 constexpr auto train_dataset_fields = [](auto& state, const auto& visit) {
     visit("source_dir", state.dataset_source_dir);
@@ -286,6 +301,7 @@ constexpr auto train_dataset_fields = [](auto& state, const auto& visit) {
     visit("resize_mode", state.compile_resize_mode);
     visit("perceptual_downscale", state.compile_perceptual_downscale);
     visit("compile_benchmark_dataset_override", state.compile_benchmark_dataset_override);
+    visit.nested("benchmark_selection", state.benchmark_selection, benchmark_selection_fields);
 };
 constexpr auto validate_dataset_fields = [](auto& request, const auto& visit) {
     visit("compiled_path", request.compiled_path);
@@ -470,6 +486,7 @@ constexpr auto train_flat_fields = [](auto& state, auto& artifact_state, const a
     visit("val_compiled_path", state.request.val_compiled_path);
     visit("test_compiled_path", state.request.test_compiled_path);
     visit("compile_benchmark_dataset_override", state.compile_benchmark_dataset_override);
+    visit.nested("benchmark_selection", state.benchmark_selection, benchmark_selection_fields);
     visit("weights_path", artifact_state.weights_path);
     visit("class_layout_path", artifact_state.class_layout_path);
     visit_record_fields<mmltk::backend::data::DataLoadingOptions>(state.request, visit);

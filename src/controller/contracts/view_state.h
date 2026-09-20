@@ -1,4 +1,5 @@
 #pragma once
+#include "src/backend/data/benchmark_dataset_options.h"
 #include <array>
 #include "src/backend/imaging/resample/image_resize.h"
 #include <concepts>
@@ -175,6 +176,7 @@ struct TrainViewState : TrainExecutionPaneState {
     mmltk::backend::imaging::resample::ImageResizeMode compile_resize_mode = mmltk::backend::imaging::resample::ImageResizeMode::Stretch;
     bool compile_perceptual_downscale = false;
     bool compile_benchmark_dataset_override = false;
+    mmltk::backend::data::BenchmarkDatasetSelection benchmark_selection{};
     bool visualize_augmentation_in_explore = false;
 };
 struct ValidateViewState {
