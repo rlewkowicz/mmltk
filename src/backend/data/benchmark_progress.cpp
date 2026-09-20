@@ -1,4 +1,8 @@
 #include "detail/benchmark_progress.h"
+#include <algorithm>
+#include <limits>
+#include <stdexcept>
+#include <utility>
 namespace mmltk::backend::data::benchmark_internal {
 using Clock = std::chrono::steady_clock;
 ProgressReporter::ProgressReporter(BenchmarkProgressCallback callback, const BenchmarkTraceSink& trace) : callback_(std::move(callback)), trace_(&trace) {
@@ -15,7 +19,7 @@ ProgressReporter::ProgressReporter(BenchmarkProgressCallback callback, const Ben
     };
 }
 void ProgressReporter::phase(const DatasetCompilePhase phase, const std::uint64_t completed, const std::uint64_t total) {
-    if (!callback_) { return; }
+    if (!callback_ && !*trace_) { return; }
     const std::lock_guard lock(mutex_);
     const bool phase_changed = state_.phase != phase;
     if (phase == DatasetCompilePhase::Extracting && state_.phase != DatasetCompilePhase::Extracting) {
@@ -34,12 +38,16 @@ void ProgressReporter::phase(const DatasetCompilePhase phase, const std::uint64_
     state_.phase = phase;
     state_.completed = completed;
     state_.total = total;
-    if (phase_changed || state_.activity.empty()) { set_activity_unlocked(default_phase_activity(phase)); }
+    if (phase_changed || state_.activity.empty()) {
+        state_.current_source.reset();
+        set_activity_unlocked(default_phase_activity(phase));
+    }
     emit();
 }
 void ProgressReporter::activity(std::string activity) {
-    if (!callback_) { return; }
+    if (!callback_ && !*trace_) { return; }
     const std::lock_guard lock(mutex_);
+    state_.current_source.reset();
     set_activity_unlocked(std::move(activity));
     emit();
 }
@@ -49,15 +57,16 @@ void ProgressReporter::pixel_attempt(const std::uint64_t completed, const std::u
     if (callback_ && state_.pixel_attempt == std::numeric_limits<std::uint64_t>::max()) {
         throw std::overflow_error("benchmark pixel attempt counter overflow");
     }
+    state_.current_source.reset();
+    state_.phase = DatasetCompilePhase::Pixels;
+    set_activity_unlocked(default_phase_activity(DatasetCompilePhase::Pixels));
+    activity_started_ = Clock::now();
     if (callback_) {
-        state_.phase = DatasetCompilePhase::Pixels;
         state_.completed = completed;
         state_.total = total;
         ++state_.pixel_attempt;
         state_.pixel_attempt_offset = completed;
-        set_activity_unlocked(default_phase_activity(DatasetCompilePhase::Pixels));
-    } else {
-        activity_started_ = Clock::now();
+        state_.activity_elapsed_seconds = 0U;
     }
     pixel_completed_before_ = completed;
     pixel_split_ = split;
@@ -73,8 +82,6 @@ void ProgressReporter::pixel_completed() {
     if ((pixel_completed_ % kPixelProgressQuantum) != 0U && pixel_completed_ != pixel_split_total_) { return; }
     if (callback_) {
         state_.completed = pixel_completed_before_ + pixel_completed_;
-        state_.activity_elapsed_seconds =
-            static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::seconds>(Clock::now() - activity_started_).count());
         emit();
     }
     if (trace_ != nullptr && *trace_) {
@@ -92,12 +99,27 @@ void ProgressReporter::pixel_completed() {
     }
 }
 void ProgressReporter::source_activity(const BenchmarkDatasetSource source, std::string activity) {
-    if (!callback_) { return; }
+    if (!callback_ && !*trace_) { return; }
     const std::lock_guard lock(mutex_);
-    BenchmarkSourceProgress& source_state = source_progress(source);
-    source_state.activity = activity;
-    set_activity_unlocked(std::move(activity));
+    if (!callback_) {
+        if (state_.activity != activity || state_.current_source != source) { trace_activity(source, activity); }
+        state_.current_source = source;
+        state_.activity = std::move(activity);
+        return;
+    }
+    set_source_activity_unlocked(source, std::move(activity));
     emit();
+}
+void ProgressReporter::set_source_activity_unlocked(const BenchmarkDatasetSource source, std::string activity) {
+    BenchmarkSourceProgress& source_state = source_progress(source);
+    if (source_state.activity != activity || state_.current_source != source) { trace_activity(source, activity); }
+    source_state.complete = false;
+    source_state.cache_hit = false;
+    source_state.resumed = false;
+    source_state.retry_count = 0U;
+    source_state.activity = activity;
+    state_.current_source = source;
+    set_activity_unlocked(std::move(activity));
 }
 bool ProgressReporter::transfer_observer_enabled() const noexcept { return static_cast<bool>(callback_); }
 bool ProgressReporter::pixel_observer_enabled() const noexcept { return callback_ || (trace_ != nullptr && static_cast<bool>(*trace_)); }
@@ -114,25 +136,85 @@ void ProgressReporter::rejected(const std::uint64_t dropped, const std::uint64_t
     state_.quarantined_images = quarantined;
     emit();
 }
-void ProgressReporter::source_bytes(const BenchmarkDatasetSource source, const std::uint64_t completed, const std::uint64_t total,
-                                    const std::uint32_t retry_count, const bool cache_hit, const bool resumed) {
-    if (!callback_) { return; }
-    const std::lock_guard lock(mutex_);
-    BenchmarkSourceProgress& progress = source_progress(source);
-    progress.completed_bytes = completed;
-    progress.total_bytes = total;
-    progress.retry_count = retry_count;
-    progress.cache_hit = cache_hit;
-    progress.resumed = progress.resumed || resumed;
-    update_source_phase_progress();
-    emit();
-}
 void ProgressReporter::source_images(const BenchmarkDatasetSource source, const std::uint64_t completed, const std::uint64_t total) {
     if (!callback_) { return; }
     const std::lock_guard lock(mutex_);
     BenchmarkSourceProgress& progress = source_progress(source);
     progress.completed_images = completed;
     progress.total_images = total;
+    select_acquisition_source(source);
+    update_source_phase_progress();
+    emit();
+}
+void ProgressReporter::select_acquisition_source(const BenchmarkDatasetSource source) {
+    if (state_.phase == DatasetCompilePhase::Downloading || state_.phase == DatasetCompilePhase::Extracting) { state_.current_source = source; }
+}
+void ProgressReporter::trace_activity(const std::optional<BenchmarkDatasetSource> source, const std::string_view activity) {
+    trace_benchmark_event(*trace_, "benchmark.progress.activity", [&] {
+        nlohmann::json fields{{"activity", activity}, {"phase", static_cast<unsigned>(state_.phase)}};
+        if (source) { fields["source"] = static_cast<unsigned>(*source); }
+        return fields;
+    });
+}
+void ProgressReporter::source_transfer(const BenchmarkDatasetSource source, const DownloadProgress& update, const std::uint64_t completed,
+                                       const std::uint64_t total) {
+    if (!callback_) { return; }
+    const std::lock_guard lock(mutex_);
+    auto& progress = source_progress(source);
+    std::string operation;
+    if (update.cache_hit) {
+        operation = "Reusing cached ";
+    } else {
+        switch (update.phase) {
+            case DownloadProgressPhase::kDownloading:
+                operation = update.redownload ? (update.resumed ? "Resuming re-download of " : "Re-downloading ")
+                                              : (update.resumed ? "Resuming " : "Downloading ");
+                break;
+            case DownloadProgressPhase::kVerifyingCachedArtifact: operation = "Verifying cached "; break;
+            case DownloadProgressPhase::kVerifyingDownloadedArtifact: operation = "Verifying downloaded "; break;
+        }
+    }
+    operation += update.artifact_id;
+    select_acquisition_source(source);
+    if (state_.current_source == source) {
+        if (state_.activity != operation) { trace_activity(source, operation); }
+        set_activity_unlocked(operation);
+    }
+    progress.complete = false;
+    progress.activity = operation + " · " + std::to_string(update.completed_bytes);
+    if (update.total_bytes != 0U) { progress.activity += " / " + std::to_string(update.total_bytes); }
+    progress.activity += update.cache_hit ? " bytes reused" : " bytes";
+    if (!update.cache_hit && update.total_bytes == 0U) { progress.activity += " (total unknown)"; }
+    if (!update.cache_hit && update.attempt != 0U) { progress.activity += " · attempt " + std::to_string(update.attempt); }
+    if (update.resumed) { progress.activity += " · retained " + std::to_string(update.retained_bytes) + " bytes"; }
+    progress.completed_bytes = completed;
+    progress.total_bytes = total;
+    progress.retry_count = !update.cache_hit && update.attempt > 0U ? update.attempt - 1U : 0U;
+    progress.cache_hit = update.cache_hit;
+    progress.resumed = update.resumed;
+    update_source_phase_progress();
+    emit();
+}
+void ProgressReporter::add_source_images(const BenchmarkDatasetSource source, const std::uint64_t count, const std::uint64_t total, std::string activity) {
+    if (!callback_) { return; }
+    const std::lock_guard lock(mutex_);
+    auto& progress = source_progress(source);
+    add_progress(progress.completed_images, count, "benchmark source image count overflow");
+    if (!activity.empty()) { set_source_activity_unlocked(source, std::move(activity)); }
+    progress.total_images = total;
+    select_acquisition_source(source);
+    update_source_phase_progress();
+    emit();
+}
+void ProgressReporter::rollback_source_images(const BenchmarkDatasetSource source, const std::uint64_t count, const std::uint64_t total, std::string activity) {
+    if (!callback_) { return; }
+    const std::lock_guard lock(mutex_);
+    auto& progress = source_progress(source);
+    if (count > progress.completed_images) { throw std::underflow_error("benchmark source image count underflow"); }
+    progress.completed_images -= count;
+    if (!activity.empty()) { set_source_activity_unlocked(source, std::move(activity)); }
+    progress.total_images = total;
+    select_acquisition_source(source);
     update_source_phase_progress();
     emit();
 }
@@ -162,9 +244,11 @@ std::string ProgressReporter::default_phase_activity(const DatasetCompilePhase p
     std::unreachable();
 }
 void ProgressReporter::set_activity_unlocked(std::string activity) {
+    if (state_.activity == activity) { return; }
+    if (!state_.current_source) { trace_activity(std::nullopt, activity); }
     state_.activity = std::move(activity);
     state_.activity_elapsed_seconds = 0U;
-    activity_started_ = Clock::now();
+    if (callback_) { activity_started_ = Clock::now(); }
 }
 void ProgressReporter::add_progress(std::uint64_t& target, const std::uint64_t value, const char* context) {
     if (value > std::numeric_limits<std::uint64_t>::max() - target) { throw std::overflow_error(context); }
@@ -202,7 +286,13 @@ void ProgressReporter::update_source_phase_progress() {
         add_progress(state_.total, kSourceProgressScale, "benchmark extraction progress overflow");
     }
 }
-void ProgressReporter::emit() const {
-    if (callback_) { callback_(state_); }
+void ProgressReporter::emit() {
+    if (callback_) {
+        if (activity_started_.time_since_epoch().count() != 0) {
+            state_.activity_elapsed_seconds =
+                static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::seconds>(Clock::now() - activity_started_).count());
+        }
+        callback_(state_);
+    }
 }
 }  // namespace mmltk::backend::data::benchmark_internal

@@ -162,44 +162,20 @@ struct TracePath final {
 struct ArtifactProgressTotals {
     std::unordered_map<std::string, std::uint64_t> completed;
     std::unordered_map<std::string, std::uint64_t> total;
-    std::unordered_map<std::string, std::uint32_t> retries;
-    std::unordered_map<std::string, bool> cache_hits;
-    std::unordered_map<std::string, bool> resumed;
-    std::unordered_map<std::string, DownloadProgressPhase> phases;
     void update(const DownloadProgress& update, ProgressReporter* reporter) {
         const std::lock_guard lock(mutex);
-        const auto prior_phase = phases.find(update.artifact_id);
-        const bool phase_changed = prior_phase == phases.end() || prior_phase->second != update.phase;
-        phases[update.artifact_id] = update.phase;
         completed[update.artifact_id] = update.completed_bytes;
         total[update.artifact_id] = update.total_bytes;
-        retries[update.artifact_id] = std::max(retries[update.artifact_id], update.attempt > 0U ? update.attempt - 1U : 0U);
-        cache_hits[update.artifact_id] = update.cache_hit;
-        resumed[update.artifact_id] = resumed[update.artifact_id] || update.resumed;
         const BenchmarkDatasetSource source = artifact_source(update.artifact_id);
-        if (phase_changed && update.phase == DownloadProgressPhase::kDownloading) {
-            reporter->source_activity(source, "Downloading " + update.artifact_id);
-        } else if (update.phase == DownloadProgressPhase::kVerifyingCachedArtifact) {
-            reporter->source_activity(source, "Verifying cached " + update.artifact_id);
-        } else if (update.phase == DownloadProgressPhase::kVerifyingDownloadedArtifact) {
-            reporter->source_activity(source, "Verifying downloaded " + update.artifact_id);
-        }
         std::uint64_t source_completed = 0U;
         std::uint64_t source_total = 0U;
-        std::uint64_t source_retries = 0U;
-        bool source_cache_hit = true;
-        bool source_resumed = false;
         for (const auto& [artifact, bytes] : completed) {
             if (artifact_source(artifact) == source) {
                 source_completed = common_math::checked_add(source_completed, bytes, "source progress overflow");
                 source_total = common_math::checked_add(source_total, total[artifact], "source progress overflow");
-                source_retries = common_math::checked_add(source_retries, retries[artifact], "source retry count overflow");
-                source_cache_hit = source_cache_hit && cache_hits[artifact];
-                source_resumed = source_resumed || resumed[artifact];
             }
         }
-        reporter->source_bytes(source, source_completed, source_total, common_math::checked_cast<std::uint32_t>(source_retries, "source retry count overflow"),
-                               source_cache_hit, source_resumed);
+        reporter->source_transfer(source, update, source_completed, source_total);
     }
     std::mutex mutex;
 };
@@ -359,7 +335,7 @@ class RequiredImageDecodeError : public std::runtime_error {
                                                           const std::vector<std::uint64_t>& expected_ids, const CatalogArtifact& artifact,
                                                           mmltk::common::concurrency::CancellationObservation cancel_requested, ProgressReporter* progress,
                                                           ArtifactProgressTotals* transfer_progress, StorageReservationPool* storage_reservations,
-                                                          std::atomic<std::uint64_t>* source_extracted_images, const std::uint64_t source_total_images,
+                                                          const std::uint64_t source_total_images,
                                                           const std::size_t decompression_workers, const std::size_t cache_write_workers,
                                                           const std::size_t download_connections, const BenchmarkTraceSink& trace,
                                                           const std::optional<JpegDecodeProbe> decode_probe = std::nullopt) {
@@ -389,8 +365,7 @@ class RequiredImageDecodeError : public std::runtime_error {
         for (const std::uint64_t image_id : expected_ids) {
             if (!std::ranges::binary_search(cached_quarantine, image_id, {}, &CachedImageRejection::image_id)) { available_ids.push_back(image_id); }
         }
-        const std::uint64_t source_completed = source_extracted_images->fetch_add(expected_ids.size(), std::memory_order_relaxed) + expected_ids.size();
-        progress->source_images(source, source_completed, source_total_images);
+        progress->add_source_images(source, expected_ids.size(), source_total_images, "Reusing cached " + archive_name + " images");
         return CachedImageDirectory{source_name,
                                     std::move(shard),
                                     image_root,
@@ -405,7 +380,7 @@ class RequiredImageDecodeError : public std::runtime_error {
         common_math::checked_multiply(expected_ids.size(), kEstimatedJpegBytes, "benchmark image cache estimate overflow"),
         artifact.expected_size != 0U ? artifact.expected_size : kArchiveScratchBytes, "benchmark archive acquisition estimate overflow");
     StorageReservationPool::Reservation storage_reservation = storage_reservations->reserve(acquisition_storage, source_name + " archive and extracted images");
-    const DownloadRequest request = make_download_request(cache, source_name, artifact);
+    DownloadRequest request = make_download_request(cache, source_name, artifact);
     std::exception_ptr last_error;
     for (std::uint32_t attempt = 1U; attempt <= 3U; ++attempt) {
         throw_if_benchmark_cancelled(cancel_requested);
@@ -432,10 +407,16 @@ class RequiredImageDecodeError : public std::runtime_error {
                 .cancel_requested = cancel_requested,
                 .progress =
                     [&](const std::uint64_t completed, const std::uint64_t) {
+                        if (completed < attempt_reported) { throw std::logic_error("archive attempt image progress regressed"); }
                         const std::uint64_t delta = completed - attempt_reported;
                         attempt_reported = completed;
-                        const std::uint64_t source_completed = source_extracted_images->fetch_add(delta, std::memory_order_relaxed) + delta;
-                        progress->source_images(source, source_completed, source_total_images);
+                        if (progress->transfer_observer_enabled()) {
+                            progress->add_source_images(source, delta, source_total_images, "Resolving " + archive_name + " selected images");
+                        }
+                        trace_benchmark_event(trace, "benchmark.images.progress", [&] {
+                            return nlohmann::json{{"source", source_name}, {"shard", shard}, {"attempt", attempt},
+                                                  {"resolved_images", completed}, {"total_images", expected_ids.size()}};
+                        });
                     },
                 .validator =
                     [&](const std::uint64_t image_id, const std::span<const std::uint8_t> encoded) {
@@ -481,8 +462,7 @@ class RequiredImageDecodeError : public std::runtime_error {
                 failure_reason = "non-standard exception";
             }
             if (attempt_reported != 0U) {
-                const std::uint64_t source_completed = source_extracted_images->fetch_sub(attempt_reported, std::memory_order_relaxed) - attempt_reported;
-                progress->source_images(source, source_completed, source_total_images);
+                progress->rollback_source_images(source, attempt_reported, source_total_images, "Withdrawing failed " + archive_name + " attempt");
             }
             throw_if_benchmark_cancelled(cancel_requested);
             if (std::filesystem::is_regular_file(request.destination)) {
@@ -496,6 +476,7 @@ class RequiredImageDecodeError : public std::runtime_error {
             if (attempt == 3U) { break; }
             progress->source_activity(source, "Repairing " + archive_name + " extraction for retry " + std::to_string(attempt + 1U));
             invalidate_download_artifact(request, cancel_requested, trace);
+            request.redownload = true;
             std::error_code cleanup_error;
             if (!common_io::remove_tree_no_follow(image_root, cleanup_error)) {
                 throw std::filesystem::filesystem_error("cannot clear failed benchmark extraction", image_root, cleanup_error);
@@ -953,9 +934,9 @@ void compile_benchmark_dataset(BenchmarkCompilerConfig config) {
         progress.phase(DatasetCompilePhase::Indexing, completed_indexes, kIndexCount);
     }
     ArtifactProgressTotals annotation_repair_progress;
-    const auto repair_annotation_artifacts = [&](const BenchmarkDatasetSource source, const std::vector<DownloadRequest>& requests,
+    const auto repair_annotation_artifacts = [&](const BenchmarkDatasetSource source, std::vector<DownloadRequest> requests,
                                                  const std::string_view reason) {
-        for (const DownloadRequest& request : requests) {
+        for (DownloadRequest& request : requests) {
             if (std::filesystem::is_regular_file(request.destination)) {
                 progress.source_activity(source, "Failure-only SHA-256 diagnosis for " + request.artifact_id);
                 const std::string failure_sha256 =
@@ -964,6 +945,7 @@ void compile_benchmark_dataset(BenchmarkCompilerConfig config) {
                                       [&] { return nlohmann::json{{"artifact", request.artifact_id}, {"sha256", failure_sha256}, {"reason", reason}}; });
             }
             invalidate_download_artifact(request, cancel_requested, trace);
+            request.redownload = true;
         }
         progress.source_activity(source,
                                  "Redownloading annotation metadata after structural "
@@ -1192,8 +1174,6 @@ void compile_benchmark_dataset(BenchmarkCompilerConfig config) {
         }
     }
     std::vector<std::optional<CachedImageDirectory>> archive_results(archive_tasks.size());
-    std::atomic<std::uint64_t> coco_extracted{0U};
-    std::atomic<std::uint64_t> objects_completed{0U};
     std::optional<AcquiredOpenImages> open_image_result;
     std::exception_ptr pipeline_error;
     std::mutex pipeline_error_mutex;
@@ -1246,12 +1226,11 @@ void compile_benchmark_dataset(BenchmarkCompilerConfig config) {
                     const std::size_t task_index = next_archive_task.fetch_add(1U, std::memory_order_relaxed);
                     if (task_index >= archive_tasks.size()) { break; }
                     const ArchiveTask& task = archive_tasks[task_index];
-                    std::atomic<std::uint64_t>* source_completed = task.source == BenchmarkDatasetSource::kCoco2017 ? &coco_extracted : &objects_completed;
                     const std::uint64_t source_total = task.source == BenchmarkDatasetSource::kCoco2017 ? coco_selected_images : objects->images.size();
                     try {
                         archive_results[task_index] =
                             acquire_archive_images(cache, task.source, task.shard, task.image_ids, task.artifact, cancel_requested, &progress,
-                                                   &image_transfer_progress, &cache_storage_reservations, source_completed, source_total, decompression_workers,
+                                                   &image_transfer_progress, &cache_storage_reservations, source_total, decompression_workers,
                                                    archive_cache_workers, archive_download_connections, trace);
                     } catch (...) {
                         record_pipeline_error();
@@ -1462,9 +1441,9 @@ void compile_benchmark_dataset(BenchmarkCompilerConfig config) {
                 "source archive");
         }
         progress.source_activity(task->source, "Repairing failed cached JPEG " + std::to_string(error.source_image_id()) + " from " + task->shard);
-        std::atomic<std::uint64_t> repaired_images{0U};
+        progress.source_images(task->source, 0U, task->image_ids.size());
         CachedImageDirectory repaired = acquire_archive_images(cache, task->source, task->shard, task->image_ids, task->artifact, cancel_requested, &progress,
-                                                               &repair_transfer_progress, &cache_storage_reservations, &repaired_images, task->image_ids.size(),
+                                                               &repair_transfer_progress, &cache_storage_reservations, task->image_ids.size(),
                                                                decompression_workers, archive_cache_workers, archive_download_connections, trace, decode_probe);
         if (repaired.image_count + repaired.quarantined.size() != task->image_ids.size()) {
             throw std::runtime_error(

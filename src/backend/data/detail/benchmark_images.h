@@ -6,6 +6,7 @@
 #include <filesystem>
 #include <functional>
 #include <optional>
+#include <mutex>
 #include <span>
 #include <string>
 #include <string_view>
@@ -29,6 +30,19 @@ template <typename Records, typename Append>
 }
 using ArchiveImageIdParser = std::function<std::optional<std::uint64_t>(std::string_view)>;
 using CachedImageProgress = std::function<void(std::uint64_t, std::uint64_t)>;
+// Per-attempt write completion publication. Counts are captured only after physical writes;
+// publication rejects an older batch without retaining a high-water mark across retries.
+class CachedImageWriteProgress {
+   public:
+    CachedImageWriteProgress(CachedImageProgress callback, std::uint64_t initial, std::uint64_t expected);
+    void completed(std::uint64_t writes);
+   private:
+    CachedImageProgress callback_;
+    std::uint64_t initial_;
+    std::uint64_t expected_;
+    std::uint64_t published_ = 0U;
+    std::mutex mutex_;
+};
 using CachedImageValidator = std::function<void(std::uint64_t, std::span<const std::uint8_t>)>;
 struct CachedImageRejection {
     std::uint64_t image_id = 0U;

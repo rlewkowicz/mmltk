@@ -154,7 +154,8 @@ function(mmltk_add_backend_data_tests)
         ${CMAKE_SOURCE_DIR}/src/backend/data/tests/test_fixture.cpp)
     mmltk_register_public_headers(mmltk_backend_data_test_support
         BASE_DIRS ${CMAKE_SOURCE_DIR}
-        FILES ${CMAKE_SOURCE_DIR}/src/backend/data/tests/test_fixture.h)
+        FILES ${CMAKE_SOURCE_DIR}/src/backend/data/tests/test_fixture.h
+              ${CMAKE_SOURCE_DIR}/src/backend/data/tests/benchmark_http_fixture.h)
     target_link_libraries(mmltk_backend_data_test_support PUBLIC
         mmltk_test_support
         mmltk::backend::data

@@ -68,7 +68,7 @@ contracts::ArtifactProgress project_artifact_progress(const mmltk::backend::data
 contracts::ArtifactProgress project_artifact_progress(const mmltk::backend::data::BenchmarkCompileProgress& value) {
     std::string activity = value.activity;
     for (const auto& source : value.sources) {
-        if (!source.complete && (!source.activity.empty() || source.completed_bytes != 0U || source.completed_images != 0U)) {
+        if (value.current_source == source.source) {
             using Source = mmltk::backend::data::BenchmarkDatasetSource;
             const std::string_view source_name = [source = source.source] {
                 switch (source) {

@@ -23,6 +23,8 @@ struct DownloadRequest {
     std::uint64_t expected_size = 0U;
     std::optional<std::string> expected_sha256;
     std::uint32_t maximum_attempts = kMaximumAttempts;
+    // An owning acquisition invalidated an earlier artifact before this request.
+    bool redownload = false;
 };
 struct DownloadProgress {
     std::string artifact_id;
@@ -32,6 +34,9 @@ struct DownloadProgress {
     bool resumed = false;
     bool cache_hit = false;
     DownloadProgressPhase phase = DownloadProgressPhase::kDownloading;
+    // Durable bytes retained before the active attempt; excludes in-flight observations.
+    std::uint64_t retained_bytes = 0U;
+    bool redownload = false;
 };
 struct DownloadResult {
     std::filesystem::path path;

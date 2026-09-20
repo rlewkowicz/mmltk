@@ -25,6 +25,16 @@
 #include "src/common/math/checked_arithmetic.h"
 #include "worker_queue.h"
 namespace mmltk::backend::data::benchmark_internal {
+CachedImageWriteProgress::CachedImageWriteProgress(CachedImageProgress callback, const std::uint64_t initial, const std::uint64_t expected)
+    : callback_(std::move(callback)), initial_(initial), expected_(expected) {}
+void CachedImageWriteProgress::completed(const std::uint64_t writes) {
+    if (!callback_ || ((writes & 127U) != 0U && writes != expected_)) { return; }
+    const std::lock_guard lock(mutex_);
+    if (writes <= published_) { return; }
+    published_ = writes;
+    callback_(initial_ + writes, initial_ + expected_);
+}
+
 using mmltk::common::io::errno_error;
 using mmltk::common::io::FileHandle;
 using mmltk::common::math::checked_add;
@@ -66,9 +76,7 @@ class CachedImageWritePool {
     CachedImageWritePool(const std::size_t worker_count, const std::size_t expected_writes, std::filesystem::path output_root, CachedImageProgress progress,
                          const std::uint64_t initially_completed, const mmltk::common::concurrency::CancellationObservation cancellation)
         : output_root_(std::move(output_root)),
-          progress_(std::move(progress)),
-          expected_writes_(expected_writes),
-          initially_completed_(initially_completed),
+          progress_(std::move(progress), initially_completed, expected_writes),
           cancellation_(cancellation) {
         const std::size_t bounded_workers = std::min<std::size_t>(8U, worker_count);
         inline_mode_ = bounded_workers == 0U;
@@ -106,9 +114,7 @@ class CachedImageWritePool {
             written_ids_.push_back(image_id);
             written_bytes_ = checked_byte_add(written_bytes_, bytes);
             const std::uint64_t completed = written_ids_.size();
-            if (progress_ && ((completed & 127U) == 0U || completed == expected_writes_)) {
-                progress_(initially_completed_ + completed, initially_completed_ + expected_writes_);
-            }
+            progress_.completed(completed);
             recycle(std::move(encoded));
             return;
         }
@@ -172,10 +178,7 @@ class CachedImageWritePool {
                     written_bytes_ = checked_byte_add(written_bytes_, bytes);
                     completed = written_ids_.size();
                 }
-                if (progress_ && ((completed & 127U) == 0U || completed == expected_writes_)) {
-                    const std::lock_guard progress_lock(progress_mutex_);
-                    progress_(initially_completed_ + completed, initially_completed_ + expected_writes_);
-                }
+                progress_.completed(completed);
             } catch (...) {
                 const std::lock_guard lock(mutex_);
                 if (!failure_) { failure_ = std::current_exception(); }
@@ -212,12 +215,9 @@ class CachedImageWritePool {
         join();
     }
     std::filesystem::path output_root_;
-    CachedImageProgress progress_;
-    std::size_t expected_writes_ = 0U;
-    std::uint64_t initially_completed_ = 0U;
+    CachedImageWriteProgress progress_;
     mmltk::common::concurrency::CancellationObservation cancellation_;
     std::mutex mutex_;
-    std::mutex progress_mutex_;
     std::condition_variable pending_;
     std::condition_variable available_;
     std::condition_variable finished_;
@@ -447,7 +447,17 @@ CachedImageDirectory extract_selected_archive_images(ArchiveExtractionRequest re
     const int output_descriptor = ::open(request.output_root.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
     if (output_descriptor < 0) { throw errno_error("cannot open cached benchmark image directory", request.output_root.string()); }
     FileHandle output_directory(output_descriptor);
+    if (request.activity) { request.activity("Checking individually cached JPEGs"); }
+    std::size_t inspected = 0U;
     for (const std::uint64_t image_id : request.selected_image_ids) {
+        throw_if_benchmark_cancelled(request.cancel_requested);
+        if (request.trace && inspected != 0U && inspected % 128U == 0U) {
+            trace_benchmark_event(request.trace, "benchmark.images.cache_scan", [&] {
+                return nlohmann::json{{"source", request.source}, {"shard", request.shard}, {"inspected_images", inspected},
+                                      {"reused_images", completed.size()}, {"total_images", request.selected_image_ids.size()}};
+            });
+        }
+        if (request.trace) { ++inspected; }
         const std::uint64_t bytes = regular_file_bytes_at(output_directory.get(), image_id);
         if (bytes != 0U) {
             if (request.validator) {
@@ -468,6 +478,11 @@ CachedImageDirectory extract_selected_archive_images(ArchiveExtractionRequest re
             image_bytes = checked_byte_add(image_bytes, bytes);
         }
     }
+    if (request.progress) { request.progress(completed.size(), selected.size()); }
+    trace_benchmark_event(request.trace, "benchmark.images.cache_reuse", [&] {
+        return nlohmann::json{{"source", request.source}, {"shard", request.shard}, {"inspected_images", selected.size()},
+                              {"reused_images", completed.size()}, {"reused_bytes", image_bytes}};
+    });
     const std::size_t pending_writes = selected.size() - completed.size() - unavailable.size();
     if (request.activity) {
         request.activity(request.cache_write_workers == 0U
@@ -498,6 +513,7 @@ CachedImageDirectory extract_selected_archive_images(ArchiveExtractionRequest re
     }
     if (request.activity) { request.activity("Scanning archive headers for selected images"); }
     bool extraction_announced = false;
+    std::uint64_t inspected_headers = 0U;
     archive_entry* entry = nullptr;
     while (completed.size() + scheduled.size() + unavailable.size() != selected.size()) {
         throw_if_benchmark_cancelled(request.cancel_requested);
@@ -506,6 +522,12 @@ CachedImageDirectory extract_selected_archive_images(ArchiveExtractionRequest re
         if (status == ARCHIVE_EOF) { break; }
         if (status != ARCHIVE_OK && status != ARCHIVE_WARN) {
             throw std::runtime_error("cannot read benchmark archive header: " + archive_error(reader.get()));
+        }
+        if (request.trace && (++inspected_headers % 1024U == 0U)) {
+            trace_benchmark_event(request.trace, "benchmark.archive.scan", [&] {
+                return nlohmann::json{{"source", request.source}, {"shard", request.shard}, {"inspected_headers", inspected_headers},
+                                      {"scheduled_images", scheduled.size()}, {"reused_images", completed.size()}};
+            });
         }
         const char* pathname = archive_entry_pathname(entry);
         const std::optional<std::uint64_t> image_id = pathname != nullptr ? request.image_id_parser(pathname) : std::nullopt;
@@ -568,7 +590,7 @@ CachedImageDirectory extract_selected_archive_images(ArchiveExtractionRequest re
         if (request.progress) { request.progress(selected.size(), selected.size()); }
     }
     std::ranges::sort(quarantined, {}, &CachedImageRejection::image_id);
-    if (request.progress && !quarantined.empty()) { request.progress(selected.size(), selected.size()); }
+    if (request.progress) { request.progress(selected.size(), selected.size()); }
     if (request.activity) {
         if (quarantined.empty()) {
             request.activity("Publishing extracted-image cache status");

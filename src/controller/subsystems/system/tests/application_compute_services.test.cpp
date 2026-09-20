@@ -18,9 +18,14 @@
 #include <stdexcept>
 #include <thread>
 #include <type_traits>
+#include <vector>
 #include "src/test_support/filesystem_test_utils.hpp"
 #include "src/test_support/async_test_utils.hpp"
 #include "src/backend/data/benchmark_dataset_compiler.h"
+#include "src/backend/data/detail/benchmark_progress.h"
+#include "src/backend/data/detail/benchmark_compiler.h"
+#include "src/backend/data/tests/benchmark_http_fixture.h"
+#include "src/common/io/file_digest.h"
 #include "src/backend/data/compiled_format.h"
 #include "src/backend/data/dataset_compiler.h"
 #include "src/backend/models/rfdetr/contract/workflow_requests.h"
@@ -394,6 +399,7 @@ TEST_CASE("artifact compile adapters preserve canonical ordinary and benchmark e
         .quarantined_images = 13U,
         .sources = {},
     };
+    benchmark.current_source = data::BenchmarkDatasetSource::kOpenImagesV7;
     benchmark.sources.push_back({
         .source = data::BenchmarkDatasetSource::kOpenImagesV7,
         .activity = "Fetching shard",
@@ -1078,3 +1084,170 @@ TEST_CASE("Train observes persistence failure beyond bounded console output with
     CHECK_FALSE(result.terminal.final_progress->persistence.error.empty());
 }
 }  // namespace mmltk::controller::subsystems::system
+
+namespace mmltk::controller::subsystems::system {
+TEST_CASE("benchmark current transfer changes artifact activity at the exact image plateau", "[gui][services][progress]") {
+    using namespace data::benchmark_internal;
+    using Source = data::BenchmarkDatasetSource;
+    const BenchmarkTraceSink quiet;
+    domain::ArtifactProgress displayed;
+    data::BenchmarkCompileProgress latest;
+    ProgressReporter reporter([&](const data::BenchmarkCompileProgress& update) {
+        latest = update;
+        displayed = project_artifact_progress(update);
+    }, quiet);
+    reporter.phase(data::DatasetCompilePhase::Extracting);
+    reporter.source_activity(Source::kCoco2017, "Old COCO activity");
+    reporter.source_images(Source::kCoco2017, 123U, 123U);
+    reporter.source_images(Source::kObjects365V2, 170161U, 408551U);
+    reporter.source_images(Source::kOpenImagesV7, 56008U, 56008U);
+    reporter.projected(1039610446176ULL);
+    const auto check_plateau = [&] {
+        CHECK(displayed.completed == 2416498U);
+        CHECK(displayed.total == 3000000U);
+        CHECK(displayed.projected_output_bytes == 1039610446176ULL);
+        CHECK(latest.sources[1].completed_images == 170161U);
+    };
+    DownloadProgress update{"objects365-patch-17", 100U, 1000U, 1U};
+    for (const bool resumed : {false, true}) {
+        for (const auto attempt : {1U, 2U}) {
+            update.attempt = attempt;
+            update.resumed = resumed;
+            update.retained_bytes = resumed ? 64U : 0U;
+            update.cache_hit = false;
+            update.total_bytes = 1000U;
+            update.completed_bytes = 100U;
+            reporter.source_transfer(Source::kObjects365V2, update, 100000U, 200000U);
+            check_plateau();
+            CHECK(displayed.activity.find("Objects365 v2") != std::string::npos);
+            CHECK(displayed.activity.find("objects365-patch-17") != std::string::npos);
+            CHECK(displayed.activity.find("100 / 1000 bytes") != std::string::npos);
+            CHECK(displayed.activity.find("attempt " + std::to_string(attempt)) != std::string::npos);
+            if (resumed) { CHECK(displayed.activity.find("retained 64 bytes") != std::string::npos); }
+            const auto prior = displayed.activity;
+            update.completed_bytes = 200U;
+            reporter.source_transfer(Source::kObjects365V2, update, 100100U, 200000U);
+            check_plateau();
+            CHECK(displayed.activity != prior);
+            CHECK(displayed.activity.find("200 / 1000 bytes") != std::string::npos);
+        }
+    }
+    update = DownloadProgress{"objects365-invalidated-archive", 16U, 1000U, 1U};
+    update.redownload = true;
+    reporter.source_transfer(Source::kObjects365V2, update, 105016U, 205000U);
+    CHECK(displayed.activity.find("Re-downloading objects365-invalidated-archive") != std::string::npos);
+    CHECK(displayed.activity.find("attempt 1") != std::string::npos);
+    check_plateau();
+    update = DownloadProgress{"objects365-cached-patch", 5000U, 5000U, 0U, false, true};
+    reporter.source_transfer(Source::kObjects365V2, update, 105000U, 205000U);
+    CHECK(displayed.activity.find("bytes reused") != std::string::npos);
+    update = DownloadProgress{"objects365-live-patch", 32U, 0U, 1U};
+    reporter.source_transfer(Source::kObjects365V2, update, 105032U, 205000U);
+    CHECK(displayed.activity.find("32 bytes (total unknown)") != std::string::npos);
+    CHECK(displayed.activity.find("reused") == std::string::npos);
+    check_plateau();
+    for (const auto phase : {DownloadProgressPhase::kVerifyingCachedArtifact, DownloadProgressPhase::kVerifyingDownloadedArtifact}) {
+        update.phase = phase;
+        reporter.source_transfer(Source::kObjects365V2, update, 105032U, 205000U);
+        CHECK(displayed.activity.find(phase == DownloadProgressPhase::kVerifyingCachedArtifact ? "Verifying cached" : "Verifying downloaded") != std::string::npos);
+        check_plateau();
+    }
+    reporter.activity("Preparing labels");
+    CHECK(displayed.activity == "Preparing labels");
+    reporter.phase(data::DatasetCompilePhase::Labels);
+    reporter.source_images(Source::kCoco2017, 123U, 123U);
+    CHECK(displayed.activity == "Preparing compiled labels");
+    reporter.source_transfer(Source::kObjects365V2, update, 105032U, 205000U);
+    CHECK(displayed.activity == "Preparing compiled labels");
+    reporter.source_complete(Source::kObjects365V2, false);
+    reporter.pixel_attempt(0U, 20U, "train", 20U);
+    reporter.source_activity(Source::kObjects365V2, "Repairing patch-17");
+    CHECK(displayed.activity.find("Repairing patch-17") != std::string::npos);
+    reporter.pixel_attempt(0U, 20U, "train", 20U);
+    CHECK(displayed.activity == "Compiling image pixels");
+    CHECK_FALSE(latest.current_source);
+    reporter.source_activity(Source::kObjects365V2, std::string(4096U, 'x'));
+    CHECK(displayed.activity.size() <= domain::kArtifactProgressTextCapacity);
+}
+}
+
+namespace mmltk::controller::subsystems::system {
+TEST_CASE("real ranged HTTP restart reaches the bounded artifact activity as a re-download", "[gui][services][progress]") {
+    using namespace data::benchmark_internal;
+    mmltk::testsupport::ScopedTempDir root("artifact-range-restart");
+    std::vector<std::uint8_t> payload(4096U);
+    for (std::size_t i = 0U; i < payload.size(); ++i) { payload[i] = static_cast<std::uint8_t>(i % 251U); }
+    data::testsupport::HttpServer server(payload);
+    DownloadRequest request{"objects365-restart", server.url("restart"), root.path() / "archive.bin", root.path() / "archive.lock", payload.size(),
+                            mmltk::common::io::sha256_hex(mmltk::common::io::sha256_bytes(payload)), 1U};
+    constexpr std::uint64_t retained = 512U;
+    {
+        std::ofstream partial(request.destination.string() + ".part", std::ios::binary);
+        partial.write(reinterpret_cast<const char*>(payload.data()), static_cast<std::streamsize>(retained));
+        REQUIRE(partial.good());
+    }
+    write_json_atomically(request.destination.string() + ".part.json",
+                          {{"schema_version", kBenchmarkCacheSchemaVersion}, {"url", request.url}, {"etag", "\"benchmark-test-etag\""}}, {});
+    server.RestartNextRangedTransfer();
+    std::vector<DownloadProgress> observed;
+    std::vector<domain::ArtifactProgress> displayed;
+    bool traced_restart = false;
+    bool traced_completion = false;
+    const auto trace = make_trace_sink([&](const std::string_view event, const std::string_view fields) {
+        const auto value = nlohmann::json::parse(fields);
+        if (event == "benchmark.download.progress" && value.at("redownload").get<bool>()) { traced_restart = true; }
+        if (event == "benchmark.download.complete") { traced_completion = value.at("redownload").get<bool>(); }
+    });
+    ProgressReporter reporter([&](const auto& update) { displayed.push_back(project_artifact_progress(update)); }, trace);
+    reporter.phase(data::DatasetCompilePhase::Extracting);
+    reporter.source_images(data::BenchmarkDatasetSource::kCoco2017, 123U, 123U);
+    reporter.source_images(data::BenchmarkDatasetSource::kObjects365V2, 170161U, 408551U);
+    reporter.source_images(data::BenchmarkDatasetSource::kOpenImagesV7, 56008U, 56008U);
+    displayed.clear();
+    const auto completed = download_artifacts({request}, 1U, {}, [&](const auto& update) {
+        observed.push_back(update);
+        reporter.source_transfer(data::BenchmarkDatasetSource::kObjects365V2, update, update.completed_bytes, update.total_bytes);
+    }, trace);
+    REQUIRE(completed.size() == 1U);
+    REQUIRE(observed.size() == displayed.size());
+    bool saw_retained = false;
+    bool saw_restart = false;
+    for (std::size_t i = 0U; i < observed.size(); ++i) {
+        const auto& update = observed[i];
+        CHECK(displayed[i].completed == 2416498U);
+        CHECK(displayed[i].total == 3000000U);
+        CHECK(displayed[i].activity.size() <= domain::kArtifactProgressTextCapacity);
+        if (update.resumed) {
+            CHECK_FALSE(saw_restart);
+            saw_retained = true;
+            CHECK(update.retained_bytes == retained);
+            CHECK(displayed[i].activity.find("Resuming objects365-restart") != std::string::npos);
+        }
+        if (update.redownload) {
+            CHECK(saw_retained);
+            saw_restart = true;
+            CHECK_FALSE(update.resumed);
+            CHECK(update.retained_bytes == 0U);
+            CHECK(displayed[i].activity.find("Re-downloading objects365-restart") != std::string::npos);
+        }
+    }
+    CHECK(saw_retained);
+    CHECK(saw_restart);
+    CHECK(traced_restart);
+    CHECK(traced_completion);
+    CHECK(mmltk::common::io::sha256_file(request.destination) == mmltk::common::io::sha256_bytes(payload));
+    CHECK_FALSE(completed.front().identity.empty());
+    CHECK(read_json_file(request.destination.string() + ".download.json").at("identity") == completed.front().identity);
+    const auto requests_before = server.requests();
+    const auto cached = download_artifacts({request}, 1U, {}, [&](const auto& update) {
+        CHECK(update.cache_hit);
+        CHECK_FALSE(update.redownload);
+        reporter.source_transfer(data::BenchmarkDatasetSource::kObjects365V2, update, update.completed_bytes, update.total_bytes);
+    });
+    CHECK(cached.front().cache_hit);
+    CHECK(cached.front().identity == completed.front().identity);
+    CHECK(displayed.back().activity.find("bytes reused") != std::string::npos);
+    CHECK(server.requests() == requests_before);
+    server.Check();
+}
+}

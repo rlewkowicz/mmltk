@@ -2,10 +2,12 @@
 #include <chrono>
 #include <cstdint>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <string_view>
 #include "src/backend/data/benchmark_dataset_compiler.h"
 #include "benchmark_cache.h"
+#include "benchmark_download.h"
 namespace mmltk::backend::data::benchmark_internal {
 class ProgressReporter {
    public:
@@ -19,8 +21,9 @@ class ProgressReporter {
     [[nodiscard]] bool pixel_observer_enabled() const noexcept;
     void projected(const std::uint64_t bytes);
     void rejected(const std::uint64_t dropped, const std::uint64_t quarantined);
-    void source_bytes(const BenchmarkDatasetSource source, const std::uint64_t completed, const std::uint64_t total, const std::uint32_t retry_count,
-                      const bool cache_hit, const bool resumed);
+    void source_transfer(BenchmarkDatasetSource source, const DownloadProgress& update, std::uint64_t completed, std::uint64_t total);
+    void add_source_images(BenchmarkDatasetSource source, std::uint64_t count, std::uint64_t total, std::string activity = {});
+    void rollback_source_images(BenchmarkDatasetSource source, std::uint64_t count, std::uint64_t total, std::string activity = {});
     void source_images(const BenchmarkDatasetSource source, const std::uint64_t completed, const std::uint64_t total);
     void source_complete(const BenchmarkDatasetSource source, const bool cache_hit);
 
@@ -30,11 +33,14 @@ class ProgressReporter {
     static void add_progress(std::uint64_t& target, const std::uint64_t value, const char* context);
     BenchmarkSourceProgress& source_progress(const BenchmarkDatasetSource source);
     void update_source_phase_progress();
-    void emit() const;
+    void set_source_activity_unlocked(BenchmarkDatasetSource source, std::string activity);
+    void select_acquisition_source(BenchmarkDatasetSource source);
+    void trace_activity(std::optional<BenchmarkDatasetSource> source, std::string_view activity);
+    void emit();
     BenchmarkProgressCallback callback_;
     const BenchmarkTraceSink* trace_ = nullptr;
     BenchmarkCompileProgress state_;
-    std::chrono::steady_clock::time_point activity_started_ = std::chrono::steady_clock::now();
+    std::chrono::steady_clock::time_point activity_started_{};
     std::string_view pixel_split_;
     std::uint64_t pixel_split_total_ = 0U;
     std::uint64_t pixel_completed_ = 0U;

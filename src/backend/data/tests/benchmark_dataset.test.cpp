@@ -1,5 +1,4 @@
 #include <algorithm>
-#include <arpa/inet.h>
 #include <array>
 #include <atomic>
 #include <catch2/catch_test_macros.hpp>
@@ -19,7 +18,6 @@
 #include <memory>
 #include <limits>
 #include <mutex>
-#include <netinet/in.h>
 #include <nlohmann/json.hpp>
 #include <optional>
 #include <span>
@@ -28,7 +26,6 @@
 #include <string>
 #include <string_view>
 #include <sys/file.h>
-#include <sys/socket.h>
 #include <sys/stat.h>
 #include <thread>
 #include <unistd.h>
@@ -45,6 +42,7 @@
 #include "detail/benchmark_writer.h"
 #include "detail/benchmark_jpeg.h"
 #include "detail/benchmark_progress.h"
+#include "detail/open_images_acquisition.h"
 #include "src/test_support/filesystem_test_utils.hpp"
 #include "src/backend/data/benchmark_dataset_compiler.h"
 #include "src/backend/data/benchmark_hash.h"
@@ -53,6 +51,7 @@
 #include "src/backend/data/compiled_dataset.h"
 #include "src/backend/data/dataset_compiler.h"
 #include "src/backend/data/tests/test_fixture.h"
+#include "src/backend/data/tests/benchmark_http_fixture.h"
 #include "src/backend/data/compiled_format.h"
 #include "src/backend/data/dataset_loader.h"
 #include "src/backend/imaging/resample/image_resize.h"
@@ -140,190 +139,17 @@ std::vector<std::uint8_t> make_payload(const std::size_t bytes) {
     for (std::size_t index = 0; index < payload.size(); ++index) { payload[index] = static_cast<std::uint8_t>((index * 131U + 17U) & 0xFFU); }
     return payload;
 }
-class HttpServer {
-   public:
-    explicit HttpServer(std::span<const std::uint8_t> payload) : HttpServer(payload, payload.size()) {}
-    explicit HttpServer(std::size_t generated_bytes) : HttpServer({}, generated_bytes) {}
-    HttpServer(std::span<const std::uint8_t> payload, std::size_t bytes)
-        : payload_(payload), payload_size_(bytes), listener_(::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0)) {
-        require_condition(listener_.get() >= 0, "failed to create benchmark HTTP socket");
-        const int reuse = 1;
-        require_condition(::setsockopt(listener_.get(), SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse)) == 0, "failed to configure benchmark HTTP socket");
-        sockaddr_in address{};
-        address.sin_family = AF_INET;
-        address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-        address.sin_port = 0;
-        require_condition(::bind(listener_.get(), reinterpret_cast<sockaddr*>(&address), sizeof(address)) == 0, "failed to bind benchmark HTTP socket");
-        require_condition(::listen(listener_.get(), 8) == 0, "failed to listen on benchmark HTTP socket");
-        socklen_t length = sizeof(address);
-        require_condition(::getsockname(listener_.get(), reinterpret_cast<sockaddr*>(&address), &length) == 0, "failed to inspect benchmark HTTP socket");
-        port_ = ntohs(address.sin_port);
-        worker_ = std::jthread([this] {
-            try {
-                run();
-            } catch (...) { failure_ = std::current_exception(); }
-        });
+[[nodiscard]] bool has_generated_payload(const fs::path& path, const std::size_t bytes) {
+    const FileHandle file = FileHandle::open_readonly(path.string());
+    std::array<std::uint8_t, 64U * 1024U> block{};
+    bool exact = true;
+    for (std::size_t offset = 0U; offset < bytes; offset += block.size()) {
+        file.pread_all(block.data(), block.size(), offset);
+        for (std::size_t i = 0U; i < block.size(); ++i) exact &= block[i] == static_cast<std::uint8_t>(((offset + i) * 131U + 17U) & 0xFFU);
     }
-    HttpServer(const HttpServer&) = delete;
-    HttpServer& operator=(const HttpServer&) = delete;
-    ~HttpServer() { Stop(); }
-    void Stop() noexcept {
-        stop_.store(true, std::memory_order_release);
-        partial_.Release();
-        ::shutdown(listener_.get(), SHUT_RDWR);
-        {
-            std::scoped_lock lock(client_mutex_);
-            if (active_client_ >= 0) ::shutdown(active_client_, SHUT_RDWR);
-        }
-        if (worker_.joinable()) worker_.join();
-    }
-    void Check() {
-        Stop();
-        if (failure_) std::rethrow_exception(failure_);
-    }
-    static constexpr std::size_t partial_bytes = 512U * 1024U;
-    void GateNextTransfer() { gate_next_.store(true, std::memory_order_release); }
-    [[nodiscard]] bool WaitPartial() const { return partial_.WaitEntered(3s); }
-    void ReleasePartial() const { partial_.Release(); }
-    [[nodiscard]] std::string url(const std::string& path) const { return "http://127.0.0.1:" + std::to_string(port_) + "/" + path; }
-    void TruncateNextTransfer() { truncate_next_.store(true, std::memory_order_release); }
-    [[nodiscard]] std::vector<std::pair<std::size_t, std::size_t>> ranges() {
-        const std::scoped_lock lock(client_mutex_);
-        return ranges_;
-    }
-    void fail_next(const int count) { failures_remaining_.store(count, std::memory_order_relaxed); }
-    [[nodiscard]] std::uint64_t requests() const { return requests_.load(std::memory_order_relaxed); }
-    [[nodiscard]] std::uint64_t ranged_requests() const { return ranged_requests_.load(std::memory_order_relaxed); }
-
-   private:
-    static bool send_all(const int socket, const void* data, const std::size_t bytes) {
-        const auto* input = static_cast<const std::uint8_t*>(data);
-        std::size_t sent = 0;
-        while (sent < bytes) {
-            const ssize_t result = ::send(socket, input + sent, bytes - sent, MSG_NOSIGNAL);
-            if (result < 0 && errno == EINTR) continue;
-            if (result <= 0) { return false; }
-            sent += static_cast<std::size_t>(result);
-        }
-        return true;
-    }
-    void run() {
-        while (!stop_.load(std::memory_order_relaxed)) {
-            const mmltk::common::io::ScopedFd client_owner{::accept4(listener_.get(), nullptr, nullptr, SOCK_CLOEXEC)};
-            const int client = client_owner.get();
-            if (client < 0) {
-                if (stop_.load(std::memory_order_relaxed)) { return; }
-                if (errno == EINTR) continue;
-                throw std::runtime_error("HTTP fixture accept failed");
-            }
-            {
-                std::scoped_lock lock(client_mutex_);
-                if (stop_.load(std::memory_order_acquire)) return;
-                active_client_ = client;
-            }
-            const mmltk::testsupport::ScopedTestCleanup clear_client([&] {
-                std::scoped_lock lock(client_mutex_);
-                active_client_ = -1;
-            });
-            const timeval deadline{.tv_sec = 3, .tv_usec = 0};
-            require_condition(::setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, &deadline, sizeof(deadline)) == 0, "HTTP receive deadline");
-            require_condition(::setsockopt(client, SOL_SOCKET, SO_SNDTIMEO, &deadline, sizeof(deadline)) == 0, "HTTP send deadline");
-            serve(client);
-        }
-    }
-    void serve(const int client) {
-        std::size_t received = 0U;
-        std::string_view request;
-        while (received < receive_.size()) {
-            const auto count = ::recv(client, receive_.data() + received, receive_.size() - received, 0);
-            if (count < 0 && errno == EINTR) continue;
-            if (count <= 0) return;
-            received += static_cast<std::size_t>(count);
-            request = {receive_.data(), received};
-            if (request.find("\r\n\r\n") != std::string_view::npos) break;
-        }
-        require_condition(request.find("\r\n\r\n") != std::string_view::npos, "HTTP header exceeds bounded receive storage");
-        requests_.fetch_add(1U, std::memory_order_relaxed);
-        if (failures_remaining_.fetch_sub(1, std::memory_order_relaxed) > 0) {
-            static constexpr std::string_view response =
-                "HTTP/1.1 503 Service Unavailable\r\n"
-                "Content-Length: 0\r\nConnection: close\r\n\r\n";
-            (void)send_all(client, response.data(), response.size());
-            return;
-        }
-        failures_remaining_.store(0, std::memory_order_relaxed);
-        std::size_t begin = 0U;
-        std::size_t end = payload_size_ - 1U;
-        bool ranged = false;
-        const std::size_t range_header = request.find("\r\nRange: bytes=");
-        if (range_header != std::string::npos) {
-            const std::size_t number_begin = range_header + std::strlen("\r\nRange: bytes=");
-            const std::size_t dash = request.find('-', number_begin);
-            if (dash != std::string::npos) {
-                const auto parsed = std::from_chars(request.data() + number_begin, request.data() + dash, begin);
-                require_condition(parsed.ec == std::errc{} && parsed.ptr == request.data() + dash, "invalid HTTP range");
-                const auto range_end = request.find("\r\n", dash);
-                if (range_end != dash + 1U) {
-                    const auto last = std::from_chars(request.data() + dash + 1U, request.data() + range_end, end);
-                    require_condition(last.ec == std::errc{} && last.ptr == request.data() + range_end, "invalid HTTP range end");
-                }
-                ranged = begin <= end && end < payload_size_;
-            }
-        }
-        if (ranged) {
-            ranged_requests_.fetch_add(1U, std::memory_order_relaxed);
-            const std::scoped_lock lock(client_mutex_);
-            ranges_.emplace_back(begin, end);
-        } else {
-            begin = 0U;
-        }
-        const std::size_t bytes = end + 1U - begin;
-        std::string header = std::string(ranged ? "HTTP/1.1 206 Partial Content\r\n" : "HTTP/1.1 200 OK\r\n") + "Content-Length: " + std::to_string(bytes) +
-                             "\r\nAccept-Ranges: bytes\r\nETag: \"benchmark-test-etag\"\r\n"
-                             "Last-Modified: Thu, 23 Jul 2026 12:00:00 GMT\r\n";
-        if (ranged) { header += "Content-Range: bytes " + std::to_string(begin) + "-" + std::to_string(end) + "/" + std::to_string(payload_size_) + "\r\n"; }
-        header += "Connection: close\r\n\r\n";
-        if (!send_all(client, header.data(), header.size())) { return; }
-        constexpr std::size_t chunk = std::size_t{16U} * 1024U;
-        if (request.starts_with("HEAD ")) return;
-        const bool gated = bytes >= partial_bytes && gate_next_.exchange(false, std::memory_order_acq_rel);
-        const bool truncated = bytes >= partial_bytes && truncate_next_.exchange(false, std::memory_order_acq_rel);
-        std::array<std::uint8_t, chunk> generated{};
-        std::size_t offset = begin;
-        while (offset <= end) {
-            const std::size_t current = std::min(chunk, end + 1U - offset);
-            const auto* data = payload_.data();
-            if (payload_.empty()) {
-                for (std::size_t i = 0; i < current; ++i) generated[i] = static_cast<std::uint8_t>(((offset + i) * 131U + 17U) & 0xFFU);
-                data = generated.data();
-            } else {
-                data += offset;
-            }
-            if (!send_all(client, data, current)) { return; }
-            offset += current;
-            if (truncated && offset - begin >= partial_bytes) return;
-            if (gated && offset - begin == partial_bytes) partial_.receipt().ArriveAndWait();
-            if (stop_.load(std::memory_order_acquire)) return;
-        }
-    }
-    const std::span<const std::uint8_t> payload_;
-    const std::size_t payload_size_;
-    std::vector<std::pair<std::size_t, std::size_t>> ranges_;
-    mmltk::common::io::ScopedFd listener_;
-    std::array<char, 16U * 1024U> receive_{};
-    std::mutex client_mutex_;
-    int active_client_ = -1;
-    std::exception_ptr failure_;
-    mmltk::testsupport::TestGate partial_{"HTTP partial transfer byte boundary"};
-    std::uint16_t port_ = 0U;
-    std::atomic<bool> stop_{false};
-    std::atomic<bool> gate_next_{false};
-    std::atomic<bool> truncate_next_{false};
-    std::atomic<int> failures_remaining_{0};
-    std::atomic<std::uint64_t> requests_{0U};
-    std::atomic<std::uint64_t> ranged_requests_{0U};
-    std::jthread worker_;
-};
+    return exact;
+}
+using mmltk::backend::data::testsupport::HttpServer;
 DownloadRequest request_for(const fs::path& root, const std::string& id, const std::string& url, const std::vector<std::uint8_t>& payload) {
     return DownloadRequest{
         id, url, root / (id + ".bin"), root / "locks" / (id + ".lock"), payload.size(), mmltk::common::io::sha256_hex(mmltk::common::io::sha256_bytes(payload)),
@@ -336,9 +162,11 @@ void test_benchmark_download_cache_lifecycle() {
     HttpServer server(payload);
     DownloadRequest retry = request_for(root.path(), "retry", server.url("retry"), payload);
     server.fail_next(1);
-    const auto retry_result = download_artifacts({retry}, 1U, {});
+    std::vector<DownloadProgress> retry_updates;
+    const auto retry_result = download_artifacts({retry}, 1U, {}, [&](const auto& update) { retry_updates.push_back(update); });
     REQUIRE(retry_result.size() == 1U);
     REQUIRE(retry_result[0].attempts == 2U);
+    CHECK(std::ranges::any_of(retry_updates, [](const auto& update) { return update.attempt == 2U && update.completed_bytes > 0U; }));
     DownloadRequest resume = request_for(root.path(), "resume", server.url("resume"), payload);
     std::atomic<bool> cancel{false};
     server.GateNextTransfer();
@@ -367,7 +195,13 @@ void test_benchmark_download_cache_lifecycle() {
     REQUIRE(fs::file_size(resume.destination.string() + ".part") == HttpServer::partial_bytes);
     server.ReleasePartial();
     cancel.store(false, std::memory_order_release);
-    const auto resumed = download_artifacts({resume}, 1U, mmltk::common::concurrency::CancellationObservation::Atomic(cancel));
+    std::vector<DownloadProgress> resumed_updates;
+    const auto resumed = download_artifacts({resume}, 1U, mmltk::common::concurrency::CancellationObservation::Atomic(cancel),
+                                           [&](const auto& update) { resumed_updates.push_back(update); });
+    REQUIRE_FALSE(resumed_updates.empty());
+    CHECK(std::ranges::any_of(resumed_updates, [](const auto& update) {
+        return update.resumed && update.retained_bytes == HttpServer::partial_bytes && update.completed_bytes > update.retained_bytes;
+    }));
     REQUIRE(resumed[0].resumed);
     REQUIRE(server.ranged_requests() > 0U);
     const std::uint64_t before_cache_hit = server.requests();
@@ -379,7 +213,16 @@ void test_benchmark_download_cache_lifecycle() {
     REQUIRE(server.requests() == before_cache_hit);
     corrupt_byte(resume.destination, 0U);
     invalidate_download_artifact(resume);
-    const auto repaired = download_artifacts({resume}, 1U, {});
+    std::size_t byte_traces = 0U;
+    const auto repaired = download_artifacts({resume}, 1U, {}, {}, [&](const auto event, const nlohmann::json& fields) {
+        if (event == "benchmark.download.progress") {
+            ++byte_traces;
+            CHECK(fields.at("artifact") == "resume");
+            CHECK_FALSE(fields.at("cache_hit").get<bool>());
+            CHECK(fields.at("retained_bytes") == 0U);
+        }
+    });
+    CHECK(byte_traces > 0U);
     REQUIRE(!repaired[0].cache_hit);
     REQUIRE(server.requests() > before_cache_hit);
     REQUIRE(repaired[0].size == payload.size());
@@ -587,7 +430,7 @@ void write_tar_octal(std::array<std::uint8_t, 512U>* header, const std::size_t o
                 header->begin() + static_cast<std::ptrdiff_t>(offset + width - digit_count - 1U));
     (*header)[offset + width - 1U] = '\0';
 }
-void write_single_jpeg_tar(const fs::path& path, const std::uint64_t image_id, const std::span<const std::uint8_t> jpeg) {
+void write_jpeg_tar_entry(std::ostream& output, const std::uint64_t image_id, const std::span<const std::uint8_t> jpeg) {
     std::array<std::uint8_t, 512U> header{};
     const std::string name = "images/" + std::to_string(image_id) + ".jpg";
     require_condition(name.size() < 100U, "benchmark test tar entry name is too long");
@@ -608,14 +451,19 @@ void write_single_jpeg_tar(const fs::path& path, const std::uint64_t image_id, c
     for (const std::uint8_t byte : header) { checksum += byte; }
     write_tar_octal(&header, 148U, 7U, checksum);
     header[155] = static_cast<std::uint8_t>(' ');
-    std::ofstream output(path, std::ios::binary | std::ios::trunc);
     output.write(reinterpret_cast<const char*>(header.data()), static_cast<std::streamsize>(header.size()));
     output.write(reinterpret_cast<const char*>(jpeg.data()), static_cast<std::streamsize>(jpeg.size()));
     const std::size_t padding = (512U - (jpeg.size() % 512U)) % 512U;
     const std::array<std::uint8_t, 1024U> zeros{};
     require_condition(padding <= zeros.size(), "benchmark test tar padding exceeds buffer");
     output.write(reinterpret_cast<const char*>(zeros.data()), static_cast<std::streamsize>(padding));
-    output.write(reinterpret_cast<const char*>(zeros.data()), static_cast<std::streamsize>(zeros.size()));
+    require_condition(output.good(), "failed to write benchmark test tar entry");
+}
+void write_single_jpeg_tar(const fs::path& path, const std::uint64_t image_id, const std::span<const std::uint8_t> jpeg) {
+    std::ofstream output(path, std::ios::binary | std::ios::trunc);
+    write_jpeg_tar_entry(output, image_id, jpeg);
+    const std::array<char, 1024U> terminator{};
+    output.write(terminator.data(), static_cast<std::streamsize>(terminator.size()));
     require_condition(output.good(), "failed to write benchmark test tar");
 }
 void test_benchmark_archive_training_quarantine() {
@@ -1589,27 +1437,30 @@ TEST_CASE("segmented downloads retain durable ranges through failure cancellatio
     server.ReleasePartial();
     request.maximum_attempts = 3U;
     server.TruncateNextTransfer();
-    std::atomic<bool> traced_retry{false}, traced_complete{false};
-    const auto resumed = download_artifacts({request}, 2U, {}, {}, [&](const std::string_view event, const nlohmann::json&) {
+    std::atomic<bool> traced_retry{false}, traced_complete{false}, traced_bytes{false}, traced_second_attempt{false}, invalid_byte_facts{false};
+    const auto resumed = download_artifacts({request}, 2U, {}, {}, [&](const std::string_view event, const nlohmann::json& fields) {
+        if (event == "benchmark.download.progress") {
+            traced_bytes.store(true, std::memory_order_relaxed);
+            if (fields.at("attempt") == 2U) { traced_second_attempt.store(true, std::memory_order_relaxed); }
+            if (fields.at("retained_bytes").get<std::uint64_t>() == 0U || fields.at("durable_bytes") > fields.at("completed_bytes")) {
+                invalid_byte_facts.store(true, std::memory_order_relaxed);
+            }
+        }
         if (event == "benchmark.download.segment_retry") traced_retry.store(true, std::memory_order_relaxed);
         if (event == "benchmark.download.segmented_complete") traced_complete.store(true, std::memory_order_relaxed);
     });
     CHECK(traced_retry.load(std::memory_order_relaxed));
     CHECK(traced_complete.load(std::memory_order_relaxed));
+    CHECK(traced_bytes.load(std::memory_order_relaxed));
+    CHECK(traced_second_attempt.load(std::memory_order_relaxed));
+    CHECK_FALSE(invalid_byte_facts.load(std::memory_order_relaxed));
     REQUIRE(resumed.size() == 1U);
     CHECK(resumed.front().resumed);
     CHECK(resumed.front().attempts == 2U);
     REQUIRE(fs::file_size(request.destination) == bytes);
     CHECK_FALSE(fs::exists(metadata_path));
     CHECK_FALSE(fs::exists(request.destination.string() + ".part"));
-    const FileHandle file = FileHandle::open_readonly(request.destination.string());
-    std::array<std::uint8_t, 64U * 1024U> block{};
-    bool exact = true;
-    for (std::size_t offset = 0U; offset < bytes; offset += block.size()) {
-        file.pread_all(block.data(), block.size(), offset);
-        for (std::size_t i = 0U; i < block.size(); ++i) exact &= block[i] == static_cast<std::uint8_t>(((offset + i) * 131U + 17U) & 0xFFU);
-    }
-    CHECK(exact);
+    CHECK(has_generated_payload(request.destination, bytes));
     server.Check();
 }
 TEST_CASE("benchmark shrinking JPEGs preserve the RGB8 intermediate projection exactly", "[backend][data][benchmark][writer][perceptual]") {
@@ -1654,17 +1505,17 @@ TEST_CASE("transfer observers are independent of trace-only pixel observers", "[
     ProgressReporter traced({}, trace);
     CHECK_FALSE(traced.transfer_observer_enabled());
     CHECK(traced.pixel_observer_enabled());
-    traced.source_bytes(BenchmarkDatasetSource::kCoco2017, 1U, 2U, 1U, false, false);
+    traced.source_transfer(BenchmarkDatasetSource::kCoco2017, DownloadProgress{"coco-fixture", 1U, 2U, 2U}, 1U, 2U);
     CHECK(traces == 0U);
     traced.pixel_attempt(0U, 1U, "train", 1U);
     traced.pixel_completed();
-    CHECK(traces == 1U);
+    CHECK(traces == 2U);
     std::vector<BenchmarkCompileProgress> updates;
     ProgressReporter observed([&](const BenchmarkCompileProgress& update) { updates.push_back(update); }, quiet);
     CHECK(observed.transfer_observer_enabled());
     CHECK(observed.pixel_observer_enabled());
     observed.phase(DatasetCompilePhase::Downloading);
-    observed.source_bytes(BenchmarkDatasetSource::kCoco2017, 5U, 11U, 2U, false, true);
+    observed.source_transfer(BenchmarkDatasetSource::kCoco2017, DownloadProgress{"coco-fixture", 5U, 11U, 3U, true}, 5U, 11U);
     REQUIRE_FALSE(updates.empty());
     CHECK(updates.back().sources[0].completed_bytes == 5U);
     CHECK(updates.back().sources[0].total_bytes == 11U);
@@ -1802,4 +1653,304 @@ TEST_CASE("benchmark sink setup failure reports once without creating a sink", "
     const auto sink = make_trace_sink(callback);
     CHECK_FALSE(sink);
     CHECK(calls == 1U);
+}
+
+TEST_CASE("archive write progress orders late batches within one attempt", "[backend][data][benchmark][progress]") {
+    std::vector<std::uint64_t> observed;
+    CachedImageWriteProgress progress([&](const auto completed, const auto total) {
+        CHECK(total == 400U);
+        observed.push_back(completed);
+    }, 16U, 384U);
+    std::promise<void> newer_published;
+    auto newer = newer_published.get_future();
+    auto old_batch = std::async(std::launch::async, [&] {
+        newer.wait();
+        progress.completed(128U);
+    });
+    progress.completed(256U);
+    newer_published.set_value();
+    mmltk::testsupport::await_test_future(old_batch, "older write batch publication", 5s);
+    progress.completed(384U);
+    REQUIRE(observed == std::vector<std::uint64_t>{272U, 400U});
+}
+TEST_CASE("source count additions serialize publication and permit retry withdrawal", "[backend][data][benchmark][progress]") {
+    const BenchmarkTraceSink quiet;
+    BenchmarkCompileProgress latest;
+    std::vector<std::uint64_t> counts;
+    mmltk::testsupport::TestGate first("first source publication");
+    ProgressReporter progress([&](const auto& update) {
+        latest = update;
+        const auto count = update.sources[1].completed_images;
+        counts.push_back(count);
+        if (count == 128U) { first.receipt().ArriveAndWait(); }
+    }, quiet);
+    const auto source = BenchmarkDatasetSource::kObjects365V2;
+    progress.phase(DatasetCompilePhase::Extracting);
+    auto first_add = std::async(std::launch::async, [&] { progress.add_source_images(source, 128U, 512U); });
+    const mmltk::testsupport::ScopedTestCleanup release([&] { first.Release(); });
+    REQUIRE(first.WaitEntered(3s));
+    auto second_add = std::async(std::launch::async, [&] { progress.add_source_images(source, 256U, 512U); });
+    first.Release();
+    mmltk::testsupport::await_test_future(first_add, "first source addition", 5s);
+    mmltk::testsupport::await_test_future(second_add, "second source addition", 5s);
+    CHECK(latest.sources[1].completed_images == 384U);
+    CHECK(std::ranges::is_sorted(counts));
+    progress.rollback_source_images(source, 128U, 512U);
+    CHECK(latest.sources[1].completed_images == 256U);
+    progress.add_source_images(source, 256U, 512U);
+    CHECK(latest.sources[1].completed_images == 512U);
+    CHECK_THROWS_AS(progress.rollback_source_images(source, 513U, 512U), std::underflow_error);
+    progress.source_images(source, std::numeric_limits<std::uint64_t>::max(), std::numeric_limits<std::uint64_t>::max());
+    CHECK_THROWS_AS(progress.add_source_images(source, 1U, std::numeric_limits<std::uint64_t>::max()), std::overflow_error);
+}
+TEST_CASE("archive image reuse reports initial and resolved counts without replacing valid JPEGs", "[backend][data][benchmark][images]") {
+    for (const std::size_t workers : {0U, 3U}) {
+        mmltk::testsupport::ScopedTempDir root("progress-reuse");
+        const auto archive = root.path() / "images.tar";
+        const auto images = root.path() / "images";
+        const auto jpeg = make_jpeg(10U, 20U, 30U);
+        write_single_jpeg_tar(archive, 2U, jpeg);
+        prepare_cached_image_directory(images);
+        write_cached_image_atomically(cached_image_path(images, 1U), jpeg, {});
+        const RetainedArtifact retained{cached_image_path(images, 1U)};
+        const std::vector<std::uint64_t> ids{1U, 2U};
+        std::vector<std::uint64_t> counts;
+        ArchiveExtractionRequest request{
+            .archive_path = archive, .source_identity = "fixture:reuse", .output_root = images,
+            .source = "objects365", .shard = "patch-0", .selected_image_ids = ids,
+            .image_id_parser = [](const std::string_view name) -> std::optional<std::uint64_t> {
+                return name.ends_with("/2.jpg") ? std::optional<std::uint64_t>{2U} : std::nullopt;
+            },
+            .progress = [&](const auto completed, const auto total) { CHECK(total == 2U); counts.push_back(completed); },
+            .validator = [](const auto, const auto encoded) {
+                if (!has_complete_jpeg_markers(encoded)) { throw std::runtime_error("invalid cached JPEG"); }
+            },
+            .decompression_workers = 0U, .cache_write_workers = workers
+        };
+        auto result = extract_selected_archive_images(request);
+        REQUIRE_FALSE(counts.empty());
+        CHECK(counts.front() == 1U);
+        CHECK(counts.back() == 2U);
+        CHECK(std::ranges::is_sorted(counts));
+        CHECK(result.image_count == 2U);
+        CHECK(result.selection_sha256 == cached_image_selection_digest(ids));
+        retained.Check();
+        const RetainedArtifact second{cached_image_path(images, 2U)};
+        fs::remove(images / ".complete.json");
+        counts.clear();
+        result = extract_selected_archive_images(request);
+        CHECK(counts.front() == 2U);
+        CHECK(counts.back() == 2U);
+        retained.Check();
+        second.Check();
+        fs::remove(archive);
+        counts.clear();
+        result = extract_selected_archive_images(request);
+        CHECK(result.cache_hit);
+        CHECK(counts == std::vector<std::uint64_t>{2U});
+        retained.Check();
+        second.Check();
+        fs::remove(images / ".complete.json");
+        write_text(cached_image_path(images, 2U), "invalid");
+        write_single_jpeg_tar(archive, 2U, jpeg);
+        counts.clear();
+        result = extract_selected_archive_images(request);
+        CHECK(counts.front() == 1U);
+        CHECK(counts.back() == 2U);
+        CHECK(mmltk::common::io::sha256_file(cached_image_path(images, 2U)) == mmltk::common::io::sha256_bytes(jpeg));
+        retained.Check();
+    }
+}
+TEST_CASE("Open Images local JPEG and complete group reuse preserve dimensions and identities", "[backend][data][benchmark][images]") {
+    mmltk::testsupport::ScopedTempDir root("open-images-reuse");
+    const auto cache = BenchmarkCacheLayout::create(root.path());
+    const auto images = cache.source_images("open-images") / "train";
+    prepare_cached_image_directory(images);
+    const auto jpeg = make_jpeg(10U, 20U, 30U);
+    write_cached_image_atomically(cached_image_path(images, 1U), jpeg, {});
+    write_cached_image_atomically(cached_image_path(images, 2U), jpeg, {});
+    const RetainedArtifact first{cached_image_path(images, 1U)};
+    const RetainedArtifact second{cached_image_path(images, 2U)};
+    NormalizedAnnotationIndex index;
+    index.source = BenchmarkDatasetSource::kOpenImagesV7;
+    index.images.resize(2U);
+    index.images[0].source_image_id = 1U;
+    index.images[1].source_image_id = 2U;
+    std::vector<QuarantinedImage> quarantined;
+    const BenchmarkTraceSink quiet;
+    BenchmarkCompileProgress latest;
+    ProgressReporter progress([&](const auto& update) { latest = update; }, quiet);
+    progress.phase(DatasetCompilePhase::Extracting);
+    auto acquired = acquire_open_images(cache, index, &quarantined, {}, &progress, 1, 0U, quiet);
+    REQUIRE(acquired.available_image_ids == std::vector<std::uint64_t>{1U, 2U});
+    CHECK(latest.sources[2].completed_images == 2U);
+    const auto width = index.images[0].width;
+    const auto height = index.images[0].height;
+    CHECK(width > 0U);
+    CHECK(height > 0U);
+    for (auto& image : index.images) { image.width = image.height = 0U; }
+    acquired = acquire_open_images(cache, index, &quarantined, {}, &progress, 1, 0U, quiet);
+    CHECK(acquired.directory.cache_hit);
+    CHECK(index.images[0].width == width);
+    CHECK(index.images[0].height == height);
+    const auto proof = images / ".groups" / "group-000000.complete.json";
+    auto manifest = read_json_file(proof);
+    manifest["identity"] = "stale";
+    write_json_atomically(proof, manifest, {});
+    acquired = acquire_open_images(cache, index, &quarantined, {}, &progress, 1, 0U, quiet);
+    CHECK_FALSE(acquired.directory.cache_hit);
+    manifest = read_json_file(proof);
+    manifest["selection_sha256"] = "stale";
+    write_json_atomically(proof, manifest, {});
+    acquired = acquire_open_images(cache, index, &quarantined, {}, &progress, 1, 0U, quiet);
+    CHECK_FALSE(acquired.directory.cache_hit);
+    manifest = read_json_file(proof);
+    index.images.push_back(NormalizedImage{.source_image_id = 3U});
+    const std::vector<std::uint64_t> requested{1U, 2U, 3U};
+    manifest["requested_image_count"] = 3U;
+    manifest["requested_selection_sha256"] = cached_image_selection_digest(requested);
+    manifest["quarantined"] = {{{"image_id", 3U}, {"reason", "fixture unavailable image"}}};
+    write_json_atomically(proof, manifest, {});
+    acquired = acquire_open_images(cache, index, &quarantined, {}, &progress, 1, 0U, quiet);
+    CHECK(acquired.directory.cache_hit);
+    CHECK(acquired.available_image_ids == std::vector<std::uint64_t>{1U, 2U});
+    REQUIRE(quarantined.size() == 1U);
+    CHECK(quarantined.front().image_id == 3U);
+    CHECK(quarantined.front().reason == "fixture unavailable image");
+    CHECK(latest.sources[2].completed_images == 3U);
+    first.Check();
+    second.Check();
+}
+
+TEST_CASE("activity diagnostics use the isolated serialized adapter independently of GUI observation", "[backend][data][benchmark][trace]") {
+    std::vector<std::string> activities;
+    const auto trace = make_trace_sink([&](const std::string_view event, const std::string_view fields) {
+        REQUIRE_FALSE(fields.empty());
+        CHECK(fields.size() < 13U * 1024U);
+        if (event == "benchmark.progress.activity") { activities.push_back(nlohmann::json::parse(fields).at("activity").get<std::string>()); }
+    });
+    ProgressReporter reporter({}, trace);
+    CHECK_FALSE(reporter.transfer_observer_enabled());
+    reporter.phase(DatasetCompilePhase::Extracting);
+    reporter.source_activity(BenchmarkDatasetSource::kObjects365V2, "Checking patch-17 cache");
+    reporter.source_activity(BenchmarkDatasetSource::kObjects365V2, "Checking patch-17 cache");
+    reporter.activity("Preparing labels");
+    reporter.activity("Preparing labels");
+    REQUIRE(activities == std::vector<std::string>{"Acquiring and extracting source images", "Checking patch-17 cache", "Preparing labels"});
+    std::size_t failed_deliveries = 0U;
+    const auto throwing = make_trace_sink([&](const auto, const auto) { ++failed_deliveries; throw std::runtime_error("diagnostic fixture"); });
+    ProgressReporter faulted({}, throwing);
+    CHECK_NOTHROW(faulted.source_activity(BenchmarkDatasetSource::kCoco2017, "Checking local cache"));
+    CHECK(failed_deliveries == 1U);
+}
+
+TEST_CASE("batched image writes settle before cancellation and preserve successful cache writes", "[backend][data][benchmark][images][cancel]") {
+    for (const bool cancel_after_batch : {false, true}) {
+        mmltk::testsupport::ScopedTempDir root("batched-cache-writes");
+        const auto archive = root.path() / "images.tar";
+        const auto jpeg = make_jpeg(5U, 10U, 20U);
+        std::vector<std::uint64_t> ids;
+        {
+            std::ofstream output(archive, std::ios::binary);
+            for (std::uint64_t id = 1U; id <= 384U; ++id) { ids.push_back(id); write_jpeg_tar_entry(output, id, jpeg); }
+            const std::array<char, 1024U> terminator{};
+            output.write(terminator.data(), static_cast<std::streamsize>(terminator.size()));
+            REQUIRE(output.good());
+        }
+        std::atomic<bool> cancelled{false};
+        std::vector<std::uint64_t> counts;
+        ArchiveExtractionRequest request{
+            .archive_path = archive, .source_identity = "fixture:batch", .output_root = root.path() / "images",
+            .source = "objects365", .shard = "patch-0", .selected_image_ids = ids,
+            .image_id_parser = [](const std::string_view name) -> std::optional<std::uint64_t> {
+                const auto digits = name.substr(name.find_last_of('/') + 1U);
+                std::uint64_t id = 0U;
+                const auto parsed = std::from_chars(digits.data(), digits.data() + digits.size() - 4U, id);
+                return parsed.ec == std::errc{} ? std::optional<std::uint64_t>{id} : std::nullopt;
+            },
+            .cancel_requested = mmltk::common::concurrency::CancellationObservation::Atomic(cancelled),
+            .progress = [&](const auto completed, const auto) {
+                counts.push_back(completed);
+                if (cancel_after_batch && completed >= 128U) { cancelled.store(true); }
+            },
+            .decompression_workers = 0U, .cache_write_workers = 3U
+        };
+        if (cancel_after_batch) {
+            CHECK_THROWS(extract_selected_archive_images(request));
+            CHECK_FALSE(fs::exists(request.output_root / ".complete.json"));
+        } else {
+            CHECK(extract_selected_archive_images(request).image_count == ids.size());
+            REQUIRE_FALSE(counts.empty());
+            CHECK(counts.back() == ids.size());
+        }
+        CHECK(std::ranges::is_sorted(counts));
+        std::uint64_t retained = 0U;
+        for (const auto id : ids) {
+            const auto path = cached_image_path(request.output_root, id);
+            if (fs::exists(path)) {
+                ++retained;
+                CHECK(mmltk::common::io::sha256_file(path) == mmltk::common::io::sha256_bytes(jpeg));
+            }
+        }
+        CHECK(retained >= 128U);
+        CHECK(retained <= ids.size());
+    }
+}
+
+TEST_CASE("fresh segmented retries expose newly durable ranges without counting sparse allocation", "[backend][data][benchmark][download]") {
+    mmltk::testsupport::ScopedTempDir root("fresh-segmented-retry");
+    constexpr std::size_t bytes = 512U * 1024U * 1024U;
+    HttpServer server(bytes);
+    DownloadRequest request{"objects365-fresh-retry", server.url("retry"), root.path() / "archive.bin", root.path() / "archive.lock", bytes, {}, 3U};
+    server.TruncateNextTransfer();
+    std::vector<DownloadProgress> updates;
+    const auto downloaded = download_artifacts({request}, 2U, {}, [&](const DownloadProgress& update) { updates.push_back(update); });
+    REQUIRE(downloaded.size() == 1U);
+    REQUIRE_FALSE(updates.empty());
+    CHECK(updates.front().completed_bytes == 0U);
+    CHECK(updates.front().retained_bytes == 0U);
+    CHECK_FALSE(updates.front().resumed);
+    bool saw_retry = false;
+    std::uint64_t previous = 0U;
+    for (const auto& update : updates) {
+        CHECK(update.completed_bytes >= previous);
+        CHECK(update.completed_bytes <= bytes);
+        CHECK(update.total_bytes == bytes);
+        CHECK(update.retained_bytes <= update.completed_bytes);
+        CHECK_FALSE(update.redownload);
+        if (update.attempt > 1U) {
+            saw_retry = true;
+            CHECK(update.resumed);
+            CHECK(update.retained_bytes >= HttpServer::partial_bytes);
+        }
+        previous = update.completed_bytes;
+    }
+    CHECK(saw_retry);
+    CHECK(updates.back().completed_bytes == bytes);
+    CHECK(has_generated_payload(request.destination, bytes));
+    server.Check();
+}
+
+TEST_CASE("discarded segmented state retains the typed re-download context during ordinary fallback", "[backend][data][benchmark][download]") {
+    mmltk::testsupport::ScopedTempDir root("segmented-redownload");
+    constexpr std::size_t bytes = 512U * 1024U * 1024U;
+    HttpServer server(bytes);
+    DownloadRequest request{"objects365-fallback", server.url("fallback"), root.path() / "archive.bin", root.path() / "archive.lock", bytes, {}, 1U};
+    server.RestartNextRangedTransfer();
+    bool saw_redownload = false;
+    bool saw_completion = false;
+    bool saw_discarded_state = false;
+    const auto trace = make_trace_sink([&](const std::string_view event, const std::string_view fields) {
+        if (event == "benchmark.download.segmented_fallback") { saw_discarded_state = nlohmann::json::parse(fields).at("redownload").get<bool>(); }
+        if (event == "benchmark.download.complete") { saw_completion = nlohmann::json::parse(fields).at("redownload").get<bool>(); }
+    });
+    const auto downloaded = download_artifacts({request}, 2U, {}, [&](const DownloadProgress& update) {
+        if (update.redownload) { saw_redownload = true; CHECK(update.retained_bytes == 0U); CHECK_FALSE(update.resumed); }
+    }, trace);
+    REQUIRE(downloaded.size() == 1U);
+    CHECK(saw_discarded_state);
+    CHECK(saw_redownload);
+    CHECK(saw_completion);
+    CHECK(has_generated_payload(request.destination, bytes));
+    server.Check();
 }

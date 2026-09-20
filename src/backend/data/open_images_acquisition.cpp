@@ -544,7 +544,17 @@ void complete_open_images_group(const std::filesystem::path& image_root, const s
         missing_downloads.reserve(group.size());
         std::vector<std::uint64_t> group_available;
         group_available.reserve(group.size());
+        progress->source_activity(BenchmarkDatasetSource::kOpenImagesV7, "Checking individually cached Open Images " + shard + " JPEGs");
+        std::size_t inspected = 0U;
         for (const std::uint64_t image_id : group) {
+            throw_if_benchmark_cancelled(cancel_requested);
+            if (trace && inspected != 0U && inspected % 128U == 0U) {
+                trace_benchmark_event(trace, "benchmark.images.cache_scan", [&] {
+                    return nlohmann::json{{"source", "open-images"}, {"shard", shard}, {"inspected_images", inspected},
+                                          {"reused_images", group_available.size()}, {"total_images", group.size()}};
+                });
+            }
+            if (trace) { ++inspected; }
             const std::filesystem::path path = cached_image_path(image_root, image_id);
             std::error_code error;
             const bool regular = std::filesystem::is_regular_file(path, error) && !error;
@@ -568,6 +578,11 @@ void complete_open_images_group(const std::filesystem::path& image_root, const s
             }
             { missing_downloads.push_back(image_id); }
         }
+        progress->source_images(BenchmarkDatasetSource::kOpenImagesV7, completed_images, ids.size());
+        trace_benchmark_event(trace, "benchmark.images.cache_reuse", [&] {
+            return nlohmann::json{{"source", "open-images"}, {"shard", shard}, {"inspected_images", group.size()},
+                                  {"reused_images", group_available.size()}, {"reused_bytes", cached_image_bytes - group_bytes_begin}};
+        });
         const std::size_t quarantine_begin = quarantined->size();
         if (!missing_downloads.empty()) {
             progress->source_activity(BenchmarkDatasetSource::kOpenImagesV7, "Downloading Open Images " + shard + " JPEGs");

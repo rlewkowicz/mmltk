@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <functional>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -39,6 +40,7 @@ struct BenchmarkCompileProgress {
     std::uint64_t projected_output_bytes = 0;
     std::uint64_t dropped_instances = 0;
     std::uint64_t quarantined_images = 0;
+    std::optional<BenchmarkDatasetSource> current_source;
     std::vector<BenchmarkSourceProgress> sources;
 };
 using BenchmarkProgressCallback = std::function<void(const BenchmarkCompileProgress&)>;
