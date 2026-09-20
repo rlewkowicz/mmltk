@@ -42,6 +42,9 @@ struct BenchmarkCompileProgress {
     std::vector<BenchmarkSourceProgress> sources;
 };
 using BenchmarkProgressCallback = std::function<void(const BenchmarkCompileProgress&)>;
+// Synchronous borrowed views. Empty json_fields reports diagnostic construction or
+// encoding failure; setup failure also has an empty event. Consumers must not
+// publish it as a successful record. Callback failures never affect compilation.
 using BenchmarkTraceCallback = std::function<void(std::string_view event, std::string_view json_fields)>;
 [[nodiscard]] std::string format_benchmark_source_status(const BenchmarkSourceProgress& progress, std::string_view default_status);
 struct BenchmarkCompilerConfig {

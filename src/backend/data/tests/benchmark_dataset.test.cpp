@@ -17,6 +17,7 @@
 #include <future>
 #include <iterator>
 #include <memory>
+#include <limits>
 #include <mutex>
 #include <netinet/in.h>
 #include <nlohmann/json.hpp>
@@ -40,6 +41,7 @@
 #include "detail/benchmark_download.h"
 #include "detail/benchmark_images.h"
 #include "detail/benchmark_sampling.h"
+#include "detail/benchmark_storage.h"
 #include "detail/benchmark_writer.h"
 #include "detail/benchmark_jpeg.h"
 #include "detail/benchmark_progress.h"
@@ -100,6 +102,22 @@ void test_benchmark_trace_gate_is_lazy() {
     REQUIRE(builder_invocations == 1U);
     REQUIRE(deliveries == 1U);
 }
+// Observe physical identity as well as bytes: a diagnostic failure must not
+// silently replace an admitted artifact with an equivalent new file.
+class RetainedArtifact final {
+   public:
+    explicit RetainedArtifact(fs::path path)
+        : path_(std::move(path)), digest_(mmltk::common::io::sha256_file(path_)), before_(mmltk::common::io::FileSnapshot::Read(path_)) {}
+    void Check() const {
+        CHECK(mmltk::common::io::FileSnapshot::Read(path_) == before_);
+        CHECK(mmltk::common::io::sha256_file(path_) == digest_);
+    }
+   private:
+    fs::path path_;
+    mmltk::common::io::Sha256Digest digest_;
+    mmltk::common::io::FileSnapshot before_;
+};
+const BenchmarkTraceSink throwing_trace = [](std::string_view, const nlohmann::json&) { throw std::runtime_error("diagnostic sink failure"); };
 void write_text(const fs::path& path, const std::string& text) {
     fs::create_directories(path.parent_path());
     std::ofstream output(path, std::ios::binary | std::ios::trunc);
@@ -353,7 +371,10 @@ void test_benchmark_download_cache_lifecycle() {
     REQUIRE(resumed[0].resumed);
     REQUIRE(server.ranged_requests() > 0U);
     const std::uint64_t before_cache_hit = server.requests();
-    const auto cached = download_artifacts({resume}, 1U, {});
+    const RetainedArtifact retained_download{resume.destination};
+    const auto cached = download_artifacts({resume}, 1U, {}, {}, throwing_trace);
+    retained_download.Check();
+    CHECK(cached[0].identity == resumed[0].identity);
     REQUIRE(cached[0].cache_hit);
     REQUIRE(server.requests() == before_cache_hit);
     corrupt_byte(resume.destination, 0U);
@@ -402,10 +423,13 @@ void test_benchmark_annotation_indexes() {
         .raw_records = 101U, .unmapped_categories = 23U, .unknown_images = 37U, .malformed_records = 41U, .degenerate_boxes = 53U, .duplicate_boxes = 67U};
     const fs::path index_path = root.path() / "mini-coco.index";
     store_normalized_annotation_index(index_path, parsed, {});
-    auto loaded = load_normalized_annotation_index(index_path, options.source, options.split, digest, {});
+    const RetainedArtifact retained_index{index_path};
+    auto loaded = load_normalized_annotation_index(index_path, options.source, options.split, digest, {}, throwing_trace);
+    retained_index.Check();
     if (!loaded.has_value()) { throw std::runtime_error("stored normalized annotation index did not reload"); }
     REQUIRE(loaded.value().images.size() == 2U);
     REQUIRE(loaded.value().boxes.size() == 2U);
+    CHECK(image_ids(*loaded) == image_ids(parsed));
     CHECK(loaded->rejected.raw_records == 101U);
     CHECK(loaded->rejected.unmapped_categories == 23U);
     CHECK(loaded->rejected.unknown_images == 37U);
@@ -658,13 +682,23 @@ void test_benchmark_cached_image_writer_and_loader() {
     write_cached_image_atomically(cached_image_path(image_root, 1U), red, {});
     write_cached_image_atomically(cached_image_path(image_root, 2U), green, {});
     const fs::path completion = image_root / ".complete.json";
-    complete_cached_image_group(image_root, completion, "validation:mini", requested_ids, red.size() + green.size(), {}, {}, cache_rejections);
+    const RetainedArtifact retained_red{cached_image_path(image_root, 1U)};
+    const RetainedArtifact retained_green{cached_image_path(image_root, 2U)};
+    complete_cached_image_group(image_root, completion, "validation:mini", requested_ids, red.size() + green.size(), {}, throwing_trace, cache_rejections);
+    const RetainedArtifact retained_completion{completion};
+    const auto proof = read_json_file(completion);
+    CHECK(proof.at("selection_sha256") == cached_image_selection_digest(ids));
+    CHECK(proof.at("requested_selection_sha256") == cached_image_selection_digest(requested_ids));
     std::uint64_t cached_bytes = 0U;
     std::vector<CachedImageRejection> loaded_rejections;
-    REQUIRE(validate_cached_image_group(image_root, completion, "validation:mini", requested_ids, &cached_bytes, {}, {}, &loaded_rejections));
+    REQUIRE(validate_cached_image_group(image_root, completion, "validation:mini", requested_ids, &cached_bytes, {}, throwing_trace, &loaded_rejections));
     REQUIRE(cached_bytes == red.size() + green.size());
     REQUIRE(loaded_rejections.size() == 1U);
     REQUIRE(loaded_rejections.front().image_id == 3U);
+    CHECK(loaded_rejections.front().reason == cache_rejections.front().reason);
+    retained_red.Check();
+    retained_green.Check();
+    retained_completion.Check();
     PreparedBenchmarkSplit split;
     split.name = "validation";
     split.class_names = {"person"};
@@ -766,7 +800,7 @@ void test_benchmark_cached_image_writer_and_loader() {
     CHECK(mmltk::common::io::sha256_file(perceptual_request.output_path) == mmltk::common::io::sha256_file(output));
     CHECK(mmltk::common::io::sha256_file(cached_image_path(image_root, 1U)) == source_digest);
     CHECK(mmltk::common::io::sha256_file(completion) == cache_manifest_digest);
-    CHECK(validate_cached_image_group(image_root, completion, "validation:mini", requested_ids, &cached_bytes, {}, {}, &loaded_rejections));
+    CHECK(validate_cached_image_group(image_root, completion, "validation:mini", requested_ids, &cached_bytes, {}, throwing_trace, &loaded_rejections));
     const auto raw_cache_identity = read_json_file(completion);
     for (const bool perceptual : {false, true}) {
         BenchmarkCompilerConfig manifest_config;
@@ -1012,6 +1046,15 @@ TEST_CASE("benchmark publication admission preserves separate physical output an
     config.progress = [&](const BenchmarkCompileProgress&) { cancelled.store(true); };
     CHECK_THROWS_WITH(compile_benchmark_dataset(config), overlap ? "benchmark output and cache directories must not overlap"
                                                                 : "benchmark dataset compilation cancelled");
+    cancelled.store(false);
+    std::size_t trace_calls = 0U;
+    config.trace = [&](std::string_view, std::string_view) {
+        ++trace_calls;
+        throw std::runtime_error("diagnostic callback failure");
+    };
+    CHECK_THROWS_WITH(compile_benchmark_dataset(config), overlap ? "benchmark output and cache directories must not overlap"
+                                                                : "benchmark dataset compilation cancelled");
+    CHECK(trace_calls == 1U);
     CHECK(cancelled.load());
     CHECK_FALSE(fs::exists(config.output_dir));
     CHECK(fs::exists(cache / "downloads") == !overlap);
@@ -1679,4 +1722,84 @@ TEST_CASE("parser workers reset segmentation scratch across masks rejections and
                 if (kind == 4U || kind == 6U) CHECK(box.mask_rle_pairs == 0U);
             }
         }
+}
+
+TEST_CASE("benchmark trace failures are lazy and delivered once", "[backend][data][benchmark][trace]") {
+    std::size_t deliveries = 0U;
+    const BenchmarkTraceSink null_sink = [&](std::string_view event, const nlohmann::json& fields) {
+        ++deliveries;
+        CHECK(event == "benchmark.test.failure");
+        CHECK(fields.is_null());
+        throw std::runtime_error("sink failure after receipt");
+    };
+    CHECK_NOTHROW(trace_benchmark_event(null_sink, "benchmark.test.failure", []() -> nlohmann::json { throw std::runtime_error("builder failure"); }));
+    CHECK(deliveries == 1U);
+    CHECK_NOTHROW(trace_benchmark_event(throwing_trace, "benchmark.test.success", [] { return nlohmann::json{{"value", 1U}}; }));
+    const auto serialized = make_trace_sink([&](std::string_view event, std::string_view fields) {
+        ++deliveries;
+        CHECK(event == "benchmark.test.failure");
+        CHECK(fields.empty());
+        throw std::runtime_error("callback failure after receipt");
+    });
+    CHECK_NOTHROW(trace_benchmark_event(serialized, "benchmark.test.failure", []() -> nlohmann::json { throw std::runtime_error("builder failure"); }));
+    CHECK(deliveries == 2U);
+    CHECK_NOTHROW(trace_benchmark_event(serialized, "benchmark.test.failure", [] { return nlohmann::json{{"native_path", "\xff"}}; }));
+    CHECK(deliveries == 3U);
+    std::size_t built = 0U;
+    const auto disabled = make_trace_sink({});
+    CHECK_FALSE(disabled);
+    trace_benchmark_event(disabled, "benchmark.test.disabled", [&] { ++built; return nlohmann::json::object(); });
+    CHECK(built == 0U);
+    std::vector<std::string> events;
+    const auto success = make_trace_sink([&](std::string_view event, std::string_view fields) {
+        events.emplace_back(event);
+        CHECK(nlohmann::json::parse(fields).at("value") == events.size());
+    });
+    trace_benchmark_event(success, "benchmark.test.first", [] { return nlohmann::json{{"value", 1U}}; });
+    trace_benchmark_event(success, "benchmark.test.second", [] { return nlohmann::json{{"value", 2U}}; });
+    CHECK((events == std::vector<std::string>{"benchmark.test.first", "benchmark.test.second"}));
+}
+TEST_CASE("benchmark storage releases reservations after diagnostic rejection", "[backend][data][benchmark][trace]") {
+    mmltk::testsupport::ScopedTempDir root{"benchmark-storage-trace"};
+    std::vector<std::uint64_t> reservations;
+    const BenchmarkTraceSink sink = [&](std::string_view event, const nlohmann::json& fields) {
+        if (event == "benchmark.storage.reserved") reservations.push_back(fields.at("reserved_bytes").get<std::uint64_t>());
+        throw std::runtime_error("storage diagnostic failure");
+    };
+    CHECK_NOTHROW(require_storage(root.path(), 1U, "fixture", sink));
+    StorageReservationPool pool{root.path(), sink};
+    for (unsigned attempt = 0; attempt < 2U; ++attempt) {
+        const auto reservation = pool.reserve(1U, "fixture");
+    }
+    CHECK((reservations == std::vector<std::uint64_t>{1U, 1U}));
+    // Admission inspects existing filesystem capacity; no disk filling occurs.
+    constexpr auto impossible = std::numeric_limits<std::uint64_t>::max();
+    CHECK_THROWS_AS(require_storage(root.path(), impossible, "fixture", {}), std::runtime_error);
+    CHECK_THROWS_AS(require_storage(root.path(), impossible, "fixture", sink), std::runtime_error);
+    CHECK_THROWS_AS(pool.reserve(impossible, "fixture"), std::runtime_error);
+    CHECK(reservations.size() == 2U);
+}
+
+TEST_CASE("benchmark sink setup failure reports once without creating a sink", "[backend][data][benchmark][trace]") {
+    struct Callback {
+        bool* reject_copy;
+        std::size_t* calls;
+        Callback(bool& reject, std::size_t& count) : reject_copy(&reject), calls(&count) {}
+        Callback(const Callback& other) : reject_copy(other.reject_copy), calls(other.calls) {
+            if (*reject_copy) throw std::runtime_error("diagnostic setup failure");
+        }
+        void operator()(std::string_view event, std::string_view fields) const {
+            ++*calls;
+            CHECK(event.empty());
+            CHECK(fields.empty());
+            throw std::runtime_error("failure callback throws");
+        }
+    };
+    bool reject_copy = false;
+    std::size_t calls = 0U;
+    const BenchmarkTraceCallback callback{Callback{reject_copy, calls}};
+    reject_copy = true;
+    const auto sink = make_trace_sink(callback);
+    CHECK_FALSE(sink);
+    CHECK(calls == 1U);
 }

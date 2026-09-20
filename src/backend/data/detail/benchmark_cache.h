@@ -13,6 +13,7 @@
 #include "src/common/concurrency/cancellation_observation.h"
 namespace mmltk::backend::data::benchmark_internal {
 inline constexpr std::uint32_t kBenchmarkCacheSchemaVersion = 2U;
+// A null value reports diagnostic construction failure; it is never product state.
 using BenchmarkTraceSink = std::function<void(std::string_view, const nlohmann::json&)>;
 struct BenchmarkCacheLayout {
     std::filesystem::path root;
@@ -46,9 +47,20 @@ void write_json_atomically(const std::filesystem::path& path, const nlohmann::js
 [[nodiscard]] bool is_safe_cache_component(std::string_view value) noexcept;
 template <class Builder>
     requires std::invocable<Builder> && std::convertible_to<std::invoke_result_t<Builder>, nlohmann::json>
-inline void trace_benchmark_event(const BenchmarkTraceSink& sink, const std::string_view event, Builder&& fields) {
+inline void trace_benchmark_event(const BenchmarkTraceSink& sink, const std::string_view event, Builder&& fields) noexcept {
     if (!sink) { return; }
-    sink(event, std::invoke(std::forward<Builder>(fields)));
+    nlohmann::json payload;
+    try {
+        payload = std::invoke(std::forward<Builder>(fields));
+    } catch (...) {
+        // Forward one failure indication, separately from sink delivery.
+        payload = nullptr;
+    }
+    try {
+        sink(event, payload);
+    } catch (...) {
+        // A sink may have delivered before throwing. Never retry it.
+    }
 }
 void remove_cache_path(const std::filesystem::path& path);
 }  // namespace mmltk::backend::data::benchmark_internal

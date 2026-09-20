@@ -39,6 +39,8 @@
 #include "src/controller/services/file_dialog_catalog.h"
 #include "src/controller/services/firefox_process_owner.h"
 #include "src/controller/services/runtime_diagnostics.h"
+#include "src/backend/data/detail/benchmark_compiler.h"
+#include "src/controller/services/artifact_store.h"
 #include "src/controller/services/runtime_diagnostic_span.h"
 #include "src/controller/services/settings_store.h"
 #include "src/common/io/noexcept_io.h"
@@ -1242,5 +1244,53 @@ TEST_CASE("file dialog client bounds output and reaps cancellation-resistant hel
     errno = 0;
     CHECK(::kill(helper_pid, 0) == -1);
     CHECK(errno == ESRCH);
+}
+TEST_CASE("backend benchmark diagnostic failures preserve operations and delivery policy", "[gui][services]") {
+    using namespace mmltk::backend::data::benchmark_internal;
+    const bool complete = GENERATE(false, true);
+    const bool encoding_failure = GENERATE(false, true);
+    mmltk::testsupport::ScopedTempDir temporary{"benchmark-diagnostic-rejection"};
+    const auto path = temporary.path() / "trace.jsonl";
+    DiagnosticsClient diagnostics{path};
+    const auto target = [&] {
+        RuntimeDiagnostics runtime{diagnostics.producer(), false,
+                                   complete ? RuntimeDiagnosticDelivery::Complete : RuntimeDiagnosticDelivery::BestEffort};
+        return runtime.target();
+    }();
+    const ArtifactBenchmarkTraceObserver observer{
+        .context = &target,
+        .report = [](const void* context, std::string_view event, std::string_view fields) noexcept {
+            static_cast<const RuntimeDiagnosticTarget*>(context)->write_benchmark_trace(event, fields);
+        },
+    };
+    const auto sink = make_trace_sink([observer](std::string_view event, std::string_view fields) noexcept { observer(event, fields); });
+    bool operation_completed = false;
+    CHECK_NOTHROW([&] {
+        trace_benchmark_event(sink, "benchmark.test.failure", [&]() -> nlohmann::json {
+            if (!encoding_failure) throw std::runtime_error("diagnostic builder failure");
+            return {{"native_path", "\xff"}};
+        });
+        operation_completed = true;
+    }());
+    CHECK(operation_completed);
+    CHECK(diagnostics.counters().accepted == 0U);
+    if (complete) {
+        require_one_terminal_wake(diagnostics);
+        CHECK(diagnostics.terminal() == DiagnosticsTerminal::Failed);
+        CHECK_FALSE(target.valid());
+    } else {
+        CHECK(target.valid());
+        trace_benchmark_event(sink, "benchmark.test.complete", [] { return nlohmann::json{{"images", 2U}}; });
+        CHECK(diagnostics.counters().accepted == 1U);
+    }
+    diagnostics.close(DiagnosticsCloseMode::Flush);
+    if (complete) {
+        CHECK(read_file(path).empty());
+    } else {
+        const auto record = nlohmann::json::parse(read_file(path));
+        CHECK(record.at("name") == "benchmark.test.complete");
+        CHECK(record.at("fields").at("images") == 2U);
+        CHECK(diagnostics.terminal() == DiagnosticsTerminal::Drained);
+    }
 }
 }  // namespace mmltk::controller::services

@@ -663,6 +663,7 @@ void run_compile(const CompileCliRequest& request) {
         };
         if (logging::enabled(spdlog::level::trace)) {
             config.trace = [](const std::string_view event, const std::string_view fields) {
+                if (fields.empty()) { return; }
                 logging::log_if_enabled("rfdetr.benchmark", spdlog::level::trace,
                                         [&](auto& current) { current.trace("{{\"event\":\"{}\",\"fields\":{}}}", event, fields); });
             };

@@ -18,6 +18,7 @@
 #include <functional>
 #include <iterator>
 #include <mutex>
+#include <memory>
 #include <ranges>
 #include <span>
 #include <string_view>
@@ -59,6 +60,32 @@ namespace common_io = mmltk::common::io;
 namespace common_math = mmltk::common::math;
 namespace common_system = mmltk::common::system;
 namespace benchmark_internal {
+BenchmarkTraceSink make_trace_sink(const BenchmarkTraceCallback& callback) noexcept {
+    if (!callback) { return {}; }
+    try {
+        const auto mutex = std::make_shared<std::mutex>();
+        return [callback, mutex](const std::string_view event, const nlohmann::json& fields) noexcept {
+            std::string serialized;
+            try {
+                if (fields.is_object()) { serialized = fields.dump(); }
+            } catch (...) {
+                // Empty fields retain encoding failure rather than claiming success.
+            }
+            try {
+                const std::lock_guard lock(*mutex);
+                callback(event, serialized);
+            } catch (...) {
+                // Delivery is attempted once, even if the callback throws.
+            }
+        };
+    } catch (...) {
+        try {
+            callback({}, {});
+        } catch (...) {
+        }
+        return {};
+    }
+}
 namespace {
 using Clock = std::chrono::steady_clock;
 constexpr std::size_t kArchivePipelineConcurrency = 4U;
@@ -93,15 +120,6 @@ struct TracePath final {
     }
     result.truncated = offset != path.size();
     return result;
-}
-[[nodiscard]] BenchmarkTraceSink make_trace_sink(const BenchmarkTraceCallback& callback) {
-    if (!callback) { return {}; }
-    const auto mutex = std::make_shared<std::mutex>();
-    return [callback, mutex](const std::string_view event, const nlohmann::json& fields) {
-        const std::string serialized = fields.dump();
-        const std::lock_guard lock(*mutex);
-        callback(event, serialized);
-    };
 }
 [[nodiscard]] std::string combined_artifact_digest(const std::string& left, const std::string& right) {
     const mmltk::common::io::Sha256Digest left_digest = mmltk::common::io::parse_sha256_hex(left);
