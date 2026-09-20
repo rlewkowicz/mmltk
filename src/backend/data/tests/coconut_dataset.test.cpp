@@ -372,6 +372,83 @@ TEST_CASE("COCONut archives reject unresolved duplicate extra and unsafe offered
     json_file(input.annotation_json, document); tar(input.mask_archive, members, link);
     CHECK_THROWS(import_coconut_annotations(input));
 }
+TEST_CASE("COCONut version-1 physical inventory has fixed bytes and admits existing caches", "[coconut]") {
+    ScopedTempDir root("coconut-inventory-v1");
+    static constexpr char expected_bytes[] =
+        "\x43\x4e\x55\x54\x49\x56\x4e\x31"  // magic
+        "\x01\x00\x00\x00"  // version 1
+        "\x02\x00\x00\x00"  // cache schema 2
+        "\x18\x00\x00\x00\x63\x6f\x63\x6f\x6e\x75\x74\x2d\x65\x78\x61\x63\x74\x2d\x72\x67\x62\x2d\x72\x6c\x65\x2d\x76\x31"  // normalization
+        "\x01\x00\x00\x00\x61"  // input identity
+        "\x00\x03\x34\x12\x00"  // Base, Objects365V1, shard 0x1234, physical
+        "\x01\x00\x00\x00\x00\x00\x00\x00"  // one record
+        "\x03\xe1\x63\x01\x00\x00\x00\x00\x00\x34\x12"  // namespace, physical ID 91105, shard
+        "\x20\x00\x00\x00\x69\x6d\x61\x67\x65\x2f\x6f\x62\x6a\x65\x63\x74\x73\x33\x36\x35\x5f\x76\x31\x5f\x30\x30\x30\x39\x31\x31\x30\x35\x2e\x6a\x70\x67"  // physical member
+        "\x01\x00\x00\x00\x61"  // archive identity
+        "\x93\xe4\x7a\xfa\x75\xda\x69\x5b\x47\xe8\xc5\x40\x1f\xb2\x30\xea\xde\x72\x66\xf7\x98\xbc\xea\x05\x7b\x52\x8f\xbd\x0b\x94\x5e\x17";  // SHA-256 footer at byte 114
+    const std::string expected(expected_bytes, sizeof(expected_bytes) - 1);
+    const auto archive = root.path() / "images.tar";
+    const auto cache = root.path() / "inventory.bin";
+    const std::vector<CoconutPhysicalImage> wanted{{CoconutImageNamespace::Objects365V1, 91105, 0x1234,
+        "image/objects365_v1_00091105.jpg", "a"}};
+    // A preexisting v1 inventory must load without its source archive.
+    mmltk::testsupport::write_text_file(cache, expected);
+    CHECK(coconut_image_archive_inventory(archive, cache, CoconutImageNamespace::Objects365V1, 0x1234, "a") == wanted);
+    CHECK_FALSE(std::filesystem::exists(archive));
+    const std::array<std::pair<std::string, std::string>, 1> members{{{wanted[0].member, "jpeg"}}};
+    tar(archive, members);
+    const auto emitted = root.path() / "emitted.bin";
+    CHECK(coconut_image_archive_inventory(archive, emitted, CoconutImageNamespace::Objects365V1, 0x1234, "a") == wanted);
+    CHECK(file_bytes(emitted) == expected);
+    CHECK(expected.size() == 114 + 32);
+    CHECK(file_bytes(cache) == expected);
+}
+TEST_CASE("COCONut version-1 component inventory pins nested physical release and ordinal identities", "[coconut]") {
+    ScopedTempDir root("coconut-component-v1");
+    static constexpr char expected_bytes[] =
+        "\x43\x4e\x55\x54\x49\x56\x4e\x31"  // magic
+        "\x01\x00\x00\x00"  // version 1
+        "\x02\x00\x00\x00"  // cache schema 2
+        "\x18\x00\x00\x00\x63\x6f\x63\x6f\x6e\x75\x74\x2d\x65\x78\x61\x63\x74\x2d\x72\x67\x62\x2d\x72\x6c\x65\x2d\x76\x31"  // normalization
+        "\x01\x00\x00\x00\x69"  // input identity
+        "\x04\x03\x00\x00\x01"  // ObjectsValidation, Objects365V1, header shard 0, component
+        "\x01\x00\x00\x00\x00\x00\x00\x00"  // one record
+        "\x03\xe1\x63\x01\x00\x00\x00\x00\x00\x34\x12"  // namespace, physical ID 91105, shard
+        "\x20\x00\x00\x00\x69\x6d\x61\x67\x65\x2f\x6f\x62\x6a\x65\x63\x74\x73\x33\x36\x35\x5f\x76\x31\x5f\x30\x30\x30\x39\x31\x31\x30\x35\x2e\x6a\x70\x67"  // physical member
+        "\x01\x00\x00\x00\x61"  // archive identity
+        "\xa1\x8b\x0a\x00\x00\x00\x00\x00"  // declared release ID 691105
+        "\x02\x00\x00\x00\x00\x00\x00\x00"  // source ordinal 2
+        "\xc5\x30\x4c\xa7\xa1\x6f\x7e\x76\xd6\xc2\x1b\xfd\x7b\xda\x2b\x39\xa0\x25\xcc\x26\x8d\xde\x23\x36\xd9\x5a\x21\x57\xeb\x9d\x46\x32";  // SHA-256 footer at byte 130
+    const std::string expected(expected_bytes, sizeof(expected_bytes) - 1);
+    CoconutComponent component;
+    component.edition = CoconutEdition::ObjectsValidation;
+    component.source = CoconutImageNamespace::Objects365V1;
+    component.input_identity = "i";
+    component.inventory = {{{CoconutImageNamespace::Objects365V1, 91105, 0x1234,
+        "image/objects365_v1_00091105.jpg", "a"}, 691105, 2}};
+    component.index.source = BenchmarkDatasetSource::kObjects365V2;
+    component.index.split = "coconut-4-3";
+    component.index.annotation_sha256 = "c5304ca7a16f7e76d6c21bfd7bda2b39a025cc268dde2336d95a2157eb9d4632";
+    component.index.images.push_back({.source_image_id = 91105, .width = 1, .height = 1, .source_shard = 0x1234});
+    const auto path = root.path() / "component.bin";
+    store_coconut_component(path, component);
+    const auto index_bytes = file_bytes(path);
+    const auto inventory_path = path.string() + ".inventory";
+    CHECK(file_bytes(inventory_path) == expected);
+    CHECK(expected.size() == 130 + 32);
+    // Substitute independent v1 bytes, retaining the index's joint completion.
+    mmltk::testsupport::write_text_file(inventory_path, expected);
+    const auto loaded = load_coconut_component(path, component.edition, component.source, "i");
+    REQUIRE(loaded);
+    CHECK(loaded->inventory == component.inventory);
+    REQUIRE(loaded->index.images.size() == 1);
+    CHECK(loaded->index.images[0].source_image_id == 91105);
+    CHECK(loaded->index.boxes.empty());
+    CHECK_FALSE(load_coconut_component(path, component.edition, component.source, "changed"));
+    store_coconut_component(path, *loaded);
+    CHECK(file_bytes(inventory_path) == expected);
+    CHECK(file_bytes(path) == index_bytes);
+}
 TEST_CASE("COCONut full physical inventories are identity-bound and independent of foreground labels", "[coconut]") {
     ScopedTempDir root("coconut-inventory");
     const auto archive = root.path() / "images.tar", cache = root.path() / "inventory.json";

@@ -1,32 +1,19 @@
 #pragma once  // backend.data private implementation boundary
 #include "benchmark_annotations.h"
 #include "coconut_catalog.h"
+#include "coconut_inventory.h"
+#include "src/backend/data/compiled_format.h"
+#include "src/common/concurrency/cancellation_observation.h"
 #include <array>
 #include <cstdint>
 #include <filesystem>
 #include <functional>
-#include <memory>
 #include <optional>
 #include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 namespace mmltk::backend::data::benchmark_internal {
-struct CoconutPhysicalImage {
-    CoconutImageNamespace source = CoconutImageNamespace::CocoTrain;
-    std::uint64_t image_id = 0;
-    std::uint16_t shard = 0;
-    std::string member;
-    std::string archive_identity;
-    bool operator==(const CoconutPhysicalImage&) const = default;
-};
-MMLTK_REFLECT_FIELDS(CoconutPhysicalImage)
-struct CoconutInventoryImage {
-    CoconutPhysicalImage physical;
-    std::uint64_t release_image_id = 0;
-    std::uint64_t source_ordinal = 0;
-    bool operator==(const CoconutInventoryImage&) const = default;
-};
-MMLTK_REFLECT_FIELDS(CoconutInventoryImage)
 struct CoconutComponent {
     CoconutEdition edition = CoconutEdition::Base;
     CoconutImageNamespace source = CoconutImageNamespace::CocoTrain;

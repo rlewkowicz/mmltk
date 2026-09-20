@@ -1,4 +1,6 @@
 #include "detail/coconut_annotations.h"
+#include "detail/coconut_inventory.h"
+#include "src/frameworks/reflection/reflected_field_policy.h"
 #include "src/common/io/file_digest.h"
 #include "src/common/io/file_memory.h"
 #include "src/common/math/checked_arithmetic.h"
@@ -168,19 +170,6 @@ void segments_from_json(const Json& input, CoconutRecord& record, const CoconutI
         record.segments.push_back(segment);
     }
 }
-struct InventoryHeader {
-    std::uint64_t magic = 0x314E564954554E43ULL;
-    std::uint32_t version = 1;
-    std::uint32_t cache_schema = kBenchmarkCacheSchemaVersion;
-    std::string normalization = std::string(kCoconutNormalizationRevision);
-    std::string input_identity;
-    CoconutEdition edition = CoconutEdition::Base;
-    CoconutImageNamespace source = CoconutImageNamespace::CocoTrain;
-    std::uint16_t shard = 0;
-    bool component = false;
-    std::uint64_t count = 0;
-};
-MMLTK_REFLECT_FIELDS(InventoryHeader)
 template<class T>
 concept InventoryRecord = std::same_as<T, CoconutPhysicalImage> || std::same_as<T, CoconutInventoryImage> || std::same_as<T, InventoryHeader>;
 // A single reflected little-endian encoding is used by hashing, writing and reading.

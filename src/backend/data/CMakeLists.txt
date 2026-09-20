@@ -102,6 +102,7 @@ mmltk_register_private_headers(mmltk_backend_data
     detail/benchmark_annotations.h
     detail/coconut_annotations.h
     detail/coconut_catalog.h
+    detail/coconut_inventory.h
     detail/benchmark_cache.h
     detail/benchmark_catalog.h
     detail/benchmark_compiler.h
