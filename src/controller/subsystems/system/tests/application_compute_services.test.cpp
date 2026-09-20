@@ -6,15 +6,20 @@
 #include <cerrno>
 #include <chrono>
 #include <csignal>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <latch>
 #include <memory>
+#include <nlohmann/json.hpp>
+#include <optional>
 #include <ranges>
 #include <stdexcept>
 #include <thread>
 #include <type_traits>
 #include "src/test_support/filesystem_test_utils.hpp"
+#include "src/test_support/async_test_utils.hpp"
 #include "src/backend/data/benchmark_dataset_compiler.h"
 #include "src/backend/data/compiled_format.h"
 #include "src/backend/data/dataset_compiler.h"
@@ -248,6 +253,87 @@ TEST_CASE("artifact compile progress is borrowed for invalid and cancelled calls
     ArtifactCompileRequest request{.source = "/unavailable", .output = "/unavailable-output", .preset = "fixture", .resolution = 384U};
     CHECK(store.compile(request, cancellation.token, observer).cancelled);
     CHECK(reports == 0U);
+}
+TEST_CASE("artifact benchmark compilation uses the environment cache and retires staging", "[gui][services][benchmark]") {
+    namespace fs = std::filesystem;
+    mmltk::testsupport::ScopedTempDir temporary{"artifact-benchmark-cache"};
+    const auto original_directory = fs::current_path();
+    const char* const environment = std::getenv("MMLTK_BENCHMARK_DATASET_CACHE_ROOT");
+    const std::optional<std::string> original_environment = environment == nullptr ? std::nullopt : std::optional<std::string>{environment};
+    const mmltk::testsupport::ScopedTestCleanup restore_process_state{[&] {
+        fs::current_path(original_directory);
+        if (original_environment) { (void)::setenv("MMLTK_BENCHMARK_DATASET_CACHE_ROOT", original_environment->c_str(), 1); }
+        else { (void)::unsetenv("MMLTK_BENCHMARK_DATASET_CACHE_ROOT"); }
+    }};
+    fs::create_directories(temporary.path() / "working");
+    fs::current_path(temporary.path() / "working");
+    auto cache = temporary.path() / "source-cache";
+    bool overlap = false;
+    SECTION("cancellation before annotation acquisition preserves the environment cache") {}
+    SECTION("overlap rejection preserves cache and published output") {
+        cache = temporary.path();
+        overlap = true;
+    }
+    REQUIRE(::setenv("MMLTK_BENCHMARK_DATASET_CACHE_ROOT", cache.c_str(), 1) == 0);
+    const auto retained = cache / "downloads/coco/retained.fixture";
+    const auto output = temporary.path() / "compiled";
+    mmltk::testsupport::write_text_file(retained, "existing cached fixture");
+    mmltk::testsupport::write_text_file(output / "train.bin", "existing published fixture");
+    struct stat before{};
+    REQUIRE(::stat(retained.c_str(), &before) == 0);
+    ArtifactCancellationFixture cancellation;
+    struct Observations final {
+        mutable std::string paths;
+        mutable std::size_t path_reports = 0U;
+    };
+    Observations observations;
+    const ArtifactDiagnosticObserver diagnostics{.benchmark = {
+        .context = &observations,
+        .report = [](const void* context, const std::string_view event, const std::string_view fields) noexcept {
+            if (event == "benchmark.compile.paths") {
+                const auto& observed = *static_cast<const Observations*>(context);
+                observed.paths = fields;
+                ++observed.path_reports;
+            }
+        },
+    }};
+    // Cancellation begins inside the real backend, after ArtifactStore's entry
+    // check. Even a cache-selection regression cannot reach a public endpoint.
+    const ArtifactProgressObserver progress{
+        .context = &cancellation,
+        .report = [](void* context, const domain::ArtifactProgress&) { static_cast<ArtifactCancellationFixture*>(context)->cancel(); },
+    };
+    ArtifactStore store;
+    const ArtifactCompileRequest request{.kind = ArtifactCompileKind::Benchmark,
+                                         .source = {},
+                                         .output = output,
+                                         .preset = "rf-detr-nano",
+                                         .resolution = 1U,
+                                         .overwrite = true};
+    const auto result = store.compile(request, cancellation.token, progress, diagnostics);
+    CHECK(result.cancelled);
+    CHECK(result.output.empty());
+    CHECK(result.inspection.detail == (overlap ? "benchmark output and cache directories must not overlap" : "benchmark dataset compilation cancelled"));
+    REQUIRE(observations.path_reports == 1U);
+    const auto paths = nlohmann::json::parse(observations.paths);
+    CHECK(paths.at("cache_root") == fs::weakly_canonical(cache).native());
+    const fs::path staging{paths.at("output_root").get<std::string>()};
+    CHECK(staging.parent_path() == fs::weakly_canonical(output.parent_path()));
+    CHECK(staging.filename().string().starts_with("compiled.tmp."));
+    CHECK_FALSE(fs::exists(staging));
+    for (const auto& entry : fs::directory_iterator(output.parent_path())) {
+        CHECK_FALSE(entry.path().filename().string().starts_with("compiled.tmp."));
+    }
+    struct stat after{};
+    REQUIRE(::stat(retained.c_str(), &after) == 0);
+    CHECK(after.st_ino == before.st_ino);
+    CHECK(after.st_size == before.st_size);
+    CHECK(after.st_mtim.tv_sec == before.st_mtim.tv_sec);
+    CHECK(after.st_mtim.tv_nsec == before.st_mtim.tv_nsec);
+    std::ifstream cached{retained};
+    CHECK(std::string(std::istreambuf_iterator<char>{cached}, {}) == "existing cached fixture");
+    std::ifstream published{output / "train.bin"};
+    CHECK(std::string(std::istreambuf_iterator<char>{published}, {}) == "existing published fixture");
 }
 TEST_CASE("artifact compile adapters preserve canonical ordinary and benchmark estimates", "[gui][services]") {
     const data::CompileProgress ordinary{

@@ -652,9 +652,6 @@ void run_compile(const CompileCliRequest& request) {
         data::BenchmarkCompilerConfig config;
         config.output_dir = request.output_dir;
         config.cache_dir = request.cache_dir;
-        if (config.cache_dir.empty()) {
-            if (const char* root = std::getenv("MMLTK_BENCHMARK_DATASET_CACHE_ROOT"); root != nullptr && root[0] != '\0') { config.cache_dir = root; }
-        }
         config.resolution = static_cast<std::uint32_t>(request.benchmark_resolution);
         config.num_workers = request.num_workers;
         config.overwrite = request.overwrite;

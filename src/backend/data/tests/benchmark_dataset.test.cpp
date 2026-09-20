@@ -8,6 +8,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
 #include <filesystem>
@@ -890,6 +891,150 @@ void test_benchmark_cli_source_status_preserves_active_transfer_state() {
     REQUIRE(format_benchmark_source_status(active, "extracting") == "Cache hit");
 }
 }  // namespace
+TEST_CASE("benchmark cache roots share explicit environment and relative precedence", "[backend][data][benchmark][cache]") {
+    mmltk::testsupport::ScopedTempDir root{"benchmark-cache-precedence"};
+    const auto original_directory = fs::current_path();
+    const char* const environment = std::getenv("MMLTK_BENCHMARK_DATASET_CACHE_ROOT");
+    const std::optional<std::string> original_environment = environment == nullptr ? std::nullopt : std::optional<std::string>{environment};
+    const mmltk::testsupport::ScopedTestCleanup restore_process_state{[&] {
+        fs::current_path(original_directory);
+        if (original_environment) { (void)::setenv("MMLTK_BENCHMARK_DATASET_CACHE_ROOT", original_environment->c_str(), 1); }
+        else { (void)::unsetenv("MMLTK_BENCHMARK_DATASET_CACHE_ROOT"); }
+    }};
+    fs::create_directories(root.path() / "working");
+    fs::current_path(root.path() / "working");
+    const auto environment_cache = root.path() / "environment-cache";
+    REQUIRE(::setenv("MMLTK_BENCHMARK_DATASET_CACHE_ROOT", environment_cache.c_str(), 1) == 0);
+    BenchmarkCompilerConfig config;
+    config.output_dir = root.path() / "compiled";
+    config.resolution = 1U;
+    config.num_workers = 1;
+    fs::path expected_cache = environment_cache;
+    bool overlap = false;
+    SECTION("explicit configuration overrides environment and resolves aliases") {
+        fs::create_directories(root.path() / "explicit-cache");
+        fs::create_directory_symlink(root.path() / "explicit-cache", root.path() / "cache-alias");
+        config.cache_dir = "../cache-alias";
+        expected_cache = root.path() / "explicit-cache";
+    }
+    SECTION("environment overrides invocation working directory") {}
+    SECTION("empty environment uses the relative fallback") {
+        REQUIRE(::setenv("MMLTK_BENCHMARK_DATASET_CACHE_ROOT", "", 1) == 0);
+        expected_cache = fs::current_path() / ".cache/benchmark-dataset/v1";
+    }
+    SECTION("unset environment uses the relative fallback") {
+        REQUIRE(::unsetenv("MMLTK_BENCHMARK_DATASET_CACHE_ROOT") == 0);
+        expected_cache = fs::current_path() / ".cache/benchmark-dataset/v1";
+    }
+    SECTION("output inside environment cache is rejected") {
+        config.output_dir = expected_cache / "compiled";
+        overlap = true;
+    }
+    SECTION("cache inside output is rejected") {
+        config.output_dir = root.path() / "compiled";
+        expected_cache = config.output_dir / "cache";
+        REQUIRE(::setenv("MMLTK_BENCHMARK_DATASET_CACHE_ROOT", expected_cache.c_str(), 1) == 0);
+        overlap = true;
+    }
+    SECTION("equal cache and output is rejected") {
+        config.output_dir = expected_cache;
+        overlap = true;
+    }
+    const auto retained = expected_cache / "retained.fixture";
+    write_text(retained, "existing cached bytes");
+    const auto retained_digest = mmltk::common::io::sha256_file(retained);
+    const auto retained_time = fs::last_write_time(retained);
+    std::atomic<bool> cancelled{true};
+    config.cancel_requested = mmltk::common::concurrency::CancellationObservation::Atomic(cancelled);
+    nlohmann::json paths;
+    std::size_t path_reports = 0U;
+    config.trace = [&](const std::string_view event, const std::string_view fields) {
+        if (event == "benchmark.compile.paths") {
+            ++path_reports;
+            paths = nlohmann::json::parse(fields);
+        }
+    };
+    if (overlap) {
+        CHECK_THROWS_WITH(compile_benchmark_dataset(config), "benchmark output and cache directories must not overlap");
+        CHECK_FALSE(fs::exists(expected_cache / "downloads"));
+    } else {
+        CHECK_THROWS_WITH(compile_benchmark_dataset(config), "benchmark dataset compilation cancelled");
+        CHECK(fs::is_directory(expected_cache / "downloads"));
+        CHECK_FALSE(fs::exists(config.output_dir));
+    }
+    REQUIRE(path_reports == 1U);
+    CHECK(paths.at("cache_root") == fs::weakly_canonical(expected_cache).native());
+    CHECK(paths.at("output_root") == fs::weakly_canonical(config.output_dir).native());
+    CHECK_FALSE(paths.at("cache_root_truncated").get<bool>());
+    CHECK_FALSE(paths.at("output_root_truncated").get<bool>());
+    CHECK(mmltk::common::io::sha256_file(retained) == retained_digest);
+    CHECK(fs::last_write_time(retained) == retained_time);
+}
+TEST_CASE("benchmark path traces bound escaped native bytes without changing admission", "[backend][data][benchmark][trace]") {
+    mmltk::testsupport::ScopedTempDir root{"benchmark-path-encoding"};
+    fs::path selected;
+    std::string expected;
+    bool truncated = false;
+    bool replaced = false;
+    SECTION("escape-heavy paths fit the envelope and report their bounded prefix") {
+        auto prefix = root.path();
+        for (unsigned index = 0U; index < 5U; ++index) { prefix /= std::string(200U, '\x01'); }
+        // 1,000 control bytes cost 6,000 serialized bytes; five separators
+        // and the temporary root are literal ASCII. The final slash costs one.
+        const auto remaining = 6144U - (root.path().native().size() + 5U + 6000U + 1U);
+        truncated = true;
+        SECTION("control bytes exhaust the escaped budget") {
+            selected = prefix / std::string(200U, '\x01');
+            expected = prefix.native() + "/" + std::string(remaining / 6U, '\x01');
+        }
+        SECTION("truncation keeps a multibyte character whole at the budget boundary") {
+            const std::string padding(remaining - 1U, 'a');
+            selected = prefix / (padding + "\xe2\x82\xac-end");
+            expected = prefix.native() + "/" + padding;
+        }
+    }
+    SECTION("invalid native bytes are replaced with explicit loss reporting") {
+        // Stray continuation, overlong, surrogate, out-of-range and incomplete
+        // encodings: all twelve bytes are invalid at their respective positions.
+        selected = root.path() / "\x80\xc0\xaf\xed\xa0\x80\xf4\x90\x80\x80\xe2\x82";
+        expected = root.path().native() + "/";
+        for (unsigned index = 0U; index < 12U; ++index) { expected += "\xef\xbf\xbd"; }
+        replaced = true;
+    }
+    SECTION("valid UTF-8 and JSON escape characters retain their exact native meaning") {
+        selected = root.path() / "\xc2\xa2\xe2\x82\xac\xf0\x9f\x98\x80\"\\\n\t";
+        expected = selected.native();
+    }
+    BenchmarkCompilerConfig config;
+    config.output_dir = selected;
+    config.cache_dir = selected;
+    config.resolution = 1U;
+    std::atomic<bool> cancelled{true};
+    config.cancel_requested = mmltk::common::concurrency::CancellationObservation::Atomic(cancelled);
+    // Both modes must reach the same product error, including non-UTF-8 paths.
+    CHECK_THROWS_WITH(compile_benchmark_dataset(config), "benchmark output and cache directories must not overlap");
+    nlohmann::json paths;
+    std::size_t deliveries = 0U;
+    std::size_t serialized_size = 0U;
+    config.trace = [&](const std::string_view event, const std::string_view fields) {
+        if (event != "benchmark.compile.paths") { return; }
+        ++deliveries;
+        serialized_size = fields.size();
+        paths = nlohmann::json::parse(fields);
+    };
+    CHECK_THROWS_WITH(compile_benchmark_dataset(config), "benchmark output and cache directories must not overlap");
+    REQUIRE(deliveries == 1U);
+    // The backend contract reserves over 3 KiB of the 16 KiB runtime record
+    // for its envelope, event name and subsequent timestamp fields.
+    CHECK(serialized_size < 13U * 1024U);
+    CHECK(paths.at("cache_root") == expected);
+    CHECK(paths.at("output_root") == expected);
+    CHECK(paths.at("cache_root_truncated") == truncated);
+    CHECK(paths.at("output_root_truncated") == truncated);
+    CHECK(paths.at("cache_root_utf8_replaced") == replaced);
+    CHECK(paths.at("output_root_utf8_replaced") == replaced);
+    CHECK_FALSE(fs::exists(selected));
+}
 TEST_CASE("benchmark destination preparation preserves parent and obstruction behavior", "[backend][data][benchmark][cache]") {
     mmltk::testsupport::ScopedTempDir root{"benchmark-parent"};
     const auto bare = root.path().filename().string() + ".json";

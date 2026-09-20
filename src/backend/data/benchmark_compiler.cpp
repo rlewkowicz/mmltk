@@ -4,6 +4,7 @@
 #include <linux/fs.h>
 #include <sys/syscall.h>
 #include <unistd.h>
+#include <algorithm>
 #include <atomic>
 #include <charconv>
 #include <chrono>
@@ -62,6 +63,51 @@ using Clock = std::chrono::steady_clock;
 constexpr std::size_t kArchivePipelineConcurrency = 4U;
 constexpr std::size_t kArchiveReadBufferBytes = std::size_t{1024U} * 1024U;
 constexpr std::uint64_t kArchiveScratchBytes = 24ULL * 1024U * 1024U * 1024U;
+struct TracePath final {
+    std::string text;
+    bool truncated = false;
+    bool utf8_replaced = false;
+};
+[[nodiscard]] TracePath project_trace_path(const std::string_view path) {
+    // Each value uses at most 6 KiB after JSON escaping. The two values and
+    // fixed fields fit below 13 KiB, leaving over 3 KiB for the runtime envelope.
+    constexpr std::size_t kEscapedPathBudget = 6U * 1024U;
+    TracePath result;
+    result.text.reserve(std::min(path.size(), kEscapedPathBudget));
+    std::size_t escaped_size = 0U;
+    std::size_t offset = 0U;
+    while (offset < path.size()) {
+        const auto byte = static_cast<unsigned char>(path[offset]);
+        std::size_t length = 1U;
+        bool valid = true;
+        if (byte >= 0x80U) {
+            if (byte >= 0xc2U && byte <= 0xdfU) { length = 2U; }
+            else if (byte >= 0xe0U && byte <= 0xefU) { length = 3U; }
+            else if (byte >= 0xf0U && byte <= 0xf4U) { length = 4U; }
+            else { length = 0U; }
+            valid = length != 0U && length <= path.size() - offset;
+            for (std::size_t index = 1U; valid && index < length; ++index) {
+                const auto continuation = static_cast<unsigned char>(path[offset + index]);
+                valid = continuation >= 0x80U && continuation <= 0xbfU;
+                if (index == 1U) {
+                    valid = valid && !(byte == 0xe0U && continuation < 0xa0U) && !(byte == 0xedU && continuation > 0x9fU) &&
+                            !(byte == 0xf0U && continuation < 0x90U) && !(byte == 0xf4U && continuation > 0x8fU);
+                }
+            }
+        }
+        // Invalid native bytes become U+FFFD; valid UTF-8 is kept whole. The
+        // replacement flag distinguishes this lossy diagnostic from the path.
+        const std::string_view token = valid ? path.substr(offset, length) : std::string_view{"\xef\xbf\xbd"};
+        const std::size_t escaped_cost = byte < 0x20U ? 6U : byte == '"' || byte == '\\' ? 2U : token.size();
+        if (escaped_cost > kEscapedPathBudget - escaped_size) { break; }
+        result.text.append(token);
+        result.utf8_replaced = result.utf8_replaced || !valid;
+        escaped_size += escaped_cost;
+        offset += valid ? length : 1U;
+    }
+    result.truncated = offset != path.size();
+    return result;
+}
 [[nodiscard]] BenchmarkTraceSink make_trace_sink(const BenchmarkTraceCallback& callback) {
     if (!callback) { return {}; }
     const auto mutex = std::make_shared<std::mutex>();
@@ -776,9 +822,22 @@ void compile_benchmark_dataset(BenchmarkCompilerConfig config) {
     progress.activity("Preparing benchmark output directory");
     std::filesystem::create_directories(output_parent);
     progress.activity("Preparing benchmark cache");
-    const std::filesystem::path cache_root = config.cache_dir.empty() ? std::filesystem::path{"./.cache/benchmark-dataset/v1"} : config.cache_dir;
-    const std::filesystem::path normalized_cache_root = std::filesystem::weakly_canonical(std::filesystem::absolute(cache_root));
+    if (config.cache_dir.empty()) {
+        if (const char* root = std::getenv("MMLTK_BENCHMARK_DATASET_CACHE_ROOT"); root != nullptr && root[0] != '\0') { config.cache_dir = root; }
+    }
+    if (config.cache_dir.empty()) { config.cache_dir = "./.cache/benchmark-dataset/v1"; }
+    const std::filesystem::path normalized_cache_root = std::filesystem::weakly_canonical(std::filesystem::absolute(config.cache_dir));
     const std::filesystem::path normalized_output = std::filesystem::weakly_canonical(config.output_dir);
+    trace_benchmark_event(trace, "benchmark.compile.paths", [&] {
+        const TracePath cache_path = project_trace_path(normalized_cache_root.native());
+        const TracePath output_path = project_trace_path(normalized_output.native());
+        return nlohmann::json{{"cache_root", cache_path.text},
+                              {"output_root", output_path.text},
+                              {"cache_root_truncated", cache_path.truncated},
+                              {"output_root_truncated", output_path.truncated},
+                              {"cache_root_utf8_replaced", cache_path.utf8_replaced},
+                              {"output_root_utf8_replaced", output_path.utf8_replaced}};
+    });
     if (path_contains(normalized_cache_root, normalized_output) || path_contains(normalized_output, normalized_cache_root)) {
         throw std::runtime_error("benchmark output and cache directories must not overlap");
     }
