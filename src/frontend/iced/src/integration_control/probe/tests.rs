@@ -210,7 +210,7 @@ fn first_native_gallery_draw_reports_placeholders_and_retains_pixels_in_enabled_
             }
             let (displayed, metadata) = surface::gallery::displayed().unwrap();
             assert_eq!(displayed.frame, Some(frame));
-            assert_eq!(metadata.gallery.slots, vec![false; 12]);
+            assert_eq!(metadata.metadata.gallery.slots, vec![false; 12]);
             assert!(surface::test_releases().is_empty());
         }
         let mut atlas_drawn = false;

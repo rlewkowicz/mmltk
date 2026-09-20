@@ -205,7 +205,7 @@ fn trace_draw(
         control,
         draw.surface,
         draw.requested,
-        draw.gallery.as_deref(),
+        draw.gallery.as_ref().map(|value| value.metadata.as_ref()),
         Some((draw.bounds, Some((image, clip)))),
         draw_identity,
     );
@@ -1173,7 +1173,7 @@ pub(crate) fn retained_surface() -> Option<Surface> {
 pub(crate) enum ExploreDisplay {
     Gallery(
         Surface,
-        std::sync::Arc<crate::generated::ExploreImageMetadata>,
+        std::sync::Arc<super::labels::GalleryContent>,
     ),
     Detail(Surface, DetailContent),
 }
@@ -1181,7 +1181,7 @@ pub(crate) enum ExploreDisplay {
 impl ExploreDisplay {
     fn paired(
         surface: Surface,
-        gallery: Option<&std::sync::Arc<crate::generated::ExploreImageMetadata>>,
+        gallery: Option<&std::sync::Arc<super::labels::GalleryContent>>,
         detail: Option<&DetailContent>,
     ) -> Option<Self> {
         if let Some(gallery) = gallery {
@@ -1380,11 +1380,23 @@ pub(crate) struct AnnotationContent {
 
 #[derive(Clone)]
 pub(crate) struct DetailContent {
+    pub(super) labels: std::sync::Arc<[super::labels::CachedLabel]>,
     pub(super) explore: std::sync::Arc<crate::generated::ExploreImageMetadata>,
     pub(super) upscale: Option<std::sync::Arc<crate::generated::UpscaleImageMetadata>>,
 }
 
 impl DetailContent {
+    pub(crate) fn new(
+        explore: std::sync::Arc<crate::generated::ExploreImageMetadata>,
+        upscale: Option<std::sync::Arc<crate::generated::UpscaleImageMetadata>>,
+    ) -> Self {
+        let scene = upscale.as_ref().map_or(&explore.scene, |value| &value.scene);
+        let labels = scene.categories.iter()
+            .map(|name| super::labels::CachedLabel::new(name.value.clone()))
+            .collect();
+        Self { explore, upscale, labels }
+    }
+
     pub(crate) fn configure_surface(
         &self,
         mut surface: Surface,
@@ -1446,7 +1458,7 @@ struct PreparedDraw {
     bounds: Rectangle,
     geometry: PlacementGeometry,
     placement: Placement,
-    gallery: Option<std::sync::Arc<crate::generated::ExploreImageMetadata>>,
+    gallery: Option<std::sync::Arc<super::labels::GalleryContent>>,
     uniform: wgpu::Buffer,
     bindings: [wgpu::BindGroup; 2],
     key: GeometryKey,
@@ -1729,8 +1741,8 @@ impl SurfaceRenderer {
                 self.draws.remove(control);
                 return;
             };
-            bounds.y += gallery::row_offset(placement, snapshot, bounds.width);
-            placement = gallery::placement(snapshot);
+            bounds.y += gallery::row_offset(placement, &snapshot.metadata, bounds.width);
+            placement = gallery::placement(&snapshot.metadata);
         }
         let Some(geometry) =
             placement_geometry(bounds, surface.display_extent(), placement, transform)
@@ -1740,7 +1752,7 @@ impl SurfaceRenderer {
                 control,
                 surface,
                 requested,
-                gallery.map(std::sync::Arc::as_ref),
+                gallery.map(|value| value.metadata.as_ref()),
                 Some((bounds, None)),
                 0,
             );
@@ -2103,7 +2115,7 @@ impl SurfaceRenderer {
                 crate::integration_control::report_atlas_draw(
                     crate::integration_control::AtlasDraw {
                         surface: draw.surface,
-                        snapshot: gallery.clone(),
+                        snapshot: gallery.metadata.clone(),
                         bounds,
                         image,
                         clip,
@@ -2247,7 +2259,7 @@ pub(crate) fn reconcile_completed(surface: Surface, model: &crate::view_model::A
         let queue = renderer.queue.clone();
         let placement = gallery::matching(Some(frame))
             .as_ref()
-            .map_or(Placement::Contain, |snapshot| gallery::placement(snapshot));
+            .map_or(Placement::Contain, |snapshot| gallery::placement(&snapshot.metadata));
         renderer.reconcile_sample(&device, &queue, surface, placement);
         for imported in [&mut renderer.imported, &mut renderer.pending]
             .into_iter()
@@ -2557,7 +2569,7 @@ impl Imported {
                 "",
                 self.image.surface,
                 self.image.surface,
-                self.image.content.gallery().map(std::sync::Arc::as_ref),
+                self.image.content.gallery().map(|value| value.metadata.as_ref()),
                 None,
                 0,
             );
@@ -2589,7 +2601,7 @@ impl Imported {
                 "",
                 sample.surface,
                 self.image.surface,
-                sample.content.gallery().map(std::sync::Arc::as_ref),
+                sample.content.gallery().map(|value| value.metadata.as_ref()),
                 None,
                 0,
             );
@@ -3069,7 +3081,7 @@ mod tests {
                     panic!("accepted empty graphics must select gallery composition");
                 };
                 assert_eq!(shown.frame, Some(candidate));
-                assert_eq!(paired.order.matchingcount, 0);
+                assert_eq!(paired.metadata.order.matchingcount, 0);
                 if !logical_first {
                     model.explore.snapshot = Some(empty);
                 }
@@ -3207,10 +3219,7 @@ mod tests {
             logical.detail.showoriginaldimensions = false;
             let captured =
                 std::sync::Arc::new(crate::generated::ExploreImageMetadata::from(&logical));
-            let old = DetailContent {
-                explore: captured.clone(),
-                upscale: None,
-            };
+            let old = DetailContent::new(captured.clone(), None);
             let mut state = crate::view::explore::state::State::default();
             assert!(!state.detail_original(&old));
             state.choose_detail_original(true);
@@ -3218,12 +3227,9 @@ mod tests {
             assert!(state.detail_original(&old));
             state.settle_detail(true);
             logical.detail.showoriginaldimensions = true;
-            let paired = DetailContent {
-                explore: std::sync::Arc::new(crate::generated::ExploreImageMetadata::from(
+            let paired = DetailContent::new(std::sync::Arc::new(crate::generated::ExploreImageMetadata::from(
                     &logical,
-                )),
-                upscale: None,
-            };
+                )), None);
             if logical_first {
                 state.rebase(Some(&logical), false);
             }
@@ -3235,16 +3241,13 @@ mod tests {
             assert!(state.detail_original(&paired));
             let mut output = old.frame().clone();
             output.source.kind = crate::generated::PresentationSourceKind::Upscale;
-            let upscale = DetailContent {
-                explore: captured.clone(),
-                upscale: Some(std::sync::Arc::new(
+            let upscale = DetailContent::new(captured.clone(), Some(std::sync::Arc::new(
                     crate::generated::UpscaleImageMetadata {
                         frame: output,
                         input: old.frame().clone(),
                         scene: captured.scene.clone(),
                     },
-                )),
-            };
+                )));
             assert!(!upscale.original_dimensions());
             assert!(state.detail_original(&upscale));
             assert!(!captured.detail.showoriginaldimensions);

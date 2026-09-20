@@ -7,6 +7,8 @@ pub(crate) mod metadata;
 pub(crate) mod pixel_trace;
 mod renderer;
 
+pub(crate) use labels::GalleryContent;
+
 pub(crate) use geometry::{Placement, SurfaceSample, ViewportOwner, physical_bounds};
 use geometry::{PlacementGeometry, placement_geometry};
 pub use geometry::{SurfaceGesture, SurfaceGestureKind};

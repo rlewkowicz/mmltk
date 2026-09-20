@@ -75,6 +75,13 @@ pub(crate) struct SettledView {
     follow_reset_seen: u64,
 }
 
+/// The complete view under which an immutable caption was derived.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct CaptionView {
+    source: ViewSource,
+    camera_bounds: (Camera, Rectangle),
+}
+
 /// A plot widget that renders data series with interactive features.
 pub struct PlotWidget {
     pub(crate) instance_id: u64,
@@ -132,7 +139,7 @@ pub struct PlotWidget {
     pub(crate) picked_points: IndexMap<PointId, (HighlightPoint, Option<TooltipUiPayload>)>,
     /// Map of hovered point id to highlight point data & tooltip text.
     pub(crate) hovered_points: IndexMap<PointId, (HighlightPoint, Option<TooltipUiPayload>)>,
-    pub(crate) cursor_ui: Option<CursorPositionUiPayload>,
+    pub(crate) cursor_ui: Option<Arc<CursorPositionUiPayload>>,
     pub(crate) x_ticks: Arc<Vec<PositionedTick>>,
     pub(crate) y_ticks: Arc<Vec<PositionedTick>>,
     pub(crate) shape_overlays_enabled: AtomicBool,
@@ -141,6 +148,8 @@ pub struct PlotWidget {
     settled_view: Option<SettledView>,
     next_publication: AtomicU64,
     accepted_publication: u64,
+    // Issued view state survives tree remounts before queued messages reduce.
+    pending_caption: std::sync::Mutex<Option<(CaptionView, u64, Option<Arc<CursorPositionUiPayload>>)>>,
 }
 
 impl Default for PlotWidget {
@@ -207,6 +216,7 @@ impl PlotWidget {
             settled_view: None,
             next_publication: AtomicU64::new(1),
             accepted_publication: 0,
+            pending_caption: std::sync::Mutex::new(None),
         }
     }
 
@@ -715,12 +725,7 @@ impl PlotWidget {
                     _ => {}
                 };
                 if fresh_view {
-                    if payload.clear_cursor_position {
-                        self.cursor_ui = None;
-                    }
-                    if let Some(c) = payload.cursor_position_ui {
-                        self.cursor_ui = Some(c);
-                    }
+                    self.cursor_ui = payload.cursor_position_ui;
                     self.x_ticks = payload.x_ticks;
                     self.y_ticks = payload.y_ticks;
                 }
@@ -1157,7 +1162,7 @@ impl PlotWidget {
             return None;
         };
 
-        let bubble = container(widget::text(payload.text.clone()).size(12.0))
+        let bubble = container(widget::text(payload.text.as_str()).size(12.0))
             .padding(6.0)
             .style(|theme| self.update_style(theme).cursor_overlay);
 
@@ -1346,7 +1351,7 @@ struct UpdateEffects {
     needs_redraw: bool,
     hover_pick: Option<HoverPickEvent>,
     drag_event: Option<DragEvent>,
-    cursor_ui: Option<CursorPositionUiPayload>,
+    cursor_ui: Option<Arc<CursorPositionUiPayload>>,
     clear_cursor_position: bool,
     /// Request publishing `camera_bounds` even when ticks didn't change.
     /// This keeps overlays in sync when tick producers are disabled.
@@ -1458,43 +1463,55 @@ fn maybe_submit_hover_request(
     }
 }
 
-fn update_cursor_overlay_on_move(
+fn update_cursor_caption(
     widget: &PlotWidget,
-    state: &PlotState,
+    state: &mut PlotState,
+    event: &iced::Event,
+    cursor: mouse::Cursor,
     effects: &mut UpdateEffects,
-) {
-    if !widget.cursor_overlay {
-        return;
-    }
-    if state.cursor_inside() {
-        let viewport = Vec2::new(state.bounds.width, state.bounds.height);
-        let plot = state.camera.screen_to_world(
-            DVec2::new(
-                state.cursor_position.x as f64,
-                state.cursor_position.y as f64,
-            ),
-            DVec2::new(viewport.x as f64, viewport.y as f64),
-        );
-        let Some(world) =
-            plot_point_to_data([plot.x, plot.y], widget.x_axis_scale, widget.y_axis_scale)
-        else {
-            effects.clear_cursor_position = true;
-            return;
-        };
-        let text = if let Some(p) = &widget.cursor_provider {
-            (p)(world[0], world[1])
+) -> CaptionView {
+    let view = CaptionView { source: widget.view_source(), camera_bounds: (state.camera, state.bounds) };
+    // Copy only immutable ownership under the lock. Formatting and user providers
+    // run after it releases, and only after the event's final camera has settled.
+    let (previous_view, previous_caption) = {
+        let pending = widget.pending_caption.lock().unwrap();
+        if let Some((view, _, caption)) = pending.as_ref()
+            .filter(|(_, publication, _)| *publication > widget.accepted_publication)
+        {
+            (Some(*view), caption.clone())
         } else {
-            format!("{:.4}, {:.4}", world[0], world[1])
-        };
-
-        effects.cursor_ui = Some(CursorPositionUiPayload {
-            x: world[0],
-            y: world[1],
-            text,
-        });
-    } else {
-        effects.clear_cursor_position = true;
+            (widget.settled_view.zip(widget.camera_bounds).map(|(settled, camera_bounds)|
+                CaptionView { source: settled.source, camera_bounds }), widget.cursor_ui.clone())
+        }
+    };
+    let left = matches!(event, iced::Event::Mouse(mouse::Event::CursorLeft));
+    let moved = matches!(event, iced::Event::Mouse(mouse::Event::CursorMoved { .. }));
+    if previous_view == Some(view) && !(widget.cursor_overlay && (left || moved)) {
+        state.cursor_caption = previous_caption;
+        return view;
     }
+    let caption = if widget.cursor_overlay && !left {
+        state.available_cursor_local_position_inside(cursor).and_then(|position| {
+            let viewport = Vec2::new(state.bounds.width, state.bounds.height);
+            let plot = state.camera.screen_to_world(
+                DVec2::new(position.x as f64, position.y as f64),
+                DVec2::new(viewport.x as f64, viewport.y as f64),
+            );
+            let world = plot_point_to_data([plot.x, plot.y], widget.x_axis_scale, widget.y_axis_scale)?;
+            let text = if let Some(provider) = &widget.cursor_provider {
+                provider(world[0], world[1])
+            } else {
+                format!("{:.4}, {:.4}", world[0], world[1])
+            };
+            Some(Arc::new(CursorPositionUiPayload { x: world[0], y: world[1], text }))
+        })
+    } else {
+        None
+    };
+    effects.clear_cursor_position = previous_caption.is_some() && caption.is_none();
+    effects.cursor_ui = caption.clone();
+    state.cursor_caption = caption;
+    view
 }
 
 fn invalidate_static_canvas(widget: &PlotWidget) {
@@ -1622,6 +1639,7 @@ fn update_plot_program<const IS_CANVAS: bool>(
             x_scale: state.x_axis_scale, y_scale: state.y_axis_scale })
     };
     let source = widget.view_source();
+
     let data_changed = previous_source.is_none_or(|previous| previous.data != source.data);
     let limits_changed = previous_source.is_some_and(|previous|
         previous.x_lim != source.x_lim || previous.y_lim != source.y_lim
@@ -1736,12 +1754,8 @@ fn update_plot_program<const IS_CANVAS: bool>(
                 iced::mouse::Event::CursorMoved { .. } => {
                     if state.available_cursor_is_inside(cursor) {
                         maybe_submit_hover_request(widget, state, &mut effects);
-                        update_cursor_overlay_on_move(widget, state, &mut effects);
                     } else {
                         clear_hover_effect(widget, state, &mut effects);
-                        if widget.cursor_overlay {
-                            effects.clear_cursor_position = true;
-                        }
                     }
                     invalidation.overlay_layer();
                 }
@@ -1814,6 +1828,8 @@ fn update_plot_program<const IS_CANVAS: bool>(
         invalidation.static_layer();
     }
 
+    let caption_view = update_cursor_caption(widget, state, event, cursor, &mut effects);
+
     let needs_publish = effects.hover_pick.is_some()
         || effects.drag_event.is_some()
         || effects.cursor_ui.is_some()
@@ -1826,9 +1842,11 @@ fn update_plot_program<const IS_CANVAS: bool>(
     }
 
     if needs_publish {
+        let publication = widget.next_publication.fetch_add(1, Ordering::Relaxed);
+        *widget.pending_caption.lock().unwrap() = Some((caption_view, publication, state.cursor_caption.clone()));
         Some(shader::Action::publish(PlotUiMessage::RenderUpdate(
             PlotRenderUpdate {
-                publication: widget.next_publication.fetch_add(1, Ordering::Relaxed),
+                publication,
                 view: SettledView { source,
                     prev_data_max_x: state.prev_data_max_x,
                     prev_last_point_y: state.prev_last_point_y,
@@ -1836,7 +1854,7 @@ fn update_plot_program<const IS_CANVAS: bool>(
                 hover_pick: effects.hover_pick,
                 drag_event: effects.drag_event,
                 clear_cursor_position: effects.clear_cursor_position,
-                cursor_position_ui: effects.cursor_ui,
+                cursor_position_ui: state.cursor_caption.clone(),
                 x_ticks: Arc::clone(&state.x_ticks),
                 y_ticks: Arc::clone(&state.y_ticks),
                 // Publish one coherent view even for cursor-only messages, so
@@ -2414,6 +2432,319 @@ mod retained_data_tests {
                 assert_eq!(plot.picked_points.contains_key(&target), if change_source { clear } else { !clear });
             }
         }
+    }
+
+    fn assert_caption_matches_final_view(
+        plot: &PlotWidget, state: &PlotState, message: &PlotUiMessage, point: iced::Point,
+    ) -> Arc<CursorPositionUiPayload> {
+        let PlotUiMessage::RenderUpdate(payload) = message else { panic!("render publication"); };
+        assert_eq!(payload.view.source, plot.view_source());
+        assert_eq!(payload.camera_bounds, (state.camera, state.bounds));
+        assert!(!payload.clear_cursor_position);
+        let expected = state.camera.screen_to_world(
+            DVec2::new((point.x - state.bounds.x) as f64, (point.y - state.bounds.y) as f64),
+            DVec2::new(state.bounds.width as f64, state.bounds.height as f64),
+        );
+        let expected = [plot.x_axis_scale.plot_to_data(expected.x).unwrap(),
+            plot.y_axis_scale.plot_to_data(expected.y).unwrap()];
+        let caption = payload.cursor_position_ui.as_ref().unwrap();
+        assert_eq!([caption.x, caption.y], expected);
+        assert_eq!(caption.text, format!("{:.4}, {:.4}", expected[0], expected[1]));
+        assert!(Arc::ptr_eq(caption, state.cursor_caption.as_ref().unwrap()));
+        let pending = plot.pending_caption.lock().unwrap();
+        let (view, publication, issued) = pending.as_ref().unwrap();
+        assert_eq!(view.source, payload.view.source);
+        assert_eq!(view.camera_bounds, payload.camera_bounds);
+        assert_eq!(*publication, payload.publication);
+        assert!(Arc::ptr_eq(caption, issued.as_ref().unwrap()));
+        caption.clone()
+    }
+
+    #[test]
+    fn settled_visible_caption_is_revalidated_after_data_limits_and_scale_replacement() {
+        for replacement in 0..3 {
+            for available in [false, true] {
+                let (mut plot, id) = fixture();
+                plot.set_cursor_overlay(true);
+                let mut state = PlotState::default();
+                mount(&mut plot, &mut state, bounds());
+                let point = iced::Point::new(320.0, 180.0);
+                let entered = publish(&plot, &mut state,
+                    &iced::Event::Mouse(mouse::Event::CursorMoved { position: point }), bounds(),
+                    mouse::Cursor::Available(point)).unwrap();
+                plot.update(entered.clone());
+                let old = plot.cursor_ui.clone().unwrap();
+                assert_eq!([old.x, old.y], [2.0, 5.0]);
+                match replacement {
+                    0 => plot.set_series_positions(&id, &[[10.0, 20.0], [30.0, 80.0]]),
+                    1 => plot.set_x_lim(100.0, 200.0),
+                    _ => plot.set_y_axis_scale(AxisScale::Log { base: 10.0 }),
+                }
+                let cursor = if available { mouse::Cursor::Available(point) } else { mouse::Cursor::Unavailable };
+                let changed = publish(&plot, &mut state, &redraw(), bounds(), cursor).unwrap();
+                let expected = if available {
+                    let caption = assert_caption_matches_final_view(&plot, &state, &changed, point);
+                    assert!(!Arc::ptr_eq(&old, &caption));
+                    assert_ne!([old.x, old.y], [caption.x, caption.y]);
+                    Some(caption)
+                } else {
+                    let PlotUiMessage::RenderUpdate(payload) = &changed else { panic!("render publication"); };
+                    assert!(payload.clear_cursor_position);
+                    assert!(payload.cursor_position_ui.is_none());
+                    None
+                };
+                plot.update(changed.clone());
+                for stale in [entered, changed] { plot.update(stale); }
+                match expected {
+                    Some(caption) => assert!(Arc::ptr_eq(&caption, plot.cursor_ui.as_ref().unwrap())),
+                    None => assert!(plot.cursor_ui.is_none()),
+                }
+                assert!(publish(&plot, &mut state, &redraw(), bounds(), cursor).is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn visible_caption_uses_final_wheel_keyboard_link_bounds_and_aspect_camera() {
+        let point = iced::Point::new(160.0, 90.0);
+        for change in 0..7 {
+            let (mut plot, _) = fixture();
+            plot.set_cursor_overlay(true);
+            plot.controls.bind_key(keyboard::Key::Named(keyboard::key::Named::Home), KeyAction::Autoscale);
+            let link = AxisLink::new();
+            plot.set_x_axis_link(link.clone());
+            let mut state = PlotState::default();
+            mount(&mut plot, &mut state, bounds());
+            if change == 3 { pan(&mut plot, &mut state); }
+            let entered = publish(&plot, &mut state,
+                &iced::Event::Mouse(mouse::Event::CursorMoved { position: point }), bounds(),
+                mouse::Cursor::Available(point)).unwrap();
+            plot.update(entered.clone());
+            let old = plot.cursor_ui.clone().unwrap();
+            let old_camera = state.camera;
+            let mut next_bounds = bounds();
+            let event = match change {
+                0 | 1 => {
+                    if change == 1 { state.modifiers = keyboard::Modifiers::CTRL; }
+                    iced::Event::Mouse(mouse::Event::WheelScrolled {
+                        delta: mouse::ScrollDelta::Lines { x: 3.0, y: 2.0 },
+                    })
+                }
+                2 | 3 => {
+                    let (named, code) = if change == 2 {
+                        (keyboard::key::Named::ArrowRight, keyboard::key::Code::ArrowRight)
+                    } else { (keyboard::key::Named::Home, keyboard::key::Code::Home) };
+                    let key = keyboard::Key::Named(named);
+                    iced::Event::Keyboard(keyboard::Event::KeyPressed {
+                        modified_key: key.clone(), key,
+                        physical_key: keyboard::key::Physical::Code(code),
+                        location: keyboard::Location::Standard, modifiers: keyboard::Modifiers::NONE,
+                        text: None, repeat: false,
+                    })
+                }
+                4 => { link.set(77.0, 5.0); redraw() }
+                5 => { next_bounds = Rectangle::with_size(iced::Size::new(800.0, 400.0)); redraw() }
+                _ => {
+                    plot.set_data_aspect(0.8);
+                    iced::Event::Mouse(mouse::Event::CursorMoved { position: point })
+                }
+            };
+            let changed = publish(&plot, &mut state, &event, next_bounds, mouse::Cursor::Available(point)).unwrap();
+            let caption = assert_caption_matches_final_view(&plot, &state, &changed, point);
+            assert!(!Arc::ptr_eq(&old, &caption));
+            assert!(state.camera != old_camera || next_bounds != bounds());
+            let PlotUiMessage::RenderUpdate(payload) = &changed else { panic!("render publication"); };
+            assert!(Arc::ptr_eq(&payload.x_ticks, &state.x_ticks));
+            assert!(Arc::ptr_eq(&payload.y_ticks, &state.y_ticks));
+            plot.update(changed.clone());
+            for stale in [entered, changed] { plot.update(stale); }
+            assert!(Arc::ptr_eq(plot.cursor_ui.as_ref().unwrap(), &caption));
+            // A later external camera adoption has no usable pointer sample.
+            link.set(99.0, 8.0);
+            let clear = publish(&plot, &mut state, &redraw(), next_bounds, mouse::Cursor::Unavailable).unwrap();
+            let PlotUiMessage::RenderUpdate(payload) = &clear else { panic!("render publication"); };
+            assert!(payload.clear_cursor_position && payload.cursor_position_ui.is_none());
+            assert_eq!(payload.camera_bounds.0, state.camera);
+            plot.update(clear);
+            assert!(publish(&plot, &mut state, &redraw(), next_bounds, mouse::Cursor::Unavailable).is_none());
+        }
+    }
+
+    #[test]
+    fn cursor_provider_formats_once_from_the_final_view_and_retains_its_exact_text() {
+        let (mut plot, _) = fixture();
+        plot.set_cursor_overlay(true);
+        let calls = Arc::new(AtomicU64::new(0));
+        let observed = calls.clone();
+        plot.set_cursor_provider(Arc::new(move |x, y| {
+            let call = observed.fetch_add(1, Ordering::Relaxed) + 1;
+            format!("人 {call}: {x:?} / {y:?}")
+        }));
+        let mut state = PlotState::default();
+        mount(&mut plot, &mut state, bounds());
+        let point = iced::Point::new(160.0, 90.0);
+        update(&mut plot, &mut state,
+            &iced::Event::Mouse(mouse::Event::CursorMoved { position: point }), bounds(),
+            mouse::Cursor::Available(point));
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        plot.set_data_aspect(0.8);
+        update(&mut plot, &mut state,
+            &iced::Event::Mouse(mouse::Event::CursorMoved { position: point }), bounds(),
+            mouse::Cursor::Available(point));
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+        let expected = state.camera.screen_to_world(DVec2::new(160.0, 90.0), DVec2::new(640.0, 360.0));
+        let caption = plot.cursor_ui.clone().unwrap();
+        assert_eq!([caption.x, caption.y], [expected.x, expected.y]);
+        assert_eq!(caption.text, format!("人 2: {:?} / {:?}", expected.x, expected.y));
+        mount(&mut plot, &mut PlotState::default(), bounds());
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+        assert!(Arc::ptr_eq(&caption, plot.cursor_ui.as_ref().unwrap()));
+        assert!(plot.view_cursor_overlay().is_some());
+    }
+
+    #[test]
+    fn caption_payload_is_shared_through_queue_settlement_remount_and_independent_drag() {
+        let (mut plot, _) = fixture();
+        plot.set_cursor_overlay(true);
+        let mut state = PlotState::default();
+        mount(&mut plot, &mut state, bounds());
+        let point = iced::Point::new(320.0, 180.0);
+        let entered = publish(&plot, &mut state,
+            &iced::Event::Mouse(mouse::Event::CursorMoved { position: point }), bounds(),
+            mouse::Cursor::Available(point)).unwrap();
+        let caption = assert_caption_matches_final_view(&plot, &state, &entered, point);
+        let queued = entered.clone();
+        let PlotUiMessage::RenderUpdate(payload) = &queued else { panic!("render publication"); };
+        assert!(Arc::ptr_eq(&caption, payload.cursor_position_ui.as_ref().unwrap()));
+        assert!(Arc::ptr_eq(&caption, state.clone().cursor_caption.as_ref().unwrap()));
+        plot.update(entered);
+        assert!(Arc::ptr_eq(&caption, plot.cursor_ui.as_ref().unwrap()));
+        let mut remount = PlotState::default();
+        let mounted = publish(&plot, &mut remount, &redraw(), bounds(), mouse::Cursor::Unavailable).unwrap();
+        let retained = assert_caption_matches_final_view(&plot, &remount, &mounted, point);
+        assert!(Arc::ptr_eq(&caption, &retained));
+        plot.update(mounted);
+        let drag = publish(&plot, &mut remount,
+            &iced::Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Middle)), bounds(),
+            mouse::Cursor::Available(point)).unwrap();
+        assert!(matches!(drag.get_drag_event(), Some(DragEvent::Start { .. })));
+        assert!(Arc::ptr_eq(&caption, &assert_caption_matches_final_view(&plot, &remount, &drag, point)));
+        plot.update(drag);
+        plot.update(queued);
+        assert!(Arc::ptr_eq(&caption, plot.cursor_ui.as_ref().unwrap()));
+    }
+
+    #[test]
+    fn cursor_caption_transitions_survive_bursts_delayed_messages_and_remounts() {
+        let (mut plot, id) = fixture();
+        plot.set_cursor_overlay(true);
+        let mut state = PlotState::default();
+        mount(&mut plot, &mut state, bounds());
+        let inside = iced::Point::new(320.0, 180.0);
+        let outside = iced::Point::new(900.0, 500.0);
+        let moved = |plot: &PlotWidget, state: &mut PlotState, point| {
+            publish(plot, state, &iced::Event::Mouse(mouse::Event::CursorMoved { position: point }),
+                bounds(), mouse::Cursor::Available(point))
+        };
+        let clear = |message: &PlotUiMessage| match message {
+            PlotUiMessage::RenderUpdate(payload) => payload.clear_cursor_position,
+            _ => false,
+        };
+        for _ in 0..3 { assert!(moved(&plot, &mut state, outside).is_none()); }
+        let entered = moved(&plot, &mut state, inside).unwrap();
+        let left = moved(&plot, &mut state, outside).unwrap();
+        assert!(clear(&left));
+        assert!(moved(&plot, &mut state, outside).is_none());
+        let reentered = moved(&plot, &mut state, inside).unwrap();
+        assert!(!clear(&reentered));
+        plot.update(reentered.clone());
+        for stale in [left, entered, reentered] { plot.update(stale); }
+        assert!(plot.cursor_ui.is_some());
+        let left = publish(&plot, &mut state, &iced::Event::Mouse(mouse::Event::CursorLeft),
+            bounds(), mouse::Cursor::Unavailable).unwrap();
+        assert!(clear(&left));
+        assert!(publish(&plot, &mut state, &iced::Event::Mouse(mouse::Event::CursorLeft),
+            bounds(), mouse::Cursor::Unavailable).is_none());
+        // A newer camera-only publication carries the pending absent caption.
+        let resized = publish(&plot, &mut state, &redraw(),
+            Rectangle::with_size(iced::Size::new(800.0, 400.0)), mouse::Cursor::Unavailable).unwrap();
+        assert!(!clear(&resized));
+        plot.update(resized);
+        plot.update(left);
+        assert!(plot.cursor_ui.is_none());
+        mount(&mut plot, &mut state, bounds());
+        let pending = moved(&plot, &mut state, inside).unwrap();
+        let mut remount = PlotState::default();
+        let remounted = publish(&plot, &mut remount, &redraw(), bounds(),
+            mouse::Cursor::Unavailable).unwrap();
+        assert!(!clear(&remounted));
+        plot.update(remounted);
+        plot.update(pending);
+        assert!(plot.cursor_ui.is_some());
+        let left = moved(&plot, &mut remount, outside).unwrap();
+        assert!(clear(&left));
+        plot.update(left);
+        assert!(plot.cursor_ui.is_none());
+        let pending = moved(&plot, &mut state, inside).unwrap();
+        plot.set_series_positions(&id, &[[10.0, 20.0], [30.0, 80.0]]);
+        mount(&mut plot, &mut state, bounds());
+        plot.update(pending);
+        assert!(plot.cursor_ui.is_none());
+        let entered = moved(&plot, &mut state, inside).unwrap();
+        let stale_clear = moved(&plot, &mut state, outside).unwrap();
+        plot.set_x_lim(100.0, 200.0);
+        let current = moved(&plot, &mut state, inside).unwrap();
+        plot.update(current);
+        assert_eq!(plot.cursor_ui.as_ref().unwrap().x, 150.0);
+        plot.update(stale_clear);
+        plot.update(entered.clone());
+        assert_eq!(plot.cursor_ui.as_ref().unwrap().x, 150.0);
+        let (mut replacement, _) = fixture();
+        replacement.set_cursor_overlay(true);
+        mount(&mut replacement, &mut state, bounds());
+        replacement.update(entered);
+        assert!(replacement.cursor_ui.is_none());
+    }
+
+    #[test]
+    fn dragging_outside_clears_caption_once_and_keeps_camera_and_drag_messages() {
+        let (mut plot, _) = fixture();
+        plot.set_cursor_overlay(true);
+        let mut state = PlotState::default();
+        mount(&mut plot, &mut state, bounds());
+        let inside = iced::Point::new(320.0, 180.0);
+        update(&mut plot, &mut state, &iced::Event::Mouse(mouse::Event::CursorMoved { position: inside }),
+            bounds(), mouse::Cursor::Available(inside));
+        update(&mut plot, &mut state, &iced::Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+            bounds(), mouse::Cursor::Available(inside));
+        let camera = state.camera;
+        for (index, point) in [iced::Point::new(700.0, 400.0), iced::Point::new(750.0, 450.0)].into_iter().enumerate() {
+            let message = publish(&plot, &mut state,
+                &iced::Event::Mouse(mouse::Event::CursorMoved { position: point }), bounds(),
+                mouse::Cursor::Available(point)).unwrap();
+            let PlotUiMessage::RenderUpdate(payload) = &message else { panic!("render publication"); };
+            assert_eq!(payload.clear_cursor_position, index == 0);
+            assert!(payload.cursor_position_ui.is_none());
+            assert_ne!(payload.camera_bounds.0, camera);
+            plot.update(message);
+        }
+        assert!(plot.cursor_ui.is_none());
+        assert!(state.pan.active);
+        update(&mut plot, &mut state, &iced::Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
+            bounds(), mouse::Cursor::Available(iced::Point::new(750.0, 450.0)));
+        assert!(!state.pan.active);
+        // Unbound drag messages remain independent from cursor-caption effects.
+        let start = publish(&plot, &mut state, &iced::Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Middle)),
+            bounds(), mouse::Cursor::Available(inside)).unwrap();
+        assert!(matches!(start.get_drag_event(), Some(crate::DragEvent::Start { .. })));
+        plot.update(start);
+        let outside = iced::Point::new(900.0, 500.0);
+        let drag = publish(&plot, &mut state, &iced::Event::Mouse(mouse::Event::CursorMoved { position: outside }),
+            bounds(), mouse::Cursor::Available(outside)).unwrap();
+        assert!(matches!(drag.get_drag_event(), Some(crate::DragEvent::Update { .. })));
+        let PlotUiMessage::RenderUpdate(payload) = &drag else { panic!("render publication"); };
+        assert!(!payload.clear_cursor_position);
+        plot.update(drag);
     }
 
     #[test]

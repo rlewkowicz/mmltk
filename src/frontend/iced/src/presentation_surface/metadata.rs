@@ -8,44 +8,27 @@ use std::{cell::RefCell, sync::Arc};
 #[derive(Clone, Default)]
 pub(super) struct Content {
     product: Option<WorkspaceImageProduct>,
-    source: Option<WorkspaceImageProduct>,
     prepared: Prepared,
 }
 #[derive(Clone, Default)]
 enum Prepared {
     #[default]
     None,
+    Gallery(Arc<super::labels::GalleryContent>),
+    Detail(DetailContent),
     Prediction(Arc<super::labels::PredictionContent>),
     Validation(Arc<super::labels::ValidationContent>),
 }
 impl Content {
-    pub(super) fn gallery(&self) -> Option<&Arc<generated::ExploreImageMetadata>> {
-        match self.product.as_ref()? {
-            WorkspaceImageProduct::Explore(value)
-                if value.mode == generated::ExploreMode::Gallery =>
-            {
-                Some(value)
-            }
+    pub(super) fn gallery(&self) -> Option<&Arc<super::labels::GalleryContent>> {
+        match &self.prepared {
+            Prepared::Gallery(value) => Some(value),
             _ => None,
         }
     }
     pub(super) fn detail(&self) -> Option<DetailContent> {
-        match self.product.as_ref()? {
-            WorkspaceImageProduct::Explore(value)
-                if value.mode == generated::ExploreMode::Detail =>
-            {
-                Some(DetailContent {
-                    explore: value.clone(),
-                    upscale: None,
-                })
-            }
-            WorkspaceImageProduct::Upscale(value) => match self.source.as_ref()? {
-                WorkspaceImageProduct::Explore(source) => Some(DetailContent {
-                    explore: source.clone(),
-                    upscale: Some(value.clone()),
-                }),
-                _ => None,
-            },
+        match &self.prepared {
+            Prepared::Detail(value) => Some(value.clone()),
             _ => None,
         }
     }
@@ -69,10 +52,13 @@ impl Content {
             _ => None,
         }
     }
-    pub(super) fn from_gallery(value: Option<Arc<generated::ExploreImageMetadata>>) -> Self {
+    pub(super) fn from_gallery(value: Option<Arc<super::labels::GalleryContent>>) -> Self {
+        let Some(value) = value else {
+            return Self::default();
+        };
         Self {
-            product: value.map(WorkspaceImageProduct::Explore),
-            ..Default::default()
+            product: Some(WorkspaceImageProduct::Explore(value.metadata.clone())),
+            prepared: Prepared::Gallery(value),
         }
     }
     #[cfg(test)]
@@ -80,16 +66,12 @@ impl Content {
         let Some(value) = value else {
             return Self::default();
         };
-        match value.upscale {
-            Some(upscale) => Self {
-                product: Some(WorkspaceImageProduct::Upscale(upscale)),
-                source: Some(WorkspaceImageProduct::Explore(value.explore)),
-                prepared: Prepared::None,
-            },
-            None => Self {
-                product: Some(WorkspaceImageProduct::Explore(value.explore)),
-                ..Default::default()
-            },
+        Self {
+            product: Some(match &value.upscale {
+                Some(upscale) => WorkspaceImageProduct::Upscale(upscale.clone()),
+                None => WorkspaceImageProduct::Explore(value.explore.clone()),
+            }),
+            prepared: Prepared::Detail(value),
         }
     }
 }
@@ -214,7 +196,11 @@ pub(crate) fn install(
             } else if !valid_detail(snapshot) {
                 return Err("invalid graphics detail metadata".into());
             }
-            Prepared::None
+            if snapshot.mode == generated::ExploreMode::Gallery {
+                Prepared::Gallery(Arc::new(super::labels::GalleryContent::new(snapshot.clone())))
+            } else {
+                Prepared::Detail(DetailContent::new(snapshot.clone(), None))
+            }
         }
         WorkspaceImageProduct::Annotation(snapshot) if snapshot.frame == metadata.frame => {
             Prepared::None
@@ -243,7 +229,7 @@ pub(crate) fn install(
                 Some(WorkspaceImageProduct::Explore(source))
                     if source.frame == snapshot.input && valid_detail(source) =>
                 {
-                    Prepared::None
+                    Prepared::Detail(DetailContent::new(source.clone(), Some(snapshot.clone())))
                 }
                 Some(WorkspaceImageProduct::Validation(source))
                     if source.frame == snapshot.input
@@ -280,7 +266,6 @@ pub(crate) fn install(
     };
     let content = Content {
         product: Some(product),
-        source,
         prepared,
     };
     let surface = Surface {
@@ -314,7 +299,7 @@ pub(crate) fn install(
         fit_revision: 0,
     };
     let placement = content.gallery().map_or(Placement::Contain, |snapshot| {
-        super::gallery::placement(snapshot)
+        super::gallery::placement(&snapshot.metadata)
     });
     let image = Image {
         frame,
@@ -343,7 +328,7 @@ pub(crate) fn install(
             return Err("graphics metadata custody capacity exhausted".into());
         }
         if let Some(gallery) = image.pending.content.gallery().map(Arc::as_ref) {
-            super::trace_gallery_source(gallery);
+            super::trace_gallery_source(&gallery.metadata);
         }
         images.push(image);
         Ok(())
@@ -720,6 +705,44 @@ mod tests {
             )),
         );
         assert!(install(physical, 800, 800, 2, &invalid).is_err());
+        super::super::reset_test_releases();
+    }
+
+    #[test]
+    fn explore_preparation_is_shared_by_pending_and_completed_publications() {
+        super::super::reset_test_releases();
+        let (model, frame) = crate::view_model::test_support::explore_presentation();
+        let snapshot = model.explore.snapshot.as_ref().unwrap();
+        install_explore(frame, snapshot);
+        let pending = pending(frame).unwrap();
+        let detail = pending.content.detail().unwrap();
+        let cloned = pending.content.clone().detail().unwrap();
+        assert!(Arc::ptr_eq(&detail.labels, &cloned.labels));
+        assert!(Arc::ptr_eq(&detail.explore, &cloned.explore));
+        assert!(super::super::accept_publication(frame));
+        let read = super::super::SampleRead::acquire(frame).unwrap();
+        let mut candidate = pending;
+        candidate.read = Some(read.clone());
+        candidate.complete = false;
+        let surface = candidate.surface;
+        let mut image = super::super::ImagePublication {
+            surface, completed: None, retained_read: None,
+            pending_sample: Some(candidate), content: Content::default(), placement: Placement::Contain,
+        };
+        super::super::authorize_draw(Some(frame));
+        assert!(image.submitted_draw(surface).is_some());
+        assert!(!image.promote(frame, &model));
+        image.complete(frame);
+        assert!(image.promote(frame, &model));
+        let completed = image.content.detail().unwrap();
+        assert!(Arc::ptr_eq(&detail.labels, &completed.labels));
+        assert!(Arc::ptr_eq(&detail.explore, &completed.explore));
+        assert!(super::super::test_releases().is_empty());
+        super::super::retire_publication(frame);
+        assert!(super::super::test_releases().is_empty());
+        drop(image);
+        drop(read);
+        assert_eq!(super::super::test_releases(), vec![frame]);
         super::super::reset_test_releases();
     }
 

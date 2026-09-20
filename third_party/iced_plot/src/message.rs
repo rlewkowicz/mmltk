@@ -79,7 +79,7 @@ pub struct PlotRenderUpdate {
     pub hover_pick: Option<HoverPickEvent>,
     pub drag_event: Option<DragEvent>,
     pub clear_cursor_position: bool,
-    pub cursor_position_ui: Option<CursorPositionUiPayload>,
+    pub cursor_position_ui: Option<Arc<CursorPositionUiPayload>>,
     pub x_ticks: Arc<Vec<PositionedTick>>,
     pub y_ticks: Arc<Vec<PositionedTick>>,
     /// Internal: Camera and bounds for coordinate conversion (only used internally, not part of public API)

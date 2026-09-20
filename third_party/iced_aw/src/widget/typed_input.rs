@@ -406,7 +406,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use iced_widget::Renderer;
+    use crate::widget::test_support::Renderer;
 
     #[derive(Clone, Debug)]
     #[allow(dead_code)]
@@ -569,13 +569,12 @@ mod tests {
     }
 
     #[test]
-    fn typed_input_children_delegates_to_text_input() {
+    fn typed_input_diff_delegates_to_text_input() {
         let value = 42u32;
-        let input = TestTypedInput::new("Enter a number", &value);
-
-        let children = Widget::<TestMessage, iced_widget::Theme, Renderer>::children(&input);
-        let text_input_children =
-            <TextInput<_, _, _> as Widget<_, _, _>>::children(&input.text_input);
-        assert_eq!(children.len(), text_input_children.len());
+        let mut input = TestTypedInput::new("Enter a number", &value);
+        let mut tree = Tree::new(&input as &dyn Widget<TestMessage, iced_widget::Theme, Renderer>);
+        input.diff(&mut tree);
+        assert_eq!(tree.tag, <TextInput<_, _, _> as Widget<_, _, _>>::tag(&input.text_input));
+        assert!(tree.children.is_empty());
     }
 }

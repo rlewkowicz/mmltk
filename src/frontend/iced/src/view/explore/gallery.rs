@@ -164,7 +164,7 @@ fn local_gestures(
         hover
             .capture(
                 current.as_ref(),
-                shown.as_ref().map(|(_, snapshot)| snapshot.as_ref()),
+                shown.as_ref().map(|(_, snapshot)| snapshot.metadata.as_ref()),
                 gesture,
                 focus_ready,
             )
@@ -178,7 +178,7 @@ pub(super) fn view<'a>(
     settings: &'a SettingsModel,
     paired: Option<(
         Surface,
-        std::sync::Arc<crate::generated::ExploreImageMetadata>,
+        std::sync::Arc<crate::presentation_surface::GalleryContent>,
     )>,
     width: f32,
     input: crate::workspace_input::Binding,
@@ -361,7 +361,7 @@ fn gallery_viewport<'a>(
     presentation_title: &'static str,
     displayed: Option<(
         Surface,
-        std::sync::Arc<crate::generated::ExploreImageMetadata>,
+        std::sync::Arc<crate::presentation_surface::GalleryContent>,
     )>,
     size: Size,
     columns: u32,
@@ -370,7 +370,7 @@ fn gallery_viewport<'a>(
 ) -> Element<'a, Message> {
     let width = size.width.max(1.0);
     let height = size.height.max(1.0);
-    let presented = displayed.as_ref().map(|(_, snapshot)| snapshot.as_ref());
+    let presented = displayed.as_ref().map(|(_, snapshot)| snapshot.metadata.as_ref());
     let matching = presented.map_or(0, |value| value.order.matchingcount);
     let first_row = presented.map_or(0, |value| value.viewport.firstrow);
     let display_columns = presented.map_or(columns, |value| value.viewport.columns);
@@ -450,12 +450,12 @@ fn gallery_viewport<'a>(
                     metadata.clone(),
                     state
                         .presented_filter(snapshot)
-                        .map_or(metadata.overlay.showlabels, |request| {
+                        .map_or(metadata.metadata.overlay.showlabels, |request| {
                             request.overlay.showlabels
                         }),
                 ),
             );
-            if metadata.order.matchingcount == 0 {
+            if metadata.metadata.order.matchingcount == 0 {
                 stack![
                     image,
                     container(text("No samples match the filters").size(22))

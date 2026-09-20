@@ -1961,10 +1961,10 @@ impl State {
                 }) && matches!(
                     crate::presentation_surface::explore_display(surface),
                     Some(crate::presentation_surface::ExploreDisplay::Gallery(shown, metadata))
-                        if metadata.order.matchingcount == 0
+                        if metadata.metadata.order.matchingcount == 0
                             && shown.frame.is_some_and(|frame| {
                                 probes.draws().gallery
-                                    == Some((frame.presentation_revision, metadata.frame.revision))
+                                    == Some((frame.presentation_revision, metadata.metadata.frame.revision))
                             })
                 ) =>
             {

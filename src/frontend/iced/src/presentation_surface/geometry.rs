@@ -249,9 +249,9 @@ impl ViewportOwner {
         let mut origin_y = 0.0;
         if matches!(placement, Placement::GalleryGrid { .. }) {
             let (shown, snapshot) = gallery::displayed()?;
-            origin_y = gallery::row_offset(placement, &snapshot, bounds.width);
+            origin_y = gallery::row_offset(placement, &snapshot.metadata, bounds.width);
             surface = shown;
-            placement = gallery::placement(&snapshot);
+            placement = gallery::placement(&snapshot.metadata);
         }
         surface.frame?;
         let geometry = placement_geometry(

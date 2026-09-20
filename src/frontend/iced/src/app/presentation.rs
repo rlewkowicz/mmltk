@@ -1399,7 +1399,7 @@ mod tests {
                 crate::presentation_surface::ExploreDisplay::Gallery(shown, metadata) => {
                     assert!(empty);
                     assert_eq!(shown.frame, Some(frame));
-                    assert_eq!(metadata.order.matchingcount, 0);
+                    assert_eq!(metadata.metadata.order.matchingcount, 0);
                 }
                 crate::presentation_surface::ExploreDisplay::Detail(shown, _) => {
                     assert!(!empty);

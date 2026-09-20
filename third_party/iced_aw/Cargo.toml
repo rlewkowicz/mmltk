@@ -6,6 +6,7 @@ authors = [
   "Andrew Wheeler <genusistimelord@gmail.com>",
 ]
 edition = "2024"
+workspace = "../../src/frontend/iced"
 description = "Additional widgets for the Iced GUI library"
 license = "MIT"
 homepage = "https://iced.rs"

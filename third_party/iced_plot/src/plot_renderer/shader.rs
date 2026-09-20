@@ -1715,7 +1715,7 @@ impl PlotRenderer {
         let width = msaa_targets.width as f32;
         let height = msaa_targets.height as f32;
 
-        // Main pass (grid, lines, markers)
+        // One chart-local pass preserves painter order and resolves only after all overlays.
         {
             let mut pass = params.encoder.begin_render_pass(&RenderPassDescriptor {
                 label: Some("iced_plot main"),
@@ -1735,116 +1735,7 @@ impl PlotRenderer {
                 0, 0, msaa_targets.width, msaa_targets.height,
             );
 
-            // grid
-            self.grid.draw(&mut pass, &self.camera_bind_group);
-            // fills
-            if let (Some(pipeline), Some(vb)) = (self.pipelines.fill.as_ref(), &self.buffers.fills)
-            {
-                pass.set_pipeline(pipeline);
-                pass.set_bind_group(0, &self.camera_bind_group, &[]);
-                pass.set_vertex_buffer(0, vb.buffer.slice(..));
-                pass.draw(0..vb.vertex_count, 0..1);
-            }
-            // lines
-            if let (Some(pipeline), Some(lb)) = (self.pipelines.line.as_ref(), &self.buffers.lines)
-            {
-                pass.set_pipeline(pipeline);
-                pass.set_bind_group(0, &self.camera_bind_group, &[]);
-                pass.set_vertex_buffer(0, lb.buffer.slice(..));
-                for seg in &lb.segments {
-                    pass.draw(seg.first_vertex..seg.first_vertex + seg.vertex_count, 0..1);
-                }
-            }
-            // reference lines (vlines and hlines)
-            if let (Some(pipeline), Some(lb)) =
-                (self.pipelines.line.as_ref(), &self.buffers.reflines)
-            {
-                pass.set_pipeline(pipeline);
-                pass.set_bind_group(0, &self.camera_bind_group, &[]);
-                pass.set_vertex_buffer(0, lb.buffer.slice(..));
-                for seg in &lb.segments {
-                    pass.draw(seg.first_vertex..seg.first_vertex + seg.vertex_count, 0..1);
-                }
-            }
-            // markers
-            if let (Some(pipeline), Some(vb)) =
-                (self.pipelines.marker.as_ref(), &self.buffers.markers)
-            {
-                pass.set_pipeline(pipeline);
-                pass.set_bind_group(0, &self.camera_bind_group, &[]);
-                pass.set_vertex_buffer(0, vb.buffer.slice(..));
-                pass.draw(0..4, 0..vb.vertex_count);
-            }
-            // highlight markers (rendered after regular markers so they appear on top)
-            if let (Some(pipeline), Some(vb)) = (
-                self.pipelines.marker.as_ref(),
-                &self.buffers.highlight_markers,
-            ) {
-                pass.set_pipeline(pipeline);
-                pass.set_bind_group(0, &self.camera_bind_group, &[]);
-                pass.set_vertex_buffer(0, vb.buffer.slice(..));
-                pass.draw(0..4, 0..vb.vertex_count);
-            }
-        }
-
-        // Selection overlay
-        if let Some(pipeline) = self.pipelines.overlay.as_ref() {
-            let mut pass = params.encoder.begin_render_pass(&RenderPassDescriptor {
-                label: Some("selection overlay"),
-                color_attachments: &[Some(msaa_attachment(msaa_targets, LoadOp::Load))],
-                depth_stencil_attachment: None,
-                occlusion_query_set: None,
-                timestamp_writes: None,
-                multiview_mask: None,
-            });
-
-            // Set viewport and scissor for selection overlay as well
-            pass.set_viewport(0.0, 0.0, width, height, 0.0, 1.0);
-            pass.set_scissor_rect(
-                0, 0, msaa_targets.width, msaa_targets.height,
-            );
-
-            pass.set_pipeline(pipeline);
-            // Draw selection if present
-            if let Some(vb) = &self.buffers.selection {
-                pass.set_vertex_buffer(0, vb.buffer.slice(..));
-                pass.draw(0..vb.vertex_count, 0..1);
-            }
-            // Draw highlight mask boxes if present
-            // Each mask box is a quad (4 vertices) in TriangleStrip topology
-            if let Some(vb) = &self.buffers.highlight {
-                pass.set_vertex_buffer(0, vb.buffer.slice(..));
-                // Draw each quad separately (4 vertices per quad)
-                let quad_count = vb.vertex_count / 4;
-                for i in 0..quad_count {
-                    pass.draw(i * 4..(i + 1) * 4, 0..1);
-                }
-            }
-        }
-
-        // Crosshairs overlay (using line list topology)
-        if let (Some(pipeline), Some(vb)) = (
-            self.pipelines.line_overlay.as_ref(),
-            &self.buffers.crosshairs,
-        ) {
-            let mut pass = params.encoder.begin_render_pass(&RenderPassDescriptor {
-                label: Some("crosshairs overlay"),
-                color_attachments: &[Some(msaa_attachment(msaa_targets, LoadOp::Load))],
-                depth_stencil_attachment: None,
-                occlusion_query_set: None,
-                timestamp_writes: None,
-                multiview_mask: None,
-            });
-
-            // Set viewport and scissor for crosshairs overlay
-            pass.set_viewport(0.0, 0.0, width, height, 0.0, 1.0);
-            pass.set_scissor_rect(
-                0, 0, msaa_targets.width, msaa_targets.height,
-            );
-
-            pass.set_pipeline(pipeline);
-            pass.set_vertex_buffer(0, vb.buffer.slice(..));
-            pass.draw(0..vb.vertex_count, 0..1);
+            self.draw_in_pass(&mut pass);
         }
 
         if let Some(pipeline) = self.pipelines.composite.as_ref() {
@@ -1887,6 +1778,86 @@ fn chart_composite_region(physical: Rectangle, window: Rectangle) -> Option<([f3
 #[cfg(test)]
 mod retained_target_tests {
     use super::*;
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn chart_single_resolve_preserves_layer_colors_alpha_and_clip_guards() {
+        let instance = Instance::new(InstanceDescriptor {
+            backends: Backends::VULKAN,
+            ..InstanceDescriptor::new_without_display_handle()
+        });
+        let adapter = iced::futures::executor::block_on(instance.request_adapter(&Default::default()))
+            .expect("plot color acceptance requires the container Vulkan adapter");
+        let (device, queue) = iced::futures::executor::block_on(adapter.request_device(&Default::default()))
+            .expect("plot color test device");
+        let format = TextureFormat::Rgba8Unorm;
+        let mut renderer = PlotRenderer::new(&device, &queue, format);
+        let mut state = PlotState::default();
+        state.bounds = Rectangle::with_size(iced::Size::new(64.0, 64.0));
+        state.camera.position = glam::DVec2::ZERO;
+        state.camera.half_extents = glam::DVec2::ONE;
+        let viewport = Viewport::with_physical_size(iced::Size::new(64, 64), 1.0);
+        renderer.prepare_frame(&device, &queue, &viewport, &state.bounds, &state);
+        assert_eq!(MSAA_SAMPLE_COUNT, 4);
+        renderer.ensure_fill_pipeline(&device);
+        // Constant interior colors deliberately separate draw order from edges,
+        // line antialiasing, camera projection, and text rasterization.
+        let vertices = |positions: &[[f32; 2]], color: [f32; 4]| {
+            let mut values = Vec::new();
+            for position in positions { values.extend_from_slice(position); values.extend_from_slice(&color); }
+            values
+        };
+        let fill = vertices(&[[-0.75, -0.75], [0.75, -0.75], [-0.75, 0.75],
+            [-0.75, 0.75], [0.75, -0.75], [0.75, 0.75]], [1.0, 0.0, 0.0, 0.5]);
+        VertexBuffer::upload(&mut renderer.buffers.fills, &device, &queue, bytemuck::cast_slice(&fill), 6);
+        let selection = vertices(&[[-0.5, 0.5], [0.5, 0.5], [-0.5, -0.5], [0.5, -0.5]], [0.0, 1.0, 0.0, 0.5]);
+        VertexBuffer::upload(&mut renderer.buffers.selection, &device, &queue, bytemuck::cast_slice(&selection), 4);
+        let highlight = vertices(&[[-0.25, 0.25], [0.25, 0.25], [-0.25, -0.25], [0.25, -0.25]], [0.0, 0.0, 1.0, 0.5]);
+        VertexBuffer::upload(&mut renderer.buffers.highlight, &device, &queue, bytemuck::cast_slice(&highlight), 4);
+        let crosshairs = vertices(&[[0.015625, -0.75], [0.015625, 0.75], [-0.75, -0.015625], [0.75, -0.015625]], [1.0, 1.0, 1.0, 0.5]);
+        VertexBuffer::upload(&mut renderer.buffers.crosshairs, &device, &queue, bytemuck::cast_slice(&crosshairs), 4);
+        let target = create_color_texture(&device, "plot color fixture", 64, 64, 1, format,
+            TextureUsages::RENDER_ATTACHMENT | TextureUsages::COPY_SRC);
+        let view = target.create_view(&Default::default());
+        let readback = device.create_buffer(&BufferDescriptor {
+            label: Some("plot color pixels"), size: 64 * 256,
+            usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ, mapped_at_creation: false,
+        });
+        let mut encoder = device.create_command_encoder(&Default::default());
+        {
+            let _clear = encoder.begin_render_pass(&RenderPassDescriptor {
+                label: Some("plot fixture clear"),
+                color_attachments: &[Some(RenderPassColorAttachment {
+                    view: &view, resolve_target: None, depth_slice: None,
+                    ops: Operations { load: LoadOp::Clear(Color::TRANSPARENT), store: StoreOp::Store },
+                })], depth_stencil_attachment: None, timestamp_writes: None,
+                occlusion_query_set: None, multiview_mask: None,
+            });
+        }
+        renderer.encode(RenderParams { encoder: &mut encoder, target: &view,
+            clip_bounds: &Rectangle { x: 10, y: 10, width: 44, height: 44 } });
+        encoder.copy_texture_to_buffer(target.as_image_copy(), TexelCopyBufferInfo {
+            buffer: &readback, layout: TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(256), rows_per_image: Some(64) },
+        }, Extent3d { width: 64, height: 64, depth_or_array_layers: 1 });
+        let _ = queue.submit([encoder.finish()]);
+        let (send, receive) = std::sync::mpsc::channel();
+        readback.slice(..).map_async(MapMode::Read, move |result| send.send(result).unwrap());
+        device.poll(PollType::Wait { submission_index: None, timeout: Some(std::time::Duration::from_secs(5)) }).unwrap();
+        receive.recv().unwrap().unwrap();
+        let pixels = readback.slice(..).get_mapped_range();
+        let pixel = |x: usize, y: usize| &pixels[(y * 64 + x) * 4..(y * 64 + x + 1) * 4];
+        for (x, y, expected) in [(12, 12, [128, 0, 0, 128]), (20, 20, [64, 128, 0, 192]),
+            (28, 28, [32, 64, 128, 224]), (32, 28, [144, 160, 192, 240]), (32, 32, [200, 208, 224, 248])] {
+            assert_eq!(pixel(x, y), expected, "interior at {x},{y}");
+        }
+        for y in 0..64 { for x in 0..64 {
+            if !(10..54).contains(&x) || !(10..54).contains(&y) {
+                assert_eq!(pixel(x, y), [0, 0, 0, 0], "untouched clip guard at {x},{y}");
+            }
+        } }
+        drop(pixels);
+        readback.unmap();
+    }
+
     #[test]
     fn chart_targets_clip_scroll_and_resize_without_window_sized_storage() {
         let window = Rectangle { x: 0.0, y: 0.0, width: 1920.0, height: 1080.0 };

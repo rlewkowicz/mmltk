@@ -65,6 +65,7 @@ pub struct PlotState {
     pub(crate) grid_style: GridStyle,
     // Interaction state
     pub(crate) cursor_position: Vec2,
+    pub(crate) cursor_caption: Option<Arc<crate::message::CursorPositionUiPayload>>,
     pub(crate) last_click_time: Option<Instant>,
     pub(crate) last_click_button: Option<mouse::Button>,
     pub(crate) legend_collapsed: bool,
@@ -128,6 +129,7 @@ impl Default for PlotState {
             bounds: Rectangle::default(),
             grid_style: GridStyle::default(),
             cursor_position: Vec2::ZERO,
+            cursor_caption: None,
             last_click_time: None,
             last_click_button: None,
             legend_collapsed: false,

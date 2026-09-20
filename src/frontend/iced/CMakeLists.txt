@@ -101,6 +101,8 @@ if(BUILD_MMLTK_BROWSER_APP AND BUILD_RFDETR_NATIVE)
         "${CMAKE_SOURCE_DIR}/third_party/iced_plot/*.rs"
         "${CMAKE_SOURCE_DIR}/third_party/iced_plot/*.toml"
         "${CMAKE_SOURCE_DIR}/third_party/iced_plot/*.wgsl"
+        "${CMAKE_SOURCE_DIR}/third_party/iced_aw/*.rs"
+        "${CMAKE_SOURCE_DIR}/third_party/iced_aw/*.toml"
     )
     set(_mmltk_frontend_build_inputs
         "${MMLTK_APPLICATION_BINDINGS}"
@@ -186,6 +188,16 @@ if(BUILD_MMLTK_BROWSER_APP AND BUILD_RFDETR_NATIVE)
             --locked
             --frozen
             --no-run
+        COMMAND "${CMAKE_COMMAND}" -E env
+            ${_mmltk_frontend_environment}
+            "${MMLTK_CARGO_EXECUTABLE}" test
+            --manifest-path "${MMLTK_FRONTEND_ICED_SOURCE_DIR}/Cargo.toml"
+            --package iced_aw
+            --no-default-features
+            --features number_input,selection_list
+            --locked
+            --frozen
+            --no-run
         DEPENDS ${_mmltk_frontend_build_inputs}
         WORKING_DIRECTORY "${MMLTK_FRONTEND_ICED_SOURCE_DIR}"
         VERBATIM
@@ -204,6 +216,16 @@ if(BUILD_MMLTK_BROWSER_APP AND BUILD_RFDETR_NATIVE)
             --manifest-path "${MMLTK_FRONTEND_ICED_SOURCE_DIR}/Cargo.toml"
             --package mmltk-browser-app
             --package iced_plot
+            --locked
+            --frozen
+            ${MMLTK_ICED_TEST_ARGUMENTS}
+        COMMAND "${CMAKE_COMMAND}" -E env
+            ${_mmltk_frontend_environment}
+            "${MMLTK_CARGO_EXECUTABLE}" test
+            --manifest-path "${MMLTK_FRONTEND_ICED_SOURCE_DIR}/Cargo.toml"
+            --package iced_aw
+            --no-default-features
+            --features number_input,selection_list
             --locked
             --frozen
             ${MMLTK_ICED_TEST_ARGUMENTS}

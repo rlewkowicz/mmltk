@@ -6,7 +6,7 @@ rust-version = "1.92"
 publish = false
 
 [workspace]
-members = [".", "../../../third_party/iced_plot"]
+members = [".", "../../../third_party/iced_plot", "../../../third_party/iced_aw"]
 default-members = ["."]
 resolver = "3"
 

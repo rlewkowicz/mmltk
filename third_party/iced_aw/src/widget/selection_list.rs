@@ -359,6 +359,7 @@ impl<P: Paragraph> State<P> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::widget::test_support::Renderer;
 
     #[derive(Clone, Debug)]
     #[allow(dead_code)]
@@ -366,7 +367,7 @@ mod tests {
         Selected(usize, String),
     }
 
-    type TestSelectionList<'a> = SelectionList<'a, String, TestMessage, iced_widget::Theme>;
+    type TestSelectionList<'a> = SelectionList<'a, String, TestMessage, iced_widget::Theme, Renderer>;
 
     #[test]
     fn selection_list_new_creates_instance() {
@@ -422,10 +423,10 @@ mod tests {
         let selection_list = TestSelectionList::new(&options, TestMessage::Selected);
 
         let tag =
-            Widget::<TestMessage, iced_widget::Theme, iced_widget::Renderer>::tag(&selection_list);
+            Widget::<TestMessage, iced_widget::Theme, Renderer>::tag(&selection_list);
         assert_eq!(
             tag,
-            tree::Tag::of::<State<<iced_widget::Renderer as iced_core::text::Renderer>::Paragraph>>(
+            tree::Tag::of::<State<<Renderer as iced_core::text::Renderer>::Paragraph>>(
             )
         );
     }
@@ -434,12 +435,10 @@ mod tests {
     fn selection_list_has_one_child() {
         let options = vec!["Option 1".to_owned()];
 
-        let selection_list = TestSelectionList::new(&options, TestMessage::Selected);
-
-        let children = Widget::<TestMessage, iced_widget::Theme, iced_widget::Renderer>::children(
-            &selection_list,
-        );
-        assert_eq!(children.len(), 1);
+        let mut selection_list = TestSelectionList::new(&options, TestMessage::Selected);
+        let mut tree = Tree::new(&selection_list as &dyn Widget<TestMessage, iced_widget::Theme, Renderer>);
+        selection_list.diff(&mut tree);
+        assert_eq!(tree.children.len(), 1);
     }
 
     #[test]
@@ -449,7 +448,7 @@ mod tests {
         let selection_list = TestSelectionList::new(&options, TestMessage::Selected);
 
         let size =
-            Widget::<TestMessage, iced_widget::Theme, iced_widget::Renderer>::size(&selection_list);
+            Widget::<TestMessage, iced_widget::Theme, Renderer>::size(&selection_list);
         assert_eq!(size.width, Length::Fill);
         assert_eq!(size.height, Length::Shrink);
     }
@@ -472,7 +471,7 @@ mod tests {
 
     #[test]
     fn state_new_creates_empty_values() {
-        type TestState = State<<iced_widget::Renderer as iced_core::text::Renderer>::Paragraph>;
+        type TestState = State<<Renderer as iced_core::text::Renderer>::Paragraph>;
 
         let options = vec!["A".to_owned(), "B".to_owned()];
         let state = TestState::new(&options);
