@@ -1380,7 +1380,7 @@ pub(crate) struct AnnotationContent {
 
 #[derive(Clone)]
 pub(crate) struct DetailContent {
-    pub(super) labels: std::sync::Arc<[super::labels::CachedLabel]>,
+    pub(super) labels: std::sync::Arc<super::labels::CategoryCaptions>,
     pub(super) explore: std::sync::Arc<crate::generated::ExploreImageMetadata>,
     pub(super) upscale: Option<std::sync::Arc<crate::generated::UpscaleImageMetadata>>,
 }
@@ -1391,9 +1391,10 @@ impl DetailContent {
         upscale: Option<std::sync::Arc<crate::generated::UpscaleImageMetadata>>,
     ) -> Self {
         let scene = upscale.as_ref().map_or(&explore.scene, |value| &value.scene);
-        let labels = scene.categories.iter()
-            .map(|name| super::labels::CachedLabel::new(name.value.clone()))
-            .collect();
+        let labels = std::sync::Arc::new(super::labels::CategoryCaptions::new(
+            &scene.categories,
+            scene.objects.iter().map(|object| object.category),
+        ));
         Self { explore, upscale, labels }
     }
 

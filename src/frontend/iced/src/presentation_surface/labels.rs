@@ -30,12 +30,14 @@ fn cell_bounds(geometry: PlacementGeometry, region: [u32; 4], cell: [u32; 4]) ->
 
 pub(crate) struct GalleryContent {
     pub(crate) metadata: std::sync::Arc<crate::generated::ExploreImageMetadata>,
-    captions: Vec<CachedLabel>,
+    captions: CategoryCaptions,
 }
 impl GalleryContent {
     pub(crate) fn new(metadata: std::sync::Arc<crate::generated::ExploreImageMetadata>) -> Self {
-        let captions = metadata.dataset.classnames.iter()
-            .map(|name| CachedLabel::new(name.value.clone())).collect();
+        let captions = CategoryCaptions::new(
+            &metadata.dataset.classnames,
+            metadata.labels.iter().map(|label| label.category),
+        );
         Self { metadata, captions }
     }
 }
@@ -44,12 +46,48 @@ pub(crate) struct PredictionContent {
     pub(super) metadata: std::sync::Arc<crate::generated::PredictImageMetadata>,
     labels: Vec<CachedLabel>,
 }
-pub(super) struct CachedLabel {
+struct CachedLabel {
     text: String,
     width: f32,
     paragraph: iced::advanced::graphics::text::Paragraph,
     background: Option<[u8; 3]>,
     cell: Option<[u32; 4]>,
+}
+
+// Category identities stay catalog-relative; only referenced names own text
+// and paragraphs. Visibility is applied at visit time over this immutable set.
+pub(super) struct CategoryCaptions {
+    indices: Vec<usize>,
+    captions: Vec<CachedLabel>,
+}
+impl CategoryCaptions {
+    pub(super) fn new(
+        names: &[crate::generated::ClassName],
+        references: impl IntoIterator<Item = u16>,
+    ) -> Self {
+        let mut indices = vec![usize::MAX; names.len()];
+        let mut captions = Vec::new();
+        for category in references {
+            let category = usize::from(category);
+            let Some(index) = indices.get_mut(category) else {
+                continue;
+            };
+            if *index == usize::MAX {
+                *index = captions.len();
+                captions.push(CachedLabel::new(names[category].value.clone()));
+            }
+        }
+        Self { indices, captions }
+    }
+
+    fn get(&self, category: usize) -> Option<&CachedLabel> {
+        self.captions.get(*self.indices.get(category)?)
+    }
+
+    #[cfg(test)]
+    pub(super) fn len(&self) -> usize {
+        self.captions.len()
+    }
 }
 fn label_text<Content>(content: Content, width: f32) -> text::Text<Content> {
     text::Text {
@@ -67,7 +105,7 @@ fn label_text<Content>(content: Content, width: f32) -> text::Text<Content> {
     }
 }
 impl CachedLabel {
-    pub(super) fn new(text: String) -> Self {
+    fn new(text: String) -> Self {
         let width = (text.chars().count() as f32 * 7.5 + 8.0).max(20.0);
         let paragraph =
             iced::advanced::graphics::text::Paragraph::with_text(label_text(text.as_str(), width));
@@ -761,14 +799,14 @@ mod tests {
             box_: native.scene.objects[0].box_.clone(), category: 0, compiledindex: 0,
         }];
         let gallery = Arc::new(GalleryContent::new(Arc::new(native.clone())));
-        assert_eq!(gallery.captions[0].text, "人é🙂");
-        assert_eq!(gallery.captions[0].width, 30.5);
+        assert_eq!(gallery.captions.get(0).unwrap().text, "人é🙂");
+        assert_eq!(gallery.captions.get(0).unwrap().width, 30.5);
         assert_eq!(CachedLabel::new(String::new()).width, 20.0);
         for _ in 0..3 {
             Source::Gallery(gallery.clone(), true).visit(|category, _, name, color, _, _, cached| {
                 assert_eq!((category, name), (0, "人é🙂"));
                 assert_eq!(color, &native.dataset.palette[0]);
-                assert!(std::ptr::eq(cached, &gallery.captions[0]));
+                assert!(std::ptr::eq(cached, gallery.captions.get(0).unwrap()));
                 assert_eq!(cached.paragraph.compare(label_text((), 30.5)), text::Difference::None);
             });
         }
@@ -790,6 +828,8 @@ mod tests {
         derived.scene.objects[0].box_.first.x = 123.0;
         let derived = Arc::new(derived);
         let prepared = super::super::DetailContent::new(native.clone(), Some(derived.clone()));
+        assert_eq!(prepared.labels.len(), 1);
+        assert!(prepared.labels.get(0).is_none());
         assert!(std::ptr::eq(prepared.scene(), &derived.scene));
         assert!(std::ptr::eq(prepared.overlay(), &native.overlay));
         assert!(Arc::ptr_eq(&prepared.clone().labels, &prepared.labels));
@@ -802,7 +842,7 @@ mod tests {
                 assert_eq!(color, &derived.scene.palette[1]);
                 assert!(std::ptr::eq(overlay.unwrap(), &native.overlay));
 
-                assert!(std::ptr::eq(cached, &prepared.labels[1]));
+                assert!(std::ptr::eq(cached, prepared.labels.get(1).unwrap()));
                 assert_eq!(cached.width, 30.5);
                 assert_eq!(cached.paragraph.compare(label_text((), cached.width)), text::Difference::None);
             });
@@ -820,6 +860,100 @@ mod tests {
         filtered.overlay.classselection.classes = vec![0];
         let hidden = super::super::DetailContent::new(Arc::new(filtered), Some(derived));
         Source::Detail(hidden, true).visit(|_, _, _, _, _, _, _| panic!("paired source filter excludes derived category"));
+    }
+
+    #[test]
+    fn explore_prepares_only_referenced_categories_and_preserves_visit_order() {
+        use crate::generated::*;
+        use std::sync::Arc;
+        let mut native = ExploreImageMetadata::from(
+            &crate::view_model::test_support::explore_snapshot(),
+        );
+        native.dataset.classnames = (0..256)
+            .map(|category| ClassName { value: format!("class {category}") })
+            .collect();
+        native.dataset.classnames[253].value = "人é🙂".into();
+        native.dataset.classnames[7].value.clear();
+        // Category 255 has a valid name but no palette entry.
+        native.dataset.palette = (0..255)
+            .map(|category| AnnotationColor {
+                hue: category as f32, saturation: 0.7, value: 0.8,
+            })
+            .collect();
+        native.scene.categories = native.dataset.classnames.clone();
+        native.scene.palette = native.dataset.palette.clone();
+        native.labels.clear();
+        native.scene.objects.clear();
+        native.overlay.classselection.mode = ExploreClassSelectionMode::All;
+        let empty = Arc::new(native.clone());
+        assert_eq!(GalleryContent::new(empty.clone()).captions.len(), 0);
+        assert_eq!(super::super::DetailContent::new(empty, None).labels.len(), 0);
+
+        for (position, category) in [253, 7, 253, 255, 256, u16::MAX].into_iter().enumerate() {
+            let mut object = crate::view_model::test_support::annotation_object(category);
+            object.box_.first.x = position as f32;
+            native.labels.push(ExploreLabel {
+                box_: object.box_.clone(), category, compiledindex: 0,
+            });
+            native.scene.objects.push(object);
+        }
+        let gallery = Arc::new(GalleryContent::new(Arc::new(native.clone())));
+        let detail = super::super::DetailContent::new(Arc::new(native.clone()), None);
+        for captions in [&gallery.captions, detail.labels.as_ref()] {
+            assert_eq!(captions.len(), 3);
+            assert_eq!(captions.indices.len(), 256);
+            assert!(captions.get(0).is_none());
+            assert!(captions.get(256).is_none());
+            assert!(captions.get(usize::from(u16::MAX)).is_none());
+            assert_eq!(captions.get(255).unwrap().text, "class 255");
+        }
+        for visible in [true, false, true, true] {
+            for (source, captions) in [
+                (Source::Gallery(gallery.clone(), visible), &gallery.captions),
+                (Source::Detail(detail.clone(), visible), detail.labels.as_ref()),
+            ] {
+                let mut seen = Vec::new();
+                source.visit(|category, bounds, name, color, count, overlay, cached| {
+                    seen.push((category, bounds.first.x, name.to_owned()));
+                    assert_eq!(count, 256);
+                    assert_eq!(color, &native.dataset.palette[usize::from(category)]);
+                    assert_eq!(overlay.unwrap(), &native.overlay);
+                    assert!(std::ptr::eq(cached, captions.get(usize::from(category)).unwrap()));
+                    assert_eq!(cached.width, if category == 7 { 20.0 } else { 30.5 });
+                    assert_eq!(cached.paragraph.compare(label_text((), cached.width)), text::Difference::None);
+                });
+                assert_eq!(seen, if visible {
+                    vec![(253, 0.0, "人é🙂".into()), (7, 1.0, "".into()), (253, 2.0, "人é🙂".into())]
+                } else { Vec::new() });
+                assert_eq!(captions.len(), 3);
+            }
+        }
+
+        // Reusing every numeric identity cannot reuse a previous product's text.
+        let mut replacement = native.clone();
+        replacement.dataset.classnames[253].value = "replacement".into();
+        replacement.scene.categories[253].value = "detail replacement".into();
+        let replacement = Arc::new(replacement);
+        let next_gallery = GalleryContent::new(replacement.clone());
+        let next_detail = super::super::DetailContent::new(replacement, None);
+        assert_eq!(next_gallery.captions.get(253).unwrap().text, "replacement");
+        assert_eq!(next_detail.labels.get(253).unwrap().text, "detail replacement");
+        assert_eq!(gallery.captions.get(253).unwrap().text, "人é🙂");
+        assert_eq!(detail.labels.get(253).unwrap().text, "人é🙂");
+        assert!(!Arc::ptr_eq(&detail.labels, &next_detail.labels));
+
+        native.overlay.classselection.mode = ExploreClassSelectionMode::Subset;
+        native.overlay.classselection.classes = vec![253];
+        native.scene.objects[0].enabled = false;
+        let filtered = super::super::DetailContent::new(Arc::new(native), None);
+        // Preparing disabled/filtered categories keeps text independent from
+        // visibility policy; visiting still applies both rules in source order.
+        assert_eq!(filtered.labels.len(), 3);
+        let mut seen = Vec::new();
+        Source::Detail(filtered, true).visit(|category, bounds, _, _, _, _, _| {
+            seen.push((category, bounds.first.x));
+        });
+        assert_eq!(seen, vec![(253, 2.0)]);
     }
 
     #[test]

@@ -710,40 +710,90 @@ mod tests {
 
     #[test]
     fn explore_preparation_is_shared_by_pending_and_completed_publications() {
-        super::super::reset_test_releases();
-        let (model, frame) = crate::view_model::test_support::explore_presentation();
-        let snapshot = model.explore.snapshot.as_ref().unwrap();
-        install_explore(frame, snapshot);
-        let pending = pending(frame).unwrap();
-        let detail = pending.content.detail().unwrap();
-        let cloned = pending.content.clone().detail().unwrap();
-        assert!(Arc::ptr_eq(&detail.labels, &cloned.labels));
-        assert!(Arc::ptr_eq(&detail.explore, &cloned.explore));
-        assert!(super::super::accept_publication(frame));
-        let read = super::super::SampleRead::acquire(frame).unwrap();
-        let mut candidate = pending;
-        candidate.read = Some(read.clone());
-        candidate.complete = false;
-        let surface = candidate.surface;
-        let mut image = super::super::ImagePublication {
-            surface, completed: None, retained_read: None,
-            pending_sample: Some(candidate), content: Content::default(), placement: Placement::Contain,
-        };
-        super::super::authorize_draw(Some(frame));
-        assert!(image.submitted_draw(surface).is_some());
-        assert!(!image.promote(frame, &model));
-        image.complete(frame);
-        assert!(image.promote(frame, &model));
-        let completed = image.content.detail().unwrap();
-        assert!(Arc::ptr_eq(&detail.labels, &completed.labels));
-        assert!(Arc::ptr_eq(&detail.explore, &completed.explore));
-        assert!(super::super::test_releases().is_empty());
-        super::super::retire_publication(frame);
-        assert!(super::super::test_releases().is_empty());
-        drop(image);
-        drop(read);
-        assert_eq!(super::super::test_releases(), vec![frame]);
-        super::super::reset_test_releases();
+        for referenced in [false, true] {
+            super::super::reset_test_releases();
+            let (model, frame) = crate::view_model::test_support::explore_presentation();
+            let mut snapshot = model.explore.snapshot.as_ref().unwrap().clone();
+            snapshot.scene.categories = (0..256)
+                .map(|category| generated::ClassName { value: format!("class {category}") })
+                .collect();
+            snapshot.scene.objects = if referenced {
+                vec![crate::view_model::test_support::annotation_object(255); 2]
+            } else {
+                Vec::new()
+            };
+            install_explore(frame, &snapshot);
+            let mut candidate = pending(frame).unwrap();
+            let detail = candidate.content.detail().unwrap();
+            let cloned = candidate.content.clone().detail().unwrap();
+            assert_eq!(detail.labels.len(), usize::from(referenced));
+            assert!(Arc::ptr_eq(&detail.labels, &cloned.labels));
+            assert!(Arc::ptr_eq(&detail.explore, &cloned.explore));
+            assert!(super::super::accept_publication(frame));
+            let read = super::super::SampleRead::acquire(frame).unwrap();
+            candidate.read = Some(read.clone());
+            candidate.complete = false;
+            let surface = candidate.surface;
+            let mut image = super::super::ImagePublication {
+                surface, completed: None, retained_read: None,
+                pending_sample: Some(candidate), content: Content::default(), placement: Placement::Contain,
+            };
+            super::super::authorize_draw(Some(frame));
+            assert!(image.submitted_draw(surface).is_some());
+            assert!(!image.promote(frame, &model));
+            image.complete(frame);
+            assert!(image.promote(frame, &model));
+            let completed = image.content.detail().unwrap();
+            assert!(Arc::ptr_eq(&detail.labels, &completed.labels));
+            assert!(Arc::ptr_eq(&detail.explore, &completed.explore));
+            assert_eq!(Arc::strong_count(&read), 2);
+
+            // New physical storage with unchanged numeric content identities
+            // still owns its independently prepared immutable metadata.
+            let replacement = FrameReady {
+                slot: 1, presentation_revision: frame.presentation_revision + 1, ..frame
+            };
+            snapshot.scene.categories[255].value = "replacement".into();
+            install_explore(replacement, &snapshot);
+            let mut next = pending(replacement).unwrap();
+            let next_detail = next.content.detail().unwrap();
+            assert_eq!(next_detail.labels.len(), usize::from(referenced));
+            assert!(!Arc::ptr_eq(&detail.labels, &next_detail.labels));
+            assert_eq!(next_detail.explore.scene.categories[255].value, "replacement");
+            assert_eq!(detail.explore.scene.categories[255].value, "class 255");
+            assert!(super::super::accept_publication(replacement));
+            let next_read = super::super::SampleRead::acquire(replacement).unwrap();
+            next.read = Some(next_read.clone());
+            next.complete = false;
+            let next_surface = next.surface;
+            image.pending_sample = Some(next);
+            assert!(!image.promote(replacement, &model));
+            assert_eq!(image.retained().unwrap().frame, Some(frame));
+            assert!(Arc::ptr_eq(&image.content.detail().unwrap().labels, &detail.labels));
+            super::super::authorize_draw(Some(replacement));
+            let encoded_draw = image.submitted_draw(next_surface).unwrap().clone();
+            assert!(Arc::ptr_eq(&encoded_draw.content.detail().unwrap().labels, &next_detail.labels));
+            image.complete(replacement);
+            assert!(image.promote(replacement, &model));
+            assert!(Arc::ptr_eq(&image.content.detail().unwrap().labels, &next_detail.labels));
+            assert!(super::super::test_releases().is_empty());
+            super::super::retire_publication(frame);
+            super::super::retire_publication(replacement);
+            retire(frame);
+            retire(replacement);
+            assert!(super::super::test_releases().is_empty());
+            drop(read);
+            assert_eq!(super::super::test_releases(), vec![frame]);
+            drop(image);
+            drop(next_read);
+            assert_eq!(super::super::test_releases(), vec![frame]);
+            drop(encoded_draw);
+            assert_eq!(super::super::test_releases(), vec![frame, replacement]);
+            // Caption handles survive both releases without holding pixels.
+            assert_eq!(detail.labels.len(), usize::from(referenced));
+            assert_eq!(next_detail.labels.len(), usize::from(referenced));
+            super::super::reset_test_releases();
+        }
     }
 
     #[test]
