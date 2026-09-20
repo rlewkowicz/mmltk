@@ -1,5 +1,3 @@
-#include <archive.h>
-#include <archive_entry.h>
 #include <fcntl.h>
 #include <linux/fs.h>
 #include <sys/syscall.h>
@@ -88,23 +86,9 @@ BenchmarkTraceSink make_trace_sink(const BenchmarkTraceCallback& callback) noexc
         return {};
     }
 }
-[[nodiscard]] DownloadRequest make_download_request(const BenchmarkCacheLayout& cache, const std::string_view source, const CatalogArtifact& artifact) {
-    DownloadRequest request;
-    request.artifact_id = artifact.artifact_id;
-    request.source = artifact.source;
-    request.url = artifact.url;
-    request.destination = cache.source_downloads(source) / artifact.filename;
-    request.lock_path = cache.locks / (artifact.artifact_id + ".lock");
-    request.expected_size = artifact.expected_size;
-    if (!artifact.expected_sha256.empty()) { request.expected_sha256 = artifact.expected_sha256; }
-    request.maximum_attempts = kMaximumAttempts;
-    return request;
-}
 namespace {
 using Clock = std::chrono::steady_clock;
 constexpr std::size_t kArchivePipelineConcurrency = 4U;
-constexpr std::size_t kArchiveReadBufferBytes = std::size_t{1024U} * 1024U;
-constexpr std::uint64_t kArchiveScratchBytes = 24ULL * 1024U * 1024U * 1024U;
 struct TracePath final {
     std::string text;
     bool truncated = false;
@@ -147,142 +131,6 @@ struct TracePath final {
         if (*parent_iterator != *child_iterator) { return false; }
     }
     return parent_iterator == parent.end();
-}
-struct ArchiveDestroy {
-    void operator()(archive* reader) const noexcept {
-        if (reader != nullptr) { (void)archive_read_free(reader); }
-    }
-};
-using ArchiveReader = std::unique_ptr<archive, ArchiveDestroy>;
-class StagingFileCleanup {
-   public:
-    void set(std::filesystem::path path) { path_ = std::move(path); }
-    ~StagingFileCleanup() {
-        if (!path_.empty()) {
-            std::error_code ignored;
-            std::filesystem::remove(path_, ignored);
-        }
-    }
-
-   private:
-    std::filesystem::path path_;
-};
-[[nodiscard]] std::string archive_error(const archive* reader) {
-    const char* message = archive_error_string(const_cast<archive*>(reader));
-    return message != nullptr ? message : "unknown libarchive error";
-}
-[[nodiscard]] std::filesystem::path extract_manifest_path(const std::filesystem::path& path) { return path.string() + ".extract.json"; }
-[[nodiscard]] std::string extract_archive_member_impl(const std::filesystem::path& archive_path, const std::string_view member_suffix,
-                                                 const std::filesystem::path& output_path, const std::string_view archive_identity,
-                                                 const std::filesystem::path& lock_path, mmltk::common::concurrency::CancellationObservation cancel_requested,
-                                                 const BenchmarkTraceSink& trace) {
-    ArtifactLease lease = ArtifactLease::acquire(lock_path, cancel_requested);
-    const std::filesystem::path completion = extract_manifest_path(output_path);
-    if (std::filesystem::is_regular_file(output_path) && std::filesystem::is_regular_file(completion)) {
-        try {
-            const nlohmann::json metadata = read_json_file(completion);
-            if (metadata.value("schema_version", 0U) == kBenchmarkCacheSchemaVersion && metadata.value("complete", false) &&
-                metadata.value("archive_identity", std::string{}) == archive_identity && metadata.value("member", std::string{}) == member_suffix &&
-                metadata.value("size", 0ULL) == std::filesystem::file_size(output_path)) {
-                const std::string identity = metadata.value("identity", std::string{});
-                if (!identity.empty()) {
-                    trace_benchmark_event(trace, "benchmark.archive.extract_cache_hit",
-                                          [&] { return nlohmann::json{{"member", member_suffix}, {"path", output_path.string()}}; });
-                    return identity;
-                }
-            }
-        } catch (const std::exception& error) {
-            trace_benchmark_event(trace, "benchmark.archive.extract_cache_invalid",
-                                  [&] { return nlohmann::json{{"member", member_suffix}, {"path", output_path.string()}, {"reason", error.what()}}; });
-        }
-    }
-    std::error_code remove_error;
-    std::filesystem::remove(output_path, remove_error);
-    if (remove_error) { throw std::filesystem::filesystem_error("cannot remove invalid extracted annotation", output_path, remove_error); }
-    remove_error.clear();
-    std::filesystem::remove(completion, remove_error);
-    if (remove_error) { throw std::filesystem::filesystem_error("cannot remove invalid extraction metadata", completion, remove_error); }
-    ArchiveReader reader(archive_read_new());
-    if (!reader) { throw std::runtime_error("cannot allocate benchmark annotation archive reader"); }
-    if (archive_read_support_filter_all(reader.get()) < ARCHIVE_WARN || archive_read_support_format_tar(reader.get()) < ARCHIVE_WARN ||
-        archive_read_support_format_zip(reader.get()) < ARCHIVE_WARN ||
-        archive_read_open_filename(reader.get(), archive_path.c_str(), kArchiveReadBufferBytes) < ARCHIVE_WARN) {
-        throw std::runtime_error("cannot open benchmark annotation archive: " + archive_error(reader.get()));
-    }
-    archive_entry* entry = nullptr;
-    bool found = false;
-    std::string staging_text = output_path.string() + ".tmp.XXXXXX";
-    common_io::FileHandle staging;
-    std::filesystem::path staging_path;
-    StagingFileCleanup staging_cleanup;
-    std::uint64_t expected_size = 0U;
-    while (true) {
-        throw_if_benchmark_cancelled(cancel_requested);
-        int status = ARCHIVE_RETRY;
-        for (std::uint32_t retry = 0U; status == ARCHIVE_RETRY && retry < 8U; ++retry) { status = archive_read_next_header(reader.get(), &entry); }
-        if (status == ARCHIVE_EOF) { break; }
-        if (status != ARCHIVE_OK && status != ARCHIVE_WARN) {
-            throw std::runtime_error("cannot read benchmark annotation archive: " + archive_error(reader.get()));
-        }
-        const char* pathname = archive_entry_pathname(entry);
-        const std::string_view name = pathname != nullptr ? std::string_view(pathname) : std::string_view{};
-        if (!name.ends_with(member_suffix)) {
-            int skip_status = ARCHIVE_RETRY;
-            for (std::uint32_t retry = 0U; skip_status == ARCHIVE_RETRY && retry < 8U; ++retry) { skip_status = archive_read_data_skip(reader.get()); }
-            if (skip_status < ARCHIVE_WARN) { throw std::runtime_error("cannot skip benchmark annotation archive member"); }
-            continue;
-        }
-        if (found || archive_entry_filetype(entry) != AE_IFREG || archive_entry_size(entry) <= 0) {
-            throw std::runtime_error("benchmark annotation archive member is missing or ambiguous");
-        }
-        found = true;
-        expected_size = common_math::checked_cast<std::uint64_t>(archive_entry_size(entry), "extracted annotation size overflow");
-        require_storage(output_path, expected_size, "extracted annotation staging", trace);
-        staging = common_io::FileHandle::create_unique_output(staging_text,
-                                                              common_math::checked_cast<std::size_t>(expected_size, "extracted annotation size overflow"));
-        staging_path = staging_text;
-        staging_cleanup.set(staging_path);
-        std::vector<std::uint8_t> buffer(kArchiveReadBufferBytes);
-        std::uint64_t offset = 0U;
-        while (offset < expected_size) {
-            throw_if_benchmark_cancelled(cancel_requested);
-            const std::size_t remaining = common_math::checked_cast<std::size_t>(expected_size - offset, "extraction remaining size overflow");
-            la_ssize_t count = ARCHIVE_RETRY;
-            for (std::uint32_t retry = 0U; count == ARCHIVE_RETRY && retry < 8U; ++retry) {
-                count = archive_read_data(reader.get(), buffer.data(), std::min(buffer.size(), remaining));
-            }
-            if (count <= 0) { throw std::runtime_error("cannot read complete benchmark annotation archive member"); }
-            staging.pwrite_all(buffer.data(), common_math::checked_cast<std::size_t>(count, "archive read overflow"),
-                               common_math::checked_cast<std::size_t>(offset, "archive write offset overflow"));
-            offset += common_math::checked_cast<std::uint64_t>(count, "archive read overflow");
-        }
-    }
-    if (!found) { throw std::runtime_error("benchmark annotation archive does not contain " + std::string(member_suffix)); }
-    staging.sync_data();
-    staging = common_io::FileHandle{};
-    std::string identity_material;
-    identity_material.reserve(archive_identity.size() + member_suffix.size() + 64U);
-    identity_material.append(archive_identity);
-    identity_material.push_back('\n');
-    identity_material.append(member_suffix);
-    identity_material.push_back('\n');
-    identity_material.append(std::to_string(expected_size));
-    const std::string identity = mmltk::common::io::sha256_hex(
-        mmltk::common::io::sha256_bytes(std::span(reinterpret_cast<const std::uint8_t*>(identity_material.data()), identity_material.size())));
-    throw_if_benchmark_cancelled(cancel_requested);
-    common_io::publish_staged_path_atomically(staging_path, output_path, true);
-    write_json_atomically(completion,
-                          nlohmann::json{{"schema_version", kBenchmarkCacheSchemaVersion},
-                                         {"complete", true},
-                                         {"archive_identity", archive_identity},
-                                         {"member", member_suffix},
-                                         {"size", expected_size},
-                                         {"identity", identity},
-                                         {"integrity_mode", "archive_structure_size"}},
-                          cancel_requested);
-    trace_benchmark_event(trace, "benchmark.archive.extracted",
-                          [&] { return nlohmann::json{{"member", member_suffix}, {"bytes", expected_size}, {"identity", identity}}; });
-    return identity;
 }
 [[nodiscard]] std::optional<std::uint64_t> parse_archive_image_id(const std::string_view path) {
     const std::size_t slash = path.find_last_of('/');
@@ -774,11 +622,6 @@ void write_split_with_progress(const BenchmarkWriteRequest& request, ProgressRep
     return nlohmann::json{{"artifacts", std::move(artifacts)}, {"open_images_train_image_url_template", open_images_train_image_url_template()}};
 }
 }  // namespace
-std::string extract_archive_member(const std::filesystem::path& archive_path, std::string_view member_suffix,
-    const std::filesystem::path& output_path, std::string_view archive_identity, const std::filesystem::path& lock_path,
-    mmltk::common::concurrency::CancellationObservation cancellation, const BenchmarkTraceSink& trace) {
-    return extract_archive_member_impl(archive_path, member_suffix, output_path, archive_identity, lock_path, cancellation, trace);
-}
 bool archive_selection_allows_quarantine(const BenchmarkDatasetSource source, const std::string_view split) noexcept {
     return source != BenchmarkDatasetSource::kCoco2017 || split == "train2017";
 }

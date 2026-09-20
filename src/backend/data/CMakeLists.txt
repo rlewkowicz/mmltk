@@ -73,6 +73,7 @@ mmltk_register_ordinary_sources(mmltk_backend_data
     coconut_annotations.cpp
     coconut_parquet.cpp
     coconut_catalog.cpp
+    benchmark_annotation_cache.cpp
     benchmark_cache.cpp
     benchmark_catalog.cpp
     benchmark_compiler.cpp
@@ -101,6 +102,7 @@ mmltk_register_retained_module_importers(mmltk_backend_data
 mmltk_register_ordinary_sources(mmltk_backend_data
     writable_pixel_range.cpp)
 mmltk_register_private_headers(mmltk_backend_data
+    detail/benchmark_annotation_cache.h
     detail/benchmark_annotations.h
     detail/coconut_annotations.h
     detail/coconut_catalog.h

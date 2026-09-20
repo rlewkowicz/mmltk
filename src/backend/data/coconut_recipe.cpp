@@ -1,5 +1,5 @@
 #include "detail/benchmark_recipe.h"
-#include "detail/benchmark_compiler.h"
+#include "detail/benchmark_annotation_cache.h"
 #include "detail/benchmark_storage.h"
 #include "src/common/io/file_digest.h"
 #include "src/common/math/checked_arithmetic.h"
@@ -132,6 +132,7 @@ CoconutRecipePreparation prepare_coconut_recipe(const BenchmarkCompilerConfig& c
             for (unsigned attempt = 1; ; ++attempt) {
                 try { components = import_coconut_annotations(request); break; }
                 catch (const CoconutPhysicalMembershipError&) { throw; }
+                catch (const InsufficientBenchmarkStorage&) { throw; }
                 catch (const std::exception& error) {
                     throw_if_benchmark_cancelled(cancellation);
                     if (attempt == 3) throw;
@@ -182,23 +183,23 @@ CoconutRecipePreparation prepare_coconut_recipe(const BenchmarkCompilerConfig& c
     prepared.duplicate_xl_images = reconcile_coconut_extensions(prepared.components, cancellation);
     std::erase_if(prepared.components, [](const CoconutComponent& component) { return component.index.images.empty(); });
     if (config.selection.validation == CoconutValidation::Stock) {
-        const auto archive = acquire(catalog.stock_annotations, "coco");
-        prepared.annotation_storage_bytes = checked_add(prepared.annotation_storage_bytes, archive.size, "stock annotation cache estimate overflow");
-        ArtifactLease lease = ArtifactLease::acquire(cache.locks / "coco-annotations.lifecycle.lock", cancellation);
-        const auto json_path = cache.source_indexes("coco") / "source-json/instances_val2017.json";
-        std::filesystem::create_directories(json_path.parent_path());
-        const auto identity = extract_archive_member(archive.path, "annotations/instances_val2017.json", json_path, archive.identity,
-            cache.locks / "coco-val-json.extract.lock", cancellation, trace);
-        const auto path = cache.source_indexes("coco") / "val2017.normalized.bin";
-        prepared.stock_validation = load_normalized_annotation_index(path, BenchmarkDatasetSource::kCoco2017, "val2017", identity, cancellation, trace);
-        if (!prepared.stock_validation) {
-            prepared.annotation_cache_hit = false;
-            prepared.stock_validation = parse_coco_style_annotations(json_path, identity, coco_category_mappings(),
-                AnnotationParseOptions{BenchmarkDatasetSource::kCoco2017, "val2017", checked_cast<std::uint32_t>(catalog.coco_validation_images,"COCO validation count overflow"), config.num_workers, true, cancellation, trace});
-            store_normalized_annotation_index(path, *prepared.stock_validation, cancellation, trace);
+        CocoAnnotationCache stock(cache, catalog.stock_annotations, false, 0,
+            checked_cast<std::uint32_t>(catalog.coco_validation_images, "COCO validation count overflow"), config.num_workers, cancellation, trace);
+        stock.discover(progress);
+        if (stock.pending_download()) {
+            const auto& request = *stock.pending_download();
+            const auto reservation = reservations.reserve(additional_download_bytes(request.destination, request.expected_size), "additional stock annotation download bytes");
+            progress.phase(DatasetCompilePhase::Downloading);
+            auto archive = download_artifacts({request}, workers, cancellation,
+                progress.transfer_observer_enabled() ? DownloadProgressSink{[&](const DownloadProgress& update) { totals.update(update, progress); }}
+                                                    : DownloadProgressSink{}, trace).front();
+            auto completed = stock.completed_indexes();
+            stock.settle(std::move(archive), progress, workers, completed, 1);
         }
-        prepared.annotation_storage_bytes = checked_add(prepared.annotation_storage_bytes,
-            checked_add(std::filesystem::file_size(path), std::filesystem::file_size(json_path), "stock annotation storage overflow"), "stock annotation storage overflow");
+        auto indexes = stock.take_indexes();
+        prepared.annotation_cache_hit = prepared.annotation_cache_hit && indexes.cache_hit;
+        prepared.annotation_storage_bytes = checked_add(prepared.annotation_storage_bytes, indexes.retained_storage_bytes, "stock annotation storage overflow");
+        prepared.stock_validation = std::move(indexes.validation);
         prepared.validation_images = prepared.stock_validation->images.size();
     }
     // COCO shares one physical ID domain across its archive subsets; Objects365 editions remain distinct.

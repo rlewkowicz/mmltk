@@ -2,7 +2,13 @@
 #include "benchmark_annotations.h"
 #include "benchmark_sampling.h"
 #include "benchmark_progress.h"
+#include "benchmark_catalog.h"
+#include "benchmark_download.h"
+#include <span>
 #include "coconut_annotations.h"
+#include "coconut_catalog.h"
+#include "coconut_inventory.h"
+#include "src/backend/data/benchmark_dataset_compiler.h"
 #include <optional>
 #include <cstddef>
 #include <cstdint>

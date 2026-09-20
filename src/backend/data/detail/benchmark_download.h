@@ -8,6 +8,8 @@
 #include <string>
 #include <vector>
 #include "benchmark_cache.h"
+#include "benchmark_catalog.h"
+#include <string_view>
 namespace mmltk::backend::data::benchmark_internal {
 inline constexpr std::uint32_t kMaximumAttempts = 5U;
 enum class DownloadProgressPhase : std::uint8_t {
@@ -53,6 +55,7 @@ struct DownloadResult {
     bool resumed = false;
     bool cache_hit = false;
 };
+[[nodiscard]] DownloadRequest make_download_request(const BenchmarkCacheLayout&, std::string_view, const CatalogArtifact&);
 using DownloadProgressSink = std::function<void(const DownloadProgress&)>;
 [[nodiscard]] std::vector<DownloadResult> download_artifacts(const std::vector<DownloadRequest>& requests, std::size_t maximum_concurrency,
                                                              mmltk::common::concurrency::CancellationObservation cancel_requested,

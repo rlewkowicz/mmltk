@@ -26,6 +26,18 @@
 #include "benchmark_curl.h"
 #include "detail/benchmark_download.h"
 namespace mmltk::backend::data::benchmark_internal {
+[[nodiscard]] DownloadRequest make_download_request(const BenchmarkCacheLayout& cache, const std::string_view source, const CatalogArtifact& artifact) {
+    DownloadRequest request;
+    request.artifact_id = artifact.artifact_id;
+    request.source = artifact.source;
+    request.url = artifact.url;
+    request.destination = cache.source_downloads(source) / artifact.filename;
+    request.lock_path = cache.locks / (artifact.artifact_id + ".lock");
+    request.expected_size = artifact.expected_size;
+    if (!artifact.expected_sha256.empty()) { request.expected_sha256 = artifact.expected_sha256; }
+    request.maximum_attempts = kMaximumAttempts;
+    return request;
+}
 using mmltk::common::io::errno_error;
 using mmltk::common::io::ScopedFd;
 using mmltk::common::io::sync_parent_directory;

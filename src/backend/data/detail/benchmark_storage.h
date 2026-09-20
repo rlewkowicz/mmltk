@@ -44,5 +44,6 @@ class StorageReservationPool {
     std::mutex mutex_;
     std::uint64_t reserved_ = 0U;
 };
+inline constexpr std::uint64_t kArchiveScratchBytes = 24ULL * 1024U * 1024U * 1024U;
 inline constexpr std::uint64_t kEstimatedJpegBytes = std::uint64_t{256U} * 1024U;
 }  // namespace mmltk::backend::data::benchmark_internal

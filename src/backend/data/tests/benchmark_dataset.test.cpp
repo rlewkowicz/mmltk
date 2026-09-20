@@ -1,3 +1,4 @@
+#include "detail/benchmark_annotation_cache.h"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -2221,4 +2222,37 @@ TEST_CASE("ordinary transfer observations exclude discarded bodies and settle un
     CHECK(cached.front().identity == downloaded.front().identity);
     CHECK(server.requests() == requests_before);
     server.Check();
+}
+
+TEST_CASE("annotation retries distinguish source corruption from local capacity and cancellation", "[benchmark][cache]") {
+    mmltk::testsupport::ScopedTempDir root("annotation-retry");
+    const auto source = root.path() / "complete-source";
+    const auto completion = root.path() / "complete-source.download.json";
+    mmltk::testsupport::write_text_file(source, "retained source");
+    mmltk::testsupport::write_text_file(completion, "retained completion");
+    const auto source_digest = mmltk::common::io::sha256_file(source);
+    const auto completion_digest = mmltk::common::io::sha256_file(completion);
+    const auto source_time = fs::last_write_time(source);
+    const auto completion_time = fs::last_write_time(completion);
+    std::atomic<bool> cancel{false};
+    const auto cancellation = mmltk::common::concurrency::CancellationObservation::Atomic(cancel);
+    unsigned bodies = 0, repairs = 0;
+    const auto repair = [&](const std::exception&) { ++repairs; remove_cache_path(source); remove_cache_path(completion); };
+    SECTION("typed storage exhaustion never invalidates completed source files") {
+        CHECK_THROWS_AS(retry_annotation_indexing(cancellation, [&] { ++bodies; throw InsufficientBenchmarkStorage("fixture capacity"); }, repair), InsufficientBenchmarkStorage);
+        CHECK(bodies == 1); CHECK(repairs == 0);
+    }
+    SECTION("cancellation never enters source repair") {
+        CHECK_THROWS(retry_annotation_indexing(cancellation, [&] { ++bodies; cancel = true; throw std::runtime_error("interrupted parse"); }, repair));
+        CHECK(bodies == 1); CHECK(repairs == 0);
+    }
+    SECTION("source corruption has exactly three bodies and two repairs") {
+        CHECK_THROWS(retry_annotation_indexing(cancellation, [&] { ++bodies; throw std::runtime_error("malformed source"); },
+            [&](const std::exception&) { ++repairs; }));
+        CHECK(bodies == 3); CHECK(repairs == 2);
+    }
+    REQUIRE(fs::is_regular_file(source)); REQUIRE(fs::is_regular_file(completion));
+    CHECK(fs::last_write_time(source) == source_time); CHECK(fs::last_write_time(completion) == completion_time);
+    CHECK(mmltk::common::io::sha256_file(source) == source_digest);
+    CHECK(mmltk::common::io::sha256_file(completion) == completion_digest);
 }

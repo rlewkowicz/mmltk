@@ -1,3 +1,4 @@
+#include "detail/benchmark_annotation_cache.h"
 #include "detail/coconut_annotations.h"
 #include "detail/benchmark_recipe.h"
 #include "detail/benchmark_images.h"
@@ -1410,4 +1411,167 @@ TEST_CASE("one admitted physical membership lookup serves every release without 
     CHECK(rebuilt.polls==construction_polls);
     CHECK(next.find(replacement.front().source,replacement.front().image_id)==&replacement.front());
     CHECK(membership.find(physical.front().source,physical.front().image_id)==&physical.front());
+}
+
+TEST_CASE("both stock recipes reuse normalized indexes without raw metadata or network", "[benchmark][coconut][cache]") {
+    ScopedTempDir root("stock-normalized-only"); LocalCoconutRecipe local(root.path());
+    auto custom = local_custom_catalog(local);
+    auto coconut = local.selected(CoconutValidation::Stock);
+    const auto raw = local.cache.source_downloads("coco") / custom.coco_annotations.filename;
+    remove_cache_path(raw); remove_cache_path(raw.string() + ".download.json");
+    remove_cache_path(local.cache.source_indexes("coco") / "source-json");
+    const auto index = local.cache.source_indexes("coco") / "val2017.normalized.bin";
+    const auto original_index = file_bytes(index);
+    const auto index_time = std::filesystem::last_write_time(index);
+    {
+        BenchmarkTraceSink trace;
+        ProgressReporter progress({}, trace);
+        CocoAnnotationCache stock(local.cache, coconut.stock_annotations, false, 0, 1, 1, {}, trace);
+        stock.discover(progress); CHECK_FALSE(stock.pending_download());
+        const auto admitted = stock.take_indexes(); CHECK(admitted.cache_hit);
+        CHECK(admitted.retained_storage_bytes == std::filesystem::file_size(index) + std::filesystem::file_size(index.string() + ".complete.json"));
+    }
+    BenchmarkCompilerConfig config; config.output_dir = root.path() / "compiled"; config.cache_dir = local.cache.root;
+    config.resolution = 3; config.num_workers = 1; config.overwrite = true;
+    std::array<std::string, 2> trains, validations;
+    for (unsigned pass = 0; pass < 4; ++pass) {
+        const auto enhanced = pass % 2;
+        config.selection = {enhanced ? BenchmarkDatasetVariant::Coconut : BenchmarkDatasetVariant::CocoCustom, CoconutValidation::Stock};
+        compile_benchmark_recipe(config, enhanced ? &coconut : nullptr, enhanced ? nullptr : &custom);
+        const auto train = file_bytes(config.output_dir / "train.bin"), val = file_bytes(config.output_dir / "val.bin");
+        if (pass < 2) { trains[enhanced] = train; validations[enhanced] = val; }
+        else { CHECK(train == trains[enhanced]); CHECK(val == validations[enhanced]); }
+        CHECK(file_bytes(index) == original_index); CHECK(std::filesystem::last_write_time(index) == index_time);
+        CHECK_FALSE(std::filesystem::exists(raw));
+        CHECK_FALSE(std::filesystem::exists(local.cache.source_indexes("coco") / "source-json"));
+    }
+}
+
+TEST_CASE("stock annotation owner repairs only missing splits with bounded source attempts", "[benchmark][coconut][download]") {
+    ScopedTempDir root("stock-source-recovery"); LocalCoconutRecipe local(root.path());
+    auto custom = local_custom_catalog(local);
+    const auto train_path = local.cache.source_indexes("coco") / "train2017.normalized.bin";
+    const auto train_bytes = file_bytes(train_path), train_metadata = file_bytes(train_path.string() + ".complete.json");
+    const auto train_time = std::filesystem::last_write_time(train_path);
+    const auto val_path = local.cache.source_indexes("coco") / "val2017.normalized.bin";
+    remove_cache_path(val_path); remove_cache_path(val_path.string() + ".complete.json");
+    auto artifact = custom.coco_annotations;
+    const auto raw = local.cache.source_downloads("coco") / artifact.filename;
+    bool succeeds = true;
+    SECTION("same-size malformed archive is replaced once") {
+        // Local HTTP serves the original archive; the admitted cache copy is damaged below.
+    }
+    SECTION("missing required member exhausts the three-body budget") {
+        const std::array<std::pair<std::string, std::string>, 1> rows{{{"annotations/unrelated.json", "{}"}}};
+        tar(raw, rows); succeeds = false;
+    }
+    SECTION("malformed required JSON exhausts the three-body budget") {
+        const std::array<std::pair<std::string, std::string>, 1> rows{{{"annotations/instances_val2017.json", "not JSON"}}};
+        tar(raw, rows); succeeds = false;
+    }
+    const auto served = file_bytes(raw);
+    mmltk::backend::data::testsupport::HttpServer server(std::vector<std::uint8_t>(served.begin(), served.end()));
+    artifact.url = server.url("stock-repair"); artifact.expected_size = served.size();
+    if (succeeds) mmltk::testsupport::write_text_file(raw, std::string(served.size(), 'x'));
+    unsigned diagnoses = 0;
+    BenchmarkTraceSink trace = [&](std::string_view event, const Json&) { if (event == "benchmark.download.failure_sha256") ++diagnoses; };
+    ProgressReporter progress({}, trace);
+    CocoAnnotationCache annotations(local.cache, artifact, true, 2, 1, 1, {}, trace);
+    annotations.discover(progress); REQUIRE(annotations.pending_download()); CHECK(annotations.completed_indexes() == 1);
+    auto acquired = download_artifacts({*annotations.pending_download()}, 1, {}).front();
+    CHECK(server.requests() == 0);
+    std::uint64_t completed = 1;
+    if (succeeds) {
+        annotations.settle(std::move(acquired), progress, 1, completed, 2);
+        auto indexes = annotations.take_indexes(); REQUIRE(indexes.train); REQUIRE(indexes.validation);
+        CHECK(indexes.train->images.size() == 2); CHECK(indexes.validation->images.size() == 1);
+        CHECK_FALSE(indexes.cache_hit); CHECK(completed == 2);
+        CHECK(server.requests() == 1); CHECK(diagnoses == 1);
+    } else {
+        CHECK_THROWS(annotations.settle(std::move(acquired), progress, 1, completed, 2));
+        CHECK(server.requests() == 2); CHECK(diagnoses == 2); CHECK(completed == 1);
+        CHECK_FALSE(std::filesystem::exists(val_path.string() + ".complete.json"));
+    }
+    CHECK(file_bytes(train_path) == train_bytes); CHECK(file_bytes(train_path.string() + ".complete.json") == train_metadata);
+    CHECK(std::filesystem::last_write_time(train_path) == train_time); server.Check();
+}
+
+TEST_CASE("stock annotation cancellation preserves the previous recipe publication", "[benchmark][coconut][cache]") {
+    ScopedTempDir root("stock-cancel-publication"); LocalCoconutRecipe local(root.path());
+    auto catalog = local.selected(CoconutValidation::Stock);
+    BenchmarkCompilerConfig config; config.output_dir = root.path() / "compiled"; config.cache_dir = local.cache.root;
+    config.selection = {BenchmarkDatasetVariant::Coconut, CoconutValidation::Stock};
+    config.resolution = 3; config.num_workers = 1; config.overwrite = true;
+    compile_benchmark_recipe(config, &catalog);
+    const auto train = file_bytes(config.output_dir / "train.bin"), val = file_bytes(config.output_dir / "val.bin");
+    const auto manifest = file_bytes(config.output_dir / "benchmark_manifest.json");
+    const auto index = local.cache.source_indexes("coco") / "val2017.normalized.bin";
+    remove_cache_path(index); remove_cache_path(index.string() + ".complete.json");
+    std::atomic<bool> cancel{false}; config.cancel_requested = mmltk::common::concurrency::CancellationObservation::Atomic(cancel);
+    config.progress = [&](const auto& value) { if (value.activity == "Parsing and indexing COCO validation annotations") cancel = true; };
+    CHECK_THROWS(compile_benchmark_recipe(config, &catalog));
+    CHECK(cancel.load()); CHECK_FALSE(std::filesystem::exists(index.string() + ".complete.json"));
+    CHECK(file_bytes(config.output_dir / "train.bin") == train); CHECK(file_bytes(config.output_dir / "val.bin") == val);
+    CHECK(file_bytes(config.output_dir / "benchmark_manifest.json") == manifest);
+}
+
+TEST_CASE("both stock recipes repair malformed admitted archives through their production entry", "[benchmark][coconut][download]") {
+    ScopedTempDir root("stock-recipe-repair"); LocalCoconutRecipe local(root.path());
+    auto custom = local_custom_catalog(local);
+    auto coconut = local.selected(CoconutValidation::Stock);
+    bool enhanced = false;
+    SECTION("Coco custom") {}
+    SECTION("Coconut Stock") { enhanced = true; }
+    const auto val = local.cache.source_indexes("coco") / "val2017.normalized.bin";
+    remove_cache_path(val); remove_cache_path(val.string() + ".complete.json");
+    const auto raw = local.cache.source_downloads("coco") / custom.coco_annotations.filename;
+    const auto served = file_bytes(raw);
+    mmltk::backend::data::testsupport::HttpServer server(std::vector<std::uint8_t>(served.begin(), served.end()));
+    custom.coco_annotations.url = server.url("stock-production"); coconut.stock_annotations.url = custom.coco_annotations.url;
+    mmltk::testsupport::write_text_file(raw, std::string(served.size(), 'x'));
+    BenchmarkCompilerConfig config; config.output_dir = root.path() / "compiled"; config.cache_dir = local.cache.root;
+    config.selection = {enhanced ? BenchmarkDatasetVariant::Coconut : BenchmarkDatasetVariant::CocoCustom, CoconutValidation::Stock};
+    config.resolution = 3; config.num_workers = 1;
+    compile_benchmark_recipe(config, enhanced ? &coconut : nullptr, enhanced ? nullptr : &custom);
+    const auto compiled = CompiledDataset::open(config.output_dir / "val.bin");
+    REQUIRE(compiled.image_entries().size() == 1); CHECK(compiled.image_entry(0).source_image_id == 9);
+    CHECK(compiled.image_entry(0).source == AnnotationSource::Coco);
+    CHECK(server.requests() == 1); CHECK(file_bytes(raw) == served); server.Check();
+}
+
+TEST_CASE("one stock request builds both splits and retains newly settled train during validation repair", "[benchmark][coconut][download]") {
+    ScopedTempDir root("stock-both-splits"); LocalCoconutRecipe local(root.path());
+    auto custom = local_custom_catalog(local);
+    const auto train = local.cache.source_indexes("coco") / "train2017.normalized.bin";
+    const auto val = local.cache.source_indexes("coco") / "val2017.normalized.bin";
+    remove_cache_path(train); remove_cache_path(train.string() + ".complete.json");
+    remove_cache_path(val); remove_cache_path(val.string() + ".complete.json");
+    const auto raw = local.cache.source_downloads("coco") / custom.coco_annotations.filename;
+    const auto training_json = file_bytes(local.cache.source_indexes("coco") / "train2017.fixture.json");
+    const auto validation_json = file_bytes(local.cache.source_indexes("coco") / "val2017.fixture.json");
+    const std::array<std::pair<std::string, std::string>, 2> valid{{{"annotations/instances_train2017.json", training_json},
+        {"annotations/instances_val2017.json", validation_json}}};
+    tar(raw, valid); const auto served = file_bytes(raw);
+    mmltk::backend::data::testsupport::HttpServer server(std::vector<std::uint8_t>(served.begin(), served.end()));
+    auto malformed = valid; malformed[1].second = "not JSON";
+    tar(raw, malformed);
+    custom.coco_annotations.expected_size = 0; custom.coco_annotations.url = server.url("both-stock-splits");
+    BenchmarkTraceSink trace;
+    std::string settled_train, settled_metadata;
+    ProgressReporter progress([&](const auto& update) {
+        if (update.activity == "Extracting COCO validation annotations" && settled_train.empty()) {
+            settled_train = file_bytes(train); settled_metadata = file_bytes(train.string() + ".complete.json");
+        }
+    }, trace);
+    CocoAnnotationCache cache(local.cache, custom.coco_annotations, true, 2, 1, 1, {}, trace);
+    cache.discover(progress); CHECK(cache.completed_indexes() == 0); REQUIRE(cache.pending_download());
+    auto acquired = download_artifacts({*cache.pending_download()}, 1, {}).front();
+    CHECK(server.requests() == 0);
+    std::uint64_t completed = 0;
+    cache.settle(std::move(acquired), progress, 1, completed, 2);
+    auto indexes = cache.take_indexes(); REQUIRE(indexes.train); REQUIRE(indexes.validation);
+    REQUIRE_FALSE(settled_train.empty()); CHECK(file_bytes(train) == settled_train);
+    CHECK(file_bytes(train.string() + ".complete.json") == settled_metadata);
+    CHECK(indexes.train->images.size() == 2); CHECK(indexes.validation->images.size() == 1);
+    CHECK(completed == 2); CHECK(server.requests() == 1); server.Check();
 }
