@@ -198,13 +198,13 @@ TEST_CASE("ONNX graph capture permits independent worker allocation and retains 
     REQUIRE(cudaMemcpy(&actual, output.as<void>(), sizeof(actual), cudaMemcpyDeviceToHost) == cudaSuccess);
     CHECK(actual == expected);
 }
+// CLEANUP-OFF: Test admission, context reporting and a namespace alias only; CUDA setup is shared by select_cuda_test_device.
 TEST_CASE("Direct neural tile preparation preserves FP32 lookup decisions and pitched crop borders", "[upscale_gpu]") {
     if (mmltk::testsupport::checked_cuda_device_count() == 0) SKIP("CUDA device unavailable");
-    REQUIRE(cudaSetDevice(0) == cudaSuccess);
-    cudaDeviceProp device{};
-    REQUIRE(cudaGetDeviceProperties(&device, 0) == cudaSuccess);
-    INFO("CUDA device 0: " << device.name << ", CC " << device.major << '.' << device.minor);
+    const auto device = mmltk::testsupport::select_cuda_test_device(0);
+    INFO(device);
     namespace tiles = mmltk::backend::imaging::upscale::image_upscaler_cuda;
+    // CLEANUP-ON
     const auto width = GENERATE(1U, 3U, 19U, 257U);
     const auto height = GENERATE(1U, 5U);
     const bool lut = GENERATE(false, true);
@@ -256,10 +256,8 @@ TEST_CASE("Direct neural tile preparation preserves FP32 lookup decisions and pi
 }
 TEST_CASE("Direct tile stitching preserves rounding ties alpha seams and pitched guard bytes", "[upscale_gpu]") {
     if (mmltk::testsupport::checked_cuda_device_count() == 0) SKIP("CUDA device unavailable");
-    REQUIRE(cudaSetDevice(0) == cudaSuccess);
-    cudaDeviceProp device{};
-    REQUIRE(cudaGetDeviceProperties(&device, 0) == cudaSuccess);
-    INFO("CUDA device 0: " << device.name << ", CC " << device.major << '.' << device.minor);
+    const auto device = mmltk::testsupport::select_cuda_test_device(0);
+    INFO(device);
     namespace tiles = mmltk::backend::imaging::upscale::image_upscaler_cuda;
     const bool lut = GENERATE(false, true);
     const auto width = GENERATE(1U, 3U, 19U, 196U, 257U, 1028U);
@@ -306,10 +304,8 @@ TEST_CASE("Direct tile stitching preserves rounding ties alpha seams and pitched
 }
 TEST_CASE("Resident ShiftLUT tiled RGBA matches independent upstream oracles across graph replay and capacity changes", "[upscale_gpu]") {
     if (mmltk::testsupport::checked_cuda_device_count() == 0) SKIP("CUDA device unavailable");
-    REQUIRE(cudaSetDevice(0) == cudaSuccess);
-    cudaDeviceProp device{};
-    REQUIRE(cudaGetDeviceProperties(&device, 0) == cudaSuccess);
-    INFO("CUDA device 0: " << device.name << ", CC " << device.major << '.' << device.minor);
+    const auto device = mmltk::testsupport::select_cuda_test_device(0);
+    INFO(device);
     namespace tiles = mmltk::backend::imaging::upscale::image_upscaler_cuda;
     namespace lut = mmltk::backend::imaging::upscale::shiftlut;
     const bool graph = GENERATE(false, true);

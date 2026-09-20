@@ -25,10 +25,8 @@ TEST_CASE("Basic selected sharpening matches independent dual-direction arithmet
     namespace nis = mmltk::backend::imaging::upscale::image_upscaler_nis;
     namespace reference = mmltk::backend::imaging::upscale::tests;
     if (mmltk::testsupport::checked_cuda_device_count() == 0) SKIP("CUDA device unavailable");
-    REQUIRE(cudaSetDevice(0) == cudaSuccess);
-    cudaDeviceProp device{};
-    REQUIRE(cudaGetDeviceProperties(&device, 0) == cudaSuccess);
-    INFO("CUDA device 0: " << device.name << ", CC " << device.major << '.' << device.minor);
+    const auto device = mmltk::testsupport::select_cuda_test_device(0);
+    INFO(device);
     const auto output_width = GENERATE(1U, 3U, 19U, 257U);
     const auto output_height = GENERATE(1U, 5U);
     const bool cropped = GENERATE(false, true);

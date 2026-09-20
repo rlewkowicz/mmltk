@@ -44,6 +44,16 @@ void apply_gesture(subsystems::annotation::AnnotationDocument& editor, Annotatio
     pointer.point = end;
     REQUIRE(editor.Pointer(pointer).outcome == subsystems::annotation::DocumentOutcome::Applied);
 }
+[[nodiscard]] contracts::AnnotationSceneContent save_and_read_scene(subsystems::annotation::AnnotationDocument& editor, const std::filesystem::path& path) {
+    REQUIRE(editor.Save(path.string()).outcome == subsystems::annotation::DocumentOutcome::Applied);
+    std::ifstream file{path, std::ios::binary};
+    const std::vector<char> characters{std::istreambuf_iterator<char>{file}, std::istreambuf_iterator<char>{}};
+    auto decoded = mmltk::frameworks::serialization::decode<contracts::AnnotationUiState>(
+        {.first = std::as_bytes(std::span{characters})},
+        {.max_bytes = contracts::kAnnotationUiStateByteBudget, .max_items = contracts::kAnnotationUiStateByteBudget});
+    REQUIRE(decoded.has_value());
+    return std::move(decoded->scene);
+}
 TEST_CASE("Native Annotation hit testing owns tool targets and selected handle precedence") {
     namespace document = subsystems::annotation;
     using Tool = contracts::AnnotationTool;
@@ -446,14 +456,7 @@ TEST_CASE("Viewed masks import full catalogs and retain editable runs through hi
     const auto saved_scene = editor.ui().scene;
     mmltk::testsupport::ScopedTempDir directory{"annotation-mask"};
     const auto path = directory.path() / "document.cbor";
-    REQUIRE(editor.Save(path.string()).outcome == document::DocumentOutcome::Applied);
-    std::ifstream file{path, std::ios::binary};
-    const std::vector<char> characters{std::istreambuf_iterator<char>{file}, std::istreambuf_iterator<char>{}};
-    const auto bytes = std::as_bytes(std::span{characters});
-    const auto decoded = mmltk::frameworks::serialization::decode<contracts::AnnotationUiState>(
-        {.first = bytes}, {.max_bytes = contracts::kAnnotationUiStateByteBudget, .max_items = contracts::kAnnotationUiStateByteBudget});
-    REQUIRE(decoded.has_value());
-    CHECK(decoded->scene == saved_scene);
+    CHECK(save_and_read_scene(editor, path) == saved_scene);
     CHECK(editor.Save((directory.path() / "absent" / "document.cbor").string()).outcome == document::DocumentOutcome::Rejected);
     CHECK(editor.ui().scene == saved_scene);
 }
@@ -607,14 +610,7 @@ TEST_CASE("Annotation journal moves retain complete payloads and restore stored 
         const auto saved = editor.ui().scene;
         mmltk::testsupport::ScopedTempDir directory{"annotation-journal"};
         const auto path = directory.path() / "document.cbor";
-        REQUIRE(editor.Save(path.string()).outcome == d::DocumentOutcome::Applied);
-        std::ifstream file{path, std::ios::binary};
-        const std::vector<char> characters{std::istreambuf_iterator<char>{file}, std::istreambuf_iterator<char>{}};
-        const auto decoded = mmltk::frameworks::serialization::decode<domain::AnnotationUiState>(
-            {.first = std::as_bytes(std::span{characters})},
-            {.max_bytes = domain::kAnnotationUiStateByteBudget, .max_items = domain::kAnnotationUiStateByteBudget});
-        REQUIRE(decoded.has_value());
-        CHECK(decoded->scene == saved);
+        CHECK(c::save_and_read_scene(editor, path) == saved);
         REQUIRE(editor.Edit({.value = c::AnnotationObjectEdit{0U}}).outcome == d::DocumentOutcome::Applied);
         REQUIRE(editor.Edit({.value = c::AnnotationSelectedObjectEdit{0U, true}}).outcome == d::DocumentOutcome::Applied);
         CHECK_FALSE(editor.ui().can_redo);

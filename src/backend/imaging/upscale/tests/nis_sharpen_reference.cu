@@ -29,6 +29,7 @@ __global__ void fixture_pixels(HalfRgba* scaled, Configuration config, unsigned 
 }
 // Independent numerical oracle: the reviewed six-tap chains are both
 // evaluated before gradient selection. Do not share production sharpening.
+// CLEANUP-IGNORE: Independent numerical oracle retains original alpha-coordinate arithmetic; sharing production code would invalidate the comparison.
 __device__ __forceinline__ std::uint32_t nearest_source_coordinate(const std::uint32_t output_coordinate, const std::uint32_t crop_extent,
                                                                    const std::uint32_t output_extent) {
     const std::uint64_t centered = static_cast<std::uint64_t>(output_coordinate) * crop_extent + crop_extent / 2U;
@@ -49,6 +50,7 @@ __device__ __forceinline__ HalfRgba load_clamped(const HalfRgba* pixels, const C
 __global__ void dual_direction_kernel(const void* source, const std::size_t source_pitch, const HalfRgba* scaled, std::uint8_t* target,
                                       const std::size_t target_pitch, const Configuration config) {
     const std::uint64_t index = static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    // CLEANUP-IGNORE: Independent dual-direction oracle retains original pixel and neighbor selection; do not share production sharpening.
     const std::uint64_t total = static_cast<std::uint64_t>(config.output_width) * config.output_height;
     if (index >= total) return;
     const std::uint32_t x = static_cast<std::uint32_t>(index % config.output_width);
@@ -85,6 +87,7 @@ __global__ void dual_direction_kernel(const void* source, const std::size_t sour
         fabsf(0.2126F * (__half2float(top.red) - __half2float(bottom.red)) + 0.7152F * (__half2float(top.green) - __half2float(bottom.green)) +
               0.0722F * (__half2float(top.blue) - __half2float(bottom.blue)));
     const float3 detail = horizontal_gradient <= vertical_gradient ? horizontal : vertical;
+    // CLEANUP-IGNORE: Independent numerical oracle retains original output arithmetic and rounding; production sharing would make byte equivalence circular.
     const float magnitude = fabsf(fmaf(0.2126F, detail.x, fmaf(0.7152F, detail.y, 0.0722F * detail.z)));
     const float strength = 0.18F + 0.16F * fminf(1.0F, magnitude * 8.0F);
     const float4 color = make_float4(fmaf(strength, detail.x, __half2float(center.red)), fmaf(strength, detail.y, __half2float(center.green)),

@@ -4,6 +4,7 @@
 #include <expected>
 #include <cstdio>
 #include <cstdlib>
+#include <string>
 namespace mmltk::testsupport {
 class ScopedTestStream final {
    public:
@@ -28,6 +29,12 @@ class ScopedTestStream final {
     INFO("cudaGetDeviceCount status=" << static_cast<int>(status) << ", count=" << count);
     REQUIRE(result.has_value());
     return *result;
+}
+[[nodiscard]] inline std::string select_cuda_test_device(const int ordinal) {
+    REQUIRE(cudaSetDevice(ordinal) == cudaSuccess);
+    cudaDeviceProp device{};
+    REQUIRE(cudaGetDeviceProperties(&device, ordinal) == cudaSuccess);
+    return "CUDA device " + std::to_string(ordinal) + ": " + device.name + ", CC " + std::to_string(device.major) + '.' + std::to_string(device.minor);
 }
 // These checks may run on worker threads, where Catch assertions are disabled.
 // Preserve the operation text and the existing process-abort failure policy.

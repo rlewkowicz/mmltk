@@ -55,17 +55,24 @@ using namespace visual_test_support;
 using mmltk::frameworks::gpu::test_support::FakeImageBackend;
 using mmltk::frameworks::gpu::test_support::RuntimeFactory;
 using namespace std::chrono_literals;
-struct ReferenceEnvironment final {
-    std::optional<std::string> prior;
+class ReferenceEnvironment final {
+   public:
     ReferenceEnvironment() {
         if (const auto* value = std::getenv("MMLTK_UPSCALE_ONNX_REFERENCE")) prior = value;
     }
+    explicit ReferenceEnvironment(bool reference) : ReferenceEnvironment() { Set(reference); }
     ~ReferenceEnvironment() {
         if (prior)
             static_cast<void>(::setenv("MMLTK_UPSCALE_ONNX_REFERENCE", prior->c_str(), 1));
         else
             static_cast<void>(::unsetenv("MMLTK_UPSCALE_ONNX_REFERENCE"));
     }
+    ReferenceEnvironment(const ReferenceEnvironment&) = delete;
+    ReferenceEnvironment& operator=(const ReferenceEnvironment&) = delete;
+    void Set(bool reference) { REQUIRE(::setenv("MMLTK_UPSCALE_ONNX_REFERENCE", reference ? "1" : "0", 1) == 0); }
+
+   private:
+    std::optional<std::string> prior;
 };
 class FailingUpscaleAlgorithm final : public UpscaleAlgorithm {
    public:
@@ -827,7 +834,7 @@ TEST_CASE("Upscale CUDA tile replay preserves reference pixels and pitched recei
     auto* pixels = static_cast<std::uint8_t*>(staging->data());
     std::array<std::vector<std::uint8_t>, 6U> reference;
     for (const bool reference_run : {true, false}) {
-        REQUIRE(::setenv("MMLTK_UPSCALE_ONNX_REFERENCE", reference_run ? "1" : "0", 1) == 0);
+        environment.Set(reference_run);
         using Stage = mmltk::backend::imaging::upscale::ImageUpscalerExecutionStage;
         std::size_t tensor_allocations = 0U;
         std::size_t model_constructions = 0U;
@@ -976,8 +983,7 @@ TEST_CASE("Native warm purpose retains full extent and provider readiness with o
     const auto method = GENERATE(UpscaleKernel::Default, UpscaleKernel::ShiftLut, UpscaleKernel::RealPlksr);
     const VisualExtent extent{GENERATE(8U, 225U, 449U), 5U};
     const bool reference_run = GENERATE(false, true);
-    ReferenceEnvironment environment;
-    REQUIRE(::setenv("MMLTK_UPSCALE_ONNX_REFERENCE", reference_run ? "1" : "0", 1) == 0);
+    ReferenceEnvironment environment{reference_run};
     std::array<unsigned, static_cast<std::size_t>(Stage::Count)> counts{};
     auto runtime = make_native_upscale_runtime_factory(
         kDevice, [&](Stage stage) { ++counts[static_cast<std::size_t>(stage)]; })(std::make_shared<ImageProductRevisionSequence>());
@@ -1065,8 +1071,7 @@ TEST_CASE("ONNX ordinary inference leaves proactive readiness to an explicit war
     using Stage = mmltk::backend::imaging::upscale::ImageUpscalerExecutionStage;
     using namespace mmltk::frameworks::gpu;
     const bool reference_run = GENERATE(false, true);
-    ReferenceEnvironment environment;
-    REQUIRE(::setenv("MMLTK_UPSCALE_ONNX_REFERENCE", reference_run ? "1" : "0", 1) == 0);
+    ReferenceEnvironment environment{reference_run};
     unsigned inferences = 0U, preparations = 0U, stitches = 0U;
     auto runtime = make_native_upscale_runtime_factory(kDevice, [&](Stage stage) {
         if (stage == Stage::WarmSubmitted) ++inferences;
@@ -1085,12 +1090,13 @@ TEST_CASE("ONNX ordinary inference leaves proactive readiness to an explicit war
     CHECK(stitches == 2U);
     CHECK(dynamic_cast<UpscaleAlgorithm*>(runtime->model())->GraphReplay(UpscaleKernel::ShiftLut) == !reference_run);
 }
+// CLEANUP-OFF: Test admission and scoped environment construction only; the shared environment behavior is owned by ReferenceEnvironment.
 TEST_CASE("ONNX first-capture fallback keeps warm execution to one image and disables readiness retries", "[upscale_gpu]") {
     if (!has_cuda_device()) SKIP("CUDA device unavailable");
     using Stage = mmltk::backend::imaging::upscale::ImageUpscalerExecutionStage;
     using namespace mmltk::frameworks::gpu;
-    ReferenceEnvironment environment;
-    REQUIRE(::setenv("MMLTK_UPSCALE_ONNX_REFERENCE", "0", 1) == 0);
+    ReferenceEnvironment environment{false};
+    // CLEANUP-ON
     bool reject = true;
     unsigned inferences = 0U, preparations = 0U, stitches = 0U, buffers = 0U;
     auto runtime = make_native_upscale_runtime_factory(kDevice, [&](Stage stage) {
@@ -1123,8 +1129,7 @@ TEST_CASE("ONNX warm readiness withdrawal settles its final bound tile before re
     if (!has_cuda_device()) SKIP("CUDA device unavailable");
     using Stage = mmltk::backend::imaging::upscale::ImageUpscalerExecutionStage;
     using namespace mmltk::frameworks::gpu;
-    ReferenceEnvironment environment;
-    REQUIRE(::setenv("MMLTK_UPSCALE_ONNX_REFERENCE", "0", 1) == 0);
+    ReferenceEnvironment environment{false};
     const unsigned occurrence = GENERATE(2U, 3U);
     bool current = true;
     unsigned inferences = 0U, preparations = 0U, stitches = 0U, contexts = 0U;
@@ -1324,12 +1329,14 @@ TEST_CASE("Native method failures are classified at the actual activation comple
     REQUIRE(scenario.events.Wait([&] { return scenario.upscale.snapshot().ready && !scenario.upscale.snapshot().busy; }, 120s));
     CHECK_FALSE(scenario.upscale.snapshot().methods[1U].initialization_failed);
 }
+// CLEANUP-OFF: Test preamble only; physical/current select failure kind and demand, unlike release_failure/armed.
 TEST_CASE("Native withdrawal does not erase a concurrently reported method failure", "[upscale_gpu]") {
     if (!has_cuda_device()) SKIP("CUDA device unavailable");
     using Stage = mmltk::backend::imaging::upscale::ImageUpscalerExecutionStage;
     using namespace mmltk::frameworks::gpu;
     const bool physical = GENERATE(false, true);
     bool current = true;
+    // CLEANUP-ON
     auto runtime = make_native_upscale_runtime_factory(kDevice, [&](Stage stage) {
         if (stage == Stage::WarmSubmitted && std::exchange(current, false))
             throw CudaError(physical ? cudaErrorContained : cudaErrorMemoryAllocation, "method failure concurrent with withdrawal");
