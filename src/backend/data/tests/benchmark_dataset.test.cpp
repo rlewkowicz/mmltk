@@ -28,6 +28,7 @@
 #include <string_view>
 #include <sys/file.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <thread>
 #include <unistd.h>
 #include <vector>
@@ -944,8 +945,9 @@ TEST_CASE("benchmark cache roots share explicit environment and relative precede
     write_text(retained, "existing cached bytes");
     const auto retained_digest = mmltk::common::io::sha256_file(retained);
     const auto retained_time = fs::last_write_time(retained);
-    std::atomic<bool> cancelled{true};
+    std::atomic<bool> cancelled{false};
     config.cancel_requested = mmltk::common::concurrency::CancellationObservation::Atomic(cancelled);
+    config.progress = [&](const BenchmarkCompileProgress&) { cancelled.store(true); };
     nlohmann::json paths;
     std::size_t path_reports = 0U;
     config.trace = [&](const std::string_view event, const std::string_view fields) {
@@ -969,6 +971,77 @@ TEST_CASE("benchmark cache roots share explicit environment and relative precede
     CHECK_FALSE(paths.at("output_root_truncated").get<bool>());
     CHECK(mmltk::common::io::sha256_file(retained) == retained_digest);
     CHECK(fs::last_write_time(retained) == retained_time);
+}
+TEST_CASE("benchmark publication admission preserves separate physical output and retained files", "[backend][data][benchmark][cache]") {
+    mmltk::testsupport::ScopedTempDir root{"benchmark-publication-admission"};
+    const auto publication = root.path() / "compiled";
+    auto cache = root.path() / "cache";
+    BenchmarkCompilerConfig config;
+    config.output_dir = root.path() / "compiled.tmp.fixture";
+    config.publication_dir = publication;
+    config.resolution = 1U;
+    config.num_workers = 1;
+    config.overwrite = true;
+    bool overlap = true;
+    SECTION("disjoint publication remains admitted") { overlap = false; }
+    SECTION("cache equals final output") { cache = publication; }
+    SECTION("cache lies below final output") { cache = publication / "cache"; }
+    SECTION("final output lies below cache") { config.publication_dir = cache / "compiled"; }
+    SECTION("relative final alias resolves before admission") {
+        cache = publication;
+        config.publication_dir = fs::relative(root.path(), fs::current_path()) / "unused/../compiled";
+    }
+    SECTION("symlink final alias resolves before admission") {
+        fs::create_directories(cache);
+        fs::create_directory_symlink(cache, publication);
+    }
+    SECTION("symlink cache alias resolves before admission") {
+        fs::create_directories(publication);
+        fs::create_directory_symlink(publication, cache);
+    }
+    config.cache_dir = cache;
+    const auto final_output = fs::weakly_canonical(fs::absolute(config.publication_dir));
+    const std::array retained{cache / "retained.fixture", final_output / "train.bin"};
+    std::array<struct stat, 2U> before{};
+    for (std::size_t index = 0; index < retained.size(); ++index) {
+        write_text(retained[index], "retained bytes");
+        REQUIRE(::stat(retained[index].c_str(), &before[index]) == 0);
+    }
+    std::atomic<bool> cancelled{false};
+    config.cancel_requested = mmltk::common::concurrency::CancellationObservation::Atomic(cancelled);
+    config.progress = [&](const BenchmarkCompileProgress&) { cancelled.store(true); };
+    CHECK_THROWS_WITH(compile_benchmark_dataset(config), overlap ? "benchmark output and cache directories must not overlap"
+                                                                : "benchmark dataset compilation cancelled");
+    CHECK(cancelled.load());
+    CHECK_FALSE(fs::exists(config.output_dir));
+    CHECK(fs::exists(cache / "downloads") == !overlap);
+    for (std::size_t index = 0; index < retained.size(); ++index) {
+        struct stat after{};
+        REQUIRE(::stat(retained[index].c_str(), &after) == 0);
+        CHECK(after.st_ino == before[index].st_ino);
+        CHECK(after.st_mtim.tv_sec == before[index].st_mtim.tv_sec);
+        CHECK(after.st_mtim.tv_nsec == before[index].st_mtim.tv_nsec);
+        std::ifstream bytes{retained[index]};
+        CHECK(std::string(std::istreambuf_iterator<char>{bytes}, {}) == "retained bytes");
+    }
+}
+TEST_CASE("benchmark overlap admission leaves an absent publication destination absent", "[backend][data][benchmark][cache]") {
+    mmltk::testsupport::ScopedTempDir root{"benchmark-absent-publication"};
+    BenchmarkCompilerConfig config;
+    config.publication_dir = root.path() / "compiled";
+    config.output_dir = config.publication_dir / "compiled.tmp.fixture";
+    config.cache_dir = config.publication_dir / "cache";
+    config.resolution = 1U;
+    config.num_workers = 1;
+    std::atomic<bool> cancelled{false};
+    config.cancel_requested = mmltk::common::concurrency::CancellationObservation::Atomic(cancelled);
+    config.progress = [&](const BenchmarkCompileProgress&) { cancelled.store(true); };
+    REQUIRE_FALSE(fs::exists(config.publication_dir));
+    CHECK_THROWS_WITH(compile_benchmark_dataset(config), "benchmark output and cache directories must not overlap");
+    CHECK(cancelled.load());
+    CHECK_FALSE(fs::exists(config.publication_dir));
+    CHECK_FALSE(fs::exists(config.output_dir));
+    CHECK_FALSE(fs::exists(config.cache_dir));
 }
 TEST_CASE("benchmark path traces bound escaped native bytes without changing admission", "[backend][data][benchmark][trace]") {
     mmltk::testsupport::ScopedTempDir root{"benchmark-path-encoding"};

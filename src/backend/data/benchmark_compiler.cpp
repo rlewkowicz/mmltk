@@ -819,15 +819,15 @@ void compile_benchmark_dataset(BenchmarkCompilerConfig config) {
     config.output_dir = std::filesystem::absolute(config.output_dir).lexically_normal();
     if (config.output_dir == config.output_dir.root_path()) { throw std::runtime_error("benchmark output directory must not be the filesystem root"); }
     const std::filesystem::path output_parent = config.output_dir.parent_path().empty() ? std::filesystem::path{"."} : config.output_dir.parent_path();
-    progress.activity("Preparing benchmark output directory");
-    std::filesystem::create_directories(output_parent);
-    progress.activity("Preparing benchmark cache");
     if (config.cache_dir.empty()) {
         if (const char* root = std::getenv("MMLTK_BENCHMARK_DATASET_CACHE_ROOT"); root != nullptr && root[0] != '\0') { config.cache_dir = root; }
     }
     if (config.cache_dir.empty()) { config.cache_dir = "./.cache/benchmark-dataset/v1"; }
     const std::filesystem::path normalized_cache_root = std::filesystem::weakly_canonical(std::filesystem::absolute(config.cache_dir));
     const std::filesystem::path normalized_output = std::filesystem::weakly_canonical(config.output_dir);
+    const std::filesystem::path normalized_publication =
+        config.publication_dir.empty() ? normalized_output
+                                       : std::filesystem::weakly_canonical(std::filesystem::absolute(config.publication_dir).lexically_normal());
     trace_benchmark_event(trace, "benchmark.compile.paths", [&] {
         const TracePath cache_path = project_trace_path(normalized_cache_root.native());
         const TracePath output_path = project_trace_path(normalized_output.native());
@@ -838,9 +838,13 @@ void compile_benchmark_dataset(BenchmarkCompilerConfig config) {
                               {"cache_root_utf8_replaced", cache_path.utf8_replaced},
                               {"output_root_utf8_replaced", output_path.utf8_replaced}};
     });
-    if (path_contains(normalized_cache_root, normalized_output) || path_contains(normalized_output, normalized_cache_root)) {
+    if (path_contains(normalized_cache_root, normalized_output) || path_contains(normalized_output, normalized_cache_root) ||
+        path_contains(normalized_cache_root, normalized_publication) || path_contains(normalized_publication, normalized_cache_root)) {
         throw std::runtime_error("benchmark output and cache directories must not overlap");
     }
+    progress.activity("Preparing benchmark output directory");
+    std::filesystem::create_directories(output_parent);
+    progress.activity("Preparing benchmark cache");
     const BenchmarkCacheLayout cache = BenchmarkCacheLayout::create(normalized_cache_root);
     progress.activity("Waiting for benchmark output lock");
     ArtifactLease output_lease = ArtifactLease::acquire(

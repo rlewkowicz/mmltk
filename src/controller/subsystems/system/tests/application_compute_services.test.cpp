@@ -267,6 +267,7 @@ TEST_CASE("artifact benchmark compilation uses the environment cache and retires
     }};
     fs::create_directories(temporary.path() / "working");
     fs::current_path(temporary.path() / "working");
+    const auto output = temporary.path() / "compiled";
     auto cache = temporary.path() / "source-cache";
     bool overlap = false;
     SECTION("cancellation before annotation acquisition preserves the environment cache") {}
@@ -274,13 +275,36 @@ TEST_CASE("artifact benchmark compilation uses the environment cache and retires
         cache = temporary.path();
         overlap = true;
     }
+    SECTION("cache equals final output while staging is a sibling") {
+        cache = output;
+        overlap = true;
+    }
+    SECTION("cache lies below final output while staging is a sibling") {
+        cache = output / "cache";
+        overlap = true;
+    }
+    SECTION("relative cache alias equals final output") {
+        cache = "../compiled";
+        overlap = true;
+    }
+    SECTION("symlink cache alias equals final output") {
+        fs::create_directories(output);
+        fs::create_directory_symlink(output, cache);
+        overlap = true;
+    }
+    SECTION("symlink final output lies below cache while staging is a sibling") {
+        fs::create_directories(cache / "published");
+        fs::create_directory_symlink(cache / "published", output);
+        overlap = true;
+    }
     REQUIRE(::setenv("MMLTK_BENCHMARK_DATASET_CACHE_ROOT", cache.c_str(), 1) == 0);
     const auto retained = cache / "downloads/coco/retained.fixture";
-    const auto output = temporary.path() / "compiled";
     mmltk::testsupport::write_text_file(retained, "existing cached fixture");
     mmltk::testsupport::write_text_file(output / "train.bin", "existing published fixture");
     struct stat before{};
     REQUIRE(::stat(retained.c_str(), &before) == 0);
+    struct stat published_before{};
+    REQUIRE(::stat((output / "train.bin").c_str(), &published_before) == 0);
     ArtifactCancellationFixture cancellation;
     struct Observations final {
         mutable std::string paths;
@@ -332,6 +356,11 @@ TEST_CASE("artifact benchmark compilation uses the environment cache and retires
     CHECK(after.st_mtim.tv_nsec == before.st_mtim.tv_nsec);
     std::ifstream cached{retained};
     CHECK(std::string(std::istreambuf_iterator<char>{cached}, {}) == "existing cached fixture");
+    struct stat published_after{};
+    REQUIRE(::stat((output / "train.bin").c_str(), &published_after) == 0);
+    CHECK(published_after.st_ino == published_before.st_ino);
+    CHECK(published_after.st_mtim.tv_sec == published_before.st_mtim.tv_sec);
+    CHECK(published_after.st_mtim.tv_nsec == published_before.st_mtim.tv_nsec);
     std::ifstream published{output / "train.bin"};
     CHECK(std::string(std::istreambuf_iterator<char>{published}, {}) == "existing published fixture");
 }

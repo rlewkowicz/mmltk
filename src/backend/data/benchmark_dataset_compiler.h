@@ -46,6 +46,9 @@ using BenchmarkTraceCallback = std::function<void(std::string_view event, std::s
 [[nodiscard]] std::string format_benchmark_source_status(const BenchmarkSourceProgress& progress, std::string_view default_status);
 struct BenchmarkCompilerConfig {
     std::filesystem::path output_dir{"./compiled"};
+    // Optional final destination for callers that publish output_dir elsewhere.
+    // Used only for cache overlap admission; empty means output_dir.
+    std::filesystem::path publication_dir;
     std::filesystem::path cache_dir;
     std::uint32_t resolution = 432;
     int num_workers = -1;

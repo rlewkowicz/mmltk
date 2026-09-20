@@ -98,12 +98,13 @@ contracts::ArtifactProgress project_artifact_progress(const mmltk::backend::data
 namespace {
 class RuntimeArtifactCompilerOperations final : public ArtifactCompilerOperations {
    private:
-    void compile_benchmark(const std::filesystem::path& output, const std::uint32_t resolution, const bool perceptual_downscale,
-                           const mmltk::backend::imaging::resample::ImageResizeMode resize_mode,
+    void compile_benchmark(const std::filesystem::path& output, const std::filesystem::path& publication, const std::uint32_t resolution,
+                           const bool perceptual_downscale, const mmltk::backend::imaging::resample::ImageResizeMode resize_mode,
                            const mmltk::common::concurrency::CancellationObservation cancellation, const ArtifactProgressObserver progress,
                            const ArtifactBenchmarkTraceObserver trace) const override {
         mmltk::backend::data::BenchmarkCompilerConfig configuration;
         configuration.output_dir = output;
+        configuration.publication_dir = publication;
         configuration.resolution = resolution;
         configuration.perceptual_downscale = perceptual_downscale;
         configuration.resize_mode = resize_mode;
@@ -366,7 +367,7 @@ ArtifactCompileResult ArtifactStore::compile(const ArtifactCompileRequest& reque
                 break;
             case ArtifactCompileKind::Benchmark: {
                 const ArtifactBenchmarkTraceObserver trace = diagnostics.benchmark;
-                compiler_operations_->compile_benchmark(staging.path(), request.resolution, request.perceptual_downscale, request.resize_mode,
+                compiler_operations_->compile_benchmark(staging.path(), request.output, request.resolution, request.perceptual_downscale, request.resize_mode,
                                                         cancellation_observation, progress, trace);
                 break;
             }

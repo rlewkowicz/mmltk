@@ -26,12 +26,18 @@ class UnusedWeightOperations final : public services::ArtifactWeightOperations {
                   services::ArtifactWeightProgressObserver) const override {}
 };
 class DiagnosticCompiler final : public services::ArtifactCompilerOperations {
+   public:
+    mutable std::filesystem::path physical_output;
+    mutable std::filesystem::path publication_output;
+
    private:
     void compile_directory(const std::filesystem::path&, const std::filesystem::path&, std::uint32_t, bool, mmltk::backend::imaging::resample::ImageResizeMode,
                            mmltk::common::concurrency::CancellationObservation, services::ArtifactProgressObserver) const override {}
-    void compile_benchmark(const std::filesystem::path&, std::uint32_t, bool, mmltk::backend::imaging::resample::ImageResizeMode,
-                           mmltk::common::concurrency::CancellationObservation, services::ArtifactProgressObserver,
+    void compile_benchmark(const std::filesystem::path& output, const std::filesystem::path& publication, std::uint32_t, bool,
+                           mmltk::backend::imaging::resample::ImageResizeMode, mmltk::common::concurrency::CancellationObservation, services::ArtifactProgressObserver,
                            services::ArtifactBenchmarkTraceObserver trace) const override {
+        physical_output = output;
+        publication_output = publication;
         trace("benchmark.direct", R"({"records":1})");
     }
 };
@@ -53,11 +59,18 @@ TEST_CASE("artifact dataset runtime forwards only its configured diagnostics obs
     ArtifactDatasetRuntime enabled{services::ArtifactStore{root / "cache", weights, compiler}, diagnostics};
     static_cast<void>(enabled.Compile(request, {}, {}));
     CHECK(traces == 1U);
+    CHECK(compiler.publication_output == request.output);
+    CHECK(compiler.physical_output != request.output);
+    CHECK(compiler.physical_output.parent_path() == request.output.parent_path());
+    CHECK_FALSE(std::filesystem::exists(compiler.physical_output));
     ArtifactDatasetRuntime disabled{services::ArtifactStore{root / "cache", weights, compiler}};
     auto disabled_request = request;
     disabled_request.output = root / "disabled";
     static_cast<void>(disabled.Compile(disabled_request, {}, {}));
     CHECK(traces == 1U);
+    CHECK(compiler.publication_output == disabled_request.output);
+    CHECK(compiler.physical_output != disabled_request.output);
+    CHECK_FALSE(std::filesystem::exists(compiler.physical_output));
 }
 TEST_CASE("dataset publishes direct progress, returns Busy, stops locally, and reconstructs after failure", "[controller][systems][dataset]") {
     const auto root = mmltk::testsupport::make_temp_root("ordinary-dataset");
