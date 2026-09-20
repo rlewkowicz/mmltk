@@ -80,7 +80,7 @@ struct ArtifactProgress final {
         const auto phase_value = static_cast<std::uint8_t>(phase);
         return phase_value > static_cast<std::uint8_t>(ArtifactCompilePhase::Idle) &&
                phase_value <= static_cast<std::uint8_t>(ArtifactCompilePhase::Publishing) && activity.size() <= kArtifactProgressTextCapacity &&
-               ((total == 0U && completed == 0U) || (total != 0U && completed <= total));
+               (total == 0U || completed <= total);
     }
     bool operator==(const ArtifactProgress&) const = default;
 };

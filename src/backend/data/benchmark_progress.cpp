@@ -27,6 +27,7 @@ void ProgressReporter::phase(const DatasetCompilePhase phase, const std::uint64_
             source.activity.clear();
             source.completed_bytes = 0U;
             source.total_bytes = 0U;
+            source.byte_total_known = true;
             source.completed_images = 0U;
             source.total_images = 0U;
             source.retry_count = 0U;
@@ -189,6 +190,7 @@ void ProgressReporter::source_transfer(const BenchmarkDatasetSource source, cons
     if (update.resumed) { progress.activity += " · retained " + std::to_string(update.retained_bytes) + " bytes"; }
     progress.completed_bytes = completed;
     progress.total_bytes = total;
+    progress.byte_total_known = total != 0U;
     progress.retry_count = !update.cache_hit && update.attempt > 0U ? update.attempt - 1U : 0U;
     progress.cache_hit = update.cache_hit;
     progress.resumed = update.resumed;
@@ -263,10 +265,13 @@ void ProgressReporter::update_source_phase_progress() {
     if (state_.phase == DatasetCompilePhase::Downloading) {
         state_.completed = 0U;
         state_.total = 0U;
+        bool all_known = true;
         for (const BenchmarkSourceProgress& source : state_.sources) {
+            all_known = all_known && source.byte_total_known;
             add_progress(state_.completed, source.completed_bytes, "benchmark download progress overflow");
             add_progress(state_.total, source.total_bytes, "benchmark download progress overflow");
         }
+        if (!all_known) { state_.total = 0U; }
         return;
     }
     if (state_.phase != DatasetCompilePhase::Extracting) { return; }
@@ -285,6 +290,28 @@ void ProgressReporter::update_source_phase_progress() {
         add_progress(state_.completed, scaled_completed, "benchmark extraction progress overflow");
         add_progress(state_.total, kSourceProgressScale, "benchmark extraction progress overflow");
     }
+}
+void ArtifactProgressTotals::update(const BenchmarkDatasetSource source, const DownloadProgress& update, ProgressReporter& reporter) {
+    if (!reporter.transfer_observer_enabled()) { return; }
+    const std::lock_guard lock(mutex_);
+    auto& totals = sources_[source];
+    const auto previous = totals.artifacts.find(update.artifact_id);
+    const bool observed = previous != totals.artifacts.end();
+    const Observation old = observed ? previous->second : Observation{};
+    const auto replace = [](const std::uint64_t aggregate, const std::uint64_t before, const std::uint64_t after) {
+        if (before > aggregate) { throw std::underflow_error("benchmark artifact progress underflow"); }
+        const auto remaining = aggregate - before;
+        if (after > std::numeric_limits<std::uint64_t>::max() - remaining) { throw std::overflow_error("benchmark artifact progress overflow"); }
+        return remaining + after;
+    };
+    const auto completed = replace(totals.completed, old.completed, update.completed_bytes);
+    const auto known_total = replace(totals.known_total, old.total, update.total_bytes);
+    const auto unknown_count = replace(totals.unknown_count, observed && old.total == 0U ? 1U : 0U, update.total_bytes == 0U ? 1U : 0U);
+    totals.artifacts.insert_or_assign(update.artifact_id, Observation{update.completed_bytes, update.total_bytes});
+    totals.completed = completed;
+    totals.known_total = known_total;
+    totals.unknown_count = unknown_count;
+    reporter.source_transfer(source, update, completed, unknown_count == 0U ? known_total : 0U);
 }
 void ProgressReporter::emit() {
     if (callback_) {

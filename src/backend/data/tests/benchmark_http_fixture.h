@@ -76,7 +76,13 @@ class HttpServer {
         const std::scoped_lock lock(client_mutex_);
         return ranges_;
     }
-    void fail_next(const int count) { failures_remaining_.store(count, std::memory_order_relaxed); }
+    void fail_next(const int count, const std::size_t body_bytes = 0U) {
+        require_condition(body_bytes <= 64U * 1024U, "HTTP failure fixture body exceeds bound");
+        failure_body_bytes_.store(body_bytes, std::memory_order_relaxed);
+        failures_remaining_.store(count, std::memory_order_release);
+    }
+    void RedirectNextTransfer() { redirect_next_.store(true, std::memory_order_release); }
+    void OmitContentLength() { omit_length_.store(true, std::memory_order_release); }
     [[nodiscard]] std::uint64_t requests() const { return requests_.load(std::memory_order_relaxed); }
     [[nodiscard]] std::uint64_t ranged_requests() const { return ranged_requests_.load(std::memory_order_relaxed); }
 
@@ -94,6 +100,13 @@ class HttpServer {
             sent += static_cast<std::size_t>(result);
         }
         return true;
+    }
+    static void send_discarded_body(const int client, const std::string_view status, const std::size_t bytes,
+                                    const std::string_view extra_headers = {}) {
+        const std::string header = "HTTP/1.1 " + std::string(status) + "\r\nContent-Length: " + std::to_string(bytes) +
+                                   "\r\n" + std::string(extra_headers) + "Connection: close\r\n\r\n";
+        const std::string body(bytes, '!');
+        if (send_all(client, header.data(), header.size())) { (void)send_all(client, body.data(), body.size()); }
     }
     void run() {
         while (!stop_.load(std::memory_order_relaxed)) {
@@ -132,14 +145,15 @@ class HttpServer {
         }
         require_condition(request.find("\r\n\r\n") != std::string_view::npos, "HTTP header exceeds bounded receive storage");
         requests_.fetch_add(1U, std::memory_order_relaxed);
-        if (failures_remaining_.fetch_sub(1, std::memory_order_relaxed) > 0) {
-            static constexpr std::string_view response =
-                "HTTP/1.1 503 Service Unavailable\r\n"
-                "Content-Length: 0\r\nConnection: close\r\n\r\n";
-            (void)send_all(client, response.data(), response.size());
+        if (failures_remaining_.fetch_sub(1, std::memory_order_acquire) > 0) {
+            send_discarded_body(client, "503 Service Unavailable", failure_body_bytes_.load(std::memory_order_relaxed));
             return;
         }
         failures_remaining_.store(0, std::memory_order_relaxed);
+        if (redirect_next_.exchange(false, std::memory_order_acq_rel)) {
+            send_discarded_body(client, "302 Found", 8192U, "Location: /redirected\r\n");
+            return;
+        }
         std::size_t begin = 0U;
         std::size_t end = payload_size_ - 1U;
         bool ranged = false;
@@ -172,9 +186,10 @@ class HttpServer {
             end = payload_size_ - 1U;
         }
         const std::size_t bytes = end + 1U - begin;
-        std::string header = std::string(ranged ? "HTTP/1.1 206 Partial Content\r\n" : "HTTP/1.1 200 OK\r\n") + "Content-Length: " + std::to_string(bytes) +
-                             "\r\nAccept-Ranges: bytes\r\nETag: \"benchmark-test-etag\"\r\n"
-                             "Last-Modified: Thu, 23 Jul 2026 12:00:00 GMT\r\n";
+        std::string header = ranged ? "HTTP/1.1 206 Partial Content\r\n" : "HTTP/1.1 200 OK\r\n";
+        if (!omit_length_.load(std::memory_order_acquire)) { header += "Content-Length: " + std::to_string(bytes) + "\r\n"; }
+        header += "Accept-Ranges: bytes\r\nETag: \"benchmark-test-etag\"\r\n"
+                  "Last-Modified: Thu, 23 Jul 2026 12:00:00 GMT\r\n";
         if (ranged) { header += "Content-Range: bytes " + std::to_string(begin) + "-" + std::to_string(end) + "/" + std::to_string(payload_size_) + "\r\n"; }
         header += "Connection: close\r\n\r\n";
         if (!send_all(client, header.data(), header.size())) { return; }
@@ -215,6 +230,9 @@ class HttpServer {
     std::atomic<bool> truncate_next_{false};
     std::atomic<bool> restart_range_{false};
     std::atomic<int> failures_remaining_{0};
+    std::atomic<std::size_t> failure_body_bytes_{0U};
+    std::atomic<bool> redirect_next_{false};
+    std::atomic<bool> omit_length_{false};
     std::atomic<std::uint64_t> requests_{0U};
     std::atomic<std::uint64_t> ranged_requests_{0U};
     std::jthread worker_;

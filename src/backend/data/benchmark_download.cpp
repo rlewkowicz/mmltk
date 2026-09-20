@@ -422,19 +422,15 @@ struct Transfer {
             if (transfer.last_progress.time_since_epoch().count() == 0 || now - transfer.last_progress >= std::chrono::milliseconds{100} ||
                 (download_total > 0 && download_now >= download_total && download_now != transfer.last_reported_download_now)) {
                 const std::uint64_t base = transfer.response_restarted ? 0U : transfer.resume_offset;
-                const std::uint64_t completed = checked_u64_add(
-                    base, checked_cast<std::uint64_t>(std::max<curl_off_t>(download_now, 0), "download progress overflow"), "download progress overflow");
-                std::uint64_t total = transfer.response_total != 0U ? transfer.response_total : transfer.request.expected_size;
-                if (total == 0U && download_total > 0) {
-                    total = checked_u64_add(base, checked_cast<std::uint64_t>(download_total, "download total overflow"), "download total overflow");
+                const std::uint64_t completed = transfer.write_offset;
+                std::uint64_t total = transfer.request.expected_size;
+                if (total == 0U && transfer.response_headers_valid) {
+                    total = transfer.response_total;
+                    if (total == 0U && download_total > 0) {
+                        total = checked_u64_add(base, checked_cast<std::uint64_t>(download_total, "download total overflow"), "download total overflow");
+                    }
                 }
-                if (transfer.progress) {
-                    transfer.progress(DownloadProgress{transfer.request.artifact_id, completed, total, transfer.attempt,
-                                                       transfer.resumed && !transfer.response_restarted, false,
-                                                       DownloadProgressPhase::kDownloading, base, transfer.redownload});
-                }
-                trace_transfer_progress(transfer.trace, transfer.request, completed, total, transfer.attempt,
-                                        transfer.resumed && !transfer.response_restarted, base, base, transfer.redownload);
+                transfer.emit_progress(completed, total, base);
                 transfer.last_progress = now;
                 transfer.last_reported_download_now = download_now;
             }
@@ -443,6 +439,15 @@ struct Transfer {
             transfer.callback_error = std::current_exception();
             return 1;
         }
+    }
+    void emit_progress(const std::uint64_t completed, const std::uint64_t total, const std::uint64_t durable) const {
+        const std::uint64_t retained = response_restarted ? 0U : resume_offset;
+        const bool retained_resume = resumed && !response_restarted;
+        if (progress) {
+            progress(DownloadProgress{request.artifact_id, completed, total, attempt, retained_resume, false,
+                                      DownloadProgressPhase::kDownloading, retained, redownload});
+        }
+        trace_transfer_progress(trace, request, completed, total, attempt, retained_resume, retained, durable, redownload);
     }
     [[nodiscard]] const std::string& effective_etag() const noexcept { return !response_headers_valid || http.etag.empty() ? resume_etag : http.etag; }
     [[nodiscard]] const std::string& effective_last_modified() const noexcept {
@@ -972,6 +977,7 @@ struct SegmentTransfer {
                           transfer.cancel_requested);
     std::error_code ignored;
     std::filesystem::remove(partial_metadata_path(request), ignored);
+    transfer.emit_progress(size, size, size);
     trace_benchmark_event(transfer.trace, "benchmark.download.complete", [&] {
         return nlohmann::json{
             {"artifact", request.artifact_id}, {"bytes", size}, {"attempt", transfer.attempt}, {"resumed", transfer.resumed && !transfer.response_restarted},

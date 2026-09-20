@@ -5,6 +5,10 @@
 #include "src/controller/services/artifact_store.h"
 #include "src/controller/services/settings_system.h"
 #include "src/common/concurrency/cancellation_observation.h"
+#include "src/backend/data/detail/benchmark_progress.h"
+#include "src/backend/data/tests/benchmark_http_fixture.h"
+#include "src/common/io/file_digest.h"
+#include <vector>
 #include <fcntl.h>
 #include <fstream>
 #include <iterator>
@@ -258,6 +262,139 @@ TEST_CASE("compilation captures its perceptual selection independently of augmen
     CHECK(next->resize_mode == ResizeMode::Stretch);
     CHECK(captured->perceptual_downscale);
     CHECK(captured->resize_mode == ResizeMode::Letterbox);
+}
+class AcquisitionDatasetRuntime final : public DatasetRuntime {
+   public:
+    using Observer = std::function<void(const contracts::ArtifactProgress&)>;
+    using Work = std::function<void(const Observer&)>;
+    explicit AcquisitionDatasetRuntime(Work work) : work_(std::move(work)) {}
+    services::ArtifactCompileResult Compile(const services::ArtifactCompileRequest& request, std::stop_token, const Observer& progress) override {
+        work_(progress);
+        return {.output = request.output, .inspection = successful_inspection({request.output / "train.bin", {}, {}})};
+    }
+    contracts::ArtifactInspection Inspect(const std::array<std::filesystem::path, contracts::kArtifactSplitCapacity>& paths, std::string_view,
+                                          std::uint32_t, std::stop_token) override {
+        return successful_inspection(paths);
+    }
+
+   private:
+    Work work_;
+};
+TEST_CASE("dataset admits real open ended acquisition and successful HTTP recovery", "[controller][systems][dataset][progress]") {
+    namespace data = mmltk::backend::data;
+    using namespace data::benchmark_internal;
+    using Source = data::BenchmarkDatasetSource;
+    const mmltk::testsupport::ScopedTempDir root{"dataset-acquisition-admission"};
+    SettingsSystem settings;
+    REQUIRE(settings.Load(install_settings(root.path())).applied());
+    bool mixed = false;
+    bool retry = false;
+    bool redirect = false;
+    auto source = Source::kCoco2017;
+    SECTION("unknown only metadata") {}
+    SECTION("mixed metadata within one source") { mixed = true; }
+    SECTION("mixed metadata across sources") { mixed = true; source = Source::kObjects365V2; }
+    SECTION("nonempty failed response followed by success") { retry = true; }
+    SECTION("discarded redirect followed by success") { redirect = true; }
+    const bool unknown = !retry && !redirect;
+    const std::vector<std::uint8_t> payload(unknown ? 1024U * 1024U : 4096U, 29U);
+    data::testsupport::HttpServer server(payload);
+    if (unknown) { server.OmitContentLength(); server.GateNextTransfer(); }
+    if (retry) server.fail_next(1, 8192U);
+    if (redirect) server.RedirectNextTransfer();
+    const DownloadRequest request{"metadata", server.url("metadata"), root.path() / "metadata.bin", root.path() / "metadata.lock",
+                                  unknown ? 0U : payload.size(), {}, 2U};
+    const DownloadRequest known{"known", server.url("known"), root.path() / "known.bin", root.path() / "known.lock", payload.size(), {}, 1U};
+    if (mixed) {
+        std::ofstream output(known.destination, std::ios::binary);
+        output.write(reinterpret_cast<const char*>(payload.data()), static_cast<std::streamsize>(payload.size()));
+        REQUIRE(output.good());
+    }
+    std::vector<contracts::ArtifactProgress> delivered;
+    std::vector<contracts::ArtifactProgress> produced;
+    std::vector<DownloadProgress> transfers;
+    std::promise<void> open_ended;
+    auto observing = open_ended.get_future();
+    bool notified = false;
+    std::promise<DatasetChanged> terminal;
+    auto completed = terminal.get_future();
+    const AcquisitionDatasetRuntime::Work work = [&](const auto& progress) {
+        const BenchmarkTraceSink trace;
+        ProgressReporter reporter([&](const auto& update) {
+            const auto projected = services::project_artifact_progress(update);
+            produced.push_back(projected);
+            progress(projected);
+        }, trace);
+        ArtifactProgressTotals totals;
+        reporter.phase(data::DatasetCompilePhase::Downloading);
+        if (mixed) (void)download_artifacts({known}, 1U, {}, [&](const auto& update) { totals.update(Source::kCoco2017, update, reporter); });
+        (void)download_artifacts({request}, 1U, {}, [&](const auto& update) {
+            transfers.push_back(update);
+            totals.update(source, update, reporter);
+        });
+    };
+    DatasetSystem dataset{settings, [&] { return std::make_unique<AcquisitionDatasetRuntime>(work); }, [&](DatasetSystem::event_type event) {
+        if (const auto* progress = std::get_if<DatasetProgress>(&event)) {
+            delivered.push_back(progress->progress);
+            if (!notified && progress->progress.total == 0U && progress->progress.completed > (mixed ? payload.size() : 0U)) {
+                notified = true;
+                open_ended.set_value();
+            }
+        } else {
+            terminal.set_value(std::get<DatasetChanged>(std::move(event)));
+        }
+    }};
+    const mmltk::testsupport::ScopedTestCleanup settle([&] { server.ReleasePartial(); dataset.Shutdown(); });
+    static_cast<void>(dataset.Compile({}));
+    if (unknown) {
+        REQUIRE(server.WaitPartial());
+        mmltk::testsupport::await_test_future(observing, "admitted open-ended metadata progress");
+        server.ReleasePartial();
+    }
+    const auto result = mmltk::testsupport::await_test_future(completed, "successful acquisition terminal");
+    dataset.Shutdown();
+    CHECK(result.snapshot.terminal.outcome == contracts::ArtifactTerminalOutcome::Succeeded);
+    CHECK(result.snapshot.terminal.detail.empty());
+    CHECK_FALSE(result.snapshot.active);
+    CHECK(delivered == produced);
+    REQUIRE_FALSE(delivered.empty());
+    for (const auto& progress : delivered) CHECK(progress.valid());
+    CHECK(delivered.back().completed == payload.size() * (mixed ? 2U : 1U));
+    CHECK(delivered.back().total == delivered.back().completed);
+    REQUIRE_FALSE(transfers.empty());
+    for (const auto& transfer : transfers) {
+        CHECK(transfer.completed_bytes <= payload.size());
+        if (retry && transfer.attempt == 1U) CHECK(transfer.completed_bytes == 0U);
+    }
+    CHECK(transfers.back().attempt == (retry ? 2U : 1U));
+    CHECK(mmltk::common::io::sha256_file(request.destination) == mmltk::common::io::sha256_bytes(payload));
+    CHECK(read_json_file(request.destination.string() + ".download.json").at("size") == payload.size());
+    server.Check();
+}
+TEST_CASE("dataset independently rejects each malformed progress invariant", "[controller][systems][dataset][progress]") {
+    const mmltk::testsupport::ScopedTempDir root{"dataset-progress-rejection"};
+    SettingsSystem settings;
+    REQUIRE(settings.Load(install_settings(root.path())).applied());
+    contracts::ArtifactProgress malformed{.phase = contracts::ArtifactCompilePhase::Downloading, .activity = "metadata", .completed = 1U, .total = 2U};
+    SECTION("known total overrun") { malformed.completed = 3U; }
+    SECTION("invalid phase") { malformed.phase = static_cast<contracts::ArtifactCompilePhase>(255U); }
+    SECTION("oversized activity") { malformed.activity.assign(contracts::kArtifactProgressTextCapacity + 1U, 'x'); }
+    CHECK_FALSE(malformed.valid());
+    std::promise<DatasetChanged> terminal;
+    auto completion = terminal.get_future();
+    std::size_t delivered = 0U;
+    DatasetSystem dataset{settings, [&] {
+        return std::make_unique<AcquisitionDatasetRuntime>([&](const auto& progress) { progress(malformed); });
+    }, [&](DatasetSystem::event_type event) {
+        if (std::holds_alternative<DatasetProgress>(event)) ++delivered;
+        else terminal.set_value(std::get<DatasetChanged>(std::move(event)));
+    }};
+    static_cast<void>(dataset.Compile({}));
+    const auto result = mmltk::testsupport::await_test_future(completion, "malformed progress rejection");
+    dataset.Shutdown();
+    CHECK(delivered == 0U);
+    CHECK(result.snapshot.terminal.outcome == contracts::ArtifactTerminalOutcome::Failed);
+    CHECK(result.snapshot.terminal.detail == "dataset compiler returned invalid progress");
 }
 }  // namespace
 }  // namespace mmltk::controller

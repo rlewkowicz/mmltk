@@ -202,6 +202,11 @@ void test_benchmark_download_cache_lifecycle() {
     CHECK(std::ranges::any_of(resumed_updates, [](const auto& update) {
         return update.resumed && update.retained_bytes == HttpServer::partial_bytes && update.completed_bytes > update.retained_bytes;
     }));
+    for (const auto& update : resumed_updates) {
+        CHECK(update.completed_bytes >= HttpServer::partial_bytes);
+        CHECK(update.completed_bytes <= payload.size());
+        CHECK(update.total_bytes == payload.size());
+    }
     REQUIRE(resumed[0].resumed);
     REQUIRE(server.ranged_requests() > 0U);
     const std::uint64_t before_cache_hit = server.requests();
@@ -1507,6 +1512,9 @@ TEST_CASE("transfer observers are independent of trace-only pixel observers", "[
     CHECK(traced.pixel_observer_enabled());
     traced.source_transfer(BenchmarkDatasetSource::kCoco2017, DownloadProgress{"coco-fixture", 1U, 2U, 2U}, 1U, 2U);
     CHECK(traces == 0U);
+    ArtifactProgressTotals unobserved_totals;
+    unobserved_totals.update(static_cast<BenchmarkDatasetSource>(255U), DownloadProgress{"unobserved", 1U, 0U}, traced);
+    CHECK(traces == 0U);
     traced.pixel_attempt(0U, 1U, "train", 1U);
     traced.pixel_completed();
     CHECK(traces == 2U);
@@ -1952,5 +1960,97 @@ TEST_CASE("discarded segmented state retains the typed re-download context durin
     CHECK(saw_redownload);
     CHECK(saw_completion);
     CHECK(has_generated_payload(request.destination, bytes));
+    server.Check();
+}
+
+TEST_CASE("artifact acquisition totals replace contributions without inventing unknown totals", "[backend][data][benchmark][progress]") {
+    BenchmarkCompileProgress latest;
+    const BenchmarkTraceSink trace;
+    ProgressReporter reporter([&](const auto& update) { latest = update; }, trace);
+    ArtifactProgressTotals totals;
+    reporter.phase(DatasetCompilePhase::Downloading);
+    const auto observe = [&](const BenchmarkDatasetSource source, const char* artifact, const std::uint64_t completed, const std::uint64_t total,
+                             const std::uint64_t expected_completed, const std::uint64_t expected_total) {
+        totals.update(source, DownloadProgress{artifact, completed, total}, reporter);
+        CHECK(latest.completed == expected_completed);
+        CHECK(latest.total == expected_total);
+        CHECK(latest.current_source == source);
+    };
+    constexpr auto coco = BenchmarkDatasetSource::kCoco2017;
+    constexpr auto objects = BenchmarkDatasetSource::kObjects365V2;
+    observe(coco, "known", 7U, 10U, 7U, 10U);
+    observe(coco, "unknown", 4U, 0U, 11U, 0U);
+    CHECK(latest.sources[0].completed_bytes == 11U);
+    CHECK(latest.sources[0].total_bytes == 0U);
+    CHECK_FALSE(latest.sources[0].byte_total_known);
+    observe(objects, "known", 8U, 20U, 19U, 0U); // Source-qualified equal artifact names.
+    observe(coco, "unknown", 2U, 0U, 17U, 0U); // Explicit retry withdrawal.
+    observe(coco, "unknown", 4U, 4U, 19U, 34U);
+    CHECK(latest.sources[0].byte_total_known);
+    observe(objects, "unknown", 3U, 0U, 22U, 0U);
+    observe(objects, "unknown", 3U, 3U, 22U, 37U);
+    observe(coco, "known", 0U, 10U, 15U, 37U); // Restart of a known artifact.
+    observe(coco, "known", 10U, 10U, 25U, 37U);
+    totals.update(coco, DownloadProgress{"known", 10U, 10U, 0U, false, true}, reporter);
+    CHECK(latest.completed == 25U);
+    CHECK(latest.total == 37U);
+    CHECK(latest.sources[0].cache_hit);
+    // A failed checked replacement leaves its prior contribution intact.
+    CHECK_THROWS_AS(totals.update(coco, DownloadProgress{"known", std::numeric_limits<std::uint64_t>::max(), 10U}, reporter), std::overflow_error);
+    observe(coco, "known", 10U, 10U, 25U, 37U);
+    CHECK_THROWS_AS(totals.update(coco, DownloadProgress{"known", 10U, std::numeric_limits<std::uint64_t>::max()}, reporter), std::overflow_error);
+    observe(coco, "known", 10U, 10U, 25U, 37U);
+}
+
+TEST_CASE("ordinary transfer observations exclude discarded bodies and settle unknown artifact sizes", "[backend][data][benchmark][download]") {
+    mmltk::testsupport::ScopedTempDir root("accepted-transfer-bytes");
+    const std::vector<std::uint8_t> payload(4096U, 73U);
+    HttpServer server(payload);
+    bool unknown = false;
+    bool retry = false;
+    bool redirect = false;
+    std::uint64_t retained = 0U;
+    SECTION("unknown length") { unknown = true; server.OmitContentLength(); }
+    SECTION("nonempty retry body exceeds the artifact") { retry = true; server.fail_next(1, 8192U); }
+    SECTION("failed response preserves the retained prefix") { retry = true; retained = 512U; server.fail_next(1, 8192U); }
+    SECTION("redirect body is discarded") { redirect = true; server.RedirectNextTransfer(); }
+    DownloadRequest request{"coco-observed", server.url("artifact"), root.path() / "artifact.bin", root.path() / "artifact.lock",
+                            unknown ? 0U : payload.size(), {}, 2U};
+    if (retained != 0U) {
+        std::ofstream partial(request.destination.string() + ".part", std::ios::binary);
+        partial.write(reinterpret_cast<const char*>(payload.data()), static_cast<std::streamsize>(retained));
+        partial.close();
+        write_json_atomically(request.destination.string() + ".part.json",
+                              {{"schema_version", kBenchmarkCacheSchemaVersion}, {"url", request.url}, {"etag", "\"benchmark-test-etag\""}}, {});
+    }
+    std::vector<DownloadProgress> updates;
+    const auto downloaded = download_artifacts({request}, 1U, {}, [&](const auto& update) { updates.push_back(update); });
+    REQUIRE(downloaded.size() == 1U);
+    REQUIRE_FALSE(updates.empty());
+    for (const auto& update : updates) {
+        CHECK(update.completed_bytes <= payload.size());
+        CHECK((update.total_bytes == 0U || update.total_bytes == payload.size()));
+        CHECK(update.retained_bytes == retained);
+        CHECK(update.completed_bytes >= retained);
+        if (retry && update.attempt == 1U) CHECK(update.completed_bytes == retained);
+    }
+    CHECK(updates.back().completed_bytes == payload.size());
+    CHECK(updates.back().total_bytes == payload.size());
+    CHECK(downloaded.front().attempts == (retry ? 2U : 1U));
+    CHECK(server.requests() == (retry || redirect ? 2U : 1U));
+    CHECK(mmltk::common::io::sha256_file(request.destination) == mmltk::common::io::sha256_bytes(payload));
+    const auto metadata = read_json_file(request.destination.string() + ".download.json");
+    CHECK(metadata.at("size") == payload.size());
+    CHECK(metadata.at("identity") == downloaded.front().identity);
+    CHECK_FALSE(fs::exists(request.destination.string() + ".part"));
+    CHECK_FALSE(fs::exists(request.destination.string() + ".part.json"));
+    const auto requests_before = server.requests();
+    const auto cached = download_artifacts({request}, 1U, {}, [&](const auto& update) {
+        CHECK(update.cache_hit);
+        CHECK(update.completed_bytes == payload.size());
+        CHECK(update.total_bytes == payload.size());
+    });
+    CHECK(cached.front().identity == downloaded.front().identity);
+    CHECK(server.requests() == requests_before);
     server.Check();
 }

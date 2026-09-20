@@ -28,7 +28,9 @@ struct DownloadRequest {
 };
 struct DownloadProgress {
     std::string artifact_id;
+    // Retained prefix plus accepted artifact writes; discarded HTTP bodies never count.
     std::uint64_t completed_bytes = 0U;
+    // Zero remains unknown until an admitted response or successful settlement establishes size.
     std::uint64_t total_bytes = 0U;
     std::uint32_t attempt = 0U;
     bool resumed = false;

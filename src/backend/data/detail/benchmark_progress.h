@@ -5,6 +5,8 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <map>
+#include <unordered_map>
 #include "src/backend/data/benchmark_dataset_compiler.h"
 #include "benchmark_cache.h"
 #include "benchmark_download.h"
@@ -45,6 +47,25 @@ class ProgressReporter {
     std::uint64_t pixel_split_total_ = 0U;
     std::uint64_t pixel_completed_ = 0U;
     std::uint64_t pixel_completed_before_ = 0U;
+    std::mutex mutex_;
+};
+// One instance belongs to one acquisition scope (metadata, images, or repair).
+class ArtifactProgressTotals final {
+   public:
+    void update(BenchmarkDatasetSource source, const DownloadProgress& update, ProgressReporter& reporter);
+
+   private:
+    struct Observation {
+        std::uint64_t completed = 0U;
+        std::uint64_t total = 0U;
+    };
+    struct SourceTotals {
+        std::unordered_map<std::string, Observation> artifacts;
+        std::uint64_t completed = 0U;
+        std::uint64_t known_total = 0U;
+        std::uint64_t unknown_count = 0U;
+    };
+    std::map<BenchmarkDatasetSource, SourceTotals> sources_;
     std::mutex mutex_;
 };
 }  // namespace mmltk::backend::data::benchmark_internal

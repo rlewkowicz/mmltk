@@ -28,6 +28,8 @@ struct BenchmarkSourceProgress {
     bool cache_hit = false;
     bool resumed = false;
     bool complete = false;
+    // Unobserved sources are neutral; an observed unknown-size contribution clears this.
+    bool byte_total_known = true;
 };
 struct BenchmarkCompileProgress {
     DatasetCompilePhase phase = DatasetCompilePhase::Planning;

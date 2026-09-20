@@ -159,26 +159,6 @@ struct TracePath final {
     if (artifact_id.starts_with("open-images-")) { return BenchmarkDatasetSource::kOpenImagesV7; }
     throw std::runtime_error("benchmark download progress has an unknown artifact");
 }
-struct ArtifactProgressTotals {
-    std::unordered_map<std::string, std::uint64_t> completed;
-    std::unordered_map<std::string, std::uint64_t> total;
-    void update(const DownloadProgress& update, ProgressReporter* reporter) {
-        const std::lock_guard lock(mutex);
-        completed[update.artifact_id] = update.completed_bytes;
-        total[update.artifact_id] = update.total_bytes;
-        const BenchmarkDatasetSource source = artifact_source(update.artifact_id);
-        std::uint64_t source_completed = 0U;
-        std::uint64_t source_total = 0U;
-        for (const auto& [artifact, bytes] : completed) {
-            if (artifact_source(artifact) == source) {
-                source_completed = common_math::checked_add(source_completed, bytes, "source progress overflow");
-                source_total = common_math::checked_add(source_total, total[artifact], "source progress overflow");
-            }
-        }
-        reporter->source_transfer(source, update, source_completed, source_total);
-    }
-    std::mutex mutex;
-};
 struct ArchiveDestroy {
     void operator()(archive* reader) const noexcept {
         if (reader != nullptr) { (void)archive_read_free(reader); }
@@ -391,7 +371,9 @@ class RequiredImageDecodeError : public std::runtime_error {
             const std::vector<DownloadResult> downloads =
                 download_artifacts({request}, download_connections, cancel_requested,
                                    progress->transfer_observer_enabled()
-                                       ? DownloadProgressSink{[&](const DownloadProgress& update) { transfer_progress->update(update, progress); }}
+                                       ? DownloadProgressSink{[&](const DownloadProgress& update) {
+                                             transfer_progress->update(artifact_source(update.artifact_id), update, *progress);
+                                         }}
                                        : DownloadProgressSink{},
                                    trace);
             progress->source_activity(source, "Opening " + archive_name + " image archive");
@@ -906,7 +888,9 @@ void compile_benchmark_dataset(BenchmarkCompilerConfig config) {
     const auto fetch_annotation_artifacts = [&](const std::vector<DownloadRequest>& requests, const std::size_t workers, ArtifactProgressTotals* totals) {
         const std::vector<DownloadResult> downloads = download_artifacts(
             requests, workers, cancel_requested,
-            progress.transfer_observer_enabled() ? DownloadProgressSink{[&](const DownloadProgress& update) { totals->update(update, &progress); }}
+            progress.transfer_observer_enabled() ? DownloadProgressSink{[&](const DownloadProgress& update) {
+                                                     totals->update(artifact_source(update.artifact_id), update, progress);
+                                                 }}
                                                  : DownloadProgressSink{},
             trace);
         for (std::size_t index = 0U; index < downloads.size(); ++index) {

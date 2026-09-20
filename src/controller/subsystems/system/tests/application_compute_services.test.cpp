@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <iterator>
 #include <latch>
 #include <memory>
@@ -1199,6 +1200,7 @@ TEST_CASE("real ranged HTTP restart reaches the bounded artifact activity as a r
         if (event == "benchmark.download.complete") { traced_completion = value.at("redownload").get<bool>(); }
     });
     ProgressReporter reporter([&](const auto& update) { displayed.push_back(project_artifact_progress(update)); }, trace);
+    ArtifactProgressTotals totals;
     reporter.phase(data::DatasetCompilePhase::Extracting);
     reporter.source_images(data::BenchmarkDatasetSource::kCoco2017, 123U, 123U);
     reporter.source_images(data::BenchmarkDatasetSource::kObjects365V2, 170161U, 408551U);
@@ -1206,7 +1208,7 @@ TEST_CASE("real ranged HTTP restart reaches the bounded artifact activity as a r
     displayed.clear();
     const auto completed = download_artifacts({request}, 1U, {}, [&](const auto& update) {
         observed.push_back(update);
-        reporter.source_transfer(data::BenchmarkDatasetSource::kObjects365V2, update, update.completed_bytes, update.total_bytes);
+        totals.update(data::BenchmarkDatasetSource::kObjects365V2, update, reporter);
     }, trace);
     REQUIRE(completed.size() == 1U);
     REQUIRE(observed.size() == displayed.size());
@@ -1214,6 +1216,7 @@ TEST_CASE("real ranged HTTP restart reaches the bounded artifact activity as a r
     bool saw_restart = false;
     for (std::size_t i = 0U; i < observed.size(); ++i) {
         const auto& update = observed[i];
+        CHECK(displayed[i].valid());
         CHECK(displayed[i].completed == 2416498U);
         CHECK(displayed[i].total == 3000000U);
         CHECK(displayed[i].activity.size() <= domain::kArtifactProgressTextCapacity);
@@ -1242,12 +1245,94 @@ TEST_CASE("real ranged HTTP restart reaches the bounded artifact activity as a r
     const auto cached = download_artifacts({request}, 1U, {}, [&](const auto& update) {
         CHECK(update.cache_hit);
         CHECK_FALSE(update.redownload);
-        reporter.source_transfer(data::BenchmarkDatasetSource::kObjects365V2, update, update.completed_bytes, update.total_bytes);
+        totals.update(data::BenchmarkDatasetSource::kObjects365V2, update, reporter);
     });
     CHECK(cached.front().cache_hit);
     CHECK(cached.front().identity == completed.front().identity);
     CHECK(displayed.back().activity.find("bytes reused") != std::string::npos);
     CHECK(server.requests() == requests_before);
+    server.Check();
+}
+}
+
+namespace mmltk::controller::subsystems::system {
+TEST_CASE("real unknown metadata bytes remain open ended through artifact projection", "[gui][services][progress]") {
+    using namespace data::benchmark_internal;
+    using Source = data::BenchmarkDatasetSource;
+    mmltk::testsupport::ScopedTempDir root("artifact-unknown-metadata");
+    const std::vector<std::uint8_t> payload(1024U * 1024U, 37U);
+    data::testsupport::HttpServer server(payload);
+    server.OmitContentLength();
+    server.GateNextTransfer();
+    bool mixed = false;
+    auto source = Source::kCoco2017;
+    SECTION("unknown only") {}
+    SECTION("mixed artifacts in one source") { mixed = true; }
+    SECTION("mixed artifacts across sources") { mixed = true; source = Source::kObjects365V2; }
+    std::vector<data::BenchmarkCompileProgress> native;
+    std::vector<domain::ArtifactProgress> displayed;
+    const BenchmarkTraceSink trace;
+    ProgressReporter reporter([&](const auto& update) {
+        native.push_back(update);
+        displayed.push_back(project_artifact_progress(update));
+    }, trace);
+    ArtifactProgressTotals totals;
+    reporter.phase(data::DatasetCompilePhase::Downloading);
+    if (mixed) {
+        DownloadRequest known{"coco-known", server.url("known"), root.path() / "known.bin", root.path() / "known.lock", payload.size(), {}, 1U};
+        // Preseeded artifact admission takes the ordinary cache path, with no network request.
+        std::ofstream output(known.destination, std::ios::binary);
+        output.write(reinterpret_cast<const char*>(payload.data()), static_cast<std::streamsize>(payload.size()));
+        output.close();
+        (void)download_artifacts({known}, 1U, {}, [&](const auto& update) { totals.update(Source::kCoco2017, update, reporter); });
+        REQUIRE(server.requests() == 0U);
+    }
+    const DownloadRequest unknown{"metadata-unknown", server.url("unknown"), root.path() / "unknown.bin", root.path() / "unknown.lock", 0U, {}, 1U};
+    std::promise<void> open_ended;
+    auto observed = open_ended.get_future();
+    bool notified = false;
+    auto transfer = std::async(std::launch::async, [&] {
+        return download_artifacts({unknown}, 1U, {}, [&](const auto& update) {
+            totals.update(source, update, reporter);
+            if (!notified && update.completed_bytes > 0U && update.total_bytes == 0U) {
+                notified = true;
+                open_ended.set_value();
+            }
+        });
+    });
+    const mmltk::testsupport::ScopedTestCleanup settle([&] { server.ReleasePartial(); });
+    REQUIRE(server.WaitPartial());
+    mmltk::testsupport::await_test_future(observed, "positive unknown-length metadata progress");
+    server.ReleasePartial();
+    const auto downloaded = mmltk::testsupport::await_test_future(transfer, "unknown-length metadata completion");
+    REQUIRE(downloaded.size() == 1U);
+    CHECK(downloaded.front().size == payload.size());
+    REQUIRE(displayed.size() == native.size());
+    bool saw_open_ended = false;
+    for (std::size_t i = 0U; i < native.size(); ++i) {
+        CHECK(displayed[i].valid());
+        CHECK(displayed[i].completed == native[i].completed);
+        CHECK(displayed[i].total == native[i].total);
+        std::uint64_t completed = 0U;
+        std::uint64_t total = 0U;
+        bool known = true;
+        for (const auto& contribution : native[i].sources) {
+            completed += contribution.completed_bytes;
+            total += contribution.total_bytes;
+            known = known && contribution.byte_total_known;
+        }
+        CHECK(native[i].completed == completed);
+        CHECK(native[i].total == (known ? total : 0U));
+        if (!known && native[i].completed > (mixed ? payload.size() : 0U)) {
+            saw_open_ended = true;
+            CHECK(displayed[i].activity.contains("total unknown"));
+        }
+    }
+    CHECK(saw_open_ended);
+    CHECK(displayed.back().completed == payload.size() * (mixed ? 2U : 1U));
+    CHECK(displayed.back().total == displayed.back().completed);
+    CHECK(mmltk::common::io::sha256_file(unknown.destination) == mmltk::common::io::sha256_bytes(payload));
+    CHECK(read_json_file(unknown.destination.string() + ".download.json").at("identity") == downloaded.front().identity);
     server.Check();
 }
 }
