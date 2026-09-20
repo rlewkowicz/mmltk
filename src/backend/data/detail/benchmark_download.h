@@ -25,6 +25,7 @@ struct DownloadRequest {
     std::uint32_t maximum_attempts = kMaximumAttempts;
     // An owning acquisition invalidated an earlier artifact before this request.
     bool redownload = false;
+    BenchmarkDatasetSource source = BenchmarkDatasetSource::kCoco2017;
 };
 struct DownloadProgress {
     std::string artifact_id;
@@ -39,6 +40,7 @@ struct DownloadProgress {
     // Durable bytes retained before the active attempt; excludes in-flight observations.
     std::uint64_t retained_bytes = 0U;
     bool redownload = false;
+    BenchmarkDatasetSource source = BenchmarkDatasetSource::kCoco2017;
 };
 struct DownloadResult {
     std::filesystem::path path;

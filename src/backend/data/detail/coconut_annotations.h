@@ -12,8 +12,32 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <stdexcept>
 #include <vector>
+#include <utility>
+#include <unordered_map>
 namespace mmltk::backend::data::benchmark_internal {
+class CoconutPhysicalMembershipError final : public std::runtime_error {
+ public:
+    CoconutPhysicalMembershipError(CoconutImageNamespace source, std::uint64_t image_id, std::string message) : std::runtime_error(std::move(message)), source_(source), image_id_(image_id) {}
+    [[nodiscard]] CoconutImageNamespace source() const noexcept { return source_; }
+    [[nodiscard]] std::uint64_t image_id() const noexcept { return image_id_; }
+ private:
+    CoconutImageNamespace source_;
+    std::uint64_t image_id_;
+};
+// Borrows one immutable admitted inventory generation. The caller must keep its
+// rows alive and unchanged until this lookup and all import requests release it.
+class CoconutPhysicalMembership final {
+ public:
+    explicit CoconutPhysicalMembership(std::span<const CoconutPhysicalImage>,
+        mmltk::common::concurrency::CancellationObservation = {});
+    CoconutPhysicalMembership(const CoconutPhysicalMembership&) = delete;
+    CoconutPhysicalMembership& operator=(const CoconutPhysicalMembership&) = delete;
+    [[nodiscard]] const CoconutPhysicalImage* find(CoconutImageNamespace, std::uint64_t) const noexcept;
+ private:
+    std::unordered_map<CoconutImageNamespace,std::unordered_map<std::uint64_t,const CoconutPhysicalImage*>> namespaces_;
+};
 struct CoconutComponent {
     CoconutEdition edition = CoconutEdition::Base;
     CoconutImageNamespace source = CoconutImageNamespace::CocoTrain;
@@ -57,7 +81,7 @@ struct CoconutImportRequest {
     std::vector<std::filesystem::path> parquet_shards;
     std::filesystem::path annotation_json;
     std::filesystem::path mask_archive;
-    std::span<const CoconutPhysicalImage> physical_images;
+    const CoconutPhysicalMembership* physical_membership = nullptr;
     std::uint64_t expected_rows = 0;
     CoconutImportLimits limits;
     mmltk::common::concurrency::CancellationObservation cancellation;

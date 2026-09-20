@@ -1110,6 +1110,7 @@ TEST_CASE("benchmark current transfer changes artifact activity at the exact ima
         CHECK(latest.sources[1].completed_images == 170161U);
     };
     DownloadProgress update{"objects365-patch-17", 100U, 1000U, 1U};
+    update.source = Source::kObjects365V2;
     for (const bool resumed : {false, true}) {
         for (const auto attempt : {1U, 2U}) {
             update.attempt = attempt;
@@ -1118,7 +1119,7 @@ TEST_CASE("benchmark current transfer changes artifact activity at the exact ima
             update.cache_hit = false;
             update.total_bytes = 1000U;
             update.completed_bytes = 100U;
-            reporter.source_transfer(Source::kObjects365V2, update, 100000U, 200000U);
+            reporter.source_transfer(update, 100000U, 200000U);
             check_plateau();
             CHECK(displayed.activity.find("Objects365 v2") != std::string::npos);
             CHECK(displayed.activity.find("objects365-patch-17") != std::string::npos);
@@ -1127,29 +1128,32 @@ TEST_CASE("benchmark current transfer changes artifact activity at the exact ima
             if (resumed) { CHECK(displayed.activity.find("retained 64 bytes") != std::string::npos); }
             const auto prior = displayed.activity;
             update.completed_bytes = 200U;
-            reporter.source_transfer(Source::kObjects365V2, update, 100100U, 200000U);
+            reporter.source_transfer(update, 100100U, 200000U);
             check_plateau();
             CHECK(displayed.activity != prior);
             CHECK(displayed.activity.find("200 / 1000 bytes") != std::string::npos);
         }
     }
     update = DownloadProgress{"objects365-invalidated-archive", 16U, 1000U, 1U};
+    update.source = Source::kObjects365V2;
     update.redownload = true;
-    reporter.source_transfer(Source::kObjects365V2, update, 105016U, 205000U);
+    reporter.source_transfer(update, 105016U, 205000U);
     CHECK(displayed.activity.find("Re-downloading objects365-invalidated-archive") != std::string::npos);
     CHECK(displayed.activity.find("attempt 1") != std::string::npos);
     check_plateau();
     update = DownloadProgress{"objects365-cached-patch", 5000U, 5000U, 0U, false, true};
-    reporter.source_transfer(Source::kObjects365V2, update, 105000U, 205000U);
+    update.source = Source::kObjects365V2;
+    reporter.source_transfer(update, 105000U, 205000U);
     CHECK(displayed.activity.find("bytes reused") != std::string::npos);
     update = DownloadProgress{"objects365-live-patch", 32U, 0U, 1U};
-    reporter.source_transfer(Source::kObjects365V2, update, 105032U, 205000U);
+    update.source = Source::kObjects365V2;
+    reporter.source_transfer(update, 105032U, 205000U);
     CHECK(displayed.activity.find("32 bytes (total unknown)") != std::string::npos);
     CHECK(displayed.activity.find("reused") == std::string::npos);
     check_plateau();
     for (const auto phase : {DownloadProgressPhase::kVerifyingCachedArtifact, DownloadProgressPhase::kVerifyingDownloadedArtifact}) {
         update.phase = phase;
-        reporter.source_transfer(Source::kObjects365V2, update, 105032U, 205000U);
+        reporter.source_transfer(update, 105032U, 205000U);
         CHECK(displayed.activity.find(phase == DownloadProgressPhase::kVerifyingCachedArtifact ? "Verifying cached" : "Verifying downloaded") != std::string::npos);
         check_plateau();
     }
@@ -1158,7 +1162,7 @@ TEST_CASE("benchmark current transfer changes artifact activity at the exact ima
     reporter.phase(data::DatasetCompilePhase::Labels);
     reporter.source_images(Source::kCoco2017, 123U, 123U);
     CHECK(displayed.activity == "Preparing compiled labels");
-    reporter.source_transfer(Source::kObjects365V2, update, 105032U, 205000U);
+    reporter.source_transfer(update, 105032U, 205000U);
     CHECK(displayed.activity == "Preparing compiled labels");
     reporter.source_complete(Source::kObjects365V2, false);
     reporter.pixel_attempt(0U, 20U, "train", 20U);
@@ -1181,6 +1185,7 @@ TEST_CASE("real ranged HTTP restart reaches the bounded artifact activity as a r
     data::testsupport::HttpServer server(payload);
     DownloadRequest request{"objects365-restart", server.url("restart"), root.path() / "archive.bin", root.path() / "archive.lock", payload.size(),
                             mmltk::common::io::sha256_hex(mmltk::common::io::sha256_bytes(payload)), 1U};
+    request.source = data::BenchmarkDatasetSource::kObjects365V2;
     constexpr std::uint64_t retained = 512U;
     {
         std::ofstream partial(request.destination.string() + ".part", std::ios::binary);
@@ -1208,7 +1213,7 @@ TEST_CASE("real ranged HTTP restart reaches the bounded artifact activity as a r
     displayed.clear();
     const auto completed = download_artifacts({request}, 1U, {}, [&](const auto& update) {
         observed.push_back(update);
-        totals.update(data::BenchmarkDatasetSource::kObjects365V2, update, reporter);
+        totals.update(update, reporter);
     }, trace);
     REQUIRE(completed.size() == 1U);
     REQUIRE(observed.size() == displayed.size());
@@ -1245,7 +1250,7 @@ TEST_CASE("real ranged HTTP restart reaches the bounded artifact activity as a r
     const auto cached = download_artifacts({request}, 1U, {}, [&](const auto& update) {
         CHECK(update.cache_hit);
         CHECK_FALSE(update.redownload);
-        totals.update(data::BenchmarkDatasetSource::kObjects365V2, update, reporter);
+        totals.update(update, reporter);
     });
     CHECK(cached.front().cache_hit);
     CHECK(cached.front().identity == completed.front().identity);
@@ -1284,16 +1289,16 @@ TEST_CASE("real unknown metadata bytes remain open ended through artifact projec
         std::ofstream output(known.destination, std::ios::binary);
         output.write(reinterpret_cast<const char*>(payload.data()), static_cast<std::streamsize>(payload.size()));
         output.close();
-        (void)download_artifacts({known}, 1U, {}, [&](const auto& update) { totals.update(Source::kCoco2017, update, reporter); });
+        (void)download_artifacts({known}, 1U, {}, [&](const auto& update) { totals.update(update, reporter); });
         REQUIRE(server.requests() == 0U);
     }
-    const DownloadRequest unknown{"metadata-unknown", server.url("unknown"), root.path() / "unknown.bin", root.path() / "unknown.lock", 0U, {}, 1U};
+    const DownloadRequest unknown{"metadata-unknown", server.url("unknown"), root.path() / "unknown.bin", root.path() / "unknown.lock", 0U, {}, 1U, false, source};
     std::promise<void> open_ended;
     auto observed = open_ended.get_future();
     bool notified = false;
     auto transfer = std::async(std::launch::async, [&] {
         return download_artifacts({unknown}, 1U, {}, [&](const auto& update) {
-            totals.update(source, update, reporter);
+            totals.update(update, reporter);
             if (!notified && update.completed_bytes > 0U && update.total_bytes == 0U) {
                 notified = true;
                 open_ended.set_value();

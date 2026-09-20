@@ -75,6 +75,8 @@ contracts::ArtifactProgress project_artifact_progress(const mmltk::backend::data
                     case Source::kCoco2017: return std::string_view{"COCO 2017"};
                     case Source::kObjects365V2: return std::string_view{"Objects365 v2"};
                     case Source::kOpenImagesV7: return std::string_view{"Open Images v7"};
+                    case Source::kCoconut: return std::string_view{"COCONut"};
+                    case Source::kObjects365V1: return std::string_view{"Objects365 v1"};
                 }
                 std::unreachable();
             }();

@@ -17,6 +17,8 @@ enum class BenchmarkDatasetSource : std::uint8_t {
     kCoco2017,
     kObjects365V2,
     kOpenImagesV7,
+    kCoconut,
+    kObjects365V1,
 };
 struct BenchmarkSourceProgress {
     BenchmarkDatasetSource source = BenchmarkDatasetSource::kCoco2017;

@@ -347,6 +347,14 @@ void write_cached_image_atomically(const std::filesystem::path& path, const std:
         throw;
     }
 }
+void invalidate_cached_image_proofs(const std::filesystem::path& root) {
+    remove_cache_path(root / ".complete.json");
+    const auto proofs = root / ".recipe-proofs";
+    const auto status = std::filesystem::symlink_status(proofs);
+    if (!std::filesystem::exists(status)) return;
+    if (!std::filesystem::is_directory(status)) throw std::runtime_error("benchmark recipe proof root is not an ordinary directory");
+    for (const auto& entry : std::filesystem::directory_iterator(proofs)) remove_cache_path(entry.path());
+}
 bool validate_cached_image_group(const std::filesystem::path& root, const std::filesystem::path& completion_path, const std::string_view identity,
                                  const std::span<const std::uint64_t> expected_image_ids, std::uint64_t* image_bytes,
                                  mmltk::common::concurrency::CancellationObservation cancel_requested, const BenchmarkTraceSink& trace,
@@ -428,7 +436,7 @@ CachedImageDirectory extract_selected_archive_images(ArchiveExtractionRequest re
         throw std::runtime_error("benchmark archive extraction IDs must be sorted and unique");
     }
     prepare_cached_image_directory(request.output_root);
-    const std::filesystem::path completion = request.output_root / ".complete.json";
+    const std::filesystem::path completion = request.completion_path.empty() ? request.output_root / ".complete.json" : request.completion_path;
     const std::string& identity = request.source_identity;
     std::uint64_t image_bytes = 0U;
     std::vector<CachedImageRejection> quarantined;
@@ -468,6 +476,7 @@ CachedImageDirectory extract_selected_archive_images(ArchiveExtractionRequest re
                 try {
                     request.validator(image_id, encoded);
                 } catch (const std::exception&) {
+                    invalidate_cached_image_proofs(request.output_root);
                     std::error_code error;
                     (void)std::filesystem::remove(path, error);
                     if (error) { throw std::filesystem::filesystem_error("cannot remove invalid cached benchmark image", path, error); }
@@ -572,6 +581,8 @@ CachedImageDirectory extract_selected_archive_images(ArchiveExtractionRequest re
                 continue;
             }
         }
+        // New members cannot invalidate existing subsets; replacements already invalidated during the scan.
+        if (std::filesystem::exists(cached_image_path(request.output_root, *image_id))) invalidate_cached_image_proofs(request.output_root);
         scheduled.emplace(*image_id);
         write_pool.submit(*image_id, std::move(encoded));
     }

@@ -445,7 +445,7 @@ struct Transfer {
         const bool retained_resume = resumed && !response_restarted;
         if (progress) {
             progress(DownloadProgress{request.artifact_id, completed, total, attempt, retained_resume, false,
-                                      DownloadProgressPhase::kDownloading, retained, redownload});
+                                      DownloadProgressPhase::kDownloading, retained, redownload, request.source});
         }
         trace_transfer_progress(trace, request, completed, total, attempt, retained_resume, retained, durable, redownload);
     }
@@ -729,7 +729,7 @@ class SegmentedDownloadState {
         if (force || completed <= request_.expected_size) {
             if (progress_) {
                 progress_(DownloadProgress{request_.artifact_id, completed, request_.expected_size, attempts, retained_bytes_ != 0U, false,
-                                           DownloadProgressPhase::kDownloading, retained_bytes_, request_.redownload});
+                                           DownloadProgressPhase::kDownloading, retained_bytes_, request_.redownload, request_.source});
             }
             trace_transfer_progress(trace_, request_, completed, request_.expected_size, attempts, retained_bytes_ != 0U, retained_bytes_, durable, request_.redownload);
         }
@@ -1036,6 +1036,10 @@ std::vector<DownloadResult> download_artifacts(const std::vector<DownloadRequest
                     completed_result.attempts,
                     false,
                     true,
+                    DownloadProgressPhase::kDownloading,
+                    0U,
+                    requests[index].redownload,
+                    requests[index].source,
                 });
             }
         } else {

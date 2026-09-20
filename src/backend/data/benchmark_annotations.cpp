@@ -1,3 +1,4 @@
+#include "detail/benchmark_storage.h"
 #include <simdjson.h>
 #include <nlohmann/json.hpp>
 #include <type_traits>
@@ -1462,6 +1463,7 @@ void store_normalized_annotation_index(const std::filesystem::path& path, const 
         throw std::overflow_error("normalized mask block size overflow");
     }
     const std::uint64_t total_size = mask_rle_offset + static_cast<std::uint64_t>(index.mask_rle_pairs.size()) * sizeof(RLEPair);
+    require_storage(path,total_size,"normalized annotation index staging",trace);
     NormalizedIndexHeader header;
     header.source = static_cast<std::uint8_t>(index.source);
     header.image_count = checked_cast<std::uint32_t>(index.images.size(), "normalized image count overflow");

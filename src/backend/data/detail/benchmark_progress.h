@@ -1,5 +1,6 @@
 #pragma once
 #include <chrono>
+#include <span>
 #include <cstdint>
 #include <mutex>
 #include <optional>
@@ -13,17 +14,18 @@
 namespace mmltk::backend::data::benchmark_internal {
 class ProgressReporter {
    public:
-    ProgressReporter(BenchmarkProgressCallback callback, const BenchmarkTraceSink& trace);
+    ProgressReporter(BenchmarkProgressCallback callback, const BenchmarkTraceSink& trace, std::span<const BenchmarkDatasetSource> sources = {});
     void phase(const DatasetCompilePhase phase, const std::uint64_t completed = 0U, const std::uint64_t total = 0U);
     void activity(std::string activity);
     void pixel_attempt(const std::uint64_t completed, const std::uint64_t total, const std::string_view split, const std::uint64_t split_total);
     void pixel_completed();
     void source_activity(const BenchmarkDatasetSource source, std::string activity);
     [[nodiscard]] bool transfer_observer_enabled() const noexcept;
+    [[nodiscard]] bool normalization_observer_enabled() const noexcept;
     [[nodiscard]] bool pixel_observer_enabled() const noexcept;
     void projected(const std::uint64_t bytes);
     void rejected(const std::uint64_t dropped, const std::uint64_t quarantined);
-    void source_transfer(BenchmarkDatasetSource source, const DownloadProgress& update, std::uint64_t completed, std::uint64_t total);
+    void source_transfer(const DownloadProgress& update, std::uint64_t completed, std::uint64_t total);
     void add_source_images(BenchmarkDatasetSource source, std::uint64_t count, std::uint64_t total, std::string activity = {});
     void rollback_source_images(BenchmarkDatasetSource source, std::uint64_t count, std::uint64_t total, std::string activity = {});
     void source_images(const BenchmarkDatasetSource source, const std::uint64_t completed, const std::uint64_t total);
@@ -52,7 +54,7 @@ class ProgressReporter {
 // One instance belongs to one acquisition scope (metadata, images, or repair).
 class ArtifactProgressTotals final {
    public:
-    void update(BenchmarkDatasetSource source, const DownloadProgress& update, ProgressReporter& reporter);
+    void update(const DownloadProgress& update, ProgressReporter& reporter);
 
    private:
     struct Observation {

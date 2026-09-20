@@ -3,8 +3,12 @@
 #include <filesystem>
 #include <mutex>
 #include <string_view>
+#include <stdexcept>
 #include "benchmark_cache.h"
 namespace mmltk::backend::data::benchmark_internal {
+class InsufficientBenchmarkStorage final : public std::runtime_error { public: using std::runtime_error::runtime_error; };
+// Additional allocation for an in-place/replaced download; allocated partial extents count once.
+[[nodiscard]] std::uint64_t additional_download_bytes(const std::filesystem::path& destination, std::uint64_t expected);
 void require_storage(const std::filesystem::path&, std::uint64_t, const char*, const BenchmarkTraceSink&);
 class StorageReservationPool {
    public:

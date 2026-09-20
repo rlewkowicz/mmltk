@@ -719,7 +719,8 @@ TEST_CASE("compiled benchmark provenance cannot be erased while Generic identiti
         file.seekp(static_cast<std::streamoff>(original.header().label_offset));
         file.write(reinterpret_cast<const char*>(&label), sizeof(label));
     };
-    for (const auto source : {AnnotationSource::Coco, AnnotationSource::Objects365, AnnotationSource::OpenImages}) {
+    for (const auto source : {AnnotationSource::Coco, AnnotationSource::Objects365, AnnotationSource::OpenImages, AnnotationSource::CoconutCoco,
+                              AnnotationSource::CoconutObjects365V1, AnnotationSource::CoconutObjects365V2}) {
         auto image = original.image_entry(0);
         auto label = original.labels()[0];
         image.source = source;
@@ -742,6 +743,11 @@ TEST_CASE("compiled benchmark provenance cannot be erased while Generic identiti
         write(image, label);
         CHECK_NOTHROW(CompiledDataset::open(path));
     }
+    auto unknown = original.image_entry(0);
+    unknown.source = static_cast<AnnotationSource>(255U);
+    write(unknown, original.labels()[0]);
+    CHECK_THROWS(CompiledDataset::open(path));
+
 }
 TEST_CASE("category IDs reject arithmetic identity loss before publication", "[backend][data][catalog]") {
     const mmltk::testsupport::ScopedTempDir root("exact-category-ids");

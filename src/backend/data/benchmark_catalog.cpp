@@ -281,6 +281,7 @@ const CatalogArtifact kObjectsAnnotations{
     "zhiyuan_objv2_train.tar.gz",
     1336483164U,
     "",
+    BenchmarkDatasetSource::kObjects365V2,
 };
 const CatalogArtifact kOpenImagesBoxes{
     "open-images-v7-train-boxes",
@@ -288,6 +289,7 @@ const CatalogArtifact kOpenImagesBoxes{
     "oidv6-train-annotations-bbox.csv",
     2258447590U,
     "",
+    BenchmarkDatasetSource::kOpenImagesV7,
 };
 const CatalogArtifact kOpenImagesClasses{
     "open-images-v7-boxable-classes",
@@ -295,6 +297,7 @@ const CatalogArtifact kOpenImagesClasses{
     "oidv7-class-descriptions-boxable.csv",
     12064U,
     "",
+    BenchmarkDatasetSource::kOpenImagesV7,
 };
 // NOLINTEND(bugprone-throwing-static-initialization)
 constexpr std::string_view kOpenImagesTrainImageUrlTemplate = "https://open-images-dataset.s3.amazonaws.com/train/{image_id_hex}.jpg";
@@ -319,6 +322,7 @@ std::vector<CatalogArtifact> objects365_train_image_artifacts() {
             filename,
             kObjects365TrainShardSizes[shard],
             "",
+            BenchmarkDatasetSource::kObjects365V2,
         });
     }
     return artifacts;
@@ -339,6 +343,8 @@ inline constexpr std::array kBenchmarkSourceDescriptors{
     BenchmarkSourceDescriptor{"coco", "2017"},
     BenchmarkSourceDescriptor{"objects365", "v2-2020"},
     BenchmarkSourceDescriptor{"open-images", "v7-bboxes-v6"},
+    BenchmarkSourceDescriptor{"coconut", "cvpr2024"},
+    BenchmarkSourceDescriptor{"objects365-v1", "v1"},
 };
 [[nodiscard]] const BenchmarkSourceDescriptor* benchmark_source_descriptor(const BenchmarkDatasetSource source) noexcept {
     const std::size_t index = static_cast<std::size_t>(source);

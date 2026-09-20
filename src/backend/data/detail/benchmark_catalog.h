@@ -18,6 +18,7 @@ struct CatalogArtifact {
     std::string filename;
     std::uint64_t expected_size = 0U;
     std::string expected_sha256;
+    BenchmarkDatasetSource source = BenchmarkDatasetSource::kCoco2017;
 };
 struct NumericCategoryMapping {
     std::uint32_t source_id = 0U;

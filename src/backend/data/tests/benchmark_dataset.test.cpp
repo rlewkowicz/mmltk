@@ -161,6 +161,8 @@ void test_benchmark_download_cache_lifecycle() {
     const std::vector<std::uint8_t> payload = make_payload(std::size_t{8U} * 1024U * 1024U);
     HttpServer server(payload);
     DownloadRequest retry = request_for(root.path(), "retry", server.url("retry"), payload);
+    retry.source = BenchmarkDatasetSource::kObjects365V2;
+    // Artifact spelling is deliberately unrelated to the owning source.
     server.fail_next(1);
     std::vector<DownloadProgress> retry_updates;
     const auto retry_result = download_artifacts({retry}, 1U, {}, [&](const auto& update) { retry_updates.push_back(update); });
@@ -196,6 +198,7 @@ void test_benchmark_download_cache_lifecycle() {
     server.ReleasePartial();
     cancel.store(false, std::memory_order_release);
     std::vector<DownloadProgress> resumed_updates;
+    resume.source = BenchmarkDatasetSource::kCoco2017;
     const auto resumed = download_artifacts({resume}, 1U, mmltk::common::concurrency::CancellationObservation::Atomic(cancel),
                                            [&](const auto& update) { resumed_updates.push_back(update); });
     REQUIRE_FALSE(resumed_updates.empty());
@@ -1673,10 +1676,10 @@ TEST_CASE("transfer observers are independent of trace-only pixel observers", "[
     ProgressReporter traced({}, trace);
     CHECK_FALSE(traced.transfer_observer_enabled());
     CHECK(traced.pixel_observer_enabled());
-    traced.source_transfer(BenchmarkDatasetSource::kCoco2017, DownloadProgress{"coco-fixture", 1U, 2U, 2U}, 1U, 2U);
+    traced.source_transfer(DownloadProgress{"coco-fixture", 1U, 2U, 2U}, 1U, 2U);
     CHECK(traces == 0U);
     ArtifactProgressTotals unobserved_totals;
-    unobserved_totals.update(static_cast<BenchmarkDatasetSource>(255U), DownloadProgress{"unobserved", 1U, 0U}, traced);
+    unobserved_totals.update(DownloadProgress{.artifact_id="unobserved", .completed_bytes=1U, .source=static_cast<BenchmarkDatasetSource>(255U)}, traced);
     CHECK(traces == 0U);
     traced.pixel_attempt(0U, 1U, "train", 1U);
     traced.pixel_completed();
@@ -1686,7 +1689,7 @@ TEST_CASE("transfer observers are independent of trace-only pixel observers", "[
     CHECK(observed.transfer_observer_enabled());
     CHECK(observed.pixel_observer_enabled());
     observed.phase(DatasetCompilePhase::Downloading);
-    observed.source_transfer(BenchmarkDatasetSource::kCoco2017, DownloadProgress{"coco-fixture", 5U, 11U, 3U, true}, 5U, 11U);
+    observed.source_transfer(DownloadProgress{"coco-fixture", 5U, 11U, 3U, true}, 5U, 11U);
     REQUIRE_FALSE(updates.empty());
     CHECK(updates.back().sources[0].completed_bytes == 5U);
     CHECK(updates.back().sources[0].total_bytes == 11U);
@@ -2073,9 +2076,11 @@ TEST_CASE("fresh segmented retries expose newly durable ranges without counting 
     constexpr std::size_t bytes = 512U * 1024U * 1024U;
     HttpServer server(bytes);
     DownloadRequest request{"objects365-fresh-retry", server.url("retry"), root.path() / "archive.bin", root.path() / "archive.lock", bytes, {}, 3U};
+    request.source = BenchmarkDatasetSource::kObjects365V2;
     server.TruncateNextTransfer();
     std::vector<DownloadProgress> updates;
     const auto downloaded = download_artifacts({request}, 2U, {}, [&](const DownloadProgress& update) { updates.push_back(update); });
+    CHECK(std::ranges::all_of(updates, [](const auto& update) { return update.source == BenchmarkDatasetSource::kObjects365V2; }));
     REQUIRE(downloaded.size() == 1U);
     REQUIRE_FALSE(updates.empty());
     CHECK(updates.front().completed_bytes == 0U);
@@ -2134,7 +2139,7 @@ TEST_CASE("artifact acquisition totals replace contributions without inventing u
     reporter.phase(DatasetCompilePhase::Downloading);
     const auto observe = [&](const BenchmarkDatasetSource source, const char* artifact, const std::uint64_t completed, const std::uint64_t total,
                              const std::uint64_t expected_completed, const std::uint64_t expected_total) {
-        totals.update(source, DownloadProgress{artifact, completed, total}, reporter);
+        totals.update(DownloadProgress{.artifact_id=artifact, .completed_bytes=completed, .total_bytes=total, .source=source}, reporter);
         CHECK(latest.completed == expected_completed);
         CHECK(latest.total == expected_total);
         CHECK(latest.current_source == source);
@@ -2154,14 +2159,14 @@ TEST_CASE("artifact acquisition totals replace contributions without inventing u
     observe(objects, "unknown", 3U, 3U, 22U, 37U);
     observe(coco, "known", 0U, 10U, 15U, 37U); // Restart of a known artifact.
     observe(coco, "known", 10U, 10U, 25U, 37U);
-    totals.update(coco, DownloadProgress{"known", 10U, 10U, 0U, false, true}, reporter);
+    totals.update(DownloadProgress{"known", 10U, 10U, 0U, false, true}, reporter);
     CHECK(latest.completed == 25U);
     CHECK(latest.total == 37U);
     CHECK(latest.sources[0].cache_hit);
     // A failed checked replacement leaves its prior contribution intact.
-    CHECK_THROWS_AS(totals.update(coco, DownloadProgress{"known", std::numeric_limits<std::uint64_t>::max(), 10U}, reporter), std::overflow_error);
+    CHECK_THROWS_AS(totals.update(DownloadProgress{"known", std::numeric_limits<std::uint64_t>::max(), 10U}, reporter), std::overflow_error);
     observe(coco, "known", 10U, 10U, 25U, 37U);
-    CHECK_THROWS_AS(totals.update(coco, DownloadProgress{"known", 10U, std::numeric_limits<std::uint64_t>::max()}, reporter), std::overflow_error);
+    CHECK_THROWS_AS(totals.update(DownloadProgress{"known", 10U, std::numeric_limits<std::uint64_t>::max()}, reporter), std::overflow_error);
     observe(coco, "known", 10U, 10U, 25U, 37U);
 }
 

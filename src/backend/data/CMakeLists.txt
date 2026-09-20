@@ -76,6 +76,8 @@ mmltk_register_ordinary_sources(mmltk_backend_data
     benchmark_cache.cpp
     benchmark_catalog.cpp
     benchmark_compiler.cpp
+    benchmark_custom_recipe.cpp
+    coconut_recipe.cpp
     benchmark_progress.cpp
     benchmark_storage.cpp
     open_images_acquisition.cpp
@@ -106,6 +108,7 @@ mmltk_register_private_headers(mmltk_backend_data
     detail/benchmark_cache.h
     detail/benchmark_catalog.h
     detail/benchmark_compiler.h
+    detail/benchmark_recipe.h
     detail/benchmark_progress.h
     detail/benchmark_storage.h
     detail/open_images_acquisition.h

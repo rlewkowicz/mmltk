@@ -30,6 +30,7 @@ inline constexpr std::string_view kCoconutNormalizationRevision = "coconut-exact
 [[nodiscard]] const CoconutReleaseComponent& coconut_release_component(CoconutEdition edition);
 [[nodiscard]] const CatalogArtifact& coconut_unlabeled_images_artifact();
 [[nodiscard]] const CatalogArtifact& coconut_validation_images_artifact();
+[[nodiscard]] std::span<const unsigned> coconut_objects_training_shards(CoconutEdition edition);
 [[nodiscard]] std::vector<CatalogArtifact> coconut_objects_training_artifacts(CoconutEdition edition);
 [[nodiscard]] std::string_view coconut_namespace_name(CoconutImageNamespace source);
 }  // namespace mmltk::backend::data::benchmark_internal

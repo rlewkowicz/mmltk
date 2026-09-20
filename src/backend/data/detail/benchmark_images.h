@@ -61,6 +61,8 @@ struct CachedImageDirectory {
 };
 [[nodiscard]] std::string cached_image_selection_digest(std::span<const std::uint64_t> image_ids);
 [[nodiscard]] std::filesystem::path cached_image_path(const std::filesystem::path& root, std::uint64_t image_id);
+// Caller holds the physical root source lease through invalidation and mutation.
+void invalidate_cached_image_proofs(const std::filesystem::path& root);
 void prepare_cached_image_directory(const std::filesystem::path& root);
 [[nodiscard]] std::size_t format_cached_image_relative_path(std::uint64_t image_id, std::span<char> output);
 [[nodiscard]] bool has_complete_jpeg_markers(std::span<const std::uint8_t> encoded) noexcept;
@@ -92,6 +94,7 @@ struct ArchiveExtractionRequest {
     std::size_t decompression_workers = 1U;
     std::size_t cache_write_workers = 1U;
     std::function<void(std::string_view)> activity;
+    std::filesystem::path completion_path;
 };
 [[nodiscard]] CachedImageDirectory extract_selected_archive_images(ArchiveExtractionRequest request);
 }  // namespace mmltk::backend::data::benchmark_internal

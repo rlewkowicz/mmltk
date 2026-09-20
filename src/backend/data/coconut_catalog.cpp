@@ -9,7 +9,7 @@ namespace {
 CatalogArtifact hf(std::string_view repo, std::string_view revision, std::string file, std::uint64_t bytes, std::string hash) {
     return {"coconut-" + std::string(repo) + "-" + std::filesystem::path(file).filename().string(),
             "https://huggingface.co/datasets/xdeng77/" + std::string(repo) + "/resolve/" + std::string(revision) + "/" + file,
-            std::filesystem::path(file).filename().string(), bytes, std::move(hash)};
+            std::filesystem::path(file).filename().string(), bytes, std::move(hash), BenchmarkDatasetSource::kCoconut};
 }
 }
 std::span<const CoconutReleaseComponent> coconut_release_catalog() {
@@ -43,17 +43,20 @@ const CatalogArtifact& coconut_unlabeled_images_artifact() {
 const CatalogArtifact& coconut_validation_images_artifact() {
     static const CatalogArtifact artifact{"coconut-objects365-validation-images",
         "https://drive.usercontent.google.com/download?id=1-wzLtddJucBVBJ67ailLrfMNmLGFag4i&export=download&confirm=t",
-        "object365_val_images.tar", 5084467200ULL, ""};
+        "object365_val_images.tar", 5084467200ULL, "", BenchmarkDatasetSource::kObjects365V1};
     return artifact;
+}
+std::span<const unsigned> coconut_objects_training_shards(CoconutEdition edition) {
+    static constexpr std::array large{32U, 35U, 40U, 50U};
+    static constexpr std::array xlarge{17U, 23U, 25U, 28U, 38U, 42U, 44U};
+    if (edition == CoconutEdition::Large) return large;
+    if (edition == CoconutEdition::XLarge) return xlarge;
+    throw std::invalid_argument("COCONut edition has no Objects365 training patches");
 }
 std::vector<CatalogArtifact> coconut_objects_training_artifacts(CoconutEdition edition) {
     const auto all = objects365_train_image_artifacts();
     std::vector<CatalogArtifact> result;
-    constexpr std::array large{32U, 35U, 40U, 50U};
-    constexpr std::array xlarge{17U, 23U, 25U, 28U, 38U, 42U, 44U};
-    const std::span<const unsigned> patches = edition == CoconutEdition::Large ? std::span<const unsigned>(large) : std::span<const unsigned>(xlarge);
-    if (edition != CoconutEdition::Large && edition != CoconutEdition::XLarge) throw std::invalid_argument("COCONut edition has no Objects365 training patches");
-    for (auto patch : patches) result.push_back(all.at(patch));
+    for (const auto patch : coconut_objects_training_shards(edition)) result.push_back(all.at(patch));
     return result;
 }
 std::string_view coconut_namespace_name(CoconutImageNamespace source) {

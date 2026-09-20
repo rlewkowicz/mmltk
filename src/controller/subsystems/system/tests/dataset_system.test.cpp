@@ -303,7 +303,7 @@ TEST_CASE("dataset admits real open ended acquisition and successful HTTP recove
     if (retry) server.fail_next(1, 8192U);
     if (redirect) server.RedirectNextTransfer();
     const DownloadRequest request{"metadata", server.url("metadata"), root.path() / "metadata.bin", root.path() / "metadata.lock",
-                                  unknown ? 0U : payload.size(), {}, 2U};
+                                  unknown ? 0U : payload.size(), {}, 2U, false, source};
     const DownloadRequest known{"known", server.url("known"), root.path() / "known.bin", root.path() / "known.lock", payload.size(), {}, 1U};
     if (mixed) {
         std::ofstream output(known.destination, std::ios::binary);
@@ -327,10 +327,10 @@ TEST_CASE("dataset admits real open ended acquisition and successful HTTP recove
         }, trace);
         ArtifactProgressTotals totals;
         reporter.phase(data::DatasetCompilePhase::Downloading);
-        if (mixed) (void)download_artifacts({known}, 1U, {}, [&](const auto& update) { totals.update(Source::kCoco2017, update, reporter); });
+        if (mixed) (void)download_artifacts({known}, 1U, {}, [&](const auto& update) { totals.update(update, reporter); });
         (void)download_artifacts({request}, 1U, {}, [&](const auto& update) {
             transfers.push_back(update);
-            totals.update(source, update, reporter);
+            totals.update(update, reporter);
         });
     };
     DatasetSystem dataset{settings, [&] { return std::make_unique<AcquisitionDatasetRuntime>(work); }, [&](DatasetSystem::event_type event) {

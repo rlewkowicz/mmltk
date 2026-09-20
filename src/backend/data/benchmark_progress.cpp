@@ -5,18 +5,16 @@
 #include <utility>
 namespace mmltk::backend::data::benchmark_internal {
 using Clock = std::chrono::steady_clock;
-ProgressReporter::ProgressReporter(BenchmarkProgressCallback callback, const BenchmarkTraceSink& trace) : callback_(std::move(callback)), trace_(&trace) {
+ProgressReporter::ProgressReporter(BenchmarkProgressCallback callback, const BenchmarkTraceSink& trace, std::span<const BenchmarkDatasetSource> sources) : callback_(std::move(callback)), trace_(&trace) {
     if (!callback_) { return; }
     const auto source_progress = [](const BenchmarkDatasetSource source) {
         BenchmarkSourceProgress progress;
         progress.source = source;
         return progress;
     };
-    state_.sources = {
-        source_progress(BenchmarkDatasetSource::kCoco2017),
-        source_progress(BenchmarkDatasetSource::kObjects365V2),
-        source_progress(BenchmarkDatasetSource::kOpenImagesV7),
-    };
+    constexpr BenchmarkDatasetSource custom_sources[]{BenchmarkDatasetSource::kCoco2017, BenchmarkDatasetSource::kObjects365V2, BenchmarkDatasetSource::kOpenImagesV7};
+    if (sources.empty()) sources = custom_sources;
+    for (const auto source : sources) state_.sources.push_back(source_progress(source));
 }
 void ProgressReporter::phase(const DatasetCompilePhase phase, const std::uint64_t completed, const std::uint64_t total) {
     if (!callback_ && !*trace_) { return; }
@@ -123,6 +121,7 @@ void ProgressReporter::set_source_activity_unlocked(const BenchmarkDatasetSource
     set_activity_unlocked(std::move(activity));
 }
 bool ProgressReporter::transfer_observer_enabled() const noexcept { return static_cast<bool>(callback_); }
+bool ProgressReporter::normalization_observer_enabled() const noexcept { return static_cast<bool>(callback_); }
 bool ProgressReporter::pixel_observer_enabled() const noexcept { return callback_ || (trace_ != nullptr && static_cast<bool>(*trace_)); }
 void ProgressReporter::projected(const std::uint64_t bytes) {
     if (!callback_) { return; }
@@ -157,10 +156,11 @@ void ProgressReporter::trace_activity(const std::optional<BenchmarkDatasetSource
         return fields;
     });
 }
-void ProgressReporter::source_transfer(const BenchmarkDatasetSource source, const DownloadProgress& update, const std::uint64_t completed,
+void ProgressReporter::source_transfer(const DownloadProgress& update, const std::uint64_t completed,
                                        const std::uint64_t total) {
     if (!callback_) { return; }
     const std::lock_guard lock(mutex_);
+    const auto source = update.source;
     auto& progress = source_progress(source);
     std::string operation;
     if (update.cache_hit) {
@@ -291,9 +291,10 @@ void ProgressReporter::update_source_phase_progress() {
         add_progress(state_.total, kSourceProgressScale, "benchmark extraction progress overflow");
     }
 }
-void ArtifactProgressTotals::update(const BenchmarkDatasetSource source, const DownloadProgress& update, ProgressReporter& reporter) {
+void ArtifactProgressTotals::update(const DownloadProgress& update, ProgressReporter& reporter) {
     if (!reporter.transfer_observer_enabled()) { return; }
     const std::lock_guard lock(mutex_);
+    const auto source = update.source;
     auto& totals = sources_[source];
     const auto previous = totals.artifacts.find(update.artifact_id);
     const bool observed = previous != totals.artifacts.end();
@@ -311,7 +312,7 @@ void ArtifactProgressTotals::update(const BenchmarkDatasetSource source, const D
     totals.completed = completed;
     totals.known_total = known_total;
     totals.unknown_count = unknown_count;
-    reporter.source_transfer(source, update, completed, unknown_count == 0U ? known_total : 0U);
+    reporter.source_transfer(update, completed, unknown_count == 0U ? known_total : 0U);
 }
 void ProgressReporter::emit() {
     if (callback_) {

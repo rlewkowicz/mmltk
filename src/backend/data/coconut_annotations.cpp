@@ -1,5 +1,6 @@
 #include "detail/coconut_annotations.h"
 #include "detail/coconut_inventory.h"
+#include "detail/benchmark_storage.h"
 #include "src/frameworks/reflection/reflected_field_policy.h"
 #include "src/common/io/file_digest.h"
 #include "src/common/io/file_memory.h"
@@ -177,7 +178,7 @@ concept InventoryRecord = std::same_as<T, CoconutPhysicalImage> || std::same_as<
 // are transient; records remain in their ordinary typed inventory owner.
 class InventoryOutput final {
  public:
-    InventoryOutput(mmltk::common::io::FileHandle* file, Cancellation cancellation) : file_(file), cancellation_(cancellation) {}
+    InventoryOutput(mmltk::common::io::FileHandle* file, Cancellation cancellation, bool count_only = false) : file_(file), cancellation_(cancellation), count_only_(count_only) {}
     template<class T> void value(const T& item) {
         if constexpr (InventoryRecord<T>) {
             mmltk::frameworks::reflection::visit_materialized_members<T>([&]<class Declaration>(const auto&) { value(item.*Declaration::pointer); });
@@ -195,7 +196,9 @@ class InventoryOutput final {
             append(bytes);
         }
     }
+    [[nodiscard]] std::uint64_t byte_size() const { return mmltk::common::math::checked_add<std::uint64_t>(offset_,32U,"inventory extent overflow"); }
     std::string finish() {
+        if (count_only_) return {};
         flush();
         const auto digest = hash_.Finish();
         if (file_) file_->pwrite_all(digest.data(),digest.size(),offset_);
@@ -204,6 +207,7 @@ class InventoryOutput final {
     }
  private:
     void append(std::span<const std::uint8_t> bytes) {
+        if (count_only_) { offset_ = mmltk::common::math::checked_add(offset_,bytes.size(),"inventory extent overflow"); return; }
         while (!bytes.empty()) {
             const auto count = std::min(bytes.size(),buffer_.size()-used_);
             std::memcpy(buffer_.data()+used_,bytes.data(),count);
@@ -221,6 +225,7 @@ class InventoryOutput final {
     }
     mmltk::common::io::FileHandle* file_;
     Cancellation cancellation_;
+    bool count_only_ = false;
     mmltk::common::io::Sha256Hasher hash_;
     std::array<std::uint8_t,65536> buffer_{};
     std::size_t used_ = 0, offset_ = 0;
@@ -308,6 +313,9 @@ template<InventoryRecord T> std::string store_inventory(const std::filesystem::p
     std::span<const T> records, std::string_view expected_identity, Cancellation cancellation) {
     throw_if_benchmark_cancelled(cancellation);
     (void)mmltk::common::io::ensure_parent_directory(path);
+    InventoryOutput extent(nullptr,cancellation,true);
+    (void)encode_inventory(extent,header,records,cancellation);
+    require_storage(path,extent.byte_size(),"COCONut inventory staging",{});
     std::string temporary=path.string()+".tmp.XXXXXX";
     auto file=mmltk::common::io::FileHandle::create_unique_output(temporary,0);
     StagingFileCleanup cleanup(temporary);
@@ -370,12 +378,8 @@ class Importer final {
  public:
     explicit Importer(const CoconutImportRequest& request) : request_(request) {
         if (request.input_identity.empty()) invalid("missing pinned input identity");
-        physical_.reserve(request.physical_images.size());
-        for (const auto& image : request.physical_images) {
-            throw_if_benchmark_cancelled(request.cancellation);
-            validate_physical(image);
-            if (!physical_.emplace(physical_key(image.source, image.image_id), &image).second) invalid("duplicate physical member: " + image.member);
-        }
+        if (!request.physical_membership) invalid("missing physical membership admission");
+        if (request_.progress) request_.progress(0);
     }
     void consume(const CoconutRecord& record, std::span<const std::uint8_t> png) {
         throw_if_benchmark_cancelled(request_.cancellation);
@@ -385,9 +389,10 @@ class Importer final {
         try { normalize(record, physical, png); }
         catch (const std::exception& error) { invalid(physical.member + ": " + error.what()); }
         ++rows_;
-        if (request_.progress) request_.progress(rows_);
+        if (request_.progress && rows_ % kProgressQuantum == 0) request_.progress(rows_);
     }
     std::vector<CoconutComponent> finish() {
+        if (request_.progress && rows_ % kProgressQuantum != 0) request_.progress(rows_);
         throw_if_benchmark_cancelled(request_.cancellation);
         if (rows_ == 0) invalid("selected release contains no offered image rows");
         if (request_.expected_rows != 0 && rows_ != request_.expected_rows) invalid("offered row count does not match the selected release");
@@ -405,26 +410,26 @@ class Importer final {
         return result;
     }
  private:
+    static constexpr std::uint64_t kProgressQuantum = 64;
     const CoconutPhysicalImage& resolve(const CoconutRecord& record) const {
         if (request_.edition == CoconutEdition::Base || request_.edition == CoconutEdition::RelabeledValidation) {
             if (coco_name(record.file_name) != record.image_id) invalid("COCO row filename/image_id mismatch: " + record.file_name);
             const CoconutPhysicalImage* match = nullptr;
             for (auto source : {CoconutImageNamespace::CocoTrain, CoconutImageNamespace::CocoUnlabeled, CoconutImageNamespace::CocoValidation}) {
                 if ((source == CoconutImageNamespace::CocoValidation) != (request_.edition == CoconutEdition::RelabeledValidation)) continue;
-                auto found = physical_.find(physical_key(source, record.image_id));
-                if (found != physical_.end()) {
+                if (const auto* found = request_.physical_membership->find(source,record.image_id)) {
                     if (match) invalid("ambiguous COCO train/unlabeled membership: " + record.file_name);
-                    match = found->second;
+                    match = found;
                 }
             }
-            if (!match) invalid("missing physical COCO archive member: " + record.file_name);
+            if (!match) throw CoconutPhysicalMembershipError(request_.edition == CoconutEdition::Base ? CoconutImageNamespace::CocoTrain : CoconutImageNamespace::CocoValidation, record.image_id, "missing physical COCO archive member: " + record.file_name);
             return *match;
         }
         const auto name = objects_name(record.physical_stem);
         if (request_.edition != CoconutEdition::ObjectsValidation && name.source != CoconutImageNamespace::Objects365V2) invalid("training extension requires Objects365 v2");
-        const auto found = physical_.find(physical_key(name.source, name.id));
-        if (found == physical_.end()) invalid("missing physical Objects365 archive member: " + record.physical_stem);
-        return *found->second;
+        const auto* found = request_.physical_membership->find(name.source,name.id);
+        if (!found) throw CoconutPhysicalMembershipError(name.source, name.id, "missing physical Objects365 archive member: " + record.physical_stem);
+        return *found;
     }
     void normalize(const CoconutRecord& record, const CoconutPhysicalImage& physical, std::span<const std::uint8_t> png) {
         const auto& limits = request_.limits;
@@ -519,7 +524,6 @@ class Importer final {
         component.inventory.push_back({physical, record.image_id, record.source_ordinal});
     }
     const CoconutImportRequest& request_;
-    std::unordered_map<PhysicalKey, const CoconutPhysicalImage*, PhysicalKeyHash> physical_;
     std::unordered_set<PhysicalKey, PhysicalKeyHash> offered_;
     std::map<CoconutImageNamespace, CoconutComponent> components_;
     std::unordered_map<std::uint32_t, std::size_t> segment_by_id_;
@@ -726,6 +730,22 @@ void validate_component(const CoconutComponent& component, Cancellation cancella
     }
 }
 }  // namespace
+CoconutPhysicalMembership::CoconutPhysicalMembership(std::span<const CoconutPhysicalImage> images, Cancellation cancellation) {
+    std::unordered_map<CoconutImageNamespace,std::size_t> counts;
+    for (const auto& image : images) { throw_if_benchmark_cancelled(cancellation); ++counts[image.source]; }
+    for (const auto& [source,count] : counts) { (void)coconut_namespace_name(source); namespaces_[source].reserve(count); }
+    for (const auto& image : images) {
+        throw_if_benchmark_cancelled(cancellation);
+        validate_physical(image);
+        if (!namespaces_.at(image.source).emplace(image.image_id,&image).second) invalid("duplicate physical member: " + image.member);
+    }
+}
+const CoconutPhysicalImage* CoconutPhysicalMembership::find(CoconutImageNamespace source, std::uint64_t id) const noexcept {
+    const auto space=namespaces_.find(source);
+    if (space==namespaces_.end()) return nullptr;
+    const auto found=space->second.find(id);
+    return found==space->second.end() ? nullptr : found->second;
+}
 std::vector<CoconutComponent> import_coconut_annotations(const CoconutImportRequest& request) {
     (void)coconut_release_component(request.edition);
     Importer importer(request);
