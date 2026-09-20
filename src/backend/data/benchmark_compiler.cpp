@@ -528,13 +528,9 @@ class RequiredImageDecodeError : public std::runtime_error {
             invalidate_download_artifact(request, cancel_requested, trace);
             retained.reset();
             request.redownload = true;
-            if (!require_every_image) {
+            // The root is shared by selections. Archive corruption invalidates
+            // proof metadata, not otherwise valid JPEGs retained in this root.
             invalidate_cached_image_proofs(image_root);
-            std::error_code cleanup_error;
-            if (!common_io::remove_tree_no_follow(image_root, cleanup_error)) {
-                throw std::filesystem::filesystem_error("cannot clear failed benchmark extraction", image_root, cleanup_error);
-            }
-            }
             trace_benchmark_event(trace, "benchmark.images.archive_retry",
                                   [&] { return nlohmann::json{{"source", source_name}, {"shard", shard}, {"attempt", attempt}, {"reason", failure_reason}}; });
         }
@@ -980,6 +976,16 @@ void benchmark_internal::compile_benchmark_recipe(BenchmarkCompilerConfig config
         std::uint16_t numeric_shard = 0;
         AdmittedRecipeArchive* admitted = nullptr;
     };
+    const auto archive_member_parser = [](const ArchiveTask& task) -> ArchiveImageIdParser {
+        if (task.members.empty()) return {};
+        return [&task](std::string_view raw) -> std::optional<std::uint64_t> {
+            // Extraction visits directory headers too; inventory admits these roots.
+            if (raw == "." || raw == "./") return std::nullopt;
+            const auto member = canonical_coconut_archive_member(raw);
+            const auto found = task.members.find(member);
+            return found == task.members.end() ? std::nullopt : std::optional(found->second);
+        };
+    };
     std::vector<ArchiveTask> archive_tasks;
     if (enhanced) {
         std::map<std::pair<CoconutImageNamespace, std::uint16_t>, std::size_t> task_slots;
@@ -1080,10 +1086,7 @@ void benchmark_internal::compile_benchmark_recipe(BenchmarkCompilerConfig config
                             acquire_archive_images(cache, task.source, task.shard, task.image_ids, task.artifact, cancel_requested, &progress,
                                                    &image_transfer_progress, &cache_storage_reservations, source_total, decompression_workers,
                                                    archive_cache_workers, archive_download_connections, trace, {}, coconut,
-                                                   task.members.empty() ? ArchiveImageIdParser{} : ArchiveImageIdParser{[&task](std::string_view member) -> std::optional<std::uint64_t> {
-                                                       const auto found = task.members.find(std::string(member));
-                                                       return found == task.members.end() ? std::nullopt : std::optional(found->second);
-                                                   }}, completion_slot, task.admitted);
+                                                   archive_member_parser(task), completion_slot, task.admitted);
                     } catch (...) {
                         record_pipeline_error();
                         return;
@@ -1343,10 +1346,7 @@ void benchmark_internal::compile_benchmark_recipe(BenchmarkCompilerConfig config
         CachedImageDirectory repaired = acquire_archive_images(cache, task->source, task->shard, task->image_ids, task->artifact, cancel_requested, &progress,
                                                                &repair_transfer_progress, &cache_storage_reservations, task->image_ids.size(),
                                                                decompression_workers, archive_cache_workers, archive_download_connections, trace, decode_probe, coconut,
-                                                               task->members.empty() ? ArchiveImageIdParser{} : ArchiveImageIdParser{[&](std::string_view member) -> std::optional<std::uint64_t> {
-                                                                   const auto found = task->members.find(std::string(member));
-                                                                   return found == task->members.end() ? std::nullopt : std::optional(found->second);
-                                                               }}, completion_slot, task->admitted);
+                                                               archive_member_parser(*task), completion_slot, task->admitted);
         if (repaired.image_count + repaired.quarantined.size() != task->image_ids.size()) {
             throw std::runtime_error(
                 "archive repair did not resolve every selected "

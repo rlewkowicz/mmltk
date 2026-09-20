@@ -54,11 +54,12 @@ void tar(const std::filesystem::path& path, std::span<const std::pair<std::strin
     for (const auto& [name, bytes] : members) {
         std::unique_ptr<archive_entry, decltype(&archive_entry_free)> entry(archive_entry_new(), archive_entry_free);
         archive_entry_set_pathname(entry.get(), name.c_str()); archive_entry_set_perm(entry.get(), 0644);
-        archive_entry_set_filetype(entry.get(), symlink ? AE_IFLNK : AE_IFREG);
+        const bool directory = name == "." || name == "./";
+        archive_entry_set_filetype(entry.get(), symlink ? AE_IFLNK : directory ? AE_IFDIR : AE_IFREG);
         if (symlink) archive_entry_set_symlink(entry.get(), "other");
-        archive_entry_set_size(entry.get(), symlink ? 0 : bytes.size());
+        archive_entry_set_size(entry.get(), symlink || directory ? 0 : bytes.size());
         REQUIRE(archive_write_header(writer.get(), entry.get()) == ARCHIVE_OK);
-        if (!symlink) REQUIRE(archive_write_data(writer.get(), bytes.data(), bytes.size()) == static_cast<la_ssize_t>(bytes.size()));
+        if (!symlink && !directory) REQUIRE(archive_write_data(writer.get(), bytes.data(), bytes.size()) == static_cast<la_ssize_t>(bytes.size()));
     }
     REQUIRE(archive_write_close(writer.get()) == ARCHIVE_OK);
 }
@@ -430,7 +431,7 @@ TEST_CASE("COCONut version-1 physical inventory has fixed bytes and admits exist
     mmltk::testsupport::write_text_file(cache, expected);
     CHECK(coconut_image_archive_inventory(archive, cache, CoconutImageNamespace::Objects365V1, 0x1234, "a") == wanted);
     CHECK_FALSE(std::filesystem::exists(archive));
-    const std::array<std::pair<std::string, std::string>, 1> members{{{wanted[0].member, "jpeg"}}};
+    const std::array<std::pair<std::string, std::string>, 3> members{{{".", ""}, {"./", ""}, {"./image//./objects365_v1_00091105.jpg", "jpeg"}}};
     tar(archive, members);
     const auto emitted = root.path() / "emitted.bin";
     CHECK(coconut_image_archive_inventory(archive, emitted, CoconutImageNamespace::Objects365V1, 0x1234, "a") == wanted);
@@ -484,6 +485,14 @@ TEST_CASE("COCONut version-1 component inventory pins nested physical release an
     CHECK(file_bytes(inventory_path) == expected);
     CHECK(file_bytes(path) == index_bytes);
 }
+TEST_CASE("COCONut physical member spelling preserves exact paths and rejects unsafe names", "[coconut]") {
+    CHECK(canonical_coconut_archive_member("././train2017//./000000000007.jpg")=="train2017/000000000007.jpg");
+    CHECK(canonical_coconut_archive_member("nested/./image//objects365_v1_00091105.jpg")=="nested/image/objects365_v1_00091105.jpg");
+    for (const std::string raw : {std::string("/train2017/a.jpg"), std::string("../a.jpg"), std::string("train2017/../a.jpg"),
+                                  std::string("train2017\\a.jpg"), std::string("train2017/a\0.jpg",16)}) {
+        CHECK_THROWS(canonical_coconut_archive_member(raw));
+    }
+}
 TEST_CASE("COCONut full physical inventories are identity-bound and independent of foreground labels", "[coconut]") {
     ScopedTempDir root("coconut-inventory");
     const auto archive = root.path() / "images.tar", cache = root.path() / "inventory.json";
@@ -495,7 +504,7 @@ TEST_CASE("COCONut full physical inventories are identity-bound and independent 
     std::filesystem::remove(archive);
     CHECK(coconut_image_archive_inventory(archive, cache, CoconutImageNamespace::CocoUnlabeled, 0, "pinned-archive") == result);
     CHECK_THROWS(coconut_image_archive_inventory(archive, cache, CoconutImageNamespace::CocoUnlabeled, 0, "changed-archive"));
-    const std::array<std::pair<std::string,std::string>,2> duplicate{{members[0],members[0]}};
+    const std::array<std::pair<std::string,std::string>,2> duplicate{{members[0],{"./unlabeled2017//./000000000007.jpg","jpeg7"}}};
     tar(archive, duplicate);
     CHECK_THROWS(coconut_image_archive_inventory(archive, {}, CoconutImageNamespace::CocoUnlabeled, 0, "duplicate-archive"));
 }
@@ -720,7 +729,7 @@ std::string white_jpeg() {
 struct LocalCoconutRecipe {
     BenchmarkCacheLayout cache;
     CoconutRecipeCatalog catalog;
-    explicit LocalCoconutRecipe(const std::filesystem::path& root, bool fully_covered = false, bool disjoint = false) : cache(BenchmarkCacheLayout::create(root / "cache")) {
+    explicit LocalCoconutRecipe(const std::filesystem::path& root, bool fully_covered = false, bool disjoint = false, bool alternate_members = false) : cache(BenchmarkCacheLayout::create(root / "cache")) {
         catalog.coco_validation_images = 1;
         const auto jpeg = white_jpeg();
         const auto physical_archive = [&](CoconutImageNamespace source, BenchmarkDatasetSource progress_source, std::string shard,
@@ -728,7 +737,15 @@ struct LocalCoconutRecipe {
             const auto id = std::string(coconut_namespace_name(source));
             const auto path = cache.source_downloads(benchmark_source_name(progress_source)) / (id + ".tar");
             std::vector<std::pair<std::string,std::string>> contents;
-            for (const auto& name : members) contents.emplace_back(name,jpeg);
+            if (alternate_members) { contents.emplace_back(".", ""); contents.emplace_back("./", ""); }
+            for (const auto& name : members) {
+                auto spelling = name;
+                if (alternate_members) {
+                    spelling.insert(spelling.find('/'), "/./");
+                    spelling = "././" + spelling;
+                }
+                contents.emplace_back(std::move(spelling),jpeg);
+            }
             tar(path,contents);
             catalog.images.push_back({source,number,std::move(shard), {id,"http://127.0.0.1:1/"+id,path.filename().string(),std::filesystem::file_size(path),"",progress_source}});
         };
@@ -793,7 +810,10 @@ struct LocalCoconutRecipe {
 }
 TEST_CASE("COCONut private catalog compiles all validation choices through the production transaction", "[coconut][benchmark]") {
     ScopedTempDir root("coconut-recipe");
-    LocalCoconutRecipe local(root.path());
+    bool alternate_members = false;
+    SECTION("canonical physical members") {}
+    SECTION("equivalent physical members and archive roots") { alternate_members = true; }
+    LocalCoconutRecipe local(root.path(),false,false,alternate_members);
     BenchmarkCompilerConfig config;
     config.output_dir=root.path()/"compiled"; config.cache_dir=local.cache.root; config.resolution=3; config.num_workers=1; config.overwrite=true;
     config.selection.dataset=BenchmarkDatasetVariant::Coconut;
@@ -841,6 +861,17 @@ TEST_CASE("COCONut private catalog compiles all validation choices through the p
             if (enhanced_identity.empty()) enhanced_identity=identity; else CHECK(identity==enhanced_identity);
         }
     }
+    // A same-size damaged cached JPEG retains the proof fast path until the
+    // writer requests repair, exercising the second production parser caller.
+    const auto validation_bytes=file_bytes(config.output_dir/"val.bin");
+    mmltk::testsupport::write_text_file(jpeg_path,std::string(std::filesystem::file_size(jpeg_path),'x'));
+    const auto repair_catalog=local.selected(config.selection.validation);
+    unsigned replacement_downloads=0;
+    config.trace=[&](std::string_view event,std::string_view) { if(event=="benchmark.download.complete") ++replacement_downloads; };
+    compile_benchmark_recipe(config,&repair_catalog);
+    CHECK(replacement_downloads==0);
+    CHECK(file_bytes(config.output_dir/"train.bin")==original_train);
+    CHECK(file_bytes(config.output_dir/"val.bin")==validation_bytes);
     const auto published=file_bytes(config.output_dir/"train.bin");
     std::atomic<bool> cancel{false};
     config.cancel_requested=mmltk::common::concurrency::CancellationObservation::Atomic(cancel);
@@ -1206,6 +1237,66 @@ TEST_CASE("custom and COCONut production transactions preserve output and shared
     }
     CHECK(file_bytes(config.output_dir/"train.bin")==custom_train); CHECK(file_bytes(config.output_dir/"val.bin")==custom_val);
     CHECK(file_bytes(config.output_dir/"benchmark_manifest.json")==published_manifest); server.Check();
+}
+
+TEST_CASE("custom archive structural recovery preserves JPEGs from other selections", "[benchmark][coconut][download]") {
+    ScopedTempDir root("custom-shared-archive-recovery"); LocalCoconutRecipe local(root.path());
+    auto custom=local_custom_catalog(local);
+    auto& artifact=custom.objects_images.at(32);
+    const auto archive=local.cache.source_downloads("objects365")/artifact.filename;
+    const auto pristine=file_bytes(archive);
+    const std::string malformed(pristine.size(),'x');
+    std::vector<std::uint8_t> payload(pristine.begin(),pristine.end());
+    mmltk::backend::data::testsupport::HttpServer server(payload); artifact.url=server.url("custom-structural");
+    auto coconut=local.selected(CoconutValidation::CoconutStock);
+    std::ranges::find(coconut.images,CoconutImageNamespace::Objects365V2,&RecipeImageArchive::source)->artifact.url=artifact.url;
+    BenchmarkCompilerConfig config; config.output_dir=root.path()/"compiled"; config.cache_dir=local.cache.root;
+    config.resolution=3; config.num_workers=1; config.overwrite=true;
+    config.selection={BenchmarkDatasetVariant::Coconut,CoconutValidation::CoconutStock};
+    compile_benchmark_recipe(config,&coconut);
+    config.selection.dataset=BenchmarkDatasetVariant::CocoCustom;
+    compile_benchmark_recipe(config,nullptr,&custom);
+    check_custom_compilation(config.output_dir);
+    const auto train=file_bytes(config.output_dir/"train.bin"), val=file_bytes(config.output_dir/"val.bin");
+    REQUIRE(server.requests()==0);
+    const auto manifest=file_bytes(config.output_dir/"benchmark_manifest.json");
+    const auto images=local.cache.source_images("objects365")/"patch-32";
+    const auto retained=cached_image_path(images,2);
+    const auto retained_bytes=file_bytes(retained);
+    struct stat before{}; REQUIRE(::stat(retained.c_str(),&before)==0);
+    const auto retained_time=std::filesystem::last_write_time(retained);
+    REQUIRE_FALSE(std::filesystem::is_empty(images/".recipe-proofs"));
+    bool exhausted=false, cancelled=false;
+    SECTION("successful retry retains unrelated bytes and allocation") {}
+    SECTION("all three attempts fail without replacing publication") { exhausted=true; std::ranges::copy(malformed,payload.begin()); }
+    SECTION("cancellation after structural diagnosis retains publication") { cancelled=true; }
+    // Remove only the selected JPEG/proof; the other recipe's proof and JPEG
+    // remain until real archive failure invalidates shared completion evidence.
+    std::filesystem::remove(cached_image_path(images,1));
+    std::filesystem::remove(images/".complete.json");
+    mmltk::testsupport::write_text_file(archive,malformed);
+    std::atomic<bool> stop{false};
+    config.cancel_requested=mmltk::common::concurrency::CancellationObservation::Atomic(stop);
+    unsigned retries=0, diagnoses=0;
+    config.trace=[&](std::string_view event,std::string_view fields) {
+        const auto facts=Json::parse(fields);
+        if(event=="benchmark.download.failure_sha256" && facts.value("artifact",std::string{})==artifact.artifact_id) ++diagnoses;
+        if(event=="benchmark.images.archive_retry" && facts.value("source",std::string{})=="objects365") {
+            ++retries;
+            if(cancelled) stop=true;
+        }
+    };
+    if(exhausted || cancelled) CHECK_THROWS(compile_benchmark_recipe(config,nullptr,&custom));
+    else { compile_benchmark_recipe(config,nullptr,&custom); check_custom_compilation(config.output_dir); }
+    CHECK(diagnoses==(exhausted?3U:1U)); CHECK(retries==(exhausted?2U:1U));
+    CHECK(server.requests()==(cancelled?0U:exhausted?2U:1U));
+    CHECK(std::filesystem::is_empty(images/".recipe-proofs"));
+    CHECK(file_bytes(retained)==retained_bytes);
+    struct stat after{}; REQUIRE(::stat(retained.c_str(),&after)==0); CHECK(after.st_ino==before.st_ino);
+    CHECK(std::filesystem::last_write_time(retained)==retained_time);
+    CHECK(file_bytes(config.output_dir/"train.bin")==train); CHECK(file_bytes(config.output_dir/"val.bin")==val);
+    if(exhausted || cancelled) CHECK(file_bytes(config.output_dir/"benchmark_manifest.json")==manifest);
+    server.Check();
 }
 
 TEST_CASE("one physical admission budget governs membership extraction and writer recovery identities", "[coconut][benchmark][download]") {

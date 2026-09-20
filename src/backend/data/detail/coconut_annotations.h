@@ -92,6 +92,8 @@ struct CoconutImportRequest {
 // Removes only XL rows covered by Large, retaining B and all namespace distinctions.
 [[nodiscard]] std::uint64_t reconcile_coconut_extensions(std::vector<CoconutComponent>& components,
     mmltk::common::concurrency::CancellationObservation cancellation = {});
+// Canonical relative member spelling; rejects absolute paths, traversal, backslashes and NUL.
+[[nodiscard]] std::string canonical_coconut_archive_member(std::string_view raw);
 // Full archive inventory, independent of annotations/foreground selection. Cache is identity-bound.
 [[nodiscard]] std::vector<CoconutPhysicalImage> coconut_image_archive_inventory(
     const std::filesystem::path& archive_path, const std::filesystem::path& cache_path,

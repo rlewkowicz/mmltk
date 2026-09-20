@@ -38,16 +38,9 @@ std::uint64_t decimal(std::string_view value) {
     if (value.empty() || error != std::errc{} || end != value.data() + value.size() || value.front() == '+' || value.front() == '-') invalid("invalid decimal image identity: " + std::string(value));
     return id;
 }
-std::string safe_member(std::string_view raw) {
-    while (raw.starts_with("./")) raw.remove_prefix(2);
-    if (raw.empty() || raw.front() == '/' || raw.find('\\') != std::string_view::npos || raw.find('\0') != std::string_view::npos) invalid("unsafe archive member: " + std::string(raw));
-    std::filesystem::path path(raw);
-    for (const auto& part : path) if (part == "..") invalid("traversing archive member: " + std::string(raw));
-    return path.lexically_normal().generic_string();
-}
 struct PhysicalName { CoconutImageNamespace source; std::uint64_t id; std::string stem; };
 PhysicalName objects_name(std::string_view name) {
-    const std::filesystem::path path(safe_member(name));
+    const std::filesystem::path path(canonical_coconut_archive_member(name));
     const auto extension = path.extension().string();
     if (!extension.empty() && extension != ".png" && extension != ".jpg" && extension != ".json") invalid("unsupported Objects365 member: " + std::string(name));
     const auto stem = path.stem().string();
@@ -58,7 +51,7 @@ PhysicalName objects_name(std::string_view name) {
     return {source, decimal(std::string_view(stem).substr(prefix.size())), stem};
 }
 std::uint64_t coco_name(std::string_view name) {
-    const std::filesystem::path path(safe_member(name));
+    const std::filesystem::path path(canonical_coconut_archive_member(name));
     if ((path.extension() != ".jpg" && path.extension() != ".png") || path.stem().string().size() != 12U) invalid("invalid COCO filename: " + std::string(name));
     return decimal(path.stem().string());
 }
@@ -78,7 +71,7 @@ const CategoryLookup& coconut_categories() {
     return lookup;
 }
 void validate_physical(const CoconutPhysicalImage& image) {
-    if (image.archive_identity.empty() || image.member != safe_member(image.member)) invalid("invalid physical inventory identity");
+    if (image.archive_identity.empty() || image.member != canonical_coconut_archive_member(image.member)) invalid("invalid physical inventory identity");
     if (std::filesystem::path(image.member).extension() != ".jpg") invalid("physical member is not JPEG: " + image.member);
     if (image.source == CoconutImageNamespace::Objects365V1 || image.source == CoconutImageNamespace::Objects365V2) {
         const auto name = objects_name(image.member);
@@ -106,7 +99,7 @@ class Archive final {
         if (status != ARCHIVE_OK) fail("reading archive header");
         const char* name = archive_entry_pathname(entry_);
         if (!name) invalid("archive member has no name");
-        member_ = archive_entry_filetype(entry_) == AE_IFDIR && (std::string_view(name) == "." || std::string_view(name) == "./") ? "." : safe_member(name);
+        member_ = archive_entry_filetype(entry_) == AE_IFDIR && (std::string_view(name) == "." || std::string_view(name) == "./") ? "." : canonical_coconut_archive_member(name);
         if (archive_entry_symlink(entry_) || archive_entry_hardlink(entry_) ||
             (archive_entry_filetype(entry_) != AE_IFREG && archive_entry_filetype(entry_) != AE_IFDIR)) invalid("unsupported archive entry: " + member_);
         return true;
@@ -730,6 +723,13 @@ void validate_component(const CoconutComponent& component, Cancellation cancella
     }
 }
 }  // namespace
+std::string canonical_coconut_archive_member(std::string_view raw) {
+    while (raw.starts_with("./")) raw.remove_prefix(2);
+    if (raw.empty() || raw.front() == '/' || raw.find('\\') != std::string_view::npos || raw.find('\0') != std::string_view::npos) invalid("unsafe archive member: " + std::string(raw));
+    std::filesystem::path path(raw);
+    for (const auto& part : path) if (part == "..") invalid("traversing archive member: " + std::string(raw));
+    return path.lexically_normal().generic_string();
+}
 CoconutPhysicalMembership::CoconutPhysicalMembership(std::span<const CoconutPhysicalImage> images, Cancellation cancellation) {
     std::unordered_map<CoconutImageNamespace,std::size_t> counts;
     for (const auto& image : images) { throw_if_benchmark_cancelled(cancellation); ++counts[image.source]; }
