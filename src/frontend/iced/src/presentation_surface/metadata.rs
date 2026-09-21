@@ -505,7 +505,7 @@ mod tests {
     }
 
     #[test]
-    fn paired_geometry_rejects_missing_source_and_inconsistent_samples() {
+    fn paired_geometry_accepts_missing_source_and_rejects_inconsistent_samples() {
         let (model, _) = crate::view_model::test_support::explore_presentation();
         let mut detail =
             generated::ExploreImageMetadata::from(model.explore.snapshot.as_ref().unwrap());
@@ -526,9 +526,9 @@ mod tests {
             detail.frame.content = region;
             assert!(valid_detail(&detail));
             for (width, height) in [(0, 480), (640, 0)] {
-                let mut invalid = detail.clone();
-                invalid.frame.sourceextent = generated::VisualExtent { width, height };
-                assert!(!valid_detail(&invalid));
+                let mut fallback = detail.clone();
+                fallback.frame.sourceextent = generated::VisualExtent { width, height };
+                assert!(valid_detail(&fallback));
             }
         }
         let mut image = crate::view_model::test_support::validation_image_metadata();

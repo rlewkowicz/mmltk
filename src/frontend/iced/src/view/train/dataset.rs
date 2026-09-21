@@ -426,6 +426,7 @@ mod tests {
         train.benchmarkselection.dataset = BenchmarkDatasetVariant::Coconut;
         let mut element = view(Some(&train), &model, true, true);
         let mut tree = widget::Tree::new(&element);
+        tree.diff(&mut element);
         let size = Size::new(1000.0, 4000.0);
         let node =
             element
@@ -522,8 +523,10 @@ mod tests {
         let settings = installed_settings_model();
         let mut train = settings.draft.as_ref().unwrap().workflows.train.clone();
         let shape = |train: &crate::generated::TrainViewState, enabled| {
-            let view = benchmark_choices(train, enabled);
-            nodes(&iced::advanced::widget::Tree::new(&view))
+            let mut view = benchmark_choices(train, enabled);
+            let mut tree = iced::advanced::widget::Tree::new(&view);
+            tree.diff(&mut view);
+            nodes(&tree)
         };
         train.compilebenchmarkdatasetoverride = false;
         let hidden = shape(&train, true);
