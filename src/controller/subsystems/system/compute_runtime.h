@@ -6,11 +6,11 @@
 #include "src/frameworks/gpu/device_execution.h"
 namespace mmltk::controller {
 struct DirectComputeConfiguration final {
-    std::optional<mmltk::frameworks::gpu::DeviceExecution> execution;
-    [[nodiscard]] bool valid() const noexcept {
-        return execution && execution->device >= 0 && execution->placement.numa_node >= 0 && !execution->placement.cpus.empty();
-    }
-    [[nodiscard]] std::optional<mmltk::common::system::ExecutionPolicyRequest> worker_policy() const;
+ std::optional<mmltk::frameworks::gpu::DeviceExecution> execution;
+ [[nodiscard]] bool valid() const noexcept {
+  return execution && execution->device >= 0 && execution->placement.numa_node >= 0 && !execution->placement.cpus.empty();
+ }
+ [[nodiscard]] std::optional<mmltk::common::system::ExecutionPolicyRequest> worker_policy() const;
 };
 using ComputeProgressSink = std::function<void(const contracts::ComputeProgress&)>;
 // The synchronous work boundary admits progress and one terminal. Runtime,

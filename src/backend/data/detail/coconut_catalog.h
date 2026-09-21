@@ -15,11 +15,11 @@ static_assert(static_cast<std::uint8_t>(CoconutImageNamespace::CocoTrain) == 0 &
               static_cast<std::uint8_t>(CoconutImageNamespace::CocoValidation) == 2 && static_cast<std::uint8_t>(CoconutImageNamespace::Objects365V1) == 3 &&
               static_cast<std::uint8_t>(CoconutImageNamespace::Objects365V2) == 4);
 struct CoconutReleaseComponent {
-    CoconutEdition edition;
-    std::string_view name;
-    std::string_view revision;
-    std::uint64_t expected_rows;
-    std::vector<CatalogArtifact> annotations;
+ CoconutEdition edition;
+ std::string_view name;
+ std::string_view revision;
+ std::uint64_t expected_rows;
+ std::vector<CatalogArtifact> annotations;
 };
 inline constexpr std::string_view kCoconutNormalizationRevision = "coconut-exact-rgb-rle-v1";
 [[nodiscard]] std::span<const CoconutReleaseComponent> coconut_release_catalog();

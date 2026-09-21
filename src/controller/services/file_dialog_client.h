@@ -23,60 +23,60 @@ using FileDialogCancellationSignal = mmltk::common::concurrency::EventCancellati
 using FileDialogCancellationSource = mmltk::common::concurrency::EventCancellationSource<FileDialogCancellationTag, false>;
 using FileDialogCancellationToken = mmltk::common::concurrency::EventCancellationToken<FileDialogCancellationTag>;
 struct FileDialogRequest final {
-    BoundedText<kFileDialogTextCapacity> title{};
-    mmltk::controller::contracts::FileDialogMode mode = mmltk::controller::contracts::FileDialogMode::OpenFile;
-    mmltk::controller::services::FileDialogFilter filter{};
-    [[nodiscard]] bool valid() const noexcept { return title.valid() && filter.name.valid() && filter.pattern.valid(); }
+ BoundedText<kFileDialogTextCapacity> title{};
+ mmltk::controller::contracts::FileDialogMode mode = mmltk::controller::contracts::FileDialogMode::OpenFile;
+ mmltk::controller::services::FileDialogFilter filter{};
+ [[nodiscard]] bool valid() const noexcept { return title.valid() && filter.name.valid() && filter.pattern.valid(); }
 };
 enum class FileDialogDisposition : std::uint8_t {
-    Selected,
-    Cancelled,
-    Failed,
-    Reaped,
+ Selected,
+ Cancelled,
+ Failed,
+ Reaped,
 };
 MMLTK_REFLECT_ENUM(FileDialogDisposition)
 enum class FileDialogFailure : std::uint8_t {
-    None,
-    CapabilityUnavailable,
-    InvalidRequest,
-    PipeCreation,
-    Fork,
-    ProcessHandle,
-    ChildSetup,
-    Exec,
-    ProcessExit,
-    Unexpected,
+ None,
+ CapabilityUnavailable,
+ InvalidRequest,
+ PipeCreation,
+ Fork,
+ ProcessHandle,
+ ChildSetup,
+ Exec,
+ ProcessExit,
+ Unexpected,
 };
 struct FileDialogResult final {
-    FileDialogDisposition disposition = FileDialogDisposition::Failed;
-    FileDialogFailure failure = FileDialogFailure::Unexpected;
-    BoundedText<kFileDialogPathStorageCapacity> path{};
-    BoundedText<kFileDialogTextCapacity> error{};
+ FileDialogDisposition disposition = FileDialogDisposition::Failed;
+ FileDialogFailure failure = FileDialogFailure::Unexpected;
+ BoundedText<kFileDialogPathStorageCapacity> path{};
+ BoundedText<kFileDialogTextCapacity> error{};
 };
 class FileDialogClient final {
-   public:
-    static constexpr std::size_t kOutputCapacity = 64U * 1024U;
-    FileDialogClient() noexcept = default;
-    [[nodiscard]] bool valid() const noexcept;
-    [[nodiscard]] FileDialogResult run(const FileDialogRequest& request, FileDialogCancellationToken cancellation) const noexcept;
+public:
+ static constexpr std::size_t kOutputCapacity = 64U * 1024U;
+ FileDialogClient() noexcept = default;
+ [[nodiscard]] bool valid() const noexcept;
+ [[nodiscard]] FileDialogResult run(const FileDialogRequest& request, FileDialogCancellationToken cancellation) const noexcept;
 
-   private:
-    struct Configuration;
-    explicit FileDialogClient(std::shared_ptr<const Configuration> configuration) noexcept : configuration_(std::move(configuration)) {}
-    std::shared_ptr<const Configuration> configuration_;
-    friend class FileDialogClientOwner;
+private:
+ struct Configuration;
+ explicit FileDialogClient(std::shared_ptr<const Configuration> configuration) noexcept : configuration_(std::move(configuration)) {}
+ std::shared_ptr<const Configuration> configuration_;
+ friend class FileDialogClientOwner;
 };
 // The shell owns one immutable helper configuration. Direct work
 // receive a copyable ordinary handle that retains that configuration directly.
 class FileDialogClientOwner final {
-   public:
-    FileDialogClientOwner(std::string_view helper_program, std::string_view launch_directory);
-    ~FileDialogClientOwner() noexcept = default;
-    FileDialogClientOwner(const FileDialogClientOwner&) = delete;
-    FileDialogClientOwner& operator=(const FileDialogClientOwner&) = delete;
-    [[nodiscard]] FileDialogClient client() const noexcept;
+public:
+ FileDialogClientOwner(std::string_view helper_program, std::string_view launch_directory);
+ ~FileDialogClientOwner() noexcept = default;
+ FileDialogClientOwner(const FileDialogClientOwner&) = delete;
+ FileDialogClientOwner& operator=(const FileDialogClientOwner&) = delete;
+ [[nodiscard]] FileDialogClient client() const noexcept;
 
-   private:
-    FileDialogClient client_{};
+private:
+ FileDialogClient client_{};
 };
 }  // namespace mmltk::controller::services

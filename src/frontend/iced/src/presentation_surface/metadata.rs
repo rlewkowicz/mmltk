@@ -661,8 +661,16 @@ mod tests {
         );
         let derived = generated::UpscaleImageMetadata {
             frame: derived_frame.clone(),
-            preparedextent: generated::VisualExtent { width: 400, height: 200 },
-            preparedcontent: generated::VisualRegion { x: 0, y: 0, width: 400, height: 200 },
+            preparedextent: generated::VisualExtent {
+                width: 400,
+                height: 200,
+            },
+            preparedcontent: generated::VisualRegion {
+                x: 0,
+                y: 0,
+                width: 400,
+                height: 200,
+            },
             input: source.frame.clone(),
             scene: crate::view_model::test_support::explore_snapshot().scene,
         };

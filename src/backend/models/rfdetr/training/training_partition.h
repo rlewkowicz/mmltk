@@ -3,11 +3,11 @@
 #include "src/backend/models/rfdetr/contract/workflow_requests.h"
 namespace mmltk::backend::models::rfdetr {
 struct DistributedTrainingPartition {
-    int rank = 0;
-    int world_size = 1;
-    int device_id = 0;
-    int worker_budget = 0;
-    int numa_node = -1;
+ int rank = 0;
+ int world_size = 1;
+ int device_id = 0;
+ int worker_budget = 0;
+ int numa_node = -1;
 };
 void apply_training_partition(TrainRequest&, const DistributedTrainingPartition&);
 // Training owns deterministic device/rank selection; CLI and service owners

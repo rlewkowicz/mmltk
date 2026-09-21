@@ -23,9 +23,9 @@ pub(crate) use renderer::{
     authorize_draw, begin_capacity_acceptance, capacity_acceptance_slots, clear_drawn_detail,
     complete_sample, discard_sample, drawable_annotation, drawable_prediction, drawable_validation,
     drawn_detail, end_capacity_acceptance, explore_display, initialize_diagnostics,
-    invalidate_drawn_slot, publication_admission_blocked, reconcile_completed, release, release_capacity_sample,
-    reset_reconstruction_probe, retained_surface, retire_publication, retire_samples,
-    same_allocation, trace_atlas_stage, trace_surface, viewer_annotation_request,
+    invalidate_drawn_slot, publication_admission_blocked, reconcile_completed, release,
+    release_capacity_sample, reset_reconstruction_probe, retained_surface, retire_publication,
+    retire_samples, same_allocation, trace_atlas_stage, trace_surface, viewer_annotation_request,
 };
 pub use renderer::{FrameReady, Notification};
 use renderer::{PendingImage, SAMPLE_CAPACITY, SampleRead, copy_completed, trace_gallery_source};
@@ -107,17 +107,29 @@ impl Surface {
         });
     }
 
-    pub(crate) fn annotation_request(self, frame: &crate::generated::VisualFrame) -> crate::generated::AnnotationOpen {
+    pub(crate) fn annotation_request(
+        self,
+        frame: &crate::generated::VisualFrame,
+    ) -> crate::generated::AnnotationOpen {
         let [x, y, width, height] = self.content_region();
         let (aspect_width, aspect_height) = self.display_extent();
         let scale = (f64::from(width) / f64::from(aspect_width))
             .min(f64::from(height) / f64::from(aspect_height));
         crate::generated::AnnotationOpen {
             source: frame.clone(),
-            crop: crate::generated::VisualRegion { x, y, width, height },
+            crop: crate::generated::VisualRegion {
+                x,
+                y,
+                width,
+                height,
+            },
             target: crate::generated::VisualExtent {
-                width: (f64::from(aspect_width) * scale).round().clamp(1.0, f64::from(width)) as u32,
-                height: (f64::from(aspect_height) * scale).round().clamp(1.0, f64::from(height)) as u32,
+                width: (f64::from(aspect_width) * scale)
+                    .round()
+                    .clamp(1.0, f64::from(width)) as u32,
+                height: (f64::from(aspect_height) * scale)
+                    .round()
+                    .clamp(1.0, f64::from(height)) as u32,
             },
         }
     }

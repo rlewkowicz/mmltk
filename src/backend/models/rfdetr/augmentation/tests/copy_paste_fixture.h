@@ -29,18 +29,18 @@ inline constexpr std::array dot_runs{mmltk::backend::data::RLEPair{27, 1},   // 
 inline constexpr std::array<std::uint64_t, 7> identity_survivors{1ULL << 27, 3ULL << 19, 1ULL << 9, 0, 1, (1ULL << 24) | (15ULL << 26) | (1ULL << 31),
                                                                  1ULL << 14};
 [[nodiscard]] inline bool fixture_contains(const std::span<const mmltk::backend::data::RLEPair> runs, const int x, const int y) {
-    if (x < 0 || x >= 8 || y < 0 || y >= 8) return false;
-    const auto pixel = static_cast<std::uint32_t>(y * 8 + x);
-    for (const auto run : runs)
-        if (pixel >= run.start && pixel - run.start < run.length) return true;
-    return false;
+ if (x < 0 || x >= 8 || y < 0 || y >= 8) return false;
+ const auto pixel = static_cast<std::uint32_t>(y * 8 + x);
+ for (const auto run : runs)
+  if (pixel >= run.start && pixel - run.start < run.length) return true;
+ return false;
 }
 [[nodiscard]] inline bool ring_paste_contains(const std::array<float, 6>& inverse, bool masked, int x, int y) {
-    const float dx = inverse[0] * ((static_cast<float>(x) + .5F) / 8) + inverse[2];
-    const float dy = inverse[4] * ((static_cast<float>(y) + .5F) / 8) + inverse[5];
-    if (!masked) return dx >= .125F && dx <= .875F && dy >= .125F && dy <= .875F;
-    return dx >= 0 && dx <= 1 && dy >= 0 && dy <= 1 &&
-           fixture_contains(ring_runs, std::clamp(static_cast<int>(std::nearbyint(dx * 8 - .5F)), 0, 7),
-                            std::clamp(static_cast<int>(std::nearbyint(dy * 8 - .5F)), 0, 7));
+ const float dx = inverse[0] * ((static_cast<float>(x) + .5F) / 8) + inverse[2];
+ const float dy = inverse[4] * ((static_cast<float>(y) + .5F) / 8) + inverse[5];
+ if (!masked) return dx >= .125F && dx <= .875F && dy >= .125F && dy <= .875F;
+ return dx >= 0 && dx <= 1 && dy >= 0 && dy <= 1 &&
+        fixture_contains(ring_runs, std::clamp(static_cast<int>(std::nearbyint(dx * 8 - .5F)), 0, 7),
+                         std::clamp(static_cast<int>(std::nearbyint(dy * 8 - .5F)), 0, 7));
 }
 }  // namespace mmltk::backend::models::rfdetr::test_support

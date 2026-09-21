@@ -12,15 +12,15 @@ AnnotationLaunchStatus draw_deferred_manual_mask_runs_rgba_pitched(const ManualM
                                                                    const std::uint32_t region_capture_x, const std::uint32_t region_capture_y,
                                                                    const std::uint8_t red, const std::uint8_t green, const std::uint8_t blue,
                                                                    const std::uint8_t alpha, const std::uintptr_t stream) noexcept {
-    return static_cast<AnnotationLaunchStatus>(detail::launch_deferred_manual_mask_runs_cuda(detail::DeferredManualMaskRunsLaunchAbi{
-        mapping,
-        {overlay_region, pitch_bytes, width, height},
-        run_pairs,
-        run_count,
-        region_capture_x,
-        region_capture_y,
-        {red, green, blue, alpha},
-        reinterpret_cast<cudaStream_t>(stream),
-    }));
+ return static_cast<AnnotationLaunchStatus>(detail::launch_deferred_manual_mask_runs_cuda(detail::DeferredManualMaskRunsLaunchAbi{
+  mapping,
+  {overlay_region, pitch_bytes, width, height},
+  run_pairs,
+  run_count,
+  region_capture_x,
+  region_capture_y,
+  {red, green, blue, alpha},
+  reinterpret_cast<cudaStream_t>(stream),
+ }));
 }
 }  // namespace mmltk::backend::imaging::annotation

@@ -9,11 +9,11 @@ namespace mmltk::backend::models::rfdetr::testsupport {
 inline constexpr std::int64_t kParityFixtureNumClasses = 91;
 inline constexpr std::int64_t kParityFixtureHiddenDim = 256;
 struct ParityFixtureCase {
-    const char* preset_name;
-    const char* upstream_filename;
-    std::int64_t query_rows;
-    std::int64_t input_size;
-    float offset;
+ const char* preset_name;
+ const char* upstream_filename;
+ std::int64_t query_rows;
+ std::int64_t input_size;
+ float offset;
 };
 [[nodiscard]] const std::array<ParityFixtureCase, 2>& parity_fixture_cases() noexcept;
 [[nodiscard]] at::Tensor make_fixture_image(const ParityFixtureCase&);

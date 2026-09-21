@@ -22,36 +22,36 @@ inline constexpr std::size_t kExploreWorkCapacity = 256U;
 using ExploreRlePair = mmltk::backend::data::RLEPair;
 using ExploreClassMask = std::array<std::uint64_t, kExploreClassMaskWords>;
 struct ExploreImageSummary {
-    ExploreClassMask classes{};
-    std::uint32_t original_width = 0U;
-    std::uint32_t original_height = 0U;
-    std::uint16_t instance_count = 0U;
-    bool has_masks = false;
+ ExploreClassMask classes{};
+ std::uint32_t original_width = 0U;
+ std::uint32_t original_height = 0U;
+ std::uint16_t instance_count = 0U;
+ bool has_masks = false;
 };
 struct ExploreSampleFilter {
-    ExploreClassMask classes{};
-    std::uint32_t min_instances = 0U;
-    std::uint32_t max_instances = 10'000U;
-    std::uint64_t min_compiled_index = 0U;
-    std::uint64_t max_compiled_index = std::numeric_limits<std::uint64_t>::max();
-    bool require_boxes = false;
-    bool require_masks = false;
-    bool restrict_classes = false;
-    [[nodiscard]] bool operator==(const ExploreSampleFilter&) const noexcept = default;
+ ExploreClassMask classes{};
+ std::uint32_t min_instances = 0U;
+ std::uint32_t max_instances = 10'000U;
+ std::uint64_t min_compiled_index = 0U;
+ std::uint64_t max_compiled_index = std::numeric_limits<std::uint64_t>::max();
+ bool require_boxes = false;
+ bool require_masks = false;
+ bool restrict_classes = false;
+ [[nodiscard]] bool operator==(const ExploreSampleFilter&) const noexcept = default;
 };
 struct ExploreViewport final {
-    std::uint32_t first_row = 0U;
-    std::uint32_t row_count = 0U;
-    std::uint32_t columns = 0U;
-    [[nodiscard]] bool valid() const noexcept { return row_count != 0U && columns != 0U; }
+ std::uint32_t first_row = 0U;
+ std::uint32_t row_count = 0U;
+ std::uint32_t columns = 0U;
+ [[nodiscard]] bool valid() const noexcept { return row_count != 0U && columns != 0U; }
 };
 struct ExploreAtlasLayout final {
-    std::uint32_t width = 0U;
-    std::uint32_t height = 0U;
-    std::uint32_t columns = 0U;
-    std::uint32_t rows = 0U;
-    std::uint32_t card_extent = 0U;
-    [[nodiscard]] bool valid() const noexcept { return width != 0U && height != 0U && columns != 0U && rows != 0U && card_extent != 0U; }
+ std::uint32_t width = 0U;
+ std::uint32_t height = 0U;
+ std::uint32_t columns = 0U;
+ std::uint32_t rows = 0U;
+ std::uint32_t card_extent = 0U;
+ [[nodiscard]] bool valid() const noexcept { return width != 0U && height != 0U && columns != 0U && rows != 0U && card_extent != 0U; }
 };
 [[nodiscard]] std::vector<ExploreImageSummary> build_explore_summaries(const mmltk::backend::data::CompiledDataset& store,
                                                                        const std::atomic<bool>* cancel_requested = nullptr,

@@ -25,66 +25,66 @@ namespace mmltk::backend::models::rfdetr {
 inline constexpr const char* kNativeCheckpointFormat = "mmltk.rfdetr.native_checkpoint";
 inline constexpr int64_t kNativeCheckpointFormatVersion = 3;
 struct NativeCheckpointMetadata {
-    ModelClassLayout class_layout;
-    std::string preset_name;
-    std::string source_kind;
-    std::string source_path;
-    int64_t num_classes = 0;
-    int64_t num_queries = 0;
-    int64_t num_select = 0;
-    std::optional<bool> sum_group_losses;
-    std::optional<bool> use_varifocal_loss;
-    std::optional<bool> use_position_supervised_loss;
-    std::optional<bool> ia_bce_loss;
-    std::optional<bool> aux_loss;
-    std::optional<int64_t> mask_point_sample_ratio;
-    std::optional<double> focal_alpha;
-    std::optional<double> cls_loss_coef;
-    std::optional<double> bbox_loss_coef;
-    std::optional<double> giou_loss_coef;
-    std::optional<double> mask_ce_loss_coef;
-    std::optional<double> mask_dice_loss_coef;
-    std::optional<double> set_cost_class;
-    std::optional<double> set_cost_bbox;
-    std::optional<double> set_cost_giou;
-    template <class Self, class Visitor>
-    void for_each_detection_field(this Self&& self, Visitor&& visitor) {
-        template for (constexpr auto member :
-                      std::define_static_array(std::meta::nonstatic_data_members_of(^^NativeCheckpointMetadata, std::meta::access_context::current()))) {
-            using Field = std::remove_cvref_t<decltype(self.[:member:])>;
-            if constexpr (model_state_detail::is_optional<Field>) {
-                constexpr auto name = std::define_static_string(std::meta::identifier_of(member));
-                visitor(name, self.[:member:]);
-            }
-        }
-    }
+ ModelClassLayout class_layout;
+ std::string preset_name;
+ std::string source_kind;
+ std::string source_path;
+ int64_t num_classes = 0;
+ int64_t num_queries = 0;
+ int64_t num_select = 0;
+ std::optional<bool> sum_group_losses;
+ std::optional<bool> use_varifocal_loss;
+ std::optional<bool> use_position_supervised_loss;
+ std::optional<bool> ia_bce_loss;
+ std::optional<bool> aux_loss;
+ std::optional<int64_t> mask_point_sample_ratio;
+ std::optional<double> focal_alpha;
+ std::optional<double> cls_loss_coef;
+ std::optional<double> bbox_loss_coef;
+ std::optional<double> giou_loss_coef;
+ std::optional<double> mask_ce_loss_coef;
+ std::optional<double> mask_dice_loss_coef;
+ std::optional<double> set_cost_class;
+ std::optional<double> set_cost_bbox;
+ std::optional<double> set_cost_giou;
+ template <class Self, class Visitor>
+ void for_each_detection_field(this Self&& self, Visitor&& visitor) {
+  template for (constexpr auto member :
+                std::define_static_array(std::meta::nonstatic_data_members_of(^^NativeCheckpointMetadata, std::meta::access_context::current()))) {
+   using Field = std::remove_cvref_t<decltype(self.[:member:])>;
+   if constexpr (model_state_detail::is_optional<Field>) {
+    constexpr auto name = std::define_static_string(std::meta::identifier_of(member));
+    visitor(name, self.[:member:]);
+   }
+  }
+ }
 };
 class DecodedNativeModelState {
-   public:
-    DecodedNativeModelState();
-    ~DecodedNativeModelState();
-    DecodedNativeModelState(DecodedNativeModelState&&) noexcept;
-    DecodedNativeModelState& operator=(DecodedNativeModelState&&) noexcept;
-    DecodedNativeModelState(const DecodedNativeModelState&) = delete;
-    DecodedNativeModelState& operator=(const DecodedNativeModelState&) = delete;
-    NativeCheckpointMetadata metadata;
-    std::shared_ptr<const ClassArtifactAdmission> class_artifact;
-    [[nodiscard]] std::size_t tensor_count() const noexcept;
-    explicit DecodedNativeModelState(std::vector<NormalizedModelStateEntry> entries);
-    [[nodiscard]] const std::vector<NormalizedModelStateEntry>& entries() const noexcept;
-    [[nodiscard]] torch::serialize::InputArchive* admitted_archive() const noexcept;
-    void retain_admitted_archive(std::unique_ptr<torch::serialize::InputArchive> archive);
-    [[nodiscard]] std::vector<NormalizedModelStateEntry> consume_entries();
-    void release_admission() noexcept;
-    void replace_entries(std::vector<NormalizedModelStateEntry> entries);
+public:
+ DecodedNativeModelState();
+ ~DecodedNativeModelState();
+ DecodedNativeModelState(DecodedNativeModelState&&) noexcept;
+ DecodedNativeModelState& operator=(DecodedNativeModelState&&) noexcept;
+ DecodedNativeModelState(const DecodedNativeModelState&) = delete;
+ DecodedNativeModelState& operator=(const DecodedNativeModelState&) = delete;
+ NativeCheckpointMetadata metadata;
+ std::shared_ptr<const ClassArtifactAdmission> class_artifact;
+ [[nodiscard]] std::size_t tensor_count() const noexcept;
+ explicit DecodedNativeModelState(std::vector<NormalizedModelStateEntry> entries);
+ [[nodiscard]] const std::vector<NormalizedModelStateEntry>& entries() const noexcept;
+ [[nodiscard]] torch::serialize::InputArchive* admitted_archive() const noexcept;
+ void retain_admitted_archive(std::unique_ptr<torch::serialize::InputArchive> archive);
+ [[nodiscard]] std::vector<NormalizedModelStateEntry> consume_entries();
+ void release_admission() noexcept;
+ void replace_entries(std::vector<NormalizedModelStateEntry> entries);
 
-   private:
-    struct Impl;
-    std::unique_ptr<Impl> impl_;
+private:
+ struct Impl;
+ std::unique_ptr<Impl> impl_;
 };
 struct ResolvedModelState {
-    ResolvedModelArtifacts artifacts;
-    DecodedNativeModelState model_state;
+ ResolvedModelArtifacts artifacts;
+ DecodedNativeModelState model_state;
 };
 void validate_decoded_model_state(const DecodedNativeModelState& state);
 enum class ModelStateContainer { Unknown, Python, Native };

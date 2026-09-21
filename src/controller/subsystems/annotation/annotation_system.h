@@ -21,179 +21,179 @@
 namespace mmltk::controller {
 struct AnnotationRenderState;
 struct AnnotationPointer final {
-    contracts::AnnotationPointerPhase phase = contracts::AnnotationPointerPhase::Begin;
-    std::uint64_t interaction_id = 0U;
-    std::uint64_t sequence = 0U;
-    contracts::AnnotationPointerTarget target{};
-    contracts::AnnotationTargetIdentity identity{};
-    // CLEANUP-IGNORE: The resolved native pointer and transport mouse enforce the same canonical brush bounds but retain distinct
-    // lifetimes.
-    contracts::AnnotationPoint point{};
-    [[= mmltk::frameworks::reflection::Minimum<std::uint16_t>{contracts::kMinAnnotationBrushRadius}]]
-        [[= mmltk::frameworks::reflection::Maximum<std::uint16_t>{contracts::kMaxAnnotationBrushRadius}]] std::uint16_t brush_radius =
-            contracts::kDefaultAnnotationBrushRadius;
-    [[nodiscard]] bool valid() const noexcept {
-        return mmltk::frameworks::reflection::enum_contains(phase) && interaction_id != 0U && sequence != 0U && target.valid() && point.finite() &&
-               brush_radius >= contracts::kMinAnnotationBrushRadius && brush_radius <= contracts::kMaxAnnotationBrushRadius;
-    }
+ contracts::AnnotationPointerPhase phase = contracts::AnnotationPointerPhase::Begin;
+ std::uint64_t interaction_id = 0U;
+ std::uint64_t sequence = 0U;
+ contracts::AnnotationPointerTarget target{};
+ contracts::AnnotationTargetIdentity identity{};
+ // CLEANUP-IGNORE: The resolved native pointer and transport mouse enforce the same canonical brush bounds but retain distinct
+ // lifetimes.
+ contracts::AnnotationPoint point{};
+ [[= mmltk::frameworks::reflection::Minimum<std::uint16_t>{contracts::kMinAnnotationBrushRadius}]]
+  [[= mmltk::frameworks::reflection::Maximum<std::uint16_t>{contracts::kMaxAnnotationBrushRadius}]] std::uint16_t brush_radius =
+   contracts::kDefaultAnnotationBrushRadius;
+ [[nodiscard]] bool valid() const noexcept {
+  return mmltk::frameworks::reflection::enum_contains(phase) && interaction_id != 0U && sequence != 0U && target.valid() && point.finite() &&
+         brush_radius >= contracts::kMinAnnotationBrushRadius && brush_radius <= contracts::kMaxAnnotationBrushRadius;
+ }
 };
 struct AnnotationOpen final {
-    VisualFrame source{};
-    VisualRegion crop{};
-    VisualExtent target{};
+ VisualFrame source{};
+ VisualRegion crop{};
+ VisualExtent target{};
 };
 struct AnnotationSave final {
-    [[= mmltk::frameworks::reflection::MaxBytes{4096U}]] std::string destination;
+ [[= mmltk::frameworks::reflection::MaxBytes{4096U}]] std::string destination;
 };
 struct AnnotationToolEdit final {
-    contracts::AnnotationTool tool = contracts::AnnotationTool::Select;
+ contracts::AnnotationTool tool = contracts::AnnotationTool::Select;
 };
 struct AnnotationSetupEdit final {
-    contracts::AnnotationSetupAction action = contracts::AnnotationSetupAction::ReloadFrame;
+ contracts::AnnotationSetupAction action = contracts::AnnotationSetupAction::ReloadFrame;
 };
 struct AnnotationHoldEdit final {
-    bool enabled = false;
+ bool enabled = false;
 };
 struct AnnotationSidebarEdit final {
-    contracts::AnnotationSidebarCommand command = contracts::AnnotationSidebarCommand::Assist;
+ contracts::AnnotationSidebarCommand command = contracts::AnnotationSidebarCommand::Assist;
 };
 struct AnnotationObjectEdit final {
-    std::uint16_t object = 0U;
+ std::uint16_t object = 0U;
 };
 struct AnnotationCategoryEdit final {
-    contracts::AnnotationText category{};
+ contracts::AnnotationText category{};
 };
 struct AnnotationClassEdit final {
-    std::uint16_t category = 0U;
+ std::uint16_t category = 0U;
 };
 struct AnnotationSelectedObjectEdit final {
-    std::uint16_t category = 0U;
-    bool enabled = true;
+ std::uint16_t category = 0U;
+ bool enabled = true;
 };
 struct AnnotationSplineEdit final {
-    std::uint16_t segment = 0U;
+ std::uint16_t segment = 0U;
 };
 struct AnnotationSplineHandleEdit final {
-    contracts::AnnotationHandleRole handle = contracts::AnnotationHandleRole::SplineInHandle;
-    contracts::AnnotationSplineHandleMode mode = contracts::AnnotationSplineHandleMode::Corner;
-    contracts::AnnotationPoint point{};
+ contracts::AnnotationHandleRole handle = contracts::AnnotationHandleRole::SplineInHandle;
+ contracts::AnnotationSplineHandleMode mode = contracts::AnnotationSplineHandleMode::Corner;
+ contracts::AnnotationPoint point{};
 };
 struct AnnotationSkeletonEdit final {
-    std::uint16_t joint = 0U;
+ std::uint16_t joint = 0U;
 };
 struct AnnotationMaskCleanupEdit final {
-    contracts::AnnotationMaskCleanup operation = contracts::AnnotationMaskCleanup::LargestComponent;
-    [[= mmltk::frameworks::reflection::Minimum<std::uint16_t>{contracts::kMinAnnotationMaskCleanupRadius}]]
-        [[= mmltk::frameworks::reflection::Maximum<std::uint16_t>{contracts::kMaxAnnotationMaskCleanupRadius}]] std::uint16_t radius =
-            contracts::kDefaultAnnotationMaskCleanupRadius;
+ contracts::AnnotationMaskCleanup operation = contracts::AnnotationMaskCleanup::LargestComponent;
+ [[= mmltk::frameworks::reflection::Minimum<std::uint16_t>{contracts::kMinAnnotationMaskCleanupRadius}]]
+  [[= mmltk::frameworks::reflection::Maximum<std::uint16_t>{contracts::kMaxAnnotationMaskCleanupRadius}]] std::uint16_t radius =
+   contracts::kDefaultAnnotationMaskCleanupRadius;
 };
 struct AnnotationMaskColorsEdit final {
-    contracts::AnnotationColorRange sup{};
-    contracts::AnnotationColorRange nosup{};
+ contracts::AnnotationColorRange sup{};
+ contracts::AnnotationColorRange nosup{};
 };
 struct AnnotationSceneEdit final {};
 struct AnnotationUndoEdit final {};
 struct AnnotationRedoEdit final {};
 struct AnnotationEdit final {
-    using variant_type =
-        std::variant<AnnotationToolEdit, AnnotationSetupEdit, AnnotationHoldEdit, AnnotationSidebarEdit, AnnotationObjectEdit, AnnotationCategoryEdit,
-                     AnnotationSelectedObjectEdit, AnnotationSplineEdit, AnnotationSplineHandleEdit, AnnotationSkeletonEdit, AnnotationMaskCleanupEdit,
-                     AnnotationMaskColorsEdit, AnnotationSceneEdit, AnnotationUndoEdit, AnnotationRedoEdit, AnnotationClassEdit>;
-    variant_type value{};
+ using variant_type =
+  std::variant<AnnotationToolEdit, AnnotationSetupEdit, AnnotationHoldEdit, AnnotationSidebarEdit, AnnotationObjectEdit, AnnotationCategoryEdit,
+               AnnotationSelectedObjectEdit, AnnotationSplineEdit, AnnotationSplineHandleEdit, AnnotationSkeletonEdit, AnnotationMaskCleanupEdit,
+               AnnotationMaskColorsEdit, AnnotationSceneEdit, AnnotationUndoEdit, AnnotationRedoEdit, AnnotationClassEdit>;
+ variant_type value{};
 };
 struct AnnotationEditRequest final {
-    AnnotationEdit edit{};
+ AnnotationEdit edit{};
 };
 class AnnotationAlgorithm : public mmltk::frameworks::gpu::SystemImageModel {
-   public:
-    [[nodiscard]] virtual mmltk::frameworks::gpu::ImageWorkspaceCoverage WorkspaceCoverage(const mmltk::frameworks::gpu::ImageWorkspaceObservation&) const {
-        return {};
-    }
-    ~AnnotationAlgorithm() override = default;
-    virtual void Open(mmltk::frameworks::gpu::ImagePlaneView source, VisualRegion, VisualExtent) = 0;
-    [[nodiscard]] virtual contracts::AnnotationColor Sample(contracts::AnnotationPoint) = 0;
-    // Source is the retained immutable document baseline. The algorithm owns
-    // allocation-local initialization, damage and reusable raster inputs.
-    virtual void Render(const AnnotationRenderState&, mmltk::frameworks::gpu::ImagePlaneView source, mmltk::frameworks::gpu::ImagePlaneView clean,
-                        mmltk::frameworks::gpu::ImagePlaneView semantic, std::uintptr_t stream) const = 0;
+public:
+ [[nodiscard]] virtual mmltk::frameworks::gpu::ImageWorkspaceCoverage WorkspaceCoverage(const mmltk::frameworks::gpu::ImageWorkspaceObservation&) const {
+  return {};
+ }
+ ~AnnotationAlgorithm() override = default;
+ virtual void Open(mmltk::frameworks::gpu::ImagePlaneView source, VisualRegion, VisualExtent) = 0;
+ [[nodiscard]] virtual contracts::AnnotationColor Sample(contracts::AnnotationPoint) = 0;
+ // Source is the retained immutable document baseline. The algorithm owns
+ // allocation-local initialization, damage and reusable raster inputs.
+ virtual void Render(const AnnotationRenderState&, mmltk::frameworks::gpu::ImagePlaneView source, mmltk::frameworks::gpu::ImagePlaneView clean,
+                     mmltk::frameworks::gpu::ImagePlaneView semantic, std::uintptr_t stream) const = 0;
 };
 struct AnnotationRenderedFacts final {
-    bool operator==(const AnnotationRenderedFacts&) const = default;
-    std::uint64_t generation = 0U;
-    std::uint64_t document_epoch = 0U;
-    std::uint64_t scene_revision = 0U;
-    contracts::AnnotationEditorFacts editor{};
+ bool operator==(const AnnotationRenderedFacts&) const = default;
+ std::uint64_t generation = 0U;
+ std::uint64_t document_epoch = 0U;
+ std::uint64_t scene_revision = 0U;
+ contracts::AnnotationEditorFacts editor{};
 };
 struct AnnotationImageMetadata final {
-    VisualFrame frame{};
-    // Opt-in evidence for the exact rendered image; never authorizes input.
-    std::optional<AnnotationRenderedFacts> diagnostics{};
+ VisualFrame frame{};
+ // Opt-in evidence for the exact rendered image; never authorizes input.
+ std::optional<AnnotationRenderedFacts> diagnostics{};
 };
 struct AnnotationSnapshot final {
-    std::uint64_t revision = 0U;
-    std::uint64_t ui_revision = 0U;
-    std::uint64_t input_document_epoch = 0U;
-    bool busy = false;
-    bool cancellation_requested = false;
-    // CLEANUP-IGNORE: Annotation readiness begins a domain-specific reflected snapshot tail, not shared state.
-    bool ready = false;
-    contracts::AnnotationUiState ui{};
-    VisualFrame frame{};
-    // CLEANUP-IGNORE: The Annotation snapshot terminator precedes domain-specific transient and critical events.
+ std::uint64_t revision = 0U;
+ std::uint64_t ui_revision = 0U;
+ std::uint64_t input_document_epoch = 0U;
+ bool busy = false;
+ bool cancellation_requested = false;
+ // CLEANUP-IGNORE: Annotation readiness begins a domain-specific reflected snapshot tail, not shared state.
+ bool ready = false;
+ contracts::AnnotationUiState ui{};
+ VisualFrame frame{};
+ // CLEANUP-IGNORE: The Annotation snapshot terminator precedes domain-specific transient and critical events.
 };
 struct[[= contracts::reflection::Event{contracts::reflection::EventDelivery::LatestState}]] AnnotationChanged final {
-    AnnotationSnapshot snapshot{};
+ AnnotationSnapshot snapshot{};
 };
 // A frame may advance without changing UI. The matching full-state identity also
 // orders command admission/settlement when socket records arrive in either order.
 struct AnnotationFrameState final {
-    // CLEANUP-IGNORE: Compact frame identity is distinct from Live's full lifecycle snapshot.
-    std::uint64_t revision = 0U;
-    std::uint64_t ui_revision = 0U;
-    // CLEANUP-IGNORE: Annotation UI, compact frame notifications, and Upscale events have distinct canonical types and delivery meanings.
-    VisualFrame frame{};
+ // CLEANUP-IGNORE: Compact frame identity is distinct from Live's full lifecycle snapshot.
+ std::uint64_t revision = 0U;
+ std::uint64_t ui_revision = 0U;
+ // CLEANUP-IGNORE: Annotation UI, compact frame notifications, and Upscale events have distinct canonical types and delivery meanings.
+ VisualFrame frame{};
 };
 // CLEANUP-IGNORE: Annotation frame state and Presentation capability events belong to different canonical owners.
 struct[[= contracts::reflection::Event{contracts::reflection::EventDelivery::LatestState}]] AnnotationFrameChanged final {
-    AnnotationFrameState snapshot{};
+ AnnotationFrameState snapshot{};
 };
 struct[[= contracts::reflection::Event{contracts::reflection::EventDelivery::Critical}]] AnnotationFailed final {
-    AnnotationSnapshot snapshot{};
-    // CLEANUP-IGNORE: This critical Annotation detail is a distinct reflected event boundary.
-    [[= mmltk::frameworks::reflection::MaxBytes{kVisualFailureByteCapacity}]] std::string detail;
+ AnnotationSnapshot snapshot{};
+ // CLEANUP-IGNORE: This critical Annotation detail is a distinct reflected event boundary.
+ [[= mmltk::frameworks::reflection::MaxBytes{kVisualFailureByteCapacity}]] std::string detail;
 };
 class AnnotationSystem final {
-   public:
-    using visual_source =
-        VisualSourceProjection<AnnotationSnapshot, PresentationSourceKind::Annotation, mmltk::frameworks::reflection::member_path<&AnnotationSnapshot::frame>,
-                               mmltk::frameworks::reflection::member_path<&AnnotationSnapshot::revision>, AnnotationImageMetadata>;
-    using event_type = std::variant<AnnotationChanged, AnnotationFrameChanged, AnnotationFailed>;
-    AnnotationSystem(VisualDeviceSettings, VisualRuntimeFactory, ExactVisualDocumentBorrower, SystemEventSink<event_type> = {}, VisualDiagnosticSink = {});
-    ~AnnotationSystem();
-    [[= contracts::reflection::direct::IntentEndpoint{}]] [[nodiscard]] AnnotationSnapshot Open(AnnotationOpen);
-    // CLEANUP-IGNORE: Annotation's pointer/edit/save endpoints are a distinct reflected domain interface.
-    [[= contracts::reflection::direct::InteractionEndpoint{}]] void Input(WorkspaceMouse);
-    // CLEANUP-IGNORE: Annotation document mutation and Explore navigation are separate direct typed domain endpoints.
-    void SetInputPeer(std::uint64_t);
-    [[= contracts::reflection::direct::IntentEndpoint{}]] [[nodiscard]] AnnotationSnapshot Edit(AnnotationEditRequest);
-    // CLEANUP-IGNORE: Annotation persistence and lifecycle methods do not duplicate Explore navigation ownership.
-    [[= contracts::reflection::direct::IntentEndpoint{}]] [[nodiscard]] AnnotationSnapshot Save(AnnotationSave);
-    [[= contracts::reflection::direct::IntentEndpoint{}]] [[nodiscard]] AnnotationSnapshot Stop() noexcept;
-    void PeerClosed() noexcept;
-    void Shutdown() noexcept;
-    [[nodiscard]] bool stopped() const noexcept;
-    [[= contracts::reflection::Snapshot{contracts::kAnnotationUiStateByteBudget}]] [[nodiscard]] AnnotationSnapshot snapshot() const;
-    [[nodiscard]] std::optional<AnnotationImageMetadata> ImageSnapshot(const VisualFrame&) const;
-    // CLEANUP-IGNORE: Annotation exposes its sealed source and workspace API; shared runtime behavior remains private.
-    [[nodiscard]] VisualSourceObservation ObserveSource() const;
-    [[nodiscard]] mmltk::frameworks::gpu::BorrowedImageProductReadView BorrowFrame() const;
-    [[nodiscard]] mmltk::frameworks::gpu::BorrowedImageWorkspace BorrowWorkspace() const;
-    [[nodiscard]] mmltk::frameworks::gpu::ImageWorkspaceObservation ObserveWorkspace() const;
-    void RequestWorkspace(VisualWorkspaceRequest);
+public:
+ using visual_source =
+  VisualSourceProjection<AnnotationSnapshot, PresentationSourceKind::Annotation, mmltk::frameworks::reflection::member_path<&AnnotationSnapshot::frame>,
+                         mmltk::frameworks::reflection::member_path<&AnnotationSnapshot::revision>, AnnotationImageMetadata>;
+ using event_type = std::variant<AnnotationChanged, AnnotationFrameChanged, AnnotationFailed>;
+ AnnotationSystem(VisualDeviceSettings, VisualRuntimeFactory, ExactVisualDocumentBorrower, SystemEventSink<event_type> = {}, VisualDiagnosticSink = {});
+ ~AnnotationSystem();
+ [[= contracts::reflection::direct::IntentEndpoint{}]] [[nodiscard]] AnnotationSnapshot Open(AnnotationOpen);
+ // CLEANUP-IGNORE: Annotation's pointer/edit/save endpoints are a distinct reflected domain interface.
+ [[= contracts::reflection::direct::InteractionEndpoint{}]] void Input(WorkspaceMouse);
+ // CLEANUP-IGNORE: Annotation document mutation and Explore navigation are separate direct typed domain endpoints.
+ void SetInputPeer(std::uint64_t);
+ [[= contracts::reflection::direct::IntentEndpoint{}]] [[nodiscard]] AnnotationSnapshot Edit(AnnotationEditRequest);
+ // CLEANUP-IGNORE: Annotation persistence and lifecycle methods do not duplicate Explore navigation ownership.
+ [[= contracts::reflection::direct::IntentEndpoint{}]] [[nodiscard]] AnnotationSnapshot Save(AnnotationSave);
+ [[= contracts::reflection::direct::IntentEndpoint{}]] [[nodiscard]] AnnotationSnapshot Stop() noexcept;
+ void PeerClosed() noexcept;
+ void Shutdown() noexcept;
+ [[nodiscard]] bool stopped() const noexcept;
+ [[= contracts::reflection::Snapshot{contracts::kAnnotationUiStateByteBudget}]] [[nodiscard]] AnnotationSnapshot snapshot() const;
+ [[nodiscard]] std::optional<AnnotationImageMetadata> ImageSnapshot(const VisualFrame&) const;
+ // CLEANUP-IGNORE: Annotation exposes its sealed source and workspace API; shared runtime behavior remains private.
+ [[nodiscard]] VisualSourceObservation ObserveSource() const;
+ [[nodiscard]] mmltk::frameworks::gpu::BorrowedImageProductReadView BorrowFrame() const;
+ [[nodiscard]] mmltk::frameworks::gpu::BorrowedImageWorkspace BorrowWorkspace() const;
+ [[nodiscard]] mmltk::frameworks::gpu::ImageWorkspaceObservation ObserveWorkspace() const;
+ void RequestWorkspace(VisualWorkspaceRequest);
 
-   private:
-    class Impl;
-    std::unique_ptr<Impl> impl_;
+private:
+ class Impl;
+ std::unique_ptr<Impl> impl_;
 };
 // CLEANUP-IGNORE: The native factory and following reflection inventory are Annotation's canonical owner-colocated API.
 [[nodiscard]] VisualRuntimeFactory make_native_annotation_runtime_factory(VisualDeviceSettings);

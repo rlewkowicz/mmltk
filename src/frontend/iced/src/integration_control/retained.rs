@@ -2964,9 +2964,11 @@ impl State {
                     || snapshot.frame.extent.height != 384
                     || request.source != snapshot.frame
                     || request.kernel != crate::generated::UpscaleKernel::Default
-                    || upscale.preparedextent
+                    || upscale
+                        .preparedextent
                         .checked_scale(crate::generated::UpscaleImageMetadata::OUTPUT_SCALE)
-                        .as_ref() != Some(&upscale.frame.extent)
+                        .as_ref()
+                        != Some(&upscale.frame.extent)
                     || model.displayed_upscale_kernel()
                         != Some(crate::generated::UpscaleKernel::Default)
                 {
@@ -3206,11 +3208,13 @@ impl State {
                     return Task::none();
                 }
                 let Some(expected_width) = upscale.preparedextent.width.checked_mul(4) else {
-                    driver.fail("Upscale prepared width cannot be represented at four-times extent");
+                    driver
+                        .fail("Upscale prepared width cannot be represented at four-times extent");
                     return Task::none();
                 };
                 let Some(expected_height) = upscale.preparedextent.height.checked_mul(4) else {
-                    driver.fail("Upscale prepared height cannot be represented at four-times extent");
+                    driver
+                        .fail("Upscale prepared height cannot be represented at four-times extent");
                     return Task::none();
                 };
                 if upscale.frame.extent.width != expected_width

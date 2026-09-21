@@ -19,17 +19,17 @@ export namespace mmltk::backend::models::rfdetr {
 using ModelExportStatus = std::int32_t;
 inline constexpr ModelExportStatus kModelExportSuccess = 0;
 class ExportOnnxSession final {
-   public:
-    ExportOnnxSession();
-    ~ExportOnnxSession();
-    ExportOnnxSession(const ExportOnnxSession&) = delete;
-    ExportOnnxSession& operator=(const ExportOnnxSession&) = delete;
-    void Run(const ExportOnnxRequest& request, mmltk::backend::ml::runtime::BorrowedCommandStream command_stream, std::stop_token stop = {});
-    [[nodiscard]] ModelExportStatus Close() noexcept;
+public:
+ ExportOnnxSession();
+ ~ExportOnnxSession();
+ ExportOnnxSession(const ExportOnnxSession&) = delete;
+ ExportOnnxSession& operator=(const ExportOnnxSession&) = delete;
+ void Run(const ExportOnnxRequest& request, mmltk::backend::ml::runtime::BorrowedCommandStream command_stream, std::stop_token stop = {});
+ [[nodiscard]] ModelExportStatus Close() noexcept;
 
-   private:
-    struct State;
-    std::shared_ptr<State> state_;
+private:
+ struct State;
+ std::shared_ptr<State> state_;
 };
 void export_onnx(const ExportOnnxRequest& request);
 ModelInfo load_onnx_model_info(const std::filesystem::path& model_path, std::span<const RfdetrNamedOutputRole> roles = {});

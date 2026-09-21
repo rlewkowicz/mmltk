@@ -10,20 +10,20 @@
 namespace mmltk::common::system {
 namespace runtime_paths {
 std::filesystem::path repository_root() {
-    if (const char* root = std::getenv("MMLTK_REPO_ROOT"); root != nullptr && root[0] != '\0') return root;
-    return std::filesystem::current_path();
+ if (const char* root = std::getenv("MMLTK_REPO_ROOT"); root != nullptr && root[0] != '\0') return root;
+ return std::filesystem::current_path();
 }
 std::filesystem::path current_executable_path() {
-    std::vector<char> buffer(256U, '\0');
-    for (;;) {
-        const ssize_t bytes = ::readlink("/proc/self/exe", buffer.data(), buffer.size() - 1U);
-        if (bytes < 0) throw std::runtime_error(std::string("failed to resolve current executable path: ") + std::strerror(errno));
-        if (static_cast<std::size_t>(bytes) < buffer.size() - 1U) {
-            buffer[static_cast<std::size_t>(bytes)] = '\0';
-            return buffer.data();
-        }
-        buffer.resize(buffer.size() * 2U, '\0');
-    }
+ std::vector<char> buffer(256U, '\0');
+ for (;;) {
+  const ssize_t bytes = ::readlink("/proc/self/exe", buffer.data(), buffer.size() - 1U);
+  if (bytes < 0) throw std::runtime_error(std::string("failed to resolve current executable path: ") + std::strerror(errno));
+  if (static_cast<std::size_t>(bytes) < buffer.size() - 1U) {
+   buffer[static_cast<std::size_t>(bytes)] = '\0';
+   return buffer.data();
+  }
+  buffer.resize(buffer.size() * 2U, '\0');
+ }
 }
 std::filesystem::path install_prefix() { return current_executable_path().parent_path().parent_path(); }
 std::filesystem::path share_root() { return install_prefix() / "share" / "mmltk"; }

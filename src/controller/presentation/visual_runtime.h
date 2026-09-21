@@ -13,24 +13,24 @@ struct SystemImageRuntimeConfig;
 namespace mmltk::controller {
 struct VisualWorkspaceDiagnostics;
 struct VisualDeviceSettings final {
-    int device = -1;
-    std::uint32_t maximum_width = 0U;
-    std::uint32_t maximum_height = 0U;
-    int numa_node = -1;
-    [[nodiscard]] constexpr bool valid() const noexcept { return device >= 0 && numa_node >= -1 && maximum_width != 0U && maximum_height != 0U; }
+ int device = -1;
+ std::uint32_t maximum_width = 0U;
+ std::uint32_t maximum_height = 0U;
+ int numa_node = -1;
+ [[nodiscard]] constexpr bool valid() const noexcept { return device >= 0 && numa_node >= -1 && maximum_width != 0U && maximum_height != 0U; }
 };
 using VisualRuntimeFactory =
-    std::function<std::unique_ptr<mmltk::frameworks::gpu::SystemImageRuntime>(std::shared_ptr<mmltk::frameworks::gpu::ImageProductRevisionSequence>)>;
+ std::function<std::unique_ptr<mmltk::frameworks::gpu::SystemImageRuntime>(std::shared_ptr<mmltk::frameworks::gpu::ImageProductRevisionSequence>)>;
 struct VisualWorkspaceRequest final {
-    std::uint64_t product_owner = 0U;
-    std::uint64_t product_revision = 0U;
-    bool detach_only = false;
-    // Presentation owns parked destinations. Only an executing attempt retains
-    // the allocation, through synchronous GPU completion and its ready response.
-    std::weak_ptr<mmltk::frameworks::gpu::ImageWorkspace> destination;
-    // Wake-only response; no producer or graphics work executes in the sink.
-    std::function<void()> ready;
-    std::shared_ptr<const VisualWorkspaceDiagnostics> diagnostics{};
+ std::uint64_t product_owner = 0U;
+ std::uint64_t product_revision = 0U;
+ bool detach_only = false;
+ // Presentation owns parked destinations. Only an executing attempt retains
+ // the allocation, through synchronous GPU completion and its ready response.
+ std::weak_ptr<mmltk::frameworks::gpu::ImageWorkspace> destination;
+ // Wake-only response; no producer or graphics work executes in the sink.
+ std::function<void()> ready;
+ std::shared_ptr<const VisualWorkspaceDiagnostics> diagnostics{};
 };
 void configure_visual_workspace_finalization(mmltk::frameworks::gpu::SystemImageRuntimeConfig&);
 [[nodiscard]] mmltk::frameworks::gpu::DeviceExecution resolve_visual_device_execution(const VisualDeviceSettings&);

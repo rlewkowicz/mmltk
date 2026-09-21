@@ -7,27 +7,27 @@
 #include "src/backend/imaging/resample/image_resize.h"
 namespace mmltk::backend::data::dataset {
 struct MaskDimensions {
-    std::uint32_t width = 0U;
-    std::uint32_t height = 0U;
+ std::uint32_t width = 0U;
+ std::uint32_t height = 0U;
 };
 struct RowMajorMaskBounds {
-    std::uint32_t min_x = 0U;
-    std::uint32_t min_y = 0U;
-    std::uint32_t max_x = 0U;
-    std::uint32_t max_y = 0U;
-    bool has_foreground = false;
+ std::uint32_t min_x = 0U;
+ std::uint32_t min_y = 0U;
+ std::uint32_t max_x = 0U;
+ std::uint32_t max_y = 0U;
+ bool has_foreground = false;
 };
 struct EncodedRowMajorMask {
-    std::vector<RLEPair> pairs;
-    RowMajorMaskBounds bounds;
+ std::vector<RLEPair> pairs;
+ RowMajorMaskBounds bounds;
 };
 struct MaskResizeScratch {
-    std::vector<std::uint8_t> target_mask;
-    std::vector<std::uint32_t> source_x;
-    std::vector<std::uint32_t> source_y;
-    MaskDimensions lookup_source{};
-    std::uint32_t lookup_width = 0U;
-    std::uint32_t lookup_height = 0U;
+ std::vector<std::uint8_t> target_mask;
+ std::vector<std::uint32_t> source_x;
+ std::vector<std::uint32_t> source_y;
+ MaskDimensions lookup_source{};
+ std::uint32_t lookup_width = 0U;
+ std::uint32_t lookup_height = 0U;
 };
 // Fills a nearest-center source-coordinate lookup for scaling a mask axis from source_extent to
 // target_extent. lookup must already be sized to target_extent.

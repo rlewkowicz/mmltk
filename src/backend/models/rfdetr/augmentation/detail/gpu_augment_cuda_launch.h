@@ -3,24 +3,24 @@
 #include "src/backend/models/rfdetr/augmentation/gpu_augment_cuda.h"
 namespace mmltk::backend::models::rfdetr {
 struct GpuAugmentationGroupLaunchConfig {
-    float probability = 0.0F;
-    float min_strength = 0.0F;
-    float max_strength = 0.0F;
+ float probability = 0.0F;
+ float min_strength = 0.0F;
+ float max_strength = 0.0F;
 };
 struct GpuAugmentationLaunchConfig {
-    int enabled = 0;
-    GpuAugmentationGroupLaunchConfig geometry;
-    GpuAugmentationGroupLaunchConfig resize;
-    GpuAugmentationGroupLaunchConfig color;
-    GpuAugmentationGroupLaunchConfig noise;
-    GpuAugmentationGroupLaunchConfig blur;
-    GpuAugmentationGroupLaunchConfig occlusion;
+ int enabled = 0;
+ GpuAugmentationGroupLaunchConfig geometry;
+ GpuAugmentationGroupLaunchConfig resize;
+ GpuAugmentationGroupLaunchConfig color;
+ GpuAugmentationGroupLaunchConfig noise;
+ GpuAugmentationGroupLaunchConfig blur;
+ GpuAugmentationGroupLaunchConfig occlusion;
 };
 // Physical pixel layout is independent of the original normalized annotation geometry.
 struct GpuAugmentationPreparedView {
-    const float* pixels = nullptr;
-    int width = 0, height = 0;
-    std::int64_t row_stride = 0, plane_stride = 0;
+ const float* pixels = nullptr;
+ int width = 0, height = 0;
+ std::int64_t row_stride = 0, plane_stride = 0;
 };
 inline constexpr std::int64_t kGpuAugmentationParameterCount = 40;
 inline constexpr std::int64_t kGpuCopyPasteParameterCount = 8;

@@ -14,33 +14,33 @@ namespace mmltk::controller::subsystems::annotation {
 namespace domain = mmltk::controller::contracts;
 enum class DocumentOutcome : std::uint8_t { Applied, Rejected, Capacity };
 struct DocumentResult final {
-    DocumentOutcome outcome = DocumentOutcome::Rejected;
-    std::string detail;
-    bool render_changed = false;
+ DocumentOutcome outcome = DocumentOutcome::Rejected;
+ std::string detail;
+ bool render_changed = false;
 };
 enum class DocumentSaveEffect : std::uint8_t { NotApplied, Committed, Uncertain };
 [[nodiscard]] DocumentSaveEffect save_annotation_document(const contracts::AnnotationUiState&, std::string_view, std::uint64_t) noexcept;
 class AnnotationDocument final {
-   public:
-    AnnotationDocument();
-    ~AnnotationDocument();
-    AnnotationDocument(const AnnotationDocument&) = delete;
-    AnnotationDocument& operator=(const AnnotationDocument&) = delete;
-    [[nodiscard]] DocumentResult Open(contracts::AnnotationSceneContent);
-    [[nodiscard]] DocumentResult Pointer(const mmltk::controller::AnnotationPointer&);
-    // Resolve a press from current native geometry; later progress retains the
-    // document/history-owned target selected by that press.
-    [[nodiscard]] bool ResolveTarget(mmltk::controller::AnnotationPointer&) const noexcept;
-    bool PeerClosed() noexcept;
-    [[nodiscard]] DocumentResult Edit(const mmltk::controller::AnnotationEdit&);
-    [[nodiscard]] DocumentResult Save(std::string_view);
-    [[nodiscard]] const contracts::AnnotationUiState& ui() const noexcept;
-    [[nodiscard]] bool ToolAvailable(contracts::AnnotationTool, std::optional<std::uint16_t>) const noexcept;
-    // At most three descriptions are retained by the input/pending/render owners.
-    void CaptureRender(AnnotationRenderState&);
+public:
+ AnnotationDocument();
+ ~AnnotationDocument();
+ AnnotationDocument(const AnnotationDocument&) = delete;
+ AnnotationDocument& operator=(const AnnotationDocument&) = delete;
+ [[nodiscard]] DocumentResult Open(contracts::AnnotationSceneContent);
+ [[nodiscard]] DocumentResult Pointer(const mmltk::controller::AnnotationPointer&);
+ // Resolve a press from current native geometry; later progress retains the
+ // document/history-owned target selected by that press.
+ [[nodiscard]] bool ResolveTarget(mmltk::controller::AnnotationPointer&) const noexcept;
+ bool PeerClosed() noexcept;
+ [[nodiscard]] DocumentResult Edit(const mmltk::controller::AnnotationEdit&);
+ [[nodiscard]] DocumentResult Save(std::string_view);
+ [[nodiscard]] const contracts::AnnotationUiState& ui() const noexcept;
+ [[nodiscard]] bool ToolAvailable(contracts::AnnotationTool, std::optional<std::uint16_t>) const noexcept;
+ // At most three descriptions are retained by the input/pending/render owners.
+ void CaptureRender(AnnotationRenderState&);
 
-   private:
-    class Impl;
-    std::unique_ptr<Impl> impl_;
+private:
+ class Impl;
+ std::unique_ptr<Impl> impl_;
 };
 }  // namespace mmltk::controller::subsystems::annotation

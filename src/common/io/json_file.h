@@ -6,9 +6,9 @@
 #include <string_view>
 namespace mmltk::common::io {
 enum class JsonWriteStage : std::uint8_t {
-    kOpen = 0,
-    kFlush = 1,
-    kRename = 2,
+ kOpen = 0,
+ kFlush = 1,
+ kRename = 2,
 };
 // Appends one complete JSON value and its record delimiter. The caller owns the error policy so
 // domain-specific writers can add context without reimplementing the stream operation.

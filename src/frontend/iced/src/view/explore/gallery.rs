@@ -187,9 +187,9 @@ pub(super) fn view<'a>(
 ) -> Element<'a, Message> {
     let snapshot = model.explore.snapshot.as_ref();
     let presentation_title = if paired.is_none()
-        && snapshot.is_some_and(|value| value.ready && !value.busy
-            && value.failure.is_empty() && value.order.matchingcount != 0)
-    {
+        && snapshot.is_some_and(|value| {
+            value.ready && !value.busy && value.failure.is_empty() && value.order.matchingcount != 0
+        }) {
         "Restoring gallery"
     } else {
         model.explore.presentation_title()

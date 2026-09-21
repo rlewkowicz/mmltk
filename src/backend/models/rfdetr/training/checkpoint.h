@@ -19,15 +19,15 @@ DecodedNativeModelState normalize_checkpoint_to_native(const std::filesystem::pa
 ModelStateLoadSummary load_model_weights(NativeRfDetrModel& model, const std::filesystem::path& weights_path, bool strict = false);
 // Immutable facts and exact evidence; no decoded archive or tensor custody.
 class TrainingCheckpointAdmission final {
-   public:
-    TrainingCheckpointAdmission(TrainingCheckpoint, std::shared_ptr<const ClassArtifactAdmission>);
-    TrainingCheckpointAdmission(TrainingCheckpoint, mmltk::common::io::FileSnapshot);
-    [[nodiscard]] const TrainingCheckpoint& checkpoint() const noexcept { return checkpoint_; }
-    void RequireUnchanged(std::stop_token stop = {}) const;
+public:
+ TrainingCheckpointAdmission(TrainingCheckpoint, std::shared_ptr<const ClassArtifactAdmission>);
+ TrainingCheckpointAdmission(TrainingCheckpoint, mmltk::common::io::FileSnapshot);
+ [[nodiscard]] const TrainingCheckpoint& checkpoint() const noexcept { return checkpoint_; }
+ void RequireUnchanged(std::stop_token stop = {}) const;
 
-   private:
-    TrainingCheckpoint checkpoint_;
-    std::variant<std::shared_ptr<const ClassArtifactAdmission>, mmltk::common::io::FileSnapshot> evidence_;
+private:
+ TrainingCheckpoint checkpoint_;
+ std::variant<std::shared_ptr<const ClassArtifactAdmission>, mmltk::common::io::FileSnapshot> evidence_;
 };
 // CPU archive admission only: no model, zero-state allocation, or CUDA initialization.
 [[nodiscard]] TrainingCheckpointAdmission inspect_training_checkpoint(const std::filesystem::path&, std::stop_token stop = {});

@@ -31,7 +31,7 @@ pub(super) fn valid_layout(snapshot: &ExploreImageMetadata) -> bool {
         && snapshot.gallery.slots.len() == snapshot.order.visibleindices.len()
 }
 
-pub(super) fn matching(frame: Option<FrameReady>) -> Option<Arc<super::GalleryContent>> {
+pub(crate) fn matching(frame: Option<FrameReady>) -> Option<Arc<super::GalleryContent>> {
     super::metadata::pending(frame?).and_then(|metadata| metadata.content.gallery().cloned())
 }
 

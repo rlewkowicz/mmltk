@@ -15,67 +15,67 @@
 #include "src/frameworks/gpu/device_execution.h"
 namespace mmltk::controller::shell {
 struct ApplicationSystemConfiguration final {
-    VisualDeviceSettings base_visual{};
-    VisualDeviceSettings output_visual{};
-    std::size_t explore_nproc = 0U;
-    ExploreNativeConfiguration explore{};
-    LiveNativeConfiguration live{};
-    PresentationNativeConfiguration presentation{};
-    services::SettingsLocation settings_location{std::string_view{}};
-    bool h2d_dataloader = true;
-    services::FileDialogClient file_dialog{};
-    services::VastProviderClient provider{};
-    std::filesystem::path training_executable{};
-    services::RuntimeDiagnosticTarget dataset_diagnostics{};
+ VisualDeviceSettings base_visual{};
+ VisualDeviceSettings output_visual{};
+ std::size_t explore_nproc = 0U;
+ ExploreNativeConfiguration explore{};
+ LiveNativeConfiguration live{};
+ PresentationNativeConfiguration presentation{};
+ services::SettingsLocation settings_location{std::string_view{}};
+ bool h2d_dataloader = true;
+ services::FileDialogClient file_dialog{};
+ services::VastProviderClient provider{};
+ std::filesystem::path training_executable{};
+ services::RuntimeDiagnosticTarget dataset_diagnostics{};
 };
 [[nodiscard]] std::unique_ptr<ExploreSystem> make_shell_explore_system(SettingsSystem&, const ApplicationSystemConfiguration&,
                                                                        const mmltk::frameworks::gpu::DeviceExecution&,
                                                                        SystemEventSink<ExploreSystem::event_type> = {}, VisualDiagnosticSink = {});
 class ApplicationSystemStorage final {
-   public:
-    using EventSink = std::function<void(browser::SystemEvent)>;
-    using ContinuitySink = std::function<void()>;
-    ApplicationSystemStorage(ApplicationSystemConfiguration, EventSink, VisualDiagnosticSink = {}, ContinuitySink = {});
-    ~ApplicationSystemStorage();
-    ApplicationSystemStorage(const ApplicationSystemStorage&) = delete;
-    ApplicationSystemStorage& operator=(const ApplicationSystemStorage&) = delete;
-    [[nodiscard]] ApplicationSystems& application_systems() noexcept;
-    [[nodiscard]] PresentationSystem& presentation() noexcept;
-    [[nodiscard]] FileDialogSystem& file_dialog() noexcept;
-    [[nodiscard]] DatasetSystem& dataset() noexcept;
-    [[nodiscard]] ModelSystem& model() noexcept;
-    [[nodiscard]] TrainingSystem& training() noexcept;
-    // CLEANUP-IGNORE: The sealed application owner exposes each independently typed system through a direct
-    // accessor; a shared erased or templated route would weaken the ordinary API.
-    [[nodiscard]] ValidationSystem& validation() noexcept;
-    [[nodiscard]] ExportSystem& export_system() noexcept;
-    [[nodiscard]] PredictSystem& predict() noexcept;
-    [[nodiscard]] ExploreSystem& explore() noexcept;
-    [[nodiscard]] AnnotationSystem& annotation() noexcept;
-    [[nodiscard]] UpscaleSystem& upscale() noexcept;
-    [[nodiscard]] LiveSystem& live() noexcept;
+public:
+ using EventSink = std::function<void(browser::SystemEvent)>;
+ using ContinuitySink = std::function<void()>;
+ ApplicationSystemStorage(ApplicationSystemConfiguration, EventSink, VisualDiagnosticSink = {}, ContinuitySink = {});
+ ~ApplicationSystemStorage();
+ ApplicationSystemStorage(const ApplicationSystemStorage&) = delete;
+ ApplicationSystemStorage& operator=(const ApplicationSystemStorage&) = delete;
+ [[nodiscard]] ApplicationSystems& application_systems() noexcept;
+ [[nodiscard]] PresentationSystem& presentation() noexcept;
+ [[nodiscard]] FileDialogSystem& file_dialog() noexcept;
+ [[nodiscard]] DatasetSystem& dataset() noexcept;
+ [[nodiscard]] ModelSystem& model() noexcept;
+ [[nodiscard]] TrainingSystem& training() noexcept;
+ // CLEANUP-IGNORE: The sealed application owner exposes each independently typed system through a direct
+ // accessor; a shared erased or templated route would weaken the ordinary API.
+ [[nodiscard]] ValidationSystem& validation() noexcept;
+ [[nodiscard]] ExportSystem& export_system() noexcept;
+ [[nodiscard]] PredictSystem& predict() noexcept;
+ [[nodiscard]] ExploreSystem& explore() noexcept;
+ [[nodiscard]] AnnotationSystem& annotation() noexcept;
+ [[nodiscard]] UpscaleSystem& upscale() noexcept;
+ [[nodiscard]] LiveSystem& live() noexcept;
 
-   private:
-    [[nodiscard]] mmltk::frameworks::gpu::BorrowedImageProductReadView BorrowExactFrame(const VisualFrame&) const;
-    [[nodiscard]] VisualDocumentRead BorrowDocument(const VisualFrame&) const;
-    EventSink events_;
-    ContinuitySink continuity_;
-    std::atomic<PresentationSystem*> presentation_notifications_{nullptr};
-    std::unique_ptr<SettingsSystem> settings_;
-    std::unique_ptr<FileDialogSystem> file_dialog_;
-    std::unique_ptr<DatasetSystem> dataset_;
-    std::unique_ptr<ModelSystem> model_;
-    std::unique_ptr<TrainingSystem> training_;
-    std::unique_ptr<ValidationSystem> validation_;
-    std::unique_ptr<ExportSystem> export_;
-    std::unique_ptr<PredictSystem> predict_;
-    std::unique_ptr<UpscaleSystem> upscale_;
-    std::unique_ptr<ExploreSystem> explore_;
-    std::unique_ptr<AnnotationSystem> annotation_;
-    std::unique_ptr<LiveSystem> live_;
-    std::array<VisualSourceReader, browser::ApplicationSchema<ApplicationSystems>::VisualSourceCount()> source_readers_{};
-    std::unique_ptr<PresentationSystem> presentation_;
-    ApplicationSystems systems_{};
+private:
+ [[nodiscard]] mmltk::frameworks::gpu::BorrowedImageProductReadView BorrowExactFrame(const VisualFrame&) const;
+ [[nodiscard]] VisualDocumentRead BorrowDocument(const VisualFrame&) const;
+ EventSink events_;
+ ContinuitySink continuity_;
+ std::atomic<PresentationSystem*> presentation_notifications_{nullptr};
+ std::unique_ptr<SettingsSystem> settings_;
+ std::unique_ptr<FileDialogSystem> file_dialog_;
+ std::unique_ptr<DatasetSystem> dataset_;
+ std::unique_ptr<ModelSystem> model_;
+ std::unique_ptr<TrainingSystem> training_;
+ std::unique_ptr<ValidationSystem> validation_;
+ std::unique_ptr<ExportSystem> export_;
+ std::unique_ptr<PredictSystem> predict_;
+ std::unique_ptr<UpscaleSystem> upscale_;
+ std::unique_ptr<ExploreSystem> explore_;
+ std::unique_ptr<AnnotationSystem> annotation_;
+ std::unique_ptr<LiveSystem> live_;
+ std::array<VisualSourceReader, browser::ApplicationSchema<ApplicationSystems>::VisualSourceCount()> source_readers_{};
+ std::unique_ptr<PresentationSystem> presentation_;
+ ApplicationSystems systems_{};
 };
 [[nodiscard]] SystemEventSink<ExploreSystem::event_type> make_explore_upscale_event_sink(ApplicationSystemStorage::EventSink&, UpscaleSystem&,
                                                                                          ApplicationSystemStorage::ContinuitySink = {},

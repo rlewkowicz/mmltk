@@ -8,12 +8,12 @@ enum class CoconutValidation : std::uint8_t { Coconut = 0, Stock = 1, CoconutSto
 MMLTK_REFLECT_ENUM(BenchmarkDatasetVariant)
 MMLTK_REFLECT_ENUM(CoconutValidation)
 struct BenchmarkDatasetSelection {
-    BenchmarkDatasetVariant dataset = BenchmarkDatasetVariant::CocoCustom;
-    CoconutValidation validation = CoconutValidation::Coconut;
-    bool operator==(const BenchmarkDatasetSelection&) const = default;
+ BenchmarkDatasetVariant dataset = BenchmarkDatasetVariant::CocoCustom;
+ CoconutValidation validation = CoconutValidation::Coconut;
+ bool operator==(const BenchmarkDatasetSelection&) const = default;
 };
 MMLTK_REFLECT_FIELDS(BenchmarkDatasetSelection)
 [[nodiscard]] constexpr bool valid_benchmark_selection(BenchmarkDatasetSelection selection) noexcept {
-    return mmltk::frameworks::reflection::enum_contains(selection.dataset) && mmltk::frameworks::reflection::enum_contains(selection.validation);
+ return mmltk::frameworks::reflection::enum_contains(selection.dataset) && mmltk::frameworks::reflection::enum_contains(selection.validation);
 }
 }  // namespace mmltk::backend::data

@@ -13,37 +13,37 @@ namespace mmltk::backend::data::benchmark_internal {
 inline constexpr std::string_view kBenchmarkCatalogRevision = "benchmark-sources-v1";
 inline constexpr std::string_view kBenchmarkMappingRevision = "coco80-faithful-annotations-v3";
 struct CatalogArtifact {
-    std::string artifact_id;
-    std::string url;
-    std::string filename;
-    std::uint64_t expected_size = 0U;
-    std::string expected_sha256;
-    BenchmarkDatasetSource source = BenchmarkDatasetSource::kCoco2017;
+ std::string artifact_id;
+ std::string url;
+ std::string filename;
+ std::uint64_t expected_size = 0U;
+ std::string expected_sha256;
+ BenchmarkDatasetSource source = BenchmarkDatasetSource::kCoco2017;
 };
 struct NumericCategoryMapping {
-    std::uint32_t source_id = 0U;
-    std::uint8_t target_id = 0U;
-    std::string_view expected_name;
+ std::uint32_t source_id = 0U;
+ std::uint8_t target_id = 0U;
+ std::string_view expected_name;
 };
 struct CategoryLookup {
-    std::vector<std::int16_t> target_by_id;
-    std::unordered_map<std::uint32_t, std::string_view> expected_names;
+ std::vector<std::int16_t> target_by_id;
+ std::unordered_map<std::uint32_t, std::string_view> expected_names;
 };
 [[nodiscard]] CategoryLookup make_numeric_lookup(std::span<const NumericCategoryMapping> mappings);
 class NumericCategoryAdmission final {
-   public:
-    explicit NumericCategoryAdmission(const CategoryLookup& lookup) : lookup_(lookup) {}
-    void observe(std::optional<std::uint32_t> id, std::optional<std::string_view> name);
-    void complete() const;
+public:
+ explicit NumericCategoryAdmission(const CategoryLookup& lookup) : lookup_(lookup) {}
+ void observe(std::optional<std::uint32_t> id, std::optional<std::string_view> name);
+ void complete() const;
 
-   private:
-    const CategoryLookup& lookup_;
-    std::unordered_set<std::uint32_t> matched_;
+private:
+ const CategoryLookup& lookup_;
+ std::unordered_set<std::uint32_t> matched_;
 };
 struct StringCategoryMapping {
-    std::string_view source_id;
-    std::uint8_t target_id = 0U;
-    std::string_view expected_name;
+ std::string_view source_id;
+ std::uint8_t target_id = 0U;
+ std::string_view expected_name;
 };
 [[nodiscard]] const std::array<std::string_view, 80>& coco80_class_names() noexcept;
 [[nodiscard]] std::span<const NumericCategoryMapping> coco_category_mappings() noexcept;

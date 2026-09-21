@@ -29,36 +29,36 @@ class ArtifactProgressTotals;
 void retry_annotation_indexing(mmltk::common::concurrency::CancellationObservation, const std::function<void()>&,
                                const std::function<void(const std::exception&)>&);
 struct CocoAnnotationIndexes {
-    std::filesystem::path train_path, validation_path;
-    std::optional<NormalizedAnnotationIndex> train, validation;
-    bool cache_hit = false;
-    std::uint64_t retained_storage_bytes = 0;
+ std::filesystem::path train_path, validation_path;
+ std::optional<NormalizedAnnotationIndex> train, validation;
+ bool cache_hit = false;
+ std::uint64_t retained_storage_bytes = 0;
 };
 // Holds the source lifecycle lease from independent discovery through settlement.
 // Callers may acquire other source leases after construction, before discovery.
 class CocoAnnotationCache final {
-   public:
-    CocoAnnotationCache(const BenchmarkCacheLayout&, const CatalogArtifact&, bool training, std::uint32_t train_count, std::uint32_t validation_count,
-                        int parse_workers, mmltk::common::concurrency::CancellationObservation, const BenchmarkTraceSink&);
-    void discover(ProgressReporter&);
-    [[nodiscard]] std::uint64_t completed_indexes() const noexcept;
-    [[nodiscard]] const std::optional<DownloadRequest>& pending_download() const noexcept { return pending_; }
-    void settle(DownloadResult, ProgressReporter&, std::size_t workers, std::uint64_t& completed, std::uint64_t total);
-    [[nodiscard]] CocoAnnotationIndexes take_indexes();
+public:
+ CocoAnnotationCache(const BenchmarkCacheLayout&, const CatalogArtifact&, bool training, std::uint32_t train_count, std::uint32_t validation_count,
+                     int parse_workers, mmltk::common::concurrency::CancellationObservation, const BenchmarkTraceSink&);
+ void discover(ProgressReporter&);
+ [[nodiscard]] std::uint64_t completed_indexes() const noexcept;
+ [[nodiscard]] const std::optional<DownloadRequest>& pending_download() const noexcept { return pending_; }
+ void settle(DownloadResult, ProgressReporter&, std::size_t workers, std::uint64_t& completed, std::uint64_t total);
+ [[nodiscard]] CocoAnnotationIndexes take_indexes();
 
-   private:
-    void build_split(bool training, const DownloadResult&, ProgressReporter&, std::uint64_t&, std::uint64_t);
-    void invalidate_missing();
-    [[nodiscard]] std::filesystem::path source_json(bool training) const;
-    const BenchmarkCacheLayout& cache_;
-    DownloadRequest request_;
-    bool training_;
-    std::uint32_t train_count_, validation_count_;
-    int parse_workers_;
-    mmltk::common::concurrency::CancellationObservation cancellation_;
-    const BenchmarkTraceSink& trace_;
-    ArtifactLease lease_;
-    CocoAnnotationIndexes indexes_;
-    std::optional<DownloadRequest> pending_;
+private:
+ void build_split(bool training, const DownloadResult&, ProgressReporter&, std::uint64_t&, std::uint64_t);
+ void invalidate_missing();
+ [[nodiscard]] std::filesystem::path source_json(bool training) const;
+ const BenchmarkCacheLayout& cache_;
+ DownloadRequest request_;
+ bool training_;
+ std::uint32_t train_count_, validation_count_;
+ int parse_workers_;
+ mmltk::common::concurrency::CancellationObservation cancellation_;
+ const BenchmarkTraceSink& trace_;
+ ArtifactLease lease_;
+ CocoAnnotationIndexes indexes_;
+ std::optional<DownloadRequest> pending_;
 };
 }  // namespace mmltk::backend::data::benchmark_internal

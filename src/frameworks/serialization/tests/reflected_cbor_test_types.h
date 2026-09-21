@@ -14,23 +14,23 @@
 namespace mmltk::frameworks::serialization::test {
 namespace policy = mmltk::frameworks::reflection;
 struct BoundBase {
-    std::uint16_t id = 0U;
+ std::uint16_t id = 0U;
 };
 struct BoundLeaf final : BoundBase {
-    [[= policy::MaxBytes{24U}]] std::string text;
-    std::array<std::byte, 3U> bytes{};
-    [[= policy::MaxBytes{1U}]][[= policy::MaxItems{1U}]] std::optional<wire::Value> payload;
+ [[= policy::MaxBytes{24U}]] std::string text;
+ std::array<std::byte, 3U> bytes{};
+ [[= policy::MaxBytes{1U}]][[= policy::MaxItems{1U}]] std::optional<wire::Value> payload;
 };
 struct BoundContainers final {
-    [[= policy::MaxItems{2U}]] std::optional<std::vector<BoundLeaf>> rows;
-    std::array<std::optional<BoundLeaf>, 2U> fixed;
-    std::inplace_vector<BoundLeaf, 2U> local;
-    [[= policy::MaxItems{2U}]] std::span<const BoundLeaf> borrowed;
-    // Unannotated dynamic leaves use the enclosing aggregate admission budget.
-    std::array<wire::Value, 2U> values;
+ [[= policy::MaxItems{2U}]] std::optional<std::vector<BoundLeaf>> rows;
+ std::array<std::optional<BoundLeaf>, 2U> fixed;
+ std::inplace_vector<BoundLeaf, 2U> local;
+ [[= policy::MaxItems{2U}]] std::span<const BoundLeaf> borrowed;
+ // Unannotated dynamic leaves use the enclosing aggregate admission budget.
+ std::array<wire::Value, 2U> values;
 };
 struct BoundFlat final {
-    [[= policy::MaxBytes{4U}]][[= policy::MaxItems{2U}]] wire::FlatValue flat;
+ [[= policy::MaxBytes{4U}]][[= policy::MaxItems{2U}]] wire::FlatValue flat;
 };
 MMLTK_REFLECT_FIELDS(BoundBase)
 MMLTK_REFLECT_FIELDS(BoundLeaf)

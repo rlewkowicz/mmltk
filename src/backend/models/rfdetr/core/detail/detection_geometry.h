@@ -3,8 +3,8 @@
 #include <cstdint>
 namespace mmltk::backend::models::rfdetr {
 enum class BoxExtentPolicy : std::uint8_t {
-    Preserve,
-    ClampNonnegative,
+ Preserve,
+ ClampNonnegative,
 };
 [[nodiscard]] torch::Tensor box_cxcywh_to_xyxy(const torch::Tensor& boxes, BoxExtentPolicy extent_policy = BoxExtentPolicy::ClampNonnegative);
 [[nodiscard]] torch::Tensor pairwise_box_iou(const torch::Tensor& boxes1, const torch::Tensor& boxes2);

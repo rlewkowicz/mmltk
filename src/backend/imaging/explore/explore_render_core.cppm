@@ -24,23 +24,23 @@ using ExploreRenderAnnotationDescriptor = detail::ExploreRenderAnnotationDescrip
 using ExploreRenderClassDescriptor = detail::ExploreRenderClassDescriptorAbi;
 using ExploreContainRect = mmltk::backend::imaging::raster::ImageContainRect;
 [[nodiscard]] inline ExploreContainRect make_explore_contain_rect(std::uint32_t width, std::uint32_t height, std::uint32_t extent) noexcept {
-    return mmltk::backend::imaging::raster::contain_image(width, height, extent, extent);
+ return mmltk::backend::imaging::raster::contain_image(width, height, extent, extent);
 }
 // Project full-canvas normalized boxes into card-local contained pixels for
 // captions and optional diagnostic regions, without changing retained meaning.
 [[nodiscard]] inline std::array<float, 4U> project_explore_card_box(const ExploreRenderCardDescriptor& card,
-                                                                  const ExploreRenderAnnotationDescriptor& annotation) noexcept {
-    std::array<float, 4U> box{};
-    for (std::size_t index = 0U; index != box.size(); ++index) {
-        const bool horizontal = index % 2U == 0U;
-        const float source = static_cast<float>(horizontal ? card.source_width : card.source_height);
-        const float origin = static_cast<float>(horizontal ? card.crop_x : card.crop_y) / source;
-        const float extent = static_cast<float>(horizontal ? card.crop_width : card.crop_height) / source;
-        const float normalized = std::clamp((annotation.box_xyxy[index] - origin) / extent, 0.0F, 1.0F);
-        box[index] = static_cast<float>(horizontal ? card.image_x : card.image_y) +
-                     normalized * static_cast<float>(horizontal ? card.image_width : card.image_height);
-    }
-    return box;
+                                                                    const ExploreRenderAnnotationDescriptor& annotation) noexcept {
+ std::array<float, 4U> box{};
+ for (std::size_t index = 0U; index != box.size(); ++index) {
+  const bool horizontal = index % 2U == 0U;
+  const float source = static_cast<float>(horizontal ? card.source_width : card.source_height);
+  const float origin = static_cast<float>(horizontal ? card.crop_x : card.crop_y) / source;
+  const float extent = static_cast<float>(horizontal ? card.crop_width : card.crop_height) / source;
+  const float normalized = std::clamp((annotation.box_xyxy[index] - origin) / extent, 0.0F, 1.0F);
+  box[index] =
+   static_cast<float>(horizontal ? card.image_x : card.image_y) + normalized * static_cast<float>(horizontal ? card.image_width : card.image_height);
+ }
+ return box;
 }
 // A tile is an independently patchable region of a persistent atlas.  Its
 // generation fields are copied from the owning lane request and remain part
@@ -48,25 +48,25 @@ using ExploreContainRect = mmltk::backend::imaging::raster::ImageContainRect;
 using ExploreRenderTileDescriptor = detail::ExploreRenderTileDescriptorAbi;
 using ExploreRenderTargetView = detail::ExploreRenderTargetViewAbi;
 struct ExploreRenderScratchView final {
-    const ExploreRenderCardDescriptor* cards = nullptr;
-    std::uint32_t card_capacity = 0U;
-    const ExploreRenderAnnotationDescriptor* annotations = nullptr;
-    std::uint32_t annotation_capacity = 0U;
-    const mmltk::backend::data::RLEPair* rle_pairs = nullptr;
-    std::uint32_t rle_capacity = 0U;
-    const ExploreRenderClassDescriptor* classes = nullptr;
-    std::uint32_t class_capacity = 0U;
-    const ExploreRenderTileDescriptor* tiles = nullptr;
-    std::uint32_t tile_capacity = 0U;
-    [[nodiscard]] bool valid() const noexcept {
-        return cards != nullptr && annotations != nullptr && (rle_pairs != nullptr || rle_capacity == 0U) && (classes != nullptr || class_capacity == 0U);
-    }
+ const ExploreRenderCardDescriptor* cards = nullptr;
+ std::uint32_t card_capacity = 0U;
+ const ExploreRenderAnnotationDescriptor* annotations = nullptr;
+ std::uint32_t annotation_capacity = 0U;
+ const mmltk::backend::data::RLEPair* rle_pairs = nullptr;
+ std::uint32_t rle_capacity = 0U;
+ const ExploreRenderClassDescriptor* classes = nullptr;
+ std::uint32_t class_capacity = 0U;
+ const ExploreRenderTileDescriptor* tiles = nullptr;
+ std::uint32_t tile_capacity = 0U;
+ [[nodiscard]] bool valid() const noexcept {
+  return cards != nullptr && annotations != nullptr && (rle_pairs != nullptr || rle_capacity == 0U) && (classes != nullptr || class_capacity == 0U);
+ }
 };
 using ExploreRenderTileBatchView = detail::ExploreRenderTileBatchViewAbi;
 [[nodiscard]] inline bool valid_tile_batch(const ExploreRenderTileBatchView& tiles, const ExploreRenderScratchView& scratch) noexcept {
-    return tiles.tile_count != 0U && tiles.tile_count <= kExploreRenderTileCapacity && tiles.tile_count <= tiles.tile_capacity &&
-           tiles.tile_count <= scratch.tile_capacity && scratch.tiles != nullptr && tiles.max_tile_width != 0U && tiles.max_tile_height != 0U &&
-           tiles.viewport_generation != 0U;
+ return tiles.tile_count != 0U && tiles.tile_count <= kExploreRenderTileCapacity && tiles.tile_count <= tiles.tile_capacity &&
+        tiles.tile_count <= scratch.tile_capacity && scratch.tiles != nullptr && tiles.max_tile_width != 0U && tiles.max_tile_height != 0U &&
+        tiles.viewport_generation != 0U;
 }
 // Semantic inputs remain separate from the clean image target.  The owner
 // may submit the same descriptors once for a clean target and once for an

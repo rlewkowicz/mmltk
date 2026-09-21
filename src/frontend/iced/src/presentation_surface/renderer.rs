@@ -832,8 +832,16 @@ impl FrameMailbox {
             .find_map(Option::take)
             .map(Notification::Copied)
             .or_else(|| self.pop().map(Notification::Native))
-            .or_else(|| self.rejected_sample.take().map(Notification::SampleRejected))
-            .or_else(|| self.rejected_publication.take().map(Notification::SampleRejected))
+            .or_else(|| {
+                self.rejected_sample
+                    .take()
+                    .map(Notification::SampleRejected)
+            })
+            .or_else(|| {
+                self.rejected_publication
+                    .take()
+                    .map(Notification::SampleRejected)
+            })
             .or_else(|| std::mem::take(&mut self.drawn).then_some(Notification::Drawn))
     }
 

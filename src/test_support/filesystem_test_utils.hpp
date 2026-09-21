@@ -16,12 +16,12 @@ void make_executable(const std::filesystem::path& path, std::filesystem::perms p
 void write_executable_file(const std::filesystem::path& path, std::string_view contents);
 void write_executable_file(const std::filesystem::path& path, std::function_ref<void(std::ostream&)> write_contents);
 class ScopedTempDir {
-   public:
-    explicit ScopedTempDir(const char* name_prefix);
-    ~ScopedTempDir();
-    [[nodiscard]] const std::filesystem::path& path() const noexcept;
+public:
+ explicit ScopedTempDir(const char* name_prefix);
+ ~ScopedTempDir();
+ [[nodiscard]] const std::filesystem::path& path() const noexcept;
 
-   private:
-    std::filesystem::path path_;
+private:
+ std::filesystem::path path_;
 };
 }  // namespace mmltk::testsupport

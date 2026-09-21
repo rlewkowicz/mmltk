@@ -19,46 +19,46 @@ namespace mmltk::backend::data::benchmark_internal {
 // append receives (image_id, reason) per record.
 template <typename Records, typename Append>
 [[nodiscard]] bool parse_quarantined_manifest_records(const Records& records, const std::span<const std::uint64_t> requested_image_ids, Append&& append) {
-    if (!records.is_array()) { return false; }
-    for (const auto& record : records) {
-        const std::uint64_t image_id = record.value("image_id", std::uint64_t{0U});
-        std::string reason = record.value("reason", std::string{});
-        if (reason.empty() || !std::ranges::binary_search(requested_image_ids, image_id)) { return false; }
-        append(image_id, std::move(reason));
-    }
-    return true;
+ if (!records.is_array()) { return false; }
+ for (const auto& record : records) {
+  const std::uint64_t image_id = record.value("image_id", std::uint64_t{0U});
+  std::string reason = record.value("reason", std::string{});
+  if (reason.empty() || !std::ranges::binary_search(requested_image_ids, image_id)) { return false; }
+  append(image_id, std::move(reason));
+ }
+ return true;
 }
 using ArchiveImageIdParser = std::function<std::optional<std::uint64_t>(std::string_view)>;
 using CachedImageProgress = std::function<void(std::uint64_t, std::uint64_t)>;
 // Per-attempt write completion publication. Counts are captured only after physical writes;
 // publication rejects an older batch without retaining a high-water mark across retries.
 class CachedImageWriteProgress {
-   public:
-    CachedImageWriteProgress(CachedImageProgress callback, std::uint64_t initial, std::uint64_t expected);
-    void completed(std::uint64_t writes);
+public:
+ CachedImageWriteProgress(CachedImageProgress callback, std::uint64_t initial, std::uint64_t expected);
+ void completed(std::uint64_t writes);
 
-   private:
-    CachedImageProgress callback_;
-    std::uint64_t initial_;
-    std::uint64_t expected_;
-    std::uint64_t published_ = 0U;
-    std::mutex mutex_;
+private:
+ CachedImageProgress callback_;
+ std::uint64_t initial_;
+ std::uint64_t expected_;
+ std::uint64_t published_ = 0U;
+ std::mutex mutex_;
 };
 using CachedImageValidator = std::function<void(std::uint64_t, std::span<const std::uint8_t>)>;
 struct CachedImageRejection {
-    std::uint64_t image_id = 0U;
-    std::string reason;
+ std::uint64_t image_id = 0U;
+ std::string reason;
 };
 struct CachedImageDirectory {
-    std::string source;
-    std::string shard;
-    std::filesystem::path path;
-    std::string identity;
-    std::string selection_sha256;
-    std::uint64_t image_count = 0U;
-    std::uint64_t image_bytes = 0U;
-    bool cache_hit = false;
-    std::vector<CachedImageRejection> quarantined;
+ std::string source;
+ std::string shard;
+ std::filesystem::path path;
+ std::string identity;
+ std::string selection_sha256;
+ std::uint64_t image_count = 0U;
+ std::uint64_t image_bytes = 0U;
+ bool cache_hit = false;
+ std::vector<CachedImageRejection> quarantined;
 };
 [[nodiscard]] std::string cached_image_selection_digest(std::span<const std::uint64_t> image_ids);
 [[nodiscard]] std::filesystem::path cached_image_path(const std::filesystem::path& root, std::uint64_t image_id);
@@ -79,22 +79,22 @@ void complete_cached_image_group(const std::filesystem::path& root, const std::f
 // Everything one archive extraction needs. The knobs live here instead of in a positional parameter
 // list so the entry point keeps a single signature that callers and the definition cannot drift.
 struct ArchiveExtractionRequest {
-    std::filesystem::path archive_path;
-    std::string source_identity;
-    std::filesystem::path output_root;
-    std::string source;
-    std::string shard;
-    std::span<const std::uint64_t> selected_image_ids;
-    ArchiveImageIdParser image_id_parser;
-    mmltk::common::concurrency::CancellationObservation cancel_requested = {};
-    CachedImageProgress progress = {};
-    CachedImageValidator validator = {};
-    BenchmarkTraceSink trace = {};
-    bool quarantine_unavailable = false;
-    std::size_t decompression_workers = 1U;
-    std::size_t cache_write_workers = 1U;
-    std::function<void(std::string_view)> activity = {};
-    std::filesystem::path completion_path = {};
+ std::filesystem::path archive_path;
+ std::string source_identity;
+ std::filesystem::path output_root;
+ std::string source;
+ std::string shard;
+ std::span<const std::uint64_t> selected_image_ids;
+ ArchiveImageIdParser image_id_parser;
+ mmltk::common::concurrency::CancellationObservation cancel_requested = {};
+ CachedImageProgress progress = {};
+ CachedImageValidator validator = {};
+ BenchmarkTraceSink trace = {};
+ bool quarantine_unavailable = false;
+ std::size_t decompression_workers = 1U;
+ std::size_t cache_write_workers = 1U;
+ std::function<void(std::string_view)> activity = {};
+ std::filesystem::path completion_path = {};
 };
 [[nodiscard]] CachedImageDirectory extract_selected_archive_images(ArchiveExtractionRequest request);
 }  // namespace mmltk::backend::data::benchmark_internal

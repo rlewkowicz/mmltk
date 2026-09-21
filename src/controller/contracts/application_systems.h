@@ -18,18 +18,18 @@ namespace mmltk::controller {
 // annotated intents, snapshot, and event variant. ApplicationShell supplies
 // the live objects; this declaration owns no lifetime.
 struct ApplicationSystems final {
-    SettingsSystem* settings = nullptr;
-    FileDialogSystem* file_dialog = nullptr;
-    DatasetSystem* dataset = nullptr;
-    ModelSystem* model = nullptr;
-    TrainingSystem* training = nullptr;
-    ValidationSystem* validation = nullptr;
-    ExportSystem* export_system = nullptr;
-    PredictSystem* predict = nullptr;
-    ExploreSystem* explore = nullptr;
-    AnnotationSystem* annotation = nullptr;
-    UpscaleSystem* upscale = nullptr;
-    LiveSystem* live = nullptr;
-    PresentationSystem* presentation = nullptr;
+ SettingsSystem* settings = nullptr;
+ FileDialogSystem* file_dialog = nullptr;
+ DatasetSystem* dataset = nullptr;
+ ModelSystem* model = nullptr;
+ TrainingSystem* training = nullptr;
+ ValidationSystem* validation = nullptr;
+ ExportSystem* export_system = nullptr;
+ PredictSystem* predict = nullptr;
+ ExploreSystem* explore = nullptr;
+ AnnotationSystem* annotation = nullptr;
+ UpscaleSystem* upscale = nullptr;
+ LiveSystem* live = nullptr;
+ PresentationSystem* presentation = nullptr;
 };
 }  // namespace mmltk::controller

@@ -15,38 +15,38 @@ void weston_seat_release(weston_seat*);
 }
 namespace {
 class HeadlessSeat final {
-   public:
-    explicit HeadlessSeat(weston_compositor* compositor) noexcept {
-        destroy_.owner = this;
-        destroy_.notify = Destroy;
-        wl_list_init(&destroy_.link);
-        weston_seat_init(&seat_, compositor, "default");
-    }
-    ~HeadlessSeat() {
-        wl_list_remove(&destroy_.link);
-        weston_seat_release(&seat_);
-    }
-    HeadlessSeat(const HeadlessSeat&) = delete;
-    HeadlessSeat& operator=(const HeadlessSeat&) = delete;
-    bool Install(weston_compositor* compositor) noexcept {
-        if (weston_seat_init_pointer(&seat_) < 0 || weston_seat_init_keyboard(&seat_, nullptr) < 0) { return false; }
-        wl_signal_add(&compositor->destroy_signal, &destroy_);
-        return true;
-    }
+public:
+ explicit HeadlessSeat(weston_compositor* compositor) noexcept {
+  destroy_.owner = this;
+  destroy_.notify = Destroy;
+  wl_list_init(&destroy_.link);
+  weston_seat_init(&seat_, compositor, "default");
+ }
+ ~HeadlessSeat() {
+  wl_list_remove(&destroy_.link);
+  weston_seat_release(&seat_);
+ }
+ HeadlessSeat(const HeadlessSeat&) = delete;
+ HeadlessSeat& operator=(const HeadlessSeat&) = delete;
+ bool Install(weston_compositor* compositor) noexcept {
+  if (weston_seat_init_pointer(&seat_) < 0 || weston_seat_init_keyboard(&seat_, nullptr) < 0) { return false; }
+  wl_signal_add(&compositor->destroy_signal, &destroy_);
+  return true;
+ }
 
-   private:
-    struct DestroyListener : wl_listener {
-        HeadlessSeat* owner = nullptr;
-    };
-    static void Destroy(wl_listener* listener, void*) noexcept { delete static_cast<DestroyListener*>(listener)->owner; }
-    weston_seat seat_{};
-    DestroyListener destroy_{};
+private:
+ struct DestroyListener : wl_listener {
+  HeadlessSeat* owner = nullptr;
+ };
+ static void Destroy(wl_listener* listener, void*) noexcept { delete static_cast<DestroyListener*>(listener)->owner; }
+ weston_seat seat_{};
+ DestroyListener destroy_{};
 };
 }  // namespace
 extern "C" WL_EXPORT int wet_module_init(weston_compositor* compositor, int*, char*[]) {
-    auto seat = std::unique_ptr<HeadlessSeat>(new (std::nothrow) HeadlessSeat(compositor));
-    if (!seat || !seat->Install(compositor)) { return -1; }
-    // The compositor's destroy listener now owns the seat and both devices.
-    seat.release();
-    return 0;
+ auto seat = std::unique_ptr<HeadlessSeat>(new (std::nothrow) HeadlessSeat(compositor));
+ if (!seat || !seat->Install(compositor)) { return -1; }
+ // The compositor's destroy listener now owns the seat and both devices.
+ seat.release();
+ return 0;
 }

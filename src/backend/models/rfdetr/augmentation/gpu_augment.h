@@ -17,100 +17,99 @@ namespace test_support {
 struct GpuAugmentationTestAccess;
 }
 enum class GpuAugmentationInputFormat : std::uint8_t {
-    PlanarFloat32,
-    Rgba8,
+ PlanarFloat32,
+ Rgba8,
 };
 struct GpuAugmentationBatchView {
-    const void* input = nullptr;
-    float* output = nullptr;
-    std::span<const std::uint32_t> image_indices;
-    int height = 0;
-    int width = 0;
-    GpuAugmentationInputFormat input_format = GpuAugmentationInputFormat::PlanarFloat32;
-    GpuAugmentationOutputDomain output_domain = GpuAugmentationOutputDomain::ModelNormalized;
-    // Optional CPU list of stable device image pointers, in logical batch order.
-    // Empty uses contiguous identity addressing. The executor stages only this list.
-    std::span<const float* const> input_slots{};
-    // Exact producer aggregate; logical bytes per slot, or whole contiguous batch.
-    std::shared_ptr<const void> input_custody{};
-    std::shared_ptr<const void> output_custody{};
-    std::size_t input_capacity_bytes = 0;
-    std::size_t output_capacity_bytes = 0;
+ const void* input = nullptr;
+ float* output = nullptr;
+ std::span<const std::uint32_t> image_indices;
+ int height = 0;
+ int width = 0;
+ GpuAugmentationInputFormat input_format = GpuAugmentationInputFormat::PlanarFloat32;
+ GpuAugmentationOutputDomain output_domain = GpuAugmentationOutputDomain::ModelNormalized;
+ // Optional CPU list of stable device image pointers, in logical batch order.
+ // Empty uses contiguous identity addressing. The executor stages only this list.
+ std::span<const float* const> input_slots{};
+ // Exact producer aggregate; logical bytes per slot, or whole contiguous batch.
+ std::shared_ptr<const void> input_custody{};
+ std::shared_ptr<const void> output_custody{};
+ std::size_t input_capacity_bytes = 0;
+ std::size_t output_capacity_bytes = 0;
 };
 struct GpuAugmentationDonor {
-    std::int64_t label = -1;
-    std::uint32_t dataset_index = 0U;
-    float area = 0.0F;
-    std::array<float, 4> box{};
-    bool has_mask = false;
+ std::int64_t label = -1;
+ std::uint32_t dataset_index = 0U;
+ float area = 0.0F;
+ std::array<float, 4> box{};
+ bool has_mask = false;
 };
 [[nodiscard]] bool augmentation_paste_admitted(const GpuAugmentationConfig& config, std::uint64_t key) noexcept;
 enum class GpuAugmentationDonorSelection : std::uint8_t {
-    Aligned,
-    Cached,
+ Aligned,
+ Cached,
 };
 struct GpuAugmentationDonorBatchView {
-    // Donor images and boxes are device-resident planar float32 data; masks are
-    // device-resident packed 64-bit words.
-    const float* images = nullptr;
-    const std::int64_t* masks = nullptr;
-    const float* boxes = nullptr;
-    std::int64_t mask_words = 0;
-    GpuAugmentationDonorSelection selection = GpuAugmentationDonorSelection::Aligned;
-    // Optional device image pointers corresponding to donor metadata slots.
-    std::span<const float* const> image_slots{};
-    std::shared_ptr<const void> image_custody;
-    std::size_t image_capacity_bytes = 0;
+ // Donor images and boxes are device-resident planar float32 data; masks are
+ // device-resident packed 64-bit words.
+ const float* images = nullptr;
+ const std::int64_t* masks = nullptr;
+ const float* boxes = nullptr;
+ std::int64_t mask_words = 0;
+ GpuAugmentationDonorSelection selection = GpuAugmentationDonorSelection::Aligned;
+ // Optional device image pointers corresponding to donor metadata slots.
+ std::span<const float* const> image_slots{};
+ std::shared_ptr<const void> image_custody;
+ std::size_t image_capacity_bytes = 0;
 };
 // Owns augmentation planning and the reusable raw-CUDA launch workspace. The
 // caller owns the CUDA context, stream, input, donor, and output storage.
 class GpuAugmentationExecutor final {
-   public:
-    GpuAugmentationExecutor(const GpuAugmentationConfig& config, std::size_t batch_capacity, int height, int width,
-                            mmltk::frameworks::gpu::DeviceContext context, mmltk::frameworks::gpu::TerminalCudaRetirementAuthority& retirement);
-    ~GpuAugmentationExecutor();
-    GpuAugmentationExecutor(const GpuAugmentationExecutor&) = delete;
-    GpuAugmentationExecutor& operator=(const GpuAugmentationExecutor&) = delete;
-    GpuAugmentationExecutor(GpuAugmentationExecutor&&) = delete;
-    GpuAugmentationExecutor& operator=(GpuAugmentationExecutor&&) = delete;
-    void Finish();
-    void Reconfigure(const GpuAugmentationConfig& config);
-    [[nodiscard]] const AugmentationBatchPlan& Run(const GpuAugmentationBatchView& batch, std::span<const std::uint64_t> image_keys,
-                                                   std::span<const GpuAugmentationDonor> donors, const GpuAugmentationDonorBatchView& donor_batch,
-                                                   cudaStream_t stream, std::size_t staging_slot = 0U);
-    [[nodiscard]] const AugmentationBatchPlan& RunTraining(const GpuAugmentationBatchView& batch, std::uint64_t seed, int epoch, int rank,
-                                                           std::uint64_t sequence, std::span<const GpuAugmentationDonor> donors,
-                                                           const GpuAugmentationDonorBatchView& donor_batch, cudaStream_t stream,
-                                                           std::size_t staging_slot = 0U);
-    // Image parameters and returned semantic geometry/erasure are planned together.
-    // The returned plan remains owned by this executor and is replaced by the next run.
-    [[nodiscard]] const AugmentationBatchPlan& plan() const;
-    // Opt-in diagnostic JSON from the actual host plan and staged launch parameters.
-    // Call after Run/RunTraining returns, with that run's staging slot, before
-    // reconfiguration or another run. Reads no device storage and retains nothing.
-    [[nodiscard]] std::string prepared_image_diagnostic(std::size_t image, std::size_t staging_slot) const;
-    [[nodiscard]] bool enabled() const;
-    [[nodiscard]] bool transforms_geometry() const;
-    [[nodiscard]] bool copy_paste_enabled() const;
-    [[nodiscard]] bool remaps_pixels() const;
-    [[nodiscard]] std::size_t batch_capacity() const;
-    [[nodiscard]] std::size_t workspace_capacity_bytes() const;
-    [[nodiscard]] std::size_t device_capacity_bytes() const;
-    [[nodiscard]] std::size_t pinned_capacity_bytes() const;
+public:
+ GpuAugmentationExecutor(const GpuAugmentationConfig& config, std::size_t batch_capacity, int height, int width, mmltk::frameworks::gpu::DeviceContext context,
+                         mmltk::frameworks::gpu::TerminalCudaRetirementAuthority& retirement);
+ ~GpuAugmentationExecutor();
+ GpuAugmentationExecutor(const GpuAugmentationExecutor&) = delete;
+ GpuAugmentationExecutor& operator=(const GpuAugmentationExecutor&) = delete;
+ GpuAugmentationExecutor(GpuAugmentationExecutor&&) = delete;
+ GpuAugmentationExecutor& operator=(GpuAugmentationExecutor&&) = delete;
+ void Finish();
+ void Reconfigure(const GpuAugmentationConfig& config);
+ [[nodiscard]] const AugmentationBatchPlan& Run(const GpuAugmentationBatchView& batch, std::span<const std::uint64_t> image_keys,
+                                                std::span<const GpuAugmentationDonor> donors, const GpuAugmentationDonorBatchView& donor_batch,
+                                                cudaStream_t stream, std::size_t staging_slot = 0U);
+ [[nodiscard]] const AugmentationBatchPlan& RunTraining(const GpuAugmentationBatchView& batch, std::uint64_t seed, int epoch, int rank, std::uint64_t sequence,
+                                                        std::span<const GpuAugmentationDonor> donors, const GpuAugmentationDonorBatchView& donor_batch,
+                                                        cudaStream_t stream, std::size_t staging_slot = 0U);
+ // Image parameters and returned semantic geometry/erasure are planned together.
+ // The returned plan remains owned by this executor and is replaced by the next run.
+ [[nodiscard]] const AugmentationBatchPlan& plan() const;
+ // Opt-in diagnostic JSON from the actual host plan and staged launch parameters.
+ // Call after Run/RunTraining returns, with that run's staging slot, before
+ // reconfiguration or another run. Reads no device storage and retains nothing.
+ [[nodiscard]] std::string prepared_image_diagnostic(std::size_t image, std::size_t staging_slot) const;
+ [[nodiscard]] bool enabled() const;
+ [[nodiscard]] bool transforms_geometry() const;
+ [[nodiscard]] bool copy_paste_enabled() const;
+ [[nodiscard]] bool remaps_pixels() const;
+ [[nodiscard]] std::size_t batch_capacity() const;
+ [[nodiscard]] std::size_t workspace_capacity_bytes() const;
+ [[nodiscard]] std::size_t device_capacity_bytes() const;
+ [[nodiscard]] std::size_t pinned_capacity_bytes() const;
 
-   private:
-    [[nodiscard]] const AugmentationBatchPlan& RunImpl(const GpuAugmentationBatchView& batch, std::span<const std::uint64_t> image_keys,
-                                                       std::span<const GpuAugmentationDonor> donors, const GpuAugmentationDonorBatchView& donor_batch,
-                                                       cudaStream_t stream, std::size_t staging_slot, bool explicit_keys, std::uint64_t seed, int epoch,
-                                                       int rank, std::uint64_t sequence);
-    void RequireActive() const;
-    void Retire(cudaError_t) noexcept;
-    void CheckSettlement(cudaError_t, const char*);
-    decltype(&cudaEventSynchronize) event_wait_ = &cudaEventSynchronize;
-    decltype(&cudaStreamSynchronize) stream_wait_ = &cudaStreamSynchronize;
-    friend struct test_support::GpuAugmentationTestAccess;
-    struct Impl;
-    std::shared_ptr<Impl> impl_;
-    mmltk::frameworks::gpu::TerminalCudaRetirementLease retirement_;
+private:
+ [[nodiscard]] const AugmentationBatchPlan& RunImpl(const GpuAugmentationBatchView& batch, std::span<const std::uint64_t> image_keys,
+                                                    std::span<const GpuAugmentationDonor> donors, const GpuAugmentationDonorBatchView& donor_batch,
+                                                    cudaStream_t stream, std::size_t staging_slot, bool explicit_keys, std::uint64_t seed, int epoch, int rank,
+                                                    std::uint64_t sequence);
+ void RequireActive() const;
+ void Retire(cudaError_t) noexcept;
+ void CheckSettlement(cudaError_t, const char*);
+ decltype(&cudaEventSynchronize) event_wait_ = &cudaEventSynchronize;
+ decltype(&cudaStreamSynchronize) stream_wait_ = &cudaStreamSynchronize;
+ friend struct test_support::GpuAugmentationTestAccess;
+ struct Impl;
+ std::shared_ptr<Impl> impl_;
+ mmltk::frameworks::gpu::TerminalCudaRetirementLease retirement_;
 };
 }  // namespace mmltk::backend::models::rfdetr

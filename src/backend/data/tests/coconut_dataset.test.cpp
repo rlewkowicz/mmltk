@@ -38,2079 +38,2071 @@ namespace {
 using Json = nlohmann::json;
 using mmltk::testsupport::ScopedTempDir;
 void arrow_ok(const arrow::Status& status) {
-    if (!status.ok()) throw std::runtime_error(status.ToString());
+ if (!status.ok()) throw std::runtime_error(status.ToString());
 }
 template <class T>
 T arrow_value(arrow::Result<T> value) {
-    arrow_ok(value.status());
-    return std::move(value).ValueOrDie();
+ arrow_ok(value.status());
+ return std::move(value).ValueOrDie();
 }
 std::string png(int width, int height, std::span<const std::uint32_t> ids) {
-    REQUIRE(ids.size() == static_cast<std::size_t>(width * height));
-    std::vector<unsigned char> pixels(ids.size() * 3);
-    for (std::size_t i = 0; i < ids.size(); ++i) {
-        pixels[i * 3] = ids[i] & 255;
-        pixels[i * 3 + 1] = (ids[i] >> 8) & 255;
-        pixels[i * 3 + 2] = (ids[i] >> 16) & 255;
-    }
-    std::string encoded;
-    REQUIRE(
-        stbi_write_png_to_func([](void* context, void* data, int size) { static_cast<std::string*>(context)->append(static_cast<const char*>(data), size); },
-                               &encoded, width, height, 3, pixels.data(), width * 3) != 0);
-    return encoded;
+ REQUIRE(ids.size() == static_cast<std::size_t>(width * height));
+ std::vector<unsigned char> pixels(ids.size() * 3);
+ for (std::size_t i = 0; i < ids.size(); ++i) {
+  pixels[i * 3] = ids[i] & 255;
+  pixels[i * 3 + 1] = (ids[i] >> 8) & 255;
+  pixels[i * 3 + 2] = (ids[i] >> 16) & 255;
+ }
+ std::string encoded;
+ REQUIRE(stbi_write_png_to_func([](void* context, void* data, int size) { static_cast<std::string*>(context)->append(static_cast<const char*>(data), size); },
+                                &encoded, width, height, 3, pixels.data(), width * 3) != 0);
+ return encoded;
 }
 void tar(const std::filesystem::path& path, std::span<const std::pair<std::string, std::string>> members, bool symlink = false) {
-    std::unique_ptr<archive, decltype(&archive_write_free)> writer(archive_write_new(), archive_write_free);
-    REQUIRE(archive_write_set_format_pax_restricted(writer.get()) == ARCHIVE_OK);
-    REQUIRE(archive_write_open_filename(writer.get(), path.c_str()) == ARCHIVE_OK);
-    for (const auto& [name, bytes] : members) {
-        std::unique_ptr<archive_entry, decltype(&archive_entry_free)> entry(archive_entry_new(), archive_entry_free);
-        archive_entry_set_pathname(entry.get(), name.c_str());
-        archive_entry_set_perm(entry.get(), 0644);
-        const bool directory = name == "." || name == "./";
-        archive_entry_set_filetype(entry.get(), symlink ? AE_IFLNK : directory ? AE_IFDIR : AE_IFREG);
-        if (symlink) archive_entry_set_symlink(entry.get(), "other");
-        archive_entry_set_size(entry.get(), symlink || directory ? 0 : bytes.size());
-        REQUIRE(archive_write_header(writer.get(), entry.get()) == ARCHIVE_OK);
-        if (!symlink && !directory) REQUIRE(archive_write_data(writer.get(), bytes.data(), bytes.size()) == static_cast<la_ssize_t>(bytes.size()));
-    }
-    REQUIRE(archive_write_close(writer.get()) == ARCHIVE_OK);
+ std::unique_ptr<archive, decltype(&archive_write_free)> writer(archive_write_new(), archive_write_free);
+ REQUIRE(archive_write_set_format_pax_restricted(writer.get()) == ARCHIVE_OK);
+ REQUIRE(archive_write_open_filename(writer.get(), path.c_str()) == ARCHIVE_OK);
+ for (const auto& [name, bytes] : members) {
+  std::unique_ptr<archive_entry, decltype(&archive_entry_free)> entry(archive_entry_new(), archive_entry_free);
+  archive_entry_set_pathname(entry.get(), name.c_str());
+  archive_entry_set_perm(entry.get(), 0644);
+  const bool directory = name == "." || name == "./";
+  archive_entry_set_filetype(entry.get(), symlink ? AE_IFLNK : directory ? AE_IFDIR : AE_IFREG);
+  if (symlink) archive_entry_set_symlink(entry.get(), "other");
+  archive_entry_set_size(entry.get(), symlink || directory ? 0 : bytes.size());
+  REQUIRE(archive_write_header(writer.get(), entry.get()) == ARCHIVE_OK);
+  if (!symlink && !directory) REQUIRE(archive_write_data(writer.get(), bytes.data(), bytes.size()) == static_cast<la_ssize_t>(bytes.size()));
+ }
+ REQUIRE(archive_write_close(writer.get()) == ARCHIVE_OK);
 }
 Json category_catalog() {
-    Json rows = Json::array();
-    // CLEANUP-OFF: independent external COCO metadata is the oracle for production category mapping.
-    constexpr std::pair<unsigned, const char*> categories[]{{1, "person"},         {2, "bicycle"},       {3, "car"},
-                                                            {4, "motorcycle"},     {5, "airplane"},      {6, "bus"},
-                                                            {7, "train"},          {8, "truck"},         {9, "boat"},
-                                                            {10, "traffic light"}, {11, "fire hydrant"}, {13, "stop sign"},
-                                                            {14, "parking meter"}, {15, "bench"},        {16, "bird"},
-                                                            {17, "cat"},           {18, "dog"},          {19, "horse"},
-                                                            {20, "sheep"},         {21, "cow"},          {22, "elephant"},
-                                                            {23, "bear"},          {24, "zebra"},        {25, "giraffe"},
-                                                            {27, "backpack"},      {28, "umbrella"},     {31, "handbag"},
-                                                            {32, "tie"},           {33, "suitcase"},     {34, "frisbee"},
-                                                            {35, "skis"},          {36, "snowboard"},    {37, "sports ball"},
-                                                            {38, "kite"},          {39, "baseball bat"}, {40, "baseball glove"},
-                                                            {41, "skateboard"},    {42, "surfboard"},    {43, "tennis racket"},
-                                                            {44, "bottle"},        {46, "wine glass"},   {47, "cup"},
-                                                            {48, "fork"},          {49, "knife"},        {50, "spoon"},
-                                                            {51, "bowl"},          {52, "banana"},       {53, "apple"},
-                                                            {54, "sandwich"},      {55, "orange"},       {56, "broccoli"},
-                                                            {57, "carrot"},        {58, "hot dog"},      {59, "pizza"},
-                                                            {60, "donut"},         {61, "cake"},         {62, "chair"},
-                                                            {63, "couch"},         {64, "potted plant"}, {65, "bed"},
-                                                            {67, "dining table"},  {70, "toilet"},       {72, "tv"},
-                                                            {73, "laptop"},        {74, "mouse"},        {75, "remote"},
-                                                            {76, "keyboard"},      {77, "cell phone"},   {78, "microwave"},
-                                                            {79, "oven"},          {80, "toaster"},      {81, "sink"},
-                                                            {82, "refrigerator"},  {84, "book"},         {85, "clock"},
-                                                            {86, "vase"},          {87, "scissors"},     {88, "teddy bear"},
-                                                            {89, "hair drier"},    {90, "toothbrush"}};
-    // CLEANUP-ON
-    for (const auto& [id, name] : categories) rows.push_back({{"id", id}, {"name", name}, {"isthing", 0}});
-    rows.push_back({{"id", 200}, {"name", "unrelated stuff"}, {"isthing", 1}});
-    return rows;
+ Json rows = Json::array();
+ // CLEANUP-OFF: independent external COCO metadata is the oracle for production category mapping.
+ constexpr std::pair<unsigned, const char*> categories[]{{1, "person"},         {2, "bicycle"},       {3, "car"},
+                                                         {4, "motorcycle"},     {5, "airplane"},      {6, "bus"},
+                                                         {7, "train"},          {8, "truck"},         {9, "boat"},
+                                                         {10, "traffic light"}, {11, "fire hydrant"}, {13, "stop sign"},
+                                                         {14, "parking meter"}, {15, "bench"},        {16, "bird"},
+                                                         {17, "cat"},           {18, "dog"},          {19, "horse"},
+                                                         {20, "sheep"},         {21, "cow"},          {22, "elephant"},
+                                                         {23, "bear"},          {24, "zebra"},        {25, "giraffe"},
+                                                         {27, "backpack"},      {28, "umbrella"},     {31, "handbag"},
+                                                         {32, "tie"},           {33, "suitcase"},     {34, "frisbee"},
+                                                         {35, "skis"},          {36, "snowboard"},    {37, "sports ball"},
+                                                         {38, "kite"},          {39, "baseball bat"}, {40, "baseball glove"},
+                                                         {41, "skateboard"},    {42, "surfboard"},    {43, "tennis racket"},
+                                                         {44, "bottle"},        {46, "wine glass"},   {47, "cup"},
+                                                         {48, "fork"},          {49, "knife"},        {50, "spoon"},
+                                                         {51, "bowl"},          {52, "banana"},       {53, "apple"},
+                                                         {54, "sandwich"},      {55, "orange"},       {56, "broccoli"},
+                                                         {57, "carrot"},        {58, "hot dog"},      {59, "pizza"},
+                                                         {60, "donut"},         {61, "cake"},         {62, "chair"},
+                                                         {63, "couch"},         {64, "potted plant"}, {65, "bed"},
+                                                         {67, "dining table"},  {70, "toilet"},       {72, "tv"},
+                                                         {73, "laptop"},        {74, "mouse"},        {75, "remote"},
+                                                         {76, "keyboard"},      {77, "cell phone"},   {78, "microwave"},
+                                                         {79, "oven"},          {80, "toaster"},      {81, "sink"},
+                                                         {82, "refrigerator"},  {84, "book"},         {85, "clock"},
+                                                         {86, "vase"},          {87, "scissors"},     {88, "teddy bear"},
+                                                         {89, "hair drier"},    {90, "toothbrush"}};
+ // CLEANUP-ON
+ for (const auto& [id, name] : categories) rows.push_back({{"id", id}, {"name", name}, {"isthing", 0}});
+ rows.push_back({{"id", 200}, {"name", "unrelated stuff"}, {"isthing", 1}});
+ return rows;
 }
 void json_file(const std::filesystem::path& path, Json value) {
-    if (value.contains("images") && value.contains("annotations") && !value.contains("categories")) value["categories"] = category_catalog();
-    mmltk::testsupport::write_text_file(path, value.dump());
+ if (value.contains("images") && value.contains("annotations") && !value.contains("categories")) value["categories"] = category_catalog();
+ mmltk::testsupport::write_text_file(path, value.dump());
 }
 Json segment(unsigned id = 1, unsigned category = 1, bool thing = true) {
-    return {{"id", id}, {"category_id", category}, {"isthing", thing ? 1 : 0}, {"iscrowd", 0}, {"area", nullptr}};
+ return {{"id", id}, {"category_id", category}, {"isthing", thing ? 1 : 0}, {"iscrowd", 0}, {"area", nullptr}};
 }
 std::shared_ptr<arrow::DataType> segment_type(bool integer_area) {
-    return arrow::struct_({arrow::field("area", integer_area ? arrow::int64() : arrow::float64()), arrow::field("category_id", arrow::int64()),
-                           arrow::field("id", arrow::int64()), arrow::field("iscrowd", arrow::int64()), arrow::field("isthing", arrow::int64())});
+ return arrow::struct_({arrow::field("area", integer_area ? arrow::int64() : arrow::float64()), arrow::field("category_id", arrow::int64()),
+                        arrow::field("id", arrow::int64()), arrow::field("iscrowd", arrow::int64()), arrow::field("isthing", arrow::int64())});
 }
 std::shared_ptr<arrow::Schema> hf_schema(bool integer_area = false) {
-    return arrow::schema({arrow::field("mask", arrow::struct_({arrow::field("bytes", arrow::binary()), arrow::field("path", arrow::utf8())})),
-                          arrow::field("segments_info", arrow::struct_({arrow::field("file_name", arrow::utf8()), arrow::field("image_id", arrow::int64()),
-                                                                        arrow::field("segments_info", arrow::list(segment_type(integer_area)))})),
-                          arrow::field("image_info", arrow::struct_({arrow::field("coco_url", arrow::utf8()), arrow::field("date_captured", arrow::utf8()),
-                                                                     arrow::field("file_name", arrow::utf8()), arrow::field("height", arrow::int64()),
-                                                                     arrow::field("id", arrow::int64()), arrow::field("license", arrow::int64()),
-                                                                     arrow::field("width", arrow::int64())}))});
+ return arrow::schema({arrow::field("mask", arrow::struct_({arrow::field("bytes", arrow::binary()), arrow::field("path", arrow::utf8())})),
+                       arrow::field("segments_info", arrow::struct_({arrow::field("file_name", arrow::utf8()), arrow::field("image_id", arrow::int64()),
+                                                                     arrow::field("segments_info", arrow::list(segment_type(integer_area)))})),
+                       arrow::field("image_info", arrow::struct_({arrow::field("coco_url", arrow::utf8()), arrow::field("date_captured", arrow::utf8()),
+                                                                  arrow::field("file_name", arrow::utf8()), arrow::field("height", arrow::int64()),
+                                                                  arrow::field("id", arrow::int64()), arrow::field("license", arrow::int64()),
+                                                                  arrow::field("width", arrow::int64())}))});
 }
 void append_value(arrow::ArrayBuilder& builder, const Json& value) {
-    if (value.is_null()) {
-        arrow_ok(builder.AppendNull());
-        return;
-    }
-    switch (builder.type()->id()) {
-        case arrow::Type::STRUCT: {
-            auto& typed = static_cast<arrow::StructBuilder&>(builder);
-            arrow_ok(typed.Append());
-            const auto type = std::static_pointer_cast<const arrow::StructType>(builder.type());
-            for (int i = 0; i < type->num_fields(); ++i) append_value(*typed.field_builder(i), value.at(type->field(i)->name()));
-            break;
-        }
-        case arrow::Type::LIST: {
-            auto& typed = static_cast<arrow::ListBuilder&>(builder);
-            arrow_ok(typed.Append());
-            for (const auto& entry : value) append_value(*typed.value_builder(), entry);
-            break;
-        }
-        case arrow::Type::INT64: arrow_ok(static_cast<arrow::Int64Builder&>(builder).Append(value.get<std::int64_t>())); break;
-        case arrow::Type::DOUBLE: arrow_ok(static_cast<arrow::DoubleBuilder&>(builder).Append(value.get<double>())); break;
-        case arrow::Type::STRING: arrow_ok(static_cast<arrow::StringBuilder&>(builder).Append(value.get<std::string>())); break;
-        case arrow::Type::BINARY: arrow_ok(static_cast<arrow::BinaryBuilder&>(builder).Append(value.get<std::string>())); break;
-        default: throw std::runtime_error("unsupported fixture type");
-    }
+ if (value.is_null()) {
+  arrow_ok(builder.AppendNull());
+  return;
+ }
+ switch (builder.type()->id()) {
+  case arrow::Type::STRUCT: {
+   auto& typed = static_cast<arrow::StructBuilder&>(builder);
+   arrow_ok(typed.Append());
+   const auto type = std::static_pointer_cast<const arrow::StructType>(builder.type());
+   for (int i = 0; i < type->num_fields(); ++i) append_value(*typed.field_builder(i), value.at(type->field(i)->name()));
+   break;
+  }
+  case arrow::Type::LIST: {
+   auto& typed = static_cast<arrow::ListBuilder&>(builder);
+   arrow_ok(typed.Append());
+   for (const auto& entry : value) append_value(*typed.value_builder(), entry);
+   break;
+  }
+  case arrow::Type::INT64: arrow_ok(static_cast<arrow::Int64Builder&>(builder).Append(value.get<std::int64_t>())); break;
+  case arrow::Type::DOUBLE: arrow_ok(static_cast<arrow::DoubleBuilder&>(builder).Append(value.get<double>())); break;
+  case arrow::Type::STRING: arrow_ok(static_cast<arrow::StringBuilder&>(builder).Append(value.get<std::string>())); break;
+  case arrow::Type::BINARY: arrow_ok(static_cast<arrow::BinaryBuilder&>(builder).Append(value.get<std::string>())); break;
+  default: throw std::runtime_error("unsupported fixture type");
+ }
 }
 void parquet_file(const std::filesystem::path& path, const Json& rows, std::shared_ptr<arrow::Schema> schema = hf_schema(),
                   parquet::Compression::type codec = parquet::Compression::SNAPPY) {
-    std::vector<std::shared_ptr<arrow::Array>> columns;
-    for (const auto& field : schema->fields()) {
-        std::unique_ptr<arrow::ArrayBuilder> builder;
-        arrow_ok(arrow::MakeBuilder(arrow::default_memory_pool(), field->type(), &builder));
-        for (const auto& row : rows) append_value(*builder, row.at(field->name()));
-        std::shared_ptr<arrow::Array> column;
-        arrow_ok(builder->Finish(&column));
-        columns.push_back(std::move(column));
-    }
-    auto output = arrow_value(arrow::io::FileOutputStream::Open(path.string()));
-    parquet::WriterProperties::Builder properties;
-    properties.compression(codec);
-    arrow_ok(parquet::arrow::WriteTable(*arrow::Table::Make(schema, columns), arrow::default_memory_pool(), output, 1, properties.build()));
-    arrow_ok(output->Close());
+ std::vector<std::shared_ptr<arrow::Array>> columns;
+ for (const auto& field : schema->fields()) {
+  std::unique_ptr<arrow::ArrayBuilder> builder;
+  arrow_ok(arrow::MakeBuilder(arrow::default_memory_pool(), field->type(), &builder));
+  for (const auto& row : rows) append_value(*builder, row.at(field->name()));
+  std::shared_ptr<arrow::Array> column;
+  arrow_ok(builder->Finish(&column));
+  columns.push_back(std::move(column));
+ }
+ auto output = arrow_value(arrow::io::FileOutputStream::Open(path.string()));
+ parquet::WriterProperties::Builder properties;
+ properties.compression(codec);
+ arrow_ok(parquet::arrow::WriteTable(*arrow::Table::Make(schema, columns), arrow::default_memory_pool(), output, 1, properties.build()));
+ arrow_ok(output->Close());
 }
 Json hf_row(unsigned id, std::string encoded, Json segments, int width = 3, int height = 3) {
-    const auto digits = std::to_string(id);
-    const auto stem = std::string(12U - digits.size(), '0') + digits;
-    return {{"mask", {{"bytes", std::move(encoded)}, {"path", nullptr}}},
-            {"segments_info", {{"file_name", stem + ".png"}, {"image_id", id}, {"segments_info", std::move(segments)}}},
-            {"image_info",
-             {{"coco_url", "http://images.cocodataset.org/train2017/" + stem + ".jpg"},
-              {"date_captured", "2017"},
-              {"file_name", stem + ".jpg"},
-              {"height", height},
-              {"width", width},
-              {"id", id},
-              {"license", 1}}}};
+ const auto digits = std::to_string(id);
+ const auto stem = std::string(12U - digits.size(), '0') + digits;
+ return {{"mask", {{"bytes", std::move(encoded)}, {"path", nullptr}}},
+         {"segments_info", {{"file_name", stem + ".png"}, {"image_id", id}, {"segments_info", std::move(segments)}}},
+         {"image_info",
+          {{"coco_url", "http://images.cocodataset.org/train2017/" + stem + ".jpg"},
+           {"date_captured", "2017"},
+           {"file_name", stem + ".jpg"},
+           {"height", height},
+           {"width", width},
+           {"id", id},
+           {"license", 1}}}};
 }
 CoconutPhysicalImage coco(unsigned id, CoconutImageNamespace source = CoconutImageNamespace::CocoTrain) {
-    const auto digits = std::to_string(id);
-    const auto prefix = source == CoconutImageNamespace::CocoTrain       ? "train2017/"
-                        : source == CoconutImageNamespace::CocoUnlabeled ? "unlabeled2017/"
-                                                                         : "val2017/";
-    return {source, id, 0, prefix + std::string(12U - digits.size(), '0') + digits + ".jpg", "physical-coco-archive"};
+ const auto digits = std::to_string(id);
+ const auto prefix = source == CoconutImageNamespace::CocoTrain ? "train2017/" : source == CoconutImageNamespace::CocoUnlabeled ? "unlabeled2017/" : "val2017/";
+ return {source, id, 0, prefix + std::string(12U - digits.size(), '0') + digits + ".jpg", "physical-coco-archive"};
 }
 CoconutPhysicalImage objects(unsigned id, CoconutImageNamespace source = CoconutImageNamespace::Objects365V2) {
-    const auto digits = std::to_string(id);
-    return {source, id, 32,
-            std::string(source == CoconutImageNamespace::Objects365V1 ? "image/objects365_v1_" : "patch32/objects365_v2_") +
-                std::string(8U - digits.size(), '0') + digits + ".jpg",
-            "physical-objects-archive"};
+ const auto digits = std::to_string(id);
+ return {source, id, 32,
+         std::string(source == CoconutImageNamespace::Objects365V1 ? "image/objects365_v1_" : "patch32/objects365_v2_") + std::string(8U - digits.size(), '0') +
+          digits + ".jpg",
+         "physical-objects-archive"};
 }
 struct LocalCoconutImportRequest : CoconutImportRequest {
-    std::unique_ptr<CoconutPhysicalMembership> membership;
-    LocalCoconutImportRequest(std::span<const CoconutPhysicalImage> physical, CoconutEdition selected)
-        : membership(std::make_unique<CoconutPhysicalMembership>(physical)) {
-        edition = selected;
-        input_identity = "pinned-local-fixture-inputs";
-        physical_membership = membership.get();
-    }
+ std::unique_ptr<CoconutPhysicalMembership> membership;
+ LocalCoconutImportRequest(std::span<const CoconutPhysicalImage> physical, CoconutEdition selected)
+     : membership(std::make_unique<CoconutPhysicalMembership>(physical)) {
+  edition = selected;
+  input_identity = "pinned-local-fixture-inputs";
+  physical_membership = membership.get();
+ }
 };
 LocalCoconutImportRequest request(std::span<const CoconutPhysicalImage> physical, CoconutEdition edition = CoconutEdition::Base) {
-    return LocalCoconutImportRequest(physical, edition);
+ return LocalCoconutImportRequest(physical, edition);
 }
 void reversed_coco_parquet(const std::filesystem::path& path) {
-    const std::array<std::uint32_t, 1> ids{1};
-    const auto mask = png(1, 1, ids);
-    parquet_file(path, Json::array({hf_row(8, mask, Json::array({segment()}), 1, 1), hf_row(7, mask, Json::array({segment()}), 1, 1)}));
+ const std::array<std::uint32_t, 1> ids{1};
+ const auto mask = png(1, 1, ids);
+ parquet_file(path, Json::array({hf_row(8, mask, Json::array({segment()}), 1, 1), hf_row(7, mask, Json::array({segment()}), 1, 1)}));
 }
 struct PollCancellation {
-    mutable std::size_t polls = 0;
-    std::size_t stop_at = std::numeric_limits<std::size_t>::max();
-    bool cancelled() const noexcept { return polls++ >= stop_at; }
+ mutable std::size_t polls = 0;
+ std::size_t stop_at = std::numeric_limits<std::size_t>::max();
+ bool cancelled() const noexcept { return polls++ >= stop_at; }
 };
 std::string file_bytes(const std::filesystem::path& path) {
-    std::ifstream input(path, std::ios::binary);
-    return {std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
+ std::ifstream input(path, std::ios::binary);
+ return {std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
 }
 void expect_runs(const CoconutComponent& component, std::span<const RLEPair> expected) {
-    REQUIRE(component.index.mask_rle_pairs.size() == expected.size());
-    for (std::size_t i = 0; i < expected.size(); ++i) {
-        CHECK(component.index.mask_rle_pairs[i].start == expected[i].start);
-        CHECK(component.index.mask_rle_pairs[i].length == expected[i].length);
-    }
+ REQUIRE(component.index.mask_rle_pairs.size() == expected.size());
+ for (std::size_t i = 0; i < expected.size(); ++i) {
+  CHECK(component.index.mask_rle_pairs[i].start == expected[i].start);
+  CHECK(component.index.mask_rle_pairs[i].length == expected[i].length);
+ }
 }
 }  // namespace
 TEST_CASE("COCONut release selection and fixed catalog are pinned", "[coconut]") {
-    CHECK(BenchmarkDatasetSelection{}.dataset == BenchmarkDatasetVariant::CocoCustom);
-    CHECK(BenchmarkDatasetSelection{}.validation == CoconutValidation::Coconut);
-    CHECK_FALSE(valid_benchmark_selection({static_cast<BenchmarkDatasetVariant>(4), CoconutValidation::Coconut}));
-    CHECK_FALSE(valid_benchmark_selection({BenchmarkDatasetVariant::Coconut, static_cast<CoconutValidation>(4)}));
-    REQUIRE(coconut_release_catalog().size() == 5);
-    const auto& base = coconut_release_component(CoconutEdition::Base);
-    CHECK(base.expected_rows == 241602);
-    REQUIRE(base.annotations.size() == 4);
-    CHECK(base.annotations[0].expected_size == 417218921);
-    CHECK(base.annotations[0].expected_sha256 == "cfddd65e62ffeafe32229a43f06c475facfb039d2107be02b380134cb4be38ae");
-    CHECK(coconut_release_component(CoconutEdition::RelabeledValidation).expected_rows == 5000);
-    CHECK(coconut_objects_training_artifacts(CoconutEdition::Large).size() == 4);
-    CHECK(coconut_objects_training_artifacts(CoconutEdition::XLarge).size() == 7);
-    CHECK(coconut_objects_training_artifacts(CoconutEdition::Large)[0].artifact_id == objects365_train_image_artifacts()[32].artifact_id);
-    CHECK(coconut_unlabeled_images_artifact().expected_size == 20126613414ULL);
-    CHECK(coconut_validation_images_artifact().expected_size == 5084467200ULL);
+ CHECK(BenchmarkDatasetSelection{}.dataset == BenchmarkDatasetVariant::CocoCustom);
+ CHECK(BenchmarkDatasetSelection{}.validation == CoconutValidation::Coconut);
+ CHECK_FALSE(valid_benchmark_selection({static_cast<BenchmarkDatasetVariant>(4), CoconutValidation::Coconut}));
+ CHECK_FALSE(valid_benchmark_selection({BenchmarkDatasetVariant::Coconut, static_cast<CoconutValidation>(4)}));
+ REQUIRE(coconut_release_catalog().size() == 5);
+ const auto& base = coconut_release_component(CoconutEdition::Base);
+ CHECK(base.expected_rows == 241602);
+ REQUIRE(base.annotations.size() == 4);
+ CHECK(base.annotations[0].expected_size == 417218921);
+ CHECK(base.annotations[0].expected_sha256 == "cfddd65e62ffeafe32229a43f06c475facfb039d2107be02b380134cb4be38ae");
+ CHECK(coconut_release_component(CoconutEdition::RelabeledValidation).expected_rows == 5000);
+ CHECK(coconut_objects_training_artifacts(CoconutEdition::Large).size() == 4);
+ CHECK(coconut_objects_training_artifacts(CoconutEdition::XLarge).size() == 7);
+ CHECK(coconut_objects_training_artifacts(CoconutEdition::Large)[0].artifact_id == objects365_train_image_artifacts()[32].artifact_id);
+ CHECK(coconut_unlabeled_images_artifact().expected_size == 20126613414ULL);
+ CHECK(coconut_validation_images_artifact().expected_size == 5084467200ULL);
 }
 TEST_CASE("COCONut Parquet shards preserve exact holes singleton crowd null area and empty images", "[coconut]") {
-    ScopedTempDir root("coconut-parquet");
-    const std::array<std::uint32_t, 9> ids{1, 1, 1, 1, 2, 1, 1, 0, 1};
-    auto first = segment();
-    first["iscrowd"] = 1;
-    auto second = segment(2, 2);
-    second["area"] = 17;
-    const auto mask = png(3, 3, ids);
-    auto row = hf_row(7, mask, Json::array({first, second}));
-    const std::array<std::uint32_t, 9> void_ids{};
-    auto empty = hf_row(8, png(3, 3, void_ids), Json::array());
-    auto nonthing = segment(1, 1, false);
-    nonthing["area"] = 0;
-    const std::array<std::uint32_t, 9> filled{1, 1, 1, 1, 1, 1, 1, 1, 1};
-    parquet_file(root.path() / "a.parquet", Json::array({row, empty}));
-    parquet_file(root.path() / "b.parquet", Json::array({hf_row(9, png(3, 3, filled), Json::array({nonthing}))}), hf_schema(true), parquet::Compression::ZSTD);
-    const std::array physical{coco(7), coco(8, CoconutImageNamespace::CocoUnlabeled), coco(9)};
-    auto input = request(physical);
-    input.parquet_shards = {root.path() / "a.parquet", root.path() / "b.parquet"};
-    input.expected_rows = 3;
-    auto components = import_coconut_annotations(input);
-    REQUIRE(components.size() == 2);
-    const auto& train = components[0];
-    REQUIRE(train.index.images.size() == 2);
-    REQUIRE(train.index.boxes.size() == 2);
-    CHECK(train.index.images[0].source_image_id == 7);
-    CHECK(train.index.images[1].source_image_id == 9);
-    CHECK(train.index.images[1].box_count == 0);
-    const auto& box = train.index.boxes[0];
-    CHECK(box.original_area == 7);
-    CHECK(box.x1 == 0.0F);
-    CHECK(box.y1 == 0.0F);
-    CHECK(box.x2 == 1.0F);
-    CHECK(box.y2 == 1.0F);
-    CHECK((box.flags & kAnnotationCrowd) != 0);
-    CHECK(box.annotation_id == 1);
-    CHECK(box.source_ordinal == 0);
-    CHECK(box.class_id == 0);
-    const auto& singleton = train.index.boxes[1];
-    CHECK(singleton.x1 == 1.0F / 3.0F);
-    CHECK(singleton.y1 == 1.0F / 3.0F);
-    CHECK(singleton.x2 == 2.0F / 3.0F);
-    CHECK(singleton.y2 == 2.0F / 3.0F);
-    CHECK(singleton.original_area == 17);
-    CHECK(singleton.source_ordinal == 1);
-    CHECK(singleton.source_category_id == 2);
-    const std::array<RLEPair, 4> runs{{{0, 4}, {5, 2}, {8, 1}, {4, 1}}};
-    expect_runs(train, runs);
-    CHECK(components[1].source == CoconutImageNamespace::CocoUnlabeled);
-    REQUIRE(components[1].index.images.size() == 1);
-    CHECK(components[1].index.images[0].source_image_id == 8);
-    CHECK(components[1].index.boxes.empty());
-    const auto cache = root.path() / "index.bin";
-    store_coconut_component(cache, train);
-    auto loaded = load_coconut_component(cache, train.edition, train.source, input.input_identity);
-    REQUIRE(loaded);
-    CHECK(loaded->inventory == train.inventory);
-    expect_runs(*loaded, runs);
-    CHECK_FALSE(load_coconut_component(cache, train.edition, train.source, "another-edition"));
-    auto manifest = read_json_file(cache.string() + ".complete.json");
-    manifest["coconut"]["inventory_identity"] = std::string(64, '0');
-    json_file(cache.string() + ".complete.json", manifest);
-    CHECK_FALSE(load_coconut_component(cache, train.edition, train.source, input.input_identity));
+ ScopedTempDir root("coconut-parquet");
+ const std::array<std::uint32_t, 9> ids{1, 1, 1, 1, 2, 1, 1, 0, 1};
+ auto first = segment();
+ first["iscrowd"] = 1;
+ auto second = segment(2, 2);
+ second["area"] = 17;
+ const auto mask = png(3, 3, ids);
+ auto row = hf_row(7, mask, Json::array({first, second}));
+ const std::array<std::uint32_t, 9> void_ids{};
+ auto empty = hf_row(8, png(3, 3, void_ids), Json::array());
+ auto nonthing = segment(1, 1, false);
+ nonthing["area"] = 0;
+ const std::array<std::uint32_t, 9> filled{1, 1, 1, 1, 1, 1, 1, 1, 1};
+ parquet_file(root.path() / "a.parquet", Json::array({row, empty}));
+ parquet_file(root.path() / "b.parquet", Json::array({hf_row(9, png(3, 3, filled), Json::array({nonthing}))}), hf_schema(true), parquet::Compression::ZSTD);
+ const std::array physical{coco(7), coco(8, CoconutImageNamespace::CocoUnlabeled), coco(9)};
+ auto input = request(physical);
+ input.parquet_shards = {root.path() / "a.parquet", root.path() / "b.parquet"};
+ input.expected_rows = 3;
+ auto components = import_coconut_annotations(input);
+ REQUIRE(components.size() == 2);
+ const auto& train = components[0];
+ REQUIRE(train.index.images.size() == 2);
+ REQUIRE(train.index.boxes.size() == 2);
+ CHECK(train.index.images[0].source_image_id == 7);
+ CHECK(train.index.images[1].source_image_id == 9);
+ CHECK(train.index.images[1].box_count == 0);
+ const auto& box = train.index.boxes[0];
+ CHECK(box.original_area == 7);
+ CHECK(box.x1 == 0.0F);
+ CHECK(box.y1 == 0.0F);
+ CHECK(box.x2 == 1.0F);
+ CHECK(box.y2 == 1.0F);
+ CHECK((box.flags & kAnnotationCrowd) != 0);
+ CHECK(box.annotation_id == 1);
+ CHECK(box.source_ordinal == 0);
+ CHECK(box.class_id == 0);
+ const auto& singleton = train.index.boxes[1];
+ CHECK(singleton.x1 == 1.0F / 3.0F);
+ CHECK(singleton.y1 == 1.0F / 3.0F);
+ CHECK(singleton.x2 == 2.0F / 3.0F);
+ CHECK(singleton.y2 == 2.0F / 3.0F);
+ CHECK(singleton.original_area == 17);
+ CHECK(singleton.source_ordinal == 1);
+ CHECK(singleton.source_category_id == 2);
+ const std::array<RLEPair, 4> runs{{{0, 4}, {5, 2}, {8, 1}, {4, 1}}};
+ expect_runs(train, runs);
+ CHECK(components[1].source == CoconutImageNamespace::CocoUnlabeled);
+ REQUIRE(components[1].index.images.size() == 1);
+ CHECK(components[1].index.images[0].source_image_id == 8);
+ CHECK(components[1].index.boxes.empty());
+ const auto cache = root.path() / "index.bin";
+ store_coconut_component(cache, train);
+ auto loaded = load_coconut_component(cache, train.edition, train.source, input.input_identity);
+ REQUIRE(loaded);
+ CHECK(loaded->inventory == train.inventory);
+ expect_runs(*loaded, runs);
+ CHECK_FALSE(load_coconut_component(cache, train.edition, train.source, "another-edition"));
+ auto manifest = read_json_file(cache.string() + ".complete.json");
+ manifest["coconut"]["inventory_identity"] = std::string(64, '0');
+ json_file(cache.string() + ".complete.json", manifest);
+ CHECK_FALSE(load_coconut_component(cache, train.edition, train.source, input.input_identity));
 }
 TEST_CASE("COCONut Parquet rejects malformed nested records missing membership and bounded overflows", "[coconut]") {
-    ScopedTempDir root("coconut-malformed");
-    const std::array<std::uint32_t, 9> ids{1, 1, 1, 1, 1, 1, 1, 1, 1};
-    auto row = hf_row(7, png(3, 3, ids), Json::array({segment()}));
-    const std::array physical{coco(7)};
-    auto input = request(physical);
-    input.parquet_shards = {root.path() / "a.parquet"};
-    input.expected_rows = 1;
-    SECTION("null image metadata") { row["image_info"] = nullptr; }
-    SECTION("null required segment ID") { row["segments_info"]["segments_info"][0]["id"] = nullptr; }
-    SECTION("mismatched release IDs") { row["segments_info"]["image_id"] = 8; }
-    SECTION("unknown thing category") { row["segments_info"]["segments_info"][0]["category_id"] = 12; }
-    SECTION("contradictory dimensions") { row["image_info"]["width"] = 4; }
-    SECTION("missing embedded bytes") { row["mask"]["bytes"] = nullptr; }
-    SECTION("PNG admission") { input.limits.max_png_bytes = 1; }
-    SECTION("pixel admission") { input.limits.max_pixels = 8; }
-    SECTION("segment admission") { input.limits.max_segments = 0; }
-    SECTION("release completeness") { input.expected_rows = 2; }
-    SECTION("missing physical member") {
-        input.membership = std::make_unique<CoconutPhysicalMembership>(std::span<const CoconutPhysicalImage>{});
-        input.physical_membership = input.membership.get();
-    }
-    SECTION("undeclared void-independent RGB ID") { row["segments_info"]["segments_info"][0]["id"] = 2; }
-    SECTION("duplicate segments") { row["segments_info"]["segments_info"].push_back(segment()); }
-    parquet_file(input.parquet_shards[0], Json::array({row}));
-    CHECK_THROWS(import_coconut_annotations(input));
+ ScopedTempDir root("coconut-malformed");
+ const std::array<std::uint32_t, 9> ids{1, 1, 1, 1, 1, 1, 1, 1, 1};
+ auto row = hf_row(7, png(3, 3, ids), Json::array({segment()}));
+ const std::array physical{coco(7)};
+ auto input = request(physical);
+ input.parquet_shards = {root.path() / "a.parquet"};
+ input.expected_rows = 1;
+ SECTION("null image metadata") { row["image_info"] = nullptr; }
+ SECTION("null required segment ID") { row["segments_info"]["segments_info"][0]["id"] = nullptr; }
+ SECTION("mismatched release IDs") { row["segments_info"]["image_id"] = 8; }
+ SECTION("unknown thing category") { row["segments_info"]["segments_info"][0]["category_id"] = 12; }
+ SECTION("contradictory dimensions") { row["image_info"]["width"] = 4; }
+ SECTION("missing embedded bytes") { row["mask"]["bytes"] = nullptr; }
+ SECTION("PNG admission") { input.limits.max_png_bytes = 1; }
+ SECTION("pixel admission") { input.limits.max_pixels = 8; }
+ SECTION("segment admission") { input.limits.max_segments = 0; }
+ SECTION("release completeness") { input.expected_rows = 2; }
+ SECTION("missing physical member") {
+  input.membership = std::make_unique<CoconutPhysicalMembership>(std::span<const CoconutPhysicalImage>{});
+  input.physical_membership = input.membership.get();
+ }
+ SECTION("undeclared void-independent RGB ID") { row["segments_info"]["segments_info"][0]["id"] = 2; }
+ SECTION("duplicate segments") { row["segments_info"]["segments_info"].push_back(segment()); }
+ parquet_file(input.parquet_shards[0], Json::array({row}));
+ CHECK_THROWS(import_coconut_annotations(input));
 }
 TEST_CASE("COCONut Parquet cancellation and nested type validation occur before normalization", "[coconut]") {
-    ScopedTempDir root("coconut-parquet-cancel");
-    const std::array<std::uint32_t, 1> ids{1};
-    auto row = hf_row(7, png(1, 1, ids), Json::array({segment()}), 1, 1);
-    const std::array physical{coco(7)};
-    auto input = request(physical);
-    input.parquet_shards = {root.path() / "a.parquet"};
-    SECTION("wrong nested type") {
-        auto schema = hf_schema();
-        auto fields = schema->fields();
-        fields[0] = arrow::field("mask", arrow::utf8());
-        row["mask"] = "wrong";
-        parquet_file(input.parquet_shards[0], Json::array({row}), arrow::schema(fields));
-        CHECK_THROWS(import_coconut_annotations(input));
-    }
-    SECTION("between records") {
-        parquet_file(input.parquet_shards[0], Json::array({row, hf_row(8, png(1, 1, ids), Json::array({segment()}), 1, 1)}));
-        std::atomic<bool> stop{false};
-        input.cancellation = mmltk::common::concurrency::CancellationObservation::Atomic(stop);
-        unsigned observed = 0;
-        input.progress = [&](std::uint64_t) {
-            ++observed;
-            stop = true;
-        };
-        CHECK_THROWS(import_coconut_annotations(input));
-        CHECK(observed == 1);
-    }
+ ScopedTempDir root("coconut-parquet-cancel");
+ const std::array<std::uint32_t, 1> ids{1};
+ auto row = hf_row(7, png(1, 1, ids), Json::array({segment()}), 1, 1);
+ const std::array physical{coco(7)};
+ auto input = request(physical);
+ input.parquet_shards = {root.path() / "a.parquet"};
+ SECTION("wrong nested type") {
+  auto schema = hf_schema();
+  auto fields = schema->fields();
+  fields[0] = arrow::field("mask", arrow::utf8());
+  row["mask"] = "wrong";
+  parquet_file(input.parquet_shards[0], Json::array({row}), arrow::schema(fields));
+  CHECK_THROWS(import_coconut_annotations(input));
+ }
+ SECTION("between records") {
+  parquet_file(input.parquet_shards[0], Json::array({row, hf_row(8, png(1, 1, ids), Json::array({segment()}), 1, 1)}));
+  std::atomic<bool> stop{false};
+  input.cancellation = mmltk::common::concurrency::CancellationObservation::Atomic(stop);
+  unsigned observed = 0;
+  input.progress = [&](std::uint64_t) {
+   ++observed;
+   stop = true;
+  };
+  CHECK_THROWS(import_coconut_annotations(input));
+  CHECK(observed == 1);
+ }
 }
 TEST_CASE("COCONut JSON joins retain heterogeneous Large rows and validation physical namespaces", "[coconut]") {
-    ScopedTempDir root("coconut-json");
-    const std::array<std::uint32_t, 4> ids{1, 0, 0, 1};
-    const auto mask = png(2, 2, ids);
-    const std::array physical{objects(91105, CoconutImageNamespace::Objects365V1), objects(91105)};
-    auto input = request(physical, CoconutEdition::ObjectsValidation);
-    input.annotation_json = root.path() / "val.json";
-    input.mask_archive = root.path() / "val.tar";
-    input.expected_rows = 2;
-    auto supported = segment();
-    supported["ignore"] = 1;
-    supported["bbox"] = Json::array({0.25, 0.5, 1.5, 1.0});
-    Json document{
-        {"images", Json::array({{{"id", 691105}, {"file_name", "691105.jpg"}, {"width", 2}, {"height", 2}},
-                                {{"id", 91105}, {"file_name", "objects365_v2_00091105.png"}, {"width", 2}, {"height", 2}}})},
-        {"annotations", Json::array({{{"image_id", 691105},
-                                      {"file_name", "691105.png"},
-                                      {"object365_file_name", "objects365_v1_00091105"},
-                                      {"segments_info", Json::array({supported})}},
-                                     {{"image_id", 91105}, {"file_name", "objects365_v2_00091105.png"}, {"segments_info", Json::array({segment()})}}})}};
-    json_file(input.annotation_json, document);
-    // Deliberately reversed archive order.
-    const std::array members{std::pair{"panoptic_o365val_v3/objects365_v2_00091105.png", mask},
-                             std::pair{"panoptic_o365val_v3/objects365_v1_00091105.png", mask}, std::pair{".DS_Store", std::string("unrelated")}};
-    std::vector<std::pair<std::string, std::string>> owned;
-    for (const auto& [name, bytes] : members) owned.emplace_back(name, bytes);
-    tar(input.mask_archive, owned);
-    auto components = import_coconut_annotations(input);
-    REQUIRE(components.size() == 2);
-    CHECK(components[0].source == CoconutImageNamespace::Objects365V1);
-    CHECK(components[1].source == CoconutImageNamespace::Objects365V2);
-    for (const auto& component : components) CHECK(component.index.images[0].source_image_id == 91105);
-    CHECK(components[0].inventory[0].release_image_id == 691105);
-    CHECK(components[0].inventory[0].physical.member == "image/objects365_v1_00091105.jpg");
-    const auto& box = components[0].index.boxes[0];
-    CHECK(box.x1 == 0.125F);
-    CHECK(box.y1 == 0.25F);
-    CHECK(box.x2 == 0.875F);
-    CHECK(box.y2 == 0.75F);
-    CHECK((box.flags & kAnnotationIgnore) != 0);
-    CHECK(box.original_area == 2);
-    const std::array<RLEPair, 2> runs{{{0, 1}, {3, 1}}};
-    expect_runs(components[0], runs);
-    CHECK(components[0].index.boxes[0].source_ordinal == 0);
-    CHECK(components[1].index.boxes[0].source_ordinal == 1);
-    const auto cache = root.path() / "val.bin";
-    store_coconut_component(cache, components[0]);
-    auto loaded = load_coconut_component(cache, input.edition, CoconutImageNamespace::Objects365V1, input.input_identity);
-    REQUIRE(loaded);
-    CHECK(loaded->inventory[0].release_image_id == 691105);
+ ScopedTempDir root("coconut-json");
+ const std::array<std::uint32_t, 4> ids{1, 0, 0, 1};
+ const auto mask = png(2, 2, ids);
+ const std::array physical{objects(91105, CoconutImageNamespace::Objects365V1), objects(91105)};
+ auto input = request(physical, CoconutEdition::ObjectsValidation);
+ input.annotation_json = root.path() / "val.json";
+ input.mask_archive = root.path() / "val.tar";
+ input.expected_rows = 2;
+ auto supported = segment();
+ supported["ignore"] = 1;
+ supported["bbox"] = Json::array({0.25, 0.5, 1.5, 1.0});
+ Json document{
+  {"images", Json::array({{{"id", 691105}, {"file_name", "691105.jpg"}, {"width", 2}, {"height", 2}},
+                          {{"id", 91105}, {"file_name", "objects365_v2_00091105.png"}, {"width", 2}, {"height", 2}}})},
+  {"annotations",
+   Json::array(
+    {{{"image_id", 691105}, {"file_name", "691105.png"}, {"object365_file_name", "objects365_v1_00091105"}, {"segments_info", Json::array({supported})}},
+     {{"image_id", 91105}, {"file_name", "objects365_v2_00091105.png"}, {"segments_info", Json::array({segment()})}}})}};
+ json_file(input.annotation_json, document);
+ // Deliberately reversed archive order.
+ const std::array members{std::pair{"panoptic_o365val_v3/objects365_v2_00091105.png", mask}, std::pair{"panoptic_o365val_v3/objects365_v1_00091105.png", mask},
+                          std::pair{".DS_Store", std::string("unrelated")}};
+ std::vector<std::pair<std::string, std::string>> owned;
+ for (const auto& [name, bytes] : members) owned.emplace_back(name, bytes);
+ tar(input.mask_archive, owned);
+ auto components = import_coconut_annotations(input);
+ REQUIRE(components.size() == 2);
+ CHECK(components[0].source == CoconutImageNamespace::Objects365V1);
+ CHECK(components[1].source == CoconutImageNamespace::Objects365V2);
+ for (const auto& component : components) CHECK(component.index.images[0].source_image_id == 91105);
+ CHECK(components[0].inventory[0].release_image_id == 691105);
+ CHECK(components[0].inventory[0].physical.member == "image/objects365_v1_00091105.jpg");
+ const auto& box = components[0].index.boxes[0];
+ CHECK(box.x1 == 0.125F);
+ CHECK(box.y1 == 0.25F);
+ CHECK(box.x2 == 0.875F);
+ CHECK(box.y2 == 0.75F);
+ CHECK((box.flags & kAnnotationIgnore) != 0);
+ CHECK(box.original_area == 2);
+ const std::array<RLEPair, 2> runs{{{0, 1}, {3, 1}}};
+ expect_runs(components[0], runs);
+ CHECK(components[0].index.boxes[0].source_ordinal == 0);
+ CHECK(components[1].index.boxes[0].source_ordinal == 1);
+ const auto cache = root.path() / "val.bin";
+ store_coconut_component(cache, components[0]);
+ auto loaded = load_coconut_component(cache, input.edition, CoconutImageNamespace::Objects365V1, input.input_identity);
+ REQUIRE(loaded);
+ CHECK(loaded->inventory[0].release_image_id == 691105);
 }
 TEST_CASE("COCONut Large shapes and sorted XL masks retain complete rows with Large precedence", "[coconut]") {
-    ScopedTempDir root("coconut-extensions");
-    const std::array<std::uint32_t, 1> ids{1};
-    const auto mask = png(1, 1, ids);
-    const std::array physical{objects(1), objects(2), objects(3)};
-    auto input = request(physical, CoconutEdition::Large);
-    input.expected_rows = 2;
-    input.annotation_json = root.path() / "large.json";
-    input.mask_archive = root.path() / "large.tar";
-    json_file(input.annotation_json,
-              {{"images", Json::array({{{"id", 900}, {"file_name", "900.jpg"}, {"object365_name", "objects365_v2_00000002"}, {"width", 1}, {"height", 1}},
-                                       {{"id", 1}, {"file_name", "objects365_v2_00000001.png"}, {"width", 1}, {"height", 1}}})},
-               {"annotations", Json::array({{{"image_id", 900}, {"file_name", "900.png"}, {"segments_info", Json::array({segment()})}},
-                                            {{"image_id", 1}, {"file_name", "objects365_v2_00000001.png"}, {"segments_info", Json::array({segment()})}}})}});
-    const std::array<std::pair<std::string, std::string>, 2> members{
-        {{"panoptic_object365/objects365_v2_00000001.png", mask}, {"panoptic_object365/objects365_v2_00000002.png", mask}}};
-    tar(input.mask_archive, members);
-    auto components = import_coconut_annotations(input);
-    REQUIRE(components.size() == 1);
-    REQUIRE(components[0].index.images.size() == 2);
-    CHECK(components[0].inventory[1].release_image_id == 900);
-    CHECK(components[0].index.boxes[0].source_ordinal == 1);
-    CHECK(components[0].index.boxes[1].source_ordinal == 0);
-    input.edition = CoconutEdition::XLarge;
-    input.annotation_json.clear();
-    input.mask_archive = root.path() / "xl.tar";
-    const std::array<std::pair<std::string, std::string>, 4> xl_members{
-        {{"coconuts_xlarge/panseg/objects365_v2_00000003.png", mask},
-         {"coconuts_xlarge/panseg_info/objects365_v2_00000003.json", Json::array({segment()}).dump()},
-         {"coconuts_xlarge/panseg_info/objects365_v2_00000002.json", Json::array({segment()}).dump()},
-         {"coconuts_xlarge/panseg/objects365_v2_00000002.png", mask}}};
-    tar(input.mask_archive, xl_members);
-    auto xl = import_coconut_annotations(input);
-    REQUIRE(xl.size() == 1);
-    REQUIRE(xl[0].index.images.size() == 2);
-    CHECK(xl[0].index.images[0].source_image_id == 2);
-    CHECK(xl[0].index.images[0].width == 1);
-    CHECK(xl[0].index.images[0].height == 1);
-    CHECK(xl[0].index.boxes[0].source_ordinal == 0);
-    CHECK(xl[0].index.boxes[1].source_ordinal == 1);
-    components.push_back(std::move(xl[0]));
-    const auto original = components;
-    const auto* retained_boxes = components[1].index.boxes.data();
-    const auto* retained_runs = components[1].index.mask_rle_pairs.data();
-    const auto* retained_inventory = components[1].inventory.data();
-    const auto box_capacity = components[1].index.boxes.capacity(), run_capacity = components[1].index.mask_rle_pairs.capacity();
-    const auto previous_identity = components[1].index.annotation_sha256;
-    PollCancellation observed;
-    CHECK(reconcile_coconut_extensions(components, mmltk::common::concurrency::CancellationObservation::Borrow(observed)) == 1);
-    for (std::size_t cut = 0; cut < observed.polls; ++cut) {
-        auto interrupted = original;
-        PollCancellation stop;
-        stop.stop_at = cut;
-        CHECK_THROWS(reconcile_coconut_extensions(interrupted, mmltk::common::concurrency::CancellationObservation::Borrow(stop)));
-        if (interrupted[1].index.annotation_sha256.empty()) {
-            const auto rejected_path = root.path() / "interrupted.bin";
-            CHECK_THROWS(store_coconut_component(rejected_path, interrupted[1]));
-            CHECK_FALSE(std::filesystem::exists(rejected_path));
-        }
-    }
-    CHECK(components[1].index.boxes.data() == retained_boxes);
-    CHECK(components[1].index.mask_rle_pairs.data() == retained_runs);
-    CHECK(components[1].inventory.data() == retained_inventory);
-    CHECK(components[1].index.boxes.capacity() == box_capacity);
-    CHECK(components[1].index.mask_rle_pairs.capacity() == run_capacity);
-    CHECK(components[1].index.annotation_sha256 != previous_identity);
-    CHECK(components[1].inventory[0] == original[1].inventory[1]);
-    CHECK(components[1].index.mask_rle_pairs[0].start == 0);
-    CHECK(components[1].index.mask_rle_pairs[0].length == 1);
-    REQUIRE(components[1].index.images.size() == 1);
-    CHECK(components[1].index.images[0].source_image_id == 3);
-    CHECK(components[1].index.boxes[0].source_ordinal == 1);
-    CHECK(components[1].index.images[0].first_box == 0);
-    CHECK(components[1].index.boxes[0].mask_rle_offset == 0);
-    CHECK(reconcile_coconut_extensions(components) == 0);
-    CHECK(components[1].index.boxes.data() == retained_boxes);
-    auto covered = original;
-    covered[0] = original[1];
-    covered[0].edition = CoconutEdition::Large;
-    CHECK(reconcile_coconut_extensions(covered) == 2);
-    CHECK(covered[1].inventory.empty());
-    CHECK(covered[1].index.images.empty());
-    CHECK(covered[1].index.boxes.empty());
-    CHECK(covered[1].index.mask_rle_pairs.empty());
-    CHECK(covered[0].inventory.size() == 2);
+ ScopedTempDir root("coconut-extensions");
+ const std::array<std::uint32_t, 1> ids{1};
+ const auto mask = png(1, 1, ids);
+ const std::array physical{objects(1), objects(2), objects(3)};
+ auto input = request(physical, CoconutEdition::Large);
+ input.expected_rows = 2;
+ input.annotation_json = root.path() / "large.json";
+ input.mask_archive = root.path() / "large.tar";
+ json_file(input.annotation_json,
+           {{"images", Json::array({{{"id", 900}, {"file_name", "900.jpg"}, {"object365_name", "objects365_v2_00000002"}, {"width", 1}, {"height", 1}},
+                                    {{"id", 1}, {"file_name", "objects365_v2_00000001.png"}, {"width", 1}, {"height", 1}}})},
+            {"annotations", Json::array({{{"image_id", 900}, {"file_name", "900.png"}, {"segments_info", Json::array({segment()})}},
+                                         {{"image_id", 1}, {"file_name", "objects365_v2_00000001.png"}, {"segments_info", Json::array({segment()})}}})}});
+ const std::array<std::pair<std::string, std::string>, 2> members{
+  {{"panoptic_object365/objects365_v2_00000001.png", mask}, {"panoptic_object365/objects365_v2_00000002.png", mask}}};
+ tar(input.mask_archive, members);
+ auto components = import_coconut_annotations(input);
+ REQUIRE(components.size() == 1);
+ REQUIRE(components[0].index.images.size() == 2);
+ CHECK(components[0].inventory[1].release_image_id == 900);
+ CHECK(components[0].index.boxes[0].source_ordinal == 1);
+ CHECK(components[0].index.boxes[1].source_ordinal == 0);
+ input.edition = CoconutEdition::XLarge;
+ input.annotation_json.clear();
+ input.mask_archive = root.path() / "xl.tar";
+ const std::array<std::pair<std::string, std::string>, 4> xl_members{
+  {{"coconuts_xlarge/panseg/objects365_v2_00000003.png", mask},
+   {"coconuts_xlarge/panseg_info/objects365_v2_00000003.json", Json::array({segment()}).dump()},
+   {"coconuts_xlarge/panseg_info/objects365_v2_00000002.json", Json::array({segment()}).dump()},
+   {"coconuts_xlarge/panseg/objects365_v2_00000002.png", mask}}};
+ tar(input.mask_archive, xl_members);
+ auto xl = import_coconut_annotations(input);
+ REQUIRE(xl.size() == 1);
+ REQUIRE(xl[0].index.images.size() == 2);
+ CHECK(xl[0].index.images[0].source_image_id == 2);
+ CHECK(xl[0].index.images[0].width == 1);
+ CHECK(xl[0].index.images[0].height == 1);
+ CHECK(xl[0].index.boxes[0].source_ordinal == 0);
+ CHECK(xl[0].index.boxes[1].source_ordinal == 1);
+ components.push_back(std::move(xl[0]));
+ const auto original = components;
+ const auto* retained_boxes = components[1].index.boxes.data();
+ const auto* retained_runs = components[1].index.mask_rle_pairs.data();
+ const auto* retained_inventory = components[1].inventory.data();
+ const auto box_capacity = components[1].index.boxes.capacity(), run_capacity = components[1].index.mask_rle_pairs.capacity();
+ const auto previous_identity = components[1].index.annotation_sha256;
+ PollCancellation observed;
+ CHECK(reconcile_coconut_extensions(components, mmltk::common::concurrency::CancellationObservation::Borrow(observed)) == 1);
+ for (std::size_t cut = 0; cut < observed.polls; ++cut) {
+  auto interrupted = original;
+  PollCancellation stop;
+  stop.stop_at = cut;
+  CHECK_THROWS(reconcile_coconut_extensions(interrupted, mmltk::common::concurrency::CancellationObservation::Borrow(stop)));
+  if (interrupted[1].index.annotation_sha256.empty()) {
+   const auto rejected_path = root.path() / "interrupted.bin";
+   CHECK_THROWS(store_coconut_component(rejected_path, interrupted[1]));
+   CHECK_FALSE(std::filesystem::exists(rejected_path));
+  }
+ }
+ CHECK(components[1].index.boxes.data() == retained_boxes);
+ CHECK(components[1].index.mask_rle_pairs.data() == retained_runs);
+ CHECK(components[1].inventory.data() == retained_inventory);
+ CHECK(components[1].index.boxes.capacity() == box_capacity);
+ CHECK(components[1].index.mask_rle_pairs.capacity() == run_capacity);
+ CHECK(components[1].index.annotation_sha256 != previous_identity);
+ CHECK(components[1].inventory[0] == original[1].inventory[1]);
+ CHECK(components[1].index.mask_rle_pairs[0].start == 0);
+ CHECK(components[1].index.mask_rle_pairs[0].length == 1);
+ REQUIRE(components[1].index.images.size() == 1);
+ CHECK(components[1].index.images[0].source_image_id == 3);
+ CHECK(components[1].index.boxes[0].source_ordinal == 1);
+ CHECK(components[1].index.images[0].first_box == 0);
+ CHECK(components[1].index.boxes[0].mask_rle_offset == 0);
+ CHECK(reconcile_coconut_extensions(components) == 0);
+ CHECK(components[1].index.boxes.data() == retained_boxes);
+ auto covered = original;
+ covered[0] = original[1];
+ covered[0].edition = CoconutEdition::Large;
+ CHECK(reconcile_coconut_extensions(covered) == 2);
+ CHECK(covered[1].inventory.empty());
+ CHECK(covered[1].index.images.empty());
+ CHECK(covered[1].index.boxes.empty());
+ CHECK(covered[1].index.mask_rle_pairs.empty());
+ CHECK(covered[0].inventory.size() == 2);
 }
 TEST_CASE("COCONut archives reject unresolved duplicate extra and unsafe offered members", "[coconut]") {
-    ScopedTempDir root("coconut-archive-reject");
-    const std::array<std::uint32_t, 1> ids{1};
-    const auto mask = png(1, 1, ids);
-    const std::array physical{objects(1)};
-    auto input = request(physical, CoconutEdition::Large);
-    input.annotation_json = root.path() / "large.json";
-    input.mask_archive = root.path() / "large.tar";
-    Json annotation{{"image_id", 1}, {"file_name", "objects365_v2_00000001.png"}, {"segments_info", Json::array({segment()})}};
-    Json document{{"images", Json::array()}, {"annotations", Json::array({annotation})}};
-    std::vector<std::pair<std::string, std::string>> members{{"panoptic_object365/objects365_v2_00000001.png", mask}};
-    bool link = false;
-    SECTION("missing mask") { members.clear(); }
-    SECTION("extra mask") { members.emplace_back("panoptic_object365/objects365_v2_00000002.png", mask); }
-    SECTION("duplicate mask") { members.push_back(members.front()); }
-    SECTION("traversal") { members.emplace_back("../outside", "x"); }
-    SECTION("symlink") { link = true; }
-    SECTION("duplicate offered annotation") { document["annotations"].push_back(annotation); }
-    SECTION("unknown physical namespace") { document["annotations"][0]["file_name"] = "00000001.png"; }
-    SECTION("contradictory physical names") { document["annotations"][0]["object365_file_name"] = "objects365_v2_00000002"; }
-    SECTION("unknown PNG segment") {
-        const std::array<std::uint32_t, 1> unknown{2};
-        members[0].second = png(1, 1, unknown);
-    }
-    json_file(input.annotation_json, document);
-    tar(input.mask_archive, members, link);
-    CHECK_THROWS(import_coconut_annotations(input));
+ ScopedTempDir root("coconut-archive-reject");
+ const std::array<std::uint32_t, 1> ids{1};
+ const auto mask = png(1, 1, ids);
+ const std::array physical{objects(1)};
+ auto input = request(physical, CoconutEdition::Large);
+ input.annotation_json = root.path() / "large.json";
+ input.mask_archive = root.path() / "large.tar";
+ Json annotation{{"image_id", 1}, {"file_name", "objects365_v2_00000001.png"}, {"segments_info", Json::array({segment()})}};
+ Json document{{"images", Json::array()}, {"annotations", Json::array({annotation})}};
+ std::vector<std::pair<std::string, std::string>> members{{"panoptic_object365/objects365_v2_00000001.png", mask}};
+ bool link = false;
+ SECTION("missing mask") { members.clear(); }
+ SECTION("extra mask") { members.emplace_back("panoptic_object365/objects365_v2_00000002.png", mask); }
+ SECTION("duplicate mask") { members.push_back(members.front()); }
+ SECTION("traversal") { members.emplace_back("../outside", "x"); }
+ SECTION("symlink") { link = true; }
+ SECTION("duplicate offered annotation") { document["annotations"].push_back(annotation); }
+ SECTION("unknown physical namespace") { document["annotations"][0]["file_name"] = "00000001.png"; }
+ SECTION("contradictory physical names") { document["annotations"][0]["object365_file_name"] = "objects365_v2_00000002"; }
+ SECTION("unknown PNG segment") {
+  const std::array<std::uint32_t, 1> unknown{2};
+  members[0].second = png(1, 1, unknown);
+ }
+ json_file(input.annotation_json, document);
+ tar(input.mask_archive, members, link);
+ CHECK_THROWS(import_coconut_annotations(input));
 }
 TEST_CASE("COCONut version-1 physical inventory has fixed bytes and admits existing caches", "[coconut]") {
-    ScopedTempDir root("coconut-inventory-v1");
-    static constexpr char expected_bytes[] =
-        "\x43\x4e\x55\x54\x49\x56\x4e\x31"                                                                                  // magic
-        "\x01\x00\x00\x00"                                                                                                  // version 1
-        "\x02\x00\x00\x00"                                                                                                  // cache schema 2
-        "\x18\x00\x00\x00\x63\x6f\x63\x6f\x6e\x75\x74\x2d\x65\x78\x61\x63\x74\x2d\x72\x67\x62\x2d\x72\x6c\x65\x2d\x76\x31"  // normalization
-        "\x01\x00\x00\x00\x61"                                                                                              // input identity
-        "\x00\x03\x34\x12\x00"                          // Base, Objects365V1, shard 0x1234, physical
-        "\x01\x00\x00\x00\x00\x00\x00\x00"              // one record
-        "\x03\xe1\x63\x01\x00\x00\x00\x00\x00\x34\x12"  // namespace, physical ID 91105, shard
-        "\x20\x00\x00\x00\x69\x6d\x61\x67\x65\x2f\x6f\x62\x6a\x65\x63\x74\x73\x33\x36\x35\x5f\x76\x31\x5f\x30\x30\x30\x39\x31\x31\x30\x35\x2e\x6a\x70"
-        "\x67"                                                                                                                               // physical member
-        "\x01\x00\x00\x00\x61"                                                                                                               // archive identity
-        "\x93\xe4\x7a\xfa\x75\xda\x69\x5b\x47\xe8\xc5\x40\x1f\xb2\x30\xea\xde\x72\x66\xf7\x98\xbc\xea\x05\x7b\x52\x8f\xbd\x0b\x94\x5e\x17";  // SHA-256
-                                                                                                                                             // footer
-                                                                                                                                             // at byte
-                                                                                                                                             // 114
-    const std::string expected(expected_bytes, sizeof(expected_bytes) - 1);
-    const auto archive = root.path() / "images.tar";
-    const auto cache = root.path() / "inventory.bin";
-    const std::vector<CoconutPhysicalImage> wanted{{CoconutImageNamespace::Objects365V1, 91105, 0x1234, "image/objects365_v1_00091105.jpg", "a"}};
-    // A preexisting v1 inventory must load without its source archive.
-    mmltk::testsupport::write_text_file(cache, expected);
-    CHECK(coconut_image_archive_inventory(archive, cache, CoconutImageNamespace::Objects365V1, 0x1234, "a") == wanted);
-    CHECK_FALSE(std::filesystem::exists(archive));
-    const std::array<std::pair<std::string, std::string>, 3> members{{{".", ""}, {"./", ""}, {"./image//./objects365_v1_00091105.jpg", "jpeg"}}};
-    tar(archive, members);
-    const auto emitted = root.path() / "emitted.bin";
-    CHECK(coconut_image_archive_inventory(archive, emitted, CoconutImageNamespace::Objects365V1, 0x1234, "a") == wanted);
-    CHECK(file_bytes(emitted) == expected);
-    CHECK(expected.size() == 114 + 32);
-    CHECK(file_bytes(cache) == expected);
+ ScopedTempDir root("coconut-inventory-v1");
+ static constexpr char expected_bytes[] =
+  "\x43\x4e\x55\x54\x49\x56\x4e\x31"                                                                                  // magic
+  "\x01\x00\x00\x00"                                                                                                  // version 1
+  "\x02\x00\x00\x00"                                                                                                  // cache schema 2
+  "\x18\x00\x00\x00\x63\x6f\x63\x6f\x6e\x75\x74\x2d\x65\x78\x61\x63\x74\x2d\x72\x67\x62\x2d\x72\x6c\x65\x2d\x76\x31"  // normalization
+  "\x01\x00\x00\x00\x61"                                                                                              // input identity
+  "\x00\x03\x34\x12\x00"                          // Base, Objects365V1, shard 0x1234, physical
+  "\x01\x00\x00\x00\x00\x00\x00\x00"              // one record
+  "\x03\xe1\x63\x01\x00\x00\x00\x00\x00\x34\x12"  // namespace, physical ID 91105, shard
+  "\x20\x00\x00\x00\x69\x6d\x61\x67\x65\x2f\x6f\x62\x6a\x65\x63\x74\x73\x33\x36\x35\x5f\x76\x31\x5f\x30\x30\x30\x39\x31\x31\x30\x35\x2e\x6a\x70"
+  "\x67"                                                                                                                               // physical member
+  "\x01\x00\x00\x00\x61"                                                                                                               // archive identity
+  "\x93\xe4\x7a\xfa\x75\xda\x69\x5b\x47\xe8\xc5\x40\x1f\xb2\x30\xea\xde\x72\x66\xf7\x98\xbc\xea\x05\x7b\x52\x8f\xbd\x0b\x94\x5e\x17";  // SHA-256
+                                                                                                                                       // footer
+                                                                                                                                       // at byte
+                                                                                                                                       // 114
+ const std::string expected(expected_bytes, sizeof(expected_bytes) - 1);
+ const auto archive = root.path() / "images.tar";
+ const auto cache = root.path() / "inventory.bin";
+ const std::vector<CoconutPhysicalImage> wanted{{CoconutImageNamespace::Objects365V1, 91105, 0x1234, "image/objects365_v1_00091105.jpg", "a"}};
+ // A preexisting v1 inventory must load without its source archive.
+ mmltk::testsupport::write_text_file(cache, expected);
+ CHECK(coconut_image_archive_inventory(archive, cache, CoconutImageNamespace::Objects365V1, 0x1234, "a") == wanted);
+ CHECK_FALSE(std::filesystem::exists(archive));
+ const std::array<std::pair<std::string, std::string>, 3> members{{{".", ""}, {"./", ""}, {"./image//./objects365_v1_00091105.jpg", "jpeg"}}};
+ tar(archive, members);
+ const auto emitted = root.path() / "emitted.bin";
+ CHECK(coconut_image_archive_inventory(archive, emitted, CoconutImageNamespace::Objects365V1, 0x1234, "a") == wanted);
+ CHECK(file_bytes(emitted) == expected);
+ CHECK(expected.size() == 114 + 32);
+ CHECK(file_bytes(cache) == expected);
 }
 TEST_CASE("COCONut version-1 component inventory pins nested physical release and ordinal identities", "[coconut]") {
-    ScopedTempDir root("coconut-component-v1");
-    static constexpr char expected_bytes[] =
-        "\x43\x4e\x55\x54\x49\x56\x4e\x31"                                                                                  // magic
-        "\x01\x00\x00\x00"                                                                                                  // version 1
-        "\x02\x00\x00\x00"                                                                                                  // cache schema 2
-        "\x18\x00\x00\x00\x63\x6f\x63\x6f\x6e\x75\x74\x2d\x65\x78\x61\x63\x74\x2d\x72\x67\x62\x2d\x72\x6c\x65\x2d\x76\x31"  // normalization
-        "\x01\x00\x00\x00\x69"                                                                                              // input identity
-        "\x04\x03\x00\x00\x01"                          // ObjectsValidation, Objects365V1, header shard 0, component
-        "\x01\x00\x00\x00\x00\x00\x00\x00"              // one record
-        "\x03\xe1\x63\x01\x00\x00\x00\x00\x00\x34\x12"  // namespace, physical ID 91105, shard
-        "\x20\x00\x00\x00\x69\x6d\x61\x67\x65\x2f\x6f\x62\x6a\x65\x63\x74\x73\x33\x36\x35\x5f\x76\x31\x5f\x30\x30\x30\x39\x31\x31\x30\x35\x2e\x6a\x70"
-        "\x67"                              // physical member
-        "\x01\x00\x00\x00\x61"              // archive identity
-        "\xa1\x8b\x0a\x00\x00\x00\x00\x00"  // declared release ID 691105
-        "\x02\x00\x00\x00\x00\x00\x00\x00"  // source ordinal 2
-        "\xc5\x30\x4c\xa7\xa1\x6f\x7e\x76\xd6\xc2\x1b\xfd\x7b\xda\x2b\x39\xa0\x25\xcc\x26\x8d\xde\x23\x36\xd9\x5a\x21\x57\xeb\x9d\x46\x32";  // SHA-256
-                                                                                                                                             // footer
-                                                                                                                                             // at byte
-                                                                                                                                             // 130
-    const std::string expected(expected_bytes, sizeof(expected_bytes) - 1);
-    CoconutComponent component;
-    component.edition = CoconutEdition::ObjectsValidation;
-    component.source = CoconutImageNamespace::Objects365V1;
-    component.input_identity = "i";
-    component.inventory = {{{CoconutImageNamespace::Objects365V1, 91105, 0x1234, "image/objects365_v1_00091105.jpg", "a"}, 691105, 2}};
-    component.index.source = BenchmarkDatasetSource::kObjects365V2;
-    component.index.split = "coconut-4-3";
-    component.index.annotation_sha256 = "c5304ca7a16f7e76d6c21bfd7bda2b39a025cc268dde2336d95a2157eb9d4632";
-    component.index.images.push_back({.source_image_id = 91105, .width = 1, .height = 1, .source_shard = 0x1234});
-    const auto path = root.path() / "component.bin";
-    store_coconut_component(path, component);
-    const auto index_bytes = file_bytes(path);
-    const auto inventory_path = path.string() + ".inventory";
-    CHECK(file_bytes(inventory_path) == expected);
-    CHECK(expected.size() == 130 + 32);
-    // Substitute independent v1 bytes, retaining the index's joint completion.
-    mmltk::testsupport::write_text_file(inventory_path, expected);
-    const auto loaded = load_coconut_component(path, component.edition, component.source, "i");
-    REQUIRE(loaded);
-    CHECK(loaded->inventory == component.inventory);
-    REQUIRE(loaded->index.images.size() == 1);
-    CHECK(loaded->index.images[0].source_image_id == 91105);
-    CHECK(loaded->index.boxes.empty());
-    CHECK_FALSE(load_coconut_component(path, component.edition, component.source, "changed"));
-    store_coconut_component(path, *loaded);
-    CHECK(file_bytes(inventory_path) == expected);
-    CHECK(file_bytes(path) == index_bytes);
+ ScopedTempDir root("coconut-component-v1");
+ static constexpr char expected_bytes[] =
+  "\x43\x4e\x55\x54\x49\x56\x4e\x31"                                                                                  // magic
+  "\x01\x00\x00\x00"                                                                                                  // version 1
+  "\x02\x00\x00\x00"                                                                                                  // cache schema 2
+  "\x18\x00\x00\x00\x63\x6f\x63\x6f\x6e\x75\x74\x2d\x65\x78\x61\x63\x74\x2d\x72\x67\x62\x2d\x72\x6c\x65\x2d\x76\x31"  // normalization
+  "\x01\x00\x00\x00\x69"                                                                                              // input identity
+  "\x04\x03\x00\x00\x01"                          // ObjectsValidation, Objects365V1, header shard 0, component
+  "\x01\x00\x00\x00\x00\x00\x00\x00"              // one record
+  "\x03\xe1\x63\x01\x00\x00\x00\x00\x00\x34\x12"  // namespace, physical ID 91105, shard
+  "\x20\x00\x00\x00\x69\x6d\x61\x67\x65\x2f\x6f\x62\x6a\x65\x63\x74\x73\x33\x36\x35\x5f\x76\x31\x5f\x30\x30\x30\x39\x31\x31\x30\x35\x2e\x6a\x70"
+  "\x67"                              // physical member
+  "\x01\x00\x00\x00\x61"              // archive identity
+  "\xa1\x8b\x0a\x00\x00\x00\x00\x00"  // declared release ID 691105
+  "\x02\x00\x00\x00\x00\x00\x00\x00"  // source ordinal 2
+  "\xc5\x30\x4c\xa7\xa1\x6f\x7e\x76\xd6\xc2\x1b\xfd\x7b\xda\x2b\x39\xa0\x25\xcc\x26\x8d\xde\x23\x36\xd9\x5a\x21\x57\xeb\x9d\x46\x32";  // SHA-256
+                                                                                                                                       // footer
+                                                                                                                                       // at byte
+                                                                                                                                       // 130
+ const std::string expected(expected_bytes, sizeof(expected_bytes) - 1);
+ CoconutComponent component;
+ component.edition = CoconutEdition::ObjectsValidation;
+ component.source = CoconutImageNamespace::Objects365V1;
+ component.input_identity = "i";
+ component.inventory = {{{CoconutImageNamespace::Objects365V1, 91105, 0x1234, "image/objects365_v1_00091105.jpg", "a"}, 691105, 2}};
+ component.index.source = BenchmarkDatasetSource::kObjects365V2;
+ component.index.split = "coconut-4-3";
+ component.index.annotation_sha256 = "c5304ca7a16f7e76d6c21bfd7bda2b39a025cc268dde2336d95a2157eb9d4632";
+ component.index.images.push_back({.source_image_id = 91105, .width = 1, .height = 1, .source_shard = 0x1234});
+ const auto path = root.path() / "component.bin";
+ store_coconut_component(path, component);
+ const auto index_bytes = file_bytes(path);
+ const auto inventory_path = path.string() + ".inventory";
+ CHECK(file_bytes(inventory_path) == expected);
+ CHECK(expected.size() == 130 + 32);
+ // Substitute independent v1 bytes, retaining the index's joint completion.
+ mmltk::testsupport::write_text_file(inventory_path, expected);
+ const auto loaded = load_coconut_component(path, component.edition, component.source, "i");
+ REQUIRE(loaded);
+ CHECK(loaded->inventory == component.inventory);
+ REQUIRE(loaded->index.images.size() == 1);
+ CHECK(loaded->index.images[0].source_image_id == 91105);
+ CHECK(loaded->index.boxes.empty());
+ CHECK_FALSE(load_coconut_component(path, component.edition, component.source, "changed"));
+ store_coconut_component(path, *loaded);
+ CHECK(file_bytes(inventory_path) == expected);
+ CHECK(file_bytes(path) == index_bytes);
 }
 TEST_CASE("COCONut physical member spelling preserves exact paths and rejects unsafe names", "[coconut]") {
-    CHECK(canonical_coconut_archive_member("././train2017//./000000000007.jpg") == "train2017/000000000007.jpg");
-    CHECK(canonical_coconut_archive_member("nested/./image//objects365_v1_00091105.jpg") == "nested/image/objects365_v1_00091105.jpg");
-    for (const std::string& raw : {std::string("/train2017/a.jpg"), std::string("../a.jpg"), std::string("train2017/../a.jpg"), std::string("train2017\\a.jpg"),
-                                   std::string("train2017/a\0.jpg", 16)}) {
-        CHECK_THROWS(canonical_coconut_archive_member(raw));
-    }
+ CHECK(canonical_coconut_archive_member("././train2017//./000000000007.jpg") == "train2017/000000000007.jpg");
+ CHECK(canonical_coconut_archive_member("nested/./image//objects365_v1_00091105.jpg") == "nested/image/objects365_v1_00091105.jpg");
+ for (const std::string& raw : {std::string("/train2017/a.jpg"), std::string("../a.jpg"), std::string("train2017/../a.jpg"), std::string("train2017\\a.jpg"),
+                                std::string("train2017/a\0.jpg", 16)}) {
+  CHECK_THROWS(canonical_coconut_archive_member(raw));
+ }
 }
 TEST_CASE("COCONut full physical inventories are identity-bound and independent of foreground labels", "[coconut]") {
-    ScopedTempDir root("coconut-inventory");
-    const auto archive = root.path() / "images.tar", cache = root.path() / "inventory.json";
-    const std::array<std::pair<std::string, std::string>, 3> members{
-        {{"unlabeled2017/000000000007.jpg", "jpeg7"}, {"unlabeled2017/000000000008.jpg", "jpeg8"}, {".DS_Store", "unrelated"}}};
-    tar(archive, members);
-    auto result = coconut_image_archive_inventory(archive, cache, CoconutImageNamespace::CocoUnlabeled, 0, "pinned-archive");
-    REQUIRE(result.size() == 2);
-    CHECK(result[0].image_id == 7);
-    CHECK(result[1].image_id == 8);
-    std::filesystem::remove(archive);
-    CHECK(coconut_image_archive_inventory(archive, cache, CoconutImageNamespace::CocoUnlabeled, 0, "pinned-archive") == result);
-    CHECK_THROWS(coconut_image_archive_inventory(archive, cache, CoconutImageNamespace::CocoUnlabeled, 0, "changed-archive"));
-    const std::array<std::pair<std::string, std::string>, 2> duplicate{{members[0], {"./unlabeled2017//./000000000007.jpg", "jpeg7"}}};
-    tar(archive, duplicate);
-    CHECK_THROWS(coconut_image_archive_inventory(archive, {}, CoconutImageNamespace::CocoUnlabeled, 0, "duplicate-archive"));
+ ScopedTempDir root("coconut-inventory");
+ const auto archive = root.path() / "images.tar", cache = root.path() / "inventory.json";
+ const std::array<std::pair<std::string, std::string>, 3> members{
+  {{"unlabeled2017/000000000007.jpg", "jpeg7"}, {"unlabeled2017/000000000008.jpg", "jpeg8"}, {".DS_Store", "unrelated"}}};
+ tar(archive, members);
+ auto result = coconut_image_archive_inventory(archive, cache, CoconutImageNamespace::CocoUnlabeled, 0, "pinned-archive");
+ REQUIRE(result.size() == 2);
+ CHECK(result[0].image_id == 7);
+ CHECK(result[1].image_id == 8);
+ std::filesystem::remove(archive);
+ CHECK(coconut_image_archive_inventory(archive, cache, CoconutImageNamespace::CocoUnlabeled, 0, "pinned-archive") == result);
+ CHECK_THROWS(coconut_image_archive_inventory(archive, cache, CoconutImageNamespace::CocoUnlabeled, 0, "changed-archive"));
+ const std::array<std::pair<std::string, std::string>, 2> duplicate{{members[0], {"./unlabeled2017//./000000000007.jpg", "jpeg7"}}};
+ tar(archive, duplicate);
+ CHECK_THROWS(coconut_image_archive_inventory(archive, {}, CoconutImageNamespace::CocoUnlabeled, 0, "duplicate-archive"));
 }
 TEST_CASE("COCONut preserves RGB24 IDs across compressed Parquet batches and relabeled integer areas", "[coconut]") {
-    ScopedTempDir root("coconut-rgb24");
-    const std::array<std::uint32_t, 1> ids{0x030201};
-    auto seg = segment(0x030201, 90);
-    seg["area"] = 1;
-    Json rows = Json::array();
-    std::vector<CoconutPhysicalImage> physical;
-    for (unsigned i = 1; i <= 18; ++i) {
-        rows.push_back(hf_row(i, png(1, 1, ids), Json::array({seg}), 1, 1));
-        physical.push_back(coco(i, CoconutImageNamespace::CocoValidation));
-    }
-    auto input = request(physical, CoconutEdition::RelabeledValidation);
-    input.parquet_shards = {root.path() / "val.parquet"};
-    input.expected_rows = 18;
-    parquet_file(input.parquet_shards[0], rows, hf_schema(true), parquet::Compression::GZIP);
-    auto components = import_coconut_annotations(input);
-    REQUIRE(components.size() == 1);
-    REQUIRE(components[0].index.images.size() == 18);
-    REQUIRE(components[0].index.boxes.size() == 18);
-    for (std::size_t i = 0; i < 18; ++i) {
-        CHECK(components[0].index.boxes[i].annotation_id == 0x030201);
-        CHECK(components[0].index.boxes[i].class_id == 79);
-        CHECK(components[0].index.boxes[i].source_ordinal == i);
-        CHECK(components[0].index.mask_rle_pairs[i].start == 0);
-        CHECK(components[0].index.mask_rle_pairs[i].length == 1);
-    }
+ ScopedTempDir root("coconut-rgb24");
+ const std::array<std::uint32_t, 1> ids{0x030201};
+ auto seg = segment(0x030201, 90);
+ seg["area"] = 1;
+ Json rows = Json::array();
+ std::vector<CoconutPhysicalImage> physical;
+ for (unsigned i = 1; i <= 18; ++i) {
+  rows.push_back(hf_row(i, png(1, 1, ids), Json::array({seg}), 1, 1));
+  physical.push_back(coco(i, CoconutImageNamespace::CocoValidation));
+ }
+ auto input = request(physical, CoconutEdition::RelabeledValidation);
+ input.parquet_shards = {root.path() / "val.parquet"};
+ input.expected_rows = 18;
+ parquet_file(input.parquet_shards[0], rows, hf_schema(true), parquet::Compression::GZIP);
+ auto components = import_coconut_annotations(input);
+ REQUIRE(components.size() == 1);
+ REQUIRE(components[0].index.images.size() == 18);
+ REQUIRE(components[0].index.boxes.size() == 18);
+ for (std::size_t i = 0; i < 18; ++i) {
+  CHECK(components[0].index.boxes[i].annotation_id == 0x030201);
+  CHECK(components[0].index.boxes[i].class_id == 79);
+  CHECK(components[0].index.boxes[i].source_ordinal == i);
+  CHECK(components[0].index.mask_rle_pairs[i].start == 0);
+  CHECK(components[0].index.mask_rle_pairs[i].length == 1);
+ }
 }
 TEST_CASE("COCONut native selection admission precedes cache mutation", "[coconut]") {
-    ScopedTempDir root("coconut-selection-admission");
-    BenchmarkCompilerConfig config;
-    config.cache_dir = root.path() / "new-cache";
-    config.output_dir = root.path() / "new-output";
-    config.selection.dataset = static_cast<BenchmarkDatasetVariant>(255);
-    CHECK_THROWS_AS(compile_benchmark_dataset(config), std::invalid_argument);
-    CHECK_FALSE(std::filesystem::exists(config.cache_dir));
-    CHECK_FALSE(std::filesystem::exists(config.output_dir));
+ ScopedTempDir root("coconut-selection-admission");
+ BenchmarkCompilerConfig config;
+ config.cache_dir = root.path() / "new-cache";
+ config.output_dir = root.path() / "new-output";
+ config.selection.dataset = static_cast<BenchmarkDatasetVariant>(255);
+ CHECK_THROWS_AS(compile_benchmark_dataset(config), std::invalid_argument);
+ CHECK_FALSE(std::filesystem::exists(config.cache_dir));
+ CHECK_FALSE(std::filesystem::exists(config.output_dir));
 }
 TEST_CASE("COCONut duplicate and ambiguous B membership never silently loses rows", "[coconut]") {
-    ScopedTempDir root("coconut-base-membership");
-    const std::array<std::uint32_t, 1> ids{1};
-    auto row = hf_row(7, png(1, 1, ids), Json::array({segment()}), 1, 1);
-    std::vector<CoconutPhysicalImage> physical{coco(7)};
-    Json rows = Json::array({row});
-    SECTION("duplicate rows") { rows.push_back(row); }
-    SECTION("ambiguous physical subsets") { physical.push_back(coco(7, CoconutImageNamespace::CocoUnlabeled)); }
-    SECTION("duplicate physical members") {
-        physical.push_back(physical[0]);
-        CHECK_THROWS(request(physical));
-        return;
-    }
-    auto input = request(physical);
-    input.parquet_shards = {root.path() / "b.parquet"};
-    parquet_file(input.parquet_shards[0], rows);
-    CHECK_THROWS(import_coconut_annotations(input));
+ ScopedTempDir root("coconut-base-membership");
+ const std::array<std::uint32_t, 1> ids{1};
+ auto row = hf_row(7, png(1, 1, ids), Json::array({segment()}), 1, 1);
+ std::vector<CoconutPhysicalImage> physical{coco(7)};
+ Json rows = Json::array({row});
+ SECTION("duplicate rows") { rows.push_back(row); }
+ SECTION("ambiguous physical subsets") { physical.push_back(coco(7, CoconutImageNamespace::CocoUnlabeled)); }
+ SECTION("duplicate physical members") {
+  physical.push_back(physical[0]);
+  CHECK_THROWS(request(physical));
+  return;
+ }
+ auto input = request(physical);
+ input.parquet_shards = {root.path() / "b.parquet"};
+ parquet_file(input.parquet_shards[0], rows);
+ CHECK_THROWS(import_coconut_annotations(input));
 }
 TEST_CASE("COCONut authoritative box retains an empty supplied mask and rejects coordinate overflow", "[coconut]") {
-    ScopedTempDir root("coconut-authoritative-box");
-    const std::array<std::uint32_t, 1> ids{0};
-    const std::array physical{objects(1)};
-    auto input = request(physical, CoconutEdition::Large);
-    input.annotation_json = root.path() / "large.json";
-    input.mask_archive = root.path() / "large.tar";
-    auto seg = segment();
-    seg["bbox"] = Json::array({-1, 0, 3, 1});
-    seg["area"] = 23;
-    bool overflow = false;
-    SECTION("outside-image authoritative bounds") {}
-    SECTION("unrepresentable bounds") {
-        seg["bbox"] = Json::array({1e30, 0, 1, 1});
-        overflow = true;
-    }
-    json_file(input.annotation_json,
-              {{"images", Json::array()},
-               {"annotations", Json::array({{{"image_id", 1}, {"file_name", "objects365_v2_00000001.png"}, {"segments_info", Json::array({seg})}}})}});
-    const std::array<std::pair<std::string, std::string>, 1> members{{{"panoptic_object365/objects365_v2_00000001.png", png(1, 1, ids)}}};
-    tar(input.mask_archive, members);
-    if (overflow) {
-        CHECK_THROWS(import_coconut_annotations(input));
-        return;
-    }
-    const auto components = import_coconut_annotations(input);
-    REQUIRE(components.size() == 1);
-    REQUIRE(components[0].index.boxes.size() == 1);
-    const auto& box = components[0].index.boxes[0];
-    CHECK(box.x1 == -1.0F);
-    CHECK(box.x2 == 2.0F);
-    CHECK(box.original_area == 23);
-    CHECK((box.flags & kAnnotationMask) != 0);
-    CHECK(box.mask_rle_pairs == 0);
+ ScopedTempDir root("coconut-authoritative-box");
+ const std::array<std::uint32_t, 1> ids{0};
+ const std::array physical{objects(1)};
+ auto input = request(physical, CoconutEdition::Large);
+ input.annotation_json = root.path() / "large.json";
+ input.mask_archive = root.path() / "large.tar";
+ auto seg = segment();
+ seg["bbox"] = Json::array({-1, 0, 3, 1});
+ seg["area"] = 23;
+ bool overflow = false;
+ SECTION("outside-image authoritative bounds") {}
+ SECTION("unrepresentable bounds") {
+  seg["bbox"] = Json::array({1e30, 0, 1, 1});
+  overflow = true;
+ }
+ json_file(input.annotation_json,
+           {{"images", Json::array()},
+            {"annotations", Json::array({{{"image_id", 1}, {"file_name", "objects365_v2_00000001.png"}, {"segments_info", Json::array({seg})}}})}});
+ const std::array<std::pair<std::string, std::string>, 1> members{{{"panoptic_object365/objects365_v2_00000001.png", png(1, 1, ids)}}};
+ tar(input.mask_archive, members);
+ if (overflow) {
+  CHECK_THROWS(import_coconut_annotations(input));
+  return;
+ }
+ const auto components = import_coconut_annotations(input);
+ REQUIRE(components.size() == 1);
+ REQUIRE(components[0].index.boxes.size() == 1);
+ const auto& box = components[0].index.boxes[0];
+ CHECK(box.x1 == -1.0F);
+ CHECK(box.x2 == 2.0F);
+ CHECK(box.original_area == 23);
+ CHECK((box.flags & kAnnotationMask) != 0);
+ CHECK(box.mask_rle_pairs == 0);
 }
 TEST_CASE("COCONut JSON requires canonical categories and exact validation image joins", "[coconut]") {
-    ScopedTempDir root("coconut-semantic-joins");
-    const std::array physical{objects(1, CoconutImageNamespace::Objects365V1), objects(2, CoconutImageNamespace::Objects365V1)};
-    auto input = request(physical, CoconutEdition::ObjectsValidation);
-    input.annotation_json = root.path() / "val.json";
-    input.mask_archive = root.path() / "val.tar";
-    Json annotation{{"image_id", 11}, {"file_name", "11.png"}, {"object365_file_name", "objects365_v1_00000001"}, {"segments_info", Json::array({segment()})}};
-    Json document{{"categories", category_catalog()},
-                  {"images", Json::array({{{"id", 11}, {"file_name", "11.png"}, {"width", 1}, {"height", 1}}})},
-                  {"annotations", Json::array({annotation})}};
-    bool valid = false;
-    SECTION("canonical names and record-level thing admission") { valid = true; }
-    SECTION("mismatched mapped name") { document["categories"][0]["name"] = "car"; }
-    SECTION("missing mapped category") { document["categories"].erase(0); }
-    SECTION("duplicate mapped category") { document["categories"].push_back(document["categories"][0]); }
-    SECTION("malformed mapped category") { document["categories"][0]["id"] = "1"; }
-    SECTION("orphan validation annotation") { document["images"] = Json::array(); }
-    SECTION("two physical members join one image row") {
-        annotation["object365_file_name"] = "objects365_v1_00000002";
-        document["annotations"].push_back(annotation);
-    }
-    json_file(input.annotation_json, document);
-    const std::array<std::uint32_t, 1> ids{1};
-    const std::array<std::pair<std::string, std::string>, 1> members{{{"panoptic_o365val_v3/objects365_v1_00000001.png", png(1, 1, ids)}}};
-    tar(input.mask_archive, members);
-    if (!valid) {
-        CHECK_THROWS(import_coconut_annotations(input));
-        return;
-    }
-    const auto components = import_coconut_annotations(input);
-    REQUIRE(components.size() == 1);
-    REQUIRE(components[0].index.boxes.size() == 1);
-    CHECK(components[0].index.boxes[0].class_id == 0);
-    CHECK(components[0].index.boxes[0].source_category_id == 1);
-    CHECK(components[0].inventory[0].release_image_id == 11);
-    CHECK(components[0].index.images[0].source_image_id == 1);
+ ScopedTempDir root("coconut-semantic-joins");
+ const std::array physical{objects(1, CoconutImageNamespace::Objects365V1), objects(2, CoconutImageNamespace::Objects365V1)};
+ auto input = request(physical, CoconutEdition::ObjectsValidation);
+ input.annotation_json = root.path() / "val.json";
+ input.mask_archive = root.path() / "val.tar";
+ Json annotation{{"image_id", 11}, {"file_name", "11.png"}, {"object365_file_name", "objects365_v1_00000001"}, {"segments_info", Json::array({segment()})}};
+ Json document{{"categories", category_catalog()},
+               {"images", Json::array({{{"id", 11}, {"file_name", "11.png"}, {"width", 1}, {"height", 1}}})},
+               {"annotations", Json::array({annotation})}};
+ bool valid = false;
+ SECTION("canonical names and record-level thing admission") { valid = true; }
+ SECTION("mismatched mapped name") { document["categories"][0]["name"] = "car"; }
+ SECTION("missing mapped category") { document["categories"].erase(0); }
+ SECTION("duplicate mapped category") { document["categories"].push_back(document["categories"][0]); }
+ SECTION("malformed mapped category") { document["categories"][0]["id"] = "1"; }
+ SECTION("orphan validation annotation") { document["images"] = Json::array(); }
+ SECTION("two physical members join one image row") {
+  annotation["object365_file_name"] = "objects365_v1_00000002";
+  document["annotations"].push_back(annotation);
+ }
+ json_file(input.annotation_json, document);
+ const std::array<std::uint32_t, 1> ids{1};
+ const std::array<std::pair<std::string, std::string>, 1> members{{{"panoptic_o365val_v3/objects365_v1_00000001.png", png(1, 1, ids)}}};
+ tar(input.mask_archive, members);
+ if (!valid) {
+  CHECK_THROWS(import_coconut_annotations(input));
+  return;
+ }
+ const auto components = import_coconut_annotations(input);
+ REQUIRE(components.size() == 1);
+ REQUIRE(components[0].index.boxes.size() == 1);
+ CHECK(components[0].index.boxes[0].class_id == 0);
+ CHECK(components[0].index.boxes[0].source_category_id == 1);
+ CHECK(components[0].inventory[0].release_image_id == 11);
+ CHECK(components[0].index.images[0].source_image_id == 1);
 }
 TEST_CASE("COCONut preparatory arrays accept either order and reject duplicate arrays", "[coconut]") {
-    ScopedTempDir root("coconut-envelope-order");
-    const std::array physical{objects(1, CoconutImageNamespace::Objects365V1)};
-    auto input = request(physical, CoconutEdition::ObjectsValidation);
-    input.annotation_json = root.path() / "val.json";
-    input.mask_archive = root.path() / "val.tar";
-    const auto categories = category_catalog().dump();
-    const auto images = Json::array({{{"id", 11}, {"file_name", "11.png"}, {"width", 3}, {"height", 1}}}).dump();
-    const auto annotations = Json::array({{{"image_id", 11},
-                                           {"file_name", "11.png"},
-                                           {"object365_file_name", "objects365_v1_00000001"},
-                                           {"segments_info", Json::array({segment(1, 1), segment(2, 13), segment(3, 90)})}}})
-                                 .dump();
-    std::string document;
-    bool valid = true;
-    SECTION("categories before images") { document = "{\"categories\":" + categories + ",\"images\":" + images + ",\"annotations\":" + annotations + "}"; }
-    SECTION("annotations before images before categories") {
-        document = "{\"annotations\":" + annotations + ",\"images\":" + images + ",\"categories\":" + categories + "}";
-    }
-    SECTION("duplicate categories after images") {
-        valid = false;
-        document = "{\"categories\":" + categories + ",\"images\":" + images + ",\"categories\":" + categories + ",\"annotations\":" + annotations + "}";
-    }
-    SECTION("duplicate images after categories") {
-        valid = false;
-        document = "{\"images\":" + images + ",\"categories\":" + categories + ",\"images\":" + images + ",\"annotations\":" + annotations + "}";
-    }
-    mmltk::testsupport::write_text_file(input.annotation_json, document);
-    const std::array<std::uint32_t, 3> ids{1, 2, 3};
-    const std::array<std::pair<std::string, std::string>, 1> members{{{"panoptic_o365val_v3/objects365_v1_00000001.png", png(3, 1, ids)}}};
-    tar(input.mask_archive, members);
-    if (!valid) {
-        CHECK_THROWS(import_coconut_annotations(input));
-        return;
-    }
-    const auto components = import_coconut_annotations(input);
-    REQUIRE(components.size() == 1);
-    REQUIRE(components[0].index.boxes.size() == 3);
-    const auto& boxes = components[0].index.boxes;
-    CHECK(boxes[0].source_category_id == 1);
-    CHECK(boxes[0].class_id == 0);
-    CHECK(boxes[1].source_category_id == 13);
-    CHECK(boxes[1].class_id == 11);
-    CHECK(boxes[2].source_category_id == 90);
-    CHECK(boxes[2].class_id == 79);
-    CHECK(components[0].inventory[0].release_image_id == 11);
-    CHECK(components[0].index.images[0].source_image_id == 1);
+ ScopedTempDir root("coconut-envelope-order");
+ const std::array physical{objects(1, CoconutImageNamespace::Objects365V1)};
+ auto input = request(physical, CoconutEdition::ObjectsValidation);
+ input.annotation_json = root.path() / "val.json";
+ input.mask_archive = root.path() / "val.tar";
+ const auto categories = category_catalog().dump();
+ const auto images = Json::array({{{"id", 11}, {"file_name", "11.png"}, {"width", 3}, {"height", 1}}}).dump();
+ const auto annotations = Json::array({{{"image_id", 11},
+                                        {"file_name", "11.png"},
+                                        {"object365_file_name", "objects365_v1_00000001"},
+                                        {"segments_info", Json::array({segment(1, 1), segment(2, 13), segment(3, 90)})}}})
+                           .dump();
+ std::string document;
+ bool valid = true;
+ SECTION("categories before images") { document = "{\"categories\":" + categories + ",\"images\":" + images + ",\"annotations\":" + annotations + "}"; }
+ SECTION("annotations before images before categories") {
+  document = "{\"annotations\":" + annotations + ",\"images\":" + images + ",\"categories\":" + categories + "}";
+ }
+ SECTION("duplicate categories after images") {
+  valid = false;
+  document = "{\"categories\":" + categories + ",\"images\":" + images + ",\"categories\":" + categories + ",\"annotations\":" + annotations + "}";
+ }
+ SECTION("duplicate images after categories") {
+  valid = false;
+  document = "{\"images\":" + images + ",\"categories\":" + categories + ",\"images\":" + images + ",\"annotations\":" + annotations + "}";
+ }
+ mmltk::testsupport::write_text_file(input.annotation_json, document);
+ const std::array<std::uint32_t, 3> ids{1, 2, 3};
+ const std::array<std::pair<std::string, std::string>, 1> members{{{"panoptic_o365val_v3/objects365_v1_00000001.png", png(3, 1, ids)}}};
+ tar(input.mask_archive, members);
+ if (!valid) {
+  CHECK_THROWS(import_coconut_annotations(input));
+  return;
+ }
+ const auto components = import_coconut_annotations(input);
+ REQUIRE(components.size() == 1);
+ REQUIRE(components[0].index.boxes.size() == 3);
+ const auto& boxes = components[0].index.boxes;
+ CHECK(boxes[0].source_category_id == 1);
+ CHECK(boxes[0].class_id == 0);
+ CHECK(boxes[1].source_category_id == 13);
+ CHECK(boxes[1].class_id == 11);
+ CHECK(boxes[2].source_category_id == 90);
+ CHECK(boxes[2].class_id == 79);
+ CHECK(components[0].inventory[0].release_image_id == 11);
+ CHECK(components[0].index.images[0].source_image_id == 1);
 }
 TEST_CASE("COCONut compact inventory is deterministic and jointly admitted under corruption and cancellation", "[coconut]") {
-    ScopedTempDir root("coconut-compact-inventory");
-    const std::array physical{coco(7), coco(8)};
-    auto input = request(physical);
-    input.parquet_shards = {root.path() / "base.parquet"};
-    reversed_coco_parquet(input.parquet_shards[0]);
-    const auto first = import_coconut_annotations(input);
-    const auto rebuilt = import_coconut_annotations(input);
-    REQUIRE(first.size() == 1);
-    REQUIRE(rebuilt.size() == 1);
-    CHECK(first[0].index.annotation_sha256 == rebuilt[0].index.annotation_sha256);
-    REQUIRE(first[0].index.images.size() == 2);
-    REQUIRE(first[0].index.boxes.size() == 2);
-    CHECK(first[0].index.images[0].source_image_id == 7);
-    CHECK(first[0].index.images[1].source_image_id == 8);
-    CHECK(first[0].index.images[0].first_box == 0);
-    CHECK(first[0].index.images[1].first_box == 1);
-    CHECK(first[0].index.boxes[0].source_ordinal == 1);
-    CHECK(first[0].index.boxes[1].source_ordinal == 0);
-    CHECK(first[0].inventory[0].release_image_id == 7);
-    CHECK(first[0].inventory[1].release_image_id == 8);
-    const auto path = root.path() / "first.bin", second = root.path() / "second.bin";
-    PollCancellation baseline;
-    store_coconut_component(path, first[0], mmltk::common::concurrency::CancellationObservation::Borrow(baseline));
-    store_coconut_component(second, rebuilt[0]);
-    const auto original = file_bytes(path.string() + ".inventory");
-    CHECK(original == file_bytes(second.string() + ".inventory"));
-    CHECK(file_bytes(path) == file_bytes(second));
-    REQUIRE(original.size() > 64);
-    CHECK(original.substr(0, 8) == "CNUTIVN1");
-    const auto loaded = load_coconut_component(path, first[0].edition, first[0].source, input.input_identity);
-    REQUIRE(loaded);
-    CHECK(loaded->inventory == first[0].inventory);
-    SECTION("truncation") {
-        std::filesystem::resize_file(path.string() + ".inventory", original.size() - 1);
-        CHECK_FALSE(load_coconut_component(path, first[0].edition, first[0].source, input.input_identity));
-    }
-    SECTION("corruption") {
-        auto corrupt = original;
-        corrupt[corrupt.size() / 2] ^= 1;
-        mmltk::testsupport::write_text_file(path.string() + ".inventory", corrupt);
-        CHECK_FALSE(load_coconut_component(path, first[0].edition, first[0].source, input.input_identity));
-    }
-    SECTION("reordered inventory cannot replace an admitted index") {
-        auto reordered = first[0];
-        std::swap(reordered.inventory[0], reordered.inventory[1]);
-        CHECK_THROWS(store_coconut_component(path, reordered));
-        CHECK(file_bytes(path.string() + ".inventory") == original);
-    }
-    SECTION("every store cancellation point prevents fresh admission") {
-        for (std::size_t cut = 0; cut < baseline.polls; ++cut) {
-            const auto cancelled_path = root.path() / ("cancelled-" + std::to_string(cut) + ".bin");
-            PollCancellation stop;
-            stop.stop_at = cut;
-            CHECK_THROWS(store_coconut_component(cancelled_path, first[0], mmltk::common::concurrency::CancellationObservation::Borrow(stop)));
-            CHECK_FALSE(load_coconut_component(cancelled_path, first[0].edition, first[0].source, input.input_identity));
-        }
-    }
-    SECTION("load cancellation propagates instead of becoming a cache miss") {
-        PollCancellation observed;
-        REQUIRE(load_coconut_component(path, first[0].edition, first[0].source, input.input_identity,
-                                       mmltk::common::concurrency::CancellationObservation::Borrow(observed)));
-        for (std::size_t cut = 0; cut < observed.polls; ++cut) {
-            PollCancellation stop;
-            stop.stop_at = cut;
-            CHECK_THROWS(load_coconut_component(path, first[0].edition, first[0].source, input.input_identity,
-                                                mmltk::common::concurrency::CancellationObservation::Borrow(stop)));
-        }
-    }
+ ScopedTempDir root("coconut-compact-inventory");
+ const std::array physical{coco(7), coco(8)};
+ auto input = request(physical);
+ input.parquet_shards = {root.path() / "base.parquet"};
+ reversed_coco_parquet(input.parquet_shards[0]);
+ const auto first = import_coconut_annotations(input);
+ const auto rebuilt = import_coconut_annotations(input);
+ REQUIRE(first.size() == 1);
+ REQUIRE(rebuilt.size() == 1);
+ CHECK(first[0].index.annotation_sha256 == rebuilt[0].index.annotation_sha256);
+ REQUIRE(first[0].index.images.size() == 2);
+ REQUIRE(first[0].index.boxes.size() == 2);
+ CHECK(first[0].index.images[0].source_image_id == 7);
+ CHECK(first[0].index.images[1].source_image_id == 8);
+ CHECK(first[0].index.images[0].first_box == 0);
+ CHECK(first[0].index.images[1].first_box == 1);
+ CHECK(first[0].index.boxes[0].source_ordinal == 1);
+ CHECK(first[0].index.boxes[1].source_ordinal == 0);
+ CHECK(first[0].inventory[0].release_image_id == 7);
+ CHECK(first[0].inventory[1].release_image_id == 8);
+ const auto path = root.path() / "first.bin", second = root.path() / "second.bin";
+ PollCancellation baseline;
+ store_coconut_component(path, first[0], mmltk::common::concurrency::CancellationObservation::Borrow(baseline));
+ store_coconut_component(second, rebuilt[0]);
+ const auto original = file_bytes(path.string() + ".inventory");
+ CHECK(original == file_bytes(second.string() + ".inventory"));
+ CHECK(file_bytes(path) == file_bytes(second));
+ REQUIRE(original.size() > 64);
+ CHECK(original.substr(0, 8) == "CNUTIVN1");
+ const auto loaded = load_coconut_component(path, first[0].edition, first[0].source, input.input_identity);
+ REQUIRE(loaded);
+ CHECK(loaded->inventory == first[0].inventory);
+ SECTION("truncation") {
+  std::filesystem::resize_file(path.string() + ".inventory", original.size() - 1);
+  CHECK_FALSE(load_coconut_component(path, first[0].edition, first[0].source, input.input_identity));
+ }
+ SECTION("corruption") {
+  auto corrupt = original;
+  corrupt[corrupt.size() / 2] ^= 1;
+  mmltk::testsupport::write_text_file(path.string() + ".inventory", corrupt);
+  CHECK_FALSE(load_coconut_component(path, first[0].edition, first[0].source, input.input_identity));
+ }
+ SECTION("reordered inventory cannot replace an admitted index") {
+  auto reordered = first[0];
+  std::swap(reordered.inventory[0], reordered.inventory[1]);
+  CHECK_THROWS(store_coconut_component(path, reordered));
+  CHECK(file_bytes(path.string() + ".inventory") == original);
+ }
+ SECTION("every store cancellation point prevents fresh admission") {
+  for (std::size_t cut = 0; cut < baseline.polls; ++cut) {
+   const auto cancelled_path = root.path() / ("cancelled-" + std::to_string(cut) + ".bin");
+   PollCancellation stop;
+   stop.stop_at = cut;
+   CHECK_THROWS(store_coconut_component(cancelled_path, first[0], mmltk::common::concurrency::CancellationObservation::Borrow(stop)));
+   CHECK_FALSE(load_coconut_component(cancelled_path, first[0].edition, first[0].source, input.input_identity));
+  }
+ }
+ SECTION("load cancellation propagates instead of becoming a cache miss") {
+  PollCancellation observed;
+  REQUIRE(load_coconut_component(path, first[0].edition, first[0].source, input.input_identity,
+                                 mmltk::common::concurrency::CancellationObservation::Borrow(observed)));
+  for (std::size_t cut = 0; cut < observed.polls; ++cut) {
+   PollCancellation stop;
+   stop.stop_at = cut;
+   CHECK_THROWS(
+    load_coconut_component(path, first[0].edition, first[0].source, input.input_identity, mmltk::common::concurrency::CancellationObservation::Borrow(stop)));
+  }
+ }
 }
 TEST_CASE("COCONut cancellation after the last record covers consolidation and identity encoding", "[coconut]") {
-    ScopedTempDir root("coconut-finalization-cancel");
-    const std::array physical{coco(7), coco(8)};
-    auto input = request(physical);
-    input.parquet_shards = {root.path() / "base.parquet"};
-    reversed_coco_parquet(input.parquet_shards[0]);
-    struct FinalRecordCancellation {
-        mutable PollCancellation counter;
-        bool armed = false;
-        bool cancelled() const noexcept { return armed && counter.cancelled(); }
-    } state;
-    input.cancellation = mmltk::common::concurrency::CancellationObservation::Borrow(state);
-    input.progress = [&](std::uint64_t count) {
-        if (count == 2) state.armed = true;
-    };
-    REQUIRE(import_coconut_annotations(input).size() == 1);
-    const auto checks = state.counter.polls;
-    REQUIRE(checks > 1);
-    for (std::size_t cut = 0; cut < checks; ++cut) {
-        state.armed = false;
-        state.counter.polls = 0;
-        state.counter.stop_at = cut;
-        CHECK_THROWS(import_coconut_annotations(input));
-        CHECK(state.armed);
-    }
+ ScopedTempDir root("coconut-finalization-cancel");
+ const std::array physical{coco(7), coco(8)};
+ auto input = request(physical);
+ input.parquet_shards = {root.path() / "base.parquet"};
+ reversed_coco_parquet(input.parquet_shards[0]);
+ struct FinalRecordCancellation {
+  mutable PollCancellation counter;
+  bool armed = false;
+  bool cancelled() const noexcept { return armed && counter.cancelled(); }
+ } state;
+ input.cancellation = mmltk::common::concurrency::CancellationObservation::Borrow(state);
+ input.progress = [&](std::uint64_t count) {
+  if (count == 2) state.armed = true;
+ };
+ REQUIRE(import_coconut_annotations(input).size() == 1);
+ const auto checks = state.counter.polls;
+ REQUIRE(checks > 1);
+ for (std::size_t cut = 0; cut < checks; ++cut) {
+  state.armed = false;
+  state.counter.polls = 0;
+  state.counter.stop_at = cut;
+  CHECK_THROWS(import_coconut_annotations(input));
+  CHECK(state.armed);
+ }
 }
 namespace {
 std::string white_jpeg(int width = 3, int height = 3) {
-    const std::vector<unsigned char> pixels(static_cast<std::size_t>(width) * height * 3U, 255U);
-    std::string bytes;
-    REQUIRE(
-        stbi_write_jpg_to_func([](void* context, void* data, int size) { static_cast<std::string*>(context)->append(static_cast<const char*>(data), size); },
-                               &bytes, width, height, 3, pixels.data(), 100));
-    return bytes;
+ const std::vector<unsigned char> pixels(static_cast<std::size_t>(width) * height * 3U, 255U);
+ std::string bytes;
+ REQUIRE(stbi_write_jpg_to_func([](void* context, void* data, int size) { static_cast<std::string*>(context)->append(static_cast<const char*>(data), size); },
+                                &bytes, width, height, 3, pixels.data(), 100));
+ return bytes;
 }
 struct ServedPhysicalArchive {
-    RecipeImageArchive& source;
-    const std::filesystem::path path;
-    std::string payload;
-    mmltk::backend::data::testsupport::HttpServer server;
-    ServedPhysicalArchive(const BenchmarkCacheLayout& cache, CoconutRecipeCatalog& catalog, CoconutImageNamespace image_source, const std::string& endpoint)
-        : source(*std::ranges::find(catalog.images, image_source, &RecipeImageArchive::source)),
-          path(cache.source_downloads(benchmark_source_name(source.artifact.source)) / source.artifact.filename),
-          payload(file_bytes(path)),
-          server(payload) {
-        source.artifact.url = server.url(endpoint);
-    }
+ RecipeImageArchive& source;
+ const std::filesystem::path path;
+ std::string payload;
+ mmltk::backend::data::testsupport::HttpServer server;
+ ServedPhysicalArchive(const BenchmarkCacheLayout& cache, CoconutRecipeCatalog& catalog, CoconutImageNamespace image_source, const std::string& endpoint)
+     : source(*std::ranges::find(catalog.images, image_source, &RecipeImageArchive::source)),
+       path(cache.source_downloads(benchmark_source_name(source.artifact.source)) / source.artifact.filename),
+       payload(file_bytes(path)),
+       server(payload) {
+  source.artifact.url = server.url(endpoint);
+ }
 };
 struct LocalCoconutRecipe {
-    const std::filesystem::path output;
-    BenchmarkCacheLayout cache;
-    CoconutRecipeCatalog catalog;
-    explicit LocalCoconutRecipe(const std::filesystem::path& root, bool fully_covered = false, bool disjoint = false, bool alternate_members = false)
-        : output(root / "compiled"), cache(BenchmarkCacheLayout::create(root / "cache")) {
-        catalog.coco_validation_images = 1;
-        const auto jpeg = white_jpeg();
-        const auto physical_archive = [&](CoconutImageNamespace source, BenchmarkDatasetSource progress_source, std::string shard, std::uint16_t number,
-                                          std::vector<std::string> members) {
-            const auto id = std::string(coconut_namespace_name(source));
-            const auto path = cache.source_downloads(benchmark_source_name(progress_source)) / (id + ".tar");
-            std::vector<std::pair<std::string, std::string>> contents;
-            if (alternate_members) {
-                contents.emplace_back(".", "");
-                contents.emplace_back("./", "");
-            }
-            for (const auto& name : members) {
-                auto spelling = name;
-                if (alternate_members) {
-                    spelling.insert(spelling.find('/'), "/./");
-                    spelling = "././" + spelling;
-                }
-                contents.emplace_back(std::move(spelling), jpeg);
-            }
-            tar(path, contents);
-            catalog.images.push_back({source,
-                                      number,
-                                      std::move(shard),
-                                      {id, "http://127.0.0.1:1/" + id, path.filename().string(), std::filesystem::file_size(path), "", progress_source}});
-        };
-        physical_archive(CoconutImageNamespace::CocoTrain, BenchmarkDatasetSource::kCoco2017, "train2017", 0, {coco(7).member});
-        physical_archive(CoconutImageNamespace::CocoUnlabeled, BenchmarkDatasetSource::kCoco2017, "unlabeled2017", 0,
-                         {coco(8, CoconutImageNamespace::CocoUnlabeled).member});
-        physical_archive(CoconutImageNamespace::CocoValidation, BenchmarkDatasetSource::kCoco2017, "val2017", 0,
-                         {coco(9, CoconutImageNamespace::CocoValidation).member});
-        physical_archive(CoconutImageNamespace::Objects365V2, BenchmarkDatasetSource::kObjects365V2, "patch-32", 32, {objects(1).member, objects(2).member});
-        physical_archive(CoconutImageNamespace::Objects365V1, BenchmarkDatasetSource::kObjects365V1, "validation", 0,
-                         {objects(1, CoconutImageNamespace::Objects365V1).member});
-        const std::array<std::uint32_t, 9> support{1, 1, 1, 1, 2, 1, 1, 0, 1}, empty{};
-        auto first = segment();
-        first["iscrowd"] = 1;
-        auto second = segment(2, 2);
-        second["area"] = 17;
-        const auto mask = png(3, 3, support);
-        const auto release = [&](CoconutEdition edition, std::string_view name, std::uint64_t count) -> CoconutReleaseComponent& {
-            catalog.releases.push_back({edition, name, "local-release-v1", count, {}});
-            return catalog.releases.back();
-        };
-        const auto annotation = [&](CoconutReleaseComponent& component, std::string filename, auto write) {
-            const auto path = cache.source_downloads("coconut-" + std::string(component.name)) / filename;
-            write(path);
-            component.annotations.push_back({std::string(component.name) + "-" + filename, "http://127.0.0.1:1/" + filename, filename,
-                                             std::filesystem::file_size(path), "", BenchmarkDatasetSource::kCoconut});
-        };
-        auto& base = release(CoconutEdition::Base, "fixture-base", 2);
-        annotation(base, "base.parquet", [&](const auto& path) {
-            parquet_file(path, Json::array({hf_row(7, mask, Json::array({first, second})), hf_row(8, png(3, 3, empty), Json::array())}));
-        });
-        auto& validation = release(CoconutEdition::RelabeledValidation, "fixture-val", 1);
-        annotation(validation, "val.parquet", [&](const auto& path) { parquet_file(path, Json::array({hf_row(9, mask, Json::array({first, second}))})); });
-        auto& large = release(CoconutEdition::Large, "fixture-large", 1);
-        annotation(large, "large.json", [&](const auto& path) {
-            json_file(path, {{"images", Json::array({{{"id", 601}, {"file_name", "601.jpg"}, {"width", 3}, {"height", 3}}})},
-                             {"annotations", Json::array({{{"image_id", 601},
-                                                           {"file_name", "601.png"},
-                                                           {"object365_file_name", "objects365_v2_00000001"},
-                                                           {"segments_info", Json::array({first, second})}}})}});
-        });
-        annotation(large, "large.tar", [&](const auto& path) {
-            const std::array<std::pair<std::string, std::string>, 1> rows{{{"panoptic_object365/objects365_v2_00000001.png", mask}}};
-            tar(path, rows);
-        });
-        auto& xl = release(CoconutEdition::XLarge, "fixture-xl", fully_covered || disjoint ? 1 : 2);
-        annotation(xl, "xl.tar", [&](const auto& path) {
-            std::vector<std::pair<std::string, std::string>> rows;
-            for (auto id : fully_covered ? std::vector<unsigned>{1} : disjoint ? std::vector<unsigned>{2} : std::vector<unsigned>{1, 2}) {
-                const auto stem = "objects365_v2_0000000" + std::to_string(id);
-                rows.emplace_back("coconuts_xlarge/panseg/" + stem + ".png", mask);
-                rows.emplace_back("coconuts_xlarge/panseg_info/" + stem + ".json", Json::array({first, second}).dump());
-            }
-            tar(path, rows);
-        });
-        auto& objects_val = release(CoconutEdition::ObjectsValidation, "fixture-objects-val", 1);
-        annotation(objects_val, "objects.json", [&](const auto& path) {
-            json_file(path, {{"images", Json::array({{{"id", 600001}, {"file_name", "600001.jpg"}, {"width", 3}, {"height", 3}}})},
-                             {"annotations", Json::array({{{"image_id", 600001},
-                                                           {"file_name", "600001.png"},
-                                                           {"object365_file_name", "objects365_v1_00000001"},
-                                                           {"segments_info", Json::array({first, second})}}})}});
-        });
-        annotation(objects_val, "objects.tar", [&](const auto& path) {
-            const std::array<std::pair<std::string, std::string>, 1> rows{{{"panoptic_o365val_v3/objects365_v1_00000001.png", mask}}};
-            tar(path, rows);
-        });
-        Json stock{{"images", Json::array({{{"id", 9}, {"file_name", "000000000009.jpg"}, {"width", 3}, {"height", 3}}})},
-                   {"annotations",
-                    Json::array({{{"id", 900}, {"image_id", 9}, {"category_id", 3}, {"bbox", Json::array({0, 0, 3, 3})}, {"area", 9}, {"iscrowd", 0}}})},
-                   {"categories", category_catalog()}};
-        const auto stock_path = cache.source_downloads("coco") / "stock.tar";
-        const std::array<std::pair<std::string, std::string>, 1> stock_members{{{"annotations/instances_val2017.json", stock.dump()}}};
-        tar(stock_path, stock_members);
-        catalog.stock_annotations = {
-            "fixture-stock", "http://127.0.0.1:1/stock", "stock.tar", std::filesystem::file_size(stock_path), "", BenchmarkDatasetSource::kCoco2017};
+ const std::filesystem::path output;
+ BenchmarkCacheLayout cache;
+ CoconutRecipeCatalog catalog;
+ explicit LocalCoconutRecipe(const std::filesystem::path& root, bool fully_covered = false, bool disjoint = false, bool alternate_members = false)
+     : output(root / "compiled"), cache(BenchmarkCacheLayout::create(root / "cache")) {
+  catalog.coco_validation_images = 1;
+  const auto jpeg = white_jpeg();
+  const auto physical_archive = [&](CoconutImageNamespace source, BenchmarkDatasetSource progress_source, std::string shard, std::uint16_t number,
+                                    std::vector<std::string> members) {
+   const auto id = std::string(coconut_namespace_name(source));
+   const auto path = cache.source_downloads(benchmark_source_name(progress_source)) / (id + ".tar");
+   std::vector<std::pair<std::string, std::string>> contents;
+   if (alternate_members) {
+    contents.emplace_back(".", "");
+    contents.emplace_back("./", "");
+   }
+   for (const auto& name : members) {
+    auto spelling = name;
+    if (alternate_members) {
+     spelling.insert(spelling.find('/'), "/./");
+     spelling = "././" + spelling;
     }
-    BenchmarkCompilerConfig compiler_config(BenchmarkDatasetSelection selection = {}, bool overwrite = false) const {
-        BenchmarkCompilerConfig config;
-        config.output_dir = output;
-        config.cache_dir = cache.root;
-        config.resolution = 3;
-        config.num_workers = 1;
-        config.overwrite = overwrite;
-        config.selection = selection;
-        return config;
-    }
-    CoconutRecipeCatalog selected(CoconutValidation choice) const {
-        auto result = catalog;
-        std::erase_if(result.releases, [&](const auto& release) {
-            return (release.edition == CoconutEdition::RelabeledValidation && choice == CoconutValidation::Stock) ||
-                   (release.edition == CoconutEdition::ObjectsValidation && choice != CoconutValidation::Coconut);
-        });
-        if (choice != CoconutValidation::Coconut)
-            std::erase_if(result.images, [](const auto& image) { return image.source == CoconutImageNamespace::Objects365V1; });
-        return result;
-    }
+    contents.emplace_back(std::move(spelling), jpeg);
+   }
+   tar(path, contents);
+   catalog.images.push_back(
+    {source, number, std::move(shard), {id, "http://127.0.0.1:1/" + id, path.filename().string(), std::filesystem::file_size(path), "", progress_source}});
+  };
+  physical_archive(CoconutImageNamespace::CocoTrain, BenchmarkDatasetSource::kCoco2017, "train2017", 0, {coco(7).member});
+  physical_archive(CoconutImageNamespace::CocoUnlabeled, BenchmarkDatasetSource::kCoco2017, "unlabeled2017", 0,
+                   {coco(8, CoconutImageNamespace::CocoUnlabeled).member});
+  physical_archive(CoconutImageNamespace::CocoValidation, BenchmarkDatasetSource::kCoco2017, "val2017", 0,
+                   {coco(9, CoconutImageNamespace::CocoValidation).member});
+  physical_archive(CoconutImageNamespace::Objects365V2, BenchmarkDatasetSource::kObjects365V2, "patch-32", 32, {objects(1).member, objects(2).member});
+  physical_archive(CoconutImageNamespace::Objects365V1, BenchmarkDatasetSource::kObjects365V1, "validation", 0,
+                   {objects(1, CoconutImageNamespace::Objects365V1).member});
+  const std::array<std::uint32_t, 9> support{1, 1, 1, 1, 2, 1, 1, 0, 1}, empty{};
+  auto first = segment();
+  first["iscrowd"] = 1;
+  auto second = segment(2, 2);
+  second["area"] = 17;
+  const auto mask = png(3, 3, support);
+  const auto release = [&](CoconutEdition edition, std::string_view name, std::uint64_t count) -> CoconutReleaseComponent& {
+   catalog.releases.push_back({edition, name, "local-release-v1", count, {}});
+   return catalog.releases.back();
+  };
+  const auto annotation = [&](CoconutReleaseComponent& component, std::string filename, auto write) {
+   const auto path = cache.source_downloads("coconut-" + std::string(component.name)) / filename;
+   write(path);
+   component.annotations.push_back({std::string(component.name) + "-" + filename, "http://127.0.0.1:1/" + filename, filename, std::filesystem::file_size(path),
+                                    "", BenchmarkDatasetSource::kCoconut});
+  };
+  auto& base = release(CoconutEdition::Base, "fixture-base", 2);
+  annotation(base, "base.parquet", [&](const auto& path) {
+   parquet_file(path, Json::array({hf_row(7, mask, Json::array({first, second})), hf_row(8, png(3, 3, empty), Json::array())}));
+  });
+  auto& validation = release(CoconutEdition::RelabeledValidation, "fixture-val", 1);
+  annotation(validation, "val.parquet", [&](const auto& path) { parquet_file(path, Json::array({hf_row(9, mask, Json::array({first, second}))})); });
+  auto& large = release(CoconutEdition::Large, "fixture-large", 1);
+  annotation(large, "large.json", [&](const auto& path) {
+   json_file(
+    path,
+    {{"images", Json::array({{{"id", 601}, {"file_name", "601.jpg"}, {"width", 3}, {"height", 3}}})},
+     {"annotations",
+      Json::array(
+       {{{"image_id", 601}, {"file_name", "601.png"}, {"object365_file_name", "objects365_v2_00000001"}, {"segments_info", Json::array({first, second})}}})}});
+  });
+  annotation(large, "large.tar", [&](const auto& path) {
+   const std::array<std::pair<std::string, std::string>, 1> rows{{{"panoptic_object365/objects365_v2_00000001.png", mask}}};
+   tar(path, rows);
+  });
+  auto& xl = release(CoconutEdition::XLarge, "fixture-xl", fully_covered || disjoint ? 1 : 2);
+  annotation(xl, "xl.tar", [&](const auto& path) {
+   std::vector<std::pair<std::string, std::string>> rows;
+   for (auto id : fully_covered ? std::vector<unsigned>{1} : disjoint ? std::vector<unsigned>{2} : std::vector<unsigned>{1, 2}) {
+    const auto stem = "objects365_v2_0000000" + std::to_string(id);
+    rows.emplace_back("coconuts_xlarge/panseg/" + stem + ".png", mask);
+    rows.emplace_back("coconuts_xlarge/panseg_info/" + stem + ".json", Json::array({first, second}).dump());
+   }
+   tar(path, rows);
+  });
+  auto& objects_val = release(CoconutEdition::ObjectsValidation, "fixture-objects-val", 1);
+  annotation(objects_val, "objects.json", [&](const auto& path) {
+   json_file(path, {{"images", Json::array({{{"id", 600001}, {"file_name", "600001.jpg"}, {"width", 3}, {"height", 3}}})},
+                    {"annotations", Json::array({{{"image_id", 600001},
+                                                  {"file_name", "600001.png"},
+                                                  {"object365_file_name", "objects365_v1_00000001"},
+                                                  {"segments_info", Json::array({first, second})}}})}});
+  });
+  annotation(objects_val, "objects.tar", [&](const auto& path) {
+   const std::array<std::pair<std::string, std::string>, 1> rows{{{"panoptic_o365val_v3/objects365_v1_00000001.png", mask}}};
+   tar(path, rows);
+  });
+  Json stock{
+   {"images", Json::array({{{"id", 9}, {"file_name", "000000000009.jpg"}, {"width", 3}, {"height", 3}}})},
+   {"annotations", Json::array({{{"id", 900}, {"image_id", 9}, {"category_id", 3}, {"bbox", Json::array({0, 0, 3, 3})}, {"area", 9}, {"iscrowd", 0}}})},
+   {"categories", category_catalog()}};
+  const auto stock_path = cache.source_downloads("coco") / "stock.tar";
+  const std::array<std::pair<std::string, std::string>, 1> stock_members{{{"annotations/instances_val2017.json", stock.dump()}}};
+  tar(stock_path, stock_members);
+  catalog.stock_annotations = {
+   "fixture-stock", "http://127.0.0.1:1/stock", "stock.tar", std::filesystem::file_size(stock_path), "", BenchmarkDatasetSource::kCoco2017};
+ }
+ BenchmarkCompilerConfig compiler_config(BenchmarkDatasetSelection selection = {}, bool overwrite = false) const {
+  BenchmarkCompilerConfig config;
+  config.output_dir = output;
+  config.cache_dir = cache.root;
+  config.resolution = 3;
+  config.num_workers = 1;
+  config.overwrite = overwrite;
+  config.selection = selection;
+  return config;
+ }
+ CoconutRecipeCatalog selected(CoconutValidation choice) const {
+  auto result = catalog;
+  std::erase_if(result.releases, [&](const auto& release) {
+   return (release.edition == CoconutEdition::RelabeledValidation && choice == CoconutValidation::Stock) ||
+          (release.edition == CoconutEdition::ObjectsValidation && choice != CoconutValidation::Coconut);
+  });
+  if (choice != CoconutValidation::Coconut) std::erase_if(result.images, [](const auto& image) { return image.source == CoconutImageNamespace::Objects365V1; });
+  return result;
+ }
 };
 }  // namespace
 TEST_CASE("COCONut private catalog compiles all validation choices through the production transaction", "[coconut][benchmark]") {
-    ScopedTempDir root("coconut-recipe");
-    bool alternate_members = false;
-    bool mismatched_geometry = false;
-    bool letterbox = false;
-    SECTION("canonical physical members") {}
-    SECTION("equivalent physical members and archive roots") { alternate_members = true; }
-    SECTION("mismatched mask geometry drops objects and retains original images") { mismatched_geometry = true; }
-    SECTION("mismatched mask geometry preserves physical image letterboxing") {
-        mismatched_geometry = true;
-        letterbox = true;
-    }
-    LocalCoconutRecipe local(root.path(), false, false, alternate_members);
-    if (mismatched_geometry) {
-        auto& physical = *std::ranges::find(local.catalog.images, CoconutImageNamespace::Objects365V2, &RecipeImageArchive::source);
-        const auto archive = local.cache.source_downloads("objects365") / physical.artifact.filename;
-        const auto pixels = white_jpeg(6, 4);
-        const std::array<std::pair<std::string, std::string>, 2> members{{{objects(1).member, pixels}, {objects(2).member, pixels}}};
-        tar(archive, members);
-        physical.artifact.expected_size = std::filesystem::file_size(archive);
-    }
-    auto config = local.compiler_config({BenchmarkDatasetVariant::Coconut, CoconutValidation::Coconut}, true);
-    if (letterbox) config.resize_mode = mmltk::backend::imaging::resample::ImageResizeMode::Letterbox;
-    std::uint64_t dropped_instances = 0;
-    config.progress = [&](const BenchmarkCompileProgress& update) { dropped_instances = update.dropped_instances; };
-    std::string original_train;
-    std::filesystem::file_time_type jpeg_time;
-    ino_t jpeg_inode = 0;
-    const auto jpeg_path = cached_image_path(local.cache.source_images("coco") / "train2017", 7);
-    std::string enhanced_identity;
-    int rebuild = 0;
-    for (const auto choice : {CoconutValidation::Coconut, CoconutValidation::Stock, CoconutValidation::CoconutStock, CoconutValidation::Coconut}) {
-        config.selection.validation = choice;
-        config.num_workers = 1 + (rebuild++ % 2);
-        const auto catalog = local.selected(choice);
-        compile_benchmark_recipe(config, &catalog);
-        const auto train = CompiledDataset::open(config.output_dir / "train.bin");
-        const auto val = CompiledDataset::open(config.output_dir / "val.bin");
-        REQUIRE(train.image_entries().size() == 4);
-        const std::array<std::uint64_t, 4> expected{7, 8, 1, 2};
-        for (std::uint32_t i = 0; i < expected.size(); ++i) CHECK(train.image_entry(i).source_image_id == expected[i]);
-        CHECK(train.image_entry(0).source == AnnotationSource::CoconutCoco);
-        CHECK(train.image_entry(2).source == AnnotationSource::CoconutObjects365V2);
-        if (mismatched_geometry) {
-            for (const auto row : {2U, 3U}) {
-                CHECK(train.image_labels(row).empty());
-                CHECK(train.image_entry(row).original_width == 6U);
-                CHECK(train.image_entry(row).original_height == 4U);
-                for (std::size_t pixel = 0; pixel < 27; ++pixel)
-                    CHECK(train.image_pixels(row)[pixel] == (letterbox && pixel % 9U >= 6U ? 0.0F : 1.0F));
-            }
-            std::ifstream report(local.cache.root / "failed.txt");
-            std::size_t failures = 0;
-            for (std::string line; std::getline(report, line); ++failures) {
-                const auto failed = Json::parse(line);
-                CHECK((failed["image_id"] == 1U || failed["image_id"] == 2U));
-                CHECK((failed["object_id"] == 1U || failed["object_id"] == 2U));
-                CHECK(failed["reason"] == "annotation dimensions 3x3 do not match image dimensions 6x4");
-                CHECK(failed["image"] == objects(failed["image_id"].get<unsigned>()).member);
-            }
-            CHECK(failures == 4U * static_cast<unsigned>(rebuild));
-        }
-        CHECK(dropped_instances == (mismatched_geometry ? 4U : 0U));
-        CHECK(train.image_labels(1).empty());
-        REQUIRE(train.image_labels(0).size() == 2);
-        CHECK(train.image_labels(0)[0].is_crowd());
-        CHECK(train.image_labels(0)[0].original_area == 7);
-        CHECK(train.image_labels(0)[1].original_area == 17);
-        CHECK(train.image_labels(0)[1].source_category_id == 2);
-        CHECK(train.image_labels(0)[0].source_ordinal == 0);
-        CHECK(train.image_labels(0)[1].source_ordinal == 1);
-        const auto runs = train.instance_rle(train.image_labels(0)[0]);
-        REQUIRE(runs.size() == 3);
-        CHECK(runs[0].start == 0);
-        CHECK(runs[0].length == 4);
-        CHECK(runs[1].start == 5);
-        CHECK(runs[1].length == 2);
-        CHECK(runs[2].start == 8);
-        CHECK(runs[2].length == 1);
-        for (std::size_t i = 0; i < 27; ++i) CHECK(train.image_pixels(0)[i] == 1.0F);
-        REQUIRE(train.class_names().size() == 80);
-        CHECK(train.class_names()[0] == "person");
-        CHECK(train.class_names()[79] == "toothbrush");
-        CHECK(val.image_entries().size() == (choice == CoconutValidation::Coconut ? 2 : 1));
-        CHECK(val.image_entry(0).source_image_id == 9);
-        CHECK(val.image_entry(0).source == (choice == CoconutValidation::Stock ? AnnotationSource::Coco : AnnotationSource::CoconutCoco));
-        CHECK(val.image_labels(0).size() == (choice == CoconutValidation::Stock ? 1 : 2));
-        if (choice == CoconutValidation::Coconut) {
-            CHECK(val.image_entry(1).source_image_id == 1);
-            CHECK(val.image_entry(1).source == AnnotationSource::CoconutObjects365V1);
-        }
-        const auto manifest = read_json_file(config.output_dir / "benchmark_manifest.json");
-        CHECK_FALSE(manifest.contains("supplemental_sampling"));
-        CHECK_FALSE(manifest["mappings"].contains("objects365"));
-        CHECK(manifest["recipe"]["duplicate_xl_images"] == 1);
-        CHECK(manifest["train"]["images"] == 4);
-        struct stat status{};
-        REQUIRE(::stat(jpeg_path.c_str(), &status) == 0);
-        if (original_train.empty()) {
-            original_train = file_bytes(config.output_dir / "train.bin");
-            jpeg_time = std::filesystem::last_write_time(jpeg_path);
-            jpeg_inode = status.st_ino;
-        } else {
-            CHECK(file_bytes(config.output_dir / "train.bin") == original_train);
-            CHECK(std::filesystem::last_write_time(jpeg_path) == jpeg_time);
-            CHECK(status.st_ino == jpeg_inode);
-        }
-        if (choice != CoconutValidation::Stock) {
-            const auto path = local.cache.source_indexes("coconut-fixture-val") / "coco-val2017.normalized.bin";
-            const auto identity = read_json_file(path.string() + ".complete.json")["identity"].get<std::string>();
-            if (enhanced_identity.empty())
-                enhanced_identity = identity;
-            else
-                CHECK(identity == enhanced_identity);
-        }
-    }
-    // A same-size damaged cached JPEG retains the proof fast path until the
-    // writer requests repair, exercising the second production parser caller.
-    const auto validation_bytes = file_bytes(config.output_dir / "val.bin");
-    mmltk::testsupport::write_text_file(jpeg_path, std::string(std::filesystem::file_size(jpeg_path), 'x'));
-    const auto repair_catalog = local.selected(config.selection.validation);
-    unsigned replacement_downloads = 0;
-    config.trace = [&](std::string_view event, std::string_view) {
-        if (event == "benchmark.download.complete") ++replacement_downloads;
-    };
-    compile_benchmark_recipe(config, &repair_catalog);
-    CHECK(replacement_downloads == 0);
-    CHECK(file_bytes(config.output_dir / "train.bin") == original_train);
-    CHECK(file_bytes(config.output_dir / "val.bin") == validation_bytes);
-    const auto published = file_bytes(config.output_dir / "train.bin");
-    std::atomic<bool> cancel{false};
-    config.cancel_requested = mmltk::common::concurrency::CancellationObservation::Atomic(cancel);
-    config.progress = [&](const BenchmarkCompileProgress& value) {
-        if (value.phase == DatasetCompilePhase::Publishing) cancel.store(true);
-    };
-    const auto catalog = local.selected(CoconutValidation::Coconut);
-    CHECK_THROWS(compile_benchmark_recipe(config, &catalog));
-    CHECK(file_bytes(config.output_dir / "train.bin") == published);
+ ScopedTempDir root("coconut-recipe");
+ bool alternate_members = false;
+ bool mismatched_geometry = false;
+ bool letterbox = false;
+ SECTION("canonical physical members") {}
+ SECTION("equivalent physical members and archive roots") { alternate_members = true; }
+ SECTION("mismatched mask geometry drops objects and retains original images") { mismatched_geometry = true; }
+ SECTION("mismatched mask geometry preserves physical image letterboxing") {
+  mismatched_geometry = true;
+  letterbox = true;
+ }
+ LocalCoconutRecipe local(root.path(), false, false, alternate_members);
+ if (mismatched_geometry) {
+  auto& physical = *std::ranges::find(local.catalog.images, CoconutImageNamespace::Objects365V2, &RecipeImageArchive::source);
+  const auto archive = local.cache.source_downloads("objects365") / physical.artifact.filename;
+  const auto pixels = white_jpeg(6, 4);
+  const std::array<std::pair<std::string, std::string>, 2> members{{{objects(1).member, pixels}, {objects(2).member, pixels}}};
+  tar(archive, members);
+  physical.artifact.expected_size = std::filesystem::file_size(archive);
+ }
+ auto config = local.compiler_config({BenchmarkDatasetVariant::Coconut, CoconutValidation::Coconut}, true);
+ if (letterbox) config.resize_mode = mmltk::backend::imaging::resample::ImageResizeMode::Letterbox;
+ std::uint64_t dropped_instances = 0;
+ config.progress = [&](const BenchmarkCompileProgress& update) { dropped_instances = update.dropped_instances; };
+ std::string original_train;
+ std::filesystem::file_time_type jpeg_time;
+ ino_t jpeg_inode = 0;
+ const auto jpeg_path = cached_image_path(local.cache.source_images("coco") / "train2017", 7);
+ std::string enhanced_identity;
+ int rebuild = 0;
+ for (const auto choice : {CoconutValidation::Coconut, CoconutValidation::Stock, CoconutValidation::CoconutStock, CoconutValidation::Coconut}) {
+  config.selection.validation = choice;
+  config.num_workers = 1 + (rebuild++ % 2);
+  const auto catalog = local.selected(choice);
+  compile_benchmark_recipe(config, &catalog);
+  const auto train = CompiledDataset::open(config.output_dir / "train.bin");
+  const auto val = CompiledDataset::open(config.output_dir / "val.bin");
+  REQUIRE(train.image_entries().size() == 4);
+  const std::array<std::uint64_t, 4> expected{7, 8, 1, 2};
+  for (std::uint32_t i = 0; i < expected.size(); ++i) CHECK(train.image_entry(i).source_image_id == expected[i]);
+  CHECK(train.image_entry(0).source == AnnotationSource::CoconutCoco);
+  CHECK(train.image_entry(2).source == AnnotationSource::CoconutObjects365V2);
+  if (mismatched_geometry) {
+   for (const auto row : {2U, 3U}) {
+    CHECK(train.image_labels(row).empty());
+    CHECK(train.image_entry(row).original_width == 6U);
+    CHECK(train.image_entry(row).original_height == 4U);
+    for (std::size_t pixel = 0; pixel < 27; ++pixel) CHECK(train.image_pixels(row)[pixel] == (letterbox && pixel % 9U >= 6U ? 0.0F : 1.0F));
+   }
+   std::ifstream report(local.cache.root / "failed.txt");
+   std::size_t failures = 0;
+   for (std::string line; std::getline(report, line); ++failures) {
+    const auto failed = Json::parse(line);
+    CHECK((failed["image_id"] == 1U || failed["image_id"] == 2U));
+    CHECK((failed["object_id"] == 1U || failed["object_id"] == 2U));
+    CHECK(failed["reason"] == "annotation dimensions 3x3 do not match image dimensions 6x4");
+    CHECK(failed["image"] == objects(failed["image_id"].get<unsigned>()).member);
+   }
+   CHECK(failures == 4U * static_cast<unsigned>(rebuild));
+  }
+  CHECK(dropped_instances == (mismatched_geometry ? 4U : 0U));
+  CHECK(train.image_labels(1).empty());
+  REQUIRE(train.image_labels(0).size() == 2);
+  CHECK(train.image_labels(0)[0].is_crowd());
+  CHECK(train.image_labels(0)[0].original_area == 7);
+  CHECK(train.image_labels(0)[1].original_area == 17);
+  CHECK(train.image_labels(0)[1].source_category_id == 2);
+  CHECK(train.image_labels(0)[0].source_ordinal == 0);
+  CHECK(train.image_labels(0)[1].source_ordinal == 1);
+  const auto runs = train.instance_rle(train.image_labels(0)[0]);
+  REQUIRE(runs.size() == 3);
+  CHECK(runs[0].start == 0);
+  CHECK(runs[0].length == 4);
+  CHECK(runs[1].start == 5);
+  CHECK(runs[1].length == 2);
+  CHECK(runs[2].start == 8);
+  CHECK(runs[2].length == 1);
+  for (std::size_t i = 0; i < 27; ++i) CHECK(train.image_pixels(0)[i] == 1.0F);
+  REQUIRE(train.class_names().size() == 80);
+  CHECK(train.class_names()[0] == "person");
+  CHECK(train.class_names()[79] == "toothbrush");
+  CHECK(val.image_entries().size() == (choice == CoconutValidation::Coconut ? 2 : 1));
+  CHECK(val.image_entry(0).source_image_id == 9);
+  CHECK(val.image_entry(0).source == (choice == CoconutValidation::Stock ? AnnotationSource::Coco : AnnotationSource::CoconutCoco));
+  CHECK(val.image_labels(0).size() == (choice == CoconutValidation::Stock ? 1 : 2));
+  if (choice == CoconutValidation::Coconut) {
+   CHECK(val.image_entry(1).source_image_id == 1);
+   CHECK(val.image_entry(1).source == AnnotationSource::CoconutObjects365V1);
+  }
+  const auto manifest = read_json_file(config.output_dir / "benchmark_manifest.json");
+  CHECK_FALSE(manifest.contains("supplemental_sampling"));
+  CHECK_FALSE(manifest["mappings"].contains("objects365"));
+  CHECK(manifest["recipe"]["duplicate_xl_images"] == 1);
+  CHECK(manifest["train"]["images"] == 4);
+  struct stat status{};
+  REQUIRE(::stat(jpeg_path.c_str(), &status) == 0);
+  if (original_train.empty()) {
+   original_train = file_bytes(config.output_dir / "train.bin");
+   jpeg_time = std::filesystem::last_write_time(jpeg_path);
+   jpeg_inode = status.st_ino;
+  } else {
+   CHECK(file_bytes(config.output_dir / "train.bin") == original_train);
+   CHECK(std::filesystem::last_write_time(jpeg_path) == jpeg_time);
+   CHECK(status.st_ino == jpeg_inode);
+  }
+  if (choice != CoconutValidation::Stock) {
+   const auto path = local.cache.source_indexes("coconut-fixture-val") / "coco-val2017.normalized.bin";
+   const auto identity = read_json_file(path.string() + ".complete.json")["identity"].get<std::string>();
+   if (enhanced_identity.empty())
+    enhanced_identity = identity;
+   else
+    CHECK(identity == enhanced_identity);
+  }
+ }
+ // A same-size damaged cached JPEG retains the proof fast path until the
+ // writer requests repair, exercising the second production parser caller.
+ const auto validation_bytes = file_bytes(config.output_dir / "val.bin");
+ mmltk::testsupport::write_text_file(jpeg_path, std::string(std::filesystem::file_size(jpeg_path), 'x'));
+ const auto repair_catalog = local.selected(config.selection.validation);
+ unsigned replacement_downloads = 0;
+ config.trace = [&](std::string_view event, std::string_view) {
+  if (event == "benchmark.download.complete") ++replacement_downloads;
+ };
+ compile_benchmark_recipe(config, &repair_catalog);
+ CHECK(replacement_downloads == 0);
+ CHECK(file_bytes(config.output_dir / "train.bin") == original_train);
+ CHECK(file_bytes(config.output_dir / "val.bin") == validation_bytes);
+ const auto published = file_bytes(config.output_dir / "train.bin");
+ std::atomic<bool> cancel{false};
+ config.cancel_requested = mmltk::common::concurrency::CancellationObservation::Atomic(cancel);
+ config.progress = [&](const BenchmarkCompileProgress& value) {
+  if (value.phase == DatasetCompilePhase::Publishing) cancel.store(true);
+ };
+ const auto catalog = local.selected(CoconutValidation::Coconut);
+ CHECK_THROWS(compile_benchmark_recipe(config, &catalog));
+ CHECK(file_bytes(config.output_dir / "train.bin") == published);
 }
 TEST_CASE("COCONut fully covered XL keeps Large rows and rebuilds without an empty index", "[coconut][benchmark]") {
-    ScopedTempDir root("coconut-covered");
-    LocalCoconutRecipe local(root.path(), true);
-    auto config = local.compiler_config({BenchmarkDatasetVariant::Coconut, CoconutValidation::Coconut}, true);
-    const auto catalog = local.selected(CoconutValidation::Coconut);
-    compile_benchmark_recipe(config, &catalog);
-    CHECK(CompiledDataset::open(config.output_dir / "train.bin").image_entries().size() == 3);
-    const auto previous = file_bytes(config.output_dir / "train.bin");
-    compile_benchmark_recipe(config, &catalog);
-    CHECK(file_bytes(config.output_dir / "train.bin") == previous);
-    const auto recipe = read_json_file(config.output_dir / "benchmark_manifest.json")["recipe"];
-    CHECK(recipe["duplicate_xl_images"] == 1);
-    const auto xl = std::ranges::find_if(recipe["components"], [](const auto& component) { return component["edition"] == CoconutEdition::XLarge; });
-    REQUIRE(xl != recipe["components"].end());
-    CHECK((*xl)["admitted_images"] == 0);
-    CHECK((*xl)["covered_by_large_images"] == 1);
-    CHECK((*xl)["selected_annotation_sha256"].is_null());
+ ScopedTempDir root("coconut-covered");
+ LocalCoconutRecipe local(root.path(), true);
+ auto config = local.compiler_config({BenchmarkDatasetVariant::Coconut, CoconutValidation::Coconut}, true);
+ const auto catalog = local.selected(CoconutValidation::Coconut);
+ compile_benchmark_recipe(config, &catalog);
+ CHECK(CompiledDataset::open(config.output_dir / "train.bin").image_entries().size() == 3);
+ const auto previous = file_bytes(config.output_dir / "train.bin");
+ compile_benchmark_recipe(config, &catalog);
+ CHECK(file_bytes(config.output_dir / "train.bin") == previous);
+ const auto recipe = read_json_file(config.output_dir / "benchmark_manifest.json")["recipe"];
+ CHECK(recipe["duplicate_xl_images"] == 1);
+ const auto xl = std::ranges::find_if(recipe["components"], [](const auto& component) { return component["edition"] == CoconutEdition::XLarge; });
+ REQUIRE(xl != recipe["components"].end());
+ CHECK((*xl)["admitted_images"] == 0);
+ CHECK((*xl)["covered_by_large_images"] == 1);
+ CHECK((*xl)["selected_annotation_sha256"].is_null());
 }
 TEST_CASE("shared root repair invalidates all proofs and preserves valid JPEG allocations", "[coconut][benchmark][cache]") {
-    ScopedTempDir root("coconut-shared-repair");
-    LocalCoconutRecipe local(root.path());
-    auto config = local.compiler_config({BenchmarkDatasetVariant::Coconut, CoconutValidation::Coconut}, true);
-    const auto catalog = local.selected(CoconutValidation::Coconut);
-    compile_benchmark_recipe(config, &catalog);
-    const auto images = local.cache.source_images("objects365") / "patch-32";
-    const std::array<std::uint64_t, 2> ids{1, 2};
-    const auto proof = images / ".recipe-proofs" / ("coconut-0-" + cached_image_selection_digest(ids) + ".json");
-    REQUIRE(std::filesystem::exists(proof));
-    const auto original = read_json_file(proof);
-    {
-        auto lease = ArtifactLease::acquire(local.cache.locks / "objects365-patch-32.images.lock", {});
-        complete_cached_image_group(images, images / ".complete.json", original["identity"].get<std::string>(), ids,
-                                    original["image_bytes"].get<std::uint64_t>(), {});
-        std::filesystem::remove(cached_image_path(images, 2));
-    }
-    struct stat before{}, after{};
-    REQUIRE(::stat(cached_image_path(images, 1).c_str(), &before) == 0);
-    const auto time = std::filesystem::last_write_time(cached_image_path(images, 1));
-    compile_benchmark_recipe(config, &catalog);
-    REQUIRE(std::filesystem::exists(cached_image_path(images, 2)));
-    CHECK_FALSE(std::filesystem::exists(images / ".complete.json"));
-    REQUIRE(::stat(cached_image_path(images, 1).c_str(), &after) == 0);
-    CHECK(before.st_ino == after.st_ino);
-    CHECK(std::filesystem::last_write_time(cached_image_path(images, 1)) == time);
-    {
-        auto lease = ArtifactLease::acquire(local.cache.locks / "objects365-patch-32.images.lock", {});
-        // A custom extraction discovers invalid bytes during its ordinary cache scan.
-        mmltk::testsupport::write_text_file(cached_image_path(images, 2), "bad JPEG");
-        const auto archive = std::ranges::find(catalog.images, CoconutImageNamespace::Objects365V2, &RecipeImageArchive::source);
-        REQUIRE(archive != catalog.images.end());
-        const auto extracted = extract_selected_archive_images({.archive_path = local.cache.source_downloads("objects365") / archive->artifact.filename,
-                                                                .source_identity = original["identity"].get<std::string>(),
-                                                                .output_root = images,
-                                                                .source = "objects365",
-                                                                .shard = "patch-32",
-                                                                .selected_image_ids = ids,
-                                                                .image_id_parser = [](std::string_view member) -> std::optional<std::uint64_t> {
-                                                                    if (member == "patch32/objects365_v2_00000001.jpg") return 1;
-                                                                    if (member == "patch32/objects365_v2_00000002.jpg") return 2;
-                                                                    return {};
-                                                                },
-                                                                .validator =
-                                                                    [](std::uint64_t, std::span<const std::uint8_t> bytes) {
-                                                                        if (!has_complete_image_markers(bytes)) throw std::runtime_error("invalid JPEG");
-                                                                    },
-                                                                .quarantine_unavailable = true,
-                                                                .decompression_workers = 0,
-                                                                .cache_write_workers = 0});
-        CHECK(extracted.image_count == 2);
-        CHECK_FALSE(std::filesystem::exists(proof));
-    }
-    compile_benchmark_recipe(config, &catalog);
-    CHECK(std::filesystem::exists(proof));
-    CHECK(std::filesystem::exists(images / ".complete.json"));
-    REQUIRE(::stat(cached_image_path(images, 1).c_str(), &after) == 0);
-    CHECK(before.st_ino == after.st_ino);
+ ScopedTempDir root("coconut-shared-repair");
+ LocalCoconutRecipe local(root.path());
+ auto config = local.compiler_config({BenchmarkDatasetVariant::Coconut, CoconutValidation::Coconut}, true);
+ const auto catalog = local.selected(CoconutValidation::Coconut);
+ compile_benchmark_recipe(config, &catalog);
+ const auto images = local.cache.source_images("objects365") / "patch-32";
+ const std::array<std::uint64_t, 2> ids{1, 2};
+ const auto proof = images / ".recipe-proofs" / ("coconut-0-" + cached_image_selection_digest(ids) + ".json");
+ REQUIRE(std::filesystem::exists(proof));
+ const auto original = read_json_file(proof);
+ {
+  auto lease = ArtifactLease::acquire(local.cache.locks / "objects365-patch-32.images.lock", {});
+  complete_cached_image_group(images, images / ".complete.json", original["identity"].get<std::string>(), ids, original["image_bytes"].get<std::uint64_t>(),
+                              {});
+  std::filesystem::remove(cached_image_path(images, 2));
+ }
+ struct stat before{}, after{};
+ REQUIRE(::stat(cached_image_path(images, 1).c_str(), &before) == 0);
+ const auto time = std::filesystem::last_write_time(cached_image_path(images, 1));
+ compile_benchmark_recipe(config, &catalog);
+ REQUIRE(std::filesystem::exists(cached_image_path(images, 2)));
+ CHECK_FALSE(std::filesystem::exists(images / ".complete.json"));
+ REQUIRE(::stat(cached_image_path(images, 1).c_str(), &after) == 0);
+ CHECK(before.st_ino == after.st_ino);
+ CHECK(std::filesystem::last_write_time(cached_image_path(images, 1)) == time);
+ {
+  auto lease = ArtifactLease::acquire(local.cache.locks / "objects365-patch-32.images.lock", {});
+  // A custom extraction discovers invalid bytes during its ordinary cache scan.
+  mmltk::testsupport::write_text_file(cached_image_path(images, 2), "bad JPEG");
+  const auto archive = std::ranges::find(catalog.images, CoconutImageNamespace::Objects365V2, &RecipeImageArchive::source);
+  REQUIRE(archive != catalog.images.end());
+  const auto extracted = extract_selected_archive_images({.archive_path = local.cache.source_downloads("objects365") / archive->artifact.filename,
+                                                          .source_identity = original["identity"].get<std::string>(),
+                                                          .output_root = images,
+                                                          .source = "objects365",
+                                                          .shard = "patch-32",
+                                                          .selected_image_ids = ids,
+                                                          .image_id_parser = [](std::string_view member) -> std::optional<std::uint64_t> {
+                                                           if (member == "patch32/objects365_v2_00000001.jpg") return 1;
+                                                           if (member == "patch32/objects365_v2_00000002.jpg") return 2;
+                                                           return {};
+                                                          },
+                                                          .validator =
+                                                           [](std::uint64_t, std::span<const std::uint8_t> bytes) {
+                                                            if (!has_complete_image_markers(bytes)) throw std::runtime_error("invalid JPEG");
+                                                           },
+                                                          .quarantine_unavailable = true,
+                                                          .decompression_workers = 0,
+                                                          .cache_write_workers = 0});
+  CHECK(extracted.image_count == 2);
+  CHECK_FALSE(std::filesystem::exists(proof));
+ }
+ compile_benchmark_recipe(config, &catalog);
+ CHECK(std::filesystem::exists(proof));
+ CHECK(std::filesystem::exists(images / ".complete.json"));
+ REQUIRE(::stat(cached_image_path(images, 1).c_str(), &after) == 0);
+ CHECK(before.st_ino == after.st_ino);
 }
 TEST_CASE("missing offered COCONut masks cannot replace the previous publication", "[coconut][benchmark]") {
-    ScopedTempDir root("coconut-missing-mask");
-    LocalCoconutRecipe local(root.path());
-    auto config = local.compiler_config({BenchmarkDatasetVariant::Coconut, CoconutValidation::Coconut}, true);
-    auto catalog = local.selected(CoconutValidation::Coconut);
-    compile_benchmark_recipe(config, &catalog);
-    const auto train = file_bytes(config.output_dir / "train.bin"), val = file_bytes(config.output_dir / "val.bin");
-    auto& large = *std::ranges::find(catalog.releases, CoconutEdition::Large, &CoconutReleaseComponent::edition);
-    auto& masks = *std::ranges::find(large.annotations, std::string("large.tar"), &CatalogArtifact::filename);
-    const auto path = local.cache.source_downloads("coconut-fixture-large") / masks.filename;
-    const std::array<std::pair<std::string, std::string>, 1> unrelated{{{"unrelated", "missing required mask"}}};
-    tar(path, unrelated);
-    masks.expected_size = std::filesystem::file_size(path);
-    masks.url += "?missing-mask";
-    CHECK_THROWS(compile_benchmark_recipe(config, &catalog));
-    CHECK(file_bytes(config.output_dir / "train.bin") == train);
-    CHECK(file_bytes(config.output_dir / "val.bin") == val);
+ ScopedTempDir root("coconut-missing-mask");
+ LocalCoconutRecipe local(root.path());
+ auto config = local.compiler_config({BenchmarkDatasetVariant::Coconut, CoconutValidation::Coconut}, true);
+ auto catalog = local.selected(CoconutValidation::Coconut);
+ compile_benchmark_recipe(config, &catalog);
+ const auto train = file_bytes(config.output_dir / "train.bin"), val = file_bytes(config.output_dir / "val.bin");
+ auto& large = *std::ranges::find(catalog.releases, CoconutEdition::Large, &CoconutReleaseComponent::edition);
+ auto& masks = *std::ranges::find(large.annotations, std::string("large.tar"), &CatalogArtifact::filename);
+ const auto path = local.cache.source_downloads("coconut-fixture-large") / masks.filename;
+ const std::array<std::pair<std::string, std::string>, 1> unrelated{{{"unrelated", "missing required mask"}}};
+ tar(path, unrelated);
+ masks.expected_size = std::filesystem::file_size(path);
+ masks.url += "?missing-mask";
+ CHECK_THROWS(compile_benchmark_recipe(config, &catalog));
+ CHECK(file_bytes(config.output_dir / "train.bin") == train);
+ CHECK(file_bytes(config.output_dir / "val.bin") == val);
 }
 TEST_CASE("COCONut disjoint XL membership remains complete", "[coconut][benchmark]") {
-    ScopedTempDir root("coconut-disjoint");
-    LocalCoconutRecipe local(root.path(), false, true);
-    auto config = local.compiler_config({BenchmarkDatasetVariant::Coconut, CoconutValidation::CoconutStock}, false);
-    const auto catalog = local.selected(CoconutValidation::CoconutStock);
-    compile_benchmark_recipe(config, &catalog);
-    CHECK(CompiledDataset::open(config.output_dir / "train.bin").image_entries().size() == 4);
-    CHECK(read_json_file(config.output_dir / "benchmark_manifest.json")["recipe"]["duplicate_xl_images"] == 0);
+ ScopedTempDir root("coconut-disjoint");
+ LocalCoconutRecipe local(root.path(), false, true);
+ auto config = local.compiler_config({BenchmarkDatasetVariant::Coconut, CoconutValidation::CoconutStock}, false);
+ const auto catalog = local.selected(CoconutValidation::CoconutStock);
+ compile_benchmark_recipe(config, &catalog);
+ CHECK(CompiledDataset::open(config.output_dir / "train.bin").image_entries().size() == 4);
+ CHECK(read_json_file(config.output_dir / "benchmark_manifest.json")["recipe"]["duplicate_xl_images"] == 0);
 }
 TEST_CASE("COCONut rejects physical COCO train validation reuse before publication", "[coconut][benchmark]") {
-    ScopedTempDir root("coconut-split-reuse");
-    LocalCoconutRecipe local(root.path());
-    auto config = local.compiler_config({BenchmarkDatasetVariant::Coconut, CoconutValidation::CoconutStock}, true);
-    auto catalog = local.selected(CoconutValidation::CoconutStock);
-    compile_benchmark_recipe(config, &catalog);
-    const auto previous = file_bytes(config.output_dir / "train.bin");
-    auto& archive = *std::ranges::find(catalog.images, CoconutImageNamespace::CocoValidation, &RecipeImageArchive::source);
-    const auto archive_path = local.cache.source_downloads("coco") / archive.artifact.filename;
-    const std::array<std::pair<std::string, std::string>, 1> members{{{coco(7, CoconutImageNamespace::CocoValidation).member, white_jpeg()}}};
-    tar(archive_path, members);
-    archive.artifact.expected_size = std::filesystem::file_size(archive_path);
-    archive.artifact.url += "?overlap";
-    auto& release = *std::ranges::find(catalog.releases, CoconutEdition::RelabeledValidation, &CoconutReleaseComponent::edition);
-    auto& artifact = release.annotations.front();
-    const auto path = local.cache.source_downloads("coconut-fixture-val") / artifact.filename;
-    const std::array<std::uint32_t, 9> ids{1, 1, 1, 1, 1, 1, 1, 1, 1};
-    parquet_file(path, Json::array({hf_row(7, png(3, 3, ids), Json::array({segment()}))}));
-    artifact.expected_size = std::filesystem::file_size(path);
-    artifact.url += "?overlap";
-    CHECK_THROWS_WITH(compile_benchmark_recipe(config, &catalog), "COCONut train and validation reuse a physical member");
-    CHECK(file_bytes(config.output_dir / "train.bin") == previous);
+ ScopedTempDir root("coconut-split-reuse");
+ LocalCoconutRecipe local(root.path());
+ auto config = local.compiler_config({BenchmarkDatasetVariant::Coconut, CoconutValidation::CoconutStock}, true);
+ auto catalog = local.selected(CoconutValidation::CoconutStock);
+ compile_benchmark_recipe(config, &catalog);
+ const auto previous = file_bytes(config.output_dir / "train.bin");
+ auto& archive = *std::ranges::find(catalog.images, CoconutImageNamespace::CocoValidation, &RecipeImageArchive::source);
+ const auto archive_path = local.cache.source_downloads("coco") / archive.artifact.filename;
+ const std::array<std::pair<std::string, std::string>, 1> members{{{coco(7, CoconutImageNamespace::CocoValidation).member, white_jpeg()}}};
+ tar(archive_path, members);
+ archive.artifact.expected_size = std::filesystem::file_size(archive_path);
+ archive.artifact.url += "?overlap";
+ auto& release = *std::ranges::find(catalog.releases, CoconutEdition::RelabeledValidation, &CoconutReleaseComponent::edition);
+ auto& artifact = release.annotations.front();
+ const auto path = local.cache.source_downloads("coconut-fixture-val") / artifact.filename;
+ const std::array<std::uint32_t, 9> ids{1, 1, 1, 1, 1, 1, 1, 1, 1};
+ parquet_file(path, Json::array({hf_row(7, png(3, 3, ids), Json::array({segment()}))}));
+ artifact.expected_size = std::filesystem::file_size(path);
+ artifact.url += "?overlap";
+ CHECK_THROWS_WITH(compile_benchmark_recipe(config, &catalog), "COCONut train and validation reuse a physical member");
+ CHECK(file_bytes(config.output_dir / "train.bin") == previous);
 }
 TEST_CASE("physical archive structural repair retains one admitted acquisition through extraction", "[coconut][benchmark][download]") {
-    ScopedTempDir root("coconut-physical-repair");
-    LocalCoconutRecipe local(root.path());
-    auto config = local.compiler_config({BenchmarkDatasetVariant::Coconut, CoconutValidation::CoconutStock}, true);
-    auto catalog = local.selected(CoconutValidation::CoconutStock);
-    ServedPhysicalArchive served(local.cache, catalog, CoconutImageNamespace::CocoTrain, "physical");
-    compile_benchmark_recipe(config, &catalog);
-    REQUIRE(served.server.requests() == 0);
-    const auto before = file_bytes(config.output_dir / "train.bin");
-    const auto unaffected = cached_image_path(local.cache.source_images("objects365") / "patch-32", 1);
-    struct stat inode{};
-    REQUIRE(::stat(unaffected.c_str(), &inode) == 0);
-    const auto proof = local.cache.source_images("objects365") / "patch-32/.recipe-proofs";
-    const auto proof_count = std::distance(std::filesystem::directory_iterator(proof), std::filesystem::directory_iterator{});
-    std::filesystem::remove(local.cache.source_indexes("coco") / (served.source.artifact.artifact_id + ".inventory.bin"));
-    mmltk::testsupport::write_text_file(served.path, std::string(served.payload.size(), 'x'));
-    unsigned physical_settlements = 0, failure_hashes = 0, cached_admissions = 0;
-    config.trace = [&](std::string_view event, std::string_view fields) {
-        const auto facts = Json::parse(fields);
-        if (facts.value("artifact", std::string{}) != served.source.artifact.artifact_id) return;
-        if (event == "benchmark.download.complete") ++physical_settlements;
-        if (event == "benchmark.download.cache_hit" || event == "benchmark.download.preseeded") ++cached_admissions;
-        if (event == "benchmark.download.failure_sha256") ++failure_hashes;
-    };
-    compile_benchmark_recipe(config, &catalog);
-    CHECK(served.server.requests() == 1);
-    CHECK(physical_settlements == 1);
-    CHECK(failure_hashes == 1);
-    CHECK(file_bytes(config.output_dir / "train.bin") == before);
-    struct stat after{};
-    REQUIRE(::stat(unaffected.c_str(), &after) == 0);
-    CHECK(after.st_ino == inode.st_ino);
-    CHECK(std::distance(std::filesystem::directory_iterator(proof), std::filesystem::directory_iterator{}) == proof_count);
-    const auto admissions_before = cached_admissions;
-    compile_benchmark_recipe(config, &catalog);
-    CHECK(served.server.requests() == 1);
-    CHECK(physical_settlements == 1);
-    CHECK(cached_admissions == admissions_before + 1);
-    std::ranges::fill(served.payload, 'x');
-    mmltk::testsupport::write_text_file(served.path, std::string(served.payload.size(), 'x'));
-    std::filesystem::remove(local.cache.source_indexes("coco") / (served.source.artifact.artifact_id + ".inventory.bin"));
-    CHECK_THROWS(compile_benchmark_recipe(config, &catalog));
-    CHECK(file_bytes(config.output_dir / "train.bin") == before);
-    REQUIRE(::stat(unaffected.c_str(), &after) == 0);
-    CHECK(after.st_ino == inode.st_ino);
-    CHECK(std::distance(std::filesystem::directory_iterator(proof), std::filesystem::directory_iterator{}) == proof_count);
-    served.server.Check();
+ ScopedTempDir root("coconut-physical-repair");
+ LocalCoconutRecipe local(root.path());
+ auto config = local.compiler_config({BenchmarkDatasetVariant::Coconut, CoconutValidation::CoconutStock}, true);
+ auto catalog = local.selected(CoconutValidation::CoconutStock);
+ ServedPhysicalArchive served(local.cache, catalog, CoconutImageNamespace::CocoTrain, "physical");
+ compile_benchmark_recipe(config, &catalog);
+ REQUIRE(served.server.requests() == 0);
+ const auto before = file_bytes(config.output_dir / "train.bin");
+ const auto unaffected = cached_image_path(local.cache.source_images("objects365") / "patch-32", 1);
+ struct stat inode{};
+ REQUIRE(::stat(unaffected.c_str(), &inode) == 0);
+ const auto proof = local.cache.source_images("objects365") / "patch-32/.recipe-proofs";
+ const auto proof_count = std::distance(std::filesystem::directory_iterator(proof), std::filesystem::directory_iterator{});
+ std::filesystem::remove(local.cache.source_indexes("coco") / (served.source.artifact.artifact_id + ".inventory.bin"));
+ mmltk::testsupport::write_text_file(served.path, std::string(served.payload.size(), 'x'));
+ unsigned physical_settlements = 0, failure_hashes = 0, cached_admissions = 0;
+ config.trace = [&](std::string_view event, std::string_view fields) {
+  const auto facts = Json::parse(fields);
+  if (facts.value("artifact", std::string{}) != served.source.artifact.artifact_id) return;
+  if (event == "benchmark.download.complete") ++physical_settlements;
+  if (event == "benchmark.download.cache_hit" || event == "benchmark.download.preseeded") ++cached_admissions;
+  if (event == "benchmark.download.failure_sha256") ++failure_hashes;
+ };
+ compile_benchmark_recipe(config, &catalog);
+ CHECK(served.server.requests() == 1);
+ CHECK(physical_settlements == 1);
+ CHECK(failure_hashes == 1);
+ CHECK(file_bytes(config.output_dir / "train.bin") == before);
+ struct stat after{};
+ REQUIRE(::stat(unaffected.c_str(), &after) == 0);
+ CHECK(after.st_ino == inode.st_ino);
+ CHECK(std::distance(std::filesystem::directory_iterator(proof), std::filesystem::directory_iterator{}) == proof_count);
+ const auto admissions_before = cached_admissions;
+ compile_benchmark_recipe(config, &catalog);
+ CHECK(served.server.requests() == 1);
+ CHECK(physical_settlements == 1);
+ CHECK(cached_admissions == admissions_before + 1);
+ std::ranges::fill(served.payload, 'x');
+ mmltk::testsupport::write_text_file(served.path, std::string(served.payload.size(), 'x'));
+ std::filesystem::remove(local.cache.source_indexes("coco") / (served.source.artifact.artifact_id + ".inventory.bin"));
+ CHECK_THROWS(compile_benchmark_recipe(config, &catalog));
+ CHECK(file_bytes(config.output_dir / "train.bin") == before);
+ REQUIRE(::stat(unaffected.c_str(), &after) == 0);
+ CHECK(after.st_ino == inode.st_ino);
+ CHECK(std::distance(std::filesystem::directory_iterator(proof), std::filesystem::directory_iterator{}) == proof_count);
+ served.server.Check();
 }
 TEST_CASE("additional download storage counts allocated retained bytes once", "[benchmark][storage]") {
-    ScopedTempDir root("additional-source-storage");
-    const auto path = root.path() / "source.tar";
-    constexpr std::uint64_t target = 65536;
-    CHECK(additional_download_bytes(path, target) == target);
-    mmltk::testsupport::write_text_file(path, std::string(target, 'a'));
-    CHECK(additional_download_bytes(path, target) == 0);
-    std::filesystem::rename(path, path.string() + ".part");
-    CHECK(additional_download_bytes(path, target) == 0);
-    std::filesystem::resize_file(path.string() + ".part", 4096);
-    struct stat partial{};
-    REQUIRE(::stat((path.string() + ".part").c_str(), &partial) == 0);
-    CHECK(additional_download_bytes(path, target) == target - std::min(target, static_cast<std::uint64_t>(partial.st_blocks) * 512U));
+ ScopedTempDir root("additional-source-storage");
+ const auto path = root.path() / "source.tar";
+ constexpr std::uint64_t target = 65536;
+ CHECK(additional_download_bytes(path, target) == target);
+ mmltk::testsupport::write_text_file(path, std::string(target, 'a'));
+ CHECK(additional_download_bytes(path, target) == 0);
+ std::filesystem::rename(path, path.string() + ".part");
+ CHECK(additional_download_bytes(path, target) == 0);
+ std::filesystem::resize_file(path.string() + ".part", 4096);
+ struct stat partial{};
+ REQUIRE(::stat((path.string() + ".part").c_str(), &partial) == 0);
+ CHECK(additional_download_bytes(path, target) == target - std::min(target, static_cast<std::uint64_t>(partial.st_blocks) * 512U));
 }
 TEST_CASE("missing physical membership repairs its archive without replacing annotation inputs", "[coconut][benchmark][download]") {
-    ScopedTempDir root("coconut-membership-repair");
-    LocalCoconutRecipe local(root.path());
-    auto catalog = local.selected(CoconutValidation::CoconutStock);
-    ServedPhysicalArchive served(local.cache, catalog, CoconutImageNamespace::CocoTrain, "membership");
-    const std::array<std::pair<std::string, std::string>, 1> wrong{{{coco(6).member, white_jpeg()}}};
-    tar(served.path, wrong);
-    REQUIRE(std::filesystem::file_size(served.path) == served.payload.size());
-    auto config = local.compiler_config({BenchmarkDatasetVariant::Coconut, CoconutValidation::CoconutStock}, false);
-    std::vector<std::string> diagnosed;
-    config.trace = [&](std::string_view event, std::string_view fields) {
-        if (event == "benchmark.download.failure_sha256") diagnosed.push_back(Json::parse(fields).at("artifact").get<std::string>());
-    };
-    compile_benchmark_recipe(config, &catalog);
-    CHECK(served.server.requests() == 1);
-    CHECK(diagnosed == std::vector<std::string>{served.source.artifact.artifact_id});
-    served.server.Check();
+ ScopedTempDir root("coconut-membership-repair");
+ LocalCoconutRecipe local(root.path());
+ auto catalog = local.selected(CoconutValidation::CoconutStock);
+ ServedPhysicalArchive served(local.cache, catalog, CoconutImageNamespace::CocoTrain, "membership");
+ const std::array<std::pair<std::string, std::string>, 1> wrong{{{coco(6).member, white_jpeg()}}};
+ tar(served.path, wrong);
+ REQUIRE(std::filesystem::file_size(served.path) == served.payload.size());
+ auto config = local.compiler_config({BenchmarkDatasetVariant::Coconut, CoconutValidation::CoconutStock}, false);
+ std::vector<std::string> diagnosed;
+ config.trace = [&](std::string_view event, std::string_view fields) {
+  if (event == "benchmark.download.failure_sha256") diagnosed.push_back(Json::parse(fields).at("artifact").get<std::string>());
+ };
+ compile_benchmark_recipe(config, &catalog);
+ CHECK(served.server.requests() == 1);
+ CHECK(diagnosed == std::vector<std::string>{served.source.artifact.artifact_id});
+ served.server.Check();
 }
 TEST_CASE("COCONut normalization observations are bounded with exact unknown-total settlement", "[coconut][progress]") {
-    ScopedTempDir root("coconut-progress-quantum");
-    std::vector<CoconutPhysicalImage> physical;
-    Json rows = Json::array();
-    const std::array<std::uint32_t, 1> ids{1};
-    const auto mask = png(1, 1, ids);
-    for (unsigned id = 1; id <= 130; ++id) {
-        physical.push_back(coco(id));
-        rows.push_back(hf_row(id, mask, Json::array({segment()}), 1, 1));
-    }
-    auto input = request(physical);
-    input.expected_rows = 0;
-    input.parquet_shards = {root.path() / "base.parquet"};
-    parquet_file(input.parquet_shards[0], rows);
-    std::vector<std::uint64_t> observed;
-    input.progress = [&](auto value) { observed.push_back(value); };
-    REQUIRE(import_coconut_annotations(input).front().index.images.size() == 130);
-    CHECK(observed == std::vector<std::uint64_t>{0, 64, 128, 130});
-    SECTION("disabled observation installs no callback") {
-        const BenchmarkTraceSink silent;
-        ProgressReporter reporter({}, silent);
-        CHECK_FALSE(reporter.normalization_observer_enabled());
-        input.progress = {};
-        observed.clear();
-        REQUIRE(import_coconut_annotations(input).front().index.images.size() == 130);
-        CHECK(observed.empty());
-        const BenchmarkTraceSink trace = [](std::string_view, const Json&) {};
-        ProgressReporter traced({}, trace);
-        CHECK_FALSE(traced.normalization_observer_enabled());
-    }
-    SECTION("cancellation remains visible between observation quanta") {
-        struct BetweenObservations {
-            mutable unsigned polls = 0;
-            bool armed = false;
-            bool cancelled() const noexcept { return armed && ++polls == 20; }
-        } stop;
-        input.cancellation = mmltk::common::concurrency::CancellationObservation::Borrow(stop);
-        observed.clear();
-        input.progress = [&](auto value) {
-            observed.push_back(value);
-            if (value == 64) stop.armed = true;
-        };
-        CHECK_THROWS(import_coconut_annotations(input));
-        CHECK(observed == std::vector<std::uint64_t>{0, 64});
-    }
+ ScopedTempDir root("coconut-progress-quantum");
+ std::vector<CoconutPhysicalImage> physical;
+ Json rows = Json::array();
+ const std::array<std::uint32_t, 1> ids{1};
+ const auto mask = png(1, 1, ids);
+ for (unsigned id = 1; id <= 130; ++id) {
+  physical.push_back(coco(id));
+  rows.push_back(hf_row(id, mask, Json::array({segment()}), 1, 1));
+ }
+ auto input = request(physical);
+ input.expected_rows = 0;
+ input.parquet_shards = {root.path() / "base.parquet"};
+ parquet_file(input.parquet_shards[0], rows);
+ std::vector<std::uint64_t> observed;
+ input.progress = [&](auto value) { observed.push_back(value); };
+ REQUIRE(import_coconut_annotations(input).front().index.images.size() == 130);
+ CHECK(observed == std::vector<std::uint64_t>{0, 64, 128, 130});
+ SECTION("disabled observation installs no callback") {
+  const BenchmarkTraceSink silent;
+  ProgressReporter reporter({}, silent);
+  CHECK_FALSE(reporter.normalization_observer_enabled());
+  input.progress = {};
+  observed.clear();
+  REQUIRE(import_coconut_annotations(input).front().index.images.size() == 130);
+  CHECK(observed.empty());
+  const BenchmarkTraceSink trace = [](std::string_view, const Json&) {};
+  ProgressReporter traced({}, trace);
+  CHECK_FALSE(traced.normalization_observer_enabled());
+ }
+ SECTION("cancellation remains visible between observation quanta") {
+  struct BetweenObservations {
+   mutable unsigned polls = 0;
+   bool armed = false;
+   bool cancelled() const noexcept { return armed && ++polls == 20; }
+  } stop;
+  input.cancellation = mmltk::common::concurrency::CancellationObservation::Borrow(stop);
+  observed.clear();
+  input.progress = [&](auto value) {
+   observed.push_back(value);
+   if (value == 64) stop.armed = true;
+  };
+  CHECK_THROWS(import_coconut_annotations(input));
+  CHECK(observed == std::vector<std::uint64_t>{0, 64});
+ }
 }
 namespace {
 CustomRecipeCatalog local_custom_catalog(LocalCoconutRecipe& local) {
-    auto catalog = custom_recipe_catalog();
-    catalog.coco_train_images_count = 2;
-    catalog.coco_validation_images_count = 1;
-    for (const auto& physical : local.catalog.images) {
-        if (physical.source == CoconutImageNamespace::CocoTrain) catalog.coco_train_images = physical.artifact;
-        if (physical.source == CoconutImageNamespace::CocoValidation) catalog.coco_val_images = physical.artifact;
-        if (physical.source == CoconutImageNamespace::Objects365V2) catalog.objects_images.at(physical.shard) = physical.artifact;
-    }
-    catalog.coco_annotations = local.catalog.stock_annotations;
-    const auto index = [&](BenchmarkDatasetSource source, std::string split, std::vector<NormalizedImage> images, std::vector<NormalizedBox> boxes) {
-        NormalizedAnnotationIndex value;
-        value.source = source;
-        value.split = std::move(split);
-        value.annotation_sha256 = std::string(64, 'a');
-        value.images = std::move(images);
-        value.boxes = std::move(boxes);
-        value.rejected.raw_records = value.boxes.size();
-        return value;
-    };
-    const auto box = [](std::uint8_t target, std::uint64_t category, std::uint64_t id) {
-        NormalizedBox value;
-        value.x2 = 1;
-        value.y2 = 1;
-        value.class_id = target;
-        value.flags = kAnnotationId | kAnnotationCategory;
-        value.original_area = 9;
-        value.annotation_id = id;
-        value.source_category_id = category;
-        return value;
-    };
-    // Ordinary preacquired normalized source facts: six rows per supplemental
-    // source, with one rare-class row, make the selected membership exact.
-    const auto coco_index = [&](std::string split, std::span<const unsigned> ids) {
-        Json document{{"images", Json::array()}, {"annotations", Json::array()}, {"categories", category_catalog()}};
-        for (const auto id : ids) {
-            document["images"].push_back({{"id", id}, {"width", 3}, {"height", 3}, {"file_name", coco(id).member}});
-            document["annotations"].push_back(
-                {{"id", id * 10}, {"image_id", id}, {"category_id", 3}, {"bbox", Json::array({0, 0, 3, 3})}, {"area", 9}, {"iscrowd", id == 7 ? 1 : 0}});
-        }
-        const auto path = local.cache.source_indexes("coco") / (split + ".fixture.json");
-        json_file(path, document);
-        return parse_coco_style_annotations(path, std::string(64, 'a'), coco_category_mappings(),
-                                            {BenchmarkDatasetSource::kCoco2017, std::move(split), static_cast<std::uint32_t>(ids.size()), 1, true, {}, {}});
-    };
-    const std::array<unsigned, 2> train_ids{7, 10};
-    const std::array<unsigned, 1> val_ids{9};
-    auto train = coco_index("train2017", train_ids);
-    auto val = coco_index("val2017", val_ids);
-    const auto object_mapping = *std::ranges::find(objects365_category_mappings(), std::uint8_t{0}, &NumericCategoryMapping::target_id);
-    const auto open_mapping = *std::ranges::find(open_images_category_mappings(), std::uint8_t{1}, &StringCategoryMapping::target_id);
-    auto objects_index = index(BenchmarkDatasetSource::kObjects365V2, "train", {}, {box(0, object_mapping.source_id, 11)});
-    auto open_index = index(BenchmarkDatasetSource::kOpenImagesV7, "train", {}, {box(1, encode_open_images_category(open_mapping.source_id), 17)});
-    open_index.boxes.front().original_area = 1;
-    for (unsigned i = 0; i < 6; ++i) {
-        objects_index.images.push_back({i + 1, i, 1, 3, 3, 32});
-        open_index.images.push_back({i + 17, i, 1, 3, 3});
-        if (i != 0) {
-            auto object_box = objects_index.boxes.front();
-            object_box.class_id = 2;
-            object_box.source_category_id = std::ranges::find(objects365_category_mappings(), std::uint8_t{2}, &NumericCategoryMapping::target_id)->source_id;
-            objects_index.boxes.push_back(object_box);
-            auto open_box = open_index.boxes.front();
-            open_box.class_id = 2;
-            open_box.source_category_id =
-                encode_open_images_category(std::ranges::find(open_images_category_mappings(), std::uint8_t{2}, &StringCategoryMapping::target_id)->source_id);
-            open_index.boxes.push_back(open_box);
-        }
-    }
-    objects_index.rejected.raw_records = objects_index.boxes.size();
-    open_index.rejected.raw_records = open_index.boxes.size();
-    store_normalized_annotation_index(local.cache.source_indexes("coco") / "train2017.normalized.bin", train, {});
-    store_normalized_annotation_index(local.cache.source_indexes("coco") / "val2017.normalized.bin", val, {});
-    store_normalized_annotation_index(local.cache.source_indexes("objects365") / "train.normalized.bin", objects_index, {});
-    store_normalized_annotation_index(local.cache.source_indexes("open-images") / "train.normalized.bin", open_index, {});
-    const auto open_path = cached_image_path(local.cache.source_images("open-images") / "train", 17);
-    std::filesystem::create_directories(open_path.parent_path());
-    mmltk::testsupport::write_text_file(open_path, white_jpeg());
-    return catalog;
+ auto catalog = custom_recipe_catalog();
+ catalog.coco_train_images_count = 2;
+ catalog.coco_validation_images_count = 1;
+ for (const auto& physical : local.catalog.images) {
+  if (physical.source == CoconutImageNamespace::CocoTrain) catalog.coco_train_images = physical.artifact;
+  if (physical.source == CoconutImageNamespace::CocoValidation) catalog.coco_val_images = physical.artifact;
+  if (physical.source == CoconutImageNamespace::Objects365V2) catalog.objects_images.at(physical.shard) = physical.artifact;
+ }
+ catalog.coco_annotations = local.catalog.stock_annotations;
+ const auto index = [&](BenchmarkDatasetSource source, std::string split, std::vector<NormalizedImage> images, std::vector<NormalizedBox> boxes) {
+  NormalizedAnnotationIndex value;
+  value.source = source;
+  value.split = std::move(split);
+  value.annotation_sha256 = std::string(64, 'a');
+  value.images = std::move(images);
+  value.boxes = std::move(boxes);
+  value.rejected.raw_records = value.boxes.size();
+  return value;
+ };
+ const auto box = [](std::uint8_t target, std::uint64_t category, std::uint64_t id) {
+  NormalizedBox value;
+  value.x2 = 1;
+  value.y2 = 1;
+  value.class_id = target;
+  value.flags = kAnnotationId | kAnnotationCategory;
+  value.original_area = 9;
+  value.annotation_id = id;
+  value.source_category_id = category;
+  return value;
+ };
+ // Ordinary preacquired normalized source facts: six rows per supplemental
+ // source, with one rare-class row, make the selected membership exact.
+ const auto coco_index = [&](std::string split, std::span<const unsigned> ids) {
+  Json document{{"images", Json::array()}, {"annotations", Json::array()}, {"categories", category_catalog()}};
+  for (const auto id : ids) {
+   document["images"].push_back({{"id", id}, {"width", 3}, {"height", 3}, {"file_name", coco(id).member}});
+   document["annotations"].push_back(
+    {{"id", id * 10}, {"image_id", id}, {"category_id", 3}, {"bbox", Json::array({0, 0, 3, 3})}, {"area", 9}, {"iscrowd", id == 7 ? 1 : 0}});
+  }
+  const auto path = local.cache.source_indexes("coco") / (split + ".fixture.json");
+  json_file(path, document);
+  return parse_coco_style_annotations(path, std::string(64, 'a'), coco_category_mappings(),
+                                      {BenchmarkDatasetSource::kCoco2017, std::move(split), static_cast<std::uint32_t>(ids.size()), 1, true, {}, {}});
+ };
+ const std::array<unsigned, 2> train_ids{7, 10};
+ const std::array<unsigned, 1> val_ids{9};
+ auto train = coco_index("train2017", train_ids);
+ auto val = coco_index("val2017", val_ids);
+ const auto object_mapping = *std::ranges::find(objects365_category_mappings(), std::uint8_t{0}, &NumericCategoryMapping::target_id);
+ const auto open_mapping = *std::ranges::find(open_images_category_mappings(), std::uint8_t{1}, &StringCategoryMapping::target_id);
+ auto objects_index = index(BenchmarkDatasetSource::kObjects365V2, "train", {}, {box(0, object_mapping.source_id, 11)});
+ auto open_index = index(BenchmarkDatasetSource::kOpenImagesV7, "train", {}, {box(1, encode_open_images_category(open_mapping.source_id), 17)});
+ open_index.boxes.front().original_area = 1;
+ for (unsigned i = 0; i < 6; ++i) {
+  objects_index.images.push_back({i + 1, i, 1, 3, 3, 32});
+  open_index.images.push_back({i + 17, i, 1, 3, 3});
+  if (i != 0) {
+   auto object_box = objects_index.boxes.front();
+   object_box.class_id = 2;
+   object_box.source_category_id = std::ranges::find(objects365_category_mappings(), std::uint8_t{2}, &NumericCategoryMapping::target_id)->source_id;
+   objects_index.boxes.push_back(object_box);
+   auto open_box = open_index.boxes.front();
+   open_box.class_id = 2;
+   open_box.source_category_id =
+    encode_open_images_category(std::ranges::find(open_images_category_mappings(), std::uint8_t{2}, &StringCategoryMapping::target_id)->source_id);
+   open_index.boxes.push_back(open_box);
+  }
+ }
+ objects_index.rejected.raw_records = objects_index.boxes.size();
+ open_index.rejected.raw_records = open_index.boxes.size();
+ store_normalized_annotation_index(local.cache.source_indexes("coco") / "train2017.normalized.bin", train, {});
+ store_normalized_annotation_index(local.cache.source_indexes("coco") / "val2017.normalized.bin", val, {});
+ store_normalized_annotation_index(local.cache.source_indexes("objects365") / "train.normalized.bin", objects_index, {});
+ store_normalized_annotation_index(local.cache.source_indexes("open-images") / "train.normalized.bin", open_index, {});
+ const auto open_path = cached_image_path(local.cache.source_images("open-images") / "train", 17);
+ std::filesystem::create_directories(open_path.parent_path());
+ mmltk::testsupport::write_text_file(open_path, white_jpeg());
+ return catalog;
 }
 void check_custom_compilation(const std::filesystem::path& output) {
-    const auto train = CompiledDataset::open(output / "train.bin");
-    const auto val = CompiledDataset::open(output / "val.bin");
-    REQUIRE(train.image_entries().size() == 3);
-    REQUIRE(val.image_entries().size() == 1);
-    const std::array<std::uint64_t, 3> ids{7, 1, 17};
-    const std::array<AnnotationSource, 3> sources{AnnotationSource::Coco, AnnotationSource::Objects365, AnnotationSource::OpenImages};
-    const std::array<unsigned, 3> classes{2, 0, 1};
-    // COCO preserves the annotation object's byte offset after {"annotations":[.
-    const std::array<std::uint64_t, 3> source_ordinals{16, 0, 0};
-    for (std::uint32_t i = 0; i < 3; ++i) {
-        CHECK(train.image_entry(i).source_image_id == ids[i]);
-        CHECK(train.image_entry(i).source == sources[i]);
-        REQUIRE(train.image_labels(i).size() == 1);
-        const auto& label = train.image_labels(i).front();
-        CHECK(label.class_id == classes[i]);
-        CHECK(label.bbox_x1 == 0.0F);
-        CHECK(label.bbox_y1 == 0.0F);
-        CHECK(label.bbox_x2 == 3.0F);
-        CHECK(label.bbox_y2 == 3.0F);
-        CHECK(label.original_area == 9);
-        CHECK(label.source_ordinal == source_ordinals[i]);
-        CHECK_FALSE(label.has_mask());
-        for (unsigned pixel = 0; pixel < 27; ++pixel) CHECK(train.image_pixels(i)[pixel] == 1.0F);
-    }
-    CHECK(train.image_labels(0).front().annotation_id == 70);
-    CHECK(train.image_labels(0).front().source_category_id == 3);
-    CHECK(train.image_labels(0).front().is_crowd());
-    CHECK(train.class_names()[2] == "car");
-    CHECK(val.image_entry(0).source_image_id == 9);
-    CHECK(val.image_entry(0).source == AnnotationSource::Coco);
-    const auto manifest = read_json_file(output / "benchmark_manifest.json");
-    CHECK(manifest["recipe"]["dataset"] == "coco-custom");
-    CHECK(manifest["compiled_format_version"] == FORMAT_VERSION);
-    CHECK(manifest["mapping_revision"] == kBenchmarkMappingRevision);
-    REQUIRE(manifest["sources"].size() == 3);
-    CHECK(manifest["sources"][0]["selected_images"] == 2);
-    CHECK(manifest["sources"][0]["compiled_images"] == 1);
-    CHECK(manifest["sources"][1]["indexed_images"] == 6);
-    CHECK(manifest["sources"][2]["indexed_images"] == 6);
-    CHECK(manifest["sources"][1]["selected_images"] == 1);
-    CHECK(manifest["sources"][2]["selected_images"] == 1);
-    CHECK(manifest["supplemental_sampling"]["target_images"] == 2);
-    CHECK(manifest["supplemental_sampling"]["objects365_shards"] == Json::array({32}));
-    REQUIRE(manifest["quarantined_images"].size() == 1);
-    CHECK(manifest["quarantined_images"][0]["image_id"] == 10);
-    CHECK(manifest["validation_source"]["compiled_images"] == 1);
-    CHECK(manifest["mappings"].contains("objects365"));
-    CHECK(manifest["mappings"].contains("open_images"));
+ const auto train = CompiledDataset::open(output / "train.bin");
+ const auto val = CompiledDataset::open(output / "val.bin");
+ REQUIRE(train.image_entries().size() == 3);
+ REQUIRE(val.image_entries().size() == 1);
+ const std::array<std::uint64_t, 3> ids{7, 1, 17};
+ const std::array<AnnotationSource, 3> sources{AnnotationSource::Coco, AnnotationSource::Objects365, AnnotationSource::OpenImages};
+ const std::array<unsigned, 3> classes{2, 0, 1};
+ // COCO preserves the annotation object's byte offset after {"annotations":[.
+ const std::array<std::uint64_t, 3> source_ordinals{16, 0, 0};
+ for (std::uint32_t i = 0; i < 3; ++i) {
+  CHECK(train.image_entry(i).source_image_id == ids[i]);
+  CHECK(train.image_entry(i).source == sources[i]);
+  REQUIRE(train.image_labels(i).size() == 1);
+  const auto& label = train.image_labels(i).front();
+  CHECK(label.class_id == classes[i]);
+  CHECK(label.bbox_x1 == 0.0F);
+  CHECK(label.bbox_y1 == 0.0F);
+  CHECK(label.bbox_x2 == 3.0F);
+  CHECK(label.bbox_y2 == 3.0F);
+  CHECK(label.original_area == 9);
+  CHECK(label.source_ordinal == source_ordinals[i]);
+  CHECK_FALSE(label.has_mask());
+  for (unsigned pixel = 0; pixel < 27; ++pixel) CHECK(train.image_pixels(i)[pixel] == 1.0F);
+ }
+ CHECK(train.image_labels(0).front().annotation_id == 70);
+ CHECK(train.image_labels(0).front().source_category_id == 3);
+ CHECK(train.image_labels(0).front().is_crowd());
+ CHECK(train.class_names()[2] == "car");
+ CHECK(val.image_entry(0).source_image_id == 9);
+ CHECK(val.image_entry(0).source == AnnotationSource::Coco);
+ const auto manifest = read_json_file(output / "benchmark_manifest.json");
+ CHECK(manifest["recipe"]["dataset"] == "coco-custom");
+ CHECK(manifest["compiled_format_version"] == FORMAT_VERSION);
+ CHECK(manifest["mapping_revision"] == kBenchmarkMappingRevision);
+ REQUIRE(manifest["sources"].size() == 3);
+ CHECK(manifest["sources"][0]["selected_images"] == 2);
+ CHECK(manifest["sources"][0]["compiled_images"] == 1);
+ CHECK(manifest["sources"][1]["indexed_images"] == 6);
+ CHECK(manifest["sources"][2]["indexed_images"] == 6);
+ CHECK(manifest["sources"][1]["selected_images"] == 1);
+ CHECK(manifest["sources"][2]["selected_images"] == 1);
+ CHECK(manifest["supplemental_sampling"]["target_images"] == 2);
+ CHECK(manifest["supplemental_sampling"]["objects365_shards"] == Json::array({32}));
+ REQUIRE(manifest["quarantined_images"].size() == 1);
+ CHECK(manifest["quarantined_images"][0]["image_id"] == 10);
+ CHECK(manifest["validation_source"]["compiled_images"] == 1);
+ CHECK(manifest["mappings"].contains("objects365"));
+ CHECK(manifest["mappings"].contains("open_images"));
 }
 }  // namespace
 TEST_CASE("custom and COCONut production transactions preserve output and shared physical caches across switches", "[benchmark][coconut]") {
-    ScopedTempDir root("both-native-recipes");
-    LocalCoconutRecipe local(root.path());
-    auto& physical = *std::ranges::find(local.catalog.images, CoconutImageNamespace::CocoTrain, &RecipeImageArchive::source);
-    const auto archive = local.cache.source_downloads("coco") / physical.artifact.filename;
-    const std::array<std::pair<std::string, std::string>, 2> members{{{coco(7).member, white_jpeg()}, {coco(10).member, "not a JPEG"}}};
-    tar(archive, members);
-    physical.artifact.expected_size = std::filesystem::file_size(archive);
-    const auto bytes = file_bytes(archive);
-    const std::vector<std::uint8_t> payload(bytes.begin(), bytes.end());
-    mmltk::backend::data::testsupport::HttpServer server(payload);
-    physical.artifact.url = server.url("shared-train");
-    auto custom = local_custom_catalog(local);
-    const auto coconut = local.selected(CoconutValidation::CoconutStock);
-    auto config = local.compiler_config({}, true);
-    const auto image_root = local.cache.source_images("coco") / "train2017";
-    const auto jpeg = cached_image_path(image_root, 7);
-    std::string custom_train, custom_val, coconut_train;
-    ino_t inode = 0;
-    std::filesystem::file_time_type mtime;
-    for (unsigned step = 0; step < 5; ++step) {
-        const bool enhanced = step % 2 == 0;
-        config.num_workers = 1 + step % 2;
-        config.selection = {enhanced ? BenchmarkDatasetVariant::Coconut : BenchmarkDatasetVariant::CocoCustom, CoconutValidation::CoconutStock};
-        compile_benchmark_recipe(config, enhanced ? &coconut : nullptr, enhanced ? nullptr : &custom);
-        CHECK(server.requests() == 0);
-        struct stat status{};
-        REQUIRE(::stat(jpeg.c_str(), &status) == 0);
-        if (step == 0) {
-            inode = status.st_ino;
-            mtime = std::filesystem::last_write_time(jpeg);
-        } else {
-            CHECK(status.st_ino == inode);
-            CHECK(std::filesystem::last_write_time(jpeg) == mtime);
-        }
-        if (enhanced) {
-            const auto train = file_bytes(config.output_dir / "train.bin");
-            if (coconut_train.empty())
-                coconut_train = train;
-            else
-                CHECK(train == coconut_train);
-            CHECK(read_json_file(config.output_dir / "benchmark_manifest.json")["recipe"]["dataset"] == "coconut");
-        } else {
-            check_custom_compilation(config.output_dir);
-            CHECK(std::filesystem::is_regular_file(image_root / ".complete.json"));
-            if (custom_train.empty()) {
-                custom_train = file_bytes(config.output_dir / "train.bin");
-                custom_val = file_bytes(config.output_dir / "val.bin");
-            } else {
-                CHECK(file_bytes(config.output_dir / "train.bin") == custom_train);
-                CHECK(file_bytes(config.output_dir / "val.bin") == custom_val);
-            }
-        }
-    }
-    // Both proof families coexist after selection switches. Each recipe repairs
-    // the same damaged member through the shared source lease and invalidates both.
-    for (const bool enhanced : {false, true}) {
-        const auto bad = std::string(std::filesystem::file_size(jpeg), 'x');
-        mmltk::testsupport::write_text_file(jpeg, bad);
-        config.selection = {enhanced ? BenchmarkDatasetVariant::Coconut : BenchmarkDatasetVariant::CocoCustom, CoconutValidation::CoconutStock};
-        compile_benchmark_recipe(config, enhanced ? &coconut : nullptr, enhanced ? nullptr : &custom);
-        CHECK(server.requests() == 0);
-        if (enhanced) {
-            CHECK_FALSE(std::filesystem::exists(image_root / ".complete.json"));
-            CHECK(file_bytes(config.output_dir / "train.bin") == coconut_train);
-        } else {
-            CHECK(std::filesystem::is_empty(image_root / ".recipe-proofs"));
-            check_custom_compilation(config.output_dir);
-        }
-    }
-    config.selection = {BenchmarkDatasetVariant::CocoCustom, CoconutValidation::CoconutStock};
-    compile_benchmark_recipe(config, nullptr, &custom);
-    check_custom_compilation(config.output_dir);
-    const auto published_manifest = file_bytes(config.output_dir / "benchmark_manifest.json");
-    SECTION("cancellation retains the complete previous custom publication") {
-        std::atomic<bool> stop{false};
-        config.cancel_requested = mmltk::common::concurrency::CancellationObservation::Atomic(stop);
-        config.progress = [&](const auto& value) {
-            if (value.phase == DatasetCompilePhase::Publishing) stop = true;
-        };
-        CHECK_THROWS(compile_benchmark_recipe(config, nullptr, &custom));
-    }
-    SECTION("required validation failure retains the complete previous custom publication") {
-        // Force a required decode-probe failure with intact archive structure.
-        auto& val = *std::ranges::find(local.catalog.images, CoconutImageNamespace::CocoValidation, &RecipeImageArchive::source);
-        const auto val_archive = local.cache.source_downloads("coco") / val.artifact.filename;
-        const std::array<std::pair<std::string, std::string>, 1> invalid{{{coco(9, CoconutImageNamespace::CocoValidation).member, "not a JPEG"}}};
-        tar(val_archive, invalid);
-        custom.coco_val_images.expected_size = std::filesystem::file_size(val_archive);
-        mmltk::testsupport::write_text_file(cached_image_path(local.cache.source_images("coco") / "val2017", 9), "broken");
-        CHECK_THROWS(compile_benchmark_recipe(config, nullptr, &custom));
-    }
+ ScopedTempDir root("both-native-recipes");
+ LocalCoconutRecipe local(root.path());
+ auto& physical = *std::ranges::find(local.catalog.images, CoconutImageNamespace::CocoTrain, &RecipeImageArchive::source);
+ const auto archive = local.cache.source_downloads("coco") / physical.artifact.filename;
+ const std::array<std::pair<std::string, std::string>, 2> members{{{coco(7).member, white_jpeg()}, {coco(10).member, "not a JPEG"}}};
+ tar(archive, members);
+ physical.artifact.expected_size = std::filesystem::file_size(archive);
+ const auto bytes = file_bytes(archive);
+ const std::vector<std::uint8_t> payload(bytes.begin(), bytes.end());
+ mmltk::backend::data::testsupport::HttpServer server(payload);
+ physical.artifact.url = server.url("shared-train");
+ auto custom = local_custom_catalog(local);
+ const auto coconut = local.selected(CoconutValidation::CoconutStock);
+ auto config = local.compiler_config({}, true);
+ const auto image_root = local.cache.source_images("coco") / "train2017";
+ const auto jpeg = cached_image_path(image_root, 7);
+ std::string custom_train, custom_val, coconut_train;
+ ino_t inode = 0;
+ std::filesystem::file_time_type mtime;
+ for (unsigned step = 0; step < 5; ++step) {
+  const bool enhanced = step % 2 == 0;
+  config.num_workers = 1 + step % 2;
+  config.selection = {enhanced ? BenchmarkDatasetVariant::Coconut : BenchmarkDatasetVariant::CocoCustom, CoconutValidation::CoconutStock};
+  compile_benchmark_recipe(config, enhanced ? &coconut : nullptr, enhanced ? nullptr : &custom);
+  CHECK(server.requests() == 0);
+  struct stat status{};
+  REQUIRE(::stat(jpeg.c_str(), &status) == 0);
+  if (step == 0) {
+   inode = status.st_ino;
+   mtime = std::filesystem::last_write_time(jpeg);
+  } else {
+   CHECK(status.st_ino == inode);
+   CHECK(std::filesystem::last_write_time(jpeg) == mtime);
+  }
+  if (enhanced) {
+   const auto train = file_bytes(config.output_dir / "train.bin");
+   if (coconut_train.empty())
+    coconut_train = train;
+   else
+    CHECK(train == coconut_train);
+   CHECK(read_json_file(config.output_dir / "benchmark_manifest.json")["recipe"]["dataset"] == "coconut");
+  } else {
+   check_custom_compilation(config.output_dir);
+   CHECK(std::filesystem::is_regular_file(image_root / ".complete.json"));
+   if (custom_train.empty()) {
+    custom_train = file_bytes(config.output_dir / "train.bin");
+    custom_val = file_bytes(config.output_dir / "val.bin");
+   } else {
     CHECK(file_bytes(config.output_dir / "train.bin") == custom_train);
     CHECK(file_bytes(config.output_dir / "val.bin") == custom_val);
-    CHECK(file_bytes(config.output_dir / "benchmark_manifest.json") == published_manifest);
-    server.Check();
+   }
+  }
+ }
+ // Both proof families coexist after selection switches. Each recipe repairs
+ // the same damaged member through the shared source lease and invalidates both.
+ for (const bool enhanced : {false, true}) {
+  const auto bad = std::string(std::filesystem::file_size(jpeg), 'x');
+  mmltk::testsupport::write_text_file(jpeg, bad);
+  config.selection = {enhanced ? BenchmarkDatasetVariant::Coconut : BenchmarkDatasetVariant::CocoCustom, CoconutValidation::CoconutStock};
+  compile_benchmark_recipe(config, enhanced ? &coconut : nullptr, enhanced ? nullptr : &custom);
+  CHECK(server.requests() == 0);
+  if (enhanced) {
+   CHECK_FALSE(std::filesystem::exists(image_root / ".complete.json"));
+   CHECK(file_bytes(config.output_dir / "train.bin") == coconut_train);
+  } else {
+   CHECK(std::filesystem::is_empty(image_root / ".recipe-proofs"));
+   check_custom_compilation(config.output_dir);
+  }
+ }
+ config.selection = {BenchmarkDatasetVariant::CocoCustom, CoconutValidation::CoconutStock};
+ compile_benchmark_recipe(config, nullptr, &custom);
+ check_custom_compilation(config.output_dir);
+ const auto published_manifest = file_bytes(config.output_dir / "benchmark_manifest.json");
+ SECTION("cancellation retains the complete previous custom publication") {
+  std::atomic<bool> stop{false};
+  config.cancel_requested = mmltk::common::concurrency::CancellationObservation::Atomic(stop);
+  config.progress = [&](const auto& value) {
+   if (value.phase == DatasetCompilePhase::Publishing) stop = true;
+  };
+  CHECK_THROWS(compile_benchmark_recipe(config, nullptr, &custom));
+ }
+ SECTION("required validation failure retains the complete previous custom publication") {
+  // Force a required decode-probe failure with intact archive structure.
+  auto& val = *std::ranges::find(local.catalog.images, CoconutImageNamespace::CocoValidation, &RecipeImageArchive::source);
+  const auto val_archive = local.cache.source_downloads("coco") / val.artifact.filename;
+  const std::array<std::pair<std::string, std::string>, 1> invalid{{{coco(9, CoconutImageNamespace::CocoValidation).member, "not a JPEG"}}};
+  tar(val_archive, invalid);
+  custom.coco_val_images.expected_size = std::filesystem::file_size(val_archive);
+  mmltk::testsupport::write_text_file(cached_image_path(local.cache.source_images("coco") / "val2017", 9), "broken");
+  CHECK_THROWS(compile_benchmark_recipe(config, nullptr, &custom));
+ }
+ CHECK(file_bytes(config.output_dir / "train.bin") == custom_train);
+ CHECK(file_bytes(config.output_dir / "val.bin") == custom_val);
+ CHECK(file_bytes(config.output_dir / "benchmark_manifest.json") == published_manifest);
+ server.Check();
 }
 TEST_CASE("custom archive structural recovery preserves JPEGs from other selections", "[benchmark][coconut][download]") {
-    ScopedTempDir root("custom-shared-archive-recovery");
-    LocalCoconutRecipe local(root.path());
-    auto custom = local_custom_catalog(local);
-    auto& artifact = custom.objects_images.at(32);
-    const auto archive = local.cache.source_downloads("objects365") / artifact.filename;
-    const auto pristine = file_bytes(archive);
-    const std::string malformed(pristine.size(), 'x');
-    std::vector<std::uint8_t> payload(pristine.begin(), pristine.end());
-    mmltk::backend::data::testsupport::HttpServer server(payload);
-    artifact.url = server.url("custom-structural");
-    auto coconut = local.selected(CoconutValidation::CoconutStock);
-    std::ranges::find(coconut.images, CoconutImageNamespace::Objects365V2, &RecipeImageArchive::source)->artifact.url = artifact.url;
-    auto config = local.compiler_config({BenchmarkDatasetVariant::Coconut, CoconutValidation::CoconutStock}, true);
-    compile_benchmark_recipe(config, &coconut);
-    config.selection.dataset = BenchmarkDatasetVariant::CocoCustom;
-    compile_benchmark_recipe(config, nullptr, &custom);
-    check_custom_compilation(config.output_dir);
-    const auto train = file_bytes(config.output_dir / "train.bin"), val = file_bytes(config.output_dir / "val.bin");
-    REQUIRE(server.requests() == 0);
-    const auto manifest = file_bytes(config.output_dir / "benchmark_manifest.json");
-    const auto images = local.cache.source_images("objects365") / "patch-32";
-    const auto retained = cached_image_path(images, 2);
-    const auto retained_bytes = file_bytes(retained);
-    struct stat before{};
-    REQUIRE(::stat(retained.c_str(), &before) == 0);
-    const auto retained_time = std::filesystem::last_write_time(retained);
-    REQUIRE_FALSE(std::filesystem::is_empty(images / ".recipe-proofs"));
-    bool exhausted = false, cancelled = false;
-    SECTION("successful retry retains unrelated bytes and allocation") {}
-    SECTION("all three attempts fail without replacing publication") {
-        exhausted = true;
-        std::ranges::copy(malformed, payload.begin());
-    }
-    SECTION("cancellation after structural diagnosis retains publication") { cancelled = true; }
-    // Remove only the selected JPEG/proof; the other recipe's proof and JPEG
-    // remain until real archive failure invalidates shared completion evidence.
-    std::filesystem::remove(cached_image_path(images, 1));
-    std::filesystem::remove(images / ".complete.json");
-    mmltk::testsupport::write_text_file(archive, malformed);
-    std::atomic<bool> stop{false};
-    config.cancel_requested = mmltk::common::concurrency::CancellationObservation::Atomic(stop);
-    unsigned retries = 0, diagnoses = 0;
-    config.trace = [&](std::string_view event, std::string_view fields) {
-        const auto facts = Json::parse(fields);
-        if (event == "benchmark.download.failure_sha256" && facts.value("artifact", std::string{}) == artifact.artifact_id) ++diagnoses;
-        if (event == "benchmark.images.archive_retry" && facts.value("source", std::string{}) == "objects365") {
-            ++retries;
-            if (cancelled) stop = true;
-        }
-    };
-    if (exhausted || cancelled)
-        CHECK_THROWS(compile_benchmark_recipe(config, nullptr, &custom));
-    else {
-        compile_benchmark_recipe(config, nullptr, &custom);
-        check_custom_compilation(config.output_dir);
-    }
-    CHECK(diagnoses == (exhausted ? 3U : 1U));
-    CHECK(retries == (exhausted ? 2U : 1U));
-    CHECK(server.requests() == (cancelled ? 0U : exhausted ? 2U : 1U));
-    CHECK(std::filesystem::is_empty(images / ".recipe-proofs"));
-    CHECK(file_bytes(retained) == retained_bytes);
-    struct stat after{};
-    REQUIRE(::stat(retained.c_str(), &after) == 0);
-    CHECK(after.st_ino == before.st_ino);
-    CHECK(std::filesystem::last_write_time(retained) == retained_time);
-    CHECK(file_bytes(config.output_dir / "train.bin") == train);
-    CHECK(file_bytes(config.output_dir / "val.bin") == val);
-    if (exhausted || cancelled) CHECK(file_bytes(config.output_dir / "benchmark_manifest.json") == manifest);
-    server.Check();
+ ScopedTempDir root("custom-shared-archive-recovery");
+ LocalCoconutRecipe local(root.path());
+ auto custom = local_custom_catalog(local);
+ auto& artifact = custom.objects_images.at(32);
+ const auto archive = local.cache.source_downloads("objects365") / artifact.filename;
+ const auto pristine = file_bytes(archive);
+ const std::string malformed(pristine.size(), 'x');
+ std::vector<std::uint8_t> payload(pristine.begin(), pristine.end());
+ mmltk::backend::data::testsupport::HttpServer server(payload);
+ artifact.url = server.url("custom-structural");
+ auto coconut = local.selected(CoconutValidation::CoconutStock);
+ std::ranges::find(coconut.images, CoconutImageNamespace::Objects365V2, &RecipeImageArchive::source)->artifact.url = artifact.url;
+ auto config = local.compiler_config({BenchmarkDatasetVariant::Coconut, CoconutValidation::CoconutStock}, true);
+ compile_benchmark_recipe(config, &coconut);
+ config.selection.dataset = BenchmarkDatasetVariant::CocoCustom;
+ compile_benchmark_recipe(config, nullptr, &custom);
+ check_custom_compilation(config.output_dir);
+ const auto train = file_bytes(config.output_dir / "train.bin"), val = file_bytes(config.output_dir / "val.bin");
+ REQUIRE(server.requests() == 0);
+ const auto manifest = file_bytes(config.output_dir / "benchmark_manifest.json");
+ const auto images = local.cache.source_images("objects365") / "patch-32";
+ const auto retained = cached_image_path(images, 2);
+ const auto retained_bytes = file_bytes(retained);
+ struct stat before{};
+ REQUIRE(::stat(retained.c_str(), &before) == 0);
+ const auto retained_time = std::filesystem::last_write_time(retained);
+ REQUIRE_FALSE(std::filesystem::is_empty(images / ".recipe-proofs"));
+ bool exhausted = false, cancelled = false;
+ SECTION("successful retry retains unrelated bytes and allocation") {}
+ SECTION("all three attempts fail without replacing publication") {
+  exhausted = true;
+  std::ranges::copy(malformed, payload.begin());
+ }
+ SECTION("cancellation after structural diagnosis retains publication") { cancelled = true; }
+ // Remove only the selected JPEG/proof; the other recipe's proof and JPEG
+ // remain until real archive failure invalidates shared completion evidence.
+ std::filesystem::remove(cached_image_path(images, 1));
+ std::filesystem::remove(images / ".complete.json");
+ mmltk::testsupport::write_text_file(archive, malformed);
+ std::atomic<bool> stop{false};
+ config.cancel_requested = mmltk::common::concurrency::CancellationObservation::Atomic(stop);
+ unsigned retries = 0, diagnoses = 0;
+ config.trace = [&](std::string_view event, std::string_view fields) {
+  const auto facts = Json::parse(fields);
+  if (event == "benchmark.download.failure_sha256" && facts.value("artifact", std::string{}) == artifact.artifact_id) ++diagnoses;
+  if (event == "benchmark.images.archive_retry" && facts.value("source", std::string{}) == "objects365") {
+   ++retries;
+   if (cancelled) stop = true;
+  }
+ };
+ if (exhausted || cancelled)
+  CHECK_THROWS(compile_benchmark_recipe(config, nullptr, &custom));
+ else {
+  compile_benchmark_recipe(config, nullptr, &custom);
+  check_custom_compilation(config.output_dir);
+ }
+ CHECK(diagnoses == (exhausted ? 3U : 1U));
+ CHECK(retries == (exhausted ? 2U : 1U));
+ CHECK(server.requests() == (cancelled ? 0U : exhausted ? 2U : 1U));
+ CHECK(std::filesystem::is_empty(images / ".recipe-proofs"));
+ CHECK(file_bytes(retained) == retained_bytes);
+ struct stat after{};
+ REQUIRE(::stat(retained.c_str(), &after) == 0);
+ CHECK(after.st_ino == before.st_ino);
+ CHECK(std::filesystem::last_write_time(retained) == retained_time);
+ CHECK(file_bytes(config.output_dir / "train.bin") == train);
+ CHECK(file_bytes(config.output_dir / "val.bin") == val);
+ if (exhausted || cancelled) CHECK(file_bytes(config.output_dir / "benchmark_manifest.json") == manifest);
+ server.Check();
 }
 TEST_CASE("one physical admission budget governs membership extraction and writer recovery identities", "[coconut][benchmark][download]") {
-    ScopedTempDir root("coconut-unified-recovery");
-    LocalCoconutRecipe local(root.path());
-    auto catalog = local.selected(CoconutValidation::CoconutStock);
-    ServedPhysicalArchive served(local.cache, catalog, CoconutImageNamespace::CocoTrain, "unified-recovery");
-    auto config = local.compiler_config({BenchmarkDatasetVariant::Coconut, CoconutValidation::CoconutStock}, true);
-    compile_benchmark_recipe(config, &catalog);
-    REQUIRE(served.server.requests() == 0);
-    const auto old_train = file_bytes(config.output_dir / "train.bin"), old_val = file_bytes(config.output_dir / "val.bin"),
-               old_manifest = file_bytes(config.output_dir / "benchmark_manifest.json");
-    const auto component_path = local.cache.source_indexes("coconut-fixture-base") / "coco-train2017.normalized.bin";
-    const auto old_component = read_json_file(component_path.string() + ".complete.json");
-    const auto old_input = old_component["coconut"]["input_identity"].get<std::string>();
-    const auto unrelated = cached_image_path(local.cache.source_images("objects365") / "patch-32", 1);
-    struct stat before{};
-    REQUIRE(::stat(unrelated.c_str(), &before) == 0);
-    const auto unrelated_time = std::filesystem::last_write_time(unrelated);
-    const auto unrelated_proofs = local.cache.source_images("objects365") / "patch-32/.recipe-proofs";
-    std::vector<std::pair<std::filesystem::path, std::string>> proofs;
-    for (const auto& proof : std::filesystem::directory_iterator(unrelated_proofs)) proofs.emplace_back(proof.path(), file_bytes(proof.path()));
-    const auto jpeg = cached_image_path(local.cache.source_images("coco") / "train2017", 7);
-    const std::string corrupt_jpeg(white_jpeg().size(), 'x');
-    const auto replace_archive = [&](unsigned id, const std::string& bytes) {
-        const std::array<std::pair<std::string, std::string>, 1> members{{{coco(id).member, bytes}}};
-        tar(served.path, members);
-        REQUIRE(std::filesystem::file_size(served.path) == served.payload.size());
-    };
-    bool exhausted = false;
-    SECTION("selected JPEG extraction refreshes physical and dependent identities") {
-        replace_archive(7, corrupt_jpeg);
-        std::filesystem::remove(jpeg);
-    }
-    SECTION("writer repair shares the same owner and refreshes dependent identities") {
-        replace_archive(7, corrupt_jpeg);
-        mmltk::testsupport::write_text_file(jpeg, corrupt_jpeg);
-    }
-    SECTION("membership repair leaves only one further physical recovery admission") {
-        exhausted = true;
-        replace_archive(7, corrupt_jpeg);
-        const auto bad = file_bytes(served.path);
-        std::ranges::copy(bad, served.payload.begin());
-        replace_archive(6, white_jpeg());
-        std::filesystem::remove(jpeg);
-        std::filesystem::remove(component_path.string() + ".complete.json");
-    }
-    std::filesystem::remove(local.cache.source_indexes("coco") / (served.source.artifact.artifact_id + ".inventory.bin"));
-    unsigned admissions = 0;
-    config.trace = [&](std::string_view event, std::string_view fields) {
-        if (event != "benchmark.download.cache_hit" && event != "benchmark.download.preseeded" && event != "benchmark.download.complete") return;
-        if (Json::parse(fields).value("artifact", std::string{}) == served.source.artifact.artifact_id) ++admissions;
-    };
-    if (exhausted) {
-        CHECK_THROWS_WITH(compile_benchmark_recipe(config, &catalog),
-                          "physical archive remains unavailable after three admissions: " + served.source.artifact.artifact_id +
-                              ": selected archive image 7 is not a complete JPEG or PNG");
-        CHECK(admissions == 3);
-        CHECK(served.server.requests() == 2);
-        CHECK(file_bytes(config.output_dir / "benchmark_manifest.json") == old_manifest);
-    } else {
-        compile_benchmark_recipe(config, &catalog);
-        CHECK(admissions == 2);
-        CHECK(served.server.requests() == 1);
-        const auto completion = read_json_file(component_path.string() + ".complete.json");
-        const auto input = completion["coconut"]["input_identity"].get<std::string>();
-        CHECK(input != old_input);
-        const auto component = load_coconut_component(component_path, CoconutEdition::Base, CoconutImageNamespace::CocoTrain, input);
-        REQUIRE(component);
-        REQUIRE(component->inventory.size() == 1);
-        const auto manifest = read_json_file(config.output_dir / "benchmark_manifest.json");
-        const auto physical =
-            std::ranges::find_if(manifest["recipe"]["artifacts"], [&](const auto& item) { return item["artifact_id"] == served.source.artifact.artifact_id; });
-        REQUIRE(physical != manifest["recipe"]["artifacts"].end());
-        CHECK(component->inventory.front().physical.archive_identity == physical->at("identity").get<std::string>());
-        const auto facts = std::ranges::find_if(manifest["recipe"]["components"], [](const auto& item) { return item["physical_source"] == "coco-train2017"; });
-        REQUIRE(facts != manifest["recipe"]["components"].end());
-        CHECK(facts->at("input_identity") == input);
-        const auto train = CompiledDataset::open(config.output_dir / "train.bin");
-        CHECK(train.image_entry(0).source_image_id == 7);
-        for (unsigned pixel = 0; pixel < 27; ++pixel) CHECK(train.image_pixels(0)[pixel] == 1.0F);
-    }
-    CHECK(file_bytes(config.output_dir / "train.bin") == old_train);
-    CHECK(file_bytes(config.output_dir / "val.bin") == old_val);
-    struct stat after{};
-    REQUIRE(::stat(unrelated.c_str(), &after) == 0);
-    CHECK(after.st_ino == before.st_ino);
-    CHECK(std::filesystem::last_write_time(unrelated) == unrelated_time);
-    for (const auto& [path, bytes] : proofs) CHECK(file_bytes(path) == bytes);
-    served.server.Check();
+ ScopedTempDir root("coconut-unified-recovery");
+ LocalCoconutRecipe local(root.path());
+ auto catalog = local.selected(CoconutValidation::CoconutStock);
+ ServedPhysicalArchive served(local.cache, catalog, CoconutImageNamespace::CocoTrain, "unified-recovery");
+ auto config = local.compiler_config({BenchmarkDatasetVariant::Coconut, CoconutValidation::CoconutStock}, true);
+ compile_benchmark_recipe(config, &catalog);
+ REQUIRE(served.server.requests() == 0);
+ const auto old_train = file_bytes(config.output_dir / "train.bin"), old_val = file_bytes(config.output_dir / "val.bin"),
+            old_manifest = file_bytes(config.output_dir / "benchmark_manifest.json");
+ const auto component_path = local.cache.source_indexes("coconut-fixture-base") / "coco-train2017.normalized.bin";
+ const auto old_component = read_json_file(component_path.string() + ".complete.json");
+ const auto old_input = old_component["coconut"]["input_identity"].get<std::string>();
+ const auto unrelated = cached_image_path(local.cache.source_images("objects365") / "patch-32", 1);
+ struct stat before{};
+ REQUIRE(::stat(unrelated.c_str(), &before) == 0);
+ const auto unrelated_time = std::filesystem::last_write_time(unrelated);
+ const auto unrelated_proofs = local.cache.source_images("objects365") / "patch-32/.recipe-proofs";
+ std::vector<std::pair<std::filesystem::path, std::string>> proofs;
+ for (const auto& proof : std::filesystem::directory_iterator(unrelated_proofs)) proofs.emplace_back(proof.path(), file_bytes(proof.path()));
+ const auto jpeg = cached_image_path(local.cache.source_images("coco") / "train2017", 7);
+ const std::string corrupt_jpeg(white_jpeg().size(), 'x');
+ const auto replace_archive = [&](unsigned id, const std::string& bytes) {
+  const std::array<std::pair<std::string, std::string>, 1> members{{{coco(id).member, bytes}}};
+  tar(served.path, members);
+  REQUIRE(std::filesystem::file_size(served.path) == served.payload.size());
+ };
+ bool exhausted = false;
+ SECTION("selected JPEG extraction refreshes physical and dependent identities") {
+  replace_archive(7, corrupt_jpeg);
+  std::filesystem::remove(jpeg);
+ }
+ SECTION("writer repair shares the same owner and refreshes dependent identities") {
+  replace_archive(7, corrupt_jpeg);
+  mmltk::testsupport::write_text_file(jpeg, corrupt_jpeg);
+ }
+ SECTION("membership repair leaves only one further physical recovery admission") {
+  exhausted = true;
+  replace_archive(7, corrupt_jpeg);
+  const auto bad = file_bytes(served.path);
+  std::ranges::copy(bad, served.payload.begin());
+  replace_archive(6, white_jpeg());
+  std::filesystem::remove(jpeg);
+  std::filesystem::remove(component_path.string() + ".complete.json");
+ }
+ std::filesystem::remove(local.cache.source_indexes("coco") / (served.source.artifact.artifact_id + ".inventory.bin"));
+ unsigned admissions = 0;
+ config.trace = [&](std::string_view event, std::string_view fields) {
+  if (event != "benchmark.download.cache_hit" && event != "benchmark.download.preseeded" && event != "benchmark.download.complete") return;
+  if (Json::parse(fields).value("artifact", std::string{}) == served.source.artifact.artifact_id) ++admissions;
+ };
+ if (exhausted) {
+  CHECK_THROWS_WITH(compile_benchmark_recipe(config, &catalog),
+                    "physical archive remains unavailable after three admissions: " + served.source.artifact.artifact_id +
+                     ": selected archive image 7 is not a complete JPEG or PNG");
+  CHECK(admissions == 3);
+  CHECK(served.server.requests() == 2);
+  CHECK(file_bytes(config.output_dir / "benchmark_manifest.json") == old_manifest);
+ } else {
+  compile_benchmark_recipe(config, &catalog);
+  CHECK(admissions == 2);
+  CHECK(served.server.requests() == 1);
+  const auto completion = read_json_file(component_path.string() + ".complete.json");
+  const auto input = completion["coconut"]["input_identity"].get<std::string>();
+  CHECK(input != old_input);
+  const auto component = load_coconut_component(component_path, CoconutEdition::Base, CoconutImageNamespace::CocoTrain, input);
+  REQUIRE(component);
+  REQUIRE(component->inventory.size() == 1);
+  const auto manifest = read_json_file(config.output_dir / "benchmark_manifest.json");
+  const auto physical =
+   std::ranges::find_if(manifest["recipe"]["artifacts"], [&](const auto& item) { return item["artifact_id"] == served.source.artifact.artifact_id; });
+  REQUIRE(physical != manifest["recipe"]["artifacts"].end());
+  CHECK(component->inventory.front().physical.archive_identity == physical->at("identity").get<std::string>());
+  const auto facts = std::ranges::find_if(manifest["recipe"]["components"], [](const auto& item) { return item["physical_source"] == "coco-train2017"; });
+  REQUIRE(facts != manifest["recipe"]["components"].end());
+  CHECK(facts->at("input_identity") == input);
+  const auto train = CompiledDataset::open(config.output_dir / "train.bin");
+  CHECK(train.image_entry(0).source_image_id == 7);
+  for (unsigned pixel = 0; pixel < 27; ++pixel) CHECK(train.image_pixels(0)[pixel] == 1.0F);
+ }
+ CHECK(file_bytes(config.output_dir / "train.bin") == old_train);
+ CHECK(file_bytes(config.output_dir / "val.bin") == old_val);
+ struct stat after{};
+ REQUIRE(::stat(unrelated.c_str(), &after) == 0);
+ CHECK(after.st_ino == before.st_ino);
+ CHECK(std::filesystem::last_write_time(unrelated) == unrelated_time);
+ for (const auto& [path, bytes] : proofs) CHECK(file_bytes(path) == bytes);
+ served.server.Check();
 }
 TEST_CASE("one admitted physical membership lookup serves every release without revalidation", "[coconut]") {
-    ScopedTempDir root("coconut-shared-membership");
-    LocalCoconutRecipe local(root.path());
-    std::vector<CoconutPhysicalImage> physical;
-    for (const auto& archive : local.catalog.images) {
-        auto rows = coconut_image_archive_inventory(local.cache.source_downloads(benchmark_source_name(archive.artifact.source)) / archive.artifact.filename,
-                                                    {}, archive.source, archive.shard, archive.artifact.artifact_id);
-        physical.insert(physical.end(), std::make_move_iterator(rows.begin()), std::make_move_iterator(rows.end()));
-    }
-    PollCancellation construction;
-    const CoconutPhysicalMembership membership(physical, mmltk::common::concurrency::CancellationObservation::Borrow(construction));
-    REQUIRE(construction.polls == 2 * physical.size());
-    const auto construction_polls = construction.polls;
-    // Any repeated use of the admission's cancellation observation now fails.
-    construction.stop_at = construction.polls;
-    const auto* v1 = membership.find(CoconutImageNamespace::Objects365V1, 1);
-    const auto* v2 = membership.find(CoconutImageNamespace::Objects365V2, 1);
-    REQUIRE(v1);
-    REQUIRE(v2);
-    CHECK(v1 != v2);
-    std::vector<CoconutComponent> components;
-    for (const auto& release : local.catalog.releases) {
-        CoconutImportRequest input;
-        input.edition = release.edition;
-        input.input_identity = "one-shared-generation";
-        input.physical_membership = &membership;
-        input.expected_rows = release.expected_rows;
-        for (const auto& artifact : release.annotations) {
-            const auto path = local.cache.source_downloads("coconut-" + std::string(release.name)) / artifact.filename;
-            if (path.extension() == ".parquet")
-                input.parquet_shards.push_back(path);
-            else if (path.extension() == ".json")
-                input.annotation_json = path;
-            else
-                input.mask_archive = path;
-        }
-        auto imported = import_coconut_annotations(input);
-        components.insert(components.end(), std::make_move_iterator(imported.begin()), std::make_move_iterator(imported.end()));
-        CHECK(construction.polls == construction_polls);
-        CHECK(membership.find(CoconutImageNamespace::Objects365V1, 1) == v1);
-        CHECK(membership.find(CoconutImageNamespace::Objects365V2, 1) == v2);
-    }
-    CHECK(reconcile_coconut_extensions(components) == 1);
-    for (std::size_t cut = 0; cut < construction_polls; ++cut) {
-        PollCancellation cancelled;
-        cancelled.stop_at = cut;
-        CHECK_THROWS(CoconutPhysicalMembership(physical, mmltk::common::concurrency::CancellationObservation::Borrow(cancelled)));
-    }
-    auto replacement = physical;
-    replacement.front().archive_identity = "replacement-generation";
-    PollCancellation rebuilt;
-    const CoconutPhysicalMembership next(replacement, mmltk::common::concurrency::CancellationObservation::Borrow(rebuilt));
-    CHECK(rebuilt.polls == construction_polls);
-    CHECK(next.find(replacement.front().source, replacement.front().image_id) == &replacement.front());
-    CHECK(membership.find(physical.front().source, physical.front().image_id) == &physical.front());
+ ScopedTempDir root("coconut-shared-membership");
+ LocalCoconutRecipe local(root.path());
+ std::vector<CoconutPhysicalImage> physical;
+ for (const auto& archive : local.catalog.images) {
+  auto rows = coconut_image_archive_inventory(local.cache.source_downloads(benchmark_source_name(archive.artifact.source)) / archive.artifact.filename, {},
+                                              archive.source, archive.shard, archive.artifact.artifact_id);
+  physical.insert(physical.end(), std::make_move_iterator(rows.begin()), std::make_move_iterator(rows.end()));
+ }
+ PollCancellation construction;
+ const CoconutPhysicalMembership membership(physical, mmltk::common::concurrency::CancellationObservation::Borrow(construction));
+ REQUIRE(construction.polls == 2 * physical.size());
+ const auto construction_polls = construction.polls;
+ // Any repeated use of the admission's cancellation observation now fails.
+ construction.stop_at = construction.polls;
+ const auto* v1 = membership.find(CoconutImageNamespace::Objects365V1, 1);
+ const auto* v2 = membership.find(CoconutImageNamespace::Objects365V2, 1);
+ REQUIRE(v1);
+ REQUIRE(v2);
+ CHECK(v1 != v2);
+ std::vector<CoconutComponent> components;
+ for (const auto& release : local.catalog.releases) {
+  CoconutImportRequest input;
+  input.edition = release.edition;
+  input.input_identity = "one-shared-generation";
+  input.physical_membership = &membership;
+  input.expected_rows = release.expected_rows;
+  for (const auto& artifact : release.annotations) {
+   const auto path = local.cache.source_downloads("coconut-" + std::string(release.name)) / artifact.filename;
+   if (path.extension() == ".parquet")
+    input.parquet_shards.push_back(path);
+   else if (path.extension() == ".json")
+    input.annotation_json = path;
+   else
+    input.mask_archive = path;
+  }
+  auto imported = import_coconut_annotations(input);
+  components.insert(components.end(), std::make_move_iterator(imported.begin()), std::make_move_iterator(imported.end()));
+  CHECK(construction.polls == construction_polls);
+  CHECK(membership.find(CoconutImageNamespace::Objects365V1, 1) == v1);
+  CHECK(membership.find(CoconutImageNamespace::Objects365V2, 1) == v2);
+ }
+ CHECK(reconcile_coconut_extensions(components) == 1);
+ for (std::size_t cut = 0; cut < construction_polls; ++cut) {
+  PollCancellation cancelled;
+  cancelled.stop_at = cut;
+  CHECK_THROWS(CoconutPhysicalMembership(physical, mmltk::common::concurrency::CancellationObservation::Borrow(cancelled)));
+ }
+ auto replacement = physical;
+ replacement.front().archive_identity = "replacement-generation";
+ PollCancellation rebuilt;
+ const CoconutPhysicalMembership next(replacement, mmltk::common::concurrency::CancellationObservation::Borrow(rebuilt));
+ CHECK(rebuilt.polls == construction_polls);
+ CHECK(next.find(replacement.front().source, replacement.front().image_id) == &replacement.front());
+ CHECK(membership.find(physical.front().source, physical.front().image_id) == &physical.front());
 }
 TEST_CASE("both stock recipes reuse normalized indexes without raw metadata or network", "[benchmark][coconut][cache]") {
-    ScopedTempDir root("stock-normalized-only");
-    LocalCoconutRecipe local(root.path());
-    auto custom = local_custom_catalog(local);
-    auto coconut = local.selected(CoconutValidation::Stock);
-    const auto raw = local.cache.source_downloads("coco") / custom.coco_annotations.filename;
-    remove_cache_path(raw);
-    remove_cache_path(raw.string() + ".download.json");
-    remove_cache_path(local.cache.source_indexes("coco") / "source-json");
-    const auto index = local.cache.source_indexes("coco") / "val2017.normalized.bin";
-    const auto original_index = file_bytes(index);
-    const auto index_time = std::filesystem::last_write_time(index);
-    {
-        BenchmarkTraceSink trace;
-        ProgressReporter progress({}, trace);
-        CocoAnnotationCache stock(local.cache, coconut.stock_annotations, false, 0, 1, 1, {}, trace);
-        stock.discover(progress);
-        CHECK_FALSE(stock.pending_download());
-        const auto admitted = stock.take_indexes();
-        CHECK(admitted.cache_hit);
-        CHECK(admitted.retained_storage_bytes == std::filesystem::file_size(index) + std::filesystem::file_size(index.string() + ".complete.json"));
-    }
-    auto config = local.compiler_config({}, true);
-    std::array<std::string, 2> trains, validations;
-    for (unsigned pass = 0; pass < 4; ++pass) {
-        const auto enhanced = pass % 2;
-        config.selection = {enhanced ? BenchmarkDatasetVariant::Coconut : BenchmarkDatasetVariant::CocoCustom, CoconutValidation::Stock};
-        compile_benchmark_recipe(config, enhanced ? &coconut : nullptr, enhanced ? nullptr : &custom);
-        const auto train = file_bytes(config.output_dir / "train.bin"), val = file_bytes(config.output_dir / "val.bin");
-        if (pass < 2) {
-            trains[enhanced] = train;
-            validations[enhanced] = val;
-        } else {
-            CHECK(train == trains[enhanced]);
-            CHECK(val == validations[enhanced]);
-        }
-        CHECK(file_bytes(index) == original_index);
-        CHECK(std::filesystem::last_write_time(index) == index_time);
-        CHECK_FALSE(std::filesystem::exists(raw));
-        CHECK_FALSE(std::filesystem::exists(local.cache.source_indexes("coco") / "source-json"));
-    }
+ ScopedTempDir root("stock-normalized-only");
+ LocalCoconutRecipe local(root.path());
+ auto custom = local_custom_catalog(local);
+ auto coconut = local.selected(CoconutValidation::Stock);
+ const auto raw = local.cache.source_downloads("coco") / custom.coco_annotations.filename;
+ remove_cache_path(raw);
+ remove_cache_path(raw.string() + ".download.json");
+ remove_cache_path(local.cache.source_indexes("coco") / "source-json");
+ const auto index = local.cache.source_indexes("coco") / "val2017.normalized.bin";
+ const auto original_index = file_bytes(index);
+ const auto index_time = std::filesystem::last_write_time(index);
+ {
+  BenchmarkTraceSink trace;
+  ProgressReporter progress({}, trace);
+  CocoAnnotationCache stock(local.cache, coconut.stock_annotations, false, 0, 1, 1, {}, trace);
+  stock.discover(progress);
+  CHECK_FALSE(stock.pending_download());
+  const auto admitted = stock.take_indexes();
+  CHECK(admitted.cache_hit);
+  CHECK(admitted.retained_storage_bytes == std::filesystem::file_size(index) + std::filesystem::file_size(index.string() + ".complete.json"));
+ }
+ auto config = local.compiler_config({}, true);
+ std::array<std::string, 2> trains, validations;
+ for (unsigned pass = 0; pass < 4; ++pass) {
+  const auto enhanced = pass % 2;
+  config.selection = {enhanced ? BenchmarkDatasetVariant::Coconut : BenchmarkDatasetVariant::CocoCustom, CoconutValidation::Stock};
+  compile_benchmark_recipe(config, enhanced ? &coconut : nullptr, enhanced ? nullptr : &custom);
+  const auto train = file_bytes(config.output_dir / "train.bin"), val = file_bytes(config.output_dir / "val.bin");
+  if (pass < 2) {
+   trains[enhanced] = train;
+   validations[enhanced] = val;
+  } else {
+   CHECK(train == trains[enhanced]);
+   CHECK(val == validations[enhanced]);
+  }
+  CHECK(file_bytes(index) == original_index);
+  CHECK(std::filesystem::last_write_time(index) == index_time);
+  CHECK_FALSE(std::filesystem::exists(raw));
+  CHECK_FALSE(std::filesystem::exists(local.cache.source_indexes("coco") / "source-json"));
+ }
 }
 TEST_CASE("stock annotation owner repairs only missing splits with bounded source attempts", "[benchmark][coconut][download]") {
-    ScopedTempDir root("stock-source-recovery");
-    LocalCoconutRecipe local(root.path());
-    auto custom = local_custom_catalog(local);
-    const auto train_path = local.cache.source_indexes("coco") / "train2017.normalized.bin";
-    const auto train_bytes = file_bytes(train_path), train_metadata = file_bytes(train_path.string() + ".complete.json");
-    const auto train_time = std::filesystem::last_write_time(train_path);
-    const auto val_path = local.cache.source_indexes("coco") / "val2017.normalized.bin";
-    remove_cache_path(val_path);
-    remove_cache_path(val_path.string() + ".complete.json");
-    auto artifact = custom.coco_annotations;
-    const auto raw = local.cache.source_downloads("coco") / artifact.filename;
-    bool succeeds = true;
-    SECTION("same-size malformed archive is replaced once") {
-        // Local HTTP serves the original archive; the admitted cache copy is damaged below.
-    }
-    SECTION("missing required member exhausts the three-body budget") {
-        const std::array<std::pair<std::string, std::string>, 1> rows{{{"annotations/unrelated.json", "{}"}}};
-        tar(raw, rows);
-        succeeds = false;
-    }
-    SECTION("malformed required JSON exhausts the three-body budget") {
-        const std::array<std::pair<std::string, std::string>, 1> rows{{{"annotations/instances_val2017.json", "not JSON"}}};
-        tar(raw, rows);
-        succeeds = false;
-    }
-    const auto served = file_bytes(raw);
-    mmltk::backend::data::testsupport::HttpServer server(served);
-    artifact.url = server.url("stock-repair");
-    artifact.expected_size = served.size();
-    if (succeeds) mmltk::testsupport::write_text_file(raw, std::string(served.size(), 'x'));
-    unsigned diagnoses = 0;
-    BenchmarkTraceSink trace = [&](std::string_view event, const Json&) {
-        if (event == "benchmark.download.failure_sha256") ++diagnoses;
-    };
-    ProgressReporter progress({}, trace);
-    CocoAnnotationCache annotations(local.cache, artifact, true, 2, 1, 1, {}, trace);
-    annotations.discover(progress);
-    REQUIRE(annotations.pending_download());
-    CHECK(annotations.completed_indexes() == 1);
-    auto acquired = download_artifacts({*annotations.pending_download()}, 1, {}).front();
-    CHECK(server.requests() == 0);
-    std::uint64_t completed = 1;
-    if (succeeds) {
-        annotations.settle(std::move(acquired), progress, 1, completed, 2);
-        auto indexes = annotations.take_indexes();
-        REQUIRE(indexes.train);
-        REQUIRE(indexes.validation);
-        CHECK(indexes.train->images.size() == 2);
-        CHECK(indexes.validation->images.size() == 1);
-        CHECK_FALSE(indexes.cache_hit);
-        CHECK(completed == 2);
-        CHECK(server.requests() == 1);
-        CHECK(diagnoses == 1);
-    } else {
-        CHECK_THROWS(annotations.settle(std::move(acquired), progress, 1, completed, 2));
-        CHECK(server.requests() == 2);
-        CHECK(diagnoses == 2);
-        CHECK(completed == 1);
-        CHECK_FALSE(std::filesystem::exists(val_path.string() + ".complete.json"));
-    }
-    CHECK(file_bytes(train_path) == train_bytes);
-    CHECK(file_bytes(train_path.string() + ".complete.json") == train_metadata);
-    CHECK(std::filesystem::last_write_time(train_path) == train_time);
-    server.Check();
+ ScopedTempDir root("stock-source-recovery");
+ LocalCoconutRecipe local(root.path());
+ auto custom = local_custom_catalog(local);
+ const auto train_path = local.cache.source_indexes("coco") / "train2017.normalized.bin";
+ const auto train_bytes = file_bytes(train_path), train_metadata = file_bytes(train_path.string() + ".complete.json");
+ const auto train_time = std::filesystem::last_write_time(train_path);
+ const auto val_path = local.cache.source_indexes("coco") / "val2017.normalized.bin";
+ remove_cache_path(val_path);
+ remove_cache_path(val_path.string() + ".complete.json");
+ auto artifact = custom.coco_annotations;
+ const auto raw = local.cache.source_downloads("coco") / artifact.filename;
+ bool succeeds = true;
+ SECTION("same-size malformed archive is replaced once") {
+  // Local HTTP serves the original archive; the admitted cache copy is damaged below.
+ }
+ SECTION("missing required member exhausts the three-body budget") {
+  const std::array<std::pair<std::string, std::string>, 1> rows{{{"annotations/unrelated.json", "{}"}}};
+  tar(raw, rows);
+  succeeds = false;
+ }
+ SECTION("malformed required JSON exhausts the three-body budget") {
+  const std::array<std::pair<std::string, std::string>, 1> rows{{{"annotations/instances_val2017.json", "not JSON"}}};
+  tar(raw, rows);
+  succeeds = false;
+ }
+ const auto served = file_bytes(raw);
+ mmltk::backend::data::testsupport::HttpServer server(served);
+ artifact.url = server.url("stock-repair");
+ artifact.expected_size = served.size();
+ if (succeeds) mmltk::testsupport::write_text_file(raw, std::string(served.size(), 'x'));
+ unsigned diagnoses = 0;
+ BenchmarkTraceSink trace = [&](std::string_view event, const Json&) {
+  if (event == "benchmark.download.failure_sha256") ++diagnoses;
+ };
+ ProgressReporter progress({}, trace);
+ CocoAnnotationCache annotations(local.cache, artifact, true, 2, 1, 1, {}, trace);
+ annotations.discover(progress);
+ REQUIRE(annotations.pending_download());
+ CHECK(annotations.completed_indexes() == 1);
+ auto acquired = download_artifacts({*annotations.pending_download()}, 1, {}).front();
+ CHECK(server.requests() == 0);
+ std::uint64_t completed = 1;
+ if (succeeds) {
+  annotations.settle(std::move(acquired), progress, 1, completed, 2);
+  auto indexes = annotations.take_indexes();
+  REQUIRE(indexes.train);
+  REQUIRE(indexes.validation);
+  CHECK(indexes.train->images.size() == 2);
+  CHECK(indexes.validation->images.size() == 1);
+  CHECK_FALSE(indexes.cache_hit);
+  CHECK(completed == 2);
+  CHECK(server.requests() == 1);
+  CHECK(diagnoses == 1);
+ } else {
+  CHECK_THROWS(annotations.settle(std::move(acquired), progress, 1, completed, 2));
+  CHECK(server.requests() == 2);
+  CHECK(diagnoses == 2);
+  CHECK(completed == 1);
+  CHECK_FALSE(std::filesystem::exists(val_path.string() + ".complete.json"));
+ }
+ CHECK(file_bytes(train_path) == train_bytes);
+ CHECK(file_bytes(train_path.string() + ".complete.json") == train_metadata);
+ CHECK(std::filesystem::last_write_time(train_path) == train_time);
+ server.Check();
 }
 TEST_CASE("stock annotation cancellation preserves the previous recipe publication", "[benchmark][coconut][cache]") {
-    ScopedTempDir root("stock-cancel-publication");
-    LocalCoconutRecipe local(root.path());
-    auto catalog = local.selected(CoconutValidation::Stock);
-    auto config = local.compiler_config({BenchmarkDatasetVariant::Coconut, CoconutValidation::Stock}, true);
-    compile_benchmark_recipe(config, &catalog);
-    const auto train = file_bytes(config.output_dir / "train.bin"), val = file_bytes(config.output_dir / "val.bin");
-    const auto manifest = file_bytes(config.output_dir / "benchmark_manifest.json");
-    const auto index = local.cache.source_indexes("coco") / "val2017.normalized.bin";
-    remove_cache_path(index);
-    remove_cache_path(index.string() + ".complete.json");
-    std::atomic<bool> cancel{false};
-    config.cancel_requested = mmltk::common::concurrency::CancellationObservation::Atomic(cancel);
-    config.progress = [&](const auto& value) {
-        if (value.activity == "Parsing and indexing COCO validation annotations") cancel = true;
-    };
-    CHECK_THROWS(compile_benchmark_recipe(config, &catalog));
-    CHECK(cancel.load());
-    CHECK_FALSE(std::filesystem::exists(index.string() + ".complete.json"));
-    CHECK(file_bytes(config.output_dir / "train.bin") == train);
-    CHECK(file_bytes(config.output_dir / "val.bin") == val);
-    CHECK(file_bytes(config.output_dir / "benchmark_manifest.json") == manifest);
+ ScopedTempDir root("stock-cancel-publication");
+ LocalCoconutRecipe local(root.path());
+ auto catalog = local.selected(CoconutValidation::Stock);
+ auto config = local.compiler_config({BenchmarkDatasetVariant::Coconut, CoconutValidation::Stock}, true);
+ compile_benchmark_recipe(config, &catalog);
+ const auto train = file_bytes(config.output_dir / "train.bin"), val = file_bytes(config.output_dir / "val.bin");
+ const auto manifest = file_bytes(config.output_dir / "benchmark_manifest.json");
+ const auto index = local.cache.source_indexes("coco") / "val2017.normalized.bin";
+ remove_cache_path(index);
+ remove_cache_path(index.string() + ".complete.json");
+ std::atomic<bool> cancel{false};
+ config.cancel_requested = mmltk::common::concurrency::CancellationObservation::Atomic(cancel);
+ config.progress = [&](const auto& value) {
+  if (value.activity == "Parsing and indexing COCO validation annotations") cancel = true;
+ };
+ CHECK_THROWS(compile_benchmark_recipe(config, &catalog));
+ CHECK(cancel.load());
+ CHECK_FALSE(std::filesystem::exists(index.string() + ".complete.json"));
+ CHECK(file_bytes(config.output_dir / "train.bin") == train);
+ CHECK(file_bytes(config.output_dir / "val.bin") == val);
+ CHECK(file_bytes(config.output_dir / "benchmark_manifest.json") == manifest);
 }
 TEST_CASE("both stock recipes repair malformed admitted archives through their production entry", "[benchmark][coconut][download]") {
-    ScopedTempDir root("stock-recipe-repair");
-    LocalCoconutRecipe local(root.path());
-    auto custom = local_custom_catalog(local);
-    auto coconut = local.selected(CoconutValidation::Stock);
-    bool enhanced = false;
-    SECTION("Coco custom") {}
-    SECTION("Coconut Stock") { enhanced = true; }
-    const auto val = local.cache.source_indexes("coco") / "val2017.normalized.bin";
-    remove_cache_path(val);
-    remove_cache_path(val.string() + ".complete.json");
-    const auto raw = local.cache.source_downloads("coco") / custom.coco_annotations.filename;
-    const auto served = file_bytes(raw);
-    mmltk::backend::data::testsupport::HttpServer server(served);
-    custom.coco_annotations.url = server.url("stock-production");
-    coconut.stock_annotations.url = custom.coco_annotations.url;
-    mmltk::testsupport::write_text_file(raw, std::string(served.size(), 'x'));
-    auto config = local.compiler_config({enhanced ? BenchmarkDatasetVariant::Coconut : BenchmarkDatasetVariant::CocoCustom, CoconutValidation::Stock}, false);
-    compile_benchmark_recipe(config, enhanced ? &coconut : nullptr, enhanced ? nullptr : &custom);
-    const auto compiled = CompiledDataset::open(config.output_dir / "val.bin");
-    REQUIRE(compiled.image_entries().size() == 1);
-    CHECK(compiled.image_entry(0).source_image_id == 9);
-    CHECK(compiled.image_entry(0).source == AnnotationSource::Coco);
-    CHECK(server.requests() == 1);
-    CHECK(file_bytes(raw) == served);
-    server.Check();
+ ScopedTempDir root("stock-recipe-repair");
+ LocalCoconutRecipe local(root.path());
+ auto custom = local_custom_catalog(local);
+ auto coconut = local.selected(CoconutValidation::Stock);
+ bool enhanced = false;
+ SECTION("Coco custom") {}
+ SECTION("Coconut Stock") { enhanced = true; }
+ const auto val = local.cache.source_indexes("coco") / "val2017.normalized.bin";
+ remove_cache_path(val);
+ remove_cache_path(val.string() + ".complete.json");
+ const auto raw = local.cache.source_downloads("coco") / custom.coco_annotations.filename;
+ const auto served = file_bytes(raw);
+ mmltk::backend::data::testsupport::HttpServer server(served);
+ custom.coco_annotations.url = server.url("stock-production");
+ coconut.stock_annotations.url = custom.coco_annotations.url;
+ mmltk::testsupport::write_text_file(raw, std::string(served.size(), 'x'));
+ auto config = local.compiler_config({enhanced ? BenchmarkDatasetVariant::Coconut : BenchmarkDatasetVariant::CocoCustom, CoconutValidation::Stock}, false);
+ compile_benchmark_recipe(config, enhanced ? &coconut : nullptr, enhanced ? nullptr : &custom);
+ const auto compiled = CompiledDataset::open(config.output_dir / "val.bin");
+ REQUIRE(compiled.image_entries().size() == 1);
+ CHECK(compiled.image_entry(0).source_image_id == 9);
+ CHECK(compiled.image_entry(0).source == AnnotationSource::Coco);
+ CHECK(server.requests() == 1);
+ CHECK(file_bytes(raw) == served);
+ server.Check();
 }
 TEST_CASE("one stock request builds both splits and retains newly settled train during validation repair", "[benchmark][coconut][download]") {
-    ScopedTempDir root("stock-both-splits");
-    LocalCoconutRecipe local(root.path());
-    auto custom = local_custom_catalog(local);
-    const auto train = local.cache.source_indexes("coco") / "train2017.normalized.bin";
-    const auto val = local.cache.source_indexes("coco") / "val2017.normalized.bin";
-    remove_cache_path(train);
-    remove_cache_path(train.string() + ".complete.json");
-    remove_cache_path(val);
-    remove_cache_path(val.string() + ".complete.json");
-    const auto raw = local.cache.source_downloads("coco") / custom.coco_annotations.filename;
-    const auto training_json = file_bytes(local.cache.source_indexes("coco") / "train2017.fixture.json");
-    const auto validation_json = file_bytes(local.cache.source_indexes("coco") / "val2017.fixture.json");
-    const std::array<std::pair<std::string, std::string>, 2> valid{
-        {{"annotations/instances_train2017.json", training_json}, {"annotations/instances_val2017.json", validation_json}}};
-    tar(raw, valid);
-    const auto served = file_bytes(raw);
-    mmltk::backend::data::testsupport::HttpServer server(served);
-    auto malformed = valid;
-    malformed[1].second = "not JSON";
-    tar(raw, malformed);
-    custom.coco_annotations.expected_size = 0;
-    custom.coco_annotations.url = server.url("both-stock-splits");
-    BenchmarkTraceSink trace;
-    std::string settled_train, settled_metadata;
-    ProgressReporter progress(
-        [&](const auto& update) {
-            if (update.activity == "Extracting COCO validation annotations" && settled_train.empty()) {
-                settled_train = file_bytes(train);
-                settled_metadata = file_bytes(train.string() + ".complete.json");
-            }
-        },
-        trace);
-    CocoAnnotationCache cache(local.cache, custom.coco_annotations, true, 2, 1, 1, {}, trace);
-    cache.discover(progress);
-    CHECK(cache.completed_indexes() == 0);
-    REQUIRE(cache.pending_download());
-    auto acquired = download_artifacts({*cache.pending_download()}, 1, {}).front();
-    CHECK(server.requests() == 0);
-    std::uint64_t completed = 0;
-    cache.settle(std::move(acquired), progress, 1, completed, 2);
-    auto indexes = cache.take_indexes();
-    REQUIRE(indexes.train);
-    REQUIRE(indexes.validation);
-    REQUIRE_FALSE(settled_train.empty());
-    CHECK(file_bytes(train) == settled_train);
-    CHECK(file_bytes(train.string() + ".complete.json") == settled_metadata);
-    CHECK(indexes.train->images.size() == 2);
-    CHECK(indexes.validation->images.size() == 1);
-    CHECK(completed == 2);
-    CHECK(server.requests() == 1);
-    server.Check();
+ ScopedTempDir root("stock-both-splits");
+ LocalCoconutRecipe local(root.path());
+ auto custom = local_custom_catalog(local);
+ const auto train = local.cache.source_indexes("coco") / "train2017.normalized.bin";
+ const auto val = local.cache.source_indexes("coco") / "val2017.normalized.bin";
+ remove_cache_path(train);
+ remove_cache_path(train.string() + ".complete.json");
+ remove_cache_path(val);
+ remove_cache_path(val.string() + ".complete.json");
+ const auto raw = local.cache.source_downloads("coco") / custom.coco_annotations.filename;
+ const auto training_json = file_bytes(local.cache.source_indexes("coco") / "train2017.fixture.json");
+ const auto validation_json = file_bytes(local.cache.source_indexes("coco") / "val2017.fixture.json");
+ const std::array<std::pair<std::string, std::string>, 2> valid{
+  {{"annotations/instances_train2017.json", training_json}, {"annotations/instances_val2017.json", validation_json}}};
+ tar(raw, valid);
+ const auto served = file_bytes(raw);
+ mmltk::backend::data::testsupport::HttpServer server(served);
+ auto malformed = valid;
+ malformed[1].second = "not JSON";
+ tar(raw, malformed);
+ custom.coco_annotations.expected_size = 0;
+ custom.coco_annotations.url = server.url("both-stock-splits");
+ BenchmarkTraceSink trace;
+ std::string settled_train, settled_metadata;
+ ProgressReporter progress(
+  [&](const auto& update) {
+   if (update.activity == "Extracting COCO validation annotations" && settled_train.empty()) {
+    settled_train = file_bytes(train);
+    settled_metadata = file_bytes(train.string() + ".complete.json");
+   }
+  },
+  trace);
+ CocoAnnotationCache cache(local.cache, custom.coco_annotations, true, 2, 1, 1, {}, trace);
+ cache.discover(progress);
+ CHECK(cache.completed_indexes() == 0);
+ REQUIRE(cache.pending_download());
+ auto acquired = download_artifacts({*cache.pending_download()}, 1, {}).front();
+ CHECK(server.requests() == 0);
+ std::uint64_t completed = 0;
+ cache.settle(std::move(acquired), progress, 1, completed, 2);
+ auto indexes = cache.take_indexes();
+ REQUIRE(indexes.train);
+ REQUIRE(indexes.validation);
+ REQUIRE_FALSE(settled_train.empty());
+ CHECK(file_bytes(train) == settled_train);
+ CHECK(file_bytes(train.string() + ".complete.json") == settled_metadata);
+ CHECK(indexes.train->images.size() == 2);
+ CHECK(indexes.validation->images.size() == 1);
+ CHECK(completed == 2);
+ CHECK(server.requests() == 1);
+ server.Check();
 }

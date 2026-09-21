@@ -21,115 +21,116 @@ namespace mmltk::controller {
 [[nodiscard]] VisualExtent checked_upscale_output_extent(VisualExtent);
 [[nodiscard]] VisualExtent restored_upscale_input_extent(const VisualFrame&);
 enum class UpscaleKernel : std::uint8_t {
-    Default,
-    ShiftLut,
-    RealPlksr,
+ Default,
+ ShiftLut,
+ RealPlksr,
 };
 struct UpscaleRequest final {
-    // Full source revision identifies semantic pixels. Document facts identify
-    // the immutable borrowed meaning independently of reusable clean pixels.
-    VisualFrame source{};
-    UpscaleKernel kernel = UpscaleKernel::Default;
-    VisualDocumentFacts document{};
-    bool operator==(const UpscaleRequest&) const = default;
+ // Full source revision identifies semantic pixels. Document facts identify
+ // the immutable borrowed meaning independently of reusable clean pixels.
+ VisualFrame source{};
+ UpscaleKernel kernel = UpscaleKernel::Default;
+ VisualDocumentFacts document{};
+ bool operator==(const UpscaleRequest&) const = default;
 };
 enum class UpscaleFailureKind : std::uint8_t { Failed, Unavailable, Physical };
 using UpscalePurpose = mmltk::backend::imaging::upscale::ImageUpscalerPurpose;
 class UpscaleAlgorithm : public mmltk::frameworks::gpu::SystemImageModel {
-   public:
-    ~UpscaleAlgorithm() override = default;
-    void BindExecutionContext(const mmltk::frameworks::gpu::DeviceContext&, std::shared_ptr<mmltk::frameworks::gpu::ImageStream>) override;
-    Release ReleaseResources() noexcept override;
-    [[nodiscard]] mmltk::frameworks::gpu::BorrowedImageReadView Prepare(mmltk::frameworks::gpu::ImagePlaneView, const VisualFrame&, VisualExtent);
-    virtual void Resample(mmltk::frameworks::gpu::ImagePlaneView, mmltk::frameworks::gpu::ImagePlaneView, std::uintptr_t) = 0;
-    virtual void Warm() = 0;
-    [[nodiscard]] virtual bool GraphReplay(UpscaleKernel) const { return false; }
-    virtual void Run(UpscaleKernel, mmltk::frameworks::gpu::ImagePlaneView source, mmltk::frameworks::gpu::ImagePlaneView target, std::uintptr_t stream,
-                     const std::function<bool()>& current = {}, UpscalePurpose purpose = UpscalePurpose::Normal) = 0;
-    virtual void Semantics(mmltk::frameworks::gpu::ImagePlaneView, mmltk::frameworks::gpu::ImagePlaneView, std::uintptr_t) = 0;
-   private:
-    std::unique_ptr<mmltk::frameworks::gpu::ImageBuffer> prepared_;
-    std::shared_ptr<mmltk::frameworks::gpu::ImageStream> preparation_stream_;
-    std::optional<VisualFrame> prepared_source_;
-    VisualExtent prepared_extent_{};
+public:
+ ~UpscaleAlgorithm() override = default;
+ void BindExecutionContext(const mmltk::frameworks::gpu::DeviceContext&, std::shared_ptr<mmltk::frameworks::gpu::ImageStream>) override;
+ Release ReleaseResources() noexcept override;
+ [[nodiscard]] mmltk::frameworks::gpu::BorrowedImageReadView Prepare(mmltk::frameworks::gpu::ImagePlaneView, const VisualFrame&, VisualExtent);
+ virtual void Resample(mmltk::frameworks::gpu::ImagePlaneView, mmltk::frameworks::gpu::ImagePlaneView, std::uintptr_t) = 0;
+ virtual void Warm() = 0;
+ [[nodiscard]] virtual bool GraphReplay(UpscaleKernel) const { return false; }
+ virtual void Run(UpscaleKernel, mmltk::frameworks::gpu::ImagePlaneView source, mmltk::frameworks::gpu::ImagePlaneView target, std::uintptr_t stream,
+                  const std::function<bool()>& current = {}, UpscalePurpose purpose = UpscalePurpose::Normal) = 0;
+ virtual void Semantics(mmltk::frameworks::gpu::ImagePlaneView, mmltk::frameworks::gpu::ImagePlaneView, std::uintptr_t) = 0;
+
+private:
+ std::unique_ptr<mmltk::frameworks::gpu::ImageBuffer> prepared_;
+ std::shared_ptr<mmltk::frameworks::gpu::ImageStream> preparation_stream_;
+ std::optional<VisualFrame> prepared_source_;
+ VisualExtent prepared_extent_{};
 };
 struct UpscaleMethodSnapshot final {
-    bool available = false;
-    bool warm = false;
-    bool failed = false;
-    bool initialization_failed = false;
-    bool graph_replay = false;
-    std::optional<UpscaleRequest> completed{};
-    std::optional<UpscaleRequest> failure{};
-    VisualFrame frame{};
+ bool available = false;
+ bool warm = false;
+ bool failed = false;
+ bool initialization_failed = false;
+ bool graph_replay = false;
+ std::optional<UpscaleRequest> completed{};
+ std::optional<UpscaleRequest> failure{};
+ VisualFrame frame{};
 };
 struct UpscaleImageMetadata final {
-    static constexpr std::uint32_t output_scale = 4U;
-    VisualFrame frame{};
-    VisualFrame input{};
-    VisualExtent prepared_extent{};
-    VisualRegion prepared_content{};
-    contracts::AnnotationSceneContent scene{};
+ static constexpr std::uint32_t output_scale = 4U;
+ VisualFrame frame{};
+ VisualFrame input{};
+ VisualExtent prepared_extent{};
+ VisualRegion prepared_content{};
+ contracts::AnnotationSceneContent scene{};
 };
 struct UpscaleSnapshot final {
-    std::uint64_t revision = 0U;
-    bool busy = false;
-    bool ready = false;
-    std::optional<UpscaleRequest> pending{};
-    std::array<UpscaleMethodSnapshot, 3U> methods{};
-    // CLEANUP-IGNORE: Upscale kernel selection is a domain field in its canonical generated snapshot.
-    UpscaleKernel kernel = UpscaleKernel::Default;
-    // CLEANUP-IGNORE: Upscale owns a receiver-private visual frame with its own generated identity.
-    VisualFrame frame{};
-    VisualFrame input{};
-    VisualExtent prepared_extent{};
-    VisualRegion prepared_content{};
-    // CLEANUP-IGNORE: Upscale completion and failure records retain distinct canonical field identities and delivery semantics.
-    contracts::AnnotationSceneContent scene{};
-    // CLEANUP-IGNORE: UpscaleSnapshot remains a distinct reflected application boundary.
+ std::uint64_t revision = 0U;
+ bool busy = false;
+ bool ready = false;
+ std::optional<UpscaleRequest> pending{};
+ std::array<UpscaleMethodSnapshot, 3U> methods{};
+ // CLEANUP-IGNORE: Upscale kernel selection is a domain field in its canonical generated snapshot.
+ UpscaleKernel kernel = UpscaleKernel::Default;
+ // CLEANUP-IGNORE: Upscale owns a receiver-private visual frame with its own generated identity.
+ VisualFrame frame{};
+ VisualFrame input{};
+ VisualExtent prepared_extent{};
+ VisualRegion prepared_content{};
+ // CLEANUP-IGNORE: Upscale completion and failure records retain distinct canonical field identities and delivery semantics.
+ contracts::AnnotationSceneContent scene{};
+ // CLEANUP-IGNORE: UpscaleSnapshot remains a distinct reflected application boundary.
 };
 struct[[= contracts::reflection::Event{contracts::reflection::EventDelivery::LatestState}]] UpscaleChanged final {
-    UpscaleSnapshot snapshot{};
+ UpscaleSnapshot snapshot{};
 };
 struct[[= contracts::reflection::Event{contracts::reflection::EventDelivery::Critical}]] UpscaleFailed final {
-    UpscaleSnapshot snapshot{};
-    [[= mmltk::frameworks::reflection::MaxBytes{kVisualFailureByteCapacity}]] std::string detail;
-    std::optional<UpscaleRequest> request{};
-    // CLEANUP-IGNORE: Upscale failure kind and source registration are domain declarations, not another runtime implementation.
-    UpscaleFailureKind kind = UpscaleFailureKind::Failed;
-    // CLEANUP-IGNORE: Upscale registers its own direct input endpoint and canonical source projection.
+ UpscaleSnapshot snapshot{};
+ [[= mmltk::frameworks::reflection::MaxBytes{kVisualFailureByteCapacity}]] std::string detail;
+ std::optional<UpscaleRequest> request{};
+ // CLEANUP-IGNORE: Upscale failure kind and source registration are domain declarations, not another runtime implementation.
+ UpscaleFailureKind kind = UpscaleFailureKind::Failed;
+ // CLEANUP-IGNORE: Upscale registers its own direct input endpoint and canonical source projection.
 };
 class UpscaleSystem final {
-   public:
-    [[= contracts::reflection::direct::InteractionEndpoint{}]] void Input(WorkspaceMouse);
-    void SetInputPeer(std::uint64_t);
-    using visual_source =
-        VisualSourceProjection<UpscaleSnapshot, PresentationSourceKind::Upscale, mmltk::frameworks::reflection::member_path<&UpscaleSnapshot::frame>,
-                               mmltk::frameworks::reflection::member_path<&UpscaleSnapshot::revision>, UpscaleImageMetadata>;
-    using event_type = std::variant<UpscaleChanged, UpscaleFailed>;
-    UpscaleSystem(VisualDeviceSettings, VisualRuntimeFactory, ExactVisualDocumentBorrower, SystemEventSink<event_type> = {}, VisualDiagnosticSink = {});
-    ~UpscaleSystem();
-    void Warm(VisualExtent) noexcept;
-    [[= contracts::reflection::direct::IntentEndpoint{}]] [[nodiscard]] UpscaleSnapshot Start(UpscaleRequest);
-    // CLEANUP-IGNORE: Upscale Stop is a distinct reflected endpoint with system-specific semantics.
-    [[= contracts::reflection::direct::IntentEndpoint{}]] void Stop() noexcept;
-    void Shutdown() noexcept;
-    [[nodiscard]] bool stopped() const noexcept;
-    // CLEANUP-IGNORE: The sealed Upscale facade publishes its own reflected snapshot and frame borrow.
-    [[= contracts::reflection::Snapshot{contracts::kAnnotationUiStateByteBudget}]] [[nodiscard]] UpscaleSnapshot snapshot() const;
-    [[nodiscard]] std::optional<UpscaleImageMetadata> ImageSnapshot(const VisualFrame&) const;
-    // CLEANUP-IGNORE: Upscale owns this sealed metadata and workspace API; shared implementation is already private.
-    [[nodiscard]] std::shared_ptr<const mmltk::frameworks::serialization::wire::Value> ImageSourceMetadata(const VisualFrame&) const;
-    // CLEANUP-IGNORE: Upscale owns this ordinary read API; a shared facade would couple independent domain systems.
-    [[nodiscard]] mmltk::frameworks::gpu::BorrowedImageProductReadView BorrowFrame() const;
-    [[nodiscard]] mmltk::frameworks::gpu::BorrowedImageWorkspace BorrowWorkspace() const;
-    [[nodiscard]] mmltk::frameworks::gpu::ImageWorkspaceObservation ObserveWorkspace() const;
-    void RequestWorkspace(VisualWorkspaceRequest);
-    [[nodiscard]] VisualDocumentRead BorrowDocument(const VisualFrame&) const;
+public:
+ [[= contracts::reflection::direct::InteractionEndpoint{}]] void Input(WorkspaceMouse);
+ void SetInputPeer(std::uint64_t);
+ using visual_source =
+  VisualSourceProjection<UpscaleSnapshot, PresentationSourceKind::Upscale, mmltk::frameworks::reflection::member_path<&UpscaleSnapshot::frame>,
+                         mmltk::frameworks::reflection::member_path<&UpscaleSnapshot::revision>, UpscaleImageMetadata>;
+ using event_type = std::variant<UpscaleChanged, UpscaleFailed>;
+ UpscaleSystem(VisualDeviceSettings, VisualRuntimeFactory, ExactVisualDocumentBorrower, SystemEventSink<event_type> = {}, VisualDiagnosticSink = {});
+ ~UpscaleSystem();
+ void Warm(VisualExtent) noexcept;
+ [[= contracts::reflection::direct::IntentEndpoint{}]] [[nodiscard]] UpscaleSnapshot Start(UpscaleRequest);
+ // CLEANUP-IGNORE: Upscale Stop is a distinct reflected endpoint with system-specific semantics.
+ [[= contracts::reflection::direct::IntentEndpoint{}]] void Stop() noexcept;
+ void Shutdown() noexcept;
+ [[nodiscard]] bool stopped() const noexcept;
+ // CLEANUP-IGNORE: The sealed Upscale facade publishes its own reflected snapshot and frame borrow.
+ [[= contracts::reflection::Snapshot{contracts::kAnnotationUiStateByteBudget}]] [[nodiscard]] UpscaleSnapshot snapshot() const;
+ [[nodiscard]] std::optional<UpscaleImageMetadata> ImageSnapshot(const VisualFrame&) const;
+ // CLEANUP-IGNORE: Upscale owns this sealed metadata and workspace API; shared implementation is already private.
+ [[nodiscard]] std::shared_ptr<const mmltk::frameworks::serialization::wire::Value> ImageSourceMetadata(const VisualFrame&) const;
+ // CLEANUP-IGNORE: Upscale owns this ordinary read API; a shared facade would couple independent domain systems.
+ [[nodiscard]] mmltk::frameworks::gpu::BorrowedImageProductReadView BorrowFrame() const;
+ [[nodiscard]] mmltk::frameworks::gpu::BorrowedImageWorkspace BorrowWorkspace() const;
+ [[nodiscard]] mmltk::frameworks::gpu::ImageWorkspaceObservation ObserveWorkspace() const;
+ void RequestWorkspace(VisualWorkspaceRequest);
+ [[nodiscard]] VisualDocumentRead BorrowDocument(const VisualFrame&) const;
 
-   private:
-    class Impl;
-    std::unique_ptr<Impl> impl_;
+private:
+ class Impl;
+ std::unique_ptr<Impl> impl_;
 };
 [[nodiscard]] VisualRuntimeFactory make_native_upscale_runtime_factory(VisualDeviceSettings,
                                                                        mmltk::backend::imaging::upscale::ImageUpscalerExecutionCheckpoint = {});

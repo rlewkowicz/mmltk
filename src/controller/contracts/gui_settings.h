@@ -14,17 +14,17 @@ namespace settings_json_detail {
 // source selections. This projects only type membership, never external keys.
 template <class T>
 consteval bool adapter_type() {
-    bool supported = std::same_as<T, GuiSettingsState>;
-    mmltk::frameworks::reflection::visit_materialized_members<GuiSettingsState>([&]<class Declaration>(const auto&) {
-        using Member = typename Declaration::member_type;
-        if constexpr (std::is_class_v<Member> && !std::same_as<Member, WorkflowSettingsState>) supported = supported || std::same_as<T, Member>;
-    });
-    mmltk::frameworks::reflection::visit_materialized_members<WorkflowSettingsState>([&]<class Declaration>(const auto&) {
-        using Workflow = typename Declaration::member_type;
-        supported = supported || std::same_as<T, Workflow>;
-        if constexpr (requires(Workflow value) { value.source; }) supported = supported || std::same_as<T, decltype(Workflow::source)>;
-    });
-    return supported;
+ bool supported = std::same_as<T, GuiSettingsState>;
+ mmltk::frameworks::reflection::visit_materialized_members<GuiSettingsState>([&]<class Declaration>(const auto&) {
+  using Member = typename Declaration::member_type;
+  if constexpr (std::is_class_v<Member> && !std::same_as<Member, WorkflowSettingsState>) supported = supported || std::same_as<T, Member>;
+ });
+ mmltk::frameworks::reflection::visit_materialized_members<WorkflowSettingsState>([&]<class Declaration>(const auto&) {
+  using Workflow = typename Declaration::member_type;
+  supported = supported || std::same_as<T, Workflow>;
+  if constexpr (requires(Workflow value) { value.source; }) supported = supported || std::same_as<T, decltype(Workflow::source)>;
+ });
+ return supported;
 }
 }  // namespace settings_json_detail
 template <class T>
@@ -39,15 +39,15 @@ namespace settings_json_detail {
 #endif
 template <GuiSettingsJsonAdapter State>
 struct JsonWrite final {
-    nlohmann::json& json;
-    const State& state;
-    friend void convert(JsonWrite);
+ nlohmann::json& json;
+ const State& state;
+ friend void convert(JsonWrite);
 };
 template <GuiSettingsJsonAdapter State>
 struct JsonRead final {
-    const nlohmann::json& json;
-    State& state;
-    friend void convert(JsonRead);
+ const nlohmann::json& json;
+ State& state;
+ friend void convert(JsonRead);
 };
 #if defined(__GNUC__) && !defined(__clang__)
 #pragma GCC diagnostic pop
@@ -55,11 +55,11 @@ struct JsonRead final {
 }  // namespace settings_json_detail
 template <GuiSettingsJsonAdapter State>
 void to_json(nlohmann::json& json, const State& state) {
-    convert(settings_json_detail::JsonWrite<State>{json, state});
+ convert(settings_json_detail::JsonWrite<State>{json, state});
 }
 template <GuiSettingsJsonAdapter State>
 void from_json(const nlohmann::json& json, State& state) {
-    convert(settings_json_detail::JsonRead<State>{json, state});
+ convert(settings_json_detail::JsonRead<State>{json, state});
 }
 [[nodiscard]] nlohmann::json snapshot_gui_settings(const GuiSettingsState& state);
 void apply_gui_settings(const nlohmann::json& j, GuiSettingsState& state);

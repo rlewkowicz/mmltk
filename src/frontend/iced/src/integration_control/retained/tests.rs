@@ -716,8 +716,22 @@ fn retained_workflows_require_the_unique_settled_control_owner() {
     annotation.inputdocumentepoch = 1;
     driver.observe_annotation_open(
         crate::generated::AnnotationOpen {
-            crop: model.explore.snapshot.as_ref().unwrap().frame.content.clone(),
-            target: model.explore.snapshot.as_ref().unwrap().frame.extent.clone(),
+            crop: model
+                .explore
+                .snapshot
+                .as_ref()
+                .unwrap()
+                .frame
+                .content
+                .clone(),
+            target: model
+                .explore
+                .snapshot
+                .as_ref()
+                .unwrap()
+                .frame
+                .extent
+                .clone(),
             source: model.explore.snapshot.as_ref().unwrap().frame.clone(),
         },
         0,

@@ -509,9 +509,14 @@ impl App {
         }
         if self.workspace.active() == FeatureId::Explore
             && self.model.foreground_visual() == Some(PresentationSourceKind::Explore)
-            && self.model.explore.snapshot.as_ref().is_some_and(|snapshot| {
-                snapshot.ready && snapshot.mode == crate::generated::ExploreMode::Gallery
-            })
+            && self
+                .model
+                .explore
+                .snapshot
+                .as_ref()
+                .is_some_and(|snapshot| {
+                    snapshot.ready && snapshot.mode == crate::generated::ExploreMode::Gallery
+                })
             && !self.presentation.gallery_handoff
             && self.presentation.pending.is_none()
             && crate::presentation_surface::gallery::displayed().is_none()
@@ -552,8 +557,8 @@ impl App {
 
 impl Controller {
     fn reject_gallery_handoff(&mut self, frame: FrameReady, model: &ApplicationModel) {
-        let rejected_pending = self.pending_rejected
-            && self.pending.and_then(|surface| surface.frame) == Some(frame);
+        let rejected_pending =
+            self.pending_rejected && self.pending.and_then(|surface| surface.frame) == Some(frame);
         if model.foreground_visual() != Some(PresentationSourceKind::Explore)
             || frame.content_session
                 != crate::generated::presentation_source_session(PresentationSourceKind::Explore)
@@ -571,9 +576,12 @@ impl Controller {
         if (self.pending.is_some() && !rejected_pending)
             || self.gallery_blocked.is_some()
             || (!rejected_pending
-                && self.incumbent.and_then(|surface| surface.frame).is_some_and(|previous| {
-                    previous.presentation_revision >= frame.presentation_revision
-                }))
+                && self
+                    .incumbent
+                    .and_then(|surface| surface.frame)
+                    .is_some_and(|previous| {
+                        previous.presentation_revision >= frame.presentation_revision
+                    }))
         {
             return;
         }
@@ -602,9 +610,12 @@ impl Controller {
                 if frame.presentation_revision > self.gallery_rejection_revision
                     && self.pending.is_none()
                     && self.gallery_blocked.is_none()
-                    && self.incumbent.and_then(|surface| surface.frame).is_none_or(|previous| {
-                        previous.presentation_revision < frame.presentation_revision
-                    })
+                    && self
+                        .incumbent
+                        .and_then(|surface| surface.frame)
+                        .is_none_or(|previous| {
+                            previous.presentation_revision < frame.presentation_revision
+                        })
                     && crate::presentation_surface::publication_admission_blocked(frame)
                 {
                     self.gallery_blocked = Some(frame);
@@ -688,9 +699,10 @@ impl Controller {
             return Ok(());
         }
         let _ = recovery;
-        if self.gallery_blocked.is_some_and(|frame| {
-            !crate::presentation_surface::publication_admission_blocked(frame)
-        }) {
+        if self
+            .gallery_blocked
+            .is_some_and(|frame| !crate::presentation_surface::publication_admission_blocked(frame))
+        {
             self.gallery_blocked = None;
             self.gallery_handoff = false;
         }
@@ -2014,8 +2026,14 @@ mod tests {
                 crate::generated::encode_annotation_Open(
                     intent.correlation,
                     AnnotationOpen {
-                        crop: crate::generated::VisualRegion { x: 0, y: 0, width: expected.extent.width, height: expected.extent.height },
-                        target: expected.extent.clone(), source: expected,
+                        crop: crate::generated::VisualRegion {
+                            x: 0,
+                            y: 0,
+                            width: expected.extent.width,
+                            height: expected.extent.height
+                        },
+                        target: expected.extent.clone(),
+                        source: expected,
                     }
                 )
                 .record
@@ -2120,7 +2138,10 @@ mod tests {
             intent.correlation,
             AnnotationOpen {
                 crop: expected.content.clone(),
-                target: crate::generated::VisualExtent { width: 1600, height: 1200 },
+                target: crate::generated::VisualExtent {
+                    width: 1600,
+                    height: 1200,
+                },
                 source: expected,
             },
         );

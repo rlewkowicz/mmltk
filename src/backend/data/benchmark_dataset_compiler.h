@@ -14,39 +14,39 @@
 #include "src/backend/data/dataset_compile_phase.h"
 namespace mmltk::backend::data {
 enum class BenchmarkDatasetSource : std::uint8_t {
-    kCoco2017,
-    kObjects365V2,
-    kOpenImagesV7,
-    kCoconut,
-    kObjects365V1,
+ kCoco2017,
+ kObjects365V2,
+ kOpenImagesV7,
+ kCoconut,
+ kObjects365V1,
 };
 struct BenchmarkSourceProgress {
-    BenchmarkDatasetSource source = BenchmarkDatasetSource::kCoco2017;
-    std::string activity;
-    std::uint64_t completed_bytes = 0;
-    std::uint64_t total_bytes = 0;
-    std::uint64_t completed_images = 0;
-    std::uint64_t total_images = 0;
-    std::uint32_t retry_count = 0;
-    bool cache_hit = false;
-    bool resumed = false;
-    bool complete = false;
-    // Unobserved sources are neutral; an observed unknown-size contribution clears this.
-    bool byte_total_known = true;
+ BenchmarkDatasetSource source = BenchmarkDatasetSource::kCoco2017;
+ std::string activity;
+ std::uint64_t completed_bytes = 0;
+ std::uint64_t total_bytes = 0;
+ std::uint64_t completed_images = 0;
+ std::uint64_t total_images = 0;
+ std::uint32_t retry_count = 0;
+ bool cache_hit = false;
+ bool resumed = false;
+ bool complete = false;
+ // Unobserved sources are neutral; an observed unknown-size contribution clears this.
+ bool byte_total_known = true;
 };
 struct BenchmarkCompileProgress {
-    DatasetCompilePhase phase = DatasetCompilePhase::Planning;
-    std::string activity;
-    std::uint64_t activity_elapsed_seconds = 0;
-    std::uint64_t completed = 0;
-    std::uint64_t total = 0;
-    std::uint64_t pixel_attempt = 0;
-    std::uint64_t pixel_attempt_offset = 0;
-    std::uint64_t projected_output_bytes = 0;
-    std::uint64_t dropped_instances = 0;
-    std::uint64_t quarantined_images = 0;
-    std::optional<BenchmarkDatasetSource> current_source = std::nullopt;
-    std::vector<BenchmarkSourceProgress> sources;
+ DatasetCompilePhase phase = DatasetCompilePhase::Planning;
+ std::string activity;
+ std::uint64_t activity_elapsed_seconds = 0;
+ std::uint64_t completed = 0;
+ std::uint64_t total = 0;
+ std::uint64_t pixel_attempt = 0;
+ std::uint64_t pixel_attempt_offset = 0;
+ std::uint64_t projected_output_bytes = 0;
+ std::uint64_t dropped_instances = 0;
+ std::uint64_t quarantined_images = 0;
+ std::optional<BenchmarkDatasetSource> current_source = std::nullopt;
+ std::vector<BenchmarkSourceProgress> sources;
 };
 using BenchmarkProgressCallback = std::function<void(const BenchmarkCompileProgress&)>;
 // Synchronous borrowed views. Empty json_fields reports diagnostic construction or
@@ -55,20 +55,20 @@ using BenchmarkProgressCallback = std::function<void(const BenchmarkCompileProgr
 using BenchmarkTraceCallback = std::function<void(std::string_view event, std::string_view json_fields)>;
 [[nodiscard]] std::string format_benchmark_source_status(const BenchmarkSourceProgress& progress, std::string_view default_status);
 struct BenchmarkCompilerConfig {
-    BenchmarkDatasetSelection selection;
-    std::filesystem::path output_dir{"./compiled"};
-    // Optional final destination for callers that publish output_dir elsewhere.
-    // Used only for cache overlap admission; empty means output_dir.
-    std::filesystem::path publication_dir;
-    std::filesystem::path cache_dir;
-    std::uint32_t resolution = 432;
-    int num_workers = -1;
-    bool overwrite = false;
-    bool perceptual_downscale = false;
-    mmltk::backend::imaging::resample::ImageResizeMode resize_mode = mmltk::backend::imaging::resample::ImageResizeMode::Stretch;
-    mmltk::common::concurrency::CancellationObservation cancel_requested;
-    BenchmarkProgressCallback progress;
-    BenchmarkTraceCallback trace;
+ BenchmarkDatasetSelection selection;
+ std::filesystem::path output_dir{"./compiled"};
+ // Optional final destination for callers that publish output_dir elsewhere.
+ // Used only for cache overlap admission; empty means output_dir.
+ std::filesystem::path publication_dir;
+ std::filesystem::path cache_dir;
+ std::uint32_t resolution = 432;
+ int num_workers = -1;
+ bool overwrite = false;
+ bool perceptual_downscale = false;
+ mmltk::backend::imaging::resample::ImageResizeMode resize_mode = mmltk::backend::imaging::resample::ImageResizeMode::Stretch;
+ mmltk::common::concurrency::CancellationObservation cancel_requested;
+ BenchmarkProgressCallback progress;
+ BenchmarkTraceCallback trace;
 };
 void compile_benchmark_dataset(BenchmarkCompilerConfig config);
 }  // namespace mmltk::backend::data

@@ -6,7 +6,7 @@ namespace {
 using namespace mmltk::controller::services;
 using namespace mmltk::controller::contracts;
 std::string sample_payload() {
-    return R"json([
+ return R"json([
         {"id": 1001, "gpu_name": "H100 SXM", "num_gpus": 8, "dlperf_usd": 18.0, "dlperf": 120.0, "dph": 8.0, "reliability": 0.99},
         {"id": 1002, "gpu_name": "H100 PCIe", "num_gpus": 4, "dlperf_usd": 17.0, "dlperf": 90.0, "dph": 5.5, "reliability": 0.98},
         {"id": 1003, "gpu_name": "L40S", "num_gpus": 4, "dlperf_usd": 19.0, "dlperf": 70.0, "dph": 4.0, "reliability": 0.97},
@@ -15,49 +15,48 @@ std::string sample_payload() {
     ])json";
 }
 void test_parse_payload() {
-    const std::vector<VastRawOffer> offers = parse_vast_offer_payload(sample_payload());
-    REQUIRE((offers.size() == 5U));
-    REQUIRE((offers[0].offer_id == 1001));
-    REQUIRE((offers[2].gpu_name == "L40S"));
+ const std::vector<VastRawOffer> offers = parse_vast_offer_payload(sample_payload());
+ REQUIRE((offers.size() == 5U));
+ REQUIRE((offers[0].offer_id == 1001));
+ REQUIRE((offers[2].gpu_name == "L40S"));
 }
 void test_parse_payload_from_object_rows() {
-    const std::vector<VastRawOffer> offers =
-        parse_vast_offer_payload(R"json({"rows":[{"id": 2001, "gpu_name": "L4", "num_gpus": 4, "dlperf_usd": 12.0}]})json");
-    REQUIRE((offers.size() == 1U));
-    REQUIRE((offers[0].offer_id == 2001));
+ const std::vector<VastRawOffer> offers = parse_vast_offer_payload(R"json({"rows":[{"id": 2001, "gpu_name": "L4", "num_gpus": 4, "dlperf_usd": 12.0}]})json");
+ REQUIRE((offers.size() == 1U));
+ REQUIRE((offers[0].offer_id == 2001));
 }
 void test_rank_filters_and_limits() {
-    const std::vector<VastRawOffer> offers = parse_vast_offer_payload(sample_payload());
-    const std::vector<VastOfferSummary> ranked = rank_vast_offers(offers, {ProviderGpuFamily::H100, ProviderGpuFamily::LSeries, ProviderGpuFamily::B200}, 2, 4);
-    REQUIRE((ranked.size() == 2U));
-    REQUIRE((ranked[0].offer_id == 1003));
-    REQUIRE((ranked[1].offer_id == 1001));
+ const std::vector<VastRawOffer> offers = parse_vast_offer_payload(sample_payload());
+ const std::vector<VastOfferSummary> ranked = rank_vast_offers(offers, {ProviderGpuFamily::H100, ProviderGpuFamily::LSeries, ProviderGpuFamily::B200}, 2, 4);
+ REQUIRE((ranked.size() == 2U));
+ REQUIRE((ranked[0].offer_id == 1003));
+ REQUIRE((ranked[1].offer_id == 1001));
 }
 void test_rank_excludes_under_min_gpu_count() {
-    const std::vector<VastRawOffer> offers = parse_vast_offer_payload(sample_payload());
-    const std::vector<VastOfferSummary> ranked = rank_vast_offers(offers, {ProviderGpuFamily::A100, ProviderGpuFamily::H100}, 4, 4);
-    REQUIRE((ranked.size() == 2U));
-    for (const VastOfferSummary& offer : ranked) { REQUIRE((offer.num_gpus >= 4)); }
+ const std::vector<VastRawOffer> offers = parse_vast_offer_payload(sample_payload());
+ const std::vector<VastOfferSummary> ranked = rank_vast_offers(offers, {ProviderGpuFamily::A100, ProviderGpuFamily::H100}, 4, 4);
+ REQUIRE((ranked.size() == 2U));
+ for (const VastOfferSummary& offer : ranked) { REQUIRE((offer.num_gpus >= 4)); }
 }
 void test_l_series_matches_l4_family() {
-    const std::vector<VastRawOffer> offers = parse_vast_offer_payload(
-        R"json([{"id": 3001, "gpu_name": "L4", "num_gpus": 4, "dlperf_usd": 15.0, "dlperf": 50.0, "dph": 3.0, "reliability": 0.96}])json");
-    const std::vector<VastOfferSummary> ranked = rank_vast_offers(offers, {ProviderGpuFamily::LSeries}, 2, 4);
-    REQUIRE((ranked.size() == 1U));
-    REQUIRE((ranked[0].family == ProviderGpuFamily::LSeries));
+ const std::vector<VastRawOffer> offers =
+  parse_vast_offer_payload(R"json([{"id": 3001, "gpu_name": "L4", "num_gpus": 4, "dlperf_usd": 15.0, "dlperf": 50.0, "dph": 3.0, "reliability": 0.96}])json");
+ const std::vector<VastOfferSummary> ranked = rank_vast_offers(offers, {ProviderGpuFamily::LSeries}, 2, 4);
+ REQUIRE((ranked.size() == 1U));
+ REQUIRE((ranked[0].family == ProviderGpuFamily::LSeries));
 }
 void test_rank_tie_breakers_prefer_lower_price_then_reliability() {
-    const std::vector<VastRawOffer> offers = parse_vast_offer_payload(
-        R"json([
+ const std::vector<VastRawOffer> offers = parse_vast_offer_payload(
+  R"json([
             {"id": 4001, "gpu_name": "H200", "num_gpus": 4, "dlperf_usd": 20.0, "dlperf": 100.0, "dph": 5.0, "reliability": 0.95},
             {"id": 4002, "gpu_name": "H200", "num_gpus": 4, "dlperf_usd": 20.0, "dlperf": 100.0, "dph": 4.5, "reliability": 0.94},
             {"id": 4003, "gpu_name": "H200", "num_gpus": 4, "dlperf_usd": 20.0, "dlperf": 100.0, "dph": 4.5, "reliability": 0.97}
         ])json");
-    const std::vector<VastOfferSummary> ranked = rank_vast_offers(offers, {ProviderGpuFamily::H200}, 3, 4);
-    REQUIRE((ranked.size() == 3U));
-    REQUIRE((ranked[0].offer_id == 4003));
-    REQUIRE((ranked[1].offer_id == 4002));
-    REQUIRE((ranked[2].offer_id == 4001));
+ const std::vector<VastOfferSummary> ranked = rank_vast_offers(offers, {ProviderGpuFamily::H200}, 3, 4);
+ REQUIRE((ranked.size() == 3U));
+ REQUIRE((ranked[0].offer_id == 4003));
+ REQUIRE((ranked[1].offer_id == 4002));
+ REQUIRE((ranked[2].offer_id == 4001));
 }
 }  // namespace
 TEST_CASE("test_parse_payload", "[gui][vast_runtime]") { test_parse_payload(); }
