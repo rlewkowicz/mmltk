@@ -1,4 +1,5 @@
 #include "detail/benchmark_images.h"
+#include "detail/benchmark_image_decoder.h"
 #include <archive.h>
 #include <archive_entry.h>
 #include <fcntl.h>
@@ -103,9 +104,9 @@ class CachedImageWritePool {
         throw_if_benchmark_cancelled(cancellation_);
         if (inline_mode_) {
             const std::uint64_t bytes = encoded.size();
-            if (!has_complete_jpeg_markers(encoded)) {
+            if (!has_complete_image_markers(encoded)) {
                 recycle(std::move(encoded));
-                throw std::runtime_error("selected archive entry is not a complete JPEG");
+                throw std::runtime_error("selected archive image " + std::to_string(image_id) + " is not a complete JPEG or PNG");
             }
             write_cached_image_atomically(cached_image_path(output_root_, image_id), encoded, cancellation_);
             written_ids_.push_back(image_id);
@@ -165,7 +166,9 @@ class CachedImageWritePool {
             if (!task) { return; }
             try {
                 const std::uint64_t bytes = task->encoded.size();
-                if (!has_complete_jpeg_markers(task->encoded)) { throw std::runtime_error("selected archive entry is not a complete JPEG"); }
+                if (!has_complete_image_markers(task->encoded)) {
+                    throw std::runtime_error("selected archive image " + std::to_string(task->image_id) + " is not a complete JPEG or PNG");
+                }
                 throw_if_benchmark_cancelled(cancellation_);
                 write_cached_image_atomically(cached_image_path(output_root_, task->image_id), task->encoded, cancellation_);
                 std::uint64_t completed = 0U;
@@ -316,12 +319,6 @@ std::size_t format_cached_image_relative_path(const std::uint64_t image_id, cons
     if (length != static_cast<int>(kPathCharacters)) { throw std::runtime_error("cannot format cached benchmark image ID"); }
     return static_cast<std::size_t>(length);
 }
-bool has_complete_jpeg_markers(const std::span<const std::uint8_t> encoded) noexcept {
-    if (encoded.size() < 4U || encoded[0] != 0xFFU || encoded[1] != 0xD8U) { return false; }
-    std::size_t end = encoded.size();
-    while (end > 2U && encoded[end - 1U] == 0xFFU) { --end; }
-    return end >= 4U && encoded[end - 2U] == 0xFFU && encoded[end - 1U] == 0xD9U;
-}
 void write_cached_image_atomically(const std::filesystem::path& path, const std::span<const std::uint8_t> encoded,
                                    const mmltk::common::concurrency::CancellationObservation cancellation) {
     if (encoded.empty()) { throw std::runtime_error("cannot cache an empty benchmark image"); }
@@ -452,7 +449,7 @@ CachedImageDirectory extract_selected_archive_images(ArchiveExtractionRequest re
     const int output_descriptor = ::open(request.output_root.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
     if (output_descriptor < 0) { throw errno_error("cannot open cached benchmark image directory", request.output_root.string()); }
     FileHandle output_directory(output_descriptor);
-    if (request.activity) { request.activity("Checking individually cached JPEGs"); }
+    if (request.activity) { request.activity("Checking individually cached images"); }
     std::size_t inspected = 0U;
     for (const std::uint64_t image_id : request.selected_image_ids) {
         throw_if_benchmark_cancelled(request.cancel_requested);
@@ -498,7 +495,7 @@ CachedImageDirectory extract_selected_archive_images(ArchiveExtractionRequest re
     const std::size_t pending_writes = selected.size() - completed.size() - unavailable.size();
     if (request.activity) {
         request.activity(request.cache_write_workers == 0U
-                             ? "Preparing inline selected-JPEG cache writes"
+                             ? "Preparing inline selected-image cache writes"
                              : "Preparing bounded cache-write queue with " + std::to_string(request.cache_write_workers) + " workers");
     }
     CachedImageWritePool write_pool(request.cache_write_workers, pending_writes, request.output_root, request.progress, completed.size(),
@@ -516,7 +513,7 @@ CachedImageDirectory extract_selected_archive_images(ArchiveExtractionRequest re
         require_archive_setup(reader.get(), archive_read_open(reader.get(), parallel_gzip.get(), nullptr, read_parallel_gzip, nullptr),
                               "open parallel gzip archive", request.archive_path, request.trace);
     } else {
-        if (request.activity) { request.activity("Scanning archive and extracting selected JPEGs"); }
+        if (request.activity) { request.activity("Scanning archive and extracting selected images"); }
         require_archive_setup(reader.get(), archive_read_support_filter_all(reader.get()), "enable archive filters", request.archive_path, request.trace);
         require_archive_setup(reader.get(), archive_read_support_format_tar(reader.get()), "enable tar archive support", request.archive_path, request.trace);
         require_archive_setup(reader.get(), archive_read_support_format_zip(reader.get()), "enable zip archive support", request.archive_path, request.trace);
@@ -557,7 +554,7 @@ CachedImageDirectory extract_selected_archive_images(ArchiveExtractionRequest re
             throw std::runtime_error("selected benchmark archive image has an invalid size");
         }
         if (!extraction_announced && request.activity) {
-            request.activity("Extracting selected JPEG payloads into the cache-write queue");
+            request.activity("Extracting selected image payloads into the cache-write queue");
             extraction_announced = true;
         }
         encoded = write_pool.acquire(checked_cast<std::size_t>(entry_size, "benchmark archive image size overflow"));
@@ -574,6 +571,10 @@ CachedImageDirectory extract_selected_archive_images(ArchiveExtractionRequest re
             try {
                 request.validator(*image_id, encoded);
             } catch (const std::exception& error) {
+                trace_benchmark_event(request.trace, "benchmark.images.validation_failed", [&] {
+                    return nlohmann::json{{"source", request.source}, {"shard", request.shard}, {"member", pathname},
+                                          {"image_id", *image_id}, {"bytes", encoded.size()}, {"reason", error.what()}};
+                });
                 if (!request.quarantine_unavailable) { throw; }
                 quarantined.push_back(CachedImageRejection{*image_id, error.what()});
                 unavailable.emplace(*image_id);
@@ -581,7 +582,7 @@ CachedImageDirectory extract_selected_archive_images(ArchiveExtractionRequest re
                 continue;
             } catch (...) {
                 if (!request.quarantine_unavailable) { throw; }
-                quarantined.push_back(CachedImageRejection{*image_id, "benchmark JPEG validation raised a non-standard exception"});
+                quarantined.push_back(CachedImageRejection{*image_id, "benchmark image validation raised a non-standard exception"});
                 unavailable.emplace(*image_id);
                 write_pool.recycle(std::move(encoded));
                 continue;
@@ -592,7 +593,7 @@ CachedImageDirectory extract_selected_archive_images(ArchiveExtractionRequest re
         scheduled.emplace(*image_id);
         write_pool.submit(*image_id, std::move(encoded));
     }
-    if (request.activity && request.cache_write_workers != 0U) { request.activity("Draining selected JPEG cache writes"); }
+    if (request.activity && request.cache_write_workers != 0U) { request.activity("Draining selected image cache writes"); }
     for (const std::uint64_t image_id : write_pool.finish(&image_bytes)) { completed.emplace(image_id); }
     std::vector<std::uint64_t> missing;
     if (completed.size() + unavailable.size() != selected.size()) {

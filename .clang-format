@@ -1,9 +1,9 @@
 ---
 BasedOnStyle: Google
 ColumnLimit: 160
-IndentWidth: 4
-ContinuationIndentWidth: 4
-TabWidth: 4
+IndentWidth: 1
+ContinuationIndentWidth: 1
+TabWidth: 1
 UseTab: Never
 DerivePointerAlignment: false
 PointerAlignment: Left

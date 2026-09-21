@@ -674,8 +674,30 @@ std::vector<CoconutRecord> json_records(const CoconutImportRequest& request) {
     throw_if_benchmark_cancelled(request.cancellation);
     const auto& categories = coconut_categories();
     NumericCategoryAdmission category_admission(categories);
-    std::unordered_map<std::uint64_t, Json> by_id;
-    std::unordered_map<std::string, std::uint64_t> by_file;
+    struct ImageRow {
+        std::optional<std::uint64_t> id;
+        std::string file_name;
+        std::string physical_stem;
+        std::uint32_t width = 0, height = 0;
+    };
+    std::vector<ImageRow> images;
+    std::unordered_map<std::uint64_t, std::size_t> by_id;
+    std::unordered_map<std::string, std::size_t> by_file, by_physical_stem;
+    const auto physical_stem = [](const Json& row) {
+        std::string stem;
+        for (const auto field : {"object365_file_name", "object365_name", "file_name"}) {
+            const auto found = row.find(field);
+            if (found == row.end() || found->is_null()) continue;
+            const auto& name = found->get_ref<const std::string&>();
+            if (name.empty() || (std::string_view(field) == "file_name" &&
+                                 !std::filesystem::path(name).filename().string().starts_with("objects365_")))
+                continue;
+            const auto parsed = objects_name(name);
+            if (!stem.empty() && stem != parsed.stem) invalid("contradictory declared Objects365 members");
+            stem = parsed.stem;
+        }
+        return stem;
+    };
     constexpr std::array<std::string_view, 2> preparation_fields{"categories", "images"};
     json_rows(request, preparation_fields, [&](std::string_view field, const Json& row) {
         if (field == "categories") {
@@ -686,17 +708,25 @@ std::vector<CoconutRecord> json_records(const CoconutImportRequest& request) {
             category_admission.observe(id, name ? std::optional<std::string_view>(*name) : std::nullopt);
             return;
         }
-        const auto id = unsigned_field(row, "id");
-        Json metadata = Json::object();
-        for (const auto key : {"id", "file_name", "object365_file_name", "object365_name", "width", "height"}) {
-            if (row.contains(key)) metadata[key] = row.at(key);
+        ImageRow image;
+        if (row.contains("id")) {
+            image.id = unsigned_field(row, "id");
+            if (!by_id.emplace(*image.id, images.size()).second) invalid("duplicate JSON image ID");
         }
-        if (!by_id.emplace(id, std::move(metadata)).second) invalid("duplicate JSON image ID");
-        if (row.contains("file_name") && !by_file.emplace(row.at("file_name").get<std::string>(), id).second) invalid("duplicate JSON image filename");
+        if (row.contains("file_name")) {
+            image.file_name = row.at("file_name").get<std::string>();
+            if (!by_file.emplace(image.file_name, images.size()).second) invalid("duplicate JSON image filename");
+        }
+        image.physical_stem = physical_stem(row);
+        if (!image.physical_stem.empty() && !by_physical_stem.emplace(image.physical_stem, images.size()).second)
+            invalid("duplicate JSON physical image: " + image.physical_stem);
+        image.width = dimension(row, "width", request.limits);
+        image.height = dimension(row, "height", request.limits);
+        images.push_back(std::move(image));
     });
     category_admission.complete();
     std::vector<CoconutRecord> result;
-    std::unordered_set<std::uint64_t> joined_images;
+    std::vector<bool> joined_images(images.size(), false);
     std::uint64_t segment_ordinal = 0;
     constexpr std::array<std::string_view, 1> annotation_fields{"annotations"};
     json_rows(request, annotation_fields, [&](std::string_view, const Json& annotation) {
@@ -704,54 +734,50 @@ std::vector<CoconutRecord> json_records(const CoconutImportRequest& request) {
         CoconutRecord record;
         record.source_ordinal = result.size();
         record.first_segment_ordinal = segment_ordinal;
-        const Json* image = nullptr;
+        std::optional<std::size_t> image_index;
+        const auto join = [&](const auto& lookup, const auto& key) {
+            const auto found = lookup.find(key);
+            if (found == lookup.end()) return;
+            if (image_index && *image_index != found->second) invalid("contradictory JSON image joins: " + record.file_name);
+            image_index = found->second;
+        };
         if (annotation.contains("image_id")) {
             record.image_id = unsigned_field(annotation, "image_id");
-            const auto found = by_id.find(record.image_id);
-            if (found != by_id.end()) image = &found->second;
+            join(by_id, record.image_id);
         }
         if (annotation.contains("file_name")) {
             record.file_name = annotation.at("file_name").get<std::string>();
-            const auto found = by_file.find(record.file_name);
-            if (found != by_file.end()) {
-                const auto* joined = &by_id.at(found->second);
-                if (image && image != joined) invalid("contradictory JSON image joins: " + record.file_name);
-                image = joined;
-                if (annotation.contains("image_id") && unsigned_field(*image, "id") != record.image_id) invalid("annotation/image ID disagreement");
-            }
+            join(by_file, record.file_name);
         }
-        const auto join_name = [&](const Json& object, std::string_view field) {
-            auto found = object.find(std::string(field));
-            if (found == object.end() || found->is_null()) return;
-            const auto name = found->get<std::string>();
-            if (name.empty()) return;
-            const auto parsed = objects_name(name);
-            if (!record.physical_stem.empty() && record.physical_stem != parsed.stem) invalid("contradictory declared Objects365 members");
-            record.physical_stem = parsed.stem;
-        };
-        join_name(annotation, "object365_file_name");
-        if (std::filesystem::path(record.file_name).filename().string().starts_with("objects365_")) join_name(annotation, "file_name");
-        if (!image && request.edition == CoconutEdition::ObjectsValidation) invalid("validation annotation has no image-record join: " + record.file_name);
-        if (image) {
-            if (!joined_images.insert(unsigned_field(*image, "id")).second) invalid("multiple annotations join one image row: " + record.file_name);
-            join_name(*image, "object365_file_name");
-            join_name(*image, "object365_name");
-            if (image->contains("file_name") && std::filesystem::path(image->at("file_name").get<std::string>()).filename().string().starts_with("objects365_"))
-                join_name(*image, "file_name");
-            record.width = dimension(*image, "width", request.limits);
-            record.height = dimension(*image, "height", request.limits);
-            if (!annotation.contains("image_id")) record.image_id = unsigned_field(*image, "id");
+        record.physical_stem = physical_stem(annotation);
+        if (!record.physical_stem.empty()) join(by_physical_stem, record.physical_stem);
+        if (!image_index && request.edition == CoconutEdition::ObjectsValidation)
+            invalid("validation annotation has no image-record join: " + record.file_name);
+        if (image_index) {
+            const auto& image = images[*image_index];
+            if (joined_images[*image_index]) invalid("multiple annotations join one image row: " + record.file_name);
+            joined_images[*image_index] = true;
+            if (image.id && annotation.contains("image_id") && *image.id != record.image_id) invalid("annotation/image ID disagreement");
+            if (!image.physical_stem.empty()) {
+                if (!record.physical_stem.empty() && record.physical_stem != image.physical_stem) invalid("contradictory declared Objects365 members");
+                record.physical_stem = image.physical_stem;
+            }
+            record.width = image.width;
+            record.height = image.height;
         }
         if (record.physical_stem.empty()) invalid("unresolved offered JSON annotation: " + record.file_name);
-        if (!annotation.contains("image_id") && !image) record.image_id = objects_name(record.physical_stem).id;
+        if (!annotation.contains("image_id")) {
+            const auto declared_id = image_index ? images[*image_index].id : std::nullopt;
+            record.image_id = declared_id ? *declared_id : objects_name(record.physical_stem).id;
+        }
         segments_from_json(annotation.at("segments_info"), record, request.limits);
         if (record.segments.size() > UINT64_MAX - segment_ordinal) invalid("segment ordinal overflow");
         segment_ordinal += record.segments.size();
         result.push_back(std::move(record));
     });
-    for (const auto& [id, image] : by_id) {
+    for (std::size_t i = 0; i < images.size(); ++i) {
         throw_if_benchmark_cancelled(request.cancellation);
-        if (!joined_images.contains(id)) invalid("offered JSON image has no annotation/mask join: " + std::to_string(id));
+        if (!joined_images[i]) invalid("offered JSON image has no annotation/mask join: " + images[i].file_name);
     }
     return result;
 }

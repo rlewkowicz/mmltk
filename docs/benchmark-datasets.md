@@ -79,7 +79,9 @@ provenance. Objects365 v1 and v2 remain distinct namespaces.
 B's train/unlabeled membership comes from complete JPEG archive inventories
 bound to archive identity. Its `coco_url`, row position, numeric ranges, or a
 foreground-filtered stock annotation index cannot establish that subset.
-Large's heterogeneous rows join through declared filenames and image records.
+Large's heterogeneous rows join through declared IDs, filenames, or full
+Objects365 stems. Image rows without `id` join through `object365_name` or
+`object365_file_name`; an annotation's supplied release ID remains intact.
 XL pairs full names in `panseg/` and `panseg_info/`; its PNG supplies missing
 dimensions. Validation joins use the declared physical stem, independently of
 archive order. Import, inventory, and extraction share canonical member spelling:
@@ -113,6 +115,13 @@ The canonical limits are in
 These precede the separate compiled-format capacity checks below.
 
 ## Persistent cache and publication
+
+Source-image validation and decoding recognize JPEG or PNG from the encoded
+content, including PNG payloads stored under `.jpg` archive members. The shared
+[image decoder](../src/backend/data/benchmark_image_decoder.cpp) retains TurboJPEG
+for JPEG and uses the existing PNG decoder without recompressing the source.
+Cached image paths keep their stable `.jpg` spelling and original encoded bytes;
+PNG pixels, dimensions, and annotation joins remain intact.
 
 The benchmark cache is persistent source data. Its default wrapper location is
 `.cache/benchmark-dataset/v1`; it remains reusable across compilation failures,
@@ -166,7 +175,9 @@ dependent inventories/labels at the compiler's preparation boundary after
 workers settle. COCONut's physical archive owner permits at most three structural
 admissions per archive across that recovery. COCONut never converts exhausted
 recovery into silent image loss; Coco custom retains its established quarantine
-behavior.
+behavior. Exhausted recovery includes the underlying failure and available image
+ID. Opt-in `benchmark.images.validation_failed` records include the archive
+member, source/shard, image ID, encoded byte count, and rejection reason.
 
 [CocoAnnotationCache](../src/backend/data/detail/benchmark_annotation_cache.h)
 is the shared stock-annotation admission owner for Coco custom and Coconut's

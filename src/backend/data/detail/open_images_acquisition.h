@@ -9,7 +9,7 @@
 #include "benchmark_cache.h"
 #include "src/common/concurrency/cancellation_observation.h"
 #include "benchmark_images.h"
-#include "benchmark_jpeg.h"
+#include "benchmark_image_decoder.h"
 #include "benchmark_progress.h"
 namespace mmltk::backend::data::benchmark_internal {
 struct QuarantinedImage {
@@ -28,5 +28,5 @@ struct AcquiredOpenImages {
                                                      std::vector<QuarantinedImage>* quarantined,
                                                      mmltk::common::concurrency::CancellationObservation cancel_requested, ProgressReporter* progress,
                                                      const int num_workers, const std::size_t cache_workers, const BenchmarkTraceSink& trace,
-                                                     const std::optional<JpegDecodeProbe> decode_probe = std::nullopt);
+                                                     const std::optional<ImageDecodeProbe> decode_probe = std::nullopt);
 }  // namespace mmltk::backend::data::benchmark_internal

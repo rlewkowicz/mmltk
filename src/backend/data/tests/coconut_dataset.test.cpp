@@ -2,6 +2,7 @@
 #include "detail/coconut_annotations.h"
 #include "detail/benchmark_recipe.h"
 #include "detail/benchmark_images.h"
+#include "detail/benchmark_image_decoder.h"
 #include "detail/benchmark_storage.h"
 #include "benchmark_http_fixture.h"
 #include "src/backend/data/compiled_dataset.h"
@@ -1230,7 +1231,7 @@ TEST_CASE("shared root repair invalidates all proofs and preserves valid JPEG al
                                                                 },
                                                                 .validator =
                                                                     [](std::uint64_t, std::span<const std::uint8_t> bytes) {
-                                                                        if (!has_complete_jpeg_markers(bytes)) throw std::runtime_error("invalid JPEG");
+                                                                        if (!has_complete_image_markers(bytes)) throw std::runtime_error("invalid JPEG");
                                                                     },
                                                                 .quarantine_unavailable = true,
                                                                 .decompression_workers = 0,
@@ -1773,7 +1774,8 @@ TEST_CASE("one physical admission budget governs membership extraction and write
     };
     if (exhausted) {
         CHECK_THROWS_WITH(compile_benchmark_recipe(config, &catalog),
-                          "physical archive remains unavailable after three admissions: " + served.source.artifact.artifact_id);
+                          "physical archive remains unavailable after three admissions: " + served.source.artifact.artifact_id +
+                              ": selected archive image 7 is not a complete JPEG or PNG");
         CHECK(admissions == 3);
         CHECK(served.server.requests() == 2);
         CHECK(file_bytes(config.output_dir / "benchmark_manifest.json") == old_manifest);

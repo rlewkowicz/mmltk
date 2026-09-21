@@ -66,7 +66,6 @@ struct CachedImageDirectory {
 void invalidate_cached_image_proofs(const std::filesystem::path& root);
 void prepare_cached_image_directory(const std::filesystem::path& root);
 [[nodiscard]] std::size_t format_cached_image_relative_path(std::uint64_t image_id, std::span<char> output);
-[[nodiscard]] bool has_complete_jpeg_markers(std::span<const std::uint8_t> encoded) noexcept;
 void write_cached_image_atomically(const std::filesystem::path& path, std::span<const std::uint8_t> encoded,
                                    mmltk::common::concurrency::CancellationObservation cancellation);
 [[nodiscard]] bool validate_cached_image_group(const std::filesystem::path& root, const std::filesystem::path& completion_path, std::string_view identity,

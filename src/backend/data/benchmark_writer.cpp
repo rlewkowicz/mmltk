@@ -33,7 +33,7 @@
 import mmltk.common.logging.mmltk_logging;
 import mmltk.common.logging.profile_utils;
 #include "benchmark_images.h"
-#include "benchmark_jpeg.h"
+#include "benchmark_image_decoder.h"
 #include "detail/benchmark_writer.h"
 #include "staging_file_cleanup.h"
 namespace mmltk::backend::data::benchmark_internal {
@@ -114,7 +114,7 @@ void decode_images(const BenchmarkWriteRequest& request, const common_io::FileHa
     std::atomic<std::uint32_t> next_image{0U};
     std::atomic<bool> worker_failed{false};
     const auto decode_worker = [&](int, const int, const int) {
-        BenchmarkJpegDecoder jpeg;
+        BenchmarkImageDecoder decoder;
         mmltk::backend::imaging::resample::RgbImageResizer resizer(1, request.perceptual_downscale);
         std::vector<std::uint8_t> encoded;
         std::vector<std::uint8_t> decoded;
@@ -140,14 +140,14 @@ void decode_images(const BenchmarkWriteRequest& request, const common_io::FileHa
                         common_io::FileHandle image_file(image_descriptor);
                         const std::size_t encoded_size = image_file.size();
                         if (encoded_size == 0U || encoded_size > std::numeric_limits<std::uint32_t>::max()) {
-                            throw std::runtime_error("cached benchmark JPEG has an invalid size");
+                            throw std::runtime_error("cached benchmark image has an invalid size");
                         }
                         encoded.resize(encoded_size);
                         image_file.pread_all(encoded.data(), encoded.size(), 0U);
-                        const BenchmarkJpegHeader jpeg_header = jpeg.read_header(encoded, image.source_width, image.source_height);
-                        (void)common_math::checked_cast<int>(jpeg_header.width, "benchmark JPEG width overflow");
-                        (void)common_math::checked_cast<int>(jpeg_header.height, "benchmark JPEG height overflow");
-                        jpeg.decode_rgb(encoded, jpeg_header, &decoded, &cmyk);
+                        const BenchmarkImageHeader image_header = decoder.read_header(encoded, image.source_width, image.source_height);
+                        (void)common_math::checked_cast<int>(image_header.width, "benchmark image width overflow");
+                        (void)common_math::checked_cast<int>(image_header.height, "benchmark image height overflow");
+                        decoder.decode_rgb(encoded, image_header, &decoded, &cmyk);
                     } catch (const std::bad_alloc&) { throw; } catch (const BenchmarkImageReadError&) {
                         throw;
                     } catch (const std::exception& error) { throw BenchmarkImageReadError(image.source_index, image.source_image_id, error.what()); }

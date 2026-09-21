@@ -148,6 +148,7 @@ artifact names and monotonic timestamps do not join different runs.
 | `benchmark.download.segmented_resume_state`, `.partial_checkpoint` | Retained range state or ordinary-transfer checkpoint and resume eligibility |
 | `benchmark.download.attempt_failed`, `.segment_retry`, `.segmented_fallback` | HTTP/CURL failure, discarded partial state, or fallback context where available |
 | `benchmark.images.cache_scan`, `.cache_reuse`, `.progress` | `source`/`shard`, inspected/reused/resolved images, and selection counts |
+| `benchmark.images.validation_failed` | Rejected archive `member`, `image_id`, `source`/`shard`, encoded `bytes`, and `reason` |
 | `benchmark.archive.scan`, `.extracted`, `.extract_cache_hit` | Archive traversal or annotation-member extraction/reuse |
 | `benchmark.images.archive_retry`, `benchmark.pixel_compile.cache_repair` | Bounded image/archive repair context |
 | `benchmark.storage.projection`, `benchmark.publication.complete` | Planned storage bounds, then actual successful publication facts |

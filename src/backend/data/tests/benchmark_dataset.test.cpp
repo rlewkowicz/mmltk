@@ -42,7 +42,7 @@
 #include "detail/benchmark_sampling.h"
 #include "detail/benchmark_storage.h"
 #include "detail/benchmark_writer.h"
-#include "detail/benchmark_jpeg.h"
+#include "detail/benchmark_image_decoder.h"
 #include "detail/benchmark_progress.h"
 #include "detail/open_images_acquisition.h"
 #include "src/test_support/filesystem_test_utils.hpp"
@@ -542,7 +542,7 @@ void test_benchmark_archive_training_quarantine() {
             },
         .validator =
             [](const std::uint64_t, const std::span<const std::uint8_t> encoded) {
-                require_condition(has_complete_jpeg_markers(encoded), "archive test JPEG is incomplete");
+                require_condition(has_complete_image_markers(encoded), "archive test JPEG is incomplete");
             },
         .trace = {},
         .quarantine_unavailable = true,
@@ -569,8 +569,8 @@ void test_benchmark_cached_image_writer_and_loader() {
     const std::vector<std::uint8_t> green = make_jpeg(8U, 240U, 8U);
     std::vector<std::uint8_t> padded = red;
     padded.insert(padded.end(), 64U, 0xFFU);
-    REQUIRE(has_complete_jpeg_markers(red));
-    REQUIRE(has_complete_jpeg_markers(padded));
+    REQUIRE(has_complete_image_markers(red));
+    REQUIRE(has_complete_image_markers(padded));
     const fs::path image_root = root.path() / "images";
     const std::vector<std::uint64_t> ids{1U, 2U};
     const std::vector<std::uint64_t> requested_ids{1U, 2U, 3U};
@@ -1661,21 +1661,25 @@ TEST_CASE("segmented downloads retain durable ranges through failure cancellatio
     CHECK(has_generated_payload(request.destination, bytes));
     server.Check();
 }
-TEST_CASE("benchmark shrinking JPEGs preserve the RGB8 intermediate projection exactly", "[backend][data][benchmark][writer][perceptual]") {
+TEST_CASE("benchmark shrinking images preserve the RGB8 intermediate projection exactly", "[backend][data][benchmark][writer][perceptual]") {
     using namespace mmltk::backend::imaging::resample;
-    mmltk::testsupport::ScopedTempDir root("shrinking-jpeg");
+    mmltk::testsupport::ScopedTempDir root("shrinking-image");
     const auto image_root = root.path() / "images";
     prepare_cached_image_directory(image_root);
     constexpr std::uint32_t width = 65U, height = 49U, target = 17U;
     std::vector<std::uint8_t> rgb(width * height * 3U);
     for (std::size_t i = 0U; i < rgb.size(); ++i) rgb[i] = static_cast<std::uint8_t>((i * 17U + i / 13U) & 255U);
-    std::vector<std::uint8_t> jpeg;
-    REQUIRE(stbi_write_jpg_to_func(append_bytes, &jpeg, width, height, 3, rgb.data(), 95) != 0);
-    write_cached_image_atomically(cached_image_path(image_root, 1U), jpeg, {});
-    BenchmarkJpegDecoder decoder;
+    std::vector<std::uint8_t> encoded;
+    SECTION("JPEG") { REQUIRE(stbi_write_jpg_to_func(append_bytes, &encoded, width, height, 3, rgb.data(), 95) != 0); }
+    SECTION("PNG") { REQUIRE(stbi_write_png_to_func(append_bytes, &encoded, width, height, 3, rgb.data(), width * 3U) != 0); }
+    REQUIRE(has_complete_image_markers(encoded));
+    CHECK_FALSE(has_complete_image_markers(std::span(encoded).first(encoded.size() - 1U)));
+    write_cached_image_atomically(cached_image_path(image_root, 1U), encoded, {});
+    BenchmarkImageDecoder decoder;
     std::vector<std::uint8_t> decoded, cmyk;
-    const auto header = decoder.read_header(jpeg, width, height);
-    decoder.decode_rgb(jpeg, header, &decoded, &cmyk);
+    const auto header = decoder.read_header(encoded, width, height);
+    decoder.decode_rgb(encoded, header, &decoded, &cmyk);
+    if (header.encoding == BenchmarkImageEncoding::Png) CHECK(decoded == rgb);
     PreparedBenchmarkSplit split;
     split.name = "train";
     split.class_names = {"person"};
@@ -1934,7 +1938,7 @@ TEST_CASE("archive image reuse reports initial and resolved counts without repla
                                              },
                                          .validator =
                                              [](const auto, const auto encoded) {
-                                                 if (!has_complete_jpeg_markers(encoded)) { throw std::runtime_error("invalid cached JPEG"); }
+                                                 if (!has_complete_image_markers(encoded)) { throw std::runtime_error("invalid cached JPEG"); }
                                              },
                                          .decompression_workers = 0U,
                                          .cache_write_workers = workers};

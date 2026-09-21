@@ -45,7 +45,7 @@
 #include "benchmark_catalog.h"
 #include "benchmark_download.h"
 #include "benchmark_images.h"
-#include "benchmark_jpeg.h"
+#include "benchmark_image_decoder.h"
 #include "benchmark_sampling.h"
 #include "benchmark_writer.h"
 #include "detail/benchmark_compiler.h"
@@ -169,7 +169,8 @@ void acquire_physical_inventory(AdmittedRecipeArchive& admitted, std::vector<Coc
     if (!recovery_reason.empty()) {
         if (admitted.structural_attempts >= 3) {
             diagnose(recovery_reason);
-            throw std::runtime_error("physical archive remains unavailable after three admissions: " + request.artifact_id);
+            throw std::runtime_error("physical archive remains unavailable after three admissions: " + request.artifact_id + ": " +
+                                     std::string(recovery_reason));
         }
         invalidate(recovery_reason);
     }
@@ -223,7 +224,7 @@ class RequiredImageDecodeError : public std::runtime_error {
                                                           ArtifactProgressTotals* transfer_progress, StorageReservationPool* storage_reservations,
                                                           const std::uint64_t source_total_images, const std::size_t decompression_workers,
                                                           const std::size_t cache_write_workers, const std::size_t download_connections,
-                                                          const BenchmarkTraceSink& trace, const std::optional<JpegDecodeProbe> decode_probe = std::nullopt,
+                                                          const BenchmarkTraceSink& trace, const std::optional<ImageDecodeProbe> decode_probe = std::nullopt,
                                                           const bool require_every_image = false, const ArchiveImageIdParser& member_parser = {},
                                                           std::string_view completion_slot = {}, AdmittedRecipeArchive* admitted_archive = nullptr) {
     if (expected_ids.empty()) { throw std::runtime_error("benchmark archive extraction cannot have an empty image selection"); }
@@ -300,7 +301,7 @@ class RequiredImageDecodeError : public std::runtime_error {
                                .front();
             }
             progress->source_activity(source, "Opening " + archive_name + " image archive");
-            JpegValidator jpeg_validator;
+            BenchmarkImageValidator image_validator;
             CachedImageDirectory extracted = extract_selected_archive_images(ArchiveExtractionRequest{
                 .archive_path = admitted_archive ? admitted_archive->download.path : retained->path,
                 .source_identity = source_identity,
@@ -328,28 +329,25 @@ class RequiredImageDecodeError : public std::runtime_error {
                     },
                 .validator =
                     [&](const std::uint64_t image_id, const std::span<const std::uint8_t> encoded) {
-                        if (!has_complete_jpeg_markers(encoded)) {
+                        if (!has_complete_image_markers(encoded)) {
                             if (decode_probe && decode_probe->image_id == image_id && !quarantine_unavailable) {
-                                throw RequiredImageDecodeError(
-                                    "required validation JPEG remains "
-                                    "incomplete after bounded repair");
+                                throw RequiredImageDecodeError("required archive image " + std::to_string(image_id) +
+                                                               " remains incomplete after bounded repair");
                             }
-                            throw std::runtime_error("selected archive entry is not a complete JPEG");
+                            throw std::runtime_error("selected archive image " + std::to_string(image_id) + " is not a complete JPEG or PNG");
                         }
-                        if (decode_probe && decode_probe->image_id == image_id) {
-                            try {
-                                jpeg_validator.validate_decodable(encoded, decode_probe->expected_width, decode_probe->expected_height);
-                            } catch (const InvalidJpegError& error) {
-                                if (!quarantine_unavailable) {
-                                    throw RequiredImageDecodeError(
-                                        "required validation JPEG remains "
-                                        "undecodable after bounded repair: " +
-                                        std::string(error.what()));
-                                }
-                                throw;
+                        try {
+                            if (decode_probe && decode_probe->image_id == image_id) {
+                                image_validator.validate_decodable(encoded, decode_probe->expected_width, decode_probe->expected_height);
+                            } else {
+                                (void)image_validator.read_header(encoded);
                             }
-                        } else {
-                            (void)jpeg_validator.read_header(encoded);
+                        } catch (const InvalidImageError& error) {
+                            if (decode_probe && decode_probe->image_id == image_id && !quarantine_unavailable) {
+                                throw RequiredImageDecodeError("required archive image " + std::to_string(image_id) +
+                                                               " remains undecodable after bounded repair: " + error.what());
+                            }
+                            throw InvalidImageError("selected archive image " + std::to_string(image_id) + ": " + error.what());
                         }
                     },
                 .trace = trace,
@@ -1197,7 +1195,7 @@ void benchmark_internal::compile_benchmark_recipe(BenchmarkCompilerConfig config
                         "benchmark image repair record is absent from the "
                         "compile plan");
                 }
-                const JpegDecodeProbe decode_probe{error.source_image_id(), failed_record->source_width, failed_record->source_height};
+                const ImageDecodeProbe decode_probe{error.source_image_id(), failed_record->source_width, failed_record->source_height};
                 const std::filesystem::path source_root = split.sources[error.source_index()].root;
                 const std::filesystem::path image_path = cached_image_path(source_root, error.source_image_id());
                 if (std::filesystem::is_regular_file(image_path)) {

@@ -98,15 +98,15 @@ class OpenImageCacheWorkers {
                           const mmltk::common::concurrency::CancellationObservation cancellation)
         : image_root_(std::move(image_root)), cancellation_(cancellation) {
         if (worker_count == 0U) {
-            inline_validator_ = std::make_unique<JpegValidator>();
+            inline_validator_ = std::make_unique<BenchmarkImageValidator>();
             return;
         }
-        std::vector<std::unique_ptr<JpegValidator>> validators;
+        std::vector<std::unique_ptr<BenchmarkImageValidator>> validators;
         validators.reserve(worker_count);
-        for (std::size_t worker = 0U; worker < worker_count; ++worker) { validators.push_back(std::make_unique<JpegValidator>()); }
+        for (std::size_t worker = 0U; worker < worker_count; ++worker) { validators.push_back(std::make_unique<BenchmarkImageValidator>()); }
         workers_.reserve(worker_count);
         for (std::size_t worker = 0U; worker < worker_count; ++worker) {
-            workers_.emplace_back([this, jpeg = std::move(validators[worker])] { run(jpeg.get()); });
+            workers_.emplace_back([this, validator = std::move(validators[worker])] { run(validator.get()); });
         }
     }
     OpenImageCacheWorkers(const OpenImageCacheWorkers&) = delete;
@@ -166,28 +166,28 @@ class OpenImageCacheWorkers {
         std::uint32_t attempt = 0U;
         std::vector<std::uint8_t> encoded;
     };
-    [[nodiscard]] Result process(Task task, JpegValidator* jpeg) const noexcept {
+    [[nodiscard]] Result process(Task task, BenchmarkImageValidator* validator) const noexcept {
         Result result;
         result.image_id = task.image_id;
         result.attempt = task.attempt;
         result.encoded = std::move(task.encoded);
         try {
             throw_if_benchmark_cancelled(cancellation_);
-            const auto [width, height] = jpeg->read_header(result.encoded);
+            const auto [width, height] = validator->read_header(result.encoded);
             result.width = width;
             result.height = height;
             write_cached_image_atomically(cached_image_path(image_root_, result.image_id), result.encoded, cancellation_);
             throw_if_benchmark_cancelled(cancellation_);
-        } catch (const InvalidJpegError& error) { result.retry_reason = error.what(); } catch (...) {
+        } catch (const InvalidImageError& error) { result.retry_reason = error.what(); } catch (...) {
             result.fatal_error = std::current_exception();
         }
         return result;
     }
-    void run(JpegValidator* jpeg) noexcept {
+    void run(BenchmarkImageValidator* validator) noexcept {
         while (true) {
             std::optional<Task> task = wait_pop_task(mutex_, pending_, stopping_, tasks_, cancellation_);
             if (!task) { return; }
-            Result result = process(std::move(*task), jpeg);
+            Result result = process(std::move(*task), validator);
             {
                 const std::lock_guard lock(mutex_);
                 if (cancellation_.requested()) {
@@ -203,7 +203,7 @@ class OpenImageCacheWorkers {
     }
     std::filesystem::path image_root_;
     mmltk::common::concurrency::CancellationObservation cancellation_;
-    std::unique_ptr<JpegValidator> inline_validator_;
+    std::unique_ptr<BenchmarkImageValidator> inline_validator_;
     mutable std::mutex mutex_;
     std::condition_variable pending_;
     std::condition_variable ready_;
@@ -342,8 +342,8 @@ void download_open_images(const std::span<const std::uint64_t> expected_ids, con
                     successes_since_throttle = 0U;
                     progress->source_activity(BenchmarkDatasetSource::kOpenImagesV7, "Open Images concurrency recovered to " + std::to_string(active_limit));
                 }
-                if (!has_complete_jpeg_markers(transfer->encoded)) {
-                    retry_or_quarantine(transfer->image_id, transfer->attempt, "Open Images response is not a complete JPEG");
+                if (!has_complete_image_markers(transfer->encoded)) {
+                    retry_or_quarantine(transfer->image_id, transfer->attempt, "Open Images response is not a complete JPEG or PNG");
                     recycle_buffer(transfer);
                     continue;
                 }
@@ -484,7 +484,7 @@ void complete_open_images_group(const std::filesystem::path& image_root, const s
                                                      std::vector<QuarantinedImage>* quarantined,
                                                      mmltk::common::concurrency::CancellationObservation cancel_requested, ProgressReporter* progress,
                                                      const int num_workers, const std::size_t cache_workers, const BenchmarkTraceSink& trace,
-                                                     const std::optional<JpegDecodeProbe> decode_probe) {
+                                                     const std::optional<ImageDecodeProbe> decode_probe) {
     const std::vector<std::uint64_t> ids = image_ids(index);
     const std::filesystem::path image_root = cache.source_images("open-images") / "train";
     prepare_cached_image_directory(image_root);
@@ -494,7 +494,7 @@ void complete_open_images_group(const std::filesystem::path& image_root, const s
     std::uint64_t completed_images = 0U;
     std::uint64_t cached_image_bytes = 0U;
     bool all_cache_hits = true;
-    JpegValidator jpeg_validator;
+    BenchmarkImageValidator image_validator;
     const std::size_t configured_workers = common_math::checked_cast<std::size_t>(num_workers, "Open Images configured worker count overflow");
     if (configured_workers > std::numeric_limits<std::size_t>::max() / 10U) { throw std::overflow_error("Open Images transfer concurrency overflow"); }
     const std::size_t transfer_concurrency = std::min<std::size_t>(256U, configured_workers * 10U);
@@ -564,7 +564,7 @@ void complete_open_images_group(const std::filesystem::path& image_root, const s
             const std::uint64_t bytes = regular ? std::filesystem::file_size(path, error) : 0U;
             if (regular && !error && bytes > 0U) {
                 try {
-                    const auto [width, height] = jpeg_validator.validate_file(path);
+                    const auto [width, height] = image_validator.validate_file(path);
                     NormalizedImage& image = find_normalized_image(&index, image_id);
                     image.width = width;
                     image.height = height;
@@ -572,10 +572,10 @@ void complete_open_images_group(const std::filesystem::path& image_root, const s
                     ++completed_images;
                     cached_image_bytes = common_math::checked_add(cached_image_bytes, bytes, "Open Images cached byte total overflow");
                     continue;
-                } catch (const InvalidJpegError& jpeg_error) {
+                } catch (const InvalidImageError& image_error) {
                     remove_cache_path(path);
                     trace_benchmark_event(trace, "benchmark.images.cache_invalid", [&] {
-                        return nlohmann::json{{"source", "open-images"}, {"shard", shard}, {"image_id", image_id}, {"error", jpeg_error.what()}};
+                        return nlohmann::json{{"source", "open-images"}, {"shard", shard}, {"image_id", image_id}, {"error", image_error.what()}};
                     });
                 }
             }
@@ -608,8 +608,8 @@ void complete_open_images_group(const std::filesystem::path& image_root, const s
             try {
                 progress->source_activity(BenchmarkDatasetSource::kOpenImagesV7,
                                           "Full-decode checking repaired Open Images JPEG " + std::to_string(decode_probe->image_id));
-                jpeg_validator.validate_decodable_file(probe_path, decode_probe->expected_width, decode_probe->expected_height);
-            } catch (const InvalidJpegError& error) {
+                image_validator.validate_decodable_file(probe_path, decode_probe->expected_width, decode_probe->expected_height);
+            } catch (const InvalidImageError& error) {
                 const std::uint64_t probe_bytes = std::filesystem::file_size(probe_path);
                 remove_cache_path(probe_path);
                 if (probe_bytes > cached_image_bytes) { throw std::runtime_error("Open Images repair byte count underflow"); }
