@@ -318,11 +318,7 @@ TEST_CASE("dataset admits real open ended acquisition and successful HTTP recove
     const DownloadRequest request{
         "metadata", server.url("metadata"), root.path() / "metadata.bin", root.path() / "metadata.lock", unknown ? 0U : payload.size(), {}, 2U, false, source};
     const DownloadRequest known{"known", server.url("known"), root.path() / "known.bin", root.path() / "known.lock", payload.size(), {}, 1U};
-    if (mixed) {
-        std::ofstream output(known.destination, std::ios::binary);
-        output.write(reinterpret_cast<const char*>(payload.data()), static_cast<std::streamsize>(payload.size()));
-        REQUIRE(output.good());
-    }
+    if (mixed) { mmltk::testsupport::write_binary_file(known.destination, payload); }
     std::vector<contracts::ArtifactProgress> delivered;
     std::vector<contracts::ArtifactProgress> produced;
     std::vector<DownloadProgress> transfers;

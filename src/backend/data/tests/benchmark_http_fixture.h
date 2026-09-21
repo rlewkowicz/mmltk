@@ -26,7 +26,12 @@
 namespace mmltk::backend::data::testsupport {
 class HttpServer {
    public:
+    // The payload is borrowed until Stop(); retain it and mutate only between settled transfers.
     explicit HttpServer(std::span<const std::uint8_t> payload) : HttpServer(payload, payload.size()) {}
+    explicit HttpServer(const std::string& payload)
+        : HttpServer(std::span<const std::uint8_t>{reinterpret_cast<const std::uint8_t*>(payload.data()), payload.size()}) {}
+    HttpServer(std::string&&) = delete;
+    HttpServer(std::vector<std::uint8_t>&&) = delete;
     explicit HttpServer(std::size_t generated_bytes) : HttpServer({}, generated_bytes) {}
     HttpServer(std::span<const std::uint8_t> payload, std::size_t bytes)
         : payload_(payload), payload_size_(bytes), listener_(::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0)) {

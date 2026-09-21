@@ -29,6 +29,7 @@
 #include <type_traits>
 #include <utility>
 #include "src/test_support/filesystem_test_utils.hpp"
+#include "src/test_support/environment_test_utils.hpp"
 #include "src/test_support/async_test_utils.hpp"
 #include "src/common/io/scoped_fd.h"
 #include "src/common/io/event_fd.h"
@@ -71,27 +72,7 @@ void release_interrupted_counter(int) noexcept {
     mmltk::common::io::write_all_noexcept(interrupted_counter_writer, {reinterpret_cast<const char*>(&value), sizeof(value)});
     errno = saved_errno;
 }
-class ScopedEnvironmentVariable final {
-   public:
-    explicit ScopedEnvironmentVariable(const std::string_view name) : name_(name) {
-        if (const char* existing = std::getenv(name_.c_str()); existing != nullptr) previous_.emplace(existing);
-        if (::unsetenv(name_.c_str()) != 0) throw std::runtime_error("cannot unset test environment variable");
-    }
-    ScopedEnvironmentVariable(const std::string_view name, const std::string_view value) : name_(name) {
-        if (const char* existing = std::getenv(name_.c_str()); existing != nullptr) previous_.emplace(existing);
-        if (::setenv(name_.c_str(), std::string{value}.c_str(), 1) != 0) throw std::runtime_error("cannot set test environment variable");
-    }
-    ~ScopedEnvironmentVariable() noexcept {
-        if (previous_)
-            static_cast<void>(::setenv(name_.c_str(), previous_->c_str(), 1));
-        else
-            static_cast<void>(::unsetenv(name_.c_str()));
-    }
-
-   private:
-    std::string name_;
-    std::optional<std::string> previous_{};
-};
+using mmltk::testsupport::ScopedEnvironmentVariable;
 [[nodiscard]] std::string read_file(const std::filesystem::path& path) {
     std::ifstream stream(path, std::ios::binary | std::ios::ate);
     if (!stream) throw std::runtime_error("cannot open test output");

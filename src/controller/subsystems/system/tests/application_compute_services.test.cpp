@@ -21,6 +21,7 @@
 #include <type_traits>
 #include <vector>
 #include "src/test_support/filesystem_test_utils.hpp"
+#include "src/test_support/environment_test_utils.hpp"
 #include "src/test_support/async_test_utils.hpp"
 #include "src/backend/data/benchmark_dataset_compiler.h"
 #include "src/backend/data/detail/benchmark_progress.h"
@@ -264,16 +265,8 @@ TEST_CASE("artifact benchmark compilation uses the environment cache and retires
     namespace fs = std::filesystem;
     mmltk::testsupport::ScopedTempDir temporary{"artifact-benchmark-cache"};
     const auto original_directory = fs::current_path();
-    const char* const environment = std::getenv("MMLTK_BENCHMARK_DATASET_CACHE_ROOT");
-    const std::optional<std::string> original_environment = environment == nullptr ? std::nullopt : std::optional<std::string>{environment};
-    const mmltk::testsupport::ScopedTestCleanup restore_process_state{[&] {
-        fs::current_path(original_directory);
-        if (original_environment) {
-            (void)::setenv("MMLTK_BENCHMARK_DATASET_CACHE_ROOT", original_environment->c_str(), 1);
-        } else {
-            (void)::unsetenv("MMLTK_BENCHMARK_DATASET_CACHE_ROOT");
-        }
-    }};
+    const mmltk::testsupport::ScopedEnvironmentVariable environment{"MMLTK_BENCHMARK_DATASET_CACHE_ROOT"};
+    const mmltk::testsupport::ScopedTestCleanup restore_directory{[&] { fs::current_path(original_directory); }};
     fs::create_directories(temporary.path() / "working");
     fs::current_path(temporary.path() / "working");
     const auto output = temporary.path() / "compiled";
@@ -1317,9 +1310,7 @@ TEST_CASE("real unknown metadata bytes remain open ended through artifact projec
     if (mixed) {
         DownloadRequest known{"coco-known", server.url("known"), root.path() / "known.bin", root.path() / "known.lock", payload.size(), {}, 1U};
         // Preseeded artifact admission takes the ordinary cache path, with no network request.
-        std::ofstream output(known.destination, std::ios::binary);
-        output.write(reinterpret_cast<const char*>(payload.data()), static_cast<std::streamsize>(payload.size()));
-        output.close();
+        mmltk::testsupport::write_binary_file(known.destination, payload);
         (void)download_artifacts({known}, 1U, {}, [&](const auto& update) { totals.update(update, reporter); });
         REQUIRE(server.requests() == 0U);
     }

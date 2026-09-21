@@ -16,16 +16,20 @@ std::filesystem::path make_temp_root(const char* const name_prefix) {
     return std::filesystem::path{created};
 }
 void write_text_file(const std::filesystem::path& path, const std::string_view contents) {
-    if (path.has_parent_path()) std::filesystem::create_directories(path.parent_path());
-    std::ofstream stream{path, std::ios::trunc};
-    if (!stream.is_open()) throw std::runtime_error("failed to write file: " + path.string());
-    stream << contents;
+    write_text_file(path, [&](std::ostream& stream) { stream << contents; });
 }
 void write_text_file(const std::filesystem::path& path, const std::function_ref<void(std::ostream&)> write_contents) {
     if (path.has_parent_path()) std::filesystem::create_directories(path.parent_path());
-    std::ofstream stream{path, std::ios::trunc};
+    std::ofstream stream{path, std::ios::binary | std::ios::trunc};
     if (!stream.is_open()) throw std::runtime_error("failed to write file: " + path.string());
     write_contents(stream);
+    stream.close();
+    if (!stream) throw std::runtime_error("failed to finish writing file: " + path.string());
+}
+void write_binary_file(const std::filesystem::path& path, const std::span<const std::uint8_t> contents) {
+    write_text_file(path, [&](std::ostream& stream) {
+        if (!contents.empty()) stream.write(reinterpret_cast<const char*>(contents.data()), static_cast<std::streamsize>(contents.size()));
+    });
 }
 void make_executable(const std::filesystem::path& path, const std::filesystem::perms permissions, const std::filesystem::perm_options options) {
     std::filesystem::permissions(path, permissions, options);

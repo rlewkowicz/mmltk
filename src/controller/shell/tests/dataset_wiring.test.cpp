@@ -5,7 +5,6 @@
 #include <filesystem>
 #include <fstream>
 #include <future>
-#include <optional>
 #include <string>
 #include <nlohmann/json.hpp>
 #include "src/controller/browser/application_materializer.h"
@@ -14,6 +13,7 @@
 #include "src/test_support/async_test_utils.hpp"
 #include "src/test_support/cuda_test_utils.hpp"
 #include "src/test_support/filesystem_test_utils.hpp"
+#include "src/test_support/environment_test_utils.hpp"
 namespace mmltk::controller::shell {
 namespace {
 TEST_CASE("production dataset factory connects optional tracing through staged overlap rejection", "[controller][shell][dataset][diagnostics][cuda]") {
@@ -25,14 +25,7 @@ TEST_CASE("production dataset factory connects optional tracing through staged o
     const auto retained = cache / "retained.fixture";
     mmltk::testsupport::write_text_file(retained, "retained cache bytes");
     const auto retained_time = std::filesystem::last_write_time(retained);
-    const char* environment = std::getenv("MMLTK_BENCHMARK_DATASET_CACHE_ROOT");
-    const std::optional<std::string> previous = environment ? std::optional<std::string>{environment} : std::nullopt;
-    const mmltk::testsupport::ScopedTestCleanup restore_environment{[&] {
-        if (previous)
-            static_cast<void>(::setenv("MMLTK_BENCHMARK_DATASET_CACHE_ROOT", previous->c_str(), 1));
-        else
-            static_cast<void>(::unsetenv("MMLTK_BENCHMARK_DATASET_CACHE_ROOT"));
-    }};
+    const mmltk::testsupport::ScopedEnvironmentVariable environment{"MMLTK_BENCHMARK_DATASET_CACHE_ROOT"};
     REQUIRE(::setenv("MMLTK_BENCHMARK_DATASET_CACHE_ROOT", cache.c_str(), 1) == 0);
     auto settings = contracts::default_gui_settings_state();
     settings.workflows.train.compile_benchmark_dataset_override = true;

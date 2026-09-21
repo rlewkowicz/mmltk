@@ -46,6 +46,7 @@
 #include "detail/benchmark_progress.h"
 #include "detail/open_images_acquisition.h"
 #include "src/test_support/filesystem_test_utils.hpp"
+#include "src/test_support/environment_test_utils.hpp"
 #include "src/backend/data/benchmark_dataset_compiler.h"
 #include "src/backend/data/benchmark_hash.h"
 #include "src/common/io/file_digest.h"
@@ -827,16 +828,8 @@ void test_benchmark_cli_source_status_preserves_active_transfer_state() {
 TEST_CASE("benchmark cache roots share explicit environment and relative precedence", "[backend][data][benchmark][cache]") {
     mmltk::testsupport::ScopedTempDir root{"benchmark-cache-precedence"};
     const auto original_directory = fs::current_path();
-    const char* const environment = std::getenv("MMLTK_BENCHMARK_DATASET_CACHE_ROOT");
-    const std::optional<std::string> original_environment = environment == nullptr ? std::nullopt : std::optional<std::string>{environment};
-    const mmltk::testsupport::ScopedTestCleanup restore_process_state{[&] {
-        fs::current_path(original_directory);
-        if (original_environment) {
-            (void)::setenv("MMLTK_BENCHMARK_DATASET_CACHE_ROOT", original_environment->c_str(), 1);
-        } else {
-            (void)::unsetenv("MMLTK_BENCHMARK_DATASET_CACHE_ROOT");
-        }
-    }};
+    const mmltk::testsupport::ScopedEnvironmentVariable environment{"MMLTK_BENCHMARK_DATASET_CACHE_ROOT"};
+    const mmltk::testsupport::ScopedTestCleanup restore_directory{[&] { fs::current_path(original_directory); }};
     fs::create_directories(root.path() / "working");
     fs::current_path(root.path() / "working");
     const auto environment_cache = root.path() / "environment-cache";

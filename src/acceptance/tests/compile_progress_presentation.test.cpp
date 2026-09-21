@@ -14,6 +14,7 @@
 #include "spdmon/spdmon.hpp"
 #include "src/backend/data/dataset_compiler.h"
 #include "src/test_support/console_output.h"
+#include "src/test_support/environment_test_utils.hpp"
 namespace {
 using ProgressClock = spdmon::ProgressBar::clock_t;
 using ProgressTimePoint = ProgressClock::time_point;
@@ -22,30 +23,6 @@ ProgressTimePoint test_progress_now() { return ProgressTimePoint{ProgressClock::
 void set_progress_now(const std::chrono::milliseconds elapsed) {
     g_progress_elapsed_ticks = std::chrono::duration_cast<ProgressClock::duration>(elapsed).count();
 }
-class ScopedEnvVar final {
-   public:
-    ScopedEnvVar(const char* name, const std::string& value) : name_(name) {
-        if (const char* existing = std::getenv(name_.c_str()); existing != nullptr) {
-            had_previous_value_ = true;
-            previous_value_ = existing;
-        }
-        if (::setenv(name_.c_str(), value.c_str(), 1) != 0) { throw std::runtime_error("setenv failed for " + name_ + ": " + std::strerror(errno)); }
-    }
-    ~ScopedEnvVar() {
-        if (had_previous_value_) {
-            static_cast<void>(::setenv(name_.c_str(), previous_value_.c_str(), 1));
-        } else {
-            static_cast<void>(::unsetenv(name_.c_str()));
-        }
-    }
-    ScopedEnvVar(const ScopedEnvVar&) = delete;
-    ScopedEnvVar& operator=(const ScopedEnvVar&) = delete;
-
-   private:
-    std::string name_;
-    std::string previous_value_;
-    bool had_previous_value_ = false;
-};
 class ScopedStderrCapture final {
    public:
     ScopedStderrCapture() {
@@ -147,7 +124,7 @@ void test_compile_postfix_formatting() {
     CHECK(spdmon::format_progress_postfix(phase_label, progress.active_workers, 3U) == "pixels 2 active \\");
 }
 void test_progress_bar_non_tty_width() {
-    ScopedEnvVar columns{"COLUMNS", "40"};
+    mmltk::testsupport::ScopedEnvironmentVariable columns{"COLUMNS", "40"};
     ScopedStderrCapture capture;
     set_progress_now(std::chrono::milliseconds{0});
     {
@@ -161,7 +138,7 @@ void test_progress_bar_non_tty_width() {
     CHECK(lines.back().size() <= 40U);
 }
 void test_progress_bar_redraw_throttling() {
-    ScopedEnvVar columns{"COLUMNS", "120"};
+    mmltk::testsupport::ScopedEnvironmentVariable columns{"COLUMNS", "120"};
     ScopedStderrCapture capture;
     set_progress_now(std::chrono::milliseconds{0});
     {
@@ -175,7 +152,7 @@ void test_progress_bar_redraw_throttling() {
     CHECK(count_substring(capture.finish(), "\r\033[2K") == 1U);
 }
 void test_progress_bar_log_preserves_lines() {
-    ScopedEnvVar columns{"COLUMNS", "120"};
+    mmltk::testsupport::ScopedEnvironmentVariable columns{"COLUMNS", "120"};
     ScopedStderrCapture capture;
     set_progress_now(std::chrono::milliseconds{0});
     {
@@ -192,7 +169,7 @@ void test_progress_bar_log_preserves_lines() {
     CHECK(lines.back().find("compile") != std::string::npos);
 }
 void test_progress_bar_counter_rollback() {
-    ScopedEnvVar columns{"COLUMNS", "120"};
+    mmltk::testsupport::ScopedEnvironmentVariable columns{"COLUMNS", "120"};
     ScopedStderrCapture capture;
     set_progress_now(std::chrono::milliseconds{0});
     {

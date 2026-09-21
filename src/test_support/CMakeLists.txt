@@ -2,7 +2,7 @@ include(MmltkComponent)
 add_library(mmltk_test_support STATIC EXCLUDE_FROM_ALL)
 mmltk_configure_component(mmltk_test_support PUBLIC_DECLARATIONS)
 mmltk_register_retained_module_importers(mmltk_test_support
-    catch_main.cpp filesystem_test_utils.cpp profile_runner_common.cpp)
+    catch_main.cpp environment_test_utils.cpp filesystem_test_utils.cpp profile_runner_common.cpp)
 mmltk_register_public_headers(mmltk_test_support
     BASE_DIRS ${CMAKE_SOURCE_DIR}
     FILES
@@ -10,6 +10,7 @@ mmltk_register_public_headers(mmltk_test_support
     async_test_utils.hpp
     cuda_test_utils.hpp
     filesystem_test_utils.hpp
+    environment_test_utils.hpp
     linux_process_test_utils.hpp
     error_expectation_test_utils.hpp
     subprocess_test_utils.hpp
