@@ -264,16 +264,7 @@ thread_local! {
 
 // Publication metadata is copyable; permission to read an external layer is not.
 pub(crate) fn accept_publication(frame: FrameReady) -> bool {
-    if mailbox_binding(frame).is_none()
-        || LIVE_READS.with(|reads| {
-            reads
-                .borrow()
-                .iter()
-                .flatten()
-                .filter_map(std::sync::Weak::upgrade)
-                .any(|read| same_mailbox_slot(read.0, frame))
-        })
-    {
+    if publication_admission_blocked(frame) {
         return false;
     }
     if RELEASED_FRAMES.with(|released| {
@@ -300,6 +291,21 @@ pub(crate) fn accept_publication(frame: FrameReady) -> bool {
         borrows.set(slots);
         true
     })
+}
+
+// Read custody, including submitted draws, outlives page publication retirement.
+// Recovery waits for that custody to settle instead of repeatedly selecting.
+pub(crate) fn publication_admission_blocked(frame: FrameReady) -> bool {
+    mailbox_binding(frame).is_none()
+        || LIVE_READS.with(|reads| {
+            reads
+                .borrow()
+                .iter()
+                .flatten()
+                .filter_map(std::sync::Weak::upgrade)
+                .any(|read| same_mailbox_slot(read.0, frame))
+        })
+        || BORROWS.with(|borrows| borrows.get().iter().all(Option::is_some))
 }
 
 fn take_publication(frame: FrameReady) -> bool {
@@ -451,6 +457,7 @@ fn settle_sample(frame: FrameReady) {
 impl Drop for SampleRead {
     fn drop(&mut self) {
         settle_sample(self.0);
+        notify_surface(Notification::Drawn);
     }
 }
 
@@ -766,7 +773,7 @@ fn notify_surface(notification: Notification) {
             let mut mailbox = mailbox.borrow_mut();
             match notification {
                 Notification::SampleRejected(frame) => {
-                    mailbox.rejected = Some(frame);
+                    remember_rejection(&mut mailbox.rejected_sample, frame);
                     trace_frame("sample_rejection_enqueued", frame);
                 }
                 Notification::Drawn => mailbox.drawn = true,
@@ -784,7 +791,10 @@ fn notify_surface(_notification: Notification) {}
 
 #[derive(Default)]
 struct FrameMailbox {
-    rejected: Option<FrameReady>,
+    // A malformed later offer cannot supersede failure of an accepted sample.
+    // These facts have independent producers and must both reach the controller.
+    rejected_sample: Option<FrameReady>,
+    rejected_publication: Option<FrameReady>,
     drawn: bool,
     frames: [Option<FrameReady>; 1],
     copied: [Option<FrameReady>; SAMPLE_CAPACITY],
@@ -813,6 +823,12 @@ fn remember_frame(slots: &mut [Option<FrameReady>; SAMPLE_CAPACITY], frame: Fram
     slots[index] = Some(frame);
 }
 
+fn remember_rejection(slot: &mut Option<FrameReady>, frame: FrameReady) {
+    if slot.is_none_or(|prior| prior.presentation_revision < frame.presentation_revision) {
+        *slot = Some(frame);
+    }
+}
+
 impl FrameMailbox {
     fn complete(&mut self, frame: FrameReady) {
         remember_frame(&mut self.copied, frame);
@@ -822,9 +838,10 @@ impl FrameMailbox {
             .iter_mut()
             .find_map(Option::take)
             .map(Notification::Copied)
-            .or_else(|| self.rejected.take().map(Notification::SampleRejected))
-            .or_else(|| std::mem::take(&mut self.drawn).then_some(Notification::Drawn))
             .or_else(|| self.pop().map(Notification::Native))
+            .or_else(|| self.rejected_sample.take().map(Notification::SampleRejected))
+            .or_else(|| self.rejected_publication.take().map(Notification::SampleRejected))
+            .or_else(|| std::mem::take(&mut self.drawn).then_some(Notification::Drawn))
     }
 
     fn push(&mut self, frame: FrameReady) -> Option<FrameReady> {
@@ -952,6 +969,9 @@ fn frame_stream() -> impl iced::futures::Stream<Item = Notification> {
                 });
             if !decoded {
                 release(ready);
+                // Preserve any valid queued offer while reporting the lost handoff.
+                remember_rejection(&mut pending.borrow_mut().rejected_publication, ready);
+                notify.wake();
                 return;
             }
             invalidate_drawn_slot(ready);
@@ -3860,15 +3880,20 @@ mod tests {
         mailbox.complete(old);
         mailbox.complete(newest);
         mailbox.complete(old);
-        mailbox.rejected = Some(old);
+        remember_rejection(&mut mailbox.rejected_sample, old);
+        let malformed = frame_ready(1, 22, 22, 400, 500);
+        remember_rejection(&mut mailbox.rejected_publication, malformed);
         assert!(
             matches!(mailbox.next_notification(), Some(Notification::Copied(frame)) if frame == newest)
+        );
+        assert!(
+            matches!(mailbox.next_notification(), Some(Notification::Native(frame)) if frame == newest)
         );
         assert!(
             matches!(mailbox.next_notification(), Some(Notification::SampleRejected(frame)) if frame == old)
         );
         assert!(
-            matches!(mailbox.next_notification(), Some(Notification::Native(frame)) if frame == newest)
+            matches!(mailbox.next_notification(), Some(Notification::SampleRejected(frame)) if frame == malformed)
         );
         assert!(mailbox.next_notification().is_none());
         drop(mailbox);

@@ -16,6 +16,13 @@ pub(super) struct Controller {
     pending: Option<Surface>,
     pending_rejected: bool,
     retained: Option<Surface>,
+    // Selection acknowledgement does not complete the graphics handoff.
+    gallery_handoff: bool,
+    gallery_blocked: Option<FrameReady>,
+    // Monotonic physical receipt frontier; a deferred loss survives its request
+    // acknowledgement without letting duplicate callbacks restart recovery.
+    gallery_rejection_revision: u64,
+    gallery_recovery_needed: bool,
     viewer: Option<(u64, u32)>,
     suspended: Option<SuspendedViewer>,
     pub(super) stop_requested: bool,
@@ -235,7 +242,9 @@ impl Controller {
                 update.redraw = true;
             }
             Message::Surface(crate::presentation_surface::Notification::SampleRejected(frame)) => {
-                if self.pending.and_then(|surface| surface.frame) == Some(frame) {
+                if !self.pending_rejected
+                    && self.pending.and_then(|surface| surface.frame) == Some(frame)
+                {
                     crate::presentation_surface::trace_surface(
                         "sample_rejection_received",
                         self.pending.expect("matching rejected publication"),
@@ -243,6 +252,7 @@ impl Controller {
                     self.pending_rejected = true;
                     update.redraw = true;
                 }
+                self.reject_gallery_handoff(frame, model);
             }
             Message::Surface(crate::presentation_surface::Notification::Drawn) => {
                 update.redraw = true;
@@ -452,6 +462,7 @@ impl App {
         self.workspace.select(feature);
         self.model.set_foreground_feature(feature);
         self.workspace.sync_workflows(&self.model);
+        self.reconcile_surface_frame();
         if let Some(frame) = self.model.presentation_refresh() {
             self.select_presentation(frame);
         }
@@ -482,6 +493,8 @@ impl App {
             ApplicationIntentEndpoint::PresentationSelect,
             move |correlation| crate::generated::encode_presentation_Select(correlation, source),
         ) {
+            self.presentation.gallery_handoff =
+                frame.source.kind == PresentationSourceKind::Explore;
             self.model.record_presentation_sent(frame);
         }
     }
@@ -492,6 +505,18 @@ impl App {
             .reconcile(&self.model, self.workspace.active(), false)
         {
             self.retire_peer(error);
+            return;
+        }
+        if self.workspace.active() == FeatureId::Explore
+            && self.model.foreground_visual() == Some(PresentationSourceKind::Explore)
+            && self.model.explore.snapshot.as_ref().is_some_and(|snapshot| {
+                snapshot.ready && snapshot.mode == crate::generated::ExploreMode::Gallery
+            })
+            && !self.presentation.gallery_handoff
+            && self.presentation.pending.is_none()
+            && crate::presentation_surface::gallery::displayed().is_none()
+        {
+            self.model.invalidate_presentation_selection();
         }
     }
 
@@ -526,11 +551,41 @@ impl App {
 }
 
 impl Controller {
-    fn present(&mut self, frame: FrameReady, _model: &ApplicationModel) -> bool {
+    fn reject_gallery_handoff(&mut self, frame: FrameReady, model: &ApplicationModel) {
+        let rejected_pending = self.pending_rejected
+            && self.pending.and_then(|surface| surface.frame) == Some(frame);
+        if model.foreground_visual() != Some(PresentationSourceKind::Explore)
+            || frame.content_session
+                != crate::generated::presentation_source_session(PresentationSourceKind::Explore)
+            || (!rejected_pending && frame.presentation_revision <= self.gallery_rejection_revision)
+        {
+            return;
+        }
+        // Consume each rejection once, even if a valid handoff makes it irrelevant.
+        // Exact pending-sample failure still retires that sample if a newer malformed
+        // offer was ignored while it was pending. Its duplicate cannot match again.
+        // A rejection arriving before its Select acknowledgement is deferred below.
+        self.gallery_rejection_revision = self
+            .gallery_rejection_revision
+            .max(frame.presentation_revision);
+        if (self.pending.is_some() && !rejected_pending)
+            || self.gallery_blocked.is_some()
+            || (!rejected_pending
+                && self.incumbent.and_then(|surface| surface.frame).is_some_and(|previous| {
+                    previous.presentation_revision >= frame.presentation_revision
+                }))
+        {
+            return;
+        }
+        self.gallery_recovery_needed = true;
+    }
+
+    fn present(&mut self, frame: FrameReady, model: &ApplicationModel) -> bool {
         if self.pending.and_then(|pending| pending.frame) == Some(frame) {
             return false;
         }
         let Some(surface) = crate::presentation_surface::metadata::surface(frame) else {
+            self.reject_gallery_handoff(frame, model);
             crate::presentation_surface::release(frame);
             return false;
         };
@@ -543,6 +598,20 @@ impl Controller {
             return false;
         }
         if !crate::presentation_surface::accept_publication(frame) {
+            if crate::presentation_surface::gallery::matching(Some(frame)).is_some() {
+                if frame.presentation_revision > self.gallery_rejection_revision
+                    && self.pending.is_none()
+                    && self.gallery_blocked.is_none()
+                    && self.incumbent.and_then(|surface| surface.frame).is_none_or(|previous| {
+                        previous.presentation_revision < frame.presentation_revision
+                    })
+                    && crate::presentation_surface::publication_admission_blocked(frame)
+                {
+                    self.gallery_blocked = Some(frame);
+                    self.gallery_handoff = true;
+                }
+                self.reject_gallery_handoff(frame, model);
+            }
             crate::presentation_surface::release(frame);
             return false;
         }
@@ -565,11 +634,21 @@ impl Controller {
             ..surface
         });
         self.pending_rejected = false;
+        if crate::presentation_surface::gallery::matching(Some(frame)).is_some() {
+            self.gallery_handoff = false;
+            self.gallery_blocked = None;
+            self.gallery_recovery_needed = false;
+        }
         self.incumbent = Some(surface);
         true
     }
 
     pub(super) fn retire_frame(&mut self) {
+        self.gallery_handoff = false;
+        self.gallery_blocked = None;
+        self.gallery_recovery_needed = false;
+        // Keep the physical receipt frontier, like incumbent, across page changes:
+        // a delayed rejection from the departed page cannot cancel re-entry.
         crate::presentation_surface::retire_samples();
         self.retire_pending();
         self.retained = None;
@@ -609,8 +688,22 @@ impl Controller {
             return Ok(());
         }
         let _ = recovery;
+        if self.gallery_blocked.is_some_and(|frame| {
+            !crate::presentation_surface::publication_admission_blocked(frame)
+        }) {
+            self.gallery_blocked = None;
+            self.gallery_handoff = false;
+        }
         if self.pending_rejected {
             self.retire_pending();
+        }
+        if self.gallery_recovery_needed
+            && !model.has_pending(ApplicationIntentEndpoint::PresentationSelect)
+            && self.pending.is_none()
+            && self.gallery_blocked.is_none()
+        {
+            self.gallery_recovery_needed = false;
+            self.gallery_handoff = false;
         }
         if let Some(surface) = self.pending {
             crate::presentation_surface::reconcile_completed(surface, model);

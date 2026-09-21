@@ -186,7 +186,14 @@ pub(super) fn view<'a>(
     input: crate::workspace_input::Binding,
 ) -> Element<'a, Message> {
     let snapshot = model.explore.snapshot.as_ref();
-    let presentation_title = model.explore.presentation_title();
+    let presentation_title = if paired.is_none()
+        && snapshot.is_some_and(|value| value.ready && !value.busy
+            && value.failure.is_empty() && value.order.matchingcount != 0)
+    {
+        "Restoring gallery"
+    } else {
+        model.explore.presentation_title()
+    };
     let columns = explore_columns(settings);
     let settings_available = settings.draft.is_some() && model.settings_edit_available();
     let mutation_available = !settings.has_local_edits() && model.explore_mutation_available();
@@ -375,8 +382,15 @@ fn gallery_viewport<'a>(
     let presented = displayed
         .as_ref()
         .map(|(_, snapshot)| snapshot.metadata.as_ref());
-    let matching = presented.map_or(0, |value| value.order.matchingcount);
-    let first_row = presented.map_or(0, |value| value.viewport.firstrow);
+    // Missing pixels do not erase the logical document or the retained scroll row.
+    let matching = presented.map_or_else(
+        || snapshot.map_or(0, |value| value.order.matchingcount),
+        |value| value.order.matchingcount,
+    );
+    let first_row = presented.map_or_else(
+        || state.gallery_first_row(snapshot.map_or(0, |value| value.viewport.firstrow)),
+        |value| value.viewport.firstrow,
+    );
     let display_columns = presented.map_or(columns, |value| value.viewport.columns);
     let maximum_extent = snapshot.map_or(
         crate::generated::VisualExtent {

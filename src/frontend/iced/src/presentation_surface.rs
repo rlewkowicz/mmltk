@@ -23,7 +23,7 @@ pub(crate) use renderer::{
     authorize_draw, begin_capacity_acceptance, capacity_acceptance_slots, clear_drawn_detail,
     complete_sample, discard_sample, drawable_annotation, drawable_prediction, drawable_validation,
     drawn_detail, end_capacity_acceptance, explore_display, initialize_diagnostics,
-    invalidate_drawn_slot, reconcile_completed, release, release_capacity_sample,
+    invalidate_drawn_slot, publication_admission_blocked, reconcile_completed, release, release_capacity_sample,
     reset_reconstruction_probe, retained_surface, retire_publication, retire_samples,
     same_allocation, trace_atlas_stage, trace_surface, viewer_annotation_request,
 };

@@ -249,6 +249,10 @@ impl ApplicationModel {
         self.explore.desired_selection = None;
     }
 
+    pub(crate) fn invalidate_presentation_selection(&mut self) {
+        self.presentation_model.clear_sent();
+    }
+
     pub fn presentation_refresh(&mut self) -> Option<VisualFrame> {
         if self.connection != ConnectionState::Connected
             || self.has_pending(ApplicationIntentEndpoint::PresentationSelect)
