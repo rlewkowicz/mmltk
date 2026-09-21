@@ -888,6 +888,7 @@ pub(crate) fn invalid_visual_frame() -> VisualFrame {
         },
         revision: 0,
         cleanrevision: 0,
+        resizemode: None,
         sourceextent: crate::generated::VisualExtent {
             width: 0,
             height: 0,

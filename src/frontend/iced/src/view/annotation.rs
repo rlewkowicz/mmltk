@@ -369,6 +369,7 @@ mod tests {
             },
             revision: 1,
             cleanrevision: 1,
+            resizemode: None,
             sourceextent: crate::generated::VisualExtent {
                 width: 640,
                 height: 480,

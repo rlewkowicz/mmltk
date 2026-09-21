@@ -5,6 +5,9 @@
 #include "src/controller/presentation/visual_diagnostics.h"
 #include "src/controller/subsystems/annotation/annotation_system.h"
 namespace mmltk::testsupport {
+[[nodiscard]] inline controller::AnnotationOpen test_annotation_open(const controller::VisualFrame& frame) {
+    return {.source = frame, .crop = {0U, 0U, frame.extent.width, frame.extent.height}, .target = frame.extent};
+}
 inline controller::VisualDiagnosticSink annotation_render_evidence() {
     static unsigned char enabled;
     return {.context = &enabled, .write = [](void*, controller::VisualDiagnosticFact) noexcept {}};
@@ -35,7 +38,7 @@ void await_annotation_render(controller::AnnotationSystem& annotation, Events& e
 }
 template <class Events>
 void open_annotation(controller::AnnotationSystem& annotation, Events& events, const controller::VisualFrame& source) {
-    static_cast<void>(annotation.Open({.source = source}));
+    static_cast<void>(annotation.Open(test_annotation_open(source)));
     REQUIRE(events.Wait([&] {
         const auto state = annotation.snapshot();
         return state.ready && state.frame.valid();

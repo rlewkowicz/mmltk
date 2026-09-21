@@ -136,7 +136,7 @@ TEST_CASE("Annotation renderer failure retires resources and allows source resta
                                 },
                                 mmltk::testsupport::annotation_render_evidence()};
     probe->fail_open = true;
-    static_cast<void>(annotation.Open({.source = source.system().snapshot().frame}));
+    static_cast<void>(annotation.Open(mmltk::testsupport::test_annotation_open(source.system().snapshot().frame)));
     REQUIRE(events.Wait([&] { return failures.load() == 1U; }));
     CHECK_FALSE(annotation.snapshot().ready);
     CHECK_FALSE(annotation.BorrowFrame().valid());
@@ -193,7 +193,7 @@ TEST_CASE("Annotation unavailable source settles ordered input and commands befo
         render.probe->open_hold = render.hold;
     }
     render.probe->fail_open = true;
-    static_cast<void>(annotation.Open({.source = source.frame()}));
+    static_cast<void>(annotation.Open(mmltk::testsupport::test_annotation_open(source.frame())));
     REQUIRE(render.entered.wait_for(2s) == std::future_status::ready);
     for (const auto kind : {WorkspaceMouseKind::Press, WorkspaceMouseKind::Motion, WorkspaceMouseKind::Release})
         annotation.Input(mmltk::testsupport::annotation_mouse(annotation, 1U, kind, {4.25F, 5.125F}));
@@ -208,7 +208,7 @@ TEST_CASE("Annotation unavailable source settles ordered input and commands befo
     mmltk::testsupport::ScopedTempDir saved{"mmltk-annotation-source-readiness"};
     const auto destination = saved.path() / "annotation.cbor";
     CHECK(annotation.Save({.destination = destination.string()}).busy);
-    CHECK(annotation.Open({.source = source.frame()}).busy);
+    CHECK(annotation.Open(mmltk::testsupport::test_annotation_open(source.frame())).busy);
     if (request_stop) CHECK(annotation.Stop().cancellation_requested);
     render.hold->release.set_value();
     REQUIRE(events.Wait([&] {
@@ -268,7 +268,7 @@ TEST_CASE("Annotation rejects an oversized incoming document without changing it
     const auto copies = backend->same_copies.load(std::memory_order_acquire);
     const auto pixel = *reinterpret_cast<const std::uint8_t*>(annotation.BorrowFrame().plane(0U).plane().data);
     reject_incoming = true;
-    static_cast<void>(annotation.Open({.source = source.frame()}));
+    static_cast<void>(annotation.Open(mmltk::testsupport::test_annotation_open(source.frame())));
     REQUIRE(events.Wait([&] { return !annotation.snapshot().busy; }));
     CHECK(annotation.snapshot().ready);
     CHECK(annotation.snapshot().ui == prior.ui);
@@ -313,7 +313,7 @@ TEST_CASE("Annotation reduces input and settles commands while rendering is held
     mmltk::testsupport::await_annotation_command(annotation, events, command.revision);
     CHECK(annotation.snapshot().ui.document_revision > committed);
     const auto document_epoch = annotation.snapshot().input_document_epoch;
-    static_cast<void>(annotation.Open({.source = source.system().snapshot().frame}));
+    static_cast<void>(annotation.Open(mmltk::testsupport::test_annotation_open(source.system().snapshot().frame)));
     CHECK(annotation.Stop().cancellation_requested);
     render.hold->release.set_value();
     REQUIRE(events.Wait([&] { return !annotation.snapshot().busy; }));
@@ -350,7 +350,7 @@ TEST_CASE("Annotation Open consumes retained prior-document input and accepts th
         std::scoped_lock lock(render.probe->mutex);
         render.probe->open_hold = render.hold;
     }
-    static_cast<void>(annotation.Open({.source = source.system().snapshot().frame}));
+    static_cast<void>(annotation.Open(mmltk::testsupport::test_annotation_open(source.system().snapshot().frame)));
     REQUIRE(render.entered.wait_for(2s) == std::future_status::ready);
     for (std::size_t index = 0U; index != 128U; ++index) {
         auto motion = right;

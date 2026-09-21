@@ -125,8 +125,9 @@ fn destructive_profile_continues_viewer_completion_into_annotation() {
         assert_eq!(driver.driver.phase, Phase::AwaitAnnotation);
         driver.observe_annotation_open(
             crate::generated::AnnotationOpen {
+                crop: source.content.clone(),
+                target: source.extent.clone(),
                 source,
-                originalcontent: true,
             },
             31,
         );

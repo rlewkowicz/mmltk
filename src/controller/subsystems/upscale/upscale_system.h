@@ -13,11 +13,13 @@
 #include "src/controller/presentation/visual_runtime.h"
 #include "src/controller/presentation/visual_diagnostics.h"
 #include "src/frameworks/gpu/image_types.h"
+#include "src/frameworks/gpu/image_buffer.h"
 #include "src/frameworks/gpu/system_image_model.h"
 #include "src/controller/presentation/visual_document.h"
 #include "src/backend/imaging/upscale/upscale_execution.h"
 namespace mmltk::controller {
 [[nodiscard]] VisualExtent checked_upscale_output_extent(VisualExtent);
+[[nodiscard]] VisualExtent restored_upscale_input_extent(const VisualFrame&);
 enum class UpscaleKernel : std::uint8_t {
     Default,
     ShiftLut,
@@ -36,11 +38,20 @@ using UpscalePurpose = mmltk::backend::imaging::upscale::ImageUpscalerPurpose;
 class UpscaleAlgorithm : public mmltk::frameworks::gpu::SystemImageModel {
    public:
     ~UpscaleAlgorithm() override = default;
+    void BindExecutionContext(const mmltk::frameworks::gpu::DeviceContext&, std::shared_ptr<mmltk::frameworks::gpu::ImageStream>) override;
+    Release ReleaseResources() noexcept override;
+    [[nodiscard]] mmltk::frameworks::gpu::BorrowedImageReadView Prepare(mmltk::frameworks::gpu::ImagePlaneView, const VisualFrame&, VisualExtent);
+    virtual void Resample(mmltk::frameworks::gpu::ImagePlaneView, mmltk::frameworks::gpu::ImagePlaneView, std::uintptr_t) = 0;
     virtual void Warm() = 0;
     [[nodiscard]] virtual bool GraphReplay(UpscaleKernel) const { return false; }
     virtual void Run(UpscaleKernel, mmltk::frameworks::gpu::ImagePlaneView source, mmltk::frameworks::gpu::ImagePlaneView target, std::uintptr_t stream,
                      const std::function<bool()>& current = {}, UpscalePurpose purpose = UpscalePurpose::Normal) = 0;
     virtual void Semantics(mmltk::frameworks::gpu::ImagePlaneView, mmltk::frameworks::gpu::ImagePlaneView, std::uintptr_t) = 0;
+   private:
+    std::unique_ptr<mmltk::frameworks::gpu::ImageBuffer> prepared_;
+    std::shared_ptr<mmltk::frameworks::gpu::ImageStream> preparation_stream_;
+    std::optional<VisualFrame> prepared_source_;
+    VisualExtent prepared_extent_{};
 };
 struct UpscaleMethodSnapshot final {
     bool available = false;
@@ -56,6 +67,8 @@ struct UpscaleImageMetadata final {
     static constexpr std::uint32_t output_scale = 4U;
     VisualFrame frame{};
     VisualFrame input{};
+    VisualExtent prepared_extent{};
+    VisualRegion prepared_content{};
     contracts::AnnotationSceneContent scene{};
 };
 struct UpscaleSnapshot final {
@@ -69,6 +82,8 @@ struct UpscaleSnapshot final {
     // CLEANUP-IGNORE: Upscale owns a receiver-private visual frame with its own generated identity.
     VisualFrame frame{};
     VisualFrame input{};
+    VisualExtent prepared_extent{};
+    VisualRegion prepared_content{};
     // CLEANUP-IGNORE: Upscale completion and failure records retain distinct canonical field identities and delivery semantics.
     contracts::AnnotationSceneContent scene{};
     // CLEANUP-IGNORE: UpscaleSnapshot remains a distinct reflected application boundary.

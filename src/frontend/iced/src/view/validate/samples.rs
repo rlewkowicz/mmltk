@@ -308,7 +308,7 @@ impl Component {
         let available = model.validation_navigation_available();
         let mut shown = surface;
         shown.fit_revision = self.fit_revision;
-        shown.configure_original(content.frame(), self.original);
+        shown.configure_original(content.frame(), &content.metadata.frame, self.original);
         let image = crate::view::image_viewer::image(
             shown,
             presentation_surface::labels::Source::Validation(

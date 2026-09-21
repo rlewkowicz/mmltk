@@ -17,7 +17,13 @@ namespace mmltk::controller::visual_test_support {
 using mmltk::frameworks::gpu::test_support::FakeImageBackend;
 using mmltk::frameworks::gpu::test_support::RuntimeFactory;
 using namespace std::chrono_literals;
-class TestUpscaleAlgorithm final : public UpscaleAlgorithm {
+class TestUpscalePreparation : public UpscaleAlgorithm {
+   public:
+    void Resample(mmltk::frameworks::gpu::ImagePlaneView source, mmltk::frameworks::gpu::ImagePlaneView target, std::uintptr_t) override {
+        Fill(target, *reinterpret_cast<const std::uint8_t*>(source.data));
+    }
+};
+class TestUpscaleAlgorithm final : public TestUpscalePreparation {
    public:
     void Semantics(const mmltk::frameworks::gpu::ImagePlaneView source, const mmltk::frameworks::gpu::ImagePlaneView target, std::uintptr_t) override {
         if (semantics_) semantics_->fetch_add(1U);
@@ -62,7 +68,7 @@ struct UpscaleExtentProbe final {
     // CLEANUP-IGNORE: Captured output views and scalar admission dimensions are distinct test evidence.
     std::vector<mmltk::frameworks::gpu::ImagePlaneView> targets;
 };
-class ExtentUpscaleAlgorithm final : public UpscaleAlgorithm {
+class ExtentUpscaleAlgorithm final : public TestUpscalePreparation {
    public:
     void Semantics(mmltk::frameworks::gpu::ImagePlaneView, const mmltk::frameworks::gpu::ImagePlaneView target, std::uintptr_t) override {
         if (target.valid()) Fill(target, 0U);

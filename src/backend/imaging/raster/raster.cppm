@@ -21,7 +21,7 @@ using ConstBytes = PitchedView<const std::uint8_t>;
 // Exactly 25 RGBA samples, with explicit source pixel coordinates. Destination
 // storage belongs to the caller and is reusable across asynchronous launches.
 [[nodiscard]] std::int32_t probe_rgba(ConstBytes, std::uint32_t* samples, std::span<const std::uint32_t, 50> coordinates, std::uintptr_t stream) noexcept;
-[[nodiscard]] std::int32_t scale_rgba_nearest(ConstBytes, MutableBytes, std::uintptr_t stream) noexcept;
+[[nodiscard]] std::int32_t scale_rgba(ConstBytes, MutableBytes, std::uintptr_t stream, bool bilinear = false) noexcept;
 struct PackedImage {
     std::uint8_t* pixels = nullptr;
     int width = 0;

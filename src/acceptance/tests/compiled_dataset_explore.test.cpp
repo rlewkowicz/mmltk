@@ -786,7 +786,7 @@ void test_compiled_dataset_explore_projection_navigation_and_streaming() {
     CHECK(borrowed_document.document->scene.objects == detail_scene.objects);
     for (const auto& object : borrowed_document.document->scene.objects) CHECK(object.mask.runs.empty());
     const auto document = controller::materialize_visual_document(*borrowed_document.document, full_detail.extent, full_detail.content,
-                                                                  controller::visual_materialized_extent(full_detail, true));
+                                                                  {32U, 16U});
     CHECK(document.frame_width == 32U);
     CHECK(document.frame_height == 16U);
     CHECK(document.categories.size() == system.snapshot().dataset.class_names.size());
@@ -1480,7 +1480,7 @@ TEST_CASE("Compiled Explore imports independent masks through both geometries an
     auto borrowed = system.BorrowDocument(frame);
     REQUIRE(borrowed.valid());
     const auto original =
-        controller::materialize_visual_document(*borrowed.document, frame.extent, frame.content, controller::visual_materialized_extent(frame, true));
+        controller::materialize_visual_document(*borrowed.document, frame.extent, frame.content, {8U, 4U});
     REQUIRE(original.objects.size() == 3);
     CHECK(original.objects[0].box == controller::contracts::AnnotationBox{{4.25F, 1.25F}, {7.75F, 3.75F}});
     CHECK(original.objects[0].mask.runs == std::vector<controller::contracts::AnnotationMaskRun>{{0, 0, 0}});
@@ -1489,7 +1489,7 @@ TEST_CASE("Compiled Explore imports independent masks through both geometries an
     CHECK_FALSE(original.objects[2].mask.present);
     const auto canvas = controller::materialize_visual_document(*borrowed.document, frame.extent, {});
     CHECK(canvas.objects[0].mask.runs.size() == (mode == resize::ImageResizeMode::Stretch ? 2 : 1));
-    const auto scaled = controller::scale_visual_document(borrowed.document, 4);
+    const auto scaled = controller::scale_visual_document(borrowed.document, {1U, 1U}, {4U, 4U});
     const controller::VisualRegion crop{frame.content.x * 4, frame.content.y * 4, frame.content.width * 4, frame.content.height * 4};
     const auto enlarged = controller::materialize_visual_document(*scaled, {32, 32}, crop, {32, 16});
     CHECK(enlarged.objects[0].mask.runs == std::vector<controller::contracts::AnnotationMaskRun>{{0, 0, 3}, {1, 0, 3}, {2, 0, 3}, {3, 0, 3}});

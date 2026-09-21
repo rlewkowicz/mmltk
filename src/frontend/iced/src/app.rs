@@ -543,6 +543,8 @@ mod route_tests {
                     crate::generated::ApplicationSystem::Upscale,
                     crate::generated::UpscaleImageMetadata {
                         frame: product,
+                        preparedextent: original.frame.extent.clone(),
+                        preparedcontent: original.frame.content.clone(),
                         input: original.frame.clone(),
                         scene: original.scene.clone(),
                     },

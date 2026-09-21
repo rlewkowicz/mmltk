@@ -63,6 +63,7 @@ pub(crate) fn visual_frame(kind: PresentationSourceKind, revision: u64) -> Visua
         },
         revision,
         cleanrevision: revision,
+        resizemode: None,
         sourceextent: crate::generated::VisualExtent {
             width: 640,
             height: 480,

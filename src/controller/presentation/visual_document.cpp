@@ -1,6 +1,5 @@
 #include "src/controller/presentation/visual_document.h"
 #include <algorithm>
-#include "src/backend/imaging/resample/image_resize.h"
 #include <atomic>
 #include <cmath>
 #include <limits>
@@ -37,12 +36,13 @@ consteval bool contains_annotation_point() {
     }
 }
 struct PointProjection final {
-    float scale = 1.0F;
+    float scale_x = 1.0F;
+    float scale_y = 1.0F;
     VisualRegion crop{};
     VisualExtent target{};
     void Apply(contracts::AnnotationPoint& point) const {
-        point.x *= scale;
-        point.y *= scale;
+        point.x *= scale_x;
+        point.y *= scale_y;
         if (!point.finite()) throw contracts::InvalidIntentError("Annotation coordinate is not finite");
         if (crop.valid()) {
             point.x = std::clamp(point.x - static_cast<float>(crop.x), 0.0F, static_cast<float>(crop.width));
@@ -68,14 +68,6 @@ void project_spatial_members(T& value, const PointProjection projection) {
     }
 }
 }  // namespace
-VisualExtent visual_materialized_extent(const VisualFrame& frame, const bool original) {
-    if (!original) return frame.extent;
-    const auto crop = frame.content.valid() ? frame.content : VisualRegion{0U, 0U, frame.extent.width, frame.extent.height};
-    if (!frame.source_extent.valid()) return {crop.width, crop.height};
-    const auto geometry = mmltk::backend::imaging::resample::compute_image_resize_geometry(
-        frame.source_extent.width, frame.source_extent.height, crop.width, crop.height, mmltk::backend::imaging::resample::ImageResizeMode::Letterbox);
-    return {geometry.resized_width, geometry.resized_height};
-}
 contracts::AnnotationSceneContent materialize_visual_document(const VisualDocument& document, const VisualExtent extent, VisualRegion crop,
                                                               VisualExtent target) {
     if (!crop.valid()) crop = {.width = extent.width, .height = extent.height};
@@ -139,10 +131,13 @@ contracts::AnnotationSceneContent materialize_visual_document(const VisualDocume
     if (!scene.valid()) throw contracts::InvalidIntentError("Annotation import exceeds the document geometry or catalog capacity");
     return scene;
 }
-std::shared_ptr<const VisualDocument> scale_visual_document(const std::shared_ptr<const VisualDocument>& source, const std::uint32_t scale) {
-    if (!source || scale == 0U) throw contracts::InvalidIntentError("Visual document scale is invalid");
+std::shared_ptr<const VisualDocument> scale_visual_document(const std::shared_ptr<const VisualDocument>& source, const VisualExtent source_extent,
+                                                            const VisualExtent target_extent) {
+    if (!source || !source_extent.valid() || !target_extent.valid()) throw contracts::InvalidIntentError("Visual document scale is invalid");
     auto target = std::make_shared<VisualDocument>(*source);
-    project_spatial_members(target->scene.objects, {.scale = static_cast<float>(scale)});
+    project_spatial_members(target->scene.objects,
+                            {.scale_x = static_cast<float>(target_extent.width) / static_cast<float>(source_extent.width),
+                             .scale_y = static_cast<float>(target_extent.height) / static_cast<float>(source_extent.height)});
     // The scene is a lightweight semantic projection until import chooses a
     // checked editable extent. Its normalized mask predicate remains valid.
     target->scene.frame_ready = false;

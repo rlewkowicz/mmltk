@@ -88,6 +88,25 @@ __global__ void scale_rgba_kernel(const draw_launch::ScaleRgbaLaunch launch) {
     const auto x = global_thread_x();
     const auto y = global_thread_y();
     if (x >= launch.target.width || y >= launch.target.height) return;
+    if (launch.bilinear) {
+        const float sx = fmaxf(0.0F, (static_cast<float>(x) + 0.5F) * launch.source.width / launch.target.width - 0.5F);
+        const float sy = fmaxf(0.0F, (static_cast<float>(y) + 0.5F) * launch.source.height / launch.target.height - 0.5F);
+        const int x0 = min(static_cast<int>(sx), launch.source.width - 1);
+        const int y0 = min(static_cast<int>(sy), launch.source.height - 1);
+        const int x1 = min(x0 + 1, launch.source.width - 1);
+        const int y1 = min(y0 + 1, launch.source.height - 1);
+        const float fx = sx - x0;
+        const float fy = sy - y0;
+        auto* target = launch.target.pixels + y * launch.target.pitch_bytes + x * 4;
+        for (int channel = 0; channel < 4; ++channel) {
+            const auto* first = launch.source.pixels + y0 * launch.source.pitch_bytes;
+            const auto* second = launch.source.pixels + y1 * launch.source.pitch_bytes;
+            const float top = first[x0 * 4 + channel] * (1.0F - fx) + first[x1 * 4 + channel] * fx;
+            const float bottom = second[x0 * 4 + channel] * (1.0F - fx) + second[x1 * 4 + channel] * fx;
+            target[channel] = static_cast<std::uint8_t>(top * (1.0F - fy) + bottom * fy + 0.5F);
+        }
+        return;
+    }
     const auto sx = static_cast<int>(static_cast<std::uint64_t>(x) * launch.source.width / launch.target.width);
     const auto sy = static_cast<int>(static_cast<std::uint64_t>(y) * launch.source.height / launch.target.height);
     const auto pixel = raster_math::load_rgba_pixel(launch.source.pixels, launch.source.pitch_bytes, sx, sy);

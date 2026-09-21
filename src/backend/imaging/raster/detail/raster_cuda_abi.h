@@ -25,6 +25,7 @@ struct ScaleRgbaLaunch {
     ConstSurfaceU8 source;
     MutableSurfaceU8 target;
     cudaStream_t stream = nullptr;
+    bool bilinear = false;
 };
 struct ProbeRgbaLaunch {
     ConstSurfaceU8 source;

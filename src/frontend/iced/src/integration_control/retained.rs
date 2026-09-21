@@ -2964,8 +2964,9 @@ impl State {
                     || snapshot.frame.extent.height != 384
                     || request.source != snapshot.frame
                     || request.kernel != crate::generated::UpscaleKernel::Default
-                    || upscale.frame.extent.width != 1536
-                    || upscale.frame.extent.height != 1536
+                    || upscale.preparedextent
+                        .checked_scale(crate::generated::UpscaleImageMetadata::OUTPUT_SCALE)
+                        .as_ref() != Some(&upscale.frame.extent)
                     || model.displayed_upscale_kernel()
                         != Some(crate::generated::UpscaleKernel::Default)
                 {
@@ -2974,7 +2975,9 @@ impl State {
                 let Some(sampleable) = probes.draws().upscale(frame, upscale.frame.revision) else {
                     return Task::none();
                 };
-                if sampleable.content_width != 1536 || sampleable.content_height != 1536 {
+                if sampleable.content_width != upscale.frame.extent.width
+                    || sampleable.content_height != upscale.frame.extent.height
+                {
                     return Task::none();
                 }
                 driver.phase = Phase::ViewerNoAspect;
@@ -3202,12 +3205,12 @@ impl State {
                     );
                     return Task::none();
                 }
-                let Some(expected_width) = source_width.checked_mul(4) else {
-                    driver.fail("Upscale source width cannot be represented at four-times extent");
+                let Some(expected_width) = upscale.preparedextent.width.checked_mul(4) else {
+                    driver.fail("Upscale prepared width cannot be represented at four-times extent");
                     return Task::none();
                 };
-                let Some(expected_height) = source_height.checked_mul(4) else {
-                    driver.fail("Upscale source height cannot be represented at four-times extent");
+                let Some(expected_height) = upscale.preparedextent.height.checked_mul(4) else {
+                    driver.fail("Upscale prepared height cannot be represented at four-times extent");
                     return Task::none();
                 };
                 if upscale.frame.extent.width != expected_width

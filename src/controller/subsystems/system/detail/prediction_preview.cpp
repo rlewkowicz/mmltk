@@ -625,13 +625,13 @@ void PredictionPreviewFrame::DrawRegion(gpu::SystemImageRuntime& runtime, gpu::I
             if (scale) {
                 if (write_clean)
                     checked(static_cast<cudaError_t>(
-                        raster::scale_rgba_nearest({clean_pixels, clean_pitch, overlay.width, overlay.height},
+                        raster::scale_rgba({clean_pixels, clean_pitch, overlay.width, overlay.height},
                                                    {reinterpret_cast<std::uint8_t*>(clean.data), clean.descriptor.pitch_bytes,
                                                     static_cast<int>(clean.descriptor.width), static_cast<int>(clean.descriptor.height)},
                                                    stream)));
                 if (write_semantic)
                     checked(static_cast<cudaError_t>(
-                        raster::scale_rgba_nearest({semantic_pixels, semantic_pitch, overlay.width, overlay.height},
+                        raster::scale_rgba({semantic_pixels, semantic_pitch, overlay.width, overlay.height},
                                                    {reinterpret_cast<std::uint8_t*>(semantic.data), semantic.descriptor.pitch_bytes,
                                                     static_cast<int>(semantic.descriptor.width), static_cast<int>(semantic.descriptor.height)},
                                                    stream)));

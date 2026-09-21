@@ -505,7 +505,7 @@ mod tests {
                 width: content[2],
                 height: content[3],
             };
-            surface.configure_original(&frame, true);
+            surface.configure_original(&frame, &frame, true);
             let bounds = Rectangle::with_size(iced::Size::new(800.0, 600.0));
             let placed = placement_geometry(
                 bounds,
@@ -520,7 +520,7 @@ mod tests {
                 inverse_content_point(placed, Point::new(400.0, 300.0), surface.content_extent()),
                 Some((320.0, content[3] as f32 / 2.0))
             );
-            surface.configure_original(&frame, false);
+            surface.configure_original(&frame, &frame, false);
             let canvas = placement_geometry(
                 bounds,
                 surface.display_extent(),
@@ -529,7 +529,7 @@ mod tests {
             )
             .unwrap();
             assert_eq!((canvas.width, canvas.height), (800.0, 600.0));
-            surface.configure_original(&frame, true);
+            surface.configure_original(&frame, &frame, true);
             assert_eq!(surface.content_region(), content);
         }
     }

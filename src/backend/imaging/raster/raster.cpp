@@ -89,9 +89,9 @@ std::vector<std::uint8_t> category_colors(const std::span<const int> labels, con
     }
     return colors;
 }
-std::int32_t scale_rgba_nearest(const ConstBytes source, const MutableBytes target, const std::uintptr_t stream) noexcept {
+std::int32_t scale_rgba(const ConstBytes source, const MutableBytes target, const std::uintptr_t stream, const bool bilinear) noexcept {
     if (!source.valid(4U) || !target.valid(4U) || stream == 0U) return cudaErrorInvalidValue;
-    return detail::launch_scale_rgba({as_launch_surface(source), as_launch_surface(target), reinterpret_cast<cudaStream_t>(stream)});
+    return detail::launch_scale_rgba({as_launch_surface(source), as_launch_surface(target), reinterpret_cast<cudaStream_t>(stream), bilinear});
 }
 std::int32_t build_category_colors_cuda(const CategoryColorWork& work) noexcept {
     if (work.count == 0U) return cudaSuccess;

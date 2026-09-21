@@ -1015,6 +1015,7 @@ class ExploreSystem::Impl final {
         auto frame = visual_frame({PresentationSourceKind::Explore, 1U}, product_extent, revision);
         frame.content = plan.mode == ExploreMode::Detail ? algorithm.DetailContent(plan) : VisualRegion{};
         frame.source_extent = plan.mode == ExploreMode::Detail ? algorithm.DetailSourceExtent(plan) : VisualExtent{};
+        frame.resize_mode = plan.mode == ExploreMode::Detail ? algorithm.DetailResizeMode(plan) : std::nullopt;
         frame.clean_revision = clean_revision;
         PreparedProduct rendered{
             .output = std::move(output),

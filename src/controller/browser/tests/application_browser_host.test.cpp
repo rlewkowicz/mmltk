@@ -279,7 +279,7 @@ class ReadyHostAnnotation final {
               },
               mmltk::testsupport::annotation_render_evidence()) {
         source_->Publish(16U, 16U, [](auto, auto, auto) {});
-        static_cast<void>(annotation_.Open({.source = visual_frame(identity_, {16U, 16U}, source_->OutputFacts().revision)}));
+        static_cast<void>(annotation_.Open({.source = visual_frame(identity_, {16U, 16U}, source_->OutputFacts().revision), .crop = {0U, 0U, 16U, 16U}, .target = {16U, 16U}}));
         const bool ready = Wait([this] { return (annotation_.snapshot().ready && annotation_.snapshot().frame.valid()) || !failure_.empty(); });
         INFO("Annotation startup failure: " << failure_);
         REQUIRE(ready);

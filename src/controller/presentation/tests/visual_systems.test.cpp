@@ -157,7 +157,7 @@ TEST_CASE("Explore viewport and Annotation pointer work preserve their intended 
                                 },
                                 mmltk::testsupport::annotation_render_evidence()};
     CHECK_FALSE(annotation.BorrowFrame().valid());
-    const auto admitted = annotation.Open({.source = explore.snapshot().frame});
+    const auto admitted = annotation.Open(mmltk::testsupport::test_annotation_open(explore.snapshot().frame));
     CHECK(admitted.busy);
     REQUIRE(annotation_events.Wait([&] { return annotation.snapshot().ready && annotation.snapshot().frame.valid(); }));
     annotation.SetInputPeer(7U);

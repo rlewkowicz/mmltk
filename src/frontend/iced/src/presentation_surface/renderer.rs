@@ -599,10 +599,7 @@ pub(crate) fn viewer_annotation_request() -> Option<crate::generated::Annotation
             && metadata::valid_content(source)
             && surface.viewer_identity == paired.surface.viewer_identity
         {
-            return Some(crate::generated::AnnotationOpen {
-                source: source.clone(),
-                originalcontent: surface.original_content(source)?,
-            });
+            return Some(surface.annotation_request(source));
         }
         return None;
     }
@@ -627,11 +624,7 @@ pub(crate) fn viewer_annotation_request() -> Option<crate::generated::Annotation
     if !metadata::valid_content(source) || crop != surface.content_region() {
         return None;
     }
-    let originalcontent = surface.original_content(source)?;
-    Some(crate::generated::AnnotationOpen {
-        source: source.clone(),
-        originalcontent,
-    })
+    Some(surface.annotation_request(source))
 }
 
 pub(crate) fn same_mailbox_slot(left: FrameReady, right: FrameReady) -> bool {
@@ -1431,7 +1424,7 @@ impl DetailContent {
             .viewer_identity()
             .map(|(dataset, image)| (dataset, u64::from(image)));
         surface.fit_revision = fit_revision;
-        surface.configure_original(self.frame(), original);
+        surface.configure_original(self.frame(), self.input_frame(), original);
         surface
     }
 
@@ -3191,6 +3184,8 @@ mod tests {
                             crate::generated::ApplicationSystem::Upscale,
                             crate::generated::UpscaleImageMetadata {
                                 frame: output.clone(),
+                                preparedextent: source.frame.extent.clone(),
+                                preparedcontent: source.frame.content.clone(),
                                 input: source.frame.clone(),
                                 scene: source.scene.clone(),
                             },
@@ -3279,6 +3274,8 @@ mod tests {
                 Some(std::sync::Arc::new(
                     crate::generated::UpscaleImageMetadata {
                         frame: output,
+                        preparedextent: old.frame().extent.clone(),
+                        preparedcontent: old.frame().content.clone(),
                         input: old.frame().clone(),
                         scene: captured.scene.clone(),
                     },
@@ -3347,6 +3344,8 @@ mod tests {
                             crate::generated::ApplicationSystem::Upscale,
                             crate::generated::UpscaleImageMetadata {
                                 frame: product.clone(),
+                                preparedextent: source.frame.extent.clone(),
+                                preparedcontent: source.frame.content.clone(),
                                 input: source.frame.clone(),
                                 scene: source.scene.clone(),
                             },
@@ -3389,10 +3388,7 @@ mod tests {
                 let surface = detail.configure_surface(pending.surface, original, 1);
                 let crop = surface.content_region();
                 record_drawn_detail(surface, crop);
-                let expected = crate::generated::AnnotationOpen {
-                    source: product,
-                    originalcontent: original,
-                };
+                let expected = surface.annotation_request(&product);
                 assert_eq!(viewer_annotation_request(), Some(expected.clone()));
                 if !original {
                     record_drawn_detail(
@@ -3598,6 +3594,8 @@ mod tests {
         };
         let upscale = crate::generated::UpscaleImageMetadata {
             frame: upscale_frame,
+            preparedextent: source.frame.extent.clone(),
+            preparedcontent: source.frame.content.clone(),
             input: source.frame.clone(),
             scene: source.scene.clone(),
         };

@@ -837,6 +837,8 @@ mod tests {
         let native = Arc::new(native);
         let original = super::super::DetailContent::new(native.clone(), None);
         let mut derived = crate::generated::UpscaleImageMetadata {
+            preparedextent: native.frame.extent.clone(),
+            preparedcontent: native.frame.content.clone(),
             input: native.frame.clone(),
             frame: native.frame.clone(),
             scene: native.scene.clone(),

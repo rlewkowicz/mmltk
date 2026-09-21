@@ -856,23 +856,8 @@ impl State {
                         driver.fail("Annotation import has no dispatched source receipt");
                         return Task::none();
                     };
-                    let expected = if request.originalcontent {
-                        let crop = &request.source.content;
-                        let source = &request.source.sourceextent;
-                        if source.width != 0 && source.height != 0 {
-                            let scale = (f64::from(crop.width) / f64::from(source.width))
-                                .min(f64::from(crop.height) / f64::from(source.height));
-                            [
-                                (f64::from(source.width) * scale).round().max(1.0) as u32,
-                                (f64::from(source.height) * scale).round().max(1.0) as u32,
-                            ]
-                        } else {
-                            [crop.width, crop.height]
-                        }
-                    } else {
-                        [request.source.extent.width, request.source.extent.height]
-                    };
-                    if !request.originalcontent
+                    let expected = [request.target.width, request.target.height];
+                    if request.crop != request.source.content
                         || snapshot.frame.extent.width != expected[0]
                         || snapshot.frame.extent.height != expected[1]
                         || u32::from(scene.framewidth) != expected[0]

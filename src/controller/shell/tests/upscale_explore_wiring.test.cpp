@@ -27,6 +27,7 @@ struct ShellWarmProbe final {
 };
 class ShellWarmAlgorithm final : public UpscaleAlgorithm {
    public:
+    void Resample(mmltk::frameworks::gpu::ImagePlaneView source, mmltk::frameworks::gpu::ImagePlaneView target, std::uintptr_t stream) override { Semantics(source, target, stream); }
     void Semantics(mmltk::frameworks::gpu::ImagePlaneView, const mmltk::frameworks::gpu::ImagePlaneView target, std::uintptr_t) override {
         if (target.valid()) std::memset(reinterpret_cast<void*>(target.data), 0, target.descriptor.pitch_bytes * target.descriptor.height);
     }

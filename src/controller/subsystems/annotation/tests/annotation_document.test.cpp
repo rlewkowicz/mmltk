@@ -376,7 +376,7 @@ TEST_CASE("Visual document projection transforms every canonical spatial member 
     };
     source->scene.objects.push_back(object);
     REQUIRE(source->scene.valid());
-    const auto scaled = scale_visual_document(source, 4U);
+    const auto scaled = scale_visual_document(source, {1U, 1U}, {4U, 4U});
     const auto& scaled_object = scaled->scene.objects.front();
     CHECK(scaled_object.mask_points.front() == contracts::AnnotationPoint{48.0F, 64.0F});
     CHECK(scaled_object.spline_knots.front().in.point == contracts::AnnotationPoint{16.0F, 32.0F});
@@ -422,7 +422,7 @@ TEST_CASE("Viewed masks import full catalogs and retain editable runs through hi
     CHECK(imported.objects.front().category == 79U);
     CHECK(imported.categories.back().value == "étiquette");
     CHECK(imported.palette == source->scene.palette);
-    const auto scaled = scale_visual_document(source, 4U);
+    const auto scaled = scale_visual_document(source, {1U, 1U}, {4U, 4U});
     const auto cropped = materialize_visual_document(*scaled, {256U, 256U}, {32U, 32U, 192U, 192U});
     REQUIRE(cropped.valid());
     REQUIRE(cropped.objects.front().mask.runs.size() == 96U);
@@ -1413,9 +1413,10 @@ TEST_CASE("Original imports restore stored aspect with fractional geometry witho
     frame.extent = {32U, 32U};
     frame.content = {0U, 0U, 32U, 32U};
     frame.source_extent = {4000U, 2000U};
-    const auto target = visual_materialized_extent(frame, true);
-    CHECK(target == VisualExtent{32U, 16U});
-    CHECK(visual_materialized_extent(frame, false) == frame.extent);
+    const VisualExtent target{32U, 16U};
+    const auto canvas = materialize_visual_document(*source, frame.extent, frame.content, frame.extent);
+    CHECK(canvas.frame_width == frame.extent.width);
+    CHECK(canvas.frame_height == frame.extent.height);
     const auto imported = materialize_visual_document(*source, frame.extent, frame.content, target);
     CHECK(imported.frame_width == 32U);
     CHECK(imported.frame_height == 16U);
@@ -1427,7 +1428,9 @@ TEST_CASE("Original imports restore stored aspect with fractional geometry witho
     REQUIRE(masked.objects.front().mask.runs.size() == 1U);
     CHECK(masked.objects.front().mask.runs.front() == contracts::AnnotationMaskRun{0U, 0U, 0U});
     frame.content = {0U, 8U, 32U, 16U};
-    CHECK(visual_materialized_extent(frame, true) == target);
+    const auto letterbox = materialize_visual_document(*source, frame.extent, frame.content, target);
+    CHECK(letterbox.frame_width == target.width);
+    CHECK(letterbox.frame_height == target.height);
 }
 TEST_CASE("Document materialization bounds empty and sparse mask queries independently of boxes") {
     auto source = std::make_shared<VisualDocument>();
@@ -1450,7 +1453,7 @@ TEST_CASE("Document materialization bounds empty and sparse mask queries indepen
     CHECK_FALSE(imported.objects[2].mask.present);
     CHECK(imported.objects[0].box == source->scene.objects[0].box);
     calls = {};
-    const auto scaled = scale_visual_document(source, 4);
+    const auto scaled = scale_visual_document(source, {1U, 1U}, {4U, 4U});
     const auto enlarged = materialize_visual_document(*scaled, {128, 128}, {});
     CHECK(calls == std::array<unsigned, 3>{64, 0, 0});
     CHECK(enlarged.objects[0].mask.runs.size() == 8);

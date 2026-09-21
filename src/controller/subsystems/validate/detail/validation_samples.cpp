@@ -22,6 +22,7 @@ class ValidationSamples::Impl final {
    public:
     struct Sample final {
         ValidationSampleMetadata metadata;
+        std::optional<mmltk::backend::imaging::resample::ImageResizeMode> resize_mode{};
         std::uint64_t content_identity = 0U;
         std::uint64_t clean_revision = 0U;
         std::shared_ptr<const PredictionPreviewFrame> raw;
@@ -252,6 +253,7 @@ class ValidationSamples::Impl final {
             };
             auto captured = std::make_shared<Sample>();
             captured->metadata = std::move(metadata);
+            captured->resize_mode = sample.resize_mode;
             captured->content_identity = (*found)->content_identity;
             captured->clean_revision = NextCleanRevision();
             captured->document = std::move(document);
@@ -393,6 +395,7 @@ class ValidationSamples::Impl final {
                 const auto found = std::ranges::find_if(drawing->samples, [&](const auto& slot) { return slot && slot->metadata.identity == *selected; });
                 image.frame.content = (*found)->metadata.content;
                 image.frame.source_extent = (*found)->metadata.source_extent;
+                image.frame.resize_mode = (*found)->resize_mode;
             }
             {
                 std::scoped_lock lock(mutex_);

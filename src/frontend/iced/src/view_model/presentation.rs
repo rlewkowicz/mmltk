@@ -52,9 +52,16 @@ impl ApplicationModel {
                 .requested_selection
                 .is_none_or(|image| snapshot.selectedimage == Some(image))
             && Self::valid_visual_source(&snapshot.frame).is_some())
-        .then(|| crate::generated::AnnotationOpen {
-            source: snapshot.frame.clone(),
-            originalcontent: snapshot.detail.showoriginaldimensions,
+        .then(|| {
+            let mut surface = crate::presentation_surface::Surface::empty();
+            surface.width = snapshot.frame.extent.width;
+            surface.height = snapshot.frame.extent.height;
+            surface.configure_original(
+                &snapshot.frame,
+                &snapshot.frame,
+                snapshot.detail.showoriginaldimensions,
+            );
+            surface.annotation_request(&snapshot.frame)
         })
     }
 

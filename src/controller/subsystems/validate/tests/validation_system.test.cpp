@@ -452,7 +452,7 @@ TEST_CASE("Validation documents preserve off-box empty and missing masks through
     CHECK(imported.objects[1].mask.present);
     CHECK(imported.objects[1].mask.runs.empty());
     CHECK_FALSE(imported.objects[2].mask.present);
-    const auto scaled = scale_visual_document(borrowed.document, 4);
+    const auto scaled = scale_visual_document(borrowed.document, {1U, 1U}, {4U, 4U});
     const auto enlarged = materialize_visual_document(*scaled, {32, 32}, {0, 8, 32, 16});
     CHECK(enlarged.objects[0].mask.runs == std::vector<contracts::AnnotationMaskRun>{{0, 0, 3}, {1, 0, 3}, {2, 0, 3}, {3, 0, 3}});
     borrowed = {};

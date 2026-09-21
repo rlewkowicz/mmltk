@@ -344,12 +344,16 @@ class AnnotationSystem::Impl final {
                 [this, request](Runtime& runtime, std::stop_token stop) -> detail::VisualRuntimeOwner::Notification {
                     if (stop.stop_requested() || CancelRequested()) return [this] { Post([this] { FinishCancelled(); }); };
                     auto source = borrow_source_(request.source);
-                    if (!source.valid()) return [this] { Post([this] { FinishRejected("Annotation source image is unavailable"); }); };
+                    if (!source.valid() || !visual_product_matches_frame(request.source, source.pixels))
+                        return [this] { Post([this] { FinishRejected("Annotation source image is unavailable"); }); };
                     const auto descriptor = source.pixels.plane(0U).plane().descriptor;
-                    if (descriptor.width > settings_.maximum_width || descriptor.height > settings_.maximum_height)
-                        return [this] { Post([this] { FinishRejected("Annotation source exceeds the configured device bounds"); }); };
-                    const auto crop = request.original_content ? request.source.content : VisualRegion{};
-                    const auto target = visual_materialized_extent(request.source, request.original_content);
+                    if (descriptor.width > settings_.maximum_width || descriptor.height > settings_.maximum_height ||
+                        !request.crop.valid() || !request.target.valid() ||
+                        request.target.width > request.crop.width || request.target.height > request.crop.height ||
+                        request.target.width > settings_.maximum_width || request.target.height > settings_.maximum_height)
+                        return [this] { Post([this] { FinishRejected("Annotation import geometry is invalid or exceeds device bounds"); }); };
+                    const auto crop = request.crop;
+                    const auto target = request.target;
                     contracts::AnnotationSceneContent scene;
                     try {
                         scene = materialize_visual_document(*source.document, request.source.extent, crop, target);

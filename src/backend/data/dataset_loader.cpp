@@ -362,6 +362,7 @@ void DatasetLoader::synchronize() { impl_->stream->synchronize(); }
 size_t DatasetLoader::num_images() const { return impl_->source.header().num_images; }
 size_t DatasetLoader::num_batches() const { return impl_->batch_starts.size(); }
 uint32_t DatasetLoader::image_width() const { return impl_->source.header().image_width; }
+mmltk::backend::imaging::resample::ImageResizeMode DatasetLoader::resize_mode() const { return impl_->source.header().resize_mode; }
 const ImageEntry& DatasetLoader::image_entry(std::uint32_t index) const {
     if (index >= num_images()) throw std::out_of_range("dataset image geometry index");
     return impl_->source.image_entry(index);

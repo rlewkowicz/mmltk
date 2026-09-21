@@ -716,6 +716,10 @@ class NativeExploreAlgorithm final : public ExploreAlgorithm {
         const auto& entry = committed_->store.image_entries()[*plan.selected_image];
         return {entry.original_width, entry.original_height};
     }
+    [[nodiscard]] std::optional<mmltk::backend::imaging::resample::ImageResizeMode> DetailResizeMode(const ExploreRenderPlan& plan) const override {
+        if (!plan.selected_image) return {};
+        return committed_->store.header().resize_mode;
+    }
     [[nodiscard]] VisualRegion DetailContent(const ExploreRenderPlan& plan) const override {
         if (!plan.selected_image) return {};
         const auto crop = committed_->store.geometry(*plan.selected_image);

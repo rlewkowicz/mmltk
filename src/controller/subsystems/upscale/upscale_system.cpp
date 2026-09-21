@@ -6,6 +6,7 @@
 #include "src/frameworks/gpu/cuda_error.h"
 #include <cuda.h>
 #include <mutex>
+#include <limits>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -18,6 +19,54 @@ VisualExtent checked_upscale_output_extent(const VisualExtent source) {
     const auto result = checked_visual_scale(source, UpscaleImageMetadata::output_scale);
     if (!source.valid() || !result) throw contracts::InvalidIntentError("Upscale four-times extent is invalid or overflows");
     return *result;
+}
+VisualExtent restored_upscale_input_extent(const VisualFrame& frame) {
+    const auto extent = frame.extent;
+    if (!extent.valid()) throw contracts::InvalidIntentError("Upscale input extent is invalid");
+    const VisualRegion full{0U, 0U, extent.width, extent.height};
+    if (frame.content.valid() && (frame.content.x > extent.width || frame.content.y > extent.height ||
+        frame.content.width > extent.width - frame.content.x || frame.content.height > extent.height - frame.content.y))
+        throw contracts::InvalidIntentError("Upscale content is outside the input extent");
+    if (frame.resize_mode != mmltk::backend::imaging::resample::ImageResizeMode::Stretch || !frame.source_extent.valid() ||
+        (frame.content.valid() && frame.content != full)) return extent;
+    const auto wide = static_cast<std::uint64_t>(extent.width) * frame.source_extent.height;
+    const auto tall = static_cast<std::uint64_t>(extent.height) * frame.source_extent.width;
+    const auto enclosing = [](std::uint64_t numerator, std::uint32_t denominator) {
+        const auto value = numerator / denominator + (numerator % denominator != 0U);
+        if (value > std::numeric_limits<std::uint32_t>::max()) throw contracts::InvalidIntentError("Upscale restored extent overflows");
+        return static_cast<std::uint32_t>(value);
+    };
+    if (wide < tall) return {enclosing(tall, frame.source_extent.height), extent.height};
+    return {extent.width, enclosing(wide, frame.source_extent.width)};
+}
+void UpscaleAlgorithm::BindExecutionContext(const mmltk::frameworks::gpu::DeviceContext& context,
+                                           std::shared_ptr<mmltk::frameworks::gpu::ImageStream> stream) {
+    prepared_ = std::make_unique<mmltk::frameworks::gpu::ImageBuffer>(context);
+    preparation_stream_ = std::move(stream);
+}
+UpscaleAlgorithm::Release UpscaleAlgorithm::ReleaseResources() noexcept {
+    // Runtime retirement has settled both the runtime stream and model reads.
+    prepared_source_.reset();
+    prepared_.reset();
+    preparation_stream_.reset();
+    return {};
+}
+mmltk::frameworks::gpu::BorrowedImageReadView UpscaleAlgorithm::Prepare(
+    const mmltk::frameworks::gpu::ImagePlaneView source, const VisualFrame& frame, const VisualExtent extent) {
+    if (extent == frame.extent) return {};
+    if (!prepared_ || !preparation_stream_) throw std::runtime_error("Upscale preparation context is unavailable");
+    if (!prepared_source_ || visual_clean_content_identity(*prepared_source_) != visual_clean_content_identity(frame) ||
+        prepared_source_->source_extent != frame.source_extent || prepared_source_->resize_mode != frame.resize_mode || prepared_extent_ != extent) {
+        prepared_source_.reset();
+        prepared_->Write(*preparation_stream_, source.descriptor.kind, extent.width, extent.height,
+                         [&](auto target, auto stream) { Resample(source, target, stream); });
+        // Readiness is ordered on the runtime stream. The enclosing product
+        // publication settles that stream (including joined model reads) before
+        // another job can reuse or grow this retained allocation.
+        prepared_extent_ = extent;
+        prepared_source_ = frame;
+    }
+    return prepared_->Borrow();
 }
 namespace {
 namespace native_upscale = mmltk::backend::imaging::upscale;
@@ -99,6 +148,14 @@ class UpscaleStreamBridge final {
 };
 class NativeUpscaleModel final : public UpscaleAlgorithm {
    public:
+    void Resample(const mmltk::frameworks::gpu::ImagePlaneView source, const mmltk::frameworks::gpu::ImagePlaneView target,
+                  const std::uintptr_t stream) override {
+        const auto status = mmltk::backend::imaging::raster::scale_rgba(
+            {reinterpret_cast<const std::uint8_t*>(source.data), source.descriptor.pitch_bytes, static_cast<int>(source.descriptor.width), static_cast<int>(source.descriptor.height)},
+            {reinterpret_cast<std::uint8_t*>(target.data), target.descriptor.pitch_bytes, static_cast<int>(target.descriptor.width), static_cast<int>(target.descriptor.height)},
+            stream, true);
+        mmltk::frameworks::gpu::ensure_cuda_ok(static_cast<cudaError_t>(status), "Upscale input preparation failed");
+    }
     void Semantics(const mmltk::frameworks::gpu::ImagePlaneView source, const mmltk::frameworks::gpu::ImagePlaneView target,
                    const std::uintptr_t stream) override {
         if (!source.valid()) {
@@ -108,7 +165,7 @@ class NativeUpscaleModel final : public UpscaleAlgorithm {
             return;
         }
         const auto status =
-            mmltk::backend::imaging::raster::scale_rgba_nearest({reinterpret_cast<const std::uint8_t*>(source.data), source.descriptor.pitch_bytes,
+            mmltk::backend::imaging::raster::scale_rgba({reinterpret_cast<const std::uint8_t*>(source.data), source.descriptor.pitch_bytes,
                                                                  static_cast<int>(source.descriptor.width), static_cast<int>(source.descriptor.height)},
                                                                 {reinterpret_cast<std::uint8_t*>(target.data), target.descriptor.pitch_bytes,
                                                                  static_cast<int>(target.descriptor.width), static_cast<int>(target.descriptor.height)},
@@ -128,7 +185,7 @@ class NativeUpscaleModel final : public UpscaleAlgorithm {
         if (owner_ || stream_bridge_) std::terminate();
     }
     Release ReleaseResources() noexcept override {
-        if (!owner_) return {};
+        if (!owner_) return UpscaleAlgorithm::ReleaseResources();
         if (owner_->Stop() != native_upscale::kImageUpscalerSuccess) {
             std::exception_ptr physical;
             try {
@@ -148,7 +205,7 @@ class NativeUpscaleModel final : public UpscaleAlgorithm {
         }
         stream_bridge_.reset();
         owner_.reset();
-        return {};
+        return UpscaleAlgorithm::ReleaseResources();
     }
     void Warm() override {
         CUcontext context = nullptr;
@@ -392,10 +449,15 @@ class UpscaleSystem::Impl final {
         if (request.kernel > UpscaleKernel::RealPlksr) throw contracts::InvalidIntentError("Upscale kernel is invalid");
         if (!request.document.valid()) throw contracts::InvalidIntentError("Upscale document facts are invalid");
         if (!request.source.valid()) throw contracts::InvalidIntentError("Upscale source frame is invalid");
-        const auto target = checked_upscale_output_extent(request.source.extent);
-        const auto content = checked_visual_scale(request.source.content, UpscaleImageMetadata::output_scale);
+        const auto prepared_extent = restored_upscale_input_extent(request.source);
+        const auto target = checked_upscale_output_extent(prepared_extent);
+        const auto prepared_content = prepared_extent == request.source.extent ? request.source.content :
+            VisualRegion{0U, 0U, prepared_extent.width, prepared_extent.height};
+        const auto content = checked_visual_scale(prepared_content, UpscaleImageMetadata::output_scale);
         if (!content) throw contracts::InvalidIntentError("Upscale content geometry overflows");
-        if (target.width > settings_.maximum_width || target.height > settings_.maximum_height)
+        if (target.width > settings_.maximum_width || target.height > settings_.maximum_height ||
+            target.width > static_cast<std::uint32_t>(std::numeric_limits<int>::max()) ||
+            target.height > static_cast<std::uint32_t>(std::numeric_limits<int>::max()))
             throw contracts::InvalidIntentError("Upscale four-times extent exceeds device bounds");
         {
             std::unique_lock admission_lock(mutex_);
@@ -450,7 +512,7 @@ class UpscaleSystem::Impl final {
             state_.methods[static_cast<std::size_t>(request.kernel)].failure.reset();
             RefreshAvailability(request);
             AdvanceRevision();
-            if (!worker_.SubmitLatest([this, request, target, content = *content, demand, admission_link](
+            if (!worker_.SubmitLatest([this, request, target, prepared_extent, content = *content, demand, admission_link](
                                           mmltk::frameworks::gpu::SystemImageRuntime& runtime,
                                           std::stop_token stop) mutable -> detail::VisualRuntimeOwner::Notification {
                     const auto current = [this, demand, stop] {
@@ -469,7 +531,8 @@ class UpscaleSystem::Impl final {
                         if (!current()) return {};
                         if (!retained_input) source = borrow_source_(request.source);
                         if (!current()) return {};
-                        if (!retained_input && (!source.valid() || source.document->facts() != request.document)) {
+                        if (!retained_input && (!source.valid() || !visual_product_matches_frame(request.source, source.pixels) ||
+                                               source.document->facts() != request.document)) {
                             std::scoped_lock lock(mutex_);
                             if (demand != demand_) return {};
                             state_.busy = false;
@@ -486,7 +549,7 @@ class UpscaleSystem::Impl final {
                             retained_input ? runtime.BorrowInput().plane(0U).plane().descriptor : source.pixels.plane(0U).plane().descriptor;
                         if (source_descriptor.width != request.source.extent.width || source_descriptor.height != request.source.extent.height)
                             throw contracts::UnavailableError("Upscale source geometry does not match its frame");
-                        auto document = retained_input ? input_document_ : scale_visual_document(source.document, UpscaleImageMetadata::output_scale);
+                        auto document = retained_input ? input_document_ : scale_visual_document(source.document, request.source.extent, target);
                         auto image_metadata = retained_input ? input_image_metadata_ : source.image_metadata;
                         auto* const model = dynamic_cast<UpscaleAlgorithm*>(runtime.model());
                         if (model == nullptr) throw std::runtime_error("Upscale runtime model is unavailable");
@@ -549,16 +612,16 @@ class UpscaleSystem::Impl final {
                             if (demand != demand_) return {};
                             baseline = records_[static_cast<std::size_t>(request.kernel)];
                             for (auto& record : records_) {
-                                if (visual_clean_content_identity(record.request.source) != visual_clean_content_identity(request.source)) record = {};
+                                if (!SameClean(record.request.source, request.source)) record = {};
                             }
                         }
                         const bool reuse_clean =
-                            baseline.product.valid() && visual_clean_content_identity(baseline.request.source) == visual_clean_content_identity(request.source);
+                            baseline.product.valid() && SameClean(baseline.request.source, request.source) && baseline.frame.extent == target;
                         auto output_candidate =
                             AcquireOutput(runtime, stop, reuse_clean ? baseline.product : mmltk::frameworks::gpu::SystemImageRuntime::CompletedOutput{},
                                           mmltk::frameworks::gpu::ImagePlanePreservation::Clean);
                         if (!output_candidate.valid() || !current()) return {};
-                        const auto write_output = [this, model, &input, request, reuse_clean, demand, stop](const auto output, const auto semantic,
+                        const auto write_output = [this, model, &input, request, prepared_extent, reuse_clean, demand, stop](const auto output, const auto semantic,
                                                                                                             const auto stream) {
                             if (diagnostics_.valid())
                                 diagnostics_.Emit([&] {
@@ -574,7 +637,10 @@ class UpscaleSystem::Impl final {
                                 return demand == demand_ && !stop.stop_requested();
                             };
                             if (!output_current()) return;
-                            if (!reuse_clean) model->Run(request.kernel, input.plane(0U).plane(), output, stream, output_current);
+                            if (!reuse_clean) {
+                                const auto prepared = model->Prepare(input.plane(0U).plane(), request.source, prepared_extent);
+                                model->Run(request.kernel, prepared.valid() ? prepared.plane() : input.plane(0U).plane(), output, stream, output_current);
+                            }
                             if (!output_current()) return;
                             model->Semantics(input.plane(1U).plane(), semantic, stream);
                         };
@@ -787,13 +853,17 @@ class UpscaleSystem::Impl final {
         std::shared_ptr<const VisualDocument> document{};
         std::shared_ptr<const mmltk::frameworks::serialization::wire::Value> image_metadata{};
     };
+    static bool SameClean(const VisualFrame& left, const VisualFrame& right) {
+        return visual_clean_content_identity(left) == visual_clean_content_identity(right) && left.source_extent == right.source_extent &&
+               left.resize_mode == right.resize_mode;
+    }
     static bool SameSource(const UpscaleRequest& left, const UpscaleRequest& right) { return left.source == right.source && left.document == right.document; }
     void RefreshAvailability(const UpscaleRequest& request) {
         for (std::size_t index = 0U; index < records_.size(); ++index) {
             const auto& record = records_[index];
             auto& method = state_.methods[index];
             method.available = record.product.valid() && SameSource(record.request, request) && record.request.kernel == static_cast<UpscaleKernel>(index) &&
-                               record.frame.extent == checked_upscale_output_extent(request.source.extent);
+                               record.frame.extent == checked_upscale_output_extent(restored_upscale_input_extent(request.source));
             method.failed = method.failure && SameSource(*method.failure, request);
         }
     }
@@ -804,6 +874,9 @@ class UpscaleSystem::Impl final {
         state_.ready = true;
         state_.kernel = record.request.kernel;
         state_.input = record.request.source;
+        state_.prepared_extent = restored_upscale_input_extent(record.request.source);
+        state_.prepared_content = state_.prepared_extent == record.request.source.extent ? record.request.source.content :
+            VisualRegion{0U, 0U, state_.prepared_extent.width, state_.prepared_extent.height};
         state_.frame = record.frame;
         document_ = record.document;
         state_.scene = std::move(scene);
@@ -819,7 +892,7 @@ class UpscaleSystem::Impl final {
     std::array<Record, 3U> records_{};
     mmltk::frameworks::gpu::ImageProductPool::Product selected_;
     std::optional<UpscaleRequest> input_request_;
-    // Shared four-times document projection for this exact receiver-owned input.
+    // Shared anisotropic output projection for this exact receiver-owned input.
     std::shared_ptr<const VisualDocument> input_document_;
     std::shared_ptr<const mmltk::frameworks::serialization::wire::Value> input_image_metadata_;
     std::shared_ptr<const VisualDocument> document_;

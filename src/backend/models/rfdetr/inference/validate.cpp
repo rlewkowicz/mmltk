@@ -150,7 +150,7 @@ struct AlignmentSample final {
                         }
                         const auto& source = loader.image_entry(sample_index);
                         delivery.sample({record, std::move(pixels), annotations, ground_truth, loader.geometry(sample_index), source.original_width,
-                                         source.original_height});
+                                         source.original_height, loader.resize_mode()});
                     }
                     if (captured_predictions != nullptr && captured_predictions->size() < request.alignment_images) {
                         if (record.detections.empty())

@@ -6,6 +6,7 @@
 #include <optional>
 #include "mmltk/frameworks/reflection/member_relation.h"
 #include "src/controller/contracts/visual_source.h"
+#include "src/backend/imaging/resample/image_resize.h"
 #include "src/frameworks/reflection/reflected_field_policy.h"
 namespace mmltk::frameworks::gpu {
 class BorrowedImageProductReadView;
@@ -56,6 +57,9 @@ struct VisualFrame final {
     VisualRegion content{};
     std::uint64_t clean_revision = 0U;
     VisualExtent source_extent{};
+    // Compiled resize provenance; a rounded Letterbox may occupy the full canvas.
+    // Unclassified products leave this absent instead of inferring a policy.
+    std::optional<mmltk::backend::imaging::resample::ImageResizeMode> resize_mode{};
     bool operator==(const VisualFrame&) const = default;
     [[nodiscard]] constexpr bool valid() const noexcept { return source.valid() && extent.valid() && revision != 0U; }
 };

@@ -74,7 +74,7 @@ class ReferenceEnvironment final {
    private:
     std::optional<std::string> prior;
 };
-class FailingUpscaleAlgorithm final : public UpscaleAlgorithm {
+class FailingUpscaleAlgorithm final : public TestUpscalePreparation {
    public:
     void Semantics(mmltk::frameworks::gpu::ImagePlaneView, const mmltk::frameworks::gpu::ImagePlaneView target, std::uintptr_t) override {
         if (target.valid()) Fill(target, 0U);
@@ -114,7 +114,7 @@ struct UpscaleActivationProbe final {
     // CLEANUP-IGNORE: First-warm completion is a separate one-shot activation observation.
     std::promise<void> first_warm_completed;
 };
-class ActivationUpscaleAlgorithm final : public UpscaleAlgorithm {
+class ActivationUpscaleAlgorithm final : public TestUpscalePreparation {
    public:
     void Semantics(mmltk::frameworks::gpu::ImagePlaneView, const mmltk::frameworks::gpu::ImagePlaneView target, std::uintptr_t) override {
         if (target.valid()) Fill(target, 0U);
@@ -159,7 +159,7 @@ struct UpscaleAdmissionRaceProbe final {
     std::atomic<std::uint32_t> received_width{0U};
     std::atomic<std::uint32_t> received_height{0U};
 };
-class RacingUpscaleAlgorithm final : public UpscaleAlgorithm {
+class RacingUpscaleAlgorithm final : public TestUpscalePreparation {
    public:
     void Semantics(mmltk::frameworks::gpu::ImagePlaneView, const mmltk::frameworks::gpu::ImagePlaneView target, std::uintptr_t) override {
         if (target.valid()) Fill(target, 0U);
@@ -183,7 +183,7 @@ struct UpscaleReleaseFailureProbe final {
     std::atomic<std::size_t> releases{0U};
     std::atomic_bool destroyed{false};
 };
-class ReleaseFailingUpscaleAlgorithm final : public UpscaleAlgorithm {
+class ReleaseFailingUpscaleAlgorithm final : public TestUpscalePreparation {
    public:
     void Semantics(mmltk::frameworks::gpu::ImagePlaneView, const mmltk::frameworks::gpu::ImagePlaneView target, std::uintptr_t) override {
         if (target.valid()) Fill(target, 0U);

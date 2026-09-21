@@ -44,7 +44,6 @@ struct VisualDocumentRead final {
     [[nodiscard]] bool valid() const noexcept { return pixels.valid() && document != nullptr; }
 };
 using ExactVisualDocumentBorrower = std::function<VisualDocumentRead(const VisualFrame&)>;
-[[nodiscard]] VisualExtent visual_materialized_extent(const VisualFrame&, bool original);
 [[nodiscard]] contracts::AnnotationSceneContent materialize_visual_document(const VisualDocument&, VisualExtent, VisualRegion, VisualExtent target = {});
-[[nodiscard]] std::shared_ptr<const VisualDocument> scale_visual_document(const std::shared_ptr<const VisualDocument>&, std::uint32_t);
+[[nodiscard]] std::shared_ptr<const VisualDocument> scale_visual_document(const std::shared_ptr<const VisualDocument>&, VisualExtent source_extent, VisualExtent target_extent);
 }  // namespace mmltk::controller

@@ -977,6 +977,8 @@ mod tests {
                 let native = app.model.upscale_snapshot.as_mut().unwrap();
                 native.kernel = kernel;
                 native.input = request.source.clone();
+                native.preparedextent = request.source.extent.clone();
+                native.preparedcontent = request.source.content.clone();
                 native.frame = request.source.clone();
                 native.frame.source.kind = PresentationSourceKind::Upscale;
                 native.frame.extent = request
@@ -1931,7 +1933,7 @@ mod tests {
                 0 => app.model.annotation.snapshot = None,
                 1 => app.model.annotation.snapshot.as_mut().unwrap().busy = true,
                 2 => crate::presentation_surface::metadata::retire(frame),
-                3 => record_draw(&app, frame, [1, 0, 639, 480]),
+                3 => record_draw(&app, frame, [1, 0, 640, 480]),
                 _ => crate::presentation_surface::clear_drawn_detail(),
             }
             let at_request = app.model.annotation.snapshot.clone();
@@ -2012,8 +2014,8 @@ mod tests {
                 crate::generated::encode_annotation_Open(
                     intent.correlation,
                     AnnotationOpen {
-                        source: expected,
-                        originalcontent: false
+                        crop: crate::generated::VisualRegion { x: 0, y: 0, width: expected.extent.width, height: expected.extent.height },
+                        target: expected.extent.clone(), source: expected,
                     }
                 )
                 .record
@@ -2037,6 +2039,8 @@ mod tests {
         upscale.ready = true;
         upscale.busy = false;
         upscale.input = input.clone();
+        upscale.preparedextent = input.extent.clone();
+        upscale.preparedcontent = input.content.clone();
         upscale.frame =
             crate::view_model::test_support::visual_frame(PresentationSourceKind::Upscale, 2);
         upscale.frame.extent = VisualExtent {
@@ -2115,8 +2119,9 @@ mod tests {
         let encoded = crate::generated::encode_annotation_Open(
             intent.correlation,
             AnnotationOpen {
+                crop: expected.content.clone(),
+                target: crate::generated::VisualExtent { width: 1600, height: 1200 },
                 source: expected,
-                originalcontent: true,
             },
         );
         assert_eq!(intent, encoded.record);

@@ -115,8 +115,6 @@ fn valid_detail(source: &generated::ExploreImageMetadata) -> bool {
         && source.dataset.identity != 0
         && source.selectedimage.is_some()
         && valid_content(&source.frame)
-        && source.frame.sourceextent.width != 0
-        && source.frame.sourceextent.height != 0
 }
 
 fn valid_validation(snapshot: &generated::ValidationImageMetadata) -> bool {
@@ -136,8 +134,6 @@ fn valid_validation(snapshot: &generated::ValidationImageMetadata) -> bool {
                 || (sample.identity.generation != 0
                     && sample.pixelextent.width != 0
                     && sample.pixelextent.height != 0
-                    && sample.sourceextent.width != 0
-                    && sample.sourceextent.height != 0
                     && valid_region(&sample.content, &sample.pixelextent)
                     && ((snapshot.detail && Some(&sample.identity) != snapshot.selected.as_ref())
                         || (sample.crop.width != 0
@@ -210,17 +206,17 @@ pub(crate) fn install(
         WorkspaceImageProduct::Upscale(snapshot) if snapshot.frame == metadata.frame => {
             if !valid_content(&snapshot.frame)
                 || snapshot.frame.sourceextent != snapshot.input.sourceextent
-                || snapshot.input.sourceextent.width == 0
-                || snapshot.input.sourceextent.height == 0
+                || !valid_content(&snapshot.input)
+                || snapshot.preparedextent.width < snapshot.input.extent.width
+                || snapshot.preparedextent.height < snapshot.input.extent.height
+                || !valid_region(&snapshot.preparedcontent, &snapshot.preparedextent)
                 || snapshot
-                    .input
-                    .extent
+                    .preparedextent
                     .checked_scale(generated::UpscaleImageMetadata::OUTPUT_SCALE)
                     .as_ref()
                     != Some(&snapshot.frame.extent)
                 || snapshot
-                    .input
-                    .content
+                    .preparedcontent
                     .checked_scale(generated::UpscaleImageMetadata::OUTPUT_SCALE)
                     .as_ref()
                     != Some(&snapshot.frame.content)
@@ -634,6 +630,7 @@ mod tests {
         source.selected = Some(source.samples[0].identity.clone());
         source.frame.extent = source.samples[0].pixelextent.clone();
         source.frame.sourceextent = source.samples[0].sourceextent.clone();
+        source.frame.resizemode = Some(generated::ImageResizeMode::Stretch);
         source.frame.content = generated::VisualRegion {
             x: 0,
             y: 0,
@@ -644,25 +641,28 @@ mod tests {
         assert!(valid_validation(&source));
         let mut derived_frame = source.frame.clone();
         derived_frame.source.kind = generated::PresentationSourceKind::Upscale;
+        derived_frame.resizemode = None;
         derived_frame.extent = generated::VisualExtent {
-            width: 800,
+            width: 1600,
             height: 800,
         };
         derived_frame.content = generated::VisualRegion {
             x: 0,
             y: 0,
-            width: 800,
+            width: 1600,
             height: 800,
         };
         let physical = crate::view_model::test_support::physical_frame(
             generated::presentation_source_session(generated::PresentationSourceKind::Upscale),
             derived_frame.revision,
             1,
-            800,
+            1600,
             800,
         );
         let derived = generated::UpscaleImageMetadata {
             frame: derived_frame.clone(),
+            preparedextent: generated::VisualExtent { width: 400, height: 200 },
+            preparedcontent: generated::VisualRegion { x: 0, y: 0, width: 400, height: 200 },
             input: source.frame.clone(),
             scene: crate::view_model::test_support::explore_snapshot().scene,
         };
@@ -675,7 +675,7 @@ mod tests {
             )),
         );
         super::super::reset_test_releases();
-        install(physical, 800, 800, 1, &bytes).unwrap();
+        install(physical, 1600, 800, 1, &bytes).unwrap();
         retire(physical);
         for invalid in 0..5 {
             let mut changed = derived.clone();
@@ -694,7 +694,7 @@ mod tests {
                     source.clone(),
                 )),
             );
-            assert!(install(physical, 800, 800, 2, &bytes).is_err());
+            assert!(install(physical, 1600, 800, 2, &bytes).is_err());
             assert!(pending(physical).is_none());
         }
         source.frame.revision += 1;
@@ -706,7 +706,7 @@ mod tests {
                 source,
             )),
         );
-        assert!(install(physical, 800, 800, 2, &invalid).is_err());
+        assert!(install(physical, 1600, 800, 2, &invalid).is_err());
         super::super::reset_test_releases();
     }
 

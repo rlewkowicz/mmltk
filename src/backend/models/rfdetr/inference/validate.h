@@ -46,6 +46,7 @@ struct ValidationSampleView final {
     std::span<const Prediction> ground_truth;
     mmltk::backend::imaging::resample::ImageResizeGeometry content{};
     std::uint32_t source_width = 0U, source_height = 0U;
+    std::optional<mmltk::backend::imaging::resample::ImageResizeMode> resize_mode{};
 };
 struct ValidationDelivery final {
     std::stop_token stop{};

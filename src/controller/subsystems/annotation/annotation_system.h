@@ -39,7 +39,8 @@ struct AnnotationPointer final {
 };
 struct AnnotationOpen final {
     VisualFrame source{};
-    bool original_content = false;
+    VisualRegion crop{};
+    VisualExtent target{};
 };
 struct AnnotationSave final {
     [[= mmltk::frameworks::reflection::MaxBytes{4096U}]] std::string destination;

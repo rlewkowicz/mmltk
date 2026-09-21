@@ -91,6 +91,7 @@ impl Surface {
     pub(crate) fn configure_original(
         &mut self,
         frame: &crate::generated::VisualFrame,
+        native: &crate::generated::VisualFrame,
         original: bool,
     ) {
         self.crop = original.then_some([
@@ -99,29 +100,25 @@ impl Surface {
             frame.content.width,
             frame.content.height,
         ]);
-        self.display_extent =
-            original.then_some((frame.sourceextent.width, frame.sourceextent.height));
+        self.display_extent = Some(if original {
+            (frame.sourceextent.width, frame.sourceextent.height)
+        } else {
+            (native.extent.width, native.extent.height)
+        });
     }
 
-    pub(crate) fn original_content(self, frame: &crate::generated::VisualFrame) -> Option<bool> {
-        let full = [0, 0, frame.extent.width, frame.extent.height];
-        match self.display_extent {
-            Some(aspect)
-                if aspect.0 != 0
-                    && aspect.1 != 0
-                    && aspect == (frame.sourceextent.width, frame.sourceextent.height)
-                    && self.crop
-                        == Some([
-                            frame.content.x,
-                            frame.content.y,
-                            frame.content.width,
-                            frame.content.height,
-                        ]) =>
-            {
-                Some(true)
-            }
-            None if self.crop.is_none() || self.crop == Some(full) => Some(false),
-            _ => None,
+    pub(crate) fn annotation_request(self, frame: &crate::generated::VisualFrame) -> crate::generated::AnnotationOpen {
+        let [x, y, width, height] = self.content_region();
+        let (aspect_width, aspect_height) = self.display_extent();
+        let scale = (f64::from(width) / f64::from(aspect_width))
+            .min(f64::from(height) / f64::from(aspect_height));
+        crate::generated::AnnotationOpen {
+            source: frame.clone(),
+            crop: crate::generated::VisualRegion { x, y, width, height },
+            target: crate::generated::VisualExtent {
+                width: (f64::from(aspect_width) * scale).round().clamp(1.0, f64::from(width)) as u32,
+                height: (f64::from(aspect_height) * scale).round().clamp(1.0, f64::from(height)) as u32,
+            },
         }
     }
 

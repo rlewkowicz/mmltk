@@ -208,7 +208,7 @@ class NativeAnnotationAlgorithm final : public AnnotationAlgorithm {
             const auto status = input.width == output.width && input.height == output.height
                                     ? cudaMemcpy2DAsync(output.pixels, output.pitch_bytes, input.pixels, input.pitch_bytes, clean.descriptor.row_bytes(),
                                                         clean.descriptor.height, cudaMemcpyDeviceToDevice, stream)
-                                    : static_cast<cudaError_t>(raster::scale_rgba_nearest(input, output, stream_value));
+                                    : static_cast<cudaError_t>(raster::scale_rgba(input, output, stream_value));
             if (status != cudaSuccess) throw std::runtime_error("Annotation clean baseline preparation failed");
         }
         raster::IntRect clip{static_cast<int>(clean.descriptor.width), static_cast<int>(clean.descriptor.height), 0, 0};

@@ -835,7 +835,7 @@ TEST_CASE("Semantic upscaling preserves class color and alpha at exact nearest s
     CudaBuffer output{8U * 4U * 4U};
     input.upload<std::uint8_t>(source);
     CudaStream stream;
-    REQUIRE(mmltk::backend::imaging::raster::scale_rgba_nearest({static_cast<const std::uint8_t*>(input.data()), 8U, 2, 1},
+    REQUIRE(mmltk::backend::imaging::raster::scale_rgba({static_cast<const std::uint8_t*>(input.data()), 8U, 2, 1},
                                                                 {static_cast<std::uint8_t*>(output.data()), 32U, 8, 4}, stream.address()) == cudaSuccess);
     std::array<std::uint8_t, 128U> pixels{};
     REQUIRE(cudaMemcpyAsync(pixels.data(), output.data(), pixels.size(), cudaMemcpyDeviceToHost, stream.get()) == cudaSuccess);

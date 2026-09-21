@@ -1425,13 +1425,17 @@ impl State {
                 };
                 let original = step == Step::Sample || self.validation_original == 1;
                 let frame = content.frame();
-                if receipt.surface.original_content(frame) != Some(original) {
+                let mut expected_surface = receipt.surface;
+                expected_surface.configure_original(frame, &content.metadata.frame, original);
+                if receipt.surface.crop != expected_surface.crop
+                    || receipt.surface.display_extent != expected_surface.display_extent
+                {
                     return Task::none();
                 }
                 let extent = if original {
                     &frame.sourceextent
                 } else {
-                    &frame.extent
+                    &content.metadata.frame.extent
                 };
                 let expected = extent.width as f32 / extent.height as f32;
                 if (receipt.image.width / receipt.image.height - expected).abs() > 0.01
