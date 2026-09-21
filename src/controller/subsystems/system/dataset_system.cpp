@@ -21,9 +21,10 @@ services::ArtifactCompileResult ArtifactDatasetRuntime::Compile(const services::
     if (diagnostics_.benchmark_trace_enabled()) {
         diagnostics.benchmark = {
             .context = &diagnostics_,
-            .report = [](const void* context, const std::string_view event, const std::string_view fields) noexcept {
-                static_cast<const services::RuntimeDiagnosticTarget*>(context)->write_benchmark_trace(event, fields);
-            },
+            .report =
+                [](const void* context, const std::string_view event, const std::string_view fields) noexcept {
+                    static_cast<const services::RuntimeDiagnosticTarget*>(context)->write_benchmark_trace(event, fields);
+                },
         };
     }
     return store_.compile(request, cancellation.token(), observer, diagnostics);

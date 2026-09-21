@@ -815,22 +815,23 @@ auto BrowserAudit::consume(const nlohmann::json& record) -> void {
     } else if (event == "integration.perceptual_controls") {
         perceptual_controls_round_trip = true;
     } else if (event == "integration.benchmark_inactive") {
-        benchmark_inactive = record.value("control", "") == DATASET_BROWSE && record.value("detail", "") == "unchanged" &&
-            numeric(record, "a") == 7.0 && numeric(record, "b") == 1.0 && numeric(record, "c") > 0.0;
+        benchmark_inactive = record.value("control", "") == DATASET_BROWSE && record.value("detail", "") == "unchanged" && numeric(record, "a") == 7.0 &&
+                             numeric(record, "b") == 1.0 && numeric(record, "c") > 0.0;
     } else if (event == "integration.benchmark_baseline") {
         if (record.value("detail", "") == "native-settled")
             benchmark_baseline = std::array{numeric(record, "a"), numeric(record, "b"), numeric(record, "c"), numeric(record, "d")};
     } else if (event == "integration.benchmark_choice") {
         if (record.value("detail", "") == "native-settled")
-            benchmark_choices.insert_or_assign(scalar(record, "a"), std::pair{record.value("control", ""),
-                std::array{numeric(record, "a"), numeric(record, "b"), numeric(record, "c"), numeric(record, "d")}});
+            benchmark_choices.insert_or_assign(
+                scalar(record, "a"),
+                std::pair{record.value("control", ""), std::array{numeric(record, "a"), numeric(record, "b"), numeric(record, "c"), numeric(record, "d")}});
     } else if (event == "integration.benchmark_click") {
         if (record.value("detail", "") == "real-click" && numeric(record, "b") == 1.0)
             benchmark_clicks.insert_or_assign(scalar(record, "a"), record.value("control", ""));
     } else if (event == "integration.benchmark_visibility") {
         if (record.value("detail", "") == "current-tree")
             benchmark_visibility.insert_or_assign(std::pair{scalar(record, "a"), record.value("control", "")},
-                std::array{numeric(record, "a"), numeric(record, "b"), numeric(record, "c"), numeric(record, "d")});
+                                                  std::array{numeric(record, "a"), numeric(record, "b"), numeric(record, "c"), numeric(record, "d")});
     } else if (event == "integration.benchmark_override") {
         benchmark_round_trip = record.value("control", "") == BENCHMARK_OVERRIDE && record.value("detail", "") == "round-trip" && numeric(record, "a") == 1.0 &&
                                numeric(record, "b") == 1.0 && numeric(record, "d") > numeric(record, "c");
@@ -1504,9 +1505,9 @@ auto BrowserAudit::readiness_blocker() const -> std::string_view {
         "Explore clipboard paste persistence and restoration", spinnerless_integer, "integer spinner suppression", spinnerless_floating,
         "floating spinner suppression", advanced_integer_persisted, "Advanced integer persistence", advanced_floating_persisted,
         "Advanced floating persistence", compile_progress_placement, "Dataset progress placement", model_progress_placement, "Model progress containment",
-        model_composition && model_copy, "Model card composition", benchmark_override.valid() && benchmark_round_trip && benchmark_choices_complete(), "benchmark override interaction",
-        perceptual_controls_round_trip, "independent perceptual controls round trip", explore_composition, "Explore composition", annotation_composition,
-        "annotation composition", workspace_fps_text && workspace_fps_pixels, "visible workspace FPS",
+        model_composition && model_copy, "Model card composition", benchmark_override.valid() && benchmark_round_trip && benchmark_choices_complete(),
+        "benchmark override interaction", perceptual_controls_round_trip, "independent perceptual controls round trip", explore_composition,
+        "Explore composition", annotation_composition, "annotation composition", workspace_fps_text && workspace_fps_pixels, "visible workspace FPS",
         settings_composition && settings_numeric_alignment && show_fps_round_trip && ui_scale_drag && ui_scale_released && ui_scale_restored &&
             complete_pointer_drag && error_composition && error_modal_usable,
         "Settings composition", dataset_configured && progress && compile_metrics && dataset_complete && progress_ordinal < dataset_complete_ordinal,
@@ -1589,9 +1590,10 @@ bool BrowserAudit::benchmark_choices_complete() const {
     if (!benchmark_inactive || !benchmark_baseline || benchmark_choices.size() != 12U || benchmark_visibility.size() != 60U) return false;
     const auto& baseline = *benchmark_baseline;
     if ((baseline[0] != 0.0 && baseline[0] != 1.0) || (baseline[1] != 0.0 && baseline[1] != 1.0) ||
-        (baseline[2] != 0.0 && baseline[2] != 1.0 && baseline[2] != 2.0) || baseline[3] <= 0.0) return false;
-    constexpr std::array controls{"train.dataset.benchmark.custom", "train.dataset.benchmark.coconut",
-        "train.dataset.validation.coconut", "train.dataset.validation.stock", "train.dataset.validation.coconut_stock"};
+        (baseline[2] != 0.0 && baseline[2] != 1.0 && baseline[2] != 2.0) || baseline[3] <= 0.0)
+        return false;
+    constexpr std::array benchmark_controls{"train.dataset.benchmark.custom", "train.dataset.benchmark.coconut", "train.dataset.validation.coconut",
+                                            "train.dataset.validation.stock", "train.dataset.validation.coconut_stock"};
     double previous_revision = baseline[3];
     double previous_dataset = baseline[1];
     double previous_validation = baseline[2];
@@ -1604,26 +1606,35 @@ bool BrowserAudit::benchmark_choices_complete() const {
         const double validation = index == 2U ? 1.0 : (index == 3U ? 2.0 : (index >= 4U && index <= 7U ? 0.0 : baseline[2]));
         const bool enabled = index < 10U || (index == 10U && baseline[0] == 1.0);
         const char* expected_control = BENCHMARK_OVERRIDE;
-        if (index == 1U || index == 6U) expected_control = controls[1];
-        else if (index == 2U) expected_control = controls[3];
-        else if (index == 3U) expected_control = controls[4];
-        else if (index == 4U) expected_control = controls[2];
-        else if (index == 5U) expected_control = controls[0];
-        else if (index == 7U) expected_control = "train.dataset.browse";
-        else if (index == 8U) expected_control = controls[2U + static_cast<std::size_t>(baseline[2])];
-        else if (index == 9U) expected_control = controls[static_cast<std::size_t>(baseline[1])];
+        if (index == 1U || index == 6U)
+            expected_control = benchmark_controls[1];
+        else if (index == 2U)
+            expected_control = benchmark_controls[3];
+        else if (index == 3U)
+            expected_control = benchmark_controls[4];
+        else if (index == 4U)
+            expected_control = benchmark_controls[2];
+        else if (index == 5U)
+            expected_control = benchmark_controls[0];
+        else if (index == 7U)
+            expected_control = "train.dataset.browse";
+        else if (index == 8U)
+            expected_control = benchmark_controls[2U + static_cast<std::size_t>(baseline[2])];
+        else if (index == 9U)
+            expected_control = benchmark_controls[static_cast<std::size_t>(baseline[1])];
         const bool changed = dataset != previous_dataset || validation != previous_validation || enabled != previous_enabled;
         if (control != expected_control || values[1] != dataset || values[2] != validation || values[3] < previous_revision ||
-            (changed && values[3] == previous_revision)) return false;
+            (changed && values[3] == previous_revision))
+            return false;
         if ((index >= 1U && index <= 9U) || changed) {
             const auto clicked = benchmark_clicks.find(index);
             if (clicked == benchmark_clicks.end() || clicked->second != control) return false;
         }
-        for (std::size_t choice = 0; choice != controls.size(); ++choice) {
-            const auto visible = benchmark_visibility.find({index, controls[choice]});
+        for (std::size_t choice = 0; choice != benchmark_controls.size(); ++choice) {
+            const auto visible = benchmark_visibility.find({index, benchmark_controls[choice]});
             const double expected = enabled && (choice < 2U || dataset == 1.0) ? 1.0 : 0.0;
-            if (visible == benchmark_visibility.end() || visible->second[1] != expected || visible->second[2] != expected ||
-                visible->second[3] != values[3]) return false;
+            if (visible == benchmark_visibility.end() || visible->second[1] != expected || visible->second[2] != expected || visible->second[3] != values[3])
+                return false;
         }
         previous_revision = values[3];
         previous_dataset = dataset;

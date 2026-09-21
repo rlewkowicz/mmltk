@@ -17,20 +17,19 @@ namespace {
     std::ranges::copy(right_digest, identity.begin() + left_digest.size());
     return mmltk::common::io::sha256_hex(mmltk::common::io::sha256_bytes(identity));
 }
-
-}
+}  // namespace
 CustomRecipeCatalog custom_recipe_catalog() {
-    return {coco_annotations_artifact(), coco_train_images_artifact(), coco_val_images_artifact(), objects365_annotations_artifact(),
-        open_images_boxes_artifact(), open_images_classes_artifact(), objects365_train_image_artifacts()};
+    return {coco_annotations_artifact(),  coco_train_images_artifact(),   coco_val_images_artifact(),        objects365_annotations_artifact(),
+            open_images_boxes_artifact(), open_images_classes_artifact(), objects365_train_image_artifacts()};
 }
 CustomRecipePreparation prepare_custom_recipe(const BenchmarkCompilerConfig& config, const BenchmarkCacheLayout& cache, const CustomRecipeCatalog& catalog,
-    ProgressReporter& progress, std::size_t effective_num_workers,
-    mmltk::common::concurrency::CancellationObservation cancel_requested, const BenchmarkTraceSink& trace) {
+                                              ProgressReporter& progress, std::size_t effective_num_workers,
+                                              mmltk::common::concurrency::CancellationObservation cancel_requested, const BenchmarkTraceSink& trace) {
     const std::filesystem::path objects_index_path = cache.source_indexes("objects365") / "train.normalized.bin";
     const std::filesystem::path open_images_index_path = cache.source_indexes("open-images") / "train.normalized.bin";
     progress.activity("Waiting for annotation cache locks");
-    CocoAnnotationCache coco_cache(cache, catalog.coco_annotations, true, catalog.coco_train_images_count,
-        catalog.coco_validation_images_count, config.num_workers, cancel_requested, trace);
+    CocoAnnotationCache coco_cache(cache, catalog.coco_annotations, true, catalog.coco_train_images_count, catalog.coco_validation_images_count,
+                                   config.num_workers, cancel_requested, trace);
     ArtifactLease objects_annotation_lifecycle = ArtifactLease::acquire(cache.locks / "objects365-annotations.lifecycle.lock", cancel_requested);
     ArtifactLease open_images_annotation_lifecycle = ArtifactLease::acquire(cache.locks / "open-images-annotations.lifecycle.lock", cancel_requested);
     constexpr std::uint64_t kIndexCount = 6U;
@@ -44,8 +43,8 @@ CustomRecipePreparation prepare_custom_recipe(const BenchmarkCompilerConfig& con
         discover_cached_index(open_images_index_path, BenchmarkDatasetSource::kOpenImagesV7, "train", cancel_requested, trace);
     const bool objects_index_cache_hit = objects.has_value();
     const bool open_images_index_cache_hit = open_images.has_value();
-    std::uint64_t completed_indexes = coco_cache.completed_indexes() +
-                                      static_cast<std::uint64_t>(objects.has_value()) + static_cast<std::uint64_t>(open_images.has_value());
+    std::uint64_t completed_indexes =
+        coco_cache.completed_indexes() + static_cast<std::uint64_t>(objects.has_value()) + static_cast<std::uint64_t>(open_images.has_value());
     progress.phase(DatasetCompilePhase::Indexing, completed_indexes, kIndexCount);
     std::vector<DownloadRequest> annotation_requests;
     std::optional<DownloadRequest> objects_annotation_request;
@@ -87,21 +86,22 @@ CustomRecipePreparation prepare_custom_recipe(const BenchmarkCompilerConfig& con
         if (!objects) { progress.source_activity(BenchmarkDatasetSource::kObjects365V2, "Downloading Objects365 annotation metadata"); }
         if (!open_images) { progress.source_activity(BenchmarkDatasetSource::kOpenImagesV7, "Downloading Open Images annotation metadata"); }
         auto downloads = download_artifacts(annotation_requests, std::min<std::size_t>(3U, effective_num_workers), cancel_requested,
-            progress.transfer_observer_enabled() ? DownloadProgressSink{[&](const DownloadProgress& update) { transfer_progress.update(update, progress); }}
-                                                : DownloadProgressSink{}, trace);
+                                            progress.transfer_observer_enabled()
+                                                ? DownloadProgressSink{[&](const DownloadProgress& update) { transfer_progress.update(update, progress); }}
+                                                : DownloadProgressSink{},
+                                            trace);
         for (std::size_t i = 0; i < downloads.size(); ++i) annotation_downloads.emplace(annotation_requests[i].artifact_id, std::move(downloads[i]));
         progress.phase(DatasetCompilePhase::Indexing, completed_indexes, kIndexCount);
     }
     ArtifactProgressTotals annotation_repair_progress;
-    const auto repair_annotations = [&](const BenchmarkDatasetSource source, const std::vector<DownloadRequest>& requests,
-                                        const std::string_view reason) {
-        auto repaired = repair_annotation_artifacts(requests, source, reason, progress, annotation_repair_progress,
-            effective_num_workers, cancel_requested, trace);
+    const auto repair_annotations = [&](const BenchmarkDatasetSource source, const std::vector<DownloadRequest>& requests, const std::string_view reason) {
+        auto repaired =
+            repair_annotation_artifacts(requests, source, reason, progress, annotation_repair_progress, effective_num_workers, cancel_requested, trace);
         for (std::size_t i = 0; i < requests.size(); ++i) annotation_downloads.insert_or_assign(requests[i].artifact_id, std::move(repaired[i]));
     };
     if (coco_cache.pending_download()) {
-        coco_cache.settle(std::move(annotation_downloads.at(catalog.coco_annotations.artifact_id)), progress,
-            effective_num_workers, completed_indexes, kIndexCount);
+        coco_cache.settle(std::move(annotation_downloads.at(catalog.coco_annotations.artifact_id)), progress, effective_num_workers, completed_indexes,
+                          kIndexCount);
     }
     auto coco_indexes = coco_cache.take_indexes();
     auto coco_train_index_path = std::move(coco_indexes.train_path);
@@ -162,7 +162,9 @@ CustomRecipePreparation prepare_custom_recipe(const BenchmarkCompilerConfig& con
             });
     }
     if (!coco_train || !coco_val || !objects || !open_images) { throw std::runtime_error("benchmark normalized annotation indexing did not complete"); }
-    if (coco_val->images.size() != catalog.coco_validation_images_count) { throw std::runtime_error("COCO val2017 normalized index must contain exactly 5,000 images"); }
+    if (coco_val->images.size() != catalog.coco_validation_images_count) {
+        throw std::runtime_error("COCO val2017 normalized index must contain exactly 5,000 images");
+    }
     {
         progress.activity("Checking COCO train and validation metadata reuse");
         std::unordered_set<std::uint64_t> validation_ids;
@@ -217,6 +219,20 @@ CustomRecipePreparation prepare_custom_recipe(const BenchmarkCompilerConfig& con
     progress.activity("Finalizing normalized annotation cache");
     open_images_annotation_lifecycle = ArtifactLease{};
     objects_annotation_lifecycle = ArtifactLease{};
-    return CustomRecipePreparation{std::move(coco_train_index_path), std::move(coco_val_index_path), std::move(objects_index_path), std::move(open_images_index_path), std::move(coco_train), std::move(coco_val), std::move(objects), std::move(open_images), std::move(coco_indexes_cache_hit), std::move(objects_index_cache_hit), std::move(open_images_index_cache_hit), std::move(combined_sampling), std::move(objects_sampling), std::move(open_images_sampling), std::move(sampling_object_artifacts)};
+    return CustomRecipePreparation{std::move(coco_train_index_path),
+                                   std::move(coco_val_index_path),
+                                   std::move(objects_index_path),
+                                   std::move(open_images_index_path),
+                                   std::move(coco_train),
+                                   std::move(coco_val),
+                                   std::move(objects),
+                                   std::move(open_images),
+                                   std::move(coco_indexes_cache_hit),
+                                   std::move(objects_index_cache_hit),
+                                   std::move(open_images_index_cache_hit),
+                                   std::move(combined_sampling),
+                                   std::move(objects_sampling),
+                                   std::move(open_images_sampling),
+                                   std::move(sampling_object_artifacts)};
 }
-}
+}  // namespace mmltk::backend::data::benchmark_internal

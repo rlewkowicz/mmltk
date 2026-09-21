@@ -49,11 +49,12 @@ RUN set -eux; \
     cmake --install /tmp/arrow-build; \
     install -Dm0644 /tmp/arrow-src/LICENSE.txt /opt/arrow/share/licenses/arrow/LICENSE.txt; \
     install -Dm0644 /tmp/arrow-src/NOTICE.txt /opt/arrow/share/licenses/arrow/NOTICE.txt; \
+    notice_pattern='.*/(license|notice|copying|copyright)([-_][^./]+)?(\.(txt|md|rst|adoc|html|xml|qbk))?'; \
     for source in /tmp/arrow-src /tmp/arrow-build; do \
         while IFS= read -r -d '' notice; do \
             relative="${notice#${source}/}"; \
             install -Dm0644 "${notice}" "/opt/arrow/share/licenses/arrow/$(basename "${source}")/${relative}"; \
-        done < <(find "${source}" -type f \( -iname 'license*' -o -iname 'notice*' -o -iname 'copying*' -o -iname 'copyright*' \) -print0); \
+        done < <(find "${source}" -regextype posix-extended -type f -iregex "${notice_pattern}" -print0); \
     done; \
     for dependency in snappy zstd zlib xsimd thrift rapidjson; do \
         case "${dependency}" in \
@@ -63,7 +64,7 @@ RUN set -eux; \
         esac; \
         test -d "${dependency_source}"; \
         mkdir -p "/opt/arrow/share/licenses/arrow/${dependency}"; \
-        find "${dependency_source}" -maxdepth 1 -type f \( -iname 'license*' -o -iname 'notice*' -o -iname 'copying*' -o -iname 'copyright*' -o -iname 'readme*' \) \
+        find "${dependency_source}" -regextype posix-extended -maxdepth 1 -type f \( -iregex "${notice_pattern}" -o -iname 'readme*' \) \
             -exec cp -t "/opt/arrow/share/licenses/arrow/${dependency}" {} +; \
         test -n "$(find "/opt/arrow/share/licenses/arrow/${dependency}" -type f -print -quit)"; \
     done; \

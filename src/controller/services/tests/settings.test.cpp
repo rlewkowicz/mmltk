@@ -1812,7 +1812,6 @@ TEST_CASE("partial training settings retain an unspecified output policy", "[gui
         CHECK(settings == expected);
     }
 }
-
 TEST_CASE("benchmark selections persist as one canonical nested value and reject invalid numbers", "[gui][settings][benchmark]") {
     namespace data = mmltk::backend::data;
     auto state = default_gui_settings_state();
@@ -1824,8 +1823,10 @@ TEST_CASE("benchmark selections persist as one canonical nested value and reject
             const auto dataset_name = mmltk::frameworks::reflection::enum_name(dataset);
             const auto validation_name = mmltk::frameworks::reflection::enum_name(validation);
             const std::array edits{
-                SettingsValueUpdate{.path = "workflows.train.benchmark_selection.dataset", .value = *mmltk::frameworks::serialization::wire::FlatValue::text(dataset_name, dataset_name.size())},
-                SettingsValueUpdate{.path = "workflows.train.benchmark_selection.validation", .value = *mmltk::frameworks::serialization::wire::FlatValue::text(validation_name, validation_name.size())}};
+                SettingsValueUpdate{.path = "workflows.train.benchmark_selection.dataset",
+                                    .value = *mmltk::frameworks::serialization::wire::FlatValue::text(dataset_name, dataset_name.size())},
+                SettingsValueUpdate{.path = "workflows.train.benchmark_selection.validation",
+                                    .value = *mmltk::frameworks::serialization::wire::FlatValue::text(validation_name, validation_name.size())}};
             REQUIRE(apply_gui_settings_values(state, edits));
             CHECK(state.workflows.train.benchmark_selection == data::BenchmarkDatasetSelection{dataset, validation});
             for (const bool enabled : {false, true}) {
@@ -1857,7 +1858,7 @@ TEST_CASE("benchmark selections persist as one canonical nested value and reject
             CHECK_THROWS(apply_gui_settings(malformed, loaded));
             CHECK(loaded == before);
             const std::array edit{SettingsValueUpdate{.path = std::string{"workflows.train.benchmark_selection."} + field,
-                .value = mmltk::frameworks::serialization::wire::FlatValue{invalid}}};
+                                                      .value = mmltk::frameworks::serialization::wire::FlatValue{invalid}}};
             CHECK_FALSE(apply_gui_settings_values(loaded, edit));
             CHECK(loaded == before);
             nlohmann::json flat = state.workflows.train;

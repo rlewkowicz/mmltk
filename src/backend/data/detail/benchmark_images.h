@@ -36,6 +36,7 @@ class CachedImageWriteProgress {
    public:
     CachedImageWriteProgress(CachedImageProgress callback, std::uint64_t initial, std::uint64_t expected);
     void completed(std::uint64_t writes);
+
    private:
     CachedImageProgress callback_;
     std::uint64_t initial_;
@@ -87,14 +88,14 @@ struct ArchiveExtractionRequest {
     std::span<const std::uint64_t> selected_image_ids;
     ArchiveImageIdParser image_id_parser;
     mmltk::common::concurrency::CancellationObservation cancel_requested = {};
-    CachedImageProgress progress;
-    CachedImageValidator validator;
-    BenchmarkTraceSink trace;
+    CachedImageProgress progress = {};
+    CachedImageValidator validator = {};
+    BenchmarkTraceSink trace = {};
     bool quarantine_unavailable = false;
     std::size_t decompression_workers = 1U;
     std::size_t cache_write_workers = 1U;
-    std::function<void(std::string_view)> activity;
-    std::filesystem::path completion_path;
+    std::function<void(std::string_view)> activity = {};
+    std::filesystem::path completion_path = {};
 };
 [[nodiscard]] CachedImageDirectory extract_selected_archive_images(ArchiveExtractionRequest request);
 }  // namespace mmltk::backend::data::benchmark_internal

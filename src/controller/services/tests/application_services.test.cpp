@@ -409,18 +409,18 @@ TEST_CASE("bounded runtime projection escapes valid text and rejects malformed U
     RuntimeDiagnostics runtime{diagnostics.producer()};
     std::string message;
     SECTION("JSON escapes and valid scalar limits") {
-        message = "quoted \"line\"\\\b\f\n\r\t\x01\x7f\xc3\xa9"
-                  "\xc2\x80\xdf\xbf\xe0\xa0\x80\xed\x9f\xbf\xee\x80\x80\xef\xbf\xbf"
-                  "\xf0\x90\x80\x80\xf4\x8f\xbf\xbf";
+        message =
+            "quoted \"line\"\\\b\f\n\r\t\x01\x7f\xc3\xa9"
+            "\xc2\x80\xdf\xbf\xe0\xa0\x80\xed\x9f\xbf\xee\x80\x80\xef\xbf\xbf"
+            "\xf0\x90\x80\x80\xf4\x8f\xbf\xbf";
     }
     SECTION("empty text") { message.clear(); }
     SECTION("embedded NUL") { message.assign("a\0b", 3U); }
     runtime.write({.event = "text", .message = message});
     for (const std::string_view malformed : {
-             "\x80", "\xbf", "\xc0\x80", "\xc1\xbf", "\xe0\x80\x80", "\xe0\x9f\xbf",
-             "\xf0\x80\x80\x80", "\xf0\x8f\xbf\xbf", "\xed\xa0\x80", "\xed\xbf\xbf",
-             "\xf4\x90\x80\x80", "\xf5\x80\x80\x80", "\xff", "\xc2x", "\xe1\x80x", "\xf1\x80\x80x",
-             "\xc2", "\xe0\xa0", "\xf0\x90\x80",
+             "\x80",         "\xbf",         "\xc0\x80",         "\xc1\xbf",         "\xe0\x80\x80", "\xe0\x9f\xbf", "\xf0\x80\x80\x80", "\xf0\x8f\xbf\xbf",
+             "\xed\xa0\x80", "\xed\xbf\xbf", "\xf4\x90\x80\x80", "\xf5\x80\x80\x80", "\xff",         "\xc2x",        "\xe1\x80x",        "\xf1\x80\x80x",
+             "\xc2",         "\xe0\xa0",     "\xf0\x90\x80",
          }) {
         runtime.write({.event = "text", .message = malformed});
     }
@@ -1253,15 +1253,13 @@ TEST_CASE("backend benchmark diagnostic failures preserve operations and deliver
     const auto path = temporary.path() / "trace.jsonl";
     DiagnosticsClient diagnostics{path};
     const auto target = [&] {
-        RuntimeDiagnostics runtime{diagnostics.producer(), false,
-                                   complete ? RuntimeDiagnosticDelivery::Complete : RuntimeDiagnosticDelivery::BestEffort};
+        RuntimeDiagnostics runtime{diagnostics.producer(), false, complete ? RuntimeDiagnosticDelivery::Complete : RuntimeDiagnosticDelivery::BestEffort};
         return runtime.target();
     }();
     const ArtifactBenchmarkTraceObserver observer{
         .context = &target,
-        .report = [](const void* context, std::string_view event, std::string_view fields) noexcept {
-            static_cast<const RuntimeDiagnosticTarget*>(context)->write_benchmark_trace(event, fields);
-        },
+        .report = [](const void* context, std::string_view event,
+                     std::string_view fields) noexcept { static_cast<const RuntimeDiagnosticTarget*>(context)->write_benchmark_trace(event, fields); },
     };
     const auto sink = make_trace_sink([observer](std::string_view event, std::string_view fields) noexcept { observer(event, fields); });
     bool operation_completed = false;

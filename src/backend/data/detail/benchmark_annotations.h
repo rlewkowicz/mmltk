@@ -79,8 +79,7 @@ struct NormalizedAnnotationIndex {
 };
 // Source and destination must be distinct. Copies one complete slice, rebasing only
 // storage offsets; source IDs need not be sorted. Metadata belongs to the caller.
-void append_normalized_image_slice(NormalizedAnnotationIndex& destination, const NormalizedAnnotationIndex& source,
-                                   std::size_t image_position,
+void append_normalized_image_slice(NormalizedAnnotationIndex& destination, const NormalizedAnnotationIndex& source, std::size_t image_position,
                                    mmltk::common::concurrency::CancellationObservation cancellation = {});
 // Retains positions in the supplied order. Identity does not inspect mask payloads;
 // increasing subsets retain allocation capacity. On cancellation during in-place

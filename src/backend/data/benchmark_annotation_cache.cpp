@@ -29,7 +29,7 @@ using ArchiveReader = std::unique_ptr<archive, ArchiveDestroy>;
     return message != nullptr ? message : "unknown libarchive error";
 }
 [[nodiscard]] std::filesystem::path extract_manifest_path(const std::filesystem::path& path) { return path.string() + ".extract.json"; }
-}
+}  // namespace
 [[nodiscard]] std::string extract_archive_member(const std::filesystem::path& archive_path, const std::string_view member_suffix,
                                                  const std::filesystem::path& output_path, const std::string_view archive_identity,
                                                  const std::filesystem::path& lock_path, mmltk::common::concurrency::CancellationObservation cancel_requested,
@@ -175,41 +175,44 @@ void retry_annotation_indexing(mmltk::common::concurrency::CancellationObservati
         try {
             body();
             break;
-        } catch (const InsufficientBenchmarkStorage&) {
-            throw;
-        } catch (const std::exception& error) {
+        } catch (const InsufficientBenchmarkStorage&) { throw; } catch (const std::exception& error) {
             throw_if_benchmark_cancelled(cancel_requested);
             if (attempt == 3U) { throw; }
             repair(error);
         }
     }
 }
-
-std::vector<DownloadResult> repair_annotation_artifacts(std::vector<DownloadRequest> requests, BenchmarkDatasetSource source,
-    std::string_view reason, ProgressReporter& progress, ArtifactProgressTotals& totals, std::size_t workers,
-    mmltk::common::concurrency::CancellationObservation cancellation, const BenchmarkTraceSink& trace) {
+std::vector<DownloadResult> repair_annotation_artifacts(std::vector<DownloadRequest> requests, BenchmarkDatasetSource source, std::string_view reason,
+                                                        ProgressReporter& progress, ArtifactProgressTotals& totals, std::size_t workers,
+                                                        mmltk::common::concurrency::CancellationObservation cancellation, const BenchmarkTraceSink& trace) {
     for (auto& request : requests) {
         if (std::filesystem::is_regular_file(request.destination)) {
             progress.source_activity(source, "Failure-only SHA-256 diagnosis for " + request.artifact_id);
             const auto sha = common_io::sha256_hex(common_io::sha256_file(request.destination, [&] { return cancellation.requested(); }));
-            trace_benchmark_event(trace, "benchmark.download.failure_sha256", [&] {
-                return nlohmann::json{{"artifact", request.artifact_id}, {"sha256", sha}, {"reason", reason}};
-            });
+            trace_benchmark_event(trace, "benchmark.download.failure_sha256",
+                                  [&] { return nlohmann::json{{"artifact", request.artifact_id}, {"sha256", sha}, {"reason", reason}}; });
         }
         invalidate_download_artifact(request, cancellation, trace);
         request.redownload = true;
     }
     progress.source_activity(source, "Redownloading annotation metadata after structural validation failure");
-    return download_artifacts(requests,
-        requests.size() == 1U ? std::min<std::size_t>(8U, workers) : std::min<std::size_t>({3U, requests.size(), workers}), cancellation,
+    return download_artifacts(
+        requests, requests.size() == 1U ? std::min<std::size_t>(8U, workers) : std::min<std::size_t>({3U, requests.size(), workers}), cancellation,
         progress.transfer_observer_enabled() ? DownloadProgressSink{[&](const DownloadProgress& update) { totals.update(update, progress); }}
-                                            : DownloadProgressSink{}, trace);
+                                             : DownloadProgressSink{},
+        trace);
 }
-CocoAnnotationCache::CocoAnnotationCache(const BenchmarkCacheLayout& cache, const CatalogArtifact& artifact, bool training,
-    std::uint32_t train_count, std::uint32_t validation_count, int parse_workers,
-    mmltk::common::concurrency::CancellationObservation cancellation, const BenchmarkTraceSink& trace)
-    : cache_(cache), request_(make_download_request(cache, "coco", artifact)), training_(training), train_count_(train_count),
-      validation_count_(validation_count), parse_workers_(parse_workers), cancellation_(cancellation), trace_(trace),
+CocoAnnotationCache::CocoAnnotationCache(const BenchmarkCacheLayout& cache, const CatalogArtifact& artifact, bool training, std::uint32_t train_count,
+                                         std::uint32_t validation_count, int parse_workers, mmltk::common::concurrency::CancellationObservation cancellation,
+                                         const BenchmarkTraceSink& trace)
+    : cache_(cache),
+      request_(make_download_request(cache, "coco", artifact)),
+      training_(training),
+      train_count_(train_count),
+      validation_count_(validation_count),
+      parse_workers_(parse_workers),
+      cancellation_(cancellation),
+      trace_(trace),
       lease_(ArtifactLease::acquire(cache.locks / "coco-annotations.lifecycle.lock", cancellation)) {
     indexes_.train_path = cache.source_indexes("coco") / "train2017.normalized.bin";
     indexes_.validation_path = cache.source_indexes("coco") / "val2017.normalized.bin";
@@ -230,8 +233,7 @@ std::uint64_t CocoAnnotationCache::completed_indexes() const noexcept {
 std::filesystem::path CocoAnnotationCache::source_json(bool training) const {
     return cache_.source_indexes("coco") / "source-json" / (training ? "instances_train2017.json" : "instances_val2017.json");
 }
-void CocoAnnotationCache::build_split(bool training, const DownloadResult& archive, ProgressReporter& progress,
-    std::uint64_t& completed, std::uint64_t total) {
+void CocoAnnotationCache::build_split(bool training, const DownloadResult& archive, ProgressReporter& progress, std::uint64_t& completed, std::uint64_t total) {
     auto& index = training ? indexes_.train : indexes_.validation;
     if (index) return;
     const std::string split = training ? "train2017" : "val2017";
@@ -239,14 +241,15 @@ void CocoAnnotationCache::build_split(bool training, const DownloadResult& archi
     const auto json_path = source_json(training);
     std::filesystem::create_directories(json_path.parent_path());
     progress.source_activity(BenchmarkDatasetSource::kCoco2017, "Extracting COCO " + label + " annotations");
-    const auto digest = extract_archive_member(archive.path, "annotations/instances_" + split + ".json", json_path, archive.identity,
-        cache_.locks / (training ? "coco-train-json.extract.lock" : "coco-val-json.extract.lock"), cancellation_, trace_);
-    index = load_or_build_index(cache_, training ? indexes_.train_path : indexes_.validation_path, BenchmarkDatasetSource::kCoco2017,
-        split, digest, cancellation_, trace_, [&] {
+    const auto digest =
+        extract_archive_member(archive.path, "annotations/instances_" + split + ".json", json_path, archive.identity,
+                               cache_.locks / (training ? "coco-train-json.extract.lock" : "coco-val-json.extract.lock"), cancellation_, trace_);
+    index = load_or_build_index(
+        cache_, training ? indexes_.train_path : indexes_.validation_path, BenchmarkDatasetSource::kCoco2017, split, digest, cancellation_, trace_, [&] {
             progress.source_activity(BenchmarkDatasetSource::kCoco2017, "Parsing and indexing COCO " + label + " annotations");
             return parse_coco_style_annotations(json_path, digest, coco_category_mappings(),
-                AnnotationParseOptions{BenchmarkDatasetSource::kCoco2017, split, training ? train_count_ : validation_count_,
-                    parse_workers_, !training, cancellation_, trace_});
+                                                AnnotationParseOptions{BenchmarkDatasetSource::kCoco2017, split, training ? train_count_ : validation_count_,
+                                                                       parse_workers_, !training, cancellation_, trace_});
         });
     progress.phase(DatasetCompilePhase::Indexing, ++completed, total);
 }
@@ -261,25 +264,29 @@ void CocoAnnotationCache::invalidate_missing() {
         remove_cache_path(path);
     }
 }
-void CocoAnnotationCache::settle(DownloadResult archive, ProgressReporter& progress, std::size_t workers,
-    std::uint64_t& completed, std::uint64_t total) {
+void CocoAnnotationCache::settle(DownloadResult archive, ProgressReporter& progress, std::size_t workers, std::uint64_t& completed, std::uint64_t total) {
     if (!pending_) throw std::logic_error("COCO annotation cache has no pending download");
     ArtifactProgressTotals repair_progress;
-    retry_annotation_indexing(cancellation_, [&] {
-        if (training_) build_split(true, archive, progress, completed, total);
-        build_split(false, archive, progress, completed, total);
-    }, [&](const std::exception& error) {
-        invalidate_missing();
-        archive = repair_annotation_artifacts({request_}, BenchmarkDatasetSource::kCoco2017, error.what(), progress,
-            repair_progress, workers, cancellation_, trace_).front();
-    });
+    retry_annotation_indexing(
+        cancellation_,
+        [&] {
+            if (training_) build_split(true, archive, progress, completed, total);
+            build_split(false, archive, progress, completed, total);
+        },
+        [&](const std::exception& error) {
+            invalidate_missing();
+            archive = repair_annotation_artifacts({request_}, BenchmarkDatasetSource::kCoco2017, error.what(), progress, repair_progress, workers,
+                                                  cancellation_, trace_)
+                          .front();
+        });
     pending_.reset();
 }
 CocoAnnotationIndexes CocoAnnotationCache::take_indexes() {
     if (pending_ || !indexes_.validation || (training_ && !indexes_.train)) throw std::logic_error("COCO annotation indexes are not settled");
     std::uint64_t storage = 0;
     const auto account = [&](const std::filesystem::path& path) {
-        if (std::filesystem::is_regular_file(path)) storage = common_math::checked_add(storage, std::filesystem::file_size(path), "stock annotation storage overflow");
+        if (std::filesystem::is_regular_file(path))
+            storage = common_math::checked_add(storage, std::filesystem::file_size(path), "stock annotation storage overflow");
     };
     account(request_.destination);
     account(request_.destination.string() + ".download.json");
@@ -287,9 +294,12 @@ CocoAnnotationIndexes CocoAnnotationCache::take_indexes() {
         if (training && !training_) continue;
         const auto& path = training ? indexes_.train_path : indexes_.validation_path;
         const auto json = source_json(training);
-        account(path); account(path.string() + ".complete.json"); account(json); account(json.string() + ".extract.json");
+        account(path);
+        account(path.string() + ".complete.json");
+        account(json);
+        account(json.string() + ".extract.json");
     }
     indexes_.retained_storage_bytes = storage;
     return std::move(indexes_);
 }
-}
+}  // namespace mmltk::backend::data::benchmark_internal

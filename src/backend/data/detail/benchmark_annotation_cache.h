@@ -15,18 +15,19 @@
 namespace mmltk::backend::data::benchmark_internal {
 class ProgressReporter;
 class ArtifactProgressTotals;
-[[nodiscard]] std::vector<DownloadResult> repair_annotation_artifacts(std::vector<DownloadRequest>, BenchmarkDatasetSource, std::string_view,
-    ProgressReporter&, ArtifactProgressTotals&, std::size_t, mmltk::common::concurrency::CancellationObservation, const BenchmarkTraceSink&);
-[[nodiscard]] std::string extract_archive_member(const std::filesystem::path&, std::string_view, const std::filesystem::path&,
-    std::string_view, const std::filesystem::path&, mmltk::common::concurrency::CancellationObservation, const BenchmarkTraceSink&);
-[[nodiscard]] std::optional<NormalizedAnnotationIndex> discover_cached_index(const std::filesystem::path&, BenchmarkDatasetSource,
-    std::string_view, mmltk::common::concurrency::CancellationObservation, const BenchmarkTraceSink&);
-[[nodiscard]] NormalizedAnnotationIndex load_or_build_index(const BenchmarkCacheLayout&, const std::filesystem::path&, BenchmarkDatasetSource,
-    std::string_view, std::string_view, mmltk::common::concurrency::CancellationObservation, const BenchmarkTraceSink&,
-    const std::function<NormalizedAnnotationIndex()>&);
+[[nodiscard]] std::vector<DownloadResult> repair_annotation_artifacts(std::vector<DownloadRequest>, BenchmarkDatasetSource, std::string_view, ProgressReporter&,
+                                                                      ArtifactProgressTotals&, std::size_t, mmltk::common::concurrency::CancellationObservation,
+                                                                      const BenchmarkTraceSink&);
+[[nodiscard]] std::string extract_archive_member(const std::filesystem::path&, std::string_view, const std::filesystem::path&, std::string_view,
+                                                 const std::filesystem::path&, mmltk::common::concurrency::CancellationObservation, const BenchmarkTraceSink&);
+[[nodiscard]] std::optional<NormalizedAnnotationIndex> discover_cached_index(const std::filesystem::path&, BenchmarkDatasetSource, std::string_view,
+                                                                             mmltk::common::concurrency::CancellationObservation, const BenchmarkTraceSink&);
+[[nodiscard]] NormalizedAnnotationIndex load_or_build_index(const BenchmarkCacheLayout&, const std::filesystem::path&, BenchmarkDatasetSource, std::string_view,
+                                                            std::string_view, mmltk::common::concurrency::CancellationObservation, const BenchmarkTraceSink&,
+                                                            const std::function<NormalizedAnnotationIndex()>&);
 // Three body attempts; cancellation and local capacity failures never repair source data.
 void retry_annotation_indexing(mmltk::common::concurrency::CancellationObservation, const std::function<void()>&,
-    const std::function<void(const std::exception&)>&);
+                               const std::function<void(const std::exception&)>&);
 struct CocoAnnotationIndexes {
     std::filesystem::path train_path, validation_path;
     std::optional<NormalizedAnnotationIndex> train, validation;
@@ -37,13 +38,14 @@ struct CocoAnnotationIndexes {
 // Callers may acquire other source leases after construction, before discovery.
 class CocoAnnotationCache final {
    public:
-    CocoAnnotationCache(const BenchmarkCacheLayout&, const CatalogArtifact&, bool training, std::uint32_t train_count,
-        std::uint32_t validation_count, int parse_workers, mmltk::common::concurrency::CancellationObservation, const BenchmarkTraceSink&);
+    CocoAnnotationCache(const BenchmarkCacheLayout&, const CatalogArtifact&, bool training, std::uint32_t train_count, std::uint32_t validation_count,
+                        int parse_workers, mmltk::common::concurrency::CancellationObservation, const BenchmarkTraceSink&);
     void discover(ProgressReporter&);
     [[nodiscard]] std::uint64_t completed_indexes() const noexcept;
     [[nodiscard]] const std::optional<DownloadRequest>& pending_download() const noexcept { return pending_; }
     void settle(DownloadResult, ProgressReporter&, std::size_t workers, std::uint64_t& completed, std::uint64_t total);
     [[nodiscard]] CocoAnnotationIndexes take_indexes();
+
    private:
     void build_split(bool training, const DownloadResult&, ProgressReporter&, std::uint64_t&, std::uint64_t);
     void invalidate_missing();
@@ -59,4 +61,4 @@ class CocoAnnotationCache final {
     CocoAnnotationIndexes indexes_;
     std::optional<DownloadRequest> pending_;
 };
-}
+}  // namespace mmltk::backend::data::benchmark_internal

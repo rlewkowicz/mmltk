@@ -35,14 +35,20 @@ using Cancellation = mmltk::common::concurrency::CancellationObservation;
 std::uint64_t decimal(std::string_view value) {
     std::uint64_t id = 0;
     const auto [end, error] = std::from_chars(value.data(), value.data() + value.size(), id);
-    if (value.empty() || error != std::errc{} || end != value.data() + value.size() || value.front() == '+' || value.front() == '-') invalid("invalid decimal image identity: " + std::string(value));
+    if (value.empty() || error != std::errc{} || end != value.data() + value.size() || value.front() == '+' || value.front() == '-')
+        invalid("invalid decimal image identity: " + std::string(value));
     return id;
 }
-struct PhysicalName { CoconutImageNamespace source; std::uint64_t id; std::string stem; };
+struct PhysicalName {
+    CoconutImageNamespace source;
+    std::uint64_t id;
+    std::string stem;
+};
 PhysicalName objects_name(std::string_view name) {
     const std::filesystem::path path(canonical_coconut_archive_member(name));
     const auto extension = path.extension().string();
-    if (!extension.empty() && extension != ".png" && extension != ".jpg" && extension != ".json") invalid("unsupported Objects365 member: " + std::string(name));
+    if (!extension.empty() && extension != ".png" && extension != ".jpg" && extension != ".json")
+        invalid("unsupported Objects365 member: " + std::string(name));
     const auto stem = path.stem().string();
     constexpr std::string_view v1 = "objects365_v1_", v2 = "objects365_v2_";
     const auto source = stem.starts_with(v1) ? CoconutImageNamespace::Objects365V1 : CoconutImageNamespace::Objects365V2;
@@ -52,7 +58,8 @@ PhysicalName objects_name(std::string_view name) {
 }
 std::uint64_t coco_name(std::string_view name) {
     const std::filesystem::path path(canonical_coconut_archive_member(name));
-    if ((path.extension() != ".jpg" && path.extension() != ".png") || path.stem().string().size() != 12U) invalid("invalid COCO filename: " + std::string(name));
+    if ((path.extension() != ".jpg" && path.extension() != ".png") || path.stem().string().size() != 12U)
+        invalid("invalid COCO filename: " + std::string(name));
     return decimal(path.stem().string());
 }
 struct PhysicalKey {
@@ -65,7 +72,7 @@ struct PhysicalKeyHash {
         return std::hash<std::uint64_t>{}(key.id) ^ (static_cast<std::size_t>(key.source) * 0x9e3779b97f4a7c15ULL);
     }
 };
-PhysicalKey physical_key(CoconutImageNamespace source, std::uint64_t id) { return {source,id}; }
+PhysicalKey physical_key(CoconutImageNamespace source, std::uint64_t id) { return {source, id}; }
 const CategoryLookup& coconut_categories() {
     static const auto lookup = make_numeric_lookup(coco_category_mappings());
     return lookup;
@@ -78,13 +85,14 @@ void validate_physical(const CoconutPhysicalImage& image) {
         if (name.source != image.source || name.id != image.image_id) invalid("contradictory Objects365 physical identity: " + image.member);
     } else {
         if (coco_name(image.member) != image.image_id) invalid("contradictory COCO physical identity: " + image.member);
-        const std::string_view directory = image.source == CoconutImageNamespace::CocoTrain ? "train2017/" :
-            image.source == CoconutImageNamespace::CocoUnlabeled ? "unlabeled2017/" : "val2017/";
+        const std::string_view directory = image.source == CoconutImageNamespace::CocoTrain       ? "train2017/"
+                                           : image.source == CoconutImageNamespace::CocoUnlabeled ? "unlabeled2017/"
+                                                                                                  : "val2017/";
         if (!image.member.starts_with(directory)) invalid("COCO physical subset disagrees with archive member: " + image.member);
     }
 }
 class Archive final {
- public:
+   public:
     explicit Archive(const std::filesystem::path& path) : handle_(archive_read_new(), archive_read_free) {
         if (!handle_) invalid("cannot allocate archive reader");
         archive_read_support_filter_all(handle_.get());
@@ -99,16 +107,20 @@ class Archive final {
         if (status != ARCHIVE_OK) fail("reading archive header");
         const char* name = archive_entry_pathname(entry_);
         if (!name) invalid("archive member has no name");
-        member_ = archive_entry_filetype(entry_) == AE_IFDIR && (std::string_view(name) == "." || std::string_view(name) == "./") ? "." : canonical_coconut_archive_member(name);
+        member_ = archive_entry_filetype(entry_) == AE_IFDIR && (std::string_view(name) == "." || std::string_view(name) == "./")
+                      ? "."
+                      : canonical_coconut_archive_member(name);
         if (archive_entry_symlink(entry_) || archive_entry_hardlink(entry_) ||
-            (archive_entry_filetype(entry_) != AE_IFREG && archive_entry_filetype(entry_) != AE_IFDIR)) invalid("unsupported archive entry: " + member_);
+            (archive_entry_filetype(entry_) != AE_IFREG && archive_entry_filetype(entry_) != AE_IFDIR))
+            invalid("unsupported archive entry: " + member_);
         return true;
     }
     const std::string& member() const { return member_; }
     bool regular() const { return archive_entry_filetype(entry_) == AE_IFREG; }
     std::span<const std::uint8_t> read(std::uint64_t limit, Cancellation cancellation) {
         const auto size = archive_entry_size(entry_);
-        if (size < 0 || static_cast<std::uint64_t>(size) > limit || static_cast<std::uint64_t>(size) > std::numeric_limits<std::size_t>::max()) invalid("archive entry exceeds admission: " + member_);
+        if (size < 0 || static_cast<std::uint64_t>(size) > limit || static_cast<std::uint64_t>(size) > std::numeric_limits<std::size_t>::max())
+            invalid("archive entry exceeds admission: " + member_);
         bytes_.resize(static_cast<std::size_t>(size));
         std::size_t offset = 0;
         while (offset < bytes_.size()) {
@@ -119,7 +131,8 @@ class Archive final {
         }
         return bytes_;
     }
- private:
+
+   private:
     [[noreturn]] void fail(const std::string& context) const {
         const char* detail = archive_error_string(handle_.get());
         invalid(context + ": " + (detail ? detail : "archive failure"));
@@ -134,7 +147,10 @@ std::uint64_t unsigned_field(const Json& value, std::string_view name) {
 }
 bool flag(const Json& object, std::string_view name, bool required = false) {
     auto field = object.find(std::string(name));
-    if (field == object.end()) { if (required) invalid("missing flag " + std::string(name)); return false; }
+    if (field == object.end()) {
+        if (required) invalid("missing flag " + std::string(name));
+        return false;
+    }
     if (field->is_boolean()) return field->get<bool>();
     if (!field->is_number_integer() || (*field != 0 && *field != 1)) invalid("invalid flag " + std::string(name));
     return *field == 1;
@@ -164,164 +180,197 @@ void segments_from_json(const Json& input, CoconutRecord& record, const CoconutI
         record.segments.push_back(segment);
     }
 }
-template<class T>
+template <class T>
 concept InventoryRecord = std::same_as<T, CoconutPhysicalImage> || std::same_as<T, CoconutInventoryImage> || std::same_as<T, InventoryHeader>;
 // A single reflected little-endian encoding is used by hashing, writing and reading.
 // Strings carry checked uint32 lengths. Only a fixed buffer and the current row
 // are transient; records remain in their ordinary typed inventory owner.
 class InventoryOutput final {
- public:
-    InventoryOutput(mmltk::common::io::FileHandle* file, Cancellation cancellation, bool count_only = false) : file_(file), cancellation_(cancellation), count_only_(count_only) {}
-    template<class T> void value(const T& item) {
+   public:
+    InventoryOutput(mmltk::common::io::FileHandle* file, Cancellation cancellation, bool count_only = false)
+        : file_(file), cancellation_(cancellation), count_only_(count_only) {}
+    template <class T>
+    void value(const T& item) {
         if constexpr (InventoryRecord<T>) {
             mmltk::frameworks::reflection::visit_materialized_members<T>([&]<class Declaration>(const auto&) { value(item.*Declaration::pointer); });
         } else if constexpr (std::is_enum_v<T>) {
             value(static_cast<std::underlying_type_t<T>>(item));
-        } else if constexpr (std::same_as<T,std::string>) {
+        } else if constexpr (std::same_as<T, std::string>) {
             if (item.size() > 4096) invalid("inventory text exceeds admission");
             value(static_cast<std::uint32_t>(item.size()));
-            append({reinterpret_cast<const std::uint8_t*>(item.data()),item.size()});
+            append({reinterpret_cast<const std::uint8_t*>(item.data()), item.size()});
         } else {
-            static_assert(std::is_unsigned_v<T> || std::same_as<T,bool>);
-            std::array<std::uint8_t,sizeof(T)> bytes{};
+            static_assert(std::is_unsigned_v<T> || std::same_as<T, bool>);
+            std::array<std::uint8_t, sizeof(T)> bytes{};
             auto number = static_cast<std::uint64_t>(item);
-            for (auto& byte : bytes) { byte = static_cast<std::uint8_t>(number & 255U); number >>= 8U; }
+            for (auto& byte : bytes) {
+                byte = static_cast<std::uint8_t>(number & 255U);
+                number >>= 8U;
+            }
             append(bytes);
         }
     }
-    [[nodiscard]] std::uint64_t byte_size() const { return mmltk::common::math::checked_add<std::uint64_t>(offset_,32U,"inventory extent overflow"); }
+    [[nodiscard]] std::uint64_t byte_size() const { return mmltk::common::math::checked_add<std::uint64_t>(offset_, 32U, "inventory extent overflow"); }
     std::string finish() {
         if (count_only_) return {};
         flush();
         const auto digest = hash_.Finish();
-        if (file_) file_->pwrite_all(digest.data(),digest.size(),offset_);
+        if (file_) file_->pwrite_all(digest.data(), digest.size(), offset_);
         throw_if_benchmark_cancelled(cancellation_);
         return mmltk::common::io::sha256_hex(digest);
     }
- private:
+
+   private:
     void append(std::span<const std::uint8_t> bytes) {
-        if (count_only_) { offset_ = mmltk::common::math::checked_add(offset_,bytes.size(),"inventory extent overflow"); return; }
+        if (count_only_) {
+            offset_ = mmltk::common::math::checked_add(offset_, bytes.size(), "inventory extent overflow");
+            return;
+        }
         while (!bytes.empty()) {
-            const auto count = std::min(bytes.size(),buffer_.size()-used_);
-            std::memcpy(buffer_.data()+used_,bytes.data(),count);
-            used_ += count; bytes = bytes.subspan(count);
+            const auto count = std::min(bytes.size(), buffer_.size() - used_);
+            std::memcpy(buffer_.data() + used_, bytes.data(), count);
+            used_ += count;
+            bytes = bytes.subspan(count);
             if (used_ == buffer_.size()) flush();
         }
     }
     void flush() {
         throw_if_benchmark_cancelled(cancellation_);
         if (!used_) return;
-        if (used_ > std::numeric_limits<std::size_t>::max()-offset_) invalid("inventory size overflow");
-        hash_.Update(std::span(buffer_.data(),used_));
-        if (file_) file_->pwrite_all(buffer_.data(),used_,offset_);
-        offset_ += used_; used_ = 0;
+        if (used_ > std::numeric_limits<std::size_t>::max() - offset_) invalid("inventory size overflow");
+        hash_.Update(std::span(buffer_.data(), used_));
+        if (file_) file_->pwrite_all(buffer_.data(), used_, offset_);
+        offset_ += used_;
+        used_ = 0;
     }
     mmltk::common::io::FileHandle* file_;
     Cancellation cancellation_;
     bool count_only_ = false;
     mmltk::common::io::Sha256Hasher hash_;
-    std::array<std::uint8_t,65536> buffer_{};
+    std::array<std::uint8_t, 65536> buffer_{};
     std::size_t used_ = 0, offset_ = 0;
 };
 class InventoryInput final {
- public:
+   public:
     InventoryInput(const std::filesystem::path& path, Cancellation cancellation)
         : file_(mmltk::common::io::FileHandle::open_readonly(path.string())), cancellation_(cancellation) {
         const auto size = file_.size();
         if (size < 32) invalid("truncated inventory");
-        content_size_ = size-32;
+        content_size_ = size - 32;
     }
-    template<class T> void value(T& item) {
+    template <class T>
+    void value(T& item) {
         if constexpr (InventoryRecord<T>) {
             mmltk::frameworks::reflection::visit_materialized_members<T>([&]<class Declaration>(const auto&) { value(item.*Declaration::pointer); });
         } else if constexpr (std::is_enum_v<T>) {
-            std::underlying_type_t<T> number{}; value(number); item = static_cast<T>(number);
-        } else if constexpr (std::same_as<T,std::string>) {
-            std::uint32_t count = 0; value(count);
+            std::underlying_type_t<T> number{};
+            value(number);
+            item = static_cast<T>(number);
+        } else if constexpr (std::same_as<T, std::string>) {
+            std::uint32_t count = 0;
+            value(count);
             if (count > 4096) invalid("inventory text exceeds admission");
-            item.resize(count); read({reinterpret_cast<std::uint8_t*>(item.data()),count});
+            item.resize(count);
+            read({reinterpret_cast<std::uint8_t*>(item.data()), count});
         } else {
-            static_assert(std::is_unsigned_v<T> || std::same_as<T,bool>);
-            std::array<std::uint8_t,sizeof(T)> bytes{}; read(bytes);
+            static_assert(std::is_unsigned_v<T> || std::same_as<T, bool>);
+            std::array<std::uint8_t, sizeof(T)> bytes{};
+            read(bytes);
             std::uint64_t number = 0;
-            for (std::size_t i=0; i<bytes.size(); ++i) number |= static_cast<std::uint64_t>(bytes[i]) << (8U*i);
-            if constexpr (std::same_as<T,bool>) { if (number>1) invalid("invalid inventory flag"); }
+            for (std::size_t i = 0; i < bytes.size(); ++i) number |= static_cast<std::uint64_t>(bytes[i]) << (8U * i);
+            if constexpr (std::same_as<T, bool>) {
+                if (number > 1) invalid("invalid inventory flag");
+            }
             item = static_cast<T>(number);
         }
     }
-    std::uint64_t maximum_records() const { return content_size_/16U; }
+    std::uint64_t maximum_records() const { return content_size_ / 16U; }
     std::string finish() {
         throw_if_benchmark_cancelled(cancellation_);
         if (loaded_ != content_size_ || cursor_ != available_) invalid("inventory has trailing records");
         mmltk::common::io::Sha256Digest expected{};
-        file_.pread_all(expected.data(),expected.size(),content_size_);
+        file_.pread_all(expected.data(), expected.size(), content_size_);
         const auto actual = hash_.Finish();
         if (actual != expected) invalid("inventory checksum mismatch");
         return mmltk::common::io::sha256_hex(actual);
     }
- private:
+
+   private:
     void read(std::span<std::uint8_t> output) {
         while (!output.empty()) {
             if (cursor_ == available_) {
                 throw_if_benchmark_cancelled(cancellation_);
-                available_ = std::min(buffer_.size(),content_size_-loaded_); cursor_=0;
+                available_ = std::min(buffer_.size(), content_size_ - loaded_);
+                cursor_ = 0;
                 if (!available_) invalid("truncated inventory record");
-                file_.pread_all(buffer_.data(),available_,loaded_);
-                hash_.Update(std::span(buffer_.data(),available_)); loaded_+=available_;
+                file_.pread_all(buffer_.data(), available_, loaded_);
+                hash_.Update(std::span(buffer_.data(), available_));
+                loaded_ += available_;
             }
-            const auto count = std::min(output.size(),available_-cursor_);
-            std::memcpy(output.data(),buffer_.data()+cursor_,count);
-            cursor_+=count; output=output.subspan(count);
+            const auto count = std::min(output.size(), available_ - cursor_);
+            std::memcpy(output.data(), buffer_.data() + cursor_, count);
+            cursor_ += count;
+            output = output.subspan(count);
         }
     }
     mmltk::common::io::FileHandle file_;
     Cancellation cancellation_;
     mmltk::common::io::Sha256Hasher hash_;
-    std::array<std::uint8_t,65536> buffer_{};
-    std::size_t content_size_=0,loaded_=0,cursor_=0,available_=0;
+    std::array<std::uint8_t, 65536> buffer_{};
+    std::size_t content_size_ = 0, loaded_ = 0, cursor_ = 0, available_ = 0;
 };
 InventoryHeader component_header(const CoconutComponent& component) {
     InventoryHeader header;
-    header.component=true; header.input_identity=component.input_identity; header.edition=component.edition;
-    header.source=component.source; header.count=component.inventory.size();
+    header.component = true;
+    header.input_identity = component.input_identity;
+    header.edition = component.edition;
+    header.source = component.source;
+    header.count = component.inventory.size();
     return header;
 }
 void validate_inventory_header(const InventoryHeader& header, const InventoryHeader& expected) {
-    if (header.magic!=expected.magic || header.version!=expected.version || header.cache_schema!=expected.cache_schema ||
-        header.normalization!=expected.normalization || header.input_identity!=expected.input_identity || header.edition!=expected.edition ||
-        header.source!=expected.source || header.shard!=expected.shard || header.component!=expected.component)
+    if (header.magic != expected.magic || header.version != expected.version || header.cache_schema != expected.cache_schema ||
+        header.normalization != expected.normalization || header.input_identity != expected.input_identity || header.edition != expected.edition ||
+        header.source != expected.source || header.shard != expected.shard || header.component != expected.component)
         invalid("inventory identity mismatch");
 }
-template<InventoryRecord T> std::string encode_inventory(InventoryOutput& output, const InventoryHeader& header,
-    std::span<const T> records, Cancellation cancellation) {
+template <InventoryRecord T>
+std::string encode_inventory(InventoryOutput& output, const InventoryHeader& header, std::span<const T> records, Cancellation cancellation) {
     output.value(header);
-    for (const auto& record : records) { throw_if_benchmark_cancelled(cancellation); output.value(record); }
+    for (const auto& record : records) {
+        throw_if_benchmark_cancelled(cancellation);
+        output.value(record);
+    }
     return output.finish();
 }
 std::string component_identity(const CoconutComponent& component, Cancellation cancellation) {
-    InventoryOutput output(nullptr,cancellation);
-    return encode_inventory(output,component_header(component),std::span(component.inventory),cancellation);
+    InventoryOutput output(nullptr, cancellation);
+    return encode_inventory(output, component_header(component), std::span(component.inventory), cancellation);
 }
-template<InventoryRecord T> std::string store_inventory(const std::filesystem::path& path, const InventoryHeader& header,
-    std::span<const T> records, std::string_view expected_identity, Cancellation cancellation) {
+template <InventoryRecord T>
+std::string store_inventory(const std::filesystem::path& path, const InventoryHeader& header, std::span<const T> records, std::string_view expected_identity,
+                            Cancellation cancellation) {
     throw_if_benchmark_cancelled(cancellation);
     (void)mmltk::common::io::ensure_parent_directory(path);
-    InventoryOutput extent(nullptr,cancellation,true);
-    (void)encode_inventory(extent,header,records,cancellation);
-    require_storage(path,extent.byte_size(),"COCONut inventory staging",{});
-    std::string temporary=path.string()+".tmp.XXXXXX";
-    auto file=mmltk::common::io::FileHandle::create_unique_output(temporary,0);
+    InventoryOutput extent(nullptr, cancellation, true);
+    (void)encode_inventory(extent, header, records, cancellation);
+    require_storage(path, extent.byte_size(), "COCONut inventory staging", {});
+    std::string temporary = path.string() + ".tmp.XXXXXX";
+    auto file = mmltk::common::io::FileHandle::create_unique_output(temporary, 0);
     StagingFileCleanup cleanup(temporary);
-    InventoryOutput output(&file,cancellation);
-    const auto identity=encode_inventory(output,header,records,cancellation);
-    if (!expected_identity.empty() && identity!=expected_identity) invalid("component inventory/index identity mismatch");
-    file.sync_data(); file=mmltk::common::io::FileHandle{};
+    InventoryOutput output(&file, cancellation);
+    const auto identity = encode_inventory(output, header, records, cancellation);
+    if (!expected_identity.empty() && identity != expected_identity) invalid("component inventory/index identity mismatch");
+    file.sync_data();
+    file = mmltk::common::io::FileHandle{};
     throw_if_benchmark_cancelled(cancellation);
-    mmltk::common::io::publish_staged_path_atomically(temporary,path,true); cleanup.published();
+    mmltk::common::io::publish_staged_path_atomically(temporary, path, true);
+    cleanup.published();
     return identity;
 }
 BenchmarkDatasetSource index_source(CoconutImageNamespace source) {
-    return source == CoconutImageNamespace::Objects365V1 || source == CoconutImageNamespace::Objects365V2 ? BenchmarkDatasetSource::kObjects365V2 : BenchmarkDatasetSource::kCoco2017;
+    return source == CoconutImageNamespace::Objects365V1 || source == CoconutImageNamespace::Objects365V2 ? BenchmarkDatasetSource::kObjects365V2
+                                                                                                          : BenchmarkDatasetSource::kCoco2017;
 }
 std::string component_split(CoconutEdition edition, CoconutImageNamespace source) {
     return "coconut-" + std::to_string(static_cast<unsigned>(edition)) + "-" + std::to_string(static_cast<unsigned>(source));
@@ -354,21 +403,21 @@ void retain_images(CoconutComponent& component, std::span<const std::size_t> ord
                 if (i != order[i]) component.inventory[i] = std::move(component.inventory[order[i]]);
             }
             component.inventory.resize(order.size());
-        } else component.inventory = std::move(inventory);
+        } else
+            component.inventory = std::move(inventory);
         component.index.annotation_sha256 = component_identity(component, cancellation);
     } catch (...) {
         component.index.annotation_sha256.clear();
         throw;
     }
 }
-
 struct SegmentSupport {
     std::uint64_t area = 0;
     std::uint32_t min_x = UINT32_MAX, min_y = UINT32_MAX, max_x = 0, max_y = 0;
     std::vector<RLEPair> runs;
 };
 class Importer final {
- public:
+   public:
     explicit Importer(const CoconutImportRequest& request) : request_(request) {
         if (request.input_identity.empty()) invalid("missing pinned input identity");
         if (!request.physical_membership) invalid("missing physical membership admission");
@@ -379,8 +428,9 @@ class Importer final {
         const auto& physical = resolve(record);
         const auto key = physical_key(physical.source, physical.image_id);
         if (!offered_.insert(key).second) invalid("duplicate offered physical member: " + physical.member);
-        try { normalize(record, physical, png); }
-        catch (const std::exception& error) { invalid(physical.member + ": " + error.what()); }
+        try {
+            normalize(record, physical, png);
+        } catch (const std::exception& error) { invalid(physical.member + ": " + error.what()); }
         ++rows_;
         if (request_.progress && rows_ % kProgressQuantum == 0) request_.progress(rows_);
     }
@@ -392,17 +442,22 @@ class Importer final {
         std::vector<CoconutComponent> result;
         for (auto& [source, component] : components_) {
             std::vector<std::size_t> order(component.inventory.size());
-            for (std::size_t i=0; i<order.size(); ++i) { throw_if_benchmark_cancelled(request_.cancellation); order[i]=i; }
+            for (std::size_t i = 0; i < order.size(); ++i) {
+                throw_if_benchmark_cancelled(request_.cancellation);
+                order[i] = i;
+            }
             throw_if_benchmark_cancelled(request_.cancellation);
-            std::ranges::sort(order, [&](auto left, auto right) { return component.inventory[left].physical.image_id < component.inventory[right].physical.image_id; });
+            std::ranges::sort(
+                order, [&](auto left, auto right) { return component.inventory[left].physical.image_id < component.inventory[right].physical.image_id; });
             throw_if_benchmark_cancelled(request_.cancellation);
-            retain_images(component, order,request_.cancellation);
+            retain_images(component, order, request_.cancellation);
             result.push_back(std::move(component));
         }
         throw_if_benchmark_cancelled(request_.cancellation);
         return result;
     }
- private:
+
+   private:
     static constexpr std::uint64_t kProgressQuantum = 64;
     const CoconutPhysicalImage& resolve(const CoconutRecord& record) const {
         if (request_.edition == CoconutEdition::Base || request_.edition == CoconutEdition::RelabeledValidation) {
@@ -410,32 +465,40 @@ class Importer final {
             const CoconutPhysicalImage* match = nullptr;
             for (auto source : {CoconutImageNamespace::CocoTrain, CoconutImageNamespace::CocoUnlabeled, CoconutImageNamespace::CocoValidation}) {
                 if ((source == CoconutImageNamespace::CocoValidation) != (request_.edition == CoconutEdition::RelabeledValidation)) continue;
-                if (const auto* found = request_.physical_membership->find(source,record.image_id)) {
+                if (const auto* found = request_.physical_membership->find(source, record.image_id)) {
                     if (match) invalid("ambiguous COCO train/unlabeled membership: " + record.file_name);
                     match = found;
                 }
             }
-            if (!match) throw CoconutPhysicalMembershipError(request_.edition == CoconutEdition::Base ? CoconutImageNamespace::CocoTrain : CoconutImageNamespace::CocoValidation, record.image_id, "missing physical COCO archive member: " + record.file_name);
+            if (!match)
+                throw CoconutPhysicalMembershipError(
+                    request_.edition == CoconutEdition::Base ? CoconutImageNamespace::CocoTrain : CoconutImageNamespace::CocoValidation, record.image_id,
+                    "missing physical COCO archive member: " + record.file_name);
             return *match;
         }
         const auto name = objects_name(record.physical_stem);
-        if (request_.edition != CoconutEdition::ObjectsValidation && name.source != CoconutImageNamespace::Objects365V2) invalid("training extension requires Objects365 v2");
-        const auto* found = request_.physical_membership->find(name.source,name.id);
+        if (request_.edition != CoconutEdition::ObjectsValidation && name.source != CoconutImageNamespace::Objects365V2)
+            invalid("training extension requires Objects365 v2");
+        const auto* found = request_.physical_membership->find(name.source, name.id);
         if (!found) throw CoconutPhysicalMembershipError(name.source, name.id, "missing physical Objects365 archive member: " + record.physical_stem);
         return *found;
     }
     void normalize(const CoconutRecord& record, const CoconutPhysicalImage& physical, std::span<const std::uint8_t> png) {
         const auto& limits = request_.limits;
-        if (png.size() > limits.max_png_bytes || png.size() > INT_MAX || png.size() < 26U ||
-            std::memcmp(png.data(), "\x89PNG\r\n\x1a\n", 8) != 0 || png[24] != 8 || png[25] != 2) invalid("expected bounded 8-bit RGB panoptic PNG");
+        if (png.size() > limits.max_png_bytes || png.size() > INT_MAX || png.size() < 26U || std::memcmp(png.data(), "\x89PNG\r\n\x1a\n", 8) != 0 ||
+            png[24] != 8 || png[25] != 2)
+            invalid("expected bounded 8-bit RGB panoptic PNG");
         int width = 0, height = 0, channels = 0;
         if (!stbi_info_from_memory(png.data(), static_cast<int>(png.size()), &width, &height, &channels) || width <= 0 || height <= 0 || channels != 3 ||
             static_cast<unsigned>(width) > limits.max_dimension || static_cast<unsigned>(height) > limits.max_dimension ||
-            static_cast<std::uint64_t>(width) * height > limits.max_pixels || static_cast<std::uint64_t>(width) * height > UINT32_MAX) invalid("PNG dimensions exceed admission");
-        if ((record.width && record.width != static_cast<unsigned>(width)) || (record.height && record.height != static_cast<unsigned>(height))) invalid("declared and PNG dimensions disagree");
+            static_cast<std::uint64_t>(width) * height > limits.max_pixels || static_cast<std::uint64_t>(width) * height > UINT32_MAX)
+            invalid("PNG dimensions exceed admission");
+        if ((record.width && record.width != static_cast<unsigned>(width)) || (record.height && record.height != static_cast<unsigned>(height)))
+            invalid("declared and PNG dimensions disagree");
         if (record.segments.size() > limits.max_segments) invalid("segment count exceeds admission");
         throw_if_benchmark_cancelled(request_.cancellation);
-        std::unique_ptr<stbi_uc, decltype(&stbi_image_free)> pixels(stbi_load_from_memory(png.data(), static_cast<int>(png.size()), &width, &height, &channels, 3), stbi_image_free);
+        std::unique_ptr<stbi_uc, decltype(&stbi_image_free)> pixels(
+            stbi_load_from_memory(png.data(), static_cast<int>(png.size()), &width, &height, &channels, 3), stbi_image_free);
         if (!pixels) invalid("cannot decode panoptic PNG");
         segment_by_id_.clear();
         if (support_.size() < record.segments.size()) support_.resize(record.segments.size());
@@ -443,7 +506,12 @@ class Importer final {
             const auto& segment = record.segments[i];
             if (segment.id == 0 || segment.id > 0xffffffU || !segment_by_id_.emplace(segment.id, i).second) invalid("duplicate/invalid segment ID");
             auto& support = support_[i];
-            support.area = 0; support.min_x = UINT32_MAX; support.min_y = UINT32_MAX; support.max_x = 0; support.max_y = 0; support.runs.clear();
+            support.area = 0;
+            support.min_x = UINT32_MAX;
+            support.min_y = UINT32_MAX;
+            support.max_x = 0;
+            support.max_y = 0;
+            support.runs.clear();
         }
         const std::uint32_t count = static_cast<std::uint32_t>(static_cast<std::uint64_t>(width) * height);
         for (std::uint32_t begin = 0; begin < count;) {
@@ -467,8 +535,10 @@ class Importer final {
                 support.min_y = std::min(support.min_y, begin / static_cast<std::uint32_t>(width));
                 support.max_y = std::max(support.max_y, begin / static_cast<std::uint32_t>(width) + 1U);
                 if (record.segments[found->second].isthing) {
-                    if (!support.runs.empty() && support.runs.back().start + support.runs.back().length == begin) support.runs.back().length += end - begin;
-                    else support.runs.push_back({begin, end - begin});
+                    if (!support.runs.empty() && support.runs.back().start + support.runs.back().length == begin)
+                        support.runs.back().length += end - begin;
+                    else
+                        support.runs.push_back({begin, end - begin});
                 }
             }
             begin = end;
@@ -476,8 +546,11 @@ class Importer final {
         auto [entry, inserted] = components_.try_emplace(physical.source);
         auto& component = entry->second;
         if (inserted) {
-            component.edition = request_.edition; component.source = physical.source; component.input_identity = request_.input_identity;
-            component.index.source = index_source(physical.source); component.index.split = component_split(request_.edition, physical.source);
+            component.edition = request_.edition;
+            component.source = physical.source;
+            component.input_identity = request_.input_identity;
+            component.index.source = index_source(physical.source);
+            component.index.split = component_split(request_.edition, physical.source);
         }
         auto& index = component.index;
         NormalizedImage image{physical.image_id, index.boxes.size(), 0, static_cast<unsigned>(width), static_cast<unsigned>(height), physical.shard, 0};
@@ -487,31 +560,42 @@ class Importer final {
             ++index.rejected.raw_records;
             if (!segment.isthing) continue;
             const auto& categories = coconut_categories().target_by_id;
-            if (segment.category_id >= categories.size() || categories[segment.category_id] < 0) invalid("unknown COCO80 thing category " + std::to_string(segment.category_id));
+            if (segment.category_id >= categories.size() || categories[segment.category_id] < 0)
+                invalid("unknown COCO80 thing category " + std::to_string(segment.category_id));
             if (segment.area && (!std::isfinite(*segment.area) || *segment.area < 0)) invalid("invalid supplied area");
             NormalizedBox box;
             if (segment.bbox) {
                 const auto& supplied = *segment.bbox;
                 if (!std::ranges::all_of(supplied, [](double value) { return std::isfinite(value); }) || supplied[2] <= 0 || supplied[3] <= 0 ||
-                    !std::isfinite(supplied[0] + supplied[2]) || !std::isfinite(supplied[1] + supplied[3])) invalid("invalid authoritative COCO bbox");
-                box.x1 = static_cast<float>(supplied[0] / width); box.y1 = static_cast<float>(supplied[1] / height);
-                box.x2 = static_cast<float>((supplied[0] + supplied[2]) / width); box.y2 = static_cast<float>((supplied[1] + supplied[3]) / height);
+                    !std::isfinite(supplied[0] + supplied[2]) || !std::isfinite(supplied[1] + supplied[3]))
+                    invalid("invalid authoritative COCO bbox");
+                box.x1 = static_cast<float>(supplied[0] / width);
+                box.y1 = static_cast<float>(supplied[1] / height);
+                box.x2 = static_cast<float>((supplied[0] + supplied[2]) / width);
+                box.y2 = static_cast<float>((supplied[1] + supplied[3]) / height);
             } else {
                 if (support.area == 0) invalid("thing segment has neither support nor authoritative bbox");
-                box.x1 = static_cast<float>(static_cast<double>(support.min_x) / width); box.y1 = static_cast<float>(static_cast<double>(support.min_y) / height);
-                box.x2 = static_cast<float>(static_cast<double>(support.max_x) / width); box.y2 = static_cast<float>(static_cast<double>(support.max_y) / height);
+                box.x1 = static_cast<float>(static_cast<double>(support.min_x) / width);
+                box.y1 = static_cast<float>(static_cast<double>(support.min_y) / height);
+                box.x2 = static_cast<float>(static_cast<double>(support.max_x) / width);
+                box.y2 = static_cast<float>(static_cast<double>(support.max_y) / height);
             }
-            if (!std::isfinite(box.x1) || !std::isfinite(box.y1) || !std::isfinite(box.x2) || !std::isfinite(box.y2) || box.x2 <= box.x1 || box.y2 <= box.y1) invalid("normalized box coordinates are not representable");
+            if (!std::isfinite(box.x1) || !std::isfinite(box.y1) || !std::isfinite(box.x2) || !std::isfinite(box.y2) || box.x2 <= box.x1 || box.y2 <= box.y1)
+                invalid("normalized box coordinates are not representable");
             if (support.runs.size() > UINT32_MAX) invalid("normalized RLE count overflow");
-            box.mask_rle_offset = index.mask_rle_pairs.size(); box.mask_rle_pairs = static_cast<std::uint32_t>(support.runs.size());
+            box.mask_rle_offset = index.mask_rle_pairs.size();
+            box.mask_rle_pairs = static_cast<std::uint32_t>(support.runs.size());
             box.class_id = static_cast<std::uint8_t>(categories[segment.category_id]);
-            box.flags = kAnnotationMask | kAnnotationId | kAnnotationCategory | (segment.crowd ? kAnnotationCrowd : 0U) | (segment.ignore ? kAnnotationIgnore : 0U);
+            box.flags =
+                kAnnotationMask | kAnnotationId | kAnnotationCategory | (segment.crowd ? kAnnotationCrowd : 0U) | (segment.ignore ? kAnnotationIgnore : 0U);
             box.original_area = segment.area.value_or(static_cast<double>(support.area));
-            box.annotation_id = segment.id; box.source_category_id = segment.category_id;
+            box.annotation_id = segment.id;
+            box.source_category_id = segment.category_id;
             if (ordinal > UINT64_MAX - record.first_segment_ordinal) invalid("source ordinal overflow");
             box.source_ordinal = record.first_segment_ordinal + ordinal;
             index.mask_rle_pairs.insert(index.mask_rle_pairs.end(), support.runs.begin(), support.runs.end());
-            index.boxes.push_back(box); ++image.box_count;
+            index.boxes.push_back(box);
+            ++image.box_count;
         }
         index.images.push_back(image);
         component.inventory.push_back({physical, record.image_id, record.source_ordinal});
@@ -534,40 +618,46 @@ std::uint32_t dimension(const Json& image, std::string_view field, const Coconut
 // immediately discards that row from the parser's array. Two sequential passes
 // permit either top-level field order without a release-sized JSON DOM.
 void json_rows(const CoconutImportRequest& request, std::span<const std::string_view> fields,
-    const std::function<void(std::string_view,const Json&)>& consume) {
+               const std::function<void(std::string_view, const Json&)>& consume) {
     std::ifstream input(request.annotation_json);
     if (!input) invalid("cannot open annotation JSON: " + request.annotation_json.string());
     std::size_t selected = fields.size();
-    std::vector<bool> found(fields.size(),false);
+    std::vector<bool> found(fields.size(), false);
     std::size_t record_events = 0;
     const auto parsed = Json::parse(input, [&](int depth, Json::parse_event_t event, Json& value) {
         if (depth > 16) invalid("annotation JSON nesting exceeds admission");
         if (depth == 0 && event == Json::parse_event_t::array_start) invalid("panoptic JSON requires an object envelope");
         if (depth == 1 && event == Json::parse_event_t::key) {
-            const auto& name=value.get_ref<const std::string&>();
-            const auto match=std::ranges::find(fields,name);
-            selected=static_cast<std::size_t>(match-fields.begin());
-            if (selected<fields.size()) {
+            const auto& name = value.get_ref<const std::string&>();
+            const auto match = std::ranges::find(fields, name);
+            selected = static_cast<std::size_t>(match - fields.begin());
+            if (selected < fields.size()) {
                 if (found[selected]) invalid("duplicate panoptic envelope field");
-                found[selected]=true;
+                found[selected] = true;
             }
-            return selected<fields.size();
+            return selected < fields.size();
         }
         if (depth == 2 && event == Json::parse_event_t::object_start) throw_if_benchmark_cancelled(request.cancellation);
-        if (selected==fields.size()) return true;
-        if (depth == 1 && (event == Json::parse_event_t::object_start || event == Json::parse_event_t::value)) invalid("panoptic envelope field must be an array");
+        if (selected == fields.size()) return true;
+        if (depth == 1 && (event == Json::parse_event_t::object_start || event == Json::parse_event_t::value))
+            invalid("panoptic envelope field must be an array");
         if (depth == 2 && (event == Json::parse_event_t::array_start || event == Json::parse_event_t::value)) invalid("panoptic row must be an object");
         if (depth == 2 && event == Json::parse_event_t::object_start) {
             throw_if_benchmark_cancelled(request.cancellation);
             record_events = 0;
         }
-        if (depth >= 2 && ++record_events > static_cast<std::size_t>(request.limits.max_segments) * 32U + 128U) invalid("panoptic row exceeds segment admission");
-        if (event == Json::parse_event_t::value && value.is_string() && value.get_ref<const std::string&>().size() > 4096U) invalid("panoptic text exceeds admission");
-        if (depth == 2 && event == Json::parse_event_t::object_end) { consume(fields[selected],value); return false; }
+        if (depth >= 2 && ++record_events > static_cast<std::size_t>(request.limits.max_segments) * 32U + 128U)
+            invalid("panoptic row exceeds segment admission");
+        if (event == Json::parse_event_t::value && value.is_string() && value.get_ref<const std::string&>().size() > 4096U)
+            invalid("panoptic text exceeds admission");
+        if (depth == 2 && event == Json::parse_event_t::object_end) {
+            consume(fields[selected], value);
+            return false;
+        }
         return true;
     });
-    for (std::size_t i=0; i<fields.size(); ++i) {
-        if (!parsed.is_object() || !found[i]) invalid("missing panoptic envelope field "+std::string(fields[i]));
+    for (std::size_t i = 0; i < fields.size(); ++i) {
+        if (!parsed.is_object() || !found[i]) invalid("missing panoptic envelope field " + std::string(fields[i]));
     }
 }
 std::vector<CoconutRecord> json_records(const CoconutImportRequest& request) {
@@ -576,30 +666,30 @@ std::vector<CoconutRecord> json_records(const CoconutImportRequest& request) {
     NumericCategoryAdmission category_admission(categories);
     std::unordered_map<std::uint64_t, Json> by_id;
     std::unordered_map<std::string, std::uint64_t> by_file;
-    constexpr std::array<std::string_view,2> preparation_fields{"categories","images"};
-    json_rows(request,preparation_fields,[&](std::string_view field,const Json& row) {
-        if (field=="categories") {
+    constexpr std::array<std::string_view, 2> preparation_fields{"categories", "images"};
+    json_rows(request, preparation_fields, [&](std::string_view field, const Json& row) {
+        if (field == "categories") {
             std::optional<std::uint32_t> id;
             std::optional<std::string> name;
-            if (row.contains("id")) id=mmltk::frameworks::serialization::decode_json_integer_exact<std::uint32_t>(row.at("id"));
-            if (row.contains("name")) name=row.at("name").get<std::string>();
-            category_admission.observe(id,name ? std::optional<std::string_view>(*name) : std::nullopt);
+            if (row.contains("id")) id = mmltk::frameworks::serialization::decode_json_integer_exact<std::uint32_t>(row.at("id"));
+            if (row.contains("name")) name = row.at("name").get<std::string>();
+            category_admission.observe(id, name ? std::optional<std::string_view>(*name) : std::nullopt);
             return;
         }
-        const auto id=unsigned_field(row,"id");
-        Json metadata=Json::object();
-        for (const auto key : {"id","file_name","object365_file_name","object365_name","width","height"}) {
-            if (row.contains(key)) metadata[key]=row.at(key);
+        const auto id = unsigned_field(row, "id");
+        Json metadata = Json::object();
+        for (const auto key : {"id", "file_name", "object365_file_name", "object365_name", "width", "height"}) {
+            if (row.contains(key)) metadata[key] = row.at(key);
         }
-        if (!by_id.emplace(id,std::move(metadata)).second) invalid("duplicate JSON image ID");
-        if (row.contains("file_name") && !by_file.emplace(row.at("file_name").get<std::string>(),id).second) invalid("duplicate JSON image filename");
+        if (!by_id.emplace(id, std::move(metadata)).second) invalid("duplicate JSON image ID");
+        if (row.contains("file_name") && !by_file.emplace(row.at("file_name").get<std::string>(), id).second) invalid("duplicate JSON image filename");
     });
     category_admission.complete();
     std::vector<CoconutRecord> result;
     std::unordered_set<std::uint64_t> joined_images;
     std::uint64_t segment_ordinal = 0;
-    constexpr std::array<std::string_view,1> annotation_fields{"annotations"};
-    json_rows(request,annotation_fields,[&](std::string_view,const Json& annotation) {
+    constexpr std::array<std::string_view, 1> annotation_fields{"annotations"};
+    json_rows(request, annotation_fields, [&](std::string_view, const Json& annotation) {
         throw_if_benchmark_cancelled(request.cancellation);
         CoconutRecord record;
         record.source_ordinal = result.size();
@@ -634,9 +724,12 @@ std::vector<CoconutRecord> json_records(const CoconutImportRequest& request) {
         if (!image && request.edition == CoconutEdition::ObjectsValidation) invalid("validation annotation has no image-record join: " + record.file_name);
         if (image) {
             if (!joined_images.insert(unsigned_field(*image, "id")).second) invalid("multiple annotations join one image row: " + record.file_name);
-            join_name(*image, "object365_file_name"); join_name(*image, "object365_name");
-            if (image->contains("file_name") && std::filesystem::path(image->at("file_name").get<std::string>()).filename().string().starts_with("objects365_")) join_name(*image, "file_name");
-            record.width = dimension(*image, "width", request.limits); record.height = dimension(*image, "height", request.limits);
+            join_name(*image, "object365_file_name");
+            join_name(*image, "object365_name");
+            if (image->contains("file_name") && std::filesystem::path(image->at("file_name").get<std::string>()).filename().string().starts_with("objects365_"))
+                join_name(*image, "file_name");
+            record.width = dimension(*image, "width", request.limits);
+            record.height = dimension(*image, "height", request.limits);
             if (!annotation.contains("image_id")) record.image_id = unsigned_field(*image, "id");
         }
         if (record.physical_stem.empty()) invalid("unresolved offered JSON annotation: " + record.file_name);
@@ -659,9 +752,11 @@ std::vector<CoconutRecord> xlarge_records(const CoconutImportRequest& request) {
     while (archive.next(request.cancellation)) {
         if (!archive.regular() || !archive.member().starts_with(prefix) || !archive.member().ends_with(".json")) continue;
         const auto name = objects_name(archive.member());
-        if (name.source != CoconutImageNamespace::Objects365V2 || archive.member() != std::string(prefix) + name.stem + ".json") invalid("unsupported XL info member: " + archive.member());
+        if (name.source != CoconutImageNamespace::Objects365V2 || archive.member() != std::string(prefix) + name.stem + ".json")
+            invalid("unsupported XL info member: " + archive.member());
         CoconutRecord record;
-        record.image_id = name.id; record.physical_stem = name.stem;
+        record.image_id = name.id;
+        record.physical_stem = name.stem;
         const auto bytes = archive.read(16U * 1024U * 1024U, request.cancellation);
         segments_from_json(Json::parse(bytes.begin(), bytes.end()), record, request.limits);
         if (!records.emplace(name.stem, std::move(record)).second) invalid("duplicate XL info member: " + archive.member());
@@ -671,15 +766,18 @@ std::vector<CoconutRecord> xlarge_records(const CoconutImportRequest& request) {
     std::uint64_t ordinal = 0;
     for (auto& [name, record] : records) {
         throw_if_benchmark_cancelled(request.cancellation);
-        record.source_ordinal = result.size(); record.first_segment_ordinal = ordinal;
+        record.source_ordinal = result.size();
+        record.first_segment_ordinal = ordinal;
         if (record.segments.size() > UINT64_MAX - ordinal) invalid("segment ordinal overflow");
-        ordinal += record.segments.size(); result.push_back(std::move(record));
+        ordinal += record.segments.size();
+        result.push_back(std::move(record));
     }
     return result;
 }
 void consume_archive(const CoconutImportRequest& request, std::vector<CoconutRecord>& records, Importer& importer) {
-    const std::string prefix = request.edition == CoconutEdition::XLarge ? "coconuts_xlarge/panseg/" :
-        request.edition == CoconutEdition::Large ? "panoptic_object365/" : "panoptic_o365val_v3/";
+    const std::string prefix = request.edition == CoconutEdition::XLarge  ? "coconuts_xlarge/panseg/"
+                               : request.edition == CoconutEdition::Large ? "panoptic_object365/"
+                                                                          : "panoptic_o365val_v3/";
     std::unordered_map<std::string, std::size_t> wanted;
     for (std::size_t i = 0; i < records.size(); ++i) {
         throw_if_benchmark_cancelled(request.cancellation);
@@ -710,7 +808,8 @@ void validate_component(const CoconutComponent& component, Cancellation cancella
     (void)coconut_namespace_name(component.source);
     (void)coconut_release_component(component.edition);
     if (component.input_identity.empty() || component.index.images.size() != component.inventory.size() ||
-        component.index.source != index_source(component.source) || component.index.split != component_split(component.edition, component.source)) invalid("component index/inventory admission mismatch");
+        component.index.source != index_source(component.source) || component.index.split != component_split(component.edition, component.source))
+        invalid("component index/inventory admission mismatch");
     (void)mmltk::common::io::parse_sha256_hex(component.index.annotation_sha256);
     std::unordered_set<std::uint64_t> ordinals;
     for (std::size_t i = 0; i < component.inventory.size(); ++i) {
@@ -719,32 +818,41 @@ void validate_component(const CoconutComponent& component, Cancellation cancella
         validate_physical(image.physical);
         if (image.physical.source != component.source || image.physical.image_id != component.index.images[i].source_image_id ||
             image.physical.shard != component.index.images[i].source_shard || !ordinals.insert(image.source_ordinal).second ||
-            (i && image.physical.image_id <= component.inventory[i - 1].physical.image_id)) invalid("invalid component image inventory");
+            (i && image.physical.image_id <= component.inventory[i - 1].physical.image_id))
+            invalid("invalid component image inventory");
     }
 }
 }  // namespace
 std::string canonical_coconut_archive_member(std::string_view raw) {
     while (raw.starts_with("./")) raw.remove_prefix(2);
-    if (raw.empty() || raw.front() == '/' || raw.find('\\') != std::string_view::npos || raw.find('\0') != std::string_view::npos) invalid("unsafe archive member: " + std::string(raw));
+    if (raw.empty() || raw.front() == '/' || raw.find('\\') != std::string_view::npos || raw.find('\0') != std::string_view::npos)
+        invalid("unsafe archive member: " + std::string(raw));
     std::filesystem::path path(raw);
-    for (const auto& part : path) if (part == "..") invalid("traversing archive member: " + std::string(raw));
+    for (const auto& part : path)
+        if (part == "..") invalid("traversing archive member: " + std::string(raw));
     return path.lexically_normal().generic_string();
 }
 CoconutPhysicalMembership::CoconutPhysicalMembership(std::span<const CoconutPhysicalImage> images, Cancellation cancellation) {
-    std::unordered_map<CoconutImageNamespace,std::size_t> counts;
-    for (const auto& image : images) { throw_if_benchmark_cancelled(cancellation); ++counts[image.source]; }
-    for (const auto& [source,count] : counts) { (void)coconut_namespace_name(source); namespaces_[source].reserve(count); }
+    std::unordered_map<CoconutImageNamespace, std::size_t> counts;
+    for (const auto& image : images) {
+        throw_if_benchmark_cancelled(cancellation);
+        ++counts[image.source];
+    }
+    for (const auto& [source, count] : counts) {
+        (void)coconut_namespace_name(source);
+        namespaces_[source].reserve(count);
+    }
     for (const auto& image : images) {
         throw_if_benchmark_cancelled(cancellation);
         validate_physical(image);
-        if (!namespaces_.at(image.source).emplace(image.image_id,&image).second) invalid("duplicate physical member: " + image.member);
+        if (!namespaces_.at(image.source).emplace(image.image_id, &image).second) invalid("duplicate physical member: " + image.member);
     }
 }
 const CoconutPhysicalImage* CoconutPhysicalMembership::find(CoconutImageNamespace source, std::uint64_t id) const noexcept {
-    const auto space=namespaces_.find(source);
-    if (space==namespaces_.end()) return nullptr;
-    const auto found=space->second.find(id);
-    return found==space->second.end() ? nullptr : found->second;
+    const auto space = namespaces_.find(source);
+    if (space == namespaces_.end()) return nullptr;
+    const auto found = space->second.find(id);
+    return found == space->second.end() ? nullptr : found->second;
 }
 std::vector<CoconutComponent> import_coconut_annotations(const CoconutImportRequest& request) {
     (void)coconut_release_component(request.edition);
@@ -752,7 +860,7 @@ std::vector<CoconutComponent> import_coconut_annotations(const CoconutImportRequ
     if (request.edition == CoconutEdition::Base || request.edition == CoconutEdition::RelabeledValidation) {
         if (request.parquet_shards.empty()) invalid("missing Parquet shards");
         read_coconut_parquet(request.parquet_shards, request.limits, request.cancellation,
-            [&](const CoconutRecord& record, std::span<const std::uint8_t> png) { importer.consume(record, png); });
+                             [&](const CoconutRecord& record, std::span<const std::uint8_t> png) { importer.consume(record, png); });
     } else {
         auto records = request.edition == CoconutEdition::XLarge ? xlarge_records(request) : json_records(request);
         consume_archive(request, records, importer);
@@ -762,47 +870,60 @@ std::vector<CoconutComponent> import_coconut_annotations(const CoconutImportRequ
 std::uint64_t reconcile_coconut_extensions(std::vector<CoconutComponent>& components, Cancellation cancellation) {
     throw_if_benchmark_cancelled(cancellation);
     std::unordered_set<PhysicalKey, PhysicalKeyHash> large, xlarge;
-    for (const auto& component : components) if (component.edition == CoconutEdition::Large) {
-        for (const auto& image : component.inventory) {
-            throw_if_benchmark_cancelled(cancellation);
-            if (!large.insert(physical_key(image.physical.source, image.physical.image_id)).second) invalid("duplicate Large physical image");
+    for (const auto& component : components)
+        if (component.edition == CoconutEdition::Large) {
+            for (const auto& image : component.inventory) {
+                throw_if_benchmark_cancelled(cancellation);
+                if (!large.insert(physical_key(image.physical.source, image.physical.image_id)).second) invalid("duplicate Large physical image");
+            }
         }
-    }
     std::uint64_t removed = 0;
-    for (auto& component : components) if (component.edition == CoconutEdition::XLarge) {
-        std::vector<std::size_t> retained;
-        for (std::size_t i = 0; i < component.inventory.size(); ++i) {
-            throw_if_benchmark_cancelled(cancellation);
-            const auto& image = component.inventory[i].physical;
-            const auto key = physical_key(image.source, image.image_id);
-            if (!xlarge.insert(key).second) invalid("duplicate XL physical image");
-            if (large.contains(key)) ++removed; else retained.push_back(i);
+    for (auto& component : components)
+        if (component.edition == CoconutEdition::XLarge) {
+            std::vector<std::size_t> retained;
+            for (std::size_t i = 0; i < component.inventory.size(); ++i) {
+                throw_if_benchmark_cancelled(cancellation);
+                const auto& image = component.inventory[i].physical;
+                const auto key = physical_key(image.source, image.image_id);
+                if (!xlarge.insert(key).second) invalid("duplicate XL physical image");
+                if (large.contains(key))
+                    ++removed;
+                else
+                    retained.push_back(i);
+            }
+            if (retained.size() != component.inventory.size()) retain_images(component, retained, cancellation);
         }
-        if (retained.size() != component.inventory.size()) retain_images(component, retained,cancellation);
-    }
     throw_if_benchmark_cancelled(cancellation);
     return removed;
 }
 std::vector<CoconutPhysicalImage> coconut_image_archive_inventory(const std::filesystem::path& archive_path, const std::filesystem::path& cache_path,
-    CoconutImageNamespace source, std::uint16_t shard, std::string archive_identity, Cancellation cancellation) {
+                                                                  CoconutImageNamespace source, std::uint16_t shard, std::string archive_identity,
+                                                                  Cancellation cancellation) {
     if (archive_identity.empty()) invalid("archive inventory needs a physical identity");
     (void)coconut_namespace_name(source);
     throw_if_benchmark_cancelled(cancellation);
     InventoryHeader expected;
-    expected.source=source; expected.shard=shard; expected.input_identity=archive_identity;
+    expected.source = source;
+    expected.shard = shard;
+    expected.input_identity = archive_identity;
     if (!cache_path.empty() && std::filesystem::is_regular_file(cache_path)) {
         try {
-            InventoryInput input(cache_path,cancellation);
-            InventoryHeader header; input.value(header); validate_inventory_header(header,expected);
-            if (header.count>input.maximum_records()) invalid("inventory count exceeds file extent");
+            InventoryInput input(cache_path, cancellation);
+            InventoryHeader header;
+            input.value(header);
+            validate_inventory_header(header, expected);
+            if (header.count > input.maximum_records()) invalid("inventory count exceeds file extent");
             throw_if_benchmark_cancelled(cancellation);
             std::vector<CoconutPhysicalImage> result;
-            result.reserve(mmltk::common::math::checked_cast<std::size_t>(header.count,"physical inventory count overflow"));
-            for (std::uint64_t i=0; i<header.count; ++i) {
+            result.reserve(mmltk::common::math::checked_cast<std::size_t>(header.count, "physical inventory count overflow"));
+            for (std::uint64_t i = 0; i < header.count; ++i) {
                 throw_if_benchmark_cancelled(cancellation);
-                CoconutPhysicalImage image; input.value(image); validate_physical(image);
-                if (image.source!=source || image.shard!=shard || image.archive_identity!=archive_identity ||
-                    (!result.empty() && image.image_id<=result.back().image_id)) invalid("invalid cached archive inventory");
+                CoconutPhysicalImage image;
+                input.value(image);
+                validate_physical(image);
+                if (image.source != source || image.shard != shard || image.archive_identity != archive_identity ||
+                    (!result.empty() && image.image_id <= result.back().image_id))
+                    invalid("invalid cached archive inventory");
                 result.push_back(std::move(image));
             }
             (void)input.finish();
@@ -814,68 +935,84 @@ std::vector<CoconutPhysicalImage> coconut_image_archive_inventory(const std::fil
     std::vector<CoconutPhysicalImage> result;
     while (archive.next(cancellation)) {
         if (!archive.regular() || !archive.member().ends_with(".jpg")) continue;
-        CoconutPhysicalImage image{source,0,shard,archive.member(),archive_identity};
-        if (source==CoconutImageNamespace::Objects365V1 || source==CoconutImageNamespace::Objects365V2) {
-            const auto name=objects_name(image.member);
-            if (name.source!=source) invalid("physical archive namespace mismatch: "+image.member);
-            image.image_id=name.id;
-        } else image.image_id=coco_name(image.member);
+        CoconutPhysicalImage image{source, 0, shard, archive.member(), archive_identity};
+        if (source == CoconutImageNamespace::Objects365V1 || source == CoconutImageNamespace::Objects365V2) {
+            const auto name = objects_name(image.member);
+            if (name.source != source) invalid("physical archive namespace mismatch: " + image.member);
+            image.image_id = name.id;
+        } else
+            image.image_id = coco_name(image.member);
         validate_physical(image);
         result.push_back(std::move(image));
     }
     throw_if_benchmark_cancelled(cancellation);
-    std::ranges::sort(result,{},&CoconutPhysicalImage::image_id);
+    std::ranges::sort(result, {}, &CoconutPhysicalImage::image_id);
     throw_if_benchmark_cancelled(cancellation);
-    for (std::size_t i=0; i<result.size(); ++i) {
+    for (std::size_t i = 0; i < result.size(); ++i) {
         throw_if_benchmark_cancelled(cancellation);
-        if (i && result[i].image_id==result[i-1].image_id) invalid("duplicate physical archive image ID");
+        if (i && result[i].image_id == result[i - 1].image_id) invalid("duplicate physical archive image ID");
     }
-    expected.count=result.size();
-    if (!cache_path.empty()) (void)store_inventory(cache_path,expected,std::span<const CoconutPhysicalImage>(result),{},cancellation);
+    expected.count = result.size();
+    if (!cache_path.empty()) (void)store_inventory(cache_path, expected, std::span<const CoconutPhysicalImage>(result), {}, cancellation);
     throw_if_benchmark_cancelled(cancellation);
     return result;
 }
 void store_coconut_component(const std::filesystem::path& index_path, const CoconutComponent& component, Cancellation cancellation) {
-    validate_component(component,cancellation);
-    const auto identity=store_inventory(index_path.string()+".inventory",component_header(component),std::span(component.inventory),component.index.annotation_sha256,cancellation);
+    validate_component(component, cancellation);
+    const auto identity = store_inventory(index_path.string() + ".inventory", component_header(component), std::span(component.inventory),
+                                          component.index.annotation_sha256, cancellation);
     throw_if_benchmark_cancelled(cancellation);
-    store_normalized_annotation_index(index_path,component.index,cancellation);
+    store_normalized_annotation_index(index_path, component.index, cancellation);
     // The existing index completion jointly admits the binary inventory. A base
     // completion alone cannot be admitted if publication is interrupted here.
-    const auto manifest_path=std::filesystem::path(index_path.string()+".complete.json");
-    auto manifest=read_json_file(manifest_path);
-    manifest["coconut"]={{"edition",component.edition},{"source",component.source},{"input_identity",component.input_identity},
-        {"normalization",kCoconutNormalizationRevision},{"inventory_identity",identity},{"inventory_count",component.inventory.size()}};
+    const auto manifest_path = std::filesystem::path(index_path.string() + ".complete.json");
+    auto manifest = read_json_file(manifest_path);
+    manifest["coconut"] = {{"edition", component.edition},
+                           {"source", component.source},
+                           {"input_identity", component.input_identity},
+                           {"normalization", kCoconutNormalizationRevision},
+                           {"inventory_identity", identity},
+                           {"inventory_count", component.inventory.size()}};
     throw_if_benchmark_cancelled(cancellation);
-    write_json_atomically(manifest_path,manifest,cancellation);
+    write_json_atomically(manifest_path, manifest, cancellation);
 }
-std::optional<CoconutComponent> load_coconut_component(const std::filesystem::path& index_path,CoconutEdition edition,CoconutImageNamespace source,
-    std::string_view input_identity,Cancellation cancellation) {
+std::optional<CoconutComponent> load_coconut_component(const std::filesystem::path& index_path, CoconutEdition edition, CoconutImageNamespace source,
+                                                       std::string_view input_identity, Cancellation cancellation) {
     throw_if_benchmark_cancelled(cancellation);
     try {
-        const auto manifest=read_json_file(index_path.string()+".complete.json");
-        const auto& facts=manifest.at("coconut");
-        if (facts.at("edition")!=edition || facts.at("source")!=source || facts.at("input_identity")!=input_identity || facts.at("normalization")!=kCoconutNormalizationRevision) return std::nullopt;
+        const auto manifest = read_json_file(index_path.string() + ".complete.json");
+        const auto& facts = manifest.at("coconut");
+        if (facts.at("edition") != edition || facts.at("source") != source || facts.at("input_identity") != input_identity ||
+            facts.at("normalization") != kCoconutNormalizationRevision)
+            return std::nullopt;
         CoconutComponent component;
-        component.edition=edition; component.source=source; component.input_identity=input_identity;
-        InventoryInput input(index_path.string()+".inventory",cancellation);
-        InventoryHeader header; input.value(header); validate_inventory_header(header,component_header(component));
-        if (header.count>input.maximum_records() || facts.at("inventory_count")!=header.count) invalid("invalid component inventory count");
+        component.edition = edition;
+        component.source = source;
+        component.input_identity = input_identity;
+        InventoryInput input(index_path.string() + ".inventory", cancellation);
+        InventoryHeader header;
+        input.value(header);
+        validate_inventory_header(header, component_header(component));
+        if (header.count > input.maximum_records() || facts.at("inventory_count") != header.count) invalid("invalid component inventory count");
         throw_if_benchmark_cancelled(cancellation);
-        component.inventory.reserve(mmltk::common::math::checked_cast<std::size_t>(header.count,"component inventory count overflow"));
-        for (std::uint64_t i=0; i<header.count; ++i) {
+        component.inventory.reserve(mmltk::common::math::checked_cast<std::size_t>(header.count, "component inventory count overflow"));
+        for (std::uint64_t i = 0; i < header.count; ++i) {
             throw_if_benchmark_cancelled(cancellation);
-            CoconutInventoryImage image; input.value(image);
+            CoconutInventoryImage image;
+            input.value(image);
             component.inventory.push_back(std::move(image));
         }
-        const auto identity=input.finish();
-        if (facts.at("inventory_identity")!=identity) invalid("component inventory completion mismatch");
-        auto index=load_normalized_annotation_index(index_path,index_source(source),component_split(edition,source),identity,cancellation);
+        const auto identity = input.finish();
+        if (facts.at("inventory_identity") != identity) invalid("component inventory completion mismatch");
+        auto index = load_normalized_annotation_index(index_path, index_source(source), component_split(edition, source), identity, cancellation);
         if (!index) return std::nullopt;
-        component.index=std::move(*index);
-        validate_component(component,cancellation);
+        component.index = std::move(*index);
+        validate_component(component, cancellation);
         throw_if_benchmark_cancelled(cancellation);
         return component;
-    } catch (const std::exception&) { throw_if_benchmark_cancelled(cancellation); return std::nullopt; }
+    } catch (const std::exception&) {
+        throw_if_benchmark_cancelled(cancellation);
+        return std::nullopt;
+    }
 }
 }  // namespace mmltk::backend::data::benchmark_internal

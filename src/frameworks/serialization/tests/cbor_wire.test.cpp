@@ -940,11 +940,17 @@ TEST_CASE("scalar allocation admission reports exact kind size path and cursor",
 }
 TEST_CASE("UTF8 scalar limits preserve literal text across every segment split", "[frameworks][serialization]") {
     for (const std::string_view text : {
-             std::string_view{}, std::string_view{"a\0b", 3U}, std::string_view{"\x01\x7f"},
-             std::string_view{"\xc2\x80"}, std::string_view{"\xdf\xbf"},
-             std::string_view{"\xe0\xa0\x80"}, std::string_view{"\xed\x9f\xbf"},
-             std::string_view{"\xee\x80\x80"}, std::string_view{"\xef\xbf\xbf"},
-             std::string_view{"\xf0\x90\x80\x80"}, std::string_view{"\xf4\x8f\xbf\xbf"},
+             std::string_view{},
+             std::string_view{"a\0b", 3U},
+             std::string_view{"\x01\x7f"},
+             std::string_view{"\xc2\x80"},
+             std::string_view{"\xdf\xbf"},
+             std::string_view{"\xe0\xa0\x80"},
+             std::string_view{"\xed\x9f\xbf"},
+             std::string_view{"\xee\x80\x80"},
+             std::string_view{"\xef\xbf\xbf"},
+             std::string_view{"\xf0\x90\x80\x80"},
+             std::string_view{"\xf4\x8f\xbf\xbf"},
          }) {
         wire::ByteBuffer expected{std::byte(0x60U + text.size())};
         for (const unsigned char byte : text) expected.push_back(std::byte{byte});
@@ -956,8 +962,10 @@ TEST_CASE("UTF8 scalar limits preserve literal text across every segment split",
             const auto decoded = reader.read_flat();
             REQUIRE(decoded.has_value());
             CHECK(decoded->visit([&](const auto& value) {
-                if constexpr (std::is_same_v<std::remove_cvref_t<decltype(value)>, std::string>) return value == text;
-                else return false;
+                if constexpr (std::is_same_v<std::remove_cvref_t<decltype(value)>, std::string>)
+                    return value == text;
+                else
+                    return false;
             }));
             CHECK(reader.offset() == expected.size());
         }
@@ -965,14 +973,25 @@ TEST_CASE("UTF8 scalar limits preserve literal text across every segment split",
 }
 TEST_CASE("malformed UTF8 categories consume complete segmented payloads before failure", "[frameworks][serialization]") {
     for (const std::string_view malformed : {
-             "\x80", "\xbf",                              // stray continuations
-             "\xc0\x80", "\xc1\xbf",                    // overlong two-byte forms
-             "\xe0\x80\x80", "\xe0\x9f\xbf",          // overlong three-byte forms
-             "\xf0\x80\x80\x80", "\xf0\x8f\xbf\xbf", // overlong four-byte forms
-             "\xed\xa0\x80", "\xed\xbf\xbf",          // surrogate limits
-             "\xf4\x90\x80\x80", "\xf5\x80\x80\x80", "\xff", // out of range
-             "\xc2x", "\xe1\x80x", "\xf1\x80\x80x", // invalid continuations
-             "\xc2", "\xe0\xa0", "\xf0\x90\x80",    // truncated scalars
+             "\x80",
+             "\xbf",  // stray continuations
+             "\xc0\x80",
+             "\xc1\xbf",  // overlong two-byte forms
+             "\xe0\x80\x80",
+             "\xe0\x9f\xbf",  // overlong three-byte forms
+             "\xf0\x80\x80\x80",
+             "\xf0\x8f\xbf\xbf",  // overlong four-byte forms
+             "\xed\xa0\x80",
+             "\xed\xbf\xbf",  // surrogate limits
+             "\xf4\x90\x80\x80",
+             "\xf5\x80\x80\x80",
+             "\xff",  // out of range
+             "\xc2x",
+             "\xe1\x80x",
+             "\xf1\x80\x80x",  // invalid continuations
+             "\xc2",
+             "\xe0\xa0",
+             "\xf0\x90\x80",  // truncated scalars
          }) {
         wire::ByteBuffer encoded{std::byte(0x60U + malformed.size())};
         for (const unsigned char byte : malformed) encoded.push_back(std::byte{byte});

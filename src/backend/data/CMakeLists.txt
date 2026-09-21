@@ -3,14 +3,14 @@ include(MmltkComponent)
 find_package(simdjson 3.13.0 EXACT CONFIG REQUIRED
     PATHS /opt/simdjson/lib/cmake/simdjson
     NO_DEFAULT_PATH)
-find_package(Arrow 25.0.1 EXACT CONFIG REQUIRED
+find_package(Arrow 25.0.1 EXACT CONFIG REQUIRED GLOBAL
     PATHS /opt/arrow/lib/cmake/Arrow NO_DEFAULT_PATH)
-find_package(Parquet 25.0.1 EXACT CONFIG REQUIRED
+find_package(Parquet 25.0.1 EXACT CONFIG REQUIRED GLOBAL
     PATHS /opt/arrow/lib/cmake/Parquet NO_DEFAULT_PATH)
 install(DIRECTORY /opt/arrow/share/licenses/arrow/
     DESTINATION share/mmltk/licenses/arrow)
 find_package(CURL REQUIRED)
-find_package(LibArchive REQUIRED)
+find_package(LibArchive REQUIRED GLOBAL)
 
 find_path(MMLTK_TURBOJPEG_INCLUDE_DIR
     NAMES turbojpeg.h

@@ -28,8 +28,10 @@ TEST_CASE("production dataset factory connects optional tracing through staged o
     const char* environment = std::getenv("MMLTK_BENCHMARK_DATASET_CACHE_ROOT");
     const std::optional<std::string> previous = environment ? std::optional<std::string>{environment} : std::nullopt;
     const mmltk::testsupport::ScopedTestCleanup restore_environment{[&] {
-        if (previous) static_cast<void>(::setenv("MMLTK_BENCHMARK_DATASET_CACHE_ROOT", previous->c_str(), 1));
-        else static_cast<void>(::unsetenv("MMLTK_BENCHMARK_DATASET_CACHE_ROOT"));
+        if (previous)
+            static_cast<void>(::setenv("MMLTK_BENCHMARK_DATASET_CACHE_ROOT", previous->c_str(), 1));
+        else
+            static_cast<void>(::unsetenv("MMLTK_BENCHMARK_DATASET_CACHE_ROOT"));
     }};
     REQUIRE(::setenv("MMLTK_BENCHMARK_DATASET_CACHE_ROOT", cache.c_str(), 1) == 0);
     auto settings = contracts::default_gui_settings_state();

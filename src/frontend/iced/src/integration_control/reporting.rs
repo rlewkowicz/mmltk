@@ -1102,7 +1102,12 @@ mod tests {
                     let expected = enabled && (position < 2 || dataset == Coconut);
                     assert_eq!(
                         record.3,
-                        [4.0, expected as u8 as f64, (position < present_count) as u8 as f64, 73.0],
+                        [
+                            4.0,
+                            expected as u8 as f64,
+                            (position < present_count) as u8 as f64,
+                            73.0
+                        ],
                     );
                 }
             }

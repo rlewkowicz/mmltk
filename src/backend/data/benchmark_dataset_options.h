@@ -14,7 +14,6 @@ struct BenchmarkDatasetSelection {
 };
 MMLTK_REFLECT_FIELDS(BenchmarkDatasetSelection)
 [[nodiscard]] constexpr bool valid_benchmark_selection(BenchmarkDatasetSelection selection) noexcept {
-    return mmltk::frameworks::reflection::enum_contains(selection.dataset) &&
-           mmltk::frameworks::reflection::enum_contains(selection.validation);
+    return mmltk::frameworks::reflection::enum_contains(selection.dataset) && mmltk::frameworks::reflection::enum_contains(selection.validation);
 }
 }  // namespace mmltk::backend::data

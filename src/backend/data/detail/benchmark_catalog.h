@@ -31,11 +31,12 @@ struct CategoryLookup {
 };
 [[nodiscard]] CategoryLookup make_numeric_lookup(std::span<const NumericCategoryMapping> mappings);
 class NumericCategoryAdmission final {
- public:
+   public:
     explicit NumericCategoryAdmission(const CategoryLookup& lookup) : lookup_(lookup) {}
     void observe(std::optional<std::uint32_t> id, std::optional<std::string_view> name);
     void complete() const;
- private:
+
+   private:
     const CategoryLookup& lookup_;
     std::unordered_set<std::uint32_t> matched_;
 };

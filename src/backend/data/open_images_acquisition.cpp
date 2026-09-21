@@ -550,8 +550,11 @@ void complete_open_images_group(const std::filesystem::path& image_root, const s
             throw_if_benchmark_cancelled(cancel_requested);
             if (trace && inspected != 0U && inspected % 128U == 0U) {
                 trace_benchmark_event(trace, "benchmark.images.cache_scan", [&] {
-                    return nlohmann::json{{"source", "open-images"}, {"shard", shard}, {"inspected_images", inspected},
-                                          {"reused_images", group_available.size()}, {"total_images", group.size()}};
+                    return nlohmann::json{{"source", "open-images"},
+                                          {"shard", shard},
+                                          {"inspected_images", inspected},
+                                          {"reused_images", group_available.size()},
+                                          {"total_images", group.size()}};
                 });
             }
             if (trace) { ++inspected; }
@@ -580,8 +583,11 @@ void complete_open_images_group(const std::filesystem::path& image_root, const s
         }
         progress->source_images(BenchmarkDatasetSource::kOpenImagesV7, completed_images, ids.size());
         trace_benchmark_event(trace, "benchmark.images.cache_reuse", [&] {
-            return nlohmann::json{{"source", "open-images"}, {"shard", shard}, {"inspected_images", group.size()},
-                                  {"reused_images", group_available.size()}, {"reused_bytes", cached_image_bytes - group_bytes_begin}};
+            return nlohmann::json{{"source", "open-images"},
+                                  {"shard", shard},
+                                  {"inspected_images", group.size()},
+                                  {"reused_images", group_available.size()},
+                                  {"reused_bytes", cached_image_bytes - group_bytes_begin}};
         });
         const std::size_t quarantine_begin = quarantined->size();
         if (!missing_downloads.empty()) {

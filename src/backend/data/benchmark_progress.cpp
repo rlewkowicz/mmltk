@@ -5,14 +5,16 @@
 #include <utility>
 namespace mmltk::backend::data::benchmark_internal {
 using Clock = std::chrono::steady_clock;
-ProgressReporter::ProgressReporter(BenchmarkProgressCallback callback, const BenchmarkTraceSink& trace, std::span<const BenchmarkDatasetSource> sources) : callback_(std::move(callback)), trace_(&trace) {
+ProgressReporter::ProgressReporter(BenchmarkProgressCallback callback, const BenchmarkTraceSink& trace, std::span<const BenchmarkDatasetSource> sources)
+    : callback_(std::move(callback)), trace_(&trace) {
     if (!callback_) { return; }
     const auto source_progress = [](const BenchmarkDatasetSource source) {
         BenchmarkSourceProgress progress;
         progress.source = source;
         return progress;
     };
-    constexpr BenchmarkDatasetSource custom_sources[]{BenchmarkDatasetSource::kCoco2017, BenchmarkDatasetSource::kObjects365V2, BenchmarkDatasetSource::kOpenImagesV7};
+    constexpr BenchmarkDatasetSource custom_sources[]{BenchmarkDatasetSource::kCoco2017, BenchmarkDatasetSource::kObjects365V2,
+                                                      BenchmarkDatasetSource::kOpenImagesV7};
     if (sources.empty()) sources = custom_sources;
     for (const auto source : sources) state_.sources.push_back(source_progress(source));
 }
@@ -156,8 +158,7 @@ void ProgressReporter::trace_activity(const std::optional<BenchmarkDatasetSource
         return fields;
     });
 }
-void ProgressReporter::source_transfer(const DownloadProgress& update, const std::uint64_t completed,
-                                       const std::uint64_t total) {
+void ProgressReporter::source_transfer(const DownloadProgress& update, const std::uint64_t completed, const std::uint64_t total) {
     if (!callback_) { return; }
     const std::lock_guard lock(mutex_);
     const auto source = update.source;
@@ -168,8 +169,8 @@ void ProgressReporter::source_transfer(const DownloadProgress& update, const std
     } else {
         switch (update.phase) {
             case DownloadProgressPhase::kDownloading:
-                operation = update.redownload ? (update.resumed ? "Resuming re-download of " : "Re-downloading ")
-                                              : (update.resumed ? "Resuming " : "Downloading ");
+                operation =
+                    update.redownload ? (update.resumed ? "Resuming re-download of " : "Re-downloading ") : (update.resumed ? "Resuming " : "Downloading ");
                 break;
             case DownloadProgressPhase::kVerifyingCachedArtifact: operation = "Verifying cached "; break;
             case DownloadProgressPhase::kVerifyingDownloadedArtifact: operation = "Verifying downloaded "; break;

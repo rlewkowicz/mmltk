@@ -42,13 +42,13 @@ struct InventoryHeader {
 MMLTK_REFLECT_FIELDS(InventoryHeader)
 // CNUTIVN1 is a declaration-order little-endian format, not a native struct dump.
 // These fixed expectations guard version 1; they do not drive any codec.
-static_assert(CHAR_BIT == 8 && sizeof(bool) == 1 && sizeof(std::uint8_t) == 1 &&
-              sizeof(std::uint16_t) == 2 && sizeof(std::uint32_t) == 4 && sizeof(std::uint64_t) == 8);
+static_assert(CHAR_BIT == 8 && sizeof(bool) == 1 && sizeof(std::uint8_t) == 1 && sizeof(std::uint16_t) == 2 && sizeof(std::uint32_t) == 4 &&
+              sizeof(std::uint64_t) == 8);
 static_assert(std::is_same_v<std::underlying_type_t<CoconutEdition>, std::uint8_t>);
 static_assert(std::is_same_v<std::underlying_type_t<CoconutImageNamespace>, std::uint8_t>);
 static_assert([] consteval {
-    const auto matches = []<class Record, class... Types>(
-        std::type_identity<std::tuple<Types...>>, const std::array<std::string_view, sizeof...(Types)>& names) consteval {
+    const auto matches = []<class Record, class... Types>(std::type_identity<std::tuple<Types...>>,
+                                                          const std::array<std::string_view, sizeof...(Types)>& names) consteval {
         constexpr const auto& fields = mmltk::frameworks::reflection::field_declarations<Record>();
         using Fields = std::remove_cvref_t<decltype(fields)>;
         static_assert(fields.size() == sizeof...(Types));
@@ -63,12 +63,11 @@ static_assert([] consteval {
     return matches.template operator()<CoconutPhysicalImage>(
                std::type_identity<std::tuple<CoconutImageNamespace, std::uint64_t, std::uint16_t, std::string, std::string>>{},
                {"source", "image_id", "shard", "member", "archive_identity"}) &&
-           matches.template operator()<CoconutInventoryImage>(
-               std::type_identity<std::tuple<CoconutPhysicalImage, std::uint64_t, std::uint64_t>>{},
-               {"physical", "release_image_id", "source_ordinal"}) &&
+           matches.template operator()<CoconutInventoryImage>(std::type_identity<std::tuple<CoconutPhysicalImage, std::uint64_t, std::uint64_t>>{},
+                                                              {"physical", "release_image_id", "source_ordinal"}) &&
            matches.template operator()<InventoryHeader>(
-               std::type_identity<std::tuple<std::uint64_t, std::uint32_t, std::uint32_t, std::string, std::string,
-                                            CoconutEdition, CoconutImageNamespace, std::uint16_t, bool, std::uint64_t>>{},
+               std::type_identity<std::tuple<std::uint64_t, std::uint32_t, std::uint32_t, std::string, std::string, CoconutEdition, CoconutImageNamespace,
+                                             std::uint16_t, bool, std::uint64_t>>{},
                {"magic", "version", "cache_schema", "normalization", "input_identity", "edition", "source", "shard", "component", "count"});
 }());
 }  // namespace mmltk::backend::data::benchmark_internal

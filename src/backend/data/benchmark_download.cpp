@@ -46,16 +46,21 @@ using mmltk::common::math::checked_cast;
 using mmltk::common::types::trim_http_field_value;
 namespace {
 using Clock = std::chrono::steady_clock;
-void trace_transfer_progress(const BenchmarkTraceSink& trace, const DownloadRequest& request, const std::uint64_t completed,
-                             const std::uint64_t total, const std::uint32_t attempt, const bool resumed,
-                             const std::uint64_t retained, const std::uint64_t durable, const bool redownload) {
+void trace_transfer_progress(const BenchmarkTraceSink& trace, const DownloadRequest& request, const std::uint64_t completed, const std::uint64_t total,
+                             const std::uint32_t attempt, const bool resumed, const std::uint64_t retained, const std::uint64_t durable,
+                             const bool redownload) {
     trace_benchmark_event(trace, "benchmark.download.progress", [&] {
-        return nlohmann::json{{"artifact", request.artifact_id}, {"completed_bytes", completed}, {"total_bytes", total},
-                              {"attempt", attempt}, {"resumed", resumed}, {"cache_hit", false},
-                              {"retained_bytes", retained}, {"durable_bytes", durable}, {"redownload", redownload}};
+        return nlohmann::json{{"artifact", request.artifact_id},
+                              {"completed_bytes", completed},
+                              {"total_bytes", total},
+                              {"attempt", attempt},
+                              {"resumed", resumed},
+                              {"cache_hit", false},
+                              {"retained_bytes", retained},
+                              {"durable_bytes", durable},
+                              {"redownload", redownload}};
     });
 }
-
 class CurlGlobal {
    public:
     static void initialize() { ensure_curl_global_initialized("cannot initialize libcurl: "); }
@@ -281,7 +286,11 @@ struct Transfer {
     curl_off_t last_reported_download_now = -1;
     Transfer(const DownloadRequest& request_value, DownloadProgressSink progress_value, BenchmarkTraceSink trace_value,
              mmltk::common::concurrency::CancellationObservation cancel, const std::uint32_t attempt_value, const bool redownload_value)
-        : request(request_value), progress(std::move(progress_value)), trace(std::move(trace_value)), cancel_requested(cancel), attempt(attempt_value),
+        : request(request_value),
+          progress(std::move(progress_value)),
+          trace(std::move(trace_value)),
+          cancel_requested(cancel),
+          attempt(attempt_value),
           redownload(request_value.redownload || redownload_value) {
         prepare_partial();
         prepare_easy();
@@ -456,8 +465,8 @@ struct Transfer {
         const std::uint64_t retained = response_restarted ? 0U : resume_offset;
         const bool retained_resume = resumed && !response_restarted;
         if (progress) {
-            progress(DownloadProgress{request.artifact_id, completed, total, attempt, retained_resume, false,
-                                      DownloadProgressPhase::kDownloading, retained, redownload, request.source});
+            progress(DownloadProgress{request.artifact_id, completed, total, attempt, retained_resume, false, DownloadProgressPhase::kDownloading, retained,
+                                      redownload, request.source});
         }
         trace_transfer_progress(trace, request, completed, total, attempt, retained_resume, retained, durable, redownload);
     }
@@ -625,9 +634,7 @@ class SegmentedDownloadState {
         active_attempt_ = std::max(active_attempt_, attempt);
         if (attempt > 1U) {
             retained_bytes_ = 0U;
-            for (const auto& segment : segments_) {
-                retained_bytes_ = checked_u64_add(retained_bytes_, segment.completed, "segmented retained byte overflow");
-            }
+            for (const auto& segment : segments_) { retained_bytes_ = checked_u64_add(retained_bytes_, segment.completed, "segmented retained byte overflow"); }
         }
         emit_progress_locked(true);
     }
@@ -743,7 +750,8 @@ class SegmentedDownloadState {
                 progress_(DownloadProgress{request_.artifact_id, completed, request_.expected_size, attempts, retained_bytes_ != 0U, false,
                                            DownloadProgressPhase::kDownloading, retained_bytes_, request_.redownload, request_.source});
             }
-            trace_transfer_progress(trace_, request_, completed, request_.expected_size, attempts, retained_bytes_ != 0U, retained_bytes_, durable, request_.redownload);
+            trace_transfer_progress(trace_, request_, completed, request_.expected_size, attempts, retained_bytes_ != 0U, retained_bytes_, durable,
+                                    request_.redownload);
         }
     }
     const DownloadRequest& request_;
@@ -955,9 +963,14 @@ struct SegmentTransfer {
     std::filesystem::remove(partial_metadata_path(request), remove_error);
     if (remove_error) { throw std::filesystem::filesystem_error("cannot remove segmented download metadata", partial_metadata_path(request), remove_error); }
     trace_benchmark_event(trace, "benchmark.download.segmented_complete", [&] {
-        return nlohmann::json{{"artifact", request.artifact_id}, {"bytes", request.expected_size}, {"identity", identity_digest},
-                              {"segments", segment_count}, {"attempts", attempts}, {"resumed", state.retained_bytes() != 0U},
-                              {"retained_bytes", state.retained_bytes()}, {"redownload", request.redownload}};
+        return nlohmann::json{{"artifact", request.artifact_id},
+                              {"bytes", request.expected_size},
+                              {"identity", identity_digest},
+                              {"segments", segment_count},
+                              {"attempts", attempts},
+                              {"resumed", state.retained_bytes() != 0U},
+                              {"retained_bytes", state.retained_bytes()},
+                              {"redownload", request.redownload}};
     });
     return DownloadResult{
         request.destination, request.expected_size, identity_digest, {}, identity.etag, identity.last_modified, attempts, state.resumed(), false,
@@ -991,9 +1004,11 @@ struct SegmentTransfer {
     std::filesystem::remove(partial_metadata_path(request), ignored);
     transfer.emit_progress(size, size, size);
     trace_benchmark_event(transfer.trace, "benchmark.download.complete", [&] {
-        return nlohmann::json{
-            {"artifact", request.artifact_id}, {"bytes", size}, {"attempt", transfer.attempt}, {"resumed", transfer.resumed && !transfer.response_restarted},
-            {"redownload", transfer.redownload}};
+        return nlohmann::json{{"artifact", request.artifact_id},
+                              {"bytes", size},
+                              {"attempt", transfer.attempt},
+                              {"resumed", transfer.resumed && !transfer.response_restarted},
+                              {"redownload", transfer.redownload}};
     });
     return DownloadResult{
         request.destination,
@@ -1083,9 +1098,11 @@ std::vector<DownloadResult> download_artifacts(const std::vector<DownloadRequest
             if (cleanup_error) {
                 throw std::filesystem::filesystem_error("cannot reset unsupported segmented metadata", partial_metadata_path(requests.front()), cleanup_error);
             }
-            trace_benchmark_event(trace, "benchmark.download.segmented_fallback",
-                                  [&] { return nlohmann::json{{"artifact", requests.front().artifact_id}, {"reason", error.what()},
-                                                        {"redownload", requests.front().redownload || pending.front().redownload}}; });
+            trace_benchmark_event(trace, "benchmark.download.segmented_fallback", [&] {
+                return nlohmann::json{{"artifact", requests.front().artifact_id},
+                                      {"reason", error.what()},
+                                      {"redownload", requests.front().redownload || pending.front().redownload}};
+            });
         }
     }
     CurlGlobal::initialize();

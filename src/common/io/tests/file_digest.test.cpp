@@ -27,11 +27,14 @@ TEST_CASE("File digest shares MD5 and SHA256 traversal with stable admission", "
 }
 TEST_CASE("Incremental SHA256 preserves chunk boundaries and sealed finalization", "[digest]") {
     io::Sha256Hasher hash;
-    const std::array<std::uint8_t,3> bytes{'a','b','c'};
-    hash.Update({}); hash.Update(std::span(bytes).first(1)); hash.Update(std::span(bytes).subspan(1));
-    CHECK(io::sha256_hex(hash.Finish())=="ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
-    CHECK_THROWS_AS(hash.Finish(),std::logic_error); CHECK_THROWS_AS(hash.Update(bytes),std::logic_error);
+    const std::array<std::uint8_t, 3> bytes{'a', 'b', 'c'};
+    hash.Update({});
+    hash.Update(std::span(bytes).first(1));
+    hash.Update(std::span(bytes).subspan(1));
+    CHECK(io::sha256_hex(hash.Finish()) == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+    CHECK_THROWS_AS(hash.Finish(), std::logic_error);
+    CHECK_THROWS_AS(hash.Update(bytes), std::logic_error);
     io::Sha256Hasher empty;
-    CHECK(io::sha256_hex(empty.Finish())=="e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
-    CHECK(io::sha256_bytes(bytes)==io::parse_sha256_hex("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"));
+    CHECK(io::sha256_hex(empty.Finish()) == "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+    CHECK(io::sha256_bytes(bytes) == io::parse_sha256_hex("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"));
 }

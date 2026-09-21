@@ -28,30 +28,38 @@ TEST_CASE("benchmark radio audit requires every real choice, current visibility 
     const bool baseline_enabled = GENERATE(false, true);
     const unsigned baseline_dataset = GENERATE(0U, 1U);
     const unsigned baseline_validation = GENERATE(0U, 1U, 2U);
+    constexpr const char* benchmark_override = "train.dataset.benchmark_override";
     BrowserAudit audit;
     const auto record = [&](const char* event, const std::string& control, const char* detail, std::array<double, 4> values) {
-        audit.consume({{"event", event}, {"control", control}, {"detail", detail},
-            {"a", values[0]}, {"b", values[1]}, {"c", values[2]}, {"d", values[3]}});
+        audit.consume({{"event", event}, {"control", control}, {"detail", detail}, {"a", values[0]}, {"b", values[1]}, {"c", values[2]}, {"d", values[3]}});
     };
-    record("integration.benchmark_baseline", BrowserAudit::BENCHMARK_OVERRIDE, "native-settled",
-        {baseline_enabled ? 1.0 : 0.0, double(baseline_dataset), double(baseline_validation), 10.0});
-    constexpr std::array controls{"train.dataset.benchmark.custom", "train.dataset.benchmark.coconut",
-        "train.dataset.validation.coconut", "train.dataset.validation.stock", "train.dataset.validation.coconut_stock"};
-    struct Step { const char* control; unsigned dataset; unsigned validation; bool enabled; };
-    const std::array sequence{
-        Step{BrowserAudit::BENCHMARK_OVERRIDE, baseline_dataset, baseline_validation, true},
-        Step{controls[1], 1U, baseline_validation, true}, Step{controls[3], 1U, 1U, true},
-        Step{controls[4], 1U, 2U, true}, Step{controls[2], 1U, 0U, true},
-        Step{controls[0], 0U, 0U, true}, Step{controls[1], 1U, 0U, true},
-        Step{"train.dataset.browse", 1U, 0U, true},
-        Step{controls[2U + baseline_validation], 1U, baseline_validation, true},
-        Step{controls[baseline_dataset], baseline_dataset, baseline_validation, true},
-        Step{BrowserAudit::BENCHMARK_OVERRIDE, baseline_dataset, baseline_validation, baseline_enabled},
-        Step{BrowserAudit::BENCHMARK_OVERRIDE, baseline_dataset, baseline_validation, false}};
+    record("integration.benchmark_baseline", benchmark_override, "native-settled",
+           {baseline_enabled ? 1.0 : 0.0, double(baseline_dataset), double(baseline_validation), 10.0});
+    constexpr std::array controls{"train.dataset.benchmark.custom", "train.dataset.benchmark.coconut", "train.dataset.validation.coconut",
+                                  "train.dataset.validation.stock", "train.dataset.validation.coconut_stock"};
+    struct Step {
+        const char* control;
+        unsigned dataset;
+        unsigned validation;
+        bool enabled;
+    };
+    const std::array sequence{Step{benchmark_override, baseline_dataset, baseline_validation, true},
+                              Step{controls[1], 1U, baseline_validation, true},
+                              Step{controls[3], 1U, 1U, true},
+                              Step{controls[4], 1U, 2U, true},
+                              Step{controls[2], 1U, 0U, true},
+                              Step{controls[0], 0U, 0U, true},
+                              Step{controls[1], 1U, 0U, true},
+                              Step{"train.dataset.browse", 1U, 0U, true},
+                              Step{controls[2U + baseline_validation], 1U, baseline_validation, true},
+                              Step{controls[baseline_dataset], baseline_dataset, baseline_validation, true},
+                              Step{benchmark_override, baseline_dataset, baseline_validation, baseline_enabled},
+                              Step{benchmark_override, baseline_dataset, baseline_validation, false}};
     for (std::size_t index = 0; index != sequence.size(); ++index) {
         const auto& step = sequence[index];
         record("integration.benchmark_click", step.control, "real-click", {double(index), 1.0, 0.0, 0.0});
-        record("integration.benchmark_choice", step.control, "native-settled", {double(index), double(step.dataset), double(step.validation), 11.0 + double(index)});
+        record("integration.benchmark_choice", step.control, "native-settled",
+               {double(index), double(step.dataset), double(step.validation), 11.0 + double(index)});
         for (std::size_t choice = 0; choice != controls.size(); ++choice) {
             const double present = step.enabled && (choice < 2U || step.dataset == 1U) ? 1.0 : 0.0;
             record("integration.benchmark_visibility", controls[choice], "current-tree", {double(index), present, present, 11.0 + double(index)});

@@ -747,7 +747,6 @@ TEST_CASE("compiled benchmark provenance cannot be erased while Generic identiti
     unknown.source = static_cast<AnnotationSource>(255U);
     write(unknown, original.labels()[0]);
     CHECK_THROWS(CompiledDataset::open(path));
-
 }
 TEST_CASE("category IDs reject arithmetic identity loss before publication", "[backend][data][catalog]") {
     const mmltk::testsupport::ScopedTempDir root("exact-category-ids");

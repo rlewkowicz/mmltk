@@ -34,7 +34,6 @@ void CachedImageWriteProgress::completed(const std::uint64_t writes) {
     published_ = writes;
     callback_(initial_ + writes, initial_ + expected_);
 }
-
 using mmltk::common::io::errno_error;
 using mmltk::common::io::FileHandle;
 using mmltk::common::math::checked_add;
@@ -75,9 +74,7 @@ class CachedImageWritePool {
    public:
     CachedImageWritePool(const std::size_t worker_count, const std::size_t expected_writes, std::filesystem::path output_root, CachedImageProgress progress,
                          const std::uint64_t initially_completed, const mmltk::common::concurrency::CancellationObservation cancellation)
-        : output_root_(std::move(output_root)),
-          progress_(std::move(progress), initially_completed, expected_writes),
-          cancellation_(cancellation) {
+        : output_root_(std::move(output_root)), progress_(std::move(progress), initially_completed, expected_writes), cancellation_(cancellation) {
         const std::size_t bounded_workers = std::min<std::size_t>(8U, worker_count);
         inline_mode_ = bounded_workers == 0U;
         const std::size_t buffer_count = inline_mode_ ? 1U : bounded_workers * 2U + 2U;
@@ -461,8 +458,11 @@ CachedImageDirectory extract_selected_archive_images(ArchiveExtractionRequest re
         throw_if_benchmark_cancelled(request.cancel_requested);
         if (request.trace && inspected != 0U && inspected % 128U == 0U) {
             trace_benchmark_event(request.trace, "benchmark.images.cache_scan", [&] {
-                return nlohmann::json{{"source", request.source}, {"shard", request.shard}, {"inspected_images", inspected},
-                                      {"reused_images", completed.size()}, {"total_images", request.selected_image_ids.size()}};
+                return nlohmann::json{{"source", request.source},
+                                      {"shard", request.shard},
+                                      {"inspected_images", inspected},
+                                      {"reused_images", completed.size()},
+                                      {"total_images", request.selected_image_ids.size()}};
             });
         }
         if (request.trace) { ++inspected; }
@@ -489,8 +489,11 @@ CachedImageDirectory extract_selected_archive_images(ArchiveExtractionRequest re
     }
     if (request.progress) { request.progress(completed.size(), selected.size()); }
     trace_benchmark_event(request.trace, "benchmark.images.cache_reuse", [&] {
-        return nlohmann::json{{"source", request.source}, {"shard", request.shard}, {"inspected_images", selected.size()},
-                              {"reused_images", completed.size()}, {"reused_bytes", image_bytes}};
+        return nlohmann::json{{"source", request.source},
+                              {"shard", request.shard},
+                              {"inspected_images", selected.size()},
+                              {"reused_images", completed.size()},
+                              {"reused_bytes", image_bytes}};
     });
     const std::size_t pending_writes = selected.size() - completed.size() - unavailable.size();
     if (request.activity) {
@@ -534,8 +537,11 @@ CachedImageDirectory extract_selected_archive_images(ArchiveExtractionRequest re
         }
         if (request.trace && (++inspected_headers % 1024U == 0U)) {
             trace_benchmark_event(request.trace, "benchmark.archive.scan", [&] {
-                return nlohmann::json{{"source", request.source}, {"shard", request.shard}, {"inspected_headers", inspected_headers},
-                                      {"scheduled_images", scheduled.size()}, {"reused_images", completed.size()}};
+                return nlohmann::json{{"source", request.source},
+                                      {"shard", request.shard},
+                                      {"inspected_headers", inspected_headers},
+                                      {"scheduled_images", scheduled.size()},
+                                      {"reused_images", completed.size()}};
             });
         }
         const char* pathname = archive_entry_pathname(entry);

@@ -61,7 +61,8 @@ ApplicationSystemStorage::ApplicationSystemStorage(ApplicationSystemConfiguratio
         [client = configuration.file_dialog, settings = settings_.get()] { return std::make_unique<NativeFileDialogRuntime>(client, *settings); },
         browser::ApplicationEventPublisher<&ApplicationSystems::file_dialog>(events_, continuity_));
     dataset_ = std::make_unique<DatasetSystem>(
-        *settings_, [diagnostics = std::move(configuration.dataset_diagnostics)] {
+        *settings_,
+        [diagnostics = std::move(configuration.dataset_diagnostics)] {
             return std::make_unique<ArtifactDatasetRuntime>(services::ArtifactStore{}, diagnostics);
         },
         browser::ApplicationEventPublisher<&ApplicationSystems::dataset>(events_, continuity_));

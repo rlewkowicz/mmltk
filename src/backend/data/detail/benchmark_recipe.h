@@ -33,8 +33,9 @@ struct CustomRecipePreparation {
     std::vector<CatalogArtifact> sampling_object_artifacts;
 };
 [[nodiscard]] CustomRecipePreparation prepare_custom_recipe(const BenchmarkCompilerConfig&, const BenchmarkCacheLayout&, const CustomRecipeCatalog&,
-    ProgressReporter&, std::size_t, mmltk::common::concurrency::CancellationObservation, const BenchmarkTraceSink&);
-}
+                                                            ProgressReporter&, std::size_t, mmltk::common::concurrency::CancellationObservation,
+                                                            const BenchmarkTraceSink&);
+}  // namespace mmltk::backend::data::benchmark_internal
 namespace mmltk::backend::data::benchmark_internal {
 struct RecipeImageArchive {
     CoconutImageNamespace source;
@@ -64,10 +65,12 @@ struct CoconutRecipePreparation {
     nlohmann::json manifest;
 };
 [[nodiscard]] CoconutRecipeCatalog coconut_recipe_catalog(CoconutValidation);
-[[nodiscard]] CoconutRecipePreparation prepare_coconut_recipe(const BenchmarkCompilerConfig&, const BenchmarkCacheLayout&,
-    const CoconutRecipeCatalog&, std::span<const AdmittedRecipeArchive>, const CoconutPhysicalMembership&, ProgressReporter&, std::size_t, mmltk::common::concurrency::CancellationObservation, const BenchmarkTraceSink&, std::span<const CoconutImageNamespace> refreshed_sources = {});
+[[nodiscard]] CoconutRecipePreparation prepare_coconut_recipe(const BenchmarkCompilerConfig&, const BenchmarkCacheLayout&, const CoconutRecipeCatalog&,
+                                                              std::span<const AdmittedRecipeArchive>, const CoconutPhysicalMembership&, ProgressReporter&,
+                                                              std::size_t, mmltk::common::concurrency::CancellationObservation, const BenchmarkTraceSink&,
+                                                              std::span<const CoconutImageNamespace> refreshed_sources = {});
 [[nodiscard]] bool coconut_validation_component(CoconutEdition) noexcept;
 [[nodiscard]] AnnotationSource coconut_annotation_source(CoconutImageNamespace);
 // Same compiler entry with explicit private source catalog, not a second execution path.
 void compile_benchmark_recipe(BenchmarkCompilerConfig, const CoconutRecipeCatalog*, const CustomRecipeCatalog* = nullptr);
-}
+}  // namespace mmltk::backend::data::benchmark_internal

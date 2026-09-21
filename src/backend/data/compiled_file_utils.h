@@ -129,8 +129,8 @@ inline void validate_compiled_original_image_dimensions(const std::span<const Im
     for (size_t image_index = 0U; image_index < index.size(); ++image_index) {
         throw_if_compiled_validation_cancelled(image_index, cancel_requested);
         const ImageEntry& entry = index[image_index];
-        if (entry.original_width == 0U || entry.original_height == 0U || entry.has_source_image_id > 1U || entry.source > AnnotationSource::CoconutObjects365V2 ||
-            (!entry.has_source_image_id && entry.source_image_id != 0U) || entry._reserved != 0U) {
+        if (entry.original_width == 0U || entry.original_height == 0U || entry.has_source_image_id > 1U ||
+            entry.source > AnnotationSource::CoconutObjects365V2 || (!entry.has_source_image_id && entry.source_image_id != 0U) || entry._reserved != 0U) {
             throw std::runtime_error("compiled original image dimensions are invalid at image " + std::to_string(image_index));
         }
     }

@@ -268,8 +268,11 @@ TEST_CASE("artifact benchmark compilation uses the environment cache and retires
     const std::optional<std::string> original_environment = environment == nullptr ? std::nullopt : std::optional<std::string>{environment};
     const mmltk::testsupport::ScopedTestCleanup restore_process_state{[&] {
         fs::current_path(original_directory);
-        if (original_environment) { (void)::setenv("MMLTK_BENCHMARK_DATASET_CACHE_ROOT", original_environment->c_str(), 1); }
-        else { (void)::unsetenv("MMLTK_BENCHMARK_DATASET_CACHE_ROOT"); }
+        if (original_environment) {
+            (void)::setenv("MMLTK_BENCHMARK_DATASET_CACHE_ROOT", original_environment->c_str(), 1);
+        } else {
+            (void)::unsetenv("MMLTK_BENCHMARK_DATASET_CACHE_ROOT");
+        }
     }};
     fs::create_directories(temporary.path() / "working");
     fs::current_path(temporary.path() / "working");
@@ -318,15 +321,16 @@ TEST_CASE("artifact benchmark compilation uses the environment cache and retires
     };
     Observations observations;
     const ArtifactDiagnosticObserver diagnostics{.benchmark = {
-        .context = &observations,
-        .report = [](const void* context, const std::string_view event, const std::string_view fields) noexcept {
-            if (event == "benchmark.compile.paths") {
-                const auto& observed = *static_cast<const Observations*>(context);
-                observed.paths = fields;
-                ++observed.path_reports;
-            }
-        },
-    }};
+                                                     .context = &observations,
+                                                     .report =
+                                                         [](const void* context, const std::string_view event, const std::string_view fields) noexcept {
+                                                             if (event == "benchmark.compile.paths") {
+                                                                 const auto& observed = *static_cast<const Observations*>(context);
+                                                                 observed.paths = fields;
+                                                                 ++observed.path_reports;
+                                                             }
+                                                         },
+                                                 }};
     // Cancellation begins inside the real backend, after ArtifactStore's entry
     // check. Even a cache-selection regression cannot reach a public endpoint.
     const ArtifactProgressObserver progress{
@@ -334,12 +338,8 @@ TEST_CASE("artifact benchmark compilation uses the environment cache and retires
         .report = [](void* context, const domain::ArtifactProgress&) { static_cast<ArtifactCancellationFixture*>(context)->cancel(); },
     };
     ArtifactStore store;
-    const ArtifactCompileRequest request{.kind = ArtifactCompileKind::Benchmark,
-                                         .source = {},
-                                         .output = output,
-                                         .preset = "rf-detr-nano",
-                                         .resolution = 1U,
-                                         .overwrite = true};
+    const ArtifactCompileRequest request{
+        .kind = ArtifactCompileKind::Benchmark, .source = {}, .output = output, .preset = "rf-detr-nano", .resolution = 1U, .overwrite = true};
     const auto result = store.compile(request, cancellation.token, progress, diagnostics);
     CHECK(result.cancelled);
     CHECK(result.output.empty());
@@ -351,9 +351,7 @@ TEST_CASE("artifact benchmark compilation uses the environment cache and retires
     CHECK(staging.parent_path() == fs::weakly_canonical(output.parent_path()));
     CHECK(staging.filename().string().starts_with("compiled.tmp."));
     CHECK_FALSE(fs::exists(staging));
-    for (const auto& entry : fs::directory_iterator(output.parent_path())) {
-        CHECK_FALSE(entry.path().filename().string().starts_with("compiled.tmp."));
-    }
+    for (const auto& entry : fs::directory_iterator(output.parent_path())) { CHECK_FALSE(entry.path().filename().string().starts_with("compiled.tmp.")); }
     struct stat after{};
     REQUIRE(::stat(retained.c_str(), &after) == 0);
     CHECK(after.st_ino == before.st_ino);
@@ -1087,7 +1085,10 @@ TEST_CASE("Train observes persistence failure beyond bounded console output with
 TEST_CASE("artifact benchmark requests admit canonical selections and Directory ignores retained choices", "[gui][services][benchmark]") {
     namespace data = mmltk::backend::data;
     ArtifactCompileRequest request{.kind = mmltk::controller::services::ArtifactCompileKind::Benchmark,
-        .source = "/source", .output = "/output", .preset = "rf-detr-nano", .resolution = 384U};
+                                   .source = "/source",
+                                   .output = "/output",
+                                   .preset = "rf-detr-nano",
+                                   .resolution = 384U};
     for (const auto dataset : {data::BenchmarkDatasetVariant::CocoCustom, data::BenchmarkDatasetVariant::Coconut}) {
         for (const auto validation : {data::CoconutValidation::Coconut, data::CoconutValidation::Stock, data::CoconutValidation::CoconutStock}) {
             request.benchmark_selection = {dataset, validation};
@@ -1101,9 +1102,7 @@ TEST_CASE("artifact benchmark requests admit canonical selections and Directory 
     request.kind = mmltk::controller::services::ArtifactCompileKind::Directory;
     CHECK(request.valid());
 }
-
 }  // namespace mmltk::controller::subsystems::system
-
 namespace mmltk::controller::subsystems::system {
 TEST_CASE("benchmark current transfer changes artifact activity at the exact image plateau", "[gui][services][progress]") {
     using namespace data::benchmark_internal;
@@ -1111,10 +1110,12 @@ TEST_CASE("benchmark current transfer changes artifact activity at the exact ima
     const BenchmarkTraceSink quiet;
     domain::ArtifactProgress displayed;
     data::BenchmarkCompileProgress latest;
-    ProgressReporter reporter([&](const data::BenchmarkCompileProgress& update) {
-        latest = update;
-        displayed = project_artifact_progress(update);
-    }, quiet);
+    ProgressReporter reporter(
+        [&](const data::BenchmarkCompileProgress& update) {
+            latest = update;
+            displayed = project_artifact_progress(update);
+        },
+        quiet);
     reporter.phase(data::DatasetCompilePhase::Extracting);
     reporter.source_activity(Source::kCoco2017, "Old COCO activity");
     reporter.source_images(Source::kCoco2017, 123U, 123U);
@@ -1172,7 +1173,8 @@ TEST_CASE("benchmark current transfer changes artifact activity at the exact ima
     for (const auto phase : {DownloadProgressPhase::kVerifyingCachedArtifact, DownloadProgressPhase::kVerifyingDownloadedArtifact}) {
         update.phase = phase;
         reporter.source_transfer(update, 105032U, 205000U);
-        CHECK(displayed.activity.find(phase == DownloadProgressPhase::kVerifyingCachedArtifact ? "Verifying cached" : "Verifying downloaded") != std::string::npos);
+        CHECK(displayed.activity.find(phase == DownloadProgressPhase::kVerifyingCachedArtifact ? "Verifying cached" : "Verifying downloaded") !=
+              std::string::npos);
         check_plateau();
     }
     reporter.activity("Preparing labels");
@@ -1192,8 +1194,7 @@ TEST_CASE("benchmark current transfer changes artifact activity at the exact ima
     reporter.source_activity(Source::kObjects365V2, std::string(4096U, 'x'));
     CHECK(displayed.activity.size() <= domain::kArtifactProgressTextCapacity);
 }
-}
-
+}  // namespace mmltk::controller::subsystems::system
 namespace mmltk::controller::subsystems::system {
 TEST_CASE("real ranged HTTP restart reaches the bounded artifact activity as a re-download", "[gui][services][progress]") {
     using namespace data::benchmark_internal;
@@ -1201,8 +1202,13 @@ TEST_CASE("real ranged HTTP restart reaches the bounded artifact activity as a r
     std::vector<std::uint8_t> payload(4096U);
     for (std::size_t i = 0U; i < payload.size(); ++i) { payload[i] = static_cast<std::uint8_t>(i % 251U); }
     data::testsupport::HttpServer server(payload);
-    DownloadRequest request{"objects365-restart", server.url("restart"), root.path() / "archive.bin", root.path() / "archive.lock", payload.size(),
-                            mmltk::common::io::sha256_hex(mmltk::common::io::sha256_bytes(payload)), 1U};
+    DownloadRequest request{"objects365-restart",
+                            server.url("restart"),
+                            root.path() / "archive.bin",
+                            root.path() / "archive.lock",
+                            payload.size(),
+                            mmltk::common::io::sha256_hex(mmltk::common::io::sha256_bytes(payload)),
+                            1U};
     request.source = data::BenchmarkDatasetSource::kObjects365V2;
     constexpr std::uint64_t retained = 512U;
     {
@@ -1229,10 +1235,13 @@ TEST_CASE("real ranged HTTP restart reaches the bounded artifact activity as a r
     reporter.source_images(data::BenchmarkDatasetSource::kObjects365V2, 170161U, 408551U);
     reporter.source_images(data::BenchmarkDatasetSource::kOpenImagesV7, 56008U, 56008U);
     displayed.clear();
-    const auto completed = download_artifacts({request}, 1U, {}, [&](const auto& update) {
-        observed.push_back(update);
-        totals.update(update, reporter);
-    }, trace);
+    const auto completed = download_artifacts(
+        {request}, 1U, {},
+        [&](const auto& update) {
+            observed.push_back(update);
+            totals.update(update, reporter);
+        },
+        trace);
     REQUIRE(completed.size() == 1U);
     REQUIRE(observed.size() == displayed.size());
     bool saw_retained = false;
@@ -1276,8 +1285,7 @@ TEST_CASE("real ranged HTTP restart reaches the bounded artifact activity as a r
     CHECK(server.requests() == requests_before);
     server.Check();
 }
-}
-
+}  // namespace mmltk::controller::subsystems::system
 namespace mmltk::controller::subsystems::system {
 TEST_CASE("real unknown metadata bytes remain open ended through artifact projection", "[gui][services][progress]") {
     using namespace data::benchmark_internal;
@@ -1291,14 +1299,19 @@ TEST_CASE("real unknown metadata bytes remain open ended through artifact projec
     auto source = Source::kCoco2017;
     SECTION("unknown only") {}
     SECTION("mixed artifacts in one source") { mixed = true; }
-    SECTION("mixed artifacts across sources") { mixed = true; source = Source::kObjects365V2; }
+    SECTION("mixed artifacts across sources") {
+        mixed = true;
+        source = Source::kObjects365V2;
+    }
     std::vector<data::BenchmarkCompileProgress> native;
     std::vector<domain::ArtifactProgress> displayed;
     const BenchmarkTraceSink trace;
-    ProgressReporter reporter([&](const auto& update) {
-        native.push_back(update);
-        displayed.push_back(project_artifact_progress(update));
-    }, trace);
+    ProgressReporter reporter(
+        [&](const auto& update) {
+            native.push_back(update);
+            displayed.push_back(project_artifact_progress(update));
+        },
+        trace);
     ArtifactProgressTotals totals;
     reporter.phase(data::DatasetCompilePhase::Downloading);
     if (mixed) {
@@ -1310,7 +1323,8 @@ TEST_CASE("real unknown metadata bytes remain open ended through artifact projec
         (void)download_artifacts({known}, 1U, {}, [&](const auto& update) { totals.update(update, reporter); });
         REQUIRE(server.requests() == 0U);
     }
-    const DownloadRequest unknown{"metadata-unknown", server.url("unknown"), root.path() / "unknown.bin", root.path() / "unknown.lock", 0U, {}, 1U, false, source};
+    const DownloadRequest unknown{
+        "metadata-unknown", server.url("unknown"), root.path() / "unknown.bin", root.path() / "unknown.lock", 0U, {}, 1U, false, source};
     std::promise<void> open_ended;
     auto observed = open_ended.get_future();
     bool notified = false;
@@ -1358,4 +1372,4 @@ TEST_CASE("real unknown metadata bytes remain open ended through artifact projec
     CHECK(read_json_file(unknown.destination.string() + ".download.json").at("identity") == downloaded.front().identity);
     server.Check();
 }
-}
+}  // namespace mmltk::controller::subsystems::system

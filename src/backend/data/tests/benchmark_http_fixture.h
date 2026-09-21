@@ -101,10 +101,9 @@ class HttpServer {
         }
         return true;
     }
-    static void send_discarded_body(const int client, const std::string_view status, const std::size_t bytes,
-                                    const std::string_view extra_headers = {}) {
-        const std::string header = "HTTP/1.1 " + std::string(status) + "\r\nContent-Length: " + std::to_string(bytes) +
-                                   "\r\n" + std::string(extra_headers) + "Connection: close\r\n\r\n";
+    static void send_discarded_body(const int client, const std::string_view status, const std::size_t bytes, const std::string_view extra_headers = {}) {
+        const std::string header = "HTTP/1.1 " + std::string(status) + "\r\nContent-Length: " + std::to_string(bytes) + "\r\n" + std::string(extra_headers) +
+                                   "Connection: close\r\n\r\n";
         const std::string body(bytes, '!');
         if (send_all(client, header.data(), header.size())) { (void)send_all(client, body.data(), body.size()); }
     }
@@ -188,8 +187,9 @@ class HttpServer {
         const std::size_t bytes = end + 1U - begin;
         std::string header = ranged ? "HTTP/1.1 206 Partial Content\r\n" : "HTTP/1.1 200 OK\r\n";
         if (!omit_length_.load(std::memory_order_acquire)) { header += "Content-Length: " + std::to_string(bytes) + "\r\n"; }
-        header += "Accept-Ranges: bytes\r\nETag: \"benchmark-test-etag\"\r\n"
-                  "Last-Modified: Thu, 23 Jul 2026 12:00:00 GMT\r\n";
+        header +=
+            "Accept-Ranges: bytes\r\nETag: \"benchmark-test-etag\"\r\n"
+            "Last-Modified: Thu, 23 Jul 2026 12:00:00 GMT\r\n";
         if (ranged) { header += "Content-Range: bytes " + std::to_string(begin) + "-" + std::to_string(end) + "/" + std::to_string(payload_size_) + "\r\n"; }
         header += "Connection: close\r\n\r\n";
         if (!send_all(client, header.data(), header.size())) { return; }
