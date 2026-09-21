@@ -342,15 +342,7 @@ mod tests {
     use super::*;
 
     fn ready_model() -> ApplicationModel {
-        let mut model = ApplicationModel::default();
-        let snapshots = crate::generated::application_snapshot_defaults()
-            .unwrap()
-            .into_iter()
-            .map(|fact| fact.value)
-            .collect();
-        model
-            .install_bootstrap(crate::generated::SCHEMA_FINGERPRINT, snapshots)
-            .unwrap();
+        let mut model = crate::view_model::test_support::bootstrapped();
         let annotation = model.annotation.snapshot.as_mut().unwrap();
         annotation.ready = true;
         annotation.busy = false;
@@ -358,29 +350,10 @@ mod tests {
         annotation.uirevision = 1;
         annotation.inputdocumentepoch = 1;
         annotation.ui.documentrevision = 1;
-        annotation.frame = crate::generated::VisualFrame {
-            source: crate::generated::PresentationSourceIdentity {
-                kind: crate::generated::PresentationSourceKind::Annotation,
-                instance: 1,
-            },
-            extent: crate::generated::VisualExtent {
-                width: 640,
-                height: 480,
-            },
-            revision: 1,
-            cleanrevision: 1,
-            resizemode: None,
-            sourceextent: crate::generated::VisualExtent {
-                width: 640,
-                height: 480,
-            },
-            content: crate::generated::VisualRegion {
-                x: 0,
-                y: 0,
-                width: 640,
-                height: 480,
-            },
-        };
+        annotation.frame = crate::view_model::test_support::visual_frame(
+            crate::generated::PresentationSourceKind::Annotation,
+            1,
+        );
         model
     }
 

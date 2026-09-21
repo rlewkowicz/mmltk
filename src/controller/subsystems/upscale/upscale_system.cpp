@@ -149,12 +149,7 @@ private:
 class NativeUpscaleModel final : public UpscaleAlgorithm {
 public:
  void Resample(const mmltk::frameworks::gpu::ImagePlaneView source, const mmltk::frameworks::gpu::ImagePlaneView target, const std::uintptr_t stream) override {
-  const auto status = mmltk::backend::imaging::raster::scale_rgba({reinterpret_cast<const std::uint8_t*>(source.data), source.descriptor.pitch_bytes,
-                                                                   static_cast<int>(source.descriptor.width), static_cast<int>(source.descriptor.height)},
-                                                                  {reinterpret_cast<std::uint8_t*>(target.data), target.descriptor.pitch_bytes,
-                                                                   static_cast<int>(target.descriptor.width), static_cast<int>(target.descriptor.height)},
-                                                                  stream, true);
-  mmltk::frameworks::gpu::ensure_cuda_ok(static_cast<cudaError_t>(status), "Upscale input preparation failed");
+  Scale(source, target, stream, true, "Upscale input preparation failed");
  }
  void Semantics(const mmltk::frameworks::gpu::ImagePlaneView source, const mmltk::frameworks::gpu::ImagePlaneView target,
                 const std::uintptr_t stream) override {
@@ -164,12 +159,7 @@ public:
                          "clear Upscale absent semantics");
    return;
   }
-  const auto status = mmltk::backend::imaging::raster::scale_rgba({reinterpret_cast<const std::uint8_t*>(source.data), source.descriptor.pitch_bytes,
-                                                                   static_cast<int>(source.descriptor.width), static_cast<int>(source.descriptor.height)},
-                                                                  {reinterpret_cast<std::uint8_t*>(target.data), target.descriptor.pitch_bytes,
-                                                                   static_cast<int>(target.descriptor.width), static_cast<int>(target.descriptor.height)},
-                                                                  stream);
-  mmltk::frameworks::gpu::ensure_cuda_ok(static_cast<cudaError_t>(status), "Upscale semantic scaling failed");
+  Scale(source, target, stream, false, "Upscale semantic scaling failed");
  }
  explicit NativeUpscaleModel(const int device, native_upscale::ImageUpscalerExecutionCheckpoint checkpoint)
      : device_(device),
@@ -273,6 +263,15 @@ public:
  }
 
 private:
+ static void Scale(const mmltk::frameworks::gpu::ImagePlaneView source, const mmltk::frameworks::gpu::ImagePlaneView target, const std::uintptr_t stream,
+                   const bool bilinear, const char* const operation) {
+  const auto status = mmltk::backend::imaging::raster::scale_rgba({reinterpret_cast<const std::uint8_t*>(source.data), source.descriptor.pitch_bytes,
+                                                                   static_cast<int>(source.descriptor.width), static_cast<int>(source.descriptor.height)},
+                                                                  {reinterpret_cast<std::uint8_t*>(target.data), target.descriptor.pitch_bytes,
+                                                                   static_cast<int>(target.descriptor.width), static_cast<int>(target.descriptor.height)},
+                                                                  stream, bilinear);
+  mmltk::frameworks::gpu::ensure_cuda_ok(static_cast<cudaError_t>(status), operation);
+ }
  void Activate(CUcontext context) {
   if (owner_) return;
   ensure_cuda_driver_ok(cuCtxSetCurrent(context), "bind Upscale image-runtime context");
