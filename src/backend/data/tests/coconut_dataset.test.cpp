@@ -533,10 +533,6 @@ TEST_CASE("COCONut archives reject unresolved duplicate extra and unsafe offered
         const std::array<std::uint32_t, 1> unknown{2};
         members[0].second = png(1, 1, unknown);
     }
-    SECTION("absent thing support") {
-        const std::array<std::uint32_t, 1> empty{0};
-        members[0].second = png(1, 1, empty);
-    }
     json_file(input.annotation_json, document);
     tar(input.mask_archive, members, link);
     CHECK_THROWS(import_coconut_annotations(input));

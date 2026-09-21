@@ -574,7 +574,17 @@ class Importer final {
                 box.x2 = static_cast<float>((supplied[0] + supplied[2]) / width);
                 box.y2 = static_cast<float>((supplied[1] + supplied[3]) / height);
             } else {
-                if (support.area == 0) invalid("thing segment has neither support nor authoritative bbox");
+                if (support.area == 0) {
+                    ++index.rejected.degenerate_boxes;
+                    if (request_.rejected_object) {
+                        try {
+                            request_.rejected_object(physical, record, segment, "thing segment has neither mask pixels nor an authoritative bbox");
+                        } catch (...) {
+                            // Reporting a discarded object cannot interrupt compilation.
+                        }
+                    }
+                    continue;
+                }
                 box.x1 = static_cast<float>(static_cast<double>(support.min_x) / width);
                 box.y1 = static_cast<float>(static_cast<double>(support.min_y) / height);
                 box.x2 = static_cast<float>(static_cast<double>(support.max_x) / width);

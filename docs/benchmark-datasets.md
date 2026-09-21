@@ -96,6 +96,16 @@ exclusive upper bounds. Supplied valid area, crowd, ignore, category, segment ID
 and ordinal remain intact; absent/null area comes from mask support.
 An image with no admitted things still has an image record.
 
+A declared thing with neither mask pixels nor an authoritative box is omitted
+from normalized object metadata and counted as a dropped instance; its image
+and other objects remain. Compilation appends the image/member, physical and
+release image IDs, object/category IDs, release, and reason to `failed.txt` in
+the nearest `.cache` ancestor of the benchmark cache (normally
+`.cache/failed.txt`). A custom cache outside `.cache` keeps the report at its
+own root. The report uses one JSON object per line and retains earlier entries.
+The first rejection produces a concise progress warning; report-write failure
+does not interrupt compilation.
+
 Current import admission bounds each encoded PNG to 64 MiB, each decoded image
 to 64 Mi pixels, each axis to 32,767, and each segment list to 65,535 entries.
 The canonical limits are in
@@ -144,6 +154,11 @@ labels, even when selected image-group proofs exist. Those inventories have
 their own identity-bound reuse path. Source archives remain retained; ordinary
 reuse does not add routine whole-file hashing. Failure diagnosis retains the
 existing SHA-256 path and bounded repair policy.
+
+After annotation-import failure, a file matching its pinned SHA-256 is retained.
+Recovery replaces only inputs without a matching pinned checksum. If every
+input already matches, the import error is returned without re-downloading the
+same release. Ordinary successful cache reuse still performs no routine hash.
 
 Repairs execute under the shared physical cache lease. They invalidate affected
 proofs and corrupt artifacts/JPEGs, retain unrelated valid JPEGs, and rebuild

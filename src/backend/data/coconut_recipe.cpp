@@ -5,6 +5,7 @@
 #include "src/common/math/checked_arithmetic.h"
 #include <algorithm>
 #include <array>
+#include <fstream>
 #include <unordered_set>
 #include <map>
 #include <tuple>
@@ -72,6 +73,10 @@ CoconutRecipePreparation prepare_coconut_recipe(const BenchmarkCompilerConfig& c
     CoconutRecipePreparation prepared;
     ArtifactProgressTotals totals;
     StorageReservationPool reservations(cache.root, trace);
+    std::ofstream failures;
+    std::filesystem::path failures_path;
+    bool failure_report_attempted = false;
+    bool failure_warning_emitted = false;
     const auto acquire = [&](const CatalogArtifact& artifact, std::string_view owner, bool redownload = false) {
         progress.phase(DatasetCompilePhase::Downloading);
         auto request = make_download_request(cache, owner, artifact);
@@ -136,6 +141,41 @@ CoconutRecipePreparation prepare_coconut_recipe(const BenchmarkCompilerConfig& c
             request.physical_membership = &physical;
             request.expected_rows = release.expected_rows;
             request.cancellation = cancellation;
+            request.rejected_object = [&](const CoconutPhysicalImage& physical_image, const CoconutRecord& record, const CoconutSegment& segment,
+                                          std::string_view reason) {
+                if (!failure_report_attempted) {
+                    failure_report_attempted = true;
+                    auto directory = cache.root;
+                    for (auto parent = cache.root; !parent.empty(); parent = parent.parent_path()) {
+                        if (parent.filename() == ".cache") {
+                            directory = parent;
+                            break;
+                        }
+                        if (parent == parent.root_path()) break;
+                    }
+                    failures_path = directory / "failed.txt";
+                    failures.open(failures_path, std::ios::app);
+                }
+                if (failures) {
+                    failures << nlohmann::json{{"image", physical_image.member},
+                                               {"image_id", physical_image.image_id},
+                                               {"release_image_id", record.image_id},
+                                               {"source", coconut_namespace_name(physical_image.source)},
+                                               {"release", release.name},
+                                               {"object_id", segment.id},
+                                               {"category_id", segment.category_id},
+                                               {"reason", reason}}
+                                    .dump()
+                             << '\n';
+                    failures.flush();
+                }
+                if (!failure_warning_emitted) {
+                    failure_warning_emitted = true;
+                    progress.source_activity(BenchmarkDatasetSource::kCoconut,
+                                             std::string("Skipping invalid COCONut objects; ") +
+                                                 (failures ? "details: " : "cannot write failure report: ") + failures_path.string());
+                }
+            };
             if (progress.normalization_observer_enabled())
                 request.progress = [&](std::uint64_t rows) { progress.phase(DatasetCompilePhase::Indexing, rows, release.expected_rows); };
             else
@@ -157,22 +197,32 @@ CoconutRecipePreparation prepare_coconut_recipe(const BenchmarkCompilerConfig& c
                 } catch (const std::exception& error) {
                     throw_if_benchmark_cancelled(cancellation);
                     if (attempt == 3) throw;
+                    bool repaired = false;
                     std::string refreshed_identity = std::string(release.revision) + std::string(kCoconutNormalizationRevision);
                     for (const auto source : sources) refreshed_identity += physical_identities[source];
                     for (std::size_t i = 0; i < release.annotations.size(); ++i) {
                         const auto& artifact = release.annotations[i];
                         auto download_request = make_download_request(cache, owner, artifact);
+                        bool matches_expected = false;
                         if (std::filesystem::is_regular_file(download_request.destination)) {
                             const auto sha = mmltk::common::io::sha256_hex(
                                 mmltk::common::io::sha256_file(download_request.destination, [&] { return cancellation.requested(); }));
+                            matches_expected = !artifact.expected_sha256.empty() && sha == artifact.expected_sha256;
                             trace_benchmark_event(trace, "benchmark.download.failure_sha256", [&] {
-                                return nlohmann::json{{"artifact", artifact.artifact_id}, {"sha256", sha}, {"reason", error.what()}};
+                                return nlohmann::json{{"artifact", artifact.artifact_id},
+                                                      {"sha256", sha},
+                                                      {"matches_expected", matches_expected},
+                                                      {"reason", error.what()}};
                             });
                         }
-                        invalidate_download_artifact(download_request, cancellation, trace);
-                        downloads[i] = acquire(artifact, owner, true);
+                        if (!matches_expected) {
+                            invalidate_download_artifact(download_request, cancellation, trace);
+                            downloads[i] = acquire(artifact, owner, true);
+                            repaired = true;
+                        }
                         refreshed_identity += downloads[i].identity;
                     }
+                    if (!repaired) throw;
                     request.input_identity = digest_text(refreshed_identity);
                     progress.source_activity(BenchmarkDatasetSource::kCoconut, "Retrying required COCONut masks after source repair");
                 }

@@ -88,6 +88,8 @@ struct CoconutImportRequest {
     CoconutImportLimits limits;
     mmltk::common::concurrency::CancellationObservation cancellation;
     std::function<void(std::uint64_t)> progress;
+    // Synchronous observation of discarded objects; report failures never reject an image.
+    std::function<void(const CoconutPhysicalImage&, const CoconutRecord&, const CoconutSegment&, std::string_view)> rejected_object;
 };
 // Every offered record is required. Unknown expected_rows means derive, never sample.
 [[nodiscard]] std::vector<CoconutComponent> import_coconut_annotations(const CoconutImportRequest& request);
