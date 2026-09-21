@@ -19,7 +19,7 @@ CompiledDataset CompiledDataset::open_mapped(const std::filesystem::path& path, 
     CompiledDataset store;
     store.path_ = path;
     store.mapping_ = std::move(mapping);
-    if (store.mapping_.size() < sizeof(mmltk::backend::data::FileHeader)) { throw std::runtime_error("compiled dataset is smaller than its v8 header"); }
+    if (store.mapping_.size() < sizeof(mmltk::backend::data::FileHeader)) { throw std::runtime_error("compiled dataset is smaller than its header"); }
     std::memcpy(&store.header_, store.mapping_.data(), sizeof(store.header_));
     mmltk::backend::data::validate_compiled_header(store.header_);
     if (store.header_.num_images > image_limit) { throw std::runtime_error("compiled dataset exceeds the caller image limit"); }

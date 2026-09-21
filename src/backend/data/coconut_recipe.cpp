@@ -1,5 +1,6 @@
 #include "detail/benchmark_recipe.h"
 #include "detail/benchmark_annotation_cache.h"
+#include "detail/benchmark_image_decoder.h"
 #include "detail/benchmark_storage.h"
 #include "src/common/io/file_digest.h"
 #include "src/common/math/checked_arithmetic.h"
@@ -26,6 +27,80 @@ std::vector<CoconutImageNamespace> edition_sources(CoconutEdition edition) {
     throw std::invalid_argument("invalid COCONut edition");
 }
 }  // namespace
+CoconutFailureReport::CoconutFailureReport(const std::filesystem::path& cache_root, ProgressReporter& progress) : progress_(progress) {
+    auto directory = cache_root;
+    for (auto parent = cache_root; !parent.empty(); parent = parent.parent_path()) {
+        if (parent.filename() == ".cache") {
+            directory = parent;
+            break;
+        }
+        if (parent == parent.root_path()) break;
+    }
+    path_ = directory / "failed.txt";
+}
+void CoconutFailureReport::reject(const CoconutPhysicalImage& image, const std::uint64_t release_image_id, const std::string_view release,
+                                 const std::uint64_t object_id, const std::uint64_t category_id, const std::string_view reason) noexcept {
+    try {
+        if (!attempted_) {
+            attempted_ = true;
+            stream_.open(path_, std::ios::app);
+        }
+        if (stream_) {
+            stream_ << nlohmann::json{{"image", image.member},
+                                     {"image_id", image.image_id},
+                                     {"release_image_id", release_image_id},
+                                     {"source", coconut_namespace_name(image.source)},
+                                     {"release", release},
+                                     {"object_id", object_id},
+                                     {"category_id", category_id},
+                                     {"reason", reason}}
+                           .dump()
+                    << '\n';
+            stream_.flush();
+        }
+        if (!warned_) {
+            warned_ = true;
+            progress_.activity(std::string("Skipping invalid COCONut objects; ") +
+                               (stream_ ? "details: " : "cannot write failure report: ") + path_.string());
+        }
+    } catch (...) {
+        // Reporting cannot make rejected object metadata fatal to compilation.
+    }
+}
+std::vector<std::pair<std::uint32_t, std::uint32_t>> coconut_image_dimensions(
+    const CoconutComponent& component, const std::string_view release, const std::span<const CachedImageDirectory> directories,
+    const std::span<const std::uint16_t> image_sources, CoconutFailureReport& failures, ProgressReporter& progress,
+    const mmltk::common::concurrency::CancellationObservation cancellation) {
+    const auto& index = component.index;
+    if (component.inventory.size() != index.images.size() || image_sources.size() != index.images.size())
+        throw std::runtime_error("COCONut image geometry membership is misaligned");
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> dimensions;
+    dimensions.reserve(index.images.size());
+    BenchmarkImageValidator validator;
+    for (std::size_t i = 0; i < index.images.size(); ++i) {
+        if ((i & 4095U) == 0U) {
+            throw_if_benchmark_cancelled(cancellation);
+            progress.activity("Checking " + std::string(release) + " image geometry: " + std::to_string(i) + "/" + std::to_string(index.images.size()));
+        }
+        if (image_sources[i] >= directories.size()) throw std::runtime_error("COCONut image geometry directory is invalid");
+        const auto& image = index.images[i];
+        auto actual = std::pair{image.width, image.height};
+        const auto path = cached_image_path(directories[image_sources[i]].path, image.source_image_id);
+        try {
+            actual = validator.validate_file(path);
+        } catch (const std::bad_alloc&) { throw; } catch (const std::exception&) {
+            // Unreadable bytes still go through the writer's bounded physical repair.
+        }
+        dimensions.push_back(actual);
+        if (actual == std::pair{image.width, image.height}) continue;
+        const auto& identity = component.inventory[i];
+        const std::string reason = "annotation dimensions " + std::to_string(image.width) + "x" + std::to_string(image.height) +
+                                   " do not match image dimensions " + std::to_string(actual.first) + "x" + std::to_string(actual.second);
+        for (const auto& box : std::span(index.boxes).subspan(static_cast<std::size_t>(image.first_box), image.box_count))
+            failures.reject(identity.physical, identity.release_image_id, release, box.annotation_id, box.source_category_id, reason);
+    }
+    return dimensions;
+}
 bool coconut_validation_component(CoconutEdition edition) noexcept {
     return edition == CoconutEdition::RelabeledValidation || edition == CoconutEdition::ObjectsValidation;
 }
@@ -66,17 +141,13 @@ CoconutRecipeCatalog coconut_recipe_catalog(CoconutValidation validation) {
 }
 CoconutRecipePreparation prepare_coconut_recipe(const BenchmarkCompilerConfig& config, const BenchmarkCacheLayout& cache, const CoconutRecipeCatalog& catalog,
                                                 std::span<const AdmittedRecipeArchive> acquired, const CoconutPhysicalMembership& physical,
-                                                ProgressReporter& progress, std::size_t workers,
+                                                ProgressReporter& progress, CoconutFailureReport& failures, std::size_t workers,
                                                 mmltk::common::concurrency::CancellationObservation cancellation, const BenchmarkTraceSink& trace,
                                                 std::span<const CoconutImageNamespace> refreshed_sources) {
     using namespace mmltk::common::math;
     CoconutRecipePreparation prepared;
     ArtifactProgressTotals totals;
     StorageReservationPool reservations(cache.root, trace);
-    std::ofstream failures;
-    std::filesystem::path failures_path;
-    bool failure_report_attempted = false;
-    bool failure_warning_emitted = false;
     const auto acquire = [&](const CatalogArtifact& artifact, std::string_view owner, bool redownload = false) {
         progress.phase(DatasetCompilePhase::Downloading);
         auto request = make_download_request(cache, owner, artifact);
@@ -143,38 +214,7 @@ CoconutRecipePreparation prepare_coconut_recipe(const BenchmarkCompilerConfig& c
             request.cancellation = cancellation;
             request.rejected_object = [&](const CoconutPhysicalImage& physical_image, const CoconutRecord& record, const CoconutSegment& segment,
                                           std::string_view reason) {
-                if (!failure_report_attempted) {
-                    failure_report_attempted = true;
-                    auto directory = cache.root;
-                    for (auto parent = cache.root; !parent.empty(); parent = parent.parent_path()) {
-                        if (parent.filename() == ".cache") {
-                            directory = parent;
-                            break;
-                        }
-                        if (parent == parent.root_path()) break;
-                    }
-                    failures_path = directory / "failed.txt";
-                    failures.open(failures_path, std::ios::app);
-                }
-                if (failures) {
-                    failures << nlohmann::json{{"image", physical_image.member},
-                                               {"image_id", physical_image.image_id},
-                                               {"release_image_id", record.image_id},
-                                               {"source", coconut_namespace_name(physical_image.source)},
-                                               {"release", release.name},
-                                               {"object_id", segment.id},
-                                               {"category_id", segment.category_id},
-                                               {"reason", reason}}
-                                    .dump()
-                             << '\n';
-                    failures.flush();
-                }
-                if (!failure_warning_emitted) {
-                    failure_warning_emitted = true;
-                    progress.source_activity(BenchmarkDatasetSource::kCoconut,
-                                             std::string("Skipping invalid COCONut objects; ") +
-                                                 (failures ? "details: " : "cannot write failure report: ") + failures_path.string());
-                }
+                failures.reject(physical_image, record.image_id, release.name, segment.id, segment.category_id, reason);
             };
             if (progress.normalization_observer_enabled())
                 request.progress = [&](std::uint64_t rows) { progress.phase(DatasetCompilePhase::Indexing, rows, release.expected_rows); };

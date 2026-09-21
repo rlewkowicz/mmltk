@@ -918,13 +918,12 @@ TEST_CASE("COCONut cancellation after the last record covers consolidation and i
     }
 }
 namespace {
-std::string white_jpeg() {
-    const std::array<unsigned char, 27> pixels{255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
-                                               255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255};
+std::string white_jpeg(int width = 3, int height = 3) {
+    const std::vector<unsigned char> pixels(static_cast<std::size_t>(width) * height * 3U, 255U);
     std::string bytes;
     REQUIRE(
         stbi_write_jpg_to_func([](void* context, void* data, int size) { static_cast<std::string*>(context)->append(static_cast<const char*>(data), size); },
-                               &bytes, 3, 3, 3, pixels.data(), 100));
+                               &bytes, width, height, 3, pixels.data(), 100));
     return bytes;
 }
 struct ServedPhysicalArchive {
@@ -1070,10 +1069,28 @@ struct LocalCoconutRecipe {
 TEST_CASE("COCONut private catalog compiles all validation choices through the production transaction", "[coconut][benchmark]") {
     ScopedTempDir root("coconut-recipe");
     bool alternate_members = false;
+    bool mismatched_geometry = false;
+    bool letterbox = false;
     SECTION("canonical physical members") {}
     SECTION("equivalent physical members and archive roots") { alternate_members = true; }
+    SECTION("mismatched mask geometry drops objects and retains original images") { mismatched_geometry = true; }
+    SECTION("mismatched mask geometry preserves physical image letterboxing") {
+        mismatched_geometry = true;
+        letterbox = true;
+    }
     LocalCoconutRecipe local(root.path(), false, false, alternate_members);
+    if (mismatched_geometry) {
+        auto& physical = *std::ranges::find(local.catalog.images, CoconutImageNamespace::Objects365V2, &RecipeImageArchive::source);
+        const auto archive = local.cache.source_downloads("objects365") / physical.artifact.filename;
+        const auto pixels = white_jpeg(6, 4);
+        const std::array<std::pair<std::string, std::string>, 2> members{{{objects(1).member, pixels}, {objects(2).member, pixels}}};
+        tar(archive, members);
+        physical.artifact.expected_size = std::filesystem::file_size(archive);
+    }
     auto config = local.compiler_config({BenchmarkDatasetVariant::Coconut, CoconutValidation::Coconut}, true);
+    if (letterbox) config.resize_mode = mmltk::backend::imaging::resample::ImageResizeMode::Letterbox;
+    std::uint64_t dropped_instances = 0;
+    config.progress = [&](const BenchmarkCompileProgress& update) { dropped_instances = update.dropped_instances; };
     std::string original_train;
     std::filesystem::file_time_type jpeg_time;
     ino_t jpeg_inode = 0;
@@ -1092,6 +1109,26 @@ TEST_CASE("COCONut private catalog compiles all validation choices through the p
         for (std::uint32_t i = 0; i < expected.size(); ++i) CHECK(train.image_entry(i).source_image_id == expected[i]);
         CHECK(train.image_entry(0).source == AnnotationSource::CoconutCoco);
         CHECK(train.image_entry(2).source == AnnotationSource::CoconutObjects365V2);
+        if (mismatched_geometry) {
+            for (const auto row : {2U, 3U}) {
+                CHECK(train.image_labels(row).empty());
+                CHECK(train.image_entry(row).original_width == 6U);
+                CHECK(train.image_entry(row).original_height == 4U);
+                for (std::size_t pixel = 0; pixel < 27; ++pixel)
+                    CHECK(train.image_pixels(row)[pixel] == (letterbox && pixel % 9U >= 6U ? 0.0F : 1.0F));
+            }
+            std::ifstream report(local.cache.root / "failed.txt");
+            std::size_t failures = 0;
+            for (std::string line; std::getline(report, line); ++failures) {
+                const auto failed = Json::parse(line);
+                CHECK((failed["image_id"] == 1U || failed["image_id"] == 2U));
+                CHECK((failed["object_id"] == 1U || failed["object_id"] == 2U));
+                CHECK(failed["reason"] == "annotation dimensions 3x3 do not match image dimensions 6x4");
+                CHECK(failed["image"] == objects(failed["image_id"].get<unsigned>()).member);
+            }
+            CHECK(failures == 4U * static_cast<unsigned>(rebuild));
+        }
+        CHECK(dropped_instances == (mismatched_geometry ? 4U : 0U));
         CHECK(train.image_labels(1).empty());
         REQUIRE(train.image_labels(0).size() == 2);
         CHECK(train.image_labels(0)[0].is_crowd());
@@ -1535,7 +1572,7 @@ void check_custom_compilation(const std::filesystem::path& output) {
     CHECK(val.image_entry(0).source == AnnotationSource::Coco);
     const auto manifest = read_json_file(output / "benchmark_manifest.json");
     CHECK(manifest["recipe"]["dataset"] == "coco-custom");
-    CHECK(manifest["compiled_format_version"] == 8);
+    CHECK(manifest["compiled_format_version"] == FORMAT_VERSION);
     CHECK(manifest["mapping_revision"] == kBenchmarkMappingRevision);
     REQUIRE(manifest["sources"].size() == 3);
     CHECK(manifest["sources"][0]["selected_images"] == 2);

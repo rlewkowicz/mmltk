@@ -140,7 +140,7 @@ stores the expensive source transformations—not PNG or JSON—so runtime loadi
 does not decode images, parse annotations, resize masks, resize inputs, or
 convert pixel layouts.
 
-The current format is **version 8**. Format-7 and other older files fail the
+The current format is **version 9**. Format-8 and other older files fail the
 ordinary version check and must be recompiled; there is no legacy reader or
 migration path. Its authoritative definitions and validation rules are
 [compiled_format.h](../src/backend/data/compiled_format.h) and
@@ -162,7 +162,7 @@ byte 0
 │ image 1: planar RGB float32              │ fixed image_stride
 │ ...                                      │
 ├──────────────────────────────────────────┤ label_offset
-│ PackedInstance[sum(num_instances)]       │ 56 bytes each
+│ PackedInstance[sum(num_instances)]       │ 60 bytes each
 ├──────────────────────────────────────────┤ mask_rle_offset
 │ RLEPair[sum(mask_rle_pairs)]             │ 8 bytes each
 └──────────────────────────────────────────┘ total_file_size
@@ -181,7 +181,7 @@ without holes inside their respective blocks.
 | Byte | Type | Field | Meaning |
 | ---: | --- | --- | --- |
 | 0 | `uint64` | `magic` | `0x464153544c445232` |
-| 8 | `uint32` | `version` | Current value: `8` |
+| 8 | `uint32` | `version` | Current value: `9` |
 | 12 | `uint32` | `num_images` | Number of images in this split |
 | 16 | `uint32` | `image_width` | Compiled image width |
 | 20 | `uint32` | `image_height` | Compiled image height |
@@ -220,7 +220,7 @@ Each packed `ImageEntry` is 40 bytes:
 | 8 | `uint32` | `label_offset` | Byte offset into the label block |
 | 12 | `uint16` | `num_instances` | Number of instances for this image |
 | 14 | `uint16` | padding | Zero |
-| 16 | `uint32` | `label_bytes` | `num_instances * 56` |
+| 16 | `uint32` | `label_bytes` | `num_instances * 60` |
 | 20 | `uint32` | `original_width` | Source width before compilation |
 | 24 | `uint32` | `original_height` | Source height before compilation |
 | 28 | `uint8` | `has_source_image_id` | Whether the source image ID is present |
@@ -242,14 +242,14 @@ per-image scale and padding fields.
 | 5 | COCONut annotations on Objects365 v1 images |
 | 6 | COCONut annotations on Objects365 v2 images |
 
-These values use the existing format-8 byte and preserve its layout. COCONut
+These values identify the annotation source independently of mask storage. COCONut
 stores the physical image ID in `source_image_id`; its separate
 [component inventory](benchmark-datasets.md#native-import-and-provenance)
 retains any differing release-row ID and the exact archive/member join.
 
 ### Instances and masks
 
-Each packed `PackedInstance` is 56 bytes:
+Each packed `PackedInstance` is 60 bytes:
 
 | Byte | Type | Field | Meaning |
 | ---: | --- | --- | --- |
@@ -259,12 +259,12 @@ Each packed `PackedInstance` is 56 bytes:
 | 6 | `float32` | `bbox_y1` | Continuous top corner |
 | 10 | `float32` | `bbox_x2` | Continuous right corner |
 | 14 | `float32` | `bbox_y2` | Continuous bottom corner |
-| 18 | `uint32` | `mask_rle_offset` | Byte offset into the RLE block |
-| 22 | `uint16` | `mask_rle_pairs` | Number of runs owned by this instance |
-| 24 | `float64` | `original_area` | Supplied or fallback area before compilation |
-| 32 | `uint64` | `annotation_id` | Source annotation identity, when present |
-| 40 | `uint64` | `source_category_id` | Source category identity, when present |
-| 48 | `uint64` | `source_ordinal` | Deterministic source annotation order |
+| 18 | `uint64` | `mask_rle_offset` | Byte offset into the RLE block |
+| 26 | `uint16` | `mask_rle_pairs` | Number of runs owned by this instance |
+| 28 | `float64` | `original_area` | Supplied or fallback area before compilation |
+| 36 | `uint64` | `annotation_id` | Source annotation identity, when present |
+| 44 | `uint64` | `source_category_id` | Source category identity, when present |
+| 52 | `uint64` | `source_ordinal` | Deterministic source annotation order |
 
 Flag bits are `1` for mask presence, `2` for crowd, `4` for raw ignore, `8` for
 annotation-ID presence, and `16` for category-ID presence. Unused bits must be
@@ -285,10 +285,11 @@ to one foreground class.
 
 The packed limits are intentional: class IDs occupy one byte, compiled image
 axes remain bounded to 32,767, and an image's instance count and an instance's
-RLE pair count must each fit an unsigned 16-bit value. Label-block and RLE-block
-byte offsets must fit their unsigned 32-bit fields. Boxes must remain finite
-and strictly ordered after conversion to float32. Compilation rejects values
-that cannot be represented before publication.
+RLE pair count must each fit an unsigned 16-bit value. Label-block byte offsets
+must fit their unsigned 32-bit fields. RLE-block byte offsets use unsigned
+64-bit fields and support combined mask storage beyond 4 GiB. Boxes must remain
+finite and strictly ordered after conversion to float32. Compilation rejects
+values that cannot be represented before publication.
 
 ## Compile and inspect
 

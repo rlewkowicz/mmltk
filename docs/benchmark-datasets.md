@@ -5,7 +5,7 @@
 The native benchmark compiler prepares `train.bin`, `val.bin`, and
 `benchmark_manifest.json` from retained source data. Both recipes use the
 existing COCO80 foreground catalog, [resize geometry](datasets.md#resize-geometry),
-and [compiled format 8](datasets.md#compiled-binary-format).
+and [compiled format 9](datasets.md#compiled-binary-format).
 
 ## Recipes and validation membership
 
@@ -107,6 +107,16 @@ the nearest `.cache` ancestor of the benchmark cache (normally
 own root. The report uses one JSON object per line and retains earlier entries.
 The first rejection produces a concise progress warning; report-write failure
 does not interrupt compilation.
+
+Before preparing COCONut labels, compilation checks each retained image's header
+against its annotation canvas. If dimensions differ, all objects on that image
+are omitted from compiled metadata and reported through the same `failed.txt`
+path, with both dimensions in the reason. The image remains, using its actual
+dimensions for resizing and Original view. A size mismatch does not establish
+that the mask belongs to the image, so the compiler does not rescale those
+annotations or invalidate the archive. Unreadable images still use bounded
+physical repair. These checks also apply when normalized annotations are reused
+from cache; retained source annotations and image bytes remain reusable.
 
 Current import admission bounds each encoded PNG to 64 MiB, each decoded image
 to 64 Mi pixels, each axis to 32,767, and each segment list to 65,535 entries.
@@ -234,7 +244,7 @@ These formats have independent versions:
 
 | Artifact | Current representation |
 | --- | --- |
-| Compiled `train.bin` / `val.bin` | [Format 8](datasets.md#compiled-binary-format), with the same packed layout and additional admitted source-kind values |
+| Compiled `train.bin` / `val.bin` | [Format 9](datasets.md#compiled-binary-format), with 64-bit mask byte offsets and 60-byte instance records |
 | Normalized annotation index | Version 3, 256-byte header, 32-byte image records, 64-byte annotation records, and source-mask RLE |
 | Download, extraction, and image-group metadata | Cache schema 2; the cache directory name remains `v1` |
 | COCONut physical/component inventory | Version 1 (`CNUTIVN1`), declaration-order little-endian encoding with checked strings/counts and a SHA-256 trailer |
@@ -256,6 +266,11 @@ are admitted together with their normalized index, input identity, edition,
 namespace, member joins, and normalization revision. Inventory strings are
 bounded to 4,096 bytes. Incompatible or invalid cache records require rebuilding
 from admitted source inputs rather than reinterpretation.
+
+Compiled mask offsets address the complete split's RLE block with 64 bits, so
+COCONut label preparation can exceed 4 GiB of mask data. Older compiled files
+require recompilation; source downloads, extracted images, and normalized
+annotation caches remain reusable.
 
 The [packed format limits](datasets.md#instances-and-masks) still apply. The
 compiler rejects unrepresentable offsets, counts, coordinates, or extents

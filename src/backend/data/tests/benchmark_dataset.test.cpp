@@ -716,7 +716,7 @@ void test_benchmark_cached_image_writer_and_loader() {
         const auto manifest = read_json_file(staged / "benchmark_manifest.json");
         CHECK(manifest.at("resampling").at("perceptual_downscale").get<bool>() == perceptual);
         CHECK(manifest.at("resampling").at("version").get<unsigned>() == 1U);
-        CHECK(manifest.at("compiled_format_version").get<unsigned>() == 8U);
+        CHECK(manifest.at("compiled_format_version").get<unsigned>() == FORMAT_VERSION);
         CHECK(manifest.at("normalized_annotation_version").get<unsigned>() == 3U);
         CHECK(manifest.at("resize_mode") == "stretch");
         CHECK(manifest.at("schema_version").get<unsigned>() == 3U);

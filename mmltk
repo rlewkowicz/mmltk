@@ -2629,6 +2629,29 @@ run_gpu_environment_diagnostic() {
     run_owned_docker_command "${diagnostic_container}" "${diagnostic_args[@]}"
 }
 
+run_benchmark_image_diagnostic() {
+    [[ "${repo_root}" != *:* ]] || die "diagnostic repository path cannot contain ':'"
+    command -v docker >/dev/null 2>&1 || die "docker is not installed"
+    docker_server_ready || die "docker daemon is unavailable; image diagnostic did not start"
+    local diagnostic_image_id diagnostic_container="${container_name}-benchmark-image"
+    diagnostic_image_id="$(docker image inspect "${build_image_name}" --format '{{.Id}}' 2>/dev/null)" ||
+        die "diagnostic requires existing image '${build_image_name}'"
+    prepare_owned_dirs "${repo_root}/build/validation/benchmark-image"
+    local -a diagnostic_args=(
+        run --rm --init --pull never --name "${diagnostic_container}"
+        --read-only --cap-drop ALL --security-opt no-new-privileges --network none
+        --user "${uid}:${gid}" --workdir /workspace
+        --tmpfs /tmp:rw,nosuid,nodev,size=64m
+        --volume "${repo_root}:/workspace:ro"
+        --volume "${repo_root}/build/validation/benchmark-image:/evidence:rw"
+        --entrypoint /usr/bin/timeout
+    )
+    append_wrapper_labels diagnostic_args "diagnose-benchmark-image"
+    run_owned_docker_command "${diagnostic_container}" "${diagnostic_args[@]}" \
+        "${diagnostic_image_id}" --signal=KILL 600s /usr/bin/python3 -I -B \
+        /workspace/tools/diagnose_benchmark_image.py "$@"
+}
+
 run_process_diagnostic() {
     if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
         printf '%s\n' \
@@ -3695,6 +3718,12 @@ if [[ "${1:-}" == "--diagnose-processes" ]]; then
     exit $?
 fi
 
+if [[ "${1:-}" == "--diagnose-benchmark-image" ]]; then
+    invocation_mode="diagnose-benchmark-image"
+    run_benchmark_image_diagnostic "${@:2}"
+    exit $?
+fi
+
 if [[ "${1:-}" == "--diagnose-native-link" ]]; then
     invocation_mode="diagnose-native-link"
     run_native_link_diagnostic "${@:2}"
@@ -3865,6 +3894,8 @@ for arg in "${passthrough_args[@]}"; do
         die "--diagnose-native-symbols must be the standalone operation; use './mmltk --diagnose-native-symbols --help'"
     [[ "${arg}" != "--diagnose-processes" ]] ||
         die "--diagnose-processes must be the standalone operation; use './mmltk --diagnose-processes --help'"
+    [[ "${arg}" != "--diagnose-benchmark-image" ]] ||
+        die "--diagnose-benchmark-image must be the standalone operation; use './mmltk --diagnose-benchmark-image --help'"
     [[ "${arg}" != "--diagnose-native-link" ]] ||
         die "--diagnose-native-link must be the standalone operation; use './mmltk --diagnose-native-link --help'"
 done

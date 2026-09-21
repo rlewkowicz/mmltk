@@ -41,7 +41,10 @@ struct CompiledDatasetInfo {
 };
 inline void validate_compiled_header(const FileHeader& header) {
     if (header.magic != MAGIC) { throw std::runtime_error("Bad magic in compiled file"); }
-    if (header.version != FORMAT_VERSION) { throw std::runtime_error("Version mismatch"); }
+    if (header.version != FORMAT_VERSION) {
+        throw std::runtime_error("compiled dataset format " + std::to_string(header.version) + " is unsupported; expected format " +
+                                 std::to_string(FORMAT_VERSION) + "; recompile the dataset");
+    }
     if (!std::ranges::all_of(header._reserved, [](std::uint8_t value) { return value == 0U; }))
         throw std::runtime_error("compiled header reserved fields are invalid");
     if (header.num_images == 0U || header.image_width == 0U || header.image_height == 0U || header.channels == 0U) {

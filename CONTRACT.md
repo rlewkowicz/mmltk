@@ -324,7 +324,7 @@ and become typed failures once at the nearest operation, worker, or external
 service boundary. A failed system preserves valid snapshots, reports failure,
 and retires its failed resources safely. Recoverable runtimes reconstruct
 lazily within that system, while independent systems continue operating.
-Persisted settings retain their named format. Compiled datasets use format 8
+Persisted settings retain their named format. Compiled datasets use format 9
 with source geometry and annotation metadata. Native RF-DETR
 checkpoints use only the current version-3 format; external upstream assets retain
 their independent import formats.

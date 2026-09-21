@@ -11,7 +11,7 @@
 #include "src/backend/data/compiled_format_limits.h"
 namespace mmltk::backend::data {
 inline constexpr uint64_t MAGIC = 0x46415354'4C445232ULL;
-inline constexpr uint32_t FORMAT_VERSION = 8;
+inline constexpr uint32_t FORMAT_VERSION = 9;
 inline constexpr size_t PAGE_SIZE = 4096;
 inline constexpr size_t HUGE_PAGE_SIZE = size_t{2} * 1024 * 1024;
 using PackedCoordinate = float;
@@ -23,7 +23,7 @@ struct __attribute__((packed)) PackedInstance {
     uint8_t class_id;
     uint8_t flags;
     PackedCoordinate bbox_x1, bbox_y1, bbox_x2, bbox_y2;
-    uint32_t mask_rle_offset;
+    uint64_t mask_rle_offset;
     uint16_t mask_rle_pairs;
     double original_area = 0.0;
     std::uint64_t annotation_id = 0;
@@ -74,7 +74,7 @@ inline std::string decode_open_images_category(std::uint64_t encoded) {
     }
     return mid;
 }
-static_assert(sizeof(PackedInstance) == 56);
+static_assert(sizeof(PackedInstance) == 60);
 struct __attribute__((packed)) ImageEntry {
     uint64_t pixel_offset;
     uint32_t label_offset;

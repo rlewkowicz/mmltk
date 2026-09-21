@@ -34,7 +34,7 @@
 ## Data and backend systems
 
 - [Datasets and compilation](datasets.md): source annotations and provenance,
-  format 8 and recompilation, Stretch/Letterbox geometry, optional perceptual
+  format 9 and recompilation, Stretch/Letterbox geometry, optional perceptual
   downscaling, quantized planar preparation, local batch capacity and leases,
   and Explore thumbnail/atlas retention through viewport and augmentation changes.
 - [Built-in benchmark datasets](benchmark-datasets.md): Coco custom and COCONut

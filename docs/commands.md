@@ -25,6 +25,7 @@ reuse a repository-scoped container and stream the application output.
 | `./mmltk --test cuda-vulkan -- --help` | Build/select the standalone CUDA/Vulkan diagnostic and show its positional options |
 | `./mmltk --logs --help` | Show log-query grammar and options |
 | `./mmltk --diagnose-processes [WRAPPER_MODE]` | Inspect processes in this repository's running wrapper containers |
+| `./mmltk --diagnose-benchmark-image --image-id ID [OPTIONS]` | Compare retained image headers with normalized annotation geometry |
 | `./mmltk --diagnose-io FILE` | Report a compiled file's storage/GPU capabilities |
 | `./mmltk --diagnose-gpu-environment runtime\|wayland-validation\|development` | Inspect an existing image's GPU, driver, library, and ICD environment |
 | `./mmltk --diagnose-gpu-program SOURCE.cpp ARGS...` | Compile and run a standalone CUDA-driver/Vulkan diagnostic using existing images |
@@ -36,7 +37,7 @@ The `|` entries above mean choose one value; they are not shell pipelines.
 Build, test, tidy, cleanup, export, and diagnostics are separate operations.
 Put `--logs`, `--diagnose-io`, `--diagnose-nvidia-payload`,
 `--diagnose-gpu-environment`, `--diagnose-gpu-program`, `--diagnose-native-symbols`,
-`--diagnose-native-link`, `--diagnose-processes`, or `--cleanup-report`
+`--diagnose-native-link`, `--diagnose-processes`, `--diagnose-benchmark-image`, or `--cleanup-report`
 first when invoking that standalone operation.
 
 The [validation guide](validation.md#standalone-cudavulkan-diagnostic) owns
@@ -66,6 +67,22 @@ one, create or alter containers, attach to a process, or build/pull images.
 Each daemon query has a 15-second deadline. No matching running container is
 a successful empty result. A snapshot describes current process state; it
 does not by itself establish a stall, completed work, or product performance.
+
+### Benchmark image geometry
+
+`./mmltk --diagnose-benchmark-image --help` describes the required numeric image
+ID and repository-relative inputs. Repeat `--index PATH` to inspect version-3
+normalized annotation rows; use `--image PATH` for a cached image or
+`--archive PATH` to find the image in a retained tar archive. JSONL output includes
+dimensions, archive member, image identity, encoded SHA-256, and JPEG EXIF
+orientation when present. Headers establish geometry, not full decodability.
+
+The command runs in the existing development image with networking disabled,
+read-only source mounts, no build or pull, and a ten-minute deadline. Optional
+`--export` copies the matched encoded image to
+`build/validation/benchmark-image/ID.jpg` or `ID.png` for inspection, replacing
+an earlier diagnostic copy. It does not change the source cache. Tar scans are
+sequential, and each inspected image is bounded to 64 MiB.
 
 ## Native CLI
 

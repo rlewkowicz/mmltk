@@ -527,9 +527,10 @@ custody; they do not substitute for the real rendered workflow case.
 
 The data cases also cover locally scheduled batch capacity, empty shards,
 categorical RLE sampling, parser scratch reuse, both resize modes, authoritative
-fractional boxes, source metadata/order/duplicates, present-empty masks, format-8
-admission, and old-version rejection. RF-DETR core cases cover full physical-slot ranking,
-post-selection class filtering, query/mask alignment, focal-alpha assignment,
+fractional boxes, source metadata/order/duplicates, present-empty masks, format-9
+admission, mask offsets beyond 4 GiB, and old-version rejection. RF-DETR core
+cases cover full physical-slot ranking, post-selection class filtering,
+query/mask alignment, focal-alpha assignment,
 crowd matching/ignore precedence, original-area ranges, per-category maxDets,
 and inclusive COCO thresholds. Training and inference cases exercise shared
 normalization and the separate candidate/evaluation budgets. These are focused

@@ -28,7 +28,7 @@ struct AugmentationPreviewAnnotation {
     bool mask_present = false;
     std::array<float, kAugmentationTransformSize> inverse{1.0F, 0.0F, 0.0F, 0.0F, 1.0F, 0.0F};
     std::array<float, kAugmentationTransformSize> occluder_inverse{1.0F, 0.0F, 0.0F, 0.0F, 1.0F, 0.0F};
-    std::uint32_t mask_rle_offset = 0U;
+    decltype(mmltk::backend::data::PackedInstance::mask_rle_offset) mask_rle_offset = 0U;
     std::uint16_t mask_rle_pairs = 0U;
     std::uint16_t class_id = 0U;
     std::int32_t occluder_index = -1;

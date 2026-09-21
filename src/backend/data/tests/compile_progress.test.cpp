@@ -35,6 +35,7 @@
 #include "src/backend/data/dataset_loader.h"
 #include "src/common/concurrency/event_cancellation.h"
 #include "src/common/io/file_memory.h"
+#include "src/common/math/checked_arithmetic.h"
 #include "src/backend/data/tests/test_fixture.h"
 #include "src/backend/data/detail/mask_rle_utils.h"
 using namespace mmltk::backend::data;
@@ -532,7 +533,7 @@ TEST_CASE("compiled annotations preserve continuous source meaning in both resiz
         config.num_workers = 1;
         DatasetCompiler::compile(DatasetCompiler::prepare(config, {"train"}), 0U);
         const auto store = CompiledDataset::open(compiled_bin_path(fixture));
-        CHECK(store.header().version == 8U);
+        CHECK(store.header().version == FORMAT_VERSION);
         CHECK(store.header().resize_mode == mode);
         const auto geometry = store.geometry(0);
         CHECK(geometry.resized_width == 8U);
@@ -569,8 +570,8 @@ TEST_CASE("compiled annotations preserve continuous source meaning in both resiz
         CHECK(store.image_entry(0).source_image_id == 0U);
     }
 }
-TEST_CASE("format 8 admission rejects invalid metadata and old versions", "[backend][data][compiler]") {
-    const mmltk::testsupport::ScopedTempDir root("format8-admission");
+TEST_CASE("compiled format admission rejects invalid metadata and old versions", "[backend][data][compiler]") {
+    const mmltk::testsupport::ScopedTempDir root("compiled-format-admission");
     const FixtureSpec fixture{.root_dir = root.path().string(), .width = 16, .height = 16, .num_images = 1, .background_images = 0};
     create_synthetic_dataset(fixture);
     compile_existing_fixture(fixture);
@@ -589,13 +590,14 @@ TEST_CASE("format 8 admission rejects invalid metadata and old versions", "[back
         CHECK_THROWS(CompiledDataset::open(path));
     };
     mutate([](auto& header, auto&) { header.version = 7U; });
+    mutate([](auto& header, auto&) { header.version = 8U; });
     mutate([](auto& header, auto&) { header.resize_mode = static_cast<mmltk::backend::imaging::resample::ImageResizeMode>(255U); });
     mutate([](auto& header, auto&) { header.mask_rle_offset = header.total_file_size + 1U; });
     mutate([](auto&, auto& label) { label.original_area = std::numeric_limits<double>::infinity(); });
     mutate([](auto&, auto& label) { label.bbox_x1 = std::numeric_limits<float>::quiet_NaN(); });
     mutate([](auto&, auto& label) { label.flags = 128U; });
     mutate([](auto&, auto& label) { label.flags &= ~kAnnotationMask; });
-    mutate([](auto&, auto& label) { label.mask_rle_offset = std::numeric_limits<std::uint32_t>::max(); });
+    mutate([](auto&, auto& label) { label.mask_rle_offset = std::numeric_limits<decltype(label.mask_rle_offset)>::max(); });
 }
 TEST_CASE("known empty masks declare availability without RLE storage", "[backend][data][compiler]") {
     const mmltk::testsupport::ScopedTempDir root("empty-mask-presence");
@@ -811,6 +813,25 @@ TEST_CASE("compiled layout checks alignment and arithmetic without storage", "[b
         }
     }
     CHECK_THROWS(make_file_header({1U, 1U, 1U, 3U, 65536U, 12U}, names, layout));
+    constexpr auto runs_per_label = std::numeric_limits<std::uint16_t>::max();
+    constexpr std::size_t label_count = std::numeric_limits<std::uint32_t>::max() / (std::size_t{runs_per_label} * sizeof(RLEPair)) + 2U;
+    std::vector<PackedInstance> labels(label_count);
+    std::uint64_t mask_bytes = 0U;
+    for (auto& label : labels) {
+        label.flags = kAnnotationMask;
+        label.bbox_x2 = label.bbox_y2 = 1.0F;
+        label.mask_rle_offset = mmltk::common::math::checked_cast<decltype(label.mask_rle_offset)>(mask_bytes, "compiled mask offset overflow");
+        label.mask_rle_pairs = runs_per_label;
+        mask_bytes += std::uint64_t{runs_per_label} * sizeof(RLEPair);
+    }
+    REQUIRE(labels.back().mask_rle_offset > std::numeric_limits<std::uint32_t>::max());
+    layout = compute_pixel_layout(1U, 512U * 512U * 3U * sizeof(float));
+    finalize_layout(layout, {labels.size(), mask_bytes / sizeof(RLEPair)});
+    const auto header = make_file_header({1U, 512U, 512U, 3U, static_cast<std::uint32_t>(labels.size()), 512U * 512U * 3U * sizeof(float)}, names, layout);
+    validate_compiled_header(header);
+    const auto sections = validate_compiled_file_sections(header, layout.total_size);
+    CHECK(validate_compiled_label_entries(labels, header, sections.rle_region_bytes) == mask_bytes);
+    CHECK_THROWS(validate_compiled_label_entries(labels, header, mask_bytes - sizeof(RLEPair)));
 }
 TEST_CASE("categorical resize agrees exactly with dense nearest-center sampling", "[backend][data][compiler][mask]") {
     using namespace mmltk::backend::data::dataset;

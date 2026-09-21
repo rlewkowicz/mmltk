@@ -320,6 +320,17 @@ TEST_CASE("native augmentation resolves exact visible support", "[backend][model
         CHECK(output[0].occluder_index == 1);
         CHECK(output[1].source_ordinal == 2);
     }
+    SECTION("preview metadata preserves dataset mask offsets beyond four GiB") {
+        const std::uint64_t source_offset = std::uint64_t{1} << 32U;
+        source.mask_rle_offset = source_offset;
+        source.mask_rle_pairs = 0U;
+        source.flags &= ~mmltk::backend::data::kAnnotationMask;
+        donor.mask_rle_offset = source_offset + sizeof(RLEPair);
+        build_augmentation_preview_annotations(std::span{&source, 1U}, &donor, &plan, 8, 8, output, runs);
+        REQUIRE(output.size() == 2);
+        CHECK(output[0].mask_rle_offset == source_offset);
+        CHECK(output[1].mask_rle_offset == source_offset + sizeof(RLEPair));
+    }
     SECTION("malformed masks fail before visibility culling") {
         const std::array malformed{RLEPair{63, 2}};
         source.mask_rle_pairs = 1;

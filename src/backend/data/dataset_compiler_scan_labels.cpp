@@ -580,7 +580,8 @@ LabelBlocks build_label_blocks(const std::filesystem::path& split_dir, uint32_t 
             const size_t image_rle_start = rle_cursor;
             size_t image_rle_cursor = image_rle_start;
             for (PackedInstance& packed : result.labels) {
-                packed.mask_rle_offset = checked_cast<uint32_t>(image_rle_cursor * sizeof(RLEPair), "mask RLE offset overflow");
+                packed.mask_rle_offset = mmltk::common::math::checked_multiply<decltype(PackedInstance::mask_rle_offset)>(
+                    image_rle_cursor, sizeof(RLEPair), "mask RLE offset overflow");
                 image_rle_cursor += packed.mask_rle_pairs;
             }
             if (image_rle_cursor - image_rle_start != result.rle_pairs.size()) {
