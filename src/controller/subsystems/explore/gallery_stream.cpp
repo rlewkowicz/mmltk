@@ -1109,14 +1109,13 @@ std::vector<ExploreLabel> GalleryStream::Impl::Labels() const {
     for (std::size_t slot = 0U; slot < State().tile_meanings.size(); ++slot) {
         if (!State().tile_meanings[slot]) continue;
         const auto& tile = *State().tile_meanings[slot];
-        const float x = static_cast<float>(slot % State().viewport.columns * side + tile.card.image_x);
-        const float y = static_cast<float>(slot / State().viewport.columns * side + tile.card.image_y);
-        const float width = static_cast<float>(tile.card.image_width);
-        const float height = static_cast<float>(tile.card.image_height);
+        const float x = static_cast<float>(slot % State().viewport.columns * side);
+        const float y = static_cast<float>(slot / State().viewport.columns * side);
         for (const auto& annotation : tile.annotations) {
             if (annotation.class_id >= State().active_classes.size() || !State().active_classes[annotation.class_id].visible) continue;
-            labels.push_back({.box = {{x + annotation.box_xyxy[0] * width, y + annotation.box_xyxy[1] * height},
-                                      {x + annotation.box_xyxy[2] * width, y + annotation.box_xyxy[3] * height}},
+            const auto box = explore::project_explore_card_box(tile.card, annotation);
+            if (box[2] <= box[0] || box[3] <= box[1]) continue;
+            labels.push_back({.box = {{x + box[0], y + box[1]}, {x + box[2], y + box[3]}},
                               .category = annotation.class_id,
                               .compiled_index = State().visible_indices[slot]});
         }

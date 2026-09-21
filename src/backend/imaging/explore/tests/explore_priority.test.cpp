@@ -22,6 +22,7 @@
 #include "src/controller/subsystems/explore/detail/gallery_stream_probe.h"
 #include "src/backend/models/rfdetr/augmentation/spatial_erasure.h"
 #include "src/backend/imaging/raster/class_palette.h"
+#include "src/backend/imaging/raster/image_containment.h"
 import mmltk.backend.imaging.explore.explore_render_core;
 import mmltk.backend.imaging.explore.compiled_explore_store;
 import mmltk.backend.imaging.raster;
@@ -306,8 +307,10 @@ TEST_CASE("Rendered probes compare owned pitched RGBA references including alpha
         for (std::size_t x = 0U; x < extent; ++x) {
             const auto pixel = y * pitch + x * 4U;
             const bool content = x >= 2U && x < 6U && y >= 2U && y < 6U;
-            const bool fringe = x >= 1U && x < 7U && y >= 1U && y < 7U;
-            filtered[pixel + 1U] = content ? 255U : fringe ? 26U : 0U;
+            constexpr auto padding = mmltk::backend::imaging::raster::kAtlasPadding;
+            filtered[pixel] = content ? 0U : padding.r;
+            filtered[pixel + 1U] = content ? 255U : padding.g;
+            filtered[pixel + 2U] = content ? 0U : padding.b;
             filtered[pixel + 3U] = 255U;
             overlay[pixel + 1U] = 255U;
             overlay[pixel + 3U] = 255U;
@@ -318,7 +321,7 @@ TEST_CASE("Rendered probes compare owned pitched RGBA references including alpha
     const ExploreRenderedCardProbe enlarged{
         .reference = target(retained), .content_x = 2U, .content_y = 2U, .content_width = 4U, .content_height = 4U, .box_width = extent, .box_height = extent};
     CHECK(measure(enlarged) == std::array<std::uint64_t, 5U>{16U, 16U, 28U, 36U, 16U});
-    // A filtered fringe is valid only when the exact RGBA copy is preserved.
+    // The crop/padding transition is valid only when its exact RGBA copy is preserved.
     auto mismatched = filtered;
     mismatched[pitch + 3U * 4U + 3U] = 0U;
     retained.upload<std::uint8_t>(mismatched);
@@ -437,6 +440,8 @@ class SemanticOracleBuffers final {
         .pixels = pixels,
         .source_width = source_width,
         .source_height = source_height,
+        .crop_width = source_width,
+        .crop_height = source_height,
         .image_x = contain.x,
         .image_y = contain.y,
         .image_width = contain.width,

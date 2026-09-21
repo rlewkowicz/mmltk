@@ -125,7 +125,9 @@ __global__ void atlas_tile_base_kernel(const ExploreRenderTargetView target_view
         return;
     }
     const auto card = cards[tile.card_index];
-    if (card.source_width == 0U || card.source_height == 0U) {
+    if (card.source_width == 0U || card.source_height == 0U || card.crop_width == 0U || card.crop_height == 0U ||
+        card.crop_x >= card.source_width || card.crop_y >= card.source_height || card.crop_width > card.source_width - card.crop_x ||
+        card.crop_height > card.source_height - card.crop_y) {
         store(target, static_cast<int>(x), static_cast<int>(y), output);
         return;
     }
@@ -135,11 +137,15 @@ __global__ void atlas_tile_base_kernel(const ExploreRenderTargetView target_view
         store(target, static_cast<int>(x), static_cast<int>(y), output);
         return;
     }
-    const float normalized_x = (static_cast<float>(x - image_x) + 0.5F) / static_cast<float>(card.image_width);
-    const float normalized_y = (static_cast<float>(y - image_y) + 0.5F) / static_cast<float>(card.image_height);
+    const float source_x = static_cast<float>(card.crop_x) +
+                           (static_cast<float>(x - image_x) + 0.5F) * static_cast<float>(card.crop_width) / static_cast<float>(card.image_width);
+    const float source_y = static_cast<float>(card.crop_y) +
+                           (static_cast<float>(y - image_y) + 0.5F) * static_cast<float>(card.crop_height) / static_cast<float>(card.image_height);
+    const float normalized_x = source_x / static_cast<float>(card.source_width);
+    const float normalized_y = source_y / static_cast<float>(card.source_height);
     if (view.draw_base != 0U && card.pixels != nullptr) {
-        const float sample_x = normalized_x * static_cast<float>(card.source_width) - 0.5F;
-        const float sample_y = normalized_y * static_cast<float>(card.source_height) - 0.5F;
+        const float sample_x = fminf(static_cast<float>(card.crop_x + card.crop_width - 1U), fmaxf(static_cast<float>(card.crop_x), source_x - 0.5F));
+        const float sample_y = fminf(static_cast<float>(card.crop_y + card.crop_height - 1U), fmaxf(static_cast<float>(card.crop_y), source_y - 0.5F));
         output = make_uchar4(to_byte(sample_nchw(card.pixels, card.source_width, card.source_height, 0U, sample_x, sample_y)),
                              to_byte(sample_nchw(card.pixels, card.source_width, card.source_height, 1U, sample_x, sample_y)),
                              to_byte(sample_nchw(card.pixels, card.source_width, card.source_height, 2U, sample_x, sample_y)), 255U);
@@ -251,13 +257,18 @@ __global__ void atlas_tile_box_kernel(const ExploreRenderTargetView target_view_
         return;
     }
     const auto card = cards[tile.card_index];
-    if (card.annotation_offset > annotation_capacity || card.annotation_count > annotation_capacity - card.annotation_offset) { return; }
+    if (card.source_width == 0U || card.source_height == 0U || card.crop_width == 0U || card.crop_height == 0U ||
+        card.annotation_offset > annotation_capacity || card.annotation_count > annotation_capacity - card.annotation_offset) { return; }
     const std::uint32_t image_x = tile.destination_x + card.image_x;
     const std::uint32_t image_y = tile.destination_y + card.image_y;
     for (std::uint32_t local = 0U; local < card.annotation_count; ++local) {
         const auto annotation = annotations[card.annotation_offset + local];
-        draw_box_edges(target, annotation, image_x, image_y, static_cast<float>(card.image_width), static_cast<float>(card.image_height), 0.0F, 0.0F, 1.0F,
-                       1.0F, image_x, image_y, min(card.image_width, tile.destination_width - min(card.image_x, tile.destination_width)),
+        draw_box_edges(target, annotation, image_x, image_y, static_cast<float>(card.image_width), static_cast<float>(card.image_height),
+                       static_cast<float>(card.crop_x) / static_cast<float>(card.source_width),
+                       static_cast<float>(card.crop_y) / static_cast<float>(card.source_height),
+                       static_cast<float>(card.crop_width) / static_cast<float>(card.source_width),
+                       static_cast<float>(card.crop_height) / static_cast<float>(card.source_height), image_x, image_y,
+                       min(card.image_width, tile.destination_width - min(card.image_x, tile.destination_width)),
                        min(card.image_height, tile.destination_height - min(card.image_y, tile.destination_height)), classes, semantics.class_count);
     }
 }
@@ -313,15 +324,16 @@ __global__ void probe_rendered_card_kernel(const ExploreRenderTargetView clean_v
     if (in_content && (clean_pixel.x != 0U || clean_pixel.y != 0U || clean_pixel.z != 0U)) atomicAdd(counts, 1ULL);
     const bool content_column = x >= probe.content_x && x < content_right;
     const bool content_row = y >= probe.content_y && y < content_bottom;
-    // Linear filtering can color the immediate outside edge during enlargement.
-    // Check black padding within each band, and compare both sides of the exact
-    // geometric transition with the retained physical-copy reference.
+    // Atlas padding is written independently of the sampled source crop.
+    // Check each band and both sides of its exact geometric transition against
+    // the retained physical-copy reference.
     const std::uint32_t padding_count =
         (probe.content_y != 0U && content_column && y == (probe.content_y - 1U) / 2U ? 1U : 0U) +
         (content_bottom < clean.height && content_column && y == content_bottom + (clean.height - content_bottom) / 2U ? 1U : 0U) +
         (probe.content_x != 0U && content_row && x == (probe.content_x - 1U) / 2U ? 1U : 0U) +
         (content_right < clean.width && content_row && x == content_right + (clean.width - content_right) / 2U ? 1U : 0U);
-    if (padding_count != 0U && clean_pixel.x == 0U && clean_pixel.y == 0U && clean_pixel.z == 0U)
+    constexpr auto padding = mmltk::backend::imaging::raster::kAtlasPadding;
+    if (padding_count != 0U && clean_pixel.x == padding.r && clean_pixel.y == padding.g && clean_pixel.z == padding.b && clean_pixel.w == padding.a)
         atomicAdd(counts + 1U, static_cast<unsigned long long>(padding_count));
     const bool on_content_edge = x == probe.content_x || y == probe.content_y || x + 1U == content_right || y + 1U == content_bottom;
     if (in_content && on_content_edge) {

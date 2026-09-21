@@ -1,6 +1,7 @@
 #include "src/controller/subsystems/explore/detail/gallery_read_scheduler.h"
 #include "src/controller/subsystems/explore/detail/gallery_stream.h"
 #include "src/backend/models/rfdetr/augmentation/sampling.h"
+#include "src/backend/imaging/resample/image_resize.h"
 #include "src/backend/models/rfdetr/augmentation/gpu_augment.h"
 #include <algorithm>
 #include <array>
@@ -205,10 +206,20 @@ void GalleryReadScheduler::ReadLanePayload(Lane& lane) {
         store_payload(lane.pinned.data(), lane.layout.annotations.offset + label_index * sizeof(explore::ExploreRenderAnnotationDescriptor), annotation);
         rle_cursor += runs.size();
     }
-    const auto image = explore::make_explore_contain_rect(lane.store->header().image_width, lane.store->header().image_height, lane.card_extent);
+    const auto& entry = lane.store->image_entry(lane.compiled_index);
+    const bool source_known = entry.original_width != 0U && entry.original_height != 0U;
+    const auto content = source_known ? lane.store->geometry(lane.compiled_index)
+                                      : mmltk::backend::imaging::resample::ImageResizeGeometry{lane.store->header().image_width,
+                                                                                             lane.store->header().image_height, 0U, 0U};
+    const auto image = explore::make_explore_contain_rect(source_known ? entry.original_width : lane.store->header().image_width,
+                                                         source_known ? entry.original_height : lane.store->header().image_height, lane.card_extent);
     const explore::ExploreRenderCardDescriptor card{
         .source_width = lane.store->header().image_width,
         .source_height = lane.store->header().image_height,
+        .crop_x = content.offset_x,
+        .crop_y = content.offset_y,
+        .crop_width = content.resized_width,
+        .crop_height = content.resized_height,
         .image_x = image.x,
         .image_y = image.y,
         .image_width = image.width,

@@ -92,20 +92,6 @@ void GalleryStreamProbe::DiagnoseRendered(const GalleryProductState& product, co
         throw std::runtime_error("Explore semantic diagnostic count failed");
     if (explore::checksum_explore_pixels(checksum_target, device_facts + 1U, stream) != explore::kExploreStorageSuccess)
         throw std::runtime_error("Explore image diagnostic checksum failed");
-    const auto letterbox = product.store->geometry(compiled_index);
-    const auto scale_coordinate = [](const std::uint32_t coordinate, const std::uint32_t destination, const std::uint32_t source) {
-        return static_cast<std::uint32_t>((static_cast<std::uint64_t>(coordinate) * destination) / source);
-    };
-    const auto scale_interval = [&scale_coordinate](const std::uint32_t offset, const std::uint32_t extent, const std::uint32_t destination,
-                                                    const std::uint32_t source) {
-        const auto begin = scale_coordinate(offset, destination, source);
-        const auto end = scale_coordinate(offset + extent, destination, source);
-        return std::pair{begin, end - begin};
-    };
-    const auto [content_x, content_width] =
-        card ? scale_interval(letterbox.offset_x, letterbox.resized_width, card->image_width, card->source_width) : std::pair{0U, 0U};
-    const auto [content_y, content_height] =
-        card ? scale_interval(letterbox.offset_y, letterbox.resized_height, card->image_height, card->source_height) : std::pair{0U, 0U};
     explore::ExploreRenderTargetView reference{};
     if (sample_card && product.cache.size() != 0U) {
         reference = gallery_target(reference_plane);
@@ -117,28 +103,27 @@ void GalleryStreamProbe::DiagnoseRendered(const GalleryProductState& product, co
     }
     const explore::ExploreRenderedCardProbe probe{
         .reference = reference,
-        .content_x = card ? card->image_x + content_x : 0U,
-        .content_y = card ? card->image_y + content_y : 0U,
-        .content_width = content_width,
-        .content_height = content_height,
+        .content_x = card ? card->image_x : 0U,
+        .content_y = card ? card->image_y : 0U,
+        .content_width = card ? card->image_width : 0U,
+        .content_height = card ? card->image_height : 0U,
     };
     if (sample_card && explore::sample_explore_rendered_card(checksum_target, count_target, reference, device_facts + kCardSamplesOffset, stream) !=
                            explore::kExploreStorageSuccess)
         throw std::runtime_error("Explore rendered card diagnostic sampling failed");
     auto rendered_probe = probe;
     if (card && probe_annotation) {
-        rendered_probe.box_x = card->image_x + static_cast<std::uint32_t>(probe_annotation->box_xyxy[0] * static_cast<float>(card->image_width));
-        rendered_probe.box_y = card->image_y + static_cast<std::uint32_t>(probe_annotation->box_xyxy[1] * static_cast<float>(card->image_height));
-        const auto box_right = card->image_x + static_cast<std::uint32_t>(probe_annotation->box_xyxy[2] * static_cast<float>(card->image_width));
-        const auto box_bottom = card->image_y + static_cast<std::uint32_t>(probe_annotation->box_xyxy[3] * static_cast<float>(card->image_height));
+        const auto box = explore::project_explore_card_box(*card, *probe_annotation);
+        rendered_probe.box_x = static_cast<std::uint32_t>(box[0]);
+        rendered_probe.box_y = static_cast<std::uint32_t>(box[1]);
+        const auto box_right = static_cast<std::uint32_t>(box[2]);
+        const auto box_bottom = static_cast<std::uint32_t>(box[3]);
         rendered_probe.box_width = box_right > rendered_probe.box_x ? box_right - rendered_probe.box_x : 0U;
         rendered_probe.box_height = box_bottom > rendered_probe.box_y ? box_bottom - rendered_probe.box_y : 0U;
         const bool padded = static_cast<std::uint64_t>(rendered_probe.content_width) * rendered_probe.content_height <
                             static_cast<std::uint64_t>(checksum_target.width) * checksum_target.height;
-        const bool full_card =
-            card->image_x == 0U && card->image_y == 0U && card->image_width == checksum_target.width && card->image_height == checksum_target.height;
         const bool identity_preview = !product.plan.augmentation.enabled || !product.plan.augmentation_config.enabled;
-        const bool probe_valid = rendered_probe.reference.valid() && identity_preview && padded && full_card && rendered_probe.box_width > 2U &&
+        const bool probe_valid = rendered_probe.reference.valid() && identity_preview && padded && rendered_probe.box_width > 2U &&
                                  rendered_probe.box_height > 2U && rendered_probe.box_x < checksum_target.width &&
                                  rendered_probe.box_y < checksum_target.height && rendered_probe.box_width <= checksum_target.width - rendered_probe.box_x &&
                                  rendered_probe.box_height <= checksum_target.height - rendered_probe.box_y;

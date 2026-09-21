@@ -745,18 +745,29 @@ void test_compiled_dataset_explore_projection_navigation_and_streaming() {
     auto detail_extent_admission = system.Select({.compiled_index = 10U});
     REQUIRE(audit.Wait([&] { return !system.snapshot().busy && system.snapshot().revision > detail_extent_admission.revision; }));
     CHECK((system.snapshot().frame.extent == controller::VisualExtent{.width = 32U, .height = 32U}));
-    CHECK(audit.detail_checksum() == rerolled_checksums[0]);
+    // Detail retains the native canvas; the atlas now contains source-aspect content.
+    CHECK(audit.detail_checksum() != 0U);
+    CHECK(audit.detail_checksum() != rerolled_checksums[0]);
     const auto detail_scene = system.snapshot().scene;
-    REQUIRE(detail_scene.objects.size() == gallery_labels.size());
-    for (std::size_t index = 0U; index < gallery_labels.size(); ++index) {
-        const auto& actual = detail_scene.objects[index].box;
-        const auto& expected = gallery_labels[index].box;
-        CHECK(std::abs(actual.first.x - expected.first.x) < 0.00001F);
-        CHECK(std::abs(actual.first.y - expected.first.y) < 0.00001F);
-        CHECK(std::abs(actual.second.x - expected.second.x) < 0.00001F);
-        CHECK(std::abs(actual.second.y - expected.second.y) < 0.00001F);
-        CHECK(detail_scene.objects[index].category == gallery_labels[index].category);
+    std::size_t gallery_label_index = 0U;
+    for (const auto& object : detail_scene.objects) {
+        auto expected = object.box;
+        const auto project_y = [&](const float value) {
+            return 8.0F + std::clamp((value - static_cast<float>(letterbox.offset_y)) /
+                                        static_cast<float>(letterbox.resized_height), 0.0F, 1.0F) * 16.0F;
+        };
+        expected.first.y = project_y(expected.first.y);
+        expected.second.y = project_y(expected.second.y);
+        if (expected.second.x <= expected.first.x || expected.second.y <= expected.first.y) continue;
+        REQUIRE(gallery_label_index < gallery_labels.size());
+        const auto& actual = gallery_labels[gallery_label_index++];
+        CHECK(std::abs(actual.box.first.x - expected.first.x) < 0.00001F);
+        CHECK(std::abs(actual.box.first.y - expected.first.y) < 0.00001F);
+        CHECK(std::abs(actual.box.second.x - expected.second.x) < 0.00001F);
+        CHECK(std::abs(actual.box.second.y - expected.second.y) < 0.00001F);
+        CHECK(actual.category == object.category);
     }
+    CHECK(gallery_label_index == gallery_labels.size());
     check_published_frame(system);
     const auto full_detail = system.snapshot().frame;
     const auto clean_detail = full_detail.clean_revision;

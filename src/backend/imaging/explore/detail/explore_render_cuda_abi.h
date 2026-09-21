@@ -21,6 +21,11 @@ struct ExploreRenderCardDescriptorAbi final {
     // CLEANUP-IGNORE: This fixed card-input kernel ABI preserves its independently versioned source geometry.
     std::uint32_t source_width = 0U;
     std::uint32_t source_height = 0U;
+    // Stored content in the compiled allocation; annotations remain full-canvas.
+    std::uint32_t crop_x = 0U;
+    std::uint32_t crop_y = 0U;
+    std::uint32_t crop_width = 0U;
+    std::uint32_t crop_height = 0U;
     std::uint32_t image_x = 0U;
     std::uint32_t image_y = 0U;
     std::uint32_t image_width = 0U;

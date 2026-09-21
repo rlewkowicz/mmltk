@@ -1,5 +1,6 @@
 module;
 #include <algorithm>
+#include <array>
 #include "src/backend/imaging/raster/image_containment.h"
 #include <cstddef>
 #include <cstdint>
@@ -24,6 +25,22 @@ using ExploreRenderClassDescriptor = detail::ExploreRenderClassDescriptorAbi;
 using ExploreContainRect = mmltk::backend::imaging::raster::ImageContainRect;
 [[nodiscard]] inline ExploreContainRect make_explore_contain_rect(std::uint32_t width, std::uint32_t height, std::uint32_t extent) noexcept {
     return mmltk::backend::imaging::raster::contain_image(width, height, extent, extent);
+}
+// Project full-canvas normalized boxes into card-local contained pixels for
+// captions and optional diagnostic regions, without changing retained meaning.
+[[nodiscard]] inline std::array<float, 4U> project_explore_card_box(const ExploreRenderCardDescriptor& card,
+                                                                  const ExploreRenderAnnotationDescriptor& annotation) noexcept {
+    std::array<float, 4U> box{};
+    for (std::size_t index = 0U; index != box.size(); ++index) {
+        const bool horizontal = index % 2U == 0U;
+        const float source = static_cast<float>(horizontal ? card.source_width : card.source_height);
+        const float origin = static_cast<float>(horizontal ? card.crop_x : card.crop_y) / source;
+        const float extent = static_cast<float>(horizontal ? card.crop_width : card.crop_height) / source;
+        const float normalized = std::clamp((annotation.box_xyxy[index] - origin) / extent, 0.0F, 1.0F);
+        box[index] = static_cast<float>(horizontal ? card.image_x : card.image_y) +
+                     normalized * static_cast<float>(horizontal ? card.image_width : card.image_height);
+    }
+    return box;
 }
 // A tile is an independently patchable region of a persistent atlas.  Its
 // generation fields are copied from the owning lane request and remain part
