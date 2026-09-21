@@ -40,12 +40,10 @@ editor widget identities survive ordinary layout and native-state updates.
 
 Train uses the [retained dashboard](#training-dashboard) in the center column,
 with the shared workspace aspect selector and a separate live progress card.
-It has no native GPU image workspace. Its Dataset card offers Stretch and
-Letterbox compilation radios, separate from perceptual downscaling; native
-[resize defaults and geometry](datasets.md#resize-geometry) drive those controls.
-It keeps the optional test split independent of inferred train/validation
-paths; manual split text fields appear when inference is disabled. Its weights
-card owns Transfer/Resume.
+It has no native GPU image workspace. Its
+[Dataset card](#dataset-compilation-controls) keeps the optional test split
+independent of inferred train/validation paths; manual split text fields appear
+when inference is disabled. Its weights card owns Transfer/Resume.
 Its Output card selects Auto Output or Browse Output, shows the selected/active
 path, and loads supported saved charts. Advanced includes
 **Exponential moving average**, disabled by default, and separate
@@ -72,6 +70,36 @@ duplicate starts. Progress shows the preparation stage and then the owning
 operation's completed work; unknown totals stay indeterminate. Video controls
 use the same pending-system admission as their typed requests, including an
 event arriving before its reply.
+
+### Dataset compilation controls
+
+The [Dataset component](../src/frontend/iced/src/view/train/dataset.rs) offers
+Stretch and Letterbox radios and a separate Perceptual downscaling checkbox.
+Native [resize defaults and geometry](datasets.md#resize-geometry) drive those
+choices. **Compile Benchmark Dataset Override** switches the explicit compile
+action between a source directory and a built-in recipe.
+
+With the override on, **Coco custom** and **Coconut** radios appear. Coco custom
+is the native default. Selecting Coconut additionally reveals **Coconut
+validation**, **Stock validation**, and **Coconut stock**; Coconut validation
+is the native initial choice. The
+[recipe membership table](benchmark-datasets.md#recipes-and-validation-membership)
+defines exactly which images and labels each choice compiles.
+
+Both selections persist in settings. Returning to Coco custom or disabling the
+override hides the dependent radios without clearing their values. The hidden
+validation choice has no effect on Coco custom, and Directory compilation ignores
+both benchmark choices. Override mode disables source-directory text and Browse;
+turning it off restores those controls. Selecting a radio never starts work.
+
+**Compile Benchmark Dataset** or **Compile Dataset** requires settled settings
+and native admission. The accepted native request captures those settings for
+the entire operation. While compilation is active, the two recipe and three
+validation radios are disabled; the established Dataset controls keep their
+existing enablement rules. The action becomes **Cancel compilation**, using
+the Dataset system's Stop operation. Progress uses native
+[acquisition and output facts](benchmark-datasets.md#reading-compilation-progress),
+and completion, cancellation, or failure comes from the native terminal result.
 
 ## Shared primary actions
 

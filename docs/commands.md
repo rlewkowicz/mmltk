@@ -130,6 +130,37 @@ for ONNX metadata commands whose output requires explicit diagnostics.
 Fatal operation failures still produce a concise
 [stderr report](logging.md#fatal-stderr-reports) with diagnostics disabled.
 
+### Benchmark cache selection
+
+GUI and CLI benchmark compilation use the same compiler-owned precedence:
+
+1. A nonempty explicit `BenchmarkCompilerConfig::cache_dir`.
+2. A nonempty `MMLTK_BENCHMARK_DATASET_CACHE_ROOT` environment value.
+3. The relative fallback `./.cache/benchmark-dataset/v1`.
+
+The wrapper supplies `MMLTK_BENCHMARK_DATASET_CACHE_ROOT` as the container path
+for `<MMLTK_CACHE_ROOT>/benchmark-dataset/v1`. `MMLTK_CACHE_ROOT` defaults to
+the repository's `.cache` and may select a subtree there; relative values are
+repository-relative. Configure that wrapper root to change the shared GUI/CLI
+location. The supplied absolute path keeps subdirectory invocation from
+accidentally selecting another cache. An empty environment value falls through
+to the compiler's relative default when it is called without that wrapper value.
+
+The CLI forwards its explicit `--cache-dir` to the compiler:
+
+```bash
+./mmltk rfdetr compile --compile-benchmark-dataset 432 \
+  --output-dir ./compiled --cache-dir ./.cache/benchmark-dataset/v1
+```
+
+`--compile-benchmark-dataset` takes the square resolution. This CLI route uses
+Coco custom; the GUI's [Dataset controls](gui-interaction.md#dataset-compilation-controls)
+expose Coconut and its validation choices. `--cache-dir` and `--overwrite`
+require benchmark mode. `--overwrite` replaces compiled output while preserving
+the separate persistent source cache. The
+[benchmark reference](benchmark-datasets.md#persistent-cache-and-publication)
+owns cache reuse, output/cache overlap rejection, and publication behavior.
+
 ## Desktop options and environment
 
 ```bash

@@ -49,6 +49,7 @@ owned path bytes across worker calls.
 
 | Workflow owner | Implementation and handoff |
 | --- | --- |
+| [DatasetSystem](../src/controller/subsystems/system/dataset_system.cpp) | Captures explicit compile settings, owns compile/inspect admission and cancellation, and invokes `ArtifactStore` through its retained runtime |
 | [TrainingSystem](../src/controller/subsystems/train/training_system.cpp) | Starts the sibling CLI through `TrainProcessClient`, owns run inspection/history through `TrainRunStore`, and admits checkpoint resume |
 | [ValidationSystem](../src/controller/subsystems/validate/validation_system.cpp) | Owns the selected evaluation session, detailed result pages, and retained samples through `ValidationSamples` |
 | [PredictSystem](../src/controller/subsystems/system/predict_system.cpp) | Owns incremental prediction, video playback control, and latest preview products |
@@ -100,6 +101,21 @@ geometry below the data layer; compilers apply it to pixels, continuous boxes,
 and categorical masks. Compiled readers expose stored mode, original extents,
 annotation metadata, and provenance without a model-layer dependency.
 
+The [benchmark recipes](benchmark-datasets.md) supply source membership and
+annotation policy to the same acquisition, resize, writer, and publication
+owners. Native
+[BenchmarkDatasetSelection](../src/backend/data/benchmark_dataset_options.h)
+owns the recipe/validation vocabulary and defaults. Settings persistence and
+generated Rust project that declaration; the Dataset component owns radio
+copy, visibility, and interaction.
+
+The shell supplies its shared `RuntimeDiagnosticTarget` to the dataset runtime
+factory. `ArtifactDatasetRuntime` retains the target by value and creates its
+borrowed artifact observer only for synchronous `Compile`. The data layer
+consumes its existing benchmark trace callbacks without a controller dependency.
+[Benchmark diagnostics](logging.md#benchmark-compilation-traces) retain the
+shared service's disablement, delivery, and shutdown policy.
+
 RF-DETR's ordinary [model.h](../src/backend/models/rfdetr/core/model.h),
 [model_state.h](../src/backend/models/rfdetr/core/model_state.h), and
 [model_state_load.h](../src/backend/models/rfdetr/core/model_state_load.h)
@@ -128,7 +144,7 @@ owners under `media/live/detail/`. Its public declarations directly name
 capture, annotation, ML-runtime, and GPU dependencies; raster composition
 remains private to the implementation.
 
-## Shared Linux facilities
+## Shared native facilities
 
 [ScopedFd](../src/common/io/scoped_fd.h) owns descriptors, and
 [event_fd.h](../src/common/io/event_fd.h) centralizes counter reads, signal,
@@ -154,6 +170,18 @@ process execution support. Test-only filesystem, process, CUDA, asynchronous
 wait, console, and CLI-option helpers live under
 [src/test_support](../src/test_support); domain fixtures remain with their
 components.
+
+[utf8.h](../src/common/types/utf8.h) recognizes complete UTF-8 scalars and valid
+text without choosing a replacement policy. The
+[visual diagnostic owner](../src/controller/presentation/visual_diagnostics.cpp)
+replaces malformed native exception bytes with U+FFFD and truncates only between
+scalars. The benchmark compiler applies its own bounded, flagged replacement to
+diagnostic path text. These projections do not rewrite native paths or change
+product failures. The runtime JSON encoder rejects invalid text that reaches it;
+the [CBOR owner](../src/frameworks/serialization/cbor_wire.cpp) rejects malformed
+wire text with `InvalidUtf8`, including split owned input and borrowed/view
+decoding. Recognition is shared; diagnostic repair and wire rejection remain
+separate boundary policies.
 
 The retained
 [logging module](../src/common/logging/mmltk_logging.cppm) owns optional native
@@ -202,7 +230,7 @@ same-name source, UI, training-target, and shared loading fields through their
 materialized native declarations. Renamed keys and field-specific conversion
 and repair remain local to settings persistence. Benchmark rejection counters
 likewise derive their binary and named JSON projections from one declaration;
-their [cache-format guards](datasets.md#benchmark-source-acquisition) preserve
+their [cache-format guards](benchmark-datasets.md#cache-formats-and-capacity) preserve
 the persisted order and representation.
 
 RF-DETR's [preset catalog](../src/backend/models/rfdetr/contract/preset_catalog.h)

@@ -21,7 +21,7 @@ projections, and their writer/reader ownership are documented in
 | --- | --- |
 | `MMLTK_LOG_LEVEL`, `MMLTK_LOG_FILE`, `MMLTK_LOG_DIR` | Native application logging to stderr and a rotating file |
 | CLI `--log-level`, `--log-file`, `--log-dir` | Override the corresponding native logging environment values |
-| `MMLTK_GUI_TRACE_FILE` | Native runtime JSONL and browser surface lifecycle diagnostics |
+| `MMLTK_GUI_TRACE_FILE` | Native runtime JSONL, benchmark compilation, and browser surface lifecycle diagnostics |
 | `MMLTK_GUI_PIXEL_TRACE=1` with a GUI trace path | Additional pixel probes |
 | `MMLTK_FIREFOX_LOG_FILE` | Redirect Firefox stdout/stderr to a separate file; does not itself enable native lifecycle or pixel collection |
 
@@ -96,8 +96,9 @@ MMLTK_FIREFOX_LOG_FILE=.mmltk-data/logs/firefox.log \
 ```
 
 `MMLTK_GUI_TRACE_FILE` opts into native JSONL command, transport, worker,
-presentation, cleanup, and failure diagnostics. The native sink opens a new
-capture and truncates that path; preserve earlier evidence before reusing it.
+benchmark compilation, presentation, cleanup, and failure diagnostics. The native
+sink opens a new capture and truncates that path; preserve earlier evidence
+before reusing it.
 `MMLTK_FIREFOX_LOG_FILE` captures the separate browser log.
 The native trace file and Firefox output file must be separate destinations.
 Their parent directories must already exist and be writable by the runtime user.
@@ -126,6 +127,63 @@ readback markers; undefined buffer-alias samples cannot prove image contents.
 
 GPU-specific trace variables are covered in [GPU execution](gpu-execution.md).
 
+## Benchmark compilation traces
+
+The [dataset runtime's owned target](architecture.md#native-domain-work) connects
+GUI compilation to the shared diagnostic sink. No pixel-trace flag is needed for
+benchmark records. CLI benchmark compilation supplies its trace callback
+when native logging is enabled at `trace`, for example with `--log-level trace`.
+
+GUI records use `kind: "benchmark_dataset"`, a top-level `name`, nested `fields`,
+and `steady_ns` from the shared runtime sink. The query tool normalizes `name`
+to `@event`; fields can be queried directly. Select one capture so repeated
+artifact names and monotonic timestamps do not join different runs.
+
+| Events or fields | Observed work |
+| --- | --- |
+| `benchmark.compile.paths` | Resolved `cache_root` and compiler `output_root`, with separate `*_truncated` and `*_utf8_replaced` diagnostic flags |
+| `benchmark.progress.activity` | Current `activity`, numeric `phase`, and optional numeric `source` |
+| `benchmark.download.cache_hit`, `.preseeded` | Retained archive `artifact`, `bytes`, and admission `integrity` |
+| `benchmark.download.progress` | `artifact`, `completed_bytes`, `total_bytes`, `attempt`, `resumed`, `retained_bytes`, `durable_bytes`, and `redownload` |
+| `benchmark.download.segmented_resume_state`, `.partial_checkpoint` | Retained range state or ordinary-transfer checkpoint and resume eligibility |
+| `benchmark.download.attempt_failed`, `.segment_retry`, `.segmented_fallback` | HTTP/CURL failure, discarded partial state, or fallback context where available |
+| `benchmark.images.cache_scan`, `.cache_reuse`, `.progress` | `source`/`shard`, inspected/reused/resolved images, and selection counts |
+| `benchmark.archive.scan`, `.extracted`, `.extract_cache_hit` | Archive traversal or annotation-member extraction/reuse |
+| `benchmark.images.archive_retry`, `benchmark.pixel_compile.cache_repair` | Bounded image/archive repair context |
+| `benchmark.storage.projection`, `benchmark.publication.complete` | Planned storage bounds, then actual successful publication facts |
+
+For a capture produced by [the GUI example](#capture-one-reproduction):
+
+```bash
+./mmltk --logs .mmltk-data/logs/gui-trace.jsonl \
+  -q '@event=benchmark.compile.paths OR @event=benchmark.progress.activity' \
+  --format timeline --limit 40
+./mmltk --logs .mmltk-data/logs/gui-trace.jsonl \
+  -q '@event:benchmark.download AND artifact="objects365-v2-train-patch-17"' \
+  --fields @event,artifact,completed_bytes,total_bytes,attempt,resumed,retained_bytes,durable_bytes,redownload \
+  --format jsonl --limit 60
+./mmltk --logs .mmltk-data/logs/gui-trace.jsonl \
+  -q '@event:benchmark.images OR @event:benchmark.archive' \
+  --where 'source="objects365" AND shard="patch-17"' \
+  --format timeline --limit 40
+```
+
+`completed_bytes` follows actual accepted writes, not preallocated file length;
+zero `total_bytes` means unknown. Retry withdrawal can legitimately decrease
+the count. The [progress reference](benchmark-datasets.md#reading-compilation-progress)
+owns source aggregation, scaled image units, and projected-output semantics.
+An unchanged image fraction or absent best-effort record cannot establish a
+deadlock or network liveness.
+
+Disabled benchmark diagnostics skip field construction, JSON serialization,
+and diagnostic collection. Transfer observers are installed only when progress
+or tracing needs them; the unobserved segmented path skips progress locking
+and clock reads. Trace construction, serialization, and callback failures are
+contained and delivery is attempted once. Invalid payloads are reported to
+diagnostic delivery failure handling, never published as successful empty records
+or turned into compilation failure. The existing complete-delivery acceptance
+mode can still fail its evidence requirements independently of product work.
+
 ## Delivery and acceptance ownership
 
 Ordinary enabled runtime diagnostics are bounded and best effort. The existing
@@ -148,6 +206,8 @@ readiness. Its driver is independent of the private
 and [JavaScript reporting state](../src/frontend/iced/src/integration_control/browser.mjs).
 With reporting disabled, payload callbacks, phase/revision/style deduplication,
 passive viewport queries, gallery scans, and diagnostic sinks stay inactive.
+Benchmark visibility reporting likewise schedules no widget measurements when
+disabled; integration control continues independently.
 Compact failed control receipts retain static source-line context without
 initializing reporting or probes. They also carry up to 4096 bytes of
 UTF-8-safe failure detail, including the native UI error kind, title, and body
@@ -255,6 +315,7 @@ record UI interaction and pixels separately from physical resource custody:
 
 | Records | Evidence |
 | --- | --- |
+| `integration.benchmark_baseline`, `integration.benchmark_click`, `integration.benchmark_choice`, `integration.benchmark_visibility`, `integration.benchmark_inactive` | Baseline native settings, real radio clicks, settled choices/restoration, current-tree presence/absence, and disabled source-control behavior |
 | `integration.atlas_resize_measured`, `integration.atlas_resize` | Gallery measurements retained beneath Detail, then required/actual rows after each completed resized return |
 | `integration.atlas_ready_cell`, `integration.atlas_canvas_sample` | Exact drawn gallery identity, compiled image, selected canvas coordinates, patch counts, and sampled color |
 | `integration.explore_integer`, `integration.explore_integer_paste_baseline`, `integration.explore_integer_paste`, `integration.explore_integer_paste_restored` | Exact decimal integer values, native revision progression, typing/paste persistence, and restoration |

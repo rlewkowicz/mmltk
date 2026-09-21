@@ -353,6 +353,15 @@ fixture uses the ordinary Stretch default. Padding observations therefore
 remain evidence for the selected geometry rather than assumptions about every
 compiled dataset.
 
+The initial Dataset interaction also clicks both benchmark recipe radios and
+all three Coconut validation radios. It waits for native settings settlement,
+checks the current widget tree for expected presence and absence, verifies that
+the disabled source Browse control is inert, and restores the baseline settings.
+The ordinary Directory compile handoff then uses the existing local fixture.
+This exercises the packaged selection controls without acquiring a live
+benchmark release. Browser audit cases reject missing clicks, stale visibility,
+incomplete choice coverage, and unconfirmed restoration.
+
 The native harness is split by evidence responsibility under
 [tests/wayland](../src/acceptance/tests/wayland):
 
@@ -487,7 +496,7 @@ sessions retain ordinary clipboard permissions.
 | Existing target | Evidence it owns |
 | --- | --- |
 | `mmltk_controller_annotation_tests` | Independent input/render progress, native hit testing, document/history/save behavior, immutable scene reuse, complete journal moves, packed upload reuse and allocation-local damage, stable target identity through Undo/Redo, retained input pressure, ordered command continuations, fractional raster boundaries, Original crop/aspect materialization, masks beyond boxes and present-empty masks, rejection, and cancellation |
-| `mmltk_controller_services_tests` | Counter-read interruption/size/error policies, reflected named settings, independent optional-test settings, training command construction, current-format saved history, bounded cursor reads, directory replacement/truncation, and output/resume admission |
+| `mmltk_controller_services_tests` | Counter-read interruption/size/error policies, reflected named settings including benchmark choices, independent optional-test settings, training command construction, current-format saved history, bounded cursor reads, directory replacement/truncation, and output/resume admission |
 | `mmltk_controller_data_compute_systems_tests` | Start/input admission including absent or incompatible optional test splits, selected validation results and retained sample/detail custody, optional preview failure, incremental prediction, and video playback cancellation |
 | `mmltk_controller_browser_tests` and `mmltk_frameworks_serialization_tests` | Reflected field/enum/schema and graphics ABI facts, nested/array metric projection fixtures, package fixtures, positional output versus named persistence, named-field lookup/error precedence, exact CBOR bytes and split owned/borrowed payloads, lossless compact input, and control receipts |
 | `mmltk_frameworks_transport_tests` | Peer replacement, reconnect, output continuity, ring wrap, and transport custody |
@@ -545,6 +554,40 @@ The source/CMake registrations and wrapper inventory define executable
 membership; `--test core` includes image resampling, while the imaging
 Annotation, Explore, and Upscale executables require `all` or explicit
 `all --executable` selection. Raster is also in `rfdetr`.
+
+### Benchmark compilation evidence
+
+The existing native suites exercise bounded release fixtures through the
+production compiler and local HTTP server. They establish cache identity,
+mask/provenance conversion, actual transfer progress, publication, and failure
+behavior independently of rendered UI acceptance:
+
+| Owner | Evidence |
+| --- | --- |
+| [benchmark_dataset.test.cpp](../src/backend/data/tests/benchmark_dataset.test.cpp), `mmltk_backend_data_tests` | Cache-root precedence and staging/publication overlap, completed-group and individual-JPEG reuse, ordered write/source progress, explicit retry withdrawal, durable segmented resume, ordinary/unknown-total downloads, range fallback, cancellation, lazy diagnostics, and typed storage failure |
+| [coconut_dataset.test.cpp](../src/backend/data/tests/coconut_dataset.test.cpp), same target | Pinned recipe selection, all validation choices, independent exact-mask expectations, empty images, physical/release joins, canonical member paths, fixed inventory bytes, format limits, cross-recipe cache reuse, scoped physical recovery, stock normalized-cache reuse without raw metadata, and unchanged prior publication on failure/cancellation |
+| [application_compute_services.test.cpp](../src/controller/subsystems/system/tests/application_compute_services.test.cpp), `mmltk_controller_data_compute_systems_tests` | Environment cache selection and staged/final output overlap through the artifact service, retained choices through materialization, and real HTTP progress projected into bounded artifact activity at an unchanged image fraction |
+| [dataset_system.test.cpp](../src/controller/subsystems/system/tests/dataset_system.test.cpp), same target | Explicit compile captures settled choices, later settings edits preserve the admitted request, owned diagnostics survive runtime reconstruction and stop/join, open-ended/recovered progress remains valid, and malformed progress is rejected |
+| [dataset_wiring.test.cpp](../src/controller/shell/tests/dataset_wiring.test.cpp), `mmltk_controller_shell_tests` | Production shell/factory propagation of enabled and disabled diagnostics through the staged compiler path |
+| [settings.test.cpp](../src/controller/services/tests/settings.test.cpp), `mmltk_controller_services_tests` | Native defaults, missing/invalid setting repair, and recipe/hidden validation persistence |
+| [Dataset component](../src/frontend/iced/src/view/train/dataset.rs) and [integration reporting](../src/frontend/iced/src/integration_control/reporting.rs), `browser-app` | Generated selection edits, visibility, disabling only the five new radios during compilation, and no passive visibility tasks or payload collection when reporting is disabled |
+
+For focused selection during the permitted testing stage:
+
+```bash
+./mmltk --test core --executable mmltk_backend_data_tests -- '[benchmark],[coconut]'
+./mmltk --test application-systems --executable mmltk_controller_data_compute_systems_tests -- '[dataset],[benchmark],[progress]'
+./mmltk --test application-systems --executable mmltk_controller_shell_tests -- '[dataset]'
+```
+
+The [packaged Dataset scenario](#packaged-wayland-acceptance) separately proves
+real clicks, native settlement, restoration, and Directory handoff.
+[Benchmark capacity and live-download limits](benchmark-datasets.md#cache-formats-and-capacity)
+define what these bounded fixtures do not establish. Runtime trace encoder
+and serialization suites additionally cover benchmark timestamps, effect-only
+delivery failures, Unicode scalar handling, and malformed wire-text rejection.
+
+### Shared fixtures and evidence
 
 Neutral fixtures and the shared Catch runner belong to
 [src/test_support](../src/test_support). Domain fixture targets live with

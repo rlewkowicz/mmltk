@@ -224,13 +224,28 @@ Each packed `ImageEntry` is 40 bytes:
 | 20 | `uint32` | `original_width` | Source width before compilation |
 | 24 | `uint32` | `original_height` | Source height before compilation |
 | 28 | `uint8` | `has_source_image_id` | Whether the source image ID is present |
-| 29 | `uint8` | `source` | `0`: Generic; `1`: COCO; `2`: Objects365; `3`: Open Images |
+| 29 | `uint8` | `source` | Annotation provenance, using the values below |
 | 30 | `uint16` | reserved | Zero |
 | 32 | `uint64` | `source_image_id` | Original source identity; zero when absent |
 
 Dense compiled image indices remain separate from source IDs. The original
 dimensions and header resize mode reconstruct the transform without redundant
 per-image scale and padding fields.
+
+| `source` | Annotation provenance |
+| ---: | --- |
+| 0 | Generic |
+| 1 | Stock COCO |
+| 2 | Stock Objects365 |
+| 3 | Open Images |
+| 4 | COCONut annotations on COCO images |
+| 5 | COCONut annotations on Objects365 v1 images |
+| 6 | COCONut annotations on Objects365 v2 images |
+
+These values use the existing format-8 byte and preserve its layout. COCONut
+stores the physical image ID in `source_image_id`; its separate
+[component inventory](benchmark-datasets.md#native-import-and-provenance)
+retains any differing release-row ID and the exact archive/member join.
 
 ### Instances and masks
 
@@ -270,9 +285,10 @@ to one foreground class.
 
 The packed limits are intentional: class IDs occupy one byte, compiled image
 axes remain bounded to 32,767, and an image's instance count and an instance's
-RLE pair count must each fit an unsigned 16-bit value. Boxes must remain finite
+RLE pair count must each fit an unsigned 16-bit value. Label-block and RLE-block
+byte offsets must fit their unsigned 32-bit fields. Boxes must remain finite
 and strictly ordered after conversion to float32. Compilation rejects values
-that cannot be represented.
+that cannot be represented before publication.
 
 ## Compile and inspect
 
@@ -306,43 +322,17 @@ inspection that does not read dataset contents or benchmark transfers.
 
 ## Benchmark-source acquisition
 
-The separate [benchmark dataset compiler](../src/backend/data/benchmark_dataset_compiler.h)
-prepares COCO 2017, Objects365 v2, and Open Images v7 inputs through the
-backend data layer. [benchmark_compiler.cpp](../src/backend/data/benchmark_compiler.cpp)
-owns orchestration, normalized annotations, split selection, and compiled
-publication. [open_images_acquisition.cpp](../src/backend/data/open_images_acquisition.cpp)
-owns Open Images acquisition and quarantine decisions;
-[benchmark_storage.cpp](../src/backend/data/benchmark_storage.cpp) owns storage
-checks and concurrent reservations; and
-[benchmark_progress.cpp](../src/backend/data/benchmark_progress.cpp) owns
-source/phase progress projection. Download/cache identity stays with the data
-layer while resizing uses the shared imaging owners below.
+The [benchmark compiler](../src/backend/data/benchmark_dataset_compiler.h)
+supports **Coco custom**, the existing COCO/Objects365/Open Images recipe, and
+**Coconut**, the full COCONut training recipe with three validation choices.
+It shares the compiled layout, resizer, and loader described here.
 
-The adapters retain supplied boxes, areas, identities, crowd/raw-ignore flags,
-and source order. COCO-style polygon or RLE segmentation becomes source mask
-support before resizing. Open Images `IsGroupOf` becomes crowd; its category
-MID remains distinct from the mapped class. Equal boxes are not deduplicated.
-
-Each COCO-style fill-parser worker retains its own segmentation parser, dense
-mask, and polygon-intersection capacity, resetting logical contents between
-annotations. Box-only Open Images compaction supplies absent mask storage
-without allocating an empty mask vector per annotation. These choices preserve
-annotation order, rejection accounting, and explicit mask presence.
-Download callers install transfer-progress callbacks only when an observer is
-enabled; the unobserved segmented in-flight path skips progress locking and
-clock reads.
-
-The normalized annotation-index cache has its own version-3 format and
-256-byte header, independent of the compiled format. It stores 32-byte image
-records, 64-byte annotation records, and mask RLE; incompatible cached indices
-are regenerated from the source annotations.
-[AnnotationRejectCounts](../src/backend/data/detail/benchmark_annotations.h)
-is the canonical declaration for its six count fields. Binary
-encode/decode follows reflected declaration order; compile-time guards pin
-the six names, `uint64` types, and order required by that cache format. Named
-JSON projections derive from those same fields. The
-[index implementation](../src/backend/data/benchmark_annotations.cpp) owns
-the header layout and staged publication.
+[Built-in benchmark datasets](benchmark-datasets.md) owns recipe membership,
+native import and physical provenance, persistent archive/JPEG/index reuse,
+bounded repair, progress units, partial downloads, and cache-format limits.
+Use [Dataset controls](gui-interaction.md#dataset-compilation-controls) for GUI
+selection and [benchmark cache selection](commands.md#benchmark-cache-selection)
+for wrapper/CLI configuration.
 
 ## Optional perceptual downscaling
 

@@ -71,6 +71,12 @@ bins. Dataset compilation defaults to Stretch, with Letterbox available
 explicitly. The shared viewer's Original option restores source aspect from
 compiled pixels; it does not recover source resolution.
 
+The Dataset card's benchmark override offers Coco custom and Coconut.
+Coconut compiles the full COCONut training recipe with a choice of validation
+annotations and membership, reusing the persistent source cache. See the
+[built-in dataset guide](docs/benchmark-datasets.md) for those choices and for
+reading download and extraction progress.
+
 ## Quick reference
 
 ```bash

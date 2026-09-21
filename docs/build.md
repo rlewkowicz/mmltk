@@ -123,6 +123,33 @@ Inspect public header selection with:
 image without rebuilding it. Supply public filenames, not directory paths.
 Reports include locations, package ownership, direct includes, and selection.
 
+### Native Parquet dependency
+
+[Dockerfile.dependencies](../docker/Dockerfile.dependencies) pins Apache
+Arrow/Parquet **25.0.1** and verifies the source archive's SHA-512. It builds
+static, position-independent libraries with GCC 16.2 and upstream C++20 policy,
+without applying first-party C++26 reflection settings to this dependency.
+Bundled dependencies follow the pins in that Arrow source release.
+
+The selected closure enables Parquet/IPC, Snappy, Zstandard, and zlib, with
+xsimd, Thrift, and RapidJSON. Boost is a transitive build dependency in that
+closure. Cloud filesystems, Arrow Dataset/Compute/Flight, Python, utilities,
+examples, and Arrow tests/benchmarks are disabled; the build installs no
+Arrow runtime DSO or replacement allocator.
+
+[The data target](../src/backend/data/CMakeLists.txt) requires that exact package
+from `/opt/arrow` and links `Arrow::arrow_static` and
+`Parquet::parquet_static` privately. The native
+[COCONut importer](benchmark-datasets.md#native-import-and-provenance) owns their
+format use. Existing libcurl, libarchive, and rapidgzip owners retain download
+and extraction responsibilities.
+
+Arrow's licenses/notices and the bundled/transitive source notices install
+under `share/mmltk/licenses/arrow`, including the six selected dependency
+directories and the captured Boost notices. The
+[runtime package inventory](../tools/runtime_package.sh) includes this tree at
+`/opt/mmltk/share/mmltk/licenses/arrow`; [NOTICE](../NOTICE) records the attribution.
+
 ## Target declarations and precompiled headers
 
 Component `CMakeLists.txt` files register sources, ordinary declaration headers,
@@ -181,6 +208,7 @@ These are the default repository-local locations:
 | `.cache/buildkit` | Exported image-build caches |
 | `.cache/image-fingerprints`, `.cache/locks` | Verified identities and mutation locks |
 | `.cache/tests/rfdetr` | RF-DETR test assets and derived artifacts |
+| `.cache/benchmark-dataset/v1` | Persistent benchmark source archives, JPEGs, indexes, and completion metadata; see [cache ownership](benchmark-datasets.md#persistent-cache-and-publication) |
 | `build/release`, `build/browser-app` | Staged package and canonical browser bundle |
 | `build/validation`, `build/logs` | Acceptance evidence and build/analysis logs |
 | `build/diagnostics` | Wrapper-owned capability, standalone GPU, and native-link diagnostic artifacts |

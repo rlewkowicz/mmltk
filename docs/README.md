@@ -6,9 +6,9 @@
 
 - [Build and reusable state](build.md): prerequisites, container toolchains,
   package outputs, Firefox staging, declaration isolation, target-local PCHs,
-  generated bindings, caches, and build timing.
+  private native Parquet dependencies, generated bindings, caches, and build timing.
 - [Commands](commands.md): wrapper operations, process snapshots, native CLI,
-  desktop options, and model tooling.
+  benchmark cache selection, desktop options, and model tooling.
 - [RF-DETR workflows and artifacts](rfdetr-workflows.md): model/class admission,
   GPU normalization, physical candidate ranking, separate candidate/COCO limits,
   shared weights selection, Transfer/Resume, automatic/manual output, training
@@ -18,11 +18,12 @@
 ## Architecture and frameworks
 
 - [Architecture and source guide](architecture.md): entrypoints, native systems,
-  shared Linux/image facilities, reflected CLI and persistence boundaries,
+  shared native/image facilities, reflected CLI and persistence boundaries,
   serialization ownership and lookup, generated bindings, frontend components,
   and vendor ownership.
 - [GUI interaction and presentation](gui-interaction.md): application wire
-  formats, workflow layout and navigation, the retained training dashboard,
+  formats, workflow layout and navigation, Dataset recipe/validation controls,
+  the retained training dashboard,
   fixed Validation metrics/atlas, the shared image viewer and primary actions,
   retained numeric editing and captions, shared immediate mouse input, native
   command settlement, Annotation content/damage, retained Explore measurements,
@@ -36,6 +37,10 @@
   format 8 and recompilation, Stretch/Letterbox geometry, optional perceptual
   downscaling, quantized planar preparation, local batch capacity and leases,
   and Explore thumbnail/atlas retention through viewport and augmentation changes.
+- [Built-in benchmark datasets](benchmark-datasets.md): Coco custom and COCONut
+  membership, three validation choices, native masks and physical provenance,
+  shared persistent cache/repair, stock annotation reuse, progress units,
+  partial downloads, and format/capacity limits.
 - [GPU execution and image loading](gpu-execution.md): device/NUMA placement,
   H2D and GDRCopy, reusable checkpoint/export readbacks, Vulkan allocation and
   CUDA import, independent display/compute selection and damage transfers,
@@ -50,8 +55,9 @@
 - [Headless Wayland](headless-wayland.md): the private NVIDIA Weston session,
   input seat, readiness, deadlines, shutdown, and artifacts.
 - [Logging](logging.md): fatal stderr reports, explicit diagnostic activation,
-  pixel probes, artifact ownership, rendered UI evidence, nested-field queries,
-  Vulkan/FD provenance, correlation, and triage.
+  benchmark cache/archive/transfer traces, pixel probes, artifact ownership,
+  rendered UI evidence, nested-field queries, Vulkan/FD provenance, correlation,
+  and triage.
 - [Planned work](roadmap.md): future directions rather than current capability.
 
 `CONTRACT.md` owns high-level architecture and component handoffs. This wiki

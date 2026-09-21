@@ -195,6 +195,15 @@ evaluation share this data meaning; crowd regions belong to evaluation rather
 than foreground supervision. Model execution owns normalization of raw compiled
 RGB independently of retained preview pixels.
 
+Built-in dataset compilation shares acquisition, persistent source caching,
+annotation normalization, and atomic output publication across recipes.
+Coco custom retains the established sampled benchmark recipe. COCONut admits
+its full training membership, including images without foreground instances,
+with explicit validation membership and annotation choices. Physical image
+identity remains distinct from annotation edition and declared release identity.
+Progress exposes actual acquisition work and known or unknown totals; diagnostics
+observe that work independently of cache validity and completion.
+
 Images and their annotation meaning share source identity and geometry through
 preview, augmentation, upscale, and editing. Clean pixels and native semantic
 image planes remain separate until producer-owned final display composition.
