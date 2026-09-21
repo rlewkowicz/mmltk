@@ -941,14 +941,14 @@ TEST_CASE("benchmark publication admission preserves separate physical output an
     CHECK_THROWS_WITH(compile_benchmark_dataset(config),
                       overlap ? "benchmark output and cache directories must not overlap" : "benchmark dataset compilation cancelled");
     cancelled.store(false);
-    std::size_t trace_calls = 0U;
-    config.trace = [&](std::string_view, std::string_view) {
-        ++trace_calls;
+    std::size_t path_trace_calls = 0U;
+    config.trace = [&](std::string_view event, std::string_view) {
+        if (event == "benchmark.compile.paths") ++path_trace_calls;
         throw std::runtime_error("diagnostic callback failure");
     };
     CHECK_THROWS_WITH(compile_benchmark_dataset(config),
                       overlap ? "benchmark output and cache directories must not overlap" : "benchmark dataset compilation cancelled");
-    CHECK(trace_calls == 1U);
+    CHECK(path_trace_calls == 1U);
     CHECK(cancelled.load());
     CHECK_FALSE(fs::exists(config.output_dir));
     CHECK(fs::exists(cache / "downloads") == !overlap);

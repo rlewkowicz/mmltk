@@ -752,8 +752,7 @@ impl State {
                         ],
                     )
                 });
-                driver.phase = Phase::BenchmarkChoice(0);
-                Task::none()
+                driver.advance_to(Phase::BenchmarkChoice(0))
             }
             Phase::BenchmarkChoice(index) => {
                 let Some(snapshot) = model
@@ -783,8 +782,7 @@ impl State {
                         .compilebenchmarkdatasetoverride
                         == enabled
                 {
-                    driver.phase = Phase::AwaitBenchmarkChoice(index);
-                    return Task::none();
+                    return driver.advance_to(Phase::AwaitBenchmarkChoice(index));
                 }
                 widget_ops::scroll_control_into_view(control.to_owned(), AnnotationReveal::Control)
                     .chain(widgets.arm(driver, control))
@@ -845,8 +843,7 @@ impl State {
                     driver.phase = Phase::PerceptualControl(0);
                     visibility.chain(self.arm_perceptual_control(driver, widgets, 0))
                 } else {
-                    driver.phase = Phase::BenchmarkChoice(index + 1);
-                    visibility
+                    visibility.chain(driver.advance_to(Phase::BenchmarkChoice(index + 1)))
                 }
             }
             Phase::PerceptualControl(index) => self.arm_perceptual_control(driver, widgets, index),
@@ -1856,7 +1853,23 @@ mod tests {
                         } else {
                             assert_eq!(controller.driver.phase, Phase::BenchmarkChoice(index + 1));
                             assert!(!controller.widgets.location_pending());
-                            assert!(iced_runtime::task::into_stream(task).is_none());
+                            let mut actions = iced_runtime::task::into_stream(task).unwrap();
+                            let Some(iced_runtime::Action::Output(RootMessage::Integration(
+                                crate::integration_control::Message::Scoped {
+                                    generation,
+                                    receipt: None,
+                                    message,
+                                },
+                            ))) = iced::futures::executor::block_on(actions.next())
+                            else {
+                                panic!("settlement must continue without passive measurements");
+                            };
+                            assert_eq!(generation, controller.driver.generation);
+                            assert!(matches!(
+                                *message,
+                                crate::integration_control::Message::Advance
+                            ));
+                            assert!(iced::futures::executor::block_on(actions.next()).is_none());
                         }
                         if index >= 10 {
                             assert_eq!(

@@ -357,8 +357,10 @@ struct Transfer {
         set_curl_option_with_prefix(easy.get(), CURLOPT_SUPPRESS_CONNECT_HEADERS, 1L, "cannot configure benchmark transfer ",
                                     "proxy CONNECT header suppression");
         if (resume_offset != 0U) {
-            set_curl_option_with_prefix(easy.get(), CURLOPT_RESUME_FROM_LARGE, static_cast<curl_off_t>(resume_offset), "cannot configure benchmark transfer ",
-                                        "resume offset");
+            // Our header admission owns both a validated 206 resume and a 200
+            // restart. libcurl's resume option rejects the latter before delivery.
+            const std::string range = std::to_string(resume_offset) + "-";
+            set_curl_option_with_prefix(easy.get(), CURLOPT_RANGE, range.c_str(), "cannot configure benchmark transfer ", "resume range");
             const std::string validator = !resume_etag.empty()            ? "If-Range: " + resume_etag
                                           : !resume_last_modified.empty() ? "If-Range: " + resume_last_modified
                                                                           : std::string{};

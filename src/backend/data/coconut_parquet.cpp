@@ -14,15 +14,19 @@
 #include <utility>
 namespace mmltk::backend::data::benchmark_internal {
 namespace {
+class ParquetFormatError final : public std::runtime_error {
+   public:
+    using std::runtime_error::runtime_error;
+};
 void check(const arrow::Status& status) {
-    if (!status.ok()) throw std::runtime_error("COCONut Parquet: " + status.ToString());
+    if (!status.ok()) throw ParquetFormatError("COCONut Parquet: " + status.ToString());
 }
 template <class T>
 T take(arrow::Result<T> result) {
     check(result.status());
     return std::move(result).ValueOrDie();
 }
-[[noreturn]] void malformed(std::string_view field) { throw std::runtime_error("COCONut Parquet invalid required field: " + std::string(field)); }
+[[noreturn]] void malformed(std::string_view field) { throw ParquetFormatError("COCONut Parquet invalid required field: " + std::string(field)); }
 template <class T>
 std::shared_ptr<const T> as(std::shared_ptr<arrow::Array> array, arrow::Type::type type, std::string_view field) {
     if (!array || array->type_id() != type) malformed(field);
@@ -197,7 +201,10 @@ void read_coconut_parquet(std::span<const std::filesystem::path> shards, const C
                 if (!batch) break;
                 read_batch(*batch, limits, cancellation, consumer, row_ordinal, segment_ordinal);
             }
-        } catch (const std::exception& error) { throw std::runtime_error("COCONut Parquet " + path.string() + ": " + error.what()); }
+        } catch (const ParquetFormatError& error) {
+            // Consumer failures retain the types used by scoped cache recovery.
+            throw std::runtime_error("COCONut Parquet " + path.string() + ": " + error.what());
+        }
     }
 }
 }  // namespace mmltk::backend::data::benchmark_internal

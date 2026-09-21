@@ -122,7 +122,7 @@ TEST_CASE("artifact dataset runtime owns its diagnostic target and borrows only 
 TEST_CASE("owned dataset diagnostics survive runtime failure reconstruction and stop join", "[controller][systems][dataset][diagnostics]") {
     const mmltk::testsupport::ScopedTempDir root{"dataset-diagnostic-reconstruction"};
     SettingsSystem settings;
-    auto location = install_settings(root.path());
+    const services::SettingsLocation location{(root.path() / "settings.json").string()};
     auto stored = contracts::default_gui_settings_state();
     stored.workflows.train.compile_benchmark_dataset_override = true;
     stored.workflows.train.compiled_dataset_dir = root.path() / "compiled";

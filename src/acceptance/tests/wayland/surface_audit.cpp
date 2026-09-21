@@ -717,10 +717,14 @@ auto SurfaceAudit::joined_failure() const -> std::string {
 auto SurfaceAudit::joined_surface_failure(const std::string& id, const SurfaceState& state) const -> std::string {
     if (!receipts_joined(id, state)) return "surface " + id + " lacks exact source, paired metadata, dispatch, or physical completion evidence";
     if (state.created == 0U && state.samples.empty()) {
-        if (state.native_stage != 4U || state.firefox_stage != 5U || state.import_failed || state.firefox_import_failed || state.width != state.browser_width ||
-            state.height != state.browser_height)
+        // An unclaimed arena advertisement owns no descriptors or GPU images.
+        // Native retirement and actual browser exit settle that pending admission;
+        // bridge closure alone cannot settle a claimed image or its readers.
+        const bool unclaimed_shutdown = native_shutdown && browser_exited && state.native_stage == 3U && state.firefox_stage == 1U;
+        if ((!unclaimed_shutdown && (state.native_stage != 4U || state.firefox_stage != 5U)) || state.import_failed || state.firefox_import_failed ||
+            state.width != state.browser_width || state.height != state.browser_height)
             return "unsampled arena " + id + " lacks matching native and Firefox admission";
-        if (!state.native_retired || !state.firefox_retired || !state.firefox_withdrawn || !state.withdrawn)
+        if (!state.native_retired || (!unclaimed_shutdown && (!state.firefox_retired || !state.firefox_withdrawn || !state.withdrawn)))
             return "unsampled arena " + id + " lacks withdrawal and physical retirement";
         const bool released_without_sampling =
             !state.publications.empty() && state.publications.size() == state.receipts.size() &&

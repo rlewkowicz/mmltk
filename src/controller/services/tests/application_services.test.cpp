@@ -1266,6 +1266,7 @@ TEST_CASE("backend benchmark diagnostic failures preserve operations and deliver
     if (complete) {
         CHECK(read_file(path).empty());
     } else {
+        require_one_terminal_wake(diagnostics);
         const auto record = nlohmann::json::parse(read_file(path));
         CHECK(record.at("name") == "benchmark.test.complete");
         CHECK(record.at("fields").at("images") == 2U);

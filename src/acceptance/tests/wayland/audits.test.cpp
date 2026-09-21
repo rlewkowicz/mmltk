@@ -31,7 +31,8 @@ TEST_CASE("benchmark radio audit requires every real choice, current visibility 
     constexpr const char* benchmark_override = "train.dataset.benchmark_override";
     BrowserAudit audit;
     const auto record = [&](const char* event, const std::string& control, const char* detail, std::array<double, 4> values) {
-        audit.consume({{"event", event}, {"control", control}, {"detail", detail}, {"a", values[0]}, {"b", values[1]}, {"c", values[2]}, {"d", values[3]}});
+        audit.consume({{"event", event}, {"control", control}, {"detail", detail}, {"a", static_cast<std::uint64_t>(values[0])},
+                       {"b", values[1]}, {"c", values[2]}, {"d", values[3]}});
     };
     record("integration.benchmark_baseline", benchmark_override, "native-settled",
            {baseline_enabled ? 1.0 : 0.0, double(baseline_dataset), double(baseline_validation), 10.0});
@@ -837,6 +838,31 @@ TEST_CASE("unsampled arena retirement joins native and Firefox physical ownershi
         CHECK(audit.evidence_settled());
         audit.SettleScenario();
         CHECK(audit.surfaces.empty());
+        SurfaceAudit unclaimed;
+        for (std::size_t stage = 0U; stage < 3U; ++stage) unclaimed.native(native_surface_record(native_surface_events[stage]));
+        unclaimed.browser(browser_surface_record("firefox.workspace.admitted"));
+        CHECK_FALSE(unclaimed.joined_failure().empty());
+        unclaimed.native({{"event", "shutdown.requested"}});
+        CHECK_FALSE(unclaimed.joined_failure().empty());
+        unclaimed.native(native_surface_record("presentation.retirement"));
+        CHECK_FALSE(unclaimed.joined_failure().empty());
+        unclaimed.browser({{"event", "firefox.workspace.channel_terminal"}, {"terminal", "orderly_bridge_close"}});
+        CHECK_FALSE(unclaimed.joined_failure().empty());
+        unclaimed.native({{"event", "shutdown.firefox_terminal"}});
+        REQUIRE(unclaimed.joined_failure().empty());
+        const auto id = SurfaceAudit::native_identity(native_surface_record(""));
+        auto missing_retirement = unclaimed;
+        missing_retirement.surfaces.at(id).native_retired = false;
+        CHECK_FALSE(missing_retirement.joined_failure().empty());
+        auto mismatched = unclaimed;
+        mismatched.surfaces.at(id).browser_width += 1U;
+        CHECK_FALSE(mismatched.joined_failure().empty());
+        auto claimed = unclaimed;
+        claimed.browser(browser_surface_record("firefox.workspace.claim_outcome"));
+        CHECK_FALSE(claimed.joined_failure().empty());
+        auto textured = unclaimed;
+        textured.browser(browser_surface_record("iced.surface.texture_create"));
+        CHECK_FALSE(textured.joined_failure().empty());
     } else {
         CHECK_FALSE(audit.joined_failure().empty());
     }

@@ -139,8 +139,8 @@ void append_value(arrow::ArrayBuilder& builder, const Json& value) {
         case arrow::Type::STRUCT: {
             auto& typed = static_cast<arrow::StructBuilder&>(builder);
             arrow_ok(typed.Append());
-            const auto& type = static_cast<const arrow::StructType&>(*builder.type());
-            for (int i = 0; i < type.num_fields(); ++i) append_value(*typed.field_builder(i), value.at(type.field(i)->name()));
+            const auto type = std::static_pointer_cast<const arrow::StructType>(builder.type());
+            for (int i = 0; i < type->num_fields(); ++i) append_value(*typed.field_builder(i), value.at(type->field(i)->name()));
             break;
         }
         case arrow::Type::LIST: {
@@ -1513,6 +1513,8 @@ void check_custom_compilation(const std::filesystem::path& output) {
     const std::array<std::uint64_t, 3> ids{7, 1, 17};
     const std::array<AnnotationSource, 3> sources{AnnotationSource::Coco, AnnotationSource::Objects365, AnnotationSource::OpenImages};
     const std::array<unsigned, 3> classes{2, 0, 1};
+    // COCO preserves the annotation object's byte offset after {"annotations":[.
+    const std::array<std::uint64_t, 3> source_ordinals{16, 0, 0};
     for (std::uint32_t i = 0; i < 3; ++i) {
         CHECK(train.image_entry(i).source_image_id == ids[i]);
         CHECK(train.image_entry(i).source == sources[i]);
@@ -1524,7 +1526,7 @@ void check_custom_compilation(const std::filesystem::path& output) {
         CHECK(label.bbox_x2 == 3.0F);
         CHECK(label.bbox_y2 == 3.0F);
         CHECK(label.original_area == 9);
-        CHECK(label.source_ordinal == 0);
+        CHECK(label.source_ordinal == source_ordinals[i]);
         CHECK_FALSE(label.has_mask());
         for (unsigned pixel = 0; pixel < 27; ++pixel) CHECK(train.image_pixels(i)[pixel] == 1.0F);
     }
