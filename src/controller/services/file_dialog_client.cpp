@@ -45,12 +45,9 @@ struct FixedOutput final {
  const std::string_view prefix = destination.view();
  return !prefix.empty() && append_text(destination.bytes.data(), destination.bytes.size(), destination.size, suffix);
 }
-[[nodiscard]] FileDialogResult dialog_result(const FileDialogDisposition disposition, const std::string_view path = {}, const std::string_view error = {},
-                                             const FileDialogFailure failure = FileDialogFailure::None) noexcept {
- return {.disposition = disposition,
-         .failure = failure,
-         .path = path.empty() ? PathText{} : PathText::From(path),
-         .error = error.empty() ? PolicyText{} : PolicyText::From(error)};
+[[nodiscard]] FileDialogResult dialog_result(
+ const FileDialogDisposition disposition, const std::string_view path = {}, const std::string_view error = {}, const FileDialogFailure failure = FileDialogFailure::None) noexcept {
+ return {.disposition = disposition, .failure = failure, .path = path.empty() ? PathText{} : PathText::From(path), .error = error.empty() ? PolicyText{} : PolicyText::From(error)};
 }
 void terminate_and_reap(const pid_t child) noexcept {
  if (child <= 0) return;
@@ -112,9 +109,7 @@ struct DialogScope final {
  std::filesystem::path picked{std::string{selected}};
  if (picked.is_relative()) picked = scope.helper_root / picked;
  std::filesystem::path resolved = canonical_path(picked);
- if (!path_within(scope.container_root, resolved) && scope.host_mounted && picked.is_absolute()) {
-  resolved = canonical_path(std::filesystem::path{kHostMount} / picked.relative_path());
- }
+ if (!path_within(scope.container_root, resolved) && scope.host_mounted && picked.is_absolute()) { resolved = canonical_path(std::filesystem::path{kHostMount} / picked.relative_path()); }
  if (!path_within(scope.container_root, resolved)) { throw std::runtime_error("selected path escapes file-dialog launch directory"); }
  PathText result = PathText::From(resolved.string());
  if (!result.valid()) throw std::runtime_error("selected file-dialog path exceeds capacity");
@@ -138,8 +133,7 @@ struct DialogScope final {
   remaining.remove_prefix(separator + 1U);
  }
 }
-[[nodiscard]] bool build_arguments(const PathText& helper, const FileDialogRequest& request, const DialogScope& scope,
-                                   std::array<PathText, kArgumentCapacity>& arguments, std::size_t& count) {
+[[nodiscard]] bool build_arguments(const PathText& helper, const FileDialogRequest& request, const DialogScope& scope, std::array<PathText, kArgumentCapacity>& arguments, std::size_t& count) {
  if (!helper.valid() || !request.valid()) return false;
  const auto add = [&](const std::string_view value) {
   if (count == arguments.size()) return false;
@@ -164,9 +158,7 @@ struct DialogScope final {
    break;
  }
  PathText filter = PathText::From("--file-filter=");
- if (!append(filter, request.filter.name.view()) || !append(filter, " | ") || !append(filter, request.filter.pattern.view()) || !add(filter.view())) {
-  return false;
- }
+ if (!append(filter, request.filter.name.view()) || !append(filter, " | ") || !append(filter, request.filter.pattern.view()) || !add(filter.view())) { return false; }
  return true;
 }
 enum class ChildSetupStage : std::uint8_t {
@@ -259,8 +251,7 @@ FileDialogClientOwner::FileDialogClientOwner(const std::string_view helper_progr
  const PathText helper = PathText::From(helper_program);
  const PathText launch = PathText::From(launch_directory);
  if (!helper.valid() || !launch.valid()) { throw std::invalid_argument("file-dialog owner configuration is invalid"); }
- client_ = FileDialogClient{std::make_shared<const FileDialogClient::Configuration>(
-  FileDialogClient::Configuration{.helper = resolve_helper_program(helper), .launch_directory = launch})};
+ client_ = FileDialogClient{std::make_shared<const FileDialogClient::Configuration>(FileDialogClient::Configuration{.helper = resolve_helper_program(helper), .launch_directory = launch})};
 }
 FileDialogClient FileDialogClientOwner::client() const noexcept { return client_.valid() ? client_ : FileDialogClient{}; }
 bool FileDialogClient::valid() const noexcept { return configuration_ && configuration_->helper.valid() && configuration_->launch_directory.valid(); }
@@ -270,7 +261,7 @@ FileDialogResult FileDialogClient::run(const FileDialogRequest& request, FileDia
   const auto configuration = configuration_;
   if (!configuration || !request.valid()) {
    return dialog_result(FileDialogDisposition::Failed, {}, configuration ? "invalid file-dialog request" : "file-dialog capability is unavailable",
-                        configuration ? FileDialogFailure::InvalidRequest : FileDialogFailure::CapabilityUnavailable);
+    configuration ? FileDialogFailure::InvalidRequest : FileDialogFailure::CapabilityUnavailable);
   }
   mmltk::common::io::ScopedFd cancellation_descriptor{cancellation.release()};
   if (cancellation_descriptor.get() < 0 || mmltk::common::concurrency::detail::cancellation_descriptor_requested(cancellation_descriptor.get())) {
@@ -311,9 +302,7 @@ FileDialogResult FileDialogClient::run(const FileDialogRequest& request, FileDia
    if (::setpgid(0, 0) != 0) { fail_child_setup(child_setup_write, ChildSetupStage::ProcessGroup); }
    if (::dup2(child_output_write, STDOUT_FILENO) < 0) { fail_child_setup(child_setup_write, ChildSetupStage::RedirectOutput); }
    const int output_flags = ::fcntl(STDOUT_FILENO, F_GETFL);
-   if (output_flags < 0 || ::fcntl(STDOUT_FILENO, F_SETFL, output_flags & ~O_NONBLOCK) != 0) {
-    fail_child_setup(child_setup_write, ChildSetupStage::RedirectOutput);
-   }
+   if (output_flags < 0 || ::fcntl(STDOUT_FILENO, F_SETFL, output_flags & ~O_NONBLOCK) != 0) { fail_child_setup(child_setup_write, ChildSetupStage::RedirectOutput); }
    const int null_descriptor = ::open("/dev/null", O_WRONLY | O_CLOEXEC);
    if (null_descriptor < 0 || ::dup2(null_descriptor, STDERR_FILENO) < 0) { fail_child_setup(child_setup_write, ChildSetupStage::RedirectErrors); }
    (void)::close(null_descriptor);
@@ -352,20 +341,15 @@ FileDialogResult FileDialogClient::run(const FileDialogRequest& request, FileDia
   const int status = reap_child(child);
   child = -1;
   drain_output_to_eof(output_read, output);
-  if (mmltk::common::concurrency::detail::cancellation_descriptor_requested(cancellation_descriptor.get())) {
-   return dialog_result(FileDialogDisposition::Reaped);
-  }
+  if (mmltk::common::concurrency::detail::cancellation_descriptor_requested(cancellation_descriptor.get())) { return dialog_result(FileDialogDisposition::Reaped); }
   const ChildSetupError child_setup_error = setup_error(setup_read);
   if (child_setup_error.valid()) { return dialog_result(FileDialogDisposition::Failed, {}, child_setup_error.message.view(), child_setup_error.failure); }
-  if (!WIFEXITED(status)) {
-   return dialog_result(FileDialogDisposition::Failed, {}, "file-dialog helper terminated by signal", FileDialogFailure::ProcessExit);
-  }
+  if (!WIFEXITED(status)) { return dialog_result(FileDialogDisposition::Failed, {}, "file-dialog helper terminated by signal", FileDialogFailure::ProcessExit); }
   const int exit_code = WEXITSTATUS(status);
   if (exit_code == 1) return dialog_result(FileDialogDisposition::Cancelled);
   if (exit_code != 0) { return dialog_result(FileDialogDisposition::Failed, {}, "file-dialog helper rejected request", FileDialogFailure::ProcessExit); }
   const PathText path = selected_path(output, scope);
-  return path.valid() ? FileDialogResult{.disposition = FileDialogDisposition::Selected, .failure = FileDialogFailure::None, .path = path}
-                      : dialog_result(FileDialogDisposition::Cancelled);
+  return path.valid() ? FileDialogResult{.disposition = FileDialogDisposition::Selected, .failure = FileDialogFailure::None, .path = path} : dialog_result(FileDialogDisposition::Cancelled);
  } catch (const std::exception& error) {
   terminate_and_reap(child);
   return dialog_result(FileDialogDisposition::Failed, {}, error.what(), FileDialogFailure::Unexpected);

@@ -63,8 +63,7 @@ MMLTK_REFLECT_FIELDS(AnnotationRejectCounts)
 // The version-3 normalized index persists declaration order as six uint64 slots.
 static_assert([] consteval {
  constexpr const auto& fields = mmltk::frameworks::reflection::field_declarations<AnnotationRejectCounts>();
- constexpr std::array<std::string_view, 6> names{"raw_records",       "unmapped_categories", "unknown_images",
-                                                 "malformed_records", "degenerate_boxes",    "duplicate_boxes"};
+ constexpr std::array<std::string_view, 6> names{"raw_records", "unmapped_categories", "unknown_images", "malformed_records", "degenerate_boxes", "duplicate_boxes"};
  static_assert(fields.size() == names.size());
  mmltk::frameworks::reflection::visit_materialized_members<AnnotationRejectCounts>(
   []<class Declaration>(const auto&) { static_assert(std::is_same_v<typename Declaration::member_type, std::uint64_t>); });
@@ -85,13 +84,12 @@ struct NormalizedAnnotationIndex {
 };
 // Source and destination must be distinct. Copies one complete slice, rebasing only
 // storage offsets; source IDs need not be sorted. Metadata belongs to the caller.
-void append_normalized_image_slice(NormalizedAnnotationIndex& destination, const NormalizedAnnotationIndex& source, std::size_t image_position,
-                                   mmltk::common::concurrency::CancellationObservation cancellation = {});
+void append_normalized_image_slice(
+ NormalizedAnnotationIndex& destination, const NormalizedAnnotationIndex& source, std::size_t image_position, mmltk::common::concurrency::CancellationObservation cancellation = {});
 // Retains positions in the supplied order. Identity does not inspect mask payloads;
 // increasing subsets retain allocation capacity. On cancellation during in-place
 // compaction the owner must discard the index, never publish it.
-void retain_normalized_image_slices(NormalizedAnnotationIndex& index, std::span<const std::size_t> order,
-                                    mmltk::common::concurrency::CancellationObservation cancellation = {});
+void retain_normalized_image_slices(NormalizedAnnotationIndex& index, std::span<const std::size_t> order, mmltk::common::concurrency::CancellationObservation cancellation = {});
 struct AnnotationParseOptions {
  BenchmarkDatasetSource source = BenchmarkDatasetSource::kCoco2017;
  std::string split;
@@ -101,17 +99,13 @@ struct AnnotationParseOptions {
  mmltk::common::concurrency::CancellationObservation cancel_requested = {};
  BenchmarkTraceSink trace;
 };
-[[nodiscard]] NormalizedAnnotationIndex parse_coco_style_annotations(const std::filesystem::path& json_path, std::string annotation_sha256,
-                                                                     std::span<const NumericCategoryMapping> mappings, const AnnotationParseOptions& options);
-[[nodiscard]] NormalizedAnnotationIndex parse_open_images_annotations(const std::filesystem::path& boxes_csv_path,
-                                                                      const std::filesystem::path& classes_csv_path, std::string annotation_sha256,
-                                                                      std::span<const StringCategoryMapping> mappings, const AnnotationParseOptions& options);
-[[nodiscard]] std::optional<NormalizedAnnotationIndex> load_normalized_annotation_index(const std::filesystem::path& path,
-                                                                                        BenchmarkDatasetSource expected_source, std::string_view expected_split,
-                                                                                        std::string_view expected_annotation_sha256,
-                                                                                        mmltk::common::concurrency::CancellationObservation cancel_requested,
-                                                                                        const BenchmarkTraceSink& trace = {});
-void store_normalized_annotation_index(const std::filesystem::path& path, const NormalizedAnnotationIndex& index,
-                                       mmltk::common::concurrency::CancellationObservation cancel_requested, const BenchmarkTraceSink& trace = {});
+[[nodiscard]] NormalizedAnnotationIndex parse_coco_style_annotations(
+ const std::filesystem::path& json_path, std::string annotation_sha256, std::span<const NumericCategoryMapping> mappings, const AnnotationParseOptions& options);
+[[nodiscard]] NormalizedAnnotationIndex parse_open_images_annotations(const std::filesystem::path& boxes_csv_path, const std::filesystem::path& classes_csv_path, std::string annotation_sha256,
+ std::span<const StringCategoryMapping> mappings, const AnnotationParseOptions& options);
+[[nodiscard]] std::optional<NormalizedAnnotationIndex> load_normalized_annotation_index(const std::filesystem::path& path, BenchmarkDatasetSource expected_source, std::string_view expected_split,
+ std::string_view expected_annotation_sha256, mmltk::common::concurrency::CancellationObservation cancel_requested, const BenchmarkTraceSink& trace = {});
+void store_normalized_annotation_index(
+ const std::filesystem::path& path, const NormalizedAnnotationIndex& index, mmltk::common::concurrency::CancellationObservation cancel_requested, const BenchmarkTraceSink& trace = {});
 [[nodiscard]] std::vector<std::uint64_t> image_ids(const NormalizedAnnotationIndex&, std::optional<std::uint16_t> shard = std::nullopt);
 }  // namespace mmltk::backend::data::benchmark_internal

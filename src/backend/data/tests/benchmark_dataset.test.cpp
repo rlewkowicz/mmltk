@@ -70,8 +70,8 @@ namespace {
 void require_condition(const bool condition, const char* message) {
  if (!condition) { throw std::runtime_error(message); }
 }
-[[nodiscard]] BenchmarkWriteRequest benchmark_write_request(const PreparedBenchmarkSplit& split, fs::path output, const std::uint32_t resolution,
-                                                            const mmltk::common::concurrency::CancellationObservation cancellation = {}) {
+[[nodiscard]] BenchmarkWriteRequest benchmark_write_request(
+ const PreparedBenchmarkSplit& split, fs::path output, const std::uint32_t resolution, const mmltk::common::concurrency::CancellationObservation cancellation = {}) {
  return {
   .split = split,
   .output_path = std::move(output),
@@ -108,8 +108,7 @@ void test_benchmark_trace_gate_is_lazy() {
 // silently replace an admitted artifact with an equivalent new file.
 class RetainedArtifact final {
 public:
- explicit RetainedArtifact(fs::path path)
-     : path_(std::move(path)), digest_(mmltk::common::io::sha256_file(path_)), before_(mmltk::common::io::FileSnapshot::Read(path_)) {}
+ explicit RetainedArtifact(fs::path path) : path_(std::move(path)), digest_(mmltk::common::io::sha256_file(path_)), before_(mmltk::common::io::FileSnapshot::Read(path_)) {}
  void Check() const {
   CHECK(mmltk::common::io::FileSnapshot::Read(path_) == before_);
   CHECK(mmltk::common::io::sha256_file(path_) == digest_);
@@ -156,7 +155,13 @@ std::vector<std::uint8_t> make_payload(const std::size_t bytes) {
 using mmltk::backend::data::testsupport::HttpServer;
 DownloadRequest request_for(const fs::path& root, const std::string& id, const std::string& url, const std::vector<std::uint8_t>& payload) {
  return DownloadRequest{
-  id, url, root / (id + ".bin"), root / "locks" / (id + ".lock"), payload.size(), mmltk::common::io::sha256_hex(mmltk::common::io::sha256_bytes(payload)), 3U,
+  id,
+  url,
+  root / (id + ".bin"),
+  root / "locks" / (id + ".lock"),
+  payload.size(),
+  mmltk::common::io::sha256_hex(mmltk::common::io::sha256_bytes(payload)),
+  3U,
  };
 }
 void test_benchmark_download_cache_lifecycle() {
@@ -202,12 +207,9 @@ void test_benchmark_download_cache_lifecycle() {
  cancel.store(false, std::memory_order_release);
  std::vector<DownloadProgress> resumed_updates;
  resume.source = BenchmarkDatasetSource::kCoco2017;
- const auto resumed = download_artifacts({resume}, 1U, mmltk::common::concurrency::CancellationObservation::Atomic(cancel),
-                                         [&](const auto& update) { resumed_updates.push_back(update); });
+ const auto resumed = download_artifacts({resume}, 1U, mmltk::common::concurrency::CancellationObservation::Atomic(cancel), [&](const auto& update) { resumed_updates.push_back(update); });
  REQUIRE_FALSE(resumed_updates.empty());
- CHECK(std::ranges::any_of(resumed_updates, [](const auto& update) {
-  return update.resumed && update.retained_bytes == HttpServer::partial_bytes && update.completed_bytes > update.retained_bytes;
- }));
+ CHECK(std::ranges::any_of(resumed_updates, [](const auto& update) { return update.resumed && update.retained_bytes == HttpServer::partial_bytes && update.completed_bytes > update.retained_bytes; }));
  for (const auto& update : resumed_updates) {
   CHECK(update.completed_bytes >= HttpServer::partial_bytes);
   CHECK(update.completed_bytes <= payload.size());
@@ -273,8 +275,7 @@ void test_benchmark_annotation_indexes() {
  REQUIRE(parsed.rejected.duplicate_boxes == 0U);
  REQUIRE(parsed.rejected.degenerate_boxes == 1U);
  REQUIRE(parsed.rejected.unmapped_categories == 1U);
- parsed.rejected = {
-  .raw_records = 101U, .unmapped_categories = 23U, .unknown_images = 37U, .malformed_records = 41U, .degenerate_boxes = 53U, .duplicate_boxes = 67U};
+ parsed.rejected = {.raw_records = 101U, .unmapped_categories = 23U, .unknown_images = 37U, .malformed_records = 41U, .degenerate_boxes = 53U, .duplicate_boxes = 67U};
  const fs::path index_path = root.path() / "mini-coco.index";
  store_normalized_annotation_index(index_path, parsed, {});
  const RetainedArtifact retained_index{index_path};
@@ -307,8 +308,8 @@ void test_benchmark_annotation_indexes() {
  persisted.read(reinterpret_cast<char*>(slots.data()), sizeof(slots));
  REQUIRE(persisted.good());
  CHECK((slots == std::array<std::uint64_t, 6>{101U, 23U, 37U, 41U, 53U, 67U}));
- const nlohmann::json expected_rejections{{"raw_records", 101U},      {"unmapped_categories", 23U}, {"unknown_images", 37U},
-                                          {"malformed_records", 41U}, {"degenerate_boxes", 53U},    {"duplicate_boxes", 67U}};
+ const nlohmann::json expected_rejections{
+  {"raw_records", 101U}, {"unmapped_categories", 23U}, {"unknown_images", 37U}, {"malformed_records", 41U}, {"degenerate_boxes", 53U}, {"duplicate_boxes", 67U}};
  const auto manifest_path = root.path() / "manifest" / "rejections.json";
  write_json_atomically(manifest_path, {{"rejected_records", reject_json(parsed.rejected)}}, {});
  CHECK(read_json_file(manifest_path).at("rejected_records") == expected_rejections);
@@ -320,10 +321,10 @@ void test_benchmark_annotation_indexes() {
  const fs::path boxes = root.path() / "boxes.csv";
  write_text(classes, "/m/person,Person\n");
  write_text(boxes,
-            "ImageID,Source,LabelName,Confidence,XMin,XMax,YMin,YMax,IsOccluded,IsTruncated,IsGroupOf\n"
-            "0000000000000001,xclick,/m/person,1,0.1,0.8,0.2,0.9,0,0,0\n"
-            "0000000000000001,xclick,/m/person,1,0.1,0.8,0.2,0.9,0,0,1\n"
-            "0000000000000001,xclick,/m/person,1,0.5,0.5,0.2,0.9\n");
+  "ImageID,Source,LabelName,Confidence,XMin,XMax,YMin,YMax,IsOccluded,IsTruncated,IsGroupOf\n"
+  "0000000000000001,xclick,/m/person,1,0.1,0.8,0.2,0.9,0,0,0\n"
+  "0000000000000001,xclick,/m/person,1,0.1,0.8,0.2,0.9,0,0,1\n"
+  "0000000000000001,xclick,/m/person,1,0.5,0.5,0.2,0.9\n");
  const std::array<StringCategoryMapping, 1> open_mappings{{
   {"/m/person", 0U, "Person"},
  }};
@@ -331,8 +332,7 @@ void test_benchmark_annotation_indexes() {
  open_options.source = BenchmarkDatasetSource::kOpenImagesV7;
  open_options.split = "train";
  open_options.num_workers = 2;
- NormalizedAnnotationIndex open =
-  parse_open_images_annotations(boxes, classes, mmltk::common::io::sha256_hex(mmltk::common::io::sha256_file(boxes)), open_mappings, open_options);
+ NormalizedAnnotationIndex open = parse_open_images_annotations(boxes, classes, mmltk::common::io::sha256_hex(mmltk::common::io::sha256_file(boxes)), open_mappings, open_options);
  REQUIRE(open.images.size() == 1U);
  REQUIRE(open.boxes.size() == 2U);
  REQUIRE(open.rejected.duplicate_boxes == 0U);
@@ -356,8 +356,7 @@ void test_benchmark_supplemental_sampling() {
   source.boxes.push_back(NormalizedBox{0.1F, 0.2F, 0.8F, 0.9F, 0U, 0U, static_cast<std::uint8_t>(image_index % 3U), {}});
   if (image_index % 5U == 0U) { source.boxes.push_back(NormalizedBox{0.2F, 0.3F, 0.7F, 0.8F, 0U, 0U, static_cast<std::uint8_t>(image_index % 3U), {}}); }
   original_box_counts[image_index] = static_cast<std::uint32_t>(source.boxes.size() - first_box);
-  source.images.push_back(
-   NormalizedImage{image_index, first_box, original_box_counts[image_index], 640U, 480U, static_cast<std::uint16_t>(image_index % 4U), 0U});
+  source.images.push_back(NormalizedImage{image_index, first_box, original_box_counts[image_index], 640U, 480U, static_cast<std::uint16_t>(image_index % 4U), 0U});
  }
  source.rejected = {89, 7, 6, 5, 4, 3};
  for (std::size_t i = 0; i < source.boxes.size(); ++i) {
@@ -420,8 +419,7 @@ void test_benchmark_supplemental_sampling() {
  std::uint64_t previous_id = 0U;
  bool first_image = true;
  const auto boxes_equal = [](const NormalizedBox& left, const NormalizedBox& right) {
-  return left.x1 == right.x1 && left.y1 == right.y1 && left.x2 == right.x2 && left.y2 == right.y2 && left.class_id == right.class_id &&
-         std::ranges::equal(left.reserved, right.reserved);
+  return left.x1 == right.x1 && left.y1 == right.y1 && left.x2 == right.x2 && left.y2 == right.y2 && left.class_id == right.class_id && std::ranges::equal(left.reserved, right.reserved);
  };
  for (std::size_t image_index = 0U; image_index < first.index.images.size(); ++image_index) {
   const NormalizedImage& selected = first.index.images[image_index];
@@ -476,8 +474,7 @@ void write_tar_octal(std::array<std::uint8_t, 512U>* header, const std::size_t o
  const std::size_t digit_count = static_cast<std::size_t>(converted.ptr - digits.data());
  require_condition(digit_count < width, "benchmark test tar number exceeds its field");
  std::fill_n(header->begin() + static_cast<std::ptrdiff_t>(offset), width - 1U, static_cast<std::uint8_t>('0'));
- std::copy_n(reinterpret_cast<const std::uint8_t*>(digits.data()), digit_count,
-             header->begin() + static_cast<std::ptrdiff_t>(offset + width - digit_count - 1U));
+ std::copy_n(reinterpret_cast<const std::uint8_t*>(digits.data()), digit_count, header->begin() + static_cast<std::ptrdiff_t>(offset + width - digit_count - 1U));
  (*header)[offset + width - 1U] = '\0';
 }
 void write_jpeg_tar_entry(std::ostream& output, const std::uint64_t image_id, const std::span<const std::uint8_t> jpeg) {
@@ -530,17 +527,14 @@ void test_benchmark_archive_training_quarantine() {
   .source = "objects365",
   .shard = "patch-0",
   .selected_image_ids = requested,
-  .image_id_parser = [](const std::string_view path) -> std::optional<std::uint64_t> {
-   return path.ends_with("/1.jpg") ? std::optional<std::uint64_t>{1U} : std::nullopt;
-  },
+  .image_id_parser = [](const std::string_view path) -> std::optional<std::uint64_t> { return path.ends_with("/1.jpg") ? std::optional<std::uint64_t>{1U} : std::nullopt; },
   .cancel_requested = {},
   .progress =
    [&](const std::uint64_t completed, const std::uint64_t total) {
     progress_completed = completed;
     progress_total = total;
    },
-  .validator = [](const std::uint64_t,
-                  const std::span<const std::uint8_t> encoded) { require_condition(has_complete_image_markers(encoded), "archive test JPEG is incomplete"); },
+  .validator = [](const std::uint64_t, const std::span<const std::uint8_t> encoded) { require_condition(has_complete_image_markers(encoded), "archive test JPEG is incomplete"); },
   .trace = {},
   .quarantine_unavailable = true,
   .decompression_workers = 0U,
@@ -598,8 +592,8 @@ void test_benchmark_cached_image_writer_and_loader() {
  split.name = "validation";
  split.class_names = {"person"};
  split.sources.push_back(CachedImageSource{image_root});
- const mmltk::backend::imaging::resample::ImageResizeGeometry letterbox = mmltk::backend::imaging::resample::compute_image_resize_geometry(
-  16U, 8U, kNanoResolution, kNanoResolution, mmltk::backend::imaging::resample::ImageResizeMode::Letterbox);
+ const mmltk::backend::imaging::resample::ImageResizeGeometry letterbox =
+  mmltk::backend::imaging::resample::compute_image_resize_geometry(16U, 8U, kNanoResolution, kNanoResolution, mmltk::backend::imaging::resample::ImageResizeMode::Letterbox);
  REQUIRE(letterbox.resized_width == kNanoResolution);
  REQUIRE(letterbox.resized_height == 192U);
  REQUIRE(letterbox.offset_x == 0U);
@@ -628,8 +622,7 @@ void test_benchmark_cached_image_writer_and_loader() {
   {},
   false,
   {},
-  {.context = &producer_events,
-   .image_completed = [](void* context) { static_cast<std::atomic<std::uint64_t>*>(context)->fetch_add(1U, std::memory_order_relaxed); }},
+  {.context = &producer_events, .image_completed = [](void* context) { static_cast<std::atomic<std::uint64_t>*>(context)->fetch_add(1U, std::memory_order_relaxed); }},
   false,
   mmltk::backend::imaging::resample::ImageResizeMode::Letterbox,
  });
@@ -705,9 +698,8 @@ void test_benchmark_cached_image_writer_and_loader() {
   fs::create_directories(staged);
   // Acquired facts come from the real raw-cache fixture. The production
   // publication boundary owns the envelope and selected policy/version.
-  const nlohmann::json acquired{{"image_cache", nlohmann::json::array({raw_cache_identity})},
-                                {"train", {{"bytes", fs::file_size(output)}}},
-                                {"val", {{"bytes", fs::file_size(perceptual_request.output_path)}}}};
+  const nlohmann::json acquired{
+   {"image_cache", nlohmann::json::array({raw_cache_identity})}, {"train", {{"bytes", fs::file_size(output)}}}, {"val", {{"bytes", fs::file_size(perceptual_request.output_path)}}}};
   publish_benchmark_manifest(manifest_config, staged, image_root, acquired, {});
   const auto manifest = read_json_file(staged / "benchmark_manifest.json");
   CHECK(manifest.at("resampling").at("perceptual_downscale").get<bool>() == perceptual);
@@ -756,11 +748,9 @@ void test_benchmark_event_cancellation_while_waiting_for_lock_without_progress()
  const fs::path output = root.path() / "compiled";
  const fs::path cache = root.path() / "cache";
  const std::string normalized_output = fs::weakly_canonical(fs::absolute(output)).generic_string();
- const fs::path lock_path = root.path() / ".cache" / "benchmark-dataset" / "v1" / "locks" /
-                            ("output-" +
-                             mmltk::common::io::sha256_hex(mmltk::common::io::sha256_bytes(
-                              std::span(reinterpret_cast<const std::uint8_t*>(normalized_output.data()), normalized_output.size()))) +
-                             ".lock");
+ const fs::path lock_path =
+  root.path() / ".cache" / "benchmark-dataset" / "v1" / "locks" /
+  ("output-" + mmltk::common::io::sha256_hex(mmltk::common::io::sha256_bytes(std::span(reinterpret_cast<const std::uint8_t*>(normalized_output.data()), normalized_output.size()))) + ".lock");
  fs::create_directories(lock_path.parent_path());
  const mmltk::common::io::ScopedFd lock_descriptor{::open(lock_path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0644)};
  const int descriptor = lock_descriptor.get();
@@ -933,16 +923,14 @@ TEST_CASE("benchmark publication admission preserves separate physical output an
  std::atomic<bool> cancelled{false};
  config.cancel_requested = mmltk::common::concurrency::CancellationObservation::Atomic(cancelled);
  config.progress = [&](const BenchmarkCompileProgress&) { cancelled.store(true); };
- CHECK_THROWS_WITH(compile_benchmark_dataset(config),
-                   overlap ? "benchmark output and cache directories must not overlap" : "benchmark dataset compilation cancelled");
+ CHECK_THROWS_WITH(compile_benchmark_dataset(config), overlap ? "benchmark output and cache directories must not overlap" : "benchmark dataset compilation cancelled");
  cancelled.store(false);
  std::size_t path_trace_calls = 0U;
  config.trace = [&](std::string_view event, std::string_view) {
   if (event == "benchmark.compile.paths") ++path_trace_calls;
   throw std::runtime_error("diagnostic callback failure");
  };
- CHECK_THROWS_WITH(compile_benchmark_dataset(config),
-                   overlap ? "benchmark output and cache directories must not overlap" : "benchmark dataset compilation cancelled");
+ CHECK_THROWS_WITH(compile_benchmark_dataset(config), overlap ? "benchmark output and cache directories must not overlap" : "benchmark dataset compilation cancelled");
  CHECK(path_trace_calls == 1U);
  CHECK(cancelled.load());
  CHECK_FALSE(fs::exists(config.output_dir));
@@ -1093,9 +1081,9 @@ TEST_CASE("normalized slices preserve exact fields and owned storage", "[backend
  input.rejected = {13, 2, 3, 4, 5, 6};
  input.images = {{30, 0, 2, 8, 4, 7, 0}, {10, 2, 0, 9, 5, 8, 0}, {20, 2, 1, 10, 6, 9, 0}, {40, 3, 1, 11, 7, 10, 0}};
  input.boxes = {{0.1F, 0.2F, 0.8F, 0.9F, 0, 2, 2, kAnnotationMask | kAnnotationCategory | kAnnotationId, {}, 4.5, 101, 3, 19},
-                {0.2F, 0.3F, 0.7F, 0.8F, 2, 0, 3, kAnnotationMask | kAnnotationCategory, {}, 0, 0, 4, 23},
-                {0.3F, 0.4F, 0.6F, 0.7F, 2, 2, 4, kAnnotationMask | kAnnotationCrowd | kAnnotationCategory, {}, 8.25, 0, 5, 29},
-                {0.4F, 0.5F, 0.8F, 0.9F, 4, 1, 5, kAnnotationMask | kAnnotationIgnore | kAnnotationCategory, {}, 1, 0, 6, 31}};
+  {0.2F, 0.3F, 0.7F, 0.8F, 2, 0, 3, kAnnotationMask | kAnnotationCategory, {}, 0, 0, 4, 23},
+  {0.3F, 0.4F, 0.6F, 0.7F, 2, 2, 4, kAnnotationMask | kAnnotationCrowd | kAnnotationCategory, {}, 8.25, 0, 5, 29},
+  {0.4F, 0.5F, 0.8F, 0.9F, 4, 1, 5, kAnnotationMask | kAnnotationIgnore | kAnnotationCategory, {}, 1, 0, 6, 31}};
  input.mask_rle_pairs = {{0, 2}, {5, 1}, {2, 3}, {9, 2}, {7, 1}};
  const auto original = input;
  std::vector<std::size_t> order{0, 1, 2, 3};
@@ -1242,26 +1230,17 @@ TEST_CASE("benchmark supplemental sampling", "[backend][data][benchmark][samplin
 TEST_CASE("benchmark cached image writer and loader", "[backend][data][benchmark][writer]") { test_benchmark_cached_image_writer_and_loader(); }
 TEST_CASE("benchmark archive quarantine policy", "[backend][data][benchmark][images]") { test_benchmark_archive_quarantine_policy(); }
 TEST_CASE("benchmark archive training quarantine", "[backend][data][benchmark][images]") { test_benchmark_archive_training_quarantine(); }
-TEST_CASE("benchmark event cancellation without progress", "[backend][data][benchmark][cancel]") {
- test_benchmark_event_cancellation_while_waiting_for_lock_without_progress();
-}
+TEST_CASE("benchmark event cancellation without progress", "[backend][data][benchmark][cancel]") { test_benchmark_event_cancellation_while_waiting_for_lock_without_progress(); }
 TEST_CASE("benchmark source status", "[backend][data][benchmark][progress]") { test_benchmark_cli_source_status_preserves_active_transfer_state(); }
 TEST_CASE("benchmark trace gate is lazy", "[backend][data][benchmark][trace]") { test_benchmark_trace_gate_is_lazy(); }
 TEST_CASE("benchmark annotations retain provenance crowd area masks and deterministic source order", "[backend][data][benchmark][annotations]") {
  mmltk::testsupport::ScopedTempDir root("faithful-benchmark");
  const auto path = root.path() / "annotations.json";
- nlohmann::json document{{"images", {{{"id", 0}, {"width", 16}, {"height", 8}}}},
-                         {"categories", {{{"id", 1}, {"name", "person"}}, {{"id", 2}, {"name", "human"}}}},
-                         {"annotations", nlohmann::json::array()}};
+ nlohmann::json document{
+  {"images", {{{"id", 0}, {"width", 16}, {"height", 8}}}}, {"categories", {{{"id", 1}, {"name", "person"}}, {{"id", 2}, {"name", "human"}}}}, {"annotations", nlohmann::json::array()}};
  for (unsigned ordinal = 0; ordinal != 128U; ++ordinal) {
-  document["annotations"].push_back({{"id", 127U - ordinal},
-                                     {"image_id", 0},
-                                     {"category_id", ordinal % 2U + 1U},
-                                     {"bbox", {-0.5, 1.25, 13.0, 5.5}},
-                                     {"area", 7.25},
-                                     {"iscrowd", ordinal % 2U},
-                                     {"ignore", true},
-                                     {"segmentation", nlohmann::json::array()}});
+  document["annotations"].push_back({{"id", 127U - ordinal}, {"image_id", 0}, {"category_id", ordinal % 2U + 1U}, {"bbox", {-0.5, 1.25, 13.0, 5.5}}, {"area", 7.25}, {"iscrowd", ordinal % 2U},
+   {"ignore", true}, {"segmentation", nlohmann::json::array()}});
  }
  document["annotations"].push_back({{"image_id", 0}, {"category_id", 1}, {"segmentation", {{"size", {8, 16}}, {"counts", {0, 1, 127}}}}});
  write_text(path, document.dump());
@@ -1306,9 +1285,8 @@ TEST_CASE("benchmark annotations retain provenance crowd area masks and determin
 TEST_CASE("benchmark semantic admission isolates malformed masks and numeric overflow", "[backend][data][benchmark][annotations]") {
  mmltk::testsupport::ScopedTempDir root("benchmark-admission");
  const auto path = root.path() / "annotations.json";
- nlohmann::json document{{"images", {{{"id", 0}, {"width", 16}, {"height", 8}, {"file_name", "patch0/0.jpg"}}}},
-                         {"categories", {{{"id", 1}, {"name", "person"}}}},
-                         {"annotations", nlohmann::json::array()}};
+ nlohmann::json document{
+  {"images", {{{"id", 0}, {"width", 16}, {"height", 8}, {"file_name", "patch0/0.jpg"}}}}, {"categories", {{{"id", 1}, {"name", "person"}}}}, {"annotations", nlohmann::json::array()}};
  const nlohmann::json base{{"image_id", 0}, {"category_id", 1}, {"bbox", {-0.5, 1.25, 13.0, 5.5}}};
  const auto append = [&](nlohmann::json record) { document["annotations"].push_back(std::move(record)); };
  auto record = base;
@@ -1370,10 +1348,10 @@ TEST_CASE("benchmark semantic admission isolates malformed masks and numeric ove
  const auto boxes = root.path() / "boxes.csv";
  write_text(classes, "/m/person,Person\n");
  write_text(boxes,
-            "ImageID,Source,LabelName,Confidence,XMin,XMax,YMin,YMax\n"
-            "0000000000000000,xclick,/m/person,1,-0.1,0.8,0.2,0.9\n"
-            "0000000000000000,xclick,/m/person,1,1e100,2e100,0.2,0.9\n"
-            "0000000000000000,xclick,/m/person,1,0,1e200,0,1e200\n");
+  "ImageID,Source,LabelName,Confidence,XMin,XMax,YMin,YMax\n"
+  "0000000000000000,xclick,/m/person,1,-0.1,0.8,0.2,0.9\n"
+  "0000000000000000,xclick,/m/person,1,1e100,2e100,0.2,0.9\n"
+  "0000000000000000,xclick,/m/person,1,0,1e200,0,1e200\n");
  const std::array<StringCategoryMapping, 1> open_mappings{{{"/m/person", 0U, "Person"}}};
  AnnotationParseOptions options;
  options.source = BenchmarkDatasetSource::kOpenImagesV7;
@@ -1429,26 +1407,20 @@ TEST_CASE("normalized benchmark caches require source category presence", "[back
 TEST_CASE("benchmark supplied bbox admission precedes mask materialization", "[backend][data][benchmark][annotations]") {
  mmltk::testsupport::ScopedTempDir root("bbox-first-admission");
  const auto path = root.path() / "annotations.json";
- nlohmann::ordered_json document{
-  {"images",
-   {{{"id", 0}, {"width", 16}, {"height", 8}, {"file_name", "patch0/0.jpg"}}, {{"id", 1}, {"width", 4096}, {"height", 4096}, {"file_name", "patch0/1.jpg"}}}},
-  {"categories", {{{"id", 1}, {"name", "person"}}}},
-  {"annotations", nlohmann::ordered_json::array()}};
+ nlohmann::ordered_json document{{"images", {{{"id", 0}, {"width", 16}, {"height", 8}, {"file_name", "patch0/0.jpg"}}, {{"id", 1}, {"width", 4096}, {"height", 4096}, {"file_name", "patch0/1.jpg"}}}},
+  {"categories", {{{"id", 1}, {"name", "person"}}}}, {"annotations", nlohmann::ordered_json::array()}};
  // Invalid compressed RLE must not override a supplied degenerate bbox.
  document["annotations"].push_back({{"image_id", 0}, {"category_id", 1}, {"bbox", {0, 0, 0, 1}}, {"segmentation", {{"size", {8, 16}}, {"counts", "!"}}}});
  // This valid all-background mask would otherwise allocate 16 MiB.
- document["annotations"].push_back(
-  {{"image_id", 1}, {"category_id", 1}, {"bbox", {0, 0, -1, 1}}, {"segmentation", {{"size", {4096, 4096}}, {"counts", {16777216U}}}}});
+ document["annotations"].push_back({{"image_id", 1}, {"category_id", 1}, {"bbox", {0, 0, -1, 1}}, {"segmentation", {{"size", {4096, 4096}}, {"counts", {16777216U}}}}});
  // Normalized-float admission also runs before that mask can be allocated.
- document["annotations"].push_back(
-  {{"image_id", 1}, {"category_id", 1}, {"bbox", {1e100, 0.0, 1e100, 1.0}}, {"segmentation", {{"size", {4096, 4096}}, {"counts", {16777216U}}}}});
- document["annotations"].push_back(
-  {{"image_id", 0}, {"category_id", 1}, {"bbox", {-1, -1, 3, 3}}, {"segmentation", {{"size", {8, 16}}, {"counts", {0, 1, 127}}}}});
+ document["annotations"].push_back({{"image_id", 1}, {"category_id", 1}, {"bbox", {1e100, 0.0, 1e100, 1.0}}, {"segmentation", {{"size", {4096, 4096}}, {"counts", {16777216U}}}}});
+ document["annotations"].push_back({{"image_id", 0}, {"category_id", 1}, {"bbox", {-1, -1, 3, 3}}, {"segmentation", {{"size", {8, 16}}, {"counts", {0, 1, 127}}}}});
  document["annotations"].push_back({{"image_id", 0}, {"category_id", 1}, {"segmentation", {{"size", {8, 16}}, {"counts", {0, 1, 127}}}}});
  // Decode-time failures must remain irrelevant to a degenerate supplied box,
  // even when segmentation is encountered before the box and identities.
- const std::array<nlohmann::ordered_json, 3> invalid_segmentations{nlohmann::ordered_json(false), nlohmann::ordered_json{{"size", {8, 16}}},
-                                                                   nlohmann::ordered_json::array({nlohmann::ordered_json::array({0, 0, 1})})};
+ const std::array<nlohmann::ordered_json, 3> invalid_segmentations{
+  nlohmann::ordered_json(false), nlohmann::ordered_json{{"size", {8, 16}}}, nlohmann::ordered_json::array({nlohmann::ordered_json::array({0, 0, 1})})};
  for (const auto& segmentation : invalid_segmentations) {
   for (const bool segmentation_first : {false, true}) {
    for (const int bbox_width : {0, 1}) {
@@ -1506,16 +1478,14 @@ TEST_CASE("benchmark supplied bbox admission precedes mask materialization", "[b
 TEST_CASE("benchmark polygon raster bounds handle extreme and half-open coordinates", "[backend][data][benchmark][annotations]") {
  mmltk::testsupport::ScopedTempDir root("polygon-bounds");
  const auto path = root.path() / "annotations.json";
- nlohmann::json document{
-  {"images", {{{"id", 0}, {"width", 4}, {"height", 4}}}}, {"categories", {{{"id", 1}, {"name", "person"}}}}, {"annotations", nlohmann::json::array()}};
+ nlohmann::json document{{"images", {{{"id", 0}, {"width", 4}, {"height", 4}}}}, {"categories", {{{"id", 1}, {"name", "person"}}}}, {"annotations", nlohmann::json::array()}};
  const std::array<std::vector<double>, 4> polygons{{
   {-1e308, -1e308, 1e308, -1e308, 1e308, 1e308, -1e308, 1e308},
   {1e308, 1e308, 1e308, 9e307, 9e307, 9e307},
   {-0.5, -0.5, 3.5, -0.5, 3.5, 3.5, -0.5, 3.5},
   {0.5, 0.5, 4.5, 0.5, 4.5, 4.5, 0.5, 4.5},
  }};
- for (const auto& polygon : polygons)
-  document["annotations"].push_back({{"image_id", 0}, {"category_id", 1}, {"bbox", {0, 0, 4, 4}}, {"segmentation", {polygon}}});
+ for (const auto& polygon : polygons) document["annotations"].push_back({{"image_id", 0}, {"category_id", 1}, {"bbox", {0, 0, 4, 4}}, {"segmentation", {polygon}}});
  write_text(path, document.dump());
  const std::array<NumericCategoryMapping, 1> mappings{{{1U, 0U, "person"}}};
  const auto digest = mmltk::common::io::sha256_hex(mmltk::common::io::sha256_file(path));
@@ -1535,8 +1505,7 @@ TEST_CASE("benchmark polygon raster bounds handle extreme and half-open coordina
     REQUIRE(pair.start + pair.length <= actual.size());
     std::fill(actual.begin() + pair.start, actual.begin() + pair.start + pair.length, true);
    }
-   for (unsigned pixel = 0; pixel < actual.size(); ++pixel)
-    CHECK(actual[pixel] == (ordinal == 0U || ordinal == 3U || (ordinal == 2U && pixel % 4U < 3U && pixel / 4U < 3U)));
+   for (unsigned pixel = 0; pixel < actual.size(); ++pixel) CHECK(actual[pixel] == (ordinal == 0U || ordinal == 3U || (ordinal == 2U && pixel % 4U < 3U && pixel / 4U < 3U)));
   }
  }
 }
@@ -1550,8 +1519,7 @@ TEST_CASE("generic and benchmark writers share complete format headers", "[backe
  prepare_cached_image_directory(image_root);
  write_cached_image_atomically(cached_image_path(image_root, 1U), make_jpeg(128U, 64U, 32U), {});
  for (const auto mode : {resize::ImageResizeMode::Stretch, resize::ImageResizeMode::Letterbox}) {
-  for (const std::string& annotation :
-       {std::string{}, std::string{R"({"class":"person","bbox_xyxy":[1,1,4,4],"mask_rle_encoding":"row_major_start_length","mask_rle":""})"},
+  for (const std::string& annotation : {std::string{}, std::string{R"({"class":"person","bbox_xyxy":[1,1,4,4],"mask_rle_encoding":"row_major_start_length","mask_rle":""})"},
         std::string{R"({"class":"person","bbox_xyxy":[1,1,4,4],"mask_rle_encoding":"row_major_start_length","mask_rle":"17:3 33:3 49:3"})"}}) {
    write_text(fs::path(fixtures::dataset_dir(fixture)) / "train/000001.jsonl", annotation);
    auto config = fixtures::compiler_config(fixture);
@@ -1635,9 +1603,7 @@ TEST_CASE("segmented downloads retain durable ranges through failure cancellatio
   if (event == "benchmark.download.progress") {
    traced_bytes.store(true, std::memory_order_relaxed);
    if (fields.at("attempt") == 2U) { traced_second_attempt.store(true, std::memory_order_relaxed); }
-   if (fields.at("retained_bytes").get<std::uint64_t>() == 0U || fields.at("durable_bytes") > fields.at("completed_bytes")) {
-    invalid_byte_facts.store(true, std::memory_order_relaxed);
-   }
+   if (fields.at("retained_bytes").get<std::uint64_t>() == 0U || fields.at("durable_bytes") > fields.at("completed_bytes")) { invalid_byte_facts.store(true, std::memory_order_relaxed); }
   }
   if (event == "benchmark.download.segment_retry") traced_retry.store(true, std::memory_order_relaxed);
   if (event == "benchmark.download.segmented_complete") traced_complete.store(true, std::memory_order_relaxed);
@@ -1725,12 +1691,9 @@ TEST_CASE("transfer observers are independent of trace-only pixel observers", "[
 TEST_CASE("parser workers reset segmentation scratch across masks rejections and dimension changes", "[backend][data][benchmark][annotations]") {
  mmltk::testsupport::ScopedTempDir root("segmentation-scratch");
  const auto path = root.path() / "annotations.json";
- nlohmann::json document{{"images",
-                          {{{"id", 1}, {"width", 16}, {"height", 8}, {"file_name", "patch0/1.jpg"}},
-                           {{"id", 2}, {"width", 4}, {"height", 4}, {"file_name", "patch0/2.jpg"}},
-                           {{"id", 3}, {"width", 4}, {"height", 4}, {"file_name", "patch0/3.jpg"}}}},
-                         {"categories", {{{"id", 1}, {"name", "person"}}}},
-                         {"annotations", nlohmann::json::array()}};
+ nlohmann::json document{{"images", {{{"id", 1}, {"width", 16}, {"height", 8}, {"file_name", "patch0/1.jpg"}}, {{"id", 2}, {"width", 4}, {"height", 4}, {"file_name", "patch0/2.jpg"}},
+                                     {{"id", 3}, {"width", 4}, {"height", 4}, {"file_name", "patch0/3.jpg"}}}},
+  {"categories", {{{"id", 1}, {"name", "person"}}}}, {"annotations", nlohmann::json::array()}};
  for (unsigned cycle = 0U; cycle < 256U; ++cycle)
   for (unsigned kind = 0U; kind < 7U; ++kind) {
    const bool small = (cycle + kind) % 2U != 0U;
@@ -1918,25 +1881,23 @@ TEST_CASE("archive image reuse reports initial and resolved counts without repla
   const std::vector<std::uint64_t> ids{1U, 2U};
   std::vector<std::uint64_t> counts;
   ArchiveExtractionRequest request{.archive_path = archive,
-                                   .source_identity = "fixture:reuse",
-                                   .output_root = images,
-                                   .source = "objects365",
-                                   .shard = "patch-0",
-                                   .selected_image_ids = ids,
-                                   .image_id_parser = [](const std::string_view name) -> std::optional<std::uint64_t> {
-                                    return name.ends_with("/2.jpg") ? std::optional<std::uint64_t>{2U} : std::nullopt;
-                                   },
-                                   .progress =
-                                    [&](const auto completed, const auto total) {
-                                     CHECK(total == 2U);
-                                     counts.push_back(completed);
-                                    },
-                                   .validator =
-                                    [](const auto, const auto encoded) {
-                                     if (!has_complete_image_markers(encoded)) { throw std::runtime_error("invalid cached JPEG"); }
-                                    },
-                                   .decompression_workers = 0U,
-                                   .cache_write_workers = workers};
+   .source_identity = "fixture:reuse",
+   .output_root = images,
+   .source = "objects365",
+   .shard = "patch-0",
+   .selected_image_ids = ids,
+   .image_id_parser = [](const std::string_view name) -> std::optional<std::uint64_t> { return name.ends_with("/2.jpg") ? std::optional<std::uint64_t>{2U} : std::nullopt; },
+   .progress =
+    [&](const auto completed, const auto total) {
+     CHECK(total == 2U);
+     counts.push_back(completed);
+    },
+   .validator =
+    [](const auto, const auto encoded) {
+     if (!has_complete_image_markers(encoded)) { throw std::runtime_error("invalid cached JPEG"); }
+    },
+   .decompression_workers = 0U,
+   .cache_write_workers = workers};
   auto result = extract_selected_archive_images(request);
   REQUIRE_FALSE(counts.empty());
   CHECK(counts.front() == 1U);
@@ -2074,25 +2035,25 @@ TEST_CASE("batched image writes settle before cancellation and preserve successf
   std::atomic<bool> cancelled{false};
   std::vector<std::uint64_t> counts;
   ArchiveExtractionRequest request{.archive_path = archive,
-                                   .source_identity = "fixture:batch",
-                                   .output_root = root.path() / "images",
-                                   .source = "objects365",
-                                   .shard = "patch-0",
-                                   .selected_image_ids = ids,
-                                   .image_id_parser = [](const std::string_view name) -> std::optional<std::uint64_t> {
-                                    const auto digits = name.substr(name.find_last_of('/') + 1U);
-                                    std::uint64_t id = 0U;
-                                    const auto parsed = std::from_chars(digits.data(), digits.data() + digits.size() - 4U, id);
-                                    return parsed.ec == std::errc{} ? std::optional<std::uint64_t>{id} : std::nullopt;
-                                   },
-                                   .cancel_requested = mmltk::common::concurrency::CancellationObservation::Atomic(cancelled),
-                                   .progress =
-                                    [&](const auto completed, const auto) {
-                                     counts.push_back(completed);
-                                     if (cancel_after_batch && completed >= 128U) { cancelled.store(true); }
-                                    },
-                                   .decompression_workers = 0U,
-                                   .cache_write_workers = 3U};
+   .source_identity = "fixture:batch",
+   .output_root = root.path() / "images",
+   .source = "objects365",
+   .shard = "patch-0",
+   .selected_image_ids = ids,
+   .image_id_parser = [](const std::string_view name) -> std::optional<std::uint64_t> {
+    const auto digits = name.substr(name.find_last_of('/') + 1U);
+    std::uint64_t id = 0U;
+    const auto parsed = std::from_chars(digits.data(), digits.data() + digits.size() - 4U, id);
+    return parsed.ec == std::errc{} ? std::optional<std::uint64_t>{id} : std::nullopt;
+   },
+   .cancel_requested = mmltk::common::concurrency::CancellationObservation::Atomic(cancelled),
+   .progress =
+    [&](const auto completed, const auto) {
+     counts.push_back(completed);
+     if (cancel_after_batch && completed >= 128U) { cancelled.store(true); }
+    },
+   .decompression_workers = 0U,
+   .cache_write_workers = 3U};
   if (cancel_after_batch) {
    CHECK_THROWS(extract_selected_archive_images(request));
    CHECK_FALSE(fs::exists(request.output_root / ".complete.json"));
@@ -2185,8 +2146,8 @@ TEST_CASE("artifact acquisition totals replace contributions without inventing u
  ProgressReporter reporter([&](const auto& update) { latest = update; }, trace);
  ArtifactProgressTotals totals;
  reporter.phase(DatasetCompilePhase::Downloading);
- const auto observe = [&](const BenchmarkDatasetSource source, const char* artifact, const std::uint64_t completed, const std::uint64_t total,
-                          const std::uint64_t expected_completed, const std::uint64_t expected_total) {
+ const auto observe = [&](const BenchmarkDatasetSource source, const char* artifact, const std::uint64_t completed, const std::uint64_t total, const std::uint64_t expected_completed,
+                       const std::uint64_t expected_total) {
   totals.update(DownloadProgress{.artifact_id = artifact, .completed_bytes = completed, .total_bytes = total, .source = source}, reporter);
   CHECK(latest.completed == expected_completed);
   CHECK(latest.total == expected_total);
@@ -2248,8 +2209,7 @@ TEST_CASE("ordinary transfer observations exclude discarded bodies and settle un
   redirect = true;
   server.RedirectNextTransfer();
  }
- DownloadRequest request{
-  "coco-observed", server.url("artifact"), root.path() / "artifact.bin", root.path() / "artifact.lock", unknown ? 0U : payload.size(), {}, 2U};
+ DownloadRequest request{"coco-observed", server.url("artifact"), root.path() / "artifact.bin", root.path() / "artifact.lock", unknown ? 0U : payload.size(), {}, 2U};
  if (invalid_request) {
   request.url = "unsupported-benchmark-protocol://artifact";
   if (segmented_probe) request.expected_size = 512ULL * 1024U * 1024U;
@@ -2259,9 +2219,7 @@ TEST_CASE("ordinary transfer observations exclude discarded bodies and settle un
    (void)download_artifacts({request}, segmented_probe ? 2U : 1U, {}, {}, [&](std::string_view event, const auto&) {
     if (event == "benchmark.download.attempt_failed" || event == "benchmark.download.segmented_probe_retry") ++retries;
    });
-  } catch (const BenchmarkDownloadUnavailable&) {
-   FAIL("invalid local protocol became optional source unavailability");
-  } catch (const std::runtime_error& error) {
+  } catch (const BenchmarkDownloadUnavailable&) { FAIL("invalid local protocol became optional source unavailability"); } catch (const std::runtime_error& error) {
    local_failure = true;
    CHECK(std::string_view(error.what()).starts_with("local benchmark CURL failure:"));
   }
@@ -2277,8 +2235,7 @@ TEST_CASE("ordinary transfer observations exclude discarded bodies and settle un
   std::ofstream partial(request.destination.string() + ".part", std::ios::binary);
   partial.write(reinterpret_cast<const char*>(payload.data()), static_cast<std::streamsize>(retained));
   partial.close();
-  write_json_atomically(request.destination.string() + ".part.json",
-                        {{"schema_version", kBenchmarkCacheSchemaVersion}, {"url", request.url}, {"etag", "\"benchmark-test-etag\""}}, {});
+  write_json_atomically(request.destination.string() + ".part.json", {{"schema_version", kBenchmarkCacheSchemaVersion}, {"url", request.url}, {"etag", "\"benchmark-test-etag\""}}, {});
  }
  std::vector<DownloadProgress> updates;
  const auto downloaded = download_artifacts({request}, 1U, {}, [&](const auto& update) { updates.push_back(update); });
@@ -2337,7 +2294,7 @@ TEST_CASE("annotation retries distinguish source corruption from local capacity 
                     throw InsufficientBenchmarkStorage("fixture capacity");
                    },
                    repair),
-                  InsufficientBenchmarkStorage);
+   InsufficientBenchmarkStorage);
   CHECK(bodies == 1);
   CHECK(repairs == 0);
  }

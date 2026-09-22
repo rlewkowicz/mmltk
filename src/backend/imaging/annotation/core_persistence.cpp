@@ -35,7 +35,11 @@ constexpr std::string_view kAnnotationMaskFormat = "rle_row_major_start_length";
 constexpr std::string_view kAnnotationBackgroundAnnotationPolicy = "empty_jsonl_file";
 constexpr std::string_view kAnnotationMaskRleEncoding = "row_major_start_length";
 constexpr std::array<std::string_view, 5> kAnnotationShapeTypes{
- "box", "mask", "spline", "point", "skeleton",
+ "box",
+ "mask",
+ "spline",
+ "point",
+ "skeleton",
 };
 AnnotationShapeType annotation_shape_type_from_name(const std::string_view shape_type_name) {
  if (shape_type_name == "box") { return AnnotationShapeType::Box; }
@@ -48,19 +52,13 @@ AnnotationShapeType annotation_shape_type_from_name(const std::string_view shape
 void validate_annotation_categories_meta(const json& meta) {
  const auto require_string = [&](const char* key, const std::string_view expected) {
   const auto field = meta.find(key);
-  if (field == meta.end() || !field->is_string() || field->get<std::string>() != expected) {
-   throw std::runtime_error("annotation categories meta: unexpected `" + std::string(key) + "`");
-  }
+  if (field == meta.end() || !field->is_string() || field->get<std::string>() != expected) { throw std::runtime_error("annotation categories meta: unexpected `" + std::string(key) + "`"); }
  };
  const auto require_shape_types = [&]() {
   const auto field = meta.find("shape_types");
-  if (field == meta.end() || !field->is_array() || field->size() != kAnnotationShapeTypes.size()) {
-   throw std::runtime_error("annotation categories meta: unexpected `shape_types`");
-  }
+  if (field == meta.end() || !field->is_array() || field->size() != kAnnotationShapeTypes.size()) { throw std::runtime_error("annotation categories meta: unexpected `shape_types`"); }
   for (std::size_t index = 0; index < kAnnotationShapeTypes.size(); ++index) {
-   if (!(*field)[index].is_string() || (*field)[index].get<std::string>() != kAnnotationShapeTypes[index]) {
-    throw std::runtime_error("annotation categories meta: unexpected `shape_types`");
-   }
+   if (!(*field)[index].is_string() || (*field)[index].get<std::string>() != kAnnotationShapeTypes[index]) { throw std::runtime_error("annotation categories meta: unexpected `shape_types`"); }
   }
  };
  require_string("version", kAnnotationCategoriesSchemaVersion);
@@ -110,9 +108,7 @@ json category_split_stats(const std::filesystem::path& split_dir) {
   {"annotated", total},
  };
 }
-void append_jsonl(const std::filesystem::path& path, const json& entry) {
- mmltk::common::io::throw_on_json_write_failure(mmltk::common::io::append_json_line(path, entry), path, "JSONL manifest");
-}
+void append_jsonl(const std::filesystem::path& path, const json& entry) { mmltk::common::io::throw_on_json_write_failure(mmltk::common::io::append_json_line(path, entry), path, "JSONL manifest"); }
 json point_to_json(const AnnotationPoint& point) { return json::array({point.x, point.y}); }
 json box_to_json(const AnnotationBox& box) { return json::array({box.x1, box.y1, box.x2, box.y2}); }
 json serialize_annotation_shape_payload(const AnnotationFrame& frame, const AnnotationObject& object) {
@@ -179,8 +175,8 @@ std::optional<AnnotationBox> annotation_box_from_json(const json& value) {
   value.at(3).get<int>(),
  };
 }
-std::optional<AnnotationBox> frame_box_to_capture_box(const AnnotationBox& frame_box, const std::uint32_t view_x, const std::uint32_t view_y,
-                                                      const std::uint32_t capture_width, const std::uint32_t capture_height) {
+std::optional<AnnotationBox> frame_box_to_capture_box(
+ const AnnotationBox& frame_box, const std::uint32_t view_x, const std::uint32_t view_y, const std::uint32_t capture_width, const std::uint32_t capture_height) {
  return normalize_annotation_box(
   AnnotationBox{
    frame_box.x1 + static_cast<int>(view_x),
@@ -195,8 +191,7 @@ std::vector<std::uint8_t> trim_dense_mask_to_bbox(const std::vector<std::uint8_t
  const std::uint32_t trimmed_height = static_cast<std::uint32_t>(std::max(0, bbox.y2 - bbox.y1));
  std::vector<std::uint8_t> trimmed(static_cast<std::size_t>(trimmed_width) * static_cast<std::size_t>(trimmed_height), 0U);
  for (std::uint32_t row = 0; row < trimmed_height; ++row) {
-  const std::size_t src_offset =
-   static_cast<std::size_t>(bbox.y1 + static_cast<int>(row)) * static_cast<std::size_t>(image_width) + static_cast<std::size_t>(bbox.x1);
+  const std::size_t src_offset = static_cast<std::size_t>(bbox.y1 + static_cast<int>(row)) * static_cast<std::size_t>(image_width) + static_cast<std::size_t>(bbox.x1);
   const std::size_t dst_offset = static_cast<std::size_t>(row) * static_cast<std::size_t>(trimmed_width);
   std::copy_n(dense_mask.begin() + static_cast<std::ptrdiff_t>(src_offset), trimmed_width, trimmed.begin() + static_cast<std::ptrdiff_t>(dst_offset));
  }
@@ -416,8 +411,7 @@ AnnotationCategories load_annotation_categories(const std::filesystem::path& out
  if (meta != parsed.end()) {
   if (!meta->is_object()) throw std::runtime_error("annotation categories meta must be an object");
   validate_annotation_categories_meta(*meta);
-  if (const auto dataset_name = meta->find("dataset_name"); dataset_name != meta->end() && dataset_name->is_string())
-   categories.dataset_name = dataset_name->get<std::string>();
+  if (const auto dataset_name = meta->find("dataset_name"); dataset_name != meta->end() && dataset_name->is_string()) categories.dataset_name = dataset_name->get<std::string>();
  }
  const auto classes = parsed.find("classes");
  if (classes == parsed.end() || !classes->is_array()) { throw std::runtime_error("annotation categories file is missing array `classes`"); }
@@ -428,9 +422,7 @@ AnnotationCategories load_annotation_categories(const std::filesystem::path& out
   AnnotationCategory category;
   category.id = entry.at("id").get<int>();
   category.name = entry.value("name", std::string{});
-  if (const auto keypoints = entry.find("keypoints"); keypoints != entry.end() && keypoints->is_array()) {
-   category.keypoints = keypoints->get<std::vector<std::string>>();
-  }
+  if (const auto keypoints = entry.find("keypoints"); keypoints != entry.end() && keypoints->is_array()) { category.keypoints = keypoints->get<std::vector<std::string>>(); }
   if (const auto edges = entry.find("skeleton_edges"); edges != entry.end() && edges->is_array()) {
    for (const auto& edge : *edges) {
     if (!edge.is_array() || edge.size() != 2U) { continue; }
@@ -499,8 +491,7 @@ std::vector<AnnotationObject> load_annotation_scene_objects(const std::filesyste
  if (candidate) *categories = std::move(*candidate);
  return objects;
 }
-std::optional<std::vector<AnnotationObject>> load_saved_annotation_scene_for_frame(const std::filesystem::path& output_root, const AnnotationFrame& frame,
-                                                                                   AnnotationCategories* categories) {
+std::optional<std::vector<AnnotationObject>> load_saved_annotation_scene_for_frame(const std::filesystem::path& output_root, const AnnotationFrame& frame, AnnotationCategories* categories) {
  const std::filesystem::path manifest_path = output_root / "manifests" / "scenes.jsonl";
  if (!std::filesystem::exists(manifest_path)) { return std::nullopt; }
  std::ifstream stream(manifest_path);
@@ -526,9 +517,8 @@ std::optional<std::vector<AnnotationObject>> load_saved_annotation_scene_for_fra
  if (best_scene_jsonl_path.empty()) { return std::nullopt; }
  return load_annotation_scene_objects(best_scene_jsonl_path, categories);
 }
-AnnotationSaveResult save_annotation_scene(const AnnotationSaveConfig& config, const AnnotationFrame& frame, AnnotationCategories& categories,
-                                           const std::vector<AnnotationObject>& objects, const bool live_mode,
-                                           const AnnotationProjectedScene* projected_scene) {
+AnnotationSaveResult save_annotation_scene(const AnnotationSaveConfig& config, const AnnotationFrame& frame, AnnotationCategories& categories, const std::vector<AnnotationObject>& objects,
+ const bool live_mode, const AnnotationProjectedScene* projected_scene) {
  static_cast<void>(validate_categories(categories));
  if (config.output_root.empty()) { throw std::runtime_error("annotation output root must not be empty"); }
  const std::vector<AnnotationResolvedObject> resolved_objects = resolve_annotation_objects(frame, categories, objects, live_mode, projected_scene);
@@ -577,8 +567,7 @@ AnnotationSaveResult save_annotation_scene(const AnnotationSaveConfig& config, c
    std::filesystem::create_directories(class_dir);
    const auto suffix = std::format("{:06}_{:03}.png", scene_index, index + 1U);
    const std::filesystem::path entity_path = class_dir / (config.split + "_" + suffix);
-   write_annotation_png(entity_path, static_cast<int>(resolved.crop_width), static_cast<int>(resolved.crop_height), 4, resolved.crop_rgba.data(),
-                        static_cast<int>(resolved.crop_width * 4U));
+   write_annotation_png(entity_path, static_cast<int>(resolved.crop_width), static_cast<int>(resolved.crop_height), 4, resolved.crop_rgba.data(), static_cast<int>(resolved.crop_width * 4U));
    result.entity_paths.push_back(entity_path);
    append_jsonl(manifest_dir / "entities.jsonl", json{
                                                   {"split", config.split},

@@ -73,14 +73,12 @@ Status AllocateHostBuffer(std::size_t bytes, bool pinned, HostBuffer* out) {
 }
 Status FreeHostBuffer(HostBuffer* buffer) {
  if (buffer == nullptr || buffer->data == nullptr) return Status::Ok();
- if (buffer->registered_storage && buffer->registered_storage->ReleaseSettled() != CUDA_SUCCESS)
-  return MakeStatus(StatusCode::kCudaError, "release capture local registered storage failed");
+ if (buffer->registered_storage && buffer->registered_storage->ReleaseSettled() != CUDA_SUCCESS) return MakeStatus(StatusCode::kCudaError, "release capture local registered storage failed");
  *buffer = {};
  return Status::Ok();
 }
 std::uint64_t PackRegion(const CaptureRegion& region) {
- return static_cast<std::uint64_t>(region.x) | (static_cast<std::uint64_t>(region.y) << 16U) | (static_cast<std::uint64_t>(region.width) << 32U) |
-        (static_cast<std::uint64_t>(region.height) << 48U);
+ return static_cast<std::uint64_t>(region.x) | (static_cast<std::uint64_t>(region.y) << 16U) | (static_cast<std::uint64_t>(region.width) << 32U) | (static_cast<std::uint64_t>(region.height) << 48U);
 }
 CaptureRegion UnpackRegion(std::uint64_t packed) {
  return CaptureRegion{

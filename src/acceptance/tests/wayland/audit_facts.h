@@ -58,8 +58,7 @@ public:
   record_["reason"] = reason;
   record_["audit_context"] = context();
  }
- void report(const std::filesystem::path& path, const std::string_view event, const std::filesystem::path& observed_file,
-             const std::optional<std::uint64_t> observed_line) {
+ void report(const std::filesystem::path& path, const std::string_view event, const std::filesystem::path& observed_file, const std::optional<std::uint64_t> observed_line) {
   if (record_.is_null() || reported_) return;
   auto record = record_;
   record["event"] = event;

@@ -68,7 +68,7 @@ public:
  [[= contracts::reflection::direct::InteractionEndpoint{}]] void Input(WorkspaceMouse);
  void SetInputPeer(std::uint64_t);
  using visual_source = VisualSourceProjection<LiveSnapshot, PresentationSourceKind::Live, mmltk::frameworks::reflection::member_path<&LiveSnapshot::frame>,
-                                              mmltk::frameworks::reflection::member_path<&LiveSnapshot::revision>>;
+  mmltk::frameworks::reflection::member_path<&LiveSnapshot::revision>>;
  using event_type = std::variant<LiveFrameCompleted, LiveChanged, LiveFailed>;
  LiveSystem(VisualDeviceSettings, VisualRuntimeFactory, SystemEventSink<event_type> = {}, VisualDiagnosticSink = {});
  ~LiveSystem();

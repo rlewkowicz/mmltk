@@ -35,8 +35,8 @@ struct AnnotationRenderHold final {
  std::future<void> entered = hold->committed.get_future();
 };
 [[nodiscard]] AnnotationSystem make_test_annotation(const std::shared_ptr<FakeImageBackend>& backend, ExploreSystem& source, EventGate& events) {
- return AnnotationSystem{kDevice, TestAnnotationAlgorithm::CreateRuntime(backend), borrow_exactly_from(source),
-                         [&events](AnnotationSystem::event_type) { events.Advance(); }, mmltk::testsupport::annotation_render_evidence()};
+ return AnnotationSystem{kDevice, TestAnnotationAlgorithm::CreateRuntime(backend), borrow_exactly_from(source), [&events](AnnotationSystem::event_type) { events.Advance(); },
+  mmltk::testsupport::annotation_render_evidence()};
 }
 auto settle_annotation_on_exit(AnnotationSystem& annotation, std::promise<void>& release) {
  return mmltk::testsupport::ScopedTestCleanup{[&annotation, &release] {
@@ -79,13 +79,13 @@ TEST_CASE("Annotation imports Validation ground truth and retains receiver pixel
  frame.source.kind = PresentationSourceKind::Validation;
  EventGate events;
  AnnotationSystem annotation{kDevice, TestAnnotationAlgorithm::CreateRuntime(backend),
-                             [&](const VisualFrame& requested) {
-                              if (!source || requested != frame) return VisualDocumentRead{};
-                              auto result = source->BorrowExact(source->frame());
-                              result.document = document;
-                              return result;
-                             },
-                             [&events](AnnotationSystem::event_type) { events.Advance(); }, mmltk::testsupport::annotation_render_evidence()};
+  [&](const VisualFrame& requested) {
+   if (!source || requested != frame) return VisualDocumentRead{};
+   auto result = source->BorrowExact(source->frame());
+   result.document = document;
+   return result;
+  },
+  [&events](AnnotationSystem::event_type) { events.Advance(); }, mmltk::testsupport::annotation_render_evidence()};
  mmltk::testsupport::open_annotation(annotation, events, frame);
  const auto scene = annotation.snapshot().ui.scene;
  REQUIRE(scene.objects.size() == 1U);
@@ -109,9 +109,7 @@ TEST_CASE("Annotation peer closure orders accepted input before replacement gest
  mmltk::testsupport::await_annotation_command(annotation, events, edited.revision);
  annotation.SetInputPeer(1U);
  const auto before = annotation.snapshot().ui.scene.objects.size();
- const auto mouse = [&](std::uint64_t peer, WorkspaceMouseKind kind, WorkspacePoint point) {
-  annotation.Input(mmltk::testsupport::annotation_mouse(annotation, peer, kind, point));
- };
+ const auto mouse = [&](std::uint64_t peer, WorkspaceMouseKind kind, WorkspacePoint point) { annotation.Input(mmltk::testsupport::annotation_mouse(annotation, peer, kind, point)); };
  mouse(1U, WorkspaceMouseKind::Press, {2, 3});
  mouse(1U, WorkspaceMouseKind::Motion, {4, 5});
  annotation.PeerClosed();
@@ -130,11 +128,11 @@ TEST_CASE("Annotation renderer failure retires resources and allows source resta
  EventGate events;
  std::atomic_uint64_t failures{0U};
  AnnotationSystem annotation{kDevice, TestAnnotationAlgorithm::CreateRuntime(backend, probe), borrow_exactly_from(source.system()),
-                             [&](AnnotationSystem::event_type event) {
-                              if (std::holds_alternative<AnnotationFailed>(event)) ++failures;
-                              events.Advance();
-                             },
-                             mmltk::testsupport::annotation_render_evidence()};
+  [&](AnnotationSystem::event_type event) {
+   if (std::holds_alternative<AnnotationFailed>(event)) ++failures;
+   events.Advance();
+  },
+  mmltk::testsupport::annotation_render_evidence()};
  probe->fail_open = true;
  static_cast<void>(annotation.Open(mmltk::testsupport::test_annotation_open(source.system().snapshot().frame)));
  REQUIRE(events.Wait([&] { return failures.load() == 1U; }));
@@ -168,15 +166,15 @@ TEST_CASE("Annotation unavailable source settles ordered input and commands befo
  std::vector<AnnotationFailed> failures;
  std::vector<std::uint64_t> failure_render_counts;
  AnnotationSystem annotation{kDevice, TestAnnotationAlgorithm::CreateRuntime(backend, render.probe), source.WithDocument(semantic),
-                             [&](AnnotationSystem::event_type event) {
-                              if (const auto* failure = std::get_if<AnnotationFailed>(&event)) {
-                               std::scoped_lock lock(observations_mutex);
-                               failures.push_back(*failure);
-                               failure_render_counts.push_back(render.probe->calls.load());
-                              }
-                              events.Advance();
-                             },
-                             mmltk::testsupport::annotation_render_evidence()};
+  [&](AnnotationSystem::event_type event) {
+   if (const auto* failure = std::get_if<AnnotationFailed>(&event)) {
+    std::scoped_lock lock(observations_mutex);
+    failures.push_back(*failure);
+    failure_render_counts.push_back(render.probe->calls.load());
+   }
+   events.Advance();
+  },
+  mmltk::testsupport::annotation_render_evidence()};
  auto release = settle_annotation_on_exit(annotation, render.hold->release);
  mmltk::testsupport::open_annotation(annotation, events, source.frame());
  annotation.SetInputPeer(1U);
@@ -251,12 +249,12 @@ TEST_CASE("Annotation rejects an oversized incoming document without changing it
  bool reject_incoming = false;
  EventGate events;
  AnnotationSystem annotation{kDevice, TestAnnotationAlgorithm::CreateRuntime(backend),
-                             [&](const VisualFrame& frame) {
-                              auto borrowed = source.BorrowExact(frame);
-                              if (reject_incoming) borrowed.document = rejected_document;
-                              return borrowed;
-                             },
-                             [&events](AnnotationSystem::event_type) { events.Advance(); }, mmltk::testsupport::annotation_render_evidence()};
+  [&](const VisualFrame& frame) {
+   auto borrowed = source.BorrowExact(frame);
+   if (reject_incoming) borrowed.document = rejected_document;
+   return borrowed;
+  },
+  [&events](AnnotationSystem::event_type) { events.Advance(); }, mmltk::testsupport::annotation_render_evidence()};
  mmltk::testsupport::open_annotation(annotation, events, source.frame());
  static_cast<void>(annotation.Edit({.edit = {.value = AnnotationCategoryEdit{contracts::AnnotationText::From("kept category")}}}));
  REQUIRE(events.Wait([&] { return !annotation.snapshot().busy; }));
@@ -288,8 +286,8 @@ TEST_CASE("Annotation reduces input and settles commands while rendering is held
  EventGate events;
  std::atomic_uint64_t held_scene{0U};
  std::atomic_bool older_completed{false};
- AnnotationSystem annotation{kDevice, TestAnnotationAlgorithm::CreateRuntime(backend, render.probe), borrow_exactly_from(source.system()),
-                             [&](AnnotationSystem::event_type) { events.Advance(); }, mmltk::testsupport::annotation_render_evidence()};
+ AnnotationSystem annotation{kDevice, TestAnnotationAlgorithm::CreateRuntime(backend, render.probe), borrow_exactly_from(source.system()), [&](AnnotationSystem::event_type) { events.Advance(); },
+  mmltk::testsupport::annotation_render_evidence()};
  auto release = settle_annotation_on_exit(annotation, render.hold->release);
  mmltk::testsupport::open_annotation(annotation, events, source.system().snapshot().frame);
  const auto initial = annotation.snapshot();
@@ -330,8 +328,7 @@ TEST_CASE("Annotation Open consumes retained prior-document input and accepts th
  std::atomic_uint64_t failures{0U};
  std::mutex observations_mutex;
  std::vector<AnnotationSnapshot> replacements;
- AnnotationSystem annotation{kDevice, TestAnnotationAlgorithm::CreateRuntime(backend, render.probe), borrow_exactly_from(source.system()),
-                             [&](AnnotationSystem::event_type event) {
+ AnnotationSystem annotation{kDevice, TestAnnotationAlgorithm::CreateRuntime(backend, render.probe), borrow_exactly_from(source.system()), [&](AnnotationSystem::event_type event) {
                               if (std::holds_alternative<AnnotationFailed>(event)) ++failures;
                               if (const auto* changed = std::get_if<AnnotationChanged>(&event); changed && changed->snapshot.input_document_epoch == 2U) {
                                std::scoped_lock lock(observations_mutex);
@@ -386,8 +383,8 @@ TEST_CASE("Annotation color sampling completes before following document command
  auto sample = std::make_shared<MutationCommitProbe>();
  auto entered = sample->committed.get_future();
  EventGate events;
- AnnotationSystem annotation{kDevice, TestAnnotationAlgorithm::CreateRuntime(backend, probe), source.WithDocument(semantic),
-                             [&](AnnotationSystem::event_type) { events.Advance(); }, mmltk::testsupport::annotation_render_evidence()};
+ AnnotationSystem annotation{kDevice, TestAnnotationAlgorithm::CreateRuntime(backend, probe), source.WithDocument(semantic), [&](AnnotationSystem::event_type) { events.Advance(); },
+  mmltk::testsupport::annotation_render_evidence()};
  auto release = settle_annotation_on_exit(annotation, sample->release);
  mmltk::testsupport::open_annotation(annotation, events, source.frame());
  auto edit = annotation.Edit({.edit = {.value = AnnotationObjectEdit{0U}}});

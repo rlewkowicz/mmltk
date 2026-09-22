@@ -59,8 +59,7 @@ TEST_CASE("video recovery never moves a deadline backward when fallback overtake
 }
 TEST_CASE("video first timing and failed scheduling leave a usable source baseline", "[controller][video]") {
  Playback playback;
- for (const auto timestamp : std::array<std::optional<double>, 3>{{{}, invalid_timestamp, infinity}})
-  CHECK_THROWS_AS(playback.Schedule(timestamp, 0.0, start), std::runtime_error);
+ for (const auto timestamp : std::array<std::optional<double>, 3>{{{}, invalid_timestamp, infinity}}) CHECK_THROWS_AS(playback.Schedule(timestamp, 0.0, start), std::runtime_error);
  CHECK(playback.Schedule({}, 4.0, start) == start);
  CHECK(playback.Schedule(10.0, 4.0, start) == start + 250ms);
  CHECK(playback.Schedule(10.25, 0.0, start) == start + 500ms);

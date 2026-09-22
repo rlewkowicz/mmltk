@@ -38,9 +38,7 @@ struct PresentationCapability final {
  VisualExtent extent{};
  std::uint64_t generation = 0U;
  PresentationCapabilityCondition condition = PresentationCapabilityCondition::Unavailable;
- [[nodiscard]] bool valid() const noexcept {
-  return (surface_high != 0U || surface_low != 0U) && extent.valid() && generation != 0U && condition != PresentationCapabilityCondition::Unavailable;
- }
+ [[nodiscard]] bool valid() const noexcept { return (surface_high != 0U || surface_low != 0U) && extent.valid() && generation != 0U && condition != PresentationCapabilityCondition::Unavailable; }
  bool operator==(const PresentationCapability&) const = default;
 };
 struct PresentationSnapshot final {
@@ -62,9 +60,7 @@ struct PresentationPublication final {
  std::uint64_t timeline_ready = 0U;
  std::uint64_t presentation_revision = 0U;
  std::uint64_t transfer_sequence = 0U;
- [[nodiscard]] bool valid() const noexcept {
-  return capability.valid() && capability.condition == PresentationCapabilityCondition::Ready && timeline_ready != 0U && presentation_revision != 0U;
- }
+ [[nodiscard]] bool valid() const noexcept { return capability.valid() && capability.condition == PresentationCapabilityCondition::Ready && timeline_ready != 0U && presentation_revision != 0U; }
 };
 struct PresentationSubmittedSource final {
  VisualSourceObservation observation{};
@@ -79,8 +75,7 @@ struct PresentationDiagnosticRecord final {
  PresentationPublication publication{};
  contracts::DiagnosticLink link{};
 };
-[[nodiscard]] VisualDiagnosticFact presentation_diagnostic_fact(VisualDiagnosticOperation, const PresentationDiagnosticRecord&, int device,
-                                                                std::uint64_t outcome = 0U) noexcept;
+[[nodiscard]] VisualDiagnosticFact presentation_diagnostic_fact(VisualDiagnosticOperation, const PresentationDiagnosticRecord&, int device, std::uint64_t outcome = 0U) noexcept;
 enum class PresentationNativeProgress : std::uint8_t {
  Waiting,
  Superseded,
@@ -157,8 +152,7 @@ struct PresentationNativeConfiguration final {
  bool pending_supersession_acceptance = false;
  std::shared_ptr<PresentationAcceptanceGate> completion_acceptance{};
 };
-[[nodiscard]] PresentationNativeWriterFactory make_native_presentation_writer_factory(VisualDeviceSettings, PresentationNativeConfiguration,
-                                                                                      VisualDiagnosticSink = {});
+[[nodiscard]] PresentationNativeWriterFactory make_native_presentation_writer_factory(VisualDeviceSettings, PresentationNativeConfiguration, VisualDiagnosticSink = {});
 struct PresentationCompleted final {
  // CLEANUP-IGNORE: Presentation completion has its own reflected identity and durable state-delivery contract.
  PresentationSnapshot snapshot{};
@@ -173,8 +167,7 @@ struct[[= contracts::reflection::Event{contracts::reflection::EventDelivery::Cri
 class PresentationSystem final {
 public:
  using event_type = std::variant<PresentationCompleted, PresentationCapabilityChanged, PresentationFailed>;
- PresentationSystem(VisualDeviceSettings, PresentationNativeWriterFactory, std::span<const VisualSourceReader>, SystemEventSink<event_type> = {},
-                    VisualDiagnosticSink = {});
+ PresentationSystem(VisualDeviceSettings, PresentationNativeWriterFactory, std::span<const VisualSourceReader>, SystemEventSink<event_type> = {}, VisualDiagnosticSink = {});
  ~PresentationSystem();
  [[= contracts::reflection::direct::IntentEndpoint{}]] [[nodiscard]] PresentationState Select(PresentationSourceIdentity);
  void SourceChanged(PresentationSourceIdentity) noexcept;

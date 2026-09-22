@@ -85,8 +85,7 @@ public:
  void Install(TerminalCudaCustody&& custody, cudaError_t failure) && noexcept;
 
 private:
- TerminalCudaRetirementLease(TerminalCudaRetirementAuthority& owner, std::size_t slot, std::uint64_t generation) noexcept
-     : owner_(&owner), slot_(slot), generation_(generation) {}
+ TerminalCudaRetirementLease(TerminalCudaRetirementAuthority& owner, std::size_t slot, std::uint64_t generation) noexcept : owner_(&owner), slot_(slot), generation_(generation) {}
  void release() noexcept;
  TerminalCudaRetirementAuthority* owner_ = nullptr;
  std::size_t slot_ = 0U;
@@ -106,8 +105,7 @@ public:
  [[nodiscard]] virtual TerminalCudaRetirementFact fact() const noexcept = 0;
 
 protected:
- [[nodiscard]] static TerminalCudaRetirementLease MakeLease(TerminalCudaRetirementAuthority& owner, const std::size_t slot,
-                                                            const std::uint64_t generation) noexcept {
+ [[nodiscard]] static TerminalCudaRetirementLease MakeLease(TerminalCudaRetirementAuthority& owner, const std::size_t slot, const std::uint64_t generation) noexcept {
   return TerminalCudaRetirementLease{owner, slot, generation};
  }
  virtual void Release(std::size_t, std::uint64_t) noexcept = 0;

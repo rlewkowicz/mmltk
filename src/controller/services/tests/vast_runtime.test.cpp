@@ -39,8 +39,7 @@ void test_rank_excludes_under_min_gpu_count() {
  for (const VastOfferSummary& offer : ranked) { REQUIRE((offer.num_gpus >= 4)); }
 }
 void test_l_series_matches_l4_family() {
- const std::vector<VastRawOffer> offers =
-  parse_vast_offer_payload(R"json([{"id": 3001, "gpu_name": "L4", "num_gpus": 4, "dlperf_usd": 15.0, "dlperf": 50.0, "dph": 3.0, "reliability": 0.96}])json");
+ const std::vector<VastRawOffer> offers = parse_vast_offer_payload(R"json([{"id": 3001, "gpu_name": "L4", "num_gpus": 4, "dlperf_usd": 15.0, "dlperf": 50.0, "dph": 3.0, "reliability": 0.96}])json");
  const std::vector<VastOfferSummary> ranked = rank_vast_offers(offers, {ProviderGpuFamily::LSeries}, 2, 4);
  REQUIRE((ranked.size() == 1U));
  REQUIRE((ranked[0].family == ProviderGpuFamily::LSeries));

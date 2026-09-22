@@ -63,8 +63,7 @@ TEST_CASE("CUDA-visible placement resolves the device PCI identity", "[framework
   CHECK(selected.device == ordinal);
   CHECK(selected.placement.numa_node >= 0);
   REQUIRE_FALSE(selected.placement.cpus.empty());
-  const auto constrained = mmltk::frameworks::gpu::resolve_device_execution(ordinal, topology, selected.placement.numa_node,
-                                                                            mmltk::common::system::format_cpu_list(topology.permitted_cpus));
+  const auto constrained = mmltk::frameworks::gpu::resolve_device_execution(ordinal, topology, selected.placement.numa_node, mmltk::common::system::format_cpu_list(topology.permitted_cpus));
   CHECK(constrained.placement.cpus == selected.placement.cpus);
  }
 }

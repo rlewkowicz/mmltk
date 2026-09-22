@@ -38,9 +38,7 @@ void fill_center_scale_lookup(std::span<std::uint32_t> lookup, std::uint32_t tar
 void include_row_major_mask_run(RowMajorMaskBounds* bounds, std::size_t begin, std::size_t end, std::uint32_t width);
 [[nodiscard]] RowMajorMaskBounds row_major_mask_bounds(std::span<const RLEPair> pairs, MaskDimensions dimensions);
 [[nodiscard]] EncodedRowMajorMask encode_dense_row_major_mask(std::span<const std::uint8_t> dense, MaskDimensions dimensions);
-void materialize_row_major_mask(std::span<const RLEPair> pairs, MaskDimensions dimensions, std::vector<std::uint8_t>* dense,
-                                RowMajorMaskBounds* bounds = nullptr);
+void materialize_row_major_mask(std::span<const RLEPair> pairs, MaskDimensions dimensions, std::vector<std::uint8_t>* dense, RowMajorMaskBounds* bounds = nullptr);
 [[nodiscard]] EncodedRowMajorMask resize_row_major_mask(std::span<const RLEPair> pairs, MaskDimensions source_dimensions, MaskDimensions target_dimensions,
-                                                        const mmltk::backend::imaging::resample::ImageResizeGeometry& letterbox, MaskResizeScratch* scratch,
-                                                        RowMajorMaskBounds* source_bounds = nullptr);
+ const mmltk::backend::imaging::resample::ImageResizeGeometry& letterbox, MaskResizeScratch* scratch, RowMajorMaskBounds* source_bounds = nullptr);
 }  // namespace mmltk::backend::data::dataset

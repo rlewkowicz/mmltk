@@ -50,12 +50,8 @@ constexpr std::uint64_t kTensorRtWorkspaceBytes = 1ULL << 30U;
  if (index >= kUpscalerCount) { std::terminate(); }
  return index;
 }
-[[nodiscard]] std::filesystem::path engine_cache_directory() {
- return mmltk::common::system::runtime_paths::repository_root() / ".cache" / "mmltk" / "upscalers";
-}
-[[nodiscard]] std::string_view precision_policy(const ImageUpscalerDescriptor& descriptor) noexcept {
- return descriptor.allow_fp16 ? "mixed-fp16" : "strict-fp32";
-}
+[[nodiscard]] std::filesystem::path engine_cache_directory() { return mmltk::common::system::runtime_paths::repository_root() / ".cache" / "mmltk" / "upscalers"; }
+[[nodiscard]] std::string_view precision_policy(const ImageUpscalerDescriptor& descriptor) noexcept { return descriptor.allow_fp16 ? "mixed-fp16" : "strict-fp32"; }
 class FileLock final {
 public:
  explicit FileLock(const std::filesystem::path& path) : descriptor_(::open(path.c_str(), O_CREAT | O_RDWR | O_CLOEXEC, 0664)) {
@@ -78,14 +74,12 @@ private:
  mmltk::common::io::ScopedFd descriptor_{};
 };
 [[nodiscard]] std::string engine_identity(const ImageUpscalerDescriptor& descriptor, const cudaDeviceProp& properties) {
- return std::string(descriptor.cache_name) + "-" + std::string(descriptor.sha256.substr(0U, 16U)) + "-trt" + std::to_string(NV_TENSORRT_MAJOR) + "." +
-        std::to_string(NV_TENSORRT_MINOR) + "." + std::to_string(NV_TENSORRT_PATCH) + "." + std::to_string(NV_TENSORRT_BUILD) + "-cuda" +
-        std::to_string(CUDART_VERSION) + "-sm" + std::to_string(properties.major) + std::to_string(properties.minor) + "-" +
-        std::string(precision_policy(descriptor)) + "-tile" + std::to_string(kImageUpscalerInputExtent);
+ return std::string(descriptor.cache_name) + "-" + std::string(descriptor.sha256.substr(0U, 16U)) + "-trt" + std::to_string(NV_TENSORRT_MAJOR) + "." + std::to_string(NV_TENSORRT_MINOR) + "." +
+        std::to_string(NV_TENSORRT_PATCH) + "." + std::to_string(NV_TENSORRT_BUILD) + "-cuda" + std::to_string(CUDART_VERSION) + "-sm" + std::to_string(properties.major) +
+        std::to_string(properties.minor) + "-" + std::string(precision_policy(descriptor)) + "-tile" + std::to_string(kImageUpscalerInputExtent);
 }
 void trace_activation_stage(const std::string_view stage, const ImageUpscalerKind kind, const std::string_view detail = {}) {
- mmltk::common::logging::trace(
-  [&](auto& logger) { logger.trace("event=image_upscaler_activation stage={} kind={} detail={}", stage, static_cast<std::uint32_t>(kind), detail); });
+ mmltk::common::logging::trace([&](auto& logger) { logger.trace("event=image_upscaler_activation stage={} kind={} detail={}", stage, static_cast<std::uint32_t>(kind), detail); });
 }
 struct ImageUpscalerInFlightGate {
  static constexpr std::size_t kCapacity = 16U;
@@ -148,8 +142,7 @@ struct ImageUpscaler::Impl {
    }();
    if (retry) {
     const auto status = Stop();
-    if (status != cudaSuccess)
-     throw ImageUpscalerUnsettledFailure{std::make_exception_ptr(mmltk::frameworks::gpu::CudaError(status, "release failed Basic method"))};
+    if (status != cudaSuccess) throw ImageUpscalerUnsettledFailure{std::make_exception_ptr(mmltk::frameworks::gpu::CudaError(status, "release failed Basic method"))};
    }
    std::lock_guard lock(mutex);
    if (device_id < 0 || (owned_device >= 0 && owned_device != device_id)) return nullptr;
@@ -187,15 +180,13 @@ struct ImageUpscaler::Impl {
    failed = true;
    if (cleanup.status() != cudaSuccess) {
     cleanup_state = CleanupState::Fatal;
-    throw ImageUpscalerUnsettledFailure{std::make_exception_ptr(mmltk::frameworks::gpu::CudaError(event_status, "create Basic completion event")),
-                                        cleanup.failure()};
+    throw ImageUpscalerUnsettledFailure{std::make_exception_ptr(mmltk::frameworks::gpu::CudaError(event_status, "create Basic completion event")), cleanup.failure()};
    }
    ensure_cuda_ok(event_status, "create Basic completion event");
    return nullptr;
   }
-  [[nodiscard]] ImageUpscalerOutcome run(const std::uint8_t* source, const std::size_t source_pitch, const std::uint32_t width, const std::uint32_t height,
-                                         std::uint8_t* target, const std::size_t target_pitch, const cudaStream_t requested_stream,
-                                         ImageUpscalerCurrent current, const ImageUpscalerExecutionCheckpoint& checkpoint) {
+  [[nodiscard]] ImageUpscalerOutcome run(const std::uint8_t* source, const std::size_t source_pitch, const std::uint32_t width, const std::uint32_t height, std::uint8_t* target,
+   const std::size_t target_pitch, const cudaStream_t requested_stream, ImageUpscalerCurrent current, const ImageUpscalerExecutionCheckpoint& checkpoint) {
    std::lock_guard lock(mutex);
    if (failed || stream == nullptr || requested_stream != stream || owned_device < 0) {
     failed = true;
@@ -225,8 +216,7 @@ struct ImageUpscaler::Impl {
      logger.trace(
       "event=image_upscaler_basic_buffers width={} height={} source_pitch={} target_pitch={} horizontal={} "
       "horizontal_bytes={} scaled={} scaled_bytes={}",
-      width, height, source_pitch, target_pitch, reinterpret_cast<std::uintptr_t>(horizontal), horizontal_capacity, reinterpret_cast<std::uintptr_t>(scaled),
-      scaled_capacity);
+      width, height, source_pitch, target_pitch, reinterpret_cast<std::uintptr_t>(horizontal), horizontal_capacity, reinterpret_cast<std::uintptr_t>(scaled), scaled_capacity);
     });
     if (!image_upscaler_admitted(checkpoint, ImageUpscalerExecutionStage::BasicLaunchAdmitted, current)) return ImageUpscalerOutcome::Cancelled;
     ensure_cuda_ok(image_upscaler_nis::launch_scale(source, source_pitch, horizontal, scaled, config, stream), "launch Basic scaling");
@@ -315,8 +305,7 @@ struct ImageUpscaler::Impl {
   bool failed = false;
   UpscalerCleanup cleanup;
  };
- explicit Impl(const std::uint64_t generation_in, const std::int32_t device_id_in, const std::uint64_t device_generation_in,
-               const ImageUpscalerAggregateConfig& config)
+ explicit Impl(const std::uint64_t generation_in, const std::int32_t device_id_in, const std::uint64_t device_generation_in, const ImageUpscalerAggregateConfig& config)
      : slots{std::make_unique<Slot>(ImageUpscalerKind::ShiftLUT, config.models[1U]), std::make_unique<Slot>(ImageUpscalerKind::RealPLKSR, config.models[2U])},
        generation(generation_in),
        device_id(device_id_in),
@@ -427,9 +416,9 @@ struct ImageUpscaler::Impl {
    .profiling_verbosity = TensorRtProfilingVerbosity::LayerNames,
    .save_engine_path = {},
    .optimization_profiles = {TensorRtOptimizationProfile{.input_name = std::string(descriptor.input_name),
-                                                         .minimum = {1, 3, kImageUpscalerInputExtent, kImageUpscalerInputExtent},
-                                                         .optimum = {1, 3, kImageUpscalerInputExtent, kImageUpscalerInputExtent},
-                                                         .maximum = {1, 3, kImageUpscalerInputExtent, kImageUpscalerInputExtent}}},
+    .minimum = {1, 3, kImageUpscalerInputExtent, kImageUpscalerInputExtent},
+    .optimum = {1, 3, kImageUpscalerInputExtent, kImageUpscalerInputExtent},
+    .maximum = {1, 3, kImageUpscalerInputExtent, kImageUpscalerInputExtent}}},
    .context = std::string("Image upscaler ") + std::string(descriptor.label),
    .log = {},
    .continue_build = [current] { return current(); },
@@ -533,8 +522,7 @@ struct ImageUpscaler::Resolver final {
   }
   return std::nullopt;
  }
- [[nodiscard]] static bool seal(const std::uint8_t service_slot, const std::uint64_t service_generation, const std::uint64_t core_generation,
-                                const std::shared_ptr<Impl>& expected) noexcept {
+ [[nodiscard]] static bool seal(const std::uint8_t service_slot, const std::uint64_t service_generation, const std::uint64_t core_generation, const std::shared_ptr<Impl>& expected) noexcept {
   Resolver& resolver = instance();
   std::lock_guard lock(resolver.mutex);
   if (service_slot >= resolver.slots.size()) return false;
@@ -544,28 +532,23 @@ struct ImageUpscaler::Resolver final {
   owner->in_flight->close();
   return true;
  }
- [[nodiscard]] static std::shared_ptr<Impl> resolve(const std::uint8_t service_slot, const std::uint64_t service_generation,
-                                                    const std::uint64_t core_generation) noexcept {
+ [[nodiscard]] static std::shared_ptr<Impl> resolve(const std::uint8_t service_slot, const std::uint64_t service_generation, const std::uint64_t core_generation) noexcept {
   Resolver& resolver = instance();
   std::lock_guard lock(resolver.mutex);
   if (service_slot >= resolver.slots.size()) return {};
   const Slot& slot = resolver.slots[service_slot];
   std::shared_ptr<Impl> owner = slot.owner.lock();
-  if (!slot.live || slot.service_generation != service_generation || slot.core_generation != core_generation || owner == nullptr ||
-      owner->generation != core_generation)
-   return {};
+  if (!slot.live || slot.service_generation != service_generation || slot.core_generation != core_generation || owner == nullptr || owner->generation != core_generation) return {};
   return owner;
  }
- static void remove(const std::uint8_t service_slot, const std::uint64_t service_generation, const std::uint64_t core_generation,
-                    const std::shared_ptr<Impl>& expected) noexcept {
+ static void remove(const std::uint8_t service_slot, const std::uint64_t service_generation, const std::uint64_t core_generation, const std::shared_ptr<Impl>& expected) noexcept {
   Resolver& resolver = instance();
   std::lock_guard lock(resolver.mutex);
   if (service_slot >= resolver.slots.size()) return;
   Slot& slot = resolver.slots[service_slot];
   if (expected == nullptr) return;
   const std::shared_ptr<Impl> registered = slot.owner.lock();
-  if (!slot.live || slot.service_generation != service_generation || slot.core_generation != core_generation || registered == nullptr || registered != expected)
-   return;
+  if (!slot.live || slot.service_generation != service_generation || slot.core_generation != core_generation || registered == nullptr || registered != expected) return;
   slot.live = false;
   slot.core_generation = 0U;
   slot.owner.reset();
@@ -573,9 +556,8 @@ struct ImageUpscaler::Resolver final {
  std::mutex mutex;
  std::array<Slot, kCapacity> slots{};
 };
-std::expected<std::unique_ptr<ImageUpscaler>, ImageUpscalerStartError> ImageUpscaler::Create(const std::int32_t device_id,
-                                                                                             const std::uint64_t device_generation,
-                                                                                             const ImageUpscalerAggregateConfig config) noexcept {
+std::expected<std::unique_ptr<ImageUpscaler>, ImageUpscalerStartError> ImageUpscaler::Create(
+ const std::int32_t device_id, const std::uint64_t device_generation, const ImageUpscalerAggregateConfig config) noexcept {
  if (device_id < 0 || device_generation == 0U || !config.valid()) return std::unexpected(ImageUpscalerStartError::InvalidCoordinate);
  std::unique_ptr<ImageUpscaler> result{new (std::nothrow) ImageUpscaler};
  if (result == nullptr) return std::unexpected(ImageUpscalerStartError::Registration);
@@ -628,23 +610,20 @@ void ImageUpscalerProcessOwner::release() noexcept {
  owner_.reset();
 }
 ImageUpscalerProcessOwner::operator bool() const noexcept { return owner_ != nullptr; }
-ImageUpscalerOutcome ImageUpscalerProcessOwner::run_rgba8(const ImageUpscalerModelHandle handle, const ImageUpscalerMode mode, const std::uint8_t* source,
-                                                          const std::size_t source_pitch, const std::uint32_t width, const std::uint32_t height,
-                                                          std::uint8_t* target, const std::size_t target_pitch, const std::uintptr_t stream_handle,
-                                                          ImageUpscalerCurrent current, const ImageUpscalerPurpose purpose) {
+ImageUpscalerOutcome ImageUpscalerProcessOwner::run_rgba8(const ImageUpscalerModelHandle handle, const ImageUpscalerMode mode, const std::uint8_t* source, const std::size_t source_pitch,
+ const std::uint32_t width, const std::uint32_t height, std::uint8_t* target, const std::size_t target_pitch, const std::uintptr_t stream_handle, ImageUpscalerCurrent current,
+ const ImageUpscalerPurpose purpose) {
  const auto stream = reinterpret_cast<cudaStream_t>(stream_handle);
  if (source == nullptr || target == nullptr || stream == nullptr || width == 0U || height == 0U || width > std::numeric_limits<std::uint32_t>::max() / 4U ||
      height > std::numeric_limits<std::uint32_t>::max() / 4U)
   throw std::invalid_argument("invalid Upscale execution geometry");
- if (source_pitch < static_cast<std::size_t>(width) * 4U || target_pitch < static_cast<std::size_t>(width) * 16U ||
-     source_pitch > std::numeric_limits<std::size_t>::max() / height ||
+ if (source_pitch < static_cast<std::size_t>(width) * 4U || target_pitch < static_cast<std::size_t>(width) * 16U || source_pitch > std::numeric_limits<std::size_t>::max() / height ||
      target_pitch > std::numeric_limits<std::size_t>::max() / (static_cast<std::size_t>(height) * 4U))
   throw std::invalid_argument("invalid Upscale execution pitch");
  if (owner_ == nullptr) throw std::invalid_argument("missing Upscale execution owner");
  if (!current()) return ImageUpscalerOutcome::Cancelled;
  auto* const owner = static_cast<ImageUpscaler::Impl*>(owner_.get());
- if (handle.device_id != owner->device_id || handle.backend_generation != owner->device_generation)
-  throw std::invalid_argument("invalid Upscale execution identity");
+ if (handle.device_id != owner->device_id || handle.backend_generation != owner->device_generation) throw std::invalid_argument("invalid Upscale execution identity");
  if (mode == ImageUpscalerMode::Basic) return owner->basic.run(source, source_pitch, width, height, target, target_pitch, stream, current, owner->checkpoint);
  const ImageUpscalerKind kind = mode == ImageUpscalerMode::ShiftLUT ? ImageUpscalerKind::ShiftLUT : ImageUpscalerKind::RealPLKSR;
  ImageUpscaler::Impl::Slot& slot = owner->slot(kind);
@@ -655,8 +634,7 @@ ImageUpscalerOutcome ImageUpscalerProcessOwner::run_rgba8(const ImageUpscalerMod
  const auto settle = [&](const std::exception_ptr& primary, const bool retire_runtime) {
   if (slot.runtime && slot.runtime->Settle() != cudaSuccess) throw ImageUpscalerUnsettledFailure{primary, slot.runtime->cleanup_failure()};
   const auto settled = cudaStreamSynchronize(stream);
-  if (settled != cudaSuccess)
-   throw ImageUpscalerUnsettledFailure{primary, std::make_exception_ptr(mmltk::frameworks::gpu::CudaError(settled, "settle neural Upscale consumer"))};
+  if (settled != cudaSuccess) throw ImageUpscalerUnsettledFailure{primary, std::make_exception_ptr(mmltk::frameworks::gpu::CudaError(settled, "settle neural Upscale consumer"))};
   if (slot.runtime) {
    try {
     slot.runtime->mark_consumed(stream);
@@ -684,21 +662,20 @@ ImageUpscalerOutcome ImageUpscalerProcessOwner::run_rgba8(const ImageUpscalerMod
    logger.trace(
     "event=image_upscaler_conversion_buffers mode={} width={} height={} source_pitch={} target_pitch={} "
     "source={} target={} stream={}",
-    static_cast<std::uint32_t>(mode), width, height, source_pitch, target_pitch, reinterpret_cast<std::uintptr_t>(source),
-    reinterpret_cast<std::uintptr_t>(target), stream_handle);
+    static_cast<std::uint32_t>(mode), width, height, source_pitch, target_pitch, reinterpret_cast<std::uintptr_t>(source), reinterpret_cast<std::uintptr_t>(target), stream_handle);
   });
   const ImageUpscalerRequest request{.device_pixels = source,
-                                     .source_pitch = source_pitch,
-                                     .target_pixels = target,
-                                     .target_pitch = target_pitch,
-                                     .source_width = width,
-                                     .source_height = height,
-                                     .crop_x = 0U,
-                                     .crop_y = 0U,
-                                     .crop_width = width,
-                                     .crop_height = height,
-                                     .current = current,
-                                     .purpose = purpose};
+   .source_pitch = source_pitch,
+   .target_pixels = target,
+   .target_pitch = target_pitch,
+   .source_width = width,
+   .source_height = height,
+   .crop_x = 0U,
+   .crop_y = 0U,
+   .crop_width = width,
+   .crop_height = height,
+   .current = current,
+   .purpose = purpose};
   const ImageUpscalerRuntimeOutput output = slot.runtime->enqueue(request, stream);
   if (owner->checkpoint) owner->checkpoint(ImageUpscalerExecutionStage::RuntimeEnqueued);
   if (output.outcome == ImageUpscalerOutcome::Cancelled || !current()) return cancel();
@@ -730,8 +707,7 @@ std::uintptr_t ImageUpscalerProcessOwner::operation_stream(const ImageUpscalerMo
 }
 bool ImageUpscalerProcessOwner::graph_replay(const ImageUpscalerMode mode) const {
  if (!owner_ || mode == ImageUpscalerMode::Basic || mode >= ImageUpscalerMode::Count) return false;
- auto& slot =
-  static_cast<ImageUpscaler::Impl*>(owner_.get())->slot(mode == ImageUpscalerMode::ShiftLUT ? ImageUpscalerKind::ShiftLUT : ImageUpscalerKind::RealPLKSR);
+ auto& slot = static_cast<ImageUpscaler::Impl*>(owner_.get())->slot(mode == ImageUpscalerMode::ShiftLUT ? ImageUpscalerKind::ShiftLUT : ImageUpscalerKind::RealPLKSR);
  std::lock_guard lock(slot.mutex);
  return slot.runtime && slot.runtime->graph_replay();
 }
@@ -751,7 +727,6 @@ ImageUpscalerStatus ImageUpscaler::Stop() noexcept {
 std::uint64_t ImageUpscaler::core_generation() const noexcept { return owner_ != nullptr && owner_->generation == generation_ ? generation_ : 0U; }
 std::exception_ptr ImageUpscaler::cleanup_failure() const noexcept {
  if (!owner_) return {};
- return mmltk::frameworks::gpu::combine_image_failures(
-  owner_->cleanup.failure(), mmltk::frameworks::gpu::combine_image_failures(owner_->runtime_cleanup_failure, owner_->basic.cleanup_failure()));
+ return mmltk::frameworks::gpu::combine_image_failures(owner_->cleanup.failure(), mmltk::frameworks::gpu::combine_image_failures(owner_->runtime_cleanup_failure, owner_->basic.cleanup_failure()));
 }
 }  // namespace mmltk::backend::imaging::upscale

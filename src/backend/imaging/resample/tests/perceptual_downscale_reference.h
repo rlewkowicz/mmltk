@@ -137,8 +137,7 @@ inline Image reference(const Image& source, unsigned width, unsigned height, std
       const auto j = std::size_t(y >= dy ? y - dy : 0) * width + (x >= dx ? x - dx : 0);
       out[k] += (patch_mean[j][k] + ratio[j][k] * (mean[i][k] - patch_mean[j][k])) / 4;
      }
-   const std::array<double, 3> rgb{out[0] + 1.402 * (out[2] - 0.5), out[0] - 0.344136 * (out[1] - 0.5) - 0.714136 * (out[2] - 0.5),
-                                   out[0] + 1.772 * (out[1] - 0.5)};
+   const std::array<double, 3> rgb{out[0] + 1.402 * (out[2] - 0.5), out[0] - 0.344136 * (out[1] - 0.5) - 0.714136 * (out[2] - 0.5), out[0] + 1.772 * (out[1] - 0.5)};
    for (unsigned k = 0; k < 3; ++k) {
     const double linear = coverage[i] > 0 ? std::clamp(rgb[k] / coverage[i], 0.0, 1.0) : 0;
     double encoded = oetf(linear);
@@ -180,21 +179,7 @@ inline Image threshold_source(unsigned width, unsigned height, double delta) {
    for (unsigned k = 0; k < 3; ++k) source.set(x, y, k, oetf(0.3 + ((x / 2) % 2 ? delta : 0) + (x % 2 ? 0.01 : -0.01)));
  return source;
 }
-inline constexpr std::array<std::array<unsigned, 4>, 16> geometries{{{17, 13, 9, 7},
-                                                                     {15, 9, 5, 3},
-                                                                     {16, 12, 8, 6},
-                                                                     {23, 11, 23, 4},
-                                                                     {13, 19, 3, 19},
-                                                                     {1, 23, 1, 7},
-                                                                     {19, 1, 5, 1},
-                                                                     {1, 1, 1, 1},
-                                                                     {17, 13, 1, 1},
-                                                                     {35, 17, 17, 8},
-                                                                     {129, 127, 2, 3},
-                                                                     {7, 5, 7, 5},
-                                                                     {34, 6, 17, 3},
-                                                                     {32, 6, 16, 3},
-                                                                     {65537, 1, 2, 1},
-                                                                     {8193, 3, 17, 1}}};
+inline constexpr std::array<std::array<unsigned, 4>, 16> geometries{{{17, 13, 9, 7}, {15, 9, 5, 3}, {16, 12, 8, 6}, {23, 11, 23, 4}, {13, 19, 3, 19}, {1, 23, 1, 7}, {19, 1, 5, 1}, {1, 1, 1, 1},
+ {17, 13, 1, 1}, {35, 17, 17, 8}, {129, 127, 2, 3}, {7, 5, 7, 5}, {34, 6, 17, 3}, {32, 6, 16, 3}, {65537, 1, 2, 1}, {8193, 3, 17, 1}}};
 inline constexpr std::array<RgbPixelFormat, 3> formats{RgbPixelFormat::RGB8, RgbPixelFormat::RGBA8, RgbPixelFormat::PlanarUnitSrgbF32};
 }  // namespace mmltk::backend::imaging::resample::test_perceptual

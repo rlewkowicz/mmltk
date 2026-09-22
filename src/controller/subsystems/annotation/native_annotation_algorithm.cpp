@@ -24,12 +24,11 @@ namespace domain = mmltk::controller::contracts;
 namespace {
 class NativeAnnotationAlgorithm final : public AnnotationAlgorithm {
 public:
- [[nodiscard]] mmltk::frameworks::gpu::ImageWorkspaceCoverage WorkspaceCoverage(
-  const mmltk::frameworks::gpu::ImageWorkspaceObservation& baseline) const override {
+ [[nodiscard]] mmltk::frameworks::gpu::ImageWorkspaceCoverage WorkspaceCoverage(const mmltk::frameworks::gpu::ImageWorkspaceObservation& baseline) const override {
   return {.allocation_identity = baseline.workspace ? baseline.workspace->identity() : 0U,
-          .regions = {&damage_, 1U},
-          .full_image = full_damage_,
-          .baseline = {baseline.product_owner, baseline.product_revision}};
+   .regions = {&damage_, 1U},
+   .full_image = full_damage_,
+   .baseline = {baseline.product_owner, baseline.product_revision}};
  }
  void Open(const mmltk::frameworks::gpu::ImagePlaneView source, const VisualRegion crop, const VisualExtent target) override {
   crop_ = crop.valid() ? crop : VisualRegion{0U, 0U, source.descriptor.width, source.descriptor.height};
@@ -55,8 +54,7 @@ public:
   sample_host_->ensure_bytes(4);
   const auto x = std::min(static_cast<unsigned>(point.x * static_cast<float>(crop_.width) / static_cast<float>(target_.width)), crop_.width - 1U) + crop_.x;
   const auto y = std::min(static_cast<unsigned>(point.y * static_cast<float>(crop_.height) / static_cast<float>(target_.height)), crop_.height - 1U) + crop_.y;
-  if (cudaMemcpy(sample_host_->data(), reinterpret_cast<const void*>(source_.data + y * source_.descriptor.pitch_bytes + x * 4U), 4, cudaMemcpyDeviceToHost) !=
-      cudaSuccess)
+  if (cudaMemcpy(sample_host_->data(), reinterpret_cast<const void*>(source_.data + y * source_.descriptor.pitch_bytes + x * 4U), 4, cudaMemcpyDeviceToHost) != cudaSuccess)
    throw std::runtime_error("Annotation color sample failed");
   const auto* pixel = static_cast<const std::uint8_t*>(sample_host_->data());
   const float r = pixel[0] / 255.0F, g = pixel[1] / 255.0F, b = pixel[2] / 255.0F;
@@ -93,17 +91,15 @@ private:
  mutable mmltk::frameworks::gpu::ImageWorkspaceRegion damage_;
  mutable bool full_damage_ = true;
  static bool SameGeometry(const domain::AnnotationObject& a, const domain::AnnotationObject& b) {
-  return a.shape == b.shape && a.point == b.point && a.spline_knots == b.spline_knots && a.skeleton_nodes == b.skeleton_nodes &&
-         a.skeleton_edges == b.skeleton_edges && a.spline_closed == b.spline_closed;
+  return a.shape == b.shape && a.point == b.point && a.spline_knots == b.spline_knots && a.skeleton_nodes == b.skeleton_nodes && a.skeleton_edges == b.skeleton_edges &&
+         a.spline_closed == b.spline_closed;
  }
  static bool SameDrawing(const domain::AnnotationObject& a, const domain::AnnotationObject& b, bool same_runs) {
   return SameGeometry(a, b) && a.box == b.box && same_runs && a.category == b.category && a.enabled == b.enabled;
  }
  static domain::AnnotationBox DrawingBox(const AnnotationRenderState& description, std::size_t index) {
   const auto& object = description.DrawingObjectAt(index);
-  if (!description.drag || description.preview_object != index ||
-      (object.shape != domain::AnnotationShape::Box && object.shape != domain::AnnotationShape::Mask))
-   return object.box;
+  if (!description.drag || description.preview_object != index || (object.shape != domain::AnnotationShape::Box && object.shape != domain::AnnotationShape::Mask)) return object.box;
   const auto box = description.TargetBox(index);
   if (!description.TransformsMask(index)) return box;
   if (box.first.x >= box.second.x || box.first.y >= box.second.y) return {};
@@ -135,8 +131,7 @@ private:
   if (!object.enabled) return {};
   const auto box = DrawingBox(description, index);
   float x1 = box.first.x, y1 = box.first.y, x2 = box.second.x, y2 = box.second.y;
-  if (object.shape != domain::AnnotationShape::Box && object.shape != domain::AnnotationShape::Mask)
-   x1 = x2 = description.DrawingPoint(index).x, y1 = y2 = description.DrawingPoint(index).y;
+  if (object.shape != domain::AnnotationShape::Box && object.shape != domain::AnnotationShape::Mask) x1 = x2 = description.DrawingPoint(index).x, y1 = y2 = description.DrawingPoint(index).y;
   const auto point = [&](domain::AnnotationPoint value) {
    x1 = std::min(x1, value.x);
    y1 = std::min(y1, value.y);
@@ -180,10 +175,10 @@ private:
    }
   }
   return {static_cast<int>(std::clamp(x1, 0.0F, static_cast<float>(width))), static_cast<int>(std::clamp(y1, 0.0F, static_cast<float>(height))),
-          static_cast<int>(std::clamp(x2, 0.0F, static_cast<float>(width))), static_cast<int>(std::clamp(y2, 0.0F, static_cast<float>(height)))};
+   static_cast<int>(std::clamp(x2, 0.0F, static_cast<float>(width))), static_cast<int>(std::clamp(y2, 0.0F, static_cast<float>(height)))};
  }
  void Render(const AnnotationRenderState& description, const mmltk::frameworks::gpu::ImagePlaneView source, const mmltk::frameworks::gpu::ImagePlaneView clean,
-             const mmltk::frameworks::gpu::ImagePlaneView semantic, const std::uintptr_t stream_value) const override {
+  const mmltk::frameworks::gpu::ImagePlaneView semantic, const std::uintptr_t stream_value) const override {
   auto stream = reinterpret_cast<cudaStream_t>(stream_value);
   auto allocation = std::ranges::find(allocations_, clean.allocation.owner, &Allocation::owner);
   if (allocation == allocations_.end()) {
@@ -191,18 +186,15 @@ private:
    allocation = std::prev(allocations_.end());
   }
   auto& retained = *allocation;
-  const bool initialize = retained.identity != clean.allocation.identity || retained.epoch != description.document_epoch ||
-                          retained.width != clean.descriptor.width || retained.height != clean.descriptor.height ||
-                          retained.semantic != semantic.allocation.identity;
+  const bool initialize = retained.identity != clean.allocation.identity || retained.epoch != description.document_epoch || retained.width != clean.descriptor.width ||
+                          retained.height != clean.descriptor.height || retained.semantic != semantic.allocation.identity;
   if (initialize) {
-   const raster::ConstBytes input{reinterpret_cast<const std::uint8_t*>(source.data + crop_.y * source.descriptor.pitch_bytes + crop_.x * 4U),
-                                  source.descriptor.pitch_bytes, static_cast<int>(crop_.width), static_cast<int>(crop_.height)};
-   const raster::MutableBytes output{reinterpret_cast<std::uint8_t*>(clean.data), clean.descriptor.pitch_bytes, static_cast<int>(clean.descriptor.width),
-                                     static_cast<int>(clean.descriptor.height)};
+   const raster::ConstBytes input{reinterpret_cast<const std::uint8_t*>(source.data + crop_.y * source.descriptor.pitch_bytes + crop_.x * 4U), source.descriptor.pitch_bytes,
+    static_cast<int>(crop_.width), static_cast<int>(crop_.height)};
+   const raster::MutableBytes output{reinterpret_cast<std::uint8_t*>(clean.data), clean.descriptor.pitch_bytes, static_cast<int>(clean.descriptor.width), static_cast<int>(clean.descriptor.height)};
    if (!source.valid()) throw std::runtime_error("Annotation clean baseline source is unavailable");
    const auto status = input.width == output.width && input.height == output.height
-                        ? cudaMemcpy2DAsync(output.pixels, output.pitch_bytes, input.pixels, input.pitch_bytes, clean.descriptor.row_bytes(),
-                                            clean.descriptor.height, cudaMemcpyDeviceToDevice, stream)
+                        ? cudaMemcpy2DAsync(output.pixels, output.pitch_bytes, input.pixels, input.pitch_bytes, clean.descriptor.row_bytes(), clean.descriptor.height, cudaMemcpyDeviceToDevice, stream)
                         : static_cast<cudaError_t>(raster::scale_rgba(input, output, stream_value));
    if (status != cudaSuccess) throw std::runtime_error("Annotation clean baseline preparation failed");
   }
@@ -230,9 +222,8 @@ private:
    }
    const auto bounds = current ? footprints_[index].bounds : raster::IntRect{};
    const bool changed = !previous || !current || palette_changed || (retained.selected == index) != (description.editor.selected_object == index) ||
-                        !SameDrawing(retained.objects[index], description.DrawingObjectAt(index), same_runs) ||
-                        retained.footprints[index].bounds.x1 != bounds.x1 || retained.footprints[index].bounds.y1 != bounds.y1 ||
-                        retained.footprints[index].bounds.x2 != bounds.x2 || retained.footprints[index].bounds.y2 != bounds.y2 ||
+                        !SameDrawing(retained.objects[index], description.DrawingObjectAt(index), same_runs) || retained.footprints[index].bounds.x1 != bounds.x1 ||
+                        retained.footprints[index].bounds.y1 != bounds.y1 || retained.footprints[index].bounds.x2 != bounds.x2 || retained.footprints[index].bounds.y2 != bounds.y2 ||
                         retained.transforms[index] != (description.preview_object == index ? description.drag : std::nullopt);
    if (changed) {
     if (previous) damage(retained.footprints[index].bounds);
@@ -248,7 +239,7 @@ private:
   full_damage_ = initialize;
   if (clip.x1 >= clip.x2 || clip.y1 >= clip.y2) return;
   if (cudaMemset2DAsync(reinterpret_cast<void*>(semantic.data + clip.y1 * semantic.descriptor.pitch_bytes + clip.x1 * 4U), semantic.descriptor.pitch_bytes, 0,
-                        static_cast<std::size_t>(clip.x2 - clip.x1) * 4U, static_cast<std::size_t>(clip.y2 - clip.y1), stream) != cudaSuccess)
+       static_cast<std::size_t>(clip.x2 - clip.x1) * 4U, static_cast<std::size_t>(clip.y2 - clip.y1), stream) != cudaSuccess)
    throw std::runtime_error("Annotation semantic damage preparation failed");
   const auto& scene = *description.scene;
   // Reuse pinned staging only after its prior transfer has consumed it;
@@ -301,8 +292,8 @@ private:
        const auto c2 = b.in.enabled ? b.in.point : b.point;
        for (unsigned sample = 1; sample <= 16; ++sample) {
         const float t = static_cast<float>(sample) / 16, u = 1 - t;
-        point({u * u * u * a.point.x + 3 * u * u * t * c1.x + 3 * u * t * t * c2.x + t * t * t * b.point.x,
-               u * u * u * a.point.y + 3 * u * u * t * c1.y + 3 * u * t * t * c2.y + t * t * t * b.point.y});
+        point(
+         {u * u * u * a.point.x + 3 * u * u * t * c1.x + 3 * u * t * t * c2.x + t * t * t * b.point.x, u * u * u * a.point.y + 3 * u * u * t * c1.y + 3 * u * t * t * c2.y + t * t * t * b.point.y});
        }
       }
      }
@@ -387,11 +378,9 @@ private:
    if (last > first) {
     auto* const pairs = static_cast<std::uint32_t*>(mask_host_->data());
     std::copy(uploaded_words_.begin() + first, uploaded_words_.begin() + last, pairs + first);
-    if (cudaMemcpyAsync(static_cast<std::uint32_t*>(mask_device_.active()) + first, pairs + first, (last - first) * sizeof(std::uint32_t),
-                        cudaMemcpyHostToDevice, stream) != cudaSuccess)
+    if (cudaMemcpyAsync(static_cast<std::uint32_t*>(mask_device_.active()) + first, pairs + first, (last - first) * sizeof(std::uint32_t), cudaMemcpyHostToDevice, stream) != cudaSuccess)
      throw std::runtime_error("Annotation changed geometry upload failed");
-    if (mask_upload_ == nullptr && cudaEventCreateWithFlags(&mask_upload_, cudaEventDisableTiming) != cudaSuccess)
-     throw std::runtime_error("Annotation mask upload event creation failed");
+    if (mask_upload_ == nullptr && cudaEventCreateWithFlags(&mask_upload_, cudaEventDisableTiming) != cudaSuccess) throw std::runtime_error("Annotation mask upload event creation failed");
     if (cudaEventRecord(mask_upload_, stream) != cudaSuccess) throw std::runtime_error("Annotation mask upload event recording failed");
     upload_pending_ = true;
    } else {
@@ -406,8 +395,7 @@ private:
   if (palette_source_ != scene.palette) {
    palette_source_ = scene.palette;
    for (std::size_t index = 0U; index < scene.categories.size(); ++index)
-    raster::color::hsv_to_rgb(scene.palette[index].hue, scene.palette[index].saturation, scene.palette[index].value, palette_[index].r, palette_[index].g,
-                              palette_[index].b);
+    raster::color::hsv_to_rgb(scene.palette[index].hue, scene.palette[index].saturation, scene.palette[index].value, palette_[index].r, palette_[index].g, palette_[index].b);
   }
   // CLEANUP-IGNORE: Enabled-object traversal feeds distinct geometry, RLE packing, and drawing bodies; no repeated loop body exists.
   for (std::size_t index = 0; index < description.ObjectCount(); ++index) {
@@ -424,8 +412,7 @@ private:
    const auto color = palette_[object.category];
    if (!object.mask.runs.empty()) {
     if (raster::raster_mask_runs_rgba(
-         {.overlay = {reinterpret_cast<std::uint8_t*>(semantic.data), semantic.descriptor.pitch_bytes, static_cast<int>(semantic.descriptor.width),
-                      static_cast<int>(semantic.descriptor.height)},
+         {.overlay = {reinterpret_cast<std::uint8_t*>(semantic.data), semantic.descriptor.pitch_bytes, static_cast<int>(semantic.descriptor.width), static_cast<int>(semantic.descriptor.height)},
           .run_pairs = static_cast<const std::uint32_t*>(mask_device_.active()) + offset * 2U,
           .run_count = static_cast<std::uint32_t>(object.mask.runs.size()),
           .color = {color.r, color.g, color.b, 92U},
@@ -440,44 +427,33 @@ private:
      throw std::runtime_error("Annotation mask rendering failed");
     offset += object.mask.runs.size();
    }
-   const raster::MutableBytes overlay{reinterpret_cast<std::uint8_t*>(semantic.data), semantic.descriptor.pitch_bytes,
-                                      static_cast<int>(semantic.descriptor.width), static_cast<int>(semantic.descriptor.height)};
+   const raster::MutableBytes overlay{
+    reinterpret_cast<std::uint8_t*>(semantic.data), semantic.descriptor.pitch_bytes, static_cast<int>(semantic.descriptor.width), static_cast<int>(semantic.descriptor.height)};
    const raster::NativeStream native_stream{reinterpret_cast<void*>(stream_value)};
    const auto& geometry = geometry_[index];
    const auto* words = total_words ? static_cast<const std::uint32_t*>(mask_device_.active()) + run_count * 2 : nullptr;
    const raster::PointBuffer points{geometry.count ? reinterpret_cast<const int*>(words + geometry.offset) : nullptr, geometry.count};
    int draw_status = 0;
-   if (object.shape == domain::AnnotationShape::Spline && geometry.count > 1)
-    draw_status = raster::raster_polyline_rgba({overlay, points, object.spline_closed, color, 2, native_stream, object_clip});
+   if (object.shape == domain::AnnotationShape::Spline && geometry.count > 1) draw_status = raster::raster_polyline_rgba({overlay, points, object.spline_closed, color, 2, native_stream, object_clip});
    if ((object.shape == domain::AnnotationShape::Point || object.shape == domain::AnnotationShape::Spline) && geometry.count == 1)
     draw_status = raster::raster_points_rgba({overlay, points, 4, {color.r, color.g, color.b, 255}, native_stream, object_clip});
    if (object.shape == domain::AnnotationShape::Skeleton && geometry.edges)
-    draw_status =
-     raster::raster_skeleton_rgba({overlay, points, {words + geometry.offset + geometry.edge_offset, geometry.edges}, color, 2, native_stream, object_clip});
+    draw_status = raster::raster_skeleton_rgba({overlay, points, {words + geometry.offset + geometry.edge_offset, geometry.edges}, color, 2, native_stream, object_clip});
    if (draw_status != 0) throw std::runtime_error("Annotation geometry rendering failed");
    if (geometry.handles && (object.shape != domain::AnnotationShape::Spline || description.editor.selected_object == index) &&
-       raster::raster_points_rgba({overlay,
-                                   {reinterpret_cast<const int*>(words + geometry.offset + geometry.handle_offset), geometry.handles},
-                                   4,
-                                   {color.r, color.g, color.b, 255},
-                                   native_stream,
-                                   object_clip}) != 0)
+       raster::raster_points_rgba(
+        {overlay, {reinterpret_cast<const int*>(words + geometry.offset + geometry.handle_offset), geometry.handles}, 4, {color.r, color.g, color.b, 255}, native_stream, object_clip}) != 0)
     throw std::runtime_error("Annotation vertex rendering failed");
    if (object.shape != domain::AnnotationShape::Box && object.shape != domain::AnnotationShape::Mask) continue;
    if (description.editor.selected_object == index &&
-       raster::raster_selection_handles_rgba(
-        {overlay,
-         {static_cast<int>(box.first.x) - 5, static_cast<int>(box.first.y) - 5, static_cast<int>(box.second.x) + 5, static_cast<int>(box.second.y) + 5},
-         3,
-         {255, 255, 255, 255},
-         native_stream,
-         object_clip}) != 0)
+       raster::raster_selection_handles_rgba({overlay, {static_cast<int>(box.first.x) - 5, static_cast<int>(box.first.y) - 5, static_cast<int>(box.second.x) + 5, static_cast<int>(box.second.y) + 5},
+        3, {255, 255, 255, 255}, native_stream, object_clip}) != 0)
     throw std::runtime_error("Annotation selection rendering failed");
    const raster::IntRect outline{static_cast<int>(box.first.x), static_cast<int>(box.first.y), static_cast<int>(box.second.x), static_cast<int>(box.second.y)};
    if (outline.x1 >= outline.x2 || outline.y1 >= outline.y2) continue;
-   mmltk::frameworks::gpu::ensure_cuda_ok(static_cast<cudaError_t>(raster::raster_box_outline_rgba(
-                                           {.overlay = overlay, .box = outline, .color = color, .thickness = 2, .stream = native_stream, .clip = object_clip})),
-                                          "Annotation semantic rendering failed");
+   mmltk::frameworks::gpu::ensure_cuda_ok(
+    static_cast<cudaError_t>(raster::raster_box_outline_rgba({.overlay = overlay, .box = outline, .color = color, .thickness = 2, .stream = native_stream, .clip = object_clip})),
+    "Annotation semantic rendering failed");
   }
   retained.epoch = description.document_epoch;
   retained.identity = clean.allocation.identity;
@@ -523,12 +499,10 @@ private:
  mutable std::uint32_t upload_width_ = 0U;
  void EnsureMasks(const std::size_t bytes) const {
   if (bytes <= mask_capacity_) return;
-  const auto capacity =
-   mask_capacity_ <= std::numeric_limits<std::size_t>::max() - mask_capacity_ / 2U ? std::max(bytes, mask_capacity_ + mask_capacity_ / 2U) : bytes;
+  const auto capacity = mask_capacity_ <= std::numeric_limits<std::size_t>::max() - mask_capacity_ / 2U ? std::max(bytes, mask_capacity_ + mask_capacity_ / 2U) : bytes;
   if (!mask_host_) mask_host_ = mmltk::frameworks::gpu::PinnedHostBuffer::ForCurrentDevice();
   mask_host_->ensure_bytes(capacity);
-  if (!mask_device_.AllocateCandidate([capacity](void*& p) { return cudaMalloc(&p, capacity); }).released() ||
-      !mask_device_.PromoteCandidate([](void* p) { return cudaFree(p); }).released())
+  if (!mask_device_.AllocateCandidate([capacity](void*& p) { return cudaMalloc(&p, capacity); }).released() || !mask_device_.PromoteCandidate([](void* p) { return cudaFree(p); }).released())
    throw std::runtime_error("Annotation mask allocation failed");
   mask_capacity_ = capacity;
  }

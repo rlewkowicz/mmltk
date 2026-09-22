@@ -24,8 +24,7 @@ __device__ __forceinline__ std::uint32_t phase(const float source_coordinate) {
 }
 // Workflow-neutral direct sampler used by atlas-style consumers that cannot
 // materialize a single rectangular separable intermediate.
-__device__ __forceinline__ float3 sample_normalized_nchw(const float* pixels, const std::uint32_t width, const std::uint32_t height, const float source_x,
-                                                         const float source_y) {
+__device__ __forceinline__ float3 sample_normalized_nchw(const float* pixels, const std::uint32_t width, const std::uint32_t height, const float source_x, const float source_y) {
  const int base_x = static_cast<int>(floorf(source_x)) - 2;
  const int base_y = static_cast<int>(floorf(source_y)) - 2;
  const std::uint32_t phase_x = phase(source_x);

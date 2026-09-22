@@ -12,16 +12,11 @@
 namespace mmltk::backend::models::rfdetr {
 void validate_resume_continuation_manifest(const ResumeContinuationManifest& manifest) {
  if (manifest.ema_requested != manifest.ema_present) {
-  throw std::runtime_error(manifest.ema_requested ? "native RF-DETR resume checkpoint is missing required EMA state"
-                                                  : "native RF-DETR resume checkpoint contains EMA state while EMA is disabled");
+  throw std::runtime_error(manifest.ema_requested ? "native RF-DETR resume checkpoint is missing required EMA state" : "native RF-DETR resume checkpoint contains EMA state while EMA is disabled");
  }
- if (manifest.scaler_scale.has_value() != manifest.scaler_growth_tracker.has_value()) {
-  throw std::runtime_error("native RF-DETR resume checkpoint gradient scaler state is incomplete");
- }
- if ((manifest.scaler_scale.has_value() &&
-      (!std::isfinite(*manifest.scaler_scale) || *manifest.scaler_scale <= 0.0 || *manifest.scaler_scale > std::numeric_limits<float>::max())) ||
-     (manifest.scaler_growth_tracker.has_value() &&
-      (*manifest.scaler_growth_tracker < 0 || *manifest.scaler_growth_tracker > static_cast<int64_t>(std::numeric_limits<int>::max())))) {
+ if (manifest.scaler_scale.has_value() != manifest.scaler_growth_tracker.has_value()) { throw std::runtime_error("native RF-DETR resume checkpoint gradient scaler state is incomplete"); }
+ if ((manifest.scaler_scale.has_value() && (!std::isfinite(*manifest.scaler_scale) || *manifest.scaler_scale <= 0.0 || *manifest.scaler_scale > std::numeric_limits<float>::max())) ||
+     (manifest.scaler_growth_tracker.has_value() && (*manifest.scaler_growth_tracker < 0 || *manifest.scaler_growth_tracker > static_cast<int64_t>(std::numeric_limits<int>::max())))) {
   throw std::runtime_error("native RF-DETR resume checkpoint gradient scaler state is invalid");
  }
 }
@@ -30,8 +25,8 @@ namespace serialization = mmltk::frameworks::serialization;
 namespace {
 // The flat archive contains only this subset of TrainRequest. Its relation to
 // native members is declared once; spelling and scalar types derive from them.
-inline constexpr std::array kContinuationRequestMembers{^^TrainRequest::optimizer,     ^^TrainRequest::lr_scheduler,    ^^TrainRequest::lr_drop,
-                                                        ^^TrainRequest::warmup_epochs, ^^TrainRequest::warmup_momentum, ^^TrainRequest::lr_min_factor};
+inline constexpr std::array kContinuationRequestMembers{
+ ^^TrainRequest::optimizer, ^^TrainRequest::lr_scheduler, ^^TrainRequest::lr_drop, ^^TrainRequest::warmup_epochs, ^^TrainRequest::warmup_momentum, ^^TrainRequest::lr_min_factor};
 template <class Visitor>
 void visit_request_members(Visitor&& visitor) {
  template for (constexpr auto member : kContinuationRequestMembers) { visitor.template operator()<member>(); }
@@ -39,8 +34,7 @@ void visit_request_members(Visitor&& visitor) {
 template <class Visitor>
 void visit_request_scalars(const TrainRequest& request, Visitor&& visitor) {
  visit_request_members([&]<std::meta::info member> {
-  constexpr auto key =
-   std::define_static_string(member == ^^TrainRequest::optimizer ? std::string("optimizer_kind") : std::string(std::meta::identifier_of(member)));
+  constexpr auto key = std::define_static_string(member == ^^TrainRequest::optimizer ? std::string("optimizer_kind") : std::string(std::meta::identifier_of(member)));
   const auto& value = request.[:member:];
   if constexpr (std::is_enum_v<std::remove_cvref_t<decltype(value)>>)
    visitor(key, std::string(cli_enum_spelling(value)));
@@ -50,14 +44,11 @@ void visit_request_scalars(const TrainRequest& request, Visitor&& visitor) {
 }
 template <class Visitor>
 void visit_augmentation_scalars(const GpuAugmentationConfig& configuration, Visitor&& visitor) {
- template for (constexpr auto member :
-               std::define_static_array(std::meta::nonstatic_data_members_of(^^GpuAugmentationConfig, std::meta::access_context::current()))) {
+ template for (constexpr auto member : std::define_static_array(std::meta::nonstatic_data_members_of(^^GpuAugmentationConfig, std::meta::access_context::current()))) {
   const auto& value = configuration.[:member:];
   if constexpr (std::is_same_v<std::remove_cvref_t<decltype(value)>, AugmentationGroupConfig>) {
-   template for (constexpr auto field :
-                 std::define_static_array(std::meta::nonstatic_data_members_of(^^AugmentationGroupConfig, std::meta::access_context::current()))) {
-    constexpr auto key = std::define_static_string(std::string("gpu_augment_") + std::string(std::meta::identifier_of(member)) + "_" +
-                                                   std::string(std::meta::identifier_of(field)));
+   template for (constexpr auto field : std::define_static_array(std::meta::nonstatic_data_members_of(^^AugmentationGroupConfig, std::meta::access_context::current()))) {
+    constexpr auto key = std::define_static_string(std::string("gpu_augment_") + std::string(std::meta::identifier_of(member)) + "_" + std::string(std::meta::identifier_of(field)));
     visitor(key, value.[:field:]);
    }
   } else {
@@ -68,8 +59,7 @@ void visit_augmentation_scalars(const GpuAugmentationConfig& configuration, Visi
 }
 template <class Values, class Visitor>
 void visit_continuation_values(Values& values, Visitor&& visitor) {
- template for (constexpr auto member :
-               std::define_static_array(std::meta::nonstatic_data_members_of(^^TrainingContinuationValues, std::meta::access_context::current()))) {
+ template for (constexpr auto member : std::define_static_array(std::meta::nonstatic_data_members_of(^^TrainingContinuationValues, std::meta::access_context::current()))) {
   visitor(std::define_static_string(std::meta::identifier_of(member)), values.[:member:]);
  }
 }
@@ -106,13 +96,11 @@ auto read_scalar(torch::serialize::InputArchive& archive, const char* key) {
 }
 void validate_values(const TrainingContinuationValues& values, bool requested_ema, bool present_ema) {
  if (values.epoch < 0 || values.epoch >= std::numeric_limits<int>::max()) throw std::runtime_error("invalid checkpoint epoch");
- if (values.ema_completed_updates < 0 || values.ema_completed_updates == std::numeric_limits<int64_t>::max() ||
-     (!requested_ema && values.ema_completed_updates != 0))
+ if (values.ema_completed_updates < 0 || values.ema_completed_updates == std::numeric_limits<int64_t>::max() || (!requested_ema && values.ema_completed_updates != 0))
   throw std::runtime_error("invalid checkpoint EMA completed update count");
  if (std::isnan(values.best_regular_metric) || std::isnan(values.best_ema_metric)) throw std::runtime_error("checkpoint best metric is invalid");
  if (values.training_attempt_id.empty() || values.training_attempt_id.size() > 64) throw std::runtime_error("invalid checkpoint attempt identity");
- if (values.training_original_descriptor.size() > mmltk::frameworks::reflection::kMaximumPathBytes)
-  throw std::runtime_error("invalid original checkpoint descriptor provenance");
+ if (values.training_original_descriptor.size() > mmltk::frameworks::reflection::kMaximumPathBytes) throw std::runtime_error("invalid original checkpoint descriptor provenance");
  validate_resume_continuation_manifest({requested_ema, present_ema, values.grad_scaler_scale, values.grad_scaler_growth_tracker});
 }
 bool has_continuation_fields(torch::serialize::InputArchive& archive) {
@@ -144,16 +132,14 @@ void write_training_configuration(torch::serialize::OutputArchive& archive, cons
 }
 TrainRequest read_training_configuration(torch::serialize::InputArchive& archive) {
  torch::Tensor configuration;
- if (!archive.try_read("training_configuration_cbor", configuration))
-  throw std::runtime_error("full checkpoint is missing current saved training configuration");
+ if (!archive.try_read("training_configuration_cbor", configuration)) throw std::runtime_error("full checkpoint is missing current saved training configuration");
  constexpr auto capacity = serialization::reflected_maximum_cbor_bytes<TrainRequest>();
- if (!configuration.defined() || !configuration.is_cpu() || configuration.scalar_type() != torch::kUInt8 || configuration.dim() != 1 ||
-     configuration.numel() <= 0 || static_cast<std::size_t>(configuration.numel()) > capacity)
+ if (!configuration.defined() || !configuration.is_cpu() || configuration.scalar_type() != torch::kUInt8 || configuration.dim() != 1 || configuration.numel() <= 0 ||
+     static_cast<std::size_t>(configuration.numel()) > capacity)
   throw std::runtime_error("invalid checkpoint training configuration");
  configuration = configuration.contiguous();
  const auto request = serialization::decode<TrainRequest>(
-  {std::span(reinterpret_cast<const std::byte*>(configuration.const_data_ptr()), static_cast<std::size_t>(configuration.numel())), {}},
-  {.max_bytes = capacity, .max_items = 4096, .max_depth = 32});
+  {std::span(reinterpret_cast<const std::byte*>(configuration.const_data_ptr()), static_cast<std::size_t>(configuration.numel())), {}}, {.max_bytes = capacity, .max_items = 4096, .max_depth = 32});
  if (!request) throw std::runtime_error("invalid checkpoint training configuration values");
  validate_train_request(*request);
  return *request;
@@ -198,8 +184,7 @@ void require_active_training_continuation(const TrainingContinuation& saved, con
   if (saved.configuration.[:member:] != active.[:member:]) throw std::runtime_error(std::string("resume configuration differs for ") + name);
  });
  if (saved.configuration.use_ema != active.use_ema) throw std::runtime_error("resume EMA selection differs from the saved training configuration");
- if (saved.configuration.training_supervision != active.training_supervision)
-  throw std::runtime_error("native RF-DETR resume checkpoint training supervision configuration does not match");
+ if (saved.configuration.training_supervision != active.training_supervision) throw std::runtime_error("native RF-DETR resume checkpoint training supervision configuration does not match");
 }
 }  // namespace detail
 }  // namespace mmltk::backend::models::rfdetr

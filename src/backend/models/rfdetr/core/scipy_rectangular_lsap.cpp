@@ -8,9 +8,8 @@ void argsort_iter(const std::pmr::vector<intptr_t>& values, std::pmr::vector<int
  std::iota(index.begin(), index.end(), 0);
  std::ranges::sort(index, [&values](intptr_t lhs, intptr_t rhs) { return values[static_cast<size_t>(lhs)] < values[static_cast<size_t>(rhs)]; });
 }
-intptr_t augmenting_path(intptr_t num_cols, double* cost, std::pmr::vector<double>& u, std::pmr::vector<double>& v, std::pmr::vector<intptr_t>& path,
-                         std::pmr::vector<intptr_t>& row_for_col, std::pmr::vector<double>& shortest_path_costs, intptr_t row,
-                         std::pmr::vector<bool>& visited_rows, std::pmr::vector<bool>& visited_cols, std::pmr::vector<intptr_t>& remaining, double* min_value) {
+intptr_t augmenting_path(intptr_t num_cols, double* cost, std::pmr::vector<double>& u, std::pmr::vector<double>& v, std::pmr::vector<intptr_t>& path, std::pmr::vector<intptr_t>& row_for_col,
+ std::pmr::vector<double>& shortest_path_costs, intptr_t row, std::pmr::vector<bool>& visited_rows, std::pmr::vector<bool>& visited_cols, std::pmr::vector<intptr_t>& remaining, double* min_value) {
  double current_min = 0.0;
  intptr_t num_remaining = num_cols;
  for (intptr_t i = 0; i < num_cols; ++i) { remaining[static_cast<size_t>(i)] = num_cols - i - 1; }
@@ -29,8 +28,7 @@ intptr_t augmenting_path(intptr_t num_cols, double* cost, std::pmr::vector<doubl
     path[static_cast<size_t>(col)] = row;
     shortest_path_costs[static_cast<size_t>(col)] = reduced_cost;
    }
-   if (shortest_path_costs[static_cast<size_t>(col)] < lowest ||
-       (shortest_path_costs[static_cast<size_t>(col)] == lowest && row_for_col[static_cast<size_t>(col)] == -1)) {
+   if (shortest_path_costs[static_cast<size_t>(col)] < lowest || (shortest_path_costs[static_cast<size_t>(col)] == lowest && row_for_col[static_cast<size_t>(col)] == -1)) {
     lowest = shortest_path_costs[static_cast<size_t>(col)];
     index = i;
    }
@@ -49,8 +47,7 @@ intptr_t augmenting_path(intptr_t num_cols, double* cost, std::pmr::vector<doubl
  *min_value = current_min;
  return sink;
 }
-RectangularLsApStatus solve_impl(intptr_t num_rows, intptr_t num_cols, double* input_cost, bool maximize, int64_t* row_indices, int64_t* col_indices,
-                                 RectangularLsApWorkspace& workspace) {
+RectangularLsApStatus solve_impl(intptr_t num_rows, intptr_t num_cols, double* input_cost, bool maximize, int64_t* row_indices, int64_t* col_indices, RectangularLsApWorkspace& workspace) {
  if (num_rows == 0 || num_cols == 0) { return RectangularLsApStatus::kOk; }
  bool transpose = num_cols < num_rows;
  auto& temp = workspace.transposed_cost;
@@ -93,14 +90,11 @@ RectangularLsApStatus solve_impl(intptr_t num_rows, intptr_t num_cols, double* i
  remaining.resize(static_cast<size_t>(num_cols));
  for (intptr_t row = 0; row < num_rows; ++row) {
   double min_value = 0.0;
-  const intptr_t sink =
-   augmenting_path(num_cols, input_cost, u, v, path, row_for_col, shortest_path_costs, row, visited_rows, visited_cols, remaining, &min_value);
+  const intptr_t sink = augmenting_path(num_cols, input_cost, u, v, path, row_for_col, shortest_path_costs, row, visited_rows, visited_cols, remaining, &min_value);
   if (sink < 0) { return RectangularLsApStatus::kInfeasible; }
   u[static_cast<size_t>(row)] += min_value;
   for (intptr_t i = 0; i < num_rows; ++i) {
-   if (visited_rows[static_cast<size_t>(i)] && i != row) {
-    u[static_cast<size_t>(i)] += min_value - shortest_path_costs[static_cast<size_t>(col_for_row[static_cast<size_t>(i)])];
-   }
+   if (visited_rows[static_cast<size_t>(i)] && i != row) { u[static_cast<size_t>(i)] += min_value - shortest_path_costs[static_cast<size_t>(col_for_row[static_cast<size_t>(i)])]; }
   }
   for (intptr_t j = 0; j < num_cols; ++j) {
    if (visited_cols[static_cast<size_t>(j)]) { v[static_cast<size_t>(j)] -= min_value - shortest_path_costs[static_cast<size_t>(j)]; }
@@ -130,9 +124,8 @@ RectangularLsApStatus solve_impl(intptr_t num_rows, intptr_t num_cols, double* i
  return RectangularLsApStatus::kOk;
 }
 }  // namespace
-RectangularLsApStatus solve_rectangular_linear_sum_assignment(int64_t num_rows, int64_t num_cols, const double* cost_matrix, bool maximize,
-                                                              int64_t* row_indices, int64_t* col_indices, RectangularLsApWorkspace& workspace) {
- return solve_impl(static_cast<intptr_t>(num_rows), static_cast<intptr_t>(num_cols), const_cast<double*>(cost_matrix), maximize, row_indices, col_indices,
-                   workspace);
+RectangularLsApStatus solve_rectangular_linear_sum_assignment(
+ int64_t num_rows, int64_t num_cols, const double* cost_matrix, bool maximize, int64_t* row_indices, int64_t* col_indices, RectangularLsApWorkspace& workspace) {
+ return solve_impl(static_cast<intptr_t>(num_rows), static_cast<intptr_t>(num_cols), const_cast<double*>(cost_matrix), maximize, row_indices, col_indices, workspace);
 }
 }  // namespace mmltk::backend::models::rfdetr

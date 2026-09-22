@@ -12,11 +12,7 @@
 namespace mmltk::backend::media::live {
 namespace system = mmltk::common::system;
 LiveVideoIngress::LiveVideoIngress(capture::CaptureConfig config, const std::uint32_t count, LivePhysicalCudaContext cuda)
-    : config_(std::move(config)),
-      cuda_(std::move(cuda)),
-      capture_(config_),
-      slots_(count == 0U ? nullptr : std::make_unique<DeviceSlot[]>(count)),
-      slot_count_(count) {
+    : config_(std::move(config)), cuda_(std::move(cuda)), capture_(config_), slots_(count == 0U ? nullptr : std::make_unique<DeviceSlot[]>(count)), slot_count_(count) {
  if (count == 0U || !cuda_.valid()) throw std::invalid_argument("Live ingress requires fixed slots and a CUDA owner");
  try {
   auto scope = cuda_.scope();
@@ -27,8 +23,7 @@ LiveVideoIngress::LiveVideoIngress(capture::CaptureConfig config, const std::uin
    slot.index = index;
    if (scope.Record(cudaStreamCreateWithFlags(&slot.stream, cudaStreamNonBlocking)) != cudaSuccess) throw std::runtime_error("create Live ingress stream");
    if (scope.Record(cudaEventCreateWithFlags(&slot.ready, cudaEventDisableTiming)) != cudaSuccess) throw std::runtime_error("create Live ingress event");
-   if (scope.Record(cudaMallocPitch(reinterpret_cast<void**>(&slot.pixels), &slot.pitch_bytes, static_cast<std::size_t>(config_.width) * 3U, config_.height)) !=
-       cudaSuccess)
+   if (scope.Record(cudaMallocPitch(reinterpret_cast<void**>(&slot.pixels), &slot.pitch_bytes, static_cast<std::size_t>(config_.width) * 3U, config_.height)) != cudaSuccess)
     throw std::runtime_error("allocate Live ingress slot");
   }
  } catch (...) {
@@ -59,9 +54,7 @@ capture::Status LiveVideoIngress::request_stop() noexcept {
  return capture_.request_stop(identity_);
 }
 std::shared_ptr<const capture::CaptureStopTerminal> LiveVideoIngress::try_take_terminal() noexcept { return capture_.try_take_stop_terminal(); }
-capture::Status LiveVideoIngress::finalize_terminal(const std::shared_ptr<const capture::CaptureStopTerminal>& terminal) {
- return capture_.finalize_stop(terminal);
-}
+capture::Status LiveVideoIngress::finalize_terminal(const std::shared_ptr<const capture::CaptureStopTerminal>& terminal) { return capture_.finalize_stop(terminal); }
 capture::Status LiveVideoIngress::report_failure(capture::Status failure) noexcept {
  running_.store(false, std::memory_order_release);
  if (!identity_.valid()) return failure;
@@ -96,10 +89,9 @@ bool LiveVideoIngress::ingest_next() {
   return false;
  }
  const std::size_t row_bytes = static_cast<std::size_t>(slot->metadata.region.width) * 3U;
- const std::uint8_t* const source =
-  slot->lease.data() + static_cast<std::size_t>(slot->metadata.region.y) * slot->lease.stride_bytes() + static_cast<std::size_t>(slot->metadata.region.x) * 3U;
- cudaError_t failure = scope.Record(cudaMemcpy2DAsync(reinterpret_cast<void*>(slot->pixels), slot->pitch_bytes, source, slot->lease.stride_bytes(), row_bytes,
-                                                      slot->metadata.region.height, cudaMemcpyHostToDevice, slot->stream));
+ const std::uint8_t* const source = slot->lease.data() + static_cast<std::size_t>(slot->metadata.region.y) * slot->lease.stride_bytes() + static_cast<std::size_t>(slot->metadata.region.x) * 3U;
+ cudaError_t failure = scope.Record(
+  cudaMemcpy2DAsync(reinterpret_cast<void*>(slot->pixels), slot->pitch_bytes, source, slot->lease.stride_bytes(), row_bytes, slot->metadata.region.height, cudaMemcpyHostToDevice, slot->stream));
  if (failure == cudaSuccess) failure = scope.Record(cudaEventRecord(slot->ready, slot->stream));
  capture::Status capture_failure = capture::Status::Ok();
  if (failure == cudaSuccess) capture_failure = capture_.mark_h2d_completion_pending(slot->lease);

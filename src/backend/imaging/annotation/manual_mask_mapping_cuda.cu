@@ -44,9 +44,8 @@ __global__ void deferred_manual_mask_runs_kernel(const DeferredManualMaskRunsLau
 cudaError_t launch_deferred_manual_mask_runs_cuda(const DeferredManualMaskRunsLaunchAbi& launch) noexcept {
  const ManualMaskMappingAbi& mapping = launch.mapping;
  if (launch.stream == nullptr || launch.overlay_region.pixels == nullptr || launch.overlay_region.width <= 0 || launch.overlay_region.height <= 0 ||
-     launch.overlay_region.pitch_bytes < static_cast<std::size_t>(launch.overlay_region.width) * 4U || launch.run_pairs == nullptr || launch.run_count == 0U ||
-     mapping.source_width == 0U || mapping.source_height == 0U || mapping.source_crop_width == 0U || mapping.source_crop_height == 0U ||
-     mapping.output_width == 0U || mapping.output_height == 0U ||
+     launch.overlay_region.pitch_bytes < static_cast<std::size_t>(launch.overlay_region.width) * 4U || launch.run_pairs == nullptr || launch.run_count == 0U || mapping.source_width == 0U ||
+     mapping.source_height == 0U || mapping.source_crop_width == 0U || mapping.source_crop_height == 0U || mapping.output_width == 0U || mapping.output_height == 0U ||
      static_cast<std::uint64_t>(mapping.source_crop_x) + mapping.source_crop_width > mapping.source_width ||
      static_cast<std::uint64_t>(mapping.source_crop_y) + mapping.source_crop_height > mapping.source_height ||
      static_cast<std::uint64_t>(mapping.view_x) + launch.region_capture_x + static_cast<std::uint32_t>(launch.overlay_region.width) > mapping.output_width ||

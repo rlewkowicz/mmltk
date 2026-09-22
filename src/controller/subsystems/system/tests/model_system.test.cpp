@@ -21,8 +21,7 @@
 using namespace mmltk::controller::test_support;
 namespace mmltk::controller {
 namespace {
-[[nodiscard]] contracts::ModelSelection export_model_selection(const contracts::GuiSettingsState& settings, const contracts::ModelArtifactInputKind input,
-                                                               std::string artifact) {
+[[nodiscard]] contracts::ModelSelection export_model_selection(const contracts::GuiSettingsState& settings, const contracts::ModelArtifactInputKind input, std::string artifact) {
  auto projection = contracts::model_settings_projection(settings, contracts::FeatureId::Export);
  REQUIRE(projection);
  projection->key.source = contracts::ModelSelectionSource::Custom;
@@ -160,8 +159,7 @@ TEST_CASE("validation materializes inherited and independent dataset sources", "
  settings.workflows.validate.model_source = contracts::ModelSelectionSource::Custom;
  settings.workflows.validate.request.weights_path = "/selected/model.pt";
  const auto model = selected_model(settings, contracts::FeatureId::Validate);
- const contracts::ArtifactInspection inspected{
-  .compatible = true, .splits = {split("/inferred/val.bin"), split("/manual.bin"), split("/independent.bin")}, .detail = {}};
+ const contracts::ArtifactInspection inspected{.compatible = true, .splits = {split("/inferred/val.bin"), split("/manual.bin"), split("/independent.bin")}, .detail = {}};
  const auto check_path = [&](const char* expected) {
   const auto request = subsystems::system::ComputeIntentMaterializer::Validation(settings, inspected, model);
   REQUIRE(request);
@@ -227,8 +225,7 @@ TEST_CASE("compute inputs retain normalized full-path identity and image indepen
  CHECK_FALSE(subsystems::system::ComputeIntentMaterializer::Predict(settings, inspected, selection));
 }
 TEST_CASE("model input materialization exhausts the canonical compatibility catalog", "[controller][systems][compute][model]") {
- const auto check_case = [](const contracts::FeatureId workflow, const contracts::ModelSelectionSource source,
-                            const contracts::ModelArtifactInputKind selected_input, const bool build_tensorrt) {
+ const auto check_case = [](const contracts::FeatureId workflow, const contracts::ModelSelectionSource source, const contracts::ModelArtifactInputKind selected_input, const bool build_tensorrt) {
   auto settings = contracts::default_gui_settings_state();
   const contracts::ModelArtifactSelectionState artifacts{
    .weights_path = "/tmp/model.pt",
@@ -284,8 +281,7 @@ TEST_CASE("model input materialization exhausts the canonical compatibility cata
   CHECK(draft_projection->key.resolution == 100U + static_cast<std::uint32_t>(workflow));
   const auto* compatibility = workflow == contracts::FeatureId::Export ? contracts::find_model_selection_compatibility(workflow, selected_input, build_tensorrt)
                                                                        : contracts::find_model_selection_compatibility(workflow, selected_input);
-  const bool expected =
-   selected_input != contracts::ModelArtifactInputKind::None && compatibility != nullptr && contracts::model_selection_source_allowed(*compatibility, source);
+  const bool expected = selected_input != contracts::ModelArtifactInputKind::None && compatibility != nullptr && contracts::model_selection_source_allowed(*compatibility, source);
   CAPTURE(workflow, source, selected_input, build_tensorrt);
   const auto result = subsystems::system::ComputeIntentMaterializer::ModelInputFor(settings, workflow);
   CHECK(result.has_value() == expected);
@@ -312,16 +308,16 @@ TEST_CASE("model input materialization exhausts the canonical compatibility cata
  };
  for (const auto workflow : {contracts::FeatureId::Train, contracts::FeatureId::Validate, contracts::FeatureId::Predict}) {
   for (const auto source : {contracts::ModelSelectionSource::Canonical, contracts::ModelSelectionSource::Custom}) {
-   for (const auto input : {contracts::ModelArtifactInputKind::Weights, contracts::ModelArtifactInputKind::Onnx, contracts::ModelArtifactInputKind::TensorRt,
-                            contracts::ModelArtifactInputKind::None}) {
+   for (const auto input :
+    {contracts::ModelArtifactInputKind::Weights, contracts::ModelArtifactInputKind::Onnx, contracts::ModelArtifactInputKind::TensorRt, contracts::ModelArtifactInputKind::None}) {
     check_case(workflow, source, input, false);
    }
   }
  }
  for (const bool build_tensorrt : {false, true}) {
   for (const auto source : {contracts::ModelSelectionSource::Canonical, contracts::ModelSelectionSource::Custom}) {
-   for (const auto input : {contracts::ModelArtifactInputKind::Weights, contracts::ModelArtifactInputKind::Onnx, contracts::ModelArtifactInputKind::TensorRt,
-                            contracts::ModelArtifactInputKind::None}) {
+   for (const auto input :
+    {contracts::ModelArtifactInputKind::Weights, contracts::ModelArtifactInputKind::Onnx, contracts::ModelArtifactInputKind::TensorRt, contracts::ModelArtifactInputKind::None}) {
     check_case(contracts::FeatureId::Export, source, input, build_tensorrt);
    }
   }
@@ -332,8 +328,7 @@ TEST_CASE("model input materialization exhausts the canonical compatibility cata
   REQUIRE_FALSE(rejected);
   CHECK(rejected.error().detail == "workflow does not support model selection");
  }
- const auto malformed =
-  subsystems::system::ComputeIntentMaterializer::ModelInputFor(unsupported, static_cast<contracts::FeatureId>(std::numeric_limits<std::uint8_t>::max()));
+ const auto malformed = subsystems::system::ComputeIntentMaterializer::ModelInputFor(unsupported, static_cast<contracts::FeatureId>(std::numeric_limits<std::uint8_t>::max()));
  REQUIRE_FALSE(malformed);
  CHECK(malformed.error().detail == "model selection is incomplete");
 }
@@ -348,16 +343,16 @@ TEST_CASE("model selection shutdown cancels and joins one active acquisition wit
  std::atomic_size_t progress = 0U;
  std::atomic_bool malformed_progress = false;
  ModelSystem model{settings, [gate] { return std::make_unique<BlockingModelRuntime>(gate); },
-                   [&](ModelSystem::event_type event) {
-                    if (std::holds_alternative<ModelProgressChanged>(event)) {
-                     const auto& value = std::get<ModelProgressChanged>(event);
-                     if (value.progress.stage != contracts::ModelProgressStage::Verifying) malformed_progress = true;
-                     ++progress;
-                    } else {
-                     ++terminals;
-                     terminal.set_value(std::get<ModelChanged>(std::move(event)).snapshot);
-                    }
-                   }};
+  [&](ModelSystem::event_type event) {
+   if (std::holds_alternative<ModelProgressChanged>(event)) {
+    const auto& value = std::get<ModelProgressChanged>(event);
+    if (value.progress.stage != contracts::ModelProgressStage::Verifying) malformed_progress = true;
+    ++progress;
+   } else {
+    ++terminals;
+    terminal.set_value(std::get<ModelChanged>(std::move(event)).snapshot);
+   }
+  }};
  CHECK_THROWS_AS(model.Select({.workflow = contracts::FeatureId::Explore}), contracts::InvalidIntentError);
  const auto admitted = model.Select({.workflow = contracts::FeatureId::Train});
  CHECK(admitted.active);
@@ -381,8 +376,7 @@ TEST_CASE("artifact model inspection observes cancellation before each opaque in
   output << "loader must not consume these bytes";
  }
  for (const auto input : {contracts::ModelArtifactInputKind::Weights, contracts::ModelArtifactInputKind::Onnx, contracts::ModelArtifactInputKind::TensorRt}) {
-  contracts::ModelSelectionKey key{
-   .workflow = contracts::FeatureId::Predict, .source = contracts::ModelSelectionSource::Custom, .input = input, .preset = "nano", .resolution = 64};
+  contracts::ModelSelectionKey key{.workflow = contracts::FeatureId::Predict, .source = contracts::ModelSelectionSource::Custom, .input = input, .preset = "nano", .resolution = 64};
   REQUIRE(key.valid());
   mmltk::controller::ArtifactModelRuntime runtime;
   std::stop_source source;

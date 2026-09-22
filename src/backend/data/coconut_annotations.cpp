@@ -36,8 +36,7 @@ using Cancellation = mmltk::common::concurrency::CancellationObservation;
 std::uint64_t decimal(std::string_view value) {
  std::uint64_t id = 0;
  const auto [end, error] = std::from_chars(value.data(), value.data() + value.size(), id);
- if (value.empty() || error != std::errc{} || end != value.data() + value.size() || value.front() == '+' || value.front() == '-')
-  invalid("invalid decimal image identity: " + std::string(value));
+ if (value.empty() || error != std::errc{} || end != value.data() + value.size() || value.front() == '+' || value.front() == '-') invalid("invalid decimal image identity: " + std::string(value));
  return id;
 }
 struct PhysicalName {
@@ -67,9 +66,7 @@ struct PhysicalKey {
  bool operator==(const PhysicalKey&) const = default;
 };
 struct PhysicalKeyHash {
- std::size_t operator()(PhysicalKey key) const noexcept {
-  return std::hash<std::uint64_t>{}(key.id) ^ (static_cast<std::size_t>(key.source) * 0x9e3779b97f4a7c15ULL);
- }
+ std::size_t operator()(PhysicalKey key) const noexcept { return std::hash<std::uint64_t>{}(key.id) ^ (static_cast<std::size_t>(key.source) * 0x9e3779b97f4a7c15ULL); }
 };
 PhysicalKey physical_key(CoconutImageNamespace source, std::uint64_t id) { return {source, id}; }
 const CategoryLookup& coconut_categories() {
@@ -84,9 +81,7 @@ void validate_physical(const CoconutPhysicalImage& image) {
   if (name.source != image.source || name.id != image.image_id) invalid("contradictory Objects365 physical identity: " + image.member);
  } else {
   if (coco_name(image.member) != image.image_id) invalid("contradictory COCO physical identity: " + image.member);
-  const std::string_view directory = image.source == CoconutImageNamespace::CocoTrain       ? "train2017/"
-                                     : image.source == CoconutImageNamespace::CocoUnlabeled ? "unlabeled2017/"
-                                                                                            : "val2017/";
+  const std::string_view directory = image.source == CoconutImageNamespace::CocoTrain ? "train2017/" : image.source == CoconutImageNamespace::CocoUnlabeled ? "unlabeled2017/" : "val2017/";
   if (!image.member.starts_with(directory)) invalid("COCO physical subset disagrees with archive member: " + image.member);
  }
 }
@@ -106,11 +101,8 @@ public:
   if (status != ARCHIVE_OK) fail("reading archive header");
   const char* name = archive_entry_pathname(entry_);
   if (!name) invalid("archive member has no name");
-  member_ = archive_entry_filetype(entry_) == AE_IFDIR && (std::string_view(name) == "." || std::string_view(name) == "./")
-             ? "."
-             : canonical_coconut_archive_member(name);
-  if (archive_entry_symlink(entry_) || archive_entry_hardlink(entry_) ||
-      (archive_entry_filetype(entry_) != AE_IFREG && archive_entry_filetype(entry_) != AE_IFDIR))
+  member_ = archive_entry_filetype(entry_) == AE_IFDIR && (std::string_view(name) == "." || std::string_view(name) == "./") ? "." : canonical_coconut_archive_member(name);
+  if (archive_entry_symlink(entry_) || archive_entry_hardlink(entry_) || (archive_entry_filetype(entry_) != AE_IFREG && archive_entry_filetype(entry_) != AE_IFDIR))
    invalid("unsupported archive entry: " + member_);
   return true;
  }
@@ -118,8 +110,7 @@ public:
  bool regular() const { return archive_entry_filetype(entry_) == AE_IFREG; }
  std::span<const std::uint8_t> read(std::uint64_t limit, Cancellation cancellation) {
   const auto size = archive_entry_size(entry_);
-  if (size < 0 || static_cast<std::uint64_t>(size) > limit || static_cast<std::uint64_t>(size) > std::numeric_limits<std::size_t>::max())
-   invalid("archive entry exceeds admission: " + member_);
+  if (size < 0 || static_cast<std::uint64_t>(size) > limit || static_cast<std::uint64_t>(size) > std::numeric_limits<std::size_t>::max()) invalid("archive entry exceeds admission: " + member_);
   bytes_.resize(static_cast<std::size_t>(size));
   std::size_t offset = 0;
   while (offset < bytes_.size()) {
@@ -141,9 +132,7 @@ private:
  std::string member_;
  std::vector<std::uint8_t> bytes_;
 };
-std::uint64_t unsigned_field(const Json& value, std::string_view name) {
- return mmltk::frameworks::serialization::decode_json_integer_exact<std::uint64_t>(value.at(std::string(name)));
-}
+std::uint64_t unsigned_field(const Json& value, std::string_view name) { return mmltk::frameworks::serialization::decode_json_integer_exact<std::uint64_t>(value.at(std::string(name))); }
 bool flag(const Json& object, std::string_view name, bool required = false) {
  auto field = object.find(std::string(name));
  if (field == object.end()) {
@@ -180,15 +169,14 @@ void segments_from_json(const Json& input, CoconutRecord& record, const CoconutI
  }
 }
 template <class T>
-concept InventoryRecord = std::same_as<T, CoconutPhysicalImage> || std::same_as<T, CoconutInventoryImage> || std::same_as<T, InventoryHeader> ||
-                          std::same_as<T, CoconutRecoveryImage> || std::same_as<T, CoconutRecoveredObject>;
+concept InventoryRecord = std::same_as<T, CoconutPhysicalImage> || std::same_as<T, CoconutInventoryImage> || std::same_as<T, InventoryHeader> || std::same_as<T, CoconutRecoveryImage> ||
+                          std::same_as<T, CoconutRecoveredObject>;
 // A single reflected little-endian encoding is used by hashing, writing and reading.
 // Strings carry checked uint32 lengths. Only a fixed buffer and the current row
 // are transient; records remain in their ordinary typed inventory owner.
 class InventoryOutput final {
 public:
- InventoryOutput(mmltk::common::io::FileHandle* file, Cancellation cancellation, bool count_only = false)
-     : file_(file), cancellation_(cancellation), count_only_(count_only) {}
+ InventoryOutput(mmltk::common::io::FileHandle* file, Cancellation cancellation, bool count_only = false) : file_(file), cancellation_(cancellation), count_only_(count_only) {}
  template <class T>
  void value(const T& item) {
   if constexpr (InventoryRecord<T>) {
@@ -255,8 +243,7 @@ private:
 };
 class InventoryInput final {
 public:
- InventoryInput(const std::filesystem::path& path, Cancellation cancellation)
-     : file_(mmltk::common::io::FileHandle::open_readonly(path.string())), cancellation_(cancellation) {
+ InventoryInput(const std::filesystem::path& path, Cancellation cancellation) : file_(mmltk::common::io::FileHandle::open_readonly(path.string())), cancellation_(cancellation) {
   const auto size = file_.size();
   if (size < 32) invalid("truncated inventory");
   content_size_ = size - 32;
@@ -338,9 +325,9 @@ InventoryHeader component_header(const CoconutComponent& component) {
  return header;
 }
 void validate_inventory_header(const InventoryHeader& header, const InventoryHeader& expected) {
- if (header.magic != expected.magic || header.version != expected.version || header.cache_schema != expected.cache_schema ||
-     header.normalization != expected.normalization || header.input_identity != expected.input_identity || header.edition != expected.edition ||
-     header.source != expected.source || header.shard != expected.shard || header.component != expected.component)
+ if (header.magic != expected.magic || header.version != expected.version || header.cache_schema != expected.cache_schema || header.normalization != expected.normalization ||
+     header.input_identity != expected.input_identity || header.edition != expected.edition || header.source != expected.source || header.shard != expected.shard ||
+     header.component != expected.component)
   invalid("inventory identity mismatch");
 }
 template <InventoryRecord T>
@@ -366,8 +353,8 @@ std::string component_identity(const CoconutComponent& component, Cancellation c
  return encode_inventory(output, component_header(component), std::span(component.inventory), cancellation, &component);
 }
 template <InventoryRecord T>
-std::string store_inventory(const std::filesystem::path& path, const InventoryHeader& header, std::span<const T> records, std::string_view expected_identity,
-                            Cancellation cancellation, const CoconutComponent* recovery = nullptr) {
+std::string store_inventory(const std::filesystem::path& path, const InventoryHeader& header, std::span<const T> records, std::string_view expected_identity, Cancellation cancellation,
+ const CoconutComponent* recovery = nullptr) {
  throw_if_benchmark_cancelled(cancellation);
  (void)mmltk::common::io::ensure_parent_directory(path);
  InventoryOutput extent(nullptr, cancellation, true);
@@ -387,8 +374,7 @@ std::string store_inventory(const std::filesystem::path& path, const InventoryHe
  return identity;
 }
 BenchmarkDatasetSource index_source(CoconutImageNamespace source) {
- return source == CoconutImageNamespace::Objects365V1 || source == CoconutImageNamespace::Objects365V2 ? BenchmarkDatasetSource::kObjects365V2
-                                                                                                       : BenchmarkDatasetSource::kCoco2017;
+ return source == CoconutImageNamespace::Objects365V1 || source == CoconutImageNamespace::Objects365V2 ? BenchmarkDatasetSource::kObjects365V2 : BenchmarkDatasetSource::kCoco2017;
 }
 std::string component_split(CoconutEdition edition, CoconutImageNamespace source) {
  return "coconut-" + std::to_string(static_cast<unsigned>(edition)) + "-" + std::to_string(static_cast<unsigned>(source));
@@ -417,8 +403,7 @@ void retain_inventory_rows(std::vector<Row>& rows, std::span<const std::size_t> 
 void retain_images(CoconutComponent& component, std::span<const std::size_t> order, Cancellation cancellation) {
  throw_if_benchmark_cancelled(cancellation);
  if (component.inventory.size() != component.index.images.size()) invalid("component inventory/image count mismatch");
- if (component.recovery_policy ? component.recovery.size() != component.inventory.size() : !component.recovery.empty())
-  invalid("component recovery/image count mismatch");
+ if (component.recovery_policy ? component.recovery.size() != component.inventory.size() : !component.recovery.empty()) invalid("component recovery/image count mismatch");
  bool increasing = true;
  for (std::size_t i = 0; i < order.size(); ++i) {
   throw_if_benchmark_cancelled(cancellation);
@@ -491,33 +476,29 @@ private:
     }
    }
    if (!match)
-    throw CoconutPhysicalMembershipError(request_.edition == CoconutEdition::Base ? CoconutImageNamespace::CocoTrain : CoconutImageNamespace::CocoValidation,
-                                         record.image_id, "missing physical COCO archive member: " + record.file_name);
+    throw CoconutPhysicalMembershipError(
+     request_.edition == CoconutEdition::Base ? CoconutImageNamespace::CocoTrain : CoconutImageNamespace::CocoValidation, record.image_id, "missing physical COCO archive member: " + record.file_name);
    return *match;
   }
   const auto name = objects_name(record.physical_stem);
-  if (request_.edition != CoconutEdition::ObjectsValidation && name.source != CoconutImageNamespace::Objects365V2)
-   invalid("training extension requires Objects365 v2");
+  if (request_.edition != CoconutEdition::ObjectsValidation && name.source != CoconutImageNamespace::Objects365V2) invalid("training extension requires Objects365 v2");
   const auto* found = request_.physical_membership->find(name.source, name.id);
   if (!found) throw CoconutPhysicalMembershipError(name.source, name.id, "missing physical Objects365 archive member: " + record.physical_stem);
   return *found;
  }
  void normalize(const CoconutRecord& record, const CoconutPhysicalImage& physical, std::span<const std::uint8_t> png) {
   const auto& limits = request_.limits;
-  if (png.size() > limits.max_png_bytes || png.size() > INT_MAX || png.size() < 26U || std::memcmp(png.data(), "\x89PNG\r\n\x1a\n", 8) != 0 || png[24] != 8 ||
-      png[25] != 2)
+  if (png.size() > limits.max_png_bytes || png.size() > INT_MAX || png.size() < 26U || std::memcmp(png.data(), "\x89PNG\r\n\x1a\n", 8) != 0 || png[24] != 8 || png[25] != 2)
    invalid("expected bounded 8-bit RGB panoptic PNG");
   int width = 0, height = 0, channels = 0;
   if (!stbi_info_from_memory(png.data(), static_cast<int>(png.size()), &width, &height, &channels) || width <= 0 || height <= 0 || channels != 3 ||
-      static_cast<unsigned>(width) > limits.max_dimension || static_cast<unsigned>(height) > limits.max_dimension ||
-      static_cast<std::uint64_t>(width) * height > limits.max_pixels || static_cast<std::uint64_t>(width) * height > UINT32_MAX)
+      static_cast<unsigned>(width) > limits.max_dimension || static_cast<unsigned>(height) > limits.max_dimension || static_cast<std::uint64_t>(width) * height > limits.max_pixels ||
+      static_cast<std::uint64_t>(width) * height > UINT32_MAX)
    invalid("PNG dimensions exceed admission");
-  if ((record.width && record.width != static_cast<unsigned>(width)) || (record.height && record.height != static_cast<unsigned>(height)))
-   invalid("declared and PNG dimensions disagree");
+  if ((record.width && record.width != static_cast<unsigned>(width)) || (record.height && record.height != static_cast<unsigned>(height))) invalid("declared and PNG dimensions disagree");
   if (record.segments.size() > limits.max_segments) invalid("segment count exceeds admission");
   throw_if_benchmark_cancelled(request_.cancellation);
-  std::unique_ptr<stbi_uc, decltype(&stbi_image_free)> pixels(stbi_load_from_memory(png.data(), static_cast<int>(png.size()), &width, &height, &channels, 3),
-                                                              stbi_image_free);
+  std::unique_ptr<stbi_uc, decltype(&stbi_image_free)> pixels(stbi_load_from_memory(png.data(), static_cast<int>(png.size()), &width, &height, &channels, 3), stbi_image_free);
   if (!pixels) invalid("cannot decode panoptic PNG");
   segment_by_id_.clear();
   if (support_.size() < record.segments.size()) support_.resize(record.segments.size());
@@ -573,8 +554,7 @@ private:
   }
   CoconutRecoveryImage recovery{physical.image_id, 0, {}};
   if (request_.recovery)
-   request_.recovery->apply(physical.source, record, static_cast<unsigned>(width), static_cast<unsigned>(height),
-                            std::span(support_).first(record.segments.size()), recovery, request_.cancellation);
+   request_.recovery->apply(physical.source, record, static_cast<unsigned>(width), static_cast<unsigned>(height), std::span(support_).first(record.segments.size()), recovery, request_.cancellation);
   auto& index = component.index;
   NormalizedImage image{physical.image_id, index.boxes.size(), 0, static_cast<unsigned>(width), static_cast<unsigned>(height), physical.shard, 0};
   for (std::size_t ordinal = 0; ordinal < record.segments.size(); ++ordinal) {
@@ -584,8 +564,7 @@ private:
    ++index.rejected.raw_records;
    if (!segment.isthing) continue;
    const auto& categories = coconut_categories().target_by_id;
-   if (segment.category_id >= categories.size() || categories[segment.category_id] < 0)
-    invalid("unknown COCO80 thing category " + std::to_string(segment.category_id));
+   if (segment.category_id >= categories.size() || categories[segment.category_id] < 0) invalid("unknown COCO80 thing category " + std::to_string(segment.category_id));
    if (segment.area && (!std::isfinite(*segment.area) || *segment.area < 0)) invalid("invalid supplied area");
    NormalizedBox box;
    if (support.recovered) {
@@ -595,8 +574,8 @@ private:
     box.y2 = support.recovered->y2;
    } else if (segment.bbox) {
     const auto& supplied = *segment.bbox;
-    if (!std::ranges::all_of(supplied, [](double value) { return std::isfinite(value); }) || supplied[2] <= 0 || supplied[3] <= 0 ||
-        !std::isfinite(supplied[0] + supplied[2]) || !std::isfinite(supplied[1] + supplied[3]))
+    if (!std::ranges::all_of(supplied, [](double value) { return std::isfinite(value); }) || supplied[2] <= 0 || supplied[3] <= 0 || !std::isfinite(supplied[0] + supplied[2]) ||
+        !std::isfinite(supplied[1] + supplied[3]))
      invalid("invalid authoritative COCO bbox");
     box.x1 = static_cast<float>(supplied[0] / width);
     box.y1 = static_cast<float>(supplied[1] / height);
@@ -628,8 +607,7 @@ private:
    box.mask_rle_pairs = static_cast<std::uint32_t>(support.runs.size());
    box.class_id = static_cast<std::uint8_t>(categories[segment.category_id]);
    box.flags = kAnnotationMask | kAnnotationId | kAnnotationCategory | (segment.crowd ? kAnnotationCrowd : 0U) | (segment.ignore ? kAnnotationIgnore : 0U);
-   box.original_area = support.recovered ? support.recovered->original_area
-                                        : support.carved ? static_cast<double>(support.area) : segment.area.value_or(static_cast<double>(support.area));
+   box.original_area = support.recovered ? support.recovered->original_area : support.carved ? static_cast<double>(support.area) : segment.area.value_or(static_cast<double>(support.area));
    box.annotation_id = segment.id;
    box.source_category_id = segment.category_id;
    box.source_ordinal = record.first_segment_ordinal + ordinal;
@@ -658,8 +636,7 @@ std::uint32_t dimension(const Json& image, std::string_view field, const Coconut
 // Parse one selected envelope row at a time. Returning false at object_end
 // immediately discards that row from the parser's array. Two sequential passes
 // permit either top-level field order without a release-sized JSON DOM.
-void json_rows(const CoconutImportRequest& request, std::span<const std::string_view> fields,
-               const std::function<void(std::string_view, const Json&)>& consume) {
+void json_rows(const CoconutImportRequest& request, std::span<const std::string_view> fields, const std::function<void(std::string_view, const Json&)>& consume) {
  std::ifstream input(request.annotation_json);
  if (!input) invalid("cannot open annotation JSON: " + request.annotation_json.string());
  std::size_t selected = fields.size();
@@ -687,8 +664,7 @@ void json_rows(const CoconutImportRequest& request, std::span<const std::string_
    record_events = 0;
   }
   if (depth >= 2 && ++record_events > static_cast<std::size_t>(request.limits.max_segments) * 32U + 128U) invalid("panoptic row exceeds segment admission");
-  if (event == Json::parse_event_t::value && value.is_string() && value.get_ref<const std::string&>().size() > 4096U)
-   invalid("panoptic text exceeds admission");
+  if (event == Json::parse_event_t::value && value.is_string() && value.get_ref<const std::string&>().size() > 4096U) invalid("panoptic text exceeds admission");
   if (depth == 2 && event == Json::parse_event_t::object_end) {
    consume(fields[selected], value);
    return false;
@@ -745,8 +721,7 @@ std::vector<CoconutRecord> json_records(const CoconutImportRequest& request) {
    if (!by_file.emplace(image.file_name, images.size()).second) invalid("duplicate JSON image filename");
   }
   image.physical_stem = physical_stem(row);
-  if (!image.physical_stem.empty() && !by_physical_stem.emplace(image.physical_stem, images.size()).second)
-   invalid("duplicate JSON physical image: " + image.physical_stem);
+  if (!image.physical_stem.empty() && !by_physical_stem.emplace(image.physical_stem, images.size()).second) invalid("duplicate JSON physical image: " + image.physical_stem);
   image.width = dimension(row, "width", request.limits);
   image.height = dimension(row, "height", request.limits);
   images.push_back(std::move(image));
@@ -814,8 +789,7 @@ std::vector<CoconutRecord> xlarge_records(const CoconutImportRequest& request) {
  while (archive.next(request.cancellation)) {
   if (!archive.regular() || !archive.member().starts_with(prefix) || !archive.member().ends_with(".json")) continue;
   const auto name = objects_name(archive.member());
-  if (name.source != CoconutImageNamespace::Objects365V2 || archive.member() != std::string(prefix) + name.stem + ".json")
-   invalid("unsupported XL info member: " + archive.member());
+  if (name.source != CoconutImageNamespace::Objects365V2 || archive.member() != std::string(prefix) + name.stem + ".json") invalid("unsupported XL info member: " + archive.member());
   CoconutRecord record;
   record.image_id = name.id;
   record.physical_stem = name.stem;
@@ -837,9 +811,7 @@ std::vector<CoconutRecord> xlarge_records(const CoconutImportRequest& request) {
  return result;
 }
 void consume_archive(const CoconutImportRequest& request, std::vector<CoconutRecord>& records, Importer& importer) {
- const std::string prefix = request.edition == CoconutEdition::XLarge  ? "coconuts_xlarge/panseg/"
-                            : request.edition == CoconutEdition::Large ? "panoptic_object365/"
-                                                                       : "panoptic_o365val_v3/";
+ const std::string prefix = request.edition == CoconutEdition::XLarge ? "coconuts_xlarge/panseg/" : request.edition == CoconutEdition::Large ? "panoptic_object365/" : "panoptic_o365val_v3/";
  std::unordered_map<std::string, std::size_t> wanted;
  for (std::size_t i = 0; i < records.size(); ++i) {
   throw_if_benchmark_cancelled(request.cancellation);
@@ -869,52 +841,49 @@ void validate_component(const CoconutComponent& component, Cancellation cancella
  throw_if_benchmark_cancelled(cancellation);
  (void)coconut_namespace_name(component.source);
  (void)coconut_release_component(component.edition);
- if (component.input_identity.empty() || component.index.images.size() != component.inventory.size() ||
-     component.index.source != index_source(component.source) || component.index.split != component_split(component.edition, component.source))
+ if (component.input_identity.empty() || component.index.images.size() != component.inventory.size() || component.index.source != index_source(component.source) ||
+     component.index.split != component_split(component.edition, component.source))
   invalid("component index/inventory admission mismatch");
  (void)mmltk::common::io::parse_sha256_hex(component.index.annotation_sha256);
  if (component.recovery_policy) {
-  if (component.recovery_policy != kCoconutRecoveryPolicy ||
-      (component.source != CoconutImageNamespace::CocoTrain && component.source != CoconutImageNamespace::CocoValidation) ||
-      component.recovery.size() != component.inventory.size()) invalid("invalid recovery source or image count");
+  if (component.recovery_policy != kCoconutRecoveryPolicy || (component.source != CoconutImageNamespace::CocoTrain && component.source != CoconutImageNamespace::CocoValidation) ||
+      component.recovery.size() != component.inventory.size())
+   invalid("invalid recovery source or image count");
   (void)mmltk::common::io::parse_sha256_hex(component.original_annotation_identity);
   for (std::size_t i = 0; i < component.recovery.size(); ++i) {
    throw_if_benchmark_cancelled(cancellation);
    const auto& fact = component.recovery[i];
    const auto& image = component.index.images[i];
-   if (fact.image_id != image.source_image_id || fact.unresolved > 65535U || fact.unresolved != fact.omissions.size() ||
-       fact.objects.size() > image.box_count || fact.objects.size() > 65535U - fact.omissions.size())
+   if (fact.image_id != image.source_image_id || fact.unresolved > 65535U || fact.unresolved != fact.omissions.size() || fact.objects.size() > image.box_count ||
+       fact.objects.size() > 65535U - fact.omissions.size())
     invalid("invalid image recovery facts");
    if (fact.objects.empty() && fact.omissions.empty()) continue;
    std::unordered_set<std::uint64_t> originals, annotations;
-   if (image.first_box > component.index.boxes.size() || image.box_count > component.index.boxes.size() - image.first_box)
-    invalid("invalid recovery image box extent");
+   if (image.first_box > component.index.boxes.size() || image.box_count > component.index.boxes.size() - image.first_box) invalid("invalid recovery image box extent");
    const auto boxes = std::span(component.index.boxes).subspan(static_cast<std::size_t>(image.first_box), image.box_count);
    std::unordered_map<std::uint64_t, const NormalizedBox*> by_annotation;
    by_annotation.reserve(boxes.size());
    for (const auto& box : boxes) by_annotation.emplace(box.annotation_id, &box);
    for (const auto& object : fact.omissions) {
-    if (object.original_annotation_id != 0 || object.source_category_id == 0 ||
-        !annotations.insert(object.annotation_id).second ||
-        by_annotation.contains(object.annotation_id))
+    if (object.original_annotation_id != 0 || object.source_category_id == 0 || !annotations.insert(object.annotation_id).second || by_annotation.contains(object.annotation_id))
      invalid("invalid omitted object identity");
    }
    for (const auto& object : fact.objects) {
     const auto found = by_annotation.find(object.annotation_id);
-    if (!originals.insert(object.original_annotation_id).second || !annotations.insert(object.annotation_id).second ||
-        found == by_annotation.end() || found->second->source_ordinal != object.source_ordinal ||
-        found->second->source_category_id != object.source_category_id) invalid("invalid recovered object identity");
+    if (!originals.insert(object.original_annotation_id).second || !annotations.insert(object.annotation_id).second || found == by_annotation.end() ||
+        found->second->source_ordinal != object.source_ordinal || found->second->source_category_id != object.source_category_id)
+     invalid("invalid recovered object identity");
    }
   }
- } else if (!component.original_annotation_identity.empty() || !component.recovery.empty()) invalid("unexpected recovery facts");
+ } else if (!component.original_annotation_identity.empty() || !component.recovery.empty())
+  invalid("unexpected recovery facts");
  std::unordered_set<std::uint64_t> ordinals;
  for (std::size_t i = 0; i < component.inventory.size(); ++i) {
   throw_if_benchmark_cancelled(cancellation);
   const auto& image = component.inventory[i];
   validate_physical(image.physical);
-  if (image.physical.source != component.source || image.physical.image_id != component.index.images[i].source_image_id ||
-      image.physical.shard != component.index.images[i].source_shard || !ordinals.insert(image.source_ordinal).second ||
-      (i && image.physical.image_id <= component.inventory[i - 1].physical.image_id))
+  if (image.physical.source != component.source || image.physical.image_id != component.index.images[i].source_image_id || image.physical.shard != component.index.images[i].source_shard ||
+      !ordinals.insert(image.source_ordinal).second || (i && image.physical.image_id <= component.inventory[i - 1].physical.image_id))
    invalid("invalid component image inventory");
  }
 }
@@ -922,15 +891,12 @@ void validate_component(const CoconutComponent& component, Cancellation cancella
 std::string coconut_component_input_identity(std::string_view base, CoconutImageNamespace source, const CoconutMaskRecovery* recovery) {
  const auto original = recovery ? recovery->original_identity(source) : std::string_view{};
  if (original.empty()) return std::string(base);
- const auto material = std::string(base) + "\nrecovery:" + std::to_string(kCoconutRecoveryPolicy) + "\n" +
-                       std::string(coconut_namespace_name(source)) + "\n" + std::string(original);
- return mmltk::common::io::sha256_hex(mmltk::common::io::sha256_bytes(
-  std::span(reinterpret_cast<const std::uint8_t*>(material.data()), material.size())));
+ const auto material = std::string(base) + "\nrecovery:" + std::to_string(kCoconutRecoveryPolicy) + "\n" + std::string(coconut_namespace_name(source)) + "\n" + std::string(original);
+ return mmltk::common::io::sha256_hex(mmltk::common::io::sha256_bytes(std::span(reinterpret_cast<const std::uint8_t*>(material.data()), material.size())));
 }
 std::string canonical_coconut_archive_member(std::string_view raw) {
  while (raw.starts_with("./")) raw.remove_prefix(2);
- if (raw.empty() || raw.front() == '/' || raw.find('\\') != std::string_view::npos || raw.find('\0') != std::string_view::npos)
-  invalid("unsafe archive member: " + std::string(raw));
+ if (raw.empty() || raw.front() == '/' || raw.find('\\') != std::string_view::npos || raw.find('\0') != std::string_view::npos) invalid("unsafe archive member: " + std::string(raw));
  std::filesystem::path path(raw);
  for (const auto& part : path)
   if (part == "..") invalid("traversing archive member: " + std::string(raw));
@@ -963,8 +929,7 @@ std::vector<CoconutComponent> import_coconut_annotations(const CoconutImportRequ
  Importer importer(request);
  if (request.edition == CoconutEdition::Base || request.edition == CoconutEdition::RelabeledValidation) {
   if (request.parquet_shards.empty()) invalid("missing Parquet shards");
-  read_coconut_parquet(request.parquet_shards, request.limits, request.cancellation,
-                       [&](const CoconutRecord& record, std::span<const std::uint8_t> png) { importer.consume(record, png); });
+  read_coconut_parquet(request.parquet_shards, request.limits, request.cancellation, [&](const CoconutRecord& record, std::span<const std::uint8_t> png) { importer.consume(record, png); });
  } else {
   auto records = request.edition == CoconutEdition::XLarge ? xlarge_records(request) : json_records(request);
   consume_archive(request, records, importer);
@@ -1000,9 +965,8 @@ std::uint64_t reconcile_coconut_extensions(std::vector<CoconutComponent>& compon
  throw_if_benchmark_cancelled(cancellation);
  return removed;
 }
-std::vector<CoconutPhysicalImage> coconut_image_archive_inventory(const std::filesystem::path& archive_path, const std::filesystem::path& cache_path,
-                                                                  CoconutImageNamespace source, std::uint16_t shard, std::string archive_identity,
-                                                                  Cancellation cancellation) {
+std::vector<CoconutPhysicalImage> coconut_image_archive_inventory(
+ const std::filesystem::path& archive_path, const std::filesystem::path& cache_path, CoconutImageNamespace source, std::uint16_t shard, std::string archive_identity, Cancellation cancellation) {
  if (archive_identity.empty()) invalid("archive inventory needs a physical identity");
  (void)coconut_namespace_name(source);
  throw_if_benchmark_cancelled(cancellation);
@@ -1025,8 +989,7 @@ std::vector<CoconutPhysicalImage> coconut_image_archive_inventory(const std::fil
     CoconutPhysicalImage image;
     input.value(image);
     validate_physical(image);
-    if (image.source != source || image.shard != shard || image.archive_identity != archive_identity ||
-        (!result.empty() && image.image_id <= result.back().image_id))
+    if (image.source != source || image.shard != shard || image.archive_identity != archive_identity || (!result.empty() && image.image_id <= result.back().image_id))
      invalid("invalid cached archive inventory");
     result.push_back(std::move(image));
    }
@@ -1063,35 +1026,26 @@ std::vector<CoconutPhysicalImage> coconut_image_archive_inventory(const std::fil
 }
 void store_coconut_component(const std::filesystem::path& index_path, const CoconutComponent& component, Cancellation cancellation) {
  validate_component(component, cancellation);
- const auto identity = store_inventory(index_path.string() + ".inventory", component_header(component), std::span(component.inventory),
-                                       component.index.annotation_sha256, cancellation, &component);
+ const auto identity = store_inventory(index_path.string() + ".inventory", component_header(component), std::span(component.inventory), component.index.annotation_sha256, cancellation, &component);
  throw_if_benchmark_cancelled(cancellation);
  store_normalized_annotation_index(index_path, component.index, cancellation);
  // The existing index completion jointly admits the binary inventory. A base
  // completion alone cannot be admitted if publication is interrupted here.
  const auto manifest_path = std::filesystem::path(index_path.string() + ".complete.json");
  auto manifest = read_json_file(manifest_path);
- manifest["coconut"] = {{"edition", component.edition},
-                        {"source", component.source},
-                        {"input_identity", component.input_identity},
-                        {"normalization", kCoconutNormalizationRevision},
-                        {"inventory_identity", identity},
-                        {"inventory_count", component.inventory.size()},
-                        {"recovery_policy", component.recovery_policy},
-                        {"original_annotation_identity", component.original_annotation_identity},
-                        {"recovery_images", component.recovery.size()}};
+ manifest["coconut"] = {{"edition", component.edition}, {"source", component.source}, {"input_identity", component.input_identity}, {"normalization", kCoconutNormalizationRevision},
+  {"inventory_identity", identity}, {"inventory_count", component.inventory.size()}, {"recovery_policy", component.recovery_policy},
+  {"original_annotation_identity", component.original_annotation_identity}, {"recovery_images", component.recovery.size()}};
  throw_if_benchmark_cancelled(cancellation);
  write_json_atomically(manifest_path, manifest, cancellation);
 }
-std::optional<CoconutComponent> load_coconut_component(const std::filesystem::path& index_path, CoconutEdition edition, CoconutImageNamespace source,
-                                                       std::string_view input_identity, Cancellation cancellation) {
+std::optional<CoconutComponent> load_coconut_component(
+ const std::filesystem::path& index_path, CoconutEdition edition, CoconutImageNamespace source, std::string_view input_identity, Cancellation cancellation) {
  throw_if_benchmark_cancelled(cancellation);
  try {
   const auto manifest = read_json_file(index_path.string() + ".complete.json");
   const auto& facts = manifest.at("coconut");
-  if (facts.at("edition") != edition || facts.at("source") != source || facts.at("input_identity") != input_identity ||
-      facts.at("normalization") != kCoconutNormalizationRevision)
-   return std::nullopt;
+  if (facts.at("edition") != edition || facts.at("source") != source || facts.at("input_identity") != input_identity || facts.at("normalization") != kCoconutNormalizationRevision) return std::nullopt;
   CoconutComponent component;
   component.edition = edition;
   component.source = source;
@@ -1117,10 +1071,12 @@ std::optional<CoconutComponent> load_coconut_component(const std::filesystem::pa
    input.value(component.original_annotation_identity);
    std::uint64_t count = 0;
    input.value(count);
-   if (count != header.count || facts.at("recovery_images") != count ||
-       facts.at("original_annotation_identity") != component.original_annotation_identity) invalid("invalid recovery completion");
+   if (count != header.count || facts.at("recovery_images") != count || facts.at("original_annotation_identity") != component.original_annotation_identity) invalid("invalid recovery completion");
    component.recovery.resize(static_cast<std::size_t>(count));
-   for (auto& image : component.recovery) { throw_if_benchmark_cancelled(cancellation); input.value(image); }
+   for (auto& image : component.recovery) {
+    throw_if_benchmark_cancelled(cancellation);
+    input.value(image);
+   }
   }
   const auto identity = input.finish();
   if (facts.at("inventory_identity") != identity) invalid("component inventory completion mismatch");

@@ -104,8 +104,7 @@ public:
  [[nodiscard]] SystemImageModel* model() noexcept;
  [[nodiscard]] std::array<ImageCopyPath, 2U> CopyFrom(BorrowedImageProductReadView);
  [[nodiscard]] std::array<ImageCopyPath, 2U> CopyFrom(OutputCandidate&, BorrowedImageProductReadView);
- [[nodiscard]] std::array<ImageCopyPath, 2U> CopyInputFrom(BorrowedImageProductReadView, ImageProductBuffer::MissingPlaneSubmit = {},
-                                                           bool preserve_clean = false);
+ [[nodiscard]] std::array<ImageCopyPath, 2U> CopyInputFrom(BorrowedImageProductReadView, ImageProductBuffer::MissingPlaneSubmit = {}, bool preserve_clean = false);
  void Publish(std::uint32_t width, std::uint32_t height, ImageProductBuffer::ProductSubmit);
 
 private:

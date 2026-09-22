@@ -44,11 +44,8 @@ struct PidfdWaitResult final {
 };
 inline void arm_timerfd(const int descriptor, const std::chrono::nanoseconds duration, const std::string_view purpose) {
  const auto count = duration.count();
- const itimerspec specification{.it_interval = {},
-                                .it_value = {.tv_sec = static_cast<time_t>(count / 1'000'000'000LL), .tv_nsec = static_cast<long>(count % 1'000'000'000LL)}};
- if (::timerfd_settime(descriptor, 0, &specification, nullptr) != 0) {
-  throw std::runtime_error(std::string{"failed to arm "} + std::string{purpose} + ": " + std::strerror(errno));
- }
+ const itimerspec specification{.it_interval = {}, .it_value = {.tv_sec = static_cast<time_t>(count / 1'000'000'000LL), .tv_nsec = static_cast<long>(count % 1'000'000'000LL)}};
+ if (::timerfd_settime(descriptor, 0, &specification, nullptr) != 0) { throw std::runtime_error(std::string{"failed to arm "} + std::string{purpose} + ": " + std::strerror(errno)); }
 }
 [[nodiscard]] inline bool consume_timerfd(const int descriptor) noexcept {
  const auto received = mmltk::common::io::read_counter_fd(descriptor);

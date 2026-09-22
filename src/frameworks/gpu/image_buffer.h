@@ -44,17 +44,14 @@ public:
  [[nodiscard]] virtual ImagePlaneView AllocatePlane(std::uintptr_t context, ImagePlaneKind kind, std::uint32_t width, std::uint32_t height) = 0;
  virtual void FreePlane(std::uintptr_t context, CUdeviceptr data) noexcept = 0;
  virtual void ClearPlane(std::uintptr_t context, std::uintptr_t stream, const ImagePlaneView&) = 0;
- [[nodiscard]] virtual std::shared_ptr<void> AllocatePinned(std::uintptr_t receiver_context,
-                                                            const mmltk::common::system::ExecutionPlacement* receiver_placement, std::size_t bytes) = 0;
+ [[nodiscard]] virtual std::shared_ptr<void> AllocatePinned(std::uintptr_t receiver_context, const mmltk::common::system::ExecutionPlacement* receiver_placement, std::size_t bytes) = 0;
  [[nodiscard]] virtual bool CanAccessPeer(int receiver, int source) = 0;
  virtual void WaitEvent(std::uintptr_t receiver_context, std::uintptr_t receiver_stream, std::uintptr_t source_event) = 0;
- virtual void CopySameDevice(std::uintptr_t context, std::uintptr_t stream, const ImagePlaneView& destination, std::uintptr_t source_context,
-                             const ImagePlaneView& source) = 0;
- virtual void CopyPeer(std::uintptr_t receiver_context, std::uintptr_t receiver_stream, int receiver_device, const ImagePlaneView& destination,
-                       std::uintptr_t source_context, int source_device, const ImagePlaneView& source) = 0;
+ virtual void CopySameDevice(std::uintptr_t context, std::uintptr_t stream, const ImagePlaneView& destination, std::uintptr_t source_context, const ImagePlaneView& source) = 0;
+ virtual void CopyPeer(std::uintptr_t receiver_context, std::uintptr_t receiver_stream, int receiver_device, const ImagePlaneView& destination, std::uintptr_t source_context, int source_device,
+  const ImagePlaneView& source) = 0;
  virtual void CopyDeviceToHost(std::uintptr_t source_context, const ImagePlaneView& source, void* destination, std::size_t destination_pitch) = 0;
- virtual void CopyHostToDevice(std::uintptr_t receiver_context, std::uintptr_t receiver_stream, const void* source, std::size_t source_pitch,
-                               const ImagePlaneView& destination) = 0;
+ virtual void CopyHostToDevice(std::uintptr_t receiver_context, std::uintptr_t receiver_stream, const void* source, std::size_t source_pitch, const ImagePlaneView& destination) = 0;
  virtual void RecordEvent(std::uintptr_t context, std::uintptr_t stream, std::uintptr_t event) = 0;
  virtual void SynchronizeEvent(std::uintptr_t context, std::uintptr_t event) = 0;
  // Terminal notification runs on success and execution/context error.
@@ -68,8 +65,7 @@ public:
 [[nodiscard]] std::shared_ptr<ImageCopyBackend> cuda_image_copy_backend();
 class DeviceContext final {
 public:
- DeviceContext(int device, std::shared_ptr<ImageCopyBackend> backend, DeviceContextMode mode = DeviceContextMode::Isolated, int numa_node = -1,
-               std::optional<DeviceExecution> execution = {});
+ DeviceContext(int device, std::shared_ptr<ImageCopyBackend> backend, DeviceContextMode mode = DeviceContextMode::Isolated, int numa_node = -1, std::optional<DeviceExecution> execution = {});
  ~DeviceContext();
  DeviceContext(const DeviceContext&) noexcept = default;
  DeviceContext& operator=(const DeviceContext&) noexcept = default;
@@ -262,9 +258,8 @@ private:
  friend class ImageStream;
  void PublishAs(ImageStream&, std::uint32_t, std::uint32_t, std::uint64_t, bool, ProductSubmit);
  [[nodiscard]] std::array<ImageAllocation, 2U> Allocations() const;
- [[nodiscard]] std::array<ImageCopyPath, 2U> CopyFromAs(ImageStream&, BorrowedImageProductReadView, MissingPlaneSubmit, std::uint64_t,
-                                                        bool preserve_clean = false, ImagePlanePreservation = ImagePlanePreservation::All,
-                                                        const ImageWorkspaceCoverage* display_coverage = nullptr);
+ [[nodiscard]] std::array<ImageCopyPath, 2U> CopyFromAs(ImageStream&, BorrowedImageProductReadView, MissingPlaneSubmit, std::uint64_t, bool preserve_clean = false,
+  ImagePlanePreservation = ImagePlanePreservation::All, const ImageWorkspaceCoverage* display_coverage = nullptr);
  [[nodiscard]] bool writable() const;
  [[nodiscard]] bool ReserveWorkspaceWrite();
  void CancelWorkspaceWrite() noexcept;

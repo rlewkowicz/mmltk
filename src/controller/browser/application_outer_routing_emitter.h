@@ -40,46 +40,20 @@ void emit_application_outer_routing(Writer& writer) {
   writer.reserve("module", symbol, "event " + std::string(Identity::system_cell::name) + "." + writer.template native_source<Event>());
   output << "pub const " << symbol << ": u64 = " << Identity::event_id << ";\n";
  });
- for (const std::string_view symbol : {"ApplicationSystem",
-                                       "ApplicationEndpoint",
-                                       "ApplicationIntentEndpoint",
-                                       "EncodedApplicationIntent",
-                                       "application_system_stable_id",
-                                       "application_system_from_stable_id",
-                                       "application_endpoint_stable_id",
-                                       "application_intent_endpoint_stable_id",
-                                       "decode_application_intent_endpoint",
-                                       "application_intent_system",
-                                       "application_reply_endpoint",
-                                       "ApplicationSnapshot",
-                                       "ApplicationEvent",
-                                       "ApplicationReply",
-                                       "APPLICATION_SNAPSHOT_COUNT",
-                                       "application_snapshot_kind",
-                                       "application_snapshot_system",
-                                       "application_event_system",
-                                       "application_bootstrap_complete",
-                                       "decode_application_snapshot",
-                                       "decode_application_event",
-                                       "application_event_delivery",
-                                       "decode_application_reply",
-                                       "dispatch_application_snapshot",
-                                       "dispatch_application_event",
-                                       "dispatch_application_reply",
-                                       "ApplicationProjection"}) {
+ for (const std::string_view symbol : {"ApplicationSystem", "ApplicationEndpoint", "ApplicationIntentEndpoint", "EncodedApplicationIntent", "application_system_stable_id",
+       "application_system_from_stable_id", "application_endpoint_stable_id", "application_intent_endpoint_stable_id", "decode_application_intent_endpoint", "application_intent_system",
+       "application_reply_endpoint", "ApplicationSnapshot", "ApplicationEvent", "ApplicationReply", "APPLICATION_SNAPSHOT_COUNT", "application_snapshot_kind", "application_snapshot_system",
+       "application_event_system", "application_bootstrap_complete", "decode_application_snapshot", "decode_application_event", "application_event_delivery", "decode_application_reply",
+       "dispatch_application_snapshot", "dispatch_application_event", "dispatch_application_reply", "ApplicationProjection"}) {
   writer.reserve("module", symbol, "generated application outer routing");
  }
  output << "\n#[derive(Debug, Clone, Copy, PartialEq, Eq)]\npub enum ApplicationSystem {\n";
  Schema::VisitSystems([&]<class SystemCell, std::meta::info Snapshot>() { output << "    " << variant(SystemCell::name) << ",\n"; });
  output << "}\npub const fn application_system_stable_id(system: ApplicationSystem) -> u64 { match system {\n";
- Schema::VisitSystems([&]<class SystemCell, std::meta::info Snapshot>() {
-  output << "    ApplicationSystem::" << variant(SystemCell::name) << " => " << SystemCell::stable_id << ",\n";
- });
+ Schema::VisitSystems([&]<class SystemCell, std::meta::info Snapshot>() { output << "    ApplicationSystem::" << variant(SystemCell::name) << " => " << SystemCell::stable_id << ",\n"; });
  output << "} }\npub const fn application_system_from_stable_id(stable_id: u64) -> Option<ApplicationSystem> { "
            "match stable_id {\n";
- Schema::VisitSystems([&]<class SystemCell, std::meta::info Snapshot>() {
-  output << "    " << SystemCell::stable_id << " => Some(ApplicationSystem::" << variant(SystemCell::name) << "),\n";
- });
+ Schema::VisitSystems([&]<class SystemCell, std::meta::info Snapshot>() { output << "    " << SystemCell::stable_id << " => Some(ApplicationSystem::" << variant(SystemCell::name) << "),\n"; });
  output << "    _ => None, } }\n"
            "#[derive(Debug, Clone, Copy, PartialEq, Eq)]\npub enum ApplicationEndpoint {\n";
  Schema::VisitEndpoints([&]<class Endpoint>() { output << "    " << variant(Endpoint::system_cell::name, Endpoint::name) << ",\n"; });
@@ -88,27 +62,22 @@ void emit_application_outer_routing(Writer& writer) {
   if constexpr (!Endpoint::interaction) output << "    " << variant(Endpoint::system_cell::name, Endpoint::name) << ",\n";
  });
  output << "}\npub const fn application_endpoint_stable_id(endpoint: ApplicationEndpoint) -> u64 { match endpoint {\n";
- Schema::VisitEndpoints([&]<class Endpoint>() {
-  output << "    ApplicationEndpoint::" << variant(Endpoint::system_cell::name, Endpoint::name) << " => " << Endpoint::stable_id << ",\n";
- });
+ Schema::VisitEndpoints([&]<class Endpoint>() { output << "    ApplicationEndpoint::" << variant(Endpoint::system_cell::name, Endpoint::name) << " => " << Endpoint::stable_id << ",\n"; });
  output << "} }\npub const fn decode_application_intent_endpoint(stable_id: u64) "
            "-> Option<ApplicationIntentEndpoint> { match stable_id {\n";
  Schema::VisitEndpoints([&]<class Endpoint>() {
-  if constexpr (!Endpoint::interaction)
-   output << "    " << Endpoint::stable_id << " => Some(ApplicationIntentEndpoint::" << variant(Endpoint::system_cell::name, Endpoint::name) << "),\n";
+  if constexpr (!Endpoint::interaction) output << "    " << Endpoint::stable_id << " => Some(ApplicationIntentEndpoint::" << variant(Endpoint::system_cell::name, Endpoint::name) << "),\n";
  });
  output << "    _ => None, } }\npub const fn application_intent_endpoint_stable_id("
            "endpoint: ApplicationIntentEndpoint) -> u64 { match endpoint {\n";
  Schema::VisitEndpoints([&]<class Endpoint>() {
-  if constexpr (!Endpoint::interaction)
-   output << "    ApplicationIntentEndpoint::" << variant(Endpoint::system_cell::name, Endpoint::name) << " => " << Endpoint::stable_id << ",\n";
+  if constexpr (!Endpoint::interaction) output << "    ApplicationIntentEndpoint::" << variant(Endpoint::system_cell::name, Endpoint::name) << " => " << Endpoint::stable_id << ",\n";
  });
  output << "} }\npub const fn application_intent_system(endpoint: ApplicationIntentEndpoint) "
            "-> ApplicationSystem { match endpoint {\n";
  Schema::VisitEndpoints([&]<class Endpoint>() {
   if constexpr (!Endpoint::interaction)
-   output << "    ApplicationIntentEndpoint::" << variant(Endpoint::system_cell::name, Endpoint::name)
-          << " => ApplicationSystem::" << variant(Endpoint::system_cell::name) << ",\n";
+   output << "    ApplicationIntentEndpoint::" << variant(Endpoint::system_cell::name, Endpoint::name) << " => ApplicationSystem::" << variant(Endpoint::system_cell::name) << ",\n";
  });
  output << "} }\n#[derive(Debug, Clone, PartialEq)]\npub struct EncodedApplicationIntent { "
            "pub endpoint: ApplicationIntentEndpoint, pub record: Intent }\n";
@@ -121,17 +90,13 @@ void emit_application_outer_routing(Writer& writer) {
   output << "    " << name << '(' << writer.template rust_type<typename Signature::result_type>() << "),\n";
   ++snapshot_count;
  });
- output << "}\npub const APPLICATION_SNAPSHOT_COUNT: usize = " << snapshot_count
-        << ";\npub const fn application_snapshot_kind(value: &ApplicationSnapshot) -> usize { match value {\n";
+ output << "}\npub const APPLICATION_SNAPSHOT_COUNT: usize = " << snapshot_count << ";\npub const fn application_snapshot_kind(value: &ApplicationSnapshot) -> usize { match value {\n";
  std::size_t snapshot_kind = 0U;
- Schema::VisitSystems([&]<class SystemCell, std::meta::info Snapshot>() {
-  output << "    ApplicationSnapshot::" << variant(SystemCell::name) << "(_) => " << snapshot_kind++ << ",\n";
- });
+ Schema::VisitSystems([&]<class SystemCell, std::meta::info Snapshot>() { output << "    ApplicationSnapshot::" << variant(SystemCell::name) << "(_) => " << snapshot_kind++ << ",\n"; });
  output << "} }\npub const fn application_snapshot_system(value: &ApplicationSnapshot) -> ApplicationSystem { "
            "match value {\n";
- Schema::VisitSystems([&]<class SystemCell, std::meta::info Snapshot>() {
-  output << "    ApplicationSnapshot::" << variant(SystemCell::name) << "(_) => ApplicationSystem::" << variant(SystemCell::name) << ",\n";
- });
+ Schema::VisitSystems(
+  [&]<class SystemCell, std::meta::info Snapshot>() { output << "    ApplicationSnapshot::" << variant(SystemCell::name) << "(_) => ApplicationSystem::" << variant(SystemCell::name) << ",\n"; });
  output << "} }\npub fn application_bootstrap_complete(values: &[ApplicationSnapshot]) -> bool {\n"
            "    if values.len() != APPLICATION_SNAPSHOT_COUNT { return false; }\n"
            "    let mut seen = [false; APPLICATION_SNAPSHOT_COUNT];\n"
@@ -162,14 +127,12 @@ void emit_application_outer_routing(Writer& writer) {
            "match reply {\n";
  Schema::VisitEndpoints([&]<class Endpoint>() {
   if constexpr (!Endpoint::interaction)
-   output << "    ApplicationReply::" << variant(Endpoint::system_cell::name, Endpoint::name)
-          << "(_) => ApplicationIntentEndpoint::" << variant(Endpoint::system_cell::name, Endpoint::name) << ",\n";
+   output << "    ApplicationReply::" << variant(Endpoint::system_cell::name, Endpoint::name) << "(_) => ApplicationIntentEndpoint::" << variant(Endpoint::system_cell::name, Endpoint::name) << ",\n";
  });
  output << "} }\n\npub fn decode_application_snapshot(system_id: u64, value: Value) "
            "-> Result<ApplicationSnapshot, String> { match system_id {\n";
  Schema::VisitSystems([&]<class SystemCell, std::meta::info Snapshot>() {
-  output << "    " << SystemCell::stable_id << " => Ok(ApplicationSnapshot::" << variant(SystemCell::name)
-         << "(FromApplicationValue::from_application_transport_value(value)?)),\n";
+  output << "    " << SystemCell::stable_id << " => Ok(ApplicationSnapshot::" << variant(SystemCell::name) << "(FromApplicationValue::from_application_transport_value(value)?)),\n";
  });
  output << "    _ => Err(\"unknown application snapshot\".into()), } }\n"
            "pub fn decode_application_event(system_id: u64, event_id: u64, value: Value) "
@@ -183,8 +146,7 @@ void emit_application_outer_routing(Writer& writer) {
            "pub fn application_event_delivery(system_id: u64, event_id: u64) -> Option<EventDelivery> { "
            "match (system_id, event_id) {\n";
  Schema::VisitEvents([&]<class Identity, class Event>(const mmltk::controller::contracts::reflection::Event metadata) {
-  output << "    (" << Identity::system_id << ", " << Identity::event_id
-         << ") => Some(EventDelivery::" << mmltk::frameworks::reflection::enum_name(metadata.delivery) << "),\n";
+  output << "    (" << Identity::system_id << ", " << Identity::event_id << ") => Some(EventDelivery::" << mmltk::frameworks::reflection::enum_name(metadata.delivery) << "),\n";
  });
  output << "    _ => None, } }\npub fn decode_application_reply(endpoint_id: u64, value: Value) "
            "-> Result<ApplicationReply, String> { match endpoint_id {\n";
@@ -199,8 +161,8 @@ void emit_application_outer_routing(Writer& writer) {
   const auto trait = system_trait(SystemCell::name);
   writer.reserve("module", trait, "system " + std::string(SystemCell::name) + " static projection");
   output << "pub trait " << trait << "<Error> {\n"
-         << "    fn project_" << writer.identifier(SystemCell::name, false)
-         << "_snapshot(&mut self, value: " << writer.template rust_type<typename Signature::result_type>() << ") -> Result<(), Error>;\n"
+         << "    fn project_" << writer.identifier(SystemCell::name, false) << "_snapshot(&mut self, value: " << writer.template rust_type<typename Signature::result_type>()
+         << ") -> Result<(), Error>;\n"
          << "    fn project_" << writer.identifier(SystemCell::name, false) << "_event(&mut self, event: ApplicationEvent);\n"
          << "    fn project_" << writer.identifier(SystemCell::name, false) << "_reply(&mut self, correlation: u64, reply: ApplicationReply);\n"
          << "}\n";
@@ -222,23 +184,21 @@ void emit_application_outer_routing(Writer& writer) {
  output << " {}\npub fn dispatch_application_snapshot<T, Error>(target: &mut T, snapshot: ApplicationSnapshot) "
            "-> Result<(), Error> where T: ApplicationProjection<Error> { match snapshot {\n";
  Schema::VisitSystems([&]<class SystemCell, std::meta::info Snapshot>() {
-  output << "    ApplicationSnapshot::" << variant(SystemCell::name) << "(value) => target.project_" << writer.identifier(SystemCell::name, false)
-         << "_snapshot(value),\n";
+  output << "    ApplicationSnapshot::" << variant(SystemCell::name) << "(value) => target.project_" << writer.identifier(SystemCell::name, false) << "_snapshot(value),\n";
  });
  output << "} }\npub fn dispatch_application_event<T, Error>(target: &mut T, event: ApplicationEvent) "
            "where T: ApplicationProjection<Error> { match event {\n";
  Schema::VisitEvents([&]<class Identity, class Event>(const auto&) {
   const auto name = variant(Identity::system_cell::name, mmltk::frameworks::serialization::reflected_schema_type_name<Event>());
-  output << "    ApplicationEvent::" << name << "(value) => target.project_" << writer.identifier(Identity::system_cell::name, false)
-         << "_event(ApplicationEvent::" << name << "(value)),\n";
+  output << "    ApplicationEvent::" << name << "(value) => target.project_" << writer.identifier(Identity::system_cell::name, false) << "_event(ApplicationEvent::" << name << "(value)),\n";
  });
  output << "} }\npub fn dispatch_application_reply<T, Error>(target: &mut T, correlation: u64, "
            "reply: ApplicationReply) where T: ApplicationProjection<Error> { match reply {\n";
  Schema::VisitEndpoints([&]<class Endpoint>() {
   if constexpr (!Endpoint::interaction) {
    const auto name = variant(Endpoint::system_cell::name, Endpoint::name);
-   output << "    ApplicationReply::" << name << "(value) => target.project_" << writer.identifier(Endpoint::system_cell::name, false)
-          << "_reply(correlation, ApplicationReply::" << name << "(value)),\n";
+   output << "    ApplicationReply::" << name << "(value) => target.project_" << writer.identifier(Endpoint::system_cell::name, false) << "_reply(correlation, ApplicationReply::" << name
+          << "(value)),\n";
   }
  });
  output << "} }\n";

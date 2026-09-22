@@ -95,8 +95,8 @@ void capture_sdp_backend_flags(EvaluationProfileRecord& profile) {
 }
 void accumulate_prediction_transfer_bytes(EvaluationProfileRecord& profile, const PostprocessedBatch& processed, const size_t image_count) {
  const size_t prediction_count = image_count * static_cast<size_t>(processed.scores.size(1));
- const size_t bbox_bytes = prediction_count * (static_cast<size_t>(processed.scores.element_size()) + static_cast<size_t>(processed.labels.element_size()) +
-                                               4U * static_cast<size_t>(processed.boxes.element_size()));
+ const size_t bbox_bytes =
+  prediction_count * (static_cast<size_t>(processed.scores.element_size()) + static_cast<size_t>(processed.labels.element_size()) + 4U * static_cast<size_t>(processed.boxes.element_size()));
  size_t mask_bytes = 0;
  if (processed.masks.has_value()) {
   const size_t pixels_per_mask = static_cast<size_t>(processed.masks->size(2)) * static_cast<size_t>(processed.masks->size(3));
@@ -137,8 +137,7 @@ void EvaluationCudaBatchTiming::accumulate(EvaluationProfileRecord& profile) con
 }
 double EvaluationCudaBatchTiming::elapsed_seconds(const Phase phase) const {
  float elapsed_milliseconds = 0.0F;
- ensure_cuda_ok(cudaEventElapsedTime(&elapsed_milliseconds, events_[event_index(phase, false)], events_[event_index(phase, true)]),
-                "cudaEventElapsedTime for validation profile phase");
+ ensure_cuda_ok(cudaEventElapsedTime(&elapsed_milliseconds, events_[event_index(phase, false)], events_[event_index(phase, true)]), "cudaEventElapsedTime for validation profile phase");
  return static_cast<double>(elapsed_milliseconds) / 1000.0;
 }
 void EvaluationCudaBatchTiming::destroy_events() noexcept {
@@ -165,9 +164,7 @@ EvaluationCudaTimingLease EvaluationCudaTimingPool::acquire() {
  return EvaluationCudaTimingLease{slots_[slot_index].get(), slot_index};
 }
 void EvaluationCudaTimingPool::release(EvaluationCudaTimingLease& lease) {
- if (!lease || lease.slot_index >= slots_.size() || slots_[lease.slot_index].get() != lease.timing) {
-  throw std::logic_error("invalid validation CUDA timing lease release");
- }
+ if (!lease || lease.slot_index >= slots_.size() || slots_[lease.slot_index].get() != lease.timing) { throw std::logic_error("invalid validation CUDA timing lease release"); }
  free_slots_.push_back(lease.slot_index);
  lease = {};
 }
@@ -176,8 +173,7 @@ struct SelectedPredictions {
  std::vector<Prediction> predictions;
  std::vector<int64_t> mask_source_indices;
 };
-SelectedPredictions select_predictions(int image_id, const torch::Tensor& scores, const torch::Tensor& labels, const torch::Tensor& boxes,
-                                       size_t category_count) {
+SelectedPredictions select_predictions(int image_id, const torch::Tensor& scores, const torch::Tensor& labels, const torch::Tensor& boxes, size_t category_count) {
  mmltk::common::logging::ScopedProfile profile_rfdetr_native_eval_select_predictions{"rfdetr.native.eval.select_predictions"};
  const auto* score_ptr = scores.data_ptr<float>();
  const auto* label_ptr = labels.data_ptr<int64_t>();
@@ -205,9 +201,7 @@ PredictionBufferSlotPool::PredictionBufferSlotPool(const size_t slot_count, cons
  if (config.batch_capacity <= 0 || config.prediction_capacity <= 0 || config.device_id < 0) {
   throw std::invalid_argument("prediction buffer configuration requires positive batch and prediction capacity");
  }
- if (config.mask_shape && (config.mask_shape->first == 0 || config.mask_shape->second == 0)) {
-  throw std::invalid_argument("prediction mask buffer configuration requires positive dimensions");
- }
+ if (config.mask_shape && (config.mask_shape->first == 0 || config.mask_shape->second == 0)) { throw std::invalid_argument("prediction mask buffer configuration requires positive dimensions"); }
  CudaGuard device_guard(checked_device_index(config.device_id));
  slots_.reserve(slot_count);
  const auto& mask_shape = config.mask_shape;
@@ -217,8 +211,7 @@ PredictionBufferSlotPool::PredictionBufferSlotPool(const size_t slot_count, cons
   slot->bbox.ensure_capacity(config.batch_capacity, config.prediction_capacity);
   if (mask_shape) {
    PinnedMaskPredictionBuffers& mask_buffers = slot->mask.emplace();
-   mask_buffers.ensure_capacity(config.batch_capacity, config.prediction_capacity, config.batch_capacity, config.prediction_capacity, mask_shape->first,
-                                mask_shape->second, config.device_id);
+   mask_buffers.ensure_capacity(config.batch_capacity, config.prediction_capacity, config.batch_capacity, config.prediction_capacity, mask_shape->first, mask_shape->second, config.device_id);
   }
   slot->ensure_ready_event(config.device_id);
   slots_.push_back(std::move(slot));
@@ -252,17 +245,14 @@ void PredictionBufferSlotPool::release(size_t slot_index) {
 PinnedPredictionBuffers::~PinnedPredictionBuffers() {
  if (ready_event != nullptr) {
   int previous_device_id = -1;
-  const bool restore_device = event_device_id >= 0 && cudaGetDevice(&previous_device_id) == cudaSuccess && previous_device_id != event_device_id &&
-                              cudaSetDevice(event_device_id) == cudaSuccess;
+  const bool restore_device = event_device_id >= 0 && cudaGetDevice(&previous_device_id) == cudaSuccess && previous_device_id != event_device_id && cudaSetDevice(event_device_id) == cudaSuccess;
   cudaEventDestroy(ready_event);
   if (restore_device) { cudaSetDevice(previous_device_id); }
   ready_event = nullptr;
  }
 }
 void PinnedBBoxPredictionBuffers::ensure_capacity(int64_t batch_count, int64_t prediction_count) {
- if (batch_capacity >= batch_count && prediction_capacity >= prediction_count && scores_cpu.defined() && labels_cpu.defined() && boxes_cpu.defined()) {
-  return;
- }
+ if (batch_capacity >= batch_count && prediction_capacity >= prediction_count && scores_cpu.defined() && labels_cpu.defined() && boxes_cpu.defined()) { return; }
  batch_capacity = std::max<int64_t>(batch_capacity, batch_count);
  prediction_capacity = std::max<int64_t>(prediction_capacity, prediction_count);
  scores_cpu = mmltk::backend::ml::cuda::numa_empty({batch_capacity, prediction_capacity}, torch::kFloat32);
@@ -270,15 +260,12 @@ void PinnedBBoxPredictionBuffers::ensure_capacity(int64_t batch_count, int64_t p
  boxes_cpu = mmltk::backend::ml::cuda::numa_empty({batch_capacity, prediction_capacity, 4}, torch::kFloat32);
  counts_cpu = mmltk::backend::ml::cuda::numa_empty({batch_capacity}, torch::kInt64);
 }
-void PinnedMaskPredictionBuffers::ensure_capacity(const int64_t batch_count, const int64_t prediction_count, const int64_t batch_capacity,
-                                                  const int64_t prediction_capacity, const uint32_t height, const uint32_t width, const int device_id) {
- const int64_t required_bytes = (mmltk::common::math::checked_cast<int64_t>(height, "prediction mask height overflow") *
-                                  mmltk::common::math::checked_cast<int64_t>(width, "prediction mask width overflow") +
-                                 7) /
-                                8;
- if (masks_cpu.defined() && masks_cpu.dim() == 3 && masks_cpu.size(0) >= batch_count && masks_cpu.size(1) >= prediction_count && masks_gpu.defined() &&
-     masks_gpu.device().is_cuda() && masks_gpu.get_device() == device_id && mask_height == height && mask_width == width &&
-     packed_mask_bytes == required_bytes) {
+void PinnedMaskPredictionBuffers::ensure_capacity(
+ const int64_t batch_count, const int64_t prediction_count, const int64_t batch_capacity, const int64_t prediction_capacity, const uint32_t height, const uint32_t width, const int device_id) {
+ const int64_t required_bytes =
+  (mmltk::common::math::checked_cast<int64_t>(height, "prediction mask height overflow") * mmltk::common::math::checked_cast<int64_t>(width, "prediction mask width overflow") + 7) / 8;
+ if (masks_cpu.defined() && masks_cpu.dim() == 3 && masks_cpu.size(0) >= batch_count && masks_cpu.size(1) >= prediction_count && masks_gpu.defined() && masks_gpu.device().is_cuda() &&
+     masks_gpu.get_device() == device_id && mask_height == height && mask_width == width && packed_mask_bytes == required_bytes) {
   return;
  }
  mask_height = height;
@@ -306,36 +293,30 @@ void PinnedPredictionBuffers::transition(const PredictionSlotState expected, con
  }
 }
 // NOLINTBEGIN(clang-analyzer-cplusplus.NewDeleteLeaks)
-StagedPredictionBatch stage_prediction_batch(PostprocessedBatch batch, size_t category_count, size_t max_dets_per_image, PredictionBufferLease lease,
-                                             int device_id, void* stream_handle) {
+StagedPredictionBatch stage_prediction_batch(PostprocessedBatch batch, size_t category_count, size_t max_dets_per_image, PredictionBufferLease lease, int device_id, void* stream_handle) {
  mmltk::common::logging::ScopedProfile profile_rfdetr_native_eval_stage_prediction_batch{"rfdetr.native.eval.stage_prediction_batch"};
  if (!lease.buffers) { throw std::runtime_error("stage_prediction_batch requires a valid prediction buffer lease"); }
- if (!batch.scores.defined() || batch.scores.dim() != 2 || !batch.labels.defined() || batch.labels.dim() != 2 || !batch.boxes.defined() ||
-     batch.boxes.dim() != 3 || batch.boxes.size(2) != 4) {
+ if (!batch.scores.defined() || batch.scores.dim() != 2 || !batch.labels.defined() || batch.labels.dim() != 2 || !batch.boxes.defined() || batch.boxes.dim() != 3 || batch.boxes.size(2) != 4) {
   throw std::runtime_error("staged prediction tensors must be scores[B,K], labels[B,K], and boxes[B,K,4]");
  }
  const auto images = std::span{lease.buffers->images};
  const int64_t batch_count = mmltk::common::math::checked_cast<int64_t>(images.size(), "prediction batch size overflow");
  const int64_t prediction_count = batch.scores.size(1);
- if (batch_count <= 0 || batch.size() < batch_count || batch.labels.size(0) < batch_count || batch.labels.size(1) != prediction_count ||
-     batch.boxes.size(0) < batch_count || batch.boxes.size(1) != prediction_count) {
+ if (batch_count <= 0 || batch.size() < batch_count || batch.labels.size(0) < batch_count || batch.labels.size(1) != prediction_count || batch.boxes.size(0) < batch_count ||
+     batch.boxes.size(1) != prediction_count) {
   throw std::runtime_error("prediction metadata and staged tensor shapes are not aligned");
  }
  PinnedPredictionBuffers& buffers = *lease.buffers;
- if (buffers.bbox.batch_capacity < batch_count || buffers.bbox.prediction_capacity < prediction_count || !buffers.bbox.scores_cpu.defined() ||
-     !buffers.bbox.labels_cpu.defined() || !buffers.bbox.boxes_cpu.defined()) {
+ if (buffers.bbox.batch_capacity < batch_count || buffers.bbox.prediction_capacity < prediction_count || !buffers.bbox.scores_cpu.defined() || !buffers.bbox.labels_cpu.defined() ||
+     !buffers.bbox.boxes_cpu.defined()) {
   throw std::runtime_error("prediction batch exceeds the configured bbox staging capacity");
  }
- if (buffers.ready_event == nullptr || buffers.event_device_id != device_id) {
-  throw std::runtime_error("prediction batch device does not match the configured staging slot");
- }
+ if (buffers.ready_event == nullptr || buffers.event_device_id != device_id) { throw std::runtime_error("prediction batch device does not match the configured staging slot"); }
  const auto score_view = buffers.bbox.scores_cpu.narrow(0, 0, batch_count).narrow(1, 0, prediction_count);
  const auto label_view = buffers.bbox.labels_cpu.narrow(0, 0, batch_count).narrow(1, 0, prediction_count);
  const auto box_view = buffers.bbox.boxes_cpu.narrow(0, 0, batch_count).narrow(1, 0, prediction_count);
  const auto count_view = buffers.bbox.counts_cpu.narrow(0, 0, batch_count);
- if (score_view.stride(1) != 1 || label_view.stride(1) != 1 || box_view.stride(1) != 4 || box_view.stride(2) != 1) {
-  throw std::logic_error("pinned prediction bbox buffers have unexpected strides");
- }
+ if (score_view.stride(1) != 1 || label_view.stride(1) != 1 || box_view.stride(1) != 4 || box_view.stride(2) != 1) { throw std::logic_error("pinned prediction bbox buffers have unexpected strides"); }
  auto stream = reinterpret_cast<cudaStream_t>(stream_handle);
  if (stream == nullptr) { throw std::runtime_error("stage_prediction_batch requires a CUDA stream"); }
  std::optional<StagedMaskPredictionBatch> staged_mask;
@@ -360,15 +341,13 @@ StagedPredictionBatch stage_prediction_batch(PostprocessedBatch batch, size_t ca
    }
    const uint32_t mask_height = mmltk::common::math::checked_cast<uint32_t>(source_masks.size(2), "prediction mask height overflow");
    const uint32_t mask_width = mmltk::common::math::checked_cast<uint32_t>(source_masks.size(3), "prediction mask width overflow");
-   const bool mask_configuration_matches = buffers.mask && buffers.mask->masks_cpu.defined() && buffers.mask->masks_gpu.defined() &&
-                                           buffers.mask->masks_gpu.device().is_cuda() && buffers.mask->masks_gpu.get_device() == device_id &&
-                                           buffers.mask->mask_height == mask_height && buffers.mask->mask_width == mask_width &&
+   const bool mask_configuration_matches = buffers.mask && buffers.mask->masks_cpu.defined() && buffers.mask->masks_gpu.defined() && buffers.mask->masks_gpu.device().is_cuda() &&
+                                           buffers.mask->masks_gpu.get_device() == device_id && buffers.mask->mask_height == mask_height && buffers.mask->mask_width == mask_width &&
                                            buffers.mask->masks_cpu.size(0) >= batch_count && buffers.mask->masks_cpu.size(1) >= prediction_count;
    if (!mask_configuration_matches) {
     if (!buffers.allow_mask_reconfiguration) { throw std::runtime_error("prediction masks do not match the configured staging capacity"); }
     if (!buffers.mask) { buffers.mask.emplace(); }
-    buffers.mask->ensure_capacity(batch_count, prediction_count, buffers.bbox.batch_capacity, buffers.bbox.prediction_capacity, mask_height, mask_width,
-                                  device_id);
+    buffers.mask->ensure_capacity(batch_count, prediction_count, buffers.bbox.batch_capacity, buffers.bbox.prediction_capacity, mask_height, mask_width, device_id);
    }
    auto mask_view = buffers.mask->masks_cpu.narrow(0, 0, batch_count).narrow(1, 0, prediction_count);
    auto packed_gpu_view = buffers.mask->masks_gpu.narrow(0, 0, batch_count).narrow(1, 0, prediction_count);
@@ -402,9 +381,7 @@ StagedPredictionBatch stage_prediction_batch(PostprocessedBatch batch, size_t ca
 // NOLINTEND(clang-analyzer-cplusplus.NewDeleteLeaks)
 namespace {
 void synchronize_staged_prediction_batch(StagedPredictionBatch& staged, EvaluationProfileRecord* profile) {
- if (!staged.lease.buffers || staged.lease.buffers->ready_event == nullptr) {
-  throw std::runtime_error("encoded prediction batch is missing its staging event");
- }
+ if (!staged.lease.buffers || staged.lease.buffers->ready_event == nullptr) { throw std::runtime_error("encoded prediction batch is missing its staging event"); }
  PinnedPredictionBuffers& buffers = *staged.lease.buffers;
  std::lock_guard<std::mutex> consume_lock(buffers.consume_mutex);
  if (buffers.state.load(std::memory_order_acquire) == PredictionSlotState::CpuMatching) { return; }
@@ -418,13 +395,10 @@ void synchronize_staged_prediction_batch(StagedPredictionBatch& staged, Evaluati
  }
  staged.pending_gpu = {};
 }
-PredictionBatchItem encode_staged_prediction_image(StagedPredictionBatch& staged, const size_t image_index, EvaluationProfileRecord* profile,
-                                                   const EvaluationDatasetOwner* evaluation_dataset) {
+PredictionBatchItem encode_staged_prediction_image(StagedPredictionBatch& staged, const size_t image_index, EvaluationProfileRecord* profile, const EvaluationDatasetOwner* evaluation_dataset) {
  mmltk::common::logging::ScopedNvtxRange nvtx_encode_staged_prediction_image{"encode_staged_prediction_image", mmltk::common::logging::nvtx_color_orange};
  mmltk::common::logging::ScopedProfile profile_rfdetr_native_eval_consume_staged_image{"rfdetr.native.eval.consume_staged_image"};
- if (image_index >= staged.active_image_count || image_index >= staged.images.size()) {
-  throw std::out_of_range("staged prediction image index exceeds the active image count");
- }
+ if (image_index >= staged.active_image_count || image_index >= staged.images.size()) { throw std::out_of_range("staged prediction image index exceeds the active image count"); }
  synchronize_staged_prediction_batch(staged, profile);
  const auto count = staged.bbox.counts_cpu[image_index].item<int64_t>();
  if (count < 0 || count > staged.bbox.scores_cpu.size(1)) throw std::runtime_error("invalid settled prediction count");
@@ -458,8 +432,7 @@ PredictionBatchItem encode_staged_prediction_image(StagedPredictionBatch& staged
   if (profile != nullptr) {
    const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - match_started);
    profile->cpu_match_nanoseconds.fetch_add(static_cast<std::uint64_t>(elapsed.count()), std::memory_order_relaxed);
-   profile->iou_candidate_count.fetch_add(result.evaluation_matches->bbox_iou_candidate_count + result.evaluation_matches->mask_iou_candidate_count,
-                                          std::memory_order_relaxed);
+   profile->iou_candidate_count.fetch_add(result.evaluation_matches->bbox_iou_candidate_count + result.evaluation_matches->mask_iou_candidate_count, std::memory_order_relaxed);
    profile->mask_iou_candidate_count.fetch_add(result.evaluation_matches->mask_iou_candidate_count, std::memory_order_relaxed);
    if (mask_view) profile->mask_task_count.fetch_add(1U, std::memory_order_relaxed);
   }
@@ -470,10 +443,9 @@ PredictionBatchItem encode_staged_prediction_image(StagedPredictionBatch& staged
  const int64_t mask_batch_stride = has_masks ? staged.mask->masks_cpu.stride(0) : 0;
  const int64_t mask_prediction_stride = has_masks ? staged.mask->masks_cpu.stride(1) : 0;
  const auto started = profile != nullptr ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
- SelectedPredictions selected = select_predictions(
-  static_cast<int>(staged.images[image_index].image_id), staged.bbox.scores_cpu.select(0, static_cast<int64_t>(image_index)).narrow(0, 0, count),
-  staged.bbox.labels_cpu.select(0, static_cast<int64_t>(image_index)).narrow(0, 0, count),
-  staged.bbox.boxes_cpu.select(0, static_cast<int64_t>(image_index)).narrow(0, 0, count), staged.category_count);
+ SelectedPredictions selected = select_predictions(static_cast<int>(staged.images[image_index].image_id), staged.bbox.scores_cpu.select(0, static_cast<int64_t>(image_index)).narrow(0, 0, count),
+  staged.bbox.labels_cpu.select(0, static_cast<int64_t>(image_index)).narrow(0, 0, count), staged.bbox.boxes_cpu.select(0, static_cast<int64_t>(image_index)).narrow(0, 0, count),
+  staged.category_count);
  if (has_masks) {
   for (size_t prediction_index = 0; prediction_index < selected.predictions.size(); ++prediction_index) {
    const int64_t source_index = selected.mask_source_indices[prediction_index];
@@ -512,8 +484,8 @@ std::vector<PredictionBatchItem> settle_prediction_batch_encoding(PendingPredict
  return results;
 }
 }  // namespace
-PendingPredictionBatchEncoding enqueue_prediction_batch_encoding(mmltk::common::concurrency::WorkerPool& cpu_pool, StagedPredictionBatch&& staged,
-                                                                 EvaluationProfileRecord* profile, const EvaluationDatasetOwner* evaluation_dataset) {
+PendingPredictionBatchEncoding enqueue_prediction_batch_encoding(
+ mmltk::common::concurrency::WorkerPool& cpu_pool, StagedPredictionBatch&& staged, EvaluationProfileRecord* profile, const EvaluationDatasetOwner* evaluation_dataset) {
  auto shared_staged = std::make_shared<StagedPredictionBatch>(std::move(staged));
  PendingPredictionBatchEncoding pending;
  pending.images.reserve(shared_staged->active_image_count);
@@ -533,9 +505,7 @@ PendingPredictionBatchEncoding enqueue_prediction_batch_encoding(mmltk::common::
  }
  return pending;
 }
-std::vector<PredictionBatchItem> collect_prediction_batch_encoding(PendingPredictionBatchEncoding&& pending) {
- return settle_prediction_batch_encoding(pending);
-}
+std::vector<PredictionBatchItem> collect_prediction_batch_encoding(PendingPredictionBatchEncoding&& pending) { return settle_prediction_batch_encoding(pending); }
 inline int64_t image_id_for_dataset_index(const std::vector<int>& image_ids, int64_t dataset_index) {
  if (dataset_index >= 0 && static_cast<size_t>(dataset_index) < image_ids.size()) { return image_ids[static_cast<size_t>(dataset_index)]; }
  return dataset_index + 1;
@@ -543,8 +513,7 @@ inline int64_t image_id_for_dataset_index(const std::vector<int>& image_ids, int
 // Projects a loader batch onto the per-image metadata every prediction and evaluation path consumes.
 // Batch slot -> dataset index -> image id is one mapping; it lives here rather than being rebuilt at
 // each call site.
-void prepare_prediction_batch_metadata(std::vector<PredictionBatchMetadata>& metadata, const mmltk::backend::data::Batch& batch,
-                                       const std::vector<int>& image_ids) {
+void prepare_prediction_batch_metadata(std::vector<PredictionBatchMetadata>& metadata, const mmltk::backend::data::Batch& batch, const std::vector<int>& image_ids) {
  metadata.clear();
  metadata.reserve(batch.num_images);
  for (size_t image_index = 0; image_index < batch.num_images; ++image_index) {
@@ -556,9 +525,8 @@ void prepare_prediction_batch_metadata(std::vector<PredictionBatchMetadata>& met
   });
  }
 }
-mmltk::backend::data::DatasetLoader::Config make_loader_config(const std::string& compiled_path, size_t batch_size, bool shuffle, int prefetch_factor,
-                                                               int gather_workers, const std::string& cpu_affinity, int device_id, uint64_t seed,
-                                                               uint32_t batch_shard_rank, uint32_t batch_shard_count) {
+mmltk::backend::data::DatasetLoader::Config make_loader_config(const std::string& compiled_path, size_t batch_size, bool shuffle, int prefetch_factor, int gather_workers,
+ const std::string& cpu_affinity, int device_id, uint64_t seed, uint32_t batch_shard_rank, uint32_t batch_shard_count) {
  mmltk::backend::data::DatasetLoader::Config config;
  config.compiled_path = std::filesystem::absolute(std::filesystem::path(compiled_path)).string();
  config.batch_size = batch_size;

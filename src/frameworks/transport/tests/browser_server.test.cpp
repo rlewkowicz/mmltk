@@ -69,8 +69,7 @@ TEST_CASE("browser output epochs keep Bootstrap first on attach and reconnect", 
    CHECK(record->bytes.front() == marker);
   }
  };
- const auto finish_open = [&](const std::uint64_t generation, const std::byte accepted, const std::byte progress, const std::byte diagnostic,
-                              const std::byte worker) {
+ const auto finish_open = [&](const std::uint64_t generation, const std::byte accepted, const std::byte progress, const std::byte diagnostic, const std::byte worker) {
   epoch.finish_open(generation);
   require_markers({accepted});
   REQUIRE(ring.push({.bytes = {progress}, .priority = BrowserRecordPriority::Critical}) == BrowserRecordPush::Enqueued);
@@ -128,8 +127,7 @@ TEST_CASE("browser output ceiling is configured independently of inbound admissi
  const auto facts = std::make_shared<CallbackFacts>();
  BrowserServer server;
  CHECK_FALSE(server.start({.asset_root = assets.path(), .session_token = "test-capability", .maximum_output_bytes = 0U}, callbacks(facts)));
- CHECK_FALSE(server.start({.asset_root = assets.path(), .session_token = "test-capability", .maximum_output_bytes = std::numeric_limits<std::size_t>::max()},
-                          callbacks(facts)));
+ CHECK_FALSE(server.start({.asset_root = assets.path(), .session_token = "test-capability", .maximum_output_bytes = std::numeric_limits<std::size_t>::max()}, callbacks(facts)));
  REQUIRE(server.start({.asset_root = assets.path(), .session_token = "test-capability", .maximum_output_bytes = 32U * 1024U * 1024U}, callbacks(facts)));
  CHECK(server.close());
 }

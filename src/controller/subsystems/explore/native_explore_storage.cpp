@@ -14,9 +14,7 @@ namespace {
 [[nodiscard]] explore::ExploreStorageStatus allocate_device(void*, void** destination, const std::size_t bytes) noexcept {
  return static_cast<explore::ExploreStorageStatus>(cudaMalloc(destination, std::max<std::size_t>(bytes, 1U)));
 }
-[[nodiscard]] explore::ExploreStorageStatus release_device(void*, void* allocation) noexcept {
- return static_cast<explore::ExploreStorageStatus>(cudaFree(allocation));
-}
+[[nodiscard]] explore::ExploreStorageStatus release_device(void*, void* allocation) noexcept { return static_cast<explore::ExploreStorageStatus>(cudaFree(allocation)); }
 }  // namespace
 explore::ExploreCudaAllocationApi ExploreHostAllocations::api() noexcept {
  return {.context = this, .allocate_device = allocate_device, .release_device = release_device, .allocate_pinned = Allocate, .release_pinned = Release};
@@ -41,19 +39,18 @@ explore::ExploreStorageStatus ExploreHostAllocations::Release(void* owner, void*
 }
 }  // namespace mmltk::controller::explore_detail
 namespace mmltk::controller::explore_detail {
-void ensure_gallery_buffer(explore::ExploreHighWaterBuffer& buffer, const std::size_t bytes, const char* const detail, VisualDiagnosticSink diagnostics_,
-                           int device_, std::uint64_t generation) {
+void ensure_gallery_buffer(explore::ExploreHighWaterBuffer& buffer, const std::size_t bytes, const char* const detail, VisualDiagnosticSink diagnostics_, int device_, std::uint64_t generation) {
  const bool observed = diagnostics_.valid();
  const auto previous = observed ? buffer.capacity_bytes() : 0U;
  if (!buffer.ensure_bytes(bytes)) throw std::runtime_error(detail);
  if (observed && buffer.capacity_bytes() != previous)
   diagnostics_.Emit([&] {
    return VisualDiagnosticFact{.system = contracts::DiagnosticOwner::Explore,
-                               .operation = VisualDiagnosticOperation::ExploreStorageGrown,
-                               .device = device_,
-                               .generation = generation,
-                               .value = previous,
-                               .detail = buffer.capacity_bytes()};
+    .operation = VisualDiagnosticOperation::ExploreStorageGrown,
+    .device = device_,
+    .generation = generation,
+    .value = previous,
+    .detail = buffer.capacity_bytes()};
   });
 }
 }  // namespace mmltk::controller::explore_detail

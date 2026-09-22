@@ -28,9 +28,9 @@ struct ModelArtifactRequest {
  [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]] std::filesystem::path class_layout_path;
  [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]] std::filesystem::path onnx_path;
  [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]] std::filesystem::path tensorrt_path;
- [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumNameBytes}]]
-  [[= mmltk::frameworks::reflection::Presentation<mmltk::frameworks::reflection::PresentationKind::Preset>{}]]
-  [[= mmltk::frameworks::reflection::CatalogProvider<RfdetrPresetCatalog>{}]] std::string preset_name;
+ [[= mmltk::frameworks::reflection::MaxBytes{
+  mmltk::frameworks::reflection::kMaximumNameBytes}]][[= mmltk::frameworks::reflection::Presentation<mmltk::frameworks::reflection::PresentationKind::Preset>{}]][
+  [= mmltk::frameworks::reflection::CatalogProvider<RfdetrPresetCatalog>{}]] std::string preset_name;
  [[= mmltk::frameworks::reflection::Minimum<int>{0}]] int resolution = 0;
  [[nodiscard]] std::size_t selected_input_count() const noexcept {
   return static_cast<std::size_t>(!weights_path.empty()) + static_cast<std::size_t>(!onnx_path.empty()) + static_cast<std::size_t>(!tensorrt_path.empty());
@@ -73,11 +73,9 @@ struct PredictRequest : ModelArtifactRequest, InferenceExecutionConfig {
  [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]] std::filesystem::path output_path;
  [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumNameBytes}]] std::string backend = "auto";
  [[= mmltk::frameworks::reflection::Minimum<std::size_t>{1U}]] std::size_t batch_size = 1U;
- [[= mmltk::frameworks::reflection::Minimum<std::size_t>{
-  0U}]][[= mmltk::frameworks::reflection::Maximum<std::size_t>{kMaximumPredictionCandidates}]] std::size_t max_dets_per_image = 500U;
+ [[= mmltk::frameworks::reflection::Minimum<std::size_t>{0U}]][[= mmltk::frameworks::reflection::Maximum<std::size_t>{kMaximumPredictionCandidates}]] std::size_t max_dets_per_image = 500U;
  [[= mmltk::frameworks::reflection::Minimum<int>{0}]] int lanes = 0;
- [[= mmltk::frameworks::reflection::Minimum<float>{
-  0.0F}]][[= mmltk::frameworks::reflection::Maximum<float>{1.0F}]][[= mmltk::frameworks::reflection::Finite{}]] float threshold = 0.0F;
+ [[= mmltk::frameworks::reflection::Minimum<float>{0.0F}]][[= mmltk::frameworks::reflection::Maximum<float>{1.0F}]][[= mmltk::frameworks::reflection::Finite{}]] float threshold = 0.0F;
  std::size_t limit_images = 0U;
  bool include_masks = true;
  bool progress_bar = true;
@@ -118,15 +116,12 @@ struct AugmentationGroupConfig {
  // behavior.
  bool operator==(const AugmentationGroupConfig&) const = default;
  // CLEANUP-IGNORE: Every augmentation scalar deliberately exposes the same reflected unit-interval policy.
- [[= mmltk::frameworks::reflection::Minimum<float>{
-  kAugmentationScalarMinimum}]][[= mmltk::frameworks::reflection::Maximum<float>{kAugmentationScalarMaximum}]][[= mmltk::frameworks::reflection::Finite{}]][
-  [= mmltk::frameworks::reflection::Presentation<mmltk::frameworks::reflection::PresentationKind::UnitInterval>{}]] float probability = 0.0F;
- [[= mmltk::frameworks::reflection::Minimum<float>{
-  kAugmentationScalarMinimum}]][[= mmltk::frameworks::reflection::Maximum<float>{kAugmentationScalarMaximum}]][[= mmltk::frameworks::reflection::Finite{}]][
-  [= mmltk::frameworks::reflection::Presentation<mmltk::frameworks::reflection::PresentationKind::UnitInterval>{}]] float min_strength = 0.0F;
- [[= mmltk::frameworks::reflection::Minimum<float>{
-  kAugmentationScalarMinimum}]][[= mmltk::frameworks::reflection::Maximum<float>{kAugmentationScalarMaximum}]][[= mmltk::frameworks::reflection::Finite{}]][
-  [= mmltk::frameworks::reflection::Presentation<mmltk::frameworks::reflection::PresentationKind::UnitInterval>{}]] float max_strength = 0.0F;
+ [[= mmltk::frameworks::reflection::Minimum<float>{kAugmentationScalarMinimum}]][[= mmltk::frameworks::reflection::Maximum<float>{kAugmentationScalarMaximum}]][
+  [= mmltk::frameworks::reflection::Finite{}]][[= mmltk::frameworks::reflection::Presentation<mmltk::frameworks::reflection::PresentationKind::UnitInterval>{}]] float probability = 0.0F;
+ [[= mmltk::frameworks::reflection::Minimum<float>{kAugmentationScalarMinimum}]][[= mmltk::frameworks::reflection::Maximum<float>{kAugmentationScalarMaximum}]][
+  [= mmltk::frameworks::reflection::Finite{}]][[= mmltk::frameworks::reflection::Presentation<mmltk::frameworks::reflection::PresentationKind::UnitInterval>{}]] float min_strength = 0.0F;
+ [[= mmltk::frameworks::reflection::Minimum<float>{kAugmentationScalarMinimum}]][[= mmltk::frameworks::reflection::Maximum<float>{kAugmentationScalarMaximum}]][
+  [= mmltk::frameworks::reflection::Finite{}]][[= mmltk::frameworks::reflection::Presentation<mmltk::frameworks::reflection::PresentationKind::UnitInterval>{}]] float max_strength = 0.0F;
 };
 struct GpuAugmentationConfig {
  bool operator==(const GpuAugmentationConfig&) const = default;
@@ -139,9 +134,8 @@ struct GpuAugmentationConfig {
  AugmentationGroupConfig blur{0.50F, 0.05F, 0.50F};
  // CLEANUP-IGNORE: Occlusion remains a named generated field rather than an opaque indexed augmentation entry.
  AugmentationGroupConfig occlusion{0.50F, 0.05F, 0.50F};
- [[= mmltk::frameworks::reflection::Minimum<float>{
-  kAugmentationScalarMinimum}]][[= mmltk::frameworks::reflection::Maximum<float>{kAugmentationScalarMaximum}]][[= mmltk::frameworks::reflection::Finite{}]][
-  [= mmltk::frameworks::reflection::Presentation<mmltk::frameworks::reflection::PresentationKind::UnitInterval>{}]] float copy_paste_probability = 0.80F;
+ [[= mmltk::frameworks::reflection::Minimum<float>{kAugmentationScalarMinimum}]][[= mmltk::frameworks::reflection::Maximum<float>{kAugmentationScalarMaximum}]][
+  [= mmltk::frameworks::reflection::Finite{}]][[= mmltk::frameworks::reflection::Presentation<mmltk::frameworks::reflection::PresentationKind::UnitInterval>{}]] float copy_paste_probability = 0.80F;
 };
 class[[= mmltk::frameworks::reflection::OpaqueRelationStorage{}]] TrainRecipeOverrideState final {
 public:
@@ -168,10 +162,10 @@ struct TrainRequest : mmltk::backend::data::DataLoadingOptions {
  [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]] std::filesystem::path class_layout_path;
  [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]] std::filesystem::path resume_path;
  [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]] std::filesystem::path output_dir;
- [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumNameBytes}]]
-  [[= mmltk::frameworks::reflection::Presentation<mmltk::frameworks::reflection::PresentationKind::Preset>{}]]
-  // CLEANUP-IGNORE: Preset metadata is deliberately repeated on the Train field consumed by reflection.
-  [[= mmltk::frameworks::reflection::CatalogProvider<RfdetrPresetCatalog>{}]] std::string preset_name;
+ [[= mmltk::frameworks::reflection::MaxBytes{
+  mmltk::frameworks::reflection::kMaximumNameBytes}]][[= mmltk::frameworks::reflection::Presentation<mmltk::frameworks::reflection::PresentationKind::Preset>{}]]
+                                                     // CLEANUP-IGNORE: Preset metadata is deliberately repeated on the Train field consumed by reflection.
+                                                     [[= mmltk::frameworks::reflection::CatalogProvider<RfdetrPresetCatalog>{}]] std::string preset_name;
  // CLEANUP-IGNORE: Optional training artifact paths share a capacity but retain distinct generated identities.
  [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]] std::filesystem::path test_compiled_path;
  [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]] std::filesystem::path distributed_store_path;
@@ -197,37 +191,31 @@ struct TrainRequest : mmltk::backend::data::DataLoadingOptions {
  [[= mmltk::frameworks::reflection::Minimum<int>{1}]] int distributed_world_size = 1;
  // CLEANUP-IGNORE: EMA and optimizer fields retain explicit reflected constraints at their canonical declarations.
  [[= mmltk::frameworks::reflection::Minimum<int>{0}]] int ema_tau = 100;
- [[= mmltk::frameworks::reflection::Minimum<double>{0.0}]][[= mmltk::frameworks::reflection::Finite{}]][
-  [= mmltk::frameworks::reflection::Presentation<mmltk::frameworks::reflection::PresentationKind::LearningRate>{}]] double lr = 1.0e-4;
+ [[= mmltk::frameworks::reflection::Minimum<double>{
+  0.0}]][[= mmltk::frameworks::reflection::Finite{}]][[= mmltk::frameworks::reflection::Presentation<mmltk::frameworks::reflection::PresentationKind::LearningRate>{}]] double lr = 1.0e-4;
  [[= mmltk::frameworks::reflection::Minimum<double>{0.0}]][[= mmltk::frameworks::reflection::Finite{}]][[= mmltk::frameworks::reflection::Presentation<
   // CLEANUP-IGNORE: Each learning-rate field needs an independently addressable generated identity.
   mmltk::frameworks::reflection::PresentationKind::LearningRate>{}]] double lr_encoder = 1.5e-4;
- [[=
-   mmltk::frameworks::reflection::Minimum<double>{0.0}]][[= mmltk::frameworks::reflection::Maximum<double>{1.0}]][[= mmltk::frameworks::reflection::Finite{}]][
+ [[= mmltk::frameworks::reflection::Minimum<double>{0.0}]][[= mmltk::frameworks::reflection::Maximum<double>{1.0}]][[= mmltk::frameworks::reflection::Finite{}]][
   [= mmltk::frameworks::reflection::Presentation<mmltk::frameworks::reflection::PresentationKind::Decay>{}]] double lr_component_decay = 0.7;
- [[=
-   mmltk::frameworks::reflection::Minimum<double>{0.0}]][[= mmltk::frameworks::reflection::Maximum<double>{1.0}]][[= mmltk::frameworks::reflection::Finite{}]][
+ [[= mmltk::frameworks::reflection::Minimum<double>{0.0}]][[= mmltk::frameworks::reflection::Maximum<double>{1.0}]][[= mmltk::frameworks::reflection::Finite{}]][
   [= mmltk::frameworks::reflection::Presentation<mmltk::frameworks::reflection::PresentationKind::Decay>{}]] double encoder_layer_decay = 0.8;
- [[=
-   mmltk::frameworks::reflection::Minimum<double>{0.0}]][[= mmltk::frameworks::reflection::Maximum<double>{1.0}]][[= mmltk::frameworks::reflection::Finite{}]][
+ [[= mmltk::frameworks::reflection::Minimum<double>{0.0}]][[= mmltk::frameworks::reflection::Maximum<double>{1.0}]][[= mmltk::frameworks::reflection::Finite{}]][
   [= mmltk::frameworks::reflection::Presentation<mmltk::frameworks::reflection::PresentationKind::Decay>{}]] double momentum = 0.95;
- [[= mmltk::frameworks::reflection::Minimum<double>{0.0}]][[= mmltk::frameworks::reflection::Finite{}]][
-  [= mmltk::frameworks::reflection::Presentation<mmltk::frameworks::reflection::PresentationKind::Decay>{}]] double weight_decay = 1.0e-4;
+ [[= mmltk::frameworks::reflection::Minimum<double>{
+  0.0}]][[= mmltk::frameworks::reflection::Finite{}]][[= mmltk::frameworks::reflection::Presentation<mmltk::frameworks::reflection::PresentationKind::Decay>{}]] double weight_decay = 1.0e-4;
  // CLEANUP-IGNORE: Warmup remains a separate constrained setting rather than an indexed optimizer scalar.
  [[= mmltk::frameworks::reflection::Minimum<double>{0.0}]][[= mmltk::frameworks::reflection::Finite{}]] double warmup_epochs = 0.0;
- [[=
-   mmltk::frameworks::reflection::Minimum<double>{0.0}]][[= mmltk::frameworks::reflection::Maximum<double>{1.0}]][[= mmltk::frameworks::reflection::Finite{}]][
+ [[= mmltk::frameworks::reflection::Minimum<double>{0.0}]][[= mmltk::frameworks::reflection::Maximum<double>{1.0}]][[= mmltk::frameworks::reflection::Finite{}]][
   [= mmltk::frameworks::reflection::Presentation<mmltk::frameworks::reflection::PresentationKind::Decay>{}]] double warmup_momentum = 0.0;
- [[=
-   mmltk::frameworks::reflection::Minimum<double>{0.0}]][[= mmltk::frameworks::reflection::Maximum<double>{1.0}]][[= mmltk::frameworks::reflection::Finite{}]][
+ [[= mmltk::frameworks::reflection::Minimum<double>{0.0}]][[= mmltk::frameworks::reflection::Maximum<double>{1.0}]][[= mmltk::frameworks::reflection::Finite{}]][
   [= mmltk::frameworks::reflection::Presentation<mmltk::frameworks::reflection::PresentationKind::Decay>{}]] double lr_min_factor = 0.0;
- [[= mmltk::frameworks::reflection::Minimum<double>{0.0}]]
-  [[= mmltk::frameworks::reflection::Finite{}]][[= mmltk::frameworks::reflection::Presentation<mmltk::frameworks::reflection::PresentationKind::Norm>{}]] double
-   // CLEANUP-IGNORE: Gradient clipping is a nonnegative norm; adjacent optimizer scalars are bounded decay
-   // fractions.
-   clip_max_norm = 0.1;
- [[=
-   mmltk::frameworks::reflection::Minimum<double>{0.0}]][[= mmltk::frameworks::reflection::Maximum<double>{1.0}]][[= mmltk::frameworks::reflection::Finite{}]][
+ [[= mmltk::frameworks::reflection::Minimum<double>{
+  0.0}]][[= mmltk::frameworks::reflection::Finite{}]][[= mmltk::frameworks::reflection::Presentation<mmltk::frameworks::reflection::PresentationKind::Norm>{}]] double
+  // CLEANUP-IGNORE: Gradient clipping is a nonnegative norm; adjacent optimizer scalars are bounded decay
+  // fractions.
+  clip_max_norm = 0.1;
+ [[= mmltk::frameworks::reflection::Minimum<double>{0.0}]][[= mmltk::frameworks::reflection::Maximum<double>{1.0}]][[= mmltk::frameworks::reflection::Finite{}]][
   [= mmltk::frameworks::reflection::Presentation<mmltk::frameworks::reflection::PresentationKind::Decay>{}]] double ema_decay = 0.993;
  [[= mmltk::frameworks::reflection::CatalogProvider<TrainRecipeCatalog>{}]] TrainOptimizerKind optimizer = TrainOptimizerKind::AdamW;
  GpuAugmentationConfig gpu_augmentation;
@@ -250,31 +238,21 @@ namespace mmltk::frameworks::reflection {
 template <>
 struct catalog_provider_relation<mmltk::backend::models::rfdetr::TrainRecipeCatalog>
     : StaticMemberRelation<mmltk::backend::models::rfdetr::TrainRecipeCatalogEntry, mmltk::backend::models::rfdetr::TrainRequest, 11U,
-                           MemberRelationEntry<member_path<&mmltk::backend::models::rfdetr::TrainRecipeCatalogEntry::lr>,
-                                               member_path<&mmltk::backend::models::rfdetr::TrainRequest::lr>>,
-                           MemberRelationEntry<member_path<&mmltk::backend::models::rfdetr::TrainRecipeCatalogEntry::lr_encoder>,
-                                               member_path<&mmltk::backend::models::rfdetr::TrainRequest::lr_encoder>>,
-                           MemberRelationEntry<member_path<&mmltk::backend::models::rfdetr::TrainRecipeCatalogEntry::lr_component_decay>,
-                                               member_path<&mmltk::backend::models::rfdetr::TrainRequest::lr_component_decay>>,
-                           MemberRelationEntry<member_path<&mmltk::backend::models::rfdetr::TrainRecipeCatalogEntry::encoder_layer_decay>,
-                                               member_path<&mmltk::backend::models::rfdetr::TrainRequest::encoder_layer_decay>>,
-                           MemberRelationEntry<member_path<&mmltk::backend::models::rfdetr::TrainRecipeCatalogEntry::momentum>,
-                                               member_path<&mmltk::backend::models::rfdetr::TrainRequest::momentum>>,
-                           MemberRelationEntry<member_path<&mmltk::backend::models::rfdetr::TrainRecipeCatalogEntry::weight_decay>,
-                                               member_path<&mmltk::backend::models::rfdetr::TrainRequest::weight_decay>>,  // CLEANUP-IGNORE: Each
-                                                                                                                           // relation row names a
-                                                                                                                           // distinct canonical source
-                                                                                                                           // and destination identity.
-                           MemberRelationEntry<member_path<&mmltk::backend::models::rfdetr::TrainRecipeCatalogEntry::warmup_epochs>,
-                                               member_path<&mmltk::backend::models::rfdetr::TrainRequest::warmup_epochs>>,
-                           MemberRelationEntry<member_path<&mmltk::backend::models::rfdetr::TrainRecipeCatalogEntry::warmup_momentum>,
-                                               member_path<&mmltk::backend::models::rfdetr::TrainRequest::warmup_momentum>>,
-                           MemberRelationEntry<member_path<&mmltk::backend::models::rfdetr::TrainRecipeCatalogEntry::lr_min_factor>,
-                                               member_path<&mmltk::backend::models::rfdetr::TrainRequest::lr_min_factor>>,
-                           MemberRelationEntry<member_path<&mmltk::backend::models::rfdetr::TrainRecipeCatalogEntry::lr_drop>,
-                                               member_path<&mmltk::backend::models::rfdetr::TrainRequest::lr_drop>>,
-                           MemberRelationEntry<member_path<&mmltk::backend::models::rfdetr::TrainRecipeCatalogEntry::lr_scheduler>,
-                                               member_path<&mmltk::backend::models::rfdetr::TrainRequest::lr_scheduler>>> {
+       MemberRelationEntry<member_path<&mmltk::backend::models::rfdetr::TrainRecipeCatalogEntry::lr>, member_path<&mmltk::backend::models::rfdetr::TrainRequest::lr>>,
+       MemberRelationEntry<member_path<&mmltk::backend::models::rfdetr::TrainRecipeCatalogEntry::lr_encoder>, member_path<&mmltk::backend::models::rfdetr::TrainRequest::lr_encoder>>,
+       MemberRelationEntry<member_path<&mmltk::backend::models::rfdetr::TrainRecipeCatalogEntry::lr_component_decay>, member_path<&mmltk::backend::models::rfdetr::TrainRequest::lr_component_decay>>,
+       MemberRelationEntry<member_path<&mmltk::backend::models::rfdetr::TrainRecipeCatalogEntry::encoder_layer_decay>, member_path<&mmltk::backend::models::rfdetr::TrainRequest::encoder_layer_decay>>,
+       MemberRelationEntry<member_path<&mmltk::backend::models::rfdetr::TrainRecipeCatalogEntry::momentum>, member_path<&mmltk::backend::models::rfdetr::TrainRequest::momentum>>,
+       MemberRelationEntry<member_path<&mmltk::backend::models::rfdetr::TrainRecipeCatalogEntry::weight_decay>,
+        member_path<&mmltk::backend::models::rfdetr::TrainRequest::weight_decay>>,  // CLEANUP-IGNORE: Each
+                                                                                    // relation row names a
+                                                                                    // distinct canonical source
+                                                                                    // and destination identity.
+       MemberRelationEntry<member_path<&mmltk::backend::models::rfdetr::TrainRecipeCatalogEntry::warmup_epochs>, member_path<&mmltk::backend::models::rfdetr::TrainRequest::warmup_epochs>>,
+       MemberRelationEntry<member_path<&mmltk::backend::models::rfdetr::TrainRecipeCatalogEntry::warmup_momentum>, member_path<&mmltk::backend::models::rfdetr::TrainRequest::warmup_momentum>>,
+       MemberRelationEntry<member_path<&mmltk::backend::models::rfdetr::TrainRecipeCatalogEntry::lr_min_factor>, member_path<&mmltk::backend::models::rfdetr::TrainRequest::lr_min_factor>>,
+       MemberRelationEntry<member_path<&mmltk::backend::models::rfdetr::TrainRecipeCatalogEntry::lr_drop>, member_path<&mmltk::backend::models::rfdetr::TrainRequest::lr_drop>>,
+       MemberRelationEntry<member_path<&mmltk::backend::models::rfdetr::TrainRecipeCatalogEntry::lr_scheduler>, member_path<&mmltk::backend::models::rfdetr::TrainRequest::lr_scheduler>>> {
  using provider_type = mmltk::backend::models::rfdetr::TrainRecipeCatalog;
  using override_state_type = mmltk::backend::models::rfdetr::TrainRecipeOverrideState;
  inline static constexpr auto source_selector = member_path<&mmltk::backend::models::rfdetr::TrainRecipeCatalogEntry::optimizer>;
@@ -342,13 +320,10 @@ static_assert(mmltk::frameworks::reflection::reflected_policies_are_valid<Augmen
 static_assert(mmltk::frameworks::reflection::reflected_policies_are_valid<GpuAugmentationConfig>());
 static_assert(mmltk::frameworks::reflection::reflected_defaults_are_valid<AugmentationGroupConfig>());
 static_assert(mmltk::frameworks::reflection::reflected_defaults_are_valid<GpuAugmentationConfig>());
-[[nodiscard]] constexpr bool augmentation_group_relationship_valid(const AugmentationGroupConfig& group) noexcept {
- return group.min_strength <= group.max_strength;
-}
+[[nodiscard]] constexpr bool augmentation_group_relationship_valid(const AugmentationGroupConfig& group) noexcept { return group.min_strength <= group.max_strength; }
 [[nodiscard]] constexpr bool gpu_augmentation_relationships_valid(const GpuAugmentationConfig& config) noexcept {
- return augmentation_group_relationship_valid(config.geometry) && augmentation_group_relationship_valid(config.resize) &&
-        augmentation_group_relationship_valid(config.color) && augmentation_group_relationship_valid(config.noise) &&
-        augmentation_group_relationship_valid(config.blur) && augmentation_group_relationship_valid(config.occlusion);
+ return augmentation_group_relationship_valid(config.geometry) && augmentation_group_relationship_valid(config.resize) && augmentation_group_relationship_valid(config.color) &&
+        augmentation_group_relationship_valid(config.noise) && augmentation_group_relationship_valid(config.blur) && augmentation_group_relationship_valid(config.occlusion);
 }
 [[nodiscard]] constexpr bool gpu_augmentation_config_valid(const GpuAugmentationConfig& config) noexcept {
  return !mmltk::frameworks::reflection::validate_reflected_fields(config).has_value() && gpu_augmentation_relationships_valid(config);
@@ -374,8 +349,8 @@ inline void apply_train_recipe(TrainRequest& target, const TrainRecipeCatalogEnt
  using Relation = mmltk::frameworks::reflection::catalog_provider_relation<TrainRecipeCatalog>;
  Relation::VisitMembers([&]<class Entry>() {
   if (!Relation::template overridden<Entry::destination>(overrides)) {
-   Entry::transform::apply(mmltk::frameworks::reflection::access<TrainRequest, Entry::destination>(target),
-                           mmltk::frameworks::reflection::access<const TrainRecipeCatalogEntry, Entry::source>(recipe));
+   Entry::transform::apply(
+    mmltk::frameworks::reflection::access<TrainRequest, Entry::destination>(target), mmltk::frameworks::reflection::access<const TrainRecipeCatalogEntry, Entry::source>(recipe));
   }
  });
 }

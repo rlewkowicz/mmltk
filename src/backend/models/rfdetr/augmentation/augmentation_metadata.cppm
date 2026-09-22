@@ -35,9 +35,8 @@ struct AugmentationPreviewAnnotation {
 };
 using ::mmltk::backend::models::rfdetr::augmentation_box_area;
 using ::mmltk::backend::models::rfdetr::transform_augmentation_box_xyxy;
-[[nodiscard]] inline AugmentationMappedInstance map_augmentation_instance(const mmltk::backend::data::PackedInstance& instance, int image_width,
-                                                                          int image_height, const AugmentationImagePlan* plan,
-                                                                          std::span<const mmltk::backend::data::RLEPair> mask = {}) {
+[[nodiscard]] inline AugmentationMappedInstance map_augmentation_instance(
+ const mmltk::backend::data::PackedInstance& instance, int image_width, int image_height, const AugmentationImagePlan* plan, std::span<const mmltk::backend::data::RLEPair> mask = {}) {
  const float inverse_width = 1.0F / static_cast<float>(image_width);
  const float inverse_height = 1.0F / static_cast<float>(image_height);
  AugmentationMappedInstance mapped;
@@ -55,8 +54,6 @@ using ::mmltk::backend::models::rfdetr::transform_augmentation_box_xyxy;
  mapped.visible = support.present;
  return mapped;
 }
-void build_augmentation_preview_annotations(std::span<const mmltk::backend::data::PackedInstance> source_instances,
-                                            const mmltk::backend::data::PackedInstance* donor_instance, const AugmentationImagePlan* plan, int image_width,
-                                            int image_height, std::vector<AugmentationPreviewAnnotation>& output,
-                                            std::span<const mmltk::backend::data::RLEPair> source_runs = {});
+void build_augmentation_preview_annotations(std::span<const mmltk::backend::data::PackedInstance> source_instances, const mmltk::backend::data::PackedInstance* donor_instance,
+ const AugmentationImagePlan* plan, int image_width, int image_height, std::vector<AugmentationPreviewAnnotation>& output, std::span<const mmltk::backend::data::RLEPair> source_runs = {});
 }  // namespace mmltk::backend::models::rfdetr

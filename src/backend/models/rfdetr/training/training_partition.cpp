@@ -12,9 +12,7 @@ std::vector<DistributedTrainingPartition> select_distributed_training_partitions
  validate_train_placement(request);
  if (request.device_ids.empty()) { return {{0, 1, request.device_id, request.workers, request.numa_node}}; }
  const std::set<int> unique_devices(request.device_ids.begin(), request.device_ids.end());
- if (unique_devices.size() != request.device_ids.size() || *unique_devices.begin() < 0) {
-  throw std::invalid_argument("distributed RF-DETR device identifiers must be unique and nonnegative");
- }
+ if (unique_devices.size() != request.device_ids.size() || *unique_devices.begin() < 0) { throw std::invalid_argument("distributed RF-DETR device identifiers must be unique and nonnegative"); }
  const int world_size = static_cast<int>(request.device_ids.size());
  std::vector<DistributedTrainingPartition> partitions;
  partitions.reserve(request.device_ids.size());

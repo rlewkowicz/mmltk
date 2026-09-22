@@ -29,8 +29,7 @@ namespace {
  // Pinned host work needs that context before the first tensor allocation.
  CUcontext current{};
  const auto context_status = cuCtxGetCurrent(&current);
- if (context_status != CUDA_SUCCESS && context_status != CUDA_ERROR_NOT_INITIALIZED)
-  throw std::runtime_error("failed to inspect LibTorch CUDA execution context");
+ if (context_status != CUDA_SUCCESS && context_status != CUDA_ERROR_NOT_INITIALIZED) throw std::runtime_error("failed to inspect LibTorch CUDA execution context");
  if (current == nullptr) {
   const auto status = cudaSetDevice(device_index);
   if (status != cudaSuccess) throw std::runtime_error(cudaGetErrorString(status));

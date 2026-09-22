@@ -109,25 +109,19 @@ CaptureSession::Impl::CaptureLoopResult CaptureSession::Impl::CaptureLoop() {
   }
   if (ready == CaptureReadyResult::kStopRequested) return StopRequestedResult();
   if (ready == CaptureReadyResult::kCameraHangup)
-   return {.kind = CaptureStopKind::kCameraHangup,
-           .status = MakeStatus(StatusCode::kNoDevice, last_error()),
-           .teardown = CaptureTeardownDisposition::kNoStreamOrDeviceLost};
+   return {.kind = CaptureStopKind::kCameraHangup, .status = MakeStatus(StatusCode::kNoDevice, last_error()), .teardown = CaptureTeardownDisposition::kNoStreamOrDeviceLost};
   if (ready == CaptureReadyResult::kCameraError)
-   return {.kind = CaptureStopKind::kCameraError,
-           .status = MakeStatus(StatusCode::kInternalError, last_error()),
-           .teardown = CaptureTeardownDisposition::kNoStreamOrDeviceLost};
+   return {.kind = CaptureStopKind::kCameraError, .status = MakeStatus(StatusCode::kInternalError, last_error()), .teardown = CaptureTeardownDisposition::kNoStreamOrDeviceLost};
   v4l2_buffer buffer{};
   Status error = Status::Ok();
   const DequeueResult dequeued = TryDequeueBuffer(&buffer, &error);
   if (dequeued == DequeueResult::kNotReady) continue;
-  if (dequeued == DequeueResult::kCameraError)
-   return {.kind = CaptureStopKind::kCameraError, .status = std::move(error), .teardown = CaptureTeardownDisposition::kNoStreamOrDeviceLost};
+  if (dequeued == DequeueResult::kCameraError) return {.kind = CaptureStopKind::kCameraError, .status = std::move(error), .teardown = CaptureTeardownDisposition::kNoStreamOrDeviceLost};
   const Status handled = HandleDequeuedBuffer(buffer);
   if (!handled.ok())
    return {.kind = camera_fault_.load(std::memory_order_acquire) ? CaptureStopKind::kCameraError : CaptureStopKind::kOwnerFailure,
-           .status = handled,
-           .teardown = camera_fault_.load(std::memory_order_acquire) ? CaptureTeardownDisposition::kNoStreamOrDeviceLost
-                                                                     : CaptureTeardownDisposition::kOwnerRetainThenStreamOff};
+    .status = handled,
+    .teardown = camera_fault_.load(std::memory_order_acquire) ? CaptureTeardownDisposition::kNoStreamOrDeviceLost : CaptureTeardownDisposition::kOwnerRetainThenStreamOff};
  }
 }
 Status CaptureSession::Impl::HandleDequeuedBuffer(const v4l2_buffer& buffer) {
@@ -255,8 +249,8 @@ Status CaptureSession::Impl::try_take_filled(FilledCaptureSlotLease* const outpu
  if (!slot.phase.compare_exchange_strong(expected, CaptureSlotPhaseValue(CaptureSlotPhase::kH2dActive), std::memory_order_acq_rel, std::memory_order_acquire))
   return MakeStatus(StatusCode::kNotReady, "filled capture slot was replaced");
  replaceable_filled_index_ = -1;
- *output = CaptureSession::MakeFilledSlotLease(active_identity(), slot.slot_index, slot.sequence, static_cast<const std::uint8_t*>(slot.capture_buffer.data),
-                                               size_image_, bytes_per_line_, kBgr3V4l2PixelFormat, slot.region, slot.capture_ns, slot.short_frame);
+ *output = CaptureSession::MakeFilledSlotLease(active_identity(), slot.slot_index, slot.sequence, static_cast<const std::uint8_t*>(slot.capture_buffer.data), size_image_, bytes_per_line_,
+  kBgr3V4l2PixelFormat, slot.region, slot.capture_ns, slot.short_frame);
  h2d_frames_admitted_.fetch_add(1U, std::memory_order_relaxed);
  return Status::Ok();
 }
@@ -265,22 +259,19 @@ Status CaptureSession::Impl::mark_h2d_completion_pending(const FilledCaptureSlot
  HostSlotRuntime& slot = *host_slots_[lease.slot()];
  if (slot.sequence != lease.sequence()) return {StatusCode::kInvalidArgument, {}};
  std::uint32_t expected = CaptureSlotPhaseValue(CaptureSlotPhase::kH2dActive);
- if (!slot.phase.compare_exchange_strong(expected, CaptureSlotPhaseValue(CaptureSlotPhase::kCompletionPending), std::memory_order_acq_rel,
-                                         std::memory_order_acquire))
+ if (!slot.phase.compare_exchange_strong(expected, CaptureSlotPhaseValue(CaptureSlotPhase::kCompletionPending), std::memory_order_acq_rel, std::memory_order_acquire))
   return MakeStatus(StatusCode::kNotReady, "capture slot is not H2D active");
  return Status::Ok();
 }
 Status CaptureSession::Impl::return_after_h2d(FilledCaptureSlotLease&& lease) noexcept {
- if (!lease.valid() || lease.identity() != active_identity() || lease.slot() >= host_slots_.size())
-  return MakeStatus(StatusCode::kInvalidArgument, "capture lease does not name the active slot");
+ if (!lease.valid() || lease.identity() != active_identity() || lease.slot() >= host_slots_.size()) return MakeStatus(StatusCode::kInvalidArgument, "capture lease does not name the active slot");
  HostSlotRuntime& slot = *host_slots_[lease.slot()];
  if (slot.sequence != lease.sequence()) return MakeStatus(StatusCode::kInvalidArgument, "capture lease sequence is stale");
  std::uint32_t phase = slot.phase.load(std::memory_order_acquire);
  bool newly_completed = false;
  for (;;) {
   if (phase == CaptureSlotPhaseValue(CaptureSlotPhase::kRequeuePending)) break;
-  if (phase != CaptureSlotPhaseValue(CaptureSlotPhase::kH2dActive) && phase != CaptureSlotPhaseValue(CaptureSlotPhase::kCompletionPending))
-   return {StatusCode::kNotReady, {}};
+  if (phase != CaptureSlotPhaseValue(CaptureSlotPhase::kH2dActive) && phase != CaptureSlotPhaseValue(CaptureSlotPhase::kCompletionPending)) return {StatusCode::kNotReady, {}};
   if (slot.phase.compare_exchange_weak(phase, CaptureSlotPhaseValue(CaptureSlotPhase::kRequeuePending), std::memory_order_acq_rel, std::memory_order_acquire)) {
    newly_completed = true;
    break;
@@ -323,11 +314,8 @@ Status CaptureSession::Impl::report_failure(const CaptureSessionIdentity identit
 }
 CaptureSession::Impl::CaptureLoopResult CaptureSession::Impl::StopRequestedResult() const {
  Status failure = FirstFailure();
- return !failure.ok()
-         ? CaptureLoopResult{.kind = CaptureStopKind::kOwnerFailure,
-                             .status = std::move(failure),
-                             .teardown = CaptureTeardownDisposition::kRequeueThenStreamOff}
-         : CaptureLoopResult{.kind = CaptureStopKind::kRequested, .status = Status::Ok(), .teardown = CaptureTeardownDisposition::kRequeueThenStreamOff};
+ return !failure.ok() ? CaptureLoopResult{.kind = CaptureStopKind::kOwnerFailure, .status = std::move(failure), .teardown = CaptureTeardownDisposition::kRequeueThenStreamOff}
+                      : CaptureLoopResult{.kind = CaptureStopKind::kRequested, .status = Status::Ok(), .teardown = CaptureTeardownDisposition::kRequeueThenStreamOff};
 }
 void CaptureSession::Impl::NotifyFilledFramePublished() {
  const auto listener = filled_frame_listener_.load(std::memory_order_acquire);

@@ -75,8 +75,7 @@ enum class ImageUpscalerExecutionStage : std::uint8_t {
 // Effect-only, per-owner instrumentation. Empty in ordinary execution; failures
 // enter the same checked settlement path as failures of the preceding operation.
 using ImageUpscalerExecutionCheckpoint = std::function<void(ImageUpscalerExecutionStage)>;
-[[nodiscard]] inline bool image_upscaler_admitted(const ImageUpscalerExecutionCheckpoint& checkpoint, ImageUpscalerExecutionStage stage,
-                                                  ImageUpscalerCurrent current) {
+[[nodiscard]] inline bool image_upscaler_admitted(const ImageUpscalerExecutionCheckpoint& checkpoint, ImageUpscalerExecutionStage stage, ImageUpscalerCurrent current) {
  if (checkpoint) checkpoint(stage);
  return current();
 }

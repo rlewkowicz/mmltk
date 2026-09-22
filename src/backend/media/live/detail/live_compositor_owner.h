@@ -26,10 +26,10 @@ struct LiveCompositorTelemetry {
 class LiveCompositor final {
 public:
  // CLEANUP-IGNORE: Its constructor and lifecycle are independent from manual-overlay worker ownership.
- LiveCompositor(LiveFrameFanout& fanout, LiveAnalyzerWorker* analyzer, LiveManualOverlayWorker* manual_overlay, LiveCompletedFramePublication& publication,
-                std::uint32_t slot_count, std::uint32_t width,
-                // CLEANUP-IGNORE: Physical compositor dimensions and CUDA context are explicit construction facts.
-                std::uint32_t height, LivePhysicalCudaContext cuda);
+ LiveCompositor(LiveFrameFanout& fanout, LiveAnalyzerWorker* analyzer, LiveManualOverlayWorker* manual_overlay, LiveCompletedFramePublication& publication, std::uint32_t slot_count,
+  std::uint32_t width,
+  // CLEANUP-IGNORE: Physical compositor dimensions and CUDA context are explicit construction facts.
+  std::uint32_t height, LivePhysicalCudaContext cuda);
  ~LiveCompositor();
  LiveCompositor(const LiveCompositor&) = delete;
  LiveCompositor& operator=(const LiveCompositor&) = delete;
@@ -39,8 +39,8 @@ public:
  [[nodiscard]] bool process_latest();
  [[nodiscard]] bool drain_completions();
  [[nodiscard]] bool settled() const noexcept;
- [[nodiscard]] bool try_acquire(PhysicalFrameRevision revision, LiveCompositeOutputLease* output, void* callback_owner,
-                                LiveCompositeOutputLease::CompleteCallback complete, LiveCompositeOutputLease::AbandonCallback abandon);
+ [[nodiscard]] bool try_acquire(
+  PhysicalFrameRevision revision, LiveCompositeOutputLease* output, void* callback_owner, LiveCompositeOutputLease::CompleteCallback complete, LiveCompositeOutputLease::AbandonCallback abandon);
  void complete_output(PhysicalFrameRevision frame_revision) noexcept;
  void abandon_output(PhysicalFrameRevision frame_revision) noexcept;
  void set_revision_listener(std::function<void()> listener);

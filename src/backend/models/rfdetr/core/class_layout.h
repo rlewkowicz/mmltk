@@ -40,6 +40,5 @@ private:
 [[nodiscard]] std::string encode_class_descriptor(const ModelClassDescriptor& descriptor);
 [[nodiscard]] ModelClassDescriptor decode_class_descriptor(std::string_view text);
 [[nodiscard]] std::vector<RfdetrNamedOutputRole> class_descriptor_output_roles(std::span<const ModelClassDescriptor> descriptors);
-[[nodiscard]] ModelClassLayout admit_artifact_class_layout(std::size_t output_width, const std::optional<ModelClassLayout>& embedded,
-                                                           std::span<const ModelClassDescriptor> descriptors);
+[[nodiscard]] ModelClassLayout admit_artifact_class_layout(std::size_t output_width, const std::optional<ModelClassLayout>& embedded, std::span<const ModelClassDescriptor> descriptors);
 }  // namespace mmltk::backend::models::rfdetr

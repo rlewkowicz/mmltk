@@ -221,11 +221,9 @@ TEST_CASE("Fused workspace raster preserves pitched guards and clipped coverage"
  const raster::ConstBytes source{static_cast<const std::uint8_t*>(clean_device.data()) + offset, clean_pitch, width, height};
  const raster::ConstBytes overlay{static_cast<const std::uint8_t*>(semantic_device.data()) + offset, semantic_pitch, width, height};
  REQUIRE(cudaMemcpy2DAsync(oracle, target_pitch, source.pixels, clean_pitch, width * 4U, height, cudaMemcpyDeviceToDevice, stream.get()) == cudaSuccess);
- REQUIRE(raster::composite_rgba(
-          {.base_rgba = raster::pitched_rgba_target(oracle, target_pitch, width, height), .overlay_rgba = overlay, .stream = stream.get()}) == cudaSuccess);
+ REQUIRE(raster::composite_rgba({.base_rgba = raster::pitched_rgba_target(oracle, target_pitch, width, height), .overlay_rgba = overlay, .stream = stream.get()}) == cudaSuccess);
  const std::array regions{raster::IntRect{-5, 0, 3, 2}, raster::IntRect{3, 2, 20, 20}, raster::IntRect{2, 1, 2, 3}};
- raster::FinalizeRgbaWork work{
-  .clean = source, .semantic = overlay, .destination = {result, target_pitch, width, height}, .regions = regions, .full_image = false, .stream = stream.get()};
+ raster::FinalizeRgbaWork work{.clean = source, .semantic = overlay, .destination = {result, target_pitch, width, height}, .regions = regions, .full_image = false, .stream = stream.get()};
  REQUIRE(raster::finalize_rgba(work) == cudaSuccess);
  REQUIRE(cudaStreamSynchronize(stream.get()) == cudaSuccess);
  std::vector<std::uint8_t> expected(guard.size()), actual(guard.size());
@@ -275,20 +273,16 @@ TEST_CASE("Rendered probes compare owned pitched RGBA references including alpha
  semantic.upload<std::uint8_t>(pixels);
  retained.upload<std::uint8_t>(reference);
  CudaStream stream;
- const auto target = [&](CudaBuffer& buffer) {
-  return ExploreRenderTargetView{.data = static_cast<std::uint8_t*>(buffer.data()), .pitch_bytes = pitch, .width = extent, .height = extent};
- };
+ const auto target = [&](CudaBuffer& buffer) { return ExploreRenderTargetView{.data = static_cast<std::uint8_t*>(buffer.data()), .pitch_bytes = pitch, .width = extent, .height = extent}; };
  const auto measure = [&](const ExploreRenderedCardProbe& probe) {
   std::array<std::uint64_t, 5U> result{};
   REQUIRE(cudaMemsetAsync(counts.data(), 0, sizeof(result), stream.get()) == cudaSuccess);
-  REQUIRE(probe_explore_rendered_card(target(clean), target(semantic), probe, static_cast<std::uint64_t*>(counts.data()), stream.address()) ==
-          kExploreStorageSuccess);
+  REQUIRE(probe_explore_rendered_card(target(clean), target(semantic), probe, static_cast<std::uint64_t*>(counts.data()), stream.address()) == kExploreStorageSuccess);
   REQUIRE(cudaMemcpyAsync(result.data(), counts.data(), sizeof(result), cudaMemcpyDeviceToHost, stream.get()) == cudaSuccess);
   REQUIRE(cudaStreamSynchronize(stream.get()) == cudaSuccess);
   return result;
  };
- const ExploreRenderedCardProbe probe{
-  .reference = target(retained), .content_x = 1U, .content_y = 1U, .content_width = 2U, .content_height = 2U, .box_width = 4U, .box_height = 4U};
+ const ExploreRenderedCardProbe probe{.reference = target(retained), .content_x = 1U, .content_y = 1U, .content_width = 2U, .content_height = 2U, .box_width = 4U, .box_height = 4U};
  const auto result = measure(probe);
  CHECK(result[0U] == 4U);
  CHECK(result[2U] == 12U);
@@ -313,8 +307,7 @@ TEST_CASE("Rendered probes compare owned pitched RGBA references including alpha
  clean.upload<std::uint8_t>(filtered);
  retained.upload<std::uint8_t>(filtered);
  semantic.upload<std::uint8_t>(overlay);
- const ExploreRenderedCardProbe enlarged{
-  .reference = target(retained), .content_x = 2U, .content_y = 2U, .content_width = 4U, .content_height = 4U, .box_width = extent, .box_height = extent};
+ const ExploreRenderedCardProbe enlarged{.reference = target(retained), .content_x = 2U, .content_y = 2U, .content_width = 4U, .content_height = 4U, .box_width = extent, .box_height = extent};
  CHECK(measure(enlarged) == std::array<std::uint64_t, 5U>{16U, 16U, 28U, 36U, 16U});
  // The crop/padding transition is valid only when its exact RGBA copy is preserved.
  auto mismatched = filtered;
@@ -342,19 +335,16 @@ struct PixelOracleGeometry final {
 };
 class SemanticOracleBuffers final {
 public:
- [[nodiscard]] SemanticOracleResult RenderDetail(std::span<const ExploreRenderAnnotationDescriptor> annotations,
-                                                 std::span<const mmltk::backend::data::RLEPair> runs, std::span<const ExploreRenderClassDescriptor> classes,
-                                                 bool boxes = false, mmltk::backend::models::rfdetr::AugmentationSpatialErasure erasure = {},
-                                                 PixelOracleGeometry geometry = {}, bool masks_with_boxes = false);
- [[nodiscard]] SemanticOracleResult RenderAtlas(std::span<const ExploreRenderAnnotationDescriptor> annotations,
-                                                std::span<const mmltk::backend::data::RLEPair> runs, std::span<const ExploreRenderClassDescriptor> classes,
-                                                bool boxes = false, mmltk::backend::models::rfdetr::AugmentationSpatialErasure erasure = {},
-                                                PixelOracleGeometry geometry = {.width = 4U, .height = 2U}, bool masks_with_boxes = false);
+ [[nodiscard]] SemanticOracleResult RenderDetail(std::span<const ExploreRenderAnnotationDescriptor> annotations, std::span<const mmltk::backend::data::RLEPair> runs,
+  std::span<const ExploreRenderClassDescriptor> classes, bool boxes = false, mmltk::backend::models::rfdetr::AugmentationSpatialErasure erasure = {}, PixelOracleGeometry geometry = {},
+  bool masks_with_boxes = false);
+ [[nodiscard]] SemanticOracleResult RenderAtlas(std::span<const ExploreRenderAnnotationDescriptor> annotations, std::span<const mmltk::backend::data::RLEPair> runs,
+  std::span<const ExploreRenderClassDescriptor> classes, bool boxes = false, mmltk::backend::models::rfdetr::AugmentationSpatialErasure erasure = {},
+  PixelOracleGeometry geometry = {.width = 4U, .height = 2U}, bool masks_with_boxes = false);
 
 private:
  void prepare(const std::span<const ExploreRenderAnnotationDescriptor> annotations, const std::span<const mmltk::backend::data::RLEPair> runs,
-              const std::span<const ExploreRenderClassDescriptor> classes, const std::uint32_t width, const std::uint32_t height, const std::uint32_t extent,
-              const bool blue) {
+  const std::span<const ExploreRenderClassDescriptor> classes, const std::uint32_t width, const std::uint32_t height, const std::uint32_t extent, const bool blue) {
   annotation_count_ = static_cast<std::uint32_t>(annotations.size());
   run_count_ = static_cast<std::uint32_t>(runs.size());
   class_count_ = static_cast<std::uint32_t>(classes.size());
@@ -428,8 +418,8 @@ private:
  // Last member settles work before any retained host/device storage dies.
  CudaStream stream;
 };
-[[nodiscard]] ExploreRenderCardDescriptor make_card(const float* pixels, const std::uint32_t source_width, const std::uint32_t source_height,
-                                                    const std::uint32_t card_extent, const std::uint32_t annotation_count = 0U) noexcept {
+[[nodiscard]] ExploreRenderCardDescriptor make_card(
+ const float* pixels, const std::uint32_t source_width, const std::uint32_t source_height, const std::uint32_t card_extent, const std::uint32_t annotation_count = 0U) noexcept {
  const auto contain = make_explore_contain_rect(source_width, source_height, card_extent);
  return {
   .pixels = pixels,
@@ -446,8 +436,7 @@ private:
 }
 [[nodiscard]] std::array<ExploreRenderAnnotationDescriptor, 2U> make_occlusion_annotations(const std::array<float, 4U>& donor_box) noexcept {
  return {
-  ExploreRenderAnnotationDescriptor{
-   .box_xyxy = {0.0F, 0.0F, 1.0F, 1.0F}, .mask_bounds = {0, 0, 1, 1}, .mask_present = true, .rle_count = 1U, .class_id = 0U, .occluder_index = 1},
+  ExploreRenderAnnotationDescriptor{.box_xyxy = {0.0F, 0.0F, 1.0F, 1.0F}, .mask_bounds = {0, 0, 1, 1}, .mask_present = true, .rle_count = 1U, .class_id = 0U, .occluder_index = 1},
   ExploreRenderAnnotationDescriptor{
    .box_xyxy = {donor_box[0U], donor_box[1U], donor_box[2U], donor_box[3U]},
    .mask_bounds = {0, 0, 1, 1},
@@ -458,11 +447,9 @@ private:
   },
  };
 }
-[[nodiscard]] SemanticOracleResult SemanticOracleBuffers::RenderDetail(const std::span<const ExploreRenderAnnotationDescriptor> annotations,
-                                                                       const std::span<const mmltk::backend::data::RLEPair> runs,
-                                                                       const std::span<const ExploreRenderClassDescriptor> classes, const bool boxes,
-                                                                       const mmltk::backend::models::rfdetr::AugmentationSpatialErasure erasure,
-                                                                       const PixelOracleGeometry geometry, const bool masks_with_boxes) {
+[[nodiscard]] SemanticOracleResult SemanticOracleBuffers::RenderDetail(const std::span<const ExploreRenderAnnotationDescriptor> annotations, const std::span<const mmltk::backend::data::RLEPair> runs,
+ const std::span<const ExploreRenderClassDescriptor> classes, const bool boxes, const mmltk::backend::models::rfdetr::AugmentationSpatialErasure erasure, const PixelOracleGeometry geometry,
+ const bool masks_with_boxes) {
  const auto kExtent = geometry.extent;
  const std::size_t kPixelCount = kExtent * kExtent;
  prepare(annotations, runs, classes, geometry.width, geometry.height, kExtent, false);
@@ -493,19 +480,16 @@ private:
  // argument types.
  return download(target_device, kPixelCount);
 }
-[[nodiscard]] SemanticOracleResult SemanticOracleBuffers::RenderAtlas(const std::span<const ExploreRenderAnnotationDescriptor> annotations,
-                                                                      const std::span<const mmltk::backend::data::RLEPair> runs,
-                                                                      const std::span<const ExploreRenderClassDescriptor> classes, const bool boxes,
-                                                                      const mmltk::backend::models::rfdetr::AugmentationSpatialErasure erasure,
-                                                                      const PixelOracleGeometry geometry, const bool masks_with_boxes) {
+[[nodiscard]] SemanticOracleResult SemanticOracleBuffers::RenderAtlas(const std::span<const ExploreRenderAnnotationDescriptor> annotations, const std::span<const mmltk::backend::data::RLEPair> runs,
+ const std::span<const ExploreRenderClassDescriptor> classes, const bool boxes, const mmltk::backend::models::rfdetr::AugmentationSpatialErasure erasure, const PixelOracleGeometry geometry,
+ const bool masks_with_boxes) {
  namespace raster = mmltk::backend::imaging::raster;
  const auto kSourceWidth = geometry.width;
  const auto kSourceHeight = geometry.height;
  const auto kExtent = geometry.extent;
  const std::size_t kPixelCount = kExtent * kExtent;
  prepare(annotations, runs, classes, kSourceWidth, kSourceHeight, kExtent, true);
- std::array cards{
-  make_card(static_cast<const float*>(source_device.data()), kSourceWidth, kSourceHeight, kExtent, static_cast<std::uint32_t>(annotations.size()))};
+ std::array cards{make_card(static_cast<const float*>(source_device.data()), kSourceWidth, kSourceHeight, kExtent, static_cast<std::uint32_t>(annotations.size()))};
  cards.front().erasure = erasure;
  const std::array tiles{ExploreRenderTileDescriptor{
   .destination_width = kExtent,
@@ -516,16 +500,13 @@ private:
  tiles_device.upload<ExploreRenderTileDescriptor>(tiles);
  const auto scratch_view = scratch(cards_device, &tiles_device);
  const ExploreRenderAtlasView atlas{.card_extent = kExtent, .card_count = 1U, .source_width = kSourceWidth, .source_height = kSourceHeight, .draw_base = 1U};
- const ExploreRenderTileBatchView batch{
-  .tile_count = 1U, .tile_capacity = 1U, .max_tile_width = kExtent, .max_tile_height = kExtent, .viewport_generation = 11U};
+ const ExploreRenderTileBatchView batch{.tile_count = 1U, .tile_capacity = 1U, .max_tile_width = kExtent, .max_tile_height = kExtent, .viewport_generation = 11U};
  const ExploreRenderTargetView clean{.data = static_cast<std::uint8_t*>(clean_device.data()), .pitch_bytes = kExtent * 4U, .width = kExtent, .height = kExtent};
- const ExploreRenderTargetView semantic{
-  .data = static_cast<std::uint8_t*>(semantic_device.data()), .pitch_bytes = kExtent * 4U, .width = kExtent, .height = kExtent};
+ const ExploreRenderTargetView semantic{.data = static_cast<std::uint8_t*>(semantic_device.data()), .pitch_bytes = kExtent * 4U, .width = kExtent, .height = kExtent};
  REQUIRE(render_explore_atlas_tiles(atlas, batch, {}, scratch_view, clean, stream.address()) == kExploreStorageSuccess);
  auto semantic_atlas = atlas;
  semantic_atlas.draw_base = 0U;
- REQUIRE(render_explore_atlas_tiles(semantic_atlas, batch, semantics(boxes, masks_with_boxes), scratch_view, semantic, stream.address()) ==
-         kExploreStorageSuccess);
+ REQUIRE(render_explore_atlas_tiles(semantic_atlas, batch, semantics(boxes, masks_with_boxes), scratch_view, semantic, stream.address()) == kExploreStorageSuccess);
  REQUIRE(count_explore_nonzero_alpha(semantic, count(), stream.address()) == kExploreStorageSuccess);
  REQUIRE(cudaMemcpyAsync(composed_device.data(), clean_device.data(), kPixelCount * 4U, cudaMemcpyDeviceToDevice, stream.get()) == cudaSuccess);
  REQUIRE(raster::composite_rgba({
@@ -549,14 +530,12 @@ TEST_CASE("Explore tiny support keeps exact outer edges under atlas and detail s
  };
  const std::array classes{ExploreRenderClassDescriptor{.color = {255U, 0U, 0U}}};
  // Single pixels at every corner, two-pixel dots, and horizontal/vertical filaments.
- const std::array<std::array<std::uint32_t, 4>, 8> rectangles{
-  {{0, 0, 1, 1}, {7, 0, 8, 1}, {0, 3, 1, 4}, {7, 3, 8, 4}, {3, 1, 4, 2}, {3, 1, 5, 2}, {2, 1, 6, 2}, {3, 0, 4, 4}}};
+ const std::array<std::array<std::uint32_t, 4>, 8> rectangles{{{0, 0, 1, 1}, {7, 0, 8, 1}, {0, 3, 1, 4}, {7, 3, 8, 4}, {3, 1, 4, 2}, {3, 1, 5, 2}, {2, 1, 6, 2}, {3, 0, 4, 4}}};
  for (const auto& rectangle : rectangles) {
   CAPTURE(rectangle);
   std::vector<RLEPair> runs;
   for (auto y = rectangle[1]; y < rectangle[3]; ++y) { runs.push_back({y * width + rectangle[0], rectangle[2] - rectangle[0]}); }
-  const std::array<float, 4> identity_bounds{float(rectangle[0]) / width, float(rectangle[1]) / height, float(rectangle[2]) / width,
-                                             float(rectangle[3]) / height};
+  const std::array<float, 4> identity_bounds{float(rectangle[0]) / width, float(rectangle[1]) / height, float(rectangle[2]) / width, float(rectangle[3]) / height};
   const auto support = augment::resolve_augmentation_annotation_support({0, 0, 1, 1}, runs, width, height, nullptr);
   REQUIRE(support.present);
   REQUIRE(support.box_xyxy == std::array<float, 4>{0, 0, 1, 1});
@@ -572,10 +551,8 @@ TEST_CASE("Explore tiny support keeps exact outer edges under atlas and detail s
    if (!present) continue;
    const std::array<float, 4> expected{float(edges[0]) / 8, float(edges[1]) / 4, float(edges[2]) / 8, float(edges[3]) / 4};
    REQUIRE(resolved.box_xyxy == expected);
-   ExploreRenderAnnotationDescriptor annotation{.box_xyxy = {expected[0], expected[1], expected[2], expected[3]},
-                                                .mask_bounds = {0, 0, 1, 1},
-                                                .mask_present = true,
-                                                .rle_count = static_cast<std::uint32_t>(runs.size())};
+   ExploreRenderAnnotationDescriptor annotation{
+    .box_xyxy = {expected[0], expected[1], expected[2], expected[3]}, .mask_bounds = {0, 0, 1, 1}, .mask_present = true, .rle_count = static_cast<std::uint32_t>(runs.size())};
    std::ranges::copy(resolved.mask_bounds, annotation.mask_bounds);
    std::ranges::copy(plan.inverse, annotation.inverse);
    for (const auto extent : {3U, 8U, 13U, 32U}) {
@@ -592,8 +569,7 @@ TEST_CASE("Explore tiny support keeps exact outer edges under atlas and detail s
      hidden_classes[0].visible = 0U;
      const auto hidden = atlas ? oracle.RenderAtlas(std::span{&annotation, 1U}, runs, hidden_classes, true, plan.erasure, geometry, true)
                                : oracle.RenderDetail(std::span{&annotation, 1U}, runs, hidden_classes, true, plan.erasure, geometry, true);
-     const auto image =
-      atlas ? make_explore_contain_rect(width, height, extent) : decltype(make_explore_contain_rect(width, height, extent)){0, 0, extent, extent};
+     const auto image = atlas ? make_explore_contain_rect(width, height, extent) : decltype(make_explore_contain_rect(width, height, extent)){0, 0, extent, extent};
      const int left = static_cast<int>(std::floor(static_cast<float>(image.x) + expected[0] * static_cast<float>(image.width)));
      const int top = static_cast<int>(std::floor(static_cast<float>(image.y) + expected[1] * static_cast<float>(image.height)));
      const int right = static_cast<int>(std::ceil(static_cast<float>(image.x) + expected[2] * static_cast<float>(image.width)));
@@ -602,8 +578,7 @@ TEST_CASE("Explore tiny support keeps exact outer edges under atlas and detail s
       for (std::uint32_t x = 0; x < extent; ++x) {
        const auto index = y * extent + x;
        const bool inside_image = x >= image.x && y >= image.y && x < image.x + image.width && y < image.y + image.height;
-       const bool exterior = ((int(x) == left - 1 || int(x) == right) && int(y) >= top - 1 && int(y) <= bottom) ||
-                             ((int(y) == top - 1 || int(y) == bottom) && int(x) >= left - 1 && int(x) <= right);
+       const bool exterior = ((int(x) == left - 1 || int(x) == right) && int(y) >= top - 1 && int(y) <= bottom) || ((int(y) == top - 1 || int(y) == bottom) && int(x) >= left - 1 && int(x) <= right);
        // Independently sample explicit source RLE at the destination pixel center.
        const float nx = (float(x) - static_cast<float>(image.x) + 0.5F) / static_cast<float>(image.width);
        const float ny = (float(y) - static_cast<float>(image.y) + 0.5F) / static_cast<float>(image.height);
@@ -612,12 +587,10 @@ TEST_CASE("Explore tiny support keeps exact outer edges under atlas and detail s
        const int source_x = nearest_pixel(sx * width);
        const int source_y = nearest_pixel(sy * height);
        const int source_pixel = source_y * int(width) + source_x;
-       const bool supported =
-        inside_image && sx >= 0 && sx < 1 && sy >= 0 && sy < 1 && !(transform == 3 && nx >= 0.5F) &&
-        std::ranges::any_of(runs, [&](const auto run) { return source_pixel >= int(run.start) && source_pixel < int(run.start + run.length); });
-       const std::array<std::uint8_t, 4> clear = atlas
-                                                  ? (inside_image ? std::array<std::uint8_t, 4>{0, 0, 255, 255} : std::array<std::uint8_t, 4>{24, 18, 35, 255})
-                                                  : std::array<std::uint8_t, 4>{0, 0, 0, 0};
+       const bool supported = inside_image && sx >= 0 && sx < 1 && sy >= 0 && sy < 1 && !(transform == 3 && nx >= 0.5F) &&
+                              std::ranges::any_of(runs, [&](const auto run) { return source_pixel >= int(run.start) && source_pixel < int(run.start + run.length); });
+       const std::array<std::uint8_t, 4> clear =
+        atlas ? (inside_image ? std::array<std::uint8_t, 4>{0, 0, 255, 255} : std::array<std::uint8_t, 4>{24, 18, 35, 255}) : std::array<std::uint8_t, 4>{0, 0, 0, 0};
        const std::array<std::uint8_t, 4> foreground = atlas ? std::array<std::uint8_t, 4>{92, 0, 163, 255} : std::array<std::uint8_t, 4>{255, 0, 0, 92};
        CHECK(masks.pixels[index] == (supported ? foreground : clear));
        CHECK(hidden.pixels[index] == clear);
@@ -637,8 +610,7 @@ TEST_CASE("Explore tiny support keeps exact outer edges under atlas and detail s
 TEST_CASE("Explore cropped detail clips exterior edges without painting surviving pixels", "[backend][imaging][explore][cuda][support]") {
  if (mmltk::testsupport::checked_cuda_device_count() == 0) SKIP("CUDA device unavailable");
  SemanticOracleBuffers oracle;
- const std::array annotations{
-  ExploreRenderAnnotationDescriptor{.box_xyxy = {0.25F, 0.25F, 0.75F, 0.5F}, .mask_bounds = {0, 0, 1, 1}, .mask_present = true, .rle_count = 1}};
+ const std::array annotations{ExploreRenderAnnotationDescriptor{.box_xyxy = {0.25F, 0.25F, 0.75F, 0.5F}, .mask_bounds = {0, 0, 1, 1}, .mask_present = true, .rle_count = 1}};
  const std::array runs{mmltk::backend::data::RLEPair{10, 4}};
  const std::array classes{ExploreRenderClassDescriptor{}};
  const PixelOracleGeometry geometry{.width = 8, .height = 4, .extent = 13, .crop_x = 3, .crop_y = 1, .crop_width = 2, .crop_height = 1};
@@ -665,8 +637,7 @@ TEST_CASE("priority output remains fixed capacity", "[backend][imaging][explore]
  std::array<std::uint32_t, kExploreWorkCapacity + 32U> order{};
  std::iota(order.begin(), order.end(), 0U);
  std::array<std::uint32_t, kExploreWorkCapacity + 32U> output{};
- const std::size_t count = prioritize_explore_work(
-  order, ExploreViewport{.first_row = 0U, .row_count = static_cast<std::uint32_t>(order.size()), .columns = 1U}, std::nullopt, 0U, output);
+ const std::size_t count = prioritize_explore_work(order, ExploreViewport{.first_row = 0U, .row_count = static_cast<std::uint32_t>(order.size()), .columns = 1U}, std::nullopt, 0U, output);
  REQUIRE(count == kExploreWorkCapacity);
  for (std::size_t index = 0U; index != count; ++index) CHECK(output[index] == index);
 }
@@ -785,12 +756,10 @@ TEST_CASE("Explore CUDA atlas and detail preserve pixels, padding, and bilinear 
   .tiles = static_cast<const ExploreRenderTileDescriptor*>(tiles_device.data()),
   .tile_capacity = 1U,
  };
- const ExploreRenderTargetView target{
-  .data = static_cast<std::uint8_t*>(target_device.data()), .pitch_bytes = kCardExtent * 4U, .width = kCardExtent, .height = kCardExtent};
- REQUIRE(
-  render_explore_atlas_tiles({.card_extent = kCardExtent, .card_count = 1U, .source_width = source_width, .source_height = kSourceHeight, .draw_base = 1U},
-                             {.tile_count = 1U, .tile_capacity = 1U, .max_tile_width = kCardExtent, .max_tile_height = kCardExtent, .viewport_generation = 7U},
-                             {.class_count = 1U, .show_boxes = 0U, .show_masks = 0U}, scratch, target, stream.address()) == kExploreStorageSuccess);
+ const ExploreRenderTargetView target{.data = static_cast<std::uint8_t*>(target_device.data()), .pitch_bytes = kCardExtent * 4U, .width = kCardExtent, .height = kCardExtent};
+ REQUIRE(render_explore_atlas_tiles({.card_extent = kCardExtent, .card_count = 1U, .source_width = source_width, .source_height = kSourceHeight, .draw_base = 1U},
+          {.tile_count = 1U, .tile_capacity = 1U, .max_tile_width = kCardExtent, .max_tile_height = kCardExtent, .viewport_generation = 7U}, {.class_count = 1U, .show_boxes = 0U, .show_masks = 0U},
+          scratch, target, stream.address()) == kExploreStorageSuccess);
  std::array<std::array<std::uint8_t, 4U>, kCardExtent * kCardExtent> pixels{};
  REQUIRE(cudaMemcpyAsync(pixels.data(), target_device.data(), pixels.size() * 4U, cudaMemcpyDeviceToHost, stream.get()) == cudaSuccess);
  REQUIRE(cudaStreamSynchronize(stream.get()) == cudaSuccess);
@@ -801,12 +770,9 @@ TEST_CASE("Explore CUDA atlas and detail preserve pixels, padding, and bilinear 
   CHECK((pixels[0U] == std::array<std::uint8_t, 4U>{0U, 0U, 0U, 255U}));
   CHECK((pixels[15U] == std::array<std::uint8_t, 4U>{0U, 255U, 255U, 255U}));
   const auto atlas_pixels = pixels;
-  REQUIRE(render_explore_detail({.pixels = static_cast<const float*>(source_device.data()),
-                                 .source_width = source_width,
-                                 .source_height = kSourceHeight,
-                                 .crop_width = source_width,
-                                 .crop_height = kSourceHeight},
-                                {.show_boxes = 0U, .show_masks = 0U}, scratch, target, stream.address()) == kExploreStorageSuccess);
+  REQUIRE(render_explore_detail(
+           {.pixels = static_cast<const float*>(source_device.data()), .source_width = source_width, .source_height = kSourceHeight, .crop_width = source_width, .crop_height = kSourceHeight},
+           {.show_boxes = 0U, .show_masks = 0U}, scratch, target, stream.address()) == kExploreStorageSuccess);
   REQUIRE(cudaMemcpyAsync(pixels.data(), target_device.data(), pixels.size() * 4U, cudaMemcpyDeviceToHost, stream.get()) == cudaSuccess);
   REQUIRE(cudaStreamSynchronize(stream.get()) == cudaSuccess);
   CHECK(pixels == atlas_pixels);
@@ -826,8 +792,8 @@ TEST_CASE("Semantic upscaling preserves class color and alpha at exact nearest s
  CudaBuffer output{8U * 4U * 4U};
  input.upload<std::uint8_t>(source);
  CudaStream stream;
- REQUIRE(mmltk::backend::imaging::raster::scale_rgba({static_cast<const std::uint8_t*>(input.data()), 8U, 2, 1},
-                                                     {static_cast<std::uint8_t*>(output.data()), 32U, 8, 4}, stream.address()) == cudaSuccess);
+ REQUIRE(
+  mmltk::backend::imaging::raster::scale_rgba({static_cast<const std::uint8_t*>(input.data()), 8U, 2, 1}, {static_cast<std::uint8_t*>(output.data()), 32U, 8, 4}, stream.address()) == cudaSuccess);
  std::array<std::uint8_t, 128U> pixels{};
  REQUIRE(cudaMemcpyAsync(pixels.data(), output.data(), pixels.size(), cudaMemcpyDeviceToHost, stream.get()) == cudaSuccess);
  REQUIRE(cudaStreamSynchronize(stream.get()) == cudaSuccess);
@@ -840,8 +806,7 @@ TEST_CASE("Explore atlas semantic planes compose through the Presentation raster
  SemanticOracleBuffers oracle;
  constexpr std::array<std::uint8_t, 4U> kBase{0U, 0U, 255U, 255U};
  constexpr std::array<std::uint8_t, 4U> kPadding{24U, 18U, 35U, 255U};
- ExploreRenderAnnotationDescriptor source{
-  .box_xyxy = {0.0F, 0.0F, 1.0F, 1.0F}, .mask_bounds = {0, 0, 1, 1}, .mask_present = true, .rle_count = 1U, .class_id = 0U};
+ ExploreRenderAnnotationDescriptor source{.box_xyxy = {0.0F, 0.0F, 1.0F, 1.0F}, .mask_bounds = {0, 0, 1, 1}, .mask_present = true, .rle_count = 1U, .class_id = 0U};
  const std::array single_run{mmltk::backend::data::RLEPair{.start = 0U, .length = 1U}};
  std::array classes{ExploreRenderClassDescriptor{}, ExploreRenderClassDescriptor{}};
  const auto visible = oracle.RenderAtlas(std::span{&source, 1U}, single_run, classes);
@@ -888,8 +853,7 @@ TEST_CASE("Explore atlas semantic planes compose through the Presentation raster
 TEST_CASE("Explore CUDA masks admit checked RLE and produce semantic composition pixels", "[backend][imaging][explore][cuda]") {
  if (mmltk::testsupport::checked_cuda_device_count() == 0) SKIP("CUDA device unavailable");
  SemanticOracleBuffers oracle;
- ExploreRenderAnnotationDescriptor annotation{
-  .box_xyxy = {0.0F, 0.0F, 1.0F, 1.0F}, .mask_bounds = {0, 0, 1, 1}, .mask_present = true, .rle_count = 1U, .class_id = 0U};
+ ExploreRenderAnnotationDescriptor annotation{.box_xyxy = {0.0F, 0.0F, 1.0F, 1.0F}, .mask_bounds = {0, 0, 1, 1}, .mask_present = true, .rle_count = 1U, .class_id = 0U};
  const std::array runs{mmltk::backend::data::RLEPair{.start = 5U, .length = 1U}};
  std::array classes{ExploreRenderClassDescriptor{}};
  const auto visible = oracle.RenderDetail(std::span{&annotation, 1U}, runs, classes);
@@ -940,8 +904,7 @@ TEST_CASE("Explore renderer rejects semantic descriptors beyond admitted storage
   .classes = reinterpret_cast<const ExploreRenderClassDescriptor*>(address),
   .class_capacity = 1U,
  };
- const ExploreRenderDetailView detail{
-  .pixels = reinterpret_cast<const float*>(address), .source_width = 1U, .source_height = 1U, .crop_width = 1U, .crop_height = 1U};
+ const ExploreRenderDetailView detail{.pixels = reinterpret_cast<const float*>(address), .source_width = 1U, .source_height = 1U, .crop_width = 1U, .crop_height = 1U};
  const ExploreRenderTargetView target{.data = reinterpret_cast<std::uint8_t*>(1U), .pitch_bytes = 4U, .width = 1U, .height = 1U};
  CHECK(render_explore_detail(detail, {.annotation_count = 1U, .class_count = 1U}, scratch, target, 1U) != kExploreStorageSuccess);
 }
@@ -977,8 +940,7 @@ TEST_CASE("Explore detail and atlas mask support follows final spatial erasure",
  if (mmltk::testsupport::checked_cuda_device_count() == 0) { SKIP("CUDA unavailable"); }
  SemanticOracleBuffers oracle;
  namespace rfdetr = mmltk::backend::models::rfdetr;
- const std::array annotations{
-  ExploreRenderAnnotationDescriptor{.box_xyxy = {0.0F, 0.0F, 1.0F, 1.0F}, .mask_bounds = {0, 0, 1, 1}, .mask_present = true, .rle_count = 1U}};
+ const std::array annotations{ExploreRenderAnnotationDescriptor{.box_xyxy = {0.0F, 0.0F, 1.0F, 1.0F}, .mask_bounds = {0, 0, 1, 1}, .mask_present = true, .rle_count = 1U}};
  const std::array runs{mmltk::backend::data::RLEPair{.start = 0U, .length = 16U}};
  const std::array classes{ExploreRenderClassDescriptor{}};
  const std::array erasures{

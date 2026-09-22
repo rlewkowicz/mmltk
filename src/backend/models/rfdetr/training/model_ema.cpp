@@ -33,19 +33,17 @@ void ModelEma::validate_cpu_shadow(const std::vector<torch::Tensor>& parameters,
   if (stop.stop_requested()) throw ArtifactPublicationCancelled{};
   const auto& source = cpu_shadow[index];
   const auto& destination = parameters[index];
-  if (!source.defined() || !source.device().is_cpu() || !source.is_floating_point() || source.sizes() != destination.sizes() ||
-      source.scalar_type() != destination.scalar_type() || source.layout() != destination.layout() || !torch::isfinite(source).all().item<bool>())
+  if (!source.defined() || !source.device().is_cpu() || !source.is_floating_point() || source.sizes() != destination.sizes() || source.scalar_type() != destination.scalar_type() ||
+      source.layout() != destination.layout() || !torch::isfinite(source).all().item<bool>())
    throw std::invalid_argument("EMA CPU tensor differs from its active parameter");
  }
 }
-ModelEma ModelEma::from_cpu_shadow(const std::vector<torch::Tensor>& parameters, const std::vector<torch::Tensor>& cpu_shadow, double decay, double tau,
-                                   int64_t completed_updates) {
+ModelEma ModelEma::from_cpu_shadow(const std::vector<torch::Tensor>& parameters, const std::vector<torch::Tensor>& cpu_shadow, double decay, double tau, int64_t completed_updates) {
  if (completed_updates < 0 || completed_updates == std::numeric_limits<int64_t>::max()) throw std::invalid_argument("invalid EMA completed update count");
  validate_cpu_shadow(parameters, cpu_shadow);
  ShadowCandidate candidate;
  candidate.tensors.reserve(parameters.size());
- for (std::size_t index = 0; index < parameters.size(); ++index)
-  candidate.tensors.push_back(cpu_shadow[index].to(parameters[index].device(), cpu_shadow[index].scalar_type(), false, true));
+ for (std::size_t index = 0; index < parameters.size(); ++index) candidate.tensors.push_back(cpu_shadow[index].to(parameters[index].device(), cpu_shadow[index].scalar_type(), false, true));
  return ModelEma(parameters, std::move(candidate), decay, tau, completed_updates);
 }
 ModelEma::Selection::Selection(ModelEma& owner, NativeRfDetrModel& module) : owner_(&owner), module_(&module), training_(module.is_training()) {

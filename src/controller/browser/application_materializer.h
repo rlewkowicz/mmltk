@@ -43,13 +43,12 @@ template <class Schema, class Endpoint>
   ++matched;
  });
  if (duplicate || matched != fields.size()) {
-  return std::unexpected(ApplicationErrorRecord{.category = mmltk::controller::contracts::ApplicationErrorCategory::InvalidIntent,
-                                                .detail = "intent contains an unknown or duplicate field"});
+  return std::unexpected(ApplicationErrorRecord{.category = mmltk::controller::contracts::ApplicationErrorCategory::InvalidIntent, .detail = "intent contains an unknown or duplicate field"});
  }
  Request request{};
  if (!mmltk::frameworks::serialization::decode_into(request, wire::Value(std::move(object)))) {
-  return std::unexpected(ApplicationErrorRecord{.category = mmltk::controller::contracts::ApplicationErrorCategory::InvalidIntent,
-                                                .detail = "intent fields do not satisfy the reflected request declaration"});
+  return std::unexpected(
+   ApplicationErrorRecord{.category = mmltk::controller::contracts::ApplicationErrorCategory::InvalidIntent, .detail = "intent fields do not satisfy the reflected request declaration"});
  }
  return request;
 }
@@ -125,8 +124,7 @@ template <class Composition>
     result.essential_input = std::same_as<typename Endpoint::request_type, WorkspaceMouse>;
     typename Endpoint::request_type request{};
     if (!mmltk::frameworks::serialization::decode_compact_into(
-         request, interaction.Get<&Interaction::value>(),
-         {.max_bytes = kMaxIntentValueBytes, .max_items = kMaxIntentValueItems, .max_depth = kMaxIntentValueDepth})) {
+         request, interaction.Get<&Interaction::value>(), {.max_bytes = kMaxIntentValueBytes, .max_items = kMaxIntentValueItems, .max_depth = kMaxIntentValueDepth})) {
      return;
     }
     try {
@@ -167,11 +165,7 @@ template <auto Member, class Event, class Composition = mmltk::controller::Appli
  using Descriptor = ApplicationEventDescriptor<Composition, Member, Event>;
  auto value = application_materializer_detail::reflected_value(event);
  if (!value) throw std::runtime_error("system event cannot be encoded");
- return {.system_id = Descriptor::system_id,
-         .event_id = Descriptor::event_id,
-         .delivery = Descriptor::delivery,
-         .state_revision = Descriptor::StateRevision(event),
-         .value = std::move(*value)};
+ return {.system_id = Descriptor::system_id, .event_id = Descriptor::event_id, .delivery = Descriptor::delivery, .state_revision = Descriptor::StateRevision(event), .value = std::move(*value)};
 }
 template <class Composition>
 [[nodiscard]] auto materialize_visual_source_readers(const Composition& systems) {
@@ -226,9 +220,7 @@ template <class Composition>
     if (!projected) throw std::runtime_error("workspace image envelope cannot be projected");
     wire::ByteBuffer bytes;
     if (!wire::encode(*projected, bytes,
-                      {.max_bytes = presentation::detail::kWorkspaceMetadataByteCapacity,
-                       .max_items = presentation::detail::kWorkspaceMetadataByteCapacity,
-                       .max_depth = wire::kMaximumNestingDepth}))
+         {.max_bytes = presentation::detail::kWorkspaceMetadataByteCapacity, .max_items = presentation::detail::kWorkspaceMetadataByteCapacity, .max_depth = wire::kMaximumNestingDepth}))
      throw std::runtime_error("workspace image metadata exceeds the graphics envelope");
     return bytes;
    },

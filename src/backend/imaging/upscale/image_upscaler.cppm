@@ -60,13 +60,8 @@ public:
 
 private:
  static constexpr std::uint8_t kInvalidService = std::numeric_limits<std::uint8_t>::max();
- ImageUpscalerClient(std::uint8_t service_slot, std::uint64_t service_generation, std::uint64_t core_generation, std::int32_t device_id,
-                     std::uint64_t device_generation) noexcept
-     : service_slot_(service_slot),
-       service_generation_(service_generation),
-       core_generation_(core_generation),
-       device_id_(device_id),
-       device_generation_(device_generation) {}
+ ImageUpscalerClient(std::uint8_t service_slot, std::uint64_t service_generation, std::uint64_t core_generation, std::int32_t device_id, std::uint64_t device_generation) noexcept
+     : service_slot_(service_slot), service_generation_(service_generation), core_generation_(core_generation), device_id_(device_id), device_generation_(device_generation) {}
  std::uint8_t service_slot_ = kInvalidService;
  std::uint64_t service_generation_ = 0U;
  std::uint64_t core_generation_ = 0U;
@@ -86,10 +81,8 @@ public:
  ImageUpscalerProcessOwner& operator=(ImageUpscalerProcessOwner&&) noexcept;
  ~ImageUpscalerProcessOwner();
  [[nodiscard]] explicit operator bool() const noexcept;
- [[nodiscard]] ImageUpscalerOutcome run_rgba8(ImageUpscalerModelHandle handle, ImageUpscalerMode mode, const std::uint8_t* source, std::size_t source_pitch,
-                                              std::uint32_t width, std::uint32_t height, std::uint8_t* target, std::size_t target_pitch, std::uintptr_t stream,
-                                              ImageUpscalerCurrent current = image_upscaler_current,
-                                              ImageUpscalerPurpose purpose = ImageUpscalerPurpose::Normal);
+ [[nodiscard]] ImageUpscalerOutcome run_rgba8(ImageUpscalerModelHandle handle, ImageUpscalerMode mode, const std::uint8_t* source, std::size_t source_pitch, std::uint32_t width, std::uint32_t height,
+  std::uint8_t* target, std::size_t target_pitch, std::uintptr_t stream, ImageUpscalerCurrent current = image_upscaler_current, ImageUpscalerPurpose purpose = ImageUpscalerPurpose::Normal);
  [[nodiscard]] std::uintptr_t operation_stream(ImageUpscalerMode mode, int device_id, ImageUpscalerCurrent current = image_upscaler_current);
  [[nodiscard]] bool graph_replay(ImageUpscalerMode mode) const;
 
@@ -102,8 +95,8 @@ private:
 class ImageUpscaler final {
 public:
  ~ImageUpscaler();
- [[nodiscard]] static std::expected<std::unique_ptr<ImageUpscaler>, ImageUpscalerStartError> Create(std::int32_t device_id, std::uint64_t device_generation,
-                                                                                                    ImageUpscalerAggregateConfig config) noexcept;
+ [[nodiscard]] static std::expected<std::unique_ptr<ImageUpscaler>, ImageUpscalerStartError> Create(
+  std::int32_t device_id, std::uint64_t device_generation, ImageUpscalerAggregateConfig config) noexcept;
  [[nodiscard]] std::expected<void, ImageUpscalerStartError> Activate() noexcept;
  ImageUpscaler(const ImageUpscaler&) = delete;
  ImageUpscaler& operator=(const ImageUpscaler&) = delete;

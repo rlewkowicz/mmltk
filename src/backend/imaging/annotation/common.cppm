@@ -49,8 +49,6 @@ struct AnnotationFrame {
  static const std::vector<std::uint8_t> kEmptyAnnotationPixels;
  return frame.pixels_bgr != nullptr ? *frame.pixels_bgr : kEmptyAnnotationPixels;
 }
-inline void set_annotation_frame_pixels(AnnotationFrame& frame, std::vector<std::uint8_t> pixels) {
- frame.pixels_bgr = std::make_shared<const std::vector<std::uint8_t>>(std::move(pixels));
-}
+inline void set_annotation_frame_pixels(AnnotationFrame& frame, std::vector<std::uint8_t> pixels) { frame.pixels_bgr = std::make_shared<const std::vector<std::uint8_t>>(std::move(pixels)); }
 using AnnotationMaskRegion = MaskRegion;
 }  // namespace mmltk::backend::imaging::annotation

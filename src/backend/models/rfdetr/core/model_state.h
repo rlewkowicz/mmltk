@@ -49,8 +49,7 @@ struct NativeCheckpointMetadata {
  std::optional<double> set_cost_giou;
  template <class Self, class Visitor>
  void for_each_detection_field(this Self&& self, Visitor&& visitor) {
-  template for (constexpr auto member :
-                std::define_static_array(std::meta::nonstatic_data_members_of(^^NativeCheckpointMetadata, std::meta::access_context::current()))) {
+  template for (constexpr auto member : std::define_static_array(std::meta::nonstatic_data_members_of(^^NativeCheckpointMetadata, std::meta::access_context::current()))) {
    using Field = std::remove_cvref_t<decltype(self.[:member:])>;
    if constexpr (model_state_detail::is_optional<Field>) {
     constexpr auto name = std::define_static_string(std::meta::identifier_of(member));
@@ -91,13 +90,11 @@ enum class ModelStateContainer { Unknown, Python, Native };
 [[nodiscard]] ModelStateContainer identify_model_state_container(const std::filesystem::path&);
 [[nodiscard]] bool is_native_checkpoint_file(const std::filesystem::path& checkpoint_path);
 [[nodiscard]] DecodedNativeModelState decode_native_model_state(const std::filesystem::path& checkpoint_path, std::stop_token stop = {});
-[[nodiscard]] DecodedNativeModelState decode_model_state(const std::filesystem::path& checkpoint_path,
-                                                         std::shared_ptr<const ClassArtifactAdmission> admission = {},
-                                                         const std::filesystem::path& class_layout_path = {}, std::stop_token stop = {});
+[[nodiscard]] DecodedNativeModelState decode_model_state(
+ const std::filesystem::path& checkpoint_path, std::shared_ptr<const ClassArtifactAdmission> admission = {}, const std::filesystem::path& class_layout_path = {}, std::stop_token stop = {});
 void write_upstream_model_state(const std::filesystem::path& checkpoint_path, const DecodedNativeModelState& model_state);
-[[nodiscard]] ResolvedModelState resolve_model_state(const std::filesystem::path& weights_path, std::string_view preset_name, int resolution,
-                                                     const std::filesystem::path& class_layout_path = {},
-                                                     std::shared_ptr<const ClassArtifactAdmission> admission = {}, std::stop_token stop = {});
+[[nodiscard]] ResolvedModelState resolve_model_state(const std::filesystem::path& weights_path, std::string_view preset_name, int resolution, const std::filesystem::path& class_layout_path = {},
+ std::shared_ptr<const ClassArtifactAdmission> admission = {}, std::stop_token stop = {});
 [[nodiscard]] NativeCheckpointMetadata make_native_checkpoint_metadata(const ResolvedModelArtifacts& artifacts, int64_t num_classes);
 [[nodiscard]] ResolvedModelArtifacts resolve_model_artifacts(const std::filesystem::path& weights_path, std::string_view preset_name, int resolution);
 }  // namespace mmltk::backend::models::rfdetr

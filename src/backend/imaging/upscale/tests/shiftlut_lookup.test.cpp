@@ -218,8 +218,7 @@ TEST_CASE("Direct neural tile preparation preserves FP32 lookup decisions and pi
  DeviceBuffer device_reference(3U * width * height * sizeof(float));
  Stream stream;
  REQUIRE(cudaMemcpyAsync(device_source.as<void>(), source.data(), source.size(), cudaMemcpyHostToDevice, stream.get()) == cudaSuccess);
- mmltk::backend::imaging::upscale::tests::normalize_reference(device_source.as<std::uint8_t>(), pitch, width, height, device_reference.as<float>(),
-                                                              stream.get());
+ mmltk::backend::imaging::upscale::tests::normalize_reference(device_source.as<std::uint8_t>(), pitch, width, height, device_reference.as<float>(), stream.get());
  const std::uint32_t halo = lut ? 32U : 16U;
  const std::uint32_t crop_x = width > 1 ? 1U : 0U;
  const auto crop_width = width - crop_x;
@@ -228,8 +227,7 @@ TEST_CASE("Direct neural tile preparation preserves FP32 lookup decisions and pi
  const auto crop_height = height - crop_y;
  const auto origin = crop_width > 192 ? 192U : 0U;
  const tiles::Tile tile{.origin_x = origin, .origin_y = 0, .core_width = std::min(192U, crop_width - origin), .core_height = crop_height};
- tiles::prepare_tile(device_source.as<std::uint8_t>(), pitch, width, height, crop_x, crop_y, crop_width, crop_height, tile, lut, halo, device_tile.as<float>(),
-                     stream.get());
+ tiles::prepare_tile(device_source.as<std::uint8_t>(), pitch, width, height, crop_x, crop_y, crop_width, crop_height, tile, lut, halo, device_tile.as<float>(), stream.get());
  REQUIRE(cudaStreamSynchronize(stream.get()) == cudaSuccess);
  std::vector<float> actual(3U * 256U * 256U);
  REQUIRE(cudaMemcpy(actual.data(), device_tile.as<void>(), actual.size() * sizeof(float), cudaMemcpyDeviceToHost) == cudaSuccess);
@@ -243,8 +241,7 @@ TEST_CASE("Direct neural tile preparation preserves FP32 lookup decisions and pi
   const auto y = reflected(static_cast<int>(index / 256U % 256U) - static_cast<int>(halo), static_cast<int>(crop_height)) + static_cast<int>(crop_y);
   const float byte = source[static_cast<std::size_t>(y) * pitch + static_cast<std::size_t>(x) * 4 + channel];
   const float normalized = std::fma(byte, 1.0F / 255.0F, -means[channel]) / deviations[channel];
-  REQUIRE(std::bit_cast<std::uint32_t>(normalized) ==
-          std::bit_cast<std::uint32_t>(reference[channel * width * height + static_cast<std::size_t>(y) * width + static_cast<std::size_t>(x)]));
+  REQUIRE(std::bit_cast<std::uint32_t>(normalized) == std::bit_cast<std::uint32_t>(reference[channel * width * height + static_cast<std::size_t>(y) * width + static_cast<std::size_t>(x)]));
   const float expected = std::clamp(std::fma(normalized, deviations[channel], means[channel]), 0.0F, 1.0F) * (lut ? 255.0F : 1.0F);
   REQUIRE(std::bit_cast<std::uint32_t>(actual[index]) == std::bit_cast<std::uint32_t>(expected));
   REQUIRE(std::floor(actual[index] / 4.0F) == std::floor(expected / 4.0F));
@@ -277,8 +274,7 @@ TEST_CASE("Direct tile stitching preserves rounding ties alpha seams and pitched
  REQUIRE(cudaMemcpyAsync(input.as<void>(), model.data(), model.size() * sizeof(float), cudaMemcpyHostToDevice, stream.get()) == cudaSuccess);
  REQUIRE(cudaMemcpyAsync(target.as<void>(), result.data(), result.size(), cudaMemcpyHostToDevice, stream.get()) == cudaSuccess);
  std::vector<tiles::Tile> layout;
- for (std::uint32_t x = 0U; x < source_width; x += 47U)
-  layout.push_back({.origin_x = x, .origin_y = 0U, .core_width = std::min(47U, source_width - x), .core_height = source_height});
+ for (std::uint32_t x = 0U; x < source_width; x += 47U) layout.push_back({.origin_x = x, .origin_y = 0U, .core_width = std::min(47U, source_width - x), .core_height = source_height});
  const auto halo = lut ? 32U : 16U;
  for (const auto tile : layout) tiles::stitch_tile(input.as<float>(), tile, lut, halo, target.as<std::uint8_t>(), pitch, width, height, stream.get());
  REQUIRE(cudaStreamSynchronize(stream.get()) == cudaSuccess);
@@ -337,8 +333,7 @@ TEST_CASE("Resident ShiftLUT tiled RGBA matches independent upstream oracles acr
    for (int pattern = 0; pattern < 2; ++pattern) {
     const auto pixels = oracle("source", width, height, pattern, width * height * 4U);
     const auto expected = oracle("expected", width, height, pattern, width * height * 64U);
-    REQUIRE(cudaMemcpy2DAsync(source.as<void>(), source_pitch, pixels.data(), width * 4U, width * 4U, height, cudaMemcpyHostToDevice, stream.get()) ==
-            cudaSuccess);
+    REQUIRE(cudaMemcpy2DAsync(source.as<void>(), source_pitch, pixels.data(), width * 4U, width * 4U, height, cudaMemcpyHostToDevice, stream.get()) == cudaSuccess);
     REQUIRE(cudaMemsetAsync(target.as<void>(), 0xB7, target_pitch * height * 4U, stream.get()) == cudaSuccess);
     for (std::uint32_t y = 0; y < height; y += 192U) {
      for (std::uint32_t x = 0; x < width; x += 192U) {
@@ -354,7 +349,7 @@ TEST_CASE("Resident ShiftLUT tiled RGBA matches independent upstream oracles acr
     REQUIRE(cudaMemcpy(actual.data(), target.as<void>(), actual.size(), cudaMemcpyDeviceToHost) == cudaSuccess);
     for (std::size_t y = 0; y < height * 4U; ++y) {
      REQUIRE(std::equal(expected.begin() + static_cast<std::ptrdiff_t>(y * width * 16U), expected.begin() + static_cast<std::ptrdiff_t>((y + 1) * width * 16U),
-                        actual.begin() + static_cast<std::ptrdiff_t>(y * target_pitch)));
+      actual.begin() + static_cast<std::ptrdiff_t>(y * target_pitch)));
      for (std::size_t byte = width * 16U; byte < target_pitch; ++byte) REQUIRE(actual[y * target_pitch + byte] == 0xB7);
     }
    }

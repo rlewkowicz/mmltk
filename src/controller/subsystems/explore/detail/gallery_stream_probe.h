@@ -68,13 +68,11 @@ private:
  cudaStream_t diagnostic_stream_ = nullptr;
  cudaEvent_t probes_ready_ = nullptr;
  bool probes_disabled_ = false;
- void DiagnoseRendered(const GalleryProductState&, const GalleryDescriptorStorage&, mmltk::frameworks::gpu::ImagePlaneView, const GalleryThumbnailCache*,
-                       mmltk::frameworks::gpu::ImagePlaneView, mmltk::frameworks::gpu::ImagePlaneView, std::uintptr_t, std::uint64_t, std::uint64_t,
-                       std::uint32_t, std::optional<std::size_t>, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t);
- static void DiagnoseDescriptors(const GalleryDescriptorStorage&, VisualDiagnosticSink, int, std::uint64_t, std::uint64_t, std::size_t, std::size_t,
-                                 std::size_t);
- static void DiagnosePreparedImage(const ExploreRenderPlan&, const GalleryReadScheduler&, const mmltk::backend::models::rfdetr::GpuAugmentationExecutor&,
-                                   VisualDiagnosticSink, const GalleryReadScheduler::Lane&, std::size_t, std::size_t) noexcept;
+ void DiagnoseRendered(const GalleryProductState&, const GalleryDescriptorStorage&, mmltk::frameworks::gpu::ImagePlaneView, const GalleryThumbnailCache*, mmltk::frameworks::gpu::ImagePlaneView,
+  mmltk::frameworks::gpu::ImagePlaneView, std::uintptr_t, std::uint64_t, std::uint64_t, std::uint32_t, std::optional<std::size_t>, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t);
+ static void DiagnoseDescriptors(const GalleryDescriptorStorage&, VisualDiagnosticSink, int, std::uint64_t, std::uint64_t, std::size_t, std::size_t, std::size_t);
+ static void DiagnosePreparedImage(const ExploreRenderPlan&, const GalleryReadScheduler&, const mmltk::backend::models::rfdetr::GpuAugmentationExecutor&, VisualDiagnosticSink,
+  const GalleryReadScheduler::Lane&, std::size_t, std::size_t) noexcept;
  void FlushProbes(std::uintptr_t);
  bool InitializeProbes() noexcept;
  void CollectProbes() noexcept;

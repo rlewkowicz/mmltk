@@ -103,8 +103,8 @@ public:
  TiledImageUpscalerRuntimeState(ImageUpscalerDescriptor descriptor, int device_id);
  ~TiledImageUpscalerRuntimeState();
  [[nodiscard]] ImageUpscalerOutcome Activate(const ImageUpscalerExecutionCheckpoint&, ImageUpscalerCurrent);
- [[nodiscard]] ImageUpscalerRuntimeOutput enqueue(const ImageUpscalerRequest& request, cudaStream_t consumer_stream, void* backend,
-                                                  ImageUpscalerSubmitTiles submit_tiles, const ImageUpscalerExecutionCheckpoint&);
+ [[nodiscard]] ImageUpscalerRuntimeOutput enqueue(
+  const ImageUpscalerRequest& request, cudaStream_t consumer_stream, void* backend, ImageUpscalerSubmitTiles submit_tiles, const ImageUpscalerExecutionCheckpoint&);
  void mark_consumed(cudaStream_t stream);
  void abandon_consumer() noexcept;
  [[nodiscard]] cudaError_t Stop(void* backend, ImageUpscalerReleaseBackend release_backend, const ImageUpscalerExecutionCheckpoint&) noexcept;
@@ -148,9 +148,7 @@ public:
  [[nodiscard]] cudaError_t Stop() noexcept final {
   return state_.Stop(&owner(), [](void* context) noexcept { return static_cast<BackendOwner*>(context)->ReleaseBackend(); }, checkpoint_);
  }
- [[nodiscard]] std::exception_ptr cleanup_failure() const noexcept final {
-  return mmltk::frameworks::gpu::combine_image_failures(state_.cleanup_failure(), owner().cleanup_.failure());
- }
+ [[nodiscard]] std::exception_ptr cleanup_failure() const noexcept final { return mmltk::frameworks::gpu::combine_image_failures(state_.cleanup_failure(), owner().cleanup_.failure()); }
 
 protected:
  [[nodiscard]] const ImageUpscalerDescriptor& descriptor() const noexcept { return state_.descriptor(); }
@@ -166,10 +164,8 @@ private:
  TiledImageUpscalerRuntimeState state_;
  ImageUpscalerExecutionCheckpoint checkpoint_;
 };
-[[nodiscard]] std::shared_ptr<ImageUpscalerRuntime> make_onnx_upscaler_runtime(const ImageUpscalerDescriptor& descriptor,
-                                                                               const std::filesystem::path& model_path, int device_id,
-                                                                               const ImageUpscalerExecutionCheckpoint&);
-[[nodiscard]] std::shared_ptr<ImageUpscalerRuntime> make_tensorrt_upscaler_runtime(const ImageUpscalerDescriptor& descriptor,
-                                                                                   std::unique_ptr<TensorRtEngine> engine, int device_id,
-                                                                                   const ImageUpscalerExecutionCheckpoint&);
+[[nodiscard]] std::shared_ptr<ImageUpscalerRuntime> make_onnx_upscaler_runtime(
+ const ImageUpscalerDescriptor& descriptor, const std::filesystem::path& model_path, int device_id, const ImageUpscalerExecutionCheckpoint&);
+[[nodiscard]] std::shared_ptr<ImageUpscalerRuntime> make_tensorrt_upscaler_runtime(
+ const ImageUpscalerDescriptor& descriptor, std::unique_ptr<TensorRtEngine> engine, int device_id, const ImageUpscalerExecutionCheckpoint&);
 }  // namespace mmltk::backend::imaging::upscale

@@ -4,8 +4,7 @@
 #include <cstdint>
 #include "manual_mask_mapping_abi.h"
 namespace mmltk::backend::imaging::annotation::detail {
-[[nodiscard]] __host__ __device__ inline std::uint32_t project_crop_coordinate(const std::uint32_t output_coordinate, const std::uint32_t crop_extent,
-                                                                               const std::uint32_t output_extent) noexcept {
+[[nodiscard]] __host__ __device__ inline std::uint32_t project_crop_coordinate(const std::uint32_t output_coordinate, const std::uint32_t crop_extent, const std::uint32_t output_extent) noexcept {
  if (output_extent == 0U) { return 0U; }
  const std::uint32_t extent_quotient = crop_extent / output_extent;
  const std::uint32_t extent_remainder = crop_extent % output_extent;

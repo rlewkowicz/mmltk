@@ -119,17 +119,14 @@ template <auto Member>
 [[nodiscard]] bool append_matcher_statistic(char* const record, const std::size_t capacity, int& length, const MatcherStatistics& statistics) noexcept {
  constexpr auto name = std::meta::identifier_of(Member);
  const auto remaining = capacity - static_cast<std::size_t>(length);
- const int appended = std::snprintf(record + length, remaining, ",\"%.*s\":%llu", static_cast<int>(name.size()), name.data(),
-                                    static_cast<unsigned long long>(statistics.[:Member:]));
+ const int appended = std::snprintf(record + length, remaining, ",\"%.*s\":%llu", static_cast<int>(name.size()), name.data(), static_cast<unsigned long long>(statistics.[:Member:]));
  if (appended < 0 || static_cast<std::size_t>(appended) >= remaining) return false;
  length += appended;
  return true;
 }
-inline constexpr auto kMatcherStatisticMembers =
- std::define_static_array(std::meta::nonstatic_data_members_of(^^MatcherStatistics, std::meta::access_context::current()));
+inline constexpr auto kMatcherStatisticMembers = std::define_static_array(std::meta::nonstatic_data_members_of(^^MatcherStatistics, std::meta::access_context::current()));
 template <std::size_t... Indices>
-[[nodiscard]] bool append_matcher_statistics(char* const record, const std::size_t capacity, int& length, const MatcherStatistics& statistics,
-                                             std::index_sequence<Indices...>) noexcept {
+[[nodiscard]] bool append_matcher_statistics(char* const record, const std::size_t capacity, int& length, const MatcherStatistics& statistics, std::index_sequence<Indices...>) noexcept {
  return (append_matcher_statistic<kMatcherStatisticMembers[Indices]>(record, capacity, length, statistics) && ...);
 }
 }  // namespace
@@ -150,8 +147,7 @@ struct MatcherWorkspace::State {
  void log(const char* event) const noexcept {
   if (trace.get() < 0) return;
   char record[768];
-  int length =
-   std::snprintf(record, sizeof(record), "{\"event\":\"%s\",\"device\":%d,\"transport\":\"%s\"", event, context ? context->device : -1, h2d ? "h2d" : "gdr");
+  int length = std::snprintf(record, sizeof(record), "{\"event\":\"%s\",\"device\":%d,\"transport\":\"%s\"", event, context ? context->device : -1, h2d ? "h2d" : "gdr");
   if (length < 0 || static_cast<std::size_t>(length) >= sizeof(record)) return;
   if (!append_matcher_statistics(record, sizeof(record), length, statistics, std::make_index_sequence<kMatcherStatisticMembers.size()>{})) return;
   if (static_cast<std::size_t>(length) + 2 > sizeof(record)) return;
@@ -210,8 +206,7 @@ at::Tensor MatcherWorkspace::cpu_indices(std::int64_t count) {
  return at::from_blob(storage->data(), {2, count}, [storage](void*) {}, at::TensorOptions().dtype(at::kLong));
 }
 void MatcherWorkspace::prepare_cost(at::IntArrayRef shape, const at::Device& device) {
- if (shape.size() != 4 || !device.is_cuda() || !device.has_index())
-  throw std::invalid_argument("matcher cost storage requires four dimensions and an explicit CUDA device");
+ if (shape.size() != 4 || !device.is_cuda() || !device.has_index()) throw std::invalid_argument("matcher cost storage requires four dimensions and an explicit CUDA device");
  c10::cuda::CUDAGuard guard(device);
  state_->bind(device);
  std::int64_t elements = 1;
@@ -236,8 +231,7 @@ at::Tensor MatcherWorkspace::read_cost() {
  state_->bind(at::Device(at::kCUDA, device_index));
  const auto stream = c10::cuda::getCurrentCUDAStream(device_index);
  const auto bytes = state_->cost->device_cost.nbytes();
- check(cuMemcpyDtoHAsync(state_->cost->cpu_cost.data_ptr(), reinterpret_cast<CUdeviceptr>(state_->cost->device_cost.data_ptr()), bytes, stream.stream()),
-       "copy active matcher costs");
+ check(cuMemcpyDtoHAsync(state_->cost->cpu_cost.data_ptr(), reinterpret_cast<CUdeviceptr>(state_->cost->device_cost.data_ptr()), bytes, stream.stream()), "copy active matcher costs");
  check(cuEventRecord(state_->cost->complete, stream.stream()), "record matcher cost completion");
  check(cuEventSynchronize(state_->cost->complete), "complete matcher cost copy");
  state_->cost->pending = false;
@@ -249,17 +243,17 @@ at::Tensor MatcherWorkspace::read_cost() {
  mmltk::common::logging::profile_add_value("rfdetr.matcher.cost_d2h_bytes", bytes);
  return state_->cost->cpu_cost;
 }
-std::vector<MatcherLayerIndices> MatcherWorkspace::pack(const std::vector<std::vector<std::pair<at::Tensor, at::Tensor>>>& indices,
-                                                        const std::vector<std::int64_t>& target_offsets, const at::Device& device) {
+std::vector<MatcherLayerIndices> MatcherWorkspace::pack(
+ const std::vector<std::vector<std::pair<at::Tensor, at::Tensor>>>& indices, const std::vector<std::int64_t>& target_offsets, const at::Device& device) {
  if (!device.is_cpu() && !device.is_cuda()) throw std::invalid_argument("matcher assignments require a CPU or CUDA device");
  std::vector<std::int64_t> offsets{0};
  for (const auto& layer : indices) {
   if (layer.size() != target_offsets.size()) throw std::invalid_argument("matcher assignment target offsets do not match the batch");
   auto count = offsets.back();
   for (const auto& pair : layer) {
-   if (!pair.first.device().is_cpu() || !pair.second.device().is_cpu() || pair.first.scalar_type() != at::kLong || pair.second.scalar_type() != at::kLong ||
-       pair.first.dim() != 1 || pair.second.dim() != 1 || !pair.first.is_contiguous() || !pair.second.is_contiguous() ||
-       pair.first.numel() != pair.second.numel() || pair.first.numel() > std::numeric_limits<std::int64_t>::max() / 24 - count)
+   if (!pair.first.device().is_cpu() || !pair.second.device().is_cpu() || pair.first.scalar_type() != at::kLong || pair.second.scalar_type() != at::kLong || pair.first.dim() != 1 ||
+       pair.second.dim() != 1 || !pair.first.is_contiguous() || !pair.second.is_contiguous() || pair.first.numel() != pair.second.numel() ||
+       pair.first.numel() > std::numeric_limits<std::int64_t>::max() / 24 - count)
     throw std::invalid_argument("matcher assignment indices require equal contiguous CPU int64 vectors");
    count += pair.first.numel();
   }
@@ -322,8 +316,7 @@ std::vector<MatcherLayerIndices> MatcherWorkspace::pack(const std::vector<std::v
     state_->count(&MatcherStatistics::storage_growth);
     mmltk::common::logging::profile_add_value("rfdetr.matcher.assignment_storage_growth", 1);
    }
-   if (!slot->physical->mapped->write(0, {reinterpret_cast<const std::byte*>(data), packed.nbytes()}))
-    throw std::runtime_error("matcher assignment upload cancelled");
+   if (!slot->physical->mapped->write(0, {reinterpret_cast<const std::byte*>(data), packed.nbytes()})) throw std::runtime_error("matcher assignment upload cancelled");
    slot->physical->lease.emplace(slot->physical->mapped->borrow());
    destination = reinterpret_cast<void*>(slot->physical->lease->device_data());
    state_->count(&MatcherStatistics::gdr_writes);
@@ -334,8 +327,7 @@ std::vector<MatcherLayerIndices> MatcherWorkspace::pack(const std::vector<std::v
     mmltk::common::logging::profile_add_value("rfdetr.matcher.assignment_storage_growth", 1);
    }
    destination = slot->physical->device_values.data_ptr();
-   check(cuMemcpyHtoDAsync(reinterpret_cast<CUdeviceptr>(destination), data, packed.nbytes(), c10::cuda::getCurrentCUDAStream(device.index()).stream()),
-         "upload packed assignments");
+   check(cuMemcpyHtoDAsync(reinterpret_cast<CUdeviceptr>(destination), data, packed.nbytes(), c10::cuda::getCurrentCUDAStream(device.index()).stream()), "upload packed assignments");
    mmltk::common::logging::profile_add_value("rfdetr.matcher.assignment_h2d_submissions", 1);
    state_->count(&MatcherStatistics::h2d_submissions);
   }
@@ -350,9 +342,8 @@ std::vector<MatcherLayerIndices> MatcherWorkspace::pack(const std::vector<std::v
  for (std::size_t layer = 0; layer < indices.size(); ++layer) {
   const auto begin = offsets[layer];
   const auto size = offsets[layer + 1] - begin;
-  result.push_back({{packed.select(0, 0).narrow(0, begin, size), packed.select(0, 1).narrow(0, begin, size)},
-                    packed.select(0, 2).narrow(0, begin, size),
-                    {cpu_packed.select(0, 0).narrow(0, begin, size), cpu_packed.select(0, 1).narrow(0, begin, size)}});
+  result.push_back({{packed.select(0, 0).narrow(0, begin, size), packed.select(0, 1).narrow(0, begin, size)}, packed.select(0, 2).narrow(0, begin, size),
+   {cpu_packed.select(0, 0).narrow(0, begin, size), cpu_packed.select(0, 1).narrow(0, begin, size)}});
  }
  state_->log("assignment_complete");
  return result;

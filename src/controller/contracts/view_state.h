@@ -35,15 +35,14 @@ enum class SourceKind : std::uint8_t {
 };
 struct SourceSelectionState {
  SourceKind kind = SourceKind::CompiledDataset;
- [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]]
-  [[= reflection::FileDialog<"Select compiled dataset", "Compiled datasets", "*.mmltk *.bin">{.mode = FileDialogMode::OpenFile}]] std::string compiled_path;
- [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]]
-  [[= reflection::FileDialog<"Select image", "Images", "*.png *.jpg *.jpeg *.bmp *.webp">{.mode = FileDialogMode::OpenFile}]] std::string single_image_path;
- [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]]
-  [[= reflection::FileDialog<"Select image directory", "Directories", "*">{.mode = FileDialogMode::OpenFolder}]] std::string image_directory;
+ [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]][
+  [= reflection::FileDialog<"Select compiled dataset", "Compiled datasets", "*.mmltk *.bin">{.mode = FileDialogMode::OpenFile}]] std::string compiled_path;
+ [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]][
+  [= reflection::FileDialog<"Select image", "Images", "*.png *.jpg *.jpeg *.bmp *.webp">{.mode = FileDialogMode::OpenFile}]] std::string single_image_path;
  [[= mmltk::frameworks::reflection::MaxBytes{
-  mmltk::frameworks::reflection::kMaximumPathBytes}]][[= reflection::FileDialog<"Select video file", "Video files", "*.mp4 *.mkv *.mov *.avi *.webm *.m4v">{
-  .mode = FileDialogMode::OpenFile}]] std::string video_file_path;
+  mmltk::frameworks::reflection::kMaximumPathBytes}]][[= reflection::FileDialog<"Select image directory", "Directories", "*">{.mode = FileDialogMode::OpenFolder}]] std::string image_directory;
+ [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]][
+  [= reflection::FileDialog<"Select video file", "Video files", "*.mp4 *.mkv *.mov *.avi *.webm *.m4v">{.mode = FileDialogMode::OpenFile}]] std::string video_file_path;
  bool recursive = false;
  [[= mmltk::frameworks::reflection::Minimum<int>{0}]] int device_index = 0;
  [[= mmltk::frameworks::reflection::Minimum<int>{1}]] int capture_width = 1920;
@@ -89,10 +88,9 @@ inline constexpr std::string_view kDefaultModelPresetName = mmltk::backend::mode
 inline constexpr int kDefaultModelResolution = static_cast<int>(mmltk::backend::models::rfdetr::kPresetCatalog.front().resolution);
 inline constexpr int kMaxExploreGridColumns = 99;
 struct WorkflowModelSelectionState {
- [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumNameBytes}]]
-  [[= mmltk::frameworks::reflection::Presentation<mmltk::frameworks::reflection::PresentationKind::Preset>{}]]
-  [[= mmltk::frameworks::reflection::CatalogProvider<mmltk::backend::models::rfdetr::RfdetrPresetCatalog>{}]] std::string preset_name{
-   std::string(kDefaultModelPresetName)};
+ [[= mmltk::frameworks::reflection::MaxBytes{
+  mmltk::frameworks::reflection::kMaximumNameBytes}]][[= mmltk::frameworks::reflection::Presentation<mmltk::frameworks::reflection::PresentationKind::Preset>{}]][
+  [= mmltk::frameworks::reflection::CatalogProvider<mmltk::backend::models::rfdetr::RfdetrPresetCatalog>{}]] std::string preset_name{std::string(kDefaultModelPresetName)};
  [[= mmltk::frameworks::reflection::Minimum<int>{1}]] int model_resolution = kDefaultModelResolution;
  ModelSelectionSource model_source = ModelSelectionSource::Canonical;
  ModelArtifactInputKind model_input = ModelArtifactInputKind::None;
@@ -100,25 +98,18 @@ struct WorkflowModelSelectionState {
 struct UiSettingsState {
  bool dark_mode = false;
  bool show_workspace_performance = false;
- [[= mmltk::frameworks::reflection::Minimum<float>{
-  0.85F}]][[= mmltk::frameworks::reflection::Maximum<float>{1.75F}]][[= mmltk::frameworks::reflection::Finite{}]] float ui_scale = 1.0f;
- [[= mmltk::frameworks::reflection::Minimum<float>{
-  10.0F}]][[= mmltk::frameworks::reflection::Maximum<float>{32.0F}]][[= mmltk::frameworks::reflection::Finite{}]] float font_size = 14.0f;
- [[= mmltk::frameworks::reflection::Minimum<float>{
-  9.0F}]][[= mmltk::frameworks::reflection::Maximum<float>{28.0F}]][[= mmltk::frameworks::reflection::Finite{}]] float secondary_font_size = 12.0f;
- [[= mmltk::frameworks::reflection::Minimum<float>{
-  9.0F}]][[= mmltk::frameworks::reflection::Maximum<float>{28.0F}]][[= mmltk::frameworks::reflection::Finite{}]] float mono_font_size = 12.0f;
- [[= mmltk::frameworks::reflection::Minimum<float>{
-  9.0F}]][[= mmltk::frameworks::reflection::Maximum<float>{31.0F}]][[= mmltk::frameworks::reflection::Finite{}]] float text_input_font_size = 13.0f;
+ [[= mmltk::frameworks::reflection::Minimum<float>{0.85F}]][[= mmltk::frameworks::reflection::Maximum<float>{1.75F}]][[= mmltk::frameworks::reflection::Finite{}]] float ui_scale = 1.0f;
+ [[= mmltk::frameworks::reflection::Minimum<float>{10.0F}]][[= mmltk::frameworks::reflection::Maximum<float>{32.0F}]][[= mmltk::frameworks::reflection::Finite{}]] float font_size = 14.0f;
+ [[= mmltk::frameworks::reflection::Minimum<float>{9.0F}]][[= mmltk::frameworks::reflection::Maximum<float>{28.0F}]][[= mmltk::frameworks::reflection::Finite{}]] float secondary_font_size = 12.0f;
+ [[= mmltk::frameworks::reflection::Minimum<float>{9.0F}]][[= mmltk::frameworks::reflection::Maximum<float>{28.0F}]][[= mmltk::frameworks::reflection::Finite{}]] float mono_font_size = 12.0f;
+ [[= mmltk::frameworks::reflection::Minimum<float>{9.0F}]][[= mmltk::frameworks::reflection::Maximum<float>{31.0F}]][[= mmltk::frameworks::reflection::Finite{}]] float text_input_font_size = 13.0f;
  [[= mmltk::frameworks::reflection::Minimum<float>{0.0F}]][[= mmltk::frameworks::reflection::Finite{}]] float crop_edge_hit_half_width = 8.0f;
  [[= mmltk::frameworks::reflection::Minimum<float>{0.0F}]][[= mmltk::frameworks::reflection::Finite{}]] float crop_corner_hit_size = 20.0f;
  [[= mmltk::frameworks::reflection::Minimum<float>{0.0F}]][[= mmltk::frameworks::reflection::Finite{}]] float crop_handle_radius = 6.0f;
  WorkspaceAspectRatio workspace_aspect_ratio = WorkspaceAspectRatio::Widescreen;
- [[= mmltk::frameworks::reflection::Minimum<int>{
-  kMinAnnotationBrushRadius}]][[= mmltk::frameworks::reflection::Maximum<int>{kMaxAnnotationBrushRadius}]] int annotation_brush_radius =
+ [[= mmltk::frameworks::reflection::Minimum<int>{kMinAnnotationBrushRadius}]][[= mmltk::frameworks::reflection::Maximum<int>{kMaxAnnotationBrushRadius}]] int annotation_brush_radius =
   kDefaultAnnotationBrushRadius;
- [[= mmltk::frameworks::reflection::Minimum<int>{
-  kMinAnnotationMaskCleanupRadius}]][[= mmltk::frameworks::reflection::Maximum<int>{kMaxAnnotationMaskCleanupRadius}]] int mask_cleanup_radius =
+ [[= mmltk::frameworks::reflection::Minimum<int>{kMinAnnotationMaskCleanupRadius}]][[= mmltk::frameworks::reflection::Maximum<int>{kMaxAnnotationMaskCleanupRadius}]] int mask_cleanup_radius =
   kDefaultAnnotationMaskCleanupRadius;
 };
 struct ModelArtifactSelectionState {
@@ -127,10 +118,9 @@ struct ModelArtifactSelectionState {
  [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]] std::string onnx_path;
  [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]] std::string tensorrt_path;
  // CLEANUP-IGNORE: The normalized artifact projection and stored workflow selection have different field ownership.
- [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumNameBytes}]]
-  [[= mmltk::frameworks::reflection::Presentation<mmltk::frameworks::reflection::PresentationKind::Preset>{}]]
-  [[= mmltk::frameworks::reflection::CatalogProvider<mmltk::backend::models::rfdetr::RfdetrPresetCatalog>{}]] std::string preset_name{
-   std::string(kDefaultModelPresetName)};
+ [[= mmltk::frameworks::reflection::MaxBytes{
+  mmltk::frameworks::reflection::kMaximumNameBytes}]][[= mmltk::frameworks::reflection::Presentation<mmltk::frameworks::reflection::PresentationKind::Preset>{}]][
+  [= mmltk::frameworks::reflection::CatalogProvider<mmltk::backend::models::rfdetr::RfdetrPresetCatalog>{}]] std::string preset_name{std::string(kDefaultModelPresetName)};
  [[= mmltk::frameworks::reflection::Minimum<int>{1}]] int resolution = kDefaultModelResolution;
  ModelSelectionSource source = ModelSelectionSource::Canonical;
  ModelArtifactInputKind input = ModelArtifactInputKind::None;
@@ -161,11 +151,9 @@ struct TrainViewState : TrainExecutionPaneState {
  mmltk::backend::models::rfdetr::TrainRequest request;
  ModelSelectionSource model_source = ModelSelectionSource::Canonical;
  ModelArtifactInputKind model_input = ModelArtifactInputKind::Weights;
- [[= mmltk::frameworks::reflection::MaxBytes{
-  mmltk::frameworks::reflection::kMaximumPathBytes}]][[= mmltk::controller::contracts::reflection::FileDialog<"Select dataset source", "Directories", "*">{
+ [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]][[= mmltk::controller::contracts::reflection::FileDialog<"Select dataset source", "Directories", "*">{
   .mode = mmltk::controller::contracts::FileDialogMode::OpenFolder}]] std::string dataset_source_dir = "./dataset";
- [[= mmltk::frameworks::reflection::MaxBytes{
-  mmltk::frameworks::reflection::kMaximumPathBytes}]][[= mmltk::controller::contracts::reflection::FileDialog<"Select compiled dataset", "Directories", "*">{
+ [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]][[= mmltk::controller::contracts::reflection::FileDialog<"Select compiled dataset", "Directories", "*">{
   .mode = mmltk::controller::contracts::FileDialogMode::OpenFolder}]] std::string compiled_dataset_dir = "./compiled";
  bool auto_output = true;
  bool use_compiled_directory_defaults = true;
@@ -206,27 +194,23 @@ struct PredictViewState {
 struct AnnotateViewState : WorkflowModelSelectionState {
  AnnotateViewState() { source.kind = SourceKind::ImageFolder; }
  SourceSelectionState source;
+ [[= mmltk::frameworks::reflection::MaxBytes{
+  mmltk::frameworks::reflection::kMaximumPathBytes}]][[= mmltk::controller::contracts::reflection::FileDialog<"Select annotation weights", "Weights", "*.pt *.pth *.ckpt *.safetensors">{
+  .mode = mmltk::controller::contracts::FileDialogMode::OpenFile}]] std::string weights_path;
+ [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]][
+  [= mmltk::controller::contracts::reflection::FileDialog<"Select annotation ONNX", "ONNX files", "*.onnx">{.mode = mmltk::controller::contracts::FileDialogMode::OpenFile}]] std::string onnx_path;
+ [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]][[= mmltk::controller::contracts::reflection::FileDialog<"Select annotation engine", "TensorRT files",
+  // CLEANUP-IGNORE: Each annotation artifact field
+  // owns a distinct reflected dialog identity.
+  "*.engine *.trt">{.mode = mmltk::controller::contracts::FileDialogMode::OpenFile}]] std::string tensorrt_path;
  [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]]
-  [[= mmltk::controller::contracts::reflection::FileDialog<"Select annotation weights", "Weights", "*.pt *.pth *.ckpt *.safetensors">{
-   .mode = mmltk::controller::contracts::FileDialogMode::OpenFile}]] std::string weights_path;
- [[= mmltk::frameworks::reflection::MaxBytes{
-  mmltk::frameworks::reflection::kMaximumPathBytes}]][[= mmltk::controller::contracts::reflection::FileDialog<"Select annotation ONNX", "ONNX files", "*.onnx">{
-  .mode = mmltk::controller::contracts::FileDialogMode::OpenFile}]] std::string onnx_path;
- [[= mmltk::frameworks::reflection::MaxBytes{
-  mmltk::frameworks::reflection::kMaximumPathBytes}]][[= mmltk::controller::contracts::reflection::FileDialog<"Select annotation engine", "TensorRT files",
-                                                                                                              // CLEANUP-IGNORE: Each annotation artifact field
-                                                                                                              // owns a distinct reflected dialog identity.
-                                                                                                              "*.engine *.trt">{
-  .mode = mmltk::controller::contracts::FileDialogMode::OpenFile}]] std::string tensorrt_path;
- [[= mmltk::frameworks::reflection::MaxBytes{
-  mmltk::frameworks::reflection::kMaximumPathBytes}]][[= mmltk::controller::contracts::reflection::FileDialog<"Select annotation output", "Directories", "*">{
-  .mode = mmltk::controller::contracts::FileDialogMode::OpenFolder}]] std::string output_dir = "./annotated-scenes";
+  [[= mmltk::controller::contracts::reflection::FileDialog<"Select annotation output", "Directories", "*">{.mode = mmltk::controller::contracts::FileDialogMode::OpenFolder}]] std::string output_dir =
+   "./annotated-scenes";
  [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumNameBytes}]] std::string split = "train";
  [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumNameBytes}]] std::string backend = "auto";
  [[= mmltk::frameworks::reflection::Minimum<int>{0}]] int device_id = 0;
  [[= mmltk::frameworks::reflection::Minimum<int>{1}]] int max_dets_per_image = 300;
- [[=
-   mmltk::frameworks::reflection::Minimum<float>{0.0F}]][[= mmltk::frameworks::reflection::Maximum<float>{1.0F}]][[= mmltk::frameworks::reflection::Finite{}]][
+ [[= mmltk::frameworks::reflection::Minimum<float>{0.0F}]][[= mmltk::frameworks::reflection::Maximum<float>{1.0F}]][[= mmltk::frameworks::reflection::Finite{}]][
   [= mmltk::frameworks::reflection::Presentation<mmltk::frameworks::reflection::PresentationKind::UnitInterval>{}]] float threshold = 0.25f;
  bool allow_fp16 = true;
  bool full_frame = false;
@@ -234,17 +218,15 @@ struct AnnotateViewState : WorkflowModelSelectionState {
 };
 // CLEANUP-IGNORE: Export owns distinct reflected artifact inputs that share the canonical path constraint.
 struct ExportViewState : WorkflowModelSelectionState {
- [[= mmltk::frameworks::reflection::MaxBytes{
-  mmltk::frameworks::reflection::kMaximumPathBytes}]][[= reflection::FileDialog<"Select class layout", "Class descriptors", "*.classes.json *.json">{
-  .mode = FileDialogMode::OpenFile}]] std::string class_layout_path;
+ [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]][
+  [= reflection::FileDialog<"Select class layout", "Class descriptors", "*.classes.json *.json">{.mode = FileDialogMode::OpenFile}]] std::string class_layout_path;
  [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]] std::string weights_path;
  [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]] std::string onnx_input_path;
+ [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]][
+  [= mmltk::controller::contracts::reflection::FileDialog<"Choose ONNX export", "ONNX files", "*.onnx">{.mode = mmltk::controller::contracts::FileDialogMode::SaveFile}]] std::string onnx_output_path;
  [[= mmltk::frameworks::reflection::MaxBytes{
-  mmltk::frameworks::reflection::kMaximumPathBytes}]][[= mmltk::controller::contracts::reflection::FileDialog<"Choose ONNX export", "ONNX files", "*.onnx">{
-  .mode = mmltk::controller::contracts::FileDialogMode::SaveFile}]] std::string onnx_output_path;
- [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]]
-  [[= mmltk::controller::contracts::reflection::FileDialog<"Choose TensorRT export", "TensorRT files", "*.engine *.trt">{
-   .mode = mmltk::controller::contracts::FileDialogMode::SaveFile}]] std::string output_path = "./rfdetr-engine.trt";
+  mmltk::frameworks::reflection::kMaximumPathBytes}]][[= mmltk::controller::contracts::reflection::FileDialog<"Choose TensorRT export", "TensorRT files", "*.engine *.trt">{
+  .mode = mmltk::controller::contracts::FileDialogMode::SaveFile}]] std::string output_path = "./rfdetr-engine.trt";
  [[= mmltk::frameworks::reflection::Minimum<int>{0}]] int device_id = 0;
  [[= mmltk::frameworks::reflection::Minimum<int>{1}]] int opset_version = 19;
  bool allow_fp16 = true;
@@ -257,9 +239,9 @@ struct ExploreViewState : mmltk::backend::data::DataLoadingOptions {
   overlay_classes.fill(true);
  }
  ExploreDatasetSource dataset_source = ExploreDatasetSource::Train;
- [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]]
-  [[= mmltk::controller::contracts::reflection::FileDialog<"Select compiled dataset", "Compiled datasets", "*.mmltk *.bin">{
-   .mode = mmltk::controller::contracts::FileDialogMode::OpenFile}]] std::string custom_compiled_path;
+ [[= mmltk::frameworks::reflection::MaxBytes{
+  mmltk::frameworks::reflection::kMaximumPathBytes}]][[= mmltk::controller::contracts::reflection::FileDialog<"Select compiled dataset", "Compiled datasets", "*.mmltk *.bin">{
+  .mode = mmltk::controller::contracts::FileDialogMode::OpenFile}]] std::string custom_compiled_path;
  [[= mmltk::frameworks::reflection::Minimum<int>{0}]] int device_id = 0;
  [[= mmltk::frameworks::reflection::Minimum<int>{1}]][[= mmltk::frameworks::reflection::Maximum<int>{kMaxExploreGridColumns}]] int grid_width = 3;
  ExploreOrder order = ExploreOrder::Sequential;
@@ -317,13 +299,13 @@ template <ModelArtifactSelectionView State>
    return s.model_resolution;
  }();
  ModelArtifactSelectionState artifact_state{.class_layout_path = {},
-                                            .weights_path = path_text(source.weights_path),
-                                            .onnx_path = {},
-                                            .tensorrt_path = {},
-                                            .preset_name = preset_name,
-                                            .resolution = resolution,
-                                            .source = s.model_source,
-                                            .input = s.model_input};
+  .weights_path = path_text(source.weights_path),
+  .onnx_path = {},
+  .tensorrt_path = {},
+  .preset_name = preset_name,
+  .resolution = resolution,
+  .source = s.model_source,
+  .input = s.model_input};
  if constexpr (requires { source.class_layout_path; }) { artifact_state.class_layout_path = path_text(source.class_layout_path); }
  if constexpr (requires { source.onnx_input_path; }) {
   artifact_state.onnx_path = path_text(source.onnx_input_path);
@@ -373,43 +355,32 @@ MMLTK_REFLECT_ENUM(TrainExecutionTarget)
 MMLTK_REFLECT_ENUM(ExploreDatasetSource)
 MMLTK_REFLECT_ENUM(ExploreDetailScaleMode)
 MMLTK_REFLECT_ENUM(WorkspaceAspectRatio)
-struct ExploreSettingsProjection final
-    : mmltk::frameworks::reflection::StaticMemberRelation<
-       // CLEANUP-IGNORE: Each relation entry identifies a different persisted field and destination; generic
-       // projection already owns the repeated machinery.
-       ExploreViewState, ExploreFilterUpdate, 11U,
-       mmltk::frameworks::reflection::MemberRelationEntry<
-        mmltk::frameworks::reflection::member_path<&ExploreViewState::require_boxes>,
-        mmltk::frameworks::reflection::member_path<&ExploreFilterUpdate::filter, &ExploreFilter::require_boxes>>,
-       mmltk::frameworks::reflection::MemberRelationEntry<
-        mmltk::frameworks::reflection::member_path<&ExploreViewState::require_masks>,
-        mmltk::frameworks::reflection::member_path<&ExploreFilterUpdate::filter, &ExploreFilter::require_masks>>,
-       mmltk::frameworks::reflection::MemberRelationEntry<
-        mmltk::frameworks::reflection::member_path<&ExploreViewState::min_instances>,
-        mmltk::frameworks::reflection::member_path<&ExploreFilterUpdate::filter, &ExploreFilter::minimum_instances>>,
-       mmltk::frameworks::reflection::MemberRelationEntry<
-        mmltk::frameworks::reflection::member_path<&ExploreViewState::max_instances>,
-        mmltk::frameworks::reflection::member_path<&ExploreFilterUpdate::filter, &ExploreFilter::maximum_instances>>,
-       mmltk::frameworks::reflection::MemberRelationEntry<
-        mmltk::frameworks::reflection::member_path<&ExploreViewState::min_compiled_index>,
-        mmltk::frameworks::reflection::member_path<&ExploreFilterUpdate::filter, &ExploreFilter::minimum_compiled_index>>,
-       mmltk::frameworks::reflection::MemberRelationEntry<
-        mmltk::frameworks::reflection::member_path<&ExploreViewState::max_compiled_index>,
-        mmltk::frameworks::reflection::member_path<&ExploreFilterUpdate::filter, &ExploreFilter::maximum_compiled_index>>,
-       mmltk::frameworks::reflection::MemberRelationEntry<mmltk::frameworks::reflection::member_path<&ExploreViewState::order>,
-                                                          mmltk::frameworks::reflection::member_path<&ExploreFilterUpdate::filter, &ExploreFilter::order>>,
-       mmltk::frameworks::reflection::MemberRelationEntry<
-        mmltk::frameworks::reflection::member_path<&ExploreViewState::shuffle_seed>,
-        mmltk::frameworks::reflection::member_path<&ExploreFilterUpdate::filter, &ExploreFilter::shuffle_seed>>,
-       mmltk::frameworks::reflection::MemberRelationEntry<
-        mmltk::frameworks::reflection::member_path<&ExploreViewState::show_boxes>,
-        mmltk::frameworks::reflection::member_path<&ExploreFilterUpdate::overlay, &ExploreOverlay::show_boxes>>,
-       mmltk::frameworks::reflection::MemberRelationEntry<
-        mmltk::frameworks::reflection::member_path<&ExploreViewState::show_masks>,
-        mmltk::frameworks::reflection::member_path<&ExploreFilterUpdate::overlay, &ExploreOverlay::show_masks>>,
-       mmltk::frameworks::reflection::MemberRelationEntry<
-        mmltk::frameworks::reflection::member_path<&ExploreViewState::show_labels>,
-        mmltk::frameworks::reflection::member_path<&ExploreFilterUpdate::overlay, &ExploreOverlay::show_labels>>> {
+struct ExploreSettingsProjection final : mmltk::frameworks::reflection::StaticMemberRelation<
+                                          // CLEANUP-IGNORE: Each relation entry identifies a different persisted field and destination; generic
+                                          // projection already owns the repeated machinery.
+                                          ExploreViewState, ExploreFilterUpdate, 11U,
+                                          mmltk::frameworks::reflection::MemberRelationEntry<mmltk::frameworks::reflection::member_path<&ExploreViewState::require_boxes>,
+                                           mmltk::frameworks::reflection::member_path<&ExploreFilterUpdate::filter, &ExploreFilter::require_boxes>>,
+                                          mmltk::frameworks::reflection::MemberRelationEntry<mmltk::frameworks::reflection::member_path<&ExploreViewState::require_masks>,
+                                           mmltk::frameworks::reflection::member_path<&ExploreFilterUpdate::filter, &ExploreFilter::require_masks>>,
+                                          mmltk::frameworks::reflection::MemberRelationEntry<mmltk::frameworks::reflection::member_path<&ExploreViewState::min_instances>,
+                                           mmltk::frameworks::reflection::member_path<&ExploreFilterUpdate::filter, &ExploreFilter::minimum_instances>>,
+                                          mmltk::frameworks::reflection::MemberRelationEntry<mmltk::frameworks::reflection::member_path<&ExploreViewState::max_instances>,
+                                           mmltk::frameworks::reflection::member_path<&ExploreFilterUpdate::filter, &ExploreFilter::maximum_instances>>,
+                                          mmltk::frameworks::reflection::MemberRelationEntry<mmltk::frameworks::reflection::member_path<&ExploreViewState::min_compiled_index>,
+                                           mmltk::frameworks::reflection::member_path<&ExploreFilterUpdate::filter, &ExploreFilter::minimum_compiled_index>>,
+                                          mmltk::frameworks::reflection::MemberRelationEntry<mmltk::frameworks::reflection::member_path<&ExploreViewState::max_compiled_index>,
+                                           mmltk::frameworks::reflection::member_path<&ExploreFilterUpdate::filter, &ExploreFilter::maximum_compiled_index>>,
+                                          mmltk::frameworks::reflection::MemberRelationEntry<mmltk::frameworks::reflection::member_path<&ExploreViewState::order>,
+                                           mmltk::frameworks::reflection::member_path<&ExploreFilterUpdate::filter, &ExploreFilter::order>>,
+                                          mmltk::frameworks::reflection::MemberRelationEntry<mmltk::frameworks::reflection::member_path<&ExploreViewState::shuffle_seed>,
+                                           mmltk::frameworks::reflection::member_path<&ExploreFilterUpdate::filter, &ExploreFilter::shuffle_seed>>,
+                                          mmltk::frameworks::reflection::MemberRelationEntry<mmltk::frameworks::reflection::member_path<&ExploreViewState::show_boxes>,
+                                           mmltk::frameworks::reflection::member_path<&ExploreFilterUpdate::overlay, &ExploreOverlay::show_boxes>>,
+                                          mmltk::frameworks::reflection::MemberRelationEntry<mmltk::frameworks::reflection::member_path<&ExploreViewState::show_masks>,
+                                           mmltk::frameworks::reflection::member_path<&ExploreFilterUpdate::overlay, &ExploreOverlay::show_masks>>,
+                                          mmltk::frameworks::reflection::MemberRelationEntry<mmltk::frameworks::reflection::member_path<&ExploreViewState::show_labels>,
+                                           mmltk::frameworks::reflection::member_path<&ExploreFilterUpdate::overlay, &ExploreOverlay::show_labels>>> {
  template <class Visitor>
  static constexpr void Visit(Visitor&& visitor) {
   VisitMembers([&]<class Entry>() { visitor.template operator()<Entry::source, Entry::destination>(); });

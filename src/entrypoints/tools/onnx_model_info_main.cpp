@@ -12,20 +12,19 @@ void log_model_info(const std::filesystem::path& model_path) {
   logger.info(
    "model[{}]: path={} input={} {} {} outputs={} queries={} "
    "classes={} dataset_images=0 dataset_classes=0",
-   info.backend, info.model_path, info.input.name, rfdetr::format_shape(info.input.shape), info.input.dtype, info.outputs.size(), info.num_queries,
-   info.num_classes);
+   info.backend, info.model_path, info.input.name, rfdetr::format_shape(info.input.shape), info.input.dtype, info.outputs.size(), info.num_queries, info.num_classes);
   for (const auto& output : info.outputs) { logger.info("  output: {} {} {}", output.name, rfdetr::format_shape(output.shape), output.dtype); }
  });
 }
 }  // namespace
 int main(const int argc, char** argv) {
  return mmltk::entrypoints::tools::run_onnx_tool_main(argc, argv,
-                                                      {
-                                                       .usage = "usage: mmltk-rfdetr-onnx-info [--log-level LEVEL] "
-                                                                "[--log-file PATH] [--log-dir PATH] MODEL.onnx",
-                                                       .application_name = "mmltk-rfdetr-onnx-info",
-                                                       .logger_name = "rfdetr.onnx_info",
-                                                       .error_prefix = "mmltk rfdetr onnx info error: ",
-                                                      },
-                                                      &log_model_info);
+  {
+   .usage = "usage: mmltk-rfdetr-onnx-info [--log-level LEVEL] "
+            "[--log-file PATH] [--log-dir PATH] MODEL.onnx",
+   .application_name = "mmltk-rfdetr-onnx-info",
+   .logger_name = "rfdetr.onnx_info",
+   .error_prefix = "mmltk rfdetr onnx info error: ",
+  },
+  &log_model_info);
 }

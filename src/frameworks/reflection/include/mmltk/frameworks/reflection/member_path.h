@@ -123,12 +123,11 @@ template <class Root, class Destination, auto... Selector, auto... Relative>
  constexpr auto selector = std::tuple{Selector...};
  return [&]<std::size_t... Index>(std::index_sequence<Index...>) {
   if constexpr (sizeof...(Index) == 0U) {
-   static_assert(std::same_as<std::remove_cvref_t<Root>, std::remove_cvref_t<Destination>>,
-                 "the provider selector parent must have the relation destination type");
+   static_assert(std::same_as<std::remove_cvref_t<Root>, std::remove_cvref_t<Destination>>, "the provider selector parent must have the relation destination type");
   } else {
    using ParentAccessor = MemberPathAccessor<std::get<Index>(selector)...>;
-   static_assert(std::same_as<std::remove_cvref_t<decltype(ParentAccessor{}(std::declval<Root&>()))>, std::remove_cvref_t<Destination>>,
-                 "the provider selector parent must have the relation destination type");
+   static_assert(
+    std::same_as<std::remove_cvref_t<decltype(ParentAccessor{}(std::declval<Root&>()))>, std::remove_cvref_t<Destination>>, "the provider selector parent must have the relation destination type");
   }
   using Rebased = MemberPathAccessor<std::get<Index>(selector)..., Relative...>;
   static_assert(Rebased::template applicable<std::remove_cvref_t<Root>>(), "the rebased provider destination must apply to its canonical root");

@@ -27,9 +27,7 @@ struct CudaDeviceOwner final {
 };
 template <class Owner, void (Owner::*RecordFailure)(cudaError_t) noexcept>
 [[nodiscard]] CudaDeviceOwner make_cuda_device_owner(Owner* owner, const int device) noexcept {
- return {.device = device, .context = owner, .record_failure = [](void* context, const cudaError_t failure) noexcept {
-          (static_cast<Owner*>(context)->*RecordFailure)(failure);
-         }};
+ return {.device = device, .context = owner, .record_failure = [](void* context, const cudaError_t failure) noexcept { (static_cast<Owner*>(context)->*RecordFailure)(failure); }};
 }
 // One allocation-free application command-issue scope. The first successful
 // query captures an immutable caller device; switching owners never replaces

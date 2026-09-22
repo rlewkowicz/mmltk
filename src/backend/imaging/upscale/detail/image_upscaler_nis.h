@@ -22,8 +22,7 @@ struct ScratchRequirements final {
  std::size_t scaled_bytes = 0U;
 };
 [[nodiscard]] std::optional<ScratchRequirements> scratch_requirements(const Configuration& config) noexcept;
-[[nodiscard]] cudaError_t launch_scale(const void* source, std::size_t source_pitch, void* horizontal, void* scaled, const Configuration& config,
-                                       cudaStream_t stream) noexcept;
-[[nodiscard]] cudaError_t launch_sharpen(const void* source, std::size_t source_pitch, const void* scaled, std::uint8_t* target, std::size_t target_pitch,
-                                         const Configuration& config, cudaStream_t stream) noexcept;
+[[nodiscard]] cudaError_t launch_scale(const void* source, std::size_t source_pitch, void* horizontal, void* scaled, const Configuration& config, cudaStream_t stream) noexcept;
+[[nodiscard]] cudaError_t launch_sharpen(
+ const void* source, std::size_t source_pitch, const void* scaled, std::uint8_t* target, std::size_t target_pitch, const Configuration& config, cudaStream_t stream) noexcept;
 }  // namespace mmltk::backend::imaging::upscale::image_upscaler_nis

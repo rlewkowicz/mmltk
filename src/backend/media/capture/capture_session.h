@@ -101,10 +101,8 @@ public:
  void set_filled_frame_listener(std::function<void()> listener);
 
 private:
- [[nodiscard]] static FilledCaptureSlotLease MakeFilledSlotLease(CaptureSessionIdentity identity, std::uint32_t slot, std::uint64_t sequence,
-                                                                 const std::uint8_t* data, std::size_t bytes, std::size_t stride_bytes,
-                                                                 std::uint32_t pixel_format, CaptureRegion region, std::uint64_t capture_ns,
-                                                                 bool short_frame) noexcept;
+ [[nodiscard]] static FilledCaptureSlotLease MakeFilledSlotLease(CaptureSessionIdentity identity, std::uint32_t slot, std::uint64_t sequence, const std::uint8_t* data, std::size_t bytes,
+  std::size_t stride_bytes, std::uint32_t pixel_format, CaptureRegion region, std::uint64_t capture_ns, bool short_frame) noexcept;
  static void ConsumeFilledSlotLease(FilledCaptureSlotLease& lease) noexcept;
  struct Impl;
  struct OwnerHandle;

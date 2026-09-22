@@ -43,16 +43,14 @@ namespace {
 }
 [[nodiscard]] bool apply_train_recipe_relation(contracts::GuiSettingsState& candidate, const std::span<const contracts::SettingsValueUpdate> updates) {
  using Relation = mmltk::frameworks::reflection::catalog_provider_relation<mmltk::backend::models::rfdetr::TrainRecipeCatalog>;
- constexpr auto selector =
-  mmltk::frameworks::reflection::member_path<&contracts::GuiSettingsState::workflows, &contracts::WorkflowSettingsState::train,
-                                             &contracts::TrainViewState::request, &mmltk::backend::models::rfdetr::TrainRequest::optimizer>;
+ constexpr auto selector = mmltk::frameworks::reflection::member_path<&contracts::GuiSettingsState::workflows, &contracts::WorkflowSettingsState::train, &contracts::TrainViewState::request,
+  &mmltk::backend::models::rfdetr::TrainRequest::optimizer>;
  auto& request = candidate.workflows.train.request;
  const auto& recipe = mmltk::backend::models::rfdetr::train_recipe(request.optimizer);
  bool valid = true;
  std::array<bool, contracts::kMaxSettingsUpdates> relation_updates{};
  Relation::VisitMembers([&]<class Entry>() {
-  constexpr auto destination =
-   mmltk::frameworks::reflection::rebase_member_path<contracts::GuiSettingsState, mmltk::backend::models::rfdetr::TrainRequest>(selector, Entry::destination);
+  constexpr auto destination = mmltk::frameworks::reflection::rebase_member_path<contracts::GuiSettingsState, mmltk::backend::models::rfdetr::TrainRequest>(selector, Entry::destination);
   constexpr auto path = mmltk::frameworks::reflection::reflected_member_path<contracts::GuiSettingsState, destination>();
   for (std::size_t update_index = 0U; update_index < updates.size(); ++update_index) {
    const auto& update = updates[update_index];
@@ -60,7 +58,7 @@ namespace {
    relation_updates[update_index] = true;
    if (flat_value_is_null(update.value)) {
     Entry::transform::apply(mmltk::frameworks::reflection::access<mmltk::backend::models::rfdetr::TrainRequest, Entry::destination>(request),
-                            mmltk::frameworks::reflection::access<const mmltk::backend::models::rfdetr::TrainRecipeCatalogEntry, Entry::source>(recipe));
+     mmltk::frameworks::reflection::access<const mmltk::backend::models::rfdetr::TrainRecipeCatalogEntry, Entry::source>(recipe));
     Relation::template clear_override<Entry::destination>(request.recipe_overrides);
    } else {
     Relation::template set_override<Entry::destination>(request.recipe_overrides);
@@ -78,8 +76,7 @@ namespace {
   .class_catalog_identity = explore.class_catalog_identity,
  };
  contracts::ExploreSettingsProjection::Visit([&]<auto Setting, auto Filter>() {
-  mmltk::frameworks::reflection::access<ExploreFilterUpdate, Filter>(result.policy) =
-   mmltk::frameworks::reflection::access<const contracts::ExploreViewState, Setting>(explore);
+  mmltk::frameworks::reflection::access<ExploreFilterUpdate, Filter>(result.policy) = mmltk::frameworks::reflection::access<const contracts::ExploreViewState, Setting>(explore);
  });
  const auto project = [](const auto& values) {
   ExploreClassSelection selection;
@@ -101,8 +98,7 @@ namespace {
 }
 void install_explore_preferences(contracts::ExploreViewState& explore, const ExploreFilterUpdate& request) {
  contracts::ExploreSettingsProjection::Visit([&]<auto Setting, auto Filter>() {
-  mmltk::frameworks::reflection::access<contracts::ExploreViewState, Setting>(explore) =
-   mmltk::frameworks::reflection::access<const ExploreFilterUpdate, Filter>(request);
+  mmltk::frameworks::reflection::access<contracts::ExploreViewState, Setting>(explore) = mmltk::frameworks::reflection::access<const ExploreFilterUpdate, Filter>(request);
  });
  const auto install = [](auto& target, const ExploreClassSelection& selection) {
   target.fill(selection.mode == ExploreClassSelectionMode::All);
@@ -175,8 +171,8 @@ contracts::SettingsUiState SettingsSystem::Update(contracts::SettingsUpdateReque
   for (const auto& update : request.updates) {
    if (!flat_value_is_null(update.value)) ordinary.updates.push_back(update);
   }
-  if ((!ordinary.updates.empty() && !contracts::apply_gui_settings_values(candidate, std::span{ordinary.updates})) ||
-      !apply_train_recipe_relation(candidate, std::span{request.updates}) || !contracts::gui_settings_valid(candidate))
+  if ((!ordinary.updates.empty() && !contracts::apply_gui_settings_values(candidate, std::span{ordinary.updates})) || !apply_train_recipe_relation(candidate, std::span{request.updates}) ||
+      !contracts::gui_settings_valid(candidate))
    throw contracts::InvalidIntentError("invalid settings update");
   result = persist(std::move(candidate));
  }
@@ -327,8 +323,8 @@ ExploreSettingsCandidate SettingsSystem::Update(const ExploreSettingsCandidate& 
   if (edit.show_original_dimensions) candidate.workflows.explore.show_original_dimensions = *edit.show_original_dimensions;
   if (edit.class_catalog_identity) candidate.workflows.explore.class_catalog_identity = *edit.class_catalog_identity;
   if (!contracts::gui_settings_valid(candidate)) {
-   const auto detail = edit.class_catalog_identity ? "Explore preferences are invalid"
-                       : edit.preferences ? (edit.augmentation_enabled ? "Explore product preferences are invalid" : "Explore filter preferences are invalid")
+   const auto detail = edit.class_catalog_identity      ? "Explore preferences are invalid"
+                       : edit.preferences               ? (edit.augmentation_enabled ? "Explore product preferences are invalid" : "Explore filter preferences are invalid")
                         : edit.show_original_dimensions ? "Explore detail settings are invalid"
                                                         : "Explore augmentation settings are invalid";
    throw contracts::InvalidIntentError(detail);

@@ -11,8 +11,7 @@ namespace torch_cuda = mmltk::backend::ml::cuda;
 using mmltk::frameworks::gpu::ensure_cuda_ok;
 struct TrainingMetricHandoff::Impl {
 public:
- explicit Impl(int device_id)
-     : device_id_(device_id), event_pool_(mmltk::frameworks::gpu::make_cuda_device_owner<Impl, &Impl::record_failure>(this, device_id), 1U, retirement_owner_) {
+ explicit Impl(int device_id) : device_id_(device_id), event_pool_(mmltk::frameworks::gpu::make_cuda_device_owner<Impl, &Impl::record_failure>(this, device_id), 1U, retirement_owner_) {
   const auto device_options = torch::TensorOptions().dtype(torch::kFloat32).device(mmltk::backend::ml::cuda::cuda_device(device_id_));
   device_values_ = torch::zeros({10 + static_cast<int64_t>(scalar_packet::size)}, device_options);
   device_values_.select(0, 6).fill_(1.0f);
@@ -114,8 +113,7 @@ TrainingMetricHandoff::TrainingMetricHandoff(int device_id) : impl_(std::make_un
 TrainingMetricHandoff::~TrainingMetricHandoff() = default;
 void TrainingMetricHandoff::reset_epoch() { impl_->reset_epoch(); }
 void TrainingMetricHandoff::begin_wave() { impl_->begin_wave(); }
-void TrainingMetricHandoff::accumulate(const torch::Tensor& loss, const torch::Tensor& class_loss, const torch::Tensor& box_loss,
-                                       const scalar_packet::Tensors& scalars) {
+void TrainingMetricHandoff::accumulate(const torch::Tensor& loss, const torch::Tensor& class_loss, const torch::Tensor& box_loss, const scalar_packet::Tensors& scalars) {
  impl_->accumulate(loss, class_loss, box_loss, scalars);
 }
 TrainingMetricSnapshot TrainingMetricHandoff::complete_step(const torch::Tensor& found_inf, int64_t wave_micro_batches, int64_t epoch_micro_batches) {

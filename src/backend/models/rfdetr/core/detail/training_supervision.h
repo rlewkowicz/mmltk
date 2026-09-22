@@ -31,11 +31,9 @@ struct DenoisingTransform {
  torch::Tensor extent_scales;
 };
 [[nodiscard]] torch::Tensor sparse_match_free_correspondence(const torch::Tensor& dense, const torch::Tensor& valid_rows, float rho);
-[[nodiscard]] DenoisingTransform transform_denoising_targets(const torch::Tensor& original_labels, const torch::Tensor& original_boxes,
-                                                             const torch::Tensor& valid_slots, int64_t object_classes, const DenoisingSupervisionConfig& config,
-                                                             const DenoisingVariates& variates);
-[[nodiscard]] torch::Tensor isolated_group_self_attention(torch::nn::MultiheadAttention& attention, const torch::Tensor& target,
-                                                          const torch::Tensor& query_position, const DecoderQueryLayout& layout);
+[[nodiscard]] DenoisingTransform transform_denoising_targets(const torch::Tensor& original_labels, const torch::Tensor& original_boxes, const torch::Tensor& valid_slots, int64_t object_classes,
+ const DenoisingSupervisionConfig& config, const DenoisingVariates& variates);
+[[nodiscard]] torch::Tensor isolated_group_self_attention(torch::nn::MultiheadAttention& attention, const torch::Tensor& target, const torch::Tensor& query_position, const DecoderQueryLayout& layout);
 class TrainingSupervisionImpl final : public torch::nn::Module {
 public:
  explicit TrainingSupervisionImpl(const NativeRfDetrConfig& config, std::int64_t foreground_count);
@@ -46,13 +44,10 @@ public:
  [[nodiscard]] bool initialized() const noexcept;
  [[nodiscard]] bool match_free_enabled() const noexcept;
  [[nodiscard]] bool denoising_enabled() const noexcept;
- [[nodiscard]] std::optional<DenoisingQueryBatch> prepare_denoising(const PreparedTargets& targets, const TrainingStepIdentity& identity,
-                                                                    const torch::Device& device, c10::ScalarType decoder_dtype,
-                                                                    const DenoisingVariates* injected_variates = nullptr);
- [[nodiscard]] MatchFreeCorrespondence correspondence(const torch::Tensor& padded_labels, const torch::Tensor& padded_boxes, const torch::Tensor& valid_rows,
-                                                      const torch::Tensor& query_features);
- [[nodiscard]] MatchFreeCost broadcast_cost(const torch::Tensor& padded_labels, const torch::Tensor& padded_boxes, const torch::Tensor& valid_rows,
-                                            const OutputLayer& layer) const;
+ [[nodiscard]] std::optional<DenoisingQueryBatch> prepare_denoising(
+  const PreparedTargets& targets, const TrainingStepIdentity& identity, const torch::Device& device, c10::ScalarType decoder_dtype, const DenoisingVariates* injected_variates = nullptr);
+ [[nodiscard]] MatchFreeCorrespondence correspondence(const torch::Tensor& padded_labels, const torch::Tensor& padded_boxes, const torch::Tensor& valid_rows, const torch::Tensor& query_features);
+ [[nodiscard]] MatchFreeCost broadcast_cost(const torch::Tensor& padded_labels, const torch::Tensor& padded_boxes, const torch::Tensor& valid_rows, const OutputLayer& layer) const;
  [[nodiscard]] TrainingLoss loss(const ModelOutputs& outputs, const PreparedTargets& targets, const DeviceLossNormalizer& normalizer, bool training_mode);
  void configure_timing(const SupervisionTimingSetup& setup);
  void begin_supervised_step_timing();

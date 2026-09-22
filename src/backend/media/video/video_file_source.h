@@ -36,8 +36,7 @@ struct VideoFrameCapacity final {
 class VideoFileSource final {
 public:
  VideoFileSource(const std::filesystem::path&, VideoFrameCapacity, int device, std::uintptr_t stream, std::stop_token,
-                 std::shared_ptr<mmltk::frameworks::gpu::TerminalCudaRetirementOwner> retirement = {},
-                 decltype(&cudaStreamSynchronize) settle = &cudaStreamSynchronize);
+  std::shared_ptr<mmltk::frameworks::gpu::TerminalCudaRetirementOwner> retirement = {}, decltype(&cudaStreamSynchronize) settle = &cudaStreamSynchronize);
  ~VideoFileSource();
  VideoFileSource(const VideoFileSource&) = delete;
  VideoFileSource& operator=(const VideoFileSource&) = delete;
@@ -46,9 +45,8 @@ public:
  [[nodiscard]] std::uint64_t frame_count() const noexcept;
 
 private:
- VideoFileSource(const std::filesystem::path&, VideoFrameCapacity, int device, std::uintptr_t stream, std::stop_token,
-                 std::shared_ptr<mmltk::frameworks::gpu::TerminalCudaRetirementOwner> retirement, decltype(&cudaStreamSynchronize) settle,
-                 mmltk::frameworks::gpu::CudaContextApi context_api);
+ VideoFileSource(const std::filesystem::path&, VideoFrameCapacity, int device, std::uintptr_t stream, std::stop_token, std::shared_ptr<mmltk::frameworks::gpu::TerminalCudaRetirementOwner> retirement,
+  decltype(&cudaStreamSynchronize) settle, mmltk::frameworks::gpu::CudaContextApi context_api);
  struct StorageLimits final {
   explicit StorageLimits(VideoFrameCapacity);
   [[nodiscard]] std::size_t Pixels(int width, int height) const;

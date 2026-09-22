@@ -56,10 +56,9 @@ TEST_CASE("production direct adapters reject unavailable physical dependencies",
  SettingsSystem settings;
  REQUIRE(settings.Load(install_settings(root)).applied());
  std::promise<FileDialogSystem::event_type> dialog_terminal;
- FileDialogSystem dialog{[&] { return std::make_unique<NativeFileDialogRuntime>(services::FileDialogClient{}, settings); },
-                         [&](FileDialogSystem::event_type event) { dialog_terminal.set_value(std::move(event)); }};
- static_cast<void>(dialog.Open(
-  services::FileDialogOpen{.target = services::FileDialogTarget{services::SettingsFieldTarget{services::file_dialog_catalog().entries().front().stable_id}}}));
+ FileDialogSystem dialog{
+  [&] { return std::make_unique<NativeFileDialogRuntime>(services::FileDialogClient{}, settings); }, [&](FileDialogSystem::event_type event) { dialog_terminal.set_value(std::move(event)); }};
+ static_cast<void>(dialog.Open(services::FileDialogOpen{.target = services::FileDialogTarget{services::SettingsFieldTarget{services::file_dialog_catalog().entries().front().stable_id}}}));
  CHECK(std::holds_alternative<FileDialogFailed>(dialog_terminal.get_future().get()));
  ArtifactDatasetRuntime artifacts;
  const auto rejected = artifacts.Compile({}, {}, {});
@@ -81,16 +80,16 @@ TEST_CASE("model and compute systems use direct facts, progress, Busy, Stop, and
  TerminalSequence<ValidationSystem::event_type> terminals;
  std::atomic_size_t progress = 0U;
  ValidationSystem validation{settings, dataset, model,
-                             [&] {
-                              const bool fail = constructions++ == 0U;
-                              return std::make_unique<FakeNonvisualComputeRuntime>(ComputeScenario{.gate = gate, .fail = fail});
-                             },
-                             [&](ValidationSystem::event_type event) {
-                              if (std::holds_alternative<ValidationProgress>(event))
-                               ++progress;
-                              else
-                               terminals.Publish(std::move(event));
-                             }};
+  [&] {
+   const bool fail = constructions++ == 0U;
+   return std::make_unique<FakeNonvisualComputeRuntime>(ComputeScenario{.gate = gate, .fail = fail});
+  },
+  [&](ValidationSystem::event_type event) {
+   if (std::holds_alternative<ValidationProgress>(event))
+    ++progress;
+   else
+    terminals.Publish(std::move(event));
+  }};
  static_cast<void>(validation.Start({}));
  // CLEANUP-IGNORE: Validation Busy evidence is independent from file-dialog and dataset admission evidence.
  CHECK_THROWS_AS(validation.Start({}), contracts::BusyError);
@@ -128,9 +127,8 @@ TEST_CASE("model and compute systems use direct facts, progress, Busy, Stop, and
  CHECK(last.rows.front().category_name->value == std::string(mmltk::backend::data::catalog::kClassNameCapacity, 'z'));
  CHECK_THROWS_AS(validation.Details({measured.operation.generation_frontier, 0U, 0U}), contracts::InvalidIntentError);
  contracts::SettingsUpdateRequest edit;
- edit.updates = {
-  {.path = "workflows.validate.request.compiled_path",
-   .value = mmltk::frameworks::serialization::wire::FlatValue::text((root / "later.bin").string(), mmltk::frameworks::reflection::kMaximumPathBytes).value()},
+ edit.updates = {{.path = "workflows.validate.request.compiled_path",
+                  .value = mmltk::frameworks::serialization::wire::FlatValue::text((root / "later.bin").string(), mmltk::frameworks::reflection::kMaximumPathBytes).value()},
   {.path = "workflows.validate.request.weights_path",
    .value = mmltk::frameworks::serialization::wire::FlatValue::text((root / "later.pt").string(), mmltk::frameworks::reflection::kMaximumPathBytes).value()}};
  static_cast<void>(settings.Update(std::move(edit)));
@@ -164,15 +162,11 @@ public:
   if (submitted.selection_generation != generation) return {.progress = PresentationNativeProgress::Superseded, .submitted = submitted};
   ++sequence_;
   return {.progress = PresentationNativeProgress::Published,
-          .submitted = submitted,
-          .publication = {.capability = {.surface_high = 1U,
-                                         .surface_low = 1U,
-                                         .extent = submitted.observation.frame.extent,
-                                         .generation = 1U,
-                                         .condition = PresentationCapabilityCondition::Ready},
-                          .timeline_ready = sequence_,
-                          .presentation_revision = sequence_,
-                          .transfer_sequence = sequence_}};
+   .submitted = submitted,
+   .publication = {.capability = {.surface_high = 1U, .surface_low = 1U, .extent = submitted.observation.frame.extent, .generation = 1U, .condition = PresentationCapabilityCondition::Ready},
+    .timeline_ready = sequence_,
+    .presentation_revision = sequence_,
+    .transfer_sequence = sequence_}};
  }
  int poll_fd() const noexcept override { return -1; }
  int completion_fd() const noexcept override { return -1; }
@@ -197,8 +191,7 @@ TEST_CASE("Predict materialized routing keeps one producer across input changes 
                                                                    : "workflows.predict.source.video_file_path";
  const auto select = [&](std::string path) {
   contracts::SettingsUpdateRequest update;
-  update.updates = {
-   {.path = "workflows.predict.source.kind", .value = static_cast<std::int64_t>(kind)},
+  update.updates = {{.path = "workflows.predict.source.kind", .value = static_cast<std::int64_t>(kind)},
    {.path = field, .value = mmltk::frameworks::serialization::wire::FlatValue::text(path, mmltk::frameworks::reflection::kMaximumPathBytes).value()}};
   static_cast<void>(settings.Update(std::move(update)));
  };
@@ -213,40 +206,32 @@ TEST_CASE("Predict materialized routing keeps one producer across input changes 
  std::uint64_t terminal_generation = 0U;
  PresentationSnapshot displayed;
  std::string routing_failure;
- PredictSystem prediction{settings,
-                          dataset,
-                          model,
-                          {.device = 0, .maximum_width = 64U, .maximum_height = 64U},
-                          [&] {
-                           return std::make_unique<FakePredictRuntime>(
-                            PredictionScenario{.compute = {.gate = gate, .fail = invalid_first && constructions++ == 0U}, .source_index = index});
-                          },
-                          [&](PredictSystem::event_type event) {
-                           if (auto* presentation = route.load()) presentation->SourceChanged({PresentationSourceKind::Predict, 1U});
-                           std::visit(
-                            [&](const auto& value) {
-                             if (!value.snapshot.operation.active) {
-                              std::scoped_lock lock(mutex);
-                              terminal_generation = std::max(terminal_generation, value.snapshot.operation.generation_frontier);
-                              changed.notify_all();
-                             }
-                            },
-                            event);
-                          }};
+ PredictSystem prediction{settings, dataset, model, {.device = 0, .maximum_width = 64U, .maximum_height = 64U},
+  [&] { return std::make_unique<FakePredictRuntime>(PredictionScenario{.compute = {.gate = gate, .fail = invalid_first && constructions++ == 0U}, .source_index = index}); },
+  [&](PredictSystem::event_type event) {
+   if (auto* presentation = route.load()) presentation->SourceChanged({PresentationSourceKind::Predict, 1U});
+   std::visit(
+    [&](const auto& value) {
+     if (!value.snapshot.operation.active) {
+      std::scoped_lock lock(mutex);
+      terminal_generation = std::max(terminal_generation, value.snapshot.operation.generation_frontier);
+      changed.notify_all();
+     }
+    },
+    event);
+  }};
  const auto readers = browser::materialize_visual_source_readers(PredictReaderComposition{&settings, &prediction});
  REQUIRE(readers.size() == 1U);
  CHECK((readers[0].source == PresentationSourceIdentity{PresentationSourceKind::Predict, 1U}));
  CHECK_FALSE(prediction.ObserveSource().valid());
  CHECK(prediction.ObserveSource() == readers[0].observe());
- PresentationSystem presentation{{.device = 0, .maximum_width = 64U, .maximum_height = 64U},
-                                 [] { return std::make_unique<PredictReaderWriter>(); },
-                                 readers,
-                                 [&](PresentationSystem::event_type event) {
-                                  std::scoped_lock lock(mutex);
-                                  if (const auto* completed = std::get_if<PresentationCompleted>(&event)) displayed = completed->snapshot;
-                                  if (const auto* failure = std::get_if<PresentationFailed>(&event)) routing_failure = failure->detail;
-                                  changed.notify_all();
-                                 }};
+ PresentationSystem presentation{{.device = 0, .maximum_width = 64U, .maximum_height = 64U}, [] { return std::make_unique<PredictReaderWriter>(); }, readers,
+  [&](PresentationSystem::event_type event) {
+   std::scoped_lock lock(mutex);
+   if (const auto* completed = std::get_if<PresentationCompleted>(&event)) displayed = completed->snapshot;
+   if (const auto* failure = std::get_if<PresentationFailed>(&event)) routing_failure = failure->detail;
+   changed.notify_all();
+  }};
  route = &presentation;
  const mmltk::testsupport::ScopedTestCleanup stop{[&] {
   prediction.Shutdown();
@@ -259,10 +244,8 @@ TEST_CASE("Predict materialized routing keeps one producer across input changes 
   const auto previous = prediction.ObserveSource().frame.revision;
   const auto admitted = prediction.Start({});
   std::unique_lock lock(mutex);
-  REQUIRE(changed.wait_for(lock, std::chrono::seconds{2}, [&] {
-   return !routing_failure.empty() ||
-          (terminal_generation >= admitted.operation.generation_frontier && (!expect_image || displayed.completed.revision > previous));
-  }));
+  REQUIRE(changed.wait_for(lock, std::chrono::seconds{2},
+   [&] { return !routing_failure.empty() || (terminal_generation >= admitted.operation.generation_frontier && (!expect_image || displayed.completed.revision > previous)); }));
   REQUIRE(routing_failure.empty());
   lock.unlock();
   return prediction.snapshot();
@@ -307,22 +290,15 @@ TEST_CASE("Predict compact publication and source observation do not reread reta
  using Publisher = browser::ApplicationEventPublisher<&PredictReaderComposition::predict, PredictReaderComposition>;
  Publisher::Sink sink = [](browser::SystemEvent) {};
  Publisher publisher{sink, [] {},
-                     [&](auto source) {
-                      if (auto* selected = route.load()) selected->SourceChanged(source);
-                     }};
- PredictSystem prediction{settings,
-                          dataset,
-                          model,
-                          {.device = 0, .maximum_width = 64U, .maximum_height = 64U},
-                          [&] {
-                           return std::make_unique<FakePredictRuntime>(
-                            PredictionScenario{.compute = {.gate = begin}, .labels = contracts::kAnnotationObjectCapacity, .after_product = after_image});
-                          },
-                          [&](PredictSystem::event_type event) {
-                           if (const auto* progress = std::get_if<PredictProgress>(&event); progress && progress->snapshot.operation.progress.sequence == 2U)
-                            scalar_sent = true;
-                           publisher(event);
-                          }};
+  [&](auto source) {
+   if (auto* selected = route.load()) selected->SourceChanged(source);
+  }};
+ PredictSystem prediction{settings, dataset, model, {.device = 0, .maximum_width = 64U, .maximum_height = 64U},
+  [&] { return std::make_unique<FakePredictRuntime>(PredictionScenario{.compute = {.gate = begin}, .labels = contracts::kAnnotationObjectCapacity, .after_product = after_image}); },
+  [&](PredictSystem::event_type event) {
+   if (const auto* progress = std::get_if<PredictProgress>(&event); progress && progress->snapshot.operation.progress.sequence == 2U) scalar_sent = true;
+   publisher(event);
+  }};
  auto readers = browser::materialize_visual_source_readers(PredictReaderComposition{&settings, &prediction});
  auto observe = std::move(readers[0].observe);
  readers[0].observe = [&, observe = std::move(observe)] {
@@ -336,15 +312,15 @@ TEST_CASE("Predict compact publication and source observation do not reread reta
   return metadata(frame);
  };
  PresentationSystem presentation{{.device = 0, .maximum_width = 64U, .maximum_height = 64U},
-                                 [&] {
-                                  return std::make_unique<PredictReaderWriter>([&] {
-                                   if (scalar_observed) mmltk::testsupport::release_test_promise(scalar_pumped);
-                                  });
-                                 },
-                                 readers,
-                                 [&](PresentationSystem::event_type event) {
-                                  if (std::holds_alternative<PresentationCompleted>(event)) mmltk::testsupport::release_test_promise(shown);
-                                 }};
+  [&] {
+   return std::make_unique<PredictReaderWriter>([&] {
+    if (scalar_observed) mmltk::testsupport::release_test_promise(scalar_pumped);
+   });
+  },
+  readers,
+  [&](PresentationSystem::event_type event) {
+   if (std::holds_alternative<PresentationCompleted>(event)) mmltk::testsupport::release_test_promise(shown);
+  }};
  route = &presentation;
  const mmltk::testsupport::ScopedTestCleanup stop{[&] {
   after_image->Release();
@@ -373,11 +349,10 @@ TEST_CASE("export and predict wrappers share Busy Stop and failure isolation", "
  auto [settings, dataset, model] = fixture.systems();
  auto export_gate = std::make_shared<mmltk::testsupport::StopGate>();
  std::promise<ComputeSystemEvent> export_terminal;
- ExportSystem export_system{settings, dataset, model,
-                            [export_gate] { return std::make_unique<FakeNonvisualComputeRuntime>(ComputeScenario{.gate = export_gate}); },
-                            [&](ComputeSystemEvent event) {
-                             if (!std::holds_alternative<ComputeProgressEvent>(event)) export_terminal.set_value(std::move(event));
-                            }};
+ ExportSystem export_system{settings, dataset, model, [export_gate] { return std::make_unique<FakeNonvisualComputeRuntime>(ComputeScenario{.gate = export_gate}); },
+  [&](ComputeSystemEvent event) {
+   if (!std::holds_alternative<ComputeProgressEvent>(event)) export_terminal.set_value(std::move(event));
+  }};
  static_cast<void>(export_system.Start({}));
  CHECK_THROWS_AS(export_system.Start({}), contracts::BusyError);
  static_cast<void>(export_system.Stop());
@@ -393,18 +368,13 @@ TEST_CASE("export and predict wrappers share Busy Stop and failure isolation", "
  std::promise<void> prediction_frame;
  std::atomic_bool frame_seen = false;
  std::atomic_size_t predict_terminals = 0U;
- PredictSystem predict{
-  settings,
-  dataset,
-  model,
-  {.device = 0, .maximum_width = 64U, .maximum_height = 64U},
+ PredictSystem predict{settings, dataset, model, {.device = 0, .maximum_width = 64U, .maximum_height = 64U},
   [&] {
    const bool fail = constructions++ == 0U;
    return std::make_unique<FakePredictRuntime>(PredictionScenario{.compute = {.gate = predict_gate, .fail = fail}, .predictions = predictions});
   },
   [&](PredictSystem::event_type event) {
-   if (const auto* changed = std::get_if<PredictChanged>(&event); changed && changed->snapshot.frame.valid() && !frame_seen.exchange(true))
-    prediction_frame.set_value();
+   if (const auto* changed = std::get_if<PredictChanged>(&event); changed && changed->snapshot.frame.valid() && !frame_seen.exchange(true)) prediction_frame.set_value();
    const auto terminal = std::visit([](const auto& value) { return value.snapshot.operation.terminal.outcome; }, event);
    if (std::holds_alternative<PredictFailed>(event))
     predict_failed.set_value(std::move(event));
@@ -448,8 +418,7 @@ TEST_CASE("export and predict wrappers share Busy Stop and failure isolation", "
   const auto request = [&] {
    auto ready = std::make_shared<std::promise<void>>();
    auto result = ready->get_future();
-   predict.RequestWorkspace(
-    {.product_owner = expected.owner, .product_revision = expected.revision, .destination = workspace, .ready = [ready] { ready->set_value(); }});
+   predict.RequestWorkspace({.product_owner = expected.owner, .product_revision = expected.revision, .destination = workspace, .ready = [ready] { ready->set_value(); }});
    return result;
   };
   auto ready = request();
@@ -515,8 +484,7 @@ TEST_CASE("CUDA export and validation preserve cancelled outcomes and prior arti
  const auto output = root.path() / "model.output";
  const auto layout = r::native_training_class_layout(mmltk::backend::data::catalog::ClassCatalog({"cat"}));
  const r::test_support::ClassArtifactFixture bundle(output, "completed artifact", layout);
- const controller::DirectComputeConfiguration configuration{
-  .execution = mmltk::frameworks::gpu::test_support::selected_test_device(0, mmltk::common::system::NumaTopology::Capture())};
+ const controller::DirectComputeConfiguration configuration{.execution = mmltk::frameworks::gpu::test_support::selected_test_device(0, mmltk::common::system::NumaTopology::Capture())};
  controller::CudaExportRuntime exporter(configuration);
  controller::CudaValidationRuntime validator(configuration);
  std::stop_source stop;

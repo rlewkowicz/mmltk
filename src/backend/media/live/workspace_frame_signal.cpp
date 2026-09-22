@@ -7,10 +7,8 @@ PhysicalFrameRevision LiveCompletedFramePublication::snapshot() const noexcept {
  for (;;) {
   const std::uint64_t before = sequence_.load(std::memory_order_seq_cst);
   if ((before & 1U) != 0U) continue;
-  const PhysicalFrameRevision result{revision_.load(std::memory_order_seq_cst),
-                                     {frame_session_.load(std::memory_order_seq_cst), frame_sequence_.load(std::memory_order_seq_cst)},
-                                     slot_.load(std::memory_order_seq_cst),
-                                     ready_.load(std::memory_order_seq_cst)};
+  const PhysicalFrameRevision result{revision_.load(std::memory_order_seq_cst), {frame_session_.load(std::memory_order_seq_cst), frame_sequence_.load(std::memory_order_seq_cst)},
+   slot_.load(std::memory_order_seq_cst), ready_.load(std::memory_order_seq_cst)};
   if (sequence_.load(std::memory_order_seq_cst) == before) return result;
  }
 }

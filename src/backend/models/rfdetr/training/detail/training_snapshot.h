@@ -21,18 +21,18 @@ struct ResumeState {
  std::optional<int> scaler_growth_tracker;
 };
 ModelStateLoadSummary load_training_model_weights(NativeRfDetrModel&, const DecodedNativeModelState&, TrainingSupervisionRoute);
-ResumeState load_resume_checkpoint_state(const std::filesystem::path&, DecodedNativeModelState&, const detail::TrainingContinuation&, NativeOptimizer&,
-                                         const TrainRequest&, const std::vector<std::string>&, const std::vector<torch::Tensor>&, bool);
-void save_collected_checkpoint(const std::filesystem::path&, const NativeCheckpointMetadata&, const NativeRfDetrModel&,
-                               const std::unordered_map<std::string, torch::Tensor>*, const char*, const char*, const std::filesystem::path&);
+ResumeState load_resume_checkpoint_state(const std::filesystem::path&, DecodedNativeModelState&, const detail::TrainingContinuation&, NativeOptimizer&, const TrainRequest&,
+ const std::vector<std::string>&, const std::vector<torch::Tensor>&, bool);
+void save_collected_checkpoint(const std::filesystem::path&, const NativeCheckpointMetadata&, const NativeRfDetrModel&, const std::unordered_map<std::string, torch::Tensor>*, const char*, const char*,
+ const std::filesystem::path&);
 std::unordered_map<std::string, torch::Tensor> ema_override_map(const std::vector<std::string>&, const ModelEma&);
 class TrainingSnapshot final {
 public:
  void begin(const NativeRfDetrModel& model);
  void prepare_ema(const std::vector<std::string>& names, const ModelEma* ema);
  void save_weights(const std::filesystem::path&, const NativeCheckpointMetadata&, bool selected, const std::filesystem::path&);
- void save_resume(const std::filesystem::path&, const NativeCheckpointMetadata&, const NativeOptimizer&, const GradScaler&, const TrainRequest&, int epoch,
-                  double best_regular, double best_ema, int64_t ema_completed_updates, std::string_view attempt_id, const std::filesystem::path& descriptor);
+ void save_resume(const std::filesystem::path&, const NativeCheckpointMetadata&, const NativeOptimizer&, const GradScaler&, const TrainRequest&, int epoch, double best_regular, double best_ema,
+  int64_t ema_completed_updates, std::string_view attempt_id, const std::filesystem::path& descriptor);
  void release();
 
 private:

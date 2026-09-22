@@ -12,19 +12,13 @@ enum class SlotState : std::uint8_t {
  Terminal,
 };
 [[nodiscard]] constexpr std::uint32_t slot_state_value(const SlotState state) noexcept { return static_cast<std::uint32_t>(state); }
-[[nodiscard]] inline bool slot_state_is(const std::atomic<std::uint32_t>& state, const SlotState expected) noexcept {
- return state.load(std::memory_order_acquire) == slot_state_value(expected);
-}
-inline void publish_live_slot_state(std::atomic<std::uint32_t>& state, const SlotState value) noexcept {
- state.store(slot_state_value(value), std::memory_order_release);
-}
+[[nodiscard]] inline bool slot_state_is(const std::atomic<std::uint32_t>& state, const SlotState expected) noexcept { return state.load(std::memory_order_acquire) == slot_state_value(expected); }
+inline void publish_live_slot_state(std::atomic<std::uint32_t>& state, const SlotState value) noexcept { state.store(slot_state_value(value), std::memory_order_release); }
 [[nodiscard]] inline bool transition_slot_state(std::atomic<std::uint32_t>& state, const SlotState expected, const SlotState desired) noexcept {
  auto encoded_expected = slot_state_value(expected);
  return state.compare_exchange_strong(encoded_expected, slot_state_value(desired), std::memory_order_acq_rel);
 }
-[[nodiscard]] inline bool claim_live_slot(std::atomic<std::uint32_t>& state, const SlotState expected) noexcept {
- return transition_slot_state(state, expected, SlotState::Completing);
-}
+[[nodiscard]] inline bool claim_live_slot(std::atomic<std::uint32_t>& state, const SlotState expected) noexcept { return transition_slot_state(state, expected, SlotState::Completing); }
 [[nodiscard]] inline bool claim_live_slot_retirement(std::atomic<std::uint32_t>& state) noexcept {
  const auto current = static_cast<SlotState>(state.load(std::memory_order_acquire));
  if (current == SlotState::Completing) return true;
@@ -65,8 +59,7 @@ void publish_live_owner_slot(std::atomic<std::uint32_t>& state, const SlotState 
  publish_live_slot_state(state, published);
 }
 template <class Scrub>
-void publish_latest_live_owner_slot(std::atomic<int>& latest, const std::uint32_t index, std::atomic<std::uint32_t>& state, const SlotState published,
-                                    Scrub&& scrub) noexcept {
+void publish_latest_live_owner_slot(std::atomic<int>& latest, const std::uint32_t index, std::atomic<std::uint32_t>& state, const SlotState published, Scrub&& scrub) noexcept {
  clear_latest_live_slot(latest, index);
  publish_live_owner_slot(state, published, std::forward<Scrub>(scrub));
 }

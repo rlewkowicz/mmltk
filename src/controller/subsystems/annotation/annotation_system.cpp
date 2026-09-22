@@ -30,20 +30,19 @@ class AnnotationSystem::Impl final {
  using Completion = std::move_only_function<void()>;
 
 public:
- Impl(const VisualDeviceSettings settings, VisualRuntimeFactory factory, ExactVisualDocumentBorrower borrow_source, SystemEventSink<event_type> events,
-      const VisualDiagnosticSink diagnostics)
+ Impl(const VisualDeviceSettings settings, VisualRuntimeFactory factory, ExactVisualDocumentBorrower borrow_source, SystemEventSink<event_type> events, const VisualDiagnosticSink diagnostics)
      : settings_(settings),
        borrow_source_(std::move(borrow_source)),
        events_(std::move(events)),
        diagnostics_(diagnostics),
        renderer_(std::move(factory), [this](std::exception_ptr failure) { RendererFailed(failure); }),
        input_worker_([this](std::stop_token stop) { Reduce(stop); }, [this](std::exception_ptr failure) { Failed(failure); },
-                     [this] {
-                      if (input_policy_) {
-                       input_policy_->Restore();
-                       input_policy_.reset();
-                      }
-                     }) {
+        [this] {
+         if (input_policy_) {
+          input_policy_->Restore();
+          input_policy_.reset();
+         }
+        }) {
   if (!settings_.valid() || !borrow_source_) throw contracts::InvalidIntentError("Annotation device settings are invalid");
   renderer_.RegisterContinuation(
    [this](Runtime& runtime, std::stop_token stop) {
@@ -74,8 +73,7 @@ public:
   {
    std::scoped_lock lock(mutex_);
    if (stopping_) throw contracts::UnavailableError("Annotation input worker is unavailable");
-   if (!mouse.valid() || mouse.source != PresentationSourceKind::Annotation || mouse.peer_epoch != input_epoch_)
-    throw contracts::InvalidIntentError("Annotation mouse ownership is invalid");
+   if (!mouse.valid() || mouse.source != PresentationSourceKind::Annotation || mouse.peer_epoch != input_epoch_) throw contracts::InvalidIntentError("Annotation mouse ownership is invalid");
    input_.Push(std::move(mouse));
   }
   input_worker_.Wake();
@@ -230,8 +228,7 @@ private:
   }
   if (!ready) {
    static_cast<void>(CancelGesture());
-   if (mouse.kind == WorkspaceMouseKind::Press && mouse.button == WorkspaceMouseButton::Left && mouse.point)
-    Reject("Annotation source image is unavailable", false);
+   if (mouse.kind == WorkspaceMouseKind::Press && mouse.button == WorkspaceMouseButton::Left && mouse.point) Reject("Annotation source image is unavailable", false);
    return;
   }
   if (mouse.button == WorkspaceMouseButton::Right) {
@@ -323,10 +320,8 @@ private:
      if constexpr (std::same_as<Request, AnnotationEditRequest>) {
       if (result.outcome == document::DocumentOutcome::Applied)
        diagnostics_.Emit([&] {
-        return VisualDiagnosticFact{.system = contracts::DiagnosticOwner::Annotation,
-                                    .operation = VisualDiagnosticOperation::DocumentEdited,
-                                    .device = settings_.device,
-                                    .generation = document_.ui().document_revision};
+        return VisualDiagnosticFact{
+         .system = contracts::DiagnosticOwner::Annotation, .operation = VisualDiagnosticOperation::DocumentEdited, .device = settings_.device, .generation = document_.ui().document_revision};
        });
      }
     }
@@ -344,8 +339,7 @@ private:
        [this, request](Runtime& runtime, std::stop_token stop) -> detail::VisualRuntimeOwner::Notification {
         if (stop.stop_requested() || CancelRequested()) return [this] { Post([this] { FinishCancelled(); }); };
         auto source = borrow_source_(request.source);
-        if (!source.valid() || !visual_product_matches_frame(request.source, source.pixels))
-         return [this] { Post([this] { FinishRejected("Annotation source image is unavailable"); }); };
+        if (!source.valid() || !visual_product_matches_frame(request.source, source.pixels)) return [this] { Post([this] { FinishRejected("Annotation source image is unavailable"); }); };
         const auto descriptor = source.pixels.plane(0U).plane().descriptor;
         if (descriptor.width > settings_.maximum_width || descriptor.height > settings_.maximum_height || !request.crop.valid() || !request.target.valid() ||
             request.target.width > request.crop.width || request.target.height > request.crop.height || request.target.width > settings_.maximum_width ||
@@ -368,10 +362,7 @@ private:
         renderer_.SetOutputRetry(false);
         const auto paths = runtime.CopyInputFrom(std::move(source.pixels));
         diagnostics_.Emit([&] {
-         return VisualDiagnosticFact{.system = contracts::DiagnosticOwner::Annotation,
-                                     .operation = VisualDiagnosticOperation::CopyCompleted,
-                                     .device = settings_.device,
-                                     .copy_path = paths[0U]};
+         return VisualDiagnosticFact{.system = contracts::DiagnosticOwner::Annotation, .operation = VisualDiagnosticOperation::CopyCompleted, .device = settings_.device, .copy_path = paths[0U]};
         });
         const auto input = runtime.BorrowInput();
         auto& algorithm = annotation_algorithm(runtime);
@@ -401,10 +392,8 @@ private:
           InstallUi(true);
           QueueRender();
           diagnostics_.Emit([&] {
-           return VisualDiagnosticFact{.system = contracts::DiagnosticOwner::Annotation,
-                                       .operation = VisualDiagnosticOperation::DocumentOpened,
-                                       .device = settings_.device,
-                                       .generation = document_.ui().document_revision};
+           return VisualDiagnosticFact{
+            .system = contracts::DiagnosticOwner::Annotation, .operation = VisualDiagnosticOperation::DocumentOpened, .device = settings_.device, .generation = document_.ui().document_revision};
           });
          });
         };
@@ -448,8 +437,7 @@ private:
   supported.sampling = true;
   auto selected = document_.Edit({.value = AnnotationObjectEdit{*pointer.target.object}});
   const bool selection_changed = selected.render_changed;
-  auto result =
-   selected.outcome == document::DocumentOutcome::Applied ? document_.Edit({.value = AnnotationMaskColorsEdit{supported, object.nosup}}) : std::move(selected);
+  auto result = selected.outcome == document::DocumentOutcome::Applied ? document_.Edit({.value = AnnotationMaskColorsEdit{supported, object.nosup}}) : std::move(selected);
   result.render_changed = result.render_changed || selection_changed;
   if (result.outcome != document::DocumentOutcome::Applied)
    Reject(std::move(result.detail), false);
@@ -484,18 +472,15 @@ private:
   return state_;
  }
  void InstallUi(bool settle) { Publish(AnnotationChanged{CaptureUi(settle)}); }
- void DiagnoseRender(VisualDiagnosticOperation operation, const AnnotationRenderState& description, const Runtime::CompletedOutput* baseline = nullptr,
-                     std::uint64_t revision = 0U) const noexcept {
+ void DiagnoseRender(VisualDiagnosticOperation operation, const AnnotationRenderState& description, const Runtime::CompletedOutput* baseline = nullptr, std::uint64_t revision = 0U) const noexcept {
   diagnostics_.Emit([&] {
-   return VisualDiagnosticFact{
-    .system = contracts::DiagnosticOwner::Annotation,
+   return VisualDiagnosticFact{.system = contracts::DiagnosticOwner::Annotation,
     .operation = operation,
     .device = settings_.device,
     .generation = description.generation,
     .value = description.scene_revision,
     .detail = description.document_epoch,
-    .context = {
-     .capacity_width = description.scene ? description.scene->frame_width : 0U,
+    .context = {.capacity_width = description.scene ? description.scene->frame_width : 0U,
      .capacity_height = description.scene ? description.scene->frame_height : 0U,
      .frame_revision = revision,
      .condition = baseline && baseline->valid() ? 1U : 0U,
@@ -553,8 +538,7 @@ private:
   const auto input = runtime.BorrowInput();
   const auto baseline = output.ObserveWorkspace();
   runtime.PublishRetained(
-   output, extent.width, extent.height,
-   [&](auto clean, auto semantic, auto stream) { annotation_algorithm(runtime).Render(description, input.plane(0U).plane(), clean, semantic, stream); },
+   output, extent.width, extent.height, [&](auto clean, auto semantic, auto stream) { annotation_algorithm(runtime).Render(description, input.plane(0U).plane(), clean, semantic, stream); },
    mmltk::frameworks::gpu::ImageSubmission::Enqueue);
   runtime.FinalizeWorkspace(output, annotation_algorithm(runtime).WorkspaceCoverage(baseline));
   renderer_.DeferCompletion(runtime, [this, &runtime, output = std::move(output), fresh_source, extent]() mutable {
@@ -568,8 +552,7 @@ private:
    frame.clean_revision = clean_revision_;
    std::optional<AnnotationRenderedFacts> evidence;
    if (diagnostics_.valid())
-    evidence = AnnotationRenderedFacts{completed_description.generation, completed_description.document_epoch, completed_description.scene_revision,
-                                       completed_description.editor};
+    evidence = AnnotationRenderedFacts{completed_description.generation, completed_description.document_epoch, completed_description.scene_revision, completed_description.editor};
    AnnotationFrameState rendered;
    {
     std::scoped_lock lock(mutex_);
@@ -651,8 +634,8 @@ private:
  detail::VisualRuntimeOwner renderer_;
  mmltk::frameworks::gpu::SystemImageWorker input_worker_;
 };
-AnnotationSystem::AnnotationSystem(VisualDeviceSettings settings, VisualRuntimeFactory factory, ExactVisualDocumentBorrower borrow_source,
-                                   SystemEventSink<event_type> events, VisualDiagnosticSink diagnostics)
+AnnotationSystem::AnnotationSystem(
+ VisualDeviceSettings settings, VisualRuntimeFactory factory, ExactVisualDocumentBorrower borrow_source, SystemEventSink<event_type> events, VisualDiagnosticSink diagnostics)
     : impl_(std::make_unique<Impl>(settings, std::move(factory), std::move(borrow_source), std::move(events), diagnostics)) {}
 AnnotationSystem::~AnnotationSystem() = default;
 AnnotationSnapshot AnnotationSystem::Open(AnnotationOpen request) { return impl_->Open(std::move(request)); }

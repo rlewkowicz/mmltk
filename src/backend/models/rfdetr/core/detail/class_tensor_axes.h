@@ -20,8 +20,7 @@ struct ClassTensorShape final {
 // archive admission consume them; inspection never constructs a tensor owner.
 class ClassTensorFamily final {
 public:
- constexpr ClassTensorFamily(std::string_view owner, std::string_view module, std::string_view tensor, bool indexed, std::int64_t dimension,
-                             ClassTensorCoordinates coordinates)
+ constexpr ClassTensorFamily(std::string_view owner, std::string_view module, std::string_view tensor, bool indexed, std::int64_t dimension, ClassTensorCoordinates coordinates)
      : owner_(owner), module_(module), tensor_(tensor), indexed_(indexed), dimension_(dimension), coordinates_(coordinates) {}
  [[nodiscard]] constexpr std::string_view module_name() const noexcept { return module_; }
  [[nodiscard]] std::string prefix() const { return (owner_.empty() ? std::string{} : std::string(owner_) + ".") + std::string(module_) + "."; }
@@ -57,12 +56,10 @@ private:
 inline constexpr std::string_view kTransformerModule = "transformer", kTrainingSupervisionModule = "training_supervision";
 inline constexpr ClassTensorFamily kDecoderClassAxis{"", "class_embed", "", false, 0, ClassTensorCoordinates::OutputSlots};
 inline constexpr ClassTensorFamily kEncoderClassAxis{kTransformerModule, "enc_out_class_embed", "", true, 0, ClassTensorCoordinates::OutputSlots};
-inline constexpr ClassTensorFamily kDenoisingClassAxis{kTrainingSupervisionModule,        "denoising_label_embedding", "weight", false, 0,
-                                                       ClassTensorCoordinates::Foreground};
+inline constexpr ClassTensorFamily kDenoisingClassAxis{kTrainingSupervisionModule, "denoising_label_embedding", "weight", false, 0, ClassTensorCoordinates::Foreground};
 inline constexpr std::string_view kProbeInputWeight = "linear1.weight";
 inline constexpr std::string_view kProbeInputLayer = kProbeInputWeight.substr(0, kProbeInputWeight.find('.'));
-inline constexpr ClassTensorFamily kMatchFreeClassAxis{
- kTrainingSupervisionModule, "ground_truth_mlp", kProbeInputWeight, false, 1, ClassTensorCoordinates::ForegroundWithBoxes};
+inline constexpr ClassTensorFamily kMatchFreeClassAxis{kTrainingSupervisionModule, "ground_truth_mlp", kProbeInputWeight, false, 1, ClassTensorCoordinates::ForegroundWithBoxes};
 [[nodiscard]] constexpr std::optional<ClassTensorShape> class_tensor_shape(std::string_view name) noexcept {
  for (const auto* family : std::array{&kDecoderClassAxis, &kEncoderClassAxis, &kDenoisingClassAxis, &kMatchFreeClassAxis})
   if (const auto axis = family->Match(name)) return axis;

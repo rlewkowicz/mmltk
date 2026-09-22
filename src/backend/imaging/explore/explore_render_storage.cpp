@@ -62,8 +62,7 @@ struct ExploreHighWaterBuffer::Owner final {
   return std::max(required, current + current / 2U);
  }
  [[nodiscard]] cudaError_t allocate(void** destination, const std::size_t bytes) noexcept {
-  return cuda_status(memory == ExploreBufferMemory::PinnedHost ? api.allocate_pinned(api.context, destination, bytes)
-                                                               : api.allocate_device(api.context, destination, bytes));
+  return cuda_status(memory == ExploreBufferMemory::PinnedHost ? api.allocate_pinned(api.context, destination, bytes) : api.allocate_device(api.context, destination, bytes));
  }
  [[nodiscard]] cudaError_t release(void* value) noexcept {
   return cuda_status(memory == ExploreBufferMemory::PinnedHost ? api.release_pinned(api.context, value) : api.release_device(api.context, value));

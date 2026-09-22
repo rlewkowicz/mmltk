@@ -9,8 +9,7 @@
 #include <stdexcept>
 #include <utility>
 namespace mmltk::backend::media::live {
-LiveFrameFanout::LiveFrameFanout(LiveVideoIngress& ingress, const std::uint32_t count, const std::uint32_t width, const std::uint32_t height,
-                                 LivePhysicalCudaContext cuda)
+LiveFrameFanout::LiveFrameFanout(LiveVideoIngress& ingress, const std::uint32_t count, const std::uint32_t width, const std::uint32_t height, LivePhysicalCudaContext cuda)
     : ingress_(ingress),
       cuda_(std::move(cuda)),
       raw_cache_(count, width, height, cuda_),
@@ -36,8 +35,7 @@ LiveFrameFanout::LiveFrameFanout(LiveVideoIngress& ingress, const std::uint32_t 
   };
   initialize(analysis_.get());
   initialize(composite_.get());
-  if (scope.Record(cudaStreamCreateWithFlags(&release_stream_, cudaStreamNonBlocking)) != cudaSuccess)
-   throw std::runtime_error("create Live fanout release stream");
+  if (scope.Record(cudaStreamCreateWithFlags(&release_stream_, cudaStreamNonBlocking)) != cudaSuccess) throw std::runtime_error("create Live fanout release stream");
  } catch (...) {
   destroy();
   throw;
@@ -105,8 +103,7 @@ bool LiveFrameFanout::process_latest() {
  }
  const auto copy = [&](FanoutSlot* target, std::atomic<int>& latest) {
   if (target == nullptr) return true;
-  const cudaError_t status =
-   copy_device_frame(scope, source, {.pixels = target->pixels, .pitch_bytes = target->pitch, .ready = target->ready, .stream = target->stream});
+  const cudaError_t status = copy_device_frame(scope, source, {.pixels = target->pixels, .pitch_bytes = target->pitch, .ready = target->ready, .stream = target->stream});
   if (status != cudaSuccess) return false;
   target->metadata = DeviceFrameMetadata::From(source);
   publish_live_slot_state(target->state, SlotState::Published);
@@ -179,12 +176,8 @@ void LiveFrameFanout::release(FanoutSlot* slots, const std::uint32_t index, cuda
  }
  publish_slot(slots, slot, SlotState::Free);
 }
-void LiveFrameFanout::release_analysis(const std::uint32_t slot, cudaEvent_t completion, cudaStream_t stream) {
- release(analysis_.get(), slot, completion, stream);
-}
-void LiveFrameFanout::release_composite(const std::uint32_t slot, cudaEvent_t completion, cudaStream_t stream) {
- release(composite_.get(), slot, completion, stream);
-}
+void LiveFrameFanout::release_analysis(const std::uint32_t slot, cudaEvent_t completion, cudaStream_t stream) { release(analysis_.get(), slot, completion, stream); }
+void LiveFrameFanout::release_composite(const std::uint32_t slot, cudaEvent_t completion, cudaStream_t stream) { release(composite_.get(), slot, completion, stream); }
 bool LiveFrameFanout::settle_source_reads(FanoutSlot* const analysis, FanoutSlot* const composite, const cudaEvent_t raw_ready) noexcept {
  auto scope = cuda_.scope();
  if (!scope) return false;
@@ -201,8 +194,7 @@ std::optional<LiveRawFrameReadbackResult> LiveFrameFanout::settle_raw_readback()
 void LiveFrameFanout::set_raw_readback_listener(std::function<void()> listener) { raw_cache_.set_ready_listener(std::move(listener)); }
 void LiveFrameFanout::set_ready_listener(std::function<void()> listener) { ready_.set_listener(std::move(listener)); }
 LiveFrameFanout::Status LiveFrameFanout::status() const noexcept {
- return {running_.load(std::memory_order_acquire), fanned_.load(std::memory_order_relaxed), dropped_.load(std::memory_order_relaxed),
-         replaced_.load(std::memory_order_relaxed)};
+ return {running_.load(std::memory_order_acquire), fanned_.load(std::memory_order_relaxed), dropped_.load(std::memory_order_relaxed), replaced_.load(std::memory_order_relaxed)};
 }
 void LiveFrameFanout::destroy() noexcept {
  if (analysis_ == nullptr && composite_ == nullptr) return;

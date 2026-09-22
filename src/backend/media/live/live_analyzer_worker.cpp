@@ -14,15 +14,9 @@
 #include "src/backend/ml/runtime/backend_factory.h"
 namespace mmltk::backend::media::live {
 namespace runtime = mmltk::backend::ml::runtime;
-LiveAnalyzerWorker::LiveAnalyzerWorker(LiveFrameFanout& fanout, const std::uint32_t count, const std::uint32_t regions, const std::uint32_t width,
-                                       const std::uint32_t height, LivePhysicalCudaContext cuda)
-    : fanout_(fanout),
-      cuda_(std::move(cuda)),
-      slots_(count == 0U ? nullptr : std::make_unique<AnalysisSlot[]>(count)),
-      slot_count_(count),
-      maximum_regions_(regions),
-      width_(width),
-      height_(height) {
+LiveAnalyzerWorker::LiveAnalyzerWorker(
+ LiveFrameFanout& fanout, const std::uint32_t count, const std::uint32_t regions, const std::uint32_t width, const std::uint32_t height, LivePhysicalCudaContext cuda)
+    : fanout_(fanout), cuda_(std::move(cuda)), slots_(count == 0U ? nullptr : std::make_unique<AnalysisSlot[]>(count)), slot_count_(count), maximum_regions_(regions), width_(width), height_(height) {
  if (count == 0U || regions == 0U || width == 0U || height == 0U || regions > runtime::kMaximumAnalysisRegions || !cuda_.valid())
   throw std::invalid_argument("Live analyzer requires bounded CUDA storage");
  try {
@@ -34,39 +28,23 @@ LiveAnalyzerWorker::LiveAnalyzerWorker(LiveFrameFanout& fanout, const std::uint3
    slot.owner = this;
    slot.annotations = std::make_unique<runtime::AnalysisAnnotationStorage[]>(regions);
    slot.allocations = std::make_unique<CUdeviceptr[]>(regions * 5U);
-   if (scope.Record(cudaStreamCreateWithFlags(&slot.settlement_stream, cudaStreamNonBlocking)) != cudaSuccess)
-    throw std::runtime_error("create Live analysis settlement stream");
+   if (scope.Record(cudaStreamCreateWithFlags(&slot.settlement_stream, cudaStreamNonBlocking)) != cudaSuccess) throw std::runtime_error("create Live analysis settlement stream");
    for (std::uint32_t region = 0; region < regions; ++region) {
     auto& annotation = slot.annotations[region];
     annotation.value_capacity = runtime::kMaximumAnalysisRegions;
     const std::size_t values = annotation.value_capacity;
-    const std::size_t sizes[5] = {values * 4U * sizeof(float), values * sizeof(std::int32_t), values * sizeof(float), values * 3U * sizeof(std::uint8_t),
-                                  values * width * height * sizeof(std::uint8_t)};
+    const std::size_t sizes[5] = {
+     values * 4U * sizeof(float), values * sizeof(std::int32_t), values * sizeof(float), values * 3U * sizeof(std::uint8_t), values * width * height * sizeof(std::uint8_t)};
     for (std::size_t plane = 0; plane < 5U; ++plane) {
      void* allocation = nullptr;
      if (scope.Record(cudaMalloc(&allocation, sizes[plane])) != cudaSuccess) throw std::runtime_error("allocate Live annotation storage");
      slot.allocations[region * 5U + plane] = reinterpret_cast<CUdeviceptr>(allocation);
     }
-    annotation.boxes_xyxy = {static_cast<std::uintptr_t>(slot.allocations[region * 5U]),
-                             sizes[0],
-                             {2U, {static_cast<std::uint32_t>(values), 4U}},
-                             runtime::AnalysisElementType::Float32};
-    annotation.class_references = {static_cast<std::uintptr_t>(slot.allocations[region * 5U + 1U]),
-                                   sizes[1],
-                                   {1U, {static_cast<std::uint32_t>(values)}},
-                                   runtime::AnalysisElementType::Int32};
-    annotation.confidences = {static_cast<std::uintptr_t>(slot.allocations[region * 5U + 2U]),
-                              sizes[2],
-                              {1U, {static_cast<std::uint32_t>(values)}},
-                              runtime::AnalysisElementType::Float32};
-    annotation.colors_rgb = {static_cast<std::uintptr_t>(slot.allocations[region * 5U + 3U]),
-                             sizes[3],
-                             {2U, {static_cast<std::uint32_t>(values), 3U}},
-                             runtime::AnalysisElementType::Uint8};
-    annotation.masks = {static_cast<std::uintptr_t>(slot.allocations[region * 5U + 4U]),
-                        sizes[4],
-                        {3U, {static_cast<std::uint32_t>(values), height, width}},
-                        runtime::AnalysisElementType::Uint8};
+    annotation.boxes_xyxy = {static_cast<std::uintptr_t>(slot.allocations[region * 5U]), sizes[0], {2U, {static_cast<std::uint32_t>(values), 4U}}, runtime::AnalysisElementType::Float32};
+    annotation.class_references = {static_cast<std::uintptr_t>(slot.allocations[region * 5U + 1U]), sizes[1], {1U, {static_cast<std::uint32_t>(values)}}, runtime::AnalysisElementType::Int32};
+    annotation.confidences = {static_cast<std::uintptr_t>(slot.allocations[region * 5U + 2U]), sizes[2], {1U, {static_cast<std::uint32_t>(values)}}, runtime::AnalysisElementType::Float32};
+    annotation.colors_rgb = {static_cast<std::uintptr_t>(slot.allocations[region * 5U + 3U]), sizes[3], {2U, {static_cast<std::uint32_t>(values), 3U}}, runtime::AnalysisElementType::Uint8};
+    annotation.masks = {static_cast<std::uintptr_t>(slot.allocations[region * 5U + 4U]), sizes[4], {3U, {static_cast<std::uint32_t>(values), height, width}}, runtime::AnalysisElementType::Uint8};
    }
   }
  } catch (...) {
@@ -158,20 +136,16 @@ bool LiveAnalyzerWorker::process_latest() {
  runtime::AnalysisRequest request{
   .identity = {source.frame.sequence, source.frame.session},
   .captured_ns = source.captured_ns,
-  .source = {{source.pixels, source.pitch_bytes * source.height, {3U, {source.height, source.width, 3U}}, runtime::AnalysisElementType::Uint8},
-             source.pitch_bytes,
-             source.width,
-             source.height,
-             3U,
-             cuda_.device()},
+  .source = {{source.pixels, source.pitch_bytes * source.height, {3U, {source.height, source.width, 3U}}, runtime::AnalysisElementType::Uint8}, source.pitch_bytes, source.width, source.height, 3U,
+   cuda_.device()},
   .source_ready = {cuda_.device(), reinterpret_cast<std::uintptr_t>(source.ready), reinterpret_cast<std::uintptr_t>(source.stream)},
   .regions = {&region, 1U},
   .annotations = {&annotation, 1U},
  };
  runtime::AnalysisResult result = provider_->Analyze(request);
  const auto completion = result.completion();
- fanout_.release_analysis(source.slot, completion.valid() ? reinterpret_cast<cudaEvent_t>(completion.event) : source.ready,
-                          completion.valid() ? reinterpret_cast<cudaStream_t>(completion.producer_stream) : source.stream);
+ fanout_.release_analysis(
+  source.slot, completion.valid() ? reinterpret_cast<cudaEvent_t>(completion.event) : source.ready, completion.valid() ? reinterpret_cast<cudaStream_t>(completion.producer_stream) : source.stream);
  if (result.terminal() != runtime::AnalysisTerminal::Completed) {
   const auto terminal = result.terminal();
   publish_slot(*slot, SlotState::Free);
@@ -179,8 +153,7 @@ bool LiveAnalyzerWorker::process_latest() {
    std::lock_guard lock(status_mutex_);
    ++status_.refused;
   }
-  if (terminal == runtime::AnalysisTerminal::InvalidInput || terminal == runtime::AnalysisTerminal::DependencyFailure ||
-      terminal == runtime::AnalysisTerminal::ExecutionFailure)
+  if (terminal == runtime::AnalysisTerminal::InvalidInput || terminal == runtime::AnalysisTerminal::DependencyFailure || terminal == runtime::AnalysisTerminal::ExecutionFailure)
    throw std::runtime_error("Live analysis provider failed");
   return true;
  }

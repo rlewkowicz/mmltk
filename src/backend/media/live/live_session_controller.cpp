@@ -29,29 +29,23 @@ capture::Status LiveMediaDataPlane::stop() noexcept { return impl_->stop(); }
 std::shared_ptr<const LivePhysicalTerminal> LiveMediaDataPlane::admitted_run_terminal() const noexcept { return impl_->admitted_run_terminal(); }
 capture::Status LiveMediaDataPlane::first_failure() const { return impl_->first_failure(); }
 std::optional<PhysicalFrameRevision> LiveMediaDataPlane::newest_revision() const noexcept { return impl_->newest_revision(); }
-bool LiveMediaDataPlane::try_acquire_output(const PhysicalFrameRevision revision, LiveCompositeOutputLease* const output) {
- return impl_->try_acquire_output(revision, output);
-}
+bool LiveMediaDataPlane::try_acquire_output(const PhysicalFrameRevision revision, LiveCompositeOutputLease* const output) { return impl_->try_acquire_output(revision, output); }
 bool LiveMediaDataPlane::request_raw_readback(LiveRawFrameReadback request) { return impl_->request_raw_readback(std::move(request)); }
 void LiveMediaDataPlane::set_revision_listener(const LiveRevisionListener listener) { impl_->set_revision_listener(listener); }
-void LiveMediaDataPlane::set_admitted_run_terminal_listener(const LiveAdmittedRunTerminalListener listener) {
- impl_->set_admitted_run_terminal_listener(listener);
-}
+void LiveMediaDataPlane::set_admitted_run_terminal_listener(const LiveAdmittedRunTerminalListener listener) { impl_->set_admitted_run_terminal_listener(listener); }
 void LiveMediaDataPlane::publish_manual_overlay(ManualOverlayDocumentSnapshot snapshot) { impl_->publish_manual_overlay(std::move(snapshot)); }
 void LiveMediaDataPlane::clear_manual_overlay(const std::uint32_t width, const std::uint32_t height) { impl_->clear_manual_overlay(width, height); }
 LiveDataPlaneConfig LiveMediaDataPlane::Impl::Validate(LiveDataPlaneConfig config) {
- if (!config.resource_worker.valid() || config.capture.cuda_device_index < 0 || config.ingress_slots == 0U || config.fanout_slots == 0U ||
-     config.analysis_slots == 0U || config.composite_slots == 0U || config.analysis_regions == 0U || config.manual_overlay_slots == 0U ||
-     config.maximum_manual_instances == 0U || !config.manual_overlay_uploads.valid())
+ if (!config.resource_worker.valid() || config.capture.cuda_device_index < 0 || config.ingress_slots == 0U || config.fanout_slots == 0U || config.analysis_slots == 0U ||
+     config.composite_slots == 0U || config.analysis_regions == 0U || config.manual_overlay_slots == 0U || config.maximum_manual_instances == 0U || !config.manual_overlay_uploads.valid())
   throw std::invalid_argument("Live data plane requires a worker, device, and fixed storage");
  if (!config.capture.execution)
-  config.capture.execution = gpu::resolve_device_execution(config.capture.cuda_device_index, mmltk::common::system::NumaTopology::Capture(),
-                                                           mmltk::common::system::bound_memory_node(mmltk::common::system::capture_memory_policy()));
+  config.capture.execution = gpu::resolve_device_execution(
+   config.capture.cuda_device_index, mmltk::common::system::NumaTopology::Capture(), mmltk::common::system::bound_memory_node(mmltk::common::system::capture_memory_policy()));
  if (config.capture.execution->device != config.capture.cuda_device_index) throw std::invalid_argument("Live placement device mismatch");
  return config;
 }
-LiveMediaDataPlane::Impl::Impl(LiveDataPlaneConfig config)
-    : config_(Validate(std::move(config))), output_callbacks_(config_.composite_slots, this, &Impl::WakeOutputCallback) {}
+LiveMediaDataPlane::Impl::Impl(LiveDataPlaneConfig config) : config_(Validate(std::move(config))), output_callbacks_(config_.composite_slots, this, &Impl::WakeOutputCallback) {}
 LiveMediaDataPlane::Impl::~Impl() { static_cast<void>(stop()); }
 LiveMediaDataPlane::Impl::PhysicalResources::PhysicalResources(Impl& owner_in, const LiveDataPlaneConfig& config)
     : owner(owner_in),
@@ -60,8 +54,7 @@ LiveMediaDataPlane::Impl::PhysicalResources::PhysicalResources(Impl& owner_in, c
       ingress(config.capture, config.ingress_slots, cuda),
       fanout(ingress, config.fanout_slots, config.capture.width, config.capture.height, cuda),
       analyzer(fanout, config.analysis_slots, config.analysis_regions, config.capture.width, config.capture.height, cuda),
-      manual_overlay(owner.manual_document_, config.manual_overlay_slots, config.capture.width, config.capture.height, config.maximum_manual_instances,
-                     config.manual_overlay_uploads, cuda),
+      manual_overlay(owner.manual_document_, config.manual_overlay_slots, config.capture.width, config.capture.height, config.maximum_manual_instances, config.manual_overlay_uploads, cuda),
       compositor(fanout, &analyzer, &manual_overlay, owner.completed_frames_, config.composite_slots, config.capture.width, config.capture.height, cuda) {
  ingress.set_ingestion_wake([this] { owner.wake(); });
  ingress.set_ready_listener([this] { owner.wake(); });
@@ -73,8 +66,7 @@ LiveMediaDataPlane::Impl::PhysicalResources::PhysicalResources(Impl& owner_in, c
  compositor.set_completion_listener([this] { owner.wake(); });
  compositor.set_revision_listener([this] { owner.publish_revision(); });
  auto scope = cuda.scope();
- if (!scope || scope.Record(cudaStreamCreateWithFlags(&analysis_stream, cudaStreamNonBlocking)) != cudaSuccess)
-  throw std::runtime_error("create Live canonical analysis command stream");
+ if (!scope || scope.Record(cudaStreamCreateWithFlags(&analysis_stream, cudaStreamNonBlocking)) != cudaSuccess) throw std::runtime_error("create Live canonical analysis command stream");
 }
 LiveMediaDataPlane::Impl::PhysicalResources::~PhysicalResources() { settle(); }
 capture::CaptureSessionStartResult LiveMediaDataPlane::Impl::PhysicalResources::start(const LiveAnalysisProviderFactory provider_factory) {
@@ -301,12 +293,8 @@ void LiveMediaDataPlane::Impl::clear_manual_overlay(const std::uint32_t width, c
 void LiveMediaDataPlane::Impl::RecordCudaFailure(void* context, const cudaError_t failure) noexcept {
  if (context != nullptr) static_cast<Impl*>(context)->record_cuda_failure(failure);
 }
-void LiveMediaDataPlane::Impl::CompleteOutput(void* context, const PhysicalFrameRevision revision) noexcept {
- static_cast<Impl*>(context)->complete_output(revision);
-}
-void LiveMediaDataPlane::Impl::AbandonOutput(void* context, const PhysicalFrameRevision revision) noexcept {
- static_cast<Impl*>(context)->abandon_output(revision);
-}
+void LiveMediaDataPlane::Impl::CompleteOutput(void* context, const PhysicalFrameRevision revision) noexcept { static_cast<Impl*>(context)->complete_output(revision); }
+void LiveMediaDataPlane::Impl::AbandonOutput(void* context, const PhysicalFrameRevision revision) noexcept { static_cast<Impl*>(context)->abandon_output(revision); }
 void LiveMediaDataPlane::Impl::WakeOutputCallback(void* context) noexcept { static_cast<Impl*>(context)->wake(); }
 void LiveMediaDataPlane::Impl::complete_output(const PhysicalFrameRevision revision) noexcept {
  LiveOutputCallbackGuard callback{output_callbacks_};
@@ -383,9 +371,7 @@ void LiveMediaDataPlane::Impl::publish_start(capture::CaptureSessionStartResult 
   std::lock_guard lock(lifecycle_);
   try {
    start_result_ = std::move(result);
-  } catch (...) {
-   start_result_ = {capture::CaptureSessionStartPhase::NoCustody, {capture::StatusCode::kInternalError, "Live start result publication failed"}, {}};
-  }
+  } catch (...) { start_result_ = {capture::CaptureSessionStartPhase::NoCustody, {capture::StatusCode::kInternalError, "Live start result publication failed"}, {}}; }
   startup_ready_ = true;
   phase_ = start_result_.running() ? (stop_requested_ || !first_failure_.ok() ? PhysicalPhase::Closing : PhysicalPhase::Running)
                                    : (start_result_.has_custody() ? PhysicalPhase::Closing : PhysicalPhase::Terminal);

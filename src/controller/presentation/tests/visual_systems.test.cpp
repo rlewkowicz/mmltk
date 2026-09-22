@@ -38,8 +38,7 @@ using namespace visual_test_support;
 using mmltk::frameworks::gpu::test_support::FakeImageBackend;
 using mmltk::frameworks::gpu::test_support::RuntimeFactory;
 using namespace std::chrono_literals;
-void present_and_wait(PresentationSystem& presentation, TestPresentationWriterState& writer, EventGate& events, const VisualSourceReader& source,
-                      const std::uint64_t revision) {
+void present_and_wait(PresentationSystem& presentation, TestPresentationWriterState& writer, EventGate& events, const VisualSourceReader& source, const std::uint64_t revision) {
  static_cast<void>(presentation.Select(source.source));
  writer.SignalReadiness();
  REQUIRE(events.Wait([&] { return presentation.snapshot().completed.revision == revision; }));
@@ -80,9 +79,7 @@ TEST_CASE("Explore retains content and accepts input through pending image compl
  auto work = std::make_shared<ExploreWorkProbe>();
  auto gate = std::make_shared<ExplorePostRenderGate>(1U);
  LoadedSettings settings;
- ExploreScenario scenario{settings, backend, [work, gate] {
-                           return std::make_unique<TestExploreAlgorithm>(std::make_shared<std::atomic<std::size_t>>(0U), nullptr, nullptr, nullptr, work, gate);
-                          }};
+ ExploreScenario scenario{settings, backend, [work, gate] { return std::make_unique<TestExploreAlgorithm>(std::make_shared<std::atomic<std::size_t>>(0U), nullptr, nullptr, nullptr, work, gate); }};
  auto& explore = scenario.system();
  mmltk::testsupport::ScopedTestCleanup release_gate{[&] { mmltk::testsupport::release_test_promise(gate->release); }};
  scenario.OpenAndWait({.extent = {96U, 48U}, .row_count = 1U, .columns = 2U});
@@ -119,14 +116,10 @@ TEST_CASE("Explore viewport and Annotation pointer work preserve their intended 
  DiagnosticCapture diagnostics;
  EventGate explore_events;
  LoadedSettings settings;
- ExploreSystem explore{settings.system(),
-                       kDevice,
-                       4U,
-                       RuntimeFactory(
-                        0, backend, mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic,
-                        [observed_nproc] { return std::make_unique<TestExploreAlgorithm>(observed_nproc); }, 3U),
-                       [&explore_events](ExploreSystem::event_type) { explore_events.Advance(); },
-                       diagnostics.sink()};
+ ExploreSystem explore{settings.system(), kDevice, 4U,
+  RuntimeFactory(
+   0, backend, mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic, [observed_nproc] { return std::make_unique<TestExploreAlgorithm>(observed_nproc); }, 3U),
+  [&explore_events](ExploreSystem::event_type) { explore_events.Advance(); }, diagnostics.sink()};
  CHECK_FALSE(explore.BorrowFrame().valid());
  CHECK_THROWS_AS(explore.UpdateViewport({.viewport = {.extent = {48U, 48U}}}), contracts::UnavailableError);
  const auto explore_admitted = explore.Open({.viewport = {.extent = {64U, 64U}}, .compiled_source = "/test"});
@@ -151,11 +144,11 @@ TEST_CASE("Explore viewport and Annotation pointer work preserve their intended 
  std::atomic_uint64_t failures{0U};
  auto probe = std::make_shared<AnnotationRenderProbe>();
  AnnotationSystem annotation{kDevice, TestAnnotationAlgorithm::CreateRuntime(backend, probe), borrow_exactly_from(explore),
-                             [&](AnnotationSystem::event_type event) {
-                              if (std::holds_alternative<AnnotationFailed>(event)) failures.fetch_add(1U);
-                              annotation_events.Advance();
-                             },
-                             mmltk::testsupport::annotation_render_evidence()};
+  [&](AnnotationSystem::event_type event) {
+   if (std::holds_alternative<AnnotationFailed>(event)) failures.fetch_add(1U);
+   annotation_events.Advance();
+  },
+  mmltk::testsupport::annotation_render_evidence()};
  CHECK_FALSE(annotation.BorrowFrame().valid());
  const auto admitted = annotation.Open(mmltk::testsupport::test_annotation_open(explore.snapshot().frame));
  CHECK(admitted.busy);
@@ -204,8 +197,7 @@ TEST_CASE("Upscale and Presentation preserve complete non-square four-times high
  auto& source = opened_explore.system();
  auto extents = std::make_shared<UpscaleExtentProbe>();
  EventGate upscale_events;
- UpscaleSystem upscale{
-  kDevice,
+ UpscaleSystem upscale{kDevice,
   RuntimeFactory(
    0, backend, mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic, [extents] { return std::make_unique<ExtentUpscaleAlgorithm>(extents); }, 4U),
   borrow_exactly_from(source), [&upscale_events](UpscaleSystem::event_type) { upscale_events.Advance(); }};
@@ -227,8 +219,8 @@ TEST_CASE("Upscale and Presentation preserve complete non-square four-times high
  const std::array presentation_sources{read_from(upscale), read_from(source)};
  auto writer_state = std::make_shared<TestPresentationWriterState>();
  EventGate presentation_events;
- PresentationSystem presentation{kDevice, [backend, writer_state] { return std::make_unique<TestPresentationWriter>(0, backend, writer_state); },
-                                 presentation_sources, [&presentation_events](PresentationSystem::event_type) { presentation_events.Advance(); }};
+ PresentationSystem presentation{kDevice, [backend, writer_state] { return std::make_unique<TestPresentationWriter>(0, backend, writer_state); }, presentation_sources,
+  [&presentation_events](PresentationSystem::event_type) { presentation_events.Advance(); }};
  PresentationScenario scenario{presentation, writer_state};
  present_and_wait(presentation, *writer_state, presentation_events, presentation_sources[0U], upscale.snapshot().frame.revision);
  CHECK((presentation.snapshot().completed.extent == VisualExtent{320U, 160U}));
@@ -264,9 +256,8 @@ TEST_CASE("Presentation forwards every private visual product to the simulated b
  const auto sources = products.sources();
  EventGate events;
  auto writer_state = std::make_shared<TestPresentationWriterState>();
- PresentationSystem presentation{kDevice,
-                                 [backend = products.backend(), writer_state] { return std::make_unique<TestPresentationWriter>(0, backend, writer_state); },
-                                 sources, [&events](PresentationSystem::event_type) { events.Advance(); }};
+ PresentationSystem presentation{kDevice, [backend = products.backend(), writer_state] { return std::make_unique<TestPresentationWriter>(0, backend, writer_state); }, sources,
+  [&events](PresentationSystem::event_type) { events.Advance(); }};
  PresentationScenario scenario{presentation, writer_state};
  std::uint64_t previous_presentation_revision = 0U;
  for (auto source = sources.rbegin(); source != sources.rend(); ++source) {
@@ -306,8 +297,8 @@ TEST_CASE("Presentation switches sources while Live advances in background") {
  auto writer_state = std::make_shared<TestPresentationWriterState>();
  writer_state->allow_publication.store(false, std::memory_order_release);
  auto first_submission = writer_state->first_submission.get_future();
- PresentationSystem presentation{kDevice, [backend, writer_state] { return std::make_unique<TestPresentationWriter>(0, backend, writer_state); },
-                                 std::span{sources}, [&presentation_events](PresentationSystem::event_type) { presentation_events.Advance(); }};
+ PresentationSystem presentation{kDevice, [backend, writer_state] { return std::make_unique<TestPresentationWriter>(0, backend, writer_state); }, std::span{sources},
+  [&presentation_events](PresentationSystem::event_type) { presentation_events.Advance(); }};
  PresentationScenario scenario{presentation, writer_state};
  CHECK(writer_state->constructions.load(std::memory_order_acquire) == 1U);
  const auto first_selection = presentation.Select(sources[0].source);
@@ -406,26 +397,21 @@ TEST_CASE("Explore Annotation Live and Upscale endpoints complete retained works
  auto backend = std::make_shared<FakeImageBackend>();
  auto explore_work = std::make_shared<ExploreWorkProbe>();
  LoadedSettings settings;
- ExploreScenario opened(settings, 2U,
-                        RuntimeFactory(0, backend, gpu::ImageProductLayout::CleanAndSemantic, ExploreScenario::TrackWork(explore_work), 3U,
-                                       fixture::FakeWorkspaceFinalizer(backend)));
+ ExploreScenario opened(settings, 2U, RuntimeFactory(0, backend, gpu::ImageProductLayout::CleanAndSemantic, ExploreScenario::TrackWork(explore_work), 3U, fixture::FakeWorkspaceFinalizer(backend)));
  opened.OpenAndWait({.extent = {32U, 32U}, .columns = 1U});
  auto& explore = opened.system();
  EventGate annotation_events, live_events, upscale_events;
  auto annotation_work = std::make_shared<AnnotationRenderProbe>();
- AnnotationSystem annotation{
-  kDevice,
+ AnnotationSystem annotation{kDevice,
   RuntimeFactory(
-   0, backend, gpu::ImageProductLayout::CleanAndSemantic, [annotation_work] { return std::make_unique<TestAnnotationAlgorithm>(annotation_work); }, 3U,
-   fixture::FakeWorkspaceFinalizer(backend)),
+   0, backend, gpu::ImageProductLayout::CleanAndSemantic, [annotation_work] { return std::make_unique<TestAnnotationAlgorithm>(annotation_work); }, 3U, fixture::FakeWorkspaceFinalizer(backend)),
   borrow_exactly_from(explore), [&](AnnotationSystem::event_type) { annotation_events.Advance(); }, mmltk::testsupport::annotation_render_evidence()};
  mmltk::testsupport::open_annotation(annotation, annotation_events, explore.snapshot().frame);
  auto captures = std::make_shared<std::atomic<std::uint64_t>>(0U);
  LiveSystem live{kDevice,
-                 RuntimeFactory(
-                  0, backend, gpu::ImageProductLayout::Clean, [captures] { return std::make_unique<TestLiveAlgorithm>(captures); }, 1U,
-                  fixture::FakeWorkspaceFinalizer(backend)),
-                 [&](LiveSystem::event_type) { live_events.Advance(); }};
+  RuntimeFactory(
+   0, backend, gpu::ImageProductLayout::Clean, [captures] { return std::make_unique<TestLiveAlgorithm>(captures); }, 1U, fixture::FakeWorkspaceFinalizer(backend)),
+  [&](LiveSystem::event_type) { live_events.Advance(); }};
  static_cast<void>(live.Start({.extent = {32U, 32U}, .frames_per_second = 120U}));
  REQUIRE(live_events.Wait([&] { return live.snapshot().completed_frames != 0U; }));
  static_cast<void>(live.Stop());
@@ -433,15 +419,13 @@ TEST_CASE("Explore Annotation Live and Upscale endpoints complete retained works
  auto kernel = std::make_shared<std::atomic<UpscaleKernel>>(UpscaleKernel::Default);
  auto upscale_runs = std::make_shared<std::atomic_uint32_t>(0U);
  UpscaleSystem upscale{kDevice,
-                       RuntimeFactory(
-                        0, backend, gpu::ImageProductLayout::CleanAndSemantic,
-                        [=] { return std::make_unique<TestUpscaleAlgorithm>(kernel, nullptr, upscale_runs); }, 4U, fixture::FakeWorkspaceFinalizer(backend)),
-                       borrow_exactly_from(explore), [&](UpscaleSystem::event_type) { upscale_events.Advance(); }};
+  RuntimeFactory(
+   0, backend, gpu::ImageProductLayout::CleanAndSemantic, [=] { return std::make_unique<TestUpscaleAlgorithm>(kernel, nullptr, upscale_runs); }, 4U, fixture::FakeWorkspaceFinalizer(backend)),
+  borrow_exactly_from(explore), [&](UpscaleSystem::event_type) { upscale_events.Advance(); }};
  static_cast<void>(upscale.Start(test_upscale_request({.source = explore.snapshot().frame})));
  REQUIRE(upscale_events.Wait([&] { return upscale.snapshot().ready; }));
  {
-  const std::array contexts{explore.BorrowFrame().plane(0U).context(), annotation.BorrowFrame().plane(0U).context(), live.BorrowFrame().plane(0U).context(),
-                            upscale.BorrowFrame().plane(0U).context()};
+  const std::array contexts{explore.BorrowFrame().plane(0U).context(), annotation.BorrowFrame().plane(0U).context(), live.BorrowFrame().plane(0U).context(), upscale.BorrowFrame().plane(0U).context()};
   for (std::size_t left = 0U; left != contexts.size(); ++left)
    for (std::size_t right = left + 1U; right != contexts.size(); ++right) CHECK_FALSE(contexts[left] == contexts[right]);
  }

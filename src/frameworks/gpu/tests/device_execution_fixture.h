@@ -15,10 +15,7 @@ inline DeviceExecution selected_test_device(int ordinal, const mmltk::common::sy
   REQUIRE(topology.nodes.size() > 1);
  }
  for (int node : topology.permitted_nodes) {
-  if (std::ranges::none_of(topology.cpus, [&](const auto& cpu) {
-       return cpu.node == node && std::ranges::find(topology.permitted_cpus, cpu.cpu) != topology.permitted_cpus.end();
-      }))
-   continue;
+  if (std::ranges::none_of(topology.cpus, [&](const auto& cpu) { return cpu.node == node && std::ranges::find(topology.permitted_cpus, cpu.cpu) != topology.permitted_cpus.end(); })) continue;
   const auto selected = resolve_device_execution(ordinal, topology, node);
   CHECK(selected.placement.numa_node == node);
   return selected;

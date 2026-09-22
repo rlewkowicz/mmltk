@@ -108,8 +108,7 @@ private:
  mmltk::backend::data::CompiledImageStream::CompletionObserver LaneCompletion() noexcept;
  void SubmitRead(Lane& lane, const bool observed);
  PayloadLayout LayoutFor(const GalleryProductState& product, const std::uint32_t compiled_index, const bool has_donor, const std::size_t donor_rle_count) const;
- void PrepareLaneStorage(const GalleryProductState& product, Lane& lane, const std::uint32_t compiled_index, const std::uint32_t slot,
-                         const std::uint64_t generation);
+ void PrepareLaneStorage(const GalleryProductState& product, Lane& lane, const std::uint32_t compiled_index, const std::uint32_t slot, const std::uint64_t generation);
  void Prioritize(GalleryProductState& product);
  bool ReserveInput(const GalleryProductState& product, Lane& lane);
  void DiscardSettledInput(const GalleryProductState& product, Lane& lane);
@@ -154,9 +153,7 @@ private:
  std::atomic<std::uint64_t> desired_generation_{0U};
  ExploreDemandCheck current_demand_{};
  bool demand_bound_ = false;
- [[nodiscard]] bool Current(std::uint64_t generation) const noexcept {
-  return generation != 0U && generation == desired_generation_.load(std::memory_order_acquire) && current_demand_(generation);
- }
+ [[nodiscard]] bool Current(std::uint64_t generation) const noexcept { return generation != 0U && generation == desired_generation_.load(std::memory_order_acquire) && current_demand_(generation); }
  std::atomic<std::size_t> stale_discarded_{0U};
  std::uint64_t next_tile_generation_ = 0U;
  std::vector<std::uint64_t> scheduled_slots_;

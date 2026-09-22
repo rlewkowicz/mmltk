@@ -27,8 +27,7 @@ public:
  BenchmarkImageDecoder& operator=(const BenchmarkImageDecoder&) = delete;
  ~BenchmarkImageDecoder();
  [[nodiscard]] BenchmarkImageHeader read_header(std::span<const std::uint8_t> encoded, std::uint32_t expected_width = 0U, std::uint32_t expected_height = 0U);
- void decode_rgb(std::span<const std::uint8_t> encoded, const BenchmarkImageHeader& header, std::vector<std::uint8_t>* rgb,
-                 std::vector<std::uint8_t>* cmyk_scratch);
+ void decode_rgb(std::span<const std::uint8_t> encoded, const BenchmarkImageHeader& header, std::vector<std::uint8_t>* rgb, std::vector<std::uint8_t>* cmyk_scratch);
 
 private:
  void* handle_ = nullptr;
@@ -44,10 +43,8 @@ struct ImageDecodeProbe {
 };
 class BenchmarkImageValidator {
 public:
- [[nodiscard]] std::pair<std::uint32_t, std::uint32_t> read_header(const std::span<const std::uint8_t> encoded, const std::uint32_t expected_width = 0U,
-                                                                   const std::uint32_t expected_height = 0U);
- [[nodiscard]] std::pair<std::uint32_t, std::uint32_t> validate_file(const std::filesystem::path& path, const std::uint32_t expected_width = 0U,
-                                                                     const std::uint32_t expected_height = 0U);
+ [[nodiscard]] std::pair<std::uint32_t, std::uint32_t> read_header(const std::span<const std::uint8_t> encoded, const std::uint32_t expected_width = 0U, const std::uint32_t expected_height = 0U);
+ [[nodiscard]] std::pair<std::uint32_t, std::uint32_t> validate_file(const std::filesystem::path& path, const std::uint32_t expected_width = 0U, const std::uint32_t expected_height = 0U);
  void validate_decodable(const std::span<const std::uint8_t> encoded, const std::uint32_t expected_width = 0U, const std::uint32_t expected_height = 0U);
  void validate_decodable_file(const std::filesystem::path& path, const std::uint32_t expected_width = 0U, const std::uint32_t expected_height = 0U);
 

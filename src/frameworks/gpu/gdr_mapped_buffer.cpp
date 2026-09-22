@@ -83,12 +83,11 @@ struct GdrMappedBuffer::Storage {
    if (trace.get() < 0) return;
    char text[512];
    const int length = std::snprintf(text, sizeof(text),
-                                    "{\"event\":\"%s\",\"device\":%d,\"context\":%llu,\"backend\":\"%s\",\"allocation\":%llu,"
-                                    "\"allocated_bytes\":%zu,\"capacity\":%zu,\"mapped_bytes\":%zu,\"mapping_type\":%d,"
-                                    "\"owned_export_fds\":%d,\"bytes\":%zu}\n",
-                                    event, device, static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(context)),
-                                    backend_known ? (dmabuf ? "dmabuf" : "gdrdrv") : "unselected", static_cast<unsigned long long>(allocation), allocated_bytes,
-                                    capacity, mapped_bytes, mapping_type, dmabuf && registration ? 1 : 0, bytes);
+    "{\"event\":\"%s\",\"device\":%d,\"context\":%llu,\"backend\":\"%s\",\"allocation\":%llu,"
+    "\"allocated_bytes\":%zu,\"capacity\":%zu,\"mapped_bytes\":%zu,\"mapping_type\":%d,"
+    "\"owned_export_fds\":%d,\"bytes\":%zu}\n",
+    event, device, static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(context)), backend_known ? (dmabuf ? "dmabuf" : "gdrdrv") : "unselected",
+    static_cast<unsigned long long>(allocation), allocated_bytes, capacity, mapped_bytes, mapping_type, dmabuf && registration ? 1 : 0, bytes);
    if (length > 0 && static_cast<std::size_t>(length) < sizeof(text)) {
     const auto written = ::write(trace.get(), text, static_cast<std::size_t>(length));
     (void)written;
@@ -180,16 +179,14 @@ struct GdrMappedBuffer::Storage {
    p.device_pointer = (p.allocation + mapping_alignment - 1) & ~(static_cast<CUdeviceptr>(mapping_alignment) - 1);
    p.registration = p.backend->pin(p.handle, p.device_pointer, p.capacity);
    const auto before = p.backend->info(p.handle, p.registration);
-   if (before.page_size == 0 || before.page_size > mapping_alignment || (before.page_size & (before.page_size - 1)) != 0 ||
-       before.base % before.page_size != 0 || before.bytes % before.page_size != 0 || before.base > p.device_pointer || before.bytes < p.capacity ||
-       p.device_pointer - before.base > before.bytes - p.capacity || before.base < p.allocation ||
-       before.bytes > p.allocated_bytes - (before.base - p.allocation))
+   if (before.page_size == 0 || before.page_size > mapping_alignment || (before.page_size & (before.page_size - 1)) != 0 || before.base % before.page_size != 0 ||
+       before.bytes % before.page_size != 0 || before.base > p.device_pointer || before.bytes < p.capacity || p.device_pointer - before.base > before.bytes - p.capacity ||
+       before.base < p.allocation || before.bytes > p.allocated_bytes - (before.base - p.allocation))
     throw std::runtime_error("GDR registration exceeds its owning allocation");
    p.mapped_bytes = before.bytes;
    p.mapping = p.backend->map(p.handle, p.registration, p.mapped_bytes);
    const auto after = p.backend->info(p.handle, p.registration);
-   if (!after.mapped || after.base != before.base || after.bytes != before.bytes || after.page_size != before.page_size)
-    throw std::runtime_error("GDR mapping geometry changed during registration");
+   if (!after.mapped || after.base != before.base || after.bytes != before.bytes || after.page_size != before.page_size) throw std::runtime_error("GDR mapping geometry changed during registration");
    p.mapping_type = after.mapping_type;
    p.cpu_pointer = static_cast<std::byte*>(p.mapping) + (p.device_pointer - after.base);
    for (auto& consumer : p.consumers) consumer.event = p.backend->create_event();

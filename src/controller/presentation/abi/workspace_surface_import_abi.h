@@ -147,9 +147,8 @@ static_assert(std::is_trivially_copyable_v<LayoutPacket>);
 [[nodiscard]] inline constexpr bool valid(const LayoutPacket& packet) noexcept {
  const LayoutPacket expected{};
  return packet.abi_version == expected.abi_version && packet.record_size == expected.record_size && packet.record_alignment == expected.record_alignment &&
-        packet.allocate_descriptor_count == expected.allocate_descriptor_count && packet.ready_descriptor_count == expected.ready_descriptor_count &&
-        packet.opcode_offset == expected.opcode_offset && packet.capability_offset == expected.capability_offset &&
-        packet.presentation_revision_offset == expected.presentation_revision_offset;
+        packet.allocate_descriptor_count == expected.allocate_descriptor_count && packet.ready_descriptor_count == expected.ready_descriptor_count && packet.opcode_offset == expected.opcode_offset &&
+        packet.capability_offset == expected.capability_offset && packet.presentation_revision_offset == expected.presentation_revision_offset;
 }
 // How many descriptors an opcode carries. A record that arrives with a
 // different count is a framing violation on either side.
@@ -158,56 +157,49 @@ static_assert(std::is_trivially_copyable_v<LayoutPacket>);
  return opcode == Opcode::Ready ? kReadyDescriptorCount : 0U;
 }
 [[nodiscard]] inline bool valid(const Record& record) noexcept {
- const bool known = record.opcode == Opcode::Allocate || record.opcode == Opcode::Drop || record.opcode == Opcode::Ready || record.opcode == Opcode::Failed ||
-                    record.opcode == Opcode::Available || record.opcode == Opcode::Presented || record.opcode == Opcode::Completed ||
-                    record.opcode == Opcode::Retired || record.opcode == Opcode::Arena || record.opcode == Opcode::ArenaReady ||
-                    record.opcode == Opcode::ReadSettled || record.opcode == Opcode::Acquired || record.opcode == Opcode::ReleaseSubmitted ||
+ const bool known = record.opcode == Opcode::Allocate || record.opcode == Opcode::Drop || record.opcode == Opcode::Ready || record.opcode == Opcode::Failed || record.opcode == Opcode::Available ||
+                    record.opcode == Opcode::Presented || record.opcode == Opcode::Completed || record.opcode == Opcode::Retired || record.opcode == Opcode::Arena ||
+                    record.opcode == Opcode::ArenaReady || record.opcode == Opcode::ReadSettled || record.opcode == Opcode::Acquired || record.opcode == Opcode::ReleaseSubmitted ||
                     record.opcode == Opcode::BindingRetired;
- if (!known || record.abi_version != kAbiVersion || record.modifier != kModifierLinear || record.descriptors != descriptor_count(record.opcode) ||
-     (record.id_high == 0U && record.id_low == 0U)) {
+ if (!known || record.abi_version != kAbiVersion || record.modifier != kModifierLinear || record.descriptors != descriptor_count(record.opcode) || (record.id_high == 0U && record.id_low == 0U)) {
   return false;
  }
  const bool empty_extent = record.width == 0U && record.height == 0U && record.stride == 0U && record.size == 0U;
  bool uuid_valid = false;
  for (const auto byte : record.device_uuid) uuid_valid = uuid_valid || byte != 0U;
- const bool empty_layout =
-  record.arena_high == 0U && record.arena_low == 0U && record.allocation_identity == 0U && record.device_incarnation == 0U &&
-  (record.offset == 0U || record.opcode == Opcode::ReadSettled || record.opcode == Opcode::Acquired || record.opcode == Opcode::ReleaseSubmitted) &&
-  record.alignment == 0U && !uuid_valid && record.dedicated == 0U && record.memory_type_bits == 0U && record.direct_sampling == 0U;
+ const bool empty_layout = record.arena_high == 0U && record.arena_low == 0U && record.allocation_identity == 0U && record.device_incarnation == 0U &&
+                           (record.offset == 0U || record.opcode == Opcode::ReadSettled || record.opcode == Opcode::Acquired || record.opcode == Opcode::ReleaseSubmitted) && record.alignment == 0U &&
+                           !uuid_valid && record.dedicated == 0U && record.memory_type_bits == 0U && record.direct_sampling == 0U;
  if (record.opcode != Opcode::Allocate && record.opcode != Opcode::Ready && record.opcode != Opcode::ArenaReady && !empty_layout) return false;
- const bool layout_valid = record.width != 0U && record.height != 0U && record.stride >= static_cast<std::uint64_t>(record.width) * 4U &&
-                           record.offset <= record.size && record.stride != 0U && record.height <= (record.size - record.offset) / record.stride &&
-                           record.alignment != 0U && (record.alignment & (record.alignment - 1U)) == 0U &&
-                           record.size <= static_cast<std::uint64_t>(std::numeric_limits<std::ptrdiff_t>::max()) && record.device_incarnation != 0U &&
-                           uuid_valid && record.dedicated <= 1U && record.memory_type_bits != 0U && record.direct_sampling <= 1U;
+ const bool layout_valid = record.width != 0U && record.height != 0U && record.stride >= static_cast<std::uint64_t>(record.width) * 4U && record.offset <= record.size && record.stride != 0U &&
+                           record.height <= (record.size - record.offset) / record.stride && record.alignment != 0U && (record.alignment & (record.alignment - 1U)) == 0U &&
+                           record.size <= static_cast<std::uint64_t>(std::numeric_limits<std::ptrdiff_t>::max()) && record.device_incarnation != 0U && uuid_valid && record.dedicated <= 1U &&
+                           record.memory_type_bits != 0U && record.direct_sampling <= 1U;
  switch (record.opcode) {
   case Opcode::Ready:
   case Opcode::Allocate: {
-   return layout_valid && record.allocation_identity != 0U && (record.arena_high != 0U || record.arena_low != 0U) && record.code == 0U &&
-          record.modifier == kModifierLinear && record.presentation_revision == 0U;
+   return layout_valid && record.allocation_identity != 0U && (record.arena_high != 0U || record.arena_low != 0U) && record.code == 0U && record.modifier == kModifierLinear &&
+          record.presentation_revision == 0U;
   }
-  case Opcode::Arena:
-   return record.width != 0U && record.height != 0U && record.stride == 0U && record.size == 0U && record.code == 0U && record.presentation_revision == 0U;
+  case Opcode::Arena: return record.width != 0U && record.height != 0U && record.stride == 0U && record.size == 0U && record.code == 0U && record.presentation_revision == 0U;
   case Opcode::ArenaReady:
-   return layout_valid && record.arena_high == 0U && record.arena_low == 0U && record.allocation_identity == 0U && record.modifier == kModifierLinear &&
-          record.code == 0U && record.presentation_revision == 0U;
+   return layout_valid && record.arena_high == 0U && record.arena_low == 0U && record.allocation_identity == 0U && record.modifier == kModifierLinear && record.code == 0U &&
+          record.presentation_revision == 0U;
   case Opcode::ReadSettled:
   case Opcode::Acquired:
   case Opcode::ReleaseSubmitted:
-   return record.offset != 0U && record.width == 0U && record.height == 0U && record.code == 0U && (record.stride != 0U || record.size != 0U) &&
-          record.presentation_revision != 0U;
+   return record.offset != 0U && record.width == 0U && record.height == 0U && record.code == 0U && (record.stride != 0U || record.size != 0U) && record.presentation_revision != 0U;
   case Opcode::Drop:
   case Opcode::Retired:
   case Opcode::BindingRetired: return empty_extent && record.modifier == kModifierLinear && record.code == 0U && record.presentation_revision == 0U;
   case Opcode::Available:
   case Opcode::Presented:
   case Opcode::Completed:
-   return record.width == 0U && record.height == 0U && record.modifier == kModifierLinear && record.code >= 1U && record.code <= 2U &&
-          (record.stride != 0U || record.size != 0U) && record.presentation_revision != 0U;
+   return record.width == 0U && record.height == 0U && record.modifier == kModifierLinear && record.code >= 1U && record.code <= 2U && (record.stride != 0U || record.size != 0U) &&
+          record.presentation_revision != 0U;
   case Opcode::Failed: {
    const auto failure = static_cast<FailureCode>(record.code);
-   const bool known_failure =
-    failure == FailureCode::NotAdmitted || failure == FailureCode::UnsupportedDescriptor || failure == FailureCode::Import || failure == FailureCode::Layout;
+   const bool known_failure = failure == FailureCode::NotAdmitted || failure == FailureCode::UnsupportedDescriptor || failure == FailureCode::Import || failure == FailureCode::Layout;
    const bool layout = failure == FailureCode::Layout;
    return known_failure && record.width == 0U && record.height == 0U && record.modifier == kModifierLinear && record.presentation_revision == 0U &&
           (layout ? record.stride != 0U && record.size != 0U : record.stride == 0U && record.size == 0U);

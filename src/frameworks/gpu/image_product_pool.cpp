@@ -34,8 +34,7 @@ struct ImageProductPool::Slot final {
  bool reserved = false;
  bool selected = false;
 };
-ImageProductPool::Availability::Availability(std::shared_ptr<Admission> admission) noexcept
-    : admission_(std::move(admission)), epoch_(admission_->epoch.load(std::memory_order_acquire)) {}
+ImageProductPool::Availability::Availability(std::shared_ptr<Admission> admission) noexcept : admission_(std::move(admission)), epoch_(admission_->epoch.load(std::memory_order_acquire)) {}
 bool ImageProductPool::Availability::Wait(std::stop_token stop) const {
  if (!admission_) return false;
  std::stop_callback stopped(stop, [gate = admission_] { gate->Notify(); });
@@ -144,12 +143,8 @@ ImageProductPool::Candidate& ImageProductPool::Candidate::operator=(Candidate&& 
 }
 bool ImageProductPool::Candidate::valid() const noexcept { return slot_ != nullptr; }
 std::uint64_t ImageProductPool::Candidate::revision() const noexcept { return revision_; }
-std::array<ImageAllocation, 2U> ImageProductPool::Candidate::allocations() const {
- return slot_ ? slot_->buffer.Allocations() : std::array<ImageAllocation, 2U>{};
-}
-ImageWorkspaceObservation ImageProductPool::Candidate::ObserveWorkspace() const {
- return slot_ ? slot_->buffer.ObserveWorkspace() : ImageWorkspaceObservation{};
-}
+std::array<ImageAllocation, 2U> ImageProductPool::Candidate::allocations() const { return slot_ ? slot_->buffer.Allocations() : std::array<ImageAllocation, 2U>{}; }
+ImageWorkspaceObservation ImageProductPool::Candidate::ObserveWorkspace() const { return slot_ ? slot_->buffer.ObserveWorkspace() : ImageWorkspaceObservation{}; }
 void ImageProductPool::Candidate::Release() noexcept {
  if (!slot_) return;
  auto slot = std::move(slot_);
@@ -194,8 +189,7 @@ ImageProductPool::Candidate ImageProductPool::Acquire(std::stop_token stop, Prod
  return {};
 }
 void ImageProductPool::ValidateBaseline(const Product& baseline) const {
- if (baseline.slot_ && (baseline.slot_->admission != admission_ || !baseline.valid()))
-  throw std::invalid_argument("image product baseline is invalid or foreign");
+ if (baseline.slot_ && (baseline.slot_->admission != admission_ || !baseline.valid())) throw std::invalid_argument("image product baseline is invalid or foreign");
 }
 ImageProductPool::Candidate ImageProductPool::TryAcquire(Product& baseline, ImagePlanePreservation preservation) {
  ValidateBaseline(baseline);
@@ -218,10 +212,8 @@ ImageProductPool::Candidate ImageProductPool::TryAcquire(Product& baseline, Imag
  }
  return {};
 }
-void ImageProductPool::Publish(ImageStream& stream, Candidate& candidate, std::uint32_t width, std::uint32_t height, std::uint64_t revision,
-                               ImageProductBuffer::ProductSubmit submit) {
- if (!candidate.slot_ || candidate.slot_->admission != admission_ || candidate.revision_ != 0U || revision == 0U)
-  throw std::invalid_argument("image product candidate is invalid");
+void ImageProductPool::Publish(ImageStream& stream, Candidate& candidate, std::uint32_t width, std::uint32_t height, std::uint64_t revision, ImageProductBuffer::ProductSubmit submit) {
+ if (!candidate.slot_ || candidate.slot_->admission != admission_ || candidate.revision_ != 0U || revision == 0U) throw std::invalid_argument("image product candidate is invalid");
  if (width == 0U || height == 0U || !submit) throw std::invalid_argument("image product submit is empty");
  auto& slot = *candidate.slot_;
  const bool same_slot = candidate.baseline_.slot_ == candidate.slot_;
@@ -231,8 +223,7 @@ void ImageProductPool::Publish(ImageStream& stream, Candidate& candidate, std::u
   auto baseline = candidate.baseline_.Borrow();
   if (!baseline.valid()) throw std::invalid_argument("image product baseline is unavailable");
   const auto descriptor = baseline.plane(0U).plane().descriptor;
-  initialized =
-   descriptor.width == width && descriptor.height == height && baseline.plane_count() == (slot.buffer.layout() == ImageProductLayout::Clean ? 1U : 2U);
+  initialized = descriptor.width == width && descriptor.height == height && baseline.plane_count() == (slot.buffer.layout() == ImageProductLayout::Clean ? 1U : 2U);
   if (initialized && !same_slot) static_cast<void>(slot.buffer.CopyFromAs(stream, std::move(baseline), {}, 0U, false, candidate.preservation_));
  }
  {
@@ -246,10 +237,9 @@ void ImageProductPool::Publish(ImageStream& stream, Candidate& candidate, std::u
  } catch (...) { stream.RethrowAfterSettlement(std::current_exception()); }
  candidate.revision_ = revision;
 }
-void ImageProductPool::PublishRetained(ImageStream& stream, Candidate& candidate, const std::uint32_t width, const std::uint32_t height,
-                                       const std::uint64_t revision, ImageProductBuffer::ProductSubmit submit, ImageSubmission submission) {
- if (!candidate.slot_ || candidate.slot_->admission != admission_ || candidate.revision_ != 0U || revision == 0U)
-  throw std::invalid_argument("retained image candidate is invalid");
+void ImageProductPool::PublishRetained(
+ ImageStream& stream, Candidate& candidate, const std::uint32_t width, const std::uint32_t height, const std::uint64_t revision, ImageProductBuffer::ProductSubmit submit, ImageSubmission submission) {
+ if (!candidate.slot_ || candidate.slot_->admission != admission_ || candidate.revision_ != 0U || revision == 0U) throw std::invalid_argument("retained image candidate is invalid");
  if (width == 0U || height == 0U || !submit) throw std::invalid_argument("image product submit is empty");
  auto& slot = *candidate.slot_;
  if (slot.buffer.terminal() || !slot.buffer.writable()) throw std::runtime_error("retained image candidate is unavailable");
@@ -279,10 +269,8 @@ std::array<ImageCopyPath, 2U> ImageProductPool::CopyFrom(ImageStream& stream, Bo
  static_cast<void>(Commit(std::move(candidate)));
  return paths;
 }
-std::array<ImageCopyPath, 2U> ImageProductPool::CopyFrom(ImageStream& stream, Candidate& candidate, BorrowedImageProductReadView source,
-                                                         std::uint64_t revision) {
- if (revision == 0U || !candidate.slot_ || candidate.slot_->admission != admission_ || candidate.revision_ != 0U)
-  throw std::invalid_argument("image copy candidate is invalid");
+std::array<ImageCopyPath, 2U> ImageProductPool::CopyFrom(ImageStream& stream, Candidate& candidate, BorrowedImageProductReadView source, std::uint64_t revision) {
+ if (revision == 0U || !candidate.slot_ || candidate.slot_->admission != admission_ || candidate.revision_ != 0U) throw std::invalid_argument("image copy candidate is invalid");
  ValidateCopySource(source, revision);
  auto& slot = *candidate.slot_;
  {
@@ -299,8 +287,7 @@ bool ImageProductPool::DetachDisplay(ImageStream& stream, const std::shared_ptr<
   if (!slot->buffer.DetachWorkspace(stream, workspace)) return false;
  return true;
 }
-bool ImageProductPool::PrepareDisplay(ImageStream& stream, std::uint64_t revision, const std::shared_ptr<ImageWorkspace>& workspace,
-                                      ImageWorkspaceFinalize finalize) {
+bool ImageProductPool::PrepareDisplay(ImageStream& stream, std::uint64_t revision, const std::shared_ptr<ImageWorkspace>& workspace, ImageWorkspaceFinalize finalize) {
  const auto product = Selected();
  if (!product.valid() || product.revision() != revision) return false;
  for (const auto& slot : slots_) {
@@ -333,8 +320,7 @@ BorrowedImageWorkspace ImageProductPool::BorrowWorkspace() const {
  return {};
 }
 void ImageProductPool::FinalizeWorkspace(Candidate& candidate, ImageWorkspaceCoverage coverage) {
- if (!candidate.slot_ || candidate.slot_->admission != admission_ || candidate.revision_ == 0U)
-  throw std::invalid_argument("workspace candidate has no completed raw product");
+ if (!candidate.slot_ || candidate.slot_->admission != admission_ || candidate.revision_ == 0U) throw std::invalid_argument("workspace candidate has no completed raw product");
  candidate.slot_->buffer.FinalizeWorkspace(coverage);
 }
 void ImageProductPool::CompleteWorkspaces() {
@@ -360,8 +346,7 @@ void ImageProductPool::ReleaseForRetirement() noexcept {
  slots_.clear();
 }
 ImageProductPool::Product ImageProductPool::Commit(Candidate&& candidate) {
- if (!candidate.slot_ || candidate.slot_->admission != admission_ || candidate.revision_ == 0U)
-  throw std::invalid_argument("image product candidate is incomplete");
+ if (!candidate.slot_ || candidate.slot_->admission != admission_ || candidate.revision_ == 0U) throw std::invalid_argument("image product candidate is incomplete");
  const auto& buffer = candidate.slot_->buffer;
  if (buffer.terminal()) throw std::invalid_argument("image product candidate is quarantined");
  const Facts facts{candidate.revision_, buffer.capacity_width(), buffer.capacity_height(), buffer.staging_capacity_bytes()};

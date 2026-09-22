@@ -99,8 +99,7 @@ private:
  ImageWorkspaceContent newest_{};
  ImageWorkspaceRegion accumulated_{};
 };
-using ImageWorkspaceFinalize =
- std::function<void(ImagePlaneView clean, ImagePlaneView semantic, ImagePlaneView destination, ImageWorkspaceCoverage, std::uintptr_t stream)>;
+using ImageWorkspaceFinalize = std::function<void(ImagePlaneView clean, ImagePlaneView semantic, ImagePlaneView destination, ImageWorkspaceCoverage, std::uintptr_t stream)>;
 // One physical Vulkan opaque-FD allocation, producer-context mappings, and
 // display-device transfer storage when the producer resides on another GPU.
 // Admission precedes writes; raw products and browser imports have their own

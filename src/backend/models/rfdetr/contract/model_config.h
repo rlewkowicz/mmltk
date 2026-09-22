@@ -67,25 +67,19 @@ struct NativeRfDetrConfig {
  if (!training_supervision_config_valid(config.training_supervision)) return false;
  if (training_supervision_enabled(config.training_supervision) &&
      (config.num_queries < 0 || config.group_detr <= 0 ||
-      !training_supervision_query_layout_valid(config.training_supervision, static_cast<std::size_t>(config.num_queries),
-                                               static_cast<std::size_t>(config.group_detr), 0U))) {
+      !training_supervision_query_layout_valid(config.training_supervision, static_cast<std::size_t>(config.num_queries), static_cast<std::size_t>(config.group_detr), 0U))) {
   return false;
  }
  if (config.training_supervision.assignment == TrainAssignmentKind::MatchFree) {
-  if (config.segmentation || !std::isfinite(config.set_cost_class) || config.set_cost_class < 0.0 || !std::isfinite(config.set_cost_bbox) ||
-      config.set_cost_bbox < 0.0 || !std::isfinite(config.set_cost_giou) || config.set_cost_giou < 0.0 ||
-      (config.set_cost_class == 0.0 && config.set_cost_bbox == 0.0 && config.set_cost_giou == 0.0)) {
+  if (config.segmentation || !std::isfinite(config.set_cost_class) || config.set_cost_class < 0.0 || !std::isfinite(config.set_cost_bbox) || config.set_cost_bbox < 0.0 ||
+      !std::isfinite(config.set_cost_giou) || config.set_cost_giou < 0.0 || (config.set_cost_class == 0.0 && config.set_cost_bbox == 0.0 && config.set_cost_giou == 0.0)) {
    return false;
   }
  }
- if (training_supervision_enabled(config.training_supervision) &&
-     (!std::isfinite(config.focal_alpha) || config.focal_alpha < 0.0 || config.focal_alpha > 1.0)) {
-  return false;
- }
+ if (training_supervision_enabled(config.training_supervision) && (!std::isfinite(config.focal_alpha) || config.focal_alpha < 0.0 || config.focal_alpha > 1.0)) { return false; }
  if (config.training_supervision.denoising.enabled &&
-     (!std::isfinite(config.cls_loss_coef) || config.cls_loss_coef < 0.0 || !std::isfinite(config.bbox_loss_coef) || config.bbox_loss_coef < 0.0 ||
-      !std::isfinite(config.giou_loss_coef) || config.giou_loss_coef < 0.0 ||
-      (config.cls_loss_coef == 0.0 && config.bbox_loss_coef == 0.0 && config.giou_loss_coef == 0.0))) {
+     (!std::isfinite(config.cls_loss_coef) || config.cls_loss_coef < 0.0 || !std::isfinite(config.bbox_loss_coef) || config.bbox_loss_coef < 0.0 || !std::isfinite(config.giou_loss_coef) ||
+      config.giou_loss_coef < 0.0 || (config.cls_loss_coef == 0.0 && config.bbox_loss_coef == 0.0 && config.giou_loss_coef == 0.0))) {
   return false;
  }
  return true;

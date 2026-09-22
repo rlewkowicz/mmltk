@@ -73,8 +73,7 @@ private:
  bool& stream_settled_;
  bool& context_retained_;
 };
-[[nodiscard]] std::unique_ptr<SystemImageRuntime> make_destruction_order_runtime(const std::shared_ptr<FakeImageBackend>& backend, bool& stream_settled,
-                                                                                 bool& context_retained) {
+[[nodiscard]] std::unique_ptr<SystemImageRuntime> make_destruction_order_runtime(const std::shared_ptr<FakeImageBackend>& backend, bool& stream_settled, bool& context_retained) {
  return std::make_unique<SystemImageRuntime>(SystemImageRuntimeConfig{
   .device = 0,
   .backend = backend,
@@ -83,8 +82,7 @@ private:
 }
 class FailingReleaseModel final : public SystemImageModel {
 public:
- FailingReleaseModel(std::shared_ptr<std::atomic_bool> destroyed, const bool all_released, const bool reports_failure = true,
-                     std::shared_ptr<std::atomic_uint64_t> release_calls = {})
+ FailingReleaseModel(std::shared_ptr<std::atomic_bool> destroyed, const bool all_released, const bool reports_failure = true, std::shared_ptr<std::atomic_uint64_t> release_calls = {})
      : destroyed_(std::move(destroyed)),
        all_released_(all_released),
        failure_(reports_failure ? std::make_exception_ptr(std::runtime_error("deterministic model release failure")) : std::exception_ptr{}),
@@ -110,12 +108,8 @@ public:
   bool destroyed = false;
   bool in_runtime_context = false;
  };
- RebindingReleaseModel(std::shared_ptr<FakeImageBackend> backend, std::shared_ptr<Destruction> destruction, std::exception_ptr rebind_failure = {},
-                       std::exception_ptr release_failure = {})
-     : backend_(std::move(backend)),
-       destruction_(std::move(destruction)),
-       rebind_failure_(std::move(rebind_failure)),
-       release_failure_(std::move(release_failure)) {}
+ RebindingReleaseModel(std::shared_ptr<FakeImageBackend> backend, std::shared_ptr<Destruction> destruction, std::exception_ptr rebind_failure = {}, std::exception_ptr release_failure = {})
+     : backend_(std::move(backend)), destruction_(std::move(destruction)), rebind_failure_(std::move(rebind_failure)), release_failure_(std::move(release_failure)) {}
  ~RebindingReleaseModel() override {
   destruction_->destroyed = true;
   destruction_->in_runtime_context = backend_->last_bound_context.load(std::memory_order_acquire) == 1U;
@@ -476,16 +470,12 @@ TEST_CASE("adopted image contexts validate complete ownership and retain indepen
  // fake context merely because no explicit backend pointer was supplied.
  CHECK_THROWS_AS(SystemImageRuntime(SystemImageRuntimeConfig{.device = 0, .adopted_context = context}), std::invalid_argument);
  CHECK_THROWS_AS(SystemImageRuntime(SystemImageRuntimeConfig{.device = 1, .backend = backend, .adopted_context = context}), std::invalid_argument);
- CHECK_THROWS_AS(SystemImageRuntime(SystemImageRuntimeConfig{.device = 0, .backend = std::make_shared<FakeImageBackend>(), .adopted_context = context}),
-                 std::invalid_argument);
- CHECK_THROWS_AS(
-  SystemImageRuntime(SystemImageRuntimeConfig{.device = 0, .backend = backend, .context_mode = DeviceContextMode::PrimaryInterop, .adopted_context = context}),
-  std::invalid_argument);
+ CHECK_THROWS_AS(SystemImageRuntime(SystemImageRuntimeConfig{.device = 0, .backend = std::make_shared<FakeImageBackend>(), .adopted_context = context}), std::invalid_argument);
+ CHECK_THROWS_AS(SystemImageRuntime(SystemImageRuntimeConfig{.device = 0, .backend = backend, .context_mode = DeviceContextMode::PrimaryInterop, .adopted_context = context}), std::invalid_argument);
  DeviceExecution unexpected;
  unexpected.device = 0;
  unexpected.placement.numa_node = 99;
- CHECK_THROWS_AS(SystemImageRuntime(SystemImageRuntimeConfig{.device = 0, .backend = backend, .execution = unexpected, .adopted_context = context}),
-                 std::invalid_argument);
+ CHECK_THROWS_AS(SystemImageRuntime(SystemImageRuntimeConfig{.device = 0, .backend = backend, .execution = unexpected, .adopted_context = context}), std::invalid_argument);
  {
   SystemImageRuntime runtime({.device = 0, .backend = backend, .adopted_context = context});
   CHECK(runtime.UsesContext(*context));
@@ -506,36 +496,34 @@ TEST_CASE("isolated CUDA contexts preserve stack depth across rebinding and reti
  const bool nested = GENERATE(false, true);
  // A fresh thread gives the driver stack a known empty baseline without
  // disturbing CUDA state retained by other hardware fixtures.
- auto observed = std::async(std::launch::async,
-                            [nested] {
-                             const auto check = [](CUresult status) {
-                              if (status != CUDA_SUCCESS) throw std::runtime_error("CUDA context stack operation failed");
-                             };
-                             DeviceContext caller(0, cuda_image_copy_backend());
-                             CUcontext caller_handle = nullptr;
-                             check(cuCtxGetCurrent(&caller_handle));
-                             if (nested) check(cuCtxPushCurrent(caller_handle));
-                             bool created_current = false;
-                             {
-                              DeviceContext candidate(0, cuda_image_copy_backend());
-                              CUcontext current = nullptr;
-                              check(cuCtxGetCurrent(&current));
-                              created_current = current && current != caller_handle;
-                              caller.Bind();
-                             }
-                             CUcontext current = nullptr;
-                             check(cuCtxGetCurrent(&current));
-                             const bool caller_current = current == caller_handle;
-                             unsigned entries = 0U;
-                             while (current && entries < 4U) {
-                              CUcontext popped = nullptr;
-                              check(cuCtxPopCurrent(&popped));
-                              ++entries;
-                              check(cuCtxGetCurrent(&current));
-                             }
-                             return std::tuple{created_current, caller_current, entries, current == nullptr};
-                            })
-                  .get();
+ auto observed = std::async(std::launch::async, [nested] {
+  const auto check = [](CUresult status) {
+   if (status != CUDA_SUCCESS) throw std::runtime_error("CUDA context stack operation failed");
+  };
+  DeviceContext caller(0, cuda_image_copy_backend());
+  CUcontext caller_handle = nullptr;
+  check(cuCtxGetCurrent(&caller_handle));
+  if (nested) check(cuCtxPushCurrent(caller_handle));
+  bool created_current = false;
+  {
+   DeviceContext candidate(0, cuda_image_copy_backend());
+   CUcontext current = nullptr;
+   check(cuCtxGetCurrent(&current));
+   created_current = current && current != caller_handle;
+   caller.Bind();
+  }
+  CUcontext current = nullptr;
+  check(cuCtxGetCurrent(&current));
+  const bool caller_current = current == caller_handle;
+  unsigned entries = 0U;
+  while (current && entries < 4U) {
+   CUcontext popped = nullptr;
+   check(cuCtxPopCurrent(&popped));
+   ++entries;
+   check(cuCtxGetCurrent(&current));
+  }
+  return std::tuple{created_current, caller_current, entries, current == nullptr};
+ }).get();
  CHECK(std::get<0>(observed));
  CHECK(std::get<1>(observed));
  CHECK(std::get<2>(observed) == (nested ? 2U : 1U));
@@ -552,8 +540,7 @@ TEST_CASE("canonical adoption validates ownership before changing the caller bin
   DeviceContext adopted(0, cuda_image_copy_backend());
   caller.Bind();
   REQUIRE(cuCtxGetCurrent(&before) == CUDA_SUCCESS);
-  CHECK_THROWS_AS(SystemImageRuntime(SystemImageRuntimeConfig{.device = 0, .backend = std::make_shared<FakeImageBackend>(), .adopted_context = adopted}),
-                  std::invalid_argument);
+  CHECK_THROWS_AS(SystemImageRuntime(SystemImageRuntimeConfig{.device = 0, .backend = std::make_shared<FakeImageBackend>(), .adopted_context = adopted}), std::invalid_argument);
   CUcontext current{};
   REQUIRE(cuCtxGetCurrent(&current) == CUDA_SUCCESS);
   CHECK(current == before);
@@ -574,8 +561,7 @@ TEST_CASE("canonical adoption validates ownership before changing the caller bin
 namespace mmltk::frameworks::gpu {
 TEST_CASE("exact CUDA context transactions restore or retain their physical owner once", "[gpu][context]") {
  enum class Failure { None, Query, Bind, RestoreOnce, RestoreAlways, BindAndRestore, LostRestore };
- const auto failure =
-  GENERATE(Failure::None, Failure::Query, Failure::Bind, Failure::RestoreOnce, Failure::RestoreAlways, Failure::BindAndRestore, Failure::LostRestore);
+ const auto failure = GENERATE(Failure::None, Failure::Query, Failure::Bind, Failure::RestoreOnce, Failure::RestoreAlways, Failure::BindAndRestore, Failure::LostRestore);
  const bool same_context = GENERATE(false, true);
  struct Driver final {
   CUcontext caller = reinterpret_cast<CUcontext>(1U);
@@ -588,26 +574,24 @@ TEST_CASE("exact CUDA context transactions restore or retain their physical owne
   bool work = false;
  } driver{.target = reinterpret_cast<CUcontext>(same_context ? 1U : 2U), .failure = failure};
  const CudaContextApi api{&driver,
-                          [](void* value, CUcontext* current) noexcept {
-                           auto& injected = *static_cast<Driver*>(value);
-                           if (injected.failure == Failure::Query) return CUDA_ERROR_INVALID_CONTEXT;
-                           *current = injected.current;
-                           return CUDA_SUCCESS;
-                          },
-                          [](void* value, CUcontext current) noexcept {
-                           auto& injected = *static_cast<Driver*>(value);
-                           if (++injected.sets == 1U && (injected.failure == Failure::Bind || injected.failure == Failure::BindAndRestore))
-                            return CUDA_ERROR_INVALID_CONTEXT;
-                           if (injected.sets > 1U && current == injected.caller) {
-                            ++injected.restores;
-                            if (injected.failure == Failure::LostRestore) return CUDA_ERROR_CONTEXT_IS_DESTROYED;
-                            if (injected.failure == Failure::RestoreAlways || injected.failure == Failure::BindAndRestore ||
-                                (injected.failure == Failure::RestoreOnce && injected.restores == 1U))
-                             return CUDA_ERROR_INVALID_CONTEXT;
-                           }
-                           injected.current = current;
-                           return CUDA_SUCCESS;
-                          }};
+  [](void* value, CUcontext* current) noexcept {
+   auto& injected = *static_cast<Driver*>(value);
+   if (injected.failure == Failure::Query) return CUDA_ERROR_INVALID_CONTEXT;
+   *current = injected.current;
+   return CUDA_SUCCESS;
+  },
+  [](void* value, CUcontext current) noexcept {
+   auto& injected = *static_cast<Driver*>(value);
+   if (++injected.sets == 1U && (injected.failure == Failure::Bind || injected.failure == Failure::BindAndRestore)) return CUDA_ERROR_INVALID_CONTEXT;
+   if (injected.sets > 1U && current == injected.caller) {
+    ++injected.restores;
+    if (injected.failure == Failure::LostRestore) return CUDA_ERROR_CONTEXT_IS_DESTROYED;
+    if (injected.failure == Failure::RestoreAlways || injected.failure == Failure::BindAndRestore || (injected.failure == Failure::RestoreOnce && injected.restores == 1U))
+     return CUDA_ERROR_INVALID_CONTEXT;
+   }
+   injected.current = current;
+   return CUDA_SUCCESS;
+  }};
  CudaContextScope scope({&driver, [](void* value) noexcept { ++static_cast<Driver*>(value)->terminal; }}, api);
  const auto run = [&] {
   scope.Run([&] {

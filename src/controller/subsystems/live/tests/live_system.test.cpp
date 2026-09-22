@@ -151,9 +151,9 @@ TEST_CASE("Live complete frames alternate native output slots without preparatio
  auto state = std::make_shared<ControlledLiveCapture>();
  EventGate events;
  LiveSystem live{kDevice,
-                 RuntimeFactory(
-                  0, backend, mmltk::frameworks::gpu::ImageProductLayout::Clean, [state] { return std::make_unique<ControlledLiveAlgorithm>(state); }, 2U),
-                 [&](LiveSystem::event_type) { events.Advance(); }};
+  RuntimeFactory(
+   0, backend, mmltk::frameworks::gpu::ImageProductLayout::Clean, [state] { return std::make_unique<ControlledLiveAlgorithm>(state); }, 2U),
+  [&](LiveSystem::event_type) { events.Advance(); }};
  const auto check = [](const auto& read, const std::size_t value) {
   REQUIRE(read.valid());
   const auto plane = read.plane(0U).plane();
@@ -208,9 +208,9 @@ TEST_CASE("Live rejected or stopped complete captures never report frame progres
  state->result = stop_after_capture;
  EventGate events;
  LiveSystem live{kDevice,
-                 RuntimeFactory(
-                  0, backend, mmltk::frameworks::gpu::ImageProductLayout::Clean, [state] { return std::make_unique<ControlledLiveAlgorithm>(state); }, 2U),
-                 [&](LiveSystem::event_type) { events.Advance(); }};
+  RuntimeFactory(
+   0, backend, mmltk::frameworks::gpu::ImageProductLayout::Clean, [state] { return std::make_unique<ControlledLiveAlgorithm>(state); }, 2U),
+  [&](LiveSystem::event_type) { events.Advance(); }};
  if (stop_after_capture) state->after_capture = [&] { static_cast<void>(live.Stop()); };
  state->Offer();
  static_cast<void>(live.Start({.extent = {7U, 3U}, .frames_per_second = 240U}));
@@ -234,12 +234,12 @@ TEST_CASE("Live receiver publication failure does not commit a captured candidat
  EventGate events;
  std::atomic_bool failed{false};
  LiveSystem live{kDevice,
-                 RuntimeFactory(
-                  0, backend, mmltk::frameworks::gpu::ImageProductLayout::Clean, [state] { return std::make_unique<ControlledLiveAlgorithm>(state); }, 2U),
-                 [&](LiveSystem::event_type event) {
-                  if (std::holds_alternative<LiveFailed>(event)) failed = true;
-                  events.Advance();
-                 }};
+  RuntimeFactory(
+   0, backend, mmltk::frameworks::gpu::ImageProductLayout::Clean, [state] { return std::make_unique<ControlledLiveAlgorithm>(state); }, 2U),
+  [&](LiveSystem::event_type event) {
+   if (std::holds_alternative<LiveFailed>(event)) failed = true;
+   events.Advance();
+  }};
  state->Offer();
  static_cast<void>(live.Start({.extent = {7U, 3U}, .frames_per_second = 240U}));
  REQUIRE(events.Wait([&] { return failed.load(); }));
@@ -252,9 +252,7 @@ public:
  void Start(const LiveStart&) override {}
  void SetOutputAvailableSink(std::function<void()>) override {}
  bool AcquireOutput() override { return true; }
- bool Capture(mmltk::frameworks::gpu::ImagePlaneView, std::uintptr_t, std::stop_token) override {
-  throw std::runtime_error("deterministic Live capture failure");
- }
+ bool Capture(mmltk::frameworks::gpu::ImagePlaneView, std::uintptr_t, std::stop_token) override { throw std::runtime_error("deterministic Live capture failure"); }
  void Stop() noexcept override {}
 };
 TEST_CASE("Live queued discrete cancellation settles without running obsolete work") {
@@ -267,8 +265,7 @@ TEST_CASE("Live queued discrete cancellation settles without running obsolete wo
  std::promise<void> active_cancelled;
  std::atomic_bool queued_ran = false;
  std::atomic_bool owner_failed = false;
- detail::VisualRuntimeOwner owner{test_live_runtime_factory(backend, captures),
-                                  [&owner_failed](std::exception_ptr) { owner_failed.store(true, std::memory_order_release); }};
+ detail::VisualRuntimeOwner owner{test_live_runtime_factory(backend, captures), [&owner_failed](std::exception_ptr) { owner_failed.store(true, std::memory_order_release); }};
  auto settle_owner = settle_visual_on_exit(owner, release_latest);
  owner.SubmitLatest([&latest_entered, &active_cancelled, release](mmltk::frameworks::gpu::SystemImageRuntime&, std::stop_token stop) mutable {
   std::stop_callback observe_stop{stop, [&active_cancelled] { active_cancelled.set_value(); }};
@@ -294,11 +291,10 @@ TEST_CASE("Live queued discrete cancellation settles without running obsolete wo
 TEST_CASE("Live failure publishes its newer settled snapshot") {
  auto backend = std::make_shared<FakeImageBackend>();
  std::promise<LiveFailed> failure;
- LiveSystem live{kDevice,
-                 RuntimeFactory(0, backend, mmltk::frameworks::gpu::ImageProductLayout::Clean, [] { return std::make_unique<FailingLiveAlgorithm>(); }),
-                 [&failure](LiveSystem::event_type event) {
-                  if (auto* failed = std::get_if<LiveFailed>(&event)) failure.set_value(std::move(*failed));
-                 }};
+ LiveSystem live{
+  kDevice, RuntimeFactory(0, backend, mmltk::frameworks::gpu::ImageProductLayout::Clean, [] { return std::make_unique<FailingLiveAlgorithm>(); }), [&failure](LiveSystem::event_type event) {
+   if (auto* failed = std::get_if<LiveFailed>(&event)) failure.set_value(std::move(*failed));
+  }};
  const auto admitted = live.Start({.extent = {80U, 45U}, .frames_per_second = 120U});
  const auto failed = failure.get_future().get();
  CHECK_FALSE(failed.snapshot.running);

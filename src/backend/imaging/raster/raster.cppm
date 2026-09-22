@@ -12,9 +12,7 @@ struct PitchedView {
  std::size_t pitch_bytes = 0U;
  int width = 0;
  int height = 0;
- [[nodiscard]] bool valid(const std::size_t channels) const noexcept {
-  return pixels != nullptr && width > 0 && height > 0 && pitch_bytes >= static_cast<std::size_t>(width) * channels;
- }
+ [[nodiscard]] bool valid(const std::size_t channels) const noexcept { return pixels != nullptr && width > 0 && height > 0 && pitch_bytes >= static_cast<std::size_t>(width) * channels; }
 };
 using MutableBytes = PitchedView<std::uint8_t>;
 using ConstBytes = PitchedView<const std::uint8_t>;

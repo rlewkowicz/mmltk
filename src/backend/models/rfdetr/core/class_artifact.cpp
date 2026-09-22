@@ -45,8 +45,8 @@ ClassArtifactSnapshot ClassArtifactSnapshot::Read(const std::filesystem::path& a
  const auto lock = detail::lock_class_artifact(artifact, false);
  return capture(artifact, descriptor);
 }
-ClassArtifactAdmission::ClassArtifactAdmission(const std::filesystem::path& artifact, const std::filesystem::path& descriptor,
-                                               std::shared_ptr<const io::FileDigests> admitted_file, std::stop_token stop, bool include_md5) {
+ClassArtifactAdmission::ClassArtifactAdmission(
+ const std::filesystem::path& artifact, const std::filesystem::path& descriptor, std::shared_ptr<const io::FileDigests> admitted_file, std::stop_token stop, bool include_md5) {
  check_stop(stop);
  // Hash outside the bundle lock; snapshot equality rejects a concurrent publication.
  if (!admitted_file) {
@@ -76,8 +76,7 @@ ClassArtifactAdmission::ClassArtifactAdmission(const std::filesystem::path& arti
 std::vector<RfdetrNamedOutputRole> ClassArtifactAdmission::output_roles() const { return class_descriptor_output_roles(descriptors_); }
 void ClassArtifactAdmission::RequireUnchanged(std::stop_token stop) const {
  check_stop(stop);
- if (snapshot_ != ClassArtifactSnapshot::Read(snapshot_.artifact_path, snapshot_.descriptor_path))
-  throw std::runtime_error("class artifact changed during model admission");
+ if (snapshot_ != ClassArtifactSnapshot::Read(snapshot_.artifact_path, snapshot_.descriptor_path)) throw std::runtime_error("class artifact changed during model admission");
  check_stop(stop);
 }
 bool ClassArtifactAdmission::Matches(const std::filesystem::path& artifact, const std::filesystem::path& descriptor) const {

@@ -46,8 +46,7 @@ void test_telemetry_pressure_preserves_a_terminal_boundary() {
  std::string line;
  std::optional<r::TrainingRecord> previous;
  while (std::getline(stream, line)) {
-  auto record =
-   mmltk::frameworks::serialization::decode_reflected_json<r::TrainingRecord>(line, {.max_bytes = r::kTrainingRecordBytes, .max_items = 8192, .max_depth = 32});
+  auto record = mmltk::frameworks::serialization::decode_reflected_json<r::TrainingRecord>(line, {.max_bytes = r::kTrainingRecordBytes, .max_items = 8192, .max_depth = 32});
   if (previous) REQUIRE(record.sequence > previous->sequence);
   previous = std::move(record);
  }
@@ -61,9 +60,7 @@ void test_telemetry_pressure_preserves_a_terminal_boundary() {
 }
 }  // namespace
 TEST_CASE("test_telemetry_persistence_failure_is_nonfatal", "[model][rfdetr][training][telemetry]") { test_telemetry_persistence_failure_is_nonfatal(); }
-TEST_CASE("test_telemetry_pressure_preserves_a_terminal_boundary", "[model][rfdetr][training][telemetry]") {
- test_telemetry_pressure_preserves_a_terminal_boundary();
-}
+TEST_CASE("test_telemetry_pressure_preserves_a_terminal_boundary", "[model][rfdetr][training][telemetry]") { test_telemetry_pressure_preserves_a_terminal_boundary(); }
 namespace {
 // The writer's actual Initialize open blocks on this FIFO until Release. No
 // sleeps, scheduler assumptions or production-only persistence hooks are used.
@@ -151,8 +148,7 @@ void test_telemetry_boundary_pressure_reserves_epoch_and_terminal() {
  std::string line;
  std::vector<r::TrainingRecord> records;
  while (std::getline(stream, line))
-  records.push_back(mmltk::frameworks::serialization::decode_reflected_json<r::TrainingRecord>(
-   line, {.max_bytes = r::kTrainingRecordBytes, .max_items = 8192, .max_depth = 32}));
+  records.push_back(mmltk::frameworks::serialization::decode_reflected_json<r::TrainingRecord>(line, {.max_bytes = r::kTrainingRecordBytes, .max_items = 8192, .max_depth = 32}));
  REQUIRE(records.size() > 2);
  for (std::size_t index = 1; index < records.size(); ++index) REQUIRE(records[index].sequence > records[index - 1].sequence);
  for (std::size_t index = 0; index + 2 < records.size(); ++index) {
@@ -181,8 +177,7 @@ void test_invalid_terminal_has_truthful_degraded_custody_and_notice() {
  progress.full_checkpoint_path = temp.path() / "checkpoint.pt";
  held.writer->Finish(progress, {});
  held.Drain();
- const auto record = mmltk::frameworks::serialization::decode_reflected_json<r::TrainingRecord>(
-  held.history, {.max_bytes = r::kTrainingRecordBytes, .max_items = 8192, .max_depth = 32});
+ const auto record = mmltk::frameworks::serialization::decode_reflected_json<r::TrainingRecord>(held.history, {.max_bytes = r::kTrainingRecordBytes, .max_items = 8192, .max_depth = 32});
  REQUIRE(record.role == r::TrainingRecordRole::Terminal);
  REQUIRE(record.progress.phase == r::TrainingPhase::Error);
  REQUIRE(record.progress.checkpoint_path.empty());
@@ -224,8 +219,7 @@ void test_telemetry_distinct_heads_drain_by_sequence() {
  HeldHistory held(temp.path());
  r::TrainingMetricProgress progress;
  progress.phase = r::TrainingPhase::Train;
- for (const auto role : {r::TrainingRecordRole::Boundary, r::TrainingRecordRole::Epoch, r::TrainingRecordRole::Live, r::TrainingRecordRole::Boundary})
-  held.writer->Submit(progress, role);
+ for (const auto role : {r::TrainingRecordRole::Boundary, r::TrainingRecordRole::Epoch, r::TrainingRecordRole::Live, r::TrainingRecordRole::Boundary}) held.writer->Submit(progress, role);
  progress.phase = r::TrainingPhase::Completed;
  held.writer->Finish(progress, {});
  held.Drain();
@@ -233,8 +227,7 @@ void test_telemetry_distinct_heads_drain_by_sequence() {
  std::string line;
  std::uint64_t sequence = 0;
  while (std::getline(stream, line)) {
-  const auto record =
-   mmltk::frameworks::serialization::decode_reflected_json<r::TrainingRecord>(line, {.max_bytes = r::kTrainingRecordBytes, .max_items = 8192, .max_depth = 32});
+  const auto record = mmltk::frameworks::serialization::decode_reflected_json<r::TrainingRecord>(line, {.max_bytes = r::kTrainingRecordBytes, .max_items = 8192, .max_depth = 32});
   REQUIRE(record.sequence == sequence++);
   REQUIRE(record.dropped_before == 0);
  }
@@ -242,18 +235,10 @@ void test_telemetry_distinct_heads_drain_by_sequence() {
  REQUIRE_FALSE(held.writer->persistence().degraded);
 }
 }  // namespace
-TEST_CASE("test_telemetry_boundary_pressure_reserves_epoch_and_terminal", "[model][rfdetr][training][telemetry]") {
- test_telemetry_boundary_pressure_reserves_epoch_and_terminal();
-}
-TEST_CASE("test_invalid_terminal_has_truthful_degraded_custody_and_notice", "[model][rfdetr][training][telemetry]") {
- test_invalid_terminal_has_truthful_degraded_custody_and_notice();
-}
-TEST_CASE("test_rejected_only_submission_notifies_before_empty_close", "[model][rfdetr][training][telemetry]") {
- test_rejected_only_submission_notifies_before_empty_close();
-}
-TEST_CASE("test_unencodable_terminal_notifies_without_later_submission", "[model][rfdetr][training][telemetry]") {
- test_unencodable_terminal_notifies_without_later_submission();
-}
+TEST_CASE("test_telemetry_boundary_pressure_reserves_epoch_and_terminal", "[model][rfdetr][training][telemetry]") { test_telemetry_boundary_pressure_reserves_epoch_and_terminal(); }
+TEST_CASE("test_invalid_terminal_has_truthful_degraded_custody_and_notice", "[model][rfdetr][training][telemetry]") { test_invalid_terminal_has_truthful_degraded_custody_and_notice(); }
+TEST_CASE("test_rejected_only_submission_notifies_before_empty_close", "[model][rfdetr][training][telemetry]") { test_rejected_only_submission_notifies_before_empty_close(); }
+TEST_CASE("test_unencodable_terminal_notifies_without_later_submission", "[model][rfdetr][training][telemetry]") { test_unencodable_terminal_notifies_without_later_submission(); }
 TEST_CASE("test_telemetry_distinct_heads_drain_by_sequence", "[model][rfdetr][training][telemetry]") { test_telemetry_distinct_heads_drain_by_sequence(); }
 TEST_CASE("telemetry retains complete history JSON through progress epoch and terminal projections", "[model][rfdetr][training][telemetry]") {
  namespace serial = mmltk::frameworks::serialization;
@@ -337,8 +322,7 @@ TEST_CASE("telemetry retains complete history JSON through progress epoch and te
  terminal["last_epoch"] = 0;
  terminal["history_size"] = 1U;
  terminal["dataset_max_instances"] = {{"train", 0U}, {"val", 0U}, {"test", nullptr}, {"largest", 0U}};
- terminal["query_resolution"] = {
-  {"source", ""}, {"resolved", 0U}, {"required", 0U}, {"automatic_query_cap", 0U}, {"automatic", false}, {"requested_override", false}};
+ terminal["query_resolution"] = {{"source", ""}, {"resolved", 0U}, {"required", 0U}, {"automatic_query_cap", 0U}, {"automatic", false}, {"requested_override", false}};
  terminal["gpu_augmentation"] = serial::reflected_json(run.configuration.gpu_augmentation, scratch, limits);
  terminal["test"] = nullptr;
  CHECK(read_json("results.json") == terminal);

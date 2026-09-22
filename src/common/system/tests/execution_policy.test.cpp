@@ -12,10 +12,7 @@
 namespace {
 using namespace mmltk::common::system;
 NumaTopology topology() {
- return {.permitted_cpus = {2, 7, 19, 31, 42},
-         .permitted_nodes = {0, 3},
-         .cpus = {{2, 0, 0, 0}, {7, 0, 0, 0}, {19, 0, 0, 1}, {31, 3, 1, 0}, {42, 3, 1, 1}},
-         .nodes = {{0, 4096}, {3, 8192}}};
+ return {.permitted_cpus = {2, 7, 19, 31, 42}, .permitted_nodes = {0, 3}, .cpus = {{2, 0, 0, 0}, {7, 0, 0, 0}, {19, 0, 0, 1}, {31, 3, 1, 0}, {42, 3, 1, 1}}, .nodes = {{0, 4096}, {3, 8192}}};
 }
 TEST_CASE("GPU placement honors sparse node IDs, SMT and explicit eligibility", "[common][system][topology]") {
  auto facts = topology();
@@ -66,41 +63,41 @@ TEST_CASE("Scoped boundary verifies effective placement and restores caller poli
 TEST_CASE("Denied priority and NUMA policy fail required worker startup", "[common][system][policy]") {
  for (const int call : {SYS_setpriority, SYS_set_mempolicy, SYS_ioprio_set}) {
   CHECK(test_support::with_denied_syscall(call, [] {
-         const auto facts = NumaTopology::Capture();
-         const auto selected = mmltk::common::system::test_support::first_permitted_cpu(facts);
-         const auto cpu = selected.cpu;
-         const auto node = selected.node;
-         try {
-          (void)apply_worker_execution_policy({{cpu}, {}, 0, node, -10, true});
-         } catch (const std::system_error& error) { return error.code().value() == EPERM; }
-         return false;
-        }) == 0);
+   const auto facts = NumaTopology::Capture();
+   const auto selected = mmltk::common::system::test_support::first_permitted_cpu(facts);
+   const auto cpu = selected.cpu;
+   const auto node = selected.node;
+   try {
+    (void)apply_worker_execution_policy({{cpu}, {}, 0, node, -10, true});
+   } catch (const std::system_error& error) { return error.code().value() == EPERM; }
+   return false;
+  }) == 0);
  }
 }
 }  // namespace
 TEST_CASE("Synchronous policy failure restores every policy already changed", "[common][system][policy]") {
  CHECK(mmltk::common::system::test_support::with_denied_syscall(SYS_ioprio_set, [] {
-        using namespace mmltk::common::system;
-        const auto before = capture_execution_policy_snapshot();
-        const auto topology = NumaTopology::Capture();
-        const auto selected = mmltk::common::system::test_support::first_permitted_cpu(topology);
-        const auto cpu = selected.cpu;
-        const auto node = selected.node;
-        try {
-         ScopedExecutionPolicy scope({{cpu}, "denied-scope", 0, node, -10, true});
-        } catch (const std::system_error&) {
-         const auto after = capture_execution_policy_snapshot();
-         return after.affinity == before.affinity && after.nice_value == before.nice_value && after.memory_policy.mode == before.memory_policy.mode &&
-                after.memory_policy.mask == before.memory_policy.mask && after.thread_name == before.thread_name;
-        }
-        return false;
-       }) == 0);
+  using namespace mmltk::common::system;
+  const auto before = capture_execution_policy_snapshot();
+  const auto topology = NumaTopology::Capture();
+  const auto selected = mmltk::common::system::test_support::first_permitted_cpu(topology);
+  const auto cpu = selected.cpu;
+  const auto node = selected.node;
+  try {
+   ScopedExecutionPolicy scope({{cpu}, "denied-scope", 0, node, -10, true});
+  } catch (const std::system_error&) {
+   const auto after = capture_execution_policy_snapshot();
+   return after.affinity == before.affinity && after.nice_value == before.nice_value && after.memory_policy.mode == before.memory_policy.mode &&
+          after.memory_policy.mask == before.memory_policy.mask && after.thread_name == before.thread_name;
+  }
+  return false;
+ }) == 0);
 }
 TEST_CASE("Policy denial rolls back partially constructed worker pools", "[common][system][policy]") {
  CHECK(mmltk::common::system::test_support::with_denied_syscall(SYS_setpriority, [] {
-        try {
-         mmltk::common::concurrency::WorkerPool workers(4);
-        } catch (const std::system_error& error) { return error.code().value() == EPERM; }
-        return false;
-       }) == 0);
+  try {
+   mmltk::common::concurrency::WorkerPool workers(4);
+  } catch (const std::system_error& error) { return error.code().value() == EPERM; }
+  return false;
+ }) == 0);
 }

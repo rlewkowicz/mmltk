@@ -44,8 +44,7 @@ enum class ParseErrorCode : unsigned char {
 struct ParseError final : std::runtime_error {
  ParseErrorCode code;
  std::string token;
- ParseError(ParseErrorCode error_code, const std::string_view error_token, const std::string_view detail)
-     : std::runtime_error(std::string(detail)), code(error_code), token(error_token) {}
+ ParseError(ParseErrorCode error_code, const std::string_view error_token, const std::string_view detail) : std::runtime_error(std::string(detail)), code(error_code), token(error_token) {}
 };
 inline constexpr std::size_t kMaximumCommandOptions = 128U;
 class PresenceSet final {
@@ -114,9 +113,7 @@ template <class Value>
  } else if constexpr (std::is_integral_v<Value>) {
   Value value{};
   const auto [position, error] = std::from_chars(text.data(), text.data() + text.size(), value);
-  if (error != std::errc{} || position != text.data() + text.size()) {
-   return std::unexpected(ParseError{ParseErrorCode::InvalidInteger, text, "invalid integer"});
-  }
+  if (error != std::errc{} || position != text.data() + text.size()) { return std::unexpected(ParseError{ParseErrorCode::InvalidInteger, text, "invalid integer"}); }
   // CLEANUP-IGNORE: Integral and floating parsing report different public error categories and finite-number
   // policy.
   return value;
@@ -139,14 +136,10 @@ template <class Value>
   if (!satisfies(value, constraint)) { return std::unexpected(ParseError{ParseErrorCode::InvalidValue, token, "value violates field policy"}); }
  }
  if constexpr (std::is_same_v<Value, std::string>) {
-  if (constraint.maximum_bytes != 0U && value.size() > constraint.maximum_bytes) {
-   return std::unexpected(ParseError{ParseErrorCode::InvalidValue, token, "value exceeds field policy"});
-  }
+  if (constraint.maximum_bytes != 0U && value.size() > constraint.maximum_bytes) { return std::unexpected(ParseError{ParseErrorCode::InvalidValue, token, "value exceeds field policy"}); }
  }
  if constexpr (std::is_same_v<Value, std::filesystem::path>) {
-  if (constraint.maximum_bytes != 0U && value.native().size() > constraint.maximum_bytes) {
-   return std::unexpected(ParseError{ParseErrorCode::InvalidValue, token, "path exceeds field policy"});
-  }
+  if (constraint.maximum_bytes != 0U && value.native().size() > constraint.maximum_bytes) { return std::unexpected(ParseError{ParseErrorCode::InvalidValue, token, "path exceeds field policy"}); }
  }
  return {};
 }
@@ -168,11 +161,10 @@ struct OptionDescriptor {
  bool (*emission_enabled)(const Request&) noexcept = nullptr;
 };
 template <class Value>
-inline constexpr bool kRepeatableValue =
- !std::is_same_v<Value, std::string> && !std::is_same_v<Value, std::filesystem::path> && requires(Value& value, typename Value::value_type item) {
-  value.push_back(std::move(item));
-  value.size();
- };
+inline constexpr bool kRepeatableValue = !std::is_same_v<Value, std::string> && !std::is_same_v<Value, std::filesystem::path> && requires(Value& value, typename Value::value_type item) {
+ value.push_back(std::move(item));
+ value.size();
+};
 template <class Value>
 using sequence_value_t = typename Value::value_type;
 template <class Value>
@@ -213,8 +205,7 @@ void append_scalar(std::vector<std::string>& arguments, const Value& value) {
  }
 }
 template <class Request, auto Access>
-[[nodiscard]] std::expected<void, ParseError> assign_accessed(Request& request, const std::string_view text, const bool negated,
-                                                              const FieldConstraint constraint) {
+[[nodiscard]] std::expected<void, ParseError> assign_accessed(Request& request, const std::string_view text, const bool negated, const FieldConstraint constraint) {
  using Value = accessor_value_t<Request, Access>;
  if constexpr (std::is_same_v<Value, bool>) {
   if (text.empty()) {
@@ -238,13 +229,9 @@ template <class Request, auto Access>
   if (auto valid = validate_scalar(*parsed, constraint, text); !valid) return std::unexpected(std::move(valid.error()));
   auto& destination = access<Request, Access>(request);
   if constexpr (kRepeatableValue<Value>) {
-   if (constraint.maximum_items != 0U && destination.size() >= constraint.maximum_items) {
-    return std::unexpected(ParseError{ParseErrorCode::InvalidValue, text, "too many option values"});
-   }
+   if (constraint.maximum_items != 0U && destination.size() >= constraint.maximum_items) { return std::unexpected(ParseError{ParseErrorCode::InvalidValue, text, "too many option values"}); }
    if constexpr (kInplaceVector<Value>) {
-    if (destination.size() == InplaceVectorCapacity<Value>::value) {
-     return std::unexpected(ParseError{ParseErrorCode::InvalidValue, text, "option capacity exceeded"});
-    }
+    if (destination.size() == InplaceVectorCapacity<Value>::value) { return std::unexpected(ParseError{ParseErrorCode::InvalidValue, text, "option capacity exceeded"}); }
    }
    destination.push_back(std::move(*parsed));
   } else {
@@ -254,8 +241,7 @@ template <class Request, auto Access>
  }
 }
 template <class Request, auto Access>
-void emit_accessed(std::vector<std::string>& arguments, const Request& request, const std::string_view name, const std::string_view negated_name,
-                   const OptionKind kind, const bool include_empty) {
+void emit_accessed(std::vector<std::string>& arguments, const Request& request, const std::string_view name, const std::string_view negated_name, const OptionKind kind, const bool include_empty) {
  using Value = accessor_value_t<const Request, Access>;
  const Value& value = access<const Request, Access>(request);
  if constexpr (std::is_same_v<Value, bool>) {
@@ -293,10 +279,8 @@ void emit_accessed(std::vector<std::string>& arguments, const Request& request, 
 }
 namespace detail {
 template <class Request, auto Access, bool (*EmissionEnabled)(const Request&) noexcept = nullptr>
-[[nodiscard]] consteval OptionDescriptor<Request> option_from_reflected_policy(const std::string_view name, const std::string_view help,
-                                                                               const std::string_view group, const std::string_view alias,
-                                                                               const std::string_view negated_name, const bool required,
-                                                                               const std::string_view environment, const FieldConstraint constraint) {
+[[nodiscard]] consteval OptionDescriptor<Request> option_from_reflected_policy(const std::string_view name, const std::string_view help, const std::string_view group, const std::string_view alias,
+ const std::string_view negated_name, const bool required, const std::string_view environment, const FieldConstraint constraint) {
  using Value = accessor_value_t<Request, Access>;
  using Scalar = descriptor_scalar_t<Value>;
  using AccessType = std::remove_cvref_t<decltype(Access)>;
@@ -348,13 +332,10 @@ template <class Request, auto Access, bool (*EmissionEnabled)(const Request&) no
 // assignment and emission, while terminal identity and policy remain derived
 // from the canonical reflected member.
 template <class Request, auto CanonicalAccess, auto Assign, auto Emit, bool (*EmissionEnabled)(const Request&) noexcept = nullptr>
-[[nodiscard]] consteval OptionDescriptor<Request> custom_option(const std::string_view name, const std::string_view help, const std::string_view group = {},
-                                                                const std::string_view alias = {}, const std::string_view negated_name = {},
-                                                                const OptionKind kind = OptionKind::Value, const bool repeatable = false,
-                                                                const bool required = false, const std::string_view environment = {}) {
+[[nodiscard]] consteval OptionDescriptor<Request> custom_option(const std::string_view name, const std::string_view help, const std::string_view group = {}, const std::string_view alias = {},
+ const std::string_view negated_name = {}, const OptionKind kind = OptionKind::Value, const bool repeatable = false, const bool required = false, const std::string_view environment = {}) {
  using AccessType = std::remove_cvref_t<decltype(CanonicalAccess)>;
- static_assert(
-  std::is_member_object_pointer_v<AccessType> || requires { AccessType::terminal_member; }, "custom CLI option requires a canonical reflected member path");
+ static_assert(std::is_member_object_pointer_v<AccessType> || requires { AccessType::terminal_member; }, "custom CLI option requires a canonical reflected member path");
  static_assert(std::is_convertible_v<decltype(Assign), decltype(OptionDescriptor<Request>::assign)>);
  static_assert(std::is_convertible_v<decltype(Emit), decltype(OptionDescriptor<Request>::emit)>);
  constexpr auto terminal = [] {
@@ -383,20 +364,16 @@ template <class Request, auto CanonicalAccess, auto Assign, auto Emit, bool (*Em
 }
 // CLEANUP-IGNORE: Ordinary reflected options and custom-syntax options are distinct developer entry points.
 template <class Request, auto Access, bool (*EmissionEnabled)(const Request&) noexcept = nullptr>
-[[nodiscard]] consteval OptionDescriptor<Request> option(const std::string_view name, const std::string_view help, const std::string_view group = {},
-                                                         const std::string_view alias = {}, const std::string_view negated_name = {},
-                                                         const bool required = false, const std::string_view environment = {}) {
- return detail::option_from_reflected_policy<Request, Access, EmissionEnabled>(name, help, group, alias, negated_name, required, environment,
-                                                                               accessor_policy<Access>());
+[[nodiscard]] consteval OptionDescriptor<Request> option(const std::string_view name, const std::string_view help, const std::string_view group = {}, const std::string_view alias = {},
+ const std::string_view negated_name = {}, const bool required = false, const std::string_view environment = {}) {
+ return detail::option_from_reflected_policy<Request, Access, EmissionEnabled>(name, help, group, alias, negated_name, required, environment, accessor_policy<Access>());
 }
 // A negative flag projects the same canonical boolean with reversed CLI polarity.
 template <class Request, auto Access>
 [[nodiscard]] consteval OptionDescriptor<Request> negative_flag(const std::string_view name, const std::string_view help, const std::string_view group = {}) {
  static_assert(std::is_same_v<accessor_value_t<Request, Access>, bool>);
  auto descriptor = option<Request, Access>(name, help, group);
- descriptor.assign = +[](Request& request, std::string_view text, bool negated, FieldConstraint constraint) {
-  return assign_accessed<Request, Access>(request, text, !negated, constraint);
- };
+ descriptor.assign = +[](Request& request, std::string_view text, bool negated, FieldConstraint constraint) { return assign_accessed<Request, Access>(request, text, !negated, constraint); };
  descriptor.emit = +[](std::vector<std::string>& arguments, const Request& request, std::string_view spelling, std::string_view, OptionKind, bool) {
   if (!access<const Request, Access>(request)) arguments.emplace_back(spelling);
  };
@@ -408,10 +385,8 @@ template <class Request, auto Access>
 // CLEANUP-IGNORE: Item-policy options deliberately extend the ordinary option entry point with one canonical item
 // member.
 template <class Request, auto Access, auto CanonicalItemMember, bool (*EmissionEnabled)(const Request&) noexcept = nullptr>
-[[nodiscard]] consteval OptionDescriptor<Request> option_with_item_policy(const std::string_view name, const std::string_view help,
-                                                                          const std::string_view group = {}, const std::string_view alias = {},
-                                                                          const std::string_view negated_name = {}, const bool required = false,
-                                                                          const std::string_view environment = {}) {
+[[nodiscard]] consteval OptionDescriptor<Request> option_with_item_policy(const std::string_view name, const std::string_view help, const std::string_view group = {},
+ const std::string_view alias = {}, const std::string_view negated_name = {}, const bool required = false, const std::string_view environment = {}) {
  using Value = accessor_value_t<Request, Access>;
  static_assert(kRepeatableValue<Value>, "item policy requires a repeatable CLI projection");
  using ItemOwner = typename MemberPointerOwner<std::remove_cvref_t<decltype(CanonicalItemMember)>>::type;
@@ -432,8 +407,7 @@ struct ParsedCommand {
  PresenceSet presence;
 };
 template <class Request, std::size_t Count>
-[[nodiscard]] consteval std::size_t unique_descriptor_index(const std::array<OptionDescriptor<Request>, Count>& descriptors,
-                                                            const ReflectedMemberIdentity identity) {
+[[nodiscard]] consteval std::size_t unique_descriptor_index(const std::array<OptionDescriptor<Request>, Count>& descriptors, const ReflectedMemberIdentity identity) {
  std::size_t result = Count;
  for (std::size_t index = 0U; index < Count; ++index) {
   if (descriptors[index].terminal_member != identity) continue;
@@ -444,20 +418,15 @@ template <class Request, std::size_t Count>
  return result;
 }
 template <class Request>
-[[nodiscard]] std::expected<ParsedCommand<Request>, ParseError> parse(const std::span<const std::string_view> arguments,
-                                                                      const std::span<const OptionDescriptor<Request>> descriptors) {
- if (descriptors.size() > kMaximumCommandOptions) {
-  return std::unexpected(ParseError{ParseErrorCode::InvalidValue, {}, "command descriptor capacity exceeded"});
- }
+[[nodiscard]] std::expected<ParsedCommand<Request>, ParseError> parse(const std::span<const std::string_view> arguments, const std::span<const OptionDescriptor<Request>> descriptors) {
+ if (descriptors.size() > kMaximumCommandOptions) { return std::unexpected(ParseError{ParseErrorCode::InvalidValue, {}, "command descriptor capacity exceeded"}); }
  ParsedCommand<Request> result{};
  PresenceSet environment_presence;
  for (std::size_t descriptor_index = 0U; descriptor_index < descriptors.size(); ++descriptor_index) {
   const auto& descriptor = descriptors[descriptor_index];
   if (descriptor.environment.empty()) continue;
   if (const char* value = std::getenv(descriptor.environment.data()); value != nullptr && value[0] != '\0') {
-   if (auto assigned = descriptor.assign(result.request, value, false, descriptor.constraint); !assigned) {
-    return std::unexpected(std::move(assigned.error()));
-   }
+   if (auto assigned = descriptor.assign(result.request, value, false, descriptor.constraint); !assigned) { return std::unexpected(std::move(assigned.error())); }
    environment_presence.set(descriptor_index);
   }
  }
@@ -507,9 +476,7 @@ template <class Request>
    }
   }
   if (descriptor == nullptr) { return std::unexpected(ParseError{ParseErrorCode::UnknownOption, spelling, "unknown option"}); }
-  if (result.presence.test(descriptor_index) && !descriptor->repeatable) {
-   return std::unexpected(ParseError{ParseErrorCode::DuplicateOption, spelling, "duplicate option"});
-  }
+  if (result.presence.test(descriptor_index) && !descriptor->repeatable) { return std::unexpected(ParseError{ParseErrorCode::DuplicateOption, spelling, "duplicate option"}); }
   std::string_view value = descriptor->kind == OptionKind::Positional ? token : inline_value;
   if (descriptor->kind == OptionKind::Flag) {
    if (has_inline_value) {
@@ -517,9 +484,7 @@ template <class Request>
     if (!parsed) return std::unexpected(std::move(parsed.error()));
    }
   } else if (descriptor->kind != OptionKind::Positional && !has_inline_value) {
-   if (++index == arguments.size() || arguments[index] == "--") {
-    return std::unexpected(ParseError{ParseErrorCode::MissingValue, spelling, "missing option value"});
-   }
+   if (++index == arguments.size() || arguments[index] == "--") { return std::unexpected(ParseError{ParseErrorCode::MissingValue, spelling, "missing option value"}); }
    value = arguments[index];
   }
   if (auto assigned = descriptor->assign(result.request, value, negated, descriptor->constraint); !assigned) {
@@ -536,8 +501,7 @@ template <class Request>
  return result;
 }
 template <class Request>
-void emit(std::vector<std::string>& arguments, const Request& request, const std::span<const OptionDescriptor<Request>> descriptors,
-          const bool include_empty = false) {
+void emit(std::vector<std::string>& arguments, const Request& request, const std::span<const OptionDescriptor<Request>> descriptors, const bool include_empty = false) {
  bool positional_separator_emitted = false;
  for (const auto& descriptor : descriptors) {
   if (descriptor.emit == nullptr || (descriptor.emission_enabled != nullptr && !descriptor.emission_enabled(request))) { continue; }
@@ -549,8 +513,7 @@ void emit(std::vector<std::string>& arguments, const Request& request, const std
  }
 }
 template <class Request, std::size_t Count>
-void emit(std::vector<std::string>& arguments, const Request& request, const std::array<OptionDescriptor<Request>, Count>& descriptors,
-          const bool include_empty = false) {
+void emit(std::vector<std::string>& arguments, const Request& request, const std::array<OptionDescriptor<Request>, Count>& descriptors, const bool include_empty = false) {
  emit(arguments, request, std::span<const OptionDescriptor<Request>>{descriptors}, include_empty);
 }
 template <class Request>
@@ -581,8 +544,7 @@ template <class Request>
  return result;
 }
 template <class Request, std::size_t Count>
-[[nodiscard]] std::string help(const std::string_view usage, const std::string_view description,
-                               const std::array<OptionDescriptor<Request>, Count>& descriptors) {
+[[nodiscard]] std::string help(const std::string_view usage, const std::string_view description, const std::array<OptionDescriptor<Request>, Count>& descriptors) {
  return help<Request>(usage, description, std::span<const OptionDescriptor<Request>>{descriptors});
 }
 struct UnexposedMember {
@@ -599,9 +561,8 @@ namespace detail {
  return policy.has_minimum || policy.has_maximum || policy.finite || policy.maximum_bytes != 0U || policy.maximum_items != 0U;
 }
 template <class Value>
-inline constexpr bool kReflectedCliAggregate =
- std::is_class_v<Value> && std::is_aggregate_v<Value> && !std::is_same_v<Value, std::string> && !std::is_same_v<Value, std::filesystem::path> &&
- !kOpaqueRelationStorage<Value> && !requires { typename Value::value_type; };
+inline constexpr bool kReflectedCliAggregate = std::is_class_v<Value> && std::is_aggregate_v<Value> && !std::is_same_v<Value, std::string> && !std::is_same_v<Value, std::filesystem::path> &&
+                                               !kOpaqueRelationStorage<Value> && !requires { typename Value::value_type; };
 template <class Root, class Current, auto... Prefix, class Visitor>
 consteval void visit_cli_policy_members(Visitor& visitor) {
  visit_materialized_bases<Current>([&]<class Base>() { visit_cli_policy_members<Root, Base, Prefix...>(visitor); });
@@ -623,23 +584,20 @@ consteval void audit_descriptors(const std::array<OptionDescriptor<Request>, Cou
   if (descriptors[left].name.empty() || descriptors[left].assign == nullptr || descriptors[left].emit == nullptr) { throw "invalid command descriptor"; }
   if (!descriptors[left].terminal_member.valid()) { throw "command descriptor has no reflected terminal identity"; }
   if ((!descriptors[left].alias.empty() && descriptors[left].alias == descriptors[left].name) ||
-      (!descriptors[left].negated_name.empty() &&
-       (descriptors[left].negated_name == descriptors[left].name || descriptors[left].negated_name == descriptors[left].alias))) {
+      (!descriptors[left].negated_name.empty() && (descriptors[left].negated_name == descriptors[left].name || descriptors[left].negated_name == descriptors[left].alias))) {
    throw "duplicate spelling within command descriptor";
   }
   if (descriptors[left].kind == OptionKind::Positional && !descriptors[left].alias.empty()) { throw "positional descriptor cannot have an alias"; }
-  if (descriptors[left].constraint.has_minimum && descriptors[left].constraint.has_maximum &&
-      descriptors[left].constraint.minimum > descriptors[left].constraint.maximum) {
+  if (descriptors[left].constraint.has_minimum && descriptors[left].constraint.has_maximum && descriptors[left].constraint.minimum > descriptors[left].constraint.maximum) {
    throw "invalid command field policy";
   }
   for (std::size_t right = left + 1U; right < Count; ++right) {
    if (descriptors[left].terminal_member == descriptors[right].terminal_member) { throw "multiple CLI descriptors own the same reflected member path"; }
    const auto collides = [](const std::string_view first, const std::string_view second) { return !first.empty() && first == second; };
-   if (collides(descriptors[left].name, descriptors[right].name) || collides(descriptors[left].name, descriptors[right].alias) ||
-       collides(descriptors[left].name, descriptors[right].negated_name) || collides(descriptors[left].alias, descriptors[right].name) ||
-       collides(descriptors[left].alias, descriptors[right].alias) || collides(descriptors[left].alias, descriptors[right].negated_name) ||
-       collides(descriptors[left].negated_name, descriptors[right].name) || collides(descriptors[left].negated_name, descriptors[right].alias) ||
-       collides(descriptors[left].negated_name, descriptors[right].negated_name)) {
+   if (collides(descriptors[left].name, descriptors[right].name) || collides(descriptors[left].name, descriptors[right].alias) || collides(descriptors[left].name, descriptors[right].negated_name) ||
+       collides(descriptors[left].alias, descriptors[right].name) || collides(descriptors[left].alias, descriptors[right].alias) ||
+       collides(descriptors[left].alias, descriptors[right].negated_name) || collides(descriptors[left].negated_name, descriptors[right].name) ||
+       collides(descriptors[left].negated_name, descriptors[right].alias) || collides(descriptors[left].negated_name, descriptors[right].negated_name)) {
     throw "duplicate command spelling";
    }
   }

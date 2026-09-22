@@ -35,9 +35,7 @@ std::shared_ptr<const T> as(std::shared_ptr<arrow::Array> array, arrow::Type::ty
 void present(const arrow::Array& array, std::int64_t row, std::string_view name) {
  if (row < 0 || row >= array.length() || array.IsNull(row)) malformed(name);
 }
-std::shared_ptr<const arrow::StructArray> structure(std::shared_ptr<arrow::Array> array, std::string_view name) {
- return as<arrow::StructArray>(std::move(array), arrow::Type::STRUCT, name);
-}
+std::shared_ptr<const arrow::StructArray> structure(std::shared_ptr<arrow::Array> array, std::string_view name) { return as<arrow::StructArray>(std::move(array), arrow::Type::STRUCT, name); }
 std::uint64_t integer(const arrow::StructArray& parent, std::string_view name, std::int64_t row) {
  const auto array = as<arrow::Int64Array>(parent.GetFieldByName(std::string(name)), arrow::Type::INT64, name);
  present(*array, row, name);
@@ -86,8 +84,8 @@ void validate_schema(const arrow::Schema& schema) {
  const auto area = segment->GetFieldByName("area");
  if (!area || (area->type()->id() != arrow::Type::INT64 && area->type()->id() != arrow::Type::DOUBLE)) malformed("area");
 }
-void read_batch(const arrow::RecordBatch& batch, const CoconutImportLimits& limits, mmltk::common::concurrency::CancellationObservation cancellation,
-                const CoconutRecordConsumer& consumer, std::uint64_t& row_ordinal, std::uint64_t& segment_ordinal) {
+void read_batch(const arrow::RecordBatch& batch, const CoconutImportLimits& limits, mmltk::common::concurrency::CancellationObservation cancellation, const CoconutRecordConsumer& consumer,
+ std::uint64_t& row_ordinal, std::uint64_t& segment_ordinal) {
  check(batch.ValidateFull());  // Includes nested offsets and value-buffer bounds.
  const auto masks = structure(batch.GetColumnByName("mask"), "mask");
  const auto annotations = structure(batch.GetColumnByName("segments_info"), "segments_info");
@@ -108,22 +106,19 @@ void read_batch(const arrow::RecordBatch& batch, const CoconutImportLimits& limi
   present(*lists, row, "segments list");
   const auto png = bytes->GetView(row);
   const auto begin = lists->value_offset(row), length = lists->value_length(row);
-  if (png.empty() || png.size() > limits.max_png_bytes || length < 0 || static_cast<std::uint64_t>(length) > limits.max_segments)
-   malformed("record exceeds PNG/segment admission");
+  if (png.empty() || png.size() > limits.max_png_bytes || length < 0 || static_cast<std::uint64_t>(length) > limits.max_segments) malformed("record exceeds PNG/segment admission");
   record.image_id = integer(*images, "id", row);
   if (integer(*annotations, "image_id", row) != record.image_id) malformed("image_id join");
   record.file_name = text(*images, "file_name", row);
   const auto annotation_file = text(*annotations, "file_name", row);
-  if (std::filesystem::path(record.file_name).stem() != std::filesystem::path(annotation_file).stem() ||
-      std::filesystem::path(annotation_file).extension() != ".png")
+  if (std::filesystem::path(record.file_name).stem() != std::filesystem::path(annotation_file).stem() || std::filesystem::path(annotation_file).extension() != ".png")
    malformed("mask/image filename join");
   // These pinned fields are schema facts, not physical subset authority.
   (void)text(*images, "coco_url", row);
   (void)text(*images, "date_captured", row);
   (void)integer(*images, "license", row);
   const auto width = integer(*images, "width", row), height = integer(*images, "height", row);
-  if (width == 0 || height == 0 || width > limits.max_dimension || height > limits.max_dimension || width > limits.max_pixels / height ||
-      width * height > UINT32_MAX)
+  if (width == 0 || height == 0 || width > limits.max_dimension || height > limits.max_dimension || width > limits.max_pixels / height || width * height > UINT32_MAX)
    malformed("dimensions exceed admission");
   record.width = static_cast<std::uint32_t>(width);
   record.height = static_cast<std::uint32_t>(height);
@@ -143,8 +138,8 @@ void read_batch(const arrow::RecordBatch& batch, const CoconutImportLimits& limi
    segment.crowd = boolean(*segments, "iscrowd", index, true);
    segment.ignore = boolean(*segments, "ignore", index, true);
    if (!areas->IsNull(index)) {
-    segment.area = areas->type_id() == arrow::Type::DOUBLE ? static_cast<const arrow::DoubleArray&>(*areas).Value(index)
-                                                           : static_cast<double>(static_cast<const arrow::Int64Array&>(*areas).Value(index));
+    segment.area =
+     areas->type_id() == arrow::Type::DOUBLE ? static_cast<const arrow::DoubleArray&>(*areas).Value(index) : static_cast<double>(static_cast<const arrow::Int64Array&>(*areas).Value(index));
     if (!std::isfinite(*segment.area) || *segment.area < 0) malformed("area");
    }
    record.segments.push_back(segment);
@@ -157,8 +152,8 @@ void read_batch(const arrow::RecordBatch& batch, const CoconutImportLimits& limi
  }
 }
 }  // namespace
-void read_coconut_parquet(std::span<const std::filesystem::path> shards, const CoconutImportLimits& limits,
-                          mmltk::common::concurrency::CancellationObservation cancellation, const CoconutRecordConsumer& consumer) {
+void read_coconut_parquet(
+ std::span<const std::filesystem::path> shards, const CoconutImportLimits& limits, mmltk::common::concurrency::CancellationObservation cancellation, const CoconutRecordConsumer& consumer) {
  std::uint64_t row_ordinal = 0, segment_ordinal = 0;
  for (const auto& path : shards) {
   throw_if_benchmark_cancelled(cancellation);

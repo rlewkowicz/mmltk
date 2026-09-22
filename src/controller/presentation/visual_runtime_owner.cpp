@@ -150,8 +150,7 @@ bool VisualRuntimeOwner::SubmitLatest(Work work) {
  worker_.Wake();
  return true;
 }
-void VisualRuntimeOwner::RegisterContinuation(Work work, DispatchObservation dispatched, const bool wake_on_output_available,
-                                              const ContinuationCancellation cancellation) {
+void VisualRuntimeOwner::RegisterContinuation(Work work, DispatchObservation dispatched, const bool wake_on_output_available, const ContinuationCancellation cancellation) {
  if (!work) throw std::invalid_argument("visual continuation work is empty");
  std::scoped_lock lock(mutex_);
  if (continuation_ || stopping_ || terminal_barrier_active_ || runtime_retirement_blocked_ || (wake_on_output_available && runtime_))
@@ -182,8 +181,7 @@ void VisualRuntimeOwner::SetOutputRetry(const bool armed) noexcept {
  output_wake_->retry_armed = armed && (continuation_state_.load(std::memory_order_acquire) & kContinuationEnabled) != 0U;
  if (!output_wake_->retry_armed) continuation_state_.fetch_and(static_cast<std::uint8_t>(~kOutputRetryPending), std::memory_order_acq_rel);
 }
-VisualRuntimeOwner::Runtime::OutputCandidate VisualRuntimeOwner::TryAcquireOutput(Runtime& runtime, Runtime::CompletedOutput& baseline,
-                                                                                  mmltk::frameworks::gpu::ImagePlanePreservation preservation) {
+VisualRuntimeOwner::Runtime::OutputCandidate VisualRuntimeOwner::TryAcquireOutput(Runtime& runtime, Runtime::CompletedOutput& baseline, mmltk::frameworks::gpu::ImagePlanePreservation preservation) {
  // Arm before observing the pool: a receiver may release the last occupied
  // allocation between the failed reservation and returning to the worker.
  SetOutputRetry(true);
@@ -307,17 +305,16 @@ mmltk::frameworks::gpu::ImageWorkspaceObservation VisualRuntimeOwner::ObserveWor
  return runtime_->ObserveWorkspace();
 }
 namespace {
-void diagnose_workspace_service(const VisualWorkspaceRequest& request, std::string_view reason,
-                                const mmltk::frameworks::gpu::ImageWorkspaceObservation& observed = {},
-                                const mmltk::frameworks::gpu::ImageWorkspaceObservation& candidate = {}) noexcept {
+void diagnose_workspace_service(const VisualWorkspaceRequest& request, std::string_view reason, const mmltk::frameworks::gpu::ImageWorkspaceObservation& observed = {},
+ const mmltk::frameworks::gpu::ImageWorkspaceObservation& candidate = {}) noexcept {
  const auto destination = request.destination.lock();
  if (!request.diagnostics || !destination) return;
  request.diagnostics->sink.Emit([&] {
   VisualDiagnosticFact fact{.system = contracts::DiagnosticOwner::Presentation,
-                            .operation = VisualDiagnosticOperation::PresentationWorkspaceService,
-                            .device = destination->layout().device,
-                            .context = request.diagnostics->context,
-                            .failure_detail = reason};
+   .operation = VisualDiagnosticOperation::PresentationWorkspaceService,
+   .device = destination->layout().device,
+   .context = request.diagnostics->context,
+   .failure_detail = reason};
   auto& progress = fact.context.workspace_progress;
   progress.requested_product_owner = request.product_owner;
   progress.requested_product_revision = request.product_revision;
@@ -344,8 +341,7 @@ void diagnose_workspace_service(const VisualWorkspaceRequest& request, std::stri
 }  // namespace
 void VisualRuntimeOwner::RequestWorkspace(VisualWorkspaceRequest request) {
  const auto destination = request.destination.lock();
- if (!request.ready || (!request.detach_only && (request.product_owner == 0U || request.product_revision == 0U)))
-  throw std::invalid_argument("visual workspace request is incomplete");
+ if (!request.ready || (!request.detach_only && (request.product_owner == 0U || request.product_revision == 0U))) throw std::invalid_argument("visual workspace request is incomplete");
  if (!destination) {
   request.ready();
   return;
@@ -360,8 +356,7 @@ void VisualRuntimeOwner::RequestWorkspace(VisualWorkspaceRequest request) {
    request.ready();
    return;
   }
-  if (workspace_request_ && workspace_request_->diagnostics && workspace_request_->diagnostics->sink.valid() &&
-      workspace_pending_.load(std::memory_order_acquire))
+  if (workspace_request_ && workspace_request_->diagnostics && workspace_request_->diagnostics->sink.valid() && workspace_pending_.load(std::memory_order_acquire))
    diagnose_workspace_service(*workspace_request_, "pending_request_replaced");
   diagnose_workspace_service(request, "request_enqueued");
   displaced = std::exchange(workspace_request_, std::move(request));
@@ -396,8 +391,7 @@ void VisualRuntimeOwner::ServiceWorkspace() {
    workspace_retry_.store(true, std::memory_order_release);
    const auto observed = runtime_->ObserveWorkspace();
    const bool expected_product = observed.product_owner == request->product_owner && observed.product_revision == request->product_revision;
-   const bool prepared =
-    request->detach_only ? runtime_->DetachDisplay(destination) : expected_product && runtime_->PrepareDisplay(request->product_revision, destination);
+   const bool prepared = request->detach_only ? runtime_->DetachDisplay(destination) : expected_product && runtime_->PrepareDisplay(request->product_revision, destination);
    if (!prepared) {
     const bool retry = request->detach_only || expected_product;
     if (retry) {
@@ -507,14 +501,12 @@ void VisualRuntimeOwner::Run(const std::stop_token worker_stop) {
   } else if (latest_) {
    latest_work = std::move(latest_);
    latest_.reset();
-  } else if (continuation_cancellation_ == ContinuationCancellation::YieldToWorkspace &&
-             (workspace_pending_.load(std::memory_order_acquire) || workspace_retry_.load(std::memory_order_acquire))) {
+  } else if (continuation_cancellation_ == ContinuationCancellation::YieldToWorkspace && (workspace_pending_.load(std::memory_order_acquire) || workspace_retry_.load(std::memory_order_acquire))) {
    // A physical completion or new request wakes us. Keep background
    // work queued without delaying that completion or polling for it.
    return;
-  } else if (const auto pending =
-              continuation_state_.fetch_and(static_cast<std::uint8_t>(~(kContinuationPending | kOutputRetryPending)), std::memory_order_acq_rel);
-             (pending & kContinuationEnabled) != 0U && (pending & (kContinuationPending | kOutputRetryPending)) != 0U) {
+  } else if (const auto pending = continuation_state_.fetch_and(static_cast<std::uint8_t>(~(kContinuationPending | kOutputRetryPending)), std::memory_order_acq_rel);
+   (pending & kContinuationEnabled) != 0U && (pending & (kContinuationPending | kOutputRetryPending)) != 0U) {
    continuation_work = true;
   } else {
    return;
@@ -522,8 +514,8 @@ void VisualRuntimeOwner::Run(const std::stop_token worker_stop) {
   active_stop_ = ordered_work ? ordered_work->stop : std::stop_source{};
   active_outcome_ = ActiveOutcome::Running;
   active_discrete_ = discrete;
-  active_preserves_input_ = (ordered_work && (ordered_work->ordered_drain || ordered_work->terminal_barrier)) ||
-                            (continuation_work && continuation_cancellation_ == ContinuationCancellation::PreserveOrderedInput);
+  active_preserves_input_ =
+   (ordered_work && (ordered_work->ordered_drain || ordered_work->terminal_barrier)) || (continuation_work && continuation_cancellation_ == ContinuationCancellation::PreserveOrderedInput);
   active_yields_to_workspace_ = continuation_work && continuation_cancellation_ == ContinuationCancellation::YieldToWorkspace;
   operation_stop = active_stop_.get_token();
  }
@@ -585,8 +577,7 @@ void VisualRuntimeOwner::Run(const std::stop_token worker_stop) {
   active_discrete_ = false;
   active_preserves_input_ = false;
   active_yields_to_workspace_ = false;
-  wake_again =
-   !ordered_.empty() || latest_.has_value() || (continuation_state_.load(std::memory_order_acquire) & (kContinuationPending | kOutputRetryPending)) != 0U;
+  wake_again = !ordered_.empty() || latest_.has_value() || (continuation_state_.load(std::memory_order_acquire) & (kContinuationPending | kOutputRetryPending)) != 0U;
  }
  NotifyReaders();
  Observe(ActivityStage::CycleFinalized, wake_again ? 1U : 0U);

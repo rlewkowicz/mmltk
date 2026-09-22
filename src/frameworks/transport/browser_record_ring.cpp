@@ -10,8 +10,7 @@ BrowserRecordPush BrowserRecordRing::push(BrowserOutputRecord record) {
    if (prior->state_revision >= record.state_revision) return BrowserRecordPush::Enqueued;
    // Append the replacement after every intervening discrete event.
    // The fixed 64-slot move is bounded and retains FIFO edge ordering.
-   for (std::size_t next = offset + 1U; next != size_; ++next)
-    records_[(read_ + next - 1U) % records_.size()] = std::move(records_[(read_ + next) % records_.size()]);
+   for (std::size_t next = offset + 1U; next != size_; ++next) records_[(read_ + next - 1U) % records_.size()] = std::move(records_[(read_ + next) % records_.size()]);
    write_ = (write_ + records_.size() - 1U) % records_.size();
    records_[write_].reset();
    --size_;

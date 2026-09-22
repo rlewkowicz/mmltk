@@ -49,8 +49,7 @@ struct ExploreViewport final {
  std::uint32_t row_count = 1U;
  std::uint32_t columns = 1U;
  [[nodiscard]] bool square_geometry() const noexcept {
-  return extent.valid() && row_count != 0U && columns != 0U && extent.width % columns == 0U && extent.height % row_count == 0U &&
-         extent.width / columns == extent.height / row_count;
+  return extent.valid() && row_count != 0U && columns != 0U && extent.width % columns == 0U && extent.height % row_count == 0U && extent.width / columns == extent.height / row_count;
  }
  [[nodiscard]] bool valid() const noexcept { return square_geometry() && static_cast<std::uint64_t>(row_count) * columns <= kExploreVisibleItemCapacity; }
 };
@@ -293,16 +292,14 @@ public:
  virtual void CommitOutputPublication() noexcept = 0;
  [[nodiscard]] virtual mmltk::frameworks::gpu::ImageWorkspaceCoverage WorkspaceCoverage(const mmltk::frameworks::gpu::ImageWorkspaceObservation&) { return {}; }
  [[nodiscard]] virtual bool RollbackOutputPublication() noexcept = 0;
- [[nodiscard]] virtual ExploreGalleryPublication BeginGallery(const ExploreRenderPlan&, const ExploreOrderCandidate*, std::size_t,
-                                                              mmltk::frameworks::gpu::ImagePlaneView, mmltk::frameworks::gpu::ImagePlaneView,
-                                                              std::uintptr_t) = 0;
+ [[nodiscard]] virtual ExploreGalleryPublication BeginGallery(
+  const ExploreRenderPlan&, const ExploreOrderCandidate*, std::size_t, mmltk::frameworks::gpu::ImagePlaneView, mmltk::frameworks::gpu::ImagePlaneView, std::uintptr_t) = 0;
  [[nodiscard]] virtual ExploreGalleryPublication AdvanceGallery() = 0;
  [[nodiscard]] virtual bool HasGalleryTiles() const = 0;
- [[nodiscard]] virtual ExploreGalleryPublication PublishGalleryTiles(mmltk::frameworks::gpu::ImagePlaneView, mmltk::frameworks::gpu::ImagePlaneView,
-                                                                     std::uintptr_t) = 0;
+ [[nodiscard]] virtual ExploreGalleryPublication PublishGalleryTiles(mmltk::frameworks::gpu::ImagePlaneView, mmltk::frameworks::gpu::ImagePlaneView, std::uintptr_t) = 0;
  virtual void RenderDetail(const ExploreRenderPlan&, std::size_t, mmltk::frameworks::gpu::ImagePlaneView,
-                           // CLEANUP-IGNORE: Explore rendering and its typed events are distinct from Upscale's snapshot and events.
-                           mmltk::frameworks::gpu::ImagePlaneView, std::uintptr_t) = 0;
+  // CLEANUP-IGNORE: Explore rendering and its typed events are distinct from Upscale's snapshot and events.
+  mmltk::frameworks::gpu::ImagePlaneView, std::uintptr_t) = 0;
  // CLEANUP-IGNORE: ExploreAlgorithm is a sealed domain interface despite matching another class terminator.
 };
 struct[[= contracts::reflection::Event{contracts::reflection::EventDelivery::LatestState}]] ExploreChanged final {
@@ -318,9 +315,8 @@ class ExploreSystem final {
 public:
  [[= contracts::reflection::direct::InteractionEndpoint{}]] void Input(WorkspaceMouse);
  void SetInputPeer(std::uint64_t);
- using visual_source =
-  VisualSourceProjection<ExploreSnapshot, PresentationSourceKind::Explore, mmltk::frameworks::reflection::member_path<&ExploreSnapshot::frame>,
-                         mmltk::frameworks::reflection::member_path<&ExploreSnapshot::revision>, ExploreImageMetadata>;
+ using visual_source = VisualSourceProjection<ExploreSnapshot, PresentationSourceKind::Explore, mmltk::frameworks::reflection::member_path<&ExploreSnapshot::frame>,
+  mmltk::frameworks::reflection::member_path<&ExploreSnapshot::revision>, ExploreImageMetadata>;
  using event_type = std::variant<ExploreChanged, ExploreFailed>;
  // CLEANUP-IGNORE: Explore construction retains its own generated system identity and runtime dependencies.
  ExploreSystem(SettingsSystem&, VisualDeviceSettings, std::size_t nproc, VisualRuntimeFactory, SystemEventSink<event_type> = {}, VisualDiagnosticSink = {});
@@ -463,8 +459,7 @@ struct ExploreNativeConfiguration final {
  std::shared_ptr<ExploreAcceptanceGate> acceptance{};
  VisualDiagnosticSink diagnostics{};
 };
-[[nodiscard]] VisualRuntimeFactory make_native_explore_runtime_factory(
- VisualDeviceSettings, std::size_t,
+[[nodiscard]] VisualRuntimeFactory make_native_explore_runtime_factory(VisualDeviceSettings, std::size_t,
  // CLEANUP-IGNORE: This native factory and canonical Explore registrations do not duplicate provider schemas.
  ExploreNativeConfiguration, std::optional<mmltk::frameworks::gpu::DeviceExecution> execution = {});
 // CLEANUP-IGNORE: Explore's separately identified canonical types are not Annotation's reflection declarations.

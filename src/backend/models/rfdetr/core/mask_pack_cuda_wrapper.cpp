@@ -10,8 +10,7 @@ void pack_bool_masks_cuda_into(const torch::Tensor& masks, torch::Tensor& packed
  TORCH_CHECK(packed_masks.scalar_type() == torch::kUInt8, "pack_bool_masks_cuda_into expects uint8 packed_masks");
  TORCH_CHECK(masks.dim() == 4, "pack_bool_masks_cuda_into expects masks shaped [B,K,H,W]");
  TORCH_CHECK(packed_masks.dim() == 3, "pack_bool_masks_cuda_into expects packed_masks shaped [B,K,bytes]");
- TORCH_CHECK(masks.size(0) == packed_masks.size(0) && masks.size(1) == packed_masks.size(1),
-             "pack_bool_masks_cuda_into batch and prediction dimensions must match");
+ TORCH_CHECK(masks.size(0) == packed_masks.size(0) && masks.size(1) == packed_masks.size(1), "pack_bool_masks_cuda_into batch and prediction dimensions must match");
  TORCH_CHECK(masks.is_contiguous(), "pack_bool_masks_cuda_into expects contiguous masks");
  TORCH_CHECK(packed_masks.is_contiguous(), "pack_bool_masks_cuda_into expects contiguous packed_masks");
  constexpr std::int64_t kMax = std::numeric_limits<std::int64_t>::max();

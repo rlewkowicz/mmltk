@@ -37,8 +37,7 @@ struct PageTarget final {
  return true;
 }
 [[nodiscard]] bool send_request(const int descriptor, const PageTarget target) noexcept {
- const std::string request =
-  "GET " + std::string{target.path} + " HTTP/1.1\r\nHost: 127.0.0.1:" + std::to_string(target.port) + "\r\nConnection: close\r\n\r\n";
+ const std::string request = "GET " + std::string{target.path} + " HTTP/1.1\r\nHost: 127.0.0.1:" + std::to_string(target.port) + "\r\nConnection: close\r\n\r\n";
  std::size_t written = 0U;
  while (written != request.size()) {
   const ssize_t bytes = ::send(descriptor, request.data() + written, request.size() - written, MSG_NOSIGNAL);
@@ -51,16 +50,14 @@ struct PageTarget final {
  const int descriptor = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
  if (descriptor < 0) return 70;
  const timeval timeout{.tv_sec = 3, .tv_usec = 0};
- if (::setsockopt(descriptor, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) != 0 ||
-     ::setsockopt(descriptor, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout)) != 0) {
+ if (::setsockopt(descriptor, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) != 0 || ::setsockopt(descriptor, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout)) != 0) {
   static_cast<void>(::close(descriptor));
   return 71;
  }
  sockaddr_in address{};
  address.sin_family = AF_INET;
  address.sin_port = htons(target.port);
- if (::inet_pton(AF_INET, "127.0.0.1", &address.sin_addr) != 1 || ::connect(descriptor, reinterpret_cast<const sockaddr*>(&address), sizeof(address)) != 0 ||
-     !send_request(descriptor, target)) {
+ if (::inet_pton(AF_INET, "127.0.0.1", &address.sin_addr) != 1 || ::connect(descriptor, reinterpret_cast<const sockaddr*>(&address), sizeof(address)) != 0 || !send_request(descriptor, target)) {
   static_cast<void>(::close(descriptor));
   return 72;
  }
@@ -97,13 +94,9 @@ int main(const int argc, char* argv[]) {
  }
  const std::string_view page{argv[9]};
  const char* pixel = std::getenv("MMLTK_GUI_PIXEL_TRACE");
- if (std::printf(
-      "mmltk fake Firefox tracing lifecycle=%d pixels=%d environment=%d\n", static_cast<int>(page.find("mmltk_surface_trace=1") != std::string_view::npos),
+ if (std::printf("mmltk fake Firefox tracing lifecycle=%d pixels=%d environment=%d\n", static_cast<int>(page.find("mmltk_surface_trace=1") != std::string_view::npos),
       static_cast<int>(page.find("mmltk_pixel_trace=1") != std::string_view::npos), static_cast<int>(pixel != nullptr && std::string_view{pixel} == "1")) < 0)
   return 75;
- if (std::fputs("mmltk fake Firefox stdout\n", stdout) == EOF || std::fputs("mmltk fake Firefox stderr\n", stderr) == EOF || std::fflush(stdout) != 0 ||
-     std::fflush(stderr) != 0) {
-  return 75;
- }
+ if (std::fputs("mmltk fake Firefox stdout\n", stdout) == EOF || std::fputs("mmltk fake Firefox stderr\n", stderr) == EOF || std::fflush(stdout) != 0 || std::fflush(stderr) != 0) { return 75; }
  return 0;
 }

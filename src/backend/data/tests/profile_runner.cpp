@@ -23,11 +23,11 @@ namespace fs = std::filesystem;
 namespace {
 [[noreturn]] void usage_error(const char* program) {
  std::fprintf(stderr,
-              "Usage: %s [--keep-artifacts] [--test-dir PATH] [--width N] "
-              "[--height N] [--num-images N] [--batch-size N] "
-              "[--num-epochs N] [--compile-workers N] "
-              "[--shuffle-prefetch N] [--repetitions N] [--warmup-runs N]\n",
-              program);
+  "Usage: %s [--keep-artifacts] [--test-dir PATH] [--width N] "
+  "[--height N] [--num-images N] [--batch-size N] "
+  "[--num-epochs N] [--compile-workers N] "
+  "[--shuffle-prefetch N] [--repetitions N] [--warmup-runs N]\n",
+  program);
  std::exit(1);
 }
 int parse_integer(const char* value, const char* program) {
@@ -37,14 +37,10 @@ int parse_integer(const char* value, const char* program) {
  if (result.ec != std::errc{} || result.ptr != text.data() + text.size()) { usage_error(program); }
  return parsed;
 }
-double seconds_since(const std::chrono::steady_clock::time_point start, const std::chrono::steady_clock::time_point end) {
- return std::chrono::duration<double>(end - start).count();
-}
+double seconds_since(const std::chrono::steady_clock::time_point start, const std::chrono::steady_clock::time_point end) { return std::chrono::duration<double>(end - start).count(); }
 std::string metric_name(const char* label, const char* suffix) { return std::string("benchmark.") + label + "." + suffix; }
-void record_duration_metric(const char* label, const char* suffix, const std::chrono::steady_clock::time_point start,
-                            const std::chrono::steady_clock::time_point end) {
- profile_record_duration_ns(metric_name(label, suffix).c_str(),
-                            static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count()));
+void record_duration_metric(const char* label, const char* suffix, const std::chrono::steady_clock::time_point start, const std::chrono::steady_clock::time_point end) {
+ profile_record_duration_ns(metric_name(label, suffix).c_str(), static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count()));
 }
 void record_value_metric(const char* label, const char* suffix, const std::uint64_t value) { profile_add_value(metric_name(label, suffix).c_str(), value); }
 std::string iteration_label(const int repetition) {
@@ -99,8 +95,7 @@ Options parse_options(int argc, char** argv) {
    usage_error(argv[0]);
   }
  }
- if (opts.width <= 0 || opts.height <= 0 || opts.num_images <= 0 || opts.batch_size <= 0 || opts.num_epochs <= 0 || opts.shuffle_prefetch <= 0 ||
-     opts.repetitions <= 0 || opts.warmup_runs < 0) {
+ if (opts.width <= 0 || opts.height <= 0 || opts.num_images <= 0 || opts.batch_size <= 0 || opts.num_epochs <= 0 || opts.shuffle_prefetch <= 0 || opts.repetitions <= 0 || opts.warmup_runs < 0) {
   std::fprintf(stderr, "numeric options must be positive except warmup-runs, which may be zero\n");
   std::exit(1);
  }
@@ -179,12 +174,16 @@ int main(int argc, char** argv) {
    logger.trace(
     "event=profile.execution_policy executable=mmltk_backend_data_profile_runner online_cpu_count={} "
     "nice_value={} scheduler_policy={} scheduler_priority={} io_class={} io_priority_data={}",
-    execution_snapshot.online_cpu_count, execution_snapshot.nice_value, execution_snapshot.scheduler_policy, execution_snapshot.scheduler_priority,
-    execution_snapshot.io_class, execution_snapshot.io_priority_data);
+    execution_snapshot.online_cpu_count, execution_snapshot.nice_value, execution_snapshot.scheduler_policy, execution_snapshot.scheduler_priority, execution_snapshot.io_class,
+    execution_snapshot.io_priority_data);
   });
   const Options opts = parse_options(argc, argv);
   const FixtureSpec fixture{
-   opts.test_dir, "train", opts.width, opts.height, opts.num_images,
+   opts.test_dir,
+   "train",
+   opts.width,
+   opts.height,
+   opts.num_images,
   };
   create_synthetic_dataset(fixture);
   for (int warmup = 0; warmup < opts.warmup_runs; ++warmup) {

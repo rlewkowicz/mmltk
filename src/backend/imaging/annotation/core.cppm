@@ -60,8 +60,7 @@ AnnotationBox box_from_mask_region(const AnnotationMaskRegion& region);
 const AnnotationMaskShape* annotation_object_mask_shape(const AnnotationObject& object);
 AnnotationMaskShape* annotation_object_mask_shape(AnnotationObject* object);
 bool annotation_object_supports_mask_editing(const AnnotationObject& object);
-bool translate_annotation_object(AnnotationObject* object, int dx, int dy, std::uint32_t capture_width, std::uint32_t capture_height,
-                                 bool clip_to_bounds = false);
+bool translate_annotation_object(AnnotationObject* object, int dx, int dy, std::uint32_t capture_width, std::uint32_t capture_height, bool clip_to_bounds = false);
 bool resize_annotation_object_to_box(AnnotationObject* object, const AnnotationBox& box, std::uint32_t capture_width, std::uint32_t capture_height);
 std::optional<AnnotationPoint> annotation_spline_segment_point(const AnnotationSplineShape& spline, std::size_t segment_index, float t);
 std::vector<AnnotationPoint> sample_annotation_spline_points(const AnnotationSplineShape& spline, int samples_per_segment = 32);
@@ -211,8 +210,7 @@ AnnotationBox normalize_annotation_box(AnnotationBox box, std::uint32_t width, s
 // AnnotationBox stores two corners; converting between the two lives here so each region type does
 // not restate the arithmetic.
 template <typename Coordinate, typename Extent>
-[[nodiscard]] constexpr AnnotationBox annotation_box_from_origin_extent(const Coordinate x, const Coordinate y, const Extent width,
-                                                                        const Extent height) noexcept {
+[[nodiscard]] constexpr AnnotationBox annotation_box_from_origin_extent(const Coordinate x, const Coordinate y, const Extent width, const Extent height) noexcept {
  return AnnotationBox{
   static_cast<int>(x),
   static_cast<int>(y),
@@ -231,8 +229,7 @@ AnnotationBox annotation_box_from_frame(const AnnotationFrame& frame, const Anno
   point.y - static_cast<float>(frame.view_y),
  };
 }
-[[nodiscard]] inline AnnotationPoint annotation_frame_point_to_capture_unclipped(const AnnotationPoint& point, const std::uint32_t view_x,
-                                                                                 const std::uint32_t view_y) noexcept {
+[[nodiscard]] inline AnnotationPoint annotation_frame_point_to_capture_unclipped(const AnnotationPoint& point, const std::uint32_t view_x, const std::uint32_t view_y) noexcept {
  return AnnotationPoint{
   point.x + static_cast<float>(view_x),
   point.y + static_cast<float>(view_y),
@@ -245,17 +242,14 @@ std::vector<std::uint8_t> decode_annotation_prediction_mask(const AnnotationEnco
 std::vector<std::uint8_t> decode_annotation_mask_rle(std::string_view encoded_mask, std::uint32_t width, std::uint32_t height);
 std::string encode_annotation_mask_rle(const std::vector<std::uint8_t>& mask);
 [[nodiscard]] AnnotationProjectedSceneLookup make_annotation_projected_scene_lookup(const AnnotationProjectedScene* projected_scene, std::size_t object_count);
-std::vector<AnnotationResolvedObject> resolve_annotation_objects(const AnnotationFrame& frame, const AnnotationCategories& categories,
-                                                                 const std::vector<AnnotationObject>& objects, bool live_mode,
-                                                                 const AnnotationProjectedScene* projected_scene = nullptr);
+std::vector<AnnotationResolvedObject> resolve_annotation_objects(
+ const AnnotationFrame& frame, const AnnotationCategories& categories, const std::vector<AnnotationObject>& objects, bool live_mode, const AnnotationProjectedScene* projected_scene = nullptr);
 AnnotationCategories load_annotation_categories(const std::filesystem::path& output_root);
 std::size_t ensure_annotation_category(AnnotationCategories& categories, const std::string& class_name);
 void write_annotation_categories(const std::filesystem::path& output_root, const AnnotationCategories& categories);
 std::vector<AnnotationObject> load_annotation_scene_objects(const std::filesystem::path& scene_jsonl_path, AnnotationCategories* categories);
-std::optional<std::vector<AnnotationObject>> load_saved_annotation_scene_for_frame(const std::filesystem::path& output_root, const AnnotationFrame& frame,
-                                                                                   AnnotationCategories* categories);
+std::optional<std::vector<AnnotationObject>> load_saved_annotation_scene_for_frame(const std::filesystem::path& output_root, const AnnotationFrame& frame, AnnotationCategories* categories);
 void write_annotation_png(const std::filesystem::path& path, int width, int height, int channels, const void* pixels, int stride_bytes);
-AnnotationSaveResult save_annotation_scene(const AnnotationSaveConfig& config, const AnnotationFrame& frame, AnnotationCategories& categories,
-                                           const std::vector<AnnotationObject>& objects, bool live_mode,
-                                           const AnnotationProjectedScene* projected_scene = nullptr);
+AnnotationSaveResult save_annotation_scene(const AnnotationSaveConfig& config, const AnnotationFrame& frame, AnnotationCategories& categories, const std::vector<AnnotationObject>& objects,
+ bool live_mode, const AnnotationProjectedScene* projected_scene = nullptr);
 }  // namespace mmltk::backend::imaging::annotation

@@ -17,34 +17,33 @@ void LocalRun::Start(Job job) {
  if (active_) throw contracts::BusyError("operation is already active");
  auto control = std::make_shared<RunControl>();
  const bool configure_policy = job.policy.has_value();
- std::jthread candidate{
-  [this, control, policy = std::move(job.policy), work = std::move(job.work), failure = std::move(job.failure)](const std::stop_token stop) mutable noexcept {
-   std::optional<mmltk::common::system::ScopedExecutionPolicy> placement;
-   if (policy) {
-    try {
-     placement.emplace(*policy);
-    } catch (...) { control->startup_failure = std::current_exception(); }
-    control->initialized.release();
-   }
-   control->ready.acquire();
-   if (!control->launch.load(std::memory_order_acquire)) return;
-   Notification notification;
+ std::jthread candidate{[this, control, policy = std::move(job.policy), work = std::move(job.work), failure = std::move(job.failure)](const std::stop_token stop) mutable noexcept {
+  std::optional<mmltk::common::system::ScopedExecutionPolicy> placement;
+  if (policy) {
    try {
-    notification = work(stop);
-   } catch (...) {
-    if (failure) {
-     try {
-      notification = failure(std::current_exception());
-     } catch (...) {}
-    }
-   }
-   Finish(control);
-   if (notification) {
+    placement.emplace(*policy);
+   } catch (...) { control->startup_failure = std::current_exception(); }
+   control->initialized.release();
+  }
+  control->ready.acquire();
+  if (!control->launch.load(std::memory_order_acquire)) return;
+  Notification notification;
+  try {
+   notification = work(stop);
+  } catch (...) {
+   if (failure) {
     try {
-     notification();
+     notification = failure(std::current_exception());
     } catch (...) {}
    }
-  }};
+  }
+  Finish(control);
+  if (notification) {
+   try {
+    notification();
+   } catch (...) {}
+  }
+ }};
  if (configure_policy) {
   control->initialized.acquire();
   if (control->startup_failure) {

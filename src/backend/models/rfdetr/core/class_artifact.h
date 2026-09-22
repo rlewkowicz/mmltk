@@ -21,8 +21,8 @@ struct ClassArtifactSnapshot final {
 // This is not a source-path lifetime lock. Rebind checks do no hashing or parsing.
 class ClassArtifactAdmission final {
 public:
- explicit ClassArtifactAdmission(const std::filesystem::path& artifact, const std::filesystem::path& descriptor = {},
-                                 std::shared_ptr<const mmltk::common::io::FileDigests> admitted_file = {}, std::stop_token stop = {}, bool include_md5 = false);
+ explicit ClassArtifactAdmission(const std::filesystem::path& artifact, const std::filesystem::path& descriptor = {}, std::shared_ptr<const mmltk::common::io::FileDigests> admitted_file = {},
+  std::stop_token stop = {}, bool include_md5 = false);
  [[nodiscard]] const std::filesystem::path& artifact_path() const noexcept { return snapshot_.artifact_path; }
  [[nodiscard]] const std::filesystem::path& descriptor_path() const noexcept { return snapshot_.descriptor_path; }
  [[nodiscard]] const std::shared_ptr<const mmltk::common::io::FileDigests>& file() const noexcept { return file_; }

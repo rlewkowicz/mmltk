@@ -41,12 +41,8 @@ namespace common_concurrency = mmltk::common::concurrency;
 namespace common_io = mmltk::common::io;
 namespace common_math = mmltk::common::math;
 namespace {
-[[nodiscard]] std::size_t checked_size_add(const std::size_t left, const std::size_t right, const char* context) {
- return common_math::checked_add(left, right, context);
-}
-[[nodiscard]] std::size_t checked_size_multiply(const std::size_t left, const std::size_t right, const char* context) {
- return common_math::checked_multiply(left, right, context);
-}
+[[nodiscard]] std::size_t checked_size_add(const std::size_t left, const std::size_t right, const char* context) { return common_math::checked_add(left, right, context); }
+[[nodiscard]] std::size_t checked_size_multiply(const std::size_t left, const std::size_t right, const char* context) { return common_math::checked_multiply(left, right, context); }
 using detail::WritablePixelRange;
 class ReadOnlyMappedRange {
 public:
@@ -56,8 +52,7 @@ public:
   const std::size_t mapping_offset = offset & ~(PAGE_SIZE - 1U);
   const std::size_t delta = offset - mapping_offset;
   const std::size_t mapping_bytes = checked_size_add(delta, bytes, "benchmark validation mmap size overflow");
-  void* mapping = ::mmap(nullptr, mapping_bytes, PROT_READ, MAP_SHARED, file.get(),
-                         common_math::checked_cast<off_t>(mapping_offset, "benchmark validation mmap offset overflow"));
+  void* mapping = ::mmap(nullptr, mapping_bytes, PROT_READ, MAP_SHARED, file.get(), common_math::checked_cast<off_t>(mapping_offset, "benchmark validation mmap offset overflow"));
   if (mapping == MAP_FAILED) { throw common_io::errno_error("benchmark validation mmap failed"); }
   region_.adopt(mapping, mapping_bytes);
   data_ = static_cast<const std::uint8_t*>(mapping) + delta;
@@ -75,8 +70,7 @@ private:
  std::size_t expected_first_label = 0U;
  for (std::size_t image_index = 0U; image_index < split.images.size(); ++image_index) {
   const EncodedImageRecord& source = split.images[image_index];
-  if (source.first_label != expected_first_label || expected_first_label > split.labels.size() ||
-      static_cast<std::size_t>(source.label_count) > split.labels.size() - expected_first_label) {
+  if (source.first_label != expected_first_label || expected_first_label > split.labels.size() || static_cast<std::size_t>(source.label_count) > split.labels.size() - expected_first_label) {
    throw std::runtime_error("benchmark split label ranges are not contiguous");
   }
   ImageEntry& destination = index[image_index];
@@ -86,8 +80,7 @@ private:
   const std::size_t label_offset = checked_size_multiply(expected_first_label, sizeof(PackedInstance), "benchmark label offset overflow");
   destination.label_offset = common_math::checked_cast<std::uint32_t>(label_offset, "benchmark label offset overflow");
   destination.num_instances = source.label_count;
-  destination.label_bytes =
-   common_math::checked_cast<std::uint32_t>(static_cast<std::size_t>(source.label_count) * sizeof(PackedInstance), "benchmark label size overflow");
+  destination.label_bytes = common_math::checked_cast<std::uint32_t>(static_cast<std::size_t>(source.label_count) * sizeof(PackedInstance), "benchmark label size overflow");
   destination.has_source_image_id = 1U;
   destination.source_image_id = source.source_image_id;
   destination.source = source.annotation_source;
@@ -98,8 +91,7 @@ private:
  if (expected_first_label != split.labels.size()) { throw std::runtime_error("benchmark labels contain unreferenced records"); }
  return index;
 }
-void decode_images(const BenchmarkWriteRequest& request, const common_io::FileHandle& output, const std::size_t pixel_offset, const std::size_t image_stride,
-                   const std::size_t pixel_bytes) {
+void decode_images(const BenchmarkWriteRequest& request, const common_io::FileHandle& output, const std::size_t pixel_offset, const std::size_t image_stride, const std::size_t pixel_bytes) {
  const PreparedBenchmarkSplit& split = request.split;
  WritablePixelRange output_pixels(output.get(), pixel_offset, pixel_bytes);
  const int worker_count = std::max(1, std::min(request.num_workers, common_math::checked_cast<int>(split.images.size(), "worker count overflow")));
@@ -128,9 +120,7 @@ void decode_images(const BenchmarkWriteRequest& request, const common_io::FileHa
     for (std::uint32_t image_index = begin; image_index < end; ++image_index) {
      if (request.cancel_requested.requested()) { throw std::runtime_error("benchmark dataset compilation cancelled"); }
      const EncodedImageRecord& image = split.images[image_index];
-     if (image.source_width == 0U || image.source_height == 0U || image.source_index >= source_directories.size()) {
-      throw std::runtime_error("benchmark image metadata is incomplete");
-     }
+     if (image.source_width == 0U || image.source_height == 0U || image.source_index >= source_directories.size()) { throw std::runtime_error("benchmark image metadata is incomplete"); }
      std::array<char, 24> relative_path{};
      (void)format_cached_image_relative_path(image.source_image_id, relative_path);
      try {
@@ -138,9 +128,7 @@ void decode_images(const BenchmarkWriteRequest& request, const common_io::FileHa
       if (image_descriptor < 0) { throw common_io::errno_error("cannot open cached benchmark image", relative_path.data()); }
       common_io::FileHandle image_file(image_descriptor);
       const std::size_t encoded_size = image_file.size();
-      if (encoded_size == 0U || encoded_size > std::numeric_limits<std::uint32_t>::max()) {
-       throw std::runtime_error("cached benchmark image has an invalid size");
-      }
+      if (encoded_size == 0U || encoded_size > std::numeric_limits<std::uint32_t>::max()) { throw std::runtime_error("cached benchmark image has an invalid size"); }
       encoded.resize(encoded_size);
       image_file.pread_all(encoded.data(), encoded.size(), 0U);
       const BenchmarkImageHeader image_header = decoder.read_header(encoded, image.source_width, image.source_height);
@@ -150,14 +138,12 @@ void decode_images(const BenchmarkWriteRequest& request, const common_io::FileHa
      } catch (const std::bad_alloc&) { throw; } catch (const BenchmarkImageReadError&) {
       throw;
      } catch (const std::exception& error) { throw BenchmarkImageReadError(image.source_index, image.source_image_id, error.what()); }
-     resizer.resize_to_planar({decoded.data(),
-                               {image.source_width, image.source_height, static_cast<std::size_t>(image.source_width) * 3U, 0U, decoded.size(),
-                                mmltk::backend::imaging::resample::RgbPixelFormat::RGB8}},
-                              {output_pixels.image(image_index, image_stride),
-                               {request.resolution, request.resolution, static_cast<std::size_t>(request.resolution) * sizeof(float),
-                                static_cast<std::size_t>(request.resolution) * request.resolution * sizeof(float), image_stride,
-                                mmltk::backend::imaging::resample::RgbPixelFormat::PlanarUnitSrgbF32}},
-                              request.resize_mode);
+     resizer.resize_to_planar(
+      {decoded.data(), {image.source_width, image.source_height, static_cast<std::size_t>(image.source_width) * 3U, 0U, decoded.size(), mmltk::backend::imaging::resample::RgbPixelFormat::RGB8}},
+      {output_pixels.image(image_index, image_stride),
+       {request.resolution, request.resolution, static_cast<std::size_t>(request.resolution) * sizeof(float), static_cast<std::size_t>(request.resolution) * request.resolution * sizeof(float),
+        image_stride, mmltk::backend::imaging::resample::RgbPixelFormat::PlanarUnitSrgbF32}},
+      request.resize_mode);
      if (request.progress) { request.progress(); }
     }
    } catch (...) {
@@ -174,13 +160,11 @@ void decode_images(const BenchmarkWriteRequest& request, const common_io::FileHa
 }
 }  // namespace
 BenchmarkImageReadError::BenchmarkImageReadError(const std::uint16_t source_index, const std::uint64_t source_image_id, std::string detail)
-    : std::runtime_error("benchmark cached image " + std::to_string(source_image_id) + " cannot be read: " + std::move(detail)),
-      source_index_(source_index),
-      source_image_id_(source_image_id) {}
+    : std::runtime_error("benchmark cached image " + std::to_string(source_image_id) + " cannot be read: " + std::move(detail)), source_index_(source_index), source_image_id_(source_image_id) {}
 std::uint16_t BenchmarkImageReadError::source_index() const noexcept { return source_index_; }
 std::uint64_t BenchmarkImageReadError::source_image_id() const noexcept { return source_image_id_; }
-PackedInstance benchmark_canvas_box(const std::uint8_t class_id, const float x1, const float y1, const float x2, const float y2,
-                                    const mmltk::backend::imaging::resample::ImageResizeGeometry& letterbox) {
+PackedInstance benchmark_canvas_box(
+ const std::uint8_t class_id, const float x1, const float y1, const float x2, const float y2, const mmltk::backend::imaging::resample::ImageResizeGeometry& letterbox) {
  if (letterbox.resized_width == 0U || letterbox.resized_height == 0U) { throw std::runtime_error("benchmark box requires a valid letterbox"); }
  PackedInstance result{};
  result.class_id = class_id;
@@ -192,9 +176,7 @@ PackedInstance benchmark_canvas_box(const std::uint8_t class_id, const float x1,
 }
 void write_benchmark_split(const BenchmarkWriteRequest& request) {
  mmltk::common::logging::ScopedProfile profile{"benchmark.writer.total"};
- if (request.resolution == 0U || request.resolution > MAX_IMAGE_EXTENT) {
-  throw std::runtime_error("benchmark resolution exceeds the compiled coordinate format");
- }
+ if (request.resolution == 0U || request.resolution > MAX_IMAGE_EXTENT) { throw std::runtime_error("benchmark resolution exceeds the compiled coordinate format"); }
  if (request.split.images.empty() || request.split.class_names.empty()) { throw std::runtime_error("benchmark split must contain images and classes"); }
  const catalog::ClassCatalog class_catalog(request.split.class_names, COMPILED_CLASS_NAME_CAPACITY);
  if (request.split.class_names.size() > MAX_CLASSES) { throw std::runtime_error("benchmark split exceeds the compiled class limit"); }
@@ -207,16 +189,14 @@ void write_benchmark_split(const BenchmarkWriteRequest& request) {
  std::vector<ImageEntry> index = build_index(request.split, layout.pixel_offset, image_stride);
  std::uint32_t max_instances = 0U;
  for (const auto& image : request.split.images) max_instances = std::max<std::uint32_t>(max_instances, image.label_count);
- const FileHeader header =
-  make_file_header({image_count, request.resolution, request.resolution, 3U, max_instances, image_stride, request.resize_mode}, class_catalog.names(), layout);
+ const FileHeader header = make_file_header({image_count, request.resolution, request.resolution, 3U, max_instances, image_stride, request.resize_mode}, class_catalog.names(), layout);
  validate_compiled_header(header);
  validate_compiled_index_entries(index, header, request.split.labels.size(), request.cancel_requested);
  validate_compiled_original_image_dimensions(index, request.cancel_requested);
  validate_compiled_annotation_provenance(index, request.split.labels, request.cancel_requested);
  const std::size_t used_rle = validate_compiled_label_entries(request.split.labels, header, layout.rle_block_size, request.cancel_requested);
  if (used_rle != layout.rle_block_size) { throw std::runtime_error("benchmark labels do not reference the complete mask block"); }
- validate_compiled_rle_pairs(request.split.labels, request.split.rle_pairs, static_cast<std::size_t>(request.resolution) * request.resolution,
-                             request.cancel_requested);
+ validate_compiled_rle_pairs(request.split.labels, request.split.rle_pairs, static_cast<std::size_t>(request.resolution) * request.resolution, request.cancel_requested);
  (void)mmltk::common::io::ensure_parent_directory(request.output_path);
  std::string staging_path_text = request.output_path.string() + ".tmp.XXXXXX";
  common_io::FileHandle output = common_io::FileHandle::create_unique_output(staging_path_text, layout.total_size);
@@ -241,14 +221,12 @@ void write_benchmark_split(const BenchmarkWriteRequest& request) {
  validate_compiled_original_image_dimensions(persisted_index_span, request.cancel_requested);
  const ReadOnlyMappedRange persisted_labels(staged, sections.label_offset, sections.label_bytes);
  const auto persisted_label_span = std::span(reinterpret_cast<const PackedInstance*>(persisted_labels.data()), sections.label_count);
- const std::size_t persisted_rle_bytes =
-  validate_compiled_label_entries(persisted_label_span, staged_header, sections.rle_region_bytes, request.cancel_requested);
+ const std::size_t persisted_rle_bytes = validate_compiled_label_entries(persisted_label_span, staged_header, sections.rle_region_bytes, request.cancel_requested);
  validate_compiled_annotation_provenance(persisted_index_span, persisted_label_span, request.cancel_requested);
  if (persisted_rle_bytes != layout.rle_block_size) { throw std::runtime_error("persisted benchmark labels do not reference the complete mask block"); }
  const ReadOnlyMappedRange persisted_rle(staged, sections.rle_offset, sections.rle_region_bytes);
  const auto persisted_rle_span = std::span(reinterpret_cast<const RLEPair*>(persisted_rle.data()), request.split.rle_pairs.size());
- validate_compiled_rle_pairs(persisted_label_span, persisted_rle_span, static_cast<std::size_t>(request.resolution) * request.resolution,
-                             request.cancel_requested);
+ validate_compiled_rle_pairs(persisted_label_span, persisted_rle_span, static_cast<std::size_t>(request.resolution) * request.resolution, request.cancel_requested);
  throw_if_benchmark_cancelled(request.cancel_requested);
  common_io::publish_staged_path_atomically(staging_path, request.output_path, request.overwrite);
  cleanup.published();

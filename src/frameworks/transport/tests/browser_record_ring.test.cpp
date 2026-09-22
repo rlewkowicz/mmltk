@@ -5,9 +5,7 @@
 #include <vector>
 namespace mmltk::frameworks::transport {
 namespace {
-[[nodiscard]] BrowserOutputRecord record(const BrowserRecordPriority priority = BrowserRecordPriority::Transient) {
- return {.bytes = {std::byte{0x01}}, .priority = priority};
-}
+[[nodiscard]] BrowserOutputRecord record(const BrowserRecordPriority priority = BrowserRecordPriority::Transient) { return {.bytes = {std::byte{0x01}}, .priority = priority}; }
 TEST_CASE("browser output ring has exactly sixty-four FIFO records", "[frameworks][transport][browser]") {
  BrowserRecordRing ring;
  for (std::size_t index = 0U; index < kBrowserRecordRingCapacity; ++index)
@@ -37,8 +35,7 @@ TEST_CASE("latest complete state replaces pending state after ordered edges", "[
  snapshot.state_system = 7U;
  snapshot.state_event = 11U;
  REQUIRE(ring.push(snapshot) == BrowserRecordPush::Enqueued);
- for (std::size_t index = 1U; index < kBrowserRecordRingCapacity; ++index)
-  REQUIRE(ring.push(record(BrowserRecordPriority::Critical)) == BrowserRecordPush::Enqueued);
+ for (std::size_t index = 1U; index < kBrowserRecordRingCapacity; ++index) REQUIRE(ring.push(record(BrowserRecordPriority::Critical)) == BrowserRecordPush::Enqueued);
  snapshot.bytes[0] = std::byte{0x02};
  snapshot.state_revision = 2U;
  REQUIRE(ring.push(snapshot) == BrowserRecordPush::Enqueued);

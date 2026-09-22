@@ -28,19 +28,15 @@ struct[[= contracts::reflection::Event{contracts::reflection::EventDelivery::Cri
 class DatasetRuntime {
 public:
  virtual ~DatasetRuntime() = default;
- [[nodiscard]] virtual services::ArtifactCompileResult Compile(const services::ArtifactCompileRequest&, std::stop_token,
-                                                               const std::function<void(const contracts::ArtifactProgress&)>&) = 0;
- [[nodiscard]] virtual contracts::ArtifactInspection Inspect(const std::array<std::filesystem::path, contracts::kArtifactSplitCapacity>&, std::string_view,
-                                                             std::uint32_t, std::stop_token) = 0;
+ [[nodiscard]] virtual services::ArtifactCompileResult Compile(const services::ArtifactCompileRequest&, std::stop_token, const std::function<void(const contracts::ArtifactProgress&)>&) = 0;
+ [[nodiscard]] virtual contracts::ArtifactInspection Inspect(const std::array<std::filesystem::path, contracts::kArtifactSplitCapacity>&, std::string_view, std::uint32_t, std::stop_token) = 0;
 };
 class ArtifactDatasetRuntime final : public DatasetRuntime {
 public:
  ArtifactDatasetRuntime();
  explicit ArtifactDatasetRuntime(services::ArtifactStore, services::RuntimeDiagnosticTarget = {});
- [[nodiscard]] services::ArtifactCompileResult Compile(const services::ArtifactCompileRequest&, std::stop_token,
-                                                       const std::function<void(const contracts::ArtifactProgress&)>&) override;
- [[nodiscard]] contracts::ArtifactInspection Inspect(const std::array<std::filesystem::path, contracts::kArtifactSplitCapacity>&, std::string_view,
-                                                     std::uint32_t, std::stop_token) override;
+ [[nodiscard]] services::ArtifactCompileResult Compile(const services::ArtifactCompileRequest&, std::stop_token, const std::function<void(const contracts::ArtifactProgress&)>&) override;
+ [[nodiscard]] contracts::ArtifactInspection Inspect(const std::array<std::filesystem::path, contracts::kArtifactSplitCapacity>&, std::string_view, std::uint32_t, std::stop_token) override;
 
 private:
  services::ArtifactStore store_;
@@ -55,8 +51,7 @@ public:
  [[= contracts::reflection::direct::IntentEndpoint{}]] [[nodiscard]] contracts::ArtifactUiState Compile(contracts::WorkflowIntent<contracts::FeatureId::Train>);
  [[= contracts::reflection::direct::IntentEndpoint{}]] [[nodiscard]] contracts::ArtifactUiState Stop() noexcept;
  void Shutdown() noexcept;
- [[nodiscard]] contracts::ArtifactInspection Inspect(std::array<std::filesystem::path, contracts::kArtifactSplitCapacity>, std::string, std::uint32_t,
-                                                     std::stop_token = {});
+ [[nodiscard]] contracts::ArtifactInspection Inspect(std::array<std::filesystem::path, contracts::kArtifactSplitCapacity>, std::string, std::uint32_t, std::stop_token = {});
  [[= contracts::reflection::Snapshot{contracts::kArtifactUiStateByteBudget}]] [[nodiscard]] contracts::ArtifactUiState snapshot() const;
 
 private:

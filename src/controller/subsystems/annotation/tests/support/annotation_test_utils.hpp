@@ -12,14 +12,13 @@ inline controller::VisualDiagnosticSink annotation_render_evidence() {
  static unsigned char enabled;
  return {.context = &enabled, .write = [](void*, controller::VisualDiagnosticFact) noexcept {}};
 }
-inline controller::WorkspaceMouse annotation_mouse(controller::AnnotationSystem& annotation, std::uint64_t peer, controller::WorkspaceMouseKind kind,
-                                                   controller::WorkspacePoint point) {
+inline controller::WorkspaceMouse annotation_mouse(controller::AnnotationSystem& annotation, std::uint64_t peer, controller::WorkspaceMouseKind kind, controller::WorkspacePoint point) {
  return {.source = controller::PresentationSourceKind::Annotation,
-         .peer_epoch = peer,
-         .document_epoch = annotation.snapshot().input_document_epoch,
-         .kind = kind,
-         .point = point,
-         .brush_radius = controller::contracts::kDefaultAnnotationBrushRadius};
+  .peer_epoch = peer,
+  .document_epoch = annotation.snapshot().input_document_epoch,
+  .kind = kind,
+  .point = point,
+  .brush_radius = controller::contracts::kDefaultAnnotationBrushRadius};
 }
 template <class Events>
 void await_annotation_command(controller::AnnotationSystem& annotation, Events& events, std::uint64_t admitted_revision) {

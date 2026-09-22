@@ -68,8 +68,7 @@ ExecutionPlacement resolve_placement(const NumaTopology& topology, int local_nod
   throw std::invalid_argument("GPU NUMA memory node is unavailable or forbidden");
  std::vector<int> cpus;
  for (const auto& cpu : topology.cpus)
-  if (cpu.node == node && std::ranges::find(topology.permitted_cpus, cpu.cpu) != topology.permitted_cpus.end() &&
-      (eligible.empty() || std::ranges::find(eligible, cpu.cpu) != eligible.end()))
+  if (cpu.node == node && std::ranges::find(topology.permitted_cpus, cpu.cpu) != topology.permitted_cpus.end() && (eligible.empty() || std::ranges::find(eligible, cpu.cpu) != eligible.end()))
    cpus.push_back(cpu.cpu);
  if (cpus.empty()) throw std::invalid_argument("GPU NUMA node has no eligible permitted CPU");
  return {node, physical_core_order(topology, cpus), memory->bytes};

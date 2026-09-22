@@ -97,12 +97,8 @@ struct ImageWorkspaceTestAccess final {
  static inline std::exception_ptr initialize_failure;
  static inline std::exception_ptr alias_failure;
  static inline std::size_t initialized = 0U;
- static void SetAvailabilitySink(ImageWorkspace& workspace, std::shared_ptr<const std::function<void()>> sink) noexcept {
-  workspace.SetAvailabilitySink(std::move(sink));
- }
- static std::shared_ptr<ImageWorkspace> Create(DeviceContext display, ImageWorkspaceLayout layout) {
-  return ImageWorkspace::Create(std::move(display), std::move(layout), {}, &operations);
- }
+ static void SetAvailabilitySink(ImageWorkspace& workspace, std::shared_ptr<const std::function<void()>> sink) noexcept { workspace.SetAvailabilitySink(std::move(sink)); }
+ static std::shared_ptr<ImageWorkspace> Create(DeviceContext display, ImageWorkspaceLayout layout) { return ImageWorkspace::Create(std::move(display), std::move(layout), {}, &operations); }
  static std::shared_ptr<ImageWorkspace> Create(std::shared_ptr<ImageCopyBackend> backend, ImageWorkspaceLayout layout) {
   return Create(DeviceContext(layout.device, std::move(backend)), std::move(layout));
  }
@@ -118,14 +114,7 @@ struct ImageWorkspaceTestAccess final {
   ImportedImageBufferTestAccess::Reset();
  }
  [[nodiscard]] static ImageWorkspaceLayout Layout(const int device = 1) noexcept {
-  return {.device_incarnation = 7U,
-          .device_uuid = {1U},
-          .device = device,
-          .width = 4U,
-          .height = 3U,
-          .pitch_bytes = 64U,
-          .required_allocation_bytes = 4096U,
-          .alignment_bytes = 64U};
+  return {.device_incarnation = 7U, .device_uuid = {1U}, .device = device, .width = 4U, .height = 3U, .pitch_bytes = 64U, .required_allocation_bytes = 4096U, .alignment_bytes = 64U};
  }
 
 private:
@@ -144,26 +133,24 @@ inline bool ContainsImageFailure(const std::exception_ptr& failure, const std::e
  if (failure == expected) return true;
  try {
   if (failure) std::rethrow_exception(failure);
- } catch (const ImageFailure& aggregate) {
-  return ContainsImageFailure(aggregate.primary(), expected) || ContainsImageFailure(aggregate.secondary(), expected);
- } catch (...) {}
+ } catch (const ImageFailure& aggregate) { return ContainsImageFailure(aggregate.primary(), expected) || ContainsImageFailure(aggregate.secondary(), expected); } catch (...) {
+ }
  return false;
 }
 inline void CopyImagePlane(const ImagePlaneView destination, const ImagePlaneView source) {
  for (std::uint32_t row = 0U; row != source.descriptor.height; ++row) {
-  std::memcpy(reinterpret_cast<std::byte*>(destination.data) + row * destination.descriptor.pitch_bytes,
-              reinterpret_cast<const std::byte*>(source.data) + row * source.descriptor.pitch_bytes, source.descriptor.row_bytes());
+  std::memcpy(reinterpret_cast<std::byte*>(destination.data) + row * destination.descriptor.pitch_bytes, reinterpret_cast<const std::byte*>(source.data) + row * source.descriptor.pitch_bytes,
+   source.descriptor.row_bytes());
  }
 }
 [[nodiscard]] inline SystemImageRuntimeConfig WorkspaceRuntimeConfig(
  std::shared_ptr<ImageCopyBackend> backend, std::shared_ptr<ImageProductRevisionSequence> revisions = std::make_shared<ImageProductRevisionSequence>()) {
  return {.device = 0,
-         .backend = std::move(backend),
-         .workspace_finalize = [](auto clean, auto, auto destination, auto, auto) { CopyImagePlane(destination, clean); },
-         .product_revisions = std::move(revisions)};
+  .backend = std::move(backend),
+  .workspace_finalize = [](auto clean, auto, auto destination, auto, auto) { CopyImagePlane(destination, clean); },
+  .product_revisions = std::move(revisions)};
 }
-[[nodiscard]] inline std::pair<std::shared_ptr<ImageWorkspace>, bool> PublishTestWorkspace(SystemImageRuntime& runtime,
-                                                                                           std::shared_ptr<ImageCopyBackend> backend, const int device = 1) {
+[[nodiscard]] inline std::pair<std::shared_ptr<ImageWorkspace>, bool> PublishTestWorkspace(SystemImageRuntime& runtime, std::shared_ptr<ImageCopyBackend> backend, const int device = 1) {
  auto workspace = ImageWorkspaceTestAccess::CreateAdmitted(std::move(backend), ImageWorkspaceTestAccess::Layout(device));
  runtime.Publish(4U, 3U, [](auto, auto, auto) {});
  const bool prepared = runtime.PrepareDisplay(runtime.Completed().revision(), workspace);
@@ -361,11 +348,9 @@ public:
  void ClearPlane(std::uintptr_t, std::uintptr_t, const ImagePlaneView& plane) override {
   MaybeFail(FailurePoint::Clear);
   ++plane_clears;
-  for (std::uint32_t row = 0U; row != plane.descriptor.height; ++row)
-   std::memset(reinterpret_cast<std::byte*>(plane.data) + row * plane.descriptor.pitch_bytes, 0, plane.descriptor.row_bytes());
+  for (std::uint32_t row = 0U; row != plane.descriptor.height; ++row) std::memset(reinterpret_cast<std::byte*>(plane.data) + row * plane.descriptor.pitch_bytes, 0, plane.descriptor.row_bytes());
  }
- [[nodiscard]] std::shared_ptr<void> AllocatePinned(std::uintptr_t context, const mmltk::common::system::ExecutionPlacement*,
-                                                    const std::size_t bytes) override {
+ [[nodiscard]] std::shared_ptr<void> AllocatePinned(std::uintptr_t context, const mmltk::common::system::ExecutionPlacement*, const std::size_t bytes) override {
   ++pinned_allocated;
   {
    std::scoped_lock lock(mutex_);
@@ -396,8 +381,7 @@ public:
  void CopyDeviceToHost(std::uintptr_t, const ImagePlaneView& source, void* const destination, const std::size_t destination_pitch) override {
   MaybeFail(FailurePoint::Copy);
   for (std::uint32_t row = 0U; row != source.descriptor.height; ++row) {
-   std::memcpy(static_cast<std::byte*>(destination) + row * destination_pitch,
-               reinterpret_cast<const std::byte*>(source.data) + row * source.descriptor.pitch_bytes, source.descriptor.row_bytes());
+   std::memcpy(static_cast<std::byte*>(destination) + row * destination_pitch, reinterpret_cast<const std::byte*>(source.data) + row * source.descriptor.pitch_bytes, source.descriptor.row_bytes());
   }
   RecordTransfer({ImageCopyPath::PinnedStaging, source, {}});
   ++staged_downloads;
@@ -405,8 +389,8 @@ public:
  void CopyHostToDevice(std::uintptr_t, std::uintptr_t, const void* const source, const std::size_t source_pitch, const ImagePlaneView& destination) override {
   MaybeFail(FailurePoint::Copy);
   for (std::uint32_t row = 0U; row != destination.descriptor.height; ++row) {
-   std::memcpy(reinterpret_cast<std::byte*>(destination.data) + row * destination.descriptor.pitch_bytes,
-               static_cast<const std::byte*>(source) + row * source_pitch, destination.descriptor.row_bytes());
+   std::memcpy(
+    reinterpret_cast<std::byte*>(destination.data) + row * destination.descriptor.pitch_bytes, static_cast<const std::byte*>(source) + row * source_pitch, destination.descriptor.row_bytes());
   }
   RecordTransfer({ImageCopyPath::PinnedStaging, {}, destination});
   ++staged_uploads;
@@ -543,36 +527,33 @@ struct WorkspaceTestFixture final {
  }
 };
 [[nodiscard]] inline ImageWorkspaceFinalize FakeWorkspaceFinalizer(std::shared_ptr<FakeImageBackend> backend) {
- return
-  [backend = std::move(backend)](ImagePlaneView clean, ImagePlaneView semantic, ImagePlaneView destination, ImageWorkspaceCoverage coverage, std::uintptr_t) {
-   ++backend->workspace_finalizations;
-   const auto draw = [&](ImageWorkspaceRegion region) {
-    for (auto y = std::max(0, region.y1); y < std::min(static_cast<int>(clean.descriptor.height), region.y2); ++y) {
-     for (auto x = std::max(0, region.x1); x < std::min(static_cast<int>(clean.descriptor.width), region.x2); ++x) {
-      const auto* base = reinterpret_cast<const std::uint8_t*>(clean.data) + y * clean.descriptor.pitch_bytes + x * 4U;
-      auto* pixel = reinterpret_cast<std::uint8_t*>(destination.data) + y * destination.descriptor.pitch_bytes + x * 4U;
-      std::memcpy(pixel, base, 4U);
-      if (!semantic.valid()) continue;
-      const auto* overlay = reinterpret_cast<const std::uint8_t*>(semantic.data) + y * semantic.descriptor.pitch_bytes + x * 4U;
-      if (overlay[3] == 0U) continue;
-      const float alpha = static_cast<float>(overlay[3]) / 255.0F;
-      for (unsigned channel = 0U; channel != 3U; ++channel)
-       pixel[channel] = static_cast<std::uint8_t>(base[channel] * (1.0F - alpha) + overlay[channel] * alpha);
-      pixel[3] = 255U;
-     }
+ return [backend = std::move(backend)](ImagePlaneView clean, ImagePlaneView semantic, ImagePlaneView destination, ImageWorkspaceCoverage coverage, std::uintptr_t) {
+  ++backend->workspace_finalizations;
+  const auto draw = [&](ImageWorkspaceRegion region) {
+   for (auto y = std::max(0, region.y1); y < std::min(static_cast<int>(clean.descriptor.height), region.y2); ++y) {
+    for (auto x = std::max(0, region.x1); x < std::min(static_cast<int>(clean.descriptor.width), region.x2); ++x) {
+     const auto* base = reinterpret_cast<const std::uint8_t*>(clean.data) + y * clean.descriptor.pitch_bytes + x * 4U;
+     auto* pixel = reinterpret_cast<std::uint8_t*>(destination.data) + y * destination.descriptor.pitch_bytes + x * 4U;
+     std::memcpy(pixel, base, 4U);
+     if (!semantic.valid()) continue;
+     const auto* overlay = reinterpret_cast<const std::uint8_t*>(semantic.data) + y * semantic.descriptor.pitch_bytes + x * 4U;
+     if (overlay[3] == 0U) continue;
+     const float alpha = static_cast<float>(overlay[3]) / 255.0F;
+     for (unsigned channel = 0U; channel != 3U; ++channel) pixel[channel] = static_cast<std::uint8_t>(base[channel] * (1.0F - alpha) + overlay[channel] * alpha);
+     pixel[3] = 255U;
     }
-   };
-   if (coverage.full_image)
-    draw({0, 0, static_cast<int>(clean.descriptor.width), static_cast<int>(clean.descriptor.height)});
-   else
-    for (auto region : coverage.regions) draw(region);
+   }
   };
+  if (coverage.full_image)
+   draw({0, 0, static_cast<int>(clean.descriptor.width), static_cast<int>(clean.descriptor.height)});
+  else
+   for (auto region : coverage.regions) draw(region);
+ };
 }
-[[nodiscard]] inline std::function<std::unique_ptr<SystemImageRuntime>(std::shared_ptr<ImageProductRevisionSequence>)> RuntimeFactory(
- const int device, const std::shared_ptr<FakeImageBackend>& backend, const ImageProductLayout layout = ImageProductLayout::Clean,
- std::function<std::unique_ptr<SystemImageModel>()> model = {}, const std::size_t output_buffer_count = 1U, ImageWorkspaceFinalize finalize = {}) {
- return [device, backend, layout, model = std::move(model), output_buffer_count,
-         finalize = std::move(finalize)](std::shared_ptr<ImageProductRevisionSequence> revisions) {
+[[nodiscard]] inline std::function<std::unique_ptr<SystemImageRuntime>(std::shared_ptr<ImageProductRevisionSequence>)> RuntimeFactory(const int device,
+ const std::shared_ptr<FakeImageBackend>& backend, const ImageProductLayout layout = ImageProductLayout::Clean, std::function<std::unique_ptr<SystemImageModel>()> model = {},
+ const std::size_t output_buffer_count = 1U, ImageWorkspaceFinalize finalize = {}) {
+ return [device, backend, layout, model = std::move(model), output_buffer_count, finalize = std::move(finalize)](std::shared_ptr<ImageProductRevisionSequence> revisions) {
   return std::make_unique<SystemImageRuntime>(SystemImageRuntimeConfig{
    .device = device,
    .backend = backend,

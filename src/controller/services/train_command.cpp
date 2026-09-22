@@ -18,12 +18,8 @@ void append_path(std::vector<std::string>& arguments, const std::string_view nam
  if (!value.empty()) append_value(arguments, name, value.string());
 }
 void append_number(std::vector<std::string>& arguments, const std::string_view name, const int value) { append_value(arguments, name, std::to_string(value)); }
-void append_number(std::vector<std::string>& arguments, const std::string_view name, const std::size_t value) {
- append_value(arguments, name, std::to_string(value));
-}
-void append_number(std::vector<std::string>& arguments, const std::string_view name, const double value) {
- append_value(arguments, name, std::to_string(value));
-}
+void append_number(std::vector<std::string>& arguments, const std::string_view name, const std::size_t value) { append_value(arguments, name, std::to_string(value)); }
+void append_number(std::vector<std::string>& arguments, const std::string_view name, const double value) { append_value(arguments, name, std::to_string(value)); }
 void append_number(std::vector<std::string>& arguments, const std::string_view name, const float value) {
  std::array<char, 32U> text{};
  const auto converted = std::to_chars(text.data(), text.data() + text.size(), value, std::chars_format::general, std::numeric_limits<float>::max_digits10);
@@ -47,14 +43,12 @@ void append_flag(std::vector<std::string>& arguments, const std::string_view ena
 template <class Value>
 void append_train_recipe_value(std::vector<std::string>& arguments, const std::string_view name, const Value& value) {
  if constexpr (std::is_enum_v<Value>) {
-  append_value(arguments, name,
-               require_enum_spelling(mmltk::backend::models::rfdetr::cli_enum_spelling(value), "RF-DETR train request has an invalid recipe enum"));
+  append_value(arguments, name, require_enum_spelling(mmltk::backend::models::rfdetr::cli_enum_spelling(value), "RF-DETR train request has an invalid recipe enum"));
  } else {
   append_number(arguments, name, value);
  }
 }
-void append_augmentation_group(std::vector<std::string>& arguments, const std::string_view group,
-                               const mmltk::backend::models::rfdetr::AugmentationGroupConfig& value) {
+void append_augmentation_group(std::vector<std::string>& arguments, const std::string_view group, const mmltk::backend::models::rfdetr::AugmentationGroupConfig& value) {
  std::string prefix{"--aug-"};
  prefix.append(group.data(), group.size());
  append_number(arguments, prefix + "-prob", value.probability);
@@ -70,8 +64,7 @@ void append_augmentation_group(std::vector<std::string>& arguments, const std::s
  return result;
 }
 }  // namespace
-std::vector<std::string> build_train_command_arguments(const mmltk::backend::models::rfdetr::TrainRequest& request,
-                                                       const std::string_view fallback_preset_name) {
+std::vector<std::string> build_train_command_arguments(const mmltk::backend::models::rfdetr::TrainRequest& request, const std::string_view fallback_preset_name) {
  const auto* command = mmltk::backend::models::rfdetr::rfdetr_command_descriptor(mmltk::backend::models::rfdetr::RfdetrCommand::Train);
  if (command == nullptr) throw std::logic_error("RF-DETR train command vocabulary is incomplete");
  auto effective = request;
@@ -101,16 +94,13 @@ std::vector<std::string> build_train_command_arguments(const mmltk::backend::mod
  append_number(arguments, "--val-batch-size", effective.val_batch_size);
  append_number(arguments, "--epochs", effective.epochs);
  append_number(arguments, "--grad-accum-steps", effective.grad_accum_steps);
- append_value(arguments, "--optimizer",
-              require_enum_spelling(mmltk::backend::models::rfdetr::cli_enum_spelling(effective.optimizer), "RF-DETR train request has an invalid optimizer"));
+ append_value(arguments, "--optimizer", require_enum_spelling(mmltk::backend::models::rfdetr::cli_enum_spelling(effective.optimizer), "RF-DETR train request has an invalid optimizer"));
  const auto& overrides = effective.recipe_overrides;
  using RecipeRelation = mmltk::frameworks::reflection::catalog_provider_relation<mmltk::backend::models::rfdetr::TrainRecipeCatalog>;
  RecipeRelation::VisitMembers([&]<class Entry>() {
   if (!RecipeRelation::template overridden<Entry::destination>(overrides)) return;
-  const auto option_name =
-   train_recipe_option_name(mmltk::frameworks::reflection::materialized_member_name<std::remove_cvref_t<decltype(Entry::destination)>::terminal_member>());
-  append_train_recipe_value(arguments, option_name,
-                            mmltk::frameworks::reflection::access<const mmltk::backend::models::rfdetr::TrainRequest, Entry::destination>(effective));
+  const auto option_name = train_recipe_option_name(mmltk::frameworks::reflection::materialized_member_name<std::remove_cvref_t<decltype(Entry::destination)>::terminal_member>());
+  append_train_recipe_value(arguments, option_name, mmltk::frameworks::reflection::access<const mmltk::backend::models::rfdetr::TrainRequest, Entry::destination>(effective));
  });
  append_flag(arguments, "--freeze-encoder", "--no-freeze-encoder", effective.freeze_encoder);
  append_number(arguments, "--clip-max-norm", effective.clip_max_norm);
@@ -122,9 +112,7 @@ std::vector<std::string> build_train_command_arguments(const mmltk::backend::mod
  append_number(arguments, "--ema-tau", effective.ema_tau);
  append_number(arguments, "--eval-max-dets", effective.eval_max_dets);
  const auto& supervision = effective.training_supervision;
- append_value(
-  arguments, "--assignment",
-  require_enum_spelling(mmltk::backend::models::rfdetr::cli_enum_spelling(supervision.assignment), "RF-DETR train request has an invalid assignment"));
+ append_value(arguments, "--assignment", require_enum_spelling(mmltk::backend::models::rfdetr::cli_enum_spelling(supervision.assignment), "RF-DETR train request has an invalid assignment"));
  append_number(arguments, "--match-free-rho", supervision.match_free.rho);
  append_number(arguments, "--match-free-correspondence-weight", supervision.match_free.correspondence_weight);
  append_number(arguments, "--match-free-query-weight", supervision.match_free.query_weight);
@@ -161,9 +149,8 @@ std::vector<std::string> build_train_command_arguments(const mmltk::backend::mod
  append_number(arguments, "--seed", effective.seed);
  append_flag(arguments, "--amp", "--no-amp", effective.amp);
  append_flag(arguments, "--progress", "--no-progress", effective.progress_bar);
- append_value(arguments, "--compile-mode",
-              require_enum_spelling(mmltk::backend::models::rfdetr::cli_enum_spelling(effective.compilation_mode),
-                                    "RF-DETR train request has an invalid compilation mode"));
+ append_value(
+  arguments, "--compile-mode", require_enum_spelling(mmltk::backend::models::rfdetr::cli_enum_spelling(effective.compilation_mode), "RF-DETR train request has an invalid compilation mode"));
  if (effective.distributed_worker) {
   arguments.emplace_back("--dist-worker");
   append_number(arguments, "--dist-rank", effective.distributed_rank);

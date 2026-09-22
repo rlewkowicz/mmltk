@@ -142,27 +142,21 @@ VastLaunchTemplateOptions parse_vast_launch_template(std::string_view template_t
 VastCreateInstanceResult parse_vast_create_instance_payload(std::string_view payload);
 VastInstanceInfo parse_vast_instance_payload(std::string_view payload);
 std::vector<VastInstanceInfo> parse_vast_instances_payload(std::string_view payload);
-std::vector<VastOfferSummary> rank_vast_offers(const std::vector<VastRawOffer>& offers,
-                                               const std::vector<mmltk::controller::contracts::ProviderGpuFamily>& selected_families, std::size_t result_limit,
-                                               int min_gpus);
-VastCreateInstanceResult create_vast_instance(const VastBridgeConfig& config, int offer_id, std::string_view image,
-                                              const VastLaunchTemplateOptions& options = {});
-VastCreateInstanceResult create_vast_instance(const VastBridgeConfig& config, int offer_id, std::string_view image, const VastLaunchTemplateOptions& options,
-                                              const VastBridgeInvocation& invocation);
+std::vector<VastOfferSummary> rank_vast_offers(
+ const std::vector<VastRawOffer>& offers, const std::vector<mmltk::controller::contracts::ProviderGpuFamily>& selected_families, std::size_t result_limit, int min_gpus);
+VastCreateInstanceResult create_vast_instance(const VastBridgeConfig& config, int offer_id, std::string_view image, const VastLaunchTemplateOptions& options = {});
+VastCreateInstanceResult create_vast_instance(const VastBridgeConfig& config, int offer_id, std::string_view image, const VastLaunchTemplateOptions& options, const VastBridgeInvocation& invocation);
 VastInstanceInfo show_vast_instance(const VastBridgeConfig& config, int instance_id);
 VastInstanceInfo show_vast_instance(const VastBridgeConfig& config, int instance_id, const VastBridgeInvocation& invocation);
 std::vector<VastInstanceInfo> show_vast_instances(const VastBridgeConfig& config);
 std::vector<VastInstanceInfo> show_vast_instances(const VastBridgeConfig& config, const VastBridgeInvocation& invocation);
 std::string fetch_vast_instance_logs(const VastBridgeConfig& config, int instance_id, std::optional<std::size_t> tail_lines = std::nullopt);
-std::string fetch_vast_instance_logs(const VastBridgeConfig& config, int instance_id, std::optional<std::size_t> tail_lines,
-                                     const VastBridgeInvocation& invocation);
+std::string fetch_vast_instance_logs(const VastBridgeConfig& config, int instance_id, std::optional<std::size_t> tail_lines, const VastBridgeInvocation& invocation);
 void start_vast_instance(const VastBridgeConfig& config, int instance_id, const VastBridgeInvocation& invocation);
 void stop_vast_instance(const VastBridgeConfig& config, int instance_id, const VastBridgeInvocation& invocation);
-std::vector<VastOfferSummary> query_vast_offers(const VastQueryConfig& config,
-                                                const std::vector<mmltk::controller::contracts::ProviderGpuFamily>& selected_families);
-std::vector<VastOfferSummary> query_vast_offers(const VastQueryConfig& config,
-                                                const std::vector<mmltk::controller::contracts::ProviderGpuFamily>& selected_families,
-                                                const VastBridgeInvocation& invocation);
+std::vector<VastOfferSummary> query_vast_offers(const VastQueryConfig& config, const std::vector<mmltk::controller::contracts::ProviderGpuFamily>& selected_families);
+std::vector<VastOfferSummary> query_vast_offers(
+ const VastQueryConfig& config, const std::vector<mmltk::controller::contracts::ProviderGpuFamily>& selected_families, const VastBridgeInvocation& invocation);
 }  // namespace mmltk::controller::services
 namespace mmltk::controller::services {
 inline constexpr std::size_t kVastOfferCapacity = 32U;
@@ -199,9 +193,7 @@ struct VastReconciliationRequest final {
  std::string launch_token;
  [[nodiscard]] bool valid() const noexcept {
   if (!valid_vast_mutation(mutation)) return false;
-  if (mutation == mmltk::controller::contracts::ProviderMutation::Create) {
-   return instance_id == 0 && !launch_token.empty() && launch_token.size() <= kVastLaunchTokenCapacity;
-  }
+  if (mutation == mmltk::controller::contracts::ProviderMutation::Create) { return instance_id == 0 && !launch_token.empty() && launch_token.size() <= kVastLaunchTokenCapacity; }
   return instance_id > 0 && launch_token.empty();
  }
 };
@@ -234,10 +226,9 @@ class VastClient final {
 public:
  explicit VastClient(VastProviderClient provider) noexcept : provider_(provider) {}
  [[nodiscard]] VastOffers query(const mmltk::controller::contracts::ProviderPreferences& preferences, const VastCancellationToken& cancellation) const;
- [[nodiscard]] VastCreateInstanceResult create(int offer_id, const mmltk::controller::contracts::ProviderPreferences& preferences,
-                                               std::string_view launch_token, VastEffectAttempt& attempt, const VastCancellationToken& cancellation) const;
- void mutate(mmltk::controller::contracts::ProviderMutation mutation, int instance_id, VastEffectAttempt& attempt,
-             const VastCancellationToken& cancellation) const;
+ [[nodiscard]] VastCreateInstanceResult create(
+  int offer_id, const mmltk::controller::contracts::ProviderPreferences& preferences, std::string_view launch_token, VastEffectAttempt& attempt, const VastCancellationToken& cancellation) const;
+ void mutate(mmltk::controller::contracts::ProviderMutation mutation, int instance_id, VastEffectAttempt& attempt, const VastCancellationToken& cancellation) const;
  [[nodiscard]] VastReconciliation reconcile(const VastReconciliationRequest& request, const VastCancellationToken& cancellation) const;
  [[nodiscard]] VastInstanceInfo instance(int instance_id, const VastCancellationToken& cancellation) const;
  [[nodiscard]] VastInventory instances(const VastCancellationToken& cancellation) const;

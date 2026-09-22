@@ -24,24 +24,22 @@ struct CoconutSegmentSupport {
 // synchronous importer uses this owner at a time; RLE scratch retains capacity.
 class CoconutMaskRecovery final {
 public:
- CoconutMaskRecovery(const NormalizedAnnotationIndex* train, const NormalizedAnnotationIndex* validation,
-                     mmltk::common::concurrency::CancellationObservation cancellation = {});
+ CoconutMaskRecovery(const NormalizedAnnotationIndex* train, const NormalizedAnnotationIndex* validation, mmltk::common::concurrency::CancellationObservation cancellation = {});
  CoconutMaskRecovery(const CoconutMaskRecovery&) = delete;
  CoconutMaskRecovery& operator=(const CoconutMaskRecovery&) = delete;
  [[nodiscard]] std::string_view original_identity(CoconutImageNamespace source) const noexcept;
  // Support belongs to this decoded image. Facts are appended for successful
  // assignments; rejection counts are settled by the importer after carving.
- void apply(CoconutImageNamespace source, const CoconutRecord& record, std::uint32_t width, std::uint32_t height,
-            std::span<CoconutSegmentSupport> support, CoconutRecoveryImage& facts,
-            mmltk::common::concurrency::CancellationObservation cancellation = {});
+ void apply(CoconutImageNamespace source, const CoconutRecord& record, std::uint32_t width, std::uint32_t height, std::span<CoconutSegmentSupport> support, CoconutRecoveryImage& facts,
+  mmltk::common::concurrency::CancellationObservation cancellation = {});
 
 private:
  using Cancellation = mmltk::common::concurrency::CancellationObservation;
  using GroupKey = std::tuple<std::uint64_t, bool, bool>;
  struct Candidate {
   const NormalizedBox* box = nullptr;
-  std::span<const RLEPair> runs;
-  dataset::RowMajorMaskBounds bounds;
+  std::span<const RLEPair> runs{};
+  dataset::RowMajorMaskBounds bounds{};
   std::size_t group = 0;
  };
  struct Group {
@@ -49,8 +47,7 @@ private:
   std::size_t begin = 0, dropped = 0, end = 0, candidate_count = 0;
   bool valid = true;
  };
- [[nodiscard]] static bool candidate_mask(const NormalizedAnnotationIndex& index, std::uint32_t width, std::uint32_t height,
-                                           Candidate& candidate, Cancellation cancellation);
+ [[nodiscard]] static bool candidate_mask(const NormalizedAnnotationIndex& index, std::uint32_t width, std::uint32_t height, Candidate& candidate, Cancellation cancellation);
  [[nodiscard]] static bool intersects(const CoconutSegmentSupport& support, const Candidate& candidate, Cancellation cancellation);
  struct Originals {
   const NormalizedAnnotationIndex* index = nullptr;

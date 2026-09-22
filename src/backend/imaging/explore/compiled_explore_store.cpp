@@ -26,9 +26,7 @@ module;
 module mmltk.backend.imaging.explore.compiled_explore_store;
 namespace mmltk::backend::imaging::explore {
 namespace {
-[[nodiscard]] bool cancellation_requested(const std::atomic<bool>* cancel_requested) noexcept {
- return cancel_requested != nullptr && cancel_requested->load(std::memory_order_relaxed);
-}
+[[nodiscard]] bool cancellation_requested(const std::atomic<bool>* cancel_requested) noexcept { return cancel_requested != nullptr && cancel_requested->load(std::memory_order_relaxed); }
 [[nodiscard]] bool generation_is_current(const std::uint64_t expected_generation, const std::atomic<std::uint64_t>* current_generation) noexcept {
  return current_generation == nullptr || current_generation->load(std::memory_order_acquire) == expected_generation;
 }
@@ -45,21 +43,19 @@ void require_not_cancelled(const std::atomic<bool>* cancel_requested) {
  state += 0x9e3779b97f4a7c15ULL;
  return value;
 }
-[[nodiscard]] bool deterministic_shuffle(std::vector<std::uint32_t>& values, const std::uint64_t seed, const std::atomic<bool>* cancel_requested,
-                                         const std::uint64_t expected_generation, const std::atomic<std::uint64_t>* current_generation) noexcept {
+[[nodiscard]] bool deterministic_shuffle(std::vector<std::uint32_t>& values, const std::uint64_t seed, const std::atomic<bool>* cancel_requested, const std::uint64_t expected_generation,
+ const std::atomic<std::uint64_t>* current_generation) noexcept {
  std::uint64_t state = seed;
  for (std::size_t remaining = values.size(); remaining > 1U; --remaining) {
-  if ((remaining & 4095U) == 0U && (cancellation_requested(cancel_requested) || !generation_is_current(expected_generation, current_generation))) {
-   return false;
-  }
+  if ((remaining & 4095U) == 0U && (cancellation_requested(cancel_requested) || !generation_is_current(expected_generation, current_generation))) { return false; }
   const std::size_t selected = static_cast<std::size_t>(splitmix64(state) % remaining);
   std::swap(values[remaining - 1U], values[selected]);
  }
  return !cancellation_requested(cancel_requested) && generation_is_current(expected_generation, current_generation);
 }
 }  // namespace
-std::vector<ExploreImageSummary> build_explore_summaries(const mmltk::backend::data::CompiledDataset& store, const std::atomic<bool>* cancel_requested,
-                                                         mmltk::common::concurrency::WorkerPool* workers) {
+std::vector<ExploreImageSummary> build_explore_summaries(
+ const mmltk::backend::data::CompiledDataset& store, const std::atomic<bool>* cancel_requested, mmltk::common::concurrency::WorkerPool* workers) {
  const auto image_entries_ = store.image_entries();
  const auto labels_ = store.labels();
  std::vector<ExploreImageSummary> summaries(image_entries_.size());
@@ -95,10 +91,9 @@ ExploreClassMask explore_class_mask(const std::span<const bool> enabled) noexcep
  }
  return mask;
 }
-bool rebuild_explore_order(const std::span<const ExploreImageSummary> summaries, const ExploreSampleFilter& filter, const bool shuffled,
-                           const std::uint64_t shuffle_seed, std::vector<std::uint32_t>& current, std::vector<std::uint32_t>& scratch,
-                           const std::atomic<bool>* cancel_requested, const std::uint64_t expected_generation,
-                           const std::atomic<std::uint64_t>* current_generation, mmltk::common::concurrency::WorkerPool* workers) {
+bool rebuild_explore_order(const std::span<const ExploreImageSummary> summaries, const ExploreSampleFilter& filter, const bool shuffled, const std::uint64_t shuffle_seed,
+ std::vector<std::uint32_t>& current, std::vector<std::uint32_t>& scratch, const std::atomic<bool>* cancel_requested, const std::uint64_t expected_generation,
+ const std::atomic<std::uint64_t>* current_generation, mmltk::common::concurrency::WorkerPool* workers) {
  if (summaries.size() > std::numeric_limits<std::uint32_t>::max()) { throw std::overflow_error("compiled dataset image count exceeds Explore index capacity"); }
  constexpr std::uint32_t kRejected = std::numeric_limits<std::uint32_t>::max();
  scratch.assign(summaries.size(), kRejected);
@@ -107,9 +102,8 @@ bool rebuild_explore_order(const std::span<const ExploreImageSummary> summaries,
    if ((image_index & 4095U) == 0U && (cancellation_requested(cancel_requested) || !generation_is_current(expected_generation, current_generation))) return;
    const ExploreImageSummary& summary = summaries[image_index];
    const std::uint64_t compiled_index = image_index;
-   if (compiled_index < filter.min_compiled_index || compiled_index > filter.max_compiled_index || summary.instance_count < filter.min_instances ||
-       summary.instance_count > filter.max_instances || (filter.require_boxes && summary.instance_count == 0U) ||
-       (filter.require_masks && !summary.has_masks) || (filter.restrict_classes && !class_masks_intersect(summary.classes, filter.classes)))
+   if (compiled_index < filter.min_compiled_index || compiled_index > filter.max_compiled_index || summary.instance_count < filter.min_instances || summary.instance_count > filter.max_instances ||
+       (filter.require_boxes && summary.instance_count == 0U) || (filter.require_masks && !summary.has_masks) || (filter.restrict_classes && !class_masks_intersect(summary.classes, filter.classes)))
     continue;
    scratch[image_index] = static_cast<std::uint32_t>(image_index);
    // CLEANUP-IGNORE: Summary production and filter classification use different callbacks; parallel_for already owns the shared mechanism.
@@ -137,23 +131,17 @@ std::optional<std::uint32_t> adjacent_explore_index(const std::span<const std::u
  }
  return position == order.begin() ? order.back() : *(position - 1);
 }
-std::optional<ExploreAtlasLayout> make_explore_atlas_layout(const std::size_t item_count, const ExploreViewport viewport,
-                                                            const std::uint32_t card_extent) noexcept {
+std::optional<ExploreAtlasLayout> make_explore_atlas_layout(const std::size_t item_count, const ExploreViewport viewport, const std::uint32_t card_extent) noexcept {
  if (item_count == 0U || !viewport.valid() || card_extent == 0U) return std::nullopt;
  const std::size_t columns = viewport.columns;
  const std::size_t rows = item_count / columns + (item_count % columns != 0U ? 1U : 0U);
- if (rows > std::numeric_limits<std::uint32_t>::max() || viewport.columns > std::numeric_limits<std::uint32_t>::max() / card_extent ||
-     rows > std::numeric_limits<std::uint32_t>::max() / card_extent)
+ if (rows > std::numeric_limits<std::uint32_t>::max() || viewport.columns > std::numeric_limits<std::uint32_t>::max() / card_extent || rows > std::numeric_limits<std::uint32_t>::max() / card_extent)
   return std::nullopt;
- return ExploreAtlasLayout{.width = viewport.columns * card_extent,
-                           .height = static_cast<std::uint32_t>(rows) * card_extent,
-                           .columns = viewport.columns,
-                           .rows = static_cast<std::uint32_t>(rows),
-                           .card_extent = card_extent};
+ return ExploreAtlasLayout{
+  .width = viewport.columns * card_extent, .height = static_cast<std::uint32_t>(rows) * card_extent, .columns = viewport.columns, .rows = static_cast<std::uint32_t>(rows), .card_extent = card_extent};
 }
-std::size_t prioritize_explore_work(const std::span<const std::uint32_t> order, const ExploreViewport viewport,
-                                    const std::optional<std::uint32_t> focused_index, const std::uint32_t background_cursor,
-                                    const std::span<std::uint32_t> output) noexcept {
+std::size_t prioritize_explore_work(const std::span<const std::uint32_t> order, const ExploreViewport viewport, const std::optional<std::uint32_t> focused_index, const std::uint32_t background_cursor,
+ const std::span<std::uint32_t> output) noexcept {
  if (order.empty() || output.empty() || !viewport.valid()) return 0U;
  const std::span<std::uint32_t> bounded_output = output.first(std::min(output.size(), kExploreWorkCapacity));
  std::size_t written = 0U;
@@ -162,9 +150,7 @@ std::size_t prioritize_explore_work(const std::span<const std::uint32_t> order, 
   bounded_output[written++] = value;
  };
  if (focused_index.has_value()) append(*focused_index);
- const auto bounded_product = [limit = order.size()](const std::size_t lhs, const std::size_t rhs) noexcept {
-  return rhs != 0U && lhs > limit / rhs ? limit : std::min(limit, lhs * rhs);
- };
+ const auto bounded_product = [limit = order.size()](const std::size_t lhs, const std::size_t rhs) noexcept { return rhs != 0U && lhs > limit / rhs ? limit : std::min(limit, lhs * rhs); };
  const std::size_t first = bounded_product(viewport.first_row, viewport.columns);
  const std::size_t visible_count = bounded_product(viewport.row_count, viewport.columns);
  const std::size_t last = first + std::min(visible_count, order.size() - first);

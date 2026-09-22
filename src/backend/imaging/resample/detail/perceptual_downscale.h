@@ -19,17 +19,7 @@ private:
  friend struct CpuDownscalerTestAccess;
  // Owner-local, one-shot preparation seam; never exposed by the public
  // resizer or consulted during pixel execution.
- enum class PreparationStep : std::uint8_t {
-  None,
-  HorizontalAxis,
-  VerticalAxis,
-  FirstMoment,
-  SecondMoment,
-  FirstCoefficient,
-  SecondCoefficient,
-  FirstAlpha,
-  SecondAlpha
- };
+ enum class PreparationStep : std::uint8_t { None, HorizontalAxis, VerticalAxis, FirstMoment, SecondMoment, FirstCoefficient, SecondCoefficient, FirstAlpha, SecondAlpha };
  PreparationStep fail_before_ = PreparationStep::None;
  void preparation_checkpoint(PreparationStep step);
  void prepare(const RgbImageLayout& source, const RgbImageLayout& destination);

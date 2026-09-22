@@ -31,15 +31,15 @@ struct ModelArtifactAdmission final {
 class ModelRuntime {
 public:
  virtual ~ModelRuntime() = default;
- [[nodiscard]] virtual ModelArtifactAdmission Acquire(const contracts::ModelSelectionKey&, const std::filesystem::path&, int inspection_device, std::stop_token,
-                                                      const std::function<void(const contracts::ModelProgress&)>&) = 0;
+ [[nodiscard]] virtual ModelArtifactAdmission Acquire(
+  const contracts::ModelSelectionKey&, const std::filesystem::path&, int inspection_device, std::stop_token, const std::function<void(const contracts::ModelProgress&)>&) = 0;
 };
 class ArtifactModelRuntime final : public ModelRuntime {
 public:
  ArtifactModelRuntime() = default;
  explicit ArtifactModelRuntime(services::ArtifactStore store) : store_(std::move(store)) {}
- [[nodiscard]] ModelArtifactAdmission Acquire(const contracts::ModelSelectionKey&, const std::filesystem::path&, int inspection_device, std::stop_token,
-                                              const std::function<void(const contracts::ModelProgress&)>&) override;
+ [[nodiscard]] ModelArtifactAdmission Acquire(
+  const contracts::ModelSelectionKey&, const std::filesystem::path&, int inspection_device, std::stop_token, const std::function<void(const contracts::ModelProgress&)>&) override;
 
 private:
  // CLEANUP-IGNORE: The model runtime owns an artifact store, while the dataset runtime additionally owns typed

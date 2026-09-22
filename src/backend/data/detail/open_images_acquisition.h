@@ -24,9 +24,7 @@ struct AcquiredOpenImages {
  CachedImageDirectory directory;
  std::vector<std::uint64_t> available_image_ids;
 };
-[[nodiscard]] AcquiredOpenImages acquire_open_images(const BenchmarkCacheLayout& cache, NormalizedAnnotationIndex& index,
-                                                     std::vector<QuarantinedImage>* quarantined,
-                                                     mmltk::common::concurrency::CancellationObservation cancel_requested, ProgressReporter* progress,
-                                                     const int num_workers, const std::size_t cache_workers, const BenchmarkTraceSink& trace,
-                                                     const std::optional<ImageDecodeProbe> decode_probe = std::nullopt);
+[[nodiscard]] AcquiredOpenImages acquire_open_images(const BenchmarkCacheLayout& cache, NormalizedAnnotationIndex& index, std::vector<QuarantinedImage>* quarantined,
+ mmltk::common::concurrency::CancellationObservation cancel_requested, ProgressReporter* progress, const int num_workers, const std::size_t cache_workers, const BenchmarkTraceSink& trace,
+ const std::optional<ImageDecodeProbe> decode_probe = std::nullopt);
 }  // namespace mmltk::backend::data::benchmark_internal

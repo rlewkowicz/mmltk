@@ -45,6 +45,5 @@ struct VisualDocumentRead final {
 };
 using ExactVisualDocumentBorrower = std::function<VisualDocumentRead(const VisualFrame&)>;
 [[nodiscard]] contracts::AnnotationSceneContent materialize_visual_document(const VisualDocument&, VisualExtent, VisualRegion, VisualExtent target = {});
-[[nodiscard]] std::shared_ptr<const VisualDocument> scale_visual_document(const std::shared_ptr<const VisualDocument>&, VisualExtent source_extent,
-                                                                          VisualExtent target_extent);
+[[nodiscard]] std::shared_ptr<const VisualDocument> scale_visual_document(const std::shared_ptr<const VisualDocument>&, VisualExtent source_extent, VisualExtent target_extent);
 }  // namespace mmltk::controller

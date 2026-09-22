@@ -36,8 +36,7 @@ T get_value_or(const nlohmann::json& j, const char* key, T fallback) {
 void get_optional_compile_mode(const nlohmann::json& j, const char* key, mmltk::backend::models::rfdetr::CompilationMode& out) {
  int compile_mode = static_cast<int>(out);
  get_optional(j, key, compile_mode);
- out = compile_mode >= static_cast<int>(mmltk::backend::models::rfdetr::CompilationMode::kNone) &&
-         compile_mode <= static_cast<int>(mmltk::backend::models::rfdetr::CompilationMode::kFullTrace)
+ out = compile_mode >= static_cast<int>(mmltk::backend::models::rfdetr::CompilationMode::kNone) && compile_mode <= static_cast<int>(mmltk::backend::models::rfdetr::CompilationMode::kFullTrace)
         ? static_cast<mmltk::backend::models::rfdetr::CompilationMode>(compile_mode)
         : mmltk::backend::models::rfdetr::CompilationMode::kSelective;
 }
@@ -50,8 +49,7 @@ void get_optional_compile_mode(const nlohmann::json& j, const char* key, mmltk::
  }
  return fallback;
 }
-[[nodiscard]] ModelSelectionSource model_selection_source_from_index(const int value,
-                                                                     const ModelSelectionSource fallback = ModelSelectionSource::Canonical) noexcept {
+[[nodiscard]] ModelSelectionSource model_selection_source_from_index(const int value, const ModelSelectionSource fallback = ModelSelectionSource::Canonical) noexcept {
  switch (static_cast<ModelSelectionSource>(value)) {
   case ModelSelectionSource::Canonical: return ModelSelectionSource::Canonical;
   case ModelSelectionSource::Custom: return ModelSelectionSource::Custom;
@@ -79,8 +77,7 @@ struct ModelArtifactsShape {
 };
 void normalize_model_artifacts(ModelArtifactSelectionState& state, const ModelArtifactsShape& shape) {
  const mmltk::backend::models::rfdetr::PresetCatalogEntry* preset = mmltk::backend::models::rfdetr::find_preset_catalog_entry(state.preset_name);
- const bool unsupported_input = (state.input == ModelArtifactInputKind::Weights && !shape.weights) ||
-                                (state.input == ModelArtifactInputKind::Onnx && !shape.onnx) ||
+ const bool unsupported_input = (state.input == ModelArtifactInputKind::Weights && !shape.weights) || (state.input == ModelArtifactInputKind::Onnx && !shape.onnx) ||
                                 (state.input == ModelArtifactInputKind::TensorRt && !shape.tensorrt);
  if (preset == nullptr || unsupported_input) {
   state = ModelArtifactSelectionState{};
@@ -145,12 +142,8 @@ struct JsonFieldWriter {
   }
  }
  void operator()(const char* key, const mmltk::backend::models::rfdetr::CompilationMode& value) const { json[key] = static_cast<int>(value); }
- void operator()(const char* key, const mmltk::backend::models::rfdetr::TrainLrSchedulerKind& value) const {
-  json[key] = mmltk::backend::models::rfdetr::cli_enum_spelling(value);
- }
- void operator()(const char* key, const mmltk::backend::models::rfdetr::TrainAssignmentKind& value) const {
-  json[key] = mmltk::backend::models::rfdetr::cli_enum_spelling(value);
- }
+ void operator()(const char* key, const mmltk::backend::models::rfdetr::TrainLrSchedulerKind& value) const { json[key] = mmltk::backend::models::rfdetr::cli_enum_spelling(value); }
+ void operator()(const char* key, const mmltk::backend::models::rfdetr::TrainAssignmentKind& value) const { json[key] = mmltk::backend::models::rfdetr::cli_enum_spelling(value); }
  template <typename T>
  void operator()(const char* key, const Hundredths<T>& field) const {
   json[key] = json_hundredths(field.value);
@@ -215,9 +208,7 @@ struct JsonFieldReader {
  void operator()(const char* key, ExploreDatasetSource& value) const {
   int index = static_cast<int>(value);
   get_optional(json, key, index);
-  value = index >= static_cast<int>(ExploreDatasetSource::Train) && index <= static_cast<int>(ExploreDatasetSource::Custom)
-           ? static_cast<ExploreDatasetSource>(index)
-           : ExploreDatasetSource::Train;
+  value = index >= static_cast<int>(ExploreDatasetSource::Train) && index <= static_cast<int>(ExploreDatasetSource::Custom) ? static_cast<ExploreDatasetSource>(index) : ExploreDatasetSource::Train;
  }
  // CLEANUP-IGNORE: This enum retains its own persisted integer admission and fallback policy; adjacent enum policies differ.
  void operator()(const char* key, ExploreOrder& value) const {
@@ -252,8 +243,7 @@ struct JsonFieldReader {
    }
    if (!found->is_object()) throw std::runtime_error("training_supervision must be an object");
    fields(candidate, JsonFieldReader{*found});
-   if (!mmltk::backend::models::rfdetr::training_supervision_config_valid(candidate))
-    throw std::runtime_error("training_supervision violates canonical constraints");
+   if (!mmltk::backend::models::rfdetr::training_supervision_config_valid(candidate)) throw std::runtime_error("training_supervision violates canonical constraints");
    value = candidate;
   } else if constexpr (std::is_same_v<T, mmltk::backend::data::BenchmarkDatasetSelection>) {
    if (found == json.end()) return;
@@ -263,8 +253,7 @@ struct JsonFieldReader {
    fields(candidate, JsonFieldReader{*found});
    if (!mmltk::backend::data::valid_benchmark_selection(candidate)) throw std::runtime_error("benchmark selection is invalid");
    value = candidate;
-  } else if constexpr (std::is_same_v<T, mmltk::backend::models::rfdetr::MatchFreeSupervisionConfig> ||
-                       std::is_same_v<T, mmltk::backend::models::rfdetr::DenoisingSupervisionConfig>) {
+  } else if constexpr (std::is_same_v<T, mmltk::backend::models::rfdetr::MatchFreeSupervisionConfig> || std::is_same_v<T, mmltk::backend::models::rfdetr::DenoisingSupervisionConfig>) {
    if (found == json.end()) return;
    if (!found->is_object()) throw std::runtime_error(std::string(key) + " must be an object");
    fields(value, JsonFieldReader{*found});
@@ -282,12 +271,9 @@ template <typename State, typename FieldVisitor>
 template <class Record, class State, class Visitor>
 void visit_record_fields(State& state, const Visitor& visit) {
  mmltk::frameworks::reflection::visit_materialized_bases<Record>([&]<class Base>() { visit_record_fields<Base>(state, visit); });
- mmltk::frameworks::reflection::visit_materialized_members<Record>(
-  [&]<class Declaration>(const auto& field) { visit(field.member_name.data(), state.*Declaration::pointer); });
+ mmltk::frameworks::reflection::visit_materialized_members<Record>([&]<class Declaration>(const auto& field) { visit(field.member_name.data(), state.*Declaration::pointer); });
 }
-constexpr auto benchmark_selection_fields = [](auto& selection, const auto& fields) {
- visit_record_fields<mmltk::backend::data::BenchmarkDatasetSelection>(selection, fields);
-};
+constexpr auto benchmark_selection_fields = [](auto& selection, const auto& fields) { visit_record_fields<mmltk::backend::data::BenchmarkDatasetSelection>(selection, fields); };
 constexpr auto source_fields = [](auto& state, const auto& visit) { visit_record_fields<SourceSelectionState>(state, visit); };
 constexpr auto train_dataset_fields = [](auto& state, const auto& visit) {
  visit("source_dir", state.dataset_source_dir);
@@ -446,12 +432,8 @@ constexpr auto export_execution_fields = [](auto& state, const auto& visit) {
  visit("allow_fp16", state.allow_fp16);
 };
 nlohmann::json snapshot_train_workflow_state(const TrainViewState& state) { return snapshot_fields(state, train_training_fields); }
-nlohmann::json snapshot_gpu_augmentation(const mmltk::backend::models::rfdetr::GpuAugmentationConfig& config) {
- return snapshot_fields(config, gpu_augmentation_fields);
-}
-void apply_gpu_augmentation_json(const nlohmann::json& json, mmltk::backend::models::rfdetr::GpuAugmentationConfig& config) {
- gpu_augmentation_fields(config, JsonFieldReader{json});
-}
+nlohmann::json snapshot_gpu_augmentation(const mmltk::backend::models::rfdetr::GpuAugmentationConfig& config) { return snapshot_fields(config, gpu_augmentation_fields); }
+void apply_gpu_augmentation_json(const nlohmann::json& json, mmltk::backend::models::rfdetr::GpuAugmentationConfig& config) { gpu_augmentation_fields(config, JsonFieldReader{json}); }
 nlohmann::json snapshot_model_artifacts(const ModelArtifactSelectionState& state, const ModelArtifactsShape& shape) {
  nlohmann::json json = nlohmann::json::object();
  model_artifact_fields(state, shape, JsonFieldWriter{json});
@@ -612,16 +594,15 @@ constexpr auto explore_fields = [](auto& state, const auto& visit) {
  visit("detail_scale_mode", state.detail_scale_mode);
 };
 template <typename State, typename Execution, typename ExecutionFields>
-[[nodiscard]] nlohmann::json snapshot_workflow_artifacts_and_execution(const State& s, const ModelArtifactsShape& artifacts_shape, const Execution& execution,
-                                                                       const ExecutionFields& execution_fields) {
+[[nodiscard]] nlohmann::json snapshot_workflow_artifacts_and_execution(
+ const State& s, const ModelArtifactsShape& artifacts_shape, const Execution& execution, const ExecutionFields& execution_fields) {
  return nlohmann::json{
   {kModelArtifactsKey, snapshot_model_artifacts(model_artifacts(s), artifacts_shape)},
   {kExecutionKey, snapshot_fields(execution, execution_fields)},
  };
 }
 template <typename State, typename Execution, typename ExecutionFields>
-void apply_workflow_artifacts_and_execution(const nlohmann::json& workflow, State& s, const ModelArtifactsShape& artifacts_shape, Execution& execution,
-                                            const ExecutionFields& execution_fields) {
+void apply_workflow_artifacts_and_execution(const nlohmann::json& workflow, State& s, const ModelArtifactsShape& artifacts_shape, Execution& execution, const ExecutionFields& execution_fields) {
  ModelArtifactSelectionState artifact_state = model_artifacts(s);
  if (const nlohmann::json* artifacts = find_object(workflow, kModelArtifactsKey)) { apply_model_artifacts_json(*artifacts, artifact_state, artifacts_shape); }
  if (const nlohmann::json* execution_json = find_object(workflow, kExecutionKey)) { execution_fields(execution, JsonFieldReader{*execution_json}); }
@@ -634,16 +615,16 @@ void apply_workflow_section(const nlohmann::json& workflow, State& s, const char
 }
 // Workflows that persist only the shared artifacts/execution blocks plus one flat field section.
 template <typename State, typename Execution, typename ExecutionFields, typename FieldList>
-void apply_section_workflow(const nlohmann::json& workflow, State& s, const ModelArtifactsShape& artifacts_shape, Execution& execution,
-                            const ExecutionFields& execution_fields, const char* section_key, const FieldList& fields) {
+void apply_section_workflow(const nlohmann::json& workflow, State& s, const ModelArtifactsShape& artifacts_shape, Execution& execution, const ExecutionFields& execution_fields,
+ const char* section_key, const FieldList& fields) {
  apply_workflow_artifacts_and_execution(workflow, s, artifacts_shape, execution, execution_fields);
  apply_workflow_section(workflow, s, section_key, fields);
 }
 // Predict and annotate persist the same layout: a source block, the shared artifacts/execution
 // blocks, and one flat field section. Only the shapes, the section key and the field list differ.
 template <typename State, typename Execution, typename ExecutionFields, typename FieldList>
-void apply_source_workflow(const nlohmann::json& workflow, State& s, const ModelArtifactsShape& artifacts_shape, Execution& execution,
-                           const ExecutionFields& execution_fields, const char* section_key, const FieldList& fields) {
+void apply_source_workflow(const nlohmann::json& workflow, State& s, const ModelArtifactsShape& artifacts_shape, Execution& execution, const ExecutionFields& execution_fields, const char* section_key,
+ const FieldList& fields) {
  if (const nlohmann::json* source = find_object(workflow, "source")) { source_fields(s.source, JsonFieldReader{*source}); }
  apply_section_workflow(workflow, s, artifacts_shape, execution, execution_fields, section_key, fields);
 }
@@ -657,8 +638,8 @@ void apply_workflow(const nlohmann::json& workflows_json, State* state, const ch
 }
 // Train and validate persist only projections of their canonical request fields.
 template <typename State, typename Dataset, typename DatasetFields, typename Execution, typename ExecutionFields>
-void apply_dataset_workflow(const nlohmann::json& workflow, State& s, const ModelArtifactsShape& artifacts_shape, Dataset& dataset,
-                            const DatasetFields& dataset_fields, Execution& execution, const ExecutionFields& execution_fields) {
+void apply_dataset_workflow(const nlohmann::json& workflow, State& s, const ModelArtifactsShape& artifacts_shape, Dataset& dataset, const DatasetFields& dataset_fields, Execution& execution,
+ const ExecutionFields& execution_fields) {
  if (const nlohmann::json* datasets = find_object(workflow, kDatasetPathsKey)) { dataset_fields(dataset, JsonFieldReader{*datasets}); }
  apply_workflow_artifacts_and_execution(workflow, s, artifacts_shape, execution, execution_fields);
 }
@@ -667,9 +648,7 @@ nlohmann::json normalize_gui_settings_document_impl(const nlohmann::json& j) {
  const auto schema_it = j.find("schema_version");
  if (schema_it == j.end()) { throw std::runtime_error("GUI settings schema_version is missing"); }
  if (!schema_it->is_number_integer() && !schema_it->is_number_unsigned()) { throw std::runtime_error("GUI settings schema_version must be an integer"); }
- if (mmltk::frameworks::serialization::decode_json_integer_exact<std::uint32_t>(*schema_it) != kGuiSettingsSchemaVersion) {
-  throw std::runtime_error("unsupported GUI settings schema_version");
- }
+ if (mmltk::frameworks::serialization::decode_json_integer_exact<std::uint32_t>(*schema_it) != kGuiSettingsSchemaVersion) { throw std::runtime_error("unsupported GUI settings schema_version"); }
  return j;
 }
 }  // namespace
@@ -858,12 +837,10 @@ void apply_workflows(const nlohmann::json& j, GuiSettingsState& settings) {
   apply_workflow_section(predict, s.request, kPredictKey, predict_fields);
   if (const nlohmann::json* values = find_object(predict, kPredictKey)) { get_optional(*values, "live_split_count", s.live_split_count); }
  });
- apply_workflow(*workflows_json, &settings.workflows.annotate, "annotate", [](const nlohmann::json& annotate, AnnotateViewState& s) {
-  apply_source_workflow(annotate, s, ModelArtifactsShape{}, s, annotate_execution_fields, kAnnotateKey, annotate_fields);
- });
- apply_workflow(*workflows_json, &settings.workflows.export_state, "export", [](const nlohmann::json& export_json, ExportViewState& s) {
-  apply_section_workflow(export_json, s, export_model_artifacts_shape(), s, export_execution_fields, kExportKey, export_fields);
- });
+ apply_workflow(*workflows_json, &settings.workflows.annotate, "annotate",
+  [](const nlohmann::json& annotate, AnnotateViewState& s) { apply_source_workflow(annotate, s, ModelArtifactsShape{}, s, annotate_execution_fields, kAnnotateKey, annotate_fields); });
+ apply_workflow(*workflows_json, &settings.workflows.export_state, "export",
+  [](const nlohmann::json& export_json, ExportViewState& s) { apply_section_workflow(export_json, s, export_model_artifacts_shape(), s, export_execution_fields, kExportKey, export_fields); });
  apply_workflow(*workflows_json, &settings.workflows.explore, kExploreKey, [](const nlohmann::json& explore, ExploreViewState& s) { explore.get_to(s); });
 }
 nlohmann::json normalize_gui_settings_document(const nlohmann::json& j) { return normalize_gui_settings_document_impl(j); }
@@ -887,23 +864,20 @@ void apply_gui_settings(const nlohmann::json& j, GuiSettingsState& state) {
  GuiSettingsState candidate = state;
  if (normalized.contains("current_view")) {
   const int value = mmltk::frameworks::serialization::decode_json_integer_exact<int>(normalized.at("current_view"));
-  candidate.current_view =
-   value >= static_cast<int>(mmltk::controller::contracts::FeatureId::Train) && value <= static_cast<int>(mmltk::controller::contracts::FeatureId::Explore)
-    ? static_cast<mmltk::controller::contracts::FeatureId>(value)
-    : mmltk::controller::contracts::FeatureId::Train;
+  candidate.current_view = value >= static_cast<int>(mmltk::controller::contracts::FeatureId::Train) && value <= static_cast<int>(mmltk::controller::contracts::FeatureId::Explore)
+                            ? static_cast<mmltk::controller::contracts::FeatureId>(value)
+                            : mmltk::controller::contracts::FeatureId::Train;
  }
  if (normalized.contains("ui")) normalized.at("ui").get_to(candidate.ui);
  apply_workflows(normalized, candidate);
  candidate.workflows.predict.request.batch_size = 1U;
  const auto normalize_start_selection = [](auto& workflow) {
-  if (workflow.model_input == ModelArtifactInputKind::None && workflow.model_source == ModelSelectionSource::Canonical)
-   workflow.model_input = ModelArtifactInputKind::Weights;
+  if (workflow.model_input == ModelArtifactInputKind::None && workflow.model_source == ModelSelectionSource::Canonical) workflow.model_input = ModelArtifactInputKind::Weights;
  };
  normalize_start_selection(candidate.workflows.train);
  normalize_start_selection(candidate.workflows.validate);
  normalize_start_selection(candidate.workflows.predict);
- if (!gui_settings_valid(candidate) ||
-     !mmltk::backend::models::rfdetr::training_supervision_config_valid(candidate.workflows.train.request.training_supervision)) {
+ if (!gui_settings_valid(candidate) || !mmltk::backend::models::rfdetr::training_supervision_config_valid(candidate.workflows.train.request.training_supervision)) {
   throw std::runtime_error("GUI settings violate typed field or cross-field constraints");
  }
  if (candidate.workflows.train.auto_output) candidate.workflows.train.request.output_dir.clear();
@@ -952,8 +926,7 @@ bool load_gui_settings_file(const std::string& path, GuiSettingsState& state, nl
   repair_selection(candidate.workflows.export_state);
   if (candidate.workflows.train.use_compiled_directory_defaults) {
    const std::filesystem::path directory{candidate.workflows.train.compiled_dataset_dir};
-   const bool defaults_match = candidate.workflows.train.request.train_compiled_path == directory / "train.bin" &&
-                               candidate.workflows.train.request.val_compiled_path == directory / "val.bin";
+   const bool defaults_match = candidate.workflows.train.request.train_compiled_path == directory / "train.bin" && candidate.workflows.train.request.val_compiled_path == directory / "val.bin";
    if (!defaults_match) {
     candidate.workflows.train.use_compiled_directory_defaults = false;
     repaired = true;

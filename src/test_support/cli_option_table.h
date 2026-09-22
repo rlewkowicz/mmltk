@@ -41,9 +41,7 @@ private:
   const std::string_view text(value);
   int result{};
   const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), result);
-  if (error != std::errc{} || end != text.data() + text.size()) {
-   throw std::invalid_argument("invalid integer for " + std::string(option_name) + ": " + std::string(text));
-  }
+  if (error != std::errc{} || end != text.data() + text.size()) { throw std::invalid_argument("invalid integer for " + std::string(option_name) + ": " + std::string(text)); }
   return result;
  }
  struct Option {

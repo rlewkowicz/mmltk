@@ -52,8 +52,7 @@ TEST_CASE("Native image handoffs preserve both planes between every visible GPU 
     source->Publish(width, 5U, [width](const auto clean, const auto semantic, const auto stream) {
      for (const auto plane : {clean, semantic}) {
       const auto fill = static_cast<unsigned char>(width + (plane.descriptor.kind == ImagePlaneKind::Clean ? 17U : 83U));
-      REQUIRE(cuMemsetD2D8Async(plane.data, plane.descriptor.pitch_bytes, fill, plane.descriptor.row_bytes(), plane.descriptor.height,
-                                reinterpret_cast<CUstream>(stream)) == CUDA_SUCCESS);
+      REQUIRE(cuMemsetD2D8Async(plane.data, plane.descriptor.pitch_bytes, fill, plane.descriptor.row_bytes(), plane.descriptor.height, reinterpret_cast<CUstream>(stream)) == CUDA_SUCCESS);
      }
     });
     const auto paths = receiver.CopyFrom(source->Borrow());
@@ -225,8 +224,7 @@ TEST_CASE("multi-plane products copy atomically and reject self copy") {
 TEST_CASE("receiver-owned missing planes initialize before borrowed-source copies") {
  auto backend = std::make_shared<FakeImageBackend>();
  SystemImageRuntime source{{.device = 0, .backend = backend}};
- source.Publish(
-  8U, 4U, [](const auto clean, auto, auto) { std::memset(reinterpret_cast<void*>(clean.data), 0x37, clean.descriptor.pitch_bytes * clean.descriptor.height); });
+ source.Publish(8U, 4U, [](const auto clean, auto, auto) { std::memset(reinterpret_cast<void*>(clean.data), 0x37, clean.descriptor.pitch_bytes * clean.descriptor.height); });
  SystemImageRuntime receiver{{.device = 0, .backend = backend, .input_layout = ImageProductLayout::CleanAndSemantic}};
  CHECK_THROWS_AS(receiver.CopyInputFrom(source.Borrow()), std::invalid_argument);
  const auto before = backend->same_copies.load();
@@ -302,8 +300,7 @@ TEST_CASE("scalar receiver copies settle an enqueued read before event-record fa
  DeviceContext context{0, backend};
  ImageStream stream{context};
  ImageBuffer source{context}, receiver{context};
- source.Write(stream, ImagePlaneKind::Clean, 8U, 8U,
-              [](auto clean, auto) { std::memset(reinterpret_cast<void*>(clean.data), 17, clean.descriptor.pitch_bytes * clean.descriptor.height); });
+ source.Write(stream, ImagePlaneKind::Clean, 8U, 8U, [](auto clean, auto) { std::memset(reinterpret_cast<void*>(clean.data), 17, clean.descriptor.pitch_bytes * clean.descriptor.height); });
  const auto settled = backend->synchronized.load();
  backend->FailAfter(FakeImageBackend::FailurePoint::RecordEvent);
  CHECK_THROWS_WITH(receiver.CopyFrom(stream, source.Borrow()), "injected image backend failure");
@@ -350,8 +347,7 @@ TEST_CASE("external image readers await a delayed producer while retaining its e
 TEST_CASE("terminal product custody retains pixels without blocking source shutdown or later writers") {
  auto backend = std::make_shared<FakeImageBackend>();
  auto source = std::make_unique<SystemImageRuntime>(SystemImageRuntimeConfig{.device = 0, .backend = backend});
- source->Publish(8U, 8U,
-                 [](auto clean, auto, auto) { std::memset(reinterpret_cast<void*>(clean.data), 73, clean.descriptor.pitch_bytes * clean.descriptor.height); });
+ source->Publish(8U, 8U, [](auto clean, auto, auto) { std::memset(reinterpret_cast<void*>(clean.data), 73, clean.descriptor.pitch_bytes * clean.descriptor.height); });
  auto borrowed = source->Borrow();
  const auto data = borrowed.plane(0U).plane().data;
  borrowed.Quarantine();
@@ -370,8 +366,7 @@ TEST_CASE("terminal product custody retains pixels without blocking source shutd
 TEST_CASE("receiver completion releases product access across threads but retains physical storage") {
  using namespace std::chrono_literals;
  auto backend = std::make_shared<FakeImageBackend>();
- auto source = std::make_unique<SystemImageRuntime>(
-  SystemImageRuntimeConfig{.device = 0, .backend = backend, .output_layout = ImageProductLayout::CleanAndSemantic, .output_buffer_count = 1U});
+ auto source = std::make_unique<SystemImageRuntime>(SystemImageRuntimeConfig{.device = 0, .backend = backend, .output_layout = ImageProductLayout::CleanAndSemantic, .output_buffer_count = 1U});
  source->Publish(8U, 8U, [](auto, auto, auto) {});
  std::atomic<unsigned> available{0U};
  source->SetOutputAvailableSink([&] { available.fetch_add(1U); });
@@ -442,8 +437,7 @@ TEST_CASE("a quarantined scalar read retains its allocation after source destruc
  DeviceContext context{0, backend};
  ImageStream stream{context};
  auto source = std::make_unique<ImageBuffer>(context);
- source->Write(stream, ImagePlaneKind::Clean, 8U, 8U,
-               [](auto clean, auto) { std::memset(reinterpret_cast<void*>(clean.data), 29, clean.descriptor.pitch_bytes * clean.descriptor.height); });
+ source->Write(stream, ImagePlaneKind::Clean, 8U, 8U, [](auto clean, auto) { std::memset(reinterpret_cast<void*>(clean.data), 29, clean.descriptor.pitch_bytes * clean.descriptor.height); });
  auto borrowed = source->Borrow();
  const auto data = borrowed.plane().data;
  borrowed.Quarantine();
@@ -477,8 +471,7 @@ TEST_CASE("receiver retains a product lease through deferred source completion")
 TEST_CASE("admitted image copies preserve readers and refuse full capacity without waiting", "[gpu][image]") {
  auto backend = std::make_shared<FakeImageBackend>();
  SystemImageRuntime source{{.device = 0, .backend = backend}};
- source.Publish(4U, 4U,
-                [](auto clean, auto, auto) { std::memset(reinterpret_cast<void*>(clean.data), 0x37, clean.descriptor.pitch_bytes * clean.descriptor.height); });
+ source.Publish(4U, 4U, [](auto clean, auto, auto) { std::memset(reinterpret_cast<void*>(clean.data), 0x37, clean.descriptor.pitch_bytes * clean.descriptor.height); });
  SystemImageRuntime receiver{{.device = 0, .backend = backend, .output_buffer_count = 2U}};
  SystemImageRuntime::CompletedOutput baseline;
  auto first = receiver.TryAcquireOutput(baseline);

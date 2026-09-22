@@ -59,8 +59,7 @@ void initialize_embedding(torch::nn::Embedding& embedding, const std::uint64_t s
  embedding->weight.normal_(0.0, 1.0, generator);
 }
 torch::Tensor scalar_edge(const torch::Tensor& tensor) { return tensor.reshape({-1}).narrow(0, 0, 1).sum() * 0.0F; }
-void require_denoising_variates(const DenoisingVariates& variates, const std::vector<int64_t>& slot_shape, const torch::Device& device,
-                                const int64_t object_classes) {
+void require_denoising_variates(const DenoisingVariates& variates, const std::vector<int64_t>& slot_shape, const torch::Device& device, const int64_t object_classes) {
  const std::vector<int64_t> coordinate_shape{slot_shape[0], slot_shape[1], slot_shape[2], 2};
  const auto require = [&](const torch::Tensor& tensor, const std::vector<int64_t>& expected, const c10::ScalarType dtype, const char* name) {
   if (!tensor.defined() || tensor.sizes().vec() != expected || tensor.device() != device || tensor.scalar_type() != dtype) {
@@ -82,8 +81,7 @@ struct TrainingSupervisionImpl::PaddedTargets {
 };
 struct TrainingSupervisionImpl::DenoisingScratch {
  void ensure(const torch::Device& requested_device, const int64_t batch, const int64_t maximum_count) {
-  static_cast<void>(
-   mmltk::common::math::checked_multiply(static_cast<std::uint64_t>(batch), static_cast<std::uint64_t>(maximum_count), "RF-DETR DN padding extent overflow"));
+  static_cast<void>(mmltk::common::math::checked_multiply(static_cast<std::uint64_t>(batch), static_cast<std::uint64_t>(maximum_count), "RF-DETR DN padding extent overflow"));
   if (!device || *device != requested_device) {
    device = requested_device;
    batch_capacity = 0;
@@ -136,14 +134,11 @@ struct TrainingSupervisionImpl::TimingState {
   Stage stage = Stage::GroundTruthProjection;
   LeaseState state = LeaseState::Free;
  };
- TimingState(const c10::DeviceIndex device, const std::size_t loss_capacity, const std::size_t lease_capacity)
-     : device_id(device), maximum_accumulated_losses(loss_capacity), slots(lease_capacity) {
+ TimingState(const c10::DeviceIndex device, const std::size_t loss_capacity, const std::size_t lease_capacity) : device_id(device), maximum_accumulated_losses(loss_capacity), slots(lease_capacity) {
   c10::cuda::CUDAGuard guard(static_cast<c10::DeviceIndex>(device_id));
   try {
    for (auto& slot : slots) {
-    if (cudaEventCreate(&slot.start) != cudaSuccess || cudaEventCreate(&slot.stop) != cudaSuccess) {
-     throw std::runtime_error("failed to create RF-DETR supervision timing events");
-    }
+    if (cudaEventCreate(&slot.start) != cudaSuccess || cudaEventCreate(&slot.stop) != cudaSuccess) { throw std::runtime_error("failed to create RF-DETR supervision timing events"); }
    }
   } catch (...) {
    release_events();
@@ -164,9 +159,7 @@ private:
  }
 
 public:
- [[nodiscard]] bool matches(const c10::DeviceIndex device, const std::size_t loss_capacity) const noexcept {
-  return device_id == device && maximum_accumulated_losses == loss_capacity;
- }
+ [[nodiscard]] bool matches(const c10::DeviceIndex device, const std::size_t loss_capacity) const noexcept { return device_id == device && maximum_accumulated_losses == loss_capacity; }
  [[nodiscard]] std::size_t outstanding() const noexcept { return slots.size() - free_count; }
  Slot& begin(const Stage stage) {
   c10::cuda::CUDAGuard guard(static_cast<c10::DeviceIndex>(device_id));
@@ -282,13 +275,11 @@ public:
  torch::nn::Linear linear1{nullptr};
  torch::nn::Linear linear2{nullptr};
 };
-TrainingSupervisionImpl::TrainingSupervisionImpl(const NativeRfDetrConfig& config, const std::int64_t foreground_count)
-    : config_(config), foreground_count_(foreground_count) {
+TrainingSupervisionImpl::TrainingSupervisionImpl(const NativeRfDetrConfig& config, const std::int64_t foreground_count) : config_(config), foreground_count_(foreground_count) {
  if (!training_supervision_enabled(config.training_supervision)) { throw std::runtime_error("inactive RF-DETR training supervision must not be constructed"); }
  if (!training_supervision_model_config_valid(config)) { throw std::runtime_error("invalid RF-DETR training supervision model configuration"); }
- if (config.training_supervision.denoising.enabled &&
-     !training_supervision_query_layout_valid(config.training_supervision, static_cast<std::size_t>(config.num_queries),
-                                              static_cast<std::size_t>(config.group_detr), static_cast<std::size_t>(config.num_queries))) {
+ if (config.training_supervision.denoising.enabled && !training_supervision_query_layout_valid(config.training_supervision, static_cast<std::size_t>(config.num_queries),
+                                                       static_cast<std::size_t>(config.group_detr), static_cast<std::size_t>(config.num_queries))) {
   throw std::runtime_error("RF-DETR worst-case DN query layout exceeds allocation capacity");
  }
  if (config.training_supervision.assignment == TrainAssignmentKind::MatchFree) {
@@ -296,8 +287,7 @@ TrainingSupervisionImpl::TrainingSupervisionImpl(const NativeRfDetrConfig& confi
   if (object_classes < 1) { throw std::runtime_error("Match-Free requires at least one real object class and one reserved channel"); }
   // The source paper specifies independent hidden-width MLPs but leaves
   // their depth and activation open; RF-DETR completes them as two-layer ReLU MLPs.
-  ground_truth_mlp_ =
-   register_module(std::string(detail::kMatchFreeClassAxis.module_name()), std::make_shared<ProbeMlpImpl>(object_classes + 4, config.hidden_dim));
+  ground_truth_mlp_ = register_module(std::string(detail::kMatchFreeClassAxis.module_name()), std::make_shared<ProbeMlpImpl>(object_classes + 4, config.hidden_dim));
   query_mlp_ = register_module("query_mlp", std::make_shared<ProbeMlpImpl>(config.hidden_dim, config.hidden_dim));
   query_projection_ = register_module("query_projection", torch::nn::Linear(torch::nn::LinearOptions(config.hidden_dim, config.hidden_dim).bias(false)));
   key_projection_ = register_module("key_projection", torch::nn::Linear(torch::nn::LinearOptions(config.hidden_dim, config.hidden_dim).bias(false)));
@@ -323,19 +313,15 @@ void TrainingSupervisionImpl::append_class_axes(std::vector<detail::ClassTensorA
  append(ground_truth_mlp_, detail::kMatchFreeClassAxis);
 }
 TrainingSupervisionImpl::~TrainingSupervisionImpl() = default;
-TrainingSupervisionImpl::PaddedTargets TrainingSupervisionImpl::pad_targets(const PreparedTargets& targets, const torch::Device& device, const int64_t batch,
-                                                                            const bool reuse_construction_scratch) {
+TrainingSupervisionImpl::PaddedTargets TrainingSupervisionImpl::pad_targets(const PreparedTargets& targets, const torch::Device& device, const int64_t batch, const bool reuse_construction_scratch) {
  if (static_cast<int64_t>(targets.counts.size()) != batch || static_cast<int64_t>(targets.offsets.size()) != batch) {
   throw std::runtime_error("RF-DETR supervision target metadata must align with the output batch");
  }
  const int64_t maximum_count = targets.counts.empty() ? 0 : *std::max_element(targets.counts.begin(), targets.counts.end());
  if (maximum_count == 0) { return {{}, {}, {}, {}, 0}; }
- if (targets.all_labels.device() != device || targets.all_boxes.device() != device) {
-  throw std::runtime_error("RF-DETR supervision targets must already reside on the prediction device");
- }
+ if (targets.all_labels.device() != device || targets.all_boxes.device() != device) { throw std::runtime_error("RF-DETR supervision targets must already reside on the prediction device"); }
  if (targets.all_labels.size(0) == 0) { throw std::runtime_error("RF-DETR nonempty target metadata requires target tensors"); }
- if (device.is_cuda() && (!targets.target_counts.defined() || targets.target_counts.device() != device || !targets.target_offsets.defined() ||
-                          targets.target_offsets.device() != device)) {
+ if (device.is_cuda() && (!targets.target_counts.defined() || targets.target_counts.device() != device || !targets.target_offsets.defined() || targets.target_offsets.device() != device)) {
   throw std::runtime_error("RF-DETR supervision CUDA metadata must already reside on the prediction device");
  }
  const auto integer_options = torch::TensorOptions().dtype(torch::kInt64).device(device);
@@ -346,8 +332,7 @@ TrainingSupervisionImpl::PaddedTargets TrainingSupervisionImpl::pad_targets(cons
   if (!denoising_scratch_) { throw std::runtime_error("RF-DETR DN construction scratch is unavailable"); }
   denoising_scratch_->ensure(device, batch, maximum_count);
   positions = denoising_scratch_->slot_positions(maximum_count).view({1, maximum_count});
-  if (targets.target_counts.defined() && targets.target_counts.device() == device && targets.target_offsets.defined() &&
-      targets.target_offsets.device() == device) {
+  if (targets.target_counts.defined() && targets.target_counts.device() == device && targets.target_offsets.defined() && targets.target_offsets.device() == device) {
    counts = targets.target_counts.to(torch::kInt64);
    offsets = targets.target_offsets.to(torch::kInt64);
   } else {
@@ -362,10 +347,8 @@ TrainingSupervisionImpl::PaddedTargets TrainingSupervisionImpl::pad_targets(cons
   }
  } else {
   positions = torch::arange(maximum_count, integer_options).view({1, maximum_count});
-  counts = targets.target_counts.defined() && targets.target_counts.device() == device ? targets.target_counts.to(torch::kInt64)
-                                                                                       : torch::tensor(targets.counts, integer_options);
-  offsets = targets.target_offsets.defined() && targets.target_offsets.device() == device ? targets.target_offsets.to(torch::kInt64)
-                                                                                          : torch::tensor(targets.offsets, integer_options);
+  counts = targets.target_counts.defined() && targets.target_counts.device() == device ? targets.target_counts.to(torch::kInt64) : torch::tensor(targets.counts, integer_options);
+  offsets = targets.target_offsets.defined() && targets.target_offsets.device() == device ? targets.target_offsets.to(torch::kInt64) : torch::tensor(targets.offsets, integer_options);
  }
  // Every value below is fresh per invocation. Returned topology can remain
  // graph-reachable while the owner grows or reuses only the source buffers.
@@ -390,10 +373,9 @@ torch::Tensor sparse_match_free_correspondence(const torch::Tensor& dense, const
  const auto sparse = torch::where(selected, dense, torch::zeros_like(dense));
  return sparse / (sparse.sum(-1, true) + kSparseCorrespondenceEpsilon);
 }
-DenoisingTransform transform_denoising_targets(const torch::Tensor& original_labels, const torch::Tensor& original_boxes, const torch::Tensor& valid_slots,
-                                               const int64_t object_classes, const DenoisingSupervisionConfig& config, const DenoisingVariates& variates) {
- if (original_labels.dim() != 3 ||
-     original_boxes.sizes().vec() != std::vector<int64_t>{original_labels.size(0), original_labels.size(1), original_labels.size(2), 4} ||
+DenoisingTransform transform_denoising_targets(const torch::Tensor& original_labels, const torch::Tensor& original_boxes, const torch::Tensor& valid_slots, const int64_t object_classes,
+ const DenoisingSupervisionConfig& config, const DenoisingVariates& variates) {
+ if (original_labels.dim() != 3 || original_boxes.sizes().vec() != std::vector<int64_t>{original_labels.size(0), original_labels.size(1), original_labels.size(2), 4} ||
      valid_slots.sizes() != original_labels.sizes() || object_classes < 1) {
   throw std::runtime_error("DN transform inputs do not share a valid target layout");
  }
@@ -415,10 +397,8 @@ DenoisingTransform transform_denoising_targets(const torch::Tensor& original_lab
  }
  return {noised_labels, noised_boxes, center_offset, extent_scale};
 }
-torch::Tensor isolated_group_self_attention(torch::nn::MultiheadAttention& attention, const torch::Tensor& target, const torch::Tensor& query_position,
-                                            const DecoderQueryLayout& layout) {
- if (target.dim() != 3 || query_position.sizes() != target.sizes() || target.size(1) != layout.total_queries() || layout.ordinary.groups <= 0 ||
-     layout.ordinary.queries_per_group <= 0) {
+torch::Tensor isolated_group_self_attention(torch::nn::MultiheadAttention& attention, const torch::Tensor& target, const torch::Tensor& query_position, const DecoderQueryLayout& layout) {
+ if (target.dim() != 3 || query_position.sizes() != target.sizes() || target.size(1) != layout.total_queries() || layout.ordinary.groups <= 0 || layout.ordinary.queries_per_group <= 0) {
   throw std::runtime_error("decoder query tensors do not match their typed group layout");
  }
  const int64_t batch = target.size(0);
@@ -431,34 +411,26 @@ torch::Tensor isolated_group_self_attention(torch::nn::MultiheadAttention& atten
  // those blocks without a quadratic all-query mask.
  const auto ordinary_target = target.narrow(1, 0, ordinary_count).view({batch, layout.ordinary.groups, layout.ordinary.queries_per_group, width});
  const auto ordinary_position = query_position.narrow(1, 0, ordinary_count).view({batch, layout.ordinary.groups, layout.ordinary.queries_per_group, width});
- const auto ordinary_q =
-  (ordinary_target + ordinary_position).permute({2, 0, 1, 3}).reshape({layout.ordinary.queries_per_group, batch * layout.ordinary.groups, width});
+ const auto ordinary_q = (ordinary_target + ordinary_position).permute({2, 0, 1, 3}).reshape({layout.ordinary.queries_per_group, batch * layout.ordinary.groups, width});
  const auto ordinary_v = ordinary_target.permute({2, 0, 1, 3}).reshape({layout.ordinary.queries_per_group, batch * layout.ordinary.groups, width});
  auto ordinary_output = std::get<0>(attention->forward(ordinary_q, ordinary_q, ordinary_v, {}, false));
- ordinary_output =
-  ordinary_output.view({layout.ordinary.queries_per_group, batch, layout.ordinary.groups, width}).permute({1, 2, 0, 3}).reshape({batch, ordinary_count, width});
+ ordinary_output = ordinary_output.view({layout.ordinary.queries_per_group, batch, layout.ordinary.groups, width}).permute({1, 2, 0, 3}).reshape({batch, ordinary_count, width});
  if (!layout.has_denoising()) { return ordinary_output; }
  const std::vector<int64_t> expected_padding{batch, layout.denoising_groups, layout.denoising_queries_per_group};
- if (!layout.denoising_key_padding.defined() || layout.denoising_key_padding.sizes().vec() != expected_padding ||
-     layout.denoising_key_padding.scalar_type() != torch::kBool || layout.denoising_key_padding.device() != target.device() ||
-     !layout.denoising_valid_slots.defined() || layout.denoising_valid_slots.sizes().vec() != expected_padding ||
+ if (!layout.denoising_key_padding.defined() || layout.denoising_key_padding.sizes().vec() != expected_padding || layout.denoising_key_padding.scalar_type() != torch::kBool ||
+     layout.denoising_key_padding.device() != target.device() || !layout.denoising_valid_slots.defined() || layout.denoising_valid_slots.sizes().vec() != expected_padding ||
      layout.denoising_valid_slots.scalar_type() != torch::kBool || layout.denoising_valid_slots.device() != target.device()) {
   throw std::runtime_error("DN key padding does not match its typed group layout");
  }
- auto denoising_target =
-  target.narrow(1, ordinary_count, layout.denoising_queries()).view({batch, layout.denoising_groups, layout.denoising_queries_per_group, width});
- auto denoising_position =
-  query_position.narrow(1, ordinary_count, layout.denoising_queries()).view({batch, layout.denoising_groups, layout.denoising_queries_per_group, width});
+ auto denoising_target = target.narrow(1, ordinary_count, layout.denoising_queries()).view({batch, layout.denoising_groups, layout.denoising_queries_per_group, width});
+ auto denoising_position = query_position.narrow(1, ordinary_count, layout.denoising_queries()).view({batch, layout.denoising_groups, layout.denoising_queries_per_group, width});
  denoising_target = torch::where(layout.denoising_valid_slots.unsqueeze(-1), denoising_target, torch::zeros_like(denoising_target));
  denoising_position = torch::where(layout.denoising_valid_slots.unsqueeze(-1), denoising_position, torch::zeros_like(denoising_position));
- const auto denoising_q =
-  (denoising_target + denoising_position).permute({2, 0, 1, 3}).reshape({layout.denoising_queries_per_group, batch * layout.denoising_groups, width});
+ const auto denoising_q = (denoising_target + denoising_position).permute({2, 0, 1, 3}).reshape({layout.denoising_queries_per_group, batch * layout.denoising_groups, width});
  const auto denoising_v = denoising_target.permute({2, 0, 1, 3}).reshape({layout.denoising_queries_per_group, batch * layout.denoising_groups, width});
  const auto key_padding = layout.denoising_key_padding.reshape({batch * layout.denoising_groups, layout.denoising_queries_per_group});
  auto denoising_output = std::get<0>(attention->forward(denoising_q, denoising_q, denoising_v, key_padding, false));
- denoising_output = denoising_output.view({layout.denoising_queries_per_group, batch, layout.denoising_groups, width})
-                     .permute({1, 2, 0, 3})
-                     .reshape({batch, layout.denoising_queries(), width});
+ denoising_output = denoising_output.view({layout.denoising_queries_per_group, batch, layout.denoising_groups, width}).permute({1, 2, 0, 3}).reshape({batch, layout.denoising_queries(), width});
  return torch::cat({ordinary_output, denoising_output}, 1);
 }
 void TrainingSupervisionImpl::initialize(const std::uint64_t request_seed) {
@@ -486,9 +458,8 @@ void TrainingSupervisionImpl::install_replicated_initialized_runtime(const Train
 bool TrainingSupervisionImpl::initialized() const noexcept { return initialized_; }
 bool TrainingSupervisionImpl::match_free_enabled() const noexcept { return config_.training_supervision.assignment == TrainAssignmentKind::MatchFree; }
 bool TrainingSupervisionImpl::denoising_enabled() const noexcept { return config_.training_supervision.denoising.enabled; }
-std::optional<DenoisingQueryBatch> TrainingSupervisionImpl::prepare_denoising(const PreparedTargets& targets, const TrainingStepIdentity& identity,
-                                                                              const torch::Device& device, const c10::ScalarType decoder_dtype,
-                                                                              const DenoisingVariates* injected_variates) {
+std::optional<DenoisingQueryBatch> TrainingSupervisionImpl::prepare_denoising(
+ const PreparedTargets& targets, const TrainingStepIdentity& identity, const torch::Device& device, const c10::ScalarType decoder_dtype, const DenoisingVariates* injected_variates) {
  if (!denoising_enabled() || !initialized_) {
   if (denoising_enabled()) { throw std::runtime_error("DN preparation was used before one-shot initialization"); }
   return std::nullopt;
@@ -498,24 +469,19 @@ std::optional<DenoisingQueryBatch> TrainingSupervisionImpl::prepare_denoising(co
  }
  const int64_t batch = static_cast<int64_t>(targets.counts.size());
  if (batch <= 0) { throw std::runtime_error("DN preparation requires nonempty batch metadata"); }
- if (static_cast<int64_t>(targets.offsets.size()) != batch) {
-  throw std::runtime_error("RF-DETR supervision target metadata must align with the output batch");
- }
+ if (static_cast<int64_t>(targets.offsets.size()) != batch) { throw std::runtime_error("RF-DETR supervision target metadata must align with the output batch"); }
  const int64_t maximum_count = *std::max_element(targets.counts.begin(), targets.counts.end());
  if (maximum_count == 0) { return std::nullopt; }
  if (maximum_count < 0) { throw std::runtime_error("DN target counts must be nonnegative"); }
  const int64_t groups = config_.training_supervision.denoising.groups;
- const auto dn_queries =
-  mmltk::common::math::checked_multiply(static_cast<std::uint64_t>(groups), static_cast<std::uint64_t>(maximum_count), "RF-DETR DN query count overflow");
+ const auto dn_queries = mmltk::common::math::checked_multiply(static_cast<std::uint64_t>(groups), static_cast<std::uint64_t>(maximum_count), "RF-DETR DN query count overflow");
  const auto dn_slots = mmltk::common::math::checked_multiply(static_cast<std::uint64_t>(batch), dn_queries, "RF-DETR DN batch query count overflow");
  static_cast<void>(mmltk::common::math::checked_multiply(dn_slots, static_cast<std::uint64_t>(config_.hidden_dim), "RF-DETR DN content extent overflow"));
  static_cast<void>(mmltk::common::math::checked_multiply(dn_slots, 4U, "RF-DETR DN box extent overflow"));
- const auto ordinary_queries = mmltk::common::math::checked_multiply(
-  static_cast<std::uint64_t>(config_.num_queries), static_cast<std::uint64_t>(std::max(1, config_.group_detr)), "RF-DETR ordinary query count overflow");
+ const auto ordinary_queries =
+  mmltk::common::math::checked_multiply(static_cast<std::uint64_t>(config_.num_queries), static_cast<std::uint64_t>(std::max(1, config_.group_detr)), "RF-DETR ordinary query count overflow");
  static_cast<void>(mmltk::common::math::checked_add(ordinary_queries, dn_queries, "RF-DETR total decoder query count overflow"));
- if (dn_queries > static_cast<std::uint64_t>(std::numeric_limits<int64_t>::max())) {
-  throw std::runtime_error("RF-DETR DN query count exceeds tensor indexing capacity");
- }
+ if (dn_queries > static_cast<std::uint64_t>(std::numeric_limits<int64_t>::max())) { throw std::runtime_error("RF-DETR DN query count exceeds tensor indexing capacity"); }
  auto operation = [&]() -> DenoisingQueryBatch {
   mmltk::backend::ml::cuda::TorchAutocastScope fp32_scope(false, torch::kFloat32);
   const auto padded = pad_targets(targets, device, batch, true);
@@ -525,8 +491,7 @@ std::optional<DenoisingQueryBatch> TrainingSupervisionImpl::prepare_denoising(co
   const auto integer_options = torch::TensorOptions().dtype(torch::kInt64).device(device);
   if (!denoising_generator_ || denoising_generator_->device() != device) {
    denoising_generator_ =
-    device.is_cuda() ? at::cuda::detail::createCUDAGenerator(static_cast<c10::DeviceIndex>(device.has_index() ? device.index() : c10::cuda::current_device()))
-                     : at::detail::createCPUGenerator();
+    device.is_cuda() ? at::cuda::detail::createCUDAGenerator(static_cast<c10::DeviceIndex>(device.has_index() ? device.index() : c10::cuda::current_device())) : at::detail::createCPUGenerator();
   }
   denoising_generator_->set_current_seed(denoising_step_seed(identity));
   DenoisingVariates generated;
@@ -548,11 +513,8 @@ std::optional<DenoisingQueryBatch> TrainingSupervisionImpl::prepare_denoising(co
   // RF-DETR keeps pretrained ordinary query width and semantics intact.
   // The additive task embedding is the dimension-preserving adaptation
   // of DN-DETR's appended indicator; it exists only on valid DN slots.
-  const auto content_fp32 =
-   denoising_label_embedding_->forward(transformed.labels) + denoising_task_embedding_->weight.index({0}).view({1, 1, 1, config_.hidden_dim});
-  const auto content = torch::where(valid.unsqueeze(-1), content_fp32, torch::zeros_like(content_fp32))
-                        .reshape({batch, static_cast<int64_t>(dn_queries), config_.hidden_dim})
-                        .to(decoder_dtype);
+  const auto content_fp32 = denoising_label_embedding_->forward(transformed.labels) + denoising_task_embedding_->weight.index({0}).view({1, 1, 1, config_.hidden_dim});
+  const auto content = torch::where(valid.unsqueeze(-1), content_fp32, torch::zeros_like(content_fp32)).reshape({batch, static_cast<int64_t>(dn_queries), config_.hidden_dim}).to(decoder_dtype);
   const auto inert_box = torch::tensor({0.5F, 0.5F, 0.25F, 0.25F}, float_options).view({1, 1, 1, 4});
   transformed.boxes = torch::where(valid.unsqueeze(-1), transformed.boxes, inert_box);
   auto key_padding = ~valid;
@@ -568,7 +530,13 @@ std::optional<DenoisingQueryBatch> TrainingSupervisionImpl::prepare_denoising(co
   layout.denoising_key_padding = key_padding;
   layout.denoising_valid_slots = valid;
   return {
-   content, transformed.boxes.reshape({batch, static_cast<int64_t>(dn_queries), 4}), labels, boxes, valid, target_indices, std::move(layout),
+   content,
+   transformed.boxes.reshape({batch, static_cast<int64_t>(dn_queries), 4}),
+   labels,
+   boxes,
+   valid,
+   target_indices,
+   std::move(layout),
   };
  };
  if (!timing_) { return operation(); }
@@ -583,22 +551,18 @@ void TrainingSupervisionImpl::configure_timing(const SupervisionTimingSetup& set
  }
  if (!setup.device.is_cuda()) { throw std::runtime_error("RF-DETR supervision GPU timing requires a CUDA device"); }
  if (setup.maximum_accumulated_losses == 0) { throw std::runtime_error("RF-DETR supervision timing requires a positive accumulation-wave capacity"); }
- const std::uint64_t supervised_layers = config_.aux_loss
-                                          ? mmltk::common::math::checked_add(static_cast<std::uint64_t>(config_.dec_layers), config_.two_stage ? 1U : 0U,
-                                                                             "RF-DETR supervision timing layer capacity overflow")
-                                          : 1U;
+ const std::uint64_t supervised_layers =
+  config_.aux_loss ? mmltk::common::math::checked_add(static_cast<std::uint64_t>(config_.dec_layers), config_.two_stage ? 1U : 0U, "RF-DETR supervision timing layer capacity overflow") : 1U;
  std::uint64_t scopes_per_loss = 2U;
  if (match_free_enabled()) {
-  scopes_per_loss = mmltk::common::math::checked_add(
-   scopes_per_loss,
-   mmltk::common::math::checked_add(
-    std::uint64_t{1}, mmltk::common::math::checked_multiply(std::uint64_t{4}, supervised_layers, "RF-DETR supervision timing scope capacity overflow"),
+  scopes_per_loss = mmltk::common::math::checked_add(scopes_per_loss,
+   mmltk::common::math::checked_add(std::uint64_t{1}, mmltk::common::math::checked_multiply(std::uint64_t{4}, supervised_layers, "RF-DETR supervision timing scope capacity overflow"),
     "RF-DETR supervision timing scope capacity overflow"),
    "RF-DETR supervision timing scope capacity overflow");
  }
  if (denoising_enabled()) { scopes_per_loss = mmltk::common::math::checked_add(scopes_per_loss, 3U, "RF-DETR supervision timing scope capacity overflow"); }
- const std::uint64_t lease_capacity = mmltk::common::math::checked_multiply(static_cast<std::uint64_t>(setup.maximum_accumulated_losses), scopes_per_loss,
-                                                                            "RF-DETR supervision timing accumulation capacity overflow");
+ const std::uint64_t lease_capacity =
+  mmltk::common::math::checked_multiply(static_cast<std::uint64_t>(setup.maximum_accumulated_losses), scopes_per_loss, "RF-DETR supervision timing accumulation capacity overflow");
  if (lease_capacity > std::numeric_limits<std::size_t>::max()) { throw std::runtime_error("RF-DETR supervision timing capacity exceeds the host size limit"); }
  const c10::DeviceIndex device_id = setup.device.has_index() ? setup.device.index() : c10::cuda::current_device();
  if (timing_ && timing_->matches(device_id, setup.maximum_accumulated_losses)) { return; }
@@ -612,16 +576,15 @@ torch::Tensor TrainingSupervisionImpl::dense_correspondence(const torch::Tensor&
  const auto keys = key_projection_->forward(query_mlp_->forward(query_features.to(torch::kFloat32)));
  return torch::softmax(torch::einsum("bmd,bgnd->bgmn", {probes, keys}) / std::sqrt(static_cast<double>(config_.hidden_dim)), -1);
 }
-MatchFreeCorrespondence TrainingSupervisionImpl::correspondence(const torch::Tensor& padded_labels, const torch::Tensor& padded_boxes,
-                                                                const torch::Tensor& valid_rows, const torch::Tensor& query_features) {
+MatchFreeCorrespondence TrainingSupervisionImpl::correspondence(
+ const torch::Tensor& padded_labels, const torch::Tensor& padded_boxes, const torch::Tensor& valid_rows, const torch::Tensor& query_features) {
  if (!initialized_) { throw std::runtime_error("Match-Free supervision was used before one-shot initialization"); }
  mmltk::backend::ml::cuda::TorchAutocastScope fp32_scope(false, torch::kFloat32);
  const auto probes = project_ground_truth(padded_labels, padded_boxes);
  const auto dense = dense_correspondence(probes, query_features);
  return {dense, sparse_match_free_correspondence(dense, valid_rows, config_.training_supervision.match_free.rho)};
 }
-MatchFreeCost TrainingSupervisionImpl::broadcast_cost(const torch::Tensor& padded_labels, const torch::Tensor& padded_boxes, const torch::Tensor& valid_rows,
-                                                      const OutputLayer& layer) const {
+MatchFreeCost TrainingSupervisionImpl::broadcast_cost(const torch::Tensor& padded_labels, const torch::Tensor& padded_boxes, const torch::Tensor& valid_rows, const OutputLayer& layer) const {
  if (!layer.query_layout) { throw std::runtime_error("Match-Free output layer is missing its typed query layout"); }
  mmltk::backend::ml::cuda::TorchAutocastScope fp32_scope(false, torch::kFloat32);
  const auto layout = *layer.query_layout;
@@ -640,8 +603,7 @@ MatchFreeCost TrainingSupervisionImpl::broadcast_cost(const torch::Tensor& padde
  const auto correction = (positive - negative).gather(-1, label_index).permute({0, 1, 3, 2});
  auto classification = negative_sum + correction;
  auto box = (boxes.unsqueeze(-3) - padded_boxes.unsqueeze(1).unsqueeze(-2)).abs().sum(-1);
- auto giou = 1.0F - batched_pairwise_generalized_box_iou(
-                     box_cxcywh_to_xyxy(padded_boxes.unsqueeze(1).expand({batch, layout.groups, padded_boxes.size(1), 4}), BoxExtentPolicy::Preserve),
+ auto giou = 1.0F - batched_pairwise_generalized_box_iou(box_cxcywh_to_xyxy(padded_boxes.unsqueeze(1).expand({batch, layout.groups, padded_boxes.size(1), 4}), BoxExtentPolicy::Preserve),
                      box_cxcywh_to_xyxy(boxes, BoxExtentPolicy::Preserve));
  const auto valid = valid_rows.unsqueeze(1).unsqueeze(-1);
  classification = torch::where(valid, classification, torch::zeros_like(classification));
@@ -658,19 +620,15 @@ TrainingLoss TrainingSupervisionImpl::empty_loss(const ModelOutputs& outputs) co
   torch::Tensor layer_zero;
   if (layer.query_layout) {
    const auto layout = *layer.query_layout;
-   layer_zero =
-    layer.pred_logits.view({layer.pred_logits.size(0), layout.groups, layout.queries_per_group, layer.pred_logits.size(-1)}).index({0, Slice(), 0, 0}).sum() *
-    0.0F;
-   layer_zero =
-    layer_zero + layer.pred_boxes.view({layer.pred_boxes.size(0), layout.groups, layout.queries_per_group, 4}).index({0, Slice(), 0, 0}).sum() * 0.0F;
+   layer_zero = layer.pred_logits.view({layer.pred_logits.size(0), layout.groups, layout.queries_per_group, layer.pred_logits.size(-1)}).index({0, Slice(), 0, 0}).sum() * 0.0F;
+   layer_zero = layer_zero + layer.pred_boxes.view({layer.pred_boxes.size(0), layout.groups, layout.queries_per_group, 4}).index({0, Slice(), 0, 0}).sum() * 0.0F;
   } else {
    layer_zero = scalar_edge(layer.pred_logits) + scalar_edge(layer.pred_boxes);
   }
   if (layer.query_features) { layer_zero = layer_zero + layer.query_features->index({0, Slice(), 0, 0}).sum() * 0.0F; }
   if (layer.pred_masks) { layer_zero = layer_zero + scalar_edge(*layer.pred_masks); }
   if (layer.sparse_pred_masks) {
-   layer_zero = layer_zero + scalar_edge(layer.sparse_pred_masks->spatial_features) + scalar_edge(layer.sparse_pred_masks->query_features) +
-                scalar_edge(layer.sparse_pred_masks->bias);
+   layer_zero = layer_zero + scalar_edge(layer.sparse_pred_masks->spatial_features) + scalar_edge(layer.sparse_pred_masks->query_features) + scalar_edge(layer.sparse_pred_masks->bias);
   }
   zero = zero.defined() ? zero + layer_zero : layer_zero;
  };
@@ -689,10 +647,8 @@ TrainingLoss TrainingSupervisionImpl::denoising_loss(const DenoisingOutputs& out
   throw std::runtime_error("DN loss requires one prediction-device target-count scalar");
  }
  const std::vector<int64_t> target_shape{outputs.main.pred_logits.size(0), outputs.groups, outputs.queries_per_group};
- if (outputs.groups != config_.training_supervision.denoising.groups || outputs.queries_per_group <= 0 ||
-     outputs.original_labels.sizes().vec() != target_shape ||
-     outputs.original_boxes.sizes().vec() != std::vector<int64_t>{target_shape[0], target_shape[1], target_shape[2], 4} ||
-     outputs.valid_slots.sizes().vec() != target_shape) {
+ if (outputs.groups != config_.training_supervision.denoising.groups || outputs.queries_per_group <= 0 || outputs.original_labels.sizes().vec() != target_shape ||
+     outputs.original_boxes.sizes().vec() != std::vector<int64_t>{target_shape[0], target_shape[1], target_shape[2], 4} || outputs.valid_slots.sizes().vec() != target_shape) {
   throw std::runtime_error("DN outputs do not match their direct-target layout");
  }
  mmltk::backend::ml::cuda::TorchAutocastScope fp32_scope(false, torch::kFloat32);
@@ -720,8 +676,7 @@ TrainingLoss TrainingSupervisionImpl::denoising_loss(const DenoisingOutputs& out
    const auto positive = config_.focal_alpha * (1.0 - probability).square() * F::softplus(-logits);
    auto classification = negative.sum(-1) + (positive - negative).gather(-1, labels.unsqueeze(-1)).squeeze(-1);
    auto box = (layer->pred_boxes.to(torch::kFloat32) - targets).abs().sum(-1);
-   auto giou = 1.0F - aligned_generalized_box_iou(box_cxcywh_to_xyxy(layer->pred_boxes.to(torch::kFloat32), BoxExtentPolicy::Preserve),
-                                                  box_cxcywh_to_xyxy(targets, BoxExtentPolicy::Preserve));
+   auto giou = 1.0F - aligned_generalized_box_iou(box_cxcywh_to_xyxy(layer->pred_boxes.to(torch::kFloat32), BoxExtentPolicy::Preserve), box_cxcywh_to_xyxy(targets, BoxExtentPolicy::Preserve));
    classification = torch::where(valid, classification, torch::zeros_like(classification));
    box = torch::where(valid, box, torch::zeros_like(box));
    giou = torch::where(valid, giou, torch::zeros_like(giou));
@@ -739,8 +694,7 @@ TrainingLoss TrainingSupervisionImpl::denoising_loss(const DenoisingOutputs& out
  timing_->measure(TimingState::Stage::DenoisingObjective, objective);
  return result;
 }
-TrainingLoss TrainingSupervisionImpl::loss(const ModelOutputs& outputs, const PreparedTargets& targets, const DeviceLossNormalizer& normalizer,
-                                           const bool training_mode) {
+TrainingLoss TrainingSupervisionImpl::loss(const ModelOutputs& outputs, const PreparedTargets& targets, const DeviceLossNormalizer& normalizer, const bool training_mode) {
  if (!initialized_) { throw std::runtime_error("RF-DETR supervision loss requires one-shot initialization"); }
  if (!match_free_enabled()) {
   if (outputs.denoising) { return denoising_loss(*outputs.denoising, normalizer); }
@@ -749,9 +703,7 @@ TrainingLoss TrainingSupervisionImpl::loss(const ModelOutputs& outputs, const Pr
  if (!normalizer.target_count.defined() || normalizer.target_count.dim() != 0 || normalizer.target_count.scalar_type() != torch::kFloat32) {
   throw std::runtime_error("Match-Free loss requires one device target-count scalar");
  }
- if (normalizer.target_count.device() != outputs.main.pred_logits.device()) {
-  throw std::runtime_error("Match-Free target-count scalar must reside on the prediction device");
- }
+ if (normalizer.target_count.device() != outputs.main.pred_logits.device()) { throw std::runtime_error("Match-Free target-count scalar must reside on the prediction device"); }
  if (timing_ && (!outputs.main.pred_logits.is_cuda() || timing_->device_id != outputs.main.pred_logits.get_device())) {
   throw std::runtime_error("Match-Free timing leases must match the prediction CUDA device");
  }
@@ -778,15 +730,21 @@ TrainingLoss TrainingSupervisionImpl::loss(const ModelOutputs& outputs, const Pr
   if (!layer->query_features || !layer->query_layout) { throw std::runtime_error("Match-Free supervised layer lacks captured query features"); }
   if (layer->query_layout->groups != groups) { throw std::runtime_error("Match-Free supervised layer has an inconsistent query group layout"); }
   const auto dense = timed(TimingState::Stage::Affinity, [&] { return dense_correspondence(probes, *layer->query_features); });
-  const auto sparse =
-   timed(TimingState::Stage::Sparse, [&] { return sparse_match_free_correspondence(dense, padded.valid, config_.training_supervision.match_free.rho); });
+  const auto sparse = timed(TimingState::Stage::Sparse, [&] { return sparse_match_free_correspondence(dense, padded.valid, config_.training_supervision.match_free.rho); });
   const auto costs = timed(TimingState::Stage::BroadcastCost, [&] { return broadcast_cost(padded.labels, padded.boxes, padded.valid, *layer); });
   const auto alpha = config_.training_supervision.match_free.correspondence_weight;
   const auto beta = config_.training_supervision.match_free.query_weight;
   auto objective = [&](const torch::Tensor& term) { return (alpha * (dense * term).sum() + beta * (sparse * term).sum()) / divisor; };
   const auto terms = timed(TimingState::Stage::Objective, [&] {
    return TrainingLoss{
-    {}, objective(costs.classification), objective(costs.box), objective(costs.giou), alpha * (dense * costs.total).sum() / divisor, {}, {}, {},
+    {},
+    objective(costs.classification),
+    objective(costs.box),
+    objective(costs.giou),
+    alpha * (dense * costs.total).sum() / divisor,
+    {},
+    {},
+    {},
    };
   });
   if (layer == &outputs.main) result.main = {terms.classification, terms.box, terms.giou};
@@ -813,11 +771,9 @@ TrainingLoss TrainingSupervisionImpl::loss(const ModelOutputs& outputs, const Pr
   std::uint64_t valid_pairs = 0;
   for (const auto count : targets.counts) {
    for (const auto* layer : layers) {
-    const auto group_pairs =
-     mmltk::common::math::checked_multiply(static_cast<std::uint64_t>(layer->query_layout->groups),
-                                           static_cast<std::uint64_t>(layer->query_layout->queries_per_group), "Match-Free valid-pair group product overflow");
-    const auto image_pairs =
-     mmltk::common::math::checked_multiply(static_cast<std::uint64_t>(count), group_pairs, "Match-Free valid-pair image product overflow");
+    const auto group_pairs = mmltk::common::math::checked_multiply(
+     static_cast<std::uint64_t>(layer->query_layout->groups), static_cast<std::uint64_t>(layer->query_layout->queries_per_group), "Match-Free valid-pair group product overflow");
+    const auto image_pairs = mmltk::common::math::checked_multiply(static_cast<std::uint64_t>(count), group_pairs, "Match-Free valid-pair image product overflow");
     valid_pairs = mmltk::common::math::checked_add(valid_pairs, image_pairs, "Match-Free valid-pair count overflow");
    }
   }

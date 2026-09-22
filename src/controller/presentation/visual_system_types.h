@@ -77,8 +77,7 @@ struct VisualCleanContentIdentity final {
  bool operator==(const VisualCleanContentIdentity&) const = default;
 };
 [[nodiscard]] bool visual_product_matches_frame(const VisualFrame&, const mmltk::frameworks::gpu::BorrowedImageProductReadView&) noexcept;
-[[nodiscard]] mmltk::frameworks::gpu::BorrowedImageProductReadView borrow_matching_visual_product(const VisualFrame&,
-                                                                                                  mmltk::frameworks::gpu::BorrowedImageProductReadView);
+[[nodiscard]] mmltk::frameworks::gpu::BorrowedImageProductReadView borrow_matching_visual_product(const VisualFrame&, mmltk::frameworks::gpu::BorrowedImageProductReadView);
 [[nodiscard]] constexpr VisualFrame visual_frame(const PresentationSourceIdentity source, const VisualExtent extent, const std::uint64_t revision) noexcept {
  return {
   .source = source,
@@ -91,13 +90,11 @@ MMLTK_REFLECT_FIELDS(VisualRegion)
 MMLTK_REFLECT_FIELDS(VisualFrame)
 MMLTK_REFLECT_FIELDS(VisualSourceObservation)
 MMLTK_REFLECT_FIELDS(VisualCleanContentIdentity)
-struct VisualCleanContentRelation final
-    : mmltk::frameworks::reflection::StaticMemberRelation<
-       VisualFrame, VisualCleanContentIdentity, 4U,
-       mmltk::frameworks::reflection::MemberRelationEntry<&VisualFrame::source, &VisualCleanContentIdentity::source>,
-       mmltk::frameworks::reflection::MemberRelationEntry<&VisualFrame::extent, &VisualCleanContentIdentity::extent>,
-       mmltk::frameworks::reflection::MemberRelationEntry<&VisualFrame::content, &VisualCleanContentIdentity::content>,
-       mmltk::frameworks::reflection::MemberRelationEntry<&VisualFrame::clean_revision, &VisualCleanContentIdentity::revision>> {
+struct VisualCleanContentRelation final : mmltk::frameworks::reflection::StaticMemberRelation<VisualFrame, VisualCleanContentIdentity, 4U,
+                                           mmltk::frameworks::reflection::MemberRelationEntry<&VisualFrame::source, &VisualCleanContentIdentity::source>,
+                                           mmltk::frameworks::reflection::MemberRelationEntry<&VisualFrame::extent, &VisualCleanContentIdentity::extent>,
+                                           mmltk::frameworks::reflection::MemberRelationEntry<&VisualFrame::content, &VisualCleanContentIdentity::content>,
+                                           mmltk::frameworks::reflection::MemberRelationEntry<&VisualFrame::clean_revision, &VisualCleanContentIdentity::revision>> {
  static constexpr auto zero_fallback_source = &VisualFrame::revision;
  static constexpr auto zero_fallback_destination = &VisualCleanContentIdentity::revision;
 };
@@ -105,8 +102,7 @@ static_assert(VisualCleanContentRelation::valid());
 [[nodiscard]] constexpr VisualCleanContentIdentity visual_clean_content_identity(const VisualFrame& frame) {
  VisualCleanContentIdentity identity;
  VisualCleanContentRelation::Project(frame, identity);
- if (identity.*VisualCleanContentRelation::zero_fallback_destination == 0U)
-  identity.*VisualCleanContentRelation::zero_fallback_destination = frame.*VisualCleanContentRelation::zero_fallback_source;
+ if (identity.*VisualCleanContentRelation::zero_fallback_destination == 0U) identity.*VisualCleanContentRelation::zero_fallback_destination = frame.*VisualCleanContentRelation::zero_fallback_source;
  return identity;
 }
 }  // namespace mmltk::controller

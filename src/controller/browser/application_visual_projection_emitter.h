@@ -67,9 +67,8 @@ void emit_application_visual_projection(Writer& writer) {
   writer.reserve("struct ApplicationVisualSnapshots", field, "visual source " + std::string(Cell::name));
   output << "pub " << field << ": Option<&'a " << writer.template rust_type<typename Projection::snapshot_type>() << ">,\n";
  });
- output << "}\nimpl" << (count == 0U ? "" : "<'a>") << " ApplicationVisualSnapshots" << (count == 0U ? "" : "<'a>")
-        << " { pub fn observe(&self, kind: " << kind_type << ") -> Option<ApplicationVisualObservation<'" << (count == 0U ? "static" : "a")
-        << ">> { match kind {\n";
+ output << "}\nimpl" << (count == 0U ? "" : "<'a>") << " ApplicationVisualSnapshots" << (count == 0U ? "" : "<'a>") << " { pub fn observe(&self, kind: " << kind_type
+        << ") -> Option<ApplicationVisualObservation<'" << (count == 0U ? "static" : "a") << ">> { match kind {\n";
  for (const auto source : presentation_source_metadata) {
   output << kind_type << "::" << writer.identifier(mmltk::frameworks::reflection::enum_name(source.kind), true) << " => ";
   bool found = false;
@@ -89,15 +88,13 @@ void emit_application_visual_projection(Writer& writer) {
  }
  output << "} } }\n";
  // This is a structural relation with an explicit zero fallback, not native function translation.
- output << "pub fn visual_clean_content_identity(frame: &" << writer.template rust_type<VisualFrame>() << ") -> "
-        << writer.template rust_type<VisualCleanContentIdentity>() << " { let mut identity = " << writer.template rust_type<VisualCleanContentIdentity>()
-        << " {\n";
+ output << "pub fn visual_clean_content_identity(frame: &" << writer.template rust_type<VisualFrame>() << ") -> " << writer.template rust_type<VisualCleanContentIdentity>()
+        << " { let mut identity = " << writer.template rust_type<VisualCleanContentIdentity>() << " {\n";
  VisualCleanContentRelation::VisitMembers([&]<class Entry>() {
-  output << visual_projection_path<VisualCleanContentIdentity, Entry::destination>(writer) << ": frame."
-         << visual_projection_path<VisualFrame, Entry::source>(writer) << ".clone(),\n";
+  output << visual_projection_path<VisualCleanContentIdentity, Entry::destination>(writer) << ": frame." << visual_projection_path<VisualFrame, Entry::source>(writer) << ".clone(),\n";
  });
  const auto destination = visual_projection_path<VisualCleanContentIdentity, VisualCleanContentRelation::zero_fallback_destination>(writer);
- output << "}; if identity." << destination << " == 0 { identity." << destination << " = frame."
-        << visual_projection_path<VisualFrame, VisualCleanContentRelation::zero_fallback_source>(writer) << "; } identity }\n";
+ output << "}; if identity." << destination << " == 0 { identity." << destination << " = frame." << visual_projection_path<VisualFrame, VisualCleanContentRelation::zero_fallback_source>(writer)
+        << "; } identity }\n";
 }
 }  // namespace mmltk::controller::browser

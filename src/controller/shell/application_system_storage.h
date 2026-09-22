@@ -28,9 +28,8 @@ struct ApplicationSystemConfiguration final {
  std::filesystem::path training_executable{};
  services::RuntimeDiagnosticTarget dataset_diagnostics{};
 };
-[[nodiscard]] std::unique_ptr<ExploreSystem> make_shell_explore_system(SettingsSystem&, const ApplicationSystemConfiguration&,
-                                                                       const mmltk::frameworks::gpu::DeviceExecution&,
-                                                                       SystemEventSink<ExploreSystem::event_type> = {}, VisualDiagnosticSink = {});
+[[nodiscard]] std::unique_ptr<ExploreSystem> make_shell_explore_system(
+ SettingsSystem&, const ApplicationSystemConfiguration&, const mmltk::frameworks::gpu::DeviceExecution&, SystemEventSink<ExploreSystem::event_type> = {}, VisualDiagnosticSink = {});
 class ApplicationSystemStorage final {
 public:
  using EventSink = std::function<void(browser::SystemEvent)>;
@@ -77,7 +76,6 @@ private:
  std::unique_ptr<PresentationSystem> presentation_;
  ApplicationSystems systems_{};
 };
-[[nodiscard]] SystemEventSink<ExploreSystem::event_type> make_explore_upscale_event_sink(ApplicationSystemStorage::EventSink&, UpscaleSystem&,
-                                                                                         ApplicationSystemStorage::ContinuitySink = {},
-                                                                                         std::function<void(PresentationSourceIdentity)> = {});
+[[nodiscard]] SystemEventSink<ExploreSystem::event_type> make_explore_upscale_event_sink(
+ ApplicationSystemStorage::EventSink&, UpscaleSystem&, ApplicationSystemStorage::ContinuitySink = {}, std::function<void(PresentationSourceIdentity)> = {});
 }  // namespace mmltk::controller::shell

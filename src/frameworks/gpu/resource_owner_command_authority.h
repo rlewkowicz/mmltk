@@ -11,8 +11,7 @@ public:
  using IsCurrent = bool (*)(const void*, std::uintptr_t) noexcept;
  using FailCurrent = bool (*)(const void*, std::uintptr_t) noexcept;
  constexpr ResourceOwnerWorkerCapability() noexcept = default;
- constexpr ResourceOwnerWorkerCapability(const void* const context, const std::uintptr_t identity, const IsCurrent is_current,
-                                         const FailCurrent fail_current_callback) noexcept
+ constexpr ResourceOwnerWorkerCapability(const void* const context, const std::uintptr_t identity, const IsCurrent is_current, const FailCurrent fail_current_callback) noexcept
      : context_(context), identity_(identity), is_current_(is_current), fail_current_(fail_current_callback) {}
  [[nodiscard]] constexpr bool valid() const noexcept { return context_ != nullptr && identity_ != 0U && is_current_ != nullptr && fail_current_ != nullptr; }
  [[nodiscard]] bool current() const noexcept { return valid() && is_current_(context_, identity_); }
@@ -27,8 +26,7 @@ private:
 };
 namespace detail {
 struct ResourceOwnerCommandIdentity final {
- explicit ResourceOwnerCommandIdentity(const ResourceOwnerWorkerCapability worker_in) noexcept
-     : worker(worker_in), mandated_owner_thread(std::this_thread::get_id()) {}
+ explicit ResourceOwnerCommandIdentity(const ResourceOwnerWorkerCapability worker_in) noexcept : worker(worker_in), mandated_owner_thread(std::this_thread::get_id()) {}
  ResourceOwnerWorkerCapability worker{};
  std::thread::id mandated_owner_thread{};
 };
@@ -65,10 +63,7 @@ public:
  ResourceOwnerCommandScope(const ResourceOwnerCommandScope&) = delete;
  ResourceOwnerCommandScope& operator=(const ResourceOwnerCommandScope&) = delete;
  ResourceOwnerCommandScope(ResourceOwnerCommandScope&& other) noexcept
-     : previous_(other.previous_),
-       previous_count_(std::exchange(other.previous_count_, 0U)),
-       active_(std::exchange(other.active_, false)),
-       restore_(std::exchange(other.restore_, false)) {}
+     : previous_(other.previous_), previous_count_(std::exchange(other.previous_count_, 0U)), active_(std::exchange(other.active_, false)), restore_(std::exchange(other.restore_, false)) {}
  ResourceOwnerCommandScope& operator=(ResourceOwnerCommandScope&&) = delete;
  ~ResourceOwnerCommandScope() noexcept {
   if (!active_ || !restore_) return;
@@ -125,8 +120,7 @@ public:
  // primary binding prevents an unrelated active resource command from
  // authorizing this identity.
  [[nodiscard]] ResourceOwnerCommandScope EnterDelegated(const ResourceOwnerCommandBinding& primary) const noexcept {
-  if (resource_owner_delivery_active() || !valid() || !primary.valid() || detail::current_resource_owner_command_count == 0U ||
-      detail::current_resource_owner_commands[0U] != primary.identity_.get())
+  if (resource_owner_delivery_active() || !valid() || !primary.valid() || detail::current_resource_owner_command_count == 0U || detail::current_resource_owner_commands[0U] != primary.identity_.get())
    return {};
   return ResourceOwnerCommandScope{identity_.get(), false};
  }
@@ -145,8 +139,7 @@ private:
 };
 class ResourceOwnerCommandAuthority final {
 public:
- explicit ResourceOwnerCommandAuthority(const ResourceOwnerWorkerCapability worker)
-     : identity_(std::make_shared<const detail::ResourceOwnerCommandIdentity>(worker)) {}
+ explicit ResourceOwnerCommandAuthority(const ResourceOwnerWorkerCapability worker) : identity_(std::make_shared<const detail::ResourceOwnerCommandIdentity>(worker)) {}
  ResourceOwnerCommandAuthority(const ResourceOwnerCommandAuthority&) = delete;
  ResourceOwnerCommandAuthority& operator=(const ResourceOwnerCommandAuthority&) = delete;
  ResourceOwnerCommandAuthority(ResourceOwnerCommandAuthority&&) = delete;

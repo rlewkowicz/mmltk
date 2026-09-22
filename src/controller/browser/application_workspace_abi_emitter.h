@@ -109,8 +109,7 @@ private:
   output_ << "}\nconst _: () = assert!(std::mem::size_of::<" << name << ">() == " << sizeof(T) << ");\n"
           << "const _: () = assert!(std::mem::align_of::<" << name << ">() == " << alignof(T) << ");\n";
   template for (constexpr auto member : members) {
-   output_ << "const _: () = assert!(std::mem::offset_of!(" << name << ", " << std::meta::identifier_of(member) << ") == " << std::meta::offset_of(member).bytes
-           << ");\n";
+   output_ << "const _: () = assert!(std::mem::offset_of!(" << name << ", " << std::meta::identifier_of(member) << ") == " << std::meta::offset_of(member).bytes << ");\n";
   }
  }
  std::ostream& output_;

@@ -39,7 +39,12 @@ __device__ inline BoxPairGeometry<T> make_box_pair_geometry(const T* boxes1, con
  const T first_area = box_area(first);
  const T second_area = box_area(second);
  return {
-  first, second, first_area, second_area, intersection, first_area + second_area - intersection,
+  first,
+  second,
+  first_area,
+  second_area,
+  intersection,
+  first_area + second_area - intersection,
  };
 }
 template <typename T>
@@ -95,11 +100,10 @@ torch::Tensor pairwise_box_iou_cuda(const torch::Tensor& boxes1, const torch::Te
  AT_DISPATCH_FLOATING_TYPES(boxes1.scalar_type(), "pairwise_box_iou_cuda", [&] {
   // NOLINTNEXTLINE(bugprone-branch-clone): each branch launches a different CUDA kernel.
   if (kind == BoxIouKind::Generalized) {
-   generalized_box_iou_kernel<scalar_t><<<blocks, threads, 0, stream>>>(boxes1.data_ptr<scalar_t>(), boxes2.data_ptr<scalar_t>(), result.data_ptr<scalar_t>(),
-                                                                        static_cast<int>(pair_count), second_count);
+   generalized_box_iou_kernel<scalar_t>
+    <<<blocks, threads, 0, stream>>>(boxes1.data_ptr<scalar_t>(), boxes2.data_ptr<scalar_t>(), result.data_ptr<scalar_t>(), static_cast<int>(pair_count), second_count);
   } else {
-   box_iou_kernel<scalar_t><<<blocks, threads, 0, stream>>>(boxes1.data_ptr<scalar_t>(), boxes2.data_ptr<scalar_t>(), result.data_ptr<scalar_t>(),
-                                                            static_cast<int>(pair_count), second_count);
+   box_iou_kernel<scalar_t><<<blocks, threads, 0, stream>>>(boxes1.data_ptr<scalar_t>(), boxes2.data_ptr<scalar_t>(), result.data_ptr<scalar_t>(), static_cast<int>(pair_count), second_count);
   }
  });
  TORCH_CHECK(cudaGetLastError() == cudaSuccess, "box IoU CUDA kernel launch failed");
@@ -107,7 +111,5 @@ torch::Tensor pairwise_box_iou_cuda(const torch::Tensor& boxes1, const torch::Te
 }
 }  // namespace
 torch::Tensor box_iou_cuda(const torch::Tensor& boxes1, const torch::Tensor& boxes2) { return pairwise_box_iou_cuda(boxes1, boxes2, BoxIouKind::Standard); }
-torch::Tensor generalized_box_iou_cuda(const torch::Tensor& boxes1, const torch::Tensor& boxes2) {
- return pairwise_box_iou_cuda(boxes1, boxes2, BoxIouKind::Generalized);
-}
+torch::Tensor generalized_box_iou_cuda(const torch::Tensor& boxes1, const torch::Tensor& boxes2) { return pairwise_box_iou_cuda(boxes1, boxes2, BoxIouKind::Generalized); }
 }  // namespace mmltk::backend::ml::ops

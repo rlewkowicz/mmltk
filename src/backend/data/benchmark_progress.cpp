@@ -13,8 +13,7 @@ ProgressReporter::ProgressReporter(BenchmarkProgressCallback callback, const Ben
   progress.source = source;
   return progress;
  };
- constexpr BenchmarkDatasetSource custom_sources[]{BenchmarkDatasetSource::kCoco2017, BenchmarkDatasetSource::kObjects365V2,
-                                                   BenchmarkDatasetSource::kOpenImagesV7};
+ constexpr BenchmarkDatasetSource custom_sources[]{BenchmarkDatasetSource::kCoco2017, BenchmarkDatasetSource::kObjects365V2, BenchmarkDatasetSource::kOpenImagesV7};
  if (sources.empty()) sources = custom_sources;
  for (const auto source : sources) state_.sources.push_back(source_progress(source));
 }
@@ -88,12 +87,8 @@ void ProgressReporter::pixel_completed() {
   const double images_per_second = elapsed_seconds > 0.0 ? static_cast<double>(pixel_completed_) / elapsed_seconds : 0.0;
   const double eta_seconds = images_per_second > 0.0 ? static_cast<double>(pixel_split_total_ - pixel_completed_) / images_per_second : 0.0;
   trace_benchmark_event(*trace_, "benchmark.pixel_compile.throughput", [&] {
-   return nlohmann::json{{"split", pixel_split_},
-                         {"completed_images", pixel_completed_},
-                         {"total_images", pixel_split_total_},
-                         {"elapsed_seconds", elapsed_seconds},
-                         {"images_per_second", images_per_second},
-                         {"eta_seconds", eta_seconds}};
+   return nlohmann::json{{"split", pixel_split_}, {"completed_images", pixel_completed_}, {"total_images", pixel_split_total_}, {"elapsed_seconds", elapsed_seconds},
+    {"images_per_second", images_per_second}, {"eta_seconds", eta_seconds}};
   });
  }
 }
@@ -166,9 +161,7 @@ void ProgressReporter::source_transfer(const DownloadProgress& update, const std
   operation = "Reusing cached ";
  } else {
   switch (update.phase) {
-   case DownloadProgressPhase::kDownloading:
-    operation = update.redownload ? (update.resumed ? "Resuming re-download of " : "Re-downloading ") : (update.resumed ? "Resuming " : "Downloading ");
-    break;
+   case DownloadProgressPhase::kDownloading: operation = update.redownload ? (update.resumed ? "Resuming re-download of " : "Re-downloading ") : (update.resumed ? "Resuming " : "Downloading "); break;
    case DownloadProgressPhase::kVerifyingCachedArtifact: operation = "Verifying cached "; break;
    case DownloadProgressPhase::kVerifyingDownloadedArtifact: operation = "Verifying downloaded "; break;
   }
@@ -281,10 +274,9 @@ void ProgressReporter::update_source_phase_progress() {
   const std::uint64_t completed = use_images ? source.completed_images : source.completed_bytes;
   const std::uint64_t total = use_images ? source.total_images : source.total_bytes;
   if (total == 0U && !source.complete) { continue; }
-  const std::uint64_t scaled_completed = total == 0U
-                                          ? kSourceProgressScale
-                                          : static_cast<std::uint64_t>(static_cast<long double>(std::min(completed, total)) *
-                                                                       static_cast<long double>(kSourceProgressScale) / static_cast<long double>(total));
+  const std::uint64_t scaled_completed =
+   total == 0U ? kSourceProgressScale
+               : static_cast<std::uint64_t>(static_cast<long double>(std::min(completed, total)) * static_cast<long double>(kSourceProgressScale) / static_cast<long double>(total));
   add_progress(state_.completed, scaled_completed, "benchmark extraction progress overflow");
   add_progress(state_.total, kSourceProgressScale, "benchmark extraction progress overflow");
  }

@@ -28,8 +28,7 @@ public:
  // same-stream views of one owning aggregate share its completion. Pressure
  // refuses before submission. finish provides explicit bounded backpressure.
  // Workspace admission is bounded to 256 MiB (512 MiB during replacement).
- void downscale(RgbConstImageView source, RgbMutableImageView destination, cudaStream_t stream, std::shared_ptr<const void> source_custody,
-                std::shared_ptr<const void> destination_custody);
+ void downscale(RgbConstImageView source, RgbMutableImageView destination, cudaStream_t stream, std::shared_ptr<const void> source_custody, std::shared_ptr<const void> destination_custody);
  // Settlement stays available after the shared authority closes admission.
  void finish();
 

@@ -3,8 +3,7 @@
 #include <limits>
 #include <utility>
 namespace mmltk::frameworks::gpu {
-ExternalGraphicsTimeline::ExternalGraphicsTimeline(mmltk::common::io::ScopedFd descriptor)
-    : ExternalGraphicsTimeline(std::move(descriptor), &cudaImportExternalSemaphore) {}
+ExternalGraphicsTimeline::ExternalGraphicsTimeline(mmltk::common::io::ScopedFd descriptor) : ExternalGraphicsTimeline(std::move(descriptor), &cudaImportExternalSemaphore) {}
 ExternalGraphicsTimeline::ExternalGraphicsTimeline(mmltk::common::io::ScopedFd descriptor, const ImportOperation import_operation) {
  if (descriptor.get() < 0 || import_operation == nullptr) throw std::invalid_argument("external graphics timeline descriptor is invalid");
  cudaExternalSemaphoreHandleDesc import{};
@@ -32,8 +31,7 @@ void ExternalGraphicsTimeline::SignalReadyAndWaitForRelease(cudaStream_t stream,
  WaitForRelease(stream, ready_value + 1U);
 }
 void ExternalGraphicsTimeline::SignalReady(cudaStream_t stream, const std::uint64_t ready_value) {
- if (!valid() || stream == nullptr || ready_value == 0U || ready_value == std::numeric_limits<std::uint64_t>::max())
-  throw std::invalid_argument("external graphics timeline publication is invalid");
+ if (!valid() || stream == nullptr || ready_value == 0U || ready_value == std::numeric_limits<std::uint64_t>::max()) throw std::invalid_argument("external graphics timeline publication is invalid");
  cudaExternalSemaphoreSignalParams signal{};
  signal.params.fence.value = ready_value;
  cudaExternalSemaphore_t timeline = semaphore_;

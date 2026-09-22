@@ -40,13 +40,11 @@ GuiSettingsState& make_snapshot(SettingsViewStates& states) {
  states.current_view = mmltk::controller::contracts::FeatureId::Annotate;
  return states;
 }
-bool load_settings(const std::filesystem::path& path, GuiSettingsState& snapshot, nlohmann::json* const normalized_document = nullptr,
-                   bool* const repair_required = nullptr) {
+bool load_settings(const std::filesystem::path& path, GuiSettingsState& snapshot, nlohmann::json* const normalized_document = nullptr, bool* const repair_required = nullptr) {
  return load_gui_settings_file(path.string(), snapshot, normalized_document, repair_required);
 }
 [[nodiscard]] auto mutable_settings_views(SettingsViewStates& states) noexcept {
- return std::tie(states.ui, states.workflows.train, states.workflows.validate, states.workflows.predict, states.workflows.annotate,
-                 states.workflows.export_state, states.workflows.explore);
+ return std::tie(states.ui, states.workflows.train, states.workflows.validate, states.workflows.predict, states.workflows.annotate, states.workflows.export_state, states.workflows.explore);
 }
 using TrainOptimizerKind = mmltk::backend::models::rfdetr::TrainOptimizerKind;
 using TrainLrSchedulerKind = mmltk::backend::models::rfdetr::TrainLrSchedulerKind;
@@ -90,41 +88,37 @@ template <auto Access>
 }
 using WorkflowSettingsState = mmltk::controller::contracts::WorkflowSettingsState;
 using ModelArtifactRequest = mmltk::backend::models::rfdetr::ModelArtifactRequest;
-static_assert(!mmltk::frameworks::reflection::accessor_is_applicable<
-              GuiSettingsState, mmltk::frameworks::reflection::member_path<&GuiSettingsState::workflows, &ExploreViewState::show_boxes>>());
+static_assert(!mmltk::frameworks::reflection::accessor_is_applicable<GuiSettingsState, mmltk::frameworks::reflection::member_path<&GuiSettingsState::workflows, &ExploreViewState::show_boxes>>());
 static_assert(mmltk::frameworks::reflection::accessor_is_applicable<ExploreViewState, &ExploreViewState::show_boxes>());
-static_assert(mmltk::frameworks::reflection::accessor_is_applicable<
-              const GuiSettingsState,
-              mmltk::frameworks::reflection::member_path<&GuiSettingsState::workflows, &WorkflowSettingsState::explore, &ExploreViewState::show_boxes>>());
-static_assert(settings_path_is<mmltk::frameworks::reflection::member_path<&GuiSettingsState::workflows, &WorkflowSettingsState::train,
-                                                                          &TrainExecutionPaneState::execution_target>>("workflows.train.execution_target"));
+static_assert(mmltk::frameworks::reflection::accessor_is_applicable<const GuiSettingsState,
+ mmltk::frameworks::reflection::member_path<&GuiSettingsState::workflows, &WorkflowSettingsState::explore, &ExploreViewState::show_boxes>>());
+static_assert(settings_path_is<mmltk::frameworks::reflection::member_path<&GuiSettingsState::workflows, &WorkflowSettingsState::train, &TrainExecutionPaneState::execution_target>>(
+ "workflows.train.execution_target"));
 static_assert(
- settings_path_is<mmltk::frameworks::reflection::member_path<&GuiSettingsState::workflows, &WorkflowSettingsState::explore, &ExploreViewState::show_boxes>>(
-  "workflows.explore.show_boxes"));
-static_assert(settings_path_is<mmltk::frameworks::reflection::member_path<&GuiSettingsState::workflows, &WorkflowSettingsState::train, &TrainViewState::request,
-                                                                          &TrainRequest::weights_path>>("workflows.train.request.weights_path"));
+ settings_path_is<mmltk::frameworks::reflection::member_path<&GuiSettingsState::workflows, &WorkflowSettingsState::explore, &ExploreViewState::show_boxes>>("workflows.explore.show_boxes"));
+static_assert(settings_path_is<mmltk::frameworks::reflection::member_path<&GuiSettingsState::workflows, &WorkflowSettingsState::train, &TrainViewState::request, &TrainRequest::weights_path>>(
+ "workflows.train.request.weights_path"));
 static_assert(
- settings_path_is<mmltk::frameworks::reflection::member_path<&GuiSettingsState::workflows, &WorkflowSettingsState::validate, &ValidateViewState::request,
-                                                             &ModelArtifactRequest::weights_path>>("workflows.validate.request.weights_path"));
+ settings_path_is<mmltk::frameworks::reflection::member_path<&GuiSettingsState::workflows, &WorkflowSettingsState::validate, &ValidateViewState::request, &ModelArtifactRequest::weights_path>>(
+  "workflows.validate.request.weights_path"));
 static_assert(
- settings_path_is<mmltk::frameworks::reflection::member_path<&GuiSettingsState::workflows, &WorkflowSettingsState::validate, &ValidateViewState::request,
-                                                             &ModelArtifactRequest::onnx_path>>("workflows.validate.request.onnx_path"));
+ settings_path_is<mmltk::frameworks::reflection::member_path<&GuiSettingsState::workflows, &WorkflowSettingsState::validate, &ValidateViewState::request, &ModelArtifactRequest::onnx_path>>(
+  "workflows.validate.request.onnx_path"));
 static_assert(
- settings_path_is<mmltk::frameworks::reflection::member_path<&GuiSettingsState::workflows, &WorkflowSettingsState::validate, &ValidateViewState::request,
-                                                             &ModelArtifactRequest::tensorrt_path>>("workflows.validate.request.tensorrt_path"));
+ settings_path_is<mmltk::frameworks::reflection::member_path<&GuiSettingsState::workflows, &WorkflowSettingsState::validate, &ValidateViewState::request, &ModelArtifactRequest::tensorrt_path>>(
+  "workflows.validate.request.tensorrt_path"));
 static_assert(
- settings_path_is<mmltk::frameworks::reflection::member_path<&GuiSettingsState::workflows, &WorkflowSettingsState::predict, &PredictViewState::request,
-                                                             &ModelArtifactRequest::weights_path>>("workflows.predict.request.weights_path"));
+ settings_path_is<mmltk::frameworks::reflection::member_path<&GuiSettingsState::workflows, &WorkflowSettingsState::predict, &PredictViewState::request, &ModelArtifactRequest::weights_path>>(
+  "workflows.predict.request.weights_path"));
+static_assert(settings_path_is<mmltk::frameworks::reflection::member_path<&GuiSettingsState::workflows, &WorkflowSettingsState::predict, &PredictViewState::request, &ModelArtifactRequest::onnx_path>>(
+ "workflows.predict.request.onnx_path"));
 static_assert(
- settings_path_is<mmltk::frameworks::reflection::member_path<&GuiSettingsState::workflows, &WorkflowSettingsState::predict, &PredictViewState::request,
-                                                             &ModelArtifactRequest::onnx_path>>("workflows.predict.request.onnx_path"));
-static_assert(
- settings_path_is<mmltk::frameworks::reflection::member_path<&GuiSettingsState::workflows, &WorkflowSettingsState::predict, &PredictViewState::request,
-                                                             &ModelArtifactRequest::tensorrt_path>>("workflows.predict.request.tensorrt_path"));
-static_assert(settings_path_is<mmltk::frameworks::reflection::member_path<&GuiSettingsState::workflows, &WorkflowSettingsState::export_state,
-                                                                          &ExportViewState::weights_path>>("workflows.export_state.weights_path"));
-static_assert(settings_path_is<mmltk::frameworks::reflection::member_path<&GuiSettingsState::workflows, &WorkflowSettingsState::export_state,
-                                                                          &ExportViewState::onnx_input_path>>("workflows.export_state.onnx_input_path"));
+ settings_path_is<mmltk::frameworks::reflection::member_path<&GuiSettingsState::workflows, &WorkflowSettingsState::predict, &PredictViewState::request, &ModelArtifactRequest::tensorrt_path>>(
+  "workflows.predict.request.tensorrt_path"));
+static_assert(settings_path_is<mmltk::frameworks::reflection::member_path<&GuiSettingsState::workflows, &WorkflowSettingsState::export_state, &ExportViewState::weights_path>>(
+ "workflows.export_state.weights_path"));
+static_assert(settings_path_is<mmltk::frameworks::reflection::member_path<&GuiSettingsState::workflows, &WorkflowSettingsState::export_state, &ExportViewState::onnx_input_path>>(
+ "workflows.export_state.onnx_input_path"));
 struct OptimizerFixture final {
  int persisted_id;
  TrainOptimizerKind native_value;
@@ -176,9 +170,7 @@ constexpr bool kCorpusSchedulerOverride = true;
 }
 [[nodiscard]] nlohmann::json golden_recipe_values(const int persisted_optimizer_id) {
  nlohmann::json values = nlohmann::json::object();
- for (const DoubleRecipeFixture& field : kDoubleRecipeFixtures) {
-  values[std::string{field.key}] = persisted_optimizer_id == 0 ? field.adamw_value : field.muon_value;
- }
+ for (const DoubleRecipeFixture& field : kDoubleRecipeFixtures) { values[std::string{field.key}] = persisted_optimizer_id == 0 ? field.adamw_value : field.muon_value; }
  values["lr_drop"] = 100;
  values["lr_scheduler"] = persisted_optimizer_id == 0 ? "step" : "cosine";
  return values;
@@ -217,8 +209,7 @@ constexpr bool kCorpusSchedulerOverride = true;
  }
  return count;
 }
-void check_recipe_schema_v8_shape(const nlohmann::json& document, const int persisted_optimizer_id, const nlohmann::json& expected_values,
-                                  const nlohmann::json& expected_overrides) {
+void check_recipe_schema_v8_shape(const nlohmann::json& document, const int persisted_optimizer_id, const nlohmann::json& expected_values, const nlohmann::json& expected_overrides) {
  REQUIRE(document.is_object());
  REQUIRE(document.at("schema_version").type() == nlohmann::json::value_t::number_unsigned);
  CHECK(document.at("schema_version") == 8U);
@@ -240,8 +231,8 @@ void check_recipe_schema_v8_shape(const nlohmann::json& document, const int pers
   REQUIRE_FALSE(train.contains(persisted_key));
   CHECK(count_object_key(document, key) == 2U);
  }
- for (const std::string_view key : std::array<std::string_view, 9U>{"lr", "lr_encoder", "lr_component_decay", "encoder_layer_decay", "momentum", "weight_decay",
-                                                                    "warmup_epochs", "warmup_momentum", "lr_min_factor"}) {
+ for (const std::string_view key :
+  std::array<std::string_view, 9U>{"lr", "lr_encoder", "lr_component_decay", "encoder_layer_decay", "momentum", "weight_decay", "warmup_epochs", "warmup_momentum", "lr_min_factor"}) {
   CHECK(training.at(std::string{key}).type() == nlohmann::json::value_t::number_float);
  }
  CHECK(training.at("lr_drop").type() == nlohmann::json::value_t::number_integer);
@@ -258,8 +249,7 @@ void check_recipe_schema_v8_shape(const nlohmann::json& document, const int pers
   CHECK(value == expected_overrides.at(std::string{key}));
  }
 }
-[[nodiscard]] std::filesystem::path write_recipe_case(const mmltk::testsupport::ScopedTempDir& temporary, const std::string_view name,
-                                                      const nlohmann::json& document) {
+[[nodiscard]] std::filesystem::path write_recipe_case(const mmltk::testsupport::ScopedTempDir& temporary, const std::string_view name, const nlohmann::json& document) {
  const std::filesystem::path path = temporary.path() / std::string{name};
  mmltk::testsupport::write_text_file(path, document.dump(2) + "\n");
  return path;
@@ -276,8 +266,7 @@ void seed_distinct_prior_recipe(GuiSettingsState& state) {
  set_recipe_override(request.recipe_overrides, &TrainRequest::lr_scheduler, !kCorpusSchedulerOverride);
  request.optimizer = TrainOptimizerKind::Muon;
 }
-void check_materialized_nonuniform_recipe(const GuiSettingsState& state, const std::string_view missing_value = {},
-                                          const std::string_view missing_override = {}) {
+void check_materialized_nonuniform_recipe(const GuiSettingsState& state, const std::string_view missing_value = {}, const std::string_view missing_override = {}) {
  const TrainRequest& request = state.workflows.train.request;
  for (const DoubleRecipeFixture& field : kDoubleRecipeFixtures) {
   CAPTURE(field.key);
@@ -287,8 +276,7 @@ void check_materialized_nonuniform_recipe(const GuiSettingsState& state, const s
  CHECK(request.lr_drop == (missing_value == "lr_drop" ? kPriorLrDrop : kCorpusLrDrop));
  CHECK(recipe_overridden(request.recipe_overrides, &TrainRequest::lr_drop) == (missing_override == "lr_drop" ? !kCorpusLrDropOverride : kCorpusLrDropOverride));
  CHECK(request.lr_scheduler == (missing_value == "lr_scheduler" ? kPriorScheduler : kCorpusScheduler));
- CHECK(recipe_overridden(request.recipe_overrides, &TrainRequest::lr_scheduler) ==
-       (missing_override == "lr_scheduler" ? !kCorpusSchedulerOverride : kCorpusSchedulerOverride));
+ CHECK(recipe_overridden(request.recipe_overrides, &TrainRequest::lr_scheduler) == (missing_override == "lr_scheduler" ? !kCorpusSchedulerOverride : kCorpusSchedulerOverride));
  CHECK(request.optimizer == TrainOptimizerKind::Muon);
 }
 [[nodiscard]] nlohmann::json expected_nonuniform_values(const std::string_view missing_value = {}) {
@@ -361,8 +349,7 @@ void test_schema_v8_nonuniform_recipe_and_every_missing_member_are_preserved() {
  GuiSettingsState absent_overrides_state = default_gui_settings_state();
  seed_distinct_prior_recipe(absent_overrides_state);
  bool absent_overrides_repaired = false;
- REQUIRE(
-  load_settings(write_recipe_case(temporary, "absent-overrides.json", absent_overrides_document), absent_overrides_state, nullptr, &absent_overrides_repaired));
+ REQUIRE(load_settings(write_recipe_case(temporary, "absent-overrides.json", absent_overrides_document), absent_overrides_state, nullptr, &absent_overrides_repaired));
  CHECK(absent_overrides_repaired);
  const TrainRequest& absent_request = absent_overrides_state.workflows.train.request;
  for (const DoubleRecipeFixture& field : kDoubleRecipeFixtures) {
@@ -379,8 +366,7 @@ void test_schema_v8_nonuniform_recipe_and_every_missing_member_are_preserved() {
   GuiSettingsState missing_value_state = default_gui_settings_state();
   seed_distinct_prior_recipe(missing_value_state);
   bool repaired = false;
-  REQUIRE(load_settings(write_recipe_case(temporary, std::string{"missing-value-"} + std::string{key} + ".json", missing_value_document), missing_value_state,
-                        nullptr, &repaired));
+  REQUIRE(load_settings(write_recipe_case(temporary, std::string{"missing-value-"} + std::string{key} + ".json", missing_value_document), missing_value_state, nullptr, &repaired));
   CHECK(repaired);
   check_materialized_nonuniform_recipe(missing_value_state, key);
   check_recipe_schema_v8_shape(snapshot_gui_settings(missing_value_state), 1, expected_nonuniform_values(key), corpus_overrides);
@@ -389,8 +375,7 @@ void test_schema_v8_nonuniform_recipe_and_every_missing_member_are_preserved() {
   GuiSettingsState missing_override_state = default_gui_settings_state();
   seed_distinct_prior_recipe(missing_override_state);
   repaired = false;
-  REQUIRE(load_settings(write_recipe_case(temporary, std::string{"missing-override-"} + std::string{key} + ".json", missing_override_document),
-                        missing_override_state, nullptr, &repaired));
+  REQUIRE(load_settings(write_recipe_case(temporary, std::string{"missing-override-"} + std::string{key} + ".json", missing_override_document), missing_override_state, nullptr, &repaired));
   CHECK(repaired);
   check_materialized_nonuniform_recipe(missing_override_state, {}, key);
   check_recipe_schema_v8_shape(snapshot_gui_settings(missing_override_state), 1, corpus_values, expected_nonuniform_overrides(key));
@@ -473,8 +458,7 @@ void test_schema_v8_recipe_optimizer_compatibility() {
    document["workflows"]["train"]["training"]["optimizer"] = raw_ids[index];
    GuiSettingsState loaded = default_gui_settings_state();
    bool repaired = true;
-   REQUIRE(load_settings(write_recipe_case(temporary, "valid-" + std::to_string(optimizer.persisted_id) + "-" + std::to_string(index) + ".json", document),
-                         loaded, nullptr, &repaired));
+   REQUIRE(load_settings(write_recipe_case(temporary, "valid-" + std::to_string(optimizer.persisted_id) + "-" + std::to_string(index) + ".json", document), loaded, nullptr, &repaired));
    CHECK_FALSE(repaired);
    CHECK(loaded.workflows.train.request.optimizer == optimizer.native_value);
    const nlohmann::json saved = snapshot_gui_settings(loaded);
@@ -537,8 +521,7 @@ void test_schema_v8_recipe_malformed_and_constraint_rejection_is_atomic() {
   std::pair<std::string_view, nlohmann::json>{"negative-optimizer", -1},
   std::pair<std::string_view, nlohmann::json>{"outside-optimizer", 2},
   std::pair<std::string_view, nlohmann::json>{"unsigned-outside-optimizer", nlohmann::json::number_unsigned_t{2}},
-  std::pair<std::string_view, nlohmann::json>{"overflowing-optimizer",
-                                              nlohmann::json::number_unsigned_t{static_cast<unsigned int>(std::numeric_limits<int>::max()) + 1U}},
+  std::pair<std::string_view, nlohmann::json>{"overflowing-optimizer", nlohmann::json::number_unsigned_t{static_cast<unsigned int>(std::numeric_limits<int>::max()) + 1U}},
  };
  for (const auto& [name, invalid_optimizer] : invalid_optimizers) {
   nlohmann::json document = recipe_document(0, golden_recipe_values(0), uniform_recipe_overrides(false));
@@ -666,40 +649,18 @@ void test_ui_settings_round_trip() {
  const nlohmann::json saved = snapshot_gui_settings(snapshot);
  REQUIRE((saved.at("schema_version") == kGuiSettingsSchemaVersion));
  CHECK(saved.at("schema_version") == 8);
- const nlohmann::json expected_source{{"kind", 1},
-                                      {"compiled_path", "/tmp/source.bin"},
-                                      {"single_image_path", "/tmp/input.png"},
-                                      {"image_directory", "/tmp/images"},
-                                      {"video_file_path", "/tmp/movie.mp4"},
-                                      {"recursive", true},
-                                      {"device_index", 3},
-                                      {"capture_width", 640},
-                                      {"capture_height", 480},
-                                      {"capture_fps", 29},
-                                      {"v4l2_buffer_count", 7},
-                                      {"crop_x", 11},
-                                      {"crop_y", 13},
-                                      {"crop_width", 101},
-                                      {"crop_height", 103}};
+ const nlohmann::json expected_source{{"kind", 1}, {"compiled_path", "/tmp/source.bin"}, {"single_image_path", "/tmp/input.png"}, {"image_directory", "/tmp/images"},
+  {"video_file_path", "/tmp/movie.mp4"}, {"recursive", true}, {"device_index", 3}, {"capture_width", 640}, {"capture_height", 480}, {"capture_fps", 29}, {"v4l2_buffer_count", 7}, {"crop_x", 11},
+  {"crop_y", 13}, {"crop_width", 101}, {"crop_height", 103}};
  CHECK(saved.at("workflows").at("predict").at("source") == expected_source);
  const auto& saved_training = saved.at("workflows").at("train").at("training");
  CHECK(saved_training.at("execution_target") == 1);
  CHECK(saved_training.at("remote_family_enabled") == nlohmann::json::array({true, false, true, false, false}));
  CHECK(saved_training.at("remote_container_image") == "test-training-image");
  CHECK(saved_training.at("remote_launch_template") == "/tmp/launch-template");
- const nlohmann::json expected_ui{{"dark_mode", true},
-                                  {"show_workspace_performance", true},
-                                  {"ui_scale", 1.35f},
-                                  {"font_size", 18.0f},
-                                  {"secondary_font_size", 15.0f},
-                                  {"mono_font_size", 14.0f},
-                                  {"text_input_font_size", 17.0f},
-                                  {"crop_edge_hit_half_width", 11.0f},
-                                  {"crop_corner_hit_size", 24.0f},
-                                  {"crop_handle_radius", 7.5f},
-                                  {"workspace_aspect_ratio", 3},
-                                  {"annotation_brush_radius", 27},
-                                  {"mask_cleanup_radius", 6}};
+ const nlohmann::json expected_ui{{"dark_mode", true}, {"show_workspace_performance", true}, {"ui_scale", 1.35f}, {"font_size", 18.0f}, {"secondary_font_size", 15.0f}, {"mono_font_size", 14.0f},
+  {"text_input_font_size", 17.0f}, {"crop_edge_hit_half_width", 11.0f}, {"crop_corner_hit_size", 24.0f}, {"crop_handle_radius", 7.5f}, {"workspace_aspect_ratio", 3}, {"annotation_brush_radius", 27},
+  {"mask_cleanup_radius", 6}};
  CHECK(saved.at("ui") == expected_ui);
  REQUIRE((saved.at("ui").at("workspace_aspect_ratio") == 3));
  REQUIRE((saved.at("ui").at("annotation_brush_radius") == 27));
@@ -758,9 +719,7 @@ void test_ui_settings_round_trip() {
  CHECK(loaded_train.remote_container_image == "test-training-image");
  CHECK(loaded_train.remote_launch_template == "/tmp/launch-template");
  apply_gui_settings(
-  {{"schema_version", 8},
-   {"ui", {{"dark_mode", false}}},
-   {"workflows", {{"predict", {{"source", {{"recursive", false}}}}}, {"train", {{"training", {{"remote_container_image", "updated-image"}}}}}}}},
+  {{"schema_version", 8}, {"ui", {{"dark_mode", false}}}, {"workflows", {{"predict", {{"source", {{"recursive", false}}}}}, {"train", {{"training", {{"remote_container_image", "updated-image"}}}}}}}},
   loaded);
  CHECK_FALSE(loaded_ui.dark_mode);
  CHECK(loaded_ui.font_size == 18.0f);
@@ -891,8 +850,7 @@ void test_fresh_defaults_use_capture_only_annotate() {
 TEST_CASE("explicit compiled selections override inferred directories and keep test input optional", "[gui][settings]") {
  auto state = default_gui_settings_state();
  const std::array updates{
-  SettingsValueUpdate{
-   .path = "workflows.train.request.train_compiled_path",
+  SettingsValueUpdate{.path = "workflows.train.request.train_compiled_path",
    .value = *mmltk::frameworks::serialization::wire::FlatValue::text("/selected/compiled.mmltk", mmltk::frameworks::reflection::kMaximumPathBytes)},
  };
  REQUIRE(apply_gui_settings_values(state, updates));
@@ -925,8 +883,7 @@ TEST_CASE("validation source follows effective training split without persisting
 TEST_CASE("optional test selection and persistence are independent of inferred training splits", "[gui][settings]") {
  auto state = default_gui_settings_state();
  const auto edit = [&](const char* path, const char* value) {
-  const std::array updates{SettingsValueUpdate{
-   .path = path, .value = *mmltk::frameworks::serialization::wire::FlatValue::text(value, mmltk::frameworks::reflection::kMaximumPathBytes)}};
+  const std::array updates{SettingsValueUpdate{.path = path, .value = *mmltk::frameworks::serialization::wire::FlatValue::text(value, mmltk::frameworks::reflection::kMaximumPathBytes)}};
   REQUIRE(apply_gui_settings_values(state, updates));
  };
  edit("workflows.train.request.test_compiled_path", "/independent/evaluation.bin");
@@ -978,8 +935,7 @@ void test_model_input_load_normalizes_invalid_values_by_workflow() {
 }
 // Seeds view states with sentinel values, then requires that loading `path` fails and leaves them
 // untouched.
-void assert_load_rejected_and_state_preserved(const std::filesystem::path& path, const mmltk::controller::contracts::FeatureId view, const float ui_scale,
-                                              const char* output_dir) {
+void assert_load_rejected_and_state_preserved(const std::filesystem::path& path, const mmltk::controller::contracts::FeatureId view, const float ui_scale, const char* output_dir) {
  SettingsViewStates states;
  states.ui.ui_scale = ui_scale;
  states.workflows.train.request.output_dir = output_dir;
@@ -1071,10 +1027,8 @@ void test_bounded_flat_settings_mutation_is_atomic() {
  CHECK(state.workflows.predict.request.resolution == preset.resolution);
  CHECK(state.workflows.predict.model_source == ModelSelectionSource::Canonical);
  CHECK(state.workflows.predict.model_input == ModelArtifactInputKind::Weights);
- const std::array device_id_values{mmltk::frameworks::serialization::wire::FlatValue{std::int64_t{2}},
-                                   mmltk::frameworks::serialization::wire::FlatValue{std::int64_t{4}}};
- const auto device_ids =
-  mmltk::frameworks::serialization::wire::FlatValue::array(device_id_values, {.max_bytes = 16U, .max_items = device_id_values.size(), .max_depth = 1U});
+ const std::array device_id_values{mmltk::frameworks::serialization::wire::FlatValue{std::int64_t{2}}, mmltk::frameworks::serialization::wire::FlatValue{std::int64_t{4}}};
+ const auto device_ids = mmltk::frameworks::serialization::wire::FlatValue::array(device_id_values, {.max_bytes = 16U, .max_items = device_id_values.size(), .max_depth = 1U});
  REQUIRE(device_ids.has_value());
  const std::array direct_flat_updates{
   SettingsValueUpdate{.path = "ui.dark_mode", .value = mmltk::frameworks::serialization::wire::FlatValue{true}},
@@ -1193,8 +1147,7 @@ void test_model_selection_settings_validation_exhausts_canonical_compatibility()
    case FeatureId::Explore: FAIL("test case requires a ModelSystem workflow");
   }
   const bool expected =
-   input == ModelArtifactInputKind::None ||
-   (workflow == FeatureId::Export ? model_selection_compatible(workflow, source, input, build_tensorrt) : model_selection_compatible(workflow, source, input));
+   input == ModelArtifactInputKind::None || (workflow == FeatureId::Export ? model_selection_compatible(workflow, source, input, build_tensorrt) : model_selection_compatible(workflow, source, input));
   CHECK(gui_settings_valid(state) == expected);
  };
  for (const auto workflow : {FeatureId::Train, FeatureId::Validate, FeatureId::Predict}) {
@@ -1244,44 +1197,39 @@ void test_gui_json_persistence_enforces_reflected_field_policies() {
   PersistenceCase{"signed outside", [](nlohmann::json& document) { document["ui"]["annotation_brush_radius"] = kMaxAnnotationBrushRadius + 1; }, true, true},
   PersistenceCase{"unsigned endpoint", [](nlohmann::json& document) { document["workflows"]["explore"]["min_instances"] = 10'000U; }, true, false},
   PersistenceCase{"unsigned outside", [](nlohmann::json& document) { document["workflows"]["explore"]["min_instances"] = 10'001U; }, true, true},
-  PersistenceCase{"unsigned conversion overflow",
-                  [](nlohmann::json& document) { document["workflows"]["explore"]["min_instances"] = std::numeric_limits<std::uint64_t>::max(); }, false,
-                  false},
+  PersistenceCase{"unsigned conversion overflow", [](nlohmann::json& document) { document["workflows"]["explore"]["min_instances"] = std::numeric_limits<std::uint64_t>::max(); }, false, false},
   PersistenceCase{"float endpoint", [](nlohmann::json& document) { document["ui"]["ui_scale"] = 1.75F; }, true, false},
   PersistenceCase{"float outside", [](nlohmann::json& document) { document["ui"]["ui_scale"] = 1.7501F; }, true, true},
   PersistenceCase{"nonfinite JSON representation", [](nlohmann::json& document) { document["ui"]["ui_scale"] = nullptr; }, false, false},
   PersistenceCase{"path endpoint",
-                  [](nlohmann::json& document) {
-                   document["workflows"]["train"]["training"]["auto_output"] = false;
-                   document["workflows"]["train"]["training"]["output_dir"] = std::string(mmltk::frameworks::reflection::kMaximumPathBytes, 'x');
-                  },
-                  true, false},
+   [](nlohmann::json& document) {
+    document["workflows"]["train"]["training"]["auto_output"] = false;
+    document["workflows"]["train"]["training"]["output_dir"] = std::string(mmltk::frameworks::reflection::kMaximumPathBytes, 'x');
+   },
+   true, false},
   PersistenceCase{"path outside",
-                  [](nlohmann::json& document) {
-                   document["workflows"]["train"]["training"]["auto_output"] = false;
-                   document["workflows"]["train"]["training"]["output_dir"] = std::string(mmltk::frameworks::reflection::kMaximumPathBytes + 1U, 'x');
-                  },
-                  false, false},
+   [](nlohmann::json& document) {
+    document["workflows"]["train"]["training"]["auto_output"] = false;
+    document["workflows"]["train"]["training"]["output_dir"] = std::string(mmltk::frameworks::reflection::kMaximumPathBytes + 1U, 'x');
+   },
+   false, false},
   PersistenceCase{"container endpoint",
-                  [](nlohmann::json& document) {
-                   auto& ids = document["workflows"]["train"]["training"]["local_device_ids"];
-                   ids = nlohmann::json::array();
-                   for (std::size_t index = 0U; index < mmltk::backend::models::rfdetr::kMaximumTrainingDevices; ++index) { ids.push_back(index); }
-                  },
-                  true, false},
+   [](nlohmann::json& document) {
+    auto& ids = document["workflows"]["train"]["training"]["local_device_ids"];
+    ids = nlohmann::json::array();
+    for (std::size_t index = 0U; index < mmltk::backend::models::rfdetr::kMaximumTrainingDevices; ++index) { ids.push_back(index); }
+   },
+   true, false},
   PersistenceCase{"container outside",
-                  [](nlohmann::json& document) {
-                   auto& ids = document["workflows"]["train"]["training"]["local_device_ids"];
-                   ids = nlohmann::json::array();
-                   for (std::size_t index = 0U; index <= mmltk::backend::models::rfdetr::kMaximumTrainingDevices; ++index) { ids.push_back(index); }
-                  },
-                  false, false},
+   [](nlohmann::json& document) {
+    auto& ids = document["workflows"]["train"]["training"]["local_device_ids"];
+    ids = nlohmann::json::array();
+    for (std::size_t index = 0U; index <= mmltk::backend::models::rfdetr::kMaximumTrainingDevices; ++index) { ids.push_back(index); }
+   },
+   false, false},
   PersistenceCase{"container element conversion overflow",
-                  [](nlohmann::json& document) {
-                   document["workflows"]["train"]["training"]["local_device_ids"] =
-                    nlohmann::json::array({static_cast<std::uint64_t>(std::numeric_limits<int>::max()) + 1U});
-                  },
-                  false, false},
+   [](nlohmann::json& document) { document["workflows"]["train"]["training"]["local_device_ids"] = nlohmann::json::array({static_cast<std::uint64_t>(std::numeric_limits<int>::max()) + 1U}); }, false,
+   false},
  };
  mmltk::testsupport::ScopedTempDir persistence_root("mmltk-field-policy-persistence");
  std::size_t persistence_index = 0U;
@@ -1324,8 +1272,7 @@ void test_explore_settings_projection_covers_every_scalar_in_both_directions() {
   CHECK(projected.overlay.show_masks == (selected == 3U));
   ExploreViewState restored;
   ExploreSettingsProjection::Visit([&]<auto Setting, auto Filter>() {
-   mmltk::frameworks::reflection::access<ExploreViewState, Setting>(restored) =
-    mmltk::frameworks::reflection::access<const mmltk::controller::ExploreFilterUpdate, Filter>(projected);
+   mmltk::frameworks::reflection::access<ExploreViewState, Setting>(restored) = mmltk::frameworks::reflection::access<const mmltk::controller::ExploreFilterUpdate, Filter>(projected);
   });
   CHECK(restored.require_boxes == (selected == 0U));
   CHECK(restored.require_masks == (selected == 1U));
@@ -1345,8 +1292,7 @@ void test_explore_settings_projection_covers_every_scalar_in_both_directions() {
  settings.show_masks = true;
  mmltk::controller::ExploreFilterUpdate filter;
  ExploreSettingsProjection::Visit([&]<auto Setting, auto Filter>() {
-  mmltk::frameworks::reflection::access<mmltk::controller::ExploreFilterUpdate, Filter>(filter) =
-   mmltk::frameworks::reflection::access<const ExploreViewState, Setting>(settings);
+  mmltk::frameworks::reflection::access<mmltk::controller::ExploreFilterUpdate, Filter>(filter) = mmltk::frameworks::reflection::access<const ExploreViewState, Setting>(settings);
  });
  CHECK(filter.filter.require_boxes);
  CHECK_FALSE(filter.filter.require_masks);
@@ -1369,8 +1315,7 @@ void test_explore_settings_projection_covers_every_scalar_in_both_directions() {
  filter.overlay.show_boxes = true;
  filter.overlay.show_masks = false;
  ExploreSettingsProjection::Visit([&]<auto Setting, auto Filter>() {
-  mmltk::frameworks::reflection::access<ExploreViewState, Setting>(settings) =
-   mmltk::frameworks::reflection::access<const mmltk::controller::ExploreFilterUpdate, Filter>(filter);
+  mmltk::frameworks::reflection::access<ExploreViewState, Setting>(settings) = mmltk::frameworks::reflection::access<const mmltk::controller::ExploreFilterUpdate, Filter>(filter);
  });
  CHECK_FALSE(settings.require_boxes);
  CHECK(settings.require_masks);
@@ -1502,14 +1447,10 @@ void test_schema_v8_training_supervision_round_trip_defaults_and_atomic_rejectio
  missing["workflows"]["train"]["training"].erase("training_supervision");
  apply_gui_settings(missing, round_trip);
  CHECK(round_trip.workflows.train.request.training_supervision == mmltk::backend::models::rfdetr::TrainingSupervisionConfig{});
- for (const nlohmann::json& malformed :
-      {nlohmann::json{"not-an-object"},
-       nlohmann::json{{"assignment", "match-free"},
-                      {"match_free", {{"rho", 0.0}, {"correspondence_weight", 1.0}, {"query_weight", 1.0}}},
-                      {"denoising", {{"enabled", false}, {"groups", 5}, {"label_noise_ratio", 0.2}, {"center_noise_scale", 0.4}, {"size_noise_scale", 0.4}}}},
-       nlohmann::json{
-        {"assignment", "match-free"},
-        {"match_free", {{"rho", 0.5}, {"correspondence_weight", 0.0}, {"query_weight", 0.0}}},
+ for (const nlohmann::json& malformed : {nlohmann::json{"not-an-object"},
+       nlohmann::json{{"assignment", "match-free"}, {"match_free", {{"rho", 0.0}, {"correspondence_weight", 1.0}, {"query_weight", 1.0}}},
+        {"denoising", {{"enabled", false}, {"groups", 5}, {"label_noise_ratio", 0.2}, {"center_noise_scale", 0.4}, {"size_noise_scale", 0.4}}}},
+       nlohmann::json{{"assignment", "match-free"}, {"match_free", {{"rho", 0.5}, {"correspondence_weight", 0.0}, {"query_weight", 0.0}}},
         {"denoising", {{"enabled", false}, {"groups", 5}, {"label_noise_ratio", 0.2}, {"center_noise_scale", 0.4}, {"size_noise_scale", 0.4}}}}}) {
   nlohmann::json invalid = saved;
   invalid["workflows"]["train"]["training"]["training_supervision"] = malformed;
@@ -1572,8 +1513,7 @@ void test_explore_preview_candidate_is_atomic_and_persists_native_modes() {
  CHECK(detail.augmentation_preview_enabled);
  CHECK(detail.show_original_dimensions);
  CHECK_THROWS_AS(settings.Update(initial, {.preferences = mmltk::controller::ExploreFilterUpdate{}}), mmltk::controller::contracts::BusyError);
- const auto filtered =
-  settings.Update(detail, {.preferences = mmltk::controller::ExploreFilterUpdate{.filter = {.minimum_instances = 1U}, .overlay = {.show_boxes = false}}});
+ const auto filtered = settings.Update(detail, {.preferences = mmltk::controller::ExploreFilterUpdate{.filter = {.minimum_instances = 1U}, .overlay = {.show_boxes = false}}});
  CHECK(filtered.version > detail.version);
  CHECK(filtered.preferences.policy.filter.minimum_instances == 1U);
  CHECK_FALSE(filtered.preferences.policy.overlay.show_boxes);
@@ -1591,8 +1531,7 @@ void test_copy_paste_default_and_persisted_overrides() {
  CHECK(settings.explore_settings_candidate().augmentation.copy_paste_probability == .80F);
  for (const float probability : {0.F, .30F, .50F, 1.F}) {
   SettingsUpdateRequest request;
-  request.updates.push_back({.path = "workflows.train.request.gpu_augmentation.copy_paste_probability",
-                             .value = mmltk::frameworks::serialization::wire::FlatValue{static_cast<double>(probability)}});
+  request.updates.push_back({.path = "workflows.train.request.gpu_augmentation.copy_paste_probability", .value = mmltk::frameworks::serialization::wire::FlatValue{static_cast<double>(probability)}});
   (void)settings.Update(std::move(request));
   mmltk::controller::SettingsSystem reloaded;
   REQUIRE(reloaded.Load(location).applied());
@@ -1615,8 +1554,7 @@ void test_apply_current_copy_paste_preference() {
  auto expected = settings.snapshot().settings_state;
  expected.workflows.train.request.gpu_augmentation.copy_paste_probability = .80F;
  SettingsUpdateRequest request;
- request.updates.push_back({.path = "workflows.train.request.gpu_augmentation.copy_paste_probability",
-                            .value = mmltk::frameworks::serialization::wire::FlatValue{static_cast<double>(.80F)}});
+ request.updates.push_back({.path = "workflows.train.request.gpu_augmentation.copy_paste_probability", .value = mmltk::frameworks::serialization::wire::FlatValue{static_cast<double>(.80F)}});
  const bool updated_only_requested_preference = settings.Update(std::move(request)).settings_state == expected;
  REQUIRE(updated_only_requested_preference);
  mmltk::controller::SettingsSystem reloaded;
@@ -1627,61 +1565,33 @@ void test_apply_current_copy_paste_preference() {
 }  // namespace
 TEST_CASE("test_ui_settings_round_trip", "[gui][settings]") { test_ui_settings_round_trip(); }
 TEST_CASE("test_schema_v8_recipe_golden_shape_and_round_trip", "[gui][settings]") { test_schema_v8_recipe_golden_shape_and_round_trip(); }
-TEST_CASE("test_schema_v8_nonuniform_recipe_and_every_missing_member_are_preserved", "[gui][settings]") {
- test_schema_v8_nonuniform_recipe_and_every_missing_member_are_preserved();
-}
-TEST_CASE("test_schema_v8_recipe_placement_and_unknown_fields_repair_canonically", "[gui][settings]") {
- test_schema_v8_recipe_placement_and_unknown_fields_repair_canonically();
-}
+TEST_CASE("test_schema_v8_nonuniform_recipe_and_every_missing_member_are_preserved", "[gui][settings]") { test_schema_v8_nonuniform_recipe_and_every_missing_member_are_preserved(); }
+TEST_CASE("test_schema_v8_recipe_placement_and_unknown_fields_repair_canonically", "[gui][settings]") { test_schema_v8_recipe_placement_and_unknown_fields_repair_canonically(); }
 TEST_CASE("test_schema_v8_recipe_scheduler_compatibility", "[gui][settings]") { test_schema_v8_recipe_scheduler_compatibility(); }
 TEST_CASE("test_schema_v8_recipe_optimizer_compatibility", "[gui][settings]") { test_schema_v8_recipe_optimizer_compatibility(); }
-TEST_CASE("test_schema_v8_recipe_malformed_and_constraint_rejection_is_atomic", "[gui][settings]") {
- test_schema_v8_recipe_malformed_and_constraint_rejection_is_atomic();
-}
+TEST_CASE("test_schema_v8_recipe_malformed_and_constraint_rejection_is_atomic", "[gui][settings]") { test_schema_v8_recipe_malformed_and_constraint_rejection_is_atomic(); }
 TEST_CASE("test_fresh_defaults_use_capture_only_annotate", "[gui][settings]") { test_fresh_defaults_use_capture_only_annotate(); }
 TEST_CASE("test_model_input_load_normalizes_invalid_values_by_workflow", "[gui][settings]") { test_model_input_load_normalizes_invalid_values_by_workflow(); }
-TEST_CASE("test_persistence_rejects_unsupported_schema_and_malformed_files", "[gui][settings]") {
- test_persistence_rejects_unsupported_schema_and_malformed_files();
-}
+TEST_CASE("test_persistence_rejects_unsupported_schema_and_malformed_files", "[gui][settings]") { test_persistence_rejects_unsupported_schema_and_malformed_files(); }
 // CLEANUP-IGNORE: Each named settings behavior remains independently registered with the native test inventory.
-TEST_CASE("test_persistence_repairs_catalog_and_compiled_directory_defaults", "[gui][settings]") {
- test_persistence_repairs_catalog_and_compiled_directory_defaults();
-}
+TEST_CASE("test_persistence_repairs_catalog_and_compiled_directory_defaults", "[gui][settings]") { test_persistence_repairs_catalog_and_compiled_directory_defaults(); }
 TEST_CASE("test_bounded_flat_settings_mutation_is_atomic", "[gui][settings]") { test_bounded_flat_settings_mutation_is_atomic(); }
-TEST_CASE("test_catalog_source_transition_normalizes_model_input_at_the_native_boundary", "[gui][settings]") {
- test_catalog_source_transition_normalizes_model_input_at_the_native_boundary();
-}
-TEST_CASE("test_model_selection_settings_validation_exhausts_canonical_compatibility", "[gui][settings]") {
- test_model_selection_settings_validation_exhausts_canonical_compatibility();
-}
+TEST_CASE("test_catalog_source_transition_normalizes_model_input_at_the_native_boundary", "[gui][settings]") { test_catalog_source_transition_normalizes_model_input_at_the_native_boundary(); }
+TEST_CASE("test_model_selection_settings_validation_exhausts_canonical_compatibility", "[gui][settings]") { test_model_selection_settings_validation_exhausts_canonical_compatibility(); }
 TEST_CASE("test_gui_json_persistence_enforces_reflected_field_policies", "[gui][settings]") { test_gui_json_persistence_enforces_reflected_field_policies(); }
-TEST_CASE("test_explore_class_capacity_is_canonical_across_persistence_and_reflection", "[gui][settings]") {
- test_explore_class_capacity_is_canonical_across_persistence_and_reflection();
-}
-TEST_CASE("test_explore_settings_projection_covers_every_scalar_in_both_directions", "[gui][settings]") {
- test_explore_settings_projection_covers_every_scalar_in_both_directions();
-}
-TEST_CASE("test_explore_class_catalog_identity_is_ordered_and_deterministic", "[gui][settings]") {
- test_explore_class_catalog_identity_is_ordered_and_deterministic();
-}
-TEST_CASE("test_explore_class_catalog_identity_rejects_generic_settings_mutation", "[gui][settings]") {
- test_explore_class_catalog_identity_rejects_generic_settings_mutation();
-}
-TEST_CASE("test_opaque_recipe_mask_rejects_generic_settings_mutation_atomically", "[gui][settings]") {
- test_opaque_recipe_mask_rejects_generic_settings_mutation_atomically();
-}
+TEST_CASE("test_explore_class_capacity_is_canonical_across_persistence_and_reflection", "[gui][settings]") { test_explore_class_capacity_is_canonical_across_persistence_and_reflection(); }
+TEST_CASE("test_explore_settings_projection_covers_every_scalar_in_both_directions", "[gui][settings]") { test_explore_settings_projection_covers_every_scalar_in_both_directions(); }
+TEST_CASE("test_explore_class_catalog_identity_is_ordered_and_deterministic", "[gui][settings]") { test_explore_class_catalog_identity_is_ordered_and_deterministic(); }
+TEST_CASE("test_explore_class_catalog_identity_rejects_generic_settings_mutation", "[gui][settings]") { test_explore_class_catalog_identity_rejects_generic_settings_mutation(); }
+TEST_CASE("test_opaque_recipe_mask_rejects_generic_settings_mutation_atomically", "[gui][settings]") { test_opaque_recipe_mask_rejects_generic_settings_mutation_atomically(); }
 TEST_CASE("test_training_supervision_relation_is_enforced_by_generic_settings_validity", "[gui][settings][training_supervision]") {
  test_training_supervision_relation_is_enforced_by_generic_settings_validity();
 }
 TEST_CASE("test_schema_v8_training_supervision_round_trip_defaults_and_atomic_rejection", "[gui][settings][training_supervision]") {
  test_schema_v8_training_supervision_round_trip_defaults_and_atomic_rejection();
 }
-TEST_CASE("test_startup_transport_override_is_session_local_in_both_directions", "[gui][settings]") {
- test_startup_transport_override_is_session_local_in_both_directions();
-}
-TEST_CASE("test_explore_preview_candidate_is_atomic_and_persists_native_modes", "[gui][settings][explore]") {
- test_explore_preview_candidate_is_atomic_and_persists_native_modes();
-}
+TEST_CASE("test_startup_transport_override_is_session_local_in_both_directions", "[gui][settings]") { test_startup_transport_override_is_session_local_in_both_directions(); }
+TEST_CASE("test_explore_preview_candidate_is_atomic_and_persists_native_modes", "[gui][settings][explore]") { test_explore_preview_candidate_is_atomic_and_persists_native_modes(); }
 TEST_CASE("test_copy_paste_default_and_persisted_overrides", "[gui][settings][copy_paste]") { test_copy_paste_default_and_persisted_overrides(); }
 TEST_CASE("test_apply_current_copy_paste_preference", "[.][acceptance][settings]") { test_apply_current_copy_paste_preference(); }
 TEST_CASE("checkpoint restore preserves output policy and installs explicit inherited splits", "[gui][settings][train]") {
@@ -1696,10 +1606,8 @@ TEST_CASE("checkpoint restore preserves output policy and installs explicit inhe
    c::SettingsUpdateRequest selected;
    selected.updates = {
     {.path = "workflows.train.auto_output", .value = Value{automatic}},
-    {.path = "workflows.train.request.output_dir",
-     .value = Value::text(automatic ? "" : "/selected/output", mmltk::frameworks::reflection::kMaximumPathBytes).value()},
-    {.path = "workflows.validate.request.compiled_path",
-     .value = Value::text(independent ? "/independent/val.bin" : "", mmltk::frameworks::reflection::kMaximumPathBytes).value()},
+    {.path = "workflows.train.request.output_dir", .value = Value::text(automatic ? "" : "/selected/output", mmltk::frameworks::reflection::kMaximumPathBytes).value()},
+    {.path = "workflows.validate.request.compiled_path", .value = Value::text(independent ? "/independent/val.bin" : "", mmltk::frameworks::reflection::kMaximumPathBytes).value()},
    };
    (void)settings.Update(std::move(selected));
    auto request = settings.snapshot().settings_state.workflows.train.request;
@@ -1731,13 +1639,11 @@ TEST_CASE("manual output selection disables automatic output and enabling it cle
  REQUIRE(settings.workflows.train.auto_output);
  REQUIRE(settings.workflows.train.request.output_dir.empty());
  const mmltk::controller::contracts::SettingsValueUpdate selected{
-  .path = "workflows.train.request.output_dir",
-  .value = mmltk::frameworks::serialization::wire::FlatValue::text("/selected/output", mmltk::frameworks::reflection::kMaximumPathBytes).value()};
+  .path = "workflows.train.request.output_dir", .value = mmltk::frameworks::serialization::wire::FlatValue::text("/selected/output", mmltk::frameworks::reflection::kMaximumPathBytes).value()};
  REQUIRE(mmltk::controller::contracts::apply_gui_settings_values(settings, std::span{&selected, 1}));
  REQUIRE_FALSE(settings.workflows.train.auto_output);
  REQUIRE(settings.workflows.train.request.output_dir == "/selected/output");
- const mmltk::controller::contracts::SettingsValueUpdate automatic{.path = "workflows.train.auto_output",
-                                                                   .value = mmltk::frameworks::serialization::wire::FlatValue{true}};
+ const mmltk::controller::contracts::SettingsValueUpdate automatic{.path = "workflows.train.auto_output", .value = mmltk::frameworks::serialization::wire::FlatValue{true}};
  REQUIRE(mmltk::controller::contracts::apply_gui_settings_values(settings, std::span{&automatic, 1}));
  REQUIRE(settings.workflows.train.auto_output);
  REQUIRE(settings.workflows.train.request.output_dir.empty());
@@ -1815,13 +1721,11 @@ TEST_CASE("benchmark selections persist as one canonical nested value and reject
   for (const auto validation : {data::CoconutValidation::Coconut, data::CoconutValidation::Stock, data::CoconutValidation::CoconutStock}) {
    const auto dataset_name = mmltk::frameworks::reflection::enum_name(dataset);
    const auto validation_name = mmltk::frameworks::reflection::enum_name(validation);
-   const std::array edits{SettingsValueUpdate{.path = "workflows.train.benchmark_selection.dataset",
-                                              .value = *mmltk::frameworks::serialization::wire::FlatValue::text(dataset_name, dataset_name.size())},
-                          SettingsValueUpdate{.path = "workflows.train.benchmark_selection.validation",
-                                              .value = *mmltk::frameworks::serialization::wire::FlatValue::text(validation_name, validation_name.size())}};
+   const std::array edits{
+    SettingsValueUpdate{.path = "workflows.train.benchmark_selection.dataset", .value = *mmltk::frameworks::serialization::wire::FlatValue::text(dataset_name, dataset_name.size())},
+    SettingsValueUpdate{.path = "workflows.train.benchmark_selection.validation", .value = *mmltk::frameworks::serialization::wire::FlatValue::text(validation_name, validation_name.size())}};
    REQUIRE(apply_gui_settings_values(state, edits));
-   const std::array recovery_edit{SettingsValueUpdate{.path = "workflows.train.benchmark_selection.recover_dropped_masks",
-                                                     .value = mmltk::frameworks::serialization::wire::FlatValue{true}}};
+   const std::array recovery_edit{SettingsValueUpdate{.path = "workflows.train.benchmark_selection.recover_dropped_masks", .value = mmltk::frameworks::serialization::wire::FlatValue{true}}};
    REQUIRE(apply_gui_settings_values(state, recovery_edit));
    CHECK(state.workflows.train.benchmark_selection == data::BenchmarkDatasetSelection{dataset, validation, true});
    auto previous_format = snapshot_gui_settings(state);
@@ -1887,8 +1791,7 @@ TEST_CASE("benchmark selections persist as one canonical nested value and reject
    auto before = loaded;
    CHECK_THROWS(apply_gui_settings(malformed, loaded));
    CHECK(loaded == before);
-   const std::array edit{SettingsValueUpdate{.path = std::string{"workflows.train.benchmark_selection."} + field,
-                                             .value = mmltk::frameworks::serialization::wire::FlatValue{invalid}}};
+   const std::array edit{SettingsValueUpdate{.path = std::string{"workflows.train.benchmark_selection."} + field, .value = mmltk::frameworks::serialization::wire::FlatValue{invalid}}};
    CHECK_FALSE(apply_gui_settings_values(loaded, edit));
    CHECK(loaded == before);
    nlohmann::json flat = state.workflows.train;

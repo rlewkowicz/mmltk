@@ -28,22 +28,15 @@ std::uint64_t img_per_sec_x100(const std::uint64_t elapsed_ns, const std::size_t
 std::uint64_t elapsed_ns_since(const std::chrono::steady_clock::time_point& started) {
  return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count());
 }
-double seconds_since(const std::chrono::steady_clock::time_point& start, const std::chrono::steady_clock::time_point& end) {
- return std::chrono::duration<double>(end - start).count();
-}
+double seconds_since(const std::chrono::steady_clock::time_point& start, const std::chrono::steady_clock::time_point& end) { return std::chrono::duration<double>(end - start).count(); }
 std::string benchmark_metric_name(const char* const suffix) { return std::string{"benchmark."} + suffix; }
 std::string benchmark_metric_name(const char* const label, const char* const suffix) { return std::string{"benchmark."} + label + "." + suffix; }
-void record_duration_metric(const char* const suffix, const std::uint64_t elapsed_ns) {
- mmltk::common::logging::profile_record_duration_ns(benchmark_metric_name(suffix).c_str(), elapsed_ns);
+void record_duration_metric(const char* const suffix, const std::uint64_t elapsed_ns) { mmltk::common::logging::profile_record_duration_ns(benchmark_metric_name(suffix).c_str(), elapsed_ns); }
+void record_duration_metric(const char* const label, const char* const suffix, const std::chrono::steady_clock::time_point& start, const std::chrono::steady_clock::time_point& end) {
+ mmltk::common::logging::profile_record_duration_ns(
+  benchmark_metric_name(label, suffix).c_str(), static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count()));
 }
-void record_duration_metric(const char* const label, const char* const suffix, const std::chrono::steady_clock::time_point& start,
-                            const std::chrono::steady_clock::time_point& end) {
- mmltk::common::logging::profile_record_duration_ns(benchmark_metric_name(label, suffix).c_str(),
-                                                    static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count()));
-}
-void record_value_metric(const char* const suffix, const std::uint64_t value) {
- mmltk::common::logging::profile_add_value(benchmark_metric_name(suffix).c_str(), value);
-}
+void record_value_metric(const char* const suffix, const std::uint64_t value) { mmltk::common::logging::profile_add_value(benchmark_metric_name(suffix).c_str(), value); }
 void record_value_metric(const char* const label, const char* const suffix, const std::uint64_t value) {
  mmltk::common::logging::profile_add_value(benchmark_metric_name(label, suffix).c_str(), value);
 }

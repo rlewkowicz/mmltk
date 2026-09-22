@@ -11,8 +11,7 @@ namespace mmltk::controller::services {
 namespace {
 using FileDialogDescriptorStorage = std::inplace_vector<FileDialogDescriptor, kFileDialogCatalogCapacity>;
 void append_model_artifact_dialogs(FileDialogDescriptorStorage& dialogs) {
- mmltk::controller::contracts::ModelSelectionRelation::VisitRows([&]<class Relation>(
-                                                                  const mmltk::controller::contracts::ModelSelectionCompatibility& compatibility) {
+ mmltk::controller::contracts::ModelSelectionRelation::VisitRows([&]<class Relation>(const mmltk::controller::contracts::ModelSelectionCompatibility& compatibility) {
   if (!compatibility.custom_allowed) return;
   constexpr auto artifact_path = mmltk::frameworks::reflection::reflected_member_path<mmltk::controller::contracts::GuiSettingsState, Relation::artifact>();
   const std::uint64_t stable_id = mmltk::controller::browser::application_settings_field_stable_id(artifact_path.view());
@@ -69,15 +68,13 @@ FileDialogCatalog FileDialogCatalog::Create(const std::span<const FileDialogDesc
  std::copy(entries.begin(), entries.end(), result.entries_.begin());
  for (std::size_t left = 0U; left < entries.size(); ++left) {
   const auto& entry = entries[left];
-  if (entry.stable_id == 0U || entry.stable_id != mmltk::controller::browser::application_settings_field_stable_id(entry.field_path.view()) ||
-      !entry.field_path.valid() || !entry.workflows.valid() || !entry.title.valid() || !entry.filter.name.valid() || !entry.filter.pattern.valid() ||
-      !mmltk::frameworks::reflection::enum_contains(entry.mode) || (entry.model_input && !mmltk::frameworks::reflection::enum_contains(*entry.model_input))) {
+  if (entry.stable_id == 0U || entry.stable_id != mmltk::controller::browser::application_settings_field_stable_id(entry.field_path.view()) || !entry.field_path.valid() || !entry.workflows.valid() ||
+      !entry.title.valid() || !entry.filter.name.valid() || !entry.filter.pattern.valid() || !mmltk::frameworks::reflection::enum_contains(entry.mode) ||
+      (entry.model_input && !mmltk::frameworks::reflection::enum_contains(*entry.model_input))) {
    throw std::logic_error("file-dialog catalog has invalid declaration metadata");
   }
   for (std::size_t right = left + 1U; right < entries.size(); ++right) {
-   if (entry.stable_id == entries[right].stable_id || entry.field_path.view() == entries[right].field_path.view()) {
-    throw std::logic_error("file-dialog catalog has a duplicate declaration");
-   }
+   if (entry.stable_id == entries[right].stable_id || entry.field_path.view() == entries[right].field_path.view()) { throw std::logic_error("file-dialog catalog has a duplicate declaration"); }
   }
  }
  return result;
@@ -90,8 +87,7 @@ std::optional<ResolvedFileDialog> FileDialogCatalog::resolve(const FileDialogOpe
  if (const auto* target = std::get_if<ModelArtifactTarget>(&request.target.value)) {
   if (!found->model_input) return std::nullopt;
   const auto* compatibility = mmltk::controller::contracts::find_model_selection_compatibility(target->workflow, target->input);
-  if (compatibility == nullptr || !compatibility->custom_allowed ||
-      found->stable_id != mmltk::controller::browser::application_settings_field_stable_id(compatibility->artifact_field_path) ||
+  if (compatibility == nullptr || !compatibility->custom_allowed || found->stable_id != mmltk::controller::browser::application_settings_field_stable_id(compatibility->artifact_field_path) ||
       !found->workflows.allows(target->workflow) || found->model_input != target->input)
    return std::nullopt;
  } else if (found->model_input) {

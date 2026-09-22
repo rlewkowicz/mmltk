@@ -24,20 +24,15 @@ struct ComputeIntentMaterializer final {
   std::string custom_artifact;
   int inspection_device = 0;
  };
- [[nodiscard]] static std::expected<ModelInput, Refusal> ModelInputFor(const mmltk::controller::contracts::GuiSettingsState& settings,
-                                                                       mmltk::controller::contracts::FeatureId workflow) noexcept;
+ [[nodiscard]] static std::expected<ModelInput, Refusal> ModelInputFor(const mmltk::controller::contracts::GuiSettingsState& settings, mmltk::controller::contracts::FeatureId workflow) noexcept;
  [[nodiscard]] static std::expected<mmltk::backend::models::rfdetr::TrainRequest, Refusal> LocalTrain(
-  const mmltk::controller::contracts::GuiSettingsState& settings, const mmltk::controller::contracts::ArtifactInspection& artifact,
-  const mmltk::controller::contracts::ModelSelection& model) noexcept;
- [[nodiscard]] static ValidationMaterialization Validation(const mmltk::controller::contracts::GuiSettingsState& settings,
-                                                           const mmltk::controller::contracts::ArtifactInspection& artifact,
-                                                           const mmltk::controller::contracts::ModelSelection& model) noexcept;
+  const mmltk::controller::contracts::GuiSettingsState& settings, const mmltk::controller::contracts::ArtifactInspection& artifact, const mmltk::controller::contracts::ModelSelection& model) noexcept;
+ [[nodiscard]] static ValidationMaterialization Validation(
+  const mmltk::controller::contracts::GuiSettingsState& settings, const mmltk::controller::contracts::ArtifactInspection& artifact, const mmltk::controller::contracts::ModelSelection& model) noexcept;
  // CLEANUP-IGNORE: Each typed materializer method is an explicit domain boundary with a distinct result vocabulary.
- [[nodiscard]] static ExportMaterialization Export(const mmltk::controller::contracts::GuiSettingsState& settings,
-                                                   const mmltk::controller::contracts::ArtifactInspection& artifact,
-                                                   const mmltk::controller::contracts::ModelSelection& model) noexcept;
- [[nodiscard]] static PredictionMaterialization Predict(const mmltk::controller::contracts::GuiSettingsState& settings,
-                                                        const mmltk::controller::contracts::ArtifactInspection& artifact,
-                                                        const mmltk::controller::contracts::ModelSelection& model) noexcept;
+ [[nodiscard]] static ExportMaterialization Export(
+  const mmltk::controller::contracts::GuiSettingsState& settings, const mmltk::controller::contracts::ArtifactInspection& artifact, const mmltk::controller::contracts::ModelSelection& model) noexcept;
+ [[nodiscard]] static PredictionMaterialization Predict(
+  const mmltk::controller::contracts::GuiSettingsState& settings, const mmltk::controller::contracts::ArtifactInspection& artifact, const mmltk::controller::contracts::ModelSelection& model) noexcept;
 };
 }  // namespace mmltk::controller::subsystems::system

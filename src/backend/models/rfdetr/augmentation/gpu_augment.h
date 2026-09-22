@@ -67,7 +67,7 @@ struct GpuAugmentationDonorBatchView {
 class GpuAugmentationExecutor final {
 public:
  GpuAugmentationExecutor(const GpuAugmentationConfig& config, std::size_t batch_capacity, int height, int width, mmltk::frameworks::gpu::DeviceContext context,
-                         mmltk::frameworks::gpu::TerminalCudaRetirementAuthority& retirement);
+  mmltk::frameworks::gpu::TerminalCudaRetirementAuthority& retirement);
  ~GpuAugmentationExecutor();
  GpuAugmentationExecutor(const GpuAugmentationExecutor&) = delete;
  GpuAugmentationExecutor& operator=(const GpuAugmentationExecutor&) = delete;
@@ -75,12 +75,10 @@ public:
  GpuAugmentationExecutor& operator=(GpuAugmentationExecutor&&) = delete;
  void Finish();
  void Reconfigure(const GpuAugmentationConfig& config);
- [[nodiscard]] const AugmentationBatchPlan& Run(const GpuAugmentationBatchView& batch, std::span<const std::uint64_t> image_keys,
-                                                std::span<const GpuAugmentationDonor> donors, const GpuAugmentationDonorBatchView& donor_batch,
-                                                cudaStream_t stream, std::size_t staging_slot = 0U);
+ [[nodiscard]] const AugmentationBatchPlan& Run(const GpuAugmentationBatchView& batch, std::span<const std::uint64_t> image_keys, std::span<const GpuAugmentationDonor> donors,
+  const GpuAugmentationDonorBatchView& donor_batch, cudaStream_t stream, std::size_t staging_slot = 0U);
  [[nodiscard]] const AugmentationBatchPlan& RunTraining(const GpuAugmentationBatchView& batch, std::uint64_t seed, int epoch, int rank, std::uint64_t sequence,
-                                                        std::span<const GpuAugmentationDonor> donors, const GpuAugmentationDonorBatchView& donor_batch,
-                                                        cudaStream_t stream, std::size_t staging_slot = 0U);
+  std::span<const GpuAugmentationDonor> donors, const GpuAugmentationDonorBatchView& donor_batch, cudaStream_t stream, std::size_t staging_slot = 0U);
  // Image parameters and returned semantic geometry/erasure are planned together.
  // The returned plan remains owned by this executor and is replaced by the next run.
  [[nodiscard]] const AugmentationBatchPlan& plan() const;
@@ -98,10 +96,8 @@ public:
  [[nodiscard]] std::size_t pinned_capacity_bytes() const;
 
 private:
- [[nodiscard]] const AugmentationBatchPlan& RunImpl(const GpuAugmentationBatchView& batch, std::span<const std::uint64_t> image_keys,
-                                                    std::span<const GpuAugmentationDonor> donors, const GpuAugmentationDonorBatchView& donor_batch,
-                                                    cudaStream_t stream, std::size_t staging_slot, bool explicit_keys, std::uint64_t seed, int epoch, int rank,
-                                                    std::uint64_t sequence);
+ [[nodiscard]] const AugmentationBatchPlan& RunImpl(const GpuAugmentationBatchView& batch, std::span<const std::uint64_t> image_keys, std::span<const GpuAugmentationDonor> donors,
+  const GpuAugmentationDonorBatchView& donor_batch, cudaStream_t stream, std::size_t staging_slot, bool explicit_keys, std::uint64_t seed, int epoch, int rank, std::uint64_t sequence);
  void RequireActive() const;
  void Retire(cudaError_t) noexcept;
  void CheckSettlement(cudaError_t, const char*);

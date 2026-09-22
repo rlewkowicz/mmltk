@@ -27,9 +27,7 @@ struct ShellWarmProbe final {
 };
 class ShellWarmAlgorithm final : public UpscaleAlgorithm {
 public:
- void Resample(mmltk::frameworks::gpu::ImagePlaneView source, mmltk::frameworks::gpu::ImagePlaneView target, std::uintptr_t stream) override {
-  Semantics(source, target, stream);
- }
+ void Resample(mmltk::frameworks::gpu::ImagePlaneView source, mmltk::frameworks::gpu::ImagePlaneView target, std::uintptr_t stream) override { Semantics(source, target, stream); }
  void Semantics(mmltk::frameworks::gpu::ImagePlaneView, const mmltk::frameworks::gpu::ImagePlaneView target, std::uintptr_t) override {
   if (target.valid()) std::memset(reinterpret_cast<void*>(target.data), 0, target.descriptor.pitch_bytes * target.descriptor.height);
  }
@@ -39,21 +37,19 @@ public:
   if (probe_->fail) throw std::runtime_error("shell warm failure");
   probe_->completed.set_value();
  }
- void Run(UpscaleKernel, mmltk::frameworks::gpu::ImagePlaneView, const mmltk::frameworks::gpu::ImagePlaneView target, std::uintptr_t stream,
-          const std::function<bool()>&, UpscalePurpose = UpscalePurpose::Normal) override {
+ void Run(UpscaleKernel, mmltk::frameworks::gpu::ImagePlaneView, const mmltk::frameworks::gpu::ImagePlaneView target, std::uintptr_t stream, const std::function<bool()>&,
+  UpscalePurpose = UpscalePurpose::Normal) override {
   Semantics({}, target, stream);
  }
 
 private:
  std::shared_ptr<ShellWarmProbe> probe_;
 };
-[[nodiscard]] UpscaleSystem shell_upscale(const std::shared_ptr<FakeImageBackend>& backend, const std::shared_ptr<ShellWarmProbe>& probe,
-                                          SystemEventSink<UpscaleSystem::event_type> events = {}) {
+[[nodiscard]] UpscaleSystem shell_upscale(const std::shared_ptr<FakeImageBackend>& backend, const std::shared_ptr<ShellWarmProbe>& probe, SystemEventSink<UpscaleSystem::event_type> events = {}) {
  return UpscaleSystem{{.device = 0, .maximum_width = 1024U, .maximum_height = 1024U},
-                      RuntimeFactory(
-                       0, backend, mmltk::frameworks::gpu::ImageProductLayout::Clean, [probe] { return std::make_unique<ShellWarmAlgorithm>(probe); }, 4U),
-                      [](const VisualFrame&) { return VisualDocumentRead{}; },
-                      std::move(events)};
+  RuntimeFactory(
+   0, backend, mmltk::frameworks::gpu::ImageProductLayout::Clean, [probe] { return std::make_unique<ShellWarmAlgorithm>(probe); }, 4U),
+  [](const VisualFrame&) { return VisualDocumentRead{}; }, std::move(events)};
 }
 [[nodiscard]] ExploreSystem::event_type ready_explore_event() {
  return ExploreChanged{ExploreSnapshot{
@@ -85,25 +81,23 @@ private:
 };
 TEST_CASE("shell Explore composition preserves explicit budgets above its permitted CPU count") {
  // Constrain only this test's construction thread, so the process remains untouched.
- const auto budgets = std::async(std::launch::async,
-                                 [] {
-                                  const auto cpu = mmltk::common::system::allowed_cpu_set().front();
-                                  mmltk::common::system::set_thread_affinity({cpu});
-                                  SettingsSystem settings;
-                                  ApplicationSystemConfiguration configuration{
-                                   .base_visual = {.device = 0, .maximum_width = 64, .maximum_height = 64},
-                                  };
-                                  const mmltk::frameworks::gpu::DeviceExecution execution{.device = 0, .placement = {.numa_node = 0, .cpus = {cpu}}};
-                                  std::vector<std::size_t> result;
-                                  for (const auto requested : {std::size_t{0}, std::size_t{8}, kExploreMaximumParallelism + 1U}) {
-                                   configuration.explore_nproc = requested;
-                                   auto explore = make_shell_explore_system(settings, configuration, execution);
-                                   result.push_back(explore->snapshot().nproc);
-                                   explore->Shutdown();
-                                  }
-                                  return result;
-                                 })
-                       .get();
+ const auto budgets = std::async(std::launch::async, [] {
+  const auto cpu = mmltk::common::system::allowed_cpu_set().front();
+  mmltk::common::system::set_thread_affinity({cpu});
+  SettingsSystem settings;
+  ApplicationSystemConfiguration configuration{
+   .base_visual = {.device = 0, .maximum_width = 64, .maximum_height = 64},
+  };
+  const mmltk::frameworks::gpu::DeviceExecution execution{.device = 0, .placement = {.numa_node = 0, .cpus = {cpu}}};
+  std::vector<std::size_t> result;
+  for (const auto requested : {std::size_t{0}, std::size_t{8}, kExploreMaximumParallelism + 1U}) {
+   configuration.explore_nproc = requested;
+   auto explore = make_shell_explore_system(settings, configuration, execution);
+   result.push_back(explore->snapshot().nproc);
+   explore->Shutdown();
+  }
+  return result;
+ }).get();
  CHECK(budgets == std::vector<std::size_t>{1U, 8U, kExploreMaximumParallelism});
 }
 TEST_CASE("shell forwards the first ready Explore event unchanged and warms Upscale once") {

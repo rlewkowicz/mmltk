@@ -74,8 +74,7 @@ public:
  ~ValidationSession();
  ValidationSession(const ValidationSession&) = delete;
  ValidationSession& operator=(const ValidationSession&) = delete;
- ValidationRunResult Run(const ValidateRequest& request, mmltk::backend::ml::runtime::BorrowedCommandStream command_stream,
-                         const ValidationDelivery& delivery = {});
+ ValidationRunResult Run(const ValidateRequest& request, mmltk::backend::ml::runtime::BorrowedCommandStream command_stream, const ValidationDelivery& delivery = {});
  [[nodiscard]] mmltk::backend::ml::runtime::RuntimeStatus Close() noexcept;
 
 private:

@@ -102,12 +102,8 @@ inline SubprocessResult run_subprocess_capture_output(const std::vector<std::str
    if (errno == EINTR) { continue; }
    throw std::runtime_error(make_errno_message("poll failed"));
   }
-  if (stdout_read.get() >= 0 && (poll_fds[0].revents & (POLLIN | POLLHUP | POLLERR | POLLNVAL))) {
-   append_available_output(stdout_read, stdout_text, output_text);
-  }
-  if (stderr_read.get() >= 0 && (poll_fds[1].revents & (POLLIN | POLLHUP | POLLERR | POLLNVAL))) {
-   append_available_output(stderr_read, stderr_text, output_text);
-  }
+  if (stdout_read.get() >= 0 && (poll_fds[0].revents & (POLLIN | POLLHUP | POLLERR | POLLNVAL))) { append_available_output(stdout_read, stdout_text, output_text); }
+  if (stderr_read.get() >= 0 && (poll_fds[1].revents & (POLLIN | POLLHUP | POLLERR | POLLNVAL))) { append_available_output(stderr_read, stderr_text, output_text); }
  }
  const int status = child.Wait();
  if (!WIFEXITED(status)) {

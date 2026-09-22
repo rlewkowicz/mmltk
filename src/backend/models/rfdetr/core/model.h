@@ -36,19 +36,16 @@ public:
  [[nodiscard]] ModelOutputs forward_with_denoising(const NestedTensor& batch, const PreparedTargets& targets, const TrainingStepIdentity& identity);
  void initialize_training_supervision(std::uint64_t request_seed);
  void replicate_training_supervision_runtime_from(const NativeRfDetrModel& source);
- [[nodiscard]] TrainingLoss supervision_loss(const ModelOutputs& outputs, const PreparedTargets& targets, const DeviceLossNormalizer& normalizer,
-                                             bool training_mode);
+ [[nodiscard]] TrainingLoss supervision_loss(const ModelOutputs& outputs, const PreparedTargets& targets, const DeviceLossNormalizer& normalizer, bool training_mode);
  void configure_supervision_timing(const SupervisionTimingSetup& setup);
  void begin_supervised_step_timing();
  void end_supervised_step_timing();
  void begin_criterion_timing();
  void end_criterion_timing();
  [[nodiscard]] SupervisionTimingHandoff harvest_supervision_timing();
- [[nodiscard]] ModelStateLoadSummary load_normalized_state(const std::vector<NormalizedModelStateEntry>& state, bool strict,
-                                                           const ModelClassLayout* admitted_layout = nullptr);
- [[nodiscard]] detail::NormalizedModelStateCandidate stage_normalized_state(const std::vector<NormalizedModelStateEntry>& state,
-                                                                            detail::NormalizedModelStateAdmission admission,
-                                                                            const ResolvedClassLayout* source_layout = nullptr);
+ [[nodiscard]] ModelStateLoadSummary load_normalized_state(const std::vector<NormalizedModelStateEntry>& state, bool strict, const ModelClassLayout* admitted_layout = nullptr);
+ [[nodiscard]] detail::NormalizedModelStateCandidate stage_normalized_state(
+  const std::vector<NormalizedModelStateEntry>& state, detail::NormalizedModelStateAdmission admission, const ResolvedClassLayout* source_layout = nullptr);
  void commit_normalized_state(detail::NormalizedModelStateCandidate candidate);
  void set_force_pytorch_deformable_attn(bool value);
  void train(bool enabled = true);

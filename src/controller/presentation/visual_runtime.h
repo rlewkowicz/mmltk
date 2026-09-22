@@ -19,8 +19,7 @@ struct VisualDeviceSettings final {
  int numa_node = -1;
  [[nodiscard]] constexpr bool valid() const noexcept { return device >= 0 && numa_node >= -1 && maximum_width != 0U && maximum_height != 0U; }
 };
-using VisualRuntimeFactory =
- std::function<std::unique_ptr<mmltk::frameworks::gpu::SystemImageRuntime>(std::shared_ptr<mmltk::frameworks::gpu::ImageProductRevisionSequence>)>;
+using VisualRuntimeFactory = std::function<std::unique_ptr<mmltk::frameworks::gpu::SystemImageRuntime>(std::shared_ptr<mmltk::frameworks::gpu::ImageProductRevisionSequence>)>;
 struct VisualWorkspaceRequest final {
  std::uint64_t product_owner = 0U;
  std::uint64_t product_revision = 0U;

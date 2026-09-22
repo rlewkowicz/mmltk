@@ -41,8 +41,7 @@ struct SystemImageRuntime::State final {
    context.emplace(config.device, std::move(backend), config.context_mode, config.numa_node, std::move(config.execution));
   }
   std::optional<mmltk::common::system::ScopedExecutionPolicy> policy;
-  if (const auto* execution = context->execution())
-   policy.emplace(mmltk::common::system::ExecutionPolicyRequest{execution->placement.cpus, {}, 0, execution->placement.numa_node, -10, false});
+  if (const auto* execution = context->execution()) policy.emplace(mmltk::common::system::ExecutionPolicyRequest{execution->placement.cpus, {}, 0, execution->placement.numa_node, -10, false});
   input = std::make_unique<ImageProductBuffer>(*context, config.input_layout);
   output = std::make_unique<ImageProductPool>(*context, config.output_layout, config.output_buffer_count, products);
   stream = std::make_shared<ImageStream>(*context);
@@ -124,8 +123,7 @@ std::optional<SystemImageRuntime::UnsafeCustody> SystemImageRuntime::UnsafeConst
   return std::nullopt;
  } catch (...) { return std::nullopt; }
 }
-SystemImageRuntime::SystemImageRuntime(SystemImageRuntimeConfig config)
-    : retention_(ReserveRetention()), product_revision_sequence_(std::move(config.product_revisions)) {
+SystemImageRuntime::SystemImageRuntime(SystemImageRuntimeConfig config) : retention_(ReserveRetention()), product_revision_sequence_(std::move(config.product_revisions)) {
  state_ = std::make_shared<State>(std::move(config.model));
  try {
   if (!product_revision_sequence_) throw std::invalid_argument("image product revision sequence is unavailable");
@@ -150,9 +148,7 @@ SystemImageRuntime::~SystemImageRuntime() noexcept {
  if (retirement.safe_to_destroy) state_.reset();
  retention_.reset();
 }
-bool SystemImageRuntime::UsesContext(const DeviceContext& context) const noexcept {
- return state_ && !state_->retired && state_->context && *state_->context == context;
-}
+bool SystemImageRuntime::UsesContext(const DeviceContext& context) const noexcept { return state_ && !state_->retired && state_->context && *state_->context == context; }
 int SystemImageRuntime::device() const noexcept { return state_ && !state_->retired && state_->context ? state_->context->device() : -1; }
 const DeviceExecution* SystemImageRuntime::execution() const noexcept { return state_ && state_->context ? state_->context->execution() : nullptr; }
 void SystemImageRuntime::BindContext() {
@@ -236,8 +232,7 @@ SystemImageRuntime::CompletedOutput SystemImageRuntime::Completed() const { retu
 ImageProductPool::Availability SystemImageRuntime::ObserveOutputAvailability() const { return ActiveState().output->ObserveAvailability(); }
 ImageProductPool::Facts SystemImageRuntime::OutputFacts() const { return ActiveState().output->SelectedFacts(); }
 ImageStorageFootprint SystemImageRuntime::OutputStorageFootprint() const { return ActiveState().output->StorageFootprint(); }
-SystemImageRuntime::OutputCandidate SystemImageRuntime::AcquireOutput(const std::stop_token stop, CompletedOutput baseline,
-                                                                      ImagePlanePreservation preservation) {
+SystemImageRuntime::OutputCandidate SystemImageRuntime::AcquireOutput(const std::stop_token stop, CompletedOutput baseline, ImagePlanePreservation preservation) {
  return ActiveState().output->Acquire(stop, std::move(baseline), preservation);
 }
 SystemImageRuntime::OutputCandidate SystemImageRuntime::TryAcquireOutput(CompletedOutput& baseline, ImagePlanePreservation preservation) {
@@ -252,16 +247,13 @@ SystemImageRuntime::CompletedOutput SystemImageRuntime::CommitOutput(OutputCandi
  ActiveState().output->FinalizeWorkspace(candidate, {});
  return ActiveState().output->Commit(std::move(candidate));
 }
-void SystemImageRuntime::PublishRetained(OutputCandidate& candidate, const std::uint32_t width, const std::uint32_t height,
-                                         ImageProductBuffer::ProductSubmit submit, ImageSubmission submission) {
+void SystemImageRuntime::PublishRetained(OutputCandidate& candidate, const std::uint32_t width, const std::uint32_t height, ImageProductBuffer::ProductSubmit submit, ImageSubmission submission) {
  auto& state = ActiveState();
  state.output->PublishRetained(*state.stream, candidate, width, height, TakeProductRevision(), std::move(submit), submission);
 }
 void SystemImageRuntime::NotifyWorkCompletion(std::function<void()> wake) { ActiveState().stream->Notify(std::move(wake)); }
 void SystemImageRuntime::CompleteWork() { ActiveState().stream->Synchronize(); }
-void SystemImageRuntime::FinalizeWorkspace(OutputCandidate& candidate, ImageWorkspaceCoverage coverage) {
- ActiveState().output->FinalizeWorkspace(candidate, coverage);
-}
+void SystemImageRuntime::FinalizeWorkspace(OutputCandidate& candidate, ImageWorkspaceCoverage coverage) { ActiveState().output->FinalizeWorkspace(candidate, coverage); }
 void SystemImageRuntime::CompleteWorkspaces() { ActiveState().output->CompleteWorkspaces(); }
 bool SystemImageRuntime::DetachDisplay(const std::shared_ptr<ImageWorkspace>& workspace) {
  auto& state = ActiveState();
@@ -294,8 +286,7 @@ std::array<ImageCopyPath, 2U> SystemImageRuntime::CopyFrom(BorrowedImageProductR
  auto& state = ActiveState();
  return state.output->CopyFrom(*state.stream, std::move(source), TakeProductRevision());
 }
-std::array<ImageCopyPath, 2U> SystemImageRuntime::CopyInputFrom(BorrowedImageProductReadView source, ImageProductBuffer::MissingPlaneSubmit initialize_missing,
-                                                                const bool preserve_clean) {
+std::array<ImageCopyPath, 2U> SystemImageRuntime::CopyInputFrom(BorrowedImageProductReadView source, ImageProductBuffer::MissingPlaneSubmit initialize_missing, const bool preserve_clean) {
  auto& state = ActiveState();
  return state.input->CopyFrom(*state.stream, std::move(source), std::move(initialize_missing), preserve_clean);
 }

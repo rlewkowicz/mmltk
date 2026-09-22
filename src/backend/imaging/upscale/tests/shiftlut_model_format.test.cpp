@@ -66,8 +66,7 @@ TEST_CASE("ShiftLUT packed storage accepts fractional LUT values and all integra
  std::vector<float> tables(lut::kTableElements);
  const std::array values{-32767.0F, -0.5F, 0.0F, 0.5F, 32767.0F};
  for (std::size_t index = 0; index < lut::table_offset(lut::TableFamily::Shifts); ++index) tables[index] = values[index % values.size()];
- for (std::size_t index = lut::table_offset(lut::TableFamily::Shifts); index < tables.size(); ++index)
-  tables[index] = static_cast<float>(static_cast<int>(index % 3) - 1);
+ for (std::size_t index = lut::table_offset(lut::TableFamily::Shifts); index < tables.size(); ++index) tables[index] = static_cast<float>(static_cast<int>(index % 3) - 1);
  REQUIRE_NOTHROW(lut::validate_tables(std::as_bytes(std::span{tables})));
  // The generator's raw buffer need not be aligned for float access.
  std::vector<std::byte> unaligned(lut::kTableBytes + 1);
@@ -84,8 +83,7 @@ TEST_CASE("ShiftLUT packed storage rejects invalid lengths before scalar access"
  REQUIRE_THROWS_AS(lut::validate_tables(storage), std::invalid_argument);
 }
 TEST_CASE("ShiftLUT packed storage rejects nonfinite and excessive LUT magnitudes", "[shiftlut_format]") {
- const auto value =
-  GENERATE(std::numeric_limits<float>::quiet_NaN(), std::numeric_limits<float>::infinity(), -std::numeric_limits<float>::infinity(), -32768.0F, 32768.0F);
+ const auto value = GENERATE(std::numeric_limits<float>::quiet_NaN(), std::numeric_limits<float>::infinity(), -std::numeric_limits<float>::infinity(), -32768.0F, 32768.0F);
  const auto index = GENERATE(std::size_t{0}, lut::table_offset(lut::TableFamily::Shifts) - 1);
  std::vector<float> tables(lut::kTableElements);
  tables[index] = value;

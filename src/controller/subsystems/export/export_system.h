@@ -39,8 +39,7 @@ using ExportRuntimeFactory = std::function<std::unique_ptr<ExportRuntime>()>;
 class ExportSystem final {
 public:
  using event_type = ComputeSystemEvent;
- ExportSystem(SettingsSystem&, DatasetSystem&, ModelSystem&, ExportRuntimeFactory, SystemEventSink<event_type> = {},
-              std::optional<mmltk::frameworks::gpu::DeviceExecution> = {});
+ ExportSystem(SettingsSystem&, DatasetSystem&, ModelSystem&, ExportRuntimeFactory, SystemEventSink<event_type> = {}, std::optional<mmltk::frameworks::gpu::DeviceExecution> = {});
  ~ExportSystem();
  [[= contracts::reflection::direct::IntentEndpoint{}]] [[nodiscard]] contracts::ComputeUiState Start(contracts::ExportWorkflowIntent);
  // CLEANUP-IGNORE: Export exposes its own reflected typed action surface; Validation remains an independently sealed

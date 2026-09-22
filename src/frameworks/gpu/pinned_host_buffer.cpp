@@ -36,15 +36,11 @@ struct PinnedHostBuffer::Retention {
  TerminalCudaRetirementLease lease = ReserveTerminalCudaLease(terminal);
  mmltk::common::io::ScopedFd trace;
  Retention() {
-  if (const auto* path = std::getenv("MMLTK_NUMA_TRANSFER_TRACE_FILE"); path && *path)
-   trace.reset(::open(path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0600));
+  if (const auto* path = std::getenv("MMLTK_NUMA_TRANSFER_TRACE_FILE"); path && *path) trace.reset(::open(path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0600));
  }
 };
 PinnedHostBuffer::PinnedHostBuffer(CUcontext context, const mmltk::common::system::ExecutionPlacement& placement, bool portable, Register registration)
-    : registration_(registration),
-      placement_(placement),
-      retention_(std::make_unique<Retention>()),
-      state_(std::make_shared<State>(context, placement.numa_node, portable)) {
+    : registration_(registration), placement_(placement), retention_(std::make_unique<Retention>()), state_(std::make_shared<State>(context, placement.numa_node, portable)) {
  if (!context || !registration || placement.cpus.empty()) throw std::invalid_argument("pinned host buffer requires an owning context and placement");
 }
 PinnedHostBuffer::~PinnedHostBuffer() noexcept {
@@ -73,8 +69,7 @@ void PinnedHostBuffer::ensure_bytes(std::size_t bytes) {
  PinnedHostBuffer replacement(state_->context, placement_, state_->portable, registration_);
  replacement.state_->memory.ensure_bytes(bytes);
  Context context(state_->context);
- check(registration_(replacement.data(), replacement.capacity_bytes(), state_->portable ? CU_MEMHOSTREGISTER_PORTABLE : 0),
-       "register strictly local host pages");
+ check(registration_(replacement.data(), replacement.capacity_bytes(), state_->portable ? CU_MEMHOSTREGISTER_PORTABLE : 0), "register strictly local host pages");
  replacement.state_->registered = true;
  replacement.log("registered", bytes);
  if (state_->registered) check(cuCtxSynchronize(), "settle pinned host growth");
@@ -84,12 +79,11 @@ void PinnedHostBuffer::ensure_bytes(std::size_t bytes) {
 void PinnedHostBuffer::log(const char* event, std::size_t active_bytes) const noexcept {
  if (retention_->trace.get() < 0) return;
  char record[384];
- const int size =
-  std::snprintf(record, sizeof(record),
-                "{\"event\":\"%s\",\"owner_context\":%llu,\"node\":%d,\"allocation\":%llu,\"capacity_bytes\":%zu,"
-                "\"active_bytes\":%zu,\"portable\":%s,\"pages\":\"owned-local-verified\"}\n",
-                event, static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(state_->context)), node(),
-                static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(data())), capacity_bytes(), active_bytes, state_->portable ? "true" : "false");
+ const int size = std::snprintf(record, sizeof(record),
+  "{\"event\":\"%s\",\"owner_context\":%llu,\"node\":%d,\"allocation\":%llu,\"capacity_bytes\":%zu,"
+  "\"active_bytes\":%zu,\"portable\":%s,\"pages\":\"owned-local-verified\"}\n",
+  event, static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(state_->context)), node(), static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(data())), capacity_bytes(),
+  active_bytes, state_->portable ? "true" : "false");
  if (size > 0 && static_cast<std::size_t>(size) < sizeof(record)) {
   const auto written = ::write(retention_->trace.get(), record, static_cast<std::size_t>(size));
   (void)written;

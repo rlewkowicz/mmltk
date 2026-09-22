@@ -18,9 +18,7 @@ static_assert(!std::is_copy_constructible_v<process::CapturedChildProcess>);
 static_assert(!std::is_copy_assignable_v<process::CapturedChildProcess>);
 static_assert(std::is_nothrow_move_constructible_v<process::CapturedChildProcess>);
 static_assert(std::is_nothrow_move_assignable_v<process::CapturedChildProcess>);
-[[nodiscard]] bool write_exact(const int fd, const std::string_view payload) {
- return ::write(fd, payload.data(), payload.size()) == static_cast<ssize_t>(payload.size());
-}
+[[nodiscard]] bool write_exact(const int fd, const std::string_view payload) { return ::write(fd, payload.data(), payload.size()) == static_cast<ssize_t>(payload.size()); }
 [[noreturn]] void exit_after_writing_stdout(const std::string_view payload) { std::_Exit(write_exact(STDOUT_FILENO, payload) ? 0 : 127); }
 TEST_CASE("child_setup_failure_round_trips", "[frameworks][process]") {
  std::array<int, 2> pipe_fds{-1, -1};
@@ -92,6 +90,6 @@ TEST_CASE("captured_child_runner_enforces_output_bound", "[frameworks][process]"
                    exit_after_writing_stdout("too much output");
                   },
                   {}, std::chrono::milliseconds{0}, -1, false, 4U),
-                 std::runtime_error);
+  std::runtime_error);
 }
 }  // namespace

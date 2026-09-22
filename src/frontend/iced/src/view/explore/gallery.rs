@@ -189,8 +189,7 @@ pub(super) fn view<'a>(
     let presentation_override = if paired.is_none()
         && snapshot.is_some_and(|value| {
             value.ready && !value.busy && value.failure.is_empty() && value.order.matchingcount != 0
-        })
-    {
+        }) {
         match model.gallery_presentation() {
             crate::view_model::GalleryPresentation::Restoring => Some("Restoring gallery"),
             crate::view_model::GalleryPresentation::Unavailable => Some("Gallery unavailable"),

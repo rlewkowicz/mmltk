@@ -116,9 +116,7 @@ std::vector<int> resolve_cpu_affinity(const std::string& spec) {
  if (spec.empty()) { return allowed; }
  std::vector<int> requested = parse_cpu_list(spec);
  for (const int cpu : requested) {
-  if (!std::binary_search(allowed.begin(), allowed.end(), cpu)) {
-   throw std::runtime_error("cpu " + std::to_string(cpu) + " is outside the current allowed cpuset " + format_cpu_list(allowed));
-  }
+  if (!std::binary_search(allowed.begin(), allowed.end(), cpu)) { throw std::runtime_error("cpu " + std::to_string(cpu) + " is outside the current allowed cpuset " + format_cpu_list(allowed)); }
  }
  return requested;
 }

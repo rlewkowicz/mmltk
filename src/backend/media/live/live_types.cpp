@@ -4,15 +4,14 @@
 namespace mmltk::backend::media::live {
 bool LiveManualOverlayUploadLimits::valid() const noexcept {
  return mask_bytes != 0U && run_values != 0U && point_values != 0U && edge_values != 0U && brush_values >= kManualOverlayBrushValueCount &&
-        run_values <= std::numeric_limits<std::size_t>::max() / sizeof(std::uint32_t) &&
-        point_values <= std::numeric_limits<std::size_t>::max() / sizeof(int) &&
+        run_values <= std::numeric_limits<std::size_t>::max() / sizeof(std::uint32_t) && point_values <= std::numeric_limits<std::size_t>::max() / sizeof(int) &&
         edge_values <= std::numeric_limits<std::size_t>::max() / sizeof(std::uint32_t) && brush_values <= std::numeric_limits<std::size_t>::max() / sizeof(int);
 }
-LiveCompositeOutputLease::LiveCompositeOutputLease(void* owner, const CompleteCallback complete, const AbandonCallback abandon, LiveOutputFrame view,
-                                                   const PhysicalFrameRevision frame_revision) noexcept
+LiveCompositeOutputLease::LiveCompositeOutputLease(
+ void* owner, const CompleteCallback complete, const AbandonCallback abandon, LiveOutputFrame view, const PhysicalFrameRevision frame_revision) noexcept
     : owner_(owner), complete_(complete), abandon_(abandon), view_(view), frame_revision_(frame_revision) {}
-LiveCompositeOutputLease LiveCompositeOutputLease::Create(void* owner, const CompleteCallback complete, const AbandonCallback abandon, LiveOutputFrame view,
-                                                          const PhysicalFrameRevision frame_revision) noexcept {
+LiveCompositeOutputLease LiveCompositeOutputLease::Create(
+ void* owner, const CompleteCallback complete, const AbandonCallback abandon, LiveOutputFrame view, const PhysicalFrameRevision frame_revision) noexcept {
  return LiveCompositeOutputLease{owner, complete, abandon, view, frame_revision};
 }
 LiveCompositeOutputLease::~LiveCompositeOutputLease() noexcept { Abandon(); }

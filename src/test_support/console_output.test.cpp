@@ -32,9 +32,7 @@ private:
  const int flags = ::fcntl(fd, F_GETFL, 0);
  return flags >= 0 && ::fcntl(fd, F_SETFL, flags | O_NONBLOCK) == 0;
 }
-[[nodiscard]] bool write_exact(const int fd, const std::string_view payload) {
- return ::write(fd, payload.data(), payload.size()) == static_cast<ssize_t>(payload.size());
-}
+[[nodiscard]] bool write_exact(const int fd, const std::string_view payload) { return ::write(fd, payload.data(), payload.size()) == static_cast<ssize_t>(payload.size()); }
 void test_append_console_output_normalizes_terminal_sequences() {
  std::string tail;
  mmltk::testsupport::console_output::append_console_output(tail, "hello\rworld\nabc\b!\033[31m?\n", 128);
@@ -57,8 +55,6 @@ void test_read_fd_to_string_reads_until_eof() {
  REQUIRE(output == "vast output");
 }
 }  // namespace
-TEST_CASE("console output normalizes terminal sequences", "[controller][services][console-output]") {
- test_append_console_output_normalizes_terminal_sequences();
-}
+TEST_CASE("console output normalizes terminal sequences", "[controller][services][console-output]") { test_append_console_output_normalizes_terminal_sequences(); }
 TEST_CASE("console output drains a nonblocking descriptor", "[controller][services][console-output]") { test_drain_nonblocking_fd_reads_available_output(); }
 TEST_CASE("console output reads through EOF", "[controller][services][console-output]") { test_read_fd_to_string_reads_until_eof(); }

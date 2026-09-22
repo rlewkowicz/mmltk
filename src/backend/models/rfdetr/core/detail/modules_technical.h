@@ -70,10 +70,9 @@ using SegmentationMlpBlock = MlpBlock;
 class SegmentationHeadImpl : public torch::nn::Module {
 public:
  SegmentationHeadImpl(int64_t in_dim, int64_t num_blocks, c10::optional<int64_t> bottleneck_ratio = 1, int64_t downsample_ratio = 4);
- std::vector<torch::Tensor> forward(const torch::Tensor& spatial_features, const std::vector<torch::Tensor>& query_features,
-                                    std::pair<int64_t, int64_t> image_size, bool skip_blocks = false);
- std::vector<OutputLayer::SparsePredMasks> sparse_forward(const torch::Tensor& spatial_features, const std::vector<torch::Tensor>& query_features,
-                                                          std::pair<int64_t, int64_t> image_size, bool skip_blocks = false);
+ std::vector<torch::Tensor> forward(const torch::Tensor& spatial_features, const std::vector<torch::Tensor>& query_features, std::pair<int64_t, int64_t> image_size, bool skip_blocks = false);
+ std::vector<OutputLayer::SparsePredMasks> sparse_forward(
+  const torch::Tensor& spatial_features, const std::vector<torch::Tensor>& query_features, std::pair<int64_t, int64_t> image_size, bool skip_blocks = false);
  torch::nn::ModuleList blocks{nullptr};
  torch::nn::Conv2d spatial_features_proj{nullptr};
  MlpBlock query_features_block{nullptr};
@@ -84,8 +83,8 @@ private:
  // Shared driver for forward and sparse_forward: walks the depthwise blocks (or the skip path) and builds one
  // output per query feature tensor via make_output(projected_spatial, projected_queries).
  template <typename Output, typename MakeOutput>
- std::vector<Output> collect_head_outputs(const torch::Tensor& spatial_features, const std::vector<torch::Tensor>& query_features,
-                                          std::pair<int64_t, int64_t> image_size, bool skip_blocks, MakeOutput&& make_output);
+ std::vector<Output> collect_head_outputs(
+  const torch::Tensor& spatial_features, const std::vector<torch::Tensor>& query_features, std::pair<int64_t, int64_t> image_size, bool skip_blocks, MakeOutput&& make_output);
  torch::Tensor project_spatial_features(const torch::Tensor& spatial_features);
  torch::Tensor project_query_features(const torch::Tensor& query_features);
  torch::Tensor resize_spatial_features(const torch::Tensor& spatial_features, std::pair<int64_t, int64_t> image_size) const;

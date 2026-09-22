@@ -31,9 +31,7 @@ struct ModelProgress final {
  std::uint64_t completed = 0U;
  std::uint64_t total = 0U;
  bool total_known = false;
- [[nodiscard]] bool valid() const noexcept {
-  return activity.size() <= kModelDetailCapacity && (!total_known || (total != 0U && completed <= total)) && (total_known || total == 0U);
- }
+ [[nodiscard]] bool valid() const noexcept { return activity.size() <= kModelDetailCapacity && (!total_known || (total != 0U && completed <= total)) && (total_known || total == 0U); }
  bool operator==(const ModelProgress&) const = default;
 };
 struct[[= reflection::feature_scope(FeatureId::Train, FeatureId::Validate, FeatureId::Predict, FeatureId::Export)]] ModelSelectionRequest final {
@@ -49,20 +47,15 @@ struct ModelSelection final {
 };
 enum class ModelSelectionOutcome : std::uint8_t { Idle, Accepted, Rejected, Cancelled, CancellationRequested };
 inline constexpr std::array kModelSelectionPresentations{
- terminal_presentation::Policy{ModelSelectionOutcome::Idle, terminal_presentation::Classification::Refused, "model_selection.idle",
-                               "No model selection has completed."},
+ terminal_presentation::Policy{ModelSelectionOutcome::Idle, terminal_presentation::Classification::Refused, "model_selection.idle", "No model selection has completed."},
  terminal_presentation::Policy{ModelSelectionOutcome::Accepted, terminal_presentation::Classification::Success, "model_selection.accepted", ""},
- terminal_presentation::Policy{ModelSelectionOutcome::Rejected, terminal_presentation::Classification::Refused, "model_selection.rejected",
-                               "The model selection was rejected."},
- terminal_presentation::Policy{ModelSelectionOutcome::Cancelled, terminal_presentation::Classification::Cancelled, "model_selection.cancelled",
-                               "The model selection was cancelled."},
- terminal_presentation::Policy{ModelSelectionOutcome::CancellationRequested, terminal_presentation::Classification::Cancelled,
-                               "model_selection.cancellation_requested", "Model selection cancellation was requested."},
+ terminal_presentation::Policy{ModelSelectionOutcome::Rejected, terminal_presentation::Classification::Refused, "model_selection.rejected", "The model selection was rejected."},
+ terminal_presentation::Policy{ModelSelectionOutcome::Cancelled, terminal_presentation::Classification::Cancelled, "model_selection.cancelled", "The model selection was cancelled."},
+ terminal_presentation::Policy{
+  ModelSelectionOutcome::CancellationRequested, terminal_presentation::Classification::Cancelled, "model_selection.cancellation_requested", "Model selection cancellation was requested."},
 };
 static_assert(terminal_presentation::complete(kModelSelectionPresentations));
-[[nodiscard]] consteval const auto& materialized_terminal_presentation_policy(std::type_identity<ModelSelectionOutcome>) {
- return kModelSelectionPresentations;
-}
+[[nodiscard]] consteval const auto& materialized_terminal_presentation_policy(std::type_identity<ModelSelectionOutcome>) { return kModelSelectionPresentations; }
 struct ModelSelectionResult final {
  ModelSelectionOutcome outcome = ModelSelectionOutcome::Idle;
  [[= mmltk::frameworks::reflection::MaxBytes{kModelDetailCapacity}]] std::string detail;

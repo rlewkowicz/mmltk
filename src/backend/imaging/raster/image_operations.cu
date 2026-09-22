@@ -9,9 +9,7 @@ namespace {
 struct AffineMatrix {
  float value[6];
 };
-[[nodiscard]] constexpr std::uint32_t divide_rounding_up(const std::uint32_t value, const std::uint32_t divisor) noexcept {
- return value / divisor + static_cast<std::uint32_t>(value % divisor != 0);
-}
+[[nodiscard]] constexpr std::uint32_t divide_rounding_up(const std::uint32_t value, const std::uint32_t divisor) noexcept { return value / divisor + static_cast<std::uint32_t>(value % divisor != 0); }
 [[nodiscard]] bool bgr_maximum_byte_offset_fits(const std::size_t pitch_bytes, const std::uint32_t width, const std::uint32_t height) noexcept {
  constexpr std::size_t kBytesPerPixel = 3U;
  constexpr auto kMaximumOffset = std::numeric_limits<std::size_t>::max();
@@ -24,8 +22,8 @@ struct AffineMatrix {
  const auto final_channel_offset = row_bytes - 1U;
  return last_row_offset <= kMaximumOffset - final_channel_offset;
 }
-__global__ void warp_affine_bgr_to_planar_kernel(const std::uint8_t* src, std::size_t src_pitch_bytes, std::uint32_t src_width, std::uint32_t src_height,
-                                                 float* dst, std::uint32_t dst_width, std::uint32_t dst_height, AffineMatrix d2s, std::uint32_t edge) {
+__global__ void warp_affine_bgr_to_planar_kernel(const std::uint8_t* src, std::size_t src_pitch_bytes, std::uint32_t src_width, std::uint32_t src_height, float* dst, std::uint32_t dst_width,
+ std::uint32_t dst_height, AffineMatrix d2s, std::uint32_t edge) {
  const std::uint32_t position = blockDim.x * blockIdx.x + threadIdx.x;
  if (position >= edge) { return; }
  const std::uint32_t dx = position % dst_width;
@@ -86,11 +84,10 @@ __global__ void vertical_flip_in_place_pitched_kernel(std::uint8_t* buffer, std:
  }
 }
 }  // namespace
-const char* validate_bgr_split_to_planar_float_args(std::size_t src_pitch_bytes, std::uint32_t src_width, std::uint32_t src_height, std::uint32_t dst_width,
-                                                    std::uint32_t dst_height, cudaStream_t stream) {
+const char* validate_bgr_split_to_planar_float_args(
+ std::size_t src_pitch_bytes, std::uint32_t src_width, std::uint32_t src_height, std::uint32_t dst_width, std::uint32_t dst_height, cudaStream_t stream) {
  if (src_width == 0U || src_height == 0U) { return "source width and height must be positive"; }
- if (src_width > static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max()) ||
-     src_height > static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max())) {
+ if (src_width > static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max()) || src_height > static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max())) {
   return "source extents exceed the CUDA kernel integer range";
  }
  if (dst_width == 0U || dst_height == 0U) { return "destination width and height must be positive"; }
@@ -104,12 +101,10 @@ const char* validate_bgr_split_to_planar_float_args(std::size_t src_pitch_bytes,
  if (destination_pixels > std::numeric_limits<std::size_t>::max() / (3U * sizeof(float))) { return "destination planes exceed the pointer-offset range"; }
  return nullptr;
 }
-cudaError_t launch_bgr_split_to_planar_float(const std::uint8_t* src, std::size_t src_pitch_bytes, std::uint32_t src_width, std::uint32_t src_height,
-                                             float* dst, std::uint32_t dst_width, std::uint32_t dst_height, cudaStream_t stream) {
+cudaError_t launch_bgr_split_to_planar_float(
+ const std::uint8_t* src, std::size_t src_pitch_bytes, std::uint32_t src_width, std::uint32_t src_height, float* dst, std::uint32_t dst_width, std::uint32_t dst_height, cudaStream_t stream) {
  if (src == nullptr || dst == nullptr || src_width == 0U || src_height == 0U || dst_width == 0U || dst_height == 0U) { return cudaErrorInvalidValue; }
- if (validate_bgr_split_to_planar_float_args(src_pitch_bytes, src_width, src_height, dst_width, dst_height, stream) != nullptr) {
-  return cudaErrorInvalidValue;
- }
+ if (validate_bgr_split_to_planar_float_args(src_pitch_bytes, src_width, src_height, dst_width, dst_height, stream) != nullptr) { return cudaErrorInvalidValue; }
  const float scale = fminf(static_cast<float>(dst_width) / static_cast<float>(src_width), static_cast<float>(dst_height) / static_cast<float>(src_height));
  const float inverse_scale = scale > 0.0f ? 1.0f / scale : 0.0f;
  const float translate_x = -scale * static_cast<float>(src_width) * 0.5f + static_cast<float>(dst_width) * 0.5f;
@@ -127,8 +122,7 @@ cudaError_t launch_bgr_split_to_planar_float(const std::uint8_t* src, std::size_
  warp_affine_bgr_to_planar_kernel<<<blocks, kThreads, 0, stream>>>(src, src_pitch_bytes, src_width, src_height, dst, dst_width, dst_height, d2s, jobs);
  return cudaPeekAtLastError();
 }
-cudaError_t launch_bgr_vertical_flip_in_place_pitched(std::uint8_t* buffer, std::size_t pitch_bytes, std::uint32_t width, std::uint32_t height,
-                                                      cudaStream_t stream) {
+cudaError_t launch_bgr_vertical_flip_in_place_pitched(std::uint8_t* buffer, std::size_t pitch_bytes, std::uint32_t width, std::uint32_t height, cudaStream_t stream) {
  if (buffer == nullptr || width == 0U || height == 0U || stream == nullptr) { return cudaErrorInvalidValue; }
  constexpr std::size_t kBgr3BytesPerPixel = 3U;
  if (pitch_bytes < static_cast<std::size_t>(width) * kBgr3BytesPerPixel) { return cudaErrorInvalidValue; }

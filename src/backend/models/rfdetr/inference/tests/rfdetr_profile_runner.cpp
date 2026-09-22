@@ -30,12 +30,10 @@ Options parse_options(int argc, char** argv) {
  add_common_profile_options(table, options);
  table.add_integer("--limit-images", options.limit_images);
  table.parse_or_exit(argc, argv,
-                     "--compiled-path PATH --checkpoint-path PATH [--repetitions N] "
-                     "[--warmup-runs N] [--device-id N] [--workers N] [--batch-size N] "
-                     "[--cpu-affinity LIST] [--limit-images N]");
- if (options.compiled_path.empty() || options.checkpoint_path.empty()) {
-  throw std::runtime_error("RF-DETR profile runner requires compiled and checkpoint paths");
- }
+  "--compiled-path PATH --checkpoint-path PATH [--repetitions N] "
+  "[--warmup-runs N] [--device-id N] [--workers N] [--batch-size N] "
+  "[--cpu-affinity LIST] [--limit-images N]");
+ if (options.compiled_path.empty() || options.checkpoint_path.empty()) { throw std::runtime_error("RF-DETR profile runner requires compiled and checkpoint paths"); }
  if (options.repetitions <= 0 || options.warmup_runs < 0 || options.batch_size <= 0 || options.limit_images < 0) {
   throw std::runtime_error("repetitions, warmup-runs, and batch-size must be positive/non-negative");
  }
@@ -69,8 +67,7 @@ void record_evaluate_metrics(const EvaluateRun& run) {
  record_optional_x10000_metric("rfdetr.evaluate.checkpoint.mask_ap_x10000", run.mask_ap);
 }
 void print_iteration_line(const char* phase, int index, int total, const EvaluateRun& run) {
- std::printf("%s=rfdetr.evaluate.checkpoint %d/%d pt=%.3fs bbox=%.4f mask=%s\n", phase, index, total, seconds_from_ns(run.elapsed_ns), run.bbox_ap,
-             optional_metric_text(run.mask_ap).c_str());
+ std::printf("%s=rfdetr.evaluate.checkpoint %d/%d pt=%.3fs bbox=%.4f mask=%s\n", phase, index, total, seconds_from_ns(run.elapsed_ns), run.bbox_ap, optional_metric_text(run.mask_ap).c_str());
  std::fflush(stdout);
 }
 }  // namespace
@@ -84,15 +81,14 @@ int main(int argc, char** argv) {
    logger.trace(
     "event=profile.execution_policy executable=mmltk_rfdetr_profile_runner online_cpu_count={} "
     "nice_value={} scheduler_policy={} scheduler_priority={} io_class={} io_priority_data={}",
-    execution_snapshot.online_cpu_count, execution_snapshot.nice_value, execution_snapshot.scheduler_policy, execution_snapshot.scheduler_priority,
-    execution_snapshot.io_class, execution_snapshot.io_priority_data);
+    execution_snapshot.online_cpu_count, execution_snapshot.nice_value, execution_snapshot.scheduler_policy, execution_snapshot.scheduler_priority, execution_snapshot.io_class,
+    execution_snapshot.io_priority_data);
   });
   const Options options = parse_options(argc, argv);
   ensure_file_exists("compiled dataset", options.compiled_path);
   ensure_file_exists("checkpoint", options.checkpoint_path);
   run_profile_phases(
-   "rfdetr.evaluate.checkpoint", options.warmup_runs, options.repetitions, [&options](bool, int) { return run_checkpoint_backend(options); },
-   record_evaluate_metrics, print_iteration_line);
+   "rfdetr.evaluate.checkpoint", options.warmup_runs, options.repetitions, [&options](bool, int) { return run_checkpoint_backend(options); }, record_evaluate_metrics, print_iteration_line);
   mmltk::common::logging::profile_flush();
   return 0;
  } catch (const std::exception& error) {

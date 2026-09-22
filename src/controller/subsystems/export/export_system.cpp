@@ -20,8 +20,7 @@ public:
 };
 CudaExportRuntime::CudaExportRuntime(DirectComputeConfiguration configuration) : impl_(std::make_unique<Impl>(configuration)) {}
 CudaExportRuntime::~CudaExportRuntime() = default;
-contracts::ComputeTerminal CudaExportRuntime::Run(mmltk::backend::models::rfdetr::ModelExportRequest operation, std::stop_token stop,
-                                                  const ComputeProgressSink&) {
+contracts::ComputeTerminal CudaExportRuntime::Run(mmltk::backend::models::rfdetr::ModelExportRequest operation, std::stop_token stop, const ComputeProgressSink&) {
  using mmltk::backend::models::rfdetr::BuildEngineRequest;
  using mmltk::backend::models::rfdetr::ExportOnnxRequest;
  return impl_->resources.Run(
@@ -35,8 +34,8 @@ contracts::ComputeTerminal CudaExportRuntime::Run(mmltk::backend::models::rfdetr
    request.device_id = impl_->resources.device();
    impl_->session.Run(request, stream, stop);
    return contracts::make_compute_terminal(contracts::ComputeOperationOutcome::Succeeded, 0, 0,
-                                           // CLEANUP-IGNORE: ONNX export publishes its domain output path from the validated request.
-                                           request.output_path.string());
+    // CLEANUP-IGNORE: ONNX export publishes its domain output path from the validated request.
+    request.output_path.string());
   },
   // CLEANUP-IGNORE: Export closes its own CUDA session run independently of prediction result ownership.
   stop);
@@ -44,7 +43,7 @@ contracts::ComputeTerminal CudaExportRuntime::Run(mmltk::backend::models::rfdetr
 class ExportSystem::Impl final {
 public:
  Impl(SettingsSystem& settings, DatasetSystem&, ModelSystem& model, ExportRuntimeFactory factory, SystemEventSink<ExportSystem::event_type> events,
-      std::optional<mmltk::frameworks::gpu::DeviceExecution> execution)
+  std::optional<mmltk::frameworks::gpu::DeviceExecution> execution)
      : settings_(settings), model_(model), factory_(std::move(factory)), events_(std::move(events)), configuration_{std::move(execution)} {
   if (!factory_) throw contracts::UnavailableError("compute runtime factory is unavailable");
   // CLEANUP-IGNORE: Export and validation have distinct admission and worker preparation after this common settings guard.
@@ -109,9 +108,7 @@ private:
    contracts::complete_compute(state_, std::move(terminal));
    settled = state_;
   }
-  return [this, settled = std::move(settled)]() mutable noexcept {
-   direct::PublishLazyNoexcept(events_, [&] { return ComputeSystemEvent{ComputeChanged{std::move(settled)}}; });
-  };
+  return [this, settled = std::move(settled)]() mutable noexcept { direct::PublishLazyNoexcept(events_, [&] { return ComputeSystemEvent{ComputeChanged{std::move(settled)}}; }); };
  }
  void Progress(const contracts::ComputeProgress& progress) noexcept {
   contracts::ComputeUiState snapshot;
@@ -132,8 +129,8 @@ private:
  DirectComputeConfiguration configuration_;
  direct::LocalRun run_;
 };
-ExportSystem::ExportSystem(SettingsSystem& settings, DatasetSystem& dataset, ModelSystem& model, ExportRuntimeFactory factory,
-                           SystemEventSink<event_type> events, std::optional<mmltk::frameworks::gpu::DeviceExecution> execution)
+ExportSystem::ExportSystem(SettingsSystem& settings, DatasetSystem& dataset, ModelSystem& model, ExportRuntimeFactory factory, SystemEventSink<event_type> events,
+ std::optional<mmltk::frameworks::gpu::DeviceExecution> execution)
     : impl_(std::make_unique<Impl>(settings, dataset, model, std::move(factory), std::move(events), std::move(execution))) {}
 ExportSystem::~ExportSystem() = default;
 contracts::ComputeUiState ExportSystem::Start(contracts::ExportWorkflowIntent) { return impl_->Start(); }

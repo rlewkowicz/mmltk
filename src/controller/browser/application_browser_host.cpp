@@ -47,8 +47,7 @@ namespace transport = mmltk::frameworks::transport;
 }
 }  // namespace
 struct ApplicationBrowserHost::Impl final {
- Impl(transport::BrowserServer& server_value, const services::RuntimeDiagnosticTarget diagnostics_value)
-     : server(&server_value), diagnostics(diagnostics_value) {}
+ Impl(transport::BrowserServer& server_value, const services::RuntimeDiagnosticTarget diagnostics_value) : server(&server_value), diagnostics(diagnostics_value) {}
  [[nodiscard]] bool install(ApplicationSystems& value) noexcept {
   ApplicationSystems* expected = nullptr;
   return systems.compare_exchange_strong(expected, &value, std::memory_order_release, std::memory_order_acquire) || expected == &value;
@@ -353,8 +352,7 @@ struct ApplicationBrowserHost::Impl final {
  std::atomic<ApplicationSystems*> systems = nullptr;
  std::atomic_bool admission = true;
 };
-ApplicationBrowserHost::ApplicationBrowserHost(transport::BrowserServer& server, const services::RuntimeDiagnosticTarget diagnostics)
-    : impl_(std::make_shared<Impl>(server, diagnostics)) {}
+ApplicationBrowserHost::ApplicationBrowserHost(transport::BrowserServer& server, const services::RuntimeDiagnosticTarget diagnostics) : impl_(std::make_shared<Impl>(server, diagnostics)) {}
 bool ApplicationBrowserHost::install(ApplicationSystems& systems) noexcept { return impl_->install(systems); }
 void ApplicationBrowserHost::install_integration(std::shared_ptr<ExploreAcceptanceGate> gate, std::shared_ptr<PresentationAcceptanceGate> completion) {
  if (!gate || impl_->integration) throw std::invalid_argument("integration gate installation is unique");
@@ -362,8 +360,7 @@ void ApplicationBrowserHost::install_integration(std::shared_ptr<ExploreAcceptan
  std::weak_ptr<Impl> weak = impl_;
  gate->SetFrontendCommand([weak](const contracts::IntegrationControlReceipt receipt) {
   const auto owner = weak.lock();
-  return owner && owner->admission.load(std::memory_order_acquire) &&
-         owner->publish_record(IntegrationControl{.receipt = receipt}, transport::BrowserRecordPriority::Critical);
+  return owner && owner->admission.load(std::memory_order_acquire) && owner->publish_record(IntegrationControl{.receipt = receipt}, transport::BrowserRecordPriority::Critical);
  });
  gate->SetRedrawCommand([weak] {
   const auto owner = weak.lock();
@@ -387,11 +384,7 @@ void ApplicationBrowserHost::install_integration(std::shared_ptr<ExploreAcceptan
      }
      std::unreachable();
     }();
-    if (!target->ObserveControl({.event = event,
-                                 .source_high = receipt.source_high,
-                                 .source_low = receipt.source_low,
-                                 .transfer = receipt.transfer,
-                                 .publication = receipt.publication}))
+    if (!target->ObserveControl({.event = event, .source_high = receipt.source_high, .source_low = receipt.source_low, .transfer = receipt.transfer, .publication = receipt.publication}))
      target->Stop();
    }
   });
@@ -410,8 +403,7 @@ void ApplicationBrowserHost::install_integration(std::shared_ptr<ExploreAcceptan
     kind = Kind::CapacityCompletionReleased;
    } else
     return false;
-   return owner->publish_record(IntegrationControl{.receipt = {.kind = kind, .sequence = owner->integration->FrontendSequence()}},
-                                transport::BrowserRecordPriority::Critical);
+   return owner->publish_record(IntegrationControl{.receipt = {.kind = kind, .sequence = owner->integration->FrontendSequence()}}, transport::BrowserRecordPriority::Critical);
   });
   impl_->completion_acceptance = std::move(completion);
  }

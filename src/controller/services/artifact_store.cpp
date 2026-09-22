@@ -29,21 +29,18 @@
 #include "src/controller/contracts/gui_settings_mutation.h"
 namespace mmltk::controller::services {
 namespace contracts = mmltk::controller::contracts;
-std::expected<ArtifactCompileRequest, ArtifactCompileMaterializationError> materialize_artifact_compile(
- const mmltk::controller::contracts::GuiSettingsState& settings) noexcept {
- const auto refusal = [](const std::string_view detail) {
-  return std::unexpected{ArtifactCompileMaterializationError{.detail = mmltk::controller::contracts::bounded_artifact_detail(detail)}};
- };
+std::expected<ArtifactCompileRequest, ArtifactCompileMaterializationError> materialize_artifact_compile(const mmltk::controller::contracts::GuiSettingsState& settings) noexcept {
+ const auto refusal = [](const std::string_view detail) { return std::unexpected{ArtifactCompileMaterializationError{.detail = mmltk::controller::contracts::bounded_artifact_detail(detail)}}; };
  if (!mmltk::controller::contracts::gui_settings_valid(settings)) return refusal("invalid settings");
  const auto& train = settings.workflows.train;
  ArtifactCompileRequest request{.source = train.dataset_source_dir,
-                                .output = train.compiled_dataset_dir,
-                                .preset = train.request.preset_name,
-                                .resolution = static_cast<std::uint32_t>(train.request.resolution),
-                                .overwrite = train.overwrite_compiled_dataset,
-                                .benchmark_selection = train.benchmark_selection,
-                                .perceptual_downscale = train.compile_perceptual_downscale,
-                                .resize_mode = train.compile_resize_mode};
+  .output = train.compiled_dataset_dir,
+  .preset = train.request.preset_name,
+  .resolution = static_cast<std::uint32_t>(train.request.resolution),
+  .overwrite = train.overwrite_compiled_dataset,
+  .benchmark_selection = train.benchmark_selection,
+  .perceptual_downscale = train.compile_perceptual_downscale,
+  .resize_mode = train.compile_resize_mode};
  request.kind = train.compile_benchmark_dataset_override ? ArtifactCompileKind::Benchmark : ArtifactCompileKind::Directory;
  if (!request.valid()) return refusal("invalid dataset compile settings");
  return request;
@@ -52,19 +49,17 @@ namespace {
 [[nodiscard]] std::uint64_t bounded_u64_count(const std::size_t value) noexcept {
  return static_cast<std::uint64_t>(std::min(value, static_cast<std::size_t>(std::numeric_limits<std::uint64_t>::max())));
 }
-[[nodiscard]] std::string bounded_progress_text(const std::string_view value) {
- return std::string{value.substr(0U, contracts::kArtifactProgressTextCapacity)};
-}
+[[nodiscard]] std::string bounded_progress_text(const std::string_view value) { return std::string{value.substr(0U, contracts::kArtifactProgressTextCapacity)}; }
 }  // namespace
 contracts::ArtifactProgress project_artifact_progress(const mmltk::backend::data::CompileProgress& value) {
  return {.phase = value.phase,
-         .activity = std::string{mmltk::backend::data::dataset_compile_phase_label(value.phase)},
-         .completed = bounded_u64_count(value.done),
-         .total = bounded_u64_count(value.total),
-         .elapsed_seconds = value.elapsed_seconds,
-         .remaining_seconds = value.remaining_seconds,
-         .throughput_per_second = value.throughput_per_second,
-         .dropped_instances = value.dropped_instances};
+  .activity = std::string{mmltk::backend::data::dataset_compile_phase_label(value.phase)},
+  .completed = bounded_u64_count(value.done),
+  .total = bounded_u64_count(value.total),
+  .elapsed_seconds = value.elapsed_seconds,
+  .remaining_seconds = value.remaining_seconds,
+  .throughput_per_second = value.throughput_per_second,
+  .dropped_instances = value.dropped_instances};
 }
 contracts::ArtifactProgress project_artifact_progress(const mmltk::backend::data::BenchmarkCompileProgress& value) {
  std::string activity = value.activity;
@@ -87,24 +82,22 @@ contracts::ArtifactProgress project_artifact_progress(const mmltk::backend::data
  }
  const mmltk::backend::data::ProgressEstimate estimate = mmltk::backend::data::estimate_progress(value.completed, value.total, value.activity_elapsed_seconds);
  return {.phase = value.phase,
-         .activity = bounded_progress_text(activity),
-         .completed = value.completed,
-         .total = value.total,
-         .elapsed_seconds = value.activity_elapsed_seconds,
-         .remaining_seconds = estimate.remaining_seconds,
-         .throughput_per_second = estimate.throughput_per_second,
-         .projected_output_bytes = value.projected_output_bytes,
-         .dropped_instances = value.dropped_instances,
-         .quarantined_images = value.quarantined_images};
+  .activity = bounded_progress_text(activity),
+  .completed = value.completed,
+  .total = value.total,
+  .elapsed_seconds = value.activity_elapsed_seconds,
+  .remaining_seconds = estimate.remaining_seconds,
+  .throughput_per_second = estimate.throughput_per_second,
+  .projected_output_bytes = value.projected_output_bytes,
+  .dropped_instances = value.dropped_instances,
+  .quarantined_images = value.quarantined_images};
 }
 namespace {
 class RuntimeArtifactCompilerOperations final : public ArtifactCompilerOperations {
 private:
- void compile_benchmark(const mmltk::backend::data::BenchmarkDatasetSelection selection, const std::filesystem::path& output,
-                        const std::filesystem::path& publication, const std::uint32_t resolution, const bool perceptual_downscale,
-                        const mmltk::backend::imaging::resample::ImageResizeMode resize_mode,
-                        const mmltk::common::concurrency::CancellationObservation cancellation, const ArtifactProgressObserver progress,
-                        const ArtifactBenchmarkTraceObserver trace) const override {
+ void compile_benchmark(const mmltk::backend::data::BenchmarkDatasetSelection selection, const std::filesystem::path& output, const std::filesystem::path& publication, const std::uint32_t resolution,
+  const bool perceptual_downscale, const mmltk::backend::imaging::resample::ImageResizeMode resize_mode, const mmltk::common::concurrency::CancellationObservation cancellation,
+  const ArtifactProgressObserver progress, const ArtifactBenchmarkTraceObserver trace) const override {
   mmltk::backend::data::BenchmarkCompilerConfig configuration;
   configuration.selection = selection;
   configuration.output_dir = output;
@@ -122,9 +115,9 @@ private:
   }
   mmltk::backend::data::compile_benchmark_dataset(std::move(configuration));
  }
- void compile_directory(const std::filesystem::path& source, const std::filesystem::path& output, const std::uint32_t resolution,
-                        const bool perceptual_downscale, const mmltk::backend::imaging::resample::ImageResizeMode resize_mode,
-                        const mmltk::common::concurrency::CancellationObservation cancellation, const ArtifactProgressObserver progress) const override {
+ void compile_directory(const std::filesystem::path& source, const std::filesystem::path& output, const std::uint32_t resolution, const bool perceptual_downscale,
+  const mmltk::backend::imaging::resample::ImageResizeMode resize_mode, const mmltk::common::concurrency::CancellationObservation cancellation,
+  const ArtifactProgressObserver progress) const override {
   std::array<std::string, contracts::kArtifactSplitCapacity> split_names{};
   std::size_t split_count = 0U;
   if (cancellation.requested()) return;
@@ -157,11 +150,9 @@ private:
     mmltk::backend::data::DatasetCompiler::compile(plan, split, nullptr, cancellation);
     continue;
    }
-   mmltk::backend::data::CompileTelemetry telemetry{
-    plan.splits[split].image_count,
-    {.context = const_cast<ArtifactProgressObserver*>(&progress), .report = [](void* context, const mmltk::backend::data::CompileProgress& update) noexcept {
-      (*static_cast<const ArtifactProgressObserver*>(context))(project_artifact_progress(update));
-     }}};
+   mmltk::backend::data::CompileTelemetry telemetry{plan.splits[split].image_count,
+    {.context = const_cast<ArtifactProgressObserver*>(&progress),
+     .report = [](void* context, const mmltk::backend::data::CompileProgress& update) noexcept { (*static_cast<const ArtifactProgressObserver*>(context))(project_artifact_progress(update)); }}};
    mmltk::backend::data::DatasetCompiler::compile(plan, split, &telemetry, cancellation);
    if (cancellation.requested()) return;
   }
@@ -171,15 +162,11 @@ const RuntimeArtifactCompilerOperations kRuntimeArtifactCompilerOperations;
 [[nodiscard]] mmltk::controller::contracts::ArtifactInspection rejected_inspection(const std::string_view detail) {
  return {.compatible = false, .splits = {}, .detail = mmltk::controller::contracts::bounded_artifact_detail(detail)};
 }
-[[nodiscard]] std::optional<std::string_view> invalid_artifact_input(const std::string_view preset, const std::filesystem::path* const source = nullptr,
-                                                                     const std::filesystem::path* const output = nullptr) {
+[[nodiscard]] std::optional<std::string_view> invalid_artifact_input(
+ const std::string_view preset, const std::filesystem::path* const source = nullptr, const std::filesystem::path* const output = nullptr) {
  if (preset.empty() || preset.size() > contracts::kArtifactPresetCapacity) return "artifact preset exceeds reflected capacity";
- if (source != nullptr && (source->empty() || source->native().size() > contracts::kArtifactPathCapacity)) {
-  return "artifact source path exceeds reflected capacity";
- }
- if (output != nullptr && (output->empty() || output->native().size() > contracts::kArtifactPathCapacity)) {
-  return "artifact output path exceeds reflected capacity";
- }
+ if (source != nullptr && (source->empty() || source->native().size() > contracts::kArtifactPathCapacity)) { return "artifact source path exceeds reflected capacity"; }
+ if (output != nullptr && (output->empty() || output->native().size() > contracts::kArtifactPathCapacity)) { return "artifact output path exceeds reflected capacity"; }
  return std::nullopt;
 }
 [[nodiscard]] std::optional<std::string_view> invalid_inspected_split(const mmltk::backend::data::CompiledDatasetInfo& info) {
@@ -189,9 +176,8 @@ const RuntimeArtifactCompilerOperations kRuntimeArtifactCompilerOperations;
  if (!info.class_catalog || info.class_catalog->empty()) return "compiled artifact class catalog is empty";
  return std::nullopt;
 }
-[[nodiscard]] mmltk::controller::contracts::ArtifactInspection inspect_artifact(
- const std::array<std::filesystem::path, contracts::kArtifactSplitCapacity>& paths, const std::string_view preset, const std::uint32_t resolution,
- const mmltk::common::concurrency::CancellationObservation cancellation) {
+[[nodiscard]] mmltk::controller::contracts::ArtifactInspection inspect_artifact(const std::array<std::filesystem::path, contracts::kArtifactSplitCapacity>& paths, const std::string_view preset,
+ const std::uint32_t resolution, const mmltk::common::concurrency::CancellationObservation cancellation) {
  mmltk::controller::contracts::ArtifactInspection result;
  if (const auto invalid = invalid_artifact_input(preset)) { return rejected_inspection(*invalid); }
  for (const auto& path : paths) {
@@ -214,12 +200,12 @@ const RuntimeArtifactCompilerOperations kRuntimeArtifactCompilerOperations;
    classes = info.class_catalog;
    if (result.splits.size() >= contracts::kArtifactSplitCapacity) { return rejected_inspection("compiled artifact split count exceeds fixed capacity"); }
    auto& split = result.splits.emplace_back(mmltk::controller::contracts::ArtifactSplitFact{.path = info.path.string(),
-                                                                                            .image_count = static_cast<std::uint32_t>(info.image_count),
-                                                                                            .width = info.width,
-                                                                                            .height = info.height,
-                                                                                            .channels = info.channels,
-                                                                                            .max_instances_per_image = info.max_instances_per_image,
-                                                                                            .class_names = {}});
+    .image_count = static_cast<std::uint32_t>(info.image_count),
+    .width = info.width,
+    .height = info.height,
+    .channels = info.channels,
+    .max_instances_per_image = info.max_instances_per_image,
+    .class_names = {}});
    for (const std::string& name : info.class_names()) split.class_names.push_back({.value = name});
   } catch (const std::exception& error) { return rejected_inspection(error.what()); }
  }
@@ -237,9 +223,8 @@ const RuntimeArtifactCompilerOperations kRuntimeArtifactCompilerOperations;
 }
 [[nodiscard]] std::optional<std::filesystem::path> validated_weight_destination(const ArtifactWeightAsset& asset, const std::filesystem::path& cache_root) {
  const std::filesystem::path filename(asset.filename);
- if (asset.filename.empty() || asset.filename.size() > contracts::kArtifactPathCapacity || filename.is_absolute() || filename.has_parent_path() ||
-     filename == std::filesystem::path{"."} || filename == std::filesystem::path{".."} || asset.filename.contains('/') || asset.filename.contains('\\') ||
-     !valid_weight_url(asset.url) || !valid_weight_md5(asset.md5)) {
+ if (asset.filename.empty() || asset.filename.size() > contracts::kArtifactPathCapacity || filename.is_absolute() || filename.has_parent_path() || filename == std::filesystem::path{"."} ||
+     filename == std::filesystem::path{".."} || asset.filename.contains('/') || asset.filename.contains('\\') || !valid_weight_url(asset.url) || !valid_weight_md5(asset.md5)) {
   return std::nullopt;
  }
  const std::filesystem::path root = cache_root.lexically_normal();
@@ -261,11 +246,9 @@ public:
  std::optional<ArtifactWeightAsset> find(const std::string_view preset) const override {
   const auto* entry = mmltk::backend::models::rfdetr::find_preset_catalog_entry(preset);
   if (entry == nullptr) return std::nullopt;
-  return ArtifactWeightAsset{
-   .filename = std::string(entry->canonical_weight_filename), .url = std::string(entry->canonical_weight_url), .md5 = std::string(entry->canonical_weight_md5)};
+  return ArtifactWeightAsset{.filename = std::string(entry->canonical_weight_filename), .url = std::string(entry->canonical_weight_url), .md5 = std::string(entry->canonical_weight_md5)};
  }
- void download(const std::string_view url, const std::filesystem::path& output, const ArtifactCancellationToken& cancellation,
-               ArtifactWeightProgressObserver) const override;
+ void download(const std::string_view url, const std::filesystem::path& output, const ArtifactCancellationToken& cancellation, ArtifactWeightProgressObserver) const override;
 };
 size_t write_weight(void* data, size_t size, size_t count, void* opaque) {
  auto& transfer = *static_cast<WeightTransfer*>(opaque);
@@ -292,13 +275,12 @@ int weight_progress(void* opaque, const curl_off_t total, const curl_off_t compl
   transfer.reported_completed = done;
   transfer.reported_total = expected;
   transfer.reported_known = known;
-  transfer.progress(
-   {.stage = contracts::ModelProgressStage::Downloading, .activity = "Downloading model weights", .completed = done, .total = expected, .total_known = known});
+  transfer.progress({.stage = contracts::ModelProgressStage::Downloading, .activity = "Downloading model weights", .completed = done, .total = expected, .total_known = known});
  }
  return 0;
 }
-void RuntimeArtifactWeightOperations::download(const std::string_view url, const std::filesystem::path& output, const ArtifactCancellationToken& cancellation,
-                                               const ArtifactWeightProgressObserver progress) const {
+void RuntimeArtifactWeightOperations::download(
+ const std::string_view url, const std::filesystem::path& output, const ArtifactCancellationToken& cancellation, const ArtifactWeightProgressObserver progress) const {
  WeightTransfer transfer{.output = std::ofstream(output, std::ios::binary | std::ios::trunc), .cancellation = &cancellation, .progress = progress};
  if (!transfer.output) throw std::runtime_error("cannot create staged canonical RF-DETR weights");
  CURL* curl = curl_easy_init();
@@ -315,9 +297,7 @@ void RuntimeArtifactWeightOperations::download(const std::string_view url, const
  curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
  const CURLcode result = curl_easy_perform(curl);
  transfer.output.close();
- if (result != CURLE_OK)
-  throw std::runtime_error(cancellation.cancelled() ? "canonical weight acquisition cancelled"
-                                                    : std::string("canonical weight download failed: ") + curl_easy_strerror(result));
+ if (result != CURLE_OK) throw std::runtime_error(cancellation.cancelled() ? "canonical weight acquisition cancelled" : std::string("canonical weight download failed: ") + curl_easy_strerror(result));
 }
 std::string md5_file(const std::filesystem::path& path, const ArtifactCancellationToken& cancellation) {
  const auto digests = mmltk::common::io::try_file_digests(path, true, [&] { return cancellation.cancelled(); });
@@ -336,36 +316,31 @@ ArtifactStore::ArtifactStore(std::filesystem::path cache_root)
        static const RuntimeArtifactWeightOperations operations;
        return operations;
       }()) {}
-ArtifactStore::ArtifactStore(std::filesystem::path cache_root, const ArtifactWeightOperations& operations)
-    : ArtifactStore(std::move(cache_root), operations, kRuntimeArtifactCompilerOperations) {}
-ArtifactStore::ArtifactStore(std::filesystem::path cache_root, const ArtifactWeightOperations& operations,
-                             const ArtifactCompilerOperations& compiler_operations)
+ArtifactStore::ArtifactStore(std::filesystem::path cache_root, const ArtifactWeightOperations& operations) : ArtifactStore(std::move(cache_root), operations, kRuntimeArtifactCompilerOperations) {}
+ArtifactStore::ArtifactStore(std::filesystem::path cache_root, const ArtifactWeightOperations& operations, const ArtifactCompilerOperations& compiler_operations)
     : cache_root_(std::move(cache_root)), weight_operations_(&operations), compiler_operations_(&compiler_operations) {}
-mmltk::controller::contracts::ArtifactInspection ArtifactStore::inspect(const std::array<std::filesystem::path, contracts::kArtifactSplitCapacity>& paths,
-                                                                        const std::string_view preset, const std::uint32_t resolution,
-                                                                        const ArtifactCancellationToken& cancellation) const {
+mmltk::controller::contracts::ArtifactInspection ArtifactStore::inspect(const std::array<std::filesystem::path, contracts::kArtifactSplitCapacity>& paths, const std::string_view preset,
+ const std::uint32_t resolution, const ArtifactCancellationToken& cancellation) const {
  return inspect_artifact(paths, preset, resolution, mmltk::common::concurrency::CancellationObservation::Borrow(cancellation));
 }
-ArtifactCompileResult ArtifactStore::compile(const ArtifactCompileRequest& request, const ArtifactCancellationToken& cancellation,
-                                             const ArtifactProgressObserver progress, const ArtifactDiagnosticObserver diagnostics) const {
+ArtifactCompileResult ArtifactStore::compile(
+ const ArtifactCompileRequest& request, const ArtifactCancellationToken& cancellation, const ArtifactProgressObserver progress, const ArtifactDiagnosticObserver diagnostics) const {
  const auto cancellation_observation = mmltk::common::concurrency::CancellationObservation::Borrow(cancellation);
  if (!request.valid()) return {.output = {}, .cancelled = false, .inspection = rejected_inspection("invalid artifact compile request")};
  if (cancellation_observation.requested()) return {.output = {}, .cancelled = true, .inspection = {}};
  try {
   if (request.kind == ArtifactCompileKind::Directory && !std::filesystem::is_directory(request.source))
    return {.output = {}, .cancelled = false, .inspection = rejected_inspection("artifact source directory is unavailable")};
-  if (!request.overwrite && std::filesystem::exists(request.output))
-   return {.output = {}, .cancelled = false, .inspection = rejected_inspection("artifact output already exists")};
+  if (!request.overwrite && std::filesystem::exists(request.output)) return {.output = {}, .cancelled = false, .inspection = rejected_inspection("artifact output already exists")};
   mmltk::common::io::StagingDirectory staging{request.output, "", ".tmp.XXXXXX", "failed to stage compiled artifact"};
   switch (request.kind) {
    case ArtifactCompileKind::Directory:
-    compiler_operations_->compile_directory(request.source, staging.path(), request.resolution, request.perceptual_downscale, request.resize_mode,
-                                            cancellation_observation, progress);
+    compiler_operations_->compile_directory(request.source, staging.path(), request.resolution, request.perceptual_downscale, request.resize_mode, cancellation_observation, progress);
     break;
    case ArtifactCompileKind::Benchmark: {
     const ArtifactBenchmarkTraceObserver trace = diagnostics.benchmark;
-    compiler_operations_->compile_benchmark(request.benchmark_selection, staging.path(), request.output, request.resolution, request.perceptual_downscale,
-                                            request.resize_mode, cancellation_observation, progress, trace);
+    compiler_operations_->compile_benchmark(
+     request.benchmark_selection, staging.path(), request.output, request.resolution, request.perceptual_downscale, request.resize_mode, cancellation_observation, progress, trace);
     break;
    }
   }
@@ -376,8 +351,7 @@ ArtifactCompileResult ArtifactStore::compile(const ArtifactCompileRequest& reque
    if (cancellation_observation.requested()) return {.output = {}, .cancelled = true, .inspection = {}};
    if (!entry.is_regular_file() || entry.path().extension() != ".bin") continue;
    if (cancellation_observation.requested()) return {.output = {}, .cancelled = true, .inspection = {}};
-   if (path_count == paths.size())
-    return {.output = {}, .cancelled = false, .inspection = rejected_inspection("compiled artifact split count is outside fixed capacity")};
+   if (path_count == paths.size()) return {.output = {}, .cancelled = false, .inspection = rejected_inspection("compiled artifact split count is outside fixed capacity")};
    paths[path_count++] = entry.path();
   }
   if (cancellation_observation.requested()) return {.output = {}, .cancelled = true, .inspection = {}};
@@ -394,16 +368,13 @@ ArtifactCompileResult ArtifactStore::compile(const ArtifactCompileRequest& reque
   staging.published();
   for (auto& split : inspection.splits) { split.path = (request.output / std::filesystem::path{split.path}.filename()).string(); }
   return {.output = request.output, .cancelled = false, .inspection = std::move(inspection)};
- } catch (const std::exception& error) {
-  return {.output = {}, .cancelled = cancellation_observation.requested(), .inspection = rejected_inspection(error.what())};
- }
+ } catch (const std::exception& error) { return {.output = {}, .cancelled = cancellation_observation.requested(), .inspection = rejected_inspection(error.what())}; }
 }
 std::filesystem::path ArtifactStore::canonical_weight_path(const std::string_view preset) const {
  auto pair = ArtifactCancellationSource::Mint();
  return canonical_weight_path(preset, pair.second);
 }
-std::filesystem::path ArtifactStore::canonical_weight_path(const std::string_view preset, const ArtifactCancellationToken& cancellation,
-                                                           const ArtifactWeightProgressObserver progress) const {
+std::filesystem::path ArtifactStore::canonical_weight_path(const std::string_view preset, const ArtifactCancellationToken& cancellation, const ArtifactWeightProgressObserver progress) const {
  const auto require_not_cancelled = [&cancellation] {
   if (cancellation.cancelled()) throw std::runtime_error("canonical weight acquisition cancelled");
  };

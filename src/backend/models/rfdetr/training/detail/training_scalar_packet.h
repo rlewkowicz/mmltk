@@ -23,8 +23,7 @@ void set(Tensors& values, const torch::Tensor& tensor) {
 inline TrainingScalars project(const float* values, double count) {
  TrainingScalars result;
  mmltk::frameworks::reflection::visit_materialized_members<TrainingScalars>([&]<class Declaration>(const auto&) {
-  constexpr auto position =
-   mmltk::frameworks::reflection::member_index<Declaration::pointer>(mmltk::frameworks::reflection::field_declarations<TrainingScalars>());
+  constexpr auto position = mmltk::frameworks::reflection::member_index<Declaration::pointer>(mmltk::frameworks::reflection::field_declarations<TrainingScalars>());
   const auto value = static_cast<double>(values[position]);
   if (count > 0 && std::isfinite(value)) result.*Declaration::pointer = value / count;
  });

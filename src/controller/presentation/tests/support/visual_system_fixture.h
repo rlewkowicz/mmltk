@@ -130,10 +130,7 @@ public:
   return [backend = std::move(backend), state = std::move(state)] { return std::make_unique<TestPresentationWriter>(0, backend, state); };
  }
  TestPresentationWriter(const int device, std::shared_ptr<FakeImageBackend> backend, std::shared_ptr<TestPresentationWriterState> state)
-     : context_(device, std::move(backend)),
-       stream_(context_),
-       sample_arena_(context_, mmltk::frameworks::gpu::ImageProductLayout::Clean),
-       state_(std::move(state)) {
+     : context_(device, std::move(backend)), stream_(context_), sample_arena_(context_, mmltk::frameworks::gpu::ImageProductLayout::Clean), state_(std::move(state)) {
   state_->constructions.fetch_add(1U, std::memory_order_acq_rel);
  }
  ~TestPresentationWriter() override { state_->retirements.fetch_add(1U, std::memory_order_acq_rel); }
@@ -376,8 +373,7 @@ template <class System>
 class MutableVisualSource final {
 public:
  MutableVisualSource(std::shared_ptr<FakeImageBackend> backend, const VisualExtent extent, const std::uint8_t value = 1U)
-     : runtime_(mmltk::frameworks::gpu::SystemImageRuntimeConfig{
-        .device = 0, .backend = std::move(backend), .output_layout = mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic}) {
+     : runtime_(mmltk::frameworks::gpu::SystemImageRuntimeConfig{.device = 0, .backend = std::move(backend), .output_layout = mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic}) {
   Publish(extent, value);
  }
  void Publish(const VisualExtent extent, const std::uint8_t value) {
@@ -443,14 +439,16 @@ class ProductPresentationSources final {
 public:
  ProductPresentationSources() : backend_(std::make_shared<FakeImageBackend>()) {
   constexpr std::array kKinds{
-   PresentationSourceKind::Explore, PresentationSourceKind::Annotation, PresentationSourceKind::Upscale,
-   PresentationSourceKind::Live,    PresentationSourceKind::Predict,
+   PresentationSourceKind::Explore,
+   PresentationSourceKind::Annotation,
+   PresentationSourceKind::Upscale,
+   PresentationSourceKind::Live,
+   PresentationSourceKind::Predict,
   };
   runtimes_.reserve(kKinds.size());
   sources_.reserve(kKinds.size());
   for (std::size_t index = 0U; index != kKinds.size(); ++index) {
-   auto runtime =
-    std::make_unique<mmltk::frameworks::gpu::SystemImageRuntime>(mmltk::frameworks::gpu::SystemImageRuntimeConfig{.device = 0, .backend = backend_});
+   auto runtime = std::make_unique<mmltk::frameworks::gpu::SystemImageRuntime>(mmltk::frameworks::gpu::SystemImageRuntimeConfig{.device = 0, .backend = backend_});
    const auto extent = VisualExtent{static_cast<std::uint32_t>(16U + index), 16U};
    runtime->Publish(extent.width, extent.height, [](auto, auto, auto) {});
    auto* const private_runtime = runtime.get();

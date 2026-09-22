@@ -20,8 +20,10 @@ struct ClassificationPolicy final {
  bool success = false;
 };
 inline constexpr std::array kClassificationPolicy{
- ClassificationPolicy{Classification::Success, true}, ClassificationPolicy{Classification::Refused, false},
- ClassificationPolicy{Classification::Failed, false}, ClassificationPolicy{Classification::Cancelled, false},
+ ClassificationPolicy{Classification::Success, true},
+ ClassificationPolicy{Classification::Refused, false},
+ ClassificationPolicy{Classification::Failed, false},
+ ClassificationPolicy{Classification::Cancelled, false},
  ClassificationPolicy{Classification::Closed, false},
 };
 // GCC 16 expands each template-for iteration into the same diagnostic scope
@@ -135,8 +137,7 @@ template <class Result>
 }
 #pragma GCC diagnostic pop
 template <class Result>
-inline constexpr bool has_policy =
- !std::same_as<terminal_enum_t<Result>, void> && requires { materialized_terminal_presentation_policy(std::type_identity<terminal_enum_t<Result>>{}); };
+inline constexpr bool has_policy = !std::same_as<terminal_enum_t<Result>, void> && requires { materialized_terminal_presentation_policy(std::type_identity<terminal_enum_t<Result>>{}); };
 template <class Result>
 [[nodiscard]] consteval const auto& materialized_policy()
  requires has_policy<Result>

@@ -132,8 +132,7 @@ void test_checkpoint_supervision_config_and_deployment_pruning() {
  config.denoising.groups = 7U;
  mmltk::backend::ml::cuda::TensorReadbackBuffers readback;
  readback.Begin();
- const std::vector<rfdetr::NormalizedModelStateEntry> entries{{"backbone.weight", torch::ones({1})},
-                                                              {"training_supervision.query_projection.weight", torch::ones({1})}};
+ const std::vector<rfdetr::NormalizedModelStateEntry> entries{{"backbone.weight", torch::ones({1})}, {"training_supervision.query_projection.weight", torch::ones({1})}};
  rfdetr::detail::reserve_state_archive(entries, readback, 0);
  torch::serialize::OutputArchive output;
  rfdetr::detail::write_training_supervision_config(output, config);
@@ -414,15 +413,13 @@ void test_target_scratch_reuse_waits_for_consumer_retirement() {
   published.target_offsets = scratch.offsets_gpu.narrow(0, 0, 2);
   published.target_counts = torch::tensor({1, 2}, integer);
   published.target_indices = torch::tensor({0, 1, 2}, integer);
-  published.packed_masks = rfdetr::PackedTargetMasks{
-   torch::full({3, 1}, 11, integer), 8, 8, torch::full({3, 6}, 13.0F, floating), torch::full({3}, 17, integer), torch::full({3, 6}, 19.0F, floating)};
+  published.packed_masks = rfdetr::PackedTargetMasks{torch::full({3, 1}, 11, integer), 8, 8, torch::full({3, 6}, 13.0F, floating), torch::full({3}, 17, integer), torch::full({3, 6}, 19.0F, floating)};
   scratch.record_pending_copy_on_stream(scratch.copy_stream_handle());
  }
  {
   c10::cuda::CUDAStreamGuard consumer_guard(consumer);
   rfdetr::TargetConsumerLease lease(scratch, published, device_id);
-  REQUIRE(cuStreamWaitValue32(reinterpret_cast<CUstream>(consumer.stream()), reinterpret_cast<CUdeviceptr>(gate_word.data_ptr()), 1U,
-                              CU_STREAM_WAIT_VALUE_EQ) == CUDA_SUCCESS);
+  REQUIRE(cuStreamWaitValue32(reinterpret_cast<CUstream>(consumer.stream()), reinterpret_cast<CUdeviceptr>(gate_word.data_ptr()), 1U, CU_STREAM_WAIT_VALUE_EQ) == CUDA_SUCCESS);
   lease.handoff();
   lease.handoff();
   observed.copy_(scratch.offsets_gpu.narrow(0, 0, 2));
@@ -437,8 +434,7 @@ void test_target_scratch_reuse_waits_for_consumer_retirement() {
   REQUIRE(cudaEventRecord(replacement_done, producer.stream()) == cudaSuccess);
  }
  REQUIRE(cudaEventQuery(replacement_done) == cudaErrorNotReady);
- REQUIRE(cuStreamWriteValue32(reinterpret_cast<CUstream>(releaser.stream()), reinterpret_cast<CUdeviceptr>(gate_word.data_ptr()), 1U,
-                              CU_STREAM_WRITE_VALUE_DEFAULT) == CUDA_SUCCESS);
+ REQUIRE(cuStreamWriteValue32(reinterpret_cast<CUstream>(releaser.stream()), reinterpret_cast<CUdeviceptr>(gate_word.data_ptr()), 1U, CU_STREAM_WRITE_VALUE_DEFAULT) == CUDA_SUCCESS);
  REQUIRE(cudaEventSynchronize(replacement_done) == cudaSuccess);
  REQUIRE(torch::equal(observed.cpu(), torch::tensor({3, 7}, torch::TensorOptions().dtype(torch::kInt64))));
  REQUIRE(cudaEventDestroy(replacement_done) == cudaSuccess);
@@ -534,7 +530,14 @@ void test_build_targets_recovers_after_staging_growth_and_failure() {
  };
  const auto batch = [&](const std::size_t images) {
   return Batch{
-   images, nullptr, label_index.data(), labels.data(), rle_pairs.data(), indices.data(), 0, 0,
+   images,
+   nullptr,
+   label_index.data(),
+   labels.data(),
+   rle_pairs.data(),
+   indices.data(),
+   0,
+   0,
   };
  };
  auto supervision = rfdetr::TrainingSupervisionConfig{};
@@ -550,8 +553,7 @@ void test_build_targets_recovers_after_staging_growth_and_failure() {
  REQUIRE(grown.packed_masks->bits.size(0) == 3);
  scratch.wait_for_pending_copy();
  labels.front().class_id = 2;
- REQUIRE_THROWS_WITH(rfdetr::build_targets(batch(1), 8, 8, true, true, device_id, scratch, "train", 8, supervision, 2),
-                     "feature-active RF-DETR target label is outside the object-class catalog");
+ REQUIRE_THROWS_WITH(rfdetr::build_targets(batch(1), 8, 8, true, true, device_id, scratch, "train", 8, supervision, 2), "feature-active RF-DETR target label is outside the object-class catalog");
  labels.front().class_id = 0;
  auto recovered = rfdetr::build_targets(batch(1), 8, 8, true, true, device_id, scratch, "train", 8, supervision, 2);
  {
@@ -577,13 +579,13 @@ void test_copy_paste_cache_publication_recovers_without_targets() {
  const std::array<mmltk::backend::data::LabelIndexEntry, 2> entries{{{0, 1, 0}, {0, 0, 0}}};
  const std::array<std::uint32_t, 1> donor_index{0}, source_index{1};
  const mmltk::backend::data::Batch donor{.num_images = 1,
-                                         .device_images = donor_pixels.data_ptr<float>(),
-                                         .label_index = entries.data(),
-                                         .labels = &instance,
-                                         .rle_pairs = &run,
-                                         .image_indices = donor_index.data(),
-                                         .slot_index = 0,
-                                         .lease_id = 0};
+  .device_images = donor_pixels.data_ptr<float>(),
+  .label_index = entries.data(),
+  .labels = &instance,
+  .rle_pairs = &run,
+  .image_indices = donor_index.data(),
+  .slot_index = 0,
+  .lease_id = 0};
  auto source = donor;
  source.device_images = source_pixels.data_ptr<float>();
  source.image_indices = source_index.data();
@@ -694,8 +696,7 @@ void test_training_adapter_matches_raw_augmentation_executor() {
    rfdetr::TargetScratch scratch(1);
    auto supervision = rfdetr::TrainingSupervisionConfig{};
    supervision.assignment = rfdetr::TrainAssignmentKind::MatchFree;
-   auto targets =
-    rfdetr::build_targets(donor_batch, width, height, include_masks, include_masks, device_id, scratch, "train", 8, supervision, 3, &adapter.batch_plan());
+   auto targets = rfdetr::build_targets(donor_batch, width, height, include_masks, include_masks, device_id, scratch, "train", 8, supervision, 3, &adapter.batch_plan());
    REQUIRE(adapter.prepare_batch_consumer() != nullptr);
    REQUIRE(adapter.finish_batch(donor_batch) != nullptr);
    {
@@ -769,8 +770,7 @@ void test_training_adapter_matches_raw_augmentation_executor() {
    CHECK(adapted_plan.images.front().paste_masked);
    std::vector<rfdetr::AugmentationPreviewAnnotation> preview;
    rfdetr::build_augmentation_preview_annotations({}, &donor_labels.front(), &adapted_plan.images.front(), width, height, preview);
-   auto pasted_targets =
-    rfdetr::build_targets(source_batch, width, height, include_masks, include_masks, device_id, scratch, "train", 8, supervision, 3, &adapter.batch_plan());
+   auto pasted_targets = rfdetr::build_targets(source_batch, width, height, include_masks, include_masks, device_id, scratch, "train", 8, supervision, 3, &adapter.batch_plan());
    REQUIRE(adapter.prepare_batch_consumer() != nullptr);
    REQUIRE(adapter.finish_batch(source_batch) != nullptr);
    rfdetr::TargetConsumerLease pasted_lease(scratch, pasted_targets, device_id);
@@ -792,8 +792,7 @@ void test_training_adapter_matches_raw_augmentation_executor() {
       ymax = std::max(ymax, y);
      }
     REQUIRE(count > 0);
-    const std::array<float, 4> footprint{static_cast<float>(xmin) / width, static_cast<float>(ymin) / height, static_cast<float>(xmax + 1) / width,
-                                         static_cast<float>(ymax + 1) / height};
+    const std::array<float, 4> footprint{static_cast<float>(xmin) / width, static_cast<float>(ymin) / height, static_cast<float>(xmax + 1) / width, static_cast<float>(ymax + 1) / height};
     CHECK(preview[0].box_xyxy == footprint);
     CHECK(preview[0].visible_area_pixels == static_cast<float>(count));
     const auto target_boxes = pasted_targets.all_boxes.cpu();
@@ -806,8 +805,8 @@ void test_training_adapter_matches_raw_augmentation_executor() {
    }
   }
 }
-void check_copy_paste_targets(const rfdetr::PreparedTargets& targets, const std::span<const std::uint64_t> support_by_class,
-                              const std::vector<rfdetr::AugmentationPreviewAnnotation>& preview, const torch::Tensor& points) {
+void check_copy_paste_targets(
+ const rfdetr::PreparedTargets& targets, const std::span<const std::uint64_t> support_by_class, const std::vector<rfdetr::AugmentationPreviewAnnotation>& preview, const torch::Tensor& points) {
  const auto boxes = targets.all_boxes.cpu(), areas = targets.all_area.cpu(), ids = targets.all_labels.cpu();
  const auto box = boxes.accessor<float, 2>();
  const auto area = areas.accessor<float, 1>();
@@ -817,8 +816,7 @@ void check_copy_paste_targets(const rfdetr::PreparedTargets& targets, const std:
  REQUIRE(preview.size() == static_cast<std::size_t>(expected_count));
  torch::Tensor sampled;
  if (targets.packed_masks && expected_count != 0)
-  sampled =
-   rfdetr::sample_target_masks(*targets.packed_masks, torch::arange(expected_count, points.options().dtype(torch::kInt64)), points, "ring support").cpu();
+  sampled = rfdetr::sample_target_masks(*targets.packed_masks, torch::arange(expected_count, points.options().dtype(torch::kInt64)), points, "ring support").cpu();
  for (std::int64_t i = 0; i < expected_count; ++i) {
   REQUIRE(id[i] >= 0);
   REQUIRE(static_cast<std::size_t>(id[i]) < support_by_class.size());
@@ -842,8 +840,7 @@ void check_copy_paste_targets(const rfdetr::PreparedTargets& targets, const std:
   CHECK(box[i][3] == static_cast<float>(y1 - y0) / 8.F);
   const auto& annotation = preview[static_cast<std::size_t>(i)];
   CHECK(annotation.class_id == id[i]);
-  CHECK(annotation.box_xyxy ==
-        std::array<float, 4>{static_cast<float>(x0) / 8.F, static_cast<float>(y0) / 8.F, static_cast<float>(x1) / 8.F, static_cast<float>(y1) / 8.F});
+  CHECK(annotation.box_xyxy == std::array<float, 4>{static_cast<float>(x0) / 8.F, static_cast<float>(y0) / 8.F, static_cast<float>(x1) / 8.F, static_cast<float>(y1) / 8.F});
   CHECK(annotation.visible_area_pixels == static_cast<float>(count));
  }
 }
@@ -862,26 +859,20 @@ void test_copy_paste_ring_support_and_cache_cycles() {
  for (std::size_t i = 0; i < dot_runs.size(); ++i) {
   const auto x = static_cast<int>(dot_runs[i].start % 8);
   const auto y = static_cast<int>(dot_runs[i].start / 8);
-  labels[i] = {static_cast<std::uint8_t>(i),
-               mmltk::backend::data::kAnnotationMask,
-               static_cast<float>(x),
-               static_cast<float>(y),
-               static_cast<float>(x + dot_runs[i].length),
-               static_cast<float>(y + 1),
-               static_cast<std::uint32_t>(i * sizeof(RLEPair)),
-               1};
+  labels[i] = {static_cast<std::uint8_t>(i), mmltk::backend::data::kAnnotationMask, static_cast<float>(x), static_cast<float>(y), static_cast<float>(x + dot_runs[i].length), static_cast<float>(y + 1),
+   static_cast<std::uint32_t>(i * sizeof(RLEPair)), 1};
  }
  labels.back() = {7, mmltk::backend::data::kAnnotationMask, 1, 1, 7, 7, dot_runs.size() * sizeof(RLEPair), static_cast<std::uint16_t>(ring_runs.size())};
  const std::array<mmltk::backend::data::LabelIndexEntry, 3> entries{{{0, 7, 0}, {7, 1, 0}, {0, 0, 0}}};
  const std::array<std::uint32_t, 1> source_index{0}, donor_index{1}, empty_index{2};
  auto batch = mmltk::backend::data::Batch{.num_images = 1,
-                                          .device_images = donor_pixels.data_ptr<float>(),
-                                          .label_index = entries.data(),
-                                          .labels = labels.data(),
-                                          .rle_pairs = runs.data(),
-                                          .image_indices = donor_index.data(),
-                                          .slot_index = 0,
-                                          .lease_id = 0};
+  .device_images = donor_pixels.data_ptr<float>(),
+  .label_index = entries.data(),
+  .labels = labels.data(),
+  .rle_pairs = runs.data(),
+  .image_indices = donor_index.data(),
+  .slot_index = 0,
+  .lease_id = 0};
  std::vector<float> centers;
  for (int y = 0; y < 8; ++y)
   for (int x = 0; x < 8; ++x) {
@@ -898,8 +889,7 @@ void test_copy_paste_ring_support_and_cache_cycles() {
   rfdetr::GpuBatchAugmenter augmenter(config, 1, 8, 8, execution_augmenter.context);
   rfdetr::TargetScratch scratch(1);
   const auto consume_cached_batch = [&] {
-   auto targets =
-    rfdetr::build_targets(batch, 8, 8, include_masks, include_masks, 0, scratch, "train", 16, rfdetr::TrainingSupervisionConfig{}, 8, &augmenter.batch_plan());
+   auto targets = rfdetr::build_targets(batch, 8, 8, include_masks, include_masks, 0, scratch, "train", 16, rfdetr::TrainingSupervisionConfig{}, 8, &augmenter.batch_plan());
    (void)augmenter.prepare_batch_consumer();
    (void)augmenter.finish_batch(batch);
    rfdetr::TargetConsumerLease lease(scratch, targets, 0);
@@ -940,8 +930,7 @@ void test_copy_paste_ring_support_and_cache_cycles() {
      const std::array means{.485F, .456F, .406F}, deviations{.229F, .224F, .225F};
      for (int c = 0; c < 3; ++c) CHECK(std::abs(rgb[0][c][y][x] - ((pasted ? .9F : .1F) - means[c]) / deviations[c]) < 1.e-5F);
     }
-   auto targets =
-    rfdetr::build_targets(batch, 8, 8, include_masks, include_masks, 0, scratch, "train", 16, rfdetr::TrainingSupervisionConfig{}, 8, &augmenter.batch_plan());
+   auto targets = rfdetr::build_targets(batch, 8, 8, include_masks, include_masks, 0, scratch, "train", 16, rfdetr::TrainingSupervisionConfig{}, 8, &augmenter.batch_plan());
    std::array<std::uint64_t, 8> expected{};
    expected[7] = footprint;
    const auto sources = cycle == 3 ? std::span{labels.data(), dot_runs.size()} : std::span<PackedInstance>{};
@@ -980,8 +969,7 @@ void test_copy_paste_ring_support_and_cache_cycles() {
    batch.image_indices = donor_index.data();
    batch.device_images = donor_pixels.data_ptr<float>();
    (void)augmenter.run(batch, 127, 0, 0, 6);
-   auto replacement =
-    rfdetr::build_targets(batch, 8, 8, false, false, 0, scratch, "train", 16, rfdetr::TrainingSupervisionConfig{}, 8, &augmenter.batch_plan());
+   auto replacement = rfdetr::build_targets(batch, 8, 8, false, false, 0, scratch, "train", 16, rfdetr::TrainingSupervisionConfig{}, 8, &augmenter.batch_plan());
    (void)augmenter.prepare_batch_consumer();
    (void)augmenter.finish_batch(batch);
    {
@@ -1064,14 +1052,8 @@ void test_native_augmentation_preview_target_support_parity() {
  const PackedInstance donor{4, mmltk::backend::data::kAnnotationMask, 0, 0, 5, 5, 3 * sizeof(RLEPair), 3};
  const std::array<mmltk::backend::data::LabelIndexEntry, 1> entries{{{0, 1, 0}}};
  const std::array<std::uint32_t, 1> indices{0};
- const mmltk::backend::data::Batch batch{.num_images = 1,
-                                         .device_images = nullptr,
-                                         .label_index = entries.data(),
-                                         .labels = &source,
-                                         .rle_pairs = runs.data(),
-                                         .image_indices = indices.data(),
-                                         .slot_index = 0,
-                                         .lease_id = 0};
+ const mmltk::backend::data::Batch batch{
+  .num_images = 1, .device_images = nullptr, .label_index = entries.data(), .labels = &source, .rle_pairs = runs.data(), .image_indices = indices.data(), .slot_index = 0, .lease_id = 0};
  for (const bool include_masks : {false, true})
   for (const bool erase_all : {false, true}) {
    rfdetr::AugmentationBatchPlan plan;
@@ -1125,14 +1107,8 @@ void test_tiny_mask_training_outer_edges() {
  const std::array<std::uint32_t, 1> indices{0};
  for (const auto run : {RLEPair{0, 1}, RLEPair{7, 1}, RLEPair{24, 1}, RLEPair{31, 1}, RLEPair{11, 1}, RLEPair{11, 2}, RLEPair{10, 4}}) {
   const PackedInstance source{0, mmltk::backend::data::kAnnotationMask, 0, 0, 8, 4, 0, 1};
-  const mmltk::backend::data::Batch batch{.num_images = 1,
-                                          .device_images = nullptr,
-                                          .label_index = entries.data(),
-                                          .labels = &source,
-                                          .rle_pairs = &run,
-                                          .image_indices = indices.data(),
-                                          .slot_index = 0,
-                                          .lease_id = 0};
+  const mmltk::backend::data::Batch batch{
+   .num_images = 1, .device_images = nullptr, .label_index = entries.data(), .labels = &source, .rle_pairs = &run, .image_indices = indices.data(), .slot_index = 0, .lease_id = 0};
   for (int geometry = 0; geometry < 4; ++geometry)
    for (const bool masks : {false, true}) {
     CAPTURE(run.start, run.length, geometry, masks);
@@ -1182,13 +1158,13 @@ void test_training_mask_targets_follow_spatial_image_erasure() {
  constexpr std::array labels{mmltk::backend::data::PackedInstance{0U, mmltk::backend::data::kAnnotationMask, 0, 0, extent, extent, 0U, 1U}};
  constexpr std::array rle{mmltk::backend::data::RLEPair{0U, extent * extent}};
  const mmltk::backend::data::Batch batch{.num_images = count,
-                                         .device_images = pixels.data_ptr<float>(),
-                                         .label_index = label_index.data(),
-                                         .labels = labels.data(),
-                                         .rle_pairs = rle.data(),
-                                         .image_indices = indices.data(),
-                                         .slot_index = 0U,
-                                         .lease_id = 0U};
+  .device_images = pixels.data_ptr<float>(),
+  .label_index = label_index.data(),
+  .labels = labels.data(),
+  .rle_pairs = rle.data(),
+  .image_indices = indices.data(),
+  .slot_index = 0U,
+  .lease_id = 0U};
  rfdetr::test_support::AugmentationExecution execution_augmenter(0);
  rfdetr::GpuBatchAugmenter augmenter(rfdetr::test_support::spatial_occlusion_config(), count, extent, extent, execution_augmenter.context);
  const auto image = augmenter.run(batch, 53U, 0, 0, 0U);
@@ -1210,8 +1186,7 @@ void test_training_mask_targets_follow_spatial_image_erasure() {
   }
  }
  const auto points = torch::tensor(centers, floats).view({1, extent * extent, 2});
- const auto sampled =
-  rfdetr::sample_target_masks(*targets.packed_masks, torch::arange(static_cast<int64_t>(count), floats.dtype(torch::kInt64)), points, "training erasure");
+ const auto sampled = rfdetr::sample_target_masks(*targets.packed_masks, torch::arange(static_cast<int64_t>(count), floats.dtype(torch::kInt64)), points, "training erasure");
  const auto visible = image.ne(0.0F).any(1).reshape({static_cast<int64_t>(count), extent * extent});
  REQUIRE(torch::equal(sampled.to(torch::kBool), visible));
  CHECK(visible.any().item<bool>());
@@ -1404,8 +1379,7 @@ void test_all_supervision_routes_execute_fixture_backed_training() {
   // The fixture has one rank; usable full microbatches exclude its tail.
   const auto expected_images = (fixture.num_images / request.batch_size) * request.batch_size;
   while (std::getline(metrics, line)) {
-   const auto record = mmltk::frameworks::serialization::decode_reflected_json<rfdetr::TrainingRecord>(
-    line, {.max_bytes = rfdetr::kTrainingRecordBytes, .max_items = 8192, .max_depth = 32});
+   const auto record = mmltk::frameworks::serialization::decode_reflected_json<rfdetr::TrainingRecord>(line, {.max_bytes = rfdetr::kTrainingRecordBytes, .max_items = 8192, .max_depth = 32});
    const auto& progress = record.progress;
    REQUIRE(record.format_version == 2);
    REQUIRE(progress.total_images == expected_images);
@@ -1558,11 +1532,8 @@ void test_all_supervision_routes_execute_fixture_backed_training() {
      rfdetr::testsupport::copy_checkpoint_archive(source, incomplete, missing);
      reject_checkpoint(incomplete, missing);
     }
-    const std::array<std::pair<const char*, c10::IValue>, 4> invalid{
-     {{"epoch", std::string("wrong-type")},
-      {"grad_scaler_scale", 0.0},
-      {"lr_drop", int64_t{inspection.configuration->lr_drop + 1}},
-      {"training_original_descriptor", std::string(mmltk::frameworks::reflection::kMaximumPathBytes + 1, 'x')}}};
+    const std::array<std::pair<const char*, c10::IValue>, 4> invalid{{{"epoch", std::string("wrong-type")}, {"grad_scaler_scale", 0.0}, {"lr_drop", int64_t{inspection.configuration->lr_drop + 1}},
+     {"training_original_descriptor", std::string(mmltk::frameworks::reflection::kMaximumPathBytes + 1, 'x')}}};
     for (const auto& [key, value] : invalid) {
      torch::serialize::InputArchive source;
      source.load_from(result.checkpoint_path.string(), torch::Device(torch::kCPU));
@@ -1664,27 +1635,13 @@ void test_all_supervision_routes_execute_fixture_backed_training() {
  std::filesystem::remove_all(root, ignored);
 }
 }  // namespace
-TEST_CASE("test_training_supervision_runtime_replication_is_one_shot", "[model][rfdetr][training][supervision][training_supervision]") {
- test_training_supervision_runtime_replication_is_one_shot();
-}
-TEST_CASE("test_checkpoint_supervision_config_and_deployment_pruning", "[model][rfdetr][training][supervision][training_supervision]") {
- test_checkpoint_supervision_config_and_deployment_pruning();
-}
-TEST_CASE("test_feature_active_host_target_invariants", "[model][rfdetr][training][supervision][training_supervision]") {
- test_feature_active_host_target_invariants();
-}
-TEST_CASE("test_ema_shadow_admission_is_transactional", "[model][rfdetr][training][supervision][training_supervision]") {
- test_ema_shadow_admission_is_transactional();
-}
-TEST_CASE("test_native_optimizer_late_failure_preserves_live_state", "[model][rfdetr][training][supervision][training_supervision]") {
- test_native_optimizer_late_failure_preserves_live_state();
-}
-TEST_CASE("test_resume_continuation_manifest_is_exact", "[model][rfdetr][training][supervision][training_supervision]") {
- test_resume_continuation_manifest_is_exact();
-}
-TEST_CASE("test_target_scratch_reuse_waits_for_consumer_retirement", "[model][rfdetr][training][supervision][training_supervision]") {
- test_target_scratch_reuse_waits_for_consumer_retirement();
-}
+TEST_CASE("test_training_supervision_runtime_replication_is_one_shot", "[model][rfdetr][training][supervision][training_supervision]") { test_training_supervision_runtime_replication_is_one_shot(); }
+TEST_CASE("test_checkpoint_supervision_config_and_deployment_pruning", "[model][rfdetr][training][supervision][training_supervision]") { test_checkpoint_supervision_config_and_deployment_pruning(); }
+TEST_CASE("test_feature_active_host_target_invariants", "[model][rfdetr][training][supervision][training_supervision]") { test_feature_active_host_target_invariants(); }
+TEST_CASE("test_ema_shadow_admission_is_transactional", "[model][rfdetr][training][supervision][training_supervision]") { test_ema_shadow_admission_is_transactional(); }
+TEST_CASE("test_native_optimizer_late_failure_preserves_live_state", "[model][rfdetr][training][supervision][training_supervision]") { test_native_optimizer_late_failure_preserves_live_state(); }
+TEST_CASE("test_resume_continuation_manifest_is_exact", "[model][rfdetr][training][supervision][training_supervision]") { test_resume_continuation_manifest_is_exact(); }
+TEST_CASE("test_target_scratch_reuse_waits_for_consumer_retirement", "[model][rfdetr][training][supervision][training_supervision]") { test_target_scratch_reuse_waits_for_consumer_retirement(); }
 TEST_CASE("test_target_staging_ring_recycles_completed_slots_without_host_wait", "[model][rfdetr][training][supervision][training_supervision]") {
  test_target_staging_ring_recycles_completed_slots_without_host_wait();
 }
@@ -1694,32 +1651,21 @@ TEST_CASE("test_target_scratch_retires_cross_device_events_on_their_owner", "[mo
 TEST_CASE("test_build_targets_recovers_after_staging_growth_and_failure", "[model][rfdetr][training][supervision][training_supervision]") {
  test_build_targets_recovers_after_staging_growth_and_failure();
 }
-TEST_CASE("test_training_adapter_matches_raw_augmentation_executor", "[model][rfdetr][training][supervision][training_supervision]") {
- test_training_adapter_matches_raw_augmentation_executor();
-}
-TEST_CASE("test_training_mask_targets_follow_spatial_image_erasure", "[model][rfdetr][training][supervision][training_supervision]") {
- test_training_mask_targets_follow_spatial_image_erasure();
-}
-TEST_CASE("test_parallel_wave_drains_failures_and_cancellation", "[model][rfdetr][training][supervision][training_supervision]") {
- test_parallel_wave_drains_failures_and_cancellation();
-}
+TEST_CASE("test_training_adapter_matches_raw_augmentation_executor", "[model][rfdetr][training][supervision][training_supervision]") { test_training_adapter_matches_raw_augmentation_executor(); }
+TEST_CASE("test_training_mask_targets_follow_spatial_image_erasure", "[model][rfdetr][training][supervision][training_supervision]") { test_training_mask_targets_follow_spatial_image_erasure(); }
+TEST_CASE("test_parallel_wave_drains_failures_and_cancellation", "[model][rfdetr][training][supervision][training_supervision]") { test_parallel_wave_drains_failures_and_cancellation(); }
 TEST_CASE("test_all_supervision_routes_execute_fixture_backed_training", "[model][rfdetr][training][supervision][training_supervision]") {
  test_all_supervision_routes_execute_fixture_backed_training();
 }
-TEST_CASE("test_native_augmentation_preview_target_support_parity", "[model][rfdetr][training][augmentation][support]") {
- test_native_augmentation_preview_target_support_parity();
-}
+TEST_CASE("test_native_augmentation_preview_target_support_parity", "[model][rfdetr][training][augmentation][support]") { test_native_augmentation_preview_target_support_parity(); }
 TEST_CASE("test_tiny_mask_training_outer_edges", "[model][rfdetr][training][augmentation][support]") { test_tiny_mask_training_outer_edges(); }
-TEST_CASE("test_copy_paste_ring_support_and_cache_cycles", "[model][rfdetr][training_supervision][augmentation][copy_paste]") {
- test_copy_paste_ring_support_and_cache_cycles();
-}
+TEST_CASE("test_copy_paste_ring_support_and_cache_cycles", "[model][rfdetr][training_supervision][augmentation][copy_paste]") { test_copy_paste_ring_support_and_cache_cycles(); }
 TEST_CASE("test_copy_paste_cache_publication_recovers_without_targets", "[model][rfdetr][training_supervision][augmentation][copy_paste]") {
  test_copy_paste_cache_publication_recovers_without_targets();
 }
 TEST_CASE("test_ema_selection_restores_identity_and_mode", "[model][rfdetr][training][ema]") { test_ema_selection_restores_identity_and_mode(); }
 TEST_CASE("test_ema_tau_updates_continue_after_restore", "[model][rfdetr][training][ema]") { test_ema_tau_updates_continue_after_restore(); }
-TEST_CASE("perceptual augmentation admits actual Torch suballocations and rejects logical overreads",
-          "[model][rfdetr][training][augmentation][perceptual][cuda]") {
+TEST_CASE("perceptual augmentation admits actual Torch suballocations and rejects logical overreads", "[model][rfdetr][training][augmentation][perceptual][cuda]") {
  if (mmltk::testsupport::checked_cuda_device_count() == 0) SKIP("CUDA unavailable; Torch resampling custody unexecuted");
  const auto stream = training_test_stream();
  c10::cuda::CUDAStreamGuard stream_guard(stream);
@@ -1729,9 +1675,8 @@ TEST_CASE("perceptual augmentation admits actual Torch suballocations and reject
   c10::cuda::CUDAStream stream;
   torch::Tensor input, output;
  };
- auto images =
-  std::make_shared<TensorImages>(TensorImages{execution.context, stream, torch::full({20, 3, 9, 9}, .25F, torch::TensorOptions().device(torch::kCUDA)),
-                                              torch::full({20, 3, 9, 9}, -.75F, torch::TensorOptions().device(torch::kCUDA))});
+ auto images = std::make_shared<TensorImages>(TensorImages{
+  execution.context, stream, torch::full({20, 3, 9, 9}, .25F, torch::TensorOptions().device(torch::kCUDA)), torch::full({20, 3, 9, 9}, -.75F, torch::TensorOptions().device(torch::kCUDA))});
  auto config = rfdetr::test_support::isolated_augmentation_config();
  config.resize = {.probability = 1.F, .min_strength = 1.F, .max_strength = 1.F};
  config.perceptual_downscale = true;
@@ -1740,15 +1685,15 @@ TEST_CASE("perceptual augmentation admits actual Torch suballocations and reject
  std::array<std::uint64_t, 20> keys{};
  for (std::size_t i = 0; i != keys.size(); ++i) keys[i] = i + 1;
  rfdetr::GpuAugmentationBatchView batch{.input = images->input.data_ptr<float>(),
-                                        .output = images->output.data_ptr<float>(),
-                                        .image_indices = indices,
-                                        .height = 9,
-                                        .width = 9,
-                                        .output_domain = rfdetr::GpuAugmentationOutputDomain::UnitRgb,
-                                        .input_custody = images,
-                                        .output_custody = images,
-                                        .input_capacity_bytes = static_cast<std::size_t>(images->input.numel()) * sizeof(float) - 1,
-                                        .output_capacity_bytes = static_cast<std::size_t>(images->output.numel()) * sizeof(float)};
+  .output = images->output.data_ptr<float>(),
+  .image_indices = indices,
+  .height = 9,
+  .width = 9,
+  .output_domain = rfdetr::GpuAugmentationOutputDomain::UnitRgb,
+  .input_custody = images,
+  .output_custody = images,
+  .input_capacity_bytes = static_cast<std::size_t>(images->input.numel()) * sizeof(float) - 1,
+  .output_capacity_bytes = static_cast<std::size_t>(images->output.numel()) * sizeof(float)};
  REQUIRE_THROWS(executor.Run(batch, keys, {}, {}, stream.stream()));
  CHECK(images->output.eq(-.75F).all().item<bool>());
  ++batch.input_capacity_bytes;
@@ -1775,11 +1720,8 @@ TEST_CASE("training cache failed settlement retains tensors stream and source an
    auto pixels = std::make_shared<torch::Tensor>(torch::full({1, 3, 4, 4}, .25F, torch::TensorOptions().device(torch::kCUDA)));
    retained_source = pixels;
    std::array<std::uint32_t, 1> indices{0};
-   mmltk::backend::data::Batch batch{.num_images = 1,
-                                     .device_images = pixels->data_ptr<float>(),
-                                     .image_indices = indices.data(),
-                                     .image_custody = pixels,
-                                     .image_capacity_bytes = 48U * sizeof(float)};
+   mmltk::backend::data::Batch batch{
+    .num_images = 1, .device_images = pixels->data_ptr<float>(), .image_indices = indices.data(), .image_custody = pixels, .image_capacity_bytes = 48U * sizeof(float)};
    if (failure_path == 0) {
     Access::FailCacheWait(owner);
     REQUIRE_THROWS(owner.reconfigure(config));
@@ -1830,8 +1772,7 @@ TEST_CASE("training excludes crowds and retains continuous targets with known em
  const std::array indices{std::uint32_t{0}};
  std::array labels{
   PackedInstance{.class_id = 0, .flags = kAnnotationCrowd, .bbox_x1 = 0, .bbox_y1 = 0, .bbox_x2 = 8, .bbox_y2 = 8, .mask_rle_offset = 0, .mask_rle_pairs = 0},
-  PackedInstance{
-   .class_id = 1, .flags = kAnnotationMask, .bbox_x1 = 1.25F, .bbox_y1 = 2.5F, .bbox_x2 = 6.25F, .bbox_y2 = 7.5F, .mask_rle_offset = 0, .mask_rle_pairs = 0},
+  PackedInstance{.class_id = 1, .flags = kAnnotationMask, .bbox_x1 = 1.25F, .bbox_y1 = 2.5F, .bbox_x2 = 6.25F, .bbox_y2 = 7.5F, .mask_rle_offset = 0, .mask_rle_pairs = 0},
  };
  const Batch batch{.num_images = 1, .label_index = entries.data(), .labels = labels.data(), .image_indices = indices.data()};
  rfdetr::TargetScratch scratch(1);

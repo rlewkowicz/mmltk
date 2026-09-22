@@ -4,22 +4,19 @@
 #include <utility>
 #include "src/common/types/generation.h"
 namespace mmltk::controller::explore_detail {
-ExploreAtlasLayout GalleryAtlas::Begin(const mmltk::frameworks::gpu::ImagePlaneView clean, const mmltk::frameworks::gpu::ImagePlaneView semantic,
-                                       const ExploreViewport& viewport, const GalleryThumbnailCache::Identity& pixels) {
+ExploreAtlasLayout GalleryAtlas::Begin(
+ const mmltk::frameworks::gpu::ImagePlaneView clean, const mmltk::frameworks::gpu::ImagePlaneView semantic, const ExploreViewport& viewport, const GalleryThumbnailCache::Identity& pixels) {
  Rollback();
- if (!clean.valid() || !semantic.valid() || clean.allocation.owner == 0U || semantic.allocation.owner == 0U || clean.allocation.identity == 0U ||
-     semantic.allocation.identity == 0U || pixels.extent == 0U || viewport.columns == 0U || viewport.row_count == 0U ||
-     clean.descriptor.width != static_cast<std::uint64_t>(viewport.columns) * pixels.extent || clean.descriptor.height % pixels.extent != 0U ||
-     clean.descriptor.width != semantic.descriptor.width || clean.descriptor.height != semantic.descriptor.height)
+ if (!clean.valid() || !semantic.valid() || clean.allocation.owner == 0U || semantic.allocation.owner == 0U || clean.allocation.identity == 0U || semantic.allocation.identity == 0U ||
+     pixels.extent == 0U || viewport.columns == 0U || viewport.row_count == 0U || clean.descriptor.width != static_cast<std::uint64_t>(viewport.columns) * pixels.extent ||
+     clean.descriptor.height % pixels.extent != 0U || clean.descriptor.width != semantic.descriptor.width || clean.descriptor.height != semantic.descriptor.height)
   throw std::invalid_argument("Explore atlas allocation/layout is invalid");
  auto found = std::ranges::find_if(allocations_, [&](const auto& value) { return value.clean.owner == clean.allocation.owner; });
  if (found == allocations_.end()) found = std::ranges::find_if(allocations_, [](const auto& value) { return value.clean.owner == 0U; });
  if (found == allocations_.end()) throw std::logic_error("Explore atlas exceeds its output pool");
  const auto rows = clean.descriptor.height / pixels.extent;
- if (rows < viewport.row_count || static_cast<std::uint64_t>(rows) * viewport.columns > kExploreVisibleItemCapacity)
-  throw std::invalid_argument("Explore atlas lacks bounded visible row capacity");
- if (found->clean != clean.allocation || found->semantic != semantic.allocation || !found->pixels.SameSource(pixels) || found->columns != viewport.columns ||
-     found->rows != rows) {
+ if (rows < viewport.row_count || static_cast<std::uint64_t>(rows) * viewport.columns > kExploreVisibleItemCapacity) throw std::invalid_argument("Explore atlas lacks bounded visible row capacity");
+ if (found->clean != clean.allocation || found->semantic != semantic.allocation || !found->pixels.SameSource(pixels) || found->columns != viewport.columns || found->rows != rows) {
   found->cells.assign(static_cast<std::size_t>(rows) * viewport.columns, {});
   found->clean = clean.allocation;
   found->semantic = semantic.allocation;

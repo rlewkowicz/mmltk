@@ -34,9 +34,7 @@ DecodedNativeModelState::~DecodedNativeModelState() = default;
 DecodedNativeModelState::DecodedNativeModelState(DecodedNativeModelState&&) noexcept = default;
 DecodedNativeModelState& DecodedNativeModelState::operator=(DecodedNativeModelState&&) noexcept = default;
 std::size_t DecodedNativeModelState::tensor_count() const noexcept { return impl_->entries.size(); }
-DecodedNativeModelState::DecodedNativeModelState(std::vector<NormalizedModelStateEntry> entries) : DecodedNativeModelState() {
- impl_->entries = std::move(entries);
-}
+DecodedNativeModelState::DecodedNativeModelState(std::vector<NormalizedModelStateEntry> entries) : DecodedNativeModelState() { impl_->entries = std::move(entries); }
 const std::vector<NormalizedModelStateEntry>& DecodedNativeModelState::entries() const noexcept { return impl_->entries; }
 torch::serialize::InputArchive* DecodedNativeModelState::admitted_archive() const noexcept { return impl_->native_archive.get(); }
 void DecodedNativeModelState::retain_admitted_archive(std::unique_ptr<torch::serialize::InputArchive> archive) { impl_->native_archive = std::move(archive); }
@@ -56,9 +54,7 @@ namespace {
 [[nodiscard]] bool supported_format(const std::string_view format) noexcept { return format == kNativeCheckpointFormat; }
 void validate_queries(const NativeCheckpointMetadata& metadata, const std::string& path, bool required) {
  if (!required && metadata.num_queries == 0 && metadata.num_select == 0) { return; }
- if (metadata.num_queries <= 0 || metadata.num_select <= 0 || metadata.num_select > metadata.num_queries) {
-  throw std::runtime_error("RF-DETR native checkpoint has invalid query metadata: " + path);
- }
+ if (metadata.num_queries <= 0 || metadata.num_select <= 0 || metadata.num_select > metadata.num_queries) { throw std::runtime_error("RF-DETR native checkpoint has invalid query metadata: " + path); }
 }
 template <class T>
 inline constexpr bool is_optional = false;
@@ -92,18 +88,15 @@ void validate_decoded_model_state(const DecodedNativeModelState& state) {
  std::unordered_set<std::string_view> names;
  names.reserve(state.tensor_count());
  for (const auto& entry : state.entries()) {
-  if (entry.name.empty() || entry.name.size() > 4096 || !names.insert(entry.name).second)
-   throw std::invalid_argument("checkpoint tensor names must be unique and nonempty");
+  if (entry.name.empty() || entry.name.size() > 4096 || !names.insert(entry.name).second) throw std::invalid_argument("checkpoint tensor names must be unique and nonempty");
   const auto axis = detail::class_tensor_shape(entry.name);
   if (!axis) continue;
-  if (!entry.tensor.defined() || entry.tensor.dim() != axis->rank || entry.tensor.size(axis->dimension) <= 0)
-   throw std::invalid_argument("invalid class-dependent checkpoint tensor: " + entry.name);
+  if (!entry.tensor.defined() || entry.tensor.dim() != axis->rank || entry.tensor.size(axis->dimension) <= 0) throw std::invalid_argument("invalid class-dependent checkpoint tensor: " + entry.name);
   const bool classifier = axis->coordinates == detail::ClassTensorCoordinates::OutputSlots;
   const auto box_columns = axis->coordinates == detail::ClassTensorCoordinates::ForegroundWithBoxes ? 4 : 0;
   if (classifier || layout.record().supervision_in_foreground_order) {
    const auto expected = classifier ? layout.output_width() : layout.catalog()->size() + box_columns;
-   if (entry.tensor.size(axis->dimension) != static_cast<std::int64_t>(expected))
-    throw std::invalid_argument("class-dependent checkpoint tensor disagrees with layout: " + entry.name);
+   if (entry.tensor.size(axis->dimension) != static_cast<std::int64_t>(expected)) throw std::invalid_argument("class-dependent checkpoint tensor disagrees with layout: " + entry.name);
   } else if (entry.tensor.size(axis->dimension) <= box_columns) {
    throw std::invalid_argument("external supervision tensor has no class-input block: " + entry.name);
   }
@@ -116,22 +109,18 @@ ModelStateContainer identify_model_state_container(const std::filesystem::path& 
  stream.read(signature.data(), signature.size());
  if (!stream) throw std::invalid_argument("truncated checkpoint container");
  if (signature != std::array<char, 4>{'P', 'K', 3, 4})
-  return static_cast<unsigned char>(signature[0]) == 0x80 && signature[1] >= 2 && signature[1] <= 5 ? ModelStateContainer::Python
-                                                                                                    : ModelStateContainer::Unknown;
+  return static_cast<unsigned char>(signature[0]) == 0x80 && signature[1] >= 2 && signature[1] <= 5 ? ModelStateContainer::Python : ModelStateContainer::Unknown;
  try {
   caffe2::serialize::PyTorchStreamReader reader(path.string());
   // InputArchive is a TorchScript archive. Python pickle archives do not
   // contain its constants/code members. Identification never loads tensors.
   const auto records = reader.getAllRecords();
   const bool native = std::ranges::any_of(records, [](const auto& name) { return name == "constants.pkl" || name.starts_with("code/"); });
-  if (native && reader.getRecordSize("data.pkl") > 16U * kClassLayoutByteBudget)
-   throw std::invalid_argument("native checkpoint metadata exceeds admission budget");
+  if (native && reader.getRecordSize("data.pkl") > 16U * kClassLayoutByteBudget) throw std::invalid_argument("native checkpoint metadata exceeds admission budget");
   return native ? ModelStateContainer::Native : reader.hasRecord("data.pkl") ? ModelStateContainer::Python : ModelStateContainer::Unknown;
  } catch (const std::exception& error) { throw std::runtime_error("corrupt RF-DETR checkpoint archive: " + path.string() + ": " + error.what()); }
 }
-bool is_native_checkpoint_file(const std::filesystem::path& checkpoint_path) {
- return identify_model_state_container(checkpoint_path) == ModelStateContainer::Native;
-}
+bool is_native_checkpoint_file(const std::filesystem::path& checkpoint_path) { return identify_model_state_container(checkpoint_path) == ModelStateContainer::Native; }
 static DecodedNativeModelState load_native_model_state(const std::filesystem::path& checkpoint_path, std::stop_token stop) {
  const auto canonical = canonical_path(checkpoint_path);
  const auto path = canonical.string();
@@ -154,13 +143,9 @@ static DecodedNativeModelState load_native_model_state(const std::filesystem::pa
    return copied;
   },
   [&] { return bytes; }, torch::Device(torch::kCPU));
- if (!supported_format(mmltk::backend::ml::serialization::require_string(archive, "format"))) {
-  throw std::runtime_error("RF-DETR checkpoint is not a native checkpoint: " + path);
- }
+ if (!supported_format(mmltk::backend::ml::serialization::require_string(archive, "format"))) { throw std::runtime_error("RF-DETR checkpoint is not a native checkpoint: " + path); }
  const auto version = mmltk::backend::ml::serialization::require_int(archive, "format_version");
- if (version != kNativeCheckpointFormatVersion) {
-  throw std::runtime_error("unsupported RF-DETR native checkpoint format version " + std::to_string(version) + ": " + path);
- }
+ if (version != kNativeCheckpointFormatVersion) { throw std::runtime_error("unsupported RF-DETR native checkpoint format version " + std::to_string(version) + ": " + path); }
  DecodedNativeModelState result;
  auto& metadata = result.metadata;
  metadata.preset_name = mmltk::backend::ml::serialization::read_optional_value<std::string>(archive, "preset_name").value_or("");
@@ -173,9 +158,8 @@ static DecodedNativeModelState load_native_model_state(const std::filesystem::pa
  metadata.class_layout = decode_class_layout(mmltk::backend::ml::serialization::require_string(archive, "class_layout"));
  if (metadata.num_classes < 0 || static_cast<std::size_t>(metadata.num_classes) != metadata.class_layout.slots.size())
   throw std::runtime_error("native checkpoint output width disagrees with class layout");
- metadata.for_each_detection_field([&archive]<class Name, class Optional>(const Name& name, Optional& field) {
-  field = mmltk::backend::ml::serialization::read_optional_value<typename Optional::value_type>(archive, name);
- });
+ metadata.for_each_detection_field(
+  [&archive]<class Name, class Optional>(const Name& name, Optional& field) { field = mmltk::backend::ml::serialization::read_optional_value<typename Optional::value_type>(archive, name); });
  model_state_detail::InputArchive state_archive;
  archive.read("state", state_archive);
  const auto entry_count = mmltk::backend::ml::serialization::require_int(state_archive, "entry_count");
@@ -197,8 +181,8 @@ static DecodedNativeModelState load_native_model_state(const std::filesystem::pa
  snapshot.RequireUnchanged(canonical);
  return result;
 }
-DecodedNativeModelState decode_model_state(const std::filesystem::path& checkpoint_path, std::shared_ptr<const ClassArtifactAdmission> admission,
-                                           const std::filesystem::path& class_layout_path, std::stop_token stop) {
+DecodedNativeModelState decode_model_state(
+ const std::filesystem::path& checkpoint_path, std::shared_ptr<const ClassArtifactAdmission> admission, const std::filesystem::path& class_layout_path, std::stop_token stop) {
  if (stop.stop_requested()) throw ArtifactPublicationCancelled{};
  const auto canonical = canonical_path(checkpoint_path);
  const auto snapshot = mmltk::common::io::FileSnapshot::Read(canonical);
@@ -240,16 +224,14 @@ DecodedNativeModelState decode_model_state(const std::filesystem::path& checkpoi
    for (const auto& asset : weight_catalog()) {
     if (asset.coco_sparse_slots && asset.md5_hash == digests->md5) {
      auto source_evidence = std::move(result.metadata.class_layout.class_name_evidence);
-     result.metadata.class_layout =
-      coco_class_layout({ClassLayoutOrigin::VerifiedAsset, std::string(asset.filename), mmltk::common::io::sha256_hex(digests->sha256)});
+     result.metadata.class_layout = coco_class_layout({ClassLayoutOrigin::VerifiedAsset, std::string(asset.filename), mmltk::common::io::sha256_hex(digests->sha256)});
      result.metadata.class_layout.class_name_evidence = std::move(source_evidence);
      break;
     }
    }
   }
   const ResolvedClassLayout layout(result.metadata.class_layout);
-  if (layout.output_width() != static_cast<std::size_t>(result.metadata.num_classes))
-   throw std::runtime_error("external checkpoint output width disagrees with class layout");
+  if (layout.output_width() != static_cast<std::size_t>(result.metadata.num_classes)) throw std::runtime_error("external checkpoint output width disagrees with class layout");
 #else
   throw std::runtime_error("RF-DETR upstream Python checkpoint loading is disabled at build time: " + canonical.string());
 #endif
@@ -267,9 +249,8 @@ DecodedNativeModelState decode_native_model_state(const std::filesystem::path& c
  result.class_artifact = std::move(admission);
  return result;
 }
-ResolvedModelState resolve_model_state(const std::filesystem::path& weights_path, const std::string_view preset_name, const int resolution,
-                                       const std::filesystem::path& class_layout_path, std::shared_ptr<const ClassArtifactAdmission> admission,
-                                       std::stop_token stop) {
+ResolvedModelState resolve_model_state(const std::filesystem::path& weights_path, const std::string_view preset_name, const int resolution, const std::filesystem::path& class_layout_path,
+ std::shared_ptr<const ClassArtifactAdmission> admission, std::stop_token stop) {
  if (stop.stop_requested()) throw ArtifactPublicationCancelled{};
  const auto canonical = canonical_path(weights_path);
  auto state = decode_model_state(canonical, std::move(admission), class_layout_path, stop);

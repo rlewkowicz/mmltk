@@ -14,10 +14,18 @@
 #include "src/backend/models/rfdetr/contract/workflow_requests.h"
 namespace {
 constexpr std::array kRetiredWeightFilenames{
- "rf-detr-base.pth", "rf-detr-base-o365.pth", "rf-detr-base-2.pth", "rf-detr-large.pth", "rf-detr-seg-preview.pt",
+ "rf-detr-base.pth",
+ "rf-detr-base-o365.pth",
+ "rf-detr-base-2.pth",
+ "rf-detr-large.pth",
+ "rf-detr-seg-preview.pt",
 };
 constexpr std::array kRetiredPresetNames{
- "rf-detr-base", "rf-detr-base-o365", "rf-detr-base-2", "rf-detr-large-deprecated", "rf-detr-seg-preview",
+ "rf-detr-base",
+ "rf-detr-base-o365",
+ "rf-detr-base-2",
+ "rf-detr-large-deprecated",
+ "rf-detr-seg-preview",
 };
 TEST_CASE("RF-DETR weight assets derive from the preset authority", "[backend][models][rfdetr][contract]") {
  using namespace mmltk::backend::models::rfdetr;

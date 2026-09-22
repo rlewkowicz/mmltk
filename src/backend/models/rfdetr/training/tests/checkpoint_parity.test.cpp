@@ -71,9 +71,7 @@ void write_module_upstream_checkpoint(const fs::path& path, const NativeRfDetrMo
  return true;
 }
 void assert_tensor_bitwise_equal(const torch::Tensor& actual, const torch::Tensor& expected, const std::string& label) {
- if (!same_shape(actual, expected)) {
-  throw std::runtime_error(label + " shape mismatch: actual=" + shape_string(actual) + " expected=" + shape_string(expected));
- }
+ if (!same_shape(actual, expected)) { throw std::runtime_error(label + " shape mismatch: actual=" + shape_string(actual) + " expected=" + shape_string(expected)); }
  const auto actual_cpu = actual.detach().cpu().contiguous();
  const auto expected_cpu = expected.detach().cpu().to(actual_cpu.scalar_type()).contiguous();
  if (torch::equal(actual_cpu, expected_cpu)) { return; }
@@ -93,9 +91,7 @@ void assert_outputs_bitwise_equal(const ModelOutputs& actual, const ModelOutputs
  for (size_t index = 0; index < actual.aux_outputs.size(); ++index) {
   assert_output_layer_bitwise_equal(actual.aux_outputs[index], expected.aux_outputs[index], std::string(preset_name) + ".aux[" + std::to_string(index) + "]");
  }
- if (actual.enc_outputs.has_value() != expected.enc_outputs.has_value()) {
-  throw std::runtime_error(std::string(preset_name) + ".enc_outputs presence mismatch");
- }
+ if (actual.enc_outputs.has_value() != expected.enc_outputs.has_value()) { throw std::runtime_error(std::string(preset_name) + ".enc_outputs presence mismatch"); }
  if (actual.enc_outputs.has_value()) { assert_output_layer_bitwise_equal(*actual.enc_outputs, *expected.enc_outputs, std::string(preset_name) + ".enc"); }
 }
 void run_checkpoint_parity_case(const ParityFixtureCase& fixture, size_t index, size_t total) {
@@ -130,6 +126,4 @@ void test_checkpoint_parity_matches_for_all_registered_fixtures() {
  const auto& fixtures = parity_fixture_cases();
  for (size_t index = 0; index < fixtures.size(); ++index) { run_checkpoint_parity_case(fixtures[index], index + 1, fixtures.size()); }
 }
-TEST_CASE("test_checkpoint_parity_matches_for_all_registered_fixtures", "[model][rfdetr][checkpoint_parity][integration]") {
- test_checkpoint_parity_matches_for_all_registered_fixtures();
-}
+TEST_CASE("test_checkpoint_parity_matches_for_all_registered_fixtures", "[model][rfdetr][checkpoint_parity][integration]") { test_checkpoint_parity_matches_for_all_registered_fixtures(); }

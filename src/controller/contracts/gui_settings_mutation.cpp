@@ -84,8 +84,7 @@ template <class T, class Source>
  } else if constexpr (std::floating_point<U>) {
   if constexpr (std::same_as<V, double> || std::same_as<V, std::int64_t> || std::same_as<V, std::uint64_t>) {
    const double converted = static_cast<double>(source);
-   if (!std::isfinite(converted) || converted < static_cast<double>(std::numeric_limits<U>::lowest()) ||
-       converted > static_cast<double>(std::numeric_limits<U>::max())) {
+   if (!std::isfinite(converted) || converted < static_cast<double>(std::numeric_limits<U>::lowest()) || converted > static_cast<double>(std::numeric_limits<U>::max())) {
     return std::unexpected(SettingsMutationError::OutOfRange);
    }
    const U narrowed = static_cast<U>(source);
@@ -136,17 +135,15 @@ template <class T>
  });
 }
 template <class T>
-[[nodiscard]] std::expected<void, SettingsMutationError> assign_flat_path(T& destination, const std::string_view path,
-                                                                          const mmltk::frameworks::serialization::wire::FlatValue& value) {
+[[nodiscard]] std::expected<void, SettingsMutationError> assign_flat_path(T& destination, const std::string_view path, const mmltk::frameworks::serialization::wire::FlatValue& value) {
  if (path.empty()) return assign_flat_leaf(destination, value);
  using U = std::remove_cvref_t<T>;
- if constexpr (std::is_arithmetic_v<U> || std::is_enum_v<U> || std::same_as<U, std::string> || std::same_as<U, std::filesystem::path> || IsOptional<U>::value ||
-               IsStdArray<U>::value || IsStdVector<U>::value) {
+ if constexpr (std::is_arithmetic_v<U> || std::is_enum_v<U> || std::same_as<U, std::string> || std::same_as<U, std::filesystem::path> || IsOptional<U>::value || IsStdArray<U>::value ||
+               IsStdVector<U>::value) {
   return std::unexpected(SettingsMutationError::InvalidPath);
  } else {
   std::expected<void, SettingsMutationError> result = std::unexpected(SettingsMutationError::InvalidPath);
-  const bool found =
-   settings_vocabulary::visit_mutable_path(destination, path, [&](const std::string_view, auto& leaf) { result = assign_flat_leaf(leaf, value); });
+  const bool found = settings_vocabulary::visit_mutable_path(destination, path, [&](const std::string_view, auto& leaf) { result = assign_flat_leaf(leaf, value); });
   return found ? result : std::unexpected(SettingsMutationError::InvalidPath);
  }
 }
@@ -156,22 +153,18 @@ template <class T>
 }
 [[nodiscard]] bool valid_train(const TrainViewState& train) noexcept {
  const auto& request = train.request;
- const bool valid_distributed = request.distributed_worker
-                                 ? request.distributed_rank >= 0 && request.distributed_world_size > 1 && !request.distributed_store_path.empty()
-                                 : request.distributed_rank == 0 && request.distributed_world_size == 1 && request.distributed_store_path.empty();
+ const bool valid_distributed = request.distributed_worker ? request.distributed_rank >= 0 && request.distributed_world_size > 1 && !request.distributed_store_path.empty()
+                                                           : request.distributed_rank == 0 && request.distributed_world_size == 1 && request.distributed_store_path.empty();
  return !request.device_ids.empty() && request.resolution > 0 && !mmltk::frameworks::reflection::validate_reflected_fields(request) &&
-        mmltk::frameworks::reflection::unique_nonnegative_identifiers(request.device_ids) &&
-        mmltk::frameworks::reflection::enum_contains(request.lr_scheduler) &&
+        mmltk::frameworks::reflection::unique_nonnegative_identifiers(request.device_ids) && mmltk::frameworks::reflection::enum_contains(request.lr_scheduler) &&
         mmltk::backend::models::rfdetr::gpu_augmentation_relationships_valid(request.gpu_augmentation) &&
         mmltk::backend::models::rfdetr::training_supervision_config_valid(request.training_supervision) && valid_distributed;
 }
-[[nodiscard]] bool valid_validate(const ValidateViewState& validate) noexcept {
- return !mmltk::frameworks::reflection::validate_reflected_fields(validate.request);
-}
+[[nodiscard]] bool valid_validate(const ValidateViewState& validate) noexcept { return !mmltk::frameworks::reflection::validate_reflected_fields(validate.request); }
 [[nodiscard]] bool valid_predict(const PredictViewState& predict) noexcept {
  const auto& request = predict.request;
- return !mmltk::frameworks::reflection::validate_reflected_fields(request) && request.resolution > 0 && request.compiled_path.empty() &&
-        request.image_inputs.empty() && predict.live_split_count > 0 && valid_source(predict.source);
+ return !mmltk::frameworks::reflection::validate_reflected_fields(request) && request.resolution > 0 && request.compiled_path.empty() && request.image_inputs.empty() && predict.live_split_count > 0 &&
+        valid_source(predict.source);
 }
 [[nodiscard]] bool selected_model_artifact_available(const ModelArtifactSelectionState& artifacts) noexcept {
  switch (artifacts.input) {
@@ -222,17 +215,15 @@ template <class T>
  return std::ranges::all_of(valid, std::identity{});
 }
 [[nodiscard]] bool valid_annotation_model_selection(const ModelArtifactSelectionState& artifacts) noexcept {
- const bool compatible = artifacts.source == ModelSelectionSource::Canonical
-                          ? artifacts.input == ModelArtifactInputKind::Weights
-                          : artifacts.source == ModelSelectionSource::Custom && artifacts.input != ModelArtifactInputKind::None;
+ const bool compatible = artifacts.source == ModelSelectionSource::Canonical ? artifacts.input == ModelArtifactInputKind::Weights
+                                                                             : artifacts.source == ModelSelectionSource::Custom && artifacts.input != ModelArtifactInputKind::None;
  return valid_model_selection_draft(artifacts, compatible);
 }
 [[nodiscard]] bool valid_settings(const GuiSettingsState& state) noexcept {
- return !mmltk::frameworks::reflection::validate_reflected_fields(state).has_value() && valid_train(state.workflows.train) &&
-        valid_validate(state.workflows.validate) && valid_predict(state.workflows.predict) && valid_source(state.workflows.annotate.source) &&
-        state.workflows.explore.min_instances <= state.workflows.explore.max_instances &&
-        state.workflows.explore.min_compiled_index <= state.workflows.explore.max_compiled_index &&
-        valid_annotation_model_selection(model_artifacts(state.workflows.annotate)) && valid_model_selection_relations(state);
+ return !mmltk::frameworks::reflection::validate_reflected_fields(state).has_value() && valid_train(state.workflows.train) && valid_validate(state.workflows.validate) &&
+        valid_predict(state.workflows.predict) && valid_source(state.workflows.annotate.source) && state.workflows.explore.min_instances <= state.workflows.explore.max_instances &&
+        state.workflows.explore.min_compiled_index <= state.workflows.explore.max_compiled_index && valid_annotation_model_selection(model_artifacts(state.workflows.annotate)) &&
+        valid_model_selection_relations(state);
 }
 [[nodiscard]] std::filesystem::path effective_train_validation_path(const TrainViewState& train) {
  return train.use_compiled_directory_defaults ? std::filesystem::path{train.compiled_dataset_dir} / "val.bin" : train.request.val_compiled_path;
@@ -245,9 +236,7 @@ void apply_compiled_directory_defaults(TrainViewState& train) {
 }
 template <class Selection>
 void normalize_canonical_source_transition(const Selection& installed, Selection& candidate) noexcept {
- if (installed.model_source != ModelSelectionSource::Canonical && candidate.model_source == ModelSelectionSource::Canonical) {
-  candidate.model_input = ModelArtifactInputKind::Weights;
- }
+ if (installed.model_source != ModelSelectionSource::Canonical && candidate.model_source == ModelSelectionSource::Canonical) { candidate.model_input = ModelArtifactInputKind::Weights; }
 }
 void normalize_canonical_source_transitions(const GuiSettingsState& installed, GuiSettingsState& candidate) noexcept {
  normalize_canonical_source_transition(installed.workflows.train, candidate.workflows.train);
@@ -275,8 +264,7 @@ std::expected<void, SettingsMutationError> apply_gui_settings_values(GuiSettings
  const auto& selected_train = candidate.workflows.train.request;
  if (selected_train.train_compiled_path != installed_train.train_compiled_path || selected_train.val_compiled_path != installed_train.val_compiled_path)
   candidate.workflows.train.use_compiled_directory_defaults = false;
- if (selected_train.output_dir != installed_train.output_dir && candidate.workflows.train.auto_output == state.workflows.train.auto_output)
-  candidate.workflows.train.auto_output = false;
+ if (selected_train.output_dir != installed_train.output_dir && candidate.workflows.train.auto_output == state.workflows.train.auto_output) candidate.workflows.train.auto_output = false;
  apply_compiled_directory_defaults(candidate.workflows.train);
  normalize_canonical_source_transitions(state, candidate);
  if (!valid_settings(candidate)) return std::unexpected(SettingsMutationError::CrossFieldViolation);

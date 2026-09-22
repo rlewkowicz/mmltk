@@ -6,12 +6,10 @@
 #include <tuple>
 namespace mmltk::backend::data::benchmark_internal {
 using Cancellation = mmltk::common::concurrency::CancellationObservation;
-bool CoconutMaskRecovery::candidate_mask(const NormalizedAnnotationIndex& index, std::uint32_t width, std::uint32_t height,
-                                         Candidate& candidate, Cancellation cancellation) {
+bool CoconutMaskRecovery::candidate_mask(const NormalizedAnnotationIndex& index, std::uint32_t width, std::uint32_t height, Candidate& candidate, Cancellation cancellation) {
  const auto& box = *candidate.box;
- if ((box.flags & (kAnnotationMask | kAnnotationId | kAnnotationCategory)) != (kAnnotationMask | kAnnotationId | kAnnotationCategory) ||
-     !std::isfinite(box.original_area) || box.original_area < 0 || !std::isfinite(box.x1) || !std::isfinite(box.y1) ||
-     !std::isfinite(box.x2) || !std::isfinite(box.y2) || box.x2 <= box.x1 || box.y2 <= box.y1 || box.mask_rle_pairs == 0 ||
+ if ((box.flags & (kAnnotationMask | kAnnotationId | kAnnotationCategory)) != (kAnnotationMask | kAnnotationId | kAnnotationCategory) || !std::isfinite(box.original_area) || box.original_area < 0 ||
+     !std::isfinite(box.x1) || !std::isfinite(box.y1) || !std::isfinite(box.x2) || !std::isfinite(box.y2) || box.x2 <= box.x1 || box.y2 <= box.y1 || box.mask_rle_pairs == 0 ||
      box.mask_rle_offset > index.mask_rle_pairs.size() || box.mask_rle_pairs > index.mask_rle_pairs.size() - box.mask_rle_offset)
   return false;
  candidate.runs = std::span(index.mask_rle_pairs).subspan(box.mask_rle_offset, box.mask_rle_pairs);
@@ -27,15 +25,18 @@ bool CoconutMaskRecovery::candidate_mask(const NormalizedAnnotationIndex& index,
  return true;
 }
 bool CoconutMaskRecovery::intersects(const CoconutSegmentSupport& support, const Candidate& candidate, Cancellation cancellation) {
- if (support.bounds.max_x <= candidate.bounds.min_x || candidate.bounds.max_x <= support.bounds.min_x || support.bounds.max_y <= candidate.bounds.min_y || candidate.bounds.max_y <= support.bounds.min_y)
+ if (support.bounds.max_x <= candidate.bounds.min_x || candidate.bounds.max_x <= support.bounds.min_x || support.bounds.max_y <= candidate.bounds.min_y ||
+     candidate.bounds.max_y <= support.bounds.min_y)
   return false;
  std::size_t left = 0, right = 0;
  while (left < support.runs.size() && right < candidate.runs.size()) {
   throw_if_benchmark_cancelled(cancellation);
   const auto a = support.runs[left], b = candidate.runs[right];
   if (a.start < b.start + b.length && b.start < a.start + a.length) return true;
-  if (a.start + a.length <= b.start) ++left;
-  else ++right;
+  if (a.start + a.length <= b.start)
+   ++left;
+  else
+   ++right;
  }
  return false;
 }
@@ -63,8 +64,8 @@ std::string_view CoconutMaskRecovery::original_identity(CoconutImageNamespace so
  const auto* selected = originals(source);
  return selected && selected->index ? std::string_view(selected->index->annotation_sha256) : std::string_view{};
 }
-void CoconutMaskRecovery::apply(CoconutImageNamespace source, const CoconutRecord& record, std::uint32_t width, std::uint32_t height,
-                                std::span<CoconutSegmentSupport> support, CoconutRecoveryImage& facts, Cancellation cancellation) {
+void CoconutMaskRecovery::apply(CoconutImageNamespace source, const CoconutRecord& record, std::uint32_t width, std::uint32_t height, std::span<CoconutSegmentSupport> support,
+ CoconutRecoveryImage& facts, Cancellation cancellation) {
  // Reset even after cancellation or an unavailable image; clear retains capacity.
  groups_.clear();
  ordinals_.clear();
@@ -81,15 +82,17 @@ void CoconutMaskRecovery::apply(CoconutImageNamespace source, const CoconutRecor
  if (found == selected->images.end() || !found->second) return;
  const auto& image = *found->second;
  const auto& index = *selected->index;
- if (width == 0 || height == 0 || static_cast<std::uint64_t>(width) * height > UINT32_MAX || image.width != width || image.height != height ||
-     image.first_box > index.boxes.size() || image.box_count > index.boxes.size() - image.first_box || support.size() != record.segments.size()) return;
- const auto dropped = [&](std::size_t ordinal) {
-  return support[ordinal].area == 0 && !record.segments[ordinal].bbox;
- };
+ if (width == 0 || height == 0 || static_cast<std::uint64_t>(width) * height > UINT32_MAX || image.width != width || image.height != height || image.first_box > index.boxes.size() ||
+     image.box_count > index.boxes.size() - image.first_box || support.size() != record.segments.size())
+  return;
+ const auto dropped = [&](std::size_t ordinal) { return support[ordinal].area == 0 && !record.segments[ordinal].bbox; };
  bool has_dropped = false;
  for (std::size_t ordinal = 0; ordinal < record.segments.size(); ++ordinal) {
   throw_if_benchmark_cancelled(cancellation);
-  if (record.segments[ordinal].isthing && dropped(ordinal)) { has_dropped = true; break; }
+  if (record.segments[ordinal].isthing && dropped(ordinal)) {
+   has_dropped = true;
+   break;
+  }
  }
  if (!has_dropped) return;
  const auto key = [&](std::size_t ordinal) {
@@ -146,22 +149,34 @@ void CoconutMaskRecovery::apply(CoconutImageNamespace source, const CoconutRecor
   bool valid = true;
   for (std::size_t i = 1; i < identities_.size(); ++i) {
    throw_if_benchmark_cancelled(cancellation);
-   if (identities_[i - 1] == identities_[i]) { valid = false; break; }
+   if (identities_[i - 1] == identities_[i]) {
+    valid = false;
+    break;
+   }
   }
   if (!valid) continue;
   represented_.assign(candidates.size(), 0);
   for (std::size_t i = group.begin + group.dropped; i < group.end; ++i) {
    throw_if_benchmark_cancelled(cancellation);
    const auto ordinal = ordinals_[i];
-   if (support[ordinal].runs.empty()) { valid = false; break; }
+   if (support[ordinal].runs.empty()) {
+    valid = false;
+    break;
+   }
    std::size_t match = candidates.size();
    for (std::size_t j = 0; j < candidates.size(); ++j) {
     throw_if_benchmark_cancelled(cancellation);
     if (!intersects(support[ordinal], candidates[j], cancellation)) continue;
-    if (match != candidates.size()) { valid = false; break; }
+    if (match != candidates.size()) {
+     valid = false;
+     break;
+    }
     match = j;
    }
-   if (!valid || match == candidates.size() || represented_[match]) { valid = false; break; }
+   if (!valid || match == candidates.size() || represented_[match]) {
+    valid = false;
+    break;
+   }
    represented_[match] = 1;
   }
   if (!valid) continue;
@@ -183,12 +198,14 @@ void CoconutMaskRecovery::apply(CoconutImageNamespace source, const CoconutRecor
    target.recovered = *candidate.box;
    target.runs.assign(candidate.runs.begin(), candidate.runs.end());
    target.area = 0;
-   for (const auto run : target.runs) { throw_if_benchmark_cancelled(cancellation); target.area += run.length; }
+   for (const auto run : target.runs) {
+    throw_if_benchmark_cancelled(cancellation);
+    target.area += run.length;
+   }
    target.bounds = candidate.bounds;
    union_.insert(union_.end(), candidate.runs.begin(), candidate.runs.end());
    if (ordinal > UINT64_MAX - record.first_segment_ordinal) throw std::runtime_error("COCONut: source ordinal overflow");
-   facts.objects.push_back({record.segments[ordinal].id, record.first_segment_ordinal + ordinal, record.segments[ordinal].category_id,
-                            candidate.box->annotation_id});
+   facts.objects.push_back({record.segments[ordinal].id, record.first_segment_ordinal + ordinal, record.segments[ordinal].category_id, candidate.box->annotation_id});
   }
  }
  if (union_.empty()) return;
@@ -200,7 +217,8 @@ void CoconutMaskRecovery::apply(CoconutImageNamespace source, const CoconutRecor
   if (used && run.start <= union_[used - 1].start + union_[used - 1].length) {
    auto& prior = union_[used - 1];
    prior.length = std::max(prior.start + prior.length, run.start + run.length) - prior.start;
-  } else union_[used++] = run;
+  } else
+   union_[used++] = run;
  }
  union_.resize(used);
  dataset::RowMajorMaskBounds recovered_bounds;
@@ -211,8 +229,9 @@ void CoconutMaskRecovery::apply(CoconutImageNamespace source, const CoconutRecor
  for (std::size_t ordinal = 0; ordinal < support.size(); ++ordinal) {
   throw_if_benchmark_cancelled(cancellation);
   auto& target = support[ordinal];
-  if (!record.segments[ordinal].isthing || target.recovered || target.runs.empty() || target.bounds.max_x <= recovered_bounds.min_x ||
-      recovered_bounds.max_x <= target.bounds.min_x || target.bounds.max_y <= recovered_bounds.min_y || recovered_bounds.max_y <= target.bounds.min_y) continue;
+  if (!record.segments[ordinal].isthing || target.recovered || target.runs.empty() || target.bounds.max_x <= recovered_bounds.min_x || recovered_bounds.max_x <= target.bounds.min_x ||
+      target.bounds.max_y <= recovered_bounds.min_y || recovered_bounds.max_y <= target.bounds.min_y)
+   continue;
   scratch_.clear();
   std::uint64_t area = 0;
   dataset::RowMajorMaskBounds bounds;
@@ -222,8 +241,7 @@ void CoconutMaskRecovery::apply(CoconutImageNamespace source, const CoconutRecor
    area += end - begin;
    dataset::include_row_major_mask_run(&bounds, begin, end, width);
   };
-  auto cut = std::lower_bound(union_.begin(), union_.end(), target.runs.front().start,
-                              [](RLEPair value, std::uint32_t position) { return value.start + value.length <= position; });
+  auto cut = std::lower_bound(union_.begin(), union_.end(), target.runs.front().start, [](RLEPair value, std::uint32_t position) { return value.start + value.length <= position; });
   for (const auto run : target.runs) {
    throw_if_benchmark_cancelled(cancellation);
    auto cursor = run.start;
@@ -231,7 +249,10 @@ void CoconutMaskRecovery::apply(CoconutImageNamespace source, const CoconutRecor
    while (cut != union_.end() && cut->start < end) {
     throw_if_benchmark_cancelled(cancellation);
     const auto cut_end = cut->start + cut->length;
-    if (cut_end <= cursor) { ++cut; continue; }
+    if (cut_end <= cursor) {
+     ++cut;
+     continue;
+    }
     if (cursor < cut->start) emit(cursor, cut->start);
     cursor = std::min(end, cut_end);
     // A cut extending beyond this supporter run must remain for the next run.

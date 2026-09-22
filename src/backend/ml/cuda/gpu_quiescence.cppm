@@ -31,8 +31,7 @@ struct GpuBackendQuiescenceRequirement {
   return false;
  }
 };
-[[nodiscard]] constexpr GpuBackendQuiescenceRequirement target_device_barrier_quiescence(const GpuBackendGeneration generation,
-                                                                                         const std::int32_t device_id) noexcept {
+[[nodiscard]] constexpr GpuBackendQuiescenceRequirement target_device_barrier_quiescence(const GpuBackendGeneration generation, const std::int32_t device_id) noexcept {
  return {
   .generation = generation,
   .device_id = device_id,

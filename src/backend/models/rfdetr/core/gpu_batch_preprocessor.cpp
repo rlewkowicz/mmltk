@@ -21,20 +21,18 @@ GpuPreprocessOutputType preprocess_output_type(const at::ScalarType output_type)
   case torch::kBFloat16: return GpuPreprocessOutputType::BFloat16;
   default:
    require(false,
-           "GPU batch preprocessing supports only FP32, FP16, and "
-           "BF16 output");
+    "GPU batch preprocessing supports only FP32, FP16, and "
+    "BF16 output");
  }
  return GpuPreprocessOutputType::Float32;
 }
 }  // namespace
-GpuBatchPreprocessor::GpuBatchPreprocessor(const std::int64_t batch_capacity, const int height, const int width, const int device_id,
-                                           const at::ScalarType output_type)
+GpuBatchPreprocessor::GpuBatchPreprocessor(const std::int64_t batch_capacity, const int height, const int width, const int device_id, const at::ScalarType output_type)
     : batch_capacity_(batch_capacity), height_(height), width_(width), device_id_(device_id), output_type_(output_type) {
  require(batch_capacity_ > 0 && height_ > 0 && width_ > 0, "invalid GPU preprocessing tensor shape");
  (void)preprocess_output_type(output_type_);
  TorchCudaDeviceGuard device_guard(checked_device_index(device_id_));
- resources_->output =
-  torch::empty({batch_capacity_, 3, height_, width_}, torch::TensorOptions().dtype(output_type_).device(mmltk::backend::ml::cuda::cuda_device(device_id_)));
+ resources_->output = torch::empty({batch_capacity_, 3, height_, width_}, torch::TensorOptions().dtype(output_type_).device(mmltk::backend::ml::cuda::cuda_device(device_id_)));
  ensure_cuda_ok(cudaEventCreateWithFlags(&resources_->consumer_complete, cudaEventDisableTiming), "cudaEventCreateWithFlags for GPU preprocessing consumer");
 }
 void GpuBatchPreprocessor::Check(cudaError_t status, const char* operation) {
@@ -46,8 +44,7 @@ GpuBatchPreprocessor::~GpuBatchPreprocessor() {
  int previous = -1;
  auto status = cudaGetDevice(&previous);
  if (status == cudaSuccess && previous != device_id_) status = cudaSetDevice(device_id_);
- if (status == cudaSuccess && has_run_)
-  status = consumer_pending_ ? cudaEventSynchronize(resources_->consumer_complete) : cudaStreamSynchronize(producer_stream_);
+ if (status == cudaSuccess && has_run_) status = consumer_pending_ ? cudaEventSynchronize(resources_->consumer_complete) : cudaStreamSynchronize(producer_stream_);
  if (status == cudaSuccess && resources_->consumer_complete) status = cudaEventDestroy(resources_->consumer_complete);
  if (status != cudaSuccess) std::move(lease_).Install(mmltk::frameworks::gpu::TerminalCudaCustody::Share(std::move(resources_)), status);
  if (previous >= 0 && previous != device_id_) static_cast<void>(cudaSetDevice(previous));
@@ -68,8 +65,7 @@ torch::Tensor GpuBatchPreprocessor::run(const mmltk::backend::data::Batch& batch
  }
  producer_stream_ = stream;
  has_run_ = true;
- normalize_gpu_batch(batch.device_images, resources_->output.data_ptr(), active_batch_size, output_batch_size, height_, width_,
-                     preprocess_output_type(output_type_), stream);
+ normalize_gpu_batch(batch.device_images, resources_->output.data_ptr(), active_batch_size, output_batch_size, height_, width_, preprocess_output_type(output_type_), stream);
  return output_batch_size == batch_capacity_ ? resources_->output : resources_->output.narrow(0, 0, output_batch_size);
 }
 void GpuBatchPreprocessor::record_consumer(cudaStream_t stream) {

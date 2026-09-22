@@ -22,18 +22,16 @@ namespace {
 namespace onnx = mmltk_onnx;
 namespace lut = mmltk::backend::imaging::upscale::shiftlut;
 void describe_layout() {
- std::cout << "{\"domain\":\"" << lut::kDomain << "\",\"operator\":\"" << lut::kOperator << "\",\"version\":" << lut::kVersion
-           << ",\"dtype\":\"<f4\",\"element_bytes\":" << sizeof(float) << ",\"elements\":" << lut::kTableElements << ",\"bytes\":" << lut::kTableBytes
-           << ",\"channels\":" << lut::kChannels << ",\"rgb_channels\":" << lut::kRgbChannels << ",\"rotations\":" << lut::kRotations
-           << ",\"stages\":" << lut::kStages << ",\"shift_axes\":" << lut::kShiftAxes << ",\"scale\":" << lut::kScale
-           << ",\"maximum_tile_extent\":" << lut::kMaximumTileExtent << ",\"scratch_elements\":" << lut::kScratchElements
-           << ",\"decision_checkpoints\":" << lut::kDecisionCheckpoints << ",\"blocks\":[";
+ std::cout << "{\"domain\":\"" << lut::kDomain << "\",\"operator\":\"" << lut::kOperator << "\",\"version\":" << lut::kVersion << ",\"dtype\":\"<f4\",\"element_bytes\":" << sizeof(float)
+           << ",\"elements\":" << lut::kTableElements << ",\"bytes\":" << lut::kTableBytes << ",\"channels\":" << lut::kChannels << ",\"rgb_channels\":" << lut::kRgbChannels
+           << ",\"rotations\":" << lut::kRotations << ",\"stages\":" << lut::kStages << ",\"shift_axes\":" << lut::kShiftAxes << ",\"scale\":" << lut::kScale
+           << ",\"maximum_tile_extent\":" << lut::kMaximumTileExtent << ",\"scratch_elements\":" << lut::kScratchElements << ",\"decision_checkpoints\":" << lut::kDecisionCheckpoints
+           << ",\"blocks\":[";
  for (std::size_t index = 0; index < lut::kTableBlocks; ++index) {
   const auto block = lut::table_block(index);
   if (index != 0) std::cout << ',';
-  std::cout << "{\"name\":\"" << block.name.data() << "\",\"kind\":\"" << (block.family == lut::TableFamily::Shifts ? "shifts" : "lut") << "\",\"dimensions\":["
-            << block.shape.outer << ',' << block.shape.inner << ',' << block.shape.domain << "],\"offset\":" << block.offset
-            << ",\"elements\":" << block.shape.elements() << '}';
+  std::cout << "{\"name\":\"" << block.name.data() << "\",\"kind\":\"" << (block.family == lut::TableFamily::Shifts ? "shifts" : "lut") << "\",\"dimensions\":[" << block.shape.outer << ','
+            << block.shape.inner << ',' << block.shape.domain << "],\"offset\":" << block.offset << ",\"elements\":" << block.shape.elements() << '}';
  }
  std::cout << "]}\n";
  if (!std::cout) throw std::runtime_error("write ShiftLUT layout description");
@@ -131,8 +129,7 @@ std::vector<float> read_vector(const std::filesystem::path& path, std::size_t co
  if (std::filesystem::file_size(path) != count * sizeof(float)) throw std::invalid_argument("invalid upstream oracle size");
  std::vector<float> values(count);
  std::ifstream stream(path, std::ios::binary);
- if (!stream.read(reinterpret_cast<char*>(values.data()), static_cast<std::streamsize>(count * sizeof(float))))
-  throw std::runtime_error("read independent upstream oracle");
+ if (!stream.read(reinterpret_cast<char*>(values.data()), static_cast<std::streamsize>(count * sizeof(float)))) throw std::runtime_error("read independent upstream oracle");
  return values;
 }
 void verify(const std::filesystem::path& path, const std::filesystem::path& directory, std::string_view lut_digest, std::string_view source_digest) {
@@ -140,8 +137,7 @@ void verify(const std::filesystem::path& path, const std::filesystem::path& dire
  std::ifstream model_file(path, std::ios::binary);
  if (!graph.ParseFromIstream(&model_file)) throw std::invalid_argument("invalid production ONNX");
  const auto matches = [&](std::string_view key, std::string_view expected) {
-  return std::any_of(graph.metadata_props().begin(), graph.metadata_props().end(),
-                     [&](const auto& property) { return property.key() == key && property.value() == expected; });
+  return std::any_of(graph.metadata_props().begin(), graph.metadata_props().end(), [&](const auto& property) { return property.key() == key && property.value() == expected; });
  };
  if (!matches("mmltk.source_assets_sha256", lut_digest) || !matches("mmltk.source_inference_sha256", source_digest))
   throw std::invalid_argument("production model does not match upstream source/LUT provenance");
@@ -165,16 +161,13 @@ void verify(const std::filesystem::path& path, const std::filesystem::path& dire
    std::int64_t height = 0, width = 0;
    std::size_t cases = 0;
    while (vectors >> label >> height >> width) {
-    if (height < 1 || width < 1 || height > lut::kMaximumTileExtent || width > lut::kMaximumTileExtent ||
-        label.find_first_not_of("abcdefghijklmnopqrstuvwxyz0123456789_") != std::string::npos)
+    if (height < 1 || width < 1 || height > lut::kMaximumTileExtent || width > lut::kMaximumTileExtent || label.find_first_not_of("abcdefghijklmnopqrstuvwxyz0123456789_") != std::string::npos)
      throw std::invalid_argument("invalid upstream vector manifest");
     const auto input_count = static_cast<std::size_t>(height * width * lut::kRgbChannels);
     const auto input = read_vector(directory / (label + ".input.f32"), input_count);
     const auto expected = read_vector(directory / (label + ".expected.f32"), input_count * lut::kOutputPhases);
-    cuda_checked(cudaMemcpyAsync(storage.Input(), input.data(), input_count * sizeof(float), cudaMemcpyHostToDevice, storage.Stream()),
-                 "copy changed verification pixels");
-    const std::array<std::int64_t, 4> input_shape{1, lut::kRgbChannels, height, width},
-     output_shape{1, lut::kRgbChannels, height * lut::kScale, width * lut::kScale};
+    cuda_checked(cudaMemcpyAsync(storage.Input(), input.data(), input_count * sizeof(float), cudaMemcpyHostToDevice, storage.Stream()), "copy changed verification pixels");
+    const std::array<std::int64_t, 4> input_shape{1, lut::kRgbChannels, height, width}, output_shape{1, lut::kRgbChannels, height * lut::kScale, width * lut::kScale};
     auto input_value = Ort::Value::CreateTensor<float>(memory, storage.Input(), input_count, input_shape.data(), input_shape.size());
     auto output_value = Ort::Value::CreateTensor<float>(memory, storage.Output(), input_count * lut::kOutputPhases, output_shape.data(), output_shape.size());
     Ort::IoBinding binding{session};
@@ -202,8 +195,7 @@ void verify(const std::filesystem::path& path, const std::filesystem::path& dire
      const auto decision_path = directory / (label + ".decisions.i8");
      if (std::filesystem::file_size(decision_path) != count) throw std::invalid_argument("invalid upstream decision oracle size");
      std::ifstream decision_file(decision_path, std::ios::binary);
-     if (!decision_file.read(reinterpret_cast<char*>(expected_decisions.data()), static_cast<std::streamsize>(count)))
-      throw std::runtime_error("read upstream lookup decisions");
+     if (!decision_file.read(reinterpret_cast<char*>(expected_decisions.data()), static_cast<std::streamsize>(count))) throw std::runtime_error("read upstream lookup decisions");
      cuda_checked(operators.ReadDecisions(decisions), "read captured ShiftLUT lookup inputs");
      if (decisions != expected_decisions) {
       std::ofstream mismatch(directory / (label + (capture ? ".graph.decisions.i8" : ".fallback.decisions.i8")), std::ios::binary);
@@ -213,8 +205,8 @@ void verify(const std::filesystem::path& path, const std::filesystem::path& dire
     }
     if (!first_row) evidence << ",\n";
     first_row = false;
-    evidence << "  {\"case\":\"" << label << "\",\"graph\":" << (capture ? "true" : "false")
-             << ",\"identical\":true,\"lookup_inputs_identical\":" << (probe_decisions ? "true" : "null") << ",\"hot_allocations\":" << after - before << '}';
+    evidence << "  {\"case\":\"" << label << "\",\"graph\":" << (capture ? "true" : "false") << ",\"identical\":true,\"lookup_inputs_identical\":" << (probe_decisions ? "true" : "null")
+             << ",\"hot_allocations\":" << after - before << '}';
     ++cases;
    }
    if (!vectors.eof() || cases == 0) throw std::runtime_error("incomplete upstream vector manifest");

@@ -35,8 +35,7 @@ DeviceExecution resolve_device_execution(int ordinal, const mmltk::common::syste
  std::ranges::transform(result.pci_identity, result.pci_identity.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
 #if CUDA_VERSION >= 12040
  const auto attribute = cuDeviceGetAttribute(&result.reported_numa_node, CU_DEVICE_ATTRIBUTE_HOST_NUMA_ID, device);
- if (attribute != CUDA_SUCCESS && attribute != CUDA_ERROR_INVALID_VALUE && attribute != CUDA_ERROR_NOT_SUPPORTED)
-  ensure_cuda_driver_ok(attribute, "resolve GPU host NUMA identity");
+ if (attribute != CUDA_SUCCESS && attribute != CUDA_ERROR_INVALID_VALUE && attribute != CUDA_ERROR_NOT_SUPPORTED) ensure_cuda_driver_ok(attribute, "resolve GPU host NUMA identity");
  if (attribute != CUDA_SUCCESS) result.reported_numa_node = -1;
 #endif
  if (result.reported_numa_node < 0) {
@@ -46,8 +45,7 @@ DeviceExecution resolve_device_execution(int ordinal, const mmltk::common::syste
  try {
   result.placement = mmltk::common::system::resolve_placement(topology, result.reported_numa_node, numa_node, eligible);
  } catch (const std::invalid_argument& error) {
-  throw std::invalid_argument("CUDA device " + std::to_string(ordinal) + " (PCI " + result.pci_identity + ") placement: " + error.what() +
-                              "; select --numa-node <GPU-local permitted node>");
+  throw std::invalid_argument("CUDA device " + std::to_string(ordinal) + " (PCI " + result.pci_identity + ") placement: " + error.what() + "; select --numa-node <GPU-local permitted node>");
  }
  return result;
 }

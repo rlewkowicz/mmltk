@@ -63,8 +63,7 @@ public:
  void NotifyContinuationAt(std::chrono::steady_clock::time_point) noexcept;
  // Arm before testing output writability; disarm clears only availability retries.
  void SetOutputRetry(bool armed) noexcept;
- [[nodiscard]] Runtime::OutputCandidate TryAcquireOutput(Runtime&, Runtime::CompletedOutput&,
-                                                         mmltk::frameworks::gpu::ImagePlanePreservation = mmltk::frameworks::gpu::ImagePlanePreservation::All);
+ [[nodiscard]] Runtime::OutputCandidate TryAcquireOutput(Runtime&, Runtime::CompletedOutput&, mmltk::frameworks::gpu::ImagePlanePreservation = mmltk::frameworks::gpu::ImagePlanePreservation::All);
  // Retain the submitted operation and its candidate until owner-thread GPU
  // settlement. Success and execution failure both notify; later GPU work
  // waits for owner-thread failure handling or completion. Input admission
@@ -155,8 +154,7 @@ private:
  std::unique_ptr<Runtime> runtime_;
  std::unique_ptr<Runtime> replacement_;
  bool replacement_active_ = false;
- const std::shared_ptr<mmltk::frameworks::gpu::ImageProductRevisionSequence> product_revision_sequence_{
-  std::make_shared<mmltk::frameworks::gpu::ImageProductRevisionSequence>()};
+ const std::shared_ptr<mmltk::frameworks::gpu::ImageProductRevisionSequence> product_revision_sequence_{std::make_shared<mmltk::frameworks::gpu::ImageProductRevisionSequence>()};
  std::optional<mmltk::common::system::ScopedExecutionPolicy> execution_policy_;
  RetainedRuntime retained_;
  std::stop_source active_stop_{std::nostopstate};

@@ -39,23 +39,18 @@ void CudaPredictRuntime::Close() noexcept {
   impl_->resources.CloseSession();
  } catch (...) { impl_->close_failed = true; }
 }
-bool CudaPredictRuntime::HasUnsafeCustody() const noexcept {
- return impl_->close_failed || impl_->session.HasUnsafeCustody() || (impl_->preview && impl_->preview->HasUnsafeCustody());
-}
-contracts::ComputeTerminal CudaPredictRuntime::Run(mmltk::backend::models::rfdetr::PredictRequest operation, const std::stop_token stop,
-                                                   const ComputeProgressSink& progress, const ProductSink& products, const PlaybackGate& gate,
-                                                   VisualExtent maximum, const ContextProvider& current_context, const PreviewRetirement& retirement) {
+bool CudaPredictRuntime::HasUnsafeCustody() const noexcept { return impl_->close_failed || impl_->session.HasUnsafeCustody() || (impl_->preview && impl_->preview->HasUnsafeCustody()); }
+contracts::ComputeTerminal CudaPredictRuntime::Run(mmltk::backend::models::rfdetr::PredictRequest operation, const std::stop_token stop, const ComputeProgressSink& progress,
+ const ProductSink& products, const PlaybackGate& gate, VisualExtent maximum, const ContextProvider& current_context, const PreviewRetirement& retirement) {
  if (!retirement) throw std::invalid_argument("prediction preview retirement authority is unavailable");
  if (!retirement->admission_open()) throw contracts::UnavailableError("prediction receiver custody is unobservable");
  return impl_->resources.Run(
-  [this, &progress, &products, &gate, stop, operation, maximum, &current_context,
-   &retirement](const mmltk::backend::ml::runtime::BorrowedCommandStream stream) mutable {
+  [this, &progress, &products, &gate, stop, operation, maximum, &current_context, &retirement](const mmltk::backend::ml::runtime::BorrowedCommandStream stream) mutable {
    operation.device_id = impl_->resources.device();
    std::shared_ptr<const mmltk::backend::data::catalog::ClassCatalog> classes;
    int class_count = 0;
    std::uint64_t sequence = 0U;
-   const auto result = impl_->session.RunAndWrite(
-    operation, stream,
+   const auto result = impl_->session.RunAndWrite(operation, stream,
     {
      .stop = stop,
      .source_pixels = static_cast<bool>(products),
@@ -67,8 +62,7 @@ contracts::ComputeTerminal CudaPredictRuntime::Run(mmltk::backend::models::rfdet
        if (!products) return;
        try {
         classes = summary.class_catalog;
-        class_count = summary.class_domain == mmltk::backend::data::catalog::ClassReferenceDomain::Foreground ? static_cast<int>(summary.class_catalog->size())
-                                                                                                              : summary.artifacts.config.num_classes;
+        class_count = summary.class_domain == mmltk::backend::data::catalog::ClassReferenceDomain::Foreground ? static_cast<int>(summary.class_catalog->size()) : summary.artifacts.config.num_classes;
        } catch (const std::exception& error) {
         if (products) products(std::unexpected{std::string{error.what()}});
        }
@@ -85,19 +79,16 @@ contracts::ComputeTerminal CudaPredictRuntime::Run(mmltk::backend::models::rfdet
         if (!retirement->admission_open()) throw std::runtime_error("prediction preview retirement admission is closed");
         if (!pixels.preview_failure.empty()) throw std::runtime_error(std::string{pixels.preview_failure});
         if (pixels.width > maximum.width || pixels.height > maximum.height) throw std::runtime_error("Prediction preview exceeds the visual dimensions");
-        if (impl_->preview && impl_->preview->HasUnsafeSourceCustody())
-         throw mmltk::backend::ml::runtime::CudaOperationError{cudaErrorUnknown, "prediction preview source custody"};
+        if (impl_->preview && impl_->preview->HasUnsafeSourceCustody()) throw mmltk::backend::ml::runtime::CudaOperationError{cudaErrorUnknown, "prediction preview source custody"};
         if (!impl_->preview || impl_->preview_context != context) {
          auto candidate = std::make_unique<detail::PredictionPreviewPool>(
-          *impl_->config.execution, *context,
-          detail::PredictionPreviewPool::TransferOperations{&cuMemcpyPeerAsync, &cudaEventRecord, &cudaStreamSynchronize, &cuMemHostRegister}, retirement);
+          *impl_->config.execution, *context, detail::PredictionPreviewPool::TransferOperations{&cuMemcpyPeerAsync, &cudaEventRecord, &cudaStreamSynchronize, &cuMemHostRegister}, retirement);
          impl_->preview = std::move(candidate);
          impl_->preview_context = context;
         }
-        auto raw = impl_->preview->Capture(pixels.chw, {pixels.width, pixels.height}, pixels.stream, record.detections, annotations, classes, class_count,
-                                           pixels.rgb8, pixels.custody, pixels.stop_source, pixels.source_control);
-        if (raw)
-         products(Product{.extent = {pixels.width, pixels.height}, .raw = std::move(raw), .image_id = record.image_id, .source_index = record.dataset_index});
+        auto raw = impl_->preview->Capture(
+         pixels.chw, {pixels.width, pixels.height}, pixels.stream, record.detections, annotations, classes, class_count, pixels.rgb8, pixels.custody, pixels.stop_source, pixels.source_control);
+        if (raw) products(Product{.extent = {pixels.width, pixels.height}, .raw = std::move(raw), .image_id = record.image_id, .source_index = record.dataset_index});
        } catch (const mmltk::backend::ml::runtime::CudaOperationError&) { throw; } catch (const std::exception& error) {
         products(std::unexpected{std::string{error.what()}});
        } catch (...) { products(std::unexpected{std::string{"Prediction preview custody transfer failed"}}); }
@@ -111,8 +102,8 @@ contracts::ComputeTerminal CudaPredictRuntime::Run(mmltk::backend::models::rfdet
        if (progress) progress({++sequence, decoded, total, "Decoded"});
       },
     });
-   return contracts::make_compute_terminal(result.cancelled ? contracts::ComputeOperationOutcome::Cancelled : contracts::ComputeOperationOutcome::Succeeded, 0U,
-                                           result.processed_images, result.cancelled ? std::string{} : operation.output_path.string());
+   return contracts::make_compute_terminal(result.cancelled ? contracts::ComputeOperationOutcome::Cancelled : contracts::ComputeOperationOutcome::Succeeded, 0U, result.processed_images,
+    result.cancelled ? std::string{} : operation.output_path.string());
   },
   {}, false);  // PredictionSession owns the atomic output completion boundary.
 }
@@ -121,8 +112,7 @@ class PredictSystem::Impl final {
  WorkspaceInput input_;
 
 public:
- Impl(SettingsSystem& settings, DatasetSystem& dataset, ModelSystem& model, const VisualDeviceSettings visual, PredictRuntimeFactory factory,
-      SystemEventSink<event_type> events)
+ Impl(SettingsSystem& settings, DatasetSystem& dataset, ModelSystem& model, const VisualDeviceSettings visual, PredictRuntimeFactory factory, SystemEventSink<event_type> events)
      : settings_(settings),
        dataset_(dataset),
        model_(model),
@@ -130,8 +120,7 @@ public:
        events_(std::move(events)),
        factory_(std::move(factory)),
        worker_(
-        [this, visual, topology = mmltk::common::system::NumaTopology::Capture(),
-         execution = std::optional<mmltk::frameworks::gpu::DeviceExecution>{}](auto revisions) mutable {
+        [this, visual, topology = mmltk::common::system::NumaTopology::Capture(), execution = std::optional<mmltk::frameworks::gpu::DeviceExecution>{}](auto revisions) mutable {
          if (!execution) execution = mmltk::frameworks::gpu::resolve_device_execution(visual.device, topology, visual.numa_node);
          mmltk::frameworks::gpu::SystemImageRuntimeConfig config{
           .device = visual.device,
@@ -180,21 +169,18 @@ public:
    playback_.Reset();
    try {
     run_.Start({
-     .work = [this, settings = settings.settings, selection, source_key = key, video = state_.video,
-              generation = *generation](const std::stop_token stop) mutable -> direct::LocalRun::Notification {
+     .work = [this, settings = settings.settings, selection, source_key = key, video = state_.video, generation = *generation](const std::stop_token stop) mutable -> direct::LocalRun::Notification {
       if (!preview_retirement_->admission_open()) throw contracts::UnavailableError("prediction receiver custody is unobservable");
       contracts::ArtifactInspection inspection;
       if (!stop.stop_requested() && settings.workflows.predict.source.kind == contracts::SourceKind::CompiledDataset)
        inspection = dataset_.Inspect({settings.workflows.predict.source.compiled_path, {}, {}}, selection.key.preset, selection.key.resolution, stop);
-      if (stop.stop_requested())
-       return [this, generation] { Settled(contracts::make_compute_terminal(contracts::ComputeOperationOutcome::Cancelled, generation)); };
+      if (stop.stop_requested()) return [this, generation] { Settled(contracts::make_compute_terminal(contracts::ComputeOperationOutcome::Cancelled, generation)); };
       auto request = subsystems::system::ComputeIntentMaterializer::Predict(settings, inspection, selection);
       if (!request) throw contracts::InvalidIntentError(request.error().detail);
       const bool initial_runtime = !runtime_;
       if (!runtime_) runtime_ = factory_();
       if (!runtime_) throw std::runtime_error("prediction runtime factory returned no runtime");
-      const auto execution =
-       mmltk::frameworks::gpu::resolve_device_execution(visual_.device, mmltk::common::system::NumaTopology::Capture(), visual_.numa_node);
+      const auto execution = mmltk::frameworks::gpu::resolve_device_execution(visual_.device, mmltk::common::system::NumaTopology::Capture(), visual_.numa_node);
       try {
        if (initial_runtime) static_cast<void>(PreviewContext(execution));
       } catch (const mmltk::frameworks::gpu::CudaContextFailure& error) {
@@ -204,8 +190,7 @@ public:
       auto terminal = runtime_->Run(
        std::move(*request), stop, [this](const auto& progress) { Progress(progress); },
        [this, &source_key, video](std::expected<PredictRuntime::Product, std::string> product) { Product(std::move(product), source_key, video); },
-       [this, stop](std::optional<double> timestamp, double fps) { return playback_.Wait(timestamp, fps, stop); },
-       {visual_.maximum_width, visual_.maximum_height},
+       [this, stop](std::optional<double> timestamp, double fps) { return playback_.Wait(timestamp, fps, stop); }, {visual_.maximum_width, visual_.maximum_height},
        [this] {
         std::unique_lock context_lock(preview_context_mutex_, std::try_to_lock);
         return context_lock.owns_lock() ? preview_context_ : std::nullopt;
@@ -355,28 +340,21 @@ private:
    labels.reserve(product.raw->predictions().size());
    for (const auto& detection : product.raw->predictions()) {
     const auto category = detection.class_reference;
-    labels.push_back({{{detection.bbox_xyxy[0], detection.bbox_xyxy[1]}, {detection.bbox_xyxy[2], detection.bbox_xyxy[3]}},
-                      category,
-                      detection.class_domain,
-                      detection.score,
-                      category >= 0 && static_cast<std::size_t>(category) < palette.size() ? palette[category] : contracts::AnnotationColor{},
-                      detection.class_domain == mmltk::backend::data::catalog::ClassReferenceDomain::Foreground && category >= 0 &&
-                        static_cast<std::size_t>(category) < classes.size()
-                       ? classes[category]
-                       : std::string{}});
+    labels.push_back({{{detection.bbox_xyxy[0], detection.bbox_xyxy[1]}, {detection.bbox_xyxy[2], detection.bbox_xyxy[3]}}, category, detection.class_domain, detection.score,
+     category >= 0 && static_cast<std::size_t>(category) < palette.size() ? palette[category] : contracts::AnnotationColor{},
+     detection.class_domain == mmltk::backend::data::catalog::ClassReferenceDomain::Foreground && category >= 0 && static_cast<std::size_t>(category) < classes.size() ? classes[category]
+                                                                                                                                                                       : std::string{}});
     const auto& label = labels.back();
     if (!label.box.valid() || !label.color.valid() || !std::isfinite(label.confidence) || label.name.size() > mmltk::frameworks::reflection::kMaximumNameBytes)
      throw std::runtime_error("Prediction preview metadata exceeds the visual product limits");
    }
    product.raw->Draw(runtime, candidate);
    const auto frame = visual_frame({PresentationSourceKind::Predict, 1U}, product.extent, candidate.revision());
-   detail::VisualRuntimeOwner::Notification notification = [this, frame, labels = std::move(labels), identity = product.image_id,
-                                                            content_identity = pending.content_identity]() mutable {
+   detail::VisualRuntimeOwner::Notification notification = [this, frame, labels = std::move(labels), identity = product.image_id, content_identity = pending.content_identity]() mutable {
     PredictSnapshot changed;
     {
      std::scoped_lock lock(mutex_);
-     const auto revision = detail::PredictRevision::Frame(state_.revision, state_.operation.active,
-                                                          state_.operation.terminal.outcome == contracts::ComputeOperationOutcome::CancellationRequested);
+     const auto revision = detail::PredictRevision::Frame(state_.revision, state_.operation.active, state_.operation.terminal.outcome == contracts::ComputeOperationOutcome::CancellationRequested);
      if (!revision) return;
      state_.frame = frame;
      state_.labels = std::move(labels);
@@ -395,9 +373,7 @@ private:
     static_cast<void>(runtime.Retire(failure));
     throw;
    }
-   if (mmltk::frameworks::gpu::is_image_execution_failure(failure) ||
-       mmltk::frameworks::gpu::find_image_failure<mmltk::backend::ml::runtime::CudaOperationError>(failure))
-    throw;
+   if (mmltk::frameworks::gpu::is_image_execution_failure(failure) || mmltk::frameworks::gpu::find_image_failure<mmltk::backend::ml::runtime::CudaOperationError>(failure)) throw;
    try {
     std::rethrow_exception(failure);
    } catch (const mmltk::frameworks::gpu::CudaContextFailure& error) {
@@ -416,8 +392,7 @@ private:
   {
    std::scoped_lock lock(mutex_);
    if (!state_.operation.active || !contracts::compute_progress_follows(progress, state_.operation.progress.sequence)) return;
-   const auto revision =
-    detail::PredictRevision::Progress(state_.revision, state_.operation.terminal.outcome == contracts::ComputeOperationOutcome::CancellationRequested);
+   const auto revision = detail::PredictRevision::Progress(state_.revision, state_.operation.terminal.outcome == contracts::ComputeOperationOutcome::CancellationRequested);
    if (!revision) return;
    state_.revision = *revision;
    static_cast<void>(contracts::advance_compute(state_.operation, progress));
@@ -430,8 +405,7 @@ private:
   {
    std::scoped_lock lock(mutex_);
    if (preview_failure_ == detail) return;
-   const auto revision =
-    detail::PredictRevision::Progress(state_.revision, state_.operation.terminal.outcome == contracts::ComputeOperationOutcome::CancellationRequested);
+   const auto revision = detail::PredictRevision::Progress(state_.revision, state_.operation.terminal.outcome == contracts::ComputeOperationOutcome::CancellationRequested);
    if (!revision) return;
    preview_failure_ = detail;
    state_.revision = *revision;
@@ -468,8 +442,7 @@ private:
    if (!revision) return;
    state_.revision = *revision;
    state_.operation.active = false;
-   state_.operation.terminal =
-    contracts::make_compute_terminal(contracts::ComputeOperationOutcome::Failed, state_.operation.generation_frontier, 0U, {}, detail);
+   state_.operation.terminal = contracts::make_compute_terminal(contracts::ComputeOperationOutcome::Failed, state_.operation.generation_frontier, 0U, {}, detail);
    failed = state_;
   }
   Publish(PredictFailed{std::move(failed), std::move(detail)});
@@ -497,14 +470,12 @@ private:
  mmltk::frameworks::gpu::TerminalCudaRetirementOwner retirement_{1U};
  mmltk::frameworks::gpu::TerminalCudaRetirementLease retirement_lease_ = mmltk::frameworks::gpu::ReserveTerminalCudaLease(retirement_);
  // Current pool, in-flight/old pending frames, context construction, and whole submission.
- PredictRuntime::PreviewRetirement preview_retirement_ =
-  std::make_shared<mmltk::frameworks::gpu::TerminalCudaRetirementOwner>(detail::PredictionPreviewPool::kSlotCapacity + 4U);
+ PredictRuntime::PreviewRetirement preview_retirement_ = std::make_shared<mmltk::frameworks::gpu::TerminalCudaRetirementOwner>(detail::PredictionPreviewPool::kSlotCapacity + 4U);
  std::shared_ptr<PredictRuntime> runtime_;
  direct::LocalRun run_;
  detail::VisualRuntimeOwner worker_;
 };
-PredictSystem::PredictSystem(SettingsSystem& settings, DatasetSystem& dataset, ModelSystem& model, const VisualDeviceSettings visual,
-                             PredictRuntimeFactory factory, SystemEventSink<event_type> events)
+PredictSystem::PredictSystem(SettingsSystem& settings, DatasetSystem& dataset, ModelSystem& model, const VisualDeviceSettings visual, PredictRuntimeFactory factory, SystemEventSink<event_type> events)
     : impl_(std::make_unique<Impl>(settings, dataset, model, visual, std::move(factory), std::move(events))) {}
 PredictSystem::~PredictSystem() = default;
 PredictSnapshot PredictSystem::Start(contracts::PredictWorkflowIntent) { return impl_->Start(); }

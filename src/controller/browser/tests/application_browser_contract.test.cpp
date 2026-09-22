@@ -76,8 +76,7 @@ MMLTK_REFLECT_FIELDS(MultipleClaimSettings)
 MMLTK_REFLECT_FIELDS(InvalidDestinationSettings)
 template <class Settings, auto Selector, auto Destination>
 struct RelationFixture
-    : mmltk::frameworks::reflection::StaticMemberRelation<
-       Row, Settings, 1U, mmltk::frameworks::reflection::MemberRelationEntry<mmltk::frameworks::reflection::member_path<&Row::value>, Destination>> {
+    : mmltk::frameworks::reflection::StaticMemberRelation<Row, Settings, 1U, mmltk::frameworks::reflection::MemberRelationEntry<mmltk::frameworks::reflection::member_path<&Row::value>, Destination>> {
  using override_state_type = OverrideState;
  inline static constexpr auto source_selector = mmltk::frameworks::reflection::member_path<&Row::value>;
  inline static constexpr auto destination_selector = Selector;
@@ -89,21 +88,16 @@ struct RelationFixture
 namespace mmltk::frameworks::reflection {
 template <>
 struct catalog_provider_relation<mmltk::controller::browser::relation_audit_test::FirstProvider>
-    : mmltk::controller::browser::relation_audit_test::RelationFixture<
-       mmltk::controller::browser::relation_audit_test::MultipleClaimSettings,
-       member_path<&mmltk::controller::browser::relation_audit_test::MultipleClaimSettings::first>,
-       member_path<&mmltk::controller::browser::relation_audit_test::MultipleClaimSettings::value>> {};
+    : mmltk::controller::browser::relation_audit_test::RelationFixture<mmltk::controller::browser::relation_audit_test::MultipleClaimSettings,
+       member_path<&mmltk::controller::browser::relation_audit_test::MultipleClaimSettings::first>, member_path<&mmltk::controller::browser::relation_audit_test::MultipleClaimSettings::value>> {};
 template <>
 struct catalog_provider_relation<mmltk::controller::browser::relation_audit_test::SecondProvider>
-    : mmltk::controller::browser::relation_audit_test::RelationFixture<
-       mmltk::controller::browser::relation_audit_test::MultipleClaimSettings,
-       member_path<&mmltk::controller::browser::relation_audit_test::MultipleClaimSettings::second>,
-       member_path<&mmltk::controller::browser::relation_audit_test::MultipleClaimSettings::value>> {};
+    : mmltk::controller::browser::relation_audit_test::RelationFixture<mmltk::controller::browser::relation_audit_test::MultipleClaimSettings,
+       member_path<&mmltk::controller::browser::relation_audit_test::MultipleClaimSettings::second>, member_path<&mmltk::controller::browser::relation_audit_test::MultipleClaimSettings::value>> {};
 // CLEANUP-IGNORE: Each specialization installs a distinct provider selector and malformed relation topology.
 template <>
 struct catalog_provider_relation<mmltk::controller::browser::relation_audit_test::InvalidDestinationProvider>
-    : mmltk::controller::browser::relation_audit_test::RelationFixture<
-       mmltk::controller::browser::relation_audit_test::InvalidDestinationSettings,
+    : mmltk::controller::browser::relation_audit_test::RelationFixture<mmltk::controller::browser::relation_audit_test::InvalidDestinationSettings,
        member_path<&mmltk::controller::browser::relation_audit_test::InvalidDestinationSettings::selector>,
        member_path<&mmltk::controller::browser::relation_audit_test::InvalidDestinationSettings::persisted>> {};
 }  // namespace mmltk::frameworks::reflection
@@ -297,14 +291,12 @@ struct UnreflectedNestedVisualSnapshot final {
 MMLTK_REFLECT_FIELDS(SyntheticVisualOperation)
 MMLTK_REFLECT_FIELDS(SyntheticVisualSnapshot)
 MMLTK_REFLECT_FIELDS(UnreflectedNestedVisualSnapshot)
-template <PresentationSourceKind Kind,
-          auto Revision = mmltk::frameworks::reflection::member_path<&SyntheticVisualSnapshot::operation, &SyntheticVisualOperation::revision>,
-          class Image = VisualImageMetadata>
+template <PresentationSourceKind Kind, auto Revision = mmltk::frameworks::reflection::member_path<&SyntheticVisualSnapshot::operation, &SyntheticVisualOperation::revision>,
+ class Image = VisualImageMetadata>
 class SyntheticVisualSystem final {
 public:
  using event_type = std::variant<SyntheticChanged>;
- using visual_source =
-  VisualSourceProjection<SyntheticVisualSnapshot, Kind, mmltk::frameworks::reflection::member_path<&SyntheticVisualSnapshot::product>, Revision, Image>;
+ using visual_source = VisualSourceProjection<SyntheticVisualSnapshot, Kind, mmltk::frameworks::reflection::member_path<&SyntheticVisualSnapshot::product>, Revision, Image>;
  [[= contracts::reflection::direct::IntentEndpoint{}]] std::uint32_t Apply(SyntheticRequest request) { return request.value; }
  [[= contracts::reflection::Snapshot{64U * 1024U}]] [[nodiscard]] SyntheticVisualSnapshot snapshot() const {
   ++samples;
@@ -328,12 +320,9 @@ MMLTK_REFLECT_FIELDS(SyntheticDerivedSnapshot)
 class SyntheticDerivedSystem final {
 public:
  using event_type = std::variant<SyntheticChanged>;
- using visual_source = VisualSourceProjection<SyntheticDerivedSnapshot, PresentationSourceKind::Upscale,
-                                              mmltk::frameworks::reflection::member_path<&SyntheticDerivedSnapshot::frame>,
-                                              mmltk::frameworks::reflection::member_path<&SyntheticDerivedSnapshot::revision>, SyntheticDerivedSnapshot>;
- [[= contracts::reflection::Snapshot{64U * 1024U}]] SyntheticDerivedSnapshot snapshot() const {
-  return {.frame = visual_frame({PresentationSourceKind::Upscale, 1U}, {48U, 32U}, 9U), .input = input};
- }
+ using visual_source = VisualSourceProjection<SyntheticDerivedSnapshot, PresentationSourceKind::Upscale, mmltk::frameworks::reflection::member_path<&SyntheticDerivedSnapshot::frame>,
+  mmltk::frameworks::reflection::member_path<&SyntheticDerivedSnapshot::revision>, SyntheticDerivedSnapshot>;
+ [[= contracts::reflection::Snapshot{64U * 1024U}]] SyntheticDerivedSnapshot snapshot() const { return {.frame = visual_frame({PresentationSourceKind::Upscale, 1U}, {48U, 32U}, 9U), .input = input}; }
  [[nodiscard]] mmltk::frameworks::gpu::BorrowedImageProductReadView BorrowFrame() const { return {}; }
  [[nodiscard]] mmltk::frameworks::gpu::BorrowedImageWorkspace BorrowWorkspace() const { return {}; }
  [[nodiscard]] mmltk::frameworks::gpu::ImageWorkspaceObservation ObserveWorkspace() const { return {}; }
@@ -366,9 +355,7 @@ struct VisualFingerprintComposition final {
 };
 struct AlternateVisualFingerprintComposition final {
  TestSettingsSystem* settings = nullptr;
- SyntheticVisualSystem<PresentationSourceKind::Predict,
-                       mmltk::frameworks::reflection::member_path<&SyntheticVisualSnapshot::operation, &SyntheticVisualOperation::alternate>>* producer =
-  nullptr;
+ SyntheticVisualSystem<PresentationSourceKind::Predict, mmltk::frameworks::reflection::member_path<&SyntheticVisualSnapshot::operation, &SyntheticVisualOperation::alternate>>* producer = nullptr;
 };
 struct DoubleScaleImage final {
  static constexpr std::uint32_t output_scale = 2U;
@@ -383,8 +370,7 @@ MMLTK_REFLECT_FIELDS(TripleScaleImage)
 template <class Image>
 struct ScaledVisualComposition final {
  TestSettingsSystem* settings = nullptr;
- SyntheticVisualSystem<PresentationSourceKind::Predict,
-                       mmltk::frameworks::reflection::member_path<&SyntheticVisualSnapshot::operation, &SyntheticVisualOperation::revision>, Image>* producer =
+ SyntheticVisualSystem<PresentationSourceKind::Predict, mmltk::frameworks::reflection::member_path<&SyntheticVisualSnapshot::operation, &SyntheticVisualOperation::revision>, Image>* producer =
   nullptr;
 };
 class RoutingTextWriter final {
@@ -397,8 +383,7 @@ public:
  [[nodiscard]] std::string identifier(const std::string_view source, const bool upper) const {
   std::string result(source);
   if (!result.empty()) {
-   result.front() = upper ? static_cast<char>(std::toupper(static_cast<unsigned char>(result.front())))
-                          : static_cast<char>(std::tolower(static_cast<unsigned char>(result.front())));
+   result.front() = upper ? static_cast<char>(std::toupper(static_cast<unsigned char>(result.front()))) : static_cast<char>(std::tolower(static_cast<unsigned char>(result.front())));
   }
   return result;
  }
@@ -508,14 +493,12 @@ struct ChangedInheritedSystems final {
  InheritanceFixtureSystem<ChangedInheritedRequest>* fixture = nullptr;
 };
 struct DirectInheritanceSettings final {
- [[= mmltk::frameworks::reflection::Minimum<std::uint32_t>{2U}]][[= mmltk::frameworks::reflection::Maximum<std::uint32_t>{12U}]] std::uint32_t inherited_limit =
-  6U;
+ [[= mmltk::frameworks::reflection::Minimum<std::uint32_t>{2U}]][[= mmltk::frameworks::reflection::Maximum<std::uint32_t>{12U}]] std::uint32_t inherited_limit = 6U;
  [[= contracts::reflection::PersistenceMetadata{}]] std::uint64_t persisted_revision = 17U;
  bool derived_enabled = true;
 };
 struct InheritedSettingsBase {
- [[= mmltk::frameworks::reflection::Minimum<std::uint32_t>{2U}]][[= mmltk::frameworks::reflection::Maximum<std::uint32_t>{12U}]] std::uint32_t inherited_limit =
-  6U;
+ [[= mmltk::frameworks::reflection::Minimum<std::uint32_t>{2U}]][[= mmltk::frameworks::reflection::Maximum<std::uint32_t>{12U}]] std::uint32_t inherited_limit = 6U;
  [[= contracts::reflection::PersistenceMetadata{}]] std::uint64_t persisted_revision = 17U;
 };
 struct InheritedSettings final : InheritedSettingsBase {
@@ -548,11 +531,10 @@ TEST_CASE("derived image envelopes select the exact reflected source system") {
   });
   const auto product = mmltk::frameworks::serialization::reflected_transport_value(derived.snapshot());
   REQUIRE(product);
-  const auto expected = mmltk::frameworks::serialization::reflected_transport_value(
-   WorkspaceImageMetadata{.schema_fingerprint = application_schema_fingerprint<DerivedVisualComposition>().words,
-                          .frame = derived.snapshot().frame,
-                          .product = {.system_id = product_id, .value = *product},
-                          .source = SystemSnapshot{.system_id = source_id, .value = *source}});
+  const auto expected = mmltk::frameworks::serialization::reflected_transport_value(WorkspaceImageMetadata{.schema_fingerprint = application_schema_fingerprint<DerivedVisualComposition>().words,
+   .frame = derived.snapshot().frame,
+   .product = {.system_id = product_id, .value = *product},
+   .source = SystemSnapshot{.system_id = source_id, .value = *source}});
   REQUIRE(expected);
   CHECK(*decoded == *expected);
  }
@@ -574,13 +556,11 @@ TEST_CASE("canonical application schema owns endpoint dispatch and stable identi
  std::uint64_t amount_id = 0U;
  Surface::Visit([&]<class Endpoint>() {
   if constexpr (!Endpoint::interaction) {
-   ApplicationSchema<TestSystems>::template VisitRequestFields<Endpoint>(
-    [&]<class Owner, class Declaration>(const ApplicationRequestFieldFact& field) { amount_id = field.stable_id; });
+   ApplicationSchema<TestSystems>::template VisitRequestFields<Endpoint>([&]<class Owner, class Declaration>(const ApplicationRequestFieldFact& field) { amount_id = field.stable_id; });
   }
  });
  REQUIRE(amount_id != 0U);
- const auto reply =
-  dispatch_intent(systems, Intent{.correlation = 7U, .endpoint_id = intent_id, .fields = {{.field_id = amount_id, .value = wire::Value(std::int64_t{4})}}});
+ const auto reply = dispatch_intent(systems, Intent{.correlation = 7U, .endpoint_id = intent_id, .fields = {{.field_id = amount_id, .value = wire::Value(std::int64_t{4})}}});
  REQUIRE(reply.result.has_value());
  CHECK(counter.snapshot().value == 4);
  const auto accepted = dispatch_interaction(systems, counter_interaction(interaction_id, 9));
@@ -610,22 +590,20 @@ TEST_CASE("visual producer projections derive nested observations and compositio
  STATIC_REQUIRE_FALSE(ApplicationSchema<DuplicateVisualComposition>::VisualSourcesAreUnique());
  using namespace mmltk::frameworks::reflection;
  using WrongOwner = VisualSourceProjection<SyntheticVisualSnapshot, PresentationSourceKind::Predict, member_path<&ExploreSnapshot::frame>,
-                                           member_path<&SyntheticVisualSnapshot::operation, &SyntheticVisualOperation::revision>>;
- using WrongType = VisualSourceProjection<SyntheticVisualSnapshot, PresentationSourceKind::Predict, member_path<&SyntheticVisualSnapshot::operation>,
-                                          member_path<&SyntheticVisualSnapshot::product>>;
+  member_path<&SyntheticVisualSnapshot::operation, &SyntheticVisualOperation::revision>>;
+ using WrongType = VisualSourceProjection<SyntheticVisualSnapshot, PresentationSourceKind::Predict, member_path<&SyntheticVisualSnapshot::operation>, member_path<&SyntheticVisualSnapshot::product>>;
  using EmptyKind = VisualSourceProjection<SyntheticVisualSnapshot, PresentationSourceKind::None, member_path<&SyntheticVisualSnapshot::product>,
-                                          member_path<&SyntheticVisualSnapshot::operation, &SyntheticVisualOperation::revision>>;
+  member_path<&SyntheticVisualSnapshot::operation, &SyntheticVisualOperation::revision>>;
  using UnknownKind = VisualSourceProjection<SyntheticVisualSnapshot, static_cast<PresentationSourceKind>(255U), member_path<&SyntheticVisualSnapshot::product>,
-                                            member_path<&SyntheticVisualSnapshot::operation, &SyntheticVisualOperation::revision>>;
+  member_path<&SyntheticVisualSnapshot::operation, &SyntheticVisualOperation::revision>>;
  constexpr auto callable_frame = [](SyntheticVisualSnapshot& value) -> VisualFrame& { return value.product; };
  constexpr auto callable_operation = [](SyntheticVisualSnapshot& value) -> SyntheticVisualOperation& { return value.operation; };
- using CallableFrame = VisualSourceProjection<SyntheticVisualSnapshot, PresentationSourceKind::Predict, callable_frame,
-                                              member_path<&SyntheticVisualSnapshot::operation, &SyntheticVisualOperation::revision>>;
+ using CallableFrame =
+  VisualSourceProjection<SyntheticVisualSnapshot, PresentationSourceKind::Predict, callable_frame, member_path<&SyntheticVisualSnapshot::operation, &SyntheticVisualOperation::revision>>;
  using CallableSegment = VisualSourceProjection<SyntheticVisualSnapshot, PresentationSourceKind::Predict, member_path<&SyntheticVisualSnapshot::product>,
-                                                member_path<callable_operation, &SyntheticVisualOperation::revision>>;
- using UnreflectedSegment =
-  VisualSourceProjection<UnreflectedNestedVisualSnapshot, PresentationSourceKind::Predict, member_path<&UnreflectedNestedVisualSnapshot::product>,
-                         member_path<&UnreflectedNestedVisualSnapshot::operation, &UnreflectedVisualOperation::revision>>;
+  member_path<callable_operation, &SyntheticVisualOperation::revision>>;
+ using UnreflectedSegment = VisualSourceProjection<UnreflectedNestedVisualSnapshot, PresentationSourceKind::Predict, member_path<&UnreflectedNestedVisualSnapshot::product>,
+  member_path<&UnreflectedNestedVisualSnapshot::operation, &UnreflectedVisualOperation::revision>>;
  STATIC_REQUIRE_FALSE(WrongOwner::valid());
  STATIC_REQUIRE_FALSE(WrongType::valid());
  STATIC_REQUIRE_FALSE(EmptyKind::valid());
@@ -688,15 +666,13 @@ TEST_CASE("visual producer projections derive nested observations and compositio
  application_schema_detail::append_type<DoubleScaleImage>(double_structure);
  application_schema_detail::append_type<TripleScaleImage>(triple_structure);
  CHECK(double_structure.words() == triple_structure.words());
- CHECK(application_schema_fingerprint<ScaledVisualComposition<DoubleScaleImage>>() !=
-       application_schema_fingerprint<ScaledVisualComposition<TripleScaleImage>>());
+ CHECK(application_schema_fingerprint<ScaledVisualComposition<DoubleScaleImage>>() != application_schema_fingerprint<ScaledVisualComposition<TripleScaleImage>>());
  std::ostringstream scaled_output;
  RoutingTextWriter scaled_writer(scaled_output);
  emit_application_visual_projection<ScaledVisualComposition<TripleScaleImage>>(scaled_writer);
  CHECK(scaled_output.str().find("pub const OUTPUT_SCALE: u32 = 3;") != std::string::npos);
  CHECK(scaled_output.str().find("pub fn checked_scale(&self, scale: u32) -> Option<Self>") != std::string::npos);
- for (const auto field : {"width", "height", "x", "y"})
-  CHECK(scaled_output.str().find(std::string("self.") + field + ".checked_mul(scale)?") != std::string::npos);
+ for (const auto field : {"width", "height", "x", "y"}) CHECK(scaled_output.str().find(std::string("self.") + field + ".checked_mul(scale)?") != std::string::npos);
 }
 TEST_CASE("materialized event publisher preserves transient and essential failure policy", "[controller][browser][reflection]") {
  std::size_t lost = 0U;
@@ -734,8 +710,8 @@ TEST_CASE("materialized event publisher preserves transient and essential failur
  CHECK((notified == std::optional{PresentationSourceIdentity{PresentationSourceKind::Annotation, 1U}}));
 }
 TEST_CASE("clean identity preserves semantic updates and distinguishes geometry and legacy products", "[controller][browser][reflection]") {
- const std::array kinds{PresentationSourceKind::None,    PresentationSourceKind::Explore, PresentationSourceKind::Annotation,
-                        PresentationSourceKind::Predict, PresentationSourceKind::Live,    PresentationSourceKind::Upscale};
+ const std::array kinds{
+  PresentationSourceKind::None, PresentationSourceKind::Explore, PresentationSourceKind::Annotation, PresentationSourceKind::Predict, PresentationSourceKind::Live, PresentationSourceKind::Upscale};
  for (std::size_t session = 0U; session < kinds.size(); ++session) CHECK(presentation_source_session(kinds[session]) == session);
  auto frame = visual_frame({PresentationSourceKind::Explore, 1U}, {32U, 24U}, 7U);
  frame.content = {1U, 2U, 20U, 16U};
@@ -826,8 +802,7 @@ TEST_CASE("protocol-17 fingerprint is deterministic and covers stable compositio
   application_schema_detail::append_type<Second>(sink);
   return sink.words();
  };
- CHECK((repeated.template operator()<std::optional<std::uint16_t>, std::optional<std::uint32_t>>() !=
-        repeated.template operator()<std::optional<std::uint32_t>, std::optional<std::uint16_t>>()));
+ CHECK((repeated.template operator()<std::optional<std::uint16_t>, std::optional<std::uint32_t>>() != repeated.template operator()<std::optional<std::uint32_t>, std::optional<std::uint16_t>>()));
  const auto object_order = [](const bool reverse) {
   using Sink = application_schema_detail::FingerprintSink;
   std::vector<std::function<void(Sink&)>> fields;
@@ -895,10 +870,9 @@ TEST_CASE("protocol-17 fingerprint is deterministic and covers stable compositio
   ApplicationSchema<Composition>::VisitApplicationSettingsLeaves(
    [&]<class Owner, class Declaration, class Member>(const ApplicationSettingsLeafFact& fact) { leaves.emplace_back(fact.path, fact.stable_id); });
   std::vector<std::pair<std::string, std::uint32_t>> defaults;
-  ApplicationSchema<Composition>::VisitApplicationSettingsDefaults(
-   [&]<class Owner, class Declaration, class Member>(const ApplicationSettingsDefaultFact& fact, const Member& value) {
-    if constexpr (std::same_as<Member, std::uint32_t>) defaults.emplace_back(fact.path, value);
-   });
+  ApplicationSchema<Composition>::VisitApplicationSettingsDefaults([&]<class Owner, class Declaration, class Member>(const ApplicationSettingsDefaultFact& fact, const Member& value) {
+   if constexpr (std::same_as<Member, std::uint32_t>) defaults.emplace_back(fact.path, value);
+  });
   return std::pair{leaves, defaults};
  };
  CHECK(settings_facts.template operator()<TestSettingsSystems>() == settings_facts.template operator()<ChangedTestSettingsSystems>());
@@ -994,13 +968,12 @@ TEST_CASE("native application schema flattens inherited request and settings dec
     CHECK(field.constraint.maximum == 9.0L);
    }
   });
-  ApplicationSchema<InheritedSystems>::template VisitRequestDefaults<Endpoint>(
-   [&]<class Owner, class Declaration, class Member>(const ApplicationRequestFieldFact& field, const Member& value) {
-    if constexpr (std::same_as<Member, std::int32_t>) {
-     CHECK(field.name == "inherited_limit");
-     request_defaults.push_back(value);
-    }
-   });
+  ApplicationSchema<InheritedSystems>::template VisitRequestDefaults<Endpoint>([&]<class Owner, class Declaration, class Member>(const ApplicationRequestFieldFact& field, const Member& value) {
+   if constexpr (std::same_as<Member, std::int32_t>) {
+    CHECK(field.name == "inherited_limit");
+    request_defaults.push_back(value);
+   }
+  });
  });
  REQUIRE((request_names == std::vector<std::string_view>{"inherited_limit", "derived_enabled"}));
  REQUIRE((request_defaults == std::vector<std::int32_t>{4}));
@@ -1047,14 +1020,12 @@ TEST_CASE("native application schema flattens inherited request and settings dec
  CHECK(settings.front().stable_id == direct_settings_id);
  std::vector<std::uint64_t> settings_default_ids;
  std::vector<std::uint64_t> integer_defaults;
- ApplicationSchema<InheritedSystems>::VisitSettingsDefaults(
-  InheritedSettings{}, [&]<class Owner, class Declaration, class Member>(const ApplicationSettingsDefaultFact& field, const Member& value) {
-   settings_default_ids.push_back(field.stable_id);
-   if constexpr (std::unsigned_integral<Member> && !std::same_as<Member, bool>) integer_defaults.push_back(static_cast<std::uint64_t>(value));
-  });
- CHECK((settings_default_ids == std::vector<std::uint64_t>{application_settings_field_stable_id("inherited_limit"),
-                                                           application_settings_field_stable_id("persisted_revision"),
-                                                           application_settings_field_stable_id("derived_enabled")}));
+ ApplicationSchema<InheritedSystems>::VisitSettingsDefaults(InheritedSettings{}, [&]<class Owner, class Declaration, class Member>(const ApplicationSettingsDefaultFact& field, const Member& value) {
+  settings_default_ids.push_back(field.stable_id);
+  if constexpr (std::unsigned_integral<Member> && !std::same_as<Member, bool>) integer_defaults.push_back(static_cast<std::uint64_t>(value));
+ });
+ CHECK((settings_default_ids == std::vector<std::uint64_t>{application_settings_field_stable_id("inherited_limit"), application_settings_field_stable_id("persisted_revision"),
+                                 application_settings_field_stable_id("derived_enabled")}));
  CHECK((integer_defaults == std::vector<std::uint64_t>{6U, 17U}));
 }
 TEST_CASE("native application fingerprint contribution changes with an inherited field policy", "[controller][browser][reflection][inheritance]") {
@@ -1108,27 +1079,25 @@ TEST_CASE("canonical schema publishes unique request and recursive settings iden
  bool workspace_aspect_is_typed = false;
  bool explore_catalog_identity_is_persistence_metadata = false;
  bool opaque_override_storage_was_exposed = false;
- ApplicationSchema<mmltk::controller::ApplicationSystems>::VisitApplicationSettingsLeaves(
-  [&]<class Owner, class Declaration, class Member>(const ApplicationSettingsLeafFact& field) {
-   REQUIRE(field.stable_id != 0U);
-   REQUIRE_FALSE(field.path.empty());
-   CHECK(identities.insert(field.stable_id).second);
-   mutable_count += field.mutable_leaf ? 1U : 0U;
-   if (field.path == "ui.workspace_aspect_ratio") { workspace_aspect_is_typed = std::same_as<std::remove_cvref_t<Member>, contracts::WorkspaceAspectRatio>; }
-   if (field.path == "workflows.explore.class_catalog_identity") {
-    explore_catalog_identity_is_persistence_metadata =
-     !field.mutable_leaf && field.stable_id == application_settings_field_stable_id("workflows.explore.class_catalog_identity");
-   }
-   opaque_override_storage_was_exposed = opaque_override_storage_was_exposed || field.path.find("recipe_overrides") != std::string_view::npos;
-   if (!field.file_dialog) return;
-   ++dialog_count;
-   const auto entries = services::file_dialog_catalog().entries();
-   const auto match = std::ranges::find(entries, field.stable_id, &services::FileDialogDescriptor::stable_id);
-   REQUIRE(match != entries.end());
-   CHECK(match->field_path.view() == field.path);
-   CHECK(match->workflows == field.workflows);
-   CHECK(match->mode == field.file_dialog->mode);
-  });
+ ApplicationSchema<mmltk::controller::ApplicationSystems>::VisitApplicationSettingsLeaves([&]<class Owner, class Declaration, class Member>(const ApplicationSettingsLeafFact& field) {
+  REQUIRE(field.stable_id != 0U);
+  REQUIRE_FALSE(field.path.empty());
+  CHECK(identities.insert(field.stable_id).second);
+  mutable_count += field.mutable_leaf ? 1U : 0U;
+  if (field.path == "ui.workspace_aspect_ratio") { workspace_aspect_is_typed = std::same_as<std::remove_cvref_t<Member>, contracts::WorkspaceAspectRatio>; }
+  if (field.path == "workflows.explore.class_catalog_identity") {
+   explore_catalog_identity_is_persistence_metadata = !field.mutable_leaf && field.stable_id == application_settings_field_stable_id("workflows.explore.class_catalog_identity");
+  }
+  opaque_override_storage_was_exposed = opaque_override_storage_was_exposed || field.path.find("recipe_overrides") != std::string_view::npos;
+  if (!field.file_dialog) return;
+  ++dialog_count;
+  const auto entries = services::file_dialog_catalog().entries();
+  const auto match = std::ranges::find(entries, field.stable_id, &services::FileDialogDescriptor::stable_id);
+  REQUIRE(match != entries.end());
+  CHECK(match->field_path.view() == field.path);
+  CHECK(match->workflows == field.workflows);
+  CHECK(match->mode == field.file_dialog->mode);
+ });
  CHECK(mutable_count == contracts::settings_vocabulary::mutable_leaf_count<contracts::GuiSettingsState>());
  CHECK(workspace_aspect_is_typed);
  CHECK(explore_catalog_identity_is_persistence_metadata);
@@ -1141,8 +1110,7 @@ TEST_CASE("canonical schema publishes unique request and recursive settings iden
   constexpr auto selector_path = mmltk::frameworks::reflection::reflected_member_path<contracts::GuiSettingsState, Selector>();
   CHECK(selector_path.view() == "workflows.train.request.optimizer");
   Relation::VisitMembers([&]<class Entry>() {
-   constexpr auto rebased =
-    mmltk::frameworks::reflection::rebase_member_path<contracts::GuiSettingsState, typename Relation::destination_type>(Selector, Entry::destination);
+   constexpr auto rebased = mmltk::frameworks::reflection::rebase_member_path<contracts::GuiSettingsState, typename Relation::destination_type>(Selector, Entry::destination);
    constexpr auto path = mmltk::frameworks::reflection::reflected_member_path<contracts::GuiSettingsState, rebased>();
    CHECK(path.view().starts_with("workflows.train.request."));
    ++relation_count;
@@ -1185,9 +1153,8 @@ TEST_CASE("custom model dialogs derive from the canonical compatibility catalog"
    }
   });
   CHECK(leaf_matches == 1U);
-  const auto found = std::ranges::find_if(entries, [&](const services::FileDialogDescriptor& entry) {
-   return entry.workflows.allows(compatibility.workflow) && entry.model_input == compatibility.input;
-  });
+  const auto found =
+   std::ranges::find_if(entries, [&](const services::FileDialogDescriptor& entry) { return entry.workflows.allows(compatibility.workflow) && entry.model_input == compatibility.input; });
   CHECK(found != entries.end());
   CHECK(found->stable_id == application_settings_field_stable_id(typed_path.view()));
   CHECK(found->field_path.view() == typed_path.view());
@@ -1206,9 +1173,7 @@ TEST_CASE("custom model dialogs derive from the canonical compatibility catalog"
 }
 TEST_CASE("export ONNX input and output publish distinct canonical dialogs", "[controller][browser][reflection][dialog]") {
  const auto entries = services::file_dialog_catalog().entries();
- const auto find_path = [&](const std::string_view path) {
-  return std::ranges::find(entries, path, [](const services::FileDialogDescriptor& entry) { return entry.field_path.view(); });
- };
+ const auto find_path = [&](const std::string_view path) { return std::ranges::find(entries, path, [](const services::FileDialogDescriptor& entry) { return entry.field_path.view(); }); };
  const auto input = find_path("workflows.export_state.onnx_input_path");
  const auto output = find_path("workflows.export_state.onnx_output_path");
  REQUIRE(input != entries.end());
@@ -1225,24 +1190,23 @@ TEST_CASE("canonical schema projects typed catalog rows and settings defaults", 
  std::set<std::uint64_t> identities;
  std::size_t provider_count = 0U;
  std::size_t catalog_row_count = 0U;
- ApplicationSchema<mmltk::controller::ApplicationSystems>::VisitCatalogProviders(
-  [&]<class Provider, class Row>(const ApplicationCatalogProviderFact& provider) {
-   ++provider_count;
-   REQUIRE(provider.stable_id != 0U);
-   REQUIRE_FALSE(provider.identity.empty());
-   REQUIRE_FALSE(provider.row_type.empty());
-   CHECK(identities.insert(provider.stable_id).second);
-   ApplicationSchema<mmltk::controller::ApplicationSystems>::template VisitCatalogRows<Provider>(
-    [&]<class ActualProvider, class ActualRow>(const ApplicationCatalogRowFact& row, const ActualRow& value) {
-     STATIC_REQUIRE(std::same_as<Row, ActualRow>);
-     ++catalog_row_count;
-     CHECK(row.provider_id == provider.stable_id);
-     REQUIRE(row.stable_id != 0U);
-     REQUIRE_FALSE(row.key.empty());
-     CHECK(identities.insert(row.stable_id).second);
-     CHECK(row.key == Provider::row_key(value));
-    });
-  });
+ ApplicationSchema<mmltk::controller::ApplicationSystems>::VisitCatalogProviders([&]<class Provider, class Row>(const ApplicationCatalogProviderFact& provider) {
+  ++provider_count;
+  REQUIRE(provider.stable_id != 0U);
+  REQUIRE_FALSE(provider.identity.empty());
+  REQUIRE_FALSE(provider.row_type.empty());
+  CHECK(identities.insert(provider.stable_id).second);
+  ApplicationSchema<mmltk::controller::ApplicationSystems>::template VisitCatalogRows<Provider>(
+   [&]<class ActualProvider, class ActualRow>(const ApplicationCatalogRowFact& row, const ActualRow& value) {
+    STATIC_REQUIRE(std::same_as<Row, ActualRow>);
+    ++catalog_row_count;
+    CHECK(row.provider_id == provider.stable_id);
+    REQUIRE(row.stable_id != 0U);
+    REQUIRE_FALSE(row.key.empty());
+    CHECK(identities.insert(row.stable_id).second);
+    CHECK(row.key == Provider::row_key(value));
+   });
+ });
  CHECK(provider_count != 0U);
  CHECK(catalog_row_count != 0U);
  std::set<std::uint64_t> default_ids;
@@ -1258,14 +1222,13 @@ TEST_CASE("canonical schema projects typed catalog rows and settings defaults", 
  CHECK(default_count == contracts::settings_vocabulary::leaf_count<contracts::GuiSettingsState>());
  std::size_t request_default_count = 0U;
  ApplicationSchema<TestSystems>::VisitEndpoints([&]<class Endpoint>() {
-  ApplicationSchema<TestSystems>::template VisitRequestDefaults<Endpoint>(
-   [&]<class Owner, class Declaration, class Member>(const ApplicationRequestFieldFact& fact, const Member& value) {
-    ++request_default_count;
-    REQUIRE(fact.endpoint_id != 0U);
-    REQUIRE(fact.stable_id != 0U);
-    REQUIRE_FALSE(fact.name.empty());
-    CHECK(mmltk::frameworks::serialization::reflected_value(value).has_value());
-   });
+  ApplicationSchema<TestSystems>::template VisitRequestDefaults<Endpoint>([&]<class Owner, class Declaration, class Member>(const ApplicationRequestFieldFact& fact, const Member& value) {
+   ++request_default_count;
+   REQUIRE(fact.endpoint_id != 0U);
+   REQUIRE(fact.stable_id != 0U);
+   REQUIRE_FALSE(fact.name.empty());
+   CHECK(mmltk::frameworks::serialization::reflected_value(value).has_value());
+  });
  });
  std::size_t request_field_count = 0U;
  ApplicationSchema<TestSystems>::VisitRequestFields([&]<class Owner, class Declaration>(const ApplicationRequestFieldFact&) { ++request_field_count; });
@@ -1273,47 +1236,52 @@ TEST_CASE("canonical schema projects typed catalog rows and settings defaults", 
 }
 TEST_CASE("model selection compatibility is a reachable deterministic nine-row catalog", "[controller][browser][reflection][model]") {
  constexpr std::array expected_keys{
-  std::string_view{"train.weights"},     std::string_view{"validate.weights"}, std::string_view{"validate.onnx"},
-  std::string_view{"validate.tensorrt"}, std::string_view{"predict.weights"},  std::string_view{"predict.onnx"},
-  std::string_view{"predict.tensorrt"},  std::string_view{"export.weights"},   std::string_view{"export.onnx"},
+  std::string_view{"train.weights"},
+  std::string_view{"validate.weights"},
+  std::string_view{"validate.onnx"},
+  std::string_view{"validate.tensorrt"},
+  std::string_view{"predict.weights"},
+  std::string_view{"predict.onnx"},
+  std::string_view{"predict.tensorrt"},
+  std::string_view{"export.weights"},
+  std::string_view{"export.onnx"},
  };
  STATIC_REQUIRE(contracts::ModelSelectionCompatibilityCatalog::identity == "model.selection.compatibility");
  STATIC_REQUIRE(contracts::ModelSelectionCompatibilityCatalog::valid());
  std::size_t provider_count = 0U;
- ApplicationSchema<mmltk::controller::ApplicationSystems>::VisitCatalogProviders(
-  [&]<class Provider, class Row>(const ApplicationCatalogProviderFact& provider) {
-   if constexpr (std::same_as<Provider, contracts::ModelSelectionCompatibilityCatalog>) {
-    STATIC_REQUIRE(std::same_as<Row, contracts::ModelSelectionCompatibility>);
-    ++provider_count;
-    CHECK(provider.identity == contracts::ModelSelectionCompatibilityCatalog::identity);
-    CHECK(provider.row_type == mmltk::frameworks::reflection::type_name<contracts::ModelSelectionCompatibility>());
-    CHECK(provider.stable_id == application_stable_id(contracts::ModelSelectionCompatibilityCatalog::identity));
-    std::size_t row_index = 0U;
-    ApplicationSchema<mmltk::controller::ApplicationSystems>::template VisitCatalogRows<Provider>(
-     [&]<class ActualProvider, class ActualRow>(const ApplicationCatalogRowFact& fact, const ActualRow& row) {
-      STATIC_REQUIRE(std::same_as<ActualProvider, Provider>);
-      STATIC_REQUIRE(std::same_as<ActualRow, Row>);
-      REQUIRE(row_index < expected_keys.size());
-      CHECK(row.key == expected_keys[row_index]);
-      CHECK(fact.key == expected_keys[row_index]);
-      CHECK_FALSE(row.artifact_field_path.empty());
-      CHECK_FALSE(row.dialog_title.empty());
-      CHECK_FALSE(row.dialog_filter.empty());
-      CHECK_FALSE(row.dialog_pattern.empty());
-      CHECK(fact.index == row_index);
-      CHECK(fact.stable_id == application_stable_id(provider.identity, fact.key));
-      ++row_index;
-     });
-    CHECK(row_index == expected_keys.size());
-   }
-  });
+ ApplicationSchema<mmltk::controller::ApplicationSystems>::VisitCatalogProviders([&]<class Provider, class Row>(const ApplicationCatalogProviderFact& provider) {
+  if constexpr (std::same_as<Provider, contracts::ModelSelectionCompatibilityCatalog>) {
+   STATIC_REQUIRE(std::same_as<Row, contracts::ModelSelectionCompatibility>);
+   ++provider_count;
+   CHECK(provider.identity == contracts::ModelSelectionCompatibilityCatalog::identity);
+   CHECK(provider.row_type == mmltk::frameworks::reflection::type_name<contracts::ModelSelectionCompatibility>());
+   CHECK(provider.stable_id == application_stable_id(contracts::ModelSelectionCompatibilityCatalog::identity));
+   std::size_t row_index = 0U;
+   ApplicationSchema<mmltk::controller::ApplicationSystems>::template VisitCatalogRows<Provider>(
+    [&]<class ActualProvider, class ActualRow>(const ApplicationCatalogRowFact& fact, const ActualRow& row) {
+     STATIC_REQUIRE(std::same_as<ActualProvider, Provider>);
+     STATIC_REQUIRE(std::same_as<ActualRow, Row>);
+     REQUIRE(row_index < expected_keys.size());
+     CHECK(row.key == expected_keys[row_index]);
+     CHECK(fact.key == expected_keys[row_index]);
+     CHECK_FALSE(row.artifact_field_path.empty());
+     CHECK_FALSE(row.dialog_title.empty());
+     CHECK_FALSE(row.dialog_filter.empty());
+     CHECK_FALSE(row.dialog_pattern.empty());
+     CHECK(fact.index == row_index);
+     CHECK(fact.stable_id == application_stable_id(provider.identity, fact.key));
+     ++row_index;
+    });
+   CHECK(row_index == expected_keys.size());
+  }
+ });
  CHECK(provider_count == 1U);
  for (std::uint8_t workflow_index = 0U; workflow_index <= static_cast<std::uint8_t>(contracts::FeatureId::Explore); ++workflow_index) {
   const auto workflow = static_cast<contracts::FeatureId>(workflow_index);
   CHECK(contracts::ModelSelectionRequest{.workflow = workflow}.valid() == contracts::model_selection_workflow_supported(workflow));
   for (const auto source : {contracts::ModelSelectionSource::Canonical, contracts::ModelSelectionSource::Custom}) {
-   for (const auto input : {contracts::ModelArtifactInputKind::Weights, contracts::ModelArtifactInputKind::Onnx, contracts::ModelArtifactInputKind::TensorRt,
-                            contracts::ModelArtifactInputKind::None}) {
+   for (const auto input :
+    {contracts::ModelArtifactInputKind::Weights, contracts::ModelArtifactInputKind::Onnx, contracts::ModelArtifactInputKind::TensorRt, contracts::ModelArtifactInputKind::None}) {
     const contracts::ModelSelectionKey key{.workflow = workflow, .source = source, .input = input, .preset = "rf-detr-nano", .resolution = 1U};
     CHECK(key.valid() == contracts::model_selection_compatible(workflow, source, input));
    }
@@ -1337,16 +1305,14 @@ TEST_CASE("Workspace graphics projection derives every native field offset witho
  std::ostringstream output;
  mmltk::controller::browser::ApplicationWorkspaceAbiEmitter(output).Emit();
  const auto generated = output.str();
- CHECK(generated.find("pub const ABI_VERSION: u32 = " + std::to_string(mmltk::controller::presentation::detail::workspace_surface_import::kAbiVersion) + ";") !=
-       std::string::npos);
+ CHECK(generated.find("pub const ABI_VERSION: u32 = " + std::to_string(mmltk::controller::presentation::detail::workspace_surface_import::kAbiVersion) + ";") != std::string::npos);
  CHECK(generated.find("pub const OPCODE_ALLOCATE: u32 = 1;") != std::string::npos);
  CHECK(generated.find("pub const ALLOCATE_DESCRIPTOR_COUNT: usize = 3;") != std::string::npos);
  CHECK(generated.find("pub const READY_MEMORY_DESCRIPTOR: usize = 0;") != std::string::npos);
  CHECK(generated.find("pub const READY_TIMELINE_DESCRIPTOR: usize = 1;") != std::string::npos);
  CHECK(generated.find("pub opcode: u32") != std::string::npos);
  CHECK(generated.find("pub const OPCODE_RELEASE_SUBMITTED: u32 = " +
-                      std::to_string(static_cast<std::uint32_t>(mmltk::controller::presentation::detail::workspace_surface_import::Opcode::ReleaseSubmitted)) +
-                      ";") != std::string::npos);
+                      std::to_string(static_cast<std::uint32_t>(mmltk::controller::presentation::detail::workspace_surface_import::Opcode::ReleaseSubmitted)) + ";") != std::string::npos);
  CHECK(generated.find("pub sequence_lock: u64") != std::string::npos);
  CHECK(generated.find("pub metadata_bytes: u32") != std::string::npos);
  CHECK(generated.find("WORKSPACE_FRAME_MAPPING_BYTES") != std::string::npos);
@@ -1393,8 +1359,7 @@ TEST_CASE("Maximum Annotation logical and distinct Upscale facts retain the exis
  displayed.objects.front().shape = c::AnnotationShape::Mask;
  auto value = browser::application_materializer_detail::reflected_value(snapshot);
  REQUIRE(value.has_value());
- browser::wire::CountingEncoder measure{
-  {.max_bytes = browser::kMaxRecordWireBytes, .max_items = browser::kMaxRecordWireBytes, .max_depth = browser::kMaxIntentValueDepth}};
+ browser::wire::CountingEncoder measure{{.max_bytes = browser::kMaxRecordWireBytes, .max_items = browser::kMaxRecordWireBytes, .max_depth = browser::kMaxIntentValueDepth}};
  const auto snapshot_size = measure.measure(*value);
  REQUIRE(snapshot_size.has_value());
  INFO("Complete Annotation snapshot bytes: " << *snapshot_size);
@@ -1404,12 +1369,10 @@ TEST_CASE("Maximum Annotation logical and distinct Upscale facts retain the exis
  REQUIRE(logical_size.has_value());
  INFO("Editable Annotation state bytes: " << *logical_size);
  browser::wire::ByteBuffer encoded;
- REQUIRE(browser::wire::encode(
-  *value, encoded, {.max_bytes = browser::kMaxOutputValueBytes, .max_items = browser::kMaxOutputValueItems, .max_depth = browser::kMaxIntentValueDepth}));
+ REQUIRE(browser::wire::encode(*value, encoded, {.max_bytes = browser::kMaxOutputValueBytes, .max_items = browser::kMaxOutputValueItems, .max_depth = browser::kMaxIntentValueDepth}));
  CHECK(encoded.size() <= c::kAnnotationUiStateByteBudget);
  {
-  const auto failed = browser::encode_system_event<&ApplicationSystems::annotation>(
-   AnnotationFailed{.snapshot = snapshot, .detail = std::string(kVisualFailureByteCapacity, 'e')});
+  const auto failed = browser::encode_system_event<&ApplicationSystems::annotation>(AnnotationFailed{.snapshot = snapshot, .detail = std::string(kVisualFailureByteCapacity, 'e')});
   REQUIRE(browser::encode_server_record(browser::ServerRecord{failed}, encoded));
   const browser::IntentReply reply{.correlation = 1U, .result = browser::application_materializer_detail::encode_result(snapshot)};
   REQUIRE(browser::encode_server_record(browser::ServerRecord{reply}, encoded));
@@ -1438,8 +1401,7 @@ TEST_CASE("Maximum Annotation logical and distinct Upscale facts retain the exis
 TEST_CASE("Predict scalar progress excludes full retained labels and keeps native observation", "[browser][predict][reflection]") {
  using namespace mmltk::controller;
  namespace reflection = mmltk::frameworks::reflection;
- constexpr auto snapshot_budget =
-  browser::application_schema_detail::annotation_value<^^PredictSystem::snapshot, contracts::reflection::Snapshot>().byte_budget;
+ constexpr auto snapshot_budget = browser::application_schema_detail::annotation_value<^^PredictSystem::snapshot, contracts::reflection::Snapshot>().byte_budget;
  STATIC_REQUIRE(mmltk::frameworks::serialization::reflected_maximum_cbor_bytes<PredictSnapshot>() <= snapshot_budget);
  PredictSnapshot snapshot;
  CHECK_FALSE(PredictSystem::visual_source::Observe(snapshot).valid());
@@ -1455,8 +1417,7 @@ TEST_CASE("Predict scalar progress excludes full retained labels and keeps nativ
  for (auto& label : snapshot.labels) label.name.assign(256U, 'c');
  const auto full = browser::application_materializer_detail::reflected_value(snapshot);
  REQUIRE(full);
- browser::wire::CountingEncoder full_measure{
-  {.max_bytes = snapshot_budget, .max_items = browser::kMaxOutputValueItems, .max_depth = browser::kMaxIntentValueDepth}};
+ browser::wire::CountingEncoder full_measure{{.max_bytes = snapshot_budget, .max_items = browser::kMaxOutputValueItems, .max_depth = browser::kMaxIntentValueDepth}};
  REQUIRE(full_measure.measure(*full));
  const auto* retained_labels = snapshot.labels.data();
  const auto progress = reflection::project_record<PredictProgressState>(snapshot);

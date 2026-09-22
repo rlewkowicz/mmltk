@@ -34,8 +34,7 @@ struct EncodedMask {
  std::vector<std::pair<uint32_t, uint32_t>> runs;
 };
 template <typename ValueAt>
-void encode_mask_values_into(const uint32_t height, const uint32_t width, EncodedMask& mask, ValueAt&& value_at,
-                             std::size_t maximum_runs = kMaximumPredictionMaskRuns) {
+void encode_mask_values_into(const uint32_t height, const uint32_t width, EncodedMask& mask, ValueAt&& value_at, std::size_t maximum_runs = kMaximumPredictionMaskRuns) {
  mask.height = height;
  mask.width = width;
  mask.area = 0;

@@ -10,8 +10,7 @@ struct ImageContainRect final {
  std::uint32_t x = 0U, y = 0U, width = 0U, height = 0U;
  bool operator==(const ImageContainRect&) const noexcept = default;
 };
-[[nodiscard]] inline ImageContainRect contain_image(std::uint32_t source_width, std::uint32_t source_height, std::uint32_t cell_width,
-                                                    std::uint32_t cell_height) noexcept {
+[[nodiscard]] inline ImageContainRect contain_image(std::uint32_t source_width, std::uint32_t source_height, std::uint32_t cell_width, std::uint32_t cell_height) noexcept {
  if (!source_width || !source_height || !cell_width || !cell_height) return {};
  auto width = cell_width;
  auto height = cell_height;

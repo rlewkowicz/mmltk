@@ -39,12 +39,10 @@ FileHeader make_file_header(const FileHeaderInputs& inputs, const std::span<cons
  header.total_file_size = layout.total_size;
  header.image_stride = inputs.image_stride;
  if (class_names.empty() || class_names.size() > MAX_CLASSES) throw std::runtime_error("invalid compiled class count");
- if (inputs.max_instances_per_image > std::numeric_limits<std::uint16_t>::max())
-  throw std::runtime_error("compiled maximum instance count exceeds the index representation");
+ if (inputs.max_instances_per_image > std::numeric_limits<std::uint16_t>::max()) throw std::runtime_error("compiled maximum instance count exceeds the index representation");
  for (std::size_t id = 0; id < class_names.size(); ++id) {
   const auto& name = class_names[id];
-  if (name.empty() || name.size() > COMPILED_CLASS_NAME_CAPACITY || name.find('\0') != std::string::npos)
-   throw std::runtime_error("invalid compiled class name or index");
+  if (name.empty() || name.size() > COMPILED_CLASS_NAME_CAPACITY || name.find('\0') != std::string::npos) throw std::runtime_error("invalid compiled class name or index");
   std::memcpy(header.class_names[id].data(), name.data(), name.size());
  }
  return header;

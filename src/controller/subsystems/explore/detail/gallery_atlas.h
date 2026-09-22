@@ -13,8 +13,7 @@ namespace mmltk::controller::explore_detail {
 // Each directory describes its own allocation, never the selected baseline.
 class GalleryAtlas final {
 public:
- [[nodiscard]] ExploreAtlasLayout Begin(mmltk::frameworks::gpu::ImagePlaneView clean, mmltk::frameworks::gpu::ImagePlaneView semantic, const ExploreViewport&,
-                                        const GalleryThumbnailCache::Identity&);
+ [[nodiscard]] ExploreAtlasLayout Begin(mmltk::frameworks::gpu::ImagePlaneView clean, mmltk::frameworks::gpu::ImagePlaneView semantic, const ExploreViewport&, const GalleryThumbnailCache::Identity&);
  [[nodiscard]] std::size_t Physical(std::size_t logical) const noexcept;
  [[nodiscard]] bool Contains(std::size_t physical, const std::shared_ptr<const GalleryTileMeaning>&, std::uint64_t semantic_identity) const;
  [[nodiscard]] bool ContainsClean(std::size_t physical, const std::shared_ptr<const GalleryTileMeaning>&) const;

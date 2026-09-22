@@ -22,8 +22,7 @@ void require_transport(bool h2d, int device) {
  if (h2d) return;
  int mmap = 0;
  const auto status = cuDeviceGetAttribute(&mmap, static_cast<CUdevice_attribute>(152), device);
- if (!(status == CUDA_SUCCESS && mmap) && ::access("/dev/gdrdrv", R_OK | W_OK) != 0)
-  SKIP("GDR backend unavailable; assignment transfer and autograd hardware behavior remain unverified");
+ if (!(status == CUDA_SUCCESS && mmap) && ::access("/dev/gdrdrv", R_OK | W_OK) != 0) SKIP("GDR backend unavailable; assignment transfer and autograd hardware behavior remain unverified");
 }
 struct MatcherDeviceScope final {
  explicit MatcherDeviceScope(const int device) : MatcherDeviceScope(device, false, true) {}

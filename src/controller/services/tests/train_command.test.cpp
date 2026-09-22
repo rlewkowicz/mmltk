@@ -38,9 +38,7 @@ void assert_flag_with_value(const std::vector<std::string>& args, const std::str
  REQUIRE((found + 1 != args.end()));
  REQUIRE((*(found + 1) == value));
 }
-void assert_flag_present(const std::vector<std::string>& args, const std::string_view flag) {
- REQUIRE((std::find(args.begin(), args.end(), flag) != args.end()));
-}
+void assert_flag_present(const std::vector<std::string>& args, const std::string_view flag) { REQUIRE((std::find(args.begin(), args.end(), flag) != args.end())); }
 void assert_float_flag_round_trip(const std::vector<std::string>& args, const std::string_view flag, const float expected) {
  const auto found = std::find(args.begin(), args.end(), flag);
  REQUIRE(found != args.end());
@@ -52,9 +50,7 @@ void assert_float_flag_round_trip(const std::vector<std::string>& args, const st
  REQUIRE(result.ptr == text.data() + text.size());
  CHECK(parsed == expected);
 }
-void assert_flag_absent(const std::vector<std::string>& args, const std::string_view flag) {
- REQUIRE((std::find(args.begin(), args.end(), flag) == args.end()));
-}
+void assert_flag_absent(const std::vector<std::string>& args, const std::string_view flag) { REQUIRE((std::find(args.begin(), args.end(), flag) == args.end())); }
 void test_single_device_builds_device_id() {
  const std::vector<std::string> args = build_train_command_arguments(make_train_request({2}));
  assert_flag_with_value(args, "--device-id", "2");
@@ -159,8 +155,8 @@ void test_resume_input_is_serialized_without_weights() {
 void test_supervision_combinations_are_forwarded_with_exact_values() {
  using mmltk::backend::models::rfdetr::TrainAssignmentKind;
  for (const auto& [assignment, denoising, expected_assignment, expected_dn] :
-      {std::tuple{TrainAssignmentKind::Hungarian, false, "hungarian", "--no-dn"}, std::tuple{TrainAssignmentKind::Hungarian, true, "hungarian", "--dn"},
-       std::tuple{TrainAssignmentKind::MatchFree, false, "match-free", "--no-dn"}, std::tuple{TrainAssignmentKind::MatchFree, true, "match-free", "--dn"}}) {
+  {std::tuple{TrainAssignmentKind::Hungarian, false, "hungarian", "--no-dn"}, std::tuple{TrainAssignmentKind::Hungarian, true, "hungarian", "--dn"},
+   std::tuple{TrainAssignmentKind::MatchFree, false, "match-free", "--no-dn"}, std::tuple{TrainAssignmentKind::MatchFree, true, "match-free", "--dn"}}) {
   auto request = make_train_request({1});
   request.training_supervision.assignment = assignment;
   request.training_supervision.match_free = {
@@ -219,8 +215,7 @@ void test_recipe_application_respects_overrides() {
  options.lr = 9.0e-4;
  mmltk::backend::models::rfdetr::TrainRecipeOverrideState overrides;
  TrainRecipeRelation::template set_override<mmltk::frameworks::reflection::member_path<&mmltk::backend::models::rfdetr::TrainRequest::lr>>(overrides);
- mmltk::backend::models::rfdetr::apply_train_recipe(
-  options, mmltk::backend::models::rfdetr::train_recipe(mmltk::backend::models::rfdetr::TrainOptimizerKind::Muon), overrides);
+ mmltk::backend::models::rfdetr::apply_train_recipe(options, mmltk::backend::models::rfdetr::train_recipe(mmltk::backend::models::rfdetr::TrainOptimizerKind::Muon), overrides);
  REQUIRE((train_recipe_value_matches(options.lr, 9.0e-4)));
  REQUIRE((train_recipe_value_matches(options.lr_encoder, 3.0e-4)));
  REQUIRE((options.lr_scheduler == mmltk::backend::models::rfdetr::TrainLrSchedulerKind::Cosine));
@@ -231,24 +226,18 @@ TEST_CASE("test_single_device_builds_device_id", "[gui][train_command]") { test_
 TEST_CASE("test_multi_device_builds_device_ids", "[gui][train_command]") { test_multi_device_builds_device_ids(); }
 TEST_CASE("test_zero_device_rejected", "[gui][train_command]") { test_zero_device_rejected(); }
 TEST_CASE("test_optimizer_arguments_are_forwarded", "[gui][train_command]") { test_optimizer_arguments_are_forwarded(); }
-TEST_CASE("test_scheduler_spelling_is_stable_for_cli_and_checkpoint_metadata", "[gui][train_command]") {
- test_scheduler_spelling_is_stable_for_cli_and_checkpoint_metadata();
-}
+TEST_CASE("test_scheduler_spelling_is_stable_for_cli_and_checkpoint_metadata", "[gui][train_command]") { test_scheduler_spelling_is_stable_for_cli_and_checkpoint_metadata(); }
 TEST_CASE("test_recipe_defaults_are_not_serialized_as_overrides", "[gui][train_command]") { test_recipe_defaults_are_not_serialized_as_overrides(); }
 TEST_CASE("test_progress_flag_enabled_is_forwarded", "[gui][train_command]") { test_progress_flag_enabled_is_forwarded(); }
 TEST_CASE("test_progress_flag_disabled_is_forwarded", "[gui][train_command]") { test_progress_flag_disabled_is_forwarded(); }
 TEST_CASE("test_resume_input_is_serialized_without_weights", "[gui][train_command]") { test_resume_input_is_serialized_without_weights(); }
-TEST_CASE("test_supervision_combinations_are_forwarded_with_exact_values", "[gui][train_command][training_supervision]") {
- test_supervision_combinations_are_forwarded_with_exact_values();
-}
+TEST_CASE("test_supervision_combinations_are_forwarded_with_exact_values", "[gui][train_command][training_supervision]") { test_supervision_combinations_are_forwarded_with_exact_values(); }
 TEST_CASE("test_supervision_float_arguments_round_trip_at_representable_boundaries", "[gui][train_command][training_supervision]") {
  test_supervision_float_arguments_round_trip_at_representable_boundaries();
 }
 TEST_CASE("test_muon_recipe_defaults_are_resolved", "[gui][train_command]") { test_muon_recipe_defaults_are_resolved(); }
 TEST_CASE("test_recipe_application_respects_overrides", "[gui][train_command]") { test_recipe_application_respects_overrides(); }
-TEST_CASE("test_perceptual_selection_is_independent_in_child_arguments", "[gui][train_command][perceptual]") {
- test_perceptual_selection_is_independent_in_child_arguments();
-}
+TEST_CASE("test_perceptual_selection_is_independent_in_child_arguments", "[gui][train_command][perceptual]") { test_perceptual_selection_is_independent_in_child_arguments(); }
 TEST_CASE("training command forwards only an explicitly selected test dataset", "[gui][train]") {
  auto request = make_train_request({0});
  assert_flag_absent(build_train_command_arguments(request), "--test-compiled");

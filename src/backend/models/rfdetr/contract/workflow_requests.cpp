@@ -29,12 +29,9 @@ void validate_export_onnx_request(const ExportOnnxRequest& request) {
 }
 void validate_predict_request(const PredictRequest& request) {
  require_valid_fields(request, "invalid RF-DETR predict fields");
- const bool compiled_source =
-  request.source_kind == PredictSourceKind::CompiledDataset && !request.compiled_path.empty() && request.image_inputs.empty() && request.video_path.empty();
- const bool image_source =
-  request.source_kind == PredictSourceKind::ImageFiles && request.compiled_path.empty() && !request.image_inputs.empty() && request.video_path.empty();
- const bool video_source =
-  request.source_kind == PredictSourceKind::VideoFile && !request.video_path.empty() && request.compiled_path.empty() && request.image_inputs.empty();
+ const bool compiled_source = request.source_kind == PredictSourceKind::CompiledDataset && !request.compiled_path.empty() && request.image_inputs.empty() && request.video_path.empty();
+ const bool image_source = request.source_kind == PredictSourceKind::ImageFiles && request.compiled_path.empty() && !request.image_inputs.empty() && request.video_path.empty();
+ const bool video_source = request.source_kind == PredictSourceKind::VideoFile && !request.video_path.empty() && request.compiled_path.empty() && request.image_inputs.empty();
  if ((!compiled_source && !image_source && !video_source) || request.output_path.empty() || request.selected_input_count() != 1U) {
   throw std::runtime_error("rfdetr predict requires exactly one source (compiled dataset, images, or video), an output path, and one model artifact");
  }
@@ -58,16 +55,13 @@ void validate_train_request(const TrainRequest& request) {
  }
  if (request.training_supervision.assignment == TrainAssignmentKind::MatchFree) {
   const PresetCatalogEntry* preset = find_preset_catalog_entry(request.preset_name);
-  if (preset != nullptr && preset->task == ModelTask::Segmentation) {
-   throw std::runtime_error("RF-DETR Match-Free supervision does not support segmentation");
-  }
+  if (preset != nullptr && preset->task == ModelTask::Segmentation) { throw std::runtime_error("RF-DETR Match-Free supervision does not support segmentation"); }
  }
  if (const PresetCatalogEntry* preset = find_preset_catalog_entry(request.preset_name)) {
   NativeRfDetrConfig model_config = native_config_from_preset(*preset);
   model_config.training_supervision = request.training_supervision;
   if (training_supervision_enabled(request.training_supervision) && request.num_queries != 0U) {
-   if (request.num_queries > static_cast<std::size_t>(std::numeric_limits<int>::max()))
-    throw std::runtime_error("RF-DETR supervision query layout exceeds the native model limit");
+   if (request.num_queries > static_cast<std::size_t>(std::numeric_limits<int>::max())) throw std::runtime_error("RF-DETR supervision query layout exceeds the native model limit");
    model_config.num_queries = static_cast<int>(request.num_queries);
   }
   if (!training_supervision_model_config_valid(model_config)) throw std::runtime_error("RF-DETR training supervision is incompatible with the selected model");
@@ -76,11 +70,9 @@ void validate_train_request(const TrainRequest& request) {
   throw std::runtime_error("RF-DETR train requires --train-compiled, --val-compiled, and --output-dir");
  }
  const std::size_t input_count = static_cast<std::size_t>(!request.weights_path.empty()) + static_cast<std::size_t>(!request.resume_path.empty());
- const bool distributed = request.distributed_worker
-                           ? request.distributed_rank >= 0 && request.distributed_world_size > 1 && !request.distributed_store_path.empty()
-                           : request.distributed_rank == 0 && request.distributed_world_size == 1 && request.distributed_store_path.empty();
- if (input_count != 1U || !gpu_augmentation_config_valid(request.gpu_augmentation) ||
-     !mmltk::frameworks::reflection::unique_nonnegative_identifiers(request.device_ids) ||
+ const bool distributed = request.distributed_worker ? request.distributed_rank >= 0 && request.distributed_world_size > 1 && !request.distributed_store_path.empty()
+                                                     : request.distributed_rank == 0 && request.distributed_world_size == 1 && request.distributed_store_path.empty();
+ if (input_count != 1U || !gpu_augmentation_config_valid(request.gpu_augmentation) || !mmltk::frameworks::reflection::unique_nonnegative_identifiers(request.device_ids) ||
      !mmltk::frameworks::reflection::enum_contains(request.lr_scheduler) || !distributed) {
   throw std::runtime_error("rfdetr train requires train/validation data, output, and one checkpoint input");
  }

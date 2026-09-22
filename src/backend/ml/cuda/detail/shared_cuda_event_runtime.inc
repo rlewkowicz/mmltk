@@ -368,8 +368,7 @@ public:
   std::shared_ptr<State> state_;
   State::Ticket ticket_{};
  };
- CudaEventPoolOwner(const mmltk::frameworks::gpu::CudaDeviceOwner owner, const std::size_t capacity,
-                    mmltk::frameworks::gpu::TerminalCudaRetirementAuthority& retirement_authority)
+ CudaEventPoolOwner(const mmltk::frameworks::gpu::CudaDeviceOwner owner, const std::size_t capacity, mmltk::frameworks::gpu::TerminalCudaRetirementAuthority& retirement_authority)
      : state_(create_state(owner, capacity, retirement_authority)), capacity_(capacity) {}
  ~CudaEventPoolOwner() noexcept { state_->close(false); }
  CudaEventPoolOwner(const CudaEventPoolOwner&) = delete;
@@ -384,8 +383,8 @@ public:
  [[nodiscard]] std::size_t capacity() const noexcept { return capacity_; }
 
 private:
- [[nodiscard]] static std::shared_ptr<State> create_state(const mmltk::frameworks::gpu::CudaDeviceOwner owner, const std::size_t capacity,
-                                                          mmltk::frameworks::gpu::TerminalCudaRetirementAuthority& retirement_authority) {
+ [[nodiscard]] static std::shared_ptr<State> create_state(
+  const mmltk::frameworks::gpu::CudaDeviceOwner owner, const std::size_t capacity, mmltk::frameworks::gpu::TerminalCudaRetirementAuthority& retirement_authority) {
   auto terminal_lease = mmltk::frameworks::gpu::ReserveTerminalCudaLease(retirement_authority);
   auto state = std::make_shared<State>(owner, capacity, std::move(terminal_lease));
   state->initialize();

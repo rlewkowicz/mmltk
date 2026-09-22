@@ -78,10 +78,8 @@ struct ChildSetupTarget final {
  void (*invoke)(void*, int, int) = nullptr;
 };
 [[nodiscard]] CapturedChildProcess spawn_captured_child_process_erased(std::string_view process_name, ChildSetupTarget child_setup, bool nonblocking_output);
-[[nodiscard]] CapturedChildProcessResult run_captured_child_process_erased(std::string_view process_name, std::string_view output_error_prefix,
-                                                                           ChildSetupTarget child_setup, ChildCancellationTarget cancellation,
-                                                                           std::chrono::milliseconds timeout, int cancel_fd, bool kill_process_group,
-                                                                           std::size_t output_limit);
+[[nodiscard]] CapturedChildProcessResult run_captured_child_process_erased(std::string_view process_name, std::string_view output_error_prefix, ChildSetupTarget child_setup,
+ ChildCancellationTarget cancellation, std::chrono::milliseconds timeout, int cancel_fd, bool kill_process_group, std::size_t output_limit);
 [[noreturn]] void fail_child_setup(int setup_fd, ChildSetupStage stage) noexcept;
 void require_child_setup_step(bool succeeded, int setup_fd, ChildSetupStage stage) noexcept;
 void prepare_captured_output_child(int output_fd, int setup_fd) noexcept;
@@ -111,9 +109,8 @@ CapturedChildProcess spawn_captured_child_process(const std::string_view process
 }
 template <typename ChildSetupFn>
 CapturedChildProcessResult run_captured_child_process(const std::string_view process_name, const std::string_view output_error_prefix, ChildSetupFn&& setup,
-                                                      const ChildCancellationTarget cancellation = {},
-                                                      const std::chrono::milliseconds timeout = std::chrono::milliseconds{0}, const int cancel_fd = -1,
-                                                      const bool kill_process_group = false, const std::size_t output_limit = kCapturedChildReadBudget) {
+ const ChildCancellationTarget cancellation = {}, const std::chrono::milliseconds timeout = std::chrono::milliseconds{0}, const int cancel_fd = -1, const bool kill_process_group = false,
+ const std::size_t output_limit = kCapturedChildReadBudget) {
  using Setup = std::remove_reference_t<ChildSetupFn>;
  ChildSetupTarget target{std::addressof(setup), [](void* context, int output, int errors) { std::invoke(*static_cast<Setup*>(context), output, errors); }};
  return run_captured_child_process_erased(process_name, output_error_prefix, target, cancellation, timeout, cancel_fd, kill_process_group, output_limit);

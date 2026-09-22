@@ -16,8 +16,7 @@ torch::Tensor corner_span_area(const torch::Tensor& lower, const torch::Tensor& 
  return extent.select(-1, 0) * extent.select(-1, 1);
 }
 torch::Tensor box_area(const torch::Tensor& boxes) { return corner_span_area(boxes.slice(-1, 0, 2), boxes.slice(-1, 2, 4)); }
-torch::Tensor span_area(const torch::Tensor& lhs_lower, const torch::Tensor& rhs_lower, const torch::Tensor& lhs_upper, const torch::Tensor& rhs_upper,
-                        const BoxSpan span) {
+torch::Tensor span_area(const torch::Tensor& lhs_lower, const torch::Tensor& rhs_lower, const torch::Tensor& lhs_upper, const torch::Tensor& rhs_upper, const BoxSpan span) {
  const auto lower = span == BoxSpan::Intersection ? torch::maximum(lhs_lower, rhs_lower) : torch::minimum(lhs_lower, rhs_lower);
  const auto upper = span == BoxSpan::Intersection ? torch::minimum(lhs_upper, rhs_upper) : torch::maximum(lhs_upper, rhs_upper);
  return corner_span_area(lower, upper);
@@ -66,8 +65,8 @@ torch::Tensor pairwise_generalized_box_iou(const torch::Tensor& boxes1, const to
   return mmltk::backend::ml::ops::generalized_box_iou_cuda(boxes1, boxes2);
  }
  const auto [iou, union_area] = generic_pairwise_iou(boxes1, boxes2);
- const auto enclosure = span_area(boxes1.slice(-1, 0, 2).unsqueeze(-2), boxes2.slice(-1, 0, 2).unsqueeze(-3), boxes1.slice(-1, 2, 4).unsqueeze(-2),
-                                  boxes2.slice(-1, 2, 4).unsqueeze(-3), BoxSpan::Enclosure);
+ const auto enclosure =
+  span_area(boxes1.slice(-1, 0, 2).unsqueeze(-2), boxes2.slice(-1, 0, 2).unsqueeze(-3), boxes1.slice(-1, 2, 4).unsqueeze(-2), boxes2.slice(-1, 2, 4).unsqueeze(-3), BoxSpan::Enclosure);
  return iou - (enclosure - union_area) / enclosure;
 }
 torch::Tensor aligned_box_iou(const torch::Tensor& boxes1, const torch::Tensor& boxes2) {

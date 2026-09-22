@@ -51,20 +51,26 @@ MMLTK_REFLECT_FIELDS(ModelArtifactDialog)
  }
  return {};
 }
-[[nodiscard]] constexpr ModelSelectionCompatibility custom_model_compatibility(const std::string_view key, const FeatureId workflow,
-                                                                               const ModelArtifactInputKind input, const bool canonical_allowed,
-                                                                               const std::optional<bool> required_export_build_tensorrt,
-                                                                               const std::string_view artifact_field_path) noexcept {
+[[nodiscard]] constexpr ModelSelectionCompatibility custom_model_compatibility(const std::string_view key, const FeatureId workflow, const ModelArtifactInputKind input, const bool canonical_allowed,
+ const std::optional<bool> required_export_build_tensorrt, const std::string_view artifact_field_path) noexcept {
  const auto dialog = model_artifact_dialog(input);
  return {
-  key, workflow, input, canonical_allowed, true, required_export_build_tensorrt, artifact_field_path, dialog.title, dialog.filter, dialog.pattern,
+  key,
+  workflow,
+  input,
+  canonical_allowed,
+  true,
+  required_export_build_tensorrt,
+  artifact_field_path,
+  dialog.title,
+  dialog.filter,
+  dialog.pattern,
  };
 }
 struct ModelSelectionTextTransform final {
  template <class Source, class Destination>
  [[nodiscard]] static consteval bool accepts() {
-  return (std::same_as<std::remove_cvref_t<Source>, std::filesystem::path> || std::same_as<std::remove_cvref_t<Source>, std::string>) &&
-         std::same_as<std::remove_cvref_t<Destination>, std::string>;
+  return (std::same_as<std::remove_cvref_t<Source>, std::filesystem::path> || std::same_as<std::remove_cvref_t<Source>, std::string>) && std::same_as<std::remove_cvref_t<Destination>, std::string>;
  }
  template <class Destination, class Source>
  static void apply(Destination& destination, const Source& source) {
@@ -104,14 +110,13 @@ struct ModelSelectionRelationRow {
   mmltk::frameworks::reflection::visit_materialized_members<ModelSelectionKey>([&]<class>(const auto&) { ++count; });
   return count;
  }();
- using key_relation = mmltk::frameworks::reflection::StaticMemberRelation<
-  GuiSettingsState, ModelSelectionKey, key_field_count - 1U, MemberRelationEntry<Source, member_path<&ModelSelectionKey::source>>,
-  MemberRelationEntry<Input, member_path<&ModelSelectionKey::input>>,
-  MemberRelationEntry<Preset, member_path<&ModelSelectionKey::preset>, ModelSelectionTextTransform>,
-  MemberRelationEntry<Resolution, member_path<&ModelSelectionKey::resolution>, ModelSelectionResolutionTransform>,
-  MemberRelationEntry<Layout, member_path<&ModelSelectionKey::class_layout_path>, ModelSelectionTextTransform>>;
- using artifact_relation = mmltk::frameworks::reflection::StaticMemberRelation<
-  GuiSettingsState, ModelSettingsProjection, 1U, MemberRelationEntry<Artifact, member_path<&ModelSettingsProjection::artifact>, ModelSelectionTextTransform>>;
+ using key_relation =
+  mmltk::frameworks::reflection::StaticMemberRelation<GuiSettingsState, ModelSelectionKey, key_field_count - 1U, MemberRelationEntry<Source, member_path<&ModelSelectionKey::source>>,
+   MemberRelationEntry<Input, member_path<&ModelSelectionKey::input>>, MemberRelationEntry<Preset, member_path<&ModelSelectionKey::preset>, ModelSelectionTextTransform>,
+   MemberRelationEntry<Resolution, member_path<&ModelSelectionKey::resolution>, ModelSelectionResolutionTransform>,
+   MemberRelationEntry<Layout, member_path<&ModelSelectionKey::class_layout_path>, ModelSelectionTextTransform>>;
+ using artifact_relation = mmltk::frameworks::reflection::StaticMemberRelation<GuiSettingsState, ModelSettingsProjection, 1U,
+  MemberRelationEntry<Artifact, member_path<&ModelSettingsProjection::artifact>, ModelSelectionTextTransform>>;
  inline static constexpr auto artifact_field_path = mmltk::frameworks::reflection::reflected_member_path<GuiSettingsState, Artifact>();
  [[nodiscard]] static consteval bool valid() {
   using namespace mmltk::frameworks::reflection;
@@ -139,52 +144,37 @@ struct ModelSelectionRelationRow {
 using mmltk::frameworks::reflection::reflected_member_path;
 struct TrainWeightsModelSelection final
     : ModelSelectionRelationRow<FeatureId::Train, member_path<&GuiSettingsState::workflows, &WorkflowSettingsState::train, &TrainViewState::model_source>,
-                                member_path<&GuiSettingsState::workflows, &WorkflowSettingsState::train, &TrainViewState::model_input>,
-                                member_path<&GuiSettingsState::workflows, &WorkflowSettingsState::train, &TrainViewState::request,
-                                            &mmltk::backend::models::rfdetr::TrainRequest::preset_name>,
-                                member_path<&GuiSettingsState::workflows, &WorkflowSettingsState::train, &TrainViewState::request,
-                                            &mmltk::backend::models::rfdetr::TrainRequest::resolution>,
-                                member_path<&GuiSettingsState::workflows, &WorkflowSettingsState::train, &TrainViewState::request,
-                                            &mmltk::backend::models::rfdetr::TrainRequest::weights_path>,
-                                member_path<&GuiSettingsState::workflows, &WorkflowSettingsState::train, &TrainViewState::request,
-                                            &mmltk::backend::models::rfdetr::TrainRequest::class_layout_path>> {
+       member_path<&GuiSettingsState::workflows, &WorkflowSettingsState::train, &TrainViewState::model_input>,
+       member_path<&GuiSettingsState::workflows, &WorkflowSettingsState::train, &TrainViewState::request, &mmltk::backend::models::rfdetr::TrainRequest::preset_name>,
+       member_path<&GuiSettingsState::workflows, &WorkflowSettingsState::train, &TrainViewState::request, &mmltk::backend::models::rfdetr::TrainRequest::resolution>,
+       member_path<&GuiSettingsState::workflows, &WorkflowSettingsState::train, &TrainViewState::request, &mmltk::backend::models::rfdetr::TrainRequest::weights_path>,
+       member_path<&GuiSettingsState::workflows, &WorkflowSettingsState::train, &TrainViewState::request, &mmltk::backend::models::rfdetr::TrainRequest::class_layout_path>> {
  inline static constexpr ModelArtifactInputKind input_kind = ModelArtifactInputKind::Weights;
- inline static constexpr ModelSelectionCompatibility compatibility =
-  custom_model_compatibility("train.weights", workflow, input_kind, true, std::nullopt, artifact_field_path.view());
+ inline static constexpr ModelSelectionCompatibility compatibility = custom_model_compatibility("train.weights", workflow, input_kind, true, std::nullopt, artifact_field_path.view());
 };
 template <auto Artifact, ModelArtifactInputKind Input>
 // CLEANUP-IGNORE: Each workflow row declares distinct reflected paths into its own request type.
 struct ValidateModelSelection
-    : ModelSelectionRelationRow<FeatureId::Validate,
-                                member_path<&GuiSettingsState::workflows, &WorkflowSettingsState::validate, &ValidateViewState::model_source>,
-                                member_path<&GuiSettingsState::workflows, &WorkflowSettingsState::validate, &ValidateViewState::model_input>,
-                                member_path<&GuiSettingsState::workflows, &WorkflowSettingsState::validate, &ValidateViewState::request,
-                                            &mmltk::backend::models::rfdetr::ValidateRequest::preset_name>,
-                                member_path<&GuiSettingsState::workflows, &WorkflowSettingsState::validate, &ValidateViewState::request,
-                                            &mmltk::backend::models::rfdetr::ValidateRequest::resolution>,
-                                Artifact,
-                                member_path<&GuiSettingsState::workflows, &WorkflowSettingsState::validate, &ValidateViewState::request,
-                                            &mmltk::backend::models::rfdetr::ValidateRequest::class_layout_path>> {
+    : ModelSelectionRelationRow<FeatureId::Validate, member_path<&GuiSettingsState::workflows, &WorkflowSettingsState::validate, &ValidateViewState::model_source>,
+       member_path<&GuiSettingsState::workflows, &WorkflowSettingsState::validate, &ValidateViewState::model_input>,
+       member_path<&GuiSettingsState::workflows, &WorkflowSettingsState::validate, &ValidateViewState::request, &mmltk::backend::models::rfdetr::ValidateRequest::preset_name>,
+       member_path<&GuiSettingsState::workflows, &WorkflowSettingsState::validate, &ValidateViewState::request, &mmltk::backend::models::rfdetr::ValidateRequest::resolution>, Artifact,
+       member_path<&GuiSettingsState::workflows, &WorkflowSettingsState::validate, &ValidateViewState::request, &mmltk::backend::models::rfdetr::ValidateRequest::class_layout_path>> {
  inline static constexpr ModelArtifactInputKind input_kind = Input;
 };
 struct ValidateWeightsModelSelection final
-    : ValidateModelSelection<member_path<&GuiSettingsState::workflows, &WorkflowSettingsState::validate, &ValidateViewState::request,
-                                         &mmltk::backend::models::rfdetr::ValidateRequest::weights_path>,
-                             ModelArtifactInputKind::Weights> {
- inline static constexpr ModelSelectionCompatibility compatibility =
-  custom_model_compatibility("validate.weights", workflow, input_kind, true, std::nullopt, artifact_field_path.view());
+    : ValidateModelSelection<member_path<&GuiSettingsState::workflows, &WorkflowSettingsState::validate, &ValidateViewState::request, &mmltk::backend::models::rfdetr::ValidateRequest::weights_path>,
+       ModelArtifactInputKind::Weights> {
+ inline static constexpr ModelSelectionCompatibility compatibility = custom_model_compatibility("validate.weights", workflow, input_kind, true, std::nullopt, artifact_field_path.view());
 };
 struct ValidateOnnxModelSelection final
-    : ValidateModelSelection<member_path<&GuiSettingsState::workflows, &WorkflowSettingsState::validate, &ValidateViewState::request,
-                                         &mmltk::backend::models::rfdetr::ValidateRequest::onnx_path>,
-                             ModelArtifactInputKind::Onnx> {
- inline static constexpr ModelSelectionCompatibility compatibility =
-  custom_model_compatibility("validate.onnx", workflow, input_kind, false, std::nullopt, artifact_field_path.view());
+    : ValidateModelSelection<member_path<&GuiSettingsState::workflows, &WorkflowSettingsState::validate, &ValidateViewState::request, &mmltk::backend::models::rfdetr::ValidateRequest::onnx_path>,
+       ModelArtifactInputKind::Onnx> {
+ inline static constexpr ModelSelectionCompatibility compatibility = custom_model_compatibility("validate.onnx", workflow, input_kind, false, std::nullopt, artifact_field_path.view());
 };
 struct ValidateTensorRtModelSelection final
-    : ValidateModelSelection<member_path<&GuiSettingsState::workflows, &WorkflowSettingsState::validate, &ValidateViewState::request,
-                                         &mmltk::backend::models::rfdetr::ValidateRequest::tensorrt_path>,
-                             ModelArtifactInputKind::TensorRt> {
+    : ValidateModelSelection<member_path<&GuiSettingsState::workflows, &WorkflowSettingsState::validate, &ValidateViewState::request, &mmltk::backend::models::rfdetr::ValidateRequest::tensorrt_path>,
+       ModelArtifactInputKind::TensorRt> {
  inline static constexpr ModelSelectionCompatibility compatibility =
   // CLEANUP-IGNORE: Compatibility rows retain distinct stable identities and artifact policies.
   custom_model_compatibility("validate.tensorrt", workflow, input_kind, false, std::nullopt, artifact_field_path.view());
@@ -193,62 +183,46 @@ template <auto Artifact, ModelArtifactInputKind Input>
 // CLEANUP-IGNORE: Each workflow row declares distinct reflected paths into its own request type.
 struct PredictModelSelection
     : ModelSelectionRelationRow<FeatureId::Predict, member_path<&GuiSettingsState::workflows, &WorkflowSettingsState::predict, &PredictViewState::model_source>,
-                                member_path<&GuiSettingsState::workflows, &WorkflowSettingsState::predict, &PredictViewState::model_input>,
-                                member_path<&GuiSettingsState::workflows, &WorkflowSettingsState::predict, &PredictViewState::request,
-                                            &mmltk::backend::models::rfdetr::PredictRequest::preset_name>,
-                                member_path<&GuiSettingsState::workflows, &WorkflowSettingsState::predict, &PredictViewState::request,
-                                            &mmltk::backend::models::rfdetr::PredictRequest::resolution>,
-                                Artifact,
-                                member_path<&GuiSettingsState::workflows, &WorkflowSettingsState::predict, &PredictViewState::request,
-                                            &mmltk::backend::models::rfdetr::PredictRequest::class_layout_path>> {
+       member_path<&GuiSettingsState::workflows, &WorkflowSettingsState::predict, &PredictViewState::model_input>,
+       member_path<&GuiSettingsState::workflows, &WorkflowSettingsState::predict, &PredictViewState::request, &mmltk::backend::models::rfdetr::PredictRequest::preset_name>,
+       member_path<&GuiSettingsState::workflows, &WorkflowSettingsState::predict, &PredictViewState::request, &mmltk::backend::models::rfdetr::PredictRequest::resolution>, Artifact,
+       member_path<&GuiSettingsState::workflows, &WorkflowSettingsState::predict, &PredictViewState::request, &mmltk::backend::models::rfdetr::PredictRequest::class_layout_path>> {
  inline static constexpr ModelArtifactInputKind input_kind = Input;
 };
 struct PredictWeightsModelSelection final
-    : PredictModelSelection<member_path<&GuiSettingsState::workflows, &WorkflowSettingsState::predict, &PredictViewState::request,
-                                        &mmltk::backend::models::rfdetr::PredictRequest::weights_path>,
-                            ModelArtifactInputKind::Weights> {
+    : PredictModelSelection<member_path<&GuiSettingsState::workflows, &WorkflowSettingsState::predict, &PredictViewState::request, &mmltk::backend::models::rfdetr::PredictRequest::weights_path>,
+       ModelArtifactInputKind::Weights> {
  inline static constexpr ModelSelectionCompatibility compatibility =
   // CLEANUP-IGNORE: Compatibility rows retain distinct stable identities and artifact policies.
   custom_model_compatibility("predict.weights", workflow, input_kind, true, std::nullopt, artifact_field_path.view());
 };
 struct PredictOnnxModelSelection final
-    : PredictModelSelection<member_path<&GuiSettingsState::workflows, &WorkflowSettingsState::predict, &PredictViewState::request,
-                                        &mmltk::backend::models::rfdetr::PredictRequest::onnx_path>,
-                            ModelArtifactInputKind::Onnx> {
+    : PredictModelSelection<member_path<&GuiSettingsState::workflows, &WorkflowSettingsState::predict, &PredictViewState::request, &mmltk::backend::models::rfdetr::PredictRequest::onnx_path>,
+       ModelArtifactInputKind::Onnx> {
  inline static constexpr ModelSelectionCompatibility compatibility =
   // CLEANUP-IGNORE: Compatibility rows retain distinct stable identities and artifact policies.
   custom_model_compatibility("predict.onnx", workflow, input_kind, false, std::nullopt, artifact_field_path.view());
 };
 struct PredictTensorRtModelSelection final
-    : PredictModelSelection<member_path<&GuiSettingsState::workflows, &WorkflowSettingsState::predict, &PredictViewState::request,
-                                        &mmltk::backend::models::rfdetr::PredictRequest::tensorrt_path>,
-                            ModelArtifactInputKind::TensorRt> {
- inline static constexpr ModelSelectionCompatibility compatibility =
-  custom_model_compatibility("predict.tensorrt", workflow, input_kind, false, std::nullopt, artifact_field_path.view());
+    : PredictModelSelection<member_path<&GuiSettingsState::workflows, &WorkflowSettingsState::predict, &PredictViewState::request, &mmltk::backend::models::rfdetr::PredictRequest::tensorrt_path>,
+       ModelArtifactInputKind::TensorRt> {
+ inline static constexpr ModelSelectionCompatibility compatibility = custom_model_compatibility("predict.tensorrt", workflow, input_kind, false, std::nullopt, artifact_field_path.view());
 };
 template <auto Artifact, auto Predicate, ModelArtifactInputKind Input>
-struct ExportModelSelection
-    : ModelSelectionRelationRow<
-       FeatureId::Export, member_path<&GuiSettingsState::workflows, &WorkflowSettingsState::export_state, &ExportViewState::model_source>,
-       member_path<&GuiSettingsState::workflows, &WorkflowSettingsState::export_state, &ExportViewState::model_input>,
-       member_path<&GuiSettingsState::workflows, &WorkflowSettingsState::export_state, &ExportViewState::preset_name>,
-       member_path<&GuiSettingsState::workflows, &WorkflowSettingsState::export_state, &ExportViewState::model_resolution>, Artifact,
-       member_path<&GuiSettingsState::workflows, &WorkflowSettingsState::export_state, &ExportViewState::class_layout_path>, Predicate> {
+struct ExportModelSelection : ModelSelectionRelationRow<FeatureId::Export, member_path<&GuiSettingsState::workflows, &WorkflowSettingsState::export_state, &ExportViewState::model_source>,
+                               member_path<&GuiSettingsState::workflows, &WorkflowSettingsState::export_state, &ExportViewState::model_input>,
+                               member_path<&GuiSettingsState::workflows, &WorkflowSettingsState::export_state, &ExportViewState::preset_name>,
+                               member_path<&GuiSettingsState::workflows, &WorkflowSettingsState::export_state, &ExportViewState::model_resolution>, Artifact,
+                               member_path<&GuiSettingsState::workflows, &WorkflowSettingsState::export_state, &ExportViewState::class_layout_path>, Predicate> {
  inline static constexpr ModelArtifactInputKind input_kind = Input;
 };
-struct ExportWeightsModelSelection final
-    : ExportModelSelection<member_path<&GuiSettingsState::workflows, &WorkflowSettingsState::export_state, &ExportViewState::weights_path>,
-                           member_path<&GuiSettingsState::workflows, &WorkflowSettingsState::export_state, &ExportViewState::build_tensorrt>,
-                           ModelArtifactInputKind::Weights> {
- inline static constexpr ModelSelectionCompatibility compatibility =
-  custom_model_compatibility("export.weights", workflow, input_kind, true, false, artifact_field_path.view());
+struct ExportWeightsModelSelection final : ExportModelSelection<member_path<&GuiSettingsState::workflows, &WorkflowSettingsState::export_state, &ExportViewState::weights_path>,
+                                            member_path<&GuiSettingsState::workflows, &WorkflowSettingsState::export_state, &ExportViewState::build_tensorrt>, ModelArtifactInputKind::Weights> {
+ inline static constexpr ModelSelectionCompatibility compatibility = custom_model_compatibility("export.weights", workflow, input_kind, true, false, artifact_field_path.view());
 };
-struct ExportOnnxModelSelection final
-    : ExportModelSelection<member_path<&GuiSettingsState::workflows, &WorkflowSettingsState::export_state, &ExportViewState::onnx_input_path>,
-                           member_path<&GuiSettingsState::workflows, &WorkflowSettingsState::export_state, &ExportViewState::build_tensorrt>,
-                           ModelArtifactInputKind::Onnx> {
- inline static constexpr ModelSelectionCompatibility compatibility =
-  custom_model_compatibility("export.onnx", workflow, input_kind, false, true, artifact_field_path.view());
+struct ExportOnnxModelSelection final : ExportModelSelection<member_path<&GuiSettingsState::workflows, &WorkflowSettingsState::export_state, &ExportViewState::onnx_input_path>,
+                                         member_path<&GuiSettingsState::workflows, &WorkflowSettingsState::export_state, &ExportViewState::build_tensorrt>, ModelArtifactInputKind::Onnx> {
+ inline static constexpr ModelSelectionCompatibility compatibility = custom_model_compatibility("export.onnx", workflow, input_kind, false, true, artifact_field_path.view());
 };
 struct ModelSelectionRelation final {
  template <class Visitor>
@@ -288,16 +262,13 @@ inline constexpr std::array<ModelSelectionCompatibility, 9U> kModelSelectionComp
  for (std::size_t index = 0U; index < kModelSelectionCompatibility.size(); ++index) {
   const auto& row = kModelSelectionCompatibility[index];
   if (row.key.empty() || (!row.canonical_allowed && !row.custom_allowed) || (row.canonical_allowed && row.input != ModelArtifactInputKind::Weights) ||
-      (row.workflow == FeatureId::Export) != row.required_export_build_tensorrt.has_value() || row.input == ModelArtifactInputKind::None ||
-      row.artifact_field_path.empty() || row.dialog_title.empty() || row.dialog_filter.empty() || row.dialog_pattern.empty()) {
+      (row.workflow == FeatureId::Export) != row.required_export_build_tensorrt.has_value() || row.input == ModelArtifactInputKind::None || row.artifact_field_path.empty() ||
+      row.dialog_title.empty() || row.dialog_filter.empty() || row.dialog_pattern.empty()) {
    return false;
   }
   for (std::size_t sibling = index + 1U; sibling < kModelSelectionCompatibility.size(); ++sibling) {
    const auto& other = kModelSelectionCompatibility[sibling];
-   if (row.key == other.key ||
-       (row.workflow == other.workflow && row.input == other.input && row.required_export_build_tensorrt == other.required_export_build_tensorrt)) {
-    return false;
-   }
+   if (row.key == other.key || (row.workflow == other.workflow && row.input == other.input && row.required_export_build_tensorrt == other.required_export_build_tensorrt)) { return false; }
   }
  }
  return true;
@@ -315,15 +286,13 @@ struct ModelSelectionCompatibilityCatalog final {
  [[nodiscard]] static constexpr std::string_view row_key(const row_type& row) noexcept { return row.key; }
  [[nodiscard]] static consteval bool valid() noexcept { return model_selection_compatibility_catalog_is_valid(); }
 };
-[[nodiscard]] constexpr const ModelSelectionCompatibility* find_model_selection_compatibility(const FeatureId workflow,
-                                                                                              const ModelArtifactInputKind input) noexcept {
+[[nodiscard]] constexpr const ModelSelectionCompatibility* find_model_selection_compatibility(const FeatureId workflow, const ModelArtifactInputKind input) noexcept {
  for (const auto& row : kModelSelectionCompatibility) {
   if (row.workflow == workflow && row.input == input) return &row;
  }
  return nullptr;
 }
-[[nodiscard]] constexpr const ModelSelectionCompatibility* find_model_selection_compatibility(const FeatureId workflow, const ModelArtifactInputKind input,
-                                                                                              const bool export_build_tensorrt) noexcept {
+[[nodiscard]] constexpr const ModelSelectionCompatibility* find_model_selection_compatibility(const FeatureId workflow, const ModelArtifactInputKind input, const bool export_build_tensorrt) noexcept {
  const auto* row = find_model_selection_compatibility(workflow, input);
  if (row == nullptr) return nullptr;
  return !row->required_export_build_tensorrt.has_value() || *row->required_export_build_tensorrt == export_build_tensorrt ? row : nullptr;
@@ -341,13 +310,11 @@ struct ModelSelectionCompatibilityCatalog final {
  }
  return false;
 }
-[[nodiscard]] constexpr bool model_selection_compatible(const FeatureId workflow, const ModelSelectionSource source,
-                                                        const ModelArtifactInputKind input) noexcept {
+[[nodiscard]] constexpr bool model_selection_compatible(const FeatureId workflow, const ModelSelectionSource source, const ModelArtifactInputKind input) noexcept {
  const auto* compatibility = find_model_selection_compatibility(workflow, input);
  return compatibility != nullptr && model_selection_source_allowed(*compatibility, source);
 }
-[[nodiscard]] constexpr bool model_selection_compatible(const FeatureId workflow, const ModelSelectionSource source, const ModelArtifactInputKind input,
-                                                        const bool export_build_tensorrt) noexcept {
+[[nodiscard]] constexpr bool model_selection_compatible(const FeatureId workflow, const ModelSelectionSource source, const ModelArtifactInputKind input, const bool export_build_tensorrt) noexcept {
  const auto* compatibility = find_model_selection_compatibility(workflow, input, export_build_tensorrt);
  return compatibility != nullptr && model_selection_source_allowed(*compatibility, source);
 }

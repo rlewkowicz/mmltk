@@ -41,8 +41,8 @@ public:
  [[nodiscard]] bool short_frame() const noexcept { return short_frame_; }
 
 private:
- FilledCaptureSlotLease(CaptureSessionIdentity identity, std::uint32_t slot, std::uint64_t sequence, const std::uint8_t* data, std::size_t bytes,
-                        std::size_t stride_bytes, std::uint32_t pixel_format, CaptureRegion region, std::uint64_t capture_ns, bool short_frame) noexcept;
+ FilledCaptureSlotLease(CaptureSessionIdentity identity, std::uint32_t slot, std::uint64_t sequence, const std::uint8_t* data, std::size_t bytes, std::size_t stride_bytes, std::uint32_t pixel_format,
+  CaptureRegion region, std::uint64_t capture_ns, bool short_frame) noexcept;
  void reset() noexcept;
  CaptureSessionIdentity identity_{};
  std::uint32_t slot_ = 0;
@@ -58,9 +58,8 @@ private:
 };
 class FilledCaptureSlotLeaseAuthority final {
 public:
- [[nodiscard]] static FilledCaptureSlotLease Create(CaptureSessionIdentity identity, std::uint32_t slot, std::uint64_t sequence, const std::uint8_t* data,
-                                                    std::size_t bytes, std::size_t stride_bytes, std::uint32_t pixel_format, CaptureRegion region,
-                                                    std::uint64_t capture_ns, bool short_frame) noexcept;
+ [[nodiscard]] static FilledCaptureSlotLease Create(CaptureSessionIdentity identity, std::uint32_t slot, std::uint64_t sequence, const std::uint8_t* data, std::size_t bytes, std::size_t stride_bytes,
+  std::uint32_t pixel_format, CaptureRegion region, std::uint64_t capture_ns, bool short_frame) noexcept;
  static void Consume(FilledCaptureSlotLease& lease) noexcept;
 };
 struct CaptureStats {

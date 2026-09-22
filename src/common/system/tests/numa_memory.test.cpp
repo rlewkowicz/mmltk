@@ -53,12 +53,12 @@ TEST_CASE("Node-bound PMR backs reusable solver vectors and over-aligned objects
 TEST_CASE("Denied binding or page verification never publishes host storage", "[common][system][numa-memory]") {
  for (const int call : {SYS_mbind, SYS_move_pages}) {
   CHECK(test_support::with_denied_syscall(call, [] {
-         NumaMemory memory(NumaTopology::Capture().permitted_nodes.front());
-         try {
-          memory.ensure_bytes(1);
-         } catch (const std::system_error& error) { return error.code().value() == EPERM && !memory.data(); }
-         return false;
-        }) == 0);
+   NumaMemory memory(NumaTopology::Capture().permitted_nodes.front());
+   try {
+    memory.ensure_bytes(1);
+   } catch (const std::system_error& error) { return error.code().value() == EPERM && !memory.data(); }
+   return false;
+  }) == 0);
  }
 }
 }  // namespace

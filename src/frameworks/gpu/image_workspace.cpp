@@ -58,13 +58,10 @@ ImageWorkspaceCoverage ImageWorkspaceDamage::Since(ImageWorkspaceContent baselin
 }
 bool ImageWorkspaceLayout::valid() const noexcept {
  const auto maximum = std::numeric_limits<std::size_t>::max();
- return format == ImageFormat::Rgba8 && device >= 0 && device_incarnation != 0U && width != 0U && height != 0U &&
-        width <= static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max()) &&
-        height <= static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max()) &&
-        std::ranges::any_of(device_uuid, [](auto byte) { return byte != 0U; }) && pitch_bytes >= static_cast<std::size_t>(width) * 4U &&
-        alignment_bytes != 0U && (alignment_bytes & (alignment_bytes - 1U)) == 0U && height <= (maximum - offset_bytes) / pitch_bytes &&
-        required_allocation_bytes >= offset_bytes + pitch_bytes * height &&
-        required_allocation_bytes <= static_cast<std::size_t>(std::numeric_limits<std::ptrdiff_t>::max());
+ return format == ImageFormat::Rgba8 && device >= 0 && device_incarnation != 0U && width != 0U && height != 0U && width <= static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max()) &&
+        height <= static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max()) && std::ranges::any_of(device_uuid, [](auto byte) { return byte != 0U; }) &&
+        pitch_bytes >= static_cast<std::size_t>(width) * 4U && alignment_bytes != 0U && (alignment_bytes & (alignment_bytes - 1U)) == 0U && height <= (maximum - offset_bytes) / pitch_bytes &&
+        required_allocation_bytes >= offset_bytes + pitch_bytes * height && required_allocation_bytes <= static_cast<std::size_t>(std::numeric_limits<std::ptrdiff_t>::max());
 }
 namespace {
 [[nodiscard]] std::exception_ptr workspace_release_failure(const char* message) noexcept {
@@ -72,8 +69,7 @@ namespace {
   throw ImageStreamExecutionFailure(std::make_exception_ptr(std::runtime_error(message)));
  } catch (...) { return std::current_exception(); }
 }
-void initialize_workspace_allocation(ImportedImageBuffer& allocation, DeviceContext context, const ImageWorkspaceLayout& layout,
-                                     mmltk::common::io::ScopedFd memory, std::uint64_t identity) {
+void initialize_workspace_allocation(ImportedImageBuffer& allocation, DeviceContext context, const ImageWorkspaceLayout& layout, mmltk::common::io::ScopedFd memory, std::uint64_t identity) {
  std::string error;
  if (!allocation.Import(std::move(context), std::move(memory), layout, identity, &error)) throw std::runtime_error(error);
 }
@@ -150,22 +146,19 @@ struct ImageWorkspace::State final {
  State(std::shared_ptr<Owner> lifetime, ImageWorkspaceLayout requested, const Operations* injected)
      : owner(std::move(lifetime)),
        layout(std::move(requested)),
-       operations(
-        injected ? *injected
-                 : Operations{&initialize_workspace_allocation, [](ImportedImageBuffer& buffer) noexcept { return buffer.Release(); },
+       operations(injected ? *injected
+                           : Operations{&initialize_workspace_allocation, [](ImportedImageBuffer& buffer) noexcept { return buffer.Release(); },
                               [](const ImportedImageBuffer& buffer, DeviceContext import_context) { return buffer.ImportAlias(std::move(import_context)); }}) {}
  void Initialize(DeviceContext source, std::optional<DeviceExecution> execution) {
   identity = next_image_allocation_identity();
   if (!layout.valid()) throw std::invalid_argument("workspace layout is invalid");
   access_descriptor.reset(::memfd_create("mmltk-workspace-access", MFD_CLOEXEC | MFD_ALLOW_SEALING));
-  if (access_descriptor.get() < 0 || ::ftruncate(access_descriptor.get(), sizeof(ImageWorkspaceAccessSignal)) != 0)
-   throw std::runtime_error("workspace access allocation failed");
+  if (access_descriptor.get() < 0 || ::ftruncate(access_descriptor.get(), sizeof(ImageWorkspaceAccessSignal)) != 0) throw std::runtime_error("workspace access allocation failed");
   const auto mapping = ::mmap(nullptr, sizeof(ImageWorkspaceAccessSignal), PROT_READ | PROT_WRITE, MAP_SHARED, access_descriptor.get(), 0);
   if (mapping == MAP_FAILED) throw std::runtime_error("workspace access mapping failed");
   access_signal = static_cast<ImageWorkspaceAccessSignal*>(mapping);
   *access_signal = {.allocation_identity = identity};
-  if (::fcntl(access_descriptor.get(), F_ADD_SEALS, F_SEAL_GROW | F_SEAL_SHRINK | F_SEAL_SEAL) != 0)
-   throw std::runtime_error("workspace access sealing failed");
+  if (::fcntl(access_descriptor.get(), F_ADD_SEALS, F_SEAL_GROW | F_SEAL_SHRINK | F_SEAL_SEAL) != 0) throw std::runtime_error("workspace access sealing failed");
   context.emplace(source.OnDevice(layout.device, std::move(execution)));
   stream.emplace(*context);
   context->Bind();
@@ -182,8 +175,7 @@ struct ImageWorkspace::State final {
   const auto role = expected & kWorkspaceAccessMask;
   if (role != kWorkspaceAccessEmpty && role != kWorkspaceAccessAvailable) return false;
   const auto epoch = expected & ~kWorkspaceAccessMask;
-  if ((epoch & ~kWorkspaceAccessRevoked) > kWorkspaceAccessRevoked - 2U * (kWorkspaceAccessMask + 1U))
-   throw std::overflow_error("workspace physical access epoch exhausted");
+  if ((epoch & ~kWorkspaceAccessRevoked) > kWorkspaceAccessRevoked - 2U * (kWorkspaceAccessMask + 1U)) throw std::overflow_error("workspace physical access epoch exhausted");
   if (!gate.compare_exchange_strong(expected, epoch + kWorkspaceAccessMask + 1U + kWorkspaceAccessWriting, std::memory_order_acq_rel)) return false;
   std::atomic_ref{access_signal->terminal_read_complete}.store(0U, std::memory_order_release);
   write_reserved = true;
@@ -295,8 +287,7 @@ ImageWorkspace::~ImageWorkspace() noexcept { static_cast<void>(Release()); }
 std::shared_ptr<ImageWorkspace> ImageWorkspace::Create(DeviceContext context, ImageWorkspaceLayout layout, std::optional<DeviceExecution> execution) {
  return Create(std::move(context), std::move(layout), std::move(execution), nullptr);
 }
-std::shared_ptr<ImageWorkspace> ImageWorkspace::Create(DeviceContext context, ImageWorkspaceLayout layout, std::optional<DeviceExecution> execution,
-                                                       const Operations* operations) {
+std::shared_ptr<ImageWorkspace> ImageWorkspace::Create(DeviceContext context, ImageWorkspaceLayout layout, std::optional<DeviceExecution> execution, const Operations* operations) {
  auto result = std::shared_ptr<ImageWorkspace>(new ImageWorkspace(std::move(context), std::move(layout), std::move(execution), operations));
  return result;
 }
@@ -311,8 +302,7 @@ std::exception_ptr ImageWorkspace::Release(std::exception_ptr initiating) noexce
    for (auto& transfer : state_->transfers) transfer.reset();
    if (state_->producer_allocation) {
     const auto released = state_->operations.release(*state_->producer_allocation);
-    if (released != cudaSuccess || state_->producer_allocation->release_failure() != cudaSuccess)
-     throw std::runtime_error("workspace producer mapping release failed");
+    if (released != cudaSuccess || state_->producer_allocation->release_failure() != cudaSuccess) throw std::runtime_error("workspace producer mapping release failed");
     state_->producer_allocation.reset();
    }
    state_->producer_stream.reset();
@@ -392,9 +382,7 @@ ImageWorkspaceContent ImageWorkspace::Content() const noexcept {
 ImagePlaneView ImageWorkspace::plane(std::uint32_t width, std::uint32_t height) const {
  if (!admitted() || state_->allocation->empty() || width == 0U || height == 0U || width > layout().width || height > layout().height)
   throw std::invalid_argument("workspace logical extent exceeds capacity");
- return {state_->allocation->data(),
-         {ImagePlaneKind::Clean, ImageFormat::Rgba8, width, height, layout().pitch_bytes},
-         {identity(), layout().width, layout().height, identity()}};
+ return {state_->allocation->data(), {ImagePlaneKind::Clean, ImageFormat::Rgba8, width, height, layout().pitch_bytes}, {identity(), layout().width, layout().height, identity()}};
 }
 mmltk::common::io::ScopedFd ImageWorkspace::ExportAccessDescriptor() const {
  mmltk::common::io::ScopedFd descriptor(::fcntl(state_->access_descriptor.get(), F_DUPFD_CLOEXEC, 0));
@@ -503,9 +491,7 @@ void ImageWorkspace::CancelDisplayWrite() noexcept {
  state_->NotifyDisplayAvailable();
 }
 std::uint64_t ImageWorkspace::product_owner() const noexcept { return state_->owner->product_owner.load(std::memory_order_acquire); }
-void ImageWorkspace::SetDisplayAvailabilitySink(std::shared_ptr<const std::function<void()>> sink) noexcept {
- state_->display_availability_sink.store(std::move(sink), std::memory_order_release);
-}
+void ImageWorkspace::SetDisplayAvailabilitySink(std::shared_ptr<const std::function<void()>> sink) noexcept { state_->display_availability_sink.store(std::move(sink), std::memory_order_release); }
 void ImageWorkspace::Detach(std::uint64_t product_owner) {
  {
   std::scoped_lock lock(state_->access);
@@ -519,14 +505,12 @@ void ImageWorkspace::Detach(std::uint64_t product_owner) {
  State::InvokeWake(state_->display_availability_sink);
 }
 bool ImageWorkspace::Acquired(std::uint64_t generation) const noexcept {
- return generation != 0U &&
-        (std::atomic_ref{state_->access_signal->access}.load(std::memory_order_acquire) & kWorkspaceAccessMask) == kWorkspaceAccessReading &&
+ return generation != 0U && (std::atomic_ref{state_->access_signal->access}.load(std::memory_order_acquire) & kWorkspaceAccessMask) == kWorkspaceAccessReading &&
         std::atomic_ref{state_->access_signal->generation}.load(std::memory_order_relaxed) == generation;
 }
 bool ImageWorkspace::TerminalReadComplete(std::uint64_t generation) const noexcept {
  const auto complete = std::atomic_ref{state_->access_signal->terminal_read_complete}.load(std::memory_order_acquire);
- return (complete & kWorkspaceAccessRevoked) != 0U && Acquired(generation) &&
-        complete == std::atomic_ref{state_->access_signal->access}.load(std::memory_order_acquire);
+ return (complete & kWorkspaceAccessRevoked) != 0U && Acquired(generation) && complete == std::atomic_ref{state_->access_signal->access}.load(std::memory_order_acquire);
 }
 void ImageWorkspace::CompleteRead(std::uint64_t generation) {
  {
@@ -535,22 +519,18 @@ void ImageWorkspace::CompleteRead(std::uint64_t generation) {
   auto access = std::atomic_ref{state_->access_signal->access};
   auto expected = access.load(std::memory_order_acquire);
   const auto role = (expected & kWorkspaceAccessRevoked) != 0U ? kWorkspaceAccessEmpty : kWorkspaceAccessAvailable;
-  if ((expected & kWorkspaceAccessMask) != kWorkspaceAccessReading ||
-      !access.compare_exchange_strong(expected, (expected & ~kWorkspaceAccessMask) | role, std::memory_order_release))
+  if ((expected & kWorkspaceAccessMask) != kWorkspaceAccessReading || !access.compare_exchange_strong(expected, (expected & ~kWorkspaceAccessMask) | role, std::memory_order_release))
    throw std::runtime_error("workspace read settlement lost physical custody");
   state_->display_held.store(false, std::memory_order_release);
  }
  State::InvokeWake(state_->availability_sink);
 }
-void ImageWorkspace::SetAvailabilitySink(std::shared_ptr<const std::function<void()>> sink) noexcept {
- state_->availability_sink.store(std::move(sink), std::memory_order_release);
-}
+void ImageWorkspace::SetAvailabilitySink(std::shared_ptr<const std::function<void()>> sink) noexcept { state_->availability_sink.store(std::move(sink), std::memory_order_release); }
 bool ImageWorkspace::QueueAllocation(mmltk::common::io::ScopedFd memory) {
  std::scoped_lock lock(state_->access);
  std::scoped_lock owner_lock(state_->owner->mutex_);
  if (state_->owner->closed_ || state_->withdrawn.load(std::memory_order_acquire)) return false;
- if (memory.get() < 0 || state_->pending_memory.get() >= 0 || admitted())
-  throw std::invalid_argument("workspace allocation descriptor is unavailable or duplicated");
+ if (memory.get() < 0 || state_->pending_memory.get() >= 0 || admitted()) throw std::invalid_argument("workspace allocation descriptor is unavailable or duplicated");
  state_->pending_memory = std::move(memory);
  return true;
 }
@@ -559,8 +539,7 @@ void ImageWorkspace::Admit(std::uint64_t allocation_identity, std::uint64_t devi
  std::unique_lock owner_lock(state_->owner->mutex_);
  if (state_->owner->failure_) std::rethrow_exception(state_->owner->failure_);
  if (state_->owner->closed_ || state_->withdrawn.load(std::memory_order_acquire)) throw std::runtime_error("workspace owner is retired");
- if (allocation_identity != identity() || device_incarnation != layout().device_incarnation || state_->admitted)
-  throw std::invalid_argument("workspace admission identity mismatch or duplicate");
+ if (allocation_identity != identity() || device_incarnation != layout().device_incarnation || state_->admitted) throw std::invalid_argument("workspace admission identity mismatch or duplicate");
  try {
   state_->context->Bind();
   state_->operations.initialize(*state_->allocation, *state_->context, layout(), std::move(state_->pending_memory), identity());
@@ -627,8 +606,7 @@ void ImageWorkspace::Finalize(BorrowedImageProductReadView source, ImageWorkspac
  const auto clean = source.plane(0U).plane();
  const ImageWorkspaceContent content{clean.allocation.owner, source.plane(0U).revision()};
  const bool expands_initialized = clean.descriptor.width > state_->width || clean.descriptor.height > state_->height;
- if (!coverage.baseline.valid() || coverage.baseline != state_->content || coverage.baseline.owner != content.owner || expands_initialized ||
-     coverage.allocation_identity != identity())
+ if (!coverage.baseline.valid() || coverage.baseline != state_->content || coverage.baseline.owner != content.owner || expands_initialized || coverage.allocation_identity != identity())
   coverage.full_image = true;
  if (!state_->write_reserved && !state_->ReservePhysicalWrite()) throw std::runtime_error("workspace physical generation is acquired");
  state_->write_invalidated = true;

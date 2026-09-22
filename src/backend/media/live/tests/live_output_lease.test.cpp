@@ -26,8 +26,8 @@ namespace {
 TEST_CASE("Live rejects placement belonging to a different capture receiver before allocating resources", "[live][numa]") {
  int owner = 0;
  LiveDataPlaneConfig config;
- config.resource_worker = mmltk::frameworks::gpu::ResourceOwnerWorkerCapability{&owner, 1, [](const void*, std::uintptr_t) noexcept { return true; },
-                                                                                [](const void*, std::uintptr_t) noexcept { return true; }};
+ config.resource_worker =
+  mmltk::frameworks::gpu::ResourceOwnerWorkerCapability{&owner, 1, [](const void*, std::uintptr_t) noexcept { return true; }, [](const void*, std::uintptr_t) noexcept { return true; }};
  config.capture.cuda_device_index = 0;
  config.capture.execution = mmltk::frameworks::gpu::DeviceExecution{.device = 1, .placement = {.numa_node = 3, .cpus = {17}}};
  REQUIRE_THROWS_AS(LiveMediaDataPlane(config), std::invalid_argument);
@@ -84,12 +84,12 @@ TEST_CASE("moving over an active Live output lease abandons only the displaced s
  LeaseProbe second;
  auto displaced = LiveCompositeOutputLease::Create(&first, &LeaseProbe::Complete, &LeaseProbe::Abandon, kView, kRevision);
  auto replacement = LiveCompositeOutputLease::Create(&second, &LeaseProbe::Complete, &LeaseProbe::Abandon, kView,
-                                                     PhysicalFrameRevision{
-                                                      .revision = 4U,
-                                                      .frame = {.session = 4U, .sequence = 6U},
-                                                      .slot = 2U,
-                                                      .ready_event = 8U,
-                                                     });
+  PhysicalFrameRevision{
+   .revision = 4U,
+   .frame = {.session = 4U, .sequence = 6U},
+   .slot = 2U,
+   .ready_event = 8U,
+  });
  displaced = std::move(replacement);
  std::move(displaced).Complete();
  CHECK(first.abandonments == 1U);

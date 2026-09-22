@@ -74,16 +74,15 @@ template <class T>
 // writers and the borrowed projection. Alternative membership remains exhaustive.
 template <class Variant, class Alternative>
 struct ReflectedVariantEnvelope final {
- static_assert([]<class... T>(std::type_identity<std::variant<T...>>) { return (std::same_as<Alternative, T> || ...); }(std::type_identity<Variant>{}),
-               "borrowed alternative must belong to its canonical variant");
+ static_assert(
+  []<class... T>(std::type_identity<std::variant<T...>>) { return (std::same_as<Alternative, T> || ...); }(std::type_identity<Variant>{}), "borrowed alternative must belong to its canonical variant");
  static constexpr auto kind_key = implementation::detail::VariantEnvelope::kind_key;
  static constexpr auto payload_key = implementation::detail::VariantEnvelope::payload_key;
  static constexpr auto field_count = implementation::detail::VariantEnvelope::field_count;
  static constexpr std::string_view kind = implementation::detail::static_variant_name<Alternative>();
  [[nodiscard]] static bool Read(wire::Reader& reader) {
   auto count = reader.begin_object_item(0U);
-  return count && *count == field_count && reader.expect_text_item(1U, kind_key) && reader.expect_text_item(1U, kind) &&
-         reader.expect_text_item(1U, payload_key);
+  return count && *count == field_count && reader.expect_text_item(1U, kind_key) && reader.expect_text_item(1U, kind) && reader.expect_text_item(1U, payload_key);
  }
 };
 template <class Record, auto BytesMember>
@@ -164,8 +163,7 @@ public:
     return direct;
    }(),
    "borrowed byte records require direct reflected fields");
-  static_assert(std::same_as<std::remove_cvref_t<decltype(record_.*BytesMember)>, wire::ByteBuffer>,
-                "borrowed byte projection requires a declaration-bounded byte buffer");
+  static_assert(std::same_as<std::remove_cvref_t<decltype(record_.*BytesMember)>, wire::ByteBuffer>, "borrowed byte projection requires a declaration-bounded byte buffer");
   constexpr auto names = [] consteval {
    std::array<std::string_view, d::flattened_member_count<Record>()> result{};
    std::size_t index = 0U;
@@ -187,8 +185,7 @@ public:
     if constexpr (std::meta::reflect_constant(Declaration::pointer) == std::meta::reflect_constant(BytesMember)) {
      auto bytes = reader.borrow_bytes_item(2U);
      constexpr auto policy = d::serialized_member_policy<Declaration>();
-     if (bytes && bytes->size() <= policy.maximum_bytes && bytes->size() >= policy.minimum_bytes &&
-         (policy.maximum_items == 0U || bytes->size() <= policy.maximum_items)) {
+     if (bytes && bytes->size() <= policy.maximum_bytes && bytes->size() >= policy.minimum_bytes && (policy.maximum_items == 0U || bytes->size() <= policy.maximum_items)) {
       bytes_ = *bytes;
       valid = true;
      }

@@ -13,8 +13,7 @@ class DatasetBatchLease final {
 public:
  // One compiled stream and one checked-out batch transaction coexist.
  static constexpr std::size_t kSourceRetirementCapacity = 2U;
- DatasetBatchLease(std::shared_ptr<mmltk::backend::data::DatasetLoader> loader, std::uintptr_t stream,
-                   std::shared_ptr<mmltk::frameworks::gpu::TerminalCudaRetirementOwner> retirement)
+ DatasetBatchLease(std::shared_ptr<mmltk::backend::data::DatasetLoader> loader, std::uintptr_t stream, std::shared_ptr<mmltk::frameworks::gpu::TerminalCudaRetirementOwner> retirement)
      : retirement_(std::move(retirement)), loader_(std::move(loader)), stream_(reinterpret_cast<void*>(stream)) {
   if (!retirement_ || !loader_) throw std::invalid_argument("prediction batch custody is unavailable");
   auto lease = retirement_->Reserve();

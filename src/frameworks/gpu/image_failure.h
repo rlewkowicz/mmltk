@@ -42,9 +42,7 @@ template <class Failure>
  } catch (...) { return {}; }
  return {};
 }
-[[nodiscard]] inline bool is_image_execution_failure(const std::exception_ptr& failure) noexcept {
- return static_cast<bool>(find_image_failure<ImageStreamExecutionFailure>(failure));
-}
+[[nodiscard]] inline bool is_image_execution_failure(const std::exception_ptr& failure) noexcept { return static_cast<bool>(find_image_failure<ImageStreamExecutionFailure>(failure)); }
 [[nodiscard]] inline std::exception_ptr combine_image_failures(std::exception_ptr primary, std::exception_ptr secondary) noexcept {
  if (!primary) return secondary;
  if (!secondary || secondary == primary) return primary;

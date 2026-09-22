@@ -81,8 +81,7 @@ namespace {
  return result == 0;
 }
 }  // namespace
-DiagnosticsClient::State::State(mmltk::common::io::ScopedFd adopted, const DiagnosticsExecutionPolicy next_policy) noexcept
-    : descriptor(std::move(adopted)), policy(next_policy) {}
+DiagnosticsClient::State::State(mmltk::common::io::ScopedFd adopted, const DiagnosticsExecutionPolicy next_policy) noexcept : descriptor(std::move(adopted)), policy(next_policy) {}
 DiagnosticSubmitResult DiagnosticsClient::State::admit_locked(std::unique_lock<std::mutex>& lock, const std::size_t count, const bool wait) noexcept {
  const auto closed = [&] { return closing || failed || terminal_pending || descriptor.get() < 0; };
  if (closed()) return DiagnosticSubmitResult::Closed;
@@ -118,8 +117,7 @@ bool DiagnosticsClient::State::flush_locked() noexcept {
  while (size != 0U || terminal_pending) {
   const bool terminal_record_active = size == 0U;
   const Record& record = terminal_record_active ? terminal_record : records[head];
-  const bool wrote = mmltk::common::io::try_write_all_noexcept(descriptor.get(), {record.bytes.data(), record.size}) &&
-                     mmltk::common::io::try_write_all_noexcept(descriptor.get(), "\n");
+  const bool wrote = mmltk::common::io::try_write_all_noexcept(descriptor.get(), {record.bytes.data(), record.size}) && mmltk::common::io::try_write_all_noexcept(descriptor.get(), "\n");
   if (!wrote) {
    write_failures.fetch_add(1U, std::memory_order_relaxed);
    failed = true;
@@ -293,15 +291,9 @@ void DiagnosticsClient::State::close(const DiagnosticsCloseMode mode) noexcept {
   signal_locked();
  }
 }
-DiagnosticsClient::DiagnosticsClient(const std::filesystem::path& path) noexcept {
- initialize(open_diagnostics_file(path), DiagnosticsExecutionPolicy::BackgroundWriter);
-}
-DiagnosticsClient::DiagnosticsClient(mmltk::common::io::ScopedFd descriptor) noexcept {
- initialize(std::move(descriptor), DiagnosticsExecutionPolicy::BackgroundWriter);
-}
-DiagnosticsClient::DiagnosticsClient(mmltk::common::io::ScopedFd descriptor, const DiagnosticsExecutionPolicy policy) noexcept {
- initialize(std::move(descriptor), policy);
-}
+DiagnosticsClient::DiagnosticsClient(const std::filesystem::path& path) noexcept { initialize(open_diagnostics_file(path), DiagnosticsExecutionPolicy::BackgroundWriter); }
+DiagnosticsClient::DiagnosticsClient(mmltk::common::io::ScopedFd descriptor) noexcept { initialize(std::move(descriptor), DiagnosticsExecutionPolicy::BackgroundWriter); }
+DiagnosticsClient::DiagnosticsClient(mmltk::common::io::ScopedFd descriptor, const DiagnosticsExecutionPolicy policy) noexcept { initialize(std::move(descriptor), policy); }
 void DiagnosticsClient::initialize(mmltk::common::io::ScopedFd descriptor, const DiagnosticsExecutionPolicy policy) noexcept {
  if (descriptor.get() < 0) return;
  // Every descriptor admitted by this sink has the same nonblocking I/O
@@ -353,17 +345,14 @@ bool DiagnosticsClient::enabled() const noexcept { return state_ != nullptr && s
 DiagnosticsProducer DiagnosticsClient::producer() const noexcept { return DiagnosticsProducer{state_}; }
 DiagnosticsCounters DiagnosticsClient::counters() const noexcept {
  if (state_ == nullptr) return {};
- return {
-  .accepted = state_->accepted.load(), .flushed = state_->flushed.load(), .dropped = state_->dropped.load(), .write_failures = state_->write_failures.load()};
+ return {.accepted = state_->accepted.load(), .flushed = state_->flushed.load(), .dropped = state_->dropped.load(), .write_failures = state_->write_failures.load()};
 }
 int DiagnosticsClient::terminal_fd() const noexcept { return state_ == nullptr ? -1 : state_->terminal_wake.get(); }
 void DiagnosticsClient::consume_terminal_wake() const noexcept {
  if (state_ == nullptr || terminal() == DiagnosticsTerminal::Pending) return;
  static_cast<void>(mmltk::common::io::read_counter_fd(state_->terminal_wake.get()));
 }
-DiagnosticsTerminal DiagnosticsClient::terminal() const noexcept {
- return state_ == nullptr ? DiagnosticsTerminal::Drained : state_->terminal.load(std::memory_order_acquire);
-}
+DiagnosticsTerminal DiagnosticsClient::terminal() const noexcept { return state_ == nullptr ? DiagnosticsTerminal::Drained : state_->terminal.load(std::memory_order_acquire); }
 void DiagnosticsClient::flush() noexcept {
  if (state_ == nullptr) return;
  if (state_->policy == DiagnosticsExecutionPolicy::CallerDriven) {
@@ -411,8 +400,7 @@ DiagnosticsProducer::Operation::Operation(const Operation& other) noexcept : sta
  ++state_->complete_operations;
  complete_active_ = true;
 }
-DiagnosticsProducer::Operation::Operation(Operation&& other) noexcept
-    : state_(std::move(other.state_)), complete_active_(std::exchange(other.complete_active_, false)) {}
+DiagnosticsProducer::Operation::Operation(Operation&& other) noexcept : state_(std::move(other.state_)), complete_active_(std::exchange(other.complete_active_, false)) {}
 DiagnosticsProducer::Operation& DiagnosticsProducer::Operation::operator=(Operation other) noexcept {
  state_.swap(other.state_);
  std::swap(complete_active_, other.complete_active_);
@@ -497,8 +485,7 @@ DiagnosticSubmitResult DiagnosticsProducer::Operation::submit_terminal_encoded(c
  if (state_->policy == DiagnosticsExecutionPolicy::BackgroundWriter) state_->signal_locked();
  return DiagnosticSubmitResult::Accepted;
 }
-DiagnosticSubmitResult DiagnosticsProducer::Operation::submit_encoded_batch(const std::size_t count, void* const context, const EncodedBatchWriter writer,
-                                                                            const bool complete) const noexcept {
+DiagnosticSubmitResult DiagnosticsProducer::Operation::submit_encoded_batch(const std::size_t count, void* const context, const EncodedBatchWriter writer, const bool complete) const noexcept {
  if (state_ == nullptr || !state_->enabled.load(std::memory_order_acquire)) return DiagnosticSubmitResult::Disabled;
  if (count == 0U) return DiagnosticSubmitResult::Accepted;
  if (writer == nullptr || count > DiagnosticsClient::kQueueCapacity) {

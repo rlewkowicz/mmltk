@@ -73,8 +73,7 @@ protected:
  NativeOptimizerStorage() = default;
  NativeOptimizerStorage(std::vector<Group> groups, std::vector<NamedParameter> params) : groups_(std::move(groups)), params_(std::move(params)) {}
  template <class Optimizer>
- [[nodiscard]] static std::vector<std::string> inspect_checkpoint(torch::serialize::InputArchive&, const std::unordered_map<std::string, torch::Tensor>&,
-                                                                  std::stop_token stop = {});
+ [[nodiscard]] static std::vector<std::string> inspect_checkpoint(torch::serialize::InputArchive&, const std::unordered_map<std::string, torch::Tensor>&, std::stop_token stop = {});
  std::vector<Group> groups_;
  std::vector<NamedParameter> params_;
  std::vector<ParamState> state_;
@@ -83,8 +82,7 @@ protected:
 };
 class NativeAdamW : public NativeOptimizerStorage<NativeAdamWGroupConfig, NativeAdamWParamState> {
 public:
- [[nodiscard]] static std::vector<std::string> InspectCheckpoint(torch::serialize::InputArchive&, const std::unordered_map<std::string, torch::Tensor>&,
-                                                                 std::stop_token stop = {});
+ [[nodiscard]] static std::vector<std::string> InspectCheckpoint(torch::serialize::InputArchive&, const std::unordered_map<std::string, torch::Tensor>&, std::stop_token stop = {});
  NativeAdamW() = default;
  NativeAdamW(std::vector<Group> groups, std::vector<NamedParameter> params, NativeOptimizerBackend backend);
  [[nodiscard]] NativeOptimizerBackend backend() const;
@@ -110,8 +108,7 @@ const char* native_optimizer_backend_name(NativeOptimizerBackend backend);
 [[nodiscard]] bool muon_parameter_eligible(std::string_view name, const torch::Tensor& parameter);
 class NativeMuonWithAuxAdam : public NativeOptimizerStorage<NativeMuonGroupConfig, NativeMuonParamState> {
 public:
- [[nodiscard]] static std::vector<std::string> InspectCheckpoint(torch::serialize::InputArchive&, const std::unordered_map<std::string, torch::Tensor>&,
-                                                                 std::stop_token stop = {});
+ [[nodiscard]] static std::vector<std::string> InspectCheckpoint(torch::serialize::InputArchive&, const std::unordered_map<std::string, torch::Tensor>&, std::stop_token stop = {});
  NativeMuonWithAuxAdam() = default;
  NativeMuonWithAuxAdam(std::vector<Group> groups, std::vector<NamedParameter> params);
  [[nodiscard]] const char* backend_name() const;

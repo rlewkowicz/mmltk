@@ -36,8 +36,7 @@ struct LiveRevisionListener final {
 };
 class LivePhysicalTerminal final {
 public:
- LivePhysicalTerminal(std::shared_ptr<const mmltk::backend::media::capture::CaptureStopTerminal> capture,
-                      mmltk::backend::media::capture::Status status) noexcept
+ LivePhysicalTerminal(std::shared_ptr<const mmltk::backend::media::capture::CaptureStopTerminal> capture, mmltk::backend::media::capture::Status status) noexcept
      : capture_(std::move(capture)), status_(std::move(status)) {}
  [[nodiscard]] bool valid() const noexcept { return capture_ != nullptr && capture_->identity.valid(); }
  [[nodiscard]] bool fully_settled() const noexcept { return valid() && status_.ok(); }

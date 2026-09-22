@@ -97,8 +97,7 @@ public:
   std::scoped_lock lock(mutex_);
   return terminal_ && !std::exchange(terminal_reported_, true);
  }
- [[nodiscard]] WaitResult AwaitHeldCompletion(const std::uint64_t generation, const std::uint64_t slot, const std::uint64_t compiled_index,
-                                              const std::uint64_t staging_bytes) {
+ [[nodiscard]] WaitResult AwaitHeldCompletion(const std::uint64_t generation, const std::uint64_t slot, const std::uint64_t compiled_index, const std::uint64_t staging_bytes) {
   std::shared_ptr<const FrontendCommand> frontend;
   std::uint64_t sequence = 0U;
   {
@@ -106,8 +105,7 @@ public:
    frontend = frontend_command_;
    sequence = frontend_sequence_;
   }
-  ControlObservation observation{
-   .event = ControlEvent::HeldWait, .generation = generation, .slot = slot, .compiled_index = compiled_index, .staging_bytes = staging_bytes};
+  ControlObservation observation{.event = ControlEvent::HeldWait, .generation = generation, .slot = slot, .compiled_index = compiled_index, .staging_bytes = staging_bytes};
   if (!SendControlObservation(observation)) {
    Terminal();
    return WaitResult::Stale;
@@ -121,10 +119,9 @@ public:
   // waiting. Reentrant callbacks may inspect or supersede demand.
   if (frontend && generation != 0U) {
    try {
-    if (compiled_index > std::numeric_limits<std::uint32_t>::max() || !(*frontend)({.kind = contracts::IntegrationControlKind::GalleryReadCompletionHeld,
-                                                                                    .sequence = sequence,
-                                                                                    .read_generation = generation,
-                                                                                    .compiled_index = static_cast<std::uint32_t>(compiled_index)}))
+    if (compiled_index > std::numeric_limits<std::uint32_t>::max() ||
+        !(*frontend)(
+         {.kind = contracts::IntegrationControlKind::GalleryReadCompletionHeld, .sequence = sequence, .read_generation = generation, .compiled_index = static_cast<std::uint32_t>(compiled_index)}))
      Terminal();
    } catch (...) { Terminal(); }
   }
@@ -175,10 +172,8 @@ public:
    sequence = frontend_sequence_;
   }
   const ControlObservation observation{.event = ControlEvent::VisibleReadHeld, .generation = generation, .compiled_index = index};
-  if (frontend &&
-      (!SendControlObservation(observation) ||
-       !(*frontend)(
-        {.kind = contracts::IntegrationControlKind::VisibleReadHeld, .sequence = sequence, .read_generation = generation, .compiled_index = index}))) {
+  if (frontend && (!SendControlObservation(observation) ||
+                   !(*frontend)({.kind = contracts::IntegrationControlKind::VisibleReadHeld, .sequence = sequence, .read_generation = generation, .compiled_index = index}))) {
    Terminal();
    return;
   }
@@ -222,12 +217,9 @@ public:
   }
   if (receipt.kind == Kind::PressureEntered && std::exchange(frontend_pressure_, true)) return reject("duplicate_pressure");
   if (receipt.kind == Kind::Settled) frontend_settled_ = true;
-  const bool sent = SendControlObservation({.event = ControlEvent::Frontend,
-                                            .generation = receipt.sequence,
-                                            .slot = static_cast<std::uint64_t>(receipt.kind),
-                                            .compiled_index = receipt.progress,
-                                            .staging_bytes = receipt.failureline},
-                                           &receipt);
+  const bool sent = SendControlObservation(
+   {.event = ControlEvent::Frontend, .generation = receipt.sequence, .slot = static_cast<std::uint64_t>(receipt.kind), .compiled_index = receipt.progress, .staging_bytes = receipt.failureline},
+   &receipt);
   if (!sent || receipt.kind == Kind::Failed) {
    terminal_ = true;
    changed_.notify_all();
@@ -250,8 +242,7 @@ public:
  }
 
 private:
- void TraceFrontendRejection(const contracts::IntegrationControlReceipt& receipt, const std::string_view reason, const ssize_t sent = 0,
-                             const int send_error = 0) const noexcept {
+ void TraceFrontendRejection(const contracts::IntegrationControlReceipt& receipt, const std::string_view reason, const ssize_t sent = 0, const int send_error = 0) const noexcept {
   if (!diagnostics_.valid()) return;
   try {
    namespace serialization = mmltk::frameworks::serialization;
@@ -287,8 +278,7 @@ private:
                                                                      }));
   } catch (...) {}
  }
- [[nodiscard]] bool SendControlObservation(const ControlObservation& observation,
-                                           const contracts::IntegrationControlReceipt* receipt = nullptr) const noexcept {
+ [[nodiscard]] bool SendControlObservation(const ControlObservation& observation, const contracts::IntegrationControlReceipt* receipt = nullptr) const noexcept {
   const bool trace_send = receipt != nullptr && diagnostics_.valid();
   const std::string_view failure = receipt ? std::string_view(receipt->failure) : std::string_view{};
   std::array<iovec, 2U> parts{{
@@ -336,8 +326,7 @@ private:
      if (current_generation_ == 0U || initial_released_generation_ != current_generation_) release_one_ = true;
     } else if (command == 2U) {
      release_all_ = true;
-    } else if (command == static_cast<std::uint8_t>(ControlCommand::ArmVisibleRead) && visible_requested_ && !visible_armed_ && !visible_held_ &&
-               frontend_command_) {
+    } else if (command == static_cast<std::uint8_t>(ControlCommand::ArmVisibleRead) && visible_requested_ && !visible_armed_ && !visible_held_ && frontend_command_) {
      visible_armed_ = true;
      visible_released_ = false;
      callback = frontend_command_;
@@ -347,16 +336,14 @@ private:
      visible_released_ = true;
     } else if (command == 4U) {
      release_held_ = true;
-    } else if ((command == static_cast<std::uint8_t>(ControlCommand::ArmNativeCompletion) ||
-                command == static_cast<std::uint8_t>(ControlCommand::ReleaseNativeCompletion) ||
+    } else if ((command == static_cast<std::uint8_t>(ControlCommand::ArmNativeCompletion) || command == static_cast<std::uint8_t>(ControlCommand::ReleaseNativeCompletion) ||
                 command == static_cast<std::uint8_t>(ControlCommand::ReleasePendingSupersession)) &&
                completion_command_) {
      completion = completion_command_;
     } else if (command == 16U && !redraw_claimed_ && !release_all_ && !release_one_ && initial_released_generation_ == 0U && redraw_command_) {
      redraw_claimed_ = true;
      redraw = redraw_command_;
-    } else if (command == 8U && frontend_settled_ && waiters_ == 0U && !held_pending_ && frontend_command_ &&
-               frontend_sequence_ != std::numeric_limits<std::uint64_t>::max()) {
+    } else if (command == 8U && frontend_settled_ && waiters_ == 0U && !held_pending_ && frontend_command_ && frontend_sequence_ != std::numeric_limits<std::uint64_t>::max()) {
      release_all_ = false;
      release_one_ = false;
      release_held_ = false;
@@ -379,9 +366,7 @@ private:
    }
    if (redraw || callback || completion) {
     try {
-     const bool accepted = completion ? (*completion)(static_cast<ControlCommand>(command))
-                           : redraw   ? (*redraw)()
-                                      : (*callback)({.kind = frontend_kind, .sequence = sequence});
+     const bool accepted = completion ? (*completion)(static_cast<ControlCommand>(command)) : redraw ? (*redraw)() : (*callback)({.kind = frontend_kind, .sequence = sequence});
      if (accepted) continue;
     } catch (...) {}
     Terminal();
@@ -442,8 +427,7 @@ void ExploreAcceptanceGate::SetInitialWaitObserver(void* context, void (*observe
  impl_->initial_wait_context = context;
  impl_->initial_wait_observer = observer;
 }
-auto ExploreAcceptanceGate::AwaitHeldCompletion(const std::uint64_t generation, const std::uint64_t slot, const std::uint64_t compiled_index,
-                                                const std::uint64_t staging_bytes) -> WaitResult {
+auto ExploreAcceptanceGate::AwaitHeldCompletion(const std::uint64_t generation, const std::uint64_t slot, const std::uint64_t compiled_index, const std::uint64_t staging_bytes) -> WaitResult {
  return impl_->AwaitHeldCompletion(generation, slot, compiled_index, staging_bytes);
 }
 bool ExploreAcceptanceGate::ClaimHeldCompletion() { return impl_->ClaimHeldCompletion(); }
@@ -486,15 +470,13 @@ void ExploreAcceptanceGate::CheckProbe() const {
 }
 void ExploreAcceptanceGate::CheckPublication(const PublicationStage stage) const {
  auto expected = stage;
- if (impl_->publication_failure.compare_exchange_strong(expected, PublicationStage::None, std::memory_order_acq_rel))
-  throw std::runtime_error("deterministic native Explore publication failure");
+ if (impl_->publication_failure.compare_exchange_strong(expected, PublicationStage::None, std::memory_order_acq_rel)) throw std::runtime_error("deterministic native Explore publication failure");
 }
 namespace explore_detail {
 namespace data = mmltk::backend::data;
 namespace explore = mmltk::backend::imaging::explore;
 namespace rfdetr = mmltk::backend::models::rfdetr;
-[[nodiscard]] std::uint64_t explore_dataset_identity(const std::string_view source, const data::FileHeader& header,
-                                                     const std::span<const explore::ExploreImageSummary> summaries) noexcept {
+[[nodiscard]] std::uint64_t explore_dataset_identity(const std::string_view source, const data::FileHeader& header, const std::span<const explore::ExploreImageSummary> summaries) noexcept {
  std::uint64_t value = 1469598103934665603ULL;
  const auto mix = [&value](const auto& item) {
   const auto* bytes = reinterpret_cast<const std::uint8_t*>(&item);
@@ -535,8 +517,7 @@ class NativeExploreAlgorithm final : public ExploreAlgorithm {
  };
 
 public:
- NativeExploreAlgorithm(ExploreNativeConfiguration configuration, const std::size_t nproc, const mmltk::frameworks::gpu::DeviceExecution& execution,
-                        const std::uint32_t maximum_height)
+ NativeExploreAlgorithm(ExploreNativeConfiguration configuration, const std::size_t nproc, const mmltk::frameworks::gpu::DeviceExecution& execution, const std::uint32_t maximum_height)
      : configuration_(configuration), nproc_(nproc), gallery_(nproc, execution, configuration, maximum_height) {}
  [[nodiscard]] bool UsesLoadingOptions(const data::DataLoadingOptions& options) const override { return configuration_.loading == options; }
  ~NativeExploreAlgorithm() override = default;
@@ -551,8 +532,7 @@ public:
   auto opened = mmltk::backend::data::CompiledDataset::open_source(std::filesystem::path{source}, configuration_.image_limit);
   if (!opened) throw std::system_error(opened.error(), "Explore compiled source could not be opened");
   if (opened->image_entries().empty()) throw contracts::InvalidIntentError("Explore compiled source contains no images");
-  if (opened->image_entries().size() > std::numeric_limits<std::uint32_t>::max())
-   throw contracts::InvalidIntentError("Explore image catalog exceeds the application boundary");
+  if (opened->image_entries().size() > std::numeric_limits<std::uint32_t>::max()) throw contracts::InvalidIntentError("Explore image catalog exceeds the application boundary");
   if (opened->class_names().size() > kExploreClassCapacity) throw contracts::InvalidIntentError("Explore class catalog exceeds the application boundary");
   if (std::ranges::any_of(opened->class_names(), [](const auto& name) { return name.size() > mmltk::backend::data::catalog::kClassNameCapacity; }))
    throw contracts::InvalidIntentError("Explore class name exceeds the application boundary");
@@ -568,8 +548,7 @@ public:
   }
   std::vector<std::uint32_t> order;
   std::vector<std::uint32_t> scratch;
-  if (!explore::rebuild_explore_order(summaries, {}, false, 0U, order, scratch, &cancelled, 0U, nullptr, &gallery_.workers()) || stop.stop_requested())
-   return {};
+  if (!explore::rebuild_explore_order(summaries, {}, false, 0U, order, scratch, &cancelled, 0U, nullptr, &gallery_.workers()) || stop.stop_requested()) return {};
   std::vector<explore::ExploreRenderClassDescriptor> classes(std::max<std::size_t>(store.header().num_classes, 1U));
   for (std::size_t index = 0U; index != store.header().num_classes; ++index) {
    const auto name = store.class_names()[index];
@@ -577,8 +556,7 @@ public:
    target.length = static_cast<std::uint8_t>(std::min<std::size_t>(name.size(), 31U));
    std::memcpy(target.name, name.data(), target.length);
    target.visible = 1U;
-   mmltk::backend::imaging::raster::color::class_color(static_cast<int>(index), static_cast<int>(classes.size()), target.color[0], target.color[1],
-                                                       target.color[2]);
+   mmltk::backend::imaging::raster::color::class_color(static_cast<int>(index), static_cast<int>(classes.size()), target.color[0], target.color[1], target.color[2]);
   }
   ExploreDatasetFacts dataset{
    .image_count = static_cast<std::uint32_t>(store.image_entries().size()),
@@ -605,13 +583,11 @@ public:
   ExploreOrderFacts order_facts{
    .matching_count = static_cast<std::uint32_t>(candidate.order.size()),
   };
-  order_facts.visible_indices.assign(candidate.order.begin(),
-                                     candidate.order.begin() + static_cast<std::ptrdiff_t>(std::min(candidate.order.size(), kExploreVisibleItemCapacity)));
+  order_facts.visible_indices.assign(candidate.order.begin(), candidate.order.begin() + static_cast<std::ptrdiff_t>(std::min(candidate.order.size(), kExploreVisibleItemCapacity)));
   open_candidate_ = std::make_shared<DatasetState>(std::move(candidate));
   return {.dataset = std::move(dataset), .order = std::move(order_facts), .dataset_identity = open_candidate_->identity};
  }
- [[nodiscard]] ExploreOrderCandidate PrepareFilter(const ExploreFilter& filter, const std::uint64_t shuffle_seed, const std::size_t nproc,
-                                                   const std::stop_token stop) override {
+ [[nodiscard]] ExploreOrderCandidate PrepareFilter(const ExploreFilter& filter, const std::uint64_t shuffle_seed, const std::size_t nproc, const std::stop_token stop) override {
   // Filtering builds a separate order over immutable summaries. Existing
   // physical inputs keep their dataset leases until the new demand can
   // adopt them by compiled identity or their callbacks settle.
@@ -622,8 +598,7 @@ public:
   std::stop_callback cancellation{stop, [&cancelled] { cancelled.store(true, std::memory_order_release); }};
   if (!RebuildOrder(dataset, filter, shuffle_seed != 0U, shuffle_seed, candidate_order_, candidate_scratch_, &cancelled)) return {};
   candidate_inverse_.assign(dataset.summaries.size(), std::numeric_limits<std::uint32_t>::max());
-  for (std::size_t position = 0; position < candidate_order_.size(); ++position)
-   candidate_inverse_[candidate_order_[position]] = static_cast<std::uint32_t>(position);
+  for (std::size_t position = 0; position < candidate_order_.size(); ++position) candidate_inverse_[candidate_order_[position]] = static_cast<std::uint32_t>(position);
   prepared_generation_ = generation;
   ExploreOrderCandidate candidate{
    .filter = filter,
@@ -731,19 +706,16 @@ public:
   const auto& order = CandidateOrder(candidate);
   const auto first = GalleryThumbnailCache::WindowFirst(order.size(), plan.viewport);
   const auto count = GalleryThumbnailCache::WindowCount(order.size(), plan.viewport);
-  return gallery_.OutputChange(plan, plan.mode == ExploreMode::Gallery ? VisibleRange(plan.viewport, candidate) : std::span<const std::uint32_t>{},
-                               &dataset->store, std::span{order}.subspan(first, count));
+  return gallery_.OutputChange(
+   plan, plan.mode == ExploreMode::Gallery ? VisibleRange(plan.viewport, candidate) : std::span<const std::uint32_t>{}, &dataset->store, std::span{order}.subspan(first, count));
  }
  void PrepareDetailOutput(mmltk::frameworks::gpu::ImageAllocation allocation) noexcept override { gallery_.PrepareDetailOutput(allocation); }
  void PrepareOutputPublication(ExploreOutputChange change, ExploreMode mode) override { gallery_.PrepareOutputPublication(change, mode); }
  void CommitOutputPublication() noexcept override { gallery_.CommitOutputPublication(); }
- mmltk::frameworks::gpu::ImageWorkspaceCoverage WorkspaceCoverage(const mmltk::frameworks::gpu::ImageWorkspaceObservation& output) override {
-  return gallery_.WorkspaceCoverage(output);
- }
+ mmltk::frameworks::gpu::ImageWorkspaceCoverage WorkspaceCoverage(const mmltk::frameworks::gpu::ImageWorkspaceObservation& output) override { return gallery_.WorkspaceCoverage(output); }
  [[nodiscard]] bool RollbackOutputPublication() noexcept override { return gallery_.RollbackOutputPublication(); }
  [[nodiscard]] ExploreGalleryPublication BeginGallery(const ExploreRenderPlan& plan, const ExploreOrderCandidate* candidate, const std::size_t nproc,
-                                                      const mmltk::frameworks::gpu::ImagePlaneView clean, const mmltk::frameworks::gpu::ImagePlaneView semantic,
-                                                      const std::uintptr_t stream) override {
+  const mmltk::frameworks::gpu::ImagePlaneView clean, const mmltk::frameworks::gpu::ImagePlaneView semantic, const std::uintptr_t stream) override {
   auto& dataset = DatasetFor(candidate);
   if (nproc != nproc_ || !plan.viewport.valid() || plan.mode != ExploreMode::Gallery) throw contracts::InvalidIntentError("Explore gallery plan is invalid");
   const auto visible = VisibleRange(plan.viewport, candidate);
@@ -751,8 +723,7 @@ public:
   const auto window_first = explore_detail::GalleryThumbnailCache::WindowFirst(order.size(), plan.viewport);
   const auto count = explore_detail::GalleryThumbnailCache::WindowCount(order.size(), plan.viewport);
   const auto window = std::span{order}.subspan(window_first, count);
-  if (gallery_.OutputChange(plan, visible, &dataset.store, window) != ExploreOutputChange::Unchanged)
-   ConfigureClasses(dataset.classes, plan.overlay, render_classes_);
+  if (gallery_.OutputChange(plan, visible, &dataset.store, window) != ExploreOutputChange::Unchanged) ConfigureClasses(dataset.classes, plan.overlay, render_classes_);
   auto store = std::shared_ptr<const data::CompiledDataset>{candidate != nullptr && open_candidate_ ? open_candidate_ : committed_, &dataset.store};
   return gallery_.Begin(plan, visible, window, window_first, std::move(store), dataset.annotated_indices, render_classes_, clean, semantic, stream);
  }
@@ -763,19 +734,16 @@ public:
   return footprint;
  }
  [[nodiscard]] bool HasGalleryTiles() const override { return gallery_.HasReadyTiles(); }
- [[nodiscard]] ExploreGalleryPublication PublishGalleryTiles(const mmltk::frameworks::gpu::ImagePlaneView clean,
-                                                             const mmltk::frameworks::gpu::ImagePlaneView semantic, const std::uintptr_t stream) override {
+ [[nodiscard]] ExploreGalleryPublication PublishGalleryTiles(
+  const mmltk::frameworks::gpu::ImagePlaneView clean, const mmltk::frameworks::gpu::ImagePlaneView semantic, const std::uintptr_t stream) override {
   return gallery_.PublishTiles(clean, semantic, stream);
  }
- void RenderDetail(const ExploreRenderPlan& plan, const std::size_t nproc, const mmltk::frameworks::gpu::ImagePlaneView clean,
-                   const mmltk::frameworks::gpu::ImagePlaneView semantic, const std::uintptr_t stream) override {
+ void RenderDetail(const ExploreRenderPlan& plan, const std::size_t nproc, const mmltk::frameworks::gpu::ImagePlaneView clean, const mmltk::frameworks::gpu::ImagePlaneView semantic,
+  const std::uintptr_t stream) override {
   RequireOpen();
-  if (nproc != nproc_ || !plan.selected_image || !Contains(*plan.selected_image))
-   throw contracts::InvalidIntentError("Explore detail selection is unavailable");
-  if (gallery_.OutputChange(plan, {}, &committed_->store, {}) != ExploreOutputChange::Unchanged)
-   ConfigureClasses(committed_->classes, plan.overlay, render_classes_);
-  gallery_.RenderDetail(plan, std::shared_ptr<const data::CompiledDataset>{committed_, &committed_->store}, committed_->annotated_indices, render_classes_,
-                        clean, semantic, stream);
+  if (nproc != nproc_ || !plan.selected_image || !Contains(*plan.selected_image)) throw contracts::InvalidIntentError("Explore detail selection is unavailable");
+  if (gallery_.OutputChange(plan, {}, &committed_->store, {}) != ExploreOutputChange::Unchanged) ConfigureClasses(committed_->classes, plan.overlay, render_classes_);
+  gallery_.RenderDetail(plan, std::shared_ptr<const data::CompiledDataset>{committed_, &committed_->store}, committed_->annotated_indices, render_classes_, clean, semantic, stream);
  }
 
 private:
@@ -794,8 +762,8 @@ private:
   RequireOpen();
   return *committed_;
  }
- [[nodiscard]] bool RebuildOrder(DatasetState& dataset, const ExploreFilter& requested, const bool shuffled, const std::uint64_t seed,
-                                 std::vector<std::uint32_t>& order, std::vector<std::uint32_t>& scratch, const std::atomic_bool* cancelled) {
+ [[nodiscard]] bool RebuildOrder(DatasetState& dataset, const ExploreFilter& requested, const bool shuffled, const std::uint64_t seed, std::vector<std::uint32_t>& order,
+  std::vector<std::uint32_t>& scratch, const std::atomic_bool* cancelled) {
   std::array<bool, data::MAX_CLASSES> enabled{};
   for (const auto index : requested.class_selection.classes)
    if (index < dataset.store.header().num_classes) enabled[index] = true;
@@ -811,14 +779,13 @@ private:
   };
   return explore::rebuild_explore_order(dataset.summaries, filter, shuffled, seed, order, scratch, cancelled, 0U, nullptr, &gallery_.workers());
  }
- static void ConfigureClasses(const std::span<const explore::ExploreRenderClassDescriptor> source, const ExploreOverlay& overlay,
-                              std::vector<explore::ExploreRenderClassDescriptor>& classes) {
+ static void ConfigureClasses(const std::span<const explore::ExploreRenderClassDescriptor> source, const ExploreOverlay& overlay, std::vector<explore::ExploreRenderClassDescriptor>& classes) {
   classes.assign(source.begin(), source.end());
   const bool unrestricted = overlay.class_selection.mode == ExploreClassSelectionMode::All;
   std::size_t visible = 0U;
   for (std::size_t class_id = 0U; class_id != classes.size(); ++class_id) {
-   const bool enabled = unrestricted || (overlay.class_selection.mode == ExploreClassSelectionMode::Subset &&
-                                         std::ranges::binary_search(overlay.class_selection.classes, static_cast<std::uint32_t>(class_id)));
+   const bool enabled =
+    unrestricted || (overlay.class_selection.mode == ExploreClassSelectionMode::Subset && std::ranges::binary_search(overlay.class_selection.classes, static_cast<std::uint32_t>(class_id)));
    classes[class_id].visible = static_cast<std::uint8_t>(enabled);
    visible += enabled ? 1U : 0U;
   }
@@ -844,15 +811,13 @@ private:
  GalleryStream gallery_;
 };
 }  // namespace explore_detail
-VisualRuntimeFactory make_native_explore_runtime_factory(const VisualDeviceSettings settings, const std::size_t nproc, ExploreNativeConfiguration configuration,
-                                                         std::optional<mmltk::frameworks::gpu::DeviceExecution> resolved_execution) {
- if (!settings.valid() || configuration.image_limit == 0U || nproc == 0U || nproc > kExploreMaximumParallelism)
-  throw contracts::InvalidIntentError("Explore native configuration is invalid");
- if (resolved_execution && (resolved_execution->device != settings.device || resolved_execution->placement.cpus.empty() ||
-                            (settings.numa_node >= 0 && resolved_execution->placement.numa_node != settings.numa_node)))
+VisualRuntimeFactory make_native_explore_runtime_factory(
+ const VisualDeviceSettings settings, const std::size_t nproc, ExploreNativeConfiguration configuration, std::optional<mmltk::frameworks::gpu::DeviceExecution> resolved_execution) {
+ if (!settings.valid() || configuration.image_limit == 0U || nproc == 0U || nproc > kExploreMaximumParallelism) throw contracts::InvalidIntentError("Explore native configuration is invalid");
+ if (resolved_execution &&
+     (resolved_execution->device != settings.device || resolved_execution->placement.cpus.empty() || (settings.numa_node >= 0 && resolved_execution->placement.numa_node != settings.numa_node)))
   throw contracts::InvalidIntentError("Explore resolved placement contradicts selected device settings");
- return [settings, nproc, execution = resolved_execution ? std::move(*resolved_execution) : resolve_visual_device_execution(settings),
-         configuration = std::move(configuration)](auto revisions) {
+ return [settings, nproc, execution = resolved_execution ? std::move(*resolved_execution) : resolve_visual_device_execution(settings), configuration = std::move(configuration)](auto revisions) {
   mmltk::common::system::ScopedExecutionPolicy construction({execution.placement.cpus, {}, 0, execution.placement.numa_node, -10, false});
   mmltk::frameworks::gpu::SystemImageRuntimeConfig config{
    .device = settings.device,

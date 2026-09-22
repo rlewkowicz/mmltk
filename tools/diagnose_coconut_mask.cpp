@@ -16,13 +16,14 @@
 #include <string>
 #include <string_view>
 #include <utility>
-
 using Json = nlohmann::json;
-template <class T> T take(arrow::Result<T> result) {
+template <class T>
+T take(arrow::Result<T> result) {
  if (!result.ok()) throw std::runtime_error(result.status().ToString());
  return std::move(result).ValueOrDie();
 }
-template <class T> std::shared_ptr<T> as(const std::shared_ptr<arrow::Array>& value) {
+template <class T>
+std::shared_ptr<T> as(const std::shared_ptr<arrow::Array>& value) {
  auto result = std::dynamic_pointer_cast<T>(value);
  if (!result) throw std::runtime_error("missing or incompatible COCONut field");
  return result;
@@ -32,9 +33,12 @@ Json fields(const arrow::StructArray& array, std::int64_t row) {
  for (int i = 0; i < array.num_fields(); ++i) {
   const auto& field = array.field(i);
   const auto name = array.struct_type()->field(i)->name();
-  if (field->IsNull(row)) result[name] = nullptr;
-  else if (field->type_id() == arrow::Type::STRING) result[name] = take(field->GetScalar(row))->ToString();
-  else result[name] = Json::parse(take(field->GetScalar(row))->ToString());
+  if (field->IsNull(row))
+   result[name] = nullptr;
+  else if (field->type_id() == arrow::Type::STRING)
+   result[name] = take(field->GetScalar(row))->ToString();
+  else
+   result[name] = Json::parse(take(field->GetScalar(row))->ToString());
  }
  return result;
 }
@@ -42,11 +46,10 @@ void inspect(std::string_view encoded, std::uint64_t id, Json metadata, bool exp
  if (encoded.size() > 64U * 1024U * 1024U) throw std::runtime_error("mask exceeds 64 MiB");
  int width = 0, height = 0, channels = 0;
  const auto* bytes = reinterpret_cast<const unsigned char*>(encoded.data());
- if (!stbi_info_from_memory(bytes, static_cast<int>(encoded.size()), &width, &height, &channels) || width <= 0 || height <= 0 ||
-     width > 32767 || height > 32767 || static_cast<std::uint64_t>(width) * height > 64U * 1024U * 1024U)
+ if (!stbi_info_from_memory(bytes, static_cast<int>(encoded.size()), &width, &height, &channels) || width <= 0 || height <= 0 || width > 32767 || height > 32767 ||
+     static_cast<std::uint64_t>(width) * height > 64U * 1024U * 1024U)
   throw std::runtime_error("invalid or oversized mask geometry");
- std::unique_ptr<unsigned char, decltype(&stbi_image_free)> pixels(
-  stbi_load_from_memory(bytes, static_cast<int>(encoded.size()), &width, &height, &channels, 3), stbi_image_free);
+ std::unique_ptr<unsigned char, decltype(&stbi_image_free)> pixels(stbi_load_from_memory(bytes, static_cast<int>(encoded.size()), &width, &height, &channels, 3), stbi_image_free);
  if (!pixels) throw std::runtime_error("cannot decode mask");
  std::map<std::uint32_t, std::uint64_t> counts;
  const auto count = static_cast<std::size_t>(width) * height;
@@ -75,8 +78,7 @@ void inspect(std::string_view encoded, std::uint64_t id, Json metadata, bool exp
   std::ofstream raw(prefix + ".mask.png", std::ios::binary);
   raw.write(encoded.data(), static_cast<std::streamsize>(encoded.size()));
   raw.close();
-  if (!raw || !stbi_write_png((prefix + ".segments.png").c_str(), width, height, 3, pixels.get(), width * 3))
-   throw std::runtime_error("cannot export mask evidence");
+  if (!raw || !stbi_write_png((prefix + ".segments.png").c_str(), width, height, 3, pixels.get(), width * 3)) throw std::runtime_error("cannot export mask evidence");
   metadata["export_prefix"] = "build/validation/benchmark-image/" + std::to_string(id);
  }
  std::cout << metadata.dump() << '\n';

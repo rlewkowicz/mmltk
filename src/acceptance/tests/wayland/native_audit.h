@@ -135,15 +135,13 @@ struct NativeAudit final {
  void record_frame(const std::uint64_t generation, const std::uint64_t revision, const std::size_t publication_ordinal);
  void record_tile_publication(const std::uint64_t generation, const std::uint64_t count, const std::size_t publication_ordinal);
  void join_gallery_publication(const std::uint64_t generation, const std::map<std::uint64_t, std::uint64_t>& complete_slots);
- void record_probe(ProbeSlots& probes, ProbeOrdinals& ordinals, const ProbeSlots::key_type& key, const ProbeSlots::mapped_type compiled_index, const bool valid,
-                   const std::string_view failure);
- void record_card_geometry(const std::uint64_t generation, const std::uint64_t slot, const std::uint64_t compiled_index, const std::uint64_t card_width,
-                           const std::uint64_t card_height, const std::uint64_t content_x, const std::uint64_t content_y, const std::uint64_t content_width,
-                           const std::uint64_t content_height);
+ void record_probe(ProbeSlots& probes, ProbeOrdinals& ordinals, const ProbeSlots::key_type& key, const ProbeSlots::mapped_type compiled_index, const bool valid, const std::string_view failure);
+ void record_card_geometry(const std::uint64_t generation, const std::uint64_t slot, const std::uint64_t compiled_index, const std::uint64_t card_width, const std::uint64_t card_height,
+  const std::uint64_t content_x, const std::uint64_t content_y, const std::uint64_t content_width, const std::uint64_t content_height);
  void consume_explore_evidence(const char* const event, const std::uint64_t value, const std::uint64_t detail = 0U, const std::uint64_t staging_bytes = 0U);
  void consume(const nlohmann::json& record);
- [[nodiscard]] std::optional<FinalCursorGenerations> final_generations_for(const std::map<std::uint64_t, std::uint64_t>& rendered_slots,
-                                                                           const std::uint64_t generation, const std::uint64_t frame_revision) const noexcept;
+ [[nodiscard]] std::optional<FinalCursorGenerations> final_generations_for(
+  const std::map<std::uint64_t, std::uint64_t>& rendered_slots, const std::uint64_t generation, const std::uint64_t frame_revision) const noexcept;
  [[nodiscard]] std::optional<std::uint64_t> generation_for(const std::map<std::uint64_t, std::uint64_t>& rendered_slots) const noexcept;
  [[nodiscard]] bool held_stale_read_discarded() const noexcept;
  [[nodiscard]] bool stale_thumbnail_discarded() const noexcept;
@@ -159,12 +157,9 @@ struct NativeAudit final {
  [[nodiscard]] bool aligned_padding_orientation(const PaddingOrientation orientation) const noexcept;
  [[nodiscard]] bool aligned_overlay_pixels() const noexcept;
  [[nodiscard]] std::string_view overlay_readiness_blocker(const bool require_pixel_probes) const noexcept;
- [[nodiscard]] std::string_view readiness_blocker(const FinalCursorGenerations final, const bool seeded_augmentation_ready,
-                                                  const bool require_overlay_pixel_probes) const noexcept;
- [[nodiscard]] bool product_completed(const FinalCursorGenerations final, const bool seeded_augmentation_ready,
-                                      const bool require_overlay_pixel_probes) const noexcept;
- [[nodiscard]] bool product_ready(const FinalCursorGenerations final, const bool seeded_augmentation_ready,
-                                  const bool require_overlay_pixel_probes) const noexcept;
+ [[nodiscard]] std::string_view readiness_blocker(const FinalCursorGenerations final, const bool seeded_augmentation_ready, const bool require_overlay_pixel_probes) const noexcept;
+ [[nodiscard]] bool product_completed(const FinalCursorGenerations final, const bool seeded_augmentation_ready, const bool require_overlay_pixel_probes) const noexcept;
+ [[nodiscard]] bool product_ready(const FinalCursorGenerations final, const bool seeded_augmentation_ready, const bool require_overlay_pixel_probes) const noexcept;
  [[nodiscard]] bool failed_before_termination() const noexcept;
  [[nodiscard]] std::string_view failure_blocker() const noexcept;
  [[nodiscard]] bool active_peer() const noexcept;

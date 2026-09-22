@@ -12,10 +12,8 @@ class DecodedNativeModelState;
 struct ModelStateLoadSummary;
 ModelStateLoadSummary apply_checkpoint_to_module(NativeRfDetrModel& module, const DecodedNativeModelState& checkpoint, bool strict = true);
 ModelStateLoadSummary apply_checkpoint_to_module(NativeRfDetrModel& module, const std::filesystem::path& checkpoint_path, bool strict = true);
-void save_native_checkpoint(const std::filesystem::path& checkpoint_path, const DecodedNativeModelState& checkpoint,
-                            const std::filesystem::path& explicit_descriptor = {});
-DecodedNativeModelState normalize_checkpoint_to_native(const std::filesystem::path& input_path, const std::filesystem::path& output_path,
-                                                       const std::filesystem::path& class_layout_path = {});
+void save_native_checkpoint(const std::filesystem::path& checkpoint_path, const DecodedNativeModelState& checkpoint, const std::filesystem::path& explicit_descriptor = {});
+DecodedNativeModelState normalize_checkpoint_to_native(const std::filesystem::path& input_path, const std::filesystem::path& output_path, const std::filesystem::path& class_layout_path = {});
 ModelStateLoadSummary load_model_weights(NativeRfDetrModel& model, const std::filesystem::path& weights_path, bool strict = false);
 // Immutable facts and exact evidence; no decoded archive or tensor custody.
 class TrainingCheckpointAdmission final {

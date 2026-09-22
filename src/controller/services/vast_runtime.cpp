@@ -36,17 +36,14 @@ bool matches_family(const mmltk::controller::contracts::ProviderGpuFamily family
   case mmltk::controller::contracts::ProviderGpuFamily::B200: return normalized_gpu_name.find("B200") != std::string_view::npos;
   case mmltk::controller::contracts::ProviderGpuFamily::H100: return normalized_gpu_name.find("H100") != std::string_view::npos;
   case mmltk::controller::contracts::ProviderGpuFamily::H200: return normalized_gpu_name.find("H200") != std::string_view::npos;
-  case mmltk::controller::contracts::ProviderGpuFamily::LSeries:
-   return normalized_gpu_name.starts_with("L4") || normalized_gpu_name.starts_with("L20") || normalized_gpu_name.starts_with("L40");
+  case mmltk::controller::contracts::ProviderGpuFamily::LSeries: return normalized_gpu_name.starts_with("L4") || normalized_gpu_name.starts_with("L20") || normalized_gpu_name.starts_with("L40");
  }
  return false;
 }
 std::optional<mmltk::controller::contracts::ProviderGpuFamily> classify_family(std::string_view gpu_name) {
  const std::string normalized = normalize_gpu_name(gpu_name);
- for (const mmltk::controller::contracts::ProviderGpuFamily family :
-      {mmltk::controller::contracts::ProviderGpuFamily::A100, mmltk::controller::contracts::ProviderGpuFamily::B200,
-       mmltk::controller::contracts::ProviderGpuFamily::H100, mmltk::controller::contracts::ProviderGpuFamily::H200,
-       mmltk::controller::contracts::ProviderGpuFamily::LSeries}) {
+ for (const mmltk::controller::contracts::ProviderGpuFamily family : {mmltk::controller::contracts::ProviderGpuFamily::A100, mmltk::controller::contracts::ProviderGpuFamily::B200,
+       mmltk::controller::contracts::ProviderGpuFamily::H100, mmltk::controller::contracts::ProviderGpuFamily::H200, mmltk::controller::contracts::ProviderGpuFamily::LSeries}) {
   if (matches_family(family, normalized)) { return family; }
  }
  return std::nullopt;
@@ -97,9 +94,7 @@ std::vector<json> extract_offer_objects(const json& payload) {
  }
  throw std::runtime_error("Vast bridge returned an unexpected search-offers payload shape");
 }
-std::string build_vast_search_query(const int min_gpus) {
- return "rentable=True rented=False verified=True external=False num_gpus>=" + std::to_string(std::max(1, min_gpus));
-}
+std::string build_vast_search_query(const int min_gpus) { return "rentable=True rented=False verified=True external=False num_gpus>=" + std::to_string(std::max(1, min_gpus)); }
 std::vector<json> extract_instance_objects(const json& payload) {
  if (payload.is_array()) { return payload.get<std::vector<json>>(); }
  if (payload.is_object()) {
@@ -176,28 +171,22 @@ std::string run_vast_bridge_command(const VastBridgeConfig& config, const std::v
    [&](const int stdout_fd, const int setup_error_fd) {
     mmltk::frameworks::process::prepare_captured_output_child(stdout_fd, setup_error_fd);
     if (!config.api_key.empty()) {
-     mmltk::frameworks::process::require_child_setup_step(::setenv("VAST_API_KEY", config.api_key.c_str(), 1) == 0, setup_error_fd,
-                                                          mmltk::frameworks::process::ChildSetupStage::SetEnvironment);
+     mmltk::frameworks::process::require_child_setup_step(::setenv("VAST_API_KEY", config.api_key.c_str(), 1) == 0, setup_error_fd, mmltk::frameworks::process::ChildSetupStage::SetEnvironment);
     }
-    mmltk::frameworks::process::require_child_setup_step(::setenv("MMLTK_VAST_HTTP_TIMEOUT_SECONDS", http_timeout_seconds.c_str(), 1) == 0, setup_error_fd,
-                                                         mmltk::frameworks::process::ChildSetupStage::SetEnvironment);
+    mmltk::frameworks::process::require_child_setup_step(
+     ::setenv("MMLTK_VAST_HTTP_TIMEOUT_SECONDS", http_timeout_seconds.c_str(), 1) == 0, setup_error_fd, mmltk::frameworks::process::ChildSetupStage::SetEnvironment);
     ::execvp(argv.program(), argv.data());
     mmltk::frameworks::process::fail_child_setup(setup_error_fd, mmltk::frameworks::process::ChildSetupStage::Exec);
    },
    {}, invocation.deadline, invocation.cancellation_fd, true, kVastBridgeOutputCapacity);
  } catch (const mmltk::frameworks::process::CapturedChildAborted& error) {
-  throw VastBridgeError(
-   error.reason() == mmltk::frameworks::process::CapturedChildAbortReason::TimedOut ? VastBridgeFailureKind::TimedOut : VastBridgeFailureKind::Cancelled,
-   error.what());
+  throw VastBridgeError(error.reason() == mmltk::frameworks::process::CapturedChildAbortReason::TimedOut ? VastBridgeFailureKind::TimedOut : VastBridgeFailureKind::Cancelled, error.what());
  } catch (const VastBridgeError&) { throw; } catch (const std::exception& error) {
   throw VastBridgeError(VastBridgeFailureKind::Process, error.what());
  }
- if (captured.setup_failure.has_value()) {
-  throw VastBridgeError(VastBridgeFailureKind::ChildSetup, mmltk::frameworks::process::format_child_setup_failure(*captured.setup_failure, "Vast bridge"));
- }
+ if (captured.setup_failure.has_value()) { throw VastBridgeError(VastBridgeFailureKind::ChildSetup, mmltk::frameworks::process::format_child_setup_failure(*captured.setup_failure, "Vast bridge")); }
  if (!WIFEXITED(captured.status) || WEXITSTATUS(captured.status) != 0) {
-  const VastBridgeFailureKind failure =
-   WIFEXITED(captured.status) && WEXITSTATUS(captured.status) == 65 ? VastBridgeFailureKind::Parse : VastBridgeFailureKind::Api;
+  const VastBridgeFailureKind failure = WIFEXITED(captured.status) && WEXITSTATUS(captured.status) == 65 ? VastBridgeFailureKind::Parse : VastBridgeFailureKind::Api;
   throw VastBridgeError(failure, captured.output.empty() ? "Vast bridge failed" : captured.output);
  }
  return trim_copy(captured.output);
@@ -259,9 +248,7 @@ const char* remote_gpu_family_label(const mmltk::controller::contracts::Provider
  }
  return "Unknown";
 }
-std::string summarize_selected_remote_gpu_families(const std::vector<mmltk::controller::contracts::ProviderGpuFamily>& families) {
- return std::to_string(families.size()) + " families selected";
-}
+std::string summarize_selected_remote_gpu_families(const std::vector<mmltk::controller::contracts::ProviderGpuFamily>& families) { return std::to_string(families.size()) + " families selected"; }
 std::vector<VastRawOffer> parse_vast_offer_payload(std::string_view payload) {
  const json parsed = parse_json_payload(payload, "Vast offer payload");
  const std::vector<json> offer_objects = extract_offer_objects(parsed);
@@ -442,9 +429,8 @@ std::vector<VastInstanceInfo> parse_vast_instances_payload(std::string_view payl
  }
  return instances;
 }
-std::vector<VastOfferSummary> rank_vast_offers(const std::vector<VastRawOffer>& offers,
-                                               const std::vector<mmltk::controller::contracts::ProviderGpuFamily>& selected_families,
-                                               const std::size_t result_limit, const int min_gpus) {
+std::vector<VastOfferSummary> rank_vast_offers(
+ const std::vector<VastRawOffer>& offers, const std::vector<mmltk::controller::contracts::ProviderGpuFamily>& selected_families, const std::size_t result_limit, const int min_gpus) {
  std::vector<VastOfferSummary> filtered;
  filtered.reserve(offers.size());
  for (const VastRawOffer& offer : offers) {
@@ -474,13 +460,11 @@ VastBridgeConfig make_vast_bridge_config(const std::string_view api_key) {
  config.api_key = std::string(api_key);
  return config;
 }
-VastCreateInstanceResult create_vast_instance(const VastBridgeConfig& config, const int offer_id, const std::string_view image,
-                                              const VastLaunchTemplateOptions& options) {
- return with_local_vast_invocation<VastCreateInstanceResult>(
-  [&](const VastBridgeInvocation& invocation) { return create_vast_instance(config, offer_id, image, options, invocation); });
+VastCreateInstanceResult create_vast_instance(const VastBridgeConfig& config, const int offer_id, const std::string_view image, const VastLaunchTemplateOptions& options) {
+ return with_local_vast_invocation<VastCreateInstanceResult>([&](const VastBridgeInvocation& invocation) { return create_vast_instance(config, offer_id, image, options, invocation); });
 }
-VastCreateInstanceResult create_vast_instance(const VastBridgeConfig& config, const int offer_id, const std::string_view image,
-                                              const VastLaunchTemplateOptions& options, const VastBridgeInvocation& invocation) {
+VastCreateInstanceResult create_vast_instance(
+ const VastBridgeConfig& config, const int offer_id, const std::string_view image, const VastLaunchTemplateOptions& options, const VastBridgeInvocation& invocation) {
  require_vast_api_key(config, "remote Vast instance creation");
  if (offer_id <= 0) { throw std::runtime_error("remote Vast instance creation requires a positive offer id"); }
  if (image.empty()) { throw std::runtime_error("remote Vast instance creation requires a container image"); }
@@ -518,8 +502,7 @@ VastCreateInstanceResult create_vast_instance(const VastBridgeConfig& config, co
  return classify_parse_failure([&] { return parse_vast_create_instance_payload(output); });
 }
 VastInstanceInfo show_vast_instance(const VastBridgeConfig& config, const int instance_id) {
- return with_local_vast_invocation<VastInstanceInfo>(
-  [&](const VastBridgeInvocation& invocation) { return show_vast_instance(config, instance_id, invocation); });
+ return with_local_vast_invocation<VastInstanceInfo>([&](const VastBridgeInvocation& invocation) { return show_vast_instance(config, instance_id, invocation); });
 }
 VastInstanceInfo show_vast_instance(const VastBridgeConfig& config, const int instance_id, const VastBridgeInvocation& invocation) {
  require_vast_api_key(config, "remote Vast instance lookup");
@@ -528,8 +511,7 @@ VastInstanceInfo show_vast_instance(const VastBridgeConfig& config, const int in
  return classify_parse_failure([&] { return parse_vast_instance_payload(output); });
 }
 std::vector<VastInstanceInfo> show_vast_instances(const VastBridgeConfig& config) {
- return with_local_vast_invocation<std::vector<VastInstanceInfo>>(
-  [&](const VastBridgeInvocation& invocation) { return show_vast_instances(config, invocation); });
+ return with_local_vast_invocation<std::vector<VastInstanceInfo>>([&](const VastBridgeInvocation& invocation) { return show_vast_instances(config, invocation); });
 }
 std::vector<VastInstanceInfo> show_vast_instances(const VastBridgeConfig& config, const VastBridgeInvocation& invocation) {
  require_vast_api_key(config, "remote Vast instance listing");
@@ -537,11 +519,9 @@ std::vector<VastInstanceInfo> show_vast_instances(const VastBridgeConfig& config
  return classify_parse_failure([&] { return parse_vast_instances_payload(output); });
 }
 std::string fetch_vast_instance_logs(const VastBridgeConfig& config, const int instance_id, const std::optional<std::size_t> tail_lines) {
- return with_local_vast_invocation<std::string>(
-  [&](const VastBridgeInvocation& invocation) { return fetch_vast_instance_logs(config, instance_id, tail_lines, invocation); });
+ return with_local_vast_invocation<std::string>([&](const VastBridgeInvocation& invocation) { return fetch_vast_instance_logs(config, instance_id, tail_lines, invocation); });
 }
-std::string fetch_vast_instance_logs(const VastBridgeConfig& config, const int instance_id, const std::optional<std::size_t> tail_lines,
-                                     const VastBridgeInvocation& invocation) {
+std::string fetch_vast_instance_logs(const VastBridgeConfig& config, const int instance_id, const std::optional<std::size_t> tail_lines, const VastBridgeInvocation& invocation) {
  require_vast_api_key(config, "remote Vast log retrieval");
  if (instance_id <= 0) { throw std::runtime_error("remote Vast log retrieval requires a positive instance id"); }
  std::vector<std::string> bridge_args{
@@ -572,33 +552,26 @@ void mutate_vast_instance(const VastBridgeConfig& config, const int instance_id,
  const std::string output = run_vast_bridge_command(config, {std::string(action.command), std::to_string(instance_id)}, invocation);
  classify_parse_failure([&] { expect_vast_action_success(output, action.payload); });
 }
-void start_vast_instance(const VastBridgeConfig& config, const int instance_id, const VastBridgeInvocation& invocation) {
- mutate_vast_instance(config, instance_id, invocation, kVastStartInstance);
+void start_vast_instance(const VastBridgeConfig& config, const int instance_id, const VastBridgeInvocation& invocation) { mutate_vast_instance(config, instance_id, invocation, kVastStartInstance); }
+void stop_vast_instance(const VastBridgeConfig& config, const int instance_id, const VastBridgeInvocation& invocation) { mutate_vast_instance(config, instance_id, invocation, kVastStopInstance); }
+std::vector<VastOfferSummary> query_vast_offers(const VastQueryConfig& config, const std::vector<mmltk::controller::contracts::ProviderGpuFamily>& selected_families) {
+ return with_local_vast_invocation<std::vector<VastOfferSummary>>([&](const VastBridgeInvocation& invocation) { return query_vast_offers(config, selected_families, invocation); });
 }
-void stop_vast_instance(const VastBridgeConfig& config, const int instance_id, const VastBridgeInvocation& invocation) {
- mutate_vast_instance(config, instance_id, invocation, kVastStopInstance);
-}
-std::vector<VastOfferSummary> query_vast_offers(const VastQueryConfig& config,
-                                                const std::vector<mmltk::controller::contracts::ProviderGpuFamily>& selected_families) {
- return with_local_vast_invocation<std::vector<VastOfferSummary>>(
-  [&](const VastBridgeInvocation& invocation) { return query_vast_offers(config, selected_families, invocation); });
-}
-std::vector<VastOfferSummary> query_vast_offers(const VastQueryConfig& config,
-                                                const std::vector<mmltk::controller::contracts::ProviderGpuFamily>& selected_families,
-                                                const VastBridgeInvocation& invocation) {
+std::vector<VastOfferSummary> query_vast_offers(
+ const VastQueryConfig& config, const std::vector<mmltk::controller::contracts::ProviderGpuFamily>& selected_families, const VastBridgeInvocation& invocation) {
  require_vast_api_key(config, "remote Vast query");
  if (selected_families.empty()) { throw std::runtime_error("remote Vast query requires at least one selected GPU family"); }
  const std::string output = run_vast_bridge_command(config,
-                                                    {
-                                                     "search-offers",
-                                                     "--query",
-                                                     build_vast_search_query(config.min_gpus),
-                                                     "--limit",
-                                                     std::to_string(std::max<std::size_t>(32, config.result_limit * 16U)),
-                                                     "--order",
-                                                     "dlperf_usd-",
-                                                    },
-                                                    invocation);
+  {
+   "search-offers",
+   "--query",
+   build_vast_search_query(config.min_gpus),
+   "--limit",
+   std::to_string(std::max<std::size_t>(32, config.result_limit * 16U)),
+   "--order",
+   "dlperf_usd-",
+  },
+  invocation);
  return classify_parse_failure([&] { return rank_vast_offers(parse_vast_offer_payload(output), selected_families, config.result_limit, config.min_gpus); });
 }
 }  // namespace mmltk::controller::services

@@ -80,9 +80,7 @@ struct IntegrationControlReceipt final {
  if (receipt.failure.size() > kIntegrationFailureMaxBytes || (receipt.kind != IntegrationControlKind::Failed && !receipt.failure.empty())) return false;
  bool valid = false;
  visit_integration_commands([&]<auto Kind, auto Policy>(auto) {
-  if (receipt.kind == Kind)
-   valid = (receipt.read_generation != 0U) == Policy.read_generation && (Policy.compiled_index || receipt.compiled_index == 0U) &&
-           (!Policy.server || receipt.progress == 0U);
+  if (receipt.kind == Kind) valid = (receipt.read_generation != 0U) == Policy.read_generation && (Policy.compiled_index || receipt.compiled_index == 0U) && (!Policy.server || receipt.progress == 0U);
  });
  return valid;
 }

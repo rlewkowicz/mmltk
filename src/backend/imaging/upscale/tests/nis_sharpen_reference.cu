@@ -24,19 +24,16 @@ __global__ void fixture_pixels(HalfRgba* scaled, Configuration config, unsigned 
  if (pattern == 2U) value = static_cast<float>((x * 31U + y * 17U) % 1024U) / 1024.0F + 1.0F / 4096.0F;
  if (pattern == 3U) value = static_cast<float>((x + y) % 32U) / 32.0F;
  if (pattern == 4U) value = static_cast<float>((x % 2U == 0U ? y * 19U : x * 43U) % 256U) / 255.0F;
- scaled[index] =
-  HalfRgba{__float2half_rn(value), __float2half_rn(pattern == 0U ? value : 1.0F - value), __float2half_rn(value * 0.75F), __float2half_rn(0.25F)};
+ scaled[index] = HalfRgba{__float2half_rn(value), __float2half_rn(pattern == 0U ? value : 1.0F - value), __float2half_rn(value * 0.75F), __float2half_rn(0.25F)};
 }
 // Independent numerical oracle: the reviewed six-tap chains are both
 // evaluated before gradient selection. Do not share production sharpening.
 // CLEANUP-IGNORE: Independent numerical oracle retains original alpha-coordinate arithmetic; sharing production code would invalidate the comparison.
-__device__ __forceinline__ std::uint32_t nearest_source_coordinate(const std::uint32_t output_coordinate, const std::uint32_t crop_extent,
-                                                                   const std::uint32_t output_extent) {
+__device__ __forceinline__ std::uint32_t nearest_source_coordinate(const std::uint32_t output_coordinate, const std::uint32_t crop_extent, const std::uint32_t output_extent) {
  const std::uint64_t centered = static_cast<std::uint64_t>(output_coordinate) * crop_extent + crop_extent / 2U;
  return min(crop_extent - 1U, static_cast<std::uint32_t>(centered / output_extent));
 }
-__device__ __forceinline__ std::uint8_t source_alpha_byte(const void* source, const std::size_t pitch, const Configuration config, const std::uint32_t x,
-                                                          const std::uint32_t y) {
+__device__ __forceinline__ std::uint8_t source_alpha_byte(const void* source, const std::size_t pitch, const Configuration config, const std::uint32_t x, const std::uint32_t y) {
  const std::uint32_t source_x = config.crop_x + nearest_source_coordinate(x, config.crop_width, config.output_width);
  const std::uint32_t source_y = config.crop_y + nearest_source_coordinate(y, config.crop_height, config.output_height);
  const auto* row = static_cast<const std::uint8_t*>(source) + static_cast<std::size_t>(source_y) * pitch;
@@ -47,8 +44,7 @@ __device__ __forceinline__ HalfRgba load_clamped(const HalfRgba* pixels, const C
  const std::uint32_t clamped_y = static_cast<std::uint32_t>(max(0, min(static_cast<int>(config.output_height) - 1, y)));
  return pixels[static_cast<std::size_t>(clamped_y) * config.output_width + clamped_x];
 }
-__global__ void dual_direction_kernel(const void* source, const std::size_t source_pitch, const HalfRgba* scaled, std::uint8_t* target,
-                                      const std::size_t target_pitch, const Configuration config) {
+__global__ void dual_direction_kernel(const void* source, const std::size_t source_pitch, const HalfRgba* scaled, std::uint8_t* target, const std::size_t target_pitch, const Configuration config) {
  const std::uint64_t index = static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
  // CLEANUP-IGNORE: Independent dual-direction oracle retains original pixel and neighbor selection; do not share production sharpening.
  const std::uint64_t total = static_cast<std::uint64_t>(config.output_width) * config.output_height;
@@ -80,18 +76,15 @@ __global__ void dual_direction_kernel(const void* source, const std::size_t sour
   vertical.y = fmaf(vertical_coefficient, __half2float(vertical_sample.green), vertical.y);
   vertical.z = fmaf(vertical_coefficient, __half2float(vertical_sample.blue), vertical.z);
  }
- const float horizontal_gradient =
-  fabsf(0.2126F * (__half2float(left.red) - __half2float(right.red)) + 0.7152F * (__half2float(left.green) - __half2float(right.green)) +
-        0.0722F * (__half2float(left.blue) - __half2float(right.blue)));
- const float vertical_gradient =
-  fabsf(0.2126F * (__half2float(top.red) - __half2float(bottom.red)) + 0.7152F * (__half2float(top.green) - __half2float(bottom.green)) +
-        0.0722F * (__half2float(top.blue) - __half2float(bottom.blue)));
+ const float horizontal_gradient = fabsf(
+  0.2126F * (__half2float(left.red) - __half2float(right.red)) + 0.7152F * (__half2float(left.green) - __half2float(right.green)) + 0.0722F * (__half2float(left.blue) - __half2float(right.blue)));
+ const float vertical_gradient = fabsf(
+  0.2126F * (__half2float(top.red) - __half2float(bottom.red)) + 0.7152F * (__half2float(top.green) - __half2float(bottom.green)) + 0.0722F * (__half2float(top.blue) - __half2float(bottom.blue)));
  const float3 detail = horizontal_gradient <= vertical_gradient ? horizontal : vertical;
  // CLEANUP-IGNORE: Independent numerical oracle retains original output arithmetic and rounding; production sharing would make byte equivalence circular.
  const float magnitude = fabsf(fmaf(0.2126F, detail.x, fmaf(0.7152F, detail.y, 0.0722F * detail.z)));
  const float strength = 0.18F + 0.16F * fminf(1.0F, magnitude * 8.0F);
- const float4 color = make_float4(fmaf(strength, detail.x, __half2float(center.red)), fmaf(strength, detail.y, __half2float(center.green)),
-                                  fmaf(strength, detail.z, __half2float(center.blue)), 0.0F);
+ const float4 color = make_float4(fmaf(strength, detail.x, __half2float(center.red)), fmaf(strength, detail.y, __half2float(center.green)), fmaf(strength, detail.z, __half2float(center.blue)), 0.0F);
  auto* output = target + static_cast<std::size_t>(y) * target_pitch + static_cast<std::size_t>(x) * 4U;
  output[0] = static_cast<std::uint8_t>(__float2int_rn(fminf(1.0F, fmaxf(0.0F, color.x)) * 255.0F));
  output[1] = static_cast<std::uint8_t>(__float2int_rn(fminf(1.0F, fmaxf(0.0F, color.y)) * 255.0F));
@@ -99,11 +92,10 @@ __global__ void dual_direction_kernel(const void* source, const std::size_t sour
  output[3] = source_alpha_byte(source, source_pitch, config, x, y);
 }
 }  // namespace
-cudaError_t sharpen_reference(const void* source, std::size_t source_pitch, const void* scaled, std::uint8_t* target, std::size_t target_pitch,
-                              const image_upscaler_nis::Configuration& config, cudaStream_t stream) {
+cudaError_t sharpen_reference(
+ const void* source, std::size_t source_pitch, const void* scaled, std::uint8_t* target, std::size_t target_pitch, const image_upscaler_nis::Configuration& config, cudaStream_t stream) {
  const std::uint64_t count = static_cast<std::uint64_t>(config.output_width) * config.output_height;
- dual_direction_kernel<<<static_cast<unsigned int>((count + 255U) / 256U), 256U, 0U, stream>>>(source, source_pitch, static_cast<const HalfRgba*>(scaled),
-                                                                                               target, target_pitch, config);
+ dual_direction_kernel<<<static_cast<unsigned int>((count + 255U) / 256U), 256U, 0U, stream>>>(source, source_pitch, static_cast<const HalfRgba*>(scaled), target, target_pitch, config);
  return cudaPeekAtLastError();
 }
 std::size_t scaled_pixel_bytes() noexcept { return sizeof(HalfRgba); }

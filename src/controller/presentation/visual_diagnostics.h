@@ -178,9 +178,8 @@ struct VisualDiagnosticNameMaterializer final {
   std::array<std::string_view, Reflection::enumerators.size()> names{};
   std::size_t index = 0U;
   template for (constexpr auto enumerator : Reflection::enumerators) {
-   static_assert(mmltk::frameworks::reflection::reflected_annotation_count<enumerator>(
-                  []<class Annotation> { return std::is_same_v<Annotation, VisualDiagnosticName>; }) == 1U,
-                 "each visual diagnostic operation requires exactly one name annotation");
+   static_assert(mmltk::frameworks::reflection::reflected_annotation_count<enumerator>([]<class Annotation> { return std::is_same_v<Annotation, VisualDiagnosticName>; }) == 1U,
+    "each visual diagnostic operation requires exactly one name annotation");
    if (static_cast<std::size_t>([:enumerator:]) != index) throw "visual diagnostic operations require dense unique values starting at zero";
    template for (constexpr auto annotation : mmltk::frameworks::reflection::reflected_annotations<enumerator>()) {
     using Annotation = std::remove_cvref_t<typename[:std::meta::type_of(annotation):]>;
@@ -188,8 +187,7 @@ struct VisualDiagnosticNameMaterializer final {
      constexpr auto name = std::meta::extract<Annotation>(annotation);
      const std::string_view alias{name.value};
      if (alias.empty() || !std::all_of(alias.begin(), alias.end(), [](const char character) {
-          return (character >= 'a' && character <= 'z') || (character >= 'A' && character <= 'Z') || (character >= '0' && character <= '9') ||
-                 character == '.' || character == '_';
+          return (character >= 'a' && character <= 'z') || (character >= 'A' && character <= 'Z') || (character >= '0' && character <= '9') || character == '.' || character == '_';
          }))
       throw "visual diagnostic names require nonempty alphanumeric, dot, or underscore text";
      names[index] = std::define_static_string(std::string_view{name.value});
@@ -266,8 +264,7 @@ struct VisualWorkspaceDiagnostics final {
  if (!target.valid()) return {};
  return {
   .context = &target,
-  .write = [](void* context,
-              VisualDiagnosticFact fact) noexcept { static_cast<services::RuntimeDiagnosticTarget*>(context)->write(visual_runtime_diagnostic(fact)); },
+  .write = [](void* context, VisualDiagnosticFact fact) noexcept { static_cast<services::RuntimeDiagnosticTarget*>(context)->write(visual_runtime_diagnostic(fact)); },
   .write_batch =
    [](void* context, const std::span<const VisualDiagnosticFact> facts) noexcept {
     constexpr std::size_t capacity = 25U;

@@ -9,8 +9,7 @@ namespace mmltk::backend::media::live {
 namespace runtime = mmltk::backend::ml::runtime;
 class LiveAnalysisFrame final {
 public:
- inline LiveAnalysisFrame(std::uint32_t slot, LiveFrameId frame, std::span<runtime::AnalysisAnnotationStorage> annotations,
-                          runtime::AnalysisResult result) noexcept
+ inline LiveAnalysisFrame(std::uint32_t slot, LiveFrameId frame, std::span<runtime::AnalysisAnnotationStorage> annotations, runtime::AnalysisResult result) noexcept
      : slot_(slot), frame_(frame), annotations_(annotations), result_(std::move(result)) {}
  LiveAnalysisFrame(const LiveAnalysisFrame&) = delete;
  LiveAnalysisFrame& operator=(const LiveAnalysisFrame&) = delete;

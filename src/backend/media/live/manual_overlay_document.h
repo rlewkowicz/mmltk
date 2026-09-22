@@ -49,13 +49,9 @@ struct ManualOverlayDeferredMaskProjection {
  std::uint32_t run_count = 0;
  std::size_t run_value_count = 0;
 };
-[[nodiscard]] bool manual_overlay_mask_region_contained(const ManualOverlayMaskRegion& region, std::uint32_t target_width,
-                                                        std::uint32_t target_height) noexcept;
-[[nodiscard]] std::optional<ManualOverlayDeferredMaskProjection> validate_manual_overlay_deferred_mask(const ManualOverlayDeferredMaskMapping& mapping,
-                                                                                                       const ManualOverlayMaskRegion& region,
-                                                                                                       std::span<const ManualOverlayMaskRun> runs,
-                                                                                                       std::uint32_t target_width,
-                                                                                                       std::uint32_t target_height) noexcept;
+[[nodiscard]] bool manual_overlay_mask_region_contained(const ManualOverlayMaskRegion& region, std::uint32_t target_width, std::uint32_t target_height) noexcept;
+[[nodiscard]] std::optional<ManualOverlayDeferredMaskProjection> validate_manual_overlay_deferred_mask(
+ const ManualOverlayDeferredMaskMapping& mapping, const ManualOverlayMaskRegion& region, std::span<const ManualOverlayMaskRun> runs, std::uint32_t target_width, std::uint32_t target_height) noexcept;
 struct ManualOverlayPoint {
  int x = 0;
  int y = 0;
@@ -113,10 +109,9 @@ struct ManualOverlayDocumentSnapshot {
  std::optional<ManualOverlayBrushPreview> brush_preview;
  SemanticRenderer renderer_mode = SemanticRenderer::NativeImageView;
  [[nodiscard]] bool same_content(const ManualOverlayDocumentSnapshot& other) const {
-  return document_generation == other.document_generation && session_revision == other.session_revision && interaction_ack == other.interaction_ack &&
-         capture_width == other.capture_width && capture_height == other.capture_height && instances == other.instances &&
-         interaction_instances == other.interaction_instances && selected_instance == other.selected_instance && brush_preview == other.brush_preview &&
-         renderer_mode == other.renderer_mode;
+  return document_generation == other.document_generation && session_revision == other.session_revision && interaction_ack == other.interaction_ack && capture_width == other.capture_width &&
+         capture_height == other.capture_height && instances == other.instances && interaction_instances == other.interaction_instances && selected_instance == other.selected_instance &&
+         brush_preview == other.brush_preview && renderer_mode == other.renderer_mode;
  }
 };
 class ManualOverlayDocument {

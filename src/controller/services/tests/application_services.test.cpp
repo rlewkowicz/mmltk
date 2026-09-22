@@ -106,20 +106,17 @@ void require_one_terminal_wake(DiagnosticsClient& diagnostics) {
   std::ofstream stream(helper);
   stream << "#!/bin/sh\n" << body << "\n";
  }
- std::filesystem::permissions(helper, std::filesystem::perms::owner_read | std::filesystem::perms::owner_write | std::filesystem::perms::owner_exec,
-                              std::filesystem::perm_options::replace);
+ std::filesystem::permissions(helper, std::filesystem::perms::owner_read | std::filesystem::perms::owner_write | std::filesystem::perms::owner_exec, std::filesystem::perm_options::replace);
  return helper;
 }
 [[nodiscard]] FileDialogRequest dialog_request(const std::string_view title = "Select",
-                                               const mmltk::controller::contracts::FileDialogMode mode = mmltk::controller::contracts::FileDialogMode::OpenFile,
-                                               const std::string_view filter = "Files", const std::string_view pattern = "*") {
+ const mmltk::controller::contracts::FileDialogMode mode = mmltk::controller::contracts::FileDialogMode::OpenFile, const std::string_view filter = "Files", const std::string_view pattern = "*") {
  return {.title = mmltk::controller::services::BoundedText<mmltk::controller::services::kFileDialogTextCapacity>::From(title),
-         .mode = mode,
-         .filter = {.name = mmltk::controller::services::BoundedText<mmltk::controller::services::kFileDialogTextCapacity>::From(filter),
-                    .pattern = mmltk::controller::services::BoundedText<mmltk::controller::services::kFileDialogTextCapacity>::From(pattern)}};
+  .mode = mode,
+  .filter = {.name = mmltk::controller::services::BoundedText<mmltk::controller::services::kFileDialogTextCapacity>::From(filter),
+   .pattern = mmltk::controller::services::BoundedText<mmltk::controller::services::kFileDialogTextCapacity>::From(pattern)}};
 }
-[[nodiscard]] FileDialogResult run_dialog(const std::filesystem::path& helper, const std::filesystem::path& launch_directory, const FileDialogRequest& request,
-                                          const bool cancel_before_run = false) {
+[[nodiscard]] FileDialogResult run_dialog(const std::filesystem::path& helper, const std::filesystem::path& launch_directory, const FileDialogRequest& request, const bool cancel_before_run = false) {
  FileDialogClientOwner owner{helper.string(), launch_directory.string()};
  auto [cancellation, token] = FileDialogCancellationSource::Mint();
  if (cancel_before_run) REQUIRE(cancellation.RequestCancel());
@@ -312,8 +309,7 @@ TEST_CASE("diagnostics disabled producers perform no submission work", "[gui][se
  DiagnosticCountingClock::reads = 0U;
  RuntimeDiagnosticSpan<RuntimeDiagnosticTarget, RuntimeDiagnosticFact, DiagnosticCountingClock> span{target, [&] {
                                                                                                       ++collections;
-                                                                                                      return std::pair{RuntimeDiagnosticFact{},
-                                                                                                                       RuntimeDiagnosticFact{}};
+                                                                                                      return std::pair{RuntimeDiagnosticFact{}, RuntimeDiagnosticFact{}};
                                                                                                      }};
  span.FinishWith([&](auto&) { ++collections; });
  target.Emit([&] {
@@ -397,9 +393,25 @@ TEST_CASE("bounded runtime projection escapes valid text and rejects malformed U
  SECTION("embedded NUL") { message.assign("a\0b", 3U); }
  runtime.write({.event = "text", .message = message});
  for (const std::string_view malformed : {
-       "\x80",         "\xbf",         "\xc0\x80",         "\xc1\xbf",         "\xe0\x80\x80", "\xe0\x9f\xbf", "\xf0\x80\x80\x80", "\xf0\x8f\xbf\xbf",
-       "\xed\xa0\x80", "\xed\xbf\xbf", "\xf4\x90\x80\x80", "\xf5\x80\x80\x80", "\xff",         "\xc2x",        "\xe1\x80x",        "\xf1\x80\x80x",
-       "\xc2",         "\xe0\xa0",     "\xf0\x90\x80",
+       "\x80",
+       "\xbf",
+       "\xc0\x80",
+       "\xc1\xbf",
+       "\xe0\x80\x80",
+       "\xe0\x9f\xbf",
+       "\xf0\x80\x80\x80",
+       "\xf0\x8f\xbf\xbf",
+       "\xed\xa0\x80",
+       "\xed\xbf\xbf",
+       "\xf4\x90\x80\x80",
+       "\xf5\x80\x80\x80",
+       "\xff",
+       "\xc2x",
+       "\xe1\x80x",
+       "\xf1\x80\x80x",
+       "\xc2",
+       "\xe0\xa0",
+       "\xf0\x90\x80",
       }) {
   runtime.write({.event = "text", .message = malformed});
  }
@@ -452,8 +464,8 @@ TEST_CASE("diagnostic spans preserve typed correlation and explicit scope outcom
  } catch (const std::runtime_error&) {}
  { RuntimeDiagnosticSpan span{target, facts}; }
  diagnostics.close();
- const std::array outcomes{contracts::DiagnosticSpanOutcome::Success, contracts::DiagnosticSpanOutcome::Cancelled, contracts::DiagnosticSpanOutcome::Exception,
-                           contracts::DiagnosticSpanOutcome::ScopeExit};
+ const std::array outcomes{
+  contracts::DiagnosticSpanOutcome::Success, contracts::DiagnosticSpanOutcome::Cancelled, contracts::DiagnosticSpanOutcome::Exception, contracts::DiagnosticSpanOutcome::ScopeExit};
  std::ifstream input{path};
  std::string line;
  for (const auto outcome : outcomes) {
@@ -486,8 +498,7 @@ TEST_CASE("diagnostic span overflow and shutdown lose effects only", "[gui][serv
  RuntimeDiagnostics runtime{diagnostics.producer()};
  auto target = runtime.target();
  const auto operation = diagnostics.producer().acquire();
- for (std::size_t index = 0U; index < DiagnosticsClient::kQueueCapacity; ++index)
-  REQUIRE(operation.submit({"{\"event\":\"full\"}"}) == DiagnosticSubmitResult::Accepted);
+ for (std::size_t index = 0U; index < DiagnosticsClient::kQueueCapacity; ++index) REQUIRE(operation.submit({"{\"event\":\"full\"}"}) == DiagnosticSubmitResult::Accepted);
  bool executed = false;
  {
   RuntimeDiagnosticSpan span{target, [] { return std::pair{RuntimeDiagnosticFact{.event = "begin"}, RuntimeDiagnosticFact{.event = "end"}}; }};
@@ -669,9 +680,7 @@ TEST_CASE("diagnostics validates records and fixed capacity", "[gui][services]")
  CHECK(operation.submit({" \t{\"valid\":true}\t "}) == DiagnosticSubmitResult::Accepted);
  std::string oversized(DiagnosticsClient::kRecordCapacity + 1U, 'x');
  CHECK(operation.submit({oversized}) == DiagnosticSubmitResult::RecordTooLarge);
- for (std::size_t index = 1U; index < DiagnosticsClient::kQueueCapacity; ++index) {
-  CHECK(operation.submit({"{\"index\":1}"}) == DiagnosticSubmitResult::Accepted);
- }
+ for (std::size_t index = 1U; index < DiagnosticsClient::kQueueCapacity; ++index) { CHECK(operation.submit({"{\"index\":1}"}) == DiagnosticSubmitResult::Accepted); }
  CHECK(operation.submit({"{\"index\":2}"}) == DiagnosticSubmitResult::Capacity);
  runtime.target().write_required({.event = "shutdown.complete"});
  CHECK(diagnostics.counters().accepted == DiagnosticsClient::kQueueCapacity + 1U);
@@ -744,8 +753,8 @@ TEST_CASE("complete background diagnostics preserve unique concurrent single and
   submitters[producer] = std::async(std::launch::async, [target = runtime.target(), producer] {
    for (std::size_t index = 0U; index != kRecordsPerProducer;) {
     if (index % 3U == 0U && index + 1U < kRecordsPerProducer) {
-     const std::array batch{RuntimeDiagnosticFact{.event = "concurrent", .sequence = index, .value = producer},
-                            RuntimeDiagnosticFact{.event = "concurrent", .sequence = index + 1U, .value = producer}};
+     const std::array batch{
+      RuntimeDiagnosticFact{.event = "concurrent", .sequence = index, .value = producer}, RuntimeDiagnosticFact{.event = "concurrent", .sequence = index + 1U, .value = producer}};
      target.write_batch(batch);
      index += 2U;
     } else {
@@ -796,8 +805,7 @@ TEST_CASE("complete diagnostic records and batches wait atomically and settle on
  REQUIRE(operation.submit({large}) == DiagnosticSubmitResult::Accepted);
  pollfd readable{.fd = reader.get(), .events = POLLIN, .revents = 0};
  REQUIRE(::poll(&readable, 1U, 2000) == 1);
- for (std::size_t index = 1U; index < DiagnosticsClient::kQueueCapacity - (record_count - 1U); ++index)
-  REQUIRE(operation.submit({"{\"event\":\"filler\"}"}) == DiagnosticSubmitResult::Accepted);
+ for (std::size_t index = 1U; index < DiagnosticsClient::kQueueCapacity - (record_count - 1U); ++index) REQUIRE(operation.submit({"{\"event\":\"filler\"}"}) == DiagnosticSubmitResult::Accepted);
  const auto before = diagnostics.counters().accepted;
  std::future<std::string> output;
  auto submission = std::async(std::launch::async, [&diagnostics, target = runtime.target(), batch, outcome] {
@@ -1089,8 +1097,8 @@ TEST_CASE("file dialog selected results require an owned bounded nonempty path",
 }
 TEST_CASE("workflow path dialogs are projected from controller member paths", "[gui][services][dialogs]") {
  const auto entries = mmltk::controller::services::file_dialog_catalog().entries();
- for (const auto path : {"workflows.validate.request.compiled_path", "workflows.train.request.output_dir", "workflows.train.request.resume_path",
-                         "workflows.predict.source.compiled_path", "workflows.predict.source.single_image_path"}) {
+ for (const auto path : {"workflows.validate.request.compiled_path", "workflows.train.request.output_dir", "workflows.train.request.resume_path", "workflows.predict.source.compiled_path",
+       "workflows.predict.source.single_image_path"}) {
   const auto found = std::ranges::find_if(entries, [path](const auto& entry) { return entry.field_path.view() == path; });
   REQUIRE(found != entries.end());
   CHECK_FALSE(found->model_input.has_value());
@@ -1103,8 +1111,8 @@ TEST_CASE("model file dialog targets remain typed through native resolution", "[
  using mmltk::controller::services::FileDialogOpen;
  using mmltk::controller::services::ModelArtifactTarget;
  const auto entries = mmltk::controller::services::file_dialog_catalog().entries();
- const auto descriptor = std::ranges::find(entries, std::string_view{"workflows.train.request.weights_path"},
-                                           [](const mmltk::controller::services::FileDialogDescriptor& value) { return value.field_path.view(); });
+ const auto descriptor =
+  std::ranges::find(entries, std::string_view{"workflows.train.request.weights_path"}, [](const mmltk::controller::services::FileDialogDescriptor& value) { return value.field_path.view(); });
  REQUIRE(descriptor != entries.end());
  const auto stable_id = descriptor->stable_id;
  const FileDialogOpen request{
@@ -1118,8 +1126,8 @@ TEST_CASE("model file dialog targets remain typed through native resolution", "[
  REQUIRE(resolved);
  CHECK(resolved->target == request.target);
  CHECK(resolved->descriptor.defer_apply());
- CHECK_FALSE(mmltk::controller::services::file_dialog_catalog().resolve(
-  FileDialogOpen{.target = mmltk::controller::services::FileDialogTarget{mmltk::controller::services::SettingsFieldTarget{stable_id}}}));
+ CHECK_FALSE(
+  mmltk::controller::services::file_dialog_catalog().resolve(FileDialogOpen{.target = mmltk::controller::services::FileDialogTarget{mmltk::controller::services::SettingsFieldTarget{stable_id}}}));
  auto mismatched = request;
  std::get<ModelArtifactTarget>(mismatched.target.value).input = ModelArtifactInputKind::Onnx;
  CHECK_FALSE(mmltk::controller::services::file_dialog_catalog().resolve(mismatched));
@@ -1192,8 +1200,7 @@ TEST_CASE("file dialog client bounds output and reaps cancellation-resistant hel
  REQUIRE(::mkfifo(pid_fifo.c_str(), 0600) == 0);
  ScopedFd readiness{::open(pid_fifo.c_str(), O_RDWR | O_CLOEXEC | O_NONBLOCK)};
  REQUIRE(readiness.get() >= 0);
- const auto resistant =
-  make_dialog_helper(temporary.path(), "resistant", "printf '%s\\n' \"$$\" > '" + pid_fifo.string() + "'; trap '' TERM; while :; do sleep 1; done");
+ const auto resistant = make_dialog_helper(temporary.path(), "resistant", "printf '%s\\n' \"$$\" > '" + pid_fifo.string() + "'; trap '' TERM; while :; do sleep 1; done");
  FileDialogClientOwner owner{resistant.string(), temporary.path().string()};
  auto [cancellation, cancellation_token] = FileDialogCancellationSource::Mint();
  FileDialogResult result;
@@ -1236,8 +1243,7 @@ TEST_CASE("backend benchmark diagnostic failures preserve operations and deliver
  }();
  const ArtifactBenchmarkTraceObserver observer{
   .context = &target,
-  .report = [](const void* context, std::string_view event,
-               std::string_view fields) noexcept { static_cast<const RuntimeDiagnosticTarget*>(context)->write_benchmark_trace(event, fields); },
+  .report = [](const void* context, std::string_view event, std::string_view fields) noexcept { static_cast<const RuntimeDiagnosticTarget*>(context)->write_benchmark_trace(event, fields); },
  };
  const auto sink = make_trace_sink([observer](std::string_view event, std::string_view fields) noexcept { observer(event, fields); });
  bool operation_completed = false;

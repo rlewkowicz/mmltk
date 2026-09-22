@@ -19,8 +19,7 @@
 namespace mmltk::backend::data::benchmark_internal {
 class CoconutPhysicalMembershipError final : public std::runtime_error {
 public:
- CoconutPhysicalMembershipError(CoconutImageNamespace source, std::uint64_t image_id, std::string message)
-     : std::runtime_error(std::move(message)), source_(source), image_id_(image_id) {}
+ CoconutPhysicalMembershipError(CoconutImageNamespace source, std::uint64_t image_id, std::string message) : std::runtime_error(std::move(message)), source_(source), image_id_(image_id) {}
  [[nodiscard]] CoconutImageNamespace source() const noexcept { return source_; }
  [[nodiscard]] std::uint64_t image_id() const noexcept { return image_id_; }
 
@@ -59,9 +58,9 @@ struct CoconutSegment {
  bool isthing = false;
  bool crowd = false;
  bool ignore = false;
- std::optional<double> area;
+ std::optional<double> area = std::nullopt;
  // External COCO bbox convention: x, y, width, height.
- std::optional<std::array<double, 4>> bbox;
+ std::optional<std::array<double, 4>> bbox = std::nullopt;
 };
 struct CoconutRecord {
  std::uint64_t image_id = 0;
@@ -80,8 +79,8 @@ struct CoconutImportLimits {
 };
 using CoconutRecordConsumer = std::function<void(const CoconutRecord&, std::span<const std::uint8_t>)>;
 // PNG is borrowed for this call only. Reader and record batch remain alive through consumer.
-void read_coconut_parquet(std::span<const std::filesystem::path> shards, const CoconutImportLimits& limits,
-                          mmltk::common::concurrency::CancellationObservation cancellation, const CoconutRecordConsumer& consumer);
+void read_coconut_parquet(
+ std::span<const std::filesystem::path> shards, const CoconutImportLimits& limits, mmltk::common::concurrency::CancellationObservation cancellation, const CoconutRecordConsumer& consumer);
 struct CoconutImportRequest {
  CoconutEdition edition = CoconutEdition::Base;
  std::string input_identity;
@@ -102,18 +101,13 @@ struct CoconutImportRequest {
 // Every offered record is required. Unknown expected_rows means derive, never sample.
 [[nodiscard]] std::vector<CoconutComponent> import_coconut_annotations(const CoconutImportRequest& request);
 // Removes only XL rows covered by Large, retaining B and all namespace distinctions.
-[[nodiscard]] std::uint64_t reconcile_coconut_extensions(std::vector<CoconutComponent>& components,
-                                                         mmltk::common::concurrency::CancellationObservation cancellation = {});
+[[nodiscard]] std::uint64_t reconcile_coconut_extensions(std::vector<CoconutComponent>& components, mmltk::common::concurrency::CancellationObservation cancellation = {});
 // Canonical relative member spelling; rejects absolute paths, traversal, backslashes and NUL.
 [[nodiscard]] std::string canonical_coconut_archive_member(std::string_view raw);
 // Full archive inventory, independent of annotations/foreground selection. Cache is identity-bound.
-[[nodiscard]] std::vector<CoconutPhysicalImage> coconut_image_archive_inventory(const std::filesystem::path& archive_path,
-                                                                                const std::filesystem::path& cache_path, CoconutImageNamespace source,
-                                                                                std::uint16_t shard, std::string archive_identity,
-                                                                                mmltk::common::concurrency::CancellationObservation cancellation = {});
-void store_coconut_component(const std::filesystem::path& index_path, const CoconutComponent& component,
-                             mmltk::common::concurrency::CancellationObservation cancellation = {});
-[[nodiscard]] std::optional<CoconutComponent> load_coconut_component(const std::filesystem::path& index_path, CoconutEdition edition,
-                                                                     CoconutImageNamespace source, std::string_view input_identity,
-                                                                     mmltk::common::concurrency::CancellationObservation cancellation = {});
+[[nodiscard]] std::vector<CoconutPhysicalImage> coconut_image_archive_inventory(const std::filesystem::path& archive_path, const std::filesystem::path& cache_path, CoconutImageNamespace source,
+ std::uint16_t shard, std::string archive_identity, mmltk::common::concurrency::CancellationObservation cancellation = {});
+void store_coconut_component(const std::filesystem::path& index_path, const CoconutComponent& component, mmltk::common::concurrency::CancellationObservation cancellation = {});
+[[nodiscard]] std::optional<CoconutComponent> load_coconut_component(
+ const std::filesystem::path& index_path, CoconutEdition edition, CoconutImageNamespace source, std::string_view input_identity, mmltk::common::concurrency::CancellationObservation cancellation = {});
 }  // namespace mmltk::backend::data::benchmark_internal

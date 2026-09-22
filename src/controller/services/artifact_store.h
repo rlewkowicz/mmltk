@@ -46,8 +46,7 @@ struct ArtifactCompileRequest final {
 struct ArtifactCompileMaterializationError final {
  std::string detail;
 };
-[[nodiscard]] std::expected<ArtifactCompileRequest, ArtifactCompileMaterializationError> materialize_artifact_compile(
- const mmltk::controller::contracts::GuiSettingsState& settings) noexcept;
+[[nodiscard]] std::expected<ArtifactCompileRequest, ArtifactCompileMaterializationError> materialize_artifact_compile(const mmltk::controller::contracts::GuiSettingsState& settings) noexcept;
 // A synchronous borrowed observer: ArtifactStore never retains caller work or
 // a callback beyond compile's dynamic extent.
 struct ArtifactProgressObserver final {
@@ -76,12 +75,10 @@ public:
 private:
  friend class ArtifactStore;
  virtual void compile_directory(const std::filesystem::path& source, const std::filesystem::path& output, std::uint32_t resolution, bool perceptual_downscale,
-                                mmltk::backend::imaging::resample::ImageResizeMode resize_mode, mmltk::common::concurrency::CancellationObservation,
-                                ArtifactProgressObserver) const = 0;
- virtual void compile_benchmark(mmltk::backend::data::BenchmarkDatasetSelection selection, const std::filesystem::path& output,
-                                const std::filesystem::path& publication, std::uint32_t resolution, bool perceptual_downscale,
-                                mmltk::backend::imaging::resample::ImageResizeMode resize_mode, mmltk::common::concurrency::CancellationObservation,
-                                ArtifactProgressObserver, ArtifactBenchmarkTraceObserver) const = 0;
+  mmltk::backend::imaging::resample::ImageResizeMode resize_mode, mmltk::common::concurrency::CancellationObservation, ArtifactProgressObserver) const = 0;
+ virtual void compile_benchmark(mmltk::backend::data::BenchmarkDatasetSelection selection, const std::filesystem::path& output, const std::filesystem::path& publication, std::uint32_t resolution,
+  bool perceptual_downscale, mmltk::backend::imaging::resample::ImageResizeMode resize_mode, mmltk::common::concurrency::CancellationObservation, ArtifactProgressObserver,
+  ArtifactBenchmarkTraceObserver) const = 0;
 };
 struct ArtifactCompileResult final {
  std::filesystem::path output;
@@ -106,8 +103,7 @@ class ArtifactWeightOperations {
 public:
  virtual ~ArtifactWeightOperations() = default;
  [[nodiscard]] virtual std::optional<ArtifactWeightAsset> find(std::string_view preset) const = 0;
- virtual void download(std::string_view url, const std::filesystem::path& output, const ArtifactCancellationToken& cancellation,
-                       ArtifactWeightProgressObserver) const = 0;
+ virtual void download(std::string_view url, const std::filesystem::path& output, const ArtifactCancellationToken& cancellation, ArtifactWeightProgressObserver) const = 0;
 };
 // The sole owner of filesystem artifact inspection, compilation, and canonical
 // RF-DETR weight acquisition. Its values are ordinary work results.
@@ -118,14 +114,12 @@ public:
  ArtifactStore(std::filesystem::path cache_root, const ArtifactWeightOperations& operations);
  ArtifactStore(std::filesystem::path cache_root, const ArtifactWeightOperations&, const ArtifactCompilerOperations&);
  ArtifactStore(std::filesystem::path, const ArtifactWeightOperations&, ArtifactCompilerOperations&&) = delete;
- [[nodiscard]] mmltk::controller::contracts::ArtifactInspection inspect(
-  const std::array<std::filesystem::path, mmltk::controller::contracts::kArtifactSplitCapacity>& paths, std::string_view preset, std::uint32_t resolution,
-  const ArtifactCancellationToken& cancellation) const;
- [[nodiscard]] ArtifactCompileResult compile(const ArtifactCompileRequest& request, const ArtifactCancellationToken& cancellation,
-                                             ArtifactProgressObserver progress = {}, ArtifactDiagnosticObserver diagnostics = {}) const;
+ [[nodiscard]] mmltk::controller::contracts::ArtifactInspection inspect(const std::array<std::filesystem::path, mmltk::controller::contracts::kArtifactSplitCapacity>& paths, std::string_view preset,
+  std::uint32_t resolution, const ArtifactCancellationToken& cancellation) const;
+ [[nodiscard]] ArtifactCompileResult compile(
+  const ArtifactCompileRequest& request, const ArtifactCancellationToken& cancellation, ArtifactProgressObserver progress = {}, ArtifactDiagnosticObserver diagnostics = {}) const;
  [[nodiscard]] std::filesystem::path canonical_weight_path(std::string_view preset) const;
- [[nodiscard]] std::filesystem::path canonical_weight_path(std::string_view preset, const ArtifactCancellationToken& cancellation,
-                                                           ArtifactWeightProgressObserver progress = {}) const;
+ [[nodiscard]] std::filesystem::path canonical_weight_path(std::string_view preset, const ArtifactCancellationToken& cancellation, ArtifactWeightProgressObserver progress = {}) const;
 
 private:
  std::filesystem::path cache_root_;

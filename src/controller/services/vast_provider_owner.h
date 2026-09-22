@@ -11,10 +11,8 @@ namespace mmltk::controller::services {
 class VastOperations {
 public:
  virtual ~VastOperations() = default;
- [[nodiscard]] virtual std::vector<VastOfferSummary> query(const VastQueryConfig&, const std::vector<mmltk::controller::contracts::ProviderGpuFamily>&,
-                                                           const VastBridgeInvocation&) const = 0;
- [[nodiscard]] virtual VastCreateInstanceResult create(const VastBridgeConfig&, int, std::string_view, const VastLaunchTemplateOptions&,
-                                                       const VastBridgeInvocation&) const = 0;
+ [[nodiscard]] virtual std::vector<VastOfferSummary> query(const VastQueryConfig&, const std::vector<mmltk::controller::contracts::ProviderGpuFamily>&, const VastBridgeInvocation&) const = 0;
+ [[nodiscard]] virtual VastCreateInstanceResult create(const VastBridgeConfig&, int, std::string_view, const VastLaunchTemplateOptions&, const VastBridgeInvocation&) const = 0;
  virtual void start(const VastBridgeConfig&, int, const VastBridgeInvocation&) const = 0;
  virtual void stop(const VastBridgeConfig&, int, const VastBridgeInvocation&) const = 0;
  [[nodiscard]] virtual VastInstanceInfo show(const VastBridgeConfig&, int, const VastBridgeInvocation&) const = 0;

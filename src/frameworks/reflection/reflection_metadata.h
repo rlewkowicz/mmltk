@@ -49,10 +49,8 @@ struct EnumMaterializer final {
 template <class Enum>
  requires std::is_enum_v<Enum>
 inline constexpr auto kReflectedEnumEntries = materialize<Enum>(EnumMaterializer{});
-#define MMLTK_REFLECT_ENUM(Type)                                                           \
- [[nodiscard]] consteval const auto& materialized_enum_entries(std::type_identity<Type>) { \
-  return ::mmltk::frameworks::reflection::kReflectedEnumEntries<Type>;                     \
- }
+#define MMLTK_REFLECT_ENUM(Type) \
+ [[nodiscard]] consteval const auto& materialized_enum_entries(std::type_identity<Type>) { return ::mmltk::frameworks::reflection::kReflectedEnumEntries<Type>; }
 template <class Enum>
  requires std::is_enum_v<Enum>
 consteval void materialized_enum_entries(std::type_identity<Enum>) = delete;

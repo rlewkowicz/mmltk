@@ -94,8 +94,7 @@ VulkanWorkspaceFixture::VulkanWorkspaceFixture(int ordinal, std::uint32_t width,
  properties.sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2;
  properties.pNext = &external_properties;
  Check(vkGetPhysicalDeviceImageFormatProperties2(physical, &query, &properties));
- if (!(external_properties.externalMemoryProperties.externalMemoryFeatures & VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT))
-  throw std::runtime_error("Vulkan fixture image cannot be exported");
+ if (!(external_properties.externalMemoryProperties.externalMemoryFeatures & VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT)) throw std::runtime_error("Vulkan fixture image cannot be exported");
  VkExternalMemoryImageCreateInfo external_image{};
  external_image.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO;
  external_image.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
@@ -118,8 +117,7 @@ VulkanWorkspaceFixture::VulkanWorkspaceFixture(int ordinal, std::uint32_t width,
  VkPhysicalDeviceMemoryProperties memory_properties{};
  vkGetPhysicalDeviceMemoryProperties(physical, &memory_properties);
  std::uint32_t type = 0U;
- while (type < memory_properties.memoryTypeCount &&
-        (!(requirements.memoryTypeBits & (1U << type)) || !(memory_properties.memoryTypes[type].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)))
+ while (type < memory_properties.memoryTypeCount && (!(requirements.memoryTypeBits & (1U << type)) || !(memory_properties.memoryTypes[type].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)))
   ++type;
  if (type == memory_properties.memoryTypeCount) throw std::runtime_error("Vulkan fixture memory type unavailable");
  VkMemoryDedicatedAllocateInfo dedicated{};
@@ -141,14 +139,14 @@ VulkanWorkspaceFixture::VulkanWorkspaceFixture(int ordinal, std::uint32_t width,
  VkSubresourceLayout sublayout{};
  vkGetImageSubresourceLayout(state.device, state.image, &subresource, &sublayout);
  state.layout = {.device_incarnation = 7U + static_cast<std::uint64_t>(ordinal),
-                 .device = ordinal,
-                 .width = width,
-                 .height = height,
-                 .pitch_bytes = sublayout.rowPitch,
-                 .offset_bytes = sublayout.offset,
-                 .required_allocation_bytes = requirements.size,
-                 .alignment_bytes = requirements.alignment,
-                 .dedicated = true};
+  .device = ordinal,
+  .width = width,
+  .height = height,
+  .pitch_bytes = sublayout.rowPitch,
+  .offset_bytes = sublayout.offset,
+  .required_allocation_bytes = requirements.size,
+  .alignment_bytes = requirements.alignment,
+  .dedicated = true};
  std::memcpy(state.layout.device_uuid.data(), uuid.bytes, VK_UUID_SIZE);
  if (!state.layout.valid()) throw std::runtime_error("Vulkan fixture pitched layout unavailable");
  VkCommandPoolCreateInfo pool_info{};

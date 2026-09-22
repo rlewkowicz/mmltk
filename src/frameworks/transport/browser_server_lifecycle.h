@@ -30,8 +30,6 @@ struct BrowserOutputEpoch final {
   if (generation == value && phase == BrowserOutputPhase::Opening) phase = BrowserOutputPhase::Open;
  }
  void close() noexcept { phase = BrowserOutputPhase::Closed; }
- [[nodiscard]] bool admits(const bool owner_thread) const noexcept {
-  return phase == BrowserOutputPhase::Open || (phase == BrowserOutputPhase::Opening && owner_thread);
- }
+ [[nodiscard]] bool admits(const bool owner_thread) const noexcept { return phase == BrowserOutputPhase::Open || (phase == BrowserOutputPhase::Opening && owner_thread); }
 };
 }  // namespace mmltk::frameworks::transport::detail

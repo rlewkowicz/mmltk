@@ -37,8 +37,8 @@ std::string g_app_name;
 std::atomic<spdlog::level::level_enum> g_level{spdlog::level::off};
 bool is_known_level_name(std::string_view value) {
  const std::string lowered = mmltk::common::types::to_lower(value);
- return lowered == "trace" || lowered == "debug" || lowered == "info" || lowered == "warn" || lowered == "warning" || lowered == "error" || lowered == "err" ||
-        lowered == "critical" || lowered == "off";
+ return lowered == "trace" || lowered == "debug" || lowered == "info" || lowered == "warn" || lowered == "warning" || lowered == "error" || lowered == "err" || lowered == "critical" ||
+        lowered == "off";
 }
 std::optional<spdlog::level::level_enum> parse_level_impl(std::string_view value) {
  if (value.empty()) { return std::nullopt; }
@@ -196,8 +196,7 @@ std::shared_ptr<spdlog::logger> logger(std::string_view name) {
  return named;
 }
 spdlog::level::level_enum level() { return g_level.load(std::memory_order_relaxed); }
-void report_fatal(const std::string_view component, const std::string_view detail, const std::optional<int> status,
-                  const std::string_view diagnostic_logger) noexcept {
+void report_fatal(const std::string_view component, const std::string_view detail, const std::optional<int> status, const std::string_view diagnostic_logger) noexcept {
  const int saved_errno = errno;
  // The maximum record is 997 bytes, including truncation markers, an int
  // status and newline; the fixed budget also stays below Linux PIPE_BUF.

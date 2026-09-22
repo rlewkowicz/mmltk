@@ -56,17 +56,14 @@ const ImageUpscalerDescriptor& image_upscaler_descriptor(const ImageUpscalerKind
  return kDescriptors[index];
 }
 std::filesystem::path image_upscaler_model_path(const ImageUpscalerDescriptor& descriptor) {
- std::filesystem::path repository =
-  mmltk::common::system::runtime_paths::repository_root() / "src" / "backend" / "imaging" / "upscale" / "assets" / descriptor.filename;
+ std::filesystem::path repository = mmltk::common::system::runtime_paths::repository_root() / "src" / "backend" / "imaging" / "upscale" / "assets" / descriptor.filename;
  if (std::filesystem::is_regular_file(repository)) { return repository; }
  std::filesystem::path installed = mmltk::common::system::runtime_paths::install_prefix() / "models" / descriptor.filename;
  if (std::filesystem::is_regular_file(installed)) { return installed; }
  throw std::runtime_error("missing Image upscaler model " + std::string(descriptor.filename));
 }
 std::size_t checked_upscaler_elements(const std::uint32_t width, const std::uint32_t height, const std::size_t channels) {
- if (width == 0U || height == 0U || static_cast<std::size_t>(height) > std::numeric_limits<std::size_t>::max() / width) {
-  throw std::overflow_error("Image upscaler dimensions overflow");
- }
+ if (width == 0U || height == 0U || static_cast<std::size_t>(height) > std::numeric_limits<std::size_t>::max() / width) { throw std::overflow_error("Image upscaler dimensions overflow"); }
  const std::size_t pixels = static_cast<std::size_t>(width) * height;
  if (channels == 0U || pixels > std::numeric_limits<std::size_t>::max() / channels) { throw std::overflow_error("Image upscaler tensor size overflow"); }
  return pixels * channels;
@@ -115,8 +112,7 @@ cudaError_t UpscalerFloatBuffer::Release(UpscalerCleanup* cleanup) noexcept {
  }
  return failure;
 }
-TiledImageUpscalerRuntimeState::TiledImageUpscalerRuntimeState(ImageUpscalerDescriptor descriptor, const int device_id)
-    : descriptor_(descriptor), device_id_(device_id) {}
+TiledImageUpscalerRuntimeState::TiledImageUpscalerRuntimeState(ImageUpscalerDescriptor descriptor, const int device_id) : descriptor_(descriptor), device_id_(device_id) {}
 ImageUpscalerOutcome TiledImageUpscalerRuntimeState::Activate(const ImageUpscalerExecutionCheckpoint& checkpoint, ImageUpscalerCurrent current) {
  if (!current()) return ImageUpscalerOutcome::Cancelled;
  ensure_cuda_ok(cudaSetDevice(device_id_), "cudaSetDevice for Image upscaler runtime");
@@ -132,13 +128,11 @@ TiledImageUpscalerRuntimeState::~TiledImageUpscalerRuntimeState() {
  if ((!stopped_ && std::uncaught_exceptions() == 0) || awaiting_consumer_ || consumer_fatal_) std::terminate();
  if (consumer_done_ != nullptr || cleanup_stream_ != nullptr) std::terminate();
 }
-ImageUpscalerRuntimeOutput TiledImageUpscalerRuntimeState::enqueue(const ImageUpscalerRequest& request, const cudaStream_t consumer_stream, void* backend,
-                                                                   const ImageUpscalerSubmitTiles submit_tiles,
-                                                                   const ImageUpscalerExecutionCheckpoint& checkpoint) {
+ImageUpscalerRuntimeOutput TiledImageUpscalerRuntimeState::enqueue(
+ const ImageUpscalerRequest& request, const cudaStream_t consumer_stream, void* backend, const ImageUpscalerSubmitTiles submit_tiles, const ImageUpscalerExecutionCheckpoint& checkpoint) {
  std::lock_guard lock(mutex_);
- if (request.device_pixels == nullptr || request.target_pixels == nullptr || consumer_stream == nullptr ||
-     request.source_pitch < static_cast<std::size_t>(request.source_width) * 4U || request.target_pitch < static_cast<std::size_t>(request.crop_width) * 16U ||
-     request.crop_width == 0U || request.crop_height == 0U || request.source_width == 0U || request.source_height == 0U ||
+ if (request.device_pixels == nullptr || request.target_pixels == nullptr || consumer_stream == nullptr || request.source_pitch < static_cast<std::size_t>(request.source_width) * 4U ||
+     request.target_pitch < static_cast<std::size_t>(request.crop_width) * 16U || request.crop_width == 0U || request.crop_height == 0U || request.source_width == 0U || request.source_height == 0U ||
      request.crop_x > request.source_width || request.crop_width > request.source_width - request.crop_x || request.crop_y > request.source_height ||
      request.crop_height > request.source_height - request.crop_y) {
   throw std::invalid_argument("Image upscaler request has invalid source geometry");
@@ -155,12 +149,10 @@ ImageUpscalerRuntimeOutput TiledImageUpscalerRuntimeState::enqueue(const ImageUp
  const std::uint32_t restored_width = request.crop_width * 4U;
  const std::uint32_t restored_height = request.crop_height * 4U;
  static_cast<void>(checked_upscaler_elements(restored_width, restored_height, 4U));
- if (request.source_pitch > std::numeric_limits<std::size_t>::max() / request.source_height ||
-     request.target_pitch > std::numeric_limits<std::size_t>::max() / restored_height)
+ if (request.source_pitch > std::numeric_limits<std::size_t>::max() / request.source_height || request.target_pitch > std::numeric_limits<std::size_t>::max() / restored_height)
   throw std::overflow_error("Image upscaler pitched image size overflow");
  if (!image_upscaler_admitted(checkpoint, ImageUpscalerExecutionStage::TargetAdmitted, request.current)) return {.outcome = ImageUpscalerOutcome::Cancelled};
- if (!request.current() || !submit_tiles(backend, request, consumer_stream, restored_width, restored_height))
-  return {.outcome = ImageUpscalerOutcome::Cancelled};
+ if (!request.current() || !submit_tiles(backend, request, consumer_stream, restored_width, restored_height)) return {.outcome = ImageUpscalerOutcome::Cancelled};
  awaiting_consumer_ = true;
  return {
   .device_pixels = request.target_pixels,
@@ -180,8 +172,7 @@ void TiledImageUpscalerRuntimeState::abandon_consumer() noexcept {
  if (!awaiting_consumer_) { return; }
  consumer_fatal_ = true;
 }
-cudaError_t TiledImageUpscalerRuntimeState::Stop(void* backend, const ImageUpscalerReleaseBackend release_backend,
-                                                 const ImageUpscalerExecutionCheckpoint& checkpoint) noexcept {
+cudaError_t TiledImageUpscalerRuntimeState::Stop(void* backend, const ImageUpscalerReleaseBackend release_backend, const ImageUpscalerExecutionCheckpoint& checkpoint) noexcept {
  std::lock_guard lock(mutex_);
  if (stopped_) return cudaSuccess;
  if (!cleanup_.Record(cudaSetDevice(device_id_), "bind neural cleanup device")) return cleanup_.status();

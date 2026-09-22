@@ -12,8 +12,7 @@ namespace mmltk::controller::detail {
 // existing CudaSessionRuntimeState execution owner.
 class ValidationSamples final {
 public:
- ValidationSamples(VisualDeviceSettings, std::function<void()> changed,
-                   PredictionPreviewPool::TransferOperations = {&cuMemcpyPeerAsync, &cudaEventRecord, &cudaStreamSynchronize, &cuMemHostRegister});
+ ValidationSamples(VisualDeviceSettings, std::function<void()> changed, PredictionPreviewPool::TransferOperations = {&cuMemcpyPeerAsync, &cudaEventRecord, &cudaStreamSynchronize, &cuMemHostRegister});
  ~ValidationSamples();
  void Begin(std::uint64_t generation, std::span<const std::uint32_t> indices);
  void Capture(std::uint64_t generation, mmltk::backend::models::rfdetr::ValidationSampleView);

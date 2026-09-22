@@ -17,9 +17,7 @@ import mmltk.common.logging.mmltk_logging;
 import mmltk.common.logging.profile_utils;
 namespace mmltk::backend::models::rfdetr {
 namespace {
-[[nodiscard]] std::filesystem::path canonical_checkpoint_path(const std::filesystem::path& checkpoint_path) {
- return std::filesystem::absolute(checkpoint_path).lexically_normal();
-}
+[[nodiscard]] std::filesystem::path canonical_checkpoint_path(const std::filesystem::path& checkpoint_path) { return std::filesystem::absolute(checkpoint_path).lexically_normal(); }
 }  // namespace
 ModelStateLoadSummary load_model_weights(NativeRfDetrModel& model, const std::filesystem::path& weights_path, const bool strict) {
  const auto checkpoint = decode_model_state(weights_path);
@@ -33,8 +31,7 @@ ModelStateLoadSummary apply_checkpoint_to_module(NativeRfDetrModel& module, cons
  return apply_checkpoint_to_module(module, checkpoint, strict);
 }
 namespace {
-void save_checkpoint_state(const std::filesystem::path& checkpoint_path, const DecodedNativeModelState& checkpoint, bool complete,
-                           const std::filesystem::path& explicit_descriptor) {
+void save_checkpoint_state(const std::filesystem::path& checkpoint_path, const DecodedNativeModelState& checkpoint, bool complete, const std::filesystem::path& explicit_descriptor) {
  mmltk::common::logging::ScopedProfile profile_rfdetr_checkpoint_save_total{"rfdetr.checkpoint.save.total"};
  const std::filesystem::path canonical_path = canonical_checkpoint_path(checkpoint_path);
  std::filesystem::create_directories(canonical_path.parent_path());
@@ -55,12 +52,10 @@ void save_checkpoint_state(const std::filesystem::path& checkpoint_path, const D
  }
 }
 }  // namespace
-void save_native_checkpoint(const std::filesystem::path& checkpoint_path, const DecodedNativeModelState& checkpoint,
-                            const std::filesystem::path& explicit_descriptor) {
+void save_native_checkpoint(const std::filesystem::path& checkpoint_path, const DecodedNativeModelState& checkpoint, const std::filesystem::path& explicit_descriptor) {
  save_checkpoint_state(checkpoint_path, checkpoint, false, explicit_descriptor);
 }
-DecodedNativeModelState normalize_checkpoint_to_native(const std::filesystem::path& input_path, const std::filesystem::path& output_path,
-                                                       const std::filesystem::path& class_layout_path) {
+DecodedNativeModelState normalize_checkpoint_to_native(const std::filesystem::path& input_path, const std::filesystem::path& output_path, const std::filesystem::path& class_layout_path) {
  auto checkpoint = decode_model_state(input_path, {}, class_layout_path);
  save_checkpoint_state(output_path, checkpoint, true, class_layout_path);
  return checkpoint;

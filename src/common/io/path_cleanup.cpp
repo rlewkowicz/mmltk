@@ -80,8 +80,7 @@ bool remove_directory_entries(DIR* directory, CleanupPolicy policy, Remove remov
   assign_errno(error, ESTALE);
   return false;
  }
- if (!remove_directory_entries(
-      directory, CleanupPolicy::FailFast, [&](const char* child) { return remove_entry_at(directory_fd, child, root_device, error); }, error)) {
+ if (!remove_directory_entries(directory, CleanupPolicy::FailFast, [&](const char* child) { return remove_entry_at(directory_fd, child, root_device, error); }, error)) {
   const std::error_code saved = error;
   ::closedir(directory);
   error = saved;

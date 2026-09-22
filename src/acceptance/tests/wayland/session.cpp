@@ -103,8 +103,7 @@ void prepare_latest_log(const std::filesystem::path& path, const std::string_vie
   std::filesystem::create_directories(history);
   std::filesystem::rename(path, history / (identity + (path.extension() == ".jsonl" ? ".jsonl" : ".log")));
  }
- if (!std::ofstream{path, std::ios::binary | std::ios::trunc})
-  throw std::runtime_error("failed to prepare " + std::string{description} + " at " + path.string());
+ if (!std::ofstream{path, std::ios::binary | std::ios::trunc}) throw std::runtime_error("failed to prepare " + std::string{description} + " at " + path.string());
 }
 [[nodiscard]] std::filesystem::path artifact_sibling(const std::filesystem::path& native, const std::string_view suffix) {
  return native.parent_path() / (native.stem().string() + std::string{suffix});
@@ -163,12 +162,10 @@ void rotate_process_log_family(const std::filesystem::path& native, const std::s
 }
 class BrowserHostProcess final {
 public:
- BrowserHostProcess(const std::filesystem::path& executable, const std::filesystem::path& diagnostics, const std::filesystem::path& runtime_log,
-                    const std::filesystem::path& firefox_log, const std::filesystem::path& working_directory, const TerminationMode termination,
-                    const mmltk::backend::data::testsupport::FixtureSpec& fixture, const std::filesystem::path& compiled_directory,
-                    const std::string& viewer_scenario, const bool logging = true, const bool high_dpi = false, const bool h2d = true,
-                    const bool pixel_probes = false, const std::string& probe_failure = {},
-                    const mmltk::backend::data::testsupport::FixtureSpec* square_fixture = nullptr) {
+ BrowserHostProcess(const std::filesystem::path& executable, const std::filesystem::path& diagnostics, const std::filesystem::path& runtime_log, const std::filesystem::path& firefox_log,
+  const std::filesystem::path& working_directory, const TerminationMode termination, const mmltk::backend::data::testsupport::FixtureSpec& fixture, const std::filesystem::path& compiled_directory,
+  const std::string& viewer_scenario, const bool logging = true, const bool high_dpi = false, const bool h2d = true, const bool pixel_probes = false, const std::string& probe_failure = {},
+  const mmltk::backend::data::testsupport::FixtureSpec* square_fixture = nullptr) {
   const std::string executable_text = executable.string();
   const std::string diagnostics_text = diagnostics.string();
   const std::string runtime_log_text = runtime_log.string();
@@ -181,8 +178,7 @@ public:
   const std::string square_source = square_fixture ? mmltk::backend::data::testsupport::dataset_dir(*square_fixture) : "";
   const std::string square_compiled = square_fixture ? mmltk::backend::data::testsupport::compiled_dir(*square_fixture) : "";
   std::array<int, 2U> control_pipe{};
-  if (::socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, control_pipe.data()) != 0)
-   throw std::runtime_error("failed to create Explore acceptance control channel");
+  if (::socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, control_pipe.data()) != 0) throw std::runtime_error("failed to create Explore acceptance control channel");
   ScopedFd control_read{control_pipe[0]};
   ScopedFd control_write{control_pipe[1]};
   const std::string control_descriptor = std::to_string(control_read.get());
@@ -193,32 +189,26 @@ public:
    control_write.reset();
    ScopedFd runtime_output{::open(runtime_log_text.c_str(), O_WRONLY | O_APPEND | O_CLOEXEC)};
    const bool configured =
-    runtime_output.get() >= 0 && ::dup2(runtime_output.get(), STDOUT_FILENO) >= 0 && ::dup2(runtime_output.get(), STDERR_FILENO) >= 0 &&
-    ::fcntl(control_read.get(), F_SETFD, 0) == 0 && ::chdir(working_directory.c_str()) == 0 &&
+    runtime_output.get() >= 0 && ::dup2(runtime_output.get(), STDOUT_FILENO) >= 0 && ::dup2(runtime_output.get(), STDERR_FILENO) >= 0 && ::fcntl(control_read.get(), F_SETFD, 0) == 0 &&
+    ::chdir(working_directory.c_str()) == 0 &&
     (logging ? (::setenv("MMLTK_LOG_LEVEL", "trace", 1) == 0 && ::setenv("MMLTK_LOG_FILE", application_log_text.c_str(), 1) == 0 &&
                 ::setenv("MMLTK_GUI_TRACE_FILE", diagnostics_text.c_str(), 1) == 0 && ::setenv("MMLTK_FIREFOX_LOG_FILE", firefox_text.c_str(), 1) == 0 &&
                 ::setenv("MOZ_LOG",
-                         "WebGPU:5,Widget:5,WidgetVSync:5,WidgetWayland:5,Dmabuf:5,WidgetCompositor:5,"
-                         "nsRefreshDriver:5,PresShell:5,Clipboard:5,WidgetClipboard:5,rotate:16",
-                         1) == 0 &&
+                 "WebGPU:5,Widget:5,WidgetVSync:5,WidgetWayland:5,Dmabuf:5,WidgetCompositor:5,"
+                 "nsRefreshDriver:5,PresShell:5,Clipboard:5,WidgetClipboard:5,rotate:16",
+                 1) == 0 &&
                 ::setenv("MOZ_LOG_FILE", mozilla_text.c_str(), 1) == 0 && ::setenv("RUST_BACKTRACE", "full", 1) == 0)
-             : (::unsetenv("MMLTK_LOG_LEVEL") == 0 && ::unsetenv("MMLTK_LOG_FILE") == 0 && ::unsetenv("MMLTK_LOG_DIR") == 0 &&
-                ::unsetenv("MMLTK_GUI_TRACE_FILE") == 0 && ::unsetenv("MMLTK_FIREFOX_LOG_FILE") == 0 && ::unsetenv("MOZ_LOG") == 0 &&
-                ::unsetenv("MOZ_LOG_FILE") == 0 && ::unsetenv("RUST_BACKTRACE") == 0)) &&
+             : (::unsetenv("MMLTK_LOG_LEVEL") == 0 && ::unsetenv("MMLTK_LOG_FILE") == 0 && ::unsetenv("MMLTK_LOG_DIR") == 0 && ::unsetenv("MMLTK_GUI_TRACE_FILE") == 0 &&
+                ::unsetenv("MMLTK_FIREFOX_LOG_FILE") == 0 && ::unsetenv("MOZ_LOG") == 0 && ::unsetenv("MOZ_LOG_FILE") == 0 && ::unsetenv("RUST_BACKTRACE") == 0)) &&
     ::setenv("MMLTK_RUN_WORKSPACE_WAYLAND_INTEGRATION", "1", 1) == 0 && ::setenv("MMLTK_RUN_WORKSPACE_WAYLAND_DPI", high_dpi ? "1.5" : "1", 1) == 0 &&
-    ::setenv("MMLTK_RUN_WORKSPACE_WAYLAND_VIEWER_SCENARIO", viewer_scenario.c_str(), 1) == 0 &&
-    ::setenv("MMLTK_GUI_PIXEL_TRACE", logging && pixel_probes ? "1" : "0", 1) == 0 &&
+    ::setenv("MMLTK_RUN_WORKSPACE_WAYLAND_VIEWER_SCENARIO", viewer_scenario.c_str(), 1) == 0 && ::setenv("MMLTK_GUI_PIXEL_TRACE", logging && pixel_probes ? "1" : "0", 1) == 0 &&
     ::setenv("MMLTK_RUN_WORKSPACE_WAYLAND_PROBE_FAILURE", probe_failure.c_str(), 1) == 0 &&
-    ::setenv("MMLTK_RUN_WORKSPACE_WAYLAND_PIXEL_FIXTURE", fixture.pixel_evidence && (viewer_scenario == "retained" || viewer_scenario == "dpi") ? "1" : "0",
-             1) == 0 &&
+    ::setenv("MMLTK_RUN_WORKSPACE_WAYLAND_PIXEL_FIXTURE", fixture.pixel_evidence && (viewer_scenario == "retained" || viewer_scenario == "dpi") ? "1" : "0", 1) == 0 &&
     ::setenv("MMLTK_RUN_WORKSPACE_WAYLAND_COMPLETION_GATE", viewer_scenario == "retained" ? "1" : "0", 1) == 0 &&
     ::setenv("MMLTK_RUN_WORKSPACE_WAYLAND_PENDING_SUPERSESSION", logging && (viewer_scenario == "retained" || viewer_scenario == "dpi") ? "1" : "0", 1) == 0 &&
-    ::setenv("MMLTK_RUN_WORKSPACE_WAYLAND_SQUARE_SOURCE", square_source.c_str(), 1) == 0 &&
-    ::setenv("MMLTK_RUN_WORKSPACE_WAYLAND_SQUARE_COMPILED", square_compiled.c_str(), 1) == 0 &&
-    ::setenv("MMLTK_RUN_WORKSPACE_WAYLAND_DATASET_SOURCE", dataset_source.c_str(), 1) == 0 &&
-    ::setenv("MMLTK_RUN_WORKSPACE_WAYLAND_COMPILED_DIRECTORY", compiled_text.c_str(), 1) == 0 &&
-    ::setenv("MMLTK_RUN_WORKSPACE_WAYLAND_RESOLUTION", resolution.c_str(), 1) == 0 &&
-    ::setenv("MMLTK_RUN_WORKSPACE_WAYLAND_EXPLORE_CONTROL_FD", control_descriptor.c_str(), 1) == 0 &&
+    ::setenv("MMLTK_RUN_WORKSPACE_WAYLAND_SQUARE_SOURCE", square_source.c_str(), 1) == 0 && ::setenv("MMLTK_RUN_WORKSPACE_WAYLAND_SQUARE_COMPILED", square_compiled.c_str(), 1) == 0 &&
+    ::setenv("MMLTK_RUN_WORKSPACE_WAYLAND_DATASET_SOURCE", dataset_source.c_str(), 1) == 0 && ::setenv("MMLTK_RUN_WORKSPACE_WAYLAND_COMPILED_DIRECTORY", compiled_text.c_str(), 1) == 0 &&
+    ::setenv("MMLTK_RUN_WORKSPACE_WAYLAND_RESOLUTION", resolution.c_str(), 1) == 0 && ::setenv("MMLTK_RUN_WORKSPACE_WAYLAND_EXPLORE_CONTROL_FD", control_descriptor.c_str(), 1) == 0 &&
     (termination != TerminationMode::WindowClose || ::setenv("MMLTK_RUN_WORKSPACE_WAYLAND_WINDOW_CLOSE", "1", 1) == 0);
    if (!configured) std::_Exit(126);
    if (h2d)
@@ -270,15 +260,13 @@ public:
   if (consumed >= static_cast<ssize_t>(sizeof(event)) && consumed <= static_cast<ssize_t>(control_buffer_.size())) {
    std::memcpy(&event, control_buffer_.data(), sizeof(event));
    const auto bytes = static_cast<std::size_t>(consumed) - sizeof(event);
-   const bool failed = event.event == ExploreAcceptanceGate::ControlEvent::Frontend &&
-                       event.slot == static_cast<std::uint64_t>(mmltk::controller::contracts::IntegrationControlKind::Failed);
+   const bool failed = event.event == ExploreAcceptanceGate::ControlEvent::Frontend && event.slot == static_cast<std::uint64_t>(mmltk::controller::contracts::IntegrationControlKind::Failed);
    if ((bytes == 0U || failed) && (!failed || event.staging_bytes != 0U)) {
     frontend_failure_ = {control_buffer_.data() + sizeof(event), bytes};
     return event;
    }
   }
-  if (consumed == 1 && static_cast<unsigned char>(control_buffer_[0]) == static_cast<unsigned char>(ExploreAcceptanceGate::ControlEvent::InitialWait))
-   return event;
+  if (consumed == 1 && static_cast<unsigned char>(control_buffer_[0]) == static_cast<unsigned char>(ExploreAcceptanceGate::ControlEvent::InitialWait)) return event;
   explore_control_closed_ = consumed == 0;
   control_write_.reset();
   return std::nullopt;
@@ -359,8 +347,7 @@ private:
 };
 void report_consumed_record(const nlohmann::json& record, const std::string_view source) {
  const std::string event = record.value("event", "");
- const bool protocol_failure = event.find("protocol") != std::string::npos ||
-                               (record.contains("terminal") && record.at("terminal").is_string() && record.at("terminal") == "protocol_failure");
+ const bool protocol_failure = event.find("protocol") != std::string::npos || (record.contains("terminal") && record.at("terminal").is_string() && record.at("terminal") == "protocol_failure");
  const bool failure = event.find("failed") != std::string::npos || event.find("failure") != std::string::npos || event.find("invalid") != std::string::npos ||
                       event.find("incomplete") != std::string::npos || protocol_failure;
  if (failure) {
@@ -401,8 +388,7 @@ public:
 private:
  void add(const std::filesystem::path& directory) {
   std::filesystem::create_directories(directory);
-  if (::inotify_add_watch(descriptor_.get(), directory.c_str(), IN_CREATE | IN_MODIFY | IN_CLOSE_WRITE) < 0)
-   throw std::runtime_error("failed to watch integration artifacts");
+  if (::inotify_add_watch(descriptor_.get(), directory.c_str(), IN_CREATE | IN_MODIFY | IN_CLOSE_WRITE) < 0) throw std::runtime_error("failed to watch integration artifacts");
  }
  ScopedFd descriptor_;
 };
@@ -422,8 +408,7 @@ private:
   }
  }
 }
-void compile_wayland_fixture(const mmltk::backend::data::testsupport::FixtureSpec& fixture, const std::uint32_t resolution,
-                             const mmltk::backend::imaging::resample::ImageResizeMode mode) {
+void compile_wayland_fixture(const mmltk::backend::data::testsupport::FixtureSpec& fixture, const std::uint32_t resolution, const mmltk::backend::imaging::resample::ImageResizeMode mode) {
  using namespace mmltk::backend::data;
  const auto plan = DatasetCompiler::prepare({.resize_mode = mode,
                                              .source_dir = mmltk::backend::data::testsupport::dataset_dir(fixture),
@@ -432,7 +417,7 @@ void compile_wayland_fixture(const mmltk::backend::data::testsupport::FixtureSpe
                                              .target_width = resolution,
                                              .target_height = resolution,
                                              .worker_cpus = {}},
-                                            {fixture.split});
+  {fixture.split});
  DatasetCompiler::compile(plan, 0U);
 }
 void prepare_wayland_upscale_assets() {
@@ -442,16 +427,16 @@ void prepare_wayland_upscale_assets() {
  auto ready = prepared.get_future();
  std::atomic_bool completed{false};
  UpscaleSystem upscale{settings, make_native_upscale_runtime_factory(settings), [](const VisualFrame&) { return VisualDocumentRead{}; },
-                       [&](UpscaleSystem::event_type event) {
-                        const auto* failure = std::get_if<UpscaleFailed>(&event);
-                        const auto* changed = std::get_if<UpscaleChanged>(&event);
-                        if (!failure && (!changed || !std::ranges::all_of(changed->snapshot.methods, [](const auto& method) { return method.warm; }))) return;
-                        if (completed.exchange(true)) return;
-                        if (failure)
-                         prepared.set_exception(std::make_exception_ptr(std::runtime_error(failure->detail)));
-                        else
-                         prepared.set_value();
-                       }};
+  [&](UpscaleSystem::event_type event) {
+   const auto* failure = std::get_if<UpscaleFailed>(&event);
+   const auto* changed = std::get_if<UpscaleChanged>(&event);
+   if (!failure && (!changed || !std::ranges::all_of(changed->snapshot.methods, [](const auto& method) { return method.warm; }))) return;
+   if (completed.exchange(true)) return;
+   if (failure)
+    prepared.set_exception(std::make_exception_ptr(std::runtime_error(failure->detail)));
+   else
+    prepared.set_value();
+  }};
  std::cout << "workspace-wayland: preparing GPU-specific upscale model assets before browser interaction deadlines\n" << std::flush;
  upscale.Warm({8U, 8U});
  if (ready.wait_for(std::chrono::seconds{120}) != std::future_status::ready) {
@@ -463,27 +448,9 @@ void prepare_wayland_upscale_assets() {
 }
 PreparedWaylandInputs::PreparedWaylandInputs()
     : root_("mmltk-wayland-inputs"),
-      square_{.root_dir = (root_.path() / "square").string(),
-              .split = "train",
-              .width = 768,
-              .height = 384,
-              .num_images = 128,
-              .background_images = 10,
-              .pixel_evidence = true},
-      mixed_{.root_dir = (root_.path() / "mixed").string(),
-             .split = "train",
-             .width = 768,
-             .height = 384,
-             .num_images = 300,
-             .background_images = 10,
-             .pixel_evidence = true},
-      probe_{.root_dir = (root_.path() / "probe").string(),
-             .split = "train",
-             .width = 768,
-             .height = 384,
-             .num_images = 3,
-             .background_images = 0,
-             .pixel_evidence = true} {
+      square_{.root_dir = (root_.path() / "square").string(), .split = "train", .width = 768, .height = 384, .num_images = 128, .background_images = 10, .pixel_evidence = true},
+      mixed_{.root_dir = (root_.path() / "mixed").string(), .split = "train", .width = 768, .height = 384, .num_images = 300, .background_images = 10, .pixel_evidence = true},
+      probe_{.root_dir = (root_.path() / "probe").string(), .split = "train", .width = 768, .height = 384, .num_images = 3, .background_images = 0, .pixel_evidence = true} {
  using namespace mmltk::backend::data::testsupport;
  for (const auto* fixture : {&square_, &mixed_}) {
   create_synthetic_dataset(*fixture);
@@ -496,8 +463,8 @@ PreparedWaylandInputs::PreparedWaylandInputs()
   std::filesystem::copy_file(split / "000012.jsonl", split / "000001.jsonl", std::filesystem::copy_options::overwrite_existing);
   std::ofstream retained_instance{split / "000013.jsonl", std::ios::app};
   if (!retained_instance) throw std::runtime_error("cannot prepare retained empty-mask compiler evidence");
-  retained_instance << R"({"class":"person","bbox_xyxy":[1,0,2,1],"mask_rle_encoding":"row_major_start_length","mask_rle":"1:1","image_size_wh":[)"
-                    << fixture->width << ',' << fixture->height << "]}\n";
+  retained_instance << R"({"class":"person","bbox_xyxy":[1,0,2,1],"mask_rle_encoding":"row_major_start_length","mask_rle":"1:1","image_size_wh":[)" << fixture->width << ',' << fixture->height
+                    << "]}\n";
  }
  replace_synthetic_image(square_, 1, 384, 384);
  // This small prerequisite is compiled once. The primary browser owns
@@ -515,16 +482,15 @@ const mmltk::backend::data::testsupport::FixtureSpec& PreparedWaylandInputs::pro
   create_synthetic_dataset(probe_);
   // Preserve the selected image's exact annotation and six-class
   // catalog while keeping every input in the initial measured row.
-  std::filesystem::copy_file(std::filesystem::path(dataset_dir(mixed_)) / mixed_.split / "000001.jsonl",
-                             std::filesystem::path(dataset_dir(probe_)) / probe_.split / "000001.jsonl", std::filesystem::copy_options::overwrite_existing);
+  std::filesystem::copy_file(std::filesystem::path(dataset_dir(mixed_)) / mixed_.split / "000001.jsonl", std::filesystem::path(dataset_dir(probe_)) / probe_.split / "000001.jsonl",
+   std::filesystem::copy_options::overwrite_existing);
   compile_wayland_fixture(probe_, kCompiledResolution, mmltk::backend::imaging::resample::ImageResizeMode::Letterbox);
   std::filesystem::remove_all(dataset_dir(probe_));
  }
  return probe_;
 }
-WaylandSession::WaylandSession(std::shared_ptr<PreparedWaylandInputs> inputs, const TerminationMode terminal, std::string profile,
-                               const bool diagnostics_enabled, const bool dpi, const bool host_to_device, std::string fault, const bool pixels_enabled,
-                               const mmltk::backend::data::testsupport::FixtureSpec* ordinary_fixture)
+WaylandSession::WaylandSession(std::shared_ptr<PreparedWaylandInputs> inputs, const TerminationMode terminal, std::string profile, const bool diagnostics_enabled, const bool dpi,
+ const bool host_to_device, std::string fault, const bool pixels_enabled, const mmltk::backend::data::testsupport::FixtureSpec* ordinary_fixture)
     : inputs_(std::move(inputs)),
       ordinary_fixture_(ordinary_fixture ? *ordinary_fixture : inputs_->mixed()),
       termination(terminal),
@@ -535,14 +501,11 @@ WaylandSession::WaylandSession(std::shared_ptr<PreparedWaylandInputs> inputs, co
       pixel_probes(logging && pixels_enabled),
       pixel_fixture(profile_ == "retained" || profile_ == "dpi"),
       probe_failure(std::move(fault)),
-      ordinary_compiled_(profile_ == "retained" ? working.path() / "compiled"
-                                                : std::filesystem::path{mmltk::backend::data::testsupport::compiled_dir(ordinary_fixture_)}),
+      ordinary_compiled_(profile_ == "retained" ? working.path() / "compiled" : std::filesystem::path{mmltk::backend::data::testsupport::compiled_dir(ordinary_fixture_)}),
       pixel_audit(pixel_probes) {
- diagnostics =
-  !logging ? quiet_artifacts.path() / "native.jsonl" : configured_path("MMLTK_GUI_TRACE_FILE", latest_wayland_artifact("latest-wayland-test.jsonl"));
+ diagnostics = !logging ? quiet_artifacts.path() / "native.jsonl" : configured_path("MMLTK_GUI_TRACE_FILE", latest_wayland_artifact("latest-wayland-test.jsonl"));
  runtime_log = !logging ? quiet_artifacts.path() / "runtime.log" : configured_path("MMLTK_LOG_FILE", latest_wayland_artifact("latest-wayland-test-native.log"));
- firefox_log =
-  !logging ? quiet_artifacts.path() / "firefox.log" : configured_path("MMLTK_FIREFOX_LOG_FILE", latest_wayland_artifact("latest-wayland-test-firefox.log"));
+ firefox_log = !logging ? quiet_artifacts.path() / "firefox.log" : configured_path("MMLTK_FIREFOX_LOG_FILE", latest_wayland_artifact("latest-wayland-test-firefox.log"));
  acceptance_log = artifact_sibling(diagnostics, "-acceptance.jsonl");
  const auto rotation_id = std::to_string(::getpid()) + "-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
  if (logging) {
@@ -567,9 +530,8 @@ WaylandSession::WaylandSession(std::shared_ptr<PreparedWaylandInputs> inputs, co
  settings_file << mmltk::controller::contracts::snapshot_gui_settings(initial_settings).dump();
  settings_file.close();
  notifications_ = std::make_unique<ArtifactNotifications>(diagnostics, firefox_log);
- process_ = std::make_unique<BrowserHostProcess>(MMLTK_TEST_MMLTK_GUI_LAUNCHER, diagnostics, runtime_log, firefox_log, working.path(), termination,
-                                                 ordinary_fixture_, ordinary_compiled_, profile_ == "blocked" ? "quiet" : profile_, logging, high_dpi, h2d,
-                                                 pixel_probes, probe_failure, &inputs_->square());
+ process_ = std::make_unique<BrowserHostProcess>(MMLTK_TEST_MMLTK_GUI_LAUNCHER, diagnostics, runtime_log, firefox_log, working.path(), termination, ordinary_fixture_, ordinary_compiled_,
+  profile_ == "blocked" ? "quiet" : profile_, logging, high_dpi, h2d, pixel_probes, probe_failure, &inputs_->square());
  deadline.reset(::timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC | TFD_NONBLOCK));
  if (deadline.get() < 0) throw std::runtime_error(std::string{"failed to create workspace Wayland acceptance deadline: "} + std::strerror(errno));
  native_cursor_ = std::make_unique<JsonLineCursor>(diagnostics, 0U);
@@ -600,8 +562,7 @@ void WaylandSession::ConsumeRecords(const bool final) {
  for (const auto& [generation, evidence] : browser.gallery_generations) {
   const auto digest = native.placeholder_digests.find(generation);
   const auto cardinality = native.placeholder_cardinalities.find(generation);
-  if ((digest != native.placeholder_digests.end() && digest->second != evidence.digest) ||
-      (cardinality != native.placeholder_cardinalities.end() && cardinality->second != evidence.slots.size()))
+  if ((digest != native.placeholder_digests.end() && digest->second != evidence.digest) || (cardinality != native.placeholder_cardinalities.end() && cardinality->second != evidence.slots.size()))
    continue;
   native.join_gallery_publication(generation, evidence.slots);
  }
@@ -623,9 +584,7 @@ void WaylandSession::RunWorkflows() {
  arm_timerfd(deadline.get(), kWaylandStartupDeadline, "workflow browser startup");
  std::size_t progress = 0U;
  std::size_t work_progress = 0U;
- const auto diagnostics_on_exit = [&] {
-  std::cerr << "\nworkflow native log:\n" << read_tail(runtime_log) << "\nworkflow browser log:\n" << read_tail(firefox_log) << std::flush;
- };
+ const auto diagnostics_on_exit = [&] { std::cerr << "\nworkflow native log:\n" << read_tail(runtime_log) << "\nworkflow browser log:\n" << read_tail(firefox_log) << std::flush; };
  for (;;) {
   ConsumeRecords();
   if (browser_failed_ || native.failed_before_termination() || !surface_audit.failure.empty()) {
@@ -668,49 +627,12 @@ void WaylandSession::RunWorkflows() {
   }
  }
  CHECK(display_adapter_seen_);
- CHECK((workflow_steps_ == std::set<std::string>{"train",
-                                                 "validation",
-                                                 "validation_original",
-                                                 "compiled",
-                                                 "image",
-                                                 "video",
-                                                 "stop",
-                                                 "export_stop",
-                                                 "export_stop_narrow_dark",
-                                                 "theme",
-                                                 "narrow",
-                                                 "chart_legend",
-                                                 "chart_pan",
-                                                 "chart_retained_expanded",
-                                                 "chart_retained_back",
-                                                 "chart_retained_hidden",
-                                                 "chart_retained_revealed",
-                                                 "chart_retained_navigation",
-                                                 "chart_tile_0",
-                                                 "chart_tile_1",
-                                                 "chart_tile_2",
-                                                 "chart_tile_3",
-                                                 "chart_tile_4",
-                                                 "chart_tile_5",
-                                                 "chart_expanded",
-                                                 "chart_aspect_0",
-                                                 "chart_aspect_1",
-                                                 "chart_aspect_2",
-                                                 "chart_aspect_3",
-                                                 "chart_aspect_4",
-                                                 "chart_aspect_5",
-                                                 "chart_wheel_grid_0",
-                                                 "chart_wheel_grid_1",
-                                                 "chart_wheel_grid_2",
-                                                 "chart_wheel_grid_3",
-                                                 "chart_wheel_grid_4",
-                                                 "chart_wheel_grid_5",
-                                                 "chart_wheel_expanded_0",
-                                                 "chart_wheel_expanded_1",
-                                                 "chart_wheel_expanded_2",
-                                                 "chart_wheel_expanded_3",
-                                                 "chart_wheel_expanded_4",
-                                                 "chart_wheel_expanded_5"}));
+ CHECK(
+  (workflow_steps_ == std::set<std::string>{"train", "validation", "validation_original", "compiled", "image", "video", "stop", "export_stop", "export_stop_narrow_dark", "theme", "narrow",
+                       "chart_legend", "chart_pan", "chart_retained_expanded", "chart_retained_back", "chart_retained_hidden", "chart_retained_revealed", "chart_retained_navigation", "chart_tile_0",
+                       "chart_tile_1", "chart_tile_2", "chart_tile_3", "chart_tile_4", "chart_tile_5", "chart_expanded", "chart_aspect_0", "chart_aspect_1", "chart_aspect_2", "chart_aspect_3",
+                       "chart_aspect_4", "chart_aspect_5", "chart_wheel_grid_0", "chart_wheel_grid_1", "chart_wheel_grid_2", "chart_wheel_grid_3", "chart_wheel_grid_4", "chart_wheel_grid_5",
+                       "chart_wheel_expanded_0", "chart_wheel_expanded_1", "chart_wheel_expanded_2", "chart_wheel_expanded_3", "chart_wheel_expanded_4", "chart_wheel_expanded_5"}));
  CHECK((workflow_pixels_ == std::set<std::string>{"progress", "train", "validation", "detail", "compiled", "image", "video", "stop", "theme", "narrow"}));
  CHECK(browser.primary_phase_progress.contains("train.primary:light"));
  CHECK(browser.primary_phase_progress.contains("validate.primary:light"));
@@ -745,8 +667,7 @@ void WaylandSession::RunScenario(const std::string& viewer_scenario, const bool 
  }
  const auto permitted_cpus = permitted_cpu_count();
  const auto& fixture = viewer_scenario == "square" ? inputs_->square() : ordinary_fixture_;
- const auto compiled_directory =
-  viewer_scenario == "square" ? std::filesystem::path{mmltk::backend::data::testsupport::compiled_dir(fixture)} : ordinary_compiled_;
+ const auto compiled_directory = viewer_scenario == "square" ? std::filesystem::path{mmltk::backend::data::testsupport::compiled_dir(fixture)} : ordinary_compiled_;
  auto& process = *process_;
  auto& notifications = *notifications_;
  auto& native_cursor = *native_cursor_;
@@ -792,9 +713,8 @@ void WaylandSession::RunScenario(const std::string& viewer_scenario, const bool 
     using Kind = mmltk::controller::contracts::IntegrationControlKind;
     const auto kind = static_cast<Kind>(entered->slot);
     if (kind == Kind::Failed)
-     FAIL("quiet integration failed after progress " << progress << ", failure receipt " << entered->compiled_index << ", frontend source line "
-                                                     << entered->staging_bytes << "\nfrontend error: " << process.frontend_failure()
-                                                     << "\nnative runtime output:\n"
+     FAIL("quiet integration failed after progress " << progress << ", failure receipt " << entered->compiled_index << ", frontend source line " << entered->staging_bytes
+                                                     << "\nfrontend error: " << process.frontend_failure() << "\nnative runtime output:\n"
                                                      << read_tail(runtime_log));
     if (kind == Kind::PressureEntered) {
      REQUIRE_FALSE(pressure_entered_);
@@ -834,19 +754,14 @@ void WaylandSession::RunScenario(const std::string& viewer_scenario, const bool 
   if (!phase_changed && !work_advanced) return false;
   observed_phase_progress = browser.phase_progress_revision;
   observed_work_progress = browser.work_progress_revision;
-  const auto duration = browser.phase_progress_class == "work"      ? kWaylandWorkDeadline
-                        : browser.phase_progress_class == "startup" ? kWaylandStartupDeadline
-                                                                    : kWaylandInteractionDeadline;
+  const auto duration = browser.phase_progress_class == "work" ? kWaylandWorkDeadline : browser.phase_progress_class == "startup" ? kWaylandStartupDeadline : kWaylandInteractionDeadline;
   arm_acceptance_deadline(duration, "integration phase " + browser.phase_progress_name);
   if (observed_phase_progress == 1U || observed_phase_progress % 25U == 0U)
    std::cout << "workspace-wayland: progress " << browser.phase_progress_name << " (phase " << observed_phase_progress << ")\n" << std::flush;
   return true;
  };
  const auto report_artifacts = [&] {
-  std::cerr << "\nnative diagnostics:\n"
-            << read_tail(diagnostics) << "\nnative runtime log:\n"
-            << read_tail(runtime_log) << "\nFirefox diagnostics:\n"
-            << read_tail(firefox_log) << '\n';
+  std::cerr << "\nnative diagnostics:\n" << read_tail(diagnostics) << "\nnative runtime log:\n" << read_tail(runtime_log) << "\nFirefox diagnostics:\n" << read_tail(firefox_log) << '\n';
  };
  bool exited_early = false;
  bool released_one_lane = false;
@@ -879,10 +794,9 @@ void WaylandSession::RunScenario(const std::string& viewer_scenario, const bool 
  const auto rendered_padding_exported = [&](const NativeAudit::PaddingOrientation orientation) {
   return std::ranges::any_of(native.rendered_probe_frames, [&](const auto& publication) {
    const auto slots = native.placeholder_slots.find(publication.first.first);
-   return native.padding_orientations.contains(publication.first) && native.padding_orientations.at(publication.first) == orientation &&
-          native.aligned_rendered_probe(publication.first) && slots != native.placeholder_slots.end() &&
-          std::ranges::any_of(publication.second,
-                              [&](const auto frame_revision) { return browser.rendered_frame_for_slots(slots->second, frame_revision, 0U); });
+   return native.padding_orientations.contains(publication.first) && native.padding_orientations.at(publication.first) == orientation && native.aligned_rendered_probe(publication.first) &&
+          slots != native.placeholder_slots.end() &&
+          std::ranges::any_of(publication.second, [&](const auto frame_revision) { return browser.rendered_frame_for_slots(slots->second, frame_revision, 0U); });
   });
  };
  const auto seeded_augmentation_ready = [&] {
@@ -897,9 +811,8 @@ void WaylandSession::RunScenario(const std::string& viewer_scenario, const bool 
  };
  const auto terminal_annotation_ready = [&] {
   return viewer_scenario != "terminal" ||
-         (native.annotation_copied && native.annotation_opened && native.annotation_edited && browser.annotation_ready && browser.annotation_tool &&
-          browser.annotation_pointer && browser.complete && browser.surface_draws.contains(browser.presentation_receipt) &&
-          browser.surface_redraws.contains(browser.presentation_receipt));
+         (native.annotation_copied && native.annotation_opened && native.annotation_edited && browser.annotation_ready && browser.annotation_tool && browser.annotation_pointer && browser.complete &&
+          browser.surface_draws.contains(browser.presentation_receipt) && browser.surface_redraws.contains(browser.presentation_receipt));
  };
  const auto acceptance_blockers = [&] {
   std::vector<std::string> blockers;
@@ -945,46 +858,32 @@ void WaylandSession::RunScenario(const std::string& viewer_scenario, const bool 
  };
  const auto record_acceptance_state = [&](const std::string_view event, const bool terminal) {
   if (!logging) return;
-  append_acceptance_record(acceptance_log, {{"event", event},
-                                            {"terminal", terminal},
-                                            {"termination", termination_label(termination)},
-                                            {"deadline_stage", deadline_stage},
-                                            {"deadline_seconds", deadline_duration.count()},
-                                            {"work_progress_revision", browser.work_progress_revision},
-                                            {"blockers", acceptance_blockers()},
-                                            {"final_material_generation", final_generations.material},
-                                            {"final_cursor_generation", final_generations.cursor},
-                                            {"browser_final_generation", browser.final_cursor_generation},
-                                            {"browser_final_frame_revision", browser.final_cursor_frame_revision},
-                                            {"browser_final_slot_count", browser.final_cursor_slot_count},
-                                            {"held_generation", native.held_generation},
-                                            {"held_slot", native.held_slot},
-                                            {"held_compiled_index", native.held_compiled_index},
-                                            {"held_staging_bytes", native.held_capacity}});
+  append_acceptance_record(
+   acceptance_log, {{"event", event}, {"terminal", terminal}, {"termination", termination_label(termination)}, {"deadline_stage", deadline_stage}, {"deadline_seconds", deadline_duration.count()},
+                    {"work_progress_revision", browser.work_progress_revision}, {"blockers", acceptance_blockers()}, {"final_material_generation", final_generations.material},
+                    {"final_cursor_generation", final_generations.cursor}, {"browser_final_generation", browser.final_cursor_generation},
+                    {"browser_final_frame_revision", browser.final_cursor_frame_revision}, {"browser_final_slot_count", browser.final_cursor_slot_count}, {"held_generation", native.held_generation},
+                    {"held_slot", native.held_slot}, {"held_compiled_index", native.held_compiled_index}, {"held_staging_bytes", native.held_capacity}});
  };
  bool readiness_reached = false;
  for (;;) {
   ConsumeRecords();
   if (!terminal_failure_observed) static_cast<void>(refresh_progress_deadline());
-  if (!terminal_failure_observed && frontend_settled_ && !browser_failed_ && !viewer_scenario.empty() && browser.viewer_complete &&
-      browser.surface_draws.contains(browser.viewer_presentation) && native.presentation_ready && native.explore_rendered && surface_audit.failure.empty() &&
-      pixel_audit.failure.empty() && (!pixel_probes || (pixel_audit.raw_complete() && pixel_audit.viewer_nonblack_complete())) &&
-      pixel_audit.probe_failure_complete(probe_failure) && surface_audit.evidence_settled() && terminal_annotation_ready() &&
-      (!pixel_fixture || pixel_audit.composition_complete()) &&
-      ((viewer_scenario != "copy" && viewer_scenario != "semantics") || pixel_audit.continuity_complete(false)) &&
-      (!pending_reconstruction || surface_audit.pending_supersession_completed()) &&
+  if (!terminal_failure_observed && frontend_settled_ && !browser_failed_ && !viewer_scenario.empty() && browser.viewer_complete && browser.surface_draws.contains(browser.viewer_presentation) &&
+      native.presentation_ready && native.explore_rendered && surface_audit.failure.empty() && pixel_audit.failure.empty() &&
+      (!pixel_probes || (pixel_audit.raw_complete() && pixel_audit.viewer_nonblack_complete())) && pixel_audit.probe_failure_complete(probe_failure) && surface_audit.evidence_settled() &&
+      terminal_annotation_ready() && (!pixel_fixture || pixel_audit.composition_complete()) &&
+      ((viewer_scenario != "copy" && viewer_scenario != "semantics") || pixel_audit.continuity_complete(false)) && (!pending_reconstruction || surface_audit.pending_supersession_completed()) &&
       (viewer_scenario != "square" || !pixel_probes || (pixel_audit.retained_logical_content && pixel_audit.upscale_growth))) {
    readiness_reached = true;
    break;
   }
   if (const auto* slots = browser.final_cursor_slots()) {
-   if (const auto identified = native.final_generations_for(*slots, browser.final_cursor_generation, browser.final_cursor_frame_revision))
-    final_generations = *identified;
+   if (const auto identified = native.final_generations_for(*slots, browser.final_cursor_generation, browser.final_cursor_frame_revision)) final_generations = *identified;
   }
   const auto recovery = pixel_audit.probe_failure_evidence(probe_failure);
   if (supersession_held && !supersession_released && surface_audit.pending_fallback(*supersession_held)) {
-   command_explore(static_cast<std::uint8_t>(ExploreAcceptanceGate::ControlCommand::ReleasePendingSupersession),
-                   "released pending arena after the exact retained fallback draw settled");
+   command_explore(static_cast<std::uint8_t>(ExploreAcceptanceGate::ControlCommand::ReleasePendingSupersession), "released pending arena after the exact retained fallback draw settled");
    supersession_released = true;
   }
   if (recover_before_reads && !recovery_redraw_requested && recovery.forwarded) {
@@ -1012,8 +911,8 @@ void WaylandSession::RunScenario(const std::string& viewer_scenario, const bool 
    released_one_lane = true;
    released_remaining_lanes = true;
   }
-  if (reads_releasable && released_one_lane && !released_remaining_lanes && !native.acceptance_first_patch_exact &&
-      native.explore_generation > released_placeholder_generation && native.placeholder_cardinalities.contains(native.explore_generation)) {
+  if (reads_releasable && released_one_lane && !released_remaining_lanes && !native.acceptance_first_patch_exact && native.explore_generation > released_placeholder_generation &&
+      native.placeholder_cardinalities.contains(native.explore_generation)) {
    command_explore(1U, "reissued one Explore lane for superseding generation");
    released_placeholder_generation = native.explore_generation;
   }
@@ -1022,16 +921,13 @@ void WaylandSession::RunScenario(const std::string& viewer_scenario, const bool 
    released_held_read = true;
   }
   if (viewer_scenario.empty() && native.acceptance_held_stale) released_held_read = true;
-  const bool rendered_probe_exported = !pixel_fixture || (rendered_padding_exported(NativeAudit::PaddingOrientation::Vertical) &&
-                                                          rendered_padding_exported(NativeAudit::PaddingOrientation::Horizontal));
-  const bool expected_window_close = termination == TerminationMode::WindowClose &&
-                                     native.product_completed(final_generations, seeded_augmentation_ready(), pixel_fixture) && !native.active_peer();
-  const bool terminal_failure = (native.failed_before_termination() && !expected_window_close) || browser.failed_before_termination() ||
-                                !surface_audit.failure.empty() || !pixel_audit.failure.empty();
+  const bool rendered_probe_exported =
+   !pixel_fixture || (rendered_padding_exported(NativeAudit::PaddingOrientation::Vertical) && rendered_padding_exported(NativeAudit::PaddingOrientation::Horizontal));
+  const bool expected_window_close = termination == TerminationMode::WindowClose && native.product_completed(final_generations, seeded_augmentation_ready(), pixel_fixture) && !native.active_peer();
+  const bool terminal_failure = (native.failed_before_termination() && !expected_window_close) || browser.failed_before_termination() || !surface_audit.failure.empty() || !pixel_audit.failure.empty();
   if (terminal_failure && !terminal_failure_observed) {
    std::cerr << "workspace-wayland failed before readiness"
-             << "\nnative failure: " << native.failure_blocker() << "\nbrowser failure: " << browser.failure_blocker()
-             << "\nacceptance blockers: " << blocker_summary();
+             << "\nnative failure: " << native.failure_blocker() << "\nbrowser failure: " << browser.failure_blocker() << "\nacceptance blockers: " << blocker_summary();
    record_acceptance_state("acceptance.readiness.blocked", true);
    report_artifacts();
    if (const auto terminal = process.reap_if_exited()) {
@@ -1044,11 +940,10 @@ void WaylandSession::RunScenario(const std::string& viewer_scenario, const bool 
    terminal_failure_observed = true;
    arm_acceptance_deadline(kWaylandFailureSettlementDeadline, "terminal failure settlement");
   }
-  if (!terminal_failure_observed && frontend_settled_ && !browser_failed_ &&
-      (native.product_ready(final_generations, seeded_augmentation_ready(), pixel_fixture) || expected_window_close) && browser.product_ready() &&
-      rendered_probe_exported && (!pixel_probes || (pixel_audit.raw_complete() && pixel_audit.viewer_nonblack_complete())) &&
-      pixel_audit.probe_failure_complete(probe_failure) && surface_audit.evidence_settled() && (!pixel_fixture || pixel_audit.composition_complete()) &&
-      pixel_audit.continuity_complete(true) && (!pending_reconstruction || surface_audit.pending_supersession_completed())) {
+  if (!terminal_failure_observed && frontend_settled_ && !browser_failed_ && (native.product_ready(final_generations, seeded_augmentation_ready(), pixel_fixture) || expected_window_close) &&
+      browser.product_ready() && rendered_probe_exported && (!pixel_probes || (pixel_audit.raw_complete() && pixel_audit.viewer_nonblack_complete())) &&
+      pixel_audit.probe_failure_complete(probe_failure) && surface_audit.evidence_settled() && (!pixel_fixture || pixel_audit.composition_complete()) && pixel_audit.continuity_complete(true) &&
+      (!pending_reconstruction || surface_audit.pending_supersession_completed())) {
    readiness_reached = true;
    break;
   }
@@ -1114,25 +1009,18 @@ void WaylandSession::RunScenario(const std::string& viewer_scenario, const bool 
     REQUIRE(visible_read_armed);
     REQUIRE_FALSE(visible_read_held.has_value());
     visible_read_held = *event;
-    if (logging)
-     append_acceptance_record(acceptance_log,
-                              {{"event", "acceptance.visible_read.held"}, {"generation", event->generation}, {"compiled_index", event->compiled_index}});
+    if (logging) append_acceptance_record(acceptance_log, {{"event", "acceptance.visible_read.held"}, {"generation", event->generation}, {"compiled_index", event->compiled_index}});
     continue;
    }
-   if (event->event == ExploreAcceptanceGate::ControlEvent::NativeCompletionHeld ||
-       event->event == ExploreAcceptanceGate::ControlEvent::NativeCapacityAvailable) {
+   if (event->event == ExploreAcceptanceGate::ControlEvent::NativeCompletionHeld || event->event == ExploreAcceptanceGate::ControlEvent::NativeCapacityAvailable) {
     REQUIRE(capacity_armed);
     REQUIRE((event->source_high != 0U || event->source_low != 0U));
     REQUIRE(event->transfer != 0U);
     REQUIRE(event->publication != 0U);
     if (logging)
      append_acceptance_record(acceptance_log,
-                              {{"event", event->event == ExploreAcceptanceGate::ControlEvent::NativeCompletionHeld ? "acceptance.native_completion.held"
-                                                                                                                   : "acceptance.native_capacity.available"},
-                               {"workspace_source_high", event->source_high},
-                               {"workspace_source_low", event->source_low},
-                               {"transfer_sequence", event->transfer},
-                               {"presentation_revision", event->publication}});
+      {{"event", event->event == ExploreAcceptanceGate::ControlEvent::NativeCompletionHeld ? "acceptance.native_completion.held" : "acceptance.native_capacity.available"},
+       {"workspace_source_high", event->source_high}, {"workspace_source_low", event->source_low}, {"transfer_sequence", event->transfer}, {"presentation_revision", event->publication}});
     if (event->event == ExploreAcceptanceGate::ControlEvent::NativeCompletionHeld) {
      REQUIRE_FALSE(capacity_held.has_value());
      capacity_held = *event;
@@ -1144,8 +1032,7 @@ void WaylandSession::RunScenario(const std::string& viewer_scenario, const bool 
      REQUIRE(event->transfer == capacity_held->transfer);
      REQUIRE(event->publication == capacity_held->publication);
      capacity_available = true;
-     command_explore(static_cast<std::uint8_t>(ExploreAcceptanceGate::ControlCommand::ReleaseNativeCompletion),
-                     "process held native completion after exact Available receipt");
+     command_explore(static_cast<std::uint8_t>(ExploreAcceptanceGate::ControlCommand::ReleaseNativeCompletion), "process held native completion after exact Available receipt");
     }
     continue;
    }
@@ -1161,13 +1048,11 @@ void WaylandSession::RunScenario(const std::string& viewer_scenario, const bool 
      REQUIRE(visible_read_held.has_value());
      REQUIRE_FALSE(visible_read_released);
      visible_read_released = true;
-     command_explore(static_cast<std::uint8_t>(ExploreAcceptanceGate::ControlCommand::ReleaseVisibleRead),
-                     "release visible miss after pending hover, selection and gallery return");
+     command_explore(static_cast<std::uint8_t>(ExploreAcceptanceGate::ControlCommand::ReleaseVisibleRead), "release visible miss after pending hover, selection and gallery return");
     } else if (kind == Kind::CapacityArmRequested) {
      REQUIRE_FALSE(capacity_armed);
      capacity_armed = true;
-     command_explore(static_cast<std::uint8_t>(ExploreAcceptanceGate::ControlCommand::ArmNativeCompletion),
-                     "arm native release-completion hold after both sample slots are occupied");
+     command_explore(static_cast<std::uint8_t>(ExploreAcceptanceGate::ControlCommand::ArmNativeCompletion), "arm native release-completion hold after both sample slots are occupied");
     } else if (kind == Kind::Settled) {
      REQUIRE_FALSE(frontend_settled_);
      frontend_settled_ = true;
@@ -1186,11 +1071,8 @@ void WaylandSession::RunScenario(const std::string& viewer_scenario, const bool 
                                : event->event == ExploreAcceptanceGate::ControlEvent::HeldProceed ? "acceptance.control.held_proceed"
                                 : event->event == ExploreAcceptanceGate::ControlEvent::HeldStale  ? "acceptance.control.held_stale"
                                                                                                   : "acceptance.control.initial_wait";
-    append_acceptance_record(acceptance_log, {{"event", control_event},
-                                              {"sequence", event->generation},
-                                              {"value", event->slot},
-                                              {"detail", event->compiled_index},
-                                              {"staging_bytes", event->staging_bytes}});
+    append_acceptance_record(
+     acceptance_log, {{"event", control_event}, {"sequence", event->generation}, {"value", event->slot}, {"detail", event->compiled_index}, {"staging_bytes", event->staging_bytes}});
    }
    if (native.causal_inconsistent) {
     record_acceptance_state("acceptance.control.failed", true);
@@ -1209,8 +1091,7 @@ void WaylandSession::RunScenario(const std::string& viewer_scenario, const bool 
     std::cerr << "native host terminal status: " << process_status_text(terminal) << '\n' << std::flush;
     FAIL("workspace Wayland product reported a terminal integration failure");
    }
-   const bool terminal_window_close = termination == TerminationMode::WindowClose &&
-                                      native.product_completed(final_generations, seeded_augmentation_ready(), pixel_fixture) && !native.active_peer();
+   const bool terminal_window_close = termination == TerminationMode::WindowClose && native.product_completed(final_generations, seeded_augmentation_ready(), pixel_fixture) && !native.active_peer();
    exited_early = !((native.product_ready(final_generations, seeded_augmentation_ready(), pixel_fixture) || terminal_window_close) && browser.product_ready());
    if (exited_early) {
     std::cerr << "workspace-wayland child exited before readiness";
@@ -1393,9 +1274,8 @@ void WaylandSession::RunScenario(const std::string& viewer_scenario, const bool 
      if (copied == state.receipts.end()) continue;
      const auto first = state.transfers.find({capacity_held->publication, capacity_held->transfer});
      const auto retry = state.transfers.find({browser.capacity_retry_publication, copied->second.transfer});
-     exact_retry = copied->second.stage == 3U && !copied->second.release_only && first != state.transfers.end() && retry != state.transfers.end() &&
-                   first->second.read.source == source && first->second.releasing && first->second.released && retry->second.releasing &&
-                   retry->second.released && browser.capacity_retry_publication >= capacity_held->publication &&
+     exact_retry = copied->second.stage == 3U && !copied->second.release_only && first != state.transfers.end() && retry != state.transfers.end() && first->second.read.source == source &&
+                   first->second.releasing && first->second.released && retry->second.releasing && retry->second.released && browser.capacity_retry_publication >= capacity_held->publication &&
                    browser.capacity_retry_frame == copied->second.frame;
      if (exact_retry) break;
     }
@@ -1429,20 +1309,10 @@ void WaylandSession::RunScenario(const std::string& viewer_scenario, const bool 
        reader_releases += custody.released;
       }
      }
-     append_acceptance_record(acceptance_log, {{"event", "acceptance.physical_inventory"},
-                                               {"live_workspaces", workspaces},
-                                               {"workspace_bytes", workspace_bytes},
-                                               {"live_sample_arenas", arenas},
-                                               {"live_sample_slots", arenas * 2U},
-                                               {"completed_browser_copies", copies},
-                                               {"settled_direct_reads", direct_reads},
-                                               {"settled_release_only_reads", release_only_reads},
-                                               {"unacquired_offers", offers},
-                                               {"encoded_draws", encodings},
-                                               {"settled_draws", settlements},
-                                               {"abandoned_draws", abandonments},
-                                               {"final_reader_releases", reader_releases},
-                                               {"explore_peak_pinned_bytes", native.explore_max_pinned}});
+     append_acceptance_record(acceptance_log,
+      {{"event", "acceptance.physical_inventory"}, {"live_workspaces", workspaces}, {"workspace_bytes", workspace_bytes}, {"live_sample_arenas", arenas}, {"live_sample_slots", arenas * 2U},
+       {"completed_browser_copies", copies}, {"settled_direct_reads", direct_reads}, {"settled_release_only_reads", release_only_reads}, {"unacquired_offers", offers}, {"encoded_draws", encodings},
+       {"settled_draws", settlements}, {"abandoned_draws", abandonments}, {"final_reader_releases", reader_releases}, {"explore_peak_pinned_bytes", native.explore_max_pinned}});
     }
    }
    CHECK((browser.atlas_notices == std::set<std::string>{"explore.gallery.capacity", "explore.gallery.empty"}));
@@ -1465,8 +1335,7 @@ void WaylandSession::RunScenario(const std::string& viewer_scenario, const bool 
    CHECK(browser.viewer_class_colors);
    CHECK(browser.viewer_labels_without_boxes);
    for (const auto kind : {1U, 5U}) {
-    CHECK(std::ranges::any_of(browser.viewer_label_products,
-                              [&](const auto& product) { return product.first == kind && browser.surface_draws.contains(product.second); }));
+    CHECK(std::ranges::any_of(browser.viewer_label_products, [&](const auto& product) { return product.first == kind && browser.surface_draws.contains(product.second); }));
    }
   }
   if (viewer_scenario == "copy") {
@@ -1506,21 +1375,18 @@ void WaylandSession::RunScenario(const std::string& viewer_scenario, const bool 
     CHECK(source != 0U);
     CHECK(browser.surface_draws.contains(presentation));
    }
-   for (const auto operation :
-        {"color-sample", "mask-fill", "move-Mask", "resize-mask", "paint-mask", "erase-mask", "move-Point", "move-Spline", "move-Skeleton", "spline-handle",
-         "singleton-spline", "reclassify", "undo-class", "redo-class", "cancel-preview", "create-Box", "create-Point", "create-Skeleton"})
+   for (const auto operation : {"color-sample", "mask-fill", "move-Mask", "resize-mask", "paint-mask", "erase-mask", "move-Point", "move-Spline", "move-Skeleton", "spline-handle", "singleton-spline",
+         "reclassify", "undo-class", "redo-class", "cancel-preview", "create-Box", "create-Point", "create-Skeleton"})
     CHECK(browser.annotation_product_operations[operation] >= 2U);
    for (const auto tool : mmltk::frameworks::reflection::enum_entries<mmltk::controller::contracts::AnnotationTool>())
     CHECK(browser.annotation_product_operations["tool-" + std::string{tool.name}] >= 2U);
    for (const auto operation : mmltk::frameworks::reflection::enum_entries<mmltk::controller::contracts::AnnotationMaskCleanup>())
     CHECK(browser.annotation_product_operations["cleanup-" + std::string{operation.name}] >= 2U);
-   CHECK((browser.viewer_import_edits ==
-          std::set<std::string>{"box-move-undo-redo", "box-resize-undo-redo", "mask-paint-undo-redo", "mask-erase-undo-redo", "class-undo-redo"}));
+   CHECK((browser.viewer_import_edits == std::set<std::string>{"box-move-undo-redo", "box-resize-undo-redo", "mask-paint-undo-redo", "mask-erase-undo-redo", "class-undo-redo"}));
    const auto saved_path = compiled_directory / "viewer-annotations.cbor";
    REQUIRE(std::filesystem::is_regular_file(saved_path));
    const auto saved_bytes = read_from(saved_path, 0U);
-   const auto saved = mmltk::frameworks::serialization::decode<mmltk::controller::contracts::AnnotationUiState>(
-    {.first = std::as_bytes(std::span{saved_bytes})},
+   const auto saved = mmltk::frameworks::serialization::decode<mmltk::controller::contracts::AnnotationUiState>({.first = std::as_bytes(std::span{saved_bytes})},
     {.max_bytes = mmltk::controller::contracts::kAnnotationUiStateByteBudget, .max_items = mmltk::controller::contracts::kAnnotationUiStateByteBudget});
    REQUIRE(saved.has_value());
    CHECK(saved->valid());
@@ -1530,9 +1396,7 @@ void WaylandSession::RunScenario(const std::string& viewer_scenario, const bool 
    CHECK(saved->scene.palette == mmltk::controller::annotation_class_palette(saved->scene.categories.size()));
    for (const auto shape : mmltk::frameworks::reflection::enum_entries<mmltk::controller::contracts::AnnotationShape>())
     CHECK(std::ranges::any_of(saved->scene.objects, [&](const auto& object) { return object.enabled && object.shape == shape.value; }));
-   CHECK(std::ranges::any_of(saved->scene.objects, [](const auto& object) {
-    return object.shape == mmltk::controller::contracts::AnnotationShape::Spline && object.spline_knots.size() == 1U;
-   }));
+   CHECK(std::ranges::any_of(saved->scene.objects, [](const auto& object) { return object.shape == mmltk::controller::contracts::AnnotationShape::Spline && object.spline_knots.size() == 1U; }));
    for (const auto& object : saved->scene.objects)
     for (const auto& run : object.mask.runs) {
      CHECK(run.first >= object.box.first.x);
@@ -1555,8 +1419,7 @@ void WaylandSession::RunScenario(const std::string& viewer_scenario, const bool 
  CHECK(browser.rendered_frame_for_slots(released_placeholder->second, 0U, 0U));
  const auto* final_cursor_slots = browser.final_cursor_slots();
  REQUIRE(final_cursor_slots != nullptr);
- const auto identified_final_generations =
-  native.final_generations_for(*final_cursor_slots, browser.final_cursor_generation, browser.final_cursor_frame_revision);
+ const auto identified_final_generations = native.final_generations_for(*final_cursor_slots, browser.final_cursor_generation, browser.final_cursor_frame_revision);
  REQUIRE(identified_final_generations.has_value());
  CHECK(identified_final_generations->material == final_generations.material);
  CHECK(identified_final_generations->cursor == final_generations.cursor);
@@ -1592,8 +1455,7 @@ void WaylandSession::RunScenario(const std::string& viewer_scenario, const bool 
  REQUIRE(native.placeholder_slots.contains(native.partial_generation));
  REQUIRE(native.patched_slots.contains(native.partial_generation));
  CHECK_FALSE(native.patched_slots.at(native.partial_generation).empty());
- CHECK(std::ranges::any_of(browser.explore_slots,
-                           [this](const auto& rendered) { return rendered.second == native.placeholder_slots.at(native.partial_generation); }));
+ CHECK(std::ranges::any_of(browser.explore_slots, [this](const auto& rendered) { return rendered.second == native.placeholder_slots.at(native.partial_generation); }));
  CHECK(native.exact_partial_slot_identity());
  CHECK(native.stale_thumbnail_discarded());
  CHECK_FALSE(native.explore_tile_regressed);

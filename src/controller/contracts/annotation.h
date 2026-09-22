@@ -77,8 +77,7 @@ struct[[= kAnnotationTextPolicy]] AnnotationText final {
   return result;
  }
  [[nodiscard]] bool valid() const noexcept {
-  return size <= bytes.size() && kAnnotationTextPolicy.accepts({bytes.data(), size}) &&
-         std::ranges::all_of(bytes.begin() + size, bytes.end(), [](const char item) { return item == '\0'; });
+  return size <= bytes.size() && kAnnotationTextPolicy.accepts({bytes.data(), size}) && std::ranges::all_of(bytes.begin() + size, bytes.end(), [](const char item) { return item == '\0'; });
  }
  [[nodiscard]] std::string_view view() const noexcept { return valid() ? std::string_view{bytes.data(), size} : std::string_view{}; }
  auto operator<=>(const AnnotationText&) const = default;
@@ -100,8 +99,7 @@ struct AnnotationColor final {
  float saturation = 0.0F;
  float value = 0.0F;
  [[nodiscard]] bool valid() const noexcept {
-  return std::isfinite(hue) && std::isfinite(saturation) && std::isfinite(value) && hue >= 0.0F && hue <= 360.0F && saturation >= 0.0F && saturation <= 1.0F &&
-         value >= 0.0F && value <= 1.0F;
+  return std::isfinite(hue) && std::isfinite(saturation) && std::isfinite(value) && hue >= 0.0F && hue <= 360.0F && saturation >= 0.0F && saturation <= 1.0F && value >= 0.0F && value <= 1.0F;
  }
  auto operator<=>(const AnnotationColor&) const = default;
 };
@@ -152,8 +150,7 @@ struct AnnotationMask final {
  AnnotationMaskCleanup cleanup = AnnotationMaskCleanup::LargestComponent;
  bool present = false;
  [[nodiscard]] bool valid() const noexcept {
-  return runs.size() <= kAnnotationMaskRunCapacity && mmltk::frameworks::reflection::enum_contains(cleanup) &&
-         std::ranges::all_of(runs, [](const auto& run) { return run.valid(); });
+  return runs.size() <= kAnnotationMaskRunCapacity && mmltk::frameworks::reflection::enum_contains(cleanup) && std::ranges::all_of(runs, [](const auto& run) { return run.valid(); });
  }
  auto operator<=>(const AnnotationMask&) const = default;
 };
@@ -174,21 +171,16 @@ struct AnnotationObject final {
  bool spline_closed = false;
  bool enabled = true;
  [[nodiscard]] bool valid() const noexcept {
-  if (mask_points.size() > kAnnotationGeometryCapacity || spline_knots.size() > kAnnotationGeometryCapacity ||
-      skeleton_nodes.size() > kAnnotationGeometryCapacity || skeleton_edges.size() > kAnnotationGeometryCapacity)
+  if (mask_points.size() > kAnnotationGeometryCapacity || spline_knots.size() > kAnnotationGeometryCapacity || skeleton_nodes.size() > kAnnotationGeometryCapacity ||
+      skeleton_edges.size() > kAnnotationGeometryCapacity)
    return false;
-  if (!name.valid() || !mmltk::frameworks::reflection::enum_contains(shape) || !point.finite() || !mask.valid() || !sup.valid() || !nosup.valid()) {
-   return false;
-  }
+  if (!name.valid() || !mmltk::frameworks::reflection::enum_contains(shape) || !point.finite() || !mask.valid() || !sup.valid() || !nosup.valid()) { return false; }
   if (shape == AnnotationShape::Box && !box.valid()) return false;
-  if (!std::ranges::all_of(mask_points, [](const auto& item) { return item.finite(); }) ||
-      !std::ranges::all_of(spline_knots, [](const auto& item) { return item.valid(); }) ||
+  if (!std::ranges::all_of(mask_points, [](const auto& item) { return item.finite(); }) || !std::ranges::all_of(spline_knots, [](const auto& item) { return item.valid(); }) ||
       !std::ranges::all_of(skeleton_nodes, [](const auto& item) { return item.valid(); })) {
    return false;
   }
-  return std::ranges::all_of(skeleton_edges, [this](const auto& edge) {
-   return edge.source < skeleton_nodes.size() && edge.target < skeleton_nodes.size() && edge.source != edge.target;
-  });
+  return std::ranges::all_of(skeleton_edges, [this](const auto& edge) { return edge.source < skeleton_nodes.size() && edge.target < skeleton_nodes.size() && edge.source != edge.target; });
  }
  auto operator<=>(const AnnotationObject&) const = default;
 };
@@ -207,9 +199,7 @@ struct AnnotationPointerTarget final {
  std::optional<std::uint16_t> object{};
  std::optional<std::uint16_t> element{};
  std::optional<AnnotationHandleRole> role{};
- [[nodiscard]] bool valid() const noexcept {
-  return (!role || mmltk::frameworks::reflection::enum_contains(*role)) && element.has_value() == role.has_value() && (!element || object.has_value());
- }
+ [[nodiscard]] bool valid() const noexcept { return (!role || mmltk::frameworks::reflection::enum_contains(*role)) && element.has_value() == role.has_value() && (!element || object.has_value()); }
  auto operator<=>(const AnnotationPointerTarget&) const = default;
 };
 // These facts are the editor portion of the public state. Collections and the
@@ -239,9 +229,8 @@ struct AnnotationSceneContent final {
  std::uint32_t frame_index = 0U;
  bool frame_ready = false;
  [[nodiscard]] bool valid() const noexcept {
-  if (!document.valid() || categories.size() > kAnnotationCategoryCapacity || objects.size() > kAnnotationObjectCapacity ||
-      palette.size() > kAnnotationCategoryCapacity || (!palette.empty() && palette.size() != categories.size()) ||
-      !std::ranges::all_of(palette, [](const auto& color) { return color.valid(); }))
+  if (!document.valid() || categories.size() > kAnnotationCategoryCapacity || objects.size() > kAnnotationObjectCapacity || palette.size() > kAnnotationCategoryCapacity ||
+      (!palette.empty() && palette.size() != categories.size()) || !std::ranges::all_of(palette, [](const auto& color) { return color.valid(); }))
    return false;
   std::size_t mask_runs = 0U;
   for (const auto& object : objects) {
@@ -249,19 +238,14 @@ struct AnnotationSceneContent final {
    mask_runs += object.mask.runs.size();
   }
   if (frame_ready && (frame_width == 0U || frame_height == 0U)) return false;
-  const auto point_in_frame = [this](const AnnotationPoint point) {
-   return !frame_ready || (point.x >= 0.0F && point.y >= 0.0F && point.x <= frame_width && point.y <= frame_height);
-  };
-  if (!std::ranges::all_of(categories, [](const auto& item) { return item.valid(); }) ||
-      !std::ranges::all_of(objects, [this, &point_in_frame](const auto& item) {
-       return item.valid() && item.category < categories.size() && point_in_frame(item.point) && point_in_frame(item.box.first) &&
-              point_in_frame(item.box.second) &&
+  const auto point_in_frame = [this](const AnnotationPoint point) { return !frame_ready || (point.x >= 0.0F && point.y >= 0.0F && point.x <= frame_width && point.y <= frame_height); };
+  if (!std::ranges::all_of(categories, [](const auto& item) { return item.valid(); }) || !std::ranges::all_of(objects, [this, &point_in_frame](const auto& item) {
+       return item.valid() && item.category < categories.size() && point_in_frame(item.point) && point_in_frame(item.box.first) && point_in_frame(item.box.second) &&
               std::ranges::all_of(
                item.mask.runs, [this](const auto& run) { return !frame_ready || (run.row < frame_height && run.last < frame_width); }) &&
               std::ranges::all_of(item.mask_points, point_in_frame) &&
               std::ranges::all_of(
-               item.spline_knots,
-               [&point_in_frame](const auto& knot) { return point_in_frame(knot.point) && point_in_frame(knot.in.point) && point_in_frame(knot.out.point); }) &&
+               item.spline_knots, [&point_in_frame](const auto& knot) { return point_in_frame(knot.point) && point_in_frame(knot.in.point) && point_in_frame(knot.out.point); }) &&
               std::ranges::all_of(item.skeleton_nodes, [&point_in_frame](const auto& node) { return point_in_frame(node.point); });
       })) {
    return false;
@@ -281,8 +265,7 @@ struct AnnotationToolCapability final {
 struct AnnotationUiState final {
  AnnotationSceneContent scene{};
  AnnotationEditorFacts editor{};
- [[= mmltk::frameworks::reflection::MaxItems{mmltk::frameworks::reflection::enum_entries<AnnotationTool>().size()}]] std::vector<AnnotationToolCapability>
-  tool_capabilities{};
+ [[= mmltk::frameworks::reflection::MaxItems{mmltk::frameworks::reflection::enum_entries<AnnotationTool>().size()}]] std::vector<AnnotationToolCapability> tool_capabilities{};
  bool can_undo = false;
  bool can_redo = false;
  bool source_navigation_available = false;
@@ -292,17 +275,16 @@ struct AnnotationUiState final {
  std::uint64_t saved_revision = 0U;
  std::uint64_t scene_revision = 0U;
  [[nodiscard]] bool empty() const noexcept {
-  return tool_capabilities.empty() && !can_undo && !can_redo && !source_navigation_available && !scene.document.valid() && scene.categories.empty() &&
-         scene.palette.empty() && scene.objects.empty() && editor == AnnotationEditorFacts{} && save_status == AnnotationSaveStatus::Idle &&
-         interaction_revision == 0U && document_revision == 0U && saved_revision == 0U && scene_revision == 0U;
+  return tool_capabilities.empty() && !can_undo && !can_redo && !source_navigation_available && !scene.document.valid() && scene.categories.empty() && scene.palette.empty() && scene.objects.empty() &&
+         editor == AnnotationEditorFacts{} && save_status == AnnotationSaveStatus::Idle && interaction_revision == 0U && document_revision == 0U && saved_revision == 0U && scene_revision == 0U;
  }
  [[nodiscard]] bool valid() const noexcept {
   if (!scene.document.valid()) return empty();
   if (!scene.valid() || !mmltk::frameworks::reflection::enum_contains(editor.tool)) return false;
   if (editor.selected_object && *editor.selected_object >= scene.objects.size()) return false;
   if (editor.selected_category && *editor.selected_category >= scene.categories.size()) return false;
-  return mmltk::frameworks::reflection::enum_contains(save_status) && document_revision != 0U && saved_revision <= document_revision && scene_revision != 0U &&
-         interaction_revision != 0U && scene.document.revision == document_revision;
+  return mmltk::frameworks::reflection::enum_contains(save_status) && document_revision != 0U && saved_revision <= document_revision && scene_revision != 0U && interaction_revision != 0U &&
+         scene.document.revision == document_revision;
  }
  // CLEANUP-IGNORE: AnnotationUiState closes its canonical domain declaration before the reflected inventory.
  auto operator<=>(const AnnotationUiState&) const = default;

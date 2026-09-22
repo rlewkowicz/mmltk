@@ -61,9 +61,7 @@ constexpr std::string_view kRevisionField{"settings_revision"};
  const nlohmann::json raw = nlohmann::json::parse(file, nullptr, false);
  if (raw.is_discarded() || !raw.is_object() || !raw.contains(kRevisionField)) return std::nullopt;
  const nlohmann::json& revision = raw.at(kRevisionField);
- if (!revision.is_number_unsigned()) {
-  throw SettingsStoreError{SettingsStoreWriteStage::Validation, "settings revision metadata must be an unsigned integer"};
- }
+ if (!revision.is_number_unsigned()) { throw SettingsStoreError{SettingsStoreWriteStage::Validation, "settings revision metadata must be an unsigned integer"}; }
  return revision.get<std::uint64_t>();
 }
 StoredSettings load_record(const std::filesystem::path& path) {
@@ -83,9 +81,7 @@ StoredSettings load_record(const std::filesystem::path& path) {
  return record;
 }
 void save_record(const std::filesystem::path& path, const contracts::GuiSettingsState& settings, const std::uint64_t revision_frontier) {
- if (!contracts::gui_settings_valid(settings)) {
-  throw SettingsStoreError{SettingsStoreWriteStage::Validation, "refusing to persist invalid typed GUI settings"};
- }
+ if (!contracts::gui_settings_valid(settings)) { throw SettingsStoreError{SettingsStoreWriteStage::Validation, "refusing to persist invalid typed GUI settings"}; }
  const std::filesystem::path parent = path.parent_path();
  if (!parent.empty()) {
   std::error_code error;
@@ -98,8 +94,7 @@ void save_record(const std::filesystem::path& path, const contracts::GuiSettings
  if (failure.has_value()) {
   std::error_code cleanup_error;
   std::filesystem::remove(path.string() + ".tmp", cleanup_error);
-  throw SettingsStoreError{settings_write_stage(*failure),
-                           "failed to persist GUI settings `" + path.string() + "` at stage " + std::string(common_io::to_string(*failure))};
+  throw SettingsStoreError{settings_write_stage(*failure), "failed to persist GUI settings `" + path.string() + "` at stage " + std::string(common_io::to_string(*failure))};
  }
 }
 }  // namespace
@@ -107,9 +102,7 @@ PersistenceLoadResult SettingsStore::load(const std::string_view location) noexc
  try {
   const std::filesystem::path path{location};
   auto record = load_record(path);
-  return {.terminal = PersistenceTerminal::Succeeded,
-          .settings = std::make_unique<contracts::GuiSettingsState>(std::move(record.settings)),
-          .revision_frontier = record.revision_frontier};
+  return {.terminal = PersistenceTerminal::Succeeded, .settings = std::make_unique<contracts::GuiSettingsState>(std::move(record.settings)), .revision_frontier = record.revision_frontier};
  } catch (const SettingsStoreError& error) { return {.detail = bounded_detail(error), .stage = error.stage}; } catch (const std::exception& error) {
   return {.detail = bounded_detail(error)};
  } catch (...) { return {.detail = "settings load failed"}; }
@@ -121,10 +114,8 @@ PersistenceSaveResult SettingsStore::save(const std::string_view location, const
   if (revision <= current.revision_frontier) return {.revision = revision, .detail = "settings revision is not newer than durable frontier"};
   save_record(path, settings, revision);
   return {.terminal = PersistenceTerminal::Succeeded, .revision = revision};
- } catch (const SettingsStoreError& error) {
-  return {.revision = revision, .detail = bounded_detail(error), .stage = error.stage};
- } catch (const std::exception& error) { return {.revision = revision, .detail = bounded_detail(error)}; } catch (...) {
-  return {.revision = revision, .detail = "settings save failed"};
- }
+ } catch (const SettingsStoreError& error) { return {.revision = revision, .detail = bounded_detail(error), .stage = error.stage}; } catch (const std::exception& error) {
+  return {.revision = revision, .detail = bounded_detail(error)};
+ } catch (...) { return {.revision = revision, .detail = "settings save failed"}; }
 }
 }  // namespace mmltk::controller::services

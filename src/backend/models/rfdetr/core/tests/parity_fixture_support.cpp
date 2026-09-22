@@ -13,8 +13,7 @@ const std::array<ParityFixtureCase, 2>& parity_fixture_cases() noexcept {
  return cases;
 }
 at::Tensor make_fixture_image(const ParityFixtureCase& fixture) {
- return torch::linspace(-1.0F + fixture.offset, 1.0F + fixture.offset, 3 * fixture.input_size * fixture.input_size,
-                        torch::TensorOptions().dtype(torch::kFloat32))
+ return torch::linspace(-1.0F + fixture.offset, 1.0F + fixture.offset, 3 * fixture.input_size * fixture.input_size, torch::TensorOptions().dtype(torch::kFloat32))
   .reshape({3, fixture.input_size, fixture.input_size});
 }
 at::Tensor make_fixture_query_feat(const ParityFixtureCase& fixture) {
@@ -24,8 +23,7 @@ at::Tensor make_fixture_query_feat(const ParityFixtureCase& fixture) {
   .add(fixture.offset);
 }
 at::Tensor make_fixture_refpoint_embed(const ParityFixtureCase& fixture) {
- return torch::linspace(-1.0F + fixture.offset, 1.0F + fixture.offset, fixture.query_rows * 4, torch::TensorOptions().dtype(torch::kFloat32))
-  .reshape({fixture.query_rows, 4});
+ return torch::linspace(-1.0F + fixture.offset, 1.0F + fixture.offset, fixture.query_rows * 4, torch::TensorOptions().dtype(torch::kFloat32)).reshape({fixture.query_rows, 4});
 }
 at::Tensor make_fixture_class_weight(const ParityFixtureCase& fixture) {
  return torch::arange(kParityFixtureNumClasses * kParityFixtureHiddenDim, torch::TensorOptions().dtype(torch::kFloat32))

@@ -6,30 +6,21 @@ constexpr std::size_t kProviderFieldCapacity = 4U * 1024U;
 constexpr std::size_t kProviderApiKeyCapacity = 512U;
 class RuntimeVastOperations final : public VastOperations {
 public:
- std::vector<VastOfferSummary> query(const VastQueryConfig& config, const std::vector<mmltk::controller::contracts::ProviderGpuFamily>& families,
-                                     const VastBridgeInvocation& invocation) const override {
+ std::vector<VastOfferSummary> query(
+  const VastQueryConfig& config, const std::vector<mmltk::controller::contracts::ProviderGpuFamily>& families, const VastBridgeInvocation& invocation) const override {
   return query_vast_offers(config, families, invocation);
  }
- VastCreateInstanceResult create(const VastBridgeConfig& config, const int offer, const std::string_view image, const VastLaunchTemplateOptions& options,
-                                 const VastBridgeInvocation& invocation) const override {
+ VastCreateInstanceResult create(
+  const VastBridgeConfig& config, const int offer, const std::string_view image, const VastLaunchTemplateOptions& options, const VastBridgeInvocation& invocation) const override {
   VastCreateInstanceResult result = create_vast_instance(config, offer, image, options, invocation);
   if (result.offer_id == 0) result.offer_id = offer;
   return result;
  }
- void start(const VastBridgeConfig& config, const int instance, const VastBridgeInvocation& invocation) const override {
-  start_vast_instance(config, instance, invocation);
- }
- void stop(const VastBridgeConfig& config, const int instance, const VastBridgeInvocation& invocation) const override {
-  stop_vast_instance(config, instance, invocation);
- }
- VastInstanceInfo show(const VastBridgeConfig& config, const int instance, const VastBridgeInvocation& invocation) const override {
-  return show_vast_instance(config, instance, invocation);
- }
- std::vector<VastInstanceInfo> inventory(const VastBridgeConfig& config, const VastBridgeInvocation& invocation) const override {
-  return show_vast_instances(config, invocation);
- }
- std::string logs(const VastBridgeConfig& config, const int instance, const std::optional<std::size_t> tail,
-                  const VastBridgeInvocation& invocation) const override {
+ void start(const VastBridgeConfig& config, const int instance, const VastBridgeInvocation& invocation) const override { start_vast_instance(config, instance, invocation); }
+ void stop(const VastBridgeConfig& config, const int instance, const VastBridgeInvocation& invocation) const override { stop_vast_instance(config, instance, invocation); }
+ VastInstanceInfo show(const VastBridgeConfig& config, const int instance, const VastBridgeInvocation& invocation) const override { return show_vast_instance(config, instance, invocation); }
+ std::vector<VastInstanceInfo> inventory(const VastBridgeConfig& config, const VastBridgeInvocation& invocation) const override { return show_vast_instances(config, invocation); }
+ std::string logs(const VastBridgeConfig& config, const int instance, const std::optional<std::size_t> tail, const VastBridgeInvocation& invocation) const override {
   return fetch_vast_instance_logs(config, instance, tail, invocation);
  }
 };

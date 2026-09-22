@@ -122,15 +122,9 @@ public:
  [[nodiscard]] bool owns_in_flight_work() const noexcept { return static_cast<bool>(owner_); }
 
 private:
- AnalysisResult(std::shared_ptr<AnalysisProvider> owner, std::uint64_t generation, AnalysisIdentity identity, AnalysisTerminal terminal,
-                std::uint64_t completed_ns, std::size_t output_count, AnalysisCompletion completion) noexcept
-     : owner_(std::move(owner)),
-       generation_(generation),
-       identity_(identity),
-       terminal_(terminal),
-       completed_ns_(completed_ns),
-       output_count_(output_count),
-       completion_(completion) {}
+ AnalysisResult(std::shared_ptr<AnalysisProvider> owner, std::uint64_t generation, AnalysisIdentity identity, AnalysisTerminal terminal, std::uint64_t completed_ns, std::size_t output_count,
+  AnalysisCompletion completion) noexcept
+     : owner_(std::move(owner)), generation_(generation), identity_(identity), terminal_(terminal), completed_ns_(completed_ns), output_count_(output_count), completion_(completion) {}
  std::shared_ptr<AnalysisProvider> owner_;
  std::uint64_t generation_ = 0U;
  AnalysisIdentity identity_{};
@@ -253,24 +247,21 @@ private:
   }
   return 0U;
  }
- [[nodiscard]] static bool ValidateBuffer(const AnalysisDeviceBuffer& buffer, const std::uint8_t rank, const std::span<const std::uint32_t> extents,
-                                          const AnalysisElementType type, const bool optional = false) noexcept {
+ [[nodiscard]] static bool ValidateBuffer(
+  const AnalysisDeviceBuffer& buffer, const std::uint8_t rank, const std::span<const std::uint32_t> extents, const AnalysisElementType type, const bool optional = false) noexcept {
   if (optional && buffer.address == 0U) { return buffer.capacity_bytes == 0U; }
   if (buffer.address == 0U || buffer.shape.rank != rank || extents.size() != rank || buffer.element_type != type) { return false; }
   std::size_t elements = 1U;
   for (std::size_t axis = 0U; axis < rank; ++axis) {
-   if (extents[axis] == 0U || buffer.shape.extents[axis] != extents[axis] || extents[axis] > std::numeric_limits<std::size_t>::max() / elements) {
-    return false;
-   }
+   if (extents[axis] == 0U || buffer.shape.extents[axis] != extents[axis] || extents[axis] > std::numeric_limits<std::size_t>::max() / elements) { return false; }
    elements *= extents[axis];
   }
   const std::size_t bytes = ElementBytes(type);
   return bytes != 0U && elements <= std::numeric_limits<std::size_t>::max() / bytes && buffer.capacity_bytes >= elements * bytes;
  }
  [[nodiscard]] static bool ValidateRequest(const AnalysisRequest& request) noexcept {
-  if (!request.identity.valid() || request.source.device < 0 || request.source.width == 0U || request.source.height == 0U ||
-      (request.source.channels != 3U && request.source.channels != 4U) || !request.source_ready.valid() ||
-      request.source_ready.device != request.source.device || request.regions.empty() || request.regions.size() > kMaximumAnalysisRegions ||
+  if (!request.identity.valid() || request.source.device < 0 || request.source.width == 0U || request.source.height == 0U || (request.source.channels != 3U && request.source.channels != 4U) ||
+      !request.source_ready.valid() || request.source_ready.device != request.source.device || request.regions.empty() || request.regions.size() > kMaximumAnalysisRegions ||
       request.annotations.size() != request.regions.size()) {
    return false;
   }
@@ -288,9 +279,8 @@ private:
   for (std::size_t index = 0U; index < request.regions.size(); ++index) {
    const AnalysisRegion& region = request.regions[index];
    const AnalysisAnnotationStorage& output = request.annotations[index];
-   if (!region.valid() || output.source_region != region || !output.count.empty() || region.width > request.source.width ||
-       region.height > request.source.height || region.x > request.source.width - region.width || region.y > request.source.height - region.height ||
-       !ValidateAnnotationStorage(output)) {
+   if (!region.valid() || output.source_region != region || !output.count.empty() || region.width > request.source.width || region.height > request.source.height ||
+       region.x > request.source.width - region.width || region.y > request.source.height - region.height || !ValidateAnnotationStorage(output)) {
     return false;
    }
   }
@@ -299,8 +289,8 @@ private:
  [[nodiscard]] static bool ValidateAnnotationStorage(const AnalysisAnnotationStorage& output) noexcept {
   if (output.value_capacity > std::numeric_limits<std::uint32_t>::max()) { return false; }
   if (output.value_capacity == 0U) {
-   return output.count.empty() && !output.masks_available && output.boxes_xyxy.capacity_bytes == 0U && output.class_references.capacity_bytes == 0U &&
-          output.confidences.capacity_bytes == 0U && output.colors_rgb.capacity_bytes == 0U && output.masks.capacity_bytes == 0U;
+   return output.count.empty() && !output.masks_available && output.boxes_xyxy.capacity_bytes == 0U && output.class_references.capacity_bytes == 0U && output.confidences.capacity_bytes == 0U &&
+          output.colors_rgb.capacity_bytes == 0U && output.masks.capacity_bytes == 0U;
   }
   const auto capacity = static_cast<std::uint32_t>(output.value_capacity);
   const std::uint32_t boxes[]{capacity, 4U};
@@ -311,10 +301,9 @@ private:
    output.source_region.height,
    output.source_region.width,
   };
-  return ValidateBuffer(output.boxes_xyxy, 2U, boxes, AnalysisElementType::Float32) &&
-         ValidateBuffer(output.class_references, 1U, values, AnalysisElementType::Int32) &&
-         ValidateBuffer(output.confidences, 1U, values, AnalysisElementType::Float32) &&
-         ValidateBuffer(output.colors_rgb, 2U, colors, AnalysisElementType::Uint8) && ValidateBuffer(output.masks, 3U, masks, AnalysisElementType::Uint8, true);
+  return ValidateBuffer(output.boxes_xyxy, 2U, boxes, AnalysisElementType::Float32) && ValidateBuffer(output.class_references, 1U, values, AnalysisElementType::Int32) &&
+         ValidateBuffer(output.confidences, 1U, values, AnalysisElementType::Float32) && ValidateBuffer(output.colors_rgb, 2U, colors, AnalysisElementType::Uint8) &&
+         ValidateBuffer(output.masks, 3U, masks, AnalysisElementType::Uint8, true);
  }
  [[nodiscard]] static bool ValidateResult(const AnalysisRequest& request, const ProviderWorkResult& result) noexcept {
   if (result.identity != request.identity) { return false; }
@@ -334,8 +323,7 @@ private:
   }
   return true;
  }
- [[nodiscard]] static AnalysisResult Terminal(const AnalysisIdentity identity, const AnalysisTerminal terminal,
-                                              const std::uint64_t completed_ns = 0U) noexcept {
+ [[nodiscard]] static AnalysisResult Terminal(const AnalysisIdentity identity, const AnalysisTerminal terminal, const std::uint64_t completed_ns = 0U) noexcept {
   return AnalysisResult{{}, 0U, identity, terminal, completed_ns, 0U, {}};
  }
  [[nodiscard]] std::uint64_t ClaimIssuing() noexcept {

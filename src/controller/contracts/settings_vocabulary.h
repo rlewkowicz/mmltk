@@ -37,8 +37,8 @@ struct is_array<std::array<T, Size>> : std::true_type {
 template <class T>
 inline constexpr bool is_leaf_v = [] {
  using U = std::remove_cvref_t<T>;
- return std::is_arithmetic_v<U> || std::is_enum_v<U> || std::same_as<U, std::string> || std::same_as<U, std::string_view> ||
-        std::same_as<U, std::filesystem::path> || is_optional<U>::value || is_vector<U>::value || is_array<U>::value;
+ return std::is_arithmetic_v<U> || std::is_enum_v<U> || std::same_as<U, std::string> || std::same_as<U, std::string_view> || std::same_as<U, std::filesystem::path> || is_optional<U>::value ||
+        is_vector<U>::value || is_array<U>::value;
 }();
 // Storage aggregates may contain leaf-shaped runtime values (for example a
 // vector of request records) that are persisted as a unit but are not valid
@@ -59,8 +59,7 @@ inline constexpr bool is_mutable_leaf_v = [] {
 template <class Declaration>
 inline constexpr bool is_persistence_metadata_v = [] {
  std::size_t count = 0U;
- Declaration::VisitAnnotations(
-  [&]<class Annotation>(const Annotation&) { count += std::same_as<std::remove_cvref_t<Annotation>, reflection::PersistenceMetadata> ? 1U : 0U; });
+ Declaration::VisitAnnotations([&]<class Annotation>(const Annotation&) { count += std::same_as<std::remove_cvref_t<Annotation>, reflection::PersistenceMetadata> ? 1U : 0U; });
  if (count > 1U) throw "settings declaration has duplicate persistence-metadata annotations";
  return count == 1U;
 }();
@@ -112,8 +111,7 @@ template <class T, class Visitor>
 constexpr void for_each_member_pair(const T& left, const T& right, Visitor&& visitor) {
  static_assert(!is_leaf_v<T>);
  if constexpr (mmltk::frameworks::reflection::kOpaqueRelationStorage<T>) return;
- mmltk::frameworks::reflection::visit_materialized_bases<T>(
-  [&]<class Base>() { for_each_member_pair(static_cast<const Base&>(left), static_cast<const Base&>(right), visitor); });
+ mmltk::frameworks::reflection::visit_materialized_bases<T>([&]<class Base>() { for_each_member_pair(static_cast<const Base&>(left), static_cast<const Base&>(right), visitor); });
  mmltk::frameworks::reflection::visit_materialized_members<T>([&]<class Declaration>(const auto& fact) {
   if constexpr (requires { Declaration::pointer; }) std::invoke(visitor, fact.member_name, left.*Declaration::pointer, right.*Declaration::pointer);
  });
@@ -133,9 +131,8 @@ template <bool MutableOnly, class T, class Leaf>
  if (path.empty() || is_leaf_v<U> || mmltk::frameworks::reflection::kOpaqueRelationStorage<U>) return 0U;
  const auto [head, tail] = split_path(path);
  std::size_t matches = 0U;
- mmltk::frameworks::reflection::visit_materialized_bases<U>([&]<class Base>() {
-  matches += visit_path_count<MutableOnly>(static_cast<std::conditional_t<std::is_const_v<std::remove_reference_t<T>>, const Base, Base>&>(object), path, leaf);
- });
+ mmltk::frameworks::reflection::visit_materialized_bases<U>(
+  [&]<class Base>() { matches += visit_path_count<MutableOnly>(static_cast<std::conditional_t<std::is_const_v<std::remove_reference_t<T>>, const Base, Base>&>(object), path, leaf); });
  mmltk::frameworks::reflection::visit_materialized_members<U>([&]<class Declaration>(const auto& fact) {
   if constexpr (requires { Declaration::pointer; }) {
    if (fact.member_name != head) return;

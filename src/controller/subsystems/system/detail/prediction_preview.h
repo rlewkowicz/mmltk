@@ -17,9 +17,8 @@
 #include "src/frameworks/gpu/image_types.h"
 #include "src/frameworks/gpu/terminal_cuda_retirement_owner.h"
 namespace mmltk::controller::detail {
-[[nodiscard]] mmltk::frameworks::gpu::DeviceContext CreatePredictionPreviewContext(const mmltk::frameworks::gpu::DeviceExecution&,
-                                                                                   const std::shared_ptr<mmltk::frameworks::gpu::TerminalCudaRetirementOwner>&,
-                                                                                   mmltk::frameworks::gpu::CudaContextApi = {});
+[[nodiscard]] mmltk::frameworks::gpu::DeviceContext CreatePredictionPreviewContext(
+ const mmltk::frameworks::gpu::DeviceExecution&, const std::shared_ptr<mmltk::frameworks::gpu::TerminalCudaRetirementOwner>&, mmltk::frameworks::gpu::CudaContextApi = {});
 // A slot owns raw model-space products. Only the visual worker draws it.
 class PredictionPreviewFrame final : public std::enable_shared_from_this<PredictionPreviewFrame> {
 public:
@@ -36,12 +35,11 @@ public:
 private:
  friend class PredictionPreviewPool;
  friend class PredictionPreviewComposition;
- void DrawRegion(mmltk::frameworks::gpu::SystemImageRuntime&, mmltk::frameworks::gpu::ImagePlaneView clean, mmltk::frameworks::gpu::ImagePlaneView semantic,
-                 std::uintptr_t stream, bool prediction_boxes, bool prediction_masks, bool ground_truth_boxes, bool ground_truth_masks,
-                 bool complementary_layers, bool write_clean, bool write_semantic) const;
+ void DrawRegion(mmltk::frameworks::gpu::SystemImageRuntime&, mmltk::frameworks::gpu::ImagePlaneView clean, mmltk::frameworks::gpu::ImagePlaneView semantic, std::uintptr_t stream,
+  bool prediction_boxes, bool prediction_masks, bool ground_truth_boxes, bool ground_truth_masks, bool complementary_layers, bool write_clean, bool write_semantic) const;
  struct State;
- PredictionPreviewFrame(const mmltk::frameworks::gpu::DeviceContext&, std::shared_ptr<mmltk::frameworks::gpu::TerminalCudaRetirementOwner>,
-                        std::shared_ptr<void>, mmltk::frameworks::gpu::CudaContextApi);
+ PredictionPreviewFrame(
+  const mmltk::frameworks::gpu::DeviceContext&, std::shared_ptr<mmltk::frameworks::gpu::TerminalCudaRetirementOwner>, std::shared_ptr<void>, mmltk::frameworks::gpu::CudaContextApi);
  void RetainUnsafe(cudaError_t) const noexcept;
  [[nodiscard]] mmltk::frameworks::gpu::CudaContextScope ContextScope() const noexcept;
  [[nodiscard]] mmltk::frameworks::gpu::CudaContextScope CompositionScope() const noexcept;
@@ -66,8 +64,8 @@ public:
   bool atlas_padding = false;
   bool operator==(const Options&) const = default;
  };
- static void Draw(mmltk::frameworks::gpu::SystemImageRuntime&, mmltk::frameworks::gpu::SystemImageRuntime::OutputCandidate&, VisualExtent,
-                  std::span<const Region>, Options, PredictionPreviewComposition* retained = nullptr);
+ static void Draw(mmltk::frameworks::gpu::SystemImageRuntime&, mmltk::frameworks::gpu::SystemImageRuntime::OutputCandidate&, VisualExtent, std::span<const Region>, Options,
+  PredictionPreviewComposition* retained = nullptr);
 
 private:
  // Allocation-local validity only; weak source references never occupy raw slots.
@@ -105,12 +103,11 @@ public:
  };
  PredictionPreviewPool(mmltk::frameworks::gpu::DeviceExecution, mmltk::frameworks::gpu::DeviceContext);
  PredictionPreviewPool(mmltk::frameworks::gpu::DeviceExecution, mmltk::frameworks::gpu::DeviceContext, TransferOperations operations,
-                       std::shared_ptr<mmltk::frameworks::gpu::TerminalCudaRetirementOwner> retirement = {}, std::size_t slots = kSlotCapacity);
- [[nodiscard]] std::shared_ptr<const PredictionPreviewFrame> Capture(
-  const float*, VisualExtent, std::uintptr_t source_stream, std::span<const mmltk::backend::models::rfdetr::Prediction>,
-  const mmltk::backend::ml::runtime::AnalysisAnnotationStorage&, std::shared_ptr<const mmltk::backend::data::catalog::ClassCatalog>, int classes,
-  const std::uint8_t* rgb8 = nullptr, std::shared_ptr<void> source_custody = {}, void (*stop_source)(void*) = nullptr, void* source_control = nullptr,
-  std::span<const mmltk::backend::models::rfdetr::Prediction> ground_truth = {}, bool composition = false);
+  std::shared_ptr<mmltk::frameworks::gpu::TerminalCudaRetirementOwner> retirement = {}, std::size_t slots = kSlotCapacity);
+ [[nodiscard]] std::shared_ptr<const PredictionPreviewFrame> Capture(const float*, VisualExtent, std::uintptr_t source_stream, std::span<const mmltk::backend::models::rfdetr::Prediction>,
+  const mmltk::backend::ml::runtime::AnalysisAnnotationStorage&, std::shared_ptr<const mmltk::backend::data::catalog::ClassCatalog>, int classes, const std::uint8_t* rgb8 = nullptr,
+  std::shared_ptr<void> source_custody = {}, void (*stop_source)(void*) = nullptr, void* source_control = nullptr, std::span<const mmltk::backend::models::rfdetr::Prediction> ground_truth = {},
+  bool composition = false);
  [[nodiscard]] bool HasUnsafeSourceCustody() const noexcept { return unsafe_source_; }
  [[nodiscard]] bool HasUnsafeCustody() const noexcept { return !retirement_->admission_open(); }
 

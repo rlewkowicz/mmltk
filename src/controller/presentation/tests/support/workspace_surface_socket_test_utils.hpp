@@ -29,9 +29,7 @@ struct WorkspaceSurfaceDescriptors final {
  const std::string native = path.string();
  if (native.size() >= sizeof(address.sun_path)) { throw std::runtime_error("workspace test shell socket path is too long"); }
  std::memcpy(address.sun_path, native.data(), native.size());
- if (::connect(socket.get(), reinterpret_cast<const sockaddr*>(&address), sizeof(address)) != 0) {
-  throw std::runtime_error("workspace test shell connection failed");
- }
+ if (::connect(socket.get(), reinterpret_cast<const sockaddr*>(&address), sizeof(address)) != 0) { throw std::runtime_error("workspace test shell connection failed"); }
  return socket;
 }
 [[nodiscard]] inline mmltk::common::io::ScopedFd workspace_surface_event_descriptor() {
@@ -39,8 +37,7 @@ struct WorkspaceSurfaceDescriptors final {
  if (descriptor < 0) { throw std::runtime_error("workspace test eventfd creation failed"); }
  return mmltk::common::io::ScopedFd{descriptor};
 }
-[[nodiscard]] inline WorkspaceSurfaceDescriptors receive_message_with_descriptors(const int socket, const std::span<std::byte> record,
-                                                                                  const char* const failure_message) {
+[[nodiscard]] inline WorkspaceSurfaceDescriptors receive_message_with_descriptors(const int socket, const std::span<std::byte> record, const char* const failure_message) {
  WorkspaceSurfaceDescriptors received;
  iovec payload{.iov_base = record.data(), .iov_len = record.size()};
  std::array<std::byte, CMSG_SPACE(sizeof(int) * kMaxWorkspaceSurfaceDescriptors)> control{};
@@ -64,8 +61,7 @@ struct WorkspaceSurfaceDescriptors final {
 // Sends one fixed-size protocol message over a SOCK_SEQPACKET socket, attaching `descriptors` as
 // SCM_RIGHTS ancillary data. Returns false when the socket would block; any other failure throws
 // with `failure_message`.
-[[nodiscard]] inline bool send_message_with_descriptors(const int socket, const std::span<const std::byte> message, const std::span<const int> descriptors,
-                                                        const char* const failure_message) {
+[[nodiscard]] inline bool send_message_with_descriptors(const int socket, const std::span<const std::byte> message, const std::span<const int> descriptors, const char* const failure_message) {
  if (descriptors.size() > kMaxWorkspaceSurfaceDescriptors) { throw std::runtime_error("workspace protocol message carries too many descriptors"); }
  iovec payload{const_cast<std::byte*>(message.data()), message.size()};
  std::array<std::byte, CMSG_SPACE(sizeof(int) * kMaxWorkspaceSurfaceDescriptors)> control{};
@@ -87,12 +83,11 @@ struct WorkspaceSurfaceDescriptors final {
  if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) { return false; }
  throw std::runtime_error(failure_message);
 }
-[[nodiscard]] inline bool send_workspace_record(const int socket, const mmltk::controller::presentation::detail::workspace_surface_import::Record& record,
-                                                const std::span<const int> descriptors = {}) {
+[[nodiscard]] inline bool send_workspace_record(
+ const int socket, const mmltk::controller::presentation::detail::workspace_surface_import::Record& record, const std::span<const int> descriptors = {}) {
  return send_message_with_descriptors(socket, std::as_bytes(std::span{&record, 1U}), descriptors, "workspace protocol test send failed");
 }
-[[nodiscard]] inline WorkspaceSurfaceDescriptors receive_workspace_record(const int socket,
-                                                                          mmltk::controller::presentation::detail::workspace_surface_import::Record& record) {
+[[nodiscard]] inline WorkspaceSurfaceDescriptors receive_workspace_record(const int socket, mmltk::controller::presentation::detail::workspace_surface_import::Record& record) {
  return receive_message_with_descriptors(socket, std::as_writable_bytes(std::span{&record, 1U}), "workspace protocol test receive failed");
 }
 }  // namespace mmltk::testsupport

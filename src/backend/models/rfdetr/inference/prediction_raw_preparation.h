@@ -12,8 +12,8 @@ namespace mmltk::backend::models::rfdetr {
 class PredictionRawPreparation final {
 public:
  using Settle = cudaError_t (*)(cudaStream_t);
- PredictionRawPreparation(bool requested, mmltk::backend::ml::runtime::AnalysisAnnotationStorage& annotation, std::string& failure, cudaStream_t stream,
-                          Settle settle = &cudaStreamSynchronize) noexcept
+ PredictionRawPreparation(
+  bool requested, mmltk::backend::ml::runtime::AnalysisAnnotationStorage& annotation, std::string& failure, cudaStream_t stream, Settle settle = &cudaStreamSynchronize) noexcept
      : available_(requested), annotation_(annotation), failure_(failure), stream_(stream), settle_(settle) {}
  [[nodiscard]] bool available() const noexcept { return available_; }
  template <typename Operation>

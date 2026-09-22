@@ -22,8 +22,7 @@ std::vector<unsigned long> node_mask(int node) {
  if (node < 0 || node > numa_max_possible_node()) throw std::invalid_argument("invalid host allocation NUMA node");
  std::vector<unsigned long> mask(static_cast<std::size_t>(numa_max_possible_node()) / word_bits + 1U);
  checked(::get_mempolicy(nullptr, mask.data(), mask.size() * word_bits, nullptr, MPOL_F_MEMS_ALLOWED), "query permitted memory nodes");
- if (!(mask[static_cast<std::size_t>(node) / word_bits] & (1UL << (static_cast<std::size_t>(node) % word_bits))))
-  throw std::invalid_argument("required NUMA memory node is forbidden");
+ if (!(mask[static_cast<std::size_t>(node) / word_bits] & (1UL << (static_cast<std::size_t>(node) % word_bits)))) throw std::invalid_argument("required NUMA memory node is forbidden");
  std::ranges::fill(mask, 0UL);
  mask[static_cast<std::size_t>(node) / word_bits] |= 1UL << (static_cast<std::size_t>(node) % word_bits);
  return mask;
@@ -141,9 +140,7 @@ void NumaMemory::verify() const {
  if (data_) verify_pages(data_, bytes_, node_);
 }
 NumaMemoryResource::NumaMemoryResource(int node) : node_(node) { (void)node_mask(node); }
-void* NumaMemoryResource::do_allocate(std::size_t bytes, std::size_t alignment) {
- return allocate_pages(page_rounded_bytes(std::max(bytes, std::size_t{1})), alignment, node_);
-}
+void* NumaMemoryResource::do_allocate(std::size_t bytes, std::size_t alignment) { return allocate_pages(page_rounded_bytes(std::max(bytes, std::size_t{1})), alignment, node_); }
 void NumaMemoryResource::do_deallocate(void* data, std::size_t bytes, std::size_t) { ::munmap(data, page_rounded_bytes(std::max(bytes, std::size_t{1}))); }
 bool NumaMemoryResource::do_is_equal(const std::pmr::memory_resource& other) const noexcept { return this == &other; }
 }  // namespace mmltk::common::system

@@ -185,8 +185,7 @@ TEST_CASE("Staged class publication permits old readers and rejects a competing 
    std::ofstream output(competing.staged_artifact());
    output << "competing replacement";
   }
-  reader =
-   std::async(std::launch::async, [&] { return r::ClassArtifactAdmission(artifact, {}, std::make_shared<const io::FileDigests>(original)).Resolve(2, {}); });
+  reader = std::async(std::launch::async, [&] { return r::ClassArtifactAdmission(artifact, {}, std::make_shared<const io::FileDigests>(original)).Resolve(2, {}); });
   // Both producers still own staging here. The reader must finish before
   // either producer enters the named replacement window.
   REQUIRE(reader.wait_for(std::chrono::seconds(2)) == std::future_status::ready);

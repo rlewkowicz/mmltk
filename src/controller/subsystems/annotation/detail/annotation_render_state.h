@@ -13,10 +13,8 @@ struct AnnotationDragPreview final {
  contracts::AnnotationPoint point;
  bool operator==(const AnnotationDragPreview&) const = default;
 };
-void materialize_annotation_drag(contracts::AnnotationObject&, const AnnotationDragPreview&, const contracts::AnnotationSceneContent&,
-                                 subsystems::annotation::MaskScratch&);
-[[nodiscard]] contracts::AnnotationSplineKnot annotation_drag_knot(contracts::AnnotationSplineKnot, const AnnotationDragPreview&,
-                                                                   const contracts::AnnotationSceneContent&);
+void materialize_annotation_drag(contracts::AnnotationObject&, const AnnotationDragPreview&, const contracts::AnnotationSceneContent&, subsystems::annotation::MaskScratch&);
+[[nodiscard]] contracts::AnnotationSplineKnot annotation_drag_knot(contracts::AnnotationSplineKnot, const AnnotationDragPreview&, const contracts::AnnotationSceneContent&);
 // One retained description has exclusive input custody while being filled and
 // exclusive renderer custody from submission through GPU settlement.
 struct AnnotationRenderState final {
@@ -46,12 +44,8 @@ struct AnnotationRenderState final {
   }
   return preview;
  }
- [[nodiscard]] bool TransformsMask(std::size_t index) const noexcept {
-  return drag && preview_object == index && scene->objects[index].shape == contracts::AnnotationShape::Mask;
- }
- [[nodiscard]] const contracts::AnnotationObject& DrawingObjectAt(std::size_t index) const {
-  return drag && preview_object == index ? scene->objects[index] : ObjectAt(index);
- }
+ [[nodiscard]] bool TransformsMask(std::size_t index) const noexcept { return drag && preview_object == index && scene->objects[index].shape == contracts::AnnotationShape::Mask; }
+ [[nodiscard]] const contracts::AnnotationObject& DrawingObjectAt(std::size_t index) const { return drag && preview_object == index ? scene->objects[index] : ObjectAt(index); }
  [[nodiscard]] contracts::AnnotationBox TargetBox(std::size_t index) const {
   contracts::AnnotationObject bounds;
   bounds.box = scene->objects[index].box;
@@ -67,9 +61,8 @@ struct AnnotationRenderState final {
   return result;
  }
  [[nodiscard]] contracts::AnnotationPoint DrawingNode(std::size_t index, std::size_t node) const {
-  return drag && preview_object == index && drag->target.role == contracts::AnnotationHandleRole::SkeletonNode && drag->target.element == node
-          ? drag->point
-          : DrawingObjectAt(index).skeleton_nodes[node].point;
+  return drag && preview_object == index && drag->target.role == contracts::AnnotationHandleRole::SkeletonNode && drag->target.element == node ? drag->point
+                                                                                                                                               : DrawingObjectAt(index).skeleton_nodes[node].point;
  }
 };
 }  // namespace mmltk::controller

@@ -34,8 +34,7 @@ void pack_rle_mask(const std::span<const data::RLEPair> runs, const std::span<st
  }
 }
 }  // namespace
-GalleryReadScheduler::GalleryReadScheduler(std::size_t nproc, const mmltk::frameworks::gpu::DeviceExecution& execution,
-                                           const ExploreNativeConfiguration& configuration)
+GalleryReadScheduler::GalleryReadScheduler(std::size_t nproc, const mmltk::frameworks::gpu::DeviceExecution& execution, const ExploreNativeConfiguration& configuration)
     : acceptance_(configuration.acceptance),
       diagnostics_(configuration.diagnostics),
       device_(execution.device),
@@ -148,11 +147,11 @@ void GalleryReadScheduler::PublishInput(Lane& lane) {
  if (lane.prefetch && lane.state == LaneState::InputReady && diagnostics_.valid())
   diagnostics_.Emit([&] {
    return VisualDiagnosticFact{.system = contracts::DiagnosticOwner::Explore,
-                               .operation = VisualDiagnosticOperation::ExplorePrefetchReady,
-                               .generation = lane.generation,
-                               .value = lane.compiled_index,
-                               .detail = lanes_.size(),
-                               .context = {.staging_bytes = lane.pinned.capacity_bytes() + image_stream_.host_storage(lane.index).capacity_bytes()}};
+    .operation = VisualDiagnosticOperation::ExplorePrefetchReady,
+    .generation = lane.generation,
+    .value = lane.compiled_index,
+    .detail = lanes_.size(),
+    .context = {.staging_bytes = lane.pinned.capacity_bytes() + image_stream_.host_storage(lane.index).capacity_bytes()}};
   });
 }
 void GalleryReadScheduler::FinishTransfer(std::size_t index, std::exception_ptr failure) noexcept {
@@ -181,11 +180,11 @@ void GalleryReadScheduler::AcceptanceDiagnostic(const VisualDiagnosticOperation 
  if (lane.prefetch) return;
  diagnostics_.Emit([&] {
   return VisualDiagnosticFact{.system = contracts::DiagnosticOwner::Explore,
-                              .operation = operation,
-                              .generation = lane.generation,
-                              .value = lane.destination_slot,
-                              .detail = detail,
-                              .context = {.staging_bytes = lane.pinned.capacity_bytes()}};
+   .operation = operation,
+   .generation = lane.generation,
+   .value = lane.destination_slot,
+   .detail = detail,
+   .context = {.staging_bytes = lane.pinned.capacity_bytes()}};
  });
 }
 void GalleryReadScheduler::ReadLanePayload(Lane& lane) {
@@ -207,11 +206,10 @@ void GalleryReadScheduler::ReadLanePayload(Lane& lane) {
  }
  const auto& entry = lane.store->image_entry(lane.compiled_index);
  const bool source_known = entry.original_width != 0U && entry.original_height != 0U;
- const auto content = source_known
-                       ? lane.store->geometry(lane.compiled_index)
-                       : mmltk::backend::imaging::resample::ImageResizeGeometry{lane.store->header().image_width, lane.store->header().image_height, 0U, 0U};
- const auto image = explore::make_explore_contain_rect(source_known ? entry.original_width : lane.store->header().image_width,
-                                                       source_known ? entry.original_height : lane.store->header().image_height, lane.card_extent);
+ const auto content =
+  source_known ? lane.store->geometry(lane.compiled_index) : mmltk::backend::imaging::resample::ImageResizeGeometry{lane.store->header().image_width, lane.store->header().image_height, 0U, 0U};
+ const auto image = explore::make_explore_contain_rect(
+  source_known ? entry.original_width : lane.store->header().image_width, source_known ? entry.original_height : lane.store->header().image_height, lane.card_extent);
  const explore::ExploreRenderCardDescriptor card{
   .source_width = lane.store->header().image_width,
   .source_height = lane.store->header().image_height,
@@ -239,8 +237,7 @@ void GalleryReadScheduler::ReadLanePayload(Lane& lane) {
   const auto donor_runs = lane.store->instance_rle(*lane.donor_instance);
   store_payload(lane.pinned.data(), lane.layout.donor_rle.offset, donor_runs);
   auto* const donor_mask = reinterpret_cast<std::uint64_t*>(static_cast<std::byte*>(lane.pinned.data()) + lane.layout.donor_mask);
-  pack_rle_mask(donor_runs, std::span{donor_mask, lane.layout.donor_mask_words},
-                static_cast<std::size_t>(lane.store->header().image_width) * lane.store->header().image_height);
+  pack_rle_mask(donor_runs, std::span{donor_mask, lane.layout.donor_mask_words}, static_cast<std::size_t>(lane.store->header().image_width) * lane.store->header().image_height);
  }
 }
 void GalleryReadScheduler::CompleteLane(const std::size_t lane_index, std::exception_ptr failure) noexcept {
@@ -258,31 +255,27 @@ void GalleryReadScheduler::CompleteLane(const std::size_t lane_index, std::excep
   }
   if (observed)
    fact = {.system = contracts::DiagnosticOwner::Explore,
-           .operation = failure ? VisualDiagnosticOperation::GalleryGpuFailed : VisualDiagnosticOperation::GalleryGpuCompleted,
-           .device = device_,
-           .generation = lane.generation,
-           .value = lane.destination_slot,
-           .detail = lane.compiled_index,
-           .context = {
-            .demand = {.demand_generation = lane.DemandGeneration()}, .transfer = {.transfer_sequence = lane.tile_generation}, .link = lane.diagnostic_link}};
+    .operation = failure ? VisualDiagnosticOperation::GalleryGpuFailed : VisualDiagnosticOperation::GalleryGpuCompleted,
+    .device = device_,
+    .generation = lane.generation,
+    .value = lane.destination_slot,
+    .detail = lane.compiled_index,
+    .context = {.demand = {.demand_generation = lane.DemandGeneration()}, .transfer = {.transfer_sequence = lane.tile_generation}, .link = lane.diagnostic_link}};
   sink = ready_sink_;
  }
  if (observed) diagnostics_(fact);
  if (sink) (*sink)();
 }
 data::CompiledImageStream::CompletionObserver GalleryReadScheduler::LaneCompletion() noexcept {
- return {.context = this, .complete = [](void* context, std::size_t index, std::exception_ptr failure) noexcept {
-          static_cast<GalleryReadScheduler*>(context)->CompleteLane(index, failure);
-         }};
+ return {.context = this, .complete = [](void* context, std::size_t index, std::exception_ptr failure) noexcept { static_cast<GalleryReadScheduler*>(context)->CompleteLane(index, failure); }};
 }
 void GalleryReadScheduler::SubmitRead(Lane& lane, const bool observed) {
  const std::array reads{data::CompiledImageRead{lane.compiled_index, 0U}, data::CompiledImageRead{lane.donor_index, lane.layout.pixel_bytes}};
  data::CompiledImageStream::ReadObserver observer;
  if (observed)
   observer = {.context = this,
-              .before = [](void* context, std::size_t index) { return static_cast<GalleryReadScheduler*>(context)->BeginReadLane(index); },
-              .complete = [](void* context, std::size_t index, std::exception_ptr failure,
-                             bool read) noexcept { static_cast<GalleryReadScheduler*>(context)->FinishReadLane(index, failure, read); }};
+   .before = [](void* context, std::size_t index) { return static_cast<GalleryReadScheduler*>(context)->BeginReadLane(index); },
+   .complete = [](void* context, std::size_t index, std::exception_ptr failure, bool read) noexcept { static_cast<GalleryReadScheduler*>(context)->FinishReadLane(index, failure, read); }};
  else
   observer = {.context = this, .before = [](void* context, std::size_t index) {
                auto& owner = *static_cast<GalleryReadScheduler*>(context);
@@ -290,20 +283,18 @@ void GalleryReadScheduler::SubmitRead(Lane& lane, const bool observed) {
                if (!owner.current_demand_(candidate_lane.DemandGeneration())) return false;
                owner.diagnostics_.Emit([&] {
                 return VisualDiagnosticFact{.system = contracts::DiagnosticOwner::Explore,
-                                            .operation = VisualDiagnosticOperation::GalleryReadStarted,
-                                            .device = owner.device_,
-                                            .generation = candidate_lane.generation,
-                                            .detail = candidate_lane.compiled_index};
+                 .operation = VisualDiagnosticOperation::GalleryReadStarted,
+                 .device = owner.device_,
+                 .generation = candidate_lane.generation,
+                 .detail = candidate_lane.compiled_index};
                });
                return true;
               }};
  image_stream_.submit(lane.index, *lane.store, std::span{reads}.first(lane.donor_instance ? 2U : 1U), observer,
-                      {.context = this, .complete = [](void* context, std::size_t index, std::exception_ptr error) noexcept {
-                        static_cast<GalleryReadScheduler*>(context)->FinishTransfer(index, error);
-                       }});
+  {.context = this, .complete = [](void* context, std::size_t index, std::exception_ptr error) noexcept { static_cast<GalleryReadScheduler*>(context)->FinishTransfer(index, error); }});
 }
-GalleryReadScheduler::PayloadLayout GalleryReadScheduler::LayoutFor(const GalleryProductState& product, const std::uint32_t compiled_index,
-                                                                    const bool has_donor, const std::size_t donor_rle_count) const {
+GalleryReadScheduler::PayloadLayout GalleryReadScheduler::LayoutFor(
+ const GalleryProductState& product, const std::uint32_t compiled_index, const bool has_donor, const std::size_t donor_rle_count) const {
  const auto& header = product.store->header();
  PayloadLayout result;
  constexpr std::size_t channels_bytes = 3U * sizeof(float);
@@ -322,8 +313,7 @@ GalleryReadScheduler::PayloadLayout GalleryReadScheduler::LayoutFor(const Galler
  }
  result.card = 0U;
  result.annotations.offset = align_up(result.card + sizeof(explore::ExploreRenderCardDescriptor), alignof(explore::ExploreRenderAnnotationDescriptor));
- result.rle.offset =
-  align_up(result.annotations.offset + result.annotations.count * sizeof(explore::ExploreRenderAnnotationDescriptor), alignof(data::RLEPair));
+ result.rle.offset = align_up(result.annotations.offset + result.annotations.count * sizeof(explore::ExploreRenderAnnotationDescriptor), alignof(data::RLEPair));
  result.tile = align_up(result.rle.offset + result.rle.count * sizeof(data::RLEPair), alignof(explore::ExploreRenderTileDescriptor));
  result.donor_rle.count = donor_rle_count;
  result.donor_mask_words = has_donor ? (pixels + 63U) / 64U : 0U;
@@ -335,24 +325,22 @@ GalleryReadScheduler::PayloadLayout GalleryReadScheduler::LayoutFor(const Galler
  result.bytes = result.donor_mask + result.donor_mask_words * sizeof(std::uint64_t);
  return result;
 }
-void GalleryReadScheduler::PrepareLaneStorage(const GalleryProductState& product, Lane& lane, const std::uint32_t compiled_index, const std::uint32_t slot,
-                                              const std::uint64_t generation) {
+void GalleryReadScheduler::PrepareLaneStorage(const GalleryProductState& product, Lane& lane, const std::uint32_t compiled_index, const std::uint32_t slot, const std::uint64_t generation) {
  image_stream_.bind_current_context();
  lane.store = product.store;
  lane.identity = {.incarnation = lane.store.get(),
-                  .dataset = product.plan.dataset_identity,
-                  .seed = product.plan.augmentation.seed,
-                  .augmentation = product.plan.augmentation_config,
-                  .extent = explore_atlas_card_extent(product.viewport),
-                  .augmented = product.plan.augmentation.enabled};
+  .dataset = product.plan.dataset_identity,
+  .seed = product.plan.augmentation.seed,
+  .augmentation = product.plan.augmentation_config,
+  .extent = explore_atlas_card_extent(product.viewport),
+  .augmented = product.plan.augmentation.enabled};
  lane.transfer_ready = false;
  lane.read_valid = false;
  lane.pending_meaning.reset();
  lane.preview_key = rfdetr::augmentation_preview_image_key(product.plan.dataset_identity, product.plan.augmentation.seed, compiled_index);
  lane.donor_instance.reset();
  const bool copy_paste_requested = product.plan.augmentation.enabled && product.plan.augmentation_config.enabled &&
-                                   rfdetr::augmentation_paste_admitted(product.plan.augmentation_config, lane.preview_key) &&
-                                   !product.annotated_indices.empty();
+                                   rfdetr::augmentation_paste_admitted(product.plan.augmentation_config, lane.preview_key) && !product.annotated_indices.empty();
  if (copy_paste_requested) {
   lane.donor_index = rfdetr::select_augmentation_preview_donor_image(product.annotated_indices, compiled_index, lane.preview_key);
   if (lane.donor_index != compiled_index) {
@@ -399,11 +387,9 @@ void GalleryReadScheduler::Prioritize(GalleryProductState& product) {
  product.priority_slots.clear();
  if (product.window_indices.empty()) return;
  product.priority_slots.reserve(product.window_indices.size());
- const auto first =
-  std::min(static_cast<std::size_t>(product.viewport.first_row) * product.viewport.columns, product.window_first + product.window_indices.size());
+ const auto first = std::min(static_cast<std::size_t>(product.viewport.first_row) * product.viewport.columns, product.window_first + product.window_indices.size());
  const auto visible_offset = first - product.window_first;
- for (std::size_t slot = 0U; slot != product.visible_indices.size(); ++slot)
-  product.priority_slots.push_back(static_cast<std::uint32_t>(visible_offset + slot));
+ for (std::size_t slot = 0U; slot != product.visible_indices.size(); ++slot) product.priority_slots.push_back(static_cast<std::uint32_t>(visible_offset + slot));
  const auto end = visible_offset + product.visible_indices.size();
  const auto columns = product.viewport.columns;
  const auto ahead = [&] {
@@ -424,8 +410,7 @@ void GalleryReadScheduler::Prioritize(GalleryProductState& product) {
   ahead();
  }
  priority_rank_.resize(product.cache.size());
- for (std::size_t rank = 0U; rank < product.priority_slots.size(); ++rank)
-  priority_rank_[product.cache.Slot(product.window_first + product.priority_slots[rank])] = rank;
+ for (std::size_t rank = 0U; rank < product.priority_slots.size(); ++rank) priority_rank_[product.cache.Slot(product.window_first + product.priority_slots[rank])] = rank;
 }
 bool GalleryReadScheduler::ReserveInput(const GalleryProductState& product, Lane& lane) {
  if (product.plan.mode != ExploreMode::Gallery || lane.store.get() != product.store.get() || lane.identity != product.cache.identity()) return false;
@@ -490,11 +475,9 @@ void GalleryReadScheduler::RebindInput(const GalleryProductState& product, const
  lane.semantic_bank = product.cache.WritableBank(lane.position, incumbent, true);
  lane.state = LaneState::InputReady;
  scheduled_slots_[product.cache.Slot(lane.position)] = generation;
- const explore::ExploreRenderTileDescriptor tile{
-  .card_index = lane.destination_slot,
+ const explore::ExploreRenderTileDescriptor tile{.card_index = lane.destination_slot,
   .destination_x = lane.prefetch ? 0U : lane.destination_slot % lane.columns * lane.card_extent,
-  .destination_y = lane.prefetch ? static_cast<std::uint32_t>(product.cache.PhysicalRow(product.cache.Slot(lane.position), lane.cache_bank))
-                                 : lane.destination_slot / lane.columns * lane.card_extent,
+  .destination_y = lane.prefetch ? static_cast<std::uint32_t>(product.cache.PhysicalRow(product.cache.Slot(lane.position), lane.cache_bank)) : lane.destination_slot / lane.columns * lane.card_extent,
   .destination_width = lane.card_extent,
   .destination_height = lane.card_extent,
   .generation = {.viewport = generation, .tile = ++next_tile_generation_}};
@@ -568,15 +551,11 @@ void GalleryReadScheduler::StartIdleLanes(const GalleryProductState& product, co
    }
    diagnostics_.Emit([&] {
     std::scoped_lock lock(lanes_mutex_);
-    contracts::DiagnosticExploreAdmission admission{
-     .admission_position = position,
+    contracts::DiagnosticExploreAdmission admission{.admission_position = position,
      .admission_first_row = product.viewport.first_row,
      .admission_row_count = product.viewport.row_count,
      .admission_columns = product.viewport.columns,
-     .admission_tier =
-      !prefetch
-       ? 0U
-       : ((position / product.viewport.columns >= product.viewport.first_row) == (product.plan.scroll_direction == ExploreScrollDirection::Forward) ? 1U : 2U),
+     .admission_tier = !prefetch ? 0U : ((position / product.viewport.columns >= product.viewport.first_row) == (product.plan.scroll_direction == ExploreScrollDirection::Forward) ? 1U : 2U),
      .admission_forward = product.plan.scroll_direction == ExploreScrollDirection::Forward};
     for (std::size_t offset = 0U; offset < product.window_indices.size(); ++offset) {
      const auto candidate = product.window_first + offset;
@@ -590,12 +569,12 @@ void GalleryReadScheduler::StartIdleLanes(const GalleryProductState& product, co
       ++admission.admission_immediate_eligible;
     }
     return VisualDiagnosticFact{.system = contracts::DiagnosticOwner::Explore,
-                                .operation = VisualDiagnosticOperation::GalleryReadScheduled,
-                                .device = device_,
-                                .generation = generation,
-                                .value = lane_index,
-                                .detail = compiled_index,
-                                .context = {.admission = admission}};
+     .operation = VisualDiagnosticOperation::GalleryReadScheduled,
+     .device = device_,
+     .generation = generation,
+     .value = lane_index,
+     .detail = compiled_index,
+     .context = {.admission = admission}};
    });
    SubmitRead(lane, true);
   } catch (...) {
@@ -615,8 +594,7 @@ void GalleryReadScheduler::StartIdleLanes(const GalleryProductState& product, co
 bool GalleryReadScheduler::HasReadyTiles() const {
  const auto generation = desired_generation_.load(std::memory_order_acquire);
  std::scoped_lock lock(lanes_mutex_);
- return std::ranges::any_of(
-  lanes_, [generation](const auto& lane) { return lane->state == LaneState::InputReady && lane->generation == generation && !lane->prefetch; });
+ return std::ranges::any_of(lanes_, [generation](const auto& lane) { return lane->state == LaneState::InputReady && lane->generation == generation && !lane->prefetch; });
 }
 void GalleryReadScheduler::SetReadySink(ExploreAlgorithm::GalleryReadySink sink) {
  auto retained = sink ? std::make_shared<const ExploreAlgorithm::GalleryReadySink>(std::move(sink)) : nullptr;

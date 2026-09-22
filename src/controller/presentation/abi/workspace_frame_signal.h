@@ -47,10 +47,9 @@ static_assert(std::atomic_ref<std::uint32_t>::is_always_lock_free);
  if (transfer_sequence == 0U || transfer_sequence > kMaximumTransferSequence) throw std::overflow_error("workspace transfer sequence is out of range");
  return (transfer_sequence - 1U) * 2U + 1U;
 }
-inline void publish_workspace_frame_signal(WorkspaceFrameSignal* const signal, const std::uint64_t timeline_ready, const std::uint64_t transfer_sequence,
-                                           const WorkspacePresentationLayer layer, const WorkspaceContentIdentity logical_content,
-                                           const std::uint64_t presentation_revision, const std::uint32_t content_width, const std::uint32_t content_height,
-                                           const std::uint64_t physical_revision, const std::span<const std::byte> metadata = {}) {
+inline void publish_workspace_frame_signal(WorkspaceFrameSignal* const signal, const std::uint64_t timeline_ready, const std::uint64_t transfer_sequence, const WorkspacePresentationLayer layer,
+ const WorkspaceContentIdentity logical_content, const std::uint64_t presentation_revision, const std::uint32_t content_width, const std::uint32_t content_height,
+ const std::uint64_t physical_revision, const std::span<const std::byte> metadata = {}) {
  if (signal == nullptr) return;
  if (metadata.size() > kWorkspaceMetadataByteCapacity) throw std::length_error("workspace image metadata exceeds its graphics envelope");
  std::atomic_ref<std::uint64_t> sequence{signal->sequence_lock};

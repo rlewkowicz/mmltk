@@ -15,8 +15,8 @@
 #include "src/common/system/execution_policy.h"
 namespace mmltk::common::concurrency {
 template <typename Index, typename Func>
-void parallel_for_range_indexed(const Index begin, const Index end, const int num_workers, const std::span<const int> cpu_affinity, Func&& func,
-                                const mmltk::common::system::ExecutionPlacement* placement = nullptr) {
+void parallel_for_range_indexed(
+ const Index begin, const Index end, const int num_workers, const std::span<const int> cpu_affinity, Func&& func, const mmltk::common::system::ExecutionPlacement* placement = nullptr) {
  static_assert(std::is_integral_v<Index>, "parallel_for_range index must be integral");
  if (begin >= end) { return; }
  const Index total = end - begin;

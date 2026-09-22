@@ -13,10 +13,7 @@ struct GpuAugmentationTestAccess final {
  static std::weak_ptr<const void> Custody(const GpuAugmentationExecutor& executor) { return executor.impl_; }
 };
 struct AugmentationExecution final {
- explicit AugmentationExecution(int device = 0)
-     : context(device, mmltk::frameworks::gpu::cuda_image_copy_backend(), mmltk::frameworks::gpu::DeviceContextMode::PrimaryInterop) {
-  context.Bind();
- }
+ explicit AugmentationExecution(int device = 0) : context(device, mmltk::frameworks::gpu::cuda_image_copy_backend(), mmltk::frameworks::gpu::DeviceContextMode::PrimaryInterop) { context.Bind(); }
  mmltk::frameworks::gpu::DeviceContext context;
  mmltk::frameworks::gpu::TerminalCudaRetirementOwner retirement{8U};
 };
@@ -54,8 +51,7 @@ struct AugmentationExecution final {
 // Independent integer-cell oracle for the explicit 8-by-4 pixel fixture.
 [[nodiscard]] inline std::array<int, 4> small_object_edges(std::array<int, 4> edges, int transform) {
  if (transform == 1) edges = {8 - edges[2], 4 - edges[3], 8 - edges[0], 4 - edges[1]};
- if (transform == 2)
-  edges = {std::clamp(2 * edges[0] - 4, 0, 8), std::clamp(2 * edges[1] - 2, 0, 4), std::clamp(2 * edges[2] - 4, 0, 8), std::clamp(2 * edges[3] - 2, 0, 4)};
+ if (transform == 2) edges = {std::clamp(2 * edges[0] - 4, 0, 8), std::clamp(2 * edges[1] - 2, 0, 4), std::clamp(2 * edges[2] - 4, 0, 8), std::clamp(2 * edges[3] - 2, 0, 4)};
  if (transform == 3) edges[2] = std::min(edges[2], 4);
  return edges;
 }

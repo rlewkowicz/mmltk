@@ -18,9 +18,7 @@ void save_upstream_python_checkpoint(const std::filesystem::path& path, const st
  set_synthetic_model_state(checkpoint, state);
  write_upstream_model_state(path, checkpoint);
 }
-void write_minimal_upstream_checkpoint(const std::filesystem::path& path, const ParityFixtureCase& fixture) {
- save_upstream_python_checkpoint(path, make_minimal_upstream_checkpoint_state(fixture));
-}
+void write_minimal_upstream_checkpoint(const std::filesystem::path& path, const ParityFixtureCase& fixture) { save_upstream_python_checkpoint(path, make_minimal_upstream_checkpoint_state(fixture)); }
 void log_fixture_phase(const char* test_name, const std::size_t index, const std::size_t total, const char* phase, const char* preset_name) {
  std::fprintf(stderr, "%s: %zu/%zu %s %s\n", test_name, index, total, phase, preset_name);
  std::fflush(stderr);

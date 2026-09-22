@@ -107,14 +107,12 @@ std::shared_ptr<torch::jit::Graph> trace_unary_graph(const torch::Tensor& input,
  auto cu = std::make_shared<torch::jit::CompilationUnit>();
  auto cls = torch::jit::ClassType::create("__torch__.TestOnnxLowering", cu, true);
  torch::jit::Module module(cu, cls);
- auto trace_res = torch::jit::tracer::trace(
-  {input}, [&](torch::jit::Stack args) -> torch::jit::Stack { return {fn(args[0].toTensor())}; }, [](const torch::autograd::Variable&) { return ""; }, false,
-  false, &module);
+ auto trace_res =
+  torch::jit::tracer::trace({input}, [&](torch::jit::Stack args) -> torch::jit::Stack { return {fn(args[0].toTensor())}; }, [](const torch::autograd::Variable&) { return ""; }, false, false, &module);
  return trace_res.first->graph;
 }
 std::pair<std::shared_ptr<torch::jit::Graph>, OnnxInitializerMap> trace_unary_graph_with_parameters(
- const torch::Tensor& input, const std::vector<std::pair<std::string, torch::Tensor>>& parameters,
- const std::function<torch::Tensor(torch::jit::Module&, const torch::Tensor&)>& fn) {
+ const torch::Tensor& input, const std::vector<std::pair<std::string, torch::Tensor>>& parameters, const std::function<torch::Tensor(torch::jit::Module&, const torch::Tensor&)>& fn) {
  auto cu = std::make_shared<torch::jit::CompilationUnit>();
  auto cls = torch::jit::ClassType::create("__torch__.TestOnnxLoweringWithParameters", cu, true);
  torch::jit::Module module(cu, cls);
@@ -124,13 +122,11 @@ std::pair<std::shared_ptr<torch::jit::Graph>, OnnxInitializerMap> trace_unary_gr
   initializers.emplace(name, value);
  }
  auto trace_res = torch::jit::tracer::trace(
-  {input}, [&](torch::jit::Stack args) -> torch::jit::Stack { return {fn(module, args[0].toTensor())}; }, [](const torch::autograd::Variable&) { return ""; },
-  false, false, &module);
+  {input}, [&](torch::jit::Stack args) -> torch::jit::Stack { return {fn(module, args[0].toTensor())}; }, [](const torch::autograd::Variable&) { return ""; }, false, false, &module);
  return {trace_res.first->graph, std::move(initializers)};
 }
 std::pair<std::shared_ptr<torch::jit::Graph>, OnnxInitializerMap> trace_unary_graph_with_bias_attr(const torch::Tensor& input, const torch::Tensor& bias) {
- return trace_unary_graph_with_parameters(
-  input, {{"bias", bias}}, [](torch::jit::Module& module, const torch::Tensor& traced_input) { return traced_input + module.attr("bias").toTensor(); });
+ return trace_unary_graph_with_parameters(input, {{"bias", bias}}, [](torch::jit::Module& module, const torch::Tensor& traced_input) { return traced_input + module.attr("bias").toTensor(); });
 }
 bool block_contains_kind(const torch::jit::Block* block, c10::Symbol kind) {
  for (const auto* node : block->nodes()) {
@@ -152,22 +148,21 @@ torch::jit::Node* find_first_node_kind(torch::jit::Block* block, c10::Symbol kin
 }
 // Requires every `removed_kinds` symbol in the traced graph, lowers it for ONNX export, then
 // requires that every `removed_kinds` symbol is gone and every `emitted_kinds` symbol is present.
-void assert_lowering_replaces_kinds(const std::shared_ptr<torch::jit::Graph>& graph, const OnnxInitializerMap* initializers,
-                                    const std::initializer_list<c10::Symbol> removed_kinds, const std::initializer_list<c10::Symbol> emitted_kinds) {
+void assert_lowering_replaces_kinds(const std::shared_ptr<torch::jit::Graph>& graph, const OnnxInitializerMap* initializers, const std::initializer_list<c10::Symbol> removed_kinds,
+ const std::initializer_list<c10::Symbol> emitted_kinds) {
  for (const c10::Symbol kind : removed_kinds) { REQUIRE((block_contains_kind(graph->block(), kind))); }
  lower_test_graph(graph, initializers);
  for (const c10::Symbol kind : removed_kinds) { REQUIRE((!block_contains_kind(graph->block(), kind))); }
  for (const c10::Symbol kind : emitted_kinds) { REQUIRE((block_contains_kind(graph->block(), kind))); }
 }
 std::shared_ptr<torch::jit::Graph> lower_unary_graph_and_check(const torch::Tensor& input, const std::function<torch::Tensor(const torch::Tensor&)>& fn,
-                                                               const std::initializer_list<c10::Symbol> removed_kinds,
-                                                               const std::initializer_list<c10::Symbol> emitted_kinds = {}) {
+ const std::initializer_list<c10::Symbol> removed_kinds, const std::initializer_list<c10::Symbol> emitted_kinds = {}) {
  auto graph = trace_unary_graph(input, fn);
  assert_lowering_replaces_kinds(graph, nullptr, removed_kinds, emitted_kinds);
  return graph;
 }
-void check_lowered_cast_target(const torch::Tensor& input, const std::function<torch::Tensor(const torch::Tensor&)>& fn, const c10::Symbol traced_kind,
-                               const mmltk::backend::models::rfdetr::OnnxTensorElementType expected_dtype) {
+void check_lowered_cast_target(
+ const torch::Tensor& input, const std::function<torch::Tensor(const torch::Tensor&)>& fn, const c10::Symbol traced_kind, const mmltk::backend::models::rfdetr::OnnxTensorElementType expected_dtype) {
  const auto graph = lower_unary_graph_and_check(input, fn, {traced_kind});
  auto* cast = find_first_node_kind(graph->block(), kOnnxCast);
  REQUIRE((cast != nullptr));
@@ -188,9 +183,7 @@ TEST_CASE("test_dtype_mapping", "[model][rfdetr][onnx_lowering]") {
  REQUIRE((onnx_tensor_data_type(OnnxTensorElementType::BFloat16) == 16));
 }
 TEST_CASE("test_lower_to_emits_onnx_cast", "[model][rfdetr][onnx_lowering]") {
- check_lowered_cast_target(
-  torch::randn({2, 3}), [](const torch::Tensor& input) { return input.to(torch::kBool); }, kAtenTo,
-  mmltk::backend::models::rfdetr::OnnxTensorElementType::Bool);
+ check_lowered_cast_target(torch::randn({2, 3}), [](const torch::Tensor& input) { return input.to(torch::kBool); }, kAtenTo, mmltk::backend::models::rfdetr::OnnxTensorElementType::Bool);
 }
 TEST_CASE("test_lower_type_as_emits_onnx_cast", "[model][rfdetr][onnx_lowering]") {
  check_lowered_cast_target(
@@ -214,13 +207,13 @@ TEST_CASE("test_lower_convolution_emits_onnx_conv", "[model][rfdetr][onnx_loweri
  auto weight = torch::randn({8, 3, 3, 3});
  auto bias = torch::randn({8});
  const auto graph = lower_unary_graph_and_check(torch::randn({1, 3, 16, 16}),
-                                                [weight, bias](const torch::Tensor& input) {
-                                                 const std::vector<int64_t> stride{2, 2};
-                                                 const std::vector<int64_t> padding{1, 1};
-                                                 const std::vector<int64_t> dilation{1, 1};
-                                                 return torch::conv2d(input, weight, bias, stride, padding, dilation, 1);
-                                                },
-                                                {kAtenConvolution});
+  [weight, bias](const torch::Tensor& input) {
+   const std::vector<int64_t> stride{2, 2};
+   const std::vector<int64_t> padding{1, 1};
+   const std::vector<int64_t> dilation{1, 1};
+   return torch::conv2d(input, weight, bias, stride, padding, dilation, 1);
+  },
+  {kAtenConvolution});
  auto* conv = find_first_node_kind(graph->block(), kOnnxConv);
  REQUIRE((conv != nullptr));
  REQUIRE((conv->is(kAttrKernelShape) == std::vector<int64_t>({3, 3})));
@@ -254,16 +247,14 @@ TEST_CASE("test_lower_repeat_emits_onnx_tile", "[model][rfdetr][onnx_lowering]")
  lower_unary_graph_and_check(torch::randn({1, 3, 4}), [](const torch::Tensor& input) { return input.repeat({2, 1, 1}); }, {kAtenRepeat}, {kOnnxTile});
 }
 TEST_CASE("test_lower_slice_and_select_emit_onnx_slice_path", "[model][rfdetr][onnx_lowering]") {
- auto graph =
-  trace_unary_graph(torch::randn({2, 3, 4}), [](const torch::Tensor& input) { return input.index({torch::indexing::Slice(), 0, torch::indexing::Slice()}); });
+ auto graph = trace_unary_graph(torch::randn({2, 3, 4}), [](const torch::Tensor& input) { return input.index({torch::indexing::Slice(), 0, torch::indexing::Slice()}); });
  REQUIRE((block_contains_kind(graph->block(), kAtenSlice) || block_contains_kind(graph->block(), kAtenSelect)));
  lower_test_graph(graph);
  REQUIRE((!block_contains_kind(graph->block(), kAtenSlice)));
  REQUIRE((!block_contains_kind(graph->block(), kAtenSelect)));
  REQUIRE((block_contains_kind(graph->block(), kOnnxSlice) || block_contains_kind(graph->block(), kOnnxReshape)));
  for (const auto axis : {0, -3}) {
-  auto [parameter_graph, initializers] = trace_unary_graph_with_parameters(
-   torch::zeros({3, 4}), {{"weight", torch::arange(24, torch::kFloat).reshape({2, 3, 4})}},
+  auto [parameter_graph, initializers] = trace_unary_graph_with_parameters(torch::zeros({3, 4}), {{"weight", torch::arange(24, torch::kFloat).reshape({2, 3, 4})}},
    [axis](torch::jit::Module& module, const torch::Tensor& input) { return input + module.attr("weight").toTensor().select(axis, 1); });
   auto* attribute = find_first_node_kind(parameter_graph->block(), kPrimGetAttr);
   REQUIRE(attribute != nullptr);
@@ -276,8 +267,7 @@ TEST_CASE("test_lower_slice_and_select_emit_onnx_slice_path", "[model][rfdetr][o
  }
 }
 TEST_CASE("test_lower_slice_with_negative_axis_and_step_emits_onnx_slice", "[model][rfdetr][onnx_lowering]") {
- lower_unary_graph_and_check(torch::randn({2, 3, 8}), [](const torch::Tensor& input) { return input.slice(-1, 0, c10::nullopt, 2); }, {kAtenSlice},
-                             {kOnnxSlice});
+ lower_unary_graph_and_check(torch::randn({2, 3, 8}), [](const torch::Tensor& input) { return input.slice(-1, 0, c10::nullopt, 2); }, {kAtenSlice}, {kOnnxSlice});
 }
 TEST_CASE("test_antialiased_bicubic_resize_preserves_torch_values", "[model][rfdetr][onnx_lowering]") {
  namespace F = torch::nn::functional;
@@ -290,9 +280,8 @@ TEST_CASE("test_antialiased_bicubic_resize_preserves_torch_values", "[model][rfd
  for (const auto& size : {std::vector<int64_t>{3, 5}, std::vector<int64_t>{11, 13}, std::vector<int64_t>{1, 1}}) {
   for (const bool align_corners : {false, true}) {
    CAPTURE(size, align_corners);
-   const auto interpolate = [&](const torch::Tensor& value) {
-    return F::interpolate(value, F::InterpolateFuncOptions().size(size).mode(torch::kBicubic).align_corners(align_corners).antialias(true));
-   };
+   const auto interpolate = [&](
+                             const torch::Tensor& value) { return F::interpolate(value, F::InterpolateFuncOptions().size(size).mode(torch::kBicubic).align_corners(align_corners).antialias(true)); };
    auto graph = trace_unary_graph(input, interpolate);
    if (align_corners) {
     mmltk::testsupport::expect_runtime_error_contains([&] { lower_test_graph(graph); }, "requires align_corners=false");
@@ -328,50 +317,40 @@ TEST_CASE("test_lower_alias_removes_alias_node", "[model][rfdetr][onnx_lowering]
 TEST_CASE("test_lower_layer_norm_emits_onnx_layer_normalization", "[model][rfdetr][onnx_lowering]") {
  const auto weight = torch::randn({8});
  const auto bias = torch::randn({8});
- auto [graph, initializers] =
-  trace_unary_graph_with_parameters(torch::randn({2, 3, 8}),
-                                    {
-                                     {"weight", weight},
-                                     {"bias", bias},
-                                    },
-                                    [](torch::jit::Module& module, const torch::Tensor& input) {
-                                     return torch::layer_norm(input, {8}, module.attr("weight").toTensor(), module.attr("bias").toTensor(), 1.0e-5, false);
-                                    });
+ auto [graph, initializers] = trace_unary_graph_with_parameters(torch::randn({2, 3, 8}),
+  {
+   {"weight", weight},
+   {"bias", bias},
+  },
+  [](torch::jit::Module& module, const torch::Tensor& input) { return torch::layer_norm(input, {8}, module.attr("weight").toTensor(), module.attr("bias").toTensor(), 1.0e-5, false); });
  assert_lowering_replaces_kinds(graph, &initializers, {kAtenLayerNorm}, {kOnnxLayerNormalization});
 }
 TEST_CASE("test_lower_add_inplace_emits_onnx_add", "[model][rfdetr][onnx_lowering]") {
  lower_unary_graph_and_check(torch::randn({2, 3, 8}),
-                             [](const torch::Tensor& input) {
-                              auto out = input + 1.0;
-                              return out.add_(input);
-                             },
-                             {kAtenAddInplace}, {kOnnxAdd});
+  [](const torch::Tensor& input) {
+   auto out = input + 1.0;
+   return out.add_(input);
+  },
+  {kAtenAddInplace}, {kOnnxAdd});
 }
 TEST_CASE("test_lower_arange_emits_onnx_range", "[model][rfdetr][onnx_lowering]") {
- lower_unary_graph_and_check(torch::randn({2, 3, 8}),
-                             [](const torch::Tensor& input) { return at::arange(input.size(2), input.options().dtype(torch::kFloat32)); }, {kAtenArange},
-                             {kOnnxRange});
+ lower_unary_graph_and_check(torch::randn({2, 3, 8}), [](const torch::Tensor& input) { return at::arange(input.size(2), input.options().dtype(torch::kFloat32)); }, {kAtenArange}, {kOnnxRange});
 }
 TEST_CASE("test_lower_narrow_with_static_size_arithmetic_emits_onnx_slice", "[model][rfdetr][onnx_lowering]") {
- lower_unary_graph_and_check(torch::randn({2, 5, 4}), [](const torch::Tensor& input) { return input.narrow(1, 1, input.size(1) - 1); }, {kAtenNarrow},
-                             {kOnnxSlice});
+ lower_unary_graph_and_check(torch::randn({2, 5, 4}), [](const torch::Tensor& input) { return input.narrow(1, 1, input.size(1) - 1); }, {kAtenNarrow}, {kOnnxSlice});
 }
 TEST_CASE("test_lower_softmax_emits_onnx_softmax", "[model][rfdetr][onnx_lowering]") {
- lower_unary_graph_and_check(torch::randn({2, 3, 4}), [](const torch::Tensor& input) { return input.softmax(-1, c10::nullopt); }, {kAtenSoftmax},
-                             {kOnnxSoftmax});
+ lower_unary_graph_and_check(torch::randn({2, 3, 4}), [](const torch::Tensor& input) { return input.softmax(-1, c10::nullopt); }, {kAtenSoftmax}, {kOnnxSoftmax});
 }
 TEST_CASE("test_lower_topk_emits_onnx_topk", "[model][rfdetr][onnx_lowering]") {
- lower_unary_graph_and_check(torch::randn({2, 4, 4}), [](const torch::Tensor& input) { return std::get<1>(input.topk(2, 1, true, true)); }, {kAtenTopk},
-                             {kOnnxTopK});
+ lower_unary_graph_and_check(torch::randn({2, 4, 4}), [](const torch::Tensor& input) { return std::get<1>(input.topk(2, 1, true, true)); }, {kAtenTopk}, {kOnnxTopK});
 }
 TEST_CASE("test_lower_ones_like_emits_constant_of_shape", "[model][rfdetr][onnx_lowering]") {
- lower_unary_graph_and_check(torch::randn({2, 3, 4}), [](const torch::Tensor& input) { return torch::ones_like(input); }, {kAtenOnesLike},
-                             {kOnnxConstantOfShape});
+ lower_unary_graph_and_check(torch::randn({2, 3, 4}), [](const torch::Tensor& input) { return torch::ones_like(input); }, {kAtenOnesLike}, {kOnnxConstantOfShape});
 }
 TEST_CASE("test_lower_einsum_emits_onnx_einsum", "[model][rfdetr][onnx_lowering]") {
  const auto query = torch::randn({2, 7, 3});
- lower_unary_graph_and_check(torch::randn({2, 3, 4, 5}), [query](const torch::Tensor& input) { return at::einsum("bchw,bnc->bnhw", {input, query}); },
-                             {kAtenEinsum}, {kOnnxMatMul, kOnnxReshape});
+ lower_unary_graph_and_check(torch::randn({2, 3, 4, 5}), [query](const torch::Tensor& input) { return at::einsum("bchw,bnc->bnhw", {input, query}); }, {kAtenEinsum}, {kOnnxMatMul, kOnnxReshape});
 }
 TEST_CASE("test_lower_split_list_unpack_emits_onnx_split", "[model][rfdetr][onnx_lowering]") {
  lower_unary_graph_and_check(torch::randn({2, 4, 4}), [](const torch::Tensor& input) { return input.split(1, 1)[0]; }, {kAtenSplit}, {kOnnxSplit});
@@ -386,12 +365,10 @@ TEST_CASE("test_lower_add_with_bias_attr_emits_onnx_add", "[model][rfdetr][onnx_
  assert_lowering_replaces_kinds(graph, &initializers, {kAtenAdd}, {kOnnxAdd});
 }
 TEST_CASE("test_lower_bool_bitwise_and_emits_onnx_and", "[model][rfdetr][onnx_lowering]") {
- lower_unary_graph_and_check(torch::randn({2, 3, 4}), [](const torch::Tensor& input) { return at::bitwise_and(input > 0.0, input < 1.0); }, {kAtenBitwiseAnd},
-                             {kOnnxAnd});
+ lower_unary_graph_and_check(torch::randn({2, 3, 4}), [](const torch::Tensor& input) { return at::bitwise_and(input > 0.0, input < 1.0); }, {kAtenBitwiseAnd}, {kOnnxAnd});
 }
 TEST_CASE("test_lower_integer_bitwise_and_fails_loudly", "[model][rfdetr][onnx_lowering]") {
- auto graph = trace_unary_graph(torch::randint(0, 8, {2, 3}, torch::TensorOptions().dtype(torch::kInt64)),
-                                [](const torch::Tensor& input) { return at::bitwise_and(input, 1); });
+ auto graph = trace_unary_graph(torch::randint(0, 8, {2, 3}, torch::TensorOptions().dtype(torch::kInt64)), [](const torch::Tensor& input) { return at::bitwise_and(input, 1); });
  REQUIRE((block_contains_kind(graph->block(), kAtenBitwiseAnd)));
  mmltk::testsupport::expect_runtime_error_contains([&graph]() { lower_test_graph(graph); }, "integer bitwise_and is not supported");
 }
@@ -445,8 +422,7 @@ TEST_CASE("test_cuda_constants_stage_once_and_retain_nested_graph_readers", "[mo
  block->appendNode(dead_block_constant);
  OnnxInitializerMap initializers{{"unused", large_dead}};
  mmltk::backend::ml::cuda::TensorReadbackBuffers readback;
- mmltk::backend::models::rfdetr::lower_graph_for_onnx_export(
-  {.graph = graph.get(), .initializer_context = &initializers, .find_initializer = &find_test_initializer, .readback = &readback});
+ mmltk::backend::models::rfdetr::lower_graph_for_onnx_export({.graph = graph.get(), .initializer_context = &initializers, .find_initializer = &find_test_initializer, .readback = &readback});
  REQUIRE((first->t(c10::attr::value).is_cpu()));
  REQUIRE((first->t(c10::attr::value).data_ptr() == second->t(c10::attr::value).data_ptr()));
  REQUIRE((torch::equal(first->t(c10::attr::value), torch::tensor({2, 3, 4}, source.options().device(torch::kCPU)))));

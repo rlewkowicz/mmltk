@@ -23,16 +23,13 @@ LiveRawFrameCache::LiveRawFrameCache(const std::uint32_t count, const std::uint3
   pinned_storage_ = mmltk::frameworks::gpu::PinnedHostBuffer::ForCurrentDevice();
   pinned_storage_->ensure_bytes(pinned_bytes_);
   pinned_ = static_cast<std::uint8_t*>(pinned_storage_->data());
-  if (scope.Record(cudaStreamCreateWithFlags(&store_stream_, cudaStreamNonBlocking)) != cudaSuccess ||
-      scope.Record(cudaStreamCreateWithFlags(&readback_stream_, cudaStreamNonBlocking)) != cudaSuccess)
+  if (scope.Record(cudaStreamCreateWithFlags(&store_stream_, cudaStreamNonBlocking)) != cudaSuccess || scope.Record(cudaStreamCreateWithFlags(&readback_stream_, cudaStreamNonBlocking)) != cudaSuccess)
    throw std::runtime_error("create Live raw-cache streams");
   for (std::uint32_t index = 0; index < count; ++index) {
    slots_[index].index = index;
-   if (scope.Record(cudaMallocPitch(reinterpret_cast<void**>(&slots_[index].pixels), &slots_[index].pitch, static_cast<std::size_t>(width) * 3U, height)) !=
-       cudaSuccess)
+   if (scope.Record(cudaMallocPitch(reinterpret_cast<void**>(&slots_[index].pixels), &slots_[index].pitch, static_cast<std::size_t>(width) * 3U, height)) != cudaSuccess)
     throw std::runtime_error("allocate Live raw-cache slot");
-   if (scope.Record(cudaEventCreateWithFlags(&slots_[index].ready, cudaEventDisableTiming)) != cudaSuccess)
-    throw std::runtime_error("create Live raw-cache event");
+   if (scope.Record(cudaEventCreateWithFlags(&slots_[index].ready, cudaEventDisableTiming)) != cudaSuccess) throw std::runtime_error("create Live raw-cache event");
   }
  } catch (...) {
   destroy();
@@ -56,8 +53,7 @@ cudaEvent_t LiveRawFrameCache::store(const DeviceFrameView& source) {
   publish_slot(*slot, SlotState::Terminal);
   return nullptr;
  }
- const cudaError_t status =
-  copy_device_frame(scope, source, {.pixels = slot->pixels, .pitch_bytes = slot->pitch, .ready = slot->ready, .stream = store_stream_});
+ const cudaError_t status = copy_device_frame(scope, source, {.pixels = slot->pixels, .pitch_bytes = slot->pitch, .ready = slot->ready, .stream = store_stream_});
  if (status != cudaSuccess) {
   const bool synchronized = scope.Record(cudaStreamSynchronize(store_stream_)) == cudaSuccess;
   publish_slot(*slot, synchronized ? SlotState::Free : SlotState::Terminal);
@@ -95,8 +91,7 @@ bool LiveRawFrameCache::begin_readback(const LiveRawFrameReadbackWork work) {
  }
  cudaError_t status = scope.Record(cudaStreamWaitEvent(readback_stream_, slot->ready, 0U));
  if (status == cudaSuccess)
-  status = scope.Record(cudaMemcpy2DAsync(pinned_, row_bytes, reinterpret_cast<const void*>(slot->pixels), slot->pitch, row_bytes, slot->region.height,
-                                          cudaMemcpyDeviceToHost, readback_stream_));
+  status = scope.Record(cudaMemcpy2DAsync(pinned_, row_bytes, reinterpret_cast<const void*>(slot->pixels), slot->pitch, row_bytes, slot->region.height, cudaMemcpyDeviceToHost, readback_stream_));
  readback_work_ = work;
  readback_slot_ = slot->index;
  readback_bytes_ = bytes;

@@ -7,9 +7,7 @@
 import mmltk.backend.models.rfdetr.inference.runtime_backend;
 namespace mmltk::backend::models::rfdetr {
 EvaluateRequest finalize_evaluate_request(EvaluateRequest request) {
- if (request.compiled_path.empty() || request.selected_input_count() != 1U || request.batch_size == 0U) {
-  throw std::invalid_argument("invalid RF-DETR evaluation request");
- }
+ if (request.compiled_path.empty() || request.selected_input_count() != 1U || request.batch_size == 0U) { throw std::invalid_argument("invalid RF-DETR evaluation request"); }
  request.compiled_path = std::filesystem::absolute(request.compiled_path);
  return request;
 }

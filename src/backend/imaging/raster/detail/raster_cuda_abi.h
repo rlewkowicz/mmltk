@@ -11,9 +11,7 @@ struct PitchedSurface {
  std::size_t pitch_bytes = 0;
  int width = 0;
  int height = 0;
- [[nodiscard]] bool valid(const std::size_t channels) const noexcept {
-  return pixels != nullptr && width > 0 && height > 0 && pitch_bytes >= static_cast<std::size_t>(width) * channels;
- }
+ [[nodiscard]] bool valid(const std::size_t channels) const noexcept { return pixels != nullptr && width > 0 && height > 0 && pitch_bytes >= static_cast<std::size_t>(width) * channels; }
 };
 template <typename PixelPtrT>
 [[nodiscard]] inline bool is_valid(const PitchedSurface<PixelPtrT>& surface) {
@@ -52,9 +50,7 @@ struct RgbaTargetViewAbi {
 };
 [[nodiscard]] inline bool is_valid(const RgbaTargetViewAbi& target) {
  if (target.width <= 0 || target.height <= 0) { return false; }
- if (target.kind == RgbaTargetKindAbi::Pitched) {
-  return is_valid(target.pitched) && target.pitched.width == target.width && target.pitched.height == target.height;
- }
+ if (target.kind == RgbaTargetKindAbi::Pitched) { return is_valid(target.pitched) && target.pitched.width == target.width && target.pitched.height == target.height; }
  return target.kind == RgbaTargetKindAbi::SurfaceObject && target.surface != 0;
 }
 [[nodiscard]] constexpr inline int normalized_positive_size(const int value) noexcept { return value > 0 ? value : 1; }

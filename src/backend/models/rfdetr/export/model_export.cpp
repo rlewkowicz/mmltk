@@ -77,15 +77,13 @@ void erase_unused_module_self_input(const std::shared_ptr<torch::jit::Graph>& gr
 void assign_onnx_tensor_names(const std::shared_ptr<torch::jit::Graph>& graph, const bool has_masks) {
  constexpr std::array<std::string_view, 3> output_names{"pred_logits", "pred_boxes", "pred_masks"};
  const std::size_t expected_outputs = has_masks ? output_names.size() : output_names.size() - 1U;
- if (graph->inputs().size() != 1U || graph->outputs().size() != expected_outputs) {
-  throw std::runtime_error("RF-DETR ONNX graph does not expose the expected image and prediction tensors");
- }
+ if (graph->inputs().size() != 1U || graph->outputs().size() != expected_outputs) { throw std::runtime_error("RF-DETR ONNX graph does not expose the expected image and prediction tensors"); }
  graph->inputs().front()->setDebugName("pixel_values");
  for (std::size_t index = 0U; index < expected_outputs; ++index) { graph->outputs()[index]->setDebugName(std::string(output_names[index])); }
 }
 }  // namespace
 void export_model_onnx(NativeRfDetrModel& model, const std::filesystem::path& output_path, const int opset_version, const int batch_size, const bool simplify,
-                       const std::filesystem::path& explicit_descriptor, const std::stop_token stop, torch_cuda::TensorReadbackBuffers& readback) {
+ const std::filesystem::path& explicit_descriptor, const std::stop_token stop, torch_cuda::TensorReadbackBuffers& readback) {
  if (stop.stop_requested()) throw ArtifactPublicationCancelled{};
  validate_supported_onnx_export_opset(opset_version);
  ClassArtifactPublication publication(output_path, explicit_descriptor);
@@ -98,8 +96,7 @@ void export_model_onnx(NativeRfDetrModel& model, const std::filesystem::path& ou
  try {
   const torch::Tensor reference = technical_model.parameters().front();
   const torch::Tensor dummy_pixels = torch::zeros({batch_size, 3, model.config().resolution, model.config().resolution}, reference.options());
-  const torch::Tensor dummy_mask =
-   torch::zeros({batch_size, model.config().resolution, model.config().resolution}, torch::TensorOptions().dtype(torch::kBool).device(reference.device()));
+  const torch::Tensor dummy_mask = torch::zeros({batch_size, model.config().resolution, model.config().resolution}, torch::TensorOptions().dtype(torch::kBool).device(reference.device()));
   auto compilation_unit = std::make_shared<torch::jit::CompilationUnit>();
   auto class_type = torch::jit::ClassType::create("__torch__.NativeRfDetrOnnxExport", compilation_unit, true);
   torch::jit::Module export_module(compilation_unit, class_type);
@@ -142,8 +139,8 @@ void export_model_onnx(NativeRfDetrModel& model, const std::filesystem::path& ou
   erase_unused_module_self_input(graph);
   assign_onnx_tensor_names(graph, has_masks);
   std::unordered_map<std::string, std::unordered_map<std::int64_t, std::string>> dynamic_axes;
-  auto exported = torch::jit::export_onnx(graph, {}, static_cast<std::int64_t>(opset_version), dynamic_axes, false, ::torch::onnx::OperatorExportTypes::ONNX,
-                                          true, false, {}, true, false, staged_model.string());
+  auto exported =
+   torch::jit::export_onnx(graph, {}, static_cast<std::int64_t>(opset_version), dynamic_axes, false, ::torch::onnx::OperatorExportTypes::ONNX, true, false, {}, true, false, staged_model.string());
   const auto& model_proto = std::get<0>(exported);
   if (model_proto == nullptr) { throw std::runtime_error("torch::jit::export_onnx returned a null ONNX model"); }
   write_onnx_model_bytes(torch::jit::serialize_model_proto_to_string(model_proto), staged_model, model.class_layout()->record());
@@ -235,8 +232,8 @@ void ExportOnnxSession::Run(const ExportOnnxRequest& request, const runtime::Bor
 }
 void ExportOnnxSession::State::Run(const ExportOnnxRequest& request, const runtime::BorrowedCommandStream execution_stream, const std::stop_token stop) {
  if (stop.stop_requested()) return;
- if (!model || !admission->Matches(request.weights_path, request.class_layout_path) || command_stream != execution_stream ||
-     weights_path != request.weights_path || preset_name != request.preset_name || resolution != request.resolution || device != request.device_id) {
+ if (!model || !admission->Matches(request.weights_path, request.class_layout_path) || command_stream != execution_stream || weights_path != request.weights_path ||
+     preset_name != request.preset_name || resolution != request.resolution || device != request.device_id) {
   auto next_weights_path = request.weights_path;
   auto next_preset_name = request.preset_name;
   if (model) {

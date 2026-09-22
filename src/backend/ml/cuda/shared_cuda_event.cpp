@@ -12,8 +12,7 @@ namespace {
 using RuntimeLease = CudaEventPoolOwner::Lease;
 }  // namespace
 struct CudaEventPool::State final {
- State(const mmltk::frameworks::gpu::CudaDeviceOwner device_owner, const std::size_t capacity,
-       mmltk::frameworks::gpu::TerminalCudaRetirementAuthority& retirement_authority)
+ State(const mmltk::frameworks::gpu::CudaDeviceOwner device_owner, const std::size_t capacity, mmltk::frameworks::gpu::TerminalCudaRetirementAuthority& retirement_authority)
      : owner(device_owner, capacity, retirement_authority) {}
  CudaEventPoolOwner owner;
 };
@@ -59,8 +58,7 @@ void CudaEventPool::Lease::retire() {
  engaged_ = false;
 }
 CudaEventPool::Lease::operator bool() const noexcept { return engaged_; }
-CudaEventPool::CudaEventPool(const mmltk::frameworks::gpu::CudaDeviceOwner owner, const std::size_t capacity,
-                             mmltk::frameworks::gpu::TerminalCudaRetirementAuthority& retirement_authority)
+CudaEventPool::CudaEventPool(const mmltk::frameworks::gpu::CudaDeviceOwner owner, const std::size_t capacity, mmltk::frameworks::gpu::TerminalCudaRetirementAuthority& retirement_authority)
     : state_(std::make_unique<State>(owner, capacity, retirement_authority)) {}
 CudaEventPool::~CudaEventPool() noexcept = default;
 std::optional<CudaEventPool::Lease> CudaEventPool::record(const std::uintptr_t stream, const char* context) {

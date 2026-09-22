@@ -10,8 +10,7 @@
 // Sampling preserves the original counter stream; these functions allocate no storage.
 namespace mmltk::backend::models::rfdetr::augment_math {
 inline constexpr float kPi = 3.14159265358979323846F;
-[[nodiscard]] __host__ __device__ __forceinline__ float sample_strength(const GpuAugmentationGroupLaunchConfig& group, const std::uint64_t key,
-                                                                        std::uint64_t& counter) {
+[[nodiscard]] __host__ __device__ __forceinline__ float sample_strength(const GpuAugmentationGroupLaunchConfig& group, const std::uint64_t key, std::uint64_t& counter) {
  const float value = uniform01(key, counter++);
  return fmaf(group.max_strength - group.min_strength, value, group.min_strength);
 }
@@ -29,8 +28,7 @@ struct GeometryPlan {
 };
 // Draws flip/rotation/resize from `key`, advancing `counter` so callers stay on the same key stream,
 // and solves the forward transform together with its inverse.
-[[nodiscard]] __host__ __device__ __forceinline__ GeometryPlan solve_geometry_plan(const GpuAugmentationLaunchConfig& config, const std::uint64_t key,
-                                                                                   std::uint64_t& counter) {
+[[nodiscard]] __host__ __device__ __forceinline__ GeometryPlan solve_geometry_plan(const GpuAugmentationLaunchConfig& config, const std::uint64_t key, std::uint64_t& counter) {
  const bool flip_x = uniform01(key, counter++) < config.geometry.probability * 0.5F;
  const bool flip_y = uniform01(key, counter++) < config.geometry.probability * 0.5F;
  float angle = 0.0F;
@@ -123,9 +121,7 @@ enum ParameterIndex : std::uint8_t {
  values[kColorMatrix + 4] = 1.0F;
  values[kColorMatrix + 8] = 1.0F;
  values[kAreaScale] = 1.0F;
- if (config.enabled == 0) {
-  return GeometryPlan{{1.0F, 0.0F, 0.0F, 0.0F, 1.0F, 0.0F}, {1.0F, 0.0F, 0.0F, 0.0F, 1.0F, 0.0F}, 1.0F, 1.0F, 0.0F, 0.0F, false, false};
- }
+ if (config.enabled == 0) { return GeometryPlan{{1.0F, 0.0F, 0.0F, 0.0F, 1.0F, 0.0F}, {1.0F, 0.0F, 0.0F, 0.0F, 1.0F, 0.0F}, 1.0F, 1.0F, 0.0F, 0.0F, false, false}; }
  std::uint64_t counter = 0;
  const augment_math::GeometryPlan geometry = augment_math::solve_geometry_plan(config, key, counter);
  for (int index = 0; index < 6; ++index) {
@@ -146,8 +142,7 @@ enum ParameterIndex : std::uint8_t {
   constexpr float luma[3] = {0.299F, 0.587F, 0.114F};
   for (int output_channel = 0; output_channel < 3; ++output_channel) {
    for (int input_channel = 0; input_channel < 3; ++input_channel) {
-    values[kColorMatrix + output_channel * 3 + input_channel] =
-     contrast * ((output_channel == input_channel ? saturation : 0.0F) + (1.0F - saturation) * luma[input_channel]);
+    values[kColorMatrix + output_channel * 3 + input_channel] = contrast * ((output_channel == input_channel ? saturation : 0.0F) + (1.0F - saturation) * luma[input_channel]);
    }
    values[kColorOffset + output_channel] = 0.5F * (1.0F - contrast) + brightness;
   }
@@ -179,12 +174,7 @@ enum ParameterIndex : std::uint8_t {
  return geometry;
 }
 [[nodiscard]] __host__ __device__ __forceinline__ AugmentationSpatialErasure spatial_erasure(const float* values, const std::uint64_t key) {
- return {key,
-         values[kOcclusionMode] == 2.0F ? 0.05F * values[kOcclusionStrength] : 0.0F,
-         values[kEraseX0],
-         values[kEraseY0],
-         values[kEraseX1],
-         values[kEraseY1],
-         values[kOcclusionMode] == 3.0F ? 1U : 0U};
+ return {
+  key, values[kOcclusionMode] == 2.0F ? 0.05F * values[kOcclusionStrength] : 0.0F, values[kEraseX0], values[kEraseY0], values[kEraseX1], values[kEraseY1], values[kOcclusionMode] == 3.0F ? 1U : 0U};
 }
 }  // namespace mmltk::backend::models::rfdetr::augment_math

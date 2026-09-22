@@ -117,10 +117,8 @@ struct CompilerConfig {
  [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]] std::string source_dir;
  [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]] std::string output_dir;
  [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumNameBytes}]] std::string split;
- [[= mmltk::frameworks::reflection::Minimum<std::uint32_t>{
-  1U}]][[= mmltk::frameworks::reflection::Maximum<std::uint32_t>{MAX_IMAGE_EXTENT}]] uint32_t target_width = 432;
- [[= mmltk::frameworks::reflection::Minimum<std::uint32_t>{
-  1U}]][[= mmltk::frameworks::reflection::Maximum<std::uint32_t>{MAX_IMAGE_EXTENT}]] uint32_t target_height = 432;
+ [[= mmltk::frameworks::reflection::Minimum<std::uint32_t>{1U}]][[= mmltk::frameworks::reflection::Maximum<std::uint32_t>{MAX_IMAGE_EXTENT}]] uint32_t target_width = 432;
+ [[= mmltk::frameworks::reflection::Minimum<std::uint32_t>{1U}]][[= mmltk::frameworks::reflection::Maximum<std::uint32_t>{MAX_IMAGE_EXTENT}]] uint32_t target_height = 432;
  // CLEANUP-IGNORE: Compiler worker controls are backend execution fields, distinct from training request controls.
  [[= mmltk::frameworks::reflection::Minimum<int>{-1}]] int num_workers = -1;
  [[= mmltk::frameworks::reflection::Minimum<int>{0}]] int cuda_mask_batch_size = 0;
@@ -166,9 +164,7 @@ struct DatasetCompilePlan {
 };
 class DatasetCompiler {
 public:
- static DatasetCompilePlan prepare(CompilerConfig config, const std::vector<std::string>& splits,
-                                   mmltk::common::concurrency::CancellationObservation cancellation = {});
- static void compile(const DatasetCompilePlan& plan, size_t split_index, CompileTelemetry* telemetry = nullptr,
-                     mmltk::common::concurrency::CancellationObservation cancellation = {});
+ static DatasetCompilePlan prepare(CompilerConfig config, const std::vector<std::string>& splits, mmltk::common::concurrency::CancellationObservation cancellation = {});
+ static void compile(const DatasetCompilePlan& plan, size_t split_index, CompileTelemetry* telemetry = nullptr, mmltk::common::concurrency::CancellationObservation cancellation = {});
 };
 }  // namespace mmltk::backend::data

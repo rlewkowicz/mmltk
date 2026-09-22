@@ -46,8 +46,7 @@ AnnotationBox clamp_capture_box(AnnotationBox box, const std::uint32_t capture_w
  return box;
 }
 bool box_has_area(const AnnotationBox& box) { return box.x2 > box.x1 && box.y2 > box.y1; }
-std::pair<int, int> clamped_box_offset(const AnnotationBox& box, const int dx, const int dy, const std::uint32_t capture_width,
-                                       const std::uint32_t capture_height) {
+std::pair<int, int> clamped_box_offset(const AnnotationBox& box, const int dx, const int dy, const std::uint32_t capture_width, const std::uint32_t capture_height) {
  const int box_width = std::max(0, box.x2 - box.x1);
  const int box_height = std::max(0, box.y2 - box.y1);
  const int max_x1 = std::max(0, static_cast<int>(capture_width) - box_width);
@@ -68,13 +67,11 @@ void translate_point(AnnotationPoint* point, const int dx, const int dy, const s
  point->x = clamp_capture_axis(point->x + static_cast<float>(dx), capture_width);
  point->y = clamp_capture_axis(point->y + static_cast<float>(dy), capture_height);
 }
-float scale_axis(const float value, const float source_min, const float source_extent, const float target_min, const float target_extent,
-                 const std::uint32_t capture_extent) {
+float scale_axis(const float value, const float source_min, const float source_extent, const float target_min, const float target_extent, const std::uint32_t capture_extent) {
  const float normalized = source_extent > 0.0f ? (value - source_min) / source_extent : 0.5f;
  return clamp_capture_axis(target_min + normalized * target_extent, capture_extent);
 }
-void scale_point_to_box(AnnotationPoint* point, const AnnotationBox& source_box, const AnnotationBox& target_box, const std::uint32_t capture_width,
-                        const std::uint32_t capture_height) {
+void scale_point_to_box(AnnotationPoint* point, const AnnotationBox& source_box, const AnnotationBox& target_box, const std::uint32_t capture_width, const std::uint32_t capture_height) {
  if (point == nullptr) { return; }
  const auto source_width = static_cast<float>(source_box.x2 - source_box.x1);
  const auto source_height = static_cast<float>(source_box.y2 - source_box.y1);
@@ -83,8 +80,8 @@ void scale_point_to_box(AnnotationPoint* point, const AnnotationBox& source_box,
  point->x = scale_axis(point->x, static_cast<float>(source_box.x1), source_width, static_cast<float>(target_box.x1), target_width, capture_width);
  point->y = scale_axis(point->y, static_cast<float>(source_box.y1), source_height, static_cast<float>(target_box.y1), target_height, capture_height);
 }
-std::vector<std::uint8_t> resize_mask_nearest(const std::vector<std::uint8_t>& source, const std::uint32_t source_width, const std::uint32_t source_height,
-                                              const std::uint32_t target_width, const std::uint32_t target_height) {
+std::vector<std::uint8_t> resize_mask_nearest(
+ const std::vector<std::uint8_t>& source, const std::uint32_t source_width, const std::uint32_t source_height, const std::uint32_t target_width, const std::uint32_t target_height) {
  if (target_width == 0U || target_height == 0U) { return {}; }
  std::vector<std::uint8_t> resized(static_cast<std::size_t>(target_width) * static_cast<std::size_t>(target_height), 0U);
  if (source_width == 0U || source_height == 0U || source.size() != static_cast<std::size_t>(source_width) * static_cast<std::size_t>(source_height)) {
@@ -221,9 +218,7 @@ std::vector<AnnotationPoint> annotation_object_points(const AnnotationObject& ob
   [](const auto& shape) {
    using T = std::decay_t<decltype(shape)>;
    std::vector<AnnotationPoint> points;
-   [[maybe_unused]] const auto push_corner = [&points](const int x, const int y) {
-    points.push_back(AnnotationPoint{static_cast<float>(x), static_cast<float>(y)});
-   };
+   [[maybe_unused]] const auto push_corner = [&points](const int x, const int y) { points.push_back(AnnotationPoint{static_cast<float>(x), static_cast<float>(y)}); };
    if constexpr (std::is_same_v<T, AnnotationBoxShape>) {
     push_corner(shape.box.x1, shape.box.y1);
     push_corner(shape.box.x2, shape.box.y1);
@@ -253,14 +248,12 @@ AnnotationMaskShape* annotation_object_mask_shape(AnnotationObject* object) {
 bool annotation_object_supports_mask_editing(const AnnotationObject& object) {
  return std::holds_alternative<AnnotationBoxShape>(object.shape) || std::holds_alternative<AnnotationMaskShape>(object.shape);
 }
-bool translate_annotation_object(AnnotationObject* object, const int dx, const int dy, const std::uint32_t capture_width, const std::uint32_t capture_height,
-                                 const bool clip_to_bounds) {
+bool translate_annotation_object(AnnotationObject* object, const int dx, const int dy, const std::uint32_t capture_width, const std::uint32_t capture_height, const bool clip_to_bounds) {
  if (object == nullptr || (dx == 0 && dy == 0)) { return false; }
  const std::optional<AnnotationBox> bbox = annotation_object_bbox(*object);
  if (!bbox.has_value()) { return false; }
  const AnnotationBox object_bbox = *bbox;
- const std::pair<int, int> clamped_offset =
-  clip_to_bounds ? std::pair<int, int>{dx, dy} : clamped_box_offset(object_bbox, dx, dy, capture_width, capture_height);
+ const std::pair<int, int> clamped_offset = clip_to_bounds ? std::pair<int, int>{dx, dy} : clamped_box_offset(object_bbox, dx, dy, capture_width, capture_height);
  const int clamped_dx = clamped_offset.first;
  const int clamped_dy = clamped_offset.second;
  if (clamped_dx == 0 && clamped_dy == 0) { return false; }
@@ -293,8 +286,7 @@ bool translate_annotation_object(AnnotationObject* object, const int dx, const i
     for (std::uint32_t row = 0U; row < visible_height; ++row) {
      const std::size_t source_offset = static_cast<std::size_t>(source_y + row) * shape->region.width + source_x;
      const std::size_t target_offset = static_cast<std::size_t>(row) * visible_width;
-     std::copy_n(shape->mask.begin() + static_cast<std::ptrdiff_t>(source_offset), visible_width,
-                 clipped_mask.begin() + static_cast<std::ptrdiff_t>(target_offset));
+     std::copy_n(shape->mask.begin() + static_cast<std::ptrdiff_t>(source_offset), visible_width, clipped_mask.begin() + static_cast<std::ptrdiff_t>(target_offset));
     }
    }
    shape->mask = std::move(clipped_mask);
@@ -340,8 +332,7 @@ bool translate_annotation_object(AnnotationObject* object, const int dx, const i
  for (AnnotationSkeletonNode& node : shape->nodes) { translate_point(&node.point, clamped_dx, clamped_dy, capture_width, capture_height); }
  return true;
 }
-bool resize_annotation_object_to_box(AnnotationObject* object, const AnnotationBox& box, const std::uint32_t capture_width,
-                                     const std::uint32_t capture_height) {
+bool resize_annotation_object_to_box(AnnotationObject* object, const AnnotationBox& box, const std::uint32_t capture_width, const std::uint32_t capture_height) {
  if (object == nullptr) { return false; }
  const AnnotationBox target_box = clamp_capture_box(box, capture_width, capture_height);
  if (!box_has_area(target_box)) { return false; }
@@ -377,8 +368,7 @@ bool resize_annotation_object_to_box(AnnotationObject* object, const AnnotationB
   },
   object->shape);
  if (!source_box.has_value()) {
-  return std::holds_alternative<AnnotationBoxShape>(object->shape) || std::holds_alternative<AnnotationMaskShape>(object->shape) ||
-         std::holds_alternative<AnnotationPointShape>(object->shape);
+  return std::holds_alternative<AnnotationBoxShape>(object->shape) || std::holds_alternative<AnnotationMaskShape>(object->shape) || std::holds_alternative<AnnotationPointShape>(object->shape);
  }
  return true;
 }
@@ -411,14 +401,12 @@ std::vector<AnnotationPoint> sample_annotation_spline_points(const AnnotationSpl
 }
 bool annotation_deferred_mask_valid(const AnnotationMaskShape& shape) noexcept {
  const std::shared_ptr<const AnnotationDeferredMask>& deferred = shape.deferred;
- if (deferred == nullptr || deferred->source_width == 0U || deferred->source_height == 0U || deferred->source_crop_width == 0U ||
-     deferred->source_crop_height == 0U || deferred->output_width == 0U || deferred->output_height == 0U || shape.region.width == 0U ||
-     shape.region.height == 0U) {
+ if (deferred == nullptr || deferred->source_width == 0U || deferred->source_height == 0U || deferred->source_crop_width == 0U || deferred->source_crop_height == 0U || deferred->output_width == 0U ||
+     deferred->output_height == 0U || shape.region.width == 0U || shape.region.height == 0U) {
   return false;
  }
  const auto contained = [](const std::uint64_t origin, const std::uint32_t extent, const std::uint32_t limit) noexcept { return origin + extent <= limit; };
- if (!contained(deferred->source_crop_x, deferred->source_crop_width, deferred->source_width) ||
-     !contained(deferred->source_crop_y, deferred->source_crop_height, deferred->source_height) ||
+ if (!contained(deferred->source_crop_x, deferred->source_crop_width, deferred->source_width) || !contained(deferred->source_crop_y, deferred->source_crop_height, deferred->source_height) ||
      !contained(static_cast<std::uint64_t>(deferred->view_x) + shape.region.capture_x, shape.region.width, deferred->output_width) ||
      !contained(static_cast<std::uint64_t>(deferred->view_y) + shape.region.capture_y, shape.region.height, deferred->output_height)) {
   return false;
@@ -451,19 +439,13 @@ std::optional<std::vector<std::uint8_t>> project_annotation_mask_pixels(const An
  std::size_t run_index = 0U;
  for (std::uint32_t y = 0U; y < shape.region.height; ++y) {
   const std::uint32_t output_y = deferred->view_y + shape.region.capture_y + y;
-  const std::uint32_t source_y = std::min(
-   deferred->source_height - 1U, deferred->source_crop_y + detail::project_crop_coordinate(output_y, deferred->source_crop_height, deferred->output_height));
+  const std::uint32_t source_y = std::min(deferred->source_height - 1U, deferred->source_crop_y + detail::project_crop_coordinate(output_y, deferred->source_crop_height, deferred->output_height));
   for (std::uint32_t x = 0U; x < shape.region.width; ++x) {
    const std::uint32_t output_x = deferred->view_x + shape.region.capture_x + x;
-   const std::uint32_t source_x = std::min(
-    deferred->source_width - 1U, deferred->source_crop_x + detail::project_crop_coordinate(output_x, deferred->source_crop_width, deferred->output_width));
+   const std::uint32_t source_x = std::min(deferred->source_width - 1U, deferred->source_crop_x + detail::project_crop_coordinate(output_x, deferred->source_crop_width, deferred->output_width));
    const std::uint64_t flattened = static_cast<std::uint64_t>(source_y) * deferred->source_width + source_x;
-   while (run_index < deferred->runs.size() && static_cast<std::uint64_t>(deferred->runs[run_index].offset) + deferred->runs[run_index].length <= flattened) {
-    ++run_index;
-   }
-   if (run_index < deferred->runs.size() && deferred->runs[run_index].offset <= flattened) {
-    pixels[static_cast<std::size_t>(y) * shape.region.width + x] = 1U;
-   }
+   while (run_index < deferred->runs.size() && static_cast<std::uint64_t>(deferred->runs[run_index].offset) + deferred->runs[run_index].length <= flattened) { ++run_index; }
+   if (run_index < deferred->runs.size() && deferred->runs[run_index].offset <= flattened) { pixels[static_cast<std::size_t>(y) * shape.region.width + x] = 1U; }
   }
  }
  return pixels;

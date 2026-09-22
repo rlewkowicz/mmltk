@@ -128,7 +128,6 @@ private:
 torch::Tensor make_size_tensor(int64_t batch_size, int64_t image_height, int64_t image_width, const torch::Device& device);
 torch::Tensor make_device_batch_tensor(const mmltk::backend::data::Batch& batch, int device_id, int64_t image_height, int64_t image_width);
 void validate_feature_active_target(int64_t label, std::span<const float, 4> normalized_cxcywh, int64_t object_classes);
-PreparedTargets build_targets(const mmltk::backend::data::Batch& batch, int image_height, int image_width, bool include_masks, bool require_masks,
-                              int device_id, TargetScratch& scratch, std::string_view split, int64_t resolved_query_count,
-                              const TrainingSupervisionConfig& supervision, int64_t object_classes, AugmentationBatchPlan* augmentation_plan = nullptr);
+PreparedTargets build_targets(const mmltk::backend::data::Batch& batch, int image_height, int image_width, bool include_masks, bool require_masks, int device_id, TargetScratch& scratch,
+ std::string_view split, int64_t resolved_query_count, const TrainingSupervisionConfig& supervision, int64_t object_classes, AugmentationBatchPlan* augmentation_plan = nullptr);
 }  // namespace mmltk::backend::models::rfdetr

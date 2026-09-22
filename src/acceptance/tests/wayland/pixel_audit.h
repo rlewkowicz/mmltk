@@ -65,9 +65,8 @@ struct PixelBoundaryAudit final {
   std::set<std::uint64_t> expected;
   bool summary = false;
   [[nodiscard]] bool complete() const {
-   return summary && !expected.empty() && cards.size() == expected.size() && std::ranges::all_of(cards, [&](const auto& card) {
-           return expected.contains(card.first) && std::ranges::all_of(card.second, [](const auto& value) { return value.has_value(); });
-          });
+   return summary && !expected.empty() && cards.size() == expected.size() &&
+          std::ranges::all_of(cards, [&](const auto& card) { return expected.contains(card.first) && std::ranges::all_of(card.second, [](const auto& value) { return value.has_value(); }); });
   }
  };
  using CompositionKey = std::tuple<std::uint64_t, std::string, std::uint64_t>;

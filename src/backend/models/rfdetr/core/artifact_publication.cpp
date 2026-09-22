@@ -21,8 +21,7 @@ ClassArtifactPublication::ClassArtifactPublication(const std::filesystem::path& 
    if (!previous_artifact_) throw std::invalid_argument("class companion has no artifact");
    previous_companion_ = io::FileSnapshot::Read(companion_);
    previous_descriptor_ = detail::read_class_descriptor(companion_);
-   if (previous_descriptor_->artifact_sha256 != io::sha256_hex(io::sha256_file(destination_)))
-    throw std::invalid_argument("existing class companion does not match artifact");
+   if (previous_descriptor_->artifact_sha256 != io::sha256_hex(io::sha256_file(destination_))) throw std::invalid_argument("existing class companion does not match artifact");
   }
  }
  staging_.emplace(destination_, ".", ".classes-XXXXXX", "stage RF-DETR artifact");

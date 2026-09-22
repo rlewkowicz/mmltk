@@ -15,9 +15,8 @@ __device__ __forceinline__ std::uint32_t reflect_coordinate(const int coordinate
  if (reflected >= static_cast<int>(extent)) { reflected = period - reflected; }
  return static_cast<std::uint32_t>(reflected);
 }
-__global__ void prepare_tile_kernel(const std::uint8_t* source, const std::size_t source_pitch, const std::uint32_t source_width,
-                                    const std::uint32_t source_height, const std::uint32_t crop_x, const std::uint32_t crop_y, const std::uint32_t crop_width,
-                                    const std::uint32_t crop_height, const Tile tile, const bool shift_lut, const std::uint32_t halo, float* input) {
+__global__ void prepare_tile_kernel(const std::uint8_t* source, const std::size_t source_pitch, const std::uint32_t source_width, const std::uint32_t source_height, const std::uint32_t crop_x,
+ const std::uint32_t crop_y, const std::uint32_t crop_width, const std::uint32_t crop_height, const Tile tile, const bool shift_lut, const std::uint32_t halo, float* input) {
  const std::uint32_t index = blockIdx.x * blockDim.x + threadIdx.x;
  constexpr std::uint32_t kPlane = kInputExtent * kInputExtent;
  if (index >= kPlane) { return; }
@@ -37,8 +36,8 @@ __global__ void prepare_tile_kernel(const std::uint8_t* source, const std::size_
   input[static_cast<std::size_t>(channel) * kPlane + index] = shift_lut ? rgb * 255.0F : rgb;
  }
 }
-__global__ void stitch_tile_kernel(const float* output, const Tile tile, const bool shift_lut, const std::uint32_t halo, std::uint8_t* restored,
-                                   const std::size_t restored_pitch, const std::uint32_t restored_width, const std::uint32_t restored_height) {
+__global__ void stitch_tile_kernel(const float* output, const Tile tile, const bool shift_lut, const std::uint32_t halo, std::uint8_t* restored, const std::size_t restored_pitch,
+ const std::uint32_t restored_width, const std::uint32_t restored_height) {
  const std::uint32_t core_output_width = tile.core_width * 4U;
  const std::uint32_t core_output_height = tile.core_height * 4U;
  const std::uint64_t core_plane = static_cast<std::uint64_t>(core_output_width) * core_output_height;
@@ -62,16 +61,16 @@ __global__ void stitch_tile_kernel(const float* output, const Tile tile, const b
  rgba[3] = 255U;
 }
 }  // namespace
-void prepare_tile(const std::uint8_t* source, const std::size_t source_pitch, const std::uint32_t source_width, const std::uint32_t source_height,
-                  const std::uint32_t crop_x, const std::uint32_t crop_y, const std::uint32_t crop_width, const std::uint32_t crop_height, const Tile tile,
-                  const bool shift_lut, const std::uint32_t halo, float* input, const cudaStream_t stream) {
+void prepare_tile(const std::uint8_t* source, const std::size_t source_pitch, const std::uint32_t source_width, const std::uint32_t source_height, const std::uint32_t crop_x,
+ const std::uint32_t crop_y, const std::uint32_t crop_width, const std::uint32_t crop_height, const Tile tile, const bool shift_lut, const std::uint32_t halo, float* input,
+ const cudaStream_t stream) {
  constexpr std::uint32_t kElements = kInputExtent * kInputExtent;
  constexpr std::uint32_t kThreads = 256U;
- prepare_tile_kernel<<<(kElements + kThreads - 1U) / kThreads, kThreads, 0U, stream>>>(source, source_pitch, source_width, source_height, crop_x, crop_y,
-                                                                                       crop_width, crop_height, tile, shift_lut, halo, input);
+ prepare_tile_kernel<<<(kElements + kThreads - 1U) / kThreads, kThreads, 0U, stream>>>(
+  source, source_pitch, source_width, source_height, crop_x, crop_y, crop_width, crop_height, tile, shift_lut, halo, input);
 }
-void stitch_tile(const float* output, const Tile tile, const bool shift_lut, const std::uint32_t halo, std::uint8_t* restored, const std::size_t restored_pitch,
-                 const std::uint32_t restored_width, const std::uint32_t restored_height, const cudaStream_t stream) {
+void stitch_tile(const float* output, const Tile tile, const bool shift_lut, const std::uint32_t halo, std::uint8_t* restored, const std::size_t restored_pitch, const std::uint32_t restored_width,
+ const std::uint32_t restored_height, const cudaStream_t stream) {
  const std::uint64_t elements = static_cast<std::uint64_t>(tile.core_width) * 4U * static_cast<std::uint64_t>(tile.core_height) * 4U;
  constexpr std::uint32_t kThreads = 256U;
  stitch_tile_kernel<<<static_cast<unsigned int>((elements + kThreads - 1U) / kThreads), kThreads, 0U, stream>>>(

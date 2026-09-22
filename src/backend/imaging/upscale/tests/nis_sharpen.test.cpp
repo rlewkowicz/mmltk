@@ -65,10 +65,8 @@ TEST_CASE("Basic selected sharpening matches independent dual-direction arithmet
   REQUIRE(nis::launch_scale(input.get(), source_pitch, horizontal.get(), scaled.get(), config, stream.get()) == cudaSuccess);
  else
   REQUIRE(reference::prepare_sharpen_pixels(scaled.get(), config, pattern, stream.get()) == cudaSuccess);
- REQUIRE(nis::launch_sharpen(input.get(), source_pitch, scaled.get(), static_cast<std::uint8_t*>(actual_device.get()), target_pitch, config, stream.get()) ==
-         cudaSuccess);
- REQUIRE(reference::sharpen_reference(input.get(), source_pitch, scaled.get(), static_cast<std::uint8_t*>(expected_device.get()), target_pitch, config,
-                                      stream.get()) == cudaSuccess);
+ REQUIRE(nis::launch_sharpen(input.get(), source_pitch, scaled.get(), static_cast<std::uint8_t*>(actual_device.get()), target_pitch, config, stream.get()) == cudaSuccess);
+ REQUIRE(reference::sharpen_reference(input.get(), source_pitch, scaled.get(), static_cast<std::uint8_t*>(expected_device.get()), target_pitch, config, stream.get()) == cudaSuccess);
  REQUIRE(cudaStreamSynchronize(stream.get()) == cudaSuccess);
  std::vector<std::uint8_t> actual(bytes), expected(bytes), unchanged(source.size());
  REQUIRE(cudaMemcpy(actual.data(), actual_device.get(), bytes, cudaMemcpyDeviceToHost) == cudaSuccess);

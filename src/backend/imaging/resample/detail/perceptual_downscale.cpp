@@ -18,8 +18,7 @@ void vector_add(__m256 value, __m256& sum, __m256& error) {
 // rectangle together. Even 2x2 reductions use eight active SIMD lanes. Byte
 // gathers never load a fourth byte beyond an RGB pixel or cross row padding.
 template <RgbPixelFormat Format>
-void integer_moments8(RgbConstImageView source, const TransferTable& transfer, std::uint32_t first_x, Footprint fy, std::uint32_t step, Moment* output,
-                      float* alpha_output) {
+void integer_moments8(RgbConstImageView source, const TransferTable& transfer, std::uint32_t first_x, Footprint fy, std::uint32_t step, Moment* output, float* alpha_output) {
  __m256 means[3]{}, variances[3]{}, mean_errors[3]{}, variance_errors[3]{};
  __m256 alpha_sum = _mm256_setzero_ps(), alpha_error = _mm256_setzero_ps();
  std::uint64_t samples = 0;
@@ -49,9 +48,7 @@ void integer_moments8(RgbConstImageView source, const TransferTable& transfer, s
     vector_add(alpha, alpha_sum, alpha_error);
    }
    using C = ColorCoefficients;
-   const auto channel = [&](float r, float g, float b) {
-    return _mm256_fmadd_ps(rgb[0], _mm256_set1_ps(r), _mm256_fmadd_ps(rgb[1], _mm256_set1_ps(g), _mm256_mul_ps(rgb[2], _mm256_set1_ps(b))));
-   };
+   const auto channel = [&](float r, float g, float b) { return _mm256_fmadd_ps(rgb[0], _mm256_set1_ps(r), _mm256_fmadd_ps(rgb[1], _mm256_set1_ps(g), _mm256_mul_ps(rgb[2], _mm256_set1_ps(b)))); };
    const __m256 colors[]{channel(C::yr, C::yg, C::yb), channel(C::cbr, C::cbg, C::cbb), channel(C::crr, C::crg, C::crb)};
    const auto inverse = _mm256_set1_ps(1.0F / static_cast<float>(++samples));
    for (int k = 0; k < 3; ++k) {
@@ -79,8 +76,7 @@ void copy_identity(RgbConstImageView source, RgbMutableImageView destination) {
  for (unsigned plane = 0; plane < geometry.planes; ++plane)
   for (std::uint32_t y = 0; y < source.layout.height; ++y)
    std::memcpy(static_cast<std::uint8_t*>(destination.data) + plane * destination.layout.plane_stride_bytes + y * destination.layout.row_stride_bytes,
-               static_cast<const std::uint8_t*>(source.data) + plane * source.layout.plane_stride_bytes + y * source.layout.row_stride_bytes,
-               geometry.row_bytes);
+    static_cast<const std::uint8_t*>(source.data) + plane * source.layout.plane_stride_bytes + y * source.layout.row_stride_bytes, geometry.row_bytes);
 }
 CpuDownscaler::CpuDownscaler() {
  for (unsigned i = 0; i < 256; ++i) transfer_.linear[i] = decode(float(i) * (1.0F / 255.0F));

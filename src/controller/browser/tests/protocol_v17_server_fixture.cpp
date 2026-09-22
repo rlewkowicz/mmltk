@@ -102,10 +102,9 @@ int main(const int argument_count, char* const* const arguments) {
  });
  if (!snapshots_valid || !named_annotation_reference) return EXIT_FAILURE;
  std::uint64_t dialog_id = 0U;
- ApplicationSchema<ApplicationSystems>::VisitApplicationSettingsLeaves(
-  [&]<class Owner, class Declaration, class Member>(const ApplicationSettingsLeafFact& fact) {
-   if (dialog_id == 0U && fact.file_dialog) dialog_id = fact.stable_id;
-  });
+ ApplicationSchema<ApplicationSystems>::VisitApplicationSettingsLeaves([&]<class Owner, class Declaration, class Member>(const ApplicationSettingsLeafFact& fact) {
+  if (dialog_id == 0U && fact.file_dialog) dialog_id = fact.stable_id;
+ });
  if (dialog_id == 0U) return EXIT_FAILURE;
  const services::FileDialogSelection cancelled{
   .target = services::FileDialogTarget{services::SettingsFieldTarget{dialog_id}},
@@ -147,12 +146,10 @@ int main(const int argument_count, char* const* const arguments) {
    .delivery = contracts::reflection::EventDelivery::Critical,
    .value = std::move(*event),
   },
-  InteractionRejected{.endpoint_id = application_stable_id("annotation", "Input"),
-                      .error = {.category = contracts::ApplicationErrorCategory::Unavailable, .detail = "fixture input unavailable"}},
-  InteractionRejected{.endpoint_id = application_stable_id("explore", "UpdateViewport"),
-                      .error = {.category = contracts::ApplicationErrorCategory::Unavailable, .detail = "fixture unavailable"}},
-  InteractionRejected{.endpoint_id = application_stable_id("annotation", "Input"),
-                      .error = {.category = contracts::ApplicationErrorCategory::Failed, .detail = std::string(kMaxErrorDetailBytes, 'r')}},
+  InteractionRejected{.endpoint_id = application_stable_id("annotation", "Input"), .error = {.category = contracts::ApplicationErrorCategory::Unavailable, .detail = "fixture input unavailable"}},
+  InteractionRejected{.endpoint_id = application_stable_id("explore", "UpdateViewport"), .error = {.category = contracts::ApplicationErrorCategory::Unavailable, .detail = "fixture unavailable"}},
+  InteractionRejected{
+   .endpoint_id = application_stable_id("annotation", "Input"), .error = {.category = contracts::ApplicationErrorCategory::Failed, .detail = std::string(kMaxErrorDetailBytes, 'r')}},
   IntegrationControl{.receipt = {.kind = contracts::IntegrationControlKind::Advance, .sequence = 2U}},
  };
  // An independent named persistence projection is test data, carried as a
@@ -162,8 +159,7 @@ int main(const int argument_count, char* const* const arguments) {
  using ControlKind = contracts::IntegrationControlKind;
  contracts::visit_integration_commands([&]<auto Kind, auto Policy>(auto) {
   if constexpr (Policy.server && Kind != ControlKind::Advance) {
-   records.emplace_back(
-    IntegrationControl{.receipt = {.kind = Kind, .sequence = 2U, .read_generation = Policy.read_generation ? 7U : 0U, .compiled_index = 0U}});
+   records.emplace_back(IntegrationControl{.receipt = {.kind = Kind, .sequence = 2U, .read_generation = Policy.read_generation ? 7U : 0U, .compiled_index = 0U}});
   }
  });
  // Native settings/projection pairs exercise every relation row through the
@@ -220,8 +216,7 @@ int main(const int argument_count, char* const* const arguments) {
  sample.pixel_extent = {640U, 640U};
  sample.source_extent = {1280U, 640U};
  sample.content = {0U, 160U, 640U, 320U};
- sample.labels.push_back(ValidationLabel{
-  .box = {{1.25F, 2.5F}, {15.0F, 19.0F}}, .color = {}, .rgb = {17U, 93U, 201U}, .category = 5U, .ground_truth = true, .confidence = 0.0F, .name = "last"});
+ sample.labels.push_back(ValidationLabel{.box = {{1.25F, 2.5F}, {15.0F, 19.0F}}, .color = {}, .rgb = {17U, 93U, 201U}, .category = 5U, .ground_truth = true, .confidence = 0.0F, .name = "last"});
  std::uint64_t validation_correlation = 600U;
  const auto append_validation = [&](const auto& value) {
   auto named = mmltk::frameworks::serialization::reflected_value(value);
@@ -232,9 +227,7 @@ int main(const int argument_count, char* const* const arguments) {
   return true;
  };
  if (!append_validation(metric_page) || !append_validation(sample_image)) return EXIT_FAILURE;
- if (!append_validation(rfdetr::kEvaluationAxes.iou) || !append_validation(rfdetr::kEvaluationAxes.recall) ||
-     !append_validation(rfdetr::kEvaluationAxes.confidence))
-  return EXIT_FAILURE;
+ if (!append_validation(rfdetr::kEvaluationAxes.iou) || !append_validation(rfdetr::kEvaluationAxes.recall) || !append_validation(rfdetr::kEvaluationAxes.confidence)) return EXIT_FAILURE;
  // Malformed pages cross the real native record encoder and Rust decoders.
  // Mutating wire values deliberately bypasses native output admission.
  const auto named_member = [](wire::Value& value, std::string_view name) -> wire::Value& {
@@ -250,8 +243,7 @@ int main(const int argument_count, char* const* const arguments) {
    named_member(named_member(named_rows[1], "category_name"), "value").storage = std::string(257U, 'x');
    // Field index is derived from the actual native named projection.
    const auto& named_fields = std::get<wire::Value::Object>(named_rows[1].storage);
-   const auto index =
-    static_cast<std::size_t>(std::ranges::find_if(named_fields, [](const auto& field) { return field.first == "category_name"; }) - named_fields.begin());
+   const auto index = static_cast<std::size_t>(std::ranges::find_if(named_fields, [](const auto& field) { return field.first == "category_name"; }) - named_fields.begin());
    auto& name = std::get<wire::Value::Array>(positional_rows[1].storage)[index];
    std::get<wire::Value::Array>(name.storage).front().storage = std::string(257U, 'x');
   } else {
@@ -321,8 +313,7 @@ int main(const int argument_count, char* const* const arguments) {
  }
  bool complete_record_surface = true;
  application_schema_detail::Variant<ServerRecord>::Visit([&]<class Alternative>() {
-  complete_record_surface =
-   complete_record_surface && std::ranges::any_of(records, [](const ServerRecord& record) { return std::holds_alternative<Alternative>(record); });
+  complete_record_surface = complete_record_surface && std::ranges::any_of(records, [](const ServerRecord& record) { return std::holds_alternative<Alternative>(record); });
  });
  if (!complete_record_surface) return EXIT_FAILURE;
  std::ofstream output(arguments[1], std::ios::binary | std::ios::trunc);

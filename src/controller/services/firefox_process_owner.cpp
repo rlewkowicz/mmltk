@@ -39,11 +39,10 @@ constexpr std::uint32_t kInitialFirefoxWindowHeight = 1'125U;
 [[nodiscard]] bool environment_entry_has_key(const std::string_view entry, const std::string_view key) noexcept {
  return entry.size() > key.size() && entry.starts_with(key) && entry[key.size()] == '=';
 }
-[[nodiscard]] std::vector<std::string> firefox_environment(const std::filesystem::path& runtime_root, const std::filesystem::path& workspace_import_socket,
-                                                           const bool integration, const bool integration_high_dpi) {
- static constexpr std::array<std::string_view, 12U> kOverridden{
-  "DISPLAY",           "GDK_BACKEND",        "LD_LIBRARY_PATH", "MOZILLA_FIVE_HOME", "MOZ_CRASHREPORTER_DISABLE", "MOZ_DBUS_REMOTE",
-  "MOZ_DEFAULT_PREFS", "MOZ_ENABLE_WAYLAND", "MOZ_NOREMOTE",    "NO_AT_BRIDGE",      "XDG_SESSION_TYPE",          "MMLTK_WORKSPACE_IMPORT_SOCKET"};
+[[nodiscard]] std::vector<std::string> firefox_environment(
+ const std::filesystem::path& runtime_root, const std::filesystem::path& workspace_import_socket, const bool integration, const bool integration_high_dpi) {
+ static constexpr std::array<std::string_view, 12U> kOverridden{"DISPLAY", "GDK_BACKEND", "LD_LIBRARY_PATH", "MOZILLA_FIVE_HOME", "MOZ_CRASHREPORTER_DISABLE", "MOZ_DBUS_REMOTE", "MOZ_DEFAULT_PREFS",
+  "MOZ_ENABLE_WAYLAND", "MOZ_NOREMOTE", "NO_AT_BRIDGE", "XDG_SESSION_TYPE", "MMLTK_WORKSPACE_IMPORT_SOCKET"};
  std::vector<std::string> result;
  std::string inherited_library_path;
  for (char** current = environ; current && *current; ++current) {
@@ -217,8 +216,7 @@ private:
 }  // namespace
 class FirefoxProcessOwner::Implementation final {
 public:
- Implementation(std::filesystem::path workspace_import_socket, FirefoxProcessConfig config, FirefoxProcessObservationTarget observations,
-                RuntimeDiagnosticTarget diagnostics) noexcept
+ Implementation(std::filesystem::path workspace_import_socket, FirefoxProcessConfig config, FirefoxProcessObservationTarget observations, RuntimeDiagnosticTarget diagnostics) noexcept
      : workspace_import_socket_(std::move(workspace_import_socket)),
        executable_(std::move(config.executable)),
        page_url_(std::move(config.page_url)),
@@ -244,32 +242,15 @@ public:
   std::vector<std::string> environment_storage;
   std::vector<char*> environment;
   try {
-   argument_storage = {executable_.string(),
-                       "--no-remote",
-                       "--new-instance",
-                       "--profile",
-                       profile_.string(),
-                       "--width",
-                       std::to_string(kInitialFirefoxWindowWidth),
-                       "--height",
-                       std::to_string(kInitialFirefoxWindowHeight),
-                       page_url_};
+   argument_storage = {executable_.string(), "--no-remote", "--new-instance", "--profile", profile_.string(), "--width", std::to_string(kInitialFirefoxWindowWidth), "--height",
+    std::to_string(kInitialFirefoxWindowHeight), page_url_};
    environment_storage = firefox_environment(executable_.parent_path(), workspace_import_socket_, integration_, integration_high_dpi_);
    environment.reserve(environment_storage.size() + 1U);
    for (auto& entry : environment_storage) environment.push_back(entry.data());
    environment.push_back(nullptr);
   } catch (...) { return startup_failed("start.arguments_refused"); }
-  std::array<char*, 11U> arguments{argument_storage[0].data(),
-                                   argument_storage[1].data(),
-                                   argument_storage[2].data(),
-                                   argument_storage[3].data(),
-                                   argument_storage[4].data(),
-                                   argument_storage[5].data(),
-                                   argument_storage[6].data(),
-                                   argument_storage[7].data(),
-                                   argument_storage[8].data(),
-                                   argument_storage[9].data(),
-                                   nullptr};
+  std::array<char*, 11U> arguments{argument_storage[0].data(), argument_storage[1].data(), argument_storage[2].data(), argument_storage[3].data(), argument_storage[4].data(),
+   argument_storage[5].data(), argument_storage[6].data(), argument_storage[7].data(), argument_storage[8].data(), argument_storage[9].data(), nullptr};
   SpawnFileActions file_actions;
   if (!prepare_log_handoff(file_actions)) return startup_failed("start.log_handoff_refused", errno);
   posix_spawnattr_t attributes{};
@@ -411,10 +392,10 @@ private:
   const auto seconds = std::chrono::duration_cast<std::chrono::seconds>(stop_grace_);
   const auto nanoseconds = stop_grace_ - seconds;
   const itimerspec deadline{.it_interval = {},
-                            .it_value = {
-                             .tv_sec = static_cast<time_t>(seconds.count()),
-                             .tv_nsec = static_cast<long>(std::chrono::duration_cast<std::chrono::nanoseconds>(nanoseconds).count()),
-                            }};
+   .it_value = {
+    .tv_sec = static_cast<time_t>(seconds.count()),
+    .tv_nsec = static_cast<long>(std::chrono::duration_cast<std::chrono::nanoseconds>(nanoseconds).count()),
+   }};
   if (::timerfd_settime(timer_fd_.get(), 0, &deadline, nullptr) != 0) {
    terminal_monitor_failure("child.stop_timer_arm_refused", errno, errno);
    return false;
@@ -467,8 +448,7 @@ private:
    publish_infrastructure_failure(failure);
    return;
   }
-  publish_terminal(child.si_code == CLD_EXITED ? FirefoxProcessTerminal::Exited : FirefoxProcessTerminal::Signaled,
-                   child.si_code == CLD_EXITED ? child.si_status : 128 + child.si_status);
+  publish_terminal(child.si_code == CLD_EXITED ? FirefoxProcessTerminal::Exited : FirefoxProcessTerminal::Signaled, child.si_code == CLD_EXITED ? child.si_status : 128 + child.si_status);
  }
  void settle_failure(const std::string_view event, const int error, const int cause = 0) noexcept {
   trace(event, static_cast<std::uint64_t>(static_cast<std::uint32_t>(error)));
@@ -511,9 +491,7 @@ private:
   observations_.publish({.kind = FirefoxPhysicalObservationKind::ProcessTerminal, .process = published});
  }
  [[nodiscard]] bool valid_launch_inputs() const noexcept {
-  if (executable_.empty() || page_url_.empty() || stop_grace_ <= std::chrono::milliseconds::zero() || stop_grace_ > kMaximumFirefoxStopGrace ||
-      !runtime_signals_are_blocked())
-   return false;
+  if (executable_.empty() || page_url_.empty() || stop_grace_ <= std::chrono::milliseconds::zero() || stop_grace_ > kMaximumFirefoxStopGrace || !runtime_signals_are_blocked()) return false;
   try {
    return std::filesystem::is_regular_file(executable_);
   } catch (...) { return false; }
@@ -547,17 +525,14 @@ private:
    std::scoped_lock lock{mutex_};
    process = custody_.pid();
   }
-  diagnostics_.Emit([&] {
-   return RuntimeDiagnosticFact{
-    .owner = contracts::DiagnosticOwner::FirefoxProcess, .event = event, .sequence = process > 0 ? static_cast<std::uint64_t>(process) : 0U, .value = value};
-  });
+  diagnostics_.Emit(
+   [&] { return RuntimeDiagnosticFact{.owner = contracts::DiagnosticOwner::FirefoxProcess, .event = event, .sequence = process > 0 ? static_cast<std::uint64_t>(process) : 0U, .value = value}; });
  }
  [[nodiscard]] bool prepare_log_handoff(SpawnFileActions& actions) noexcept {
   if (log_file_.empty()) return true;
   firefox_log_.reset(::open(log_file_.c_str(), O_WRONLY | O_APPEND | O_CREAT | O_CLOEXEC, S_IRUSR | S_IWUSR));
   if (firefox_log_.get() < 0) return false;
-  return actions.initialize() && actions.add_dup2(firefox_log_.get(), STDOUT_FILENO) && actions.add_dup2(firefox_log_.get(), STDERR_FILENO) &&
-         actions.add_close(firefox_log_.get());
+  return actions.initialize() && actions.add_dup2(firefox_log_.get(), STDOUT_FILENO) && actions.add_dup2(firefox_log_.get(), STDERR_FILENO) && actions.add_close(firefox_log_.get());
  }
  FirefoxProcessStartResult startup_failed(std::string_view event, const int error = 0) noexcept {
   trace(event, static_cast<std::uint64_t>(error));
@@ -596,10 +571,9 @@ bool block_browser_runtime_signals() noexcept {
  const sigset_t signals = runtime_signal_set();
  return ::pthread_sigmask(SIG_BLOCK, &signals, nullptr) == 0;
 }
-FirefoxProcessOwner::FirefoxProcessOwner(std::filesystem::path workspace_import_socket, FirefoxProcessConfig config,
-                                         const FirefoxProcessObservationTarget observations, const RuntimeDiagnosticTarget diagnostics) noexcept
-    : observations_(observations),
-      implementation_(new (std::nothrow) Implementation(std::move(workspace_import_socket), std::move(config), observations, diagnostics)) {}
+FirefoxProcessOwner::FirefoxProcessOwner(
+ std::filesystem::path workspace_import_socket, FirefoxProcessConfig config, const FirefoxProcessObservationTarget observations, const RuntimeDiagnosticTarget diagnostics) noexcept
+    : observations_(observations), implementation_(new (std::nothrow) Implementation(std::move(workspace_import_socket), std::move(config), observations, diagnostics)) {}
 FirefoxProcessOwner::FirefoxProcessOwner(const FirefoxProcessObservationTarget observations) noexcept : observations_(observations) {}
 FirefoxProcessOwner::~FirefoxProcessOwner() noexcept = default;
 FirefoxProcessStartResult FirefoxProcessOwner::start() noexcept {

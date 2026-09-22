@@ -10,8 +10,7 @@ namespace mmltk::controller::contracts {
 struct WorkflowSettingsState {
  [[= mmltk::controller::contracts::reflection::feature_scope(mmltk::controller::contracts::FeatureId::Train)]] TrainViewState train;
  [[= mmltk::controller::contracts::reflection::feature_scope(mmltk::controller::contracts::FeatureId::Validate)]] ValidateViewState validate;
- [[= mmltk::controller::contracts::reflection::feature_scope(mmltk::controller::contracts::FeatureId::Predict,
-                                                             mmltk::controller::contracts::FeatureId::Live)]] PredictViewState predict;
+ [[= mmltk::controller::contracts::reflection::feature_scope(mmltk::controller::contracts::FeatureId::Predict, mmltk::controller::contracts::FeatureId::Live)]] PredictViewState predict;
  // CLEANUP-IGNORE: Each reflected workflow member carries its own canonical feature scope for generated settings
  // projection.
  [[= mmltk::controller::contracts::reflection::feature_scope(mmltk::controller::contracts::FeatureId::Annotate)]] AnnotateViewState annotate;

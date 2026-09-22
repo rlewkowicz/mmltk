@@ -134,15 +134,9 @@ void test_query_layout_capacity_checks_each_product_and_sum() {
 }
 }  // namespace
 TEST_CASE("test_defaults_and_cli_spellings_are_stable", "[model][rfdetr][training_supervision]") { test_defaults_and_cli_spellings_are_stable(); }
-TEST_CASE("test_open_and_closed_ranges_and_relation_are_enforced", "[model][rfdetr][training_supervision]") {
- test_open_and_closed_ranges_and_relation_are_enforced();
-}
-TEST_CASE("test_reflected_cbor_round_trip_preserves_complete_nested_value", "[model][rfdetr][training_supervision]") {
- test_reflected_cbor_round_trip_preserves_complete_nested_value();
-}
+TEST_CASE("test_open_and_closed_ranges_and_relation_are_enforced", "[model][rfdetr][training_supervision]") { test_open_and_closed_ranges_and_relation_are_enforced(); }
+TEST_CASE("test_reflected_cbor_round_trip_preserves_complete_nested_value", "[model][rfdetr][training_supervision]") { test_reflected_cbor_round_trip_preserves_complete_nested_value(); }
 TEST_CASE("test_request_and_model_boundaries_reject_unsupported_feature_combinations", "[model][rfdetr][training_supervision]") {
  test_request_and_model_boundaries_reject_unsupported_feature_combinations();
 }
-TEST_CASE("test_query_layout_capacity_checks_each_product_and_sum", "[model][rfdetr][training_supervision]") {
- test_query_layout_capacity_checks_each_product_and_sum();
-}
+TEST_CASE("test_query_layout_capacity_checks_each_product_and_sum", "[model][rfdetr][training_supervision]") { test_query_layout_capacity_checks_each_product_and_sum(); }

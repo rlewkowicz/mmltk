@@ -64,10 +64,10 @@ struct RfdetrCommandMaterializer final {
    if (declaration_count != 1U) throw "each RF-DETR command requires one declaration";
    result[index++] = {
     .command = [:enumerator:],
-                             .name = std::define_static_string(declaration.name.view()),
-                             .alias_a = std::define_static_string(declaration.alias_a.view()),
-                             .alias_b = std::define_static_string(declaration.alias_b.view()),
-                             .description = std::define_static_string(declaration.description.view()),
+    .name = std::define_static_string(declaration.name.view()),
+    .alias_a = std::define_static_string(declaration.alias_a.view()),
+    .alias_b = std::define_static_string(declaration.alias_b.view()),
+    .description = std::define_static_string(declaration.description.view()),
    };
   }
   return result;
@@ -82,10 +82,7 @@ inline constexpr auto kRfdetrCommands = mmltk::frameworks::reflection::materiali
 }
 [[nodiscard]] constexpr std::optional<RfdetrCommand> parse_rfdetr_command(const std::string_view spelling) noexcept {
  for (const auto& descriptor : kRfdetrCommands) {
-  if (spelling == descriptor.name || (!descriptor.alias_a.empty() && spelling == descriptor.alias_a) ||
-      (!descriptor.alias_b.empty() && spelling == descriptor.alias_b)) {
-   return descriptor.command;
-  }
+  if (spelling == descriptor.name || (!descriptor.alias_a.empty() && spelling == descriptor.alias_a) || (!descriptor.alias_b.empty() && spelling == descriptor.alias_b)) { return descriptor.command; }
  }
  return std::nullopt;
 }
@@ -93,15 +90,12 @@ inline constexpr auto kRfdetrCommands = mmltk::frameworks::reflection::materiali
  for (std::size_t left = 0U; left < kRfdetrCommands.size(); ++left) {
   const auto& descriptor = kRfdetrCommands[left];
   if (descriptor.name.empty() || (!descriptor.alias_a.empty() && descriptor.alias_a == descriptor.name) ||
-      (!descriptor.alias_b.empty() && (descriptor.alias_b == descriptor.name || descriptor.alias_b == descriptor.alias_a)) ||
-      rfdetr_command_descriptor(descriptor.command) != &descriptor) {
+      (!descriptor.alias_b.empty() && (descriptor.alias_b == descriptor.name || descriptor.alias_b == descriptor.alias_a)) || rfdetr_command_descriptor(descriptor.command) != &descriptor) {
    return false;
   }
   for (std::size_t right = left + 1U; right < kRfdetrCommands.size(); ++right) {
    const auto& candidate = kRfdetrCommands[right];
-   const auto matches = [&candidate](const std::string_view value) {
-    return !value.empty() && (value == candidate.name || value == candidate.alias_a || value == candidate.alias_b);
-   };
+   const auto matches = [&candidate](const std::string_view value) { return !value.empty() && (value == candidate.name || value == candidate.alias_a || value == candidate.alias_b); };
    if (matches(descriptor.name) || matches(descriptor.alias_a) || matches(descriptor.alias_b)) { return false; }
   }
  }

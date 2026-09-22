@@ -12,15 +12,15 @@ struct ValidationRuntimeResult final {
 class ValidationRuntime {
 public:
  virtual ~ValidationRuntime() = default;
- [[nodiscard]] virtual ValidationRuntimeResult Run(mmltk::backend::models::rfdetr::ValidateRequest, std::stop_token, const ComputeProgressSink&,
-                                                   const mmltk::backend::models::rfdetr::ValidationDelivery&) = 0;
+ [[nodiscard]] virtual ValidationRuntimeResult Run(
+  mmltk::backend::models::rfdetr::ValidateRequest, std::stop_token, const ComputeProgressSink&, const mmltk::backend::models::rfdetr::ValidationDelivery&) = 0;
 };
 class CudaValidationRuntime final : public ValidationRuntime {
 public:
  explicit CudaValidationRuntime(DirectComputeConfiguration);
  ~CudaValidationRuntime() override;
- [[nodiscard]] ValidationRuntimeResult Run(mmltk::backend::models::rfdetr::ValidateRequest, std::stop_token, const ComputeProgressSink&,
-                                           const mmltk::backend::models::rfdetr::ValidationDelivery&) override;
+ [[nodiscard]] ValidationRuntimeResult Run(
+  mmltk::backend::models::rfdetr::ValidateRequest, std::stop_token, const ComputeProgressSink&, const mmltk::backend::models::rfdetr::ValidationDelivery&) override;
 
 private:
  class Impl;

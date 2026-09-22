@@ -37,8 +37,8 @@ bool pixel_matches_range(const AnnotationColorRange& range, const AnnotationHsv&
  const float sat_max = annotation_clamp_unit(range.center.saturation + range.tolerance.saturation_plus_pct / 100.0f);
  const float value_min = annotation_clamp_unit(range.center.value - range.tolerance.value_minus_pct / 100.0f);
  const float value_max = annotation_clamp_unit(range.center.value + range.tolerance.value_plus_pct / 100.0f);
- return hue_in_window(hsv.hue_degrees, range.center.hue_degrees - hue_minus, range.center.hue_degrees + hue_plus) && hsv.saturation >= sat_min &&
-        hsv.saturation <= sat_max && hsv.value >= value_min && hsv.value <= value_max;
+ return hue_in_window(hsv.hue_degrees, range.center.hue_degrees - hue_minus, range.center.hue_degrees + hue_plus) && hsv.saturation >= sat_min && hsv.saturation <= sat_max && hsv.value >= value_min &&
+        hsv.value <= value_max;
 }
 std::vector<std::uint8_t> seed_mask_from_box(const AnnotationBox& box, const std::uint32_t width, const std::uint32_t height) {
  std::vector<std::uint8_t> mask(static_cast<std::size_t>(width) * static_cast<std::size_t>(height), 0U);
@@ -77,11 +77,8 @@ void rasterize_line(std::vector<std::uint8_t>& mask, const std::uint32_t width, 
   }
  }
 }
-AnnotationBox mask_region_box(const AnnotationMaskRegion& region) {
- return annotation_box_from_origin_extent(region.capture_x, region.capture_y, region.width, region.height);
-}
-std::vector<std::uint8_t> project_mask_region_to_frame(const AnnotationFrame& frame, const AnnotationMaskRegion& region,
-                                                       const std::vector<std::uint8_t>& mask) {
+AnnotationBox mask_region_box(const AnnotationMaskRegion& region) { return annotation_box_from_origin_extent(region.capture_x, region.capture_y, region.width, region.height); }
+std::vector<std::uint8_t> project_mask_region_to_frame(const AnnotationFrame& frame, const AnnotationMaskRegion& region, const std::vector<std::uint8_t>& mask) {
  std::vector<std::uint8_t> projected(static_cast<std::size_t>(frame.width) * static_cast<std::size_t>(frame.height), 0U);
  if (projected.empty() || mask.empty() || region.width == 0 || region.height == 0) { return projected; }
  const AnnotationBox region_box = mask_region_box(region);
@@ -101,8 +98,7 @@ std::vector<std::uint8_t> project_mask_region_to_frame(const AnnotationFrame& fr
 }
 std::optional<AnnotationPoint> capture_point_to_frame(const AnnotationFrame& frame, const AnnotationPoint& point) {
  const AnnotationBox view_box = annotation_frame_view_box(frame);
- if (point.x < static_cast<float>(view_box.x1) || point.y < static_cast<float>(view_box.y1) || point.x >= static_cast<float>(view_box.x2) ||
-     point.y >= static_cast<float>(view_box.y2)) {
+ if (point.x < static_cast<float>(view_box.x1) || point.y < static_cast<float>(view_box.y1) || point.x >= static_cast<float>(view_box.x2) || point.y >= static_cast<float>(view_box.y2)) {
   return std::nullopt;
  }
  return AnnotationPoint{
@@ -114,9 +110,7 @@ std::vector<AnnotationPoint> capture_points_to_frame(const AnnotationFrame& fram
  std::vector<AnnotationPoint> frame_points;
  frame_points.reserve(capture_points.size());
  for (const AnnotationPoint& capture_point : capture_points) {
-  if (const std::optional<AnnotationPoint> frame_point = capture_point_to_frame(frame, capture_point); frame_point.has_value()) {
-   frame_points.push_back(*frame_point);
-  }
+  if (const std::optional<AnnotationPoint> frame_point = capture_point_to_frame(frame, capture_point); frame_point.has_value()) { frame_points.push_back(*frame_point); }
  }
  return frame_points;
 }
@@ -158,8 +152,7 @@ void fill_closed_path(std::vector<std::uint8_t>& mask, const std::uint32_t width
   }
  }
 }
-std::vector<std::uint8_t> seed_mask_from_paths(const std::vector<AnnotationPoint>& points, const std::uint32_t width, const std::uint32_t height,
-                                               const bool closed) {
+std::vector<std::uint8_t> seed_mask_from_paths(const std::vector<AnnotationPoint>& points, const std::uint32_t width, const std::uint32_t height, const bool closed) {
  std::vector<std::uint8_t> mask(static_cast<std::size_t>(width) * static_cast<std::size_t>(height), 0U);
  if (points.empty()) { return mask; }
  paint_mask_pixel(mask, width, height, static_cast<int>(std::lround(points.front().x)), static_cast<int>(std::lround(points.front().y)));
@@ -170,8 +163,7 @@ std::vector<std::uint8_t> seed_mask_from_paths(const std::vector<AnnotationPoint
  }
  return mask;
 }
-EffectiveObjectSeed effective_object_seed(const AnnotationFrame& frame, const AnnotationObject& object, const bool live_mode,
-                                          const AnnotationVisibleObject* projected_object) {
+EffectiveObjectSeed effective_object_seed(const AnnotationFrame& frame, const AnnotationObject& object, const bool live_mode, const AnnotationVisibleObject* projected_object) {
  EffectiveObjectSeed seed;
  seed.shape_type = annotation_shape_type(object.shape);
  std::visit(
@@ -193,9 +185,7 @@ EffectiveObjectSeed effective_object_seed(const AnnotationFrame& frame, const An
     const bool dense_mask_valid = shape.mask.size() == static_cast<std::size_t>(shape.region.width) * shape.region.height;
     if (frame_match && dense_mask_valid) {
      seed.mask = project_mask_region_to_frame(frame, shape.region, shape.mask);
-     if (const std::optional<AnnotationBox> mask_box = annotation_bbox_from_mask(seed.mask, frame.width, frame.height); mask_box.has_value()) {
-      seed.box = *mask_box;
-     }
+     if (const std::optional<AnnotationBox> mask_box = annotation_bbox_from_mask(seed.mask, frame.width, frame.height); mask_box.has_value()) { seed.box = *mask_box; }
     } else if (shape.deferred == nullptr) {
      seed.mask = seed_mask_from_box(seed.box, frame.width, frame.height);
     }
@@ -252,17 +242,15 @@ EffectiveObjectSeed effective_object_seed(const AnnotationFrame& frame, const An
       rasterize_line(seed.mask, frame.width, frame.height, *source_frame, *target_frame);
      }
     }
-    for (const AnnotationPoint& point : seed.points_xy) {
-     paint_mask_pixel(seed.mask, frame.width, frame.height, static_cast<int>(std::lround(point.x)), static_cast<int>(std::lround(point.y)));
-    }
+    for (const AnnotationPoint& point : seed.points_xy) { paint_mask_pixel(seed.mask, frame.width, frame.height, static_cast<int>(std::lround(point.x)), static_cast<int>(std::lround(point.y))); }
     if (const std::optional<AnnotationBox> bbox = annotation_bbox_from_mask(seed.mask, frame.width, frame.height); bbox.has_value()) { seed.box = *bbox; }
    }
   },
   object.shape);
  return seed;
 }
-AnnotationResolvedObject resolve_object(const AnnotationFrame& frame, const AnnotationCategories& categories, const AnnotationObject& object,
-                                        const std::size_t object_index, const bool live_mode, const AnnotationVisibleObject* projected_object) {
+AnnotationResolvedObject resolve_object(const AnnotationFrame& frame, const AnnotationCategories& categories, const AnnotationObject& object, const std::size_t object_index, const bool live_mode,
+ const AnnotationVisibleObject* projected_object) {
  if (object.category_index >= categories.items.size()) { throw std::runtime_error("annotation object category index is out of range"); }
  EffectiveObjectSeed seed = effective_object_seed(frame, object, live_mode, projected_object);
  AnnotationResolvedObject resolved;
@@ -294,9 +282,7 @@ AnnotationResolvedObject resolve_object(const AnnotationFrame& frame, const Anno
   }
  }
  if (!annotation_box_has_area(resolved.bbox)) {
-  if (const std::optional<AnnotationBox> object_bbox = annotation_object_bbox(object); object_bbox.has_value()) {
-   resolved.bbox = annotation_box_to_frame(frame, *object_bbox);
-  }
+  if (const std::optional<AnnotationBox> object_bbox = annotation_object_bbox(object); object_bbox.has_value()) { resolved.bbox = annotation_box_to_frame(frame, *object_bbox); }
  }
  if (annotation_box_has_area(resolved.bbox) && has_dense_mask && !resolved.mask_rle.empty()) {
   resolved.crop_width = static_cast<std::uint32_t>(resolved.bbox.x2 - resolved.bbox.x1);
@@ -305,8 +291,7 @@ AnnotationResolvedObject resolve_object(const AnnotationFrame& frame, const Anno
   for (int y = resolved.bbox.y1; y < resolved.bbox.y2; ++y) {
    for (int x = resolved.bbox.x1; x < resolved.bbox.x2; ++x) {
     const std::size_t source_index = static_cast<std::size_t>(y) * static_cast<std::size_t>(frame.width) + static_cast<std::size_t>(x);
-    const std::size_t crop_index =
-     (static_cast<std::size_t>(y - resolved.bbox.y1) * static_cast<std::size_t>(resolved.crop_width) + static_cast<std::size_t>(x - resolved.bbox.x1)) * 4U;
+    const std::size_t crop_index = (static_cast<std::size_t>(y - resolved.bbox.y1) * static_cast<std::size_t>(resolved.crop_width) + static_cast<std::size_t>(x - resolved.bbox.x1)) * 4U;
     const std::size_t source_byte = source_index * 3U;
     resolved.crop_rgba[crop_index + 0] = frame_pixels[source_byte + 2];
     resolved.crop_rgba[crop_index + 1] = frame_pixels[source_byte + 1];
@@ -317,9 +302,8 @@ AnnotationResolvedObject resolve_object(const AnnotationFrame& frame, const Anno
  }
  return resolved;
 }
-std::vector<AnnotationResolvedObject> resolve_annotation_objects_with_lookup(const AnnotationFrame& frame, const AnnotationCategories& categories,
-                                                                             const std::vector<AnnotationObject>& objects, const bool live_mode,
-                                                                             const AnnotationProjectedSceneLookup& projected_scene_lookup) {
+std::vector<AnnotationResolvedObject> resolve_annotation_objects_with_lookup(const AnnotationFrame& frame, const AnnotationCategories& categories, const std::vector<AnnotationObject>& objects,
+ const bool live_mode, const AnnotationProjectedSceneLookup& projected_scene_lookup) {
  std::vector<AnnotationResolvedObject> resolved_objects;
  resolved_objects.reserve(objects.size());
  for (std::size_t index = 0; index < objects.size(); ++index) {
@@ -335,8 +319,8 @@ std::vector<AnnotationResolvedObject> resolve_annotation_objects_with_lookup(con
  }
  return resolved_objects;
 }
-const AnnotationVisibleObject* lookup_projected_scene_visible_object(const AnnotationProjectedScene* projected_scene, const std::size_t object_count,
-                                                                     const std::size_t object_index, std::size_t* cursor) noexcept {
+const AnnotationVisibleObject* lookup_projected_scene_visible_object(
+ const AnnotationProjectedScene* projected_scene, const std::size_t object_count, const std::size_t object_index, std::size_t* cursor) noexcept {
  if (projected_scene == nullptr || object_index >= object_count) { return nullptr; }
  const std::size_t visible_object_count = projected_scene->visible_objects.size();
  if (visible_object_count == 0U) { return nullptr; }
@@ -371,9 +355,8 @@ const AnnotationVisibleGeometry* AnnotationProjectedSceneLookup::visible_geometr
  const AnnotationVisibleObject* visible_object = lookup_projected_scene_visible_object(projected_scene, object_count, index, &visible_geometry_cursor);
  return visible_object != nullptr ? &visible_object->geometry : nullptr;
 }
-std::vector<AnnotationResolvedObject> resolve_annotation_objects(const AnnotationFrame& frame, const AnnotationCategories& categories,
-                                                                 const std::vector<AnnotationObject>& objects, const bool live_mode,
-                                                                 const AnnotationProjectedScene* projected_scene) {
+std::vector<AnnotationResolvedObject> resolve_annotation_objects(
+ const AnnotationFrame& frame, const AnnotationCategories& categories, const std::vector<AnnotationObject>& objects, const bool live_mode, const AnnotationProjectedScene* projected_scene) {
  return resolve_annotation_objects_with_lookup(frame, categories, objects, live_mode, make_annotation_projected_scene_lookup(projected_scene, objects.size()));
 }
 }  // namespace mmltk::backend::imaging::annotation

@@ -73,8 +73,8 @@ la_ssize_t read_parallel_gzip(archive* archive_reader, void* opaque, const void*
 }
 class CachedImageWritePool {
 public:
- CachedImageWritePool(const std::size_t worker_count, const std::size_t expected_writes, std::filesystem::path output_root, CachedImageProgress progress,
-                      const std::uint64_t initially_completed, const mmltk::common::concurrency::CancellationObservation cancellation)
+ CachedImageWritePool(const std::size_t worker_count, const std::size_t expected_writes, std::filesystem::path output_root, CachedImageProgress progress, const std::uint64_t initially_completed,
+  const mmltk::common::concurrency::CancellationObservation cancellation)
      : output_root_(std::move(output_root)), progress_(std::move(progress), initially_completed, expected_writes), cancellation_(cancellation) {
   const std::size_t bounded_workers = std::min<std::size_t>(8U, worker_count);
   inline_mode_ = bounded_workers == 0U;
@@ -166,9 +166,7 @@ private:
    if (!task) { return; }
    try {
     const std::uint64_t bytes = task->encoded.size();
-    if (!has_complete_image_markers(task->encoded)) {
-     throw std::runtime_error("selected archive image " + std::to_string(task->image_id) + " is not a complete JPEG or PNG");
-    }
+    if (!has_complete_image_markers(task->encoded)) { throw std::runtime_error("selected archive image " + std::to_string(task->image_id) + " is not a complete JPEG or PNG"); }
     throw_if_benchmark_cancelled(cancellation_);
     write_cached_image_atomically(cached_image_path(output_root_, task->image_id), task->encoded, cancellation_);
     std::uint64_t completed = 0U;
@@ -235,11 +233,8 @@ private:
  const char* message = archive_error_string(reader);
  return message != nullptr ? message : "unknown libarchive error";
 }
-[[nodiscard]] std::uint64_t checked_byte_add(const std::uint64_t left, const std::uint64_t right) {
- return checked_add(left, right, "cached image byte total overflow");
-}
-[[nodiscard]] std::vector<std::uint64_t> available_image_ids(const std::span<const std::uint64_t> requested,
-                                                             const std::span<const CachedImageRejection> quarantined) {
+[[nodiscard]] std::uint64_t checked_byte_add(const std::uint64_t left, const std::uint64_t right) { return checked_add(left, right, "cached image byte total overflow"); }
+[[nodiscard]] std::vector<std::uint64_t> available_image_ids(const std::span<const std::uint64_t> requested, const std::span<const CachedImageRejection> quarantined) {
  std::vector<std::uint64_t> available;
  available.reserve(requested.size() - quarantined.size());
  std::size_t quarantine_index = 0U;
@@ -253,13 +248,10 @@ private:
  return available;
 }
 // Builds the published cache-directory record from the surviving (non-quarantined) image ids.
-[[nodiscard]] CachedImageDirectory make_cached_image_directory(const std::string& source, const std::string& shard, std::filesystem::path output_root,
-                                                               const std::string& identity, const std::span<const std::uint64_t> selected_image_ids,
-                                                               const std::uint64_t image_bytes, const bool cache_hit,
-                                                               std::vector<CachedImageRejection> quarantined) {
+[[nodiscard]] CachedImageDirectory make_cached_image_directory(const std::string& source, const std::string& shard, std::filesystem::path output_root, const std::string& identity,
+ const std::span<const std::uint64_t> selected_image_ids, const std::uint64_t image_bytes, const bool cache_hit, std::vector<CachedImageRejection> quarantined) {
  const std::vector<std::uint64_t> available = available_image_ids(selected_image_ids, quarantined);
- return CachedImageDirectory{source,      shard,     std::move(output_root), identity, cached_image_selection_digest(available), available.size(),
-                             image_bytes, cache_hit, std::move(quarantined)};
+ return CachedImageDirectory{source, shard, std::move(output_root), identity, cached_image_selection_digest(available), available.size(), image_bytes, cache_hit, std::move(quarantined)};
 }
 [[nodiscard]] std::string missing_archive_images_message(const std::span<const std::uint64_t> missing) {
  std::string message = "verified benchmark archive is missing " + std::to_string(missing.size()) + " selected images";
@@ -282,19 +274,15 @@ private:
  if (::fstatat(root_descriptor, relative.data(), &status, AT_SYMLINK_NOFOLLOW) != 0 || !S_ISREG(status.st_mode) || status.st_size <= 0) { return 0U; }
  return static_cast<std::uint64_t>(status.st_size);
 }
-void require_archive_setup(archive* reader, const int status, const char* operation, const std::filesystem::path& archive_path,
-                           const BenchmarkTraceSink& trace) {
+void require_archive_setup(archive* reader, const int status, const char* operation, const std::filesystem::path& archive_path, const BenchmarkTraceSink& trace) {
  if (status != ARCHIVE_OK && status != ARCHIVE_WARN) { throw std::runtime_error(std::string("cannot ") + operation + ": " + archive_error(reader)); }
  if (status == ARCHIVE_WARN) {
-  trace_benchmark_event(trace, "benchmark.archive.warning", [&] {
-   return nlohmann::json{{"archive", archive_path.filename().string()}, {"operation", operation}, {"error", archive_error(reader)}};
-  });
+  trace_benchmark_event(trace, "benchmark.archive.warning", [&] { return nlohmann::json{{"archive", archive_path.filename().string()}, {"operation", operation}, {"error", archive_error(reader)}}; });
  }
 }
 }  // namespace
 std::string cached_image_selection_digest(const std::span<const std::uint64_t> image_ids) {
- return mmltk::common::io::sha256_hex(
-  mmltk::common::io::sha256_bytes(std::span(reinterpret_cast<const std::uint8_t*>(image_ids.data()), image_ids.size_bytes())));
+ return mmltk::common::io::sha256_hex(mmltk::common::io::sha256_bytes(std::span(reinterpret_cast<const std::uint8_t*>(image_ids.data()), image_ids.size_bytes())));
 }
 std::filesystem::path cached_image_path(const std::filesystem::path& root, const std::uint64_t image_id) {
  std::array<char, 24> relative{};
@@ -314,13 +302,11 @@ std::size_t format_cached_image_relative_path(const std::uint64_t image_id, cons
  constexpr std::size_t kPathCharacters = 23U;
  constexpr std::size_t kRequiredBytes = kPathCharacters + 1U;
  if (output.size() < kRequiredBytes) { throw std::runtime_error("cached benchmark image path buffer is too small"); }
- const int length = std::snprintf(output.data(), output.size(), "%02llx/%016llx.jpg", static_cast<unsigned long long>(image_id & 0xFFU),
-                                  static_cast<unsigned long long>(image_id));
+ const int length = std::snprintf(output.data(), output.size(), "%02llx/%016llx.jpg", static_cast<unsigned long long>(image_id & 0xFFU), static_cast<unsigned long long>(image_id));
  if (length != static_cast<int>(kPathCharacters)) { throw std::runtime_error("cannot format cached benchmark image ID"); }
  return static_cast<std::size_t>(length);
 }
-void write_cached_image_atomically(const std::filesystem::path& path, const std::span<const std::uint8_t> encoded,
-                                   const mmltk::common::concurrency::CancellationObservation cancellation) {
+void write_cached_image_atomically(const std::filesystem::path& path, const std::span<const std::uint8_t> encoded, const mmltk::common::concurrency::CancellationObservation cancellation) {
  if (encoded.empty()) { throw std::runtime_error("cannot cache an empty benchmark image"); }
  std::string staging_text = path.string() + ".tmp.XXXXXX";
  std::vector<char> writable_path(staging_text.begin(), staging_text.end());
@@ -350,16 +336,12 @@ void invalidate_cached_image_proofs(const std::filesystem::path& root) {
  for (const auto& entry : std::filesystem::directory_iterator(proofs)) remove_cache_path(entry.path());
 }
 bool validate_cached_image_group(const std::filesystem::path& root, const std::filesystem::path& completion_path, const std::string_view identity,
-                                 const std::span<const std::uint64_t> expected_image_ids, std::uint64_t* image_bytes,
-                                 mmltk::common::concurrency::CancellationObservation cancel_requested, const BenchmarkTraceSink& trace,
-                                 std::vector<CachedImageRejection>* quarantined) {
+ const std::span<const std::uint64_t> expected_image_ids, std::uint64_t* image_bytes, mmltk::common::concurrency::CancellationObservation cancel_requested, const BenchmarkTraceSink& trace,
+ std::vector<CachedImageRejection>* quarantined) {
  try {
   if (expected_image_ids.empty() || !std::filesystem::is_regular_file(completion_path)) { return false; }
   const nlohmann::json manifest = read_json_file(completion_path);
-  if (manifest.value("schema_version", 0U) != kBenchmarkCacheSchemaVersion || !manifest.value("complete", false) ||
-      manifest.value("identity", std::string{}) != identity) {
-   return false;
-  }
+  if (manifest.value("schema_version", 0U) != kBenchmarkCacheSchemaVersion || !manifest.value("complete", false) || manifest.value("identity", std::string{}) != identity) { return false; }
   std::vector<CachedImageRejection> cached_quarantine;
   std::vector<std::uint64_t> available;
   std::span<const std::uint64_t> validated_ids = expected_image_ids;
@@ -369,9 +351,8 @@ bool validate_cached_image_group(const std::filesystem::path& root, const std::f
    if (requested_count != expected_image_ids.size() || requested_digest != cached_image_selection_digest(expected_image_ids)) { return false; }
    if (const auto records = manifest.find("quarantined"); records != manifest.end()) {
     cached_quarantine.reserve(records->size());
-    const bool parsed = parse_quarantined_manifest_records(*records, expected_image_ids, [&](const std::uint64_t image_id, std::string reason) {
-     cached_quarantine.push_back(CachedImageRejection{image_id, std::move(reason)});
-    });
+    const bool parsed = parse_quarantined_manifest_records(
+     *records, expected_image_ids, [&](const std::uint64_t image_id, std::string reason) { cached_quarantine.push_back(CachedImageRejection{image_id, std::move(reason)}); });
     if (!parsed) { return false; }
     std::ranges::sort(cached_quarantine, {}, &CachedImageRejection::image_id);
     if (std::ranges::adjacent_find(cached_quarantine, {}, &CachedImageRejection::image_id) != cached_quarantine.end()) { return false; }
@@ -379,19 +360,15 @@ bool validate_cached_image_group(const std::filesystem::path& root, const std::f
    available = available_image_ids(expected_image_ids, cached_quarantine);
    validated_ids = available;
   }
-  if (manifest.value("image_count", 0ULL) != validated_ids.size() ||
-      manifest.value("selection_sha256", std::string{}) != cached_image_selection_digest(validated_ids)) {
-   return false;
-  }
+  if (manifest.value("image_count", 0ULL) != validated_ids.size() || manifest.value("selection_sha256", std::string{}) != cached_image_selection_digest(validated_ids)) { return false; }
   if (!std::filesystem::is_directory(root)) { return false; }
   throw_if_benchmark_cancelled(cancel_requested);
   const std::uint64_t total_bytes = manifest.value("image_bytes", std::uint64_t{0U});
   if (total_bytes == 0U) { return false; }
   if (image_bytes != nullptr) { *image_bytes = total_bytes; }
   if (quarantined != nullptr) { *quarantined = std::move(cached_quarantine); }
-  trace_benchmark_event(trace, "benchmark.images.cache_hit", [&] {
-   return nlohmann::json{{"identity", identity}, {"images", validated_ids.size()}, {"quarantined", quarantined != nullptr ? quarantined->size() : 0U}};
-  });
+  trace_benchmark_event(
+   trace, "benchmark.images.cache_hit", [&] { return nlohmann::json{{"identity", identity}, {"images", validated_ids.size()}, {"quarantined", quarantined != nullptr ? quarantined->size() : 0U}}; });
   return true;
  } catch (const std::exception&) {
   throw_if_benchmark_cancelled(cancel_requested);
@@ -399,18 +376,13 @@ bool validate_cached_image_group(const std::filesystem::path& root, const std::f
  }
 }
 void complete_cached_image_group(const std::filesystem::path& root, const std::filesystem::path& completion_path, const std::string_view identity,
-                                 const std::span<const std::uint64_t> expected_image_ids, const std::uint64_t image_bytes,
-                                 const mmltk::common::concurrency::CancellationObservation cancellation, const BenchmarkTraceSink& trace,
-                                 const std::span<const CachedImageRejection> quarantined) {
+ const std::span<const std::uint64_t> expected_image_ids, const std::uint64_t image_bytes, const mmltk::common::concurrency::CancellationObservation cancellation, const BenchmarkTraceSink& trace,
+ const std::span<const CachedImageRejection> quarantined) {
  const std::vector<std::uint64_t> available = available_image_ids(expected_image_ids, quarantined);
  nlohmann::json quarantined_records = nlohmann::json::array();
  for (const CachedImageRejection& image : quarantined) { quarantined_records.push_back({{"image_id", image.image_id}, {"reason", image.reason}}); }
- nlohmann::json manifest{{"schema_version", kBenchmarkCacheSchemaVersion},
-                         {"complete", true},
-                         {"identity", identity},
-                         {"image_count", available.size()},
-                         {"image_bytes", image_bytes},
-                         {"selection_sha256", cached_image_selection_digest(available)}};
+ nlohmann::json manifest{{"schema_version", kBenchmarkCacheSchemaVersion}, {"complete", true}, {"identity", identity}, {"image_count", available.size()}, {"image_bytes", image_bytes},
+  {"selection_sha256", cached_image_selection_digest(available)}};
  if (!quarantined.empty()) {
   manifest["requested_image_count"] = expected_image_ids.size();
   manifest["requested_selection_sha256"] = cached_image_selection_digest(expected_image_ids);
@@ -418,9 +390,8 @@ void complete_cached_image_group(const std::filesystem::path& root, const std::f
  }
  throw_if_benchmark_cancelled(cancellation);
  write_json_atomically(completion_path, manifest, cancellation);
- trace_benchmark_event(trace, "benchmark.images.complete", [&] {
-  return nlohmann::json{{"root", root.string()}, {"identity", identity}, {"images", available.size()}, {"quarantined", quarantined.size()}};
- });
+ trace_benchmark_event(
+  trace, "benchmark.images.complete", [&] { return nlohmann::json{{"root", root.string()}, {"identity", identity}, {"images", available.size()}, {"quarantined", quarantined.size()}}; });
 }
 CachedImageDirectory extract_selected_archive_images(ArchiveExtractionRequest request) {
  if (request.selected_image_ids.empty() || !request.image_id_parser || request.source.empty() || request.shard.empty() || request.source_identity.empty()) {
@@ -434,11 +405,10 @@ CachedImageDirectory extract_selected_archive_images(ArchiveExtractionRequest re
  const std::string& identity = request.source_identity;
  std::uint64_t image_bytes = 0U;
  std::vector<CachedImageRejection> quarantined;
- if (validate_cached_image_group(request.output_root, completion, identity, request.selected_image_ids, &image_bytes, request.cancel_requested, request.trace,
-                                 request.quarantine_unavailable ? &quarantined : nullptr)) {
+ if (validate_cached_image_group(
+      request.output_root, completion, identity, request.selected_image_ids, &image_bytes, request.cancel_requested, request.trace, request.quarantine_unavailable ? &quarantined : nullptr)) {
   if (request.progress) { request.progress(request.selected_image_ids.size(), request.selected_image_ids.size()); }
-  return make_cached_image_directory(request.source, request.shard, std::move(request.output_root), identity, request.selected_image_ids, image_bytes, true,
-                                     std::move(quarantined));
+  return make_cached_image_directory(request.source, request.shard, std::move(request.output_root), identity, request.selected_image_ids, image_bytes, true, std::move(quarantined));
  }
  const std::unordered_set<std::uint64_t> selected(request.selected_image_ids.begin(), request.selected_image_ids.end());
  std::unordered_set<std::uint64_t> completed;
@@ -455,11 +425,8 @@ CachedImageDirectory extract_selected_archive_images(ArchiveExtractionRequest re
   throw_if_benchmark_cancelled(request.cancel_requested);
   if (request.trace && inspected != 0U && inspected % 128U == 0U) {
    trace_benchmark_event(request.trace, "benchmark.images.cache_scan", [&] {
-    return nlohmann::json{{"source", request.source},
-                          {"shard", request.shard},
-                          {"inspected_images", inspected},
-                          {"reused_images", completed.size()},
-                          {"total_images", request.selected_image_ids.size()}};
+    return nlohmann::json{
+     {"source", request.source}, {"shard", request.shard}, {"inspected_images", inspected}, {"reused_images", completed.size()}, {"total_images", request.selected_image_ids.size()}};
    });
   }
   if (request.trace) { ++inspected; }
@@ -485,20 +452,14 @@ CachedImageDirectory extract_selected_archive_images(ArchiveExtractionRequest re
   }
  }
  if (request.progress) { request.progress(completed.size(), selected.size()); }
- trace_benchmark_event(request.trace, "benchmark.images.cache_reuse", [&] {
-  return nlohmann::json{{"source", request.source},
-                        {"shard", request.shard},
-                        {"inspected_images", selected.size()},
-                        {"reused_images", completed.size()},
-                        {"reused_bytes", image_bytes}};
- });
+ trace_benchmark_event(request.trace, "benchmark.images.cache_reuse",
+  [&] { return nlohmann::json{{"source", request.source}, {"shard", request.shard}, {"inspected_images", selected.size()}, {"reused_images", completed.size()}, {"reused_bytes", image_bytes}}; });
  const std::size_t pending_writes = selected.size() - completed.size() - unavailable.size();
  if (request.activity) {
-  request.activity(request.cache_write_workers == 0U ? "Preparing inline selected-image cache writes"
-                                                     : "Preparing bounded cache-write queue with " + std::to_string(request.cache_write_workers) + " workers");
+  request.activity(
+   request.cache_write_workers == 0U ? "Preparing inline selected-image cache writes" : "Preparing bounded cache-write queue with " + std::to_string(request.cache_write_workers) + " workers");
  }
- CachedImageWritePool write_pool(request.cache_write_workers, pending_writes, request.output_root, request.progress, completed.size(),
-                                 request.cancel_requested);
+ CachedImageWritePool write_pool(request.cache_write_workers, pending_writes, request.output_root, request.progress, completed.size(), request.cancel_requested);
  std::unordered_set<std::uint64_t> scheduled;
  scheduled.reserve(pending_writes);
  ArchiveReader reader(archive_read_new());
@@ -509,15 +470,13 @@ CachedImageDirectory extract_selected_archive_images(ArchiveExtractionRequest re
   parallel_gzip = std::make_unique<ParallelGzipStream>(request.archive_path, request.decompression_workers);
   require_archive_setup(reader.get(), archive_read_support_filter_none(reader.get()), "disable archive filters", request.archive_path, request.trace);
   require_archive_setup(reader.get(), archive_read_support_format_tar(reader.get()), "enable tar archive support", request.archive_path, request.trace);
-  require_archive_setup(reader.get(), archive_read_open(reader.get(), parallel_gzip.get(), nullptr, read_parallel_gzip, nullptr), "open parallel gzip archive",
-                        request.archive_path, request.trace);
+  require_archive_setup(reader.get(), archive_read_open(reader.get(), parallel_gzip.get(), nullptr, read_parallel_gzip, nullptr), "open parallel gzip archive", request.archive_path, request.trace);
  } else {
   if (request.activity) { request.activity("Scanning archive and extracting selected images"); }
   require_archive_setup(reader.get(), archive_read_support_filter_all(reader.get()), "enable archive filters", request.archive_path, request.trace);
   require_archive_setup(reader.get(), archive_read_support_format_tar(reader.get()), "enable tar archive support", request.archive_path, request.trace);
   require_archive_setup(reader.get(), archive_read_support_format_zip(reader.get()), "enable zip archive support", request.archive_path, request.trace);
-  require_archive_setup(reader.get(), archive_read_open_filename(reader.get(), request.archive_path.c_str(), kArchiveBlockBytes), "open benchmark archive",
-                        request.archive_path, request.trace);
+  require_archive_setup(reader.get(), archive_read_open_filename(reader.get(), request.archive_path.c_str(), kArchiveBlockBytes), "open benchmark archive", request.archive_path, request.trace);
  }
  if (request.activity) { request.activity("Scanning archive headers for selected images"); }
  bool extraction_announced = false;
@@ -531,11 +490,7 @@ CachedImageDirectory extract_selected_archive_images(ArchiveExtractionRequest re
   if (status != ARCHIVE_OK && status != ARCHIVE_WARN) { throw std::runtime_error("cannot read benchmark archive header: " + archive_error(reader.get())); }
   if (request.trace && (++inspected_headers % 1024U == 0U)) {
    trace_benchmark_event(request.trace, "benchmark.archive.scan", [&] {
-    return nlohmann::json{{"source", request.source},
-                          {"shard", request.shard},
-                          {"inspected_headers", inspected_headers},
-                          {"scheduled_images", scheduled.size()},
-                          {"reused_images", completed.size()}};
+    return nlohmann::json{{"source", request.source}, {"shard", request.shard}, {"inspected_headers", inspected_headers}, {"scheduled_images", scheduled.size()}, {"reused_images", completed.size()}};
    });
   }
   const char* pathname = archive_entry_pathname(entry);
@@ -547,9 +502,7 @@ CachedImageDirectory extract_selected_archive_images(ArchiveExtractionRequest re
    continue;
   }
   const la_int64_t entry_size = archive_entry_size(entry);
-  if (entry_size <= 0 || static_cast<std::uint64_t>(entry_size) > kMaximumArchiveImageBytes) {
-   throw std::runtime_error("selected benchmark archive image has an invalid size");
-  }
+  if (entry_size <= 0 || static_cast<std::uint64_t>(entry_size) > kMaximumArchiveImageBytes) { throw std::runtime_error("selected benchmark archive image has an invalid size"); }
   if (!extraction_announced && request.activity) {
    request.activity("Extracting selected image payloads into the cache-write queue");
    extraction_announced = true;
@@ -558,9 +511,7 @@ CachedImageDirectory extract_selected_archive_images(ArchiveExtractionRequest re
   std::size_t offset = 0U;
   while (offset < encoded.size()) {
    la_ssize_t count = ARCHIVE_RETRY;
-   for (int retry = 0; retry < 3 && count == ARCHIVE_RETRY; ++retry) {
-    count = archive_read_data(reader.get(), encoded.data() + offset, encoded.size() - offset);
-   }
+   for (int retry = 0; retry < 3 && count == ARCHIVE_RETRY; ++retry) { count = archive_read_data(reader.get(), encoded.data() + offset, encoded.size() - offset); }
    if (count <= 0) { throw std::runtime_error("cannot read selected benchmark archive image"); }
    offset += checked_cast<std::size_t>(count, "benchmark archive read size overflow");
   }
@@ -568,10 +519,8 @@ CachedImageDirectory extract_selected_archive_images(ArchiveExtractionRequest re
    try {
     request.validator(*image_id, encoded);
    } catch (const std::exception& error) {
-    trace_benchmark_event(request.trace, "benchmark.images.validation_failed", [&] {
-     return nlohmann::json{{"source", request.source}, {"shard", request.shard},  {"member", pathname},
-                           {"image_id", *image_id},    {"bytes", encoded.size()}, {"reason", error.what()}};
-    });
+    trace_benchmark_event(request.trace, "benchmark.images.validation_failed",
+     [&] { return nlohmann::json{{"source", request.source}, {"shard", request.shard}, {"member", pathname}, {"image_id", *image_id}, {"bytes", encoded.size()}, {"reason", error.what()}}; });
     if (!request.quarantine_unavailable) { throw; }
     quarantined.push_back(CachedImageRejection{*image_id, error.what()});
     unavailable.emplace(*image_id);
@@ -599,9 +548,7 @@ CachedImageDirectory extract_selected_archive_images(ArchiveExtractionRequest re
    if (!completed.contains(image_id) && !unavailable.contains(image_id)) { missing.push_back(image_id); }
   }
   if (!request.quarantine_unavailable) { throw std::runtime_error(missing_archive_images_message(missing)); }
-  for (const std::uint64_t image_id : missing) {
-   quarantined.push_back(CachedImageRejection{image_id, "verified official archive does not contain selected image"});
-  }
+  for (const std::uint64_t image_id : missing) { quarantined.push_back(CachedImageRejection{image_id, "verified official archive does not contain selected image"}); }
   if (request.progress) { request.progress(selected.size(), selected.size()); }
  }
  std::ranges::sort(quarantined, {}, &CachedImageRejection::image_id);
@@ -613,9 +560,7 @@ CachedImageDirectory extract_selected_archive_images(ArchiveExtractionRequest re
    request.activity("Quarantined " + std::to_string(quarantined.size()) + " unavailable training images; publishing cache status");
   }
  }
- complete_cached_image_group(request.output_root, completion, identity, request.selected_image_ids, image_bytes, request.cancel_requested, request.trace,
-                             quarantined);
- return make_cached_image_directory(request.source, request.shard, std::move(request.output_root), identity, request.selected_image_ids, image_bytes, false,
-                                    std::move(quarantined));
+ complete_cached_image_group(request.output_root, completion, identity, request.selected_image_ids, image_bytes, request.cancel_requested, request.trace, quarantined);
+ return make_cached_image_directory(request.source, request.shard, std::move(request.output_root), identity, request.selected_image_ids, image_bytes, false, std::move(quarantined));
 }
 }  // namespace mmltk::backend::data::benchmark_internal

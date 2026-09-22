@@ -22,11 +22,9 @@
 namespace mmltk::backend::models::rfdetr {
 bool muon_parameter_eligible(const std::string_view name, const torch::Tensor& parameter) {
  if ((parameter.dim() != 2 && parameter.dim() != 4) || name.find(".weight") == std::string_view::npos) { return false; }
- if (name.find("embeddings") != std::string_view::npos || name.find("position_embeddings") != std::string_view::npos ||
-     name.find("cls_token") != std::string_view::npos || name.find("mask_token") != std::string_view::npos ||
-     name.find("query_feat") != std::string_view::npos || name.find("refpoint_embed") != std::string_view::npos ||
-     name.find("class_embed") != std::string_view::npos || name.find("bbox_embed") != std::string_view::npos ||
-     name.find("segmentation_head") != std::string_view::npos) {
+ if (name.find("embeddings") != std::string_view::npos || name.find("position_embeddings") != std::string_view::npos || name.find("cls_token") != std::string_view::npos ||
+     name.find("mask_token") != std::string_view::npos || name.find("query_feat") != std::string_view::npos || name.find("refpoint_embed") != std::string_view::npos ||
+     name.find("class_embed") != std::string_view::npos || name.find("bbox_embed") != std::string_view::npos || name.find("segmentation_head") != std::string_view::npos) {
   return false;
  }
  return true;
@@ -47,9 +45,7 @@ constexpr int64_t kMuonNsSteps = 5;
 constexpr double kAuxAdamBeta1 = 0.9;
 constexpr double kAuxAdamBeta2 = 0.95;
 constexpr double kAuxAdamEps = 1.0e-10;
-bool finite_equal(const double value, const double expected, const double tolerance = 1.0e-12) {
- return std::isfinite(value) && std::abs(value - expected) <= tolerance;
-}
+bool finite_equal(const double value, const double expected, const double tolerance = 1.0e-12) { return std::isfinite(value) && std::abs(value - expected) <= tolerance; }
 NativeOptimizerBackend parse_backend_name(const std::string& name) {
  if (name == "eager") { return NativeOptimizerBackend::eager; }
  if (name == "foreach") { return NativeOptimizerBackend::foreach; }
@@ -62,8 +58,7 @@ torch::Tensor align_tensor_like_param(const torch::Tensor& source, const torch::
  return aligned;
 }
 void ensure_aligned(torch::Tensor& t, const torch::Tensor& param) {
- if (!t.defined() || t.sizes() != param.sizes() || t.device() != param.device() || t.scalar_type() != param.scalar_type() || t.layout() != param.layout() ||
-     t.strides() != param.strides()) {
+ if (!t.defined() || t.sizes() != param.sizes() || t.device() != param.device() || t.scalar_type() != param.scalar_type() || t.layout() != param.layout() || t.strides() != param.strides()) {
   t = align_tensor_like_param(t, param);
  }
 }
@@ -109,8 +104,7 @@ void validate_group_indices(const Group& group, const size_t param_count, const 
  }
 }
 template <typename NamedParameterCollection>
-void populate_named_parameter_views(const NamedParameterCollection& params, std::vector<torch::Tensor>& all_params, std::vector<std::string>& all_param_names,
-                                    const char* undefined_param_message) {
+void populate_named_parameter_views(const NamedParameterCollection& params, std::vector<torch::Tensor>& all_params, std::vector<std::string>& all_param_names, const char* undefined_param_message) {
  all_params.reserve(params.size());
  all_param_names.reserve(params.size());
  for (const auto& param : params) {
@@ -127,13 +121,10 @@ void write_archive_layout_counts(torch::serialize::OutputArchive& archive, const
  mmltk::backend::ml::serialization::write_int(archive, "group_count", static_cast<int64_t>(group_count));
  mmltk::backend::ml::serialization::write_int(archive, "param_count", static_cast<int64_t>(param_count));
 }
-void validate_archive_layout_counts(torch::serialize::InputArchive& archive, const size_t expected_group_count, const size_t expected_param_count,
-                                    const char* mismatch_message) {
+void validate_archive_layout_counts(torch::serialize::InputArchive& archive, const size_t expected_group_count, const size_t expected_param_count, const char* mismatch_message) {
  const auto group_count = mmltk::backend::ml::serialization::require_int(archive, "group_count");
  const auto param_count = mmltk::backend::ml::serialization::require_int(archive, "param_count");
- if (group_count != static_cast<int64_t>(expected_group_count) || param_count != static_cast<int64_t>(expected_param_count)) {
-  throw std::runtime_error(mismatch_message);
- }
+ if (group_count != static_cast<int64_t>(expected_group_count) || param_count != static_cast<int64_t>(expected_param_count)) { throw std::runtime_error(mismatch_message); }
 }
 template <typename WriteEntryFn>
 void write_indexed_optimizer_archive(torch::serialize::OutputArchive& archive, const char* entry_name, const size_t entry_count, WriteEntryFn&& write_entry) {
@@ -151,26 +142,21 @@ void read_indexed_optimizer_archive(torch::serialize::InputArchive& archive, con
   read_entry(index, entry_archive);
  }
 }
-void write_named_parameter_archive(torch::serialize::OutputArchive& archive, const std::string& name) {
- mmltk::backend::ml::serialization::write_string(archive, "name", name);
-}
+void write_named_parameter_archive(torch::serialize::OutputArchive& archive, const std::string& name) { mmltk::backend::ml::serialization::write_string(archive, "name", name); }
 void validate_named_parameter_archive(torch::serialize::InputArchive& archive, const std::string& expected_name, const char* mismatch_message) {
  if (mmltk::backend::ml::serialization::require_string(archive, "name") != expected_name) { throw std::runtime_error(mismatch_message); }
 }
-torch::Tensor require_parameter_state_tensor(torch::serialize::InputArchive& archive, const char* entry_name, const torch::Tensor& param,
-                                             const char* shape_mismatch_message, bool materialize) {
+torch::Tensor require_parameter_state_tensor(torch::serialize::InputArchive& archive, const char* entry_name, const torch::Tensor& param, const char* shape_mismatch_message, bool materialize) {
  auto state_tensor = mmltk::backend::ml::serialization::require_tensor(archive, entry_name);
- if (state_tensor.sizes() != param.sizes() || !state_tensor.device().is_cpu() || !state_tensor.is_floating_point() ||
-     state_tensor.scalar_type() != param.scalar_type() || state_tensor.layout() != param.layout() || !torch::isfinite(state_tensor).all().item<bool>()) {
+ if (state_tensor.sizes() != param.sizes() || !state_tensor.device().is_cpu() || !state_tensor.is_floating_point() || state_tensor.scalar_type() != param.scalar_type() ||
+     state_tensor.layout() != param.layout() || !torch::isfinite(state_tensor).all().item<bool>()) {
   throw std::runtime_error(shape_mismatch_message);
  }
  return materialize ? align_tensor_like_param(state_tensor, param) : state_tensor;
 }
-torch::Tensor require_adam_step_tensor(torch::serialize::InputArchive& archive, const torch::Tensor& param, const NativeOptimizerBackend backend,
-                                       bool materialize) {
+torch::Tensor require_adam_step_tensor(torch::serialize::InputArchive& archive, const torch::Tensor& param, const NativeOptimizerBackend backend, bool materialize) {
  auto step = mmltk::backend::ml::serialization::require_tensor(archive, "step");
- if (!step.defined() || !step.device().is_cpu() || step.dim() != 0 || step.scalar_type() != torch::kFloat32 || !torch::isfinite(step).item<bool>() ||
-     step.item<float>() < 0.0F) {
+ if (!step.defined() || !step.device().is_cpu() || step.dim() != 0 || step.scalar_type() != torch::kFloat32 || !torch::isfinite(step).item<bool>() || step.item<float>() < 0.0F) {
   throw std::runtime_error("native AdamW archive step does not match the current optimizer");
  }
  return materialize ? step.to(step_device_for_backend(param, backend), torch::kFloat32, false, true).contiguous() : step;
@@ -179,8 +165,7 @@ template <typename ParamIndexCollection>
 void write_group_param_indices(torch::serialize::OutputArchive& archive, const ParamIndexCollection& param_indices) {
  mmltk::backend::ml::serialization::write_int(archive, "param_index_count", static_cast<int64_t>(param_indices.size()));
  for (size_t param_index = 0; param_index < param_indices.size(); ++param_index) {
-  mmltk::backend::ml::serialization::write_int(archive, mmltk::backend::ml::serialization::archive_entry_name("param_index", param_index).c_str(),
-                                               static_cast<int64_t>(param_indices[param_index]));
+  mmltk::backend::ml::serialization::write_int(archive, mmltk::backend::ml::serialization::archive_entry_name("param_index", param_index).c_str(), static_cast<int64_t>(param_indices[param_index]));
  }
 }
 template <typename GroupConfig>
@@ -190,26 +175,23 @@ void write_group_lr_weight_decay(torch::serialize::OutputArchive& archive, const
 }
 // Every native optimizer stamps its archive with the same format tag and version, so one reader
 // rejects legacy and future archives for all of them. `label` names the optimizer in both failures.
-void validate_optimizer_archive_format(torch::serialize::InputArchive& archive, const char* expected_format, const int64_t expected_version,
-                                       const std::string_view label) {
+void validate_optimizer_archive_format(torch::serialize::InputArchive& archive, const char* expected_format, const int64_t expected_version, const std::string_view label) {
  c10::IValue format_value;
  if (!archive.try_read("format", format_value) || !format_value.isString() || format_value.toStringRef() != expected_format) {
   throw std::runtime_error(
    std::format("native RF-DETR resume checkpoint uses a legacy {} archive; rebuild the "
                "checkpoint with the current mmltk",
-               label));
+    label));
  }
  const auto version = mmltk::backend::ml::serialization::require_int(archive, "format_version");
  if (version != expected_version) { throw std::runtime_error(std::format("unsupported native {} archive version: {}", label, version)); }
 }
 template <typename ParamIndexCollection>
-void validate_group_param_indices(torch::serialize::InputArchive& archive, const ParamIndexCollection& param_indices, const char* size_mismatch_message,
-                                  const char* order_mismatch_message) {
+void validate_group_param_indices(torch::serialize::InputArchive& archive, const ParamIndexCollection& param_indices, const char* size_mismatch_message, const char* order_mismatch_message) {
  const auto param_index_count = mmltk::backend::ml::serialization::require_int(archive, "param_index_count");
  if (param_index_count != static_cast<int64_t>(param_indices.size())) { throw std::runtime_error(size_mismatch_message); }
  for (size_t param_index = 0; param_index < param_indices.size(); ++param_index) {
-  const auto stored_param_index =
-   mmltk::backend::ml::serialization::require_int(archive, mmltk::backend::ml::serialization::archive_entry_name("param_index", param_index).c_str());
+  const auto stored_param_index = mmltk::backend::ml::serialization::require_int(archive, mmltk::backend::ml::serialization::archive_entry_name("param_index", param_index).c_str());
   if (stored_param_index != static_cast<int64_t>(param_indices[param_index])) { throw std::runtime_error(order_mismatch_message); }
  }
 }
@@ -217,8 +199,8 @@ void validate_group_param_indices(torch::serialize::InputArchive& archive, const
 // decay, whatever optimizer-specific fields `read_config` claims, and the parameter index roster.
 // The mirror of write_group_lr_weight_decay plus write_group_param_indices on the save path.
 template <typename GroupCollection, typename ReadConfigFn>
-void read_optimizer_group_archives(torch::serialize::InputArchive& archive, GroupCollection& groups, const char* size_mismatch_message,
-                                   const char* order_mismatch_message, ReadConfigFn&& read_config) {
+void read_optimizer_group_archives(
+ torch::serialize::InputArchive& archive, GroupCollection& groups, const char* size_mismatch_message, const char* order_mismatch_message, ReadConfigFn&& read_config) {
  read_indexed_optimizer_archive(archive, "group", groups.size(), [&](const size_t index, auto& group_archive) {
   auto& group = groups[index];
   group.config.lr = mmltk::backend::ml::serialization::require_double(group_archive, "lr");
@@ -245,8 +227,7 @@ std::vector<bool> collect_muon_param_flags(const GroupCollection& groups, const 
 // Shared state-initialization skeleton for the native optimizers: size the per-parameter state to
 // the parameter list, resolve the per-parameter group flag once, then let the caller fill each slot.
 template <typename States, typename NamedParameters, typename GroupCollection, typename FlagAccessor, typename StateInitializer>
-void initialize_param_states(States& states, const NamedParameters& params, const GroupCollection& groups, FlagAccessor&& flag_accessor,
-                             StateInitializer&& state_initializer) {
+void initialize_param_states(States& states, const NamedParameters& params, const GroupCollection& groups, FlagAccessor&& flag_accessor, StateInitializer&& state_initializer) {
  states.clear();
  states.resize(params.size());
  const std::vector<bool> flags = collect_group_param_flags(groups, params.size(), std::forward<FlagAccessor>(flag_accessor));
@@ -276,8 +257,8 @@ void validate_adamw_param_for_backend(const torch::Tensor& param, const torch::T
  }
  if (torch::is_complex(param)) { throw std::runtime_error("native AdamW does not support complex parameters"); }
 }
-void align_adamw_state_tensors(torch::Tensor& step, torch::Tensor& exp_avg, torch::Tensor& exp_avg_sq, torch::Tensor& max_exp_avg_sq, torch::Tensor& grad,
-                               const torch::Tensor& param, const NativeOptimizerBackend backend, const bool amsgrad) {
+void align_adamw_state_tensors(torch::Tensor& step, torch::Tensor& exp_avg, torch::Tensor& exp_avg_sq, torch::Tensor& max_exp_avg_sq, torch::Tensor& grad, const torch::Tensor& param,
+ const NativeOptimizerBackend backend, const bool amsgrad) {
  const auto step_device = step_device_for_backend(param, backend);
  if (!step.defined() || step.device() != step_device) { step = step.to(step_device, torch::kFloat32).contiguous(); }
  if (step.scalar_type() != torch::kFloat32) { step = step.to(step_device, torch::kFloat32).contiguous(); }
@@ -286,9 +267,8 @@ void align_adamw_state_tensors(torch::Tensor& step, torch::Tensor& exp_avg, torc
  ensure_aligned(grad, param);
  if (amsgrad) { ensure_aligned(max_exp_avg_sq, param); }
 }
-void collect_adamw_batch(std::map<std::pair<int, int>, AdamWBatch>& batches, const torch::Tensor& param, const torch::Tensor& grad,
-                         const torch::Tensor& exp_avg, const torch::Tensor& exp_avg_sq, const torch::Tensor& max_exp_avg_sq, const torch::Tensor& step,
-                         const bool amsgrad) {
+void collect_adamw_batch(std::map<std::pair<int, int>, AdamWBatch>& batches, const torch::Tensor& param, const torch::Tensor& grad, const torch::Tensor& exp_avg, const torch::Tensor& exp_avg_sq,
+ const torch::Tensor& max_exp_avg_sq, const torch::Tensor& step, const bool amsgrad) {
  const auto device_index = static_cast<int>(param.device().index());
  const auto key = std::make_pair(device_index, static_cast<int>(param.scalar_type()));
  auto& batch = batches[key];
@@ -338,8 +318,8 @@ void apply_foreach_adamw_batch(AdamWBatch& batch, const NativeAdamWGroupConfig& 
 }
 void apply_fused_adamw_batch(AdamWBatch& batch, const NativeAdamWGroupConfig& config) {
  torch::_foreach_add_(batch.steps, 1.0);
- at::_fused_adamw_(batch.params, batch.grads, batch.exp_avgs, batch.exp_avg_sqs, batch.max_exp_avg_sqs, batch.steps, config.lr, kAdamBeta1, kAdamBeta2,
-                   config.weight_decay, kAdamEps, config.amsgrad, false, std::nullopt, std::nullopt);
+ at::_fused_adamw_(batch.params, batch.grads, batch.exp_avgs, batch.exp_avg_sqs, batch.max_exp_avg_sqs, batch.steps, config.lr, kAdamBeta1, kAdamBeta2, config.weight_decay, kAdamEps, config.amsgrad,
+  false, std::nullopt, std::nullopt);
 }
 template <typename Params, typename States, typename Group>
 void step_adamw_group_batched(Params& params, States& states, const Group& group, const NativeOptimizerBackend backend) {
@@ -373,20 +353,17 @@ torch::Tensor adam_update(const torch::Tensor& grad, torch::Tensor& exp_avg, tor
 // Reconstruct only the saved CPU layout, then reuse the optimizer's complete
 // continuation parser. No model construction, zero-state allocation, or CUDA.
 template <class Groups, class Parameters>
-void read_inspection_layout(torch::serialize::InputArchive& archive, const std::unordered_map<std::string, torch::Tensor>& tensors, Groups& groups,
-                            Parameters& parameters, std::stop_token stop) {
+void read_inspection_layout(torch::serialize::InputArchive& archive, const std::unordered_map<std::string, torch::Tensor>& tensors, Groups& groups, Parameters& parameters, std::stop_token stop) {
  const auto count = mmltk::backend::ml::serialization::require_int(archive, "param_count");
  const auto group_count = mmltk::backend::ml::serialization::require_int(archive, "group_count");
- if (count <= 0 || static_cast<std::uint64_t>(count) > tensors.size() || group_count <= 0 || group_count > count)
-  throw std::runtime_error("invalid optimizer inspection inventory");
+ if (count <= 0 || static_cast<std::uint64_t>(count) > tensors.size() || group_count <= 0 || group_count > count) throw std::runtime_error("invalid optimizer inspection inventory");
  std::unordered_set<std::string> names;
  parameters.reserve(static_cast<std::size_t>(count));
  read_indexed_optimizer_archive(archive, "param", static_cast<std::size_t>(count), [&](auto, auto& parameter) {
   if (stop.stop_requested()) throw ArtifactPublicationCancelled{};
   const auto name = mmltk::backend::ml::serialization::require_string(parameter, "name");
   const auto found = tensors.find(name);
-  if (found == tensors.end() || !names.insert(name).second || !found->second.is_cpu())
-   throw std::runtime_error("optimizer parameter has no unique CPU model tensor");
+  if (found == tensors.end() || !names.insert(name).second || !found->second.is_cpu()) throw std::runtime_error("optimizer parameter has no unique CPU model tensor");
   parameters.push_back({name, found->second});
  });
  groups.resize(static_cast<std::size_t>(group_count));
@@ -399,10 +376,8 @@ void read_inspection_layout(torch::serialize::InputArchive& archive, const std::
   indices.reserve(static_cast<std::size_t>(members));
   for (int64_t ordinal = 0; ordinal < members; ++ordinal) {
    if (stop.stop_requested()) throw ArtifactPublicationCancelled{};
-   const auto value =
-    mmltk::backend::ml::serialization::require_int(group, mmltk::backend::ml::serialization::archive_entry_name("param_index", ordinal).c_str());
-   if (value < 0 || value >= count || assigned[static_cast<std::size_t>(value)])
-    throw std::runtime_error("optimizer groups do not partition the parameter inventory");
+   const auto value = mmltk::backend::ml::serialization::require_int(group, mmltk::backend::ml::serialization::archive_entry_name("param_index", ordinal).c_str());
+   if (value < 0 || value >= count || assigned[static_cast<std::size_t>(value)]) throw std::runtime_error("optimizer groups do not partition the parameter inventory");
    assigned[static_cast<std::size_t>(value)] = true;
    indices.push_back(static_cast<std::size_t>(value));
   }
@@ -412,9 +387,8 @@ void read_inspection_layout(torch::serialize::InputArchive& archive, const std::
 }  // namespace
 template <typename GroupConfig, typename ParamStateT>
 template <class Optimizer>
-std::vector<std::string> NativeOptimizerStorage<GroupConfig, ParamStateT>::inspect_checkpoint(torch::serialize::InputArchive& archive,
-                                                                                              const std::unordered_map<std::string, torch::Tensor>& tensors,
-                                                                                              std::stop_token stop) {
+std::vector<std::string> NativeOptimizerStorage<GroupConfig, ParamStateT>::inspect_checkpoint(
+ torch::serialize::InputArchive& archive, const std::unordered_map<std::string, torch::Tensor>& tensors, std::stop_token stop) {
  Optimizer candidate;
  read_inspection_layout(archive, tensors, candidate.groups_, candidate.params_, stop);
  populate_named_parameter_views(candidate.params_, candidate.all_params_, candidate.all_param_names_, "invalid CPU checkpoint tensor");
@@ -468,9 +442,7 @@ void NativeAdamW::initialize_state() {
   });
 }
 void NativeAdamW::zero_grad(const bool set_to_none) { zero_grad_parameters(all_params_, set_to_none); }
-void NativeAdamW::set_lrs(const std::vector<double>& base_lrs, const double scale) {
- set_scaled_group_lrs(groups_, base_lrs, scale, "native AdamW base LR count does not match param group count");
-}
+void NativeAdamW::set_lrs(const std::vector<double>& base_lrs, const double scale) { set_scaled_group_lrs(groups_, base_lrs, scale, "native AdamW base LR count does not match param group count"); }
 void NativeAdamW::step() {
  torch::NoGradGuard no_grad;
  for (const auto& group : groups_) {
@@ -507,8 +479,7 @@ void NativeAdamW::step_group_eager(const Group& group) {
 void NativeAdamW::step_group_foreach(const Group& group) { step_adamw_group_batched(params_, state_, group, NativeOptimizerBackend::foreach); }
 void NativeAdamW::step_group_fused(const Group& group) { step_adamw_group_batched(params_, state_, group, NativeOptimizerBackend::fused); }
 template <typename GroupConfig, typename ParamStateT>
-void NativeOptimizerStorage<GroupConfig, ParamStateT>::reserve_checkpoint(mmltk::backend::ml::cuda::TensorReadbackBuffers& readback,
-                                                                          std::size_t first_slot) const {
+void NativeOptimizerStorage<GroupConfig, ParamStateT>::reserve_checkpoint(mmltk::backend::ml::cuda::TensorReadbackBuffers& readback, std::size_t first_slot) const {
  std::vector<torch::Tensor> tensors;
  for (const auto& state : state_) {
   template for (constexpr auto member : std::define_static_array(std::meta::nonstatic_data_members_of(^^ParamStateT, std::meta::access_context::current()))) {
@@ -523,8 +494,7 @@ template class NativeOptimizerStorage<NativeAdamWGroupConfig, NativeAdamWParamSt
 template class NativeOptimizerStorage<NativeMuonGroupConfig, NativeMuonParamState>;
 namespace {
 template <class State>
-void write_optimizer_state(torch::serialize::OutputArchive& archive, const State& state, mmltk::backend::ml::cuda::TensorReadbackBuffers& readback,
-                           std::size_t& slot) {
+void write_optimizer_state(torch::serialize::OutputArchive& archive, const State& state, mmltk::backend::ml::cuda::TensorReadbackBuffers& readback, std::size_t& slot) {
  template for (constexpr auto member : std::define_static_array(std::meta::nonstatic_data_members_of(^^State, std::meta::access_context::current()))) {
   if constexpr (std::is_same_v<std::remove_cvref_t<decltype(state.[:member:])>, torch::Tensor>) {
    if (state.[:member:].defined()) archive.write(std::string(std::meta::identifier_of(member)), readback.Stage(slot++));
@@ -567,14 +537,14 @@ void NativeAdamW::read_checkpoint(torch::serialize::InputArchive& archive, std::
  validate_archive_layout_counts(archive, groups_.size(), params_.size(), "native AdamW archive layout does not match the current optimizer");
  auto candidate_groups = groups_;
  read_optimizer_group_archives(archive, candidate_groups,
-                               "native AdamW archive parameter group size does not match the "
-                               "current optimizer",
-                               "native AdamW archive parameter group order does not match the "
-                               "current optimizer",
-                               [stop](auto& group_archive, auto& config) {
-                                if (stop.stop_requested()) throw ArtifactPublicationCancelled{};
-                                config.amsgrad = mmltk::backend::ml::serialization::require_int(group_archive, "amsgrad") != 0;
-                               });
+  "native AdamW archive parameter group size does not match the "
+  "current optimizer",
+  "native AdamW archive parameter group order does not match the "
+  "current optimizer",
+  [stop](auto& group_archive, auto& config) {
+   if (stop.stop_requested()) throw ArtifactPublicationCancelled{};
+   config.amsgrad = mmltk::backend::ml::serialization::require_int(group_archive, "amsgrad") != 0;
+  });
  for (const auto& group : candidate_groups) {
   if (stop.stop_requested()) throw ArtifactPublicationCancelled{};
   if (!std::isfinite(group.config.lr) || group.config.lr < 0.0 || !std::isfinite(group.config.weight_decay) || group.config.weight_decay < 0.0) {
@@ -586,18 +556,18 @@ void NativeAdamW::read_checkpoint(torch::serialize::InputArchive& archive, std::
  read_indexed_optimizer_archive(archive, "param", params_.size(), [&](const size_t index, auto& param_archive) {
   if (stop.stop_requested()) throw ArtifactPublicationCancelled{};
   validate_named_parameter_archive(param_archive, params_[index].name,
-                                   "native AdamW archive parameter order "
-                                   "does not match the current model");
+   "native AdamW archive parameter order "
+   "does not match the current model");
   const auto& param = params_[index].tensor;
   auto loaded_step = require_adam_step_tensor(param_archive, param, backend_, materialize);
   auto loaded_exp_avg = require_parameter_state_tensor(param_archive, "exp_avg", param,
-                                                       "native AdamW archive tensor shape "
-                                                       "does not match the current model",
-                                                       materialize);
+   "native AdamW archive tensor shape "
+   "does not match the current model",
+   materialize);
   auto loaded_exp_avg_sq = require_parameter_state_tensor(param_archive, "exp_avg_sq", param,
-                                                          "native AdamW archive tensor shape "
-                                                          "does not match the current model",
-                                                          materialize);
+   "native AdamW archive tensor shape "
+   "does not match the current model",
+   materialize);
   const bool has_max_exp_avg_sq = mmltk::backend::ml::serialization::require_int(param_archive, "has_max_exp_avg_sq") != 0;
   if (has_max_exp_avg_sq != uses_amsgrad[index]) { throw std::runtime_error("native AdamW archive AMSGrad state does not match the current optimizer"); }
   auto& state = candidate_state[index];
@@ -606,9 +576,9 @@ void NativeAdamW::read_checkpoint(torch::serialize::InputArchive& archive, std::
   state.exp_avg_sq = std::move(loaded_exp_avg_sq);
   if (has_max_exp_avg_sq) {
    state.max_exp_avg_sq = require_parameter_state_tensor(param_archive, "max_exp_avg_sq", param,
-                                                         "native AdamW archive AMSGrad tensor shape does not match the "
-                                                         "current model",
-                                                         materialize);
+    "native AdamW archive AMSGrad tensor shape does not match the "
+    "current model",
+    materialize);
   } else {
    state.max_exp_avg_sq = torch::Tensor();
   }
@@ -616,12 +586,10 @@ void NativeAdamW::read_checkpoint(torch::serialize::InputArchive& archive, std::
  groups_.swap(candidate_groups);
  state_.swap(candidate_state);
 }
-std::vector<std::string> NativeAdamW::InspectCheckpoint(torch::serialize::InputArchive& archive, const std::unordered_map<std::string, torch::Tensor>& tensors,
-                                                        std::stop_token stop) {
+std::vector<std::string> NativeAdamW::InspectCheckpoint(torch::serialize::InputArchive& archive, const std::unordered_map<std::string, torch::Tensor>& tensors, std::stop_token stop) {
  return inspect_checkpoint<NativeAdamW>(archive, tensors, stop);
 }
-NativeMuonWithAuxAdam::NativeMuonWithAuxAdam(std::vector<Group> groups, std::vector<NamedParameter> params)
-    : NativeOptimizerStorage(std::move(groups), std::move(params)) {
+NativeMuonWithAuxAdam::NativeMuonWithAuxAdam(std::vector<Group> groups, std::vector<NamedParameter> params) : NativeOptimizerStorage(std::move(groups), std::move(params)) {
  populate_named_parameter_views(params_, all_params_, all_param_names_, "native Muon received an undefined parameter tensor");
  validate_group_collection_indices(groups_, params_.size(), "native Muon parameter group index is out of range");
  initialize_state();
@@ -675,8 +643,7 @@ void NativeMuonWithAuxAdam::step() {
   }
  }
 }
-void NativeMuonWithAuxAdam::save(torch::serialize::OutputArchive& archive, mmltk::backend::ml::cuda::TensorReadbackBuffers& readback,
-                                 std::size_t first_slot) const {
+void NativeMuonWithAuxAdam::save(torch::serialize::OutputArchive& archive, mmltk::backend::ml::cuda::TensorReadbackBuffers& readback, std::size_t first_slot) const {
  mmltk::backend::ml::serialization::write_string(archive, "format", kNativeMuonFormat);
  mmltk::backend::ml::serialization::write_int(archive, "format_version", kNativeMuonFormatVersion);
  mmltk::backend::ml::serialization::write_int(archive, "ns_steps", kMuonNsSteps);
@@ -706,8 +673,7 @@ void NativeMuonWithAuxAdam::save(torch::serialize::OutputArchive& archive, mmltk
 void NativeMuonWithAuxAdam::load(torch::serialize::InputArchive& archive, std::stop_token stop) { read_checkpoint(archive, stop, true); }
 void NativeMuonWithAuxAdam::read_checkpoint(torch::serialize::InputArchive& archive, std::stop_token stop, bool materialize) {
  validate_optimizer_archive_format(archive, kNativeMuonFormat, kNativeMuonFormatVersion, "Muon");
- if (mmltk::backend::ml::serialization::require_int(archive, "ns_steps") != kMuonNsSteps ||
-     !finite_equal(mmltk::backend::ml::serialization::require_double(archive, "muon_coeff_a"), kMuonCoeffA) ||
+ if (mmltk::backend::ml::serialization::require_int(archive, "ns_steps") != kMuonNsSteps || !finite_equal(mmltk::backend::ml::serialization::require_double(archive, "muon_coeff_a"), kMuonCoeffA) ||
      !finite_equal(mmltk::backend::ml::serialization::require_double(archive, "muon_coeff_b"), kMuonCoeffB) ||
      !finite_equal(mmltk::backend::ml::serialization::require_double(archive, "muon_coeff_c"), kMuonCoeffC) ||
      !finite_equal(mmltk::backend::ml::serialization::require_double(archive, "muon_eps"), kMuonNormEps) ||
@@ -721,20 +687,20 @@ void NativeMuonWithAuxAdam::read_checkpoint(torch::serialize::InputArchive& arch
  validate_archive_layout_counts(archive, groups_.size(), params_.size(), "native Muon archive layout does not match the current optimizer");
  auto candidate_groups = groups_;
  read_optimizer_group_archives(archive, candidate_groups,
-                               "native Muon archive parameter group size does not match the "
-                               "current optimizer",
-                               "native Muon archive parameter group order does not match the "
-                               "current optimizer",
-                               [stop](auto& group_archive, auto& config) {
-                                if (stop.stop_requested()) throw ArtifactPublicationCancelled{};
-                                config.momentum = mmltk::backend::ml::serialization::require_double(group_archive, "momentum");
-                                config.use_muon = mmltk::backend::ml::serialization::require_int(group_archive, "use_muon") != 0;
-                                config.nesterov = mmltk::backend::ml::serialization::require_int(group_archive, "nesterov") != 0;
-                               });
+  "native Muon archive parameter group size does not match the "
+  "current optimizer",
+  "native Muon archive parameter group order does not match the "
+  "current optimizer",
+  [stop](auto& group_archive, auto& config) {
+   if (stop.stop_requested()) throw ArtifactPublicationCancelled{};
+   config.momentum = mmltk::backend::ml::serialization::require_double(group_archive, "momentum");
+   config.use_muon = mmltk::backend::ml::serialization::require_int(group_archive, "use_muon") != 0;
+   config.nesterov = mmltk::backend::ml::serialization::require_int(group_archive, "nesterov") != 0;
+  });
  for (const auto& group : candidate_groups) {
   if (stop.stop_requested()) throw ArtifactPublicationCancelled{};
-  if (!std::isfinite(group.config.lr) || group.config.lr < 0.0 || !std::isfinite(group.config.weight_decay) || group.config.weight_decay < 0.0 ||
-      !std::isfinite(group.config.momentum) || group.config.momentum < 0.0 || group.config.momentum > 1.0) {
+  if (!std::isfinite(group.config.lr) || group.config.lr < 0.0 || !std::isfinite(group.config.weight_decay) || group.config.weight_decay < 0.0 || !std::isfinite(group.config.momentum) ||
+      group.config.momentum < 0.0 || group.config.momentum > 1.0) {
    throw std::runtime_error("native Muon archive parameter group does not match the current optimizer");
   }
  }
@@ -743,8 +709,8 @@ void NativeMuonWithAuxAdam::read_checkpoint(torch::serialize::InputArchive& arch
  read_indexed_optimizer_archive(archive, "param", params_.size(), [&](const size_t index, auto& param_archive) {
   if (stop.stop_requested()) throw ArtifactPublicationCancelled{};
   validate_named_parameter_archive(param_archive, params_[index].name,
-                                   "native Muon archive parameter order "
-                                   "does not match the current model");
+   "native Muon archive parameter order "
+   "does not match the current model");
   const bool stored_use_muon = mmltk::backend::ml::serialization::require_int(param_archive, "use_muon") != 0;
   if (stored_use_muon != use_muon[index]) {
    throw std::runtime_error(
@@ -755,9 +721,9 @@ void NativeMuonWithAuxAdam::read_checkpoint(torch::serialize::InputArchive& arch
   auto& state = candidate_state[index];
   if (stored_use_muon) {
    auto momentum_buffer = require_parameter_state_tensor(param_archive, "momentum_buffer", param,
-                                                         "native Muon archive momentum tensor shape does not match the "
-                                                         "current model",
-                                                         materialize);
+    "native Muon archive momentum tensor shape does not match the "
+    "current model",
+    materialize);
    state.step = 0;
    state.exp_avg = torch::Tensor();
    state.exp_avg_sq = torch::Tensor();
@@ -767,13 +733,13 @@ void NativeMuonWithAuxAdam::read_checkpoint(torch::serialize::InputArchive& arch
   const auto step = mmltk::backend::ml::serialization::require_int(param_archive, "step");
   if (step < 0) { throw std::runtime_error("native Muon archive step does not match the current optimizer"); }
   auto exp_avg = require_parameter_state_tensor(param_archive, "exp_avg", param,
-                                                "native Muon archive AuxAdam tensor shape does not match the "
-                                                "current model",
-                                                materialize);
+   "native Muon archive AuxAdam tensor shape does not match the "
+   "current model",
+   materialize);
   auto exp_avg_sq = require_parameter_state_tensor(param_archive, "exp_avg_sq", param,
-                                                   "native Muon archive AuxAdam tensor shape does not match the "
-                                                   "current model",
-                                                   materialize);
+   "native Muon archive AuxAdam tensor shape does not match the "
+   "current model",
+   materialize);
   state.step = step;
   state.momentum_buffer = torch::Tensor();
   state.exp_avg = std::move(exp_avg);
@@ -782,15 +748,12 @@ void NativeMuonWithAuxAdam::read_checkpoint(torch::serialize::InputArchive& arch
  groups_.swap(candidate_groups);
  state_.swap(candidate_state);
 }
-std::vector<std::string> NativeMuonWithAuxAdam::InspectCheckpoint(torch::serialize::InputArchive& archive,
-                                                                  const std::unordered_map<std::string, torch::Tensor>& tensors, std::stop_token stop) {
+std::vector<std::string> NativeMuonWithAuxAdam::InspectCheckpoint(torch::serialize::InputArchive& archive, const std::unordered_map<std::string, torch::Tensor>& tensors, std::stop_token stop) {
  return inspect_checkpoint<NativeMuonWithAuxAdam>(archive, tensors, stop);
 }
 NativeOptimizer::NativeOptimizer(NativeAdamW optimizer) : storage_(std::move(optimizer)) {}
 NativeOptimizer::NativeOptimizer(NativeMuonWithAuxAdam optimizer) : storage_(std::move(optimizer)) {}
-TrainOptimizerKind NativeOptimizer::kind() const {
- return std::holds_alternative<NativeAdamW>(storage_) ? TrainOptimizerKind::AdamW : TrainOptimizerKind::Muon;
-}
+TrainOptimizerKind NativeOptimizer::kind() const { return std::holds_alternative<NativeAdamW>(storage_) ? TrainOptimizerKind::AdamW : TrainOptimizerKind::Muon; }
 std::string_view NativeOptimizer::kind_name() const { return cli_enum_spelling(kind()); }
 NativeOptimizer NativeOptimizer::stage_load(torch::serialize::InputArchive& archive) const {
  NativeOptimizer candidate = *this;
@@ -849,8 +812,7 @@ void NativeOptimizer::load(torch::serialize::InputArchive& archive) {
 bool is_encoder_param(std::string_view name) { return name.find("backbone.0.encoder") != std::string_view::npos; }
 bool encoder_zero_weight_decay(std::string_view name) {
  return name.find("gamma") != std::string_view::npos || name.find("bias") != std::string_view::npos || name.find("norm") != std::string_view::npos ||
-        name.find("embeddings") != std::string_view::npos || name.find("position_embeddings") != std::string_view::npos ||
-        name.find("rel_pos") != std::string_view::npos;
+        name.find("embeddings") != std::string_view::npos || name.find("position_embeddings") != std::string_view::npos || name.find("rel_pos") != std::string_view::npos;
 }
 int encoder_layer_id(std::string_view name) {
  constexpr int kNumVitLayers = 13;
@@ -868,8 +830,7 @@ double parameter_lr(std::string_view name, const TrainRequest& options) {
  if (is_encoder_param(name)) {
   constexpr int kNumVitLayers = 13;
   const int layer_id = encoder_layer_id(name);
-  return options.lr_encoder * std::pow(options.encoder_layer_decay, static_cast<double>(kNumVitLayers + 1 - layer_id)) * options.lr_component_decay *
-         options.lr_component_decay;
+  return options.lr_encoder * std::pow(options.encoder_layer_decay, static_cast<double>(kNumVitLayers + 1 - layer_id)) * options.lr_component_decay * options.lr_component_decay;
  }
  if (name.find("transformer.decoder") != std::string_view::npos) { return options.lr * options.lr_component_decay; }
  return options.lr;
@@ -882,10 +843,8 @@ double parameter_weight_decay(std::string_view name, const TrainRequest& options
 // parameter and one Group per bucket, recording each bucket's base lr and moving its parameter indices into
 // the optimizer group. group_config maps a bucket to the optimizer-specific group configuration.
 template <typename Optimizer, typename Groups, typename NamedParams, typename GroupConfigFn>
-std::pair<std::vector<typename Optimizer::Group>, std::vector<typename Optimizer::NamedParameter>> build_optimizer_inputs(Groups& groups,
-                                                                                                                          const NamedParams& named_params,
-                                                                                                                          std::vector<double>& base_lrs,
-                                                                                                                          GroupConfigFn&& group_config) {
+std::pair<std::vector<typename Optimizer::Group>, std::vector<typename Optimizer::NamedParameter>> build_optimizer_inputs(
+ Groups& groups, const NamedParams& named_params, std::vector<double>& base_lrs, GroupConfigFn&& group_config) {
  std::vector<typename Optimizer::Group> optimizer_groups;
  std::vector<typename Optimizer::NamedParameter> optimizer_params;
  optimizer_groups.reserve(groups.size());
@@ -926,16 +885,15 @@ OptimizerBuildResult build_optimizer(NativeRfDetrModel& model, const TrainReques
  std::vector<double> base_lrs;
  base_lrs.reserve(groups.size());
  if (options.optimizer == TrainOptimizerKind::Muon) {
-  auto [optimizer_groups, optimizer_params] = build_optimizer_inputs<NativeMuonWithAuxAdam>(groups, named_params, base_lrs, [&options](const GroupSpec& group) {
-   return NativeMuonGroupConfig{group.lr, group.weight_decay, options.momentum, group.use_muon, true};
-  });
+  auto [optimizer_groups, optimizer_params] = build_optimizer_inputs<NativeMuonWithAuxAdam>(
+   groups, named_params, base_lrs, [&options](const GroupSpec& group) { return NativeMuonGroupConfig{group.lr, group.weight_decay, options.momentum, group.use_muon, true}; });
   return OptimizerBuildResult{
    NativeOptimizer(NativeMuonWithAuxAdam(std::move(optimizer_groups), std::move(optimizer_params))),
    std::move(base_lrs),
   };
  }
- auto [optimizer_groups, optimizer_params] = build_optimizer_inputs<NativeAdamW>(
-  groups, named_params, base_lrs, [](const GroupSpec& group) { return NativeAdamWGroupConfig{group.lr, group.weight_decay, false}; });
+ auto [optimizer_groups, optimizer_params] =
+  build_optimizer_inputs<NativeAdamW>(groups, named_params, base_lrs, [](const GroupSpec& group) { return NativeAdamWGroupConfig{group.lr, group.weight_decay, false}; });
  std::vector<torch::Tensor> trainable_params;
  trainable_params.reserve(optimizer_params.size());
  for (const auto& named_param : optimizer_params) { trainable_params.push_back(named_param.tensor); }

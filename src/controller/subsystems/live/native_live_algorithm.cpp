@@ -74,10 +74,8 @@ public:
   }
   if (!lease_) throw std::logic_error("Live capture has no acquired output");
   const auto source = lease_.view();
-  if (source.width != target.descriptor.width || source.height != target.descriptor.height)
-   throw std::runtime_error("Live composite extent changed unexpectedly");
-  const cudaError_t status = detail::copy_live_receiver_frame(target, source.pixels, source.pitch_bytes, source.ready_event, stream_value,
-                                                              detail::native_live_receiver_copy_operations());
+  if (source.width != target.descriptor.width || source.height != target.descriptor.height) throw std::runtime_error("Live composite extent changed unexpectedly");
+  const cudaError_t status = detail::copy_live_receiver_frame(target, source.pixels, source.pitch_bytes, source.ready_event, stream_value, detail::native_live_receiver_copy_operations());
   if (status != cudaSuccess) throw std::runtime_error("Live composite receiver copy failed");
   std::move(lease_).Complete();
   return true;
@@ -91,9 +89,7 @@ public:
  }
 
 private:
- static bool IsCurrent(const void* context, std::uintptr_t) noexcept {
-  return static_cast<const NativeLiveAlgorithm*>(context)->owner_thread_ == std::this_thread::get_id();
- }
+ static bool IsCurrent(const void* context, std::uintptr_t) noexcept { return static_cast<const NativeLiveAlgorithm*>(context)->owner_thread_ == std::this_thread::get_id(); }
  static bool FailCurrent(const void* context, std::uintptr_t) noexcept {
   auto& owner = *const_cast<NativeLiveAlgorithm*>(static_cast<const NativeLiveAlgorithm*>(context));
   owner.Fail();

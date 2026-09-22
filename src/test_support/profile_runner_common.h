@@ -30,8 +30,7 @@ void add_common_profile_options(CliOptionTable& table, CommonProfileOptions& opt
 [[nodiscard]] std::string benchmark_metric_name(const char* suffix);
 [[nodiscard]] std::string benchmark_metric_name(const char* label, const char* suffix);
 void record_duration_metric(const char* suffix, std::uint64_t elapsed_ns);
-void record_duration_metric(const char* label, const char* suffix, const std::chrono::steady_clock::time_point& start,
-                            const std::chrono::steady_clock::time_point& end);
+void record_duration_metric(const char* label, const char* suffix, const std::chrono::steady_clock::time_point& start, const std::chrono::steady_clock::time_point& end);
 void record_value_metric(const char* suffix, std::uint64_t value);
 void record_value_metric(const char* label, const char* suffix, std::uint64_t value);
 void record_optional_x10000_metric(const char* suffix, const std::optional<double>& value);
@@ -44,8 +43,7 @@ void capture_profile_iteration(const std::string& label);
 // then the recorded repetitions (with per-iteration profile capture), then prints one line per run.
 // `run_iteration(is_warmup, one_based_index)` produces the per-run result object.
 template <typename RunIteration, typename RecordMetrics, typename PrintLine>
-inline void run_profile_phases(const char* run_label, const int warmup_run_count, const int repetition_count, RunIteration&& run_iteration,
-                               RecordMetrics&& record_metrics, PrintLine&& print_line) {
+inline void run_profile_phases(const char* run_label, const int warmup_run_count, const int repetition_count, RunIteration&& run_iteration, RecordMetrics&& record_metrics, PrintLine&& print_line) {
  using Run = std::decay_t<std::invoke_result_t<RunIteration&, bool, int>>;
  std::vector<Run> warmup_runs;
  warmup_runs.reserve(static_cast<size_t>(std::max(0, warmup_run_count)));
@@ -64,8 +62,6 @@ inline void run_profile_phases(const char* run_label, const int warmup_run_count
   capture_profile_iteration(iteration_label_for_run(run_label, repetition + 1));
  }
  for (int warmup = 0; warmup < warmup_run_count; ++warmup) { print_line("warmup", warmup + 1, warmup_run_count, warmup_runs[static_cast<size_t>(warmup)]); }
- for (int repetition = 0; repetition < repetition_count; ++repetition) {
-  print_line("repetition", repetition + 1, repetition_count, repetition_runs[static_cast<size_t>(repetition)]);
- }
+ for (int repetition = 0; repetition < repetition_count; ++repetition) { print_line("repetition", repetition + 1, repetition_count, repetition_runs[static_cast<size_t>(repetition)]); }
 }
 }  // namespace mmltk::testsupport

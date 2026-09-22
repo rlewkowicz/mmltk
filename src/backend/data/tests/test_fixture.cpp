@@ -33,10 +33,14 @@ void write_png_stub(const std::string& path, int width, int height, bool pixel_e
  stbi_write_png(path.c_str(), width, height, 3, pixels.data(), width * 3);
 }
 constexpr std::array<const char*, 6> kClassNames{
- "person", "ret", "scope", "iron_sight", "anchor_dot", "glint",
+ "person",
+ "ret",
+ "scope",
+ "iron_sight",
+ "anchor_dot",
+ "glint",
 };
-void write_synthetic_sample(const fs::path& split_dir, const int image_index, const int width, const int height, const int background_images,
-                            const bool pixel_evidence) {
+void write_synthetic_sample(const fs::path& split_dir, const int image_index, const int width, const int height, const int background_images, const bool pixel_evidence) {
  std::array<char, 64> fname{};
  std::snprintf(fname.data(), fname.size(), "%06d.png", image_index);
  write_png_stub((split_dir / fname.data()).string(), width, height, pixel_evidence);
@@ -61,8 +65,8 @@ void write_synthetic_sample(const fs::path& split_dir, const int image_index, co
    append_run(x1, x2);
   }
  }
- annotations << R"({"class":")" << kClassNames[cls] << R"(","bbox_xyxy":[)" << x1 << "," << y1 << "," << x2 << "," << y2
-             << R"(],"mask_rle_encoding":"row_major_start_length","mask_rle":")" << rle << R"(","image_size_wh":[)" << width << "," << height << R"(]})"
+ annotations << R"({"class":")" << kClassNames[cls] << R"(","bbox_xyxy":[)" << x1 << "," << y1 << "," << x2 << "," << y2 << R"(],"mask_rle_encoding":"row_major_start_length","mask_rle":")" << rle
+             << R"(","image_size_wh":[)" << width << "," << height << R"(]})"
              << "\n";
 }
 }  // namespace
@@ -103,8 +107,7 @@ void create_synthetic_dataset(const FixtureSpec& spec) {
 )" << R"(           "background_annotation_policy":"empty_jsonl_file"},
 )" << R"(  "classes": [
 )" << R"(    {"id":)"
-    << spec.first_class_id << R"(,"name":"person"},)" << R"({"id":)" << spec.first_class_id + 1 << R"(,"name":"ret"},)" << R"({"id":)"
-    << spec.first_class_id + 2 << R"(,"name":"scope"},
+    << spec.first_class_id << R"(,"name":"person"},)" << R"({"id":)" << spec.first_class_id + 1 << R"(,"name":"ret"},)" << R"({"id":)" << spec.first_class_id + 2 << R"(,"name":"scope"},
 )" << R"(    {"id":)"
     << spec.first_class_id + 3 << R"(,"name":"iron_sight"},)" << R"({"id":)" << spec.first_class_id + 4 << R"(,"name":"anchor_dot"},)"
     << R"({"id":)" << spec.first_class_id + 5 << R"(,"name":"glint"}
@@ -117,8 +120,7 @@ void create_synthetic_dataset(const FixtureSpec& spec) {
 }
 void replace_synthetic_image(const FixtureSpec& spec, const int image_index, const int width, const int height) {
  if (image_index < 1 || image_index > spec.num_images || width <= 30 || height <= 30) throw std::invalid_argument("synthetic replacement image is invalid");
- write_synthetic_sample(fs::path(dataset_dir(spec)) / spec.split, image_index, width, height, std::clamp(spec.background_images, 0, spec.num_images),
-                        spec.pixel_evidence);
+ write_synthetic_sample(fs::path(dataset_dir(spec)) / spec.split, image_index, width, height, std::clamp(spec.background_images, 0, spec.num_images), spec.pixel_evidence);
 }
 std::vector<float> expected_nchw_stub(const std::string& path, int width, int height) {
  const std::vector<uint8_t> pixels = stub_rgb_pixels(path, width, height);
@@ -131,19 +133,16 @@ std::vector<float> expected_nchw_stub(const std::string& path, int width, int he
  }
  return nchw;
 }
-std::vector<float> expected_resized_rgb(std::span<const std::uint8_t> rgb, const std::uint32_t width, const std::uint32_t height,
-                                        const std::uint32_t target_width, const std::uint32_t target_height,
-                                        const mmltk::backend::imaging::resample::ImageResizeMode mode, const bool perceptual) {
+std::vector<float> expected_resized_rgb(std::span<const std::uint8_t> rgb, const std::uint32_t width, const std::uint32_t height, const std::uint32_t target_width, const std::uint32_t target_height,
+ const mmltk::backend::imaging::resample::ImageResizeMode mode, const bool perceptual) {
  using namespace mmltk::backend::imaging::resample;
  if (rgb.size() != std::size_t(width) * height * 3U) throw std::invalid_argument("RGB fixture extent mismatch");
  const auto geometry = compute_image_resize_geometry(width, height, target_width, target_height, mode);
  RgbImageResizer resizer(1, perceptual);
  std::vector<std::uint8_t> bytes(std::size_t(geometry.resized_width) * geometry.resized_height * 3U);
- resizer.resize(rgb.data(), static_cast<int>(width), static_cast<int>(height), bytes.data(), static_cast<int>(geometry.resized_width),
-                static_cast<int>(geometry.resized_height));
+ resizer.resize(rgb.data(), static_cast<int>(width), static_cast<int>(height), bytes.data(), static_cast<int>(geometry.resized_width), static_cast<int>(geometry.resized_height));
  std::vector<float> expected(std::size_t(target_width) * target_height * 3U);
- letterboxed_rgb_hwc_u8_to_nchw_f32(bytes.data(), expected.data(), geometry.resized_width, geometry.resized_height, target_width, target_height,
-                                    geometry.offset_x, geometry.offset_y);
+ letterboxed_rgb_hwc_u8_to_nchw_f32(bytes.data(), expected.data(), geometry.resized_width, geometry.resized_height, target_width, target_height, geometry.offset_x, geometry.offset_y);
  return expected;
 }
 void assert_image_matches(const float* actual, const std::vector<float>& expected) {

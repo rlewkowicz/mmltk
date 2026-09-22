@@ -19,9 +19,7 @@ template <typename T>
   const JsonUnsigned source = value.get_ref<const JsonUnsigned&>();
   if constexpr (std::is_signed_v<T>) {
    if constexpr (std::numeric_limits<T>::digits < std::numeric_limits<JsonUnsigned>::digits) {
-    if (source > static_cast<JsonUnsigned>(std::numeric_limits<T>::max())) {
-     throw std::runtime_error("JSON unsigned integer is outside the signed target range");
-    }
+    if (source > static_cast<JsonUnsigned>(std::numeric_limits<T>::max())) { throw std::runtime_error("JSON unsigned integer is outside the signed target range"); }
    }
   } else if constexpr (std::numeric_limits<T>::digits < std::numeric_limits<JsonUnsigned>::digits) {
    if (source > static_cast<JsonUnsigned>(std::numeric_limits<T>::max())) { throw std::runtime_error("JSON unsigned integer is outside the target range"); }
@@ -41,9 +39,7 @@ template <typename T>
    using UnsignedJsonSigned = std::make_unsigned_t<JsonSigned>;
    const UnsignedJsonSigned nonnegative = static_cast<UnsignedJsonSigned>(source);
    if constexpr (std::numeric_limits<T>::digits < std::numeric_limits<UnsignedJsonSigned>::digits) {
-    if (nonnegative > static_cast<UnsignedJsonSigned>(std::numeric_limits<T>::max())) {
-     throw std::runtime_error("JSON signed integer is outside the unsigned target range");
-    }
+    if (nonnegative > static_cast<UnsignedJsonSigned>(std::numeric_limits<T>::max())) { throw std::runtime_error("JSON signed integer is outside the unsigned target range"); }
    }
   }
   return static_cast<T>(source);

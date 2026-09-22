@@ -16,12 +16,9 @@
 #include "src/controller/contracts/model_selection.h"
 namespace mmltk::controller::subsystems::system {
 namespace {
-[[nodiscard]] ComputeIntentMaterializer::Refusal refused(const std::string_view detail) noexcept {
- return {.detail = mmltk::controller::contracts::bounded_artifact_detail(detail)};
-}
+[[nodiscard]] ComputeIntentMaterializer::Refusal refused(const std::string_view detail) noexcept { return {.detail = mmltk::controller::contracts::bounded_artifact_detail(detail)}; }
 [[nodiscard]] std::expected<const mmltk::controller::contracts::ArtifactSplitFact*, ComputeIntentMaterializer::Refusal> current_artifact_split(
- const mmltk::controller::contracts::ArtifactInspection& inspection, const std::filesystem::path& configured_path,
- const std::string_view unavailable_detail) noexcept {
+ const mmltk::controller::contracts::ArtifactInspection& inspection, const std::filesystem::path& configured_path, const std::string_view unavailable_detail) noexcept {
  if (!inspection.available()) return std::unexpected(refused("artifact facts are unavailable"));
  const auto configured_name = configured_path.lexically_normal();
  if (configured_name.empty()) return std::unexpected(refused(unavailable_detail));
@@ -32,9 +29,7 @@ namespace {
   const auto split_name = std::filesystem::path{split.path}.lexically_normal();
   if (split_name.empty()) return std::unexpected(refused("artifact facts are invalid"));
   for (std::size_t previous = 0U; previous != index; ++previous) {
-   if (std::filesystem::path{inspection.splits[previous].path}.lexically_normal() == split_name) {
-    return std::unexpected(refused("artifact split identity is duplicated"));
-   }
+   if (std::filesystem::path{inspection.splits[previous].path}.lexically_normal() == split_name) { return std::unexpected(refused("artifact split identity is duplicated")); }
   }
   if (split_name == configured_name) selected = &split;
  }
@@ -45,13 +40,11 @@ namespace {
  const mmltk::controller::contracts::GuiSettingsState& settings, const mmltk::controller::contracts::ArtifactInspection& inspection) noexcept {
  return current_artifact_split(inspection, settings.workflows.train.request.train_compiled_path, "training artifact is unavailable");
 }
-[[nodiscard]] std::expected<void, ComputeIntentMaterializer::Refusal> require_model(const mmltk::controller::contracts::GuiSettingsState& settings,
-                                                                                    const mmltk::controller::contracts::FeatureId workflow,
-                                                                                    const mmltk::controller::contracts::ModelSelection& model) noexcept {
+[[nodiscard]] std::expected<void, ComputeIntentMaterializer::Refusal> require_model(
+ const mmltk::controller::contracts::GuiSettingsState& settings, const mmltk::controller::contracts::FeatureId workflow, const mmltk::controller::contracts::ModelSelection& model) noexcept {
  const auto current = ComputeIntentMaterializer::ModelInputFor(settings, workflow);
  if (!current) return std::unexpected(current.error());
- if (!model.valid() || model.key != current->key ||
-     (model.key.source == mmltk::controller::contracts::ModelSelectionSource::Custom && model.artifact != current->custom_artifact))
+ if (!model.valid() || model.key != current->key || (model.key.source == mmltk::controller::contracts::ModelSelectionSource::Custom && model.artifact != current->custom_artifact))
   return std::unexpected(refused("model selection does not match current workflow settings"));
  return {};
 }
@@ -67,8 +60,7 @@ void assign_model_artifact(mmltk::backend::models::rfdetr::ModelArtifactRequest&
   case mmltk::controller::contracts::ModelArtifactInputKind::None: std::unreachable();
  }
 }
-void assign_export_output_facts(mmltk::backend::models::rfdetr::ModelArtifactOutputRequest& request, const mmltk::controller::contracts::ExportViewState& state,
-                                std::filesystem::path output_path) {
+void assign_export_output_facts(mmltk::backend::models::rfdetr::ModelArtifactOutputRequest& request, const mmltk::controller::contracts::ExportViewState& state, std::filesystem::path output_path) {
  request.preset_name = state.preset_name;
  request.resolution = state.model_resolution;
  request.output_path = std::move(output_path);
@@ -100,8 +92,7 @@ std::expected<ComputeIntentMaterializer::ModelInput, ComputeIntentMaterializer::
  return materialized;
 }
 std::expected<mmltk::backend::models::rfdetr::TrainRequest, ComputeIntentMaterializer::Refusal> ComputeIntentMaterializer::LocalTrain(
- const mmltk::controller::contracts::GuiSettingsState& settings, const mmltk::controller::contracts::ArtifactInspection& artifact,
- const mmltk::controller::contracts::ModelSelection& model) noexcept {
+ const mmltk::controller::contracts::GuiSettingsState& settings, const mmltk::controller::contracts::ArtifactInspection& artifact, const mmltk::controller::contracts::ModelSelection& model) noexcept {
  auto request = settings.workflows.train.request;
  if (settings.workflows.train.auto_output) request.output_dir = "./gui-train-output";
  const auto selected = require_model(settings, mmltk::controller::contracts::FeatureId::Train, model);
@@ -136,14 +127,12 @@ std::expected<mmltk::backend::models::rfdetr::TrainRequest, ComputeIntentMateria
 }
 // CLEANUP-IGNORE: Validation materialization is a direct typed workflow boundary; sharing its orchestration with
 // training or prediction would require an erased or detector-only generic request builder.
-ComputeIntentMaterializer::ValidationMaterialization ComputeIntentMaterializer::Validation(const mmltk::controller::contracts::GuiSettingsState& settings,
-                                                                                           const mmltk::controller::contracts::ArtifactInspection& artifact,
-                                                                                           const mmltk::controller::contracts::ModelSelection& model) noexcept {
+ComputeIntentMaterializer::ValidationMaterialization ComputeIntentMaterializer::Validation(
+ const mmltk::controller::contracts::GuiSettingsState& settings, const mmltk::controller::contracts::ArtifactInspection& artifact, const mmltk::controller::contracts::ModelSelection& model) noexcept {
  auto request = settings.workflows.validate.request;
  const auto selected = require_model(settings, mmltk::controller::contracts::FeatureId::Validate, model);
  if (!selected) return std::unexpected(selected.error());
- const auto compiled =
-  current_artifact_split(artifact, mmltk::controller::contracts::resolve_validation_source(settings), "selected validation artifact is unavailable");
+ const auto compiled = current_artifact_split(artifact, mmltk::controller::contracts::resolve_validation_source(settings), "selected validation artifact is unavailable");
  if (!compiled) return std::unexpected(compiled.error());
  request.compiled_path = (*compiled)->path;
  assign_model_artifact(request, model);
@@ -157,9 +146,8 @@ ComputeIntentMaterializer::ValidationMaterialization ComputeIntentMaterializer::
  request.compile_cuda_device_id = -1;
  return request;
 }
-ComputeIntentMaterializer::ExportMaterialization ComputeIntentMaterializer::Export(const mmltk::controller::contracts::GuiSettingsState& settings,
-                                                                                   const mmltk::controller::contracts::ArtifactInspection& artifact,
-                                                                                   const mmltk::controller::contracts::ModelSelection& model) noexcept {
+ComputeIntentMaterializer::ExportMaterialization ComputeIntentMaterializer::Export(
+ const mmltk::controller::contracts::GuiSettingsState& settings, const mmltk::controller::contracts::ArtifactInspection& artifact, const mmltk::controller::contracts::ModelSelection& model) noexcept {
  static_cast<void>(artifact);
  const auto selected = require_model(settings, mmltk::controller::contracts::FeatureId::Export, model);
  if (!selected) return std::unexpected(selected.error());
@@ -179,9 +167,7 @@ ComputeIntentMaterializer::ExportMaterialization ComputeIntentMaterializer::Expo
  mmltk::backend::models::rfdetr::ExportOnnxRequest request{};
  auto& output = static_cast<mmltk::backend::models::rfdetr::ModelArtifactOutputRequest&>(request);
  assign_model_artifact(output, model);
- assign_export_output_facts(
-  output, state,
-  state.onnx_output_path.empty() ? std::filesystem::path{model.artifact}.replace_extension(".onnx") : std::filesystem::path{state.onnx_output_path});
+ assign_export_output_facts(output, state, state.onnx_output_path.empty() ? std::filesystem::path{model.artifact}.replace_extension(".onnx") : std::filesystem::path{state.onnx_output_path});
  // CLEANUP-IGNORE: ONNX export validation consumes fields distinct from the TensorRT branch above.
  request.opset_version = state.opset_version;
  request.simplify = state.simplify;
@@ -194,9 +180,8 @@ ComputeIntentMaterializer::ExportMaterialization ComputeIntentMaterializer::Expo
 }
 // CLEANUP-IGNORE: Prediction materialization owns source selection and prediction-only request fields after the shared
 // model and artifact primitives have validated their inputs.
-ComputeIntentMaterializer::PredictionMaterialization ComputeIntentMaterializer::Predict(const mmltk::controller::contracts::GuiSettingsState& settings,
-                                                                                        const mmltk::controller::contracts::ArtifactInspection& artifact,
-                                                                                        const mmltk::controller::contracts::ModelSelection& model) noexcept {
+ComputeIntentMaterializer::PredictionMaterialization ComputeIntentMaterializer::Predict(
+ const mmltk::controller::contracts::GuiSettingsState& settings, const mmltk::controller::contracts::ArtifactInspection& artifact, const mmltk::controller::contracts::ModelSelection& model) noexcept {
  auto request = settings.workflows.predict.request;
  const auto selected = require_model(settings, mmltk::controller::contracts::FeatureId::Predict, model);
  if (!selected) return std::unexpected(selected.error());
@@ -212,8 +197,7 @@ ComputeIntentMaterializer::PredictionMaterialization ComputeIntentMaterializer::
  } else if (source.kind == mmltk::controller::contracts::SourceKind::SingleImage) {
   if (source.single_image_path.empty()) return std::unexpected(refused("prediction image is unavailable"));
   request.source_kind = mmltk::backend::models::rfdetr::PredictSourceKind::ImageFiles;
-  request.image_inputs.push_back(
-   {.image_path = source.single_image_path, .source_name = std::filesystem::path{source.single_image_path}.filename().string(), .image_id = 0});
+  request.image_inputs.push_back({.image_path = source.single_image_path, .source_name = std::filesystem::path{source.single_image_path}.filename().string(), .image_id = 0});
  } else if (source.kind == mmltk::controller::contracts::SourceKind::VideoFile) {
   if (source.video_file_path.empty()) return std::unexpected(refused("prediction video is unavailable"));
   request.source_kind = mmltk::backend::models::rfdetr::PredictSourceKind::VideoFile;

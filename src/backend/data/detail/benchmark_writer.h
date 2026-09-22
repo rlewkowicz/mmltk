@@ -40,8 +40,7 @@ private:
  std::uint16_t source_index_ = 0U;
  std::uint64_t source_image_id_ = 0U;
 };
-[[nodiscard]] PackedInstance benchmark_canvas_box(std::uint8_t class_id, float x1, float y1, float x2, float y2,
-                                                  const mmltk::backend::imaging::resample::ImageResizeGeometry& letterbox);
+[[nodiscard]] PackedInstance benchmark_canvas_box(std::uint8_t class_id, float x1, float y1, float x2, float y2, const mmltk::backend::imaging::resample::ImageResizeGeometry& letterbox);
 struct BenchmarkWriteProgressEvent final {
  void* context = nullptr;
  void (*image_completed)(void*) = nullptr;

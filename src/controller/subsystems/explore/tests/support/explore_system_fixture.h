@@ -85,27 +85,23 @@ public:
  void PrepareOutputPublication(ExploreOutputChange, ExploreMode) final {}
  void CommitOutputPublication() noexcept final {}
  bool RollbackOutputPublication() noexcept final { return true; }
- ExploreGalleryPublication BeginGallery(const ExploreRenderPlan& plan, const ExploreOrderCandidate* candidate, const std::size_t nproc,
-                                        const mmltk::frameworks::gpu::ImagePlaneView clean, const mmltk::frameworks::gpu::ImagePlaneView semantic,
-                                        const std::uintptr_t stream) final {
+ ExploreGalleryPublication BeginGallery(const ExploreRenderPlan& plan, const ExploreOrderCandidate* candidate, const std::size_t nproc, const mmltk::frameworks::gpu::ImagePlaneView clean,
+  const mmltk::frameworks::gpu::ImagePlaneView semantic, const std::uintptr_t stream) final {
   RenderProduct(plan, candidate, nproc, clean, semantic, stream);
   generation_ = plan.generation;
   return {.generation = generation_, .layout = test_atlas_layout(plan, clean)};
  }
  ExploreGalleryPublication AdvanceGallery() final { return {.generation = generation_}; }
  bool HasGalleryTiles() const final { return false; }
- ExploreGalleryPublication PublishGalleryTiles(mmltk::frameworks::gpu::ImagePlaneView, mmltk::frameworks::gpu::ImagePlaneView, std::uintptr_t) final {
-  return {.generation = generation_};
- }
- void RenderDetail(const ExploreRenderPlan& plan, const std::size_t nproc, const mmltk::frameworks::gpu::ImagePlaneView clean,
-                   const mmltk::frameworks::gpu::ImagePlaneView semantic, const std::uintptr_t stream) final {
+ ExploreGalleryPublication PublishGalleryTiles(mmltk::frameworks::gpu::ImagePlaneView, mmltk::frameworks::gpu::ImagePlaneView, std::uintptr_t) final { return {.generation = generation_}; }
+ void RenderDetail(const ExploreRenderPlan& plan, const std::size_t nproc, const mmltk::frameworks::gpu::ImagePlaneView clean, const mmltk::frameworks::gpu::ImagePlaneView semantic,
+  const std::uintptr_t stream) final {
   RenderProduct(plan, nullptr, nproc, clean, semantic, stream);
   generation_ = 0U;
  }
 
 protected:
- virtual void RenderProduct(const ExploreRenderPlan&, const ExploreOrderCandidate*, std::size_t, mmltk::frameworks::gpu::ImagePlaneView,
-                            mmltk::frameworks::gpu::ImagePlaneView, std::uintptr_t) = 0;
+ virtual void RenderProduct(const ExploreRenderPlan&, const ExploreOrderCandidate*, std::size_t, mmltk::frameworks::gpu::ImagePlaneView, mmltk::frameworks::gpu::ImagePlaneView, std::uintptr_t) = 0;
 
 private:
  ExploreDemandCheck demand_;
@@ -280,9 +276,7 @@ public:
   };
  }
  ExploreOrderCandidate PrepareFilter(const ExploreFilter& filter, const std::uint64_t seed, std::size_t, std::stop_token) override {
-  return {.filter = filter,
-          .order = {.matching_count = static_cast<std::uint32_t>(order_.size()), .shuffle_seed = seed, .visible_indices = order_},
-          .generation = ++candidate_generation_};
+  return {.filter = filter, .order = {.matching_count = static_cast<std::uint32_t>(order_.size()), .shuffle_seed = seed, .visible_indices = order_}, .generation = ++candidate_generation_};
  }
  void Commit(ExploreOrderCandidate) noexcept override {}
  void AbortRenderGeneration() override { ClearStreamingState(); }
@@ -364,9 +358,8 @@ public:
   if (std::exchange(probe_->fail_next_labels, false)) throw std::runtime_error("deterministic Explore prepared-label failure");
   return {};
  }
- ExploreGalleryPublication BeginGallery(const ExploreRenderPlan& plan, const ExploreOrderCandidate* candidate, const std::size_t nproc,
-                                        const mmltk::frameworks::gpu::ImagePlaneView clean, const mmltk::frameworks::gpu::ImagePlaneView semantic,
-                                        std::uintptr_t) override {
+ ExploreGalleryPublication BeginGallery(const ExploreRenderPlan& plan, const ExploreOrderCandidate* candidate, const std::size_t nproc, const mmltk::frameworks::gpu::ImagePlaneView clean,
+  const mmltk::frameworks::gpu::ImagePlaneView semantic, std::uintptr_t) override {
   std::shared_ptr<ExplorePostRenderGate> gate;
   {
    std::scoped_lock lock(probe_->mutex);
@@ -419,11 +412,9 @@ public:
  }
  bool HasGalleryTiles() const override {
   std::scoped_lock lock(probe_->mutex);
-  return std::ranges::any_of(
-   probe_->assignments, [this](const auto& assignment) { return assignment.ready && !assignment.gpu_pending && assignment.generation == probe_->generation; });
+  return std::ranges::any_of(probe_->assignments, [this](const auto& assignment) { return assignment.ready && !assignment.gpu_pending && assignment.generation == probe_->generation; });
  }
- ExploreGalleryPublication PublishGalleryTiles(const mmltk::frameworks::gpu::ImagePlaneView clean, const mmltk::frameworks::gpu::ImagePlaneView semantic,
-                                               std::uintptr_t) override {
+ ExploreGalleryPublication PublishGalleryTiles(const mmltk::frameworks::gpu::ImagePlaneView clean, const mmltk::frameworks::gpu::ImagePlaneView semantic, std::uintptr_t) override {
   GalleryReadySink wake;
   ExploreGalleryPublication facts;
   {
@@ -453,8 +444,7 @@ public:
   if (wake) wake();
   return facts;
  }
- void RenderDetail(const ExploreRenderPlan& plan, std::size_t, const mmltk::frameworks::gpu::ImagePlaneView clean,
-                   const mmltk::frameworks::gpu::ImagePlaneView semantic, std::uintptr_t) override {
+ void RenderDetail(const ExploreRenderPlan& plan, std::size_t, const mmltk::frameworks::gpu::ImagePlaneView clean, const mmltk::frameworks::gpu::ImagePlaneView semantic, std::uintptr_t) override {
   Fill(clean, static_cast<std::uint8_t>(0x60U + plan.selected_image.value_or(0U)));
   Fill(semantic, 0U);
   std::scoped_lock lock(probe_->mutex);
@@ -502,9 +492,7 @@ private:
  void ScheduleLocked() {
   while (probe_->assignments.size() < probe_->nproc && probe_->next_slot != probe_->visible.size()) {
    const auto slot = probe_->priority_slots[probe_->next_slot++];
-   if (probe_->completed_slots[slot] != 0U ||
-       std::ranges::any_of(probe_->assignments, [&](const auto& work) { return work.generation == probe_->generation && work.slot == slot; }))
-    continue;
+   if (probe_->completed_slots[slot] != 0U || std::ranges::any_of(probe_->assignments, [&](const auto& work) { return work.generation == probe_->generation && work.slot == slot; })) continue;
    probe_->assignments.push_back({
     .generation = probe_->generation,
     .compiled_index = probe_->visible[slot],
@@ -534,18 +522,14 @@ private:
  std::uint64_t candidate_generation_ = 0U;
  std::optional<PublicationCheckpoint> checkpoint_;
 };
-[[nodiscard]] inline VisualRuntimeFactory streaming_explore_runtime_factory(std::shared_ptr<FakeImageBackend> backend,
-                                                                            std::shared_ptr<StreamingExploreProbe> probe) {
+[[nodiscard]] inline VisualRuntimeFactory streaming_explore_runtime_factory(std::shared_ptr<FakeImageBackend> backend, std::shared_ptr<StreamingExploreProbe> probe) {
  return RuntimeFactory(
-  0, std::move(backend), mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic,
-  [probe = std::move(probe)] { return std::make_unique<ControlledStreamingExploreAlgorithm>(probe); }, 3U);
+  0, std::move(backend), mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic, [probe = std::move(probe)] { return std::make_unique<ControlledStreamingExploreAlgorithm>(probe); }, 3U);
 }
 class TestExploreAlgorithm : public SynchronousExploreAlgorithm {
 public:
- explicit TestExploreAlgorithm(
-  std::shared_ptr<std::atomic<std::size_t>> observed_nproc, std::shared_ptr<ExploreRenderGate> gate = {}, std::shared_ptr<std::atomic_uint64_t> commits = {},
-  std::shared_ptr<ExploreFinalizationGate> finalization_gate = {}, std::shared_ptr<ExploreWorkProbe> work_probe = {},
-  std::shared_ptr<ExplorePostRenderGate> post_render_gate = {},
+ explicit TestExploreAlgorithm(std::shared_ptr<std::atomic<std::size_t>> observed_nproc, std::shared_ptr<ExploreRenderGate> gate = {}, std::shared_ptr<std::atomic_uint64_t> commits = {},
+  std::shared_ptr<ExploreFinalizationGate> finalization_gate = {}, std::shared_ptr<ExploreWorkProbe> work_probe = {}, std::shared_ptr<ExplorePostRenderGate> post_render_gate = {},
   std::shared_ptr<ExploreDetailExtentProbe> detail_extent = {})  // CLEANUP-IGNORE: This test algorithm has its own injected controls.
      : observed_nproc_(std::move(observed_nproc)),               // CLEANUP-IGNORE: Distinct test algorithms directly retain their own injected controls.
        gate_(std::move(gate)),
@@ -560,11 +544,10 @@ public:
   candidate_order_ = {0U, 1U, 2U};
   candidate_render_failure_ = source == "/render-failed";
   if (source == "/allocation-failed") throw std::bad_alloc{};
-  const std::vector<mmltk::backend::data::catalog::ClassName> class_names = source == "/different-catalog"
-                                                                             ? std::vector<mmltk::backend::data::catalog::ClassName>{{"animal"}, {"building"}}
-                                                                             : std::vector<mmltk::backend::data::catalog::ClassName>{{"person"}, {"vehicle"}};
+  const std::vector<mmltk::backend::data::catalog::ClassName> class_names =
+   source == "/different-catalog" ? std::vector<mmltk::backend::data::catalog::ClassName>{{"animal"}, {"building"}} : std::vector<mmltk::backend::data::catalog::ClassName>{{"person"}, {"vehicle"}};
   return {.dataset = {.image_count = 3U, .image_width = 64U, .image_height = 64U, .class_names = class_names},
-          .order = {.matching_count = static_cast<std::uint32_t>(candidate_order_.size()), .visible_indices = candidate_order_}};
+   .order = {.matching_count = static_cast<std::uint32_t>(candidate_order_.size()), .visible_indices = candidate_order_}};
  }
  ExploreOrderCandidate PrepareFilter(const ExploreFilter& filter, std::uint64_t seed, std::size_t, std::stop_token) override {
   if (work_probe_) work_probe_->prepares.fetch_add(1U, std::memory_order_release);
@@ -572,8 +555,8 @@ public:
   if (filter.minimum_instances == 8U) candidate_render_failure_ = true;
   if (candidate_order_.empty()) candidate_order_ = order_;
   return {.filter = filter,
-          .order = {.matching_count = static_cast<std::uint32_t>(candidate_order_.size()), .shuffle_seed = seed, .visible_indices = candidate_order_},
-          .generation = ++candidate_generation_};
+   .order = {.matching_count = static_cast<std::uint32_t>(candidate_order_.size()), .shuffle_seed = seed, .visible_indices = candidate_order_},
+   .generation = ++candidate_generation_};
  }
  void Commit(ExploreOrderCandidate) noexcept override {
   order_ = std::move(candidate_order_);
@@ -606,19 +589,15 @@ public:
   return facts;
  }
  bool Contains(std::uint32_t value) const override { return std::ranges::find(order_, value) != order_.end(); }
- VisualExtent DetailExtent(const ExploreRenderPlan& plan) const override {
-  return detail_extent_ ? detail_extent_->padded : ExploreAlgorithm::DetailExtent(plan);
- }
+ VisualExtent DetailExtent(const ExploreRenderPlan& plan) const override { return detail_extent_ ? detail_extent_->padded : ExploreAlgorithm::DetailExtent(plan); }
  VisualRegion DetailContent(const ExploreRenderPlan&) const override {
   if (!detail_extent_) return {};
-  return {(detail_extent_->padded.width - detail_extent_->original.width) / 2U, (detail_extent_->padded.height - detail_extent_->original.height) / 2U,
-          detail_extent_->original.width, detail_extent_->original.height};
+  return {(detail_extent_->padded.width - detail_extent_->original.width) / 2U, (detail_extent_->padded.height - detail_extent_->original.height) / 2U, detail_extent_->original.width,
+   detail_extent_->original.height};
  }
- std::optional<std::uint32_t> Adjacent(std::uint32_t selected, std::int64_t offset) const override {
-  return static_cast<std::uint32_t>((static_cast<std::int64_t>(selected) + offset % 3 + 3) % 3);
- }
- void RenderProduct(const ExploreRenderPlan& plan, const ExploreOrderCandidate* candidate, const std::size_t nproc,
-                    const mmltk::frameworks::gpu::ImagePlaneView clean, const mmltk::frameworks::gpu::ImagePlaneView semantic, std::uintptr_t) override {
+ std::optional<std::uint32_t> Adjacent(std::uint32_t selected, std::int64_t offset) const override { return static_cast<std::uint32_t>((static_cast<std::int64_t>(selected) + offset % 3 + 3) % 3); }
+ void RenderProduct(const ExploreRenderPlan& plan, const ExploreOrderCandidate* candidate, const std::size_t nproc, const mmltk::frameworks::gpu::ImagePlaneView clean,
+  const mmltk::frameworks::gpu::ImagePlaneView semantic, std::uintptr_t) override {
   if (candidate != nullptr && candidate_render_failure_) throw std::runtime_error("deterministic Explore candidate render failure");
   if (work_probe_) work_probe_->renders.fetch_add(1U, std::memory_order_release);
   if (work_probe_) {
@@ -658,10 +637,10 @@ class OpenedExplore final {
 public:
  OpenedExplore(std::shared_ptr<FakeImageBackend> backend, const VisualExtent extent)
      : explore_(settings_.system(), kDevice, 2U,
-                RuntimeFactory(
-                 0, std::move(backend), mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic,
-                 [] { return std::make_unique<TestExploreAlgorithm>(std::make_shared<std::atomic<std::size_t>>(0U)); }, 3U),
-                [this](ExploreSystem::event_type) { events_.Advance(); }) {
+        RuntimeFactory(
+         0, std::move(backend), mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic, [] { return std::make_unique<TestExploreAlgorithm>(std::make_shared<std::atomic<std::size_t>>(0U)); },
+         3U),
+        [this](ExploreSystem::event_type) { events_.Advance(); }) {
   static_cast<void>(explore_.Open({.viewport = {.extent = extent, .columns = extent.width / extent.height}, .compiled_source = "/test"}));
   REQUIRE(events_.Wait([this] { return explore_.snapshot().ready; }));
  }
@@ -680,11 +659,8 @@ class ExploreScenario final {
 public:
  using ModelFactory = std::function<std::unique_ptr<mmltk::frameworks::gpu::SystemImageModel>()>;
  using Observer = std::function<void(ExploreSystem::event_type)>;
- ExploreScenario(LoadedSettings& settings, std::shared_ptr<FakeImageBackend> backend, ModelFactory model = {}, Observer observer = {},
-                 VisualDiagnosticSink diagnostics = {})
-     : ExploreScenario(
-        settings, 2U,
-        RuntimeFactory(0, std::move(backend), mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic, model ? std::move(model) : DefaultModel(), 3U),
+ ExploreScenario(LoadedSettings& settings, std::shared_ptr<FakeImageBackend> backend, ModelFactory model = {}, Observer observer = {}, VisualDiagnosticSink diagnostics = {})
+     : ExploreScenario(settings, 2U, RuntimeFactory(0, std::move(backend), mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic, model ? std::move(model) : DefaultModel(), 3U),
         std::move(observer), diagnostics) {}
  ExploreScenario(LoadedSettings& settings, const std::size_t nproc, VisualRuntimeFactory runtime, Observer observer = {}, VisualDiagnosticSink diagnostics = {})
      : observer_(std::move(observer)),
@@ -708,11 +684,9 @@ public:
   return [commits = std::move(commits)] { return std::make_unique<TestExploreAlgorithm>(std::make_shared<std::atomic<std::size_t>>(0U), nullptr, commits); };
  }
  [[nodiscard]] static ModelFactory TrackWork(std::shared_ptr<ExploreWorkProbe> work) {
-  return
-   [work = std::move(work)] { return std::make_unique<TestExploreAlgorithm>(std::make_shared<std::atomic<std::size_t>>(0U), nullptr, nullptr, nullptr, work); };
+  return [work = std::move(work)] { return std::make_unique<TestExploreAlgorithm>(std::make_shared<std::atomic<std::size_t>>(0U), nullptr, nullptr, nullptr, work); };
  }
- [[nodiscard]] static ModelFactory GateAfterRender(std::shared_ptr<ExplorePostRenderGate> gate, std::shared_ptr<std::atomic_uint64_t> commits = {},
-                                                   std::shared_ptr<ExploreWorkProbe> work = {}) {
+ [[nodiscard]] static ModelFactory GateAfterRender(std::shared_ptr<ExplorePostRenderGate> gate, std::shared_ptr<std::atomic_uint64_t> commits = {}, std::shared_ptr<ExploreWorkProbe> work = {}) {
   return [gate = std::move(gate), commits = std::move(commits), work = std::move(work)] {
    return std::make_unique<TestExploreAlgorithm>(std::make_shared<std::atomic<std::size_t>>(0U), nullptr, commits, nullptr, work, gate);
   };

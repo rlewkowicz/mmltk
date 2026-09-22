@@ -50,11 +50,8 @@ public:
  LiveCompositeOutputLease& operator=(const LiveCompositeOutputLease&) = delete;
  LiveCompositeOutputLease(LiveCompositeOutputLease&& other) noexcept;
  LiveCompositeOutputLease& operator=(LiveCompositeOutputLease&& other) noexcept;
- [[nodiscard]] static LiveCompositeOutputLease Create(void* owner, CompleteCallback complete, AbandonCallback abandon, LiveOutputFrame view,
-                                                      PhysicalFrameRevision frame_revision) noexcept;
- [[nodiscard]] explicit operator bool() const noexcept {
-  return owner_ != nullptr && complete_ != nullptr && abandon_ != nullptr && view_.valid() && frame_revision_.valid();
- }
+ [[nodiscard]] static LiveCompositeOutputLease Create(void* owner, CompleteCallback complete, AbandonCallback abandon, LiveOutputFrame view, PhysicalFrameRevision frame_revision) noexcept;
+ [[nodiscard]] explicit operator bool() const noexcept { return owner_ != nullptr && complete_ != nullptr && abandon_ != nullptr && view_.valid() && frame_revision_.valid(); }
  [[nodiscard]] const LiveOutputFrame& view() const noexcept { return view_; }
  [[nodiscard]] PhysicalFrameRevision frame_revision() const noexcept { return frame_revision_; }
  void Complete() && noexcept;

@@ -11,18 +11,13 @@ torch::Tensor cast_for_kernel(const torch::Tensor& tensor) {
  if (tensor.scalar_type() == torch::kHalf || tensor.scalar_type() == torch::kBFloat16) { return tensor.to(torch::kFloat32).contiguous(); }
  TORCH_CHECK(false, "deformable attention CUDA supports float32 inputs or AMP upcasts from fp16/bf16");
 }
-torch::ScalarType restore_dtype(torch::autograd::AutogradContext* ctx, const char* key) {
- return static_cast<torch::ScalarType>(ctx->saved_data[key].toInt());
-}  // namespace
+torch::ScalarType restore_dtype(torch::autograd::AutogradContext* ctx, const char* key) { return static_cast<torch::ScalarType>(ctx->saved_data[key].toInt()); }  // namespace
 class MsDeformAttnAutograd : public torch::autograd::Function<MsDeformAttnAutograd> {
 public:
- static torch::autograd::variable_list forward(torch::autograd::AutogradContext* ctx, const torch::Tensor& value, const torch::Tensor& spatial_shapes,
-                                               const torch::Tensor& level_start_index, const torch::Tensor& sampling_locations,
-                                               const torch::Tensor& attention_weights, int64_t im2col_step) {
-  TORCH_CHECK(value.is_cuda() && sampling_locations.is_cuda() && attention_weights.is_cuda(),
-              "deformable attention values, locations, and weights must be CUDA tensors");
-  TORCH_CHECK(value.device() == sampling_locations.device() && value.device() == attention_weights.device(),
-              "deformable attention CUDA inputs must share one device");
+ static torch::autograd::variable_list forward(torch::autograd::AutogradContext* ctx, const torch::Tensor& value, const torch::Tensor& spatial_shapes, const torch::Tensor& level_start_index,
+  const torch::Tensor& sampling_locations, const torch::Tensor& attention_weights, int64_t im2col_step) {
+  TORCH_CHECK(value.is_cuda() && sampling_locations.is_cuda() && attention_weights.is_cuda(), "deformable attention values, locations, and weights must be CUDA tensors");
+  TORCH_CHECK(value.device() == sampling_locations.device() && value.device() == attention_weights.device(), "deformable attention CUDA inputs must share one device");
   TORCH_CHECK(spatial_shapes.device().is_cpu() && level_start_index.device().is_cpu(), "deformable attention layout metadata must remain on CPU");
   c10::cuda::CUDAGuard device_guard(value.device());
   auto value_fp32 = cast_for_kernel(value);
@@ -53,18 +48,21 @@ public:
   auto grad_sampling_locations = grads[1].to(restore_dtype(ctx, "sampling_dtype"));
   auto grad_attention_weights = grads[2].to(restore_dtype(ctx, "attention_dtype"));
   return {
-   grad_value, torch::Tensor(), torch::Tensor(), grad_sampling_locations, grad_attention_weights, torch::Tensor(),
+   grad_value,
+   torch::Tensor(),
+   torch::Tensor(),
+   grad_sampling_locations,
+   grad_attention_weights,
+   torch::Tensor(),
   };
  }
 };
 }  // namespace
 namespace detail {
-void ms_deform_attn_cuda_autograd_abi(const void* const value, const void* const spatial_shapes, const void* const level_start_index,
-                                      const void* const sampling_locations, const void* const attention_weights, const std::int64_t im2col_step,
-                                      void* const output) {
- auto outputs = MsDeformAttnAutograd::apply(*static_cast<const torch::Tensor*>(value), *static_cast<const torch::Tensor*>(spatial_shapes),
-                                            *static_cast<const torch::Tensor*>(level_start_index), *static_cast<const torch::Tensor*>(sampling_locations),
-                                            *static_cast<const torch::Tensor*>(attention_weights), im2col_step);
+void ms_deform_attn_cuda_autograd_abi(const void* const value, const void* const spatial_shapes, const void* const level_start_index, const void* const sampling_locations,
+ const void* const attention_weights, const std::int64_t im2col_step, void* const output) {
+ auto outputs = MsDeformAttnAutograd::apply(*static_cast<const torch::Tensor*>(value), *static_cast<const torch::Tensor*>(spatial_shapes), *static_cast<const torch::Tensor*>(level_start_index),
+  *static_cast<const torch::Tensor*>(sampling_locations), *static_cast<const torch::Tensor*>(attention_weights), im2col_step);
  *static_cast<torch::Tensor*>(output) = outputs.front();
 }
 }  // namespace detail

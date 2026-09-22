@@ -37,8 +37,8 @@ public:
   worker_.RegisterContinuation([this](auto& runtime, const std::stop_token stop) { return Capture(runtime, stop); }, {}, true);
  }
  LiveSnapshot Start(const LiveStart request) {
-  if (!request.extent.valid() || request.extent.width > settings_.maximum_width || request.extent.height > settings_.maximum_height ||
-      request.frames_per_second == 0U || request.frames_per_second > 240U)
+  if (!request.extent.valid() || request.extent.width > settings_.maximum_width || request.extent.height > settings_.maximum_height || request.frames_per_second == 0U ||
+      request.frames_per_second > 240U)
    throw contracts::InvalidIntentError("Live capture settings are invalid");
   const auto cadence = std::chrono::microseconds{1'000'000U / request.frames_per_second};
   std::scoped_lock state_lock(mutex_);
@@ -156,8 +156,7 @@ private:
   if (!candidate.valid()) return {};
   if (!algorithm->AcquireOutput()) return {};
   bool captured = false;
-  runtime.PublishRetained(candidate, request_.extent.width, request_.extent.height,
-                          [&](const auto target, const auto, const auto stream) { captured = algorithm->Capture(target, stream, run_stop); });
+  runtime.PublishRetained(candidate, request_.extent.width, request_.extent.height, [&](const auto target, const auto, const auto stream) { captured = algorithm->Capture(target, stream, run_stop); });
   if (!captured || run_stop.stop_requested()) {
    static_cast<void>(worker_.NotifyContinuation());
    return {};
@@ -173,10 +172,8 @@ private:
   next_capture_ = std::chrono::steady_clock::now() + cadence_;
   worker_.NotifyContinuationAt(next_capture_);
   diagnostics_.Emit([&] {
-   return VisualDiagnosticFact{.system = contracts::DiagnosticOwner::Live,
-                               .operation = VisualDiagnosticOperation::FrameCompleted,
-                               .device = settings_.device,
-                               .generation = runtime.OutputFacts().revision};
+   return VisualDiagnosticFact{
+    .system = contracts::DiagnosticOwner::Live, .operation = VisualDiagnosticOperation::FrameCompleted, .device = settings_.device, .generation = runtime.OutputFacts().revision};
   });
   return [this] { PublishFrame(); };
  }

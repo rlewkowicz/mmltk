@@ -30,8 +30,7 @@ std::vector<std::uint8_t> bgr_to_rgb_copy(const std::vector<std::uint8_t>& pixel
 }
 }  // namespace
 std::string next_annotation_object_id(const std::size_t object_count) { return "manual-" + std::to_string(object_count + 1U); }
-void write_annotation_png(const std::filesystem::path& path, const int width, const int height, const int channels, const void* pixels,
-                          const int stride_bytes) {
+void write_annotation_png(const std::filesystem::path& path, const int width, const int height, const int channels, const void* pixels, const int stride_bytes) {
  if (stbi_write_png(path.c_str(), width, height, channels, pixels, stride_bytes) == 0) { throw std::runtime_error("failed to write PNG: " + path.string()); }
 }
 AnnotationFrame load_annotation_frame(const AnnotationImageInput& input) {
@@ -66,13 +65,9 @@ void write_annotation_frame_png(const std::filesystem::path& path, const Annotat
  write_annotation_png(path, static_cast<int>(frame.width), static_cast<int>(frame.height), 3, pixels_rgb.data(), static_cast<int>(frame.width * 3U));
 }
 AnnotationHsv sample_annotation_hsv(const AnnotationFrame& frame, const int x, const int y) {
- if (x < 0 || y < 0 || x >= static_cast<int>(frame.width) || y >= static_cast<int>(frame.height)) {
-  throw std::runtime_error("annotation eyedropper sample is outside the current frame");
- }
+ if (x < 0 || y < 0 || x >= static_cast<int>(frame.width) || y >= static_cast<int>(frame.height)) { throw std::runtime_error("annotation eyedropper sample is outside the current frame"); }
  const std::vector<std::uint8_t>& pixels_bgr = annotation_frame_pixels(frame);
- if (pixels_bgr.size() < static_cast<std::size_t>(frame.width) * static_cast<std::size_t>(frame.height) * 3U) {
-  throw std::runtime_error("annotation eyedropper sample requires frame pixels");
- }
+ if (pixels_bgr.size() < static_cast<std::size_t>(frame.width) * static_cast<std::size_t>(frame.height) * 3U) { throw std::runtime_error("annotation eyedropper sample requires frame pixels"); }
  const std::size_t pixel_index = static_cast<std::size_t>(y) * static_cast<std::size_t>(frame.width) + static_cast<std::size_t>(x);
  const std::size_t byte_offset = pixel_index * 3U;
  return annotation_bgr_to_hsv(pixels_bgr[byte_offset + 0], pixels_bgr[byte_offset + 1], pixels_bgr[byte_offset + 2]);
@@ -85,8 +80,8 @@ void recenter_annotation_range(AnnotationColorRange& range, const AnnotationHsv&
  range.sampling = false;
 }
 bool annotation_range_active(const AnnotationColorRange& range) {
- return range.tolerance.hue_minus_pct > 0.0f || range.tolerance.hue_plus_pct > 0.0f || range.tolerance.saturation_minus_pct > 0.0f ||
-        range.tolerance.saturation_plus_pct > 0.0f || range.tolerance.value_minus_pct > 0.0f || range.tolerance.value_plus_pct > 0.0f;
+ return range.tolerance.hue_minus_pct > 0.0f || range.tolerance.hue_plus_pct > 0.0f || range.tolerance.saturation_minus_pct > 0.0f || range.tolerance.saturation_plus_pct > 0.0f ||
+        range.tolerance.value_minus_pct > 0.0f || range.tolerance.value_plus_pct > 0.0f;
 }
 bool annotation_box_has_area(const AnnotationBox& box) { return box.x2 > box.x1 && box.y2 > box.y1; }
 AnnotationBox normalize_annotation_box(AnnotationBox box, const std::uint32_t width, const std::uint32_t height) {
@@ -151,8 +146,7 @@ AnnotationFrame extract_annotation_frame_region(const AnnotationFrame& frame, co
  const AnnotationBox requested = normalize_annotation_box(capture_box, annotation_frame_capture_width(frame), annotation_frame_capture_height(frame));
  const AnnotationBox view_box = annotation_frame_view_box(frame);
  const AnnotationBox overlap = annotation_intersect_boxes(requested, view_box);
- if (!annotation_box_has_area(requested) || overlap.x1 != requested.x1 || overlap.y1 != requested.y1 || overlap.x2 != requested.x2 ||
-     overlap.y2 != requested.y2) {
+ if (!annotation_box_has_area(requested) || overlap.x1 != requested.x1 || overlap.y1 != requested.y1 || overlap.x2 != requested.x2 || overlap.y2 != requested.y2) {
   throw std::runtime_error("requested annotation crop is outside the current frame view");
  }
  AnnotationFrame extracted = frame;
@@ -166,11 +160,9 @@ AnnotationFrame extract_annotation_frame_region(const AnnotationFrame& frame, co
  const std::vector<std::uint8_t>& source_pixels = annotation_frame_pixels(frame);
  const AnnotationBox local = annotation_box_to_frame(frame, requested);
  for (std::uint32_t row = 0; row < extracted.height; ++row) {
-  const std::size_t src_offset =
-   (static_cast<std::size_t>(local.y1) + static_cast<std::size_t>(row)) * static_cast<std::size_t>(frame.width) * 3U + static_cast<std::size_t>(local.x1) * 3U;
+  const std::size_t src_offset = (static_cast<std::size_t>(local.y1) + static_cast<std::size_t>(row)) * static_cast<std::size_t>(frame.width) * 3U + static_cast<std::size_t>(local.x1) * 3U;
   const std::size_t dst_offset = static_cast<std::size_t>(row) * static_cast<std::size_t>(extracted.width) * 3U;
-  std::copy_n(source_pixels.begin() + static_cast<std::ptrdiff_t>(src_offset), static_cast<std::size_t>(extracted.width) * 3U,
-              extracted_pixels.begin() + static_cast<std::ptrdiff_t>(dst_offset));
+  std::copy_n(source_pixels.begin() + static_cast<std::ptrdiff_t>(src_offset), static_cast<std::size_t>(extracted.width) * 3U, extracted_pixels.begin() + static_cast<std::ptrdiff_t>(dst_offset));
  }
  set_annotation_frame_pixels(extracted, std::move(extracted_pixels));
  return extracted;

@@ -65,8 +65,8 @@ public:
  TrainProcessClient& operator=(const TrainProcessClient&) = delete;
  TrainProcessClient(TrainProcessClient&&) noexcept;
  TrainProcessClient& operator=(TrainProcessClient&&) noexcept = delete;
- [[nodiscard]] static TrainProcessClient launch(const mmltk::backend::models::rfdetr::TrainRequest& request, const std::filesystem::path& cli_path,
-                                                std::string_view fallback_preset_name = {}, TrainProcessOptions options = {});
+ [[nodiscard]] static TrainProcessClient launch(
+  const mmltk::backend::models::rfdetr::TrainRequest& request, const std::filesystem::path& cli_path, std::string_view fallback_preset_name = {}, TrainProcessOptions options = {});
  [[nodiscard]] bool active() const noexcept;
  [[nodiscard]] std::int32_t process_group_id() const noexcept;
  [[nodiscard]] int stdout_fd() const noexcept;
@@ -78,8 +78,7 @@ public:
  [[nodiscard]] bool request_stop(bool force) noexcept;
  [[nodiscard]] bool consume_stop_request();
  [[nodiscard]] bool consume_escalation();
- std::size_t consume_output(std::string& output, std::size_t budget = kTrainProcessReadBudget,
-                            std::size_t retention_limit = std::numeric_limits<std::size_t>::max());
+ std::size_t consume_output(std::string& output, std::size_t budget = kTrainProcessReadBudget, std::size_t retention_limit = std::numeric_limits<std::size_t>::max());
  [[nodiscard]] std::optional<TrainProcessProgress> consume_progress();
  [[nodiscard]] std::optional<TrainProcessExit> consume_exit(std::string* retained_output = nullptr);
  void force_reap() noexcept;

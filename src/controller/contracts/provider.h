@@ -40,9 +40,8 @@ struct ProviderOffer final {
  [[= mmltk::frameworks::reflection::MaxBytes{128U}]] std::string location{};
  ProviderGpuFamily family = ProviderGpuFamily::A100;
  [[nodiscard]] bool valid() const noexcept {
-  return offer_id > 0 && gpu_count > 0 && gpu_name.size() <= 128U && location.size() <= 128U && std::isfinite(gpu_ram_gib) && gpu_ram_gib >= 0.0 &&
-         std::isfinite(hourly_price) && hourly_price >= 0.0 && std::isfinite(reliability) && reliability >= 0.0 && reliability <= 1.0 &&
-         static_cast<std::uint8_t>(family) <= static_cast<std::uint8_t>(ProviderGpuFamily::LSeries);
+  return offer_id > 0 && gpu_count > 0 && gpu_name.size() <= 128U && location.size() <= 128U && std::isfinite(gpu_ram_gib) && gpu_ram_gib >= 0.0 && std::isfinite(hourly_price) &&
+         hourly_price >= 0.0 && std::isfinite(reliability) && reliability >= 0.0 && reliability <= 1.0 && static_cast<std::uint8_t>(family) <= static_cast<std::uint8_t>(ProviderGpuFamily::LSeries);
  }
  bool operator==(const ProviderOffer&) const = default;
 };
@@ -53,8 +52,8 @@ struct ProviderPreferences final {
  [[= mmltk::frameworks::reflection::MaxBytes{kProviderTextCapacity}]] std::string image{};
  [[= mmltk::frameworks::reflection::MaxBytes{kProviderTextCapacity}]] std::string template_text{};
  [[nodiscard]] bool valid() const noexcept {
-  if (minimum_gpus <= 0 || result_limit == 0U || result_limit > kProviderOfferCapacity || families.empty() || image.empty() ||
-      image.size() > kProviderTextCapacity || template_text.size() > kProviderTextCapacity) {
+  if (minimum_gpus <= 0 || result_limit == 0U || result_limit > kProviderOfferCapacity || families.empty() || image.empty() || image.size() > kProviderTextCapacity ||
+      template_text.size() > kProviderTextCapacity) {
    return false;
   }
   for (std::size_t index = 0U; index < families.size(); ++index) {
@@ -78,41 +77,28 @@ struct[[= mmltk::controller::contracts::reflection::feature_scope(mmltk::control
 struct[[= mmltk::controller::contracts::reflection::feature_scope(mmltk::controller::contracts::FeatureId::Train)]] ProviderStopIntent final {};
 enum class ProviderQueryOutcome : std::uint8_t { Idle, Succeeded, Failed, Cancelled, Rejected };
 inline constexpr std::array kProviderQueryTerminalPresentations{
- terminal_presentation::Policy{ProviderQueryOutcome::Idle, terminal_presentation::Classification::Refused, "provider.query.idle",
-                               "No provider query has completed."},
+ terminal_presentation::Policy{ProviderQueryOutcome::Idle, terminal_presentation::Classification::Refused, "provider.query.idle", "No provider query has completed."},
  terminal_presentation::Policy{ProviderQueryOutcome::Succeeded, terminal_presentation::Classification::Success, "provider.query.succeeded", ""},
- terminal_presentation::Policy{ProviderQueryOutcome::Failed, terminal_presentation::Classification::Failed, "provider.query.failed",
-                               "The provider query failed."},
- terminal_presentation::Policy{ProviderQueryOutcome::Cancelled, terminal_presentation::Classification::Cancelled, "provider.query.cancelled",
-                               "The provider query was cancelled."},
- terminal_presentation::Policy{ProviderQueryOutcome::Rejected, terminal_presentation::Classification::Refused, "provider.query.rejected",
-                               "The provider query was rejected."},
+ terminal_presentation::Policy{ProviderQueryOutcome::Failed, terminal_presentation::Classification::Failed, "provider.query.failed", "The provider query failed."},
+ terminal_presentation::Policy{ProviderQueryOutcome::Cancelled, terminal_presentation::Classification::Cancelled, "provider.query.cancelled", "The provider query was cancelled."},
+ terminal_presentation::Policy{ProviderQueryOutcome::Rejected, terminal_presentation::Classification::Refused, "provider.query.rejected", "The provider query was rejected."},
 };
 static_assert(terminal_presentation::complete(kProviderQueryTerminalPresentations));
-[[nodiscard]] consteval const auto& materialized_terminal_presentation_policy(std::type_identity<ProviderQueryOutcome>) {
- return kProviderQueryTerminalPresentations;
-}
+[[nodiscard]] consteval const auto& materialized_terminal_presentation_policy(std::type_identity<ProviderQueryOutcome>) { return kProviderQueryTerminalPresentations; }
 enum class RemoteSessionPhase : std::uint8_t { Absent, Running, Stopped, Unknown };
 enum class RemoteOperationOutcome : std::uint8_t { Idle, Applied, Failed, Inconclusive, Cancelled, CancellationRequested, Refused };
 inline constexpr std::array kRemoteOperationTerminalPresentations{
- terminal_presentation::Policy{RemoteOperationOutcome::Idle, terminal_presentation::Classification::Refused, "remote_operation.idle",
-                               "No remote operation has completed."},
+ terminal_presentation::Policy{RemoteOperationOutcome::Idle, terminal_presentation::Classification::Refused, "remote_operation.idle", "No remote operation has completed."},
  terminal_presentation::Policy{RemoteOperationOutcome::Applied, terminal_presentation::Classification::Success, "remote_operation.applied", ""},
- terminal_presentation::Policy{RemoteOperationOutcome::Failed, terminal_presentation::Classification::Failed, "remote_operation.failed",
-                               "The remote operation failed."},
- terminal_presentation::Policy{RemoteOperationOutcome::Inconclusive, terminal_presentation::Classification::Failed, "remote_operation.inconclusive",
-                               "The remote operation outcome is inconclusive."},
- terminal_presentation::Policy{RemoteOperationOutcome::Cancelled, terminal_presentation::Classification::Cancelled, "remote_operation.cancelled",
-                               "The remote operation was cancelled."},
- terminal_presentation::Policy{RemoteOperationOutcome::CancellationRequested, terminal_presentation::Classification::Cancelled,
-                               "remote_operation.cancellation_requested", "Remote operation cancellation was requested."},
- terminal_presentation::Policy{RemoteOperationOutcome::Refused, terminal_presentation::Classification::Refused, "remote_operation.refused",
-                               "The remote operation was refused."},
+ terminal_presentation::Policy{RemoteOperationOutcome::Failed, terminal_presentation::Classification::Failed, "remote_operation.failed", "The remote operation failed."},
+ terminal_presentation::Policy{RemoteOperationOutcome::Inconclusive, terminal_presentation::Classification::Failed, "remote_operation.inconclusive", "The remote operation outcome is inconclusive."},
+ terminal_presentation::Policy{RemoteOperationOutcome::Cancelled, terminal_presentation::Classification::Cancelled, "remote_operation.cancelled", "The remote operation was cancelled."},
+ terminal_presentation::Policy{
+  RemoteOperationOutcome::CancellationRequested, terminal_presentation::Classification::Cancelled, "remote_operation.cancellation_requested", "Remote operation cancellation was requested."},
+ terminal_presentation::Policy{RemoteOperationOutcome::Refused, terminal_presentation::Classification::Refused, "remote_operation.refused", "The remote operation was refused."},
 };
 static_assert(terminal_presentation::complete(kRemoteOperationTerminalPresentations));
-[[nodiscard]] consteval const auto& materialized_terminal_presentation_policy(std::type_identity<RemoteOperationOutcome>) {
- return kRemoteOperationTerminalPresentations;
-}
+[[nodiscard]] consteval const auto& materialized_terminal_presentation_policy(std::type_identity<RemoteOperationOutcome>) { return kRemoteOperationTerminalPresentations; }
 enum class ProviderMutation : std::uint8_t { Create, Start, Stop };
 enum class ProviderReconciliationDisposition : std::uint8_t { Applied, NotApplied, Inconclusive };
 // These are the complete provider-worker results. A provider fault is a

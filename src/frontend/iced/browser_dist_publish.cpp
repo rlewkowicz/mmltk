@@ -30,8 +30,7 @@ constexpr std::string_view kWasmSuffix = "_bg.wasm";
  std::ifstream input(marker_path, std::ios::binary);
  if (!input) { throw std::runtime_error("could not read generated native protocol marker"); }
  std::string marker{std::istreambuf_iterator<char>{input}, std::istreambuf_iterator<char>{}};
- if (!marker.starts_with(kProtocolMarkerPrefix) || marker.size() == kProtocolMarkerPrefix.size() ||
-     !std::ranges::all_of(marker.substr(kProtocolMarkerPrefix.size()), ascii_digit)) {
+ if (!marker.starts_with(kProtocolMarkerPrefix) || marker.size() == kProtocolMarkerPrefix.size() || !std::ranges::all_of(marker.substr(kProtocolMarkerPrefix.size()), ascii_digit)) {
   throw std::runtime_error("generated native protocol marker is malformed");
  }
  return marker;
@@ -85,13 +84,10 @@ constexpr std::string_view kWasmSuffix = "_bg.wasm";
   cursor = content_end + 1U;
  }
  std::size_t suffix_occurrences = 0U;
- for (std::size_t suffix_position = index.find(kWasmSuffix); suffix_position != std::string_view::npos;
-      suffix_position = index.find(kWasmSuffix, suffix_position + kWasmSuffix.size())) {
+ for (std::size_t suffix_position = index.find(kWasmSuffix); suffix_position != std::string_view::npos; suffix_position = index.find(kWasmSuffix, suffix_position + kWasmSuffix.size())) {
   ++suffix_occurrences;
  }
- if (suffix_occurrences == 0U || suffix_occurrences != accepted_occurrences || references.size() != 1U) {
-  throw std::runtime_error("browser index must select exactly one WebAssembly URL");
- }
+ if (suffix_occurrences == 0U || suffix_occurrences != accepted_occurrences || references.size() != 1U) { throw std::runtime_error("browser index must select exactly one WebAssembly URL"); }
  return *references.begin();
 }
 [[nodiscard]] std::filesystem::path admitted_relative_wasm(std::string reference) {
@@ -121,9 +117,7 @@ constexpr std::string_view kWasmSuffix = "_bg.wasm";
  const std::filesystem::path relative = admitted_relative_wasm(selected_wasm_reference(index));
  const std::filesystem::path candidate = asset_root / relative;
  const std::filesystem::file_status selected_status = std::filesystem::symlink_status(candidate);
- if (selected_status.type() != std::filesystem::file_type::regular) {
-  throw std::runtime_error("selected browser WebAssembly entry is not a non-symlink regular file");
- }
+ if (selected_status.type() != std::filesystem::file_type::regular) { throw std::runtime_error("selected browser WebAssembly entry is not a non-symlink regular file"); }
  std::size_t wasm_count = 0U;
  bool selected_path_found = false;
  for (const auto& entry : std::filesystem::recursive_directory_iterator(asset_root)) {
@@ -157,22 +151,16 @@ void validate_protocol_marker(const char* asset_root, const std::string_view mar
   }
   cursor = digits_end == cursor ? cursor + 1 : digits_end;
  }
- if (marker_count != 1U || matching_marker_count != 1U) {
-  throw std::runtime_error("selected browser WebAssembly bundle has an invalid native protocol marker");
- }
+ if (marker_count != 1U || matching_marker_count != 1U) { throw std::runtime_error("selected browser WebAssembly bundle has an invalid native protocol marker"); }
 }
 void verify(const char* asset_root, const char* protocol_marker_path) {
- if (!path_exists(asset_root) || !std::filesystem::is_directory(asset_root)) {
-  throw std::runtime_error("browser distribution is missing or is not a directory");
- }
+ if (!path_exists(asset_root) || !std::filesystem::is_directory(asset_root)) { throw std::runtime_error("browser distribution is missing or is not a directory"); }
  validate_protocol_marker(asset_root, read_protocol_marker(protocol_marker_path));
 }
 void publish(const char* staged_path, const char* current_path, const char* protocol_marker_path) {
  verify(staged_path, protocol_marker_path);
  if (!path_exists(current_path)) {
-  if (::rename(staged_path, current_path) != 0) {
-   throw std::runtime_error(std::string("initial browser distribution rename failed: ") + std::strerror(errno));
-  }
+  if (::rename(staged_path, current_path) != 0) { throw std::runtime_error(std::string("initial browser distribution rename failed: ") + std::strerror(errno)); }
   return;
  }
  if (::syscall(SYS_renameat2, AT_FDCWD, staged_path, AT_FDCWD, current_path, RENAME_EXCHANGE) != 0) {
@@ -180,10 +168,7 @@ void publish(const char* staged_path, const char* current_path, const char* prot
  }
  std::error_code cleanup_error;
  std::filesystem::remove_all(staged_path, cleanup_error);
- if (cleanup_error) {
-  std::cerr << "mmltk-browser-bundle-contract: published bundle but could not remove previous bundle at " << staged_path << ": " << cleanup_error.message()
-            << '\n';
- }
+ if (cleanup_error) { std::cerr << "mmltk-browser-bundle-contract: published bundle but could not remove previous bundle at " << staged_path << ": " << cleanup_error.message() << '\n'; }
 }
 }  // namespace
 int main(const int argc, char** argv) {

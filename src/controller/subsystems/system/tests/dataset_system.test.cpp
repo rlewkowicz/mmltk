@@ -33,8 +33,7 @@ namespace {
 class UnusedWeightOperations final : public services::ArtifactWeightOperations {
 public:
  [[nodiscard]] std::optional<services::ArtifactWeightAsset> find(std::string_view) const override { return std::nullopt; }
- void download(std::string_view, const std::filesystem::path&, const services::ArtifactCancellationToken&,
-               services::ArtifactWeightProgressObserver) const override {}
+ void download(std::string_view, const std::filesystem::path&, const services::ArtifactCancellationToken&, services::ArtifactWeightProgressObserver) const override {}
 };
 class DiagnosticCompiler final : public services::ArtifactCompilerOperations {
 public:
@@ -47,11 +46,10 @@ public:
 
 private:
  void compile_directory(const std::filesystem::path&, const std::filesystem::path&, std::uint32_t, bool, mmltk::backend::imaging::resample::ImageResizeMode,
-                        mmltk::common::concurrency::CancellationObservation, services::ArtifactProgressObserver) const override {}
- void compile_benchmark(mmltk::backend::data::BenchmarkDatasetSelection selected, const std::filesystem::path& output, const std::filesystem::path& publication,
-                        std::uint32_t, bool, mmltk::backend::imaging::resample::ImageResizeMode,
-                        mmltk::common::concurrency::CancellationObservation cancellation, services::ArtifactProgressObserver,
-                        services::ArtifactBenchmarkTraceObserver trace) const override {
+  mmltk::common::concurrency::CancellationObservation, services::ArtifactProgressObserver) const override {}
+ void compile_benchmark(mmltk::backend::data::BenchmarkDatasetSelection selected, const std::filesystem::path& output, const std::filesystem::path& publication, std::uint32_t, bool,
+  mmltk::backend::imaging::resample::ImageResizeMode, mmltk::common::concurrency::CancellationObservation cancellation, services::ArtifactProgressObserver,
+  services::ArtifactBenchmarkTraceObserver trace) const override {
   selection = selected;
   physical_output = output;
   publication_output = publication;
@@ -66,8 +64,7 @@ TEST_CASE("artifact dataset runtime owns its diagnostic target and borrows only 
  UnusedWeightOperations weights;
  DiagnosticCompiler compiler;
  const auto log = root.path() / "trace.jsonl";
- services::DiagnosticsClient client{mmltk::common::io::ScopedFd{::open(log.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600)},
-                                    services::DiagnosticsExecutionPolicy::CallerDriven};
+ services::DiagnosticsClient client{mmltk::common::io::ScopedFd{::open(log.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600)}, services::DiagnosticsExecutionPolicy::CallerDriven};
  REQUIRE(client.enabled());
  services::RuntimeDiagnosticTarget target;
  {
@@ -85,14 +82,13 @@ TEST_CASE("artifact dataset runtime owns its diagnostic target and borrows only 
   enabled = false;
  }
  SECTION("destroyed producer installs no observer") {
-  services::DiagnosticsClient temporary{mmltk::common::io::ScopedFd{::open((root.path() / "closed.jsonl").c_str(), O_WRONLY | O_CREAT | O_CLOEXEC, 0600)},
-                                        services::DiagnosticsExecutionPolicy::CallerDriven};
+  services::DiagnosticsClient temporary{
+   mmltk::common::io::ScopedFd{::open((root.path() / "closed.jsonl").c_str(), O_WRONLY | O_CREAT | O_CLOEXEC, 0600)}, services::DiagnosticsExecutionPolicy::CallerDriven};
   services::RuntimeDiagnostics creator{temporary.producer()};
   target = creator.target();
   enabled = false;
  }
- const services::ArtifactCompileRequest request{
-  .kind = services::ArtifactCompileKind::Benchmark,
+ const services::ArtifactCompileRequest request{.kind = services::ArtifactCompileKind::Benchmark,
   .source = {},
   .output = root.path() / "output",
   .preset = "rf-detr-base",
@@ -128,8 +124,8 @@ TEST_CASE("owned dataset diagnostics survive runtime failure reconstruction and 
  stored.workflows.train.compiled_dataset_dir = root.path() / "compiled";
  REQUIRE(services::SettingsStore::save(location.value(), stored, 1U).succeeded());
  REQUIRE(settings.Load(location).applied());
- services::DiagnosticsClient client{mmltk::common::io::ScopedFd{::open((root.path() / "trace.jsonl").c_str(), O_WRONLY | O_CREAT | O_CLOEXEC, 0600)},
-                                    services::DiagnosticsExecutionPolicy::CallerDriven};
+ services::DiagnosticsClient client{
+  mmltk::common::io::ScopedFd{::open((root.path() / "trace.jsonl").c_str(), O_WRONLY | O_CREAT | O_CLOEXEC, 0600)}, services::DiagnosticsExecutionPolicy::CallerDriven};
  REQUIRE(client.enabled());
  services::RuntimeDiagnosticTarget target;
  {
@@ -143,13 +139,13 @@ TEST_CASE("owned dataset diagnostics survive runtime failure reconstruction and 
  mmltk::testsupport::TestGate gate{"dataset compiler"};
  compiler.work = [](auto) { throw std::runtime_error("diagnostic compiler failure"); };
  DatasetSystem dataset{settings,
-                       [&, target] {
-                        ++constructions;
-                        return std::make_unique<ArtifactDatasetRuntime>(services::ArtifactStore{root.path() / "cache", weights, compiler}, target);
-                       },
-                       [&](DatasetSystem::event_type event) {
-                        if (std::holds_alternative<DatasetChanged>(event)) terminals.Publish(std::move(event));
-                       }};
+  [&, target] {
+   ++constructions;
+   return std::make_unique<ArtifactDatasetRuntime>(services::ArtifactStore{root.path() / "cache", weights, compiler}, target);
+  },
+  [&](DatasetSystem::event_type event) {
+   if (std::holds_alternative<DatasetChanged>(event)) terminals.Publish(std::move(event));
+  }};
  mmltk::testsupport::ScopedTestCleanup cleanup{[&] {
   gate.Release();
   dataset.Shutdown();
@@ -184,16 +180,16 @@ TEST_CASE("dataset publishes direct progress, returns Busy, stops locally, and r
  TerminalSequence<DatasetSystem::event_type> terminals;
  std::atomic_size_t progress = 0U;
  DatasetSystem dataset{settings,
-                       [&] {
-                        const bool fail = constructions++ == 0U;
-                        return std::make_unique<FakeDatasetRuntime>(gate, fail);
-                       },
-                       [&](DatasetSystem::event_type event) {
-                        if (std::holds_alternative<DatasetProgress>(event))
-                         ++progress;
-                        else
-                         terminals.Publish(std::move(event));
-                       }};
+  [&] {
+   const bool fail = constructions++ == 0U;
+   return std::make_unique<FakeDatasetRuntime>(gate, fail);
+  },
+  [&](DatasetSystem::event_type event) {
+   if (std::holds_alternative<DatasetProgress>(event))
+    ++progress;
+   else
+    terminals.Publish(std::move(event));
+  }};
  static_cast<void>(dataset.Compile({}));
  CHECK_THROWS_AS(dataset.Compile({}), contracts::BusyError);
  // CLEANUP-IGNORE: Compile and Inspect are separate dataset admission endpoints sharing one system-owned runtime.
@@ -224,13 +220,13 @@ TEST_CASE("dataset rejects Compile and a second Inspect while Inspect owns the r
  std::atomic_int constructions = 0;
  std::promise<DatasetSystem::event_type> compile_done;
  DatasetSystem dataset{settings,
-                       [&] {
-                        ++constructions;
-                        return std::make_unique<BlockingInspectRuntime>(observation);
-                       },
-                       [&](DatasetSystem::event_type event) {
-                        if (!std::holds_alternative<DatasetProgress>(event)) compile_done.set_value(std::move(event));
-                       }};
+  [&] {
+   ++constructions;
+   return std::make_unique<BlockingInspectRuntime>(observation);
+  },
+  [&](DatasetSystem::event_type event) {
+   if (!std::holds_alternative<DatasetProgress>(event)) compile_done.set_value(std::move(event));
+  }};
  const std::array<std::filesystem::path, contracts::kArtifactSplitCapacity> paths{root / "train.bin", {}, {}};
  auto inspecting = std::async(std::launch::async, [&] { return dataset.Inspect(paths, "rf-detr-base", 560U); });
  observation->inspect_started.get_future().wait();
@@ -279,8 +275,7 @@ public:
   work_(progress);
   return {.output = request.output, .inspection = successful_inspection({request.output / "train.bin", {}, {}})};
  }
- contracts::ArtifactInspection Inspect(const std::array<std::filesystem::path, contracts::kArtifactSplitCapacity>& paths, std::string_view, std::uint32_t,
-                                       std::stop_token) override {
+ contracts::ArtifactInspection Inspect(const std::array<std::filesystem::path, contracts::kArtifactSplitCapacity>& paths, std::string_view, std::uint32_t, std::stop_token) override {
   return successful_inspection(paths);
  }
 
@@ -315,8 +310,7 @@ TEST_CASE("dataset admits real open ended acquisition and successful HTTP recove
  }
  if (retry) server.fail_next(1, 8192U);
  if (redirect) server.RedirectNextTransfer();
- const DownloadRequest request{
-  "metadata", server.url("metadata"), root.path() / "metadata.bin", root.path() / "metadata.lock", unknown ? 0U : payload.size(), {}, 2U, false, source};
+ const DownloadRequest request{"metadata", server.url("metadata"), root.path() / "metadata.bin", root.path() / "metadata.lock", unknown ? 0U : payload.size(), {}, 2U, false, source};
  const DownloadRequest known{"known", server.url("known"), root.path() / "known.bin", root.path() / "known.lock", payload.size(), {}, 1U};
  if (mixed) { mmltk::testsupport::write_binary_file(known.destination, payload); }
  std::vector<contracts::ArtifactProgress> delivered;
@@ -345,17 +339,17 @@ TEST_CASE("dataset admits real open ended acquisition and successful HTTP recove
   });
  };
  DatasetSystem dataset{settings, [&] { return std::make_unique<AcquisitionDatasetRuntime>(work); },
-                       [&](DatasetSystem::event_type event) {
-                        if (const auto* progress = std::get_if<DatasetProgress>(&event)) {
-                         delivered.push_back(progress->progress);
-                         if (!notified && progress->progress.total == 0U && progress->progress.completed > (mixed ? payload.size() : 0U)) {
-                          notified = true;
-                          open_ended.set_value();
-                         }
-                        } else {
-                         terminal.set_value(std::get<DatasetChanged>(std::move(event)));
-                        }
-                       }};
+  [&](DatasetSystem::event_type event) {
+   if (const auto* progress = std::get_if<DatasetProgress>(&event)) {
+    delivered.push_back(progress->progress);
+    if (!notified && progress->progress.total == 0U && progress->progress.completed > (mixed ? payload.size() : 0U)) {
+     notified = true;
+     open_ended.set_value();
+    }
+   } else {
+    terminal.set_value(std::get<DatasetChanged>(std::move(event)));
+   }
+  }};
  const mmltk::testsupport::ScopedTestCleanup settle([&] {
   server.ReleasePartial();
   dataset.Shutdown();
@@ -399,12 +393,12 @@ TEST_CASE("dataset independently rejects each malformed progress invariant", "[c
  auto completion = terminal.get_future();
  std::size_t delivered = 0U;
  DatasetSystem dataset{settings, [&] { return std::make_unique<AcquisitionDatasetRuntime>([&](const auto& progress) { progress(malformed); }); },
-                       [&](DatasetSystem::event_type event) {
-                        if (std::holds_alternative<DatasetProgress>(event))
-                         ++delivered;
-                        else
-                         terminal.set_value(std::get<DatasetChanged>(std::move(event)));
-                       }};
+  [&](DatasetSystem::event_type event) {
+   if (std::holds_alternative<DatasetProgress>(event))
+    ++delivered;
+   else
+    terminal.set_value(std::get<DatasetChanged>(std::move(event)));
+  }};
  static_cast<void>(dataset.Compile({}));
  const auto result = mmltk::testsupport::await_test_future(completion, "malformed progress rejection");
  dataset.Shutdown();
@@ -420,10 +414,10 @@ TEST_CASE("dataset compile observes the settled benchmark selection and retains 
  REQUIRE(settings.Load(install_settings(root.path())).applied());
  contracts::SettingsUpdateRequest edit;
  edit.updates = {{.path = "workflows.train.compile_benchmark_dataset_override", .value = FlatValue{true}},
-                 {.path = "workflows.train.benchmark_selection.dataset", .value = *FlatValue::text("Coconut", 7U)},
-                 {.path = "workflows.train.benchmark_selection.validation", .value = *FlatValue::text("CoconutStock", 12U)},
-                 {.path = "workflows.train.benchmark_selection.recover_dropped_masks", .value = FlatValue{true}},
-                 {.path = "workflows.train.compiled_dataset_dir", .value = *FlatValue::text((root.path() / "output").string(), 4096U)}};
+  {.path = "workflows.train.benchmark_selection.dataset", .value = *FlatValue::text("Coconut", 7U)},
+  {.path = "workflows.train.benchmark_selection.validation", .value = *FlatValue::text("CoconutStock", 12U)},
+  {.path = "workflows.train.benchmark_selection.recover_dropped_masks", .value = FlatValue{true}},
+  {.path = "workflows.train.compiled_dataset_dir", .value = *FlatValue::text((root.path() / "output").string(), 4096U)}};
  const auto settled = settings.Update(std::move(edit));
  const data::BenchmarkDatasetSelection selected{data::BenchmarkDatasetVariant::Coconut, data::CoconutValidation::CoconutStock, true};
  REQUIRE(settled.settings_state.workflows.train.benchmark_selection == selected);
@@ -443,8 +437,7 @@ TEST_CASE("dataset compile observes the settled benchmark selection and retains 
  CHECK(compiler.selection == selected);
  contracts::SettingsUpdateRequest later;
  later.updates = {{.path = "workflows.train.benchmark_selection.recover_dropped_masks", .value = FlatValue{false}},
-                  {.path = "workflows.train.benchmark_selection.validation", .value = *FlatValue::text("Stock", 5U)},
-                  {.path = "workflows.train.compile_benchmark_dataset_override", .value = FlatValue{false}}};
+  {.path = "workflows.train.benchmark_selection.validation", .value = *FlatValue::text("Stock", 5U)}, {.path = "workflows.train.compile_benchmark_dataset_override", .value = FlatValue{false}}};
  const auto changed = settings.Update(std::move(later));
  CHECK(changed.settings_state.workflows.train.benchmark_selection.validation == data::CoconutValidation::Stock);
  CHECK(compiler.selection == selected);
@@ -460,8 +453,7 @@ TEST_CASE("configured artifact compiler receives every benchmark selection witho
  UnusedWeightOperations weights;
  DiagnosticCompiler compiler;
  ArtifactDatasetRuntime runtime{services::ArtifactStore{root.path() / "cache", weights, compiler}};
- services::ArtifactCompileRequest request{
-  .kind = services::ArtifactCompileKind::Benchmark, .source = {}, .output = root.path() / "output", .preset = "rf-detr-nano", .resolution = 384U};
+ services::ArtifactCompileRequest request{.kind = services::ArtifactCompileKind::Benchmark, .source = {}, .output = root.path() / "output", .preset = "rf-detr-nano", .resolution = 384U};
  for (const auto dataset : {data::BenchmarkDatasetVariant::CocoCustom, data::BenchmarkDatasetVariant::Coconut}) {
   for (const auto validation : {data::CoconutValidation::Coconut, data::CoconutValidation::Stock, data::CoconutValidation::CoconutStock}) {
    request.benchmark_selection = {dataset, validation};

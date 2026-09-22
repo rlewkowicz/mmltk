@@ -80,8 +80,7 @@ void ArtifactLease::release() noexcept {
 void throw_if_benchmark_cancelled(mmltk::common::concurrency::CancellationObservation cancel_requested) {
  if (cancel_requested.requested()) { throw std::runtime_error("benchmark dataset compilation cancelled"); }
 }
-void write_json_atomically(const std::filesystem::path& path, const nlohmann::json& value,
-                           const mmltk::common::concurrency::CancellationObservation cancellation) {
+void write_json_atomically(const std::filesystem::path& path, const nlohmann::json& value, const mmltk::common::concurrency::CancellationObservation cancellation) {
  (void)mmltk::common::io::ensure_parent_directory(path);
  const std::string serialized = value.dump(2);
  std::string staging_text = path.string() + ".next.XXXXXX";
@@ -110,8 +109,8 @@ nlohmann::json read_json_file(const std::filesystem::path& path) {
 bool is_safe_cache_component(const std::string_view value) noexcept {
  if (value.empty() || value == "." || value == "..") { return false; }
  for (const char character : value) {
-  const bool valid = (character >= 'a' && character <= 'z') || (character >= 'A' && character <= 'Z') || (character >= '0' && character <= '9') ||
-                     character == '-' || character == '_' || character == '.';
+  const bool valid =
+   (character >= 'a' && character <= 'z') || (character >= 'A' && character <= 'Z') || (character >= '0' && character <= '9') || character == '-' || character == '_' || character == '.';
   if (!valid) { return false; }
  }
  return true;

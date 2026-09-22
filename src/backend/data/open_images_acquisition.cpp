@@ -28,16 +28,12 @@ constexpr std::size_t kMaximumOpenImagesJpegBytes = std::size_t{8U} * 1024U * 10
 constexpr std::size_t kMaximumRetainedOpenImagesBufferBytes = std::size_t{2U} * 1024U * 1024U;
 [[nodiscard]] NormalizedImage& find_normalized_image(NormalizedAnnotationIndex* index, const std::uint64_t image_id) {
  const auto found = std::ranges::lower_bound(index->images, image_id, {}, &NormalizedImage::source_image_id);
- if (found == index->images.end() || found->source_image_id != image_id) {
-  throw std::runtime_error("cached benchmark image is absent from its annotation index");
- }
+ if (found == index->images.end() || found->source_image_id != image_id) { throw std::runtime_error("cached benchmark image is absent from its annotation index"); }
  return *found;
 }
 [[nodiscard]] const NormalizedImage& find_normalized_image(const NormalizedAnnotationIndex& index, const std::uint64_t image_id) {
  const auto found = std::ranges::lower_bound(index.images, image_id, {}, &NormalizedImage::source_image_id);
- if (found == index.images.end() || found->source_image_id != image_id) {
-  throw std::runtime_error("cached benchmark image is absent from its annotation index");
- }
+ if (found == index.images.end() || found->source_image_id != image_id) { throw std::runtime_error("cached benchmark image is absent from its annotation index"); }
  return *found;
 }
 void ensure_curl_global() { ensure_curl_global_initialized("cannot initialize Open Images transfers: "); }
@@ -52,31 +48,28 @@ struct OpenImagesTransfer {
  std::vector<std::uint8_t> encoded;
  std::exception_ptr callback_error;
  std::array<char, CURL_ERROR_SIZE> error_buffer{};
- OpenImagesTransfer(const std::uint64_t id, const std::uint32_t attempt_value, mmltk::common::concurrency::CancellationObservation cancel,
-                    std::vector<std::uint8_t> reusable_buffer)
+ OpenImagesTransfer(const std::uint64_t id, const std::uint32_t attempt_value, mmltk::common::concurrency::CancellationObservation cancel, std::vector<std::uint8_t> reusable_buffer)
      : image_id(id), attempt(attempt_value), cancel_requested(cancel), easy(curl_easy_init()), encoded(std::move(reusable_buffer)) {
   if (!easy) { throw std::runtime_error("cannot allocate Open Images transfer"); }
   encoded.clear();
   const std::string url = open_images_train_image_url(image_id);
   configure_curl_transfer(easy.get(),
-                          CurlTransferSetup{
-                           .url = url.c_str(),
-                           .maximum_redirects = 5L,
-                           .error_buffer = error_buffer.data(),
-                           .owner = this,
-                           .write_callback = &OpenImagesTransfer::write_callback,
-                           .header_callback = nullptr,
-                           .progress_callback = &curl_cancel_progress_callback<OpenImagesTransfer>,
-                          },
-                          "cannot configure Open Images ");
+   CurlTransferSetup{
+    .url = url.c_str(),
+    .maximum_redirects = 5L,
+    .error_buffer = error_buffer.data(),
+    .owner = this,
+    .write_callback = &OpenImagesTransfer::write_callback,
+    .header_callback = nullptr,
+    .progress_callback = &curl_cancel_progress_callback<OpenImagesTransfer>,
+   },
+   "cannot configure Open Images ");
   set_open_images_curl_long_option(easy.get(), CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_2TLS, "HTTP/2");
   set_open_images_curl_long_option(easy.get(), CURLOPT_TCP_KEEPALIVE, 1L, "TCP keepalive");
  }
  static std::size_t write_callback(char* data, const std::size_t size, const std::size_t count, void* opaque) {
   return curl_run_data_callback<OpenImagesTransfer>(size, count, opaque, [data](OpenImagesTransfer& transfer, const std::size_t bytes) {
-   if (bytes > kMaximumOpenImagesJpegBytes || transfer.encoded.size() > kMaximumOpenImagesJpegBytes - bytes) {
-    throw std::runtime_error("Open Images JPEG exceeds the bounded transfer size");
-   }
+   if (bytes > kMaximumOpenImagesJpegBytes || transfer.encoded.size() > kMaximumOpenImagesJpegBytes - bytes) { throw std::runtime_error("Open Images JPEG exceeds the bounded transfer size"); }
    const auto* source = reinterpret_cast<const std::uint8_t*>(data);
    transfer.encoded.insert(transfer.encoded.end(), source, source + bytes);
    return bytes;
@@ -212,20 +205,16 @@ private:
  std::size_t outstanding_ = 0U;
  bool stopping_ = false;
 };
-void download_open_images(const std::span<const std::uint64_t> expected_ids, const std::filesystem::path& image_root,
-                          NormalizedAnnotationIndex* annotation_index, std::vector<QuarantinedImage>* quarantined,
-                          mmltk::common::concurrency::CancellationObservation cancel_requested, ProgressReporter* progress, std::uint64_t* completed_images,
-                          const std::uint64_t total_images, std::uint64_t* cached_image_bytes, const std::size_t transfer_concurrency,
-                          const std::size_t cache_workers, const BenchmarkTraceSink& trace) {
+void download_open_images(const std::span<const std::uint64_t> expected_ids, const std::filesystem::path& image_root, NormalizedAnnotationIndex* annotation_index,
+ std::vector<QuarantinedImage>* quarantined, mmltk::common::concurrency::CancellationObservation cancel_requested, ProgressReporter* progress, std::uint64_t* completed_images,
+ const std::uint64_t total_images, std::uint64_t* cached_image_bytes, const std::size_t transfer_concurrency, const std::size_t cache_workers, const BenchmarkTraceSink& trace) {
  ensure_curl_global();
  CurlMulti multi(curl_multi_init());
  if (!multi) { throw std::runtime_error("cannot allocate Open Images multi transfer"); }
- if (curl_multi_setopt(multi.get(), CURLMOPT_MAX_TOTAL_CONNECTIONS,
-                       common_math::checked_cast<long>(transfer_concurrency, "Open Images concurrency overflow")) != CURLM_OK) {
+ if (curl_multi_setopt(multi.get(), CURLMOPT_MAX_TOTAL_CONNECTIONS, common_math::checked_cast<long>(transfer_concurrency, "Open Images concurrency overflow")) != CURLM_OK) {
   throw std::runtime_error("cannot set Open Images transfer concurrency");
  }
- if (curl_multi_setopt(multi.get(), CURLMOPT_MAX_HOST_CONNECTIONS,
-                       common_math::checked_cast<long>(transfer_concurrency, "Open Images host concurrency overflow")) != CURLM_OK ||
+ if (curl_multi_setopt(multi.get(), CURLMOPT_MAX_HOST_CONNECTIONS, common_math::checked_cast<long>(transfer_concurrency, "Open Images host concurrency overflow")) != CURLM_OK ||
      curl_multi_setopt(multi.get(), CURLMOPT_PIPELINING, CURLPIPE_MULTIPLEX) != CURLM_OK) {
   throw std::runtime_error("cannot configure Open Images HTTP multiplexing");
  }
@@ -253,13 +242,10 @@ void download_open_images(const std::span<const std::uint64_t> expected_ids, con
  const auto recycle_buffer = [&](std::unique_ptr<OpenImagesTransfer>& transfer) { recycle_encoded(std::move(transfer->encoded)); };
  const auto report_image_progress = [&] {
   constexpr std::uint64_t kProgressBatch = 64U;
-  if (*completed_images == total_images || *completed_images % kProgressBatch == 0U) {
-   progress->source_images(BenchmarkDatasetSource::kOpenImagesV7, *completed_images, total_images);
-  }
+  if (*completed_images == total_images || *completed_images % kProgressBatch == 0U) { progress->source_images(BenchmarkDatasetSource::kOpenImagesV7, *completed_images, total_images); }
  };
  const auto retry_or_quarantine = [&](const std::uint64_t image_id, const std::uint32_t attempt, std::string reason, const bool throttled = false) {
-  trace_benchmark_event(trace, "benchmark.open_images.image_attempt_failed",
-                        [&] { return nlohmann::json{{"image_id", image_id}, {"attempt", attempt}, {"reason", reason}}; });
+  trace_benchmark_event(trace, "benchmark.open_images.image_attempt_failed", [&] { return nlohmann::json{{"image_id", image_id}, {"attempt", attempt}, {"reason", reason}}; });
   if (attempt < kMaximumAttempts) {
    const std::uint64_t backoff_ms = std::min<std::uint64_t>(throttled ? 8000U : 2000U, (throttled ? 500U : 100U) << std::min<std::uint32_t>(attempt - 1U, 4U));
    pending.push_back(Pending{image_id, attempt + 1U, Clock::now() + std::chrono::milliseconds{backoff_ms}});
@@ -321,14 +307,12 @@ void download_open_images(const std::span<const std::uint64_t> expected_ids, con
     long response_code = 0L;
     (void)curl_easy_getinfo(completion->handle, CURLINFO_RESPONSE_CODE, &response_code);
     if (completion->result != CURLE_OK || response_code != 200L || transfer->encoded.empty()) {
-     const std::string reason = transfer->error_buffer[0] != '\0' ? transfer->error_buffer.data()
-                                                                  : "HTTP " + std::to_string(response_code) + ": " + curl_easy_strerror(completion->result);
+     const std::string reason = transfer->error_buffer[0] != '\0' ? transfer->error_buffer.data() : "HTTP " + std::to_string(response_code) + ": " + curl_easy_strerror(completion->result);
      retry_or_quarantine(transfer->image_id, transfer->attempt, reason, response_code == 429L || response_code == 503L);
      if (response_code == 429L || response_code == 503L) {
       active_limit = std::max<std::size_t>(minimum_active_limit, active_limit * 3U / 4U);
       successes_since_throttle = 0U;
-      progress->source_activity(BenchmarkDatasetSource::kOpenImagesV7,
-                                "Open Images server throttled; continuing with " + std::to_string(active_limit) + " concurrent requests");
+      progress->source_activity(BenchmarkDatasetSource::kOpenImagesV7, "Open Images server throttled; continuing with " + std::to_string(active_limit) + " concurrent requests");
      }
      recycle_buffer(transfer);
      continue;
@@ -377,10 +361,8 @@ struct CachedOpenImagesGroup {
  if (length <= 0 || static_cast<std::size_t>(length) >= shard_buffer.size()) { throw std::runtime_error("cannot format Open Images image group"); }
  return std::string(shard_buffer.data(), static_cast<std::size_t>(length));
 }
-[[nodiscard]] CachedOpenImagesGroup discover_cached_open_images_group(const std::filesystem::path& image_root, const std::filesystem::path& completion,
-                                                                      const std::string_view identity, const std::span<const std::uint64_t> requested_image_ids,
-                                                                      mmltk::common::concurrency::CancellationObservation cancel_requested,
-                                                                      const BenchmarkTraceSink& trace) {
+[[nodiscard]] CachedOpenImagesGroup discover_cached_open_images_group(const std::filesystem::path& image_root, const std::filesystem::path& completion, const std::string_view identity,
+ const std::span<const std::uint64_t> requested_image_ids, mmltk::common::concurrency::CancellationObservation cancel_requested, const BenchmarkTraceSink& trace) {
  CachedOpenImagesGroup result;
  try {
   if (!std::filesystem::is_regular_file(completion)) { return result; }
@@ -389,9 +371,8 @@ struct CachedOpenImagesGroup {
   const std::size_t requested_count = manifest.value("requested_image_count", available_count);
   const std::string available_digest = manifest.value("selection_sha256", std::string{});
   const std::string requested_digest = manifest.value("requested_selection_sha256", available_digest);
-  if (manifest.value("schema_version", 0U) != kBenchmarkCacheSchemaVersion || !manifest.value("complete", false) ||
-      manifest.value("identity", std::string{}) != identity || requested_count != requested_image_ids.size() || available_count > requested_image_ids.size() ||
-      requested_digest != cached_image_selection_digest(requested_image_ids)) {
+  if (manifest.value("schema_version", 0U) != kBenchmarkCacheSchemaVersion || !manifest.value("complete", false) || manifest.value("identity", std::string{}) != identity ||
+      requested_count != requested_image_ids.size() || available_count > requested_image_ids.size() || requested_digest != cached_image_selection_digest(requested_image_ids)) {
    return result;
   }
   if (const auto iterator = manifest.find("quarantined"); iterator != manifest.end()) {
@@ -407,9 +388,7 @@ struct CachedOpenImagesGroup {
    std::ranges::sort(result.quarantined, {}, &QuarantinedImage::image_id);
    if (std::ranges::adjacent_find(result.quarantined, {}, &QuarantinedImage::image_id) != result.quarantined.end()) { return CachedOpenImagesGroup{}; }
   }
-  if (result.quarantined.size() > requested_image_ids.size() || available_count != requested_image_ids.size() - result.quarantined.size()) {
-   return CachedOpenImagesGroup{};
-  }
+  if (result.quarantined.size() > requested_image_ids.size() || available_count != requested_image_ids.size() - result.quarantined.size()) { return CachedOpenImagesGroup{}; }
   result.available_image_ids.reserve(requested_image_ids.size() - result.quarantined.size());
   std::size_t quarantine_index = 0U;
   for (const std::uint64_t image_id : requested_image_ids) {
@@ -419,9 +398,7 @@ struct CachedOpenImagesGroup {
    }
    result.available_image_ids.push_back(image_id);
   }
-  if (available_count != result.available_image_ids.size() || available_digest != cached_image_selection_digest(result.available_image_ids)) {
-   return CachedOpenImagesGroup{};
-  }
+  if (available_count != result.available_image_ids.size() || available_digest != cached_image_selection_digest(result.available_image_ids)) { return CachedOpenImagesGroup{}; }
   const auto dimensions = manifest.find("dimensions");
   if (dimensions == manifest.end() || !dimensions->is_array() || dimensions->size() != available_count * 3U) { return CachedOpenImagesGroup{}; }
   result.dimensions.reserve(available_count);
@@ -432,8 +409,7 @@ struct CachedOpenImagesGroup {
    if (image_id != result.available_image_ids[index] || width == 0U || height == 0U) { return CachedOpenImagesGroup{}; }
    result.dimensions.push_back({width, height});
   }
-  if (!result.available_image_ids.empty() &&
-      !validate_cached_image_group(image_root, completion, identity, result.available_image_ids, &result.image_bytes, cancel_requested, trace)) {
+  if (!result.available_image_ids.empty() && !validate_cached_image_group(image_root, completion, identity, result.available_image_ids, &result.image_bytes, cancel_requested, trace)) {
    return CachedOpenImagesGroup{};
   }
   result.valid = true;
@@ -444,9 +420,8 @@ struct CachedOpenImagesGroup {
  }
 }
 void complete_open_images_group(const std::filesystem::path& image_root, const std::filesystem::path& completion, const std::string_view identity,
-                                const std::span<const std::uint64_t> requested_image_ids, const std::span<const std::uint64_t> available_image_ids,
-                                const std::span<const QuarantinedImage> quarantined, const NormalizedAnnotationIndex& index, const std::uint64_t image_bytes,
-                                const mmltk::common::concurrency::CancellationObservation cancellation, const BenchmarkTraceSink& trace) {
+ const std::span<const std::uint64_t> requested_image_ids, const std::span<const std::uint64_t> available_image_ids, const std::span<const QuarantinedImage> quarantined,
+ const NormalizedAnnotationIndex& index, const std::uint64_t image_bytes, const mmltk::common::concurrency::CancellationObservation cancellation, const BenchmarkTraceSink& trace) {
  nlohmann::json quarantine_records = nlohmann::json::array();
  for (const QuarantinedImage& image : quarantined) { quarantine_records.push_back({{"image_id", image.image_id}, {"reason", image.reason}}); }
  nlohmann::json dimensions = nlohmann::json::array();
@@ -458,29 +433,26 @@ void complete_open_images_group(const std::filesystem::path& image_root, const s
   dimensions.push_back(image.height);
  }
  write_json_atomically(completion,
-                       nlohmann::json{
-                        {"schema_version", kBenchmarkCacheSchemaVersion},
-                        {"complete", true},
-                        {"identity", identity},
-                        {"image_count", available_image_ids.size()},
-                        {"image_bytes", image_bytes},
-                        {"selection_sha256", cached_image_selection_digest(available_image_ids)},
-                        {"requested_image_count", requested_image_ids.size()},
-                        {"requested_selection_sha256", cached_image_selection_digest(requested_image_ids)},
-                        {"dimensions", std::move(dimensions)},
-                        {"quarantined", std::move(quarantine_records)},
-                       },
-                       cancellation);
- trace_benchmark_event(trace, "benchmark.images.complete", [&] {
-  return nlohmann::json{{"root", image_root.string()}, {"identity", identity}, {"images", available_image_ids.size()}, {"quarantined", quarantined.size()}};
- });
+  nlohmann::json{
+   {"schema_version", kBenchmarkCacheSchemaVersion},
+   {"complete", true},
+   {"identity", identity},
+   {"image_count", available_image_ids.size()},
+   {"image_bytes", image_bytes},
+   {"selection_sha256", cached_image_selection_digest(available_image_ids)},
+   {"requested_image_count", requested_image_ids.size()},
+   {"requested_selection_sha256", cached_image_selection_digest(requested_image_ids)},
+   {"dimensions", std::move(dimensions)},
+   {"quarantined", std::move(quarantine_records)},
+  },
+  cancellation);
+ trace_benchmark_event(trace, "benchmark.images.complete",
+  [&] { return nlohmann::json{{"root", image_root.string()}, {"identity", identity}, {"images", available_image_ids.size()}, {"quarantined", quarantined.size()}}; });
 }
 }  // namespace
-[[nodiscard]] AcquiredOpenImages acquire_open_images(const BenchmarkCacheLayout& cache, NormalizedAnnotationIndex& index,
-                                                     std::vector<QuarantinedImage>* quarantined,
-                                                     mmltk::common::concurrency::CancellationObservation cancel_requested, ProgressReporter* progress,
-                                                     const int num_workers, const std::size_t cache_workers, const BenchmarkTraceSink& trace,
-                                                     const std::optional<ImageDecodeProbe> decode_probe) {
+[[nodiscard]] AcquiredOpenImages acquire_open_images(const BenchmarkCacheLayout& cache, NormalizedAnnotationIndex& index, std::vector<QuarantinedImage>* quarantined,
+ mmltk::common::concurrency::CancellationObservation cancel_requested, ProgressReporter* progress, const int num_workers, const std::size_t cache_workers, const BenchmarkTraceSink& trace,
+ const std::optional<ImageDecodeProbe> decode_probe) {
  const std::vector<std::uint64_t> ids = image_ids(index);
  const std::filesystem::path image_root = cache.source_images("open-images") / "train";
  prepare_cached_image_directory(image_root);
@@ -495,9 +467,8 @@ void complete_open_images_group(const std::filesystem::path& image_root, const s
  if (configured_workers > std::numeric_limits<std::size_t>::max() / 10U) { throw std::overflow_error("Open Images transfer concurrency overflow"); }
  const std::size_t transfer_concurrency = std::min<std::size_t>(256U, configured_workers * 10U);
  if (transfer_concurrency == 0U) { throw std::runtime_error("Open Images transfer budget must be positive"); }
- progress->source_activity(BenchmarkDatasetSource::kOpenImagesV7,
-                           "Open Images downloader ready with " + std::to_string(transfer_concurrency) + " concurrent requests and " +
-                            (cache_workers == 0U ? std::string{"inline cache writes"} : std::to_string(cache_workers) + " cache workers"));
+ progress->source_activity(BenchmarkDatasetSource::kOpenImagesV7, "Open Images downloader ready with " + std::to_string(transfer_concurrency) + " concurrent requests and " +
+                                                                   (cache_workers == 0U ? std::string{"inline cache writes"} : std::to_string(cache_workers) + " cache workers"));
  for (std::size_t begin = 0U; begin < ids.size(); begin += kOpenImagesGroupImages) {
   throw_if_benchmark_cancelled(cancel_requested);
   const std::size_t end = std::min(ids.size(), begin + kOpenImagesGroupImages);
@@ -507,8 +478,7 @@ void complete_open_images_group(const std::filesystem::path& image_root, const s
   progress->source_activity(BenchmarkDatasetSource::kOpenImagesV7, "Waiting for Open Images " + shard + " image lock");
   ArtifactLease lease = ArtifactLease::acquire(cache.locks / ("open-images-" + shard + ".images.lock"), cancel_requested);
   if (decode_probe && std::ranges::binary_search(group, decode_probe->image_id)) {
-   progress->source_activity(BenchmarkDatasetSource::kOpenImagesV7,
-                             "Invalidating failed Open Images JPEG " + std::to_string(decode_probe->image_id) + " under the group lock");
+   progress->source_activity(BenchmarkDatasetSource::kOpenImagesV7, "Invalidating failed Open Images JPEG " + std::to_string(decode_probe->image_id) + " under the group lock");
    remove_cache_path(completion);
    remove_cache_path(cached_image_path(image_root, decode_probe->image_id));
   }
@@ -533,8 +503,7 @@ void complete_open_images_group(const std::filesystem::path& image_root, const s
   }
   all_cache_hits = false;
   const std::uint64_t group_bytes_begin = cached_image_bytes;
-  require_storage(cache.root, common_math::checked_multiply(group.size(), kEstimatedJpegBytes, "Open Images cache estimate overflow"), "Open Images JPEG cache",
-                  trace);
+  require_storage(cache.root, common_math::checked_multiply(group.size(), kEstimatedJpegBytes, "Open Images cache estimate overflow"), "Open Images JPEG cache", trace);
   std::vector<std::uint64_t> missing_downloads;
   missing_downloads.reserve(group.size());
   std::vector<std::uint64_t> group_available;
@@ -544,10 +513,8 @@ void complete_open_images_group(const std::filesystem::path& image_root, const s
   for (const std::uint64_t image_id : group) {
    throw_if_benchmark_cancelled(cancel_requested);
    if (trace && inspected != 0U && inspected % 128U == 0U) {
-    trace_benchmark_event(trace, "benchmark.images.cache_scan", [&] {
-     return nlohmann::json{
-      {"source", "open-images"}, {"shard", shard}, {"inspected_images", inspected}, {"reused_images", group_available.size()}, {"total_images", group.size()}};
-    });
+    trace_benchmark_event(trace, "benchmark.images.cache_scan",
+     [&] { return nlohmann::json{{"source", "open-images"}, {"shard", shard}, {"inspected_images", inspected}, {"reused_images", group_available.size()}, {"total_images", group.size()}}; });
    }
    if (trace) { ++inspected; }
    const std::filesystem::path path = cached_image_path(image_root, image_id);
@@ -566,30 +533,23 @@ void complete_open_images_group(const std::filesystem::path& image_root, const s
      continue;
     } catch (const InvalidImageError& image_error) {
      remove_cache_path(path);
-     trace_benchmark_event(trace, "benchmark.images.cache_invalid",
-                           [&] { return nlohmann::json{{"source", "open-images"}, {"shard", shard}, {"image_id", image_id}, {"error", image_error.what()}}; });
+     trace_benchmark_event(trace, "benchmark.images.cache_invalid", [&] { return nlohmann::json{{"source", "open-images"}, {"shard", shard}, {"image_id", image_id}, {"error", image_error.what()}}; });
     }
    }
    { missing_downloads.push_back(image_id); }
   }
   progress->source_images(BenchmarkDatasetSource::kOpenImagesV7, completed_images, ids.size());
   trace_benchmark_event(trace, "benchmark.images.cache_reuse", [&] {
-   return nlohmann::json{{"source", "open-images"},
-                         {"shard", shard},
-                         {"inspected_images", group.size()},
-                         {"reused_images", group_available.size()},
-                         {"reused_bytes", cached_image_bytes - group_bytes_begin}};
+   return nlohmann::json{
+    {"source", "open-images"}, {"shard", shard}, {"inspected_images", group.size()}, {"reused_images", group_available.size()}, {"reused_bytes", cached_image_bytes - group_bytes_begin}};
   });
   const std::size_t quarantine_begin = quarantined->size();
   if (!missing_downloads.empty()) {
    progress->source_activity(BenchmarkDatasetSource::kOpenImagesV7, "Downloading Open Images " + shard + " JPEGs");
-   download_open_images(missing_downloads, image_root, &index, quarantined, cancel_requested, progress, &completed_images, ids.size(), &cached_image_bytes,
-                        transfer_concurrency, cache_workers, trace);
+   download_open_images(missing_downloads, image_root, &index, quarantined, cancel_requested, progress, &completed_images, ids.size(), &cached_image_bytes, transfer_concurrency, cache_workers, trace);
   }
   std::unordered_set<std::uint64_t> missing;
-  for (std::size_t index_position = quarantine_begin; index_position < quarantined->size(); ++index_position) {
-   missing.emplace((*quarantined)[index_position].image_id);
-  }
+  for (std::size_t index_position = quarantine_begin; index_position < quarantined->size(); ++index_position) { missing.emplace((*quarantined)[index_position].image_id); }
   for (const std::uint64_t image_id : missing_downloads) {
    if (!missing.contains(image_id)) { group_available.push_back(image_id); }
   }
@@ -597,8 +557,7 @@ void complete_open_images_group(const std::filesystem::path& image_root, const s
   if (decode_probe && std::ranges::binary_search(group, decode_probe->image_id) && std::ranges::binary_search(group_available, decode_probe->image_id)) {
    const std::filesystem::path probe_path = cached_image_path(image_root, decode_probe->image_id);
    try {
-    progress->source_activity(BenchmarkDatasetSource::kOpenImagesV7,
-                              "Full-decode checking repaired Open Images JPEG " + std::to_string(decode_probe->image_id));
+    progress->source_activity(BenchmarkDatasetSource::kOpenImagesV7, "Full-decode checking repaired Open Images JPEG " + std::to_string(decode_probe->image_id));
     image_validator.validate_decodable_file(probe_path, decode_probe->expected_width, decode_probe->expected_height);
    } catch (const InvalidImageError& error) {
     const std::uint64_t probe_bytes = std::filesystem::file_size(probe_path);
@@ -606,39 +565,27 @@ void complete_open_images_group(const std::filesystem::path& image_root, const s
     if (probe_bytes > cached_image_bytes) { throw std::runtime_error("Open Images repair byte count underflow"); }
     cached_image_bytes -= probe_bytes;
     const auto available_image = std::ranges::lower_bound(group_available, decode_probe->image_id);
-    if (available_image == group_available.end() || *available_image != decode_probe->image_id) {
-     throw std::runtime_error("Open Images repair image availability changed");
-    }
+    if (available_image == group_available.end() || *available_image != decode_probe->image_id) { throw std::runtime_error("Open Images repair image availability changed"); }
     group_available.erase(available_image);
-    quarantined->push_back(QuarantinedImage{BenchmarkDatasetSource::kOpenImagesV7, decode_probe->image_id,
-                                            "permanently undecodable after bounded repair: " + std::string(error.what())});
+    quarantined->push_back(QuarantinedImage{BenchmarkDatasetSource::kOpenImagesV7, decode_probe->image_id, "permanently undecodable after bounded repair: " + std::string(error.what())});
     progress->source_activity(BenchmarkDatasetSource::kOpenImagesV7,
-                              "Quarantined permanently undecodable Open Images "
-                              "training JPEG " +
-                               std::to_string(decode_probe->image_id));
-    trace_benchmark_event(trace, "benchmark.images.decode_quarantine",
-                          [&] { return nlohmann::json{{"source", "open-images"}, {"image_id", decode_probe->image_id}, {"reason", error.what()}}; });
+     "Quarantined permanently undecodable Open Images "
+     "training JPEG " +
+      std::to_string(decode_probe->image_id));
+    trace_benchmark_event(trace, "benchmark.images.decode_quarantine", [&] { return nlohmann::json{{"source", "open-images"}, {"image_id", decode_probe->image_id}, {"reason", error.what()}}; });
    }
   }
   const std::span<const QuarantinedImage> group_quarantined(quarantined->data() + quarantine_begin, quarantined->size() - quarantine_begin);
   if (group_available.size() + group_quarantined.size() != group.size()) { throw std::runtime_error("Open Images group completion count is inconsistent"); }
   progress->source_activity(BenchmarkDatasetSource::kOpenImagesV7, "Finalizing Open Images " + shard + " cache");
-  complete_open_images_group(image_root, completion, identity, group, group_available, group_quarantined, index, cached_image_bytes - group_bytes_begin,
-                             cancel_requested, trace);
+  complete_open_images_group(image_root, completion, identity, group, group_available, group_quarantined, index, cached_image_bytes - group_bytes_begin, cancel_requested, trace);
   available.insert(available.end(), group_available.begin(), group_available.end());
   progress->source_images(BenchmarkDatasetSource::kOpenImagesV7, completed_images, ids.size());
  }
  std::ranges::sort(available);
  available.erase(std::unique(available.begin(), available.end()), available.end());
- return AcquiredOpenImages{CachedImageDirectory{"open-images",
-                                                "train",
-                                                image_root,
-                                                "open-images-v7:train:" + std::string(kBenchmarkCatalogRevision),
-                                                cached_image_selection_digest(available),
-                                                available.size(),
-                                                cached_image_bytes,
-                                                all_cache_hits,
-                                                {}},
-                           std::move(available)};
+ return AcquiredOpenImages{CachedImageDirectory{"open-images", "train", image_root, "open-images-v7:train:" + std::string(kBenchmarkCatalogRevision), cached_image_selection_digest(available),
+                            available.size(), cached_image_bytes, all_cache_hits, {}},
+  std::move(available)};
 }
 }  // namespace mmltk::backend::data::benchmark_internal

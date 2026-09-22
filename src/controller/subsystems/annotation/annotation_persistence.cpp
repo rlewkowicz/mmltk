@@ -68,8 +68,8 @@ private:
  }
  mmltk::common::io::ScopedFd descriptor_;
 };
-[[nodiscard]] DocumentSaveEffect atomic_save(const std::span<const std::byte> bytes, const std::string_view destination, const std::uint64_t document_revision,
-                                             const std::uint64_t generation) noexcept {
+[[nodiscard]] DocumentSaveEffect atomic_save(
+ const std::span<const std::byte> bytes, const std::string_view destination, const std::uint64_t document_revision, const std::uint64_t generation) noexcept {
  PosixAtomicSaveBackend backend;
  if (bytes.empty() || destination.empty() || generation == 0U) return DocumentSaveEffect::NotApplied;
  constexpr std::string_view marker{".mmltk-annotation-"};
@@ -97,8 +97,7 @@ private:
  return backend.sync_parent(destination) ? DocumentSaveEffect::Committed : DocumentSaveEffect::Uncertain;
 }
 }  // namespace
-DocumentSaveEffect save_annotation_document(const domain::AnnotationUiState& state, const std::string_view destination,
-                                            const std::uint64_t generation) noexcept {
+DocumentSaveEffect save_annotation_document(const domain::AnnotationUiState& state, const std::string_view destination, const std::uint64_t generation) noexcept {
  if (!state.valid() || destination.empty() || generation == 0U) return DocumentSaveEffect::NotApplied;
  std::vector<std::byte> bytes;
  if (!domain::encode_annotation_persistence(state, bytes)) return DocumentSaveEffect::NotApplied;

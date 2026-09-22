@@ -37,8 +37,7 @@ struct BoundedText final {
  constexpr bool operator==(const BoundedText&) const noexcept = default;
 };
 struct FileDialogSelected final {
- [[= mmltk::frameworks::reflection::MinBytes{
-  1U}]][[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]] std::string path{};
+ [[= mmltk::frameworks::reflection::MinBytes{1U}]][[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]] std::string path{};
  constexpr bool operator==(const FileDialogSelected&) const noexcept = default;
 };
 struct FileDialogCancelled final {

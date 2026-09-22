@@ -31,9 +31,7 @@ using ExecutionContextOwner = std::unique_ptr<nvinfer1::IExecutionContext, declt
  }
 }
 [[nodiscard]] RuntimeShape runtime_shape(const nvinfer1::Dims& dimensions) {
- if (dimensions.nbDims < 0 || dimensions.nbDims > static_cast<std::int32_t>(kMaximumRuntimeRank)) {
-  throw std::runtime_error("TensorRT tensor rank exceeds the public bound");
- }
+ if (dimensions.nbDims < 0 || dimensions.nbDims > static_cast<std::int32_t>(kMaximumRuntimeRank)) { throw std::runtime_error("TensorRT tensor rank exceeds the public bound"); }
  RuntimeShape shape{.rank = static_cast<std::uint8_t>(dimensions.nbDims)};
  std::copy_n(dimensions.d, dimensions.nbDims, shape.extents.begin());
  return shape;
@@ -78,10 +76,7 @@ using ExecutionContextOwner = std::unique_ptr<nvinfer1::IExecutionContext, declt
 class TensorRtSharedState final {
 public:
  explicit TensorRtSharedState(const RuntimeBackendOptions& options)
-     : engine_(options.model_path, make_engine_options(options)),
-       model_info_(read_model_info(engine_, options.model_path)),
-       device_(options.device),
-       command_stream_(options.command_stream) {}
+     : engine_(options.model_path, make_engine_options(options)), model_info_(read_model_info(engine_, options.model_path)), device_(options.device), command_stream_(options.command_stream) {}
  [[nodiscard]] const TensorRtEngine& engine() const noexcept { return engine_; }
  [[nodiscard]] const RuntimeModelInfo& model_info() const noexcept { return model_info_; }
  [[nodiscard]] std::int32_t device() const noexcept { return device_; }
@@ -111,12 +106,10 @@ public:
  void SaveCompiledModel(const std::filesystem::path& path) const override { shared_->Save(path); }
 
 private:
- [[nodiscard]] RawSubmission Submit(const RuntimeTensorBuffer& input, const std::span<RuntimeTensorBuffer> outputs,
-                                    const RuntimeContinuation continuation) override {
+ [[nodiscard]] RawSubmission Submit(const RuntimeTensorBuffer& input, const std::span<RuntimeTensorBuffer> outputs, const RuntimeContinuation continuation) override {
   cuda_lane().Activate();
   const RuntimeModelInfo& info = shared_->model_info();
-  if (!context_->setInputShape(info.input.name.c_str(), tensor_dimensions(input.shape)) ||
-      !context_->setInputTensorAddress(info.input.name.c_str(), input.device_data)) {
+  if (!context_->setInputShape(info.input.name.c_str(), tensor_dimensions(input.shape)) || !context_->setInputTensorAddress(info.input.name.c_str(), input.device_data)) {
    throw std::runtime_error("TensorRT failed to bind the model input");
   }
   const std::int32_t unresolved = context_->inferShapes(0, nullptr);
@@ -128,9 +121,7 @@ private:
   }
   for (std::size_t index = 0U; index < outputs.size(); ++index) {
    outputs[index].shape = resolved_shapes[index];
-   if (!context_->setOutputTensorAddress(info.outputs[index].name.c_str(), outputs[index].device_data)) {
-    throw std::runtime_error("TensorRT failed to bind a model output");
-   }
+   if (!context_->setOutputTensorAddress(info.outputs[index].name.c_str(), outputs[index].device_data)) { throw std::runtime_error("TensorRT failed to bind a model output"); }
   }
   if (!context_->enqueueV3(reinterpret_cast<cudaStream_t>(cuda_lane().native_stream()))) {
    cuda_lane().Synchronize();

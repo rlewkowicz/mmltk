@@ -15,14 +15,12 @@ inline constexpr std::size_t kMaxSettingsFlatValueBytes = 16U * 1024U;
 inline constexpr std::size_t kMaxSettingsFlatValueItems = 64U;
 struct SettingsValueUpdate final {
  [[= mmltk::frameworks::reflection::MaxBytes{kMaxSettingsPathBytes}]] std::string path;
- [[= mmltk::frameworks::reflection::MaxBytes{kMaxSettingsFlatValueBytes}]]
-  [[= mmltk::frameworks::reflection::MaxItems{kMaxSettingsFlatValueItems}]] mmltk::frameworks::serialization::wire::FlatValue value;
+ [[= mmltk::frameworks::reflection::MaxBytes{
+  kMaxSettingsFlatValueBytes}]][[= mmltk::frameworks::reflection::MaxItems{kMaxSettingsFlatValueItems}]] mmltk::frameworks::serialization::wire::FlatValue value;
 };
 inline constexpr std::size_t kMaxSettingsUpdates = 64U;
 struct[[= reflection::all_feature_scope()]] SettingsUpdateRequest final {
- [[= mmltk::frameworks::reflection::MaxItems{
-  kMaxSettingsUpdates}]][[= reflection::direct::SettingsUpdateValues{}]] std::inplace_vector<SettingsValueUpdate, kMaxSettingsUpdates>
-  updates;
+ [[= mmltk::frameworks::reflection::MaxItems{kMaxSettingsUpdates}]][[= reflection::direct::SettingsUpdateValues{}]] std::inplace_vector<SettingsValueUpdate, kMaxSettingsUpdates> updates;
 };
 struct[[= reflection::all_feature_scope()]] SettingsResetRequest final {};
 MMLTK_REFLECT_FIELDS(SettingsValueUpdate)

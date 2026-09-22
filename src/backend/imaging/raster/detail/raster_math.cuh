@@ -23,12 +23,10 @@ __host__ __device__ inline RgbaPixelU8 add_layer_rgb(RgbaPixelU8 ground_truth, R
  return {add(ground_truth.r, prediction.r), add(ground_truth.g, prediction.g), add(ground_truth.b, prediction.b), ground_truth.a};
 }
 __device__ __forceinline__ std::uint8_t clamp_to_u8(const float value) { return static_cast<std::uint8_t>(fminf(255.0f, fmaxf(0.0f, value))); }
-__device__ __forceinline__ std::uint8_t* pitched_pixel_ptr(std::uint8_t* base, const std::size_t pitch_bytes, const int x, const int y,
-                                                           const std::size_t channel_count) {
+__device__ __forceinline__ std::uint8_t* pitched_pixel_ptr(std::uint8_t* base, const std::size_t pitch_bytes, const int x, const int y, const std::size_t channel_count) {
  return base + static_cast<std::size_t>(y) * pitch_bytes + static_cast<std::size_t>(x) * channel_count;
 }
-__device__ __forceinline__ const std::uint8_t* pitched_pixel_ptr(const std::uint8_t* base, const std::size_t pitch_bytes, const int x, const int y,
-                                                                 const std::size_t channel_count) {
+__device__ __forceinline__ const std::uint8_t* pitched_pixel_ptr(const std::uint8_t* base, const std::size_t pitch_bytes, const int x, const int y, const std::size_t channel_count) {
  return base + static_cast<std::size_t>(y) * pitch_bytes + static_cast<std::size_t>(x) * channel_count;
 }
 enum class RgbByteOrder : std::uint8_t {
@@ -66,8 +64,7 @@ __device__ __forceinline__ void store_rgba_pixel(std::uint8_t* base, const std::
  dst[2] = pixel.b;
  dst[3] = pixel.a;
 }
-__device__ __forceinline__ RgbPixelFloat blend_rgb(const RgbPixelFloat& base, const std::uint8_t r, const std::uint8_t g, const std::uint8_t b,
-                                                   const float alpha) {
+__device__ __forceinline__ RgbPixelFloat blend_rgb(const RgbPixelFloat& base, const std::uint8_t r, const std::uint8_t g, const std::uint8_t b, const float alpha) {
  const float inv_alpha = 1.0f - alpha;
  return RgbPixelFloat{
   base.r * inv_alpha + static_cast<float>(r) * alpha,

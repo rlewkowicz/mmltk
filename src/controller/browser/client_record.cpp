@@ -14,9 +14,7 @@ namespace {
 [[nodiscard]] std::unexpected<RecordCodecError> failure(const wire::ErrorCode code) { return std::unexpected(RecordCodecError{code}); }
 [[nodiscard]] bool valid_intent(const Intent& intent) noexcept {
  return intent.protocol_version == kBrowserProtocolVersion && intent.correlation != 0U && intent.endpoint_id != 0U &&
-        std::ranges::all_of(intent.fields, [&intent](const IntentField& field) {
-         return field.field_id != 0U && std::ranges::count(intent.fields, field.field_id, &IntentField::field_id) == 1U;
-        });
+        std::ranges::all_of(intent.fields, [&intent](const IntentField& field) { return field.field_id != 0U && std::ranges::count(intent.fields, field.field_id, &IntentField::field_id) == 1U; });
 }
 [[nodiscard]] bool valid_client_record(const ClientRecord& record) noexcept {
  return std::visit(
@@ -27,8 +25,7 @@ namespace {
    } else if constexpr (std::same_as<T, Interaction>) {
     return value.protocol_version == kBrowserProtocolVersion && value.endpoint_id != 0U;
    } else if constexpr (std::same_as<T, IntegrationControl>) {
-    return value.protocol_version == kBrowserProtocolVersion && contracts::integration_receipt_valid(value.receipt) &&
-           !contracts::integration_server_command(value.receipt.kind);
+    return value.protocol_version == kBrowserProtocolVersion && contracts::integration_receipt_valid(value.receipt) && !contracts::integration_server_command(value.receipt.kind);
    }
   },
   record);
@@ -38,18 +35,15 @@ namespace {
   []<class Record>(const Record& value) noexcept {
    using T = std::remove_cvref_t<Record>;
    if constexpr (std::same_as<T, Bootstrap>) {
-    if (value.protocol_version != kBrowserProtocolVersion || value.input_epoch == 0U || value.schema_fingerprint[0] == 0U || value.schema_fingerprint[1] == 0U)
-     return false;
-    return std::ranges::all_of(value.snapshots, [&value](const SystemSnapshot& snapshot) {
-     return snapshot.system_id != 0U && std::ranges::count(value.snapshots, snapshot.system_id, &SystemSnapshot::system_id) == 1U;
-    });
+    if (value.protocol_version != kBrowserProtocolVersion || value.input_epoch == 0U || value.schema_fingerprint[0] == 0U || value.schema_fingerprint[1] == 0U) return false;
+    return std::ranges::all_of(
+     value.snapshots, [&value](const SystemSnapshot& snapshot) { return snapshot.system_id != 0U && std::ranges::count(value.snapshots, snapshot.system_id, &SystemSnapshot::system_id) == 1U; });
    } else if constexpr (std::same_as<T, IntentReply>) {
     return value.protocol_version == kBrowserProtocolVersion && value.correlation != 0U && (value.result.has_value() != value.error.has_value());
    } else if constexpr (std::same_as<T, InteractionRejected>) {
     return value.protocol_version == kBrowserProtocolVersion && value.endpoint_id != 0U;
    } else if constexpr (std::same_as<T, IntegrationControl>) {
-    return value.protocol_version == kBrowserProtocolVersion && contracts::integration_receipt_valid(value.receipt) &&
-           contracts::integration_server_command(value.receipt.kind);
+    return value.protocol_version == kBrowserProtocolVersion && contracts::integration_receipt_valid(value.receipt) && contracts::integration_server_command(value.receipt.kind);
    } else {
     return value.protocol_version == kBrowserProtocolVersion && value.system_id != 0U && value.event_id != 0U;
    }
@@ -162,8 +156,8 @@ ApplicationErrorRecord map_current_exception() noexcept {
   return {.category = error.category(), .detail = normalized_error_detail(error.what())};
  } catch (const std::invalid_argument& error) {
   return {.category = mmltk::controller::contracts::ApplicationErrorCategory::InvalidIntent, .detail = normalized_error_detail(error.what())};
- } catch (const std::exception& error) {
-  return {.category = mmltk::controller::contracts::ApplicationErrorCategory::Failed, .detail = normalized_error_detail(error.what())};
- } catch (...) { return {.category = mmltk::controller::contracts::ApplicationErrorCategory::Failed, .detail = "unknown application failure"}; }
+ } catch (const std::exception& error) { return {.category = mmltk::controller::contracts::ApplicationErrorCategory::Failed, .detail = normalized_error_detail(error.what())}; } catch (...) {
+  return {.category = mmltk::controller::contracts::ApplicationErrorCategory::Failed, .detail = "unknown application failure"};
+ }
 }
 }  // namespace mmltk::controller::browser

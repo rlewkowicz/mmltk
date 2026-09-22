@@ -14,8 +14,7 @@ constexpr std::size_t page_bytes = 2U * r::kTrainingRecordBytes;
 constexpr serial::wire::Limits record_limits{.max_bytes = line_bytes, .max_items = 8192, .max_depth = 32};
 r::TrainingRun ReadRun(const std::filesystem::path& directory) {
  std::ifstream input(directory / "run.json", std::ios::binary);
- if (!input || !std::filesystem::is_regular_file(directory / "metrics.jsonl"))
-  throw std::runtime_error("output directory has no supported current run.json/metrics.jsonl history");
+ if (!input || !std::filesystem::is_regular_file(directory / "metrics.jsonl")) throw std::runtime_error("output directory has no supported current run.json/metrics.jsonl history");
  std::string text(manifest_bytes + 1, '\0');
  input.read(text.data(), static_cast<std::streamsize>(text.size()));
  text.resize(static_cast<std::size_t>(input.gcount()));
@@ -57,8 +56,7 @@ r::TrainingHistoryPage TrainRunStore::Read(const r::TrainingHistoryQuery& query)
   throw std::runtime_error("opened history was replaced or truncated");
  metrics_identity_ = identity;
  const auto size = identity.bytes;
- if (query.cursor > size || query.cursor > static_cast<std::uint64_t>(std::numeric_limits<std::streamoff>::max()))
-  throw std::invalid_argument("training history cursor is outside the stream");
+ if (query.cursor > size || query.cursor > static_cast<std::uint64_t>(std::numeric_limits<std::streamoff>::max())) throw std::invalid_argument("training history cursor is outside the stream");
  metrics_.clear();
  if (query.cursor) {
   metrics_.seekg(static_cast<std::streamoff>(query.cursor - 1));
@@ -86,8 +84,7 @@ r::TrainingHistoryPage TrainRunStore::Read(const r::TrainingHistoryQuery& query)
   if (!complete) break;  // A partial append is retried from its initial byte.
   if (consumed > page_bytes) break;
   auto record = serial::decode_reflected_json<r::TrainingRecord>(line_, record_limits);
-  if (record.format_version != r::kTrainingRunFormat || record.run_id != run_->run_id || record.attempt_id.empty() ||
-      record.evaluated_weights != run_->evaluated_weights)
+  if (record.format_version != r::kTrainingRunFormat || record.run_id != run_->run_id || record.attempt_id.empty() || record.evaluated_weights != run_->evaluated_weights)
    throw std::runtime_error("training history record belongs to an incompatible run");
   page.next_cursor += line_.size() + 1;
   page.records.push_back(std::move(record));
@@ -95,8 +92,7 @@ r::TrainingHistoryPage TrainRunStore::Read(const r::TrainingHistoryQuery& query)
  page.more = page.next_cursor < size && ((!page.records.empty() && consumed >= page_bytes) || page.records.size() == query.count);
  return page;
 }
-std::filesystem::path TrainRunStore::ResolveOutput(const std::filesystem::path& selected, const std::optional<r::TrainingCheckpoint>& resume,
-                                                   const bool automatic) {
+std::filesystem::path TrainRunStore::ResolveOutput(const std::filesystem::path& selected, const std::optional<r::TrainingCheckpoint>& resume, const bool automatic) {
  if (selected.empty()) throw std::invalid_argument("training output directory is empty");
  const auto root = std::filesystem::absolute(selected).lexically_normal();
  if (!automatic && resume && std::filesystem::exists(root / "run.json") && std::filesystem::exists(root / "metrics.jsonl")) {
@@ -104,9 +100,8 @@ std::filesystem::path TrainRunStore::ResolveOutput(const std::filesystem::path& 
   try {
    run = ReadRun(root);
   } catch (const std::exception&) {}
-  if (run &&
-      (std::filesystem::weakly_canonical(resume->path.parent_path()) == std::filesystem::weakly_canonical(root) && resume->path.filename() == "checkpoint.pt" &&
-       resume->attempt_id == run->checkpoint_attempt_id && resume->evaluated_weights == run->evaluated_weights && resume->class_layout == run->class_layout))
+  if (run && (std::filesystem::weakly_canonical(resume->path.parent_path()) == std::filesystem::weakly_canonical(root) && resume->path.filename() == "checkpoint.pt" &&
+              resume->attempt_id == run->checkpoint_attempt_id && resume->evaluated_weights == run->evaluated_weights && resume->class_layout == run->class_layout))
    return root;
   (void)run;
  }

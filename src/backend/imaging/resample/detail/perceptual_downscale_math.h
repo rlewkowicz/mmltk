@@ -49,8 +49,7 @@ MMLTK_PERCEPTUAL_HD inline Footprint footprint(std::uint32_t src, std::uint32_t 
  const std::uint64_t begin = std::uint64_t(i) * src, end = (std::uint64_t(i) + 1) * src;
  const auto first = static_cast<std::uint32_t>(begin / dst);
  const auto last = static_cast<std::uint32_t>((end - 1) / dst);
- return {first, last + 1, first == last ? float(double(end - begin) / dst) : float(double(dst - begin % dst) / dst),
-         float(double(end - std::uint64_t(last) * dst) / dst)};
+ return {first, last + 1, first == last ? float(double(end - begin) / dst) : float(double(dst - begin % dst) / dst), float(double(end - std::uint64_t(last) * dst) / dst)};
 }
 struct Moment {
  float mean[3], variance[3];
@@ -100,9 +99,7 @@ MMLTK_PERCEPTUAL_HD inline Moment merge(Moment a, float aw, Moment b, float bw) 
  }
  return a;
 }
-MMLTK_PERCEPTUAL_HD inline float contrast_ratio(float low, float within) {
- return low >= variance_threshold ? ::sqrtf(1.0F + ::fmaxf(0, within) / low) : low_variance_ratio;
-}
+MMLTK_PERCEPTUAL_HD inline float contrast_ratio(float low, float within) { return low >= variance_threshold ? ::sqrtf(1.0F + ::fmaxf(0, within) / low) : low_variance_ratio; }
 MMLTK_PERCEPTUAL_HD inline Coefficient patch(const Moment& a, const Moment& b, const Moment& c, const Moment& d) {
  Coefficient result;
  for (int k = 0; k < 3; ++k) {
@@ -120,8 +117,8 @@ MMLTK_PERCEPTUAL_HD inline Color reconstruct(const Moment& m, const Coefficient&
  float v[3];
  for (int k = 0; k < 3; ++k) {
   // Centered reconstruction avoids subtracting large r*m terms.
-  v[k] = (::fmaf(a.ratio[k], m.mean[k] - a.center[k], a.center[k]) + ::fmaf(b.ratio[k], m.mean[k] - b.center[k], b.center[k]) +
-          ::fmaf(c.ratio[k], m.mean[k] - c.center[k], c.center[k]) + ::fmaf(d.ratio[k], m.mean[k] - d.center[k], d.center[k])) *
+  v[k] = (::fmaf(a.ratio[k], m.mean[k] - a.center[k], a.center[k]) + ::fmaf(b.ratio[k], m.mean[k] - b.center[k], b.center[k]) + ::fmaf(c.ratio[k], m.mean[k] - c.center[k], c.center[k]) +
+          ::fmaf(d.ratio[k], m.mean[k] - d.center[k], d.center[k])) *
          0.25F;
  }
  return {v[0], v[1], v[2]};

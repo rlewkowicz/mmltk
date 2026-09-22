@@ -11,8 +11,7 @@ bool visual_product_matches_frame(const VisualFrame& frame, const mmltk::framewo
  }
  return true;
 }
-mmltk::frameworks::gpu::BorrowedImageProductReadView borrow_matching_visual_product(const VisualFrame& frame,
-                                                                                    mmltk::frameworks::gpu::BorrowedImageProductReadView borrowed) {
+mmltk::frameworks::gpu::BorrowedImageProductReadView borrow_matching_visual_product(const VisualFrame& frame, mmltk::frameworks::gpu::BorrowedImageProductReadView borrowed) {
  return visual_product_matches_frame(frame, borrowed) ? std::move(borrowed) : mmltk::frameworks::gpu::BorrowedImageProductReadView{};
 }
 }  // namespace mmltk::controller

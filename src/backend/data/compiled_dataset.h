@@ -58,8 +58,7 @@ public:
   void (*write)(void*, std::size_t, std::span<const std::byte>);
  };
  [[nodiscard]] bool read_images_to(std::span<const CompiledImageRead>, ImageDestination, const std::atomic<bool>&, bool prefault = false) const;
- [[nodiscard]] bool read_images(std::span<const CompiledImageRead> reads, std::span<std::byte> destination, const std::atomic<bool>& cancelled,
-                                bool prefault = false) const;
+ [[nodiscard]] bool read_images(std::span<const CompiledImageRead> reads, std::span<std::byte> destination, const std::atomic<bool>& cancelled, bool prefault = false) const;
 
 private:
  [[nodiscard]] static CompiledDataset open_mapped(const std::filesystem::path&, mmltk::common::io::MappedFile, std::size_t image_limit, AccessPattern);

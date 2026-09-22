@@ -68,8 +68,8 @@ std::string visual_failure_detail(const std::exception_ptr failure, const std::s
  }
  return {bounded.data(), size};
 }
-void report_visual_worker_failure(const VisualDiagnosticSink diagnostics, const contracts::DiagnosticOwner system, const int device,
-                                  const std::string_view detail, const std::uint64_t generation) noexcept {
+void report_visual_worker_failure(
+ const VisualDiagnosticSink diagnostics, const contracts::DiagnosticOwner system, const int device, const std::string_view detail, const std::uint64_t generation) noexcept {
  diagnostics.Emit([&] {
   return VisualDiagnosticFact{
    .system = system,

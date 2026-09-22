@@ -77,14 +77,14 @@ Options parse_options(int argc, char** argv) {
  table.add_flag("--dn", options.denoising);
  add_common_profile_options(table, options);
  table.parse_or_exit(argc, argv,
-                     "--weights-path PATH [--test-dir PATH] [--keep-artifacts] "
-                     "[--width N] [--height N] [--num-images N] [--batch-size N] [--epochs N] "
-                     "[--device-id N] [--workers N] [--lanes N] [--prefetch-factor N] [--compile-workers N] "
-                     "[--seed N] [--assignment hungarian|match-free] [--dn] "
-                     "[--repetitions N] [--warmup-runs N] [--cpu-affinity LIST]");
+  "--weights-path PATH [--test-dir PATH] [--keep-artifacts] "
+  "[--width N] [--height N] [--num-images N] [--batch-size N] [--epochs N] "
+  "[--device-id N] [--workers N] [--lanes N] [--prefetch-factor N] [--compile-workers N] "
+  "[--seed N] [--assignment hungarian|match-free] [--dn] "
+  "[--repetitions N] [--warmup-runs N] [--cpu-affinity LIST]");
  if (options.weights_path.empty()) { throw std::runtime_error("RF-DETR train profile runner requires --weights-path"); }
- if (options.width <= 0 || options.height <= 0 || options.num_images <= 0 || options.batch_size <= 0 || options.epochs <= 0 || options.device_id < 0 ||
-     options.workers < 0 || options.lanes < 0 || options.prefetch_factor <= 0 || options.repetitions <= 0 || options.warmup_runs < 0) {
+ if (options.width <= 0 || options.height <= 0 || options.num_images <= 0 || options.batch_size <= 0 || options.epochs <= 0 || options.device_id < 0 || options.workers < 0 || options.lanes < 0 ||
+     options.prefetch_factor <= 0 || options.repetitions <= 0 || options.warmup_runs < 0) {
   throw std::runtime_error("numeric options must be positive except lanes and warmup-runs, which may be zero");
  }
  if (options.num_images < options.batch_size) { throw std::runtime_error("num-images must be at least batch-size for RF-DETR train profile"); }
@@ -94,12 +94,8 @@ Options parse_options(int argc, char** argv) {
  }
  return options;
 }
-[[nodiscard]] TrainAssignmentKind selected_assignment(const Options& options) {
- return *mmltk::backend::models::rfdetr::train_assignment_from_spelling(options.assignment);
-}
-[[nodiscard]] std::string profile_run_label(const Options& options) {
- return "rfdetr.train.assignment-" + options.assignment + (options.denoising ? ".dn-on" : ".dn-off");
-}
+[[nodiscard]] TrainAssignmentKind selected_assignment(const Options& options) { return *mmltk::backend::models::rfdetr::train_assignment_from_spelling(options.assignment); }
+[[nodiscard]] std::string profile_run_label(const Options& options) { return "rfdetr.train.assignment-" + options.assignment + (options.denoising ? ".dn-on" : ".dn-off"); }
 void build_fixture(const Options& options, const FixtureSpec& fixture) {
  mmltk::backend::data::testsupport::create_synthetic_dataset(fixture);
  CompilerConfig config;
@@ -174,14 +170,11 @@ void record_train_metrics(const TrainRun& run, const Options& options) {
  record_value_metric("rfdetr.train.loss_x10000", x10000_metric(run.train_loss));
  record_value_metric("rfdetr.train.val_bbox_ap_x10000", x10000_metric(run.bbox_ap));
  record_optional_x10000_metric("rfdetr.train.val_mask_ap_x10000", run.mask_ap);
- if (run.peak_allocated_cuda_bytes.has_value()) {
-  mmltk::common::logging::profile_add_value("rfdetr.train.peak_allocated_cuda_bytes", *run.peak_allocated_cuda_bytes);
- }
+ if (run.peak_allocated_cuda_bytes.has_value()) { mmltk::common::logging::profile_add_value("rfdetr.train.peak_allocated_cuda_bytes", *run.peak_allocated_cuda_bytes); }
 }
 void print_iteration_line(const Options& options, const char* phase, int index, int total, const TrainRun& run) {
- std::printf("%s=rfdetr.train mode=%s dn=%s %d/%d total=%.3fs train_loss=%.4f bbox=%.4f mask=%s\n", phase, options.assignment.c_str(),
-             options.denoising ? "on" : "off", index, total, seconds_from_ns(run.elapsed_ns), run.train_loss, run.bbox_ap,
-             optional_metric_text(run.mask_ap).c_str());
+ std::printf("%s=rfdetr.train mode=%s dn=%s %d/%d total=%.3fs train_loss=%.4f bbox=%.4f mask=%s\n", phase, options.assignment.c_str(), options.denoising ? "on" : "off", index, total,
+  seconds_from_ns(run.elapsed_ns), run.train_loss, run.bbox_ap, optional_metric_text(run.mask_ap).c_str());
  std::fflush(stdout);
 }
 [[nodiscard]] bool metric_line(const std::string_view line, const std::string_view metric) {
@@ -251,12 +244,8 @@ void verify_profile_route(const std::string& log_path, const std::string& run_la
   const auto& evidence = repetitions[repetition];
   if (!evidence.found) { throw std::runtime_error("profile log is missing a requested measured repetition block"); }
   if (match_free) {
-   if (!evidence.positive_layers || !evidence.positive_valid_pairs) {
-    throw std::runtime_error("Match-Free profile repetition lacks positive supervised-layer and valid-pair evidence");
-   }
-   if (std::ranges::any_of(evidence.matcher_line, std::identity{})) {
-    throw std::runtime_error("Match-Free profile repetition contains native matcher activity");
-   }
+   if (!evidence.positive_layers || !evidence.positive_valid_pairs) { throw std::runtime_error("Match-Free profile repetition lacks positive supervised-layer and valid-pair evidence"); }
+   if (std::ranges::any_of(evidence.matcher_line, std::identity{})) { throw std::runtime_error("Match-Free profile repetition contains native matcher activity"); }
   } else if (!std::ranges::all_of(evidence.positive_matcher, std::identity{})) {
    throw std::runtime_error("Hungarian profile repetition lacks positive native matcher activity");
   }
@@ -273,8 +262,8 @@ int main(int argc, char** argv) {
    logger.trace(
     "event=profile.execution_policy executable=mmltk_rfdetr_train_profile_runner online_cpu_count={} "
     "nice_value={} scheduler_policy={} scheduler_priority={} io_class={} io_priority_data={}",
-    execution_snapshot.online_cpu_count, execution_snapshot.nice_value, execution_snapshot.scheduler_policy, execution_snapshot.scheduler_priority,
-    execution_snapshot.io_class, execution_snapshot.io_priority_data);
+    execution_snapshot.online_cpu_count, execution_snapshot.nice_value, execution_snapshot.scheduler_policy, execution_snapshot.scheduler_priority, execution_snapshot.io_class,
+    execution_snapshot.io_priority_data);
   });
   const Options options = parse_options(argc, argv);
   ensure_file_exists("weights checkpoint", options.weights_path);
@@ -282,7 +271,11 @@ int main(int argc, char** argv) {
   if (profile_log == nullptr || profile_log[0] == '\0') { throw std::runtime_error("RF-DETR train profile runner requires nonempty MMLTK_PROFILE_LOG"); }
   const std::string run_label = profile_run_label(options);
   const FixtureSpec fixture{
-   options.test_dir, "train", options.width, options.height, options.num_images,
+   options.test_dir,
+   "train",
+   options.width,
+   options.height,
+   options.num_images,
   };
   build_fixture(options, fixture);
   const std::string compiled_path = mmltk::backend::data::testsupport::compiled_bin_path(fixture);

@@ -78,8 +78,7 @@ struct CudaFixture {
    cuda_check(cudaSetDevice(0));
    execution = gpu::test_support::selected_test_device(0, common::system::NumaTopology::Capture());
    const auto& p = execution.placement;
-   policy =
-    std::make_unique<common::system::ScopedExecutionPolicy>(common::system::ExecutionPolicyRequest{p.cpus, "perceptual-test", 0, p.numa_node, -10, false});
+   policy = std::make_unique<common::system::ScopedExecutionPolicy>(common::system::ExecutionPolicyRequest{p.cpus, "perceptual-test", 0, p.numa_node, -10, false});
    context_owner = std::make_unique<gpu::DeviceContext>(0, gpu::cuda_image_copy_backend(), gpu::DeviceContextMode::PrimaryInterop, -1, execution);
    context_owner->Bind();
    CUcontext context = nullptr;
@@ -149,31 +148,31 @@ struct FakeCompletion {
            *out = reinterpret_cast<cudaEvent_t>(active->events.back().get());
            return cudaSuccess;
           },
-          +[](cudaEvent_t event, cudaStream_t) -> cudaError_t {
-           if (active->record_status == cudaSuccess) reinterpret_cast<Event*>(event)->complete = false;
-           return active->record_status;
-          },
-          +[](cudaEvent_t event) -> cudaError_t {
-           if (active->query_status != cudaSuccess) return active->query_status;
-           return reinterpret_cast<Event*>(event)->complete ? cudaSuccess : cudaErrorNotReady;
-          },
-          +[](cudaEvent_t event) -> cudaError_t {
-           if (active->wait_status == cudaSuccess) reinterpret_cast<Event*>(event)->complete = true;
-           return active->wait_status;
-          },
-          +[](cudaStream_t stream) -> cudaError_t {
-           ++active->stream_waits;
-           active->waited = stream;
-           return active->wait_status;
-          },
-          +[](cudaStream_t, cudaEvent_t, unsigned) -> cudaError_t {
-           ++active->orders;
-           return cudaSuccess;
-          },
-          +[](cudaEvent_t) -> cudaError_t {
-           ++active->destroys;
-           return cudaSuccess;
-          }};
+   +[](cudaEvent_t event, cudaStream_t) -> cudaError_t {
+    if (active->record_status == cudaSuccess) reinterpret_cast<Event*>(event)->complete = false;
+    return active->record_status;
+   },
+   +[](cudaEvent_t event) -> cudaError_t {
+    if (active->query_status != cudaSuccess) return active->query_status;
+    return reinterpret_cast<Event*>(event)->complete ? cudaSuccess : cudaErrorNotReady;
+   },
+   +[](cudaEvent_t event) -> cudaError_t {
+    if (active->wait_status == cudaSuccess) reinterpret_cast<Event*>(event)->complete = true;
+    return active->wait_status;
+   },
+   +[](cudaStream_t stream) -> cudaError_t {
+    ++active->stream_waits;
+    active->waited = stream;
+    return active->wait_status;
+   },
+   +[](cudaStream_t, cudaEvent_t, unsigned) -> cudaError_t {
+    ++active->orders;
+    return cudaSuccess;
+   },
+   +[](cudaEvent_t) -> cudaError_t {
+    ++active->destroys;
+    return cudaSuccess;
+   }};
  }
 };
 }  // namespace
@@ -183,14 +182,12 @@ TEST_CASE("CUDA perceptual serial traversal retains every accumulator bit", "[ba
  cudaDeviceProp properties{};
  cuda_check(cudaGetDeviceProperties(&properties, 0));
  INFO("CUDA device 0: " << properties.name << " CC " << properties.major << "." << properties.minor);
- constexpr std::array cases{std::array{1U, 19U, 1U, 7U},  std::array{19U, 1U, 7U, 1U},   std::array{17U, 13U, 7U, 5U},
-                            std::array{32U, 24U, 8U, 6U}, std::array{14U, 14U, 2U, 2U},  std::array{15U, 14U, 2U, 2U},
-                            std::array{16U, 16U, 2U, 2U}, std::array{257U, 5U, 19U, 3U}, std::array{67U, 61U, 1U, 1U}};
+ constexpr std::array cases{std::array{1U, 19U, 1U, 7U}, std::array{19U, 1U, 7U, 1U}, std::array{17U, 13U, 7U, 5U}, std::array{32U, 24U, 8U, 6U}, std::array{14U, 14U, 2U, 2U},
+  std::array{15U, 14U, 2U, 2U}, std::array{16U, 16U, 2U, 2U}, std::array{257U, 5U, 19U, 3U}, std::array{67U, 61U, 1U, 1U}};
  for (auto format : formats)
   for (const auto& dims : cases)
    for (unsigned pattern : {0U, 5U, 6U, 7U}) {
-    INFO("format " << static_cast<int>(format) << " source " << dims[0] << "x" << dims[1] << " destination " << dims[2] << "x" << dims[3] << " pattern "
-                   << pattern);
+    INFO("format " << static_cast<int>(format) << " source " << dims[0] << "x" << dims[1] << " destination " << dims[2] << "x" << dims[3] << " pattern " << pattern);
     // Offset subview retains padded rows and independent plane slices.
     Image source(dims[0] + 2, dims[1] + 2, format, 7);
     source.fill(pattern);
@@ -227,8 +224,7 @@ TEST_CASE("CUDA perceptual allocation-local preparation matches fresh owners", "
  if (!has_cuda()) SKIP("CUDA unavailable; preparation reuse acceptance is not established");
  CudaFixture fixture(2);
  GpuPerceptualDownscaler retained(*fixture.context_owner, fixture.retirement);
- constexpr std::array sequence{RgbPixelFormat::PlanarUnitSrgbF32, RgbPixelFormat::RGB8, RgbPixelFormat::RGBA8, RgbPixelFormat::PlanarUnitSrgbF32,
-                               RgbPixelFormat::RGB8};
+ constexpr std::array sequence{RgbPixelFormat::PlanarUnitSrgbF32, RgbPixelFormat::RGB8, RgbPixelFormat::RGBA8, RgbPixelFormat::PlanarUnitSrgbF32, RgbPixelFormat::RGB8};
  for (const auto& dims : {std::array{19U, 15U, 9U, 7U}, std::array{19U, 15U, 9U, 7U}, std::array{7U, 5U, 3U, 2U}, std::array{129U, 127U, 65U, 63U}}) {
   struct PreparedCase {
    Image source;
@@ -309,8 +305,7 @@ TEST_CASE("CUDA perceptual resampling agrees with independent CPU geometry and c
  for (auto format : formats)
   for (const auto& dims : geometries)
    for (unsigned pattern : {0U, 3U, 5U, 6U, 7U}) {
-    INFO("format " << static_cast<int>(format) << " source " << dims[0] << "x" << dims[1] << " destination " << dims[2] << "x" << dims[3] << " pattern "
-                   << pattern);
+    INFO("format " << static_cast<int>(format) << " source " << dims[0] << "x" << dims[1] << " destination " << dims[2] << "x" << dims[3] << " pattern " << pattern);
     Image source(dims[0], dims[1], format, 3), expected(dims[2], dims[3], format, 5);
     source.fill(pattern);
     auto input = fixture.upload(source), output = std::make_shared<DeviceImage>(expected.layout);
@@ -572,8 +567,7 @@ TEST_CASE("perceptual admission distinguishes caller facts from physical Driver 
   REQUIRE_FALSE(valid.physical_failure());
   REQUIRE(foreign.caller_rejection());
   REQUIRE_FALSE(foreign.physical_failure());
-  for (const auto status : {CUDA_ERROR_DEINITIALIZED, CUDA_ERROR_NOT_INITIALIZED, CUDA_ERROR_INVALID_CONTEXT, CUDA_ERROR_CONTEXT_IS_DESTROYED,
-                            CUDA_ERROR_ILLEGAL_ADDRESS, CUDA_ERROR_LAUNCH_FAILED}) {
+  for (const auto status : {CUDA_ERROR_DEINITIALIZED, CUDA_ERROR_NOT_INITIALIZED, CUDA_ERROR_INVALID_CONTEXT, CUDA_ERROR_CONTEXT_IS_DESTROYED, CUDA_ERROR_ILLEGAL_ADDRESS, CUDA_ERROR_LAUNCH_FAILED}) {
    const DriverAdmission failed{status, false, query};
    REQUIRE(failed.status == status);
    REQUIRE(failed.physical_failure());
@@ -658,12 +652,11 @@ TEST_CASE("CUDA perceptual resampling retains actual imported Vulkan mapped subv
  Image source(21, 17, RgbPixelFormat::RGBA8), cropped(19, 15, RgbPixelFormat::RGBA8), shape(9, 7, RgbPixelFormat::RGBA8);
  source.fill(3);
  std::memcpy(fixture.staging->data(), source.storage.data(), source.layout.capacity_bytes);
- cuda_check(cudaMemcpy2DAsync(reinterpret_cast<void*>(imported->data()), imported->pitch_bytes(), fixture.staging->data(), source.layout.row_stride_bytes,
-                              21U * 4U, 17U, cudaMemcpyHostToDevice, fixture.stream));
+ cuda_check(cudaMemcpy2DAsync(
+  reinterpret_cast<void*>(imported->data()), imported->pitch_bytes(), fixture.staging->data(), source.layout.row_stride_bytes, 21U * 4U, 17U, cudaMemcpyHostToDevice, fixture.stream));
  exporter.reset();
  const auto offset = imported->pitch_bytes() + 4U;
- RgbConstImageView subview{reinterpret_cast<const void*>(imported->data() + offset),
-                           {19, 15, imported->pitch_bytes(), 0, imported->pitch_bytes() * 16U - 4U, RgbPixelFormat::RGBA8}};
+ RgbConstImageView subview{reinterpret_cast<const void*>(imported->data() + offset), {19, 15, imported->pitch_bytes(), 0, imported->pitch_bytes() * 16U - 4U, RgbPixelFormat::RGBA8}};
  auto destination = std::make_shared<DeviceImage>(shape.layout);
  GpuPerceptualDownscaler resizer(*fixture.context_owner, fixture.retirement);
  auto invalid = subview;

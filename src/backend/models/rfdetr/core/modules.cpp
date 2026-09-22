@@ -52,10 +52,7 @@ struct PositionEmbeddingSineImpl::FullValidCache final {
  };
  [[nodiscard]] Entry* Find(int device_index, int64_t height, int64_t width, const torch::Device& device, bool align_dim_orders) noexcept {
   for (auto& entry : entries) {
-   if (entry.device_type == device.type() && entry.device_index == device_index && entry.height == height && entry.width == width &&
-       entry.align_dim_orders == align_dim_orders) {
-    return &entry;
-   }
+   if (entry.device_type == device.type() && entry.device_index == device_index && entry.height == height && entry.width == width && entry.align_dim_orders == align_dim_orders) { return &entry; }
   }
   return nullptr;
  }
@@ -65,25 +62,25 @@ struct PositionEmbeddingSineImpl::FullValidCache final {
 };
 namespace {
 using namespace torch::indexing;
-torch::Tensor build_sine_position_embedding(const torch::Tensor& x_embed, const torch::Tensor& y_embed, const int64_t num_pos_feats, const double temperature,
-                                            const bool align_dim_orders, const bool make_contiguous) {
+torch::Tensor build_sine_position_embedding(
+ const torch::Tensor& x_embed, const torch::Tensor& y_embed, const int64_t num_pos_feats, const double temperature, const bool align_dim_orders, const bool make_contiguous) {
  auto dim_t = torch::arange(num_pos_feats, torch::TensorOptions().dtype(torch::kFloat32).device(x_embed.device()));
  dim_t = torch::pow(torch::full_like(dim_t, temperature), 2.0 * torch::floor(dim_t / 2.0) / static_cast<double>(num_pos_feats));
  auto pos_x = x_embed.unsqueeze(-1) / dim_t;
  auto pos_y = y_embed.unsqueeze(-1) / dim_t;
  pos_x = torch::stack(
-          {
-           pos_x.index({Slice(), Slice(), Slice(), Slice(0, None, 2)}).sin(),
-           pos_x.index({Slice(), Slice(), Slice(), Slice(1, None, 2)}).cos(),
-          },
-          4)
+  {
+   pos_x.index({Slice(), Slice(), Slice(), Slice(0, None, 2)}).sin(),
+   pos_x.index({Slice(), Slice(), Slice(), Slice(1, None, 2)}).cos(),
+  },
+  4)
           .flatten(3);
  pos_y = torch::stack(
-          {
-           pos_y.index({Slice(), Slice(), Slice(), Slice(0, None, 2)}).sin(),
-           pos_y.index({Slice(), Slice(), Slice(), Slice(1, None, 2)}).cos(),
-          },
-          4)
+  {
+   pos_y.index({Slice(), Slice(), Slice(), Slice(0, None, 2)}).sin(),
+   pos_y.index({Slice(), Slice(), Slice(), Slice(1, None, 2)}).cos(),
+  },
+  4)
           .flatten(3);
  auto pos = torch::cat({pos_y, pos_x}, 3);
  pos = align_dim_orders ? pos.permute({1, 2, 0, 3}) : pos.permute({0, 3, 1, 2});
@@ -96,8 +93,7 @@ torch::Tensor inverse_sigmoid(const torch::Tensor& x, double eps) {
  const auto x2 = (1.0 - clamped).clamp_min(eps);
  return torch::log(x1 / x2);
 }
-MlpImpl::MlpImpl(int64_t input_dim, int64_t hidden_dim, int64_t output_dim, int64_t num_layers)
-    : num_layers_(num_layers), layers(register_module("layers", torch::nn::ModuleList())) {
+MlpImpl::MlpImpl(int64_t input_dim, int64_t hidden_dim, int64_t output_dim, int64_t num_layers) : num_layers_(num_layers), layers(register_module("layers", torch::nn::ModuleList())) {
  if (num_layers_ <= 0) { throw std::runtime_error("Mlp requires num_layers > 0"); }
  int64_t in_features = input_dim;
  for (int64_t index = 0; index < num_layers_; ++index) {
@@ -114,8 +110,7 @@ torch::Tensor MlpImpl::forward(torch::Tensor x) {
  return x;
 }
 DetectionHeadImpl::DetectionHeadImpl(int64_t hidden_dim, int64_t num_classes)
-    : class_embed(register_module("class_embed", torch::nn::Linear(hidden_dim, num_classes))),
-      bbox_embed(register_module("bbox_embed", Mlp(hidden_dim, hidden_dim, 4, 3))) {}
+    : class_embed(register_module("class_embed", torch::nn::Linear(hidden_dim, num_classes))), bbox_embed(register_module("bbox_embed", Mlp(hidden_dim, hidden_dim, 4, 3))) {}
 std::pair<torch::Tensor, torch::Tensor> DetectionHeadImpl::forward(const torch::Tensor& hs) {
  return {
   class_embed->forward(hs),
@@ -123,11 +118,7 @@ std::pair<torch::Tensor, torch::Tensor> DetectionHeadImpl::forward(const torch::
  };
 }
 PositionEmbeddingSineImpl::PositionEmbeddingSineImpl(int64_t num_pos_feats, double temperature, bool normalize, c10::optional<double> scale)
-    : num_pos_feats_(num_pos_feats),
-      temperature_(temperature),
-      normalize_(normalize),
-      scale_(scale.value_or(2.0 * M_PI)),
-      full_valid_cache_(std::make_unique<FullValidCache>()) {
+    : num_pos_feats_(num_pos_feats), temperature_(temperature), normalize_(normalize), scale_(scale.value_or(2.0 * M_PI)), full_valid_cache_(std::make_unique<FullValidCache>()) {
  if (scale.has_value() && !normalize_) { throw std::runtime_error("PositionEmbeddingSine scale requires normalize=true"); }
 }
 torch::Tensor PositionEmbeddingSineImpl::forward(const NestedTensor& tensor_list, bool align_dim_orders) const {
@@ -145,18 +136,14 @@ torch::Tensor PositionEmbeddingSineImpl::forward_mask(const torch::Tensor& mask,
  }
  return build_sine_position_embedding(x_embed, y_embed, num_pos_feats_, temperature_, align_dim_orders, false);
 }
-torch::Tensor PositionEmbeddingSineImpl::forward_full_valid(int64_t batch_size, int64_t height, int64_t width, const torch::Device& device,
-                                                            bool align_dim_orders) const {
- if (batch_size <= 0 || height <= 0 || width <= 0) {
-  throw std::runtime_error("PositionEmbeddingSine full-valid cache requires positive batch and spatial sizes");
- }
+torch::Tensor PositionEmbeddingSineImpl::forward_full_valid(int64_t batch_size, int64_t height, int64_t width, const torch::Device& device, bool align_dim_orders) const {
+ if (batch_size <= 0 || height <= 0 || width <= 0) { throw std::runtime_error("PositionEmbeddingSine full-valid cache requires positive batch and spatial sizes"); }
  const int device_index = device.has_index() ? device.index() : -1;
  const auto wait_for_cache_entry = [](const auto& entry) {
   if (entry.device_type != c10::DeviceType::CUDA || !entry.ready_event) { return; }
   const auto cuda_device_index = checked_device_index(entry.device_index);
   c10::cuda::CUDAGuard device_guard(cuda_device_index);
-  entry.ready_event->wait(reinterpret_cast<std::uintptr_t>(c10::cuda::getCurrentCUDAStream(cuda_device_index).stream()),
-                          "wait for position embedding cache reuse");
+  entry.ready_event->wait(reinterpret_cast<std::uintptr_t>(c10::cuda::getCurrentCUDAStream(cuda_device_index).stream()), "wait for position embedding cache reuse");
  };
  const auto expand_entry = [batch_size](const auto& entry) {
   if (entry.align_dim_orders) { return entry.base.expand({entry.height, entry.width, batch_size, entry.base.size(3)}); }
@@ -179,8 +166,7 @@ torch::Tensor PositionEmbeddingSineImpl::forward_full_valid(int64_t batch_size, 
   if (cache.event_owner->device() != device_index) throw std::invalid_argument("position embedding cache has one fixed CUDA device");
   if (cache.entries.size() >= 16U) throw std::runtime_error("position embedding cache reached its fixed capacity");
   base = build_full_valid_base(height, width, device, align_dim_orders);
-  ready_event = cache.event_owner->pool().record(reinterpret_cast<std::uintptr_t>(c10::cuda::getCurrentCUDAStream(cuda_device_index).stream()),
-                                                 "record position embedding cache readiness");
+  ready_event = cache.event_owner->pool().record(reinterpret_cast<std::uintptr_t>(c10::cuda::getCurrentCUDAStream(cuda_device_index).stream()), "record position embedding cache readiness");
   if (!ready_event) throw std::runtime_error("position embedding cache event capacity is exhausted");
  } else {
   base = build_full_valid_base(height, width, device, align_dim_orders);
@@ -227,11 +213,8 @@ torch::Tensor PositionEmbeddingSineImpl::build_full_valid_base(int64_t height, i
  return build_sine_position_embedding(x_embed, y_embed, num_pos_feats_, temperature_, align_dim_orders, true);
 }
 PositionEmbeddingSineImpl::FullValidCache::EventOwner::EventOwner(const int device)
-    : device_(device),
-      event_pool_(mmltk::frameworks::gpu::make_cuda_device_owner<EventOwner, &EventOwner::record_failure>(this, device), 16U, retirement_owner_) {}
-void PositionEmbeddingSineImpl::FullValidCache::EventOwner::record_failure(const cudaError_t failure) noexcept {
- mmltk::frameworks::gpu::record_first_cuda_failure(first_failure_, failure);
-}
+    : device_(device), event_pool_(mmltk::frameworks::gpu::make_cuda_device_owner<EventOwner, &EventOwner::record_failure>(this, device), 16U, retirement_owner_) {}
+void PositionEmbeddingSineImpl::FullValidCache::EventOwner::record_failure(const cudaError_t failure) noexcept { mmltk::frameworks::gpu::record_first_cuda_failure(first_failure_, failure); }
 mmltk::backend::ml::cuda::CudaEventPool& PositionEmbeddingSineImpl::FullValidCache::EventOwner::pool() noexcept { return event_pool_; }
 int PositionEmbeddingSineImpl::FullValidCache::EventOwner::device() const noexcept { return device_; }
 DepthwiseConvBlockImpl::DepthwiseConvBlockImpl(int64_t dim, double layer_scale_init_value)
@@ -253,8 +236,7 @@ torch::Tensor DepthwiseConvBlockImpl::forward(torch::Tensor x) {
  return x + residual;
 }
 MlpBlockImpl::MlpBlockImpl(int64_t dim, double layer_scale_init_value)
-    : norm_in(register_module("norm_in", torch::nn::LayerNorm(torch::nn::LayerNormOptions({dim})))),
-      layers(register_module("layers", torch::nn::ModuleList())) {
+    : norm_in(register_module("norm_in", torch::nn::LayerNorm(torch::nn::LayerNormOptions({dim})))), layers(register_module("layers", torch::nn::ModuleList())) {
  layers->push_back(torch::nn::Linear(dim, dim * 4));
  layers->push_back(torch::nn::GELU());
  layers->push_back(torch::nn::Linear(dim * 4, dim));
@@ -306,8 +288,8 @@ torch::Tensor SegmentationHeadImpl::resize_spatial_features(const torch::Tensor&
                                           .align_corners(false));
 }
 template <typename Output, typename MakeOutput>
-std::vector<Output> SegmentationHeadImpl::collect_head_outputs(const torch::Tensor& spatial_features, const std::vector<torch::Tensor>& query_features,
-                                                               const std::pair<int64_t, int64_t> image_size, const bool skip_blocks, MakeOutput&& make_output) {
+std::vector<Output> SegmentationHeadImpl::collect_head_outputs(
+ const torch::Tensor& spatial_features, const std::vector<torch::Tensor>& query_features, const std::pair<int64_t, int64_t> image_size, const bool skip_blocks, MakeOutput&& make_output) {
  auto resized_features = resize_spatial_features(spatial_features, image_size);
  std::vector<Output> outputs;
  outputs.reserve(query_features.size());
@@ -323,17 +305,14 @@ std::vector<Output> SegmentationHeadImpl::collect_head_outputs(const torch::Tens
  outputs.push_back(make_output(resized_features, project_query_features(query_features.front())));
  return outputs;
 }
-std::vector<torch::Tensor> SegmentationHeadImpl::forward(const torch::Tensor& spatial_features, const std::vector<torch::Tensor>& query_features,
-                                                         std::pair<int64_t, int64_t> image_size, bool skip_blocks) {
+std::vector<torch::Tensor> SegmentationHeadImpl::forward(
+ const torch::Tensor& spatial_features, const std::vector<torch::Tensor>& query_features, std::pair<int64_t, int64_t> image_size, bool skip_blocks) {
  return collect_head_outputs<torch::Tensor>(
-  spatial_features, query_features, image_size, skip_blocks,
-  [this](const torch::Tensor& spatial, const torch::Tensor& queries) { return torch::einsum("bchw,bnc->bnhw", {spatial, queries}) + bias; });
+  spatial_features, query_features, image_size, skip_blocks, [this](const torch::Tensor& spatial, const torch::Tensor& queries) { return torch::einsum("bchw,bnc->bnhw", {spatial, queries}) + bias; });
 }
-std::vector<OutputLayer::SparsePredMasks> SegmentationHeadImpl::sparse_forward(const torch::Tensor& spatial_features,
-                                                                               const std::vector<torch::Tensor>& query_features,
-                                                                               std::pair<int64_t, int64_t> image_size, bool skip_blocks) {
- return collect_head_outputs<OutputLayer::SparsePredMasks>(
-  spatial_features, query_features, image_size, skip_blocks,
+std::vector<OutputLayer::SparsePredMasks> SegmentationHeadImpl::sparse_forward(
+ const torch::Tensor& spatial_features, const std::vector<torch::Tensor>& query_features, std::pair<int64_t, int64_t> image_size, bool skip_blocks) {
+ return collect_head_outputs<OutputLayer::SparsePredMasks>(spatial_features, query_features, image_size, skip_blocks,
   [this](torch::Tensor spatial, torch::Tensor queries) { return OutputLayer::SparsePredMasks{std::move(spatial), std::move(queries), bias}; });
 }
 }  // namespace mmltk::backend::models::rfdetr

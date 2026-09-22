@@ -2,9 +2,7 @@
 #include <stdexcept>
 #include <utility>
 namespace mmltk::frameworks::gpu {
-TerminalCudaCustody* TerminalCudaRetirementOwner::Slot::uninitialized_custody() noexcept {
- return reinterpret_cast<TerminalCudaCustody*>(custody_storage.data());
-}
+TerminalCudaCustody* TerminalCudaRetirementOwner::Slot::uninitialized_custody() noexcept { return reinterpret_cast<TerminalCudaCustody*>(custody_storage.data()); }
 bool TerminalCudaRetirementOwner::admission_open() const noexcept { return !terminal_.load(std::memory_order_acquire); }
 TerminalCudaRetirementOwner::TerminalCudaRetirementOwner(const std::size_t capacity)
     : slots_(capacity == 0U || capacity > kMaximumCapacity ? nullptr : std::make_unique<Slot[]>(capacity)), capacity_(slots_ == nullptr ? 0U : capacity) {
@@ -39,8 +37,7 @@ void TerminalCudaRetirementOwner::Release(const std::size_t index, const std::ui
  slot.failure = cudaSuccess;
  --reservations_;
 }
-void TerminalCudaRetirementOwner::Install(const std::size_t index, const std::uint64_t generation, TerminalCudaCustody&& custody,
-                                          const cudaError_t failure) noexcept {
+void TerminalCudaRetirementOwner::Install(const std::size_t index, const std::uint64_t generation, TerminalCudaCustody&& custody, const cudaError_t failure) noexcept {
  std::lock_guard lock(mutex_);
  if (index >= capacity_ || !custody) std::terminate();
  Slot& slot = slots_[index];

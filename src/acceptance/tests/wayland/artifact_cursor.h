@@ -55,8 +55,8 @@ private:
  void consume_line(Audit& audit, Observer& observer) {
   if (line_) ++*line_;
   const std::string_view line{pending_};
-  if (format_ == Format::FirefoxText && ((line.contains("Uncaptured WebGPU error: Texture") && line.contains("is invalid")) ||
-                                         line.contains("XPCOMGlueLoad error") || line.contains("Couldn't load XPCOM") || line.contains("panicked at"))) {
+  if (format_ == Format::FirefoxText && ((line.contains("Uncaptured WebGPU error: Texture") && line.contains("is invalid")) || line.contains("XPCOMGlueLoad error") ||
+                                         line.contains("Couldn't load XPCOM") || line.contains("panicked at"))) {
    const nlohmann::json failure{{"event", "integration.failed"}, {"detail", std::string{line}}};
    audit.consume(failure);
    observer(failure);

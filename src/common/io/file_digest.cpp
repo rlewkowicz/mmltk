@@ -26,19 +26,12 @@ void update_digest(EVP_MD_CTX* context, const void* data, const std::size_t size
 [[nodiscard]] Sha256Digest finish_digest(EVP_MD_CTX* context) {
  Sha256Digest digest{};
  unsigned int digest_size = 0U;
- if (EVP_DigestFinal_ex(context, digest.data(), &digest_size) != 1 || digest_size != digest.size()) {
-  throw std::runtime_error("cannot finalize SHA-256 digest");
- }
+ if (EVP_DigestFinal_ex(context, digest.data(), &digest_size) != 1 || digest_size != digest.size()) { throw std::runtime_error("cannot finalize SHA-256 digest"); }
  return digest;
 }
 FileSnapshot snapshot(const struct stat& value) {
- return {static_cast<std::uint64_t>(value.st_dev),
-         static_cast<std::uint64_t>(value.st_ino),
-         static_cast<std::uint64_t>(value.st_size),
-         value.st_mtim.tv_sec,
-         value.st_mtim.tv_nsec,
-         value.st_ctim.tv_sec,
-         value.st_ctim.tv_nsec};
+ return {static_cast<std::uint64_t>(value.st_dev), static_cast<std::uint64_t>(value.st_ino), static_cast<std::uint64_t>(value.st_size), value.st_mtim.tv_sec, value.st_mtim.tv_nsec,
+  value.st_ctim.tv_sec, value.st_ctim.tv_nsec};
 }
 FileSnapshot snapshot(int fd) {
  struct stat value{};

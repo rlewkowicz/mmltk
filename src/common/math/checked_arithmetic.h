@@ -11,9 +11,7 @@ template <typename T, typename U>
  if constexpr (std::is_signed_v<U>) {
   const auto signed_value = static_cast<std::intmax_t>(value);
   if constexpr (std::is_signed_v<T>) {
-   if (signed_value < static_cast<std::intmax_t>(std::numeric_limits<T>::min()) || signed_value > static_cast<std::intmax_t>(std::numeric_limits<T>::max())) {
-    throw std::overflow_error(context);
-   }
+   if (signed_value < static_cast<std::intmax_t>(std::numeric_limits<T>::min()) || signed_value > static_cast<std::intmax_t>(std::numeric_limits<T>::max())) { throw std::overflow_error(context); }
   } else if (signed_value < 0 || static_cast<std::uintmax_t>(signed_value) > static_cast<std::uintmax_t>(std::numeric_limits<T>::max())) {
    throw std::overflow_error(context);
   }

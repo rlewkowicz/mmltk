@@ -21,15 +21,13 @@ namespace {
  std::size_t position = normalized_path.find(candidate);
  while (position != std::string_view::npos) {
   const std::size_t end = position + candidate.size();
-  if ((position == 0U || is_match_boundary(normalized_path[position - 1U])) && (end == normalized_path.size() || is_match_boundary(normalized_path[end]))) {
-   return true;
-  }
+  if ((position == 0U || is_match_boundary(normalized_path[position - 1U])) && (end == normalized_path.size() || is_match_boundary(normalized_path[end]))) { return true; }
   position = normalized_path.find(candidate, position + 1U);
  }
  return false;
 }
-void consider_candidate(const PresetCatalogEntry& preset, const std::string_view normalized_path, const std::string_view candidate,
-                        const std::size_t base_score, const PresetCatalogEntry*& best, std::size_t& best_score) {
+void consider_candidate(
+ const PresetCatalogEntry& preset, const std::string_view normalized_path, const std::string_view candidate, const std::size_t base_score, const PresetCatalogEntry*& best, std::size_t& best_score) {
  if (!contains_path_token(normalized_path, candidate)) return;
  const std::size_t score = base_score + candidate.size();
  if (score > best_score) {
@@ -37,15 +35,20 @@ void consider_candidate(const PresetCatalogEntry& preset, const std::string_view
   best_score = score;
  }
 }
-void consider_known_aliases(const PresetCatalogEntry& preset, const std::string_view normalized_path, const PresetCatalogEntry*& best,
-                            std::size_t& best_score) {
+void consider_known_aliases(const PresetCatalogEntry& preset, const std::string_view normalized_path, const PresetCatalogEntry*& best, std::size_t& best_score) {
  struct Alias final {
   std::string_view preset;
   std::string_view path_token;
  };
  constexpr std::array aliases{
-  Alias{"rf-detr-seg-nano", "seg-n"},  Alias{"rf-detr-seg-small", "seg-s"},   Alias{"rf-detr-seg-medium", "seg-med"},  Alias{"rf-detr-seg-medium", "seg-m"},
-  Alias{"rf-detr-seg-large", "seg-l"}, Alias{"rf-detr-seg-xlarge", "seg-xl"}, Alias{"rf-detr-seg-xxlarge", "seg-2xl"}, Alias{"rf-detr-seg-xxlarge", "seg-xxl"},
+  Alias{"rf-detr-seg-nano", "seg-n"},
+  Alias{"rf-detr-seg-small", "seg-s"},
+  Alias{"rf-detr-seg-medium", "seg-med"},
+  Alias{"rf-detr-seg-medium", "seg-m"},
+  Alias{"rf-detr-seg-large", "seg-l"},
+  Alias{"rf-detr-seg-xlarge", "seg-xl"},
+  Alias{"rf-detr-seg-xxlarge", "seg-2xl"},
+  Alias{"rf-detr-seg-xxlarge", "seg-xxl"},
  };
  for (const Alias& alias : aliases) {
   if (alias.preset == preset.preset_name) { consider_candidate(preset, normalized_path, alias.path_token, 1400U, best, best_score); }
@@ -77,8 +80,7 @@ const PresetCatalogEntry* infer_model_preset_from_path(const std::filesystem::pa
   consider_candidate(preset, normalized, mmltk::common::types::to_lower(std::filesystem::path(weight).stem().string()), 2900U, best, best_score);
   consider_candidate(preset, normalized, mmltk::common::types::to_lower(preset.preset_name), 2800U, best, best_score);
   if (preset.preset_name.starts_with("rf-detr-")) {
-   consider_candidate(preset, normalized, mmltk::common::types::to_lower(preset.preset_name.substr(std::string_view{"rf-detr-"}.size())), 1500U, best,
-                      best_score);
+   consider_candidate(preset, normalized, mmltk::common::types::to_lower(preset.preset_name.substr(std::string_view{"rf-detr-"}.size())), 1500U, best, best_score);
   }
   consider_known_aliases(preset, normalized, best, best_score);
  }

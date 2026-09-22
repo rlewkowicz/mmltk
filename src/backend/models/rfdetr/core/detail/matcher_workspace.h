@@ -33,8 +33,7 @@ public:
  [[nodiscard]] at::Tensor cpu_indices(std::int64_t count);
  [[nodiscard]] TracedLossOpCache& loss_cache() noexcept;
  [[nodiscard]] LsapScratch& solver() noexcept { return solver_; }
- [[nodiscard]] std::vector<MatcherLayerIndices> pack(const std::vector<std::vector<std::pair<at::Tensor, at::Tensor>>>&,
-                                                     const std::vector<std::int64_t>& target_offsets, const at::Device&);
+ [[nodiscard]] std::vector<MatcherLayerIndices> pack(const std::vector<std::vector<std::pair<at::Tensor, at::Tensor>>>&, const std::vector<std::int64_t>& target_offsets, const at::Device&);
  // Called after the lane's complete forward/backward use. CPU ownership still
  // prevents reuse of tensors saved in retained graphs.
  void complete_assignments(CUstream stream);

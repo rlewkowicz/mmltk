@@ -42,19 +42,16 @@ struct PostprocessedSelection {
  std::optional<torch::Tensor> mask_logits{};
  torch::Tensor counts{};
 };
-PostprocessedSelection select_output_batch_fixed_size(const OutputTensors&, int64_t height, int64_t width, int64_t count, bool require_masks = false,
-                                                      ClassPostprocessLane* classes = nullptr);
+PostprocessedSelection select_output_batch_fixed_size(const OutputTensors&, int64_t height, int64_t width, int64_t count, bool require_masks = false, ClassPostprocessLane* classes = nullptr);
 // Complete concurrently live scratch: gathered logits, expanded logits, device
 // bools, and host bools. Dense preview storage and encoded records are separate.
 struct SelectedMaskCapacity final {
  std::array<std::size_t, 4U> bytes{};
- [[nodiscard]] static SelectedMaskCapacity Resolve(std::size_t count, std::size_t model_height, std::size_t model_width, std::size_t height, std::size_t width,
-                                                   std::size_t dtype_bytes) {
+ [[nodiscard]] static SelectedMaskCapacity Resolve(std::size_t count, std::size_t model_height, std::size_t model_width, std::size_t height, std::size_t width, std::size_t dtype_bytes) {
   const auto model_pixels = checked_prediction_extent(model_height, model_width, kMaximumPredictionTensorBytes);
   const auto pixels = checked_prediction_extent(height, width, kMaximumEncodedMaskPixels);
-  const auto floating = [&](std::size_t plane) {
-   return checked_prediction_extent(count, checked_prediction_extent(plane, dtype_bytes, kMaximumPredictionTensorBytes), kMaximumPredictionTensorBytes);
-  };
+  const auto floating = [&](
+                         std::size_t plane) { return checked_prediction_extent(count, checked_prediction_extent(plane, dtype_bytes, kMaximumPredictionTensorBytes), kMaximumPredictionTensorBytes); };
   const auto boolean = checked_prediction_extent(count, pixels, kMaximumPredictionTensorBytes);
   return {{floating(model_pixels), floating(pixels), boolean, boolean}};
  }
@@ -86,6 +83,5 @@ struct PostprocessedBatch {
  torch::Tensor counts{};
  [[nodiscard]] int64_t size() const { return scores.defined() ? scores.size(0) : 0; }
 };
-PostprocessedBatch postprocess_output_batch_fixed_size(const OutputTensors& outputs, int64_t target_height, int64_t target_width, int64_t num_select,
-                                                       ClassPostprocessLane* classes = nullptr);
+PostprocessedBatch postprocess_output_batch_fixed_size(const OutputTensors& outputs, int64_t target_height, int64_t target_width, int64_t num_select, ClassPostprocessLane* classes = nullptr);
 }  // namespace mmltk::backend::models::rfdetr

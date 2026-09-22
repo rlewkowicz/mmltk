@@ -40,15 +40,11 @@ void sync_parent_directory(const std::filesystem::path& path) {
 void publish_staged_path_atomically(const std::filesystem::path& staging, const std::filesystem::path& destination, const bool overwrite) {
  std::error_code status_error;
  const auto status = std::filesystem::symlink_status(destination, status_error);
- if (status_error && status_error != std::errc::no_such_file_or_directory) {
-  throw std::filesystem::filesystem_error("failed to inspect publication destination", destination, status_error);
- }
+ if (status_error && status_error != std::errc::no_such_file_or_directory) { throw std::filesystem::filesystem_error("failed to inspect publication destination", destination, status_error); }
  const bool exists = !status_error && status.type() != std::filesystem::file_type::not_found;
  if (!overwrite) {
   if (exists) throw std::runtime_error("publication destination already exists: " + destination.string());
-  if (::syscall(SYS_renameat2, AT_FDCWD, staging.c_str(), AT_FDCWD, destination.c_str(), RENAME_NOREPLACE) != 0) {
-   throw errno_error("atomic no-replace publication failed", destination.string());
-  }
+  if (::syscall(SYS_renameat2, AT_FDCWD, staging.c_str(), AT_FDCWD, destination.c_str(), RENAME_NOREPLACE) != 0) { throw errno_error("atomic no-replace publication failed", destination.string()); }
   try {
    sync_parent_directory(destination);
   } catch (...) {
@@ -67,9 +63,7 @@ void publish_staged_path_atomically(const std::filesystem::path& staging, const 
   }
   return;
  }
- if (::syscall(SYS_renameat2, AT_FDCWD, staging.c_str(), AT_FDCWD, destination.c_str(), RENAME_EXCHANGE) != 0) {
-  throw errno_error("atomic path exchange failed", destination.string());
- }
+ if (::syscall(SYS_renameat2, AT_FDCWD, staging.c_str(), AT_FDCWD, destination.c_str(), RENAME_EXCHANGE) != 0) { throw errno_error("atomic path exchange failed", destination.string()); }
  try {
   sync_parent_directory(destination);
  } catch (...) {
@@ -150,8 +144,7 @@ void FileHandle::sync_data() const {
  if (::fdatasync(get()) != 0) throw errno_error("fdatasync failed");
 }
 MappedByteRegion::~MappedByteRegion() { unmap(); }
-MappedByteRegion::MappedByteRegion(MappedByteRegion&& other) noexcept
-    : address_(std::exchange(other.address_, nullptr)), bytes_(std::exchange(other.bytes_, 0)) {}
+MappedByteRegion::MappedByteRegion(MappedByteRegion&& other) noexcept : address_(std::exchange(other.address_, nullptr)), bytes_(std::exchange(other.bytes_, 0)) {}
 MappedByteRegion& MappedByteRegion::operator=(MappedByteRegion&& other) noexcept {
  if (this != &other) {
   unmap();

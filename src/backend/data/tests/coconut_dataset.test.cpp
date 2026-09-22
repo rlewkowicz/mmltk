@@ -59,8 +59,8 @@ std::string png(int width, int height, std::span<const std::uint32_t> ids) {
   pixels[i * 3 + 2] = (ids[i] >> 16) & 255;
  }
  std::string encoded;
- REQUIRE(stbi_write_png_to_func([](void* context, void* data, int size) { static_cast<std::string*>(context)->append(static_cast<const char*>(data), size); },
-                                &encoded, width, height, 3, pixels.data(), width * 3) != 0);
+ REQUIRE(stbi_write_png_to_func(
+          [](void* context, void* data, int size) { static_cast<std::string*>(context)->append(static_cast<const char*>(data), size); }, &encoded, width, height, 3, pixels.data(), width * 3) != 0);
  return encoded;
 }
 void tar(const std::filesystem::path& path, std::span<const std::pair<std::string, std::string>> members, bool symlink = false) {
@@ -83,33 +83,14 @@ void tar(const std::filesystem::path& path, std::span<const std::pair<std::strin
 Json category_catalog() {
  Json rows = Json::array();
  // CLEANUP-OFF: independent external COCO metadata is the oracle for production category mapping.
- constexpr std::pair<unsigned, const char*> categories[]{{1, "person"},         {2, "bicycle"},       {3, "car"},
-                                                         {4, "motorcycle"},     {5, "airplane"},      {6, "bus"},
-                                                         {7, "train"},          {8, "truck"},         {9, "boat"},
-                                                         {10, "traffic light"}, {11, "fire hydrant"}, {13, "stop sign"},
-                                                         {14, "parking meter"}, {15, "bench"},        {16, "bird"},
-                                                         {17, "cat"},           {18, "dog"},          {19, "horse"},
-                                                         {20, "sheep"},         {21, "cow"},          {22, "elephant"},
-                                                         {23, "bear"},          {24, "zebra"},        {25, "giraffe"},
-                                                         {27, "backpack"},      {28, "umbrella"},     {31, "handbag"},
-                                                         {32, "tie"},           {33, "suitcase"},     {34, "frisbee"},
-                                                         {35, "skis"},          {36, "snowboard"},    {37, "sports ball"},
-                                                         {38, "kite"},          {39, "baseball bat"}, {40, "baseball glove"},
-                                                         {41, "skateboard"},    {42, "surfboard"},    {43, "tennis racket"},
-                                                         {44, "bottle"},        {46, "wine glass"},   {47, "cup"},
-                                                         {48, "fork"},          {49, "knife"},        {50, "spoon"},
-                                                         {51, "bowl"},          {52, "banana"},       {53, "apple"},
-                                                         {54, "sandwich"},      {55, "orange"},       {56, "broccoli"},
-                                                         {57, "carrot"},        {58, "hot dog"},      {59, "pizza"},
-                                                         {60, "donut"},         {61, "cake"},         {62, "chair"},
-                                                         {63, "couch"},         {64, "potted plant"}, {65, "bed"},
-                                                         {67, "dining table"},  {70, "toilet"},       {72, "tv"},
-                                                         {73, "laptop"},        {74, "mouse"},        {75, "remote"},
-                                                         {76, "keyboard"},      {77, "cell phone"},   {78, "microwave"},
-                                                         {79, "oven"},          {80, "toaster"},      {81, "sink"},
-                                                         {82, "refrigerator"},  {84, "book"},         {85, "clock"},
-                                                         {86, "vase"},          {87, "scissors"},     {88, "teddy bear"},
-                                                         {89, "hair drier"},    {90, "toothbrush"}};
+ constexpr std::pair<unsigned, const char*> categories[]{{1, "person"}, {2, "bicycle"}, {3, "car"}, {4, "motorcycle"}, {5, "airplane"}, {6, "bus"}, {7, "train"}, {8, "truck"}, {9, "boat"},
+  {10, "traffic light"}, {11, "fire hydrant"}, {13, "stop sign"}, {14, "parking meter"}, {15, "bench"}, {16, "bird"}, {17, "cat"}, {18, "dog"}, {19, "horse"}, {20, "sheep"}, {21, "cow"},
+  {22, "elephant"}, {23, "bear"}, {24, "zebra"}, {25, "giraffe"}, {27, "backpack"}, {28, "umbrella"}, {31, "handbag"}, {32, "tie"}, {33, "suitcase"}, {34, "frisbee"}, {35, "skis"}, {36, "snowboard"},
+  {37, "sports ball"}, {38, "kite"}, {39, "baseball bat"}, {40, "baseball glove"}, {41, "skateboard"}, {42, "surfboard"}, {43, "tennis racket"}, {44, "bottle"}, {46, "wine glass"}, {47, "cup"},
+  {48, "fork"}, {49, "knife"}, {50, "spoon"}, {51, "bowl"}, {52, "banana"}, {53, "apple"}, {54, "sandwich"}, {55, "orange"}, {56, "broccoli"}, {57, "carrot"}, {58, "hot dog"}, {59, "pizza"},
+  {60, "donut"}, {61, "cake"}, {62, "chair"}, {63, "couch"}, {64, "potted plant"}, {65, "bed"}, {67, "dining table"}, {70, "toilet"}, {72, "tv"}, {73, "laptop"}, {74, "mouse"}, {75, "remote"},
+  {76, "keyboard"}, {77, "cell phone"}, {78, "microwave"}, {79, "oven"}, {80, "toaster"}, {81, "sink"}, {82, "refrigerator"}, {84, "book"}, {85, "clock"}, {86, "vase"}, {87, "scissors"},
+  {88, "teddy bear"}, {89, "hair drier"}, {90, "toothbrush"}};
  // CLEANUP-ON
  for (const auto& [id, name] : categories) rows.push_back({{"id", id}, {"name", name}, {"isthing", 0}});
  rows.push_back({{"id", 200}, {"name", "unrelated stuff"}, {"isthing", 1}});
@@ -119,21 +100,17 @@ void json_file(const std::filesystem::path& path, Json value) {
  if (value.contains("images") && value.contains("annotations") && !value.contains("categories")) value["categories"] = category_catalog();
  mmltk::testsupport::write_text_file(path, value.dump());
 }
-Json segment(unsigned id = 1, unsigned category = 1, bool thing = true) {
- return {{"id", id}, {"category_id", category}, {"isthing", thing ? 1 : 0}, {"iscrowd", 0}, {"area", nullptr}};
-}
+Json segment(unsigned id = 1, unsigned category = 1, bool thing = true) { return {{"id", id}, {"category_id", category}, {"isthing", thing ? 1 : 0}, {"iscrowd", 0}, {"area", nullptr}}; }
 std::shared_ptr<arrow::DataType> segment_type(bool integer_area) {
- return arrow::struct_({arrow::field("area", integer_area ? arrow::int64() : arrow::float64()), arrow::field("category_id", arrow::int64()),
-                        arrow::field("id", arrow::int64()), arrow::field("iscrowd", arrow::int64()), arrow::field("isthing", arrow::int64())});
+ return arrow::struct_({arrow::field("area", integer_area ? arrow::int64() : arrow::float64()), arrow::field("category_id", arrow::int64()), arrow::field("id", arrow::int64()),
+  arrow::field("iscrowd", arrow::int64()), arrow::field("isthing", arrow::int64())});
 }
 std::shared_ptr<arrow::Schema> hf_schema(bool integer_area = false) {
  return arrow::schema({arrow::field("mask", arrow::struct_({arrow::field("bytes", arrow::binary()), arrow::field("path", arrow::utf8())})),
-                       arrow::field("segments_info", arrow::struct_({arrow::field("file_name", arrow::utf8()), arrow::field("image_id", arrow::int64()),
-                                                                     arrow::field("segments_info", arrow::list(segment_type(integer_area)))})),
-                       arrow::field("image_info", arrow::struct_({arrow::field("coco_url", arrow::utf8()), arrow::field("date_captured", arrow::utf8()),
-                                                                  arrow::field("file_name", arrow::utf8()), arrow::field("height", arrow::int64()),
-                                                                  arrow::field("id", arrow::int64()), arrow::field("license", arrow::int64()),
-                                                                  arrow::field("width", arrow::int64())}))});
+  arrow::field(
+   "segments_info", arrow::struct_({arrow::field("file_name", arrow::utf8()), arrow::field("image_id", arrow::int64()), arrow::field("segments_info", arrow::list(segment_type(integer_area)))})),
+  arrow::field("image_info", arrow::struct_({arrow::field("coco_url", arrow::utf8()), arrow::field("date_captured", arrow::utf8()), arrow::field("file_name", arrow::utf8()),
+                              arrow::field("height", arrow::int64()), arrow::field("id", arrow::int64()), arrow::field("license", arrow::int64()), arrow::field("width", arrow::int64())}))});
 }
 void append_value(arrow::ArrayBuilder& builder, const Json& value) {
  if (value.is_null()) {
@@ -161,8 +138,7 @@ void append_value(arrow::ArrayBuilder& builder, const Json& value) {
   default: throw std::runtime_error("unsupported fixture type");
  }
 }
-void parquet_file(const std::filesystem::path& path, const Json& rows, std::shared_ptr<arrow::Schema> schema = hf_schema(),
-                  parquet::Compression::type codec = parquet::Compression::SNAPPY) {
+void parquet_file(const std::filesystem::path& path, const Json& rows, std::shared_ptr<arrow::Schema> schema = hf_schema(), parquet::Compression::type codec = parquet::Compression::SNAPPY) {
  std::vector<std::shared_ptr<arrow::Array>> columns;
  for (const auto& field : schema->fields()) {
   std::unique_ptr<arrow::ArrayBuilder> builder;
@@ -181,16 +157,9 @@ void parquet_file(const std::filesystem::path& path, const Json& rows, std::shar
 Json hf_row(unsigned id, std::string encoded, Json segments, int width = 3, int height = 3) {
  const auto digits = std::to_string(id);
  const auto stem = std::string(12U - digits.size(), '0') + digits;
- return {{"mask", {{"bytes", std::move(encoded)}, {"path", nullptr}}},
-         {"segments_info", {{"file_name", stem + ".png"}, {"image_id", id}, {"segments_info", std::move(segments)}}},
-         {"image_info",
-          {{"coco_url", "http://images.cocodataset.org/train2017/" + stem + ".jpg"},
-           {"date_captured", "2017"},
-           {"file_name", stem + ".jpg"},
-           {"height", height},
-           {"width", width},
-           {"id", id},
-           {"license", 1}}}};
+ return {{"mask", {{"bytes", std::move(encoded)}, {"path", nullptr}}}, {"segments_info", {{"file_name", stem + ".png"}, {"image_id", id}, {"segments_info", std::move(segments)}}},
+  {"image_info", {{"coco_url", "http://images.cocodataset.org/train2017/" + stem + ".jpg"}, {"date_captured", "2017"}, {"file_name", stem + ".jpg"}, {"height", height}, {"width", width}, {"id", id},
+                  {"license", 1}}}};
 }
 CoconutPhysicalImage coco(unsigned id, CoconutImageNamespace source = CoconutImageNamespace::CocoTrain) {
  const auto digits = std::to_string(id);
@@ -199,23 +168,18 @@ CoconutPhysicalImage coco(unsigned id, CoconutImageNamespace source = CoconutIma
 }
 CoconutPhysicalImage objects(unsigned id, CoconutImageNamespace source = CoconutImageNamespace::Objects365V2) {
  const auto digits = std::to_string(id);
- return {source, id, 32,
-         std::string(source == CoconutImageNamespace::Objects365V1 ? "image/objects365_v1_" : "patch32/objects365_v2_") + std::string(8U - digits.size(), '0') +
-          digits + ".jpg",
-         "physical-objects-archive"};
+ return {source, id, 32, std::string(source == CoconutImageNamespace::Objects365V1 ? "image/objects365_v1_" : "patch32/objects365_v2_") + std::string(8U - digits.size(), '0') + digits + ".jpg",
+  "physical-objects-archive"};
 }
 struct LocalCoconutImportRequest : CoconutImportRequest {
  std::unique_ptr<CoconutPhysicalMembership> membership;
- LocalCoconutImportRequest(std::span<const CoconutPhysicalImage> physical, CoconutEdition selected)
-     : membership(std::make_unique<CoconutPhysicalMembership>(physical)) {
+ LocalCoconutImportRequest(std::span<const CoconutPhysicalImage> physical, CoconutEdition selected) : membership(std::make_unique<CoconutPhysicalMembership>(physical)) {
   edition = selected;
   input_identity = "pinned-local-fixture-inputs";
   physical_membership = membership.get();
  }
 };
-LocalCoconutImportRequest request(std::span<const CoconutPhysicalImage> physical, CoconutEdition edition = CoconutEdition::Base) {
- return LocalCoconutImportRequest(physical, edition);
-}
+LocalCoconutImportRequest request(std::span<const CoconutPhysicalImage> physical, CoconutEdition edition = CoconutEdition::Base) { return LocalCoconutImportRequest(physical, edition); }
 void reversed_coco_parquet(const std::filesystem::path& path) {
  const std::array<std::uint32_t, 1> ids{1};
  const auto mask = png(1, 1, ids);
@@ -244,7 +208,10 @@ NormalizedAnnotationIndex recovery_originals(unsigned image_id, std::span<const 
  index.images.push_back({.source_image_id = image_id, .box_count = static_cast<std::uint32_t>(masks.size()), .width = 3, .height = 3});
  for (std::size_t i = 0; i < masks.size(); ++i) {
   NormalizedBox box;
-  box.x1 = 0.1F; box.y1 = 0.2F; box.x2 = 0.8F; box.y2 = 0.9F;
+  box.x1 = 0.1F;
+  box.y1 = 0.2F;
+  box.x2 = 0.8F;
+  box.y2 = 0.9F;
   box.mask_rle_offset = i;
   box.mask_rle_pairs = 1;
   box.class_id = 16;
@@ -416,16 +383,13 @@ TEST_CASE("COCONut JSON joins retain heterogeneous Large rows and validation phy
  supported["ignore"] = 1;
  supported["bbox"] = Json::array({0.25, 0.5, 1.5, 1.0});
  Json document{
-  {"images", Json::array({{{"id", 691105}, {"file_name", "691105.jpg"}, {"width", 2}, {"height", 2}},
-                          {{"id", 91105}, {"file_name", "objects365_v2_00091105.png"}, {"width", 2}, {"height", 2}}})},
-  {"annotations",
-   Json::array(
-    {{{"image_id", 691105}, {"file_name", "691105.png"}, {"object365_file_name", "objects365_v1_00091105"}, {"segments_info", Json::array({supported})}},
-     {{"image_id", 91105}, {"file_name", "objects365_v2_00091105.png"}, {"segments_info", Json::array({segment()})}}})}};
+  {"images", Json::array({{{"id", 691105}, {"file_name", "691105.jpg"}, {"width", 2}, {"height", 2}}, {{"id", 91105}, {"file_name", "objects365_v2_00091105.png"}, {"width", 2}, {"height", 2}}})},
+  {"annotations", Json::array({{{"image_id", 691105}, {"file_name", "691105.png"}, {"object365_file_name", "objects365_v1_00091105"}, {"segments_info", Json::array({supported})}},
+                   {{"image_id", 91105}, {"file_name", "objects365_v2_00091105.png"}, {"segments_info", Json::array({segment()})}}})}};
  json_file(input.annotation_json, document);
  // Deliberately reversed archive order.
- const std::array members{std::pair{"panoptic_o365val_v3/objects365_v2_00091105.png", mask}, std::pair{"panoptic_o365val_v3/objects365_v1_00091105.png", mask},
-                          std::pair{".DS_Store", std::string("unrelated")}};
+ const std::array members{
+  std::pair{"panoptic_o365val_v3/objects365_v2_00091105.png", mask}, std::pair{"panoptic_o365val_v3/objects365_v1_00091105.png", mask}, std::pair{".DS_Store", std::string("unrelated")}};
  std::vector<std::pair<std::string, std::string>> owned;
  for (const auto& [name, bytes] : members) owned.emplace_back(name, bytes);
  tar(input.mask_archive, owned);
@@ -462,13 +426,11 @@ TEST_CASE("COCONut Large shapes and sorted XL masks retain complete rows with La
  input.expected_rows = 2;
  input.annotation_json = root.path() / "large.json";
  input.mask_archive = root.path() / "large.tar";
- json_file(input.annotation_json,
-           {{"images", Json::array({{{"id", 900}, {"file_name", "900.jpg"}, {"object365_name", "objects365_v2_00000002"}, {"width", 1}, {"height", 1}},
-                                    {{"id", 1}, {"file_name", "objects365_v2_00000001.png"}, {"width", 1}, {"height", 1}}})},
-            {"annotations", Json::array({{{"image_id", 900}, {"file_name", "900.png"}, {"segments_info", Json::array({segment()})}},
-                                         {{"image_id", 1}, {"file_name", "objects365_v2_00000001.png"}, {"segments_info", Json::array({segment()})}}})}});
- const std::array<std::pair<std::string, std::string>, 2> members{
-  {{"panoptic_object365/objects365_v2_00000001.png", mask}, {"panoptic_object365/objects365_v2_00000002.png", mask}}};
+ json_file(input.annotation_json, {{"images", Json::array({{{"id", 900}, {"file_name", "900.jpg"}, {"object365_name", "objects365_v2_00000002"}, {"width", 1}, {"height", 1}},
+                                               {{"id", 1}, {"file_name", "objects365_v2_00000001.png"}, {"width", 1}, {"height", 1}}})},
+                                   {"annotations", Json::array({{{"image_id", 900}, {"file_name", "900.png"}, {"segments_info", Json::array({segment()})}},
+                                                    {{"image_id", 1}, {"file_name", "objects365_v2_00000001.png"}, {"segments_info", Json::array({segment()})}}})}});
+ const std::array<std::pair<std::string, std::string>, 2> members{{{"panoptic_object365/objects365_v2_00000001.png", mask}, {"panoptic_object365/objects365_v2_00000002.png", mask}}};
  tar(input.mask_archive, members);
  auto components = import_coconut_annotations(input);
  REQUIRE(components.size() == 1);
@@ -480,10 +442,8 @@ TEST_CASE("COCONut Large shapes and sorted XL masks retain complete rows with La
  input.annotation_json.clear();
  input.mask_archive = root.path() / "xl.tar";
  const std::array<std::pair<std::string, std::string>, 4> xl_members{
-  {{"coconuts_xlarge/panseg/objects365_v2_00000003.png", mask},
-   {"coconuts_xlarge/panseg_info/objects365_v2_00000003.json", Json::array({segment()}).dump()},
-   {"coconuts_xlarge/panseg_info/objects365_v2_00000002.json", Json::array({segment()}).dump()},
-   {"coconuts_xlarge/panseg/objects365_v2_00000002.png", mask}}};
+  {{"coconuts_xlarge/panseg/objects365_v2_00000003.png", mask}, {"coconuts_xlarge/panseg_info/objects365_v2_00000003.json", Json::array({segment()}).dump()},
+   {"coconuts_xlarge/panseg_info/objects365_v2_00000002.json", Json::array({segment()}).dump()}, {"coconuts_xlarge/panseg/objects365_v2_00000002.png", mask}}};
  tar(input.mask_archive, xl_members);
  auto xl = import_coconut_annotations(input);
  REQUIRE(xl.size() == 1);
@@ -575,9 +535,9 @@ TEST_CASE("COCONut version-1 physical inventory has fixed bytes and admits exist
   "\x02\x00\x00\x00"                                                                                                  // cache schema 2
   "\x18\x00\x00\x00\x63\x6f\x63\x6f\x6e\x75\x74\x2d\x65\x78\x61\x63\x74\x2d\x72\x67\x62\x2d\x72\x6c\x65\x2d\x76\x31"  // normalization
   "\x01\x00\x00\x00\x61"                                                                                              // input identity
-  "\x00\x03\x34\x12\x00"                          // Base, Objects365V1, shard 0x1234, physical
-  "\x01\x00\x00\x00\x00\x00\x00\x00"              // one record
-  "\x03\xe1\x63\x01\x00\x00\x00\x00\x00\x34\x12"  // namespace, physical ID 91105, shard
+  "\x00\x03\x34\x12\x00"                                                                                              // Base, Objects365V1, shard 0x1234, physical
+  "\x01\x00\x00\x00\x00\x00\x00\x00"                                                                                  // one record
+  "\x03\xe1\x63\x01\x00\x00\x00\x00\x00\x34\x12"                                                                      // namespace, physical ID 91105, shard
   "\x20\x00\x00\x00\x69\x6d\x61\x67\x65\x2f\x6f\x62\x6a\x65\x63\x74\x73\x33\x36\x35\x5f\x76\x31\x5f\x30\x30\x30\x39\x31\x31\x30\x35\x2e\x6a\x70"
   "\x67"                                                                                                                               // physical member
   "\x01\x00\x00\x00\x61"                                                                                                               // archive identity
@@ -609,14 +569,14 @@ TEST_CASE("COCONut version-1 component inventory pins nested physical release an
   "\x02\x00\x00\x00"                                                                                                  // cache schema 2
   "\x18\x00\x00\x00\x63\x6f\x63\x6f\x6e\x75\x74\x2d\x65\x78\x61\x63\x74\x2d\x72\x67\x62\x2d\x72\x6c\x65\x2d\x76\x31"  // normalization
   "\x01\x00\x00\x00\x69"                                                                                              // input identity
-  "\x04\x03\x00\x00\x01"                          // ObjectsValidation, Objects365V1, header shard 0, component
-  "\x01\x00\x00\x00\x00\x00\x00\x00"              // one record
-  "\x03\xe1\x63\x01\x00\x00\x00\x00\x00\x34\x12"  // namespace, physical ID 91105, shard
+  "\x04\x03\x00\x00\x01"                                                                                              // ObjectsValidation, Objects365V1, header shard 0, component
+  "\x01\x00\x00\x00\x00\x00\x00\x00"                                                                                  // one record
+  "\x03\xe1\x63\x01\x00\x00\x00\x00\x00\x34\x12"                                                                      // namespace, physical ID 91105, shard
   "\x20\x00\x00\x00\x69\x6d\x61\x67\x65\x2f\x6f\x62\x6a\x65\x63\x74\x73\x33\x36\x35\x5f\x76\x31\x5f\x30\x30\x30\x39\x31\x31\x30\x35\x2e\x6a\x70"
-  "\x67"                              // physical member
-  "\x01\x00\x00\x00\x61"              // archive identity
-  "\xa1\x8b\x0a\x00\x00\x00\x00\x00"  // declared release ID 691105
-  "\x02\x00\x00\x00\x00\x00\x00\x00"  // source ordinal 2
+  "\x67"                                                                                                                               // physical member
+  "\x01\x00\x00\x00\x61"                                                                                                               // archive identity
+  "\xa1\x8b\x0a\x00\x00\x00\x00\x00"                                                                                                   // declared release ID 691105
+  "\x02\x00\x00\x00\x00\x00\x00\x00"                                                                                                   // source ordinal 2
   "\xc5\x30\x4c\xa7\xa1\x6f\x7e\x76\xd6\xc2\x1b\xfd\x7b\xda\x2b\x39\xa0\x25\xcc\x26\x8d\xde\x23\x36\xd9\x5a\x21\x57\xeb\x9d\x46\x32";  // SHA-256
                                                                                                                                        // footer
                                                                                                                                        // at byte
@@ -653,16 +613,14 @@ TEST_CASE("COCONut version-1 component inventory pins nested physical release an
 TEST_CASE("COCONut physical member spelling preserves exact paths and rejects unsafe names", "[coconut]") {
  CHECK(canonical_coconut_archive_member("././train2017//./000000000007.jpg") == "train2017/000000000007.jpg");
  CHECK(canonical_coconut_archive_member("nested/./image//objects365_v1_00091105.jpg") == "nested/image/objects365_v1_00091105.jpg");
- for (const std::string& raw : {std::string("/train2017/a.jpg"), std::string("../a.jpg"), std::string("train2017/../a.jpg"), std::string("train2017\\a.jpg"),
-                                std::string("train2017/a\0.jpg", 16)}) {
+ for (const std::string& raw : {std::string("/train2017/a.jpg"), std::string("../a.jpg"), std::string("train2017/../a.jpg"), std::string("train2017\\a.jpg"), std::string("train2017/a\0.jpg", 16)}) {
   CHECK_THROWS(canonical_coconut_archive_member(raw));
  }
 }
 TEST_CASE("COCONut full physical inventories are identity-bound and independent of foreground labels", "[coconut]") {
  ScopedTempDir root("coconut-inventory");
  const auto archive = root.path() / "images.tar", cache = root.path() / "inventory.json";
- const std::array<std::pair<std::string, std::string>, 3> members{
-  {{"unlabeled2017/000000000007.jpg", "jpeg7"}, {"unlabeled2017/000000000008.jpg", "jpeg8"}, {".DS_Store", "unrelated"}}};
+ const std::array<std::pair<std::string, std::string>, 3> members{{{"unlabeled2017/000000000007.jpg", "jpeg7"}, {"unlabeled2017/000000000008.jpg", "jpeg8"}, {".DS_Store", "unrelated"}}};
  tar(archive, members);
  auto result = coconut_image_archive_inventory(archive, cache, CoconutImageNamespace::CocoUnlabeled, 0, "pinned-archive");
  REQUIRE(result.size() == 2);
@@ -746,9 +704,7 @@ TEST_CASE("COCONut authoritative box retains an empty supplied mask and rejects 
   seg["bbox"] = Json::array({1e30, 0, 1, 1});
   overflow = true;
  }
- json_file(input.annotation_json,
-           {{"images", Json::array()},
-            {"annotations", Json::array({{{"image_id", 1}, {"file_name", "objects365_v2_00000001.png"}, {"segments_info", Json::array({seg})}}})}});
+ json_file(input.annotation_json, {{"images", Json::array()}, {"annotations", Json::array({{{"image_id", 1}, {"file_name", "objects365_v2_00000001.png"}, {"segments_info", Json::array({seg})}}})}});
  const std::array<std::pair<std::string, std::string>, 1> members{{{"panoptic_object365/objects365_v2_00000001.png", png(1, 1, ids)}}};
  tar(input.mask_archive, members);
  if (overflow) {
@@ -772,9 +728,7 @@ TEST_CASE("COCONut JSON requires canonical categories and exact validation image
  input.annotation_json = root.path() / "val.json";
  input.mask_archive = root.path() / "val.tar";
  Json annotation{{"image_id", 11}, {"file_name", "11.png"}, {"object365_file_name", "objects365_v1_00000001"}, {"segments_info", Json::array({segment()})}};
- Json document{{"categories", category_catalog()},
-               {"images", Json::array({{{"id", 11}, {"file_name", "11.png"}, {"width", 1}, {"height", 1}}})},
-               {"annotations", Json::array({annotation})}};
+ Json document{{"categories", category_catalog()}, {"images", Json::array({{{"id", 11}, {"file_name", "11.png"}, {"width", 1}, {"height", 1}}})}, {"annotations", Json::array({annotation})}};
  bool valid = false;
  SECTION("canonical names and record-level thing admission") { valid = true; }
  SECTION("mismatched mapped name") { document["categories"][0]["name"] = "car"; }
@@ -810,17 +764,12 @@ TEST_CASE("COCONut preparatory arrays accept either order and reject duplicate a
  input.mask_archive = root.path() / "val.tar";
  const auto categories = category_catalog().dump();
  const auto images = Json::array({{{"id", 11}, {"file_name", "11.png"}, {"width", 3}, {"height", 1}}}).dump();
- const auto annotations = Json::array({{{"image_id", 11},
-                                        {"file_name", "11.png"},
-                                        {"object365_file_name", "objects365_v1_00000001"},
-                                        {"segments_info", Json::array({segment(1, 1), segment(2, 13), segment(3, 90)})}}})
-                           .dump();
+ const auto annotations =
+  Json::array({{{"image_id", 11}, {"file_name", "11.png"}, {"object365_file_name", "objects365_v1_00000001"}, {"segments_info", Json::array({segment(1, 1), segment(2, 13), segment(3, 90)})}}}).dump();
  std::string document;
  bool valid = true;
  SECTION("categories before images") { document = "{\"categories\":" + categories + ",\"images\":" + images + ",\"annotations\":" + annotations + "}"; }
- SECTION("annotations before images before categories") {
-  document = "{\"annotations\":" + annotations + ",\"images\":" + images + ",\"categories\":" + categories + "}";
- }
+ SECTION("annotations before images before categories") { document = "{\"annotations\":" + annotations + ",\"images\":" + images + ",\"categories\":" + categories + "}"; }
  SECTION("duplicate categories after images") {
   valid = false;
   document = "{\"categories\":" + categories + ",\"images\":" + images + ",\"categories\":" + categories + ",\"annotations\":" + annotations + "}";
@@ -910,13 +859,11 @@ TEST_CASE("COCONut compact inventory is deterministic and jointly admitted under
  }
  SECTION("load cancellation propagates instead of becoming a cache miss") {
   PollCancellation observed;
-  REQUIRE(load_coconut_component(path, first[0].edition, first[0].source, input.input_identity,
-                                 mmltk::common::concurrency::CancellationObservation::Borrow(observed)));
+  REQUIRE(load_coconut_component(path, first[0].edition, first[0].source, input.input_identity, mmltk::common::concurrency::CancellationObservation::Borrow(observed)));
   for (std::size_t cut = 0; cut < observed.polls; ++cut) {
    PollCancellation stop;
    stop.stop_at = cut;
-   CHECK_THROWS(
-    load_coconut_component(path, first[0].edition, first[0].source, input.input_identity, mmltk::common::concurrency::CancellationObservation::Borrow(stop)));
+   CHECK_THROWS(load_coconut_component(path, first[0].edition, first[0].source, input.input_identity, mmltk::common::concurrency::CancellationObservation::Borrow(stop)));
   }
  }
 }
@@ -950,8 +897,8 @@ namespace {
 std::string white_jpeg(int width = 3, int height = 3) {
  const std::vector<unsigned char> pixels(static_cast<std::size_t>(width) * height * 3U, 255U);
  std::string bytes;
- REQUIRE(stbi_write_jpg_to_func([](void* context, void* data, int size) { static_cast<std::string*>(context)->append(static_cast<const char*>(data), size); },
-                                &bytes, width, height, 3, pixels.data(), 100));
+ REQUIRE(
+  stbi_write_jpg_to_func([](void* context, void* data, int size) { static_cast<std::string*>(context)->append(static_cast<const char*>(data), size); }, &bytes, width, height, 3, pixels.data(), 100));
  return bytes;
 }
 struct ServedPhysicalArchive {
@@ -975,8 +922,7 @@ struct LocalCoconutRecipe {
      : output(root / "compiled"), cache(BenchmarkCacheLayout::create(root / "cache")) {
   catalog.coco_validation_images = 1;
   const auto jpeg = white_jpeg();
-  const auto physical_archive = [&](CoconutImageNamespace source, BenchmarkDatasetSource progress_source, std::string shard, std::uint16_t number,
-                                    std::vector<std::string> members) {
+  const auto physical_archive = [&](CoconutImageNamespace source, BenchmarkDatasetSource progress_source, std::string shard, std::uint16_t number, std::vector<std::string> members) {
    const auto id = std::string(coconut_namespace_name(source));
    const auto path = cache.source_downloads(benchmark_source_name(progress_source)) / (id + ".tar");
    std::vector<std::pair<std::string, std::string>> contents;
@@ -993,17 +939,13 @@ struct LocalCoconutRecipe {
     contents.emplace_back(std::move(spelling), jpeg);
    }
    tar(path, contents);
-   catalog.images.push_back(
-    {source, number, std::move(shard), {id, "http://127.0.0.1:1/" + id, path.filename().string(), std::filesystem::file_size(path), "", progress_source}});
+   catalog.images.push_back({source, number, std::move(shard), {id, "http://127.0.0.1:1/" + id, path.filename().string(), std::filesystem::file_size(path), "", progress_source}});
   };
   physical_archive(CoconutImageNamespace::CocoTrain, BenchmarkDatasetSource::kCoco2017, "train2017", 0, {coco(7).member});
-  physical_archive(CoconutImageNamespace::CocoUnlabeled, BenchmarkDatasetSource::kCoco2017, "unlabeled2017", 0,
-                   {coco(8, CoconutImageNamespace::CocoUnlabeled).member});
-  physical_archive(CoconutImageNamespace::CocoValidation, BenchmarkDatasetSource::kCoco2017, "val2017", 0,
-                   {coco(9, CoconutImageNamespace::CocoValidation).member});
+  physical_archive(CoconutImageNamespace::CocoUnlabeled, BenchmarkDatasetSource::kCoco2017, "unlabeled2017", 0, {coco(8, CoconutImageNamespace::CocoUnlabeled).member});
+  physical_archive(CoconutImageNamespace::CocoValidation, BenchmarkDatasetSource::kCoco2017, "val2017", 0, {coco(9, CoconutImageNamespace::CocoValidation).member});
   physical_archive(CoconutImageNamespace::Objects365V2, BenchmarkDatasetSource::kObjects365V2, "patch-32", 32, {objects(1).member, objects(2).member});
-  physical_archive(CoconutImageNamespace::Objects365V1, BenchmarkDatasetSource::kObjects365V1, "validation", 0,
-                   {objects(1, CoconutImageNamespace::Objects365V1).member});
+  physical_archive(CoconutImageNamespace::Objects365V1, BenchmarkDatasetSource::kObjects365V1, "validation", 0, {objects(1, CoconutImageNamespace::Objects365V1).member});
   const std::array<std::uint32_t, 9> support{1, 1, 1, 1, 2, 1, 1, 0, 1}, empty{};
   auto first = segment();
   first["iscrowd"] = 1;
@@ -1017,23 +959,16 @@ struct LocalCoconutRecipe {
   const auto annotation = [&](CoconutReleaseComponent& component, std::string filename, auto write) {
    const auto path = cache.source_downloads("coconut-" + std::string(component.name)) / filename;
    write(path);
-   component.annotations.push_back({std::string(component.name) + "-" + filename, "http://127.0.0.1:1/" + filename, filename, std::filesystem::file_size(path),
-                                    "", BenchmarkDatasetSource::kCoconut});
+   component.annotations.push_back({std::string(component.name) + "-" + filename, "http://127.0.0.1:1/" + filename, filename, std::filesystem::file_size(path), "", BenchmarkDatasetSource::kCoconut});
   };
   auto& base = release(CoconutEdition::Base, "fixture-base", 2);
-  annotation(base, "base.parquet", [&](const auto& path) {
-   parquet_file(path, Json::array({hf_row(7, mask, Json::array({first, second})), hf_row(8, png(3, 3, empty), Json::array())}));
-  });
+  annotation(base, "base.parquet", [&](const auto& path) { parquet_file(path, Json::array({hf_row(7, mask, Json::array({first, second})), hf_row(8, png(3, 3, empty), Json::array())})); });
   auto& validation = release(CoconutEdition::RelabeledValidation, "fixture-val", 1);
   annotation(validation, "val.parquet", [&](const auto& path) { parquet_file(path, Json::array({hf_row(9, mask, Json::array({first, second}))})); });
   auto& large = release(CoconutEdition::Large, "fixture-large", 1);
   annotation(large, "large.json", [&](const auto& path) {
-   json_file(
-    path,
-    {{"images", Json::array({{{"id", 601}, {"file_name", "601.jpg"}, {"width", 3}, {"height", 3}}})},
-     {"annotations",
-      Json::array(
-       {{{"image_id", 601}, {"file_name", "601.png"}, {"object365_file_name", "objects365_v2_00000001"}, {"segments_info", Json::array({first, second})}}})}});
+   json_file(path, {{"images", Json::array({{{"id", 601}, {"file_name", "601.jpg"}, {"width", 3}, {"height", 3}}})},
+                    {"annotations", Json::array({{{"image_id", 601}, {"file_name", "601.png"}, {"object365_file_name", "objects365_v2_00000001"}, {"segments_info", Json::array({first, second})}}})}});
   });
   annotation(large, "large.tar", [&](const auto& path) {
    const std::array<std::pair<std::string, std::string>, 1> rows{{{"panoptic_object365/objects365_v2_00000001.png", mask}}};
@@ -1051,25 +986,20 @@ struct LocalCoconutRecipe {
   });
   auto& objects_val = release(CoconutEdition::ObjectsValidation, "fixture-objects-val", 1);
   annotation(objects_val, "objects.json", [&](const auto& path) {
-   json_file(path, {{"images", Json::array({{{"id", 600001}, {"file_name", "600001.jpg"}, {"width", 3}, {"height", 3}}})},
-                    {"annotations", Json::array({{{"image_id", 600001},
-                                                  {"file_name", "600001.png"},
-                                                  {"object365_file_name", "objects365_v1_00000001"},
-                                                  {"segments_info", Json::array({first, second})}}})}});
+   json_file(
+    path, {{"images", Json::array({{{"id", 600001}, {"file_name", "600001.jpg"}, {"width", 3}, {"height", 3}}})},
+           {"annotations", Json::array({{{"image_id", 600001}, {"file_name", "600001.png"}, {"object365_file_name", "objects365_v1_00000001"}, {"segments_info", Json::array({first, second})}}})}});
   });
   annotation(objects_val, "objects.tar", [&](const auto& path) {
    const std::array<std::pair<std::string, std::string>, 1> rows{{{"panoptic_o365val_v3/objects365_v1_00000001.png", mask}}};
    tar(path, rows);
   });
-  Json stock{
-   {"images", Json::array({{{"id", 9}, {"file_name", "000000000009.jpg"}, {"width", 3}, {"height", 3}}})},
-   {"annotations", Json::array({{{"id", 900}, {"image_id", 9}, {"category_id", 3}, {"bbox", Json::array({0, 0, 3, 3})}, {"area", 9}, {"iscrowd", 0}}})},
-   {"categories", category_catalog()}};
+  Json stock{{"images", Json::array({{{"id", 9}, {"file_name", "000000000009.jpg"}, {"width", 3}, {"height", 3}}})},
+   {"annotations", Json::array({{{"id", 900}, {"image_id", 9}, {"category_id", 3}, {"bbox", Json::array({0, 0, 3, 3})}, {"area", 9}, {"iscrowd", 0}}})}, {"categories", category_catalog()}};
   const auto stock_path = cache.source_downloads("coco") / "stock.tar";
   const std::array<std::pair<std::string, std::string>, 1> stock_members{{{"annotations/instances_val2017.json", stock.dump()}}};
   tar(stock_path, stock_members);
-  catalog.stock_annotations = {
-   "fixture-stock", "http://127.0.0.1:1/stock", "stock.tar", std::filesystem::file_size(stock_path), "", BenchmarkDatasetSource::kCoco2017};
+  catalog.stock_annotations = {"fixture-stock", "http://127.0.0.1:1/stock", "stock.tar", std::filesystem::file_size(stock_path), "", BenchmarkDatasetSource::kCoco2017};
  }
  BenchmarkCompilerConfig compiler_config(BenchmarkDatasetSelection selection = {}, bool overwrite = false) const {
   BenchmarkCompilerConfig config;
@@ -1261,8 +1191,7 @@ TEST_CASE("shared root repair invalidates all proofs and preserves valid JPEG al
  const auto original = read_json_file(proof);
  {
   auto lease = ArtifactLease::acquire(local.cache.locks / "objects365-patch-32.images.lock", {});
-  complete_cached_image_group(images, images / ".complete.json", original["identity"].get<std::string>(), ids, original["image_bytes"].get<std::uint64_t>(),
-                              {});
+  complete_cached_image_group(images, images / ".complete.json", original["identity"].get<std::string>(), ids, original["image_bytes"].get<std::uint64_t>(), {});
   std::filesystem::remove(cached_image_path(images, 2));
  }
  struct stat before{}, after{};
@@ -1281,23 +1210,23 @@ TEST_CASE("shared root repair invalidates all proofs and preserves valid JPEG al
   const auto archive = std::ranges::find(catalog.images, CoconutImageNamespace::Objects365V2, &RecipeImageArchive::source);
   REQUIRE(archive != catalog.images.end());
   const auto extracted = extract_selected_archive_images({.archive_path = local.cache.source_downloads("objects365") / archive->artifact.filename,
-                                                          .source_identity = original["identity"].get<std::string>(),
-                                                          .output_root = images,
-                                                          .source = "objects365",
-                                                          .shard = "patch-32",
-                                                          .selected_image_ids = ids,
-                                                          .image_id_parser = [](std::string_view member) -> std::optional<std::uint64_t> {
-                                                           if (member == "patch32/objects365_v2_00000001.jpg") return 1;
-                                                           if (member == "patch32/objects365_v2_00000002.jpg") return 2;
-                                                           return {};
-                                                          },
-                                                          .validator =
-                                                           [](std::uint64_t, std::span<const std::uint8_t> bytes) {
-                                                            if (!has_complete_image_markers(bytes)) throw std::runtime_error("invalid JPEG");
-                                                           },
-                                                          .quarantine_unavailable = true,
-                                                          .decompression_workers = 0,
-                                                          .cache_write_workers = 0});
+   .source_identity = original["identity"].get<std::string>(),
+   .output_root = images,
+   .source = "objects365",
+   .shard = "patch-32",
+   .selected_image_ids = ids,
+   .image_id_parser = [](std::string_view member) -> std::optional<std::uint64_t> {
+    if (member == "patch32/objects365_v2_00000001.jpg") return 1;
+    if (member == "patch32/objects365_v2_00000002.jpg") return 2;
+    return {};
+   },
+   .validator =
+    [](std::uint64_t, std::span<const std::uint8_t> bytes) {
+     if (!has_complete_image_markers(bytes)) throw std::runtime_error("invalid JPEG");
+    },
+   .quarantine_unavailable = true,
+   .decompression_workers = 0,
+   .cache_write_workers = 0});
   CHECK(extracted.image_count == 2);
   CHECK_FALSE(std::filesystem::exists(proof));
  }
@@ -1521,13 +1450,12 @@ CustomRecipeCatalog local_custom_catalog(LocalCoconutRecipe& local) {
   Json document{{"images", Json::array()}, {"annotations", Json::array()}, {"categories", category_catalog()}};
   for (const auto id : ids) {
    document["images"].push_back({{"id", id}, {"width", 3}, {"height", 3}, {"file_name", coco(id).member}});
-   document["annotations"].push_back(
-    {{"id", id * 10}, {"image_id", id}, {"category_id", 3}, {"bbox", Json::array({0, 0, 3, 3})}, {"area", 9}, {"iscrowd", id == 7 ? 1 : 0}});
+   document["annotations"].push_back({{"id", id * 10}, {"image_id", id}, {"category_id", 3}, {"bbox", Json::array({0, 0, 3, 3})}, {"area", 9}, {"iscrowd", id == 7 ? 1 : 0}});
   }
   const auto path = local.cache.source_indexes("coco") / (split + ".fixture.json");
   json_file(path, document);
-  return parse_coco_style_annotations(path, std::string(64, 'a'), coco_category_mappings(),
-                                      {BenchmarkDatasetSource::kCoco2017, std::move(split), static_cast<std::uint32_t>(ids.size()), 1, true, {}, {}});
+  return parse_coco_style_annotations(
+   path, std::string(64, 'a'), coco_category_mappings(), {BenchmarkDatasetSource::kCoco2017, std::move(split), static_cast<std::uint32_t>(ids.size()), 1, true, {}, {}});
  };
  const std::array<unsigned, 2> train_ids{7, 10};
  const std::array<unsigned, 1> val_ids{9};
@@ -1548,8 +1476,7 @@ CustomRecipeCatalog local_custom_catalog(LocalCoconutRecipe& local) {
    objects_index.boxes.push_back(object_box);
    auto open_box = open_index.boxes.front();
    open_box.class_id = 2;
-   open_box.source_category_id =
-    encode_open_images_category(std::ranges::find(open_images_category_mappings(), std::uint8_t{2}, &StringCategoryMapping::target_id)->source_id);
+   open_box.source_category_id = encode_open_images_category(std::ranges::find(open_images_category_mappings(), std::uint8_t{2}, &StringCategoryMapping::target_id)->source_id);
    open_index.boxes.push_back(open_box);
   }
  }
@@ -1791,8 +1718,7 @@ TEST_CASE("one physical admission budget governs membership extraction and write
  auto config = local.compiler_config({BenchmarkDatasetVariant::Coconut, CoconutValidation::CoconutStock}, true);
  compile_benchmark_recipe(config, &catalog);
  REQUIRE(served.server.requests() == 0);
- const auto old_train = file_bytes(config.output_dir / "train.bin"), old_val = file_bytes(config.output_dir / "val.bin"),
-            old_manifest = file_bytes(config.output_dir / "benchmark_manifest.json");
+ const auto old_train = file_bytes(config.output_dir / "train.bin"), old_val = file_bytes(config.output_dir / "val.bin"), old_manifest = file_bytes(config.output_dir / "benchmark_manifest.json");
  const auto component_path = local.cache.source_indexes("coconut-fixture-base") / "coco-train2017.normalized.bin";
  const auto old_component = read_json_file(component_path.string() + ".complete.json");
  const auto old_input = old_component["coconut"]["input_identity"].get<std::string>();
@@ -1836,8 +1762,7 @@ TEST_CASE("one physical admission budget governs membership extraction and write
  };
  if (exhausted) {
   CHECK_THROWS_WITH(compile_benchmark_recipe(config, &catalog),
-                    "physical archive remains unavailable after three admissions: " + served.source.artifact.artifact_id +
-                     ": selected archive image 7 is not a complete JPEG or PNG");
+   "physical archive remains unavailable after three admissions: " + served.source.artifact.artifact_id + ": selected archive image 7 is not a complete JPEG or PNG");
   CHECK(admissions == 3);
   CHECK(served.server.requests() == 2);
   CHECK(file_bytes(config.output_dir / "benchmark_manifest.json") == old_manifest);
@@ -1852,8 +1777,7 @@ TEST_CASE("one physical admission budget governs membership extraction and write
   REQUIRE(component);
   REQUIRE(component->inventory.size() == 1);
   const auto manifest = read_json_file(config.output_dir / "benchmark_manifest.json");
-  const auto physical =
-   std::ranges::find_if(manifest["recipe"]["artifacts"], [&](const auto& item) { return item["artifact_id"] == served.source.artifact.artifact_id; });
+  const auto physical = std::ranges::find_if(manifest["recipe"]["artifacts"], [&](const auto& item) { return item["artifact_id"] == served.source.artifact.artifact_id; });
   REQUIRE(physical != manifest["recipe"]["artifacts"].end());
   CHECK(component->inventory.front().physical.archive_identity == physical->at("identity").get<std::string>());
   const auto facts = std::ranges::find_if(manifest["recipe"]["components"], [](const auto& item) { return item["physical_source"] == "coco-train2017"; });
@@ -1877,8 +1801,8 @@ TEST_CASE("one admitted physical membership lookup serves every release without 
  LocalCoconutRecipe local(root.path());
  std::vector<CoconutPhysicalImage> physical;
  for (const auto& archive : local.catalog.images) {
-  auto rows = coconut_image_archive_inventory(local.cache.source_downloads(benchmark_source_name(archive.artifact.source)) / archive.artifact.filename, {},
-                                              archive.source, archive.shard, archive.artifact.artifact_id);
+  auto rows = coconut_image_archive_inventory(
+   local.cache.source_downloads(benchmark_source_name(archive.artifact.source)) / archive.artifact.filename, {}, archive.source, archive.shard, archive.artifact.artifact_id);
   physical.insert(physical.end(), std::make_move_iterator(rows.begin()), std::make_move_iterator(rows.end()));
  }
  PollCancellation construction;
@@ -2099,8 +2023,7 @@ TEST_CASE("one stock request builds both splits and retains newly settled train 
  const auto raw = local.cache.source_downloads("coco") / custom.coco_annotations.filename;
  const auto training_json = file_bytes(local.cache.source_indexes("coco") / "train2017.fixture.json");
  const auto validation_json = file_bytes(local.cache.source_indexes("coco") / "val2017.fixture.json");
- const std::array<std::pair<std::string, std::string>, 2> valid{
-  {{"annotations/instances_train2017.json", training_json}, {"annotations/instances_val2017.json", validation_json}}};
+ const std::array<std::pair<std::string, std::string>, 2> valid{{{"annotations/instances_train2017.json", training_json}, {"annotations/instances_val2017.json", validation_json}}};
  tar(raw, valid);
  const auto served = file_bytes(raw);
  mmltk::backend::data::testsupport::HttpServer server(served);
@@ -2139,7 +2062,6 @@ TEST_CASE("one stock request builds both splits and retains newly settled train 
  CHECK(server.requests() == 1);
  server.Check();
 }
-
 TEST_CASE("COCONut recovers the complete dropped dog candidate set and carves source supporters", "[coconut][benchmark]") {
  ScopedTempDir root("coconut-recovery");
  unsigned image_id = 2212;
@@ -2148,7 +2070,11 @@ TEST_CASE("COCONut recovers the complete dropped dog candidate set and carves so
  bool empty_supporter = false;
  std::vector<RLEPair> masks{{0, 2}, {1, 2}};  // Independent originals intentionally overlap.
  SECTION("two dogs on couch") {}
- SECTION("dog on boat") { image_id = 400; supporter_category = 9; masks.resize(1); }
+ SECTION("dog on boat") {
+  image_id = 400;
+  supporter_category = 9;
+  masks.resize(1);
+ }
  SECTION("recovery off retains the previous omission and metadata") { enabled = false; }
  SECTION("an emptied supporter is omitted without recursive recovery") { empty_supporter = true; }
  auto originals = recovery_originals(image_id, masks);
@@ -2222,8 +2148,7 @@ TEST_CASE("COCONut recovers the complete dropped dog candidate set and carves so
  CHECK(cached->inventory == component.inventory);
  const auto roundtrip = root.path() / "recovery-roundtrip.normalized.bin";
  store_coconut_component(roundtrip, *cached);
- for (const auto suffix : {"", ".inventory", ".complete.json"})
-  CHECK(file_bytes(cache.string() + suffix) == file_bytes(roundtrip.string() + suffix));
+ for (const auto suffix : {"", ".inventory", ".complete.json"}) CHECK(file_bytes(cache.string() + suffix) == file_bytes(roundtrip.string() + suffix));
  const auto settled = file_bytes(cache);
  std::atomic<bool> cancelled{true};
  CHECK_THROWS(store_coconut_component(cache, component, mmltk::common::concurrency::CancellationObservation::Atomic(cancelled)));
@@ -2236,7 +2161,6 @@ TEST_CASE("COCONut recovers the complete dropped dog candidate set and carves so
  malformed.recovery.front().objects.front().original_annotation_id += 1;
  CHECK_THROWS(store_coconut_component(cache, malformed));
  CHECK(file_bytes(cache) == settled);
-
 }
 TEST_CASE("COCONut recovery requires a unique represented match and exact remaining candidate count", "[coconut][benchmark]") {
  const std::array<RLEPair, 2> masks{{{0, 2}, {3, 2}}};
@@ -2244,8 +2168,8 @@ TEST_CASE("COCONut recovery requires a unique represented match and exact remain
  CoconutRecord record;
  record.image_id = 7;
  record.first_segment_ordinal = 5;
- record.segments = {{.id = 20, .category_id = 18, .isthing = true}, {.id = 10, .category_id = 18, .isthing = true},
-                    {.id = 30, .category_id = 63, .isthing = true, .bbox = std::array<double, 4>{-1, 0, 5, 3}}};
+ record.segments = {
+  {.id = 20, .category_id = 18, .isthing = true}, {.id = 10, .category_id = 18, .isthing = true}, {.id = 30, .category_id = 63, .isthing = true, .bbox = std::array<double, 4>{-1, 0, 5, 3}}};
  const std::array<RLEPair, 1> whole{{{0, 9}}};
  std::vector<CoconutSegmentSupport> support{recovery_support(std::span(masks).first(1)), {}, recovery_support(whole)};
  auto source = CoconutImageNamespace::CocoTrain;
@@ -2255,7 +2179,10 @@ TEST_CASE("COCONut recovery requires a unique represented match and exact remain
  SECTION("represented dog excludes its original and boxed couch is carved") { accepted = true; }
  SECTION("one survivor intersects both originals") { support[0] = recovery_support(std::array<RLEPair, 1>{{{0, 5}}}); }
  SECTION("survivor has no positive match") { support[0] = recovery_support(std::array<RLEPair, 1>{{{6, 1}}}); }
- SECTION("survivor has bbox but no usable mask") { support[0] = {}; record.segments[0].bbox = std::array<double, 4>{0, 0, 1, 1}; }
+ SECTION("survivor has bbox but no usable mask") {
+  support[0] = {};
+  record.segments[0].bbox = std::array<double, 4>{0, 0, 1, 1};
+ }
  SECTION("two survivors claim one original") {
   record.segments.push_back({.id = 40, .category_id = 18, .isthing = true});
   support.push_back(support[0]);
@@ -2290,9 +2217,18 @@ TEST_CASE("COCONut recovery requires a unique represented match and exact remain
   source = CoconutImageNamespace::CocoValidation;
   originals.split = "val2017";
  }
- SECTION("train rejects validation originals") { wrong_split = true; originals.split = "val2017"; }
- SECTION("validation rejects train originals") { wrong_split = true; source = CoconutImageNamespace::CocoValidation; }
- SECTION("train rejects a noncanonical split") { wrong_split = true; originals.split = "train"; }
+ SECTION("train rejects validation originals") {
+  wrong_split = true;
+  originals.split = "val2017";
+ }
+ SECTION("validation rejects train originals") {
+  wrong_split = true;
+  source = CoconutImageNamespace::CocoValidation;
+ }
+ SECTION("train rejects a noncanonical split") {
+  wrong_split = true;
+  originals.split = "train";
+ }
  SECTION("validation rejects a noncanonical split") {
   wrong_split = true;
   source = CoconutImageNamespace::CocoValidation;
@@ -2345,12 +2281,10 @@ TEST_CASE("COCONut recovery propagates cancellation before mutating masks", "[co
  std::vector<CoconutSegmentSupport> support(1);
  CoconutRecoveryImage facts{7, 0, {}};
  std::atomic<bool> cancelled{true};
- CHECK_THROWS(recovery.apply(CoconutImageNamespace::CocoTrain, record, 3, 3, support, facts,
-                             mmltk::common::concurrency::CancellationObservation::Atomic(cancelled)));
+ CHECK_THROWS(recovery.apply(CoconutImageNamespace::CocoTrain, record, 3, 3, support, facts, mmltk::common::concurrency::CancellationObservation::Atomic(cancelled)));
  CHECK(support[0].runs.empty());
  CHECK(facts.objects.empty());
 }
-
 TEST_CASE("COCONut recovery reuses bounded image work across run geometry and cancellation", "[coconut][benchmark]") {
  struct Geometry {
   dataset::MaskDimensions dimensions;
@@ -2379,9 +2313,11 @@ TEST_CASE("COCONut recovery reuses bounded image work across run geometry and ca
   const auto& geometry = cases[i];
   CoconutRecord record;
   record.image_id = i + 1;
-  originals.images.push_back({.source_image_id = record.image_id, .first_box = originals.boxes.size(),
-                              .box_count = static_cast<std::uint32_t>(geometry.cuts.size()),
-                              .width = geometry.dimensions.width, .height = geometry.dimensions.height});
+  originals.images.push_back({.source_image_id = record.image_id,
+   .first_box = originals.boxes.size(),
+   .box_count = static_cast<std::uint32_t>(geometry.cuts.size()),
+   .width = geometry.dimensions.width,
+   .height = geometry.dimensions.height});
   for (std::size_t j = 0; j < geometry.cuts.size(); ++j) {
    auto box = prototype.boxes.front();
    box.annotation_id = j + 100;
@@ -2424,8 +2360,8 @@ TEST_CASE("COCONut recovery reuses bounded image work across run geometry and ca
   // Exercise every cancellation boundary, including partially populated scratch.
   const auto* original_storage = support.back().runs.data();
   PollCancellation complete;
-  recovery.apply(CoconutImageNamespace::CocoTrain, record, geometry.dimensions.width, geometry.dimensions.height,
-                  support, facts, mmltk::common::concurrency::CancellationObservation::Borrow(complete));
+  recovery.apply(
+   CoconutImageNamespace::CocoTrain, record, geometry.dimensions.width, geometry.dimensions.height, support, facts, mmltk::common::concurrency::CancellationObservation::Borrow(complete));
   if (i == 2) {
    CHECK_FALSE(support.back().carved);
    CHECK(support.back().runs.data() == original_storage);
@@ -2435,8 +2371,8 @@ TEST_CASE("COCONut recovery reuses bounded image work across run geometry and ca
    auto interrupted = fresh_support();
    CoconutRecoveryImage partial{record.image_id, 0, {}};
    PollCancellation cancellation{.stop_at = stop};
-   CHECK_THROWS(recovery.apply(CoconutImageNamespace::CocoTrain, record, geometry.dimensions.width, geometry.dimensions.height,
-                               interrupted, partial, mmltk::common::concurrency::CancellationObservation::Borrow(cancellation)));
+   CHECK_THROWS(recovery.apply(
+    CoconutImageNamespace::CocoTrain, record, geometry.dimensions.width, geometry.dimensions.height, interrupted, partial, mmltk::common::concurrency::CancellationObservation::Borrow(cancellation)));
    support = fresh_support();
    facts = {record.image_id, 0, {}};
    recovery.apply(CoconutImageNamespace::CocoTrain, record, geometry.dimensions.width, geometry.dimensions.height, support, facts);
@@ -2465,7 +2401,6 @@ TEST_CASE("COCONut recovery reuses bounded image work across run geometry and ca
   CHECK(support.back().runs.data() == unchanged);
  }
 }
-
 TEST_CASE("retained COCO source dogs recover exactly and remain disjoint after compiler mask projection", "[coconut][benchmark]") {
  ScopedTempDir root("coconut-source-recovery");
  const auto fixtures = std::filesystem::path(__FILE__).parent_path() / "fixtures/coconut_recovery";
@@ -2480,7 +2415,10 @@ TEST_CASE("retained COCO source dogs recover exactly and remain disjoint after c
   for (const auto& object : original.at("objects")) {
    NormalizedBox box;
    const auto bounds = object.at("bbox").get<std::array<float, 4>>();
-   box.x1 = bounds[0]; box.y1 = bounds[1]; box.x2 = bounds[2]; box.y2 = bounds[3];
+   box.x1 = bounds[0];
+   box.y1 = bounds[1];
+   box.x2 = bounds[2];
+   box.y2 = bounds[3];
    box.annotation_id = object.at("annotation_id");
    box.source_category_id = object.at("source_category_id");
    box.source_ordinal = object.at("source_ordinal");
@@ -2521,8 +2459,7 @@ TEST_CASE("retained COCO source dogs recover exactly and remain disjoint after c
    for (unsigned projection = 0; projection < 3; ++projection) {
     using namespace mmltk::backend::imaging::resample;
     const dataset::MaskDimensions target = projection == 0 ? dataset::MaskDimensions{width, height} : dataset::MaskDimensions{384, 384};
-    const auto geometry = compute_image_resize_geometry(width, height, target.width, target.height,
-                                                        projection == 2 ? ImageResizeMode::Letterbox : ImageResizeMode::Stretch);
+    const auto geometry = compute_image_resize_geometry(width, height, target.width, target.height, projection == 2 ? ImageResizeMode::Letterbox : ImageResizeMode::Stretch);
     dataset::MaskResizeScratch scratch;
     const auto dogs = dataset::resize_row_major_mask(dog_runs, {width, height}, target, geometry, &scratch);
     const auto support = dataset::resize_row_major_mask(support_runs, {width, height}, target, geometry, &scratch);
@@ -2543,15 +2480,13 @@ TEST_CASE("retained COCO source dogs recover exactly and remain disjoint after c
   auto changed = index;
   changed.annotation_sha256 = std::string(64, 'a');
   CoconutMaskRecovery changed_recovery(&changed, nullptr);
-  CHECK_FALSE(load_coconut_component(path, component.edition, component.source,
-                                     coconut_component_input_identity(input.input_identity, component.source, &changed_recovery)));
+  CHECK_FALSE(load_coconut_component(path, component.edition, component.source, coconut_component_input_identity(input.input_identity, component.source, &changed_recovery)));
   auto corrupt = read_json_file(path.string() + ".complete.json");
   corrupt["coconut"]["recovery_policy"] = 99;
   write_json_atomically(path.string() + ".complete.json", corrupt, {});
   CHECK_FALSE(load_coconut_component(path, component.edition, component.source, component.input_identity));
  }
 }
-
 TEST_CASE("optional COCO split admission is independent and never conceals output failures", "[coconut][benchmark][cache]") {
  ScopedTempDir root("coco-optional-admission");
  LocalCoconutRecipe local(root.path());
@@ -2562,9 +2497,16 @@ TEST_CASE("optional COCO split admission is independent and never conceals outpu
  bool local_parser_failure = false, local_archive_failure = false;
  unsigned unusable_document = 0;
  SECTION("missing optional train preserves discovered required validation") {}
- SECTION("missing optional validation preserves discovered train") { missing_train = false; required_validation = false; }
+ SECTION("missing optional validation preserves discovered train") {
+  missing_train = false;
+  required_validation = false;
+ }
  SECTION("initial download failure returns independently admitted required validation") { initial_failure = true; }
- SECTION("initial download failure returns independently admitted optional train") { initial_failure = true; missing_train = false; required_validation = false; }
+ SECTION("initial download failure returns independently admitted optional train") {
+  initial_failure = true;
+  missing_train = false;
+  required_validation = false;
+ }
  SECTION("optional output publication failure remains fatal") { publication_failure = true; }
  SECTION("local parser file opening failure remains fatal") { local_parser_failure = true; }
  SECTION("local archive file opening failure remains fatal") { local_archive_failure = true; }
@@ -2573,19 +2515,25 @@ TEST_CASE("optional COCO split admission is independent and never conceals outpu
  SECTION("optional mistyped image metadata is unavailable") { unusable_document = 3; }
  SECTION("optional integer exceeding 64 bits is unavailable") { unusable_document = 4; }
  SECTION("missing optional train cannot prevent cold required validation admission") { cold = true; }
- SECTION("cold usable train survives unavailable optional validation") { cold = true; missing_train = false; required_validation = false; }
+ SECTION("cold usable train survives unavailable optional validation") {
+  cold = true;
+  missing_train = false;
+  required_validation = false;
+ }
  const auto missing = missing_train ? train : validation;
  const auto retained = missing_train ? validation : train;
  const auto retained_bytes = file_bytes(retained);
- if (cold) { remove_cache_path(retained); remove_cache_path(retained.string() + ".complete.json"); }
+ if (cold) {
+  remove_cache_path(retained);
+  remove_cache_path(retained.string() + ".complete.json");
+ }
  remove_cache_path(missing);
  remove_cache_path(missing.string() + ".complete.json");
  auto artifact = catalog.coco_annotations;
  const auto archive_path = local.cache.source_downloads("coco") / artifact.filename;
  if (!publication_failure && !local_parser_failure && !local_archive_failure) {
   const auto split = missing_train ? "val2017" : "train2017";
-  const std::array<std::pair<std::string, std::string>, 1> rows{{{
-   cold ? "annotations/instances_" + std::string(split) + ".json" : "annotations/unrelated.json",
+  const std::array<std::pair<std::string, std::string>, 1> rows{{{cold ? "annotations/instances_" + std::string(split) + ".json" : "annotations/unrelated.json",
    cold ? file_bytes(local.cache.source_indexes("coco") / (std::string(split) + ".fixture.json")) : "{}"}}};
   tar(archive_path, rows);
  }
@@ -2605,26 +2553,28 @@ TEST_CASE("optional COCO split admission is independent and never conceals outpu
   const std::array<std::pair<std::string, std::string>, 1> rows{{{"annotations/instances_train2017.json", std::move(payload)}}};
   tar(archive_path, rows);
  }
- mmltk::backend::data::testsupport::HttpServer server(file_bytes(archive_path));
+ const auto server_payload = file_bytes(archive_path);
+ mmltk::backend::data::testsupport::HttpServer server(server_payload);
  artifact.url = server.url("optional-split");
  artifact.expected_size = std::filesystem::file_size(archive_path);
  if (publication_failure) std::filesystem::create_directory(missing);
  BenchmarkTraceSink trace;
  bool parser_entered = false, extraction_entered = false;
- ProgressReporter progress([&](const BenchmarkCompileProgress& update) {
-  if (local_archive_failure && update.activity == "Extracting COCO train annotations") {
-   extraction_entered = true;
-   REQUIRE(std::filesystem::remove(archive_path));
-  }
-  if (local_parser_failure && update.activity == "Parsing and indexing COCO train annotations") {
-   parser_entered = true;
-   // Remove the already-extracted input at the ordinary progress boundary.
-   // The parser's open failure is local, not evidence of unusable source bytes.
-   REQUIRE(std::filesystem::remove(local.cache.source_indexes("coco") / "source-json/instances_train2017.json"));
-  }
- }, trace);
- CocoAnnotationCache cache(local.cache, artifact, {CocoSplitAdmission::Optional,
-                                                   required_validation ? CocoSplitAdmission::Required : CocoSplitAdmission::Optional}, 2, 1, 1, {}, trace);
+ ProgressReporter progress(
+  [&](const BenchmarkCompileProgress& update) {
+   if (local_archive_failure && update.activity == "Extracting COCO train annotations") {
+    extraction_entered = true;
+    REQUIRE(std::filesystem::remove(archive_path));
+   }
+   if (local_parser_failure && update.activity == "Parsing and indexing COCO train annotations") {
+    parser_entered = true;
+    // Remove the already-extracted input at the ordinary progress boundary.
+    // The parser's open failure is local, not evidence of unusable source bytes.
+    REQUIRE(std::filesystem::remove(local.cache.source_indexes("coco") / "source-json/instances_train2017.json"));
+   }
+  },
+  trace);
+ CocoAnnotationCache cache(local.cache, artifact, {CocoSplitAdmission::Optional, required_validation ? CocoSplitAdmission::Required : CocoSplitAdmission::Optional}, 2, 1, 1, {}, trace);
  cache.discover(progress);
  REQUIRE(cache.pending_download());
  auto completed = cache.completed_indexes();
@@ -2658,7 +2608,6 @@ TEST_CASE("optional COCO split admission is independent and never conceals outpu
  CHECK(completed == 1);
  server.Check();
 }
-
 TEST_CASE("COCONut recovery caches preserve base and physical products across every validation choice", "[coconut][benchmark][cache]") {
  ScopedTempDir root("coconut-recovery-recipe");
  LocalCoconutRecipe local(root.path());
@@ -2729,7 +2678,8 @@ TEST_CASE("COCONut recovery caches preserve base and physical products across ev
  const auto archive_path = local.cache.source_downloads("coco") / local.catalog.stock_annotations.filename;
  const std::array<std::pair<std::string, std::string>, 1> unavailable{{{"annotations/unrelated.json", "{}"}}};
  tar(archive_path, unavailable);
- mmltk::backend::data::testsupport::HttpServer server(file_bytes(archive_path));
+ const auto server_payload = file_bytes(archive_path);
+ mmltk::backend::data::testsupport::HttpServer server(server_payload);
  local.catalog.stock_annotations.url = server.url("unavailable-originals");
  local.catalog.stock_annotations.expected_size = std::filesystem::file_size(archive_path);
  for (const bool missing_train : {true, false}) {
@@ -2763,7 +2713,6 @@ TEST_CASE("COCONut recovery caches preserve base and physical products across ev
  CHECK_THROWS(compile_benchmark_recipe(config, &catalog));
  CHECK(file_bytes(config.output_dir / "train.bin") == previous);
 }
-
 TEST_CASE("COCONut recovery facts follow physical images when import rows are reordered", "[coconut][benchmark][cache]") {
  ScopedTempDir root("coconut-recovery-order");
  const std::array physical{coco(3), coco(5), coco(7), coco(9)};
@@ -2773,10 +2722,8 @@ TEST_CASE("COCONut recovery facts follow physical images when import rows are re
  CoconutMaskRecovery recovery(&originals, nullptr);
  const std::array<std::uint32_t, 9> pixels{1, 1, 1, 1, 1, 1, 1, 1, 1}, empty{};
  const auto mask = png(3, 3, pixels), empty_mask = png(3, 3, empty);
- const auto rows = Json::array({hf_row(3, mask, Json::array({segment(1, 63), segment(2, 18), segment(3, 17)})),
-                                hf_row(5, empty_mask, Json::array()),
-                                hf_row(7, mask, Json::array({segment(1, 63), segment(2, 18)})),
-                                hf_row(9, empty_mask, Json::array({segment(3, 17)}))});
+ const auto rows = Json::array({hf_row(3, mask, Json::array({segment(1, 63), segment(2, 18), segment(3, 17)})), hf_row(5, empty_mask, Json::array()),
+  hf_row(7, mask, Json::array({segment(1, 63), segment(2, 18)})), hf_row(9, empty_mask, Json::array({segment(3, 17)}))});
  std::array<std::size_t, 4> order{0, 1, 2, 3};
  SECTION("already ordered rows retain every kind of recovery fact") {}
  SECTION("permuted rows move every kind of recovery fact") { order = {2, 3, 1, 0}; }
@@ -2849,8 +2796,7 @@ TEST_CASE("COCONut recovery facts follow physical images when import rows are re
  }
  const auto roundtrip = root.path() / "roundtrip.normalized.bin";
  store_coconut_component(roundtrip, *cached);
- for (const auto suffix : {"", ".inventory", ".complete.json"})
-  CHECK(file_bytes(path.string() + suffix) == file_bytes(roundtrip.string() + suffix));
+ for (const auto suffix : {"", ".inventory", ".complete.json"}) CHECK(file_bytes(path.string() + suffix) == file_bytes(roundtrip.string() + suffix));
  const auto rebuilt = import_coconut_annotations(input);
  REQUIRE(rebuilt.size() == 1);
  CHECK(rebuilt.front().index.annotation_sha256 == component.index.annotation_sha256);

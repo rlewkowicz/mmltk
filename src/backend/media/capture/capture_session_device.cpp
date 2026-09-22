@@ -72,9 +72,7 @@ Status CaptureSession::Impl::ConfigureCaptureFormat() {
  format.fmt.pix.pixelformat = kBgr3V4l2PixelFormat;
  format.fmt.pix.field = V4L2_FIELD_NONE;
  if (DeviceIoctl(VIDIOC_S_FMT, &format) == -1) { return MakeErrnoStatus(StatusCode::kUnsupported, "VIDIOC_S_FMT"); }
- if (format.fmt.pix.pixelformat != kBgr3V4l2PixelFormat) {
-  return MakeStatus(StatusCode::kUnsupported, "driver negotiated a different pixel format than requested BGR3");
- }
+ if (format.fmt.pix.pixelformat != kBgr3V4l2PixelFormat) { return MakeStatus(StatusCode::kUnsupported, "driver negotiated a different pixel format than requested BGR3"); }
  const std::uint32_t capture_width = format.fmt.pix.width;
  const std::uint32_t capture_height = format.fmt.pix.height;
  const std::size_t minimum_line_bytes = static_cast<std::size_t>(capture_width) * kBgr3BytesPerPixel;
@@ -165,8 +163,7 @@ Status CaptureSession::Impl::QueueV4l2Buffer(const std::uint32_t slot_index, con
  const int error_number = TryQueueV4l2Buffer(slot_index);
  if (error_number != 0) {
   Status status = MakeErrnoStatus(StatusCode::kInternalError, "VIDIOC_QBUF", error_number);
-  if (slot_index < host_slots_.size())
-   host_slots_[slot_index]->phase.store(capture_internal::CaptureSlotPhaseValue(CaptureSlotPhase::kOwnerRetained), std::memory_order_release);
+  if (slot_index < host_slots_.size()) host_slots_[slot_index]->phase.store(capture_internal::CaptureSlotPhaseValue(CaptureSlotPhase::kOwnerRetained), std::memory_order_release);
   if (record_requeue_failure) {
    requeue_failures_.fetch_add(1, std::memory_order_relaxed);
    SetLastError(status.message);

@@ -161,36 +161,34 @@ TEST_CASE("Compute policy denial precedes admission and CUDA construction", "[co
  using namespace mmltk::controller;
  for (const auto call : {SYS_setpriority, SYS_set_mempolicy}) {
   CHECK(mmltk::common::system::test_support::with_denied_syscall(call, [] {
-         const auto topology = NumaTopology::Capture();
-         const auto selected = mmltk::common::system::test_support::first_permitted_cpu(topology);
-         const auto cpu = selected.cpu;
-         const auto node = selected.node;
-         direct::LocalRun run;
-         bool admitted = false;
-         try {
-          run.Start({
-           .policy = ExecutionPolicyRequest{{cpu}, {}, 0, node, -10, false},
-           .prepare = [&] { admitted = true; },
-           .work = [](std::stop_token) -> direct::LocalRun::Notification { return {}; },
-          });
-         } catch (const std::system_error& error) {
-          if (admitted || run.active() || error.code().value() != EPERM) return false;
-          const DirectComputeConfiguration configuration{
-           .execution = mmltk::frameworks::gpu::DeviceExecution{.device = 999999, .placement = {.numa_node = node, .cpus = {cpu}}}};
-          for (const auto& construct :
-               std::array<std::function<void()>, 3>{[&] { CudaValidationRuntime runtime(configuration); }, [&] { CudaExportRuntime runtime(configuration); },
-                                                    [&] { CudaPredictRuntime runtime(configuration); }}) {
-           try {
-            construct();
-            return false;
-           } catch (const std::system_error& denied) {
-            if (denied.code().value() != EPERM) return false;
-           }
-          }
-          return true;
-         }
-         return false;
-        }) == 0);
+   const auto topology = NumaTopology::Capture();
+   const auto selected = mmltk::common::system::test_support::first_permitted_cpu(topology);
+   const auto cpu = selected.cpu;
+   const auto node = selected.node;
+   direct::LocalRun run;
+   bool admitted = false;
+   try {
+    run.Start({
+     .policy = ExecutionPolicyRequest{{cpu}, {}, 0, node, -10, false},
+     .prepare = [&] { admitted = true; },
+     .work = [](std::stop_token) -> direct::LocalRun::Notification { return {}; },
+    });
+   } catch (const std::system_error& error) {
+    if (admitted || run.active() || error.code().value() != EPERM) return false;
+    const DirectComputeConfiguration configuration{.execution = mmltk::frameworks::gpu::DeviceExecution{.device = 999999, .placement = {.numa_node = node, .cpus = {cpu}}}};
+    for (const auto& construct : std::array<std::function<void()>, 3>{
+          [&] { CudaValidationRuntime runtime(configuration); }, [&] { CudaExportRuntime runtime(configuration); }, [&] { CudaPredictRuntime runtime(configuration); }}) {
+     try {
+      construct();
+      return false;
+     } catch (const std::system_error& denied) {
+      if (denied.code().value() != EPERM) return false;
+     }
+    }
+    return true;
+   }
+   return false;
+  }) == 0);
  }
 }
 }  // namespace

@@ -69,15 +69,14 @@ TEST_CASE("ordinary settings and file dialog expose direct state, Busy, Stop, an
                           ++constructions;
                           return std::make_unique<FakeDialogRuntime>(gate, constructions.load() == 1U);
                          },
-                         [&](FileDialogSystem::event_type event) {
-                          switch (completions++) {
-                           case 0U: first_completion.set_value(std::move(event)); throw std::runtime_error("observer failure");
-                           case 1U: second_completion.set_value(std::move(event)); break;
-                           default: third_completion.set_value(std::move(event)); break;
-                          }
-                         }};
- const services::FileDialogOpen selector{
-  .target = services::FileDialogTarget{services::SettingsFieldTarget{services::file_dialog_catalog().entries().front().stable_id}}};
+  [&](FileDialogSystem::event_type event) {
+   switch (completions++) {
+    case 0U: first_completion.set_value(std::move(event)); throw std::runtime_error("observer failure");
+    case 1U: second_completion.set_value(std::move(event)); break;
+    default: third_completion.set_value(std::move(event)); break;
+   }
+  }};
+ const services::FileDialogOpen selector{.target = services::FileDialogTarget{services::SettingsFieldTarget{services::file_dialog_catalog().entries().front().stable_id}}};
  const auto admission = dialog.Open(selector);
  CHECK(admission.generation == 1U);
  CHECK(admission.active);
@@ -137,8 +136,7 @@ TEST_CASE("settings serializes competing durable updates", "[controller][systems
   } catch (...) {}
  };
  std::jthread first{update, contracts::SettingsValueUpdate{.path = "ui.dark_mode", .value = mmltk::frameworks::serialization::wire::FlatValue{true}}};
- std::jthread second{
-  update, contracts::SettingsValueUpdate{.path = "ui.annotation_brush_radius", .value = mmltk::frameworks::serialization::wire::FlatValue{std::int64_t{9}}}};
+ std::jthread second{update, contracts::SettingsValueUpdate{.path = "ui.annotation_brush_radius", .value = mmltk::frameworks::serialization::wire::FlatValue{std::int64_t{9}}}};
  start.arrive_and_wait();
  first.join();
  second.join();
@@ -180,8 +178,7 @@ TEST_CASE("settings rejects empty updates without persisting and accepts relatio
  const auto cleared = settings.Update(std::move(clear));
  CHECK(cleared.revision == pinned.revision + 1U);
  CHECK_FALSE(TrainRecipeRelation::template overridden<lr>(cleared.settings_state.workflows.train.request.recipe_overrides));
- CHECK(cleared.settings_state.workflows.train.request.lr ==
-       mmltk::backend::models::rfdetr::train_recipe(cleared.settings_state.workflows.train.request.optimizer).lr);
+ CHECK(cleared.settings_state.workflows.train.request.lr == mmltk::backend::models::rfdetr::train_recipe(cleared.settings_state.workflows.train.request.optimizer).lr);
 }
 TEST_CASE("Explore catalog identity changes only through successful catalog persistence", "[controller][systems][settings][explore]") {
  const auto root = mmltk::testsupport::make_temp_root("ordinary-settings-explore-catalog");
@@ -229,8 +226,7 @@ TEST_CASE("failed Explore catalog persistence preserves the exact pending Settin
  queue_failed_dark_mode_update(settings, root);
  constexpr ExploreClassCatalogIdentity rejected_identity = 0x8765'4321U;
  const auto candidate = settings.explore_settings_candidate();
- CHECK_THROWS_AS(settings.Update(candidate, {.preferences = candidate.preferences.policy, .class_catalog_identity = rejected_identity}),
-                 contracts::FailedError);
+ CHECK_THROWS_AS(settings.Update(candidate, {.preferences = candidate.preferences.policy, .class_catalog_identity = rejected_identity}), contracts::FailedError);
  REQUIRE(std::filesystem::remove(root / "settings.json"));
  REQUIRE(settings.Retry().applied());
  const auto recovered = settings.snapshot();
@@ -258,8 +254,7 @@ TEST_CASE("settings retry cannot overwrite a newer committed update", "[controll
  block_changed = true;
  std::jthread update{[&] {
   contracts::SettingsUpdateRequest request;
-  request.updates.emplace_back(
-   contracts::SettingsValueUpdate{.path = "ui.annotation_brush_radius", .value = mmltk::frameworks::serialization::wire::FlatValue{std::int64_t{9}}});
+  request.updates.emplace_back(contracts::SettingsValueUpdate{.path = "ui.annotation_brush_radius", .value = mmltk::frameworks::serialization::wire::FlatValue{std::int64_t{9}}});
   static_cast<void>(settings.Update(std::move(request)));
  }};
  update_committed.get_future().wait();

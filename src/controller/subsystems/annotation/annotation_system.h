@@ -29,12 +29,12 @@ struct AnnotationPointer final {
  // CLEANUP-IGNORE: The resolved native pointer and transport mouse enforce the same canonical brush bounds but retain distinct
  // lifetimes.
  contracts::AnnotationPoint point{};
- [[= mmltk::frameworks::reflection::Minimum<std::uint16_t>{contracts::kMinAnnotationBrushRadius}]]
-  [[= mmltk::frameworks::reflection::Maximum<std::uint16_t>{contracts::kMaxAnnotationBrushRadius}]] std::uint16_t brush_radius =
-   contracts::kDefaultAnnotationBrushRadius;
+ [[= mmltk::frameworks::reflection::Minimum<std::uint16_t>{
+  contracts::kMinAnnotationBrushRadius}]][[= mmltk::frameworks::reflection::Maximum<std::uint16_t>{contracts::kMaxAnnotationBrushRadius}]] std::uint16_t brush_radius =
+  contracts::kDefaultAnnotationBrushRadius;
  [[nodiscard]] bool valid() const noexcept {
-  return mmltk::frameworks::reflection::enum_contains(phase) && interaction_id != 0U && sequence != 0U && target.valid() && point.finite() &&
-         brush_radius >= contracts::kMinAnnotationBrushRadius && brush_radius <= contracts::kMaxAnnotationBrushRadius;
+  return mmltk::frameworks::reflection::enum_contains(phase) && interaction_id != 0U && sequence != 0U && target.valid() && point.finite() && brush_radius >= contracts::kMinAnnotationBrushRadius &&
+         brush_radius <= contracts::kMaxAnnotationBrushRadius;
  }
 };
 struct AnnotationOpen final {
@@ -83,9 +83,9 @@ struct AnnotationSkeletonEdit final {
 };
 struct AnnotationMaskCleanupEdit final {
  contracts::AnnotationMaskCleanup operation = contracts::AnnotationMaskCleanup::LargestComponent;
- [[= mmltk::frameworks::reflection::Minimum<std::uint16_t>{contracts::kMinAnnotationMaskCleanupRadius}]]
-  [[= mmltk::frameworks::reflection::Maximum<std::uint16_t>{contracts::kMaxAnnotationMaskCleanupRadius}]] std::uint16_t radius =
-   contracts::kDefaultAnnotationMaskCleanupRadius;
+ [[= mmltk::frameworks::reflection::Minimum<std::uint16_t>{
+  contracts::kMinAnnotationMaskCleanupRadius}]][[= mmltk::frameworks::reflection::Maximum<std::uint16_t>{contracts::kMaxAnnotationMaskCleanupRadius}]] std::uint16_t radius =
+  contracts::kDefaultAnnotationMaskCleanupRadius;
 };
 struct AnnotationMaskColorsEdit final {
  contracts::AnnotationColorRange sup{};
@@ -96,9 +96,8 @@ struct AnnotationUndoEdit final {};
 struct AnnotationRedoEdit final {};
 struct AnnotationEdit final {
  using variant_type =
-  std::variant<AnnotationToolEdit, AnnotationSetupEdit, AnnotationHoldEdit, AnnotationSidebarEdit, AnnotationObjectEdit, AnnotationCategoryEdit,
-               AnnotationSelectedObjectEdit, AnnotationSplineEdit, AnnotationSplineHandleEdit, AnnotationSkeletonEdit, AnnotationMaskCleanupEdit,
-               AnnotationMaskColorsEdit, AnnotationSceneEdit, AnnotationUndoEdit, AnnotationRedoEdit, AnnotationClassEdit>;
+  std::variant<AnnotationToolEdit, AnnotationSetupEdit, AnnotationHoldEdit, AnnotationSidebarEdit, AnnotationObjectEdit, AnnotationCategoryEdit, AnnotationSelectedObjectEdit, AnnotationSplineEdit,
+   AnnotationSplineHandleEdit, AnnotationSkeletonEdit, AnnotationMaskCleanupEdit, AnnotationMaskColorsEdit, AnnotationSceneEdit, AnnotationUndoEdit, AnnotationRedoEdit, AnnotationClassEdit>;
  variant_type value{};
 };
 struct AnnotationEditRequest final {
@@ -106,16 +105,14 @@ struct AnnotationEditRequest final {
 };
 class AnnotationAlgorithm : public mmltk::frameworks::gpu::SystemImageModel {
 public:
- [[nodiscard]] virtual mmltk::frameworks::gpu::ImageWorkspaceCoverage WorkspaceCoverage(const mmltk::frameworks::gpu::ImageWorkspaceObservation&) const {
-  return {};
- }
+ [[nodiscard]] virtual mmltk::frameworks::gpu::ImageWorkspaceCoverage WorkspaceCoverage(const mmltk::frameworks::gpu::ImageWorkspaceObservation&) const { return {}; }
  ~AnnotationAlgorithm() override = default;
  virtual void Open(mmltk::frameworks::gpu::ImagePlaneView source, VisualRegion, VisualExtent) = 0;
  [[nodiscard]] virtual contracts::AnnotationColor Sample(contracts::AnnotationPoint) = 0;
  // Source is the retained immutable document baseline. The algorithm owns
  // allocation-local initialization, damage and reusable raster inputs.
- virtual void Render(const AnnotationRenderState&, mmltk::frameworks::gpu::ImagePlaneView source, mmltk::frameworks::gpu::ImagePlaneView clean,
-                     mmltk::frameworks::gpu::ImagePlaneView semantic, std::uintptr_t stream) const = 0;
+ virtual void Render(const AnnotationRenderState&, mmltk::frameworks::gpu::ImagePlaneView source, mmltk::frameworks::gpu::ImagePlaneView clean, mmltk::frameworks::gpu::ImagePlaneView semantic,
+  std::uintptr_t stream) const = 0;
 };
 struct AnnotationRenderedFacts final {
  bool operator==(const AnnotationRenderedFacts&) const = default;
@@ -164,9 +161,8 @@ struct[[= contracts::reflection::Event{contracts::reflection::EventDelivery::Cri
 };
 class AnnotationSystem final {
 public:
- using visual_source =
-  VisualSourceProjection<AnnotationSnapshot, PresentationSourceKind::Annotation, mmltk::frameworks::reflection::member_path<&AnnotationSnapshot::frame>,
-                         mmltk::frameworks::reflection::member_path<&AnnotationSnapshot::revision>, AnnotationImageMetadata>;
+ using visual_source = VisualSourceProjection<AnnotationSnapshot, PresentationSourceKind::Annotation, mmltk::frameworks::reflection::member_path<&AnnotationSnapshot::frame>,
+  mmltk::frameworks::reflection::member_path<&AnnotationSnapshot::revision>, AnnotationImageMetadata>;
  using event_type = std::variant<AnnotationChanged, AnnotationFrameChanged, AnnotationFailed>;
  AnnotationSystem(VisualDeviceSettings, VisualRuntimeFactory, ExactVisualDocumentBorrower, SystemEventSink<event_type> = {}, VisualDiagnosticSink = {});
  ~AnnotationSystem();

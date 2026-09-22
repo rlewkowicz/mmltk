@@ -1,8 +1,7 @@
 
 #include "src/backend/models/rfdetr/core/detection_types.h"
 namespace mmltk::backend::models::rfdetr {
-void assert_inference_output_dtype(const torch::Tensor& pred_logits, const torch::Tensor& pred_boxes, const at::ScalarType expected_dtype,
-                                   const char* context) {
+void assert_inference_output_dtype(const torch::Tensor& pred_logits, const torch::Tensor& pred_boxes, const at::ScalarType expected_dtype, const char* context) {
  if (!pred_logits.defined() || !pred_boxes.defined()) { throw std::runtime_error(std::string(context) + " returned undefined detection outputs"); }
  if (pred_logits.scalar_type() != expected_dtype) { throw std::runtime_error(std::string(context) + " returned logits with the wrong element type"); }
  const bool valid_box_dtype = pred_boxes.scalar_type() == expected_dtype || (expected_dtype != at::kFloat && pred_boxes.scalar_type() == at::kFloat);

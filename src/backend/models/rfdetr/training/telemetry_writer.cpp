@@ -146,13 +146,11 @@ struct TrainingTelemetryWriter::Impl final {
   const auto directory = run.configuration.output_dir;
   const auto manifest = directory / "run.json";
   if (!run.configuration.resume_path.empty() && std::filesystem::exists(manifest)) {
-   if (!std::filesystem::exists(directory / "metrics.jsonl") ||
-       !std::filesystem::equivalent(std::filesystem::absolute(run.configuration.resume_path).parent_path(), directory))
+   if (!std::filesystem::exists(directory / "metrics.jsonl") || !std::filesystem::equivalent(std::filesystem::absolute(run.configuration.resume_path).parent_path(), directory))
     throw std::runtime_error("selected output history is not associated with the resume checkpoint");
    auto previous = serial::decode_reflected_json<TrainingRun>(read_manifest(manifest), manifest_limits);
-   if (previous.format_version != kTrainingRunFormat || previous.run_id.empty() || previous.attempt_id.empty() ||
-       previous.evaluated_weights != run.evaluated_weights || previous.class_layout != run.class_layout || run.source_checkpoint_attempt_id.empty() ||
-       previous.checkpoint_attempt_id != run.source_checkpoint_attempt_id)
+   if (previous.format_version != kTrainingRunFormat || previous.run_id.empty() || previous.attempt_id.empty() || previous.evaluated_weights != run.evaluated_weights ||
+       previous.class_layout != run.class_layout || run.source_checkpoint_attempt_id.empty() || previous.checkpoint_attempt_id != run.source_checkpoint_attempt_id)
     throw std::runtime_error("resume history has an unsupported or incompatible run format");
    run.run_id = previous.run_id;
    run.checkpoint_attempt_id = previous.checkpoint_attempt_id;
@@ -200,13 +198,10 @@ struct TrainingTelemetryWriter::Impl final {
    projection["last_epoch"] = record.progress.epoch;
    projection["history_size"] = completed->history_size;
    const auto& bounds = run.execution.dataset_limits;
-   projection["dataset_max_instances"] = {{"train", bounds.train_max_instances},
-                                          {"val", bounds.val_max_instances},
-                                          {"test", bounds.test_max_instances ? nlohmann::json(*bounds.test_max_instances) : nlohmann::json(nullptr)},
-                                          {"largest", bounds.largest_max_instances}};
-   projection["query_resolution"] = {{"source", bounds.query_source},           {"resolved", bounds.resolved_num_queries},
-                                     {"required", bounds.required_num_queries}, {"automatic_query_cap", bounds.automatic_num_queries_cap},
-                                     {"automatic", bounds.automatic},           {"requested_override", bounds.requested_override}};
+   projection["dataset_max_instances"] = {{"train", bounds.train_max_instances}, {"val", bounds.val_max_instances},
+    {"test", bounds.test_max_instances ? nlohmann::json(*bounds.test_max_instances) : nlohmann::json(nullptr)}, {"largest", bounds.largest_max_instances}};
+   projection["query_resolution"] = {{"source", bounds.query_source}, {"resolved", bounds.resolved_num_queries}, {"required", bounds.required_num_queries},
+    {"automatic_query_cap", bounds.automatic_num_queries_cap}, {"automatic", bounds.automatic}, {"requested_override", bounds.requested_override}};
    projection["gpu_augmentation"] = serial::reflected_json(run.configuration.gpu_augmentation, scratch, limits);
    projection["test"] = record.progress.test ? serial::reflected_json(*record.progress.test, scratch, limits) : nlohmann::json(nullptr);
    write_file(directory / "results.json", projection);
@@ -319,9 +314,7 @@ void TrainingTelemetryWriter::Submit(TrainingMetricProgress progress, TrainingRe
   impl_->Wake();
  } catch (...) { impl_->Drop(); }
 }
-void TrainingTelemetryWriter::Finish(TrainingMetricProgress progress, TrainingFinalFacts facts) noexcept {
- impl_->Complete(std::move(progress), std::move(facts));
-}
+void TrainingTelemetryWriter::Finish(TrainingMetricProgress progress, TrainingFinalFacts facts) noexcept { impl_->Complete(std::move(progress), std::move(facts)); }
 void TrainingTelemetryWriter::Close() noexcept {
  impl_->stopping.store(true);
  impl_->Wake();

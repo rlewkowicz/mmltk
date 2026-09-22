@@ -31,12 +31,8 @@ constexpr std::size_t kProgressDocumentLimit = 2U * mmltk::backend::models::rfde
 constexpr std::size_t kProgressEdgeReadBudget = std::size_t{16U} * 1024U;
 [[nodiscard]] std::string bounded_error(std::string value) { return mmltk::controller::contracts::bounded_compute_error(std::move(value)); }
 void validate_progress_fields(const std::string& status, const std::string& checkpoint) {
- if (!mmltk::controller::contracts::valid_compute_text(status, mmltk::controller::contracts::kComputeStatusCapacity)) {
-  throw std::runtime_error("train progress status exceeds fixed capacity");
- }
- if (!mmltk::controller::contracts::valid_compute_text(checkpoint, mmltk::controller::contracts::kComputePathCapacity)) {
-  throw std::runtime_error("train checkpoint path exceeds fixed capacity");
- }
+ if (!mmltk::controller::contracts::valid_compute_text(status, mmltk::controller::contracts::kComputeStatusCapacity)) { throw std::runtime_error("train progress status exceeds fixed capacity"); }
+ if (!mmltk::controller::contracts::valid_compute_text(checkpoint, mmltk::controller::contracts::kComputePathCapacity)) { throw std::runtime_error("train checkpoint path exceeds fixed capacity"); }
 }
 [[nodiscard]] int event_descriptor() {
  const int descriptor = ::eventfd(0U, EFD_CLOEXEC | EFD_NONBLOCK);
@@ -63,9 +59,7 @@ void signal_group(const pid_t group, const int signal) noexcept {
 void arm_escalation(const int descriptor, const std::chrono::milliseconds delay_value) {
  const auto delay = std::chrono::duration_cast<std::chrono::nanoseconds>(delay_value).count();
  const itimerspec timer{.it_interval = {}, .it_value = {.tv_sec = delay / 1'000'000'000LL, .tv_nsec = delay % 1'000'000'000LL}};
- if (::timerfd_settime(descriptor, 0, &timer, nullptr) != 0) {
-  throw std::system_error(errno, std::generic_category(), "failed to arm train escalation timerfd");
- }
+ if (::timerfd_settime(descriptor, 0, &timer, nullptr) != 0) { throw std::system_error(errno, std::generic_category(), "failed to arm train escalation timerfd"); }
 }
 [[nodiscard]] int progress_descriptor(const std::filesystem::path& directory, int& watch) {
  const int descriptor = ::inotify_init1(IN_CLOEXEC | IN_NONBLOCK);
@@ -141,8 +135,7 @@ void TrainProcessClient::State::refresh_group_members() {
   if (errno != 0 || end == entry->d_name || *end != '\0' || encoded <= 0 || encoded > std::numeric_limits<pid_t>::max()) continue;
   const pid_t candidate = static_cast<pid_t>(encoded);
   std::array<char, 64U> path{};
-  if (const int length = std::snprintf(path.data(), path.size(), "/proc/%ld/stat", encoded); length <= 0 || static_cast<std::size_t>(length) >= path.size())
-   continue;
+  if (const int length = std::snprintf(path.data(), path.size(), "/proc/%ld/stat", encoded); length <= 0 || static_cast<std::size_t>(length) >= path.size()) continue;
   mmltk::common::io::ScopedFd stat_fd(::open(path.data(), O_RDONLY | O_CLOEXEC));
   if (stat_fd.get() < 0) continue;
   std::array<char, 4096U> stat{};
@@ -169,8 +162,7 @@ void TrainProcessClient::State::refresh_group_members() {
   }
   mmltk::common::io::ScopedFd member(descriptor);
   epoll_event event{.events = EPOLLIN, .data = {.u64 = static_cast<std::uint64_t>(candidate)}};
-  if (::epoll_ctl(lifecycle_fd.get(), EPOLL_CTL_ADD, member.get(), &event) != 0)
-   throw std::system_error(errno, std::generic_category(), "failed to register train group member");
+  if (::epoll_ctl(lifecycle_fd.get(), EPOLL_CTL_ADD, member.get(), &event) != 0) throw std::system_error(errno, std::generic_category(), "failed to register train group member");
   group_members.push_back(GroupMember{.pid = candidate, .pidfd = std::move(member)});
  }
  group_tracking = found || !group_members.empty();
@@ -204,8 +196,8 @@ TrainProcessClient::TrainProcessClient() noexcept = default;
 TrainProcessClient::TrainProcessClient(State state) noexcept : state_(std::move(state)) {}
 TrainProcessClient::~TrainProcessClient() noexcept { force_reap(); }
 TrainProcessClient::TrainProcessClient(TrainProcessClient&&) noexcept = default;
-TrainProcessClient TrainProcessClient::launch(const mmltk::backend::models::rfdetr::TrainRequest& request, const std::filesystem::path& cli_path,
-                                              const std::string_view fallback_preset_name, const TrainProcessOptions options) {
+TrainProcessClient TrainProcessClient::launch(
+ const mmltk::backend::models::rfdetr::TrainRequest& request, const std::filesystem::path& cli_path, const std::string_view fallback_preset_name, const TrainProcessOptions options) {
  if (options.escalation_delay <= std::chrono::milliseconds::zero()) { throw std::invalid_argument("train escalation delay must be positive"); }
  std::filesystem::create_directories(request.output_dir);
  std::error_code cleanup_error;
@@ -225,9 +217,7 @@ TrainProcessClient TrainProcessClient::launch(const mmltk::backend::models::rfde
  });
  try {
   const pid_t child_pid = child.pid();
-  if (::setpgid(child_pid, child_pid) != 0 && errno != EACCES && errno != ESRCH) {
-   throw std::system_error(errno, std::generic_category(), "failed to establish train process group");
-  }
+  if (::setpgid(child_pid, child_pid) != 0 && errno != EACCES && errno != ESRCH) { throw std::system_error(errno, std::generic_category(), "failed to establish train process group"); }
   State state;
   state.pid = child_pid;
   state.group = child_pid;
@@ -366,11 +356,9 @@ std::optional<TrainProcessProgress> TrainProcessClient::read_progress() {
  if (progress.is_object()) read_json_value(progress, "dropped_records", dropped_records);
  ++state_->progress_sequence;
  return TrainProcessProgress{.progress = {.sequence = state_->progress_sequence, .completed = completed, .total = total, .status = std::move(status)},
-                             .checkpoint_path = std::move(checkpoint),
-                             .metrics = std::move(metrics),
-                             .persistence = {.degraded = state_->persistence_failed,
-                                             .dropped_records = dropped_records,
-                                             .error = state_->persistence_failed ? "Training metric persistence is incomplete" : ""}};
+  .checkpoint_path = std::move(checkpoint),
+  .metrics = std::move(metrics),
+  .persistence = {.degraded = state_->persistence_failed, .dropped_records = dropped_records, .error = state_->persistence_failed ? "Training metric persistence is incomplete" : ""}};
 }
 std::optional<TrainProcessExit> TrainProcessClient::consume_exit(std::string* retained_output) {
  if (!active()) return std::nullopt;
@@ -402,11 +390,7 @@ std::optional<TrainProcessExit> TrainProcessClient::consume_exit(std::string* re
   if (!consume_output(output, kTrainProcessReadBudget, retained_output ? kTrainProcessReadBudget : 0)) break;
  }
  auto final_progress = read_progress();
- TrainProcessExit exit{.outcome = TrainProcessExitOutcome::Failed,
-                       .wait_status = state_->wait_status,
-                       .setup_failure = setup.has_value(),
-                       .final_progress = std::move(final_progress),
-                       .error = {}};
+ TrainProcessExit exit{.outcome = TrainProcessExitOutcome::Failed, .wait_status = state_->wait_status, .setup_failure = setup.has_value(), .final_progress = std::move(final_progress), .error = {}};
  if (setup) exit.error = bounded_error(mmltk::frameworks::process::format_child_setup_failure(*setup, "local training"));
  if (setup)
   exit.outcome = TrainProcessExitOutcome::Failed;

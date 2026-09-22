@@ -47,12 +47,12 @@ public:
         [this](auto revisions) {
          EnsurePool();
          gpu::SystemImageRuntimeConfig config{.device = visual_.device,
-                                              .output_layout = gpu::ImageProductLayout::CleanAndSemantic,
-                                              .output_buffer_count = 2U,
-                                              .numa_node = visual_.numa_node,
-                                              .execution = execution_,
-                                              .product_revisions = std::move(revisions),
-                                              .adopted_context = context_};
+          .output_layout = gpu::ImageProductLayout::CleanAndSemantic,
+          .output_buffer_count = 2U,
+          .numa_node = visual_.numa_node,
+          .execution = execution_,
+          .product_revisions = std::move(revisions),
+          .adopted_context = context_};
          configure_visual_workspace_finalization(config);
          return std::make_unique<gpu::SystemImageRuntime>(std::move(config));
         },
@@ -65,8 +65,7 @@ public:
          }
          Notify();
         }) {
-  if (visual_.valid() && (visual_.maximum_width < 8U || visual_.maximum_height < 9U))
-   throw contracts::InvalidIntentError("validation requires at least an 8 by 9 image envelope");
+  if (visual_.valid() && (visual_.maximum_width < 8U || visual_.maximum_height < 9U)) throw contracts::InvalidIntentError("validation requires at least an 8 by 9 image envelope");
   worker_.RegisterContinuation([this](auto& runtime, auto stop) { return Render(runtime, stop); }, {}, true);
  }
  ~Impl() { Shutdown(); }
@@ -102,8 +101,7 @@ public:
     RestoreIncumbent();
    else
     current_.reset();
-   if (content_frontier_ > std::numeric_limits<std::uint64_t>::max() - (rfdetr::kValidationSampleCapacity + 2U))
-    throw contracts::FailedError("validation content identities exhausted");
+   if (content_frontier_ > std::numeric_limits<std::uint64_t>::max() - (rfdetr::kValidationSampleCapacity + 2U)) throw contracts::FailedError("validation content identities exhausted");
    if (!requested_.atlas) {
     requested_.atlas = std::make_shared<Set>();
     requested_.atlas->atlas_identity = ++content_frontier_;
@@ -163,8 +161,7 @@ public:
    std::scoped_lock lock(mutex_);
    if (!current_ || current_->generation != generation || settled_success_) return;
   }
-  if (!sample.pixels.preview_failure.empty() || (!sample.pixels.chw && !sample.pixels.rgb8) || sample.pixels.width > visual_.maximum_width ||
-      sample.pixels.height > visual_.maximum_height) {
+  if (!sample.pixels.preview_failure.empty() || (!sample.pixels.chw && !sample.pixels.rgb8) || sample.pixels.width > visual_.maximum_width || sample.pixels.height > visual_.maximum_height) {
    Settle(generation, false);
    return;
   }
@@ -172,9 +169,9 @@ public:
   std::shared_ptr<const PredictionPreviewFrame> raw;
   {
    std::scoped_lock lock(pool_mutex_);
-   raw = pool_->Capture(sample.pixels.chw, {sample.pixels.width, sample.pixels.height}, sample.pixels.stream, sample.prediction.detections, sample.annotations,
-                        sample.annotations.class_catalog, static_cast<int>(sample.annotations.class_catalog->size()), sample.pixels.rgb8,
-                        std::move(sample.pixels.custody), sample.pixels.stop_source, sample.pixels.source_control, sample.ground_truth, true);
+   raw = pool_->Capture(sample.pixels.chw, {sample.pixels.width, sample.pixels.height}, sample.pixels.stream, sample.prediction.detections, sample.annotations, sample.annotations.class_catalog,
+    static_cast<int>(sample.annotations.class_catalog->size()), sample.pixels.rgb8, std::move(sample.pixels.custody), sample.pixels.stop_source, sample.pixels.source_control, sample.ground_truth,
+    true);
   }
   if (!raw) {
    Settle(generation, false);
@@ -195,13 +192,8 @@ public:
     mmltk::backend::imaging::raster::color::class_color(static_cast<int>(category), static_cast<int>(raw->classes().size()), rgb[0], rgb[1], rgb[2]);
     if (ground_truth)
      for (auto& channel : rgb) channel = 255U - channel;
-    metadata.labels.push_back({{{prediction.bbox_xyxy[0], prediction.bbox_xyxy[1]}, {prediction.bbox_xyxy[2], prediction.bbox_xyxy[3]}},
-                               palette[category],
-                               rgb,
-                               static_cast<std::uint32_t>(category),
-                               ground_truth,
-                               prediction.score,
-                               raw->classes()[category]});
+    metadata.labels.push_back({{{prediction.bbox_xyxy[0], prediction.bbox_xyxy[1]}, {prediction.bbox_xyxy[2], prediction.bbox_xyxy[3]}}, palette[category], rgb, static_cast<std::uint32_t>(category),
+     ground_truth, prediction.score, raw->classes()[category]});
    }
   };
   labels(raw->predictions(), false);
@@ -209,9 +201,8 @@ public:
   {
    std::scoped_lock lock(mutex_);
    if (!current_ || current_->generation != generation || settled_success_) return;
-   auto found = std::ranges::find_if(current_->samples, [&](const auto& slot) {
-    return slot && slot->metadata.identity.generation != 0U && slot->metadata.identity.dataset_index == sample.prediction.dataset_index;
-   });
+   auto found = std::ranges::find_if(
+    current_->samples, [&](const auto& slot) { return slot && slot->metadata.identity.generation != 0U && slot->metadata.identity.dataset_index == sample.prediction.dataset_index; });
    if (found == current_->samples.end()) throw std::logic_error("validation captured an unselected sample");
    if ((*found)->raw) return;  // A delivery identity owns one immutable sample.
    metadata.identity = (*found)->metadata.identity;
@@ -229,8 +220,7 @@ public:
     object.category = static_cast<std::uint16_t>(gt.class_reference);
     object.box = {{gt.bbox_xyxy[0], gt.bbox_xyxy[1]}, {gt.bbox_xyxy[2], gt.bbox_xyxy[3]}};
     object.mask.present = gt.has_mask;
-    document->mask_bounds.push_back(gt.has_mask ? mmltk::backend::imaging::sampling::rle_support_bounds(std::span{gt.mask.runs}, gt.mask.width, gt.mask.height)
-                                                : std::array<float, 4>{});
+    document->mask_bounds.push_back(gt.has_mask ? mmltk::backend::imaging::sampling::rle_support_bounds(std::span{gt.mask.runs}, gt.mask.width, gt.mask.height) : std::array<float, 4>{});
     object.shape = object.mask.present ? contracts::AnnotationShape::Mask : contracts::AnnotationShape::Box;
     document->scene.objects.push_back(std::move(object));
    }
@@ -241,8 +231,7 @@ public:
     if (index >= masks->size()) return false;
     const auto& mask = (*masks)[index];
     if (!(x >= 0.0F && x < 1.0F && y >= 0.0F && y < 1.0F)) return false;
-    const auto offset =
-     static_cast<std::uint32_t>(y * static_cast<float>(mask.height)) * mask.width + static_cast<std::uint32_t>(x * static_cast<float>(mask.width));
+    const auto offset = static_cast<std::uint32_t>(y * static_cast<float>(mask.height)) * mask.width + static_cast<std::uint32_t>(x * static_cast<float>(mask.width));
     const auto after = std::ranges::upper_bound(mask.runs, offset, {}, &std::pair<std::uint32_t, std::uint32_t>::first);
     if (after == mask.runs.begin()) return false;
     const auto& run = *std::prev(after);
@@ -278,8 +267,7 @@ public:
   {
    std::scoped_lock lock(mutex_);
    if (!displayed_) throw contracts::InvalidIntentError("validation sample is not displayed");
-   const auto found =
-    std::ranges::find_if(displayed_->samples, [&](const auto& sample) { return sample && sample->raw && sample->metadata.identity == identity; });
+   const auto found = std::ranges::find_if(displayed_->samples, [&](const auto& sample) { return sample && sample->raw && sample->metadata.identity == identity; });
    if (found == displayed_->samples.end()) throw contracts::InvalidIntentError("validation sample identity is stale");
    requested_.atlas = displayed_;
    requested_.detail = identity;
@@ -373,15 +361,14 @@ public:
     metadata = sample->metadata;
     if (!sample->raw || (selected && sample->metadata.identity != *selected)) continue;
     const auto contained = mmltk::backend::imaging::raster::contain_image(metadata.pixel_extent.width, metadata.pixel_extent.height, cell_width, cell_height);
-    metadata.crop = selected ? VisualRegion{0U, 0U, extent.width, extent.height}
-                             : VisualRegion{static_cast<std::uint32_t>(index % 2U) * cell_width + contained.x,
-                                            static_cast<std::uint32_t>(index / 2U) * cell_height + contained.y, contained.width, contained.height};
+    metadata.crop =
+     selected ? VisualRegion{0U, 0U, extent.width, extent.height}
+              : VisualRegion{static_cast<std::uint32_t>(index % 2U) * cell_width + contained.x, static_cast<std::uint32_t>(index / 2U) * cell_height + contained.y, contained.width, contained.height};
     regions[region_count++] = {sample->raw, metadata.crop};
    }
-   PredictionPreviewComposition::Draw(
-    runtime, candidate, extent, std::span(regions).first(region_count),
-    {overlays.prediction_layer && overlays.prediction_boxes, overlays.prediction_layer && overlays.prediction_masks,
-     overlays.ground_truth_layer && overlays.ground_truth_boxes, overlays.ground_truth_layer && overlays.ground_truth_masks, true, !selected},
+   PredictionPreviewComposition::Draw(runtime, candidate, extent, std::span(regions).first(region_count),
+    {overlays.prediction_layer && overlays.prediction_boxes, overlays.prediction_layer && overlays.prediction_masks, overlays.ground_truth_layer && overlays.ground_truth_boxes,
+     overlays.ground_truth_layer && overlays.ground_truth_masks, true, !selected},
     &preparation_);
    image.frame = visual_frame({PresentationSourceKind::Validation, 1U}, extent, candidate.revision());
    image.frame.content = {0U, 0U, extent.width, extent.height};
@@ -549,8 +536,7 @@ VisualDocumentRead ValidationSamples::BorrowDocument(const VisualFrame& frame) c
  if (!document) return {};
  auto encoded = mmltk::frameworks::serialization::reflected_transport_value(metadata);
  if (!encoded) throw std::runtime_error("validation document metadata cannot be projected");
- return {borrow_matching_visual_product(frame, impl_->worker_), std::move(document),
-         std::make_shared<const mmltk::frameworks::serialization::wire::Value>(std::move(*encoded))};
+ return {borrow_matching_visual_product(frame, impl_->worker_), std::move(document), std::make_shared<const mmltk::frameworks::serialization::wire::Value>(std::move(*encoded))};
 }
 gpu::BorrowedImageWorkspace ValidationSamples::BorrowWorkspace() const { return impl_->worker_.BorrowWorkspace(); }
 gpu::ImageWorkspaceObservation ValidationSamples::ObserveWorkspace() const { return impl_->worker_.ObserveWorkspace(); }

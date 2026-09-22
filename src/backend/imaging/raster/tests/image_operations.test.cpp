@@ -29,27 +29,58 @@ struct PitchedDeviceImage {
 PitchedDeviceImage upload_pitched_bgr(const std::vector<std::uint8_t>& host, const std::uint32_t width, const std::uint32_t height, const cudaStream_t stream) {
  PitchedDeviceImage image;
  CUDA_ASSERT_OK(cudaMallocPitch(reinterpret_cast<void**>(&image.device), &image.pitch_bytes, static_cast<std::size_t>(width) * 3U, height));
- CUDA_ASSERT_OK(cudaMemcpy2DAsync(image.device, image.pitch_bytes, host.data(), static_cast<std::size_t>(width) * 3U, static_cast<std::size_t>(width) * 3U,
-                                  height, cudaMemcpyHostToDevice, stream));
+ CUDA_ASSERT_OK(cudaMemcpy2DAsync(image.device, image.pitch_bytes, host.data(), static_cast<std::size_t>(width) * 3U, static_cast<std::size_t>(width) * 3U, height, cudaMemcpyHostToDevice, stream));
  return image;
 }
 void test_vertical_flip_in_place_reverses_rows() {
  constexpr std::uint32_t width = 2;
  constexpr std::uint32_t height = 3;
  const std::vector<std::uint8_t> input = {
-  1, 2, 3, 4, 5, 6, 11, 12, 13, 14, 15, 16, 21, 22, 23, 24, 25, 26,
+  1,
+  2,
+  3,
+  4,
+  5,
+  6,
+  11,
+  12,
+  13,
+  14,
+  15,
+  16,
+  21,
+  22,
+  23,
+  24,
+  25,
+  26,
  };
  const std::vector<std::uint8_t> expected = {
-  21, 22, 23, 24, 25, 26, 11, 12, 13, 14, 15, 16, 1, 2, 3, 4, 5, 6,
+  21,
+  22,
+  23,
+  24,
+  25,
+  26,
+  11,
+  12,
+  13,
+  14,
+  15,
+  16,
+  1,
+  2,
+  3,
+  4,
+  5,
+  6,
  };
  cudaStream_t stream = create_nonblocking_stream_on_device_zero();
  const PitchedDeviceImage image = upload_pitched_bgr(input, width, height, stream);
- CUDA_ASSERT_OK(static_cast<cudaError_t>(
-  launch_bgr_vertical_flip_in_place_pitched(image.device, image.pitch_bytes, width, height, reinterpret_cast<std::uintptr_t>(stream))));
+ CUDA_ASSERT_OK(static_cast<cudaError_t>(launch_bgr_vertical_flip_in_place_pitched(image.device, image.pitch_bytes, width, height, reinterpret_cast<std::uintptr_t>(stream))));
  CUDA_ASSERT_OK(cudaStreamSynchronize(stream));
  std::vector<std::uint8_t> output(expected.size(), 0U);
- CUDA_ASSERT_OK(cudaMemcpy2D(output.data(), static_cast<std::size_t>(width) * 3U, image.device, image.pitch_bytes, static_cast<std::size_t>(width) * 3U, height,
-                             cudaMemcpyDeviceToHost));
+ CUDA_ASSERT_OK(cudaMemcpy2D(output.data(), static_cast<std::size_t>(width) * 3U, image.device, image.pitch_bytes, static_cast<std::size_t>(width) * 3U, height, cudaMemcpyDeviceToHost));
  CHECK(output == expected);
  CUDA_ASSERT_OK(cudaFree(image.device));
  CUDA_ASSERT_OK(cudaStreamDestroy(stream));
@@ -58,14 +89,18 @@ void test_split_to_planar_preserves_bottom_row_orientation() {
  constexpr std::uint32_t width = 1;
  constexpr std::uint32_t height = 2;
  const std::vector<std::uint8_t> input = {
-  10, 20, 30, 200, 150, 100,
+  10,
+  20,
+  30,
+  200,
+  150,
+  100,
  };
  cudaStream_t stream = create_nonblocking_stream_on_device_zero();
  const PitchedDeviceImage source = upload_pitched_bgr(input, width, height, stream);
  float* dst_device = nullptr;
  CUDA_ASSERT_OK(cudaMalloc(reinterpret_cast<void**>(&dst_device), static_cast<std::size_t>(3U * width * height) * sizeof(float)));
- CUDA_ASSERT_OK(static_cast<cudaError_t>(
-  launch_bgr_split_to_planar_float(source.device, source.pitch_bytes, width, height, dst_device, width, height, reinterpret_cast<std::uintptr_t>(stream))));
+ CUDA_ASSERT_OK(static_cast<cudaError_t>(launch_bgr_split_to_planar_float(source.device, source.pitch_bytes, width, height, dst_device, width, height, reinterpret_cast<std::uintptr_t>(stream))));
  CUDA_ASSERT_OK(cudaStreamSynchronize(stream));
  std::vector<float> output(static_cast<std::size_t>(3U) * width * height, 0.0f);
  CUDA_ASSERT_OK(cudaMemcpy(output.data(), dst_device, output.size() * sizeof(float), cudaMemcpyDeviceToHost));
@@ -104,34 +139,11 @@ TEST_CASE("Flat mask runs match independent pixel membership through clipped row
   const auto row_width = static_cast<std::uint32_t>(width);
   const auto pixel_count = row_width * static_cast<std::uint32_t>(height);
   const std::array<std::vector<std::uint32_t>, 14U> cases{
-   {{},
-    {0U, 0U},
-    {11U, 32U},
-    {0U, std::numeric_limits<std::uint32_t>::max()},
-    {116U, 6U, 117U, 9U, std::numeric_limits<std::uint32_t>::max(), std::numeric_limits<std::uint32_t>::max()},
-    {2U, 4U, 12U, 29U, 63U, 21U, 101U, 2U},
-    {0U, pixel_count},
-    {row_width / 2U, 2U * row_width},
-    {row_width - 1U, row_width + 2U},
-    {row_width - 1U, 1U},
-    {row_width, 1U},
-    {row_width, 2U * row_width},
-    {pixel_count - 1U, std::numeric_limits<std::uint32_t>::max()},
-    {0U, row_width, row_width + 1U, row_width, 3U * row_width, 2U * row_width, pixel_count, 1U}}};
-  const std::array<raster::IntRect, 14U> clips{{{0, 0, width, height},
-                                                {5, 3, 6, 4},
-                                                {4, 1, 9, 5},
-                                                {2, 2, 2, 7},
-                                                {1, 5, 8, 5},
-                                                {-7, -9, 4, 2},
-                                                {width, height, 20, 20},
-                                                {width / 2, 0, width / 2 + 1, height},
-                                                {1, 0, width - 1, height},
-                                                {0, 1, width, height - 1},
-                                                {0, 0, 0, height},
-                                                {-4, -3, -1, height},
-                                                {0, height + 1, width, height + 3},
-                                                {0, -4, width, -1}}};
+   {{}, {0U, 0U}, {11U, 32U}, {0U, std::numeric_limits<std::uint32_t>::max()}, {116U, 6U, 117U, 9U, std::numeric_limits<std::uint32_t>::max(), std::numeric_limits<std::uint32_t>::max()},
+    {2U, 4U, 12U, 29U, 63U, 21U, 101U, 2U}, {0U, pixel_count}, {row_width / 2U, 2U * row_width}, {row_width - 1U, row_width + 2U}, {row_width - 1U, 1U}, {row_width, 1U}, {row_width, 2U * row_width},
+    {pixel_count - 1U, std::numeric_limits<std::uint32_t>::max()}, {0U, row_width, row_width + 1U, row_width, 3U * row_width, 2U * row_width, pixel_count, 1U}}};
+  const std::array<raster::IntRect, 14U> clips{{{0, 0, width, height}, {5, 3, 6, 4}, {4, 1, 9, 5}, {2, 2, 2, 7}, {1, 5, 8, 5}, {-7, -9, 4, 2}, {width, height, 20, 20},
+   {width / 2, 0, width / 2 + 1, height}, {1, 0, width - 1, height}, {0, 1, width, height - 1}, {0, 0, 0, height}, {-4, -3, -1, height}, {0, height + 1, width, height + 3}, {0, -4, width, -1}}};
   for (const auto& runs : cases)
    for (const auto clip : clips) {
     CAPTURE(runs, clip.x1, clip.y1, clip.x2, clip.y2);
@@ -150,11 +162,11 @@ TEST_CASE("Flat mask runs match independent pixel membership through clipped row
     CUDA_ASSERT_OK(cudaMemsetAsync(storage, untouched, expected.size(), stream));
     if (!runs.empty()) CUDA_ASSERT_OK(cudaMemcpyAsync(pairs, runs.data(), runs.size() * sizeof(std::uint32_t), cudaMemcpyHostToDevice, stream));
     CHECK(raster::raster_mask_runs_rgba({.overlay = {storage + guard, pitch, width, height},
-                                         .run_pairs = runs.empty() ? nullptr : pairs,
-                                         .run_count = static_cast<std::uint32_t>(runs.size() / 2U),
-                                         .color = {color[0], color[1], color[2], color[3]},
-                                         .stream = {reinterpret_cast<void*>(stream)},
-                                         .clip = clip}) == (runs.empty() ? cudaErrorInvalidValue : cudaSuccess));
+           .run_pairs = runs.empty() ? nullptr : pairs,
+           .run_count = static_cast<std::uint32_t>(runs.size() / 2U),
+           .color = {color[0], color[1], color[2], color[3]},
+           .stream = {reinterpret_cast<void*>(stream)},
+           .clip = clip}) == (runs.empty() ? cudaErrorInvalidValue : cudaSuccess));
     CUDA_ASSERT_OK(cudaStreamSynchronize(stream));
     std::vector<std::uint8_t> actual(expected.size());
     CUDA_ASSERT_OK(cudaMemcpy(actual.data(), storage, actual.size(), cudaMemcpyDeviceToHost));

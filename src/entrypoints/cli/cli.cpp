@@ -44,26 +44,22 @@ struct InfoCommandRequest final {
 };
 MMLTK_REFLECT_FIELDS(BenchCommandRequest)
 MMLTK_REFLECT_FIELDS(InfoCommandRequest)
-inline constexpr std::array kCompileOptions{
- reflection::option<data::CompilerConfig, &data::CompilerConfig::resize_mode>("--resize-mode", "Image geometry: Stretch or Letterbox", "Dataset"),
+inline constexpr std::array kCompileOptions{reflection::option<data::CompilerConfig, &data::CompilerConfig::resize_mode>("--resize-mode", "Image geometry: Stretch or Letterbox", "Dataset"),
  reflection::option<data::CompilerConfig, &data::CompilerConfig::perceptual_downscale>("--perceptual-downscale", "Perceptual shrinking", "Dataset"),
  reflection::option<data::CompilerConfig, &data::CompilerConfig::source_dir>("--source-dir", "Source dataset directory", "Dataset", "source_dir", {}, true),
- reflection::option<data::CompilerConfig, &data::CompilerConfig::output_dir>("--output-dir", "Compiled binary output directory", "Dataset", "output_dir", {},
-                                                                             true),
+ reflection::option<data::CompilerConfig, &data::CompilerConfig::output_dir>("--output-dir", "Compiled binary output directory", "Dataset", "output_dir", {}, true),
  reflection::option<data::CompilerConfig, &data::CompilerConfig::split>("--split", "Dataset split", "Dataset", "split", {}, true),
  reflection::option<data::CompilerConfig, &data::CompilerConfig::target_width>("--width", "Target image width", "Dataset"),
  reflection::option<data::CompilerConfig, &data::CompilerConfig::target_height>("--height", "Target image height", "Dataset"),
  reflection::option<data::CompilerConfig, &data::CompilerConfig::cuda_mask_batch_size>("--cuda-mask-batch-size", "CUDA mask batch size", "Execution"),
  reflection::option<data::CompilerConfig, &data::CompilerConfig::cuda_device_id>("--cuda-device-id", "CUDA device id", "Execution"),
  reflection::option<data::CompilerConfig, &data::CompilerConfig::num_workers>("--workers", "CPU worker budget", "Execution")};
-inline constexpr std::array kBenchOptions{
- reflection::negative_flag<BenchCommandRequest, &BenchCommandRequest::h2d_dataloader>("--gdrcopy", "Use GDRCopy image loading", "Execution"),
+inline constexpr std::array kBenchOptions{reflection::negative_flag<BenchCommandRequest, &BenchCommandRequest::h2d_dataloader>("--gdrcopy", "Use GDRCopy image loading", "Execution"),
  reflection::option<BenchCommandRequest, &BenchCommandRequest::numa_node>("--numa-node", "GPU-local NUMA node (-1 automatic)", "Execution"),
  reflection::option<BenchCommandRequest, &BenchCommandRequest::compiled_path>("--compiled", "Compiled dataset binary", "Dataset", "compiled", {}, true),
  reflection::option<BenchCommandRequest, &BenchCommandRequest::batch_size>("--batch-size", "Streaming batch size", "Execution", "batch_size"),
  reflection::option<BenchCommandRequest, &BenchCommandRequest::epochs>("--epochs", "Number of epochs", "Execution", "num_epochs")};
-inline constexpr std::array kInfoOptions{
- reflection::option<InfoCommandRequest, &InfoCommandRequest::compiled_path>("--compiled", "Compiled dataset binary", "Dataset", "compiled", {}, true)};
+inline constexpr std::array kInfoOptions{reflection::option<InfoCommandRequest, &InfoCommandRequest::compiled_path>("--compiled", "Compiled dataset binary", "Dataset", "compiled", {}, true)};
 inline constexpr std::array kCompileUnexposed{
  reflection::unexposed<data::CompilerConfig, &data::CompilerConfig::worker_cpus>("execution resolves the concrete CPU set from the container "
                                                                                  "allocation")};
@@ -111,19 +107,18 @@ void run_compile(const data::CompilerConfig& config) {
   std::size_t* total;
   spdmon::ProgressBar* bar;
  } state{&last_done, &total, &bar};
- data::CompileTelemetry telemetry{plan.splits[0].image_count,
-                                  {.context = &state, .report = [](void* context, const data::CompileProgress& progress) noexcept {
-                                    auto& progress_state = *static_cast<ProgressState*>(context);
-                                    if (progress.total != *progress_state.total) {
-                                     *progress_state.total = progress.total;
-                                     progress_state.bar->set_total(*progress_state.total);
-                                    }
-                                    if (progress.done > *progress_state.last_done) {
-                                     progress_state.bar->add(progress.done - *progress_state.last_done);
-                                     *progress_state.last_done = progress.done;
-                                    }
-                                    progress_state.bar->set_postfix("processed " + std::to_string(progress.done) + "/" + std::to_string(progress.total));
-                                   }}};
+ data::CompileTelemetry telemetry{plan.splits[0].image_count, {.context = &state, .report = [](void* context, const data::CompileProgress& progress) noexcept {
+                                                                auto& progress_state = *static_cast<ProgressState*>(context);
+                                                                if (progress.total != *progress_state.total) {
+                                                                 *progress_state.total = progress.total;
+                                                                 progress_state.bar->set_total(*progress_state.total);
+                                                                }
+                                                                if (progress.done > *progress_state.last_done) {
+                                                                 progress_state.bar->add(progress.done - *progress_state.last_done);
+                                                                 *progress_state.last_done = progress.done;
+                                                                }
+                                                                progress_state.bar->set_postfix("processed " + std::to_string(progress.done) + "/" + std::to_string(progress.total));
+                                                               }}};
  data::DatasetCompiler::compile(plan, 0U, &telemetry);
  bar.close();
  const auto finished = std::chrono::steady_clock::now();
@@ -200,9 +195,7 @@ int handle_info(const std::span<const std::string_view> arguments, int, char**, 
  return 0;
 }
 #if MMLTK_BUILD_RFDETR_NATIVE
-int handle_rfdetr(const std::span<const std::string_view> arguments, const int argc, char** argv, bool) {
- return mmltk::entrypoints::cli::handle_rfdetr_cli(arguments, argc, argv);
-}
+int handle_rfdetr(const std::span<const std::string_view> arguments, const int argc, char** argv, bool) { return mmltk::entrypoints::cli::handle_rfdetr_cli(arguments, argc, argv); }
 #endif
 inline constexpr std::array kRootCommands{
  RootCommand{"compile", "Compile a raw dataset split", &handle_compile},
@@ -247,8 +240,7 @@ int main(const int argc, char** argv) {
   const RootCommand* command = find_root_command(filtered.front());
   if (command == nullptr) { throw std::runtime_error("unknown command: " + std::string(filtered.front())); }
   const std::span<const std::string_view> arguments{filtered.begin() + 1, filtered.end()};
-  const bool help_requested =
-   std::ranges::find(arguments, std::string_view{"--help"}) != arguments.end() || std::ranges::find(arguments, std::string_view{"-h"}) != arguments.end();
+  const bool help_requested = std::ranges::find(arguments, std::string_view{"--help"}) != arguments.end() || std::ranges::find(arguments, std::string_view{"-h"}) != arguments.end();
   return command->handler(arguments, argc, argv, help_requested);
  } catch (const std::exception& error) { logging::report_fatal("mmltk error", error.what()); } catch (...) {
   logging::report_fatal("mmltk error", "unknown exception");

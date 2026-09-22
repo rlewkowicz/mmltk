@@ -66,16 +66,12 @@ struct CachedImageDirectory {
 void invalidate_cached_image_proofs(const std::filesystem::path& root);
 void prepare_cached_image_directory(const std::filesystem::path& root);
 [[nodiscard]] std::size_t format_cached_image_relative_path(std::uint64_t image_id, std::span<char> output);
-void write_cached_image_atomically(const std::filesystem::path& path, std::span<const std::uint8_t> encoded,
-                                   mmltk::common::concurrency::CancellationObservation cancellation);
+void write_cached_image_atomically(const std::filesystem::path& path, std::span<const std::uint8_t> encoded, mmltk::common::concurrency::CancellationObservation cancellation);
 [[nodiscard]] bool validate_cached_image_group(const std::filesystem::path& root, const std::filesystem::path& completion_path, std::string_view identity,
-                                               std::span<const std::uint64_t> expected_image_ids, std::uint64_t* image_bytes,
-                                               mmltk::common::concurrency::CancellationObservation cancel_requested, const BenchmarkTraceSink& trace = {},
-                                               std::vector<CachedImageRejection>* quarantined = nullptr);
-void complete_cached_image_group(const std::filesystem::path& root, const std::filesystem::path& completion_path, std::string_view identity,
-                                 std::span<const std::uint64_t> expected_image_ids, std::uint64_t image_bytes,
-                                 mmltk::common::concurrency::CancellationObservation cancellation, const BenchmarkTraceSink& trace = {},
-                                 std::span<const CachedImageRejection> quarantined = {});
+ std::span<const std::uint64_t> expected_image_ids, std::uint64_t* image_bytes, mmltk::common::concurrency::CancellationObservation cancel_requested, const BenchmarkTraceSink& trace = {},
+ std::vector<CachedImageRejection>* quarantined = nullptr);
+void complete_cached_image_group(const std::filesystem::path& root, const std::filesystem::path& completion_path, std::string_view identity, std::span<const std::uint64_t> expected_image_ids,
+ std::uint64_t image_bytes, mmltk::common::concurrency::CancellationObservation cancellation, const BenchmarkTraceSink& trace = {}, std::span<const CachedImageRejection> quarantined = {});
 // Everything one archive extraction needs. The knobs live here instead of in a positional parameter
 // list so the entry point keeps a single signature that callers and the definition cannot drift.
 struct ArchiveExtractionRequest {

@@ -55,8 +55,7 @@ public:
   if (query_observer != nullptr) ++*query_observer;
   return offers;
  }
- VastCreateInstanceResult create(const VastBridgeConfig&, int, std::string_view, const VastLaunchTemplateOptions& options,
-                                 const VastBridgeInvocation&) const override {
+ VastCreateInstanceResult create(const VastBridgeConfig&, int, std::string_view, const VastLaunchTemplateOptions& options, const VastBridgeInvocation&) const override {
   ++creates;
   created_label = options.label;
   if (throw_create) throw std::runtime_error("create effect failed");
@@ -102,8 +101,7 @@ struct ArtifactCancellationFixture final {
  ArtifactCancellationToken token;
 
 private:
- explicit ArtifactCancellationFixture(std::pair<ArtifactCancellationSource, ArtifactCancellationToken>&& pair) noexcept
-     : source(std::move(pair.first)), token(std::move(pair.second)) {}
+ explicit ArtifactCancellationFixture(std::pair<ArtifactCancellationSource, ArtifactCancellationToken>&& pair) noexcept : source(std::move(pair.first)), token(std::move(pair.second)) {}
 };
 class ArtifactTestOperations final : public ArtifactWeightOperations {
 public:
@@ -111,14 +109,9 @@ public:
   ++finds;
   return preset == "fixture" ? std::optional<ArtifactWeightAsset>{{.filename = filename, .url = url, .md5 = md5}} : std::nullopt;
  }
- void download(std::string_view, const std::filesystem::path& output, const ArtifactCancellationToken& cancellation,
-               ArtifactWeightProgressObserver progress) const override {
+ void download(std::string_view, const std::filesystem::path& output, const ArtifactCancellationToken& cancellation, ArtifactWeightProgressObserver progress) const override {
   ++downloads;
-  progress({.stage = domain::ModelProgressStage::Downloading,
-            .activity = "fixture download",
-            .completed = payload.size(),
-            .total = payload.size(),
-            .total_known = true});
+  progress({.stage = domain::ModelProgressStage::Downloading, .activity = "fixture download", .completed = payload.size(), .total = payload.size(), .total_known = true});
   if (cancel_on_download && cancellation_trigger != nullptr) {
    if (&cancellation_trigger->token != &cancellation) { throw std::runtime_error("artifact fixture cancellation identity mismatch"); }
    cancellation_trigger->cancel();
@@ -228,9 +221,9 @@ TEST_CASE("artifact service derives bounded inspection contracts from reflected 
  CHECK_FALSE(rejected.detail.empty());
  CHECK(rejected.detail.size() <= domain::kArtifactErrorCapacity);
  ArtifactCompileRequest exact{.source = std::filesystem::path(std::string(domain::kArtifactPathCapacity, 's')),
-                              .output = std::filesystem::path(std::string(domain::kArtifactPathCapacity, 'o')),
-                              .preset = std::string(domain::kArtifactPresetCapacity, 'p'),
-                              .resolution = 1U};
+  .output = std::filesystem::path(std::string(domain::kArtifactPathCapacity, 'o')),
+  .preset = std::string(domain::kArtifactPresetCapacity, 'p'),
+  .resolution = 1U};
  CHECK(exact.valid());
  exact.source = std::filesystem::path(std::string(domain::kArtifactPathCapacity + 1U, 's'));
  CHECK_FALSE(exact.valid());
@@ -253,8 +246,7 @@ TEST_CASE("artifact compile progress is borrowed for invalid and cancelled calls
  ArtifactStore store;
  ArtifactCancellationFixture cancellation;
  std::size_t reports = 0U;
- const ArtifactProgressObserver observer{.context = &reports,
-                                         .report = [](void* context, const domain::ArtifactProgress&) { ++*static_cast<std::size_t*>(context); }};
+ const ArtifactProgressObserver observer{.context = &reports, .report = [](void* context, const domain::ArtifactProgress&) { ++*static_cast<std::size_t*>(context); }};
  CHECK_FALSE(store.compile({}, cancellation.token, observer).inspection.detail.empty());
  cancellation.cancel();
  ArtifactCompileRequest request{.source = "/unavailable", .output = "/unavailable-output", .preset = "fixture", .resolution = 384U};
@@ -331,8 +323,7 @@ TEST_CASE("artifact benchmark compilation uses the environment cache and retires
   .report = [](void* context, const domain::ArtifactProgress&) { static_cast<ArtifactCancellationFixture*>(context)->cancel(); },
  };
  ArtifactStore store;
- const ArtifactCompileRequest request{
-  .kind = ArtifactCompileKind::Benchmark, .source = {}, .output = output, .preset = "rf-detr-nano", .resolution = 1U, .overwrite = true};
+ const ArtifactCompileRequest request{.kind = ArtifactCompileKind::Benchmark, .source = {}, .output = output, .preset = "rf-detr-nano", .resolution = 1U, .overwrite = true};
  const auto result = store.compile(request, cancellation.token, progress, diagnostics);
  CHECK(result.cancelled);
  CHECK(result.output.empty());
@@ -421,17 +412,14 @@ TEST_CASE("artifact service owns verified cache publication and cancellation cle
  CHECK_FALSE(std::filesystem::exists(root / "fixture.bin"));
  ArtifactCancellationFixture first;
  std::vector<domain::ModelProgress> weight_progress;
- const ArtifactWeightProgressObserver observer{.context = &weight_progress, .report = [](void* context, const domain::ModelProgress& value) noexcept {
-                                                static_cast<std::vector<domain::ModelProgress>*>(context)->push_back(value);
-                                               }};
+ const ArtifactWeightProgressObserver observer{
+  .context = &weight_progress, .report = [](void* context, const domain::ModelProgress& value) noexcept { static_cast<std::vector<domain::ModelProgress>*>(context)->push_back(value); }};
  CHECK(store.canonical_weight_path("fixture", first.token, observer) == root / "fixture.bin");
  CHECK(operations.finds == 1U);
  CHECK(operations.downloads == 1U);
  REQUIRE(weight_progress.size() >= 3U);
  CHECK(weight_progress.front().stage == domain::ModelProgressStage::InspectingCache);
- CHECK(std::ranges::any_of(weight_progress, [](const auto& value) {
-  return value.stage == domain::ModelProgressStage::Downloading && value.total_known && value.completed == value.total;
- }));
+ CHECK(std::ranges::any_of(weight_progress, [](const auto& value) { return value.stage == domain::ModelProgressStage::Downloading && value.total_known && value.completed == value.total; }));
  CHECK(weight_progress.back().stage == domain::ModelProgressStage::Verifying);
  ArtifactCancellationFixture cached;
  weight_progress.clear();
@@ -460,7 +448,14 @@ TEST_CASE("artifact service refuses hostile weight metadata before transfer or c
  ArtifactTestOperations operations;
  ArtifactStore store(root, operations);
  const std::array<std::string, 8U> hostile_filenames{
-  "", ".", "..", "../outside.bin", "/outside.bin", "nested/weight.bin", "nested\\weight.bin", std::string(domain::kArtifactPathCapacity + 1U, 'f'),
+  "",
+  ".",
+  "..",
+  "../outside.bin",
+  "/outside.bin",
+  "nested/weight.bin",
+  "nested\\weight.bin",
+  std::string(domain::kArtifactPathCapacity + 1U, 'f'),
  };
  for (const std::string& filename : hostile_filenames) {
   operations.filename = filename;
@@ -563,10 +558,7 @@ TEST_CASE("duplicated Vast cancellation signal reaches a running invocation fd",
    observed = ready > 0 && (event.revents & POLLIN) != 0;
    return {};
   }
-  VastCreateInstanceResult create(const VastBridgeConfig&, int, std::string_view, const VastLaunchTemplateOptions&,
-                                  const VastBridgeInvocation&) const override {
-   return {};
-  }
+  VastCreateInstanceResult create(const VastBridgeConfig&, int, std::string_view, const VastLaunchTemplateOptions&, const VastBridgeInvocation&) const override { return {}; }
   void start(const VastBridgeConfig&, int, const VastBridgeInvocation&) const override {}
   void stop(const VastBridgeConfig&, int, const VastBridgeInvocation&) const override {}
   VastInstanceInfo show(const VastBridgeConfig&, int, const VastBridgeInvocation&) const override { return {}; }
@@ -706,17 +698,14 @@ TEST_CASE("Vast client validates before provider effects and classifies all reco
  CHECK_THROWS(client.logs(1, 0U, cancellation));
  CHECK(operations->log_reads == 0U);
  operations->record.actual_status = "stopped";
- CHECK(client.reconcile({.mutation = domain::ProviderMutation::Start, .instance_id = 3, .launch_token = {}}, cancellation).disposition ==
-       VastReconciliation::Disposition::NotApplied);
+ CHECK(client.reconcile({.mutation = domain::ProviderMutation::Start, .instance_id = 3, .launch_token = {}}, cancellation).disposition == VastReconciliation::Disposition::NotApplied);
  operations->record.actual_status = "pending";
- CHECK(client.reconcile({.mutation = domain::ProviderMutation::Start, .instance_id = 3, .launch_token = {}}, cancellation).disposition ==
-       VastReconciliation::Disposition::Inconclusive);
+ CHECK(client.reconcile({.mutation = domain::ProviderMutation::Start, .instance_id = 3, .launch_token = {}}, cancellation).disposition == VastReconciliation::Disposition::Inconclusive);
  VastInstanceInfo created;
  created.instance_id = 17;
  created.label = "launch-17";
  operations->records = {created};
- const auto create_reconciliation =
-  client.reconcile({.mutation = domain::ProviderMutation::Create, .instance_id = 0, .launch_token = "launch-17"}, cancellation);
+ const auto create_reconciliation = client.reconcile({.mutation = domain::ProviderMutation::Create, .instance_id = 0, .launch_token = "launch-17"}, cancellation);
  CHECK(create_reconciliation.disposition == VastReconciliation::Disposition::Applied);
  CHECK(create_reconciliation.instance->instance_id == 17);
  operations->records.clear();
@@ -844,8 +833,7 @@ TEST_CASE("Vast create accepts only complete provider result records", "[gui][se
 }
 TEST_CASE("artifact compile reports synchronously through the caller-owned observer", "[gui][services]") {
  mmltk::testsupport::ScopedTempDir temporary("mmltk-artifact-progress");
- const mmltk::backend::data::testsupport::FixtureSpec fixture{
-  .root_dir = temporary.path().string(), .split = "train", .width = 16, .height = 16, .num_images = 1};
+ const mmltk::backend::data::testsupport::FixtureSpec fixture{.root_dir = temporary.path().string(), .split = "train", .width = 16, .height = 16, .num_images = 1};
  mmltk::backend::data::testsupport::create_synthetic_dataset(fixture);
  ArtifactStore store;
  ArtifactCancellationFixture cancellation;
@@ -859,8 +847,7 @@ TEST_CASE("artifact compile reports synchronously through the caller-owned obser
                                           ++value.count;
                                          }};
  const ArtifactCompileResult result = store.compile(
-  {.source = mmltk::backend::data::testsupport::dataset_dir(fixture), .output = temporary.path() / "compiled", .preset = "rf-detr-nano", .resolution = 16U},
-  cancellation.token, observer);
+  {.source = mmltk::backend::data::testsupport::dataset_dir(fixture), .output = temporary.path() / "compiled", .preset = "rf-detr-nano", .resolution = 16U}, cancellation.token, observer);
  reports.accepting = false;
  CHECK(result.inspection.detail.empty());
  CHECK(std::filesystem::exists(result.output));
@@ -912,17 +899,15 @@ TEST_CASE("Train process run owns its stop token, forwards progress, and reaps s
  mmltk::testsupport::ScopedTempDir temp("mmltk-train-run");
  const auto output = temp.path() / "output";
  const auto executable = script(temp,
-                                "out=''; while [ $# -gt 0 ]; do [ \"$1\" = '--output-dir' ] && { out=\"$2\"; break; }; shift; done\n"
-                                "printf "
-                                "'{\"phase\":\"training\",\"completed_batches\":1,\"total_batches\":1,\"checkpoint_path\":\"checkpoint."
-                                "pt\"}' > \"$out/progress.json\"\n"
-                                "printf complete\n");
+  "out=''; while [ $# -gt 0 ]; do [ \"$1\" = '--output-dir' ] && { out=\"$2\"; break; }; shift; done\n"
+  "printf "
+  "'{\"phase\":\"training\",\"completed_batches\":1,\"total_batches\":1,\"checkpoint_path\":\"checkpoint."
+  "pt\"}' > \"$out/progress.json\"\n"
+  "printf complete\n");
  auto client = TrainProcessClient::launch(train_request(output), executable);
  auto [source, token] = TrainProcessStopSource::Mint();
  std::size_t progress_reports = 0U;
- const auto result =
-  client.Run(std::move(token),
-             {.context = &progress_reports, .report = [](void* context, const TrainProcessProgress&) noexcept { ++*static_cast<std::size_t*>(context); }});
+ const auto result = client.Run(std::move(token), {.context = &progress_reports, .report = [](void* context, const TrainProcessProgress&) noexcept { ++*static_cast<std::size_t*>(context); }});
  CHECK(result.terminal.outcome == services::TrainProcessExitOutcome::Succeeded);
  CHECK_FALSE(result.terminal.setup_failure);
  CHECK_FALSE(client.active());
@@ -949,12 +934,12 @@ TEST_CASE("Train process client observes bounded output and inotify progress", "
  std::filesystem::create_directories(output);
  REQUIRE(::mkfifo((temp.path() / "gate").c_str(), 0600) == 0);
  const auto executable = script(temp,
-                                "out=''; while [ $# -gt 0 ]; do [ \"$1\" = '--output-dir' ] && { out=\"$2\"; break; }; shift; done\n"
-                                "read ignored < \"$(dirname \"$out\")/gate\"\n"
-                                "printf first; printf "
-                                "'{\"phase\":\"training\",\"completed_batches\":1,\"total_batches\":2,\"checkpoint_path\":\"checkpoint."
-                                "pt\"}' > \"$out/progress.json\"\n"
-                                "printf second; printf '{\"best_checkpoint\":\"best.pt\"}' > \"$out/results.json\"\n");
+  "out=''; while [ $# -gt 0 ]; do [ \"$1\" = '--output-dir' ] && { out=\"$2\"; break; }; shift; done\n"
+  "read ignored < \"$(dirname \"$out\")/gate\"\n"
+  "printf first; printf "
+  "'{\"phase\":\"training\",\"completed_batches\":1,\"total_batches\":2,\"checkpoint_path\":\"checkpoint."
+  "pt\"}' > \"$out/progress.json\"\n"
+  "printf second; printf '{\"best_checkpoint\":\"best.pt\"}' > \"$out/results.json\"\n");
  auto client = TrainProcessClient::launch(train_request(output), executable);
  {
   std::ofstream gate(temp.path() / "gate");
@@ -985,10 +970,10 @@ TEST_CASE("Train process client rejects oversized public progress fields", "[gui
  std::filesystem::create_directories(output);
  REQUIRE(::mkfifo((temp.path() / "gate").c_str(), 0600) == 0);
  const auto executable = script(temp,
-                                "out=''; while [ $# -gt 0 ]; do [ \"$1\" = '--output-dir' ] && { out=\"$2\"; break; }; shift; done\n"
-                                "read ignored < \"$(dirname \"$out\")/gate\"\n"
-                                "long=$(yes x | tr -d '\\n' | head -c 4097)\n"
-                                "printf '{\"phase\":\"%s\",\"checkpoint_path\":\"checkpoint.pt\"}' \"$long\" > \"$out/progress.json\"\n");
+  "out=''; while [ $# -gt 0 ]; do [ \"$1\" = '--output-dir' ] && { out=\"$2\"; break; }; shift; done\n"
+  "read ignored < \"$(dirname \"$out\")/gate\"\n"
+  "long=$(yes x | tr -d '\\n' | head -c 4097)\n"
+  "printf '{\"phase\":\"%s\",\"checkpoint_path\":\"checkpoint.pt\"}' \"$long\" > \"$out/progress.json\"\n");
  auto client = TrainProcessClient::launch(train_request(output), executable);
  {
   std::ofstream gate(temp.path() / "gate");
@@ -1003,10 +988,10 @@ TEST_CASE("Train process client rejects oversized public checkpoint paths", "[gu
  std::filesystem::create_directories(output);
  REQUIRE(::mkfifo((temp.path() / "gate").c_str(), 0600) == 0);
  const auto executable = script(temp,
-                                "out=''; while [ $# -gt 0 ]; do [ \"$1\" = '--output-dir' ] && { out=\"$2\"; break; }; shift; done\n"
-                                "read ignored < \"$(dirname \"$out\")/gate\"\n"
-                                "long=$(yes x | tr -d '\\n' | head -c 4097)\n"
-                                "printf '{\"phase\":\"training\",\"checkpoint_path\":\"%s\"}' \"$long\" > \"$out/progress.json\"\n");
+  "out=''; while [ $# -gt 0 ]; do [ \"$1\" = '--output-dir' ] && { out=\"$2\"; break; }; shift; done\n"
+  "read ignored < \"$(dirname \"$out\")/gate\"\n"
+  "long=$(yes x | tr -d '\\n' | head -c 4097)\n"
+  "printf '{\"phase\":\"training\",\"checkpoint_path\":\"%s\"}' \"$long\" > \"$out/progress.json\"\n");
  auto client = TrainProcessClient::launch(train_request(output), executable);
  {
   std::ofstream gate(temp.path() / "gate");
@@ -1060,8 +1045,8 @@ TEST_CASE("Train process client destructor reaps a live process group", "[gui][s
 TEST_CASE("Train observes persistence failure beyond bounded console output without a progress file", "[gui][services][train]") {
  mmltk::testsupport::ScopedTempDir temp("mmltk-train-persistence-marker");
  const auto executable = script(temp,
-                                "head -c 131064 /dev/zero\n"
-                                "printf '\\nMMLTK_TRAIN_PERSISTENCE_FAILED_V1\\n'\n");
+  "head -c 131064 /dev/zero\n"
+  "printf '\\nMMLTK_TRAIN_PERSISTENCE_FAILED_V1\\n'\n");
  auto client = TrainProcessClient::launch(train_request(temp.path() / "output"), executable);
  auto [source, token] = TrainProcessStopSource::Mint();
  const auto result = client.Run(std::move(token));
@@ -1073,8 +1058,7 @@ TEST_CASE("Train observes persistence failure beyond bounded console output with
 }
 TEST_CASE("artifact benchmark requests admit canonical selections and Directory ignores retained choices", "[gui][services][benchmark]") {
  namespace data = mmltk::backend::data;
- ArtifactCompileRequest request{
-  .kind = mmltk::controller::services::ArtifactCompileKind::Benchmark, .source = "/source", .output = "/output", .preset = "rf-detr-nano", .resolution = 384U};
+ ArtifactCompileRequest request{.kind = mmltk::controller::services::ArtifactCompileKind::Benchmark, .source = "/source", .output = "/output", .preset = "rf-detr-nano", .resolution = 384U};
  for (const auto dataset : {data::BenchmarkDatasetVariant::CocoCustom, data::BenchmarkDatasetVariant::Coconut}) {
   for (const auto validation : {data::CoconutValidation::Coconut, data::CoconutValidation::Stock, data::CoconutValidation::CoconutStock}) {
    request.benchmark_selection = {dataset, validation};
@@ -1187,13 +1171,8 @@ TEST_CASE("real ranged HTTP restart reaches the bounded artifact activity as a r
  std::vector<std::uint8_t> payload(4096U);
  for (std::size_t i = 0U; i < payload.size(); ++i) { payload[i] = static_cast<std::uint8_t>(i % 251U); }
  data::testsupport::HttpServer server(payload);
- DownloadRequest request{"objects365-restart",
-                         server.url("restart"),
-                         root.path() / "archive.bin",
-                         root.path() / "archive.lock",
-                         payload.size(),
-                         mmltk::common::io::sha256_hex(mmltk::common::io::sha256_bytes(payload)),
-                         1U};
+ DownloadRequest request{
+  "objects365-restart", server.url("restart"), root.path() / "archive.bin", root.path() / "archive.lock", payload.size(), mmltk::common::io::sha256_hex(mmltk::common::io::sha256_bytes(payload)), 1U};
  request.source = data::BenchmarkDatasetSource::kObjects365V2;
  constexpr std::uint64_t retained = 512U;
  {
@@ -1201,8 +1180,7 @@ TEST_CASE("real ranged HTTP restart reaches the bounded artifact activity as a r
   partial.write(reinterpret_cast<const char*>(payload.data()), static_cast<std::streamsize>(retained));
   REQUIRE(partial.good());
  }
- write_json_atomically(request.destination.string() + ".part.json",
-                       {{"schema_version", kBenchmarkCacheSchemaVersion}, {"url", request.url}, {"etag", "\"benchmark-test-etag\""}}, {});
+ write_json_atomically(request.destination.string() + ".part.json", {{"schema_version", kBenchmarkCacheSchemaVersion}, {"url", request.url}, {"etag", "\"benchmark-test-etag\""}}, {});
  server.RestartNextRangedTransfer();
  std::vector<DownloadProgress> observed;
  std::vector<domain::ArtifactProgress> displayed;

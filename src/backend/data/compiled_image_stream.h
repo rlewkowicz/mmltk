@@ -84,8 +84,7 @@ public:
  [[nodiscard]] mmltk::common::concurrency::WorkerPool& workers() noexcept;
  // Copies the compact read list into reused slot storage. At most one read
  // job per slot is admitted. Visible work can cancel queued prefetch jobs.
- void submit(std::size_t slot, const CompiledDataset& source, std::span<const CompiledImageRead> reads, ReadObserver observer,
-             CompletionObserver transfer = {nullptr, nullptr});
+ void submit(std::size_t slot, const CompiledDataset& source, std::span<const CompiledImageRead> reads, ReadObserver observer, CompletionObserver transfer = {nullptr, nullptr});
  void cancel_reads() noexcept;
  void cancel_read(std::size_t slot) noexcept;
  void wait_reads();

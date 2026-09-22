@@ -9,9 +9,8 @@ module;
 #include "src/backend/models/rfdetr/contract/workflow_requests.h"
 module mmltk.backend.models.rfdetr.inference.loader;
 namespace mmltk::backend::models::rfdetr::inference_detail {
-std::unique_ptr<mmltk::backend::data::DatasetLoader> make_loader(const std::filesystem::path& compiled_path, const std::size_t batch_size,
-                                                                 const InferenceExecutionConfig& execution, const std::size_t prefetch_factor,
-                                                                 std::shared_ptr<mmltk::frameworks::gpu::TerminalCudaRetirementOwner> retirement) {
+std::unique_ptr<mmltk::backend::data::DatasetLoader> make_loader(const std::filesystem::path& compiled_path, const std::size_t batch_size, const InferenceExecutionConfig& execution,
+ const std::size_t prefetch_factor, std::shared_ptr<mmltk::frameworks::gpu::TerminalCudaRetirementOwner> retirement) {
  if (compiled_path.empty() || batch_size == 0 || prefetch_factor == 0 || prefetch_factor > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
   throw std::invalid_argument("invalid RF-DETR inference loader setup");
  }

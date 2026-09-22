@@ -35,9 +35,7 @@ r::Prediction box(int category, std::array<float, 4> bounds, float score = 1.0F)
 }
 class EvaluationFixture final {
 public:
- explicit EvaluationFixture(const std::vector<std::vector<r::Prediction>>& images, int resolution = 128,
-                            const std::vector<std::vector<nlohmann::json>>& metadata = {})
-     : root_("evaluator-answers") {
+ explicit EvaluationFixture(const std::vector<std::vector<r::Prediction>>& images, int resolution = 128, const std::vector<std::vector<nlohmann::json>>& metadata = {}) : root_("evaluator-answers") {
   const data::testsupport::FixtureSpec fixture{root_.path().string(), "train", 128, 128, static_cast<int>(images.size()), 0, 0};
   data::testsupport::create_synthetic_dataset(fixture);
   constexpr std::array names{"person", "ret", "scope", "iron_sight", "anchor_dot", "glint"};
@@ -71,20 +69,15 @@ public:
   config.num_workers = 1;
   const auto plan = data::DatasetCompiler::prepare(config, {config.split});
   data::DatasetCompiler::compile(plan, 0U);
-  loader = std::make_unique<data::DatasetLoader>(data::DatasetLoader::Config{.compiled_path = data::testsupport::compiled_bin_path(fixture),
-                                                                             .batch_size = 1U,
-                                                                             .shuffle = false,
-                                                                             .prefetch_factor = 2,
-                                                                             .gather_workers = 1,
-                                                                             .loading = data::data_loading_options(true)});
+  loader = std::make_unique<data::DatasetLoader>(data::DatasetLoader::Config{
+   .compiled_path = data::testsupport::compiled_bin_path(fixture), .batch_size = 1U, .shuffle = false, .prefetch_factor = 2, .gather_workers = 1, .loading = data::data_loading_options(true)});
  }
  std::unique_ptr<data::DatasetLoader> loader;
 
 private:
  mmltk::testsupport::ScopedTempDir root_;
 };
-r::EvaluationDatasetOwner::ImageMatches match(r::EvaluationDatasetOwner& owner, std::int64_t image, const std::vector<r::Prediction>& predictions,
-                                              std::size_t cap, bool masks = false) {
+r::EvaluationDatasetOwner::ImageMatches match(r::EvaluationDatasetOwner& owner, std::int64_t image, const std::vector<r::Prediction>& predictions, std::size_t cap, bool masks = false) {
  std::vector<float> scores, boxes;
  std::vector<std::int64_t> labels;
  for (const auto& prediction : predictions) {
@@ -93,10 +86,10 @@ r::EvaluationDatasetOwner::ImageMatches match(r::EvaluationDatasetOwner& owner, 
   boxes.insert(boxes.end(), prediction.bbox_xyxy.begin(), prediction.bbox_xyxy.end());
  }
  return owner.match_predictions(image, {static_cast<int>(image + 1), scores.data(), labels.data(), boxes.data(), scores.size()}, std::nullopt, cap,
-                                masks ? std::span<const r::Prediction>{predictions} : std::span<const r::Prediction>{});
+  masks ? std::span<const r::Prediction>{predictions} : std::span<const r::Prediction>{});
 }
-const r::EvaluationMetricDetail& row(const std::vector<r::EvaluationMetricDetail>& rows, r::EvaluationArea area, std::optional<std::uint32_t> category,
-                                     r::EvaluationMetricKind kind = r::EvaluationMetricKind::Box) {
+const r::EvaluationMetricDetail& row(
+ const std::vector<r::EvaluationMetricDetail>& rows, r::EvaluationArea area, std::optional<std::uint32_t> category, r::EvaluationMetricKind kind = r::EvaluationMetricKind::Box) {
  const auto found = std::ranges::find_if(rows, [&](const auto& value) { return value.area == area && value.category == category && value.kind == kind; });
  REQUIRE(found != rows.end());
  return *found;
@@ -170,10 +163,8 @@ TEST_CASE("evaluation preserves COCO GT ties and upstream float64 confidence bou
  CHECK(summary.bbox.confidence.recall == Approx(1.0));
  for (const auto [score, threshold] : std::array<std::pair<float, double>, 4>{{{.60F, .61}, {.58F, .58}, {.5F, .51}, {0.0F, .01}}}) {
   owner.clear_predictions();
-  owner.merge_matches(match(owner, 0,
-                            {box(0, {0, 0, 20, 20}, 1.0F), box(0, {10, 0, 30, 20}, 1.0F), box(0, {0, 0, 20, 20}, score),
-                             box(0, {0, 0, 20, 20}, std::numeric_limits<float>::quiet_NaN())},
-                            10));
+  owner.merge_matches(
+   match(owner, 0, {box(0, {0, 0, 20, 20}, 1.0F), box(0, {10, 0, 30, 20}, 1.0F), box(0, {0, 0, 20, 20}, score), box(0, {0, 0, 20, 20}, std::numeric_limits<float>::quiet_NaN())}, 10));
   summary = owner.evaluate(10, r::EvaluationDetailRetention::Detailed);
   CHECK(summary.bbox.confidence_threshold == Approx(threshold));
   CHECK(summary.bbox.confidence.f1 == Approx(1.0));
@@ -233,8 +224,7 @@ TEST_CASE("compact and detailed evaluation share all summary values and retain o
  const auto permutation = selected->permutation_to(*catalog);
  CHECK(permutation.front() == catalog->size() - 1U);
  CHECK(permutation.back() == 0U);
- auto predictions = std::vector{box(static_cast<int>(permutation.back()), {0, 0, 32, 32}, .9F),
-                                box(static_cast<int>(permutation.front()), {32, 32, 96, 96}, .7F), box(0, {0, 0, 32, 32}, .7F)};
+ auto predictions = std::vector{box(static_cast<int>(permutation.back()), {0, 0, 32, 32}, .9F), box(static_cast<int>(permutation.front()), {32, 32, 96, 96}, .7F), box(0, {0, 0, 32, 32}, .7F)};
  owner.merge_matches(match(owner, 0, predictions, 10U, true));
  // Input replacement and loader destruction do not relabel the evaluated run.
  selected = std::make_shared<const data::catalog::ClassCatalog>(std::vector<std::string>{"later input"});
@@ -289,8 +279,7 @@ TEST_CASE("each native double IoU threshold is inclusive at its exact rational b
 TEST_CASE("COCO crowds repeat ignore matches while ordinary annotations retain priority", "[rfdetr][evaluation][gpu]") {
  const auto crowd = box(0, {0, 0, 128, 128});
  const auto ordinary = box(0, {10, 10, 30, 30});
- EvaluationFixture fixture({{crowd, ordinary, box(1, {0, 0, 128, 128})}}, 128,
-                           {{{{"iscrowd", true}}, {{"ignore", true}}, {{"iscrowd", true}, {"ignore", false}}}});
+ EvaluationFixture fixture({{crowd, ordinary, box(1, {0, 0, 128, 128})}}, 128, {{{{"iscrowd", true}}, {{"ignore", true}}, {{"iscrowd", true}, {"ignore", false}}}});
  r::EvaluationDatasetOwner owner(*fixture.loader, r::EvaluationMetricSet::BBoxAndMask);
  CHECK(fixture.loader->label_data()[1].raw_ignore());
  const auto prediction = box(0, {10, 10, 28, 30}, .9F);

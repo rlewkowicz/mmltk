@@ -36,12 +36,10 @@ struct FileDigests final {
  Sha256Digest sha256;
  std::string md5;
 };
-[[nodiscard]] std::optional<FileDigests> try_file_digests(
- const std::filesystem::path& path, bool include_md5, std::function_ref<bool()> cancelled = +[]() noexcept { return false; });
+[[nodiscard]] std::optional<FileDigests> try_file_digests(const std::filesystem::path& path, bool include_md5, std::function_ref<bool()> cancelled = +[]() noexcept { return false; });
 [[nodiscard]] Sha256Digest sha256_bytes(std::span<const std::uint8_t> bytes);
 [[nodiscard]] Sha256Digest sha256_file(const std::filesystem::path& path, std::function_ref<bool()> cancelled = +[]() noexcept { return false; });
-[[nodiscard]] std::optional<Sha256Digest> try_sha256_file(
- const std::filesystem::path& path, std::function_ref<bool()> cancelled = +[]() noexcept { return false; });
+[[nodiscard]] std::optional<Sha256Digest> try_sha256_file(const std::filesystem::path& path, std::function_ref<bool()> cancelled = +[]() noexcept { return false; });
 [[nodiscard]] std::string sha256_hex(const Sha256Digest& digest);
 [[nodiscard]] Sha256Digest parse_sha256_hex(const std::string& value);
 }  // namespace mmltk::common::io

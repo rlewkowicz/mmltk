@@ -88,19 +88,18 @@ void write_metric_line(FILE* out, const std::string& name, const Metric& metric)
   const double avg_ms = total_ms / static_cast<double>(metric.calls);
   const double min_ms = static_cast<double>(metric.min_ns) / 1.0e6;
   const double max_ms = static_cast<double>(metric.max_ns) / 1.0e6;
-  std::fprintf(out, " calls=%llu total_ms=%.3f avg_ms=%.3f min_ms=%.3f max_ms=%.3f", static_cast<unsigned long long>(metric.calls), total_ms, avg_ms, min_ms,
-               max_ms);
+  std::fprintf(out, " calls=%llu total_ms=%.3f avg_ms=%.3f min_ms=%.3f max_ms=%.3f", static_cast<unsigned long long>(metric.calls), total_ms, avg_ms, min_ms, max_ms);
  }
  if (metric.has_value) {
   std::fprintf(out, " value_count=%llu value_sum=%llu value_last=%llu value_min=%llu value_max=%llu", static_cast<unsigned long long>(metric.value_count),
-               static_cast<unsigned long long>(metric.value_sum), static_cast<unsigned long long>(metric.value_last),
-               static_cast<unsigned long long>(metric.value_min), static_cast<unsigned long long>(metric.value_max));
+   static_cast<unsigned long long>(metric.value_sum), static_cast<unsigned long long>(metric.value_last), static_cast<unsigned long long>(metric.value_min),
+   static_cast<unsigned long long>(metric.value_max));
  }
  std::fputc('\n', out);
 }
 void write_run_block(FILE* out, const RunSnapshot& run) {
- std::fprintf(out, "=== mmltk profile build=%s pid=%d run=%s iteration=%s total_ms=%.3f ===\n", MMLTK_BUILD_CONFIG, static_cast<int>(::getpid()),
-              run.run_label.c_str(), run.iteration_label.c_str(), static_cast<double>(run.total_ns) / 1.0e6);
+ std::fprintf(out, "=== mmltk profile build=%s pid=%d run=%s iteration=%s total_ms=%.3f ===\n", MMLTK_BUILD_CONFIG, static_cast<int>(::getpid()), run.run_label.c_str(), run.iteration_label.c_str(),
+  static_cast<double>(run.total_ns) / 1.0e6);
  for (const auto& entry : run.items) { write_metric_line(out, entry.first, entry.second); }
  std::fputc('\n', out);
 }
@@ -132,8 +131,8 @@ void write_aggregate_block(FILE* out, const std::string& run_label, const std::v
  items.reserve(aggregate_metrics.size());
  for (const auto& entry : aggregate_metrics) { items.emplace_back(entry.first, entry.second); }
  std::ranges::sort(items, [](const auto& lhs, const auto& rhs) { return lhs.first < rhs.first; });
- std::fprintf(out, "=== mmltk profile aggregate build=%s pid=%d run=%s runs=%zu process_total_ms=%.3f ===\n", MMLTK_BUILD_CONFIG, static_cast<int>(::getpid()),
-              run_label.c_str(), runs.size(), static_cast<double>(process_total_ns) / 1.0e6);
+ std::fprintf(out, "=== mmltk profile aggregate build=%s pid=%d run=%s runs=%zu process_total_ms=%.3f ===\n", MMLTK_BUILD_CONFIG, static_cast<int>(::getpid()), run_label.c_str(), runs.size(),
+  static_cast<double>(process_total_ns) / 1.0e6);
  for (const auto& entry : items) {
   const AggregateMetric& metric = entry.second;
   std::fprintf(out, "%s runs=%llu", entry.first.c_str(), static_cast<unsigned long long>(metric.runs));
@@ -143,17 +142,15 @@ void write_aggregate_block(FILE* out, const std::string& run_label, const std::v
    const double total_ms_min_per_run = static_cast<double>(metric.total_ns_min_per_run) / 1.0e6;
    const double total_ms_max_per_run = static_cast<double>(metric.total_ns_max_per_run) / 1.0e6;
    std::fprintf(out,
-                " calls_total=%llu calls_avg_per_run=%.3f total_ms_avg_per_run=%.3f avg_ms_per_call=%.3f "
-                "total_ms_min_per_run=%.3f total_ms_max_per_run=%.3f",
-                static_cast<unsigned long long>(metric.calls_total), static_cast<double>(metric.calls_total) / static_cast<double>(metric.runs),
-                total_ms_avg_per_run, avg_ms_per_call, total_ms_min_per_run, total_ms_max_per_run);
+    " calls_total=%llu calls_avg_per_run=%.3f total_ms_avg_per_run=%.3f avg_ms_per_call=%.3f "
+    "total_ms_min_per_run=%.3f total_ms_max_per_run=%.3f",
+    static_cast<unsigned long long>(metric.calls_total), static_cast<double>(metric.calls_total) / static_cast<double>(metric.runs), total_ms_avg_per_run, avg_ms_per_call, total_ms_min_per_run,
+    total_ms_max_per_run);
   }
   if (metric.has_value) {
-   std::fprintf(out, " value_count_total=%llu value_avg=%.3f value_last_avg=%.3f value_min=%llu value_max=%llu",
-                static_cast<unsigned long long>(metric.value_count_total),
-                static_cast<double>(metric.value_sum_total) / static_cast<double>(metric.value_count_total),
-                static_cast<double>(metric.value_last_sum) / static_cast<double>(metric.value_runs), static_cast<unsigned long long>(metric.value_min),
-                static_cast<unsigned long long>(metric.value_max));
+   std::fprintf(out, " value_count_total=%llu value_avg=%.3f value_last_avg=%.3f value_min=%llu value_max=%llu", static_cast<unsigned long long>(metric.value_count_total),
+    static_cast<double>(metric.value_sum_total) / static_cast<double>(metric.value_count_total), static_cast<double>(metric.value_last_sum) / static_cast<double>(metric.value_runs),
+    static_cast<unsigned long long>(metric.value_min), static_cast<unsigned long long>(metric.value_max));
   }
   std::fputc('\n', out);
  }

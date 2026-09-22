@@ -127,17 +127,12 @@ void GalleryThumbnailCache::Restore(const std::size_t slot, Entry entry) noexcep
  next_[slot] = head;
  head = slot;
 }
-void GalleryThumbnailCache::Complete(const std::size_t position, const std::uint32_t compiled_index, std::shared_ptr<const GalleryTileMeaning> meaning,
-                                     const std::uint64_t semantic_identity, const std::uint8_t bank, const std::uint8_t semantic_bank) {
+void GalleryThumbnailCache::Complete(const std::size_t position, const std::uint32_t compiled_index, std::shared_ptr<const GalleryTileMeaning> meaning, const std::uint64_t semantic_identity,
+ const std::uint8_t bank, const std::uint8_t semantic_bank) {
  if (bank > 1U || semantic_bank > 1U) throw std::invalid_argument("Explore cache plane version is invalid");
  const auto slot = Assign(compiled_index);
  Save(slot);
- entries_.at(slot) = {.position = position,
-                      .compiled_index = compiled_index,
-                      .bank = bank,
-                      .semantic_bank = semantic_bank,
-                      .meaning = std::move(meaning),
-                      .semantic_identity = semantic_identity};
+ entries_.at(slot) = {.position = position, .compiled_index = compiled_index, .bank = bank, .semantic_bank = semantic_bank, .meaning = std::move(meaning), .semantic_identity = semantic_identity};
 }
 void GalleryThumbnailCache::UpdateSemantics(const std::size_t position, const std::uint64_t semantic_identity, const std::uint8_t semantic_bank) {
  if (semantic_bank > 1U) throw std::invalid_argument("Explore cache plane version is invalid");
@@ -150,8 +145,7 @@ void GalleryThumbnailCache::UpdateSemantics(const std::size_t position, const st
 }
 std::size_t GalleryThumbnailCache::MetadataBytes() const noexcept {
  return entries_.capacity() * sizeof(Entry) + undo_.capacity() * sizeof(Undo) +
-        (buckets_.capacity() + next_.capacity() + demand_slots_.capacity() + prior_demand_.capacity() + undo_indices_.capacity()) * sizeof(std::size_t) +
-        (pinned_.capacity() + 7U) / 8U;
+        (buckets_.capacity() + next_.capacity() + demand_slots_.capacity() + prior_demand_.capacity() + undo_indices_.capacity()) * sizeof(std::size_t) + (pinned_.capacity() + 7U) / 8U;
 }
 void GalleryThumbnailCache::BeginUpdate() {
  if (updating_) throw std::logic_error("Explore cache update is already active");
@@ -183,8 +177,7 @@ void GalleryThumbnailCache::RollbackUpdate() noexcept {
  for (const auto slot : demand_slots_) pinned_[slot] = true;
  CommitUpdate();
 }
-std::size_t GalleryThumbnailCache::MeaningBytes(const GalleryThumbnailCache* other,
-                                                const std::span<const std::shared_ptr<const GalleryTileMeaning>> additional_meanings) const {
+std::size_t GalleryThumbnailCache::MeaningBytes(const GalleryThumbnailCache* other, const std::span<const std::shared_ptr<const GalleryTileMeaning>> additional_meanings) const {
  if (additional_meanings.size() > 2U * kMaximumCards) throw std::length_error("Explore retained meaning accounting exceeds the owner bound");
  std::size_t bytes = MetadataBytes();
  struct Allocation {
@@ -195,8 +188,7 @@ std::size_t GalleryThumbnailCache::MeaningBytes(const GalleryThumbnailCache* oth
  std::size_t count = 0U;
  const auto meaning = [&](const auto& value) {
   if (value)
-   allocations[count++] = {value.get(), GallerySharedBytes(value) +
-                                         value->annotations.capacity() * sizeof(decltype(GalleryTileMeaning::annotations)::value_type) +
+   allocations[count++] = {value.get(), GallerySharedBytes(value) + value->annotations.capacity() * sizeof(decltype(GalleryTileMeaning::annotations)::value_type) +
                                          value->runs.capacity() * sizeof(decltype(GalleryTileMeaning::runs)::value_type)};
  };
  const auto visit = [&](const auto& entries) {

@@ -70,15 +70,14 @@ TEST_CASE("Predict revision capacity preserves cancellation and terminal observa
 }
 class UnsafePredictRuntime final : public PredictRuntime {
 public:
- UnsafePredictRuntime(bool on_close, std::shared_ptr<int> custody, bool preview_terminal = false)
-     : on_close_(on_close), preview_terminal_(preview_terminal), custody_(std::move(custody)) {}
+ UnsafePredictRuntime(bool on_close, std::shared_ptr<int> custody, bool preview_terminal = false) : on_close_(on_close), preview_terminal_(preview_terminal), custody_(std::move(custody)) {}
  void Close() noexcept override {
   ++*custody_;
   unsafe_ = true;
  }
  [[nodiscard]] bool HasUnsafeCustody() const noexcept override { return unsafe_; }
- contracts::ComputeTerminal Run(mmltk::backend::models::rfdetr::PredictRequest, std::stop_token, const ComputeProgressSink&, const ProductSink&,
-                                const PlaybackGate&, VisualExtent, const ContextProvider&, const PreviewRetirement& retirement) override {
+ contracts::ComputeTerminal Run(mmltk::backend::models::rfdetr::PredictRequest, std::stop_token, const ComputeProgressSink&, const ProductSink&, const PlaybackGate&, VisualExtent,
+  const ContextProvider&, const PreviewRetirement& retirement) override {
   if (preview_terminal_) {
    auto lease = mmltk::frameworks::gpu::ReserveTerminalCudaLease(*retirement);
    auto retained = custody_;
@@ -106,18 +105,14 @@ TEST_CASE("Predict seals unsafe execution and close custody across repeated admi
  std::atomic_size_t constructions = 0U;
  std::promise<void> failed;
  {
-  PredictSystem prediction{settings,
-                           dataset,
-                           model,
-                           {.device = 0, .maximum_width = 64U, .maximum_height = 64U},
-                           [&] {
-                            ++constructions;
-                            return std::make_unique<UnsafePredictRuntime>(on_close, custody, preview_terminal);
-                           },
-                           [&](PredictSystem::event_type event) {
-                            if (const auto* failure = std::get_if<PredictFailed>(&event); failure && !failure->snapshot.operation.active)
-                             mmltk::testsupport::release_test_promise(failed);
-                           }};
+  PredictSystem prediction{settings, dataset, model, {.device = 0, .maximum_width = 64U, .maximum_height = 64U},
+   [&] {
+    ++constructions;
+    return std::make_unique<UnsafePredictRuntime>(on_close, custody, preview_terminal);
+   },
+   [&](PredictSystem::event_type event) {
+    if (const auto* failure = std::get_if<PredictFailed>(&event); failure && !failure->snapshot.operation.active) mmltk::testsupport::release_test_promise(failed);
+   }};
   static_cast<void>(prediction.Start({}));
   mmltk::testsupport::await_test_promise(failed, "unsafe Predict settlement");
   REQUIRE_FALSE(prediction.snapshot().operation.active);
@@ -148,8 +143,7 @@ TEST_CASE("receiver retirement outlives concurrent preview pool destruction", "[
  REQUIRE(raw);
  auto draw = std::async(std::launch::async, [raw, context] {
   try {
-   gpu::SystemImageRuntime runtime(
-    {.device = 0, .context_mode = gpu::DeviceContextMode::Isolated, .output_layout = gpu::ImageProductLayout::CleanAndSemantic, .adopted_context = context});
+   gpu::SystemImageRuntime runtime({.device = 0, .context_mode = gpu::DeviceContextMode::Isolated, .output_layout = gpu::ImageProductLayout::CleanAndSemantic, .adopted_context = context});
    auto candidate = runtime.AcquireOutput();
    raw->Draw(runtime, candidate);
   } catch (...) { return std::current_exception(); }
@@ -191,26 +185,23 @@ TEST_CASE("late receiver custody seals Predict admission while optional visual f
  std::atomic_size_t constructions = 0U;
  std::promise<void> first_frame, first_done, second_done, visual_failure, recovered;
  {
-  PredictSystem prediction{settings,
-                           dataset,
-                           model,
-                           {.device = 0, .maximum_width = 64U, .maximum_height = 64U},
-                           [&] {
-                            ++constructions;
-                            return std::make_unique<FakePredictRuntime>(PredictionScenario{.compute = {.gate = gate}, .receiver_fault = fault});
-                           },
-                           [&](PredictSystem::event_type event) {
-                            if (const auto* changed = std::get_if<PredictChanged>(&event)) {
-                             const auto& state = changed->snapshot;
-                             if (state.frame.valid() && state.operation.generation_frontier == 1U) mmltk::testsupport::release_test_promise(first_frame);
-                             if (!state.operation.active) {
-                              if (state.operation.generation_frontier == 1U) mmltk::testsupport::release_test_promise(first_done);
-                              if (state.operation.generation_frontier == 2U) mmltk::testsupport::release_test_promise(second_done);
-                             }
-                             if (state.operation.generation_frontier == 3U && state.frame.revision > 1U) mmltk::testsupport::release_test_promise(recovered);
-                            }
-                            if (std::holds_alternative<PredictFailed>(event)) mmltk::testsupport::release_test_promise(visual_failure);
-                           }};
+  PredictSystem prediction{settings, dataset, model, {.device = 0, .maximum_width = 64U, .maximum_height = 64U},
+   [&] {
+    ++constructions;
+    return std::make_unique<FakePredictRuntime>(PredictionScenario{.compute = {.gate = gate}, .receiver_fault = fault});
+   },
+   [&](PredictSystem::event_type event) {
+    if (const auto* changed = std::get_if<PredictChanged>(&event)) {
+     const auto& state = changed->snapshot;
+     if (state.frame.valid() && state.operation.generation_frontier == 1U) mmltk::testsupport::release_test_promise(first_frame);
+     if (!state.operation.active) {
+      if (state.operation.generation_frontier == 1U) mmltk::testsupport::release_test_promise(first_done);
+      if (state.operation.generation_frontier == 2U) mmltk::testsupport::release_test_promise(second_done);
+     }
+     if (state.operation.generation_frontier == 3U && state.frame.revision > 1U) mmltk::testsupport::release_test_promise(recovered);
+    }
+    if (std::holds_alternative<PredictFailed>(event)) mmltk::testsupport::release_test_promise(visual_failure);
+   }};
   const mmltk::testsupport::ScopedTestCleanup stop{[&] {
    fault->upload.Release();
    prediction.Shutdown();
@@ -261,16 +252,12 @@ TEST_CASE("prediction preview refusal preserves successful inference completion"
  gate->Release();
  std::promise<PredictSnapshot> completed;
  std::promise<PredictFailed> preview_failed;
- PredictSystem prediction{settings,
-                          dataset,
-                          model,
-                          {.device = 0, .maximum_width = 64U, .maximum_height = 64U},
-                          [gate] { return std::make_unique<FakePredictRuntime>(PredictionScenario{.compute = {.gate = gate}, .refuse_preview = true}); },
-                          [&](PredictSystem::event_type event) {
-                           if (auto* failure = std::get_if<PredictFailed>(&event)) preview_failed.set_value(std::move(*failure));
-                           if (auto* changed = std::get_if<PredictChanged>(&event); changed && !changed->snapshot.operation.active)
-                            completed.set_value(std::move(changed->snapshot));
-                          }};
+ PredictSystem prediction{settings, dataset, model, {.device = 0, .maximum_width = 64U, .maximum_height = 64U},
+  [gate] { return std::make_unique<FakePredictRuntime>(PredictionScenario{.compute = {.gate = gate}, .refuse_preview = true}); },
+  [&](PredictSystem::event_type event) {
+   if (auto* failure = std::get_if<PredictFailed>(&event)) preview_failed.set_value(std::move(*failure));
+   if (auto* changed = std::get_if<PredictChanged>(&event); changed && !changed->snapshot.operation.active) completed.set_value(std::move(changed->snapshot));
+  }};
  static_cast<void>(prediction.Start({}));
  const auto failure = mmltk::testsupport::await_test_promise(preview_failed, "prediction preview refusal");
  CHECK(failure.snapshot.operation.terminal.outcome != contracts::ComputeOperationOutcome::Failed);
@@ -299,8 +286,7 @@ TEST_CASE("prediction raw custody is bounded under retained readers and preserve
   REQUIRE(reader);
  }
  CHECK_FALSE(pool->Capture(source, {2U, 2U}, 0U, {}, {}, classes, 2, nullptr, custody));
- gpu::SystemImageRuntime runtime(
-  {.device = 0, .context_mode = gpu::DeviceContextMode::Isolated, .output_layout = gpu::ImageProductLayout::CleanAndSemantic, .adopted_context = context});
+ gpu::SystemImageRuntime runtime({.device = 0, .context_mode = gpu::DeviceContextMode::Isolated, .output_layout = gpu::ImageProductLayout::CleanAndSemantic, .adopted_context = context});
  auto candidate = runtime.AcquireOutput();
  readers[0]->Draw(runtime, candidate);
  const auto complete = runtime.CommitOutput(std::move(candidate));
@@ -315,10 +301,8 @@ TEST_CASE("prediction raw custody is bounded under retained readers and preserve
  CHECK(rgba == std::array<std::uint8_t, 16U>{255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 255});
  // A replacement renderer rejects a pending old-context frame before touching its candidate.
  gpu::DeviceContext replacement_context(0, gpu::cuda_image_copy_backend(), gpu::DeviceContextMode::Isolated, execution.placement.numa_node, execution);
- gpu::SystemImageRuntime replacement({.device = 0,
-                                      .context_mode = gpu::DeviceContextMode::Isolated,
-                                      .output_layout = gpu::ImageProductLayout::CleanAndSemantic,
-                                      .adopted_context = replacement_context});
+ gpu::SystemImageRuntime replacement(
+  {.device = 0, .context_mode = gpu::DeviceContextMode::Isolated, .output_layout = gpu::ImageProductLayout::CleanAndSemantic, .adopted_context = replacement_context});
  CHECK(readers[0]->CompatibleWith(runtime));
  CHECK_FALSE(readers[0]->CompatibleWith(replacement));
  gpu::SystemImageRuntime::OutputCandidate untouched;
@@ -383,8 +367,7 @@ TEST_CASE("prediction transfer faults settle or retain exact source custody", "[
  }
  fault.Reset({.fail_copy = 2, .fail_settle = true});
  int stopped = 0;
- CHECK_THROWS_AS(pool->Capture(source, {2, 2}, 0, predictions, annotations, classes, 1, nullptr, custody, &CountPredictionSourceStop, &stopped),
-                 runtime::CudaOperationError);
+ CHECK_THROWS_AS(pool->Capture(source, {2, 2}, 0, predictions, annotations, classes, 1, nullptr, custody, &CountPredictionSourceStop, &stopped), runtime::CudaOperationError);
  CHECK(stopped == 1);
  CHECK(pool->HasUnsafeSourceCustody());
  const auto attempted = fault.copies;
@@ -414,9 +397,7 @@ TEST_CASE("preview slot reuse orders cross-stream writes and preserves fault cus
  for (int stage : {0, 1, 2, 3, 4}) {
   fault.Reset();
   mmltk::controller::detail::PredictionPreviewPool pool(execution, context, PredictionTransferFault::Operations(), {}, 1U);
-  auto capture = [&](cudaStream_t stream) {
-   return pool.Capture(input.pixels(), {2U, 2U}, reinterpret_cast<std::uintptr_t>(stream), {}, input.annotations(), classes, 1, nullptr, input.custody());
-  };
+  auto capture = [&](cudaStream_t stream) { return pool.Capture(input.pixels(), {2U, 2U}, reinterpret_cast<std::uintptr_t>(stream), {}, input.annotations(), classes, 1, nullptr, input.custody()); };
   auto previous = capture(first.get());
   REQUIRE(previous);
   previous.reset();  // The peer copy need not have completed or been drawn.
@@ -448,8 +429,7 @@ TEST_CASE("preview recapture invalidates retained scratch and destination region
  PredictionReceiverFault fault;
  ScopedPredictionReceiverFault receiver(fault);
  detail::PredictionPreviewPool pool(execution, context, PredictionReceiverFault::Operations(), {}, 1U);
- gpu::SystemImageRuntime runtime(
-  {.device = 0, .output_layout = gpu::ImageProductLayout::CleanAndSemantic, .output_buffer_count = 2U, .adopted_context = context});
+ gpu::SystemImageRuntime runtime({.device = 0, .output_layout = gpu::ImageProductLayout::CleanAndSemantic, .output_buffer_count = 2U, .adopted_context = context});
  Composition retained;
  const auto classes = std::make_shared<const mmltk::backend::data::catalog::ClassCatalog>(std::vector<std::string>{"sample"});
  const detail::PredictionPreviewFrame* slot = nullptr;
@@ -472,8 +452,7 @@ TEST_CASE("preview recapture invalidates retained scratch and destination region
    context.Bind();
    const auto clean = image.plane(0U).plane();
    std::array<std::array<std::uint8_t, 4U>, 16U> actual{};
-   REQUIRE(cudaMemcpy2D(actual.data(), 16U, reinterpret_cast<const void*>(clean.data), clean.descriptor.pitch_bytes, 16U, 4U, cudaMemcpyDeviceToHost) ==
-           cudaSuccess);
+   REQUIRE(cudaMemcpy2D(actual.data(), 16U, reinterpret_cast<const void*>(clean.data), clean.descriptor.pitch_bytes, 16U, 4U, cudaMemcpyDeviceToHost) == cudaSuccess);
    std::array<std::uint8_t, 4U> expected{0, 0, 0, 255};
    expected[generation] = 255U;
    CHECK(std::ranges::all_of(actual, [&](auto pixel) { return pixel == expected; }));
@@ -496,8 +475,7 @@ TEST_CASE("ordinary preview allocation refusal leaves its decoded source intact"
  auto raw = pool.Capture(nullptr, input.extent(), 0, {}, {}, classes, 1, input.rgb8(), source);
  REQUIRE(raw);
  CHECK(source.use_count() == 2);
- gpu::SystemImageRuntime runtime(
-  {.device = 0, .context_mode = gpu::DeviceContextMode::Isolated, .output_layout = gpu::ImageProductLayout::CleanAndSemantic, .adopted_context = context});
+ gpu::SystemImageRuntime runtime({.device = 0, .context_mode = gpu::DeviceContextMode::Isolated, .output_layout = gpu::ImageProductLayout::CleanAndSemantic, .adopted_context = context});
  auto candidate = runtime.AcquireOutput();
  CHECK_THROWS(raw->Draw(runtime, candidate));
  CHECK(input.rgb8()[0] == 255U);
@@ -523,9 +501,7 @@ TEST_CASE("preview context failure retains initialized state and source before r
  const bool terminal = GENERATE(false, true);
  enum class Stage { Capture, Draw, Destruction };
  const auto stage = GENERATE(Stage::Capture, Stage::Draw, Stage::Destruction);
- PredictionContextFault driver{query_failure ? PredictionContextFault::Failure::Query
-                               : terminal    ? PredictionContextFault::Failure::RestoreAlways
-                                             : PredictionContextFault::Failure::RestoreOnce};
+ PredictionContextFault driver{query_failure ? PredictionContextFault::Failure::Query : terminal ? PredictionContextFault::Failure::RestoreAlways : PredictionContextFault::Failure::RestoreOnce};
  const auto api = driver.Api();
  const auto execution = gpu::resolve_device_execution(0, mmltk::common::system::NumaTopology::Capture());
  gpu::DeviceContext context(0, gpu::cuda_image_copy_backend(), gpu::DeviceContextMode::Isolated, execution.placement.numa_node, execution);
@@ -602,17 +578,12 @@ TEST_CASE("Predict replacement pressure coalesces without overwriting its select
  std::promise<void> failed;
  std::atomic_size_t published = 0U;
  std::atomic_uint64_t last_revision = 0U;
- PredictSystem prediction{
-  settings,
-  dataset,
-  model,
-  {.device = 0, .maximum_width = 64U, .maximum_height = 64U},
+ PredictSystem prediction{settings, dataset, model, {.device = 0, .maximum_width = 64U, .maximum_height = 64U},
   [&] { return std::make_unique<FakePredictRuntime>(PredictionScenario{.compute = {.gate = gate}, .source_index = source_index, .labels = 1U}); },
   [&](PredictSystem::event_type event) {
    if (const auto* changed = std::get_if<PredictChanged>(&event)) {
     const auto& snapshot = changed->snapshot;
-    if (!snapshot.operation.active && snapshot.operation.generation_frontier <= done.size())
-     mmltk::testsupport::release_test_promise(done[snapshot.operation.generation_frontier - 1U]);
+    if (!snapshot.operation.active && snapshot.operation.generation_frontier <= done.size()) mmltk::testsupport::release_test_promise(done[snapshot.operation.generation_frontier - 1U]);
     if (snapshot.frame.valid() && snapshot.frame.revision > last_revision.load()) {
      last_revision = snapshot.frame.revision;
      const auto index = published.fetch_add(1U);

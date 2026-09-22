@@ -110,8 +110,7 @@ TEST_CASE("parallel range workers are pinned", "[common][concurrency][worker_poo
  const int requested_workers = std::min<int>(4, static_cast<int>(allowed.size()));
  REQUIRE(requested_workers >= 1);
  std::vector<std::vector<int>> masks(static_cast<std::size_t>(requested_workers));
- parallel_for_range_indexed<int>(0, requested_workers, requested_workers,
-                                 [&](const int worker, int, int) { masks[static_cast<std::size_t>(worker)] = allowed_cpu_set(); });
+ parallel_for_range_indexed<int>(0, requested_workers, requested_workers, [&](const int worker, int, int) { masks[static_cast<std::size_t>(worker)] = allowed_cpu_set(); });
  std::set<int> observed;
  for (const auto& mask : masks) {
   REQUIRE(mask.size() == 1);

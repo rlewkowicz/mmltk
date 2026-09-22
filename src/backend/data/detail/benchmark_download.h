@@ -66,8 +66,6 @@ struct DownloadResult {
 [[nodiscard]] DownloadRequest make_download_request(const BenchmarkCacheLayout&, std::string_view, const CatalogArtifact&);
 using DownloadProgressSink = std::function<void(const DownloadProgress&)>;
 [[nodiscard]] std::vector<DownloadResult> download_artifacts(const std::vector<DownloadRequest>& requests, std::size_t maximum_concurrency,
-                                                             mmltk::common::concurrency::CancellationObservation cancel_requested,
-                                                             const DownloadProgressSink& progress = {}, const BenchmarkTraceSink& trace = {});
-void invalidate_download_artifact(const DownloadRequest& request, mmltk::common::concurrency::CancellationObservation cancel_requested = {},
-                                  const BenchmarkTraceSink& trace = {});
+ mmltk::common::concurrency::CancellationObservation cancel_requested, const DownloadProgressSink& progress = {}, const BenchmarkTraceSink& trace = {});
+void invalidate_download_artifact(const DownloadRequest& request, mmltk::common::concurrency::CancellationObservation cancel_requested = {}, const BenchmarkTraceSink& trace = {});
 }  // namespace mmltk::backend::data::benchmark_internal

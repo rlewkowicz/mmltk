@@ -28,13 +28,11 @@ class HttpServer {
 public:
  // The payload is borrowed until Stop(); retain it and mutate only between settled transfers.
  explicit HttpServer(std::span<const std::uint8_t> payload) : HttpServer(payload, payload.size()) {}
- explicit HttpServer(const std::string& payload)
-     : HttpServer(std::span<const std::uint8_t>{reinterpret_cast<const std::uint8_t*>(payload.data()), payload.size()}) {}
+ explicit HttpServer(const std::string& payload) : HttpServer(std::span<const std::uint8_t>{reinterpret_cast<const std::uint8_t*>(payload.data()), payload.size()}) {}
  HttpServer(std::string&&) = delete;
  HttpServer(std::vector<std::uint8_t>&&) = delete;
  explicit HttpServer(std::size_t generated_bytes) : HttpServer({}, generated_bytes) {}
- HttpServer(std::span<const std::uint8_t> payload, std::size_t bytes)
-     : payload_(payload), payload_size_(bytes), listener_(::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0)) {
+ HttpServer(std::span<const std::uint8_t> payload, std::size_t bytes) : payload_(payload), payload_size_(bytes), listener_(::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0)) {
   require_condition(listener_.get() >= 0, "failed to create benchmark HTTP socket");
   const int reuse = 1;
   require_condition(::setsockopt(listener_.get(), SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse)) == 0, "failed to configure benchmark HTTP socket");
@@ -107,8 +105,7 @@ private:
   return true;
  }
  static void send_discarded_body(const int client, const std::string_view status, const std::size_t bytes, const std::string_view extra_headers = {}) {
-  const std::string header =
-   "HTTP/1.1 " + std::string(status) + "\r\nContent-Length: " + std::to_string(bytes) + "\r\n" + std::string(extra_headers) + "Connection: close\r\n\r\n";
+  const std::string header = "HTTP/1.1 " + std::string(status) + "\r\nContent-Length: " + std::to_string(bytes) + "\r\n" + std::string(extra_headers) + "Connection: close\r\n\r\n";
   const std::string body(bytes, '!');
   if (send_all(client, header.data(), header.size())) { (void)send_all(client, body.data(), body.size()); }
  }

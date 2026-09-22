@@ -35,8 +35,7 @@
 #include "src/frameworks/gpu/tests/device_execution_fixture.h"
 #include "src/backend/models/rfdetr/core/runtime.h"
 namespace mmltk::backend::models::rfdetr {
-torch::Tensor sample_packed_masks_cuda(const torch::Tensor& packed_mask_bits, int64_t height, int64_t width, const torch::Tensor& mask_indices,
-                                       const torch::Tensor& point_coords);
+torch::Tensor sample_packed_masks_cuda(const torch::Tensor& packed_mask_bits, int64_t height, int64_t width, const torch::Tensor& mask_indices, const torch::Tensor& point_coords);
 }
 namespace {
 using namespace torch::indexing;
@@ -107,14 +106,12 @@ mmltk::backend::models::rfdetr::PreparedTargets make_single_image_targets(const 
  return targets;
 }
 mmltk::backend::models::rfdetr::PreparedTargets make_targets() {
- return make_single_image_targets(torch::tensor({{0.5f, 0.5f, 0.2f, 0.2f}}, torch::TensorOptions().dtype(torch::kFloat32)),
-                                  torch::tensor({1}, torch::TensorOptions().dtype(torch::kInt64)),
-                                  torch::tensor({400.0f}, torch::TensorOptions().dtype(torch::kFloat32)));
+ return make_single_image_targets(torch::tensor({{0.5f, 0.5f, 0.2f, 0.2f}}, torch::TensorOptions().dtype(torch::kFloat32)), torch::tensor({1}, torch::TensorOptions().dtype(torch::kInt64)),
+  torch::tensor({400.0f}, torch::TensorOptions().dtype(torch::kFloat32)));
 }
 mmltk::backend::models::rfdetr::PreparedTargets make_multi_targets() {
  return make_single_image_targets(torch::tensor({{0.5f, 0.5f, 0.2f, 0.2f}, {0.2f, 0.2f, 0.1f, 0.12f}}, torch::TensorOptions().dtype(torch::kFloat32)),
-                                  torch::tensor({1, 2}, torch::TensorOptions().dtype(torch::kInt64)),
-                                  torch::tensor({400.0f, 120.0f}, torch::TensorOptions().dtype(torch::kFloat32)));
+  torch::tensor({1, 2}, torch::TensorOptions().dtype(torch::kInt64)), torch::tensor({400.0f, 120.0f}, torch::TensorOptions().dtype(torch::kFloat32)));
 }
 mmltk::backend::models::rfdetr::DetectionConfig make_config() {
  mmltk::backend::models::rfdetr::DetectionConfig config;
@@ -163,8 +160,7 @@ mmltk::backend::models::rfdetr::ModelOutputs make_distinct_layer_outputs() {
 mmltk::backend::models::rfdetr::ModelOutputs make_multi_match_outputs() {
  mmltk::backend::models::rfdetr::ModelOutputs outputs;
  outputs.main.pred_logits = torch::tensor({{{-5.0f, 8.0f, -5.0f}, {-5.0f, -5.0f, 8.0f}, {7.0f, -5.0f, -5.0f}}}, torch::TensorOptions().dtype(torch::kFloat32));
- outputs.main.pred_boxes =
-  torch::tensor({{{0.52f, 0.48f, 0.22f, 0.18f}, {0.18f, 0.22f, 0.12f, 0.08f}, {0.9f, 0.9f, 0.05f, 0.05f}}}, torch::TensorOptions().dtype(torch::kFloat32));
+ outputs.main.pred_boxes = torch::tensor({{{0.52f, 0.48f, 0.22f, 0.18f}, {0.18f, 0.22f, 0.12f, 0.08f}, {0.9f, 0.9f, 0.05f, 0.05f}}}, torch::TensorOptions().dtype(torch::kFloat32));
  return outputs;
 }
 mmltk::backend::models::rfdetr::ModelOutputs make_mask_outputs(int64_t height, int64_t width) {
@@ -212,8 +208,7 @@ void assert_single_trivial_match(const MatcherIndices& indices) {
  REQUIRE(indices[0].second.template item<int64_t>() == 0);
 }
 // Single-image targets with a packed mask that sets the given (y, x) cells of a height x width grid.
-mmltk::backend::models::rfdetr::PreparedTargets make_packed_mask_targets(const int64_t height, const int64_t width,
-                                                                         const std::initializer_list<std::pair<int64_t, int64_t>> cells) {
+mmltk::backend::models::rfdetr::PreparedTargets make_packed_mask_targets(const int64_t height, const int64_t width, const std::initializer_list<std::pair<int64_t, int64_t>> cells) {
  auto targets = make_targets();
  auto target_masks = torch::zeros({1, height, width}, torch::TensorOptions().dtype(torch::kFloat32));
  for (const auto& [y, x] : cells) { target_masks.index_put_({0, y, x}, 1.0f); }
@@ -333,8 +328,7 @@ void test_rectangular_matcher_layers_preserve_all_targets() {
  rfdetr::populate_default_detection_weight_dict(config);
  const auto float_options = torch::TensorOptions().dtype(torch::kFloat32);
  const auto integer_options = float_options.dtype(torch::kInt64);
- auto targets = make_single_image_targets(torch::full({target_count + 1, 4}, 0.2F, float_options), torch::zeros({target_count + 1}, integer_options),
-                                          torch::ones({target_count + 1}, float_options));
+ auto targets = make_single_image_targets(torch::full({target_count + 1, 4}, 0.2F, float_options), torch::zeros({target_count + 1}, integer_options), torch::ones({target_count + 1}, float_options));
  targets.resolved_query_count = 300;
  targets.counts = {0, target_count, 1};
  targets.offsets = {0, 0, target_count};
@@ -431,8 +425,7 @@ void test_sparse_mask_loss_matches_dense_reference() {
  constexpr int64_t kChannels = 2;
  auto targets = make_packed_mask_targets(kHeight, kWidth, {{2, 2}, {2, 3}, {2, 4}, {3, 2}, {3, 3}, {3, 4}});
  auto config = make_mask_loss_config();
- auto spatial_features =
-  torch::linspace(0.05f, 1.28f, kChannels * kHeight * kWidth, torch::TensorOptions().dtype(torch::kFloat32)).view({1, kChannels, kHeight, kWidth});
+ auto spatial_features = torch::linspace(0.05f, 1.28f, kChannels * kHeight * kWidth, torch::TensorOptions().dtype(torch::kFloat32)).view({1, kChannels, kHeight, kWidth});
  auto query_features = torch::tensor({{{0.35f, -0.15f}, {-0.2f, 0.4f}}}, torch::TensorOptions().dtype(torch::kFloat32));
  auto bias = torch::tensor({0.05f}, torch::TensorOptions().dtype(torch::kFloat32));
  auto dense_masks = torch::einsum("bchw,bnc->bnhw", {spatial_features, query_features}).add(bias);
@@ -479,15 +472,12 @@ void test_packed_mask_sampling_matches_grid_sample_nearest_boundaries() {
  // CLEANUP-IGNORE: Packed-mask boundary coordinates are independent from supervision CUDA fixtures.
  const auto packed_bits = packed.bits.to(torch::kCUDA);
  const auto mask_indices = torch::tensor({0}, torch::TensorOptions().dtype(torch::kInt64).device(torch::kCUDA));
- const auto point_coords =
-  torch::tensor({{{0.0f, 0.5f}, {0.125f, 0.5f}, {0.25f, 0.5f}, {0.375f, 0.5f}, {0.5f, 0.5f}, {0.625f, 0.5f}, {0.75f, 0.5f}, {0.875f, 0.5f}, {1.0f, 0.5f}}},
-                torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA));
+ const auto point_coords = torch::tensor({{{0.0f, 0.5f}, {0.125f, 0.5f}, {0.25f, 0.5f}, {0.375f, 0.5f}, {0.5f, 0.5f}, {0.625f, 0.5f}, {0.75f, 0.5f}, {0.875f, 0.5f}, {1.0f, 0.5f}}},
+  torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA));
  const auto sampled = mmltk::backend::models::rfdetr::sample_packed_masks_cuda(packed_bits, packed.height, packed.width, mask_indices, point_coords);
  const auto dense_cuda = dense_masks.unsqueeze(1).to(torch::kCUDA);
- const auto expected = F::grid_sample(dense_cuda, point_coords.unsqueeze(2).mul(2.0f).sub(1.0f),
-                                      F::GridSampleFuncOptions().mode(torch::kNearest).padding_mode(torch::kBorder).align_corners(false))
-                        .squeeze(3)
-                        .squeeze(1);
+ const auto expected =
+  F::grid_sample(dense_cuda, point_coords.unsqueeze(2).mul(2.0f).sub(1.0f), F::GridSampleFuncOptions().mode(torch::kNearest).padding_mode(torch::kBorder).align_corners(false)).squeeze(3).squeeze(1);
  REQUIRE(torch::equal(sampled.cpu(), expected.cpu()));
 }
 constexpr std::array<std::pair<int64_t, int64_t>, 5> postprocess_geometries{{
@@ -520,8 +510,7 @@ void require_postprocess_geometries(const GeometrySelections& selections) {
   const auto [height, width] = postprocess_geometries[index];
   const auto h = static_cast<float>(height);
   const auto w = static_cast<float>(width);
-  const auto expected_boxes =
-   torch::tensor({{{0.625F * w, 0.F, 0.875F * w, 0.5F * h}, {0.25F * w, 0.375F * h, 0.75F * w, 0.625F * h}, {0.25F * w, 0.375F * h, 0.75F * w, 0.625F * h}}});
+  const auto expected_boxes = torch::tensor({{{0.625F * w, 0.F, 0.875F * w, 0.5F * h}, {0.25F * w, 0.375F * h, 0.75F * w, 0.625F * h}, {0.25F * w, 0.375F * h, 0.75F * w, 0.625F * h}}});
   const auto& selected = selections[index];
   CHECK(torch::equal(selected.boxes.cpu(), expected_boxes));
   CHECK(torch::allclose(selected.scores.cpu(), expected_scores));
@@ -532,8 +521,7 @@ void require_postprocess_geometries(const GeometrySelections& selections) {
 }
 void test_postprocess() {
  const auto outputs = make_outputs();
- const auto result = mmltk::backend::models::rfdetr::postprocess_output_batch_fixed_size(
-  {outputs.main.pred_logits, outputs.main.pred_boxes, outputs.main.pred_masks}, 100, 100, 2);
+ const auto result = mmltk::backend::models::rfdetr::postprocess_output_batch_fixed_size({outputs.main.pred_logits, outputs.main.pred_boxes, outputs.main.pred_masks}, 100, 100, 2);
  REQUIRE(result.size() == 1);
  REQUIRE(result.counts[0].item<int64_t>() == 2);
  REQUIRE(result.scores.size(1) == 2);
@@ -570,20 +558,14 @@ void test_postprocess_cuda_stream_replacement() {
 }  // namespace
 TEST_CASE("test_weight_dict_population", "[model][rfdetr][native_ops]") { test_weight_dict_population(); }
 TEST_CASE("test_matcher_and_losses", "[model][rfdetr][native_ops]") { test_matcher_and_losses(); }
-TEST_CASE("test_batched_matcher_transfer_matches_single_layer_losses", "[model][rfdetr][native_ops]") {
- test_batched_matcher_transfer_matches_single_layer_losses();
-}
+TEST_CASE("test_batched_matcher_transfer_matches_single_layer_losses", "[model][rfdetr][native_ops]") { test_batched_matcher_transfer_matches_single_layer_losses(); }
 TEST_CASE("test_multi_match_box_losses", "[model][rfdetr][native_ops]") { test_multi_match_box_losses(); }
 TEST_CASE("test_matcher_sanitizes_nonfinite_costs", "[model][rfdetr][native_ops]") { test_matcher_sanitizes_nonfinite_costs(); }
 TEST_CASE("test_rectangular_matcher_layers_preserve_all_targets", "[model][rfdetr][native_ops]") { test_rectangular_matcher_layers_preserve_all_targets(); }
 TEST_CASE("test_cpu_mask_loss_uses_upstream_keys", "[model][rfdetr][native_ops]") { test_cpu_mask_loss_uses_upstream_keys(); }
 TEST_CASE("test_sparse_mask_loss_matches_dense_reference", "[model][rfdetr][native_ops]") { test_sparse_mask_loss_matches_dense_reference(); }
-TEST_CASE("test_matcher_mask_cost_handles_zero_point_sampling_on_cuda", "[model][rfdetr][native_ops]") {
- test_matcher_mask_cost_handles_zero_point_sampling_on_cuda();
-}
-TEST_CASE("test_packed_mask_sampling_matches_grid_sample_nearest_boundaries", "[model][rfdetr][native_ops]") {
- test_packed_mask_sampling_matches_grid_sample_nearest_boundaries();
-}
+TEST_CASE("test_matcher_mask_cost_handles_zero_point_sampling_on_cuda", "[model][rfdetr][native_ops]") { test_matcher_mask_cost_handles_zero_point_sampling_on_cuda(); }
+TEST_CASE("test_packed_mask_sampling_matches_grid_sample_nearest_boundaries", "[model][rfdetr][native_ops]") { test_packed_mask_sampling_matches_grid_sample_nearest_boundaries(); }
 TEST_CASE("test_postprocess", "[model][rfdetr][native_ops]") { test_postprocess(); }
 TEST_CASE("test_postprocess_cuda_stream_replacement", "[model][rfdetr][native_ops][cuda]") { test_postprocess_cuda_stream_replacement(); }
 TEST_CASE("LSAP solver arrays use the owning node resource and retain capacity", "[rfdetr][lsap][numa]") {
@@ -597,14 +579,12 @@ TEST_CASE("LSAP solver arrays use the owning node resource and retain capacity",
  scratch.costs = {4, 1, 3, 2, 0, 5};
  scratch.row_indices.resize(2);
  scratch.col_indices.resize(2);
- REQUIRE(solve_rectangular_linear_sum_assignment(2, 3, scratch.costs.data(), false, scratch.row_indices.data(), scratch.col_indices.data(), scratch.solver) ==
-         RectangularLsApStatus::kOk);
+ REQUIRE(solve_rectangular_linear_sum_assignment(2, 3, scratch.costs.data(), false, scratch.row_indices.data(), scratch.col_indices.data(), scratch.solver) == RectangularLsApStatus::kOk);
  CHECK(scratch.col_indices[0] == 1);
  CHECK(scratch.col_indices[1] == 0);
  auto* duals = scratch.solver.column_duals.data();
  const auto capacity = scratch.solver.column_duals.capacity();
- REQUIRE(solve_rectangular_linear_sum_assignment(2, 3, scratch.costs.data(), false, scratch.row_indices.data(), scratch.col_indices.data(), scratch.solver) ==
-         RectangularLsApStatus::kOk);
+ REQUIRE(solve_rectangular_linear_sum_assignment(2, 3, scratch.costs.data(), false, scratch.row_indices.data(), scratch.col_indices.data(), scratch.solver) == RectangularLsApStatus::kOk);
  CHECK(scratch.solver.column_duals.data() == duals);
  CHECK(scratch.solver.column_duals.capacity() == capacity);
  CHECK(scratch.costs.get_allocator().resource() == &memory);
@@ -612,8 +592,7 @@ TEST_CASE("LSAP solver arrays use the owning node resource and retain capacity",
  CHECK(scratch.solver.visited_columns.get_allocator().resource() == &memory);
  CHECK(scratch.row_indices.get_allocator().resource() == &memory);
  // Tall and maximizing cases exercise the PMR transpose and sorting workspaces.
- REQUIRE(solve_rectangular_linear_sum_assignment(3, 2, scratch.costs.data(), true, scratch.row_indices.data(), scratch.col_indices.data(), scratch.solver) ==
-         RectangularLsApStatus::kOk);
+ REQUIRE(solve_rectangular_linear_sum_assignment(3, 2, scratch.costs.data(), true, scratch.row_indices.data(), scratch.col_indices.data(), scratch.solver) == RectangularLsApStatus::kOk);
  CHECK(scratch.solver.transposed_cost.get_allocator().resource() == &memory);
  CHECK(scratch.solver.sorted_indices.get_allocator().resource() == &memory);
 }
@@ -627,8 +606,7 @@ TEST_CASE("Criterion losses and gradients share one assignment upload under both
   int mmap = 0;
   const auto status = cuDeviceGetAttribute(&mmap, static_cast<CUdevice_attribute>(152), 0);
   REQUIRE((status == CUDA_SUCCESS || status == CUDA_ERROR_INVALID_VALUE));
-  if (!(status == CUDA_SUCCESS && mmap) && ::access("/dev/gdrdrv", R_OK | W_OK) != 0)
-   SKIP("GDR unavailable; criterion GDR loss and gradient parity remain unverified");
+  if (!(status == CUDA_SUCCESS && mmap) && ::access("/dev/gdrdrv", R_OK | W_OK) != 0) SKIP("GDR unavailable; criterion GDR loss and gradient parity remain unverified");
  }
  // CLEANUP-IGNORE: Criterion parity owns its device placement after its transport-specific hardware admission.
  const auto execution = mmltk::frameworks::gpu::test_support::selected_test_device(0, mmltk::common::system::NumaTopology::Capture());
@@ -693,8 +671,7 @@ TEST_CASE("Criterion losses and gradients share one assignment upload under both
  REQUIRE(observed.losses.size() == baseline.losses.size());
  for (const auto& [name, expected] : baseline.losses) REQUIRE(torch::allclose(observed.losses.at(name), expected, 1e-6, 1e-6));
  REQUIRE(observed.gradients.size() == baseline.gradients.size());
- for (std::size_t index = 0; index < baseline.gradients.size(); ++index)
-  REQUIRE(torch::allclose(observed.gradients[index], baseline.gradients[index], 1e-6, 1e-6));
+ for (std::size_t index = 0; index < baseline.gradients.size(); ++index) REQUIRE(torch::allclose(observed.gradients[index], baseline.gradients[index], 1e-6, 1e-6));
  REQUIRE(observed.statistics.cost_submissions == 1);
  REQUIRE(observed.statistics.cost_dependencies == 1);
  REQUIRE(observed.statistics.cost_bytes == 4 * 1 * 4 * 1 * sizeof(float));
@@ -758,8 +735,7 @@ TEST_CASE("Physical ranking precedes slot filtering and keeps stable query mask 
   record.no_object = r::NoObjectEncoding::ExplicitBackground;
   std::uint32_t foreground = 0;
   for (std::uint32_t slot = 0; slot < 3; ++slot)
-   record.slots[slot] =
-    slot == background ? r::ModelClassSlot{r::ClassSlotRole::Background, std::nullopt} : r::ModelClassSlot{r::ClassSlotRole::Foreground, foreground++};
+   record.slots[slot] = slot == background ? r::ModelClassSlot{r::ClassSlotRole::Background, std::nullopt} : r::ModelClassSlot{r::ClassSlotRole::Foreground, foreground++};
   r::ClassPostprocessLane classes(std::make_shared<const r::ResolvedClassLayout>(record));
   classes.Prepare(torch::kCPU);
   r::OutputTensors outputs;

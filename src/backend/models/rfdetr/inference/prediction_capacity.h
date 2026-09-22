@@ -14,13 +14,12 @@ struct PredictionCapacity final {
  std::size_t pixels = 0U;
  // One UInt8 mask, independent of discarded top-k candidates. Chunks are selected later.
  std::size_t mask_bytes = 0U;
- [[nodiscard]] static PredictionCapacity Resolve(std::size_t requested, std::size_t batch, std::int64_t queries, std::int64_t classes, std::uint32_t width,
-                                                 std::uint32_t height, bool masks, std::optional<std::size_t> eligible_classes = std::nullopt) {
+ [[nodiscard]] static PredictionCapacity Resolve(std::size_t requested, std::size_t batch, std::int64_t queries, std::int64_t classes, std::uint32_t width, std::uint32_t height, bool masks,
+  std::optional<std::size_t> eligible_classes = std::nullopt) {
   if (requested != 0 || !eligible_classes || *eligible_classes != 0) validate_prediction_candidates(requested);
   if (queries <= 0 || classes <= 0 || queries > std::numeric_limits<std::int32_t>::max() || classes > std::numeric_limits<std::int32_t>::max())
    throw std::invalid_argument("RF-DETR backend candidate shape is invalid");
-  const auto available = checked_prediction_extent(static_cast<std::size_t>(queries), static_cast<std::size_t>(classes),
-                                                   static_cast<std::size_t>(std::numeric_limits<std::int64_t>::max()));
+  const auto available = checked_prediction_extent(static_cast<std::size_t>(queries), static_cast<std::size_t>(classes), static_cast<std::size_t>(std::numeric_limits<std::int64_t>::max()));
   static_cast<void>(checked_prediction_extent(batch, available, kMaximumPredictionTensorBytes / sizeof(float)));
   const auto eligible = eligible_classes.value_or(static_cast<std::size_t>(classes));
   if (eligible > static_cast<std::size_t>(classes)) throw std::invalid_argument("eligible class count exceeds physical logits width");
@@ -34,8 +33,7 @@ struct PredictionMaskChunk final {
  std::size_t count = 0U;
  std::size_t retained_limit = 0U;
  SelectedMaskCapacity capacity;
- [[nodiscard]] static PredictionMaskChunk Resolve(std::size_t survivors, std::size_t model_height, std::size_t model_width, std::size_t height,
-                                                  std::size_t width, std::size_t dtype_bytes) {
+ [[nodiscard]] static PredictionMaskChunk Resolve(std::size_t survivors, std::size_t model_height, std::size_t model_width, std::size_t height, std::size_t width, std::size_t dtype_bytes) {
   validate_prediction_candidates(survivors);
   const auto one = SelectedMaskCapacity::Resolve(1U, model_height, model_width, height, width, dtype_bytes);
   const auto limit = std::max(kPredictionMaskChunkBytes, one.Total());

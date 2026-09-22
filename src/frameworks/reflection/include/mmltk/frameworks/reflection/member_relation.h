@@ -60,9 +60,7 @@ struct StaticMemberRelation {
  }
  template <class SourceValue, class DestinationValue>
  static constexpr void Project(const SourceValue& source, DestinationValue& destination) {
-  VisitMembers([&]<class Entry>() {
-   Entry::transform::apply(access<DestinationValue, Entry::destination>(destination), access<const SourceValue, Entry::source>(source));
-  });
+  VisitMembers([&]<class Entry>() { Entry::transform::apply(access<DestinationValue, Entry::destination>(destination), access<const SourceValue, Entry::source>(source)); });
  }
 };
 template <class Provider>

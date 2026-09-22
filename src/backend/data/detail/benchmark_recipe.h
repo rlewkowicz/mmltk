@@ -36,9 +36,8 @@ struct CustomRecipePreparation {
  SupplementalSamplingResult objects_sampling, open_images_sampling;
  std::vector<CatalogArtifact> sampling_object_artifacts;
 };
-[[nodiscard]] CustomRecipePreparation prepare_custom_recipe(const BenchmarkCompilerConfig&, const BenchmarkCacheLayout&, const CustomRecipeCatalog&,
-                                                            ProgressReporter&, std::size_t, mmltk::common::concurrency::CancellationObservation,
-                                                            const BenchmarkTraceSink&);
+[[nodiscard]] CustomRecipePreparation prepare_custom_recipe(const BenchmarkCompilerConfig&, const BenchmarkCacheLayout&, const CustomRecipeCatalog&, ProgressReporter&, std::size_t,
+ mmltk::common::concurrency::CancellationObservation, const BenchmarkTraceSink&);
 }  // namespace mmltk::backend::data::benchmark_internal
 namespace mmltk::backend::data::benchmark_internal {
 struct RecipeImageArchive {
@@ -71,8 +70,7 @@ struct CoconutRecipePreparation {
 class CoconutFailureReport {
 public:
  CoconutFailureReport(const std::filesystem::path& cache_root, ProgressReporter& progress);
- void reject(const CoconutPhysicalImage&, std::uint64_t release_image_id, std::string_view release, std::uint64_t object_id, std::uint64_t category_id,
-             std::string_view reason) noexcept;
+ void reject(const CoconutPhysicalImage&, std::uint64_t release_image_id, std::string_view release, std::uint64_t object_id, std::uint64_t category_id, std::string_view reason) noexcept;
 
 private:
  std::filesystem::path path_;
@@ -81,16 +79,12 @@ private:
  bool attempted_ = false;
  bool warned_ = false;
 };
-[[nodiscard]] std::vector<std::pair<std::uint32_t, std::uint32_t>> coconut_image_dimensions(const CoconutComponent&, std::string_view release,
-                                                                                            std::span<const CachedImageDirectory>,
-                                                                                            std::span<const std::uint16_t> image_sources, CoconutFailureReport&,
-                                                                                            ProgressReporter&,
-                                                                                            mmltk::common::concurrency::CancellationObservation);
+[[nodiscard]] std::vector<std::pair<std::uint32_t, std::uint32_t>> coconut_image_dimensions(const CoconutComponent&, std::string_view release, std::span<const CachedImageDirectory>,
+ std::span<const std::uint16_t> image_sources, CoconutFailureReport&, ProgressReporter&, mmltk::common::concurrency::CancellationObservation);
 [[nodiscard]] CoconutRecipeCatalog coconut_recipe_catalog(CoconutValidation);
-[[nodiscard]] CoconutRecipePreparation prepare_coconut_recipe(const BenchmarkCompilerConfig&, const BenchmarkCacheLayout&, const CoconutRecipeCatalog&,
-                                                              std::span<const AdmittedRecipeArchive>, const CoconutPhysicalMembership&, ProgressReporter&,
-                                                              CoconutFailureReport&, std::size_t, mmltk::common::concurrency::CancellationObservation,
-                                                              const BenchmarkTraceSink&, std::span<const CoconutImageNamespace> refreshed_sources = {});
+[[nodiscard]] CoconutRecipePreparation prepare_coconut_recipe(const BenchmarkCompilerConfig&, const BenchmarkCacheLayout&, const CoconutRecipeCatalog&, std::span<const AdmittedRecipeArchive>,
+ const CoconutPhysicalMembership&, ProgressReporter&, CoconutFailureReport&, std::size_t, mmltk::common::concurrency::CancellationObservation, const BenchmarkTraceSink&,
+ std::span<const CoconutImageNamespace> refreshed_sources = {});
 [[nodiscard]] bool coconut_validation_component(CoconutEdition) noexcept;
 [[nodiscard]] AnnotationSource coconut_annotation_source(CoconutImageNamespace);
 // Same compiler entry with explicit private source catalog, not a second execution path.

@@ -180,8 +180,7 @@ MMLTK_REFLECT_FIELDS(TrainingCheckpointQuery)
 struct TrainingHistoryQuery final {
  std::uint64_t generation = 0;
  std::uint64_t cursor = 0;
- [[= mmltk::frameworks::reflection::Minimum<std::uint32_t>{
-  1}]][[= mmltk::frameworks::reflection::Maximum<std::uint32_t>{kTrainingHistoryPageSize}]] std::uint32_t count = kTrainingHistoryPageSize;
+ [[= mmltk::frameworks::reflection::Minimum<std::uint32_t>{1}]][[= mmltk::frameworks::reflection::Maximum<std::uint32_t>{kTrainingHistoryPageSize}]] std::uint32_t count = kTrainingHistoryPageSize;
 };
 MMLTK_REFLECT_FIELDS(TrainingHistoryQuery)
 struct TrainingHistoryPage final {

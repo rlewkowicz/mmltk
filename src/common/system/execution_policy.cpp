@@ -32,8 +32,7 @@ void set_nice(int value) {
  if (::setpriority(PRIO_PROCESS, 0, value) != 0) throw std::system_error(errno, std::generic_category(), "required worker nice priority denied");
 }
 void set_io(int value) {
- if (::syscall(SYS_ioprio_set, IOPRIO_WHO_PROCESS, 0, value) != 0)
-  throw std::system_error(errno, std::generic_category(), "required worker I/O priority denied");
+ if (::syscall(SYS_ioprio_set, IOPRIO_WHO_PROCESS, 0, value) != 0) throw std::system_error(errno, std::generic_category(), "required worker I/O priority denied");
 }
 void set_scheduler(int policy, int priority) {
  sched_param parameter{};
@@ -62,8 +61,7 @@ ExecutionPolicySnapshot apply_execution_policy(const ExecutionPolicyRequest& req
  set_nice(target);
  if (request.storage_worker) set_io(IOPRIO_PRIO_VALUE(IOPRIO_CLASS_BE, 0));
  auto result = capture_execution_policy_snapshot();
- if (result.nice_value != target || result.scheduler_policy != SCHED_OTHER ||
-     (request.storage_worker && (result.io_class != IOPRIO_CLASS_BE || result.io_priority_data != 0)) ||
+ if (result.nice_value != target || result.scheduler_policy != SCHED_OTHER || (request.storage_worker && (result.io_class != IOPRIO_CLASS_BE || result.io_priority_data != 0)) ||
      (request.numa_node >= 0 && result.numa_node != request.numa_node))
   throw std::runtime_error("required worker execution policy verification failed");
  return result;
@@ -113,13 +111,10 @@ void ScopedExecutionPolicy::Restore() {
  if (!active_) return;
  const auto current = capture_execution_policy_snapshot();
  if (current.affinity != previous_.affinity) set_thread_affinity(previous_.affinity);
- if (current.memory_policy.mode != previous_.memory_policy.mode || current.memory_policy.mask != previous_.memory_policy.mask)
-  restore_memory_policy(previous_.memory_policy);
- if (current.scheduler_policy != previous_.scheduler_policy || current.scheduler_priority != previous_.scheduler_priority)
-  set_scheduler(previous_.scheduler_policy, previous_.scheduler_priority);
+ if (current.memory_policy.mode != previous_.memory_policy.mode || current.memory_policy.mask != previous_.memory_policy.mask) restore_memory_policy(previous_.memory_policy);
+ if (current.scheduler_policy != previous_.scheduler_policy || current.scheduler_priority != previous_.scheduler_priority) set_scheduler(previous_.scheduler_policy, previous_.scheduler_priority);
  set_nice(previous_.nice_value);
- if (current.io_class != previous_.io_class || current.io_priority_data != previous_.io_priority_data)
-  set_io(IOPRIO_PRIO_VALUE(previous_.io_class, previous_.io_priority_data));
+ if (current.io_class != previous_.io_class || current.io_priority_data != previous_.io_priority_data) set_io(IOPRIO_PRIO_VALUE(previous_.io_class, previous_.io_priority_data));
  if (current.thread_name != previous_.thread_name) set_thread_name(previous_.thread_name);
  active_ = false;
 }

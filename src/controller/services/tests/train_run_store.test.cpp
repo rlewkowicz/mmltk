@@ -52,8 +52,7 @@ void test_current_training_history_pages_and_attempt_configuration() {
   last = page.records.back();
   std::string line;
   REQUIRE(static_cast<bool>(std::getline(history, line)));
-  const auto persisted = mmltk::frameworks::serialization::decode_reflected_json<r::TrainingRecord>(
-   line, {.max_bytes = r::kTrainingRecordBytes, .max_items = 8192U, .max_depth = 32U});
+  const auto persisted = mmltk::frameworks::serialization::decode_reflected_json<r::TrainingRecord>(line, {.max_bytes = r::kTrainingRecordBytes, .max_items = 8192U, .max_depth = 32U});
   CHECK(*last == persisted);
   if (last->progress.phase == r::TrainingPhase::Starting) CHECK(last->attempt_configuration == run.configuration);
   if (!page.more) break;
@@ -104,9 +103,7 @@ void test_current_training_history_pages_and_attempt_configuration() {
  REQUIRE_THROWS(store.Read({old_generation, 0, 1}));
 }
 }  // namespace
-TEST_CASE("test_current_training_history_pages_and_attempt_configuration", "[gui][train][history]") {
- test_current_training_history_pages_and_attempt_configuration();
-}
+TEST_CASE("test_current_training_history_pages_and_attempt_configuration", "[gui][train][history]") { test_current_training_history_pages_and_attempt_configuration(); }
 TEST_CASE("saved training format one is explicitly incompatible", "[gui][train][history]") {
  namespace r = mmltk::backend::models::rfdetr;
  mmltk::testsupport::ScopedTempDir temp{"training-old-format"};
@@ -116,8 +113,7 @@ TEST_CASE("saved training format one is explicitly incompatible", "[gui][train][
  run.attempt_id = "old-attempt";
  std::ofstream(temp.path() / "metrics.jsonl");
  std::vector<std::byte> scratch(r::kTrainingManifestBytes);
- std::ofstream(temp.path() / "run.json") << mmltk::frameworks::serialization::reflected_json(
-  run, scratch, {.max_bytes = r::kTrainingManifestBytes, .max_items = 65536, .max_depth = 32});
+ std::ofstream(temp.path() / "run.json") << mmltk::frameworks::serialization::reflected_json(run, scratch, {.max_bytes = r::kTrainingManifestBytes, .max_items = 65536, .max_depth = 32});
  TrainRunStore store;
  REQUIRE_THROWS_WITH(store.Open(temp.path()), Catch::Matchers::ContainsSubstring("unsupported or inconsistent training run format"));
 }

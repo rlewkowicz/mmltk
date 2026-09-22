@@ -53,8 +53,8 @@ inline constexpr std::array kModels{
   }
   for (std::size_t preset_index = 0U; preset_index < model.presets.size(); ++preset_index) {
    const auto& preset = model.presets[preset_index];
-   if (preset.model_id != model.model_id || preset.preset_name.empty() || preset.display_name.empty() || preset.size_label.empty() || preset.task.empty() ||
-       preset.canonical_weight_filename.empty() || preset.resolution == 0U) {
+   if (preset.model_id != model.model_id || preset.preset_name.empty() || preset.display_name.empty() || preset.size_label.empty() || preset.task.empty() || preset.canonical_weight_filename.empty() ||
+       preset.resolution == 0U) {
     return false;
    }
    for (std::size_t sibling_model_index = model_index; sibling_model_index < kModels.size(); ++sibling_model_index) {

@@ -26,8 +26,7 @@ WaveTargetNormalizer::WaveTargetNormalizer(const std::size_t lanes, const int de
     : host_counts_(lanes, 0), published_(lanes, false), device_id_(device_id), distributed_(&distributed) {
  if (lanes == 0) { throw std::invalid_argument("RF-DETR target normalizer wave requires at least one lane"); }
  mmltk::frameworks::gpu::CudaDeviceScope scope(device_id_);
- mmltk::frameworks::gpu::ensure_cuda_ok(scope ? scope.FinalizeStatus(cudaEventCreateWithFlags(&ready_, cudaEventDisableTiming)) : scope.Finalize(),
-                                        "create RF-DETR target normalizer event");
+ mmltk::frameworks::gpu::ensure_cuda_ok(scope ? scope.FinalizeStatus(cudaEventCreateWithFlags(&ready_, cudaEventDisableTiming)) : scope.Finalize(), "create RF-DETR target normalizer event");
 }
 WaveTargetNormalizer::~WaveTargetNormalizer() noexcept {
  if (ready_ != nullptr) {
@@ -60,8 +59,7 @@ void WaveTargetNormalizer::resolve(const DistributedContext& distributed, const 
   }
   counts.div_(static_cast<double>(std::max(1, distributed.world_size)));
   mmltk::frameworks::gpu::ensure_cuda_ok(
-   cudaEventRecord(ready_, torch_cuda::current_torch_cuda_stream_object(torch_cuda::checked_device_index(device_id_)).stream()),
-   "record RF-DETR target normalizer readiness");
+   cudaEventRecord(ready_, torch_cuda::current_torch_cuda_stream_object(torch_cuda::checked_device_index(device_id_)).stream()), "record RF-DETR target normalizer readiness");
   {
    std::lock_guard lock(mutex_);
    device_counts_ = std::move(counts);
@@ -172,9 +170,8 @@ scalar_packet::Tensors ordinary_scalar_tensors(const TensorMap& losses, const to
  assign.operator()<^^TrainingScalars::cardinality_error>("cardinality_error");
  return values;
 }
-RoutedTrainingLoss compute_routed_training_loss(NativeRfDetrModel& model, const TrainingSupervisionRoute route, const ModelOutputs& outputs,
-                                                const PreparedTargets& targets, const DeviceLossNormalizer& normalizer,
-                                                const DetectionConfig& detection_config) {
+RoutedTrainingLoss compute_routed_training_loss(NativeRfDetrModel& model, const TrainingSupervisionRoute route, const ModelOutputs& outputs, const PreparedTargets& targets,
+ const DeviceLossNormalizer& normalizer, const DetectionConfig& detection_config) {
  if (route_uses_match_free(route)) {
   const auto loss = model.supervision_loss(outputs, targets, normalizer, true);
   scalar_packet::Tensors scalars;

@@ -34,10 +34,9 @@ __device__ __forceinline__ float cxcywh_generalized_iou(const float* lhs, const 
  return isfinite(result) ? result : 0.0f;
 }
 template <typename Logit, typename Box>
-__global__ void matcher_cost_kernel(float* output, const Logit* pred_logits, const Box* pred_boxes, const int64_t* target_labels, const float* target_boxes,
-                                    const int64_t* target_offsets, const int64_t* target_counts, int64_t batch_size, int64_t query_count, int64_t class_count,
-                                    int64_t output_query_stride, int64_t max_targets, int64_t total_targets, float class_cost, float bbox_cost, float giou_cost,
-                                    float focal_alpha) {
+__global__ void matcher_cost_kernel(float* output, const Logit* pred_logits, const Box* pred_boxes, const int64_t* target_labels, const float* target_boxes, const int64_t* target_offsets,
+ const int64_t* target_counts, int64_t batch_size, int64_t query_count, int64_t class_count, int64_t output_query_stride, int64_t max_targets, int64_t total_targets, float class_cost, float bbox_cost,
+ float giou_cost, float focal_alpha) {
  const int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
  const int64_t total = batch_size * query_count * max_targets;
  if (index >= total) { return; }
@@ -57,18 +56,15 @@ __global__ void matcher_cost_kernel(float* output, const Logit* pred_logits, con
  const float negative_class_cost = (1.0f - focal_alpha) * probability * probability * stable_softplus(logit);
  const Box* prediction = pred_boxes + (batch_index * query_count + query_index) * 4;
  const float* target = target_boxes + target_index * 4;
- const float prediction_float[4] = {static_cast<float>(prediction[0]), static_cast<float>(prediction[1]), static_cast<float>(prediction[2]),
-                                    static_cast<float>(prediction[3])};
- const float l1 = fabsf(prediction_float[0] - target[0]) + fabsf(prediction_float[1] - target[1]) + fabsf(prediction_float[2] - target[2]) +
-                  fabsf(prediction_float[3] - target[3]);
+ const float prediction_float[4] = {static_cast<float>(prediction[0]), static_cast<float>(prediction[1]), static_cast<float>(prediction[2]), static_cast<float>(prediction[3])};
+ const float l1 = fabsf(prediction_float[0] - target[0]) + fabsf(prediction_float[1] - target[1]) + fabsf(prediction_float[2] - target[2]) + fabsf(prediction_float[3] - target[3]);
  const float giou = cxcywh_generalized_iou(prediction_float, target);
  const float cost = class_cost * (positive_class_cost - negative_class_cost) + bbox_cost * l1 - giou_cost * giou;
  output[(batch_index * output_query_stride + query_index) * max_targets + target_slot] = isfinite(cost) ? cost : 0.0f;
 }
 template <typename Logit>
-__global__ void matcher_mask_cost_kernel(float* output, const Logit* pred_logits, const float* target_masks, const int64_t* target_offsets,
-                                         const int64_t* target_counts, int64_t batch_size, int64_t query_count, int64_t output_query_stride,
-                                         int64_t max_targets, int64_t total_targets, int64_t point_count, float ce_cost, float dice_cost) {
+__global__ void matcher_mask_cost_kernel(float* output, const Logit* pred_logits, const float* target_masks, const int64_t* target_offsets, const int64_t* target_counts, int64_t batch_size,
+ int64_t query_count, int64_t output_query_stride, int64_t max_targets, int64_t total_targets, int64_t point_count, float ce_cost, float dice_cost) {
  constexpr int kWarpSize = 32;
  const int lane = static_cast<int>(threadIdx.x) & (kWarpSize - 1);
  const int64_t warp_index = (static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x) / static_cast<int64_t>(kWarpSize);
@@ -132,13 +128,11 @@ int64_t checked_extent(const std::initializer_list<int64_t> factors, const int64
  return product;
 }
 float checked_cost_coefficient(const double value, const char* name) {
- TORCH_CHECK(std::isfinite(value) && std::abs(value) <= static_cast<double>(std::numeric_limits<float>::max()), name,
-             " must be finite and representable as float32");
+ TORCH_CHECK(std::isfinite(value) && std::abs(value) <= static_cast<double>(std::numeric_limits<float>::max()), name, " must be finite and representable as float32");
  return static_cast<float>(value);
 }
-void pairwise_detection_cost_cuda_out(const torch::Tensor& output, const torch::Tensor& pred_logits, const torch::Tensor& pred_boxes,
-                                      const torch::Tensor& target_labels, const torch::Tensor& target_boxes, const torch::Tensor& target_offsets,
-                                      const torch::Tensor& target_counts, double class_cost, double bbox_cost, double giou_cost, double focal_alpha) {
+void pairwise_detection_cost_cuda_out(const torch::Tensor& output, const torch::Tensor& pred_logits, const torch::Tensor& pred_boxes, const torch::Tensor& target_labels,
+ const torch::Tensor& target_boxes, const torch::Tensor& target_offsets, const torch::Tensor& target_counts, double class_cost, double bbox_cost, double giou_cost, double focal_alpha) {
  check_matcher_tensor(output, torch::kFloat32, 3, "matcher cost output");
  check_matcher_floating_tensor(pred_logits, 3, "matcher logits");
  check_matcher_floating_tensor(pred_boxes, 3, "matcher boxes");
@@ -146,26 +140,23 @@ void pairwise_detection_cost_cuda_out(const torch::Tensor& output, const torch::
  check_matcher_tensor(target_boxes, torch::kFloat32, 2, "matcher target boxes");
  check_matcher_tensor(target_offsets, torch::kInt64, 1, "matcher target offsets");
  check_matcher_tensor(target_counts, torch::kInt64, 1, "matcher target counts");
- TORCH_CHECK(output.device() == pred_logits.device() && output.device() == pred_boxes.device() && output.device() == target_labels.device() &&
-              output.device() == target_boxes.device() && output.device() == target_offsets.device() && output.device() == target_counts.device(),
-             "matcher CUDA tensors must share one device");
- TORCH_CHECK(pred_boxes.size(0) == pred_logits.size(0) && pred_boxes.size(1) == pred_logits.size(1) && pred_boxes.size(2) == 4,
-             "matcher prediction boxes must be [batch, queries, 4]");
+ TORCH_CHECK(output.device() == pred_logits.device() && output.device() == pred_boxes.device() && output.device() == target_labels.device() && output.device() == target_boxes.device() &&
+              output.device() == target_offsets.device() && output.device() == target_counts.device(),
+  "matcher CUDA tensors must share one device");
+ TORCH_CHECK(pred_boxes.size(0) == pred_logits.size(0) && pred_boxes.size(1) == pred_logits.size(1) && pred_boxes.size(2) == 4, "matcher prediction boxes must be [batch, queries, 4]");
  TORCH_CHECK(output.size(0) >= pred_logits.size(0) && output.size(1) >= pred_logits.size(1), "matcher output shape does not cover predictions");
  TORCH_CHECK(target_boxes.size(0) == target_labels.size(0) && target_boxes.size(1) == 4, "matcher target boxes and labels disagree");
- TORCH_CHECK(target_offsets.size(0) == pred_logits.size(0) && target_counts.size(0) == pred_logits.size(0),
-             "matcher target metadata does not match batch size");
+ TORCH_CHECK(target_offsets.size(0) == pred_logits.size(0) && target_counts.size(0) == pred_logits.size(0), "matcher target metadata does not match batch size");
  const int64_t batch = pred_logits.size(0);
  const int64_t queries = pred_logits.size(1);
  const int64_t classes = pred_logits.size(2);
  const int64_t max_targets = output.size(2);
  const int64_t total_targets = target_labels.size(0);
- TORCH_CHECK(checked_extent({batch, queries, classes}, std::numeric_limits<int64_t>::max(), "matcher logits pointer extent") == pred_logits.numel(),
-             "matcher logits storage does not match its shape");
- TORCH_CHECK(checked_extent({batch, queries, 4}, std::numeric_limits<int64_t>::max(), "matcher prediction-box pointer extent") == pred_boxes.numel(),
-             "matcher prediction-box storage does not match its shape");
- TORCH_CHECK(checked_extent({total_targets, 4}, std::numeric_limits<int64_t>::max(), "matcher target-box pointer extent") == target_boxes.numel(),
-             "matcher target-box storage does not match its shape");
+ TORCH_CHECK(checked_extent({batch, queries, classes}, std::numeric_limits<int64_t>::max(), "matcher logits pointer extent") == pred_logits.numel(), "matcher logits storage does not match its shape");
+ TORCH_CHECK(
+  checked_extent({batch, queries, 4}, std::numeric_limits<int64_t>::max(), "matcher prediction-box pointer extent") == pred_boxes.numel(), "matcher prediction-box storage does not match its shape");
+ TORCH_CHECK(
+  checked_extent({total_targets, 4}, std::numeric_limits<int64_t>::max(), "matcher target-box pointer extent") == target_boxes.numel(), "matcher target-box storage does not match its shape");
  const int64_t output_extent = checked_extent({batch, output.size(1), max_targets}, std::numeric_limits<int64_t>::max(), "matcher output pointer extent");
  TORCH_CHECK(output_extent <= output.numel(), "matcher output storage does not cover its checked pointer extent");
  const float checked_alpha = checked_cost_coefficient(focal_alpha, "matcher focal alpha");
@@ -181,28 +172,25 @@ void pairwise_detection_cost_cuda_out(const torch::Tensor& output, const torch::
   using Logit = scalar_t;
   AT_DISPATCH_FLOATING_TYPES_AND2(at::ScalarType::Half, at::ScalarType::BFloat16, pred_boxes.scalar_type(), "pairwise_detection_cost_boxes", [&] {
    using Box = scalar_t;
-   matcher_cost_kernel<Logit, Box><<<blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
-    output.data_ptr<float>(), pred_logits.data_ptr<Logit>(), pred_boxes.data_ptr<Box>(), target_labels.data_ptr<int64_t>(), target_boxes.data_ptr<float>(),
-    target_offsets.data_ptr<int64_t>(), target_counts.data_ptr<int64_t>(), batch, queries, classes, output.size(1), max_targets, total_targets,
-    checked_class_cost, checked_bbox_cost, checked_giou_cost, checked_alpha);
+   matcher_cost_kernel<Logit, Box><<<blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(output.data_ptr<float>(), pred_logits.data_ptr<Logit>(), pred_boxes.data_ptr<Box>(),
+    target_labels.data_ptr<int64_t>(), target_boxes.data_ptr<float>(), target_offsets.data_ptr<int64_t>(), target_counts.data_ptr<int64_t>(), batch, queries, classes, output.size(1), max_targets,
+    total_targets, checked_class_cost, checked_bbox_cost, checked_giou_cost, checked_alpha);
   });
  });
  TORCH_CHECK(cudaGetLastError() == cudaSuccess, "matcher cost CUDA kernel launch failed");
 }
-void pairwise_mask_cost_cuda_add_(const torch::Tensor& output, const torch::Tensor& pred_mask_logits, const torch::Tensor& target_masks,
-                                  const torch::Tensor& target_offsets, const torch::Tensor& target_counts, double ce_cost, double dice_cost) {
+void pairwise_mask_cost_cuda_add_(const torch::Tensor& output, const torch::Tensor& pred_mask_logits, const torch::Tensor& target_masks, const torch::Tensor& target_offsets,
+ const torch::Tensor& target_counts, double ce_cost, double dice_cost) {
  check_matcher_tensor(output, torch::kFloat32, 3, "matcher mask cost output");
  check_matcher_floating_tensor(pred_mask_logits, 3, "matcher sampled mask logits");
  check_matcher_tensor(target_masks, torch::kFloat32, 2, "matcher sampled target masks");
  check_matcher_tensor(target_offsets, torch::kInt64, 1, "matcher target offsets");
  check_matcher_tensor(target_counts, torch::kInt64, 1, "matcher target counts");
- TORCH_CHECK(output.device() == pred_mask_logits.device() && output.device() == target_masks.device() && output.device() == target_offsets.device() &&
-              output.device() == target_counts.device(),
-             "matcher mask CUDA tensors must share one device");
+ TORCH_CHECK(output.device() == pred_mask_logits.device() && output.device() == target_masks.device() && output.device() == target_offsets.device() && output.device() == target_counts.device(),
+  "matcher mask CUDA tensors must share one device");
  TORCH_CHECK(output.size(0) >= pred_mask_logits.size(0) && output.size(1) >= pred_mask_logits.size(1), "matcher mask output shape does not cover predictions");
  TORCH_CHECK(target_masks.size(1) == pred_mask_logits.size(2), "matcher sampled prediction and target masks disagree");
- TORCH_CHECK(
-  output.size(0) >= pred_mask_logits.size(0) && target_offsets.size(0) == pred_mask_logits.size(0) && target_counts.size(0) == pred_mask_logits.size(0),
+ TORCH_CHECK(output.size(0) >= pred_mask_logits.size(0) && target_offsets.size(0) == pred_mask_logits.size(0) && target_counts.size(0) == pred_mask_logits.size(0),
   "matcher mask batch metadata does not cover predictions");
  const int64_t batch = pred_mask_logits.size(0);
  const int64_t queries = pred_mask_logits.size(1);
@@ -210,9 +198,9 @@ void pairwise_mask_cost_cuda_add_(const torch::Tensor& output, const torch::Tens
  const int64_t max_targets = output.size(2);
  const int64_t total_targets = target_masks.size(0);
  TORCH_CHECK(checked_extent({batch, queries, points}, std::numeric_limits<int64_t>::max(), "matcher mask-logit pointer extent") == pred_mask_logits.numel(),
-             "matcher mask-logit storage does not match its shape");
- TORCH_CHECK(checked_extent({total_targets, points}, std::numeric_limits<int64_t>::max(), "matcher target-mask pointer extent") == target_masks.numel(),
-             "matcher target-mask storage does not match its shape");
+  "matcher mask-logit storage does not match its shape");
+ TORCH_CHECK(
+  checked_extent({total_targets, points}, std::numeric_limits<int64_t>::max(), "matcher target-mask pointer extent") == target_masks.numel(), "matcher target-mask storage does not match its shape");
  const int64_t output_extent = checked_extent({batch, output.size(1), max_targets}, std::numeric_limits<int64_t>::max(), "matcher mask output pointer extent");
  TORCH_CHECK(output_extent <= output.numel(), "matcher mask output storage does not cover its checked pointer extent");
  const float checked_ce_cost = checked_cost_coefficient(ce_cost, "matcher mask cross-entropy cost");
@@ -220,15 +208,13 @@ void pairwise_mask_cost_cuda_add_(const torch::Tensor& output, const torch::Tens
  c10::cuda::CUDAGuard device_guard(output.device());
  constexpr int threads = 256;
  constexpr int warps_per_block = threads / 32;
- const int64_t pair_count =
-  checked_extent({batch, queries, max_targets}, static_cast<int64_t>(std::numeric_limits<int>::max()) * warps_per_block, "matcher mask cost");
+ const int64_t pair_count = checked_extent({batch, queries, max_targets}, static_cast<int64_t>(std::numeric_limits<int>::max()) * warps_per_block, "matcher mask cost");
  if (pair_count == 0) { return; }
  if (pred_mask_logits.size(2) == 0) { return; }
  const int blocks = static_cast<int>((pair_count + warps_per_block - 1) / warps_per_block);
  AT_DISPATCH_FLOATING_TYPES_AND2(at::ScalarType::Half, at::ScalarType::BFloat16, pred_mask_logits.scalar_type(), "pairwise_mask_cost", [&] {
-  matcher_mask_cost_kernel<scalar_t><<<blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
-   output.data_ptr<float>(), pred_mask_logits.data_ptr<scalar_t>(), target_masks.data_ptr<float>(), target_offsets.data_ptr<int64_t>(),
-   target_counts.data_ptr<int64_t>(), batch, queries, output.size(1), max_targets, total_targets, points, checked_ce_cost, checked_dice_cost);
+  matcher_mask_cost_kernel<scalar_t><<<blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(output.data_ptr<float>(), pred_mask_logits.data_ptr<scalar_t>(), target_masks.data_ptr<float>(),
+   target_offsets.data_ptr<int64_t>(), target_counts.data_ptr<int64_t>(), batch, queries, output.size(1), max_targets, total_targets, points, checked_ce_cost, checked_dice_cost);
  });
  TORCH_CHECK(cudaGetLastError() == cudaSuccess, "matcher mask cost CUDA kernel launch failed");
 }

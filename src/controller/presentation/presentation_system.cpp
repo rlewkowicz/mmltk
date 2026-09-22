@@ -17,35 +17,34 @@
 #include "src/common/types/generation.h"
 #include "src/frameworks/gpu/terminal_cuda_retirement_owner.h"
 namespace mmltk::controller {
-VisualDiagnosticFact presentation_diagnostic_fact(const VisualDiagnosticOperation operation, const PresentationDiagnosticRecord& record, const int device,
-                                                  const std::uint64_t outcome) noexcept {
+VisualDiagnosticFact presentation_diagnostic_fact(const VisualDiagnosticOperation operation, const PresentationDiagnosticRecord& record, const int device, const std::uint64_t outcome) noexcept {
  const auto& capability = record.publication.capability;
  return {.system = contracts::DiagnosticOwner::Presentation,
-         .operation = operation,
-         .device = device,
-         .generation = capability.generation,
-         .value = record.publication.presentation_revision,
-         .detail = outcome,
-         .context = {.capacity_width = capability.extent.width,
-                     .capacity_height = capability.extent.height,
-                     .surface_high = capability.surface_high,
-                     .surface_low = capability.surface_low,
-                     .selection_generation = record.submitted.selection_generation,
-                     .frame_revision = record.submitted.observation.frame.revision,
-                     .condition = static_cast<std::uint64_t>(capability.condition),
-                     .outcome = outcome,
-                     .source = visual_diagnostic_source(record.submitted.observation),
-                     .publication = {.presentation_revision = record.publication.presentation_revision},
-                     .allocation = {.allocation_generation = capability.generation},
-                     .transfer = {.transfer_sequence = record.publication.transfer_sequence, .timeline_ready = record.publication.timeline_ready},
-                     .link = record.link}};
+  .operation = operation,
+  .device = device,
+  .generation = capability.generation,
+  .value = record.publication.presentation_revision,
+  .detail = outcome,
+  .context = {.capacity_width = capability.extent.width,
+   .capacity_height = capability.extent.height,
+   .surface_high = capability.surface_high,
+   .surface_low = capability.surface_low,
+   .selection_generation = record.submitted.selection_generation,
+   .frame_revision = record.submitted.observation.frame.revision,
+   .condition = static_cast<std::uint64_t>(capability.condition),
+   .outcome = outcome,
+   .source = visual_diagnostic_source(record.submitted.observation),
+   .publication = {.presentation_revision = record.publication.presentation_revision},
+   .allocation = {.allocation_generation = capability.generation},
+   .transfer = {.transfer_sequence = record.publication.transfer_sequence, .timeline_ready = record.publication.timeline_ready},
+   .link = record.link}};
 }
 namespace gpu = mmltk::frameworks::gpu;
 class PresentationSystem::Impl final {
 public:
  static constexpr std::size_t kMaximumSources = 8U;
- Impl(const VisualDeviceSettings settings, PresentationNativeWriterFactory factory, const std::span<const VisualSourceReader> sources,
-      SystemEventSink<event_type> events, VisualDiagnosticSink diagnostics)
+ Impl(
+  const VisualDeviceSettings settings, PresentationNativeWriterFactory factory, const std::span<const VisualSourceReader> sources, SystemEventSink<event_type> events, VisualDiagnosticSink diagnostics)
      : settings_(settings), events_(std::move(events)), diagnostics_(diagnostics), writer_(CreateWriter(settings, factory)) {
   if (!settings_.valid() || sources.empty() || sources.size() > kMaximumSources) throw contracts::InvalidIntentError("Presentation configuration is invalid");
   for (const auto& source : sources) {
@@ -165,11 +164,8 @@ private:
   bool force = true;
  };
  void AdvanceRevision() { state_.revision = mmltk::common::types::advance_monotonic_identity(state_.revision); }
- std::span<const VisualSourceReader>::iterator Find(const PresentationSourceIdentity source) {
-  return std::ranges::find(sources_, source, &VisualSourceReader::source);
- }
- [[nodiscard]] static std::unique_ptr<PresentationNativeWriter> CreateWriter(const VisualDeviceSettings settings,
-                                                                             const PresentationNativeWriterFactory& factory) {
+ std::span<const VisualSourceReader>::iterator Find(const PresentationSourceIdentity source) { return std::ranges::find(sources_, source, &VisualSourceReader::source); }
+ [[nodiscard]] static std::unique_ptr<PresentationNativeWriter> CreateWriter(const VisualDeviceSettings settings, const PresentationNativeWriterFactory& factory) {
   if (!settings.valid() || !factory) throw contracts::InvalidIntentError("Presentation configuration is invalid");
   auto writer = factory();
   if (!writer) throw std::runtime_error("Presentation native writer is unavailable");
@@ -208,9 +204,8 @@ private:
    {
     std::scoped_lock lock(mutex_);
     const bool reserved = in_flight_ && in_flight_->selection_generation == pending->generation && in_flight_->observation.frame.source == pending->source;
-    if (reserved && !stopping_ && !stop.stop_requested() && observation.valid() && frame.source == pending->source &&
-        pending->generation == selection_generation_ && state_.selected == pending->source &&
-        (pending->force || state_.completed != frame || state_.completed_source_revision != observation.snapshot_revision)) {
+    if (reserved && !stopping_ && !stop.stop_requested() && observation.valid() && frame.source == pending->source && pending->generation == selection_generation_ &&
+        state_.selected == pending->source && (pending->force || state_.completed != frame || state_.completed_source_revision != observation.snapshot_revision)) {
      in_flight_ = submitted;
      submit = true;
     } else if (reserved) {
@@ -237,7 +232,7 @@ private:
                                                                                 .generation = pump_generation,
                                                                                 .value = pump_frame_revision,
                                                                                 .context = {.selection_generation = pump_generation, .source = pump_source}},
-                                                                               VisualDiagnosticOperation::PresentationPumpCompleted);
+                                              VisualDiagnosticOperation::PresentationPumpCompleted);
                                             }};
   const PresentationNativeOutcome outcome = writer_->Pump(pump_generation);
   pump_span.FinishWith([&](auto& fact) { fact.detail = static_cast<std::uint64_t>(outcome.progress); });
@@ -275,8 +270,7 @@ private:
       // Catch up to already-published source progress once.
       // An unchanged unavailable borrow waits for its owner's
       // notification; repeating it cannot make progress.
-      if (!pending_ && superseded_source_advanced && in_flight_->selection_generation == selection_generation_ &&
-          state_.selected == in_flight_->observation.frame.source)
+      if (!pending_ && superseded_source_advanced && in_flight_->selection_generation == selection_generation_ && state_.selected == in_flight_->observation.frame.source)
        pending_ = Pending{
         .source = state_.selected,
         .generation = selection_generation_,
@@ -319,21 +313,20 @@ private:
      .value = capability_snapshot.revision,
      .detail = static_cast<std::uint64_t>(capability_snapshot.capability.condition),
      .context = {.capacity_width = capability_snapshot.capability.extent.width,
-                 .capacity_height = capability_snapshot.capability.extent.height,
-                 .surface_high = capability_snapshot.capability.surface_high,
-                 .surface_low = capability_snapshot.capability.surface_low,
-                 .selection_generation = pump_generation,
-                 .frame_revision = pump_frame_revision,
-                 .condition = static_cast<std::uint64_t>(capability_snapshot.capability.condition),
-                 .outcome = 1U},
+      .capacity_height = capability_snapshot.capability.extent.height,
+      .surface_high = capability_snapshot.capability.surface_high,
+      .surface_low = capability_snapshot.capability.surface_low,
+      .selection_generation = pump_generation,
+      .frame_revision = pump_frame_revision,
+      .condition = static_cast<std::uint64_t>(capability_snapshot.capability.condition),
+      .outcome = 1U},
     };
    });
    Publish(event_type{PresentationCapabilityChanged{capability_snapshot}});
   }
   if (!publish) return;
   diagnostics_.Emit([&] {
-   auto fact = presentation_diagnostic_fact(VisualDiagnosticOperation::TimelineReady, {outcome.submitted, outcome.publication, outcome.diagnostic_link},
-                                            settings_.device, 1U);
+   auto fact = presentation_diagnostic_fact(VisualDiagnosticOperation::TimelineReady, {outcome.submitted, outcome.publication, outcome.diagnostic_link}, settings_.device, 1U);
    fact.value = completed.timeline_ready;
    return fact;
   });
@@ -405,8 +398,7 @@ private:
    // Capacity and shared custody are reserved before the worker starts.
    // A terminal receiver retains its borrowed source and CUDA resources.
    auto* retained_writer = retired.get();
-   std::move(retirement_)
-    .Install(gpu::TerminalCudaCustody::Share(std::move(retired)), result == Retirement::RetainedBrowserRead ? cudaSuccess : cudaErrorUnknown);
+   std::move(retirement_).Install(gpu::TerminalCudaCustody::Share(std::move(retired)), result == Retirement::RetainedBrowserRead ? cudaSuccess : cudaErrorUnknown);
    if (result == Retirement::RetainedBrowserRead) retained_writer->TerminalCustodyInstalled();
   }
   if (result == Retirement::UnsafeFailure || result == Retirement::ReleasedWithFailure) Failed({});
@@ -435,8 +427,8 @@ private:
  mmltk::common::io::ScopedFd control_fd_;
  std::jthread worker_;
 };
-PresentationSystem::PresentationSystem(const VisualDeviceSettings settings, PresentationNativeWriterFactory factory,
-                                       const std::span<const VisualSourceReader> sources, SystemEventSink<event_type> events, VisualDiagnosticSink diagnostics)
+PresentationSystem::PresentationSystem(
+ const VisualDeviceSettings settings, PresentationNativeWriterFactory factory, const std::span<const VisualSourceReader> sources, SystemEventSink<event_type> events, VisualDiagnosticSink diagnostics)
     : impl_(std::make_unique<Impl>(settings, std::move(factory), sources, std::move(events), diagnostics)) {}
 PresentationSystem::~PresentationSystem() {
  if (!impl_->stopped()) std::terminate();

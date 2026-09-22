@@ -18,19 +18,17 @@ using ValidationRuntimeFactory = std::function<std::unique_ptr<ValidationRuntime
 class ValidationSystem final {
 public:
  using event_type = std::variant<ValidationChanged, ValidationProgress>;
- using visual_source =
-  VisualSourceProjection<ValidationSnapshot, PresentationSourceKind::Validation, mmltk::frameworks::reflection::member_path<&ValidationSnapshot::frame>,
-                         mmltk::frameworks::reflection::member_path<&ValidationSnapshot::frame, &VisualFrame::revision>, ValidationImageMetadata>;
- ValidationSystem(SettingsSystem&, DatasetSystem&, ModelSystem&, ValidationRuntimeFactory, SystemEventSink<event_type> = {},
-                  std::optional<mmltk::frameworks::gpu::DeviceExecution> = {}, VisualDeviceSettings = {});
+ using visual_source = VisualSourceProjection<ValidationSnapshot, PresentationSourceKind::Validation, mmltk::frameworks::reflection::member_path<&ValidationSnapshot::frame>,
+  mmltk::frameworks::reflection::member_path<&ValidationSnapshot::frame, &VisualFrame::revision>, ValidationImageMetadata>;
+ ValidationSystem(
+  SettingsSystem&, DatasetSystem&, ModelSystem&, ValidationRuntimeFactory, SystemEventSink<event_type> = {}, std::optional<mmltk::frameworks::gpu::DeviceExecution> = {}, VisualDeviceSettings = {});
  ~ValidationSystem();
  [[= contracts::reflection::direct::IntentEndpoint{}]] [[nodiscard]] ValidationSnapshot Start(contracts::ValidateWorkflowIntent);
  [[= contracts::reflection::direct::IntentEndpoint{}]] [[nodiscard]] ValidationSnapshot Stop() noexcept;
  [[= contracts::reflection::direct::IntentEndpoint{}]] [[nodiscard]] ValidationSnapshot SelectSample(ValidationSampleIdentity);
  [[= contracts::reflection::direct::IntentEndpoint{}]] [[nodiscard]] ValidationSnapshot CloseDetail();
  [[= contracts::reflection::direct::IntentEndpoint{}]] [[nodiscard]] ValidationSnapshot SetOverlays(ValidationOverlays);
- [[= contracts::reflection::direct::IntentEndpoint{}]] [[nodiscard]] mmltk::backend::models::rfdetr::EvaluationDetailPage Details(
-  mmltk::backend::models::rfdetr::EvaluationDetailQuery) const;
+ [[= contracts::reflection::direct::IntentEndpoint{}]] [[nodiscard]] mmltk::backend::models::rfdetr::EvaluationDetailPage Details(mmltk::backend::models::rfdetr::EvaluationDetailQuery) const;
  [[= contracts::reflection::direct::InteractionEndpoint{}]] void Input(WorkspaceMouse);
  void SetInputPeer(std::uint64_t);
  void Shutdown() noexcept;

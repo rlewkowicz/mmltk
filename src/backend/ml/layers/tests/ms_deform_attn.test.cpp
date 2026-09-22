@@ -15,8 +15,7 @@ void test_cuda_ms_deform_attn_matches_reference() {
  auto value_ref = value.detach().clone().requires_grad_(true);
  auto sampling_ref = sampling_locations.detach().clone().requires_grad_(true);
  auto attention_ref = attention_weights.detach().clone().requires_grad_(true);
- const auto actual =
-  mmltk::backend::ml::layers::ms_deform_attn_cuda_autograd(value, spatial_shapes, level_start_index, sampling_locations, attention_weights, 64);
+ const auto actual = mmltk::backend::ml::layers::ms_deform_attn_cuda_autograd(value, spatial_shapes, level_start_index, sampling_locations, attention_weights, 64);
  const auto expected = mmltk::backend::ml::layers::ms_deform_attn_reference(value_ref, spatial_shapes, sampling_ref, attention_ref);
  REQUIRE((torch::allclose(actual, expected, 1.0e-4, 1.0e-4)));
  const auto grad = torch::randn_like(actual);

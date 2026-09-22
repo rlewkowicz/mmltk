@@ -28,8 +28,7 @@ namespace {
 [[nodiscard]] bool valid_event_name(const std::string_view event) noexcept {
  if (event.empty() || event.size() > 96U) return false;
  for (const unsigned char character : event) {
-  const bool valid = (character >= 'a' && character <= 'z') || (character >= 'A' && character <= 'Z') || (character >= '0' && character <= '9') ||
-                     character == '.' || character == '_';
+  const bool valid = (character >= 'a' && character <= 'z') || (character >= 'A' && character <= 'Z') || (character >= '0' && character <= '9') || character == '.' || character == '_';
   if (!valid) return false;
  }
  return true;
@@ -37,8 +36,7 @@ namespace {
 [[nodiscard]] bool valid_message_size(const RuntimeDiagnosticFact& fact) noexcept {
  // These bounded numeric objects batch one prepared image or one card grid.
  // The final encoder still enforces the unchanged whole-record capacity.
- const bool image_details =
-  fact.owner == contracts::DiagnosticOwner::Explore && (fact.event == "explore.augmentation.image.prepared" || fact.event == "explore.card.pixel_samples");
+ const bool image_details = fact.owner == contracts::DiagnosticOwner::Explore && (fact.event == "explore.augmentation.image.prepared" || fact.event == "explore.card.pixel_samples");
  return fact.message.size() <= (image_details ? 4096U : 1024U);
 }
 namespace wire = mmltk::frameworks::serialization::wire;
@@ -75,8 +73,7 @@ public:
   return append("}}");
  }
  [[nodiscard]] bool benchmark_event(const std::string_view event, const std::string_view json_fields, const std::int64_t steady_ns) noexcept {
-  return append("{\"kind\":\"benchmark_dataset\",\"steady_ns\":") && integer(steady_ns) && append(",\"name\":") && string(event) && append(",\"fields\":") &&
-         append(json_fields) && append("}");
+  return append("{\"kind\":\"benchmark_dataset\",\"steady_ns\":") && integer(steady_ns) && append(",\"name\":") && string(event) && append(",\"fields\":") && append(json_fields) && append("}");
  }
  [[nodiscard]] std::string_view view() const noexcept { return {destination_.data(), size_}; }
 
@@ -88,8 +85,8 @@ private:
    if (!valid) return;
    const auto& value = record.*Declaration::pointer;
    using Value = std::remove_cvref_t<decltype(value)>;
-   if constexpr (std::is_arithmetic_v<Value> || std::is_enum_v<Value> || std::is_same_v<Value, std::string_view> ||
-                 std::is_same_v<Value, contracts::DiagnosticTraceId> || std::is_same_v<Value, contracts::DiagnosticSpanId>) {
+   if constexpr (std::is_arithmetic_v<Value> || std::is_enum_v<Value> || std::is_same_v<Value, std::string_view> || std::is_same_v<Value, contracts::DiagnosticTraceId> ||
+                 std::is_same_v<Value, contracts::DiagnosticSpanId>) {
     valid = append(",") && string(field.member_name) && append(":");
     if (!valid) return;
     if constexpr (std::is_same_v<Value, contracts::DiagnosticOwner>)
@@ -269,8 +266,7 @@ void RuntimeDiagnosticTarget::write_benchmark_trace(const std::string_view event
  if (state_) state_->write_benchmark_trace(event, json_fields);
 }
 RuntimeDiagnostics::RuntimeDiagnostics(DiagnosticsProducer producer, const bool pixel_probes, const RuntimeDiagnosticDelivery delivery) {
- if (delivery == RuntimeDiagnosticDelivery::Complete && !producer.supports_complete_delivery())
-  throw std::runtime_error("complete diagnostics requires a background writer");
+ if (delivery == RuntimeDiagnosticDelivery::Complete && !producer.supports_complete_delivery()) throw std::runtime_error("complete diagnostics requires a background writer");
  if (!producer.enabled()) {
   if (delivery == RuntimeDiagnosticDelivery::Complete) throw std::runtime_error("complete diagnostics sink initialization failed");
   return;
@@ -281,14 +277,11 @@ RuntimeDiagnostics::RuntimeDiagnostics(DiagnosticsProducer producer, const bool 
   if (delivery == RuntimeDiagnosticDelivery::Complete) throw;
  }
 }
-RuntimeDiagnosticTarget RuntimeDiagnostics::target() noexcept {
- return state_ && state_->enabled() ? RuntimeDiagnosticTarget{state_} : RuntimeDiagnosticTarget{};
-}
+RuntimeDiagnosticTarget RuntimeDiagnostics::target() noexcept { return state_ && state_->enabled() ? RuntimeDiagnosticTarget{state_} : RuntimeDiagnosticTarget{}; }
 void RuntimeDiagnostics::Submit(void* const context, const RuntimeDiagnosticFact fact) noexcept {
  if (context != nullptr) { static_cast<RuntimeDiagnostics*>(context)->write(fact); }
 }
-void RuntimeDiagnostics::SubmitBrowserEvent(void* const context, const std::string_view event,
-                                            const mmltk::frameworks::serialization::wire::Value& fields) noexcept {
+void RuntimeDiagnostics::SubmitBrowserEvent(void* const context, const std::string_view event, const mmltk::frameworks::serialization::wire::Value& fields) noexcept {
  if (context != nullptr) { static_cast<RuntimeDiagnostics*>(context)->write_browser_event(event, fields); }
 }
 void RuntimeDiagnostics::SubmitBenchmarkTrace(void* const context, const std::string_view event, const std::string_view json_fields) noexcept {
@@ -308,8 +301,7 @@ void RuntimeDiagnosticTarget::State::write(const RuntimeDiagnosticFact fact, con
  if (!operation.enabled()) return;
  write(operation, fact, required);
 }
-void RuntimeDiagnosticTarget::State::write(const DiagnosticsProducer::Operation& operation, const RuntimeDiagnosticFact fact,
-                                           const bool required) const noexcept {
+void RuntimeDiagnosticTarget::State::write(const DiagnosticsProducer::Operation& operation, const RuntimeDiagnosticFact fact, const bool required) const noexcept {
  const std::string_view owner = owner_name(fact.owner);
  if (owner.empty() || !valid_event_name(fact.event) || (!fact.participant.empty() && !valid_event_name(fact.participant))) {
   fail_delivery();
@@ -365,8 +357,7 @@ void RuntimeDiagnosticTarget::State::write_batch(const std::span<const RuntimeDi
    complete));
  } catch (...) { fail_delivery(); }
 }
-void RuntimeDiagnosticTarget::State::write_browser_event(const std::string_view event,
-                                                         const mmltk::frameworks::serialization::wire::Value& fields) const noexcept {
+void RuntimeDiagnosticTarget::State::write_browser_event(const std::string_view event, const mmltk::frameworks::serialization::wire::Value& fields) const noexcept {
  const DiagnosticsProducer::Operation operation = complete ? producer.acquire_complete() : producer.acquire();
  if (!operation.enabled()) return;
  if (!valid_event_name(event)) {
@@ -389,8 +380,7 @@ void RuntimeDiagnosticTarget::State::write_browser_event(const std::string_view 
 void RuntimeDiagnosticTarget::State::write_benchmark_trace(const std::string_view event, const std::string_view json_fields) const noexcept {
  const DiagnosticsProducer::Operation operation = complete ? producer.acquire_complete() : producer.acquire();
  if (!operation.enabled()) return;
- if (!valid_event_name(event) || json_fields.empty() || json_fields.size() > DiagnosticsClient::kRecordCapacity ||
-     json_fields.find_first_of("\r\n") != std::string_view::npos) {
+ if (!valid_event_name(event) || json_fields.empty() || json_fields.size() > DiagnosticsClient::kRecordCapacity || json_fields.find_first_of("\r\n") != std::string_view::npos) {
   fail_delivery();
   return;
  }

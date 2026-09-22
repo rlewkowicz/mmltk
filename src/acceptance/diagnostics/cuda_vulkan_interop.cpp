@@ -83,8 +83,7 @@ static void transfer_fd(int original, Fd& received) {
  control.fill(0);
  if (recvmsg(receiver.value, &message, MSG_CMSG_CLOEXEC) != 1) throw std::runtime_error("recvmsg");
  header = CMSG_FIRSTHDR(&message);
- if (!header || header->cmsg_level != SOL_SOCKET || header->cmsg_type != SCM_RIGHTS || header->cmsg_len != CMSG_LEN(sizeof(int)) ||
-     message.msg_flags & (MSG_CTRUNC | MSG_TRUNC))
+ if (!header || header->cmsg_level != SOL_SOCKET || header->cmsg_type != SCM_RIGHTS || header->cmsg_len != CMSG_LEN(sizeof(int)) || message.msg_flags & (MSG_CTRUNC | MSG_TRUNC))
   throw std::runtime_error("invalid SCM_RIGHTS receipt");
  std::memcpy(&received.value, CMSG_DATA(header), sizeof(int));
 }
@@ -156,10 +155,7 @@ struct Device {
    CHECK(cuEventCreate(&producer_complete, CU_EVENT_DISABLE_TIMING));
    CHECK(cuCtxSetCurrent(context));
   }
-  std::printf("cuda_pid=%ld cuda_context=%s\n", static_cast<long>(getpid()),
-              mode == 2          ? "separate_producer_and_semaphore"
-              : isolated_context ? "isolated"
-                                 : "primary");
+  std::printf("cuda_pid=%ld cuda_context=%s\n", static_cast<long>(getpid()), mode == 2 ? "separate_producer_and_semaphore" : isolated_context ? "isolated" : "primary");
  }
  void initialize_vulkan(bool validation) {
   auto app = vk_structure<VkApplicationInfo>(VK_STRUCTURE_TYPE_APPLICATION_INFO);
@@ -175,11 +171,9 @@ struct Device {
   info.ppEnabledExtensionNames = &debug_extension;
   auto debug = vk_structure<VkDebugUtilsMessengerCreateInfoEXT>(VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT);
   debug.messageSeverity = VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT;
-  debug.messageType =
-   VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT;
+  debug.messageType = VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT;
   debug.pUserData = &validation_errors;
-  debug.pfnUserCallback = [](VkDebugUtilsMessageSeverityFlagBitsEXT severity, VkDebugUtilsMessageTypeFlagsEXT, const VkDebugUtilsMessengerCallbackDataEXT* data,
-                             void* user) -> VkBool32 {
+  debug.pfnUserCallback = [](VkDebugUtilsMessageSeverityFlagBitsEXT severity, VkDebugUtilsMessageTypeFlagsEXT, const VkDebugUtilsMessengerCallbackDataEXT* data, void* user) -> VkBool32 {
    if (severity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT) static_cast<std::atomic<unsigned>*>(user)->fetch_add(1, std::memory_order_relaxed);
    std::fprintf(stderr, "VULKAN: %s\n", data->pMessage);
    return VK_FALSE;
@@ -231,8 +225,7 @@ struct Device {
   external.pNext = &type;
   auto semaphore_properties = vk_structure<VkExternalSemaphoreProperties>(VK_STRUCTURE_TYPE_EXTERNAL_SEMAPHORE_PROPERTIES);
   vkGetPhysicalDeviceExternalSemaphoreProperties(physical, &external, &semaphore_properties);
-  if (!(semaphore_properties.externalSemaphoreFeatures & VK_EXTERNAL_SEMAPHORE_FEATURE_EXPORTABLE_BIT))
-   throw std::runtime_error("timeline opaque FD export unavailable");
+  if (!(semaphore_properties.externalSemaphoreFeatures & VK_EXTERNAL_SEMAPHORE_FEATURE_EXPORTABLE_BIT)) throw std::runtime_error("timeline opaque FD export unavailable");
   float priority = 1;
   auto queue_info = vk_structure<VkDeviceQueueCreateInfo>(VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO);
   queue_info.queueFamilyIndex = family;
@@ -428,8 +421,7 @@ struct Image {
   vkGetImageMemoryRequirements2(device.vk, &image_info, &requirements);
   if (!vulkan_only) CHECK(cuCtxSetCurrent(device.producer_context ? device.producer_context : device.context));
   bytes = std::max<uint64_t>(requirements.memoryRequirements.size, layout.offset + layout.rowPitch * height);
-  needs_dedicated =
-   dedicated.requiresDedicatedAllocation || (features & VK_EXTERNAL_MEMORY_FEATURE_DEDICATED_ONLY_BIT) || memory_owner == MemoryOwner::VulkanDedicated;
+  needs_dedicated = dedicated.requiresDedicatedAllocation || (features & VK_EXTERNAL_MEMORY_FEATURE_DEDICATED_ONLY_BIT) || memory_owner == MemoryOwner::VulkanDedicated;
   auto dedicate = vk_structure<VkMemoryDedicatedAllocateInfo>(VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO);
   dedicate.image = image;
   auto allocate = vk_structure<VkMemoryAllocateInfo>(VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO);
@@ -480,8 +472,8 @@ struct Image {
    transfer_fd(exported.value, backing);
    if (!vulkan_only) import_memory();
   }
-  std::printf("image=%ux%u pitch=%lu offset=%lu bytes=%zu memory_type=%u dedicated=%d cuda_va=%llu memory_owner=%s\n", width, height, layout.rowPitch,
-              layout.offset, bytes, allocate.memoryTypeIndex, needs_dedicated, address, memory_owner == MemoryOwner::Cuda ? "cuda" : "vulkan");
+  std::printf("image=%ux%u pitch=%lu offset=%lu bytes=%zu memory_type=%u dedicated=%d cuda_va=%llu memory_owner=%s\n", width, height, layout.rowPitch, layout.offset, bytes, allocate.memoryTypeIndex,
+   needs_dedicated, address, memory_owner == MemoryOwner::Cuda ? "cuda" : "vulkan");
   auto timeline = vk_structure<VkSemaphoreTypeCreateInfo>(VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO);
   timeline.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
   auto export_semaphore = vk_structure<VkExportSemaphoreCreateInfo>(VK_STRUCTURE_TYPE_EXPORT_SEMAPHORE_CREATE_INFO, &timeline);
@@ -762,8 +754,7 @@ static int vulkan_peer() {
   for (unsigned iteration = 0; iteration < settings.transfers; ++iteration) {
    for (unsigned slot = 0; slot < images.size(); ++slot) {
     auto write = receive_packet(socket.value, Operation::Write);
-    if (write.pair != pair || write.slot != slot || write.iteration != iteration || write.seed != pixel_seed(pair, slot, iteration) ||
-        write.ready != 2ULL * (iteration + 1))
+    if (write.pair != pair || write.slot != slot || write.iteration != iteration || write.seed != pixel_seed(pair, slot, iteration) || write.ready != 2ULL * (iteration + 1))
      throw std::runtime_error("invalid producer timeline or pixel identity");
     images[slot]->consume(write.ready, write.seed);
     write.operation = Operation::Compared;
@@ -789,9 +780,8 @@ static NativePair run_peer(Exporter& peer, Device& device, Packet settings) {
    auto& image = *images[slot];
    const auto allocation = receive_packet(peer.socket(), Operation::Allocation, &image.backing, &image.exported_semaphore);
    if (allocation.pair != pair || allocation.slot != slot || allocation.width != settings.width || allocation.height != settings.height ||
-       std::memcmp(&allocation.uuid, &device.uuid, sizeof(CUuuid)) || allocation.dedicated > 1 || (settings.owner == 2 && !allocation.dedicated) ||
-       allocation.pitch < uint64_t(settings.width) * 4 || allocation.offset > allocation.bytes ||
-       allocation.pitch > (allocation.bytes - allocation.offset) / settings.height)
+       std::memcmp(&allocation.uuid, &device.uuid, sizeof(CUuuid)) || allocation.dedicated > 1 || (settings.owner == 2 && !allocation.dedicated) || allocation.pitch < uint64_t(settings.width) * 4 ||
+       allocation.offset > allocation.bytes || allocation.pitch > (allocation.bytes - allocation.offset) / settings.height)
     throw std::runtime_error("invalid exported layout or device");
    image.bytes = allocation.bytes;
    image.layout.offset = allocation.offset;
@@ -800,8 +790,8 @@ static NativePair run_peer(Exporter& peer, Device& device, Packet settings) {
    image.import_memory();
    image.import_semaphore();
    CHECK(cuMemAllocHost(&image.native, size_t(settings.width) * settings.height * 4));
-   std::printf("native_import pair=%u slot=%u pitch=%lu offset=%lu bytes=%zu dedicated=%u retained_fd=%d cuda_va=%llu\n", pair, slot, image.layout.rowPitch,
-               image.layout.offset, image.bytes, allocation.dedicated, image.backing.value, image.address);
+   std::printf("native_import pair=%u slot=%u pitch=%lu offset=%lu bytes=%zu dedicated=%u retained_fd=%d cuda_va=%llu\n", pair, slot, image.layout.rowPitch, image.layout.offset, image.bytes,
+    allocation.dedicated, image.backing.value, image.address);
   }
   for (unsigned iteration = 0; iteration < settings.transfers; ++iteration) {
    for (unsigned slot = 0; slot < images.size(); ++slot) {
@@ -843,8 +833,8 @@ static void cross_process(Packet settings, unsigned context_mode) {
  for (auto& image : replaced) image->release_native();
  retained = {};
  replaced = {};
- std::printf("PASS process_mode=1 images=%u transfers=%u pixels_per_transfer=%lu replacement=settled final_release=complete\n", (settings.pairs + 1) * 2,
-             (settings.pairs + 1) * 2 * settings.transfers, size_t(settings.width) * settings.height);
+ std::printf("PASS process_mode=1 images=%u transfers=%u pixels_per_transfer=%lu replacement=settled final_release=complete\n", (settings.pairs + 1) * 2, (settings.pairs + 1) * 2 * settings.transfers,
+  size_t(settings.width) * settings.height);
 }
 int main(int argc, char** argv) {
  std::setvbuf(stdout, nullptr, _IOLBF, 0);
@@ -869,8 +859,8 @@ int main(int argc, char** argv) {
    if (error != std::errc{} || *end) throw std::runtime_error("invalid numeric argument");
   }
   auto [width, height, pairs, transfers, validation, context_mode, memory_owner, process_mode] = options;
-  if (!width || !height || width > 4096 || height > 4096 || !pairs || pairs > 256 || !transfers || transfers > 256 || validation > 1 || context_mode > 2 ||
-      memory_owner > 2 || process_mode > 1 || (process_mode && !memory_owner))
+  if (!width || !height || width > 4096 || height > 4096 || !pairs || pairs > 256 || !transfers || transfers > 256 || validation > 1 || context_mode > 2 || memory_owner > 2 || process_mode > 1 ||
+      (process_mode && !memory_owner))
    throw std::runtime_error("argument out of range");
   if (process_mode) {
    Packet settings{};

@@ -34,6 +34,6 @@ struct RectangularLsApWorkspace {
  std::pmr::vector<std::intptr_t> remaining_columns;
  std::pmr::vector<std::intptr_t> sorted_indices;
 };
-RectangularLsApStatus solve_rectangular_linear_sum_assignment(int64_t num_rows, int64_t num_cols, const double* cost_matrix, bool maximize,
-                                                              int64_t* row_indices, int64_t* col_indices, RectangularLsApWorkspace& workspace);
+RectangularLsApStatus solve_rectangular_linear_sum_assignment(
+ int64_t num_rows, int64_t num_cols, const double* cost_matrix, bool maximize, int64_t* row_indices, int64_t* col_indices, RectangularLsApWorkspace& workspace);
 }  // namespace mmltk::backend::models::rfdetr

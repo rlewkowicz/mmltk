@@ -19,14 +19,12 @@ namespace {
 }
 }  // namespace
 std::size_t validate_runtime_tensor_buffer(const RuntimeTensorDescriptor& descriptor, const RuntimeTensorBuffer& buffer, const RuntimeShape* resolved_shape) {
- if (descriptor.name.empty() || buffer.device_data == nullptr || descriptor.element_type != buffer.element_type ||
-     descriptor.shape.rank > kMaximumRuntimeRank || buffer.shape.rank > kMaximumRuntimeRank || descriptor.shape.rank != buffer.shape.rank) {
+ if (descriptor.name.empty() || buffer.device_data == nullptr || descriptor.element_type != buffer.element_type || descriptor.shape.rank > kMaximumRuntimeRank ||
+     buffer.shape.rank > kMaximumRuntimeRank || descriptor.shape.rank != buffer.shape.rank) {
   throw std::invalid_argument("invalid runtime tensor descriptor");
  }
  const RuntimeShape& actual = resolved_shape == nullptr ? buffer.shape : *resolved_shape;
- if (actual.rank > kMaximumRuntimeRank || actual.rank != descriptor.shape.rank || actual.rank != buffer.shape.rank) {
-  throw std::invalid_argument("runtime tensor rank mismatch");
- }
+ if (actual.rank > kMaximumRuntimeRank || actual.rank != descriptor.shape.rank || actual.rank != buffer.shape.rank) { throw std::invalid_argument("runtime tensor rank mismatch"); }
  std::size_t elements = 1U;
  for (std::size_t axis = 0U; axis < actual.rank; ++axis) {
   const std::int64_t declared = descriptor.shape.extents[axis];
@@ -41,9 +39,7 @@ std::size_t validate_runtime_tensor_buffer(const RuntimeTensorDescriptor& descri
   elements *= extent;
  }
  const std::size_t scalar_bytes = element_bytes(buffer.element_type);
- if (scalar_bytes == 0U || elements > std::numeric_limits<std::size_t>::max() / scalar_bytes) {
-  throw std::overflow_error("runtime tensor byte count overflow");
- }
+ if (scalar_bytes == 0U || elements > std::numeric_limits<std::size_t>::max() / scalar_bytes) { throw std::overflow_error("runtime tensor byte count overflow"); }
  const std::size_t required = elements * scalar_bytes;
  if (buffer.capacity_bytes < required) { throw std::invalid_argument("runtime tensor capacity is too small"); }
  return required;

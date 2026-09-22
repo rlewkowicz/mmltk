@@ -13,8 +13,7 @@ NumaHostTensor::NumaHostTensor(int device, std::shared_ptr<void> context_custody
 at::Tensor NumaHostTensor::view(at::IntArrayRef shape, at::ScalarType dtype) {
  std::size_t bytes = c10::elementSize(dtype);
  for (const auto size : shape) {
-  if (size < 0 || (size && bytes > std::numeric_limits<std::size_t>::max() / static_cast<std::size_t>(size)))
-   throw std::invalid_argument("NUMA host tensor shape overflows");
+  if (size < 0 || (size && bytes > std::numeric_limits<std::size_t>::max() / static_cast<std::size_t>(size))) throw std::invalid_argument("NUMA host tensor shape overflows");
   bytes *= static_cast<std::size_t>(size);
  }
  // Existing tensor views must never be invalidated by high-water growth.

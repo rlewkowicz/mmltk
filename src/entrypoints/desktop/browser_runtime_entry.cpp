@@ -57,8 +57,8 @@ private:
  static_cast<void>(std::to_chars(detail.data() + prefix.size(), detail.data() + detail.size() - 1U, error));
  return detail;
 }
-[[nodiscard]] int fail_closed(mmltk::controller::shell::ApplicationShell& shell, const std::string_view stage, const std::string_view detail = {},
-                              const std::optional<int> status = std::nullopt) noexcept {
+[[nodiscard]] int fail_closed(
+ mmltk::controller::shell::ApplicationShell& shell, const std::string_view stage, const std::string_view detail = {}, const std::optional<int> status = std::nullopt) noexcept {
  mmltk::common::logging::report_fatal(stage, detail, status);
  shell.request_shutdown(mmltk::controller::shell::ApplicationShutdownReason::InfrastructureFailure);
  static_cast<void>(shell.shutdown());
@@ -85,8 +85,8 @@ public:
          shell.request_shutdown(mmltk::controller::shell::ApplicationShutdownReason::InfrastructureFailure);
          return;
         }
-        shell.request_shutdown(signal.ssi_signo == SIGINT ? mmltk::controller::shell::ApplicationShutdownReason::SignalInterrupt
-                                                          : mmltk::controller::shell::ApplicationShutdownReason::SignalTerminate);
+        shell.request_shutdown(
+         signal.ssi_signo == SIGINT ? mmltk::controller::shell::ApplicationShutdownReason::SignalInterrupt : mmltk::controller::shell::ApplicationShutdownReason::SignalTerminate);
        }) {}
  ~SignalWaiter() {
   thread_.request_stop();
@@ -127,8 +127,8 @@ private:
  std::string result;
  result.reserve(value.size());
  for (const unsigned char character : value) {
-  if ((character >= 'a' && character <= 'z') || (character >= 'A' && character <= 'Z') || (character >= '0' && character <= '9') || character == '-' ||
-      character == '_' || character == '.' || character == '~') {
+  if ((character >= 'a' && character <= 'z') || (character >= 'A' && character <= 'Z') || (character >= '0' && character <= '9') || character == '-' || character == '_' || character == '.' ||
+      character == '~') {
    result.push_back(static_cast<char>(character));
   } else {
    result.push_back('%');
@@ -192,36 +192,29 @@ int main(int argc, char** argv) {
    const char* const completion_gate = std::getenv("MMLTK_RUN_WORKSPACE_WAYLAND_COMPLETION_GATE");
    if (completion_gate != nullptr && std::string_view{completion_gate} == "1") {
     config.completion_acceptance = std::make_shared<mmltk::controller::PresentationAcceptanceGate>();
-    config.explore.acceptance->SetReadObserver(config.explore.acceptance.get(), [](void* owner, std::uint64_t generation, std::uint32_t index) {
-     static_cast<mmltk::controller::ExploreAcceptanceGate*>(owner)->AwaitVisibleRead(generation, index);
-    });
+    config.explore.acceptance->SetReadObserver(config.explore.acceptance.get(),
+     [](void* owner, std::uint64_t generation, std::uint32_t index) { static_cast<mmltk::controller::ExploreAcceptanceGate*>(owner)->AwaitVisibleRead(generation, index); });
    }
    const char* const pending_supersession = std::getenv("MMLTK_RUN_WORKSPACE_WAYLAND_PENDING_SUPERSESSION");
    config.pending_supersession_acceptance = pending_supersession != nullptr && std::string_view{pending_supersession} == "1";
-   if (config.pending_supersession_acceptance && !config.completion_acceptance)
-    config.completion_acceptance = std::make_shared<mmltk::controller::PresentationAcceptanceGate>();
+   if (config.pending_supersession_acceptance && !config.completion_acceptance) config.completion_acceptance = std::make_shared<mmltk::controller::PresentationAcceptanceGate>();
   }
   if (lifecycle_trace != nullptr && *lifecycle_trace != '\0') {
    config.diagnostics = mmltk::controller::services::DiagnosticsClient{std::filesystem::path{lifecycle_trace}};
    if (integration) config.diagnostic_delivery = mmltk::controller::services::RuntimeDiagnosticDelivery::Complete;
   }
   config.settings_location = production_settings_location();
-  const int diagnostics_terminal =
-   config.diagnostic_delivery == mmltk::controller::services::RuntimeDiagnosticDelivery::Complete ? config.diagnostics.terminal_fd() : -1;
+  const int diagnostics_terminal = config.diagnostic_delivery == mmltk::controller::services::RuntimeDiagnosticDelivery::Complete ? config.diagnostics.terminal_fd() : -1;
   mmltk::controller::shell::ApplicationShell shell{std::move(config)};
   try {
    const std::filesystem::path assets = configured_root("MMLTK_BROWSER_APP_ASSET_ROOT_OVERRIDE", MMLTK_BROWSER_APP_ASSET_ROOT);
    std::string page_query;
    if (integration) {
     page_query = "mmltk_integration=1";
-    if (const char* fixture = std::getenv("MMLTK_RUN_WORKSPACE_WAYLAND_PIXEL_FIXTURE"); fixture != nullptr && std::string_view{fixture} == "1")
-     page_query += "&mmltk_integration_pixel_fixture=1";
-    if (const char* scenario = std::getenv("MMLTK_RUN_WORKSPACE_WAYLAND_VIEWER_SCENARIO"); scenario != nullptr)
-     page_query += "&mmltk_integration_viewer_scenario=" + query_value(scenario);
-    if (const char* square = std::getenv("MMLTK_RUN_WORKSPACE_WAYLAND_SQUARE_SOURCE"); square != nullptr)
-     page_query += "&mmltk_integration_square_source=" + query_value(square);
-    if (const char* square = std::getenv("MMLTK_RUN_WORKSPACE_WAYLAND_SQUARE_COMPILED"); square != nullptr)
-     page_query += "&mmltk_integration_square_compiled=" + query_value(square);
+    if (const char* fixture = std::getenv("MMLTK_RUN_WORKSPACE_WAYLAND_PIXEL_FIXTURE"); fixture != nullptr && std::string_view{fixture} == "1") page_query += "&mmltk_integration_pixel_fixture=1";
+    if (const char* scenario = std::getenv("MMLTK_RUN_WORKSPACE_WAYLAND_VIEWER_SCENARIO"); scenario != nullptr) page_query += "&mmltk_integration_viewer_scenario=" + query_value(scenario);
+    if (const char* square = std::getenv("MMLTK_RUN_WORKSPACE_WAYLAND_SQUARE_SOURCE"); square != nullptr) page_query += "&mmltk_integration_square_source=" + query_value(square);
+    if (const char* square = std::getenv("MMLTK_RUN_WORKSPACE_WAYLAND_SQUARE_COMPILED"); square != nullptr) page_query += "&mmltk_integration_square_compiled=" + query_value(square);
     const char* const window_close = std::getenv("MMLTK_RUN_WORKSPACE_WAYLAND_WINDOW_CLOSE");
     if (window_close != nullptr && std::string_view{window_close} == "1") page_query += "&mmltk_integration_window_close=1";
     const char* const source = std::getenv("MMLTK_RUN_WORKSPACE_WAYLAND_DATASET_SOURCE");
@@ -240,18 +233,16 @@ int main(int argc, char** argv) {
     if (!page_query.empty()) page_query += '&';
     page_query += "mmltk_pixel_trace=1";
    }
-   if (!shell.start_browser_host({.asset_root = assets, .session_token = session_token(), .page_query = std::move(page_query)})) {
-    return fail_closed(shell, "browser host start failed");
-   }
+   if (!shell.start_browser_host({.asset_root = assets, .session_token = session_token(), .page_query = std::move(page_query)})) { return fail_closed(shell, "browser host start failed"); }
    auto& server = shell.browser_server();
    if (!server.running()) { return fail_closed(shell, "browser server stopped during startup"); }
    auto page = server.page_url();
    if (!page) return fail_closed(shell, "browser page URL unavailable");
    const auto process_start = shell.start_firefox({.executable = configured_root("MMLTK_FIREFOX_RUNTIME_ROOT_OVERRIDE", MMLTK_FIREFOX_RUNTIME_ROOT) / "firefox",
-                                                   .page_url = std::move(*page),
-                                                   .log_file = firefox_log_file(),
-                                                   .integration = integration,
-                                                   .integration_high_dpi = integration_high_dpi});
+    .page_url = std::move(*page),
+    .log_file = firefox_log_file(),
+    .integration = integration,
+    .integration_high_dpi = integration_high_dpi});
    if (process_start == mmltk::controller::services::FirefoxProcessStartResult::Terminal) {
     const auto firefox = shell.firefox_lifecycle();
     const auto detail = firefox_error_detail(firefox.error_code);

@@ -72,11 +72,9 @@ std::string worker_name_for_index(const std::string& prefix, const std::size_t i
 }
 }  // namespace
 WorkerPool::WorkerPool(const std::size_t worker_count, std::vector<int> cpu_affinity, std::string thread_name_prefix, const std::size_t queued_capacity,
-                       const mmltk::common::system::ExecutionPlacement* placement, const bool storage_worker)
+ const mmltk::common::system::ExecutionPlacement* placement, const bool storage_worker)
     : impl_(std::make_unique<Impl>()) {
- if (worker_count == 0U || worker_count > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
-  throw std::runtime_error("worker_count must be greater than zero");
- }
+ if (worker_count == 0U || worker_count > static_cast<std::size_t>(std::numeric_limits<int>::max())) { throw std::runtime_error("worker_count must be greater than zero"); }
  if (placement) {
   if (placement->numa_node < 0 || placement->cpus.empty()) throw std::invalid_argument("worker placement is unresolved");
   for (int cpu : placement->cpus)
@@ -94,8 +92,7 @@ WorkerPool::WorkerPool(const std::size_t worker_count, std::vector<int> cpu_affi
  impl_->storage_worker = storage_worker;
  impl_->thread_name_prefix = std::move(thread_name_prefix);
  const auto actual_worker_count =
-  placement ? worker_count
-            : static_cast<std::size_t>(mmltk::common::system::clamp_worker_count_to_cpus(static_cast<int>(worker_count), impl_->cpu_affinity.size(), 0, 1));
+  placement ? worker_count : static_cast<std::size_t>(mmltk::common::system::clamp_worker_count_to_cpus(static_cast<int>(worker_count), impl_->cpu_affinity.size(), 0, 1));
  impl_->tasks.resize(std::max(queued_capacity, actual_worker_count));
  impl_->workers.reserve(actual_worker_count);
  impl_->policies.resize(actual_worker_count);
@@ -153,9 +150,7 @@ WorkerPool::WorkerPool(const std::size_t worker_count, std::vector<int> cpu_affi
       std::lock_guard lock(impl_->mutex);
       if (impl_->pending_tasks == 0U) {
        impl_->shutdown = true;
-       if (impl_->startup_error == nullptr) {
-        impl_->startup_error = std::make_exception_ptr(std::runtime_error("worker pool internal task accounting underflow"));
-       }
+       if (impl_->startup_error == nullptr) { impl_->startup_error = std::make_exception_ptr(std::runtime_error("worker pool internal task accounting underflow")); }
        impl_->work_cv.notify_all();
        impl_->idle_cv.notify_all();
        impl_->startup_cv.notify_all();

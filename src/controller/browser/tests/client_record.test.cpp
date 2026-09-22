@@ -33,8 +33,7 @@ struct ClientFixture final {
 class FixtureFileDialogSystem final {
 public:
  using event_type = std::variant<mmltk::controller::FileDialogFailed>;
- [[= mmltk::controller::contracts::reflection::direct::IntentEndpoint{}]] [[nodiscard]] mmltk::controller::FileDialogSnapshot Open(
-  mmltk::controller::services::FileDialogOpen request) {
+ [[= mmltk::controller::contracts::reflection::direct::IntentEndpoint{}]] [[nodiscard]] mmltk::controller::FileDialogSnapshot Open(mmltk::controller::services::FileDialogOpen request) {
   const auto dialog = mmltk::controller::services::file_dialog_catalog().resolve(request);
   if (!dialog) throw mmltk::controller::contracts::InvalidIntentError("unknown fixture file dialog");
   opened = request;
@@ -53,14 +52,12 @@ public:
  [[= mmltk::controller::contracts::reflection::direct::IntentEndpoint{}]] [[nodiscard]] mmltk::controller::contracts::SettingsUiState Update(
   mmltk::controller::contracts::SettingsUpdateRequest request) {
   state = mmltk::controller::contracts::default_gui_settings_state();
-  const auto applied =
-   mmltk::controller::contracts::apply_gui_settings_values(state, std::span<const mmltk::controller::contracts::SettingsValueUpdate>{request.updates});
+  const auto applied = mmltk::controller::contracts::apply_gui_settings_values(state, std::span<const mmltk::controller::contracts::SettingsValueUpdate>{request.updates});
   if (!applied) throw mmltk::controller::contracts::InvalidIntentError("invalid fixture settings update");
   latest = std::move(request);
   return snapshot();
  }
- [[= mmltk::controller::contracts::reflection::Snapshot{
-  mmltk::controller::contracts::kSettingsUiStateByteBudget}]] [[nodiscard]] mmltk::controller::contracts::SettingsUiState snapshot() const {
+ [[= mmltk::controller::contracts::reflection::Snapshot{mmltk::controller::contracts::kSettingsUiStateByteBudget}]] [[nodiscard]] mmltk::controller::contracts::SettingsUiState snapshot() const {
   return {.revision = 1U, .settings_state = state, .validation_source = mmltk::controller::contracts::resolve_validation_source(state)};
  }
  mmltk::controller::contracts::GuiSettingsState state{};
@@ -69,19 +66,14 @@ public:
 class FixtureExploreSystem final {
 public:
  using event_type = std::variant<mmltk::controller::ExploreChanged>;
- [[= mmltk::controller::contracts::reflection::direct::InteractionEndpoint{}]] void UpdateViewport(mmltk::controller::ExploreViewportUpdate request) {
-  latest = request.viewport;
- }
- [[= mmltk::controller::contracts::reflection::Snapshot{64U * 1024U}]] [[nodiscard]] mmltk::controller::ExploreSnapshot snapshot() const {
-  return {.viewport = latest};
- }
+ [[= mmltk::controller::contracts::reflection::direct::InteractionEndpoint{}]] void UpdateViewport(mmltk::controller::ExploreViewportUpdate request) { latest = request.viewport; }
+ [[= mmltk::controller::contracts::reflection::Snapshot{64U * 1024U}]] [[nodiscard]] mmltk::controller::ExploreSnapshot snapshot() const { return {.viewport = latest}; }
  mmltk::controller::ExploreViewport latest{};
 };
 class FixtureAnnotationSystem final {
 public:
  using event_type = std::variant<mmltk::controller::AnnotationChanged>;
- [[= mmltk::controller::contracts::reflection::direct::IntentEndpoint{}]] [[nodiscard]] mmltk::controller::AnnotationSnapshot Edit(
-  mmltk::controller::AnnotationEditRequest request) {
+ [[= mmltk::controller::contracts::reflection::direct::IntentEndpoint{}]] [[nodiscard]] mmltk::controller::AnnotationSnapshot Edit(mmltk::controller::AnnotationEditRequest request) {
   if (const auto* category = std::get_if<mmltk::controller::AnnotationCategoryEdit>(&request.edit.value); category != nullptr && !category->category.valid())
    throw mmltk::controller::contracts::InvalidIntentError("invalid fixture annotation category");
   alternatives.push_back(request.edit.value.index());
@@ -164,12 +156,9 @@ TEST_CASE("integration control retains typed direction and sequence validation",
  using Kind = mmltk::controller::contracts::IntegrationControlKind;
  wire::ByteBuffer encoded;
  mmltk::controller::contracts::visit_integration_commands([&]<auto kind, auto policy>(auto) {
-  const IntegrationControl source{.receipt = {.kind = kind,
-                                              .sequence = 3U,
-                                              .progress = policy.server ? 0U : 5U,
-                                              .failureline = kind == Kind::Failed ? 123U : 0U,
-                                              .read_generation = policy.read_generation ? 7U : 0U,
-                                              .compiled_index = 0U}};
+  const IntegrationControl source{
+   .receipt = {
+    .kind = kind, .sequence = 3U, .progress = policy.server ? 0U : 5U, .failureline = kind == Kind::Failed ? 123U : 0U, .read_generation = policy.read_generation ? 7U : 0U, .compiled_index = 0U}};
   check_integration_round_trip(source, policy.server, encoded);
   auto invalid = source.receipt;
   invalid.read_generation = policy.read_generation ? 0U : 7U;
@@ -184,8 +173,7 @@ TEST_CASE("integration control retains typed direction and sequence validation",
 TEST_CASE("integration failure text has a bounded failed-only canonical payload", "[controller][browser][protocol]") {
  using namespace mmltk::controller::contracts;
  for (const auto size : {0U, 1U, static_cast<unsigned>(kIntegrationFailureMaxBytes)}) {
-  IntegrationControl source{
-   .receipt = {.kind = IntegrationControlKind::Failed, .sequence = 3U, .progress = 7U, .failureline = 123U, .failure = std::string(size, 'x')}};
+  IntegrationControl source{.receipt = {.kind = IntegrationControlKind::Failed, .sequence = 3U, .progress = 7U, .failureline = 123U, .failure = std::string(size, 'x')}};
   wire::ByteBuffer encoded;
   check_integration_round_trip(source, false, encoded);
   source.receipt.failure.assign(kIntegrationFailureMaxBytes + 1U, 'x');
@@ -193,8 +181,7 @@ TEST_CASE("integration failure text has a bounded failed-only canonical payload"
  }
  visit_integration_commands([&]<auto kind, auto policy>(auto) {
   if constexpr (kind != IntegrationControlKind::Failed) {
-   const IntegrationControl source{
-    .receipt = {.kind = kind, .sequence = 3U, .read_generation = policy.read_generation ? 1U : 0U, .failure = "Protocol: invalid frame"}};
+   const IntegrationControl source{.receipt = {.kind = kind, .sequence = 3U, .read_generation = policy.read_generation ? 1U : 0U, .failure = "Protocol: invalid frame"}};
    CHECK_FALSE(integration_receipt_valid(source.receipt));
   }
  });
@@ -274,8 +261,7 @@ TEST_CASE("Rust Protocol-17 client fixtures are accepted by native codec", "[con
  CHECK(interaction.endpoint_id == application_stable_id("explore", "UpdateViewport"));
  ExploreViewportUpdate decoded_interaction{};
  REQUIRE(mmltk::frameworks::serialization::decode_compact_into(
-  decoded_interaction, {.first = interaction.value},
-  {.max_bytes = kMaxIntentValueBytes, .max_items = kMaxIntentValueItems, .max_depth = kMaxIntentValueDepth}));
+  decoded_interaction, {.first = interaction.value}, {.max_bytes = kMaxIntentValueBytes, .max_items = kMaxIntentValueItems, .max_depth = kMaxIntentValueDepth}));
  CHECK(decoded_interaction.viewport.first_row == 0U);
  CHECK(decoded_interaction.viewport.row_count == 1U);
  CHECK(decoded_interaction.viewport.columns == 1U);
@@ -311,8 +297,7 @@ TEST_CASE("Rust Protocol-17 client fixtures are accepted by native codec", "[con
  unknown[1] = std::byte{0x17};
  CHECK_FALSE(decode_interaction_view(unknown));
  CHECK_FALSE(decode_client_record({.first = unknown}));
- REQUIRE(mmltk::frameworks::serialization::encode(ClientRecord{interaction}, projected,
-                                                  {.max_bytes = kMaxRecordWireBytes, .max_items = kMaxIntentValueItems, .max_depth = kMaxIntentValueDepth}));
+ REQUIRE(mmltk::frameworks::serialization::encode(ClientRecord{interaction}, projected, {.max_bytes = kMaxRecordWireBytes, .max_items = kMaxIntentValueItems, .max_depth = kMaxIntentValueDepth}));
  CHECK_FALSE(decode_interaction_view(projected));
  CHECK_FALSE(decode_client_record({.first = projected}));
  const auto accepted_interaction = dispatch_interaction(systems, interaction);
@@ -359,8 +344,7 @@ TEST_CASE("browser server records preserve reply and event error vocabulary", "[
  const auto decoded = decode_server_record(wire::ByteSegments{.first = encoded, .second = {}});
  REQUIRE(decoded);
  CHECK(*decoded == failed);
- for (const auto delivery :
-      {mmltk::controller::contracts::reflection::EventDelivery::Transient, mmltk::controller::contracts::reflection::EventDelivery::Critical,
+ for (const auto delivery : {mmltk::controller::contracts::reflection::EventDelivery::Transient, mmltk::controller::contracts::reflection::EventDelivery::Critical,
        mmltk::controller::contracts::reflection::EventDelivery::LatestState}) {
   const ServerRecord event = SystemEvent{
    .system_id = 29U,
@@ -377,12 +361,9 @@ TEST_CASE("browser server records preserve reply and event error vocabulary", "[
 }
 TEST_CASE("consumed server records retain empty and large nested leaf ownership", "[controller][browser][protocol][limits]") {
  for (const std::size_t size : {0U, 65535U, 65536U, 65537U}) {
-  const wire::Value payload(
-   wire::Value::Object{{"nested", wire::Value(wire::Value::Array{wire::Value(std::string(size, 'x')), wire::Value(wire::ByteBuffer(size, std::byte{0xa5}))})}});
-  for (const ServerRecord& source :
-       std::array<ServerRecord, 3U>{SystemEvent{.system_id = 1U, .event_id = 2U, .state_revision = 7U, .value = payload},
-                                    Bootstrap{.schema_fingerprint = {11U, 13U}, .input_epoch = 1U, .snapshots = {{.system_id = 1U, .value = payload}}},
-                                    IntentReply{.correlation = 9U, .result = payload}}) {
+  const wire::Value payload(wire::Value::Object{{"nested", wire::Value(wire::Value::Array{wire::Value(std::string(size, 'x')), wire::Value(wire::ByteBuffer(size, std::byte{0xa5}))})}});
+  for (const ServerRecord& source : std::array<ServerRecord, 3U>{SystemEvent{.system_id = 1U, .event_id = 2U, .state_revision = 7U, .value = payload},
+        Bootstrap{.schema_fingerprint = {11U, 13U}, .input_epoch = 1U, .snapshots = {{.system_id = 1U, .value = payload}}}, IntentReply{.correlation = 9U, .result = payload}}) {
    auto owned = source;
    wire::ByteBuffer expected;
    REQUIRE(encode_server_record(source, expected));
@@ -403,13 +384,10 @@ TEST_CASE("consumed server records retain empty and large nested leaf ownership"
 TEST_CASE("complete server records preserve exact 64 KiB neighboring extents", "[controller][browser][protocol][limits]") {
  for (const std::size_t target : {65535U, 65536U, 65537U}) {
   const auto payload = [](std::size_t text_size) {
-   return wire::Value(wire::Value::Object{
-    {"nested", wire::Value(wire::Value::Array{wire::Value(std::string(text_size, 'x')), wire::Value(wire::ByteBuffer(31U, std::byte{0xa5}))})}});
+   return wire::Value(wire::Value::Object{{"nested", wire::Value(wire::Value::Array{wire::Value(std::string(text_size, 'x')), wire::Value(wire::ByteBuffer(31U, std::byte{0xa5}))})}});
   };
-  for (ServerRecord source :
-       std::array<ServerRecord, 3U>{SystemEvent{.system_id = 1U, .event_id = 2U, .state_revision = 7U, .value = payload(32768U)},
-                                    Bootstrap{.schema_fingerprint = {11U, 13U}, .input_epoch = 1U, .snapshots = {{.system_id = 1U, .value = payload(32768U)}}},
-                                    IntentReply{.correlation = 9U, .result = payload(32768U)}}) {
+  for (ServerRecord source : std::array<ServerRecord, 3U>{SystemEvent{.system_id = 1U, .event_id = 2U, .state_revision = 7U, .value = payload(32768U)},
+        Bootstrap{.schema_fingerprint = {11U, 13U}, .input_epoch = 1U, .snapshots = {{.system_id = 1U, .value = payload(32768U)}}}, IntentReply{.correlation = 9U, .result = payload(32768U)}}) {
    wire::ByteBuffer expected;
    REQUIRE(encode_server_record(source, expected));
    REQUIRE(expected.size() < target);
@@ -443,22 +421,17 @@ TEST_CASE("output records admit bounded scene collections and complete bootstrap
  namespace cbor = mmltk::frameworks::serialization;
  wire::ByteBuffer encoded;
  wire::Value::Array objects(4096U, wire::Value(std::uint64_t{1U}));
- const ServerRecord event = SystemEvent{.system_id = 1U,
-                                        .event_id = 2U,
-                                        .delivery = mmltk::controller::contracts::reflection::EventDelivery::LatestState,
-                                        .state_revision = 1U,
-                                        .value = wire::Value(std::move(objects))};
+ const ServerRecord event =
+  SystemEvent{.system_id = 1U, .event_id = 2U, .delivery = mmltk::controller::contracts::reflection::EventDelivery::LatestState, .state_revision = 1U, .value = wire::Value(std::move(objects))};
  REQUIRE(encode_server_record(event, encoded));
- const auto event_payload_bytes =
-  cbor::measure(std::get<SystemEvent>(event).value, {.max_bytes = kMaxOutputValueBytes, .max_items = kMaxOutputValueItems, .max_depth = kMaxIntentValueDepth});
+ const auto event_payload_bytes = cbor::measure(std::get<SystemEvent>(event).value, {.max_bytes = kMaxOutputValueBytes, .max_items = kMaxOutputValueItems, .max_depth = kMaxIntentValueDepth});
  REQUIRE(event_payload_bytes);
  CHECK(encoded.size() <= cbor::reflected_structural_cbor_bytes<std::variant<SystemEvent>>(*event_payload_bytes));
  const auto decoded = decode_server_record(wire::ByteSegments{.first = encoded, .second = {}});
  REQUIRE(decoded);
  CHECK(*decoded == event);
  const wire::Value payload(std::string(kMaxOutputValueBytes, 'x'));
- const ServerRecord bootstrap =
-  Bootstrap{.schema_fingerprint = {11U, 13U}, .input_epoch = 1U, .snapshots = {{.system_id = 1U, .value = payload}, {.system_id = 2U, .value = payload}}};
+ const ServerRecord bootstrap = Bootstrap{.schema_fingerprint = {11U, 13U}, .input_epoch = 1U, .snapshots = {{.system_id = 1U, .value = payload}, {.system_id = 2U, .value = payload}}};
  REQUIRE(encode_server_record(bootstrap, encoded));
  CHECK(encoded.size() > kMaxOutputValueBytes * 2U);
  CHECK(encoded.size() <= kMaxRecordWireBytes);
@@ -534,10 +507,8 @@ TEST_CASE("Bootstrap uses the compact protocol-17 fingerprint and bounded snapsh
  auto zero_epoch = std::get<Bootstrap>(bootstrap);
  zero_epoch.input_epoch = 0U;
  CHECK_FALSE(encode_server_record(ServerRecord{zero_epoch}, encoded));
- for (const ServerRecord& record : std::array<ServerRecord, 2U>{
-       InteractionRejected{.endpoint_id = 7U, .error = {.detail = "input unavailable"}},
-       InteractionRejected{.endpoint_id = 1U,
-                           .error = {.category = mmltk::controller::contracts::ApplicationErrorCategory::Unavailable, .detail = "unavailable"}}}) {
+ for (const ServerRecord& record : std::array<ServerRecord, 2U>{InteractionRejected{.endpoint_id = 7U, .error = {.detail = "input unavailable"}},
+       InteractionRejected{.endpoint_id = 1U, .error = {.category = mmltk::controller::contracts::ApplicationErrorCategory::Unavailable, .detail = "unavailable"}}}) {
   // CLEANUP-IGNORE: Interaction rejection round trips are independent wire-variant oracles, not a second codec implementation.
   REQUIRE(encode_server_record(record, encoded));
   const auto decoded = decode_server_record(wire::ByteSegments{.first = encoded, .second = {}});
@@ -547,8 +518,7 @@ TEST_CASE("Bootstrap uses the compact protocol-17 fingerprint and bounded snapsh
  std::vector<SystemSnapshot> too_many_snapshots;
  too_many_snapshots.reserve(kMaxSnapshotCount + 1U);
  for (std::size_t index = 0U; index <= kMaxSnapshotCount; ++index) too_many_snapshots.push_back({.system_id = index + 1U, .value = wire::Value{}});
- CHECK_FALSE(
-  encode_server_record(ServerRecord{Bootstrap{.schema_fingerprint = {11U, 13U}, .input_epoch = 1U, .snapshots = std::move(too_many_snapshots)}}, encoded));
+ CHECK_FALSE(encode_server_record(ServerRecord{Bootstrap{.schema_fingerprint = {11U, 13U}, .input_epoch = 1U, .snapshots = std::move(too_many_snapshots)}}, encoded));
  CHECK_FALSE(encode_server_record(ServerRecord{Bootstrap{
                                    .schema_fingerprint = {11U, 13U},
                                    .input_epoch = 1U,
@@ -557,7 +527,7 @@ TEST_CASE("Bootstrap uses the compact protocol-17 fingerprint and bounded snapsh
                                     .value = wire::Value(std::string(kMaxOutputValueBytes + 1U, 'x')),
                                    }},
                                   }},
-                                  encoded));
+  encoded));
  REQUIRE(encode_server_record(bootstrap, encoded));
  encoded.push_back(std::byte{0xf6});
  CHECK_FALSE(decode_server_record(wire::ByteSegments{.first = encoded, .second = {}}));
@@ -575,7 +545,7 @@ TEST_CASE("browser records reject duplicate identities and invalid renderer obse
                                      {.field_id = 3U, .value = wire::Value{}},
                                     },
                                   }},
-                                  encoded));
+  encoded));
 }
 TEST_CASE("settings leaf traversal retains every reflected constraint dimension", "[controller][browser][schema][settings]") {
  std::size_t leaves = 0U;
@@ -626,24 +596,24 @@ TEST_CASE("exception mapping preserves the common bounded error vocabulary", "[c
                                      .detail = std::string(kMaxErrorDetailBytes + 1U, 'x'),
                                     },
                                   }},
-                                  encoded));
+  encoded));
 }
 }  // namespace
 }  // namespace mmltk::controller::browser
 TEST_CASE("Native graphics records reject unknown raw opcodes and malformed descriptor counts", "[browser][workspace][protocol]") {
  namespace abi = mmltk::controller::presentation::detail::workspace_surface_import;
  abi::Record record{.id_high = 1U,
-                    .width = 4U,
-                    .height = 3U,
-                    .stride = 32U,
-                    .size = 96U,
-                    .descriptors = abi::kAllocateDescriptorCount,
-                    .arena_high = 2U,
-                    .allocation_identity = 3U,
-                    .device_incarnation = 4U,
-                    .alignment = 32U,
-                    .device_uuid = {1U},
-                    .memory_type_bits = 1U};
+  .width = 4U,
+  .height = 3U,
+  .stride = 32U,
+  .size = 96U,
+  .descriptors = abi::kAllocateDescriptorCount,
+  .arena_high = 2U,
+  .allocation_identity = 3U,
+  .device_incarnation = 4U,
+  .alignment = 32U,
+  .device_uuid = {1U},
+  .memory_type_bits = 1U};
  REQUIRE(abi::valid(record));
  record.opcode = static_cast<abi::Opcode>(0xffff'ffffU);
  CHECK_FALSE(abi::valid(record));
@@ -665,16 +635,16 @@ TEST_CASE("Graphics arena negotiation and source completion use independent reco
  arena.allocation_identity = 1U;
  CHECK_FALSE(abi::valid(arena));
  abi::Record layout{.opcode = abi::Opcode::ArenaReady,
-                    .id_high = 1U,
-                    .width = 4U,
-                    .height = 3U,
-                    .stride = 32U,
-                    .size = 128U,
-                    .device_incarnation = 2U,
-                    .offset = 32U,
-                    .alignment = 32U,
-                    .device_uuid = {1U},
-                    .memory_type_bits = 1U};
+  .id_high = 1U,
+  .width = 4U,
+  .height = 3U,
+  .stride = 32U,
+  .size = 128U,
+  .device_incarnation = 2U,
+  .offset = 32U,
+  .alignment = 32U,
+  .device_uuid = {1U},
+  .memory_type_bits = 1U};
  REQUIRE(abi::valid(layout));
  SECTION("direct sampling is a negotiated binary capability") {
   layout.direct_sampling = 1U;
@@ -730,16 +700,16 @@ TEST_CASE("compact workspace mouse records preserve fractional coordinates and w
  namespace cbor = mmltk::frameworks::serialization;
  constexpr wire::Limits limits{.max_bytes = kMaxIntentValueBytes, .max_items = kMaxIntentValueItems, .max_depth = kMaxIntentValueDepth};
  const WorkspaceMouse source{.source = PresentationSourceKind::Annotation,
-                             .peer_epoch = 9U,
-                             .document_epoch = 3U,
-                             .kind = WorkspaceMouseKind::Wheel,
-                             .point = WorkspacePoint{1.25F, 2.5F},
-                             .button = WorkspaceMouseButton::Other,
-                             .other_button = 127U,
-                             .click_count = 2U,
-                             .modifiers = 15U,
-                             .wheel_unit = WorkspaceWheelUnit::Pixels,
-                             .wheel = {0.125F, -0.25F}};
+  .peer_epoch = 9U,
+  .document_epoch = 3U,
+  .kind = WorkspaceMouseKind::Wheel,
+  .point = WorkspacePoint{1.25F, 2.5F},
+  .button = WorkspaceMouseButton::Other,
+  .other_button = 127U,
+  .click_count = 2U,
+  .modifiers = 15U,
+  .wheel_unit = WorkspaceWheelUnit::Pixels,
+  .wheel = {0.125F, -0.25F}};
  wire::ByteBuffer bytes(cbor::compact_maximum_cbor_bytes<WorkspaceMouse>());
  cbor::FixedCborEncoder encoder(bytes);
  REQUIRE(cbor::encode_compact(encoder, source));

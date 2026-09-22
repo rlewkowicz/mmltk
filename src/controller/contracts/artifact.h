@@ -29,8 +29,7 @@ struct ArtifactSplitFact final {
  std::uint32_t height = 0U;
  std::uint32_t channels = 0U;
  std::uint32_t max_instances_per_image = 0U;
- [[= mmltk::frameworks::reflection::MaxItems{mmltk::backend::data::catalog::kClassCatalogCapacity}]] std::vector<mmltk::backend::data::catalog::ClassName>
-  class_names;
+ [[= mmltk::frameworks::reflection::MaxItems{mmltk::backend::data::catalog::kClassCatalogCapacity}]] std::vector<mmltk::backend::data::catalog::ClassName> class_names;
  [[nodiscard]] bool valid() const noexcept {
   if (path.empty() || path.size() > kArtifactPathCapacity || image_count == 0U || width == 0U || height == 0U || channels == 0U || class_names.empty() ||
       class_names.size() > mmltk::backend::data::catalog::kClassCatalogCapacity)
@@ -61,8 +60,7 @@ struct ArtifactInspection final {
 using ArtifactCompilePhase = mmltk::backend::data::DatasetCompilePhase;
 struct ArtifactProgress final {
  [[= reflection::ProgressField{reflection::ProgressFieldSemantic::StageOrStatus}]] ArtifactCompilePhase phase = ArtifactCompilePhase::Idle;
- [[= reflection::ProgressField{
-  reflection::ProgressFieldSemantic::ActivityOrDetail}]][[= mmltk::frameworks::reflection::MaxBytes{kArtifactProgressTextCapacity}]] std::string activity;
+ [[= reflection::ProgressField{reflection::ProgressFieldSemantic::ActivityOrDetail}]][[= mmltk::frameworks::reflection::MaxBytes{kArtifactProgressTextCapacity}]] std::string activity;
  // CLEANUP-IGNORE: Artifact progress fields carry compile-specific semantics and generated identities.
  [[= reflection::ProgressField{reflection::ProgressFieldSemantic::Completed}]] std::uint64_t completed = 0U;
  [[= reflection::ProgressField{reflection::ProgressFieldSemantic::Total}]] std::uint64_t total = 0U;
@@ -85,22 +83,16 @@ struct ArtifactProgress final {
 };
 enum class ArtifactTerminalOutcome : std::uint8_t { Idle, Succeeded, Failed, Cancelled, CancellationRequested, Refused };
 inline constexpr std::array kArtifactTerminalPresentations{
- terminal_presentation::Policy{ArtifactTerminalOutcome::Idle, terminal_presentation::Classification::Refused, "artifact.idle",
-                               "No artifact operation has completed."},
+ terminal_presentation::Policy{ArtifactTerminalOutcome::Idle, terminal_presentation::Classification::Refused, "artifact.idle", "No artifact operation has completed."},
  terminal_presentation::Policy{ArtifactTerminalOutcome::Succeeded, terminal_presentation::Classification::Success, "artifact.succeeded", ""},
- terminal_presentation::Policy{ArtifactTerminalOutcome::Failed, terminal_presentation::Classification::Failed, "artifact.failed",
-                               "The artifact operation failed."},
- terminal_presentation::Policy{ArtifactTerminalOutcome::Cancelled, terminal_presentation::Classification::Cancelled, "artifact.cancelled",
-                               "The artifact operation was cancelled."},
- terminal_presentation::Policy{ArtifactTerminalOutcome::CancellationRequested, terminal_presentation::Classification::Cancelled,
-                               "artifact.cancellation_requested", "Artifact cancellation was requested."},
- terminal_presentation::Policy{ArtifactTerminalOutcome::Refused, terminal_presentation::Classification::Refused, "artifact.refused",
-                               "The artifact operation was refused."},
+ terminal_presentation::Policy{ArtifactTerminalOutcome::Failed, terminal_presentation::Classification::Failed, "artifact.failed", "The artifact operation failed."},
+ terminal_presentation::Policy{ArtifactTerminalOutcome::Cancelled, terminal_presentation::Classification::Cancelled, "artifact.cancelled", "The artifact operation was cancelled."},
+ terminal_presentation::Policy{
+  ArtifactTerminalOutcome::CancellationRequested, terminal_presentation::Classification::Cancelled, "artifact.cancellation_requested", "Artifact cancellation was requested."},
+ terminal_presentation::Policy{ArtifactTerminalOutcome::Refused, terminal_presentation::Classification::Refused, "artifact.refused", "The artifact operation was refused."},
 };
 static_assert(terminal_presentation::complete(kArtifactTerminalPresentations));
-[[nodiscard]] consteval const auto& materialized_terminal_presentation_policy(std::type_identity<ArtifactTerminalOutcome>) {
- return kArtifactTerminalPresentations;
-}
+[[nodiscard]] consteval const auto& materialized_terminal_presentation_policy(std::type_identity<ArtifactTerminalOutcome>) { return kArtifactTerminalPresentations; }
 struct ArtifactTerminal final {
  ArtifactTerminalOutcome outcome = ArtifactTerminalOutcome::Idle;
  [[= mmltk::frameworks::reflection::MaxBytes{kArtifactPathCapacity}]] std::string artifact;

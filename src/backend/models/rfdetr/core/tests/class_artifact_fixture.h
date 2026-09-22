@@ -10,8 +10,7 @@
 namespace mmltk::backend::models::rfdetr::test_support {
 class ClassArtifactFixture final {
 public:
- ClassArtifactFixture(std::filesystem::path artifact, std::string_view bytes, const ModelClassLayout& layout)
-     : artifact_(std::move(artifact)), companion_(artifact_.string() + ".classes.json") {
+ ClassArtifactFixture(std::filesystem::path artifact, std::string_view bytes, const ModelClassLayout& layout) : artifact_(std::move(artifact)), companion_(artifact_.string() + ".classes.json") {
   {
    std::ofstream output(artifact_);
    output << bytes;

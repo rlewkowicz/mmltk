@@ -15,8 +15,7 @@ namespace detail {
  return !value.empty() && std::ranges::all_of(value, [](const unsigned char character) { return character >= 0x20U && character != 0x7FU; });
 }
 template <std::size_t Capacity>
-[[nodiscard]] constexpr bool workspace_storage_valid(const std::array<char, Capacity>& storage, const std::uint16_t size,
-                                                     const std::uint64_t revision) noexcept {
+[[nodiscard]] constexpr bool workspace_storage_valid(const std::array<char, Capacity>& storage, const std::uint16_t size, const std::uint64_t revision) noexcept {
  return size != 0U && size <= storage.size() && revision != 0U && workspace_text_valid({storage.data(), size}) &&
         std::ranges::all_of(storage.begin() + static_cast<std::ptrdiff_t>(size), storage.end(), [](const char character) { return character == '\0'; });
 }

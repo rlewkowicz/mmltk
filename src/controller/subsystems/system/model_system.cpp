@@ -13,8 +13,8 @@ import mmltk.backend.models.rfdetr.model_export;
 import mmltk.backend.models.rfdetr.inference.runtime_backend;
 #include "src/controller/subsystems/system/compute_intent_materializer.h"
 namespace mmltk::controller {
-ModelArtifactAdmission ArtifactModelRuntime::Acquire(const contracts::ModelSelectionKey& key, const std::filesystem::path& custom, const int inspection_device,
-                                                     const std::stop_token stop, const std::function<void(const contracts::ModelProgress&)>& progress) {
+ModelArtifactAdmission ArtifactModelRuntime::Acquire(const contracts::ModelSelectionKey& key, const std::filesystem::path& custom, const int inspection_device, const std::stop_token stop,
+ const std::function<void(const contracts::ModelProgress&)>& progress) {
  if (!key.valid()) throw std::invalid_argument("model selection key is invalid");
  std::filesystem::path artifact;
  if (key.source == contracts::ModelSelectionSource::Custom) {
@@ -28,12 +28,12 @@ ModelArtifactAdmission ArtifactModelRuntime::Acquire(const contracts::ModelSelec
   mmltk::common::concurrency::ScopedEventCancellation<services::ArtifactCancellationSource> cancellation{stop};
   // CLEANUP-IGNORE: Artifact weight and dataset progress observers adapt distinct typed service callbacks at their
   // respective runtime boundaries.
-  const services::ArtifactWeightProgressObserver observer{.context = const_cast<std::function<void(const contracts::ModelProgress&)>*>(&progress),
-                                                          .report = [](void* context, const contracts::ModelProgress& value) noexcept {
-                                                           try {
-                                                            (*static_cast<std::function<void(const contracts::ModelProgress&)>*>(context))(value);
-                                                           } catch (...) {}
-                                                          }};
+  const services::ArtifactWeightProgressObserver observer{
+   .context = const_cast<std::function<void(const contracts::ModelProgress&)>*>(&progress), .report = [](void* context, const contracts::ModelProgress& value) noexcept {
+    try {
+     (*static_cast<std::function<void(const contracts::ModelProgress&)>*>(context))(value);
+    } catch (...) {}
+   }};
   artifact = store_.canonical_weight_path(key.preset, cancellation.token(), observer);
  }
  if (stop.stop_requested()) throw std::runtime_error("model selection cancelled");
@@ -56,15 +56,12 @@ ModelArtifactAdmission ArtifactModelRuntime::Acquire(const contracts::ModelSelec
  if (stop.stop_requested()) throw std::runtime_error("model selection cancelled");
  return {.artifact = artifact.string(), .class_layout = rfdetr::ResolvedClassLayout(std::move(layout)).summary()};
 }
-ModelSystem::ModelSystem(SettingsSystem& settings, RuntimeFactory factory, SystemEventSink<event_type> events)
-    : settings_(settings), factory_(std::move(factory)), events_(std::move(events)) {
+ModelSystem::ModelSystem(SettingsSystem& settings, RuntimeFactory factory, SystemEventSink<event_type> events) : settings_(settings), factory_(std::move(factory)), events_(std::move(events)) {
  if (!factory_) throw contracts::UnavailableError("model runtime factory is unavailable");
 }
 ModelSystem::~ModelSystem() = default;
 direct::LocalRun::Notification ModelSystem::changed(contracts::ModelUiState settled) {
- return [this, settled = std::move(settled)]() mutable noexcept {
-  direct::PublishLazyNoexcept(events_, [&] { return event_type{ModelChanged{std::move(settled)}}; });
- };
+ return [this, settled = std::move(settled)]() mutable noexcept { direct::PublishLazyNoexcept(events_, [&] { return event_type{ModelChanged{std::move(settled)}}; }); };
 }
 contracts::ModelUiState ModelSystem::Select(const contracts::ModelSelectionRequest request) {
  if (!request.valid()) throw contracts::InvalidIntentError("model workflow is invalid");
@@ -96,14 +93,13 @@ contracts::ModelUiState ModelSystem::Select(const contracts::ModelSelectionReque
    try {
     if (!runtime_) runtime_ = factory_();
     if (!runtime_) throw std::runtime_error("model runtime is unavailable");
-    auto artifact =
-     runtime_->Acquire(input.key, input.custom_artifact, input.inspection_device, stop, [this, &malformed_progress](const contracts::ModelProgress& value) {
-      if (!value.valid()) {
-       malformed_progress.store(true, std::memory_order_relaxed);
-      } else {
-       progress(value);
-      }
-     });
+    auto artifact = runtime_->Acquire(input.key, input.custom_artifact, input.inspection_device, stop, [this, &malformed_progress](const contracts::ModelProgress& value) {
+     if (!value.valid()) {
+      malformed_progress.store(true, std::memory_order_relaxed);
+     } else {
+      progress(value);
+     }
+    });
     if (malformed_progress.load(std::memory_order_relaxed)) throw std::runtime_error("model runtime returned invalid progress");
     if (stop.stop_requested()) {
      terminal.outcome = contracts::ModelSelectionOutcome::Cancelled;

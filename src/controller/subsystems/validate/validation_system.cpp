@@ -23,8 +23,8 @@ public:
 };
 CudaValidationRuntime::CudaValidationRuntime(DirectComputeConfiguration c) : impl_(std::make_unique<Impl>(c)) {}
 CudaValidationRuntime::~CudaValidationRuntime() = default;
-ValidationRuntimeResult CudaValidationRuntime::Run(mmltk::backend::models::rfdetr::ValidateRequest operation, std::stop_token stop,
-                                                   const ComputeProgressSink& progress, const mmltk::backend::models::rfdetr::ValidationDelivery& delivery) {
+ValidationRuntimeResult CudaValidationRuntime::Run(
+ mmltk::backend::models::rfdetr::ValidateRequest operation, std::stop_token stop, const ComputeProgressSink& progress, const mmltk::backend::models::rfdetr::ValidationDelivery& delivery) {
  ValidationRuntimeResult result;
  result.terminal = impl_->resources.Run(
   [this, &result, &progress, &delivery, stop, operation = std::move(operation)](const mmltk::backend::ml::runtime::BorrowedCommandStream stream) mutable {
@@ -40,16 +40,15 @@ ValidationRuntimeResult CudaValidationRuntime::Run(mmltk::backend::models::rfdet
    auto evaluated = impl_->session.Run(operation, stream, callbacks);
    if (evaluated.backends.size() > 1U) throw std::logic_error("GUI validation requires one selected backend");
    if (!evaluated.backends.empty()) result.evaluation = std::move(evaluated.backends.begin()->second);
-   return contracts::make_compute_terminal(evaluated.cancelled ? contracts::ComputeOperationOutcome::Cancelled : contracts::ComputeOperationOutcome::Succeeded,
-                                           0U, evaluated.processed_images);
+   return contracts::make_compute_terminal(evaluated.cancelled ? contracts::ComputeOperationOutcome::Cancelled : contracts::ComputeOperationOutcome::Succeeded, 0U, evaluated.processed_images);
   },
   stop);
  return result;
 }
 class ValidationSystem::Impl final {
 public:
- Impl(SettingsSystem& settings, DatasetSystem& dataset, ModelSystem& model, ValidationRuntimeFactory factory,
-      SystemEventSink<ValidationSystem::event_type> events, std::optional<mmltk::frameworks::gpu::DeviceExecution> execution, VisualDeviceSettings visual)
+ Impl(SettingsSystem& settings, DatasetSystem& dataset, ModelSystem& model, ValidationRuntimeFactory factory, SystemEventSink<ValidationSystem::event_type> events,
+  std::optional<mmltk::frameworks::gpu::DeviceExecution> execution, VisualDeviceSettings visual)
      : settings_(settings),
        dataset_(dataset),
        model_(model),
@@ -67,9 +66,7 @@ public:
    delivery.sample = [this, generation](auto sample) {
     try {
      samples_.Capture(generation, std::move(sample));
-    } catch (const mmltk::backend::ml::runtime::CudaOperationError&) {
-     throw;
-    } catch (...) { /* Sample settlement retains the incumbent; metrics remain valid. */
+    } catch (const mmltk::backend::ml::runtime::CudaOperationError&) { throw; } catch (...) { /* Sample settlement retains the incumbent; metrics remain valid. */
     }
    };
   }
@@ -184,9 +181,8 @@ public:
  bool previews_ = false;
  detail::ValidationSamples samples_;
 };
-ValidationSystem::ValidationSystem(SettingsSystem& settings, DatasetSystem& dataset, ModelSystem& model, ValidationRuntimeFactory factory,
-                                   SystemEventSink<event_type> events, std::optional<mmltk::frameworks::gpu::DeviceExecution> execution,
-                                   VisualDeviceSettings visual)
+ValidationSystem::ValidationSystem(SettingsSystem& settings, DatasetSystem& dataset, ModelSystem& model, ValidationRuntimeFactory factory, SystemEventSink<event_type> events,
+ std::optional<mmltk::frameworks::gpu::DeviceExecution> execution, VisualDeviceSettings visual)
     : impl_(std::make_unique<Impl>(settings, dataset, model, std::move(factory), std::move(events), std::move(execution), visual)) {}
 ValidationSystem::~ValidationSystem() = default;
 ValidationSnapshot ValidationSystem::Start(contracts::ValidateWorkflowIntent) {

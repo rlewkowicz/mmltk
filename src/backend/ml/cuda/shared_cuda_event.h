@@ -28,8 +28,7 @@ public:
   bool engaged_ = false;
   friend class CudaEventPool;
  };
- CudaEventPool(mmltk::frameworks::gpu::CudaDeviceOwner owner, std::size_t capacity,
-               mmltk::frameworks::gpu::TerminalCudaRetirementAuthority& retirement_authority);
+ CudaEventPool(mmltk::frameworks::gpu::CudaDeviceOwner owner, std::size_t capacity, mmltk::frameworks::gpu::TerminalCudaRetirementAuthority& retirement_authority);
  ~CudaEventPool() noexcept;
  CudaEventPool(const CudaEventPool&) = delete;
  CudaEventPool& operator=(const CudaEventPool&) = delete;

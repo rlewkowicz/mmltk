@@ -26,10 +26,8 @@ int resolve_num_workers(int configured_workers, const std::span<const int> worke
  if (configured_workers > 0) {
   const int clamped = clamp_worker_count_to_cpus(configured_workers, allowed.size(), 0, 1);
   if (configured_workers != clamped) {
-   mmltk::common::logging::warn([&](spdlog::logger& log) {
-    log.warn("compile workers clamped {}->{} for cpuset={} (reserved=0 minimum=1)", configured_workers, clamped,
-             mmltk::common::system::format_cpu_list(allowed));
-   });
+   mmltk::common::logging::warn(
+    [&](spdlog::logger& log) { log.warn("compile workers clamped {}->{} for cpuset={} (reserved=0 minimum=1)", configured_workers, clamped, mmltk::common::system::format_cpu_list(allowed)); });
   }
   return clamped;
  }
@@ -38,8 +36,8 @@ int resolve_num_workers(int configured_workers, const std::span<const int> worke
 void assign_pixel_offsets(std::vector<ImageEntry>& index, size_t pixel_offset, size_t image_stride) {
  for (size_t i = 0; i < index.size(); ++i) { index[i].pixel_offset = pixel_offset + i * image_stride; }
 }
-void write_metadata_blocks(const FileHandle& fd, const FileLayout& layout, const FileHeader& header, const LabelBlocks& label_blocks,
-                           mmltk::common::concurrency::CancellationObservation cancel_requested) {
+void write_metadata_blocks(
+ const FileHandle& fd, const FileLayout& layout, const FileHeader& header, const LabelBlocks& label_blocks, mmltk::common::concurrency::CancellationObservation cancel_requested) {
  constexpr size_t kWriteChunkBytes = size_t{16U} * 1024U * 1024U;
  const auto write_block = [&](const void* source, const size_t bytes, const size_t offset) {
   const auto* source_bytes = static_cast<const std::uint8_t*>(source);

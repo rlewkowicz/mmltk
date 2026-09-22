@@ -10,21 +10,13 @@ struct LinearPointSampleShape {
  std::int64_t coord_batches = 0;
  std::int64_t total = 0;
 };
-[[nodiscard]] inline LinearPointSampleShape make_linear_point_sample_shape(const std::int64_t sample_count, const std::int64_t coord_batches,
-                                                                           const std::int64_t point_count) {
+[[nodiscard]] inline LinearPointSampleShape make_linear_point_sample_shape(const std::int64_t sample_count, const std::int64_t coord_batches, const std::int64_t point_count) {
  return LinearPointSampleShape{sample_count, point_count, coord_batches, sample_count * point_count};
 }
-[[nodiscard]] __host__ __device__ __forceinline__ std::int64_t point_index(const std::int64_t index, const std::int64_t point_count) {
- return index % point_count;
-}
-[[nodiscard]] __host__ __device__ __forceinline__ std::int64_t sample_index(const std::int64_t index, const std::int64_t point_count) {
- return index / point_count;
-}
-[[nodiscard]] __host__ __device__ __forceinline__ std::int64_t coord_batch_index(const std::int64_t coord_batches, const std::int64_t sample_index) {
- return coord_batches == 1 ? 0 : sample_index;
-}
-[[nodiscard]] __host__ __device__ __forceinline__ std::int64_t coord_offset(const std::int64_t coord_batch, const std::int64_t point_index,
-                                                                            const std::int64_t point_count) {
+[[nodiscard]] __host__ __device__ __forceinline__ std::int64_t point_index(const std::int64_t index, const std::int64_t point_count) { return index % point_count; }
+[[nodiscard]] __host__ __device__ __forceinline__ std::int64_t sample_index(const std::int64_t index, const std::int64_t point_count) { return index / point_count; }
+[[nodiscard]] __host__ __device__ __forceinline__ std::int64_t coord_batch_index(const std::int64_t coord_batches, const std::int64_t sample_index) { return coord_batches == 1 ? 0 : sample_index; }
+[[nodiscard]] __host__ __device__ __forceinline__ std::int64_t coord_offset(const std::int64_t coord_batch, const std::int64_t point_index, const std::int64_t point_count) {
  return (coord_batch * point_count + point_index) * 2;
 }
 struct MatcherPointSampleLaunch {

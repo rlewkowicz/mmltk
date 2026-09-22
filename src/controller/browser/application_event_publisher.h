@@ -13,8 +13,7 @@ public:
  using Sink = std::function<void(SystemEvent)>;
  using ContinuitySink = std::function<void()>;
  using SourceSink = std::function<void(PresentationSourceIdentity)>;
- ApplicationEventPublisher(Sink& sink, ContinuitySink continuity, SourceSink source = {})
-     : sink_(sink), continuity_(std::move(continuity)), source_(std::move(source)) {}
+ ApplicationEventPublisher(Sink& sink, ContinuitySink continuity, SourceSink source = {}) : sink_(sink), continuity_(std::move(continuity)), source_(std::move(source)) {}
  template <class Variant>
  void operator()(const Variant& event) const noexcept {
   std::visit(

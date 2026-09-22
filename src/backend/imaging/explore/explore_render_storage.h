@@ -11,9 +11,7 @@ struct ExploreCudaAllocationApi final {
  ExploreStorageStatus (*release_device)(void*, void*) noexcept = nullptr;
  ExploreStorageStatus (*allocate_pinned)(void*, void**, std::size_t) noexcept = nullptr;
  ExploreStorageStatus (*release_pinned)(void*, void*) noexcept = nullptr;
- [[nodiscard]] bool valid() const noexcept {
-  return allocate_device != nullptr && release_device != nullptr && allocate_pinned != nullptr && release_pinned != nullptr;
- }
+ [[nodiscard]] bool valid() const noexcept { return allocate_device != nullptr && release_device != nullptr && allocate_pinned != nullptr && release_pinned != nullptr; }
 };
 enum class ExploreBufferMemory : std::uint8_t {
  PinnedHost,

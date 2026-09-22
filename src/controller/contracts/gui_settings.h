@@ -67,6 +67,5 @@ void apply_gui_settings(const nlohmann::json& j, GuiSettingsState& state);
 [[nodiscard]] GuiSettingsState load_initial_gui_settings_state(const std::string& path);
 // Typed parse and repair classification used by the application-owned
 // SettingsStore boundary.
-[[nodiscard]] bool load_gui_settings_file(const std::string& path, GuiSettingsState& state, nlohmann::json* normalized_document = nullptr,
-                                          bool* repair_required = nullptr);
+[[nodiscard]] bool load_gui_settings_file(const std::string& path, GuiSettingsState& state, nlohmann::json* normalized_document = nullptr, bool* repair_required = nullptr);
 }  // namespace mmltk::controller::contracts

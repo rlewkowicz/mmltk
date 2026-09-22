@@ -91,8 +91,7 @@ void set_parameter(rfdetr::TrainingSupervisionImpl& supervision, const std::stri
  destination->copy_(value);
 }
 void install_oracle_projections(rfdetr::TrainingSupervisionImpl& supervision) {
- set_parameter(supervision, "ground_truth_mlp.linear1.weight",
-               torch::tensor({{1.0F, -0.5F, 0.2F, 0.3F, -0.1F, 0.4F}, {-0.25F, 0.75F, -0.3F, 0.1F, 0.5F, 0.2F}}));
+ set_parameter(supervision, "ground_truth_mlp.linear1.weight", torch::tensor({{1.0F, -0.5F, 0.2F, 0.3F, -0.1F, 0.4F}, {-0.25F, 0.75F, -0.3F, 0.1F, 0.5F, 0.2F}}));
  set_parameter(supervision, "ground_truth_mlp.linear1.bias", torch::tensor({0.1F, 0.2F}));
  set_parameter(supervision, "ground_truth_mlp.linear2.weight", torch::tensor({{0.8F, -0.2F}, {0.3F, 0.7F}}));
  set_parameter(supervision, "ground_truth_mlp.linear2.bias", torch::tensor({0.05F, -0.1F}));
@@ -215,9 +214,7 @@ void append_layer_gradient_evidence(const rfdetr::OutputLayer& layer, const std:
 std::vector<std::string> output_gradient_evidence(const rfdetr::ModelOutputs& outputs, const bool require_zero) {
  std::vector<std::string> names;
  append_layer_gradient_evidence(outputs.main, "main", require_zero, names);
- for (std::size_t index = 0; index < outputs.aux_outputs.size(); ++index) {
-  append_layer_gradient_evidence(outputs.aux_outputs[index], "aux." + std::to_string(index), require_zero, names);
- }
+ for (std::size_t index = 0; index < outputs.aux_outputs.size(); ++index) { append_layer_gradient_evidence(outputs.aux_outputs[index], "aux." + std::to_string(index), require_zero, names); }
  if (outputs.enc_outputs) { append_layer_gradient_evidence(*outputs.enc_outputs, "encoder", require_zero, names); }
  return names;
 }
@@ -249,11 +246,8 @@ std::vector<std::string> ordered_defined_trainable_gradients(rfdetr::NativeRfDet
 }
 rfdetr::OutputLayer oracle_layer(const torch::Tensor& features) {
  rfdetr::OutputLayer layer;
- layer.pred_logits =
-  torch::tensor({{{0.4F, -0.7F, 0.2F}, {-0.1F, 0.8F, -0.3F}, {0.6F, 0.1F, -0.5F}}}, torch::TensorOptions().dtype(torch::kFloat32)).set_requires_grad(true);
- layer.pred_boxes =
-  torch::tensor({{{0.45F, 0.55F, 0.2F, 0.3F}, {0.2F, 0.25F, 0.15F, 0.1F}, {0.7F, 0.65F, 0.25F, 0.2F}}}, torch::TensorOptions().dtype(torch::kFloat32))
-   .set_requires_grad(true);
+ layer.pred_logits = torch::tensor({{{0.4F, -0.7F, 0.2F}, {-0.1F, 0.8F, -0.3F}, {0.6F, 0.1F, -0.5F}}}, torch::TensorOptions().dtype(torch::kFloat32)).set_requires_grad(true);
+ layer.pred_boxes = torch::tensor({{{0.45F, 0.55F, 0.2F, 0.3F}, {0.2F, 0.25F, 0.15F, 0.1F}, {0.7F, 0.65F, 0.25F, 0.2F}}}, torch::TensorOptions().dtype(torch::kFloat32)).set_requires_grad(true);
  layer.query_features = features;
  layer.query_layout = rfdetr::SupervisedQueryLayout{1, 3};
  return layer;
@@ -305,8 +299,7 @@ void test_gathered_ground_truth_affinity_matches_explicit_one_hot_and_sqrt_d() {
  const auto one_hot = torch::eye(2).index({labels});
  const auto input = torch::cat({one_hot, boxes}, -1);
  const auto parameters = supervision.named_parameters(true);
- const auto gt_hidden =
-  torch::relu(torch::matmul(input, parameters["ground_truth_mlp.linear1.weight"].transpose(0, 1)) + parameters["ground_truth_mlp.linear1.bias"]);
+ const auto gt_hidden = torch::relu(torch::matmul(input, parameters["ground_truth_mlp.linear1.weight"].transpose(0, 1)) + parameters["ground_truth_mlp.linear1.bias"]);
  const auto gt = torch::matmul(gt_hidden, parameters["ground_truth_mlp.linear2.weight"].transpose(0, 1)) + parameters["ground_truth_mlp.linear2.bias"];
  const auto query_hidden = torch::relu(features);
  const auto expected = torch::softmax(torch::einsum("bmd,bgnd->bgmn", {gt, query_hidden}) / std::sqrt(2.0), -1);
@@ -321,8 +314,7 @@ void test_rectangular_supervision_retains_404_targets_with_300_queries() {
  rfdetr::TrainingSupervisionImpl supervision(config, config.num_classes - 1);
  supervision.initialize(404);
  const auto integers = torch::TensorOptions().dtype(torch::kInt64);
- const auto targets =
-  batched_targets({torch::full({404, 4}, 0.2F), torch::zeros({0, 4})}, {torch::zeros({404}, integers), torch::zeros({0}, integers)}, config.num_queries);
+ const auto targets = batched_targets({torch::full({404, 4}, 0.2F), torch::zeros({0, 4})}, {torch::zeros({404}, integers), torch::zeros({0}, integers)}, config.num_queries);
  rfdetr::ModelOutputs outputs;
  auto& layer = outputs.main;
  layer.pred_logits = torch::zeros({2, 300, config.num_classes}).set_requires_grad(true);
@@ -593,8 +585,7 @@ void test_timing_leases_are_explicit_bounded_and_harvested_once() {
  dn_owner.configure_supervision_timing({torch::Device(torch::kCUDA), 1, true});
  const auto dn_float_options = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
  const auto dn_integer_options = torch::TensorOptions().dtype(torch::kInt64).device(torch::kCUDA);
- const auto dn_targets =
-  batched_targets({torch::tensor({{0.5F, 0.5F, 0.2F, 0.25F}}, dn_float_options)}, {torch::tensor({1}, dn_integer_options)}, dn_config.num_queries);
+ const auto dn_targets = batched_targets({torch::tensor({{0.5F, 0.5F, 0.2F, 0.25F}}, dn_float_options)}, {torch::tensor({1}, dn_integer_options)}, dn_config.num_queries);
  const auto dn_image = torch::zeros({3, 64, 64}, dn_float_options);
  const auto record_dn_step = [&](const std::uint64_t batch_sequence) {
   dn_owner.begin_supervised_step_timing();
@@ -748,10 +739,8 @@ void test_mixed_empty_images_use_safe_internal_padding_without_loss_contribution
  mixed.main.pred_logits = mixed.main.pred_logits.repeat({2, 1, 1});
  mixed.main.pred_boxes = mixed.main.pred_boxes.repeat({2, 1, 1});
  mixed.main.query_features = single_features.repeat({2, 1, 1, 1}).clone().set_requires_grad(true);
- auto mixed_targets =
-  batched_targets({torch::tensor({{0.5F, 0.5F, 0.2F, 0.25F}}),
-                   torch::tensor({{std::numeric_limits<float>::quiet_NaN(), std::numeric_limits<float>::infinity(), -1.0F, -2.0F}})},
-                  {torch::tensor({1}, torch::TensorOptions().dtype(torch::kInt64)), torch::tensor({99}, torch::TensorOptions().dtype(torch::kInt64))});
+ auto mixed_targets = batched_targets({torch::tensor({{0.5F, 0.5F, 0.2F, 0.25F}}), torch::tensor({{std::numeric_limits<float>::quiet_NaN(), std::numeric_limits<float>::infinity(), -1.0F, -2.0F}})},
+  {torch::tensor({1}, torch::TensorOptions().dtype(torch::kInt64)), torch::tensor({99}, torch::TensorOptions().dtype(torch::kInt64))});
  mixed_targets.counts[1] = 0;
  mixed_targets.target_counts.index_put_({1}, 0);
  mixed_targets.all_boxes = mixed_targets.all_boxes.detach().set_requires_grad(true);
@@ -852,8 +841,7 @@ void test_dn_endpoint_transform_mapping_padding_and_one_class_behavior() {
  rfdetr::TrainingSupervisionImpl supervision(config, config.num_classes - 1);
  supervision.initialize(101);
  const auto boxes = std::vector<torch::Tensor>{torch::tensor({{0.02F, 0.98F, 0.2F, 0.4F}, {0.5F, 0.5F, 0.1F, 0.2F}}), torch::zeros({0, 4})};
- const auto labels = std::vector<torch::Tensor>{torch::tensor({0, 2}, torch::TensorOptions().dtype(torch::kInt64)),
-                                                torch::zeros({0}, torch::TensorOptions().dtype(torch::kInt64))};
+ const auto labels = std::vector<torch::Tensor>{torch::tensor({0, 2}, torch::TensorOptions().dtype(torch::kInt64)), torch::zeros({0}, torch::TensorOptions().dtype(torch::kInt64))};
  const auto targets = batched_targets(boxes, labels);
  const std::vector<int64_t> slot_shape{2, 2, 2};
  rfdetr::DenoisingVariates variates;
@@ -867,15 +855,14 @@ void test_dn_endpoint_transform_mapping_padding_and_one_class_behavior() {
  REQUIRE(prepared->layout.denoising_queries() == 4);
  REQUIRE(prepared->content.sizes().vec() == std::vector<int64_t>{2, 4, 4});
  REQUIRE(prepared->normalized_references.sizes().vec() == std::vector<int64_t>{2, 4, 4});
- const auto transformed = rfdetr::transform_denoising_targets(prepared->original_labels, prepared->original_boxes, prepared->valid_slots,
-                                                              config.num_classes - 1, config.training_supervision.denoising, variates);
+ const auto transformed =
+  rfdetr::transform_denoising_targets(prepared->original_labels, prepared->original_boxes, prepared->valid_slots, config.num_classes - 1, config.training_supervision.denoising, variates);
  const auto expanded_extents = prepared->original_boxes.slice(-1, 2, 4);
  const auto sampled_bounds = expanded_extents * (0.5F * config.training_supervision.denoising.center_noise_scale);
  const auto valid_coordinates = prepared->valid_slots.unsqueeze(-1).expand_as(sampled_bounds);
  REQUIRE((transformed.center_offsets.abs().index({valid_coordinates}) < sampled_bounds.index({valid_coordinates})).all().item<bool>());
  REQUIRE(transformed.extent_scales.min().item<float>() >= 1.0F - config.training_supervision.denoising.size_noise_scale);
- REQUIRE(transformed.extent_scales.max().item<float>() <=
-         std::nextafter(1.0F + config.training_supervision.denoising.size_noise_scale, std::numeric_limits<float>::infinity()));
+ REQUIRE(transformed.extent_scales.max().item<float>() <= std::nextafter(1.0F + config.training_supervision.denoising.size_noise_scale, std::numeric_limits<float>::infinity()));
  REQUIRE(prepared->valid_slots.index({0}).all().item<bool>());
  REQUIRE_FALSE(prepared->valid_slots.index({1}).any().item<bool>());
  REQUIRE(int64_values(prepared->target_indices.index({0, 0})) == std::vector<int64_t>{0, 1});
@@ -896,8 +883,8 @@ void test_dn_endpoint_transform_mapping_padding_and_one_class_behavior() {
  const auto second_bound = boxes[0].index({1, Slice(2, 4)}) * (0.5F * config.training_supervision.denoising.center_noise_scale);
  REQUIRE(transformed.center_offsets.index({0, 0, 1, 0}).item<float>() == -std::nextafter(second_bound.index({0}).item<float>(), 0.0F));
  REQUIRE(transformed.center_offsets.index({0, 0, 1, 1}).item<float>() == std::nextafter(second_bound.index({1}).item<float>(), 0.0F));
- const auto expected_extent = boxes[0].index({1, Slice(2, 4)}) * torch::tensor({1.0F - config.training_supervision.denoising.size_noise_scale,
-                                                                                1.0F + config.training_supervision.denoising.size_noise_scale});
+ const auto expected_extent =
+  boxes[0].index({1, Slice(2, 4)}) * torch::tensor({1.0F - config.training_supervision.denoising.size_noise_scale, 1.0F + config.training_supervision.denoising.size_noise_scale});
  REQUIRE(torch::allclose(prepared->normalized_references.index({0, 1, Slice(2, 4)}), expected_extent));
  REQUIRE(prepared->normalized_references.min().item<float>() >= 0.0F);
  REQUIRE(prepared->normalized_references.max().item<float>() <= 1.0F);
@@ -910,8 +897,8 @@ void test_dn_endpoint_transform_mapping_padding_and_one_class_behavior() {
  REQUIRE(prepared->original_labels.index({0, 0, 1}).item<int64_t>() == 2);
  auto open_upper = variates;
  open_upper.label_flip = torch::ones(slot_shape);
- const auto open_upper_unflipped = rfdetr::transform_denoising_targets(prepared->original_labels, prepared->original_boxes, prepared->valid_slots,
-                                                                       config.num_classes - 1, config.training_supervision.denoising, open_upper);
+ const auto open_upper_unflipped =
+  rfdetr::transform_denoising_targets(prepared->original_labels, prepared->original_boxes, prepared->valid_slots, config.num_classes - 1, config.training_supervision.denoising, open_upper);
  REQUIRE(torch::equal(open_upper_unflipped.labels, prepared->original_labels));
  const auto distinct_labels = torch::tensor({{{0, 2}}}, torch::TensorOptions().dtype(torch::kInt64));
  const auto distinct_boxes = torch::tensor({{{{0.4F, 0.6F, 0.2F, 0.4F}, {0.7F, 0.3F, 0.1F, 0.2F}}}});
@@ -921,12 +908,9 @@ void test_dn_endpoint_transform_mapping_padding_and_one_class_behavior() {
  distinct.size = torch::tensor({0.2F, 0.8F, 0.3F, 0.7F}).view({1, 1, 2, 2});
  distinct.label_flip = torch::tensor({{{0.49F, 1.0F}}});
  distinct.other_label = torch::zeros({1, 1, 2}, torch::TensorOptions().dtype(torch::kInt64));
- const auto independently_noised =
-  rfdetr::transform_denoising_targets(distinct_labels, distinct_boxes, distinct_valid, 3, config.training_supervision.denoising, distinct);
- const auto expected_center_offsets =
-  (distinct.center * 2.0F - 1.0F) * distinct_boxes.slice(-1, 2, 4) * (0.5F * config.training_supervision.denoising.center_noise_scale);
- const auto expected_extent_scales =
-  1.0F - config.training_supervision.denoising.size_noise_scale + 2.0F * config.training_supervision.denoising.size_noise_scale * distinct.size;
+ const auto independently_noised = rfdetr::transform_denoising_targets(distinct_labels, distinct_boxes, distinct_valid, 3, config.training_supervision.denoising, distinct);
+ const auto expected_center_offsets = (distinct.center * 2.0F - 1.0F) * distinct_boxes.slice(-1, 2, 4) * (0.5F * config.training_supervision.denoising.center_noise_scale);
+ const auto expected_extent_scales = 1.0F - config.training_supervision.denoising.size_noise_scale + 2.0F * config.training_supervision.denoising.size_noise_scale * distinct.size;
  REQUIRE(torch::allclose(independently_noised.center_offsets, expected_center_offsets));
  REQUIRE(torch::allclose(independently_noised.extent_scales, expected_extent_scales));
  REQUIRE(int64_values(independently_noised.labels) == std::vector<int64_t>{1, 2});
@@ -943,17 +927,16 @@ void test_dn_endpoint_transform_mapping_padding_and_one_class_behavior() {
  const auto one_prepared = one_class.prepare_denoising(one_targets, {1, 2, 3, 4}, torch::Device(torch::kCPU), torch::kFloat32, &one_variates);
  REQUIRE(one_prepared.has_value());
  REQUIRE((one_prepared->original_labels == 0).all().item<bool>());
- const auto one_transformed = rfdetr::transform_denoising_targets(one_prepared->original_labels, one_prepared->original_boxes, one_prepared->valid_slots, 1,
-                                                                  one_class_config.training_supervision.denoising, one_variates);
+ const auto one_transformed =
+  rfdetr::transform_denoising_targets(one_prepared->original_labels, one_prepared->original_boxes, one_prepared->valid_slots, 1, one_class_config.training_supervision.denoising, one_variates);
  REQUIRE((one_transformed.labels == 0).all().item<bool>());
  auto zero_flip_config = config;
  zero_flip_config.training_supervision.denoising.label_noise_ratio = 0.0F;
- const auto zero_ratio_unflipped =
-  rfdetr::transform_denoising_targets(prepared->original_labels, prepared->original_boxes, prepared->valid_slots, zero_flip_config.num_classes - 1,
-                                      zero_flip_config.training_supervision.denoising, variates);
+ const auto zero_ratio_unflipped = rfdetr::transform_denoising_targets(
+  prepared->original_labels, prepared->original_boxes, prepared->valid_slots, zero_flip_config.num_classes - 1, zero_flip_config.training_supervision.denoising, variates);
  REQUIRE(torch::equal(zero_ratio_unflipped.labels, prepared->original_labels));
- const auto all_empty = batched_targets({torch::zeros({0, 4}), torch::zeros({0, 4})}, {torch::zeros({0}, torch::TensorOptions().dtype(torch::kInt64)),
-                                                                                       torch::zeros({0}, torch::TensorOptions().dtype(torch::kInt64))});
+ const auto all_empty =
+  batched_targets({torch::zeros({0, 4}), torch::zeros({0, 4})}, {torch::zeros({0}, torch::TensorOptions().dtype(torch::kInt64)), torch::zeros({0}, torch::TensorOptions().dtype(torch::kInt64))});
  REQUIRE_FALSE(supervision.prepare_denoising(all_empty, {9, 3, 2, 7}, torch::Device(torch::kCPU), torch::kFloat32));
 }
 void test_dn_center_underflow_other_label_bijection_and_step_determinism() {
@@ -962,8 +945,8 @@ void test_dn_center_underflow_other_label_bijection_and_step_determinism() {
  config.training_supervision.denoising.label_noise_ratio = 1.0F;
  rfdetr::TrainingSupervisionImpl supervision(config, config.num_classes - 1);
  supervision.initialize(103);
- const auto targets = batched_targets({torch::tensor({{0.5F, 0.5F, 0.2F, 0.3F}, {0.4F, 0.6F, 0.1F, 0.15F}, {0.7F, 0.3F, 0.25F, 0.2F}})},
-                                      {torch::tensor({0, 1, 2}, torch::TensorOptions().dtype(torch::kInt64))});
+ const auto targets =
+  batched_targets({torch::tensor({{0.5F, 0.5F, 0.2F, 0.3F}, {0.4F, 0.6F, 0.1F, 0.15F}, {0.7F, 0.3F, 0.25F, 0.2F}})}, {torch::tensor({0, 1, 2}, torch::TensorOptions().dtype(torch::kInt64))});
  rfdetr::DenoisingVariates variates;
  variates.center = torch::zeros({1, 2, 3, 2});
  variates.size = torch::full({1, 2, 3, 2}, 0.5F);
@@ -971,8 +954,8 @@ void test_dn_center_underflow_other_label_bijection_and_step_determinism() {
  variates.other_label = torch::tensor({0, 0, 1, 1, 1, 0}, torch::TensorOptions().dtype(torch::kInt64)).view({1, 2, 3});
  const auto prepared = supervision.prepare_denoising(targets, {1, 0, 0, 0}, torch::Device(torch::kCPU), torch::kFloat32, &variates);
  REQUIRE(prepared.has_value());
- const auto transformed = rfdetr::transform_denoising_targets(prepared->original_labels, prepared->original_boxes, prepared->valid_slots,
-                                                              config.num_classes - 1, config.training_supervision.denoising, variates);
+ const auto transformed =
+  rfdetr::transform_denoising_targets(prepared->original_labels, prepared->original_boxes, prepared->valid_slots, config.num_classes - 1, config.training_supervision.denoising, variates);
  const auto transformed_centers = transformed.boxes.view({1, 2, 3, 4}).slice(-1, 0, 2);
  const auto source_centers = targets.all_boxes.view({1, 1, 3, 4}).slice(-1, 0, 2).expand({1, 2, 3, 2});
  REQUIRE(torch::equal(transformed_centers, source_centers));
@@ -995,8 +978,8 @@ void test_dn_center_underflow_other_label_bijection_and_step_determinism() {
  REQUIRE(torch::equal(first->target_indices, repeated->target_indices));
  REQUIRE_FALSE(torch::equal(first->normalized_references, intervening->normalized_references));
 }
-torch::Tensor dense_group_attention(torch::nn::MultiheadAttention& attention, const torch::Tensor& target, const torch::Tensor& position,
-                                    const std::vector<int64_t>& group_widths, bool allow_dn_to_ordinary) {
+torch::Tensor dense_group_attention(
+ torch::nn::MultiheadAttention& attention, const torch::Tensor& target, const torch::Tensor& position, const std::vector<int64_t>& group_widths, bool allow_dn_to_ordinary) {
  const int64_t total = target.size(1);
  auto mask = torch::full({total, total}, -std::numeric_limits<float>::infinity(), target.options());
  int64_t offset = 0;
@@ -1063,9 +1046,8 @@ void test_dn_direct_loss_auxiliary_gating_padding_and_retained_graphs() {
  config.giou_loss_coef = 2.0;
  rfdetr::TrainingSupervisionImpl supervision(config, config.num_classes - 1);
  supervision.initialize(106);
- const auto targets =
-  batched_targets({torch::tensor({{0.5F, 0.5F, 0.2F, 0.2F}}), torch::zeros({0, 4})},
-                  {torch::tensor({1}, torch::TensorOptions().dtype(torch::kInt64)), torch::zeros({0}, torch::TensorOptions().dtype(torch::kInt64))});
+ const auto targets = batched_targets(
+  {torch::tensor({{0.5F, 0.5F, 0.2F, 0.2F}}), torch::zeros({0, 4})}, {torch::tensor({1}, torch::TensorOptions().dtype(torch::kInt64)), torch::zeros({0}, torch::TensorOptions().dtype(torch::kInt64))});
  const auto prepared = supervision.prepare_denoising(targets, {7, 2, 1, 9}, torch::Device(torch::kCPU), torch::kFloat32);
  REQUIRE(prepared.has_value());
  auto make_outputs = [&](const rfdetr::DenoisingQueryBatch& prepared_batch, float shift) {
@@ -1082,8 +1064,7 @@ void test_dn_direct_loss_auxiliary_gating_padding_and_retained_graphs() {
   const int64_t queries = prepared_batch.layout.denoising_queries_per_group;
   denoising.main.pred_logits = torch::full({batch, groups, queries, 4}, shift).set_requires_grad(true);
   denoising.main.pred_boxes = (prepared_batch.original_boxes + shift).clone().set_requires_grad(true);
-  denoising.aux_outputs.push_back({torch::full({batch, groups, queries, 4}, shift + 0.1F).set_requires_grad(true),
-                                   (prepared_batch.original_boxes + shift + 0.1F).clone().set_requires_grad(true)});
+  denoising.aux_outputs.push_back({torch::full({batch, groups, queries, 4}, shift + 0.1F).set_requires_grad(true), (prepared_batch.original_boxes + shift + 0.1F).clone().set_requires_grad(true)});
   outputs.denoising = std::move(denoising);
   outputs.main.pred_logits = torch::zeros({batch, 4, 4}).set_requires_grad(true);
   outputs.main.pred_boxes = torch::zeros({batch, 4, 4}).set_requires_grad(true);
@@ -1120,9 +1101,8 @@ void test_dn_direct_loss_auxiliary_gating_padding_and_retained_graphs() {
  auto retained_first = make_outputs(*prepared, 0.02F);
  // CLEANUP-IGNORE: This retained graph transition has its own target topology and lifetime assertions.
  const auto retained_first_loss = supervision.loss(retained_first, targets, {torch::tensor(1.0F)}, true).total;
- const auto other_targets =
-  batched_targets({torch::tensor({{0.4F, 0.4F, 0.1F, 0.1F}, {0.7F, 0.7F, 0.2F, 0.2F}}), torch::zeros({0, 4})},
-                  {torch::tensor({0, 2}, torch::TensorOptions().dtype(torch::kInt64)), torch::zeros({0}, torch::TensorOptions().dtype(torch::kInt64))});
+ const auto other_targets = batched_targets({torch::tensor({{0.4F, 0.4F, 0.1F, 0.1F}, {0.7F, 0.7F, 0.2F, 0.2F}}), torch::zeros({0, 4})},
+  {torch::tensor({0, 2}, torch::TensorOptions().dtype(torch::kInt64)), torch::zeros({0}, torch::TensorOptions().dtype(torch::kInt64))});
  const auto other_prepared = supervision.prepare_denoising(other_targets, {7, 2, 1, 10}, torch::Device(torch::kCPU), torch::kFloat32);
  REQUIRE(other_prepared.has_value());
  auto retained_second = make_outputs(*other_prepared, 0.08F);
@@ -1205,8 +1185,7 @@ void test_production_dn_retained_graph_scratch_padding_and_gradients() {
  owner.train(true);
  owner.initialize_training_supervision(0x5a5aULL);
  const auto image = torch::rand({3, 64, 64});
- const auto first_targets =
-  batched_targets({torch::tensor({{0.4F, 0.6F, 0.2F, 0.25F}})}, {torch::tensor({0}, torch::TensorOptions().dtype(torch::kInt64))}, config.num_queries);
+ const auto first_targets = batched_targets({torch::tensor({{0.4F, 0.6F, 0.2F, 0.25F}})}, {torch::tensor({0}, torch::TensorOptions().dtype(torch::kInt64))}, config.num_queries);
  auto first = owner.forward_with_denoising(rfdetr::nested_tensor_from_tensor_list({image}), first_targets, {71, 3, 1, 4});
  REQUIRE(first.denoising.has_value());
  first.denoising->main.pred_logits.retain_grad();
@@ -1215,8 +1194,7 @@ void test_production_dn_retained_graph_scratch_padding_and_gradients() {
  first.denoising->aux_outputs.front().pred_logits.retain_grad();
  first.denoising->aux_outputs.front().pred_boxes.retain_grad();
  const auto first_loss = owner.supervision_loss(first, first_targets, {torch::tensor(1.0F)}, true).total;
- const auto second_targets = batched_targets(
-  {torch::tensor({{0.2F, 0.3F, 0.1F, 0.15F}, {0.75F, 0.7F, 0.2F, 0.2F}}), torch::zeros({0, 4})},
+ const auto second_targets = batched_targets({torch::tensor({{0.2F, 0.3F, 0.1F, 0.15F}, {0.75F, 0.7F, 0.2F, 0.2F}}), torch::zeros({0, 4})},
   {torch::tensor({1, 2}, torch::TensorOptions().dtype(torch::kInt64)), torch::zeros({0}, torch::TensorOptions().dtype(torch::kInt64))}, config.num_queries);
  auto second = owner.forward_with_denoising(rfdetr::nested_tensor_from_tensor_list({image.clone(), image.clone()}), second_targets, {71, 3, 1, 5});
  REQUIRE(second.denoising.has_value());
@@ -1228,18 +1206,17 @@ void test_production_dn_retained_graph_scratch_padding_and_gradients() {
  second.denoising->main.pred_logits.retain_grad();
  second.denoising->main.pred_boxes.retain_grad();
  const auto second_loss = owner.supervision_loss(second, second_targets, {torch::tensor(2.0F)}, true).total;
- const auto high_water_targets = batched_targets({torch::tensor({{0.2F, 0.2F, 0.1F, 0.1F}, {0.5F, 0.5F, 0.2F, 0.2F}, {0.8F, 0.8F, 0.1F, 0.1F}})},
-                                                 {torch::tensor({0, 1, 2}, torch::TensorOptions().dtype(torch::kInt64))}, config.num_queries);
+ const auto high_water_targets = batched_targets(
+  {torch::tensor({{0.2F, 0.2F, 0.1F, 0.1F}, {0.5F, 0.5F, 0.2F, 0.2F}, {0.8F, 0.8F, 0.1F, 0.1F}})}, {torch::tensor({0, 1, 2}, torch::TensorOptions().dtype(torch::kInt64))}, config.num_queries);
  static_cast<void>(owner.forward_with_denoising(rfdetr::nested_tensor_from_tensor_list({image.clone()}), high_water_targets, {71, 3, 1, 6}));
  second_loss.backward();
  first_loss.backward();
- require_finite_gradients({first.denoising->main.pred_logits, first.denoising->main.pred_boxes, first.denoising->aux_outputs.front().pred_logits,
-                           first.denoising->aux_outputs.front().pred_boxes, second.denoising->main.pred_logits, second.denoising->main.pred_boxes});
+ require_finite_gradients({first.denoising->main.pred_logits, first.denoising->main.pred_boxes, first.denoising->aux_outputs.front().pred_logits, first.denoising->aux_outputs.front().pred_boxes,
+  second.denoising->main.pred_logits, second.denoising->main.pred_boxes});
  REQUIRE(second.denoising->main.pred_logits.grad().index({1}).abs().sum().item<float>() == 0.0F);
  REQUIRE(second.denoising->main.pred_boxes.grad().index({1}).abs().sum().item<float>() == 0.0F);
- for (const auto& name : {"training_supervision.denoising_label_embedding.weight", "training_supervision.denoising_task_embedding.weight",
-                          "training_supervision.ground_truth_mlp.linear1.weight", "class_embed.weight", "bbox_embed.layers.2.weight",
-                          "transformer.decoder.layers.0.self_attn.in_proj_weight"}) {
+ for (const auto& name : {"training_supervision.denoising_label_embedding.weight", "training_supervision.denoising_task_embedding.weight", "training_supervision.ground_truth_mlp.linear1.weight",
+       "class_embed.weight", "bbox_embed.layers.2.weight", "transformer.decoder.layers.0.self_attn.in_proj_weight"}) {
   const auto parameters = owner.named_parameters(true);
   const auto* parameter = parameters.find(name);
   REQUIRE(parameter != nullptr);
@@ -1269,14 +1246,13 @@ void test_production_dn_retained_graph_scratch_padding_and_gradients() {
   REQUIRE(parameter->grad().defined());
   REQUIRE(parameter->grad().abs().sum().item<float>() == 0.0F);
  }
- const auto over_capacity_targets = batched_targets({torch::full({config.num_queries + 1, 4}, 0.2F)},
-                                                    {torch::zeros({config.num_queries + 1}, torch::TensorOptions().dtype(torch::kInt64))}, config.num_queries);
+ const auto over_capacity_targets =
+  batched_targets({torch::full({config.num_queries + 1, 4}, 0.2F)}, {torch::zeros({config.num_queries + 1}, torch::TensorOptions().dtype(torch::kInt64))}, config.num_queries);
  const auto over_capacity = owner.forward_with_denoising(rfdetr::nested_tensor_from_tensor_list({image.clone()}), over_capacity_targets, {71, 3, 1, 8});
  REQUIRE(over_capacity.main.pred_logits.size(1) == config.num_queries);
  REQUIRE(over_capacity.denoising.has_value());
  REQUIRE(over_capacity.denoising->queries_per_group == config.num_queries + 1);
- const auto over_capacity_loss =
-  owner.supervision_loss(over_capacity, over_capacity_targets, {torch::tensor(static_cast<float>(config.num_queries + 1))}, true);
+ const auto over_capacity_loss = owner.supervision_loss(over_capacity, over_capacity_targets, {torch::tensor(static_cast<float>(config.num_queries + 1))}, true);
  REQUIRE(torch::isfinite(over_capacity_loss.total).item<bool>());
  over_capacity_loss.total.backward();
  REQUIRE_FALSE(rfdetr::training_supervision_query_layout_valid(config.training_supervision, std::numeric_limits<std::size_t>::max(), 2U, 0U));
@@ -1299,10 +1275,9 @@ void test_dn_reference_conventions_inference_removal_and_disabled_exact_path() {
  const auto additive_reference = rfdetr::inverse_sigmoid(prepared->normalized_references);
  REQUIRE(torch::allclose(additive_reference.sigmoid(), reparameterized_reference, 1.0e-6, 1.0e-6));
  const auto zero_delta = torch::zeros_like(reparameterized_reference);
- const auto reparameterized_result =
-  torch::cat({zero_delta.slice(-1, 0, 2) * reparameterized_reference.slice(-1, 2, 4) + reparameterized_reference.slice(-1, 0, 2),
-              zero_delta.slice(-1, 2, 4).exp() * reparameterized_reference.slice(-1, 2, 4)},
-             -1);
+ const auto reparameterized_result = torch::cat(
+  {zero_delta.slice(-1, 0, 2) * reparameterized_reference.slice(-1, 2, 4) + reparameterized_reference.slice(-1, 0, 2), zero_delta.slice(-1, 2, 4).exp() * reparameterized_reference.slice(-1, 2, 4)},
+  -1);
  REQUIRE(torch::equal(reparameterized_result, reparameterized_reference));
  auto inactive_config = rfdetr::native_config_from_preset(rfdetr::model_presets().front());
  inactive_config.resolution = 64;
@@ -1343,10 +1318,9 @@ void test_dn_all_empty_loss_is_finite_and_parameter_anchored() {
  outputs.main.pred_logits = torch::zeros({2, 4, 4}).set_requires_grad(true);
  // CLEANUP-IGNORE: All-empty prediction tensors prove DN parameter anchoring, not nonempty loss setup.
  outputs.main.pred_boxes = torch::zeros({2, 4, 4}).set_requires_grad(true);
- const auto targets =
-  batched_targets({torch::zeros({0, 4}), torch::zeros({0, 4})}, {torch::zeros({0}, torch::TensorOptions().dtype(torch::kInt64)),
-                                                                 // CLEANUP-IGNORE: Two empty rows specifically exercise the zero-target path.
-                                                                 torch::zeros({0}, torch::TensorOptions().dtype(torch::kInt64))});
+ const auto targets = batched_targets({torch::zeros({0, 4}), torch::zeros({0, 4})}, {torch::zeros({0}, torch::TensorOptions().dtype(torch::kInt64)),
+                                                                                     // CLEANUP-IGNORE: Two empty rows specifically exercise the zero-target path.
+                                                                                     torch::zeros({0}, torch::TensorOptions().dtype(torch::kInt64))});
  const auto loss = supervision.loss(outputs, targets, {torch::tensor(0.0F)}, true);
  REQUIRE(torch::isfinite(loss.total).item<bool>());
  REQUIRE(loss.total.item<float>() == 0.0F);
@@ -1372,8 +1346,8 @@ void test_active_empty_loss_anchors_every_selected_mask_operand() {
    if (dense) {
     layer.pred_masks = torch::zeros({1, 4, 2, 2}).set_requires_grad(true);
    } else {
-    layer.sparse_pred_masks = rfdetr::OutputLayer::SparsePredMasks{
-     torch::zeros({1, 8, 2, 2}).set_requires_grad(true), torch::zeros({1, 4, 8}).set_requires_grad(true), torch::zeros({1, 4, 1}).set_requires_grad(true)};
+    layer.sparse_pred_masks =
+     rfdetr::OutputLayer::SparsePredMasks{torch::zeros({1, 8, 2, 2}).set_requires_grad(true), torch::zeros({1, 4, 8}).set_requires_grad(true), torch::zeros({1, 4, 1}).set_requires_grad(true)};
    }
    return layer;
   };
@@ -1484,8 +1458,7 @@ void test_sparse_masks_share_erasure_after_geometry_and_donor_composition() {
  auto transforms = torch::tensor({1.F, 0.F, 0.F, 0.F, 1.F, 0.F}, floats).repeat({4, 1});
  transforms.index_put_({3, 2}, -0.5F);
  auto occluder_transforms = torch::tensor({1.F, 0.F, 0.F, 0.F, 1.F, 0.F}, floats).repeat({4, 1});
- const rfdetr::PackedTargetMasks masks{
-  torch::full({4, 1}, 0xFFFF, integers), 4, 4, transforms, torch::tensor({1, -1, -1, -1}, integers), occluder_transforms, bytes.to(torch::kCUDA)};
+ const rfdetr::PackedTargetMasks masks{torch::full({4, 1}, 0xFFFF, integers), 4, 4, transforms, torch::tensor({1, -1, -1, -1}, integers), occluder_transforms, bytes.to(torch::kCUDA)};
  const auto points = torch::tensor({0.125F, 0.125F, 0.375F, 0.375F, 0.625F, 0.125F, 0.125F, 0.625F, 1.0F, 1.0F}, floats).view({1, 5, 2});
  const auto sampled = rfdetr::sample_target_masks(masks, torch::arange(4, integers), points, "erasure test");
  const auto expected = torch::tensor({0.F, 0.F, 0.F, 0.F, 0.F, 0.F, 0.F, 1.F, 1.F, 1.F, 0.F, 0.F, 0.F, 0.F, 0.F, 0.F, 0.F, 1.F, 0.F, 1.F}, floats).view({4, 5});
@@ -1498,19 +1471,13 @@ void test_sparse_masks_share_erasure_after_geometry_and_donor_composition() {
 }
 }  // namespace
 // CLEANUP-IGNORE: These separately registered mathematical cases have different test bodies and acceptance obligations.
-TEST_CASE("test_sparse_masks_share_erasure_after_geometry_and_donor_composition", "[model][rfdetr][training_supervision]") {
- test_sparse_masks_share_erasure_after_geometry_and_donor_composition();
-}
+TEST_CASE("test_sparse_masks_share_erasure_after_geometry_and_donor_composition", "[model][rfdetr][training_supervision]") { test_sparse_masks_share_erasure_after_geometry_and_donor_composition(); }
 // CLEANUP-IGNORE: Registration is an exhaustive inventory of semantically independent mathematical tests.
-TEST_CASE("test_geometry_preserves_consumer_policies_and_batch_isolation", "[model][rfdetr][training_supervision]") {
- test_geometry_preserves_consumer_policies_and_batch_isolation();
-}
+TEST_CASE("test_geometry_preserves_consumer_policies_and_batch_isolation", "[model][rfdetr][training_supervision]") { test_geometry_preserves_consumer_policies_and_batch_isolation(); }
 TEST_CASE("test_gathered_ground_truth_affinity_matches_explicit_one_hot_and_sqrt_d", "[model][rfdetr][training_supervision]") {
  test_gathered_ground_truth_affinity_matches_explicit_one_hot_and_sqrt_d();
 }
-TEST_CASE("test_rectangular_supervision_retains_404_targets_with_300_queries", "[model][rfdetr][training_supervision]") {
- test_rectangular_supervision_retains_404_targets_with_300_queries();
-}
+TEST_CASE("test_rectangular_supervision_retains_404_targets_with_300_queries", "[model][rfdetr][training_supervision]") { test_rectangular_supervision_retains_404_targets_with_300_queries(); }
 TEST_CASE("test_scg_excludes_inactive_columns_handles_ties_and_keeps_selected_gradients_live", "[model][rfdetr][training_supervision]") {
  test_scg_excludes_inactive_columns_handles_ties_and_keeps_selected_gradients_live();
 }
@@ -1520,18 +1487,10 @@ TEST_CASE("test_complete_focal_cost_and_both_objectives_keep_prediction_and_prob
 TEST_CASE("test_focal_broadcast_cost_sums_every_channel_and_places_coefficients_once", "[model][rfdetr][training_supervision]") {
  test_focal_broadcast_cost_sums_every_channel_and_places_coefficients_once();
 }
-TEST_CASE("test_layer_group_and_device_target_reductions_follow_declared_gating", "[model][rfdetr][training_supervision]") {
- test_layer_group_and_device_target_reductions_follow_declared_gating();
-}
-TEST_CASE("test_complete_match_free_loss_is_fp32_inside_cuda_autocast", "[model][rfdetr][training_supervision]") {
- test_complete_match_free_loss_is_fp32_inside_cuda_autocast();
-}
-TEST_CASE("test_timing_leases_are_explicit_bounded_and_harvested_once", "[model][rfdetr][training_supervision]") {
- test_timing_leases_are_explicit_bounded_and_harvested_once();
-}
-TEST_CASE("test_empty_and_retained_graphs_are_finite_and_independent", "[model][rfdetr][training_supervision]") {
- test_empty_and_retained_graphs_are_finite_and_independent();
-}
+TEST_CASE("test_layer_group_and_device_target_reductions_follow_declared_gating", "[model][rfdetr][training_supervision]") { test_layer_group_and_device_target_reductions_follow_declared_gating(); }
+TEST_CASE("test_complete_match_free_loss_is_fp32_inside_cuda_autocast", "[model][rfdetr][training_supervision]") { test_complete_match_free_loss_is_fp32_inside_cuda_autocast(); }
+TEST_CASE("test_timing_leases_are_explicit_bounded_and_harvested_once", "[model][rfdetr][training_supervision]") { test_timing_leases_are_explicit_bounded_and_harvested_once(); }
+TEST_CASE("test_empty_and_retained_graphs_are_finite_and_independent", "[model][rfdetr][training_supervision]") { test_empty_and_retained_graphs_are_finite_and_independent(); }
 TEST_CASE("test_production_match_free_boundary_captures_layers_and_empty_gradient_anchors", "[model][rfdetr][training_supervision]") {
  test_production_match_free_boundary_captures_layers_and_empty_gradient_anchors();
 }
@@ -1541,36 +1500,20 @@ TEST_CASE("test_mixed_empty_images_use_safe_internal_padding_without_loss_contri
 TEST_CASE("test_conditional_model_construction_preserves_rng_and_default_state_topology", "[model][rfdetr][training_supervision]") {
  test_conditional_model_construction_preserves_rng_and_default_state_topology();
 }
-TEST_CASE("test_dn_endpoint_transform_mapping_padding_and_one_class_behavior", "[model][rfdetr][training_supervision]") {
- test_dn_endpoint_transform_mapping_padding_and_one_class_behavior();
-}
-TEST_CASE("test_dn_center_underflow_other_label_bijection_and_step_determinism", "[model][rfdetr][training_supervision]") {
- test_dn_center_underflow_other_label_bijection_and_step_determinism();
-}
+TEST_CASE("test_dn_endpoint_transform_mapping_padding_and_one_class_behavior", "[model][rfdetr][training_supervision]") { test_dn_endpoint_transform_mapping_padding_and_one_class_behavior(); }
+TEST_CASE("test_dn_center_underflow_other_label_bijection_and_step_determinism", "[model][rfdetr][training_supervision]") { test_dn_center_underflow_other_label_bijection_and_step_determinism(); }
 TEST_CASE("test_split_self_attention_matches_equation_seven_and_symmetric_group_layout", "[model][rfdetr][training_supervision]") {
  test_split_self_attention_matches_equation_seven_and_symmetric_group_layout();
 }
-TEST_CASE("test_dn_direct_loss_auxiliary_gating_padding_and_retained_graphs", "[model][rfdetr][training_supervision]") {
- test_dn_direct_loss_auxiliary_gating_padding_and_retained_graphs();
-}
-TEST_CASE("test_production_dn_forward_preserves_reference_and_output_boundaries", "[model][rfdetr][training_supervision]") {
- test_production_dn_forward_preserves_reference_and_output_boundaries();
-}
-TEST_CASE("test_production_dn_retained_graph_scratch_padding_and_gradients", "[model][rfdetr][training_supervision]") {
- test_production_dn_retained_graph_scratch_padding_and_gradients();
-}
+TEST_CASE("test_dn_direct_loss_auxiliary_gating_padding_and_retained_graphs", "[model][rfdetr][training_supervision]") { test_dn_direct_loss_auxiliary_gating_padding_and_retained_graphs(); }
+TEST_CASE("test_production_dn_forward_preserves_reference_and_output_boundaries", "[model][rfdetr][training_supervision]") { test_production_dn_forward_preserves_reference_and_output_boundaries(); }
+TEST_CASE("test_production_dn_retained_graph_scratch_padding_and_gradients", "[model][rfdetr][training_supervision]") { test_production_dn_retained_graph_scratch_padding_and_gradients(); }
 TEST_CASE("test_dn_reference_conventions_inference_removal_and_disabled_exact_path", "[model][rfdetr][training_supervision]") {
  test_dn_reference_conventions_inference_removal_and_disabled_exact_path();
 }
-TEST_CASE("test_dn_all_empty_loss_is_finite_and_parameter_anchored", "[model][rfdetr][training_supervision]") {
- test_dn_all_empty_loss_is_finite_and_parameter_anchored();
-}
-TEST_CASE("test_active_empty_loss_anchors_every_selected_mask_operand", "[model][rfdetr][training_supervision]") {
- test_active_empty_loss_anchors_every_selected_mask_operand();
-}
-TEST_CASE("test_dn_preparation_and_objective_remain_fp32_under_cuda_autocast", "[model][rfdetr][training_supervision]") {
- test_dn_preparation_and_objective_remain_fp32_under_cuda_autocast();
-}
+TEST_CASE("test_dn_all_empty_loss_is_finite_and_parameter_anchored", "[model][rfdetr][training_supervision]") { test_dn_all_empty_loss_is_finite_and_parameter_anchored(); }
+TEST_CASE("test_active_empty_loss_anchors_every_selected_mask_operand", "[model][rfdetr][training_supervision]") { test_active_empty_loss_anchors_every_selected_mask_operand(); }
+TEST_CASE("test_dn_preparation_and_objective_remain_fp32_under_cuda_autocast", "[model][rfdetr][training_supervision]") { test_dn_preparation_and_objective_remain_fp32_under_cuda_autocast(); }
 TEST_CASE("test_feature_initialization_is_reproducible_and_independent_of_dn_toggle", "[model][rfdetr][training_supervision]") {
  test_feature_initialization_is_reproducible_and_independent_of_dn_toggle();
 }

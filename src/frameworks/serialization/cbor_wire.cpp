@@ -25,13 +25,11 @@ namespace {
  if (const auto* text = std::get_if<std::string>(&value.storage)) return text->size() <= limits.max_bytes;
  if (const auto* bytes = std::get_if<ByteBuffer>(&value.storage)) return bytes->size() <= limits.max_bytes;
  if (const auto* array = std::get_if<Value::Array>(&value.storage)) {
-  return array->size() <= limits.max_items &&
-         std::all_of(array->begin(), array->end(), [&](const Value& child) { return dynamic_value_within_limits(child, limits, depth + 1U); });
+  return array->size() <= limits.max_items && std::all_of(array->begin(), array->end(), [&](const Value& child) { return dynamic_value_within_limits(child, limits, depth + 1U); });
  }
  if (const auto* object = std::get_if<Value::Object>(&value.storage)) {
-  return object->size() <= limits.max_items && std::all_of(object->begin(), object->end(), [&](const auto& member) {
-          return member.first.size() <= limits.max_bytes && dynamic_value_within_limits(member.second, limits, depth + 1U);
-         });
+  return object->size() <= limits.max_items &&
+         std::all_of(object->begin(), object->end(), [&](const auto& member) { return member.first.size() <= limits.max_bytes && dynamic_value_within_limits(member.second, limits, depth + 1U); });
  }
  return true;
 }
@@ -86,9 +84,7 @@ namespace {
  return std::bit_cast<float>(bits);
 }
 [[nodiscard]] EncodeError encode_error(const ErrorCode code = ErrorCode::LimitExceeded) { return {.code = code, .offset = 0U, .path = {}}; }
-[[nodiscard]] bool fits_remaining(const std::size_t value, const std::size_t used, const std::size_t limit) noexcept {
- return used <= limit && value <= limit - used;
-}
+[[nodiscard]] bool fits_remaining(const std::size_t value, const std::size_t used, const std::size_t limit) noexcept { return used <= limit && value <= limit - used; }
 [[nodiscard]] bool duplicate_object_key(const Value::Object& object) {
  std::set<std::string_view, std::less<>> names;
  for (const auto& [name, ignored] : object) {
@@ -114,9 +110,7 @@ template <class Range, class Operation>
 [[nodiscard]] std::expected<void, EncodeError> validate_object_encoding(const Value::Object& object, const std::size_t items, const Limits& limits) {
  if (duplicate_object_key(object)) { return std::unexpected(encode_error(ErrorCode::DuplicateKey)); }
  constexpr std::size_t kMapEntriesItemCount = 2U;
- if (items > limits.max_items || object.size() > (limits.max_items - items) / kMapEntriesItemCount) {
-  return std::unexpected(encode_error(ErrorCode::LimitExceeded));
- }
+ if (items > limits.max_items || object.size() > (limits.max_items - items) / kMapEntriesItemCount) { return std::unexpected(encode_error(ErrorCode::LimitExceeded)); }
  return {};
 }
 [[nodiscard]] constexpr std::uint8_t additional_info_for_head_size(const std::size_t size) noexcept {
@@ -208,16 +202,13 @@ std::expected<FlatValue, DecodeError> FlatValue::from_value(const Value& value, 
    if constexpr (std::is_same_v<T, std::monostate> || std::is_same_v<T, bool> || std::is_same_v<T, std::int64_t> || std::is_same_v<T, std::uint64_t>) {
     return FlatValue(leaf);
    } else if constexpr (std::is_same_v<T, double>) {
-    return std::isfinite(leaf) ? std::expected<FlatValue, DecodeError>(FlatValue(leaf))
-                               : std::unexpected(DecodeError{.code = ErrorCode::InvalidFloat, .offset = 0U, .path = {}});
+    return std::isfinite(leaf) ? std::expected<FlatValue, DecodeError>(FlatValue(leaf)) : std::unexpected(DecodeError{.code = ErrorCode::InvalidFloat, .offset = 0U, .path = {}});
    } else if constexpr (std::is_same_v<T, std::string>) {
     return FlatValue::text(leaf, limits.max_bytes);
    } else if constexpr (std::is_same_v<T, ByteBuffer>) {
     return FlatValue::bytes(leaf, limits.max_bytes);
    } else if constexpr (std::is_same_v<T, Value::Array>) {
-    if (leaf.size() > limits.max_items || (limits.max_depth == 0U && !leaf.empty())) {
-     return std::unexpected(DecodeError{.code = ErrorCode::LimitExceeded, .offset = 0U, .path = {}});
-    }
+    if (leaf.size() > limits.max_items || (limits.max_depth == 0U && !leaf.empty())) { return std::unexpected(DecodeError{.code = ErrorCode::LimitExceeded, .offset = 0U, .path = {}}); }
     FlatValue::Array result;
     result.reserve(leaf.size());
     for (const Value& item : leaf) {
@@ -265,8 +256,7 @@ bool dynamic_value_within_limits(const FlatValue& value, const DynamicValueLimit
   return true;
  });
 }
-Reader::Reader(const ByteSegments bytes, const Limits limits, const StructuralValidationScratch scratch) noexcept
-    : input_(bytes), limits_(limits), structural_scratch_(scratch) {}
+Reader::Reader(const ByteSegments bytes, const Limits limits, const StructuralValidationScratch scratch) noexcept : input_(bytes), limits_(limits), structural_scratch_(scratch) {}
 void Reader::PathScope::release() noexcept {
  if (reader_ != nullptr) {
   reader_->path_.pop_back();
@@ -445,8 +435,7 @@ std::expected<FlatValue, DecodeError> Reader::read_flat_scalar(const ItemHead he
  };
  return head.major == 2U ? as_flat(bytes(count)) : as_flat(text(count));
 }
-std::expected<std::size_t, DecodeError> Reader::begin_container_item(const std::size_t depth, const std::uint8_t expected_major,
-                                                                     const AllocationKind allocation_kind) {
+std::expected<std::size_t, DecodeError> Reader::begin_container_item(const std::size_t depth, const std::uint8_t expected_major, const AllocationKind allocation_kind) {
  auto head = item_head(depth);
  if (!head) { return std::unexpected(head.error()); }
  if (head->major != expected_major) { return std::unexpected(error(ErrorCode::TypeMismatch)); }
@@ -557,9 +546,7 @@ std::expected<FlatValue, DecodeError> Reader::read_flat_item(const std::size_t d
  if (head->major != 4U) { return read_flat_scalar(*head, true); }
  auto count = size_argument(head->additional);
  if (!count) return std::unexpected(count.error());
- if (!allocation_allowed(AllocationKind::Sequence, *count) || !fits_remaining(*count, items_, limits_.max_items)) {
-  return std::unexpected(error(ErrorCode::LimitExceeded));
- }
+ if (!allocation_allowed(AllocationKind::Sequence, *count) || !fits_remaining(*count, items_, limits_.max_items)) { return std::unexpected(error(ErrorCode::LimitExceeded)); }
  FlatValue::Array result;
  result.reserve(*count);
  for (std::size_t index = 0U; index < *count; ++index) {
@@ -604,9 +591,7 @@ std::expected<Value, DecodeError> Reader::read_item(const std::size_t depth, con
  auto count = size_argument(head->additional);
  if (!count) return std::unexpected(count.error());
  if (head->major == 4U) {
-  if (materialize && apply_allocation_policy && !allocation_allowed(AllocationKind::Sequence, *count)) {
-   return std::unexpected(error(ErrorCode::LimitExceeded));
-  }
+  if (materialize && apply_allocation_policy && !allocation_allowed(AllocationKind::Sequence, *count)) { return std::unexpected(error(ErrorCode::LimitExceeded)); }
   if (!fits_remaining(*count, items_, limits_.max_items)) { return std::unexpected(error(ErrorCode::LimitExceeded)); }
   Value::Array values;
   if (materialize) { values.reserve(*count); }
@@ -618,9 +603,7 @@ std::expected<Value, DecodeError> Reader::read_item(const std::size_t depth, con
   return materialize ? Value(std::move(values)) : Value{};
  }
  if (head->major == 5U) {
-  if (materialize && apply_allocation_policy && !allocation_allowed(AllocationKind::Object, *count)) {
-   return std::unexpected(error(ErrorCode::LimitExceeded));
-  }
+  if (materialize && apply_allocation_policy && !allocation_allowed(AllocationKind::Object, *count)) { return std::unexpected(error(ErrorCode::LimitExceeded)); }
   constexpr std::size_t kMapEntriesItemCount = 2U;
   if (*count > (limits_.max_items - items_) / kMapEntriesItemCount) { return std::unexpected(error(ErrorCode::LimitExceeded)); }
   if (!materialize) {
@@ -673,9 +656,7 @@ std::expected<Value, DecodeError> Reader::read() { return read_document(&Reader:
 std::expected<void, DecodeError> Reader::validate_structural() {
  if (!input_.second.empty()) { return std::unexpected(error(ErrorCode::MalformedItem)); }
  if (input_.size() > limits_.max_bytes) { return std::unexpected(error(ErrorCode::LimitExceeded)); }
- if (input_.size() >= std::numeric_limits<std::uint32_t>::max() || structural_scratch_.key_offsets.size() < limits_.max_items) {
-  return std::unexpected(error(ErrorCode::LimitExceeded));
- }
+ if (input_.size() >= std::numeric_limits<std::uint32_t>::max() || structural_scratch_.key_offsets.size() < limits_.max_items) { return std::unexpected(error(ErrorCode::LimitExceeded)); }
  structural_scratch_cursor_ = 0U;
  auto result = read_item(0U, false, false);
  if (!result) { return std::unexpected(result.error()); }

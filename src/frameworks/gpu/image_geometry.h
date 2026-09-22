@@ -25,9 +25,7 @@ struct ImageAxisScale final {
    .original_pixels = original / divisor,
   };
  }
- [[nodiscard]] constexpr bool valid() const noexcept {
-  return backing_pixels != 0U && original_pixels != 0U && std::gcd(backing_pixels, original_pixels) == 1U;
- }
+ [[nodiscard]] constexpr bool valid() const noexcept { return backing_pixels != 0U && original_pixels != 0U && std::gcd(backing_pixels, original_pixels) == 1U; }
  constexpr bool operator==(const ImageAxisScale&) const noexcept = default;
 };
 struct ImageGeometry final {

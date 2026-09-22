@@ -8,9 +8,8 @@ namespace mmltk::backend::data::benchmark_internal {
 enum class CoconutEdition : std::uint8_t { Base = 0, RelabeledValidation = 1, Large = 2, XLarge = 3, ObjectsValidation = 4 };
 enum class CoconutImageNamespace : std::uint8_t { CocoTrain = 0, CocoUnlabeled = 1, CocoValidation = 2, Objects365V1 = 3, Objects365V2 = 4 };
 // Persisted inventory and completion identities retain these numeric meanings.
-static_assert(static_cast<std::uint8_t>(CoconutEdition::Base) == 0 && static_cast<std::uint8_t>(CoconutEdition::RelabeledValidation) == 1 &&
-              static_cast<std::uint8_t>(CoconutEdition::Large) == 2 && static_cast<std::uint8_t>(CoconutEdition::XLarge) == 3 &&
-              static_cast<std::uint8_t>(CoconutEdition::ObjectsValidation) == 4);
+static_assert(static_cast<std::uint8_t>(CoconutEdition::Base) == 0 && static_cast<std::uint8_t>(CoconutEdition::RelabeledValidation) == 1 && static_cast<std::uint8_t>(CoconutEdition::Large) == 2 &&
+              static_cast<std::uint8_t>(CoconutEdition::XLarge) == 3 && static_cast<std::uint8_t>(CoconutEdition::ObjectsValidation) == 4);
 static_assert(static_cast<std::uint8_t>(CoconutImageNamespace::CocoTrain) == 0 && static_cast<std::uint8_t>(CoconutImageNamespace::CocoUnlabeled) == 1 &&
               static_cast<std::uint8_t>(CoconutImageNamespace::CocoValidation) == 2 && static_cast<std::uint8_t>(CoconutImageNamespace::Objects365V1) == 3 &&
               static_cast<std::uint8_t>(CoconutImageNamespace::Objects365V2) == 4);

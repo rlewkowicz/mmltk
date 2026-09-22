@@ -9,19 +9,15 @@
 #include "src/common/math/checked_arithmetic.h"
 namespace mmltk::backend::data::dataset {
 using mmltk::common::math::checked_cast;
-void fill_center_scale_lookup(const std::span<std::uint32_t> lookup, const std::uint32_t target_extent, const std::uint32_t source_extent,
-                              const char* overflow_context) {
+void fill_center_scale_lookup(const std::span<std::uint32_t> lookup, const std::uint32_t target_extent, const std::uint32_t source_extent, const char* overflow_context) {
  const std::uint64_t target_twice = static_cast<std::uint64_t>(2U) * target_extent;
  for (std::uint32_t index = 0U; index < target_extent; ++index) {
-  lookup[index] = std::min<std::uint32_t>(
-   source_extent - 1U, checked_cast<std::uint32_t>(((static_cast<std::uint64_t>(2U) * index + 1U) * source_extent) / target_twice, overflow_context));
+  lookup[index] = std::min<std::uint32_t>(source_extent - 1U, checked_cast<std::uint32_t>(((static_cast<std::uint64_t>(2U) * index + 1U) * source_extent) / target_twice, overflow_context));
  }
 }
 namespace {
 [[nodiscard]] std::size_t checked_pixel_count(const MaskDimensions dimensions) {
- if (dimensions.width == 0U || dimensions.height == 0U || dimensions.width > std::numeric_limits<std::size_t>::max() / dimensions.height) {
-  throw std::runtime_error("mask dimensions are invalid");
- }
+ if (dimensions.width == 0U || dimensions.height == 0U || dimensions.width > std::numeric_limits<std::size_t>::max() / dimensions.height) { throw std::runtime_error("mask dimensions are invalid"); }
  return static_cast<std::size_t>(dimensions.width) * dimensions.height;
 }
 }  // namespace
@@ -52,10 +48,7 @@ void include_row_major_mask_run(RowMajorMaskBounds* bounds, const std::size_t be
 }
 namespace {
 void prepare_lookup(const MaskDimensions source, const std::uint32_t width, const std::uint32_t height, MaskResizeScratch* scratch) {
- if (scratch->lookup_source.width == source.width && scratch->lookup_source.height == source.height && scratch->lookup_width == width &&
-     scratch->lookup_height == height) {
-  return;
- }
+ if (scratch->lookup_source.width == source.width && scratch->lookup_source.height == source.height && scratch->lookup_width == width && scratch->lookup_height == height) { return; }
  scratch->lookup_source = source;
  scratch->lookup_width = width;
  scratch->lookup_height = height;
@@ -64,8 +57,7 @@ void prepare_lookup(const MaskDimensions source, const std::uint32_t width, cons
  fill_center_scale_lookup(scratch->source_x, width, source.width, "scaled mask x overflow");
  fill_center_scale_lookup(scratch->source_y, height, source.height, "scaled mask y overflow");
 }
-void clear_padding(std::vector<std::uint8_t>* target, const MaskDimensions dimensions,
-                   const mmltk::backend::imaging::resample::ImageResizeGeometry& letterbox) {
+void clear_padding(std::vector<std::uint8_t>* target, const MaskDimensions dimensions, const mmltk::backend::imaging::resample::ImageResizeGeometry& letterbox) {
  const std::size_t top = static_cast<std::size_t>(letterbox.offset_y) * dimensions.width;
  std::fill_n(target->data(), top, std::uint8_t{0U});
  const std::uint32_t right = dimensions.width - letterbox.offset_x - letterbox.resized_width;
@@ -122,8 +114,7 @@ void inspect_row_major_mask(const std::span<const RLEPair> pairs, const MaskDime
  if (bounds != nullptr) *bounds = {};
  std::size_t previous_end = 0U;
  for (const auto pair : pairs) {
-  if (pair.length == 0U || pair.start < previous_end || pair.start > pixels || pair.length > pixels - pair.start)
-   throw std::runtime_error("row-major mask contains an invalid run");
+  if (pair.length == 0U || pair.start < previous_end || pair.start > pixels || pair.length > pixels - pair.start) throw std::runtime_error("row-major mask contains an invalid run");
   previous_end = static_cast<std::size_t>(pair.start) + pair.length;
   include_row_major_mask_run(bounds, pair.start, previous_end, dimensions.width);
  }
@@ -134,8 +125,7 @@ RowMajorMaskBounds row_major_mask_bounds(const std::span<const RLEPair> pairs, c
  inspect_row_major_mask(pairs, dimensions, &bounds);
  return bounds;
 }
-void materialize_row_major_mask(const std::span<const RLEPair> pairs, const MaskDimensions dimensions, std::vector<std::uint8_t>* dense,
-                                RowMajorMaskBounds* bounds) {
+void materialize_row_major_mask(const std::span<const RLEPair> pairs, const MaskDimensions dimensions, std::vector<std::uint8_t>* dense, RowMajorMaskBounds* bounds) {
  if (dense == nullptr) { throw std::invalid_argument("dense mask output is required"); }
  const std::size_t pixels = checked_pixel_count(dimensions);
  dense->assign(pixels, std::uint8_t{0U});
@@ -152,8 +142,7 @@ void materialize_row_major_mask(const std::span<const RLEPair> pairs, const Mask
  }
 }
 EncodedRowMajorMask resize_row_major_mask(const std::span<const RLEPair> pairs, const MaskDimensions source_dimensions, const MaskDimensions target_dimensions,
-                                          const mmltk::backend::imaging::resample::ImageResizeGeometry& letterbox, MaskResizeScratch* scratch,
-                                          RowMajorMaskBounds* source_bounds) {
+ const mmltk::backend::imaging::resample::ImageResizeGeometry& letterbox, MaskResizeScratch* scratch, RowMajorMaskBounds* source_bounds) {
  if (scratch == nullptr || letterbox.resized_width == 0U || letterbox.resized_height == 0U || letterbox.resized_width > target_dimensions.width ||
      letterbox.resized_height > target_dimensions.height || letterbox.offset_x > target_dimensions.width - letterbox.resized_width ||
      letterbox.offset_y > target_dimensions.height - letterbox.resized_height) {

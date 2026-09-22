@@ -21,14 +21,10 @@ struct AtlasDrawAudit final {
  using SourceKey = std::array<std::uint64_t, 4U>;
  using SampleKey = std::pair<std::string, std::uint64_t>;
  using AllocationKey = std::tuple<std::string, std::uint64_t, std::uint64_t>;
- static constexpr std::initializer_list<const char*> source_fields{
-  "content_session", "source_kind",    "source_instance", "source_revision", "content_width", "content_height", "dataset_identity", "columns", "rows",
-  "first_row",       "matching_count", "visible_indices", "row_capacity",    "row_origin",    "card_extent"};
- static constexpr std::initializer_list<const char*> image_fields{
-  "surface",     "width",           "height",          "presentation_revision", "frame_revision", "content_session",
-  "source_kind", "source_instance", "source_revision", "content_width",         "content_height", "columns",
-  "rows",        "first_row",       "matching_count",  "visible_indices",       "row_capacity",   "row_origin",
-  "card_extent"};
+ static constexpr std::initializer_list<const char*> source_fields{"content_session", "source_kind", "source_instance", "source_revision", "content_width", "content_height", "dataset_identity",
+  "columns", "rows", "first_row", "matching_count", "visible_indices", "row_capacity", "row_origin", "card_extent"};
+ static constexpr std::initializer_list<const char*> image_fields{"surface", "width", "height", "presentation_revision", "frame_revision", "content_session", "source_kind", "source_instance",
+  "source_revision", "content_width", "content_height", "columns", "rows", "first_row", "matching_count", "visible_indices", "row_capacity", "row_origin", "card_extent"};
  static constexpr std::array stage_names{"fractional", "row1", "row2", "row10", "row9", "end", "restored"};
  static constexpr std::array held_names{"held-visible", "held-return", "held-aligned", "held-extra", "held-restored", "held-complete"};
  static constexpr std::array return_names{"return-cached", "return-aligned", "return-extra", "return-restored"};
@@ -68,10 +64,9 @@ struct AtlasDrawAudit final {
  FirstAuditFailure failure;
  [[nodiscard]] const nlohmann::json* acquisition_for(const SampleKey& key) const;
  [[nodiscard]] bool empty_draw_submitted(const SurfaceAudit& physical) const;
- [[nodiscard]] bool check(const bool passed, const std::string_view reason, const nlohmann::json& record, const nlohmann::json* prior = nullptr,
-                          const std::string_view field = {}, const nlohmann::json* expected = nullptr);
- [[nodiscard]] bool check_fields(const nlohmann::json& record, const nlohmann::json& prior, const std::initializer_list<const char*> fields,
-                                 const std::string_view reason);
+ [[nodiscard]] bool check(
+  const bool passed, const std::string_view reason, const nlohmann::json& record, const nlohmann::json* prior = nullptr, const std::string_view field = {}, const nlohmann::json* expected = nullptr);
+ [[nodiscard]] bool check_fields(const nlohmann::json& record, const nlohmann::json& prior, const std::initializer_list<const char*> fields, const std::string_view reason);
  [[nodiscard]] static SourceKey source_key(const nlohmann::json& record);
  [[nodiscard]] static SampleKey sample_key(const nlohmann::json& record);
  [[nodiscard]] static AllocationKey allocation_key(const nlohmann::json& record);
@@ -99,9 +94,7 @@ struct BrowserAudit final {
   double width = 0.0;
   double height = 0.0;
   [[nodiscard]] bool valid() const noexcept { return width > 0.0 && height > 0.0; }
-  [[nodiscard]] bool contains_horizontally(const Bounds& inner, const double tolerance = 1.0) const noexcept {
-   return inner.x >= x - tolerance && inner.x + inner.width <= x + width + tolerance;
-  }
+  [[nodiscard]] bool contains_horizontally(const Bounds& inner, const double tolerance = 1.0) const noexcept { return inner.x >= x - tolerance && inner.x + inner.width <= x + width + tolerance; }
   [[nodiscard]] bool contains(const Bounds& inner, const double tolerance = 1.0) const noexcept {
    return contains_horizontally(inner, tolerance) && inner.y >= y - tolerance && inner.y + inner.height <= y + height + tolerance;
   }
@@ -348,10 +341,8 @@ struct BrowserAudit final {
  [[nodiscard]] std::string_view readiness_blocker() const;
  [[nodiscard]] bool product_ready() const;
  [[nodiscard]] bool terminal_evidence_settled() const noexcept;
- [[nodiscard]] bool rendered_frame_for_slots(const std::map<std::uint64_t, std::uint64_t>& native_slots, const std::uint64_t source_revision,
-                                             const std::size_t minimum_redraws) const noexcept;
- [[nodiscard]] bool observed_frame_revision_for_slots(const std::map<std::uint64_t, std::uint64_t>& native_slots,
-                                                      const std::uint64_t source_revision) const noexcept;
+ [[nodiscard]] bool rendered_frame_for_slots(const std::map<std::uint64_t, std::uint64_t>& native_slots, const std::uint64_t source_revision, const std::size_t minimum_redraws) const noexcept;
+ [[nodiscard]] bool observed_frame_revision_for_slots(const std::map<std::uint64_t, std::uint64_t>& native_slots, const std::uint64_t source_revision) const noexcept;
  [[nodiscard]] const std::map<std::uint64_t, std::uint64_t>* final_cursor_slots() const noexcept;
  [[nodiscard]] const std::map<std::uint64_t, std::uint64_t>* pointer_slots() const noexcept;
  [[nodiscard]] bool failed_before_termination() const noexcept;
@@ -409,7 +400,11 @@ private:
  static constexpr const char* SETTINGS_RESET = "settings.reset";
  static constexpr const char* SETTINGS_CLOSE = "settings.close";
  static constexpr std::array<std::string_view, 5> SETTINGS_NUMERIC_CONTROLS{
-  "settings.ui_scale", "settings.font_size", "settings.secondary_font_size", "settings.mono_font_size", "settings.text_input_font_size",
+  "settings.ui_scale",
+  "settings.font_size",
+  "settings.secondary_font_size",
+  "settings.mono_font_size",
+  "settings.text_input_font_size",
  };
 };
 }  // namespace mmltk::acceptance::wayland

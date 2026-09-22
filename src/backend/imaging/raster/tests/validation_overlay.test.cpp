@@ -33,18 +33,16 @@ TEST_CASE("validation adds completed layers once with unchanged alpha and ordina
  std::unique_ptr<Input, decltype(release)> storage(device, release);
  const auto draw = [&](bool add, bool device_count = false) {
   REQUIRE(cudaMemcpyAsync(device, &input, sizeof(input), cudaMemcpyHostToDevice, stream.get()) == cudaSuccess);
-  REQUIRE(raster::raster_instance_overlay_rgba(
-           {.overlay = {reinterpret_cast<std::uint8_t*>(device), 16U, 4, 1},
-            .instances = {reinterpret_cast<const float*>(reinterpret_cast<std::uint8_t*>(device) + offsetof(Input, boxes)),
-                          reinterpret_cast<const std::uint8_t*>(device) + offsetof(Input, colors),
-                          reinterpret_cast<const int*>(reinterpret_cast<std::uint8_t*>(device) + offsetof(Input, labels)), 2,
-                          device_count ? reinterpret_cast<const std::int64_t*>(reinterpret_cast<std::uint8_t*>(device) + offsetof(Input, count)) : nullptr},
-            .masks = reinterpret_cast<const bool*>(reinterpret_cast<std::uint8_t*>(device) + offsetof(Input, masks)),
-            .mask_alpha = 96U,
-            .box_thickness = 0,
-            .stream = {stream.get()},
-            .labels = false,
-            .add_rgb_to_existing = add}) == cudaSuccess);
+  REQUIRE(raster::raster_instance_overlay_rgba({.overlay = {reinterpret_cast<std::uint8_t*>(device), 16U, 4, 1},
+           .instances = {reinterpret_cast<const float*>(reinterpret_cast<std::uint8_t*>(device) + offsetof(Input, boxes)), reinterpret_cast<const std::uint8_t*>(device) + offsetof(Input, colors),
+            reinterpret_cast<const int*>(reinterpret_cast<std::uint8_t*>(device) + offsetof(Input, labels)), 2,
+            device_count ? reinterpret_cast<const std::int64_t*>(reinterpret_cast<std::uint8_t*>(device) + offsetof(Input, count)) : nullptr},
+           .masks = reinterpret_cast<const bool*>(reinterpret_cast<std::uint8_t*>(device) + offsetof(Input, masks)),
+           .mask_alpha = 96U,
+           .box_thickness = 0,
+           .stream = {stream.get()},
+           .labels = false,
+           .add_rgb_to_existing = add}) == cudaSuccess);
   std::array<std::uint8_t, 16> output{};
   REQUIRE(cudaMemcpyAsync(output.data(), device, output.size(), cudaMemcpyDeviceToHost, stream.get()) == cudaSuccess);
   REQUIRE(cudaStreamSynchronize(stream.get()) == cudaSuccess);

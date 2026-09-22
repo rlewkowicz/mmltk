@@ -95,8 +95,7 @@ public:
  ExploreOrderFacts Visible(ExploreViewport, const ExploreOrderCandidate* = nullptr) const override { return {}; }
  bool Contains(std::uint32_t) const override { return false; }
  std::optional<std::uint32_t> Adjacent(std::uint32_t, std::int64_t) const override { return {}; }
- void RenderProduct(const ExploreRenderPlan&, const ExploreOrderCandidate*, std::size_t, mmltk::frameworks::gpu::ImagePlaneView,
-                    mmltk::frameworks::gpu::ImagePlaneView, std::uintptr_t) override {
+ void RenderProduct(const ExploreRenderPlan&, const ExploreOrderCandidate*, std::size_t, mmltk::frameworks::gpu::ImagePlaneView, mmltk::frameworks::gpu::ImagePlaneView, std::uintptr_t) override {
   throw std::runtime_error("deterministic compiled renderer failure");
  }
 };
@@ -106,8 +105,7 @@ public:
  REQUIRE(borrowed.valid());
  return borrowed.plane(0U).revision();
 }
-[[nodiscard]] VisualRuntimeFactory gated_visual_construction(VisualRuntimeFactory factory, std::promise<void>& constructing, std::shared_future<void> release,
-                                                             const std::size_t ordinal) {
+[[nodiscard]] VisualRuntimeFactory gated_visual_construction(VisualRuntimeFactory factory, std::promise<void>& constructing, std::shared_future<void> release, const std::size_t ordinal) {
  return [factory = std::move(factory), &constructing, release = std::move(release), ordinal, constructions = std::size_t{0U}](auto revisions) mutable {
   if (ordinal == 0U || ++constructions == ordinal) {
    constructing.set_value();
@@ -168,8 +166,7 @@ auto first_visual_failure(std::atomic_uint& count, std::promise<std::exception_p
   if (count.fetch_add(1U) == 0U) first.set_value(failure);
  };
 }
-void submit_visual_workspace(detail::VisualRuntimeOwner& owner, const std::shared_ptr<FakeImageBackend>& backend,
-                             std::promise<mmltk::frameworks::gpu::SystemImageRuntime::CompletedOutput>& created) {
+void submit_visual_workspace(detail::VisualRuntimeOwner& owner, const std::shared_ptr<FakeImageBackend>& backend, std::promise<mmltk::frameworks::gpu::SystemImageRuntime::CompletedOutput>& created) {
  const bool submitted = owner.SubmitOrdered([&backend, &created](auto& runtime, std::stop_token) {
   auto [workspace, prepared] = mmltk::frameworks::gpu::test_support::PublishTestWorkspace(runtime, backend);
   REQUIRE(prepared);
@@ -239,12 +236,11 @@ TEST_CASE("Visual workspace retirement resumes queued work only after its delaye
  auto failure_result = failed.get_future();
  std::atomic<std::size_t> failures{0U};
  mmltk::testsupport::TestGate staged_gate("workspace staged retirement");
- detail::VisualRuntimeOwner owner{
-  [&](auto revisions) {
-   ++constructions;
-   auto runtime = std::make_unique<SystemImageRuntime>(mmltk::frameworks::gpu::test_support::WorkspaceRuntimeConfig(backend, std::move(revisions)));
-   return runtime;
-  },
+ detail::VisualRuntimeOwner owner{[&](auto revisions) {
+                                   ++constructions;
+                                   auto runtime = std::make_unique<SystemImageRuntime>(mmltk::frameworks::gpu::test_support::WorkspaceRuntimeConfig(backend, std::move(revisions)));
+                                   return runtime;
+                                  },
   [&](std::exception_ptr failure) {
    if (failures.fetch_add(1U) == 0U) failed.set_value(failure);
   }};
@@ -310,8 +306,7 @@ TEST_CASE("a failed visual aggregate publishes once and reconstructs lazily") {
  auto constructions = std::make_shared<std::atomic<std::uint64_t>>(0U);
  auto failures = std::make_shared<std::atomic<std::uint64_t>>(0U);
  LoadedSettings settings;
- ExploreScenario scenario{
-  settings, backend,
+ ExploreScenario scenario{settings, backend,
   [constructions] {
    const auto generation = constructions->fetch_add(1U, std::memory_order_acq_rel);
    if (generation == 0U) return std::unique_ptr<mmltk::frameworks::gpu::SystemImageModel>{std::make_unique<FailingExploreAlgorithm>()};
@@ -334,10 +329,7 @@ TEST_CASE("a failed visual aggregate publishes once and reconstructs lazily") {
 TEST_CASE("Workspace input retains ordered high-water records for independent native owners") {
  WorkspaceInputQueue<WorkspaceMouse> queue;
  for (std::size_t index = 0U; index != 1024U; ++index)
-  queue.Push({.source = PresentationSourceKind::Explore,
-              .peer_epoch = 1U,
-              .kind = WorkspaceMouseKind::Motion,
-              .point = WorkspacePoint{static_cast<float>(index) + 0.25F, 0.125F}});
+  queue.Push({.source = PresentationSourceKind::Explore, .peer_epoch = 1U, .kind = WorkspaceMouseKind::Motion, .point = WorkspacePoint{static_cast<float>(index) + 0.25F, 0.125F}});
  const auto capacity = queue.capacity();
  for (std::size_t index = 0U; index != 1024U; ++index) {
   const auto mouse = queue.Pop();
@@ -353,14 +345,14 @@ TEST_CASE("Workspace input retains ordered high-water records for independent na
   owner.SetPeer(2U);
   for (const auto entry : mmltk::frameworks::reflection::enum_entries<WorkspaceMouseKind>()) {
    WorkspaceMouse mouse{.source = source.kind,
-                        .peer_epoch = 2U,
-                        .kind = entry.value,
-                        .button = WorkspaceMouseButton::Other,
-                        .other_button = 65535U,
-                        .click_count = 2U,
-                        .modifiers = 15U,
-                        .wheel_unit = WorkspaceWheelUnit::Pixels,
-                        .wheel = {-0.125F, 0.25F}};
+    .peer_epoch = 2U,
+    .kind = entry.value,
+    .button = WorkspaceMouseButton::Other,
+    .other_button = 65535U,
+    .click_count = 2U,
+    .modifiers = 15U,
+    .wheel_unit = WorkspaceWheelUnit::Pixels,
+    .wheel = {-0.125F, 0.25F}};
    owner.Accept(mouse, source.kind);
    REQUIRE(owner.latest());
    CHECK(owner.latest()->kind == mouse.kind);
@@ -384,18 +376,16 @@ TEST_CASE("visual runtime reconstructs after consecutive factory failures") {
                                    if (attempts->fetch_add(1U, std::memory_order_acq_rel) < 2U) throw std::runtime_error("deterministic construction failure");
                                    return successful(std::move(revisions));
                                   },
-                                  [failures, &failure_events](std::exception_ptr) {
-                                   failures->fetch_add(1U, std::memory_order_acq_rel);
-                                   failure_events.Advance();
-                                  }};
+  [failures, &failure_events](std::exception_ptr) {
+   failures->fetch_add(1U, std::memory_order_acq_rel);
+   failure_events.Advance();
+  }};
  const auto submit = [&owner](detail::VisualRuntimeOwner::Work work) { REQUIRE(owner.SubmitDiscrete(std::move(work))); };
  submit(no_op_visual_work);
  REQUIRE(failure_events.Wait([&] { return failures->load(std::memory_order_acquire) == 1U; }));
  submit(no_op_visual_work);
  REQUIRE(failure_events.Wait([&] { return failures->load(std::memory_order_acquire) == 2U; }));
- submit([&completed](mmltk::frameworks::gpu::SystemImageRuntime&, std::stop_token) {
-  return detail::VisualRuntimeOwner::Notification{[&completed] { completed.set_value(); }};
- });
+ submit([&completed](mmltk::frameworks::gpu::SystemImageRuntime&, std::stop_token) { return detail::VisualRuntimeOwner::Notification{[&completed] { completed.set_value(); }}; });
  REQUIRE_NOTHROW(mmltk::testsupport::await_test_promise(completed, "completed", 2s));
  CHECK(attempts->load(std::memory_order_acquire) == 3U);
  CHECK(failures->load(std::memory_order_acquire) == 2U);
@@ -424,7 +414,7 @@ TEST_CASE("failed visual runtime replacement keeps the exact completed product")
                                    if (attempts->fetch_add(1U, std::memory_order_acq_rel) == 1U) throw std::runtime_error("deterministic replacement failure");
                                    return successful(std::move(revisions));
                                   },
-                                  [&failed](std::exception_ptr) { failed.set_value(); }};
+  [&failed](std::exception_ptr) { failed.set_value(); }};
  submit_visual_revision(owner, first_completed);
  const auto first_revision = first_completed.get_future().get();
  REQUIRE(owner.SubmitDiscrete(no_op_visual_work, {}, true));
@@ -433,8 +423,7 @@ TEST_CASE("failed visual runtime replacement keeps the exact completed product")
  REQUIRE(retained.valid());
  CHECK(retained.plane(0U).revision() == first_revision);
  std::promise<void> rejected;
- REQUIRE(owner.SubmitDiscrete([&rejected](auto&, std::stop_token) { return detail::VisualRuntimeOwner::Notification{[&rejected] { rejected.set_value(); }}; },
-                              {}, true));
+ REQUIRE(owner.SubmitDiscrete([&rejected](auto&, std::stop_token) { return detail::VisualRuntimeOwner::Notification{[&rejected] { rejected.set_value(); }}; }, {}, true));
  REQUIRE_NOTHROW(mmltk::testsupport::await_test_promise(rejected, "rejected", 2s));
  retained = owner.Borrow();
  REQUIRE(retained.valid());
@@ -492,8 +481,7 @@ TEST_CASE("staged completion wins late stop before promotion and publishes its e
  auto released = release.get_future().share();
  std::promise<std::uint64_t> published;
  std::atomic_bool cancelled = false;
- detail::VisualRuntimeOwner owner{
-  test_live_runtime_factory(backend, captures), [](std::exception_ptr) {},
+ detail::VisualRuntimeOwner owner{test_live_runtime_factory(backend, captures), [](std::exception_ptr) {},
   [&](detail::VisualRuntimeOwner::ActivityStage stage, std::uint64_t completed) noexcept {
    if (!producer_claims_completion && stage == detail::VisualRuntimeOwner::ActivityStage::StagedCompletionLatched && completed != 0U) {
     latched.set_value();
@@ -674,13 +662,13 @@ TEST_CASE("visual continuations coalesce behind the newest replaceable input") {
  std::atomic_bool reserved{false}, failed_try{false};
  mmltk::frameworks::gpu::SystemImageRuntime::CompletedOutput baseline;
  detail::VisualRuntimeOwner retry_owner{test_live_runtime_factory(backend, captures, {}, 1U), [](std::exception_ptr) {},
-                                        [&](detail::VisualRuntimeOwner::ActivityStage stage, std::uint64_t value) noexcept {
-                                         if (stage == detail::VisualRuntimeOwner::ActivityStage::CycleFinalized) {
-                                          wake_again.store(value, std::memory_order_release);
-                                          cycles.fetch_add(1U, std::memory_order_release);
-                                          retry_events.Advance();
-                                         }
-                                        }};
+  [&](detail::VisualRuntimeOwner::ActivityStage stage, std::uint64_t value) noexcept {
+   if (stage == detail::VisualRuntimeOwner::ActivityStage::CycleFinalized) {
+    wake_again.store(value, std::memory_order_release);
+    cycles.fetch_add(1U, std::memory_order_release);
+    retry_events.Advance();
+   }
+  }};
  retry_owner.RegisterContinuation(
   [&](auto& runtime, std::stop_token) {
    auto output = runtime.TryAcquireOutput(baseline);
@@ -751,8 +739,7 @@ TEST_CASE("visual continuation cancellation policy is independent of output avai
    const bool completed = owner.TryCompleteActiveWork();
    return detail::VisualRuntimeOwner::Notification{[&, observed_stop, completed] { cancelled.set_value(observed_stop && !completed); }};
   },
-  {}, output_wake,
-  preserve_input ? detail::VisualRuntimeOwner::ContinuationCancellation::PreserveOrderedInput : detail::VisualRuntimeOwner::ContinuationCancellation::Cancel);
+  {}, output_wake, preserve_input ? detail::VisualRuntimeOwner::ContinuationCancellation::PreserveOrderedInput : detail::VisualRuntimeOwner::ContinuationCancellation::Cancel);
  REQUIRE(owner.NotifyContinuation());
  mmltk::testsupport::await_test_promise(entered, "continuation entered");
  static_cast<void>(owner.RequestActiveStop());
@@ -771,9 +758,9 @@ TEST_CASE("visual completion notification remains independent of a blocked produ
  std::promise<void> notified;
  std::promise<void> borrow_locked;
  detail::VisualRuntimeOwner owner{test_live_runtime_factory(backend, captures), [](std::exception_ptr) {},
-                                  [&](detail::VisualRuntimeOwner::ActivityStage stage, std::uint64_t) noexcept {
-                                   if (stage == detail::VisualRuntimeOwner::ActivityStage::BorrowLocked) borrow_locked.set_value();
-                                  }};
+  [&](detail::VisualRuntimeOwner::ActivityStage stage, std::uint64_t) noexcept {
+   if (stage == detail::VisualRuntimeOwner::ActivityStage::BorrowLocked) borrow_locked.set_value();
+  }};
  mmltk::testsupport::ScopedTestCleanup settle_owner{[&] {
   mmltk::testsupport::release_test_promise(release_publish);
   mmltk::testsupport::release_test_promise(release_work);
@@ -871,9 +858,8 @@ TEST_CASE("visual terminal and failure boundaries discard pending continuations"
  detail::VisualRuntimeOwner failing{test_live_runtime_factory(backend, captures), [&](std::exception_ptr) { failed.set_value(); }};
  auto settle_failing = settle_visual_on_exit(failing, release_failure_boundary);
  submit_blocked_visual_work(failing, failure_boundary_entered, failure_release);
- REQUIRE(failing.SubmitOrdered([](mmltk::frameworks::gpu::SystemImageRuntime&, std::stop_token) -> detail::VisualRuntimeOwner::Notification {
-  throw std::runtime_error("deterministic continuation boundary failure");
- }));
+ REQUIRE(failing.SubmitOrdered(
+  [](mmltk::frameworks::gpu::SystemImageRuntime&, std::stop_token) -> detail::VisualRuntimeOwner::Notification { throw std::runtime_error("deterministic continuation boundary failure"); }));
  submit_counting_continuation(failing, continuations);
  release_failure_boundary.set_value();
  REQUIRE_NOTHROW(mmltk::testsupport::await_test_promise(failed, "failed", 2s));
@@ -893,8 +879,7 @@ TEST_CASE("visual terminal and failure boundaries discard pending continuations"
 }
 class RetainedConstructionModel final : public mmltk::frameworks::gpu::SystemImageModel {
 public:
- RetainedConstructionModel(std::shared_ptr<std::atomic_bool> destroyed, std::shared_ptr<std::atomic_uint64_t> release_calls, std::exception_ptr failure = {},
-                           bool all_released = false)
+ RetainedConstructionModel(std::shared_ptr<std::atomic_bool> destroyed, std::shared_ptr<std::atomic_uint64_t> release_calls, std::exception_ptr failure = {}, bool all_released = false)
      : destroyed_(std::move(destroyed)),
        release_calls_(std::move(release_calls)),
        failure_(failure ? std::move(failure) : std::make_exception_ptr(std::runtime_error("deterministic retained construction resource"))),
@@ -925,14 +910,12 @@ TEST_CASE("visual runtime failures retain initiating execution and model retirem
  const auto settlement = std::make_exception_ptr(std::runtime_error("stream settlement"));
  const auto retirement = std::make_exception_ptr(std::runtime_error("model retirement"));
  std::promise<std::exception_ptr> reported;
- detail::VisualRuntimeOwner owner{[&](auto revisions) {
-                                   return std::make_unique<SystemImageRuntime>(
-                                    SystemImageRuntimeConfig{.device = 0,
-                                                             .backend = backend,
-                                                             .model = std::make_unique<RetainedConstructionModel>(destroyed, releases, retirement, safe),
-                                                             .product_revisions = std::move(revisions)});
-                                  },
-                                  [&](std::exception_ptr failure) { reported.set_value(failure); }};
+ detail::VisualRuntimeOwner owner{
+  [&](auto revisions) {
+   return std::make_unique<SystemImageRuntime>(
+    SystemImageRuntimeConfig{.device = 0, .backend = backend, .model = std::make_unique<RetainedConstructionModel>(destroyed, releases, retirement, safe), .product_revisions = std::move(revisions)});
+  },
+  [&](std::exception_ptr failure) { reported.set_value(failure); }};
  auto work = [&](auto&, std::stop_token) -> detail::VisualRuntimeOwner::Notification {
   backend->FailAfter(FakeImageBackend::FailurePoint::SynchronizeStream, 0U, settlement);
   std::rethrow_exception(initiating);
@@ -949,8 +932,8 @@ TEST_CASE("visual runtime failures retain initiating execution and model retirem
  if (!safe) CHECK_FALSE(owner.SubmitOrdered(no_op_visual_work));
  owner.StopAndWait();
 }
-void check_visual_construction_custody(const FakeImageBackend::FailurePoint failure_point, const std::string_view expected_failure,
-                                       const std::uint64_t expected_contexts, const std::uint64_t expected_release_calls) {
+void check_visual_construction_custody(
+ const FakeImageBackend::FailurePoint failure_point, const std::string_view expected_failure, const std::uint64_t expected_contexts, const std::uint64_t expected_release_calls) {
  auto backend = std::make_shared<FakeImageBackend>();
  auto destroyed = std::make_shared<std::atomic_bool>(false);
  auto release_calls = std::make_shared<std::atomic_uint64_t>(0U);
@@ -969,17 +952,16 @@ void check_visual_construction_custody(const FakeImageBackend::FailurePoint fail
                                      .product_revisions = std::move(revisions),
                                     });
                                    },
-                                   [&, expected_failure](const std::exception_ptr failure) {
-                                    try {
-                                     std::rethrow_exception(failure);
-                                    } catch (const std::runtime_error& error) {
-                                     const bool identities =
-                                      mmltk::frameworks::gpu::test_support::ContainsImageFailure(failure, construction_failure) &&
-                                      (expected_release_calls == 0U || mmltk::frameworks::gpu::test_support::ContainsImageFailure(failure, release_failure));
-                                     reported_typed_failure.store(std::string_view{error.what()} == expected_failure && identities, std::memory_order_release);
-                                    } catch (...) {}
-                                    failed.set_value();
-                                   }};
+   [&, expected_failure](const std::exception_ptr failure) {
+    try {
+     std::rethrow_exception(failure);
+    } catch (const std::runtime_error& error) {
+     const bool identities = mmltk::frameworks::gpu::test_support::ContainsImageFailure(failure, construction_failure) &&
+                             (expected_release_calls == 0U || mmltk::frameworks::gpu::test_support::ContainsImageFailure(failure, release_failure));
+     reported_typed_failure.store(std::string_view{error.what()} == expected_failure && identities, std::memory_order_release);
+    } catch (...) {}
+    failed.set_value();
+   }};
   backend->FailAfter(failure_point, 0U, construction_failure);
   REQUIRE(owner.SubmitOrdered(no_op_visual_work));
   REQUIRE_NOTHROW(mmltk::testsupport::await_test_promise(failed, "failed", 2s));
@@ -1027,10 +1009,10 @@ TEST_CASE("visual retirement reports an unestablished context boundary and disab
  std::promise<void> failed;
  detail::VisualRuntimeOwner owner{[&](auto revisions) {
                                    constructions.fetch_add(1U, std::memory_order_acq_rel);
-                                   return std::make_unique<mmltk::frameworks::gpu::SystemImageRuntime>(mmltk::frameworks::gpu::SystemImageRuntimeConfig{
-                                    .device = 0, .backend = backend, .product_revisions = std::move(revisions)});
+                                   return std::make_unique<mmltk::frameworks::gpu::SystemImageRuntime>(
+                                    mmltk::frameworks::gpu::SystemImageRuntimeConfig{.device = 0, .backend = backend, .product_revisions = std::move(revisions)});
                                   },
-                                  [&failed](std::exception_ptr) { failed.set_value(); }};
+  [&failed](std::exception_ptr) { failed.set_value(); }};
  REQUIRE(owner.SubmitOrdered([backend](mmltk::frameworks::gpu::SystemImageRuntime&, std::stop_token) -> detail::VisualRuntimeOwner::Notification {
   backend->FailPersistently(FakeImageBackend::FailurePoint::Bind);
   throw std::runtime_error("deterministic work failure before retirement");
@@ -1084,8 +1066,7 @@ TEST_CASE("Visual worker failures submit bounded valid UTF8 from dependency exce
   payload += "tail";
  }
  SECTION("malformed bytes are replaced without losing subsequent valid text") {
-  const auto malformed = GENERATE(std::string_view{"\xff"}, std::string_view{"\xc0\x80"}, std::string_view{"\xed\xa0\x80"},
-                                  std::string_view{"\xf4\x90\x80\x80"}, std::string_view{"\xe2\x82"});
+  const auto malformed = GENERATE(std::string_view{"\xff"}, std::string_view{"\xc0\x80"}, std::string_view{"\xed\xa0\x80"}, std::string_view{"\xf4\x90\x80\x80"}, std::string_view{"\xe2\x82"});
   payload = "failure: " + std::string{malformed} + " tail \xc3\xa9";
   expected = "failure: ";
   for (std::size_t index = 0U; index < malformed.size(); ++index) expected += "\xef\xbf\xbd";
@@ -1139,10 +1120,9 @@ TEST_CASE("Visual diagnostic boundaries capture immutable observations without o
  };
  {
   services::RuntimeDiagnosticSpan span{sink, [&] {
-                                        return visual_diagnostic_boundary(
-                                         {.system = contracts::DiagnosticOwner::Presentation,
-                                          .operation = VisualDiagnosticOperation::PresentationPumpStarted,
-                                          .context = {.selection_generation = 20U, .source = visual_diagnostic_source(source)}},
+                                        return visual_diagnostic_boundary({.system = contracts::DiagnosticOwner::Presentation,
+                                                                           .operation = VisualDiagnosticOperation::PresentationPumpStarted,
+                                                                           .context = {.selection_generation = 20U, .source = visual_diagnostic_source(source)}},
                                          VisualDiagnosticOperation::PresentationPumpCompleted);
                                        }};
   source.frame.revision = 8U;  // Selecting an older completed product is a new observation.
@@ -1186,12 +1166,11 @@ TEST_CASE("recoverable visual failure restores creator policy before rebuilding 
  std::promise<std::vector<int>> completed;
  detail::VisualRuntimeOwner owner{[&](auto revisions) {
                                    construction_affinities.push_back(allowed_cpu_set());
-                                   return std::make_unique<mmltk::frameworks::gpu::SystemImageRuntime>(mmltk::frameworks::gpu::SystemImageRuntimeConfig{
-                                    .device = 0, .backend = backend, .execution = execution, .product_revisions = std::move(revisions)});
+                                   return std::make_unique<mmltk::frameworks::gpu::SystemImageRuntime>(
+                                    mmltk::frameworks::gpu::SystemImageRuntimeConfig{.device = 0, .backend = backend, .execution = execution, .product_revisions = std::move(revisions)});
                                   },
-                                  [&](std::exception_ptr) { failed.set_value(); }};
- REQUIRE(
-  owner.SubmitOrdered([](auto&, std::stop_token) -> detail::VisualRuntimeOwner::Notification { throw std::runtime_error("recoverable operation failure"); }));
+  [&](std::exception_ptr) { failed.set_value(); }};
+ REQUIRE(owner.SubmitOrdered([](auto&, std::stop_token) -> detail::VisualRuntimeOwner::Notification { throw std::runtime_error("recoverable operation failure"); }));
  REQUIRE_NOTHROW(mmltk::testsupport::await_test_promise(failed, "failed", 2s));
  REQUIRE(owner.SubmitOrdered([&](auto&, std::stop_token) -> detail::VisualRuntimeOwner::Notification {
   completed.set_value(allowed_cpu_set());
@@ -1361,12 +1340,10 @@ TEST_CASE("Display terminal failure wakes request readiness and preserves the la
  std::promise<std::exception_ptr> failed;
  std::promise<void> published;
  std::atomic_uint failures{0U};
- detail::VisualRuntimeOwner owner(RuntimeFactory(0, backend, gpu::ImageProductLayout::Clean, {}, 1U, fixture::FakeWorkspaceFinalizer(backend)),
-                                  first_visual_failure(failures, failed));
+ detail::VisualRuntimeOwner owner(RuntimeFactory(0, backend, gpu::ImageProductLayout::Clean, {}, 1U, fixture::FakeWorkspaceFinalizer(backend)), first_visual_failure(failures, failed));
  publish_visual_pixels(owner, published);
  auto make_workspace = [&] {
-  auto workspace = mmltk::frameworks::gpu::test_support::ImageWorkspaceTestAccess::CreateAdmitted(
-   backend, mmltk::frameworks::gpu::test_support::ImageWorkspaceTestAccess::Layout(0));
+  auto workspace = mmltk::frameworks::gpu::test_support::ImageWorkspaceTestAccess::CreateAdmitted(backend, mmltk::frameworks::gpu::test_support::ImageWorkspaceTestAccess::Layout(0));
   return workspace;
  };
  ProducerWorkspaceRequest previous{.workspace = make_workspace()};
@@ -1406,8 +1383,8 @@ TEST_CASE("Background visual work yields until requested display pixels physical
  auto released = release.get_future().share();
  std::atomic_uint runs{0U};
  std::atomic_bool resumed_with_pixels{false};
- detail::VisualRuntimeOwner owner(RuntimeFactory(0, backend, gpu::ImageProductLayout::Clean, {}, 1U, fixture::FakeWorkspaceFinalizer(backend)),
-                                  [](auto) { FAIL("background display fixture unexpectedly failed"); });
+ detail::VisualRuntimeOwner owner(
+  RuntimeFactory(0, backend, gpu::ImageProductLayout::Clean, {}, 1U, fixture::FakeWorkspaceFinalizer(backend)), [](auto) { FAIL("background display fixture unexpectedly failed"); });
  auto settle = settle_visual_on_exit(owner, release);
  owner.RegisterContinuation(
   [&](auto&, std::stop_token stop) {

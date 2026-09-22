@@ -38,8 +38,7 @@ void write_child_diagnostic(const char* data, size_t size) noexcept {
 size_t tensor_nbytes(const torch::Tensor& tensor) {
  const auto count = tensor.numel();
  const auto width = tensor.element_size();
- if (count < 0 || (width && static_cast<std::uint64_t>(count) > std::numeric_limits<size_t>::max() / width))
-  throw std::overflow_error("RF-DETR raw tensor extent overflows");
+ if (count < 0 || (width && static_cast<std::uint64_t>(count) > std::numeric_limits<size_t>::max() / width)) throw std::overflow_error("RF-DETR raw tensor extent overflows");
  return static_cast<size_t>(count) * width;
 }
 std::string tensor_entry_filename(const size_t index) { return std::format("entry_{:06}.bin", index); }
@@ -109,9 +108,7 @@ std::optional<Value> manifest_optional_value(const json& object, const char* key
 }
 void wait_for_child(const pid_t child_pid, const char* operation) {
  const int status = mmltk::frameworks::process::wait_child_process(child_pid);
- if (status < 0) {
-  throw std::runtime_error(std::format("failed to wait for RF-DETR Python checkpoint bridge during {}: {}", operation, std::strerror(errno)));
- }
+ if (status < 0) { throw std::runtime_error(std::format("failed to wait for RF-DETR Python checkpoint bridge during {}: {}", operation, std::strerror(errno))); }
  if (WIFEXITED(status) && WEXITSTATUS(status) == 0) { return; }
  std::string detail;
  if (WIFEXITED(status)) {
@@ -144,9 +141,7 @@ void run_python_bridge(const char* operation, const std::vector<std::string>& ar
  for (auto& part : command) { argv.push_back(part.data()); }
  argv.push_back(nullptr);
  const pid_t child_pid = ::fork();
- if (child_pid < 0) {
-  throw std::runtime_error(std::string("failed to fork RF-DETR Python checkpoint bridge during ") + operation + ": " + std::strerror(errno));
- }
+ if (child_pid < 0) { throw std::runtime_error(std::string("failed to fork RF-DETR Python checkpoint bridge during ") + operation + ": " + std::strerror(errno)); }
  if (child_pid == 0) {
   ::unsetenv("LD_LIBRARY_PATH");
   ::unsetenv("PYTHONPATH");
@@ -161,25 +156,21 @@ void run_python_bridge(const char* operation, const std::vector<std::string>& ar
 void populate_metadata_from_manifest(const json& metadata_json, NativeCheckpointMetadata& metadata) {
  if (const auto layout = metadata_json.find("class_layout"); layout != metadata_json.end()) metadata.class_layout = decode_class_layout(layout->dump());
  if (const auto evidence = metadata_json.find("class_name_evidence"); evidence != metadata_json.end()) {
-  if (!evidence->is_array() || evidence->size() > mmltk::backend::data::catalog::kClassCatalogCapacity)
-   throw std::invalid_argument("invalid upstream class-name evidence");
+  if (!evidence->is_array() || evidence->size() > mmltk::backend::data::catalog::kClassCatalogCapacity) throw std::invalid_argument("invalid upstream class-name evidence");
   mmltk::backend::data::catalog::OrderedClassCatalog names;
   for (const auto& entry : *evidence) {
    if (!entry.is_string()) throw std::invalid_argument("invalid upstream class-name evidence entry");
    auto name = entry.get<std::string>();
-   if (name.size() > mmltk::backend::data::catalog::kClassNameCapacity || name.find('\0') != std::string::npos)
-    throw std::invalid_argument("oversized upstream class-name evidence");
+   if (name.size() > mmltk::backend::data::catalog::kClassNameCapacity || name.find('\0') != std::string::npos) throw std::invalid_argument("oversized upstream class-name evidence");
    names.names.push_back({std::move(name)});
   }
-  if (!metadata.class_layout.class_name_evidence.names.empty() && metadata.class_layout.class_name_evidence != names)
-   throw std::invalid_argument("conflicting upstream class-name evidence");
+  if (!metadata.class_layout.class_name_evidence.names.empty() && metadata.class_layout.class_name_evidence != names) throw std::invalid_argument("conflicting upstream class-name evidence");
   metadata.class_layout.class_name_evidence = std::move(names);
  }
  metadata.num_queries = manifest_optional_value<int64_t>(metadata_json, "num_queries").value_or(0);
  metadata.num_select = manifest_optional_value<int64_t>(metadata_json, "num_select").value_or(0);
- metadata.for_each_detection_field([&metadata_json]<class Name, class Optional>(const Name& name, Optional& field) {
-  field = manifest_optional_value<typename Optional::value_type>(metadata_json, name);
- });
+ metadata.for_each_detection_field(
+  [&metadata_json]<class Name, class Optional>(const Name& name, Optional& field) { field = manifest_optional_value<typename Optional::value_type>(metadata_json, name); });
 }
 DecodedNativeModelState load_checkpoint_from_manifest(const fs::path& manifest_path) {
  const json manifest = read_json_file(manifest_path);
@@ -189,9 +180,7 @@ DecodedNativeModelState load_checkpoint_from_manifest(const fs::path& manifest_p
   populate_metadata_from_manifest(*metadata_it, checkpoint.metadata);
  }
  const auto found = manifest.find("state_dict");
- if (found == manifest.end() || !found->is_array()) {
-  throw std::runtime_error("RF-DETR checkpoint manifest is missing state_dict array: " + manifest_path.string());
- }
+ if (found == manifest.end() || !found->is_array()) { throw std::runtime_error("RF-DETR checkpoint manifest is missing state_dict array: " + manifest_path.string()); }
  std::vector<NormalizedModelStateEntry> entries;
  entries.reserve(found->size());
  for (const auto& entry_json : *found) {
@@ -200,8 +189,8 @@ DecodedNativeModelState load_checkpoint_from_manifest(const fs::path& manifest_p
   const auto tensor_it = entry_json.find("tensor_path");
   const auto dtype_it = entry_json.find("dtype");
   const auto sizes_it = entry_json.find("sizes");
-  if (name_it == entry_json.end() || !name_it->is_string() || tensor_it == entry_json.end() || !tensor_it->is_string() || dtype_it == entry_json.end() ||
-      !dtype_it->is_string() || sizes_it == entry_json.end() || !sizes_it->is_array()) {
+  if (name_it == entry_json.end() || !name_it->is_string() || tensor_it == entry_json.end() || !tensor_it->is_string() || dtype_it == entry_json.end() || !dtype_it->is_string() ||
+      sizes_it == entry_json.end() || !sizes_it->is_array()) {
    throw std::runtime_error("RF-DETR checkpoint manifest entry is missing name/tensor_path/dtype/sizes");
   }
   const fs::path tensor_path = manifest_path.parent_path() / tensor_it->get<std::string>();
@@ -218,9 +207,7 @@ DecodedNativeModelState load_checkpoint_from_manifest(const fs::path& manifest_p
   const size_t bytes = tensor_nbytes(tensor);
   if (bytes > 0) {
    tensor_stream.read(static_cast<char*>(tensor.data_ptr()), static_cast<std::streamsize>(bytes));
-   if (tensor_stream.gcount() != static_cast<std::streamsize>(bytes) || tensor_stream.bad()) {
-    throw std::runtime_error("failed to read RF-DETR checkpoint tensor payload: " + tensor_path.string());
-   }
+   if (tensor_stream.gcount() != static_cast<std::streamsize>(bytes) || tensor_stream.bad()) { throw std::runtime_error("failed to read RF-DETR checkpoint tensor payload: " + tensor_path.string()); }
   }
   entries.push_back({
    name_it->get<std::string>(),
@@ -255,10 +242,8 @@ json manifest_from_model_state(const fs::path& root, const std::vector<Normalize
    readback.Complete();
    const fs::path tensor_path = tensor_dir / tensor_entry_filename(index);
    write_raw_tensor_file(tensor_path, tensor);
-   manifest["state_dict"].push_back({{"name", entries[index].name},
-                                     {"tensor_path", fs::relative(tensor_path, root).string()},
-                                     {"dtype", mmltk::backend::ml::serialization::scalar_type_name(tensor.scalar_type())},
-                                     {"sizes", tensor.sizes().vec()}});
+   manifest["state_dict"].push_back({{"name", entries[index].name}, {"tensor_path", fs::relative(tensor_path, root).string()},
+    {"dtype", mmltk::backend::ml::serialization::scalar_type_name(tensor.scalar_type())}, {"sizes", tensor.sizes().vec()}});
   }
   readback.Release();
  }
@@ -287,8 +272,7 @@ void write_upstream_model_state(const fs::path& checkpoint_path, const DecodedNa
  ScopedTempDirectory temp_dir("mmltk_rfdetr_save_");
  const fs::path manifest_path = temp_dir.path / "manifest.json";
  auto manifest = manifest_from_model_state(temp_dir.path, entries);
- if (!model_state.metadata.class_layout.slots.empty())
-  manifest["metadata"]["class_layout"] = json::parse(encode_class_layout(model_state.metadata.class_layout));
+ if (!model_state.metadata.class_layout.slots.empty()) manifest["metadata"]["class_layout"] = json::parse(encode_class_layout(model_state.metadata.class_layout));
  if (model_state.metadata.num_queries > 0) manifest["metadata"]["num_queries"] = model_state.metadata.num_queries;
  if (model_state.metadata.num_select > 0) manifest["metadata"]["num_select"] = model_state.metadata.num_select;
  model_state.metadata.for_each_detection_field([&]<class Name, class Optional>(const Name& name, const Optional& field) {

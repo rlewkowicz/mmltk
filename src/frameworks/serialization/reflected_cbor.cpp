@@ -25,8 +25,7 @@ void prepend_path(wire::Error& error, const std::string_view component) {
  error.path = std::move(nested);
 }
 bool allocation_path_names_match(const DecodeAllocationLimit& limit, const wire::AllocationRequest& request) noexcept {
- if ((limit.recursive_dynamic && limit.path.size() > request.path.size()) || (!limit.recursive_dynamic && limit.path.size() != request.path.size()))
-  return false;
+ if ((limit.recursive_dynamic && limit.path.size() > request.path.size()) || (!limit.recursive_dynamic && limit.path.size() != request.path.size())) return false;
  for (std::size_t index = 0U; index < limit.path.size(); ++index) {
   const DecodePathSelector& expected = limit.path[index];
   const wire::DecodePathElement& actual = request.path[index];
@@ -42,10 +41,8 @@ bool allocation_discriminators_match(const DecodeAllocationLimit& limit, const w
  return true;
 }
 bool allocation_limit_accepts(const DecodeAllocationLimit& limit, const wire::AllocationRequest& request) noexcept {
- if ((request.kind == wire::AllocationKind::Text || request.kind == wire::AllocationKind::Bytes) && limit.max_bytes && request.size > *limit.max_bytes)
-  return false;
- if ((request.kind == wire::AllocationKind::Sequence || request.kind == wire::AllocationKind::Object) && limit.max_items && request.size > *limit.max_items)
-  return false;
+ if ((request.kind == wire::AllocationKind::Text || request.kind == wire::AllocationKind::Bytes) && limit.max_bytes && request.size > *limit.max_bytes) return false;
+ if ((request.kind == wire::AllocationKind::Sequence || request.kind == wire::AllocationKind::Object) && limit.max_items && request.size > *limit.max_items) return false;
  return true;
 }
 bool allocation_allowed(const void* raw_context, const wire::AllocationRequest& request) noexcept {
@@ -67,9 +64,7 @@ bool allocation_allowed(const void* raw_context, const wire::AllocationRequest& 
 namespace mmltk::frameworks::serialization::implementation {
 FixedCborEncoder::FixedCborEncoder(const std::span<std::byte> destination) noexcept : destination_(destination) {}
 bool FixedCborEncoder::unsigned_integer(const std::uint64_t value) noexcept { return head(0U, value); }
-bool FixedCborEncoder::signed_integer(const std::int64_t value) noexcept {
- return value >= 0 ? head(0U, static_cast<std::uint64_t>(value)) : head(1U, static_cast<std::uint64_t>(-(value + 1)));
-}
+bool FixedCborEncoder::signed_integer(const std::int64_t value) noexcept { return value >= 0 ? head(0U, static_cast<std::uint64_t>(value)) : head(1U, static_cast<std::uint64_t>(-(value + 1))); }
 bool FixedCborEncoder::floating(const double value) noexcept {
  const auto encoding = wire::canonical_float_encoding(value);
  if (!encoding) return false;

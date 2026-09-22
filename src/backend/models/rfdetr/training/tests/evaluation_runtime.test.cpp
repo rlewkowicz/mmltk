@@ -86,8 +86,7 @@ TEST_CASE("Evaluation staging preserves categories beyond the per-category evalu
  auto lease = slots->acquire();
  lease.buffers->images.push_back({0, 17, {}});
  PostprocessedBatch batch{torch::tensor({.9F, .8F, .7F}).view({1, 3}).to(device), torch::tensor({0L, 1L, -1L}, torch::kInt64).view({1, 3}).to(device),
-                          torch::tensor({0.F, 0.F, 2.F, 2.F, 3.F, 3.F, 5.F, 5.F, 0.F, 0.F, 0.F, 0.F}).view({1, 3, 4}).to(device), std::nullopt,
-                          torch::tensor({2L}, torch::kInt64).to(device)};
+  torch::tensor({0.F, 0.F, 2.F, 2.F, 3.F, 3.F, 5.F, 5.F, 0.F, 0.F, 0.F, 0.F}).view({1, 3, 4}).to(device), std::nullopt, torch::tensor({2L}, torch::kInt64).to(device)};
  auto staged = stage_prediction_batch(std::move(batch), 2, 1, std::move(lease), 0, stream.stream());
  mmltk::common::concurrency::WorkerPool workers(1);
  const auto images = collect_prediction_batch_encoding(enqueue_prediction_batch_encoding(workers, std::move(staged)));

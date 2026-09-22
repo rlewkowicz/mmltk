@@ -57,9 +57,8 @@ private:
 // typed UI settlement and those independent evidence streams have joined.
 class WaylandSession final {
 public:
- WaylandSession(std::shared_ptr<PreparedWaylandInputs> inputs, TerminationMode terminal, std::string profile, bool diagnostics_enabled = true, bool dpi = false,
-                bool host_to_device = true, std::string fault = {}, bool pixels_enabled = true,
-                const mmltk::backend::data::testsupport::FixtureSpec* ordinary_fixture = nullptr);
+ WaylandSession(std::shared_ptr<PreparedWaylandInputs> inputs, TerminationMode terminal, std::string profile, bool diagnostics_enabled = true, bool dpi = false, bool host_to_device = true,
+  std::string fault = {}, bool pixels_enabled = true, const mmltk::backend::data::testsupport::FixtureSpec* ordinary_fixture = nullptr);
  ~WaylandSession();
  void RunScenario(const std::string& viewer_scenario, bool last, bool dark = false, bool pending_reconstruction = false);
 

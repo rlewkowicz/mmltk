@@ -61,19 +61,14 @@ void require_detection_metadata_equal(const Metadata& expected, const Metadata& 
 fs::path fixture_root() { return fs::temp_directory_path() / "mmltk_rfdetr_checkpoint_fixture"; }
 fs::path upstream_fixture_path(const ParityFixtureCase& fixture) { return fixture_root() / "upstream" / fixture.upstream_filename; }
 fs::path native_roundtrip_path(const ParityFixtureCase& fixture) { return fixture_root() / "native" / (std::string(fixture.preset_name) + ".native.pt"); }
-fs::path native_golden_fixture_path(const ParityFixtureCase& fixture) {
- return fixture_root() / "golden" / (std::string(fixture.preset_name) + ".golden.native.pt");
-}
-const mmltk::backend::models::rfdetr::NormalizedModelStateEntry* find_entry(const mmltk::backend::models::rfdetr::DecodedNativeModelState& checkpoint,
-                                                                            const char* name) {
+fs::path native_golden_fixture_path(const ParityFixtureCase& fixture) { return fixture_root() / "golden" / (std::string(fixture.preset_name) + ".golden.native.pt"); }
+const mmltk::backend::models::rfdetr::NormalizedModelStateEntry* find_entry(const mmltk::backend::models::rfdetr::DecodedNativeModelState& checkpoint, const char* name) {
  for (const auto& entry : state_entries(checkpoint)) {
   if (entry.name == name) { return &entry; }
  }
  return nullptr;
 }
-void write_archive_string(torch::serialize::OutputArchive& archive, const char* key, std::string_view value) {
- archive.write(key, c10::IValue(std::string(value)));
-}
+void write_archive_string(torch::serialize::OutputArchive& archive, const char* key, std::string_view value) { archive.write(key, c10::IValue(std::string(value))); }
 void write_archive_int(torch::serialize::OutputArchive& archive, const char* key, int64_t value) { archive.write(key, c10::IValue(value)); }
 void write_legacy_native_checkpoint(const fs::path& output_path, int version = 1, std::string_view format = "fastloader.rfdetr.native_checkpoint") {
  fs::create_directories(output_path.parent_path());
@@ -182,9 +177,7 @@ void test_native_checkpoint_tensor_preparation() {
  synthetic_entries.push_back({"cpu_contiguous", cpu_contiguous});
  synthetic_entries.push_back({"cpu_non_contiguous", cpu_non_contiguous});
  const bool has_cuda = torch::cuda::is_available();
- if (has_cuda) {
-  synthetic_entries.push_back({"cuda_tensor", torch::arange(6, torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA)).view({2, 3})});
- }
+ if (has_cuda) { synthetic_entries.push_back({"cuda_tensor", torch::arange(6, torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA)).view({2, 3})}); }
  set_synthetic_model_state(checkpoint, std::move(synthetic_entries));
  mmltk::backend::models::rfdetr::save_native_checkpoint(output_path, checkpoint);
  const auto loaded = mmltk::backend::models::rfdetr::decode_model_state(output_path);
@@ -298,8 +291,7 @@ void test_training_supervision_checkpoint_blob_admission() {
  obsolete_key_output.save_to(path.string());
  torch::serialize::InputArchive obsolete_key_input;
  obsolete_key_input.load_from(path.string());
- REQUIRE(mmltk::backend::models::rfdetr::detail::read_training_supervision_config(obsolete_key_input) ==
-         mmltk::backend::models::rfdetr::TrainingSupervisionConfig{});
+ REQUIRE(mmltk::backend::models::rfdetr::detail::read_training_supervision_config(obsolete_key_input) == mmltk::backend::models::rfdetr::TrainingSupervisionConfig{});
  const std::array variants{
   [] {
    mmltk::backend::models::rfdetr::TrainingSupervisionConfig value;
@@ -363,10 +355,43 @@ void test_training_supervision_checkpoint_blob_admission() {
   REQUIRE_THROWS(mmltk::backend::models::rfdetr::detail::read_training_supervision_config(raw_input));
  };
  constexpr std::array<std::uint8_t, 25> duplicate_assignment{
-  0xa2U, 0x6aU, 'a', 's', 's', 'i', 'g', 'n', 'm', 'e', 'n', 't', 0U, 0x6aU, 'a', 's', 's', 'i', 'g', 'n', 'm', 'e', 'n', 't', 0U,
+  0xa2U,
+  0x6aU,
+  'a',
+  's',
+  's',
+  'i',
+  'g',
+  'n',
+  'm',
+  'e',
+  'n',
+  't',
+  0U,
+  0x6aU,
+  'a',
+  's',
+  's',
+  'i',
+  'g',
+  'n',
+  'm',
+  'e',
+  'n',
+  't',
+  0U,
  };
  constexpr std::array<std::uint8_t, 10> unknown_field{
-  0xa1U, 0x67U, 'u', 'n', 'k', 'n', 'o', 'w', 'n', 0U,
+  0xa1U,
+  0x67U,
+  'u',
+  'n',
+  'k',
+  'n',
+  'o',
+  'w',
+  'n',
+  0U,
  };
  constexpr std::array<std::uint8_t, 1> missing_required_field{0xa0U};
  require_raw_cbor_rejected(duplicate_assignment);
@@ -446,9 +471,7 @@ void test_checkpoint_tensor_and_legacy_support() {
  test_strict_model_state_admission_is_duplicate_free_and_atomic();
 }
 TEST_CASE("test_checkpoint_roundtrip_and_fixture_loading", "[model][rfdetr][checkpoint]") { test_checkpoint_roundtrip_and_fixture_loading(); }
-TEST_CASE("test_cuda_upstream_raw_state_preserves_logical_values", "[model][rfdetr][checkpoint][cuda]") {
- test_cuda_upstream_raw_state_preserves_logical_values();
-}
+TEST_CASE("test_cuda_upstream_raw_state_preserves_logical_values", "[model][rfdetr][checkpoint][cuda]") { test_cuda_upstream_raw_state_preserves_logical_values(); }
 TEST_CASE("test_checkpoint_tensor_and_legacy_support", "[model][rfdetr][checkpoint][training_supervision]") { test_checkpoint_tensor_and_legacy_support(); }
 TEST_CASE("Fresh transfer maps actual classifier and supervision axes by class identity", "[model][rfdetr][checkpoint][layout]") {
  namespace r = mmltk::backend::models::rfdetr;
@@ -470,12 +493,8 @@ TEST_CASE("Fresh transfer maps actual classifier and supervision axes by class i
  auto source = r::testsupport::clone_normalized_model_state(owner);
  // Independent expected axes cover both classifier owners and distinct
  // supervision coordinates, rather than consulting the production inventory.
- const std::array axes{std::pair{"class_embed.weight", 0},
-                       std::pair{"class_embed.bias", 0},
-                       std::pair{"transformer.enc_out_class_embed.0.weight", 0},
-                       std::pair{"transformer.enc_out_class_embed.0.bias", 0},
-                       std::pair{"training_supervision.denoising_label_embedding.weight", 0},
-                       std::pair{"training_supervision.ground_truth_mlp.linear1.weight", 1}};
+ const std::array axes{std::pair{"class_embed.weight", 0}, std::pair{"class_embed.bias", 0}, std::pair{"transformer.enc_out_class_embed.0.weight", 0},
+  std::pair{"transformer.enc_out_class_embed.0.bias", 0}, std::pair{"training_supervision.denoising_label_embedding.weight", 0}, std::pair{"training_supervision.ground_truth_mlp.linear1.weight", 1}};
  for (const auto& [name, dimension] : axes) {
   auto entry = std::ranges::find(source, name, &r::NormalizedModelStateEntry::name);
   REQUIRE(entry != source.end());
@@ -498,8 +517,7 @@ TEST_CASE("Fresh transfer maps actual classifier and supervision axes by class i
   CHECK(torch::equal(actual->select(dimension, 1), torch::full_like(actual->select(dimension, 1), 10.)));
   CHECK(torch::equal(actual->select(dimension, 2), seeded->tensor.select(dimension, 2)));
   if (dimension == 1) {
-   for (std::int64_t box = 3; box < 7; ++box)
-    CHECK(torch::equal(actual->select(1, box), torch::full_like(actual->select(1, box), 10. + static_cast<double>(box))));
+   for (std::int64_t box = 3; box < 7; ++box) CHECK(torch::equal(actual->select(1, box), torch::full_like(actual->select(1, box), 10. + static_cast<double>(box))));
   } else if (actual->size(0) == 4) {
    CHECK(torch::equal(actual->select(0, 3), seeded->tensor.select(0, 3)));
   }
@@ -529,8 +547,7 @@ TEST_CASE("Fresh transfer maps actual classifier and supervision axes by class i
    CHECK(torch::equal(first, overlap ? torch::full_like(first, 11.) : original->tensor.select(dimension, 0)));
    CHECK(torch::equal(actual->select(dimension, 1), original->tensor.select(dimension, 1)));
    if (dimension == 1) {
-    for (std::int64_t box = 0; box < 4; ++box)
-     CHECK(torch::equal(actual->select(1, 2 + box), torch::full_like(actual->select(1, 2 + box), 13. + static_cast<double>(box))));
+    for (std::int64_t box = 0; box < 4; ++box) CHECK(torch::equal(actual->select(1, 2 + box), torch::full_like(actual->select(1, 2 + box), 13. + static_cast<double>(box))));
    } else if (actual->size(0) == 3) {
     CHECK(torch::equal(actual->select(0, 2), original->tensor.select(0, 2)));
    }

@@ -36,11 +36,9 @@ namespace mmltk::backend::media::video::test_support {
 struct VideoFileSourceTestAccess final {
  static auto Limits(VideoFrameCapacity capacity) { return VideoFileSource::StorageLimits(capacity); }
  static void ConfigureLogging(void (*callback)(void*, int, const char*, va_list) = nullptr) { VideoFileSource::ConfigureLogging(callback); }
- static std::unique_ptr<VideoFileSource> Create(const std::filesystem::path& path, VideoFrameCapacity capacity, int device, std::uintptr_t stream,
-                                                std::stop_token stop, std::shared_ptr<mmltk::frameworks::gpu::TerminalCudaRetirementOwner> retirement,
-                                                mmltk::frameworks::gpu::CudaContextApi context_api) {
-  return std::unique_ptr<VideoFileSource>(
-   new VideoFileSource(path, capacity, device, stream, stop, std::move(retirement), &cudaStreamSynchronize, context_api));
+ static std::unique_ptr<VideoFileSource> Create(const std::filesystem::path& path, VideoFrameCapacity capacity, int device, std::uintptr_t stream, std::stop_token stop,
+  std::shared_ptr<mmltk::frameworks::gpu::TerminalCudaRetirementOwner> retirement, mmltk::frameworks::gpu::CudaContextApi context_api) {
+  return std::unique_ptr<VideoFileSource>(new VideoFileSource(path, capacity, device, stream, stop, std::move(retirement), &cudaStreamSynchronize, context_api));
  }
 };
 }  // namespace mmltk::backend::media::video::test_support
@@ -98,14 +96,13 @@ TEST_CASE("local YUV video delivers sequential colors timing and EOF", "[video][
  REQUIRE_THROWS_AS(mmltk::backend::media::video::VideoFileSource("/nonexistent/predict-video", {4U}, 0, 1U, {}, retirement), std::invalid_argument);
  CHECK(retirement->admission_open());
  for (auto pixels : {0U, 1U, 3U}) {
-  CHECK_THROWS_AS(mmltk::backend::media::video::VideoFileSource(path, {pixels}, 0, reinterpret_cast<std::uintptr_t>(stream), {}, retirement),
-                  std::invalid_argument);
+  CHECK_THROWS_AS(mmltk::backend::media::video::VideoFileSource(path, {pixels}, 0, reinterpret_cast<std::uintptr_t>(stream), {}, retirement), std::invalid_argument);
   CHECK(retirement->admission_open());
   CHECK(retirement->fact().reservations == 0U);
  }
  {
-  auto source = std::make_unique<mmltk::backend::media::video::VideoFileSource>(path, mmltk::backend::media::video::VideoFrameCapacity{4U}, 0,
-                                                                                reinterpret_cast<std::uintptr_t>(stream), std::stop_token{}, retirement);
+  auto source = std::make_unique<mmltk::backend::media::video::VideoFileSource>(
+   path, mmltk::backend::media::video::VideoFrameCapacity{4U}, 0, reinterpret_cast<std::uintptr_t>(stream), std::stop_token{}, retirement);
   REQUIRE(source->frames_per_second() == 4.0);
   for (std::uint64_t index = 0U; index < 2U; ++index) {
    const auto frame = source->Next();
@@ -145,8 +142,7 @@ TEST_CASE("local YUV video delivers sequential colors timing and EOF", "[video][
  }
  CHECK_FALSE(retirement->admission_open());
  CHECK(retirement->fact().occupancy == 1U);
- for (unsigned attempt = 0U; attempt < 4U; ++attempt)
-  CHECK_THROWS(mmltk::backend::media::video::VideoFileSource(path, {4U}, 0, reinterpret_cast<std::uintptr_t>(stream), {}, retirement));
+ for (unsigned attempt = 0U; attempt < 4U; ++attempt) CHECK_THROWS(mmltk::backend::media::video::VideoFileSource(path, {4U}, 0, reinterpret_cast<std::uintptr_t>(stream), {}, retirement));
  CHECK(retirement->fact().occupancy == 1U);
  REQUIRE(cudaSetDevice(0) == cudaSuccess);
  std::stop_source stop;
@@ -155,8 +151,7 @@ TEST_CASE("local YUV video delivers sequential colors timing and EOF", "[video][
  CHECK_FALSE(cancelled.Next().has_value());
 }
 namespace {
-void write_rotated_video(const std::filesystem::path& path, double rotation, int width = 64, int height = 32, const char* muxer = "mp4",
-                         AVCodecID codec_id = AV_CODEC_ID_MPEG4) {
+void write_rotated_video(const std::filesystem::path& path, double rotation, int width = 64, int height = 32, const char* muxer = "mp4", AVCodecID codec_id = AV_CODEC_ID_MPEG4) {
  AVFormatContext* output = nullptr;
  REQUIRE(avformat_alloc_output_context2(&output, nullptr, muxer, path.c_str()) >= 0);
  const mmltk::testsupport::ScopedTestCleanup release_output{[&] {
@@ -190,8 +185,7 @@ void write_rotated_video(const std::filesystem::path& path, double rotation, int
  REQUIRE(track);
  track->time_base = codec->time_base;
  REQUIRE(avcodec_parameters_from_context(track->codecpar, codec) >= 0);
- auto* matrix =
-  av_packet_side_data_new(&track->codecpar->coded_side_data, &track->codecpar->nb_coded_side_data, AV_PKT_DATA_DISPLAYMATRIX, 9U * sizeof(std::int32_t), 0);
+ auto* matrix = av_packet_side_data_new(&track->codecpar->coded_side_data, &track->codecpar->nb_coded_side_data, AV_PKT_DATA_DISPLAYMATRIX, 9U * sizeof(std::int32_t), 0);
  REQUIRE(matrix);
  av_display_rotation_set(reinterpret_cast<std::int32_t*>(matrix->data), rotation);
  REQUIRE(avio_open(&output->pb, path.c_str(), AVIO_FLAG_WRITE) >= 0);
@@ -257,8 +251,7 @@ void count_log_dispatch(void* context, int, const char*, va_list) {
 TEST_CASE("video logging disables callback dispatch and preserves independent process state", "[video]") {
  using Access = mmltk::backend::media::video::test_support::VideoFileSourceTestAccess;
  const auto index = GENERATE(0U, 1U, 2U, 3U, 4U, 5U, 6U);
- const std::array levels{spdlog::level::off,  spdlog::level::trace, spdlog::level::debug,   spdlog::level::info,
-                         spdlog::level::warn, spdlog::level::err,   spdlog::level::critical};
+ const std::array levels{spdlog::level::off, spdlog::level::trace, spdlog::level::debug, spdlog::level::info, spdlog::level::warn, spdlog::level::err, spdlog::level::critical};
  const std::array admissions{AV_LOG_QUIET, AV_LOG_TRACE, AV_LOG_DEBUG, AV_LOG_INFO, AV_LOG_WARNING, AV_LOG_ERROR, AV_LOG_FATAL};
  const auto original_application = mmltk::common::logging::level();
  const auto original_ffmpeg = av_log_get_level();
@@ -273,47 +266,47 @@ TEST_CASE("video logging disables callback dispatch and preserves independent pr
  // Invoke the private setup directly: a once_flag inherited from an earlier
  // decoder test must neither skip this case nor be reset in production.
  CHECK(isolated_process([&] {
-        mmltk::common::logging::initialize({.app_name = "video-parent-log-test", .level = spdlog::level::warn, .log_file = log_path});
-        av_log_set_level(AV_LOG_DEBUG);
-        av_log_set_callback(&count_log_dispatch);
-        const auto result = isolated_process([&] {
-         mmltk::common::logging::initialize({.app_name = "video-logging-test", .level = levels[index], .log_file = nested_log_path});
-         av_log_set_level(AV_LOG_VERBOSE);
-         av_log_set_callback(&count_log_dispatch);
-         bool rejected = false;
-         try {
-          mmltk::backend::media::video::VideoFileSource source("/nonexistent/video-logging", {4U}, 0, 1U, {});
-         } catch (const std::invalid_argument&) { rejected = true; }
-         if (!rejected || av_log_get_level() != AV_LOG_VERBOSE) return 1;
-         LogDispatchCount context;
-         av_log(&context, AV_LOG_TRACE, "invalid path retains callback");
-         if (context.calls != 1) return 2;
-         Access::ConfigureLogging(&count_log_dispatch);
-         if (av_log_get_level() != admissions[index]) return 3;
-         context.calls = 0;
-         av_log(&context, AV_LOG_TRACE, "actual callback dispatch");
-         av_log(&context, AV_LOG_PANIC, "actual callback dispatch");
-         if (context.calls != (levels[index] == spdlog::level::off ? 0 : 2)) return 4;
-         Access::ConfigureLogging();
-         for (int decoration : {0, AV_LOG_C(134)}) {
-          int suppressed = -1;
-          int admitted = -1;
-          const auto rejected_level = levels[index] == spdlog::level::off ? AV_LOG_PANIC : admissions[index] + 8;
-          av_log(nullptr, rejected_level | decoration, "hidden%n", &suppressed);
-          if (suppressed != -1) return 5;
-          if (levels[index] != spdlog::level::off) {
-           av_log(nullptr, admissions[index] | decoration, "visible%n", &admitted);
-           if (admitted != 7) return 6;
-          }
-         }
-         return 0;
-        });
-        if (result != 0) return result;
-        if (mmltk::common::logging::level() != spdlog::level::warn || av_log_get_level() != AV_LOG_DEBUG) return 7;
-        LogDispatchCount context;
-        av_log(&context, AV_LOG_DEBUG, "independent callback retained");
-        return context.calls == 1 ? 0 : 8;
-       }) == 0);
+  mmltk::common::logging::initialize({.app_name = "video-parent-log-test", .level = spdlog::level::warn, .log_file = log_path});
+  av_log_set_level(AV_LOG_DEBUG);
+  av_log_set_callback(&count_log_dispatch);
+  const auto result = isolated_process([&] {
+   mmltk::common::logging::initialize({.app_name = "video-logging-test", .level = levels[index], .log_file = nested_log_path});
+   av_log_set_level(AV_LOG_VERBOSE);
+   av_log_set_callback(&count_log_dispatch);
+   bool rejected = false;
+   try {
+    mmltk::backend::media::video::VideoFileSource source("/nonexistent/video-logging", {4U}, 0, 1U, {});
+   } catch (const std::invalid_argument&) { rejected = true; }
+   if (!rejected || av_log_get_level() != AV_LOG_VERBOSE) return 1;
+   LogDispatchCount context;
+   av_log(&context, AV_LOG_TRACE, "invalid path retains callback");
+   if (context.calls != 1) return 2;
+   Access::ConfigureLogging(&count_log_dispatch);
+   if (av_log_get_level() != admissions[index]) return 3;
+   context.calls = 0;
+   av_log(&context, AV_LOG_TRACE, "actual callback dispatch");
+   av_log(&context, AV_LOG_PANIC, "actual callback dispatch");
+   if (context.calls != (levels[index] == spdlog::level::off ? 0 : 2)) return 4;
+   Access::ConfigureLogging();
+   for (int decoration : {0, AV_LOG_C(134)}) {
+    int suppressed = -1;
+    int admitted = -1;
+    const auto rejected_level = levels[index] == spdlog::level::off ? AV_LOG_PANIC : admissions[index] + 8;
+    av_log(nullptr, rejected_level | decoration, "hidden%n", &suppressed);
+    if (suppressed != -1) return 5;
+    if (levels[index] != spdlog::level::off) {
+     av_log(nullptr, admissions[index] | decoration, "visible%n", &admitted);
+     if (admitted != 7) return 6;
+    }
+   }
+   return 0;
+  });
+  if (result != 0) return result;
+  if (mmltk::common::logging::level() != spdlog::level::warn || av_log_get_level() != AV_LOG_DEBUG) return 7;
+  LogDispatchCount context;
+  av_log(&context, AV_LOG_DEBUG, "independent callback retained");
+  return context.calls == 1 ? 0 : 8;
+ }) == 0);
  CHECK(mmltk::common::logging::level() == original_application);
  CHECK(av_log_get_level() == original_ffmpeg);
 }
@@ -384,14 +377,14 @@ TEST_CASE("video resolution growth stays bounded and failed admission preserves 
  const auto stream = stream_owner.get();
  unsigned context_calls = 0U;
  gpu::CudaContextApi api{&context_calls,
-                         [](void* count, CUcontext* context) noexcept {
-                          ++*static_cast<unsigned*>(count);
-                          return cuCtxGetCurrent(context);
-                         },
-                         [](void* count, CUcontext context) noexcept {
-                          ++*static_cast<unsigned*>(count);
-                          return cuCtxSetCurrent(context);
-                         }};
+  [](void* count, CUcontext* context) noexcept {
+   ++*static_cast<unsigned*>(count);
+   return cuCtxGetCurrent(context);
+  },
+  [](void* count, CUcontext context) noexcept {
+   ++*static_cast<unsigned*>(count);
+   return cuCtxSetCurrent(context);
+  }};
  auto retirement = std::make_shared<gpu::TerminalCudaRetirementOwner>(1U);
  auto source = Access::Create(path, {64U * 32U}, 0, reinterpret_cast<std::uintptr_t>(stream), {}, retirement, api);
  std::optional<mmltk::backend::media::video::VideoFrame> previous;
@@ -601,8 +594,7 @@ TEST_CASE("video exact context transitions seal the existing owner before furthe
   unsigned sets = 0U;
   CUcontext caller = nullptr;
  } driver{stage == Stage::Construction, query, repeated};
- gpu::CudaContextApi api{
-  &driver,
+ gpu::CudaContextApi api{&driver,
   [](void* opaque, CUcontext* value) noexcept {
    auto& injected = *static_cast<Driver*>(opaque);
    ++injected.calls;
@@ -622,8 +614,7 @@ TEST_CASE("video exact context transitions seal the existing owner before furthe
  auto authority = std::make_shared<gpu::TerminalCudaRetirementOwner>(1U);
  std::unique_ptr<VideoFileSource> source;
  const auto create = [&] {
-  source = mmltk::backend::media::video::test_support::VideoFileSourceTestAccess::Create(path, {4U}, 0, reinterpret_cast<std::uintptr_t>(stream),
-                                                                                         std::stop_token{}, authority, api);
+  source = mmltk::backend::media::video::test_support::VideoFileSourceTestAccess::Create(path, {4U}, 0, reinterpret_cast<std::uintptr_t>(stream), std::stop_token{}, authority, api);
  };
  const bool terminal = query || repeated;
  if (stage == Stage::Construction) {

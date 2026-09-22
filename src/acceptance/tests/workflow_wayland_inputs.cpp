@@ -28,7 +28,7 @@ WorkflowWaylandInputs::WorkflowWaylandInputs(const std::filesystem::path& root)
                                                    .target_width = 64,
                                                    .target_height = 64,
                                                    .worker_cpus = {}},
-                                                  {fixture_.split});
+  {fixture_.split});
  data::DatasetCompiler::compile(plan, 0U);
  const auto compiled = data::CompiledDataset::open(data::testsupport::compiled_bin_path(fixture_));
  auto config = rfdetr::native_config_from_preset(rfdetr::model_presets().front());

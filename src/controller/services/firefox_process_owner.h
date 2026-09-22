@@ -22,9 +22,7 @@ struct FirefoxProcessObservationTarget final {
  void* context = nullptr;
  bool (*install_process_group)(void*, pid_t) noexcept = nullptr;
  void (*submit_observation)(void*, FirefoxPhysicalObservation) noexcept = nullptr;
- [[nodiscard]] bool install(const pid_t process_group) const noexcept {
-  return install_process_group != nullptr && install_process_group(context, process_group);
- }
+ [[nodiscard]] bool install(const pid_t process_group) const noexcept { return install_process_group != nullptr && install_process_group(context, process_group); }
  void publish(const FirefoxPhysicalObservation observation) const noexcept {
   if (submit_observation != nullptr) submit_observation(context, observation);
  }
@@ -35,8 +33,7 @@ enum class FirefoxProcessStartResult : unsigned char {
 };
 class FirefoxProcessOwner final {
 public:
- FirefoxProcessOwner(std::filesystem::path workspace_import_socket, FirefoxProcessConfig config, FirefoxProcessObservationTarget observations,
-                     RuntimeDiagnosticTarget diagnostics = {}) noexcept;
+ FirefoxProcessOwner(std::filesystem::path workspace_import_socket, FirefoxProcessConfig config, FirefoxProcessObservationTarget observations, RuntimeDiagnosticTarget diagnostics = {}) noexcept;
  ~FirefoxProcessOwner() noexcept;
  FirefoxProcessOwner(const FirefoxProcessOwner&) = delete;
  FirefoxProcessOwner& operator=(const FirefoxProcessOwner&) = delete;

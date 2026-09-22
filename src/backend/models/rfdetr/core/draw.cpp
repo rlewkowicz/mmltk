@@ -40,12 +40,9 @@ struct PendingEvalSampleWrite {
 struct EvaluationSampleWriter::Impl final {
 public:
  explicit Impl(const int device)
-     : device_id(device),
-       retirement_owner(1U),
-       event_pool(mmltk::frameworks::gpu::make_cuda_device_owner<Impl, &Impl::record_failure>(this, device), 1U, retirement_owner) {
+     : device_id(device), retirement_owner(1U), event_pool(mmltk::frameworks::gpu::make_cuda_device_owner<Impl, &Impl::record_failure>(this, device), 1U, retirement_owner) {
   mmltk::frameworks::gpu::CudaDeviceScope scope(device);
-  ensure_cuda_ok(scope ? scope.FinalizeStatus(cudaStreamCreateWithFlags(&settlement_stream, cudaStreamNonBlocking)) : scope.Finalize(),
-                 "create eval sample settlement stream");
+  ensure_cuda_ok(scope ? scope.FinalizeStatus(cudaStreamCreateWithFlags(&settlement_stream, cudaStreamNonBlocking)) : scope.Finalize(), "create eval sample settlement stream");
  }
  ~Impl() noexcept {
   pool.wait_idle();
@@ -99,17 +96,12 @@ void EvaluationSampleWriter::Impl::Enqueue(PendingEvalSampleWrite pending) {
 }
 EvaluationSampleWriter::EvaluationSampleWriter() = default;
 EvaluationSampleWriter::~EvaluationSampleWriter() = default;
-void build_instance_colors_async(const std::int32_t* labels, const std::size_t count, const int num_classes, std::uint8_t* colors_rgb,
-                                 const cudaStream_t stream) {
+void build_instance_colors_async(const std::int32_t* labels, const std::size_t count, const int num_classes, std::uint8_t* colors_rgb, const cudaStream_t stream) {
  if (count == 0U) { return; }
- if (labels == nullptr || colors_rgb == nullptr || stream == nullptr) {
-  throw std::invalid_argument("RF-DETR instance color generation requires device buffers and a stream");
- }
- ensure_cuda_ok(static_cast<cudaError_t>(mmltk::backend::imaging::raster::build_category_colors_cuda({labels, count, num_classes, colors_rgb, stream})),
-                "RF-DETR instance color generation");
+ if (labels == nullptr || colors_rgb == nullptr || stream == nullptr) { throw std::invalid_argument("RF-DETR instance color generation requires device buffers and a stream"); }
+ ensure_cuda_ok(static_cast<cudaError_t>(mmltk::backend::imaging::raster::build_category_colors_cuda({labels, count, num_classes, colors_rgb, stream})), "RF-DETR instance color generation");
 }
-void EvaluationSampleWriter::Draw(const at::Tensor& image_chw, const at::Tensor& result_boxes, const at::Tensor& result_labels, const at::Tensor& result_masks,
-                                  const RenderSampleOptions& options) {
+void EvaluationSampleWriter::Draw(const at::Tensor& image_chw, const at::Tensor& result_boxes, const at::Tensor& result_labels, const at::Tensor& result_masks, const RenderSampleOptions& options) {
  if (image_chw.numel() == 0) { return; }
  const auto device = image_chw.device();
  if (!device.is_cuda()) throw std::invalid_argument("eval sample writer requires a CUDA image");
@@ -165,7 +157,7 @@ void EvaluationSampleWriter::Draw(const at::Tensor& image_chw, const at::Tensor&
                    static_cast<int>(options.box_thickness),
                    draw_stream.stream(),
                   })),
-                  "RF-DETR eval sample raster");
+    "RF-DETR eval sample raster");
   }
   image_host = mmltk::backend::ml::cuda::numa_empty({height, width, 3}, torch::kUInt8, device.index());
   image_host.copy_(image_u8, true);

@@ -25,14 +25,9 @@ struct CpuDownscalerTestAccess {
  static bool armed(const CpuDownscaler& owner) { return owner.fail_before_ != Step::None; }
  static std::size_t horizontal_size(const CpuDownscaler& owner) { return owner.x_.size(); }
  static Storage storage(const CpuDownscaler& owner) {
-  return {{{owner.x_.data(), owner.x_.capacity()},
-           {owner.y_.data(), owner.y_.capacity()},
-           {owner.moments_[0].data(), owner.moments_[0].capacity()},
-           {owner.moments_[1].data(), owner.moments_[1].capacity()},
-           {owner.coefficients_[0].data(), owner.coefficients_[0].capacity()},
-           {owner.coefficients_[1].data(), owner.coefficients_[1].capacity()},
-           {owner.alpha_[0].data(), owner.alpha_[0].capacity()},
-           {owner.alpha_[1].data(), owner.alpha_[1].capacity()}}};
+  return {{{owner.x_.data(), owner.x_.capacity()}, {owner.y_.data(), owner.y_.capacity()}, {owner.moments_[0].data(), owner.moments_[0].capacity()},
+   {owner.moments_[1].data(), owner.moments_[1].capacity()}, {owner.coefficients_[0].data(), owner.coefficients_[0].capacity()}, {owner.coefficients_[1].data(), owner.coefficients_[1].capacity()},
+   {owner.alpha_[0].data(), owner.alpha_[0].capacity()}, {owner.alpha_[1].data(), owner.alpha_[1].capacity()}}};
  }
 };
 }  // namespace mmltk::backend::imaging::resample::perceptual
@@ -106,8 +101,7 @@ TEST_CASE("perceptual resampling matches independent moments and full-area geome
  for (auto format : formats)
   for (const auto& dims : geometries)
    for (unsigned pattern = 0; pattern < 8; ++pattern) {
-    INFO("format " << static_cast<int>(format) << " source " << dims[0] << "x" << dims[1] << " destination " << dims[2] << "x" << dims[3] << " pattern "
-                   << pattern);
+    INFO("format " << static_cast<int>(format) << " source " << dims[0] << "x" << dims[1] << " destination " << dims[2] << "x" << dims[3] << " pattern " << pattern);
     Image source(dims[0], dims[1], format, 3), output(dims[2], dims[3], format, 5);
     source.fill(pattern);
     const auto expected = reference(source, dims[2], dims[3], 5);
@@ -128,13 +122,12 @@ void check_prepared_pixels(perceptual::CpuDownscaler& resizer, const test_percep
  REQUIRE(padding_intact(output));
  REQUIRE(perceptual::CpuDownscalerTestAccess::prepared(resizer));
 }
-void check_preparation_recovery(RgbPixelFormat prior_format, RgbPixelFormat requested_format, const std::array<unsigned, 4>& requested,
-                                perceptual::CpuDownscalerTestAccess::Step failure, bool prior_first) {
+void check_preparation_recovery(
+ RgbPixelFormat prior_format, RgbPixelFormat requested_format, const std::array<unsigned, 4>& requested, perceptual::CpuDownscalerTestAccess::Step failure, bool prior_first) {
  using namespace test_perceptual;
  using Access = perceptual::CpuDownscalerTestAccess;
- INFO("prior format " << static_cast<int>(prior_format) << " requested format " << static_cast<int>(requested_format) << " geometry " << requested[0] << "x"
-                      << requested[1] << " -> " << requested[2] << "x" << requested[3] << " boundary " << static_cast<int>(failure) << " prior first "
-                      << prior_first);
+ INFO("prior format " << static_cast<int>(prior_format) << " requested format " << static_cast<int>(requested_format) << " geometry " << requested[0] << "x" << requested[1] << " -> " << requested[2]
+                      << "x" << requested[3] << " boundary " << static_cast<int>(failure) << " prior first " << prior_first);
  perceptual::CpuDownscaler resizer;
  Image prior_source(17, 13, prior_format, 3), prior_output(9, 7, prior_format, 5);
  Image source(requested[0], requested[1], requested_format, 3), output(requested[2], requested[3], requested_format, 5);
@@ -173,8 +166,7 @@ void check_preparation_recovery(RgbPixelFormat prior_format, RgbPixelFormat requ
 TEST_CASE("perceptual CPU preparation retains safe recovery at each storage boundary", "[backend][data][image_resize][perceptual]") {
  using Access = perceptual::CpuDownscalerTestAccess;
  using Step = Access::Step;
- constexpr std::array steps{Step::HorizontalAxis,   Step::VerticalAxis,      Step::FirstMoment, Step::SecondMoment,
-                            Step::FirstCoefficient, Step::SecondCoefficient, Step::FirstAlpha,  Step::SecondAlpha};
+ constexpr std::array steps{Step::HorizontalAxis, Step::VerticalAxis, Step::FirstMoment, Step::SecondMoment, Step::FirstCoefficient, Step::SecondCoefficient, Step::FirstAlpha, Step::SecondAlpha};
  constexpr std::array<std::array<unsigned, 4>, 2> requests{{{19, 101, 7, 99}, {29, 23, 19, 17}}};
  for (auto prior : test_perceptual::formats)
   for (auto requested : test_perceptual::formats)
@@ -380,45 +372,28 @@ TEST_CASE("resize geometry explicitly chooses stretch or rounded letterbox", "[b
  CHECK_THROWS(compute_image_resize_geometry(1, 1, 8, 8, static_cast<ImageResizeMode>(255)));
 }
 namespace {
-void check_compiler_projection(RgbImageResizer& resizer, const std::vector<std::uint8_t>& source, std::uint32_t width, std::uint32_t height,
-                               std::uint32_t target_width, std::uint32_t target_height, ImageResizeMode mode) {
+void check_compiler_projection(
+ RgbImageResizer& resizer, const std::vector<std::uint8_t>& source, std::uint32_t width, std::uint32_t height, std::uint32_t target_width, std::uint32_t target_height, ImageResizeMode mode) {
  const auto geometry = compute_image_resize_geometry(width, height, target_width, target_height, mode);
  std::vector<std::uint8_t> bytes(std::size_t(geometry.resized_width) * geometry.resized_height * 3U);
- resizer.resize(source.data(), static_cast<int>(width), static_cast<int>(height), bytes.data(), static_cast<int>(geometry.resized_width),
-                static_cast<int>(geometry.resized_height));
+ resizer.resize(source.data(), static_cast<int>(width), static_cast<int>(height), bytes.data(), static_cast<int>(geometry.resized_width), static_cast<int>(geometry.resized_height));
  const auto plane = std::size_t(target_width) * target_height;
  std::vector<float> expected(plane * 3U + 8U, -17.0F), actual(expected);
- letterboxed_rgb_hwc_u8_to_nchw_f32(bytes.data(), expected.data(), geometry.resized_width, geometry.resized_height, target_width, target_height,
-                                    geometry.offset_x, geometry.offset_y);
+ letterboxed_rgb_hwc_u8_to_nchw_f32(bytes.data(), expected.data(), geometry.resized_width, geometry.resized_height, target_width, target_height, geometry.offset_x, geometry.offset_y);
  resizer.resize_to_planar({source.data(), {width, height, std::size_t(width) * 3U, 0U, source.size(), RgbPixelFormat::RGB8}},
-                          {actual.data(),
-                           {target_width, target_height, std::size_t(target_width) * sizeof(float), plane * sizeof(float), plane * 3U * sizeof(float),
-                            RgbPixelFormat::PlanarUnitSrgbF32}},
-                          mode);
+  {actual.data(), {target_width, target_height, std::size_t(target_width) * sizeof(float), plane * sizeof(float), plane * 3U * sizeof(float), RgbPixelFormat::PlanarUnitSrgbF32}}, mode);
  REQUIRE(std::memcmp(actual.data(), expected.data(), expected.size() * sizeof(float)) == 0);
 }
 }  // namespace
 TEST_CASE("compiler planar projection preserves every quantized RGB8 bit", "[backend][data][image_resize][perceptual]") {
- constexpr std::array<std::array<std::uint32_t, 4>, 13> sizes{{{32, 18, 16, 9},
-                                                               {34, 18, 17, 9},
-                                                               {16, 10, 8, 5},
-                                                               {14, 10, 7, 5},
-                                                               {17, 13, 9, 7},
-                                                               {17, 13, 17, 5},
-                                                               {17, 13, 7, 13},
-                                                               {17, 13, 1, 1},
-                                                               {1, 17, 1, 7},
-                                                               {31, 3, 9, 11},
-                                                               {17, 13, 17, 13},
-                                                               {17, 13, 23, 19},
-                                                               {17, 13, 9, 19}}};
+ constexpr std::array<std::array<std::uint32_t, 4>, 13> sizes{{{32, 18, 16, 9}, {34, 18, 17, 9}, {16, 10, 8, 5}, {14, 10, 7, 5}, {17, 13, 9, 7}, {17, 13, 17, 5}, {17, 13, 7, 13}, {17, 13, 1, 1},
+  {1, 17, 1, 7}, {31, 3, 9, 11}, {17, 13, 17, 13}, {17, 13, 23, 19}, {17, 13, 9, 19}}};
  for (const bool enabled : {false, true}) {
   RgbImageResizer resizer(1, enabled);
   for (const auto& dims : sizes)
    for (const auto mode : {ImageResizeMode::Stretch, ImageResizeMode::Letterbox})
     for (unsigned pattern = 0U; pattern < 4U; ++pattern) {
-     INFO("enabled " << enabled << " source " << dims[0] << "x" << dims[1] << " target " << dims[2] << "x" << dims[3] << " mode " << static_cast<int>(mode)
-                     << " pattern " << pattern);
+     INFO("enabled " << enabled << " source " << dims[0] << "x" << dims[1] << " target " << dims[2] << "x" << dims[3] << " mode " << static_cast<int>(mode) << " pattern " << pattern);
      auto source = make_test_image(static_cast<int>(dims[0]), static_cast<int>(dims[1]));
      std::uint32_t random = 0x792719U;
      for (std::size_t i = 0; i < source.size(); ++i) {

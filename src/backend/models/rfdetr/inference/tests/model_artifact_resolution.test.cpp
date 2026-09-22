@@ -12,8 +12,7 @@ import mmltk.backend.models.rfdetr.inference.analysis_provider;
 import mmltk.backend.models.rfdetr.inference.prediction;
 import mmltk.backend.models.rfdetr.inference.runtime_backend;
 namespace rfdetr = mmltk::backend::models::rfdetr;
-static_assert(std::is_same_v<decltype(rfdetr::MakeRfdetrAnalysisProvider(std::declval<const rfdetr::RfdetrAnalysisOptions&>())),
-                             std::shared_ptr<mmltk::backend::ml::runtime::AnalysisProvider>>);
+static_assert(std::is_same_v<decltype(rfdetr::MakeRfdetrAnalysisProvider(std::declval<const rfdetr::RfdetrAnalysisOptions&>())), std::shared_ptr<mmltk::backend::ml::runtime::AnalysisProvider>>);
 TEST_CASE("inference owns ONNX and TensorRT artifact selection", "[model][rfdetr][artifact_resolution]") {
  rfdetr::ModelArtifactRequest onnx;
  onnx.onnx_path = "/tmp/rf-detr-nano.onnx";

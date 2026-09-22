@@ -27,15 +27,12 @@ void validate_config(const DatasetLoader::Config& config) {
  if (config.batch_size == 0) { throw std::invalid_argument("batch_size must be greater than zero"); }
  if (config.prefetch_factor <= 0) { throw std::invalid_argument("prefetch_factor must be greater than zero"); }
  if (config.gather_workers < 0) { throw std::invalid_argument("gather_workers must be non-negative"); }
- if (config.shuffle && config.gather_workers > 0 && config.gather_workers > config.prefetch_factor) {
-  throw std::invalid_argument("gather_workers must not exceed prefetch_factor");
- }
+ if (config.shuffle && config.gather_workers > 0 && config.gather_workers > config.prefetch_factor) { throw std::invalid_argument("gather_workers must not exceed prefetch_factor"); }
  if (config.batch_shard_count == 0) { throw std::invalid_argument("batch_shard_count must be greater than zero"); }
  if (config.batch_shard_rank >= config.batch_shard_count) { throw std::invalid_argument("batch_shard_rank must be less than batch_shard_count"); }
 }
 // NOLINTBEGIN(bugprone-easily-swappable-parameters)
-void build_block_shuffled_order(std::vector<uint32_t>& order, uint32_t num_images, size_t batch_size, std::mt19937_64& rng, std::vector<size_t>& block_order,
-                                std::vector<size_t>& chunk_order) {
+void build_block_shuffled_order(std::vector<uint32_t>& order, uint32_t num_images, size_t batch_size, std::mt19937_64& rng, std::vector<size_t>& block_order, std::vector<size_t>& chunk_order) {
  if (num_images == 0) { return; }
  const auto total_images = static_cast<size_t>(num_images);
  const size_t chunk_images = std::min(total_images, std::max(kShuffleChunkImages, batch_size));
@@ -104,8 +101,7 @@ struct DatasetLoader::Impl {
   if (batch.slot_index >= slots.size()) throw std::runtime_error(std::string(operation) + ": batch slot index out of range");
   auto& slot = slots[batch.slot_index];
   if (slot.lease != batch.lease_id) throw std::runtime_error(std::string(operation) + ": stale batch lease");
-  if (slot.state != State::CheckedOut && !(released && slot.state == State::Released))
-   throw std::runtime_error(std::string(operation) + ": batch is not checked out");
+  if (slot.state != State::CheckedOut && !(released && slot.state == State::Released)) throw std::runtime_error(std::string(operation) + ": batch is not checked out");
   return slot;
  }
  static void read_complete(void* context, const size_t index, std::exception_ptr error, const bool read) noexcept {
@@ -136,12 +132,8 @@ struct DatasetLoader::Impl {
   }
   changed.notify_all();
  }
- static void transfer_complete(void* context, const size_t index, std::exception_ptr error) noexcept {
-  static_cast<Impl*>(context)->completed(index, error, false);
- }
- static void consumer_complete(void* context, const size_t index, std::exception_ptr error) noexcept {
-  static_cast<Impl*>(context)->completed(index, error, true);
- }
+ static void transfer_complete(void* context, const size_t index, std::exception_ptr error) noexcept { static_cast<Impl*>(context)->completed(index, error, false); }
+ static void consumer_complete(void* context, const size_t index, std::exception_ptr error) noexcept { static_cast<Impl*>(context)->completed(index, error, true); }
  void rebuild_schedule() {
   batch_starts.clear();
   const size_t images = source.header().num_images;
@@ -202,21 +194,19 @@ struct DatasetLoader::Impl {
   changed.notify_all();
  }
 };
-DatasetLoader::DatasetLoader(const Config& config, std::shared_ptr<mmltk::frameworks::gpu::TerminalCudaRetirementOwner> retirement,
-                             decltype(&cudaEventRecord) record_consumer)
+DatasetLoader::DatasetLoader(const Config& config, std::shared_ptr<mmltk::frameworks::gpu::TerminalCudaRetirementOwner> retirement, decltype(&cudaEventRecord) record_consumer)
     : impl_(std::make_unique<Impl>()) {
  validate_config(config);
  if (!record_consumer) throw std::invalid_argument("dataset consumer completion operation is unavailable");
  auto& state = *impl_;
  state.config = config;
- state.source =
-  CompiledDataset::open(config.compiled_path, config.shuffle ? CompiledDataset::AccessPattern::Normal : CompiledDataset::AccessPattern::Sequential);
+ state.source = CompiledDataset::open(config.compiled_path, config.shuffle ? CompiledDataset::AccessPattern::Normal : CompiledDataset::AccessPattern::Sequential);
  state.order.resize(state.source.header().num_images);
  std::iota(state.order.begin(), state.order.end(), 0U);
  state.rebuild_schedule();
- const auto execution = config.execution ? *config.execution
-                                         : mmltk::frameworks::gpu::resolve_device_execution(config.device_id, mmltk::common::system::NumaTopology::Capture(),
-                                                                                            config.loading.numa_node, config.cpu_affinity);
+ const auto execution = config.execution
+                         ? *config.execution
+                         : mmltk::frameworks::gpu::resolve_device_execution(config.device_id, mmltk::common::system::NumaTopology::Capture(), config.loading.numa_node, config.cpu_affinity);
  const auto& cpus = execution.placement.cpus;
  const int requested = config.gather_workers > 0 ? config.gather_workers : config.prefetch_factor;
  const auto useful_slots = std::max<std::size_t>(1U, std::min(static_cast<std::size_t>(config.prefetch_factor), state.batch_starts.size()));
@@ -225,13 +215,13 @@ DatasetLoader::DatasetLoader(const Config& config, std::shared_ptr<mmltk::framew
  // Scheduled starts increase; only the last global batch can be short.
  const auto maximum_count = state.batch_starts.empty() ? 0U : std::min(config.batch_size, state.order.size() - state.batch_starts.front());
  state.stream = std::make_unique<CompiledImageStream>(CompiledImageStream::Config{.slots = state.slots.size(),
-                                                                                  .workers = workers,
-                                                                                  .device = config.device_id,
-                                                                                  .cpu_affinity = config.cpu_affinity,
-                                                                                  .loading = config.loading,
-                                                                                  .execution = execution,
-                                                                                  .record_consumer = record_consumer},
-                                                      std::move(retirement));
+                                                       .workers = workers,
+                                                       .device = config.device_id,
+                                                       .cpu_affinity = config.cpu_affinity,
+                                                       .loading = config.loading,
+                                                       .execution = execution,
+                                                       .record_consumer = record_consumer},
+  std::move(retirement));
  const auto stride = static_cast<size_t>(state.source.header().image_stride);
  if (config.batch_size > std::numeric_limits<size_t>::max() / stride) throw std::overflow_error("dataset batch storage size overflow");
  mmltk::frameworks::gpu::CudaDeviceScope scope(config.device_id);
@@ -324,16 +314,16 @@ bool DatasetLoader::next_batch(Batch& out, std::stop_token stop) {
    slot.state = Impl::State::CheckedOut;
    ++impl_->consumed;
    out = {.num_images = slot.count,
-          .device_images = static_cast<const float*>(impl_->stream->device_storage(index).data()),
-          .label_index = impl_->source.label_index().data(),
-          .labels = impl_->source.labels().data(),
-          .rle_pairs = impl_->source.rle_pairs().data(),
-          .image_indices = impl_->order.data() + slot.start,
-          .slot_index = index,
-          .lease_id = slot.lease,
-          .owner = impl_.get(),
-          .image_custody = impl_->stream->storage_custody(),
-          .image_capacity_bytes = slot.count * impl_->source.header().image_stride};
+    .device_images = static_cast<const float*>(impl_->stream->device_storage(index).data()),
+    .label_index = impl_->source.label_index().data(),
+    .labels = impl_->source.labels().data(),
+    .rle_pairs = impl_->source.rle_pairs().data(),
+    .image_indices = impl_->order.data() + slot.start,
+    .slot_index = index,
+    .lease_id = slot.lease,
+    .owner = impl_.get(),
+    .image_custody = impl_->stream->storage_custody(),
+    .image_capacity_bytes = slot.count * impl_->source.header().image_stride};
    return true;
   }
   impl_->changed.wait(lock);

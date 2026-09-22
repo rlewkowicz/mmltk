@@ -20,9 +20,7 @@ using ProgressClock = spdmon::ProgressBar::clock_t;
 using ProgressTimePoint = ProgressClock::time_point;
 ProgressClock::duration::rep g_progress_elapsed_ticks = 0;
 ProgressTimePoint test_progress_now() { return ProgressTimePoint{ProgressClock::duration{g_progress_elapsed_ticks}}; }
-void set_progress_now(const std::chrono::milliseconds elapsed) {
- g_progress_elapsed_ticks = std::chrono::duration_cast<ProgressClock::duration>(elapsed).count();
-}
+void set_progress_now(const std::chrono::milliseconds elapsed) { g_progress_elapsed_ticks = std::chrono::duration_cast<ProgressClock::duration>(elapsed).count(); }
 class ScopedStderrCapture final {
 public:
  ScopedStderrCapture() {

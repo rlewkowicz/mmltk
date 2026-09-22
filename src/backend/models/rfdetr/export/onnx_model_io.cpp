@@ -20,9 +20,7 @@ module mmltk.backend.models.rfdetr.model_export;
 import mmltk.common.logging.mmltk_logging;
 namespace mmltk::backend::models::rfdetr {
 namespace {
-[[nodiscard]] std::runtime_error onnx_model_io_error(const char* message, const std::filesystem::path& path) {
- return std::runtime_error(std::string(message) + ": " + path.string());
-}
+[[nodiscard]] std::runtime_error onnx_model_io_error(const char* message, const std::filesystem::path& path) { return std::runtime_error(std::string(message) + ": " + path.string()); }
 [[nodiscard]] ONNX_NAMESPACE::ModelProto load_onnx_model(const std::filesystem::path& model_path) {
  ONNX_NAMESPACE::ModelProto model;
  std::ifstream input(model_path, std::ios::binary);
@@ -95,8 +93,7 @@ void run_onnx_simplify(ONNX_NAMESPACE::ModelProto& model) {
 }  // namespace
 void write_onnx_model_bytes(const std::string_view serialized_model, const std::filesystem::path& output_path, const ModelClassLayout& layout) {
  ONNX_NAMESPACE::ModelProto model;
- if (serialized_model.size() > static_cast<std::size_t>(std::numeric_limits<int>::max()) ||
-     !model.ParseFromArray(serialized_model.data(), static_cast<int>(serialized_model.size())))
+ if (serialized_model.size() > static_cast<std::size_t>(std::numeric_limits<int>::max()) || !model.ParseFromArray(serialized_model.data(), static_cast<int>(serialized_model.size())))
   throw std::invalid_argument("invalid serialized ONNX model");
  auto* metadata = model.add_metadata_props();
  metadata->set_key("mmltk.rfdetr.class_layout");
@@ -130,8 +127,7 @@ ModelInfo load_onnx_model_info(const std::filesystem::path& model_path, std::spa
  }
  apply_rfdetr_output_roles(info, roles);
  static_cast<void>(validate_rfdetr_output_layout(info));
- if (info.class_layout && info.class_layout->slots.size() != static_cast<std::size_t>(info.num_classes))
-  throw std::invalid_argument("ONNX class layout disagrees with logits width");
+ if (info.class_layout && info.class_layout->slots.size() != static_cast<std::size_t>(info.num_classes)) throw std::invalid_argument("ONNX class layout disagrees with logits width");
  return info;
 }
 void simplify_onnx_model_file(const std::filesystem::path& model_path) {
@@ -140,15 +136,15 @@ void simplify_onnx_model_file(const std::filesystem::path& model_path) {
  const auto& descriptor = publication.previous_descriptor();
  const auto roles = descriptor ? descriptor->output_roles : std::vector<RfdetrNamedOutputRole>{};
  const auto admitted = load_onnx_model_info(model_path, roles);
- const auto expected = admit_artifact_class_layout(
-  admitted.num_classes, admitted.class_layout, descriptor ? std::span<const ModelClassDescriptor>(&*descriptor, 1) : std::span<const ModelClassDescriptor>{});
+ const auto expected =
+  admit_artifact_class_layout(admitted.num_classes, admitted.class_layout, descriptor ? std::span<const ModelClassDescriptor>(&*descriptor, 1) : std::span<const ModelClassDescriptor>{});
  auto model = load_onnx_model(model_path);
  source_lease = mmltk::common::io::ScopedFd{};
  run_onnx_simplify(model);
  write_onnx_model(model, publication.staged_artifact());
  const auto reopened = load_onnx_model_info(publication.staged_artifact(), roles);
- if (admit_artifact_class_layout(reopened.num_classes, reopened.class_layout,
-                                 descriptor ? std::span<const ModelClassDescriptor>(&*descriptor, 1) : std::span<const ModelClassDescriptor>{}) != expected ||
+ if (admit_artifact_class_layout(reopened.num_classes, reopened.class_layout, descriptor ? std::span<const ModelClassDescriptor>(&*descriptor, 1) : std::span<const ModelClassDescriptor>{}) !=
+      expected ||
      rfdetr_output_roles(reopened) != rfdetr_output_roles(admitted))
   throw std::runtime_error("ONNX simplification changed admitted class metadata");
  publication.Publish(descriptor);

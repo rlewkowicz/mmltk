@@ -18,9 +18,7 @@ public:
    if (previous == std::numeric_limits<std::uint64_t>::max()) return {};
   } while (!sequence_.compare_exchange_weak(previous, previous + 1U, std::memory_order_relaxed));
   const auto value = previous + 1U;
-  return {.trace_id = parent.trace_id ? parent.trace_id : contracts::DiagnosticTraceId{value},
-          .span_id = contracts::DiagnosticSpanId{value},
-          .parent_span_id = parent.span_id};
+  return {.trace_id = parent.trace_id ? parent.trace_id : contracts::DiagnosticTraceId{value}, .span_id = contracts::DiagnosticSpanId{value}, .parent_span_id = parent.span_id};
  }
  [[nodiscard]] static std::uint64_t issued() noexcept { return sequence_.load(std::memory_order_relaxed); }
 

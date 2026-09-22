@@ -47,8 +47,7 @@ struct ExploreFilterUpdate final {
  ExploreOverlay overlay{};
 };
 using ExploreClassCatalogIdentity = std::uint64_t;
-[[nodiscard]] inline ExploreClassCatalogIdentity explore_class_catalog_identity(
- const std::span<const mmltk::backend::data::catalog::ClassName> class_names) noexcept {
+[[nodiscard]] inline ExploreClassCatalogIdentity explore_class_catalog_identity(const std::span<const mmltk::backend::data::catalog::ClassName> class_names) noexcept {
  constexpr ExploreClassCatalogIdentity offset_basis = 14'695'981'039'346'656'037ULL;
  constexpr ExploreClassCatalogIdentity prime = 1'099'511'628'211ULL;
  ExploreClassCatalogIdentity identity = offset_basis;

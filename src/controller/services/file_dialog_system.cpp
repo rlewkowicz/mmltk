@@ -17,8 +17,7 @@ services::FileDialogSelection NativeFileDialogRuntime::Open(const services::Reso
  if (result.disposition != services::FileDialogDisposition::Selected || !result.path.valid()) throw contracts::FailedError("file dialog operation failed");
  selection.result = services::FileDialogSelected{std::string(result.path.bytes.data(), result.path.size)};
  if (resolved.descriptor.defer_apply()) return selection;
- auto update =
-  services::resolve_file_dialog_path(services::file_dialog_stable_id(selection.target), std::get<services::FileDialogSelected>(selection.result).path);
+ auto update = services::resolve_file_dialog_path(services::file_dialog_stable_id(selection.target), std::get<services::FileDialogSelected>(selection.result).path);
  if (!update) throw contracts::FailedError("selected file path cannot be applied");
  contracts::SettingsUpdateRequest request_update;
  request_update.updates.emplace_back(std::move(*update));
@@ -74,9 +73,7 @@ FileDialogSnapshot FileDialogSystem::Open(const services::FileDialogOpen request
     return [this, settled = std::move(settled), detail = std::move(detail)]() mutable noexcept {
      direct::PublishLazyNoexcept(events_, [&] { return event_type{FileDialogFailed{std::move(settled), std::move(detail)}}; });
     };
-   return [this, settled = std::move(settled)]() mutable noexcept {
-    direct::PublishLazyNoexcept(events_, [&] { return event_type{FileDialogCompleted{std::move(settled)}}; });
-   };
+   return [this, settled = std::move(settled)]() mutable noexcept { direct::PublishLazyNoexcept(events_, [&] { return event_type{FileDialogCompleted{std::move(settled)}}; }); };
   },
   .failure = [this](std::exception_ptr) -> direct::LocalRun::Notification {
    runtime_.reset();
@@ -88,9 +85,8 @@ FileDialogSnapshot FileDialogSystem::Open(const services::FileDialogOpen request
     state_.selection.reset();
     settled = state_;
    }
-   return [this, settled = std::move(settled)]() mutable noexcept {
-    direct::PublishLazyNoexcept(events_, [&] { return event_type{FileDialogFailed{std::move(settled), "file dialog worker failed"}}; });
-   };
+   return
+    [this, settled = std::move(settled)]() mutable noexcept { direct::PublishLazyNoexcept(events_, [&] { return event_type{FileDialogFailed{std::move(settled), "file dialog worker failed"}}; }); };
   },
  });
  return snapshot();

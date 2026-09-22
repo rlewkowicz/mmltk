@@ -73,8 +73,7 @@ template <class Composition>
 [[nodiscard]] consteval bool reflected_application_ids_match_members() {
  std::size_t count = 0U;
  bool matched = true;
- template for (constexpr auto reflected_member :
-               std::define_static_array(std::meta::nonstatic_data_members_of(^^Composition, std::meta::access_context::unchecked()))) {
+ template for (constexpr auto reflected_member : std::define_static_array(std::meta::nonstatic_data_members_of(^^Composition, std::meta::access_context::unchecked()))) {
   using Reflected = ReflectedSystem<Composition, reflected_member>;
   matched = matched && application_system_stable_id<Composition, Reflected::pointer>() == Reflected::stable_id;
   ++count;
@@ -87,8 +86,7 @@ template <class Composition>
  std::size_t system_count = 0U;
  // CLEANUP-IGNORE: Stable system IDs and exhaustive event IDs are independent compile-time oracles over different facts.
  bool matched = true;
- template for (constexpr auto reflected_member :
-               std::define_static_array(std::meta::nonstatic_data_members_of(^^Composition, std::meta::access_context::unchecked()))) {
+ template for (constexpr auto reflected_member : std::define_static_array(std::meta::nonstatic_data_members_of(^^Composition, std::meta::access_context::unchecked()))) {
   using SystemCell = ReflectedSystem<Composition, reflected_member>;
   matched = matched && append_reflected_event_ids<Composition, SystemCell>(identities);
   ++system_count;
@@ -140,9 +138,7 @@ struct HostCallbackContext final {
   if (self.host.activated) self.host.activated(self.host.context.get());
   if (self.pressure != OpenPressure::Activation) return;
   wire::ByteBuffer bytes;
-  if (!encode_server_record(ServerRecord{InteractionRejected{.endpoint_id = self.epoch,
-                                                             .error = {.category = contracts::ApplicationErrorCategory::Unavailable, .detail = "activation"}}},
-                            bytes)) {
+  if (!encode_server_record(ServerRecord{InteractionRejected{.endpoint_id = self.epoch, .error = {.category = contracts::ApplicationErrorCategory::Unavailable, .detail = "activation"}}}, bytes)) {
    self.server->close_peer();
    return;
   }
@@ -238,7 +234,7 @@ public:
  void Open(mmltk::frameworks::gpu::ImagePlaneView, VisualRegion, VisualExtent) override {}
  contracts::AnnotationColor Sample(contracts::AnnotationPoint) override { return {}; }
  void Render(const AnnotationRenderState&, const mmltk::frameworks::gpu::ImagePlaneView source, const mmltk::frameworks::gpu::ImagePlaneView clean,
-             const mmltk::frameworks::gpu::ImagePlaneView semantic, std::uintptr_t) const override {
+  const mmltk::frameworks::gpu::ImagePlaneView semantic, std::uintptr_t) const override {
   if (source.valid()) mmltk::frameworks::gpu::test_support::CopyImagePlane(clean, source);
   std::memset(reinterpret_cast<void*>(semantic.data), 0, semantic.descriptor.pitch_bytes * semantic.descriptor.height);
  }
@@ -247,8 +243,7 @@ class ReadyHostAnnotation final {
 public:
  ReadyHostAnnotation()
      : backend_(std::make_shared<mmltk::frameworks::gpu::test_support::FakeImageBackend>()),
-       source_(
-        std::make_unique<mmltk::frameworks::gpu::SystemImageRuntime>(mmltk::frameworks::gpu::SystemImageRuntimeConfig{.device = 0, .backend = backend_})),
+       source_(std::make_unique<mmltk::frameworks::gpu::SystemImageRuntime>(mmltk::frameworks::gpu::SystemImageRuntimeConfig{.device = 0, .backend = backend_})),
        annotation_(
         {.device = 0, .maximum_width = 64U, .maximum_height = 64U},
         [backend = backend_](auto revisions) {
@@ -278,8 +273,7 @@ public:
         },
         mmltk::testsupport::annotation_render_evidence()) {
   source_->Publish(16U, 16U, [](auto, auto, auto) {});
-  static_cast<void>(
-   annotation_.Open({.source = visual_frame(identity_, {16U, 16U}, source_->OutputFacts().revision), .crop = {0U, 0U, 16U, 16U}, .target = {16U, 16U}}));
+  static_cast<void>(annotation_.Open({.source = visual_frame(identity_, {16U, 16U}, source_->OutputFacts().revision), .crop = {0U, 0U, 16U, 16U}, .target = {16U, 16U}}));
   const bool ready = Wait([this] { return (annotation_.snapshot().ready && annotation_.snapshot().frame.valid()) || !failure_.empty(); });
   INFO("Annotation startup failure: " << failure_);
   REQUIRE(ready);
@@ -460,7 +454,7 @@ TEST_CASE("direct host emits Bootstrap and dispatches intent on a real peer") {
                                .endpoint_id = endpoint,
                                .fields = {},
                               }},
-                              intent));
+  intent));
  peer.send_binary(intent);
  auto reply_frame = peer.receive();
  REQUIRE(reply_frame);
@@ -519,7 +513,7 @@ TEST_CASE("direct host keeps a real peer after decoded application interaction r
                                .endpoint_id = settings_reset_endpoint(),
                                .fields = {},
                               }},
-                              later_intent));
+  later_intent));
  peer.send_binary(later_intent);
  const auto reply_frame = peer.receive();
  REQUIRE(reply_frame);
@@ -647,8 +641,7 @@ TEST_CASE("direct host retains nested event bytes after publisher ownership ends
    .event_id = 2U,
    .delivery = contracts::reflection::EventDelivery::Critical,
    .state_revision = size + 1U,
-   .value = wire::Value(wire::Value::Object{
-    {"nested", wire::Value(wire::Value::Array{wire::Value(std::string(size, 'x')), wire::Value(wire::ByteBuffer(size, std::byte{0xa5}))})}}),
+   .value = wire::Value(wire::Value::Object{{"nested", wire::Value(wire::Value::Array{wire::Value(std::string(size, 'x')), wire::Value(wire::ByteBuffer(size, std::byte{0xa5}))})}}),
   };
   wire::ByteBuffer expected;
   REQUIRE(encode_server_record(ServerRecord{event}, expected));
@@ -664,11 +657,8 @@ TEST_CASE("direct host queues exact 64 KiB neighboring records with retired publ
  LoopbackWebSocket peer{server.websocket()};
  REQUIRE(peer.receive());
  for (const std::size_t target : {65535U, 65536U, 65537U}) {
-  const auto payload = [](std::size_t text_size) {
-   return wire::Value(wire::Value::Array{wire::Value(std::string(text_size, 'x')), wire::Value(wire::ByteBuffer(31U, std::byte{0xa5}))});
-  };
-  SystemEvent event{
-   .system_id = 1U, .event_id = 2U, .delivery = contracts::reflection::EventDelivery::Critical, .state_revision = 7U, .value = payload(32768U)};
+  const auto payload = [](std::size_t text_size) { return wire::Value(wire::Value::Array{wire::Value(std::string(text_size, 'x')), wire::Value(wire::ByteBuffer(31U, std::byte{0xa5}))}); };
+  SystemEvent event{.system_id = 1U, .event_id = 2U, .delivery = contracts::reflection::EventDelivery::Critical, .state_revision = 7U, .value = payload(32768U)};
   wire::ByteBuffer expected;
   REQUIRE(encode_server_record(ServerRecord{event}, expected));
   REQUIRE(expected.size() < target);

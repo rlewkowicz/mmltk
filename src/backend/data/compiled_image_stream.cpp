@@ -57,8 +57,7 @@ struct CompiledImageStream::Buffer::Impl {
  bool pinned;
  cudaError_t free(void* value) const noexcept { return cudaFree(value); }
 };
-CompiledImageStream::Buffer::Buffer(const bool pinned, const mmltk::common::system::ExecutionPlacement* placement, const bool mapped)
-    : impl_(std::make_unique<Impl>(pinned, placement)) {
+CompiledImageStream::Buffer::Buffer(const bool pinned, const mmltk::common::system::ExecutionPlacement* placement, const bool mapped) : impl_(std::make_unique<Impl>(pinned, placement)) {
  impl_->mapped = mapped;
 }
 // Physical release is explicit after stream settlement. A failed system keeps
@@ -93,13 +92,9 @@ void CompiledImageStream::Buffer::ensure_bytes(const std::size_t bytes) {
  gpu::ensure_cuda_ok(state.allocation.PromoteCandidate([&](void* value) { return state.free(value); }).failure, "compiled image staging replacement");
  state.capacity = bytes;
 }
-void* CompiledImageStream::Buffer::data() const noexcept {
- return impl_->gdr ? reinterpret_cast<void*>(impl_->lease.device_data()) : impl_->host ? impl_->host->data() : impl_->allocation.active();
-}
+void* CompiledImageStream::Buffer::data() const noexcept { return impl_->gdr ? reinterpret_cast<void*>(impl_->lease.device_data()) : impl_->host ? impl_->host->data() : impl_->allocation.active(); }
 std::size_t CompiledImageStream::Buffer::capacity_bytes() const noexcept { return impl_->capacity; }
-bool CompiledImageStream::Buffer::owns_allocation() const noexcept {
- return (impl_->gdr && impl_->capacity != 0) || (impl_->host && impl_->host->data()) || !impl_->allocation.empty();
-}
+bool CompiledImageStream::Buffer::owns_allocation() const noexcept { return (impl_->gdr && impl_->capacity != 0) || (impl_->host && impl_->host->data()) || !impl_->allocation.empty(); }
 int CompiledImageStream::Buffer::reset() noexcept {
  if (impl_->gdr) {
   try {
@@ -160,9 +155,7 @@ struct CompiledImageStream::Impl {
  };
  explicit Impl(Config selected)
      : config(std::move(selected)),
-       execution(config.execution ? *config.execution
-                                  : gpu::resolve_device_execution(config.device, mmltk::common::system::NumaTopology::Capture(), config.loading.numa_node,
-                                                                  config.cpu_affinity)),
+       execution(config.execution ? *config.execution : gpu::resolve_device_execution(config.device, mmltk::common::system::NumaTopology::Capture(), config.loading.numa_node, config.cpu_affinity)),
        cpus(execution.placement.cpus),
        pool(std::make_unique<mmltk::common::concurrency::WorkerPool>(config.workers, cpus, "compiled-read", config.slots, &execution.placement, true)),
        slots(config.slots),
@@ -176,8 +169,8 @@ struct CompiledImageStream::Impl {
     log.debug(
      "event=execution.placement owner=compiled-read device={} pci={} node={} eligible={} worker={} "
      "cpu={} nice={} scheduler={} io_class={} io_priority={}",
-     execution.device, execution.pci_identity, execution.placement.numa_node, mmltk::common::system::format_cpu_list(cpus), worker, policy.affinity.front(),
-     policy.nice_value, policy.scheduler_policy, policy.io_class, policy.io_priority_data);
+     execution.device, execution.pci_identity, execution.placement.numa_node, mmltk::common::system::format_cpu_list(cpus), worker, policy.affinity.front(), policy.nice_value, policy.scheduler_policy,
+     policy.io_class, policy.io_priority_data);
    });
   for (auto& slot : slots) slot = std::make_unique<Slot>(execution.placement);
   for (auto& device : devices) device = std::make_unique<Buffer>(false, nullptr, !config.loading.h2d_dataloader);
@@ -309,8 +302,8 @@ struct CompiledImageStream::Retention {
  std::shared_ptr<Impl> state;
 };
 CompiledImageStream::CompiledImageStream(Config config, std::shared_ptr<gpu::TerminalCudaRetirementOwner> retirement) {
- if (!config.settle || !config.record_consumer || config.slots == 0 || config.slots > std::numeric_limits<std::size_t>::max() / 2 || config.workers == 0 ||
-     config.workers > config.slots || config.workers > static_cast<std::size_t>(std::numeric_limits<int>::max()))
+ if (!config.settle || !config.record_consumer || config.slots == 0 || config.slots > std::numeric_limits<std::size_t>::max() / 2 || config.workers == 0 || config.workers > config.slots ||
+     config.workers > static_cast<std::size_t>(std::numeric_limits<int>::max()))
   throw std::invalid_argument("invalid compiled image stream capacity");
  retention_ = std::make_unique<Retention>(std::move(retirement));
  impl_ = std::make_shared<Impl>(std::move(config));
@@ -334,8 +327,7 @@ void CompiledImageStream::bind_current_context() {
    for (auto* event : {&slot->transfer, &slot->consumer})
     gpu::ensure_cuda_ok(cudaEventCreateWithFlags(event, cudaEventDisableTiming | cudaEventBlockingSync), "compiled image stream event allocation");
   }
-  if (impl_->config.loading.h2d_dataloader)
-   gpu::ensure_cuda_ok(gpu::cuda_stream_create_with_highest_priority(&impl_->copy, cudaStreamNonBlocking), "compiled image copy stream");
+  if (impl_->config.loading.h2d_dataloader) gpu::ensure_cuda_ok(gpu::cuda_stream_create_with_highest_priority(&impl_->copy, cudaStreamNonBlocking), "compiled image copy stream");
   impl_->completion_worker = std::thread([this] { impl_->complete_loop(); });
   {
    std::unique_lock lock(impl_->mutex);
@@ -359,9 +351,9 @@ CompiledImageStream::~CompiledImageStream() {
     mmltk::common::logging::critical([&](spdlog::logger& log) {
      try {
       std::rethrow_exception(failure);
-     } catch (const std::exception& error) {
-      log.critical("compiled image stream retained unsafe CUDA resources on device {}: {}", retention_->state->config.device, error.what());
-     } catch (...) { log.critical("compiled image stream retained unsafe CUDA resources after an unknown failure"); }
+     } catch (const std::exception& error) { log.critical("compiled image stream retained unsafe CUDA resources on device {}: {}", retention_->state->config.device, error.what()); } catch (...) {
+      log.critical("compiled image stream retained unsafe CUDA resources after an unknown failure");
+     }
     });
     return;
    }
@@ -443,8 +435,7 @@ void CompiledImageStream::prepare_device(const std::size_t index, const std::siz
  {
   std::lock_guard lock(impl_->mutex);
   const auto& slot = *impl_->slots.at(index);
-  if (slot.reading || slot.transfer_pending || slot.consumer_pending || slot.unfenced)
-   throw std::logic_error("compiled image device storage is still borrowed");
+  if (slot.reading || slot.transfer_pending || slot.consumer_pending || slot.unfenced) throw std::logic_error("compiled image device storage is still borrowed");
  }
  on_context(impl_->context, [&] {
   // Slots have independent storage. Growing this idle slot does not
@@ -466,8 +457,7 @@ std::span<const std::byte> CompiledImageStream::host_images(const std::size_t in
  if (!impl_->config.loading.h2d_dataloader && !slot.host_materialized) {
   on_context(impl_->context, [&] { slot.host.ensure_bytes(bytes); });
   mmltk::common::system::ScopedExecutionPolicy policy({impl_->cpus, {}, 0, impl_->execution.placement.numa_node, -10, true});
-  if (!slot.source->read_images(slot.reads, {static_cast<std::byte*>(slot.host.data()), bytes}, slot.cancelled, impl_->config.prefault))
-   throw std::runtime_error("CPU image view read cancelled");
+  if (!slot.source->read_images(slot.reads, {static_cast<std::byte*>(slot.host.data()), bytes}, slot.cancelled, impl_->config.prefault)) throw std::runtime_error("CPU image view read cancelled");
   slot.host_materialized = true;
  }
  return {static_cast<const std::byte*>(slot.host.data()), bytes};
@@ -475,8 +465,8 @@ std::span<const std::byte> CompiledImageStream::host_images(const std::size_t in
 const CompiledImageStream::Buffer& CompiledImageStream::host_storage(const std::size_t slot) const { return impl_->slots.at(slot)->host; }
 const CompiledImageStream::Buffer& CompiledImageStream::device_storage(const std::size_t index) const { return *impl_->devices.at(index); }
 mmltk::common::concurrency::WorkerPool& CompiledImageStream::workers() noexcept { return *impl_->pool; }
-void CompiledImageStream::submit(const std::size_t index, const CompiledDataset& source, const std::span<const CompiledImageRead> reads,
-                                 const ReadObserver observer, const CompletionObserver transfer) {
+void CompiledImageStream::submit(
+ const std::size_t index, const CompiledDataset& source, const std::span<const CompiledImageRead> reads, const ReadObserver observer, const CompletionObserver transfer) {
  auto& slot = *impl_->slots.at(index);
  const auto stride = static_cast<std::size_t>(source.header().image_stride);
  const auto capacity = impl_->config.loading.h2d_dataloader ? slot.host.capacity_bytes() : device_storage(index).capacity_bytes();
@@ -490,8 +480,7 @@ void CompiledImageStream::submit(const std::size_t index, const CompiledDataset&
   std::lock_guard lock(impl_->mutex);
   if (impl_->failure) std::rethrow_exception(impl_->failure);
   if (!impl_->initialized) throw std::logic_error("compiled image stream must bind its context before submitting reads");
-  if (slot.reading || slot.transfer_pending || slot.consumer_pending || slot.unfenced || impl_->stopping)
-   throw std::logic_error("compiled image slot is still in use");
+  if (slot.reading || slot.transfer_pending || slot.consumer_pending || slot.unfenced || impl_->stopping) throw std::logic_error("compiled image slot is still in use");
   slot.reads.assign(reads.begin(), reads.end());
   slot.cancelled.store(false, std::memory_order_release);
   slot.reading = true;
@@ -525,18 +514,15 @@ void CompiledImageStream::read_slot(const std::size_t index) noexcept {
  try {
   if (!current.cancelled.load(std::memory_order_acquire) && (!observer.before || observer.before(observer.context, index))) {
    if (impl_->config.loading.h2d_dataloader) {
-    read = source.read_images(current.reads, {static_cast<std::byte*>(current.host.data()), current.host.capacity_bytes()}, current.cancelled,
-                              impl_->config.prefault);
+    read = source.read_images(current.reads, {static_cast<std::byte*>(current.host.data()), current.host.capacity_bytes()}, current.cancelled, impl_->config.prefault);
    } else {
     auto& destination = *impl_->devices.at(index);
     on_context(impl_->context, [&] {
      destination.begin_write();
      read = source.read_images_to(current.reads,
-                                  CompiledDataset::ImageDestination{&destination, destination.capacity_bytes(),
-                                                                    [](void* buffer, std::size_t offset, std::span<const std::byte> bytes) {
-                                                                     static_cast<Buffer*>(buffer)->write(offset, bytes);
-                                                                    }},
-                                  current.cancelled, impl_->config.prefault);
+      CompiledDataset::ImageDestination{
+       &destination, destination.capacity_bytes(), [](void* buffer, std::size_t offset, std::span<const std::byte> bytes) { static_cast<Buffer*>(buffer)->write(offset, bytes); }},
+      current.cancelled, impl_->config.prefault);
      if (read) destination.publish(nullptr);
     });
    }
@@ -592,15 +578,13 @@ void CompiledImageStream::upload(const std::size_t slot, const std::size_t bytes
  {
   std::lock_guard lock(impl_->mutex);
   auto& physical = *impl_->slots.at(slot);
-  if (physical.unfenced && physical.unfenced_stream != reinterpret_cast<cudaStream_t>(stream))
-   throw std::logic_error("compiled image uploads require one transfer boundary");
+  if (physical.unfenced && physical.unfenced_stream != reinterpret_cast<cudaStream_t>(stream)) throw std::logic_error("compiled image uploads require one transfer boundary");
   physical.unfenced = true;
   physical.unfenced_stream = reinterpret_cast<cudaStream_t>(stream);
  }
  mmltk::common::logging::profile_add_value("compiled.stream.h2d.bytes", bytes);
  mmltk::common::logging::profile_add_value("compiled.stream.h2d.submissions", 1U);
- gpu::ensure_cuda_ok(cudaMemcpyAsync(device.data(), host.data(), bytes, cudaMemcpyHostToDevice, reinterpret_cast<cudaStream_t>(stream)),
-                     "compiled image upload");
+ gpu::ensure_cuda_ok(cudaMemcpyAsync(device.data(), host.data(), bytes, cudaMemcpyHostToDevice, reinterpret_cast<cudaStream_t>(stream)), "compiled image upload");
 }
 void CompiledImageStream::wait_transfer(const std::size_t slot) {
  if (!impl_->config.loading.h2d_dataloader) {
@@ -614,9 +598,7 @@ void CompiledImageStream::handoff(const std::size_t slot, void* stream) {
   (void)wait_read(slot);
   return;
  }
- on_context(impl_->context, [&] {
-  gpu::ensure_cuda_ok(cudaStreamWaitEvent(reinterpret_cast<cudaStream_t>(stream), impl_->slots.at(slot)->transfer, 0), "compiled image consumer handoff");
- });
+ on_context(impl_->context, [&] { gpu::ensure_cuda_ok(cudaStreamWaitEvent(reinterpret_cast<cudaStream_t>(stream), impl_->slots.at(slot)->transfer, 0), "compiled image consumer handoff"); });
 }
 void CompiledImageStream::release(const std::size_t slot, void* stream, CompletionObserver observer) {
  on_context(impl_->context, [&] {
@@ -675,7 +657,6 @@ bool CompiledImageStream::owns_allocation() const noexcept {
         std::ranges::any_of(impl_->devices, [](const auto& device) { return device->owns_allocation(); });
 }
 bool CompiledImageStream::owns_resources() const noexcept {
- return owns_allocation() || impl_->copy != nullptr ||
-        std::ranges::any_of(impl_->slots, [](const auto& slot) { return slot->transfer != nullptr || slot->consumer != nullptr; });
+ return owns_allocation() || impl_->copy != nullptr || std::ranges::any_of(impl_->slots, [](const auto& slot) { return slot->transfer != nullptr || slot->consumer != nullptr; });
 }
 }  // namespace mmltk::backend::data

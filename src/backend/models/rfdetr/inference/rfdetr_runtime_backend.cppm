@@ -43,8 +43,7 @@ struct ResolvedInferenceArtifact final {
 };
 [[nodiscard]] ResolvedInferenceArtifact resolve_inference_artifact(const ModelArtifactRequest& artifacts, std::string backend);
 [[nodiscard]] ModelArtifactRequest select_inference_artifact(const ModelArtifactRequest& artifacts, const ResolvedInferenceArtifact& resolved);
-[[nodiscard]] ResolvedModelArtifacts describe_inference_artifact(const ModelArtifactRequest& request, const ResolvedInferenceArtifact& artifact,
-                                                                 std::uint32_t resolution);
+[[nodiscard]] ResolvedModelArtifacts describe_inference_artifact(const ModelArtifactRequest& request, const ResolvedInferenceArtifact& artifact, std::uint32_t resolution);
 // Deferred masks pair selected top-k queries with their model-resolution logits.
 // Materialize on the lane stream before its next Run. Custody retains the exact
 // allocation through exceptional retirement; it is not a replay or immutable cache.
@@ -73,8 +72,7 @@ public:
  [[nodiscard]] const mmltk::backend::ml::runtime::RuntimeModelInfo& model_info() const noexcept;
  // Mask capacity does not imply demand; availability belongs to each produced result.
  [[nodiscard]] mmltk::backend::ml::runtime::RuntimeSubmission Run(const mmltk::backend::ml::runtime::RuntimeTensorBuffer& input,
-                                                                  std::span<mmltk::backend::ml::runtime::AnalysisAnnotationStorage> annotations,
-                                                                  std::span<RfdetrMaskSelection> selections = {}, bool include_masks = false);
+  std::span<mmltk::backend::ml::runtime::AnalysisAnnotationStorage> annotations, std::span<RfdetrMaskSelection> selections = {}, bool include_masks = false);
  void ReleaseAfterCompletion(mmltk::backend::ml::runtime::RuntimeSubmission&& submission);
  [[nodiscard]] mmltk::backend::ml::runtime::RuntimeStatus Close() noexcept;
  [[nodiscard]] std::span<const RfdetrNamedOutputRole> output_roles() const noexcept;
@@ -82,9 +80,8 @@ public:
 
 private:
  struct State;
- explicit RfdetrRuntimeBackend(std::shared_ptr<mmltk::backend::ml::runtime::RuntimeBackend> lane, std::string backend_name, std::uint32_t static_resolution,
-                               std::size_t maximum_detections, std::shared_ptr<const ResolvedClassLayout> layout,
-                               std::vector<RfdetrNamedOutputRole> output_roles, std::shared_ptr<const ClassArtifactAdmission> admission);
+ explicit RfdetrRuntimeBackend(std::shared_ptr<mmltk::backend::ml::runtime::RuntimeBackend> lane, std::string backend_name, std::uint32_t static_resolution, std::size_t maximum_detections,
+  std::shared_ptr<const ResolvedClassLayout> layout, std::vector<RfdetrNamedOutputRole> output_roles, std::shared_ptr<const ClassArtifactAdmission> admission);
  std::shared_ptr<mmltk::backend::ml::runtime::RuntimeBackend> lane_;
  std::string backend_name_;
  std::uint32_t static_resolution_ = 0U;
@@ -93,10 +90,9 @@ private:
  friend std::shared_ptr<RfdetrRuntimeBackend> make_rfdetr_runtime_backend(const RfdetrRuntimeBackendOptions& options);
 };
 [[nodiscard]] std::shared_ptr<RfdetrRuntimeBackend> make_rfdetr_runtime_backend(const RfdetrRuntimeBackendOptions& options);
-[[nodiscard]] std::vector<std::shared_ptr<RfdetrRuntimeBackend>> make_rfdetr_runtime_backend_lanes(const RfdetrRuntimeBackendOptions& options,
-                                                                                                   std::size_t lane_count);
+[[nodiscard]] std::vector<std::shared_ptr<RfdetrRuntimeBackend>> make_rfdetr_runtime_backend_lanes(const RfdetrRuntimeBackendOptions& options, std::size_t lane_count);
 [[nodiscard]] ModelInfo inspect_tensorrt_model(const ModelArtifactRequest& artifacts, int device_id, std::stop_token stop = {});
 void build_tensorrt_engine(const BuildEngineRequest& request);
-void build_tensorrt_engine(const BuildEngineRequest& request, mmltk::backend::ml::runtime::BorrowedCommandStream command_stream,
-                           std::shared_ptr<const ClassArtifactAdmission> admission = {}, std::stop_token stop = {});
+void build_tensorrt_engine(
+ const BuildEngineRequest& request, mmltk::backend::ml::runtime::BorrowedCommandStream command_stream, std::shared_ptr<const ClassArtifactAdmission> admission = {}, std::stop_token stop = {});
 }  // namespace mmltk::backend::models::rfdetr

@@ -35,15 +35,7 @@ struct __attribute__((packed)) PackedInstance {
  [[nodiscard]] bool is_crowd() const noexcept { return (flags & kAnnotationCrowd) != 0U; }
  [[nodiscard]] bool raw_ignore() const noexcept { return (flags & kAnnotationIgnore) != 0U; }
 };
-enum class AnnotationSource : std::uint8_t {
- Generic = 0,
- Coco = 1,
- Objects365 = 2,
- OpenImages = 3,
- CoconutCoco = 4,
- CoconutObjects365V1 = 5,
- CoconutObjects365V2 = 6
-};
+enum class AnnotationSource : std::uint8_t { Generic = 0, Coco = 1, Objects365 = 2, OpenImages = 3, CoconutCoco = 4, CoconutObjects365V1 = 5, CoconutObjects365V2 = 6 };
 // Open Images MIDs are /m/ followed by at most eight ASCII identifier bytes.
 // Store those bytes little-endian, with zero padding; this is not a hash.
 inline std::uint64_t encode_open_images_category(std::string_view mid) {
@@ -96,8 +88,7 @@ struct SourceCategoryIdentity {
 };
 [[nodiscard]] inline SourceCategoryIdentity source_category_identity(const ImageEntry& image, const PackedInstance& annotation) noexcept {
  if (!annotation.has_source_category()) return {};
- return {image.source == AnnotationSource::OpenImages ? SourceCategoryIdentity::Kind::OpenImagesMid : SourceCategoryIdentity::Kind::Numeric,
-         annotation.source_category_id};
+ return {image.source == AnnotationSource::OpenImages ? SourceCategoryIdentity::Kind::OpenImagesMid : SourceCategoryIdentity::Kind::Numeric, annotation.source_category_id};
 }
 struct __attribute__((packed)) FileHeader {
  uint64_t magic;

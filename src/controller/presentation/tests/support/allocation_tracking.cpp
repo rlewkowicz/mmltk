@@ -23,9 +23,7 @@ Scope::~Scope() { enabled = false; }
 }  // namespace native_gallery_allocations
 [[gnu::noinline]] void* operator new(std::size_t bytes) { return native_gallery_allocations::Allocate(bytes, alignof(std::max_align_t)); }
 [[gnu::noinline]] void* operator new[](std::size_t bytes) { return ::operator new(bytes); }
-[[gnu::noinline]] void* operator new(std::size_t bytes, std::align_val_t alignment) {
- return native_gallery_allocations::Allocate(bytes, static_cast<std::size_t>(alignment));
-}
+[[gnu::noinline]] void* operator new(std::size_t bytes, std::align_val_t alignment) { return native_gallery_allocations::Allocate(bytes, static_cast<std::size_t>(alignment)); }
 [[gnu::noinline]] void* operator new[](std::size_t bytes, std::align_val_t alignment) { return ::operator new(bytes, alignment); }
 [[gnu::noinline]] void operator delete(void* value) noexcept { std::free(value); }
 [[gnu::noinline]] void operator delete[](void* value) noexcept { std::free(value); }

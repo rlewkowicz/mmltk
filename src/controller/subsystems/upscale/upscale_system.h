@@ -44,8 +44,8 @@ public:
  virtual void Resample(mmltk::frameworks::gpu::ImagePlaneView, mmltk::frameworks::gpu::ImagePlaneView, std::uintptr_t) = 0;
  virtual void Warm() = 0;
  [[nodiscard]] virtual bool GraphReplay(UpscaleKernel) const { return false; }
- virtual void Run(UpscaleKernel, mmltk::frameworks::gpu::ImagePlaneView source, mmltk::frameworks::gpu::ImagePlaneView target, std::uintptr_t stream,
-                  const std::function<bool()>& current = {}, UpscalePurpose purpose = UpscalePurpose::Normal) = 0;
+ virtual void Run(UpscaleKernel, mmltk::frameworks::gpu::ImagePlaneView source, mmltk::frameworks::gpu::ImagePlaneView target, std::uintptr_t stream, const std::function<bool()>& current = {},
+  UpscalePurpose purpose = UpscalePurpose::Normal) = 0;
  virtual void Semantics(mmltk::frameworks::gpu::ImagePlaneView, mmltk::frameworks::gpu::ImagePlaneView, std::uintptr_t) = 0;
 
 private:
@@ -104,9 +104,8 @@ class UpscaleSystem final {
 public:
  [[= contracts::reflection::direct::InteractionEndpoint{}]] void Input(WorkspaceMouse);
  void SetInputPeer(std::uint64_t);
- using visual_source =
-  VisualSourceProjection<UpscaleSnapshot, PresentationSourceKind::Upscale, mmltk::frameworks::reflection::member_path<&UpscaleSnapshot::frame>,
-                         mmltk::frameworks::reflection::member_path<&UpscaleSnapshot::revision>, UpscaleImageMetadata>;
+ using visual_source = VisualSourceProjection<UpscaleSnapshot, PresentationSourceKind::Upscale, mmltk::frameworks::reflection::member_path<&UpscaleSnapshot::frame>,
+  mmltk::frameworks::reflection::member_path<&UpscaleSnapshot::revision>, UpscaleImageMetadata>;
  using event_type = std::variant<UpscaleChanged, UpscaleFailed>;
  UpscaleSystem(VisualDeviceSettings, VisualRuntimeFactory, ExactVisualDocumentBorrower, SystemEventSink<event_type> = {}, VisualDiagnosticSink = {});
  ~UpscaleSystem();
@@ -132,8 +131,7 @@ private:
  class Impl;
  std::unique_ptr<Impl> impl_;
 };
-[[nodiscard]] VisualRuntimeFactory make_native_upscale_runtime_factory(VisualDeviceSettings,
-                                                                       mmltk::backend::imaging::upscale::ImageUpscalerExecutionCheckpoint = {});
+[[nodiscard]] VisualRuntimeFactory make_native_upscale_runtime_factory(VisualDeviceSettings, mmltk::backend::imaging::upscale::ImageUpscalerExecutionCheckpoint = {});
 MMLTK_REFLECT_ENUM(UpscaleKernel)
 MMLTK_REFLECT_ENUM(UpscaleFailureKind)
 MMLTK_REFLECT_FIELDS(UpscaleRequest)

@@ -16,8 +16,8 @@
 namespace mmltk::backend::media::live {
 class LiveManualOverlayWorker final {
 public:
- LiveManualOverlayWorker(ManualOverlayDocument& document, std::uint32_t slots, std::uint32_t width, std::uint32_t height, std::uint32_t maximum_instances,
-                         LiveManualOverlayUploadLimits upload_limits, LivePhysicalCudaContext cuda);
+ LiveManualOverlayWorker(ManualOverlayDocument& document, std::uint32_t slots, std::uint32_t width, std::uint32_t height, std::uint32_t maximum_instances, LiveManualOverlayUploadLimits upload_limits,
+  LivePhysicalCudaContext cuda);
  ~LiveManualOverlayWorker();
  LiveManualOverlayWorker(const LiveManualOverlayWorker&) = delete;
  LiveManualOverlayWorker& operator=(const LiveManualOverlayWorker&) = delete;

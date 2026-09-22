@@ -86,10 +86,57 @@ void emit_rust_value(std::ostream& output, const mmltk::controller::browser::wir
  }
  if (result.empty() || std::isdigit(static_cast<unsigned char>(result.front()))) result.insert(result.begin(), '_');
  static constexpr std::array keywords{
-  "as",     "async", "await", "become",   "box",    "break",  "const",   "continue", "crate",   "do",    "dyn",    "else",   "enum",
-  "extern", "false", "final", "fn",       "for",    "gen",    "if",      "impl",     "in",      "let",   "loop",   "macro",  "match",
-  "mod",    "move",  "mut",   "override", "priv",   "pub",    "ref",     "return",   "self",    "Self",  "static", "struct", "super",
-  "trait",  "true",  "try",   "type",     "typeof", "unsafe", "unsized", "use",      "virtual", "where", "while",  "yield",
+  "as",
+  "async",
+  "await",
+  "become",
+  "box",
+  "break",
+  "const",
+  "continue",
+  "crate",
+  "do",
+  "dyn",
+  "else",
+  "enum",
+  "extern",
+  "false",
+  "final",
+  "fn",
+  "for",
+  "gen",
+  "if",
+  "impl",
+  "in",
+  "let",
+  "loop",
+  "macro",
+  "match",
+  "mod",
+  "move",
+  "mut",
+  "override",
+  "priv",
+  "pub",
+  "ref",
+  "return",
+  "self",
+  "Self",
+  "static",
+  "struct",
+  "super",
+  "trait",
+  "true",
+  "try",
+  "type",
+  "typeof",
+  "unsafe",
+  "unsized",
+  "use",
+  "virtual",
+  "where",
+  "while",
+  "yield",
  };
  if (std::ranges::find(keywords, result) != keywords.end()) result.push_back('_');
  return result;
@@ -104,8 +151,7 @@ void emit_rust_value(std::ostream& output, const mmltk::controller::browser::wir
    if (!result.empty() && result.back() != '_') result.push_back('_');
    continue;
   }
-  if (std::isupper(byte) && !result.empty() && result.back() != '_' && index != 0U && std::islower(static_cast<unsigned char>(source[index - 1U])))
-   result.push_back('_');
+  if (std::isupper(byte) && !result.empty() && result.back() != '_' && index != 0U && std::islower(static_cast<unsigned char>(source[index - 1U]))) result.push_back('_');
   result.push_back(static_cast<char>(std::toupper(byte)));
  }
  if (result.empty() || std::isdigit(static_cast<unsigned char>(result.front()))) result.insert(result.begin(), '_');
@@ -128,25 +174,21 @@ public:
   const auto [entry, inserted] = symbols_.emplace(key, std::string(source));
   if (inserted) return true;
   if (entry->second == source) return false;
-  throw std::logic_error("Rust symbol collision in " + std::string(name_space) + " for `" + std::string(symbol) + "` between `" + entry->second + "` and `" +
-                         std::string(source) + "`");
+  throw std::logic_error("Rust symbol collision in " + std::string(name_space) + " for `" + std::string(symbol) + "` between `" + entry->second + "` and `" + std::string(source) + "`");
  }
 
 private:
  std::map<std::string, std::string> symbols_;
 };
 template <class Type>
-concept NamedVariant =
- requires(Type value) {
-  typename Type::variant_type;
-  value.value;
- } && schema::Variant<typename Type::variant_type>::value &&
- std::same_as<std::remove_cvref_t<decltype(std::declval<Type>().value)>, typename Type::variant_type>;
+concept NamedVariant = requires(Type value) {
+ typename Type::variant_type;
+ value.value;
+} && schema::Variant<typename Type::variant_type>::value && std::same_as<std::remove_cvref_t<decltype(std::declval<Type>().value)>, typename Type::variant_type>;
 template <class Value>
 [[nodiscard]] std::string rust_type() {
  using Type = std::remove_cvref_t<Value>;
- static_assert(schema::runtime_boundary_projectable<Type>() || schema::catalog_boundary_projectable<Type>(),
-               "Rust spelling requested for a type outside the canonical application schema categories");
+ static_assert(schema::runtime_boundary_projectable<Type>() || schema::catalog_boundary_projectable<Type>(), "Rust spelling requested for a type outside the canonical application schema categories");
  if constexpr (std::same_as<Type, void>)
   return "()";
  else if constexpr (std::same_as<Type, bool>)
@@ -281,8 +323,7 @@ class BindingEmitter final {
 
 public:
  explicit BindingEmitter(std::ostream& output) : output_(output) {
-  for (const std::string_view symbol :
-       {"Cow", "Value", "IntoApplicationValue", "FromApplicationValue", "object", "take_field", "take_optional_field", "application_value_within_limits"})
+  for (const std::string_view symbol : {"Cow", "Value", "IntoApplicationValue", "FromApplicationValue", "object", "take_field", "take_optional_field", "application_value_within_limits"})
    symbols_.Reserve("module", symbol, "codec foundation");
  }
  void Emit() {
@@ -299,11 +340,9 @@ public:
              "take_optional_field, FromApplicationValue, IntoApplicationValue, Value};\n"
              "\n"
              "pub const BROWSER_PROTOCOL_VERSION: u64 = "
-          << mmltk::controller::browser::kBrowserProtocolVersion
-          << ";\npub const MAX_RECORD_WIRE_BYTES: usize = " << mmltk::controller::browser::kMaxRecordWireBytes
+          << mmltk::controller::browser::kBrowserProtocolVersion << ";\npub const MAX_RECORD_WIRE_BYTES: usize = " << mmltk::controller::browser::kMaxRecordWireBytes
           << ";\npub const MAX_OUTPUT_VALUE_BYTES: usize = " << kMaxOutputValueBytes << ";\npub const MAX_OUTPUT_VALUE_ITEMS: usize = " << kMaxOutputValueItems
-          << ";\npub const MAX_BOOTSTRAP_WIRE_BYTES: usize = " << bootstrap_bound
-          << ";\npub const SYSTEM_EVENT_FIELD_COUNT: usize = " << cbor::reflected_cbor_member_count<SystemEvent>()
+          << ";\npub const MAX_BOOTSTRAP_WIRE_BYTES: usize = " << bootstrap_bound << ";\npub const SYSTEM_EVENT_FIELD_COUNT: usize = " << cbor::reflected_cbor_member_count<SystemEvent>()
           << ";\npub const MAX_INTENT_VALUE_BYTES: usize = " << mmltk::controller::browser::kMaxIntentValueBytes
           << ";\npub const MAX_INTENT_VALUE_ITEMS: usize = " << mmltk::controller::browser::kMaxIntentValueItems
           << ";\npub const MAX_INTENT_VALUE_DEPTH: usize = " << mmltk::controller::browser::kMaxIntentValueDepth
@@ -314,8 +353,7 @@ public:
              "pub static MMLTK_HOST_API_PROTOCOL_MARKER: &[u8] = b"
           << std::quoted(browser_protocol_marker()) << ";\npub const SCHEMA_FINGERPRINT: [u64; 2] = [" << fingerprint[0] << ", " << fingerprint[1] << "];\n\n";
   symbols_.Reserve("module", "EXPLORE_VISIBLE_ITEM_CAPACITY", "canonical Explore visible constraint");
-  output_ << "pub const EXPLORE_VISIBLE_ITEM_CAPACITY: u32 = "
-          << mmltk::frameworks::reflection::policy_of_member<&mmltk::controller::ExploreOrderFacts::visible_indices>().maximum_items << ";\n";
+  output_ << "pub const EXPLORE_VISIBLE_ITEM_CAPACITY: u32 = " << mmltk::frameworks::reflection::policy_of_member<&mmltk::controller::ExploreOrderFacts::visible_indices>().maximum_items << ";\n";
   EmitType<mmltk::controller::contracts::ApplicationErrorCategory>();
   EmitType<mmltk::controller::contracts::reflection::EventDelivery>();
   VisitBoundaryTypes();
@@ -349,12 +387,10 @@ public:
    Schema::VisitVisualSources([&]<class Cell, std::meta::info, class Projection>() {
     std::size_t count = 0U;
     Schema::VisitEndpoints([&]<class Endpoint>() {
-     if constexpr (Endpoint::interaction && std::same_as<typename Endpoint::system_cell, Cell> &&
-                   std::same_as<typename Endpoint::request_type, mmltk::controller::WorkspaceMouse>) {
+     if constexpr (Endpoint::interaction && std::same_as<typename Endpoint::system_cell, Cell> && std::same_as<typename Endpoint::request_type, mmltk::controller::WorkspaceMouse>) {
       ++count;
-      output_ << "PresentationSourceKind::" << rust_identifier(mmltk::frameworks::reflection::enum_name(Projection::kind), true) << " => encode_"
-              << rust_identifier(Cell::name, false) << "_" << rust_identifier(Endpoint::name, false)
-              << (retained ? "_into(mouse, scratch, output),\n" : "(mouse),\n");
+      output_ << "PresentationSourceKind::" << rust_identifier(mmltk::frameworks::reflection::enum_name(Projection::kind), true) << " => encode_" << rust_identifier(Cell::name, false) << "_"
+              << rust_identifier(Endpoint::name, false) << (retained ? "_into(mouse, scratch, output),\n" : "(mouse),\n");
      }
     });
     if (count != 1U) throw std::logic_error("Each workspace source must declare exactly one canonical mouse endpoint");
@@ -391,8 +427,7 @@ private:
     output_ << "    " << variant << ",\n";
    }
    output_ << "}\nimpl IntoApplicationValue for " << name << " { fn into_application_value(self) -> Value { Value::Text(match self {\n";
-   for (const auto entry : mmltk::frameworks::reflection::enum_entries<Type>())
-    output_ << "    Self::" << rust_identifier(entry.name, true) << " => \"" << entry.name << "\",\n";
+   for (const auto entry : mmltk::frameworks::reflection::enum_entries<Type>()) output_ << "    Self::" << rust_identifier(entry.name, true) << " => \"" << entry.name << "\",\n";
    output_ << "}.into()) } }\nimpl FromApplicationValue for " << name << " { fn from_application_value(value: Value) -> Result<Self, String> { match value {\n";
    for (const auto entry : mmltk::frameworks::reflection::enum_entries<Type>())
     output_ << "    Value::Text(value) if value == \"" << entry.name << "\" => Ok(Self::" << rust_identifier(entry.name, true) << "),\n";
@@ -536,8 +571,8 @@ private:
    output_ << "match self {\n";
    schema::Variant<Variant>::Visit([&]<class Alternative>() {
     const auto source = mmltk::frameworks::serialization::reflected_schema_type_name<Alternative>();
-    output_ << "    Self::" << rust_identifier(source, true) << "(value) => Value::Object(vec![(\"kind\".into(), Value::Text(\"" << source
-            << "\".into())), (\"payload\".into(), value." << method << "())]),\n";
+    output_ << "    Self::" << rust_identifier(source, true) << "(value) => Value::Object(vec![(\"kind\".into(), Value::Text(\"" << source << "\".into())), (\"payload\".into(), value." << method
+            << "())]),\n";
    });
    output_ << '}';
    if (wrapped) output_ << (transport ? "; Value::Array(vec![value])" : "; Value::Object(vec![(\"value\".into(), value)])");
@@ -611,8 +646,7 @@ private:
  }
  void EmitConstraintFields(const mmltk::frameworks::reflection::FieldConstraint& constraint) {
   EmitConstraintBounds(output_, constraint);
-  output_ << ", minimum_bytes: " << constraint.minimum_bytes << ", maximum_bytes: " << constraint.maximum_bytes
-          << ", maximum_items: " << constraint.maximum_items;
+  output_ << ", minimum_bytes: " << constraint.minimum_bytes << ", maximum_bytes: " << constraint.maximum_bytes << ", maximum_items: " << constraint.maximum_items;
  }
  template <class Field>
  void EmitConstraint(const std::string& member, const mmltk::frameworks::reflection::FieldConstraint constraint) {
@@ -639,13 +673,10 @@ private:
      output_ << "if !application_value_within_limits(&" << member << ", " << constraint.maximum_bytes << ", " << constraint.maximum_items
              << ", MAX_INTENT_VALUE_DEPTH, 0) { return Err(\"dynamic field capacity exceeded\".into()) }\n";
    } else if constexpr (std::same_as<Type, std::string> || std::same_as<Type, std::filesystem::path>) {
-    if (constraint.minimum_bytes != 0U)
-     output_ << "if " << member << ".len() < " << constraint.minimum_bytes << " { return Err(\"field byte minimum not met\".into()) }\n";
-    if (constraint.maximum_bytes != 0U)
-     output_ << "if " << member << ".len() > " << constraint.maximum_bytes << " { return Err(\"field byte capacity exceeded\".into()) }\n";
+    if (constraint.minimum_bytes != 0U) output_ << "if " << member << ".len() < " << constraint.minimum_bytes << " { return Err(\"field byte minimum not met\".into()) }\n";
+    if (constraint.maximum_bytes != 0U) output_ << "if " << member << ".len() > " << constraint.maximum_bytes << " { return Err(\"field byte capacity exceeded\".into()) }\n";
    } else if constexpr (schema::Sequence<Type>::value) {
-    if (constraint.maximum_items != 0U)
-     output_ << "if " << member << ".len() > " << constraint.maximum_items << " { return Err(\"field item capacity exceeded\".into()) }\n";
+    if (constraint.maximum_items != 0U) output_ << "if " << member << ".len() > " << constraint.maximum_items << " { return Err(\"field item capacity exceeded\".into()) }\n";
    }
   }
  }
@@ -665,17 +696,14 @@ private:
    if constexpr (!std::is_void_v<typename Endpoint::result_type>) EmitType<typename Endpoint::result_type>();
   });
   mmltk::controller::browser::ApplicationSchema<ApplicationSystems>::VisitEvents([&]<class Identity, class Event>(const auto&) { EmitType<Event>(); });
-  mmltk::controller::browser::ApplicationSchema<ApplicationSystems>::VisitCatalogProviders(
-   [&]<class Provider, class Row>(const auto&) { EmitCatalogDependencies<Row>(); });
+  mmltk::controller::browser::ApplicationSchema<ApplicationSystems>::VisitCatalogProviders([&]<class Provider, class Row>(const auto&) { EmitCatalogDependencies<Row>(); });
  }
  template <class Type>
  void EmitSnapshotFieldComparison() {
   const auto name = rust_type<Type>();
   if (!symbols_.Reserve("impl " + name, "visit_differing_fields", NativeSource<Type>() + " snapshot field comparison")) return;
   output_ << "impl " << name << " {\n    pub fn visit_differing_fields(&self, other: &Self, mut visitor: impl FnMut(&'static str)) {\n";
-  VisitRustFields<Type>([&]<class, class>(const auto&, const std::string& member) {
-   output_ << "        if self." << member << " != other." << member << " { visitor(\"" << member << "\"); }\n";
-  });
+  VisitRustFields<Type>([&]<class, class>(const auto&, const std::string& member) { output_ << "        if self." << member << " != other." << member << " { visitor(\"" << member << "\"); }\n"; });
   output_ << "    }\n}\n\n";
  }
  template <class Type>
@@ -689,8 +717,7 @@ private:
     if (!feature_scope.empty()) throw std::logic_error("reachable type has duplicate feature scopes");
     std::set<mmltk::controller::contracts::FeatureId> unique;
     for (const auto feature : annotation.values) {
-     if (!mmltk::controller::contracts::valid_feature(feature) || !unique.insert(feature).second)
-      throw std::logic_error("reachable type has invalid feature scope");
+     if (!mmltk::controller::contracts::valid_feature(feature) || !unique.insert(feature).second) throw std::logic_error("reachable type has invalid feature scope");
      if (!feature_scope.empty()) feature_scope += ", ";
      feature_scope += "FeatureId::" + rust_identifier(mmltk::frameworks::reflection::enum_name(feature), true);
     }
@@ -719,11 +746,11 @@ private:
     }
    });
    std::ostringstream row;
-   row << "ReflectedFieldFact { owner: \"" << name << "\", declaration_owner: \"" << mmltk::frameworks::serialization::reflected_schema_type_name<Owner>()
-       << "\", name: \"" << fact.member_name << "\", ";
+   row << "ReflectedFieldFact { owner: \"" << name << "\", declaration_owner: \"" << mmltk::frameworks::serialization::reflected_schema_type_name<Owner>() << "\", name: \"" << fact.member_name
+       << "\", ";
    EmitCompactConstraintFields(row, fact.constraint);
-   row << ", presentation: \"" << mmltk::frameworks::reflection::enum_name(fact.presentation) << "\", operation_state: " << operation_state
-       << ", progress: " << progress << ", catalog_provider: " << catalog << " },\n";
+   row << ", presentation: \"" << mmltk::frameworks::reflection::enum_name(fact.presentation) << "\", operation_state: " << operation_state << ", progress: " << progress
+       << ", catalog_provider: " << catalog << " },\n";
    field_facts_.push_back(std::move(row).str());
   });
  }
@@ -731,8 +758,7 @@ private:
   ReserveGeneratedStruct("ReflectedTypeFact", "generated reflected type metadata", {"name", "feature_scope", "progress_work"});
   symbols_.Reserve("module", "REFLECTED_TYPE_FACTS", "generated reflected type metadata");
   ReserveGeneratedStruct("ReflectedFieldFact", "generated reflected field metadata",
-                         {"owner", "declaration_owner", "name", "finite", "minimum", "maximum", "min_bytes", "max_bytes", "max_items", "presentation",
-                          "operation_state", "progress", "catalog_provider"});
+   {"owner", "declaration_owner", "name", "finite", "minimum", "maximum", "min_bytes", "max_bytes", "max_items", "presentation", "operation_state", "progress", "catalog_provider"});
   symbols_.Reserve("module", "REFLECTED_FIELD_FACTS", "generated reflected field metadata");
   output_ << "#[derive(Debug, Clone, Copy, PartialEq, Eq)]\n"
              "pub struct ReflectedTypeFact { pub name: &'static str, "
@@ -787,11 +813,9 @@ private:
   output_ << "#[derive(Debug, Clone, Copy, PartialEq, Eq)]\npub struct ModelSelectionFields {\n";
   EmitModelKeyFields<TrainWeightsModelSelection>(true);
   output_ << "}\nimpl ModelSelectionFields { pub fn all(&self) -> [u64; " << TrainWeightsModelSelection::key_relation::member_count << "] { [";
-  TrainWeightsModelSelection::key_relation::VisitMembers(
-   [&]<class Entry>() { output_ << "self." << RustMemberPath<ModelSelectionKey, Entry::destination>() << ','; });
+  TrainWeightsModelSelection::key_relation::VisitMembers([&]<class Entry>() { output_ << "self." << RustMemberPath<ModelSelectionKey, Entry::destination>() << ','; });
   output_ << "] } }\n";
-  ReserveGeneratedStruct("ModelArtifactDialogFact", "canonical model artifact dialogs",
-                         {"target", "stable_field_id", "key_fields", "predicate_field_id", "field_path", "dialog"});
+  ReserveGeneratedStruct("ModelArtifactDialogFact", "canonical model artifact dialogs", {"target", "stable_field_id", "key_fields", "predicate_field_id", "field_path", "dialog"});
   symbols_.Reserve("module", "MODEL_ARTIFACT_DIALOGS", "canonical model artifact dialogs");
   output_ << "#[derive(Debug, Clone, PartialEq)]\n"
              "pub struct ModelArtifactDialogFact { pub target: ModelArtifactTarget, "
@@ -803,8 +827,8 @@ private:
    const auto stable_id = mmltk::controller::browser::application_settings_field_stable_id(path.view());
    output_ << "ModelArtifactDialogFact { target: ModelArtifactTarget { stableid: " << stable_id
            << ", workflow: FeatureId::" << rust_identifier(mmltk::frameworks::reflection::enum_name(row.workflow), true)
-           << ", input: ModelArtifactInputKind::" << rust_identifier(mmltk::frameworks::reflection::enum_name(row.input), true)
-           << " }, stable_field_id: " << stable_id << ", key_fields: ModelSelectionFields {";
+           << ", input: ModelArtifactInputKind::" << rust_identifier(mmltk::frameworks::reflection::enum_name(row.input), true) << " }, stable_field_id: " << stable_id
+           << ", key_fields: ModelSelectionFields {";
    EmitModelKeyFields<Relation>(false);
    output_ << "}, predicate_field_id: ";
    if constexpr (std::tuple_size_v<decltype(Relation::predicate)> == 0U)
@@ -834,15 +858,13 @@ private:
    output_ << "if workflow == FeatureId::" << rust_identifier(mmltk::frameworks::reflection::enum_name(row.workflow), true) << " && ";
    EmitModelPredicate<Relation>(row);
    output_ << " {\nif result.is_none() { result = Some(ModelSettingsProjection { key: ModelSelectionKey {\n";
-   output_ << RustMemberPath<ModelSelectionKey, Relation::workflow_destination>()
-           << ": FeatureId::" << rust_identifier(mmltk::frameworks::reflection::enum_name(Relation::workflow), true) << ",\n";
+   output_ << RustMemberPath<ModelSelectionKey, Relation::workflow_destination>() << ": FeatureId::" << rust_identifier(mmltk::frameworks::reflection::enum_name(Relation::workflow), true) << ",\n";
    Relation::key_relation::VisitMembers([&]<class Entry>() {
     output_ << RustMemberPath<ModelSelectionKey, Entry::destination>() << ": settings." << RustMemberPath<Settings, Entry::source>();
     if constexpr (std::same_as<typename Entry::transform, ModelSelectionResolutionTransform>)
      output_ << " as u32";
     else {
-     static_assert(std::same_as<typename Entry::transform, ModelSelectionTextTransform> ||
-                   std::same_as<typename Entry::transform, mmltk::frameworks::reflection::ExactMemberTransform>);
+     static_assert(std::same_as<typename Entry::transform, ModelSelectionTextTransform> || std::same_as<typename Entry::transform, mmltk::frameworks::reflection::ExactMemberTransform>);
      output_ << ".clone()";
     }
     output_ << ",\n";
@@ -852,15 +874,12 @@ private:
     output_ << "false";
    else
     output_ << "settings." << RustMemberPath<Settings, std::get<0>(Relation::predicate)>();
-   output_ << " }); }\nif settings." << RustMemberPath<Settings, Relation::input>()
-           << " == ModelArtifactInputKind::" << rust_identifier(mmltk::frameworks::reflection::enum_name(row.input), true)
+   output_ << " }); }\nif settings." << RustMemberPath<Settings, Relation::input>() << " == ModelArtifactInputKind::" << rust_identifier(mmltk::frameworks::reflection::enum_name(row.input), true)
            << " { let projection = result.as_mut().unwrap();\n";
-   Relation::artifact_relation::VisitMembers([&]<class Entry>() {
-    output_ << "projection." << RustMemberPath<ModelSettingsProjection, Entry::destination>() << " = settings." << RustMemberPath<Settings, Entry::source>()
-            << ".clone();\n";
-   });
-   output_ << "projection.compatible = match projection.key.source { ModelSelectionSource::Canonical => " << (row.canonical_allowed ? "true" : "false")
-           << ", ModelSelectionSource::Custom => " << (row.custom_allowed ? "true" : "false") << " };\n} }\n";
+   Relation::artifact_relation::VisitMembers(
+    [&]<class Entry>() { output_ << "projection." << RustMemberPath<ModelSettingsProjection, Entry::destination>() << " = settings." << RustMemberPath<Settings, Entry::source>() << ".clone();\n"; });
+   output_ << "projection.compatible = match projection.key.source { ModelSelectionSource::Canonical => " << (row.canonical_allowed ? "true" : "false") << ", ModelSelectionSource::Custom => "
+           << (row.custom_allowed ? "true" : "false") << " };\n} }\n";
   });
   output_ << "result }\n";
  }
@@ -872,16 +891,14 @@ private:
   symbols_.Reserve("module", "integration_server_command", "canonical integration command direction");
   const auto kind_type = writer.rust_type<IntegrationControlKind>();
   output_ << "pub const fn integration_server_command(kind: " << kind_type << ") -> bool { match kind {\n";
-  mmltk::controller::contracts::visit_integration_commands([&]<auto, auto Policy>(const auto name) {
-   output_ << kind_type << "::" << writer.identifier(name, true) << " => " << (Policy.server ? "true" : "false") << ",\n";
-  });
+  mmltk::controller::contracts::visit_integration_commands(
+   [&]<auto, auto Policy>(const auto name) { output_ << kind_type << "::" << writer.identifier(name, true) << " => " << (Policy.server ? "true" : "false") << ",\n"; });
   output_ << "} }\n";
   symbols_.Reserve("module", "INTEGRATION_FAILURE_MAX_BYTES", "canonical failure receipt byte limit");
   output_ << "pub const INTEGRATION_FAILURE_MAX_BYTES: usize = " << mmltk::controller::contracts::kIntegrationFailureMaxBytes << ";\n";
   symbols_.Reserve("module", "integration_receipt_valid", "canonical integration receipt policy");
   output_ << "pub const fn integration_receipt_valid(receipt: &" << writer.rust_type<mmltk::controller::contracts::IntegrationControlReceipt>()
-          << ") -> bool { receipt.sequence != 0 && (matches!(receipt.kind, " << kind_type
-          << "::Failed) == (receipt.failureline != 0)) && receipt.failure.len() <= INTEGRATION_FAILURE_MAX_BYTES && "
+          << ") -> bool { receipt.sequence != 0 && (matches!(receipt.kind, " << kind_type << "::Failed) == (receipt.failureline != 0)) && receipt.failure.len() <= INTEGRATION_FAILURE_MAX_BYTES && "
           << "(matches!(receipt.kind, " << kind_type << "::Failed) || receipt.failure.is_empty()) && match receipt.kind {\n";
   mmltk::controller::contracts::visit_integration_commands([&]<auto, auto Policy>(const auto name) {
    output_ << kind_type << "::" << writer.identifier(name, true) << " => receipt.readgeneration " << (Policy.read_generation ? "!=" : "==") << " 0"
@@ -918,8 +935,8 @@ private:
    output_ << "Value::Object(vec![\n";
    VisitRustFields<Type>([&]<class Field, class>(const auto& fact, const std::string& member) {
     output_ << "(\"" << fact.member_name << "\".into(), ";
-    constexpr bool client = std::same_as<Type, mmltk::controller::browser::Intent> || std::same_as<Type, mmltk::controller::browser::IntentField> ||
-                            std::same_as<Type, mmltk::controller::browser::Interaction>;
+    constexpr bool client =
+     std::same_as<Type, mmltk::controller::browser::Intent> || std::same_as<Type, mmltk::controller::browser::IntentField> || std::same_as<Type, mmltk::controller::browser::Interaction>;
     if (client && fact.member_name == "protocol_version")
      output_ << "BROWSER_PROTOCOL_VERSION.into_application_value()";
     else
@@ -1025,12 +1042,12 @@ private:
       fields << rust_type<Leaf>();
      } else {
       static_assert((Builtin<Leaf> || std::is_enum_v<Leaf>) && !std::same_as<Leaf, wire::Value> && !std::same_as<Leaf, wire::FlatValue>,
-                    "unsupported reflected server-record preflight leaf; alternative is identified by this instantiation");
+       "unsupported reflected server-record preflight leaf; alternative is identified by this instantiation");
       std::size_t maximum_bytes = fact.constraint.maximum_bytes;
       if constexpr (std::same_as<Leaf, std::string> || std::same_as<Leaf, std::filesystem::path> || std::same_as<Leaf, std::string_view>) {
        static_assert(mmltk::frameworks::reflection::materialized_member_declaration<Declaration::pointer>().constraint.maximum_bytes > 0U,
-                     "reflected server-record text/path leaf requires positive MaxBytes; owning field is identified "
-                     "by this instantiation");
+        "reflected server-record text/path leaf requires positive MaxBytes; owning field is identified "
+        "by this instantiation");
       } else if constexpr (std::is_enum_v<Leaf>) {
        for (const auto enumerator : mmltk::frameworks::reflection::enum_entries<Leaf>()) maximum_bytes = std::max(maximum_bytes, enumerator.name.size());
       }
@@ -1095,14 +1112,12 @@ private:
   output_ << "Self::Leaf { .. } => 0, } }\n"
              "pub fn max_leaf_bytes(self) -> usize { match self { Self::Leaf { maximum_bytes, .. } => maximum_bytes, _ => 0 } }\n"
              "pub fn map_child(self, key: &[u8]) -> Self { match self {\n";
-  for (const auto& [name, entry] : records)
-   output_ << "Self::" << name << " => match key {\n" << entry.fields << "_ => Self::Leaf { maximum_bytes: 0, maximum_items: 0 }, },\n";
+  for (const auto& [name, entry] : records) output_ << "Self::" << name << " => match key {\n" << entry.fields << "_ => Self::Leaf { maximum_bytes: 0, maximum_items: 0 }, },\n";
   output_ << "leaf => leaf, } } }\n";
  }
  void EmitEndpoints() {
   ReserveGeneratedStruct("FieldFact", "generated request-field metadata",
-                         {"endpoint_id", "field_id", "name", "finite", "minimum", "maximum", "min_bytes", "max_bytes", "max_items", "presentation",
-                          "file_dialog_identity", "settings_update_values"});
+   {"endpoint_id", "field_id", "name", "finite", "minimum", "maximum", "min_bytes", "max_bytes", "max_items", "presentation", "file_dialog_identity", "settings_update_values"});
   symbols_.Reserve("module", "APPLICATION_REQUEST_FIELDS", "generated request-field metadata");
   output_ << "#[derive(Debug, Clone, Copy, PartialEq)]\npub struct FieldFact { "
              "pub endpoint_id: u64, pub field_id: u64, pub name: &'static str, "
@@ -1112,14 +1127,12 @@ private:
              "pub static APPLICATION_REQUEST_FIELDS: &[FieldFact] = &[\n";
   mmltk::controller::browser::ApplicationSchema<ApplicationSystems>::VisitEndpoints([&]<class Endpoint>() {
    if constexpr (Endpoint::signature::has_request) {
-    mmltk::controller::browser::ApplicationSchema<ApplicationSystems>::template VisitRequestFields<Endpoint>(
-     [&]<class Owner, class Declaration>(const auto& fact) {
-      output_ << "FieldFact { endpoint_id: " << Endpoint::stable_id << ", field_id: " << fact.stable_id << ", name: \"" << fact.name << "\", ";
-      EmitCompactConstraintFields(output_, fact.constraint);
-      output_ << ", presentation: \"" << mmltk::frameworks::reflection::enum_name(fact.presentation)
-              << "\", file_dialog_identity: " << (fact.file_dialog_identity ? "true" : "false")
-              << ", settings_update_values: " << (fact.settings_update_values ? "true" : "false") << " },\n";
-     });
+    mmltk::controller::browser::ApplicationSchema<ApplicationSystems>::template VisitRequestFields<Endpoint>([&]<class Owner, class Declaration>(const auto& fact) {
+     output_ << "FieldFact { endpoint_id: " << Endpoint::stable_id << ", field_id: " << fact.stable_id << ", name: \"" << fact.name << "\", ";
+     EmitCompactConstraintFields(output_, fact.constraint);
+     output_ << ", presentation: \"" << mmltk::frameworks::reflection::enum_name(fact.presentation) << "\", file_dialog_identity: " << (fact.file_dialog_identity ? "true" : "false")
+             << ", settings_update_values: " << (fact.settings_update_values ? "true" : "false") << " },\n";
+    });
    }
   });
   output_ << "];\n";
@@ -1131,8 +1144,7 @@ private:
             << ") -> Result<crate::protocol::client_records::ScheduledInteraction, crate::protocol::ProtocolError> { "
                "Ok(crate::protocol::client_records::ScheduledInteraction { record: Interaction { endpoint_id: "
             << Endpoint::stable_id
-            << ", value: crate::application_codec::ByteBuffer(crate::protocol::client_records::compact_bytes(&request)?) }, replaceable: "
-            << (Endpoint::replaceable ? "true" : "false") << " }) }\n";
+            << ", value: crate::application_codec::ByteBuffer(crate::protocol::client_records::compact_bytes(&request)?) }, replaceable: " << (Endpoint::replaceable ? "true" : "false") << " }) }\n";
     symbols_.Reserve("module", function + "_into", "retained compact endpoint encoder " + std::string(Endpoint::name));
     output_ << "pub fn " << function << "_into(request: &" << rust_type<typename Endpoint::request_type>()
             << ", scratch: &mut Vec<u8>, output: &mut Vec<u8>) -> Result<(), crate::protocol::ProtocolError> { "
@@ -1145,10 +1157,9 @@ private:
             << "ApplicationIntentEndpoint::" << rust_identifier(Endpoint::system_cell::name, true) << rust_identifier(Endpoint::name, true)
             << ", record: Intent { correlation, endpoint_id: " << Endpoint::stable_id << ", fields: vec![\n";
     if constexpr (Endpoint::signature::has_request) {
-     mmltk::controller::browser::ApplicationSchema<ApplicationSystems>::template VisitRequestFields<Endpoint>(
-      [&]<class Owner, class Declaration>(const auto& fact) {
-       output_ << "IntentField { field_id: " << fact.stable_id << ", value: request." << rust_identifier(fact.name, false) << ".into_application_value() },\n";
-      });
+     mmltk::controller::browser::ApplicationSchema<ApplicationSystems>::template VisitRequestFields<Endpoint>([&]<class Owner, class Declaration>(const auto& fact) {
+      output_ << "IntentField { field_id: " << fact.stable_id << ", value: request." << rust_identifier(fact.name, false) << ".into_application_value() },\n";
+     });
     }
     output_ << "] } } }\n";
    }
@@ -1180,8 +1191,8 @@ private:
   } else if constexpr (shape == cbor::CompactShape::Enum) {
    if (!compact_types_.insert(NativeSource<Type>()).second) return;
    output_ << "impl crate::protocol::client_records::Compact for " << rust_type<Type>()
-           << " { fn compact(&self, bytes: &mut Vec<u8>) -> Result<(), crate::protocol::ProtocolError> { let value: "
-           << (std::is_signed_v<std::underlying_type_t<Type>> ? "i64" : "u64") << " = match self {\n";
+           << " { fn compact(&self, bytes: &mut Vec<u8>) -> Result<(), crate::protocol::ProtocolError> { let value: " << (std::is_signed_v<std::underlying_type_t<Type>> ? "i64" : "u64")
+           << " = match self {\n";
    for (const auto entry : mmltk::frameworks::reflection::enum_entries<Type>()) {
     output_ << "Self::" << rust_identifier(entry.name, true) << " => ";
     if constexpr (std::is_signed_v<std::underlying_type_t<Type>>)
@@ -1235,8 +1246,7 @@ private:
   if (apply) {
    symbols_.Reserve("impl " + rust_type<Target>(), "apply_to", "canonical progress projection");
    output_ << "impl " << rust_type<Target>() << " { pub fn apply_to(&self, target: &mut " << rust_type<Source>() << ") {\n";
-   VisitRustFields<Target>(
-    [&]<class, class>(const auto&, const std::string& member) { output_ << "target." << member << " = self." << member << ".clone();\n"; });
+   VisitRustFields<Target>([&]<class, class>(const auto&, const std::string& member) { output_ << "target." << member << " = self." << member << ".clone();\n"; });
    output_ << "} }\n";
   }
  }
@@ -1248,8 +1258,7 @@ private:
    const auto selector = rust_type<Record>() + "Field::" + rust_identifier(fact.member_name, true);
    const std::string name(fact.member_name);
    if constexpr (schema::StaticArray<Field>::value) {
-    for (std::size_t index = 0; index < schema::StaticArray<Field>::extent; ++index)
-     visitor(selector + "(" + std::to_string(index) + ")", name + "[" + std::to_string(index) + "]");
+    for (std::size_t index = 0; index < schema::StaticArray<Field>::extent; ++index) visitor(selector + "(" + std::to_string(index) + ")", name + "[" + std::to_string(index) + "]");
    } else if constexpr (schema::ReflectedObject<Field> && !Builtin<Field>) {
     VisitScalarSelectors<Field>([&](const std::string& nested, const std::string& leaf) { visitor(selector + "(" + nested + ")", name + "." + leaf); });
    } else {
@@ -1315,21 +1324,17 @@ private:
  void EmitImageMetadata() {
   Schema::VisitVisualSources([&]<class Cell, std::meta::info, class Projection>() {
    EmitRecordProjection<typename Projection::snapshot_type, typename Projection::image_type>(false, false);
-   if constexpr (requires { typename Cell::type::progress_type; }) {
-    EmitRecordProjection<typename Projection::snapshot_type, typename Cell::type::progress_type>(true, true);
-   }
+   if constexpr (requires { typename Cell::type::progress_type; }) { EmitRecordProjection<typename Projection::snapshot_type, typename Cell::type::progress_type>(true, true); }
   });
   symbols_.Reserve("module", "WorkspaceImageProduct", "canonical visual source image projections");
   symbols_.Reserve("module", "decode_workspace_image_product", "canonical visual source image projections");
   output_ << "#[derive(Debug, Clone, PartialEq)]\npub enum WorkspaceImageProduct {\n";
-  Schema::VisitVisualSources([&]<class Cell, std::meta::info, class Projection>() {
-   output_ << rust_identifier(Cell::name, true) << "(std::sync::Arc<" << rust_type<typename Projection::image_type>() << ">),\n";
-  });
+  Schema::VisitVisualSources(
+   [&]<class Cell, std::meta::info, class Projection>() { output_ << rust_identifier(Cell::name, true) << "(std::sync::Arc<" << rust_type<typename Projection::image_type>() << ">),\n"; });
   output_ << "}\npub fn decode_workspace_image_product(system_id: u64, value: Value) -> Result<WorkspaceImageProduct, String> { "
              "match system_id {\n";
   Schema::VisitVisualSources([&]<class Cell, std::meta::info, class Projection>() {
-   output_ << Cell::stable_id << " => { let image: " << rust_type<typename Projection::image_type>()
-           << " = FromApplicationValue::from_application_transport_value(value)?;\n"
+   output_ << Cell::stable_id << " => { let image: " << rust_type<typename Projection::image_type>() << " = FromApplicationValue::from_application_transport_value(value)?;\n"
            << "if presentation_source_session(image.frame.source.kind) != " << mmltk::controller::presentation_source_session(Projection::kind)
            << " { return Err(\"workspace image product kind mismatch\".into()); }\n"
            << "Ok(WorkspaceImageProduct::" << rust_identifier(Cell::name, true) << "(std::sync::Arc::new(image))) },\n";
@@ -1356,10 +1361,9 @@ private:
  }
  void EmitSettingsHelpers() {
   ReserveGeneratedStruct("SettingsLeafFact", "generated settings-leaf metadata",
-                         {"stable_field_id", "path", "owner", "member", "mutable_leaf", "workflows", "catalog_provider", "has_file_dialog", "finite", "minimum",
-                          "maximum", "minimum_bytes", "maximum_bytes", "maximum_items"});
-  ReserveGeneratedStruct("SettingsLeafConstraint", "generated typed settings constraint",
-                         {"stable_field_id", "finite", "minimum", "maximum", "minimum_bytes", "maximum_bytes", "maximum_items"});
+   {"stable_field_id", "path", "owner", "member", "mutable_leaf", "workflows", "catalog_provider", "has_file_dialog", "finite", "minimum", "maximum", "minimum_bytes", "maximum_bytes",
+    "maximum_items"});
+  ReserveGeneratedStruct("SettingsLeafConstraint", "generated typed settings constraint", {"stable_field_id", "finite", "minimum", "maximum", "minimum_bytes", "maximum_bytes", "maximum_items"});
   symbols_.Reserve("module", "SETTINGS_LEAVES", "generated settings-leaf metadata");
   symbols_.Reserve("module", "SETTINGS_UPDATE_CAPACITY", "generated settings update capacity");
   output_ << "pub const SETTINGS_UPDATE_CAPACITY: usize = " << mmltk::controller::contracts::kMaxSettingsUpdates << ";\n";
@@ -1380,25 +1384,23 @@ private:
              "pub maximum: Option<f64>, pub minimum_bytes: usize, "
              "pub maximum_bytes: usize, pub maximum_items: usize }\n"
              "pub static SETTINGS_LEAVES: &[SettingsLeafFact] = &[\n";
-  Schema::VisitApplicationSettingsLeaves(
-   [&]<class Owner, class Declaration, class Member>(const mmltk::controller::browser::ApplicationSettingsLeafFact& fact) {
-    output_ << "SettingsLeafFact { stable_field_id: " << fact.stable_id << ", path: \"" << fact.path << "\", owner: \""
-            << mmltk::frameworks::serialization::reflected_schema_type_name<Owner>() << "\", member: \""
-            << mmltk::frameworks::reflection::materialized_member_name<Declaration::pointer>() << "\", mutable_leaf: " << (fact.mutable_leaf ? "true" : "false")
-            << ", workflows: &[";
-    for (std::size_t index = 0U; index < fact.workflows.count; ++index) {
-     if (index != 0U) output_ << ", ";
-     output_ << "FeatureId::" << rust_identifier(mmltk::frameworks::reflection::enum_name(fact.workflows.workflows[index]), true);
-    }
-    output_ << "], catalog_provider: ";
-    if (fact.catalog_provider.empty())
-     output_ << "None";
-    else
-     output_ << "Some(\"" << fact.catalog_provider << "\")";
-    output_ << ", has_file_dialog: " << (fact.file_dialog ? "true" : "false") << ", ";
-    EmitConstraintFields(fact.constraint);
-    output_ << " },\n";
-   });
+  Schema::VisitApplicationSettingsLeaves([&]<class Owner, class Declaration, class Member>(const mmltk::controller::browser::ApplicationSettingsLeafFact& fact) {
+   output_ << "SettingsLeafFact { stable_field_id: " << fact.stable_id << ", path: \"" << fact.path << "\", owner: \"" << mmltk::frameworks::serialization::reflected_schema_type_name<Owner>()
+           << "\", member: \"" << mmltk::frameworks::reflection::materialized_member_name<Declaration::pointer>() << "\", mutable_leaf: " << (fact.mutable_leaf ? "true" : "false")
+           << ", workflows: &[";
+   for (std::size_t index = 0U; index < fact.workflows.count; ++index) {
+    if (index != 0U) output_ << ", ";
+    output_ << "FeatureId::" << rust_identifier(mmltk::frameworks::reflection::enum_name(fact.workflows.workflows[index]), true);
+   }
+   output_ << "], catalog_provider: ";
+   if (fact.catalog_provider.empty())
+    output_ << "None";
+   else
+    output_ << "Some(\"" << fact.catalog_provider << "\")";
+   output_ << ", has_file_dialog: " << (fact.file_dialog ? "true" : "false") << ", ";
+   EmitConstraintFields(fact.constraint);
+   output_ << " },\n";
+  });
   output_ << "];\n";
   symbols_.Reserve("module", "SettingsFieldValue", "generated settings identity value");
   symbols_.Reserve("module", "SettingsFieldApplyError", "generated settings identity error");
@@ -1443,31 +1445,30 @@ private:
               "_ => Err(SettingsFieldApplyError::TypeMismatch) },\n";
   });
   output_ << "_ => Err(SettingsFieldApplyError::UnknownField), } }\n";
-  Schema::VisitApplicationSettingsLeaves(
-   [&]<class Owner, class Declaration, class Member>(const mmltk::controller::browser::ApplicationSettingsLeafFact& fact) {
-    if (!fact.mutable_leaf) return;
-    const auto function = "update_" + rust_identifier(fact.path, false);
-    symbols_.Reserve("module", function, "settings leaf " + std::string(fact.path));
-    output_ << "pub fn " << function << "(value: " << rust_type<Member>()
-            << ") -> SettingsValueUpdate { "
-               "SettingsValueUpdate { path: \""
-            << fact.path
-            << "\".into(), value: "
-               "value.into_application_value() } }\n";
-    const auto edit_function = "edit_" + rust_identifier(fact.path, false);
-    symbols_.Reserve("module", edit_function, "settings draft leaf " + std::string(fact.path));
-    output_ << "pub fn " << edit_function << "(state: &mut " << settings_type << ", value: " << rust_type<Member>() << ") -> SettingsValueUpdate { state";
-    emit_rust_field_access(output_, fact.path);
-    output_ << " = value.clone(); " << function << "(value) }\n";
-    const auto constraint_function = "constraint_" + rust_identifier(fact.path, false);
-    symbols_.Reserve("module", constraint_function, "settings constraint " + std::string(fact.path));
-    output_ << "pub const fn " << constraint_function
-            << "() -> SettingsLeafConstraint { "
-               "SettingsLeafConstraint { stable_field_id: "
-            << fact.stable_id << ", ";
-    EmitConstraintFields(fact.constraint);
-    output_ << " } }\n";
-   });
+  Schema::VisitApplicationSettingsLeaves([&]<class Owner, class Declaration, class Member>(const mmltk::controller::browser::ApplicationSettingsLeafFact& fact) {
+   if (!fact.mutable_leaf) return;
+   const auto function = "update_" + rust_identifier(fact.path, false);
+   symbols_.Reserve("module", function, "settings leaf " + std::string(fact.path));
+   output_ << "pub fn " << function << "(value: " << rust_type<Member>()
+           << ") -> SettingsValueUpdate { "
+              "SettingsValueUpdate { path: \""
+           << fact.path
+           << "\".into(), value: "
+              "value.into_application_value() } }\n";
+   const auto edit_function = "edit_" + rust_identifier(fact.path, false);
+   symbols_.Reserve("module", edit_function, "settings draft leaf " + std::string(fact.path));
+   output_ << "pub fn " << edit_function << "(state: &mut " << settings_type << ", value: " << rust_type<Member>() << ") -> SettingsValueUpdate { state";
+   emit_rust_field_access(output_, fact.path);
+   output_ << " = value.clone(); " << function << "(value) }\n";
+   const auto constraint_function = "constraint_" + rust_identifier(fact.path, false);
+   symbols_.Reserve("module", constraint_function, "settings constraint " + std::string(fact.path));
+   output_ << "pub const fn " << constraint_function
+           << "() -> SettingsLeafConstraint { "
+              "SettingsLeafConstraint { stable_field_id: "
+           << fact.stable_id << ", ";
+   EmitConstraintFields(fact.constraint);
+   output_ << " } }\n";
+  });
  }
  void EmitRequestDefaults() {
   ReserveGeneratedStruct("RequestDefaultFact", "canonical request defaults", {"endpoint_id", "field_id", "path", "value"});
@@ -1476,43 +1477,39 @@ private:
   output_ << "#[derive(Debug, Clone, PartialEq)]\n"
              "pub enum RequestDefault {\n";
   mmltk::controller::browser::ApplicationSchema<ApplicationSystems>::VisitEndpoints([&]<class Endpoint>() {
-   mmltk::controller::browser::ApplicationSchema<ApplicationSystems>::template VisitRequestDefaults<Endpoint>(
-    [&]<class Owner, class Declaration, class Member>(const auto& fact, const Member&) {
-     EmitType<Member>();
-     const auto variant = rust_identifier(std::string(Endpoint::system_cell::name) + "." + std::string(Endpoint::name) + "." + std::string(fact.name), true);
-     symbols_.Reserve("enum RequestDefault", variant,
-                      "request default " + std::string(Endpoint::system_cell::name) + "." + std::string(Endpoint::name) + "." + std::string(fact.name));
-     output_ << "    " << variant << "(" << rust_type<Member>() << "),\n";
-    });
+   mmltk::controller::browser::ApplicationSchema<ApplicationSystems>::template VisitRequestDefaults<Endpoint>([&]<class Owner, class Declaration, class Member>(const auto& fact, const Member&) {
+    EmitType<Member>();
+    const auto variant = rust_identifier(std::string(Endpoint::system_cell::name) + "." + std::string(Endpoint::name) + "." + std::string(fact.name), true);
+    symbols_.Reserve("enum RequestDefault", variant, "request default " + std::string(Endpoint::system_cell::name) + "." + std::string(Endpoint::name) + "." + std::string(fact.name));
+    output_ << "    " << variant << "(" << rust_type<Member>() << "),\n";
+   });
   });
   output_ << "}\n#[derive(Debug, Clone, PartialEq)]\n"
              "pub struct RequestDefaultFact { pub endpoint_id: u64, "
              "pub field_id: u64, pub path: &'static str, "
              "pub value: RequestDefault }\n";
   mmltk::controller::browser::ApplicationSchema<ApplicationSystems>::VisitEndpoints([&]<class Endpoint>() {
-   mmltk::controller::browser::ApplicationSchema<ApplicationSystems>::template VisitRequestDefaults<Endpoint>(
-    [&]<class Owner, class Declaration, class Member>(const auto& fact, const Member& value) {
-     auto encoded = mmltk::frameworks::serialization::reflected_value(value);
-     const std::string path = std::string(Endpoint::system_cell::name) + "." + std::string(Endpoint::name) + "." + std::string(fact.name);
-     if (!encoded) throw std::logic_error("unsupported request default at `" + path + "`");
-     const auto function = "default_request_" + rust_identifier(path, false);
-     symbols_.Reserve("module", function, "request default " + path);
-     output_ << "pub fn " << function << "() -> Result<" << rust_type<Member>()
-             << ", String> { "
-                "FromApplicationValue::from_application_value(";
-     emit_rust_value(output_, *encoded);
-     output_ << ") }\n";
-    });
+   mmltk::controller::browser::ApplicationSchema<ApplicationSystems>::template VisitRequestDefaults<Endpoint>([&]<class Owner, class Declaration, class Member>(const auto& fact, const Member& value) {
+    auto encoded = mmltk::frameworks::serialization::reflected_value(value);
+    const std::string path = std::string(Endpoint::system_cell::name) + "." + std::string(Endpoint::name) + "." + std::string(fact.name);
+    if (!encoded) throw std::logic_error("unsupported request default at `" + path + "`");
+    const auto function = "default_request_" + rust_identifier(path, false);
+    symbols_.Reserve("module", function, "request default " + path);
+    output_ << "pub fn " << function << "() -> Result<" << rust_type<Member>()
+            << ", String> { "
+               "FromApplicationValue::from_application_value(";
+    emit_rust_value(output_, *encoded);
+    output_ << ") }\n";
+   });
   });
   output_ << "pub fn application_request_defaults() "
              "-> Result<Vec<RequestDefaultFact>, String> { Ok(vec![\n";
   mmltk::controller::browser::ApplicationSchema<ApplicationSystems>::VisitEndpoints([&]<class Endpoint>() {
-   mmltk::controller::browser::ApplicationSchema<ApplicationSystems>::template VisitRequestDefaults<Endpoint>(
-    [&]<class Owner, class Declaration, class Member>(const auto& fact, const Member&) {
-     const std::string path = std::string(Endpoint::system_cell::name) + "." + std::string(Endpoint::name) + "." + std::string(fact.name);
-     output_ << "RequestDefaultFact { endpoint_id: " << fact.endpoint_id << ", field_id: " << fact.stable_id << ", path: " << std::quoted(path)
-             << ", value: RequestDefault::" << rust_identifier(path, true) << "(default_request_" << rust_identifier(path, false) << "()?) },\n";
-    });
+   mmltk::controller::browser::ApplicationSchema<ApplicationSystems>::template VisitRequestDefaults<Endpoint>([&]<class Owner, class Declaration, class Member>(const auto& fact, const Member&) {
+    const std::string path = std::string(Endpoint::system_cell::name) + "." + std::string(Endpoint::name) + "." + std::string(fact.name);
+    output_ << "RequestDefaultFact { endpoint_id: " << fact.endpoint_id << ", field_id: " << fact.stable_id << ", path: " << std::quoted(path)
+            << ", value: RequestDefault::" << rust_identifier(path, true) << "(default_request_" << rust_identifier(path, false) << "()?) },\n";
+   });
   });
   output_ << "]) }\n";
  }
@@ -1523,34 +1520,31 @@ private:
   Schema::VisitApplicationSettingsDefaults([&]<class Owner, class Declaration, class Member>(const auto&, const Member&) { EmitType<Member>(); });
   output_ << "#[derive(Debug, Clone, PartialEq)]\n"
              "pub enum SettingsDefault {\n";
-  Schema::VisitApplicationSettingsDefaults(
-   [&]<class Owner, class Declaration, class Member>(const mmltk::controller::browser::ApplicationSettingsDefaultFact& fact, const Member&) {
-    const auto variant = rust_identifier(fact.path, true);
-    symbols_.Reserve("enum SettingsDefault", variant, "settings default " + std::string(fact.path));
-    output_ << "    " << variant << "(" << rust_type<Member>() << "),\n";
-   });
+  Schema::VisitApplicationSettingsDefaults([&]<class Owner, class Declaration, class Member>(const mmltk::controller::browser::ApplicationSettingsDefaultFact& fact, const Member&) {
+   const auto variant = rust_identifier(fact.path, true);
+   symbols_.Reserve("enum SettingsDefault", variant, "settings default " + std::string(fact.path));
+   output_ << "    " << variant << "(" << rust_type<Member>() << "),\n";
+  });
   output_ << "}\n#[derive(Debug, Clone, PartialEq)]\n"
              "pub struct SettingsDefaultFact { pub stable_field_id: u64, "
              "pub path: &'static str, pub value: SettingsDefault }\n";
-  Schema::VisitApplicationSettingsDefaults(
-   [&]<class Owner, class Declaration, class Member>(const mmltk::controller::browser::ApplicationSettingsDefaultFact& fact, const Member& value) {
-    auto encoded = mmltk::frameworks::serialization::reflected_value(value);
-    if (!encoded) throw std::logic_error("unsupported settings default at `" + std::string(fact.path) + "`");
-    const auto function = "default_" + rust_identifier(fact.path, false);
-    symbols_.Reserve("module", function, "settings default " + std::string(fact.path));
-    output_ << "pub fn " << function << "() -> Result<" << rust_type<Member>()
-            << ", String> { "
-               "FromApplicationValue::from_application_value(";
-    emit_rust_value(output_, *encoded);
-    output_ << ") }\n";
-   });
+  Schema::VisitApplicationSettingsDefaults([&]<class Owner, class Declaration, class Member>(const mmltk::controller::browser::ApplicationSettingsDefaultFact& fact, const Member& value) {
+   auto encoded = mmltk::frameworks::serialization::reflected_value(value);
+   if (!encoded) throw std::logic_error("unsupported settings default at `" + std::string(fact.path) + "`");
+   const auto function = "default_" + rust_identifier(fact.path, false);
+   symbols_.Reserve("module", function, "settings default " + std::string(fact.path));
+   output_ << "pub fn " << function << "() -> Result<" << rust_type<Member>()
+           << ", String> { "
+              "FromApplicationValue::from_application_value(";
+   emit_rust_value(output_, *encoded);
+   output_ << ") }\n";
+  });
   output_ << "pub fn application_settings_defaults() "
              "-> Result<Vec<SettingsDefaultFact>, String> { Ok(vec![\n";
-  Schema::VisitApplicationSettingsDefaults(
-   [&]<class Owner, class Declaration, class Member>(const mmltk::controller::browser::ApplicationSettingsDefaultFact& fact, const Member&) {
-    output_ << "SettingsDefaultFact { stable_field_id: " << fact.stable_id << ", path: " << std::quoted(fact.path)
-            << ", value: SettingsDefault::" << rust_identifier(fact.path, true) << "(default_" << rust_identifier(fact.path, false) << "()?) },\n";
-   });
+  Schema::VisitApplicationSettingsDefaults([&]<class Owner, class Declaration, class Member>(const mmltk::controller::browser::ApplicationSettingsDefaultFact& fact, const Member&) {
+   output_ << "SettingsDefaultFact { stable_field_id: " << fact.stable_id << ", path: " << std::quoted(fact.path) << ", value: SettingsDefault::" << rust_identifier(fact.path, true) << "(default_"
+           << rust_identifier(fact.path, false) << "()?) },\n";
+  });
   output_ << "]) }\n";
  }
  template <class Value>
@@ -1572,98 +1566,90 @@ private:
   output_ << "#[derive(Debug, Clone, Copy, PartialEq, Eq)]\n"
              "pub struct SettingsRelationFact { pub stable_field_id: u64, "
              "pub source_path: &'static str, pub destination_path: &'static str }\n";
-  mmltk::controller::browser::ApplicationSchema<ApplicationSystems>::template VisitSettingsRelations<Settings>(
-   [&]<class Provider, class Relation, auto Selector>() {
-    const std::string provider_name = rust_identifier(mmltk::frameworks::reflection::type_name<Provider>(), true);
-    const std::string field_type = provider_name + "RelationField";
-    const std::string facts_name = rust_constant_identifier(provider_name) + "_RELATION";
-    const std::string rows_name = rust_constant_identifier(mmltk::frameworks::reflection::type_name<Provider>());
-    symbols_.Reserve("module", field_type, NativeSource<Provider>() + " settings relation");
-    symbols_.Reserve("module", facts_name, NativeSource<Provider>() + " settings relation facts");
-    output_ << "#[derive(Debug, Clone, Copy, PartialEq, Eq)]\npub enum " << field_type << " {\n";
+  mmltk::controller::browser::ApplicationSchema<ApplicationSystems>::template VisitSettingsRelations<Settings>([&]<class Provider, class Relation, auto Selector>() {
+   const std::string provider_name = rust_identifier(mmltk::frameworks::reflection::type_name<Provider>(), true);
+   const std::string field_type = provider_name + "RelationField";
+   const std::string facts_name = rust_constant_identifier(provider_name) + "_RELATION";
+   const std::string rows_name = rust_constant_identifier(mmltk::frameworks::reflection::type_name<Provider>());
+   symbols_.Reserve("module", field_type, NativeSource<Provider>() + " settings relation");
+   symbols_.Reserve("module", facts_name, NativeSource<Provider>() + " settings relation facts");
+   output_ << "#[derive(Debug, Clone, Copy, PartialEq, Eq)]\npub enum " << field_type << " {\n";
+   Relation::VisitMembers([&]<class Entry>() {
+    constexpr auto terminal = std::remove_cvref_t<decltype(Entry::destination)>::terminal_member;
+    output_ << rust_identifier(mmltk::frameworks::reflection::materialized_member_name<terminal>(), true) << ",\n";
+   });
+   const auto emit_relation_bit_arms = [&] {
+    std::size_t ordinal = 0U;
     Relation::VisitMembers([&]<class Entry>() {
      constexpr auto terminal = std::remove_cvref_t<decltype(Entry::destination)>::terminal_member;
-     output_ << rust_identifier(mmltk::frameworks::reflection::materialized_member_name<terminal>(), true) << ",\n";
+     output_ << field_type << "::" << rust_identifier(mmltk::frameworks::reflection::materialized_member_name<terminal>(), true) << " => " << (std::uint16_t{1U} << ordinal++) << "u16,\n";
     });
-    const auto emit_relation_bit_arms = [&] {
-     std::size_t ordinal = 0U;
-     Relation::VisitMembers([&]<class Entry>() {
-      constexpr auto terminal = std::remove_cvref_t<decltype(Entry::destination)>::terminal_member;
-      output_ << field_type << "::" << rust_identifier(mmltk::frameworks::reflection::materialized_member_name<terminal>(), true) << " => "
-              << (std::uint16_t{1U} << ordinal++) << "u16,\n";
-     });
-    };
-    output_ << "}\nimpl " << rust_type<typename Relation::override_state_type>() << " {\n"
-            << "pub fn overridden(&self, field: " << field_type << ") -> bool { let bit = match field {\n";
-    emit_relation_bit_arms();
-    output_ << "}; self.0 & bit != 0 }\n"
-               "fn set_override(&mut self, field: "
-            << field_type << ") { self.0 |= match field {\n";
-    emit_relation_bit_arms();
-    output_ << "}; }\nfn clear_override(&mut self, field: " << field_type << ") { self.0 &= !(match field {\n";
-    emit_relation_bit_arms();
-    output_ << "}); }\n}\npub static " << facts_name << ": &[SettingsRelationFact] = &[\n";
-    constexpr auto selector_path = mmltk::frameworks::reflection::reflected_member_path<Settings, Selector>();
-    constexpr auto override_path =
-     mmltk::frameworks::reflection::rebase_member_path<Settings, typename Relation::destination_type>(Selector, Relation::destination_override_state);
-    constexpr auto rendered_override_path = mmltk::frameworks::reflection::reflected_member_path<Settings, override_path>();
-    const auto visit_relation_fields = [&]<class Visitor>(Visitor&& visitor) {
-     Relation::VisitMembers([&]<class Entry>() {
-      constexpr auto destination =
-       mmltk::frameworks::reflection::rebase_member_path<Settings, typename Relation::destination_type>(Selector, Entry::destination);
-      constexpr auto destination_path = mmltk::frameworks::reflection::reflected_member_path<Settings, destination>();
-      constexpr auto source_path = mmltk::frameworks::reflection::reflected_member_path<typename Relation::source_type, Entry::source>();
-      visitor.template operator()<Entry>(destination_path, source_path);
-     });
-    };
-    visit_relation_fields([&]<class Entry>(const auto& destination_path, const auto& source_path) {
-     output_ << "SettingsRelationFact { stable_field_id: " << mmltk::controller::browser::application_settings_field_stable_id(destination_path.view())
-             << ", source_path: " << std::quoted(source_path.view()) << ", destination_path: " << std::quoted(destination_path.view()) << " },\n";
+   };
+   output_ << "}\nimpl " << rust_type<typename Relation::override_state_type>() << " {\n"
+           << "pub fn overridden(&self, field: " << field_type << ") -> bool { let bit = match field {\n";
+   emit_relation_bit_arms();
+   output_ << "}; self.0 & bit != 0 }\n"
+              "fn set_override(&mut self, field: "
+           << field_type << ") { self.0 |= match field {\n";
+   emit_relation_bit_arms();
+   output_ << "}; }\nfn clear_override(&mut self, field: " << field_type << ") { self.0 &= !(match field {\n";
+   emit_relation_bit_arms();
+   output_ << "}); }\n}\npub static " << facts_name << ": &[SettingsRelationFact] = &[\n";
+   constexpr auto selector_path = mmltk::frameworks::reflection::reflected_member_path<Settings, Selector>();
+   constexpr auto override_path = mmltk::frameworks::reflection::rebase_member_path<Settings, typename Relation::destination_type>(Selector, Relation::destination_override_state);
+   constexpr auto rendered_override_path = mmltk::frameworks::reflection::reflected_member_path<Settings, override_path>();
+   const auto visit_relation_fields = [&]<class Visitor>(Visitor&& visitor) {
+    Relation::VisitMembers([&]<class Entry>() {
+     constexpr auto destination = mmltk::frameworks::reflection::rebase_member_path<Settings, typename Relation::destination_type>(Selector, Entry::destination);
+     constexpr auto destination_path = mmltk::frameworks::reflection::reflected_member_path<Settings, destination>();
+     constexpr auto source_path = mmltk::frameworks::reflection::reflected_member_path<typename Relation::source_type, Entry::source>();
+     visitor.template operator()<Entry>(destination_path, source_path);
     });
-    output_ << "];\n";
-    visit_relation_fields([&]<class Entry>(const auto& destination_path, const auto& source_path) {
-     using Field = mmltk::frameworks::reflection::accessor_value_t<typename Relation::destination_type, Entry::destination>;
-     constexpr auto source_selector_path = mmltk::frameworks::reflection::reflected_member_path<typename Relation::source_type, Relation::source_selector>();
-     constexpr auto terminal = std::remove_cvref_t<decltype(Entry::destination)>::terminal_member;
-     const std::string variant = rust_identifier(mmltk::frameworks::reflection::materialized_member_name<terminal>(), true);
-     const std::string suffix = rust_identifier(destination_path.view(), false);
-     constexpr auto relative_override_path =
-      mmltk::frameworks::reflection::reflected_member_path<typename Relation::destination_type, Relation::destination_override_state>();
-     constexpr auto relative_destination_path = mmltk::frameworks::reflection::reflected_member_path<typename Relation::destination_type, Entry::destination>();
-     constexpr auto relative_selector_path =
-      mmltk::frameworks::reflection::reflected_member_path<typename Relation::destination_type, Relation::destination_selector>();
-     const auto emit_effective_value = [&](const std::string_view state_override_path, const std::string_view state_destination_path,
-                                           const std::string_view state_selector_path) {
-      output_ << "if state";
-      emit_rust_field_access(output_, state_override_path);
-      output_ << ".overridden(" << field_type << "::" << variant << ") { state";
-      emit_rust_field_access(output_, state_destination_path);
-      output_ << ".clone() } else { " << rows_name << ".iter().find(|row| row";
-      emit_rust_field_access(output_, source_selector_path.view());
-      output_ << " == state";
-      emit_rust_field_access(output_, state_selector_path);
-      output_ << ").unwrap_or(&" << rows_name << "[0])";
-      emit_rust_field_access(output_, source_path.view());
-      output_ << ".clone() }";
-     };
-     output_ << "pub fn effective_" << suffix << "(state: &" << rust_type<typename Relation::destination_type>() << ") -> " << rust_type<Field>() << " { ";
-     emit_effective_value(relative_override_path.view(), relative_destination_path.view(), relative_selector_path.view());
-     output_ << " }\n";
-     output_ << "pub fn edit_relation_" << suffix << "(state: &mut " << rust_type<Settings>() << ", value: " << rust_type<Field>()
-             << ") -> SettingsValueUpdate { state";
-     emit_rust_field_access(output_, destination_path.view());
-     output_ << " = value.clone(); state";
-     emit_rust_field_access(output_, rendered_override_path.view());
-     output_ << ".set_override(" << field_type << "::" << variant << "); update_" << suffix << "(value) }\n";
-     output_ << "pub fn clear_relation_" << suffix << "(state: &mut " << rust_type<Settings>() << ") -> SettingsValueUpdate { let value = ";
-     emit_effective_value(rendered_override_path.view(), destination_path.view(), selector_path.view());
-     output_ << "; state";
-     emit_rust_field_access(output_, rendered_override_path.view());
-     output_ << ".clear_override(" << field_type << "::" << variant << "); state";
-     emit_rust_field_access(output_, destination_path.view());
-     output_ << " = value; SettingsValueUpdate { path: " << std::quoted(destination_path.view()) << ".into(), value: Value::Null } }\n";
-    });
+   };
+   visit_relation_fields([&]<class Entry>(const auto& destination_path, const auto& source_path) {
+    output_ << "SettingsRelationFact { stable_field_id: " << mmltk::controller::browser::application_settings_field_stable_id(destination_path.view())
+            << ", source_path: " << std::quoted(source_path.view()) << ", destination_path: " << std::quoted(destination_path.view()) << " },\n";
    });
+   output_ << "];\n";
+   visit_relation_fields([&]<class Entry>(const auto& destination_path, const auto& source_path) {
+    using Field = mmltk::frameworks::reflection::accessor_value_t<typename Relation::destination_type, Entry::destination>;
+    constexpr auto source_selector_path = mmltk::frameworks::reflection::reflected_member_path<typename Relation::source_type, Relation::source_selector>();
+    constexpr auto terminal = std::remove_cvref_t<decltype(Entry::destination)>::terminal_member;
+    const std::string variant = rust_identifier(mmltk::frameworks::reflection::materialized_member_name<terminal>(), true);
+    const std::string suffix = rust_identifier(destination_path.view(), false);
+    constexpr auto relative_override_path = mmltk::frameworks::reflection::reflected_member_path<typename Relation::destination_type, Relation::destination_override_state>();
+    constexpr auto relative_destination_path = mmltk::frameworks::reflection::reflected_member_path<typename Relation::destination_type, Entry::destination>();
+    constexpr auto relative_selector_path = mmltk::frameworks::reflection::reflected_member_path<typename Relation::destination_type, Relation::destination_selector>();
+    const auto emit_effective_value = [&](const std::string_view state_override_path, const std::string_view state_destination_path, const std::string_view state_selector_path) {
+     output_ << "if state";
+     emit_rust_field_access(output_, state_override_path);
+     output_ << ".overridden(" << field_type << "::" << variant << ") { state";
+     emit_rust_field_access(output_, state_destination_path);
+     output_ << ".clone() } else { " << rows_name << ".iter().find(|row| row";
+     emit_rust_field_access(output_, source_selector_path.view());
+     output_ << " == state";
+     emit_rust_field_access(output_, state_selector_path);
+     output_ << ").unwrap_or(&" << rows_name << "[0])";
+     emit_rust_field_access(output_, source_path.view());
+     output_ << ".clone() }";
+    };
+    output_ << "pub fn effective_" << suffix << "(state: &" << rust_type<typename Relation::destination_type>() << ") -> " << rust_type<Field>() << " { ";
+    emit_effective_value(relative_override_path.view(), relative_destination_path.view(), relative_selector_path.view());
+    output_ << " }\n";
+    output_ << "pub fn edit_relation_" << suffix << "(state: &mut " << rust_type<Settings>() << ", value: " << rust_type<Field>() << ") -> SettingsValueUpdate { state";
+    emit_rust_field_access(output_, destination_path.view());
+    output_ << " = value.clone(); state";
+    emit_rust_field_access(output_, rendered_override_path.view());
+    output_ << ".set_override(" << field_type << "::" << variant << "); update_" << suffix << "(value) }\n";
+    output_ << "pub fn clear_relation_" << suffix << "(state: &mut " << rust_type<Settings>() << ") -> SettingsValueUpdate { let value = ";
+    emit_effective_value(rendered_override_path.view(), destination_path.view(), selector_path.view());
+    output_ << "; state";
+    emit_rust_field_access(output_, rendered_override_path.view());
+    output_ << ".clear_override(" << field_type << "::" << variant << "); state";
+    emit_rust_field_access(output_, destination_path.view());
+    output_ << " = value; SettingsValueUpdate { path: " << std::quoted(destination_path.view()) << ".into(), value: Value::Null } }\n";
+   });
+  });
  }
  void EmitCatalogs() {
   ReserveGeneratedStruct("CatalogProviderFact", "canonical catalog providers", {"stable_id", "identity", "name", "row_type", "row_count"});
@@ -1674,8 +1660,7 @@ private:
   symbols_.Reserve("module", "decode_application_catalog_row", "canonical typed catalog rows");
   symbols_.Reserve("module", "CATALOG_PROVIDERS", "canonical catalog providers");
   symbols_.Reserve("module", "CATALOG_ROWS", "canonical catalog rows");
-  ReserveGeneratedStruct("FileDialogFact", "canonical file-dialog projection",
-                         {"stable_field_id", "title", "filter", "pattern", "field_path", "workflows", "mode", "artifact"});
+  ReserveGeneratedStruct("FileDialogFact", "canonical file-dialog projection", {"stable_field_id", "title", "filter", "pattern", "field_path", "workflows", "mode", "artifact"});
   symbols_.Reserve("module", "FILE_DIALOGS", "canonical file-dialog projection");
   output_ << "\n#[derive(Debug, Clone, Copy, PartialEq, Eq)]\n"
              "pub struct CatalogProviderFact { pub stable_id: u64, "
@@ -1685,19 +1670,17 @@ private:
              "pub struct CatalogRowFact { pub provider_id: u64, "
              "pub stable_id: u64, pub key: &'static str, "
              "pub index: usize }\n";
-  mmltk::controller::browser::ApplicationSchema<ApplicationSystems>::VisitCatalogProviders(
-   [&]<class Provider, class Row>(const mmltk::controller::browser::ApplicationCatalogProviderFact& provider) {
-    EmitCatalogDependencies<Row>();
-    const std::string static_name = rust_constant_identifier(provider.name);
-    symbols_.Reserve("module", static_name, "catalog provider " + std::string(provider.name));
-    output_ << "pub static " << static_name << ": &[" << rust_type<Row>() << "] = &[\n";
-    mmltk::controller::browser::ApplicationSchema<ApplicationSystems>::template VisitCatalogRows<Provider>(
-     [&]<class ActualProvider, class ActualRow>(const auto&, const ActualRow& row) {
-      emit_catalog_value(output_, row);
-      output_ << ",\n";
-     });
-    output_ << "];\n";
+  mmltk::controller::browser::ApplicationSchema<ApplicationSystems>::VisitCatalogProviders([&]<class Provider, class Row>(const mmltk::controller::browser::ApplicationCatalogProviderFact& provider) {
+   EmitCatalogDependencies<Row>();
+   const std::string static_name = rust_constant_identifier(provider.name);
+   symbols_.Reserve("module", static_name, "catalog provider " + std::string(provider.name));
+   output_ << "pub static " << static_name << ": &[" << rust_type<Row>() << "] = &[\n";
+   mmltk::controller::browser::ApplicationSchema<ApplicationSystems>::template VisitCatalogRows<Provider>([&]<class ActualProvider, class ActualRow>(const auto&, const ActualRow& row) {
+    emit_catalog_value(output_, row);
+    output_ << ",\n";
    });
+   output_ << "];\n";
+  });
   output_ << "#[derive(Debug, Clone, PartialEq)]\n"
              "pub enum ApplicationCatalogRow {\n";
   mmltk::controller::browser::ApplicationSchema<ApplicationSystems>::VisitCatalogProviders([&]<class Provider, class Row>(const auto& provider) {
@@ -1714,8 +1697,7 @@ private:
   output_ << "} } }\npub fn decode_application_catalog_row(provider_id: u64, value: Value) "
              "-> Result<ApplicationCatalogRow, String> { match provider_id {\n";
   mmltk::controller::browser::ApplicationSchema<ApplicationSystems>::VisitCatalogProviders([&]<class Provider, class Row>(const auto& provider) {
-   output_ << provider.stable_id << " => Ok(ApplicationCatalogRow::" << rust_identifier(provider.name, true)
-           << "(FromApplicationValue::from_application_value(value)?)),\n";
+   output_ << provider.stable_id << " => Ok(ApplicationCatalogRow::" << rust_identifier(provider.name, true) << "(FromApplicationValue::from_application_value(value)?)),\n";
   });
   output_ << "_ => Err(\"unknown catalog provider\".into()), } }\n"
              "#[derive(Debug, Clone, PartialEq)]\n"
@@ -1725,28 +1707,24 @@ private:
              "pub fn application_catalog_rows() -> Vec<CatalogValueFact> { vec![\n";
   mmltk::controller::browser::ApplicationSchema<ApplicationSystems>::VisitCatalogProviders([&]<class Provider, class Row>(const auto& provider) {
    const std::string static_name = rust_constant_identifier(provider.name);
-   mmltk::controller::browser::ApplicationSchema<ApplicationSystems>::template VisitCatalogRows<Provider>(
-    [&]<class ActualProvider, class ActualRow>(const auto& row, const ActualRow&) {
-     output_ << "CatalogValueFact { provider_id: " << row.provider_id << ", stable_id: " << row.stable_id << ", key: " << std::quoted(row.key)
-             << ", value: ApplicationCatalogRow::" << rust_identifier(provider.name, true) << "(" << static_name << "[" << row.index << "].clone()) },\n";
-    });
+   mmltk::controller::browser::ApplicationSchema<ApplicationSystems>::template VisitCatalogRows<Provider>([&]<class ActualProvider, class ActualRow>(const auto& row, const ActualRow&) {
+    output_ << "CatalogValueFact { provider_id: " << row.provider_id << ", stable_id: " << row.stable_id << ", key: " << std::quoted(row.key)
+            << ", value: ApplicationCatalogRow::" << rust_identifier(provider.name, true) << "(" << static_name << "[" << row.index << "].clone()) },\n";
+   });
   });
   output_ << "] }\n";
   output_ << "pub static CATALOG_PROVIDERS: &[CatalogProviderFact] = &[\n";
-  mmltk::controller::browser::ApplicationSchema<ApplicationSystems>::VisitCatalogProviders(
-   [&]<class Provider, class Row>(const mmltk::controller::browser::ApplicationCatalogProviderFact& provider) {
-    std::size_t row_count = 0U;
-    mmltk::controller::browser::ApplicationSchema<ApplicationSystems>::template VisitCatalogRows<Provider>(
-     [&]<class ActualProvider, class ActualRow>(const auto&, const ActualRow&) { ++row_count; });
-    output_ << "CatalogProviderFact { stable_id: " << provider.stable_id << ", identity: " << std::quoted(provider.identity)
-            << ", name: " << std::quoted(provider.name) << ", row_type: " << std::quoted(provider.row_type) << ", row_count: " << row_count << " },\n";
-   });
+  mmltk::controller::browser::ApplicationSchema<ApplicationSystems>::VisitCatalogProviders([&]<class Provider, class Row>(const mmltk::controller::browser::ApplicationCatalogProviderFact& provider) {
+   std::size_t row_count = 0U;
+   mmltk::controller::browser::ApplicationSchema<ApplicationSystems>::template VisitCatalogRows<Provider>([&]<class ActualProvider, class ActualRow>(const auto&, const ActualRow&) { ++row_count; });
+   output_ << "CatalogProviderFact { stable_id: " << provider.stable_id << ", identity: " << std::quoted(provider.identity) << ", name: " << std::quoted(provider.name)
+           << ", row_type: " << std::quoted(provider.row_type) << ", row_count: " << row_count << " },\n";
+  });
   output_ << "];\npub static CATALOG_ROWS: &[CatalogRowFact] = &[\n";
   mmltk::controller::browser::ApplicationSchema<ApplicationSystems>::VisitCatalogProviders([&]<class Provider, class Row>(const auto&) {
    mmltk::controller::browser::ApplicationSchema<ApplicationSystems>::template VisitCatalogRows<Provider>(
     [&]<class ActualProvider, class ActualRow>(const mmltk::controller::browser::ApplicationCatalogRowFact& fact, const ActualRow&) {
-     output_ << "CatalogRowFact { provider_id: " << fact.provider_id << ", stable_id: " << fact.stable_id << ", key: " << std::quoted(fact.key)
-             << ", index: " << fact.index << " },\n";
+     output_ << "CatalogRowFact { provider_id: " << fact.provider_id << ", stable_id: " << fact.stable_id << ", key: " << std::quoted(fact.key) << ", index: " << fact.index << " },\n";
     });
   });
   output_ << "];\n#[derive(Debug, Clone, Copy, PartialEq, Eq)]\npub struct FileDialogFact { "
@@ -1755,18 +1733,17 @@ private:
              "pub workflows: &'static [FeatureId], "
              "pub mode: FileDialogMode }\n"
              "pub static FILE_DIALOGS: &[FileDialogFact] = &[\n";
-  Schema::VisitApplicationSettingsLeaves(
-   [&]<class Owner, class Declaration, class Member>(const mmltk::controller::browser::ApplicationSettingsLeafFact& field) {
-    if (!field.file_dialog) return;
-    const auto& dialog = *field.file_dialog;
-    output_ << "FileDialogFact { stable_field_id: " << field.stable_id << ", title: \"" << dialog.title << "\", filter: \"" << dialog.filter
-            << "\", pattern: \"" << dialog.pattern << "\", field_path: \"" << field.path << "\", workflows: &[";
-    for (std::size_t index = 0U; index < field.workflows.count; ++index) {
-     if (index != 0U) output_ << ", ";
-     output_ << "FeatureId::" << rust_identifier(mmltk::frameworks::reflection::enum_name(field.workflows.workflows[index]), true);
-    }
-    output_ << "], mode: FileDialogMode::" << rust_identifier(mmltk::frameworks::reflection::enum_name(dialog.mode), true) << " },\n";
-   });
+  Schema::VisitApplicationSettingsLeaves([&]<class Owner, class Declaration, class Member>(const mmltk::controller::browser::ApplicationSettingsLeafFact& field) {
+   if (!field.file_dialog) return;
+   const auto& dialog = *field.file_dialog;
+   output_ << "FileDialogFact { stable_field_id: " << field.stable_id << ", title: \"" << dialog.title << "\", filter: \"" << dialog.filter << "\", pattern: \"" << dialog.pattern
+           << "\", field_path: \"" << field.path << "\", workflows: &[";
+   for (std::size_t index = 0U; index < field.workflows.count; ++index) {
+    if (index != 0U) output_ << ", ";
+    output_ << "FeatureId::" << rust_identifier(mmltk::frameworks::reflection::enum_name(field.workflows.workflows[index]), true);
+   }
+   output_ << "], mode: FileDialogMode::" << rust_identifier(mmltk::frameworks::reflection::enum_name(dialog.mode), true) << " },\n";
+  });
   output_ << "];\n";
  }
  std::ostream& output_;
@@ -1789,8 +1766,8 @@ private:
 };
 }  // namespace
 int main(const int argument_count, char* const* const arguments) {
- if (argument_count != 4 || arguments[1] == nullptr || std::string_view(arguments[1]).empty() || arguments[2] == nullptr ||
-     std::string_view(arguments[2]).empty() || arguments[3] == nullptr || std::string_view(arguments[3]).empty())
+ if (argument_count != 4 || arguments[1] == nullptr || std::string_view(arguments[1]).empty() || arguments[2] == nullptr || std::string_view(arguments[2]).empty() || arguments[3] == nullptr ||
+     std::string_view(arguments[3]).empty())
   return EXIT_FAILURE;
  try {
   const std::filesystem::path graphics_destination(arguments[3]);

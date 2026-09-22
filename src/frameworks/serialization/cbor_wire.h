@@ -153,9 +153,7 @@ struct StructuralValidationScratch final {
 };
 // CBOR's argument encoding is shared by the reader, writer, and counter.  Keeping
 // it here makes all budget calculations use the same shortest-form rule.
-[[nodiscard]] constexpr std::size_t head_size(const std::uint64_t value) noexcept {
- return value < 24U ? 1U : value <= 0xffU ? 2U : value <= 0xffffU ? 3U : value <= 0xffffffffU ? 5U : 9U;
-}
+[[nodiscard]] constexpr std::size_t head_size(const std::uint64_t value) noexcept { return value < 24U ? 1U : value <= 0xffU ? 2U : value <= 0xffffU ? 3U : value <= 0xffffffffU ? 5U : 9U; }
 enum class CanonicalFloatWidth : std::uint8_t {
  Half = 2U,
  Single = 4U,
@@ -266,15 +264,13 @@ private:
 class CountingEncoder;
 class Writer {
 public:
- explicit Writer(ByteBuffer& destination, Limits limits, RawArrayItems raw_array = {}) noexcept
-     : dynamic_destination_(&destination), limits_(limits), raw_array_(raw_array) {}
+ explicit Writer(ByteBuffer& destination, Limits limits, RawArrayItems raw_array = {}) noexcept : dynamic_destination_(&destination), limits_(limits), raw_array_(raw_array) {}
  [[nodiscard]] std::expected<void, EncodeError> write(const Value& value);
  [[nodiscard]] std::expected<void, EncodeError> append_raw_item(ByteSegments item);
  [[nodiscard]] std::size_t bytes_written() const noexcept;
 
 private:
- explicit Writer(std::span<std::byte> destination, Limits limits, RawArrayItems raw_array = {}) noexcept
-     : fixed_destination_(destination), limits_(limits), raw_array_(raw_array) {}
+ explicit Writer(std::span<std::byte> destination, Limits limits, RawArrayItems raw_array = {}) noexcept : fixed_destination_(destination), limits_(limits), raw_array_(raw_array) {}
  explicit Writer(Limits limits, RawArrayItems raw_array) noexcept : limits_(limits), raw_array_(raw_array), count_only_(true) {}
  friend std::expected<std::size_t, EncodeError> encode(const Value&, std::span<std::byte>, Limits);
  friend class CountingEncoder;

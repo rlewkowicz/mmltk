@@ -16,7 +16,18 @@ namespace mmltk::backend::imaging::resample {  // Model-independent resampling.
 namespace {
 void warm_up_avir_rgb_resize_path() {
  std::array<std::uint8_t, 12> source{
-  0U, 16U, 32U, 48U, 64U, 80U, 96U, 112U, 128U, 144U, 160U, 176U,
+  0U,
+  16U,
+  32U,
+  48U,
+  64U,
+  80U,
+  96U,
+  112U,
+  128U,
+  144U,
+  160U,
+  176U,
  };
  std::array<std::uint8_t, 27> output{};
  avir::CImageResizer<> resizer{8};
@@ -29,11 +40,9 @@ struct RgbImageResizer::Impl {
  std::vector<std::uint8_t> byte_scratch;
  std::unique_ptr<perceptual::CpuDownscaler> perceptual;
 };
-ImageResizeGeometry compute_image_resize_geometry(const std::uint32_t source_width, const std::uint32_t source_height, const std::uint32_t target_width,
-                                                  const std::uint32_t target_height, const ImageResizeMode mode) {
- if (source_width == 0U || source_height == 0U || target_width == 0U || target_height == 0U) {
-  throw std::runtime_error("letterbox source and target dimensions must be positive");
- }
+ImageResizeGeometry compute_image_resize_geometry(
+ const std::uint32_t source_width, const std::uint32_t source_height, const std::uint32_t target_width, const std::uint32_t target_height, const ImageResizeMode mode) {
+ if (source_width == 0U || source_height == 0U || target_width == 0U || target_height == 0U) { throw std::runtime_error("letterbox source and target dimensions must be positive"); }
  if (mode == ImageResizeMode::Stretch) return {target_width, target_height, 0U, 0U};
  if (mode != ImageResizeMode::Letterbox) throw std::invalid_argument("invalid image resize mode");
  ImageResizeGeometry result;
@@ -57,9 +66,7 @@ ImageResizeGeometry compute_image_resize_geometry(const std::uint32_t source_wid
 namespace {
 [[nodiscard]] std::size_t checked_pixel_count(const std::uint32_t width, const std::uint32_t height) {
  if (width == 0U || height == 0U) { throw std::runtime_error("RGB conversion dimensions must be positive"); }
- if (static_cast<std::size_t>(height) > std::numeric_limits<std::size_t>::max() / static_cast<std::size_t>(width)) {
-  throw std::overflow_error("RGB conversion pixel count overflow");
- }
+ if (static_cast<std::size_t>(height) > std::numeric_limits<std::size_t>::max() / static_cast<std::size_t>(width)) { throw std::overflow_error("RGB conversion pixel count overflow"); }
  const std::size_t pixels = static_cast<std::size_t>(width) * height;
  if (pixels > std::numeric_limits<std::size_t>::max() / 3U) { throw std::overflow_error("RGB conversion plane size overflow"); }
  return pixels;
@@ -77,16 +84,19 @@ struct RgbShuffleMasks {
 };
 [[nodiscard]] const RgbShuffleMasks& rgb_shuffle_masks() {
  static const RgbShuffleMasks masks{
-  _mm_setr_epi8(0, 3, 6, 9, 12, 15, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1),  _mm_setr_epi8(-1, -1, -1, -1, -1, -1, 2, 5, 8, 11, 14, -1, -1, -1, -1, -1),
-  _mm_setr_epi8(-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 1, 4, 7, 10, 13), _mm_setr_epi8(1, 4, 7, 10, 13, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1),
-  _mm_setr_epi8(-1, -1, -1, -1, -1, 0, 3, 6, 9, 12, 15, -1, -1, -1, -1, -1),  _mm_setr_epi8(-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 2, 5, 8, 11, 14),
-  _mm_setr_epi8(2, 5, 8, 11, 14, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1), _mm_setr_epi8(-1, -1, -1, -1, -1, 1, 4, 7, 10, 13, -1, -1, -1, -1, -1, -1),
+  _mm_setr_epi8(0, 3, 6, 9, 12, 15, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1),
+  _mm_setr_epi8(-1, -1, -1, -1, -1, -1, 2, 5, 8, 11, 14, -1, -1, -1, -1, -1),
+  _mm_setr_epi8(-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 1, 4, 7, 10, 13),
+  _mm_setr_epi8(1, 4, 7, 10, 13, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1),
+  _mm_setr_epi8(-1, -1, -1, -1, -1, 0, 3, 6, 9, 12, 15, -1, -1, -1, -1, -1),
+  _mm_setr_epi8(-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 2, 5, 8, 11, 14),
+  _mm_setr_epi8(2, 5, 8, 11, 14, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1),
+  _mm_setr_epi8(-1, -1, -1, -1, -1, 1, 4, 7, 10, 13, -1, -1, -1, -1, -1, -1),
   _mm_setr_epi8(-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 0, 3, 6, 9, 12, 15),
  };
  return masks;
 }
-inline void convert_sixteen_rgb_pixels(const std::uint8_t* source, float* destination_r, float* destination_g, float* destination_b, const __m256 scale,
-                                       const RgbShuffleMasks& masks) {
+inline void convert_sixteen_rgb_pixels(const std::uint8_t* source, float* destination_r, float* destination_g, float* destination_b, const __m256 scale, const RgbShuffleMasks& masks) {
  const __m128i a = _mm_loadu_si128(reinterpret_cast<const __m128i*>(source));
  const __m128i b = _mm_loadu_si128(reinterpret_cast<const __m128i*>(source + 16));
  const __m128i c = _mm_loadu_si128(reinterpret_cast<const __m128i*>(source + 32));
@@ -100,8 +110,8 @@ inline void convert_sixteen_rgb_pixels(const std::uint8_t* source, float* destin
  _mm256_storeu_ps(destination_b, _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(blue)), scale));
  _mm256_storeu_ps(destination_b + 8, _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_srli_si128(blue, 8))), scale));
 }
-void clear_letterbox_padding(float* plane, const std::uint32_t destination_width, const std::uint32_t destination_height, const std::uint32_t source_width,
-                             const std::uint32_t source_height, const std::uint32_t offset_x, const std::uint32_t offset_y) {
+void clear_letterbox_padding(float* plane, const std::uint32_t destination_width, const std::uint32_t destination_height, const std::uint32_t source_width, const std::uint32_t source_height,
+ const std::uint32_t offset_x, const std::uint32_t offset_y) {
  const std::size_t top_pixels = static_cast<std::size_t>(offset_y) * destination_width;
  if (top_pixels != 0U) { std::fill_n(plane, top_pixels, 0.0F); }
  const std::uint32_t right = destination_width - offset_x - source_width;
@@ -120,8 +130,8 @@ void clear_letterbox_padding(float* plane, const std::uint32_t destination_width
 namespace {
 // Converts pixel_count packed RGB bytes into planar floats: sixteen pixels per SIMD step, then a
 // scalar tail. Pointers are taken by value so callers keep their own cursors.
-inline void convert_rgb_pixels_to_planar_f32(const std::uint8_t* source, float* destination_r, float* destination_g, float* destination_b,
-                                             const std::size_t pixel_count, const __m256 scale, const RgbShuffleMasks& masks) {
+inline void convert_rgb_pixels_to_planar_f32(
+ const std::uint8_t* source, float* destination_r, float* destination_g, float* destination_b, const std::size_t pixel_count, const __m256 scale, const RgbShuffleMasks& masks) {
  std::size_t pixel = 0U;
  for (; pixel + 15U < pixel_count; pixel += 16U) {
   convert_sixteen_rgb_pixels(source, destination_r, destination_g, destination_b, scale, masks);
@@ -145,12 +155,10 @@ void rgb_hwc_u8_to_nchw_f32(const std::uint8_t* source, float* destination, cons
  const RgbShuffleMasks& masks = rgb_shuffle_masks();
  convert_rgb_pixels_to_planar_f32(source, destination, destination + pixel_count, destination + pixel_count * 2U, pixel_count, scale, masks);
 }
-void letterboxed_rgb_hwc_u8_to_nchw_f32(const std::uint8_t* source, float* destination, const std::uint32_t source_width, const std::uint32_t source_height,
-                                        const std::uint32_t destination_width, const std::uint32_t destination_height, const std::uint32_t offset_x,
-                                        const std::uint32_t offset_y) {
+void letterboxed_rgb_hwc_u8_to_nchw_f32(const std::uint8_t* source, float* destination, const std::uint32_t source_width, const std::uint32_t source_height, const std::uint32_t destination_width,
+ const std::uint32_t destination_height, const std::uint32_t offset_x, const std::uint32_t offset_y) {
  if (source == nullptr || destination == nullptr) { throw std::runtime_error("letterboxed RGB conversion requires non-null buffers"); }
- if (source_width > destination_width || source_height > destination_height || offset_x > destination_width - source_width ||
-     offset_y > destination_height - source_height) {
+ if (source_width > destination_width || source_height > destination_height || offset_x > destination_width - source_width || offset_y > destination_height - source_height) {
   throw std::runtime_error("letterboxed RGB region is outside its destination");
  }
  const std::size_t destination_pixel_count = checked_pixel_count(destination_width, destination_height);
@@ -163,8 +171,8 @@ void letterboxed_rgb_hwc_u8_to_nchw_f32(const std::uint8_t* source, float* desti
  for (std::uint32_t row = 0U; row < source_height; ++row) {
   const std::uint8_t* source_row = source + static_cast<std::size_t>(row) * source_width * 3U;
   const std::size_t destination_row = static_cast<std::size_t>(offset_y + row) * destination_width + offset_x;
-  convert_rgb_pixels_to_planar_f32(source_row, destination + destination_row, destination + destination_pixel_count + destination_row,
-                                   destination + destination_pixel_count * 2U + destination_row, source_width, scale, masks);
+  convert_rgb_pixels_to_planar_f32(
+   source_row, destination + destination_row, destination + destination_pixel_count + destination_row, destination + destination_pixel_count * 2U + destination_row, source_width, scale, masks);
  }
 }
 ResizeWorkerPlan plan_rgb_resize_workers(int total_workers, bool any_resize, bool any_downscale) {
@@ -195,12 +203,8 @@ void RgbImageResizer::resize(const uint8_t* src, int src_width, int src_height, 
  if (impl_->perceptual_enabled && dst_width <= src_width && dst_height <= src_height) {
   const auto layout = [](int width, int height) {
    const auto row = common::math::checked_multiply<std::size_t>(width, 3, "perceptual image extent overflow");
-   return RgbImageLayout{static_cast<std::uint32_t>(width),
-                         static_cast<std::uint32_t>(height),
-                         row,
-                         0,
-                         common::math::checked_multiply(row, height, "perceptual image extent overflow"),
-                         RgbPixelFormat::RGB8};
+   return RgbImageLayout{
+    static_cast<std::uint32_t>(width), static_cast<std::uint32_t>(height), row, 0, common::math::checked_multiply(row, height, "perceptual image extent overflow"), RgbPixelFormat::RGB8};
   };
   downscale({src, layout(src_width, src_height)}, {dst, layout(dst_width, dst_height)});
   return;
@@ -234,8 +238,8 @@ ImageResizeGeometry RgbImageResizer::resize_to_planar(RgbConstImageView source, 
   if (!impl_->perceptual) impl_->perceptual = std::make_unique<perceptual::CpuDownscaler>();
   impl_->perceptual->run_quantized_planar(source, content);
   for (unsigned plane = 0; plane < 3; ++plane)
-   clear_letterbox_padding(pixels + plane * (output.plane_stride_bytes / sizeof(float)), output.width, output.height, geometry.resized_width,
-                           geometry.resized_height, geometry.offset_x, geometry.offset_y);
+   clear_letterbox_padding(
+    pixels + plane * (output.plane_stride_bytes / sizeof(float)), output.width, output.height, geometry.resized_width, geometry.resized_height, geometry.offset_x, geometry.offset_y);
   return geometry;
  }
  const auto* bytes = static_cast<const std::uint8_t*>(source.data);
@@ -248,8 +252,7 @@ ImageResizeGeometry RgbImageResizer::resize_to_planar(RgbConstImageView source, 
  if (geometry.resized_width == output.width && geometry.resized_height == output.height)
   rgb_hwc_u8_to_nchw_f32(bytes, pixels, output.width, output.height);
  else
-  letterboxed_rgb_hwc_u8_to_nchw_f32(bytes, pixels, geometry.resized_width, geometry.resized_height, output.width, output.height, geometry.offset_x,
-                                     geometry.offset_y);
+  letterboxed_rgb_hwc_u8_to_nchw_f32(bytes, pixels, geometry.resized_width, geometry.resized_height, output.width, output.height, geometry.offset_x, geometry.offset_y);
  return geometry;
 }
 void RgbImageResizer::downscale(RgbConstImageView source, RgbMutableImageView destination) {

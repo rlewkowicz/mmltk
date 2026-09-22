@@ -62,14 +62,12 @@ void project_spatial_members(T& value, const PointProjection projection) {
   if constexpr (std::ranges::range<T>) {
    for (auto& item : value) project_spatial_members(item, projection);
   } else {
-   mmltk::frameworks::reflection::visit_materialized_members<T>(
-    [&]<class Declaration>(const auto&) { project_spatial_members(value.*Declaration::pointer, projection); });
+   mmltk::frameworks::reflection::visit_materialized_members<T>([&]<class Declaration>(const auto&) { project_spatial_members(value.*Declaration::pointer, projection); });
   }
  }
 }
 }  // namespace
-contracts::AnnotationSceneContent materialize_visual_document(const VisualDocument& document, const VisualExtent extent, VisualRegion crop,
-                                                              VisualExtent target) {
+contracts::AnnotationSceneContent materialize_visual_document(const VisualDocument& document, const VisualExtent extent, VisualRegion crop, VisualExtent target) {
  if (!crop.valid()) crop = {.width = extent.width, .height = extent.height};
  if (!extent.valid() || crop.x > extent.width || crop.y > extent.height || crop.width > extent.width - crop.x || crop.height > extent.height - crop.y ||
      crop.width > std::numeric_limits<std::uint16_t>::max() || crop.height > std::numeric_limits<std::uint16_t>::max())
@@ -89,14 +87,12 @@ contracts::AnnotationSceneContent materialize_visual_document(const VisualDocume
   object.mask.runs.clear();
   if (index >= document.mask_bounds.size()) throw contracts::InvalidIntentError("Annotation mask bounds are unavailable");
   const auto& bounds = document.mask_bounds[index];
-  if (!std::ranges::all_of(bounds, [](float value) { return std::isfinite(value) && value >= 0 && value <= 1; }) || bounds[0] > bounds[2] ||
-      bounds[1] > bounds[3])
+  if (!std::ranges::all_of(bounds, [](float value) { return std::isfinite(value) && value >= 0 && value <= 1; }) || bounds[0] > bounds[2] || bounds[1] > bounds[3])
    throw contracts::InvalidIntentError("Annotation mask bounds are invalid");
   if (bounds[0] == bounds[2] || bounds[1] == bounds[3]) continue;
   if (!document.mask_contains) throw contracts::InvalidIntentError("Annotation mask support is unavailable");
   const auto coordinate = [](std::uint32_t pixel, std::uint32_t offset, std::uint32_t size, std::uint32_t output, std::uint32_t full) {
-   return (static_cast<float>(offset) + std::floor(static_cast<float>(pixel) * static_cast<float>(size) / static_cast<float>(output)) + 0.5F) /
-          static_cast<float>(full);
+   return (static_cast<float>(offset) + std::floor(static_cast<float>(pixel) * static_cast<float>(size) / static_cast<float>(output)) + 0.5F) / static_cast<float>(full);
   };
   // Binary search the actual nearest-sampling coordinates. This includes
   // ties at closed support edges and avoids inverse-rounding omissions.
@@ -130,12 +126,11 @@ contracts::AnnotationSceneContent materialize_visual_document(const VisualDocume
  if (!scene.valid()) throw contracts::InvalidIntentError("Annotation import exceeds the document geometry or catalog capacity");
  return scene;
 }
-std::shared_ptr<const VisualDocument> scale_visual_document(const std::shared_ptr<const VisualDocument>& source, const VisualExtent source_extent,
-                                                            const VisualExtent target_extent) {
+std::shared_ptr<const VisualDocument> scale_visual_document(const std::shared_ptr<const VisualDocument>& source, const VisualExtent source_extent, const VisualExtent target_extent) {
  if (!source || !source_extent.valid() || !target_extent.valid()) throw contracts::InvalidIntentError("Visual document scale is invalid");
  auto target = std::make_shared<VisualDocument>(*source);
- project_spatial_members(target->scene.objects, {.scale_x = static_cast<float>(target_extent.width) / static_cast<float>(source_extent.width),
-                                                 .scale_y = static_cast<float>(target_extent.height) / static_cast<float>(source_extent.height)});
+ project_spatial_members(target->scene.objects,
+  {.scale_x = static_cast<float>(target_extent.width) / static_cast<float>(source_extent.width), .scale_y = static_cast<float>(target_extent.height) / static_cast<float>(source_extent.height)});
  // The scene is a lightweight semantic projection until import chooses a
  // checked editable extent. Its normalized mask predicate remains valid.
  target->scene.frame_ready = false;

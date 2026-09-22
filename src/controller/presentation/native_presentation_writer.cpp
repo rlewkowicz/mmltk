@@ -196,20 +196,16 @@ struct AdmittedSource final {
     context.Bind();
    } catch (...) { std::terminate(); }
   }
-  Cleanup(VisualDiagnosticOperation::PresentationSourceProbeDeviceReleaseStarted, VisualDiagnosticOperation::PresentationSourceProbeDeviceReleaseCompleted,
-          [&] { pixel_device.reset(); });
-  Cleanup(VisualDiagnosticOperation::PresentationSourceProbeHostReleaseStarted, VisualDiagnosticOperation::PresentationSourceProbeHostReleaseCompleted,
-          [&] { pixels.reset(); });
+  Cleanup(VisualDiagnosticOperation::PresentationSourceProbeDeviceReleaseStarted, VisualDiagnosticOperation::PresentationSourceProbeDeviceReleaseCompleted, [&] { pixel_device.reset(); });
+  Cleanup(VisualDiagnosticOperation::PresentationSourceProbeHostReleaseStarted, VisualDiagnosticOperation::PresentationSourceProbeHostReleaseCompleted, [&] { pixels.reset(); });
   release_span.reset();
   transfer.reset();
-  Cleanup(VisualDiagnosticOperation::PresentationSourceStreamDestructionStarted, VisualDiagnosticOperation::PresentationSourceStreamDestructionCompleted,
-          [&] { auto owned = std::move(stream); });
+  Cleanup(VisualDiagnosticOperation::PresentationSourceStreamDestructionStarted, VisualDiagnosticOperation::PresentationSourceStreamDestructionCompleted, [&] { auto owned = std::move(stream); });
   Cleanup(VisualDiagnosticOperation::PresentationSourceSignalReleaseStarted, VisualDiagnosticOperation::PresentationSourceSignalReleaseCompleted, [&] {
    signal = {};
    edge.reset();
   });
-  Cleanup(VisualDiagnosticOperation::PresentationSourceTimelineDestructionStarted, VisualDiagnosticOperation::PresentationSourceTimelineDestructionCompleted,
-          [&] { timeline.reset(); });
+  Cleanup(VisualDiagnosticOperation::PresentationSourceTimelineDestructionStarted, VisualDiagnosticOperation::PresentationSourceTimelineDestructionCompleted, [&] { timeline.reset(); });
  }
  [[nodiscard]] std::optional<std::exception_ptr> ReleaseWorkspace(std::optional<gpu::ImageStreamSettlement> completed = {}) {
   if (!workspace_release_started) {
@@ -220,18 +216,15 @@ struct AdmittedSource final {
    }
    retirement_failure = gpu::combine_image_failures(retirement_failure, settled.failure);
    if (timeline && timeline->Release() != cudaSuccess)
-    retirement_failure =
-     gpu::combine_image_failures(retirement_failure, std::make_exception_ptr(std::runtime_error("native source timeline retirement failed")));
+    retirement_failure = gpu::combine_image_failures(retirement_failure, std::make_exception_ptr(std::runtime_error("native source timeline retirement failed")));
    workspace_release_started = true;
    workspace_retirement.SetWake(workspace_release_wake);
    workspace_release_span.emplace(diagnostics, [&] {
-    return visual_diagnostic_boundary(
-     VisualDiagnosticFact{
-      .system = contracts::DiagnosticOwner::Presentation,
-      .operation = VisualDiagnosticOperation::PresentationSourceWorkspaceReleaseStarted,
-      .device = context.device(),
-      .generation = generation,
-      .context = {.surface_high = description.id_high, .surface_low = description.id_low, .workspace = native::workspace_source_diagnostic(description)}},
+    return visual_diagnostic_boundary(VisualDiagnosticFact{.system = contracts::DiagnosticOwner::Presentation,
+                                       .operation = VisualDiagnosticOperation::PresentationSourceWorkspaceReleaseStarted,
+                                       .device = context.device(),
+                                       .generation = generation,
+                                       .context = {.surface_high = description.id_high, .surface_low = description.id_low, .workspace = native::workspace_source_diagnostic(description)}},
      VisualDiagnosticOperation::PresentationSourceWorkspaceReleaseCompleted);
    });
    workspace.reset();
@@ -288,13 +281,11 @@ private:
  template <class Release>
  void Cleanup(VisualDiagnosticOperation started, VisualDiagnosticOperation completed, Release&& release) noexcept {
   services::RuntimeDiagnosticSpan span(diagnostics, [&] {
-   return visual_diagnostic_boundary(
-    VisualDiagnosticFact{
-     .system = contracts::DiagnosticOwner::Presentation,
-     .operation = started,
-     .device = context.device(),
-     .generation = generation,
-     .context = {.surface_high = description.id_high, .surface_low = description.id_low, .workspace = native::workspace_source_diagnostic(description)}},
+   return visual_diagnostic_boundary(VisualDiagnosticFact{.system = contracts::DiagnosticOwner::Presentation,
+                                      .operation = started,
+                                      .device = context.device(),
+                                      .generation = generation,
+                                      .context = {.surface_high = description.id_high, .surface_low = description.id_low, .workspace = native::workspace_source_diagnostic(description)}},
     completed);
   });
   std::forward<Release>(release)();
@@ -303,13 +294,10 @@ private:
 };
 class NativePresentationWriter final : public PresentationNativeWriter {
 public:
- NativePresentationWriter(VisualDeviceSettings settings, PresentationNativeConfiguration configuration, VisualDiagnosticSink diagnostics,
-                          gpu::DeviceExecution execution)
+ NativePresentationWriter(VisualDeviceSettings settings, PresentationNativeConfiguration configuration, VisualDiagnosticSink diagnostics, gpu::DeviceExecution execution)
      : NativePresentationWriter(
-        settings, std::move(configuration), diagnostics,
-        gpu::DeviceContext(settings.device, gpu::cuda_image_copy_backend(), gpu::DeviceContextMode::Isolated, settings.numa_node, execution)) {}
- NativePresentationWriter(VisualDeviceSettings settings, PresentationNativeConfiguration configuration, VisualDiagnosticSink diagnostics,
-                          gpu::DeviceContext context)
+        settings, std::move(configuration), diagnostics, gpu::DeviceContext(settings.device, gpu::cuda_image_copy_backend(), gpu::DeviceContextMode::Isolated, settings.numa_node, execution)) {}
+ NativePresentationWriter(VisualDeviceSettings settings, PresentationNativeConfiguration configuration, VisualDiagnosticSink diagnostics, gpu::DeviceContext context)
      : settings_(settings),
        configuration_(std::move(configuration)),
        diagnostics_(diagnostics),
@@ -337,8 +325,7 @@ public:
  void Submit(PresentationSubmittedSource submitted, const VisualSourceReader& reader) override {
   if (!submitted.valid() || reader.source != submitted.observation.frame.source || !reader.observe_workspace || !reader.request_workspace || pending_)
    throw std::invalid_argument("direct workspace submission is invalid");
-  pending_ =
-   Pending{.submitted = submitted, .reader = &reader, .link = diagnostics_.valid() ? services::DiagnosticSpanIds::Next() : contracts::DiagnosticLink{}};
+  pending_ = Pending{.submitted = submitted, .reader = &reader, .link = diagnostics_.valid() ? services::DiagnosticSpanIds::Next() : contracts::DiagnosticLink{}};
   if (reader.image_metadata) {
    auto metadata = reader.image_metadata(submitted.observation.frame);
    if (metadata) pending_->metadata = std::move(*metadata);
@@ -348,8 +335,7 @@ public:
   {
    services::RuntimeDiagnosticSpan channel_span(diagnostics_, [&] {
     return visual_diagnostic_boundary(
-     VisualDiagnosticFact{
-      .system = contracts::DiagnosticOwner::Presentation, .operation = VisualDiagnosticOperation::PresentationChannelPumpStarted, .device = settings_.device},
+     VisualDiagnosticFact{.system = contracts::DiagnosticOwner::Presentation, .operation = VisualDiagnosticOperation::PresentationChannelPumpStarted, .device = settings_.device},
      VisualDiagnosticOperation::PresentationChannelPumpCompleted);
    });
    channel_.pump();
@@ -373,8 +359,7 @@ public:
   RetireSources();
   PresentationNativeOutcome result;
   if (transfer_ && stage_ == Stage::ReadyComplete) result = Publish();
-  if (!transfer_ && result.progress != PresentationNativeProgress::Published &&
-      ((active_ && active_->binding_retired) || (candidate_ && candidate_->binding_retired))) {
+  if (!transfer_ && result.progress != PresentationNativeProgress::Published && ((active_ && active_->binding_retired) || (candidate_ && candidate_->binding_retired))) {
    result.capability = Capability();
    if (pending_ && pending_->destination && pending_->destination->preparing->load(std::memory_order_acquire)) return result;
    const std::ptrdiff_t needed = int(active_ && active_->binding_retired) + int(candidate_ && candidate_->binding_retired);
@@ -427,8 +412,7 @@ public:
  }
  void TerminalCustodyInstalled() noexcept override {
   for (const auto& source : sources_)
-   if (source->transfer && source->workspace->Acquired(source->transfer->physical_revision))
-    Diagnose(VisualDiagnosticOperation::PresentationTerminalReadRetained, *source->transfer, 1U);
+   if (source->transfer && source->workspace->Acquired(source->transfer->physical_revision)) Diagnose(VisualDiagnosticOperation::PresentationTerminalReadRetained, *source->transfer, 1U);
  }
 
 private:
@@ -473,23 +457,20 @@ private:
    const auto status = source->transfer ? cudaStreamQuery(reinterpret_cast<cudaStream_t>(source->stream.native_handle())) : cudaSuccess;
    if (status != cudaSuccess && status != cudaErrorNotReady) return Retirement::UnsafeFailure;
    if (source->completion.ready.load(std::memory_order_acquire) && source->completion.status != cudaSuccess) return Retirement::UnsafeFailure;
-   if ((acquired && !source->release_submitted && !terminal_complete) ||
-       (acquired && source->release_submitted && status == cudaErrorNotReady && !terminal_complete)) {
+   if ((acquired && !source->release_submitted && !terminal_complete) || (acquired && source->release_submitted && status == cudaErrorNotReady && !terminal_complete)) {
     if (!browser_terminal) return Retirement::UnsafeFailure;
     result = Retirement::RetainedBrowserRead;
     continue;
    }
    const auto settled = source->stream.Settle();
-   if (!settled.completion_reached || settled.failure || (source->completion.ready.load(std::memory_order_acquire) && source->completion.status != cudaSuccess))
-    return Retirement::UnsafeFailure;
+   if (!settled.completion_reached || settled.failure || (source->completion.ready.load(std::memory_order_acquire) && source->completion.status != cudaSuccess)) return Retirement::UnsafeFailure;
    if (acquired && !source->release_complete && (source->release_submitted || terminal_complete)) {
     try {
      source->workspace->CompleteRead(source->transfer->physical_revision);
      source->release_complete = true;
     } catch (...) { return Retirement::UnsafeFailure; }
    }
-   if (browser_terminal && source->transfer && source->release_complete)
-    Diagnose(VisualDiagnosticOperation::PresentationTerminalReadCompleted, *source->transfer, 1U);
+   if (browser_terminal && source->transfer && source->release_complete) Diagnose(VisualDiagnosticOperation::PresentationTerminalReadCompleted, *source->transfer, 1U);
    source->workspace->CancelDisplayWrite();
    source->transfer.reset();
    source->exposed = source->acquired = source->release_submitted = source->release_complete = false;
@@ -517,8 +498,7 @@ private:
    if (!source->transfer) continue;
    auto& transfer = *source->transfer;
    if (configuration_.completion_acceptance && source->completion.ready.load(std::memory_order_acquire) &&
-       configuration_.completion_acceptance->Hold(
-        {source->description.id_high, source->description.id_low, transfer.publication.transfer_sequence, transfer.publication.presentation_revision}))
+       configuration_.completion_acceptance->Hold({source->description.id_high, source->description.id_low, transfer.publication.transfer_sequence, transfer.publication.presentation_revision}))
     continue;
    if (source->completion.ready.exchange(false, std::memory_order_acq_rel)) {
     if (source->completion.status != cudaSuccess) throw std::runtime_error("presentation asynchronous source release failed");
@@ -528,8 +508,7 @@ private:
    }
    if (!source->release_complete) continue;
    const auto& frame = transfer.pending.submitted.observation.frame;
-   if (!channel_.read_settled(source->id(), {presentation_source_session(frame.source.kind), frame.revision}, transfer.publication.presentation_revision,
-                              transfer.publication.transfer_sequence))
+   if (!channel_.read_settled(source->id(), {presentation_source_session(frame.source.kind), frame.revision}, transfer.publication.presentation_revision, transfer.publication.transfer_sequence))
     continue;
    if (source->release_span) source->release_span->FinishWith([](auto& fact) { fact.context.outcome = 1U; });
    source->release_span.reset();
@@ -539,18 +518,16 @@ private:
  }
  static PresentationCapability CapabilityOf(const SampleArena& arena) noexcept {
   return {.surface_high = arena.id.high,
-          .surface_low = arena.id.low,
-          .extent = arena.extent,
-          .generation = arena.generation,
-          .condition = arena.ready ? PresentationCapabilityCondition::Ready : PresentationCapabilityCondition::Admitted};
+   .surface_low = arena.id.low,
+   .extent = arena.extent,
+   .generation = arena.generation,
+   .condition = arena.ready ? PresentationCapabilityCondition::Ready : PresentationCapabilityCondition::Admitted};
  }
  PresentationCapability Capability() const noexcept {
   const auto* arena = candidate_ ? candidate_.get() : active_.get();
   return arena && channel_.claimable(arena->id) ? CapabilityOf(*arena) : PresentationCapability{};
  }
- static bool Contains(const SampleArena& arena, VisualExtent extent) noexcept {
-  return arena.extent.width >= extent.width && arena.extent.height >= extent.height;
- }
+ static bool Contains(const SampleArena& arena, VisualExtent extent) noexcept { return arena.extent.width >= extent.width && arena.extent.height >= extent.height; }
  void RetireArena(std::unique_ptr<SampleArena>& arena, VisualDiagnosticOperation operation) {
   const auto slot = std::ranges::find_if(retiring_, [](const auto& value) { return !value; });
   if (slot == retiring_.end()) throw std::runtime_error("Firefox arena retirement capacity exceeded");
@@ -565,8 +542,7 @@ private:
   if (candidate_) {
    if (Contains(*candidate_, extent)) return candidate_.get();
    if (configuration_.completion_acceptance && configuration_.completion_acceptance->SupersessionHeld()) return nullptr;
-   if (candidate_->ready && std::ranges::any_of(retiring_, [](const auto& arena) { return !arena; }))
-    RetireArena(candidate_, VisualDiagnosticOperation::PresentationCandidateWithdrawal);
+   if (candidate_->ready && std::ranges::any_of(retiring_, [](const auto& arena) { return !arena; })) RetireArena(candidate_, VisualDiagnosticOperation::PresentationCandidateWithdrawal);
    return nullptr;
   }
   if (active_ && Contains(*active_, extent)) return active_.get();
@@ -581,16 +557,14 @@ private:
   arena->id = native::WorkspaceSurfaceImportId::generate();
   arena->generation = mmltk::common::types::take_monotonic_identity(next_generation_);
   arena->submitted = pending_->submitted;
-  arena->extent = {active_ ? std::max(active_->extent.width, extent.width) : extent.width,
-                   active_ ? std::max(active_->extent.height, extent.height) : extent.height};
+  arena->extent = {active_ ? std::max(active_->extent.width, extent.width) : extent.width, active_ ? std::max(active_->extent.height, extent.height) : extent.height};
   if (pending_supersession_acceptance_ && active_ && pending_->submitted.observation.frame.source.kind == PresentationSourceKind::Upscale) {
    pending_supersession_acceptance_ = false;
    arena->extent = active_->extent;
    if (configuration_.completion_acceptance) configuration_.completion_acceptance->HoldSupersession(arena->id.high, arena->id.low);
   }
   DiagnoseArena(VisualDiagnosticOperation::PresentationArenaAdvertised, *arena, 1U);
-  if (!channel_.admit_arena(arena->id, arena->generation, arena->extent.width, arena->extent.height, arena->submitted.selection_generation,
-                            arena->submitted.observation.frame.revision))
+  if (!channel_.admit_arena(arena->id, arena->generation, arena->extent.width, arena->extent.height, arena->submitted.selection_generation, arena->submitted.observation.frame.revision))
    return nullptr;
   candidate_ = std::move(arena);
   return candidate_.get();
@@ -599,15 +573,15 @@ private:
   if (!arena.context) throw std::runtime_error("Firefox workspace device is unresolved");
   const auto& packet = arena.layout;
   gpu::ImageWorkspaceLayout layout{.device_incarnation = packet.device_incarnation,
-                                   .device = arena.context->device(),
-                                   .width = packet.width,
-                                   .height = packet.height,
-                                   .pitch_bytes = packet.stride,
-                                   .offset_bytes = packet.offset,
-                                   .required_allocation_bytes = std::max<std::uint64_t>(packet.size, configuration_.minimum_allocation_bytes),
-                                   .alignment_bytes = packet.alignment,
-                                   .dedicated = packet.dedicated != 0U,
-                                   .direct_sampling = packet.direct_sampling != 0U};
+   .device = arena.context->device(),
+   .width = packet.width,
+   .height = packet.height,
+   .pitch_bytes = packet.stride,
+   .offset_bytes = packet.offset,
+   .required_allocation_bytes = std::max<std::uint64_t>(packet.size, configuration_.minimum_allocation_bytes),
+   .alignment_bytes = packet.alignment,
+   .dedicated = packet.dedicated != 0U,
+   .direct_sampling = packet.direct_sampling != 0U};
   std::ranges::copy(packet.device_uuid, layout.device_uuid.begin());
   if (!layout.valid()) throw std::runtime_error("Firefox returned an invalid workspace layout");
   return layout;
@@ -615,13 +589,13 @@ private:
  void Request(const VisualSourceReader& reader, const gpu::ImageWorkspaceObservation& observed, AdmittedSource& source, bool detach_only = false) {
   source.preparing->store(true, std::memory_order_release);
   VisualWorkspaceRequest request{.product_owner = observed.product_owner,
-                                 .product_revision = observed.product_revision,
-                                 .detach_only = detach_only,
-                                 .destination = source.workspace,
-                                 .ready = [completion = source.preparing, weak = std::weak_ptr{wake_}] {
-                                  completion->store(false, std::memory_order_release);
-                                  if (const auto wake = weak.lock()) static_cast<void>(mmltk::common::io::signal_event_fd(wake->get()));
-                                 }};
+   .product_revision = observed.product_revision,
+   .detach_only = detach_only,
+   .destination = source.workspace,
+   .ready = [completion = source.preparing, weak = std::weak_ptr{wake_}] {
+    completion->store(false, std::memory_order_release);
+    if (const auto wake = weak.lock()) static_cast<void>(mmltk::common::io::signal_event_fd(wake->get()));
+   }};
   try {
    reader.request_workspace(std::move(request));
   } catch (...) {
@@ -637,8 +611,7 @@ private:
     if (candidate_->binding_retired) return;
     throw std::runtime_error("Firefox arena admission failed");
    }
-   if (outcome.layout.opcode != abi::Opcode::ArenaReady || outcome.layout.width != candidate_->extent.width ||
-       outcome.layout.height != candidate_->extent.height)
+   if (outcome.layout.opcode != abi::Opcode::ArenaReady || outcome.layout.width != candidate_->extent.width || outcome.layout.height != candidate_->extent.height)
     throw std::runtime_error("Firefox arena layout identity mismatch");
    candidate_->layout = outcome.layout;
    // Browser display selection and each producer's compute selection
@@ -653,9 +626,7 @@ private:
   for (auto& source : sources_) {
    if (source->id() != outcome.id) continue;
    if (!outcome.imported) {
-    if (source->withdrawing || (active_ && active_->id == source->arena() && active_->binding_retired) ||
-        (candidate_ && candidate_->id == source->arena() && candidate_->binding_retired))
-     return;
+    if (source->withdrawing || (active_ && active_->id == source->arena() && active_->binding_retired) || (candidate_ && candidate_->id == source->arena() && candidate_->binding_retired)) return;
     throw std::runtime_error("Firefox source admission failed");
    }
    if (source->withdrawing) return;
@@ -678,9 +649,7 @@ private:
  void Withdraw(AdmittedSource& source) {
   if (source.withdrawing) return;
   source.workspace->Withdraw();
-  if (source.acquired || source.release_submitted || (transfer_ && transfer_->source == &source) ||
-      (source.transfer && source.workspace->Acquired(source.transfer->physical_revision)))
-   return;
+  if (source.acquired || source.release_submitted || (transfer_ && transfer_->source == &source) || (source.transfer && source.workspace->Acquired(source.transfer->physical_revision))) return;
   const auto withdrawal = channel_.withdraw(source.id());
   if (withdrawal.progress == native::WorkspaceSurfaceWithdrawalProgress::Invalid || withdrawal.progress == native::WorkspaceSurfaceWithdrawalProgress::Capacity)
    throw std::runtime_error("Firefox source withdrawal failed");
@@ -689,9 +658,7 @@ private:
  }
  void RetireSources() {
   for (auto& source : sources_)
-   if (source->workspace &&
-       (source->workspace->retired() || std::ranges::any_of(retiring_, [&](const auto& arena) { return arena && source->arena() == arena->id; })))
-    Withdraw(*source);
+   if (source->workspace && (source->workspace->retired() || std::ranges::any_of(retiring_, [&](const auto& arena) { return arena && source->arena() == arena->id; }))) Withdraw(*source);
  }
  std::exception_ptr FinishSourceRetirements(bool propagate = true) {
   std::exception_ptr failure;
@@ -716,11 +683,9 @@ private:
   return {.progress = PresentationNativeProgress::Superseded, .submitted = submitted};
  }
  PresentationNativeOutcome Prepare(std::uint64_t selection) {
-  const auto wait = [&](std::string_view reason, const SampleArena* arena = nullptr, const gpu::ImageWorkspaceObservation* observed = nullptr,
-                        const AdmittedSource* source = nullptr) {
+  const auto wait = [&](std::string_view reason, const SampleArena* arena = nullptr, const gpu::ImageWorkspaceObservation* observed = nullptr, const AdmittedSource* source = nullptr) {
    diagnostics_.Emit([&] {
-    auto fact = presentation_diagnostic_fact(
-     VisualDiagnosticOperation::PresentationWorkspaceWait,
+    auto fact = presentation_diagnostic_fact(VisualDiagnosticOperation::PresentationWorkspaceWait,
      {.submitted = pending_->submitted, .publication = {.capability = arena ? CapabilityOf(*arena) : PresentationCapability{}}}, settings_.device);
     fact.failure_detail = reason;
     auto& progress = fact.context.workspace_progress;
@@ -760,8 +725,7 @@ private:
   };
   if (!channel_.connected()) return wait("peer_unavailable");
   if (pending_->reader->image_metadata && pending_->metadata.empty()) return Supersede();
-  if (pending_->destination && pending_->destination->preparing->load(std::memory_order_acquire))
-   return wait("producer_finalization_pending", nullptr, nullptr, pending_->destination);
+  if (pending_->destination && pending_->destination->preparing->load(std::memory_order_acquire)) return wait("producer_finalization_pending", nullptr, nullptr, pending_->destination);
   if (pending_->submitted.selection_generation != selection) {
    if (pending_->destination) pending_->destination->workspace->CancelDisplayWrite();
    return Supersede();
@@ -785,8 +749,7 @@ private:
     }
    }
    for (auto& source : sources_)
-    if (!admitted && !source->withdrawing && source->arena() == arena->id && !source->exposed && !source->transfer &&
-        !source->preparing->load(std::memory_order_acquire)) {
+    if (!admitted && !source->withdrawing && source->arena() == arena->id && !source->exposed && !source->transfer && !source->preparing->load(std::memory_order_acquire)) {
      admitted = source.get();
      break;
     }
@@ -811,8 +774,7 @@ private:
     if (source->edge.get() < 0) throw std::runtime_error("native source eventfd creation failed");
     source->signal = native::WorkspaceSurfaceFrameSignal::create();
     auto access = source->workspace->ExportAccessDescriptor();
-    if (!channel_.admit_source(source->description, source->generation, source->edge.get(), source->signal.descriptor(), access.get(),
-                               pending_->submitted.selection_generation, frame.revision))
+    if (!channel_.admit_source(source->description, source->generation, source->edge.get(), source->signal.descriptor(), access.get(), pending_->submitted.selection_generation, frame.revision))
      return wait("source_admission_backpressure", arena, &observed);
     admitted = source.get();
     sources_.push_back(std::move(source));
@@ -832,9 +794,8 @@ private:
   services::RuntimeDiagnosticSpan borrow_span(
    diagnostics_,
    [&] {
-    auto fact = presentation_diagnostic_fact(VisualDiagnosticOperation::PresentationSourceBorrowStarted,
-                                             {.submitted = pending_->submitted, .publication = {.capability = CapabilityOf(*arena)}, .link = pending_->link},
-                                             settings_.device);
+    auto fact = presentation_diagnostic_fact(
+     VisualDiagnosticOperation::PresentationSourceBorrowStarted, {.submitted = pending_->submitted, .publication = {.capability = CapabilityOf(*arena)}, .link = pending_->link}, settings_.device);
     fact.context.workspace = native::workspace_source_diagnostic(admitted->description);
     return visual_diagnostic_boundary(fact, VisualDiagnosticOperation::PresentationSourceBorrowCompleted);
    },
@@ -861,13 +822,13 @@ private:
    borrow_span.FinishWith([](auto& fact) { fact.context.outcome = 1U; });
    const auto transfer = mmltk::common::types::take_monotonic_identity(admitted->next_transfer);
    transfer_.emplace(Transfer{.source = admitted,
-                              .pending = std::move(*pending_),
-                              .publication = {.capability = CapabilityOf(*arena),
-                                              .timeline_ready = native::detail::workspace_timeline_ready(transfer),
-                                              .presentation_revision = mmltk::common::types::take_monotonic_identity(next_publication_),
-                                              .transfer_sequence = transfer},
-                              .plane = admitted->workspace->plane(frame.extent.width, frame.extent.height),
-                              .physical_revision = admitted->workspace->revision()});
+    .pending = std::move(*pending_),
+    .publication = {.capability = CapabilityOf(*arena),
+     .timeline_ready = native::detail::workspace_timeline_ready(transfer),
+     .presentation_revision = mmltk::common::types::take_monotonic_identity(next_publication_),
+     .transfer_sequence = transfer},
+    .plane = admitted->workspace->plane(frame.extent.width, frame.extent.height),
+    .physical_revision = admitted->workspace->revision()});
    diagnostics_.Emit([&] {
     auto fact = Fact(VisualDiagnosticOperation::PresentationSourceReadSubmitted, *transfer_, 0U);
     fact.value = 0U;
@@ -877,11 +838,7 @@ private:
    });
    SamplePixels(*transfer_, admitted->stream);
    ready_span_.emplace(
-    diagnostics_,
-    [&] {
-     return visual_diagnostic_boundary(Fact(VisualDiagnosticOperation::PresentationReadySyncStarted, *transfer_, 0U),
-                                       VisualDiagnosticOperation::PresentationReadySyncCompleted);
-    },
+    diagnostics_, [&] { return visual_diagnostic_boundary(Fact(VisualDiagnosticOperation::PresentationReadySyncStarted, *transfer_, 0U), VisualDiagnosticOperation::PresentationReadySyncCompleted); },
     transfer_->pending.link);
    admitted->timeline->SignalReady(reinterpret_cast<cudaStream_t>(admitted->stream.native_handle()), transfer_->publication.timeline_ready);
    stage_ = Stage::ReadyPending;
@@ -904,10 +861,9 @@ private:
   // A completed offer consumes no external read. Acquisition owns the
   // read; only its submitted Vulkan release can arm native completion.
   static_cast<void>(channel_.take_capacity_wake());
-  native::detail::publish_workspace_frame_signal(source.signal.mapping(), transfer.publication.timeline_ready, transfer.publication.transfer_sequence,
-                                                 native::WorkspacePresentationLayer::Primary, {presentation_source_session(frame.source.kind), frame.revision},
-                                                 transfer.publication.presentation_revision, frame.extent.width, frame.extent.height,
-                                                 transfer.physical_revision, transfer.pending.metadata);
+  native::detail::publish_workspace_frame_signal(source.signal.mapping(), transfer.publication.timeline_ready, transfer.publication.transfer_sequence, native::WorkspacePresentationLayer::Primary,
+   {presentation_source_session(frame.source.kind), frame.revision}, transfer.publication.presentation_revision, frame.extent.width, frame.extent.height, transfer.physical_revision,
+   transfer.pending.metadata);
   source.workspace->CancelWrite();
   source.exposed = true;
   if (!mmltk::common::io::signal_event_fd(source.edge.get())) throw std::runtime_error("native source frame publication failed");
@@ -918,10 +874,8 @@ private:
    active_ = std::move(candidate_);
    DiagnoseArena(VisualDiagnosticOperation::PresentationReplacement, *active_, 1U);
   }
-  PresentationNativeOutcome outcome{.progress = PresentationNativeProgress::Published,
-                                    .submitted = transfer.pending.submitted,
-                                    .publication = transfer.publication,
-                                    .diagnostic_link = transfer.pending.link};
+  PresentationNativeOutcome outcome{
+   .progress = PresentationNativeProgress::Published, .submitted = transfer.pending.submitted, .publication = transfer.publication, .diagnostic_link = transfer.pending.link};
   return outcome;
  }
  void ObserveSourceTransition(const abi::Record& record) {
@@ -931,16 +885,14 @@ private:
     if (arena && arena->id == id) arena->binding_retired = true;
    return;
   }
-  const auto found = std::ranges::find_if(
-   sources_, [&](const auto& source) { return source->description.id_high == record.id_high && source->description.id_low == record.id_low; });
+  const auto found = std::ranges::find_if(sources_, [&](const auto& source) { return source->description.id_high == record.id_high && source->description.id_low == record.id_low; });
   if (found == sources_.end()) throw std::runtime_error("workspace acquisition source is unavailable");
   auto& source = **found;
   if (!source.transfer || source.release_submitted) throw std::runtime_error("workspace source transition is duplicate or unavailable");
   auto& transfer = *source.transfer;
   const auto& frame = transfer.pending.submitted.observation.frame;
   if (record.offset != transfer.publication.transfer_sequence || record.presentation_revision != transfer.publication.presentation_revision ||
-      record.stride != presentation_source_session(frame.source.kind) || record.size != frame.revision ||
-      !source.workspace->Acquired(transfer.physical_revision))
+      record.stride != presentation_source_session(frame.source.kind) || record.size != frame.revision || !source.workspace->Acquired(transfer.physical_revision))
    throw std::runtime_error("workspace acquisition does not own the exact completed publication");
   if (record.opcode == abi::Opcode::Acquired) {
    if (source.acquired) throw std::runtime_error("workspace acquisition is duplicate");
@@ -949,11 +901,7 @@ private:
   }
   if (record.opcode != abi::Opcode::ReleaseSubmitted || !source.acquired) throw std::runtime_error("workspace release submission has no acquisition");
   source.release_span.emplace(
-   diagnostics_,
-   [&] {
-    return visual_diagnostic_boundary(Fact(VisualDiagnosticOperation::PresentationReleaseWaitStarted, transfer, 0U),
-                                      VisualDiagnosticOperation::PresentationReleaseWaitCompleted);
-   },
+   diagnostics_, [&] { return visual_diagnostic_boundary(Fact(VisualDiagnosticOperation::PresentationReleaseWaitStarted, transfer, 0U), VisualDiagnosticOperation::PresentationReleaseWaitCompleted); },
    transfer.pending.link);
   source.context.Bind();
   source.timeline->WaitForRelease(reinterpret_cast<cudaStream_t>(source.stream.native_handle()), transfer.publication.timeline_ready + 1U);
@@ -985,17 +933,13 @@ private:
    }
    source.pixel_coordinates = coordinates;
    services::RuntimeDiagnosticSpan probe_span(
-    diagnostics_,
-    [&] {
-     return visual_diagnostic_boundary(Fact(VisualDiagnosticOperation::PresentationPixelProbeStarted, transfer, 0U),
-                                       VisualDiagnosticOperation::PresentationPixelProbeSubmitted);
-    },
+    diagnostics_, [&] { return visual_diagnostic_boundary(Fact(VisualDiagnosticOperation::PresentationPixelProbeStarted, transfer, 0U), VisualDiagnosticOperation::PresentationPixelProbeSubmitted); },
     transfer.pending.link);
-   if (mmltk::backend::imaging::raster::probe_rgba({reinterpret_cast<const std::uint8_t*>(plane.data), plane.descriptor.pitch_bytes,
-                                                    static_cast<int>(plane.descriptor.width), static_cast<int>(plane.descriptor.height)},
-                                                   source.pixel_device.get(), coordinates, stream.native_handle()) != cudaSuccess ||
-       cudaMemcpyAsync(source.pixels->data(), source.pixel_device.get(), kPixelSampleCount * sizeof(std::uint32_t), cudaMemcpyDeviceToHost,
-                       reinterpret_cast<cudaStream_t>(stream.native_handle())) != cudaSuccess)
+   if (mmltk::backend::imaging::raster::probe_rgba(
+        {reinterpret_cast<const std::uint8_t*>(plane.data), plane.descriptor.pitch_bytes, static_cast<int>(plane.descriptor.width), static_cast<int>(plane.descriptor.height)},
+        source.pixel_device.get(), coordinates, stream.native_handle()) != cudaSuccess ||
+       cudaMemcpyAsync(source.pixels->data(), source.pixel_device.get(), kPixelSampleCount * sizeof(std::uint32_t), cudaMemcpyDeviceToHost, reinterpret_cast<cudaStream_t>(stream.native_handle())) !=
+        cudaSuccess)
     throw std::runtime_error("probe submission failed");
    source.probe_pending = true;
    // Observe the source bytes through the transfer path independently
@@ -1003,10 +947,9 @@ private:
    // host regions until the existing stream completion settles them.
    auto* copied = static_cast<std::uint32_t*>(source.pixels->data()) + kPixelSampleCount;
    for (std::size_t index = 0U; index != kPixelSampleCount; ++index) {
-    const auto offset = static_cast<std::size_t>(coordinates[2U * index + 1U]) * plane.descriptor.pitch_bytes +
-                        static_cast<std::size_t>(coordinates[2U * index]) * sizeof(std::uint32_t);
-    if (cudaMemcpyAsync(copied + index, reinterpret_cast<const void*>(plane.data + offset), sizeof(std::uint32_t), cudaMemcpyDeviceToHost,
-                        reinterpret_cast<cudaStream_t>(stream.native_handle())) != cudaSuccess)
+    const auto offset = static_cast<std::size_t>(coordinates[2U * index + 1U]) * plane.descriptor.pitch_bytes + static_cast<std::size_t>(coordinates[2U * index]) * sizeof(std::uint32_t);
+    if (cudaMemcpyAsync(copied + index, reinterpret_cast<const void*>(plane.data + offset), sizeof(std::uint32_t), cudaMemcpyDeviceToHost, reinterpret_cast<cudaStream_t>(stream.native_handle())) !=
+        cudaSuccess)
      throw std::runtime_error("source-copy probe submission failed");
    }
    source.probe_source_copy_pending = true;
@@ -1020,25 +963,23 @@ private:
   const bool copied = std::exchange(source.probe_source_copy_pending, false);
   if (!diagnostics_.pixel_probes_enabled()) return;
   const auto* values = static_cast<const std::uint32_t*>(source.pixels->data());
-  const std::array operations{operation, operation == VisualDiagnosticOperation::PresentationPixelAfterRelease
-                                          ? VisualDiagnosticOperation::PresentationPixelSourceCopyAfterRelease
-                                          : VisualDiagnosticOperation::PresentationPixelSourceCopyBeforeReady};
+  const std::array operations{operation, operation == VisualDiagnosticOperation::PresentationPixelAfterRelease ? VisualDiagnosticOperation::PresentationPixelSourceCopyAfterRelease
+                                                                                                               : VisualDiagnosticOperation::PresentationPixelSourceCopyBeforeReady};
   std::array<VisualDiagnosticFact, kPixelSampleCount> facts;
   for (std::size_t probe = 0U; probe != (copied ? operations.size() : 1U); ++probe) {
    for (std::size_t index = 0U; index != facts.size(); ++index) {
     facts[index] = Fact(operations[probe], transfer, 0U);
     facts[index].context.pixel = {.sample_index = static_cast<std::uint32_t>(index),
-                                  .sample_x = source.pixel_coordinates[2U * index],
-                                  .sample_y = source.pixel_coordinates[2U * index + 1U],
-                                  .sample_rgba = values[probe * kPixelSampleCount + index]};
+     .sample_x = source.pixel_coordinates[2U * index],
+     .sample_y = source.pixel_coordinates[2U * index + 1U],
+     .sample_rgba = values[probe * kPixelSampleCount + index]};
    }
    diagnostics_.WriteBatch(facts);
   }
  }
  VisualDiagnosticFact Fact(VisualDiagnosticOperation operation, const Transfer& transfer, std::uint64_t outcome) const noexcept {
   auto fact =
-   presentation_diagnostic_fact(operation, {.submitted = transfer.pending.submitted, .publication = transfer.publication, .link = transfer.pending.link},
-                                transfer.source->context.device(), outcome);
+   presentation_diagnostic_fact(operation, {.submitted = transfer.pending.submitted, .publication = transfer.publication, .link = transfer.pending.link}, transfer.source->context.device(), outcome);
   fact.context.workspace = native::workspace_source_diagnostic(transfer.source->description);
   fact.context.workspace.native_process_id = static_cast<std::uint64_t>(::getpid());
   fact.context.workspace.workspace_plane = transfer.plane.data;
@@ -1047,21 +988,21 @@ private:
  void DiagnoseSource(VisualDiagnosticOperation operation, const AdmittedSource& source, std::uint64_t outcome) const noexcept {
   diagnostics_.Emit([&] {
    return VisualDiagnosticFact{.system = contracts::DiagnosticOwner::Presentation,
-                               .operation = operation,
-                               .device = source.context.device(),
-                               .generation = source.generation,
-                               .context = {.capacity_width = source.description.width,
-                                           .capacity_height = source.description.height,
-                                           .surface_high = source.description.id_high,
-                                           .surface_low = source.description.id_low,
-                                           .outcome = outcome,
-                                           .workspace = native::workspace_source_diagnostic(source.description)}};
+    .operation = operation,
+    .device = source.context.device(),
+    .generation = source.generation,
+    .context = {.capacity_width = source.description.width,
+     .capacity_height = source.description.height,
+     .surface_high = source.description.id_high,
+     .surface_low = source.description.id_low,
+     .outcome = outcome,
+     .workspace = native::workspace_source_diagnostic(source.description)}};
   });
  }
  void DiagnoseArena(VisualDiagnosticOperation operation, const SampleArena& arena, std::uint64_t outcome) const noexcept {
   diagnostics_.Emit([&] {
-   auto fact = presentation_diagnostic_fact(operation, {.submitted = arena.submitted, .publication = {.capability = CapabilityOf(arena)}},
-                                            arena.context ? arena.context->device() : settings_.device, outcome);
+   auto fact =
+    presentation_diagnostic_fact(operation, {.submitted = arena.submitted, .publication = {.capability = CapabilityOf(arena)}}, arena.context ? arena.context->device() : settings_.device, outcome);
    if (operation == VisualDiagnosticOperation::PresentationImportOutcome) fact.value = outcome;
    return fact;
   });
@@ -1106,10 +1047,8 @@ private:
  friend struct test_support::NativePresentationWriterTestAccess;
 };
 }  // namespace
-std::unique_ptr<PresentationNativeWriter> test_support::NativePresentationWriterTestAccess::Create(gpu::DeviceContext context,
-                                                                                                   PresentationNativeConfiguration configuration,
-                                                                                                   std::shared_ptr<gpu::ImageWorkspace> workspace,
-                                                                                                   VisualDiagnosticSink diagnostics) {
+std::unique_ptr<PresentationNativeWriter> test_support::NativePresentationWriterTestAccess::Create(
+ gpu::DeviceContext context, PresentationNativeConfiguration configuration, std::shared_ptr<gpu::ImageWorkspace> workspace, VisualDiagnosticSink diagnostics) {
  const VisualDeviceSettings settings{context.device(), workspace->layout().width, workspace->layout().height};
  auto result = std::make_unique<NativePresentationWriter>(settings, std::move(configuration), diagnostics, std::move(context));
  abi::Record description{};
@@ -1124,8 +1063,7 @@ void test_support::NativePresentationWriterTestAccess::RetireSource(Presentation
  for (auto& source : native.sources_) source->retirement_requested = true;
  static_cast<void>(native.Pump(0U));
 }
-PresentationNativeWriterFactory make_native_presentation_writer_factory(VisualDeviceSettings settings, PresentationNativeConfiguration configuration,
-                                                                        VisualDiagnosticSink diagnostics) {
+PresentationNativeWriterFactory make_native_presentation_writer_factory(VisualDeviceSettings settings, PresentationNativeConfiguration configuration, VisualDiagnosticSink diagnostics) {
  if (!settings.valid() || configuration.import_socket.empty()) throw contracts::InvalidIntentError("Presentation configuration is invalid");
  return [settings, configuration = std::move(configuration), diagnostics, execution = resolve_visual_device_execution(settings)] {
   return std::make_unique<NativePresentationWriter>(settings, configuration, diagnostics, execution);

@@ -10,13 +10,11 @@
 namespace mmltk::backend::models::rfdetr {
 namespace catalog = mmltk::backend::data::catalog;
 ResolvedClassLayout::ResolvedClassLayout(ModelClassLayout record) : record_(std::move(record)) {
- if (record_.version != kClassLayoutVersion || record_.slots.size() > kMaximumClassOutputSlots)
-  throw std::invalid_argument("unsupported or oversized RF-DETR class layout");
+ if (record_.version != kClassLayoutVersion || record_.slots.size() > kMaximumClassOutputSlots) throw std::invalid_argument("unsupported or oversized RF-DETR class layout");
  if (record_.provenance.producer.find('\0') != std::string::npos || record_.provenance.producer.size() > 1024 || record_.provenance.artifact_sha256.size() > 64)
   throw std::invalid_argument("oversized RF-DETR class provenance");
  if (!record_.provenance.artifact_sha256.empty() &&
-     (record_.provenance.artifact_sha256.size() != 64 ||
-      !std::ranges::all_of(record_.provenance.artifact_sha256, [](char c) { return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'); })))
+     (record_.provenance.artifact_sha256.size() != 64 || !std::ranges::all_of(record_.provenance.artifact_sha256, [](char c) { return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'); })))
   throw std::invalid_argument("invalid RF-DETR class provenance digest");
  if (record_.provenance.origin > ClassLayoutOrigin::VerifiedAsset) throw std::invalid_argument("unknown RF-DETR class provenance");
  if (record_.class_name_evidence.names.size() > catalog::kClassCatalogCapacity) throw std::invalid_argument("oversized class-name evidence");
@@ -28,8 +26,7 @@ ResolvedClassLayout::ResolvedClassLayout(ModelClassLayout record) : record_(std:
  for (const auto& slot : record_.slots) {
   switch (slot.role) {
    case ClassSlotRole::Foreground:
-    if (!slot.foreground_index || *slot.foreground_index >= catalog_->size() || seen[*slot.foreground_index])
-     throw std::invalid_argument("duplicate or invalid foreground output slot");
+    if (!slot.foreground_index || *slot.foreground_index >= catalog_->size() || seen[*slot.foreground_index]) throw std::invalid_argument("duplicate or invalid foreground output slot");
     seen[*slot.foreground_index] = true;
     break;
    case ClassSlotRole::Background: ++background_count; [[fallthrough]];
@@ -46,8 +43,7 @@ ResolvedClassLayout::ResolvedClassLayout(ModelClassLayout record) : record_(std:
  for (std::size_t index = 0; index < catalog_->size(); ++index)
   if (!seen[index]) throw std::invalid_argument("class layout omits a foreground class");
  if (!semantic_ && !catalog_->empty()) throw std::invalid_argument("partial foreground bindings are unsupported");
- if (semantic_ && record_.provenance.origin == ClassLayoutOrigin::Unresolved)
-  throw std::invalid_argument("resolved class layout requires authoritative provenance");
+ if (semantic_ && record_.provenance.origin == ClassLayoutOrigin::Unresolved) throw std::invalid_argument("resolved class layout requires authoritative provenance");
  if (record_.supervision_in_foreground_order && !semantic_) throw std::invalid_argument("unresolved class layout cannot declare foreground supervision");
  switch (record_.no_object) {
   case NoObjectEncoding::AllNegative:
@@ -61,10 +57,8 @@ ResolvedClassLayout::ResolvedClassLayout(ModelClassLayout record) : record_(std:
    break;
   default: throw std::invalid_argument("unknown no-object encoding");
  }
- if (record_.scores != ClassScoreEncoding::SigmoidLogits && record_.scores != ClassScoreEncoding::SoftmaxLogits)
-  throw std::invalid_argument("unknown score encoding");
- if (record_.scores == ClassScoreEncoding::SoftmaxLogits && record_.no_object == NoObjectEncoding::AllNegative)
-  throw std::invalid_argument("softmax cannot encode all-negative no-object targets");
+ if (record_.scores != ClassScoreEncoding::SigmoidLogits && record_.scores != ClassScoreEncoding::SoftmaxLogits) throw std::invalid_argument("unknown score encoding");
+ if (record_.scores == ClassScoreEncoding::SoftmaxLogits && record_.no_object == NoObjectEncoding::AllNegative) throw std::invalid_argument("softmax cannot encode all-negative no-object targets");
  physical_references_.resize(record_.slots.size(), -1);
  for (std::size_t index = 0; index < record_.slots.size(); ++index) {
   const auto& slot = record_.slots[index];
@@ -73,16 +67,14 @@ ResolvedClassLayout::ResolvedClassLayout(ModelClassLayout record) : record_(std:
   ++eligible_count_;
  }
 }
-catalog::ClassReferenceDomain ResolvedClassLayout::domain() const noexcept {
- return semantic_ ? catalog::ClassReferenceDomain::Foreground : catalog::ClassReferenceDomain::RawOutputSlot;
-}
+catalog::ClassReferenceDomain ResolvedClassLayout::domain() const noexcept { return semantic_ ? catalog::ClassReferenceDomain::Foreground : catalog::ClassReferenceDomain::RawOutputSlot; }
 ModelClassLayoutSummary ResolvedClassLayout::summary() const {
  ModelClassLayoutSummary result{.domain = domain(),
-                                .foreground_count = static_cast<std::uint32_t>(catalog_->size()),
-                                .output_count = static_cast<std::uint32_t>(output_width()),
-                                .scores = record_.scores,
-                                .no_object = record_.no_object,
-                                .provenance = record_.provenance};
+  .foreground_count = static_cast<std::uint32_t>(catalog_->size()),
+  .output_count = static_cast<std::uint32_t>(output_width()),
+  .scores = record_.scores,
+  .no_object = record_.no_object,
+  .provenance = record_.provenance};
  for (const auto& slot : record_.slots) {
   result.background_count += slot.role == ClassSlotRole::Background;
   result.unused_count += slot.role == ClassSlotRole::Unused;
@@ -187,8 +179,7 @@ std::vector<RfdetrNamedOutputRole> class_descriptor_output_roles(std::span<const
  if (roles.size() > 3) throw std::invalid_argument("too many artifact output roles");
  return roles;
 }
-ModelClassLayout admit_artifact_class_layout(std::size_t output_width, const std::optional<ModelClassLayout>& embedded,
-                                             std::span<const ModelClassDescriptor> descriptors) {
+ModelClassLayout admit_artifact_class_layout(std::size_t output_width, const std::optional<ModelClassLayout>& embedded, std::span<const ModelClassDescriptor> descriptors) {
  std::optional<ModelClassLayout> selected = embedded;
  for (const auto& descriptor : descriptors) {
   auto next = descriptor.layout;

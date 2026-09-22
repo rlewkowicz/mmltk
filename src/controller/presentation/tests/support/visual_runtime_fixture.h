@@ -31,8 +31,7 @@ struct ProducerWorkspaceRequest final {
   REQUIRE(content.valid());
   auto completed = std::make_shared<std::promise<void>>();
   ready = completed->get_future();
-  producer.RequestWorkspace(
-   {.product_owner = content.owner, .product_revision = content.revision, .destination = workspace, .ready = [completed] { completed->set_value(); }});
+  producer.RequestWorkspace({.product_owner = content.owner, .product_revision = content.revision, .destination = workspace, .ready = [completed] { completed->set_value(); }});
  }
  template <class Producer>
  void CheckCompleted(Producer& producer) {

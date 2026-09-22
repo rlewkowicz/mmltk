@@ -69,8 +69,7 @@ private:
    pause_started_ = now;
   else if (deadline_) {
    const auto elapsed = now - pause_started_;
-   if (elapsed < Clock::duration::zero() || elapsed >= Clock::time_point::max() - *deadline_)
-    throw std::runtime_error("video pause exceeds the playback clock");
+   if (elapsed < Clock::duration::zero() || elapsed >= Clock::time_point::max() - *deadline_) throw std::runtime_error("video pause exceeds the playback clock");
    *deadline_ += elapsed;
   }
   paused_ = value;

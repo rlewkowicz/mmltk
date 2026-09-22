@@ -14,12 +14,10 @@ std::size_t add_bytes(std::size_t left, std::size_t right) {
  return left + right;
 }
 std::size_t tensor_bytes(const at::Tensor& tensor) {
- if (!tensor.defined() || tensor.layout() != at::kStrided || tensor.is_quantized() || (!tensor.is_cpu() && !tensor.is_cuda()))
-  throw std::invalid_argument("unsupported tensor readback storage");
+ if (!tensor.defined() || tensor.layout() != at::kStrided || tensor.is_quantized() || (!tensor.is_cpu() && !tensor.is_cuda())) throw std::invalid_argument("unsupported tensor readback storage");
  std::size_t elements = 1;
  for (const auto extent : tensor.sizes()) {
-  if (extent < 0 || (extent && elements > std::numeric_limits<std::size_t>::max() / static_cast<std::size_t>(extent)))
-   throw std::overflow_error("tensor readback shape overflows");
+  if (extent < 0 || (extent && elements > std::numeric_limits<std::size_t>::max() / static_cast<std::size_t>(extent))) throw std::overflow_error("tensor readback shape overflows");
   elements *= static_cast<std::size_t>(extent);
  }
  const auto item = tensor.element_size();
@@ -45,8 +43,7 @@ struct SourceDevice final {
  explicit SourceDevice(c10::DeviceIndex index) : device(index), stream(c10::cuda::getCurrentCUDAStream(index)), producer(stream) {
   c10::cuda::CUDAGuard guard(index);
   CUcontext current{};
-  if (cuCtxGetCurrent(&current) != CUDA_SUCCESS || cuDevicePrimaryCtxRetain(&context, index) != CUDA_SUCCESS)
-   throw std::runtime_error("retain tensor readback context");
+  if (cuCtxGetCurrent(&current) != CUDA_SUCCESS || cuDevicePrimaryCtxRetain(&context, index) != CUDA_SUCCESS) throw std::runtime_error("retain tensor readback context");
   if (current != context) {
    (void)cuDevicePrimaryCtxRelease(index);
    context = nullptr;
@@ -152,8 +149,7 @@ struct TensorReadbackBuffers::Impl final {
   complete();
   // Torch archives keep TensorImpl handles until their actual destruction.
   for (const auto& slot : storage->slots)
-   if (slot.host && slot.source.defined() && slot.source.is_cuda() && slot.bytes && slot.view.defined() &&
-       (slot.view.use_count() != 1 || slot.view.storage().use_count() != 1))
+   if (slot.host && slot.source.defined() && slot.source.is_cuda() && slot.bytes && slot.view.defined() && (slot.view.use_count() != 1 || slot.view.storage().use_count() != 1))
     throw std::logic_error("tensor readback still has serializer readers");
   for (auto& slot : storage->slots) {
    slot.source = at::Tensor{};
@@ -219,8 +215,7 @@ void TensorReadbackBuffers::Reserve(std::span<const at::Tensor> sources, std::si
  }
  for (const auto& device : impl_->storage->devices) {
   total = add_bytes(total, std::max(device->scratch_bytes, device->requested_scratch));
-  if (device->requested_scratch > static_cast<std::size_t>(std::numeric_limits<std::int64_t>::max()))
-   throw std::overflow_error("tensor packing scratch exceeds tensor extent");
+  if (device->requested_scratch > static_cast<std::size_t>(std::numeric_limits<std::int64_t>::max())) throw std::overflow_error("tensor packing scratch exceeds tensor extent");
  }
  // One placement/context scope and at most one scratch growth per device.
  for (auto& retained : impl_->storage->devices) {
@@ -243,8 +238,7 @@ void TensorReadbackBuffers::Reserve(std::span<const at::Tensor> sources, std::si
   if (device.requested_scratch > device.scratch_bytes) {
    device.scratch = at::Tensor{};
    device.scratch_bytes = 0;
-   device.scratch =
-    at::empty({static_cast<std::int64_t>(device.requested_scratch)}, at::TensorOptions().device(at::Device(at::kCUDA, device.device)).dtype(at::kByte));
+   device.scratch = at::empty({static_cast<std::int64_t>(device.requested_scratch)}, at::TensorOptions().device(at::Device(at::kCUDA, device.device)).dtype(at::kByte));
    device.scratch_bytes = device.requested_scratch;
   }
  }

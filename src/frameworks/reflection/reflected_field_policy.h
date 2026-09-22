@@ -25,10 +25,9 @@ template <class T>
 using RemoveCvRef = std::remove_cvref_t<T>;
 template <class T>
 inline constexpr bool kReflectedIntegerScalar =
- std::same_as<RemoveCvRef<T>, bool> || std::same_as<RemoveCvRef<T>, std::uint8_t> || std::same_as<RemoveCvRef<T>, std::uint16_t> ||
- std::same_as<RemoveCvRef<T>, std::uint32_t> || std::same_as<RemoveCvRef<T>, std::uint64_t> || std::same_as<RemoveCvRef<T>, std::int8_t> ||
- std::same_as<RemoveCvRef<T>, std::int16_t> || std::same_as<RemoveCvRef<T>, std::int32_t> || std::same_as<RemoveCvRef<T>, std::int64_t> ||
- (std::same_as<RemoveCvRef<T>, char> && std::is_signed_v<char> && std::numeric_limits<char>::digits == std::numeric_limits<std::int8_t>::digits);
+ std::same_as<RemoveCvRef<T>, bool> || std::same_as<RemoveCvRef<T>, std::uint8_t> || std::same_as<RemoveCvRef<T>, std::uint16_t> || std::same_as<RemoveCvRef<T>, std::uint32_t> ||
+ std::same_as<RemoveCvRef<T>, std::uint64_t> || std::same_as<RemoveCvRef<T>, std::int8_t> || std::same_as<RemoveCvRef<T>, std::int16_t> || std::same_as<RemoveCvRef<T>, std::int32_t> ||
+ std::same_as<RemoveCvRef<T>, std::int64_t> || (std::same_as<RemoveCvRef<T>, char> && std::is_signed_v<char> && std::numeric_limits<char>::digits == std::numeric_limits<std::int8_t>::digits);
 struct OpaqueRelationStorage : Annotation {
  static constexpr bool is_opaque_relation_storage = true;
 };
@@ -187,13 +186,12 @@ struct MaxItemsAnnotation<Annotation, std::void_t<decltype(Annotation::is_max_it
 template <class Annotation, class = void>
 struct PresentationAnnotation : std::false_type {};
 template <class Annotation>
-struct PresentationAnnotation<Annotation, std::void_t<decltype(Annotation::kind)>>
-    : std::bool_constant<std::is_convertible_v<decltype(Annotation::kind), PresentationKind>> {};
+struct PresentationAnnotation<Annotation, std::void_t<decltype(Annotation::kind)>> : std::bool_constant<std::is_convertible_v<decltype(Annotation::kind), PresentationKind>> {};
 template <class Annotation>
-inline constexpr bool kPolicyAnnotation = MinimumAnnotation<RemoveCvRef<Annotation>>::value || MaximumAnnotation<RemoveCvRef<Annotation>>::value ||
-                                          FiniteAnnotation<RemoveCvRef<Annotation>>::value || MinBytesAnnotation<RemoveCvRef<Annotation>>::value ||
-                                          MaxBytesAnnotation<RemoveCvRef<Annotation>>::value || MaxItemsAnnotation<RemoveCvRef<Annotation>>::value ||
-                                          PresentationAnnotation<RemoveCvRef<Annotation>>::value || is_catalog_provider_annotation<RemoveCvRef<Annotation>>;
+inline constexpr bool kPolicyAnnotation =
+ MinimumAnnotation<RemoveCvRef<Annotation>>::value || MaximumAnnotation<RemoveCvRef<Annotation>>::value || FiniteAnnotation<RemoveCvRef<Annotation>>::value ||
+ MinBytesAnnotation<RemoveCvRef<Annotation>>::value || MaxBytesAnnotation<RemoveCvRef<Annotation>>::value || MaxItemsAnnotation<RemoveCvRef<Annotation>>::value ||
+ PresentationAnnotation<RemoveCvRef<Annotation>>::value || is_catalog_provider_annotation<RemoveCvRef<Annotation>>;
 template <class Annotation>
 constexpr void apply_field_constraint(FieldConstraint& result, const Annotation& annotation) {
  using A = RemoveCvRef<Annotation>;
@@ -265,18 +263,16 @@ template <std::meta::info Member>
  });
  constexpr bool numeric = std::is_arithmetic_v<MemberType> && !std::is_same_v<MemberType, bool>;
  constexpr bool dynamic_value = kBoundedDynamicLeaf<MemberType>;
- constexpr bool minimum_byte_bounded =
-  std::is_same_v<MemberType, std::string> || std::is_same_v<MemberType, std::filesystem::path> || kByteSequence<MemberType>;
+ constexpr bool minimum_byte_bounded = std::is_same_v<MemberType, std::string> || std::is_same_v<MemberType, std::filesystem::path> || kByteSequence<MemberType>;
  constexpr bool byte_bounded = minimum_byte_bounded || dynamic_value;
  constexpr bool item_bounded = (requires(const MemberType& value) {
-                                typename MemberType::value_type;
-                                value.size();
-                               } && (!byte_bounded || kByteSequence<MemberType>)) || dynamic_value;
+  typename MemberType::value_type;
+  value.size();
+ } && (!byte_bounded || kByteSequence<MemberType>)) || dynamic_value;
  const FieldConstraint policy = policy_of<Member>();
  const bool fixed_sequence_capacity = fixed_sequence_capacity_is_valid<MemberType>(policy.maximum_items);
- return minima <= 1U && maxima <= 1U && finite_markers <= 1U && byte_minima <= 1U && byte_limits <= 1U && item_limits <= 1U && presentation_markers <= 1U &&
-        catalog_markers <= 1U && (!policy.has_minimum || numeric) && (!policy.has_maximum || numeric) &&
-        (!policy.finite || std::is_floating_point_v<MemberType>) && (policy.minimum_bytes == 0U || minimum_byte_bounded) &&
+ return minima <= 1U && maxima <= 1U && finite_markers <= 1U && byte_minima <= 1U && byte_limits <= 1U && item_limits <= 1U && presentation_markers <= 1U && catalog_markers <= 1U &&
+        (!policy.has_minimum || numeric) && (!policy.has_maximum || numeric) && (!policy.finite || std::is_floating_point_v<MemberType>) && (policy.minimum_bytes == 0U || minimum_byte_bounded) &&
         (policy.maximum_bytes == 0U || byte_bounded) && (policy.maximum_items == 0U || item_bounded) &&
         (policy.minimum_bytes == 0U || policy.maximum_bytes == 0U || policy.minimum_bytes <= policy.maximum_bytes) &&
         (!policy.has_minimum || !policy.has_maximum || policy.minimum <= policy.maximum) && fixed_sequence_capacity;
@@ -330,13 +326,11 @@ struct MaterializedOpaqueMemberDeclaration final {
   std::size_t minima = 0U;
   std::size_t maxima = 0U;
   std::size_t finite = 0U;
-  ((minima += MinimumAnnotation<RemoveCvRef<decltype(Annotations)>>::value ? 1U : 0U,
-    maxima += MaximumAnnotation<RemoveCvRef<decltype(Annotations)>>::value ? 1U : 0U,
+  ((minima += MinimumAnnotation<RemoveCvRef<decltype(Annotations)>>::value ? 1U : 0U, maxima += MaximumAnnotation<RemoveCvRef<decltype(Annotations)>>::value ? 1U : 0U,
     finite += FiniteAnnotation<RemoveCvRef<decltype(Annotations)>>::value ? 1U : 0U),
    ...);
   constexpr bool numeric = std::is_arithmetic_v<Member> && !std::is_same_v<Member, bool>;
-  return minima <= 1U && maxima <= 1U && finite <= 1U && (!constraint.has_minimum || numeric) && (!constraint.has_maximum || numeric) &&
-         (!constraint.finite || std::is_floating_point_v<Member>) &&
+  return minima <= 1U && maxima <= 1U && finite <= 1U && (!constraint.has_minimum || numeric) && (!constraint.has_maximum || numeric) && (!constraint.finite || std::is_floating_point_v<Member>) &&
          (!constraint.has_minimum || !constraint.has_maximum || constraint.minimum <= constraint.maximum);
  }();
  template <class Visitor>
@@ -383,8 +377,7 @@ struct FieldPolicyMaterializer final {
      using AnnotationType = RemoveCvRef<typename[:std::meta::type_of(annotation):]>;
      declaration_arguments.push_back(std::meta::reflect_constant(std::meta::extract<AnnotationType>(annotation)));
     }
-    product_arguments.push_back(
-     std::meta::substitute(kOpaqueRelationStorage<Owner> ? ^^MaterializedOpaqueMemberDeclaration : ^^MaterializedMemberDeclaration, declaration_arguments));
+    product_arguments.push_back(std::meta::substitute(kOpaqueRelationStorage<Owner> ? ^^MaterializedOpaqueMemberDeclaration : ^^MaterializedMemberDeclaration, declaration_arguments));
    }
    return std::meta::substitute(^^MaterializedFieldPolicyProduct, product_arguments);
   }();
@@ -423,10 +416,8 @@ inline constexpr auto kReflectedFieldPolicies = [] consteval {
  else
   return materialize<Owner>(FieldPolicyMaterializer{});
 }();
-#define MMLTK_REFLECT_FIELDS(Type)                                                           \
- [[nodiscard]] consteval const auto& materialized_field_policies(std::type_identity<Type>) { \
-  return ::mmltk::frameworks::reflection::kReflectedFieldPolicies<Type>;                     \
- }
+#define MMLTK_REFLECT_FIELDS(Type) \
+ [[nodiscard]] consteval const auto& materialized_field_policies(std::type_identity<Type>) { return ::mmltk::frameworks::reflection::kReflectedFieldPolicies<Type>; }
 template <class Owner>
 consteval void materialized_field_policies(std::type_identity<Owner>) = delete;
 template <class Owner>
@@ -574,9 +565,7 @@ struct OpaqueRelationStorageValidation final {
   OpaqueRelationStorageAccess::VisitMember(value, [&]<std::meta::info Member>(const auto& member_value) {
    if (result) return;
    constexpr FieldConstraint member_policy = policy_of<Member>();
-   if (auto violation = field_value_violation(member_value, member_policy); violation) {
-    result = ValidationError{std::define_static_string(std::meta::identifier_of(Member)), *violation};
-   }
+   if (auto violation = field_value_violation(member_value, member_policy); violation) { result = ValidationError{std::define_static_string(std::meta::identifier_of(Member)), *violation}; }
   });
   return result;
  }
@@ -595,8 +584,8 @@ template <class T>
   Product::Visit([&]<class Declaration, std::size_t Index>() {
    using Member = typename Declaration::member_type;
    const auto& policy = declarations[Index];
-   valid = policy.private_member && policy.default_zero && policy.annotations_valid && policy.only_policy_annotations && std::unsigned_integral<Member> &&
-           !std::same_as<Member, bool> && policy.constraint.has_maximum && policy.constraint.maximum == static_cast<long double>(valid_bits);
+   valid = policy.private_member && policy.default_zero && policy.annotations_valid && policy.only_policy_annotations && std::unsigned_integral<Member> && !std::same_as<Member, bool> &&
+           policy.constraint.has_maximum && policy.constraint.maximum == static_cast<long double>(valid_bits);
   });
   return valid;
  }
@@ -681,8 +670,7 @@ constexpr void normalize_reflected_intrinsics(T& value, const T& defaults) noexc
       normalize_reflected_number(*field, fallback, member_policy);
      } else if constexpr (std::is_enum_v<Item>) {
       if (field_value_violation(*field, member_policy)) *field = fallback;
-     } else if constexpr (std::is_class_v<Item> && !std::is_same_v<Item, std::string> && !std::is_same_v<Item, std::filesystem::path> &&
-                          !kBoundedDynamicLeaf<Item>) {
+     } else if constexpr (std::is_class_v<Item> && !std::is_same_v<Item, std::string> && !std::is_same_v<Item, std::filesystem::path> && !kBoundedDynamicLeaf<Item>) {
       normalize_reflected_intrinsics(*field, fallback);
      }
     }
@@ -690,8 +678,8 @@ constexpr void normalize_reflected_intrinsics(T& value, const T& defaults) noexc
     normalize_reflected_number(field, default_field, member_policy);
    } else if constexpr (std::is_enum_v<Field>) {
     if (field_value_violation(field, member_policy)) field = default_field;
-   } else if constexpr (std::is_class_v<Field> && !std::is_same_v<Field, std::string> && !std::is_same_v<Field, std::filesystem::path> &&
-                        !kBoundedDynamicLeaf<Field> && !requires { typename Field::value_type; }) {
+   } else if constexpr (std::is_class_v<Field> && !std::is_same_v<Field, std::string> && !std::is_same_v<Field, std::filesystem::path> && !kBoundedDynamicLeaf<Field> &&
+                        !requires { typename Field::value_type; }) {
     normalize_reflected_intrinsics(field, default_field);
    }
   }
@@ -729,12 +717,10 @@ template <ReflectedPolicyAudit Audit, class T>
   using Member = OptionalValueT<typename Declaration::member_type>;
   if constexpr (requires { typename Member::value_type; }) {
    using Element = RemoveCvRef<typename Member::value_type>;
-   if constexpr (std::is_class_v<Element> && !kBoundedDynamicLeaf<Element> && !std::is_same_v<Element, std::string> &&
-                 !std::is_same_v<Element, std::filesystem::path>) {
+   if constexpr (std::is_class_v<Element> && !kBoundedDynamicLeaf<Element> && !std::is_same_v<Element, std::string> && !std::is_same_v<Element, std::filesystem::path>) {
     valid = valid && reflected_policies_satisfy<Audit, Element>();
    }
-  } else if constexpr (std::is_class_v<Member> && !kBoundedDynamicLeaf<Member> && !std::is_same_v<Member, std::string> &&
-                       !std::is_same_v<Member, std::filesystem::path>) {
+  } else if constexpr (std::is_class_v<Member> && !kBoundedDynamicLeaf<Member> && !std::is_same_v<Member, std::string> && !std::is_same_v<Member, std::filesystem::path>) {
    valid = valid && reflected_policies_satisfy<Audit, Member>();
   }
  });

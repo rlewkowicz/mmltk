@@ -59,8 +59,7 @@ private:
 // transport and process paths perform no trace collection or formatting.
 class RuntimeDiagnostics final {
 public:
- explicit RuntimeDiagnostics(DiagnosticsProducer producer, bool pixel_probes = false,
-                             RuntimeDiagnosticDelivery delivery = RuntimeDiagnosticDelivery::BestEffort);
+ explicit RuntimeDiagnostics(DiagnosticsProducer producer, bool pixel_probes = false, RuntimeDiagnosticDelivery delivery = RuntimeDiagnosticDelivery::BestEffort);
  [[nodiscard]] RuntimeDiagnosticTarget target() noexcept;
  void write(RuntimeDiagnosticFact fact) noexcept;
  void write_browser_event(std::string_view event, const mmltk::frameworks::serialization::wire::Value& fields) noexcept;

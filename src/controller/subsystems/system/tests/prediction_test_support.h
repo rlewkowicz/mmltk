@@ -27,8 +27,8 @@ class PredictionSource final {
 public:
  using Detection = mmltk::backend::models::rfdetr::Prediction;
  using Catalog = std::shared_ptr<const mmltk::backend::data::catalog::ClassCatalog>;
- static PredictionSource Device(const mmltk::frameworks::gpu::DeviceExecution&, VisualExtent, std::span<const float> pixels,
-                                std::vector<Detection> detections = {}, Catalog = {}, std::span<const std::uint8_t> masks = {});
+ static PredictionSource Device(
+  const mmltk::frameworks::gpu::DeviceExecution&, VisualExtent, std::span<const float> pixels, std::vector<Detection> detections = {}, Catalog = {}, std::span<const std::uint8_t> masks = {});
  static PredictionSource Decoded(VisualExtent, std::span<const std::uint8_t> pixels, Catalog = {});
  [[nodiscard]] const float* pixels() const noexcept { return pixels_; }
  [[nodiscard]] const std::uint8_t* rgb8() const noexcept { return rgb8_; }
@@ -154,8 +154,7 @@ private:
 class FakeNonvisualComputeRuntime final : public ValidationRuntime, public ExportRuntime {
 public:
  explicit FakeNonvisualComputeRuntime(ComputeScenario scenario) : sequence_(std::move(scenario)) {}
- ValidationRuntimeResult Run(mmltk::backend::models::rfdetr::ValidateRequest, std::stop_token, const ComputeProgressSink&,
-                             const mmltk::backend::models::rfdetr::ValidationDelivery&) override;
+ ValidationRuntimeResult Run(mmltk::backend::models::rfdetr::ValidateRequest, std::stop_token, const ComputeProgressSink&, const mmltk::backend::models::rfdetr::ValidationDelivery&) override;
  contracts::ComputeTerminal Run(mmltk::backend::models::rfdetr::ModelExportRequest, std::stop_token, const ComputeProgressSink&) override;
 
 private:
@@ -173,8 +172,8 @@ struct PredictionScenario final {
 class FakePredictRuntime final : public PredictRuntime {
 public:
  explicit FakePredictRuntime(PredictionScenario);
- contracts::ComputeTerminal Run(mmltk::backend::models::rfdetr::PredictRequest, std::stop_token, const ComputeProgressSink&, const ProductSink&,
-                                const PlaybackGate&, VisualExtent, const ContextProvider&, const PreviewRetirement&) override;
+ contracts::ComputeTerminal Run(mmltk::backend::models::rfdetr::PredictRequest, std::stop_token, const ComputeProgressSink&, const ProductSink&, const PlaybackGate&, VisualExtent,
+  const ContextProvider&, const PreviewRetirement&) override;
 
 private:
  ComputeSequence sequence_;

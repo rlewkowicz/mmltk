@@ -90,15 +90,9 @@ TEST_CASE("vendored_catch2_reporter_fixture", "[.][core][vendored][reporter_fixt
  // NOLINTNEXTLINE(bugprone-chained-comparison): Catch2 decomposes REQUIRE through operator<=.
  REQUIRE(fixture_value == 2);
 }
-TEST_CASE("test_spdlog_log_msg_payload_helpers_preserve_raw_payload_and_apply_formatting", "[core][vendored]") {
- test_spdlog_log_msg_payload_helpers_preserve_raw_payload_and_apply_formatting();
-}
-TEST_CASE("test_spdlog_log_msg_payload_helpers_clamp_large_lengths_to_int_max", "[core][vendored]") {
- test_spdlog_log_msg_payload_helpers_clamp_large_lengths_to_int_max();
-}
-TEST_CASE("test_catch2_compact_reporter_formats_shared_assertion_details", "[core][vendored]") {
- test_catch2_compact_reporter_formats_shared_assertion_details();
-}
+TEST_CASE("test_spdlog_log_msg_payload_helpers_preserve_raw_payload_and_apply_formatting", "[core][vendored]") { test_spdlog_log_msg_payload_helpers_preserve_raw_payload_and_apply_formatting(); }
+TEST_CASE("test_spdlog_log_msg_payload_helpers_clamp_large_lengths_to_int_max", "[core][vendored]") { test_spdlog_log_msg_payload_helpers_clamp_large_lengths_to_int_max(); }
+TEST_CASE("test_catch2_compact_reporter_formats_shared_assertion_details", "[core][vendored]") { test_catch2_compact_reporter_formats_shared_assertion_details(); }
 TEST_CASE("test_catch2_tap_reporter_formats_shared_assertion_details", "[core][vendored]") { test_catch2_tap_reporter_formats_shared_assertion_details(); }
 TEST_CASE("fatal_reporting_fixture", "[.][core][logging][fatal_fixture]") {
  namespace logging = mmltk::common::logging;
@@ -147,9 +141,8 @@ TEST_CASE("fatal reporting is bounded visible and independent of diagnostic sink
   const auto log = directory.path() / (mode + ".log");
   if (mode == "init-failure") std::filesystem::create_directory(log);
   const bool enabled = mode == "enabled" || mode == "disabled-after-init" || mode == "sink-failure" || mode == "init-failure";
-  const auto result = run_subprocess_capture_output(
-   {"env", "-u", "MMLTK_LOG_DIR", "MMLTK_FATAL_FIXTURE=" + mode, "MMLTK_LOG_LEVEL=off", "MMLTK_LOG_FILE=", "MMLTK_FATAL_LOG=" + log.string(),
-    mmltk::common::system::runtime_paths::current_executable_path().string(), "fatal_reporting_fixture", "--reporter", "compact", "--colour-mode", "none"});
+  const auto result = run_subprocess_capture_output({"env", "-u", "MMLTK_LOG_DIR", "MMLTK_FATAL_FIXTURE=" + mode, "MMLTK_LOG_LEVEL=off", "MMLTK_LOG_FILE=", "MMLTK_FATAL_LOG=" + log.string(),
+   mmltk::common::system::runtime_paths::current_executable_path().string(), "fatal_reporting_fixture", "--reporter", "compact", "--colour-mode", "none"});
   INFO(result.output_text);
   REQUIRE(result.exit_code == 0);
   const auto begin = result.stderr_text.find("fatal: ");
@@ -187,9 +180,8 @@ TEST_CASE("fatal reporting preserves thread signals and status with a broken std
    struct sigaction disposition{};
    disposition.sa_handler = SIG_DFL;
    sigset_t pipe_signal{}, original{}, after{}, pending{};
-   if (::sigemptyset(&disposition.sa_mask) != 0 || ::sigaction(SIGPIPE, &disposition, nullptr) != 0 || ::sigemptyset(&pipe_signal) != 0 ||
-       ::sigaddset(&pipe_signal, SIGPIPE) != 0 || ::pthread_sigmask(pending_before ? SIG_BLOCK : SIG_UNBLOCK, &pipe_signal, nullptr) != 0 ||
-       ::pthread_sigmask(SIG_BLOCK, nullptr, &original) != 0 || ::dup2(writer.get(), STDERR_FILENO) < 0)
+   if (::sigemptyset(&disposition.sa_mask) != 0 || ::sigaction(SIGPIPE, &disposition, nullptr) != 0 || ::sigemptyset(&pipe_signal) != 0 || ::sigaddset(&pipe_signal, SIGPIPE) != 0 ||
+       ::pthread_sigmask(pending_before ? SIG_BLOCK : SIG_UNBLOCK, &pipe_signal, nullptr) != 0 || ::pthread_sigmask(SIG_BLOCK, nullptr, &original) != 0 || ::dup2(writer.get(), STDERR_FILENO) < 0)
     std::_Exit(90);
    if (pending_before && ::raise(SIGPIPE) != 0) std::_Exit(91);
    errno = EINVAL;

@@ -43,8 +43,7 @@ public:
   DataLoadingOptions loading{};
   std::optional<mmltk::frameworks::gpu::DeviceExecution> execution{};
  };
- explicit DatasetLoader(const Config& config, std::shared_ptr<mmltk::frameworks::gpu::TerminalCudaRetirementOwner> retirement = {},
-                        decltype(&cudaEventRecord) record_consumer = &cudaEventRecord);
+ explicit DatasetLoader(const Config& config, std::shared_ptr<mmltk::frameworks::gpu::TerminalCudaRetirementOwner> retirement = {}, decltype(&cudaEventRecord) record_consumer = &cudaEventRecord);
  ~DatasetLoader();
  DatasetLoader(const DatasetLoader&) = delete;
  DatasetLoader& operator=(const DatasetLoader&) = delete;

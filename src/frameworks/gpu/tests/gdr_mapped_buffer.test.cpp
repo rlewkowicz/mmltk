@@ -249,9 +249,9 @@ TEST_CASE("Mapped construction failures release every acquired physical resource
   bool runtime_failure = false;
   try {
    buffer.ensure_bytes(64);
-  } catch (const mmltk::frameworks::gpu::GdrTransportUnavailable&) {
-   FAIL("resource failure misclassified as unavailable transport");
-  } catch (const std::runtime_error&) { runtime_failure = true; }
+  } catch (const mmltk::frameworks::gpu::GdrTransportUnavailable&) { FAIL("resource failure misclassified as unavailable transport"); } catch (const std::runtime_error&) {
+   runtime_failure = true;
+  }
   CHECK(runtime_failure);
   CHECK(buffer.capacity_bytes() == 0);
   check_no_live_resources(*api);
@@ -488,8 +488,8 @@ struct HardwareConsumer final {
  done: ret;
 }
 )ptx";
-   if (cuModuleLoadData(&module, kernel) != CUDA_SUCCESS || cuModuleGetFunction(&function, module, "consume") != CUDA_SUCCESS ||
-       cuStreamCreate(&stream, CU_STREAM_NON_BLOCKING) != CUDA_SUCCESS || cuMemAlloc(&output, page) != CUDA_SUCCESS)
+   if (cuModuleLoadData(&module, kernel) != CUDA_SUCCESS || cuModuleGetFunction(&function, module, "consume") != CUDA_SUCCESS || cuStreamCreate(&stream, CU_STREAM_NON_BLOCKING) != CUDA_SUCCESS ||
+       cuMemAlloc(&output, page) != CUDA_SUCCESS)
     throw std::runtime_error("initialize GDR hardware consumer");
   } catch (...) {
    release();
@@ -514,8 +514,7 @@ struct HardwareConsumer final {
  }
  void submit(CUdeviceptr source, unsigned length) {
   void* arguments[]{&source, &output, &length};
-  if (cuLaunchKernel(function, (length + 127) / 128, 1, 1, 128, 1, 1, 0, stream, arguments, nullptr) != CUDA_SUCCESS)
-   throw std::runtime_error("launch GDR hardware consumer");
+  if (cuLaunchKernel(function, (length + 127) / 128, 1, 1, 128, 1, 1, 0, stream, arguments, nullptr) != CUDA_SUCCESS) throw std::runtime_error("launch GDR hardware consumer");
  }
 };
 CUdevice hardware_device() {
@@ -641,8 +640,7 @@ TEST_CASE("Independent GDR handles copy while another isolated owner registers a
    lease = {};
    if (!buffer.write(0, values)) throw std::runtime_error("unexpected hardware cancellation");
    if (cuMemcpyDtoH(result.data(), consumer.output, result.size()) != CUDA_SUCCESS) throw std::runtime_error("GDR concurrent readback failed");
-   if (std::ranges::any_of(result, [](auto value) { return value != (0x3c ^ 90); }))
-    throw std::runtime_error("GDR concurrent CUDA consumer observed incorrect bytes");
+   if (std::ranges::any_of(result, [](auto value) { return value != (0x3c ^ 90); })) throw std::runtime_error("GDR concurrent CUDA consumer observed incorrect bytes");
   }
   stable.close();
  };

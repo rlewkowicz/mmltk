@@ -34,8 +34,7 @@ TEST_CASE("production dataset factory connects optional tracing through staged o
  const services::SettingsLocation location{(root.path() / "settings.json").string()};
  REQUIRE(services::SettingsStore::save(location.value(), settings, 1U).succeeded());
  const auto log = root.path() / "trace.jsonl";
- services::DiagnosticsClient client{mmltk::common::io::ScopedFd{::open(log.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600)},
-                                    services::DiagnosticsExecutionPolicy::CallerDriven};
+ services::DiagnosticsClient client{mmltk::common::io::ScopedFd{::open(log.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600)}, services::DiagnosticsExecutionPolicy::CallerDriven};
  REQUIRE(client.enabled());
  bool enabled = true;
  SECTION("enabled factory retains the target beyond configuration and creator lifetimes") {}

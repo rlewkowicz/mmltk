@@ -560,12 +560,15 @@ impl App {
     }
 
     pub(super) fn select_presentation(&mut self, frame: VisualFrame) {
-        if self.model.has_pending(ApplicationIntentEndpoint::PresentationSelect) {
+        if self
+            .model
+            .has_pending(ApplicationIntentEndpoint::PresentationSelect)
+        {
             return;
         }
         let source = frame.source.clone();
-        let gallery = GalleryIdentity::current(&self.model)
-            .filter(|identity| identity.frame == frame);
+        let gallery =
+            GalleryIdentity::current(&self.model).filter(|identity| identity.frame == frame);
         if gallery.as_ref().is_some_and(|identity| {
             self.presentation.gallery.as_ref().is_some_and(|demand| {
                 demand.identity == *identity && demand.status == GalleryStatus::Failed
@@ -592,7 +595,9 @@ impl App {
                 &mut self.presentation.gallery_blocked,
             ] {
                 if gallery.as_ref().is_some_and(|identity| {
-                    evidence.as_ref().is_some_and(|handoff| handoff.matches(identity))
+                    evidence
+                        .as_ref()
+                        .is_some_and(|handoff| handoff.matches(identity))
                 }) {
                     *evidence = None;
                 }
@@ -614,7 +619,11 @@ impl App {
     }
 
     pub(super) fn settle_presentation_select(&mut self, correlation: u64, succeeded: bool) {
-        if self.presentation.selection.as_ref().is_some_and(|(request, _)| *request == correlation)
+        if self
+            .presentation
+            .selection
+            .as_ref()
+            .is_some_and(|(request, _)| *request == correlation)
             && let Some((_, identity)) = self.presentation.selection.take()
             && !succeeded
             && let Some(demand) = self.presentation.gallery.as_mut()
@@ -634,9 +643,11 @@ impl App {
             self.retire_peer(error);
             return;
         }
-        if self.presentation.gallery.as_ref().is_some_and(|demand| {
-            demand.status == GalleryStatus::Needed
-        })
+        if self
+            .presentation
+            .gallery
+            .as_ref()
+            .is_some_and(|demand| demand.status == GalleryStatus::Needed)
             && self.presentation.pending.is_none()
             && !self.presentation.gallery_admission_blocked()
         {
@@ -703,9 +714,11 @@ impl Controller {
             if feature != FeatureId::Explore
                 || context.as_ref().map_or(
                     model.connection == crate::view_model::ConnectionState::Connected,
-                    |context| evidence.as_ref().is_some_and(|handoff| {
-                        !handoff.context.same_context(context)
-                    }),
+                    |context| {
+                        evidence
+                            .as_ref()
+                            .is_some_and(|handoff| !handoff.context.same_context(context))
+                    },
                 )
             {
                 *evidence = None;
@@ -719,18 +732,27 @@ impl Controller {
             self.selection = None;
             return;
         };
-        if self.gallery.as_ref().is_none_or(|demand| demand.identity != identity) {
+        if self
+            .gallery
+            .as_ref()
+            .is_none_or(|demand| demand.identity != identity)
+        {
             // Advancing the same gallery is native notification-driven. A new
             // dataset or return from Detail needs its own publication request.
-            let status = self.gallery.as_ref().filter(|demand| {
-                demand.identity.same_context(&identity) && demand.status != GalleryStatus::Failed
-            }).map_or(GalleryStatus::Needed, |demand| {
-                if demand.status == GalleryStatus::Drawable {
-                    GalleryStatus::Waiting
-                } else {
-                    demand.status
-                }
-            });
+            let status = self
+                .gallery
+                .as_ref()
+                .filter(|demand| {
+                    demand.identity.same_context(&identity)
+                        && demand.status != GalleryStatus::Failed
+                })
+                .map_or(GalleryStatus::Needed, |demand| {
+                    if demand.status == GalleryStatus::Drawable {
+                        GalleryStatus::Waiting
+                    } else {
+                        demand.status
+                    }
+                });
             self.gallery = Some(GalleryRestoration { identity, status });
         }
         let demand = self.gallery.as_ref().expect("current gallery demand");
@@ -761,7 +783,9 @@ impl Controller {
         }) || self.gallery_loss.as_ref().is_some_and(|handoff| {
             // Metadata-less rejection becomes an admission fact only after its
             // exact physical content matches the installed Gallery demand.
-            self.gallery.as_ref().is_some_and(|demand| handoff.matches(&demand.identity))
+            self.gallery
+                .as_ref()
+                .is_some_and(|demand| handoff.matches(&demand.identity))
                 && crate::presentation_surface::publication_admission_blocked(handoff.frame)
         })
     }
@@ -791,7 +815,8 @@ impl Controller {
         let Some(demand) = self.gallery.as_mut() else {
             return;
         };
-        if let Some((surface, _)) = displayed.as_ref()
+        if let Some((surface, _)) = displayed
+            .as_ref()
             .filter(|(_, content)| demand.identity.matches(content))
         {
             // An older drawable receipt cannot satisfy a later loss of the same
@@ -799,7 +824,9 @@ impl Controller {
             if ![&self.gallery_loss, &self.gallery_blocked]
                 .into_iter()
                 .any(|evidence| {
-                    evidence.as_ref().is_some_and(|handoff| handoff.matches(&demand.identity))
+                    evidence
+                        .as_ref()
+                        .is_some_and(|handoff| handoff.matches(&demand.identity))
                 })
             {
                 demand.status = GalleryStatus::Drawable;
@@ -816,7 +843,7 @@ impl Controller {
         let rejected_pending =
             self.pending_rejected && self.pending.and_then(|surface| surface.frame) == Some(frame);
         if frame.content_session
-                != crate::generated::presentation_source_session(PresentationSourceKind::Explore)
+            != crate::generated::presentation_source_session(PresentationSourceKind::Explore)
             || (!rejected_pending && frame.presentation_revision <= self.gallery_rejection_revision)
         {
             return;
@@ -834,7 +861,10 @@ impl Controller {
                 // Valid paired Gallery metadata is authoritative even during a
                 // reconnect snapshot gap. An installed context can disqualify
                 // a foreign dataset/source without gating independent graphics.
-                if retained_context.as_ref().is_some_and(|context| !context.contains(content)) {
+                if retained_context
+                    .as_ref()
+                    .is_some_and(|context| !context.contains(content))
+                {
                     return;
                 }
                 GalleryIdentity {
@@ -855,14 +885,23 @@ impl Controller {
                 context
             }
         };
-        if self.pending.and_then(|surface| surface.frame).is_some_and(|pending| {
-            !rejected_pending && pending.presentation_revision >= frame.presentation_revision
-        }) || self.gallery_loss.as_ref().is_some_and(|loss| {
-            loss.frame.presentation_revision >= frame.presentation_revision
-        }) || (!rejected_pending
-            && self.incumbent.and_then(|surface| surface.frame).is_some_and(|previous| {
-                previous.presentation_revision >= frame.presentation_revision
-            }))
+        if self
+            .pending
+            .and_then(|surface| surface.frame)
+            .is_some_and(|pending| {
+                !rejected_pending && pending.presentation_revision >= frame.presentation_revision
+            })
+            || self
+                .gallery_loss
+                .as_ref()
+                .is_some_and(|loss| loss.frame.presentation_revision >= frame.presentation_revision)
+            || (!rejected_pending
+                && self
+                    .incumbent
+                    .and_then(|surface| surface.frame)
+                    .is_some_and(|previous| {
+                        previous.presentation_revision >= frame.presentation_revision
+                    }))
         {
             return;
         }
@@ -897,14 +936,13 @@ impl Controller {
             return false;
         };
         if self.gallery.as_ref().is_some_and(|demand| {
-            self.pending.and_then(|pending| {
-                crate::presentation_surface::gallery::matching(pending.frame)
-            }).is_some_and(|content| demand.identity.contains(&content))
+            self.pending
+                .and_then(|pending| crate::presentation_surface::gallery::matching(pending.frame))
+                .is_some_and(|content| demand.identity.contains(&content))
         }) && GalleryIdentity::current(model).is_some_and(|identity| {
             crate::presentation_surface::gallery::matching(Some(frame))
                 .is_none_or(|content| !identity.contains(&content))
-        })
-        {
+        }) {
             // A delayed viewer/dataset offer cannot displace useful gallery
             // admission. A requested Detail transition has no current gallery
             // identity and remains admissible before its logical snapshot.
@@ -1024,10 +1062,11 @@ impl Controller {
                 && [&self.gallery_loss, &self.gallery_blocked]
                     .into_iter()
                     .any(|evidence| {
-                        evidence.as_ref().is_some_and(|handoff| handoff.matches(&demand.identity))
+                        evidence
+                            .as_ref()
+                            .is_some_and(|handoff| handoff.matches(&demand.identity))
                     })
-        })
-            && !model.has_pending(ApplicationIntentEndpoint::PresentationSelect)
+        }) && !model.has_pending(ApplicationIntentEndpoint::PresentationSelect)
             && self.pending.is_none()
             && !self.gallery_admission_blocked()
         {

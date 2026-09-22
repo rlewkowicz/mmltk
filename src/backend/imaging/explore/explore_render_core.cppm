@@ -28,8 +28,7 @@ using ExploreContainRect = mmltk::backend::imaging::raster::ImageContainRect;
 }
 // Project full-canvas normalized boxes into card-local contained pixels for
 // captions and optional diagnostic regions, without changing retained meaning.
-[[nodiscard]] inline std::array<float, 4U> project_explore_card_box(const ExploreRenderCardDescriptor& card,
-                                                                    const ExploreRenderAnnotationDescriptor& annotation) noexcept {
+[[nodiscard]] inline std::array<float, 4U> project_explore_card_box(const ExploreRenderCardDescriptor& card, const ExploreRenderAnnotationDescriptor& annotation) noexcept {
  std::array<float, 4U> box{};
  for (std::size_t index = 0U; index != box.size(); ++index) {
   const bool horizontal = index % 2U == 0U;
@@ -37,8 +36,7 @@ using ExploreContainRect = mmltk::backend::imaging::raster::ImageContainRect;
   const float origin = static_cast<float>(horizontal ? card.crop_x : card.crop_y) / source;
   const float extent = static_cast<float>(horizontal ? card.crop_width : card.crop_height) / source;
   const float normalized = std::clamp((annotation.box_xyxy[index] - origin) / extent, 0.0F, 1.0F);
-  box[index] =
-   static_cast<float>(horizontal ? card.image_x : card.image_y) + normalized * static_cast<float>(horizontal ? card.image_width : card.image_height);
+  box[index] = static_cast<float>(horizontal ? card.image_x : card.image_y) + normalized * static_cast<float>(horizontal ? card.image_width : card.image_height);
  }
  return box;
 }
@@ -58,15 +56,12 @@ struct ExploreRenderScratchView final {
  std::uint32_t class_capacity = 0U;
  const ExploreRenderTileDescriptor* tiles = nullptr;
  std::uint32_t tile_capacity = 0U;
- [[nodiscard]] bool valid() const noexcept {
-  return cards != nullptr && annotations != nullptr && (rle_pairs != nullptr || rle_capacity == 0U) && (classes != nullptr || class_capacity == 0U);
- }
+ [[nodiscard]] bool valid() const noexcept { return cards != nullptr && annotations != nullptr && (rle_pairs != nullptr || rle_capacity == 0U) && (classes != nullptr || class_capacity == 0U); }
 };
 using ExploreRenderTileBatchView = detail::ExploreRenderTileBatchViewAbi;
 [[nodiscard]] inline bool valid_tile_batch(const ExploreRenderTileBatchView& tiles, const ExploreRenderScratchView& scratch) noexcept {
- return tiles.tile_count != 0U && tiles.tile_count <= kExploreRenderTileCapacity && tiles.tile_count <= tiles.tile_capacity &&
-        tiles.tile_count <= scratch.tile_capacity && scratch.tiles != nullptr && tiles.max_tile_width != 0U && tiles.max_tile_height != 0U &&
-        tiles.viewport_generation != 0U;
+ return tiles.tile_count != 0U && tiles.tile_count <= kExploreRenderTileCapacity && tiles.tile_count <= tiles.tile_capacity && tiles.tile_count <= scratch.tile_capacity && scratch.tiles != nullptr &&
+        tiles.max_tile_width != 0U && tiles.max_tile_height != 0U && tiles.viewport_generation != 0U;
 }
 // Semantic inputs remain separate from the clean image target.  The owner
 // may submit the same descriptors once for a clean target and once for an
@@ -82,34 +77,27 @@ using ExploreRenderedCardSampleGrid = detail::ExploreRenderedCardSampleGridAbi;
 // with placeholder set writes the deterministic placeholder without reading a
 // card; every tile is filtered by the exact viewport generation carried by its
 // lane descriptor.
-[[nodiscard]] ExploreStorageStatus render_explore_atlas_tiles(const ExploreRenderAtlasView& view, const ExploreRenderTileBatchView& tiles,
-                                                              const ExploreRenderSemanticView& semantics, const ExploreRenderScratchView& scratch,
-                                                              const ExploreRenderTargetView& target, std::uintptr_t stream,
-                                                              detail::ExploreRenderDemand demand = {}) noexcept;
-[[nodiscard]] ExploreStorageStatus render_explore_detail(const ExploreRenderDetailView& view, const ExploreRenderSemanticView& semantics,
-                                                         const ExploreRenderScratchView& scratch, const ExploreRenderTargetView& target, std::uintptr_t stream,
-                                                         detail::ExploreRenderDemand demand = {}) noexcept;
+[[nodiscard]] ExploreStorageStatus render_explore_atlas_tiles(const ExploreRenderAtlasView& view, const ExploreRenderTileBatchView& tiles, const ExploreRenderSemanticView& semantics,
+ const ExploreRenderScratchView& scratch, const ExploreRenderTargetView& target, std::uintptr_t stream, detail::ExploreRenderDemand demand = {}) noexcept;
+[[nodiscard]] ExploreStorageStatus render_explore_detail(const ExploreRenderDetailView& view, const ExploreRenderSemanticView& semantics, const ExploreRenderScratchView& scratch,
+ const ExploreRenderTargetView& target, std::uintptr_t stream, detail::ExploreRenderDemand demand = {}) noexcept;
 // Adds the target's nonzero-alpha pixel count to a caller-owned device counter.
 // The caller controls clearing and transfer so diagnostics can reuse storage.
-[[nodiscard]] ExploreStorageStatus count_explore_nonzero_alpha(const ExploreRenderTargetView& target, std::uint64_t* device_count,
-                                                               std::uintptr_t stream) noexcept;
+[[nodiscard]] ExploreStorageStatus count_explore_nonzero_alpha(const ExploreRenderTargetView& target, std::uint64_t* device_count, std::uintptr_t stream) noexcept;
 // Adds a deterministic position-sensitive checksum of every RGBA pixel to a
 // caller-owned device value. This is diagnostic evidence, not image identity.
-[[nodiscard]] ExploreStorageStatus checksum_explore_pixels(const ExploreRenderTargetView& target, std::uint64_t* device_checksum,
-                                                           std::uintptr_t stream) noexcept;
+[[nodiscard]] ExploreStorageStatus checksum_explore_pixels(const ExploreRenderTargetView& target, std::uint64_t* device_checksum, std::uintptr_t stream) noexcept;
 // Counts rendered content, exact immediately-outside padding samples, semantic
 // box-edge pixels, semantic mask-interior pixels, and exact expected immediately-
 // inside content samples against the retained RGBA copy into five caller-owned
 // device values. The reference contains no borrowed compiled-image storage.
-[[nodiscard]] ExploreStorageStatus probe_explore_rendered_card(const ExploreRenderTargetView& clean, const ExploreRenderTargetView& semantic,
-                                                               const ExploreRenderedCardProbe& probe, std::uint64_t* device_counts,
-                                                               std::uintptr_t stream) noexcept;
+[[nodiscard]] ExploreStorageStatus probe_explore_rendered_card(
+ const ExploreRenderTargetView& clean, const ExploreRenderTargetView& semantic, const ExploreRenderedCardProbe& probe, std::uint64_t* device_counts, std::uintptr_t stream) noexcept;
 // Samples a fixed compact grid of clean, semantic, and optional retained clean
 // pixels at floor(percent * extent / 100) independently in each target.
 // The caller supplies ExploreRenderedCardSampleGrid::kSampleCount *
 // ExploreRenderedCardSampleGrid::kWordsPerSample device values
 // and owns all storage, submission, and transfer as for the other probes.
-[[nodiscard]] ExploreStorageStatus sample_explore_rendered_card(const ExploreRenderTargetView& clean, const ExploreRenderTargetView& semantic,
-                                                                const ExploreRenderTargetView& reference, std::uint64_t* device_samples,
-                                                                std::uintptr_t stream) noexcept;
+[[nodiscard]] ExploreStorageStatus sample_explore_rendered_card(
+ const ExploreRenderTargetView& clean, const ExploreRenderTargetView& semantic, const ExploreRenderTargetView& reference, std::uint64_t* device_samples, std::uintptr_t stream) noexcept;
 }  // namespace mmltk::backend::imaging::explore

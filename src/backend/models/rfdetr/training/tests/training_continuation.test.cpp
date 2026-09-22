@@ -23,14 +23,14 @@ r::TrainRequest saved_request() {
 torch::serialize::InputArchive continuation_fixture(const r::TrainRequest& request) {
  torch::serialize::OutputArchive output;
  r::detail::write_training_continuation(output, request,
-                                        {.epoch = 0,
-                                         .best_regular_metric = -std::numeric_limits<double>::infinity(),
-                                         .best_ema_metric = -std::numeric_limits<double>::infinity(),
-                                         .grad_scaler_scale = 1024.0,
-                                         .grad_scaler_growth_tracker = 17,
-                                         .ema_completed_updates = request.use_ema ? 37 : 0,
-                                         .training_attempt_id = "attempt",
-                                         .training_original_descriptor = "original.json"});
+  {.epoch = 0,
+   .best_regular_metric = -std::numeric_limits<double>::infinity(),
+   .best_ema_metric = -std::numeric_limits<double>::infinity(),
+   .grad_scaler_scale = 1024.0,
+   .grad_scaler_growth_tracker = 17,
+   .ema_completed_updates = request.use_ema ? 37 : 0,
+   .training_attempt_id = "attempt",
+   .training_original_descriptor = "original.json"});
  torch::serialize::OutputArchive optimizer;
  mmltk::backend::ml::serialization::write_int(optimizer, "fixture", 1);
  output.write("optimizer", optimizer);
@@ -77,29 +77,13 @@ void test_current_continuation_required_fields() {
  REQUIRE_FALSE(r::detail::read_training_continuation(input).has_value());
 }
 void test_current_continuation_scalar_boundaries() {
- const std::array<std::pair<std::string, c10::IValue>, 22> invalid{
-  {{"epoch", int64_t{-1}},
-   {"epoch", int64_t{std::numeric_limits<int>::max()}},
-   {"grad_scaler_scale", 0.0},
-   {"grad_scaler_scale", std::numeric_limits<double>::infinity()},
-   {"grad_scaler_growth_tracker", int64_t{-1}},
-   {"grad_scaler_growth_tracker", int64_t{std::numeric_limits<int>::max()} + 1},
-   {"ema_completed_updates", int64_t{-1}},
-   {"ema_completed_updates", std::numeric_limits<int64_t>::max()},
-   {"ema_completed_updates", int64_t{1}},
-   {"best_regular_metric", std::numeric_limits<double>::quiet_NaN()},
-   {"best_ema_metric", std::numeric_limits<double>::quiet_NaN()},
-   {"training_attempt_id", std::string{}},
-   {"training_attempt_id", std::string(65, 'a')},
-   {"training_original_descriptor", std::string(mmltk::frameworks::reflection::kMaximumPathBytes + 1, 'a')},
-   {"warmup_epochs", 0.25},
-   {"warmup_momentum", 0.25},
-   {"lr_min_factor", 0.25},
-   {"lr_drop", int64_t{7}},
-   {"lr_scheduler", std::string("cosine")},
-   {"gpu_augment_perceptual_downscale", false},
-   {"optimizer_kind", std::string("invalid")},
-   {"gpu_augment_geometry_probability", 0.125}}};
+ const std::array<std::pair<std::string, c10::IValue>, 22> invalid{{{"epoch", int64_t{-1}}, {"epoch", int64_t{std::numeric_limits<int>::max()}}, {"grad_scaler_scale", 0.0},
+  {"grad_scaler_scale", std::numeric_limits<double>::infinity()}, {"grad_scaler_growth_tracker", int64_t{-1}}, {"grad_scaler_growth_tracker", int64_t{std::numeric_limits<int>::max()} + 1},
+  {"ema_completed_updates", int64_t{-1}}, {"ema_completed_updates", std::numeric_limits<int64_t>::max()}, {"ema_completed_updates", int64_t{1}},
+  {"best_regular_metric", std::numeric_limits<double>::quiet_NaN()}, {"best_ema_metric", std::numeric_limits<double>::quiet_NaN()}, {"training_attempt_id", std::string{}},
+  {"training_attempt_id", std::string(65, 'a')}, {"training_original_descriptor", std::string(mmltk::frameworks::reflection::kMaximumPathBytes + 1, 'a')}, {"warmup_epochs", 0.25},
+  {"warmup_momentum", 0.25}, {"lr_min_factor", 0.25}, {"lr_drop", int64_t{7}}, {"lr_scheduler", std::string("cosine")}, {"gpu_augment_perceptual_downscale", false},
+  {"optimizer_kind", std::string("invalid")}, {"gpu_augment_geometry_probability", 0.125}}};
  for (const auto& [key, value] : invalid) {
   auto source = continuation_fixture(saved_request());
   torch::serialize::OutputArchive output;

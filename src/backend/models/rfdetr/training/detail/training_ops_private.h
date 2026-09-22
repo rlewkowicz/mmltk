@@ -60,8 +60,7 @@ private:
 template <class Result>
 class ParallelTrainingWave final {
 public:
- ParallelTrainingWave(const std::size_t lane_count, const bool active, const int device_id, const DistributedContext& distributed)
-     : distributed_(&distributed) {
+ ParallelTrainingWave(const std::size_t lane_count, const bool active, const int device_id, const DistributedContext& distributed) : distributed_(&distributed) {
   futures_.reserve(lane_count);
   results_.reserve(lane_count);
   if (active) { normalizer_ = std::make_shared<WaveTargetNormalizer>(lane_count, device_id, distributed); }
@@ -240,6 +239,5 @@ struct RoutedTrainingLoss {
 };
 torch::Tensor loss_value_or_zero(const TensorMap&, const torch::Device&, std::string_view);
 scalar_packet::Tensors ordinary_scalar_tensors(const TensorMap&, const torch::Tensor&, const torch::Tensor&);
-RoutedTrainingLoss compute_routed_training_loss(NativeRfDetrModel&, TrainingSupervisionRoute, const ModelOutputs&, const PreparedTargets&,
-                                                const DeviceLossNormalizer&, const DetectionConfig&);
+RoutedTrainingLoss compute_routed_training_loss(NativeRfDetrModel&, TrainingSupervisionRoute, const ModelOutputs&, const PreparedTargets&, const DeviceLossNormalizer&, const DetectionConfig&);
 }  // namespace mmltk::backend::models::rfdetr

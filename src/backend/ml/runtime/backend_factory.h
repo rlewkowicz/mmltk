@@ -106,8 +106,8 @@ public:
  [[nodiscard]] std::size_t output_count() const noexcept { return output_count_; }
 
 private:
- RuntimeSubmission(std::shared_ptr<RuntimeBackend> owner, std::uint64_t generation, std::int32_t device, BorrowedCommandStream stream,
-                   std::uintptr_t completion_event, std::size_t output_count) noexcept
+ RuntimeSubmission(
+  std::shared_ptr<RuntimeBackend> owner, std::uint64_t generation, std::int32_t device, BorrowedCommandStream stream, std::uintptr_t completion_event, std::size_t output_count) noexcept
      : owner_(std::move(owner)), generation_(generation), device_(device), stream_(stream), completion_event_(completion_event), output_count_(output_count) {}
  std::shared_ptr<RuntimeBackend> owner_;
  std::uint64_t generation_ = 0U;
@@ -141,8 +141,8 @@ public:
  [[nodiscard]] virtual const RuntimeModelInfo& model_info() const noexcept = 0;
  [[nodiscard]] std::int32_t device() const noexcept;
  [[nodiscard]] BorrowedCommandStream command_stream() const noexcept;
- [[nodiscard]] RuntimeSubmission Run(const RuntimeTensorBuffer& input, std::span<RuntimeTensorBuffer> outputs, const RuntimeOutputBinding output_binding,
-                                     const RuntimeContinuation continuation, std::shared_ptr<void> retained_storage);
+ [[nodiscard]] RuntimeSubmission Run(
+  const RuntimeTensorBuffer& input, std::span<RuntimeTensorBuffer> outputs, const RuntimeOutputBinding output_binding, const RuntimeContinuation continuation, std::shared_ptr<void> retained_storage);
  void ReleaseAfterCompletion(RuntimeSubmission&& submission);
  [[nodiscard]] RuntimeStatus Close() noexcept;
  [[nodiscard]] virtual std::shared_ptr<RuntimeBackend> MakeLane() const = 0;
@@ -208,9 +208,7 @@ private:
  [[nodiscard]] RuntimeStatus SettleActive(bool observe_completion, LaneState succeeded, LaneState failed) noexcept;
  void AbandonSubmission(const std::uint64_t generation) noexcept {
   std::lock_guard lock(state_mutex_);
-  if (state_ == LaneState::Active && generation == generation_ && active_submission_.has_value()) {
-   static_cast<void>(SettleActive(false, LaneState::Idle, LaneState::Active));
-  }
+  if (state_ == LaneState::Active && generation == generation_ && active_submission_.has_value()) { static_cast<void>(SettleActive(false, LaneState::Idle, LaneState::Active)); }
  }
  mutable std::mutex state_mutex_;
  CudaLane lane_;
@@ -229,14 +227,10 @@ inline void RuntimeSubmission::Abandon() noexcept {
 [[nodiscard]] std::shared_ptr<RuntimeBackend> make_runtime_backend(const RuntimeBackendOptions& options);
 }  // namespace mmltk::backend::ml::runtime
 namespace mmltk::backend::ml::runtime {
-[[nodiscard]] std::size_t validate_runtime_tensor_buffer(const RuntimeTensorDescriptor& descriptor, const RuntimeTensorBuffer& buffer,
-                                                         const RuntimeShape* resolved_shape = nullptr);
+[[nodiscard]] std::size_t validate_runtime_tensor_buffer(const RuntimeTensorDescriptor& descriptor, const RuntimeTensorBuffer& buffer, const RuntimeShape* resolved_shape = nullptr);
 [[nodiscard]] std::shared_ptr<RuntimeBackend> make_onnx_runtime_backend(const RuntimeBackendOptions& options);
-inline void RuntimeBackend::ValidateRuntimeTensorSet(const RuntimeModelInfo& model, const RuntimeTensorBuffer& input,
-                                                     const std::span<RuntimeTensorBuffer> outputs) {
- if (model.input.name.empty() || model.output_count > kMaximumRuntimeOutputs || outputs.size() != model.output_count) {
-  throw std::invalid_argument("runtime tensor-set contract mismatch");
- }
+inline void RuntimeBackend::ValidateRuntimeTensorSet(const RuntimeModelInfo& model, const RuntimeTensorBuffer& input, const std::span<RuntimeTensorBuffer> outputs) {
+ if (model.input.name.empty() || model.output_count > kMaximumRuntimeOutputs || outputs.size() != model.output_count) { throw std::invalid_argument("runtime tensor-set contract mismatch"); }
  static_cast<void>(validate_runtime_tensor_buffer(model.input, input));
  for (std::size_t index = 0U; index < outputs.size(); ++index) { static_cast<void>(validate_runtime_tensor_buffer(model.outputs[index], outputs[index])); }
 }

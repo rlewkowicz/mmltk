@@ -14,8 +14,7 @@ std::expected<CompiledDataset, std::error_code> CompiledDataset::open_source(con
  if (!mapping) { return std::unexpected{mapping.error()}; }
  return open_mapped(path, std::move(*mapping), image_limit, AccessPattern::Random);
 }
-CompiledDataset CompiledDataset::open_mapped(const std::filesystem::path& path, mmltk::common::io::MappedFile mapping, const std::size_t image_limit,
-                                             const AccessPattern access) {
+CompiledDataset CompiledDataset::open_mapped(const std::filesystem::path& path, mmltk::common::io::MappedFile mapping, const std::size_t image_limit, const AccessPattern access) {
  CompiledDataset store;
  store.path_ = path;
  store.mapping_ = std::move(mapping);
@@ -34,16 +33,13 @@ CompiledDataset CompiledDataset::open_mapped(const std::filesystem::path& path, 
  mmltk::backend::data::validate_compiled_original_image_dimensions(store.image_entries_);
  const std::size_t used_rle_bytes = mmltk::backend::data::validate_compiled_label_entries(store.labels_, store.header_, store.rle_pairs_.size_bytes());
  if (used_rle_bytes != store.rle_pairs_.size_bytes()) { throw std::runtime_error("compiled label metadata does not reference the complete RLE block"); }
- if (store.header_.image_height != 0U && store.header_.image_width > std::numeric_limits<std::size_t>::max() / store.header_.image_height) {
-  throw std::overflow_error("compiled mask size overflow");
- }
+ if (store.header_.image_height != 0U && store.header_.image_width > std::numeric_limits<std::size_t>::max() / store.header_.image_height) { throw std::overflow_error("compiled mask size overflow"); }
  const std::size_t mask_pixels = static_cast<std::size_t>(store.header_.image_width) * store.header_.image_height;
  mmltk::backend::data::validate_compiled_rle_pairs(store.labels_, store.rle_pairs_, mask_pixels);
  validate_compiled_annotation_provenance(store.image_entries_, store.labels_);
  store.masks_available_ = std::ranges::any_of(store.labels_, [](const PackedInstance& label) { return label.has_mask(); });
  store.label_index_.reserve(store.image_entries_.size());
- for (const auto& entry : store.image_entries_)
-  store.label_index_.push_back({static_cast<std::uint32_t>(entry.label_offset / sizeof(PackedInstance)), entry.num_instances, 0});
+ for (const auto& entry : store.image_entries_) store.label_index_.push_back({static_cast<std::uint32_t>(entry.label_offset / sizeof(PackedInstance)), entry.num_instances, 0});
  store.catalog_ = std::make_shared<const catalog::ClassCatalog>(compiled_class_catalog(store.header_));
  store.mapping_.advise_aligned_range(sections.index_offset, sections.expected_index_bytes, MADV_SEQUENTIAL);
  store.mapping_.advise_aligned_range(sections.pixel_offset, sections.pixel_blob_size, MADV_HUGEPAGE);
@@ -80,22 +76,17 @@ const float* CompiledDataset::image_pixels(const std::uint32_t compiled_index) c
 }
 mmltk::backend::imaging::resample::ImageResizeGeometry CompiledDataset::geometry(const std::uint32_t compiled_index) const {
  const mmltk::backend::data::ImageEntry& entry = image_entry(compiled_index);
- return mmltk::backend::imaging::resample::compute_image_resize_geometry(entry.original_width, entry.original_height, header_.image_width, header_.image_height,
-                                                                         header_.resize_mode);
+ return mmltk::backend::imaging::resample::compute_image_resize_geometry(entry.original_width, entry.original_height, header_.image_width, header_.image_height, header_.resize_mode);
 }
 std::span<const LabelIndexEntry> CompiledDataset::label_index() const noexcept { return label_index_; }
 const float* CompiledDataset::pixel_blob() const noexcept { return reinterpret_cast<const float*>(mapping_.data() + header_.pixel_offset); }
-bool CompiledDataset::read_images(const std::span<const CompiledImageRead> reads, const std::span<std::byte> destination, const std::atomic<bool>& cancelled,
-                                  const bool prefault) const {
+bool CompiledDataset::read_images(const std::span<const CompiledImageRead> reads, const std::span<std::byte> destination, const std::atomic<bool>& cancelled, const bool prefault) const {
  return read_images_to(reads,
-                       ImageDestination{destination.data(), destination.size(),
-                                        [](void* data, std::size_t offset, std::span<const std::byte> bytes) {
-                                         std::memcpy(static_cast<std::byte*>(data) + offset, bytes.data(), bytes.size());
-                                        }},
-                       cancelled, prefault);
+  ImageDestination{
+   destination.data(), destination.size(), [](void* data, std::size_t offset, std::span<const std::byte> bytes) { std::memcpy(static_cast<std::byte*>(data) + offset, bytes.data(), bytes.size()); }},
+  cancelled, prefault);
 }
-bool CompiledDataset::read_images_to(const std::span<const CompiledImageRead> reads, const ImageDestination destination, const std::atomic<bool>& cancelled,
-                                     const bool prefault) const {
+bool CompiledDataset::read_images_to(const std::span<const CompiledImageRead> reads, const ImageDestination destination, const std::atomic<bool>& cancelled, const bool prefault) const {
  if (!destination.write) throw std::invalid_argument("compiled image destination has no writer");
  constexpr std::size_t kReadExtent = 16U * 1024U * 1024U;
  const auto stride = static_cast<std::size_t>(header_.image_stride);
@@ -105,8 +96,8 @@ bool CompiledDataset::read_images_to(const std::span<const CompiledImageRead> re
  }
  for (std::size_t first = 0; first < reads.size();) {
   std::size_t count = 1;
-  while (first + count < reads.size() && reads[first + count].index == reads[first].index + count &&
-         reads[first + count].destination_offset == reads[first].destination_offset + count * stride && count < std::max<std::size_t>(1, kReadExtent / stride))
+  while (first + count < reads.size() && reads[first + count].index == reads[first].index + count && reads[first + count].destination_offset == reads[first].destination_offset + count * stride &&
+         count < std::max<std::size_t>(1, kReadExtent / stride))
    ++count;
   const auto source_offset = image_entries_[reads[first].index].pixel_offset;
   const auto bytes = count * stride;
@@ -115,8 +106,7 @@ bool CompiledDataset::read_images_to(const std::span<const CompiledImageRead> re
    const auto extent = std::min(kReadExtent, bytes - offset);
    mapping_.advise_aligned_range(source_offset + offset, extent, MADV_WILLNEED);
    if (prefault) mapping_.advise_aligned_range(source_offset + offset, extent, MADV_POPULATE_READ);
-   destination.write(destination.context, reads[first].destination_offset + offset,
-                     {reinterpret_cast<const std::byte*>(mapping_.data() + source_offset + offset), extent});
+   destination.write(destination.context, reads[first].destination_offset + offset, {reinterpret_cast<const std::byte*>(mapping_.data() + source_offset + offset), extent});
    offset += extent;
   }
   first += count;

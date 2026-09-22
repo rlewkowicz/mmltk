@@ -25,8 +25,7 @@ struct RuntimeSplit {
  int lane_threads = 1;
  int cpu_threads = 1;
 };
-RuntimeConfig resolve_runtime_config(int requested_workers, int requested_lanes, int loader_prefetch_factor, const std::string& cpu_affinity_value, int device,
-                                     int numa_node = -1);
+RuntimeConfig resolve_runtime_config(int requested_workers, int requested_lanes, int loader_prefetch_factor, const std::string& cpu_affinity_value, int device, int numa_node = -1);
 RuntimeSplit split_runtime_workers(const RuntimeConfig& config);
 class RuntimeContext;
 class ScopedRuntimeContext final {

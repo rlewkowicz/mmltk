@@ -79,8 +79,8 @@ private:
  std::uint64_t low_ = 0U;
  std::uint64_t high_ = 0U;
 };
-[[nodiscard]] std::vector<ClassMembership> build_memberships(const NormalizedAnnotationIndex& source, SupplementalSamplingStats* stats,
-                                                             mmltk::common::concurrency::CancellationObservation cancel_requested) {
+[[nodiscard]] std::vector<ClassMembership> build_memberships(
+ const NormalizedAnnotationIndex& source, SupplementalSamplingStats* stats, mmltk::common::concurrency::CancellationObservation cancel_requested) {
  stats->full_images = source.images.size();
  stats->full_boxes = source.boxes.size();
  std::vector<ClassMembership> memberships(source.images.size());
@@ -103,17 +103,13 @@ private:
  }
  return memberships;
 }
-[[nodiscard]] std::array<std::uint64_t, kClassCount> coco_class_counts(const NormalizedAnnotationIndex& coco_train,
-                                                                       mmltk::common::concurrency::CancellationObservation cancel_requested) {
+[[nodiscard]] std::array<std::uint64_t, kClassCount> coco_class_counts(const NormalizedAnnotationIndex& coco_train, mmltk::common::concurrency::CancellationObservation cancel_requested) {
  SupplementalSamplingStats ignored;
  const std::vector<ClassMembership> memberships = build_memberships(coco_train, &ignored, cancel_requested);
  return ignored.available_class_images;
 }
-[[nodiscard]] std::vector<std::uint16_t> choose_objects365_shards(const NormalizedAnnotationIndex& objects365,
-                                                                  const std::span<const ClassMembership> memberships,
-                                                                  const std::span<const std::uint64_t> shard_bytes, const std::uint64_t required_images,
-                                                                  std::uint64_t* selected_archive_bytes,
-                                                                  mmltk::common::concurrency::CancellationObservation cancel_requested) {
+[[nodiscard]] std::vector<std::uint16_t> choose_objects365_shards(const NormalizedAnnotationIndex& objects365, const std::span<const ClassMembership> memberships,
+ const std::span<const std::uint64_t> shard_bytes, const std::uint64_t required_images, std::uint64_t* selected_archive_bytes, mmltk::common::concurrency::CancellationObservation cancel_requested) {
  if (shard_bytes.empty()) { throw std::runtime_error("Objects365 sampler requires archive byte identities"); }
  std::vector<ShardSummary> summaries(shard_bytes.size());
  std::array<std::uint64_t, kClassCount> full_class_images{};
@@ -130,22 +126,17 @@ private:
   }
  }
  const std::uint64_t headroom_images =
-  checked_cast<std::uint64_t>((static_cast<unsigned long long>(required_images) * kShardCandidateHeadroomNumerator + kShardCandidateHeadroomDenominator - 1U) /
-                               kShardCandidateHeadroomDenominator,
-                              "Objects365 sampling headroom overflow");
+  checked_cast<std::uint64_t>((static_cast<unsigned long long>(required_images) * kShardCandidateHeadroomNumerator + kShardCandidateHeadroomDenominator - 1U) / kShardCandidateHeadroomDenominator,
+   "Objects365 sampling headroom overflow");
  std::array<std::uint64_t, kClassCount> coverage_targets{};
- for (std::size_t class_id = 0U; class_id < kClassCount; ++class_id) {
-  coverage_targets[class_id] = std::min(full_class_images[class_id], kShardClassCoverageFloor);
- }
+ for (std::size_t class_id = 0U; class_id < kClassCount; ++class_id) { coverage_targets[class_id] = std::min(full_class_images[class_id], kShardClassCoverageFloor); }
  std::vector<std::uint8_t> selected(summaries.size(), std::uint8_t{0U});
  std::array<std::uint64_t, kClassCount> selected_coverage{};
  std::uint64_t selected_images = 0U;
  *selected_archive_bytes = 0U;
  std::vector<std::uint16_t> result;
  result.reserve(summaries.size());
- while (
-  selected_images < headroom_images ||
-  !std::ranges::equal(selected_coverage, coverage_targets, [](const std::uint64_t available, const std::uint64_t target) { return available >= target; })) {
+ while (selected_images < headroom_images || !std::ranges::equal(selected_coverage, coverage_targets, [](const std::uint64_t available, const std::uint64_t target) { return available >= target; })) {
   throw_if_cancelled(cancel_requested);
   std::size_t best = summaries.size();
   long double best_score = -1.0L;
@@ -194,8 +185,7 @@ private:
  std::ranges::sort(result);
  return result;
 }
-[[nodiscard]] SourceSelection make_source_selection(const NormalizedAnnotationIndex& source, std::vector<ClassMembership> memberships,
-                                                    const std::span<const std::uint8_t> eligible_shards) {
+[[nodiscard]] SourceSelection make_source_selection(const NormalizedAnnotationIndex& source, std::vector<ClassMembership> memberships, const std::span<const std::uint8_t> eligible_shards) {
  SourceSelection result;
  result.source = &source;
  result.memberships = std::move(memberships);
@@ -241,8 +231,8 @@ void select_image(SourceSelection* source, const std::uint32_t image_index, std:
   ++(*combined_counts)[*class_id];
  }
 }
-[[nodiscard]] std::size_t rarest_available_class(SourceSelection* objects, SourceSelection* open_images,
-                                                 const std::array<std::uint64_t, kClassCount>& combined_counts, const bool open_only, const bool open_allowed) {
+[[nodiscard]] std::size_t rarest_available_class(
+ SourceSelection* objects, SourceSelection* open_images, const std::array<std::uint64_t, kClassCount>& combined_counts, const bool open_only, const bool open_allowed) {
  std::size_t chosen = kClassCount;
  std::uint64_t chosen_count = std::numeric_limits<std::uint64_t>::max();
  for (std::size_t class_id = 0U; class_id < kClassCount; ++class_id) {
@@ -275,13 +265,9 @@ void select_image(SourceSelection* source, const std::uint32_t image_index, std:
  return result;
 }
 }  // namespace
-CombinedSupplementalSamplingResult sample_combined_supplemental_indices(const NormalizedAnnotationIndex& coco_train,
-                                                                        const NormalizedAnnotationIndex& objects365,
-                                                                        const NormalizedAnnotationIndex& open_images,
-                                                                        const std::span<const std::uint64_t> objects365_shard_bytes,
-                                                                        mmltk::common::concurrency::CancellationObservation cancel_requested) {
- if (coco_train.source != BenchmarkDatasetSource::kCoco2017 || objects365.source != BenchmarkDatasetSource::kObjects365V2 ||
-     open_images.source != BenchmarkDatasetSource::kOpenImagesV7) {
+CombinedSupplementalSamplingResult sample_combined_supplemental_indices(const NormalizedAnnotationIndex& coco_train, const NormalizedAnnotationIndex& objects365,
+ const NormalizedAnnotationIndex& open_images, const std::span<const std::uint64_t> objects365_shard_bytes, mmltk::common::concurrency::CancellationObservation cancel_requested) {
+ if (coco_train.source != BenchmarkDatasetSource::kCoco2017 || objects365.source != BenchmarkDatasetSource::kObjects365V2 || open_images.source != BenchmarkDatasetSource::kOpenImagesV7) {
   throw std::runtime_error("combined supplemental sampler received the wrong sources");
  }
  if (objects365.images.size() < kSupplementalBudgetDenominator || open_images.images.size() < kSupplementalBudgetDenominator) {
@@ -296,8 +282,7 @@ CombinedSupplementalSamplingResult sample_combined_supplemental_indices(const No
  std::vector<ClassMembership> object_memberships = build_memberships(objects365, &object_membership_stats, cancel_requested);
  SupplementalSamplingStats open_membership_stats;
  std::vector<ClassMembership> open_memberships = build_memberships(open_images, &open_membership_stats, cancel_requested);
- result.objects365_shards =
-  choose_objects365_shards(objects365, object_memberships, objects365_shard_bytes, required_objects, &result.objects365_archive_bytes, cancel_requested);
+ result.objects365_shards = choose_objects365_shards(objects365, object_memberships, objects365_shard_bytes, required_objects, &result.objects365_archive_bytes, cancel_requested);
  std::vector<std::uint8_t> eligible_shards(objects365_shard_bytes.size(), std::uint8_t{0U});
  for (const std::uint16_t shard : result.objects365_shards) { eligible_shards[shard] = 1U; }
  SourceSelection object_selection = make_source_selection(objects365, std::move(object_memberships), eligible_shards);
@@ -307,12 +292,9 @@ CombinedSupplementalSamplingResult sample_combined_supplemental_indices(const No
  while (selected_total < result.target_images) {
   if ((selected_total & 4095U) == 0U) { throw_if_cancelled(cancel_requested); }
   const bool open_allowed = open_selection.stats.selected_images < result.open_images_ceiling;
-  const bool force_open = open_selection.stats.selected_images < result.open_images_floor &&
-                          open_selection.stats.selected_images * result.target_images <= selected_total * result.open_images_floor;
+  const bool force_open = open_selection.stats.selected_images < result.open_images_floor && open_selection.stats.selected_images * result.target_images <= selected_total * result.open_images_floor;
   std::size_t chosen_class = rarest_available_class(&object_selection, &open_selection, combined_counts, force_open, open_allowed);
-  if (chosen_class == kClassCount && force_open) {
-   chosen_class = rarest_available_class(&object_selection, &open_selection, combined_counts, false, open_allowed);
-  }
+  if (chosen_class == kClassCount && force_open) { chosen_class = rarest_available_class(&object_selection, &open_selection, combined_counts, false, open_allowed); }
   if (chosen_class == kClassCount) { break; }
   const bool object_available = !force_open && class_candidate_available(&object_selection, chosen_class);
   if (object_available) {
@@ -336,8 +318,7 @@ CombinedSupplementalSamplingResult sample_combined_supplemental_indices(const No
  fill_from_hash_order(&object_selection, result.target_images - result.open_images_floor, &selected_total);
  fill_from_hash_order(&open_selection, result.open_images_ceiling, &selected_total);
  fill_from_hash_order(&object_selection, result.target_images, &selected_total);
- if (selected_total != result.target_images || open_selection.stats.selected_images < result.open_images_floor ||
-     open_selection.stats.selected_images > result.open_images_ceiling) {
+ if (selected_total != result.target_images || open_selection.stats.selected_images < result.open_images_floor || open_selection.stats.selected_images > result.open_images_ceiling) {
   throw std::runtime_error("combined supplemental sampler could not fill its exact target");
  }
  object_selection.stats.selected_boxes = object_selection.selected_boxes;

@@ -9,8 +9,8 @@
 #include "src/backend/data/tests/test_fixture.h"
 #include "src/backend/models/rfdetr/augmentation/tests/copy_paste_fixture.h"
 namespace mmltk::testsupport {
-std::filesystem::path compile_explore_fixture(const std::filesystem::path& temporary_root, const std::string_view fixture_name, const int num_images,
-                                              const ExploreFixtureDimensions dimensions, const ExploreFixtureAnnotations annotations) {
+std::filesystem::path compile_explore_fixture(
+ const std::filesystem::path& temporary_root, const std::string_view fixture_name, const int num_images, const ExploreFixtureDimensions dimensions, const ExploreFixtureAnnotations annotations) {
  const backend::data::testsupport::FixtureSpec fixture{
   .root_dir = (temporary_root / fixture_name).string(),
   .split = "train",
@@ -20,8 +20,7 @@ std::filesystem::path compile_explore_fixture(const std::filesystem::path& tempo
  };
  backend::data::testsupport::create_synthetic_dataset(fixture);
  if (annotations.objects != 0U) {
-  if (annotations.runs_per_object > static_cast<std::size_t>(dimensions.source_height))
-   throw std::invalid_argument("Explore fixture mask rows exceed the image height");
+  if (annotations.runs_per_object > static_cast<std::size_t>(dimensions.source_height)) throw std::invalid_argument("Explore fixture mask rows exceed the image height");
   for (int image = 11; image <= num_images; ++image) {
    std::ostringstream filename;
    filename << std::setfill('0') << std::setw(6) << image << ".jsonl";
@@ -83,12 +82,9 @@ std::filesystem::path compile_explore_fixture(const std::filesystem::path& tempo
  mmltk::backend::data::DatasetCompiler::compile(plan, 0U);
  return backend::data::testsupport::compiled_bin_path(fixture);
 }
-std::filesystem::path compile_explore_membership_fixture(const std::filesystem::path& temporary_root) {
- return compile_explore_fixture(temporary_root, "membership-fixture", 12);
-}
+std::filesystem::path compile_explore_membership_fixture(const std::filesystem::path& temporary_root) { return compile_explore_fixture(temporary_root, "membership-fixture", 12); }
 std::filesystem::path corrupt_explore_label_index(const std::filesystem::path& source, const std::filesystem::path& destination) {
- if (!std::filesystem::copy_file(source, destination, std::filesystem::copy_options::overwrite_existing))
-  throw std::runtime_error("failed to copy Explore corruption fixture");
+ if (!std::filesystem::copy_file(source, destination, std::filesystem::copy_options::overwrite_existing)) throw std::runtime_error("failed to copy Explore corruption fixture");
  std::fstream file{destination, std::ios::binary | std::ios::in | std::ios::out};
  if (!file) throw std::runtime_error("failed to open Explore corruption fixture");
  mmltk::backend::data::FileHeader header{};

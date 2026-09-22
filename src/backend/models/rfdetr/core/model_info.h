@@ -31,8 +31,7 @@ inline void apply_rfdetr_output_roles(ModelInfo& info, std::span<const RfdetrNam
  if (roles.size() > 3) throw std::invalid_argument("too many RF-DETR output roles");
  for (const auto& declared : roles) {
   auto output = std::ranges::find(info.outputs, declared.name, &TensorInfo::name);
-  if (output == info.outputs.end() || declared.role == RfdetrOutputRole::Unspecified ||
-      (output->role != RfdetrOutputRole::Unspecified && output->role != declared.role))
+  if (output == info.outputs.end() || declared.role == RfdetrOutputRole::Unspecified || (output->role != RfdetrOutputRole::Unspecified && output->role != declared.role))
    throw std::invalid_argument("RF-DETR output role metadata disagrees with artifact");
   output->role = declared.role;
  }
@@ -82,8 +81,7 @@ struct RfdetrOutputRoles final {
  if (!logits || !boxes || info.outputs.size() != (masks ? 3U : 2U)) throw std::invalid_argument("RF-DETR requires declared logits and boxes outputs");
  const auto& shape = info.outputs[*logits].shape;
  for (const auto& output : info.outputs)
-  if (output.shape[1] != shape[1] || (output.shape[0] > 0 && shape[0] > 0 && output.shape[0] != shape[0]))
-   throw std::invalid_argument("RF-DETR output batch/query axes disagree");
+  if (output.shape[1] != shape[1] || (output.shape[0] > 0 && shape[0] > 0 && output.shape[0] != shape[0])) throw std::invalid_argument("RF-DETR output batch/query axes disagree");
  info.num_queries = shape[1];
  info.num_classes = shape[2];
  info.has_masks = masks.has_value();

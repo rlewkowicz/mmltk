@@ -97,8 +97,7 @@ public:
  void Publish(ImageStream&, Candidate&, std::uint32_t, std::uint32_t, std::uint64_t, ImageProductBuffer::ProductSubmit);
  // Writes only this candidate's existing storage. The callback receives
  // exact post-growth allocation facts and initializes newly acquired regions.
- void PublishRetained(ImageStream&, Candidate&, std::uint32_t, std::uint32_t, std::uint64_t, ImageProductBuffer::ProductSubmit,
-                      ImageSubmission = ImageSubmission::Complete);
+ void PublishRetained(ImageStream&, Candidate&, std::uint32_t, std::uint32_t, std::uint64_t, ImageProductBuffer::ProductSubmit, ImageSubmission = ImageSubmission::Complete);
  [[nodiscard]] std::array<ImageCopyPath, 2U> CopyFrom(ImageStream&, BorrowedImageProductReadView, std::uint64_t);
  [[nodiscard]] std::array<ImageCopyPath, 2U> CopyFrom(ImageStream&, Candidate&, BorrowedImageProductReadView, std::uint64_t);
  Product Commit(Candidate&&);

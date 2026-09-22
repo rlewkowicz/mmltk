@@ -34,11 +34,17 @@ AnnotationObject make_box_object(const AnnotationBox& box) {
  object.shape = AnnotationBoxShape{box};
  return object;
 }
-AnnotationObject make_mask_object(const AnnotationBox& box, const AnnotationMaskRegion& region, const std::vector<std::uint8_t>& mask,
-                                  const std::uint64_t seed_frame_id, const std::optional<ContentIdentity>& seed_live_frame_id) {
+AnnotationObject make_mask_object(
+ const AnnotationBox& box, const AnnotationMaskRegion& region, const std::vector<std::uint8_t>& mask, const std::uint64_t seed_frame_id, const std::optional<ContentIdentity>& seed_live_frame_id) {
  AnnotationObject object;
  object.shape = AnnotationMaskShape{
-  box, region, mask, seed_frame_id, seed_live_frame_id, nullptr, {},
+  box,
+  region,
+  mask,
+  seed_frame_id,
+  seed_live_frame_id,
+  nullptr,
+  {},
  };
  return object;
 }
@@ -54,8 +60,54 @@ AnnotationFrame make_frame() {
  frame.capture_width = 4;
  frame.capture_height = 4;
  set_annotation_frame_pixels(frame, {
-                                     0,   0, 255, 0,   0, 255, 0,   255, 0,   0,   255, 0,   0,   0, 255, 0,   0, 255, 0,   255, 0,   0,   255, 0,
-                                     255, 0, 0,   255, 0, 0,   255, 255, 255, 255, 255, 255, 255, 0, 0,   255, 0, 0,   255, 255, 255, 255, 255, 255,
+                                     0,
+                                     0,
+                                     255,
+                                     0,
+                                     0,
+                                     255,
+                                     0,
+                                     255,
+                                     0,
+                                     0,
+                                     255,
+                                     0,
+                                     0,
+                                     0,
+                                     255,
+                                     0,
+                                     0,
+                                     255,
+                                     0,
+                                     255,
+                                     0,
+                                     0,
+                                     255,
+                                     0,
+                                     255,
+                                     0,
+                                     0,
+                                     255,
+                                     0,
+                                     0,
+                                     255,
+                                     255,
+                                     255,
+                                     255,
+                                     255,
+                                     255,
+                                     255,
+                                     0,
+                                     0,
+                                     255,
+                                     0,
+                                     0,
+                                     255,
+                                     255,
+                                     255,
+                                     255,
+                                     255,
+                                     255,
                                     });
  return frame;
 }
@@ -109,15 +161,13 @@ std::vector<std::uint8_t> make_single_pixel_seed_mask() {
  return seed_mask;
 }
 AnnotationObject make_capture_space_mask_preview_object(const std::uint64_t seed_frame_id, const std::optional<ContentIdentity>& seed_live_frame_id) {
- AnnotationObject instance =
-  make_mask_object(AnnotationBox{1, 1, 3, 3}, AnnotationMaskRegion{0, 0, 4, 4}, make_single_pixel_seed_mask(), seed_frame_id, seed_live_frame_id);
+ AnnotationObject instance = make_mask_object(AnnotationBox{1, 1, 3, 3}, AnnotationMaskRegion{0, 0, 4, 4}, make_single_pixel_seed_mask(), seed_frame_id, seed_live_frame_id);
  instance.category_index = 0U;
  return instance;
 }
-std::vector<AnnotationResolvedObject> make_capture_space_preview_result(const AnnotationFrame& cropped, const std::uint64_t seed_frame_id,
-                                                                        const std::optional<ContentIdentity>& seed_live_frame_id, const bool live_mode) {
- return resolve_annotation_objects(cropped, make_single_category("reticle"), {make_capture_space_mask_preview_object(seed_frame_id, seed_live_frame_id)},
-                                   live_mode);
+std::vector<AnnotationResolvedObject> make_capture_space_preview_result(
+ const AnnotationFrame& cropped, const std::uint64_t seed_frame_id, const std::optional<ContentIdentity>& seed_live_frame_id, const bool live_mode) {
+ return resolve_annotation_objects(cropped, make_single_category("reticle"), {make_capture_space_mask_preview_object(seed_frame_id, seed_live_frame_id)}, live_mode);
 }
 const AnnotationResolvedObject& require_single_resolved_object(const std::vector<AnnotationResolvedObject>& resolved_objects) {
  REQUIRE(resolved_objects.size() == 1U);
@@ -130,15 +180,14 @@ void assert_resolved_bbox_and_mask(const AnnotationResolvedObject& resolved, con
  REQUIRE(resolved.bbox.y2 == bbox.y2);
  REQUIRE(resolved.mask_rle == mask_rle);
 }
-void assert_single_resolved_bbox_and_mask(const std::vector<AnnotationResolvedObject>& resolved_objects, const AnnotationBox& bbox,
-                                          const std::string_view mask_rle) {
+void assert_single_resolved_bbox_and_mask(const std::vector<AnnotationResolvedObject>& resolved_objects, const AnnotationBox& bbox, const std::string_view mask_rle) {
  assert_resolved_bbox_and_mask(require_single_resolved_object(resolved_objects), bbox, mask_rle);
 }
 std::vector<AnnotationResolvedObject> build_reticle_preview(const AnnotationFrame& frame, AnnotationObject object, const bool live_mode = false) {
  return resolve_annotation_objects(frame, make_single_category("reticle"), {std::move(object)}, live_mode);
 }
-void assert_frame_window(const AnnotationFrame& frame, const std::uint32_t width, const std::uint32_t height, const std::uint32_t view_x,
-                         const std::uint32_t view_y, const std::uint32_t capture_width, const std::uint32_t capture_height) {
+void assert_frame_window(const AnnotationFrame& frame, const std::uint32_t width, const std::uint32_t height, const std::uint32_t view_x, const std::uint32_t view_y, const std::uint32_t capture_width,
+ const std::uint32_t capture_height) {
  REQUIRE(frame.width == width);
  REQUIRE(frame.height == height);
  REQUIRE(frame.view_x == view_x);
@@ -152,8 +201,8 @@ struct ReloadedScene {
 };
 // Saves a single-object scene under a fresh temp root and reloads it, requiring exactly one loaded
 // object and the expected single category name.
-ReloadedScene save_and_reload_single_object(const char* temp_name, const char* split, const AnnotationFrame& frame, AnnotationCategories categories,
-                                            const AnnotationObject& object, const char* expected_category_name) {
+ReloadedScene save_and_reload_single_object(
+ const char* temp_name, const char* split, const AnnotationFrame& frame, AnnotationCategories categories, const AnnotationObject& object, const char* expected_category_name) {
  const ScopedTempDir temporary{temp_name};
  const fs::path& temp_root = temporary.path();
  AnnotationSaveConfig config;
@@ -185,8 +234,7 @@ TEST_CASE("test_preview_builds_mask_from_box_minus_sup", "[backend][imaging][ann
  assert_single_resolved_bbox_and_mask(preview, AnnotationBox{2, 0, 4, 2}, "2:2 6:2");
 }
 TEST_CASE("test_preview_nosup_restores_suppressed_pixels", "[backend][imaging][annotation]") {
- const std::vector<AnnotationResolvedObject> preview =
-  build_reticle_preview(make_frame(), make_reticle_box_preview_object(AnnotationBox{0, 0, 2, 2}, true, true));
+ const std::vector<AnnotationResolvedObject> preview = build_reticle_preview(make_frame(), make_reticle_box_preview_object(AnnotationBox{0, 0, 2, 2}, true, true));
  assert_single_resolved_bbox_and_mask(preview, AnnotationBox{0, 0, 2, 2}, "0:2 4:2");
 }
 TEST_CASE("test_resolved_crop_preserves_mask_alpha", "[backend][imaging][annotation]") {
@@ -220,7 +268,22 @@ TEST_CASE("test_prediction_mask_decode_and_bbox", "[backend][imaging][annotation
 }
 TEST_CASE("test_mask_rle_round_trip_decode", "[backend][imaging][annotation]") {
  const std::vector<std::uint8_t> mask = {
-  0, 1, 1, 0, 0, 0, 1, 0, 1, 1, 0, 0, 0, 0, 0, 1,
+  0,
+  1,
+  1,
+  0,
+  0,
+  0,
+  1,
+  0,
+  1,
+  1,
+  0,
+  0,
+  0,
+  0,
+  0,
+  1,
  };
  const std::string encoded = encode_annotation_mask_rle(mask);
  const std::vector<std::uint8_t> decoded = decode_annotation_mask_rle(encoded, 4, 4);
@@ -285,8 +348,7 @@ TEST_CASE("test_persistent_capture_space_model_mask_survives_live_mode", "[backe
 TEST_CASE("test_live_model_mask_requires_matching_live_frame_identity", "[backend][imaging][annotation]") {
  AnnotationFrame cropped = make_capture_space_frame();
  cropped.live_frame_id = ContentIdentity{41U, cropped.frame_id};
- const std::vector<AnnotationResolvedObject> preview =
-  make_capture_space_preview_result(cropped, cropped.frame_id, ContentIdentity{99U, cropped.frame_id}, true);
+ const std::vector<AnnotationResolvedObject> preview = make_capture_space_preview_result(cropped, cropped.frame_id, ContentIdentity{99U, cropped.frame_id}, true);
  assert_single_resolved_bbox_and_mask(preview, AnnotationBox{0, 0, 2, 2}, "0:4");
 }
 TEST_CASE("test_live_model_mask_uses_matching_live_frame_identity_even_if_display_id_drifts", "[backend][imaging][annotation]") {
@@ -359,7 +421,7 @@ TEST_CASE("test_load_annotation_categories_rejects_missing_required_schema_field
  write_text_file(categories_path, R"({"classes":[]})");
  REQUIRE(load_annotation_categories(temp_root).items.empty());
  write_text_file(categories_path,
-                 R"({
+  R"({
   "meta": {
     "dataset_name": "sample",
     "version": "3.0",
@@ -376,7 +438,7 @@ TEST_CASE("test_load_annotation_categories_rejects_wrong_schema_version", "[back
  const ScopedTempDir temporary{"mmltk-test-gui-annotation-version"};
  const fs::path& temp_root = temporary.path();
  write_text_file(temp_root / "categories.json",
-                 R"({
+  R"({
   "meta": {
     "dataset_name": "sample",
     "version": "2.0",
@@ -395,15 +457,15 @@ TEST_CASE("test_load_annotation_scene_objects_rejects_malformed_shape_records", 
  const fs::path& temp_root = temporary.path();
  const fs::path scene_path = temp_root / "scene.jsonl";
  write_text_file(scene_path,
-                 R"({"class":"point","shape_type":"point","image_size_wh":[32,24],"view_origin_xy":[0,0],"capture_size_wh":[32,24],"shape":{}}
+  R"({"class":"point","shape_type":"point","image_size_wh":[32,24],"view_origin_xy":[0,0],"capture_size_wh":[32,24],"shape":{}}
 )");
  expect_runtime_error_contains([&]() { (void)load_annotation_scene_objects(scene_path, nullptr); }, "point record is missing `shape.xy`");
  write_text_file(scene_path,
-                 R"({"class":"curve","shape_type":"spline","image_size_wh":[32,24],"view_origin_xy":[0,0],"capture_size_wh":[32,24],"shape":{"closed":false}}
+  R"({"class":"curve","shape_type":"spline","image_size_wh":[32,24],"view_origin_xy":[0,0],"capture_size_wh":[32,24],"shape":{"closed":false}}
 )");
  expect_runtime_error_contains([&]() { (void)load_annotation_scene_objects(scene_path, nullptr); }, "spline record is missing array `shape.knots`");
  write_text_file(scene_path,
-                 R"({"class":"pose","shape_type":"skeleton","image_size_wh":[32,24],"view_origin_xy":[0,0],"capture_size_wh":[32,24],"shape":{"nodes":[]}}
+  R"({"class":"pose","shape_type":"skeleton","image_size_wh":[32,24],"view_origin_xy":[0,0],"capture_size_wh":[32,24],"shape":{"nodes":[]}}
 )");
  expect_runtime_error_contains([&]() { (void)load_annotation_scene_objects(scene_path, nullptr); }, "skeleton record is missing array `shape.edges`");
 }
@@ -429,8 +491,7 @@ TEST_CASE("test_scene_round_trip_preserves_spline_topology", "[backend][imaging]
    },
   },
  };
- const ReloadedScene scene =
-  save_and_reload_single_object("mmltk-test-gui-annotation-spline", "train", cropped, make_single_category("curve"), spline, "curve");
+ const ReloadedScene scene = save_and_reload_single_object("mmltk-test-gui-annotation-spline", "train", cropped, make_single_category("curve"), spline, "curve");
  const AnnotationSplineShape* loaded_spline = std::get_if<AnnotationSplineShape>(&scene.objects.front().shape);
  REQUIRE(loaded_spline != nullptr);
  REQUIRE(loaded_spline->closed);
@@ -507,7 +568,7 @@ TEST_CASE("test_dense_source_catalog_reorder_preserves_jsonl_meaning", "[backend
  REQUIRE(load_annotation_scene_objects(root / "empty.jsonl", &categories).empty());
  REQUIRE(categories.items.size() == 3U);
  for (const auto text : {R"({"classes":[{"id":0,"name":"same"},{"id":1,"name":"same"}]})", R"({"classes":[{"id":1,"name":"a"},{"id":1,"name":"b"}]})",
-                         R"({"classes":[{"id":1,"name":"a"},{"id":3,"name":"b"}]})", R"({"classes":[{"id":0,"name":""}]})"}) {
+       R"({"classes":[{"id":1,"name":"a"},{"id":3,"name":"b"}]})", R"({"classes":[{"id":0,"name":""}]})"}) {
   write_text_file(root / "categories.json", text);
   REQUIRE_THROWS(load_annotation_categories(root));
  }

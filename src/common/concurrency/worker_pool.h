@@ -14,7 +14,7 @@ namespace mmltk::common::concurrency {
 class WorkerPool final {
 public:
  WorkerPool(size_t worker_count, std::vector<int> cpu_affinity = {}, std::string thread_name_prefix = "fastworker", std::size_t queued_capacity = 0U,
-            const mmltk::common::system::ExecutionPlacement* placement = nullptr, bool storage_worker = true);
+  const mmltk::common::system::ExecutionPlacement* placement = nullptr, bool storage_worker = true);
  ~WorkerPool();
  WorkerPool(const WorkerPool&) = delete;
  WorkerPool& operator=(const WorkerPool&) = delete;

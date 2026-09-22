@@ -38,10 +38,8 @@ std::size_t workspace_bytes(std::uint32_t width, std::uint32_t height, bool alph
  const auto axis_count = common::math::checked_add<std::size_t>(width, height, "perceptual image offset overflow");
  const auto axes = common::math::checked_multiply(axis_count, sizeof(Footprint), "perceptual image extent overflow");
  const auto pixels = common::math::checked_multiply<std::size_t>(width, height, "perceptual image extent overflow");
- const auto planes =
-  common::math::checked_multiply(pixels, sizeof(Moment) + sizeof(Coefficient) + (alpha ? sizeof(float) : 0), "perceptual image extent overflow");
- if (axes > workspace_limit - sizeof(TransferTable) || planes > workspace_limit - sizeof(TransferTable) - axes)
-  throw std::length_error("perceptual CUDA workspace exceeds 256 MiB");
+ const auto planes = common::math::checked_multiply(pixels, sizeof(Moment) + sizeof(Coefficient) + (alpha ? sizeof(float) : 0), "perceptual image extent overflow");
+ if (axes > workspace_limit - sizeof(TransferTable) || planes > workspace_limit - sizeof(TransferTable) - axes) throw std::length_error("perceptual CUDA workspace exceeds 256 MiB");
  return sizeof(TransferTable) + axes + planes;
 }
 Workspace bind_workspace(void* storage, std::uint32_t width, std::uint32_t height, bool alpha) {
@@ -56,8 +54,7 @@ Workspace bind_workspace(void* storage, std::uint32_t width, std::uint32_t heigh
  return result;
 }
 __global__ void prepare_kernel(Workspace work, std::uint32_t sw, std::uint32_t sh, std::uint32_t dw, std::uint32_t dh, bool axes, bool transfer) {
- for (std::size_t i = blockIdx.x * std::size_t(blockDim.x) + threadIdx.x; i < static_cast<std::size_t>(max(axes ? max(dw, dh) : 0U, transfer ? 256U : 0U));
-      i += std::size_t(blockDim.x) * gridDim.x) {
+ for (std::size_t i = blockIdx.x * std::size_t(blockDim.x) + threadIdx.x; i < static_cast<std::size_t>(max(axes ? max(dw, dh) : 0U, transfer ? 256U : 0U)); i += std::size_t(blockDim.x) * gridDim.x) {
   if (transfer && i < 256) work.transfer->linear[i] = decode(float(i) * (1.0F / 255.0F));
   if (axes && i < dw) work.x[i] = footprint(sw, dw, static_cast<std::uint32_t>(i));
   if (axes && i < dh) work.y[i] = footprint(sh, dh, static_cast<std::uint32_t>(i));
@@ -159,8 +156,7 @@ __global__ void output_kernel(Workspace work, RgbMutableImageView output, std::s
   const auto left = x ? i - 1 : i, up = y ? i - width : i, corner = y ? left - width : left;
   float alpha = 1;
   if constexpr (Format == RgbPixelFormat::RGBA8) alpha = work.alpha[i];
-  store<Format>(output, x, y, reconstruct(work.moments[i], work.coefficients[i], work.coefficients[left], work.coefficients[up], work.coefficients[corner]),
-                alpha, *work.transfer);
+  store<Format>(output, x, y, reconstruct(work.moments[i], work.coefficients[i], work.coefficients[left], work.coefficients[up], work.coefficients[corner]), alpha, *work.transfer);
  }
 }
 template <RgbPixelFormat Format, bool Integer>
@@ -175,8 +171,7 @@ void launch(RgbConstImageView source, RgbMutableImageView output, Workspace work
   large_moments<Format, Integer><<<static_cast<unsigned>(std::min<std::size_t>(count, 65535)), threads, 0, stream>>>(source, work, output.layout.width, count);
  require_cuda(cudaGetLastError());
  const auto tiles = ((std::size_t(output.layout.width) + 15) / 16) * ((std::size_t(output.layout.height) + 15) / 16);
- coefficients_kernel<<<static_cast<unsigned>(std::min<std::size_t>(tiles, 65535)), threads, 0, stream>>>(work, output.layout.width, output.layout.height,
-                                                                                                         tiles);
+ coefficients_kernel<<<static_cast<unsigned>(std::min<std::size_t>(tiles, 65535)), threads, 0, stream>>>(work, output.layout.width, output.layout.height, tiles);
  require_cuda(cudaGetLastError());
  output_kernel<Format><<<blocks(count), threads, 0, stream>>>(work, output, count);
  require_cuda(cudaGetLastError());
@@ -255,8 +250,7 @@ struct GpuPerceptualDownscaler::Impl {
   CUdeviceptr base = 0;
   std::size_t bytes = 0;
   const auto address = static_cast<CUdeviceptr>(reinterpret_cast<std::uintptr_t>(pointer));
-  CUpointer_attribute attributes[]{CU_POINTER_ATTRIBUTE_CONTEXT, CU_POINTER_ATTRIBUTE_MEMORY_TYPE, CU_POINTER_ATTRIBUTE_DEVICE_ORDINAL,
-                                   CU_POINTER_ATTRIBUTE_MEMPOOL_HANDLE};
+  CUpointer_attribute attributes[]{CU_POINTER_ATTRIBUTE_CONTEXT, CU_POINTER_ATTRIBUTE_MEMORY_TYPE, CU_POINTER_ATTRIBUTE_DEVICE_ORDINAL, CU_POINTER_ATTRIBUTE_MEMPOOL_HANDLE};
   void* results[]{static_cast<void*>(&allocation_context), &memory_type, &allocation_device, static_cast<void*>(&pool)};
   const auto pointer_status = cuPointerGetAttributes(4, attributes, results, address);
   // Stream-ordered pool allocations belong to a device, not a context.
@@ -265,9 +259,7 @@ struct GpuPerceptualDownscaler::Impl {
   if (pointer_status != CUDA_SUCCESS || memory_type != CU_MEMORYTYPE_DEVICE || !own_allocation) return {pointer_status, false, AdmissionQuery::Pointer};
   // RANGE_START_ADDR/RANGE_SIZE can include unmapped reserved VA.
   const auto range_status = cuMemGetAddressRange(&base, &bytes, address);
-  return {range_status,
-          range_status == CUDA_SUCCESS && address >= base && address - base <= bytes && extent <= bytes - static_cast<std::size_t>(address - base),
-          AdmissionQuery::Range};
+  return {range_status, range_status == CUDA_SUCCESS && address >= base && address - base <= bytes && extent <= bytes - static_cast<std::size_t>(address - base), AdmissionQuery::Range};
  }
  DriverAdmission check_stream(cudaStream_t stream) const {
   if (!stream) return {};  // Exact current context proves null-stream identity.
@@ -310,8 +302,8 @@ void GpuPerceptualDownscaler::finish() {
  }
  impl_->settle_transfer();
 }
-void GpuPerceptualDownscaler::downscale(RgbConstImageView source, RgbMutableImageView destination, cudaStream_t stream,
-                                        std::shared_ptr<const void> source_custody, std::shared_ptr<const void> destination_custody) {
+void GpuPerceptualDownscaler::downscale(
+ RgbConstImageView source, RgbMutableImageView destination, cudaStream_t stream, std::shared_ptr<const void> source_custody, std::shared_ptr<const void> destination_custody) {
  if (!impl_) throw std::runtime_error("perceptual CUDA owner has terminal custody");
  const auto validated = validate_pair(source, destination);
  const bool identity = validated.identity;
@@ -343,10 +335,9 @@ void GpuPerceptualDownscaler::downscale(RgbConstImageView source, RgbMutableImag
    if (source.data != destination.data) {
     const auto geometry = identity_geometry(source.layout);
     for (unsigned plane = 0; plane < geometry.planes; ++plane)
-     require_cuda(cudaMemcpy2DAsync(static_cast<std::uint8_t*>(destination.data) + plane * destination.layout.plane_stride_bytes,
-                                    destination.layout.row_stride_bytes,
-                                    static_cast<const std::uint8_t*>(source.data) + plane * source.layout.plane_stride_bytes, source.layout.row_stride_bytes,
-                                    geometry.row_bytes, source.layout.height, cudaMemcpyDeviceToDevice, stream));
+     require_cuda(cudaMemcpy2DAsync(static_cast<std::uint8_t*>(destination.data) + plane * destination.layout.plane_stride_bytes, destination.layout.row_stride_bytes,
+      static_cast<const std::uint8_t*>(source.data) + plane * source.layout.plane_stride_bytes, source.layout.row_stride_bytes, geometry.row_bytes, source.layout.height, cudaMemcpyDeviceToDevice,
+      stream));
    }
   } else {
    const bool grow = required > impl_->capacity;
@@ -358,14 +349,12 @@ void GpuPerceptualDownscaler::downscale(RgbConstImageView source, RgbMutableImag
     impl_->capacity = required;
    }
    const Workspace work = bind_workspace(impl_->storage.active(), destination.layout.width, destination.layout.height, alpha);
-   const bool prepare_axes = grow || impl_->sw != source.layout.width || impl_->sh != source.layout.height || impl_->dw != destination.layout.width ||
-                             impl_->dh != destination.layout.height || impl_->alpha != alpha;
+   const bool prepare_axes =
+    grow || impl_->sw != source.layout.width || impl_->sh != source.layout.height || impl_->dw != destination.layout.width || impl_->dh != destination.layout.height || impl_->alpha != alpha;
    const bool prepare_transfer = source.layout.format != RgbPixelFormat::PlanarUnitSrgbF32 && !impl_->transfer_ready && !impl_->transfer_pending;
    if (prepare_axes || prepare_transfer) {
-    const auto count =
-     std::max<std::size_t>({prepare_axes ? destination.layout.width : 0U, prepare_axes ? destination.layout.height : 0U, prepare_transfer ? 256U : 0U});
-    prepare_kernel<<<blocks(count), threads, 0, stream>>>(work, source.layout.width, source.layout.height, destination.layout.width, destination.layout.height,
-                                                          prepare_axes, prepare_transfer);
+    const auto count = std::max<std::size_t>({prepare_axes ? destination.layout.width : 0U, prepare_axes ? destination.layout.height : 0U, prepare_transfer ? 256U : 0U});
+    prepare_kernel<<<blocks(count), threads, 0, stream>>>(work, source.layout.width, source.layout.height, destination.layout.width, destination.layout.height, prepare_axes, prepare_transfer);
     require_cuda(cudaGetLastError());
     if (prepare_transfer) impl_->transfer_pending = &slot;
     impl_->sw = source.layout.width;

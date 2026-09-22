@@ -82,21 +82,18 @@ public:
  }
  ~OnnxRuntimeBackend() override { static_cast<void>(Close()); }
  [[nodiscard]] const RuntimeModelInfo& model_info() const noexcept override { return info_; }
- [[nodiscard]] RawSubmission Submit(const RuntimeTensorBuffer& input, const std::span<RuntimeTensorBuffer> outputs,
-                                    const RuntimeContinuation continuation) override {
+ [[nodiscard]] RawSubmission Submit(const RuntimeTensorBuffer& input, const std::span<RuntimeTensorBuffer> outputs, const RuntimeContinuation continuation) override {
   cuda_lane().Activate();
   OnnxBindingScope binding_scope{*binding_};
   const Ort::MemoryInfo memory("Cuda", OrtArenaAllocator, options_.device, OrtMemTypeDefault);
   const auto input_shape = shape_extents(input.shape);
-  Ort::Value input_value =
-   Ort::Value::CreateTensor(memory, input.device_data, input.capacity_bytes, input_shape.data(), input_shape.size(), onnx_element_type(input.element_type));
+  Ort::Value input_value = Ort::Value::CreateTensor(memory, input.device_data, input.capacity_bytes, input_shape.data(), input_shape.size(), onnx_element_type(input.element_type));
   binding_->BindInput(info_.input.name.c_str(), input_value);
   output_values_.clear();
   for (std::size_t index = 0U; index < outputs.size(); ++index) {
    RuntimeTensorBuffer& output = outputs[index];
    const auto output_shape = shape_extents(output.shape);
-   output_values_.push_back(Ort::Value::CreateTensor(memory, output.device_data, output.capacity_bytes, output_shape.data(), output_shape.size(),
-                                                     onnx_element_type(output.element_type)));
+   output_values_.push_back(Ort::Value::CreateTensor(memory, output.device_data, output.capacity_bytes, output_shape.data(), output_shape.size(), onnx_element_type(output.element_type)));
    binding_->BindOutput(info_.outputs[index].name.c_str(), output_values_.back());
   }
   try {
@@ -147,7 +144,5 @@ private:
  std::vector<Ort::Value> output_values_;
 };
 }  // namespace
-[[nodiscard]] std::shared_ptr<RuntimeBackend> make_onnx_runtime_backend(const RuntimeBackendOptions& options) {
- return std::make_shared<OnnxRuntimeBackend>(options);
-}
+[[nodiscard]] std::shared_ptr<RuntimeBackend> make_onnx_runtime_backend(const RuntimeBackendOptions& options) { return std::make_shared<OnnxRuntimeBackend>(options); }
 }  // namespace mmltk::backend::ml::runtime

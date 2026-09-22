@@ -30,8 +30,7 @@ constexpr mmltk::entrypoints::tools::OnnxToolMainConfig kTestConfig{
  return mmltk::entrypoints::tools::run_onnx_tool_main(static_cast<int>(argv.size()), argv.data(), kTestConfig, operation);
 }
 void test_onnx_tool_main_routes_one_model_after_logging_options() {
- CHECK(run_onnx_tool({"mmltk-rfdetr-onnx-info", "--log-level=off", "--log-file", "/tmp/mmltk-onnx-info-test.log", "--log-dir", "/tmp", "/tmp/model.onnx"}) ==
-       0);
+ CHECK(run_onnx_tool({"mmltk-rfdetr-onnx-info", "--log-level=off", "--log-file", "/tmp/mmltk-onnx-info-test.log", "--log-dir", "/tmp", "/tmp/model.onnx"}) == 0);
  CHECK(captured_model_path == "/tmp/model.onnx");
 }
 void test_onnx_tool_main_rejects_a_missing_model() {
@@ -93,10 +92,6 @@ void test_onnx_fatal_errors_remain_visible_with_diagnostics_off() {
  CHECK(text.find("onnx-info-test: observed model operation failure") != std::string::npos);
 }
 }  // namespace
-TEST_CASE("test_onnx_tool_main_routes_one_model_after_logging_options", "[entrypoints][tools][onnx]") {
- test_onnx_tool_main_routes_one_model_after_logging_options();
-}
+TEST_CASE("test_onnx_tool_main_routes_one_model_after_logging_options", "[entrypoints][tools][onnx]") { test_onnx_tool_main_routes_one_model_after_logging_options(); }
 TEST_CASE("test_onnx_tool_main_rejects_a_missing_model", "[entrypoints][tools][onnx]") { test_onnx_tool_main_rejects_a_missing_model(); }
-TEST_CASE("test_onnx_fatal_errors_remain_visible_with_diagnostics_off", "[entrypoints][tools][onnx]") {
- test_onnx_fatal_errors_remain_visible_with_diagnostics_off();
-}
+TEST_CASE("test_onnx_fatal_errors_remain_visible_with_diagnostics_off", "[entrypoints][tools][onnx]") { test_onnx_fatal_errors_remain_visible_with_diagnostics_off(); }

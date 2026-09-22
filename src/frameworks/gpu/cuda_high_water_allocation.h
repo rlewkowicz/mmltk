@@ -19,12 +19,8 @@ struct CudaReleaseReceipt final {
  if (status == cudaErrorContextIsDestroyed || status == cudaErrorCudartUnloading) return CudaFailureDisposition::Unproved;
  return CudaFailureDisposition::Retryable;
 }
-[[nodiscard]] constexpr CudaReleaseReceipt cuda_release_receipt(const cudaError_t status) noexcept {
- return {.disposition = cuda_failure_disposition(status), .failure = status};
-}
-[[nodiscard]] constexpr bool cuda_custody_unproved(const cudaError_t status) noexcept {
- return cuda_failure_disposition(status) == CudaFailureDisposition::Unproved;
-}
+[[nodiscard]] constexpr CudaReleaseReceipt cuda_release_receipt(const cudaError_t status) noexcept { return {.disposition = cuda_failure_disposition(status), .failure = status}; }
+[[nodiscard]] constexpr bool cuda_custody_unproved(const cudaError_t status) noexcept { return cuda_failure_disposition(status) == CudaFailureDisposition::Unproved; }
 // Sole identity owner for one reusable high-water allocation. A replacement
 // is adopted only after the incumbent release succeeds. A retryable incumbent
 // release retains that incumbent and transfers the candidate to the one

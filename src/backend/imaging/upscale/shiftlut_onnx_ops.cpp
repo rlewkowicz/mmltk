@@ -92,8 +92,8 @@ public:
    auto output = context.GetOutput(0, shape.data(), shape.size());
    auto* first = reinterpret_cast<std::int8_t*>(storage_.data() + kTableElements);
    checked(enqueue(input.GetTensorData<float>(), storage_.data(), first, first + kScratchElements, output.GetTensorMutableData<float>(), height, width,
-                   static_cast<cudaStream_t>(context.GetGPUComputeStream()), storage_.Decisions(static_cast<std::size_t>(height) * width)),
-           "submit ShiftLUT stages");
+            static_cast<cudaStream_t>(context.GetGPUComputeStream()), storage_.Decisions(static_cast<std::size_t>(height) * width)),
+    "submit ShiftLUT stages");
    return nullptr;
   } catch (const std::exception& error) { return Ort::GetApi().CreateStatus(ORT_RUNTIME_EXCEPTION, error.what()); } catch (...) {
    return Ort::GetApi().CreateStatus(ORT_RUNTIME_EXCEPTION, "unknown ShiftLUT failure");
@@ -139,8 +139,7 @@ Operators::~Operators() = default;
 void Operators::Register(Ort::SessionOptions& options) { options.Add(impl_->domain); }
 cudaError_t Operators::Release() noexcept { return impl_->storage.Release(); }
 cudaError_t Operators::ReadDecisions(std::span<std::int8_t> target) noexcept { return impl_->storage.ReadDecisions(target); }
-void configure_verification_session(Operators& operators, Ort::SessionOptions& options, const int device, const bool enable_cuda_graph,
-                                    const cudaStream_t stream) {
+void configure_verification_session(Operators& operators, Ort::SessionOptions& options, const int device, const bool enable_cuda_graph, const cudaStream_t stream) {
  operators.Register(options);
  Ort::CUDAProviderOptions cuda;
  cuda.Update(std::unordered_map<std::string, std::string>{

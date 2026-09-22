@@ -12,9 +12,7 @@ public:
 private:
  torch::Tensor host_, device_;
  int device_index_;
- friend void publish_prediction_count(std::shared_ptr<PredictionCountStorage>& storage, const torch::Tensor& count,
-                                      mmltk::backend::ml::runtime::AnalysisAnnotationStorage& output, int device);
+ friend void publish_prediction_count(std::shared_ptr<PredictionCountStorage>& storage, const torch::Tensor& count, mmltk::backend::ml::runtime::AnalysisAnnotationStorage& output, int device);
 };
-void publish_prediction_count(std::shared_ptr<PredictionCountStorage>& storage, const torch::Tensor& count,
-                              mmltk::backend::ml::runtime::AnalysisAnnotationStorage& output, int device);
+void publish_prediction_count(std::shared_ptr<PredictionCountStorage>& storage, const torch::Tensor& count, mmltk::backend::ml::runtime::AnalysisAnnotationStorage& output, int device);
 }  // namespace mmltk::backend::models::rfdetr

@@ -104,8 +104,8 @@ struct MaskShape {
  std::vector<MaskRun> runs;
  bool operator==(const MaskShape& other) const {
   const bool deferred_equal = deferred == nullptr || other.deferred == nullptr ? deferred == other.deferred : *deferred == *other.deferred;
-  return box == other.box && region == other.region && mask == other.mask && seed_frame_id == other.seed_frame_id &&
-         seed_live_frame_id == other.seed_live_frame_id && deferred_equal && runs == other.runs;
+  return box == other.box && region == other.region && mask == other.mask && seed_frame_id == other.seed_frame_id && seed_live_frame_id == other.seed_live_frame_id && deferred_equal &&
+         runs == other.runs;
  }
 };
 struct SplineShape {

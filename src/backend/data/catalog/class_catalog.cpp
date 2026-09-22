@@ -7,8 +7,7 @@ ClassCatalog::ClassCatalog(std::vector<std::string> names, std::size_t name_capa
  lookup_.reserve(names_.size());
  for (std::size_t index = 0; index < names_.size(); ++index) {
   const auto& name = names_[index];
-  if (name.empty() || name.size() > name_capacity || name.find('\0') != std::string::npos)
-   throw std::invalid_argument("class catalog contains an empty, NUL-containing, or overlong name");
+  if (name.empty() || name.size() > name_capacity || name.find('\0') != std::string::npos) throw std::invalid_argument("class catalog contains an empty, NUL-containing, or overlong name");
   if (!lookup_.emplace(name, static_cast<std::uint32_t>(index)).second) throw std::invalid_argument("class catalog contains duplicate name: " + name);
  }
 }

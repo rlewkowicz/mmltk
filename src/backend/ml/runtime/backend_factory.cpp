@@ -26,8 +26,8 @@ RuntimeBackend::~RuntimeBackend() {
  std::lock_guard lock(state_mutex_);
  state_ = LaneState::Closed;
 }
-RuntimeSubmission RuntimeBackend::Run(const RuntimeTensorBuffer& input, std::span<RuntimeTensorBuffer> outputs, const RuntimeOutputBinding output_binding,
-                                      const RuntimeContinuation continuation, std::shared_ptr<void> retained_storage) {
+RuntimeSubmission RuntimeBackend::Run(
+ const RuntimeTensorBuffer& input, std::span<RuntimeTensorBuffer> outputs, const RuntimeOutputBinding output_binding, const RuntimeContinuation continuation, std::shared_ptr<void> retained_storage) {
  std::shared_ptr<RuntimeBackend> owner = weak_from_this().lock();
  if (!owner) throw std::logic_error("runtime lane must have shared lifetime ownership");
  std::unique_lock lane_lock(state_mutex_);
@@ -36,8 +36,7 @@ RuntimeSubmission RuntimeBackend::Run(const RuntimeTensorBuffer& input, std::spa
   output_binding.Invoke(device(), command_stream().native_handle, outputs);
   ValidateRuntimeTensorSet(model_info(), input, outputs);
   const RawSubmission submitted = Submit(input, outputs, continuation);
-  if (submitted.device != device() || submitted.output_count != outputs.size() || !submitted.stream || submitted.stream != command_stream() ||
-      submitted.completion_event == 0U) {
+  if (submitted.device != device() || submitted.output_count != outputs.size() || !submitted.stream || submitted.stream != command_stream() || submitted.completion_event == 0U) {
    active_submission_.emplace(ActiveSubmission{.receipt = submitted, .retained_storage = std::move(retained_storage)});
    state_ = LaneState::Active;
    const auto retired = SettleActive(false, LaneState::Idle, LaneState::Active);
@@ -56,8 +55,7 @@ void RuntimeBackend::ReleaseAfterCompletion(RuntimeSubmission&& submission) {
  if (submission.owner_.get() != this) throw std::invalid_argument("runtime submission does not belong to this active lane");
  const std::shared_ptr<RuntimeBackend> keep_alive = submission.owner_;
  std::unique_lock lane_lock(state_mutex_);
- if (state_ != LaneState::Active || !active_submission_.has_value() || submission.generation_ != generation_)
-  throw std::invalid_argument("runtime submission is not the active lane receipt");
+ if (state_ != LaneState::Active || !active_submission_.has_value() || submission.generation_ != generation_) throw std::invalid_argument("runtime submission is not the active lane receipt");
  const RuntimeStatus completed = SettleActive(true, LaneState::Idle, LaneState::Active);
  submission.Disarm();
  lane_lock.unlock();
@@ -103,8 +101,7 @@ RuntimeStatus RuntimeBackend::SettleActive(const bool observe_completion, const 
  }
  return status;
 }
-RuntimeBackend::CudaLane::CudaLane(const std::int32_t device, const BorrowedCommandStream command_stream)
-    : device_(device), stream_(command_stream.native_handle), owns_stream_(!command_stream) {
+RuntimeBackend::CudaLane::CudaLane(const std::int32_t device, const BorrowedCommandStream command_stream) : device_(device), stream_(command_stream.native_handle), owns_stream_(!command_stream) {
  if (device_ < 0) throw std::invalid_argument("runtime CUDA lane device is invalid");
  Activate();
  if (owns_stream_) {

@@ -172,12 +172,12 @@ void exercise_schedule_capacity(const std::string& path, const bool h2d) {
   std::uint32_t shards, rank;
   bool drop;
  };
- const std::array cases{Schedule{32U, 8, 1U, 0U, false}, Schedule{7U, 8, 3U, 2U, false},  Schedule{7U, 8, 4U, 3U, false}, Schedule{32U, 8, 1U, 0U, true},
-                        Schedule{4U, 2, 1U, 0U, false},  Schedule{10U, 2, 1U, 0U, false}, Schedule{7U, 8, 1U, 0U, true}};
+ const std::array cases{Schedule{32U, 8, 1U, 0U, false}, Schedule{7U, 8, 3U, 2U, false}, Schedule{7U, 8, 4U, 3U, false}, Schedule{32U, 8, 1U, 0U, true}, Schedule{4U, 2, 1U, 0U, false},
+  Schedule{10U, 2, 1U, 0U, false}, Schedule{7U, 8, 1U, 0U, true}};
  for (const auto schedule : cases)
   for (const bool shuffle : {false, true}) {
-   INFO("batch " << schedule.batch << " prefetch " << schedule.prefetch << " shards " << schedule.shards << " rank " << schedule.rank << " drop "
-                 << schedule.drop << " shuffle " << shuffle << " H2D " << h2d);
+   INFO("batch " << schedule.batch << " prefetch " << schedule.prefetch << " shards " << schedule.shards << " rank " << schedule.rank << " drop " << schedule.drop << " shuffle " << shuffle << " H2D "
+                 << h2d);
    DatasetLoader::Config config;
    config.compiled_path = path;
    config.batch_size = schedule.batch;
@@ -576,8 +576,7 @@ void test_roundtrip_end_to_end() {
  cudaDeviceProp device{};
  ensure_cuda_ok(cudaGetDeviceProperties(&device, 0), "selected data test device");
  INFO("CUDA device 0: " << device.name << " CC " << device.major << "." << device.minor);
- const mmltk::frameworks::gpu::DeviceContext context(0, mmltk::frameworks::gpu::cuda_image_copy_backend(),
-                                                     mmltk::frameworks::gpu::DeviceContextMode::PrimaryInterop);
+ const mmltk::frameworks::gpu::DeviceContext context(0, mmltk::frameworks::gpu::cuda_image_copy_backend(), mmltk::frameworks::gpu::DeviceContextMode::PrimaryInterop);
  mmltk::frameworks::gpu::ImageStream owned_stream(context);
  const auto compute_stream = reinterpret_cast<cudaStream_t>(owned_stream.native_handle());
  create_synthetic_dataset(fixture);

@@ -53,9 +53,8 @@ public:
  virtual ~PredictRuntime() = default;
  virtual void Close() noexcept {}
  [[nodiscard]] virtual bool HasUnsafeCustody() const noexcept { return false; }
- [[nodiscard]] virtual contracts::ComputeTerminal Run(mmltk::backend::models::rfdetr::PredictRequest, std::stop_token, const ComputeProgressSink&,
-                                                      const ProductSink&, const PlaybackGate&, VisualExtent maximum, const ContextProvider&,
-                                                      const PreviewRetirement&) = 0;
+ [[nodiscard]] virtual contracts::ComputeTerminal Run(mmltk::backend::models::rfdetr::PredictRequest, std::stop_token, const ComputeProgressSink&, const ProductSink&, const PlaybackGate&,
+  VisualExtent maximum, const ContextProvider&, const PreviewRetirement&) = 0;
 };
 class CudaPredictRuntime final : public PredictRuntime {
 public:
@@ -63,8 +62,8 @@ public:
  ~CudaPredictRuntime() override;
  void Close() noexcept override;
  [[nodiscard]] bool HasUnsafeCustody() const noexcept override;
- [[nodiscard]] contracts::ComputeTerminal Run(mmltk::backend::models::rfdetr::PredictRequest, std::stop_token, const ComputeProgressSink&, const ProductSink&,
-                                              const PlaybackGate&, VisualExtent maximum, const ContextProvider&, const PreviewRetirement&) override;
+ [[nodiscard]] contracts::ComputeTerminal Run(mmltk::backend::models::rfdetr::PredictRequest, std::stop_token, const ComputeProgressSink&, const ProductSink&, const PlaybackGate&,
+  VisualExtent maximum, const ContextProvider&, const PreviewRetirement&) override;
 
 private:
  class Impl;
@@ -115,10 +114,9 @@ class PredictSystem final {
 public:
  [[= contracts::reflection::direct::InteractionEndpoint{}]] void Input(WorkspaceMouse);
  void SetInputPeer(std::uint64_t);
- using visual_source =
-  VisualSourceProjection<PredictSnapshot, PresentationSourceKind::Predict, mmltk::frameworks::reflection::member_path<&PredictSnapshot::frame>,
-                         // Logical progress does not invalidate committed pixels or metadata.
-                         mmltk::frameworks::reflection::member_path<&PredictSnapshot::frame, &VisualFrame::revision>, PredictImageMetadata>;
+ using visual_source = VisualSourceProjection<PredictSnapshot, PresentationSourceKind::Predict, mmltk::frameworks::reflection::member_path<&PredictSnapshot::frame>,
+  // Logical progress does not invalidate committed pixels or metadata.
+  mmltk::frameworks::reflection::member_path<&PredictSnapshot::frame, &VisualFrame::revision>, PredictImageMetadata>;
  using progress_type = PredictProgressState;
  using event_type = std::variant<PredictProgress, PredictChanged, PredictFailed>;
  PredictSystem(SettingsSystem&, DatasetSystem&, ModelSystem&, VisualDeviceSettings, PredictRuntimeFactory, SystemEventSink<event_type> = {});

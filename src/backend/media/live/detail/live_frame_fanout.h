@@ -25,9 +25,7 @@ struct LiveRawFrameReadbackResult final {
  const std::uint8_t* pixels = nullptr;
  std::size_t bytes = 0U;
  bool completed = false;
- [[nodiscard]] inline bool valid() const noexcept {
-  return frame.valid() && ((completed && pixels != nullptr && bytes != 0U) || (!completed && pixels == nullptr && bytes == 0U));
- }
+ [[nodiscard]] inline bool valid() const noexcept { return frame.valid() && ((completed && pixels != nullptr && bytes != 0U) || (!completed && pixels == nullptr && bytes == 0U)); }
 };
 class LiveRawFrameCache final {
 public:

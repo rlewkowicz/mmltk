@@ -84,26 +84,21 @@ constexpr TableBlock table_block(std::size_t index) noexcept {
  } else if (family == TableFamily::Up) {
   result.name = {'U', 'P', '_', 'M', 'S', 'B'};
  } else {
-  result.name = {
-   family == TableFamily::Pointwise ? 'P' : 'D', 'W', static_cast<char>('0' + static_cast<char>(stage)), '_', family == TableFamily::Low ? 'L' : 'M', 'S', 'B'};
+  result.name = {family == TableFamily::Pointwise ? 'P' : 'D', 'W', static_cast<char>('0' + static_cast<char>(stage)), '_', family == TableFamily::Low ? 'L' : 'M', 'S', 'B'};
  }
  return result;
 }
 inline constexpr std::size_t kTableElements = table_offset(TableFamily::Shifts) + dimensions(TableFamily::Shifts).elements();
 inline constexpr std::size_t kTableBytes = kTableElements * sizeof(float);
 inline constexpr std::size_t kMaximumTilePixels = static_cast<std::size_t>(kMaximumTileExtent) * static_cast<std::size_t>(kMaximumTileExtent);
-constexpr std::size_t scratch_elements(std::size_t pixels) noexcept {
- return static_cast<std::size_t>(kRotatedBatch) * static_cast<std::size_t>(kChannels) * pixels;
-}
+constexpr std::size_t scratch_elements(std::size_t pixels) noexcept { return static_cast<std::size_t>(kRotatedBatch) * static_cast<std::size_t>(kChannels) * pixels; }
 inline constexpr std::size_t kScratchElements = scratch_elements(kMaximumTilePixels);
 constexpr std::size_t decision_elements(std::size_t pixels) noexcept { return kDecisionCheckpoints * scratch_elements(pixels); }
 constexpr std::size_t decision_offset(Stage stage, Decision decision, std::size_t pixels) noexcept {
  return (static_cast<std::size_t>(stage) * kDecisionsPerStage + static_cast<std::size_t>(decision)) * scratch_elements(pixels);
 }
 inline constexpr std::size_t kDecisionStorageOffset = 2 * kScratchElements;
-constexpr std::size_t resident_bytes(std::size_t decision_capacity) noexcept {
- return kTableBytes + (kDecisionStorageOffset + decision_elements(decision_capacity)) * sizeof(std::int8_t);
-}
+constexpr std::size_t resident_bytes(std::size_t decision_capacity) noexcept { return kTableBytes + (kDecisionStorageOffset + decision_elements(decision_capacity)) * sizeof(std::int8_t); }
 // Cold-path validation accepts unaligned little-endian FP32 storage.
 void validate_tables(std::span<const std::byte> bytes);
 }  // namespace mmltk::backend::imaging::upscale::shiftlut

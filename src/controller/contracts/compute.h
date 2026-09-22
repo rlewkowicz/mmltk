@@ -25,24 +25,17 @@ inline constexpr std::size_t kComputePathCapacity = std::size_t{4U} * 1024U;
 [[nodiscard]] inline std::string bounded_compute_output(const std::string_view value) { return std::string{value.substr(0U, kComputePathCapacity)}; }
 enum class ComputeOperationOutcome : std::uint8_t { Idle, Running, Succeeded, Failed, Cancelled, CancellationRequested, Refused };
 inline constexpr std::array kComputeTerminalPresentations{
- terminal_presentation::Policy{ComputeOperationOutcome::Idle, terminal_presentation::Classification::Refused, "compute.idle",
-                               "No compute operation has completed."},
- terminal_presentation::Policy{ComputeOperationOutcome::Running, terminal_presentation::Classification::Refused, "compute.running",
-                               "The compute operation is still running."},
+ terminal_presentation::Policy{ComputeOperationOutcome::Idle, terminal_presentation::Classification::Refused, "compute.idle", "No compute operation has completed."},
+ terminal_presentation::Policy{ComputeOperationOutcome::Running, terminal_presentation::Classification::Refused, "compute.running", "The compute operation is still running."},
  terminal_presentation::Policy{ComputeOperationOutcome::Succeeded, terminal_presentation::Classification::Success, "compute.succeeded", ""},
- terminal_presentation::Policy{ComputeOperationOutcome::Failed, terminal_presentation::Classification::Failed, "compute.failed",
-                               "The compute operation failed."},
- terminal_presentation::Policy{ComputeOperationOutcome::Cancelled, terminal_presentation::Classification::Cancelled, "compute.cancelled",
-                               "The compute operation was cancelled."},
- terminal_presentation::Policy{ComputeOperationOutcome::CancellationRequested, terminal_presentation::Classification::Cancelled,
-                               "compute.cancellation_requested", "Compute cancellation was requested."},
- terminal_presentation::Policy{ComputeOperationOutcome::Refused, terminal_presentation::Classification::Refused, "compute.refused",
-                               "The compute operation was refused."},
+ terminal_presentation::Policy{ComputeOperationOutcome::Failed, terminal_presentation::Classification::Failed, "compute.failed", "The compute operation failed."},
+ terminal_presentation::Policy{ComputeOperationOutcome::Cancelled, terminal_presentation::Classification::Cancelled, "compute.cancelled", "The compute operation was cancelled."},
+ terminal_presentation::Policy{
+  ComputeOperationOutcome::CancellationRequested, terminal_presentation::Classification::Cancelled, "compute.cancellation_requested", "Compute cancellation was requested."},
+ terminal_presentation::Policy{ComputeOperationOutcome::Refused, terminal_presentation::Classification::Refused, "compute.refused", "The compute operation was refused."},
 };
 static_assert(terminal_presentation::complete(kComputeTerminalPresentations));
-[[nodiscard]] consteval const auto& materialized_terminal_presentation_policy(std::type_identity<ComputeOperationOutcome>) {
- return kComputeTerminalPresentations;
-}
+[[nodiscard]] consteval const auto& materialized_terminal_presentation_policy(std::type_identity<ComputeOperationOutcome>) { return kComputeTerminalPresentations; }
 [[nodiscard]] inline constexpr std::optional<std::uint64_t> next_compute_generation(const std::uint64_t frontier) noexcept {
  if (frontier == std::numeric_limits<std::uint64_t>::max()) return std::nullopt;
  return frontier + 1U;
@@ -71,11 +64,9 @@ struct ComputeTerminal final {
 // The only construction boundary for public compute operation state.  Keeping
 // the complete record here prevents individual systems from publishing partial
 // aggregates with inconsistent field initialization or byte bounds.
-[[nodiscard]] inline ComputeTerminal make_compute_terminal(const ComputeOperationOutcome outcome, const std::uint64_t generation = 0U,
-                                                           const std::uint64_t completed = 0U, const std::string_view output = {},
-                                                           const std::string_view detail = {}) {
- return {
-  .outcome = outcome, .generation = generation, .completed = completed, .output = bounded_compute_output(output), .detail = bounded_compute_error(detail)};
+[[nodiscard]] inline ComputeTerminal make_compute_terminal(
+ const ComputeOperationOutcome outcome, const std::uint64_t generation = 0U, const std::uint64_t completed = 0U, const std::string_view output = {}, const std::string_view detail = {}) {
+ return {.outcome = outcome, .generation = generation, .completed = completed, .output = bounded_compute_output(output), .detail = bounded_compute_error(detail)};
 }
 [[nodiscard]] inline ComputeTerminal compute_failure_terminal(const std::exception_ptr failure, const std::string_view fallback) {
  try {
@@ -88,16 +79,11 @@ struct ComputeProgress final {
  std::uint64_t sequence = 0U;
  [[= reflection::ProgressField{reflection::ProgressFieldSemantic::Completed}]] std::uint64_t completed = 0U;
  [[= reflection::ProgressField{reflection::ProgressFieldSemantic::Total}]] std::uint64_t total = 0U;
- [[= reflection::ProgressField{
-  reflection::ProgressFieldSemantic::StageOrStatus}]][[= mmltk::frameworks::reflection::MaxBytes{kComputeStatusCapacity}]] std::string status;
- [[nodiscard]] bool valid() const noexcept {
-  return sequence != 0U && valid_compute_text(status, kComputeStatusCapacity) && (total == 0U || completed <= total);
- }
+ [[= reflection::ProgressField{reflection::ProgressFieldSemantic::StageOrStatus}]][[= mmltk::frameworks::reflection::MaxBytes{kComputeStatusCapacity}]] std::string status;
+ [[nodiscard]] bool valid() const noexcept { return sequence != 0U && valid_compute_text(status, kComputeStatusCapacity) && (total == 0U || completed <= total); }
  bool operator==(const ComputeProgress&) const = default;
 };
-[[nodiscard]] inline bool compute_progress_follows(const ComputeProgress& value, const std::uint64_t sequence_frontier) noexcept {
- return value.valid() && value.sequence > sequence_frontier;
-}
+[[nodiscard]] inline bool compute_progress_follows(const ComputeProgress& value, const std::uint64_t sequence_frontier) noexcept { return value.valid() && value.sequence > sequence_frontier; }
 struct ComputeUiState final {
  // The frontier advances when a system begins an operation, so a worker infrastructure failure can leave the
  // last domain terminal at an earlier generation without permitting that operation identity to be reused.

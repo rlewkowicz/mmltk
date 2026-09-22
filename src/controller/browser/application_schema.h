@@ -131,13 +131,13 @@ template <std::meta::info Member, class Annotation>
 }
 template <std::meta::info Member>
 [[nodiscard]] consteval bool endpoint_member_eligible() {
- return std::meta::is_function(Member) && std::meta::is_public(Member) && std::meta::is_user_declared(Member) && !std::meta::is_constructor(Member) &&
-        !std::meta::is_destructor(Member) && !std::meta::is_static_member(Member);
+ return std::meta::is_function(Member) && std::meta::is_public(Member) && std::meta::is_user_declared(Member) && !std::meta::is_constructor(Member) && !std::meta::is_destructor(Member) &&
+        !std::meta::is_static_member(Member);
 }
 template <std::meta::info Member>
 [[nodiscard]] consteval bool snapshot_member_eligible() {
- return std::meta::is_function(Member) && std::meta::is_public(Member) && std::meta::is_user_declared(Member) && !std::meta::is_constructor(Member) &&
-        !std::meta::is_destructor(Member) && !std::meta::is_static_member(Member);
+ return std::meta::is_function(Member) && std::meta::is_public(Member) && std::meta::is_user_declared(Member) && !std::meta::is_constructor(Member) && !std::meta::is_destructor(Member) &&
+        !std::meta::is_static_member(Member);
 }
 template <std::meta::info Member>
 [[nodiscard]] consteval std::size_t endpoint_annotation_count() {
@@ -237,8 +237,8 @@ template <class Declaration>
  if (dialog_count > 1U) throw "settings declaration has duplicate file dialogs";
  if (provider_count > 1U) throw "settings declaration has duplicate catalog providers";
  if (result.workflows && !result.workflows->valid()) throw "settings declaration has invalid feature scope";
- if (result.file_dialog && (result.file_dialog->title.empty() || result.file_dialog->filter.empty() || result.file_dialog->pattern.empty() ||
-                            !mmltk::frameworks::reflection::enum_contains(result.file_dialog->mode)))
+ if (result.file_dialog &&
+     (result.file_dialog->title.empty() || result.file_dialog->filter.empty() || result.file_dialog->pattern.empty() || !mmltk::frameworks::reflection::enum_contains(result.file_dialog->mode)))
   throw "settings declaration has invalid file-dialog metadata";
  return result;
 }
@@ -292,8 +292,7 @@ constexpr void visit_settings_leaves(Visitor& visitor, std::string prefix, const
    if constexpr (vocabulary::is_leaf_v<Member>) {
     constexpr auto path = mmltk::frameworks::reflection::member_path<Prefix..., Declaration::pointer>;
     static_assert(runtime_boundary_projectable<Member>(), "settings leaf contains a type unsupported by the runtime Rust projection");
-    static_assert(!metadata.file_dialog || std::same_as<Member, std::string> || std::same_as<Member, std::filesystem::path>,
-                  "file dialog requires a path-like settings leaf");
+    static_assert(!metadata.file_dialog || std::same_as<Member, std::string> || std::same_as<Member, std::filesystem::path>, "file dialog requires a path-like settings leaf");
     constexpr auto dialog = [&] {
      if constexpr (constexpr auto workflow_dialog = mmltk::controller::contracts::workflow_path_dialog<path>(); workflow_dialog)
       return std::optional<ApplicationFileDialogFact>{{workflow_dialog->title, workflow_dialog->filter, workflow_dialog->pattern, workflow_dialog->mode}};
@@ -320,8 +319,7 @@ constexpr void visit_settings_leaves(Visitor& visitor, std::string prefix, const
 }
 // CLEANUP-OFF: Default traversal carries runtime values while leaf traversal carries compile-time metadata.
 template <class Value, class Visitor>
-void visit_settings_defaults(Visitor& visitor, const Value& defaults, std::string prefix,
-                             const mmltk::controller::contracts::reflection::ReflectedWorkflowPolicy inherited) {
+void visit_settings_defaults(Visitor& visitor, const Value& defaults, std::string prefix, const mmltk::controller::contracts::reflection::ReflectedWorkflowPolicy inherited) {
  using Type = std::remove_cvref_t<Value>;
  namespace vocabulary = mmltk::controller::contracts::settings_vocabulary;
  static_assert(!vocabulary::is_leaf_v<Type>);
@@ -438,8 +436,7 @@ template <class Type>
    using Field = typename Declaration::member_type;
    ++members;
    if (fact.member_name == "bytes") {
-    if constexpr (ByteSequence<Field>::value && Sequence<Field>::value)
-     bytes = ByteSequence<Field>::extent == policy.capacity && std::same_as<typename Sequence<Field>::value_type, char>;
+    if constexpr (ByteSequence<Field>::value && Sequence<Field>::value) bytes = ByteSequence<Field>::extent == policy.capacity && std::same_as<typename Sequence<Field>::value_type, char>;
    } else if (fact.member_name == "size") {
     if constexpr (std::unsigned_integral<Field>) size = std::numeric_limits<Field>::max() >= policy.capacity;
    }
@@ -461,9 +458,9 @@ concept ProjectableCatalogProvider = requires(const typename Provider::row_type&
 template <class Value>
 [[nodiscard]] consteval bool runtime_scalar_projectable() {
  using Type = std::remove_cvref_t<Value>;
- return std::same_as<Type, void> || mmltk::frameworks::reflection::kReflectedIntegerScalar<Type> || std::same_as<Type, float> || std::same_as<Type, double> ||
-        std::same_as<Type, std::byte> || std::same_as<Type, std::string> || std::same_as<Type, std::filesystem::path> ||
-        std::same_as<Type, mmltk::frameworks::serialization::wire::Value> || std::same_as<Type, mmltk::frameworks::serialization::wire::FlatValue>;
+ return std::same_as<Type, void> || mmltk::frameworks::reflection::kReflectedIntegerScalar<Type> || std::same_as<Type, float> || std::same_as<Type, double> || std::same_as<Type, std::byte> ||
+        std::same_as<Type, std::string> || std::same_as<Type, std::filesystem::path> || std::same_as<Type, mmltk::frameworks::serialization::wire::Value> ||
+        std::same_as<Type, mmltk::frameworks::serialization::wire::FlatValue>;
 }
 template <BoundaryProjection Projection, class Value>
 [[nodiscard]] consteval bool boundary_projectable() {
@@ -499,9 +496,8 @@ template <BoundaryProjection Projection, class Value>
   return supported;
  } else if constexpr (Projection == BoundaryProjection::Catalog) {
   return std::same_as<Type, std::string_view> ||
-         (runtime_scalar_projectable<Type>() && !std::same_as<Type, void> && !std::same_as<Type, std::string> && !std::same_as<Type, std::filesystem::path> &&
-          !std::same_as<Type, std::byte> && !std::same_as<Type, mmltk::frameworks::serialization::wire::Value> &&
-          !std::same_as<Type, mmltk::frameworks::serialization::wire::FlatValue>);
+         (runtime_scalar_projectable<Type>() && !std::same_as<Type, void> && !std::same_as<Type, std::string> && !std::same_as<Type, std::filesystem::path> && !std::same_as<Type, std::byte> &&
+          !std::same_as<Type, mmltk::frameworks::serialization::wire::Value> && !std::same_as<Type, mmltk::frameworks::serialization::wire::FlatValue>);
  } else {
   return runtime_scalar_projectable<Type>();
  }
@@ -576,8 +572,7 @@ constexpr void visit_settings_relations(Visitor& visitor) {
       using Relation = mmltk::frameworks::reflection::catalog_provider_relation<Provider>;
       constexpr auto selector = mmltk::frameworks::reflection::member_path<Prefix..., Declaration::pointer>;
       static_assert(std::same_as<Member, mmltk::frameworks::reflection::accessor_value_t<typename Relation::destination_type, Relation::destination_selector>>);
-      constexpr auto override_path =
-       mmltk::frameworks::reflection::rebase_member_path<Root, typename Relation::destination_type>(selector, Relation::destination_override_state);
+      constexpr auto override_path = mmltk::frameworks::reflection::rebase_member_path<Root, typename Relation::destination_type>(selector, Relation::destination_override_state);
       using Override = mmltk::frameworks::reflection::accessor_value_t<Root, override_path>;
       static_assert(std::same_as<Override, typename Relation::override_state_type>);
       static_assert(mmltk::frameworks::reflection::kOpaqueRelationStorage<Override>);
@@ -630,8 +625,7 @@ template <class Root, class Relation, auto Selector>
     if (leaf.identity != identity) return;
     ++matches;
     using Destination = accessor_value_t<Root, destination>;
-    valid = valid && std::same_as<Member, Destination> && leaf.mutable_leaf && leaf.path == rendered.view() &&
-            leaf.stable_id == application_settings_field_stable_id(rendered.view());
+    valid = valid && std::same_as<Member, Destination> && leaf.mutable_leaf && leaf.path == rendered.view() && leaf.stable_id == application_settings_field_stable_id(rendered.view());
    };
    visit_settings_leaves<Root, Root>(leaf_visitor, {}, all_feature_workflows());
    valid = valid && matches == 1U;
@@ -641,8 +635,8 @@ template <class Root, class Relation, auto Selector>
 }
 template <class Root, class Value, auto... Prefix>
 // CPD-OFF: Relation auditing and relation visitation recurse the same native tree but produce different facts.
-consteval void audit_settings_relations(std::vector<mmltk::frameworks::reflection::ReflectedMemberIdentity>& opaque,
-                                        std::vector<mmltk::frameworks::reflection::ReflectedMemberIdentity>& claims, bool& valid) {
+consteval void audit_settings_relations(
+ std::vector<mmltk::frameworks::reflection::ReflectedMemberIdentity>& opaque, std::vector<mmltk::frameworks::reflection::ReflectedMemberIdentity>& claims, bool& valid) {
  using Type = std::remove_cvref_t<Value>;
  namespace vocabulary = mmltk::controller::contracts::settings_vocabulary;
  if constexpr (vocabulary::is_leaf_v<Type> || mmltk::frameworks::reflection::kOpaqueRelationStorage<Type>) {
@@ -654,8 +648,7 @@ consteval void audit_settings_relations(std::vector<mmltk::frameworks::reflectio
    if constexpr (requires { Declaration::pointer; }) {
     using Member = typename Declaration::member_type;
     constexpr auto path = mmltk::frameworks::reflection::member_path<Prefix..., Declaration::pointer>;
-    if constexpr (mmltk::frameworks::reflection::kOpaqueRelationStorage<Member>)
-     opaque.push_back(mmltk::frameworks::reflection::accessor_member_identity<Root, path>());
+    if constexpr (mmltk::frameworks::reflection::kOpaqueRelationStorage<Member>) opaque.push_back(mmltk::frameworks::reflection::accessor_member_identity<Root, path>());
     auto provider_visitor = [&]<class Provider>() {
      if constexpr (mmltk::frameworks::reflection::HasCatalogProviderRelation<Provider>) {
       using Relation = mmltk::frameworks::reflection::catalog_provider_relation<Provider>;
@@ -927,8 +920,7 @@ void append_type(FingerprintSink& sink) {
    append_type<Field>(sink);
   };
   visit_fields<Type>(visitor);
- } else if constexpr (std::same_as<Type, mmltk::frameworks::serialization::wire::Value> ||
-                      std::same_as<Type, mmltk::frameworks::serialization::wire::FlatValue>) {
+ } else if constexpr (std::same_as<Type, mmltk::frameworks::serialization::wire::Value> || std::same_as<Type, mmltk::frameworks::serialization::wire::FlatValue>) {
   sink.append(std::same_as<Type, mmltk::frameworks::serialization::wire::FlatValue> ? "flat-dynamic" : "dynamic");
  } else if constexpr (std::same_as<Type, std::string_view>) {
   sink.append("static-string");
@@ -959,8 +951,7 @@ struct ReflectedSystem final {
 template <class Composition, auto Member>
 [[nodiscard]] consteval std::meta::info application_system_member() {
  constexpr std::meta::info target = std::meta::reflect_constant(Member);
- template for (constexpr std::meta::info cell :
-               std::define_static_array(std::meta::nonstatic_data_members_of(^^Composition, std::meta::access_context::unchecked()))) {
+ template for (constexpr std::meta::info cell : std::define_static_array(std::meta::nonstatic_data_members_of(^^Composition, std::meta::access_context::unchecked()))) {
   if constexpr (std::meta::reflect_constant(&[:cell:]) == target) return cell;
  }
  throw "event sink must name a reflected composition member";
@@ -1025,9 +1016,8 @@ struct EventVisitor final {
 }  // namespace application_schema_detail
 template <class SystemCell, std::meta::info Method>
 struct ReflectedEndpoint final {
- static_assert(application_schema_detail::SupportedEndpointMethod<Method>,
-               "annotated endpoint must be a public non-static method with zero or one by-value request and "
-               "supported cv/noexcept qualifiers");
+ static_assert(application_schema_detail::SupportedEndpointMethod<Method>, "annotated endpoint must be a public non-static method with zero or one by-value request and "
+                                                                           "supported cv/noexcept qualifiers");
  using system_cell = SystemCell;
  using system_type = typename SystemCell::type;
  static constexpr auto method = &[:Method:];
@@ -1042,12 +1032,10 @@ struct ReflectedEndpoint final {
   return false;
  }();
  static_assert(signature::request_by_value && signature::result_by_value, "annotated endpoint request and result must be values");
- static_assert(application_schema_detail::runtime_boundary_projectable<request_type>(),
-               "annotated endpoint request contains an unsupported or unreflected reachable type");
- static_assert(application_schema_detail::runtime_boundary_projectable<result_type>(),
-               "annotated endpoint result contains an unsupported or unreflected reachable type");
- static_assert(!interaction || mmltk::frameworks::serialization::compact_shape<request_type> != mmltk::frameworks::serialization::CompactShape::Unsupported,
-               "interaction request has no compact wire projection");
+ static_assert(application_schema_detail::runtime_boundary_projectable<request_type>(), "annotated endpoint request contains an unsupported or unreflected reachable type");
+ static_assert(application_schema_detail::runtime_boundary_projectable<result_type>(), "annotated endpoint result contains an unsupported or unreflected reachable type");
+ static_assert(
+  !interaction || mmltk::frameworks::serialization::compact_shape<request_type> != mmltk::frameworks::serialization::CompactShape::Unsupported, "interaction request has no compact wire projection");
  static_assert(!interaction || (signature::has_request && std::is_void_v<result_type>), "InteractionEndpoint requires one typed request and no reply");
 };
 template <class... Endpoint>
@@ -1208,8 +1196,7 @@ struct ApplicationSchema final {
                                                                                "optionally noexcept method with a non-void value result");
    if constexpr (application_schema_detail::SupportedSnapshotMethod<snapshot>) {
     using Signature = SystemMethodSignature<decltype(&[:snapshot:])>;
-    static_assert(application_schema_detail::runtime_boundary_projectable<typename Signature::result_type>(),
-                  "snapshot contains an unsupported or unreflected reachable type");
+    static_assert(application_schema_detail::runtime_boundary_projectable<typename Signature::result_type>(), "snapshot contains an unsupported or unreflected reachable type");
     visitor.template operator()<SystemCell, snapshot>();
    }
   }
@@ -1257,10 +1244,8 @@ struct ApplicationSchema final {
  }
  template <class Endpoint, class Declaration, class Policy>
  [[nodiscard]] static constexpr ApplicationRequestFieldFact RequestFieldFact(const Policy& policy) {
-  constexpr bool file_dialog_identity =
-   application_schema_detail::declaration_has_annotation<Declaration, mmltk::controller::contracts::reflection::direct::FileDialogFieldIdentity>();
-  constexpr bool settings_update_values =
-   application_schema_detail::declaration_has_annotation<Declaration, mmltk::controller::contracts::reflection::direct::SettingsUpdateValues>();
+  constexpr bool file_dialog_identity = application_schema_detail::declaration_has_annotation<Declaration, mmltk::controller::contracts::reflection::direct::FileDialogFieldIdentity>();
+  constexpr bool settings_update_values = application_schema_detail::declaration_has_annotation<Declaration, mmltk::controller::contracts::reflection::direct::SettingsUpdateValues>();
   return {
    .endpoint_id = Endpoint::stable_id,
    .stable_id = application_field_stable_id(Endpoint::stable_id, policy.member_name),
@@ -1274,9 +1259,7 @@ struct ApplicationSchema final {
  template <class Endpoint, class Visitor>
  static constexpr void VisitRequestFields(Visitor&& visitor) {
   if constexpr (Endpoint::signature::has_request) {
-   auto field_visitor = [&]<class Owner, class Declaration>(const auto& policy) {
-    visitor.template operator()<Owner, Declaration>(RequestFieldFact<Endpoint, Declaration>(policy));
-   };
+   auto field_visitor = [&]<class Owner, class Declaration>(const auto& policy) { visitor.template operator()<Owner, Declaration>(RequestFieldFact<Endpoint, Declaration>(policy)); };
    application_schema_detail::visit_fields<typename Endpoint::request_type>(field_visitor);
   }
  }
@@ -1292,8 +1275,7 @@ struct ApplicationSchema final {
    const Request defaults{};
    auto field_visitor = [&]<class Owner, class Declaration>(const auto& policy) {
     using Member = typename Declaration::member_type;
-    visitor.template operator()<Owner, Declaration, Member>(RequestFieldFact<Endpoint, Declaration>(policy),
-                                                            static_cast<const Owner&>(defaults).*Declaration::pointer);
+    visitor.template operator()<Owner, Declaration, Member>(RequestFieldFact<Endpoint, Declaration>(policy), static_cast<const Owner&>(defaults).*Declaration::pointer);
    };
    application_schema_detail::visit_fields<Request>(field_visitor);
   }
@@ -1327,8 +1309,7 @@ struct ApplicationSchema final {
  }
  template <class Settings, class Visitor>
  static constexpr void VisitSettingsRelations(Visitor&& visitor) {
-  static_assert(application_schema_detail::settings_relations_are_valid<Settings>(),
-                "settings relations must resolve uniquely to mutable canonical leaves and claim opaque storage once");
+  static_assert(application_schema_detail::settings_relations_are_valid<Settings>(), "settings relations must resolve uniquely to mutable canonical leaves and claim opaque storage once");
   application_schema_detail::visit_settings_relations<Settings, Settings>(visitor);
  }
  template <class Provider, class Visitor>
@@ -1364,8 +1345,7 @@ struct ApplicationSchema final {
   auto visit_provider = [&]<class Provider>() {
    application_schema_detail::validate_catalog_provider<Provider>();
    using Row = typename Provider::row_type;
-   static_assert(std::meta::has_identifier(^^Provider) && std::meta::has_identifier(^^Row),
-                 "catalog providers and rows require canonical declaration identifiers");
+   static_assert(std::meta::has_identifier(^^Provider) && std::meta::has_identifier(^^Row), "catalog providers and rows require canonical declaration identifiers");
    constexpr std::string_view name = std::meta::identifier_of(^^Provider);
    constexpr std::string_view identity = Provider::identity;
    constexpr std::string_view row_type = mmltk::frameworks::reflection::type_name<Row>();
@@ -1462,8 +1442,7 @@ template <class Composition>
   sink.append(destination.view());
  });
  constexpr auto fallback_source = mmltk::frameworks::reflection::reflected_member_path<VisualFrame, VisualCleanContentRelation::zero_fallback_source>();
- constexpr auto fallback_destination =
-  mmltk::frameworks::reflection::reflected_member_path<VisualCleanContentIdentity, VisualCleanContentRelation::zero_fallback_destination>();
+ constexpr auto fallback_destination = mmltk::frameworks::reflection::reflected_member_path<VisualCleanContentIdentity, VisualCleanContentRelation::zero_fallback_destination>();
  sink.append("zero-fallback");
  sink.append(fallback_source.view());
  sink.append(fallback_destination.view());
@@ -1498,23 +1477,21 @@ template <class Composition>
     reserve_identity(field.stable_id, endpoint_source + "." + std::string(field.name));
     application_schema_detail::append_request_field_fingerprint<Declaration>(sink, field);
    });
-   ApplicationSchema<Composition>::template VisitRequestDefaults<Endpoint>(
-    [&]<class Owner, class Declaration, class Member>(const ApplicationRequestFieldFact& field, const Member& value) {
-     sink.append("request-default");
-     sink.append_number(field.endpoint_id);
-     sink.append_number(field.stable_id);
-     sink.append(field.name);
-     auto encoded = mmltk::frameworks::serialization::reflected_value(value);
-     if (!encoded) throw std::logic_error("unsupported reflected request default");
-     application_schema_detail::append_wire_value(sink, *encoded);
-    });
+   ApplicationSchema<Composition>::template VisitRequestDefaults<Endpoint>([&]<class Owner, class Declaration, class Member>(const ApplicationRequestFieldFact& field, const Member& value) {
+    sink.append("request-default");
+    sink.append_number(field.endpoint_id);
+    sink.append_number(field.stable_id);
+    sink.append(field.name);
+    auto encoded = mmltk::frameworks::serialization::reflected_value(value);
+    if (!encoded) throw std::logic_error("unsupported reflected request default");
+    application_schema_detail::append_wire_value(sink, *encoded);
+   });
    application_schema_detail::append_type<typename Endpoint::request_type>(sink);
   }
   if constexpr (!std::is_void_v<typename Endpoint::result_type>) application_schema_detail::append_type<typename Endpoint::result_type>(sink);
  });
  ApplicationSchema<Composition>::VisitEvents([&]<class Identity, class Event>(const mmltk::controller::contracts::reflection::Event metadata) {
-  reserve_identity(Identity::event_id,
-                   "event " + std::string(Identity::system_cell::name) + "." + std::string(mmltk::frameworks::reflection::type_name<Event>()));
+  reserve_identity(Identity::event_id, "event " + std::string(Identity::system_cell::name) + "." + std::string(mmltk::frameworks::reflection::type_name<Event>()));
   sink.append("event");
   sink.append_number(Identity::system_id);
   sink.append_number(Identity::event_id);
@@ -1541,13 +1518,12 @@ template <class Composition>
    sink.append_number(static_cast<std::uint8_t>(field.file_dialog->mode));
   }
  });
- ApplicationSchema<Composition>::VisitApplicationSettingsDefaults(
-  [&]<class Owner, class Declaration, class Member>(const ApplicationSettingsDefaultFact& fact, const Member& value) {
-   sink.append("settings-default");
-   sink.append_number(fact.stable_id);
-   sink.append(fact.path);
-   application_schema_detail::append_value(sink, value);
-  });
+ ApplicationSchema<Composition>::VisitApplicationSettingsDefaults([&]<class Owner, class Declaration, class Member>(const ApplicationSettingsDefaultFact& fact, const Member& value) {
+  sink.append("settings-default");
+  sink.append_number(fact.stable_id);
+  sink.append(fact.path);
+  application_schema_detail::append_value(sink, value);
+ });
  ApplicationSchema<Composition>::VisitCatalogProviders([&]<class Provider, class Row>(const ApplicationCatalogProviderFact& provider) {
   reserve_identity(provider.stable_id, "catalog provider " + std::string(provider.name));
   sink.append("catalog-provider");
@@ -1556,16 +1532,15 @@ template <class Composition>
   sink.append(provider.row_type);
   sink.append_number(provider.stable_id);
   application_schema_detail::append_type<Row>(sink);
-  ApplicationSchema<Composition>::template VisitCatalogRows<Provider>(
-   [&]<class ActualProvider, class ActualRow>(const ApplicationCatalogRowFact& fact, const ActualRow& row) {
-    reserve_identity(fact.stable_id, "catalog row " + std::string(provider.name) + "." + std::string(fact.key));
-    sink.append("catalog-row");
-    sink.append_number(fact.provider_id);
-    sink.append_number(fact.stable_id);
-    sink.append(fact.key);
-    sink.append_number(fact.index);
-    application_schema_detail::append_value(sink, row);
-   });
+  ApplicationSchema<Composition>::template VisitCatalogRows<Provider>([&]<class ActualProvider, class ActualRow>(const ApplicationCatalogRowFact& fact, const ActualRow& row) {
+   reserve_identity(fact.stable_id, "catalog row " + std::string(provider.name) + "." + std::string(fact.key));
+   sink.append("catalog-row");
+   sink.append_number(fact.provider_id);
+   sink.append_number(fact.stable_id);
+   sink.append(fact.key);
+   sink.append_number(fact.index);
+   application_schema_detail::append_value(sink, row);
+  });
  });
  return sink;
 }

@@ -23,8 +23,7 @@
 #include <utility>
 import mmltk.common.logging.profile_utils;
 namespace mmltk::backend::models::rfdetr::detail {
-void publish_native_checkpoint_archive(torch::serialize::OutputArchive& archive, const std::filesystem::path& destination,
-                                       const std::filesystem::path& explicit_descriptor) {
+void publish_native_checkpoint_archive(torch::serialize::OutputArchive& archive, const std::filesystem::path& destination, const std::filesystem::path& explicit_descriptor) {
  ClassArtifactPublication publication(destination, explicit_descriptor);
  archive.save_to(publication.staged_artifact().string());
  publication.Publish();
@@ -39,8 +38,8 @@ constexpr serialization::wire::Limits kTrainingSupervisionCborLimits{
  .max_items = 64U,
  .max_depth = 8U,
 };
-void write_state_archive_impl(torch::serialize::OutputArchive& archive, const char* key, const std::vector<NormalizedModelStateEntry>& entries,
-                              const bool include_training_supervision, mmltk::backend::ml::cuda::TensorReadbackBuffers& readback, std::size_t first_slot) {
+void write_state_archive_impl(torch::serialize::OutputArchive& archive, const char* key, const std::vector<NormalizedModelStateEntry>& entries, const bool include_training_supervision,
+ mmltk::backend::ml::cuda::TensorReadbackBuffers& readback, std::size_t first_slot) {
  mmltk::common::logging::ScopedProfile profile_rfdetr_checkpoint_save_write_state_archive{"rfdetr.checkpoint.save.write_state_archive"};
  torch::serialize::OutputArchive state_archive;
  std::size_t entry_count = 0;
@@ -65,8 +64,7 @@ void write_native_checkpoint_metadata(torch::serialize::OutputArchive& archive, 
   throw std::runtime_error("RF-DETR native checkpoint requires positive num_queries and num_select <= num_queries");
  }
  const ResolvedClassLayout layout(metadata.class_layout);
- if (layout.output_width() != static_cast<std::size_t>(metadata.num_classes))
-  throw std::runtime_error("native checkpoint class layout disagrees with tensor output width");
+ if (layout.output_width() != static_cast<std::size_t>(metadata.num_classes)) throw std::runtime_error("native checkpoint class layout disagrees with tensor output width");
  mmltk::backend::ml::serialization::write_string(archive, "class_layout", encode_class_layout(metadata.class_layout));
  mmltk::backend::ml::serialization::write_string(archive, "format", kNativeCheckpointFormat);
  mmltk::backend::ml::serialization::write_int(archive, "format_version", kNativeCheckpointFormatVersion);
@@ -85,19 +83,18 @@ void write_native_checkpoint_metadata(torch::serialize::OutputArchive& archive, 
    mmltk::backend::ml::serialization::write_optional_double(archive, key, value);
  });
 }
-void reserve_state_archive(const std::vector<NormalizedModelStateEntry>& entries, mmltk::backend::ml::cuda::TensorReadbackBuffers& readback,
-                           std::size_t first_slot) {
+void reserve_state_archive(const std::vector<NormalizedModelStateEntry>& entries, mmltk::backend::ml::cuda::TensorReadbackBuffers& readback, std::size_t first_slot) {
  std::vector<torch::Tensor> sources;
  sources.reserve(entries.size());
  for (const auto& entry : entries) sources.push_back(entry.tensor);
  readback.Reserve(sources, first_slot);
 }
-void write_state_archive(torch::serialize::OutputArchive& archive, const char* key, const std::vector<NormalizedModelStateEntry>& entries,
-                         mmltk::backend::ml::cuda::TensorReadbackBuffers& readback, std::size_t first_slot) {
+void write_state_archive(
+ torch::serialize::OutputArchive& archive, const char* key, const std::vector<NormalizedModelStateEntry>& entries, mmltk::backend::ml::cuda::TensorReadbackBuffers& readback, std::size_t first_slot) {
  write_state_archive_impl(archive, key, entries, false, readback, first_slot);
 }
-void write_resume_state_archive(torch::serialize::OutputArchive& archive, const char* key, const std::vector<NormalizedModelStateEntry>& entries,
-                                mmltk::backend::ml::cuda::TensorReadbackBuffers& readback, std::size_t first_slot) {
+void write_resume_state_archive(
+ torch::serialize::OutputArchive& archive, const char* key, const std::vector<NormalizedModelStateEntry>& entries, mmltk::backend::ml::cuda::TensorReadbackBuffers& readback, std::size_t first_slot) {
  write_state_archive_impl(archive, key, entries, true, readback, first_slot);
 }
 void write_training_supervision_config(torch::serialize::OutputArchive& archive, const TrainingSupervisionConfig& config) {
@@ -123,28 +120,22 @@ TrainingSupervisionConfig read_training_supervision_config(torch::serialize::Inp
  tensor = tensor.contiguous();
  const auto bytes = std::span(reinterpret_cast<const std::byte*>(tensor.data_ptr<std::uint8_t>()), static_cast<std::size_t>(tensor.numel()));
  const auto decoded = serialization::decode<TrainingSupervisionConfig>({bytes, {}}, kTrainingSupervisionCborLimits);
- if (!decoded.has_value() || !training_supervision_config_valid(*decoded)) {
-  throw std::runtime_error("invalid RF-DETR training supervision CBOR configuration");
- }
+ if (!decoded.has_value() || !training_supervision_config_valid(*decoded)) { throw std::runtime_error("invalid RF-DETR training supervision CBOR configuration"); }
  return *decoded;
 }
 void require_resume_training_supervision_config(torch::serialize::InputArchive& archive, const TrainingSupervisionConfig& expected) {
- if (read_training_supervision_config(archive) != expected) {
-  throw std::runtime_error("native RF-DETR resume checkpoint training supervision configuration does not match");
- }
+ if (read_training_supervision_config(archive) != expected) { throw std::runtime_error("native RF-DETR resume checkpoint training supervision configuration does not match"); }
 }
 std::vector<torch::Tensor> read_ema_shadow_archive(torch::serialize::InputArchive& archive, std::span<const std::string> expected_names, std::stop_token stop) {
  const auto count = mmltk::backend::ml::serialization::require_int(archive, "entry_count");
- if (count < 0 || static_cast<std::uint64_t>(count) != expected_names.size())
-  throw std::runtime_error("RF-DETR training checkpoint state count does not match the bounded active inventory");
+ if (count < 0 || static_cast<std::uint64_t>(count) != expected_names.size()) throw std::runtime_error("RF-DETR training checkpoint state count does not match the bounded active inventory");
  std::vector<torch::Tensor> shadow;
  shadow.reserve(expected_names.size());
  for (std::size_t index = 0; index < expected_names.size(); ++index) {
   if (stop.stop_requested()) throw ArtifactPublicationCancelled{};
   torch::serialize::InputArchive entry;
   archive.read(mmltk::backend::ml::serialization::archive_entry_name(index), entry);
-  if (mmltk::backend::ml::serialization::require_string(entry, "name") != expected_names[index])
-   throw std::runtime_error("RF-DETR training checkpoint state names do not match the active inventory");
+  if (mmltk::backend::ml::serialization::require_string(entry, "name") != expected_names[index]) throw std::runtime_error("RF-DETR training checkpoint state names do not match the active inventory");
   shadow.push_back(mmltk::backend::ml::serialization::require_tensor(entry, "tensor"));
  }
  return shadow;
@@ -155,8 +146,7 @@ TrainingCheckpointAdmission::TrainingCheckpointAdmission(TrainingCheckpoint chec
     : checkpoint_(std::move(checkpoint)), evidence_(std::move(evidence)) {
  if (!std::get<0>(evidence_)) throw std::invalid_argument("missing checkpoint artifact evidence");
 }
-TrainingCheckpointAdmission::TrainingCheckpointAdmission(TrainingCheckpoint checkpoint, mmltk::common::io::FileSnapshot evidence)
-    : checkpoint_(std::move(checkpoint)), evidence_(evidence) {}
+TrainingCheckpointAdmission::TrainingCheckpointAdmission(TrainingCheckpoint checkpoint, mmltk::common::io::FileSnapshot evidence) : checkpoint_(std::move(checkpoint)), evidence_(evidence) {}
 void TrainingCheckpointAdmission::RequireUnchanged(std::stop_token stop) const {
  if (stop.stop_requested()) throw ArtifactPublicationCancelled{};
  if (const auto* native = std::get_if<0>(&evidence_)) {
@@ -206,8 +196,7 @@ TrainingCheckpointAdmission inspect_training_checkpoint(const std::filesystem::p
   if (stop.stop_requested()) throw ArtifactPublicationCancelled{};
   tensors.emplace(entry.name, entry.tensor);
  }
- const auto names = request.optimizer == TrainOptimizerKind::AdamW ? NativeAdamW::InspectCheckpoint(optimizer, tensors, stop)
-                                                                   : NativeMuonWithAuxAdam::InspectCheckpoint(optimizer, tensors, stop);
+ const auto names = request.optimizer == TrainOptimizerKind::AdamW ? NativeAdamW::InspectCheckpoint(optimizer, tensors, stop) : NativeMuonWithAuxAdam::InspectCheckpoint(optimizer, tensors, stop);
  if (request.use_ema) {
   torch::serialize::InputArchive ema;
   archive.read("ema_state", ema);

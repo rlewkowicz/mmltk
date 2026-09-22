@@ -73,7 +73,7 @@ Runs dilate(const Runs& runs, std::uint16_t radius, std::uint16_t width, std::ui
    const int dy = y - run.row;
    const int reach = static_cast<int>(std::sqrt(static_cast<double>(radius) * radius - dy * dy));
    result.push_back({static_cast<std::uint16_t>(y), static_cast<std::uint16_t>(std::max(0, static_cast<int>(run.first) - reach)),
-                     static_cast<std::uint16_t>(std::min(static_cast<int>(width) - 1, static_cast<int>(run.last) + reach))});
+    static_cast<std::uint16_t>(std::min(static_cast<int>(width) - 1, static_cast<int>(run.last) + reach))});
   }
   // Bound transient storage while consolidating actual support.
   if (result.size() > c::kAnnotationMaskRunCapacity * 2) normalize(result);
@@ -92,8 +92,7 @@ void update_mask_bounds(c::AnnotationObject& object) {
   first = std::min(first, run.first);
   last = std::max(last, run.last);
  }
- object.box = {{static_cast<float>(first), static_cast<float>(object.mask.runs.front().row)},
-               {static_cast<float>(last) + 1, static_cast<float>(object.mask.runs.back().row) + 1}};
+ object.box = {{static_cast<float>(first), static_cast<float>(object.mask.runs.front().row)}, {static_cast<float>(last) + 1, static_cast<float>(object.mask.runs.back().row) + 1}};
 }
 }  // namespace
 void normalize_mask(c::AnnotationObject& object) {
@@ -137,8 +136,7 @@ void MaskRows::Materialize(c::AnnotationObject& object) const {
  }
  update_mask_bounds(object);
 }
-void MaskRows::Stroke(c::AnnotationPoint from, c::AnnotationPoint to, std::uint16_t radius, std::uint16_t width, std::uint16_t height, bool erase,
-                      MaskScratch& scratch) {
+void MaskRows::Stroke(c::AnnotationPoint from, c::AnnotationPoint to, std::uint16_t radius, std::uint16_t width, std::uint16_t height, bool erase, MaskScratch& scratch) {
  auto& stroke = scratch.stroke;
  stroke.clear();
  const float dx = to.x - from.x, dy = to.y - from.y;
@@ -237,8 +235,7 @@ void transform_mask(c::AnnotationObject& object, c::AnnotationBox from, c::Annot
  for (auto run : object.mask.runs) {
   const auto [first, last] = map_interval(run.first, run.last, from.first.x, to.first.x, sx);
   const auto [top, bottom] = map_interval(run.row, run.row, from.first.y, to.first.y, sy);
-  for (int row = top; row <= bottom; ++row)
-   transformed.push_back({static_cast<std::uint16_t>(row), static_cast<std::uint16_t>(first), static_cast<std::uint16_t>(last)});
+  for (int row = top; row <= bottom; ++row) transformed.push_back({static_cast<std::uint16_t>(row), static_cast<std::uint16_t>(first), static_cast<std::uint16_t>(last)});
   if (transformed.size() > c::kAnnotationMaskRunCapacity * 2) normalize(transformed);
  }
  object.mask.runs.swap(transformed);
@@ -250,8 +247,7 @@ void fill_mask(c::AnnotationObject& object, c::AnnotationPoint point, std::uint1
  Components components(empty);
  std::size_t selected = empty.size();
  for (std::size_t index = 0; index < empty.size(); ++index)
-  if (empty[index].row == static_cast<unsigned>(point.y) && point.x >= empty[index].first && point.x < static_cast<unsigned>(empty[index].last) + 1)
-   selected = components.root(index);
+  if (empty[index].row == static_cast<unsigned>(point.y) && point.x >= empty[index].first && point.x < static_cast<unsigned>(empty[index].last) + 1) selected = components.root(index);
  if (selected == empty.size()) return;
  for (std::size_t index = 0; index < empty.size(); ++index)
   if (components.root(index) == selected) object.mask.runs.push_back(empty[index]);

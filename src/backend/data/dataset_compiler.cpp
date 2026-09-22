@@ -34,9 +34,8 @@ ProgressEstimate estimate_progress(const std::uint64_t completed, const std::uin
  const std::uint64_t throughput = completed / elapsed_seconds;
  if (completed >= total) { return {.remaining_seconds = 0U, .throughput_per_second = throughput}; }
  const __uint128_t remaining = static_cast<__uint128_t>(total - completed) * elapsed_seconds / completed;
- return {.remaining_seconds =
-          remaining > std::numeric_limits<std::uint64_t>::max() ? std::numeric_limits<std::uint64_t>::max() : static_cast<std::uint64_t>(remaining),
-         .throughput_per_second = throughput};
+ return {
+  .remaining_seconds = remaining > std::numeric_limits<std::uint64_t>::max() ? std::numeric_limits<std::uint64_t>::max() : static_cast<std::uint64_t>(remaining), .throughput_per_second = throughput};
 }
 CompileProgress CompileTelemetry::snapshot() const noexcept { return snapshot(phase_.load(std::memory_order_relaxed)); }
 CompileProgress CompileTelemetry::snapshot(const DatasetCompilePhase phase) const noexcept {
@@ -52,17 +51,17 @@ CompileProgress CompileTelemetry::snapshot(const DatasetCompilePhase phase) cons
  const auto progress = [&](const size_t done) {
   const ProgressEstimate estimate = estimate_progress(done, total, elapsed_seconds);
   return CompileProgress{.done = done,
-                         .total = total,
-                         .elapsed_seconds = elapsed_seconds,
-                         .remaining_seconds = estimate.remaining_seconds,
-                         .throughput_per_second = estimate.throughput_per_second,
-                         .phase = phase,
-                         .label_done = label_done,
-                         .label_total = num_images,
-                         .pixel_done = pixel_done,
-                         .pixel_total = num_images,
-                         .active_workers = label_active + pixel_active,
-                         .dropped_instances = dropped_instances_.load(std::memory_order_relaxed)};
+   .total = total,
+   .elapsed_seconds = elapsed_seconds,
+   .remaining_seconds = estimate.remaining_seconds,
+   .throughput_per_second = estimate.throughput_per_second,
+   .phase = phase,
+   .label_done = label_done,
+   .label_total = num_images,
+   .pixel_done = pixel_done,
+   .pixel_total = num_images,
+   .active_workers = label_active + pixel_active,
+   .dropped_instances = dropped_instances_.load(std::memory_order_relaxed)};
  };
  if (phase == DatasetCompilePhase::Planning) { return progress(0U); }
  if (phase == DatasetCompilePhase::Syncing || phase == DatasetCompilePhase::Publishing) {
@@ -139,8 +138,7 @@ void compiler_internal::ProgressCounter::add_completed(const size_t count) noexc
  }
 }
 void compiler_internal::ProgressCounter::end_worker() noexcept { update_worker_count(false); }
-DatasetCompilePlan DatasetCompiler::prepare(CompilerConfig config, const std::vector<std::string>& splits,
-                                            const mmltk::common::concurrency::CancellationObservation cancellation) {
+DatasetCompilePlan DatasetCompiler::prepare(CompilerConfig config, const std::vector<std::string>& splits, const mmltk::common::concurrency::CancellationObservation cancellation) {
  mmltk::common::logging::ScopedProfile profile{"compiler.prepare"};
  if (splits.empty()) { throw std::runtime_error("dataset compile plan requires at least one split"); }
  if (const auto valid = validate_compiler_config(config); !valid) { throw std::runtime_error(std::string(compiler_config_validation_message(valid.error()))); }
@@ -154,15 +152,12 @@ DatasetCompilePlan DatasetCompiler::prepare(CompilerConfig config, const std::ve
  plan.splits = std::move(scan.splits);
  return plan;
 }
-void DatasetCompiler::compile(const DatasetCompilePlan& plan, const size_t split_index, CompileTelemetry* const telemetry,
-                              const mmltk::common::concurrency::CancellationObservation cancellation) {
+void DatasetCompiler::compile(const DatasetCompilePlan& plan, const size_t split_index, CompileTelemetry* const telemetry, const mmltk::common::concurrency::CancellationObservation cancellation) {
  mmltk::common::logging::ScopedProfile profile{"compiler.total"};
  if (split_index >= plan.splits.size()) { throw std::runtime_error("dataset compile split index is out of range"); }
  CompilerConfig effective_config = plan.config;
  effective_config.split = plan.splits[split_index].split;
- if (const auto valid = validate_compiler_config(effective_config); !valid) {
-  throw std::runtime_error(std::string(compiler_config_validation_message(valid.error())));
- }
+ if (const auto valid = validate_compiler_config(effective_config); !valid) { throw std::runtime_error(std::string(compiler_config_validation_message(valid.error()))); }
  const auto throw_if_cancelled = [&] {
   if (cancellation.requested()) { throw std::runtime_error("dataset compilation cancelled"); }
  };
@@ -206,8 +201,8 @@ void DatasetCompiler::compile(const DatasetCompilePlan& plan, const size_t split
   layout = compute_pixel_layout(num_images, image_stride);
  }
  mmltk::common::logging::debug([&](spdlog::logger& log) {
-  log.debug("[compile] Pixel layout: pixel_offset={} ({:.1f} MB aligned), pixels={:.2f} GB", layout.pixel_offset,
-            static_cast<double>(layout.pixel_offset) / (1024.0 * 1024.0), static_cast<double>(layout.pixel_blob_size) / (1024.0 * 1024.0 * 1024.0));
+  log.debug("[compile] Pixel layout: pixel_offset={} ({:.1f} MB aligned), pixels={:.2f} GB", layout.pixel_offset, static_cast<double>(layout.pixel_offset) / (1024.0 * 1024.0),
+   static_cast<double>(layout.pixel_blob_size) / (1024.0 * 1024.0 * 1024.0));
  });
  const std::filesystem::path out_path = out_dir / (effective_config.split + ".bin");
  std::string staging_path_text = out_path.string() + ".tmp.XXXXXX";
@@ -249,8 +244,8 @@ void DatasetCompiler::compile(const DatasetCompilePlan& plan, const size_t split
   }
  });
  try {
-  label_blocks = compiler_internal::build_label_blocks(split_dir, num_images, effective_config, class_catalog, plan.source_category_base, label_workers,
-                                                       label_cpus, telemetry != nullptr ? &label_progress : nullptr, &failure_requested, cancellation);
+  label_blocks = compiler_internal::build_label_blocks(
+   split_dir, num_images, effective_config, class_catalog, plan.source_category_base, label_workers, label_cpus, telemetry != nullptr ? &label_progress : nullptr, &failure_requested, cancellation);
   if (telemetry != nullptr) { telemetry->set_dropped_instances(label_blocks.dropped_instances); }
  } catch (...) {
   failure_requested.store(true, std::memory_order_relaxed);
@@ -269,8 +264,7 @@ void DatasetCompiler::compile(const DatasetCompilePlan& plan, const size_t split
  }
  compiler_internal::assign_pixel_offsets(label_blocks.index, layout.pixel_offset, image_stride);
  throw_if_cancelled();
- mmltk::common::logging::debug(
-  [&](spdlog::logger& log) { log.debug("[compile] Layout: total={:.2f} GB", static_cast<double>(layout.total_size) / (1024.0 * 1024.0 * 1024.0)); });
+ mmltk::common::logging::debug([&](spdlog::logger& log) { log.debug("[compile] Layout: total={:.2f} GB", static_cast<double>(layout.total_size) / (1024.0 * 1024.0 * 1024.0)); });
  fd.preallocate(layout.total_size);
  const FileHeader header = make_file_header(
   FileHeaderInputs{
@@ -303,8 +297,6 @@ void DatasetCompiler::compile(const DatasetCompilePlan& plan, const size_t split
  throw_if_cancelled();
  publish_staged_path_atomically(staging_path, out_path);
  staging_cleanup.published();
- mmltk::common::logging::debug([&](spdlog::logger& log) {
-  log.debug("[compile] Written {} ({:.2f} GB)", out_path.string(), static_cast<double>(layout.total_size) / (1024.0 * 1024.0 * 1024.0));
- });
+ mmltk::common::logging::debug([&](spdlog::logger& log) { log.debug("[compile] Written {} ({:.2f} GB)", out_path.string(), static_cast<double>(layout.total_size) / (1024.0 * 1024.0 * 1024.0)); });
 }
 }  // namespace mmltk::backend::data

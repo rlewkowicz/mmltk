@@ -5,8 +5,7 @@
 namespace mmltk::backend::data::detail {
 WritablePixelRange::WritablePixelRange(const int file_descriptor, const std::size_t offset, const std::size_t bytes) {
  if (bytes == 0U) return;
- void* const mapping = ::mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_SHARED, file_descriptor,
-                              mmltk::common::math::checked_cast<off_t>(offset, "writable pixel mmap offset overflow"));
+ void* const mapping = ::mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_SHARED, file_descriptor, mmltk::common::math::checked_cast<off_t>(offset, "writable pixel mmap offset overflow"));
  if (mapping == MAP_FAILED) throw mmltk::common::io::errno_error("writable pixel mmap failed");
  region_.adopt(mapping, bytes);
  (void)::madvise(mapping, bytes, MADV_HUGEPAGE);

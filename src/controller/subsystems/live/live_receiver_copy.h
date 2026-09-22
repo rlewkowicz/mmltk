@@ -11,6 +11,6 @@ struct LiveReceiverCopyOperations final {
  [[nodiscard]] bool valid() const noexcept { return wait != nullptr && copy != nullptr && synchronize != nullptr; }
 };
 [[nodiscard]] LiveReceiverCopyOperations native_live_receiver_copy_operations() noexcept;
-[[nodiscard]] cudaError_t copy_live_receiver_frame(mmltk::frameworks::gpu::ImagePlaneView target, std::uintptr_t source, std::size_t source_pitch,
-                                                   std::uintptr_t ready_event, std::uintptr_t stream, const LiveReceiverCopyOperations&) noexcept;
+[[nodiscard]] cudaError_t copy_live_receiver_frame(
+ mmltk::frameworks::gpu::ImagePlaneView target, std::uintptr_t source, std::size_t source_pitch, std::uintptr_t ready_event, std::uintptr_t stream, const LiveReceiverCopyOperations&) noexcept;
 }  // namespace mmltk::controller::detail

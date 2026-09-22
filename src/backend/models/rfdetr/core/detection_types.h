@@ -23,8 +23,8 @@ struct PreparedTarget {
 };
 struct PackedTargetMasks {
  PackedTargetMasks() = default;
- PackedTargetMasks(torch::Tensor packed_bits, int64_t mask_height, int64_t mask_width, torch::Tensor transforms = {}, torch::Tensor occluder_indices = {},
-                   torch::Tensor occluder_transforms = {}, torch::Tensor spatial_erasure = {})
+ PackedTargetMasks(torch::Tensor packed_bits, int64_t mask_height, int64_t mask_width, torch::Tensor transforms = {}, torch::Tensor occluder_indices = {}, torch::Tensor occluder_transforms = {},
+  torch::Tensor spatial_erasure = {})
      : bits(std::move(packed_bits)),
        height(mask_height),
        width(mask_width),

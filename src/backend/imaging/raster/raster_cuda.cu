@@ -16,8 +16,8 @@ __global__ void probe_rgba_kernel(const draw_launch::ProbeRgbaLaunch launch) {
  const auto x = launch.coordinates[index * 2U];
  const auto y = launch.coordinates[index * 2U + 1U];
  const auto* pixel = launch.source.pixels + static_cast<std::size_t>(y) * launch.source.pitch_bytes + static_cast<std::size_t>(x) * 4U;
- launch.samples[index] = static_cast<std::uint32_t>(pixel[0]) | (static_cast<std::uint32_t>(pixel[1]) << 8U) | (static_cast<std::uint32_t>(pixel[2]) << 16U) |
-                         (static_cast<std::uint32_t>(pixel[3]) << 24U);
+ launch.samples[index] =
+  static_cast<std::uint32_t>(pixel[0]) | (static_cast<std::uint32_t>(pixel[1]) << 8U) | (static_cast<std::uint32_t>(pixel[2]) << 16U) | (static_cast<std::uint32_t>(pixel[3]) << 24U);
 }
 cudaError_t launch_probe_rgba(const draw_launch::ProbeRgbaLaunch& launch) noexcept {
  probe_rgba_kernel<<<1, 32, 0, launch.stream>>>(launch);
@@ -164,8 +164,7 @@ __device__ void apply_box_color<raster_math::RgbaPixelU8>(raster_math::RgbaPixel
  pixel.a = 255U;
 }
 template <typename PixelT>
-__device__ void apply_boxes_and_labels(int x, int y, const float* boxes, const uint8_t* colors, const int* labels, int num_instances, int box_thickness,
-                                       PixelT& pixel, bool labels_enabled = true) {
+__device__ void apply_boxes_and_labels(int x, int y, const float* boxes, const uint8_t* colors, const int* labels, int num_instances, int box_thickness, PixelT& pixel, bool labels_enabled = true) {
  if (box_thickness <= 0 && !labels_enabled) return;
  for (int i = 0; i < num_instances; ++i) {
   const int x1 = static_cast<int>(boxes[i * 4 + 0]);
@@ -183,8 +182,7 @@ __device__ int resolved_instance_count(const InstancesT& instances) {
  return requested <= 0 ? 0 : requested >= instances.instance_count ? instances.instance_count : static_cast<int>(requested);
 }
 template <typename PixelT, typename InstancesT>
-__device__ void blend_instance_masks(PixelT& pixel, const InstancesT& instances, const int image_width, const int image_height, const int x, const int y,
-                                     const float mask_alpha) {
+__device__ void blend_instance_masks(PixelT& pixel, const InstancesT& instances, const int image_width, const int image_height, const int x, const int y, const float mask_alpha) {
  const int image_area = image_width * image_height;
  const int pixel_index = y * image_width + x;
  for (int i = 0, count = resolved_instance_count(instances); i < count; ++i) {
@@ -202,8 +200,8 @@ __device__ void apply_launch_boxes_and_labels(const int x, const int y, const La
  apply_boxes_and_labels(x, y, instances.boxes, instances.colors, instances.labels, resolved_instance_count(instances), launch.box_thickness, pixel);
 }
 template <typename OverlayT, typename ColorT>
-__device__ bool store_segment_hit_rgba_pixel(const OverlayT& overlay, const int x, const int y, const float px, const float py, const float ax, const float ay,
-                                             const float bx, const float by, const float max_distance_sq, const ColorT& color) {
+__device__ bool store_segment_hit_rgba_pixel(
+ const OverlayT& overlay, const int x, const int y, const float px, const float py, const float ax, const float ay, const float bx, const float by, const float max_distance_sq, const ColorT& color) {
  if (raster_math::point_to_segment_distance_sq(px, py, ax, ay, bx, by) > max_distance_sq) { return false; }
  raster_math::store_rgba_pixel(overlay.pixels, overlay.pitch_bytes, x, y, raster_math::RgbaPixelU8{color.r, color.g, color.b, 255U});
  return true;
@@ -269,8 +267,7 @@ __global__ void composite_rgba_over_bgr_pitched_kernel(const draw_launch::Compos
  raster_math::RgbaPixelU8 overlay_pixel{};
  if (!load_visible_rgba_overlay(overlay_rgba, x, y, overlay_pixel)) { return; }
  const auto base_pixel = raster_math::load_rgb_pixel<raster_math::RgbByteOrder::Bgr>(base_bgr.pixels, base_bgr.pitch_bytes, x, y);
- raster_math::store_rgb_pixel<raster_math::RgbByteOrder::Bgr>(base_bgr.pixels, base_bgr.pitch_bytes, x, y,
-                                                              raster_math::composite_rgba_over_bgr(base_pixel, overlay_pixel));
+ raster_math::store_rgb_pixel<raster_math::RgbByteOrder::Bgr>(base_bgr.pixels, base_bgr.pitch_bytes, x, y, raster_math::composite_rgba_over_bgr(base_pixel, overlay_pixel));
 }
 __global__ void finalize_rgba_kernel(const draw_launch::FinalizeRgbaLaunch launch) {
  const auto dx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -286,13 +283,11 @@ __global__ void finalize_rgba_kernel(const draw_launch::FinalizeRgbaLaunch launc
  raster_math::store_rgba_pixel(launch.destination.pixels, launch.destination.pitch_bytes, x, y, pixel);
 }
 cudaError_t launch_finalize_rgba(const draw_launch::FinalizeRgbaLaunch& launch) noexcept {
- if (!launch.clean.valid(4U) || !launch.destination.valid(4U) || launch.region.x1 < 0 || launch.region.y1 < 0 || launch.region.x2 <= launch.region.x1 ||
-     launch.region.y2 <= launch.region.y1 || launch.region.x2 > launch.clean.width || launch.region.y2 > launch.clean.height ||
-     launch.destination.width != launch.clean.width || launch.destination.height != launch.clean.height ||
+ if (!launch.clean.valid(4U) || !launch.destination.valid(4U) || launch.region.x1 < 0 || launch.region.y1 < 0 || launch.region.x2 <= launch.region.x1 || launch.region.y2 <= launch.region.y1 ||
+     launch.region.x2 > launch.clean.width || launch.region.y2 > launch.clean.height || launch.destination.width != launch.clean.width || launch.destination.height != launch.clean.height ||
      (launch.semantic.pixels && (!launch.semantic.valid(4U) || launch.semantic.width != launch.clean.width || launch.semantic.height != launch.clean.height)))
   return cudaErrorInvalidValue;
- finalize_rgba_kernel<<<draw_kernel_grid(launch.region.x2 - launch.region.x1, launch.region.y2 - launch.region.y1), draw_kernel_block(), 0, launch.stream>>>(
-  launch);
+ finalize_rgba_kernel<<<draw_kernel_grid(launch.region.x2 - launch.region.x1, launch.region.y2 - launch.region.y1), draw_kernel_block(), 0, launch.stream>>>(launch);
  return cudaGetLastError();
 }
 __global__ void composite_rgba_over_rgba_pitched_kernel(const draw_launch::CompositeRgbaOverRgbaPitchedLaunch launch) {
@@ -300,8 +295,7 @@ __global__ void composite_rgba_over_rgba_pitched_kernel(const draw_launch::Compo
  if (!sample.visible) { return; }
  const auto& base_rgba = launch.base_rgba;
  const auto base_pixel = raster_math::load_rgba_pixel(base_rgba.pixels, base_rgba.pitch_bytes, sample.x, sample.y);
- raster_math::store_rgba_pixel(base_rgba.pixels, base_rgba.pitch_bytes, sample.x, sample.y,
-                               raster_math::composite_rgba_over_rgba(base_pixel, sample.overlay_pixel));
+ raster_math::store_rgba_pixel(base_rgba.pixels, base_rgba.pitch_bytes, sample.x, sample.y, raster_math::composite_rgba_over_rgba(base_pixel, sample.overlay_pixel));
 }
 __device__ raster_math::RgbaPixelU8 surface_read_rgba(const cudaSurfaceObject_t surface, const int x, const int y) {
  uchar4 raw{};
@@ -355,8 +349,7 @@ __global__ void draw_manual_mask_rgba_pitched_kernel(const draw_launch::ManualMa
  const int y = global_thread_y();
  if (x >= overlay_region.width || y >= overlay_region.height) { return; }
  if (launch.mask[y * overlay_region.width + x] == 0U) { return; }
- raster_math::store_rgba_pixel(overlay_region.pixels, overlay_region.pitch_bytes, x, y,
-                               raster_math::RgbaPixelU8{launch.color.r, launch.color.g, launch.color.b, launch.color.a});
+ raster_math::store_rgba_pixel(overlay_region.pixels, overlay_region.pitch_bytes, x, y, raster_math::RgbaPixelU8{launch.color.r, launch.color.g, launch.color.b, launch.color.a});
 }
 __global__ void draw_manual_mask_runs_rgba_pitched_kernel(const draw_launch::ManualMaskRunsRgbaPitchedLaunch launch) {
  const std::uint32_t run_index = blockIdx.x;
@@ -377,11 +370,9 @@ __global__ void draw_manual_mask_runs_rgba_pitched_kernel(const draw_launch::Man
    return __fadd_rn(target, __fmul_rn(__fsub_rn(value, source), scale));
   };
   const int first = max(max(0, launch.clip.x1), static_cast<int>(floorf(project(x, launch.source_x, launch.target_x, launch.scale_x))));
-  const int last = min(min(launch.overlay_region.width, launch.clip.x2),
-                       static_cast<int>(ceilf(project(x + static_cast<float>(length), launch.source_x, launch.target_x, launch.scale_x))));
+  const int last = min(min(launch.overlay_region.width, launch.clip.x2), static_cast<int>(ceilf(project(x + static_cast<float>(length), launch.source_x, launch.target_x, launch.scale_x))));
   const int top = max(max(0, launch.clip.y1), static_cast<int>(floorf(project(y, launch.source_y, launch.target_y, launch.scale_y))));
-  const int bottom =
-   min(min(launch.overlay_region.height, launch.clip.y2), static_cast<int>(ceilf(project(y + 1, launch.source_y, launch.target_y, launch.scale_y))));
+  const int bottom = min(min(launch.overlay_region.height, launch.clip.y2), static_cast<int>(ceilf(project(y + 1, launch.source_y, launch.target_y, launch.scale_y))));
   if (first >= last || top >= bottom) return;
   const auto count = static_cast<std::uint64_t>(last - first) * static_cast<std::uint64_t>(bottom - top);
   for (auto pixel = static_cast<std::uint64_t>(threadIdx.x); pixel < count; pixel += blockDim.x) {
@@ -390,10 +381,9 @@ __global__ void draw_manual_mask_runs_rgba_pitched_kernel(const draw_launch::Man
    // Scaling can map disjoint base intervals onto the same destination
    // pixel. A single atomic RGBA store preserves canonical union
    // coverage without a conflicting write or transformed-run upload.
-   const auto color = static_cast<unsigned>(launch.color.r) | (static_cast<unsigned>(launch.color.g) << 8U) | (static_cast<unsigned>(launch.color.b) << 16U) |
-                      (static_cast<unsigned>(launch.color.a) << 24U);
-   auto* destination = reinterpret_cast<unsigned*>(launch.overlay_region.pixels + static_cast<std::size_t>(py) * launch.overlay_region.pitch_bytes +
-                                                   static_cast<std::size_t>(px) * 4U);
+   const auto color =
+    static_cast<unsigned>(launch.color.r) | (static_cast<unsigned>(launch.color.g) << 8U) | (static_cast<unsigned>(launch.color.b) << 16U) | (static_cast<unsigned>(launch.color.a) << 24U);
+   auto* destination = reinterpret_cast<unsigned*>(launch.overlay_region.pixels + static_cast<std::size_t>(py) * launch.overlay_region.pitch_bytes + static_cast<std::size_t>(px) * 4U);
    atomicExch(destination, color);
   }
   return;
@@ -418,8 +408,7 @@ __global__ void draw_manual_mask_runs_rgba_pitched_kernel(const draw_launch::Man
  if (first >= last) return;
  for (auto pixel = first + threadIdx.x; pixel < last; pixel += blockDim.x) {
   const int x = left + static_cast<int>(pixel % clipped_width), y = static_cast<int>(first_row + pixel / clipped_width);
-  raster_math::store_rgba_pixel(launch.overlay_region.pixels, launch.overlay_region.pitch_bytes, x, y,
-                                raster_math::RgbaPixelU8{launch.color.r, launch.color.g, launch.color.b, launch.color.a});
+  raster_math::store_rgba_pixel(launch.overlay_region.pixels, launch.overlay_region.pitch_bytes, x, y, raster_math::RgbaPixelU8{launch.color.r, launch.color.g, launch.color.b, launch.color.a});
  }
 }
 __global__ void draw_box_outline_rgba_pitched_kernel(const draw_launch::BoxOutlineRgbaPitchedLaunch launch) {
@@ -440,12 +429,8 @@ __global__ void draw_selection_handles_rgba_pitched_kernel(const draw_launch::Se
  const int corners_x[4] = {box.x1, box.x2 - 1, box.x1, box.x2 - 1};
  const int corners_y[4] = {box.y1, box.y1, box.y2 - 1, box.y2 - 1};
  for (int i = 0; i < 4; ++i) {
-  if (x < corners_x[i] - launch.handle_radius || x > corners_x[i] + launch.handle_radius || y < corners_y[i] - launch.handle_radius ||
-      y > corners_y[i] + launch.handle_radius) {
-   continue;
-  }
-  raster_math::store_rgba_pixel(overlay.pixels, overlay.pitch_bytes, x, y,
-                                raster_math::RgbaPixelU8{launch.color.r, launch.color.g, launch.color.b, launch.color.a});
+  if (x < corners_x[i] - launch.handle_radius || x > corners_x[i] + launch.handle_radius || y < corners_y[i] - launch.handle_radius || y > corners_y[i] + launch.handle_radius) { continue; }
+  raster_math::store_rgba_pixel(overlay.pixels, overlay.pitch_bytes, x, y, raster_math::RgbaPixelU8{launch.color.r, launch.color.g, launch.color.b, launch.color.a});
   return;
  }
 }
@@ -454,9 +439,7 @@ __global__ void draw_polyline_rgba_pitched_kernel(const draw_launch::PolylineRgb
  const auto& points = launch.points;
  const int x = launch.clip.x1 + global_thread_x();
  const int y = launch.clip.y1 + global_thread_y();
- if (x >= launch.clip.x2 || y >= launch.clip.y2 || x >= overlay.width || y >= overlay.height || points.points_xy == nullptr || points.point_count < 2) {
-  return;
- }
+ if (x >= launch.clip.x2 || y >= launch.clip.y2 || x >= overlay.width || y >= overlay.height || points.points_xy == nullptr || points.point_count < 2) { return; }
  const int segment_count = launch.closed ? points.point_count : points.point_count - 1;
  const float px = static_cast<float>(x) + 0.5f;
  const float py = static_cast<float>(y) + 0.5f;
@@ -476,9 +459,7 @@ __global__ void draw_points_rgba_pitched_kernel(const draw_launch::PointsRgbaPit
  const auto& points = launch.points;
  const int x = launch.clip.x1 + global_thread_x();
  const int y = launch.clip.y1 + global_thread_y();
- if (x >= launch.clip.x2 || y >= launch.clip.y2 || x >= overlay.width || y >= overlay.height || points.points_xy == nullptr || points.point_count <= 0) {
-  return;
- }
+ if (x >= launch.clip.x2 || y >= launch.clip.y2 || x >= overlay.width || y >= overlay.height || points.points_xy == nullptr || points.point_count <= 0) { return; }
  const float px = static_cast<float>(x) + 0.5f;
  const float py = static_cast<float>(y) + 0.5f;
  const float max_distance_sq = static_cast<float>(launch.radius * launch.radius);
@@ -487,8 +468,7 @@ __global__ void draw_points_rgba_pitched_kernel(const draw_launch::PointsRgbaPit
   const float qx = static_cast<float>(points.points_xy[xy_index + 0]);
   const float qy = static_cast<float>(points.points_xy[xy_index + 1]);
   if (raster_math::point_distance_sq(px, py, qx, qy) > max_distance_sq) { continue; }
-  raster_math::store_rgba_pixel(overlay.pixels, overlay.pitch_bytes, x, y,
-                                raster_math::RgbaPixelU8{launch.color.r, launch.color.g, launch.color.b, launch.color.a});
+  raster_math::store_rgba_pixel(overlay.pixels, overlay.pitch_bytes, x, y, raster_math::RgbaPixelU8{launch.color.r, launch.color.g, launch.color.b, launch.color.a});
   return;
  }
 }
@@ -498,8 +478,8 @@ __global__ void draw_skeleton_rgba_pitched_kernel(const draw_launch::SkeletonRgb
  const auto& edges = launch.edges;
  const int x = launch.clip.x1 + global_thread_x();
  const int y = launch.clip.y1 + global_thread_y();
- if (x >= launch.clip.x2 || y >= launch.clip.y2 || x >= overlay.width || y >= overlay.height || points.points_xy == nullptr || edges.edge_indices == nullptr ||
-     points.point_count <= 0 || edges.edge_count <= 0) {
+ if (x >= launch.clip.x2 || y >= launch.clip.y2 || x >= overlay.width || y >= overlay.height || points.points_xy == nullptr || edges.edge_indices == nullptr || points.point_count <= 0 ||
+     edges.edge_count <= 0) {
   return;
  }
  const float px = static_cast<float>(x) + 0.5f;
@@ -530,11 +510,10 @@ __global__ void draw_skeleton_rgba_pitched_kernel(const draw_launch::SkeletonRgb
   kernel<<<grid, block, 0, normalized_launch.stream>>>(normalized_launch);                                                           \
   return cudaGetLastError();                                                                                                         \
  }
-MMLTK_DRAW_CUDA_DEFINE_NORMALIZED_SURFACE_LAUNCHER(launch_draw_masks_boxes, draw_launch::MaskBoxLabelRgbLaunch, image, box_thickness,
-                                                   has_valid_mask_box_label_rgb_launch(launch), draw_masks_and_boxes_kernel)
+MMLTK_DRAW_CUDA_DEFINE_NORMALIZED_SURFACE_LAUNCHER(
+ launch_draw_masks_boxes, draw_launch::MaskBoxLabelRgbLaunch, image, box_thickness, has_valid_mask_box_label_rgb_launch(launch), draw_masks_and_boxes_kernel)
 MMLTK_DRAW_CUDA_DEFINE_NORMALIZED_SURFACE_LAUNCHER(launch_draw_boxes_labels_bgr_pitched, draw_launch::BoxLabelBgrPitchedLaunch, image, box_thickness,
-                                                   draw_launch::is_valid(launch.image) && has_valid_box_label_inputs(launch.instances),
-                                                   draw_boxes_labels_bgr_pitched_kernel)
+ draw_launch::is_valid(launch.image) && has_valid_box_label_inputs(launch.instances), draw_boxes_labels_bgr_pitched_kernel)
 MMLTK_DRAW_CUDA_DEFINE_LAUNCHER(launch_build_instance_colors_from_zero_based_labels, draw_launch::InstanceColorBuildLaunch) {
  if (launch.labels == nullptr || launch.colors_rgb == nullptr || launch.count == 0U) { return cudaErrorInvalidValue; }
  const int safe_count = static_cast<int>(launch.count);
@@ -544,9 +523,7 @@ MMLTK_DRAW_CUDA_DEFINE_LAUNCHER(launch_build_instance_colors_from_zero_based_lab
  return cudaGetLastError();
 }
 MMLTK_DRAW_CUDA_DEFINE_NORMALIZED_SURFACE_LAUNCHER(launch_draw_masks_boxes_labels_bgr_pitched, draw_launch::MaskBoxLabelBgrPitchedLaunch, image, box_thickness,
-                                                   draw_launch::is_valid(launch.image) && launch.instances.masks != nullptr &&
-                                                    has_valid_mask_box_label_inputs(launch.instances),
-                                                   draw_masks_boxes_labels_bgr_pitched_kernel)
+ draw_launch::is_valid(launch.image) && launch.instances.masks != nullptr && has_valid_mask_box_label_inputs(launch.instances), draw_masks_boxes_labels_bgr_pitched_kernel)
 MMLTK_DRAW_CUDA_DEFINE_LAUNCHER(launch_draw_analysis_overlay_rgba_pitched, draw_launch::AnalysisOverlayRgbaPitchedLaunch) {
  if (!draw_launch::is_valid(launch.overlay) || !has_valid_mask_box_label_inputs(launch.instances) || launch.box_thickness < 0) return cudaErrorInvalidValue;
  const dim3 block = draw_kernel_block();

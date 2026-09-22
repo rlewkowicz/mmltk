@@ -38,10 +38,7 @@ const char* child_setup_stage_label(const ChildSetupStage stage) noexcept {
 CapturedChildProcess::CapturedChildProcess(const int pid, const int pidfd, const int stdout_fd, const int setup_error_fd) noexcept
     : pid_(pid), pidfd_(pidfd), stdout_fd_(stdout_fd), setup_error_fd_(setup_error_fd) {}
 CapturedChildProcess::CapturedChildProcess(CapturedChildProcess&& other) noexcept
-    : pid_(std::exchange(other.pid_, -1)),
-      pidfd_(std::move(other.pidfd_)),
-      stdout_fd_(std::move(other.stdout_fd_)),
-      setup_error_fd_(std::move(other.setup_error_fd_)) {}
+    : pid_(std::exchange(other.pid_, -1)), pidfd_(std::move(other.pidfd_)), stdout_fd_(std::move(other.stdout_fd_)), setup_error_fd_(std::move(other.setup_error_fd_)) {}
 CapturedChildProcess& CapturedChildProcess::operator=(CapturedChildProcess&& other) noexcept {
  if (this != &other) {
   close();
@@ -92,9 +89,7 @@ inline ScopedFd make_timeout_fd(const std::chrono::milliseconds timeout, const s
  itimerspec specification{};
  specification.it_value.tv_sec = static_cast<time_t>(timeout_ns.count() / 1000000000LL);
  specification.it_value.tv_nsec = static_cast<long>(timeout_ns.count() % 1000000000LL);
- if (::timerfd_settime(fd, 0, &specification, nullptr) != 0) {
-  throw std::runtime_error(std::string("failed to arm timeout fd for ") + std::string(process_name) + ": " + std::strerror(errno));
- }
+ if (::timerfd_settime(fd, 0, &specification, nullptr) != 0) { throw std::runtime_error(std::string("failed to arm timeout fd for ") + std::string(process_name) + ": " + std::strerror(errno)); }
  return timeout_fd;
 }
 inline bool write_child_setup_failure(const int fd, const ChildSetupStage stage) noexcept {
@@ -175,8 +170,7 @@ inline void kill_captured_child(const pid_t pid, const bool kill_process_group) 
  }
  (void)::kill(pid, SIGKILL);
 }
-CapturedChildProcess spawn_captured_child_process_erased(const std::string_view process_name, const ChildSetupTarget child_setup,
-                                                         const bool nonblocking_output) {
+CapturedChildProcess spawn_captured_child_process_erased(const std::string_view process_name, const ChildSetupTarget child_setup, const bool nonblocking_output) {
  std::array<int, 2> stdout_pipe{-1, -1};
  std::string stdout_pipe_label{process_name};
  stdout_pipe_label.append(" output pipe");
@@ -266,8 +260,8 @@ inline void poll_child_process_events(std::array<pollfd, 4U>& wait_fds, const st
  do { ready = ::poll(wait_fds.data(), wait_fds.size(), -1); } while (ready < 0 && errno == EINTR);
  if (ready < 0) { throw std::runtime_error(std::string("failed to wait for ") + std::string(wait_context) + ": " + std::strerror(errno)); }
 }
-inline void read_captured_child_output(const int fd, CapturedChildProcessResult& result, const std::string_view error_prefix, const std::size_t output_limit,
-                                       const std::size_t read_budget = kCapturedChildReadBudget) {
+inline void read_captured_child_output(
+ const int fd, CapturedChildProcessResult& result, const std::string_view error_prefix, const std::size_t output_limit, const std::size_t read_budget = kCapturedChildReadBudget) {
  if (fd < 0 || read_budget == 0U) { return; }
  std::array<char, 4096U> buffer{};
  std::size_t consumed = 0U;
@@ -294,8 +288,7 @@ inline void read_captured_child_output(const int fd, CapturedChildProcessResult&
 // Both the explicit-cancel and the poll-driven cancel/timeout paths tear the child down the same
 // way; only the reason in the thrown message differs.
 [[noreturn]] inline void abort_captured_child_process(CapturedChildProcess& process, CapturedChildProcessResult& result, const std::string_view process_name,
-                                                      const std::string_view output_error_prefix, const CapturedChildAbortReason reason,
-                                                      const bool kill_process_group, const std::size_t output_limit) {
+ const std::string_view output_error_prefix, const CapturedChildAbortReason reason, const bool kill_process_group, const std::size_t output_limit) {
  kill_captured_child(process.pid(), kill_process_group);
  result.status = wait_child_process(process.pid());
  static_cast<void>(process.release_pid());
@@ -303,13 +296,9 @@ inline void read_captured_child_output(const int fd, CapturedChildProcessResult&
  process.close();
  throw CapturedChildAborted(std::string(process_name) + (reason == CapturedChildAbortReason::Cancelled ? " cancelled" : " timed out"), reason);
 }
-CapturedChildProcessResult run_captured_child_process_erased(const std::string_view process_name, const std::string_view output_error_prefix,
-                                                             const ChildSetupTarget child_setup, const ChildCancellationTarget cancellation,
-                                                             const std::chrono::milliseconds timeout, const int cancel_fd, const bool kill_process_group,
-                                                             const std::size_t output_limit) {
- if (output_limit == 0U || output_limit > kMaximumCapturedChildOutputBytes) {
-  throw std::invalid_argument("captured child output limit is outside the framework bound");
- }
+CapturedChildProcessResult run_captured_child_process_erased(const std::string_view process_name, const std::string_view output_error_prefix, const ChildSetupTarget child_setup,
+ const ChildCancellationTarget cancellation, const std::chrono::milliseconds timeout, const int cancel_fd, const bool kill_process_group, const std::size_t output_limit) {
+ if (output_limit == 0U || output_limit > kMaximumCapturedChildOutputBytes) { throw std::invalid_argument("captured child output limit is outside the framework bound"); }
  ScopedFd timeout_fd = make_timeout_fd(timeout, process_name);
  CapturedChildProcess process = spawn_captured_child_process_erased(process_name, child_setup, true);
  CapturedChildProcessResult result;
@@ -317,9 +306,7 @@ CapturedChildProcessResult run_captured_child_process_erased(const std::string_v
   while (true) {
    read_captured_child_output(process.stdout_fd(), result, output_error_prefix, output_limit);
    if (result.output_limit_exceeded) { throw std::runtime_error(std::string(process_name) + " output exceeded capture limit"); }
-   if (cancellation.is_requested()) {
-    abort_captured_child_process(process, result, process_name, output_error_prefix, CapturedChildAbortReason::Cancelled, kill_process_group, output_limit);
-   }
+   if (cancellation.is_requested()) { abort_captured_child_process(process, result, process_name, output_error_prefix, CapturedChildAbortReason::Cancelled, kill_process_group, output_limit); }
    std::array<pollfd, 4U> wait_fds{{
     pollfd{process.stdout_fd(), POLLIN, 0},
     pollfd{process.pidfd(), POLLIN, 0},
@@ -345,8 +332,8 @@ CapturedChildProcessResult run_captured_child_process_erased(const std::string_v
    const bool cancelled = (wait_fds[2].revents & (POLLIN | POLLHUP | POLLERR)) != 0 || cancellation.is_requested();
    const bool timed_out = (wait_fds[3].revents & (POLLIN | POLLHUP | POLLERR)) != 0;
    if (cancelled || timed_out) {
-    abort_captured_child_process(process, result, process_name, output_error_prefix,
-                                 cancelled ? CapturedChildAbortReason::Cancelled : CapturedChildAbortReason::TimedOut, kill_process_group, output_limit);
+    abort_captured_child_process(
+     process, result, process_name, output_error_prefix, cancelled ? CapturedChildAbortReason::Cancelled : CapturedChildAbortReason::TimedOut, kill_process_group, output_limit);
    }
   }
   read_captured_child_output(process.stdout_fd(), result, output_error_prefix, output_limit, output_limit + 1U);

@@ -36,8 +36,8 @@ namespace {
   .frame_ready = true,
  };
 }
-void apply_gesture(subsystems::annotation::AnnotationDocument& editor, AnnotationPointer& pointer, contracts::AnnotationPoint end,
-                   contracts::AnnotationPointerPhase phase = contracts::AnnotationPointerPhase::End) {
+void apply_gesture(
+ subsystems::annotation::AnnotationDocument& editor, AnnotationPointer& pointer, contracts::AnnotationPoint end, contracts::AnnotationPointerPhase phase = contracts::AnnotationPointerPhase::End) {
  REQUIRE(editor.Pointer(pointer).outcome == subsystems::annotation::DocumentOutcome::Applied);
  pointer.phase = phase;
  ++pointer.sequence;
@@ -49,8 +49,7 @@ void apply_gesture(subsystems::annotation::AnnotationDocument& editor, Annotatio
  std::ifstream file{path, std::ios::binary};
  const std::vector<char> characters{std::istreambuf_iterator<char>{file}, std::istreambuf_iterator<char>{}};
  auto decoded = mmltk::frameworks::serialization::decode<contracts::AnnotationUiState>(
-  {.first = std::as_bytes(std::span{characters})},
-  {.max_bytes = contracts::kAnnotationUiStateByteBudget, .max_items = contracts::kAnnotationUiStateByteBudget});
+  {.first = std::as_bytes(std::span{characters})}, {.max_bytes = contracts::kAnnotationUiStateByteBudget, .max_items = contracts::kAnnotationUiStateByteBudget});
  REQUIRE(decoded.has_value());
  return std::move(decoded->scene);
 }
@@ -68,8 +67,7 @@ TEST_CASE("Native Annotation hit testing owns tool targets and selected handle p
   {.name = contracts::AnnotationText::From("spline"), .shape = Shape::Spline, .spline_knots = {{{20, 20}, {{10, 20}, true}, {{30, 20}, true}}}},
   {.name = contracts::AnnotationText::From("skeleton"),
    .shape = Shape::Skeleton,
-   .skeleton_nodes = {{.key = contracts::AnnotationText::From("visible"), .point = {40, 40}},
-                      {.key = contracts::AnnotationText::From("hidden"), .point = {55, 55}, .visible = false}}},
+   .skeleton_nodes = {{.key = contracts::AnnotationText::From("visible"), .point = {40, 40}}, {.key = contracts::AnnotationText::From("hidden"), .point = {55, 55}, .visible = false}}},
  };
  REQUIRE(editor.Open(scene).outcome == document::DocumentOutcome::Applied);
  const auto select = [&](std::uint16_t object) { REQUIRE(editor.Edit({.value = AnnotationObjectEdit{object}}).outcome == document::DocumentOutcome::Applied); };
@@ -335,9 +333,7 @@ TEST_CASE("New indexed Annotation objects keep initial element identities throug
    .phase = contracts::AnnotationPointerPhase::Update,
    .interaction_id = 2U,
    .sequence = 1U,
-   .target = {.object = 0U,
-              .element = 0U,
-              .role = tool == contracts::AnnotationTool::Spline ? contracts::AnnotationHandleRole::SplineKnot : contracts::AnnotationHandleRole::SkeletonNode},
+   .target = {.object = 0U, .element = 0U, .role = tool == contracts::AnnotationTool::Spline ? contracts::AnnotationHandleRole::SplineKnot : contracts::AnnotationHandleRole::SkeletonNode},
    .identity = {.object = identity.object, .element = identity.elements.front()},
    .point = {12.0F, 14.0F},
   };
@@ -467,10 +463,9 @@ TEST_CASE("Annotation import capacity failure leaves the open editable document 
  CHECK(editor.Open(excessive).outcome != document::DocumentOutcome::Applied);
  CHECK(editor.ui() == kept);
  excessive = test_scene("direct://too-many-runs");
- excessive.objects.push_back(
-  {.name = contracts::AnnotationText::From("mask"),
-   .shape = contracts::AnnotationShape::Mask,
-   .mask = {.runs = std::vector<contracts::AnnotationMaskRun>(contracts::kAnnotationMaskRunCapacity + 1U, {1U, 1U, 2U}), .present = true}});
+ excessive.objects.push_back({.name = contracts::AnnotationText::From("mask"),
+  .shape = contracts::AnnotationShape::Mask,
+  .mask = {.runs = std::vector<contracts::AnnotationMaskRun>(contracts::kAnnotationMaskRunCapacity + 1U, {1U, 1U, 2U}), .present = true}});
  CHECK(editor.Open(std::move(excessive)).outcome != document::DocumentOutcome::Applied);
  CHECK(editor.ui() == kept);
  // Inject malformed current facts through the existing read-only observation
@@ -503,18 +498,17 @@ TEST_CASE("Annotation valid repeated edits do not consume history and editing ou
  namespace d = c::subsystems::annotation;
  d::AnnotationDocument editor;
  c::contracts::AnnotationSceneContent scene{.document = c::contracts::WorkspaceResource::From("test://history", 1U),
-                                            .categories = {{.value = "vehicle"}},
-                                            .objects = {{.name = c::contracts::AnnotationText::From("box")}},
-                                            .frame_width = 64,
-                                            .frame_height = 64,
-                                            .frame_ready = true};
+  .categories = {{.value = "vehicle"}},
+  .objects = {{.name = c::contracts::AnnotationText::From("box")}},
+  .frame_width = 64,
+  .frame_height = 64,
+  .frame_ready = true};
  REQUIRE(editor.Open(scene).outcome == d::DocumentOutcome::Applied);
  REQUIRE(editor.Edit({.value = c::AnnotationObjectEdit{0}}).outcome == d::DocumentOutcome::Applied);
  const auto revision = editor.ui().document_revision;
  CHECK(editor.Edit({.value = c::AnnotationObjectEdit{0}}).outcome == d::DocumentOutcome::Applied);
  CHECK(editor.ui().document_revision == revision);
- for (unsigned index = 0; index < 80; ++index)
-  REQUIRE(editor.Edit({.value = c::AnnotationSelectedObjectEdit{0, index % 2 != 0}}).outcome == d::DocumentOutcome::Applied);
+ for (unsigned index = 0; index < 80; ++index) REQUIRE(editor.Edit({.value = c::AnnotationSelectedObjectEdit{0, index % 2 != 0}}).outcome == d::DocumentOutcome::Applied);
  for (unsigned index = 0; index < 32; ++index) REQUIRE(editor.Edit({.value = c::AnnotationUndoEdit{}}).outcome == d::DocumentOutcome::Applied);
  CHECK_FALSE(editor.ui().can_undo);
  const auto exhausted = editor.ui();
@@ -530,8 +524,8 @@ TEST_CASE("Annotation journal moves retain complete payloads and restore stored 
  namespace domain = c::contracts;
  d::AnnotationDocument editor;
  auto scene = c::test_scene("test://journal-owned-payloads");
- scene.objects = {{.name = domain::AnnotationText::From("attached mask"), .box = {{2, 2}, {24, 24}}, .mask = {.present = true}},
-                  {.name = domain::AnnotationText::From("second"), .box = {{30, 30}, {50, 50}}}};
+ scene.objects = {
+  {.name = domain::AnnotationText::From("attached mask"), .box = {{2, 2}, {24, 24}}, .mask = {.present = true}}, {.name = domain::AnnotationText::From("second"), .box = {{30, 30}, {50, 50}}}};
  for (std::uint16_t row = 0; row != 64U; ++row)
   for (std::uint16_t x = 0; x != 64U; x += 2U) scene.objects[0].mask.runs.push_back({row, x, x});
  REQUIRE(editor.Open(scene).outcome == d::DocumentOutcome::Applied);
@@ -616,11 +610,8 @@ TEST_CASE("Annotation brush follows every segment as one cancelable transaction"
  namespace c = mmltk::controller;
  namespace d = c::subsystems::annotation;
  d::AnnotationDocument editor;
- c::contracts::AnnotationSceneContent scene{.document = c::contracts::WorkspaceResource::From("test://brush", 1U),
-                                            .categories = {{.value = "vehicle"}},
-                                            .frame_width = 64,
-                                            .frame_height = 64,
-                                            .frame_ready = true};
+ c::contracts::AnnotationSceneContent scene{
+  .document = c::contracts::WorkspaceResource::From("test://brush", 1U), .categories = {{.value = "vehicle"}}, .frame_width = 64, .frame_height = 64, .frame_ready = true};
  REQUIRE(editor.Open(scene).outcome == d::DocumentOutcome::Applied);
  REQUIRE(editor.Edit({.value = c::AnnotationToolEdit{c::contracts::AnnotationTool::MaskPaint}}).outcome == d::DocumentOutcome::Applied);
  c::AnnotationPointer pointer{.interaction_id = 1, .sequence = 1, .point = {10, 10}, .brush_radius = 2};
@@ -650,11 +641,8 @@ TEST_CASE("Annotation render descriptions retain exact previews independently of
  namespace d = c::subsystems::annotation;
  for (const auto tool : {c::contracts::AnnotationTool::Box, c::contracts::AnnotationTool::MaskPaint}) {
   d::AnnotationDocument editor;
-  c::contracts::AnnotationSceneContent scene{.document = c::contracts::WorkspaceResource::From("test://immutable-render", 1U),
-                                             .categories = {{.value = "object"}},
-                                             .frame_width = 64U,
-                                             .frame_height = 64U,
-                                             .frame_ready = true};
+  c::contracts::AnnotationSceneContent scene{
+   .document = c::contracts::WorkspaceResource::From("test://immutable-render", 1U), .categories = {{.value = "object"}}, .frame_width = 64U, .frame_height = 64U, .frame_ready = true};
   REQUIRE(editor.Open(scene).outcome == d::DocumentOutcome::Applied);
   REQUIRE(editor.Edit({.value = c::AnnotationToolEdit{tool}}).render_changed);
   CHECK_FALSE(editor.Edit({.value = c::AnnotationToolEdit{tool}}).render_changed);
@@ -697,10 +685,8 @@ TEST_CASE("Annotation large committed scenes reuse bounded immutable storage acr
  namespace d = c::subsystems::annotation;
  d::AnnotationDocument editor;
  auto scene = c::test_scene("test://retained-large");
- scene.objects.resize(c::contracts::kAnnotationObjectCapacity - 1U, {.name = c::contracts::AnnotationText::From("mask"),
-                                                                     .shape = c::contracts::AnnotationShape::Mask,
-                                                                     .box = {{1, 1}, {8, 8}},
-                                                                     .mask = {.runs = {{1, 1, 7}, {3, 1, 7}, {5, 1, 7}}, .present = true}});
+ scene.objects.resize(c::contracts::kAnnotationObjectCapacity - 1U,
+  {.name = c::contracts::AnnotationText::From("mask"), .shape = c::contracts::AnnotationShape::Mask, .box = {{1, 1}, {8, 8}}, .mask = {.runs = {{1, 1, 7}, {3, 1, 7}, {5, 1, 7}}, .present = true}});
  REQUIRE(editor.Open(scene).outcome == d::DocumentOutcome::Applied);
  REQUIRE(editor.Edit({.value = c::AnnotationToolEdit{c::contracts::AnnotationTool::Box}}).render_changed);
  c::AnnotationRenderState held, pending, scratch;
@@ -860,15 +846,15 @@ TEST_CASE("Annotation changing mask previews reuse their private high-water stor
 TEST_CASE("Annotation creates each supported shape in the selected native class") {
  namespace c = mmltk::controller;
  namespace d = c::subsystems::annotation;
- for (auto tool : {c::contracts::AnnotationTool::Box, c::contracts::AnnotationTool::Point, c::contracts::AnnotationTool::Spline,
-                   c::contracts::AnnotationTool::Skeleton, c::contracts::AnnotationTool::MaskPaint}) {
+ for (auto tool :
+  {c::contracts::AnnotationTool::Box, c::contracts::AnnotationTool::Point, c::contracts::AnnotationTool::Spline, c::contracts::AnnotationTool::Skeleton, c::contracts::AnnotationTool::MaskPaint}) {
   d::AnnotationDocument editor;
   c::contracts::AnnotationSceneContent scene{.document = c::contracts::WorkspaceResource::From("test://create", 1U),
-                                             .categories = {{.value = "first"}, {.value = "second"}},
-                                             .palette = {{0, 1, 1}, {200, 0.5F, 0.8F}},
-                                             .frame_width = 64,
-                                             .frame_height = 64,
-                                             .frame_ready = true};
+   .categories = {{.value = "first"}, {.value = "second"}},
+   .palette = {{0, 1, 1}, {200, 0.5F, 0.8F}},
+   .frame_width = 64,
+   .frame_height = 64,
+   .frame_ready = true};
   REQUIRE(editor.Open(scene).outcome == d::DocumentOutcome::Applied);
   CHECK(editor.ui().scene.palette == scene.palette);
   CHECK(editor.ui().editor.selected_category == 0);
@@ -887,18 +873,12 @@ TEST_CASE("Annotation mask fill and cleanup modify support and preserve tight pi
  namespace c = mmltk::controller;
  namespace d = c::subsystems::annotation;
  d::AnnotationDocument editor;
- c::contracts::AnnotationObject object{
-  .name = c::contracts::AnnotationText::From("ring"),
+ c::contracts::AnnotationObject object{.name = c::contracts::AnnotationText::From("ring"),
   .shape = c::contracts::AnnotationShape::Mask,
   .box = {{10, 10}, {15, 15}},
-  .mask = {.runs = {{10, 10, 14}, {11, 10, 10}, {11, 14, 14}, {12, 10, 10}, {12, 14, 14}, {13, 10, 10}, {13, 14, 14}, {14, 10, 14}, {40, 40, 40}},
-           .present = true}};
- c::contracts::AnnotationSceneContent scene{.document = c::contracts::WorkspaceResource::From("test://cleanup", 1U),
-                                            .categories = {{.value = "mask"}},
-                                            .objects = {object},
-                                            .frame_width = 64,
-                                            .frame_height = 64,
-                                            .frame_ready = true};
+  .mask = {.runs = {{10, 10, 14}, {11, 10, 10}, {11, 14, 14}, {12, 10, 10}, {12, 14, 14}, {13, 10, 10}, {13, 14, 14}, {14, 10, 14}, {40, 40, 40}}, .present = true}};
+ c::contracts::AnnotationSceneContent scene{
+  .document = c::contracts::WorkspaceResource::From("test://cleanup", 1U), .categories = {{.value = "mask"}}, .objects = {object}, .frame_width = 64, .frame_height = 64, .frame_ready = true};
  REQUIRE(editor.Open(scene).outcome == d::DocumentOutcome::Applied);
  REQUIRE(editor.Edit({.value = c::AnnotationObjectEdit{0}}).outcome == d::DocumentOutcome::Applied);
  REQUIRE(editor.Edit({.value = c::AnnotationMaskCleanupEdit{c::contracts::AnnotationMaskCleanup::LargestComponent, 1}}).outcome == d::DocumentOutcome::Applied);
@@ -911,8 +891,8 @@ TEST_CASE("Annotation mask fill and cleanup modify support and preserve tight pi
  REQUIRE(editor.Edit({.value = c::AnnotationUndoEdit{}}).outcome == d::DocumentOutcome::Applied);
  REQUIRE(editor.Edit({.value = c::AnnotationMaskCleanupEdit{c::contracts::AnnotationMaskCleanup::FillHoles, 1}}).outcome == d::DocumentOutcome::Applied);
  CHECK(editor.ui().scene.objects.front().mask.runs == filled_runs);
- for (auto operation : {c::contracts::AnnotationMaskCleanup::Dilate, c::contracts::AnnotationMaskCleanup::Erode, c::contracts::AnnotationMaskCleanup::Open,
-                        c::contracts::AnnotationMaskCleanup::Close, c::contracts::AnnotationMaskCleanup::FillHoles}) {
+ for (auto operation : {c::contracts::AnnotationMaskCleanup::Dilate, c::contracts::AnnotationMaskCleanup::Erode, c::contracts::AnnotationMaskCleanup::Open, c::contracts::AnnotationMaskCleanup::Close,
+       c::contracts::AnnotationMaskCleanup::FillHoles}) {
   CAPTURE(operation);
   REQUIRE(editor.Edit({.value = c::AnnotationMaskCleanupEdit{operation, 1}}).outcome == d::DocumentOutcome::Applied);
   CHECK(editor.ui().scene.valid());
@@ -936,17 +916,16 @@ TEST_CASE("Annotation boxes move and resize without changing their pixel content
  namespace d = c::subsystems::annotation;
  d::AnnotationDocument editor;
  c::contracts::AnnotationSceneContent scene{.document = c::contracts::WorkspaceResource::From("test://box", 1),
-                                            .categories = {{.value = "box"}},
-                                            .objects = {{.name = c::contracts::AnnotationText::From("box"), .box = {{10, 10}, {20, 20}}}},
-                                            .frame_width = 64,
-                                            .frame_height = 64,
-                                            .frame_ready = true};
+  .categories = {{.value = "box"}},
+  .objects = {{.name = c::contracts::AnnotationText::From("box"), .box = {{10, 10}, {20, 20}}}},
+  .frame_width = 64,
+  .frame_height = 64,
+  .frame_ready = true};
  REQUIRE(editor.Open(scene).outcome == d::DocumentOutcome::Applied);
  c::AnnotationPointer pointer{.interaction_id = 1, .sequence = 1, .target = {.object = 0}, .point = {15, 15}};
  c::apply_gesture(editor, pointer, {25, 25});
  CHECK(editor.ui().scene.objects.front().box == c::contracts::AnnotationBox{{20, 20}, {30, 30}});
- pointer = {
-  .interaction_id = 2, .sequence = 1, .target = {.object = 0, .element = 2, .role = c::contracts::AnnotationHandleRole::BoxCorner}, .point = {30, 30}};
+ pointer = {.interaction_id = 2, .sequence = 1, .target = {.object = 0, .element = 2, .role = c::contracts::AnnotationHandleRole::BoxCorner}, .point = {30, 30}};
  c::apply_gesture(editor, pointer, {40, 45});
  CHECK(editor.ui().scene.objects.front().box == c::contracts::AnnotationBox{{20, 20}, {40, 45}});
 }
@@ -972,14 +951,12 @@ TEST_CASE("Annotation native capabilities reject incompatible typed tools and ta
  namespace d = c::subsystems::annotation;
  d::AnnotationDocument editor;
  c::contracts::AnnotationSceneContent scene{.document = c::contracts::WorkspaceResource::From("test://capabilities", 1),
-                                            .categories = {{.value = "class"}},
-                                            .objects = {{.name = c::contracts::AnnotationText::From("box"), .box = {{1, 1}, {20, 20}}},
-                                                        {.name = c::contracts::AnnotationText::From("mask"),
-                                                         .shape = c::contracts::AnnotationShape::Mask,
-                                                         .mask = {.runs = {{10, 10, 20}}, .present = true}}},
-                                            .frame_width = 64,
-                                            .frame_height = 64,
-                                            .frame_ready = true};
+  .categories = {{.value = "class"}},
+  .objects = {{.name = c::contracts::AnnotationText::From("box"), .box = {{1, 1}, {20, 20}}},
+   {.name = c::contracts::AnnotationText::From("mask"), .shape = c::contracts::AnnotationShape::Mask, .mask = {.runs = {{10, 10, 20}}, .present = true}}},
+  .frame_width = 64,
+  .frame_height = 64,
+  .frame_ready = true};
  for (const auto shape : {c::contracts::AnnotationShape::Point, c::contracts::AnnotationShape::Spline, c::contracts::AnnotationShape::Skeleton})
   scene.objects.push_back({.name = c::contracts::AnnotationText::From("geometry"), .shape = shape});
  REQUIRE(editor.Open(scene).outcome == d::DocumentOutcome::Applied);
@@ -1004,8 +981,7 @@ TEST_CASE("Annotation native capabilities reject incompatible typed tools and ta
  CHECK(editor.Pointer(pointer).outcome == d::DocumentOutcome::Rejected);
  CHECK(editor.ui() == sampled_before);
  CHECK(editor.ToolAvailable(c::contracts::AnnotationTool::ColorSample, 1));
- CHECK(std::ranges::any_of(editor.ui().tool_capabilities,
-                           [](auto capability) { return capability.tool == c::contracts::AnnotationTool::ColorSample && capability.available; }));
+ CHECK(std::ranges::any_of(editor.ui().tool_capabilities, [](auto capability) { return capability.tool == c::contracts::AnnotationTool::ColorSample && capability.available; }));
  REQUIRE(editor.Edit({.value = c::AnnotationObjectEdit{0}}).outcome == d::DocumentOutcome::Applied);
  CHECK(editor.ui().editor.tool == c::contracts::AnnotationTool::Select);
 }
@@ -1062,10 +1038,8 @@ TEST_CASE("Mask drag descriptions retain base intervals and commit exact transfo
  namespace d = c::subsystems::annotation;
  d::AnnotationDocument editor;
  auto scene = c::test_scene("test://mask-transform");
- scene.objects.push_back({.name = c::contracts::AnnotationText::From("mask"),
-                          .shape = c::contracts::AnnotationShape::Mask,
-                          .box = {{10, 10}, {14, 12}},
-                          .mask = {.runs = {{10, 10, 13}, {11, 11, 12}}, .present = true}});
+ scene.objects.push_back(
+  {.name = c::contracts::AnnotationText::From("mask"), .shape = c::contracts::AnnotationShape::Mask, .box = {{10, 10}, {14, 12}}, .mask = {.runs = {{10, 10, 13}, {11, 11, 12}}, .present = true}});
  REQUIRE(editor.Open(scene).outcome == d::DocumentOutcome::Applied);
  c::AnnotationPointer pointer{.interaction_id = 1U, .sequence = 1U, .target = {.object = 0U}, .point = {11.25F, 10.5F}};
  REQUIRE(editor.Pointer(pointer).outcome == d::DocumentOutcome::Applied);
@@ -1095,8 +1069,7 @@ TEST_CASE("Native annotation raster retains allocation damage and exact mask-tra
  namespace gpu = mmltk::frameworks::gpu;
  if (mmltk::testsupport::checked_cuda_device_count() == 0) SKIP("CUDA device unavailable");
  std::promise<std::exception_ptr> done;
- c::detail::VisualRuntimeOwner owner(c::make_native_annotation_runtime_factory({.device = 0, .maximum_width = 64U, .maximum_height = 64U}),
-                                     [&](auto failure) { done.set_value(failure); });
+ c::detail::VisualRuntimeOwner owner(c::make_native_annotation_runtime_factory({.device = 0, .maximum_width = 64U, .maximum_height = 64U}), [&](auto failure) { done.set_value(failure); });
  const bool submitted = owner.SubmitOrdered([&](auto& runtime, std::stop_token) {
   cudaDeviceProp properties{};
   REQUIRE(cudaGetDeviceProperties(&properties, 0) == cudaSuccess);
@@ -1104,8 +1077,8 @@ TEST_CASE("Native annotation raster retains allocation damage and exact mask-tra
   auto& algorithm = dynamic_cast<c::AnnotationAlgorithm&>(*runtime.model());
   const auto open = [&](unsigned char value) {
    runtime.PublishInput(64U, 64U, [value](auto clean, auto, auto stream) {
-    REQUIRE(cudaMemset2DAsync(reinterpret_cast<void*>(clean.data), clean.descriptor.pitch_bytes, value, clean.descriptor.row_bytes(), clean.descriptor.height,
-                              reinterpret_cast<cudaStream_t>(stream)) == cudaSuccess);
+    REQUIRE(cudaMemset2DAsync(
+             reinterpret_cast<void*>(clean.data), clean.descriptor.pitch_bytes, value, clean.descriptor.row_bytes(), clean.descriptor.height, reinterpret_cast<cudaStream_t>(stream)) == cudaSuccess);
    });
    const auto input = runtime.BorrowInput();
    algorithm.Open(input.plane(0U).plane(), {}, {64U, 64U});
@@ -1114,8 +1087,7 @@ TEST_CASE("Native annotation raster retains allocation damage and exact mask-tra
   auto scene = std::make_shared<c::contracts::AnnotationSceneContent>(c::test_scene("test://native-raster"));
   scene->categories.push_back({.value = "second"});
   scene->palette = {{0, 1, 1}, {120, 1, 1}};
-  scene->objects = {
-   {.name = c::contracts::AnnotationText::From("first box"), .shape = c::contracts::AnnotationShape::Box, .box = {{4, 4}, {20, 20}}},
+  scene->objects = {{.name = c::contracts::AnnotationText::From("first box"), .shape = c::contracts::AnnotationShape::Box, .box = {{4, 4}, {20, 20}}},
    {.name = c::contracts::AnnotationText::From("second box"), .shape = c::contracts::AnnotationShape::Box, .box = {{10, 4}, {26, 20}}, .category = 1U},
    {.name = c::contracts::AnnotationText::From("mask"), .shape = c::contracts::AnnotationShape::Mask, .box = {{6, 10}, {15, 16}}, .mask = {.present = true}}};
   for (std::uint16_t row = 10U; row != 16U; ++row) scene->objects.back().mask.runs.push_back({row, 6U, 14U});
@@ -1142,8 +1114,7 @@ TEST_CASE("Native annotation raster retains allocation damage and exact mask-tra
    std::array<unsigned char, 64U * 64U * 4U> pixels;
    for (std::size_t plane = 0U; plane != 2U; ++plane) {
     const auto source = product.plane(plane).plane();
-    REQUIRE(cudaMemcpy2D(pixels.data(), 64U * 4U, reinterpret_cast<const void*>(source.data), source.descriptor.pitch_bytes, 64U * 4U, 64U,
-                         cudaMemcpyDeviceToHost) == cudaSuccess);
+    REQUIRE(cudaMemcpy2D(pixels.data(), 64U * 4U, reinterpret_cast<const void*>(source.data), source.descriptor.pitch_bytes, 64U * 4U, 64U, cudaMemcpyDeviceToHost) == cudaSuccess);
     if (plane == 0U) CHECK(std::ranges::all_of(pixels, [clean_value](auto byte) { return byte == clean_value; }));
    }
    return pixels;
@@ -1182,11 +1153,7 @@ TEST_CASE("Native annotation raster retains allocation damage and exact mask-tra
   CHECK(render(82U) == preview);
   CHECK(render(82U) == preview);
   auto mixed = std::make_shared<c::contracts::AnnotationSceneContent>(*scene);
-  mixed->objects = {
-   {.name = c::contracts::AnnotationText::From("point"),
-    .shape = c::contracts::AnnotationShape::Point,
-    .point = {20, 8},
-    .mask = {.runs = {{44U, 40U, 52U}}, .present = true}},
+  mixed->objects = {{.name = c::contracts::AnnotationText::From("point"), .shape = c::contracts::AnnotationShape::Point, .point = {20, 8}, .mask = {.runs = {{44U, 40U, 52U}}, .present = true}},
    {.name = c::contracts::AnnotationText::From("spline"),
     .shape = c::contracts::AnnotationShape::Spline,
     .mask = {.runs = {{46U, 40U, 52U}}, .present = true},
@@ -1194,13 +1161,9 @@ TEST_CASE("Native annotation raster retains allocation damage and exact mask-tra
    {.name = c::contracts::AnnotationText::From("skeleton"),
     .shape = c::contracts::AnnotationShape::Skeleton,
     .mask = {.runs = {{48U, 40U, 52U}}, .present = true},
-    .skeleton_nodes = {{.key = c::contracts::AnnotationText::From("first"), .point = {4, 12}},
-                       {.key = c::contracts::AnnotationText::From("second"), .point = {12, 12}}},
+    .skeleton_nodes = {{.key = c::contracts::AnnotationText::From("first"), .point = {4, 12}}, {.key = c::contracts::AnnotationText::From("second"), .point = {12, 12}}},
     .skeleton_edges = {{0U, 1U}}},
-   {.name = c::contracts::AnnotationText::From("masked box"),
-    .shape = c::contracts::AnnotationShape::Box,
-    .box = {{2, 2}, {10, 10}},
-    .mask = {.runs = {{50U, 40U, 52U}}, .present = true}},
+   {.name = c::contracts::AnnotationText::From("masked box"), .shape = c::contracts::AnnotationShape::Box, .box = {{2, 2}, {10, 10}}, .mask = {.runs = {{50U, 40U, 52U}}, .present = true}},
    {.name = c::contracts::AnnotationText::From("covering box"), .shape = c::contracts::AnnotationShape::Box, .box = {{42, 41}, {55, 54}}, .category = 1U}};
   REQUIRE(mixed->valid());
   description.scene = mixed;
@@ -1262,21 +1225,14 @@ TEST_CASE("Native annotation raster retains allocation damage and exact mask-tra
    c::subsystems::annotation::AnnotationDocument history;
    auto packed = c::test_scene("test://packed-membership");
    packed.palette = {{0, 1, 1}};
-   packed.objects = {{.name = c::contracts::AnnotationText::From("first point"),
-                      .shape = c::contracts::AnnotationShape::Point,
-                      .point = {20, 8},
-                      .mask = {.runs = {{44U, 10U, 18U}}, .present = true}},
-                     {.name = c::contracts::AnnotationText::From("middle point"), .shape = c::contracts::AnnotationShape::Point, .point = {12, 20}},
-                     {.name = c::contracts::AnnotationText::From("trailing point"),
-                      .shape = c::contracts::AnnotationShape::Point,
-                      .point = {30, 30},
-                      .mask = {.runs = {{48U, 40U, 50U}}, .present = true}}};
+   packed.objects = {{.name = c::contracts::AnnotationText::From("first point"), .shape = c::contracts::AnnotationShape::Point, .point = {20, 8}, .mask = {.runs = {{44U, 10U, 18U}}, .present = true}},
+    {.name = c::contracts::AnnotationText::From("middle point"), .shape = c::contracts::AnnotationShape::Point, .point = {12, 20}},
+    {.name = c::contracts::AnnotationText::From("trailing point"), .shape = c::contracts::AnnotationShape::Point, .point = {30, 30}, .mask = {.runs = {{48U, 40U, 50U}}, .present = true}}};
    REQUIRE(history.Open(packed).outcome == c::subsystems::annotation::DocumentOutcome::Applied);
    REQUIRE(history.Edit({.value = c::AnnotationObjectEdit{2U}}).outcome == c::subsystems::annotation::DocumentOutcome::Applied);
    std::array<c::AnnotationRenderState, 4U> layouts;
    history.CaptureRender(layouts[0]);
-   REQUIRE(history.Edit({.value = c::AnnotationSidebarEdit{c::contracts::AnnotationSidebarCommand::Delete}}).outcome ==
-           c::subsystems::annotation::DocumentOutcome::Applied);
+   REQUIRE(history.Edit({.value = c::AnnotationSidebarEdit{c::contracts::AnnotationSidebarCommand::Delete}}).outcome == c::subsystems::annotation::DocumentOutcome::Applied);
    history.CaptureRender(layouts[1]);
    REQUIRE(history.Edit({.value = c::AnnotationUndoEdit{}}).outcome == c::subsystems::annotation::DocumentOutcome::Applied);
    history.CaptureRender(layouts[2]);
@@ -1320,8 +1276,7 @@ TEST_CASE("Native annotation raster retains allocation damage and exact mask-tra
   editor.CaptureRender(description);
   compare_fresh();
   pointer.phase = c::contracts::AnnotationPointerPhase::Update;
-  for (const auto point : std::array<c::contracts::AnnotationPoint, 7U>{
-        {{16.5F, 19.5F}, {17.5F, 19.5F}, {16.5F, 20.5F}, {17.5F, 20.5F}, {32.75F, 38.25F}, {16.5F, 19.5F}, {32.75F, 38.25F}}}) {
+  for (const auto point : std::array<c::contracts::AnnotationPoint, 7U>{{{16.5F, 19.5F}, {17.5F, 19.5F}, {16.5F, 20.5F}, {17.5F, 20.5F}, {32.75F, 38.25F}, {16.5F, 19.5F}, {32.75F, 38.25F}}}) {
    pointer.point = point;
    ++pointer.sequence;
    REQUIRE(editor.Pointer(pointer).render_changed);
@@ -1397,8 +1352,7 @@ TEST_CASE("Annotation class admission preserves CBOR non-box content and journal
 TEST_CASE("Original imports restore stored aspect with fractional geometry without source-resolution allocation") {
  auto source = std::make_shared<VisualDocument>();
  source->scene = test_scene("compiled://stretch");
- source->scene.objects.push_back(
-  {.name = contracts::AnnotationText::From("fractional"), .shape = contracts::AnnotationShape::Box, .box = {{4.5F, 8.25F}, {24.5F, 28.75F}}});
+ source->scene.objects.push_back({.name = contracts::AnnotationText::From("fractional"), .shape = contracts::AnnotationShape::Box, .box = {{4.5F, 8.25F}, {24.5F, 28.75F}}});
  VisualFrame frame;
  frame.extent = {32U, 32U};
  frame.content = {0U, 0U, 32U, 32U};
@@ -1426,8 +1380,7 @@ TEST_CASE("Document materialization bounds empty and sparse mask queries indepen
  auto source = std::make_shared<VisualDocument>();
  source->scene = test_scene("compiled://bounded");
  for (unsigned index = 0; index < 3; ++index)
-  source->scene.objects.push_back(
-   {.name = contracts::AnnotationText::From("object " + std::to_string(index)), .box = {{24.25F, 24.5F}, {30.75F, 31.25F}}, .mask = {.present = index != 2}});
+  source->scene.objects.push_back({.name = contracts::AnnotationText::From("object " + std::to_string(index)), .box = {{24.25F, 24.5F}, {30.75F, 31.25F}}, .mask = {.present = index != 2}});
  source->mask_bounds = {{{0, 0, .0625F, .0625F}}, {}, {}};
  std::array<unsigned, 3> calls{};
  source->mask_contains = [&calls](std::size_t index, float x, float y) {

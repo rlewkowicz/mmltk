@@ -44,8 +44,7 @@ struct AnnotationRenderProbe final {
 class TestAnnotationAlgorithm final : public AnnotationAlgorithm {
 public:
  static VisualRuntimeFactory CreateRuntime(std::shared_ptr<FakeImageBackend> backend, std::shared_ptr<AnnotationRenderProbe> probe = {}) {
-  return RuntimeFactory(0, std::move(backend), mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic,
-                        [probe = std::move(probe)] { return std::make_unique<TestAnnotationAlgorithm>(probe); });
+  return RuntimeFactory(0, std::move(backend), mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic, [probe = std::move(probe)] { return std::make_unique<TestAnnotationAlgorithm>(probe); });
  }
  explicit TestAnnotationAlgorithm(std::shared_ptr<AnnotationRenderProbe> probe = {}) : probe_(std::move(probe)) {}
  void Open(mmltk::frameworks::gpu::ImagePlaneView, VisualRegion, VisualExtent) override {
@@ -58,7 +57,7 @@ public:
   return {120.0F, 1.0F, 1.0F};
  }
  void Render(const AnnotationRenderState& description, const mmltk::frameworks::gpu::ImagePlaneView source, const mmltk::frameworks::gpu::ImagePlaneView clean,
-             const mmltk::frameworks::gpu::ImagePlaneView semantic, std::uintptr_t) const override {
+  const mmltk::frameworks::gpu::ImagePlaneView semantic, std::uintptr_t) const override {
   if (probe_) {
    const auto scene = *description.scene;
    const auto editor = description.editor;
@@ -66,8 +65,7 @@ public:
    const auto preview_object = description.preview_object;
    probe_->calls.fetch_add(1U, std::memory_order_release);
    probe_->Wait(probe_->hold);
-   if (*description.scene != scene || description.editor != editor || description.preview != preview || description.preview_object != preview_object)
-    probe_->exact_content = false;
+   if (*description.scene != scene || description.editor != editor || description.preview != preview || description.preview_object != preview_object) probe_->exact_content = false;
    if (probe_->fail_render.exchange(false)) throw std::runtime_error("deterministic render failure");
   }
   if (source.valid()) mmltk::frameworks::gpu::test_support::CopyImagePlane(clean, source);
@@ -77,8 +75,7 @@ public:
 private:
  std::shared_ptr<AnnotationRenderProbe> probe_;
 };
-[[nodiscard]] inline mmltk::frameworks::gpu::BorrowedImageProductReadView hold_annotation_frame(AnnotationSystem& annotation, EventGate& events,
-                                                                                                contracts::AnnotationTool tool) {
+[[nodiscard]] inline mmltk::frameworks::gpu::BorrowedImageProductReadView hold_annotation_frame(AnnotationSystem& annotation, EventGate& events, contracts::AnnotationTool tool) {
  const auto edit = annotation.Edit({.edit = {.value = AnnotationToolEdit{tool}}});
  mmltk::testsupport::await_annotation_command(annotation, events, edit.revision);
  mmltk::testsupport::await_annotation_render(annotation, events);

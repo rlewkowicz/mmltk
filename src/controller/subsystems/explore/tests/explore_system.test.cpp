@@ -186,8 +186,7 @@ TEST_CASE("Gallery cache memory deduplicates shared meaning across slot versions
  const std::uint64_t key = 1U;
  cache.Complete(0U, 0U, meaning, key);
  cache.Complete(1U, 1U, meaning, key);
- const auto expected = cache.MetadataBytes() + explore_detail::GallerySharedBytes(meaning) +
-                       meaning->annotations.capacity() * sizeof(decltype(meaning->annotations)::value_type) +
+ const auto expected = cache.MetadataBytes() + explore_detail::GallerySharedBytes(meaning) + meaning->annotations.capacity() * sizeof(decltype(meaning->annotations)::value_type) +
                        meaning->runs.capacity() * sizeof(decltype(meaning->runs)::value_type);
  CHECK(cache.MeaningBytes() == expected);
  const std::uint64_t other = 2U;
@@ -199,8 +198,8 @@ TEST_CASE("Gallery cache memory deduplicates shared meaning across slot versions
  auto replacement = explore_detail::MakeGalleryShared<explore_detail::GalleryTileMeaning>();
  replacement->runs.reserve(11U);
  candidate.Complete(20U, 20U, replacement, other, 1U, 1U);
- CHECK(cache.MeaningBytes(&candidate) == incumbent_bytes + candidate.MetadataBytes() + explore_detail::GallerySharedBytes(replacement) +
-                                          replacement->runs.capacity() * sizeof(decltype(replacement->runs)::value_type));
+ CHECK(cache.MeaningBytes(&candidate) ==
+       incumbent_bytes + candidate.MetadataBytes() + explore_detail::GallerySharedBytes(replacement) + replacement->runs.capacity() * sizeof(decltype(replacement->runs)::value_type));
 }
 TEST_CASE("Gallery product metadata accounts both retained vector high waters and bit storage", "[explore][cache]") {
  explore_detail::GalleryProductState product;
@@ -211,11 +210,10 @@ TEST_CASE("Gallery product metadata accounts both retained vector high waters an
  product.completed_slots.resize(256U);
  product.tile_meanings.resize(256U);
  product.plan.overlay.class_selection.classes.resize(kExploreClassCapacity);
- const auto expected = (product.visible_indices.capacity() + product.window_indices.capacity() + product.priority_slots.capacity() +
-                        product.plan.overlay.class_selection.classes.capacity()) *
-                        sizeof(std::uint32_t) +
-                       product.active_classes.capacity() * sizeof(decltype(product.active_classes)::value_type) + product.completed_slots.capacity() / 8U +
-                       product.tile_meanings.capacity() * sizeof(decltype(product.tile_meanings)::value_type);
+ const auto expected =
+  (product.visible_indices.capacity() + product.window_indices.capacity() + product.priority_slots.capacity() + product.plan.overlay.class_selection.classes.capacity()) * sizeof(std::uint32_t) +
+  product.active_classes.capacity() * sizeof(decltype(product.active_classes)::value_type) + product.completed_slots.capacity() / 8U +
+  product.tile_meanings.capacity() * sizeof(decltype(product.tile_meanings)::value_type);
  CHECK(product.MetadataBytes() == expected);
  explore_detail::GalleryProductState inactive;
  inactive.ReserveFor(product);
@@ -242,8 +240,7 @@ struct CancellationProbe final {
 }
 class CancellableExploreAlgorithm final : public SynchronousExploreAlgorithm {
 public:
- explicit CancellableExploreAlgorithm(std::shared_ptr<CancellationProbe> probe, std::shared_ptr<ExploreDemandCheck> demand = {})
-     : probe_(std::move(probe)), retained_demand_(std::move(demand)) {}
+ explicit CancellableExploreAlgorithm(std::shared_ptr<CancellationProbe> probe, std::shared_ptr<ExploreDemandCheck> demand = {}) : probe_(std::move(probe)), retained_demand_(std::move(demand)) {}
  void SetCurrentDemand(ExploreDemandCheck demand) override {
   if (retained_demand_) *retained_demand_ = demand;
   SynchronousExploreAlgorithm::SetCurrentDemand(std::move(demand));
@@ -271,8 +268,8 @@ public:
  }
  bool Contains(std::uint32_t value) const override { return value == 0U; }
  std::optional<std::uint32_t> Adjacent(std::uint32_t, std::int64_t) const override { return 0U; }
- void RenderProduct(const ExploreRenderPlan& plan, const ExploreOrderCandidate*, std::size_t, const mmltk::frameworks::gpu::ImagePlaneView clean,
-                    const mmltk::frameworks::gpu::ImagePlaneView semantic, std::uintptr_t) override {
+ void RenderProduct(const ExploreRenderPlan& plan, const ExploreOrderCandidate*, std::size_t, const mmltk::frameworks::gpu::ImagePlaneView clean, const mmltk::frameworks::gpu::ImagePlaneView semantic,
+  std::uintptr_t) override {
   Fill(clean, static_cast<std::uint8_t>(plan.generation));
   Fill(semantic, 2U);
  }
@@ -297,8 +294,7 @@ public:
  explicit CancellableOpenPreparationAlgorithm(std::shared_ptr<OpenPreparationProbe> probe) : probe_(std::move(probe)) {}
  ExploreOpened Open(std::string_view, std::stop_token) override {
   candidate_order_ = {0U};
-  return {.dataset = {.image_count = 1U, .image_width = 32U, .image_height = 32U, .class_names = {{"person"}}},
-          .order = {.matching_count = 1U, .visible_indices = candidate_order_}};
+  return {.dataset = {.image_count = 1U, .image_width = 32U, .image_height = 32U, .class_names = {{"person"}}}, .order = {.matching_count = 1U, .visible_indices = candidate_order_}};
  }
  ExploreOrderCandidate PrepareFilter(const ExploreFilter& filter, const std::uint64_t seed, std::size_t, const std::stop_token stop) override {
   const auto call = probe_->prepare_calls.fetch_add(1U, std::memory_order_acq_rel);
@@ -314,9 +310,7 @@ public:
     return {};
    }
   }
-  return {.filter = filter,
-          .order = {.matching_count = 1U, .shuffle_seed = seed, .visible_indices = candidate_order_},
-          .generation = static_cast<std::uint64_t>(call) + 1U};
+  return {.filter = filter, .order = {.matching_count = 1U, .shuffle_seed = seed, .visible_indices = candidate_order_}, .generation = static_cast<std::uint64_t>(call) + 1U};
  }
  void Commit(ExploreOrderCandidate candidate) noexcept override {
   order_ = std::move(candidate.order.visible_indices);
@@ -335,8 +329,8 @@ public:
  bool Contains(const std::uint32_t value) const override { return std::ranges::find(order_, value) != order_.end(); }
  std::optional<std::uint32_t> Adjacent(const std::uint32_t value, std::int64_t) const override { return Contains(value) ? std::optional{value} : std::nullopt; }
  // CLEANUP-IGNORE: These fake algorithms publish different semantic-plane values; only their clean-plane fill is shared.
- void RenderProduct(const ExploreRenderPlan& plan, const ExploreOrderCandidate*, std::size_t, const mmltk::frameworks::gpu::ImagePlaneView clean,
-                    const mmltk::frameworks::gpu::ImagePlaneView semantic, std::uintptr_t) override {
+ void RenderProduct(const ExploreRenderPlan& plan, const ExploreOrderCandidate*, std::size_t, const mmltk::frameworks::gpu::ImagePlaneView clean, const mmltk::frameworks::gpu::ImagePlaneView semantic,
+  std::uintptr_t) override {
   Fill(clean, static_cast<std::uint8_t>(plan.generation));
   Fill(semantic, 0U);
  }
@@ -348,15 +342,14 @@ private:
 };
 class AtomicFilterExploreAlgorithm final : public SynchronousExploreAlgorithm {
 public:
- AtomicFilterExploreAlgorithm(std::shared_ptr<CancellationProbe> probe, std::shared_ptr<std::atomic_uint64_t> commits)
-     : probe_(std::move(probe)), commits_(std::move(commits)) {}
+ AtomicFilterExploreAlgorithm(std::shared_ptr<CancellationProbe> probe, std::shared_ptr<std::atomic_uint64_t> commits) : probe_(std::move(probe)), commits_(std::move(commits)) {}
  ExploreOpened Open(std::string_view, std::stop_token) override {
   committed_ = {0U};
   return {.dataset = {.image_count = 2U, .image_width = 32U, .image_height = 32U, .class_names = {}}, .order = {.matching_count = 1U, .visible_indices = {0U}}};
  }
  ExploreOrderCandidate PrepareFilter(const ExploreFilter& filter, std::uint64_t seed, std::size_t,
-                                     // CLEANUP-IGNORE: Atomic-filter cancellation and reopen cancellation exercise different algorithm boundaries.
-                                     const std::stop_token stop) override {
+  // CLEANUP-IGNORE: Atomic-filter cancellation and reopen cancellation exercise different algorithm boundaries.
+  const std::stop_token stop) override {
   if (prepare_count_++ == 0U) return {.filter = filter, .order = {.matching_count = 1U, .shuffle_seed = seed, .visible_indices = {0U}}, .generation = 1U};
   if (wait_for_cancellation(stop, *probe_)) return {};
   return {.filter = filter, .order = {.matching_count = 1U, .shuffle_seed = seed, .visible_indices = {1U}}, .generation = 1U};
@@ -375,8 +368,8 @@ public:
  }
  bool Contains(std::uint32_t value) const override { return std::ranges::find(committed_, value) != committed_.end(); }
  std::optional<std::uint32_t> Adjacent(std::uint32_t value, std::int64_t) const override { return Contains(value) ? std::optional{value} : std::nullopt; }
- void RenderProduct(const ExploreRenderPlan& plan, const ExploreOrderCandidate*, std::size_t, mmltk::frameworks::gpu::ImagePlaneView clean,
-                    mmltk::frameworks::gpu::ImagePlaneView semantic, std::uintptr_t) override {
+ void RenderProduct(
+  const ExploreRenderPlan& plan, const ExploreOrderCandidate*, std::size_t, mmltk::frameworks::gpu::ImagePlaneView clean, mmltk::frameworks::gpu::ImagePlaneView semantic, std::uintptr_t) override {
   if (plan.generation == 1U) {
    Fill(clean, 1U);
    Fill(semantic, 0U);
@@ -403,8 +396,8 @@ struct ExplorePressureProbe final {
  [[nodiscard]] VisualDiagnosticSink sink() noexcept {
   return {.context = this, .write = [](void* context, const VisualDiagnosticFact fact) noexcept {
            auto& probe = *static_cast<ExplorePressureProbe*>(context);
-           if (fact.operation == VisualDiagnosticOperation::ExploreContinuationStarted &&
-               fact.detail == 30U + static_cast<std::uint64_t>(detail::VisualRuntimeOwner::ActivityStage::CycleFinalized) && fact.value == 0U) {
+           if (fact.operation == VisualDiagnosticOperation::ExploreContinuationStarted && fact.detail == 30U + static_cast<std::uint64_t>(detail::VisualRuntimeOwner::ActivityStage::CycleFinalized) &&
+               fact.value == 0U) {
             probe.idle_attempts.store(probe.attempts.load(std::memory_order_acquire), std::memory_order_release);
             probe.events.Advance();
            }
@@ -424,8 +417,8 @@ public:
   probe_.events.Advance();
   return probe_.semantic_detail && plan.mode == ExploreMode::Detail ? ExploreOutputChange::Semantic : ExploreOutputChange::Initialize;
  }
- void RenderProduct(const ExploreRenderPlan& plan, const ExploreOrderCandidate* candidate, const std::size_t nproc,
-                    mmltk::frameworks::gpu::ImagePlaneView clean, mmltk::frameworks::gpu::ImagePlaneView semantic, const std::uintptr_t stream) override {
+ void RenderProduct(const ExploreRenderPlan& plan, const ExploreOrderCandidate* candidate, const std::size_t nproc, mmltk::frameworks::gpu::ImagePlaneView clean,
+  mmltk::frameworks::gpu::ImagePlaneView semantic, const std::uintptr_t stream) override {
   if (probe_.fail_render.exchange(false, std::memory_order_acq_rel)) throw std::runtime_error("Explore pending predecessor failed");
   TestExploreAlgorithm::RenderProduct(plan, candidate, nproc, clean, semantic, stream);
  }
@@ -487,17 +480,16 @@ public:
  explicit ExplorePressureFixture(const bool gated_resume = false)
      : probe{.render_gate = gated_resume ? std::make_shared<ExplorePostRenderGate>(3U) : nullptr},
        scenario{settings, backend,
-                [&] {
-                 probe.runtimes.fetch_add(1U, std::memory_order_release);
-                 return std::make_unique<CapacityExploreAlgorithm>(probe);
-                },
-                [this](ExploreSystem::event_type event) {
-                 std::scoped_lock lock(observation_mutex);
-                 const bool failed = std::holds_alternative<ExploreFailed>(event);
-                 observations.push_back(
-                  {std::visit([](auto& value) { return std::move(value.snapshot); }, event), probe.runtimes.load(std::memory_order_acquire), failed});
-                },
-                probe.sink()} {}
+        [&] {
+         probe.runtimes.fetch_add(1U, std::memory_order_release);
+         return std::make_unique<CapacityExploreAlgorithm>(probe);
+        },
+        [this](ExploreSystem::event_type event) {
+         std::scoped_lock lock(observation_mutex);
+         const bool failed = std::holds_alternative<ExploreFailed>(event);
+         observations.push_back({std::visit([](auto& value) { return std::move(value.snapshot); }, event), probe.runtimes.load(std::memory_order_acquire), failed});
+        },
+        probe.sink()} {}
  ~ExplorePressureFixture() {
   if (probe.render_gate) mmltk::testsupport::release_test_promise(probe.render_gate->release);
   static_cast<void>(scenario.system().Stop());
@@ -746,15 +738,13 @@ void check_catalog_selection_preserved(const ExploreFilterPreferences& actual, c
  CHECK(actual.policy.filter.class_selection == expected.policy.filter.class_selection);
  CHECK(actual.policy.overlay.class_selection == expected.policy.overlay.class_selection);
 }
-[[nodiscard]] ExploreScenario tracked_explore_scenario(LoadedSettings& settings, std::shared_ptr<FakeImageBackend> backend,
-                                                       std::shared_ptr<std::atomic_uint64_t> commits, ExploreScenario::Observer observer = {}) {
+[[nodiscard]] ExploreScenario tracked_explore_scenario(
+ LoadedSettings& settings, std::shared_ptr<FakeImageBackend> backend, std::shared_ptr<std::atomic_uint64_t> commits, ExploreScenario::Observer observer = {}) {
  return ExploreScenario{settings, std::move(backend), ExploreScenario::TrackCommits(std::move(commits)), std::move(observer)};
 }
-[[nodiscard]] ExploreSnapshot wait_for_explore_failure(ExploreScenario& scenario, const std::shared_ptr<std::atomic_uint64_t>& failures,
-                                                       const std::uint64_t admission_revision) {
+[[nodiscard]] ExploreSnapshot wait_for_explore_failure(ExploreScenario& scenario, const std::shared_ptr<std::atomic_uint64_t>& failures, const std::uint64_t admission_revision) {
  auto& explore = scenario.system();
- REQUIRE(scenario.Wait(
-  [&] { return failures->load(std::memory_order_acquire) == 1U && !explore.snapshot().busy && explore.snapshot().revision > admission_revision; }));
+ REQUIRE(scenario.Wait([&] { return failures->load(std::memory_order_acquire) == 1U && !explore.snapshot().busy && explore.snapshot().revision > admission_revision; }));
  return explore.snapshot();
 }
 class TrackedExploreFailureFixture final {
@@ -784,9 +774,8 @@ void check_restored_filter(const ExploreSnapshot& restored, const ExploreSnapsho
  CHECK(restored.frame == committed.frame);
 }
 [[nodiscard]] bool assignments_match(const StreamingExploreProbe& probe, const std::span<const std::uint32_t> visible_indices) {
- return std::ranges::all_of(probe.assignments, [&](const auto& assignment) {
-  return assignment.generation == probe.generation && std::ranges::find(visible_indices, assignment.compiled_index) != visible_indices.end();
- });
+ return std::ranges::all_of(
+  probe.assignments, [&](const auto& assignment) { return assignment.generation == probe.generation && std::ranges::find(visible_indices, assignment.compiled_index) != visible_indices.end(); });
 }
 [[nodiscard]] ExploreClassCatalogIdentity test_explore_catalog_identity() {
  const std::array names{
@@ -876,8 +865,7 @@ TEST_CASE("Explore demand completes on another thread while publication owns fin
  probe->publication_gate = gate;
  auto entered = gate->entered.get_future();
  EventGate events;
- ExploreSystem explore{settings.system(), kDevice, 2U, streaming_explore_runtime_factory(backend, probe),
-                       [&events](ExploreSystem::event_type) { events.Advance(); }};
+ ExploreSystem explore{settings.system(), kDevice, 2U, streaming_explore_runtime_factory(backend, probe), [&events](ExploreSystem::event_type) { events.Advance(); }};
  auto settle_explore = settle_explore_on_exit(explore, gate->release);
  static_cast<void>(explore.Open({.viewport = {.extent = {8U, 4U}, .row_count = 1U, .columns = 2U}, .compiled_source = "/test"}));
  REQUIRE(entered.wait_for(2s) == std::future_status::ready);
@@ -905,10 +893,8 @@ TEST_CASE("Each Explore runtime binds the same retained demand before ingress", 
  {
   EventGate events;
   ExploreSystem explore{settings.system(), kDevice, 2U,
-                        [first_factory, replacement_factory, constructions](auto revisions) {
-                         return constructions->fetch_add(1U) == 0U ? first_factory(std::move(revisions)) : replacement_factory(std::move(revisions));
-                        },
-                        [&events](ExploreSystem::event_type) { events.Advance(); }};
+   [first_factory, replacement_factory, constructions](auto revisions) { return constructions->fetch_add(1U) == 0U ? first_factory(std::move(revisions)) : replacement_factory(std::move(revisions)); },
+   [&events](ExploreSystem::event_type) { events.Advance(); }};
   const ExploreViewport viewport{.extent = {8U, 4U}, .row_count = 1U, .columns = 2U};
   open_streaming_gallery(explore, events, viewport);
   {
@@ -921,8 +907,7 @@ TEST_CASE("Each Explore runtime binds the same retained demand before ingress", 
   CHECK(retained(first.gallery.generation));
   contracts::SettingsUpdateRequest update;
   update.updates.push_back(
-   {.path = "workflows.explore.h2d_dataloader",
-    .value = mmltk::frameworks::serialization::wire::FlatValue{!settings.system().explore_settings_candidate().loading.h2d_dataloader}});
+   {.path = "workflows.explore.h2d_dataloader", .value = mmltk::frameworks::serialization::wire::FlatValue{!settings.system().explore_settings_candidate().loading.h2d_dataloader}});
   static_cast<void>(settings.system().Update(std::move(update)));
   static_cast<void>(explore.Open({.viewport = viewport, .compiled_source = "/replacement"}));
   REQUIRE(events.Wait([&] { return explore.snapshot().ready && explore.snapshot().frame.revision > first.frame.revision; }));
@@ -946,10 +931,9 @@ TEST_CASE("Explore shutdown invalidates retained demand after cancelled replacem
  auto entered = probe->entered.get_future();
  EventGate events;
  ExploreSystem explore{settings.system(), kDevice, 2U,
-                       RuntimeFactory(
-                        0, backend, mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic,
-                        [probe, retained] { return std::make_unique<CancellableExploreAlgorithm>(probe, retained); }, 3U),
-                       [&events](ExploreSystem::event_type) { events.Advance(); }};
+  RuntimeFactory(
+   0, backend, mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic, [probe, retained] { return std::make_unique<CancellableExploreAlgorithm>(probe, retained); }, 3U),
+  [&events](ExploreSystem::event_type) { events.Advance(); }};
  const ExploreViewport viewport{.extent = {32U, 32U}};
  static_cast<void>(explore.Open({.viewport = viewport, .compiled_source = "/incumbent"}));
  REQUIRE(events.Wait([&] { return explore.snapshot().ready; }));
@@ -969,8 +953,7 @@ TEST_CASE("Explore publishes placeholders before loaders and patches released la
  auto backend = std::make_shared<FakeImageBackend>();
  auto probe = std::make_shared<StreamingExploreProbe>();
  EventGate events;
- ExploreSystem explore{settings.system(), kDevice, 2U, streaming_explore_runtime_factory(backend, probe),
-                       [&events](ExploreSystem::event_type) { events.Advance(); }};
+ ExploreSystem explore{settings.system(), kDevice, 2U, streaming_explore_runtime_factory(backend, probe), [&events](ExploreSystem::event_type) { events.Advance(); }};
  open_streaming_gallery(explore, events, {.extent = {8U, 4U}, .row_count = 1U, .columns = 2U});
  const auto placeholder = explore.snapshot();
  CHECK_FALSE(placeholder.busy);
@@ -1044,15 +1027,12 @@ TEST_CASE("Explore batches ready lanes and stale viewport completions cannot pub
  EventGate events;
  std::atomic_uint64_t changed_events = 0U;
  DiagnosticCapture diagnostics;
- ExploreSystem explore{settings.system(),
-                       kDevice,
-                       2U,
-                       streaming_explore_runtime_factory(backend, probe),
-                       [&events, &changed_events](ExploreSystem::event_type event) {
-                        if (std::holds_alternative<ExploreChanged>(event)) changed_events.fetch_add(1U, std::memory_order_release);
-                        events.Advance();
-                       },
-                       diagnostics.sink()};
+ ExploreSystem explore{settings.system(), kDevice, 2U, streaming_explore_runtime_factory(backend, probe),
+  [&events, &changed_events](ExploreSystem::event_type event) {
+   if (std::holds_alternative<ExploreChanged>(event)) changed_events.fetch_add(1U, std::memory_order_release);
+   events.Advance();
+  },
+  diagnostics.sink()};
  open_streaming_gallery(explore, events, {.extent = {8U, 4U}, .row_count = 1U, .columns = 2U});
  probe->AllowAllocation();
  REQUIRE(probe->Wait([&] { return probe->assignments.size() == 2U; }));
@@ -1069,8 +1049,7 @@ TEST_CASE("Explore batches ready lanes and stale viewport completions cannot pub
  static_cast<void>(explore.UpdateAugmentation({.enabled = true}));
  REQUIRE(events.Wait([&] { return explore.snapshot().frame.revision > before_old_viewport; }));
  REQUIRE(probe->Wait([&] {
-  return probe->assignments.size() == 2U &&
-         std::ranges::all_of(probe->assignments, [](const auto& assignment) { return assignment.compiled_index == 0U || assignment.compiled_index == 1U; });
+  return probe->assignments.size() == 2U && std::ranges::all_of(probe->assignments, [](const auto& assignment) { return assignment.compiled_index == 0U || assignment.compiled_index == 1U; });
  }));
  probe->StartRead(0U);
  explore.UpdateViewport({.viewport = {.extent = {8U, 4U}, .first_row = 2U, .row_count = 1U, .columns = 2U}});
@@ -1079,10 +1058,8 @@ TEST_CASE("Explore batches ready lanes and stale viewport completions cannot pub
  const auto events_at_placeholder = changed_events.load(std::memory_order_acquire);
  probe->Release(0U);
  probe->Release(1U);
- REQUIRE(probe->Wait([&] {
-  return probe->stale == 2U &&
-         std::ranges::all_of(probe->assignments, [](const auto& assignment) { return assignment.compiled_index == 4U || assignment.compiled_index == 5U; });
- }));
+ REQUIRE(probe->Wait(
+  [&] { return probe->stale == 2U && std::ranges::all_of(probe->assignments, [](const auto& assignment) { return assignment.compiled_index == 4U || assignment.compiled_index == 5U; }); }));
  CHECK(explore.snapshot().frame.revision == newest_placeholder);
  CHECK(changed_events.load(std::memory_order_acquire) == events_at_placeholder);
  CHECK(explore.snapshot().order.visible_indices == std::vector<std::uint32_t>{4U, 5U});
@@ -1204,23 +1181,23 @@ TEST_CASE("Explore failed staged runtime construction resumes the incumbent unfi
  ExploreSystem* active = nullptr;
  std::atomic_bool exact_incumbent_borrow = false;
  ExploreScenario scenario{settings, 2U,
-                          [attempts, incumbent_factory, replacement_factory](auto revisions) {
-                           if (attempts->fetch_add(1U) == 0U) return incumbent_factory(std::move(revisions));
-                           // Construct real replacement execution resources, then reject before
-                           // the staged owner can replace the still-live incumbent runtime.
-                           auto rejected = replacement_factory(std::move(revisions));
-                           throw std::runtime_error("deterministic staged Explore construction failure");
-                          },
-                          [&](ExploreSystem::event_type event) {
-                           if (const auto* value = std::get_if<ExploreFailed>(&event)) {
-                            exact_incumbent_borrow = visual_product_matches_frame(value->snapshot.frame, active->BorrowFrame());
-                            // Remove the rejected execution request before the next normal
-                            // completion rechecks settings. No new Explore demand is sent.
-                            select_transport(initial_h2d);
-                            failed.set_value(value->snapshot);
-                            probe->ReleaseAll();
-                           }
-                          }};
+  [attempts, incumbent_factory, replacement_factory](auto revisions) {
+   if (attempts->fetch_add(1U) == 0U) return incumbent_factory(std::move(revisions));
+   // Construct real replacement execution resources, then reject before
+   // the staged owner can replace the still-live incumbent runtime.
+   auto rejected = replacement_factory(std::move(revisions));
+   throw std::runtime_error("deterministic staged Explore construction failure");
+  },
+  [&](ExploreSystem::event_type event) {
+   if (const auto* value = std::get_if<ExploreFailed>(&event)) {
+    exact_incumbent_borrow = visual_product_matches_frame(value->snapshot.frame, active->BorrowFrame());
+    // Remove the rejected execution request before the next normal
+    // completion rechecks settings. No new Explore demand is sent.
+    select_transport(initial_h2d);
+    failed.set_value(value->snapshot);
+    probe->ReleaseAll();
+   }
+  }};
  auto& explore = scenario.system();
  active = &explore;
  scenario.OpenAndWait({.extent = {8U, 4U}, .row_count = 1U, .columns = 2U}, "/incumbent");
@@ -1392,8 +1369,7 @@ TEST_CASE("Explore lane read and callback gates preserve the accepted atlas thro
  auto backend = std::make_shared<FakeImageBackend>();
  auto probe = std::make_shared<StreamingExploreProbe>();
  EventGate events;
- ExploreSystem explore{settings.system(), kDevice, 1U, streaming_explore_runtime_factory(backend, probe),
-                       [&events](ExploreSystem::event_type) { events.Advance(); }};
+ ExploreSystem explore{settings.system(), kDevice, 1U, streaming_explore_runtime_factory(backend, probe), [&events](ExploreSystem::event_type) { events.Advance(); }};
  open_streaming_gallery(explore, events, {.extent = {4U, 4U}, .row_count = 1U, .columns = 1U});
  const auto placeholder_revision = explore.snapshot().frame.revision;
  probe->AllowAllocation();
@@ -1432,18 +1408,17 @@ TEST_CASE("Explore storage diagnostics aggregate renderer and all three output s
  CAPTURE(logging_enabled);
  class StorageAlgorithm final : public TestExploreAlgorithm {
  public:
-  explicit StorageAlgorithm(std::shared_ptr<std::atomic<std::size_t>> calls)
-      : TestExploreAlgorithm(std::make_shared<std::atomic<std::size_t>>(0U)), calls_(std::move(calls)) {}
+  explicit StorageAlgorithm(std::shared_ptr<std::atomic<std::size_t>> calls) : TestExploreAlgorithm(std::make_shared<std::atomic<std::size_t>>(0U)), calls_(std::move(calls)) {}
   [[nodiscard]] ExploreStorageFootprint StorageFootprint() const override {
    ++*calls_;
    return {.host_bytes = 101U,
-           .device_bytes = 1000U,
-           .pinned_bytes = 200U,
-           .cache_device_bytes = 300U,
-           .descriptor_bytes = 400U,
-           .augmentation_device_bytes = 50U,
-           .augmentation_pinned_bytes = 25U,
-           .cache_cards = 60U};
+    .device_bytes = 1000U,
+    .pinned_bytes = 200U,
+    .cache_device_bytes = 300U,
+    .descriptor_bytes = 400U,
+    .augmentation_device_bytes = 50U,
+    .augmentation_pinned_bytes = 25U,
+    .cache_cards = 60U};
   }
 
  private:
@@ -1456,31 +1431,27 @@ TEST_CASE("Explore storage diagnostics aggregate renderer and all three output s
  } capture;
  capture.enabled.store(logging_enabled);
  const VisualDiagnosticSink diagnostics{.context = &capture,
-                                        .write =
-                                         [](void* context, VisualDiagnosticFact fact) noexcept {
-                                          if (fact.operation != VisualDiagnosticOperation::ExploreCacheStorage) return;
-                                          auto& observed_capture = *static_cast<Capture*>(context);
-                                          std::scoped_lock lock(observed_capture.mutex);
-                                          observed_capture.storage = fact;
-                                         },
-                                        .enabled = [](void* context) noexcept { return static_cast<Capture*>(context)->enabled.load(); }};
+  .write =
+   [](void* context, VisualDiagnosticFact fact) noexcept {
+    if (fact.operation != VisualDiagnosticOperation::ExploreCacheStorage) return;
+    auto& observed_capture = *static_cast<Capture*>(context);
+    std::scoped_lock lock(observed_capture.mutex);
+    observed_capture.storage = fact;
+   },
+  .enabled = [](void* context) noexcept { return static_cast<Capture*>(context)->enabled.load(); }};
  auto calls = std::make_shared<std::atomic<std::size_t>>(0U);
  auto backend = std::make_shared<FakeImageBackend>();
- auto factory =
-  RuntimeFactory(0, backend, mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic, [calls] { return std::make_unique<StorageAlgorithm>(calls); }, 3U);
+ auto factory = RuntimeFactory(0, backend, mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic, [calls] { return std::make_unique<StorageAlgorithm>(calls); }, 3U);
  mmltk::frameworks::gpu::SystemImageRuntime* physical = nullptr;
  LoadedSettings settings;
  EventGate events;
- ExploreSystem explore{settings.system(),
-                       kDevice,
-                       2U,
-                       [factory = std::move(factory), &physical](auto revisions) mutable {
-                        auto runtime = factory(std::move(revisions));
-                        physical = runtime.get();
-                        return runtime;
-                       },
-                       [&events](ExploreSystem::event_type) { events.Advance(); },
-                       diagnostics};
+ ExploreSystem explore{settings.system(), kDevice, 2U,
+  [factory = std::move(factory), &physical](auto revisions) mutable {
+   auto runtime = factory(std::move(revisions));
+   physical = runtime.get();
+   return runtime;
+  },
+  [&events](ExploreSystem::event_type) { events.Advance(); }, diagnostics};
  static_cast<void>(explore.Open({.viewport = {.extent = {32U, 32U}, .columns = 1U}, .compiled_source = "/test"}));
  REQUIRE(events.Wait([&] { return explore.snapshot().ready; }));
  const auto first_revision = explore.snapshot().frame.revision;
@@ -1521,15 +1492,14 @@ TEST_CASE("Explore Open rejects never-loaded settings before runtime constructio
  auto backend = std::make_shared<FakeImageBackend>();
  auto constructions = std::make_shared<std::atomic_uint64_t>(0U);
  auto events = std::make_shared<std::atomic_uint64_t>(0U);
- auto factory = RuntimeFactory(
-  0, backend, mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic,
-  [] { return std::make_unique<TestExploreAlgorithm>(std::make_shared<std::atomic<std::size_t>>(0U)); }, 3U);
+ auto factory =
+  RuntimeFactory(0, backend, mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic, [] { return std::make_unique<TestExploreAlgorithm>(std::make_shared<std::atomic<std::size_t>>(0U)); }, 3U);
  ExploreSystem explore{settings, kDevice, 2U,
-                       [factory = std::move(factory), constructions](auto revisions) mutable {
-                        constructions->fetch_add(1U, std::memory_order_release);
-                        return factory(std::move(revisions));
-                       },
-                       [events](ExploreSystem::event_type) { events->fetch_add(1U, std::memory_order_release); }};
+  [factory = std::move(factory), constructions](auto revisions) mutable {
+   constructions->fetch_add(1U, std::memory_order_release);
+   return factory(std::move(revisions));
+  },
+  [events](ExploreSystem::event_type) { events->fetch_add(1U, std::memory_order_release); }};
  const auto before = explore.snapshot();
  CHECK_THROWS_AS(explore.Open({.viewport = {}, .compiled_source = "/test"}), contracts::InvalidIntentError);
  CHECK_THROWS_AS(explore.Open({.viewport = {.extent = {64U, 64U}}, .compiled_source = "/test"}), contracts::UnavailableError);
@@ -1543,8 +1513,7 @@ TEST_CASE("Explore settings guards reject reopen and live filter before candidat
  auto backend = std::make_shared<FakeImageBackend>();
  auto work = std::make_shared<ExploreWorkProbe>();
  EventGate events;
- ExploreSystem explore{
-  settings.system(), kDevice, 2U,
+ ExploreSystem explore{settings.system(), kDevice, 2U,
   RuntimeFactory(
    0, backend, mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic,
    [work] { return std::make_unique<TestExploreAlgorithm>(std::make_shared<std::atomic<std::size_t>>(0U), nullptr, nullptr, nullptr, work); }, 3U),
@@ -1559,7 +1528,7 @@ TEST_CASE("Explore settings guards reject reopen and live filter before candidat
  CHECK_THROWS_AS(explore.UpdateFilter({
                   .filter = {.minimum_instances = 2U, .maximum_instances = 1U},
                  }),
-                 contracts::InvalidIntentError);
+  contracts::InvalidIntentError);
  CHECK_THROWS_AS(explore.UpdateFilter({.filter = before.filter, .overlay = before.overlay}), contracts::UnavailableError);
  CHECK_THROWS_AS(explore.Open({.viewport = {.extent = {64U, 64U}}, .compiled_source = "/reopen"}), contracts::UnavailableError);
  CHECK(work->opens.load(std::memory_order_acquire) == opens);
@@ -1579,21 +1548,20 @@ TEST_CASE("Explore installs and atomically persists typed live filter preference
  persist_explore_catalog(settings.system(), test_explore_catalog_identity());
  const auto initial_events = settings_events->load(std::memory_order_acquire);
  (void)settings.system().Update(
-  settings.system().explore_settings_candidate(),
-  {.preferences = mmltk::controller::ExploreFilterUpdate{
-    .filter =
-     {
-      .class_selection = {.mode = ExploreClassSelectionMode::Subset, .classes = {1U}},
-      .minimum_instances = 1U,
-      .maximum_instances = 9U,
-      .minimum_compiled_index = 0U,
-      .maximum_compiled_index = 2U,
-      .order = ExploreOrder::Shuffled,
-      .shuffle_seed = 41U,
-      .require_boxes = true,
-     },
-    .overlay = {.class_selection = {.mode = ExploreClassSelectionMode::Subset, .classes = {1U}}, .show_boxes = false, .show_masks = true},
-   }});
+  settings.system().explore_settings_candidate(), {.preferences = mmltk::controller::ExploreFilterUpdate{
+                                                    .filter =
+                                                     {
+                                                      .class_selection = {.mode = ExploreClassSelectionMode::Subset, .classes = {1U}},
+                                                      .minimum_instances = 1U,
+                                                      .maximum_instances = 9U,
+                                                      .minimum_compiled_index = 0U,
+                                                      .maximum_compiled_index = 2U,
+                                                      .order = ExploreOrder::Shuffled,
+                                                      .shuffle_seed = 41U,
+                                                      .require_boxes = true,
+                                                     },
+                                                    .overlay = {.class_selection = {.mode = ExploreClassSelectionMode::Subset, .classes = {1U}}, .show_boxes = false, .show_masks = true},
+                                                   }});
  CHECK(settings_events->load(std::memory_order_acquire) == initial_events + 1U);
  auto backend = std::make_shared<FakeImageBackend>();
  auto commits = std::make_shared<std::atomic_uint64_t>(0U);
@@ -1703,10 +1671,8 @@ TEST_CASE("Explore original-content sampling preserves the full native detail pr
  auto backend = std::make_shared<FakeImageBackend>();
  auto extents = std::make_shared<ExploreDetailExtentProbe>();
  LoadedSettings settings;
- ExploreScenario scenario{settings, backend, [extents] {
-                           return std::make_unique<DocumentExploreAlgorithm>(std::make_shared<std::atomic<std::size_t>>(0U), nullptr, nullptr, nullptr, nullptr,
-                                                                             nullptr, extents);
-                          }};
+ ExploreScenario scenario{
+  settings, backend, [extents] { return std::make_unique<DocumentExploreAlgorithm>(std::make_shared<std::atomic<std::size_t>>(0U), nullptr, nullptr, nullptr, nullptr, nullptr, extents); }};
  auto& explore = scenario.system();
  scenario.OpenAndWait({.extent = {96U, 48U}, .row_count = 1U, .columns = 2U});
  const auto gallery_frame = explore.snapshot().frame;
@@ -1871,8 +1837,7 @@ TEST_CASE("failed and cancelled Explore opens preserve the last successful catal
   auto backend = std::make_shared<FakeImageBackend>();
   auto gate = std::make_shared<ExploreFinalizationGate>();
   auto entered = gate->entered.get_future();
-  ExploreScenario scenario{settings, backend,
-                           [gate] { return std::make_unique<TestExploreAlgorithm>(std::make_shared<std::atomic<std::size_t>>(0U), nullptr, nullptr, gate); }};
+  ExploreScenario scenario{settings, backend, [gate] { return std::make_unique<TestExploreAlgorithm>(std::make_shared<std::atomic<std::size_t>>(0U), nullptr, nullptr, gate); }};
   auto& explore = scenario.system();
   auto settle_explore = settle_explore_on_exit(explore, gate->release);
   scenario.OpenAndWait({.extent = {64U, 64U}});
@@ -2005,9 +1970,8 @@ TEST_CASE("Explore persistence failure retains the ready runtime product") {
  auto backend = std::make_shared<FakeImageBackend>();
  auto commits = std::make_shared<std::atomic_uint64_t>(0U);
  auto failures = std::make_shared<std::atomic_uint64_t>(0U);
- ExploreScenario scenario{settings, backend,
-                          [commits] { return std::make_unique<TestExploreAlgorithm>(std::make_shared<std::atomic<std::size_t>>(0U), nullptr, commits); },
-                          count_explore_failures(failures)};
+ ExploreScenario scenario{
+  settings, backend, [commits] { return std::make_unique<TestExploreAlgorithm>(std::make_shared<std::atomic<std::size_t>>(0U), nullptr, commits); }, count_explore_failures(failures)};
  auto& explore = scenario.system();
  scenario.OpenAndWait({.extent = {64U, 64U}});
  const auto prior = explore.snapshot();
@@ -2100,9 +2064,7 @@ TEST_CASE("Explore Open cancellation wins at its post-render finalization bounda
  auto commits = std::make_shared<std::atomic_uint64_t>(0U);
  auto gate = std::make_shared<ExploreFinalizationGate>();
  auto entered = gate->entered.get_future();
- ExploreScenario scenario{settings, backend, [commits, gate] {
-                           return std::make_unique<TestExploreAlgorithm>(std::make_shared<std::atomic<std::size_t>>(0U), nullptr, commits, gate);
-                          }};
+ ExploreScenario scenario{settings, backend, [commits, gate] { return std::make_unique<TestExploreAlgorithm>(std::make_shared<std::atomic<std::size_t>>(0U), nullptr, commits, gate); }};
  auto& explore = scenario.system();
  auto settle_explore = settle_explore_on_exit(explore, gate->release);
  gate->Arm();
@@ -2182,10 +2144,9 @@ TEST_CASE("Explore cancellation during saved-filter preparation discards the unp
   auto cancelled = probe->cancelled.get_future();
   std::atomic_uint64_t settled_revision{0U};
   ExploreScenario scenario{settings, backend, [probe] { return std::make_unique<CancellableOpenPreparationAlgorithm>(probe); },
-                           [&](ExploreSystem::event_type event) {
-                            if (const auto* changed = std::get_if<ExploreChanged>(&event); changed && !changed->snapshot.busy)
-                             settled_revision.store(changed->snapshot.revision, std::memory_order_release);
-                           }};
+   [&](ExploreSystem::event_type event) {
+    if (const auto* changed = std::get_if<ExploreChanged>(&event); changed && !changed->snapshot.busy) settled_revision.store(changed->snapshot.revision, std::memory_order_release);
+   }};
   auto& explore = scenario.system();
   const auto wait_settled = [&](const ExploreSnapshot& admitted) {
    // The typed completion is delivered after worker admission is released.
@@ -2237,8 +2198,7 @@ TEST_CASE("Explore newest desired work renders the captured current Settings aug
  const float original = probe->rendered_copy_paste_probability.load(std::memory_order_acquire);
  const float requested = original == 0.75F ? 0.25F : 0.75F;
  contracts::SettingsUpdateRequest update;
- update.updates.push_back({.path = "workflows.train.request.gpu_augmentation.copy_paste_probability",
-                           .value = mmltk::frameworks::serialization::wire::FlatValue{static_cast<double>(requested)}});
+ update.updates.push_back({.path = "workflows.train.request.gpu_augmentation.copy_paste_probability", .value = mmltk::frameworks::serialization::wire::FlatValue{static_cast<double>(requested)}});
  static_cast<void>(settings.system().Update(std::move(update)));
  const auto previous = scenario.system().snapshot().frame;
  SECTION("checked reroll") { static_cast<void>(scenario.system().RerollAugmentation()); }
@@ -2247,8 +2207,7 @@ TEST_CASE("Explore newest desired work renders the captured current Settings aug
   overlay.show_masks = !overlay.show_masks;
   static_cast<void>(scenario.system().UpdateOverlay(overlay));
  }
- REQUIRE(scenario.Wait(
-  [&] { return scenario.system().snapshot().frame != previous && probe->rendered_copy_paste_probability.load(std::memory_order_acquire) == requested; }));
+ REQUIRE(scenario.Wait([&] { return scenario.system().snapshot().frame != previous && probe->rendered_copy_paste_probability.load(std::memory_order_acquire) == requested; }));
  CHECK(probe->rendered_copy_paste_probability.load(std::memory_order_acquire) == requested);
  CHECK(settings.system().explore_settings_candidate().augmentation.copy_paste_probability == requested);
 }
@@ -2263,9 +2222,8 @@ TEST_CASE("Explore viewport admission rejects malformed grids and publishes nati
  scenario.OpenAndWait({.extent = {64U, 32U}, .columns = 2U});
  const auto prior = explore.snapshot();
  for (const auto viewport :
-      {ExploreViewport{.extent = {64U, 64U}, .columns = 2U}, ExploreViewport{.extent = {65U, 32U}, .columns = 2U},
-       ExploreViewport{.extent = {64U, 65U}, .row_count = 2U, .columns = 2U}, ExploreViewport{.extent = {64U, 64U}, .row_count = 0U},
-       ExploreViewport{.extent = {64U, 64U}, .columns = 0U}, ExploreViewport{.extent = {1U, 1U}, .row_count = UINT32_MAX, .columns = UINT32_MAX}}) {
+  {ExploreViewport{.extent = {64U, 64U}, .columns = 2U}, ExploreViewport{.extent = {65U, 32U}, .columns = 2U}, ExploreViewport{.extent = {64U, 65U}, .row_count = 2U, .columns = 2U},
+   ExploreViewport{.extent = {64U, 64U}, .row_count = 0U}, ExploreViewport{.extent = {64U, 64U}, .columns = 0U}, ExploreViewport{.extent = {1U, 1U}, .row_count = UINT32_MAX, .columns = UINT32_MAX}}) {
   CHECK_FALSE(viewport.valid());
   CHECK_THROWS_AS(explore.UpdateViewport({.viewport = viewport}), contracts::InvalidIntentError);
  }
@@ -2286,8 +2244,7 @@ TEST_CASE("Explore viewport admission rejects malformed grids and publishes nati
  mmltk::frameworks::serialization::FixedCborEncoder writer(bytes);
  REQUIRE(mmltk::frameworks::serialization::encode_compact(writer, request));
  bytes.resize(writer.size());
- const auto dispatched = browser::dispatch_interaction(
-  application, browser::Interaction{.endpoint_id = browser::application_stable_id("explore", "UpdateViewport"), .value = std::move(bytes)});
+ const auto dispatched = browser::dispatch_interaction(application, browser::Interaction{.endpoint_id = browser::application_stable_id("explore", "UpdateViewport"), .value = std::move(bytes)});
  CHECK(dispatched.disposition == browser::InteractionDispatchDisposition::Accepted);
  rejected = explore.snapshot();
  REQUIRE(rejected.viewport_result);
@@ -2344,9 +2301,7 @@ TEST_CASE("Explore unavailable runtime and selected transport publish distinct t
 class TransportFailingExploreAlgorithm final : public TestExploreAlgorithm {
 public:
  explicit TransportFailingExploreAlgorithm(bool safe)
-     : TestExploreAlgorithm(std::make_shared<std::atomic<std::size_t>>(0U)),
-       safe_(safe),
-       retirement_(std::make_exception_ptr(std::runtime_error("distinct Explore retirement failure"))) {}
+     : TestExploreAlgorithm(std::make_shared<std::atomic<std::size_t>>(0U)), safe_(safe), retirement_(std::make_exception_ptr(std::runtime_error("distinct Explore retirement failure"))) {}
  ExploreOpened Open(std::string_view, std::stop_token) override { throw mmltk::frameworks::gpu::GdrTransportUnavailable("selected GDR transport unavailable"); }
  [[nodiscard]] Release ReleaseResources() noexcept override { return {.all_released = safe_, .failure = retirement_}; }
 
@@ -2509,8 +2464,7 @@ TEST_CASE("Explore shared input lifecycles preserve atlas content through scroll
  LoadedSettings settings;
  // The old borrowed atlas, current atlas and detail remain independently
  // retained while the fake algorithm initializes the closing-gallery output.
- ExploreScenario scenario{settings, 2U,
-                          RuntimeFactory(0, backend, mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic, ExploreScenario::TrackWork(work), 4U)};
+ ExploreScenario scenario{settings, 2U, RuntimeFactory(0, backend, mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic, ExploreScenario::TrackWork(work), 4U)};
  auto& explore = scenario.system();
  scenario.OpenAndWait({.extent = {96U, 96U}, .row_count = 2U, .columns = 2U});
  explore.SetInputPeer(1U);
@@ -2525,12 +2479,9 @@ TEST_CASE("Explore shared input lifecycles preserve atlas content through scroll
  CHECK(explore.snapshot().frame == before.frame);
  CHECK(work->renders.load() == renders);
  motion({0.25F, 48.0F});
- CHECK_THROWS_AS(explore.Input({.source = PresentationSourceKind::Predict, .peer_epoch = 1U, .point = WorkspacePoint{1.0F, 1.0F}}),
-                 contracts::InvalidIntentError);
+ CHECK_THROWS_AS(explore.Input({.source = PresentationSourceKind::Predict, .peer_epoch = 1U, .point = WorkspacePoint{1.0F, 1.0F}}), contracts::InvalidIntentError);
  CHECK_THROWS_AS(motion({std::numeric_limits<float>::infinity(), 0.0F}), contracts::InvalidIntentError);
- for (const auto point : {WorkspacePoint{48.0F, 48.0F}, WorkspacePoint{96.0F, 0.0F}, WorkspacePoint{0.0F, 96.0F}, WorkspacePoint{-0.125F, 0.0F}}) {
-  motion(point);
- }
+ for (const auto point : {WorkspacePoint{48.0F, 48.0F}, WorkspacePoint{96.0F, 0.0F}, WorkspacePoint{0.0F, 96.0F}, WorkspacePoint{-0.125F, 0.0F}}) { motion(point); }
  for (const auto kind : {WorkspaceMouseKind::Press, WorkspaceMouseKind::Release, WorkspaceMouseKind::Wheel}) { motion({1.5F, 1.5F}, kind); }
  for (const auto kind : {WorkspaceMouseKind::Leave, WorkspaceMouseKind::Cancel}) {
   motion({1.5F, 1.5F}, kind);
@@ -2688,15 +2639,11 @@ TEST_CASE("lifecycle diagnostics preserve Explore rendering work and never retai
   {
    // CLEANUP-IGNORE: This scoped system measures diagnostic enablement without changing pixels or
    // allocations; the settings-guard fixture owns different work probes and failure expectations.
-   ExploreSystem explore{
-    settings.system(),
-    kDevice,
-    2U,
+   ExploreSystem explore{settings.system(), kDevice, 2U,
     RuntimeFactory(
      0, backend, mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic,
      [work] { return std::make_unique<TestExploreAlgorithm>(std::make_shared<std::atomic<std::size_t>>(0U), nullptr, nullptr, nullptr, work); }, 2U),
-    [&events](ExploreSystem::event_type) { events.Advance(); },
-    sink};
+    [&events](ExploreSystem::event_type) { events.Advance(); }, sink};
    static_cast<void>(explore.Open({.viewport = {.extent = {64U, 64U}}, .compiled_source = "/test"}));
    REQUIRE(events.Wait([&] { return explore.snapshot().ready; }));
    {
@@ -2707,8 +2654,7 @@ TEST_CASE("lifecycle diagnostics preserve Explore rendering work and never retai
      const auto row_bytes = plane.descriptor.row_bytes();
      result.pixels[index].resize(row_bytes * plane.descriptor.height);
      for (std::uint32_t row = 0U; row < plane.descriptor.height; ++row)
-      std::memcpy(result.pixels[index].data() + row * row_bytes, reinterpret_cast<const std::uint8_t*>(plane.data) + row * plane.descriptor.pitch_bytes,
-                  row_bytes);
+      std::memcpy(result.pixels[index].data() + row * row_bytes, reinterpret_cast<const std::uint8_t*>(plane.data) + row * plane.descriptor.pitch_bytes, row_bytes);
     }
    }
    diagnostics.close(services::DiagnosticsCloseMode::Discard);
@@ -2780,13 +2726,12 @@ TEST_CASE("Explore applies a transport change after a pending settings mutation 
  gate->release.set_value();
  const bool reopened = scenario.Wait([&] {
   const auto snapshot = active->snapshot();
-  return work->opens.load(std::memory_order_acquire) == 2U && snapshot.ready && !snapshot.busy && snapshot.failure.empty() &&
-         snapshot.revision > admitted.revision;
+  return work->opens.load(std::memory_order_acquire) == 2U && snapshot.ready && !snapshot.busy && snapshot.failure.empty() && snapshot.revision > admitted.revision;
  });
  const auto observed = active->snapshot();
- INFO("opens=" << work->opens.load(std::memory_order_acquire) << " ready=" << observed.ready << " busy=" << observed.busy << " failure=" << observed.failure
-               << " revision=" << observed.revision << " admitted=" << admitted.revision << " contexts-created=" << backend->contexts_created
-               << " contexts-destroyed=" << backend->contexts_destroyed << " failures=" << failures->load(std::memory_order_acquire));
+ INFO("opens=" << work->opens.load(std::memory_order_acquire) << " ready=" << observed.ready << " busy=" << observed.busy << " failure=" << observed.failure << " revision=" << observed.revision
+               << " admitted=" << admitted.revision << " contexts-created=" << backend->contexts_created << " contexts-destroyed=" << backend->contexts_destroyed
+               << " failures=" << failures->load(std::memory_order_acquire));
  REQUIRE(reopened);
  active->Shutdown();
  CHECK(backend->contexts_created == 2U);

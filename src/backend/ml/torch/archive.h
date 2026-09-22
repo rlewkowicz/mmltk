@@ -13,9 +13,7 @@
 namespace mmltk::backend::ml::serialization {
 inline std::string archive_entry_name(std::size_t index) { return std::format("entry_{:06}", index); }
 inline std::string archive_entry_name(const char* prefix, std::size_t index) { return std::format("{}_{:06}", prefix, index); }
-inline void write_string(torch::serialize::OutputArchive& archive, const char* key, std::string_view value) {
- archive.write(key, c10::IValue(std::string(value)));
-}
+inline void write_string(torch::serialize::OutputArchive& archive, const char* key, std::string_view value) { archive.write(key, c10::IValue(std::string(value))); }
 inline void write_int(torch::serialize::OutputArchive& archive, const char* key, int64_t value) { archive.write(key, c10::IValue(value)); }
 inline void write_bool(torch::serialize::OutputArchive& archive, const char* key, bool value) { archive.write(key, c10::IValue(value)); }
 inline void write_double(torch::serialize::OutputArchive& archive, const char* key, double value) { archive.write(key, c10::IValue(value)); }

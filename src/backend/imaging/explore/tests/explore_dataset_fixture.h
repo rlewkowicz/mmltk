@@ -21,9 +21,8 @@ struct ExploreFixtureAnnotations final {
  bool independent_masks = false;
  bool derive_boxes_from_masks = false;
 };
-[[nodiscard]] std::filesystem::path compile_explore_fixture(const std::filesystem::path& temporary_root, std::string_view fixture_name = "fixture",
-                                                            int num_images = 2, ExploreFixtureDimensions dimensions = {},
-                                                            ExploreFixtureAnnotations annotations = {});
+[[nodiscard]] std::filesystem::path compile_explore_fixture(
+ const std::filesystem::path& temporary_root, std::string_view fixture_name = "fixture", int num_images = 2, ExploreFixtureDimensions dimensions = {}, ExploreFixtureAnnotations annotations = {});
 // The first ten source images are deliberately empty; image 10 carries class
 // zero and image 11 carries class one. This gives system integration tests a
 // trusted compiled split whose filter rows are observably distinct.

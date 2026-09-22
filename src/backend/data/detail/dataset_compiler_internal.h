@@ -68,14 +68,12 @@ struct PixelBlobWriteRequest {
 int resolve_num_workers(int configured_workers, std::span<const int> worker_cpus);
 std::filesystem::path image_path(const std::filesystem::path& split_dir, uint32_t zero_based_index);
 std::filesystem::path annotation_path(const std::filesystem::path& split_dir, uint32_t zero_based_index);
-DatasetScan scan_dataset(const CompilerConfig& config, const std::vector<std::string>& splits,
-                         mmltk::common::concurrency::CancellationObservation cancellation = {});
-LabelBlocks build_label_blocks(const std::filesystem::path& split_dir, uint32_t num_images, const CompilerConfig& config,
-                               const catalog::ClassCatalog& class_catalog, std::uint8_t source_category_base, int num_workers, std::span<const int> worker_cpus,
-                               ProgressCounter* completed_images = nullptr, std::atomic<bool>* failure_requested = nullptr,
-                               mmltk::common::concurrency::CancellationObservation cancellation = {});
+DatasetScan scan_dataset(const CompilerConfig& config, const std::vector<std::string>& splits, mmltk::common::concurrency::CancellationObservation cancellation = {});
+LabelBlocks build_label_blocks(const std::filesystem::path& split_dir, uint32_t num_images, const CompilerConfig& config, const catalog::ClassCatalog& class_catalog, std::uint8_t source_category_base,
+ int num_workers, std::span<const int> worker_cpus, ProgressCounter* completed_images = nullptr, std::atomic<bool>* failure_requested = nullptr,
+ mmltk::common::concurrency::CancellationObservation cancellation = {});
 void assign_pixel_offsets(std::vector<ImageEntry>& index, size_t pixel_offset, size_t image_stride);
 void write_metadata_blocks(const mmltk::common::io::FileHandle& fd, const FileLayout& layout, const FileHeader& header, const LabelBlocks& label_blocks,
-                           mmltk::common::concurrency::CancellationObservation cancel_requested = {});
+ mmltk::common::concurrency::CancellationObservation cancel_requested = {});
 void write_pixel_blob(const mmltk::common::io::FileHandle& fd, const PixelBlobWriteRequest& request);
 }  // namespace mmltk::backend::data::compiler_internal

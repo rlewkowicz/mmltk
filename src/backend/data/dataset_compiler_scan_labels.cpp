@@ -84,14 +84,10 @@ std::uint64_t compute_skew_x1000(std::uint64_t total, std::uint64_t peak, std::u
  return (peak * 1000ULL * count) / total;
 }
 #endif
-std::filesystem::path numbered_path(const std::filesystem::path& dir, uint32_t one_based_index, const char* extension) {
- return dir / std::format("{:06}{}", one_based_index, extension);
-}
+std::filesystem::path numbered_path(const std::filesystem::path& dir, uint32_t one_based_index, const char* extension) { return dir / std::format("{:06}{}", one_based_index, extension); }
 uint32_t count_sequential_images(const std::filesystem::path& split_dir, mmltk::common::concurrency::CancellationObservation cancel_requested) {
  mmltk::common::logging::ScopedProfile profile{"compiler.scan.count_sequential_images"};
- if (!std::filesystem::exists(split_dir) || !std::filesystem::is_directory(split_dir)) {
-  throw std::runtime_error("split directory not found: " + split_dir.string());
- }
+ if (!std::filesystem::exists(split_dir) || !std::filesystem::is_directory(split_dir)) { throw std::runtime_error("split directory not found: " + split_dir.string()); }
  uint32_t png_count = 0U;
  uint32_t jsonl_count = 0U;
  uint32_t max_png_index = 0U;
@@ -137,9 +133,7 @@ ParsedRle parse_rle(const std::string_view rle) {
   if (cursor == end || *cursor != ':') { throw std::runtime_error("mask_rle run is missing ':' separator"); }
   ++cursor;
   const auto length_result = std::from_chars(cursor, end, length);
-  if (length_result.ec != std::errc{} || length_result.ptr == cursor || length == 0U) {
-   throw std::runtime_error("mask_rle contains an invalid, zero, or overflowing run length");
-  }
+  if (length_result.ec != std::errc{} || length_result.ptr == cursor || length == 0U) { throw std::runtime_error("mask_rle contains an invalid, zero, or overflowing run length"); }
   cursor = length_result.ptr;
   if (cursor != end && !std::isspace(static_cast<unsigned char>(*cursor))) { throw std::runtime_error("mask_rle runs must be separated by whitespace"); }
   if (!parsed.pairs.empty() && static_cast<size_t>(start) < previous_end) { throw std::runtime_error("mask_rle runs must be sorted and non-overlapping"); }
@@ -167,9 +161,7 @@ ImageDimensions load_image_dimensions(const std::filesystem::path& image_file) {
 }
 void validate_record_image_dimensions(const json& record, const std::filesystem::path& annotation_file, const ImageDimensions& source_dims) {
  if (!record.contains("image_size_wh")) { return; }
- if (!record["image_size_wh"].is_array() || record["image_size_wh"].size() != 2) {
-  throw std::runtime_error("invalid image_size_wh in " + annotation_file.string());
- }
+ if (!record["image_size_wh"].is_array() || record["image_size_wh"].size() != 2) { throw std::runtime_error("invalid image_size_wh in " + annotation_file.string()); }
  const int record_width = record["image_size_wh"][0].get<int>();
  const int record_height = record["image_size_wh"][1].get<int>();
  if (record_width != static_cast<int>(source_dims.width) || record_height != static_cast<int>(source_dims.height)) {
@@ -183,9 +175,8 @@ void append_diagnostic(std::vector<CompileDiagnostic>* diagnostics, CompileDiagn
  } catch (...) {}
 }
 // NOLINTBEGIN(bugprone-easily-swappable-parameters)
-ParsedLabels parse_jsonl(const std::filesystem::path& annotation_file, const std::filesystem::path& image_file, const catalog::ClassCatalog& class_catalog,
-                         const CompilerConfig& config, ResizeObservation* resize_observation, dataset::MaskResizeScratch& mask_scratch,
-                         std::vector<CompileDiagnostic>* diagnostics) {
+ParsedLabels parse_jsonl(const std::filesystem::path& annotation_file, const std::filesystem::path& image_file, const catalog::ClassCatalog& class_catalog, const CompilerConfig& config,
+ ResizeObservation* resize_observation, dataset::MaskResizeScratch& mask_scratch, std::vector<CompileDiagnostic>* diagnostics) {
  mmltk::common::logging::ScopedProfile profile{"compiler.labels.parse_jsonl"};
  ParsedLabels parsed_labels;
  std::ifstream file(annotation_file);
@@ -195,9 +186,8 @@ ParsedLabels parse_jsonl(const std::filesystem::path& annotation_file, const std
  const uint32_t target_height = config.target_height;
  const bool exact_target = source_dims.width == target_width && source_dims.height == target_height;
  const mmltk::backend::imaging::resample::ImageResizeGeometry letterbox =
-  exact_target
-   ? mmltk::backend::imaging::resample::ImageResizeGeometry{target_width, target_height, 0U, 0U}
-   : mmltk::backend::imaging::resample::compute_image_resize_geometry(source_dims.width, source_dims.height, target_width, target_height, config.resize_mode);
+  exact_target ? mmltk::backend::imaging::resample::ImageResizeGeometry{target_width, target_height, 0U, 0U}
+               : mmltk::backend::imaging::resample::compute_image_resize_geometry(source_dims.width, source_dims.height, target_width, target_height, config.resize_mode);
  const bool needs_resize = !exact_target;
  const bool needs_downscale = source_dims.width > letterbox.resized_width || source_dims.height > letterbox.resized_height;
  if (resize_observation != nullptr) {
@@ -211,14 +201,11 @@ ParsedLabels parse_jsonl(const std::filesystem::path& annotation_file, const std
   ++line_number;
   if (line.empty()) { continue; }
   json record = json::parse(line, nullptr, false);
-  if (record.is_discarded()) {
-   throw std::runtime_error("invalid JSON annotation record in " + annotation_file.string() + " at line " + std::to_string(line_number));
-  }
+  if (record.is_discarded()) { throw std::runtime_error("invalid JSON annotation record in " + annotation_file.string() + " at line " + std::to_string(line_number)); }
   validate_record_image_dimensions(record, annotation_file, source_dims);
   if (record.contains("image_id")) {
    const auto& value = record["image_id"];
-   if (!value.is_number_integer() || (!value.is_number_unsigned() && value.get<std::int64_t>() < 0))
-    throw std::runtime_error("image_id must be a nonnegative integer");
+   if (!value.is_number_integer() || (!value.is_number_unsigned() && value.get<std::int64_t>() < 0)) throw std::runtime_error("image_id must be a nonnegative integer");
    const auto id = value.get<std::uint64_t>();
    if (parsed_labels.has_image_id && parsed_labels.image_id != id) throw std::runtime_error("inconsistent source image identities");
    parsed_labels.image_id = id;
@@ -226,10 +213,7 @@ ParsedLabels parse_jsonl(const std::filesystem::path& annotation_file, const std
   }
   const std::string class_name = record["class"].get<std::string>();
   const auto class_id = class_catalog.resolve(class_name);
-  if (!class_id) {
-   throw std::runtime_error("annotation class '" + class_name + "' is not declared in categories.json: " + annotation_file.string() + " at line " +
-                            std::to_string(line_number));
-  }
+  if (!class_id) { throw std::runtime_error("annotation class '" + class_name + "' is not declared in categories.json: " + annotation_file.string() + " at line " + std::to_string(line_number)); }
   ParsedInstance instance{};
   instance.class_id = checked_cast<std::uint8_t>(*class_id, "compiled class index overflow");
   try {
@@ -284,14 +268,13 @@ ParsedLabels parse_jsonl(const std::filesystem::path& annotation_file, const std
     }
    } else {
     if (!source_bounds.has_foreground) throw std::runtime_error("annotation requires a bbox or a nonempty source mask");
-    source_box = {static_cast<double>(source_bounds.min_x), static_cast<double>(source_bounds.min_y), static_cast<double>(source_bounds.max_x),
-                  static_cast<double>(source_bounds.max_y)};
+    source_box = {static_cast<double>(source_bounds.min_x), static_cast<double>(source_bounds.min_y), static_cast<double>(source_bounds.max_x), static_cast<double>(source_bounds.max_y)};
    }
    if (!std::ranges::all_of(source_box, [](double value) { return std::isfinite(value); }) || source_box[2] <= source_box[0] || source_box[3] <= source_box[1])
     throw std::runtime_error("invalid source bbox");
    if (diagnostics != nullptr && has_mask && source_bounds.has_foreground && record.contains("bbox_xyxy")) {
-    const std::array<double, 4> mask_box{static_cast<double>(source_bounds.min_x), static_cast<double>(source_bounds.min_y),
-                                         static_cast<double>(source_bounds.max_x), static_cast<double>(source_bounds.max_y)};
+    const std::array<double, 4> mask_box{
+     static_cast<double>(source_bounds.min_x), static_cast<double>(source_bounds.min_y), static_cast<double>(source_bounds.max_x), static_cast<double>(source_bounds.max_y)};
     if (source_box != mask_box) {
      CompileDiagnostic diagnostic;
      diagnostic.kind = CompileDiagnosticKind::kSourceBoundingBoxMismatch;
@@ -314,20 +297,17 @@ ParsedLabels parse_jsonl(const std::filesystem::path& annotation_file, const std
    if (!std::isfinite(metadata.original_area) || metadata.original_area < 0.0) throw std::runtime_error("invalid annotation area");
    for (size_t coordinate = 0; coordinate < 4U; ++coordinate) {
     const bool x = (coordinate & 1U) == 0U;
-    const double scaled = source_box[coordinate] * (x ? letterbox.resized_width : letterbox.resized_height) / (x ? source_dims.width : source_dims.height) +
-                          (x ? letterbox.offset_x : letterbox.offset_y);
+    const double scaled =
+     source_box[coordinate] * (x ? letterbox.resized_width : letterbox.resized_height) / (x ? source_dims.width : source_dims.height) + (x ? letterbox.offset_x : letterbox.offset_y);
     constexpr double limit = std::numeric_limits<float>::max();
     if (!std::isfinite(scaled) || scaled < -limit || scaled > limit) throw std::runtime_error("transformed bbox overflow");
     instance.bbox[coordinate] = static_cast<float>(scaled);
    }
    if (instance.bbox[2] <= instance.bbox[0] || instance.bbox[3] <= instance.bbox[1]) throw std::runtime_error("transformed bbox loses strict corner ordering");
-   instance.rle_pairs = needs_resize
-                         ? dataset::resize_row_major_mask(parsed_rle.pairs, source_dims, {target_width, target_height}, letterbox, &mask_scratch).pairs
-                         : std::move(parsed_rle.pairs);
+   instance.rle_pairs = needs_resize ? dataset::resize_row_major_mask(parsed_rle.pairs, source_dims, {target_width, target_height}, letterbox, &mask_scratch).pairs : std::move(parsed_rle.pairs);
   } catch (const std::exception& error) {
-   throw std::runtime_error(std::string(error.what()) + " in " + annotation_file.string() + " at line " + std::to_string(line_number) + " (source " +
-                            std::to_string(source_dims.width) + "x" + std::to_string(source_dims.height) + ", target " + std::to_string(target_width) + "x" +
-                            std::to_string(target_height) + ")");
+   throw std::runtime_error(std::string(error.what()) + " in " + annotation_file.string() + " at line " + std::to_string(line_number) + " (source " + std::to_string(source_dims.width) + "x" +
+                            std::to_string(source_dims.height) + ", target " + std::to_string(target_width) + "x" + std::to_string(target_height) + ")");
   }
   mmltk::common::logging::profile_add_value("compiler.labels.instances", 1);
   mmltk::common::logging::profile_add_value("compiler.labels.rle_pairs", instance.rle_pairs.size());
@@ -361,14 +341,9 @@ std::pair<size_t, size_t> aggregate_worker_sizes(const std::vector<WorkerResult>
  return {total_labels, total_rle_pairs};
 }
 }  // namespace
-std::filesystem::path image_path(const std::filesystem::path& split_dir, uint32_t zero_based_index) {
- return numbered_path(split_dir, zero_based_index + 1, ".png");
-}
-std::filesystem::path annotation_path(const std::filesystem::path& split_dir, uint32_t zero_based_index) {
- return numbered_path(split_dir, zero_based_index + 1, ".jsonl");
-}
-DatasetScan scan_dataset(const CompilerConfig& config, const std::vector<std::string>& splits,
-                         const mmltk::common::concurrency::CancellationObservation cancellation) {
+std::filesystem::path image_path(const std::filesystem::path& split_dir, uint32_t zero_based_index) { return numbered_path(split_dir, zero_based_index + 1, ".png"); }
+std::filesystem::path annotation_path(const std::filesystem::path& split_dir, uint32_t zero_based_index) { return numbered_path(split_dir, zero_based_index + 1, ".jsonl"); }
+DatasetScan scan_dataset(const CompilerConfig& config, const std::vector<std::string>& splits, const mmltk::common::concurrency::CancellationObservation cancellation) {
  const auto check_cancelled = [&] {
   if (cancellation.requested()) { throw std::runtime_error("dataset compilation cancelled"); }
  };
@@ -405,9 +380,7 @@ DatasetScan scan_dataset(const CompilerConfig& config, const std::vector<std::st
  for (const auto& category : parsed_categories) {
   check_cancelled();
   const int normalized_id = category.raw_id - class_id_base;
-  if (normalized_id < 0 || normalized_id >= static_cast<int>(ordered_names.size())) {
-   throw std::runtime_error("class id out of supported range in categories.json");
-  }
+  if (normalized_id < 0 || normalized_id >= static_cast<int>(ordered_names.size())) { throw std::runtime_error("class id out of supported range in categories.json"); }
   const auto class_id = static_cast<uint8_t>(normalized_id);
   if (seen_ids[class_id]) { throw std::runtime_error("duplicate class id in categories.json"); }
   seen_ids[class_id] = true;
@@ -431,10 +404,9 @@ DatasetScan scan_dataset(const CompilerConfig& config, const std::vector<std::st
  check_cancelled();
  return scan;
 }
-LabelBlocks build_label_blocks(const std::filesystem::path& split_dir, uint32_t num_images, const CompilerConfig& config,
-                               const catalog::ClassCatalog& class_catalog, std::uint8_t source_category_base, int num_workers,
-                               const std::span<const int> worker_cpus, ProgressCounter* completed_images, std::atomic<bool>* failure_requested,
-                               const mmltk::common::concurrency::CancellationObservation cancellation) {
+LabelBlocks build_label_blocks(const std::filesystem::path& split_dir, uint32_t num_images, const CompilerConfig& config, const catalog::ClassCatalog& class_catalog, std::uint8_t source_category_base,
+ int num_workers, const std::span<const int> worker_cpus, ProgressCounter* completed_images, std::atomic<bool>* failure_requested,
+ const mmltk::common::concurrency::CancellationObservation cancellation) {
  mmltk::common::logging::ScopedProfile profile{"compiler.labels.build_blocks"};
  auto record_worker_stats = [&](const std::vector<LabelWorkerStats>& worker_stats) {
 #if MMLTK_ENABLE_PROFILING
@@ -476,63 +448,60 @@ LabelBlocks build_label_blocks(const std::filesystem::path& split_dir, uint32_t 
  std::vector<LabelWorkerStats> worker_stats(static_cast<size_t>(worker_count));
  std::vector<std::vector<CompileDiagnostic>> worker_diagnostics;
  if (config.diagnostics != nullptr) { worker_diagnostics.resize(static_cast<size_t>(worker_count)); }
- parallel_for_range_indexed<uint32_t>(
-  0, num_images, num_workers, worker_cpus, [&](int worker_id, uint32_t start, uint32_t end) {  // NOLINT(bugprone-easily-swappable-parameters)
-   LabelWorkerStats& stats = worker_stats[static_cast<size_t>(worker_id)];
+ parallel_for_range_indexed<uint32_t>(0, num_images, num_workers, worker_cpus, [&](int worker_id, uint32_t start, uint32_t end) {  // NOLINT(bugprone-easily-swappable-parameters)
+  LabelWorkerStats& stats = worker_stats[static_cast<size_t>(worker_id)];
 #if MMLTK_ENABLE_PROFILING
-   const auto worker_start = std::chrono::steady_clock::now();
+  const auto worker_start = std::chrono::steady_clock::now();
 #endif
-   dataset::MaskResizeScratch mask_scratch;
-   ProgressBatch progress(completed_images);
-   std::vector<CompileDiagnostic>* diagnostics = worker_diagnostics.empty() ? nullptr : &worker_diagnostics[static_cast<size_t>(worker_id)];
-   for (uint32_t image_index = start; image_index < end; ++image_index) {
-    if (cancellation.requested()) {
-     worker_cancelled.store(true, std::memory_order_relaxed);
-     throw std::runtime_error("dataset compilation cancelled");
-    }
-    if (worker_cancelled.load(std::memory_order_relaxed) || (failure_requested != nullptr && failure_requested->load(std::memory_order_relaxed))) { break; }
-    try {
-     ResizeObservation resize_observation;
-     ParsedLabels parsed_labels = parse_jsonl(annotation_path(split_dir, image_index), image_path(split_dir, image_index), class_catalog, config,
-                                              &resize_observation, mask_scratch, diagnostics);
-     if (resize_observation.needs_resize) { any_image_resize.store(true, std::memory_order_relaxed); }
-     if (resize_observation.needs_downscale) { any_image_downscale.store(true, std::memory_order_relaxed); }
-     WorkerResult& result = worker_results[image_index];
-     result.has_image_id = parsed_labels.has_image_id;
-     result.image_id = parsed_labels.image_id;
-     result.original_width = resize_observation.source_dimensions.width;
-     result.original_height = resize_observation.source_dimensions.height;
-     std::vector<ParsedInstance>& instances = parsed_labels.instances;
-     result.labels.reserve(instances.size());
-     const size_t instance_rle_pairs = parsed_rle_pair_count(instances);
-     result.rle_pairs.reserve(instance_rle_pairs);
-     for (const ParsedInstance& instance : instances) {
-      auto packed = pack_instance(instance);
-      if ((packed.flags & kAnnotationCategory) == 0U) {
-       packed.source_category_id = static_cast<std::uint64_t>(packed.class_id) + source_category_base;
-       packed.flags |= kAnnotationCategory;
-      }
-      result.labels.push_back(packed);
-      result.rle_pairs.insert(result.rle_pairs.end(), instance.rle_pairs.begin(), instance.rle_pairs.end());
-     }
-#if MMLTK_ENABLE_PROFILING
-     ++stats.images;
-     stats.instances += instances.size();
-     stats.rle_pairs += instance_rle_pairs;
-#endif
-     stats.dropped_instances += parsed_labels.dropped_instances;
-     progress.increment();
-    } catch (...) {
-     worker_cancelled.store(true, std::memory_order_relaxed);
-     if (failure_requested != nullptr) { failure_requested->store(true, std::memory_order_relaxed); }
-     throw;
-    }
+  dataset::MaskResizeScratch mask_scratch;
+  ProgressBatch progress(completed_images);
+  std::vector<CompileDiagnostic>* diagnostics = worker_diagnostics.empty() ? nullptr : &worker_diagnostics[static_cast<size_t>(worker_id)];
+  for (uint32_t image_index = start; image_index < end; ++image_index) {
+   if (cancellation.requested()) {
+    worker_cancelled.store(true, std::memory_order_relaxed);
+    throw std::runtime_error("dataset compilation cancelled");
    }
+   if (worker_cancelled.load(std::memory_order_relaxed) || (failure_requested != nullptr && failure_requested->load(std::memory_order_relaxed))) { break; }
+   try {
+    ResizeObservation resize_observation;
+    ParsedLabels parsed_labels = parse_jsonl(annotation_path(split_dir, image_index), image_path(split_dir, image_index), class_catalog, config, &resize_observation, mask_scratch, diagnostics);
+    if (resize_observation.needs_resize) { any_image_resize.store(true, std::memory_order_relaxed); }
+    if (resize_observation.needs_downscale) { any_image_downscale.store(true, std::memory_order_relaxed); }
+    WorkerResult& result = worker_results[image_index];
+    result.has_image_id = parsed_labels.has_image_id;
+    result.image_id = parsed_labels.image_id;
+    result.original_width = resize_observation.source_dimensions.width;
+    result.original_height = resize_observation.source_dimensions.height;
+    std::vector<ParsedInstance>& instances = parsed_labels.instances;
+    result.labels.reserve(instances.size());
+    const size_t instance_rle_pairs = parsed_rle_pair_count(instances);
+    result.rle_pairs.reserve(instance_rle_pairs);
+    for (const ParsedInstance& instance : instances) {
+     auto packed = pack_instance(instance);
+     if ((packed.flags & kAnnotationCategory) == 0U) {
+      packed.source_category_id = static_cast<std::uint64_t>(packed.class_id) + source_category_base;
+      packed.flags |= kAnnotationCategory;
+     }
+     result.labels.push_back(packed);
+     result.rle_pairs.insert(result.rle_pairs.end(), instance.rle_pairs.begin(), instance.rle_pairs.end());
+    }
 #if MMLTK_ENABLE_PROFILING
-   stats.active_ns = checked_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - worker_start).count(),
-                                                 "worker active time overflow");
+    ++stats.images;
+    stats.instances += instances.size();
+    stats.rle_pairs += instance_rle_pairs;
 #endif
-  });
+    stats.dropped_instances += parsed_labels.dropped_instances;
+    progress.increment();
+   } catch (...) {
+    worker_cancelled.store(true, std::memory_order_relaxed);
+    if (failure_requested != nullptr) { failure_requested->store(true, std::memory_order_relaxed); }
+    throw;
+   }
+  }
+#if MMLTK_ENABLE_PROFILING
+  stats.active_ns = checked_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - worker_start).count(), "worker active time overflow");
+#endif
+ });
  if (config.diagnostics != nullptr) {
   for (std::vector<CompileDiagnostic>& diagnostics : worker_diagnostics) {
    for (CompileDiagnostic& diagnostic : diagnostics) { append_diagnostic(config.diagnostics, std::move(diagnostic)); }
@@ -568,13 +537,10 @@ LabelBlocks build_label_blocks(const std::filesystem::path& split_dir, uint32_t 
    const size_t image_rle_start = rle_cursor;
    size_t image_rle_cursor = image_rle_start;
    for (PackedInstance& packed : result.labels) {
-    packed.mask_rle_offset =
-     mmltk::common::math::checked_multiply<decltype(PackedInstance::mask_rle_offset)>(image_rle_cursor, sizeof(RLEPair), "mask RLE offset overflow");
+    packed.mask_rle_offset = mmltk::common::math::checked_multiply<decltype(PackedInstance::mask_rle_offset)>(image_rle_cursor, sizeof(RLEPair), "mask RLE offset overflow");
     image_rle_cursor += packed.mask_rle_pairs;
    }
-   if (image_rle_cursor - image_rle_start != result.rle_pairs.size()) {
-    throw std::runtime_error("label and RLE counts diverged while assembling label blocks");
-   }
+   if (image_rle_cursor - image_rle_start != result.rle_pairs.size()) { throw std::runtime_error("label and RLE counts diverged while assembling label blocks"); }
    if (!result.labels.empty()) { std::ranges::copy(result.labels, blocks.labels.data() + label_cursor); }
    if (!result.rle_pairs.empty()) { std::ranges::copy(result.rle_pairs, blocks.rle_pairs.data() + image_rle_start); }
    label_cursor += result.labels.size();
@@ -582,9 +548,7 @@ LabelBlocks build_label_blocks(const std::filesystem::path& split_dir, uint32_t 
   }
  }
  blocks.max_instances_per_image = max_instances_per_image;
- if (mmltk::common::logging::profile_enabled()) {
-  mmltk::common::logging::profile_set_value("compiler.labels.max_instances_per_image", max_instances_per_image);
- }
+ if (mmltk::common::logging::profile_enabled()) { mmltk::common::logging::profile_set_value("compiler.labels.max_instances_per_image", max_instances_per_image); }
  return blocks;
 }
 }  // namespace mmltk::backend::data::compiler_internal

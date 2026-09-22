@@ -82,8 +82,8 @@ inline constexpr std::array<TrainRecipeCatalogEntry, 2U> kTrainRecipeCatalog{{
 [[nodiscard]] consteval bool train_recipe_catalog_is_valid() {
  for (std::size_t index = 0U; index < kTrainRecipeCatalog.size(); ++index) {
   const auto& recipe = kTrainRecipeCatalog[index];
-  if (cli_enum_spelling(recipe.optimizer).empty() || cli_enum_spelling(recipe.lr_scheduler).empty() || recipe.lr < 0.0 || recipe.lr_encoder < 0.0 ||
-      recipe.momentum < 0.0 || recipe.momentum > 1.0 || recipe.weight_decay < 0.0)
+  if (cli_enum_spelling(recipe.optimizer).empty() || cli_enum_spelling(recipe.lr_scheduler).empty() || recipe.lr < 0.0 || recipe.lr_encoder < 0.0 || recipe.momentum < 0.0 || recipe.momentum > 1.0 ||
+      recipe.weight_decay < 0.0)
    return false;
   for (std::size_t sibling = index + 1U; sibling < kTrainRecipeCatalog.size(); ++sibling) {
    if (recipe.optimizer == kTrainRecipeCatalog[sibling].optimizer) return false;

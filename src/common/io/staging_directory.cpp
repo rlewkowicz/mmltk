@@ -4,8 +4,7 @@
 #include <vector>
 #include "src/common/io/file_memory.h"
 namespace mmltk::common::io {
-StagingDirectory::StagingDirectory(const std::filesystem::path& destination, const std::string_view prefix, const std::string_view suffix,
-                                   const char* const failure_action) {
+StagingDirectory::StagingDirectory(const std::filesystem::path& destination, const std::string_view prefix, const std::string_view suffix, const char* const failure_action) {
  const std::filesystem::path parent = mmltk::common::io::ensure_parent_directory(destination);
  const std::string pattern = (parent / (std::string(prefix) + destination.filename().string() + std::string(suffix))).string();
  std::vector<char> writable(pattern.begin(), pattern.end());

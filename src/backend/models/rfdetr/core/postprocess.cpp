@@ -34,11 +34,13 @@ torch::Tensor fixed_box_scale(const torch::Tensor& boxes, const int64_t height, 
  cudaStream_t stream = nullptr;
  if (boxes.is_cuda()) { stream = at::cuda::getCurrentCUDAStream(boxes.get_device()).stream(); }
  thread_local FixedBoxScaleCacheEntry cache;
- if (cache.scale.defined() && cache.device == boxes.device() && cache.stream == stream && cache.height == height && cache.width == width) {
-  return cache.scale;
- }
+ if (cache.scale.defined() && cache.device == boxes.device() && cache.stream == stream && cache.height == height && cache.width == width) { return cache.scale; }
  FixedBoxScaleCacheEntry candidate{
-  boxes.device(), stream, height, width, torch::tensor({width, height, width, height}, boxes.options().dtype(torch::kFloat32)).view({1, 1, 4}),
+  boxes.device(),
+  stream,
+  height,
+  width,
+  torch::tensor({width, height, width, height}, boxes.options().dtype(torch::kFloat32)).view({1, 1, 4}),
  };
  // Never rewrite storage still read by queued work. Torch retires the old
  // allocation on its own stream; construction failure leaves the cache intact.
@@ -49,8 +51,7 @@ PostprocessCore postprocess_core(const OutputTensors& outputs, int64_t target_he
  mmltk::common::logging::ScopedProfile profile_rfdetr_native_postprocess_total{"rfdetr.native.postprocess.total"};
  const auto out_logits = (classes ? classes->ValidateLogits(outputs.pred_logits) : outputs.pred_logits).to(torch::kFloat32);
  const auto out_bbox = outputs.pred_boxes.to(torch::kFloat32);
- if (out_logits.dim() != 3 || out_bbox.dim() != 3 || out_bbox.size(2) != 4 || out_bbox.size(0) != out_logits.size(0) ||
-     out_bbox.size(1) != out_logits.size(1) || num_select < 0)
+ if (out_logits.dim() != 3 || out_bbox.dim() != 3 || out_bbox.size(2) != 4 || out_bbox.size(0) != out_logits.size(0) || out_bbox.size(1) != out_logits.size(1) || num_select < 0)
   throw std::invalid_argument("invalid RF-DETR postprocessing shapes or selection limit");
  if (out_logits.numel() != 0) static_cast<void>(checked_prediction_extent(out_logits.numel(), sizeof(std::int64_t), kMaximumPredictionTensorBytes));
  PostprocessCore core;
@@ -115,27 +116,22 @@ void ClassPostprocessLane::Prepare(const torch::Device& device) {
  prepared_stream_ = stream;
 }
 torch::Tensor ClassPostprocessLane::ValidateLogits(const torch::Tensor& logits) const {
- if (logits.dim() != 3 || static_cast<std::size_t>(logits.size(2)) != layout_->output_width())
-  throw std::invalid_argument("logit width disagrees with admitted class layout");
+ if (logits.dim() != 3 || static_cast<std::size_t>(logits.size(2)) != layout_->output_width()) throw std::invalid_argument("logit width disagrees with admitted class layout");
  return logits;
 }
 torch::Tensor ClassPostprocessLane::References(const torch::Tensor& indices) const {
  const auto stream = indices.is_cuda() ? at::cuda::getCurrentCUDAStream(indices.get_device()).stream() : nullptr;
- if (!references_.defined() || indices.device() != references_.device() || prepared_stream_ != stream)
-  throw std::invalid_argument("class references used outside the prepared lane");
+ if (!references_.defined() || indices.device() != references_.device() || prepared_stream_ != stream) throw std::invalid_argument("class references used outside the prepared lane");
  return references_.index_select(0, indices.flatten()).view(indices.sizes());
 }
-PostprocessedSelection select_output_batch_fixed_size(const OutputTensors& outputs, int64_t height, int64_t width, int64_t count, bool require_masks,
-                                                      ClassPostprocessLane* classes) {
+PostprocessedSelection select_output_batch_fixed_size(const OutputTensors& outputs, int64_t height, int64_t width, int64_t count, bool require_masks, ClassPostprocessLane* classes) {
  if (require_masks && !outputs.pred_masks) throw std::runtime_error("RF-DETR requested masks are absent");
  auto core = postprocess_core(outputs, height, width, count, classes);
  if (outputs.pred_masks &&
-     (outputs.pred_masks->dim() != 4 || outputs.pred_masks->size(0) != outputs.pred_logits.size(0) ||
-      outputs.pred_masks->size(1) != outputs.pred_logits.size(1) || outputs.pred_masks->size(2) <= 0 || outputs.pred_masks->size(3) <= 0 ||
-      !outputs.pred_masks->is_floating_point() || outputs.pred_masks->device() != outputs.pred_logits.device()))
+     (outputs.pred_masks->dim() != 4 || outputs.pred_masks->size(0) != outputs.pred_logits.size(0) || outputs.pred_masks->size(1) != outputs.pred_logits.size(1) || outputs.pred_masks->size(2) <= 0 ||
+      outputs.pred_masks->size(3) <= 0 || !outputs.pred_masks->is_floating_point() || outputs.pred_masks->device() != outputs.pred_logits.device()))
   throw std::invalid_argument("RF-DETR mask logits are incompatible with selected queries");
- if (outputs.pred_masks)
-  static_cast<void>(checked_prediction_extent(outputs.pred_masks->numel(), outputs.pred_masks->element_size(), kMaximumPredictionTensorBytes));
+ if (outputs.pred_masks) static_cast<void>(checked_prediction_extent(outputs.pred_masks->numel(), outputs.pred_masks->element_size(), kMaximumPredictionTensorBytes));
  return {std::move(core.scores), std::move(core.labels), std::move(core.boxes), std::move(core.query_indices), outputs.pred_masks, std::move(core.counts)};
 }
 SelectedMaskCapacity SelectedMaskWorkspace::RetainedCapacity(std::size_t host_bytes) const {
@@ -174,8 +170,7 @@ torch::Tensor materialize_selected_masks(const torch::Tensor& logits, const torc
  SelectedMaskWorkspace workspace;
  return workspace.Materialize(logits, query_indices, height, width);
 }
-PostprocessedBatch postprocess_output_batch_fixed_size(const OutputTensors& outputs, int64_t target_height, int64_t target_width, int64_t num_select,
-                                                       ClassPostprocessLane* classes) {
+PostprocessedBatch postprocess_output_batch_fixed_size(const OutputTensors& outputs, int64_t target_height, int64_t target_width, int64_t num_select, ClassPostprocessLane* classes) {
  auto selected = select_output_batch_fixed_size(outputs, target_height, target_width, num_select, false, classes);
  PostprocessedBatch result{selected.scores, selected.labels, selected.boxes, std::nullopt, selected.counts};
  if (selected.mask_logits) result.masks = materialize_selected_masks(*selected.mask_logits, selected.query_indices, target_height, target_width);

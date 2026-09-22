@@ -14,25 +14,21 @@ AugmentationAnnotationSupport mask_extent(std::span<const mmltk::backend::data::
  for (const auto& run : runs) support.area_pixels += static_cast<float>(run.length);
  return support;
 }
-bool contains(const std::array<float, 4>& box, std::span<const mmltk::backend::data::RLEPair> runs, const std::array<float, 6>& inverse, float x, float y,
-              int width, int height) {
+bool contains(const std::array<float, 4>& box, std::span<const mmltk::backend::data::RLEPair> runs, const std::array<float, 6>& inverse, float x, float y, int width, int height) {
  // CLEANUP-IGNORE: Inverse support sampling and forward box-corner projection intentionally express opposite coordinate mappings.
  const float sx = inverse[0] * x + inverse[1] * y + inverse[2];
  const float sy = inverse[3] * x + inverse[4] * y + inverse[5];
  if (sx < 0 || sx > 1 || sy < 0 || sy > 1) return false;
  if (runs.empty()) return sx >= box[0] && sx <= box[2] && sy >= box[1] && sy <= box[3];
- const auto pixel =
-  mmltk::backend::imaging::sampling::support_pixel_index(sy, height) * width + mmltk::backend::imaging::sampling::support_pixel_index(sx, width);
+ const auto pixel = mmltk::backend::imaging::sampling::support_pixel_index(sy, height) * width + mmltk::backend::imaging::sampling::support_pixel_index(sx, width);
  return mmltk::backend::imaging::sampling::rle_support_contains(runs.data(), runs.size(), pixel);
 }
 }  // namespace
 bool augmentation_changes_support(const AugmentationImagePlan* plan) noexcept {
- return plan != nullptr &&
-        (plan->forward != identity || plan->paste_donor_slot >= 0 || plan->erasure.dropout_probability > 0 || plan->erasure.rectangular != 0);
+ return plan != nullptr && (plan->forward != identity || plan->paste_donor_slot >= 0 || plan->erasure.dropout_probability > 0 || plan->erasure.rectangular != 0);
 }
-AugmentationAnnotationSupport resolve_augmentation_annotation_support(const std::array<float, 4>& source_box,
-                                                                      std::span<const mmltk::backend::data::RLEPair> source_mask, int width, int height,
-                                                                      const AugmentationImagePlan* plan, bool donor, bool mask_present) {
+AugmentationAnnotationSupport resolve_augmentation_annotation_support(
+ const std::array<float, 4>& source_box, std::span<const mmltk::backend::data::RLEPair> source_mask, int width, int height, const AugmentationImagePlan* plan, bool donor, bool mask_present) {
  if (width <= 0 || height <= 0) throw std::invalid_argument("augmentation support requires positive image dimensions");
  const float image_width = static_cast<float>(width), image_height = static_cast<float>(height);
  mask_present = mask_present || !source_mask.empty();
@@ -41,8 +37,7 @@ AugmentationAnnotationSupport resolve_augmentation_annotation_support(const std:
   source_mask = {};
   mask_present = false;
  }
- const auto original = source_mask.empty() ? AugmentationAnnotationSupport{transform_augmentation_box_xyxy(source_box, identity),
-                                                                           augmentation_box_area(source_box) * image_width * image_height, true}
+ const auto original = source_mask.empty() ? AugmentationAnnotationSupport{transform_augmentation_box_xyxy(source_box, identity), augmentation_box_area(source_box) * image_width * image_height, true}
                                            : mask_extent(source_mask, width, height);
  if (!augmentation_changes_support(plan)) {
   auto result = original;
@@ -62,10 +57,8 @@ AugmentationAnnotationSupport resolve_augmentation_annotation_support(const std:
  if (!source_mask.empty() && augmentation_box_area(candidate) > 0) {
   constexpr float margin = 8 * std::numeric_limits<float>::epsilon();
   const auto& forward = plan->forward;
-  const float x_error = margin * (donor ? (1 + std::abs(1 / inverse[0]) + std::abs(inverse[2] / inverse[0]))
-                                        : (1 + std::abs(forward[0]) + std::abs(forward[1]) + std::abs(forward[2])));
-  const float y_error = margin * (donor ? (1 + std::abs(1 / inverse[4]) + std::abs(inverse[5] / inverse[4]))
-                                        : (1 + std::abs(forward[3]) + std::abs(forward[4]) + std::abs(forward[5])));
+  const float x_error = margin * (donor ? (1 + std::abs(1 / inverse[0]) + std::abs(inverse[2] / inverse[0])) : (1 + std::abs(forward[0]) + std::abs(forward[1]) + std::abs(forward[2])));
+  const float y_error = margin * (donor ? (1 + std::abs(1 / inverse[4]) + std::abs(inverse[5] / inverse[4])) : (1 + std::abs(forward[3]) + std::abs(forward[4]) + std::abs(forward[5])));
   candidate[0] = std::max(0.0F, candidate[0] - x_error);
   candidate[1] = std::max(0.0F, candidate[1] - y_error);
   candidate[2] = std::min(1.0F, candidate[2] + x_error);
@@ -103,8 +96,7 @@ AugmentationAnnotationSupport resolve_augmentation_annotation_support(const std:
   }
  result.present = max_x >= 0;
  if (result.present)
-  result.box_xyxy = {static_cast<float>(min_x) / image_width, static_cast<float>(min_y) / image_height, static_cast<float>(max_x + 1) / image_width,
-                     static_cast<float>(max_y + 1) / image_height};
+  result.box_xyxy = {static_cast<float>(min_x) / image_width, static_cast<float>(min_y) / image_height, static_cast<float>(max_x + 1) / image_width, static_cast<float>(max_y + 1) / image_height};
  // Raster support governs custom erasure and occlusion. Pure geometry keeps
  // the supplied continuous detection box, even when its resized mask vanishes.
  if (!modifies_visibility) {

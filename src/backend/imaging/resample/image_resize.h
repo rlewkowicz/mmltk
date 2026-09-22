@@ -33,11 +33,10 @@ struct ImageResizeGeometry {
  std::uint32_t offset_x = 0;
  std::uint32_t offset_y = 0;
 };
-[[nodiscard]] ImageResizeGeometry compute_image_resize_geometry(std::uint32_t source_width, std::uint32_t source_height, std::uint32_t target_width,
-                                                                std::uint32_t target_height, ImageResizeMode mode);
+[[nodiscard]] ImageResizeGeometry compute_image_resize_geometry(std::uint32_t source_width, std::uint32_t source_height, std::uint32_t target_width, std::uint32_t target_height, ImageResizeMode mode);
 void rgb_hwc_u8_to_nchw_f32(const std::uint8_t* source, float* destination, std::uint32_t width, std::uint32_t height);
-void letterboxed_rgb_hwc_u8_to_nchw_f32(const std::uint8_t* source, float* destination, std::uint32_t source_width, std::uint32_t source_height,
-                                        std::uint32_t destination_width, std::uint32_t destination_height, std::uint32_t offset_x, std::uint32_t offset_y);
+void letterboxed_rgb_hwc_u8_to_nchw_f32(const std::uint8_t* source, float* destination, std::uint32_t source_width, std::uint32_t source_height, std::uint32_t destination_width,
+ std::uint32_t destination_height, std::uint32_t offset_x, std::uint32_t offset_y);
 struct ResizeWorkerPlan {
  int image_workers = 1;
  int resize_threads_per_image = 1;

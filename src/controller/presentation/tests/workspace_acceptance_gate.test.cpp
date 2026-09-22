@@ -55,8 +55,7 @@ TEST_CASE("acceptance gate retains one reader across settled frontend workflows"
  CHECK(fixture.Await(held) == ExploreAcceptanceGate::WaitResult::Proceed);
  CHECK_FALSE(gate.ClaimHeldCompletion());
  CHECK_FALSE(gate.ObserveFrontend({.kind = Kind::Settled, .sequence = 2U}));
- for (const auto kind : {Kind::Progress, Kind::Settled, Kind::PressureEntered})
-  CHECK_FALSE(gate.ObserveFrontend({.kind = kind, .sequence = 1U, .progress = 1U, .failureline = 123U}));
+ for (const auto kind : {Kind::Progress, Kind::Settled, Kind::PressureEntered}) CHECK_FALSE(gate.ObserveFrontend({.kind = kind, .sequence = 1U, .progress = 1U, .failureline = 123U}));
  CHECK(gate.ObserveFrontend({.kind = Kind::Progress, .sequence = 1U, .progress = 1U}));
  CHECK_FALSE(gate.ObserveFrontend({.kind = Kind::Progress, .sequence = 1U, .progress = 1U}));
  CHECK_FALSE(gate.ObserveFrontend({.kind = Kind::Advance, .sequence = 1U}));
@@ -79,8 +78,7 @@ TEST_CASE("acceptance gate drains queued worker commands and wakes stale waits",
  AcceptanceGateFixture fixture{transport};
  auto& commands = fixture.commands();
  auto& gate = fixture.gate();
- for (const auto command : std::array<std::uint8_t, 3U>{1U, 2U, 4U})
-  REQUIRE(::send(commands.get(), &command, sizeof(command), MSG_NOSIGNAL) == sizeof(command));
+ for (const auto command : std::array<std::uint8_t, 3U>{1U, 2U, 4U}) REQUIRE(::send(commands.get(), &command, sizeof(command), MSG_NOSIGNAL) == sizeof(command));
  gate.AdvanceGeneration(7U);
  auto initial = std::async(std::launch::async, [&] { return gate.AwaitInitialRelease(7U); });
  CHECK(fixture.Await(initial) == ExploreAcceptanceGate::WaitResult::Proceed);
@@ -99,8 +97,7 @@ TEST_CASE("acceptance failure forwards exact bounded text in its terminal packet
  AcceptanceGateFixture fixture{SOCK_SEQPACKET};
  auto& gate = fixture.gate();
  gate.SetFrontendCommand([](auto) { return true; });
- contracts::IntegrationControlReceipt receipt{
-  .kind = contracts::IntegrationControlKind::Failed, .sequence = 1U, .progress = 87U, .failureline = 123U, .failure = std::string(size, 'x')};
+ contracts::IntegrationControlReceipt receipt{.kind = contracts::IntegrationControlKind::Failed, .sequence = 1U, .progress = 87U, .failureline = 123U, .failure = std::string(size, 'x')};
  auto invalid = receipt;
  invalid.sequence = 2U;
  CHECK_FALSE(gate.ObserveFrontend(invalid));
@@ -242,8 +239,7 @@ TEST_CASE("completed gallery read receipts retain identity through reentrant sup
  auto held = std::async(std::launch::async, [&] { return gate.AwaitHeldCompletion(7U, 3U, 47U, 1024U); });
  CHECK(fixture.Await(held) == ExploreAcceptanceGate::WaitResult::Stale);
  REQUIRE(received.has_value());
- CHECK(
-  (*received == contracts::IntegrationControlReceipt{.kind = Kind::GalleryReadCompletionHeld, .sequence = 1U, .read_generation = 7U, .compiled_index = 47U}));
+ CHECK((*received == contracts::IntegrationControlReceipt{.kind = Kind::GalleryReadCompletionHeld, .sequence = 1U, .read_generation = 7U, .compiled_index = 47U}));
  for (const auto expected : {ExploreAcceptanceGate::ControlEvent::HeldWait, ExploreAcceptanceGate::ControlEvent::HeldStale}) {
   ExploreAcceptanceGate::ControlObservation observation{};
   REQUIRE(::recv(fixture.commands().get(), &observation, sizeof(observation), MSG_DONTWAIT) == sizeof(observation));
