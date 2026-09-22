@@ -212,6 +212,40 @@ export function mmltkIntegrationReport(event, control, detail, a, b, c, d) {
   report({event, control, detail, a: String(a), b: String(b), c: String(c), d: String(d)});
 }
 
+// Both gallery probes sample only ready visible card interiors, in at most nine
+// 8x8 patches. The workflow fixture requires chromatic image pixels so neutral
+// workspace/background/placeholder colors cannot satisfy its proof.
+function sampleReadyCard(context, rectangle, chromatic = false) {
+  const left = Math.ceil(rectangle[0]), top = Math.ceil(rectangle[1]);
+  const spanX = Math.floor(rectangle[0] + rectangle[2]) - left;
+  const spanY = Math.floor(rectangle[1] + rectangle[3]) - top;
+  const width = Math.min(8, spanX), height = Math.min(8, spanY);
+  if (width < 1 || height < 1) throw new Error('empty visible ready-cell interior');
+  let x, y, pixels;
+  let colored = 0;
+  // A clipped or augmented image can have black padding at its center.
+  // Search a bounded set of patches inside the actual visible interior,
+  // retaining the selected physical coordinates for native pixel audit.
+  for (const vertical of [.5, .9, .1]) {
+    for (const horizontal of [.5, .9, .1]) {
+      x = left + Math.round((spanX - width) * horizontal);
+      y = top + Math.round((spanY - height) * vertical);
+      pixels = context.getImageData(x, y, width, height).data;
+      colored = 0;
+      for (let p = 0; p < pixels.length; p += 4) {
+        if (pixels[p + 3] > 0 && Math.max(pixels[p], pixels[p + 1], pixels[p + 2]) > 8
+            && (!chromatic || Math.max(pixels[p], pixels[p + 1], pixels[p + 2]) - Math.min(pixels[p], pixels[p + 1], pixels[p + 2]) > 24)) {
+          colored++;
+        }
+      }
+      if (colored * 2 >= width * height) break;
+    }
+    if (colored * 2 >= width * height) break;
+  }
+  const matched = colored * 2 >= width * height;
+  return {x, y, width, height, pixels, colored, matched};
+}
+
 export function mmltkIntegrationAtlasPixels(receipt, rectangles, cards, fields, sourceRevision, presentationRevision, completed) {
   completed = integrationCompletion(completed);
   if (!integrationState) return;
@@ -238,32 +272,8 @@ export function mmltkIntegrationAtlasPixels(receipt, rectangles, cards, fields, 
       if (cards.length * 4 !== rectangles.length) throw new Error('ready-cell identity count');
       let nonblack = 0;
       for (let i = 0; i < rectangles.length; i += 4) {
-        const left = Math.ceil(rectangles[i]), top = Math.ceil(rectangles[i + 1]);
-        const spanX = Math.floor(rectangles[i] + rectangles[i + 2]) - left;
-        const spanY = Math.floor(rectangles[i + 1] + rectangles[i + 3]) - top;
-        const width = Math.min(8, spanX), height = Math.min(8, spanY);
-        if (width < 1 || height < 1) throw new Error('empty visible ready-cell interior');
-        let x, y, pixels;
-        let colored = 0;
-        // A clipped or augmented image can have black padding at its center.
-        // Search a bounded set of patches inside the actual visible interior,
-        // retaining the selected physical coordinates for native pixel audit.
-        for (const vertical of [.5, .9, .1]) {
-          for (const horizontal of [.5, .9, .1]) {
-            x = left + Math.round((spanX - width) * horizontal);
-            y = top + Math.round((spanY - height) * vertical);
-            pixels = context.getImageData(x, y, width, height).data;
-            colored = 0;
-            for (let p = 0; p < pixels.length; p += 4) {
-              if (pixels[p + 3] > 0 && Math.max(pixels[p], pixels[p + 1], pixels[p + 2]) > 8) {
-                colored++;
-              }
-            }
-            if (colored * 2 >= width * height) break;
-          }
-          if (colored * 2 >= width * height) break;
-        }
-        const matched = colored * 2 >= width * height;
+        const {x, y, width, height, pixels, colored, matched} =
+          sampleReadyCard(context, rectangles.slice(i, i + 4));
         nonblack += Number(matched);
         const center = (Math.floor(height / 2) * width + Math.floor(width / 2)) * 4;
         const rgba = (pixels[center] | pixels[center + 1] << 8 | pixels[center + 2] << 16 | pixels[center + 3] << 24) >>> 0;
@@ -676,7 +686,7 @@ function workflowCaptionPixels(owner, canvas, snapshot, control, stage, caseInde
 }
 
 export function mmltkIntegrationWorkflowPixels(control, cssBounds, chart, progress, source, presentation,
-  captionStage, captionCase, captionPatches, completed) {
+  captionStage, captionCase, captionPatches, completed, galleryTile) {
   completed = integrationCompletion(completed);
   const owner = integrationState;
   if (!owner || !integrationDriver) { completed('failed'); return; }
@@ -684,6 +694,7 @@ export function mmltkIntegrationWorkflowPixels(control, cssBounds, chart, progre
   const receipt = widget ? undefined : mmltkIntegrationProbe(control);
   cssBounds = Array.from(cssBounds);
   captionPatches = Array.from(captionPatches);
+  galleryTile = Array.from(galleryTile);
   // Widget layout precedes the browser compositor. Sample the completed canvas
   // after two presentation opportunities, with bounded retries owned by Rust.
   integrationFrame(() => integrationFrame(() => {
@@ -697,6 +708,26 @@ export function mmltkIntegrationWorkflowPixels(control, cssBounds, chart, progre
     try {
       const canvas = document.querySelector('canvas');
       if (!canvas) throw new Error('missing workflow canvas');
+      if (control === 'explore.gallery.workspace') {
+        if (widget || galleryTile.length !== 5 || !galleryTile.every(Number.isFinite)
+            || !Number.isInteger(galleryTile[0]) || galleryTile[0] < 0) {
+          throw new Error('missing ready gallery tile');
+        }
+        const rectangle = galleryTile.slice(1);
+        if (rectangle[0] < 0 || rectangle[1] < 0 || rectangle[2] < 8 || rectangle[3] < 8
+            || rectangle[0] + rectangle[2] > canvas.width || rectangle[1] + rectangle[3] > canvas.height) {
+          throw new Error('ready gallery tile outside canvas');
+        }
+        const sample = sampleReadyCard(canvasSnapshot(canvas), rectangle, true);
+        const sampled = sample.width * sample.height;
+        const matched = sample.matched && sample.colored >= 12;
+        report({event: 'integration.workflow.pixels', control, detail: 'validate-to-explore',
+          a: String(source), b: String(presentation), c: String(sampled), d: String(sample.colored),
+          ready_tile: true, compiled_index: galleryTile[0], matched,
+          canvas_x: sample.x, canvas_y: sample.y, sample_width: sample.width, sample_height: sample.height});
+        completed(matched ? 'observed' : 'failed', sampled, sample.colored);
+        return;
+      }
       const [x,y,w,h] = canvasPixelBounds(canvas, cssBounds, control);
       // The chart's middle strip excludes its legend and vertical axis. Only
       // saturated curve pixels count; neutral axes, grid and text cannot pass.

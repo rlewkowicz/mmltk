@@ -186,20 +186,7 @@ pub(super) fn view<'a>(
     input: crate::workspace_input::Binding,
 ) -> Element<'a, Message> {
     let snapshot = model.explore.snapshot.as_ref();
-    let presentation_override = if paired.is_none()
-        && snapshot.is_some_and(|value| {
-            value.ready && !value.busy && value.failure.is_empty() && value.order.matchingcount != 0
-        }) {
-        match model.gallery_presentation() {
-            crate::view_model::GalleryPresentation::Restoring => Some("Restoring gallery"),
-            crate::view_model::GalleryPresentation::Unavailable => Some("Gallery unavailable"),
-            crate::view_model::GalleryPresentation::Inactive => None,
-        }
-    } else {
-        None
-    };
-    let presentation_title =
-        presentation_override.unwrap_or_else(|| model.explore.presentation_title());
+    let presentation_title = model.explore.gallery_title(paired.is_some(), model.gallery_presentation());
     let columns = explore_columns(settings);
     let settings_available = settings.draft.is_some() && model.settings_edit_available();
     let mutation_available = !settings.has_local_edits() && model.explore_mutation_available();
@@ -333,7 +320,7 @@ pub(super) fn view<'a>(
     })
     .width(Fill)
     .height(Fill);
-    let status = container(text(gallery_status(&model.explore, presentation_override)).size(12))
+    let status = container(text(gallery_status(&model.explore, Some(presentation_title))).size(12))
         .id(super::STATUS_CARD_ID)
         .padding(Padding::from([6, 10]))
         .width(Fill)

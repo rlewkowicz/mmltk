@@ -426,13 +426,8 @@ impl App {
     }
 
     fn finish_viewer_departure(&mut self, stop: bool) {
-        let source = if self.workspace.active() == FeatureId::Validate {
-            PresentationSourceKind::Validation
-        } else {
-            self.model.viewer_native_kind()
-        };
         self.model.abandon_viewer();
-        self.model.set_foreground_visual(Some(source));
+        self.model.set_foreground_feature(self.workspace.active());
         self.presentation.stop_requested |= stop;
         self.dispatch_viewer_desired();
     }
@@ -1082,6 +1077,44 @@ mod tests {
     use super::*;
     use crate::generated::{ExploreMode, PresentationSourceKind};
     use crate::presentation_surface::{record_drawn_detail, reset_test_releases, test_releases};
+
+    #[test]
+    fn every_page_returns_directly_to_explore_with_and_without_validation_results() {
+        for origin in crate::generated::FEATURE_ID_VALUES.iter().copied() {
+            for rebase in [false, true] {
+                for results in [false, true] {
+                    let (mut app, _) = viewer_app();
+                    let explore = app.model.explore.snapshot.as_mut().unwrap();
+                    explore.mode = ExploreMode::Gallery;
+                    explore.selectedimage = None;
+                    app.model.abandon_viewer();
+                    if results {
+                        app.model.workflow.validation.as_mut().unwrap().frame =
+                            crate::view_model::test_support::visual_frame(PresentationSourceKind::Validation, 9);
+                    }
+                    app.workspace.select(origin);
+                    app.model.set_foreground_feature(origin);
+                    if rebase {
+                        app.rebase_page(FeatureId::Explore);
+                    } else {
+                        navigate(&mut app, FeatureId::Explore);
+                    }
+                    assert_eq!(app.model.foreground_visual(), Some(PresentationSourceKind::Explore));
+                    assert!(GalleryIdentity::current(&app.model).is_some());
+                    assert!(app.model.requested_upscale.is_none());
+                    let mut late = app.model.workflow.validation.clone().unwrap();
+                    late.frame = crate::view_model::test_support::visual_frame(
+                        PresentationSourceKind::Validation, 10,
+                    );
+                    app.model.reduce_event(crate::generated::ApplicationEvent::ValidationValidationChanged(
+                        crate::generated::ValidationChanged { snapshot: late },
+                    ));
+                    app.reconcile_surface_frame();
+                    assert!(GalleryIdentity::current(&app.model).is_some());
+                }
+            }
+        }
+    }
 
     #[test]
     fn full_bootstrap_restores_only_the_exact_suspended_viewer() {
@@ -1983,6 +2016,9 @@ mod tests {
         ] in crate::view_model::test_support::presentation_arrival_orders()
         {
             let (mut app, frame) = viewer_app();
+            navigate(&mut app, FeatureId::Validate);
+            navigate(&mut app, FeatureId::Explore);
+            assert_eq!(app.model.foreground_visual(), Some(PresentationSourceKind::Explore));
             let next = FrameReady {
                 content_sequence: 2,
                 presentation_revision: 6,

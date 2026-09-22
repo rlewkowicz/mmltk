@@ -490,6 +490,13 @@ auto BrowserAudit::consume(const nlohmann::json& record) -> void {
     ++phase_progress_revision;
    }
   }
+ } else if (event == "integration.workflow.pixels" && record.value("detail", "") == "validate-to-explore") {
+  const auto sampled = scalar(record, "c"), colored = scalar(record, "d");
+  const auto width = scalar(record, "sample_width"), height = scalar(record, "sample_height");
+  validate_to_explore_pixels = record.value("control", "") == kExploreGalleryControl && scalar(record, "a") != 0U && scalar(record, "b") != 0U &&
+                              record.value("ready_tile", false) && record.value("matched", false) && record.contains("compiled_index") &&
+                              width > 0U && width <= 8U && height > 0U && height <= 8U && sampled == width * height &&
+                              colored >= 12U && colored <= sampled && colored * 2U >= sampled;
  } else if (event == "integration.workflow.operation_progress") {
   constexpr std::array<std::string_view, 4U> primary_controls{"train.primary", "validate.primary", "predict.primary", "export.primary"};
   const auto control = std::ranges::find(primary_controls, record.value("control", ""));

@@ -22,6 +22,7 @@ pub enum Picture {
     Progress,
     Train,
     Validation,
+    Gallery,
     Detail,
     Compiled,
     Image,
@@ -36,6 +37,7 @@ impl Picture {
             Self::Progress => "progress",
             Self::Train => "train",
             Self::Validation => "validation",
+            Self::Gallery => "validate-to-explore",
             Self::Detail => "detail",
             Self::Compiled => "compiled",
             Self::Image => "image",
@@ -54,6 +56,7 @@ impl Picture {
             Self::Train | Self::Theme | Self::Narrow => "train.metrics.plot".into(),
             Self::Validation => crate::view::validate::samples::ATLAS_ID.into(),
             Self::Detail => "validate.detail.image".into(),
+            Self::Gallery => crate::view::explore::GALLERY_WORKSPACE_ID.into(),
             _ => "workflow.visual.workspace".into(),
         }
     }
@@ -120,6 +123,9 @@ pub(super) enum Step {
     BackToCharts,
     ChartAspect(u8),
     ChartAspectReady(u8),
+    PrepareExplore,
+    OpenGallery,
+    GalleryReady,
     Validate,
     StartValidate,
     Validating,
@@ -134,6 +140,8 @@ pub(super) enum Step {
     ValidationLayerReady(bool, u8),
     CloseSample,
     ClosedSample,
+    Explore,
+    Gallery,
     Predict,
     Source(u8),
     SourceReady(u8),
@@ -180,6 +188,7 @@ pub(super) struct State {
     validation_layer: u8,
     caption_patches: Vec<f64>,
     caption_receipt: Option<super::probe::ProbeReceipt>,
+    gallery_tile: Vec<f64>,
     validation_original: u8,
     validation_frame: Option<crate::presentation_surface::Surface>,
     export_pixels: bool,
@@ -187,6 +196,42 @@ pub(super) struct State {
     primary_reveal: [Option<(u64, u64)>; 4],
     work_progress: Option<(FeatureId, u64, u64)>,
     export_narrow: bool,
+}
+
+fn ready_gallery_tile(
+    model: &ApplicationModel,
+) -> Option<(super::probe::ProbeReceipt, [f64; 5])> {
+    let (surface, content) = crate::presentation_surface::gallery::displayed()?;
+    let current = model.explore.snapshot.as_ref()?;
+    if model.foreground_visual() != Some(crate::generated::PresentationSourceKind::Explore)
+        || current.mode != crate::generated::ExploreMode::Gallery
+        || content.metadata.frame != current.frame
+        || content.metadata.dataset.identity != current.dataset.identity
+        || content.metadata.order.matchingcount == 0
+    {
+        return None;
+    }
+    let receipt = super::probe::current_receipt(crate::view::explore::GALLERY_WORKSPACE_ID)?;
+    if receipt.surface.frame != surface.frame {
+        return None;
+    }
+    let draw = super::pixel_checks::AtlasDraw {
+        surface,
+        snapshot: content.metadata.clone(),
+        bounds: receipt.bounds,
+        image: receipt.image,
+        clip: receipt.clip,
+    };
+    let (compiled, tile) = draw
+        .ready_tiles()
+        .find(|(_, tile)| tile.width >= 8.0 && tile.height >= 8.0)?;
+    Some((receipt, [
+        f64::from(compiled),
+        f64::from(tile.x),
+        f64::from(tile.y),
+        f64::from(tile.width),
+        f64::from(tile.height),
+    ]))
 }
 
 fn atlas_cell(bounds: Rectangle, index: u8) -> Rectangle {
@@ -931,6 +976,8 @@ impl State {
                     | Step::ChartLeave
                     | Step::ChartReturn
                     | Step::Validate
+                    | Step::PrepareExplore
+                    | Step::Explore
                     | Step::Predict
                     | Step::Export
                     | Step::ExportReturn
@@ -968,19 +1015,21 @@ impl State {
             }
             ProbeOutcome::Observed(sampled, visible) if sampled > 0 && visible >= 12 => {
                 self.pixel_attempts = 0;
-                reporting::emit(|sink| {
-                    sink.record(
-                        "integration.workflow.pixels",
-                        &picture.control(index),
-                        picture.name(),
-                        [
-                            self.pixel_source as f64,
-                            self.pixel_presentation as f64,
-                            sampled as f64,
-                            visible as f64,
-                        ],
-                    )
-                });
+                if picture != Picture::Gallery {
+                    reporting::emit(|sink| {
+                        sink.record(
+                            "integration.workflow.pixels",
+                            &picture.control(index),
+                            picture.name(),
+                            [
+                                self.pixel_source as f64,
+                                self.pixel_presentation as f64,
+                                sampled as f64,
+                                visible as f64,
+                            ],
+                        )
+                    });
+                }
                 driver.phase = Phase::Workflows(match picture {
                     Picture::Progress => Step::LeaveTrain,
                     Picture::Train => Step::NoImageWorkspace,
@@ -990,6 +1039,7 @@ impl State {
                     Picture::Detail if self.validation_layer < 8 => Step::ValidationLayer(true, self.validation_layer + 1),
                     Picture::Detail if self.validation_original < 2 => Step::ValidationOriginal,
                     Picture::Detail => Step::CloseSample,
+                    Picture::Gallery => Step::Predict,
                     Picture::Compiled => Step::Source(1),
                     Picture::Image => Step::Source(2),
                     Picture::Video => Step::Restart,
@@ -1193,7 +1243,7 @@ impl State {
         };
         let input = crate::presentation_surface::physical_bounds(bounds, driver.input_scale);
         if let Step::Pixels(picture, index) = step {
-            if matches!(picture, Picture::Validation | Picture::Detail)
+            if matches!(picture, Picture::Validation | Picture::Detail | Picture::Gallery)
                 && self.caption_receipt != super::probe::current_receipt(control)
             {
                 return;
@@ -1243,6 +1293,7 @@ impl State {
                     },
                     &self.caption_patches,
                     &callback,
+                    &self.gallery_tile,
                 );
             }
             return;
@@ -1261,6 +1312,8 @@ impl State {
             Step::StartTrain => Step::Training,
             Step::LeaveTrain => Step::HiddenTrain,
             Step::ReturnTrain => Step::Trained,
+            Step::PrepareExplore => Step::OpenGallery,
+            Step::OpenGallery => Step::GalleryReady,
             Step::Validate => Step::StartValidate,
             Step::StartValidate => Step::Validating,
             Step::OpenSample => Step::Sample,
@@ -1268,6 +1321,7 @@ impl State {
             Step::HideBoxes => Step::HiddenBoxes,
             Step::ValidationLayer(detail, index) => Step::ValidationLayerReady(detail, index),
             Step::CloseSample => Step::ClosedSample,
+            Step::Explore => Step::Gallery,
             Step::Predict => Step::Source(0),
             Step::Source(index) => Step::SourceReady(index),
             Step::StartPredict(index) => Step::Predicting(index),
@@ -1695,13 +1749,24 @@ impl State {
                     if index as usize + 1 < crate::generated::WORKSPACE_ASPECT_RATIO_VALUES.len() {
                         Step::ChartAspect(index + 1)
                     } else {
-                        Step::Validate
+                        Step::PrepareExplore
                     },
                 )
             }
             Step::NoImageWorkspace => widgets.arm(driver, "workflow.visual.workspace"),
             Step::TrainAspect | Step::NoValidationAspect => {
                 widgets.arm(driver, "workflow.workspace.aspect")
+            }
+            Step::PrepareExplore => self.workflow_control(
+                widgets,
+                driver,
+                crate::view::navigation::stable_id(FeatureId::Explore),
+            ),
+            Step::OpenGallery if active == FeatureId::Explore && settled && model.explore_open_available() => {
+                self.workflow_control(widgets, driver, crate::view::explore::OPEN_ID)
+            }
+            Step::GalleryReady if ready_gallery_tile(model).is_some() => {
+                self.workflow_step(driver, Step::Validate)
             }
             Step::StartValidate
                 if active == FeatureId::Validate
@@ -1857,7 +1922,15 @@ impl State {
                 self.workflow_control(widgets, driver, "validate.detail.close")
             }
             Step::ClosedSample if validation.is_some_and(|value| !value.detail) => {
-                self.workflow_step(driver, Step::Predict)
+                self.workflow_step(driver, Step::Explore)
+            }
+            Step::Explore => self.workflow_control(
+                widgets,
+                driver,
+                crate::view::navigation::stable_id(FeatureId::Explore),
+            ),
+            Step::Gallery if active == FeatureId::Explore => {
+                self.workflow_step(driver, Step::Pixels(Picture::Gallery, 0))
             }
             Step::Predict => self.workflow_control(
                 widgets,
@@ -2089,6 +2162,7 @@ impl State {
             Step::Pixels(picture, index) => {
                 self.caption_patches.clear();
                 self.caption_receipt = None;
+                self.gallery_tile.clear();
                 if picture.chart() || picture == Picture::Progress {
                     self.pixel_source = 0;
                     self.pixel_presentation = 0;
@@ -2128,6 +2202,13 @@ impl State {
                                 self.caption_receipt = Some(receipt);
                                 Some(surface)
                             })
+                    } else if picture == Picture::Gallery {
+                        ready_gallery_tile(model).map(|(receipt, tile)| {
+                            let surface = receipt.surface;
+                            self.gallery_tile.extend(tile);
+                            self.caption_receipt = Some(receipt);
+                            surface
+                        })
                     } else {
                         crate::presentation_surface::drawable_prediction(surface)
                             .map(|(surface, _)| surface)

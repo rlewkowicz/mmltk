@@ -247,19 +247,18 @@ impl ApplicationModel {
     }
 
     pub fn set_foreground_feature(&mut self, feature: FeatureId) {
-        if ((feature == FeatureId::Explore
-            && self.viewer_native_kind() == PresentationSourceKind::Explore)
-            || (feature == FeatureId::Validate
-                && self.viewer_native_kind() == PresentationSourceKind::Validation))
-            && matches!(
-                self.presentation_model.foreground(),
-                Some(
-                    PresentationSourceKind::Explore
-                        | PresentationSourceKind::Validation
-                        | PresentationSourceKind::Upscale
-                )
-            )
-        {
+        let destination = Self::page_visual_source(feature);
+        let foreground = self.foreground_visual();
+        let viewer_page = matches!(feature, FeatureId::Explore | FeatureId::Validate);
+        let request_belongs = self.requested_upscale.as_ref().is_none_or(|request| {
+            Some(request.source.source.kind) == destination
+        });
+        let same_owner = (foreground == destination && request_belongs)
+            || (foreground == Some(PresentationSourceKind::Upscale)
+                && self.requested_upscale.as_ref().is_some_and(|request| {
+                    Some(request.source.source.kind) == destination
+                }));
+        if viewer_page && same_owner {
             return;
         }
         self.abandon_viewer();
@@ -357,6 +356,61 @@ mod tests {
             document: explore.document.clone(),
         });
         source
+    }
+
+    #[test]
+    fn foreground_selection_is_owned_by_the_destination_page() {
+        for origin in crate::generated::FEATURE_ID_VALUES.iter().copied() {
+            for results in [false, true] {
+                let mut model = bootstrapped();
+                model.set_foreground_feature(origin);
+                if results {
+                    model.workflow.validation.as_mut().unwrap().frame =
+                        visual_frame(PresentationSourceKind::Validation, 8);
+                }
+                model.abandon_viewer();
+                model.set_foreground_feature(FeatureId::Explore);
+                assert_eq!(model.foreground_visual(), Some(PresentationSourceKind::Explore));
+                assert!(model.requested_upscale.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn an_upscale_source_without_a_viewer_cannot_claim_destination_ownership() {
+        for page in [FeatureId::Explore, FeatureId::Validate] {
+            let mut model = bootstrapped();
+            model.set_foreground_visual(Some(PresentationSourceKind::Upscale));
+            model.set_foreground_feature(page);
+            assert_eq!(model.foreground_visual(), ApplicationModel::page_visual_source(page));
+        }
+    }
+
+    #[test]
+    fn same_page_preserves_only_its_own_upscale_request() {
+        for page in [FeatureId::Explore, FeatureId::Validate] {
+            let native = ApplicationModel::page_visual_source(page).unwrap();
+            for source in [PresentationSourceKind::Explore, PresentationSourceKind::Validation] {
+                for foreground in [native, source, PresentationSourceKind::Upscale] {
+                    let mut model = bootstrapped();
+                    let request = crate::generated::UpscaleRequest {
+                        source: visual_frame(source, 7),
+                        kernel: crate::generated::UpscaleKernel::ShiftLut,
+                        document: model.explore.snapshot.as_ref().unwrap().document.clone(),
+                    };
+                    model.requested_upscale = Some(request.clone());
+                    model.set_foreground_visual(Some(foreground));
+                    model.set_foreground_feature(page);
+                    if source == native {
+                        assert_eq!(model.foreground_visual(), Some(foreground));
+                        assert_eq!(model.requested_upscale, Some(request));
+                    } else {
+                        assert_eq!(model.foreground_visual(), Some(native));
+                        assert!(model.requested_upscale.is_none());
+                    }
+                }
+            }
+        }
     }
 
     #[test]

@@ -395,6 +395,7 @@ extern "C" {
         caption_case: u32,
         caption_patches: &[f64],
         completed: &wasm_bindgen::JsValue,
+        gallery_tile: &[f64],
     );
     #[wasm_bindgen::prelude::wasm_bindgen(js_name = mmltkIntegrationClickAfterSurfaceDraw)]
     fn click_after_surface_draw_js(

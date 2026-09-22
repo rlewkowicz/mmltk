@@ -25,6 +25,24 @@
 #include "native_audit.h"
 #include "browser_audit.h"
 namespace mmltk::acceptance::wayland {
+TEST_CASE("Validate to Explore requires real gallery pixel evidence", "[workspace][audit][pixel]") {
+ const auto defect = GENERATE("none", "control", "source", "presentation", "sampled", "visible", "placeholder", "background", "missing_tile", "unbounded");
+ BrowserAudit audit;
+ nlohmann::json record{{"event", "integration.workflow.pixels"}, {"detail", "validate-to-explore"}, {"control", "explore.gallery.workspace"},
+  {"a", 7U}, {"b", 9U}, {"c", 64U}, {"d", 48U}, {"ready_tile", true}, {"matched", true}, {"compiled_index", 0U}, {"sample_width", 8U}, {"sample_height", 8U}};
+ if (std::string_view{defect} == "control") record["control"] = "validate.detail.image";
+ if (std::string_view{defect} == "source") record["a"] = 0U;
+ if (std::string_view{defect} == "presentation") record["b"] = 0U;
+ if (std::string_view{defect} == "sampled") record["c"] = 0U;
+ if (std::string_view{defect} == "visible") record["d"] = 11U;
+ if (std::string_view{defect} == "placeholder") record["ready_tile"] = false;
+ if (std::string_view{defect} == "background") { record["d"] = 0U; record["matched"] = false; }
+ if (std::string_view{defect} == "missing_tile") record.erase("compiled_index");
+ if (std::string_view{defect} == "unbounded") { record["sample_width"] = 100U; record["c"] = 800U; record["d"] = 800U; }
+ audit.consume(record);
+ CHECK(audit.validate_to_explore_pixels == (std::string_view{defect} == "none"));
+}
+
 TEST_CASE("benchmark radio audit requires every real choice, current visibility and settled restoration", "[workspace][audit][benchmark]") {
  const bool baseline_enabled = GENERATE(false, true);
  const unsigned baseline_dataset = GENERATE(0U, 1U);

@@ -94,8 +94,32 @@ impl ExploreModel {
             {
                 "Preparing visible tiles"
             }
-            ExplorePresentationState::Populated => "GPU gallery ready",
+            ExplorePresentationState::Populated => "Dataset ready",
         }
+    }
+
+    pub fn gallery_title(
+        &self,
+        drawable: bool,
+        presentation: super::GalleryPresentation,
+    ) -> &'static str {
+        if self.snapshot.as_ref().is_some_and(|snapshot| !snapshot.failure.is_empty()) {
+            return self.presentation_title();
+        }
+        if !drawable && self.snapshot.as_ref().is_some_and(|snapshot| {
+            snapshot.ready && snapshot.order.matchingcount != 0
+        }) {
+            if matches!(presentation, super::GalleryPresentation::Unavailable) {
+                return "Gallery unavailable";
+            }
+            if self.snapshot.as_ref().is_some_and(|snapshot| snapshot.busy)
+                || self.gallery_progress().is_some_and(|(ready, total)| ready < total)
+            {
+                return "Preparing visible tiles";
+            }
+            return "Restoring gallery";
+        }
+        self.presentation_title()
     }
 
     pub fn reset_transport(&mut self) {
@@ -367,6 +391,31 @@ mod tests {
     }
 
     #[test]
+    fn dataset_readiness_never_claims_an_absent_gallery_is_drawable() {
+        let mut snapshot = explore_snapshot();
+        snapshot.ready = true;
+        snapshot.order.matchingcount = 1;
+        let mut model = ExploreModel { snapshot: Some(snapshot), ..Default::default() };
+        for state in [super::super::GalleryPresentation::Inactive, super::super::GalleryPresentation::Restoring] {
+            assert_eq!(model.gallery_title(false, state), "Restoring gallery");
+            assert_eq!(model.gallery_title(true, state), "Dataset ready");
+        }
+        assert_eq!(model.gallery_title(false, super::super::GalleryPresentation::Unavailable), "Gallery unavailable");
+        model.snapshot.as_mut().unwrap().busy = true;
+        assert_eq!(model.gallery_title(false, super::super::GalleryPresentation::Inactive), "Preparing visible tiles");
+        model.snapshot.as_mut().unwrap().failure = "failed".into();
+        for drawable in [false, true] {
+            for busy in [false, true] {
+                model.snapshot.as_mut().unwrap().busy = busy;
+                for state in [super::super::GalleryPresentation::Inactive, super::super::GalleryPresentation::Unavailable] {
+                    assert_eq!(model.gallery_title(drawable, state), model.presentation_title());
+                    assert!(model.gallery_title(drawable, state).contains("Explore operation failed"));
+                }
+            }
+        }
+    }
+
+    #[test]
     fn failed_runtime_and_transport_are_visible_even_if_a_stale_busy_flag_remains() {
         let mut snapshot = explore_snapshot();
         snapshot.failure = "Unavailable".into();
@@ -383,6 +432,10 @@ mod tests {
         model.snapshot.as_mut().unwrap().failurekind =
             crate::generated::ExploreFailureKind::SelectedTransportUnavailable;
         assert!(model.presentation_title().contains("select H2D"));
+        assert_eq!(
+            model.gallery_title(false, super::super::GalleryPresentation::Unavailable),
+            model.presentation_title(),
+        );
         assert_eq!(model.presentation_state(), ExplorePresentationState::Error);
     }
 

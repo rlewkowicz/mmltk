@@ -566,6 +566,26 @@ pub struct AtlasDraw {
 }
 
 impl AtlasDraw {
+    pub(super) fn ready_tiles(&self) -> impl Iterator<Item = (u32, Rectangle)> + '_ {
+        let columns = self.snapshot.viewport.columns.max(1);
+        let side = self.image.width / columns as f32;
+        self.snapshot.gallery.slots.iter().enumerate().filter_map(move |(slot, ready)| {
+            if !*ready {
+                return None;
+            }
+            let compiled = *self.snapshot.order.visibleindices.get(slot)?;
+            // Exclude card/grid edges and intersect the real visible image clip.
+            let tile = Rectangle {
+                x: self.image.x + (slot as u32 % columns) as f32 * side + side * 0.2,
+                y: self.image.y + (slot as u32 / columns) as f32 * side + side * 0.2,
+                width: side * 0.6,
+                height: side * 0.6,
+            };
+            let visible = tile.intersection(&self.clip)?;
+            (visible.width >= 2.0 && visible.height >= 2.0).then_some((compiled, visible))
+        })
+    }
+
     pub(super) fn visible_slot(&self, compiled_index: u32) -> Option<usize> {
         self.snapshot
             .order
@@ -679,16 +699,7 @@ pub(crate) fn report_atlas_draw(draw: AtlasDraw, dark: bool, scale: f32) {
 pub(super) fn sample_atlas_pixels(draw: AtlasDraw) {
     let rectangles = atlas_pixel_rectangles(&draw);
     let frame = draw.surface.frame.expect("drawn atlas publication");
-    let columns = draw.snapshot.viewport.columns.max(1);
-    let side = draw.image.width / columns as f32;
-    let cards: Vec<u32> = rectangles
-        .chunks_exact(4)
-        .map(|rect| {
-            let column = ((rect[0] + rect[2] * 0.5 - draw.image.x) / side) as usize;
-            let row = ((rect[1] + rect[3] * 0.5 - draw.image.y) / side) as usize;
-            draw.snapshot.order.visibleindices[row * columns as usize + column]
-        })
-        .collect();
+    let cards: Vec<u32> = draw.ready_tiles().map(|(compiled, _)| compiled).collect();
     let fields = format!(
         "{{{}{},\"image\":[{},{},{},{}],\"overlay_boxes\":{},\"overlay_masks\":{},\"overlay_labels\":{}}}",
         crate::presentation_surface::surface_trace_fields(draw.surface, draw.surface),
@@ -727,28 +738,9 @@ pub(super) fn sample_atlas_pixels(_draw: AtlasDraw) {}
 
 #[cfg(any(target_arch = "wasm32", test))]
 pub(super) fn atlas_pixel_rectangles(draw: &AtlasDraw) -> Vec<f32> {
-    let snapshot = &draw.snapshot;
-    let columns = snapshot.viewport.columns.max(1);
-    let side = draw.image.width / columns as f32;
-    let mut rectangles = Vec::with_capacity(snapshot.gallery.slots.len() * 4);
-    for (slot, ready) in snapshot.gallery.slots.iter().enumerate() {
-        if !*ready {
-            continue;
-        }
-        // Interior samples exclude the grid and card boundary. Intersect with
-        // the real draw clip so an offscreen tile cannot satisfy acceptance.
-        let tile = Rectangle {
-            x: draw.image.x + (slot as u32 % columns) as f32 * side + side * 0.2,
-            y: draw.image.y + (slot as u32 / columns) as f32 * side + side * 0.2,
-            width: side * 0.6,
-            height: side * 0.6,
-        };
-        if let Some(visible) = tile.intersection(&draw.clip)
-            && visible.width >= 2.0
-            && visible.height >= 2.0
-        {
-            rectangles.extend([visible.x, visible.y, visible.width, visible.height]);
-        }
+    let mut rectangles = Vec::with_capacity(draw.snapshot.gallery.slots.len() * 4);
+    for (_, visible) in draw.ready_tiles() {
+        rectangles.extend([visible.x, visible.y, visible.width, visible.height]);
     }
     rectangles
 }

@@ -81,6 +81,7 @@ struct AtlasDrawAudit final {
  void consume(const nlohmann::json& record);
 };
 struct BrowserAudit final {
+ bool validate_to_explore_pixels = false;
  AtlasDrawAudit atlas_draws;
  bool owned_atlas_seen = false;
  bool owned_atlas_current = false;
