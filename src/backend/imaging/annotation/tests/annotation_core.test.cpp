@@ -251,6 +251,41 @@ TEST_CASE("test_resolved_crop_preserves_mask_alpha", "[backend][imaging][annotat
  REQUIRE(resolved.crop_rgba[23] == 255U);
  REQUIRE(resolved.crop_rgba[35] == 255U);
 }
+void check_resolved_pixels(const AnnotationFrame& frame, const AnnotationObject& object, bool live, const std::vector<std::uint8_t>& expected,
+ const AnnotationBox& box, std::string_view rle) {
+ const auto preview = build_reticle_preview(frame, object, live);
+ const auto& resolved = require_single_resolved_object(preview);
+ assert_resolved_bbox_and_mask(resolved, box, rle);
+ CHECK(resolved.mask == expected);
+ std::vector<std::uint8_t> crop;
+ if (!rle.empty()) {
+  const auto& bgr = annotation_frame_pixels(frame);
+  for (int y = box.y1; y < box.y2; ++y) {
+   for (int x = box.x1; x < box.x2; ++x) {
+    const auto index = static_cast<std::size_t>(y) * frame.width + static_cast<std::size_t>(x);
+    crop.insert(crop.end(), {bgr[index * 3 + 2], bgr[index * 3 + 1], bgr[index * 3], static_cast<std::uint8_t>(expected[index] ? 255 : 0)});
+   }
+  }
+ }
+ CHECK(resolved.crop_width == (rle.empty() ? 0U : static_cast<std::uint32_t>(box.x2 - box.x1)));
+ CHECK(resolved.crop_height == (rle.empty() ? 0U : static_cast<std::uint32_t>(box.y2 - box.y1)));
+ CHECK(resolved.crop_rgba == crop);
+}
+TEST_CASE("Annotation resolved support keeps exact mask bounds encoding and crop bytes", "[backend][imaging][annotation]") {
+ const auto frame = make_frame();
+ const std::vector<std::uint8_t> suppressed{0, 0, 1, 0, 0, 0, 1, 0, 1, 1, 1, 0, 0, 0, 0, 0};
+ check_resolved_pixels(frame, make_reticle_box_preview_object({0, 0, 3, 3}, true), false, suppressed, {0, 0, 3, 3}, "2:1 6:1 8:3");
+ check_resolved_pixels(frame, make_reticle_box_preview_object({0, 0, 2, 2}, true, true), false,
+  {1, 1, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}, {0, 0, 2, 2}, "0:2 4:2");
+ check_resolved_pixels(frame, make_reticle_box_preview_object({0, 0, 2, 2}, true), false, std::vector<std::uint8_t>(16), {0, 0, 2, 2}, "");
+ const std::vector<std::uint8_t> edges{1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1};
+ check_resolved_pixels(frame, make_mask_object({1, 1, 3, 3}, {0, 0, 4, 4}, edges, frame.frame_id, {}), false, edges, {0, 0, 4, 4}, "0:1 15:1");
+ check_resolved_pixels(frame, make_mask_object({1, 1, 3, 3}, {0, 0, 4, 4}, std::vector<std::uint8_t>(16), frame.frame_id, {}), false,
+  std::vector<std::uint8_t>(16), {1, 1, 3, 3}, "");
+ const auto cropped = make_capture_space_frame();
+ check_resolved_pixels(cropped, make_capture_space_mask_preview_object(0, {}), true, {1, 0, 0, 0}, {0, 0, 1, 1}, "0:1");
+ check_resolved_pixels(cropped, make_capture_space_mask_preview_object(cropped.frame_id + 1, {}), true, {1, 1, 1, 1}, {0, 0, 2, 2}, "0:4");
+}
 TEST_CASE("test_prediction_mask_decode_and_bbox", "[backend][imaging][annotation]") {
  AnnotationEncodedMask encoded;
  encoded.width = 4;
@@ -325,6 +360,7 @@ TEST_CASE("test_deferred_model_mask_stays_compact_during_initial_preview_resolut
  const AnnotationMaskShape& persistent = std::get<AnnotationMaskShape>(object.shape);
  REQUIRE(persistent.mask.empty());
  REQUIRE(persistent.deferred == deferred);
+ check_resolved_pixels(cropped, object, false, {}, {0, 0, 2, 2}, "");
 }
 TEST_CASE("test_invalid_deferred_model_mask_has_deterministic_box_preview", "[backend][imaging][annotation]") {
  const AnnotationFrame cropped = make_capture_space_frame();

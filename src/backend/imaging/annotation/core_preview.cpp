@@ -264,6 +264,8 @@ AnnotationResolvedObject resolve_object(const AnnotationFrame& frame, const Anno
  if (has_dense_mask) {
   resolved.mask.assign(seed.mask.size(), 0U);
   const AnnotationBox box = normalize_annotation_box(seed.box, frame.width, frame.height);
+  int min_x = static_cast<int>(frame.width), min_y = static_cast<int>(frame.height);
+  int max_x = -1, max_y = -1;
   for (int y = box.y1; y < box.y2; ++y) {
    const std::size_t row_offset = static_cast<std::size_t>(y) * static_cast<std::size_t>(frame.width);
    for (int x = box.x1; x < box.x2; ++x) {
@@ -273,11 +275,17 @@ AnnotationResolvedObject resolve_object(const AnnotationFrame& frame, const Anno
     const AnnotationHsv hsv = annotation_bgr_to_hsv(frame_pixels[byte_offset + 0], frame_pixels[byte_offset + 1], frame_pixels[byte_offset + 2]);
     const bool sup_match = pixel_matches_range(object.sup, hsv);
     const bool nosup_match = pixel_matches_range(object.nosup, hsv);
-    if (!sup_match || nosup_match) { resolved.mask[pixel_index] = 1U; }
+    if (!sup_match || nosup_match) {
+     resolved.mask[pixel_index] = 1U;
+     min_x = std::min(min_x, x);
+     min_y = std::min(min_y, y);
+     max_x = std::max(max_x, x);
+     max_y = std::max(max_y, y);
+    }
    }
   }
-  if (const std::optional<AnnotationBox> bbox = annotation_bbox_from_mask(resolved.mask, frame.width, frame.height); bbox.has_value()) {
-   resolved.bbox = *bbox;
+  if (max_x >= min_x && max_y >= min_y) {
+   resolved.bbox = {min_x, min_y, max_x + 1, max_y + 1};
    resolved.mask_rle = encode_annotation_mask_rle(resolved.mask);
   }
  }

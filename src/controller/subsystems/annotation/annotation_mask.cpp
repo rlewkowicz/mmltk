@@ -1,5 +1,7 @@
 #include "src/controller/subsystems/annotation/detail/annotation_mask.h"
+#include "src/controller/contracts/annotation_limits.h"
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <numeric>
 #include <stdexcept>
@@ -64,14 +66,26 @@ struct Components {
   return index;
  }
 };
-Runs dilate(const Runs& runs, std::uint16_t radius, std::uint16_t width, std::uint16_t height) {
+class DiskReach final {
+public:
+ explicit DiskReach(std::uint16_t radius) : radius_(radius) { reach_.fill(-1); }
+ int At(int dy) {
+  auto& reach = reach_[static_cast<std::size_t>(std::abs(dy))];
+  if (reach < 0) reach = static_cast<int>(std::sqrt(static_cast<double>(radius_) * radius_ - dy * dy));
+  return reach;
+ }
+private:
+ std::uint16_t radius_;
+ std::array<int, c::kMaxAnnotationMaskCleanupRadius + 1> reach_;
+};
+Runs dilate(const Runs& runs, std::uint16_t radius, std::uint16_t width, std::uint16_t height, DiskReach& disk) {
  Runs result;
  for (auto run : runs) {
   const int low = std::max(0, static_cast<int>(run.row) - radius);
   const int high = std::min(static_cast<int>(height) - 1, static_cast<int>(run.row) + radius);
   for (int y = low; y <= high; ++y) {
    const int dy = y - run.row;
-   const int reach = static_cast<int>(std::sqrt(static_cast<double>(radius) * radius - dy * dy));
+   const int reach = disk.At(dy);
    result.push_back({static_cast<std::uint16_t>(y), static_cast<std::uint16_t>(std::max(0, static_cast<int>(run.first) - reach)),
     static_cast<std::uint16_t>(std::min(static_cast<int>(width) - 1, static_cast<int>(run.last) + reach))});
   }
@@ -278,9 +292,10 @@ void cleanup_mask(c::AnnotationObject& object, c::AnnotationMaskCleanup operatio
   for (std::size_t index = 0; index < empty.size(); ++index)
    if (!outside[components.root(index)]) runs.push_back(empty[index]);
  } else {
-  const auto grow = [&] { runs = dilate(runs, radius, width, height); };
+  DiskReach disk(radius);
+  const auto grow = [&] { runs = dilate(runs, radius, width, height, disk); };
   const auto shrink = [&] {
-   runs = complement(dilate(complement(runs, width, height), radius, width, height), width, height);
+   runs = complement(dilate(complement(runs, width, height), radius, width, height, disk), width, height);
    Runs interior;
    for (auto run : runs) {
     if (run.row < radius || static_cast<unsigned>(run.row) + radius >= height || width <= 2U * radius) continue;
