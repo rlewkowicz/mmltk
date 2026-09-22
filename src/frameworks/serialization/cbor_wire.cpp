@@ -703,6 +703,12 @@ std::expected<void, EncodeError> Writer::head(const std::uint8_t major, const st
  }
  return {};
 }
+std::expected<void, EncodeError> Writer::write_text_body(const std::string_view text) {
+ if (!mmltk::common::types::valid_utf8(text)) { return std::unexpected(encode_error(ErrorCode::InvalidUtf8)); }
+ auto result = head(3U, text.size());
+ if (!result) { return result; }
+ return append(std::as_bytes(std::span<const char>{text.data(), text.size()}));
+}
 std::expected<void, EncodeError> Writer::write_item(const Value& value, const std::size_t depth) {
  auto begun = begin_encode_item(depth, items_, limits_);
  if (!begun) return begun;
@@ -729,10 +735,7 @@ std::expected<void, EncodeError> Writer::write_item(const Value& value, const st
     }
     return {};
    } else if constexpr (std::is_same_v<T, std::string>) {
-    if (!mmltk::common::types::valid_utf8(item)) { return std::unexpected(encode_error(ErrorCode::InvalidUtf8)); }
-    auto result = head(3U, item.size());
-    if (!result) { return result; }
-    return append(std::as_bytes(std::span<const char>{item.data(), item.size()}));
+    return write_text_body(item);
    } else if constexpr (std::is_same_v<T, ByteBuffer>) {
     auto result = head(2U, item.size());
     if (!result) { return result; }
@@ -753,7 +756,9 @@ std::expected<void, EncodeError> Writer::write_item(const Value& value, const st
     auto result = head(5U, item.size());
     if (!result) { return result; }
     return encode_each(item, [this, depth](const auto& entry) {
-     auto encoded = write_item(Value(entry.first), depth + 1U);
+     auto encoded = begin_encode_item(depth + 1U, items_, limits_);
+     if (!encoded) return encoded;
+     encoded = write_text_body(entry.first);
      if (!encoded) return encoded;
      return write_item(entry.second, depth + 1U);
     });

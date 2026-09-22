@@ -7,7 +7,6 @@
 #include <charconv>
 #include <memory>
 #include <stdexcept>
-#include <vector>
 namespace mmltk::common::io {
 namespace {
 constexpr std::size_t kHashReadBytes = std::size_t{16U} * 1024U * 1024U;
@@ -69,13 +68,14 @@ std::optional<FileDigests> try_file_digests(const std::filesystem::path& path, b
  result.snapshot = snapshot(file.get());
  Sha256Hasher sha;
  auto md5 = include_md5 ? make_digest_context(EVP_md5()) : DigestContext{};
- std::vector<std::uint8_t> buffer(std::min<std::uint64_t>(kHashReadBytes, std::max<std::uint64_t>(result.snapshot.bytes, 1U)));
+ const auto capacity = std::min<std::uint64_t>(kHashReadBytes, std::max<std::uint64_t>(result.snapshot.bytes, 1U));
+ auto buffer = std::make_unique_for_overwrite<std::uint8_t[]>(capacity);
  for (std::uint64_t offset = 0; offset < result.snapshot.bytes;) {
   if (cancelled()) return std::nullopt;
-  const auto count = std::min<std::uint64_t>(buffer.size(), result.snapshot.bytes - offset);
-  file.pread_all(buffer.data(), count, offset);
-  sha.Update(std::span(buffer.data(), count));
-  if (md5) update_digest(md5.get(), buffer.data(), count);
+  const auto count = std::min<std::uint64_t>(capacity, result.snapshot.bytes - offset);
+  file.pread_all(buffer.get(), count, offset);
+  sha.Update(std::span(buffer.get(), count));
+  if (md5) update_digest(md5.get(), buffer.get(), count);
   offset += count;
  }
  if (cancelled()) return std::nullopt;

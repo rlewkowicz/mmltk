@@ -280,6 +280,7 @@ private:
  [[nodiscard]] std::expected<void, EncodeError> head(std::uint8_t major, std::uint64_t argument);
  [[nodiscard]] std::expected<void, EncodeError> put(std::byte value);
  [[nodiscard]] std::expected<void, EncodeError> append_raw_item(ByteSegments item, std::size_t depth);
+ [[nodiscard]] std::expected<void, EncodeError> write_text_body(std::string_view text);
  [[nodiscard]] std::expected<void, EncodeError> write_item(const Value& value, std::size_t depth);
  ByteBuffer* dynamic_destination_ = nullptr;
  std::span<std::byte> fixed_destination_{};

@@ -10,9 +10,11 @@ module;
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <functional>
 #include <limits>
 #include <mutex>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <unordered_map>
 #include <utility>
@@ -65,8 +67,13 @@ struct AggregateMetric {
  std::uint64_t value_min = std::numeric_limits<std::uint64_t>::max();
  std::uint64_t value_max = 0;
 };
+struct MetricNameHash {
+ using is_transparent = void;
+ std::size_t operator()(const std::string_view name) const noexcept { return std::hash<std::string_view>{}(name); }
+};
+using MetricMap = std::unordered_map<std::string, Metric, MetricNameHash, std::equal_to<>>;
 bool has_metric_data(const Metric& metric) { return metric.calls > 0 || metric.has_value; }
-std::vector<std::pair<std::string, Metric>> sorted_metric_items(const std::unordered_map<std::string, Metric>& metrics) {
+std::vector<std::pair<std::string, Metric>> sorted_metric_items(const MetricMap& metrics) {
  std::vector<std::pair<std::string, Metric>> items;
  items.reserve(metrics.size());
  for (const auto& entry : metrics) {
@@ -164,7 +171,7 @@ public:
  }
  void record_duration(const char* name, std::uint64_t elapsed_ns) {
   std::lock_guard<std::mutex> lock(mtx_);
-  Metric& metric = metrics_[name];
+  Metric& metric = metric_for(name);
   ++metric.calls;
   metric.total_ns += elapsed_ns;
   metric.min_ns = std::min(metric.min_ns, elapsed_ns);
@@ -172,7 +179,7 @@ public:
  }
  void add_value(const char* name, std::uint64_t delta) {
   std::lock_guard<std::mutex> lock(mtx_);
-  Metric& metric = metrics_[name];
+  Metric& metric = metric_for(name);
   metric.has_value = true;
   ++metric.value_count;
   metric.value_sum += delta;
@@ -260,10 +267,15 @@ public:
  }
 
 private:
+ Metric& metric_for(const std::string_view name) {
+  const auto found = metrics_.find(name);
+  if (found != metrics_.end()) return found->second;
+  return metrics_.try_emplace(std::string{name}).first->second;
+ }
  ProfileRegistry() { std::atexit(&ProfileRegistry::flush_atexit); }
  static void flush_atexit() { ProfileRegistry::instance().flush(); }
  std::mutex mtx_;
- std::unordered_map<std::string, Metric> metrics_;
+ MetricMap metrics_;
  std::vector<RunSnapshot> runs_;
  std::string process_label_;
  std::string run_label_ = "unnamed";

@@ -1,6 +1,12 @@
 #pragma once
+#include <bit>
 #include <cstddef>
+#include <cstdint>
 #include <string_view>
+#include <type_traits>
+#if defined(__AVX2__)
+#include <immintrin.h>
+#endif
 namespace mmltk::common::types {
 // Recognize one complete scalar without imposing replacement or text policy.
 [[nodiscard]] constexpr std::size_t utf8_prefix_length(const std::string_view text) noexcept {
@@ -24,6 +30,17 @@ namespace mmltk::common::types {
 }
 [[nodiscard]] constexpr bool valid_utf8(std::string_view text) noexcept {
  while (!text.empty()) {
+#if defined(__AVX2__)
+  if (!std::is_constant_evaluated() && text.size() >= 32U && static_cast<unsigned char>(text.front()) < 0x80U) {
+   const auto bytes = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(text.data()));
+   const auto high_bits = static_cast<std::uint32_t>(_mm256_movemask_epi8(bytes));
+   if (high_bits == 0U) {
+    text.remove_prefix(32U);
+    continue;
+   }
+   text.remove_prefix(static_cast<std::size_t>(std::countr_zero(high_bits)));
+  }
+#endif
   const auto length = utf8_prefix_length(text);
   if (length == 0U) return false;
   text.remove_prefix(length);

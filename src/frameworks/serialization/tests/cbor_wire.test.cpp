@@ -5,6 +5,10 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <memory>
+#include <sys/mman.h>
+#include <unistd.h>
+#include "src/common/types/utf8.h"
 #include <optional>
 #include <span>
 #include <string>
@@ -913,6 +917,67 @@ TEST_CASE("scalar allocation admission reports exact kind size path and cursor",
   }
  }
 }
+constexpr bool scalar_valid_utf8(std::string_view text) noexcept {
+ while (!text.empty()) {
+  const auto length = mmltk::common::types::utf8_prefix_length(text);
+  if (length == 0U) return false;
+  text.remove_prefix(length);
+ }
+ return true;
+}
+static_assert(mmltk::common::types::valid_utf8("01234567890123456789012345678901\xc2\x80"));
+static_assert(mmltk::common::types::valid_utf8(std::string_view{"a\0b", 3U}));
+static_assert(!mmltk::common::types::valid_utf8("01234567890123456789012345678901\xed\xa0\x80"));
+TEST_CASE("UTF8 block boundaries agree with scalar recognition", "[frameworks][serialization]") {
+ const auto compare = [](const std::string_view scalar) {
+  for (std::size_t prefix = 0U; prefix <= 65U; ++prefix) {
+   for (std::size_t alignment = 0U; alignment < 32U; ++alignment) {
+    std::string storage(alignment + prefix, 'a');
+    storage += scalar;
+    storage.append(65U, '\0');
+    const auto text = std::string_view{storage}.substr(alignment);
+    CHECK(mmltk::common::types::valid_utf8(text) == scalar_valid_utf8(text));
+    // Every truncation also exercises scalars split at the end of the input.
+    for (std::size_t bytes = 0U; bytes <= scalar.size(); ++bytes) {
+     const auto tail = text.substr(0U, prefix + bytes);
+     CHECK(mmltk::common::types::valid_utf8(tail) == scalar_valid_utf8(tail));
+    }
+   }
+  }
+ };
+ for (const std::string_view scalar : {std::string_view{}, std::string_view{"a\0b", 3U}, std::string_view{"\x7f"}, std::string_view{"\xc2\x80"},
+       std::string_view{"\xdf\xbf"}, std::string_view{"\xe0\xa0\x80"}, std::string_view{"\xed\x9f\xbf"}, std::string_view{"\xef\xbf\xbf"},
+       std::string_view{"\xf0\x90\x80\x80"}, std::string_view{"\xf4\x8f\xbf\xbf"}}) compare(scalar);
+ for (const auto scalar : mmltk::testsupport::kMalformedUtf8) compare(scalar);
+ std::string dense;
+ for (std::size_t count = 0U; count < 64U; ++count) dense += "\xf0\x90\x80\x80";
+ CHECK(mmltk::common::types::valid_utf8(dense));
+}
+TEST_CASE("UTF8 validation stays inside a protected page tail", "[frameworks][serialization]") {
+ const auto page_size = ::sysconf(_SC_PAGESIZE);
+ REQUIRE(page_size >= 128);
+ const auto bytes = static_cast<std::size_t>(page_size);
+ void* mapping = ::mmap(nullptr, bytes * 2U, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+ REQUIRE(mapping != MAP_FAILED);
+ const auto release = [bytes](void* address) { ::munmap(address, bytes * 2U); };
+ const std::unique_ptr<void, decltype(release)> owner(mapping, release);
+ auto* end = static_cast<char*>(mapping) + bytes;
+ REQUIRE(::mprotect(end, bytes, PROT_NONE) == 0);
+ for (std::size_t length = 0U; length <= 97U; ++length) {
+  auto* begin = end - length;
+  std::fill(begin, end, '\0');
+  CHECK(mmltk::common::types::valid_utf8({begin, length}));
+  if (length >= 4U) {
+   const std::string_view scalar{"\xf4\x8f\xbf\xbf"};
+   std::copy(scalar.begin(), scalar.end(), end - 4U);
+   CHECK(mmltk::common::types::valid_utf8({begin, length}));
+  }
+  if (length != 0U) {
+   end[-1] = static_cast<char>(0xc2);
+   CHECK_FALSE(mmltk::common::types::valid_utf8({begin, length}));
+  }
+ }
+}
 TEST_CASE("UTF8 scalar limits preserve literal text across every segment split", "[frameworks][serialization]") {
  for (const std::string_view text : {
        std::string_view{},
@@ -1235,6 +1300,65 @@ TEST_CASE("direct_writer_failures_restore_reusable_destination_state", "[framewo
  REQUIRE(bounded_writer.write(wire::Value(std::uint64_t{2U})).has_value());
  REQUIRE(!bounded_writer.write(wire::Value(std::uint64_t{3U})).has_value());
  REQUIRE(bounded_items.size() == 2U);
+}
+TEST_CASE("CBOR borrowed map text preserves bytes and admission", "[frameworks][serialization]") {
+ std::string key(63U, 'k');
+ key += std::string_view{"\0\xc2\x80", 3U};
+ const wire::Value value(wire::Value::Object{{key, wire::Value(wire::Value::Object{{"", wire::Value(std::string{"text"})}})}});
+ wire::ByteBuffer expected{std::byte{0xa1}, std::byte{0x78}, std::byte{66}};
+ for (const unsigned char byte : key) expected.push_back(std::byte{byte});
+ const std::array suffix{std::byte{0xa1}, std::byte{0x60}, std::byte{0x64}, std::byte{'t'}, std::byte{'e'}, std::byte{'x'}, std::byte{'t'}};
+ expected.insert(expected.end(), suffix.begin(), suffix.end());
+ const auto limits = test_limits(expected.size(), 5U, 2U);
+ const auto measured = wire::CountingEncoder(limits).measure(value);
+ REQUIRE(measured);
+ CHECK(*measured == expected.size());
+ wire::ByteBuffer encoded;
+ REQUIRE(wire::encode(value, encoded, limits));
+ CHECK(encoded == expected);
+ for (std::size_t split = 0U; split <= encoded.size(); ++split) {
+  const auto decoded = wire::decode({std::span(encoded).first(split), std::span(encoded).subspan(split)}, limits);
+  REQUIRE(decoded);
+  wire::ByteBuffer roundtrip;
+  REQUIRE(wire::encode(*decoded, roundtrip, limits));
+  CHECK(roundtrip == expected);
+ }
+ for (std::size_t capacity = 0U; capacity <= expected.size(); ++capacity) {
+  wire::ByteBuffer fixed(capacity, std::byte{0xaa});
+  const auto result = wire::encode(value, std::span{fixed}, limits);
+  if (capacity == expected.size()) {
+   REQUIRE(result);
+   CHECK(fixed == expected);
+  } else {
+   REQUIRE_FALSE(result);
+   CHECK(result.error().code == wire::ErrorCode::LimitExceeded);
+   CHECK(std::ranges::all_of(fixed, [](std::byte byte) { return byte == std::byte{0xaa}; }));
+  }
+ }
+ const auto reject = [](const wire::Value& rejected, wire::Limits bounds, const wire::ErrorCode code) {
+  const auto count = wire::CountingEncoder(bounds).measure(rejected);
+  REQUIRE_FALSE(count);
+  CHECK(count.error().code == code);
+  wire::ByteBuffer destination;
+  wire::Writer writer(destination, bounds);
+  const auto result = writer.write(rejected);
+  REQUIRE_FALSE(result);
+  CHECK(result.error().code == code);
+  CHECK(destination.empty());
+  REQUIRE(writer.write(wire::Value{}));
+  CHECK(destination == wire::ByteBuffer{std::byte{0xf6}});
+ };
+ reject(value, test_limits(expected.size() - 1U, 5U, 2U), wire::ErrorCode::LimitExceeded);
+ reject(value, test_limits(expected.size(), 4U, 2U), wire::ErrorCode::LimitExceeded);
+ reject(value, test_limits(expected.size(), 5U, 1U), wire::ErrorCode::DepthExceeded);
+ for (const auto malformed : mmltk::testsupport::kMalformedUtf8) {
+  const wire::Value invalid(wire::Value::Object{{std::string{malformed}, wire::Value{}}});
+  reject(invalid, test_limits(128U, 3U, 1U), wire::ErrorCode::InvalidUtf8);
+  reject(invalid, test_limits(128U, 3U, 0U), wire::ErrorCode::DepthExceeded);
+  reject(invalid, test_limits(128U, 2U, 1U), wire::ErrorCode::LimitExceeded);
+  const wire::Value duplicate(wire::Value::Object{{std::string{malformed}, wire::Value{}}, {std::string{malformed}, wire::Value{}}});
+  reject(duplicate, test_limits(128U, 1U, 0U), wire::ErrorCode::DuplicateKey);
+ }
 }
 TEST_CASE("preserves_signed_integer_boundaries_and_rejects_unrepresentable_negatives", "[frameworks][serialization]") {
  wire::ByteBuffer encoded_minimum;
