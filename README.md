@@ -68,8 +68,11 @@ metrics, output files, and continuation. Current native checkpoints use version
 and old output-directory history are unsupported. Upstream weights keep their
 own supported input routes. Compiled datasets use format 9; recompile older
 bins. Dataset compilation defaults to Stretch, with Letterbox available
-explicitly. The shared viewer's Original option restores source aspect from
-compiled pixels; it does not recover source resolution.
+explicitly. Explore thumbnails preserve source proportions in padded cells.
+Every Upscale method prepares stretched compiled input at source aspect first.
+The shared viewer's Original option changes how retained pixels are displayed;
+it does not recover source resolution. See the
+[viewer guide](docs/gui-interaction.md#original-view-and-annotation-import).
 
 The Dataset card's benchmark override offers Coco custom and Coconut.
 Coconut compiles the full COCONut training recipe with a choice of validation

@@ -26,17 +26,18 @@
   the retained training dashboard,
   fixed Validation metrics/atlas, the shared image viewer and primary actions,
   retained numeric editing and captions, shared immediate mouse input, native
-  command settlement, Annotation content/damage, retained Explore measurements,
-  paired image geometry, Original aspect restoration, upscaling the selected
-  source, importing displayed images, direct/copy acquisition, retained redraws,
-  FPS, and resource lifetime.
+  command settlement, Annotation content/damage, retained Explore measurements
+  and gallery recovery, paired image geometry, the Original display choice,
+  upscaling the selected source, importing displayed crop/aspect, direct/copy
+  acquisition, retained redraws, FPS, and resource lifetime.
 
 ## Data and backend systems
 
 - [Datasets and compilation](datasets.md): source annotations and provenance,
   format 9 and recompilation, Stretch/Letterbox geometry, optional perceptual
   downscaling, quantized planar preparation, local batch capacity and leases,
-  and Explore thumbnail/atlas retention through viewport and augmentation changes.
+  source proportions in Explore tiles, and atlas retention through viewport and
+  augmentation changes.
 - [Built-in benchmark datasets](benchmark-datasets.md): Coco custom and COCONut
   membership, three validation choices, native masks and physical provenance,
   shared persistent cache/repair, stock annotation reuse, progress units,
@@ -44,7 +45,8 @@
 - [GPU execution and image loading](gpu-execution.md): device/NUMA placement,
   H2D and GDRCopy, reusable checkpoint/export readbacks, Vulkan allocation and
   CUDA import, independent display/compute selection and damage transfers,
-  Upscale warming, provider capture, and capability inspection.
+  Upscale input preparation and warming, provider capture, and capability
+  inspection.
 
 ## Engineering, validation, and operations
 

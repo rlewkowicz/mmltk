@@ -206,6 +206,50 @@ The [standalone CUDA/Vulkan diagnostic](validation.md#standalone-cudavulkan-diag
 exercises allocation, descriptor, timeline, pixel, and exporter-exit behavior
 without a browser. It complements packaged Wayland acceptance.
 
+## Upscale input preparation
+
+The [Upscale controller](../src/controller/subsystems/upscale/upscale_system.cpp)
+copies the selected native frame and its clean/semantic planes into receiver-owned
+storage before releasing the source borrow. All three methods share the same
+preparation policy, defined by `restored_upscale_input_extent`:
+
+| Native input facts | Prepared geometry |
+| --- | --- |
+| Explicit Stretch provenance, known source dimensions, and no partial crop | Retain matching aspect; otherwise expand one axis with ceiling division to enclose the native extent at source aspect, shrinking neither |
+| Letterbox, including rounded content that fills the canvas | Retain the native canvas, content rectangle, and padding |
+| Missing resize provenance or source dimensions, or a separate partial content rectangle | Retain native geometry |
+
+The method's four-times scale applies to this prepared extent. For example,
+432×432 Stretch input from a 16:9 source prepares 768×432 pixels, then produces
+3072×1728. The source image's original resolution is not allocated. Checked
+extent/content arithmetic and the device's output bounds admit the complete
+result before work begins.
+
+`UpscaleAlgorithm` owns the reusable prepared clean buffer on its execution
+context. A changed extent uses the existing GPU bilinear raster operation;
+unchanged geometry uses the copied input directly. Reuse follows clean-content
+identity, source extent, resize provenance, and prepared extent. Method switches
+can share preparation; semantic-only revisions preserve compatible clean work.
+Semantic planes scale with nearest sampling, and continuous document geometry
+projects from the native input to the actual output. The method's ordinary
+completion and cancellation boundaries retain all preparation and consumer
+custody.
+
+Canonical [UpscaleImageMetadata](../src/controller/subsystems/upscale/upscale_system.h)
+keeps the geometries distinct:
+
+| Field | Meaning |
+| --- | --- |
+| `input` | Exact native source frame, including compiled content, source extent, and resize provenance |
+| `prepared_extent`, `prepared_content` | Geometry submitted to the selected method |
+| `frame` | Completed output, at four times the prepared extent/content, with the original source extent retained |
+
+Reflection projects these facts and checked scaling into Rust. The
+[graphics metadata decoder](../src/frontend/iced/src/presentation_surface/metadata.rs)
+checks the native source pairing, prepared bounds, and scaled output together.
+The [Original display and Annotation import rules](gui-interaction.md#original-view-and-annotation-import)
+use the paired geometry independently of processing.
+
 ## Upscale warm execution
 
 The [Upscale controller](../src/controller/subsystems/upscale/upscale_system.cpp)

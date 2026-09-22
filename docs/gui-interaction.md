@@ -184,15 +184,19 @@ Explore keeps its existing palette and single caption layer.
 ## Original view and annotation import
 
 Explore's **Original content** and Validation's **Original** controls restore
-the source aspect ratio using the compiled pixels. Stretch uses the full
-canvas with inverse anisotropic display scaling. Letterbox crops the stored
-content rectangle before restoring source aspect. Turning Original off shows
-the actual model canvas, including padding. No source image file is opened and
-no discarded source-resolution detail is recovered.
+the source aspect ratio using completed pixels. With Original on, Stretch uses
+the full content and Letterbox crops the stored padding; the source extent
+determines the displayed proportions. With Original off, the whole product is
+displayed at the native input canvas's aspect, including any padding. A restored
+Upscale product can therefore appear at the compiled aspect while reusing its
+restored pixels. Missing source dimensions fall back to the sampled pixel
+extent. No source image file is opened and no discarded source-resolution detail
+is recovered.
 
 The exact displayed `VisualFrame` carries canvas extent, content rectangle,
-and source extent through the graphics metadata. The Iced
-[surface geometry](../src/frontend/iced/src/presentation_surface/geometry.rs)
+source extent, and optional compiled resize provenance through the graphics
+metadata. Upscale keeps the native input separate from prepared and output
+geometry. The Iced [surface geometry](../src/frontend/iced/src/presentation_surface/geometry.rs)
 keeps pixel sampling and displayed aspect distinct while applying one coherent
 mapping to boxes, masks, labels, fit, pan, zoom, clipping, and inverse input
 coordinates. This view choice reuses completed pixels; toggling Original does
@@ -201,17 +205,21 @@ not launch another upscale or alter its processing identity.
 Basic, Fast, and Neural Upscale use the currently selected native detail source
 and its document facts. A previous image can remain visible while navigation
 settles, but it does not become the source of a new explicit Upscale request.
-The derived product carries the scaled canvas/content geometry and unchanged
-source extent. Checked geometry scaling and the native output-scale constant
-are [generated from native declarations](architecture.md#nativerust-boundary).
-The same Original preference then applies to the derived image.
+Every method uses the same
+[native input preparation](gpu-execution.md#upscale-input-preparation), restoring
+known Stretch input before processing and retaining Letterbox geometry.
+Preparation is independent of Original. The derived product retains its native
+source identity and source extent alongside the prepared and scaled geometry;
+the same Original preference applies to the result.
 
-**Open in Annotation** instead captures the exact displayed image and its
-applied Original choice at dispatch, including a displayed derived result.
-The receiving owner completes its pixel copy before releasing the borrow and
-materializes continuous annotation coordinates through the same crop and aspect
-transform. The materialized aspect fits within the available compiled or
-derived content extent; it does not allocate the original source resolution.
+**Open in Annotation** captures the exact drawn image, crop, and target extent
+at dispatch, including a displayed derived result. The reflected `AnnotationOpen`
+request carries those three facts; it does not ask the receiver to reinterpret
+a later Original setting. The target uses the displayed aspect fitted within
+the sampled content's pixel extent, rounded to integer dimensions. Import uses
+that image region independently of screen zoom or window clipping. The receiving
+owner completes its pixel copy before releasing the borrow and materializes
+continuous annotation coordinates through the same crop and aspect transform.
 Later navigation or a preference change cannot alter that accepted import.
 
 Masks retain their own support bounds independently of boxes. Import can
@@ -372,7 +380,7 @@ application intents or own UI behavior.
 
 The WebSocket carries controls and logical UI facts. The independent FD graphics
 channel carries completed images and immutable `WorkspaceImageMetadata`:
-schema identity, frame dimensions/content region/source extent, and the
+schema identity, [paired frame geometry](#original-view-and-annotation-import), and the
 corresponding native product projection, including atlas layout and labels where
 applicable.
 Firefox transports this payload opaquely. The
@@ -631,9 +639,24 @@ introduces no intentional frame delay, but makes no hard one-frame guarantee.
 ## Explore gallery and displayed geometry
 
 [Explore residency](datasets.md#explore-thumbnails-and-atlas-residency) owns the
-cache, priority, and physical atlas rules. The GUI includes every partially
-visible row in demand. Its measured viewport may alternate between N and N+1
-rows while card raster extent remains unchanged.
+cache, tile geometry, priority, and physical atlas rules. The GUI includes every
+partially visible row in demand. Its measured viewport may alternate between
+N and N+1 rows while card raster extent remains unchanged.
+
+Native dataset readiness and a drawable atlas are independent. While a ready,
+nonempty gallery has no paired image and no active native work or failure, the
+GUI shows **Restoring gallery**. Logical match counts and the retained scroll
+row remain available. The gallery keeps its GPU/input surface mounted beneath
+the status overlay, so graphics binding can establish the first or replacement
+image without waiting for an already displayed atlas.
+
+[Presentation routing](../src/frontend/iced/src/app/presentation.rs) renews
+selection when a ready gallery has neither a drawable atlas nor an active
+handoff. A selection reply does not complete that graphics handoff. Capacity
+pressure waits for actual reader settlement and availability; rejected offers
+are consumed once, and delayed duplicate receipts cannot restart recovery or
+replace a newer valid image. Recovery uses retained native products and the
+existing graphics notifications without reopening the dataset or polling.
 
 The retained gallery sensor continues measuring beneath Detail. The component
 records the latest size, native capacity, column count, scroll row, and row

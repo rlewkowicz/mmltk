@@ -262,11 +262,14 @@ schema materialization derives native readers and
 [generated Rust observations](../src/controller/browser/application_visual_projection_emitter.h)
 from the same facts.
 That emitter also derives checked scaling for canonical visual extents/regions
-and the native Upscale output-scale constant. Frame metadata carries canvas
-extent, content rectangle, and source extent together. Rust owns the Original
-view preference and uses those facts for its sampling and display transform;
-it does not repeat native geometry inventories or infer a processing request
-from the currently retained fallback image.
+and the native Upscale output-scale constant.
+[Canonical visual frames](../src/controller/presentation/visual_system_types.h)
+keep geometry and optional compiled resize provenance paired with each product.
+Upscale separately projects native input, prepared input, and output
+geometry; [input preparation](gpu-execution.md#upscale-input-preparation) owns
+their meaning. Rust owns the Original view preference and uses those facts for
+its sampling and display transform; it does not repeat native geometry inventories
+or infer a processing request from the currently retained fallback image.
 
 The [application binding generator](../src/controller/browser/application_binding_generator.cpp)
 also derives typed scalar selectors and inventories from canonical training
@@ -346,8 +349,8 @@ Train's charts are ordinary Iced drawing and use no native image workspace.
 continuous annotation coordinates and mask support independently of box
 bounds. Its materializer projects spatial members from the canonical
 annotation declarations and rasterizes masks for the receiving document.
-Annotation captures an exact displayed frame and view choice before its
-receiver copy; Upscale requests use the current selected source. The
+Annotation captures the exact displayed frame, crop, and target extent before its
+receiver copy; Upscale requests use the current selected native source. The
 [viewer reference](gui-interaction.md#original-view-and-annotation-import)
 owns the Original/canvas, aspect-restoration, and import behavior.
 
@@ -367,8 +370,10 @@ Explore's
 [GalleryThumbnailCache](../src/controller/subsystems/explore/detail/gallery_thumbnail_cache.h),
 [GalleryStream](../src/controller/subsystems/explore/detail/gallery_stream.h),
 and [GalleryAtlas](../src/controller/subsystems/explore/detail/gallery_atlas.h)
-own retained thumbnail identity, disk/GPU admission, and allocation-local cell
-meaning respectively. [Dataset loading and Explore residency](datasets.md#explore-thumbnails-and-atlas-residency)
+own retained thumbnail identity, stream coordination, and allocation-local cell
+meaning respectively. `GalleryReadScheduler` owns disk/GPU admission and prepares
+each card's stored-content crop and rectangle fitted to source proportions.
+[Dataset loading and Explore residency](datasets.md#explore-thumbnails-and-atlas-residency)
 explains their handoffs.
 
 The Rust browser-image boundary is

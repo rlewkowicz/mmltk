@@ -117,7 +117,10 @@ reconstruct the content rectangle exactly.
 
 The [Original viewer](gui-interaction.md#original-view-and-annotation-import)
 restores source aspect from these compiled pixels and geometry; it does not
-recover source resolution.
+recover source resolution. Explore and retained Validation detail frames carry
+the stored resize mode as explicit provenance, alongside source and content
+extents. [Upscale preparation](gpu-execution.md#upscale-input-preparation) uses
+that provenance independently of the viewer preference.
 
 Both compilers use `RgbImageResizer::resize_to_planar` to project packed RGB8
 into the compiled planar float canvas. Perceptual shrinking writes directly
@@ -555,6 +558,19 @@ extent. Filtered position and viewport row count are demand, not pixel identity.
 Overlay validity is separate: box/mask/class changes reuse clean tiles and
 retained annotation meaning; label visibility remains presentation state.
 Per-image augmentation and donor choices remain independent of batch order.
+
+Each square card contains an image rectangle fitted to that image's original
+width and height, with the shared atlas padding around it. The
+[read scheduler](../src/controller/subsystems/explore/gallery_read_scheduler.cpp)
+derives a separate source crop from the stored resize mode: the full canvas for
+Stretch, or the stored content rectangle for Letterbox. Missing original
+dimensions use the compiled canvas and its aspect. The existing
+[GPU tile pass](../src/backend/imaging/explore/explore_render_core.cu) samples
+that crop directly into the contained rectangle; it does not create an
+intermediate aspect-restored image. RGB sampling clamps to the crop, and boxes
+and masks use the same mapping. Native caption projection uses that card geometry
+before Iced draws the text. Augmentation still produces pixels and annotation
+meaning in the compiled canvas before this presentation transform.
 
 Enabling augmentation, rerolling its seed, or disabling it keeps completed
 tiles when dataset identity, the retained compiled-file incarnation, and card

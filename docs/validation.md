@@ -541,8 +541,9 @@ still apply.
 The `browser-app` cases additionally cover generated resize settings, paired
 source/aspect geometry and inverse input mapping, Original changes without
 restarting Upscale, and rapid-navigation requests using the current selected
-source while Annotation import retains the exact displayed image/view.
-They verify shared paired caption content and referenced-category preparation.
+source while Annotation import retains the exact drawn source, crop, and target
+extent. They verify shared paired caption content and referenced-category
+preparation.
 The iced_plot shader case compares every RGBA pixel against the prior three-pass
 sequence for fractional and opaque alpha, with separate fixed opaque-color,
 painter-order, and clip-guard checks. Plot cases also cover caption reconciliation

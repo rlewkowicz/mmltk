@@ -217,12 +217,16 @@ Derived results match the current source and requested processing parameters.
 Iced owns fit, crop, pan, zoom, clipping, sampling, and redraws of completed
 workspace images. Native product dimensions remain independent of window size.
 Images and their attached metadata use the same view geometry.
-Original view restores source aspect from the compiled content and its paired
-source dimensions. It retains the available pixel detail; the model-canvas view
-shows the compiled geometry and any padding. Annotation import materializes the
-displayed content and its annotation meaning through the same transform.
-Upscale follows the currently selected native source; its derived pixels and
-metadata support the same independent view choice.
+Original view displays source proportions using completed pixels and their
+paired source geometry. The model-canvas view uses the native input's proportions
+and includes its padding. Both choices reuse completed processing.
+Upscale follows the currently selected native source and restores explicitly
+stretched compiled content to source aspect before processing, without shrinking
+either input axis. Letterbox input retains its proportional content and padding;
+unknown source geometry preserves native dimensions. Native input geometry remains
+distinct from prepared and derived geometry. Annotation import captures the
+displayed crop and proportions and materializes pixels and annotation meaning
+through that same transform.
 Same-image revisions retain viewer identity and transforms; a new image resets
 them. Stable widget identities preserve interaction state through ordinary
 updates.
@@ -384,9 +388,12 @@ its useful caches while external display storage is occupied.
 
 Explore atlas loading follows the visible viewport and scroll direction: visible
 rows first, then leading rows, then prior rows. Cached rows entering the viewport
-populate its first result before additional content is fetched. Viewport changes,
-newly loaded content, and actual product changes update the content used by shared
-incremental rendering. All visual producers use that autonomous rendering path.
+populate its first result before additional content is fetched. Each tile shows
+source proportions within a padded cell. Gallery restoration preserves logical
+demand and republishes retained products through graphics availability.
+Viewport changes, newly loaded content, and actual product changes update the
+content used by shared incremental rendering. All visual producers use that
+autonomous rendering path.
 Browser redraws follow the visible window's graphics cadence and can reuse unchanged
 completed pixels.
 The optional workspace FPS display counts actual browser queue submissions
