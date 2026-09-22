@@ -1,4 +1,5 @@
 #include <ATen/cuda/CUDAContext.h>
+#include <cuda_runtime_api.h>
 #include <limits>
 #include "detail/mask_pack_cuda.h"
 import mmltk.backend.imaging.raster;
@@ -29,7 +30,10 @@ void pack_bool_masks_cuda_into(const torch::Tensor& masks, torch::Tensor& packed
  work.mask_count = mask_count;
  work.pixels_per_mask = pixels_per_mask;
  work.bytes_per_mask = bytes_per_mask;
- work.stream = at::cuda::getCurrentCUDAStream().stream();
+ const auto stream = at::cuda::getCurrentCUDAStream().stream();
+ // Torch names the legacy default stream with a null handle; raster requires
+ // an explicit stream so an absent native execution dependency stays invalid.
+ work.stream = stream == nullptr ? cudaStreamLegacy : stream;
  const cudaError_t status = static_cast<cudaError_t>(mmltk::backend::imaging::raster::pack_bool_masks(work));
  TORCH_CHECK(status == cudaSuccess, "pack_bool_masks_cuda_into raster launch failed: ", cudaGetErrorString(status));
 }

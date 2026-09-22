@@ -498,7 +498,12 @@ TEST_CASE("full HD prediction materializes masks only for threshold survivors", 
  write_prediction_model(root / "model.onnx", 300);
  REQUIRE(cudaSetDevice(0) == cudaSuccess);
  const mmltk::testsupport::ScopedTestStream stream_owner;
- const auto stream = stream_owner.get();
+ auto selected_stream = c10::cuda::getDefaultCUDAStream(0);
+ SECTION("explicit default stream") { REQUIRE(selected_stream.stream() == nullptr); }
+ SECTION("nonblocking stream") { selected_stream = c10::cuda::getStreamFromExternal(stream_owner.get(), 0); }
+ const c10::cuda::CUDAStreamGuard stream_guard(selected_stream);
+ const auto stream = selected_stream.stream();
+ REQUIRE(c10::cuda::getCurrentCUDAStream().stream() == stream);
  rfdetr::PredictRequest request;
  request.source_kind = rfdetr::PredictSourceKind::ImageFiles;
  request.image_inputs = {{image, "full HD", 42}};
@@ -512,6 +517,8 @@ TEST_CASE("full HD prediction materializes masks only for threshold survivors", 
  rfdetr::PredictionSession session;
  const auto result = session.RunAndWrite(request, {reinterpret_cast<std::uintptr_t>(stream), true}, {.completed = [](const auto& record, auto pixels, const auto& annotations) {
   REQUIRE(record.detections.size() == 2U);
+  CHECK(record.detections[0].class_reference == 0);
+  CHECK(record.detections[1].class_reference == 1);
   CHECK(record.detections[0].mask.area == 1920U * 1080U);
   CHECK(record.detections[1].mask.area == 0U);
   CHECK(record.detections[0].mask.runs == std::vector<std::pair<std::uint32_t, std::uint32_t>>{{0U, 1920U * 1080U}});
@@ -571,6 +578,7 @@ TEST_CASE("full HD prediction materializes masks only for threshold survivors", 
   {.completed = [](const auto& record, auto, const auto&) { CHECK(record.detections.empty()); }});
  CHECK(empty.processed_images == 2U);
  CHECK_FALSE(session.HasUnsafeCustody());
+ CHECK(session.Close() == mmltk::backend::ml::runtime::kRuntimeSuccess);
 }
 TEST_CASE("bbox-only runtime consumers do not turn mask capacity into demand", "[model][rfdetr][prediction][gpu]") {
  namespace runtime = mmltk::backend::ml::runtime;
@@ -1443,6 +1451,13 @@ TEST_CASE("prediction packed readback preserves admission and charges every reta
 }
 TEST_CASE("prediction mask packing retains exact odd-stride bytes through device and pinned reuse", "[model][rfdetr][prediction][gpu]") {
  REQUIRE(cudaSetDevice(0) == cudaSuccess);
+ const mmltk::testsupport::ScopedTestStream stream_owner;
+ auto selected_stream = c10::cuda::getDefaultCUDAStream(0);
+ SECTION("explicit default stream") { REQUIRE(selected_stream.stream() == nullptr); }
+ SECTION("nonblocking stream") { selected_stream = c10::cuda::getStreamFromExternal(stream_owner.get(), 0); }
+ const c10::cuda::CUDAStreamGuard stream_guard(selected_stream);
+ const auto stream = selected_stream.stream();
+ REQUIRE(c10::cuda::getCurrentCUDAStream().stream() == stream);
  mmltk::backend::ml::cuda::NumaHostTensor host(0);
  torch::Tensor packed, values;
  std::size_t previous_device = 0U, previous_host = 0U;
@@ -1461,7 +1476,7 @@ TEST_CASE("prediction mask packing retains exact odd-stride bytes through device
   values = torch::Tensor{};
   values = host.view(packed.sizes(), torch::kUInt8);
   values.copy_(packed, true);
-  REQUIRE(cudaStreamSynchronize(c10::cuda::getCurrentCUDAStream().stream()) == cudaSuccess);
+  REQUIRE(cudaStreamSynchronize(stream) == cudaSuccess);
   CHECK(static_cast<std::size_t>(values.numel()) == count * stride);
   CHECK(packed.storage().nbytes() == std::max(previous_device, count * stride));
   CHECK(host.capacity_bytes() == std::max(previous_host, mmltk::common::system::page_rounded_bytes(count * stride)));

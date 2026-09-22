@@ -604,6 +604,10 @@ Do not add regression tests. You may add standard tests that exercise required
 behavior, boundaries, failure handling, resource safety, and integration.
 Final test selection is fixed by [Final Validation](#final-validation-workflow).
 
+Do not add tests to Firefox's test suites or execute those suites. Test Firefox
+only indirectly through this repository's first-party suites and packaged
+application acceptance.
+
 For hardware tests, correct an evidence-identified cause narrowly.
 Roll back only if the targeted failure persists or the test stays stuck at the
 same point. If it advances to a distinct blocker, retain the correction and log
