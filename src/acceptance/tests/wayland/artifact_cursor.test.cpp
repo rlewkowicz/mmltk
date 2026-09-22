@@ -4,6 +4,7 @@
 #include "src/test_support/filesystem_test_utils.hpp"
 #include <nlohmann/json.hpp>
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/matchers/catch_matchers.hpp>
 #include <array>
 #include <cstddef>
 #include <filesystem>
@@ -11,6 +12,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <vector>
 #include "session.h"
 namespace mmltk::acceptance::wayland {
 using mmltk::testsupport::ScopedTempDir;
@@ -60,7 +62,7 @@ TEST_CASE("native evidence cursors reject malformed truncated oversized and inco
  ScopedTempDir temporary{"mmltk-evidence-cursor"};
  const auto path = temporary.path() / "native.jsonl";
  const auto observer = [](const auto&) {};
- for (const std::string& content : {std::string{"not JSON\n"}, std::string{"[]\n"}, std::string{"\n"}, std::string(64U * 1024U + 1U, 'x')}) {
+ for (const std::string& content : {std::string{"not JSON\n"}, std::string{"[]\n"}, std::string{"\n"}, std::string{"{\"event\":\"bad\0value\"}\n", 22U}, std::string(64U * 1024U + 1U, 'x')}) {
   {
    std::ofstream output{path, std::ios::binary | std::ios::trunc};
    output << content;
@@ -77,6 +79,7 @@ TEST_CASE("native evidence cursors reject malformed truncated oversized and inco
  Count audit;
  JsonLineCursor cursor{path, 0U};
  cursor.consume(audit, observer);
+ cursor.consume(audit, observer, true);
  CHECK(audit.records == 0U);
  CHECK_THROWS_AS(cursor.finish(), std::runtime_error);
  {
@@ -118,7 +121,7 @@ TEST_CASE("evidence reads cross chunk boundaries and failure tails select actual
  const auto firefox = temporary.path() / "firefox.log";
  {
   std::ofstream output{firefox};
-  output << "intentional Firefox text\nprefix {\"event\":\"browser\"}\n";
+  output << "\nintentional Firefox text\nprefix {\"event\":\"browser\"}\n";
  }
  Count browser;
  JsonLineCursor browser_cursor{firefox, 0U, JsonLineCursor::Format::FirefoxText};
@@ -180,5 +183,90 @@ TEST_CASE("evidence reads cross chunk boundaries and failure tails select actual
    }
   }
  }
+}
+TEST_CASE("evidence cursor admits exact line limits and retains admitted overflow prefixes", "[workspace][audit]") {
+ struct Records final {
+  std::vector<nlohmann::json> values;
+  void consume(const nlohmann::json& value) { values.push_back(value); }
+ };
+ ScopedTempDir temporary{"mmltk-evidence-limits"};
+ const auto path = temporary.path() / "native.jsonl";
+ constexpr std::size_t limit = 64U * 1024U;
+ const auto observer = [](const auto&) {};
+ for (const std::size_t split : {0U, 16383U, 16384U, 65536U}) {
+  for (const bool overflow : {false, true}) {
+   INFO("split=" << split << ", overflow=" << overflow);
+   std::string record = "{\"event\":\"limit\"}";
+   record.resize(limit, ' ');
+   mmltk::testsupport::write_text_file(path, std::string_view{record}.substr(0U, split));
+   Records audit;
+   JsonLineCursor cursor{path, 0U};
+   cursor.consume(audit, observer);
+   {
+    std::ofstream output{path, std::ios::binary | std::ios::app};
+    output << std::string_view{record}.substr(split);
+    if (overflow) output << 'x';
+   }
+   if (overflow) {
+    CHECK_THROWS_WITH(cursor.consume(audit, observer), "evidence line exceeded capacity: " + path.string());
+   } else {
+    cursor.consume(audit, observer);
+   }
+   CHECK(audit.values.empty());
+   CHECK(cursor.line() == 0U);
+   CHECK_THROWS_AS(cursor.finish(), std::runtime_error);
+   { std::ofstream output{path, std::ios::app}; output << '\n'; }
+   cursor.consume(audit, observer);
+   cursor.finish();
+   REQUIRE(audit.values.size() == 1U);
+   CHECK(audit.values.front().at("event") == "limit");
+   CHECK(cursor.line() == 1U);
+  }
+ }
+}
+TEST_CASE("evidence cursor preserves callback failure order and captured extent", "[workspace][audit]") {
+ struct Audit final {
+  std::vector<std::string>* order;
+  bool fail;
+  void consume(const nlohmann::json& record) {
+   order->push_back("audit:" + record.at("event").get<std::string>());
+   if (fail) throw std::runtime_error("audit failure");
+  }
+ };
+ ScopedTempDir temporary{"mmltk-evidence-callback"};
+ const auto path = temporary.path() / "native.jsonl";
+ for (const bool audit_failure : {false, true}) {
+  mmltk::testsupport::write_text_file(path, "{\"event\":\"first\"}\n{\"event\":\"skipped\"}\n");
+  std::vector<std::string> order;
+  Audit audit{&order, audit_failure};
+  JsonLineCursor cursor{path, 0U};
+  CHECK_THROWS_AS(cursor.consume(audit, [&](const nlohmann::json&) {
+   order.push_back("observer:first");
+   throw std::runtime_error("observer failure");
+  }), std::runtime_error);
+  CHECK(order.size() == (audit_failure ? 1U : 2U));
+  CHECK(order.front() == "audit:first");
+  CHECK(cursor.line() == 1U);
+  CHECK_THROWS_AS(cursor.finish(), std::runtime_error);
+  audit.fail = false;
+  { std::ofstream output{path, std::ios::app}; output << '\n'; }
+  cursor.consume(audit, [&](const nlohmann::json& value) { order.push_back("observer:" + value.at("event").get<std::string>()); });
+  CHECK(order[order.size() - 2U] == "audit:first");
+  CHECK(order.back() == "observer:first");
+  CHECK(cursor.line() == 2U);
+  cursor.finish();
+ }
+ mmltk::testsupport::write_text_file(path, "{\"event\":\"first\"}\r\n");
+ std::vector<std::string> order;
+ Audit audit{&order, false};
+ JsonLineCursor cursor{path, 0U};
+ cursor.consume(audit, [&](const auto&) {
+  std::ofstream output{path, std::ios::app};
+  output << "{\"event\":\"later\"}\n";
+ });
+ CHECK(order == std::vector<std::string>{"audit:first"});
+ cursor.consume(audit, [](const auto&) {});
+ CHECK(order == std::vector<std::string>{"audit:first", "audit:later"});
+ cursor.finish();
 }
 }  // namespace mmltk::acceptance::wayland

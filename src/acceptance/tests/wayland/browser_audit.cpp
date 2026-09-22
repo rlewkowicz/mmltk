@@ -1413,10 +1413,7 @@ auto BrowserAudit::terminal_evidence_settled() const noexcept -> bool {
  return complete && presentation_receipt != 0U && surface_redraw_counts.contains(presentation_receipt) && surface_redraw_counts.at(presentation_receipt) >= 3U;
 }
 auto BrowserAudit::rendered_frame_for_slots(const std::map<std::uint64_t, std::uint64_t>& native_slots, const std::uint64_t source_revision, const std::size_t minimum_redraws) const noexcept -> bool {
- for (const auto& [snapshot_revision, slots] : explore_slots) {
-  if (slots != native_slots || !explore_slot_frames.contains(snapshot_revision)) continue;
-  const auto source = explore_slot_frames.at(snapshot_revision);
-  if (source_revision != 0U && source != source_revision) continue;
+ const auto rendered = [this, minimum_redraws](const std::uint64_t source) noexcept {
   for (const auto& geometry : surface_geometries) {
    const auto key = std::pair{geometry.presentation_revision, geometry.source_revision};
    if (geometry.source_revision != source || !surface_scales.contains(key) || !surface_draws.contains(geometry.presentation_revision) ||
@@ -1427,6 +1424,11 @@ auto BrowserAudit::rendered_frame_for_slots(const std::map<std::uint64_t, std::u
                            (!explore_gallery.valid() || (std::abs(geometry.width / scale - explore_gallery.width) < 1.0 && square_atlas_frames.contains(key) && atlas_scaled_frames.contains(key)));
    if (normalized) return true;
   }
+  return false;
+ };
+ if (source_revision != 0U) return observed_frame_revision_for_slots(native_slots, source_revision) && rendered(source_revision);
+ for (const auto& [snapshot_revision, slots] : explore_slots) {
+  if (slots == native_slots && explore_slot_frames.contains(snapshot_revision) && rendered(explore_slot_frames.at(snapshot_revision))) return true;
  }
  return false;
 }

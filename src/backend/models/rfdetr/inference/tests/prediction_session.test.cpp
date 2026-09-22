@@ -15,6 +15,8 @@
 #include <nlohmann/json.hpp>
 #include "src/test_support/async_test_utils.hpp"
 #include "src/test_support/filesystem_test_utils.hpp"
+#include "src/test_support/subprocess_test_utils.hpp"
+#include "src/entrypoints/cli/tests/support/cli_path.h"
 #include "src/backend/data/tests/test_fixture.h"
 #include "src/backend/data/compiled_dataset.h"
 #include "src/backend/models/rfdetr/inference/dataset_batch_lease.h"
@@ -180,6 +182,28 @@ TEST_CASE("prediction delivers bounded ordered images masks and receiver-owned p
    file.put(0);
    file.put(0);
   }
+ }
+ const auto unicode_image = root / "帧 café.ppm";
+ std::filesystem::copy_file(image, unicode_image);
+ const auto cli_output = root / "cli.json";
+ const auto cli = mmltk::testsupport::run_subprocess_capture_output({
+  mmltk::testsupport::mmltk_cli_path(), "--log-level=off", "rfdetr", "predict", "--onnx", (root / "rf-detr-nano.onnx").string(),
+  "--output", cli_output.string(), "--resolution", "8", "--no-fp16", "--max-dets-per-image", "2",
+  "--image", image.string(), "--image=" + unicode_image.string(), "--image", (root / "." / "red.ppm").string(),
+ });
+ INFO(cli.output_text);
+ REQUIRE(cli.exit_code == 0);
+ std::ifstream cli_file{cli_output};
+ const auto cli_json = nlohmann::json::parse(cli_file);
+ REQUIRE(cli_json.at("records").size() == 3U);
+ const std::array expected_names{image.filename().string(), unicode_image.filename().string(), image.filename().string()};
+ // CLI ordinals are zero-based; prediction retains its established zero-ID fallback.
+ const std::array<std::int64_t, 3> expected_ids{1, 1, 2};
+ for (std::size_t index = 0U; index < expected_names.size(); ++index) {
+  const auto& record = cli_json.at("records").at(index);
+  CHECK(record.at("image_id") == expected_ids[index]);
+  CHECK(record.at("dataset_index") == index);
+  CHECK(record.at("source_name") == expected_names[index]);
  }
  REQUIRE(cudaSetDevice(0) == cudaSuccess);
  const mmltk::testsupport::ScopedTestStream stream_owner;

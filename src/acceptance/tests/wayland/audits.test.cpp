@@ -9,6 +9,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <map>
+#include <limits>
 #include <numeric>
 #include <optional>
 #include <ranges>
@@ -516,6 +517,75 @@ void rendered_probe_audit_rejects_mismatched_identity() {
  CHECK(browser.observed_frame_revision_for_slots({{2U, 11U}}, 50U));
  CHECK_FALSE(browser.rendered_frame_for_slots({{2U, 11U}}, 0U, 0U));
  CHECK(browser.rendered_frame_for_slots({{3U, 12U}}, 0U, 0U));
+}
+TEST_CASE("native probe joins retain strict ordinal ranges at maximum generation", "[workspace][audit]") {
+ const auto generation = std::numeric_limits<std::uint64_t>::max();
+ const auto key = std::pair{generation, std::uint64_t{2U}};
+ NativeAudit audit;
+ audit.placeholder_slots[generation].emplace(2U, 11U);
+ audit.rendered_probe_slots[key] = 11U;
+ audit.transition_probe_slots[key] = 11U;
+ audit.rendered_probe_ordinals[key] = 3U;
+ audit.transition_probe_ordinals[key] = 5U;
+ audit.rendered_probe_slots[{generation - 1U, 2U}] = 99U;
+ audit.reconcile_rendered_probes(generation);
+ CHECK(audit.rendered_probe_frames.empty());
+ audit.published_frames[generation] = {{3U, 30U}, {4U, 40U}, {5U, 50U}};
+ audit.reconcile_rendered_probes(generation);
+ CHECK(audit.rendered_probe_frames.empty());
+ audit.published_frames[generation].insert(audit.published_frames[generation].begin(), {{1U, 10U}, {2U, 20U}});
+ audit.reconcile_rendered_probes(generation);
+ CHECK(audit.rendered_probe_frames.at(key) == std::vector<std::uint64_t>{20U});
+ audit.published_frames[generation].insert(audit.published_frames[generation].end(), {{6U, 60U}, {7U, 70U}});
+ audit.reconcile_rendered_probes(generation);
+ CHECK(audit.rendered_probe_frames.at(key) == std::vector<std::uint64_t>{60U, 70U});
+ CHECK(audit.rendered_probe_frames.size() == 1U);
+ audit.patched_slots[generation][2U] = 12U;
+ audit.reconcile_rendered_probes(generation);
+ CHECK(audit.causal_failure == "rendered probe patch identity");
+ CHECK(audit.rendered_probe_frames.at(key) == std::vector<std::uint64_t>{60U, 70U});
+}
+TEST_CASE("rendered slot queries share fixed and wildcard geometry admission", "[workspace][audit]") {
+ BrowserAudit audit;
+ const std::map<std::uint64_t, std::uint64_t> slots{{2U, 11U}};
+ for (std::uint64_t snapshot = 1U; snapshot <= 3U; ++snapshot) {
+  audit.explore_slots[snapshot] = slots;
+  audit.explore_slot_frames[snapshot] = 50U;
+ }
+ audit.surface_geometries.push_back({.presentation_revision = 70U, .source_revision = 50U, .width = 640.0, .height = 320.0});
+ const auto key = std::pair{70U, 50U};
+ audit.surface_draws.insert(70U);
+ audit.surface_redraw_counts[70U] = 2U;
+ for (const double scale : {0.0, -1.0, std::numeric_limits<double>::quiet_NaN(), 1.0}) {
+  audit.surface_scales[key] = scale;
+  for (const std::uint64_t source : {0U, 50U}) {
+   CHECK(audit.rendered_frame_for_slots(slots, source, 2U) == (scale > 0.0));
+   CHECK_FALSE(audit.rendered_frame_for_slots(slots, source, 3U));
+  }
+ }
+ audit.explore_slots[4U] = slots;
+ audit.explore_slot_frames[4U] = 0U;
+ audit.surface_geometries.push_back({.presentation_revision = 71U, .source_revision = 0U, .width = 640.0, .height = 320.0});
+ audit.surface_scales[{71U, 0U}] = 1.0;
+ audit.surface_draws.insert(71U);
+ audit.surface_draws.erase(70U);
+ CHECK(audit.rendered_frame_for_slots(slots, 0U, 0U));
+ CHECK_FALSE(audit.rendered_frame_for_slots(slots, 50U, 0U));
+ audit.surface_draws.erase(71U);
+ audit.surface_draws.insert(70U);
+ CHECK_FALSE(audit.rendered_frame_for_slots(slots, 51U, 0U));
+ CHECK_FALSE(audit.rendered_frame_for_slots({{2U, 12U}}, 50U, 0U));
+ audit.surface_geometries.front().width = std::numeric_limits<double>::quiet_NaN();
+ CHECK_FALSE(audit.rendered_frame_for_slots(slots, 50U, 0U));
+ audit.surface_geometries.front().width = 640.0;
+ audit.explore_gallery = {.x = 0.0, .y = 0.0, .width = 640.0, .height = 320.0};
+ CHECK_FALSE(audit.rendered_frame_for_slots(slots, 50U, 0U));
+ audit.square_atlas_frames.insert(key);
+ audit.atlas_scaled_frames.insert(key);
+ for (const double width : {639.0, 639.5, 640.0, 641.0}) {
+  audit.surface_geometries.front().width = width;
+  for (const std::uint64_t source : {0U, 50U}) CHECK(audit.rendered_frame_for_slots(slots, source, 0U) == (width > 639.0 && width < 641.0));
+ }
 }
 TEST_CASE("browser compile metrics accept zero drops and require consistent progress", "[workspace][audit]") {
  const auto dropped = GENERATE(0U, 3U);

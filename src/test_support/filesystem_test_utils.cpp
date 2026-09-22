@@ -4,14 +4,11 @@
 #include <cstring>
 #include <fstream>
 #include <stdexcept>
-#include <vector>
 #include "src/common/io/file_memory.h"
 namespace mmltk::testsupport {
 std::filesystem::path make_temp_root(const char* const name_prefix) {
  std::string pattern = (std::filesystem::temp_directory_path() / (std::string{name_prefix} + ".XXXXXX")).string();
- std::vector<char> writable(pattern.begin(), pattern.end());
- writable.push_back('\0');
- const char* const created = ::mkdtemp(writable.data());
+ const char* const created = ::mkdtemp(pattern.data());
  if (created == nullptr) throw std::runtime_error(std::string{"mkdtemp failed: "} + std::strerror(errno));
  return std::filesystem::path{created};
 }

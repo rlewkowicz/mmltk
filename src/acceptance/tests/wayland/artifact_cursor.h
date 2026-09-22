@@ -33,14 +33,17 @@ public:
    const auto count = std::min<std::uintmax_t>(chunk.size(), captured_end - offset_);
    if (!input.read(chunk.data(), static_cast<std::streamsize>(count))) throw std::runtime_error("evidence transport read failed: " + path_.string());
    offset_ += count;
-   for (const char byte : std::string_view{chunk.data(), static_cast<std::size_t>(count)}) {
-    if (byte != '\n') {
-     if (pending_.size() == kLineLimit) throw std::runtime_error("evidence line exceeded capacity: " + path_.string());
-     pending_.push_back(byte);
-     continue;
-    }
+   std::string_view remaining{chunk.data(), static_cast<std::size_t>(count)};
+   while (!remaining.empty()) {
+    const auto newline = remaining.find('\n');
+    const auto segment = newline == std::string_view::npos ? remaining.size() : newline;
+    const auto admitted = std::min(segment, kLineLimit - pending_.size());
+    pending_.append(remaining.data(), admitted);
+    if (admitted != segment) throw std::runtime_error("evidence line exceeded capacity: " + path_.string());
+    if (newline == std::string_view::npos) break;
     consume_line(audit, observer);
     pending_.clear();
+    remaining.remove_prefix(segment + 1U);
    }
   }
   if (final && format_ == Format::FirefoxText && !pending_.empty()) {

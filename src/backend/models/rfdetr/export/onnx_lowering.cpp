@@ -8,7 +8,7 @@ module;
 #include <algorithm>
 #include <array>
 #include <cmath>
-#include <deque>
+#include <functional>
 #include <format>
 #include <limits>
 #include <map>
@@ -937,17 +937,18 @@ void topologically_sort_block(torch::jit::Block* block) {
    ++indegree[node];
   }
  }
- std::deque<torch::jit::Node*> ready;
- for (auto* node : nodes) {
-  if (indegree.at(node) == 0) { ready.push_back(node); }
+ std::vector<size_t> ready;
+ ready.reserve(nodes.size());
+ for (size_t ordinal = 0; ordinal < nodes.size(); ++ordinal) {
+  if (indegree.at(nodes[ordinal]) == 0) ready.push_back(ordinal);
  }
- std::ranges::sort(
-  ready, [&](const torch::jit::Node* lhs, const torch::jit::Node* rhs) { return original_index.at(const_cast<torch::jit::Node*>(lhs)) < original_index.at(const_cast<torch::jit::Node*>(rhs)); });
+ std::make_heap(ready.begin(), ready.end(), std::greater<>{});
  std::vector<torch::jit::Node*> sorted;
  sorted.reserve(nodes.size());
  while (!ready.empty()) {
-  auto* node = ready.front();
-  ready.pop_front();
+  std::pop_heap(ready.begin(), ready.end(), std::greater<>{});
+  auto* node = nodes[ready.back()];
+  ready.pop_back();
   sorted.push_back(node);
   const auto edge_it = edges.find(node);
   if (edge_it == edges.end()) { continue; }
@@ -956,9 +957,8 @@ void topologically_sort_block(torch::jit::Block* block) {
    TORCH_INTERNAL_ASSERT(degree > 0);
    --degree;
    if (degree == 0) {
-    auto insert_it = std::upper_bound(ready.begin(), ready.end(), user,
-     [&](const torch::jit::Node* lhs, const torch::jit::Node* rhs) { return original_index.at(const_cast<torch::jit::Node*>(lhs)) < original_index.at(const_cast<torch::jit::Node*>(rhs)); });
-    ready.insert(insert_it, user);
+    ready.push_back(original_index.at(user));
+    std::push_heap(ready.begin(), ready.end(), std::greater<>{});
    }
   }
  }

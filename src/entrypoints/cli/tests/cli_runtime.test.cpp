@@ -494,6 +494,8 @@ void test_rfdetr_info_forwards_explicit_logging_options() {
   {{"MMLTK_LOG_LEVEL=debug"}, {"--log-level", "off", "--log-file", file.string()}, file, false},
   {{"MMLTK_LOG_LEVEL=off"}, {"--log-level", "info", "--log-file", file.string()}, file, true},
   {{}, {"--log-file=" + file.string()}, file, true},
+  {{}, {"--log-file=ignored.log", "--log-file", file.string(), "--log-level=debug", "--log-level", "info"}, file, true},
+  {{}, {"--log-dir=ignored-directory", "--log-dir", directory.string(), "--log-level", "info"}, directory / "mmltk-rfdetr-onnx-info.log", true},
   {{}, {"--log-level=off", "--log-level=info", "--log-dir=" + directory.string()}, directory / "mmltk-rfdetr-onnx-info.log", true},
   {{"MMLTK_LOG_LEVEL=off"}, {"--log-level=info", "--log-level=", "--log-file=" + file.string()}, file, false},
  };
@@ -893,5 +895,38 @@ TEST_CASE("CLI rejects invalid resize modes through ordinary option parsing", "[
   CHECK(result.exit_code != 0);
   CHECK(result.output_text.find("resize-mode") != std::string::npos);
   CHECK(result.output_text.find("invalid enum value") != std::string::npos);
+ }
+}
+
+TEST_CASE("CLI logging admission precedes root and RF-DETR help and dispatch", "[core][cli][logging]") {
+ for (const std::vector<std::string>& arguments : std::vector<std::vector<std::string>>{{"--help"}, {"rfdetr", "--help"}, {"rfdetr", "info", "--help"}, {"unknown-command"}}) {
+  for (const bool environment : {false, true}) {
+   std::vector<std::string> command{"env", "-u", "MMLTK_LOG_LEVEL", "-u", "MMLTK_LOG_FILE", "-u", "MMLTK_LOG_DIR"};
+   if (environment) command.emplace_back("MMLTK_LOG_LEVEL=banana");
+   command.push_back(mmltk_cli_path());
+   command.emplace_back(environment ? "--log-level=off" : "--log-level=banana");
+   command.insert(command.end(), arguments.begin(), arguments.end());
+   const auto result = run_subprocess_capture_output(command);
+   CHECK(result.exit_code == 1);
+   CHECK(result.stdout_text.empty());
+   CHECK(result.stderr_text.find("invalid MMLTK log level: banana") != std::string::npos);
+   CHECK(result.stderr_text.find("fatal: ", result.stderr_text.find("fatal: ") + 1U) == std::string::npos);
+  }
+ }
+}
+TEST_CASE("CLI prediction source finalization preserves empty and conflicting source rejection", "[core][cli][rfdetr]") {
+ const ScopedTempDir root{"mmltk-cli-predict-sources"};
+ const auto image = (root.path() / "子目录" / "image café.png").string();
+ const std::vector<std::vector<std::string>> sources{
+  {},
+  {"--compiled", (root.path() / "dataset.bin").string(), "--image", image, "--image=" + image},
+ };
+ for (const auto& source : sources) {
+  std::vector<std::string> command{mmltk_cli_path(), "--log-level=off", "rfdetr", "predict", "--onnx", (root.path() / "model.onnx").string(), "--output", (root.path() / "result.json").string()};
+  command.insert(command.end(), source.begin(), source.end());
+  const auto result = run_subprocess_capture_output(command);
+  CHECK(result.exit_code == 1);
+  CHECK(result.stderr_text.find("rfdetr predict requires exactly one source") != std::string::npos);
+  CHECK_FALSE(fs::exists(root.path() / "result.json"));
  }
 }

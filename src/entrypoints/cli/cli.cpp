@@ -30,7 +30,7 @@ namespace reflection = mmltk::frameworks::reflection;
 namespace common_system = mmltk::common::system;
 #if MMLTK_BUILD_RFDETR_NATIVE
 namespace mmltk::entrypoints::cli {
-int handle_rfdetr_cli(std::span<const std::string_view> arguments, int argc, char** argv);
+int handle_rfdetr_cli(std::span<const std::string_view> arguments, const logging::CliOverrides& logging_options);
 }
 #endif
 namespace {
@@ -162,13 +162,13 @@ void run_bench(const BenchCommandRequest& request) {
   std::printf("Epoch %d: %zu images in %.2f sec (%.0f img/sec)\n", epoch, total, seconds, seconds > 0.0 ? static_cast<double>(total) / seconds : 0.0);
  }
 }
-using RootCommandHandler = int (*)(std::span<const std::string_view>, int, char**, bool);
+using RootCommandHandler = int (*)(std::span<const std::string_view>, const logging::CliOverrides&, bool);
 struct RootCommand final {
  std::string_view name;
  std::string_view description;
  RootCommandHandler handler;
 };
-int handle_compile(const std::span<const std::string_view> arguments, int, char**, const bool help_requested) {
+int handle_compile(const std::span<const std::string_view> arguments, const logging::CliOverrides&, const bool help_requested) {
  if (help_requested) {
   std::puts(reflection::help("mmltk compile [options]", "Compile a raw dataset split", kCompileOptions).c_str());
   return 0;
@@ -178,7 +178,7 @@ int handle_compile(const std::span<const std::string_view> arguments, int, char*
  run_compile(parsed.request);
  return 0;
 }
-int handle_bench(const std::span<const std::string_view> arguments, int, char**, const bool help_requested) {
+int handle_bench(const std::span<const std::string_view> arguments, const logging::CliOverrides&, const bool help_requested) {
  if (help_requested) {
   std::puts(reflection::help("mmltk bench [options]", "Benchmark streaming throughput", kBenchOptions).c_str());
   return 0;
@@ -186,7 +186,7 @@ int handle_bench(const std::span<const std::string_view> arguments, int, char**,
  run_bench(parse_bench_request(arguments));
  return 0;
 }
-int handle_info(const std::span<const std::string_view> arguments, int, char**, const bool help_requested) {
+int handle_info(const std::span<const std::string_view> arguments, const logging::CliOverrides&, const bool help_requested) {
  if (help_requested) {
   std::puts(reflection::help("mmltk info [options]", "Inspect compiled metadata", kInfoOptions).c_str());
   return 0;
@@ -195,7 +195,7 @@ int handle_info(const std::span<const std::string_view> arguments, int, char**, 
  return 0;
 }
 #if MMLTK_BUILD_RFDETR_NATIVE
-int handle_rfdetr(const std::span<const std::string_view> arguments, const int argc, char** argv, bool) { return mmltk::entrypoints::cli::handle_rfdetr_cli(arguments, argc, argv); }
+int handle_rfdetr(const std::span<const std::string_view> arguments, const logging::CliOverrides& logging_options, bool) { return mmltk::entrypoints::cli::handle_rfdetr_cli(arguments, logging_options); }
 #endif
 inline constexpr std::array kRootCommands{
  RootCommand{"compile", "Compile a raw dataset split", &handle_compile},
@@ -230,7 +230,8 @@ void print_root_help() {
 }  // namespace
 int main(const int argc, char** argv) {
  try {
-  logging::initialize(logging::merge(logging::config_from_env("mmltk"), logging::scan_cli_overrides(argc, argv)));
+  logging::CliOverrides logging_options;
+  logging::initialize(logging::merge(logging::config_from_env("mmltk"), logging_options = logging::scan_cli_overrides(argc, argv)));
   (void)common_system::apply_process_execution_policy();
   const auto filtered = non_logging_arguments(argc, argv, 1);
   if (filtered.empty() || filtered.front() == "--help" || filtered.front() == "-h") {
@@ -241,7 +242,7 @@ int main(const int argc, char** argv) {
   if (command == nullptr) { throw std::runtime_error("unknown command: " + std::string(filtered.front())); }
   const std::span<const std::string_view> arguments{filtered.begin() + 1, filtered.end()};
   const bool help_requested = std::ranges::find(arguments, std::string_view{"--help"}) != arguments.end() || std::ranges::find(arguments, std::string_view{"-h"}) != arguments.end();
-  return command->handler(arguments, argc, argv, help_requested);
+  return command->handler(arguments, logging_options, help_requested);
  } catch (const std::exception& error) { logging::report_fatal("mmltk error", error.what()); } catch (...) {
   logging::report_fatal("mmltk error", "unknown exception");
  }

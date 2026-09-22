@@ -471,4 +471,44 @@ TEST_CASE("test_pre_staging_cleanup_preserves_unused_mutating_results", "[model]
   if (node->kind() == kOnnxAdd) ++additions;
  REQUIRE(additions == 2);
 }
+TEST_CASE("ONNX lowering orders ready nodes by original ordinal in each block", "[model][rfdetr][onnx_lowering]") {
+ auto graph = std::make_shared<torch::jit::Graph>();
+ auto* input = graph->addInput();
+ const auto populate = [&](torch::jit::Block* block) {
+  auto* first = graph->create(kOnnxAdd, {input, input}, 1);
+  auto* second = graph->create(kOnnxAdd, {input, input}, 1);
+  auto* producer = graph->create(kOnnxAdd, {input, input}, 1);
+  auto* independent = graph->create(kOnnxAdd, {input, input}, 1);
+  first->replaceInput(0, producer->output());
+  first->replaceInput(1, producer->output());
+  second->replaceInput(0, first->output());
+  for (auto* node : {first, second, producer, independent}) {
+   block->appendNode(node);
+   block->registerOutput(node->output());
+  }
+  return std::vector{producer, first, second, independent};
+ };
+ auto expected = populate(graph->block());
+ auto* container = graph->create(c10::Symbol::fromQualString("onnx::If"), 1);
+ graph->appendNode(container);
+ graph->registerOutput(container->output());
+ expected.push_back(container);
+ auto* nested = container->addBlock();
+ const auto nested_expected = populate(nested);
+ lower_test_graph(graph);
+ CHECK(std::vector<torch::jit::Node*>(graph->nodes().begin(), graph->nodes().end()) == expected);
+ CHECK(std::vector<torch::jit::Node*>(nested->nodes().begin(), nested->nodes().end()) == nested_expected);
+}
+TEST_CASE("ONNX lowering rejects cyclic dependencies before reordering the block", "[model][rfdetr][onnx_lowering]") {
+ auto graph = std::make_shared<torch::jit::Graph>();
+ auto* input = graph->addInput();
+ auto* first = graph->create(kOnnxAdd, {input, input}, 1);
+ auto* second = graph->create(kOnnxAdd, {first->output(), input}, 1);
+ graph->appendNode(first);
+ graph->appendNode(second);
+ first->replaceInput(0, second->output());
+ graph->registerOutput(second->output());
+ mmltk::testsupport::expect_runtime_error_contains([&] { lower_test_graph(graph); }, "RF-DETR ONNX export produced a cyclic or unsortable lowered graph");
+ CHECK(std::vector<torch::jit::Node*>(graph->nodes().begin(), graph->nodes().end()) == std::vector{first, second});
+}
 }  // namespace

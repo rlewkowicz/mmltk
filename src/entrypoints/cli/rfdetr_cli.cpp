@@ -581,16 +581,20 @@ void run_compile(const CompileCliRequest& request) {
 }
 void finalize_predict_request(PredictCliRequest& state) {
  state.request.image_inputs.clear();
- state.request.image_inputs.reserve(state.image_paths.size());
- for (std::size_t index = 0U; index < state.image_paths.size(); ++index) {
-  const auto& path = state.image_paths[index];
+ const auto count = state.image_paths.size();
+ const auto source_kind = count == 0U ? rfdetr::PredictSourceKind::CompiledDataset : rfdetr::PredictSourceKind::ImageFiles;
+ state.request.image_inputs.reserve(count);
+ for (std::size_t index = 0U; index < count; ++index) {
+  auto& path = state.image_paths[index];
+  auto source_name = path.filename().string();
   state.request.image_inputs.push_back({
-   .image_path = path,
-   .source_name = path.filename().string(),
+   .image_path = std::move(path),
+   .source_name = std::move(source_name),
    .image_id = static_cast<std::int64_t>(index),
   });
  }
- state.request.source_kind = state.image_paths.empty() ? rfdetr::PredictSourceKind::CompiledDataset : rfdetr::PredictSourceKind::ImageFiles;
+ decltype(state.image_paths){}.swap(state.image_paths);
+ state.request.source_kind = source_kind;
  state.request = rfdetr::finalize_predict_request(std::move(state.request));
 }
 void apply_train_presence(TrainCliRequest& state, const reflection::PresenceSet& presence) {
@@ -794,7 +798,7 @@ void print_rfdetr_help() {
  std::fputc('\n', stdout);
 }
 }  // namespace
-int handle_rfdetr_cli(const std::span<const std::string_view> arguments, int argc, char** argv) {
+int handle_rfdetr_cli(const std::span<const std::string_view> arguments, const logging::CliOverrides& logging_options) {
  if (arguments.empty() || arguments.front() == "--help" || arguments.front() == "-h") {
   print_rfdetr_help();
   return 0;
@@ -810,7 +814,7 @@ int handle_rfdetr_cli(const std::span<const std::string_view> arguments, int arg
  const bool help_requested =
   std::ranges::find(command_arguments, std::string_view{"--help"}) != command_arguments.end() || std::ranges::find(command_arguments, std::string_view{"-h"}) != command_arguments.end();
  try {
-  return dispatch_command(*descriptor, command_arguments, help_requested, logging::scan_cli_overrides(argc, argv));
+  return dispatch_command(*descriptor, command_arguments, help_requested, logging_options);
  } catch (const std::exception& error) { logging::report_fatal("mmltk rfdetr error", error.what(), std::nullopt, "rfdetr.cli"); } catch (...) {
   logging::report_fatal("mmltk rfdetr error", "unknown exception", std::nullopt, "rfdetr.cli");
  }

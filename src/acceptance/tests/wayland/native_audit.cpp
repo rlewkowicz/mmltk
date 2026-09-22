@@ -49,8 +49,8 @@ auto NativeAudit::reconcile_rendered_probes(const std::uint64_t generation) -> v
  const auto frames = published_frames.find(generation);
  const auto placeholder = placeholder_slots.find(generation);
  if (frames == published_frames.end() || frames->second.empty() || placeholder == placeholder_slots.end()) return;
- for (const auto& [key, compiled_index] : rendered_probe_slots) {
-  if (key.first != generation) continue;
+ for (auto probe = rendered_probe_slots.lower_bound({generation, 0U}); probe != rendered_probe_slots.end() && probe->first.first == generation; ++probe) {
+  const auto& [key, compiled_index] = *probe;
   const auto transition = transition_probe_slots.find(key);
   const auto slot = placeholder->second.find(key.second);
   if (transition == transition_probe_slots.end() || slot == placeholder->second.end()) continue;
@@ -72,14 +72,11 @@ auto NativeAudit::reconcile_rendered_probes(const std::uint64_t generation) -> v
   if (rendered_ordinal != rendered_probe_ordinals.end() && transition_ordinal != transition_probe_ordinals.end()) {
    const auto first_probe = std::min(rendered_ordinal->second, transition_ordinal->second);
    const auto last_probe = std::max(rendered_ordinal->second, transition_ordinal->second);
-   for (const auto& frame : frames->second)
-    if (frame.first > last_probe) frame_revisions.push_back(frame.second);
+   const auto suffix = std::ranges::upper_bound(frames->second, last_probe, {}, &FramePublication::first);
+   for (auto frame = suffix; frame != frames->second.end(); ++frame) frame_revisions.push_back(frame->second);
    if (frame_revisions.empty()) {
-    for (auto frame = frames->second.rbegin(); frame != frames->second.rend(); ++frame)
-     if (frame->first < first_probe) {
-      frame_revisions.push_back(frame->second);
-      break;
-     }
+    auto predecessor = std::ranges::lower_bound(frames->second, first_probe, {}, &FramePublication::first);
+    if (predecessor != frames->second.begin()) frame_revisions.push_back((--predecessor)->second);
    }
   } else if (frames->second.size() == 1U) {
    // Direct audit fixtures can provide already-correlated probes.
