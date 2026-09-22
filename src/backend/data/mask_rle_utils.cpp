@@ -24,7 +24,8 @@ namespace {
  }
  return static_cast<std::size_t>(dimensions.width) * dimensions.height;
 }
-void include_run(RowMajorMaskBounds* bounds, const std::size_t begin, const std::size_t end, const std::uint32_t width) {
+}  // namespace
+void include_row_major_mask_run(RowMajorMaskBounds* bounds, const std::size_t begin, const std::size_t end, const std::uint32_t width) {
  if (bounds == nullptr) { return; }
  const std::uint32_t begin_y = checked_cast<std::uint32_t>(begin / width, "mask run y overflow");
  const std::uint32_t begin_x = checked_cast<std::uint32_t>(begin % width, "mask run x overflow");
@@ -49,6 +50,7 @@ void include_run(RowMajorMaskBounds* bounds, const std::size_t begin, const std:
   bounds->max_x = width;
  }
 }
+namespace {
 void prepare_lookup(const MaskDimensions source, const std::uint32_t width, const std::uint32_t height, MaskResizeScratch* scratch) {
  if (scratch->lookup_source.width == source.width && scratch->lookup_source.height == source.height && scratch->lookup_width == width &&
      scratch->lookup_height == height) {
@@ -110,7 +112,7 @@ EncodedRowMajorMask encode_dense_row_major_mask(const std::span<const std::uint8
    checked_cast<std::uint32_t>(begin, "mask run start overflow"),
    checked_cast<std::uint32_t>(cursor - begin, "mask run length overflow"),
   });
-  include_run(&encoded.bounds, begin, cursor, dimensions.width);
+  include_row_major_mask_run(&encoded.bounds, begin, cursor, dimensions.width);
  }
  return encoded;
 }
@@ -123,7 +125,7 @@ void inspect_row_major_mask(const std::span<const RLEPair> pairs, const MaskDime
   if (pair.length == 0U || pair.start < previous_end || pair.start > pixels || pair.length > pixels - pair.start)
    throw std::runtime_error("row-major mask contains an invalid run");
   previous_end = static_cast<std::size_t>(pair.start) + pair.length;
-  include_run(bounds, pair.start, previous_end, dimensions.width);
+  include_row_major_mask_run(bounds, pair.start, previous_end, dimensions.width);
  }
 }
 }  // namespace
@@ -145,7 +147,7 @@ void materialize_row_major_mask(const std::span<const RLEPair> pairs, const Mask
   if (length == 0U || begin < previous_end || begin > pixels || length > pixels - begin) { throw std::runtime_error("row-major mask contains an invalid run"); }
   const std::size_t end = begin + length;
   std::fill(dense->data() + begin, dense->data() + end, std::uint8_t{1U});
-  include_run(bounds, begin, end, dimensions.width);
+  include_row_major_mask_run(bounds, begin, end, dimensions.width);
   previous_end = end;
  }
 }

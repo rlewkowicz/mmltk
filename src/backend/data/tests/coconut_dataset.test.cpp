@@ -254,12 +254,10 @@ NormalizedAnnotationIndex recovery_originals(unsigned image_id, std::span<const 
  }
  return index;
 }
-CoconutSegmentSupport recovery_support(std::span<const RLEPair> runs) {
+CoconutSegmentSupport recovery_support(std::span<const RLEPair> runs, dataset::MaskDimensions dimensions = {3, 3}) {
  CoconutSegmentSupport support;
  support.runs.assign(runs.begin(), runs.end());
- const auto bounds = dataset::row_major_mask_bounds(runs, {3, 3});
- support.min_x = bounds.min_x; support.min_y = bounds.min_y;
- support.max_x = bounds.max_x; support.max_y = bounds.max_y;
+ support.bounds = dataset::row_major_mask_bounds(runs, dimensions);
  for (const auto run : runs) support.area += run.length;
  return support;
 }
@@ -2282,10 +2280,10 @@ TEST_CASE("COCONut recovery requires a unique represented match and exact remain
   REQUIRE(support.size() == unchanged_support.size());
   for (std::size_t i = 0; i < support.size(); ++i) {
    CHECK(support[i].area == unchanged_support[i].area);
-   CHECK(support[i].min_x == unchanged_support[i].min_x);
-   CHECK(support[i].min_y == unchanged_support[i].min_y);
-   CHECK(support[i].max_x == unchanged_support[i].max_x);
-   CHECK(support[i].max_y == unchanged_support[i].max_y);
+   CHECK(support[i].bounds.min_x == unchanged_support[i].bounds.min_x);
+   CHECK(support[i].bounds.min_y == unchanged_support[i].bounds.min_y);
+   CHECK(support[i].bounds.max_x == unchanged_support[i].bounds.max_x);
+   CHECK(support[i].bounds.max_y == unchanged_support[i].bounds.max_y);
    CHECK_FALSE(support[i].recovered);
    CHECK_FALSE(support[i].carved);
    REQUIRE(support[i].runs.size() == unchanged_support[i].runs.size());
@@ -2323,4 +2321,119 @@ TEST_CASE("COCONut recovery propagates cancellation before mutating masks", "[co
                              mmltk::common::concurrency::CancellationObservation::Atomic(cancelled)));
  CHECK(support[0].runs.empty());
  CHECK(facts.objects.empty());
+}
+
+TEST_CASE("COCONut recovery reuses bounded image work across run geometry and cancellation", "[coconut][benchmark]") {
+ struct Geometry {
+  dataset::MaskDimensions dimensions;
+  std::vector<RLEPair> supporter, cuts, expected;
+  dataset::RowMajorMaskBounds bounds;
+ };
+ const std::vector<Geometry> cases{
+  // One cut spans three separate supporter runs, including a row boundary.
+  {{5, 4}, {{1, 3}, {6, 3}, {11, 3}}, {{2, 11}}, {{1, 1}, {13, 1}}, {1, 0, 4, 3, true}},
+  // Adjacent recovered cuts coalesce; singleton output crosses neither row.
+  {{3, 3}, {{0, 9}}, {{0, 2}, {2, 2}, {5, 1}, {8, 1}}, {{4, 1}, {6, 2}}, {0, 1, 2, 3, true}},
+  // Disjoint cuts can touch supporter endpoints without changing its storage.
+  {{4, 2}, {{2, 2}, {6, 1}}, {{0, 2}, {4, 2}, {7, 1}}, {{2, 2}, {6, 1}}, {2, 0, 4, 2, true}},
+  {{2, 2}, {{0, 1}, {2, 2}}, {{0, 4}}, {}, {}},
+  // Cross-row emission must widen x bounds to the complete row.
+  {{4, 3}, {{0, 12}}, {{0, 2}, {10, 2}}, {{2, 8}}, {0, 0, 4, 3, true}},
+  // Sparse supporter starts beyond an unrelated union prefix.
+  {{5, 5}, {{21, 3}}, {{0, 1}, {4, 1}, {8, 1}, {22, 1}}, {{21, 1}, {23, 1}}, {1, 4, 4, 5, true}},
+ };
+ const auto prototype = recovery_originals(1, std::array<RLEPair, 1>{{{0, 1}}});
+ NormalizedAnnotationIndex originals;
+ originals.annotation_sha256 = prototype.annotation_sha256;
+ originals.split = prototype.split;
+ std::vector<CoconutRecord> records;
+ for (std::size_t i = 0; i < cases.size(); ++i) {
+  const auto& geometry = cases[i];
+  CoconutRecord record;
+  record.image_id = i + 1;
+  originals.images.push_back({.source_image_id = record.image_id, .first_box = originals.boxes.size(),
+                              .box_count = static_cast<std::uint32_t>(geometry.cuts.size()),
+                              .width = geometry.dimensions.width, .height = geometry.dimensions.height});
+  for (std::size_t j = 0; j < geometry.cuts.size(); ++j) {
+   auto box = prototype.boxes.front();
+   box.annotation_id = j + 100;
+   box.source_category_id = j + 18;
+   box.mask_rle_offset = originals.mask_rle_pairs.size();
+   originals.boxes.push_back(box);
+   originals.mask_rle_pairs.push_back(geometry.cuts[j]);
+   record.segments.push_back({.id = static_cast<std::uint32_t>(j + 10), .category_id = box.source_category_id, .isthing = true});
+  }
+  record.segments.push_back({.id = 30, .category_id = 63, .isthing = true});
+  records.push_back(std::move(record));
+ }
+ CoconutMaskRecovery recovery(&originals, nullptr);
+ // Repeat in reverse order as well, exercising growth, shrinkage and key reuse.
+ for (std::size_t pass = 0; pass < cases.size() * 2; ++pass) {
+  const auto i = pass < cases.size() ? pass : cases.size() * 2 - pass - 1;
+  CAPTURE(pass, i);
+  const auto& geometry = cases[i];
+  auto record = records[i];
+  const auto fresh_support = [&] {
+   std::vector<CoconutSegmentSupport> result(geometry.cuts.size());
+   result.push_back(recovery_support(geometry.supporter, geometry.dimensions));
+   return result;
+  };
+  std::vector<std::uint8_t> dense;
+  dataset::RowMajorMaskBounds materialized;
+  dataset::materialize_row_major_mask(geometry.expected, geometry.dimensions, &dense, &materialized);
+  const auto encoded = dataset::encode_dense_row_major_mask(dense, geometry.dimensions);
+  for (const auto& bounds : {materialized, encoded.bounds}) {
+   CHECK(bounds.has_foreground == geometry.bounds.has_foreground);
+   CHECK(bounds.min_x == geometry.bounds.min_x);
+   CHECK(bounds.min_y == geometry.bounds.min_y);
+   CHECK(bounds.max_x == geometry.bounds.max_x);
+   CHECK(bounds.max_y == geometry.bounds.max_y);
+  }
+  // Optional bounds output and singleton/cross-row accumulation share validation.
+  dataset::materialize_row_major_mask(geometry.expected, geometry.dimensions, &dense);
+  auto support = fresh_support();
+  CoconutRecoveryImage facts{record.image_id, 0, {}};
+  // Exercise every cancellation boundary, including partially populated scratch.
+  const auto* original_storage = support.back().runs.data();
+  PollCancellation complete;
+  recovery.apply(CoconutImageNamespace::CocoTrain, record, geometry.dimensions.width, geometry.dimensions.height,
+                  support, facts, mmltk::common::concurrency::CancellationObservation::Borrow(complete));
+  if (i == 2) {
+   CHECK_FALSE(support.back().carved);
+   CHECK(support.back().runs.data() == original_storage);
+  }
+  for (std::size_t stop = 0; stop < complete.polls; ++stop) {
+   CAPTURE(stop);
+   auto interrupted = fresh_support();
+   CoconutRecoveryImage partial{record.image_id, 0, {}};
+   PollCancellation cancellation{.stop_at = stop};
+   CHECK_THROWS(recovery.apply(CoconutImageNamespace::CocoTrain, record, geometry.dimensions.width, geometry.dimensions.height,
+                               interrupted, partial, mmltk::common::concurrency::CancellationObservation::Borrow(cancellation)));
+   support = fresh_support();
+   facts = {record.image_id, 0, {}};
+   recovery.apply(CoconutImageNamespace::CocoTrain, record, geometry.dimensions.width, geometry.dimensions.height, support, facts);
+   REQUIRE(facts.objects.size() == geometry.cuts.size());
+   const auto& carved = support.back();
+   REQUIRE(carved.runs.size() == geometry.expected.size());
+   std::uint64_t expected_area = 0;
+   for (std::size_t run = 0; run < geometry.expected.size(); ++run) {
+    CHECK(carved.runs[run].start == geometry.expected[run].start);
+    CHECK(carved.runs[run].length == geometry.expected[run].length);
+    expected_area += geometry.expected[run].length;
+   }
+   CHECK(carved.area == expected_area);
+   CHECK(carved.bounds.has_foreground == geometry.bounds.has_foreground);
+   CHECK(carved.bounds.min_x == geometry.bounds.min_x);
+   CHECK(carved.bounds.min_y == geometry.bounds.min_y);
+   CHECK(carved.bounds.max_x == geometry.bounds.max_x);
+   CHECK(carved.bounds.max_y == geometry.bounds.max_y);
+  }
+  // Once all thing masks are present, the next call needs no matching workspace.
+  const auto* unchanged = support.back().runs.data();
+  facts.objects.clear();
+  for (auto& segment : record.segments) segment.bbox = std::array<double, 4>{0, 0, 1, 1};
+  recovery.apply(CoconutImageNamespace::CocoTrain, record, geometry.dimensions.width, geometry.dimensions.height, support, facts);
+  CHECK(facts.objects.empty());
+  CHECK(support.back().runs.data() == unchanged);
+ }
 }

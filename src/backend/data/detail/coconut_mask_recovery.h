@@ -1,16 +1,20 @@
 #pragma once  // backend.data private implementation boundary
 #include "coconut_annotations.h"
+#include "mask_rle_utils.h"
+#include "src/common/concurrency/cancellation_observation.h"
+#include <cstddef>
 #include <cstdint>
 #include <optional>
 #include <span>
 #include <string_view>
+#include <tuple>
 #include <unordered_map>
 #include <vector>
 namespace mmltk::backend::data::benchmark_internal {
 inline constexpr std::uint32_t kCoconutRecoveryPolicy = 1;
 struct CoconutSegmentSupport {
  std::uint64_t area = 0;
- std::uint32_t min_x = UINT32_MAX, min_y = UINT32_MAX, max_x = 0, max_y = 0;
+ dataset::RowMajorMaskBounds bounds;
  std::vector<RLEPair> runs;
  std::optional<NormalizedBox> recovered;
  bool carved = false;
@@ -31,12 +35,35 @@ public:
             mmltk::common::concurrency::CancellationObservation cancellation = {});
 
 private:
+ using Cancellation = mmltk::common::concurrency::CancellationObservation;
+ using GroupKey = std::tuple<std::uint64_t, bool, bool>;
+ struct Candidate {
+  const NormalizedBox* box = nullptr;
+  std::span<const RLEPair> runs;
+  dataset::RowMajorMaskBounds bounds;
+  std::size_t group = 0;
+ };
+ struct Group {
+  GroupKey key;
+  std::size_t begin = 0, dropped = 0, end = 0, candidate_count = 0;
+  bool valid = true;
+ };
+ [[nodiscard]] static bool candidate_mask(const NormalizedAnnotationIndex& index, std::uint32_t width, std::uint32_t height,
+                                           Candidate& candidate, Cancellation cancellation);
+ [[nodiscard]] static bool intersects(const CoconutSegmentSupport& support, const Candidate& candidate, Cancellation cancellation);
  struct Originals {
   const NormalizedAnnotationIndex* index = nullptr;
   std::unordered_map<std::uint64_t, const NormalizedImage*> images;
  };
  [[nodiscard]] const Originals* originals(CoconutImageNamespace source) const noexcept;
  Originals train_, validation_;
+ // Flat image/group workspaces retain only high-water capacity, never historical keys.
+ std::vector<Group> groups_;
+ std::vector<std::size_t> ordinals_;
+ std::vector<Candidate> candidates_;
+ std::vector<std::uint8_t> represented_;
+ std::vector<const Candidate*> remaining_;
+ std::vector<std::uint64_t> identities_;
  std::vector<RLEPair> union_, scratch_;
 };
 }  // namespace mmltk::backend::data::benchmark_internal

@@ -1,5 +1,6 @@
 #pragma once  // backend.data private implementation boundary
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <span>
 #include <vector>
@@ -32,6 +33,9 @@ struct MaskResizeScratch {
 // Fills a nearest-center source-coordinate lookup for scaling a mask axis from source_extent to
 // target_extent. lookup must already be sized to target_extent.
 void fill_center_scale_lookup(std::span<std::uint32_t> lookup, std::uint32_t target_extent, std::uint32_t source_extent, const char* overflow_context);
+// Accumulates one validated nonempty [begin, end) run at a nonzero width.
+// A null output skips geometry; validation and cancellation remain caller-owned.
+void include_row_major_mask_run(RowMajorMaskBounds* bounds, std::size_t begin, std::size_t end, std::uint32_t width);
 [[nodiscard]] RowMajorMaskBounds row_major_mask_bounds(std::span<const RLEPair> pairs, MaskDimensions dimensions);
 [[nodiscard]] EncodedRowMajorMask encode_dense_row_major_mask(std::span<const std::uint8_t> dense, MaskDimensions dimensions);
 void materialize_row_major_mask(std::span<const RLEPair> pairs, MaskDimensions dimensions, std::vector<std::uint8_t>* dense,

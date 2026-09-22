@@ -499,10 +499,7 @@ private:
    if (segment.id == 0 || segment.id > 0xffffffU || !segment_by_id_.emplace(segment.id, i).second) invalid("duplicate/invalid segment ID");
    auto& support = support_[i];
    support.area = 0;
-   support.min_x = UINT32_MAX;
-   support.min_y = UINT32_MAX;
-   support.max_x = 0;
-   support.max_y = 0;
+   support.bounds = {};
    support.runs.clear();
    support.recovered.reset();
    support.carved = false;
@@ -524,10 +521,7 @@ private:
     if (found == segment_by_id_.end()) invalid("PNG references undeclared segment " + std::to_string(id));
     auto& support = support_[found->second];
     support.area += end - begin;
-    support.min_x = std::min(support.min_x, begin % static_cast<std::uint32_t>(width));
-    support.max_x = std::max(support.max_x, (end - 1U) % static_cast<std::uint32_t>(width) + 1U);
-    support.min_y = std::min(support.min_y, begin / static_cast<std::uint32_t>(width));
-    support.max_y = std::max(support.max_y, begin / static_cast<std::uint32_t>(width) + 1U);
+    dataset::include_row_major_mask_run(&support.bounds, begin, end, static_cast<std::uint32_t>(width));
     if (record.segments[found->second].isthing) {
      if (!support.runs.empty() && support.runs.back().start + support.runs.back().length == begin)
       support.runs.back().length += end - begin;
@@ -593,10 +587,10 @@ private:
      }
      continue;
     }
-    box.x1 = static_cast<float>(static_cast<double>(support.min_x) / width);
-    box.y1 = static_cast<float>(static_cast<double>(support.min_y) / height);
-    box.x2 = static_cast<float>(static_cast<double>(support.max_x) / width);
-    box.y2 = static_cast<float>(static_cast<double>(support.max_y) / height);
+    box.x1 = static_cast<float>(static_cast<double>(support.bounds.min_x) / width);
+    box.y1 = static_cast<float>(static_cast<double>(support.bounds.min_y) / height);
+    box.x2 = static_cast<float>(static_cast<double>(support.bounds.max_x) / width);
+    box.y2 = static_cast<float>(static_cast<double>(support.bounds.max_y) / height);
    }
    if (!std::isfinite(box.x1) || !std::isfinite(box.y1) || !std::isfinite(box.x2) || !std::isfinite(box.y2) || box.x2 <= box.x1 || box.y2 <= box.y1)
     invalid("normalized box coordinates are not representable");
