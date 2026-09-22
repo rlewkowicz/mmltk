@@ -6,6 +6,7 @@
 #include <vector>
 #include "src/test_support/cuda_test_utils.hpp"
 #include "src/backend/imaging/raster/image_operations.h"
+#include "src/backend/imaging/raster/chw_image.h"
 import mmltk.backend.imaging.raster;
 namespace {
 using mmltk::backend::imaging::raster::launch_bgr_split_to_planar_float;
@@ -175,5 +176,50 @@ TEST_CASE("Flat mask runs match independent pixel membership through clipped row
   CUDA_ASSERT_OK(cudaFree(storage));
  }
  CUDA_ASSERT_OK(cudaFree(pairs));
+ CUDA_ASSERT_OK(cudaStreamDestroy(stream));
+}
+
+TEST_CASE("RGB byte and CHW conversion preserve every byte with odd extents and padded pitch", "[backend][cuda][raster]") {
+ namespace raster = mmltk::backend::imaging::raster;
+ if (!has_cuda_device()) SKIP("no CUDA device available");
+ auto stream = create_nonblocking_stream_on_device_zero();
+ constexpr std::uint32_t width = 257U, height = 3U;
+ constexpr std::size_t count = width * height, pitch = width * 4U + 13U, guard = 7U;
+ std::vector<std::uint8_t> rgb(count * 3U), expected(guard * 2U + pitch * height, 0xA7U);
+ std::vector<float> chw(count * 3U);
+ for (std::size_t pixel = 0U; pixel < count; ++pixel) {
+  const auto output = guard + pixel / width * pitch + pixel % width * 4U;
+  for (std::size_t channel = 0U; channel < 3U; ++channel) {
+   const auto value = static_cast<std::uint8_t>(pixel + channel * 79U);
+   rgb[pixel * 3U + channel] = value;
+   chw[channel * count + pixel] = static_cast<float>(value) * (1.0F / 255.0F);
+   expected[output + channel] = value;
+  }
+  expected[output + 3U] = 255U;
+ }
+ void* source = nullptr;
+ std::uint8_t* destination = nullptr;
+ CUDA_ASSERT_OK(cudaMalloc(&source, chw.size() * sizeof(float)));
+ CUDA_ASSERT_OK(cudaMalloc(reinterpret_cast<void**>(&destination), expected.size()));
+ for (bool bytes : {false, true}) {
+  CUDA_ASSERT_OK(cudaMemcpyAsync(source, bytes ? static_cast<const void*>(rgb.data()) : chw.data(), bytes ? rgb.size() : chw.size() * sizeof(float), cudaMemcpyHostToDevice, stream));
+  CUDA_ASSERT_OK(cudaMemsetAsync(destination, 0xA7, expected.size(), stream));
+  const auto convert = [&](std::uint32_t w, std::uint32_t h, std::size_t row) {
+   return bytes ? raster::rgb8_to_rgba(static_cast<const std::uint8_t*>(source), w, h, destination + guard, row, stream)
+                : raster::chw_float_to_rgba(static_cast<const float*>(source), w, h, destination + guard, row, stream);
+  };
+  CHECK(convert(0U, height, pitch) == cudaErrorInvalidValue);
+  CHECK(convert(width, 0U, pitch) == cudaErrorInvalidValue);
+  CHECK(convert(width, height, width * 4U - 1U) == cudaErrorInvalidValue);
+  CUDA_ASSERT_OK(static_cast<cudaError_t>(convert(width, height, pitch)));
+  CUDA_ASSERT_OK(cudaStreamSynchronize(stream));
+  std::vector<std::uint8_t> actual(expected.size());
+  CUDA_ASSERT_OK(cudaMemcpy(actual.data(), destination, actual.size(), cudaMemcpyDeviceToHost));
+  CHECK(actual == expected);
+ }
+ CHECK(raster::rgb8_to_rgba(nullptr, width, height, destination, pitch, stream) == cudaErrorInvalidValue);
+ CHECK(raster::rgb8_to_rgba(static_cast<const std::uint8_t*>(source), width, height, nullptr, pitch, stream) == cudaErrorInvalidValue);
+ CUDA_ASSERT_OK(cudaFree(destination));
+ CUDA_ASSERT_OK(cudaFree(source));
  CUDA_ASSERT_OK(cudaStreamDestroy(stream));
 }

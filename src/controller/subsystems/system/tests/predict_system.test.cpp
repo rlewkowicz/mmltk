@@ -382,6 +382,7 @@ TEST_CASE("prediction transfer faults settle or retain exact source custody", "[
 TEST_CASE("preview slot reuse orders cross-stream writes and preserves fault custody", "[controller][gpu]") {
  namespace gpu = mmltk::frameworks::gpu;
  namespace runtime = mmltk::backend::ml::runtime;
+ const bool decoded = GENERATE(false, true);
  const auto execution = gpu::resolve_device_execution(0, mmltk::common::system::NumaTopology::Capture());
  REQUIRE(cudaSetDevice(0) == cudaSuccess);
  cudaStream_t first_raw = nullptr, second_raw = nullptr;
@@ -391,13 +392,19 @@ TEST_CASE("preview slot reuse orders cross-stream writes and preserves fault cus
  std::unique_ptr<std::remove_pointer_t<cudaStream_t>, decltype(&cudaStreamDestroy)> second(second_raw, &cudaStreamDestroy);
  const auto classes = std::make_shared<const mmltk::backend::data::catalog::ClassCatalog>(std::vector<std::string>{"object"});
  const std::array<float, 12> pixels{};
- auto input = PredictionSource::Device(execution, {2U, 2U}, pixels, {}, classes);
+ const std::array<std::uint8_t, 12> rgb{};
+ auto input = PredictionSource::Device(execution, {2U, 2U}, pixels, {{.class_reference = 0}}, classes);
+ auto bytes = PredictionSource::Decoded({2U, 2U}, rgb, classes);
+ auto custody = std::make_shared<std::pair<std::shared_ptr<void>, std::shared_ptr<void>>>(input.custody(), bytes.custody());
  gpu::DeviceContext context(0, gpu::cuda_image_copy_backend(), gpu::DeviceContextMode::Isolated, execution.placement.numa_node, execution);
  PredictionTransferFault fault;
  for (int stage : {0, 1, 2, 3, 4}) {
   fault.Reset();
   mmltk::controller::detail::PredictionPreviewPool pool(execution, context, PredictionTransferFault::Operations(), {}, 1U);
-  auto capture = [&](cudaStream_t stream) { return pool.Capture(input.pixels(), {2U, 2U}, reinterpret_cast<std::uintptr_t>(stream), {}, input.annotations(), classes, 1, nullptr, input.custody()); };
+  auto capture = [&](cudaStream_t stream) {
+   return pool.Capture(decoded ? nullptr : input.pixels(), {2U, 2U}, reinterpret_cast<std::uintptr_t>(stream), input.detections(), input.annotations(), classes, 1,
+    decoded ? bytes.rgb8() : nullptr, custody);
+  };
   auto previous = capture(first.get());
   REQUIRE(previous);
   previous.reset();  // The peer copy need not have completed or been drawn.
@@ -424,6 +431,7 @@ TEST_CASE("preview recapture invalidates retained scratch and destination region
  namespace gpu = mmltk::frameworks::gpu;
  // CLEANUP-IGNORE: An alias and ordinary policy/context construction precede independently owned test resources.
  using Composition = detail::PredictionPreviewComposition;
+ const bool decoded = GENERATE(false, true);
  const auto execution = gpu::resolve_device_execution(0, mmltk::common::system::NumaTopology::Capture());
  gpu::DeviceContext context(0, gpu::cuda_image_copy_backend(), gpu::DeviceContextMode::Isolated, execution.placement.numa_node, execution);
  PredictionReceiverFault fault;
@@ -438,8 +446,11 @@ TEST_CASE("preview recapture invalidates retained scratch and destination region
   const auto count = side * side;
   std::vector<float> pixels(count * 3U, 0.0F);
   std::fill_n(pixels.begin() + generation * count, count, 1.0F);
-  auto source = PredictionSource::Device(execution, {side, side}, pixels, {}, classes);
-  auto frame = pool.Capture(source.pixels(), {side, side}, 0U, {}, source.annotations(), classes, 1, nullptr, source.custody(), nullptr, nullptr, {}, true);
+  std::vector<std::uint8_t> rgb(count * 3U, 0U);
+  for (std::size_t pixel = 0U; pixel < count; ++pixel) rgb[pixel * 3U + generation] = 255U;
+  const bool bytes = decoded != (generation == 1U);
+  auto source = bytes ? PredictionSource::Decoded({side, side}, rgb, classes) : PredictionSource::Device(execution, {side, side}, pixels, {}, classes);
+  auto frame = pool.Capture(source.pixels(), {side, side}, 0U, {}, source.annotations(), classes, 1, source.rgb8(), source.custody(), nullptr, nullptr, {}, true);
   REQUIRE(frame);
   if (slot) CHECK(frame.get() == slot);  // Weak preparation records cannot occupy a raw slot.
   slot = frame.get();
@@ -459,6 +470,100 @@ TEST_CASE("preview recapture invalidates retained scratch and destination region
    CHECK(fault.draws == generation + 1U);
   }
  }
+}
+TEST_CASE("decoded compact preview retains bytes through retry and release without widening admission", "[controller][gpu]") {
+ namespace gpu = mmltk::frameworks::gpu;
+ namespace rfdetr = mmltk::backend::models::rfdetr;
+ using Composition = detail::PredictionPreviewComposition;
+ const auto execution = gpu::resolve_device_execution(0, mmltk::common::system::NumaTopology::Capture());
+ gpu::DeviceContext context(0, gpu::cuda_image_copy_backend(), gpu::DeviceContextMode::Isolated, execution.placement.numa_node, execution);
+ PredictionReceiverFault fault;
+ ScopedPredictionReceiverFault receiver(fault);
+ PredictionTransferFault transfer;
+ auto operations = PredictionReceiverFault::Operations();
+ operations.copy = PredictionTransferFault::Operations().copy;
+ detail::PredictionPreviewPool pool(execution, context, operations, {}, 1U);
+ gpu::SystemImageRuntime runtime({.device = 0, .output_layout = gpu::ImageProductLayout::CleanAndSemantic, .adopted_context = context});
+ const auto classes = std::make_shared<const mmltk::backend::data::catalog::ClassCatalog>(std::vector<std::string>{"object"});
+ // Odd 3P puts every typed annotation after required alignment padding.
+ constexpr VisualExtent extent{3U, 3U};
+ std::array<std::uint8_t, 27U> rgb{};
+ for (std::size_t index = 0U; index < rgb.size(); ++index) rgb[index] = static_cast<std::uint8_t>(index * 9U);
+ auto decoded = PredictionSource::Decoded(extent, rgb, classes);
+ const std::array<float, 27U> unused{};
+ const std::array<std::uint8_t, 9U> mask{1, 0, 0, 0, 1, 0, 0, 0, 1};
+ auto annotations = PredictionSource::Device(execution, extent, unused, {{.class_reference = 0, .bbox_xyxy = {0, 0, 2, 2}}}, classes, mask);
+ auto custody = std::make_shared<std::pair<std::shared_ptr<void>, std::shared_ptr<void>>>(decoded.custody(), annotations.custody());
+ std::weak_ptr<void> lifetime = decoded.custody();
+ rfdetr::Prediction gt{.class_reference = 0};
+ gt.mask.runs.emplace_back(0U, 9U);
+ const std::array ground_truth{gt};
+ auto frame = pool.Capture(nullptr, extent, 0U, annotations.detections(), annotations.annotations(), classes, 1, decoded.rgb8(), custody, nullptr, nullptr, ground_truth, true);
+ REQUIRE(frame);
+ custody.reset();
+ decoded.custody().reset();
+ annotations.custody().reset();
+ fault.draw_failures_remaining = 1U;
+ {
+  auto candidate = runtime.AcquireOutput();
+  CHECK_THROWS(frame->Draw(runtime, candidate));
+ }
+ CHECK_FALSE(lifetime.expired());
+ CHECK(fault.uploaded_bytes == rgb.size());
+ const auto storage = fault.upload_destination.load();
+ REQUIRE(transfer.copies == 3);
+ CHECK(transfer.destinations[0] == storage + 28U);
+ CHECK(transfer.destinations[1] == storage + 44U);
+ CHECK(transfer.destinations[2] == storage + 48U);
+ CHECK(transfer.copy_bytes == std::array<std::size_t, 4U>{16U, 4U, 9U, 0U});
+ CHECK(transfer.destinations[0] % alignof(float) == 0U);
+ CHECK(transfer.destinations[1] % alignof(std::int32_t) == 0U);
+ const auto staging = fault.upload_staging.load();
+ for (unsigned draw = 0U; draw < 3U; ++draw) {
+  auto candidate = runtime.AcquireOutput();
+  const std::array regions{Composition::Region{frame, {0U, 0U, 3U, 3U}}};
+  Composition::Draw(runtime, candidate, extent, regions, {.prediction_boxes = false, .prediction_masks = true, .ground_truth_masks = true, .complementary_layers = true});
+  auto complete = runtime.CommitOutput(std::move(candidate));
+  CHECK(lifetime.expired());
+  auto image = complete.Borrow();
+  context.Bind();
+  std::array<std::uint8_t, 36U> pixels{}, semantic{};
+  for (std::size_t layer = 0U; layer < 2U; ++layer) {
+   const auto plane = image.plane(layer).plane();
+   REQUIRE(cudaMemcpy2D(layer == 0U ? pixels.data() : semantic.data(), 12U, reinterpret_cast<void*>(plane.data), plane.descriptor.pitch_bytes, 12U, 3U, cudaMemcpyDeviceToHost) == cudaSuccess);
+  }
+  for (std::size_t pixel = 0U; pixel < 9U; ++pixel) {
+   for (std::size_t channel = 0U; channel < 3U; ++channel) CHECK(pixels[pixel * 4U + channel] == rgb[pixel * 3U + channel]);
+   CHECK(pixels[pixel * 4U + 3U] == 255U);
+   CHECK(semantic[pixel * 4U + 3U] == 96U);
+   if (mask[pixel])
+    for (std::size_t channel = 0U; channel < 3U; ++channel) CHECK(semantic[pixel * 4U + channel] == 255U);
+  }
+ }
+ CHECK(fault.uploads == 3U); // RGB failure, RGB retry, and once-only ground truth.
+ CHECK(fault.uploaded_bytes == rgb.size() * 2U + 2U * sizeof(std::uint32_t));
+ CHECK(fault.upload_destination == storage + 60U); // 28 + 16 + 4 + 9 + 3, already word-aligned.
+ CHECK(fault.upload_destination.load() % alignof(std::uint32_t) == 0U);
+ // Pinned storage may grow for GT, but repeated settled draws never upload again.
+ CHECK(staging != 0U);
+ const auto retained_staging = fault.upload_staging.load() - rgb.size();
+ frame.reset();
+ auto tiny = PredictionSource::Decoded({1U, 1U}, std::array<std::uint8_t, 3U>{7U, 31U, 129U});
+ auto next = pool.Capture(nullptr, {1U, 1U}, 0U, {}, {}, tiny.classes(), 0, tiny.rgb8(), tiny.custody());
+ REQUIRE(next);
+ {
+  auto candidate = runtime.AcquireOutput();
+  next->Draw(runtime, candidate);
+ }
+ CHECK(fault.upload_destination == storage); // Existing raw high-water storage is reused.
+ CHECK(fault.upload_staging == retained_staging);
+ next.reset();
+ // No GPU read is reachable for either former refusal: 12P first, then the
+ // complete former 12P + annotations + scratch aggregate, even though RGB fits.
+ CHECK_THROWS_AS(pool.Capture(nullptr, {89478486U, 1U}, 0U, {}, {}, tiny.classes(), 0, tiny.rgb8(), tiny.custody()), std::invalid_argument);
+ CHECK_THROWS_AS(pool.Capture(nullptr, {60000000U, 1U}, 0U, {}, {}, tiny.classes(), 0, tiny.rgb8(), tiny.custody(), nullptr, nullptr, {}, true), std::invalid_argument);
+ CHECK_THROWS_AS(pool.Capture(nullptr, {83000000U, 1U}, 0U, annotations.detections(), annotations.annotations(), classes, 1, tiny.rgb8(), tiny.custody()), std::invalid_argument);
+ CHECK(fault.uploads == 4U);
 }
 TEST_CASE("ordinary preview allocation refusal leaves its decoded source intact", "[controller][gpu]") {
  namespace gpu = mmltk::frameworks::gpu;

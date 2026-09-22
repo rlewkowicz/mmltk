@@ -10,6 +10,7 @@
 #include "src/controller/subsystems/system/predict_system.h"
 #include "src/controller/subsystems/system/detail/prediction_preview.h"
 #include <atomic>
+#include <array>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
@@ -57,6 +58,9 @@ public:
  std::atomic_uint draw_failures_remaining = 0U;
  std::atomic_size_t draws = 0U;
  std::atomic_size_t uploads = 0U;
+ std::atomic_size_t uploaded_bytes = 0U;
+ std::atomic<std::uintptr_t> upload_destination = 0U;
+ std::atomic<std::uintptr_t> upload_staging = 0U;
  std::atomic_size_t semantic_writes = 0U;
  std::atomic_bool partial_semantic = false;
  std::size_t fail_upload_at = 0U;
@@ -67,6 +71,8 @@ public:
 private:
  static cudaError_t ClearSemantic(void*, std::size_t, int, std::size_t, std::size_t, cudaStream_t);
  static cudaError_t Upload(void*, const void*, std::size_t, cudaMemcpyKind, cudaStream_t);
+ static cudaError_t PartialDraw(std::uint32_t, std::uint8_t*, std::size_t, cudaStream_t) noexcept;
+ static int ConvertRgb8(const std::uint8_t*, std::uint32_t, std::uint32_t, std::uint8_t*, std::size_t, cudaStream_t) noexcept;
  static int Convert(const float*, std::uint32_t, std::uint32_t, std::uint8_t*, std::size_t, cudaStream_t) noexcept;
 };
 // Declare before users; release/stop/join guards belong after their futures or
@@ -106,6 +112,8 @@ public:
  PredictionTransferFault& operator=(const PredictionTransferFault&) = delete;
  void Reset();
  void Reset(Selection);
+ std::array<CUdeviceptr, 4U> destinations{};
+ std::array<std::size_t, 4U> copy_bytes{};
  int copies = 0;
  int settlements = 0;
  int waits = 0;

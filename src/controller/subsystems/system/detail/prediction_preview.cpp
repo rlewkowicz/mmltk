@@ -1,6 +1,5 @@
 #include "src/backend/imaging/raster/image_containment.h"
 #include "prediction_preview.h"
-#include "src/backend/imaging/resample/image_resize.h"
 #include "src/backend/ml/runtime/backend_factory.h"
 #include "src/frameworks/gpu/pinned_host_buffer.h"
 #include "src/backend/imaging/raster/chw_image.h"
@@ -67,10 +66,13 @@ struct PredictionPreviewFrame::State final {
  std::optional<gpu::DeviceContext> source_context;
  cudaEvent_t source_ready = nullptr;
  bool source_recorded = false;
+ enum class Pixels { ChwFloat, Rgb8 };
+ Pixels pixels = Pixels::ChwFloat;
  const std::uint8_t* rgb8 = nullptr;
  decltype(&cuMemHostRegister) register_host = &cuMemHostRegister;
  decltype(PredictionPreviewPool::TransferOperations::upload) upload = &cudaMemcpyAsync;
  decltype(&raster::chw_float_to_rgba) convert = &raster::chw_float_to_rgba;
+ decltype(&raster::rgb8_to_rgba) convert_rgb8 = &raster::rgb8_to_rgba;
  mmltk::common::system::ExecutionPlacement placement;
  std::shared_ptr<void> decoded_source;
  std::unique_ptr<gpu::PinnedHostBuffer> pinned;
@@ -162,7 +164,7 @@ PredictionPreviewPool::PredictionPreviewPool(
       slots_(preview_slot_count(slots)) {
  if (!retirement_->admission_open()) throw std::runtime_error("prediction preview retirement admission is closed");
  if (!operations_.wait || !operations_.copy || !operations_.record || !operations_.settle || !operations_.register_host || !operations_.upload || !operations_.clear_semantic || !operations_.convert ||
-     !operations_.context_api.get || !operations_.context_api.set)
+     !operations_.convert_rgb8 || !operations_.context_api.get || !operations_.context_api.set)
   throw std::invalid_argument("prediction transfer operations are incomplete");
  // Compatibility follows the retained context, device and execution owner.
  // A backend decorating CUDA operations does not create a different context.
@@ -198,10 +200,20 @@ std::shared_ptr<const PredictionPreviewFrame> PredictionPreviewPool::Capture(con
   ground_truth_words += gt.mask.runs.size() * 2U;
  }
  const auto raw_bytes = pixel_bytes + count * (4U * sizeof(float) + sizeof(std::int32_t) + 3U) + mask_bytes;
- const auto ground_truth_offset = (raw_bytes + 3U) & ~std::size_t{3U};
+ const auto admitted_ground_truth_offset = (raw_bytes + 3U) & ~std::size_t{3U};
+ const auto admitted_scratch_offset = admitted_ground_truth_offset + ground_truth_words * sizeof(std::uint32_t);
+ const auto admitted_bytes = admitted_scratch_offset + (composition ? pixel_count * 8U : 0U);
+ if (admitted_bytes > rfdetr::kMaximumPredictionTensorBytes) throw std::invalid_argument("prediction raw preview exceeds storage capacity");
+ // Admission above deliberately retains the former float and full aggregate bounds.
+ // Every physical extent is bounded by that admitted layout; RGB's aligned prefix
+ // cannot exceed 12P, including odd pixel counts.
+ const auto physical_pixels = rgb8 ? pixel_count * 3U : pixel_bytes;
+ const auto boxes_offset = (physical_pixels + alignof(float) - 1U) & ~(alignof(float) - 1U);
+ const auto physical_raw_bytes = boxes_offset + (raw_bytes - pixel_bytes);
+ const auto ground_truth_offset = (physical_raw_bytes + 3U) & ~std::size_t{3U};
  const auto scratch_offset = ground_truth_offset + ground_truth_words * sizeof(std::uint32_t);
  const auto bytes = scratch_offset + (composition ? pixel_count * 8U : 0U);
- if (bytes > rfdetr::kMaximumPredictionTensorBytes) throw std::invalid_argument("prediction raw preview exceeds storage capacity");
+ if (bytes > admitted_bytes) throw std::invalid_argument("prediction compact preview exceeds admitted storage");
  try {
   if (!*available) *available = std::shared_ptr<PredictionPreviewFrame>(new PredictionPreviewFrame(context_, retirement_, source_custody, operations_.context_api));
   auto& state = *(*available)->state_;
@@ -225,18 +237,20 @@ std::shared_ptr<const PredictionPreviewFrame> PredictionPreviewPool::Capture(con
    }
    state.context.Bind();
    state.Reserve(bytes);
+   state.pixels = rgb8 ? PredictionPreviewFrame::State::Pixels::Rgb8 : PredictionPreviewFrame::State::Pixels::ChwFloat;
    state.rgb8 = rgb8;
    state.decoded_source = rgb8 ? source_custody : std::shared_ptr<void>{};
    state.register_host = operations_.register_host;
    state.upload = operations_.upload;
    state.convert = operations_.convert;
+   state.convert_rgb8 = operations_.convert_rgb8;
    state.clear_semantic = operations_.clear_semantic;
    if (state.capture == std::numeric_limits<std::uint64_t>::max()) throw std::runtime_error("preview capture identity exhausted");
    ++state.capture;
    state.prepared = state.pending = {};
    state.placement = execution_.placement;
    state.extent = extent;
-   state.boxes_offset = pixel_bytes;
+   state.boxes_offset = boxes_offset;
    state.labels_offset = state.boxes_offset + count * 4U * sizeof(float);
    state.masks_offset = state.labels_offset + count * sizeof(std::int32_t);
    state.colors_offset = state.masks_offset + mask_bytes;
@@ -488,12 +502,12 @@ void PredictionPreviewFrame::DrawRegion(gpu::SystemImageRuntime& runtime, gpu::I
    state.pending = state.prepared;
    const bool upload_gt = write_semantic && ground_truth_masks && !state.prepared.ground_truth && !state.ground_truth_runs.empty();
    if ((state.rgb8 || upload_gt) && !state.pinned) state.pinned = std::make_unique<gpu::PinnedHostBuffer>(scope.Current(), state.placement, false, state.register_host);
-   const auto rgb_bytes = state.rgb8 ? static_cast<std::size_t>(state.extent.width) * state.extent.height * 3U * sizeof(float) : 0U;
+   const auto rgb_bytes = state.rgb8 ? static_cast<std::size_t>(state.extent.width) * state.extent.height * 3U : 0U;
    const auto gt_bytes = upload_gt ? state.ground_truth_runs.size() * sizeof(std::uint32_t) : 0U;
    if (rgb_bytes + gt_bytes != 0U) state.pinned->ensure_bytes(rgb_bytes + gt_bytes);
    if (state.rgb8) {
     const auto bytes = rgb_bytes;
-    mmltk::backend::imaging::resample::rgb_hwc_u8_to_nchw_f32(state.rgb8, static_cast<float*>(state.pinned->data()), state.extent.width, state.extent.height);
+    std::memcpy(state.pinned->data(), state.rgb8, bytes);
     checked(state.upload(data, state.pinned->data(), bytes, cudaMemcpyHostToDevice, cuda_stream));
    }
    const bool scale = clean.descriptor.width != state.extent.width || clean.descriptor.height != state.extent.height;
@@ -506,7 +520,10 @@ void PredictionPreviewFrame::DrawRegion(gpu::SystemImageRuntime& runtime, gpu::I
    raster::MutableBytes overlay{semantic_pixels, semantic_pitch, static_cast<int>(state.extent.width), static_cast<int>(state.extent.height)};
    if (write_clean && (!scale || !state.prepared.clean)) {
     if (scale) state.prepared.clean = false;
-    checked(static_cast<cudaError_t>(state.convert(reinterpret_cast<const float*>(data), state.extent.width, state.extent.height, clean_pixels, clean_pitch, cuda_stream)));
+    const auto converted = state.pixels == State::Pixels::Rgb8
+                            ? state.convert_rgb8(data, state.extent.width, state.extent.height, clean_pixels, clean_pitch, cuda_stream)
+                            : state.convert(reinterpret_cast<const float*>(data), state.extent.width, state.extent.height, clean_pixels, clean_pitch, cuda_stream);
+    checked(static_cast<cudaError_t>(converted));
     if (scale) state.pending.clean = true;
    }
    const PredictionPreviewComposition::Options semantic_options{prediction_boxes, prediction_masks, ground_truth_boxes, ground_truth_masks, complementary_layers};

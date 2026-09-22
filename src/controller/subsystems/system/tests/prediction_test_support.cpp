@@ -98,6 +98,9 @@ cudaError_t PredictionReceiverFault::Upload(void* destination, const void* sourc
  if (copied != cudaSuccess) return copied;
  auto* fault = receiver_fault.load();
  if (!fault) return cudaSuccess;
+ fault->uploaded_bytes += bytes;
+ fault->upload_destination = reinterpret_cast<std::uintptr_t>(destination);
+ fault->upload_staging = reinterpret_cast<std::uintptr_t>(source);
  const auto ordinal = ++fault->uploads;
  if (!fault->enabled || (fault->fail_upload_at != 0U && fault->fail_upload_at != ordinal)) return cudaSuccess;
  // Actual upload/pinned allocation precede injection; physical test work is
@@ -107,7 +110,7 @@ cudaError_t PredictionReceiverFault::Upload(void* destination, const void* sourc
  if (fault->terminal) throw gpu::ImageStreamExecutionFailure(std::make_exception_ptr(std::runtime_error("injected receiver completion failure")));
  return settled == cudaSuccess ? cudaErrorMemoryAllocation : settled;
 }
-int PredictionReceiverFault::Convert(const float* source, std::uint32_t width, std::uint32_t height, std::uint8_t* destination, std::size_t pitch, cudaStream_t stream) noexcept {
+cudaError_t PredictionReceiverFault::PartialDraw(std::uint32_t width, std::uint8_t* destination, std::size_t pitch, cudaStream_t stream) noexcept {
  auto* fault = receiver_fault.load();
  bool fail = false;
  if (fault) {
@@ -123,7 +126,15 @@ int PredictionReceiverFault::Convert(const float* source, std::uint32_t width, s
   const auto settled = cudaStreamSynchronize(stream);
   return settled == cudaSuccess ? cudaErrorMemoryAllocation : settled;
  }
- return mmltk::backend::imaging::raster::chw_float_to_rgba(source, width, height, destination, pitch, stream);
+ return cudaSuccess;
+}
+int PredictionReceiverFault::Convert(const float* source, std::uint32_t width, std::uint32_t height, std::uint8_t* destination, std::size_t pitch, cudaStream_t stream) noexcept {
+ const auto status = PartialDraw(width, destination, pitch, stream);
+ return status == cudaSuccess ? mmltk::backend::imaging::raster::chw_float_to_rgba(source, width, height, destination, pitch, stream) : status;
+}
+int PredictionReceiverFault::ConvertRgb8(const std::uint8_t* source, std::uint32_t width, std::uint32_t height, std::uint8_t* destination, std::size_t pitch, cudaStream_t stream) noexcept {
+ const auto status = PartialDraw(width, destination, pitch, stream);
+ return status == cudaSuccess ? mmltk::backend::imaging::raster::rgb8_to_rgba(source, width, height, destination, pitch, stream) : status;
 }
 cudaError_t PredictionReceiverFault::ClearSemantic(void* destination, std::size_t pitch, int value, std::size_t width, std::size_t height, cudaStream_t stream) {
  auto* fault = receiver_fault.load();
@@ -137,7 +148,7 @@ cudaError_t PredictionReceiverFault::ClearSemantic(void* destination, std::size_
  return cudaMemset2DAsync(destination, pitch, value, width, height, stream);
 }
 detail::PredictionPreviewPool::TransferOperations PredictionReceiverFault::Operations() {
- return {&cuMemcpyPeerAsync, &cudaEventRecord, &cudaStreamSynchronize, &cuMemHostRegister, &Upload, {}, &Convert, &cudaStreamWaitEvent, &ClearSemantic};
+ return {&cuMemcpyPeerAsync, &cudaEventRecord, &cudaStreamSynchronize, &cuMemHostRegister, &Upload, {}, &Convert, &cudaStreamWaitEvent, &ClearSemantic, &ConvertRgb8};
 }
 namespace {
 class SettlementBackend final : public gpu::ImageCopyBackend {
@@ -208,10 +219,19 @@ void PredictionTransferFault::Reset() { Reset(Selection{}); }
 void PredictionTransferFault::Reset(Selection selection) {
  selection_ = selection;
  copies = settlements = waits = 0;
+ destinations = {};
+ copy_bytes = {};
  waited_stream = nullptr;
 }
 CUresult PredictionTransferFault::Copy(CUdeviceptr destination, CUcontext destination_context, CUdeviceptr source, CUcontext source_context, std::size_t bytes, CUstream stream) {
- if (transfer_fault && ++transfer_fault->copies == transfer_fault->selection_.fail_copy) return CUDA_ERROR_INVALID_VALUE;
+ if (transfer_fault) {
+  const auto index = static_cast<std::size_t>(transfer_fault->copies++);
+  if (index < transfer_fault->destinations.size()) {
+   transfer_fault->destinations[index] = destination;
+   transfer_fault->copy_bytes[index] = bytes;
+  }
+  if (transfer_fault->copies == transfer_fault->selection_.fail_copy) return CUDA_ERROR_INVALID_VALUE;
+ }
  return cuMemcpyPeerAsync(destination, destination_context, source, source_context, bytes, stream);
 }
 cudaError_t PredictionTransferFault::Record(cudaEvent_t event, cudaStream_t stream) {

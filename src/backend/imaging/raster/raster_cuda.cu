@@ -166,14 +166,17 @@ __device__ void apply_box_color<raster_math::RgbaPixelU8>(raster_math::RgbaPixel
 template <typename PixelT>
 __device__ void apply_boxes_and_labels(int x, int y, const float* boxes, const uint8_t* colors, const int* labels, int num_instances, int box_thickness, PixelT& pixel, bool labels_enabled = true) {
  if (box_thickness <= 0 && !labels_enabled) return;
- for (int i = 0; i < num_instances; ++i) {
+ for (int i = num_instances; i-- > 0;) {
   const int x1 = static_cast<int>(boxes[i * 4 + 0]);
   const int y1 = static_cast<int>(boxes[i * 4 + 1]);
   const int x2 = static_cast<int>(boxes[i * 4 + 2]);
   const int y2 = static_cast<int>(boxes[i * 4 + 3]);
   const bool is_edge = box_thickness > 0 && pixel_hits_box_edge(x, y, x1, y1, x2, y2, box_thickness);
   const bool is_label = labels_enabled && pixel_hits_label_digit(x, y, x1, y1, labels[i]);
-  if (is_edge || is_label) { apply_box_color(pixel, colors, i * 3); }
+  if (is_edge || is_label) {
+   apply_box_color(pixel, colors, i * 3);
+   break;
+  }
  }
 }
 template <typename InstancesT>
@@ -245,10 +248,11 @@ __global__ void draw_analysis_overlay_rgba_pitched_kernel(const draw_launch::Ana
  if (x >= overlay.width || y >= overlay.height) { return; }
  raster_math::RgbaPixelU8 pixel{};
  if (instances.masks != nullptr) {
-  for (int i = 0; i < count; ++i) {
+  for (int i = count; i-- > 0;) {
    if (!instances.masks[i * overlay.width * overlay.height + y * overlay.width + x]) { continue; }
    raster_math::apply_rgb(&pixel.r, &pixel.g, &pixel.b, instances.colors, i * 3);
    pixel.a = launch.mask_alpha;
+   break;
   }
  }
  apply_boxes_and_labels(x, y, instances.boxes, instances.colors, instances.labels, count, launch.box_thickness, pixel, launch.labels);

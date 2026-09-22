@@ -100,6 +100,7 @@ public:
   decltype(&mmltk::backend::imaging::raster::chw_float_to_rgba) convert = &mmltk::backend::imaging::raster::chw_float_to_rgba;
   decltype(&cudaStreamWaitEvent) wait = &cudaStreamWaitEvent;
   decltype(&cudaMemset2DAsync) clear_semantic = &cudaMemset2DAsync;
+  decltype(&mmltk::backend::imaging::raster::rgb8_to_rgba) convert_rgb8 = &mmltk::backend::imaging::raster::rgb8_to_rgba;
  };
  PredictionPreviewPool(mmltk::frameworks::gpu::DeviceExecution, mmltk::frameworks::gpu::DeviceContext);
  PredictionPreviewPool(mmltk::frameworks::gpu::DeviceExecution, mmltk::frameworks::gpu::DeviceContext, TransferOperations operations,
