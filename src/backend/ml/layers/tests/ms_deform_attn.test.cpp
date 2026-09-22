@@ -29,7 +29,6 @@ void test_cuda_ms_deform_attn_matches_reference() {
 }
 }  // namespace
 TEST_CASE("test_cuda_ms_deform_attn_matches_reference", "[backend][ml][layers]") { test_cuda_ms_deform_attn_matches_reference(); }
-
 TEST_CASE("Deformable attention overwrites every output across chunks and empty support", "[backend][ml][layers]") {
  if (mmltk::testsupport::checked_cuda_device_count() == 0) SKIP("CUDA unavailable; attention overwrite coverage remains unverified");
  const int step = GENERATE(1, 2, 4, 64);

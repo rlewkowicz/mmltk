@@ -135,8 +135,8 @@ TEST_CASE("Matcher costs copy only compact active shapes after high-water growth
    REQUIRE(matrix.eq(11).all().item<bool>());
   };
   constexpr auto limit = std::numeric_limits<int64_t>::max() / sizeof(float);
-  const auto reject_layout = [&](at::IntArrayRef queries, at::IntArrayRef counts, const at::Device& device) {
-   REQUIRE_THROWS(workspace.prepare_cost(queries, counts, device));
+  const auto reject_layout = [&](at::IntArrayRef queries, at::IntArrayRef counts, const at::Device& target_device) {
+   REQUIRE_THROWS(workspace.prepare_cost(queries, counts, target_device));
    require_completed();
   };
   const at::Device gpu(at::kCUDA, device_index);
@@ -167,15 +167,17 @@ TEST_CASE("Matcher costs copy only compact active shapes after high-water growth
    const auto other_device = static_cast<c10::DeviceIndex>((device + 1) % devices);
    reject_layout({2}, {1}, at::Device(at::kCUDA, other_device));
   }
-  struct Layout final { std::vector<int64_t> queries, counts; };
+  struct Layout final {
+   std::vector<int64_t> queries, counts;
+  };
   const std::vector<Layout> layouts{
-   {{2}, {1}},                         // Equal-size reuse.
-   {{8, 3, 5}, {0, 4, 1}},             // Regrow within the initial high water.
-   {{5, 8, 3}, {2, 0, 3}},             // Same sizes, changed layer and image intervals.
-   {{1, 0}, {0, 1}},                   // Shrink both metadata vectors, including an empty layer.
-   {{3, 2, 1}, {1, 0, 2}},             // Regrow metadata and storage within capacity.
-   {{9, 7, 5, 3}, {0, 3, 0, 4, 2}},   // Genuine metadata and cost-storage growth.
-   {{2}, {0, 0}},                     // Empty image intervals after growth.
+   {{2}, {1}},                       // Equal-size reuse.
+   {{8, 3, 5}, {0, 4, 1}},           // Regrow within the initial high water.
+   {{5, 8, 3}, {2, 0, 3}},           // Same sizes, changed layer and image intervals.
+   {{1, 0}, {0, 1}},                 // Shrink both metadata vectors, including an empty layer.
+   {{3, 2, 1}, {1, 0, 2}},           // Regrow metadata and storage within capacity.
+   {{9, 7, 5, 3}, {0, 3, 0, 4, 2}},  // Genuine metadata and cost-storage growth.
+   {{2}, {0, 0}},                    // Empty image intervals after growth.
   };
   std::uint64_t expected_bytes = counters.cost_bytes;
   for (std::size_t iteration = 0; iteration < layouts.size(); ++iteration) {
@@ -265,7 +267,6 @@ TEST_CASE("Assignment transports retain autograd indices across overlapping resu
   REQUIRE(at::equal(mmltk::backend::ml::cuda::numa_readback(values.grad()), at::tensor({1.f, 0.f, 1.f, 0.f, 1.f, 0.f}).view({2, 3})));
  }
 }
-
 TEST_CASE("Compact matcher matrices preserve CUDA pair bits across independent lookup ranges", "[rfdetr][matcher][cuda][numa]") {
  int devices = 0;
  if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0) SKIP("CUDA unavailable; compact pair arithmetic remains unverified");

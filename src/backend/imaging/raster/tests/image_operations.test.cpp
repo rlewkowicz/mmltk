@@ -178,7 +178,6 @@ TEST_CASE("Flat mask runs match independent pixel membership through clipped row
  CUDA_ASSERT_OK(cudaFree(pairs));
  CUDA_ASSERT_OK(cudaStreamDestroy(stream));
 }
-
 TEST_CASE("RGB byte and CHW conversion preserve every byte with odd extents and padded pitch", "[backend][cuda][raster]") {
  namespace raster = mmltk::backend::imaging::raster;
  if (!has_cuda_device()) SKIP("no CUDA device available");

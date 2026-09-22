@@ -945,9 +945,9 @@ TEST_CASE("UTF8 block boundaries agree with scalar recognition", "[frameworks][s
    }
   }
  };
- for (const std::string_view scalar : {std::string_view{}, std::string_view{"a\0b", 3U}, std::string_view{"\x7f"}, std::string_view{"\xc2\x80"},
-       std::string_view{"\xdf\xbf"}, std::string_view{"\xe0\xa0\x80"}, std::string_view{"\xed\x9f\xbf"}, std::string_view{"\xef\xbf\xbf"},
-       std::string_view{"\xf0\x90\x80\x80"}, std::string_view{"\xf4\x8f\xbf\xbf"}}) compare(scalar);
+ for (const std::string_view scalar : {std::string_view{}, std::string_view{"a\0b", 3U}, std::string_view{"\x7f"}, std::string_view{"\xc2\x80"}, std::string_view{"\xdf\xbf"},
+       std::string_view{"\xe0\xa0\x80"}, std::string_view{"\xed\x9f\xbf"}, std::string_view{"\xef\xbf\xbf"}, std::string_view{"\xf0\x90\x80\x80"}, std::string_view{"\xf4\x8f\xbf\xbf"}})
+  compare(scalar);
  for (const auto scalar : mmltk::testsupport::kMalformedUtf8) compare(scalar);
  std::string dense;
  for (std::size_t count = 0U; count < 64U; ++count) dense += "\xf0\x90\x80\x80";

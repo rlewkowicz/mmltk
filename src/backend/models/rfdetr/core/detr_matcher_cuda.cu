@@ -37,8 +37,8 @@ namespace {
 struct MatcherPair final {
  int64_t batch_index, query_index, target_index, output_index;
 };
-__device__ __forceinline__ bool matcher_pair(int64_t index, const int64_t* target_offsets, const int64_t* target_counts, const int64_t* output_offsets,
- int64_t output_targets, int64_t batch_size, int64_t query_count, int64_t max_targets, int64_t total_targets, MatcherPair& pair) {
+__device__ __forceinline__ bool matcher_pair(int64_t index, const int64_t* target_offsets, const int64_t* target_counts, const int64_t* output_offsets, int64_t output_targets, int64_t batch_size,
+ int64_t query_count, int64_t max_targets, int64_t total_targets, MatcherPair& pair) {
  const int64_t total = batch_size * query_count * max_targets;
  if (index >= total) { return false; }
  const int64_t target_slot = index % max_targets;
@@ -58,8 +58,8 @@ __device__ __forceinline__ bool matcher_pair(int64_t index, const int64_t* targe
 }  // namespace
 template <typename Logit, typename Box>
 __global__ void matcher_cost_kernel(float* output, const Logit* pred_logits, const Box* pred_boxes, const int64_t* target_labels, const float* target_boxes, const int64_t* target_offsets,
- const int64_t* target_counts, const int64_t* output_offsets, int64_t output_targets, int64_t batch_size, int64_t query_count, int64_t class_count, int64_t max_targets, int64_t total_targets, float class_cost, float bbox_cost,
- float giou_cost, float focal_alpha) {
+ const int64_t* target_counts, const int64_t* output_offsets, int64_t output_targets, int64_t batch_size, int64_t query_count, int64_t class_count, int64_t max_targets, int64_t total_targets,
+ float class_cost, float bbox_cost, float giou_cost, float focal_alpha) {
  const int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
  MatcherPair pair;
  if (!matcher_pair(index, target_offsets, target_counts, output_offsets, output_targets, batch_size, query_count, max_targets, total_targets, pair)) { return; }
@@ -80,8 +80,8 @@ __global__ void matcher_cost_kernel(float* output, const Logit* pred_logits, con
  output[output_index] = isfinite(cost) ? cost : 0.0f;
 }
 template <typename Logit>
-__global__ void matcher_mask_cost_kernel(float* output, const Logit* pred_logits, const float* target_masks, const int64_t* target_offsets, const int64_t* target_counts, const int64_t* output_offsets, int64_t output_targets, int64_t batch_size,
- int64_t query_count, int64_t max_targets, int64_t total_targets, int64_t point_count, float ce_cost, float dice_cost) {
+__global__ void matcher_mask_cost_kernel(float* output, const Logit* pred_logits, const float* target_masks, const int64_t* target_offsets, const int64_t* target_counts, const int64_t* output_offsets,
+ int64_t output_targets, int64_t batch_size, int64_t query_count, int64_t max_targets, int64_t total_targets, int64_t point_count, float ce_cost, float dice_cost) {
  constexpr int kWarpSize = 32;
  const int lane = static_cast<int>(threadIdx.x) & (kWarpSize - 1);
  const int64_t warp_index = (static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x) / static_cast<int64_t>(kWarpSize);
@@ -151,7 +151,8 @@ float checked_cost_coefficient(const double value, const char* name) {
  return static_cast<float>(value);
 }
 void pairwise_detection_cost_cuda_out(const torch::Tensor& output, const torch::Tensor& pred_logits, const torch::Tensor& pred_boxes, const torch::Tensor& target_labels,
- const torch::Tensor& target_boxes, const torch::Tensor& target_offsets, const torch::Tensor& target_counts, const torch::Tensor& output_offsets, int64_t padded_queries, int64_t max_targets, double class_cost, double bbox_cost, double giou_cost, double focal_alpha) {
+ const torch::Tensor& target_boxes, const torch::Tensor& target_offsets, const torch::Tensor& target_counts, const torch::Tensor& output_offsets, int64_t padded_queries, int64_t max_targets,
+ double class_cost, double bbox_cost, double giou_cost, double focal_alpha) {
  check_matcher_tensor(output, torch::kFloat32, 1, "matcher cost output");
  check_matcher_floating_tensor(pred_logits, 3, "matcher logits");
  check_matcher_floating_tensor(pred_boxes, 3, "matcher boxes");
@@ -192,8 +193,8 @@ void pairwise_detection_cost_cuda_out(const torch::Tensor& output, const torch::
   AT_DISPATCH_FLOATING_TYPES_AND2(at::ScalarType::Half, at::ScalarType::BFloat16, pred_boxes.scalar_type(), "pairwise_detection_cost_boxes", [&] {
    using Box = scalar_t;
    matcher_cost_kernel<Logit, Box><<<blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(output.data_ptr<float>(), pred_logits.data_ptr<Logit>(), pred_boxes.data_ptr<Box>(),
-    target_labels.data_ptr<int64_t>(), target_boxes.data_ptr<float>(), target_offsets.data_ptr<int64_t>(), target_counts.data_ptr<int64_t>(), output_offsets.data_ptr<int64_t>(), output_targets, batch, queries, classes, max_targets,
-    total_targets, checked_class_cost, checked_bbox_cost, checked_giou_cost, checked_alpha);
+    target_labels.data_ptr<int64_t>(), target_boxes.data_ptr<float>(), target_offsets.data_ptr<int64_t>(), target_counts.data_ptr<int64_t>(), output_offsets.data_ptr<int64_t>(), output_targets, batch,
+    queries, classes, max_targets, total_targets, checked_class_cost, checked_bbox_cost, checked_giou_cost, checked_alpha);
   });
  });
  TORCH_CHECK(cudaGetLastError() == cudaSuccess, "matcher cost CUDA kernel launch failed");
@@ -211,8 +212,7 @@ void pairwise_mask_cost_cuda_add_(const torch::Tensor& output, const torch::Tens
   "matcher mask CUDA tensors must share one device");
  TORCH_CHECK(padded_queries >= pred_mask_logits.size(1), "matcher mask output shape does not cover predictions");
  TORCH_CHECK(target_masks.size(1) == pred_mask_logits.size(2), "matcher sampled prediction and target masks disagree");
- TORCH_CHECK(target_offsets.size(0) == pred_mask_logits.size(0) && target_counts.size(0) == pred_mask_logits.size(0),
-  "matcher mask batch metadata does not cover predictions");
+ TORCH_CHECK(target_offsets.size(0) == pred_mask_logits.size(0) && target_counts.size(0) == pred_mask_logits.size(0), "matcher mask batch metadata does not cover predictions");
  const int64_t batch = pred_mask_logits.size(0);
  const int64_t queries = pred_mask_logits.size(1);
  const int64_t points = pred_mask_logits.size(2);
@@ -233,7 +233,8 @@ void pairwise_mask_cost_cuda_add_(const torch::Tensor& output, const torch::Tens
  const int blocks = static_cast<int>((pair_count + warps_per_block - 1) / warps_per_block);
  AT_DISPATCH_FLOATING_TYPES_AND2(at::ScalarType::Half, at::ScalarType::BFloat16, pred_mask_logits.scalar_type(), "pairwise_mask_cost", [&] {
   matcher_mask_cost_kernel<scalar_t><<<blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(output.data_ptr<float>(), pred_mask_logits.data_ptr<scalar_t>(), target_masks.data_ptr<float>(),
-   target_offsets.data_ptr<int64_t>(), target_counts.data_ptr<int64_t>(), output_offsets.data_ptr<int64_t>(), output_targets, batch, queries, max_targets, total_targets, points, checked_ce_cost, checked_dice_cost);
+   target_offsets.data_ptr<int64_t>(), target_counts.data_ptr<int64_t>(), output_offsets.data_ptr<int64_t>(), output_targets, batch, queries, max_targets, total_targets, points, checked_ce_cost,
+   checked_dice_cost);
  });
  TORCH_CHECK(cudaGetLastError() == cudaSuccess, "matcher mask cost CUDA kernel launch failed");
 }

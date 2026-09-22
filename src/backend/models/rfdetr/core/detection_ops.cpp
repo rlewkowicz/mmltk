@@ -591,8 +591,8 @@ std::vector<MatchIndices> compute_matcher_indices_for_layers(
  for (size_t image = 0; image < targets.counts.size(); ++image) {
   const auto count = targets.counts[image];
   const auto offset = targets.offsets[image];
-  if (count < 0 || count > std::numeric_limits<int64_t>::max() - total_targets || offset < 0 ||
-      offset > available_targets || count > available_targets - offset) throw std::invalid_argument("matcher target range is invalid");
+  if (count < 0 || count > std::numeric_limits<int64_t>::max() - total_targets || offset < 0 || offset > available_targets || count > available_targets - offset)
+   throw std::invalid_argument("matcher target range is invalid");
   total_targets += count;
  }
  int64_t max_queries = 0;
@@ -633,11 +633,12 @@ std::vector<MatchIndices> compute_matcher_indices_for_layers(
   target_offsets = target_offsets.contiguous();
   target_counts = target_counts.contiguous();
   const auto output_offsets = scratch.output_offsets(targets.offsets, target_offsets);
-  const auto target_indices =
-   targets.target_indices.defined() && targets.target_indices.device() == device ? targets.target_indices : torch::arange(targets.all_labels.numel(), torch::TensorOptions().dtype(torch::kInt64).device(device));
+  const auto target_indices = targets.target_indices.defined() && targets.target_indices.device() == device
+                               ? targets.target_indices
+                               : torch::arange(targets.all_labels.numel(), torch::TensorOptions().dtype(torch::kInt64).device(device));
   for (size_t layer_index = 0; layer_index < layers.size(); ++layer_index) {
-   build_cuda_matcher_cost_into(*layers[layer_index], targets, config, target_indices, scratch.device_layer(static_cast<int64_t>(layer_index)),
-    target_offsets, target_counts, output_offsets, max_queries, max_targets_per_image);
+   build_cuda_matcher_cost_into(
+    *layers[layer_index], targets, config, target_indices, scratch.device_layer(static_cast<int64_t>(layer_index)), target_offsets, target_counts, output_offsets, max_queries, max_targets_per_image);
   }
   {
    mmltk::common::logging::ScopedProfile profile_rfdetr_matcher_cost_to_cpu{"rfdetr.matcher.cost_to_cpu"};

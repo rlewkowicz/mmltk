@@ -1208,7 +1208,8 @@ TEST_CASE("Cross-device display damage copies cropped planes and matches complet
   static_cast<void>(backend->TakeTransfers());
   workspace->Finalize(source.Borrow(), coverage, [&](auto clean, auto overlay, auto destination, auto submitted, auto stream) {
    std::size_t finalized_bytes = 0U;
-   if (submitted.full_image) finalized_bytes = width * height * 4U;
+   if (submitted.full_image)
+    finalized_bytes = width * height * 4U;
    else {
     CHECK(submitted.regions.size() <= 8U);
     for (const auto region : submitted.regions) {
@@ -1354,9 +1355,7 @@ TEST_CASE("Alternating displays accumulate skipped damage and recover from histo
   const auto baseline = content();
   const std::array<ImageWorkspaceRegion, 1U> region{{{x, y, x + 1, y + 1}}};
   expected[static_cast<std::size_t>(y) * 16U + x * 4U] = value;
-  product.Publish(stream, 4U, 3U, [value, x, y](auto clean, auto, auto) {
-   *(reinterpret_cast<std::uint8_t*>(clean.data) + y * clean.descriptor.pitch_bytes + x * 4U) = value;
-  });
+  product.Publish(stream, 4U, 3U, [value, x, y](auto clean, auto, auto) { *(reinterpret_cast<std::uint8_t*>(clean.data) + y * clean.descriptor.pitch_bytes + x * 4U) = value; });
   history.Record(content(), {.regions = region, .full_image = false, .baseline = baseline});
  };
  change(37U, 0, 0);
@@ -2067,8 +2066,7 @@ TEST_CASE("Workspace damage retains bounded disjoint conservative patches", "[gp
   hull.x2 = std::max(hull.x2, rectangle.x2);
   hull.y2 = std::max(hull.y2, rectangle.y2);
   for (auto y = rectangle.y1; y < rectangle.y2; ++y)
-   for (auto x = rectangle.x1; x < rectangle.x2; ++x)
-    CHECK(std::ranges::any_of(coverage.regions, [&](auto result) { return result.x1 <= x && x < result.x2 && result.y1 <= y && y < result.y2; }));
+   for (auto x = rectangle.x1; x < rectangle.x2; ++x) CHECK(std::ranges::any_of(coverage.regions, [&](auto result) { return result.x1 <= x && x < result.x2 && result.y1 <= y && y < result.y2; }));
  }
  for (std::size_t index = 0U; index != coverage.regions.size(); ++index) {
   const auto rectangle = coverage.regions[index];
@@ -2084,14 +2082,14 @@ TEST_CASE("Workspace damage preserves exact chains and empty coverage lifetime",
  ImageWorkspaceDamage damage;
  const ImageWorkspaceRegion patch{1, 2, 3, 4};
  damage.Record({7U, 2U}, {.regions = {&patch, 1U}, .full_image = false, .baseline = {7U, 1U}});
- damage.Record({7U, 2U}, {}); // Duplicate publication cannot replace the recorded change.
+ damage.Record({7U, 2U}, {});  // Duplicate publication cannot replace the recorded change.
  damage.Record({}, {});
  auto coverage = damage.Since({7U, 1U}, {7U, 2U}, 31U);
  REQUIRE_FALSE(coverage.full_image);
  REQUIRE(coverage.regions.size() == 1U);
  CHECK(coverage.regions.front() == patch);
  damage.Record({7U, 3U}, {.full_image = false, .baseline = {7U, 2U}});
- CHECK(coverage.regions.front() == patch); // Recording does not overwrite the retained result.
+ CHECK(coverage.regions.front() == patch);  // Recording does not overwrite the retained result.
  for (const auto baseline : {ImageWorkspaceContent{7U, 2U}, ImageWorkspaceContent{7U, 3U}}) {
   coverage = damage.Since(baseline, {7U, 3U}, 32U);
   REQUIRE_FALSE(coverage.full_image);
@@ -2105,8 +2103,7 @@ TEST_CASE("Workspace damage preserves exact chains and empty coverage lifetime",
  damage.Record({7U, 5U}, {.full_image = false, .baseline = {7U, 4U}});
  CHECK(damage.Since({7U, 3U}, {7U, 5U}, 32U).full_image);
  ImageWorkspaceDamage bounded;
- for (std::uint64_t revision = 2U; revision <= 65U; ++revision)
-  bounded.Record({7U, revision}, {.regions = {&patch, 1U}, .full_image = false, .baseline = {7U, revision - 1U}});
+ for (std::uint64_t revision = 2U; revision <= 65U; ++revision) bounded.Record({7U, revision}, {.regions = {&patch, 1U}, .full_image = false, .baseline = {7U, revision - 1U}});
  CHECK_FALSE(bounded.Since({7U, 1U}, {7U, 65U}, 33U).full_image);
  bounded.Record({7U, 66U}, {.full_image = false, .baseline = {7U, 65U}});
  CHECK(bounded.Since({7U, 1U}, {7U, 66U}, 33U).full_image);

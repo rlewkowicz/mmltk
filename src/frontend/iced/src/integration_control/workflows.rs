@@ -222,7 +222,9 @@ fn validation_caption_patches(
     }
     let metadata = &content.metadata;
     let sample = if metadata.detail {
-        metadata.samples.iter()
+        metadata
+            .samples
+            .iter()
             .find(|sample| metadata.selected.as_ref() == Some(&sample.identity))
     } else {
         metadata.samples.get(usize::from(sample_index))
@@ -243,10 +245,14 @@ fn validation_caption_patches(
         let width = metadata.frame.extent.width / 2;
         let height = metadata.frame.extent.height / 3;
         Rectangle {
-            x: receipt.image.x + (f32::from(sample_index % 2) * width as f32 * sx - crop_x as f32)
-                * receipt.image.width / crop_width as f32,
-            y: receipt.image.y + (f32::from(sample_index / 2) * height as f32 * sy - crop_y as f32)
-                * receipt.image.height / crop_height as f32,
+            x: receipt.image.x
+                + (f32::from(sample_index % 2) * width as f32 * sx - crop_x as f32)
+                    * receipt.image.width
+                    / crop_width as f32,
+            y: receipt.image.y
+                + (f32::from(sample_index / 2) * height as f32 * sy - crop_y as f32)
+                    * receipt.image.height
+                    / crop_height as f32,
             width: width as f32 * sx * receipt.image.width / crop_width as f32,
             height: height as f32 * sy * receipt.image.height / crop_height as f32,
         }
@@ -255,20 +261,30 @@ fn validation_caption_patches(
         return;
     };
     let layers: [Vec<_>; 2] = std::array::from_fn(|layer| {
-        sample.labels.iter().rev()
+        sample
+            .labels
+            .iter()
+            .rev()
             .filter(|label| label.groundtruth == (layer == 0))
             .filter_map(|label| {
-                let x = (sample.crop.x as f32 + label.box_.first.x * sample.crop.width as f32
-                    / sample.pixelextent.width as f32) * sx;
-                let y = (sample.crop.y as f32 + label.box_.first.y * sample.crop.height as f32
-                    / sample.pixelextent.height as f32) * sy;
+                let x = (sample.crop.x as f32
+                    + label.box_.first.x * sample.crop.width as f32
+                        / sample.pixelextent.width as f32)
+                    * sx;
+                let y = (sample.crop.y as f32
+                    + label.box_.first.y * sample.crop.height as f32
+                        / sample.pixelextent.height as f32)
+                    * sy;
                 let bounds = Rectangle {
-                    x: receipt.image.x + (x - crop_x as f32) * receipt.image.width / crop_width as f32,
-                    y: receipt.image.y + (y - crop_y as f32) * receipt.image.height / crop_height as f32,
+                    x: receipt.image.x
+                        + (x - crop_x as f32) * receipt.image.width / crop_width as f32,
+                    y: receipt.image.y
+                        + (y - crop_y as f32) * receipt.image.height / crop_height as f32,
                     width: (label.name.chars().count() as f32 * 7.5 + 8.0).max(20.0) * scale,
                     height: 19.0 * scale,
                 };
-                bounds.intersection(&clip)
+                bounds
+                    .intersection(&clip)
                     .map(|_| (bounds, label.rgb.0, !label.name.trim().is_empty()))
             })
             .take(16)
@@ -276,7 +292,10 @@ fn validation_caption_patches(
     });
     for (det_index, (det, det_rgb, _)) in layers[1].iter().enumerate() {
         for (gt_index, (gt, gt_rgb, has_text)) in layers[0].iter().enumerate() {
-            let Some(mut interior) = det.intersection(gt).and_then(|value| value.intersection(&clip)) else {
+            let Some(mut interior) = det
+                .intersection(gt)
+                .and_then(|value| value.intersection(&clip))
+            else {
                 continue;
             };
             interior.x += scale;
@@ -300,15 +319,20 @@ fn validation_caption_patches(
             let height = interior.height.min(15.0);
             let patch = Rectangle {
                 x: (target.x - width / 2.0).clamp(interior.x, interior.x + interior.width - width),
-                y: (target.y - height / 2.0).clamp(interior.y, interior.y + interior.height - height),
+                y: (target.y - height / 2.0)
+                    .clamp(interior.y, interior.y + interior.height - height),
                 width,
                 height,
             };
             // Browser rounding must retain the target too, not merely a legal
             // sliver of background beside it. Occlusion uses the final patch.
-            if target.x < patch.x.ceil() || target.x >= (patch.x + width).floor()
-                || target.y < patch.y.ceil() || target.y >= (patch.y + height).floor()
-                || layers[0][..gt_index].iter().chain(&layers[1][..det_index])
+            if target.x < patch.x.ceil()
+                || target.x >= (patch.x + width).floor()
+                || target.y < patch.y.ceil()
+                || target.y >= (patch.y + height).floor()
+                || layers[0][..gt_index]
+                    .iter()
+                    .chain(&layers[1][..det_index])
                     .any(|(later, _, _)| later.intersection(&patch).is_some())
             {
                 continue;
@@ -391,8 +415,12 @@ mod tests {
         };
         let mut patches = Vec::new();
         for stage in 0..=8 {
-            (metadata.overlays.groundtruthlayer, metadata.overlays.predictionlayer) = super::layer_selection(stage);
-            let content = crate::presentation_surface::labels::ValidationContent::new(metadata.clone());
+            (
+                metadata.overlays.groundtruthlayer,
+                metadata.overlays.predictionlayer,
+            ) = super::layer_selection(stage);
+            let content =
+                crate::presentation_surface::labels::ValidationContent::new(metadata.clone());
             super::validation_caption_patches(&content, &receipt, 0, &mut patches);
             assert_eq!(patches.len(), 10);
             assert!((patches[0] - 52.2).abs() < 0.001);
@@ -404,7 +432,8 @@ mod tests {
         for detail in [false, true] {
             metadata.detail = detail;
             metadata.selected = detail.then(|| metadata.samples[0].identity.clone());
-            let content = crate::presentation_surface::labels::ValidationContent::new(metadata.clone());
+            let content =
+                crate::presentation_surface::labels::ValidationContent::new(metadata.clone());
             for (scale, expected_origin) in [
                 (1.0, [61.0, 41.0]),
                 (1.5, [91.5, 64.35]),
@@ -417,16 +446,27 @@ mod tests {
                 let scaled = super::super::probe::ProbeReceipt {
                     bounds: crate::presentation_surface::physical_bounds(bounds, scale),
                     image: crate::presentation_surface::physical_bounds(bounds, scale),
-                    clip: crate::presentation_surface::physical_bounds(iced::Rectangle {
-                        x: 60.0, y: 40.0, width: 100.0, height: 100.0,
-                    }, scale),
+                    clip: crate::presentation_surface::physical_bounds(
+                        iced::Rectangle {
+                            x: 60.0,
+                            y: 40.0,
+                            width: 100.0,
+                            height: 100.0,
+                        },
+                        scale,
+                    ),
                     scale,
                     ..receipt.clone()
                 };
                 super::validation_caption_patches(&content, &scaled, 0, &mut patches);
                 assert_eq!(patches.len(), 10);
                 let factor = f64::from(scale);
-                let expected = [expected_origin[0], expected_origin[1], (19.7 * factor).min(128.0), 15.0];
+                let expected = [
+                    expected_origin[0],
+                    expected_origin[1],
+                    (19.7 * factor).min(128.0),
+                    15.0,
+                ];
                 for (actual, expected) in patches[..4].iter().zip(expected) {
                     assert!((*actual - expected).abs() < 0.001);
                     assert!(actual.is_finite());
@@ -448,19 +488,35 @@ mod tests {
                 assert!(patches[1] + patches[3] <= 56.4 * factor + 0.001);
                 assert_eq!(&patches[4..], &[0.0, 255.0, 255.0, 255.0, 0.0, 0.0]);
                 for clip in [
-                    iced::Rectangle { x: 52.0, y: 38.0, width: 8.0, height: 30.0 },
-                    iced::Rectangle { x: 50.0, y: 39.0, width: 40.0, height: 6.0 },
+                    iced::Rectangle {
+                        x: 52.0,
+                        y: 38.0,
+                        width: 8.0,
+                        height: 30.0,
+                    },
+                    iced::Rectangle {
+                        x: 50.0,
+                        y: 39.0,
+                        width: 40.0,
+                        height: 6.0,
+                    },
                 ] {
                     let excluded = super::super::probe::ProbeReceipt {
                         clip: crate::presentation_surface::physical_bounds(clip, scale),
                         ..scaled.clone()
                     };
                     super::validation_caption_patches(&content, &excluded, 0, &mut patches);
-                    assert!(patches.is_empty(), "clip excludes the horizontal or vertical glyph target");
+                    assert!(
+                        patches.is_empty(),
+                        "clip excludes the horizontal or vertical glyph target"
+                    );
                 }
             }
             for scale in [0.0, -1.0, f32::NAN, f32::INFINITY] {
-                let invalid = super::super::probe::ProbeReceipt { scale, ..receipt.clone() };
+                let invalid = super::super::probe::ProbeReceipt {
+                    scale,
+                    ..receipt.clone()
+                };
                 super::validation_caption_patches(&content, &invalid, 0, &mut patches);
                 assert!(patches.is_empty());
             }
@@ -471,7 +527,10 @@ mod tests {
             blank.samples[0].labels[1].name = name.into();
             let content = crate::presentation_surface::labels::ValidationContent::new(blank);
             super::validation_caption_patches(&content, &receipt, 0, &mut patches);
-            assert!(patches.is_empty(), "a blank GT paragraph has no glyph target");
+            assert!(
+                patches.is_empty(),
+                "a blank GT paragraph has no glyph target"
+            );
         }
         let content = crate::presentation_surface::labels::ValidationContent::new(metadata);
         super::validation_caption_patches(&content, &receipt, 5, &mut patches);
@@ -1157,7 +1216,11 @@ impl State {
                     } else {
                         -1
                     },
-                    if picture == Picture::Detail { 6 } else { u32::from(index) },
+                    if picture == Picture::Detail {
+                        6
+                    } else {
+                        u32::from(index)
+                    },
                     &self.caption_patches,
                     &callback,
                 );
@@ -1749,11 +1812,15 @@ impl State {
                 }) =>
             {
                 self.validation_layer = index;
-                completed("validation_layer_settled", [
-                    f64::from(u8::from(detail)), index as f64,
-                    f64::from(u8::from(layer_selection(index).0)),
-                    f64::from(u8::from(layer_selection(index).1)),
-                ]);
+                completed(
+                    "validation_layer_settled",
+                    [
+                        f64::from(u8::from(detail)),
+                        index as f64,
+                        f64::from(u8::from(layer_selection(index).0)),
+                        f64::from(u8::from(layer_selection(index).1)),
+                    ],
+                );
                 self.workflow_step(
                     driver,
                     Step::Pixels(
@@ -2027,12 +2094,15 @@ impl State {
                                         || !content.metadata.overlays.predictionboxes)
                             })
                             .and_then(|(surface, content)| {
-                                let receipt = super::probe::current_receipt(&picture.control(index))?;
+                                let receipt =
+                                    super::probe::current_receipt(&picture.control(index))?;
                                 if receipt.surface.frame != surface.frame {
                                     return None;
                                 }
                                 validation_caption_patches(
-                                    &content, &receipt, index,
+                                    &content,
+                                    &receipt,
+                                    index,
                                     &mut self.caption_patches,
                                 );
                                 self.caption_receipt = Some(receipt);

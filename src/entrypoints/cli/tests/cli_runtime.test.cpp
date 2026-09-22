@@ -897,7 +897,6 @@ TEST_CASE("CLI rejects invalid resize modes through ordinary option parsing", "[
   CHECK(result.output_text.find("invalid enum value") != std::string::npos);
  }
 }
-
 TEST_CASE("CLI logging admission precedes root and RF-DETR help and dispatch", "[core][cli][logging]") {
  for (const std::vector<std::string>& arguments : std::vector<std::vector<std::string>>{{"--help"}, {"rfdetr", "--help"}, {"rfdetr", "info", "--help"}, {"unknown-command"}}) {
   for (const bool environment : {false, true}) {

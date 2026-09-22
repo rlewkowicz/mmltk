@@ -402,8 +402,8 @@ TEST_CASE("preview slot reuse orders cross-stream writes and preserves fault cus
   fault.Reset();
   mmltk::controller::detail::PredictionPreviewPool pool(execution, context, PredictionTransferFault::Operations(), {}, 1U);
   auto capture = [&](cudaStream_t stream) {
-   return pool.Capture(decoded ? nullptr : input.pixels(), {2U, 2U}, reinterpret_cast<std::uintptr_t>(stream), input.detections(), input.annotations(), classes, 1,
-    decoded ? bytes.rgb8() : nullptr, custody);
+   return pool.Capture(
+    decoded ? nullptr : input.pixels(), {2U, 2U}, reinterpret_cast<std::uintptr_t>(stream), input.detections(), input.annotations(), classes, 1, decoded ? bytes.rgb8() : nullptr, custody);
   };
   auto previous = capture(first.get());
   REQUIRE(previous);
@@ -540,9 +540,9 @@ TEST_CASE("decoded compact preview retains bytes through retry and release witho
     for (std::size_t channel = 0U; channel < 3U; ++channel) CHECK(semantic[pixel * 4U + channel] == 255U);
   }
  }
- CHECK(fault.uploads == 3U); // RGB failure, RGB retry, and once-only ground truth.
+ CHECK(fault.uploads == 3U);  // RGB failure, RGB retry, and once-only ground truth.
  CHECK(fault.uploaded_bytes == rgb.size() * 2U + 2U * sizeof(std::uint32_t));
- CHECK(fault.upload_destination == storage + 60U); // 28 + 16 + 4 + 9 + 3, already word-aligned.
+ CHECK(fault.upload_destination == storage + 60U);  // 28 + 16 + 4 + 9 + 3, already word-aligned.
  CHECK(fault.upload_destination.load() % alignof(std::uint32_t) == 0U);
  // Pinned storage may grow for GT, but repeated settled draws never upload again.
  CHECK(staging != 0U);
@@ -555,7 +555,7 @@ TEST_CASE("decoded compact preview retains bytes through retry and release witho
   auto candidate = runtime.AcquireOutput();
   next->Draw(runtime, candidate);
  }
- CHECK(fault.upload_destination == storage); // Existing raw high-water storage is reused.
+ CHECK(fault.upload_destination == storage);  // Existing raw high-water storage is reused.
  CHECK(fault.upload_staging == retained_staging);
  next.reset();
  // No GPU read is reachable for either former refusal: 12P first, then the

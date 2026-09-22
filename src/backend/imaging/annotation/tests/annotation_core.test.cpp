@@ -251,8 +251,7 @@ TEST_CASE("test_resolved_crop_preserves_mask_alpha", "[backend][imaging][annotat
  REQUIRE(resolved.crop_rgba[23] == 255U);
  REQUIRE(resolved.crop_rgba[35] == 255U);
 }
-void check_resolved_pixels(const AnnotationFrame& frame, const AnnotationObject& object, bool live, const std::vector<std::uint8_t>& expected,
- const AnnotationBox& box, std::string_view rle) {
+void check_resolved_pixels(const AnnotationFrame& frame, const AnnotationObject& object, bool live, const std::vector<std::uint8_t>& expected, const AnnotationBox& box, std::string_view rle) {
  const auto preview = build_reticle_preview(frame, object, live);
  const auto& resolved = require_single_resolved_object(preview);
  assert_resolved_bbox_and_mask(resolved, box, rle);
@@ -275,13 +274,11 @@ TEST_CASE("Annotation resolved support keeps exact mask bounds encoding and crop
  const auto frame = make_frame();
  const std::vector<std::uint8_t> suppressed{0, 0, 1, 0, 0, 0, 1, 0, 1, 1, 1, 0, 0, 0, 0, 0};
  check_resolved_pixels(frame, make_reticle_box_preview_object({0, 0, 3, 3}, true), false, suppressed, {0, 0, 3, 3}, "2:1 6:1 8:3");
- check_resolved_pixels(frame, make_reticle_box_preview_object({0, 0, 2, 2}, true, true), false,
-  {1, 1, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}, {0, 0, 2, 2}, "0:2 4:2");
+ check_resolved_pixels(frame, make_reticle_box_preview_object({0, 0, 2, 2}, true, true), false, {1, 1, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}, {0, 0, 2, 2}, "0:2 4:2");
  check_resolved_pixels(frame, make_reticle_box_preview_object({0, 0, 2, 2}, true), false, std::vector<std::uint8_t>(16), {0, 0, 2, 2}, "");
  const std::vector<std::uint8_t> edges{1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1};
  check_resolved_pixels(frame, make_mask_object({1, 1, 3, 3}, {0, 0, 4, 4}, edges, frame.frame_id, {}), false, edges, {0, 0, 4, 4}, "0:1 15:1");
- check_resolved_pixels(frame, make_mask_object({1, 1, 3, 3}, {0, 0, 4, 4}, std::vector<std::uint8_t>(16), frame.frame_id, {}), false,
-  std::vector<std::uint8_t>(16), {1, 1, 3, 3}, "");
+ check_resolved_pixels(frame, make_mask_object({1, 1, 3, 3}, {0, 0, 4, 4}, std::vector<std::uint8_t>(16), frame.frame_id, {}), false, std::vector<std::uint8_t>(16), {1, 1, 3, 3}, "");
  const auto cropped = make_capture_space_frame();
  check_resolved_pixels(cropped, make_capture_space_mask_preview_object(0, {}), true, {1, 0, 0, 0}, {0, 0, 1, 1}, "0:1");
  check_resolved_pixels(cropped, make_capture_space_mask_preview_object(cropped.frame_id + 1, {}), true, {1, 1, 1, 1}, {0, 0, 2, 2}, "0:4");

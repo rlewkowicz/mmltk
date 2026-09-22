@@ -39,7 +39,6 @@ TEST_CASE("Incremental SHA256 preserves chunk boundaries and sealed finalization
  CHECK(io::sha256_hex(empty.Finish()) == "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
  CHECK(io::sha256_bytes(bytes) == io::parse_sha256_hex("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"));
 }
-
 TEST_CASE("File digest handles empty files and complete multi-chunk input", "[digest]") {
  io::StagingDirectory temporary(std::filesystem::temp_directory_path() / "digest", ".", "-XXXXXX", "digest fixture");
  const auto path = temporary.path() / "input";
@@ -79,25 +78,38 @@ TEST_CASE("File digest handles empty files and complete multi-chunk input", "[di
 TEST_CASE("File digest rejects mutation and replacement during admission", "[digest]") {
  io::StagingDirectory temporary(std::filesystem::temp_directory_path() / "digest", ".", "-XXXXXX", "digest fixture");
  const auto path = temporary.path() / "input";
- { std::ofstream file(path); file << "abc"; }
+ {
+  std::ofstream file(path);
+  file << "abc";
+ }
  int checkpoints = 0;
  SECTION("truncation before the read cannot expose unwritten scratch") {
-  CHECK_THROWS_WITH(io::try_file_digests(path, true, [&] {
-   if (++checkpoints == 2) std::filesystem::resize_file(path, 1U);
-   return false;
-  }), "unexpected EOF during pread");
+  CHECK_THROWS_WITH(io::try_file_digests(path, true,
+                     [&] {
+                      if (++checkpoints == 2) std::filesystem::resize_file(path, 1U);
+                      return false;
+                     }),
+   "unexpected EOF during pread");
  }
  SECTION("growth after the read fails descriptor admission") {
-  CHECK_THROWS_WITH(io::try_file_digests(path, true, [&] {
-   if (++checkpoints == 3) { std::ofstream file(path, std::ios::app); file << "d"; }
-   return false;
-  }), "artifact changed while computing digest");
+  CHECK_THROWS_WITH(io::try_file_digests(path, true,
+                     [&] {
+                      if (++checkpoints == 3) {
+                       std::ofstream file(path, std::ios::app);
+                       file << "d";
+                      }
+                      return false;
+                     }),
+   "artifact changed while computing digest");
  }
  SECTION("replacement before final admission fails pathname custody") {
   CHECK_THROWS(io::try_file_digests(path, true, [&] {
    if (++checkpoints == 3) {
     const auto replacement = temporary.path() / "replacement";
-    { std::ofstream file(replacement); file << "abc"; }
+    {
+     std::ofstream file(replacement);
+     file << "abc";
+    }
     std::filesystem::rename(replacement, path);
    }
    return false;

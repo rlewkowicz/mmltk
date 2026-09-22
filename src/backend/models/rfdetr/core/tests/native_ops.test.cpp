@@ -869,7 +869,6 @@ TEST_CASE("matcher focal alpha changes dense and CUDA assignments consistently",
   CHECK(indices[0].first.item<std::int64_t>() == (alpha == .25 ? 1 : 0));
  }
 }
-
 TEST_CASE("CUDA matcher keeps exact grouped assignments for repeated and reordered target ranges", "[model][rfdetr][matcher][cuda][numa]") {
  namespace r = mmltk::backend::models::rfdetr;
  if (mmltk::testsupport::checked_cuda_device_count() == 0) SKIP("CUDA unavailable; compact assignment coverage remains unverified");

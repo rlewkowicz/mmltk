@@ -1706,14 +1706,20 @@ mod tests {
         assert!(std::ptr::eq(presented.overlay, &snapshot.overlay));
         let mut owned = presented.to_owned();
         owned.overlay.classselection.classes = vec![7, 2, 7];
-        assert_ne!(owned.overlay.classselection.classes, snapshot.overlay.classselection.classes);
+        assert_ne!(
+            owned.overlay.classselection.classes,
+            snapshot.overlay.classselection.classes
+        );
         state.record_submission(owned);
         snapshot.ready = false;
         let presented = state.presented_filter(Some(&snapshot)).unwrap();
         let submitted = &state.submitted_filter.as_ref().unwrap().request;
         assert!(std::ptr::eq(presented.filter, &submitted.filter));
         assert!(std::ptr::eq(presented.overlay, &submitted.overlay));
-        assert!(std::ptr::eq(state.presented_filter(None).unwrap().overlay, &submitted.overlay));
+        assert!(std::ptr::eq(
+            state.presented_filter(None).unwrap().overlay,
+            &submitted.overlay
+        ));
     }
 
     #[test]
@@ -1723,7 +1729,9 @@ mod tests {
         snapshot.ready = true;
         let request = submit_toggled_labels(&mut state, &snapshot);
         assert_eq!(
-            state.presented_filter(Some(&snapshot)).map(PresentedFilter::to_owned),
+            state
+                .presented_filter(Some(&snapshot))
+                .map(PresentedFilter::to_owned),
             Some(request.clone())
         );
         state.record_admission(snapshot.revision);
@@ -1736,7 +1744,9 @@ mod tests {
         state.rebase(Some(&settled), false);
         assert!(state.submitted_filter.is_none());
         assert_eq!(
-            state.presented_filter(Some(&settled)).map(PresentedFilter::to_owned),
+            state
+                .presented_filter(Some(&settled))
+                .map(PresentedFilter::to_owned),
             Some(ExploreFilterUpdate {
                 filter: settled.filter,
                 overlay: settled.overlay,

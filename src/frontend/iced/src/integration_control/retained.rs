@@ -2959,11 +2959,15 @@ impl State {
                     }
                     let Some(crate::presentation_surface::ExploreDisplay::Detail(shown, content)) =
                         crate::presentation_surface::explore_display(surface)
-                    else { return Task::none(); };
+                    else {
+                        return Task::none();
+                    };
                     let Some(receipt) = current_receipt(explore::DETAIL_WORKSPACE_ID) else {
                         return Task::none();
                     };
-                    if content.overlay() != &snapshot.overlay || receipt.surface.frame != shown.frame {
+                    if content.overlay() != &snapshot.overlay
+                        || receipt.surface.frame != shown.frame
+                    {
                         return Task::none();
                     }
                     // Re-arm the ordinary actual-draw observer once per settled
@@ -2975,13 +2979,19 @@ impl State {
                         rearm_viewer_observation();
                         return Task::none();
                     }
-                    reporting::emit(|sink| sink.record(
-                        "integration.viewer_class_selection", explore::DETAIL_WORKSPACE_ID,
-                        "paired-selection-retained-redraw",
-                        [self.detail_selection_step as f64, snapshot.frame.revision as f64,
-                         snapshot.overlay.classselection.classes.len() as f64,
-                         shown.frame.map_or(0, |frame| frame.slot) as f64],
-                    ));
+                    reporting::emit(|sink| {
+                        sink.record(
+                            "integration.viewer_class_selection",
+                            explore::DETAIL_WORKSPACE_ID,
+                            "paired-selection-retained-redraw",
+                            [
+                                self.detail_selection_step as f64,
+                                snapshot.frame.revision as f64,
+                                snapshot.overlay.classselection.classes.len() as f64,
+                                shown.frame.map_or(0, |frame| frame.slot) as f64,
+                            ],
+                        )
+                    });
                     if self.detail_selection_step == 4 {
                         return self.begin_upscale_series(widgets, driver, model, &snapshot.frame);
                     }
@@ -2989,11 +2999,13 @@ impl State {
                     self.detail_selection_redraw = false;
                     probes.await_viewer_draw();
                     rearm_viewer_observation();
-                    explore_message(explore::Message::Details(match self.detail_selection_step {
-                        1 => explore::details::Message::NoClasses,
-                        3 => explore::details::Message::ClassToggled(0),
-                        _ => explore::details::Message::AllClasses,
-                    }))
+                    explore_message(explore::Message::Details(
+                        match self.detail_selection_step {
+                            1 => explore::details::Message::NoClasses,
+                            3 => explore::details::Message::ClassToggled(0),
+                            _ => explore::details::Message::AllClasses,
+                        },
+                    ))
                 } else {
                     driver.phase = Phase::ViewerOverlay(index + 1);
                     widgets.arm(driver, overlay_control(index + 1, true))

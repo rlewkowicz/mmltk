@@ -42,9 +42,8 @@ void ImageWorkspaceDamage::Regions::Insert(ImageWorkspaceRegion region) noexcept
  for (std::size_t index = 0U; index < count_;) {
   const auto existing = rectangles_[index];
   const bool intersects = region.x1 < existing.x2 && existing.x1 < region.x2 && region.y1 < existing.y2 && existing.y1 < region.y2;
-  const bool rectangular_union =
-   (region.x1 == existing.x1 && region.x2 == existing.x2 && region.y1 <= existing.y2 && existing.y1 <= region.y2) ||
-   (region.y1 == existing.y1 && region.y2 == existing.y2 && region.x1 <= existing.x2 && existing.x1 <= region.x2);
+  const bool rectangular_union = (region.x1 == existing.x1 && region.x2 == existing.x2 && region.y1 <= existing.y2 && existing.y1 <= region.y2) ||
+                                 (region.y1 == existing.y1 && region.y2 == existing.y2 && region.x1 <= existing.x2 && existing.x1 <= region.x2);
   if (!intersects && !rectangular_union) {
    ++index;
    continue;

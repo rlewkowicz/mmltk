@@ -520,9 +520,8 @@ void PredictionPreviewFrame::DrawRegion(gpu::SystemImageRuntime& runtime, gpu::I
    raster::MutableBytes overlay{semantic_pixels, semantic_pitch, static_cast<int>(state.extent.width), static_cast<int>(state.extent.height)};
    if (write_clean && (!scale || !state.prepared.clean)) {
     if (scale) state.prepared.clean = false;
-    const auto converted = state.pixels == State::Pixels::Rgb8
-                            ? state.convert_rgb8(data, state.extent.width, state.extent.height, clean_pixels, clean_pitch, cuda_stream)
-                            : state.convert(reinterpret_cast<const float*>(data), state.extent.width, state.extent.height, clean_pixels, clean_pitch, cuda_stream);
+    const auto converted = state.pixels == State::Pixels::Rgb8 ? state.convert_rgb8(data, state.extent.width, state.extent.height, clean_pixels, clean_pitch, cuda_stream)
+                                                               : state.convert(reinterpret_cast<const float*>(data), state.extent.width, state.extent.height, clean_pixels, clean_pitch, cuda_stream);
     checked(static_cast<cudaError_t>(converted));
     if (scale) state.pending.clean = true;
    }

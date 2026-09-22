@@ -811,7 +811,14 @@ pub(in crate::integration_control) fn check_reset_atlas_callbacks(
         image: Rectangle { x: 17.0, ..bounds },
         ..draw
     };
-    record_probe_draw(EXPLORE_GALLERY, surface, bounds, moved_draw.image, bounds, 1.0);
+    record_probe_draw(
+        EXPLORE_GALLERY,
+        surface,
+        bounds,
+        moved_draw.image,
+        bounds,
+        1.0,
+    );
     assert!(!controller.probes.accepts_message(
         &controller.driver,
         &controller.pixel_checks,

@@ -1,5 +1,6 @@
 #include "src/controller/presentation/annotation_palette.h"
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/matchers/catch_matchers.hpp>
 #include <array>
 #include <algorithm>
 #include <string_view>
@@ -137,8 +138,8 @@ void check_mask_hits(subsystems::annotation::AnnotationDocument& editor) {
    contracts::AnnotationPointerTarget expected;
    if (const auto selected = editor.ui().editor.selected_object) {
     const auto& box = scene.objects[*selected].box;
-    const std::array<contracts::AnnotationPoint, 4> corners{{{box.first.x - 5, box.first.y - 5}, {box.second.x + 4, box.first.y - 5},
-     {box.second.x + 4, box.second.y + 4}, {box.first.x - 5, box.second.y + 4}}};
+    const std::array<contracts::AnnotationPoint, 4> corners{
+     {{box.first.x - 5, box.first.y - 5}, {box.second.x + 4, box.first.y - 5}, {box.second.x + 4, box.second.y + 4}, {box.first.x - 5, box.second.y + 4}}};
     for (std::size_t i = 0; i < corners.size(); ++i) {
      if (std::hypot(x - corners[i].x, y - corners[i].y) <= 6.0F) {
       expected = {*selected, static_cast<std::uint16_t>(i), contracts::AnnotationHandleRole::BoxCorner};
@@ -149,9 +150,8 @@ void check_mask_hits(subsystems::annotation::AnnotationDocument& editor) {
    if (!expected.object) {
     for (std::size_t i = scene.objects.size(); i-- != 0;) {
      const auto& object = scene.objects[i];
-     if (object.enabled && std::ranges::any_of(object.mask.runs, [x, y](auto run) {
-      return run.row == static_cast<std::uint16_t>(std::clamp(y, 0.0F, 65535.0F)) && x >= run.first && x < run.last + 1.0F;
-     })) {
+     if (object.enabled &&
+         std::ranges::any_of(object.mask.runs, [x, y](auto run) { return run.row == static_cast<std::uint16_t>(std::clamp(y, 0.0F, 65535.0F)) && x >= run.first && x < run.last + 1.0F; })) {
       expected.object = static_cast<std::uint16_t>(i);
       break;
      }
@@ -167,7 +167,8 @@ TEST_CASE("Annotation normalized mask membership preserves fractional hits and m
  namespace document = subsystems::annotation;
  document::AnnotationDocument editor;
  auto scene = test_scene("direct://mask-membership");
- contracts::AnnotationObject object{.name = contracts::AnnotationText::From("mask"), .shape = contracts::AnnotationShape::Mask,
+ contracts::AnnotationObject object{.name = contracts::AnnotationText::From("mask"),
+  .shape = contracts::AnnotationShape::Mask,
   .mask = {.runs = {{14, 10, 14}, {0, 3, 5}, {12, 14, 14}, {10, 12, 14}, {10, 10, 12}, {11, 10, 10}, {11, 14, 14}, {12, 10, 10}, {13, 10, 10}, {13, 14, 14}}, .present = true}};
  scene.objects = {object, object, object};
  scene.objects.back().enabled = false;
@@ -1021,7 +1022,7 @@ std::vector<mmltk::controller::contracts::AnnotationMaskRun> pixel_runs(const Ma
  }
  return runs;
 }
-}
+}  // namespace
 TEST_CASE("Annotation disk cleanup agrees with scalar support for every admitted radius") {
  namespace c = mmltk::controller;
  namespace d = c::subsystems::annotation;
@@ -1039,8 +1040,10 @@ TEST_CASE("Annotation disk cleanup agrees with scalar support for every admitted
     const auto shrunk = scalar_disk(pixels, width, height, radius, true);
     for (auto operation : {Operation::Dilate, Operation::Erode, Operation::Open, Operation::Close}) {
      CAPTURE(radius, width, height, support, operation);
-     const auto expected = operation == Operation::Dilate ? grown : operation == Operation::Erode ? shrunk :
-      operation == Operation::Open ? scalar_disk(shrunk, width, height, radius, false) : scalar_disk(grown, width, height, radius, true);
+     const auto expected = operation == Operation::Dilate  ? grown
+                           : operation == Operation::Erode ? shrunk
+                            : operation == Operation::Open ? scalar_disk(shrunk, width, height, radius, false)
+                                                           : scalar_disk(grown, width, height, radius, true);
      c::contracts::AnnotationObject object{.shape = c::contracts::AnnotationShape::Mask, .mask = {.runs = pixel_runs(pixels, width, height)}};
      d::cleanup_mask(object, operation, static_cast<std::uint16_t>(radius), static_cast<std::uint16_t>(width), static_cast<std::uint16_t>(height));
      CHECK(object.mask.runs == pixel_runs(expected, width, height));
@@ -1080,7 +1083,7 @@ TEST_CASE("Annotation cleanup preserves component ties and transient run admissi
  REQUIRE(editor.Open(scene).outcome == d::DocumentOutcome::Applied);
  REQUIRE(editor.Edit({.value = c::AnnotationObjectEdit{0U}}).outcome == d::DocumentOutcome::Applied);
  const auto before = editor.ui();
- for (std::uint16_t radius : {0, 33, 65535}) {
+ for (const auto radius : std::array<std::uint16_t, 3>{0, 33, 65535}) {
   CHECK(editor.Edit({.value = c::AnnotationMaskCleanupEdit{Operation::Dilate, radius}}).outcome == d::DocumentOutcome::Rejected);
   CHECK(editor.ui().scene == before.scene);
   CHECK(editor.ui().document_revision == before.document_revision);

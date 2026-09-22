@@ -361,7 +361,6 @@ TEST_CASE("COCO maxDets applies independently to each category", "[rfdetr][evalu
  CHECK(r::resolve_evaluation_max_dets(0) == 500);
  CHECK(r::resolve_evaluation_max_dets(1) == 1);
 }
-
 TEST_CASE("packed mask words preserve scalar runs and exception-time state", "[rfdetr][evaluation]") {
  r::EncodedMask scalar, packed;
  for (const auto width : {0U, 1U, 7U, 8U, 9U, 63U, 64U, 65U, 127U}) {
@@ -385,7 +384,9 @@ TEST_CASE("packed mask words preserve scalar runs and exception-time state", "[r
     for (const auto allowance : {0U, 1U, 2U, 31U, 512U}) {
      CAPTURE(width, height, pattern, allowance);
      const auto encode = [](auto&& operation) {
-      try { operation(); } catch (const std::invalid_argument& error) { return std::string(error.what()); }
+      try {
+       operation();
+      } catch (const std::invalid_argument& error) { return std::string(error.what()); }
       return std::string{};
      };
      const auto scalar_error = encode([&] { r::encode_mask_values_into(height, width, scalar, value, allowance); });
@@ -418,14 +419,12 @@ TEST_CASE("packed mask words preserve scalar runs and exception-time state", "[r
 }
 TEST_CASE("evaluation retained prefixes preserve score bits records and metrics", "[rfdetr][evaluation][gpu]") {
  const auto ordinary = box(0, {0, 0, 32, 32});
- EvaluationFixture fixture({{ordinary, ordinary, box(0, {0, 0, 128, 128})}}, 128,
-  {{{{"area", 1024.0}}, {{"area", 9216.0}, {"ignore", true}}, {{"iscrowd", true}}}});
- const std::array scores{0.0F, -0.0F, 1.0F, std::numeric_limits<float>::quiet_NaN(), std::numeric_limits<float>::infinity(), 1.0F,
-  -std::numeric_limits<float>::infinity(), std::numeric_limits<float>::quiet_NaN()};
+ EvaluationFixture fixture({{ordinary, ordinary, box(0, {0, 0, 128, 128})}}, 128, {{{{"area", 1024.0}}, {{"area", 9216.0}, {"ignore", true}}, {{"iscrowd", true}}}});
+ const std::array scores{
+  0.0F, -0.0F, 1.0F, std::numeric_limits<float>::quiet_NaN(), std::numeric_limits<float>::infinity(), 1.0F, -std::numeric_limits<float>::infinity(), std::numeric_limits<float>::quiet_NaN()};
  const std::array<std::uint32_t, 8U> order{4U, 2U, 5U, 0U, 1U, 6U, 3U, 7U};
  std::vector<r::Prediction> predictions;
- for (std::size_t index = 0U; index < scores.size(); ++index)
-  predictions.push_back(box(0, {0, 0, index % 2U == 0U ? 32.0F : 24.0F, 32}, scores[index]));
+ for (std::size_t index = 0U; index < scores.size(); ++index) predictions.push_back(box(0, {0, 0, index % 2U == 0U ? 32.0F : 24.0F, 32}, scores[index]));
  r::EvaluationDatasetOwner full(*fixture.loader, r::EvaluationMetricSet::BBoxAndMask);
  const auto full_matches = match(full, 0, predictions, predictions.size(), true);
  REQUIRE(full_matches.mask);

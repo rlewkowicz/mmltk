@@ -1142,8 +1142,7 @@ public:
     case Shape::Box: hit = point.x >= object.box.first.x - 3.0F && point.x <= object.box.second.x + 3.0F && point.y >= object.box.first.y - 3.0F && point.y <= object.box.second.y + 3.0F; break;
     case Shape::Mask: {
      const auto row = static_cast<std::uint16_t>(std::clamp(point.y, 0.0F, 65535.0F));
-     auto next = std::upper_bound(object.mask.runs.begin(), object.mask.runs.end(), point.x,
-      [row](float x, const auto& run) { return row < run.row || (row == run.row && x < run.first); });
+     auto next = std::upper_bound(object.mask.runs.begin(), object.mask.runs.end(), point.x, [row](float x, const auto& run) { return row < run.row || (row == run.row && x < run.first); });
      if (next != object.mask.runs.begin()) {
       const auto& run = *--next;
       hit = run.row == row && point.x >= run.first && point.x < run.last + 1.0F;

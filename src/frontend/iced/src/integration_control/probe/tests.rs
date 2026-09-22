@@ -752,7 +752,14 @@ fn probe_preparation_keeps_original_frame_through_widget_location() {
     let frame = surface.frame.unwrap();
     let controller = &mut fixture.controller;
     for swatch in [false, true] {
-        record_probe_draw("workflow.visual.workspace", surface, bounds, bounds, bounds, 1.0);
+        record_probe_draw(
+            "workflow.visual.workspace",
+            surface,
+            bounds,
+            bounds,
+            bounds,
+            1.0,
+        );
         controller.driver.phase = if swatch {
             Phase::CopyCapability
         } else {
@@ -807,7 +814,14 @@ fn probe_preparation_keeps_original_frame_through_widget_location() {
         }
         controller.widgets.begin_location();
         let moved = Rectangle { x: 17.0, ..bounds };
-        record_probe_draw("workflow.visual.workspace", surface, bounds, moved, bounds, 1.0);
+        record_probe_draw(
+            "workflow.visual.workspace",
+            surface,
+            bounds,
+            moved,
+            bounds,
+            1.0,
+        );
         assert!(
             !controller.probes.prepare_annotation_probe(
                 &controller.widgets,

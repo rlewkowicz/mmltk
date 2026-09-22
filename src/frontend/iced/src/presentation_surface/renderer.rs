@@ -1418,9 +1418,16 @@ impl DetailContent {
         let labels = std::sync::Arc::new(super::labels::CategoryCaptions::new(
             &scene.categories,
             &scene.palette,
-            scene.objects.iter()
+            scene
+                .objects
+                .iter()
                 .map(|object| object.category)
-                .filter(|category| membership.get(usize::from(*category)).copied().unwrap_or(false)),
+                .filter(|category| {
+                    membership
+                        .get(usize::from(*category))
+                        .copied()
+                        .unwrap_or(false)
+                }),
         ));
         Self {
             explore,
@@ -1741,7 +1748,8 @@ impl SurfaceRenderer {
         if change.changed {
             // Displaced backing remains alive until every cached binding and
             // comparison view has been refreshed. It grants no sampling rights.
-            for draw in draws.values_mut()
+            for draw in draws
+                .values_mut()
                 .filter(|draw| same_allocation(draw.surface, imported.image.surface))
             {
                 draw.refresh_views(device, layout, sampler, &imported.views);
@@ -1762,7 +1770,12 @@ impl SurfaceRenderer {
         {
             let change = imported.ensure_source(device, queue, surface);
             Self::propagate_source_views(
-                &mut self.draws, device, &self.layout, &self.sampler, imported, change,
+                &mut self.draws,
+                device,
+                &self.layout,
+                &self.sampler,
+                imported,
+                change,
             );
             imported.reconcile_sample(surface, placement);
             return;
@@ -1908,7 +1921,12 @@ impl SurfaceRenderer {
         {
             let change = imported.ensure_source(device, queue, surface);
             Self::propagate_source_views(
-                &mut self.draws, device, &self.layout, &self.sampler, imported, change,
+                &mut self.draws,
+                device,
+                &self.layout,
+                &self.sampler,
+                imported,
+                change,
             );
             imported.prepare(surface, placement);
             return;
@@ -3138,12 +3156,14 @@ mod tests {
             usage: wgpu::TextureUsages::TEXTURE_BINDING,
             view_formats: &[],
         });
-        let views = std::array::from_fn(|index| texture.create_view(&wgpu::TextureViewDescriptor {
-            dimension: Some(wgpu::TextureViewDimension::D2),
-            base_array_layer: index as u32,
-            array_layer_count: Some(1),
-            ..Default::default()
-        }));
+        let views = std::array::from_fn(|index| {
+            texture.create_view(&wgpu::TextureViewDescriptor {
+                dimension: Some(wgpu::TextureViewDimension::D2),
+                base_array_layer: index as u32,
+                array_layer_count: Some(1),
+                ..Default::default()
+            })
+        });
         RENDERER.with(|owner| {
             let owner = owner.borrow();
             let owner = owner.as_ref().unwrap();
@@ -3167,7 +3187,13 @@ mod tests {
                 placement: Placement::Contain,
                 gallery: None,
                 bindings: std::array::from_fn(|index| {
-                    bind_group(device, &owner.layout, &owner.sampler, &uniform, &views[index])
+                    bind_group(
+                        device,
+                        &owner.layout,
+                        &owner.sampler,
+                        &uniform,
+                        &views[index],
+                    )
                 }),
                 uniform,
                 views: views.clone(),
@@ -3231,16 +3257,26 @@ mod tests {
                 views: views.clone(),
                 diagnostics: None,
                 pixel_trace: [None, None],
-                _arena: [Some(std::sync::Arc::new(ArenaTexture {
-                    surface: direct, texture: None, lifetime: None,
-                })), None],
+                _arena: [
+                    Some(std::sync::Arc::new(ArenaTexture {
+                        surface: direct,
+                        texture: None,
+                        lifetime: None,
+                    })),
+                    None,
+                ],
             };
             // Deliberately different cached views expose an accidental scan on
             // an unchanged source: the bindings must remain untouched here.
             let unchanged = imported.ensure_source(device, &owner.queue, direct);
             assert!(!unchanged.changed && unchanged.retired.is_none());
             SurfaceRenderer::propagate_source_views(
-                &mut draws, device, &owner.layout, &owner.sampler, &imported, unchanged,
+                &mut draws,
+                device,
+                &owner.layout,
+                &owner.sampler,
+                &imported,
+                unchanged,
             );
             assert!(draws.values().all(|draw| draw.bindings == before_geometry));
             let fallback = imported.ensure_source(device, &owner.queue, surface);
@@ -3252,7 +3288,12 @@ mod tests {
             let inserted = imported.ensure_source(device, &owner.queue, incoming);
             assert!(inserted.changed && inserted.retired.is_none()); // Empty slot still changed.
             SurfaceRenderer::propagate_source_views(
-                &mut draws, device, &owner.layout, &owner.sampler, &imported, inserted,
+                &mut draws,
+                device,
+                &owner.layout,
+                &owner.sampler,
+                &imported,
+                inserted,
             );
             assert!(draws.values().all(|draw| draw.views == imported.views));
             let predecessor = std::sync::Arc::downgrade(imported._arena[1].as_ref().unwrap());
@@ -3261,7 +3302,12 @@ mod tests {
             assert!(alias.changed && alias.retired.is_some());
             assert!(predecessor.upgrade().is_some());
             SurfaceRenderer::propagate_source_views(
-                &mut draws, device, &owner.layout, &owner.sampler, &imported, alias,
+                &mut draws,
+                device,
+                &owner.layout,
+                &owner.sampler,
+                &imported,
+                alias,
             );
             assert!(draws.values().all(|draw| draw.views == imported.views));
             assert_eq!(imported.views[0], imported.views[1]);
@@ -3272,7 +3318,12 @@ mod tests {
             let replaced = imported.ensure_source(device, &owner.queue, incoming);
             assert!(replaced.changed && replaced.retired.is_some());
             SurfaceRenderer::propagate_source_views(
-                &mut draws, device, &owner.layout, &owner.sampler, &imported, replaced,
+                &mut draws,
+                device,
+                &owner.layout,
+                &owner.sampler,
+                &imported,
+                replaced,
             );
             assert!(draws.values().all(|draw| draw.views == imported.views));
             // Comparison views and bindings drop before their imported backing.

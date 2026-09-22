@@ -187,9 +187,24 @@ TEST_CASE("prediction delivers bounded ordered images masks and receiver-owned p
  std::filesystem::copy_file(image, unicode_image);
  const auto cli_output = root / "cli.json";
  const auto cli = mmltk::testsupport::run_subprocess_capture_output({
-  mmltk::testsupport::mmltk_cli_path(), "--log-level=off", "rfdetr", "predict", "--onnx", (root / "rf-detr-nano.onnx").string(),
-  "--output", cli_output.string(), "--resolution", "8", "--no-fp16", "--max-dets-per-image", "2",
-  "--image", image.string(), "--image=" + unicode_image.string(), "--image", (root / "." / "red.ppm").string(),
+  mmltk::testsupport::mmltk_cli_path(),
+  "--log-level=off",
+  "rfdetr",
+  "predict",
+  "--onnx",
+  (root / "rf-detr-nano.onnx").string(),
+  "--output",
+  cli_output.string(),
+  "--resolution",
+  "8",
+  "--no-fp16",
+  "--max-dets-per-image",
+  "2",
+  "--image",
+  image.string(),
+  "--image=" + unicode_image.string(),
+  "--image",
+  (root / "." / "red.ppm").string(),
  });
  INFO(cli.output_text);
  REQUIRE(cli.exit_code == 0);
@@ -564,42 +579,41 @@ TEST_CASE("full HD prediction materializes masks only for threshold survivors", 
   std::shared_ptr<void> custody;
   const auto mode = session.Run(request, {reinterpret_cast<std::uintptr_t>(stream), true},
    {.demand = [=](auto) { return rfdetr::PredictionDemand{.source_pixels = true, .encoded_masks = encoded, .preview_masks = true}; },
-    .completed = [&](const auto& record, auto pixels, const auto& annotations) {
-     REQUIRE(record.detections.size() == 2U);
-     CHECK(record.detections[0].has_mask == encoded);
-     CHECK(record.detections[1].has_mask == encoded);
-     REQUIRE(pixels.rgb8);
-     REQUIRE(pixels.custody);
-     custody = pixels.custody;
-     REQUIRE(annotations.masks_available);
-     REQUIRE(annotations.masks.address != 0U);
-     std::array<std::uint8_t, 2U> samples{};
-     const auto* masks = reinterpret_cast<const std::uint8_t*>(annotations.masks.address);
-     REQUIRE(cudaMemcpyAsync(samples.data(), masks, 1U, cudaMemcpyDeviceToHost, stream) == cudaSuccess);
-     REQUIRE(cudaMemcpyAsync(samples.data() + 1U, masks + 1920U * 1080U, 1U, cudaMemcpyDeviceToHost, stream) == cudaSuccess);
-     REQUIRE(cudaStreamSynchronize(stream) == cudaSuccess);
-     CHECK(samples == std::array<std::uint8_t, 2U>{1U, 0U});
-    }});
+    .completed =
+     [&](const auto& record, auto pixels, const auto& annotations) {
+      REQUIRE(record.detections.size() == 2U);
+      CHECK(record.detections[0].has_mask == encoded);
+      CHECK(record.detections[1].has_mask == encoded);
+      REQUIRE(pixels.rgb8);
+      REQUIRE(pixels.custody);
+      custody = pixels.custody;
+      REQUIRE(annotations.masks_available);
+      REQUIRE(annotations.masks.address != 0U);
+      std::array<std::uint8_t, 2U> samples{};
+      const auto* masks = reinterpret_cast<const std::uint8_t*>(annotations.masks.address);
+      REQUIRE(cudaMemcpyAsync(samples.data(), masks, 1U, cudaMemcpyDeviceToHost, stream) == cudaSuccess);
+      REQUIRE(cudaMemcpyAsync(samples.data() + 1U, masks + 1920U * 1080U, 1U, cudaMemcpyDeviceToHost, stream) == cudaSuccess);
+      REQUIRE(cudaStreamSynchronize(stream) == cudaSuccess);
+      CHECK(samples == std::array<std::uint8_t, 2U>{1U, 0U});
+     }});
   CHECK(mode.processed_images == 1U);
   REQUIRE(custody);
  }
  request.include_masks = true;
  request.image_inputs.push_back({image, "second", 43});
  std::stop_source stop;
- const auto cancelled = session.RunAndWrite(request, {reinterpret_cast<std::uintptr_t>(stream), true},
-  {.stop = stop.get_token(), .completed = [&](const auto& record, auto, const auto&) {
-    CHECK(record.image_id == 42);
-    REQUIRE(record.detections.size() == 2U);
-    CHECK(record.detections[0].mask.area == 1920U * 1080U);
-    stop.request_stop();
-   }});
+ const auto cancelled = session.RunAndWrite(request, {reinterpret_cast<std::uintptr_t>(stream), true}, {.stop = stop.get_token(), .completed = [&](const auto& record, auto, const auto&) {
+                                                                                                         CHECK(record.image_id == 42);
+                                                                                                         REQUIRE(record.detections.size() == 2U);
+                                                                                                         CHECK(record.detections[0].mask.area == 1920U * 1080U);
+                                                                                                         stop.request_stop();
+                                                                                                        }});
  CHECK(cancelled.cancelled);
  CHECK(cancelled.processed_images == 1U);
  std::ifstream preserved(request.output_path);
  CHECK(nlohmann::json::parse(preserved) == original);
  request.threshold = 1.0F;
- const auto empty = session.Run(request, {reinterpret_cast<std::uintptr_t>(stream), true},
-  {.completed = [](const auto& record, auto, const auto&) { CHECK(record.detections.empty()); }});
+ const auto empty = session.Run(request, {reinterpret_cast<std::uintptr_t>(stream), true}, {.completed = [](const auto& record, auto, const auto&) { CHECK(record.detections.empty()); }});
  CHECK(empty.processed_images == 2U);
  CHECK_FALSE(session.HasUnsafeCustody());
  CHECK(session.Close() == mmltk::backend::ml::runtime::kRuntimeSuccess);
@@ -1434,7 +1448,6 @@ TEST_CASE("Analysis providers distinguish empty known and pending counts", "[mod
   CHECK(output.count.empty());
  }
 }
-
 TEST_CASE("prediction packed readback preserves admission and charges every retained allocation", "[model][rfdetr][prediction]") {
  using rfdetr::PredictionMaskChunk;
  using rfdetr::PredictionMaskReadback;

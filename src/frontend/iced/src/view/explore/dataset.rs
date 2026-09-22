@@ -700,14 +700,25 @@ mod membership_tests {
     fn dense_membership_preserves_modes_duplicates_and_catalog_boundaries() {
         use crate::generated::{ExploreClassSelection, ExploreClassSelectionMode};
         for count in [0, 1, 4] {
-            for mode in [ExploreClassSelectionMode::All, ExploreClassSelectionMode::None, ExploreClassSelectionMode::Subset] {
-                let selection = ExploreClassSelection { mode, classes: vec![3, u32::MAX, 1, 3, 0] };
+            for mode in [
+                ExploreClassSelectionMode::All,
+                ExploreClassSelectionMode::None,
+                ExploreClassSelectionMode::Subset,
+            ] {
+                let selection = ExploreClassSelection {
+                    mode,
+                    classes: vec![3, u32::MAX, 1, 3, 0],
+                };
                 let actual = super::class_membership(&selection, count);
-                let expected: Vec<_> = (0..count).map(|index| match mode {
-                    ExploreClassSelectionMode::All => true,
-                    ExploreClassSelectionMode::None => false,
-                    ExploreClassSelectionMode::Subset => selection.classes.contains(&(index as u32)),
-                }).collect();
+                let expected: Vec<_> = (0..count)
+                    .map(|index| match mode {
+                        ExploreClassSelectionMode::All => true,
+                        ExploreClassSelectionMode::None => false,
+                        ExploreClassSelectionMode::Subset => {
+                            selection.classes.contains(&(index as u32))
+                        }
+                    })
+                    .collect();
                 assert_eq!(actual, expected);
                 assert_eq!(super::class_membership(&selection, count), actual);
             }

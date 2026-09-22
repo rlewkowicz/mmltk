@@ -50,7 +50,7 @@ TEST_CASE("validation adds completed layers once with unchanged alpha and ordina
   REQUIRE(cudaStreamSynchronize(stream.get()) == cudaSuccess);
   return output;
  };
- CHECK(raster::raster_instance_overlay_rgba({}) == cudaSuccess); // Empty static count preserves its no-op contract.
+ CHECK(raster::raster_instance_overlay_rgba({}) == cudaSuccess);  // Empty static count preserves its no-op contract.
  CHECK(draw(true) == std::array<std::uint8_t, 16>{255, 255, 255, 96, 255, 60, 40, 177, 3, 4, 5, 81, 10, 20, 30, 96});
  CHECK(draw(false) == std::array<std::uint8_t, 16>{10, 20, 30, 96, 10, 20, 30, 96, 0, 0, 0, 0, 10, 20, 30, 96});
  input.count = 1;
@@ -58,7 +58,6 @@ TEST_CASE("validation adds completed layers once with unchanged alpha and ordina
  input.count = 0;
  CHECK(draw(false, true) == std::array<std::uint8_t, 16>{});
 }
-
 TEST_CASE("overwrite raster agrees with forward host painting for overlaps labels and hidden layers", "[raster][cuda][validation]") {
  if (!mmltk::testsupport::checked_cuda_device_count()) SKIP("no CUDA device available");
  REQUIRE(cudaSetDevice(0) == cudaSuccess);
@@ -82,9 +81,7 @@ TEST_CASE("overwrite raster agrees with forward host painting for overlaps label
  std::unique_ptr<Input, decltype(release)> storage(device, release);
  // These literal glyphs are host-owned expected shapes, stamped forwards like
  // an ordinary painter; neither CUDA hit helpers nor reverse search are used.
- constexpr std::array<std::array<std::string_view, 7U>, 2U> glyphs{{
-  {".###.", "#...#", "#..##", "#.#.#", "##..#", "#...#", ".###."},
-  {"..#..", ".##..", "..#..", "..#..", "..#..", "..#..", ".###."}}};
+ constexpr std::array<std::array<std::string_view, 7U>, 2U> glyphs{{{".###.", "#...#", "#..##", "#.#.#", "##..#", "#...#", ".###."}, {"..#..", ".##..", "..#..", "..#..", "..#..", "..#..", ".###."}}};
  for (const std::int64_t count : {-3LL, 0LL, 1LL, 2LL, 3LL, 99LL})
   for (bool boxes : {false, true})
    for (bool labels : {false, true})
@@ -127,8 +124,8 @@ TEST_CASE("overwrite raster agrees with forward host painting for overlaps label
         const auto offset = guard + y * pitch + x * 4U;
         const auto pixel = layer[y * width + x];
         for (std::size_t channel = 0U; channel < 4U; ++channel)
-         expected[offset + channel] = add ? (channel == 3U ? input.pixels[offset + channel]
-                                                                          : static_cast<std::uint8_t>(std::min(255, input.pixels[offset + channel] + pixel[channel]))) : pixel[channel];
+         expected[offset + channel] =
+          add ? (channel == 3U ? input.pixels[offset + channel] : static_cast<std::uint8_t>(std::min(255, input.pixels[offset + channel] + pixel[channel]))) : pixel[channel];
        }
       REQUIRE(cudaMemcpyAsync(device, &input, sizeof(input), cudaMemcpyHostToDevice, stream.get()) == cudaSuccess);
       const auto base = reinterpret_cast<std::uint8_t*>(device);

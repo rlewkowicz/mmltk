@@ -195,7 +195,9 @@ int handle_info(const std::span<const std::string_view> arguments, const logging
  return 0;
 }
 #if MMLTK_BUILD_RFDETR_NATIVE
-int handle_rfdetr(const std::span<const std::string_view> arguments, const logging::CliOverrides& logging_options, bool) { return mmltk::entrypoints::cli::handle_rfdetr_cli(arguments, logging_options); }
+int handle_rfdetr(const std::span<const std::string_view> arguments, const logging::CliOverrides& logging_options, bool) {
+ return mmltk::entrypoints::cli::handle_rfdetr_cli(arguments, logging_options);
+}
 #endif
 inline constexpr std::array kRootCommands{
  RootCommand{"compile", "Compile a raw dataset split", &handle_compile},

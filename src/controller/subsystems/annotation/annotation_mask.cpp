@@ -74,6 +74,7 @@ public:
   if (reach < 0) reach = static_cast<int>(std::sqrt(static_cast<double>(radius_) * radius_ - dy * dy));
   return reach;
  }
+
 private:
  std::uint16_t radius_;
  std::array<int, c::kMaxAnnotationMaskCleanupRadius + 1> reach_;

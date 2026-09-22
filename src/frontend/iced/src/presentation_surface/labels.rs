@@ -79,7 +79,9 @@ impl CategoryCaptions {
                 *index = captions.len();
                 captions.push(CachedLabel::new(
                     names[category].value.clone(),
-                    palette.get(category).map_or(Color::TRANSPARENT, class_color),
+                    palette
+                        .get(category)
+                        .map_or(Color::TRANSPARENT, class_color),
                 ));
             }
         }
@@ -178,28 +180,34 @@ impl ValidationContent {
                     point.y = sample.crop.y as f32
                         + point.y * sample.crop.height as f32 / sample.pixelextent.height as f32;
                 }
-                labels[usize::from(!label.groundtruth)].push((sample_index, label_index, bounds, {
-                    let [r, g, b] = label.rgb.0;
-                    let mut cached = CachedLabel::new(label.name.clone(), Color::from_rgb8(r, g, b));
-                    cached.cell = Some(if metadata.detail {
-                        [
-                            0,
-                            0,
-                            metadata.frame.extent.width,
-                            metadata.frame.extent.height,
-                        ]
-                    } else {
-                        let width = metadata.frame.extent.width / 2;
-                        let height = metadata.frame.extent.height / 3;
-                        [
-                            sample_index as u32 % 2 * width,
-                            sample_index as u32 / 2 * height,
-                            width,
-                            height,
-                        ]
-                    });
-                    cached
-                }));
+                labels[usize::from(!label.groundtruth)].push((
+                    sample_index,
+                    label_index,
+                    bounds,
+                    {
+                        let [r, g, b] = label.rgb.0;
+                        let mut cached =
+                            CachedLabel::new(label.name.clone(), Color::from_rgb8(r, g, b));
+                        cached.cell = Some(if metadata.detail {
+                            [
+                                0,
+                                0,
+                                metadata.frame.extent.width,
+                                metadata.frame.extent.height,
+                            ]
+                        } else {
+                            let width = metadata.frame.extent.width / 2;
+                            let height = metadata.frame.extent.height / 3;
+                            [
+                                sample_index as u32 % 2 * width,
+                                sample_index as u32 / 2 * height,
+                                width,
+                                height,
+                            ]
+                        });
+                        cached
+                    },
+                ));
             }
         }
         Self {
@@ -328,7 +336,10 @@ impl Source {
                 ];
                 let [mut gt, mut det] = std::array::from_fn(|layer| {
                     let labels = &content.labels[layer];
-                    labels.iter().take(if visible[layer] { labels.len() } else { 0 }).peekable()
+                    labels
+                        .iter()
+                        .take(if visible[layer] { labels.len() } else { 0 })
+                        .peekable()
                 });
                 // Combined diagnostic visits retain source order; each paint layer
                 // advances only its own collection and owns no copied captions.
@@ -636,16 +647,34 @@ mod tests {
     fn cached_colors_keep_exact_conversion_and_strict_contrast() {
         for value in [0.0, 0.55, f32::from_bits(0.55f32.to_bits() + 1), 1.0] {
             for hue in [-360.0, 0.0, 60.0, 120.0, 240.0, 359.0, 720.0] {
-                let native = crate::generated::AnnotationColor { hue, saturation: 0.7, value };
+                let native = crate::generated::AnnotationColor {
+                    hue,
+                    saturation: 0.7,
+                    value,
+                };
                 let expected = class_color(&native);
                 let label = CachedLabel::new("人é🙂".into(), expected);
                 assert_eq!(label.background, expected);
-                assert_eq!(label.foreground, if expected.r * 0.2126 + expected.g * 0.7152 + expected.b * 0.0722 > 0.55 { Color::BLACK } else { Color::WHITE });
+                assert_eq!(
+                    label.foreground,
+                    if expected.r * 0.2126 + expected.g * 0.7152 + expected.b * 0.0722 > 0.55 {
+                        Color::BLACK
+                    } else {
+                        Color::WHITE
+                    }
+                );
                 assert_eq!(label.width, 30.5);
             }
             let background = Color::from_rgb(value, value, value);
             let label = CachedLabel::new(String::new(), background);
-            assert_eq!(label.foreground, if background.r * 0.2126 + background.g * 0.7152 + background.b * 0.0722 > 0.55 { Color::BLACK } else { Color::WHITE });
+            assert_eq!(
+                label.foreground,
+                if background.r * 0.2126 + background.g * 0.7152 + background.b * 0.0722 > 0.55 {
+                    Color::BLACK
+                } else {
+                    Color::WHITE
+                }
+            );
         }
     }
 
@@ -728,8 +757,19 @@ mod tests {
                 let mut combined = Vec::new();
                 source.visit(|_, _, _, _, _, _, cached| combined.push(cached.text.as_ptr()));
                 let expected_combined: Vec<_> = (0..4)
-                    .filter(|index| if index % 2 == 1 { gt_visible } else { det_visible })
-                    .map(|index| content.labels[usize::from(index % 2 == 0)][index / 2].3.text.as_ptr())
+                    .filter(|index| {
+                        if index % 2 == 1 {
+                            gt_visible
+                        } else {
+                            det_visible
+                        }
+                    })
+                    .map(|index| {
+                        content.labels[usize::from(index % 2 == 0)][index / 2]
+                            .3
+                            .text
+                            .as_ptr()
+                    })
                     .collect();
                 assert_eq!(combined, expected_combined);
                 let mut seen = Vec::new();
@@ -749,12 +789,19 @@ mod tests {
                             det_visible
                         }
                     })
-                    .map(|index| content.labels[usize::from(index % 2 == 0)][index / 2].3.text.as_ptr())
+                    .map(|index| {
+                        content.labels[usize::from(index % 2 == 0)][index / 2]
+                            .3
+                            .text
+                            .as_ptr()
+                    })
                     .collect();
                 assert_eq!(paragraphs, expected_paragraphs);
                 let expected: Vec<_> = (0..if gt_visible { 2 } else { 0 })
                     .map(|_| Color::from_rgb8(0, 255, 255))
-                    .chain((0..if det_visible { 2 } else { 0 }).map(|_| Color::from_rgb8(255, 0, 0)))
+                    .chain(
+                        (0..if det_visible { 2 } else { 0 }).map(|_| Color::from_rgb8(255, 0, 0)),
+                    )
                     .collect();
                 assert_eq!(seen, expected);
                 let mut surface = Surface::empty();
@@ -871,8 +918,15 @@ mod tests {
                     assert_eq!((category, name), (0, "人é🙂"));
                     assert_eq!(color, &native.dataset.palette[0]);
                     let expected = class_color(color);
-                    assert_eq!([cached.background.r, cached.background.g, cached.background.b].map(f32::to_bits),
-                        [expected.r, expected.g, expected.b].map(f32::to_bits));
+                    assert_eq!(
+                        [
+                            cached.background.r,
+                            cached.background.g,
+                            cached.background.b
+                        ]
+                        .map(f32::to_bits),
+                        [expected.r, expected.g, expected.b].map(f32::to_bits)
+                    );
                     assert!(std::ptr::eq(cached, gallery.captions.get(0).unwrap()));
                     assert_eq!(
                         cached.paragraph.compare(label_text((), 30.5)),

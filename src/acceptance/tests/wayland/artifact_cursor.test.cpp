@@ -215,7 +215,10 @@ TEST_CASE("evidence cursor admits exact line limits and retains admitted overflo
    CHECK(audit.values.empty());
    CHECK(cursor.line() == 0U);
    CHECK_THROWS_AS(cursor.finish(), std::runtime_error);
-   { std::ofstream output{path, std::ios::app}; output << '\n'; }
+   {
+    std::ofstream output{path, std::ios::app};
+    output << '\n';
+   }
    cursor.consume(audit, observer);
    cursor.finish();
    REQUIRE(audit.values.size() == 1U);
@@ -240,16 +243,21 @@ TEST_CASE("evidence cursor preserves callback failure order and captured extent"
   std::vector<std::string> order;
   Audit audit{&order, audit_failure};
   JsonLineCursor cursor{path, 0U};
-  CHECK_THROWS_AS(cursor.consume(audit, [&](const nlohmann::json&) {
-   order.push_back("observer:first");
-   throw std::runtime_error("observer failure");
-  }), std::runtime_error);
+  CHECK_THROWS_AS(cursor.consume(audit,
+                   [&](const nlohmann::json&) {
+                    order.push_back("observer:first");
+                    throw std::runtime_error("observer failure");
+                   }),
+   std::runtime_error);
   CHECK(order.size() == (audit_failure ? 1U : 2U));
   CHECK(order.front() == "audit:first");
   CHECK(cursor.line() == 1U);
   CHECK_THROWS_AS(cursor.finish(), std::runtime_error);
   audit.fail = false;
-  { std::ofstream output{path, std::ios::app}; output << '\n'; }
+  {
+   std::ofstream output{path, std::ios::app};
+   output << '\n';
+  }
   cursor.consume(audit, [&](const nlohmann::json& value) { order.push_back("observer:" + value.at("event").get<std::string>()); });
   CHECK(order[order.size() - 2U] == "audit:first");
   CHECK(order.back() == "observer:first");
