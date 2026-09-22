@@ -103,7 +103,7 @@ class PaddedMappedFile {
 public:
  explicit PaddedMappedFile(const std::filesystem::path& path) : file_(FileHandle::open_readonly(path.string())) {
   size_ = file_.size();
-  if (size_ == 0U) { throw std::runtime_error("benchmark annotation file is empty: " + path.string()); }
+  if (size_ == 0U) { throw AnnotationDocumentRejected("benchmark annotation file is empty: " + path.string()); }
   if (size_ > std::numeric_limits<std::size_t>::max() - simdjson::SIMDJSON_PADDING) { throw std::overflow_error("benchmark annotation mapping size overflow"); }
   capacity_ = size_ + simdjson::SIMDJSON_PADDING;
   void* reservation = ::mmap(nullptr, capacity_, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
@@ -147,7 +147,7 @@ private:
  const char* data = file.data();
  std::size_t index = 0U;
  while (index < file.size() && static_cast<unsigned char>(data[index]) <= ' ') { ++index; }
- if (index == file.size() || data[index] != '{') { throw std::runtime_error("benchmark COCO-style annotations must contain a top-level object"); }
+ if (index == file.size() || data[index] != '{') { throw AnnotationDocumentRejected("benchmark COCO-style annotations must contain a top-level object"); }
  int object_depth = 0;
  int array_depth = 0;
  bool in_string = false;
@@ -178,14 +178,14 @@ private:
       break;
      }
     }
-    if (key_end == file.size()) { throw std::runtime_error("unterminated key in benchmark annotation JSON"); }
+    if (key_end == file.size()) { throw AnnotationDocumentRejected("unterminated key in benchmark annotation JSON"); }
     std::size_t cursor = key_end + 1U;
     while (cursor < file.size() && static_cast<unsigned char>(data[cursor]) <= ' ') { ++cursor; }
     const bool is_object_key = cursor < file.size() && data[cursor] == ':';
     if (!key_escape && is_object_key && std::string_view(data + key_begin, key_end - key_begin) == wanted_key) {
      ++cursor;
      while (cursor < file.size() && static_cast<unsigned char>(data[cursor]) <= ' ') { ++cursor; }
-     if (cursor == file.size() || data[cursor] != '[') { throw std::runtime_error("benchmark annotation JSON field is not an array"); }
+     if (cursor == file.size() || data[cursor] != '[') { throw AnnotationDocumentRejected("benchmark annotation JSON field is not an array"); }
      const std::size_t content_begin = cursor + 1U;
      int depth = 1;
      bool value_string = false;
@@ -208,7 +208,7 @@ private:
        return ByteRange{content_begin, cursor};
       }
      }
-     throw std::runtime_error("unterminated array in benchmark annotation JSON");
+     throw AnnotationDocumentRejected("unterminated array in benchmark annotation JSON");
     }
     index = key_end;
     continue;
@@ -224,7 +224,7 @@ private:
    --array_depth;
   }
  }
- throw std::runtime_error("benchmark annotation JSON is missing array '" + std::string(wanted_key) + "'");
+ throw AnnotationDocumentRejected("benchmark annotation JSON is missing array '" + std::string(wanted_key) + "'");
 }
 // Converts an ascending boundary list (plus the terminal offset) into contiguous byte ranges.
 [[nodiscard]] std::vector<ByteRange> ranges_from_boundaries(std::vector<std::size_t>& boundaries, const std::size_t end) {
@@ -254,14 +254,38 @@ private:
    }
    ++object_depth;
   } else if (token == '}') {
-   if (object_depth == 0) { throw std::runtime_error("unbalanced object in benchmark annotation array"); }
+   if (object_depth == 0) { throw AnnotationDocumentRejected("unbalanced object in benchmark annotation array"); }
    --object_depth;
   } else if (object_depth == 0 && token != ',' && static_cast<unsigned char>(token) > ' ') {
-   throw std::runtime_error("benchmark annotation array contains a non-object value");
+   throw AnnotationDocumentRejected("benchmark annotation array contains a non-object value");
   }
  }
- if (object_depth != 0 || in_string) { throw std::runtime_error("unterminated object in benchmark annotation array"); }
+ if (object_depth != 0 || in_string) { throw AnnotationDocumentRejected("unterminated object in benchmark annotation array"); }
  return ranges_from_boundaries(boundaries, array.end);
+}
+[[noreturn]] void reject_json_document(const simdjson::simdjson_error& error) {
+ // Only errors that describe source syntax or source values are optional-source
+ // rejection. Allocation, parser capacity/setup and API misuse retain their type.
+ switch (error.error()) {
+  case simdjson::TAPE_ERROR:
+  case simdjson::DEPTH_ERROR:
+  case simdjson::STRING_ERROR:
+  case simdjson::T_ATOM_ERROR:
+  case simdjson::F_ATOM_ERROR:
+  case simdjson::N_ATOM_ERROR:
+  case simdjson::NUMBER_ERROR:
+  case simdjson::UTF8_ERROR:
+  case simdjson::EMPTY:
+  case simdjson::UNESCAPED_CHARS:
+  case simdjson::UNCLOSED_STRING:
+  case simdjson::INCORRECT_TYPE:
+  case simdjson::NUMBER_OUT_OF_RANGE:
+  case simdjson::BIGINT_ERROR:
+  case simdjson::NO_SUCH_FIELD:
+  case simdjson::INCOMPLETE_ARRAY_OR_OBJECT:
+  case simdjson::TRAILING_CONTENT: throw AnnotationDocumentRejected(error.what());
+  default: throw;
+ }
 }
 void for_each_object(const PaddedMappedFile& file, const ByteRange range, simdjson::ondemand::parser& parser,
                      const std::function<void(simdjson::ondemand::object, std::uint64_t)>& callback) {
@@ -275,16 +299,21 @@ void for_each_object(const PaddedMappedFile& file, const ByteRange range, simdjs
   if (token == '{') {
    if (depth++ == 0) { object_begin = index; }
   } else if (token == '}') {
-   if (depth == 0) { throw std::runtime_error("unbalanced benchmark JSON object"); }
+   if (depth == 0) { throw AnnotationDocumentRejected("unbalanced benchmark JSON object"); }
    if (--depth == 0) {
     const std::size_t object_size = index + 1U - object_begin;
     const simdjson::padded_string_view view(file.data() + object_begin, object_size, file.capacity_from(object_begin));
-    simdjson::ondemand::document document = parser.iterate(view);
-    callback(document.get_object(), object_begin);
+    simdjson::ondemand::document document;
+    simdjson::ondemand::object object;
+    try {
+     document = parser.iterate(view);
+     object = document.get_object();
+    } catch (const simdjson::simdjson_error& error) { reject_json_document(error); }
+    callback(object, object_begin);
    }
   }
  }
- if (depth != 0 || in_string) { throw std::runtime_error("partition ended inside a benchmark JSON object"); }
+ if (depth != 0 || in_string) { throw AnnotationDocumentRejected("partition ended inside a benchmark JSON object"); }
 }
 void parallel_object_array(const PaddedMappedFile& file, const ByteRange array, const int requested_workers,
                            mmltk::common::concurrency::CancellationObservation cancel_requested,
@@ -301,13 +330,13 @@ void parallel_object_array(const PaddedMappedFile& file, const ByteRange array, 
 }
 [[nodiscard]] std::uint16_t parse_objects365_shard(const std::string_view file_name) {
  const std::size_t patch = file_name.find("patch");
- if (patch == std::string_view::npos) { throw std::runtime_error("Objects365 image path does not identify its patch"); }
+ if (patch == std::string_view::npos) { throw AnnotationDocumentRejected("Objects365 image path does not identify its patch"); }
  const std::size_t begin = patch + 5U;
  std::uint32_t value = 0U;
  const auto result = std::from_chars(file_name.data() + begin, file_name.data() + file_name.size(), value);
  const bool valid_delimiter = result.ptr != file_name.data() + begin && (result.ptr == file_name.data() + file_name.size() || *result.ptr == '/' ||
                                                                          *result.ptr == '\\' || *result.ptr == '_' || *result.ptr == '.');
- if (result.ec != std::errc{} || !valid_delimiter || value > 50U) { throw std::runtime_error("Objects365 image path has an invalid patch number"); }
+ if (result.ec != std::errc{} || !valid_delimiter || value > 50U) { throw AnnotationDocumentRejected("Objects365 image path has an invalid patch number"); }
  return static_cast<std::uint16_t>(value);
 }
 struct ParsedImage {
@@ -316,7 +345,7 @@ struct ParsedImage {
  std::uint32_t height = 0U;
  std::uint16_t shard = 0U;
 };
-[[nodiscard]] ParsedImage parse_image_object(simdjson::ondemand::object object, const BenchmarkDatasetSource source) {
+[[nodiscard]] ParsedImage parse_image_object(simdjson::ondemand::object object, const BenchmarkDatasetSource source) try {
  ParsedImage parsed;
  bool have_id = false;
  bool have_width = false;
@@ -339,10 +368,11 @@ struct ParsedImage {
   }
  }
  if (!have_id || !have_width || !have_height || !have_filename || parsed.width == 0U || parsed.height == 0U) {
-  throw std::runtime_error("benchmark image annotation is incomplete");
+  throw AnnotationDocumentRejected("benchmark image annotation is incomplete");
  }
  return parsed;
-}
+} catch (const simdjson::simdjson_error& error) { reject_json_document(error); }
+catch (const std::overflow_error& error) { throw AnnotationDocumentRejected(error.what()); }
 struct ParsedAnnotation {
  struct Segmentation {
   std::vector<std::vector<double>> polygons;
@@ -470,7 +500,7 @@ void parse_segmentation(simdjson::ondemand::value value, ParsedAnnotation::Segme
  return parsed;
 }
 void validate_numeric_categories(const PaddedMappedFile& file, const ByteRange categories, const CategoryLookup& lookup,
-                                 mmltk::common::concurrency::CancellationObservation cancel_requested) {
+                                 mmltk::common::concurrency::CancellationObservation cancel_requested) try {
  NumericCategoryAdmission admission(lookup);
  simdjson::ondemand::parser parser;
  for_each_object(file, categories, parser, [&](simdjson::ondemand::object object, std::uint64_t) {
@@ -488,11 +518,15 @@ void validate_numeric_categories(const PaddedMappedFile& file, const ByteRange c
     have_name = true;
    }
   }
-  admission.observe(have_id ? std::optional(id) : std::nullopt, have_name ? std::optional(name) : std::nullopt);
+  // This call validates source category values; allocations still propagate.
+  try { admission.observe(have_id ? std::optional(id) : std::nullopt, have_name ? std::optional(name) : std::nullopt); }
+  catch (const std::runtime_error& error) { throw AnnotationDocumentRejected(error.what()); }
   throw_if_benchmark_cancelled(cancel_requested);
  });
- admission.complete();
-}
+ try { admission.complete(); }
+ catch (const std::runtime_error& error) { throw AnnotationDocumentRejected(error.what()); }
+} catch (const simdjson::simdjson_error& error) { reject_json_document(error); }
+catch (const std::overflow_error& error) { throw AnnotationDocumentRejected(error.what()); }
 struct BoxCandidate {
  std::uint32_t image_index = 0U;
  NormalizedBox box;
@@ -1199,7 +1233,7 @@ NormalizedAnnotationIndex parse_coco_style_annotations(const std::filesystem::pa
  std::ranges::sort(images, {}, &ParsedImage::id);
  if (images.empty() || std::ranges::adjacent_find(images, {}, &ParsedImage::id) != images.end() ||
      (options.expected_image_count != 0U && images.size() != options.expected_image_count)) {
-  throw std::runtime_error("benchmark source image metadata count or IDs are invalid");
+  throw AnnotationDocumentRejected("benchmark source image metadata count or IDs are invalid");
  }
  std::unordered_map<std::uint64_t, std::uint32_t> image_lookup;
  image_lookup.reserve(images.size());

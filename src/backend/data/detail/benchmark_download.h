@@ -10,7 +10,12 @@
 #include "benchmark_cache.h"
 #include "benchmark_catalog.h"
 #include <string_view>
+#include <stdexcept>
 namespace mmltk::backend::data::benchmark_internal {
+class BenchmarkDownloadUnavailable final : public std::runtime_error {
+public:
+ using std::runtime_error::runtime_error;
+};
 inline constexpr std::uint32_t kMaximumAttempts = 5U;
 enum class DownloadProgressPhase : std::uint8_t {
  kDownloading,

@@ -236,7 +236,7 @@ void expect_runs(const CoconutComponent& component, std::span<const RLEPair> exp
 }
 NormalizedAnnotationIndex recovery_originals(unsigned image_id, std::span<const RLEPair> masks) {
  NormalizedAnnotationIndex index;
- index.annotation_sha256 = "original-instances-fixture";
+ index.annotation_sha256 = std::string(64, 'a');
  index.split = "train2017";
  index.images.push_back({.source_image_id = image_id, .box_count = static_cast<std::uint32_t>(masks.size()), .width = 3, .height = 3});
  for (std::size_t i = 0; i < masks.size(); ++i) {
@@ -1940,7 +1940,7 @@ TEST_CASE("both stock recipes reuse normalized indexes without raw metadata or n
  {
   BenchmarkTraceSink trace;
   ProgressReporter progress({}, trace);
-  CocoAnnotationCache stock(local.cache, coconut.stock_annotations, false, 0, 1, 1, {}, trace);
+  CocoAnnotationCache stock(local.cache, coconut.stock_annotations, {CocoSplitAdmission::Unselected, CocoSplitAdmission::Required}, 0, 1, 1, {}, trace);
   stock.discover(progress);
   CHECK_FALSE(stock.pending_download());
   const auto admitted = stock.take_indexes();
@@ -2003,7 +2003,7 @@ TEST_CASE("stock annotation owner repairs only missing splits with bounded sourc
   if (event == "benchmark.download.failure_sha256") ++diagnoses;
  };
  ProgressReporter progress({}, trace);
- CocoAnnotationCache annotations(local.cache, artifact, true, 2, 1, 1, {}, trace);
+ CocoAnnotationCache annotations(local.cache, artifact, {CocoSplitAdmission::Required, CocoSplitAdmission::Required}, 2, 1, 1, {}, trace);
  annotations.discover(progress);
  REQUIRE(annotations.pending_download());
  CHECK(annotations.completed_indexes() == 1);
@@ -2116,7 +2116,7 @@ TEST_CASE("one stock request builds both splits and retains newly settled train 
    }
   },
   trace);
- CocoAnnotationCache cache(local.cache, custom.coco_annotations, true, 2, 1, 1, {}, trace);
+ CocoAnnotationCache cache(local.cache, custom.coco_annotations, {CocoSplitAdmission::Required, CocoSplitAdmission::Required}, 2, 1, 1, {}, trace);
  cache.discover(progress);
  CHECK(cache.completed_indexes() == 0);
  REQUIRE(cache.pending_download());
@@ -2209,6 +2209,25 @@ TEST_CASE("COCONut recovers the complete dropped dog candidate set and carves so
    CHECK(runs[0].length == 2);
   }
  }
+ const auto cache = root.path() / "recovery.normalized.bin";
+ store_coconut_component(cache, component);
+ const auto cached = load_coconut_component(cache, component.edition, component.source, component.input_identity);
+ REQUIRE(cached);
+ CHECK(cached->recovery.front().unresolved == facts.unresolved);
+ CHECK(cached->recovery.front().omissions.size() == facts.unresolved);
+ const auto settled = file_bytes(cache);
+ std::atomic<bool> cancelled{true};
+ CHECK_THROWS(store_coconut_component(cache, component, mmltk::common::concurrency::CancellationObservation::Atomic(cancelled)));
+ CHECK(file_bytes(cache) == settled);
+ const auto failed = root.path() / "failed.normalized.bin";
+ std::filesystem::create_directory(failed.string() + ".inventory");
+ CHECK_THROWS(store_coconut_component(failed, component));
+ CHECK_FALSE(std::filesystem::exists(failed.string() + ".complete.json"));
+ auto malformed = component;
+ malformed.recovery.front().objects.front().original_annotation_id += 1;
+ CHECK_THROWS(store_coconut_component(cache, malformed));
+ CHECK(file_bytes(cache) == settled);
+
 }
 TEST_CASE("COCONut recovery requires a unique represented match and exact remaining candidate count", "[coconut][benchmark]") {
  const std::array<RLEPair, 2> masks{{{0, 2}, {3, 2}}};
@@ -2436,4 +2455,320 @@ TEST_CASE("COCONut recovery reuses bounded image work across run geometry and ca
   CHECK(facts.objects.empty());
   CHECK(support.back().runs.data() == unchanged);
  }
+}
+
+TEST_CASE("retained COCO source dogs recover exactly and remain disjoint after compiler mask projection", "[coconut][benchmark]") {
+ ScopedTempDir root("coconut-source-recovery");
+ const auto fixtures = std::filesystem::path(__FILE__).parent_path() / "fixtures/coconut_recovery";
+ for (const unsigned id : {2212U, 400U}) {
+  CAPTURE(id);
+  const auto original = Json::parse(file_bytes(fixtures / (std::to_string(id) + ".originals.json")));
+  const auto source = Json::parse(file_bytes(fixtures / (std::to_string(id) + ".segments.json")));
+  NormalizedAnnotationIndex index;
+  index.split = "train2017";
+  index.annotation_sha256 = original.at("annotation_sha256");
+  const auto width = original.at("width").get<std::uint32_t>(), height = original.at("height").get<std::uint32_t>();
+  for (const auto& object : original.at("objects")) {
+   NormalizedBox box;
+   const auto bounds = object.at("bbox").get<std::array<float, 4>>();
+   box.x1 = bounds[0]; box.y1 = bounds[1]; box.x2 = bounds[2]; box.y2 = bounds[3];
+   box.annotation_id = object.at("annotation_id");
+   box.source_category_id = object.at("source_category_id");
+   box.source_ordinal = object.at("source_ordinal");
+   box.original_area = object.at("original_area");
+   box.flags = object.at("flags");
+   box.class_id = object.at("class_id");
+   box.mask_rle_offset = index.mask_rle_pairs.size();
+   for (const auto& run : object.at("runs")) index.mask_rle_pairs.push_back({run[0].get<std::uint32_t>(), run[1].get<std::uint32_t>()});
+   box.mask_rle_pairs = static_cast<std::uint32_t>(index.mask_rle_pairs.size() - box.mask_rle_offset);
+   index.boxes.push_back(box);
+  }
+  index.images.push_back({.source_image_id = id, .box_count = static_cast<std::uint32_t>(index.boxes.size()), .width = width, .height = height});
+  CoconutMaskRecovery recovery(&index, nullptr);
+  const std::array physical{coco(id)};
+  auto input = request(physical);
+  input.recovery = &recovery;
+  input.parquet_shards = {root.path() / "source.parquet"};
+  parquet_file(input.parquet_shards[0], Json::array({hf_row(id, file_bytes(fixtures / (std::to_string(id) + ".mask.png")), source.at("segments"), width, height)}));
+  const auto result = import_coconut_annotations(input);
+  REQUIRE(result.size() == 1);
+  const auto& component = result.front();
+  REQUIRE(component.recovery.size() == 1);
+  REQUIRE(component.recovery.front().objects.size() == (id == 2212 ? 2 : 1));
+  CHECK(component.recovery.front().unresolved == 0);
+  const auto supporter = std::ranges::find(component.index.boxes, id == 2212 ? 63U : 9U, &NormalizedBox::source_category_id);
+  REQUIRE(supporter != component.index.boxes.end());
+  CHECK(supporter->original_area < (id == 2212 ? 192166 : 259651));
+  for (const auto& fact : component.recovery.front().objects) {
+   const auto dog = std::ranges::find(component.index.boxes, fact.annotation_id, &NormalizedBox::annotation_id);
+   const auto original_dog = std::ranges::find(index.boxes, fact.original_annotation_id, &NormalizedBox::annotation_id);
+   REQUIRE(dog != component.index.boxes.end());
+   REQUIRE(original_dog != index.boxes.end());
+   CHECK(dog->source_category_id == 18);
+   const auto dog_runs = std::span(component.index.mask_rle_pairs).subspan(dog->mask_rle_offset, dog->mask_rle_pairs);
+   const auto expected = std::span(index.mask_rle_pairs).subspan(original_dog->mask_rle_offset, original_dog->mask_rle_pairs);
+   CHECK(std::ranges::equal(dog_runs, expected, [](auto a, auto b) { return a.start == b.start && a.length == b.length; }));
+   const auto support_runs = std::span(component.index.mask_rle_pairs).subspan(supporter->mask_rle_offset, supporter->mask_rle_pairs);
+   for (unsigned projection = 0; projection < 3; ++projection) {
+    using namespace mmltk::backend::imaging::resample;
+    const dataset::MaskDimensions target = projection == 0 ? dataset::MaskDimensions{width, height} : dataset::MaskDimensions{384, 384};
+    const auto geometry = compute_image_resize_geometry(width, height, target.width, target.height,
+                                                        projection == 2 ? ImageResizeMode::Letterbox : ImageResizeMode::Stretch);
+    dataset::MaskResizeScratch scratch;
+    const auto dogs = dataset::resize_row_major_mask(dog_runs, {width, height}, target, geometry, &scratch);
+    const auto support = dataset::resize_row_major_mask(support_runs, {width, height}, target, geometry, &scratch);
+    std::vector<std::uint8_t> foreground, background;
+    dataset::materialize_row_major_mask(dogs.pairs, target, &foreground);
+    dataset::materialize_row_major_mask(support.pairs, target, &background);
+    std::size_t intersection = 0;
+    for (std::size_t pixel = 0; pixel < foreground.size(); ++pixel) intersection += foreground[pixel] && background[pixel];
+    CHECK(intersection == 0);
+   }
+  }
+  const auto path = root.path() / "recovered.normalized.bin";
+  store_coconut_component(path, component);
+  const auto cached = load_coconut_component(path, component.edition, component.source, component.input_identity);
+  REQUIRE(cached);
+  CHECK(cached->index.annotation_sha256 == component.index.annotation_sha256);
+  CHECK(cached->recovery.front().objects.size() == component.recovery.front().objects.size());
+  auto changed = index;
+  changed.annotation_sha256 = std::string(64, 'a');
+  CoconutMaskRecovery changed_recovery(&changed, nullptr);
+  CHECK_FALSE(load_coconut_component(path, component.edition, component.source,
+                                     coconut_component_input_identity(input.input_identity, component.source, &changed_recovery)));
+  auto corrupt = read_json_file(path.string() + ".complete.json");
+  corrupt["coconut"]["recovery_policy"] = 99;
+  write_json_atomically(path.string() + ".complete.json", corrupt, {});
+  CHECK_FALSE(load_coconut_component(path, component.edition, component.source, component.input_identity));
+ }
+}
+
+TEST_CASE("optional COCO split admission is independent and never conceals output failures", "[coconut][benchmark][cache]") {
+ ScopedTempDir root("coco-optional-admission");
+ LocalCoconutRecipe local(root.path());
+ auto catalog = local_custom_catalog(local);
+ const auto train = local.cache.source_indexes("coco") / "train2017.normalized.bin";
+ const auto validation = local.cache.source_indexes("coco") / "val2017.normalized.bin";
+ bool missing_train = true, initial_failure = false, publication_failure = false, required_validation = true, cold = false;
+ bool local_parser_failure = false;
+ unsigned unusable_document = 0;
+ SECTION("missing optional train preserves discovered required validation") {}
+ SECTION("missing optional validation preserves discovered train") { missing_train = false; required_validation = false; }
+ SECTION("initial download failure returns independently admitted required validation") { initial_failure = true; }
+ SECTION("initial download failure returns independently admitted optional train") { initial_failure = true; missing_train = false; required_validation = false; }
+ SECTION("optional output publication failure remains fatal") { publication_failure = true; }
+ SECTION("local parser file opening failure remains fatal") { local_parser_failure = true; }
+ SECTION("optional malformed document is unavailable") { unusable_document = 1; }
+ SECTION("optional category metadata rejection is unavailable") { unusable_document = 2; }
+ SECTION("optional mistyped image metadata is unavailable") { unusable_document = 3; }
+ SECTION("optional integer exceeding 64 bits is unavailable") { unusable_document = 4; }
+ SECTION("missing optional train cannot prevent cold required validation admission") { cold = true; }
+ SECTION("cold usable train survives unavailable optional validation") { cold = true; missing_train = false; required_validation = false; }
+ const auto missing = missing_train ? train : validation;
+ const auto retained = missing_train ? validation : train;
+ const auto retained_bytes = file_bytes(retained);
+ if (cold) { remove_cache_path(retained); remove_cache_path(retained.string() + ".complete.json"); }
+ remove_cache_path(missing);
+ remove_cache_path(missing.string() + ".complete.json");
+ auto artifact = catalog.coco_annotations;
+ const auto archive_path = local.cache.source_downloads("coco") / artifact.filename;
+ if (!publication_failure && !local_parser_failure) {
+  const auto split = missing_train ? "val2017" : "train2017";
+  const std::array<std::pair<std::string, std::string>, 1> rows{{{
+   cold ? "annotations/instances_" + std::string(split) + ".json" : "annotations/unrelated.json",
+   cold ? file_bytes(local.cache.source_indexes("coco") / (std::string(split) + ".fixture.json")) : "{}"}}};
+  tar(archive_path, rows);
+ }
+ if (unusable_document) {
+  auto document = Json::parse(file_bytes(local.cache.source_indexes("coco") / "train2017.fixture.json"));
+  if (unusable_document == 2) document["categories"][0]["name"] = "wrong source category name";
+  if (unusable_document == 3) document["images"][0]["width"] = "not a numeric dimension";
+  if (unusable_document == 4) document["images"][0]["width"] = "oversized-integer";
+  auto payload = unusable_document == 1 ? std::string("not JSON") : document.dump();
+  if (unusable_document == 4) {
+   // Retain an exact JSON integer literal rather than a rounded double/string.
+   const std::string marker = "\"oversized-integer\"";
+   const auto position = payload.find(marker);
+   REQUIRE(position != std::string::npos);
+   payload.replace(position, marker.size(), "18446744073709551616");
+  }
+  const std::array<std::pair<std::string, std::string>, 1> rows{{{"annotations/instances_train2017.json", std::move(payload)}}};
+  tar(archive_path, rows);
+ }
+ mmltk::backend::data::testsupport::HttpServer server(file_bytes(archive_path));
+ artifact.url = server.url("optional-split");
+ artifact.expected_size = std::filesystem::file_size(archive_path);
+ if (publication_failure) std::filesystem::create_directory(missing);
+ BenchmarkTraceSink trace;
+ bool parser_entered = false;
+ ProgressReporter progress([&](const BenchmarkCompileProgress& update) {
+  if (local_parser_failure && update.activity == "Parsing and indexing COCO train annotations") {
+   parser_entered = true;
+   // Remove the already-extracted input at the ordinary progress boundary.
+   // The parser's open failure is local, not evidence of unusable source bytes.
+   REQUIRE(std::filesystem::remove(local.cache.source_indexes("coco") / "source-json/instances_train2017.json"));
+  }
+ }, trace);
+ CocoAnnotationCache cache(local.cache, artifact, {CocoSplitAdmission::Optional,
+                                                   required_validation ? CocoSplitAdmission::Required : CocoSplitAdmission::Optional}, 2, 1, 1, {}, trace);
+ cache.discover(progress);
+ REQUIRE(cache.pending_download());
+ auto completed = cache.completed_indexes();
+ REQUIRE(completed == (cold ? 0 : 1));
+ if (initial_failure)
+  cache.download_unavailable(BenchmarkDownloadUnavailable("fixture source unavailable"), progress);
+ else {
+  auto archive = download_artifacts({*cache.pending_download()}, 1, {}).front();
+  if (publication_failure || local_parser_failure) {
+   CHECK_THROWS(cache.settle(std::move(archive), progress, 1, completed, 2));
+   CHECK(parser_entered == local_parser_failure);
+   CHECK(server.requests() == 0);
+   CHECK(completed == 1);
+   CHECK_THROWS(cache.take_indexes());
+   CHECK(file_bytes(retained) == retained_bytes);
+   return;
+  }
+  cache.settle(std::move(archive), progress, 1, completed, 2);
+ }
+ const auto indexes = cache.take_indexes();
+ CHECK(indexes.train.has_value() == !missing_train);
+ CHECK(indexes.validation.has_value() == missing_train);
+ if (!cold) CHECK(file_bytes(retained) == retained_bytes);
+ CHECK(completed == 1);
+ server.Check();
+}
+
+TEST_CASE("COCONut recovery caches preserve base and physical products across every validation choice", "[coconut][benchmark][cache]") {
+ ScopedTempDir root("coconut-recovery-recipe");
+ LocalCoconutRecipe local(root.path());
+ for (auto& release : local.catalog.releases) {
+  if (release.edition != CoconutEdition::Base && release.edition != CoconutEdition::RelabeledValidation) continue;
+  auto& artifact = release.annotations.front();
+  const auto path = local.cache.source_downloads("coconut-" + std::string(release.name)) / artifact.filename;
+  const std::array<std::uint32_t, 9> pixels{1, 1, 1, 1, 1, 1, 1, 1, 1}, empty{};
+  auto rows = Json::array({hf_row(release.edition == CoconutEdition::Base ? 7 : 9, png(3, 3, pixels), Json::array({segment(1, 63), segment(2, 18)}))});
+  if (release.edition == CoconutEdition::Base) rows.push_back(hf_row(8, png(3, 3, empty), Json::array()));
+  parquet_file(path, rows);
+  artifact.expected_size = std::filesystem::file_size(path);
+ }
+ for (const bool training : {true, false}) {
+  auto index = recovery_originals(training ? 7 : 9, std::array<RLEPair, 1>{{{0, 1}}});
+  index.annotation_sha256 = std::string(64, training ? 'a' : 'b');
+  index.split = training ? "train2017" : "val2017";
+  store_normalized_annotation_index(local.cache.source_indexes("coco") / (index.split + ".normalized.bin"), index, {});
+ }
+ auto config = local.compiler_config({BenchmarkDatasetVariant::Coconut, CoconutValidation::Coconut}, true);
+ const auto base_path = local.cache.source_indexes("coconut-fixture-base") / "coco-train2017.normalized.bin";
+ const auto unlabeled_path = local.cache.source_indexes("coconut-fixture-base") / "coco-unlabeled2017.normalized.bin";
+ const auto image = cached_image_path(local.cache.source_images("coco") / "train2017", 7);
+ std::string base_bytes, unlabeled_bytes, off_train, recovered_train;
+ std::filesystem::file_time_type image_time{}, unlabeled_time{};
+ for (const auto choice : {CoconutValidation::Coconut, CoconutValidation::Stock, CoconutValidation::CoconutStock}) {
+  config.selection.validation = choice;
+  const auto catalog = local.selected(choice);
+  for (const bool enabled : {false, true, true, false, true}) {
+   config.selection.recover_dropped_masks = enabled;
+   compile_benchmark_recipe(config, &catalog);
+   const auto manifest = Json::parse(file_bytes(config.output_dir / "benchmark_manifest.json")).at("recipe");
+   CHECK(manifest.at("recovered_objects") == (enabled ? (choice == CoconutValidation::Stock ? 1 : 2) : 0));
+   CHECK(manifest.at("unresolved_objects") == 0);
+   const auto train_bytes = file_bytes(config.output_dir / "train.bin");
+   auto& expected = enabled ? recovered_train : off_train;
+   if (expected.empty()) expected = train_bytes;
+   CHECK(train_bytes == expected);
+   if (base_bytes.empty()) {
+    base_bytes = file_bytes(base_path);
+    unlabeled_bytes = file_bytes(unlabeled_path);
+    image_time = std::filesystem::last_write_time(image);
+    unlabeled_time = std::filesystem::last_write_time(unlabeled_path);
+   }
+   CHECK(file_bytes(base_path) == base_bytes);
+   CHECK(file_bytes(unlabeled_path) == unlabeled_bytes);
+   CHECK(std::filesystem::last_write_time(unlabeled_path) == unlabeled_time);
+   CHECK(std::filesystem::last_write_time(image) == image_time);
+   for (const auto& component : manifest.at("components"))
+    if (component.at("physical_source") == "coco-train2017") {
+     CHECK(component.at("recovery_policy") == (enabled ? kCoconutRecoveryPolicy : 0));
+     CHECK(component.at("original_annotation_identity") == (enabled ? std::string(64, 'a') : std::string{}));
+    }
+  }
+ }
+ CHECK(off_train != recovered_train);
+ const auto previous = file_bytes(config.output_dir / "train.bin");
+ const auto prior_manifest = file_bytes(config.output_dir / "benchmark_manifest.json");
+ auto changed = recovery_originals(7, std::array<RLEPair, 1>{{{0, 1}}});
+ changed.annotation_sha256 = std::string(64, 'c');
+ store_normalized_annotation_index(local.cache.source_indexes("coco") / "train2017.normalized.bin", changed, {});
+ const auto catalog = local.selected(config.selection.validation);
+ compile_benchmark_recipe(config, &catalog);
+ CHECK(file_bytes(config.output_dir / "train.bin") == previous);
+ CHECK(file_bytes(config.output_dir / "benchmark_manifest.json") != prior_manifest);
+ // Both original splits remain independent through the recipe, including a
+ // required Stock validation beside an unavailable optional train original.
+ const auto archive_path = local.cache.source_downloads("coco") / local.catalog.stock_annotations.filename;
+ const std::array<std::pair<std::string, std::string>, 1> unavailable{{{"annotations/unrelated.json", "{}"}}};
+ tar(archive_path, unavailable);
+ mmltk::backend::data::testsupport::HttpServer server(file_bytes(archive_path));
+ local.catalog.stock_annotations.url = server.url("unavailable-originals");
+ local.catalog.stock_annotations.expected_size = std::filesystem::file_size(archive_path);
+ for (const bool missing_train : {true, false}) {
+  const auto split = missing_train ? "train2017" : "val2017";
+  const auto path = local.cache.source_indexes("coco") / (std::string(split) + ".normalized.bin");
+  remove_cache_path(path);
+  remove_cache_path(path.string() + ".complete.json");
+  config.selection.validation = missing_train ? CoconutValidation::Stock : CoconutValidation::CoconutStock;
+  const auto selected = local.selected(config.selection.validation);
+  compile_benchmark_recipe(config, &selected);
+  const auto manifest = Json::parse(file_bytes(config.output_dir / "benchmark_manifest.json")).at("recipe");
+  CHECK(manifest.at("recovered_objects") == (missing_train ? 0 : 1));
+  CHECK(manifest.at("unresolved_objects") == 1);
+  CHECK(manifest.at("original_annotations").at(missing_train ? "train" : "validation").is_null());
+  // A later admission retries the original and immediately reuses/rebuilds its
+  // correctly bound derived cache rather than accepting unavailable as complete.
+  auto restored = recovery_originals(missing_train ? 7 : 9, std::array<RLEPair, 1>{{{0, 1}}});
+  restored.split = split;
+  restored.annotation_sha256 = std::string(64, missing_train ? 'c' : 'b');
+  store_normalized_annotation_index(path, restored, {});
+  compile_benchmark_recipe(config, &selected);
+  const auto retried = Json::parse(file_bytes(config.output_dir / "benchmark_manifest.json")).at("recipe");
+  CHECK(retried.at("recovered_objects") == (missing_train ? 1 : 2));
+  CHECK(retried.at("unresolved_objects") == 0);
+  CHECK(file_bytes(base_path) == base_bytes);
+  CHECK(std::filesystem::last_write_time(image) == image_time);
+ }
+ server.Check();
+ std::atomic<bool> stop{true};
+ config.cancel_requested = mmltk::common::concurrency::CancellationObservation::Atomic(stop);
+ CHECK_THROWS(compile_benchmark_recipe(config, &catalog));
+ CHECK(file_bytes(config.output_dir / "train.bin") == previous);
+}
+
+TEST_CASE("COCONut recovery facts follow physical images when import rows are reordered", "[coconut][benchmark][cache]") {
+ ScopedTempDir root("coconut-recovery-order");
+ const std::array physical{coco(7), coco(3)};
+ auto originals = recovery_originals(7, std::array<RLEPair, 1>{{{0, 1}}});
+ auto second = recovery_originals(3, std::array<RLEPair, 1>{{{4, 1}}});
+ append_normalized_image_slice(originals, second, 0);
+ CoconutMaskRecovery recovery(&originals, nullptr);
+ const std::array<std::uint32_t, 9> pixels{1, 1, 1, 1, 1, 1, 1, 1, 1};
+ auto input = request(physical);
+ input.recovery = &recovery;
+ input.parquet_shards = {root.path() / "unordered.parquet"};
+ parquet_file(input.parquet_shards.front(), Json::array({hf_row(7, png(3, 3, pixels), Json::array({segment(1, 63), segment(2, 18)})),
+                                                        hf_row(3, png(3, 3, pixels), Json::array({segment(1, 63), segment(2, 18)}))}));
+ const auto components = import_coconut_annotations(input);
+ REQUIRE(components.size() == 1);
+ const auto& component = components.front();
+ REQUIRE(component.recovery.size() == 2);
+ CHECK(component.recovery[0].image_id == 3);
+ CHECK(component.recovery[1].image_id == 7);
+ CHECK(component.recovery[0].objects.front().source_ordinal == 3);
+ CHECK(component.recovery[1].objects.front().source_ordinal == 1);
+ const auto path = root.path() / "ordered.normalized.bin";
+ store_coconut_component(path, component);
+ const auto cached = load_coconut_component(path, component.edition, component.source, component.input_identity);
+ REQUIRE(cached);
+ CHECK(cached->recovery[0].image_id == 3);
+ CHECK(cached->recovery[1].image_id == 7);
+ CHECK(cached->index.annotation_sha256 == component.index.annotation_sha256);
 }

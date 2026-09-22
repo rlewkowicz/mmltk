@@ -28,7 +28,7 @@ CustomRecipePreparation prepare_custom_recipe(const BenchmarkCompilerConfig& con
  const std::filesystem::path objects_index_path = cache.source_indexes("objects365") / "train.normalized.bin";
  const std::filesystem::path open_images_index_path = cache.source_indexes("open-images") / "train.normalized.bin";
  progress.activity("Waiting for annotation cache locks");
- CocoAnnotationCache coco_cache(cache, catalog.coco_annotations, true, catalog.coco_train_images_count, catalog.coco_validation_images_count,
+ CocoAnnotationCache coco_cache(cache, catalog.coco_annotations, {CocoSplitAdmission::Required, CocoSplitAdmission::Required}, catalog.coco_train_images_count, catalog.coco_validation_images_count,
                                 config.num_workers, cancel_requested, trace);
  ArtifactLease objects_annotation_lifecycle = ArtifactLease::acquire(cache.locks / "objects365-annotations.lifecycle.lock", cancel_requested);
  ArtifactLease open_images_annotation_lifecycle = ArtifactLease::acquire(cache.locks / "open-images-annotations.lifecycle.lock", cancel_requested);

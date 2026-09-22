@@ -52,6 +52,8 @@ struct CoconutRecoveryImage {
  std::uint64_t image_id = 0;
  std::uint64_t unresolved = 0;
  std::vector<CoconutRecoveredObject> objects;
+ // Omitted COCONut identities have no admitted original; original_annotation_id is zero.
+ std::vector<CoconutRecoveredObject> omissions;
 };
 MMLTK_REFLECT_FIELDS(CoconutRecoveryImage)
 struct CoconutComponent {
@@ -111,6 +113,7 @@ struct CoconutImportRequest {
  // Synchronous observation of discarded objects; report failures never reject an image.
  std::function<void(const CoconutPhysicalImage&, const CoconutRecord&, const CoconutSegment&, std::string_view)> rejected_object;
 };
+[[nodiscard]] std::string coconut_component_input_identity(std::string_view base, CoconutImageNamespace, const CoconutMaskRecovery*);
 // Every offered record is required. Unknown expected_rows means derive, never sample.
 [[nodiscard]] std::vector<CoconutComponent> import_coconut_annotations(const CoconutImportRequest& request);
 // Removes only XL rows covered by Large, retaining B and all namespace distinctions.

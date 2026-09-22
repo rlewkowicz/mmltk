@@ -1,0 +1,58 @@
+{
+  "export_prefix": "build/validation/benchmark-image/400",
+  "height": 640,
+  "image_id": 400,
+  "image_info": {
+    "coco_url": "http://images.cocodataset.org/train2017/000000000400.jpg",
+    "date_captured": "2013-11-14 16:03:19",
+    "file_name": "000000000400.jpg",
+    "height": 640,
+    "id": 400,
+    "license": 3,
+    "width": 638
+  },
+  "kind": "panoptic_mask",
+  "path": ".cache/benchmark-dataset/v1/downloads/coconut-coconut_b/train-00000-of-00004.parquet",
+  "row": 72,
+  "segments": [
+    {
+      "area": null,
+      "category_id": 155,
+      "id": 1,
+      "iscrowd": 0,
+      "isthing": 0,
+      "observed_pixels": 145659
+    },
+    {
+      "area": null,
+      "category_id": 18,
+      "id": 2,
+      "iscrowd": 0,
+      "isthing": 1,
+      "observed_pixels": 0
+    },
+    {
+      "area": null,
+      "category_id": 9,
+      "id": 3,
+      "iscrowd": 0,
+      "isthing": 1,
+      "observed_pixels": 259651
+    }
+  ],
+  "support": [
+    {
+      "id": 0,
+      "pixels": 3010
+    },
+    {
+      "id": 1,
+      "pixels": 145659
+    },
+    {
+      "id": 3,
+      "pixels": 259651
+    }
+  ],
+  "width": 638
+}

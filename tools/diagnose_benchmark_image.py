@@ -47,7 +47,7 @@ def compiled_sample(path, sample):
         return image_id if has_id else None
 
 
-def annotation_rows(path, image_id, include_objects=False):
+def annotation_rows(path, image_id, include_objects=False, export_mask_runs=False):
     # Version-3 normalized source cache; independent of the compiled .bin format.
     with path.open("rb") as stream:
         header = stream.read(256)
@@ -68,7 +68,9 @@ def annotation_rows(path, image_id, include_objects=False):
                 if identity == image_id:
                     report(kind="annotation", path=str(path), row=start + index, image_id=identity,
                            width=width, height=height, shard=shard, first_box=first_box, boxes=boxes)
-                    if include_objects:
+                    if include_objects or export_mask_runs:
+                        exported = []
+                        exported_pairs = 0
                         box_offset = struct.unpack_from("<Q", header, 44)[0] + first_box * 64
                         if boxes > 65535 or box_offset + boxes * 64 > path.stat().st_size:
                             raise ValueError("normalized annotation slice exceeds admission")
@@ -77,11 +79,32 @@ def annotation_rows(path, image_id, include_objects=False):
                         if len(payload) != boxes * 64:
                             raise ValueError("truncated normalized annotations")
                         for box in struct.iter_unpack("<ffffQIBB2xdQQQ", payload):
-                            x1, y1, x2, y2, _, pairs, category, flags, area, annotation_id, source_category, ordinal = box
+                            x1, y1, x2, y2, first_pair, pairs, category, flags, area, annotation_id, source_category, ordinal = box
                             report(kind="annotation_object", path=str(path), image_id=identity, annotation_id=annotation_id,
                                    class_id=category, source_category_id=source_category, flags=flags,
                                    bbox=[x1, y1, x2, y2], mask_pairs=pairs, original_area=area, source_ordinal=ordinal)
+                            if export_mask_runs:
+                                exported_pairs += pairs
+                                if pairs > 65535 or exported_pairs > 1048576:
+                                    raise ValueError("selected object mask exceeds export bound")
+                                mask_offset = struct.unpack_from("<Q", header, 52)[0] + first_pair * 8
+                                if mask_offset + pairs * 8 > path.stat().st_size:
+                                    raise ValueError("selected object mask exceeds index extent")
+                                stream.seek(mask_offset)
+                                runs = list(struct.iter_unpack("<II", stream.read(pairs * 8)))
+                                if len(runs) != pairs:
+                                    raise ValueError("truncated selected object mask")
+                                exported.append(dict(annotation_id=annotation_id, class_id=category, source_category_id=source_category,
+                                                     flags=flags, bbox=[x1, y1, x2, y2], original_area=area, source_ordinal=ordinal, runs=runs))
+                        if export_mask_runs:
+                            completion = json.loads(Path(str(path) + ".complete.json").read_text())
+                            output = Path("/evidence") / f"{image_id}.originals.json"
+                            output.write_text(json.dumps(dict(image_id=identity, width=width, height=height, index=str(path),
+                                                              annotation_sha256=completion["annotation_sha256"], objects=exported)) + "\n")
+                            report(kind="mask_run_export", path=f"build/validation/benchmark-image/{output.name}", objects=len(exported))
                     return
+        if export_mask_runs:
+            raise ValueError("selected image is absent from normalized index")
 
 
 def exif_orientation(payload):
@@ -163,6 +186,7 @@ def main():
     parser.add_argument("--sample", type=int, help="zero-based compiled sample index")
     parser.add_argument("--index", type=Path, action="append", default=[])
     parser.add_argument("--objects", action="store_true", help="include normalized object records for each matching index row")
+    parser.add_argument("--export-mask-runs", action="store_true", help="export bounded selected-image normalized RLEs and identities")
     parser.add_argument("--image", type=Path)
     parser.add_argument("--archive", type=Path)
     parser.add_argument("--parquet", type=Path, help="inspect a raw COCONut mask and segment metadata")
@@ -182,6 +206,8 @@ def main():
         parser.error("image ID must fit uint64")
     if args.image_id is None and (args.index or args.image or args.archive or args.parquet or args.panoptic):
         parser.error("this compiled sample has no source image ID")
+    if args.export_mask_runs and len(args.index) != 1:
+        parser.error("--export-mask-runs requires exactly one --index")
     if args.parquet or args.panoptic:
         executable = Path("/evidence/diagnose_coconut_mask")
         subprocess.run([
@@ -195,7 +221,7 @@ def main():
             if path:
                 subprocess.run([str(executable), mode, str(path), str(args.image_id), str(int(args.export))], check=True, timeout=120)
     for path in args.index:
-        annotation_rows(path, args.image_id, args.objects)
+        annotation_rows(path, args.image_id, args.objects, args.export_mask_runs)
     if args.image:
         with args.image.open("rb") as stream:
             inspect_image(stream.read(64 * 1024 * 1024 + 1), args.export, path=str(args.image), image_id=args.image_id)

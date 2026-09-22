@@ -1,8 +1,9 @@
 ---
 BasedOnStyle: Google
-ColumnLimit: 160
+ColumnLimit: 200
 IndentWidth: 1
 ContinuationIndentWidth: 1
+AlignAfterOpenBracket: false
 TabWidth: 1
 UseTab: Never
 DerivePointerAlignment: false

@@ -10,6 +10,7 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <stdexcept>
 #include <string_view>
 #include <vector>
 #include "src/common/concurrency/cancellation_observation.h"
@@ -18,6 +19,11 @@
 #include "src/backend/data/benchmark_dataset_compiler.h"
 #include "src/backend/data/compiled_format.h"
 namespace mmltk::backend::data::benchmark_internal {
+// Rejection of the annotation document itself, never a local execution failure.
+class AnnotationDocumentRejected final : public std::runtime_error {
+public:
+ using std::runtime_error::runtime_error;
+};
 inline constexpr std::uint32_t kNormalizedAnnotationIndexVersion = 3U;
 struct __attribute__((packed)) NormalizedBox {
  float x1 = 0.0F;

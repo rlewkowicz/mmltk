@@ -1,0 +1,102 @@
+{
+  "export_prefix": "build/validation/benchmark-image/2212",
+  "height": 426,
+  "image_id": 2212,
+  "image_info": {
+    "coco_url": "http://images.cocodataset.org/train2017/000000002212.jpg",
+    "date_captured": "2013-11-14 16:03:19",
+    "file_name": "000000002212.jpg",
+    "height": 426,
+    "id": 2212,
+    "license": 3,
+    "width": 640
+  },
+  "kind": "panoptic_mask",
+  "path": ".cache/benchmark-dataset/v1/downloads/coconut-coconut_b/train-00000-of-00004.parquet",
+  "row": 449,
+  "segments": [
+    {
+      "area": null,
+      "category_id": 118,
+      "id": 1,
+      "iscrowd": 0,
+      "isthing": 0,
+      "observed_pixels": 28763
+    },
+    {
+      "area": null,
+      "category_id": 199,
+      "id": 2,
+      "iscrowd": 0,
+      "isthing": 0,
+      "observed_pixels": 26262
+    },
+    {
+      "area": null,
+      "category_id": 180,
+      "id": 3,
+      "iscrowd": 0,
+      "isthing": 0,
+      "observed_pixels": 23301
+    },
+    {
+      "area": null,
+      "category_id": 195,
+      "id": 4,
+      "iscrowd": 0,
+      "isthing": 0,
+      "observed_pixels": 288
+    },
+    {
+      "area": null,
+      "category_id": 18,
+      "id": 5,
+      "iscrowd": 0,
+      "isthing": 1,
+      "observed_pixels": 0
+    },
+    {
+      "area": null,
+      "category_id": 18,
+      "id": 6,
+      "iscrowd": 0,
+      "isthing": 1,
+      "observed_pixels": 0
+    },
+    {
+      "area": null,
+      "category_id": 63,
+      "id": 7,
+      "iscrowd": 0,
+      "isthing": 1,
+      "observed_pixels": 192166
+    }
+  ],
+  "support": [
+    {
+      "id": 0,
+      "pixels": 1860
+    },
+    {
+      "id": 1,
+      "pixels": 28763
+    },
+    {
+      "id": 2,
+      "pixels": 26262
+    },
+    {
+      "id": 3,
+      "pixels": 23301
+    },
+    {
+      "id": 4,
+      "pixels": 288
+    },
+    {
+      "id": 7,
+      "pixels": 192166
+    }
+  ],
+  "width": 640
+}

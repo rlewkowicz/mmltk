@@ -577,7 +577,7 @@ struct IdentityProbe {
                          {"http_status", probe.http.response_code},
                          {"detail", probe.error_buffer[0] != '\0' ? probe.error_buffer.data() : curl_easy_strerror(result)}};
   });
-  if (attempt == request.maximum_attempts) { throw std::runtime_error("cannot establish a stable ranged download identity for " + request.artifact_id); }
+  if (attempt == request.maximum_attempts) { throw BenchmarkDownloadUnavailable("cannot establish a stable ranged download identity for " + request.artifact_id); }
   // The remote probe retry is intentionally deadline-based HTTP backoff, not local status polling.
   throw_if_benchmark_cancelled(cancel_requested);
   std::this_thread::sleep_for(std::chrono::milliseconds{std::min<std::uint64_t>(4000U, 250U << std::min<std::uint32_t>(attempt - 1U, 4U))});
@@ -828,7 +828,7 @@ struct SegmentTransfer {
  static std::size_t write_callback(char* data, const std::size_t size, const std::size_t count, void* opaque) {
   return curl_run_data_callback<SegmentTransfer>(size, count, opaque, [data](SegmentTransfer& transfer, const std::size_t bytes) -> std::size_t {
    if (!transfer.response_headers_valid) { return 0U; }
-   if (bytes > transfer.range_end + 1U - transfer.write_offset) { throw std::runtime_error("segmented response exceeds its validated byte range"); }
+   if (bytes > transfer.range_end + 1U - transfer.write_offset) { throw BenchmarkDownloadUnavailable("segmented response exceeds its validated byte range"); }
    append_transfer_bytes(&transfer.write_offset, SegmentTransfer::kWriteContext, transfer.descriptor, data, bytes);
    transfer.state.report_in_flight(transfer.segment_index, transfer.transferred());
    return bytes;
@@ -871,7 +871,7 @@ struct SegmentTransfer {
    const std::uint64_t segment_size = segment.end + 1U - segment.begin;
    if (segment.completed == segment_size) { break; }
    const std::uint32_t attempt = segment.attempts + 1U;
-   if (attempt > request.maximum_attempts) { throw std::runtime_error("segmented benchmark download exhausted retries for " + request.artifact_id); }
+   if (attempt > request.maximum_attempts) { throw BenchmarkDownloadUnavailable("segmented benchmark download exhausted retries for " + request.artifact_id); }
    const std::uint64_t attempt_begin = segment.begin + segment.completed;
    state.begin_attempt(attempt);
    SegmentTransfer transfer(request, identity, state, segment_index, attempt_begin, segment.end, attempt, descriptor, cancel_requested);
@@ -909,7 +909,7 @@ struct SegmentTransfer {
                           {"completed_bytes", transfer.transferred()},
                           {"detail", transfer.error_buffer[0] != '\0' ? transfer.error_buffer.data() : curl_easy_strerror(result)}};
    });
-   if (attempt == request.maximum_attempts) { throw std::runtime_error("segmented benchmark download failed after retries for " + request.artifact_id); }
+   if (attempt == request.maximum_attempts) { throw BenchmarkDownloadUnavailable("segmented benchmark download failed after retries for " + request.artifact_id); }
    // The remote segment retry is intentionally deadline-based HTTP backoff.
    throw_if_benchmark_cancelled(cancel_requested);
    std::this_thread::sleep_for(std::chrono::milliseconds{std::min<std::uint64_t>(4000U, 250U << std::min<std::uint32_t>(attempt - 1U, 4U))});
@@ -1123,7 +1123,7 @@ std::vector<DownloadResult> download_artifacts(const std::vector<DownloadRequest
                          {"http_status", transfer.http.response_code}, {"reset_partial", reset_partial}, {"detail", detail}};
   });
   if (transfer.attempt >= transfer.request.maximum_attempts) {
-   throw std::runtime_error("benchmark download failed after retries for " + transfer.request.artifact_id + ": " + detail);
+   throw BenchmarkDownloadUnavailable("benchmark download failed after retries for " + transfer.request.artifact_id + ": " + detail);
   }
   const auto backoff = std::chrono::milliseconds{std::min<std::uint64_t>(4000U, 250U << std::min<std::uint32_t>(transfer.attempt - 1U, 4U))};
   pending.push_back(PendingTransfer{request_index, transfer.attempt + 1U, Clock::now() + backoff, transfer.redownload || reset_partial});
