@@ -2218,6 +2218,12 @@ TEST_CASE("COCONut recovers the complete dropped dog candidate set and carves so
  REQUIRE(cached);
  CHECK(cached->recovery.front().unresolved == facts.unresolved);
  CHECK(cached->recovery.front().omissions.size() == facts.unresolved);
+ CHECK(cached->index.annotation_sha256 == component.index.annotation_sha256);
+ CHECK(cached->inventory == component.inventory);
+ const auto roundtrip = root.path() / "recovery-roundtrip.normalized.bin";
+ store_coconut_component(roundtrip, *cached);
+ for (const auto suffix : {"", ".inventory", ".complete.json"})
+  CHECK(file_bytes(cache.string() + suffix) == file_bytes(roundtrip.string() + suffix));
  const auto settled = file_bytes(cache);
  std::atomic<bool> cancelled{true};
  CHECK_THROWS(store_coconut_component(cache, component, mmltk::common::concurrency::CancellationObservation::Atomic(cancelled)));
@@ -2760,30 +2766,94 @@ TEST_CASE("COCONut recovery caches preserve base and physical products across ev
 
 TEST_CASE("COCONut recovery facts follow physical images when import rows are reordered", "[coconut][benchmark][cache]") {
  ScopedTempDir root("coconut-recovery-order");
- const std::array physical{coco(7), coco(3)};
+ const std::array physical{coco(3), coco(5), coco(7), coco(9)};
  auto originals = recovery_originals(7, std::array<RLEPair, 1>{{{0, 1}}});
  auto second = recovery_originals(3, std::array<RLEPair, 1>{{{4, 1}}});
  append_normalized_image_slice(originals, second, 0);
  CoconutMaskRecovery recovery(&originals, nullptr);
- const std::array<std::uint32_t, 9> pixels{1, 1, 1, 1, 1, 1, 1, 1, 1};
+ const std::array<std::uint32_t, 9> pixels{1, 1, 1, 1, 1, 1, 1, 1, 1}, empty{};
+ const auto mask = png(3, 3, pixels), empty_mask = png(3, 3, empty);
+ const auto rows = Json::array({hf_row(3, mask, Json::array({segment(1, 63), segment(2, 18), segment(3, 17)})),
+                                hf_row(5, empty_mask, Json::array()),
+                                hf_row(7, mask, Json::array({segment(1, 63), segment(2, 18)})),
+                                hf_row(9, empty_mask, Json::array({segment(3, 17)}))});
+ std::array<std::size_t, 4> order{0, 1, 2, 3};
+ SECTION("already ordered rows retain every kind of recovery fact") {}
+ SECTION("permuted rows move every kind of recovery fact") { order = {2, 3, 1, 0}; }
+ auto offered = Json::array();
+ std::array<std::uint64_t, 4> image_ordinals{}, object_ordinals{};
+ std::uint64_t ordinal = 0;
+ for (std::size_t i = 0; i < order.size(); ++i) {
+  const auto position = order[i];
+  offered.push_back(rows[position]);
+  image_ordinals[position] = i;
+  object_ordinals[position] = ordinal;
+  ordinal += position == 0 ? 3U : position == 2 ? 2U : position == 3 ? 1U : 0U;
+ }
  auto input = request(physical);
  input.recovery = &recovery;
- input.parquet_shards = {root.path() / "unordered.parquet"};
- parquet_file(input.parquet_shards.front(), Json::array({hf_row(7, png(3, 3, pixels), Json::array({segment(1, 63), segment(2, 18)})),
-                                                        hf_row(3, png(3, 3, pixels), Json::array({segment(1, 63), segment(2, 18)}))}));
+ input.parquet_shards = {root.path() / "source.parquet"};
+ parquet_file(input.parquet_shards.front(), offered);
  const auto components = import_coconut_annotations(input);
  REQUIRE(components.size() == 1);
  const auto& component = components.front();
- REQUIRE(component.recovery.size() == 2);
- CHECK(component.recovery[0].image_id == 3);
- CHECK(component.recovery[1].image_id == 7);
- CHECK(component.recovery[0].objects.front().source_ordinal == 3);
- CHECK(component.recovery[1].objects.front().source_ordinal == 1);
  const auto path = root.path() / "ordered.normalized.bin";
  store_coconut_component(path, component);
  const auto cached = load_coconut_component(path, component.edition, component.source, component.input_identity);
  REQUIRE(cached);
- CHECK(cached->recovery[0].image_id == 3);
- CHECK(cached->recovery[1].image_id == 7);
- CHECK(cached->index.annotation_sha256 == component.index.annotation_sha256);
+ for (const auto* product : {&component, &*cached}) {
+  REQUIRE(product->recovery.size() == physical.size());
+  REQUIRE(product->inventory.size() == physical.size());
+  REQUIRE(product->index.images.size() == physical.size());
+  CHECK(product->index.annotation_sha256 == component.index.annotation_sha256);
+  CHECK(product->input_identity == component.input_identity);
+  CHECK(product->recovery_policy == kCoconutRecoveryPolicy);
+  CHECK(product->original_annotation_identity == originals.annotation_sha256);
+  for (std::size_t i = 0; i < physical.size(); ++i) {
+   CAPTURE(i);
+   const auto& facts = product->recovery[i];
+   const auto& inventory = product->inventory[i];
+   const auto& image = product->index.images[i];
+   CHECK(inventory.physical == physical[i]);
+   CHECK(inventory.release_image_id == physical[i].image_id);
+   CHECK(inventory.source_ordinal == image_ordinals[i]);
+   CHECK(image.source_image_id == physical[i].image_id);
+   CHECK(facts.image_id == physical[i].image_id);
+   const bool recovered = i == 0 || i == 2, omitted = i == 0 || i == 3;
+   REQUIRE(facts.objects.size() == (recovered ? 1 : 0));
+   REQUIRE(facts.omissions.size() == (omitted ? 1 : 0));
+   CHECK(facts.unresolved == facts.omissions.size());
+   CHECK(image.box_count == (recovered ? 2 : 0));
+   if (recovered) {
+    const auto& object = facts.objects.front();
+    CHECK(object.annotation_id == 2);
+    CHECK(object.source_ordinal == object_ordinals[i] + 1);
+    CHECK(object.source_category_id == 18);
+    CHECK(object.original_annotation_id == 200);
+    const auto& box = product->index.boxes[image.first_box + 1];
+    CHECK(box.annotation_id == object.annotation_id);
+    CHECK(box.source_ordinal == object.source_ordinal);
+    REQUIRE(box.mask_rle_pairs == 1);
+    const auto run = product->index.mask_rle_pairs[box.mask_rle_offset];
+    CHECK(run.start == (i == 0 ? 4 : 0));
+    CHECK(run.length == 1);
+   }
+   if (omitted) {
+    const auto& object = facts.omissions.front();
+    CHECK(object.annotation_id == 3);
+    CHECK(object.source_ordinal == object_ordinals[i] + (i == 0 ? 2 : 0));
+    CHECK(object.source_category_id == 17);
+    CHECK(object.original_annotation_id == 0);
+   }
+  }
+ }
+ const auto roundtrip = root.path() / "roundtrip.normalized.bin";
+ store_coconut_component(roundtrip, *cached);
+ for (const auto suffix : {"", ".inventory", ".complete.json"})
+  CHECK(file_bytes(path.string() + suffix) == file_bytes(roundtrip.string() + suffix));
+ const auto rebuilt = import_coconut_annotations(input);
+ REQUIRE(rebuilt.size() == 1);
+ CHECK(rebuilt.front().index.annotation_sha256 == component.index.annotation_sha256);
+ store_coconut_component(roundtrip, rebuilt.front());
+ CHECK(file_bytes(path.string() + ".inventory") == file_bytes(roundtrip.string() + ".inventory"));
 }

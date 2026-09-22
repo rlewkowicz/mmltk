@@ -10,6 +10,7 @@
 #include <string_view>
 #include <tuple>
 #include <type_traits>
+#include <vector>
 namespace mmltk::backend::data::benchmark_internal {
 struct CoconutPhysicalImage {
  CoconutImageNamespace source = CoconutImageNamespace::CocoTrain;
@@ -27,6 +28,21 @@ struct CoconutInventoryImage {
  bool operator==(const CoconutInventoryImage&) const = default;
 };
 MMLTK_REFLECT_FIELDS(CoconutInventoryImage)
+struct CoconutRecoveredObject {
+ std::uint64_t annotation_id = 0;
+ std::uint64_t source_ordinal = 0;
+ std::uint64_t source_category_id = 0;
+ std::uint64_t original_annotation_id = 0;
+};
+MMLTK_REFLECT_FIELDS(CoconutRecoveredObject)
+struct CoconutRecoveryImage {
+ std::uint64_t image_id = 0;
+ std::uint64_t unresolved = 0;
+ std::vector<CoconutRecoveredObject> objects;
+ // Omitted COCONut identities have no admitted original; original_annotation_id is zero.
+ std::vector<CoconutRecoveredObject> omissions;
+};
+MMLTK_REFLECT_FIELDS(CoconutRecoveryImage)
 struct InventoryHeader {
  std::uint64_t magic = 0x314E564954554E43ULL;
  std::uint32_t version = 1;
@@ -41,7 +57,7 @@ struct InventoryHeader {
 };
 MMLTK_REFLECT_FIELDS(InventoryHeader)
 // CNUTIVN1 is a declaration-order little-endian format, not a native struct dump.
-// These fixed expectations guard version 1; they do not drive any codec.
+// These fixed expectations guard version 1 and its recovery trailer; they do not drive any codec.
 static_assert(CHAR_BIT == 8 && sizeof(bool) == 1 && sizeof(std::uint8_t) == 1 && sizeof(std::uint16_t) == 2 && sizeof(std::uint32_t) == 4 &&
               sizeof(std::uint64_t) == 8);
 static_assert(std::is_same_v<std::underlying_type_t<CoconutEdition>, std::uint8_t>);
@@ -65,6 +81,12 @@ static_assert([] consteval {
          {"source", "image_id", "shard", "member", "archive_identity"}) &&
         matches.template operator()<CoconutInventoryImage>(std::type_identity<std::tuple<CoconutPhysicalImage, std::uint64_t, std::uint64_t>>{},
                                                            {"physical", "release_image_id", "source_ordinal"}) &&
+        matches.template operator()<CoconutRecoveredObject>(
+         std::type_identity<std::tuple<std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t>>{},
+         {"annotation_id", "source_ordinal", "source_category_id", "original_annotation_id"}) &&
+        matches.template operator()<CoconutRecoveryImage>(
+         std::type_identity<std::tuple<std::uint64_t, std::uint64_t, std::vector<CoconutRecoveredObject>, std::vector<CoconutRecoveredObject>>>{},
+         {"image_id", "unresolved", "objects", "omissions"}) &&
         matches.template operator()<InventoryHeader>(
          std::type_identity<std::tuple<std::uint64_t, std::uint32_t, std::uint32_t, std::string, std::string, CoconutEdition, CoconutImageNamespace,
                                        std::uint16_t, bool, std::uint64_t>>{},

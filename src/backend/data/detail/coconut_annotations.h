@@ -41,21 +41,6 @@ private:
  std::unordered_map<CoconutImageNamespace, std::unordered_map<std::uint64_t, const CoconutPhysicalImage*>> namespaces_;
 };
 class CoconutMaskRecovery;
-struct CoconutRecoveredObject {
- std::uint64_t annotation_id = 0;
- std::uint64_t source_ordinal = 0;
- std::uint64_t source_category_id = 0;
- std::uint64_t original_annotation_id = 0;
-};
-MMLTK_REFLECT_FIELDS(CoconutRecoveredObject)
-struct CoconutRecoveryImage {
- std::uint64_t image_id = 0;
- std::uint64_t unresolved = 0;
- std::vector<CoconutRecoveredObject> objects;
- // Omitted COCONut identities have no admitted original; original_annotation_id is zero.
- std::vector<CoconutRecoveredObject> omissions;
-};
-MMLTK_REFLECT_FIELDS(CoconutRecoveryImage)
 struct CoconutComponent {
  CoconutEdition edition = CoconutEdition::Base;
  CoconutImageNamespace source = CoconutImageNamespace::CocoTrain;

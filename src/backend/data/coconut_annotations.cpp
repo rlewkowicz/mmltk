@@ -393,10 +393,32 @@ BenchmarkDatasetSource index_source(CoconutImageNamespace source) {
 std::string component_split(CoconutEdition edition, CoconutImageNamespace source) {
  return "coconut-" + std::to_string(static_cast<unsigned>(edition)) + "-" + std::to_string(static_cast<unsigned>(source));
 }
+// The admitted order applies to each aligned metadata collection. Move owned
+// strings and object vectors only after normalized slice admission succeeds.
+template <class Row>
+void retain_inventory_rows(std::vector<Row>& rows, std::span<const std::size_t> order, bool increasing, Cancellation cancellation) {
+ if (increasing) {
+  for (std::size_t i = 0; i < order.size(); ++i) {
+   throw_if_benchmark_cancelled(cancellation);
+   if (i != order[i]) rows[i] = std::move(rows[order[i]]);
+  }
+  rows.resize(order.size());
+ } else {
+  std::vector<Row> retained;
+  retained.reserve(order.size());
+  for (const auto position : order) {
+   throw_if_benchmark_cancelled(cancellation);
+   retained.push_back(std::move(rows[position]));
+  }
+  rows = std::move(retained);
+ }
+}
 // Inventory owns physical joins; normalized storage owns slice movement.
 void retain_images(CoconutComponent& component, std::span<const std::size_t> order, Cancellation cancellation) {
  throw_if_benchmark_cancelled(cancellation);
  if (component.inventory.size() != component.index.images.size()) invalid("component inventory/image count mismatch");
+ if (component.recovery_policy ? component.recovery.size() != component.inventory.size() : !component.recovery.empty())
+  invalid("component recovery/image count mismatch");
  bool increasing = true;
  for (std::size_t i = 0; i < order.size(); ++i) {
   throw_if_benchmark_cancelled(cancellation);
@@ -406,30 +428,9 @@ void retain_images(CoconutComponent& component, std::span<const std::size_t> ord
  // Invalidate admission before destructive compaction or identity settlement.
  component.index.annotation_sha256.clear();
  try {
-  std::vector<CoconutInventoryImage> inventory;
-  if (!increasing) {
-   inventory.reserve(order.size());
-   for (const auto position : order) {
-    throw_if_benchmark_cancelled(cancellation);
-    inventory.push_back(component.inventory[position]);
-   }
-  }
   retain_normalized_image_slices(component.index, order, cancellation);
-  if (increasing) {
-   for (std::size_t i = 0; i < order.size(); ++i) {
-    throw_if_benchmark_cancelled(cancellation);
-    if (i != order[i]) component.inventory[i] = std::move(component.inventory[order[i]]);
-   }
-   component.inventory.resize(order.size());
-  } else
-   component.inventory = std::move(inventory);
-  if (component.recovery_policy) {
-   std::unordered_set<std::uint64_t> retained;
-   retained.reserve(component.inventory.size());
-   for (const auto& image : component.inventory) retained.insert(image.physical.image_id);
-   std::erase_if(component.recovery, [&](const auto& image) { return !retained.contains(image.image_id); });
-   std::ranges::sort(component.recovery, {}, &CoconutRecoveryImage::image_id);
-  }
+  retain_inventory_rows(component.inventory, order, increasing, cancellation);
+  if (component.recovery_policy) retain_inventory_rows(component.recovery, order, increasing, cancellation);
   component.index.annotation_sha256 = component_identity(component, cancellation);
  } catch (...) {
   component.index.annotation_sha256.clear();

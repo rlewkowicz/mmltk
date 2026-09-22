@@ -1,5 +1,6 @@
 #pragma once  // backend.data private implementation boundary
 #include "coconut_annotations.h"
+#include "coconut_inventory.h"
 #include "mask_rle_utils.h"
 #include "src/common/concurrency/cancellation_observation.h"
 #include <cstddef>
