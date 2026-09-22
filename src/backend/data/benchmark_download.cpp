@@ -160,9 +160,8 @@ void append_transfer_bytes(std::uint64_t* write_offset, const DownloadWriteConte
    etag = metadata.value("etag", std::string{});
    last_modified = metadata.value("last_modified", std::string{});
    attempts = metadata.value("attempts", 0U);
-  } catch (const std::bad_alloc&) { throw; } catch (const std::length_error&) {
-   throw;
-  } catch (const std::overflow_error&) { throw; } catch (const std::exception&) {
+  } catch (const std::exception& error) {
+   if (is_benchmark_capacity_failure(error)) throw;
    return std::nullopt;
   }
  }
@@ -330,9 +329,8 @@ struct Transfer {
     metadata_matches = metadata.value("schema_version", 0U) == kBenchmarkCacheSchemaVersion && metadata.value("url", std::string{}) == request.url;
     resume_etag = metadata.value("etag", std::string{});
     resume_last_modified = metadata.value("last_modified", std::string{});
-   } catch (const std::bad_alloc&) { throw; } catch (const std::length_error&) {
-    throw;
-   } catch (const std::overflow_error&) { throw; } catch (const std::exception&) {
+   } catch (const std::exception& error) {
+    if (is_benchmark_capacity_failure(error)) throw;
     metadata_matches = false;
    }
   }
@@ -686,9 +684,8 @@ private:
       segment.attempts = 0U;
      }
     }
-   } catch (const std::bad_alloc&) { throw; } catch (const std::length_error&) {
-    throw;
-   } catch (const std::overflow_error&) { throw; } catch (const std::exception&) {
+   } catch (const std::exception& error) {
+    if (is_benchmark_capacity_failure(error)) throw;
     valid = false;
    }
   }
@@ -1090,9 +1087,8 @@ std::vector<DownloadResult> download_artifacts(const std::vector<DownloadRequest
      std::string detail = "invalid HTTP range response";
      try {
       std::rethrow_exception(transfer->callback_error);
-     } catch (const std::bad_alloc&) { throw; } catch (const std::length_error&) {
-      throw;
-     } catch (const std::overflow_error&) { throw; } catch (const std::exception& error) {
+     } catch (const std::exception& error) {
+      if (is_benchmark_capacity_failure(error)) throw;
       detail = error.what();
      } catch (...) { detail = "non-standard HTTP range callback exception"; }
      schedule_retry(*transfer, request_index, true, completion->result, detail);

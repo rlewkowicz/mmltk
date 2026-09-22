@@ -1902,8 +1902,7 @@ TEST_CASE("stock annotation owner repairs only missing splits with bounded sourc
  const auto train_bytes = file_bytes(train_path), train_metadata = file_bytes(train_path.string() + ".complete.json");
  const auto train_time = std::filesystem::last_write_time(train_path);
  const auto val_path = local.cache.source_indexes("coco") / "val2017.normalized.bin";
- remove_cache_path(val_path);
- remove_cache_path(val_path.string() + ".complete.json");
+ remove_normalized_annotation_index(val_path);
  auto artifact = custom.coco_annotations;
  const auto raw = local.cache.source_downloads("coco") / artifact.filename;
  bool succeeds = true;
@@ -1969,8 +1968,7 @@ TEST_CASE("stock annotation cancellation preserves the previous recipe publicati
  const auto train = file_bytes(config.output_dir / "train.bin"), val = file_bytes(config.output_dir / "val.bin");
  const auto manifest = file_bytes(config.output_dir / "benchmark_manifest.json");
  const auto index = local.cache.source_indexes("coco") / "val2017.normalized.bin";
- remove_cache_path(index);
- remove_cache_path(index.string() + ".complete.json");
+ remove_normalized_annotation_index(index);
  std::atomic<bool> cancel{false};
  config.cancel_requested = mmltk::common::concurrency::CancellationObservation::Atomic(cancel);
  config.progress = [&](const auto& value) {
@@ -1992,8 +1990,7 @@ TEST_CASE("both stock recipes repair malformed admitted archives through their p
  SECTION("Coco custom") {}
  SECTION("Coconut Stock") { enhanced = true; }
  const auto val = local.cache.source_indexes("coco") / "val2017.normalized.bin";
- remove_cache_path(val);
- remove_cache_path(val.string() + ".complete.json");
+ remove_normalized_annotation_index(val);
  const auto raw = local.cache.source_downloads("coco") / custom.coco_annotations.filename;
  const auto served = file_bytes(raw);
  mmltk::backend::data::testsupport::HttpServer server(served);
@@ -2016,10 +2013,8 @@ TEST_CASE("one stock request builds both splits and retains newly settled train 
  auto custom = local_custom_catalog(local);
  const auto train = local.cache.source_indexes("coco") / "train2017.normalized.bin";
  const auto val = local.cache.source_indexes("coco") / "val2017.normalized.bin";
- remove_cache_path(train);
- remove_cache_path(train.string() + ".complete.json");
- remove_cache_path(val);
- remove_cache_path(val.string() + ".complete.json");
+ remove_normalized_annotation_index(train);
+ remove_normalized_annotation_index(val);
  const auto raw = local.cache.source_downloads("coco") / custom.coco_annotations.filename;
  const auto training_json = file_bytes(local.cache.source_indexes("coco") / "train2017.fixture.json");
  const auto validation_json = file_bytes(local.cache.source_indexes("coco") / "val2017.fixture.json");
@@ -2523,12 +2518,8 @@ TEST_CASE("optional COCO split admission is independent and never conceals outpu
  const auto missing = missing_train ? train : validation;
  const auto retained = missing_train ? validation : train;
  const auto retained_bytes = file_bytes(retained);
- if (cold) {
-  remove_cache_path(retained);
-  remove_cache_path(retained.string() + ".complete.json");
- }
- remove_cache_path(missing);
- remove_cache_path(missing.string() + ".complete.json");
+ if (cold) { remove_normalized_annotation_index(retained); }
+ remove_normalized_annotation_index(missing);
  auto artifact = catalog.coco_annotations;
  const auto archive_path = local.cache.source_downloads("coco") / artifact.filename;
  if (!publication_failure && !local_parser_failure && !local_archive_failure) {
@@ -2685,8 +2676,7 @@ TEST_CASE("COCONut recovery caches preserve base and physical products across ev
  for (const bool missing_train : {true, false}) {
   const auto split = missing_train ? "train2017" : "val2017";
   const auto path = local.cache.source_indexes("coco") / (std::string(split) + ".normalized.bin");
-  remove_cache_path(path);
-  remove_cache_path(path.string() + ".complete.json");
+  remove_normalized_annotation_index(path);
   config.selection.validation = missing_train ? CoconutValidation::Stock : CoconutValidation::CoconutStock;
   const auto selected = local.selected(config.selection.validation);
   compile_benchmark_recipe(config, &selected);

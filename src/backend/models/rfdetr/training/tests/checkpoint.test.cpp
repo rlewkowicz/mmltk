@@ -368,6 +368,7 @@ void test_training_supervision_checkpoint_blob_admission() {
   'n',
   't',
   0U,
+  // CLEANUP-IGNORE: The repeated CBOR key is the malformed input this fixture must reject.
   0x6aU,
   'a',
   's',

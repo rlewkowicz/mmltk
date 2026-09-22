@@ -122,8 +122,7 @@ CustomRecipePreparation prepare_custom_recipe(const BenchmarkCompilerConfig& con
     const std::filesystem::path json_path = cache.source_indexes("objects365") / "source-json" / "zhiyuan_objv2_train.json";
     remove_cache_path(json_path.string() + ".extract.json");
     remove_cache_path(json_path);
-    remove_cache_path(objects_index_path.string() + ".complete.json");
-    remove_cache_path(objects_index_path);
+    remove_normalized_annotation_index(objects_index_path);
     repair_annotations(BenchmarkDatasetSource::kObjects365V2, {*objects_annotation_request}, error.what());
    });
  }
@@ -143,8 +142,7 @@ CustomRecipePreparation prepare_custom_recipe(const BenchmarkCompilerConfig& con
     progress.phase(DatasetCompilePhase::Indexing, completed_indexes, kIndexCount);
    },
    [&](const std::exception& error) {
-    remove_cache_path(open_images_index_path.string() + ".complete.json");
-    remove_cache_path(open_images_index_path);
+    remove_normalized_annotation_index(open_images_index_path);
     repair_annotations(BenchmarkDatasetSource::kOpenImagesV7, {*open_images_boxes_request, *open_images_classes_request}, error.what());
    });
  }

@@ -62,9 +62,8 @@ using ArchiveReader = std::unique_ptr<archive, ArchiveDestroy>;
      return identity;
     }
    }
-  } catch (const std::bad_alloc&) { throw; } catch (const std::length_error&) {
-   throw;
-  } catch (const std::overflow_error&) { throw; } catch (const std::exception& error) {
+  } catch (const std::exception& error) {
+   if (is_benchmark_capacity_failure(error)) throw;
    trace_benchmark_event(trace, "benchmark.archive.extract_cache_invalid", [&] { return nlohmann::json{{"member", member_suffix}, {"path", output_path.string()}, {"reason", error.what()}}; });
   }
  }
@@ -148,9 +147,8 @@ using ArchiveReader = std::unique_ptr<archive, ArchiveDestroy>;
   const nlohmann::json manifest = read_json_file(path.string() + ".complete.json");
   const std::string digest = manifest.at("annotation_sha256").get<std::string>();
   return load_normalized_annotation_index(path, source, split, digest, cancel_requested, trace);
- } catch (const std::bad_alloc&) { throw; } catch (const std::length_error&) {
-  throw;
- } catch (const std::overflow_error&) { throw; } catch (const std::exception&) {
+ } catch (const std::exception& error) {
+  if (is_benchmark_capacity_failure(error)) throw;
   throw_if_benchmark_cancelled(cancel_requested);
   return std::nullopt;
  }
@@ -252,8 +250,7 @@ void CocoAnnotationCache::invalidate_missing() {
   const auto& path = training ? indexes_.train_path : indexes_.validation_path;
   remove_cache_path(json.string() + ".extract.json");
   remove_cache_path(json);
-  remove_cache_path(path.string() + ".complete.json");
-  remove_cache_path(path);
+  remove_normalized_annotation_index(path);
  }
 }
 void CocoAnnotationCache::settle(DownloadResult archive, ProgressReporter& progress, std::size_t workers, std::uint64_t& completed, std::uint64_t total) {

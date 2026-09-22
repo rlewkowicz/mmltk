@@ -15,6 +15,7 @@ mmltk_register_public_headers(mmltk_test_support
     error_expectation_test_utils.hpp
     subprocess_test_utils.hpp
     profile_runner_common.h
+    utf8_test_data.h
     cli_option_table.h)
 target_link_libraries(mmltk_test_support PUBLIC
     Catch2::Catch2 CUDA::cudart mmltk::common::io mmltk::common::logging stb)

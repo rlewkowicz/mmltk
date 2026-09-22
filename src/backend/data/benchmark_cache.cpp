@@ -8,6 +8,8 @@
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <new>
+#include <stdexcept>
 #include <string_view>
 #include <thread>
 #include "src/common/io/file_memory.h"
@@ -79,6 +81,9 @@ void ArtifactLease::release() noexcept {
 }
 void throw_if_benchmark_cancelled(mmltk::common::concurrency::CancellationObservation cancel_requested) {
  if (cancel_requested.requested()) { throw std::runtime_error("benchmark dataset compilation cancelled"); }
+}
+bool is_benchmark_capacity_failure(const std::exception& error) noexcept {
+ return dynamic_cast<const std::bad_alloc*>(&error) != nullptr || dynamic_cast<const std::length_error*>(&error) != nullptr || dynamic_cast<const std::overflow_error*>(&error) != nullptr;
 }
 void write_json_atomically(const std::filesystem::path& path, const nlohmann::json& value, const mmltk::common::concurrency::CancellationObservation cancellation) {
  (void)mmltk::common::io::ensure_parent_directory(path);

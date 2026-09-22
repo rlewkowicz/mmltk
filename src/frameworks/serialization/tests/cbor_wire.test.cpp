@@ -18,6 +18,7 @@
 #include "src/frameworks/serialization/serialization.h"
 #include "src/frameworks/serialization/reflected_json.h"
 #include "src/frameworks/serialization/tests/reflected_cbor_test_types.h"
+#include "src/test_support/utf8_test_data.h"
 namespace mmltk::frameworks::serialization::test {
 // CLEANUP-IGNORE: This isolated serialization fixture mirrors an opaque private shape without depending on RF-DETR.
 struct OpaqueFixtureProvider;
@@ -946,27 +947,7 @@ TEST_CASE("UTF8 scalar limits preserve literal text across every segment split",
  }
 }
 TEST_CASE("malformed UTF8 categories consume complete segmented payloads before failure", "[frameworks][serialization]") {
- for (const std::string_view malformed : {
-       "\x80",
-       "\xbf",  // stray continuations
-       "\xc0\x80",
-       "\xc1\xbf",  // overlong two-byte forms
-       "\xe0\x80\x80",
-       "\xe0\x9f\xbf",  // overlong three-byte forms
-       "\xf0\x80\x80\x80",
-       "\xf0\x8f\xbf\xbf",  // overlong four-byte forms
-       "\xed\xa0\x80",
-       "\xed\xbf\xbf",  // surrogate limits
-       "\xf4\x90\x80\x80",
-       "\xf5\x80\x80\x80",
-       "\xff",  // out of range
-       "\xc2x",
-       "\xe1\x80x",
-       "\xf1\x80\x80x",  // invalid continuations
-       "\xc2",
-       "\xe0\xa0",
-       "\xf0\x90\x80",  // truncated scalars
-      }) {
+ for (const std::string_view malformed : mmltk::testsupport::kMalformedUtf8) {
   wire::ByteBuffer encoded{std::byte(0x60U + malformed.size())};
   for (const unsigned char byte : malformed) encoded.push_back(std::byte{byte});
   const wire::ByteBuffer retained{std::byte{0xaa}, std::byte{0xbb}};

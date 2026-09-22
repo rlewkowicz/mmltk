@@ -3,6 +3,7 @@
 #include <atomic>
 #include <concepts>
 #include <cstdint>
+#include <exception>
 #include <filesystem>
 #include <functional>
 #include <string>
@@ -42,6 +43,8 @@ private:
  mmltk::common::io::ScopedFd descriptor_;
 };
 void throw_if_benchmark_cancelled(mmltk::common::concurrency::CancellationObservation cancellation);
+// Allocation and capacity failures cannot become cache misses or transfer retries.
+[[nodiscard]] bool is_benchmark_capacity_failure(const std::exception& error) noexcept;
 void write_json_atomically(const std::filesystem::path& path, const nlohmann::json& value, mmltk::common::concurrency::CancellationObservation cancellation);
 [[nodiscard]] nlohmann::json read_json_file(const std::filesystem::path& path);
 [[nodiscard]] bool is_safe_cache_component(std::string_view value) noexcept;

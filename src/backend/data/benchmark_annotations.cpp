@@ -1388,13 +1388,17 @@ std::optional<NormalizedAnnotationIndex> load_normalized_annotation_index(const 
     {"source", benchmark_source_name(index.source)}, {"split", index.split}, {"images", index.images.size()}, {"boxes", index.boxes.size()}, {"mask_rle_pairs", index.mask_rle_pairs.size()}};
   });
   return index;
- } catch (const std::bad_alloc&) { throw; } catch (const std::length_error&) {
-  throw;
- } catch (const std::overflow_error&) { throw; } catch (const std::exception& error) {
+ } catch (const std::exception& error) {
+  if (is_benchmark_capacity_failure(error)) throw;
   if (cancel_requested.requested()) { throw; }
   trace_benchmark_event(trace, "benchmark.annotations.cache_invalid", [&] { return nlohmann::json{{"path", path.string()}, {"error", error.what()}}; });
   return std::nullopt;
  }
+}
+void remove_normalized_annotation_index(const std::filesystem::path& path) {
+ // Retire admission before removing the bytes it authorizes.
+ remove_cache_path(normalized_manifest_path(path));
+ remove_cache_path(path);
 }
 void store_normalized_annotation_index(
  const std::filesystem::path& path, const NormalizedAnnotationIndex& index, mmltk::common::concurrency::CancellationObservation cancel_requested, const BenchmarkTraceSink& trace) {
