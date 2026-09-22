@@ -33,24 +33,37 @@ __device__ __forceinline__ float cxcywh_generalized_iou(const float* lhs, const 
  const float result = enclosing_area > 0.0f ? iou - (enclosing_area - union_area) / enclosing_area : iou;
  return isfinite(result) ? result : 0.0f;
 }
-template <typename Logit, typename Box>
-__global__ void matcher_cost_kernel(float* output, const Logit* pred_logits, const Box* pred_boxes, const int64_t* target_labels, const float* target_boxes, const int64_t* target_offsets,
- const int64_t* target_counts, const int64_t* output_offsets, int64_t output_targets, int64_t batch_size, int64_t query_count, int64_t class_count, int64_t max_targets, int64_t total_targets, float class_cost, float bbox_cost,
- float giou_cost, float focal_alpha) {
- const int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+namespace {
+struct MatcherPair final {
+ int64_t batch_index, query_index, target_index, output_index;
+};
+__device__ __forceinline__ bool matcher_pair(int64_t index, const int64_t* target_offsets, const int64_t* target_counts, const int64_t* output_offsets,
+ int64_t output_targets, int64_t batch_size, int64_t query_count, int64_t max_targets, int64_t total_targets, MatcherPair& pair) {
  const int64_t total = batch_size * query_count * max_targets;
- if (index >= total) { return; }
+ if (index >= total) { return false; }
  const int64_t target_slot = index % max_targets;
  const int64_t query_index = (index / max_targets) % query_count;
  const int64_t batch_index = index / (query_count * max_targets);
  const int64_t output_begin = output_offsets[batch_index];
  const int64_t output_end = batch_index + 1 < batch_size ? output_offsets[batch_index + 1] : output_targets;
- if (output_begin < 0 || output_end < output_begin || output_end > output_targets || target_slot >= output_end - output_begin) { return; }
+ if (output_begin < 0 || output_end < output_begin || output_end > output_targets || target_slot >= output_end - output_begin) { return false; }
  const int64_t output_count = output_end - output_begin;
- if (target_slot >= target_counts[batch_index]) { return; }
+ if (target_slot >= target_counts[batch_index]) { return false; }
  const int64_t target_offset = target_offsets[batch_index];
- if (target_offset < 0 || target_slot >= total_targets || target_offset > total_targets - target_slot - 1) { return; }
+ if (target_offset < 0 || target_slot >= total_targets || target_offset > total_targets - target_slot - 1) { return false; }
  const int64_t target_index = target_offset + target_slot;
+ pair = {batch_index, query_index, target_index, query_count * output_begin + query_index * output_count + target_slot};
+ return true;
+}
+}  // namespace
+template <typename Logit, typename Box>
+__global__ void matcher_cost_kernel(float* output, const Logit* pred_logits, const Box* pred_boxes, const int64_t* target_labels, const float* target_boxes, const int64_t* target_offsets,
+ const int64_t* target_counts, const int64_t* output_offsets, int64_t output_targets, int64_t batch_size, int64_t query_count, int64_t class_count, int64_t max_targets, int64_t total_targets, float class_cost, float bbox_cost,
+ float giou_cost, float focal_alpha) {
+ const int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+ MatcherPair pair;
+ if (!matcher_pair(index, target_offsets, target_counts, output_offsets, output_targets, batch_size, query_count, max_targets, total_targets, pair)) { return; }
+ const auto [batch_index, query_index, target_index, output_index] = pair;
  const int64_t class_index = target_labels[target_index];
  if (class_index < 0 || class_index >= class_count) { return; }
  const float logit = static_cast<float>(pred_logits[(batch_index * query_count + query_index) * class_count + class_index]);
@@ -64,7 +77,7 @@ __global__ void matcher_cost_kernel(float* output, const Logit* pred_logits, con
  const float l1 = fabsf(prediction_float[0] - target[0]) + fabsf(prediction_float[1] - target[1]) + fabsf(prediction_float[2] - target[2]) + fabsf(prediction_float[3] - target[3]);
  const float giou = cxcywh_generalized_iou(prediction_float, target);
  const float cost = class_cost * (positive_class_cost - negative_class_cost) + bbox_cost * l1 - giou_cost * giou;
- output[query_count * output_begin + query_index * output_count + target_slot] = isfinite(cost) ? cost : 0.0f;
+ output[output_index] = isfinite(cost) ? cost : 0.0f;
 }
 template <typename Logit>
 __global__ void matcher_mask_cost_kernel(float* output, const Logit* pred_logits, const float* target_masks, const int64_t* target_offsets, const int64_t* target_counts, const int64_t* output_offsets, int64_t output_targets, int64_t batch_size,
@@ -72,19 +85,9 @@ __global__ void matcher_mask_cost_kernel(float* output, const Logit* pred_logits
  constexpr int kWarpSize = 32;
  const int lane = static_cast<int>(threadIdx.x) & (kWarpSize - 1);
  const int64_t warp_index = (static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x) / static_cast<int64_t>(kWarpSize);
- const int64_t pair_count = batch_size * query_count * max_targets;
- if (warp_index >= pair_count) { return; }
- const int64_t target_slot = warp_index % max_targets;
- const int64_t query_index = (warp_index / max_targets) % query_count;
- const int64_t batch_index = warp_index / (query_count * max_targets);
- const int64_t output_begin = output_offsets[batch_index];
- const int64_t output_end = batch_index + 1 < batch_size ? output_offsets[batch_index + 1] : output_targets;
- if (output_begin < 0 || output_end < output_begin || output_end > output_targets || target_slot >= output_end - output_begin) { return; }
- const int64_t output_count = output_end - output_begin;
- if (target_slot >= target_counts[batch_index]) { return; }
- const int64_t target_offset = target_offsets[batch_index];
- if (target_offset < 0 || target_slot >= total_targets || target_offset > total_targets - target_slot - 1) { return; }
- const int64_t target_index = target_offset + target_slot;
+ MatcherPair pair;
+ if (!matcher_pair(warp_index, target_offsets, target_counts, output_offsets, output_targets, batch_size, query_count, max_targets, total_targets, pair)) { return; }
+ const auto [batch_index, query_index, target_index, output_index] = pair;
  const Logit* prediction = pred_logits + (batch_index * query_count + query_index) * point_count;
  const float* target = target_masks + target_index * point_count;
  float ce_sum = 0.0f;
@@ -109,7 +112,6 @@ __global__ void matcher_mask_cost_kernel(float* output, const Logit* pred_logits
  if (lane == 0) {
   const float ce = ce_sum / static_cast<float>(point_count);
   const float dice = 1.0f - (2.0f * intersection + 1.0f) / (probability_sum + target_sum + 1.0f);
-  const int64_t output_index = query_count * output_begin + query_index * output_count + target_slot;
   const float current = isfinite(output[output_index]) ? output[output_index] : 0.0f;
   const float updated = current + ce_cost * ce + dice_cost * dice;
   output[output_index] = isfinite(updated) ? updated : current;
@@ -135,6 +137,15 @@ int64_t checked_extent(const std::initializer_list<int64_t> factors, const int64
  }
  return product;
 }
+namespace {
+int64_t checked_output_targets(const torch::Tensor& output, const torch::Tensor& output_offsets, int64_t batch, int64_t queries, int64_t padded_queries, int64_t max_targets, const char* context) {
+ (void)checked_extent({batch, padded_queries, max_targets}, std::numeric_limits<int64_t>::max() / sizeof(float), context);
+ TORCH_CHECK(output_offsets.numel() == batch && (queries ? output.numel() % queries == 0 : output.numel() == 0), "matcher compact output layout does not cover predictions");
+ const int64_t output_targets = queries ? output.numel() / queries : 0;
+ TORCH_CHECK(output_targets <= checked_extent({batch, max_targets}, std::numeric_limits<int64_t>::max(), "matcher target extent"), "matcher compact target extent exceeds padded layout");
+ return output_targets;
+}
+}  // namespace
 float checked_cost_coefficient(const double value, const char* name) {
  TORCH_CHECK(std::isfinite(value) && std::abs(value) <= static_cast<double>(std::numeric_limits<float>::max()), name, " must be finite and representable as float32");
  return static_cast<float>(value);
@@ -166,10 +177,7 @@ void pairwise_detection_cost_cuda_out(const torch::Tensor& output, const torch::
   checked_extent({batch, queries, 4}, std::numeric_limits<int64_t>::max(), "matcher prediction-box pointer extent") == pred_boxes.numel(), "matcher prediction-box storage does not match its shape");
  TORCH_CHECK(
   checked_extent({total_targets, 4}, std::numeric_limits<int64_t>::max(), "matcher target-box pointer extent") == target_boxes.numel(), "matcher target-box storage does not match its shape");
- (void)checked_extent({batch, padded_queries, max_targets}, std::numeric_limits<int64_t>::max() / sizeof(float), "matcher output pointer extent");
- TORCH_CHECK(output_offsets.numel() == batch && (queries ? output.numel() % queries == 0 : output.numel() == 0), "matcher compact output layout does not cover predictions");
- const int64_t output_targets = queries ? output.numel() / queries : 0;
- TORCH_CHECK(output_targets <= checked_extent({batch, max_targets}, std::numeric_limits<int64_t>::max(), "matcher target extent"), "matcher compact target extent exceeds padded layout");
+ const int64_t output_targets = checked_output_targets(output, output_offsets, batch, queries, padded_queries, max_targets, "matcher output pointer extent");
  const float checked_alpha = checked_cost_coefficient(focal_alpha, "matcher focal alpha");
  const float checked_class_cost = checked_cost_coefficient(class_cost, "matcher class cost");
  const float checked_bbox_cost = checked_cost_coefficient(bbox_cost, "matcher box cost");
@@ -213,10 +221,7 @@ void pairwise_mask_cost_cuda_add_(const torch::Tensor& output, const torch::Tens
   "matcher mask-logit storage does not match its shape");
  TORCH_CHECK(
   checked_extent({total_targets, points}, std::numeric_limits<int64_t>::max(), "matcher target-mask pointer extent") == target_masks.numel(), "matcher target-mask storage does not match its shape");
- (void)checked_extent({batch, padded_queries, max_targets}, std::numeric_limits<int64_t>::max() / sizeof(float), "matcher mask output pointer extent");
- TORCH_CHECK(output_offsets.numel() == batch && (queries ? output.numel() % queries == 0 : output.numel() == 0), "matcher compact output layout does not cover predictions");
- const int64_t output_targets = queries ? output.numel() / queries : 0;
- TORCH_CHECK(output_targets <= checked_extent({batch, max_targets}, std::numeric_limits<int64_t>::max(), "matcher target extent"), "matcher compact target extent exceeds padded layout");
+ const int64_t output_targets = checked_output_targets(output, output_offsets, batch, queries, padded_queries, max_targets, "matcher mask output pointer extent");
  const float checked_ce_cost = checked_cost_coefficient(ce_cost, "matcher mask cross-entropy cost");
  const float checked_dice_cost = checked_cost_coefficient(dice_cost, "matcher mask dice cost");
  c10::cuda::CUDAGuard device_guard(output.device());

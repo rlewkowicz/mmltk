@@ -129,9 +129,26 @@ TEST_CASE("Matcher costs copy only compact active shapes after high-water growth
   REQUIRE(counters.cost_submissions == 2);
   REQUIRE(counters.cost_dependencies == 2);
   REQUIRE(counters.cost_bytes == (80 + 2) * sizeof(float));
-  REQUIRE_THROWS(workspace.prepare_cost({1}, {-1}, at::Device(at::kCUDA, device_index)));
-  REQUIRE_THROWS(workspace.prepare_cost({std::numeric_limits<int64_t>::max()}, {2}, at::Device(at::kCUDA, device_index)));
-  REQUIRE_THROWS(workspace.prepare_cost({2}, {1}, at::Device(at::kCPU)));
+  const auto require_completed = [&] {
+   const auto matrix = workspace.cpu_matrix(0, 0);
+   REQUIRE(matrix.sizes() == at::IntArrayRef({2, 1}));
+   REQUIRE(matrix.eq(11).all().item<bool>());
+  };
+  constexpr auto limit = std::numeric_limits<int64_t>::max() / sizeof(float);
+  const auto reject_layout = [&](at::IntArrayRef queries, at::IntArrayRef counts, const at::Device& device) {
+   REQUIRE_THROWS(workspace.prepare_cost(queries, counts, device));
+   require_completed();
+  };
+  const at::Device gpu(at::kCUDA, device_index);
+  reject_layout({1}, {-1}, gpu);
+  reject_layout({-1}, {1}, gpu);
+  reject_layout({1}, {limit, 1}, gpu);
+  reject_layout({std::numeric_limits<int64_t>::max()}, {2}, gpu);
+  reject_layout({limit, 1}, {1}, gpu);
+  // Compact storage fits, but the former padded shape must still be rejected.
+  reject_layout({limit / 2, 0}, {1, 1}, gpu);
+  reject_layout({2}, {1}, at::Device(at::kCPU));
+  reject_layout({2}, {1}, at::Device(at::kCUDA));
   REQUIRE_THROWS(workspace.cpu_matrix(2, 0));
   // An exception after queued writes leaves the workspace responsible for settlement.
   try {
@@ -148,7 +165,46 @@ TEST_CASE("Matcher costs copy only compact active shapes after high-water growth
   } catch (const std::runtime_error& error) { REQUIRE(std::string_view(error.what()) == "abandon pending matcher generation"); }
   if (devices > 1) {
    const auto other_device = static_cast<c10::DeviceIndex>((device + 1) % devices);
-   REQUIRE_THROWS(workspace.prepare_cost({2}, {1}, at::Device(at::kCUDA, other_device)));
+   reject_layout({2}, {1}, at::Device(at::kCUDA, other_device));
+  }
+  struct Layout final { std::vector<int64_t> queries, counts; };
+  const std::vector<Layout> layouts{
+   {{2}, {1}},                         // Equal-size reuse.
+   {{8, 3, 5}, {0, 4, 1}},             // Regrow within the initial high water.
+   {{5, 8, 3}, {2, 0, 3}},             // Same sizes, changed layer and image intervals.
+   {{1, 0}, {0, 1}},                   // Shrink both metadata vectors, including an empty layer.
+   {{3, 2, 1}, {1, 0, 2}},             // Regrow metadata and storage within capacity.
+   {{9, 7, 5, 3}, {0, 3, 0, 4, 2}},   // Genuine metadata and cost-storage growth.
+   {{2}, {0, 0}},                     // Empty image intervals after growth.
+  };
+  std::uint64_t expected_bytes = counters.cost_bytes;
+  for (std::size_t iteration = 0; iteration < layouts.size(); ++iteration) {
+   const auto& layout = layouts[iteration];
+   workspace.prepare_cost(layout.queries, layout.counts, gpu);
+   if (iteration < 5) REQUIRE(workspace.device_layer(0).data_ptr() == backing);
+   int64_t targets = 0;
+   for (const auto count : layout.counts) targets += count;
+   int64_t elements = 0;
+   for (std::size_t layer = 0; layer < layout.queries.size(); ++layer) {
+    auto output = workspace.device_layer(layer);
+    output.copy_(at::arange(output.numel(), output.options()) + static_cast<int64_t>(layer) * 1000);
+    elements += layout.queries[layer] * targets;
+   }
+   REQUIRE(workspace.read_cost().numel() == elements);
+   for (std::size_t layer = 0; layer < layout.queries.size(); ++layer) {
+    int64_t begin = static_cast<int64_t>(layer) * 1000;
+    for (std::size_t image = 0; image < layout.counts.size(); ++image) {
+     const auto matrix = workspace.cpu_matrix(layer, image);
+     REQUIRE(matrix.sizes() == at::IntArrayRef({layout.queries[layer], layout.counts[image]}));
+     REQUIRE(at::equal(matrix.flatten(), at::arange(begin, begin + matrix.numel(), matrix.options())));
+     begin += matrix.numel();
+    }
+   }
+   expected_bytes += elements * sizeof(float);
+   const auto reused = workspace.statistics();
+   REQUIRE(reused.cost_submissions == counters.cost_submissions + iteration + 1);
+   REQUIRE(reused.cost_dependencies == reused.cost_submissions);
+   REQUIRE(reused.cost_bytes == expected_bytes);
   }
  }
 }

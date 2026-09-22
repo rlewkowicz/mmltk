@@ -214,17 +214,16 @@ void MatcherWorkspace::prepare_cost(at::IntArrayRef queries, at::IntArrayRef cou
   if (lhs < 0 || rhs < 0 || (rhs && lhs > limit / rhs)) throw std::invalid_argument("matcher cost shape overflows");
   return lhs * rhs;
  };
- std::vector<std::int64_t> prefixes{0}, layers{0};
- std::int64_t max_targets = 0, max_queries = 0;
+ std::int64_t targets = 0, elements = 0, max_targets = 0, max_queries = 0;
  for (auto count : counts) {
-  if (count < 0 || count > limit - prefixes.back()) throw std::invalid_argument("matcher target prefix overflows");
-  prefixes.push_back(prefixes.back() + count);
+  if (count < 0 || count > limit - targets) throw std::invalid_argument("matcher target prefix overflows");
+  targets += count;
   max_targets = std::max(max_targets, count);
  }
  for (auto count : queries) {
-  const auto extent = product(count, prefixes.back());
-  if (extent > limit - layers.back()) throw std::invalid_argument("matcher layer prefix overflows");
-  layers.push_back(layers.back() + extent);
+  const auto extent = product(count, targets);
+  if (extent > limit - elements) throw std::invalid_argument("matcher layer prefix overflows");
+  elements += extent;
   max_queries = std::max(max_queries, count);
  }
  // Retain the former padded allocation admission even though storage is compact.
@@ -236,7 +235,10 @@ void MatcherWorkspace::prepare_cost(at::IntArrayRef queries, at::IntArrayRef cou
   check(cuCtxSynchronize(), "settle unfinished matcher cost generation before reuse");
   cost.pending = false;
  }
- const auto elements = layers.back();
+ // Reserve before replacing any active metadata; settled reuse keeps capacity.
+ cost.queries.reserve(queries.size());
+ cost.target_prefixes.reserve(counts.size() + 1);
+ cost.layer_prefixes.reserve(queries.size() + 1);
  if (!cost.device_backing.defined() || cost.device_backing.numel() < elements) {
   cost.device_backing = at::empty({elements}, at::TensorOptions().dtype(at::kFloat).device(device));
   mmltk::common::logging::profile_add_value("rfdetr.matcher.cost_storage_growth", 1);
@@ -246,8 +248,12 @@ void MatcherWorkspace::prepare_cost(at::IntArrayRef queries, at::IntArrayRef cou
  cost.cpu_cost = cost.host->view({elements}, at::kFloat);
  cost.output_prefixes = at::Tensor{};
  cost.queries.assign(queries.begin(), queries.end());
- cost.target_prefixes = std::move(prefixes);
- cost.layer_prefixes = std::move(layers);
+ cost.target_prefixes.clear();
+ cost.target_prefixes.push_back(0);
+ for (auto count : counts) cost.target_prefixes.push_back(cost.target_prefixes.back() + count);
+ cost.layer_prefixes.clear();
+ cost.layer_prefixes.push_back(0);
+ for (auto count : queries) cost.layer_prefixes.push_back(cost.layer_prefixes.back() + count * targets);
  cost.pending = true;
 }
 at::Tensor MatcherWorkspace::device_layer(std::int64_t index) const {
