@@ -68,17 +68,24 @@ fn validation_draw_changes_wake_the_scenario_once_with_current_receipt_custody()
         "validate.detail.image",
     ] {
         let bounds = fixture.bounds;
-        record_probe_draw(control, fixture.surface, bounds, bounds, bounds);
+        record_probe_draw(control, fixture.surface, bounds, bounds, bounds, 1.0);
         let first = fixture.receiver.try_recv().unwrap();
         assert!(fixture.controller.accepts_message(&first));
-        record_probe_draw(control, fixture.surface, bounds, bounds, bounds);
+        record_probe_draw(control, fixture.surface, bounds, bounds, bounds, 1.0);
         assert!(fixture.receiver.try_recv().is_err());
         let moved = Rectangle { x: 1.0, ..bounds };
-        record_probe_draw(control, fixture.surface, bounds, moved, bounds);
+        record_probe_draw(control, fixture.surface, bounds, moved, bounds, 1.0);
         assert!(!fixture.controller.accepts_message(&first));
         let replacement = fixture.receiver.try_recv().unwrap();
         assert!(fixture.controller.accepts_message(&replacement));
-        record_probe_draw(control, fixture.surface, bounds, moved, bounds);
+        record_probe_draw(control, fixture.surface, bounds, moved, bounds, 1.0);
+        assert!(fixture.receiver.try_recv().is_err());
+        record_probe_draw(control, fixture.surface, bounds, moved, bounds, 2.0);
+        assert!(!fixture.controller.accepts_message(&replacement));
+        let rescaled = fixture.receiver.try_recv().unwrap();
+        assert!(fixture.controller.accepts_message(&rescaled));
+        assert_eq!(current_receipt(control).unwrap().scale, 2.0);
+        record_probe_draw(control, fixture.surface, bounds, moved, bounds, 2.0);
         assert!(fixture.receiver.try_recv().is_err());
     }
 }
@@ -280,7 +287,7 @@ fn quiet_driver_and_disabled_frontend_collect_no_probe_state() {
             .map(|image| (snapshot.dataset.identity, u64::from(image)))
     });
     let bounds = Rectangle::new(iced::Point::ORIGIN, iced::Size::new(640.0, 480.0));
-    record_probe_draw(EXPLORE_GALLERY, surface, bounds, bounds, bounds);
+    record_probe_draw(EXPLORE_GALLERY, surface, bounds, bounds, bounds, 1.0);
     SURFACE_DRAW_OBSERVER.with(|observer| {
         let observer = observer.borrow();
         assert!(observer.receipts.is_empty());
@@ -405,7 +412,7 @@ fn scenario_reset_isolates_queued_messages_geometry_and_obsolete_subscription_te
     let (_, frame) = crate::view_model::test_support::explore_presentation();
     let surface = crate::view_model::test_support::physical_surface(frame);
     let bounds = Rectangle::new(iced::Point::ORIGIN, iced::Size::new(640.0, 480.0));
-    record_probe_draw(EXPLORE_GALLERY, surface, bounds, bounds, bounds);
+    record_probe_draw(EXPLORE_GALLERY, surface, bounds, bounds, bounds, 1.0);
     let old_receipt = current_receipt(EXPLORE_GALLERY).unwrap();
     old_output
         .try_send(Message::Located {
@@ -419,6 +426,7 @@ fn scenario_reset_isolates_queued_messages_geometry_and_obsolete_subscription_te
         bounds,
         bounds,
         bounds,
+        1.0,
     );
     let viewer = ViewerDraw {
         crop: surface.content_region(),
@@ -486,11 +494,11 @@ fn scenario_reset_isolates_queued_messages_geometry_and_obsolete_subscription_te
             receiver.try_recv().is_err(),
             "no physical receipt cannot enqueue a draw"
         );
-        record_probe_draw(control, surface, bounds, bounds, bounds);
+        record_probe_draw(control, surface, bounds, bounds, bounds, 1.0);
         report_surface_draw(control, 5, 1, false, 640, 480, 1, viewer);
         let queued = receiver.try_recv().unwrap();
         let moved = Rectangle { x: 17.0, ..bounds };
-        record_probe_draw(control, surface, bounds, moved, bounds);
+        record_probe_draw(control, surface, bounds, moved, bounds, 1.0);
         assert!(!controller.probes.accepts_message(
             &controller.driver,
             &controller.pixel_checks,
@@ -576,7 +584,7 @@ fn annotation_and_upscale_consumers_retire_invalidations_without_pixel_evidence(
         } else {
             "workflow.visual.workspace"
         };
-        record_probe_draw(control, surface, bounds, bounds, bounds);
+        record_probe_draw(control, surface, bounds, bounds, bounds, 1.0);
         let arm = |controller: &mut Controller, image| match consumer {
             0 | 1 => {
                 controller.driver.phase = if consumer == 0 {
@@ -662,7 +670,7 @@ fn annotation_and_upscale_consumers_retire_invalidations_without_pixel_evidence(
         assert_eq!(controller.driver.phase, phase);
 
         let moved = Rectangle { x: 17.0, ..bounds };
-        record_probe_draw(control, surface, bounds, moved, bounds);
+        record_probe_draw(control, surface, bounds, moved, bounds, 1.0);
         let mut replacement = arm(controller, moved);
         for outcome in [
             ProbeOutcome::Invalidated,
@@ -744,7 +752,7 @@ fn probe_preparation_keeps_original_frame_through_widget_location() {
     let frame = surface.frame.unwrap();
     let controller = &mut fixture.controller;
     for swatch in [false, true] {
-        record_probe_draw("workflow.visual.workspace", surface, bounds, bounds, bounds);
+        record_probe_draw("workflow.visual.workspace", surface, bounds, bounds, bounds, 1.0);
         controller.driver.phase = if swatch {
             Phase::CopyCapability
         } else {
@@ -799,7 +807,7 @@ fn probe_preparation_keeps_original_frame_through_widget_location() {
         }
         controller.widgets.begin_location();
         let moved = Rectangle { x: 17.0, ..bounds };
-        record_probe_draw("workflow.visual.workspace", surface, bounds, moved, bounds);
+        record_probe_draw("workflow.visual.workspace", surface, bounds, moved, bounds, 1.0);
         assert!(
             !controller.probes.prepare_annotation_probe(
                 &controller.widgets,

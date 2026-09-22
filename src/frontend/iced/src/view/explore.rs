@@ -305,7 +305,8 @@ pub fn filter_edit(
 ) -> Result<crate::generated::ExploreFilterUpdate, String> {
     let mut request = state
         .presented_filter(model.snapshot.as_ref())
-        .ok_or_else(|| "Explore filter settings are not installed".to_owned())?;
+        .ok_or_else(|| "Explore filter settings are not installed".to_owned())?
+        .to_owned();
     apply(&mut request);
     Ok(request)
 }

@@ -176,7 +176,7 @@ pub(super) fn view<'a>(
         });
     let classes = class_checklist(
         snapshot,
-        filter.as_ref().map(|filter| &filter.filter.classselection),
+        filter.map(|filter| &filter.filter.classselection),
         mutation_available,
         Message::ClassToggled,
     );
@@ -390,15 +390,20 @@ pub(super) fn class_selection(
     }
 }
 
-pub(crate) fn selection_contains(
+pub(crate) fn class_membership(
     selection: &crate::generated::ExploreClassSelection,
-    index: u32,
-) -> bool {
-    match selection.mode {
-        crate::generated::ExploreClassSelectionMode::All => true,
-        crate::generated::ExploreClassSelectionMode::None => false,
-        crate::generated::ExploreClassSelectionMode::Subset => selection.classes.contains(&index),
+    catalog_count: usize,
+) -> Vec<bool> {
+    use crate::generated::ExploreClassSelectionMode;
+    let mut membership = vec![selection.mode == ExploreClassSelectionMode::All; catalog_count];
+    if selection.mode == ExploreClassSelectionMode::Subset {
+        for &category in &selection.classes {
+            if let Some(selected) = membership.get_mut(category as usize) {
+                *selected = true;
+            }
+        }
     }
+    membership
 }
 
 pub(super) fn class_checklist<'a, Message: Clone + 'a>(
@@ -410,6 +415,7 @@ pub(super) fn class_checklist<'a, Message: Clone + 'a>(
     let (Some(snapshot), Some(selection)) = (snapshot, selection) else {
         return column![text("Class names appear after opening a dataset.")].into();
     };
+    let membership = class_membership(selection, snapshot.dataset.classnames.len());
     snapshot
         .dataset
         .classnames
@@ -418,7 +424,7 @@ pub(super) fn class_checklist<'a, Message: Clone + 'a>(
         .fold(column![].spacing(3), |column, (index, name)| {
             let index = index as u32;
             column.push(
-                checkbox(selection_contains(selection, index))
+                checkbox(membership[index as usize])
                     .label(name.value.clone())
                     .on_toggle_maybe(enabled.then_some(move |_| on_toggle(index))),
             )
@@ -685,5 +691,26 @@ mod tests {
                 .workflows
                 .contains(&crate::generated::FeatureId::Explore)
         );
+    }
+}
+
+#[cfg(test)]
+mod membership_tests {
+    #[test]
+    fn dense_membership_preserves_modes_duplicates_and_catalog_boundaries() {
+        use crate::generated::{ExploreClassSelection, ExploreClassSelectionMode};
+        for count in [0, 1, 4] {
+            for mode in [ExploreClassSelectionMode::All, ExploreClassSelectionMode::None, ExploreClassSelectionMode::Subset] {
+                let selection = ExploreClassSelection { mode, classes: vec![3, u32::MAX, 1, 3, 0] };
+                let actual = super::class_membership(&selection, count);
+                let expected: Vec<_> = (0..count).map(|index| match mode {
+                    ExploreClassSelectionMode::All => true,
+                    ExploreClassSelectionMode::None => false,
+                    ExploreClassSelectionMode::Subset => selection.classes.contains(&(index as u32)),
+                }).collect();
+                assert_eq!(actual, expected);
+                assert_eq!(super::class_membership(&selection, count), actual);
+            }
+        }
     }
 }

@@ -36,6 +36,7 @@ impl GalleryContent {
     pub(crate) fn new(metadata: std::sync::Arc<crate::generated::ExploreImageMetadata>) -> Self {
         let captions = CategoryCaptions::new(
             &metadata.dataset.classnames,
+            &metadata.dataset.palette,
             metadata.labels.iter().map(|label| label.category),
         );
         Self { metadata, captions }
@@ -50,12 +51,13 @@ struct CachedLabel {
     text: String,
     width: f32,
     paragraph: iced::advanced::graphics::text::Paragraph,
-    background: Option<[u8; 3]>,
+    background: Color,
+    foreground: Color,
     cell: Option<[u32; 4]>,
 }
 
 // Category identities stay catalog-relative; only referenced names own text
-// and paragraphs. Visibility is applied at visit time over this immutable set.
+// and paragraphs. Detail selection is folded into the absent index sentinel.
 pub(super) struct CategoryCaptions {
     indices: Vec<usize>,
     captions: Vec<CachedLabel>,
@@ -63,6 +65,7 @@ pub(super) struct CategoryCaptions {
 impl CategoryCaptions {
     pub(super) fn new(
         names: &[crate::generated::ClassName],
+        palette: &[crate::generated::AnnotationColor],
         references: impl IntoIterator<Item = u16>,
     ) -> Self {
         let mut indices = vec![usize::MAX; names.len()];
@@ -74,7 +77,10 @@ impl CategoryCaptions {
             };
             if *index == usize::MAX {
                 *index = captions.len();
-                captions.push(CachedLabel::new(names[category].value.clone()));
+                captions.push(CachedLabel::new(
+                    names[category].value.clone(),
+                    palette.get(category).map_or(Color::TRANSPARENT, class_color),
+                ));
             }
         }
         Self { indices, captions }
@@ -105,7 +111,7 @@ fn label_text<Content>(content: Content, width: f32) -> text::Text<Content> {
     }
 }
 impl CachedLabel {
-    fn new(text: String) -> Self {
+    fn new(text: String, background: Color) -> Self {
         let width = (text.chars().count() as f32 * 7.5 + 8.0).max(20.0);
         let paragraph =
             iced::advanced::graphics::text::Paragraph::with_text(label_text(text.as_str(), width));
@@ -113,7 +119,14 @@ impl CachedLabel {
             text,
             width,
             paragraph,
-            background: None,
+            background,
+            foreground: if background.r * 0.2126 + background.g * 0.7152 + background.b * 0.0722
+                > 0.55
+            {
+                Color::BLACK
+            } else {
+                Color::WHITE
+            },
             cell: None,
         }
     }
@@ -135,7 +148,7 @@ impl PredictionContent {
                         format!("Raw slot {} {}", item.classreference, item.confidence)
                     }
                 };
-                CachedLabel::new(text)
+                CachedLabel::new(text, class_color(&item.color))
             })
             .collect();
         Self { metadata, labels }
@@ -144,7 +157,7 @@ impl PredictionContent {
 
 pub(crate) struct ValidationContent {
     pub(crate) metadata: std::sync::Arc<crate::generated::ValidationImageMetadata>,
-    labels: Vec<(usize, usize, crate::generated::AnnotationBox, CachedLabel)>,
+    labels: [Vec<(usize, usize, crate::generated::AnnotationBox, CachedLabel)>; 2],
     pub(crate) upscale: Option<std::sync::Arc<crate::generated::UpscaleImageMetadata>>,
 }
 impl ValidationContent {
@@ -152,7 +165,7 @@ impl ValidationContent {
         metadata: impl Into<std::sync::Arc<crate::generated::ValidationImageMetadata>>,
     ) -> Self {
         let metadata = metadata.into();
-        let mut labels = Vec::new();
+        let mut labels: [Vec<_>; 2] = std::array::from_fn(|_| Vec::new());
         for (sample_index, sample) in metadata.samples.iter().enumerate().filter(|(_, sample)| {
             sample.available
                 && (!metadata.detail || metadata.selected.as_ref() == Some(&sample.identity))
@@ -165,9 +178,9 @@ impl ValidationContent {
                     point.y = sample.crop.y as f32
                         + point.y * sample.crop.height as f32 / sample.pixelextent.height as f32;
                 }
-                labels.push((sample_index, label_index, bounds, {
-                    let mut cached = CachedLabel::new(label.name.clone());
-                    cached.background = Some(label.rgb.0);
+                labels[usize::from(!label.groundtruth)].push((sample_index, label_index, bounds, {
+                    let [r, g, b] = label.rgb.0;
+                    let mut cached = CachedLabel::new(label.name.clone(), Color::from_rgb8(r, g, b));
                     cached.cell = Some(if metadata.detail {
                         [
                             0,
@@ -206,7 +219,7 @@ impl ValidationContent {
     ) -> Self {
         let scale_x = upscale.frame.extent.width as f32 / self.metadata.frame.extent.width as f32;
         let scale_y = upscale.frame.extent.height as f32 / self.metadata.frame.extent.height as f32;
-        for (_, _, bounds, cached) in &mut self.labels {
+        for (_, _, bounds, cached) in self.labels.iter_mut().flatten() {
             if let Some(cell) = &mut cached.cell {
                 cell[0] = (cell[0] as f32 * scale_x) as u32;
                 cell[1] = (cell[1] as f32 * scale_y) as u32;
@@ -236,8 +249,16 @@ impl Source {
     fn caption_layers(&self) -> [Self; 2] {
         match self {
             Self::Validation(content, gt, det) => [
-                Self::Validation(content.clone(), *gt, false),
-                Self::Validation(content.clone(), false, *det),
+                if *gt && content.metadata.overlays.groundtruthlayer {
+                    Self::Validation(content.clone(), true, false)
+                } else {
+                    Self::Hidden
+                },
+                if *det && content.metadata.overlays.predictionlayer {
+                    Self::Validation(content.clone(), false, true)
+                } else {
+                    Self::Hidden
+                },
             ],
             _ => [self.clone(), Self::Hidden],
         }
@@ -281,12 +302,7 @@ impl Source {
                 let scene = content.scene();
                 let overlay = content.overlay();
                 for object in &scene.objects {
-                    if !object.enabled
-                        || !crate::view::explore::dataset::selection_contains(
-                            &overlay.classselection,
-                            u32::from(object.category),
-                        )
-                    {
+                    if !object.enabled {
                         continue;
                     }
                     if let (Some(name), Some(color)) = (
@@ -306,15 +322,28 @@ impl Source {
                 }
             }
             Self::Validation(content, ground_truth, predictions) => {
-                for (sample, index, bounds, cached) in &content.labels {
+                let visible = [
+                    *ground_truth && content.metadata.overlays.groundtruthlayer,
+                    *predictions && content.metadata.overlays.predictionlayer,
+                ];
+                let [mut gt, mut det] = std::array::from_fn(|layer| {
+                    let labels = &content.labels[layer];
+                    labels.iter().take(if visible[layer] { labels.len() } else { 0 }).peekable()
+                });
+                // Combined diagnostic visits retain source order; each paint layer
+                // advances only its own collection and owns no copied captions.
+                loop {
+                    let next = match (gt.peek(), det.peek()) {
+                        (Some(left), Some(right)) if (left.0, left.1) <= (right.0, right.1) => {
+                            gt.next()
+                        }
+                        (Some(_), Some(_)) => det.next(),
+                        (Some(_), None) => gt.next(),
+                        (None, Some(_)) => det.next(),
+                        (None, None) => break,
+                    };
+                    let (sample, index, bounds, cached) = next.expect("nonempty caption layer");
                     let item = &content.metadata.samples[*sample].labels[*index];
-                    if (item.groundtruth
-                        && (!ground_truth || !content.metadata.overlays.groundtruthlayer))
-                        || (!item.groundtruth
-                            && (!predictions || !content.metadata.overlays.predictionlayer))
-                    {
-                        continue;
-                    }
                     label(
                         item.category as u16,
                         bounds,
@@ -534,7 +563,7 @@ impl<Message> Labelled<'_, Message> {
         {
             renderer.with_layer(clip, |renderer| {
                 source.visit(
-                    |category, bounds, _name, color, catalog_count, overlay, cached| {
+                    |category, bounds, _name, _color, catalog_count, overlay, cached| {
                         let rect = label_bounds(geometry, region, bounds, cached.width);
                         let Some(label_clip) = cached.cell.map_or(Some(clip), |cell| {
                             cell_bounds(geometry, region, cell).intersection(&clip)
@@ -544,10 +573,7 @@ impl<Message> Labelled<'_, Message> {
                         let Some(background) = rect.intersection(&label_clip) else {
                             return;
                         };
-                        let color = cached
-                            .background
-                            .map(|rgb| Color::from_rgb8(rgb[0], rgb[1], rgb[2]))
-                            .unwrap_or_else(|| class_color(color));
+                        let color = cached.background;
                         renderer.fill_quad(
                             renderer::Quad {
                                 bounds: if cached.cell.is_some() {
@@ -560,16 +586,10 @@ impl<Message> Labelled<'_, Message> {
                             color,
                         );
                         let position = Point::new(rect.x + 3.0, rect.y + 9.5);
-                        let foreground =
-                            if color.r * 0.2126 + color.g * 0.7152 + color.b * 0.0722 > 0.55 {
-                                Color::BLACK
-                            } else {
-                                Color::WHITE
-                            };
                         renderer.fill_paragraph(
                             &cached.paragraph,
                             position,
-                            foreground,
+                            cached.foreground,
                             label_clip,
                         );
                         if crate::integration_control::reporting_enabled()
@@ -613,14 +633,31 @@ mod tests {
     use super::*;
 
     #[test]
+    fn cached_colors_keep_exact_conversion_and_strict_contrast() {
+        for value in [0.0, 0.55, f32::from_bits(0.55f32.to_bits() + 1), 1.0] {
+            for hue in [-360.0, 0.0, 60.0, 120.0, 240.0, 359.0, 720.0] {
+                let native = crate::generated::AnnotationColor { hue, saturation: 0.7, value };
+                let expected = class_color(&native);
+                let label = CachedLabel::new("人é🙂".into(), expected);
+                assert_eq!(label.background, expected);
+                assert_eq!(label.foreground, if expected.r * 0.2126 + expected.g * 0.7152 + expected.b * 0.0722 > 0.55 { Color::BLACK } else { Color::WHITE });
+                assert_eq!(label.width, 30.5);
+            }
+            let background = Color::from_rgb(value, value, value);
+            let label = CachedLabel::new(String::new(), background);
+            assert_eq!(label.foreground, if background.r * 0.2126 + background.g * 0.7152 + background.b * 0.0722 > 0.55 { Color::BLACK } else { Color::WHITE });
+        }
+    }
+
+    #[test]
     fn validation_labels_cache_paragraphs_and_toggle_each_domain_independently() {
         let content = std::sync::Arc::new(ValidationContent::new(
             crate::view_model::test_support::validation_image_metadata(),
         ));
-        assert_eq!(content.labels.len(), 2);
-        assert!((content.labels[0].2.first.x - 51.2).abs() < 0.001);
-        assert!((content.labels[0].2.first.y - 38.4).abs() < 0.001);
-        let pointer = content.labels[0].3.text.as_ptr();
+        assert_eq!(content.labels.iter().map(Vec::len).sum::<usize>(), 2);
+        assert!((content.labels[0][0].2.first.x - 51.2).abs() < 0.001);
+        assert!((content.labels[0][0].2.first.y - 38.4).abs() < 0.001);
+        let pointer = content.labels[0][0].3.text.as_ptr();
         for (gt, predictions, expected) in [
             (true, true, 2),
             (true, false, 1),
@@ -688,11 +725,18 @@ mod tests {
                 let source = Source::Validation(content.clone(), flags & 4 != 0, flags & 8 != 0);
                 let gt_visible = flags & 5 == 5;
                 let det_visible = flags & 10 == 10;
+                let mut combined = Vec::new();
+                source.visit(|_, _, _, _, _, _, cached| combined.push(cached.text.as_ptr()));
+                let expected_combined: Vec<_> = (0..4)
+                    .filter(|index| if index % 2 == 1 { gt_visible } else { det_visible })
+                    .map(|index| content.labels[usize::from(index % 2 == 0)][index / 2].3.text.as_ptr())
+                    .collect();
+                assert_eq!(combined, expected_combined);
                 let mut seen = Vec::new();
                 let mut paragraphs = Vec::new();
                 for layer in source.caption_layers() {
                     layer.visit(|_, _, _, _, _, _, cached| {
-                        seen.push(cached.background.unwrap());
+                        seen.push(cached.background);
                         paragraphs.push(cached.text.as_ptr());
                     });
                 }
@@ -705,12 +749,12 @@ mod tests {
                             det_visible
                         }
                     })
-                    .map(|index| content.labels[index].3.text.as_ptr())
+                    .map(|index| content.labels[usize::from(index % 2 == 0)][index / 2].3.text.as_ptr())
                     .collect();
                 assert_eq!(paragraphs, expected_paragraphs);
                 let expected: Vec<_> = (0..if gt_visible { 2 } else { 0 })
-                    .map(|_| [0, 255, 255])
-                    .chain((0..if det_visible { 2 } else { 0 }).map(|_| [255, 0, 0]))
+                    .map(|_| Color::from_rgb8(0, 255, 255))
+                    .chain((0..if det_visible { 2 } else { 0 }).map(|_| Color::from_rgb8(255, 0, 0)))
                     .collect();
                 assert_eq!(seen, expected);
                 let mut surface = Surface::empty();
@@ -820,12 +864,15 @@ mod tests {
         let gallery = Arc::new(GalleryContent::new(Arc::new(native.clone())));
         assert_eq!(gallery.captions.get(0).unwrap().text, "人é🙂");
         assert_eq!(gallery.captions.get(0).unwrap().width, 30.5);
-        assert_eq!(CachedLabel::new(String::new()).width, 20.0);
+        assert_eq!(CachedLabel::new(String::new(), Color::BLACK).width, 20.0);
         for _ in 0..3 {
             Source::Gallery(gallery.clone(), true).visit(
                 |category, _, name, color, _, _, cached| {
                     assert_eq!((category, name), (0, "人é🙂"));
                     assert_eq!(color, &native.dataset.palette[0]);
+                    let expected = class_color(color);
+                    assert_eq!([cached.background.r, cached.background.g, cached.background.b].map(f32::to_bits),
+                        [expected.r, expected.g, expected.b].map(f32::to_bits));
                     assert!(std::ptr::eq(cached, gallery.captions.get(0).unwrap()));
                     assert_eq!(
                         cached.paragraph.compare(label_text((), 30.5)),
@@ -1019,12 +1066,11 @@ mod tests {
         assert!(!Arc::ptr_eq(&detail.labels, &next_detail.labels));
 
         native.overlay.classselection.mode = ExploreClassSelectionMode::Subset;
-        native.overlay.classselection.classes = vec![253];
+        native.overlay.classselection.classes = vec![253, u32::MAX, 253, 256];
         native.scene.objects[0].enabled = false;
         let filtered = super::super::DetailContent::new(Arc::new(native), None);
-        // Preparing disabled/filtered categories keeps text independent from
-        // visibility policy; visiting still applies both rules in source order.
-        assert_eq!(filtered.labels.len(), 3);
+        // Selection is prepared once; object enablement still applies in source order.
+        assert_eq!(filtered.labels.len(), 1);
         let mut seen = Vec::new();
         Source::Detail(filtered, true).visit(|category, bounds, _, _, _, _, _| {
             seen.push((category, bounds.first.x));

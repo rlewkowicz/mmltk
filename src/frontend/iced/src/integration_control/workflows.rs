@@ -178,6 +178,8 @@ pub(super) struct State {
     pixel_attempts: u8,
     progress_epoch: Option<u64>,
     validation_layer: u8,
+    caption_patches: Vec<f64>,
+    caption_receipt: Option<super::probe::ProbeReceipt>,
     validation_original: u8,
     validation_frame: Option<crate::presentation_surface::Surface>,
     export_pixels: bool,
@@ -196,11 +198,128 @@ fn atlas_cell(bounds: Rectangle, index: u8) -> Rectangle {
     }
 }
 fn layer_selection(index: u8) -> (bool, bool) {
-    match index {
+    match index % 4 {
         1 => (false, true),
         2 => (false, false),
         3 => (true, false),
         _ => (true, true),
+    }
+}
+
+// Independent native-metadata oracle: retain at most eight small intersections
+// of GT and Det caption interiors. Last-painted captions exclude occluders.
+// The browser compares actual Det-only pixels with the later combined layer.
+fn validation_caption_patches(
+    content: &crate::presentation_surface::labels::ValidationContent,
+    receipt: &super::probe::ProbeReceipt,
+    sample_index: u8,
+    patches: &mut Vec<f64>,
+) {
+    patches.clear();
+    let scale = receipt.scale;
+    if !scale.is_finite() || scale <= 0.0 {
+        return;
+    }
+    let metadata = &content.metadata;
+    let sample = if metadata.detail {
+        metadata.samples.iter()
+            .find(|sample| metadata.selected.as_ref() == Some(&sample.identity))
+    } else {
+        metadata.samples.get(usize::from(sample_index))
+    };
+    let Some(sample) = sample.filter(|sample| sample.available) else {
+        return;
+    };
+    let [crop_x, crop_y, crop_width, crop_height] = receipt.surface.content_region();
+    if crop_width == 0 || crop_height == 0 {
+        return;
+    }
+    let frame = content.frame();
+    let sx = frame.extent.width as f32 / metadata.frame.extent.width as f32;
+    let sy = frame.extent.height as f32 / metadata.frame.extent.height as f32;
+    let cell = if metadata.detail {
+        receipt.image
+    } else {
+        let width = metadata.frame.extent.width / 2;
+        let height = metadata.frame.extent.height / 3;
+        Rectangle {
+            x: receipt.image.x + (f32::from(sample_index % 2) * width as f32 * sx - crop_x as f32)
+                * receipt.image.width / crop_width as f32,
+            y: receipt.image.y + (f32::from(sample_index / 2) * height as f32 * sy - crop_y as f32)
+                * receipt.image.height / crop_height as f32,
+            width: width as f32 * sx * receipt.image.width / crop_width as f32,
+            height: height as f32 * sy * receipt.image.height / crop_height as f32,
+        }
+    };
+    let Some(clip) = cell.intersection(&receipt.clip) else {
+        return;
+    };
+    let layers: [Vec<_>; 2] = std::array::from_fn(|layer| {
+        sample.labels.iter().rev()
+            .filter(|label| label.groundtruth == (layer == 0))
+            .filter_map(|label| {
+                let x = (sample.crop.x as f32 + label.box_.first.x * sample.crop.width as f32
+                    / sample.pixelextent.width as f32) * sx;
+                let y = (sample.crop.y as f32 + label.box_.first.y * sample.crop.height as f32
+                    / sample.pixelextent.height as f32) * sy;
+                let bounds = Rectangle {
+                    x: receipt.image.x + (x - crop_x as f32) * receipt.image.width / crop_width as f32,
+                    y: receipt.image.y + (y - crop_y as f32) * receipt.image.height / crop_height as f32,
+                    width: (label.name.chars().count() as f32 * 7.5 + 8.0).max(20.0) * scale,
+                    height: 19.0 * scale,
+                };
+                bounds.intersection(&clip)
+                    .map(|_| (bounds, label.rgb.0, !label.name.trim().is_empty()))
+            })
+            .take(16)
+            .collect()
+    });
+    for (det_index, (det, det_rgb, _)) in layers[1].iter().enumerate() {
+        for (gt_index, (gt, gt_rgb, has_text)) in layers[0].iter().enumerate() {
+            let Some(mut interior) = det.intersection(gt).and_then(|value| value.intersection(&clip)) else {
+                continue;
+            };
+            interior.x += scale;
+            interior.y += scale;
+            interior.width -= 2.0 * scale;
+            interior.height -= 2.0 * scale;
+            if !*has_text || interior.width < 4.0 || interior.height < 4.0 {
+                continue;
+            }
+            // Public label layout: a left-aligned paragraph starts three logical
+            // pixels inside the quad, has width (quad - 6), and is centered at
+            // y + 9.5. Keep the bounded read on that text region on both axes;
+            // the independent browser oracle still requires actual glyph pixels.
+            let text_left = gt.x + 3.0 * scale;
+            let text_width = gt.width - 6.0 * scale;
+            let target = iced::Point::new(text_left + text_width / 2.0, gt.y + 9.5 * scale);
+            if !interior.contains(target) {
+                continue;
+            }
+            let width = interior.width.min(128.0);
+            let height = interior.height.min(15.0);
+            let patch = Rectangle {
+                x: (target.x - width / 2.0).clamp(interior.x, interior.x + interior.width - width),
+                y: (target.y - height / 2.0).clamp(interior.y, interior.y + interior.height - height),
+                width,
+                height,
+            };
+            // Browser rounding must retain the target too, not merely a legal
+            // sliver of background beside it. Occlusion uses the final patch.
+            if target.x < patch.x.ceil() || target.x >= (patch.x + width).floor()
+                || target.y < patch.y.ceil() || target.y >= (patch.y + height).floor()
+                || layers[0][..gt_index].iter().chain(&layers[1][..det_index])
+                    .any(|(later, _, _)| later.intersection(&patch).is_some())
+            {
+                continue;
+            }
+            patches.extend([patch.x, patch.y, patch.width, patch.height].map(f64::from));
+            patches.extend(gt_rgb.map(f64::from));
+            patches.extend(det_rgb.map(f64::from));
+            if patches.len() == 80 {
+                return;
+            }
+        }
     }
 }
 
@@ -244,6 +363,121 @@ mod tests {
                 &crate::view::router::Router::default(),
             )
             .units()
+    }
+
+    #[test]
+    fn caption_patch_oracle_uses_paired_native_bounds_and_explicit_rgb() {
+        let mut metadata = crate::view_model::test_support::validation_image_metadata();
+        let mut gt = metadata.samples[0].labels[0].clone();
+        gt.name = "人é🙂".into();
+        gt.rgb.0 = [0, 255, 255];
+        let mut det = gt.clone();
+        det.groundtruth = false;
+        det.rgb.0 = [255, 0, 0];
+        metadata.samples[0].labels = vec![det, gt];
+        let bounds = iced::Rectangle::with_size(iced::Size::new(512.0, 576.0));
+        let receipt = super::super::probe::ProbeReceipt {
+            generation: 1,
+            control: crate::view::validate::samples::ATLAS_ID,
+            surface: crate::presentation_surface::Surface {
+                width: 512,
+                height: 576,
+                ..crate::presentation_surface::Surface::empty()
+            },
+            bounds,
+            image: bounds,
+            clip: bounds,
+            scale: 1.0,
+        };
+        let mut patches = Vec::new();
+        for stage in 0..=8 {
+            (metadata.overlays.groundtruthlayer, metadata.overlays.predictionlayer) = super::layer_selection(stage);
+            let content = crate::presentation_surface::labels::ValidationContent::new(metadata.clone());
+            super::validation_caption_patches(&content, &receipt, 0, &mut patches);
+            assert_eq!(patches.len(), 10);
+            assert!((patches[0] - 52.2).abs() < 0.001);
+            assert!((patches[1] - 40.4).abs() < 0.001);
+            assert!((patches[2] - 28.5).abs() < 0.001);
+            assert_eq!(patches[3], 15.0);
+            assert_eq!(&patches[4..], &[0.0, 255.0, 255.0, 255.0, 0.0, 0.0]);
+        }
+        for detail in [false, true] {
+            metadata.detail = detail;
+            metadata.selected = detail.then(|| metadata.samples[0].identity.clone());
+            let content = crate::presentation_surface::labels::ValidationContent::new(metadata.clone());
+            for (scale, expected_origin) in [
+                (1.0, [61.0, 41.0]),
+                (1.5, [91.5, 64.35]),
+                (2.0, [122.0, 88.3]),
+                (4.25, [259.25, 196.075]),
+                (5.25, [320.25, 243.975]),
+                (12.5, [766.625, 591.25]),
+                (40.0, [2594.0, 1908.5]),
+            ] {
+                let scaled = super::super::probe::ProbeReceipt {
+                    bounds: crate::presentation_surface::physical_bounds(bounds, scale),
+                    image: crate::presentation_surface::physical_bounds(bounds, scale),
+                    clip: crate::presentation_surface::physical_bounds(iced::Rectangle {
+                        x: 60.0, y: 40.0, width: 100.0, height: 100.0,
+                    }, scale),
+                    scale,
+                    ..receipt.clone()
+                };
+                super::validation_caption_patches(&content, &scaled, 0, &mut patches);
+                assert_eq!(patches.len(), 10);
+                let factor = f64::from(scale);
+                let expected = [expected_origin[0], expected_origin[1], (19.7 * factor).min(128.0), 15.0];
+                for (actual, expected) in patches[..4].iter().zip(expected) {
+                    assert!((*actual - expected).abs() < 0.001);
+                    assert!(actual.is_finite());
+                }
+                assert!(patches[2] <= 128.0 && patches[3] <= 15.0);
+                assert!((patches[0] + patches[2]).floor() - patches[0].ceil() >= 3.0);
+                assert!((patches[1] + patches[3]).floor() - patches[1].ceil() >= 3.0);
+                // Independently known Unicode paragraph region: x=54.2..78.7,
+                // vertical center y=47.9, before viewport scaling. Its center
+                // must survive both physical capping and browser rounding.
+                let target = [66.45 * factor, 47.9 * factor];
+                for axis in 0..2 {
+                    assert!(patches[axis].ceil() <= target[axis]);
+                    assert!(target[axis] < (patches[axis] + patches[axis + 2]).floor());
+                }
+                assert!(patches[0] >= 61.0 * factor - 0.001);
+                assert!(patches[1] >= 41.0 * factor - 0.001);
+                assert!(patches[0] + patches[2] <= 80.7 * factor + 0.001);
+                assert!(patches[1] + patches[3] <= 56.4 * factor + 0.001);
+                assert_eq!(&patches[4..], &[0.0, 255.0, 255.0, 255.0, 0.0, 0.0]);
+                for clip in [
+                    iced::Rectangle { x: 52.0, y: 38.0, width: 8.0, height: 30.0 },
+                    iced::Rectangle { x: 50.0, y: 39.0, width: 40.0, height: 6.0 },
+                ] {
+                    let excluded = super::super::probe::ProbeReceipt {
+                        clip: crate::presentation_surface::physical_bounds(clip, scale),
+                        ..scaled.clone()
+                    };
+                    super::validation_caption_patches(&content, &excluded, 0, &mut patches);
+                    assert!(patches.is_empty(), "clip excludes the horizontal or vertical glyph target");
+                }
+            }
+            for scale in [0.0, -1.0, f32::NAN, f32::INFINITY] {
+                let invalid = super::super::probe::ProbeReceipt { scale, ..receipt.clone() };
+                super::validation_caption_patches(&content, &invalid, 0, &mut patches);
+                assert!(patches.is_empty());
+            }
+        }
+        metadata.detail = false;
+        for name in ["", "   "] {
+            let mut blank = metadata.clone();
+            blank.samples[0].labels[1].name = name.into();
+            let content = crate::presentation_surface::labels::ValidationContent::new(blank);
+            super::validation_caption_patches(&content, &receipt, 0, &mut patches);
+            assert!(patches.is_empty(), "a blank GT paragraph has no glyph target");
+        }
+        let content = crate::presentation_surface::labels::ValidationContent::new(metadata);
+        super::validation_caption_patches(&content, &receipt, 5, &mut patches);
+        assert!(patches.is_empty());
+        super::validation_caption_patches(&content, &receipt, u8::MAX, &mut patches);
+        assert!(patches.is_empty());
     }
 
     #[test]
@@ -672,9 +906,9 @@ impl State {
                     Picture::Progress => Step::LeaveTrain,
                     Picture::Train => Step::NoImageWorkspace,
                     Picture::Validation if index < 5 => Step::Pixels(picture, index + 1),
-                    Picture::Validation if self.validation_layer < 4 => Step::ValidationLayer(false, self.validation_layer + 1),
+                    Picture::Validation if self.validation_layer < 8 => Step::ValidationLayer(false, self.validation_layer + 1),
                     Picture::Validation => { self.validation_layer = 0; Step::OpenSample },
-                    Picture::Detail if self.validation_layer < 4 => Step::ValidationLayer(true, self.validation_layer + 1),
+                    Picture::Detail if self.validation_layer < 8 => Step::ValidationLayer(true, self.validation_layer + 1),
                     Picture::Detail if self.validation_original < 2 => Step::ValidationOriginal,
                     Picture::Detail => Step::CloseSample,
                     Picture::Compiled => Step::Source(1),
@@ -880,6 +1114,11 @@ impl State {
         };
         let input = crate::presentation_surface::physical_bounds(bounds, driver.input_scale);
         if let Step::Pixels(picture, index) = step {
+            if matches!(picture, Picture::Validation | Picture::Detail)
+                && self.caption_receipt != super::probe::current_receipt(control)
+            {
+                return;
+            }
             driver.phase = Phase::Workflows(Step::AwaitPixels(picture, index));
             #[cfg(not(target_arch = "wasm32"))]
             let _ = (input, picture.chart());
@@ -913,6 +1152,13 @@ impl State {
                     picture == Picture::Progress,
                     self.pixel_source as f64,
                     self.pixel_presentation as f64,
+                    if matches!(picture, Picture::Validation | Picture::Detail) {
+                        i32::from(self.validation_layer)
+                    } else {
+                        -1
+                    },
+                    if picture == Picture::Detail { 6 } else { u32::from(index) },
+                    &self.caption_patches,
                     &callback,
                 );
             }
@@ -1486,7 +1732,7 @@ impl State {
                 .workflow_control(
                     widgets,
                     driver,
-                    if index == 1 || index == 3 {
+                    if index % 2 == 1 {
                         "validate.gt.layer"
                     } else {
                         "validate.pred.layer"
@@ -1503,6 +1749,11 @@ impl State {
                 }) =>
             {
                 self.validation_layer = index;
+                completed("validation_layer_settled", [
+                    f64::from(u8::from(detail)), index as f64,
+                    f64::from(u8::from(layer_selection(index).0)),
+                    f64::from(u8::from(layer_selection(index).1)),
+                ]);
                 self.workflow_step(
                     driver,
                     Step::Pixels(
@@ -1749,6 +2000,8 @@ impl State {
                 self.workflow_step(driver, Step::Export)
             }
             Step::Pixels(picture, index) => {
+                self.caption_patches.clear();
+                self.caption_receipt = None;
                 if picture.chart() || picture == Picture::Progress {
                     self.pixel_source = 0;
                     self.pixel_presentation = 0;
@@ -1767,10 +2020,24 @@ impl State {
                                         content.metadata.overlays.groundtruthlayer,
                                         content.metadata.overlays.predictionlayer,
                                     ) == layer_selection(self.validation_layer)
+                                    && validation.is_some_and(|snapshot| {
+                                        content.metadata.overlays == snapshot.overlays
+                                    })
                                     && (picture != Picture::Detail
                                         || !content.metadata.overlays.predictionboxes)
                             })
-                            .map(|(surface, _)| surface)
+                            .and_then(|(surface, content)| {
+                                let receipt = super::probe::current_receipt(&picture.control(index))?;
+                                if receipt.surface.frame != surface.frame {
+                                    return None;
+                                }
+                                validation_caption_patches(
+                                    &content, &receipt, index,
+                                    &mut self.caption_patches,
+                                );
+                                self.caption_receipt = Some(receipt);
+                                Some(surface)
+                            })
                     } else {
                         crate::presentation_surface::drawable_prediction(surface)
                             .map(|(surface, _)| surface)

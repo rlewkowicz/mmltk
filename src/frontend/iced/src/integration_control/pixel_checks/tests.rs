@@ -155,6 +155,7 @@ impl ProbeFixture {
             self.bounds,
             self.bounds,
             self.bounds,
+            1.0,
         );
         let (_, evidence) = pixel_checks::tests::fps_pixel_fixture(false, 1.0);
         let mut output = self.fps_draw_output(evidence);
@@ -372,7 +373,7 @@ fn fps_capture_invalidation_rearms_and_obsolete_callbacks_cannot_finish_replacem
                     x: 1.0,
                     ..fixture.bounds
                 };
-                record_probe_draw(EXPLORE_GALLERY, fixture.surface, moved, moved, moved);
+                record_probe_draw(EXPLORE_GALLERY, fixture.surface, moved, moved, moved, 1.0);
                 FpsPixelOutcome::Captured(pixels.clone())
             }
             2 => {

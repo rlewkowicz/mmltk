@@ -57,7 +57,7 @@ pub(super) fn view<'a>(
     };
     let overlay_classes = class_checklist(
         snapshot,
-        filter.as_ref().map(|filter| &filter.overlay.classselection),
+        filter.map(|filter| &filter.overlay.classselection),
         available,
         Message::ClassToggled,
     );

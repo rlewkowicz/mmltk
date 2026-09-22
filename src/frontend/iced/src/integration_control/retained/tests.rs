@@ -398,7 +398,7 @@ fn atlas_invalidation_cannot_retire_a_replacement_request_on_the_same_draw() {
             &crate::view_model::test_support::explore_snapshot(),
         )),
     };
-    record_probe_draw(EXPLORE_GALLERY, surface, bounds, bounds, bounds);
+    record_probe_draw(EXPLORE_GALLERY, surface, bounds, bounds, bounds, 1.0);
     report_atlas_draw(draw.clone(), false, 1.0);
     controller.update(receiver.try_recv().unwrap());
     let mut old_pixels = atlas_probe_output(false).unwrap();
@@ -804,14 +804,14 @@ pub(in crate::integration_control) fn check_reset_atlas_callbacks(
     let (surface, bounds) = (draw.surface, draw.bounds);
     report_atlas_draw(draw.clone(), true, 1.0);
     assert!(receiver.try_recv().is_err());
-    record_probe_draw(EXPLORE_GALLERY, surface, bounds, bounds, bounds);
+    record_probe_draw(EXPLORE_GALLERY, surface, bounds, bounds, bounds, 1.0);
     report_atlas_draw(draw.clone(), true, 1.0);
     let queued = receiver.try_recv().unwrap();
     let moved_draw = AtlasDraw {
         image: Rectangle { x: 17.0, ..bounds },
         ..draw
     };
-    record_probe_draw(EXPLORE_GALLERY, surface, bounds, moved_draw.image, bounds);
+    record_probe_draw(EXPLORE_GALLERY, surface, bounds, moved_draw.image, bounds, 1.0);
     assert!(!controller.probes.accepts_message(
         &controller.driver,
         &controller.pixel_checks,
@@ -841,6 +841,7 @@ pub(in crate::integration_control) fn check_atlas_pixel_callbacks(
         draw.bounds,
         draw.image,
         draw.clip,
+        1.0,
     );
     atlas_probe_output(false)
         .unwrap()

@@ -90,6 +90,8 @@ pub struct ProbeReceipt {
     pub(super) bounds: Rectangle,
     pub(super) image: Rectangle,
     pub(super) clip: Rectangle,
+    // Bounds, image, and clip are already in backing pixels at this viewport scale.
+    pub(super) scale: f32,
 }
 
 #[derive(Clone)]
@@ -336,6 +338,7 @@ pub(crate) fn record_probe_draw(
     bounds: Rectangle,
     image: Rectangle,
     clip: Rectangle,
+    scale: f32,
 ) {
     if !reporting_enabled() {
         return;
@@ -349,6 +352,7 @@ pub(crate) fn record_probe_draw(
             bounds,
             image,
             clip,
+            scale,
         };
         #[cfg(target_arch = "wasm32")]
         if let Some(frame) = surface.frame {

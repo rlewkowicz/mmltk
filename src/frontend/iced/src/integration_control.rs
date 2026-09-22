@@ -391,6 +391,9 @@ extern "C" {
         progress: bool,
         source: f64,
         presentation: f64,
+        caption_stage: i32,
+        caption_case: u32,
+        caption_patches: &[f64],
         completed: &wasm_bindgen::JsValue,
     );
     #[wasm_bindgen::prelude::wasm_bindgen(js_name = mmltkIntegrationClickAfterSurfaceDraw)]

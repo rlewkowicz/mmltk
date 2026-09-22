@@ -961,3 +961,171 @@ test('Save Annotations active perimeter evidence keeps its green save-only core'
   assert.equal(reports.length,2);
   assert.ok(reports.every(report=>report.label === 'Save Annotations' && report.core[1]>report.core[0]+60));
 });
+
+const validationWorkspace = 'validate.detail.image';
+const captionPatch = [20, 20, 24, 12, 0, 255, 255, 255, 0, 0];
+function captionRaster(stage, broken = false) {
+  return (x, y) => {
+    if (x < 20 || x >= 44 || y < 20 || y >= 32) return [48, 80, 112, 255];
+    const mode = stage % 4;
+    if (mode === 2) return [48, 80, 112, 255];
+    const gtGlyph = x >= 24 && x < 28 && y >= 23 && y < 29;
+    if (mode === 3 || (broken && mode === 0 && gtGlyph)) {
+      return gtGlyph ? [0, 0, 0, 255] : [0, 255, 255, 255];
+    }
+    return x >= 34 && x < 37 && y >= 23 && y < 29 ? [255, 255, 255, 255] : [255, 0, 0, 255];
+  };
+}
+function workflowCaption(fixture, stage, results, patches = captionPatch, caseIndex = 6) {
+  browser.mmltkIntegrationReceipt(validationWorkspace, `caption-geometry-${stage}`, 7 + stage, 11 + stage);
+  browser.mmltkIntegrationWorkflowPixels(validationWorkspace, [0, 0, 100, 80], false, false,
+    7 + stage, 11 + stage, stage, caseIndex, patches, (...values) => results.push(values));
+  fixture.flushFrames();
+}
+
+test('workflow caption patches compare completed layers including GT glyphs under Det backgrounds', t => {
+  const f = canvasFixture(t, true), results = [];
+  for (let stage = 0; stage <= 8; ++stage) {
+    f.sampling.raster = captionRaster(stage);
+    workflowCaption(f, stage, results);
+    assert.equal(results.at(-1)[0], 'observed');
+  }
+  const evidence = f.reports.filter(record => record.event === 'integration.workflow.caption_pixels');
+  assert.equal(evidence.length, 9);
+  assert.ok(evidence[3].glyphs > 0);
+  assert.equal(evidence[4].compared, 24 * 12);
+  assert.equal(evidence[8].verified, 1);
+  assert.equal(f.allocations.copies, 9, 'caption and ordinary workflow pixels share one canvas snapshot');
+  assert.equal(f.reports.some(record => record.event === 'integration.annotation_swatch'), false);
+});
+
+test('workflow caption oracle rejects GT glyphs surviving the Det background', t => {
+  const f = canvasFixture(t, true), results = [];
+  for (let stage = 0; stage <= 4; ++stage) {
+    f.sampling.raster = captionRaster(stage, stage === 4);
+    workflowCaption(f, stage, results);
+  }
+  assert.equal(results.at(-1)[0], 'failed');
+  assert.ok(f.reports.some(record => record.detail?.includes('completely cover ground-truth')));
+});
+
+test('workflow caption probes keep invalidation and disabled execution independent of evidence', t => {
+  const f = canvasFixture(t, true), results = [];
+  browser.mmltkIntegrationReceipt(validationWorkspace, 'before', 7, 11);
+  browser.mmltkIntegrationWorkflowPixels(validationWorkspace, [0, 0, 100, 80], false, false,
+    7, 11, 1, 6, captionPatch, (...values) => results.push(values));
+  browser.mmltkIntegrationReceipt(validationWorkspace, 'after', 8, 12);
+  f.flushFrames();
+  assert.deepEqual(results, [['invalidated', 0, 0]]);
+  assert.equal(f.allocations.reads, 0);
+  browser.mmltkIntegrationInitialize(false);
+  browser.mmltkIntegrationWorkflowPixels(validationWorkspace, [0, 0, 100, 80], false, false,
+    8, 12, 1, 6, { [Symbol.iterator]() { throw new Error('disabled caption collection'); } },
+    (...values) => results.push(values));
+  assert.equal(f.allocations.reads, 0);
+  assert.equal(f.frames.length, 0);
+});
+
+test('workflow caption probes reject malformed bounds, absent RGB, and missing overlap proof', t => {
+  const f = canvasFixture(t, true), results = [];
+  for (const patches of [captionPatch.slice(1), [...captionPatch, ...new Array(80).fill(0)],
+    [20, 20, 513, 12, 0, 255, 255, 255, 0, 0],
+    [20, 20, 24, 12, 0, 256, 255, 255, 0, 0],
+    [-10, 20, 24, 12, 0, 255, 255, 255, 0, 0]]) {
+    workflowCaption(f, 1, results, patches);
+    assert.equal(results.at(-1)[0], 'failed');
+  }
+  f.sampling.pixel = () => [64, 64, 64, 255];
+  workflowCaption(f, 1, results);
+  assert.equal(results.at(-1)[0], 'failed', 'explicit RGB must be observed');
+  workflowCaption(f, 8, results, []);
+  assert.equal(results.at(-1)[0], 'failed', 'a compiled oracle without overlap is not acceptance');
+});
+
+
+test('workflow caption baselines cannot prove a replacement geometry or survive canvas failure', t => {
+  const f = canvasFixture(t, true), results = [];
+  for (let stage = 1; stage <= 3; ++stage) {
+    f.sampling.raster = captionRaster(stage);
+    workflowCaption(f, stage, results);
+  }
+  f.sampling.raster = captionRaster(8);
+  workflowCaption(f, 8, results, [21, ...captionPatch.slice(1)]);
+  assert.equal(results.at(-1)[0], 'failed', 'new geometry cannot inherit a layer comparison');
+  f.sampling.error = new Error('canvas unavailable');
+  const before = results.length;
+  workflowCaption(f, 1, results);
+  assert.deepEqual(results.at(-1), ['failed', 0, 0]);
+  browser.mmltkIntegrationResetScenario();
+  f.flushFrames();
+  assert.equal(results.length, before + 1, 'failure completes its exact request once');
+});
+
+
+test('workflow captions sample explicit backing pixels without a second CSS scale', t => {
+  const f = canvasFixture(t, true), results = [];
+  f.css.width = 320;
+  f.css.height = 240;
+  const reads = [];
+  f.sampling.raster = (x, y) => { reads.push([x, y]); return captionRaster(1)(x, y); };
+  workflowCaption(f, 1, results);
+  assert.equal(results.at(-1)[0], 'observed');
+  assert.deepEqual(reads[0], [20, 20]);
+  assert.deepEqual(reads[24 * 12 - 1], [43, 31]);
+  assert.deepEqual(reads[24 * 12], [30, 20], 'ordinary workflow bounds still use CSS conversion');
+  assert.equal(f.allocations.copies, 1);
+});
+
+test('workflow overlap proof cannot borrow Det background from another patch', t => {
+  const f = canvasFixture(t, true), results = [];
+  const patches = [...captionPatch, 60, ...captionPatch.slice(1)];
+  for (let stage = 1; stage <= 4; ++stage) {
+    f.sampling.raster = (x, y) => {
+      if (x >= 20 && x < 44 && y >= 20 && y < 32) {
+        // A has the Det background and a GT background, but no GT glyph.
+        return stage === 2 ? [48, 80, 112, 255] :
+          (stage === 3 ? [0, 255, 255, 255] : [255, 0, 0, 255]);
+      }
+      if (x >= 60 && x < 84 && y >= 20 && y < 32) {
+        // B has GT glyphs, but neither Det-only nor combined contains Det.
+        return stage === 3 ? captionRaster(3)(x - 40, y) : [48, 80, 112, 255];
+      }
+      return [48, 80, 112, 255];
+    };
+    workflowCaption(f, stage, results, patches);
+    if (results.at(-1)[0] === 'failed') break;
+  }
+  assert.equal(results.at(-1)[0], 'failed');
+  assert.ok(f.reports.some(record => record.detail?.includes('expected colors')));
+});
+
+for (const leak of ['gt-background', 'det-background', 'gt-glyph', 'det-glyph']) {
+  test(`workflow hidden state rejects partial ${leak} leakage in its own patch`, t => {
+    const f = canvasFixture(t, true), results = [];
+    for (let stage = 1; stage <= 3; ++stage) {
+      f.sampling.raster = (x, y) => {
+        if (stage === 2) {
+          if (leak === 'gt-background' && x === 22 && y === 22) return [0, 255, 255, 255];
+          if (leak === 'det-background' && x === 22 && y === 22) return [255, 0, 0, 255];
+          if (leak === 'gt-glyph' && x === 24 && y === 23) return [0, 0, 0, 255];
+          if (leak === 'det-glyph' && x === 34 && y === 23) return [255, 255, 255, 255];
+        }
+        return captionRaster(stage)(x, y);
+      };
+      workflowCaption(f, stage, results);
+      if (results.at(-1)[0] === 'failed') break;
+    }
+    assert.equal(results.at(-1)[0], 'failed');
+    assert.ok(f.reports.some(record => record.detail?.includes('hidden validation captions retained')));
+  });
+}
+
+for (const stage of [1, 3]) {
+  test(`workflow single layer ${stage} rejects the other layer's partial caption`, t => {
+    const f = canvasFixture(t, true), results = [];
+    f.sampling.raster = (x, y) => x === 22 && y === 22 ?
+      (stage === 1 ? [0, 255, 255, 255] : [255, 0, 0, 255]) : captionRaster(stage)(x, y);
+    workflowCaption(f, stage, results);
+    assert.equal(results.at(-1)[0], 'failed');
+  });
+}

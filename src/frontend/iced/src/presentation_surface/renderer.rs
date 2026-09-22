@@ -1411,9 +1411,16 @@ impl DetailContent {
         let scene = upscale
             .as_ref()
             .map_or(&explore.scene, |value| &value.scene);
+        let membership = crate::view::explore::dataset::class_membership(
+            &explore.overlay.classselection,
+            scene.categories.len(),
+        );
         let labels = std::sync::Arc::new(super::labels::CategoryCaptions::new(
             &scene.categories,
-            scene.objects.iter().map(|object| object.category),
+            &scene.palette,
+            scene.objects.iter()
+                .map(|object| object.category)
+                .filter(|category| membership.get(usize::from(*category)).copied().unwrap_or(false)),
         ));
         Self {
             explore,
@@ -1486,7 +1493,25 @@ struct PreparedDraw {
     gallery: Option<std::sync::Arc<super::labels::GalleryContent>>,
     uniform: wgpu::Buffer,
     bindings: [wgpu::BindGroup; 2],
+    views: [wgpu::TextureView; 2],
     key: GeometryKey,
+}
+
+impl PreparedDraw {
+    fn refresh_views(
+        &mut self,
+        device: &wgpu::Device,
+        layout: &wgpu::BindGroupLayout,
+        sampler: &wgpu::Sampler,
+        views: &[wgpu::TextureView; 2],
+    ) {
+        for (index, view) in views.iter().enumerate() {
+            if self.views[index] != *view {
+                self.bindings[index] = bind_group(device, layout, sampler, &self.uniform, view);
+                self.views[index] = view.clone();
+            }
+        }
+    }
 }
 
 impl Drop for SurfaceRenderer {
@@ -1705,6 +1730,26 @@ impl SurfaceRenderer {
             .find(|candidate| same_allocation(candidate.image.surface, surface))
     }
 
+    fn propagate_source_views(
+        draws: &mut std::collections::HashMap<&'static str, PreparedDraw>,
+        device: &wgpu::Device,
+        layout: &wgpu::BindGroupLayout,
+        sampler: &wgpu::Sampler,
+        imported: &Imported,
+        change: SourceViewChange,
+    ) {
+        if change.changed {
+            // Displaced backing remains alive until every cached binding and
+            // comparison view has been refreshed. It grants no sampling rights.
+            for draw in draws.values_mut()
+                .filter(|draw| same_allocation(draw.surface, imported.image.surface))
+            {
+                draw.refresh_views(device, layout, sampler, &imported.views);
+            }
+        }
+        drop(change.retired);
+    }
+
     fn reconcile_sample(
         &mut self,
         device: &wgpu::Device,
@@ -1715,7 +1760,10 @@ impl SurfaceRenderer {
         if let Some(imported) =
             Self::matching_import(&mut self.imported, &mut self.pending, surface)
         {
-            imported.ensure_source(device, queue, surface);
+            let change = imported.ensure_source(device, queue, surface);
+            Self::propagate_source_views(
+                &mut self.draws, device, &self.layout, &self.sampler, imported, change,
+            );
             imported.reconcile_sample(surface, placement);
             return;
         }
@@ -1813,23 +1861,11 @@ impl SurfaceRenderer {
                     .flatten(),
                 uniform,
                 bindings,
+                views: imported.views.clone(),
                 key,
             }
         });
-        if !same_allocation(draw.surface, surface)
-            || surface.frame.is_some_and(|frame| frame.direct_sampling)
-                && draw.surface.frame != surface.frame
-        {
-            draw.bindings = std::array::from_fn(|index| {
-                bind_group(
-                    device,
-                    &self.layout,
-                    &self.sampler,
-                    &draw.uniform,
-                    &imported.views[index],
-                )
-            });
-        }
+        draw.refresh_views(device, &self.layout, &self.sampler, &imported.views);
         if draw.key != key {
             write_content_geometry(queue, &draw.uniform, key);
             draw.key = key;
@@ -1870,7 +1906,10 @@ impl SurfaceRenderer {
         if let Some(imported) =
             Self::matching_import(&mut self.imported, &mut self.pending, surface)
         {
-            imported.ensure_source(device, queue, surface);
+            let change = imported.ensure_source(device, queue, surface);
+            Self::propagate_source_views(
+                &mut self.draws, device, &self.layout, &self.sampler, imported, change,
+            );
             imported.prepare(surface, placement);
             return;
         }
@@ -2129,6 +2168,7 @@ impl SurfaceRenderer {
                 bounds,
                 image,
                 clip,
+                self.scale_factor,
             );
             crate::integration_control::sample_boundary_pixels(
                 draw.surface,
@@ -2438,10 +2478,21 @@ impl ImagePublication {
     }
 }
 
+#[derive(Default)]
+struct SourceViewChange {
+    changed: bool,
+    retired: Option<std::sync::Arc<ArenaTexture>>,
+}
+
 impl Imported {
-    fn ensure_source(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, surface: Surface) {
+    fn ensure_source(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        surface: Surface,
+    ) -> SourceViewChange {
         let Some(frame) = surface.frame.filter(|frame| frame.direct_sampling) else {
-            return;
+            return SourceViewChange::default();
         };
         let index = frame.slot as usize;
         let matches_source = |arena: &Option<std::sync::Arc<ArenaTexture>>| {
@@ -2452,16 +2503,20 @@ impl Imported {
             })
         };
         if matches_source(&self._arena[index]) {
-            return;
+            return SourceViewChange::default();
         }
         if let Some(existing) = self._arena.iter().position(matches_source) {
             // A direct source can return in either free mailbox slot. Both
             // bindings share its one texture and probe owner; explicit texture
             // destruction still waits for the final binding and actual readers.
+            let changed = self.views[index] != self.views[existing];
             self.views[index] = self.views[existing].clone();
             self.pixel_trace[index] = self.pixel_trace[existing].clone();
-            self._arena[index] = self._arena[existing].clone();
-            return;
+            let arena = self._arena[existing].clone();
+            return SourceViewChange {
+                changed,
+                retired: std::mem::replace(&mut self._arena[index], arena),
+            };
         }
         let label = format!(
             "mmltk-surface-v4/{:016x}{:016x}",
@@ -2481,11 +2536,13 @@ impl Imported {
             usage: wgpu::TextureUsages::TEXTURE_BINDING,
             view_formats: &[],
         });
-        self.views[index] = texture.create_view(&wgpu::TextureViewDescriptor {
+        let view = texture.create_view(&wgpu::TextureViewDescriptor {
             dimension: Some(wgpu::TextureViewDimension::D2),
             array_layer_count: Some(1),
             ..wgpu::TextureViewDescriptor::default()
         });
+        let changed = self.views[index] != view;
+        self.views[index] = view;
         self.pixel_trace[index] =
             pixel_trace::PixelTrace::new(device, queue, &texture, surface).map(std::sync::Arc::new);
         let lifetime = self
@@ -2497,11 +2554,14 @@ impl Imported {
             .lifetime
             .clone();
         trace_source_texture("source_texture_create", surface);
-        self._arena[index] = Some(std::sync::Arc::new(ArenaTexture {
-            surface,
-            texture: Some(texture),
-            lifetime,
-        }));
+        SourceViewChange {
+            changed,
+            retired: self._arena[index].replace(std::sync::Arc::new(ArenaTexture {
+                surface,
+                texture: Some(texture),
+                lifetime,
+            })),
+        }
     }
 
     fn reconcile_sample(&mut self, surface: Surface, placement: Placement) {
@@ -2976,6 +3036,7 @@ mod tests {
             let owner = owner.as_ref().unwrap();
             (owner.device.clone(), owner.format)
         });
+        retained_view_bindings(&device, surface);
         let texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("workspace FPS functional target"),
             size: wgpu::Extent3d {
@@ -3060,6 +3121,166 @@ mod tests {
         );
         let _ = renderer.screenshot(&viewport, iced::Color::WHITE);
         assert_eq!(sample(&mut tree, 2000), 1);
+    }
+
+    fn retained_view_bindings(device: &wgpu::Device, surface: Surface) {
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("retained binding identity cases"),
+            size: wgpu::Extent3d {
+                width: 4,
+                height: 4,
+                depth_or_array_layers: 2,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let views = std::array::from_fn(|index| texture.create_view(&wgpu::TextureViewDescriptor {
+            dimension: Some(wgpu::TextureViewDimension::D2),
+            base_array_layer: index as u32,
+            array_layer_count: Some(1),
+            ..Default::default()
+        }));
+        RENDERER.with(|owner| {
+            let owner = owner.borrow();
+            let owner = owner.as_ref().unwrap();
+            let bounds = Rectangle::with_size(iced::Size::new(32.0, 32.0));
+            let uniform = device.create_buffer(&wgpu::BufferDescriptor {
+                label: None,
+                size: 64,
+                usage: wgpu::BufferUsages::UNIFORM,
+                mapped_at_creation: false,
+            });
+            let mut draw = PreparedDraw {
+                surface,
+                requested: surface,
+                bounds,
+                geometry: PlacementGeometry {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 32.0,
+                    height: 32.0,
+                },
+                placement: Placement::Contain,
+                gallery: None,
+                bindings: std::array::from_fn(|index| {
+                    bind_group(device, &owner.layout, &owner.sampler, &uniform, &views[index])
+                }),
+                uniform,
+                views: views.clone(),
+                key: geometry_key(surface, bounds, Placement::Contain, ViewTransform::FIT),
+            };
+            assert_ne!(views[0], views[1]); // Distinct fallback layers.
+            let original = draw.bindings.clone();
+            for revision in 0..3 {
+                draw.surface.frame.as_mut().unwrap().presentation_revision += revision;
+                draw.refresh_views(device, &owner.layout, &owner.sampler, &views);
+                assert_eq!(draw.bindings, original); // New publication, same views.
+            }
+            let replacement = texture.create_view(&wgpu::TextureViewDescriptor {
+                dimension: Some(wgpu::TextureViewDimension::D2),
+                array_layer_count: Some(1),
+                ..Default::default()
+            });
+            let changed = [replacement.clone(), views[1].clone()];
+            draw.refresh_views(device, &owner.layout, &owner.sampler, &changed);
+            assert_ne!(draw.bindings[0], original[0]); // Same publication, replaced view.
+            assert_eq!(draw.bindings[1], original[1]);
+            assert_eq!(draw.views, changed);
+            let before_alias = draw.bindings.clone();
+            let aliased = [replacement.clone(), replacement];
+            draw.refresh_views(device, &owner.layout, &owner.sampler, &aliased);
+            assert_eq!(draw.bindings[0], before_alias[0]);
+            assert_ne!(draw.bindings[1], before_alias[1]);
+            assert_eq!(draw.views[0], draw.views[1]);
+            let before_geometry = draw.bindings.clone();
+            draw.bounds.width *= 2.0;
+            draw.key = geometry_key(surface, draw.bounds, Placement::Contain, ViewTransform::FIT);
+            draw.refresh_views(device, &owner.layout, &owner.sampler, &aliased);
+            assert_eq!(draw.bindings, before_geometry);
+            let second = PreparedDraw {
+                surface: draw.surface,
+                requested: draw.requested,
+                bounds: draw.bounds,
+                geometry: draw.geometry,
+                placement: draw.placement,
+                gallery: None,
+                uniform: draw.uniform.clone(),
+                bindings: draw.bindings.clone(),
+                views: draw.views.clone(),
+                key: draw.key,
+            };
+            let mut draws = std::collections::HashMap::from([("first", draw), ("second", second)]);
+            let mut direct = surface;
+            let frame = direct.frame.as_mut().unwrap();
+            frame.direct_sampling = true;
+            frame.slot = 0;
+            frame.source_high = 1000;
+            let mut imported = Imported {
+                image: ImagePublication {
+                    surface: direct,
+                    pending_sample: None,
+                    completed: None,
+                    retained_read: None,
+                    content: metadata::Content::default(),
+                    placement: Placement::Contain,
+                },
+                views: views.clone(),
+                diagnostics: None,
+                pixel_trace: [None, None],
+                _arena: [Some(std::sync::Arc::new(ArenaTexture {
+                    surface: direct, texture: None, lifetime: None,
+                })), None],
+            };
+            // Deliberately different cached views expose an accidental scan on
+            // an unchanged source: the bindings must remain untouched here.
+            let unchanged = imported.ensure_source(device, &owner.queue, direct);
+            assert!(!unchanged.changed && unchanged.retired.is_none());
+            SurfaceRenderer::propagate_source_views(
+                &mut draws, device, &owner.layout, &owner.sampler, &imported, unchanged,
+            );
+            assert!(draws.values().all(|draw| draw.bindings == before_geometry));
+            let fallback = imported.ensure_source(device, &owner.queue, surface);
+            assert!(!fallback.changed && fallback.retired.is_none());
+
+            let mut incoming = direct;
+            incoming.frame.as_mut().unwrap().slot = 1;
+            incoming.frame.as_mut().unwrap().source_high += 1;
+            let inserted = imported.ensure_source(device, &owner.queue, incoming);
+            assert!(inserted.changed && inserted.retired.is_none()); // Empty slot still changed.
+            SurfaceRenderer::propagate_source_views(
+                &mut draws, device, &owner.layout, &owner.sampler, &imported, inserted,
+            );
+            assert!(draws.values().all(|draw| draw.views == imported.views));
+            let predecessor = std::sync::Arc::downgrade(imported._arena[1].as_ref().unwrap());
+            incoming.frame.as_mut().unwrap().source_high = direct.frame.unwrap().source_high;
+            let alias = imported.ensure_source(device, &owner.queue, incoming);
+            assert!(alias.changed && alias.retired.is_some());
+            assert!(predecessor.upgrade().is_some());
+            SurfaceRenderer::propagate_source_views(
+                &mut draws, device, &owner.layout, &owner.sampler, &imported, alias,
+            );
+            assert!(draws.values().all(|draw| draw.views == imported.views));
+            assert_eq!(imported.views[0], imported.views[1]);
+            assert!(predecessor.upgrade().is_none());
+            let repeated = imported.ensure_source(device, &owner.queue, incoming);
+            assert!(!repeated.changed && repeated.retired.is_none());
+            incoming.frame.as_mut().unwrap().source_high += 2;
+            let replaced = imported.ensure_source(device, &owner.queue, incoming);
+            assert!(replaced.changed && replaced.retired.is_some());
+            SurfaceRenderer::propagate_source_views(
+                &mut draws, device, &owner.layout, &owner.sampler, &imported, replaced,
+            );
+            assert!(draws.values().all(|draw| draw.views == imported.views));
+            // Comparison views and bindings drop before their imported backing.
+            drop(draws);
+            drop(imported);
+        });
+        drop(views);
+        texture.destroy();
     }
 
     #[test]

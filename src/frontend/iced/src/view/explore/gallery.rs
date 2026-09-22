@@ -278,7 +278,7 @@ pub(super) fn view<'a>(
     let overlay_controls = state.presented_filter(snapshot).map_or_else(
         || text("Overlays unavailable").into(),
         |request| {
-            super::overlay::view(&request.overlay, mutation_available, false).map(Message::Overlay)
+            super::overlay::view(request.overlay, mutation_available, false).map(Message::Overlay)
         },
     );
     let progress: Element<'a, Message> = model.explore.gallery_progress().map_or_else(

@@ -72,7 +72,7 @@ pub(super) fn view<'a>(
         .1;
     let overlay = state
         .presented_filter(model.explore.snapshot.as_ref())
-        .map_or_else(|| content.overlay().clone(), |request| request.overlay);
+        .map_or(content.overlay(), |request| request.overlay);
     let image = crate::view::image_viewer::image(
         content.configure_surface(surface, original, state.fit_revision),
         crate::presentation_surface::labels::Source::Detail(content.clone(), overlay.showlabels),
@@ -103,7 +103,7 @@ pub(super) fn view<'a>(
         )
         .id(super::DETAIL_ORIGINAL_ID),
         space::horizontal(),
-        super::overlay::view(&overlay, available, true).map(Message::Overlay),
+        super::overlay::view(overlay, available, true).map(Message::Overlay),
     ]
     .spacing(7)
     .align_y(Center);

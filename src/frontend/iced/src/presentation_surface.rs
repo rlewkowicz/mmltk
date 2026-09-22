@@ -208,13 +208,15 @@ impl<Message> shader::Program<Message> for Program<Message> {
             self.surface
         };
         if let Some(input) = &self.input {
-            let point = state
-                .viewport
-                .sample(bounds, cursor, surface, self.placement, false)
-                .map(|sample| crate::generated::WorkspacePoint {
-                    x: sample.content_x,
-                    y: sample.content_y,
-                });
+            let point = if matches!(event, Event::Window(iced::window::Event::RedrawRequested(_))) {
+                None
+            } else {
+                state.viewport.sample(bounds, cursor, surface, self.placement, false)
+                    .map(|sample| crate::generated::WorkspacePoint {
+                        x: sample.content_x,
+                        y: sample.content_y,
+                    })
+            };
             state.input.event(input, event, bounds, cursor, point);
         }
         state.viewport.update(
@@ -269,5 +271,56 @@ fn surface_for_content_session(content_session: u64) -> Surface {
         display_extent: None,
         viewer_identity: None,
         fit_revision: 0,
+    }
+}
+
+#[cfg(test)]
+mod redraw_tests {
+    use super::*;
+    use iced::widget::shader::Program as _;
+
+    #[test]
+    fn redraw_rebind_cancels_pressed_owner_without_projecting_a_point() {
+        use crate::generated::{PresentationSourceKind, WorkspaceMouseKind};
+        let (connection, _capture) = crate::transport_connection::Connection::test_channel();
+        let binding = crate::workspace_input::Binding::default()
+            .for_source(PresentationSourceKind::Explore, 1, None);
+        binding.set_connection(Some(connection.clone()));
+        let mut program = Program::<()> {
+            show_fps: true,
+            input: Some(binding.clone()),
+            surface: surface_for_content_session(1),
+            publish: None,
+            local: None,
+            placement: Placement::Contain,
+            control_id: "redraw.binding",
+        };
+        let mut state = WorkspaceViewport::default();
+        let bounds = Rectangle::with_size(iced::Size::new(640.0, 480.0));
+        let cursor = mouse::Cursor::Available(iced::Point::new(32.0, 48.0));
+        program.update(
+            &mut state,
+            &Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+            bounds,
+            cursor,
+        );
+        connection.flush(|_| Ok(())).unwrap();
+        program.input = Some(binding.for_source(PresentationSourceKind::Predict, 2, None));
+        let redraw = Event::Window(iced::window::Event::RedrawRequested(iced::time::Instant::now()));
+        program.update(&mut state, &redraw, bounds, cursor);
+        assert!(state.fps.is_some());
+        let mut cancel = crate::workspace_input::record(WorkspaceMouseKind::Cancel, None);
+        cancel.source = PresentationSourceKind::Explore;
+        cancel.documentepoch = 1;
+        cancel.peerepoch = 1;
+        let expected = crate::generated::encode_workspace_mouse(cancel).unwrap().encode().unwrap();
+        let mut output = Vec::new();
+        connection.flush(|bytes| {
+            output.push(bytes.to_vec());
+            Ok(())
+        }).unwrap();
+        assert_eq!(output, vec![expected]);
+        program.update(&mut state, &redraw, bounds, cursor);
+        connection.flush(|_| panic!("unchanged redraw emits no input")).unwrap();
     }
 }

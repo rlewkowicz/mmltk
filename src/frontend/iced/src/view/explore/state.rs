@@ -3,6 +3,21 @@ use crate::generated::{
 };
 use std::sync::{Arc, Mutex};
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PresentedFilter<'a> {
+    pub filter: &'a crate::generated::ExploreFilter,
+    pub overlay: &'a crate::generated::ExploreOverlay,
+}
+
+impl PresentedFilter<'_> {
+    pub fn to_owned(self) -> ExploreFilterUpdate {
+        ExploreFilterUpdate {
+            filter: self.filter.clone(),
+            overlay: self.overlay.clone(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub(super) struct GallerySource {
     dataset: u64,
@@ -389,19 +404,22 @@ impl State {
         self.submitted_filter = None;
     }
 
-    pub fn presented_filter(
-        &self,
-        snapshot: Option<&ExploreSnapshot>,
-    ) -> Option<ExploreFilterUpdate> {
+    pub fn presented_filter<'a>(
+        &'a self,
+        snapshot: Option<&'a ExploreSnapshot>,
+    ) -> Option<PresentedFilter<'a>> {
         self.submitted_filter
             .as_ref()
-            .map(|value| value.request.clone())
+            .map(|value| PresentedFilter {
+                filter: &value.request.filter,
+                overlay: &value.request.overlay,
+            })
             .or_else(|| {
                 snapshot
                     .filter(|value| value.ready)
-                    .map(|value| ExploreFilterUpdate {
-                        filter: value.filter.clone(),
-                        overlay: value.overlay.clone(),
+                    .map(|value| PresentedFilter {
+                        filter: &value.filter,
+                        overlay: &value.overlay,
                     })
             })
     }
@@ -1676,13 +1694,36 @@ mod tests {
     }
 
     #[test]
+    fn presented_filter_borrows_submitted_before_ready_and_edits_independently() {
+        let mut state = State::default();
+        let mut snapshot = explore_snapshot();
+        snapshot.ready = false;
+        assert!(state.presented_filter(None).is_none());
+        assert!(state.presented_filter(Some(&snapshot)).is_none());
+        snapshot.ready = true;
+        let presented = state.presented_filter(Some(&snapshot)).unwrap();
+        assert!(std::ptr::eq(presented.filter, &snapshot.filter));
+        assert!(std::ptr::eq(presented.overlay, &snapshot.overlay));
+        let mut owned = presented.to_owned();
+        owned.overlay.classselection.classes = vec![7, 2, 7];
+        assert_ne!(owned.overlay.classselection.classes, snapshot.overlay.classselection.classes);
+        state.record_submission(owned);
+        snapshot.ready = false;
+        let presented = state.presented_filter(Some(&snapshot)).unwrap();
+        let submitted = &state.submitted_filter.as_ref().unwrap().request;
+        assert!(std::ptr::eq(presented.filter, &submitted.filter));
+        assert!(std::ptr::eq(presented.overlay, &submitted.overlay));
+        assert!(std::ptr::eq(state.presented_filter(None).unwrap().overlay, &submitted.overlay));
+    }
+
+    #[test]
     fn optimistic_filter_survives_admission_and_clears_after_native_settlement() {
         let mut state = State::default();
         let mut snapshot = explore_snapshot();
         snapshot.ready = true;
         let request = submit_toggled_labels(&mut state, &snapshot);
         assert_eq!(
-            state.presented_filter(Some(&snapshot)),
+            state.presented_filter(Some(&snapshot)).map(PresentedFilter::to_owned),
             Some(request.clone())
         );
         state.record_admission(snapshot.revision);
@@ -1695,7 +1736,7 @@ mod tests {
         state.rebase(Some(&settled), false);
         assert!(state.submitted_filter.is_none());
         assert_eq!(
-            state.presented_filter(Some(&settled)),
+            state.presented_filter(Some(&settled)).map(PresentedFilter::to_owned),
             Some(ExploreFilterUpdate {
                 filter: settled.filter,
                 overlay: settled.overlay,

@@ -447,7 +447,7 @@ impl Component {
         )
         .then_some(role);
         if let Some((_, object)) = self.selected_object(model) {
-            self.reconcile_handle(&object.clone());
+            self.reconcile_handle(object);
         }
     }
 

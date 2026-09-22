@@ -72,6 +72,8 @@ pub(super) struct State {
     resize_previous_size: Option<iced::Size>,
     oversized_gallery: Option<(iced::Size, crate::generated::VisualExtent)>,
     selection_grid: Option<(u32, u32, u32, u64, u64)>,
+    detail_selection_step: u8,
+    detail_selection_redraw: bool,
 }
 impl Default for State {
     fn default() -> Self {
@@ -113,6 +115,8 @@ impl Default for State {
             resize_previous_size: None,
             oversized_gallery: None,
             selection_grid: None,
+            detail_selection_step: 0,
+            detail_selection_redraw: false,
         }
     }
 }
@@ -2944,7 +2948,52 @@ impl State {
                     )
                 });
                 if index == 8 {
-                    self.begin_upscale_series(widgets, driver, model, &snapshot.frame)
+                    use crate::generated::ExploreClassSelectionMode;
+                    let expected = match self.detail_selection_step {
+                        1 => ExploreClassSelectionMode::None,
+                        3 => ExploreClassSelectionMode::Subset,
+                        _ => ExploreClassSelectionMode::All,
+                    };
+                    if snapshot.overlay.classselection.mode != expected {
+                        return Task::none();
+                    }
+                    let Some(crate::presentation_surface::ExploreDisplay::Detail(shown, content)) =
+                        crate::presentation_surface::explore_display(surface)
+                    else { return Task::none(); };
+                    let Some(receipt) = current_receipt(explore::DETAIL_WORKSPACE_ID) else {
+                        return Task::none();
+                    };
+                    if content.overlay() != &snapshot.overlay || receipt.surface.frame != shown.frame {
+                        return Task::none();
+                    }
+                    // Re-arm the ordinary actual-draw observer once per settled
+                    // selection. Repeated ready draws reuse the same physical views,
+                    // independently of the next native class-control publication.
+                    if !self.detail_selection_redraw {
+                        self.detail_selection_redraw = true;
+                        probes.await_viewer_draw();
+                        rearm_viewer_observation();
+                        return Task::none();
+                    }
+                    reporting::emit(|sink| sink.record(
+                        "integration.viewer_class_selection", explore::DETAIL_WORKSPACE_ID,
+                        "paired-selection-retained-redraw",
+                        [self.detail_selection_step as f64, snapshot.frame.revision as f64,
+                         snapshot.overlay.classselection.classes.len() as f64,
+                         shown.frame.map_or(0, |frame| frame.slot) as f64],
+                    ));
+                    if self.detail_selection_step == 4 {
+                        return self.begin_upscale_series(widgets, driver, model, &snapshot.frame);
+                    }
+                    self.detail_selection_step += 1;
+                    self.detail_selection_redraw = false;
+                    probes.await_viewer_draw();
+                    rearm_viewer_observation();
+                    explore_message(explore::Message::Details(match self.detail_selection_step {
+                        1 => explore::details::Message::NoClasses,
+                        3 => explore::details::Message::ClassToggled(0),
+                        _ => explore::details::Message::AllClasses,
+                    }))
                 } else {
                     driver.phase = Phase::ViewerOverlay(index + 1);
                     widgets.arm(driver, overlay_control(index + 1, true))

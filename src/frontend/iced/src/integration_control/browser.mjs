@@ -564,13 +564,126 @@ export function mmltkIntegrationPrimaryActionMeasured(control, token, measured, 
     }
 }
 
-export function mmltkIntegrationWorkflowPixels(control, cssBounds, chart, progress, source, presentation, completed) {
+// Completed-layer oracle, independent of Rust caption caches and font shaping.
+// Backing-pixel coordinates bypass CSS conversion. Each of seven cases retains
+// at most eight bounded Det/hidden patches; proof never crosses patch identities.
+function workflowCaptionPixels(owner, canvas, snapshot, control, stage, caseIndex, patches) {
+  if (stage < 0) return;
+  if (!Number.isInteger(stage) || stage > 8 || !Number.isInteger(caseIndex) || caseIndex < 0 || caseIndex > 6 ||
+      patches.length > 80 || patches.length % 10 || !patches.every(Number.isFinite)) {
+    throw new Error('invalid workflow caption probe');
+  }
+  const evidence = owner.workflowCaptions ??= {cases: new Array(7)};
+  const geometry = JSON.stringify(patches);
+  let entry = evidence.cases[caseIndex];
+  if (!entry || entry.geometry !== geometry || stage === 0) {
+    entry = {geometry, patches: Array.from({length: patches.length / 10}, () => ({}))};
+    evidence.cases[caseIndex] = entry;
+  }
+  const matches = (pixels, offset, rgb, tolerance = 1) =>
+    rgb.every((channel, index) => Math.abs(channel - pixels[offset + index]) <= tolerance);
+  const samePixel = (left, right, offset) =>
+    Math.abs(left[offset] - right[offset]) <= 3 &&
+    Math.abs(left[offset + 1] - right[offset + 1]) <= 3 &&
+    Math.abs(left[offset + 2] - right[offset + 2]) <= 3;
+  const linear = value => value <= .04045 ? value / 12.92 : ((value + .055) / 1.055) ** 2.4;
+  const foreground = rgb => rgb[0] / 255 * .2126 + rgb[1] / 255 * .7152 + rgb[2] / 255 * .0722 > .55 ? 0 : 255;
+  const inspectLayer = (pixels, rgb) => {
+    const ink = foreground(rgb);
+    const channel = rgb.reduce((best, value, index) => Math.abs(ink - value) > Math.abs(ink - rgb[best]) ? index : best, 0);
+    const delta = ink - rgb[channel];
+    let backgrounds = 0;
+    const glyphs = [], inkPixels = [];
+    for (let offset = 0; offset < pixels.length; offset += 4) {
+      const alpha = delta === 0 ? 0 : (pixels[offset + channel] - rgb[channel]) / delta;
+      const linearBackground = linear(rgb[channel] / 255);
+      const linearDelta = ink / 255 - linearBackground;
+      const linearAlpha = linearDelta === 0 ? 0 :
+        (linear(pixels[offset + channel] / 255) - linearBackground) / linearDelta;
+      const encodedBlend = rgb.every((value, index) =>
+        Math.abs(pixels[offset + index] - (value + alpha * (ink - value))) <= 3);
+      const linearBlend = rgb.every((value, index) =>
+        Math.abs(linear(pixels[offset + index] / 255) -
+          (linear(value / 255) + linearAlpha * (ink / 255 - linear(value / 255)))) <= .015);
+      if (pixels[offset + 3] !== 255 || alpha < -.02 || alpha > 1.02 || (!encodedBlend && !linearBlend)) {
+        throw new Error('workflow caption contains another layer or loses its expected colors');
+      }
+      backgrounds += Number(matches(pixels, offset, rgb));
+      if (!matches(pixels, offset, rgb, 3)) inkPixels.push(offset);
+      if (Math.abs(delta) > 24 && Math.max(Math.abs(pixels[offset] - ink), Math.abs(pixels[offset + 1] - ink),
+        Math.abs(pixels[offset + 2] - ink)) <= 24) glyphs.push(offset);
+    }
+    if (!backgrounds) throw new Error('workflow caption explicit RGB is absent from its patch');
+    return {backgrounds, glyphs, inkPixels};
+  };
+  const mode = stage % 4;
+  let backgrounds = 0, glyphs = 0, compared = 0;
+  for (let offset = 0; offset < patches.length; offset += 10) {
+    const bounds = patches.slice(offset, offset + 4);
+    const gtRgb = patches.slice(offset + 4, offset + 7), detRgb = patches.slice(offset + 7, offset + 10);
+    if (bounds[2] <= 0 || bounds[3] <= 0 || bounds[2] > 512 || bounds[3] > 60 ||
+        [...gtRgb, ...detRgb].some(value => value < 0 || value > 255 || !Number.isInteger(value))) {
+      throw new Error('invalid workflow caption patch');
+    }
+    const left = Math.ceil(bounds[0]), top = Math.ceil(bounds[1]);
+    const right = Math.floor(bounds[0] + bounds[2]), bottom = Math.floor(bounds[1] + bounds[3]);
+    if (left < 0 || top < 0 || right > canvas.width || bottom > canvas.height || right <= left || bottom <= top ||
+        (right - left) * (bottom - top) > 32768) throw new Error('workflow caption patch is outside its bounded canvas region');
+    const pixels = snapshot.getImageData(left, top, right - left, bottom - top).data;
+    const index = offset / 10;
+    if (mode === 1) entry.patches[index] = {};
+    const patch = entry.patches[index];
+    if (mode === 1) {
+      const observed = inspectLayer(pixels, detRgb);
+      backgrounds += observed.backgrounds;
+      patch.det = pixels;
+      patch.detGlyphs = observed.inkPixels;
+      patch.detBackgrounds = observed.backgrounds;
+    } else if (mode === 2) {
+      for (let pixel = 0; pixel < pixels.length; pixel += 4) {
+        if (matches(pixels, pixel, gtRgb) || matches(pixels, pixel, detRgb)) {
+          throw new Error('hidden validation captions retained layer background pixels');
+        }
+      }
+      if (patch.detGlyphs?.some(pixel => samePixel(pixels, patch.det, pixel))) {
+        throw new Error('hidden validation captions retained detection glyph pixels');
+      }
+      patch.hidden = pixels;
+    } else if (mode === 3) {
+      const observed = inspectLayer(pixels, gtRgb);
+      backgrounds += observed.backgrounds;
+      glyphs += observed.glyphs.length;
+      if (patch.hidden && observed.inkPixels.some(pixel => samePixel(patch.hidden, pixels, pixel))) {
+        throw new Error('hidden validation captions retained ground-truth glyph pixels');
+      }
+      patch.gtBackgrounds = observed.backgrounds;
+      patch.gtGlyphs = observed.glyphs.length;
+    } else if (stage > 0 && patch.det && patch.hidden && patch.gtBackgrounds) {
+      if (pixels.length !== patch.det.length || pixels.some((channel, index) => channel !== patch.det[index])) {
+        throw new Error('detection captions do not completely cover ground-truth captions');
+      }
+      compared += pixels.length / 4;
+      patch.verified = patch.detBackgrounds > 0 && patch.gtGlyphs > 0;
+    }
+  }
+  const verified = evidence.cases.reduce((count, value) => count +
+    (value?.patches.filter(patch => patch.verified).length ?? 0), 0);
+  report({event: 'integration.workflow.caption_pixels', control, stage, case: caseIndex,
+    patches: entry.patches.length, backgrounds, glyphs, compared, verified});
+  if (stage === 8 && caseIndex === 6 && verified === 0) {
+    throw new Error('workflow did not verify overlapping GT glyphs and detection captions');
+  }
+}
+
+export function mmltkIntegrationWorkflowPixels(control, cssBounds, chart, progress, source, presentation,
+  captionStage, captionCase, captionPatches, completed) {
   completed = integrationCompletion(completed);
   const owner = integrationState;
   if (!owner || !integrationDriver) { completed('failed'); return; }
   const widget = chart || progress;
   const receipt = widget ? undefined : mmltkIntegrationProbe(control);
   cssBounds = Array.from(cssBounds);
+  captionPatches = Array.from(captionPatches);
   // Widget layout precedes the browser compositor. Sample the completed canvas
   // after two presentation opportunities, with bounded retries owned by Rust.
   integrationFrame(() => integrationFrame(() => {
@@ -594,6 +707,7 @@ export function mmltkIntegrationWorkflowPixels(control, cssBounds, chart, progre
       const bottom = Math.min(canvas.height, Math.floor(y + h * (progress ? 1 : 0.88)));
       if (right <= left || bottom <= top) throw new Error('workflow canvas region is not visible');
       const snapshot = canvasSnapshot(canvas);
+      workflowCaptionPixels(owner, canvas, snapshot, control, captionStage, captionCase, captionPatches);
       const pixels = snapshot.getImageData(left, top, right-left, bottom-top).data;
       let visible = 0;
       for (let offset=0; offset<pixels.length; offset+=4) {

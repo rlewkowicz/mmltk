@@ -14,7 +14,8 @@ pub(super) fn update(
 ) -> Result<crate::generated::ExploreOverlay, String> {
     let mut request = state
         .presented_filter(snapshot)
-        .ok_or_else(|| "Explore overlays are not installed".to_owned())?;
+        .ok_or_else(|| "Explore overlays are not installed".to_owned())?
+        .to_owned();
     match message {
         Message::LabelsToggled(value) => request.overlay.showlabels = value,
         Message::MasksToggled(value) => request.overlay.showmasks = value,
