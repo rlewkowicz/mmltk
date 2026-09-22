@@ -70,19 +70,29 @@ does not by itself establish a stall, completed work, or product performance.
 
 ### Benchmark image geometry
 
-`./mmltk --diagnose-benchmark-image --help` describes the required numeric image
-ID and repository-relative inputs. Repeat `--index PATH` to inspect version-3
-normalized annotation rows; use `--image PATH` for a cached image or
+`./mmltk --diagnose-benchmark-image --help` describes the numeric image ID and
+repository-relative inputs. Alternatively, `--compiled PATH --sample N`
+resolves a zero-based Explore sample to its source identity and compiled objects.
+Repeat `--index PATH` to inspect version-3 normalized annotation rows; add
+`--objects` for their object records. Use `--image PATH` for a cached image or
 `--archive PATH` to find the image in a retained tar archive. JSONL output includes
 dimensions, archive member, image identity, encoded SHA-256, and JPEG EXIF
 orientation when present. Headers establish geometry, not full decodability.
+`--parquet PATH` inspects the matching COCONut row's original embedded PNG and
+segment metadata; `--panoptic PATH` inspects an extracted panoptic PNG. These
+count exact RGB segment IDs and report each declared segment's pixel support
+when metadata is available. They compile a bounded diagnostic helper with the
+existing development compiler, native Arrow libraries, and vendored PNG decoder;
+no Python Parquet package or new dependency is installed.
 
 The command runs in the existing development image with networking disabled,
-read-only source mounts, no build or pull, and a ten-minute deadline. Optional
+read-only source mounts, no image build or pull, and a ten-minute deadline. Optional
 `--export` copies the matched encoded image to
 `build/validation/benchmark-image/ID.jpg` or `ID.png` for inspection, replacing
-an earlier diagnostic copy. It does not change the source cache. Tar scans are
-sequential, and each inspected image is bounded to 64 MiB.
+an earlier diagnostic copy. Mask inspection additionally exports the exact
+`ID.mask.png` and a segment-color visualization `ID.segments.png`. It does not
+change the source cache. Tar scans are sequential, and each inspected image is
+bounded to 64 MiB.
 
 ## Native CLI
 

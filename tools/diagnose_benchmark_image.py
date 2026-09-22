@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 import re
 import struct
+import subprocess
 import sys
 import tarfile
 
@@ -14,7 +15,39 @@ def report(**fields):
     print(json.dumps(fields), flush=True)
 
 
-def annotation_rows(path, image_id):
+def compiled_sample(path, sample):
+    with path.open("rb") as stream:
+        header = stream.read(8328)
+        if len(header) != 8328 or struct.unpack_from("<QI", header) != (0x464153544C445232, 9):
+            raise ValueError(f"unsupported compiled dataset: {path}")
+        count, width, height = struct.unpack_from("<III", header, 12)
+        index_offset, label_offset = struct.unpack_from("<QQ", header, 32)
+        if sample < 0 or sample >= count:
+            raise ValueError("sample index is outside the compiled dataset")
+        stream.seek(index_offset + sample * 40)
+        entry = stream.read(40)
+        if len(entry) != 40:
+            raise ValueError("truncated compiled image entry")
+        _, first_label, instances, _, label_bytes, source_width, source_height, has_id, source, _, image_id = struct.unpack("<QIHHIIIBBHQ", entry)
+        if label_bytes != instances * 60:
+            raise ValueError("compiled label count disagrees with byte extent")
+        stream.seek(label_offset + first_label)
+        labels = []
+        for _ in range(instances):
+            payload = stream.read(60)
+            if len(payload) != 60:
+                raise ValueError("truncated compiled label")
+            category, flags, x1, y1, x2, y2, mask_offset, mask_pairs, area, annotation_id, source_category, ordinal = struct.unpack("<BBffffQHdQQQ", payload)
+            class_name = header[80 + category * 32:112 + category * 32].split(b"\0", 1)[0].decode("utf-8")
+            labels.append(dict(class_id=category, class_name=class_name, flags=flags, bbox=[x1, y1, x2, y2],
+                               mask_pairs=mask_pairs, annotation_id=annotation_id, source_category_id=source_category, original_area=area))
+        report(kind="compiled_sample", path=str(path), sample=sample, image_count=count,
+               width=width, height=height, original_width=source_width, original_height=source_height,
+               source=source, image_id=image_id if has_id else None, instances=labels)
+        return image_id if has_id else None
+
+
+def annotation_rows(path, image_id, include_objects=False):
     # Version-3 normalized source cache; independent of the compiled .bin format.
     with path.open("rb") as stream:
         header = stream.read(256)
@@ -35,6 +68,20 @@ def annotation_rows(path, image_id):
                 if identity == image_id:
                     report(kind="annotation", path=str(path), row=start + index, image_id=identity,
                            width=width, height=height, shard=shard, first_box=first_box, boxes=boxes)
+                    if include_objects:
+                        box_offset = struct.unpack_from("<Q", header, 44)[0] + first_box * 64
+                        if boxes > 65535 or box_offset + boxes * 64 > path.stat().st_size:
+                            raise ValueError("normalized annotation slice exceeds admission")
+                        stream.seek(box_offset)
+                        payload = stream.read(boxes * 64)
+                        if len(payload) != boxes * 64:
+                            raise ValueError("truncated normalized annotations")
+                        for box in struct.iter_unpack("<ffffQIBB2xdQQQ", payload):
+                            x1, y1, x2, y2, _, pairs, category, flags, area, annotation_id, source_category, ordinal = box
+                            report(kind="annotation_object", path=str(path), image_id=identity, annotation_id=annotation_id,
+                                   class_id=category, source_category_id=source_category, flags=flags,
+                                   bbox=[x1, y1, x2, y2], mask_pairs=pairs, original_area=area, source_ordinal=ordinal)
+                    return
 
 
 def exif_orientation(payload):
@@ -111,16 +158,44 @@ def inspect_image(data, export, **identity):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--image-id", type=int, required=True)
+    parser.add_argument("--image-id", type=int)
+    parser.add_argument("--compiled", type=Path)
+    parser.add_argument("--sample", type=int, help="zero-based compiled sample index")
     parser.add_argument("--index", type=Path, action="append", default=[])
+    parser.add_argument("--objects", action="store_true", help="include normalized object records for each matching index row")
     parser.add_argument("--image", type=Path)
     parser.add_argument("--archive", type=Path)
+    parser.add_argument("--parquet", type=Path, help="inspect a raw COCONut mask and segment metadata")
+    parser.add_argument("--panoptic", type=Path, help="count RGB segment IDs in a retained panoptic PNG")
     parser.add_argument("--export", action="store_true", help="copy inspected image into build/validation/benchmark-image")
     args = parser.parse_args()
-    if args.image_id < 0 or args.image_id > 2**64 - 1:
+    if (args.compiled is None) != (args.sample is None):
+        parser.error("--compiled and --sample are required together")
+    if args.compiled:
+        identity = compiled_sample(args.compiled, args.sample)
+        if args.image_id is not None and identity != args.image_id:
+            parser.error("--image-id disagrees with the compiled sample")
+        args.image_id = identity
+    if args.image_id is None and not args.compiled:
+        parser.error("--image-id or --compiled with --sample is required")
+    if args.image_id is not None and (args.image_id < 0 or args.image_id > 2**64 - 1):
         parser.error("image ID must fit uint64")
+    if args.image_id is None and (args.index or args.image or args.archive or args.parquet or args.panoptic):
+        parser.error("this compiled sample has no source image ID")
+    if args.parquet or args.panoptic:
+        executable = Path("/evidence/diagnose_coconut_mask")
+        subprocess.run([
+            "/opt/gcc-16.2/bin/g++", "-std=c++26", "-O2",
+            "-isystem", "/opt/arrow/include", "-I/workspace/third_party/json/include", "-I/workspace/third_party/stb",
+            "/workspace/tools/diagnose_coconut_mask.cpp", "-L/opt/arrow/lib",
+            "-lparquet", "-larrow", "-larrow_bundled_dependencies", "-pthread", "-ldl",
+            "-o", str(executable),
+        ], check=True, timeout=120)
+        for mode, path in (("parquet", args.parquet), ("png", args.panoptic)):
+            if path:
+                subprocess.run([str(executable), mode, str(path), str(args.image_id), str(int(args.export))], check=True, timeout=120)
     for path in args.index:
-        annotation_rows(path, args.image_id)
+        annotation_rows(path, args.image_id, args.objects)
     if args.image:
         with args.image.open("rb") as stream:
             inspect_image(stream.read(64 * 1024 * 1024 + 1), args.export, path=str(args.image), image_id=args.image_id)
@@ -142,5 +217,5 @@ def main():
 if __name__ == "__main__":
     try:
         main()
-    except (OSError, ValueError, struct.error, tarfile.TarError) as error:
+    except (OSError, ValueError, struct.error, tarfile.TarError, subprocess.SubprocessError) as error:
         sys.exit(f"benchmark image diagnostic: {error}")
