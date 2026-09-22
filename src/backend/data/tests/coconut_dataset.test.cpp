@@ -2149,9 +2149,11 @@ TEST_CASE("COCONut recovers the complete dropped dog candidate set and carves so
  CHECK_THROWS(store_coconut_component(cache, component, mmltk::common::concurrency::CancellationObservation::Atomic(cancelled)));
  CHECK(file_bytes(cache) == settled);
  const auto failed = root.path() / "failed.normalized.bin";
- std::filesystem::create_directory(failed.string() + ".inventory");
+ const auto failed_completion = std::filesystem::path(failed.string() + ".complete.json");
+ mmltk::testsupport::write_text_file(failed_completion / "blocker", "retain");
  CHECK_THROWS(store_coconut_component(failed, component));
- CHECK_FALSE(std::filesystem::exists(failed.string() + ".complete.json"));
+ CHECK_FALSE(std::filesystem::is_regular_file(failed_completion));
+ CHECK_FALSE(load_coconut_component(failed, component.edition, component.source, component.input_identity));
  auto malformed = component;
  malformed.recovery.front().objects.front().original_annotation_id += 1;
  CHECK_THROWS(store_coconut_component(cache, malformed));
@@ -2398,7 +2400,7 @@ TEST_CASE("COCONut recovery reuses bounded image work across run geometry and ca
 }
 TEST_CASE("retained COCO source dogs recover exactly and remain disjoint after compiler mask projection", "[coconut][benchmark]") {
  ScopedTempDir root("coconut-source-recovery");
- const auto fixtures = std::filesystem::path(__FILE__).parent_path() / "fixtures/coconut_recovery";
+ const auto fixtures = std::filesystem::path(MMLTK_TEST_SOURCE_ROOT) / "src/backend/data/tests/fixtures/coconut_recovery";
  for (const unsigned id : {2212U, 400U}) {
   CAPTURE(id);
   const auto original = Json::parse(file_bytes(fixtures / (std::to_string(id) + ".originals.json")));
@@ -2527,6 +2529,11 @@ TEST_CASE("optional COCO split admission is independent and never conceals outpu
   const std::array<std::pair<std::string, std::string>, 1> rows{{{cold ? "annotations/instances_" + std::string(split) + ".json" : "annotations/unrelated.json",
    cold ? file_bytes(local.cache.source_indexes("coco") / (std::string(split) + ".fixture.json")) : "{}"}}};
   tar(archive_path, rows);
+ } else {
+  const std::array<std::pair<std::string, std::string>, 1> rows{{
+   {"annotations/instances_train2017.json", file_bytes(local.cache.source_indexes("coco") / "train2017.fixture.json")},
+  }};
+  tar(archive_path, rows);
  }
  if (unusable_document) {
   auto document = Json::parse(file_bytes(local.cache.source_indexes("coco") / "train2017.fixture.json"));
@@ -2548,7 +2555,7 @@ TEST_CASE("optional COCO split admission is independent and never conceals outpu
  mmltk::backend::data::testsupport::HttpServer server(server_payload);
  artifact.url = server.url("optional-split");
  artifact.expected_size = std::filesystem::file_size(archive_path);
- if (publication_failure) std::filesystem::create_directory(missing);
+ if (publication_failure) mmltk::testsupport::write_text_file(std::filesystem::path(missing.string() + ".complete.json") / "blocker", "retain");
  BenchmarkTraceSink trace;
  bool parser_entered = false, extraction_entered = false;
  ProgressReporter progress(

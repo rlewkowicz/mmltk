@@ -1043,8 +1043,10 @@ std::vector<DownloadResult> download_artifacts(const std::vector<DownloadRequest
  CurlMultiTransfers<Transfer> active(std::move(multi), "benchmark transfer");
  active.reserve(maximum_concurrency);
  const auto schedule_retry = [&](Transfer& transfer, const std::size_t request_index, const bool reset_partial, const CURLcode curl_code, const std::string& detail) {
-  throw_if_benchmark_cancelled(cancel_requested);
+  // Completed handles have left the active set, so cancellation cleanup cannot
+  // checkpoint them. Preserve their validators before propagating cancellation.
   if (!reset_partial) transfer.persist_partial_metadata();
+  throw_if_benchmark_cancelled(cancel_requested);
   reject_local_curl_failure(curl_code);
   if (reset_partial) {
    transfer.partial = ScopedFd{};

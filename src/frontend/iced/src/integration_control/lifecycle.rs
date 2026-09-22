@@ -633,8 +633,10 @@ impl State {
             Phase::AdvancedLayout(index) => widgets.arm(driver, advanced_layout_field(index).0),
             Phase::TriggerError => {
                 driver.phase = Phase::AwaitErrorModal;
+                // Reject an inactive operation through the ordinary UI handler.
+                // Start can first acquire a model and depends on external assets.
                 Task::done(RootMessage::Workspace(crate::view::router::Message::Train(
-                    train::Message::StartRequested,
+                    train::Message::TrainingStopRequested,
                 )))
             }
             Phase::AwaitErrorModal if model.error.is_some() => {
