@@ -12,6 +12,7 @@
 #include <functional>
 #include <list>
 #include <mutex>
+#include <new>
 #include <ranges>
 #include <string_view>
 #include <thread>
@@ -46,6 +47,35 @@ using mmltk::common::math::checked_cast;
 using mmltk::common::types::trim_http_field_value;
 namespace {
 using Clock = std::chrono::steady_clock;
+void reject_local_curl_failure(const CURLcode result) {
+ switch (result) {
+  case CURLE_OUT_OF_MEMORY: throw std::bad_alloc{};
+  case CURLE_UNSUPPORTED_PROTOCOL:
+  case CURLE_FAILED_INIT:
+  case CURLE_URL_MALFORMAT:
+  case CURLE_NOT_BUILT_IN:
+  case CURLE_READ_ERROR:
+  case CURLE_BAD_FUNCTION_ARGUMENT:
+  case CURLE_INTERFACE_FAILED:
+  case CURLE_UNKNOWN_OPTION:
+  case CURLE_SETOPT_OPTION_SYNTAX:
+  case CURLE_SSL_ENGINE_NOTFOUND:
+  case CURLE_SSL_ENGINE_SETFAILED:
+  case CURLE_SSL_ENGINE_INITFAILED:
+  case CURLE_SSL_CERTPROBLEM:
+  case CURLE_SSL_CIPHER:
+  case CURLE_SSL_CACERT_BADFILE:
+  case CURLE_SSL_CRL_BADFILE:
+  case CURLE_FILE_COULDNT_READ_FILE:
+  case CURLE_ABORTED_BY_CALLBACK:
+  case CURLE_AGAIN:
+  case CURLE_RECURSIVE_API_CALL:
+  case CURLE_UNRECOVERABLE_POLL:
+   throw std::runtime_error(std::string("local benchmark CURL failure: ") + curl_easy_strerror(result));
+  default: break;
+ }
+}
+
 void trace_transfer_progress(const BenchmarkTraceSink& trace, const DownloadRequest& request, const std::uint64_t completed, const std::uint64_t total,
                              const std::uint32_t attempt, const bool resumed, const std::uint64_t retained, const std::uint64_t durable,
                              const bool redownload) {
@@ -145,6 +175,9 @@ void append_transfer_bytes(std::uint64_t* write_offset, const DownloadWriteConte
    etag = metadata.value("etag", std::string{});
    last_modified = metadata.value("last_modified", std::string{});
    attempts = metadata.value("attempts", 0U);
+  } catch (const std::bad_alloc&) { throw;
+  } catch (const std::length_error&) { throw;
+  } catch (const std::overflow_error&) { throw;
   } catch (const std::exception&) { return std::nullopt; }
  }
  throw_if_benchmark_cancelled(cancel_requested);
@@ -305,6 +338,9 @@ struct Transfer {
     metadata_matches = metadata.value("schema_version", 0U) == kBenchmarkCacheSchemaVersion && metadata.value("url", std::string{}) == request.url;
     resume_etag = metadata.value("etag", std::string{});
     resume_last_modified = metadata.value("last_modified", std::string{});
+   } catch (const std::bad_alloc&) { throw;
+   } catch (const std::length_error&) { throw;
+   } catch (const std::overflow_error&) { throw;
    } catch (const std::exception&) { metadata_matches = false; }
   }
   if (!metadata_matches) {
@@ -550,6 +586,8 @@ struct IdentityProbe {
   const CURLcode result = curl_easy_perform(probe.easy.get());
   (void)curl_easy_getinfo(probe.easy.get(), CURLINFO_RESPONSE_CODE, &probe.http.response_code);
   if (probe.callback_error) { std::rethrow_exception(probe.callback_error); }
+  throw_if_benchmark_cancelled(cancel_requested);
+  reject_local_curl_failure(result);
   const bool valid_range = result == CURLE_OK && probe.http.response_code == 206L && probe.http.range && !probe.http.range->unsatisfied &&
                            probe.http.range->start == 0U && probe.http.range->end == 0U && probe.http.range->total == request.expected_size;
   const bool strong_etag = !probe.http.etag.empty() && !starts_with_case_insensitive(probe.http.etag, "W/");
@@ -704,6 +742,9 @@ private:
       segment.attempts = 0U;
      }
     }
+   } catch (const std::bad_alloc&) { throw;
+   } catch (const std::length_error&) { throw;
+   } catch (const std::overflow_error&) { throw;
    } catch (const std::exception&) { valid = false; }
   }
   if (!valid) {
@@ -889,16 +930,15 @@ struct SegmentTransfer {
      throw;
     }
    }
-   if (transfer.http.response_code == 200L) {
-    state.abandon_attempt(segment_index, attempt);
-    throw SegmentedDownloadUnsupported("server ignored a segmented byte range");
-   }
    const bool complete = result == CURLE_OK && transfer.response_headers_valid && transfer.write_offset == segment.end + 1U;
    if (transfer.response_headers_valid) {
     state.commit_attempt(segment_index, attempt_begin, transfer.transferred(), attempt);
    } else {
     state.abandon_attempt(segment_index, attempt);
    }
+   throw_if_benchmark_cancelled(cancel_requested);
+   reject_local_curl_failure(result);
+   if (transfer.http.response_code == 200L) { throw SegmentedDownloadUnsupported("server ignored a segmented byte range"); }
    if (complete) { break; }
    trace_benchmark_event(trace, "benchmark.download.segment_retry", [&] {
     return nlohmann::json{{"artifact", request.artifact_id},
@@ -1107,6 +1147,9 @@ std::vector<DownloadResult> download_artifacts(const std::vector<DownloadRequest
  active.reserve(maximum_concurrency);
  const auto schedule_retry = [&](Transfer& transfer, const std::size_t request_index, const bool reset_partial, const CURLcode curl_code,
                                  const std::string& detail) {
+  throw_if_benchmark_cancelled(cancel_requested);
+  if (!reset_partial) transfer.persist_partial_metadata();
+  reject_local_curl_failure(curl_code);
   if (reset_partial) {
    transfer.partial = ScopedFd{};
    std::error_code error;
@@ -1115,8 +1158,6 @@ std::vector<DownloadResult> download_artifacts(const std::vector<DownloadRequest
    error.clear();
    std::filesystem::remove(partial_metadata_path(transfer.request), error);
    if (error) { throw std::filesystem::filesystem_error("cannot reset benchmark partial metadata", partial_metadata_path(transfer.request), error); }
-  } else {
-   transfer.persist_partial_metadata();
   }
   trace_benchmark_event(trace, "benchmark.download.attempt_failed", [&] {
    return nlohmann::json{{"artifact", transfer.request.artifact_id},   {"attempt", transfer.attempt},    {"curl_code", static_cast<int>(curl_code)},
@@ -1153,6 +1194,9 @@ std::vector<DownloadResult> download_artifacts(const std::vector<DownloadRequest
      std::string detail = "invalid HTTP range response";
      try {
       std::rethrow_exception(transfer->callback_error);
+     } catch (const std::bad_alloc&) { throw;
+     } catch (const std::length_error&) { throw;
+     } catch (const std::overflow_error&) { throw;
      } catch (const std::exception& error) { detail = error.what(); } catch (...) {
       detail = "non-standard HTTP range callback exception";
      }

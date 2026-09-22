@@ -12,6 +12,9 @@
 #include <string_view>
 #include <stdexcept>
 namespace mmltk::backend::data::benchmark_internal {
+// Only remote/source unavailability or rejected response content. Local setup, allocation,
+// invalid requests, callback failures, storage failures, and cancellation propagate
+// separately and must never permit optional-source omission.
 class BenchmarkDownloadUnavailable final : public std::runtime_error {
 public:
  using std::runtime_error::runtime_error;

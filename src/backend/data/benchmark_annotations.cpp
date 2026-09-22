@@ -13,6 +13,7 @@
 #include <filesystem>
 #include <functional>
 #include <numeric>
+#include <new>
 #include <ranges>
 #include <span>
 #include <string_view>
@@ -1457,6 +1458,9 @@ std::optional<NormalizedAnnotationIndex> load_normalized_annotation_index(const 
                          {"mask_rle_pairs", index.mask_rle_pairs.size()}};
   });
   return index;
+ } catch (const std::bad_alloc&) { throw;
+ } catch (const std::length_error&) { throw;
+ } catch (const std::overflow_error&) { throw;
  } catch (const std::exception& error) {
   if (cancel_requested.requested()) { throw; }
   trace_benchmark_event(trace, "benchmark.annotations.cache_invalid", [&] { return nlohmann::json{{"path", path.string()}, {"error", error.what()}}; });

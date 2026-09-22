@@ -9,6 +9,9 @@
 #include <archive.h>
 #include <archive_entry.h>
 #include <algorithm>
+#include <cerrno>
+#include <new>
+#include <stdexcept>
 #include <memory>
 #include <span>
 #include <utility>
@@ -32,6 +35,16 @@ using ArchiveReader = std::unique_ptr<archive, ArchiveDestroy>;
  const char* message = archive_error_string(const_cast<archive*>(reader));
  return message != nullptr ? message : "unknown libarchive error";
 }
+[[noreturn]] void throw_archive_read_failure(archive* reader, const la_ssize_t status, const char* operation) {
+ const int error = archive_errno(reader);
+ if (error == ENOMEM) throw std::bad_alloc{};
+ const std::string message = std::string(operation) + " (status=" + std::to_string(status) + ", errno=" + std::to_string(error) + "): " + archive_error(reader);
+ // libarchive also uses EINVAL for malformed/truncated tar metadata and EILSEQ
+ // for source character encoding. Other positive errno values describe local
+ // file access, I/O, or resource failures, not rejected archive bytes.
+ if (error > 0 && error != EINVAL && error != EILSEQ) throw std::runtime_error(message);
+ throw AnnotationSourceUnavailable(message);
+}
 [[nodiscard]] std::filesystem::path extract_manifest_path(const std::filesystem::path& path) { return path.string() + ".extract.json"; }
 }  // namespace
 [[nodiscard]] std::string extract_archive_member(const std::filesystem::path& archive_path, const std::string_view member_suffix,
@@ -53,6 +66,9 @@ using ArchiveReader = std::unique_ptr<archive, ArchiveDestroy>;
      return identity;
     }
    }
+  } catch (const std::bad_alloc&) { throw;
+  } catch (const std::length_error&) { throw;
+  } catch (const std::overflow_error&) { throw;
   } catch (const std::exception& error) {
    trace_benchmark_event(trace, "benchmark.archive.extract_cache_invalid",
                          [&] { return nlohmann::json{{"member", member_suffix}, {"path", output_path.string()}, {"reason", error.what()}}; });
@@ -65,11 +81,14 @@ using ArchiveReader = std::unique_ptr<archive, ArchiveDestroy>;
  std::filesystem::remove(completion, remove_error);
  if (remove_error) { throw std::filesystem::filesystem_error("cannot remove invalid extraction metadata", completion, remove_error); }
  ArchiveReader reader(archive_read_new());
- if (!reader) { throw std::runtime_error("cannot allocate benchmark annotation archive reader"); }
+ if (!reader) { throw std::bad_alloc{}; }
  if (archive_read_support_filter_all(reader.get()) < ARCHIVE_WARN || archive_read_support_format_tar(reader.get()) < ARCHIVE_WARN ||
-     archive_read_support_format_zip(reader.get()) < ARCHIVE_WARN ||
-     archive_read_open_filename(reader.get(), archive_path.c_str(), kArchiveReadBufferBytes) < ARCHIVE_WARN) {
-  throw AnnotationSourceUnavailable("cannot open benchmark annotation archive: " + archive_error(reader.get()));
+     archive_read_support_format_zip(reader.get()) < ARCHIVE_WARN) {
+  throw std::runtime_error("cannot configure benchmark annotation archive reader: " + archive_error(reader.get()));
+ }
+ const int open_status = archive_read_open_filename(reader.get(), archive_path.c_str(), kArchiveReadBufferBytes);
+ if (open_status < ARCHIVE_WARN) {
+  throw_archive_read_failure(reader.get(), open_status, "cannot open benchmark annotation archive");
  }
  archive_entry* entry = nullptr;
  bool found = false;
@@ -83,13 +102,13 @@ using ArchiveReader = std::unique_ptr<archive, ArchiveDestroy>;
   int status = ARCHIVE_RETRY;
   for (std::uint32_t retry = 0U; status == ARCHIVE_RETRY && retry < 8U; ++retry) { status = archive_read_next_header(reader.get(), &entry); }
   if (status == ARCHIVE_EOF) { break; }
-  if (status != ARCHIVE_OK && status != ARCHIVE_WARN) { throw AnnotationSourceUnavailable("cannot read benchmark annotation archive: " + archive_error(reader.get())); }
+  if (status != ARCHIVE_OK && status != ARCHIVE_WARN) { throw_archive_read_failure(reader.get(), status, "cannot read benchmark annotation archive"); }
   const char* pathname = archive_entry_pathname(entry);
   const std::string_view name = pathname != nullptr ? std::string_view(pathname) : std::string_view{};
   if (!name.ends_with(member_suffix)) {
    int skip_status = ARCHIVE_RETRY;
    for (std::uint32_t retry = 0U; skip_status == ARCHIVE_RETRY && retry < 8U; ++retry) { skip_status = archive_read_data_skip(reader.get()); }
-   if (skip_status < ARCHIVE_WARN) { throw AnnotationSourceUnavailable("cannot skip benchmark annotation archive member"); }
+   if (skip_status < ARCHIVE_WARN) { throw_archive_read_failure(reader.get(), skip_status, "cannot skip benchmark annotation archive member"); }
    continue;
   }
   if (found || archive_entry_filetype(entry) != AE_IFREG || archive_entry_size(entry) <= 0) {
@@ -111,7 +130,8 @@ using ArchiveReader = std::unique_ptr<archive, ArchiveDestroy>;
    for (std::uint32_t retry = 0U; count == ARCHIVE_RETRY && retry < 8U; ++retry) {
     count = archive_read_data(reader.get(), buffer.data(), std::min(buffer.size(), remaining));
    }
-   if (count <= 0) { throw AnnotationSourceUnavailable("cannot read complete benchmark annotation archive member"); }
+   if (count < 0) { throw_archive_read_failure(reader.get(), count, "cannot read benchmark annotation archive member"); }
+   if (count == 0) { throw AnnotationSourceUnavailable("cannot read complete benchmark annotation archive member"); }
    staging.pwrite_all(buffer.data(), common_math::checked_cast<std::size_t>(count, "archive read overflow"),
                       common_math::checked_cast<std::size_t>(offset, "archive write offset overflow"));
    offset += common_math::checked_cast<std::uint64_t>(count, "archive read overflow");
@@ -152,6 +172,9 @@ using ArchiveReader = std::unique_ptr<archive, ArchiveDestroy>;
   const nlohmann::json manifest = read_json_file(path.string() + ".complete.json");
   const std::string digest = manifest.at("annotation_sha256").get<std::string>();
   return load_normalized_annotation_index(path, source, split, digest, cancel_requested, trace);
+ } catch (const std::bad_alloc&) { throw;
+ } catch (const std::length_error&) { throw;
+ } catch (const std::overflow_error&) { throw;
  } catch (const std::exception&) {
   throw_if_benchmark_cancelled(cancel_requested);
   return std::nullopt;
@@ -332,6 +355,8 @@ CocoAnnotationIndexes CocoAnnotationCache::take_indexes() {
   account(json.string() + ".extract.json");
  }
  indexes_.retained_storage_bytes = storage;
- return std::move(indexes_);
+ auto result = std::move(indexes_);
+ lease_ = ArtifactLease{};
+ return result;
 }
 }  // namespace mmltk::backend::data::benchmark_internal

@@ -9,6 +9,9 @@
 #include "benchmark_http_fixture.h"
 #include "src/backend/data/compiled_dataset.h"
 #include <sys/stat.h>
+#include <sys/file.h>
+#include <cerrno>
+#include "src/common/io/file_memory.h"
 #include "src/backend/data/benchmark_dataset_options.h"
 #include "src/test_support/filesystem_test_utils.hpp"
 #include <arrow/api.h>
@@ -2550,7 +2553,7 @@ TEST_CASE("optional COCO split admission is independent and never conceals outpu
  const auto train = local.cache.source_indexes("coco") / "train2017.normalized.bin";
  const auto validation = local.cache.source_indexes("coco") / "val2017.normalized.bin";
  bool missing_train = true, initial_failure = false, publication_failure = false, required_validation = true, cold = false;
- bool local_parser_failure = false;
+ bool local_parser_failure = false, local_archive_failure = false;
  unsigned unusable_document = 0;
  SECTION("missing optional train preserves discovered required validation") {}
  SECTION("missing optional validation preserves discovered train") { missing_train = false; required_validation = false; }
@@ -2558,6 +2561,7 @@ TEST_CASE("optional COCO split admission is independent and never conceals outpu
  SECTION("initial download failure returns independently admitted optional train") { initial_failure = true; missing_train = false; required_validation = false; }
  SECTION("optional output publication failure remains fatal") { publication_failure = true; }
  SECTION("local parser file opening failure remains fatal") { local_parser_failure = true; }
+ SECTION("local archive file opening failure remains fatal") { local_archive_failure = true; }
  SECTION("optional malformed document is unavailable") { unusable_document = 1; }
  SECTION("optional category metadata rejection is unavailable") { unusable_document = 2; }
  SECTION("optional mistyped image metadata is unavailable") { unusable_document = 3; }
@@ -2572,7 +2576,7 @@ TEST_CASE("optional COCO split admission is independent and never conceals outpu
  remove_cache_path(missing.string() + ".complete.json");
  auto artifact = catalog.coco_annotations;
  const auto archive_path = local.cache.source_downloads("coco") / artifact.filename;
- if (!publication_failure && !local_parser_failure) {
+ if (!publication_failure && !local_parser_failure && !local_archive_failure) {
   const auto split = missing_train ? "val2017" : "train2017";
   const std::array<std::pair<std::string, std::string>, 1> rows{{{
    cold ? "annotations/instances_" + std::string(split) + ".json" : "annotations/unrelated.json",
@@ -2600,8 +2604,12 @@ TEST_CASE("optional COCO split admission is independent and never conceals outpu
  artifact.expected_size = std::filesystem::file_size(archive_path);
  if (publication_failure) std::filesystem::create_directory(missing);
  BenchmarkTraceSink trace;
- bool parser_entered = false;
+ bool parser_entered = false, extraction_entered = false;
  ProgressReporter progress([&](const BenchmarkCompileProgress& update) {
+  if (local_archive_failure && update.activity == "Extracting COCO train annotations") {
+   extraction_entered = true;
+   REQUIRE(std::filesystem::remove(archive_path));
+  }
   if (local_parser_failure && update.activity == "Parsing and indexing COCO train annotations") {
    parser_entered = true;
    // Remove the already-extracted input at the ordinary progress boundary.
@@ -2619,9 +2627,10 @@ TEST_CASE("optional COCO split admission is independent and never conceals outpu
   cache.download_unavailable(BenchmarkDownloadUnavailable("fixture source unavailable"), progress);
  else {
   auto archive = download_artifacts({*cache.pending_download()}, 1, {}).front();
-  if (publication_failure || local_parser_failure) {
+  if (publication_failure || local_parser_failure || local_archive_failure) {
    CHECK_THROWS(cache.settle(std::move(archive), progress, 1, completed, 2));
    CHECK(parser_entered == local_parser_failure);
+   CHECK(extraction_entered == local_archive_failure);
    CHECK(server.requests() == 0);
    CHECK(completed == 1);
    CHECK_THROWS(cache.take_indexes());
@@ -2630,7 +2639,13 @@ TEST_CASE("optional COCO split admission is independent and never conceals outpu
   }
   cache.settle(std::move(archive), progress, 1, completed, 2);
  }
+ // Probe the real source lease without sleeps or a potentially hanging waiter.
+ const auto lease_probe = mmltk::common::io::FileHandle::open_readonly((local.cache.locks / "coco-annotations.lifecycle.lock").string());
+ REQUIRE(::flock(lease_probe.get(), LOCK_EX | LOCK_NB) == -1);
+ REQUIRE(errno == EWOULDBLOCK);
  const auto indexes = cache.take_indexes();
+ REQUIRE(::flock(lease_probe.get(), LOCK_EX | LOCK_NB) == 0);
+ CHECK(::flock(lease_probe.get(), LOCK_UN) == 0);
  CHECK(indexes.train.has_value() == !missing_train);
  CHECK(indexes.validation.has_value() == missing_train);
  if (!cold) CHECK(file_bytes(retained) == retained_bytes);

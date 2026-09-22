@@ -2224,7 +2224,13 @@ TEST_CASE("ordinary transfer observations exclude discarded bodies and settle un
  bool unknown = false;
  bool retry = false;
  bool redirect = false;
+ bool invalid_request = false, segmented_probe = false;
  std::uint64_t retained = 0U;
+ SECTION("invalid local protocol remains fatal") {
+  invalid_request = true;
+  SECTION("ordinary transfer") {}
+  SECTION("segmented identity probe") { segmented_probe = true; }
+ }
  SECTION("unknown length") {
   unknown = true;
   server.OmitContentLength();
@@ -2244,6 +2250,29 @@ TEST_CASE("ordinary transfer observations exclude discarded bodies and settle un
  }
  DownloadRequest request{
   "coco-observed", server.url("artifact"), root.path() / "artifact.bin", root.path() / "artifact.lock", unknown ? 0U : payload.size(), {}, 2U};
+ if (invalid_request) {
+  request.url = "unsupported-benchmark-protocol://artifact";
+  if (segmented_probe) request.expected_size = 512ULL * 1024U * 1024U;
+  bool local_failure = false;
+  unsigned retries = 0;
+  try {
+   (void)download_artifacts({request}, segmented_probe ? 2U : 1U, {}, {}, [&](std::string_view event, const auto&) {
+    if (event == "benchmark.download.attempt_failed" || event == "benchmark.download.segmented_probe_retry") ++retries;
+   });
+  } catch (const BenchmarkDownloadUnavailable&) {
+   FAIL("invalid local protocol became optional source unavailability");
+  } catch (const std::runtime_error& error) {
+   local_failure = true;
+   CHECK(std::string_view(error.what()).starts_with("local benchmark CURL failure:"));
+  }
+  CHECK(local_failure);
+  CHECK(retries == 0);
+  CHECK(server.requests() == 0);
+  CHECK_FALSE(fs::exists(request.destination));
+  CHECK_FALSE(fs::exists(request.destination.string() + ".download.json"));
+  server.Check();
+  return;
+ }
  if (retained != 0U) {
   std::ofstream partial(request.destination.string() + ".part", std::ios::binary);
   partial.write(reinterpret_cast<const char*>(payload.data()), static_cast<std::streamsize>(retained));
