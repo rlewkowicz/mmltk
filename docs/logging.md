@@ -232,6 +232,8 @@ members into their `.history` directories. A transcript captured by the caller
 is another source; it does not substitute for independently owned native or
 browser evidence. The headless supervisor owns a separate unique artifact
 directory, described in [headless Wayland](headless-wayland.md).
+Use [capture selection](#select-captures-and-histories) to find the scenario's
+archived family after later browser lifetimes have rotated it.
 
 Enabled acceptance requires complete physical and rendered evidence.
 Missing-record exceptions cannot establish a successful handoff or sample.
@@ -326,6 +328,8 @@ record UI interaction and pixels separately from physical resource custody:
 | `integration.workflow.completed` | Typed Train, dashboard interaction/aspect, Validate, compiled/image/video Predict, Stop, theme, and narrow-layout stage completion |
 | `integration.workflow.pixels` | Actual sampled/visible canvas pixel counts for charts, the live progress bar, validation atlas/detail, and prediction stages; image captures retain the expected source/presentation revisions |
 | `integration.workflow.progress` | Native completed/total image counts and epoch facts at the live progress capture |
+| `integration.workflow.caption_pixels` | Caption case/stage, patch count, observed background/glyph pixels, compared pixels, and currently verified overlap patches from the actual canvas |
+| `integration.workflow.caption_geometry` | Opt-in bounded clip and candidate GT/Det label rectangles when the workflow finds no eligible overlapping caption patch |
 | `integration.metric_projection` | Finite sample count, connected-segment count, and total projected entries for a Train curve |
 | `integration.metric_values` | First and last finite projected points for the named curve |
 | `integration.chart_view` | Settled camera ranges at retained-view interaction stages |
@@ -354,6 +358,29 @@ workflow case requires both semantic completion and actual canvas observations.
 A sparse chart can legitimately have finite samples but no connected segments
 when records are missing; its markers preserve those observations without
 joining gaps.
+
+Validation caption evidence uses seven cases: atlas cells 0–5 and detail case
+6. Stages 0–8 start with both layers, then repeat Det-only, hidden, GT-only, and
+both twice. Thus a complete workflow observes 63 distinct case/stage pairs;
+repeated captures can add records without adding cases. Each case holds at most
+eight patches selected from paired native bounds and explicit RGB, separately
+from the rendering caption cache. The browser oracle requires actual layer
+backgrounds, checks hidden pixels, and compares the restored combined patch
+byte-for-byte with Det-only pixels. Final completion also requires a patch with
+observed GT glyphs covered by Det captions. Empty patch sets or geometry records
+alone cannot prove that overlap.
+
+`verified` on caption-pixel records counts currently verified patches across
+cases. It can decrease when a new visibility cycle or changed geometry resets
+a case's evidence. `backgrounds`, `glyphs`, and `compared` describe the current
+stage's work. Geometry records carry
+`control`, a `detail` describing the clip or layer/text/scale, and rectangle
+`x`, `y`, `width`, `height` as strings in fields `a`, `b`, `c`, `d`. At most
+16 candidate labels per layer are reported per selection attempt, only while
+integration reporting is enabled. The
+[workflow fixture](validation.md#packaged-wayland-acceptance) establishes the
+overlap using a real native checkpoint; these records describe its rendered
+observations rather than production model accuracy.
 
 Atlas canvas sampling uses one snapshot of the current canvas. For each ready
 tile, its interior is intersected with the actual draw clip; at most nine
@@ -447,8 +474,9 @@ Quote values containing spaces or punctuation.
 
 Missing fields do not satisfy comparisons, including `!=`; `NOT` can include
 them. `has(field)` tests presence, including null and zero. `--errors` adds
-`@error=true`; it is a broad failure-candidate search aid, not a diagnosis.
-An `error=0` metric alone is not an error.
+`@error=true`; it and failure-candidate counts are broad search aids, not test
+verdicts. Use terminal status and the owning suite's assertions to establish
+success or failure. An `error=0` metric alone is not an error.
 
 ## Fields and correlation
 
@@ -621,6 +649,26 @@ Mozilla main/child filenames retain physical and logical child identities;
 each process can have four bounded module-log rotation files. Native
 application rotations `STEM-application.1.log` through `.5.log` also belong
 to that family.
+
+Each new logged Wayland browser lifetime rotates the prior family, including
+successful workflow captures. The current `latest-wayland-test` members therefore
+describe the latest logged lifetime, not every scenario in the suite. Successful
+caption and other browser diagnostics live in the matching Firefox artifact;
+the Catch transcript need not repeat them. List the runs, select the workflow archive,
+then query its successful observations explicitly. For example, replace
+`ARCHIVE_ID` with the returned identity:
+
+```bash
+./mmltk --logs --family latest-wayland-test --run ARCHIVE_ID --strict \
+  -q '@event=integration.workflow.caption_pixels' \
+  --fields @event,case,stage,patches,backgrounds,glyphs,compared,verified \
+  --format jsonl --limit 100
+```
+
+An empty result from a later capture does not establish that earlier records
+are missing.
+`--strict` checks parsing of the selected inputs; successful parsing and record
+presence remain separate from the rendered assertions and test outcome.
 
 The current Wayland harness uses one rotation identity for its artifact family.
 Older or independently produced captures can have separate rotation IDs.

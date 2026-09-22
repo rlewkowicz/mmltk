@@ -13,22 +13,24 @@
 - [RF-DETR workflows and artifacts](rfdetr-workflows.md): model/class admission,
   GPU normalization, physical candidate ranking, separate candidate/COCO limits,
   shared weights selection, Transfer/Resume, automatic/manual output, training
-  inputs and live progress, EMA, saved history,
-  evaluation metrics and samples, and incremental image/video prediction.
+  inputs and live progress, EMA, saved history, compact matcher costs,
+  evaluation metrics and samples, packed mask delivery,
+  deterministic export ordering, and incremental image/video prediction.
 
 ## Architecture and frameworks
 
 - [Architecture and source guide](architecture.md): entrypoints, native systems,
-  shared native/image facilities, reflected CLI and persistence boundaries,
+  shared byte/image facilities, reflected CLI and persistence boundaries,
   serialization ownership and lookup, generated bindings, frontend components,
   and vendor ownership.
 - [GUI interaction and presentation](gui-interaction.md): application wire
   formats, workflow layout and navigation, Dataset recipe/validation/recovery
-  controls, the retained training dashboard,
-  fixed Validation metrics/atlas, the shared image viewer and primary actions,
-  retained numeric editing and captions, shared immediate mouse input, native
-  command settlement, Annotation content/damage, retained Explore measurements
-  and gallery recovery, paired image geometry, the Original display choice,
+  controls, the retained training dashboard, fixed Validation metrics/atlas,
+  the shared image viewer and primary actions,
+  retained numeric editing, prepared captions and texture bindings, shared
+  immediate mouse input, native command settlement, Annotation mask work and
+  content/damage, retained Explore measurements and gallery recovery,
+  paired image geometry, the Original display choice,
   upscaling the selected source, importing displayed crop/aspect, direct/copy
   acquisition, retained redraws, FPS, and resource lifetime.
 
@@ -45,10 +47,10 @@
   counts, append-only rejection history, shared persistent cache/repair, stock
   annotation reuse, progress units, partial downloads, and format/capacity limits.
 - [GPU execution and image loading](gpu-execution.md): device/NUMA placement,
-  H2D and GDRCopy, reusable checkpoint/export readbacks, Vulkan allocation and
-  CUDA import, independent display/compute selection and damage transfers,
-  Upscale input preparation and warming, provider capture, and capability
-  inspection.
+  H2D and GDRCopy, RGB8 preview storage, reusable checkpoint/export readbacks,
+  Vulkan allocation and CUDA import, independent display/compute selection,
+  bounded sparse damage transfers, Upscale input preparation and warming,
+  provider capture, and capability inspection.
 
 ## Engineering, validation, and operations
 
@@ -61,8 +63,8 @@
   input seat, readiness, deadlines, shutdown, and artifacts.
 - [Logging](logging.md): fatal stderr reports, explicit diagnostic activation,
   benchmark cache/archive/transfer traces, pixel probes, artifact ownership,
-  rendered UI evidence, nested-field queries, Vulkan/FD provenance, correlation,
-  and triage.
+  rendered UI and caption evidence, archived-run selection, nested-field queries,
+  Vulkan/FD provenance, correlation, and triage.
 - [Planned work](roadmap.md): future directions rather than current capability.
 
 `CONTRACT.md` owns high-level architecture and component handoffs. This wiki

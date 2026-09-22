@@ -126,7 +126,9 @@ owns both execution and the corresponding `--no-run` check commands.
 
 These are first-party application suites. `browser-runtime` exercises desktop
 startup and process ownership with fixtures; `workspace-wayland` runs the
-packaged application. Neither is a Firefox-specific test runner.
+packaged application. Firefox coverage remains indirect through these routes,
+under the [repository test policy](../AGENTS.md#tests); Firefox-owned suites are
+outside the permitted test set.
 
 | Suite | Selection |
 | --- | --- |
@@ -391,6 +393,15 @@ separate `lifecycle`, `retained`, `annotation_product`, and `workflows`
 scenario modules, with shared widget, pixel, and probe helpers. Its private
 reporting owner remains effect-only.
 
+The JSONL cursor reads one captured file extent in 16 KiB chunks, appending
+newline-delimited segments into a retained buffer capped at 64 KiB per line.
+Later appends wait for the next notification. Malformed native JSON, overflow,
+truncation, and an incomplete final native record remain failures. Native
+probe reconciliation searches the selected generation's ordered frame range;
+when a source revision is fixed, browser checks establish matching slot identity
+before one geometry scan. Evidence ordinals, predecessor/suffix rules,
+independent stream drains, and late-conflict rejection still govern those joins.
+
 The workflow case uses
 [native model/video fixtures](../src/acceptance/tests/workflow_wayland_inputs.cpp)
 and the real packaged desktop's sibling CLI, prediction, and validation systems.
@@ -401,6 +412,15 @@ progress bar, all six thumbnails, detail, each prediction source, retained Stop
 output, and theme/narrow layouts. Progress evidence pairs the bar capture with
 observed native image counts during the Train phase; hidden-tab evidence then
 requires metric sequence advancement.
+
+The workflow fixture keeps a real six-query native detector. It calibrates its
+checkpoint against the model's actual selected proposals so detection captions
+overlap the synthetic ground-truth boxes; its Validation request uses FP32 to
+match that calibration. Training still updates the real model. The independent
+[caption canvas oracle](logging.md#rendered-ui-acceptance-evidence) cycles GT/Det
+visibility across atlas and detail, requires visible glyph evidence, and checks
+that Det captions cover GT captions. Native completion or caption-cache contents
+cannot substitute for those pixels.
 
 The same case pans the chart and changes its legend through browser input,
 then requires settled camera/legend retention through expansion, return to the
@@ -504,24 +524,25 @@ sessions retain ordinary clipboard permissions.
 
 | Existing target | Evidence it owns |
 | --- | --- |
-| `mmltk_controller_annotation_tests` | Independent input/render progress, native hit testing, document/history/save behavior, immutable scene reuse, complete journal moves, packed upload reuse and allocation-local damage, stable target identity through Undo/Redo, retained input pressure, ordered command continuations, fractional raster boundaries, Original crop/aspect materialization, masks beyond boxes and present-empty masks, rejection, and cancellation |
+| `mmltk_controller_annotation_tests` | Independent input/render progress, normalized-run hit testing, disk cleanup against scalar support, document/history/save behavior, immutable scene reuse, complete journal moves, packed upload reuse and allocation-local damage, stable target identity through Undo/Redo, retained input pressure, ordered command continuations, fractional raster boundaries, Original crop/aspect materialization, masks beyond boxes and present-empty masks, rejection, and cancellation |
 | `mmltk_controller_services_tests` | Counter-read interruption/size/error policies, reflected named settings including benchmark choices, independent optional-test settings, training command construction, current-format saved history, bounded cursor reads, directory replacement/truncation, and output/resume admission |
-| `mmltk_controller_data_compute_systems_tests` | Start/input admission including absent or incompatible optional test splits, selected validation results and retained sample/detail custody, optional preview failure, incremental prediction, and video playback cancellation |
-| `mmltk_controller_browser_tests` and `mmltk_frameworks_serialization_tests` | Reflected field/enum/schema and graphics ABI facts, nested/array metric projection fixtures, package fixtures, positional output versus named persistence, named-field lookup/error precedence, exact CBOR bytes and split owned/borrowed payloads, lossless compact input, and control receipts |
+| `mmltk_controller_data_compute_systems_tests` | Start/input admission including absent or incompatible optional test splits, selected validation results and retained sample/detail custody, compact RGB8 preview transfers/reuse and failure, incremental prediction, and video playback cancellation |
+| `mmltk_controller_browser_tests` and `mmltk_frameworks_serialization_tests` | Reflected field/enum/schema and graphics ABI facts, nested/array metric projection fixtures, package fixtures, positional output versus named persistence, named-field lookup/error precedence, exact CBOR bytes and borrowed map keys, split owned/borrowed payloads, UTF-8 block/page tails, lossless compact input, and control receipts |
 | `mmltk_frameworks_transport_tests` | Peer replacement, reconnect, output continuity, ring wrap, and transport custody |
 | `mmltk_controller_explore_tests` | Explore domain admission, settings/filter persistence, thumbnail identity, viewport priority, augmentation refresh, staged replacement, cancellation, and failure |
 | `mmltk_controller_upscale_tests` | Exact receiver copies, complete retained writes, semantic-only clean preservation, checked output geometry, paired source extent, retained derived results, once-only warm admission, provider readiness/fallback, activation, cancellation, and resource retirement |
 | `mmltk_controller_live_tests` | Complete retained capture writes, receiver completion/failure, held readers, queued cancellation, and settled snapshots |
 | `mmltk_controller_visual_systems_tests` | Shared visual runtime, presentation protocol/custody, native gallery cache/priority/atlas integration, acceptance gates, and cross-system workspace behavior |
-| `mmltk_frameworks_gpu_tests` | Independent raw-product/display storage, late workspace admission and availability wakes, Vulkan-owned CUDA import and backing lifetime, complete receiver/device transfers, cropped display coverage and scratch custody, acquisition/release/settlement, pressure, failure, and retirement |
+| `mmltk_frameworks_gpu_tests` | Independent raw-product/display storage, late workspace admission and availability wakes, Vulkan-owned CUDA import and backing lifetime, complete receiver/device transfers, sparse display coverage/coarsening/history recovery and scratch custody, acquisition/release/settlement, pressure, failure, and retirement |
 | `mmltk_acceptance` | Compiled-dataset Explore integration, retained residency, projection, control-reader settlement, independent prepared/released artifacts, and bounded fatal reporting with disabled/uninitialized/failed sinks and broken pipes |
 | `mmltk_entrypoints_cli_tests` and `mmltk_entrypoints_tools_tests` | Reflected CLI parsing, scalar/item/fixed-capacity error precedence and unchanged rejected destinations; CLI/ONNX fatal stderr, logging overrides and named file identities, and command exit behavior |
 | `mmltk_common_concurrency_tests` | Borrowed cancellation, scoped stop-token bridging, pre-requested/concurrent cancellation, unwind, and source destruction policy |
 | `mmltk_entrypoints_desktop_tests` and `mmltk_controller_firefox_process_tests` | Desktop startup/child failure status, exact launch OS errors, unexpected signal reporting, and quiet requested shutdown |
 | `mmltk_backend_imaging_explore_tests` | Rendered-card geometry, semantic planes, filtered padding fringes, and exact two-sided copy evidence |
+| `mmltk_backend_imaging_annotation_tests` | Resolved-mask foreground support, tight bounds, empty masks, and HSV filtering against independent scalar expectations |
 | `mmltk_backend_imaging_upscale_tests` | Exact Basic sharpening bytes and guards, bitwise neural tile preparation, tile stitching, ONNX capture/replay, explicit allocation-counter ownership, and separate independent raster-oracle cases |
 | `mmltk_backend_imaging_resample_tests` | Independent CPU/CUDA perceptual-resampling values, bitwise quantized planar projection and CUDA accumulator traversal, allocation-local table reuse, checked views, completion, and resource custody |
-| `mmltk_backend_imaging_raster_tests` | Pitched BGR row orientation, planar float pixel conversion, and exact clipped flat-mask runs |
+| `mmltk_backend_imaging_raster_tests` | Pitched BGR row orientation, exact RGB8/planar-float conversion with odd extents and pitch guards, overwrite painter order and independent blended/additive behavior, and clipped flat-mask runs |
 | `browser-app` | Primary-action preparation, independent optional-test/output editing, generated scalar selection, bounded live/saved chart histories and gaps, camera/legend retention and plot picking cancellation, live progress availability, validation viewer and video-control admission, shared immediate mouse input and transport retention, typed state reduction, component/crop identity, retained gallery measurements and reconciliation, exact integer/filter reduction, shared layout/navigation, image metadata independent of logical snapshots, encoded/submitted draw custody, completed fallback through navigation, local labels, FPS submission counting, exact displayed gallery interaction, quiet failure receipts, and JavaScript probe/input/callback settlement |
 | `workspace-wayland` | Real training/validation/prediction workflows and actual chart/progress/sample/preview pixels, dashboard aspect/retention/wheel behavior, packaged integer typing/paste and spinner/wheel policy, Detail-open resize returns, shared Annotate layout and long-list reachability, retained sessions, native-source/browser-arena identity, negotiated direct/copy draws, recovery, and shutdown |
 
@@ -547,12 +568,23 @@ numerical and integration checks, not a full COCO accuracy or external parity
 run; [compiled-mask limits](rfdetr-workflows.md#evaluation-metrics-and-retained-samples)
 still apply.
 
+RF-DETR core cases also compare packed-mask encoding with scalar runs and
+exception-time state, retained evaluation prefixes with complete ordering, and
+compact matcher matrices with independent CUDA pair values and target lookup
+ranges. Inference cases cover packed-readback budget/fallback decisions,
+odd-byte strides, retained device/pinned capacity, and CLI image identity.
+Export cases retain deterministic dependency ordering and cycle rejection;
+ML layer cases check fully overwritten deformable-attention output and its
+existing gradients. The common I/O cases check empty/multi-chunk file digests,
+cancellation, mutation, and replacement.
+
 The `browser-app` cases additionally cover generated resize settings, paired
 source/aspect geometry and inverse input mapping, Original changes without
 restarting Upscale, and rapid-navigation requests using the current selected
 source while Annotation import retains the exact drawn source, crop, and target
-extent. They verify shared paired caption content and referenced-category
-preparation.
+extent. They verify shared paired caption colors and referenced-category
+membership, separated GT/Det collections, actual texture-view binding reuse and
+retirement, borrowed pending filter presentation, and redraw input cancellation.
 The iced_plot shader case compares every RGBA pixel against the prior three-pass
 sequence for fractional and opaque alpha, with separate fixed opaque-color,
 painter-order, and clip-guard checks. Plot cases also cover caption reconciliation

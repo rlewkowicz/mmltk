@@ -74,6 +74,28 @@ mapped allocation.
 with host-path rewriting. `MMLTK_NUMA_TRANSFER_TRACE_FILE` provides the separate
 NUMA transfer trace. See [logging](logging.md) for joining captured identities.
 
+## Prediction preview storage
+
+[PredictionPreviewPool](../src/controller/subsystems/system/detail/prediction_preview.cpp)
+captures the source representation with each retained preview. Decoded RGB8
+uses three bytes per pixel in pinned upload staging and device storage; the
+[raster converter](../src/backend/imaging/raster/chw_image.cu) copies those RGB
+bytes directly into pitched RGBA with opaque alpha. Captured CHW float sources
+retain their existing conversion. Boxes and run storage keep their required
+alignment after either pixel layout.
+
+Admission still checks the established float-sized aggregate limit before
+choosing compact physical storage. Reuse retains the representation after the
+decoded source is released; decoded ownership, pinned staging, and device
+storage remain protected until their respective copies and conversions settle.
+This preview path is independent of model-input normalization and
+[encoded prediction-mask readback](rfdetr-workflows.md#incremental-prediction).
+
+The [raster backend](../src/backend/imaging/raster/raster_cuda.cu) scans
+overwrite-only box/digit and analysis-mask colors from the last object backward,
+stopping at the final matching writer for each pixel. Blended mask passes and
+Validation's additive GT/Det composition retain their forward composition work.
+
 ## Checkpoint and export readbacks
 
 [TensorReadbackBuffers](../src/backend/ml/cuda/tensor_readback.h) owns reusable
@@ -187,6 +209,15 @@ GPU samples. These are separate from the same-GPU display path.
 
 ### Display transfer coverage
 
+`ImageWorkspaceDamage` retains 64 content transitions with at most eight
+rectangles per transition and accumulated query. Overlapping rectangles merge
+conservatively; touching rectangles merge when their union is rectangular.
+Separated changes retain separate coverage. Exceeding the rectangle capacity
+coarsens that set to one enclosing rectangle; later additions extend it.
+An empty partial change keeps one empty rectangle so finalizer validation still
+runs. A missing transition chain, owner change, or full-image change requires
+full coverage.
+
 `ImageWorkspace` validates damage against the exact display allocation,
 initialized extent, and prior product owner/revision. Missing or incompatible
 baseline facts require a full fill. For admitted partial coverage on a different
@@ -195,6 +226,14 @@ plane, retaining original coordinates and pitches for final composition.
 The pinned route packs those regions into retained per-plane staging sized for their
 combined bytes. Raw readers remain held through transfer settlement; transfer
 scratch remains held through final display completion.
+
+The controller's [raster finalizer](../src/controller/presentation/visual_runtime.cpp)
+consumes the same region span, with at most eight region submissions. These
+savings apply to native transfer and finalization. Firefox's capability-copy
+fallback still copies the retained arena's full capacity; sparse native damage
+does not establish a valid baseline in an alternate browser sample slot.
+Direct sampling performs no such copy. Neither route changes source-read or
+draw settlement requirements.
 
 This partial storage stays inside the workspace finalization boundary.
 Public `ImageProductBuffer::CopyFrom` operations continue to produce complete

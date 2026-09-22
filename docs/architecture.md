@@ -26,6 +26,12 @@ retained modules, links, and tests. Native executable targets install as
 `mmltk` and `mmltk-browser-host`. The [build reference](build.md#target-declarations-and-precompiled-headers)
 owns declaration-only dependencies, header isolation, and target-local PCHs.
 
+Root CLI startup scans logging overrides once and passes the result through
+RF-DETR dispatch, including sibling ONNX-tool configuration. Prediction
+finalization captures each image's source name and ordinal before moving its
+parsed path into the admitted request. Command validation and backend preflight
+still precede device work.
+
 ## Native domain work
 
 `src/controller/subsystems/` contains product systems. Dataset/model and
@@ -162,6 +168,9 @@ shared destination-parent creation, treating a bare filename's parent as `.`.
 publication; [StagingDirectory](../src/common/io/staging_directory.h) owns
 temporary-directory cleanup until publication. Domain owners retain staging,
 sync, cancellation, overwrite, and persistence-format policy.
+[file_digest.cpp](../src/common/io/file_digest.cpp) reads file snapshots through
+overwrite-only scratch bounded to 16 MiB, hashing only bytes filled by completed
+reads. Cancellation and before/after file-identity checks remain with that owner.
 
 [runtime_paths.h](../src/common/system/runtime_paths.h) resolves repository,
 executable, installation, and packaged asset paths for native consumers.
@@ -172,7 +181,9 @@ wait, console, and CLI-option helpers live under
 components.
 
 [utf8.h](../src/common/types/utf8.h) recognizes complete UTF-8 scalars and valid
-text without choosing a replacement policy. The
+text without choosing a replacement policy. Native AVX2 execution skips bounded
+32-byte ASCII spans; non-ASCII scalars, short tails, and constant evaluation keep
+the scalar recognition rules without reading beyond the input. The
 [visual diagnostic owner](../src/controller/presentation/visual_diagnostics.cpp)
 replaces malformed native exception bytes with U+FFFD and truncates only between
 scalars. The benchmark compiler applies its own bounded, flagged replacement to
@@ -191,6 +202,10 @@ visibility independent of logger initialization and optional file sinks.
 Entrypoints choose the failure context and exit policy; the
 [logging guide](logging.md#fatal-stderr-reports) defines the report and process
 status behavior.
+The private [profiling registry](../src/common/logging/profile_utils.cpp)
+looks up existing metric names through borrowed text and constructs an owned key
+only when inserting a new metric. Its opt-in activation remains independent
+of product work.
 
 ## Reflected value and persistence boundaries
 
@@ -221,9 +236,11 @@ records and named persistence retain their separate
 
 The browser host moves owned Bootstrap, Reply, and Event temporaries into their
 server records. CBOR encoding measures the required byte count before reserving
-output storage. Rust map decoding likewise moves its decoded key strings into
-the map. Const encoding APIs, validation limits, error precedence, and transport
-delivery policy retain their existing contracts.
+output storage. The writer emits map keys from borrowed text through the same
+UTF-8-checked text body as string values, preserving depth/item admission and
+output-limit error order without temporary key values. Rust map decoding moves
+its decoded key strings into the map. Const encoding APIs, validation limits,
+error precedence, and transport delivery policy retain their existing contracts.
 
 [gui_settings.cpp](../src/controller/contracts/gui_settings.cpp) projects
 same-name source, UI, training-target, and shared loading fields through their

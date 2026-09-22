@@ -187,6 +187,14 @@ as GT backgrounds. The existing font, glyph layout, contrast, and alpha policy
 remain. These layer controls and color/composition rules belong to Validation;
 Explore keeps its existing palette and single caption layer.
 
+The [caption owner](../src/frontend/iced/src/presentation_surface/labels.rs)
+prepares separate GT and Det collections with the paired image metadata. Each
+paint layer visits only its collection, and a hidden layer contributes no
+captions. Prepared colors, contrast, text, and paragraphs are shared by retained
+draws; an upscale projects their bounds with the derived image. Combined
+diagnostic visits retain the original sample/label order independently of paint
+layer order.
+
 ## Original view and annotation import
 
 Explore's **Original content** and Validation's **Original** controls restore
@@ -327,6 +335,12 @@ These filter inputs remain mounted with stable native field identities when
 mutation is temporarily unavailable. Disabling their input callback preserves
 focus through pending filter admission and settlement. Settings and filters
 still use their owning typed mutation paths.
+
+Explore reads pending submitted filter/overlay values, or the ready native
+snapshot, through borrowed presentation views. Only an edit constructs an owned
+request. Class checklists derive dense catalog membership once per list
+construction, preserving All/None/Subset meaning without searching the selected
+class vector for every row.
 
 The vendored [NumberInput](../third_party/iced_aw/src/widget/number_input.rs)
 retains its text-input and modifier child trees through diff and layout.
@@ -499,6 +513,17 @@ identities are not part of the saved named format. A positive fractional Box
 preview whose bounds truncate to empty integer raster coverage skips just the
 outline; the gesture, mask content, selection, and damage processing remain
 valid.
+
+Mask hit testing uses the document's normalized row/start run order to find one
+predecessor in O(log R) for R runs in a candidate mask, while object painter
+order and selected-handle precedence stay unchanged. The
+[mask cleanup owner](../src/controller/subsystems/annotation/annotation_mask.cpp)
+computes each disk reach once per absolute row offset within one cleanup and
+reuses it across erosion/dilation stages. The backend
+[resolved-mask builder](../src/backend/imaging/annotation/core_preview.cpp)
+accumulates tight, exclusive support bounds as it writes foreground pixels,
+preserving empty-mask and HSV-filter behavior without another full-mask bounds
+scan.
 
 All six visual producers use the shared
 [VisualRuntimeOwner](../src/controller/presentation/visual_runtime_owner.h).
@@ -714,13 +739,17 @@ paired until each replacement completes; see the
 [thumbnail cache rules](datasets.md#explore-thumbnails-and-atlas-residency).
 
 The [paired content owner](../src/frontend/iced/src/presentation_surface/metadata.rs)
-prepares caption data when validated image metadata is installed, then shares
-it through pending and retained display content. Detail reads its original or
+prepares caption text, paragraphs, background colors, and foreground contrast
+when validated image metadata is installed, then shares them through pending
+and retained display content. Detail reads its original or
 derived scene from that same immutable metadata owner. The
 [category-caption index](../src/frontend/iced/src/presentation_surface/labels.rs)
 provides constant-time lookup by catalog reference while constructing text and
-paragraphs only for referenced categories. Label visibility and class filtering
-apply during drawing and reuse this prepared content.
+paragraphs only for referenced categories. Detail folds the paired class
+selection into that index during construction, so each object visit needs no
+selection-vector scan. Local label visibility still applies during drawing.
+Pending controls do not change the colors or membership of an older displayed
+image's captions.
 
 Select, Next, Previous, and Close cancel the departed detail viewer's derived
 request while retaining the last displayed GPU frame for replacement.
@@ -780,6 +809,19 @@ capacity growth, or a newer copy is pending. Iced fit, pan, zoom, clipping,
 sampling, and redraws reuse browser-owned images. Same-image revisions retain
 viewer identity and transforms. New source identity resets them; a reconnect
 also carries its own connection identity, even when revision numbers repeat.
+
+The [surface renderer](../src/frontend/iced/src/presentation_surface/renderer.rs)
+caches each draw's two actual `TextureView` handles and replaces a bind group
+only when its view changes. A direct source returning in the other mailbox slot
+can reuse its existing texture/view. Source replacement refreshes all affected
+cached bindings before releasing displaced backing; page teardown drops those
+bindings before imported textures enter final retirement. View equality permits
+binding reuse only: `SampleRead`, encoded draws, and physical completion still
+govern sampling and destruction.
+
+Ordinary redraw events skip unused mouse-coordinate projection while still
+reconciling input ownership and cancellation, viewer state, and the FPS meter.
+Pointer events retain the complete coordinate mapping.
 
 Unacquired offers require no source-read settlement. An acquired image rejected
 by the page still completes its GPU read and ownership release.

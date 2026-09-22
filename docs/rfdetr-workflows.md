@@ -38,6 +38,12 @@ own persisted/browser record structure, independently of these resource owners.
 The [build reference](build.md#target-declarations-and-precompiled-headers)
 describes compilation and header isolation.
 
+The [ONNX lowerer](../src/backend/models/rfdetr/export/onnx_lowering.cpp)
+orders ready nodes with a min-heap of their original ordinals. Each emitted
+node is the earliest eligible node in the original block, including nested
+blocks; ready-queue insertion/removal costs O(log V) for V nodes. Dependency
+deduplication, cycle rejection, and exported order retain their existing rules.
+
 ## Class identity and model admission
 
 The immutable [ClassCatalog](../src/backend/data/catalog/class_catalog.h) owns
@@ -223,6 +229,24 @@ The implementation starts at
 [detection_ops.cpp](../src/backend/models/rfdetr/core/detection_ops.cpp).
 `run.json` records the observed dataset limits and resolved query policy.
 
+Each training lane's
+[MatcherWorkspace](../src/backend/models/rfdetr/core/detail/matcher_workspace.h)
+packs float32 costs as contiguous per-layer, per-image matrices. For layer query
+counts `Q_l` and image target counts `T_i`, the active payload contains
+`sum_l(sum_i(Q_l * T_i))` values. Checked layer and target prefixes locate those
+matrices; input target lookup offsets remain separate from compact output
+offsets. Device and GPU-local pinned host buffers retain high-water capacity,
+and one settled D2H copy exposes the complete active payload to the existing
+solver. The former padded-shape overflow admission remains enforced.
+
+The [CUDA cost kernels](../src/backend/models/rfdetr/core/detr_matcher_cuda.cu)
+keep their padded launch indexing, float arithmetic, mask-point lane assignment,
+and reduction order while writing compact addresses. Solver traversal, ties,
+loss accumulation, and assignment lifetime are unchanged. Separately, the
+[deformable-attention forward wrapper](../src/backend/ml/layers/ms_deform_attn_cuda_wrapper.cpp)
+allocates overwrite-only output because the forward kernel fills every active
+element; backward accumulation retains its required zero initialization.
+
 EMA is optional and **off by default**. The GUI's **Exponential moving average**
 setting and CLI `--use-ema` enable persistent GPU shadow weights, updated at the existing
 optimizer-update boundary. `--no-ema` disables them. Disabled EMA creates no
@@ -395,6 +419,12 @@ source order, including distinct duplicate annotations; equal-IoU choices
 follow the last annotation within the same ignore group. Score ties retain
 stable prediction order through 101-point precision accumulation.
 
+Per-category selection partially sorts only the retained prefix when predictions
+exceed maxDets, using the same score, NaN, and source-index ordering as the full
+sort. Matching stops scanning candidates once all ten IoU thresholds for that
+detection and area have settled. These shortcuts preserve the ordering and
+ignore/crowd rules above.
+
 No eligible ground truth produces unavailable metrics rather than a fabricated
 zero result. Box-and-mask evaluation requires every ground-truth annotation to
 declare a mask; a declared empty mask is valid. Masks remain rasters at compiled
@@ -441,6 +471,26 @@ delivered incrementally, with source pixels requested only for consumers that
 need them. Predict keeps the latest preview instead of retaining all run
 images. Borrowed source storage remains held until receiver copies finish;
 semantic prediction can still complete when a contained preview failure occurs.
+
+Only threshold survivors materialize requested masks, in bounded chunks.
+[PredictionMaskReadback](../src/backend/models/rfdetr/inference/prediction_capacity.h)
+chooses packed readback when its extra device bytes plus page-rounded pinned
+host bytes are smaller than the dense host payload and the complete retained
+allocation inventory fits the existing chunk budget. Otherwise encoding uses
+dense boolean readback. Packing does not enlarge survivor/chunk admission;
+preview-only demand performs no encoded-mask host readback.
+
+The [existing raster packer](../src/backend/models/rfdetr/core/mask_pack_cuda_wrapper.cpp)
+stores row-major pixels low bit first in `ceil(width * height / 8)` bytes per
+mask on the current CUDA stream, including Torch's legacy default stream.
+Host encoding begins after that stream settles. The shared
+[packed RLE encoder](../src/backend/models/rfdetr/core/evaluator.cpp) scans bounded
+64-bit words, carries runs across word boundaries, and ignores unused tail bits.
+It preserves scalar start/length runs, area, aggregate run limits, and partial
+state on capacity failure. Storage grows with emitted runs rather than the
+full run allowance. GPU preview masks retain their own representation and
+custody; [preview storage](gpu-execution.md#prediction-preview-storage) owns
+decoded RGB8 and CHW pixel handling.
 
 Video decoding, frame timestamps, and end-of-file are owned by
 [VideoFileSource](../src/backend/media/video/video_file_source.h).
