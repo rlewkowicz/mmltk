@@ -5,6 +5,7 @@
 #include "benchmark_catalog.h"
 #include "benchmark_download.h"
 #include "benchmark_images.h"
+#include "benchmark_writer.h"
 #include <span>
 #include "coconut_annotations.h"
 #include "coconut_catalog.h"
@@ -14,7 +15,11 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
+#include <exception>
 #include <fstream>
+#include <mutex>
+#include <memory>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -37,7 +42,7 @@ struct CustomRecipePreparation {
  std::vector<CatalogArtifact> sampling_object_artifacts;
 };
 [[nodiscard]] CustomRecipePreparation prepare_custom_recipe(const BenchmarkCompilerConfig&, const BenchmarkCacheLayout&, const CustomRecipeCatalog&, ProgressReporter&, std::size_t,
- mmltk::common::concurrency::CancellationObservation, const BenchmarkTraceSink&);
+ mmltk::common::concurrency::CancellationObservation, const BenchmarkTraceSink&, std::span<const int> worker_cpus = {});
 }  // namespace mmltk::backend::data::benchmark_internal
 namespace mmltk::backend::data::benchmark_internal {
 struct RecipeImageArchive {
@@ -51,14 +56,22 @@ struct AdmittedRecipeArchive {
  DownloadResult download;
  unsigned structural_attempts = 0;
 };
+enum class CoconutReleaseBoundary { MetadataConsumed, MasksStarted };
 // Private ordinary catalog facts are also used by bounded local release fixtures.
 struct CoconutRecipeCatalog {
  std::vector<CoconutReleaseComponent> releases;
  std::vector<RecipeImageArchive> images;
  CatalogArtifact stock_annotations;
  std::uint64_t coco_validation_images = 5000U;
+ // Effect-only production-boundary notification, called outside owner/reporter
+ // locks. It neither selects work nor supplies readiness or cache decisions.
+ std::function<void(CoconutEdition, CoconutReleaseBoundary)> release_observer;
 };
+struct CoconutRecipeInputs;
+[[nodiscard]] std::shared_ptr<CoconutRecipeInputs> acquire_coconut_recipe_inputs(const BenchmarkCacheLayout&, const CoconutRecipeCatalog&, ProgressReporter&, std::size_t,
+ mmltk::common::concurrency::CancellationObservation, const BenchmarkTraceSink&, std::size_t download_connections = 0, std::span<const int> cpus = {}, std::function<void(std::exception_ptr)> failed = {});
 struct CoconutRecipePreparation {
+ std::shared_ptr<CoconutRecipeInputs> inputs;
  std::vector<CoconutComponent> components;
  std::optional<NormalizedAnnotationIndex> stock_validation;
  bool annotation_cache_hit = true;
@@ -76,17 +89,19 @@ private:
  std::filesystem::path path_;
  ProgressReporter& progress_;
  std::ofstream stream_;
+ std::mutex mutex_;
  bool attempted_ = false;
  bool warned_ = false;
 };
-[[nodiscard]] std::vector<std::pair<std::uint32_t, std::uint32_t>> coconut_image_dimensions(const CoconutComponent&, std::string_view release, std::span<const CachedImageDirectory>,
- std::span<const std::uint16_t> image_sources, CoconutFailureReport&, ProgressReporter&, mmltk::common::concurrency::CancellationObservation);
 [[nodiscard]] CoconutRecipeCatalog coconut_recipe_catalog(CoconutValidation);
 [[nodiscard]] CoconutRecipePreparation prepare_coconut_recipe(const BenchmarkCompilerConfig&, const BenchmarkCacheLayout&, const CoconutRecipeCatalog&, std::span<const AdmittedRecipeArchive>,
  const CoconutPhysicalMembership&, ProgressReporter&, CoconutFailureReport&, std::size_t, mmltk::common::concurrency::CancellationObservation, const BenchmarkTraceSink&,
- std::span<const CoconutImageNamespace> refreshed_sources = {});
+ std::span<const CoconutImageNamespace> refreshed_sources = {}, bool metadata_only = false, std::shared_ptr<CoconutRecipeInputs> inputs = {});
 [[nodiscard]] bool coconut_validation_component(CoconutEdition) noexcept;
 [[nodiscard]] AnnotationSource coconut_annotation_source(CoconutImageNamespace);
 // Same compiler entry with explicit private source catalog, not a second execution path.
-void compile_benchmark_recipe(BenchmarkCompilerConfig, const CoconutRecipeCatalog*, const CustomRecipeCatalog* = nullptr);
+// Optional effect-only notification outside cache/reporter locks. Membership
+// and scheduling remain owned by the production compiler.
+void compile_benchmark_recipe(BenchmarkCompilerConfig, const CoconutRecipeCatalog*, const CustomRecipeCatalog* = nullptr,
+ const std::function<void(BenchmarkDatasetSource, std::string_view)>& source_labels_started = {}, const BenchmarkImageReadObserver& image_opened = {});
 }  // namespace mmltk::backend::data::benchmark_internal

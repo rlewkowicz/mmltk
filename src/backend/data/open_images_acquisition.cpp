@@ -87,8 +87,8 @@ public:
   std::string retry_reason;
   std::exception_ptr fatal_error;
  };
- OpenImageCacheWorkers(const std::size_t worker_count, std::filesystem::path image_root, const mmltk::common::concurrency::CancellationObservation cancellation)
-     : image_root_(std::move(image_root)), cancellation_(cancellation) {
+ OpenImageCacheWorkers(const std::size_t worker_count, std::filesystem::path image_root, const mmltk::common::concurrency::CancellationObservation cancellation, CachedImageReadySink ready)
+     : ready_(std::move(ready)), image_root_(std::move(image_root)), cancellation_(cancellation) {
   if (worker_count == 0U) {
    inline_validator_ = std::make_unique<BenchmarkImageValidator>();
    return;
@@ -153,6 +153,7 @@ public:
  }
 
 private:
+ CachedImageReadySink ready_;
  struct Task {
   std::uint64_t image_id = 0U;
   std::uint32_t attempt = 0U;
@@ -169,6 +170,7 @@ private:
    result.width = width;
    result.height = height;
    write_cached_image_atomically(cached_image_path(image_root_, result.image_id), result.encoded, cancellation_);
+   if (ready_) ready_({image_root_, result.image_id});
    throw_if_benchmark_cancelled(cancellation_);
   } catch (const InvalidImageError& error) { result.retry_reason = error.what(); } catch (...) {
    result.fatal_error = std::current_exception();
@@ -207,7 +209,7 @@ private:
 };
 void download_open_images(const std::span<const std::uint64_t> expected_ids, const std::filesystem::path& image_root, NormalizedAnnotationIndex* annotation_index,
  std::vector<QuarantinedImage>* quarantined, mmltk::common::concurrency::CancellationObservation cancel_requested, ProgressReporter* progress, std::uint64_t* completed_images,
- const std::uint64_t total_images, std::uint64_t* cached_image_bytes, const std::size_t transfer_concurrency, const std::size_t cache_workers, const BenchmarkTraceSink& trace) {
+ const std::uint64_t total_images, std::uint64_t* cached_image_bytes, const std::size_t transfer_concurrency, const std::size_t cache_workers, const BenchmarkTraceSink& trace, const CachedImageReadySink& image_ready) {
  ensure_curl_global();
  CurlMulti multi(curl_multi_init());
  if (!multi) { throw std::runtime_error("cannot allocate Open Images multi transfer"); }
@@ -218,7 +220,7 @@ void download_open_images(const std::span<const std::uint64_t> expected_ids, con
      curl_multi_setopt(multi.get(), CURLMOPT_PIPELINING, CURLPIPE_MULTIPLEX) != CURLM_OK) {
   throw std::runtime_error("cannot configure Open Images HTTP multiplexing");
  }
- OpenImageCacheWorkers cache_writer(cache_workers, image_root, cancel_requested);
+ OpenImageCacheWorkers cache_writer(cache_workers, image_root, cancel_requested, image_ready);
  struct Pending {
   std::uint64_t image_id = 0U;
   std::uint32_t attempt = 1U;
@@ -452,7 +454,7 @@ void complete_open_images_group(const std::filesystem::path& image_root, const s
 }  // namespace
 [[nodiscard]] AcquiredOpenImages acquire_open_images(const BenchmarkCacheLayout& cache, NormalizedAnnotationIndex& index, std::vector<QuarantinedImage>* quarantined,
  mmltk::common::concurrency::CancellationObservation cancel_requested, ProgressReporter* progress, const int num_workers, const std::size_t cache_workers, const BenchmarkTraceSink& trace,
- const std::optional<ImageDecodeProbe> decode_probe) {
+ const std::optional<ImageDecodeProbe> decode_probe, const CachedImageReadySink& image_ready) {
  const std::vector<std::uint64_t> ids = image_ids(index);
  const std::filesystem::path image_root = cache.source_images("open-images") / "train";
  prepare_cached_image_directory(image_root);
@@ -476,7 +478,12 @@ void complete_open_images_group(const std::filesystem::path& image_root, const s
   const std::string shard = open_images_group_name(begin / kOpenImagesGroupImages);
   const std::filesystem::path completion = image_root / ".groups" / (shard + ".complete.json");
   progress->source_activity(BenchmarkDatasetSource::kOpenImagesV7, "Waiting for Open Images " + shard + " image lock");
-  ArtifactLease lease = ArtifactLease::acquire(cache.locks / ("open-images-" + shard + ".images.lock"), cancel_requested);
+  auto lease = std::make_shared<ArtifactLease>(ArtifactLease::acquire(cache.locks / ("open-images-" + shard + ".images.lock"), cancel_requested));
+  const CachedImageReadySink publish_image = image_ready ? CachedImageReadySink{[&, lease](const CachedImageReady& image) {
+   auto owned = image;
+   owned.custody = lease;
+   image_ready(owned);
+  }} : CachedImageReadySink{};
   if (decode_probe && std::ranges::binary_search(group, decode_probe->image_id)) {
    progress->source_activity(BenchmarkDatasetSource::kOpenImagesV7, "Invalidating failed Open Images JPEG " + std::to_string(decode_probe->image_id) + " under the group lock");
    remove_cache_path(completion);
@@ -491,6 +498,7 @@ void complete_open_images_group(const std::filesystem::path& image_root, const s
     NormalizedImage& image = find_normalized_image(&index, cached_group.available_image_ids[image_index]);
     image.width = cached_group.dimensions[image_index][0];
     image.height = cached_group.dimensions[image_index][1];
+    if (publish_image) publish_image({image_root, image.source_image_id});
    }
   }
   if (group_cache_hit) {
@@ -527,6 +535,7 @@ void complete_open_images_group(const std::filesystem::path& image_root, const s
      NormalizedImage& image = find_normalized_image(&index, image_id);
      image.width = width;
      image.height = height;
+     if (publish_image) publish_image({image_root, image_id});
      group_available.push_back(image_id);
      ++completed_images;
      cached_image_bytes = common_math::checked_add(cached_image_bytes, bytes, "Open Images cached byte total overflow");
@@ -546,7 +555,7 @@ void complete_open_images_group(const std::filesystem::path& image_root, const s
   const std::size_t quarantine_begin = quarantined->size();
   if (!missing_downloads.empty()) {
    progress->source_activity(BenchmarkDatasetSource::kOpenImagesV7, "Downloading Open Images " + shard + " JPEGs");
-   download_open_images(missing_downloads, image_root, &index, quarantined, cancel_requested, progress, &completed_images, ids.size(), &cached_image_bytes, transfer_concurrency, cache_workers, trace);
+   download_open_images(missing_downloads, image_root, &index, quarantined, cancel_requested, progress, &completed_images, ids.size(), &cached_image_bytes, transfer_concurrency, cache_workers, trace, publish_image);
   }
   std::unordered_set<std::uint64_t> missing;
   for (std::size_t index_position = quarantine_begin; index_position < quarantined->size(); ++index_position) { missing.emplace((*quarantined)[index_position].image_id); }

@@ -6,6 +6,7 @@
 #include <filesystem>
 #include <functional>
 #include <optional>
+#include <memory>
 #include <mutex>
 #include <span>
 #include <string>
@@ -44,6 +45,14 @@ private:
  std::uint64_t published_ = 0U;
  std::mutex mutex_;
 };
+// Emitted only after admitted cache reuse or durable atomic image publication.
+// The acquiring source lease remains held until its consumer drains readers.
+struct CachedImageReady {
+ std::filesystem::path root;
+ std::uint64_t image_id = 0;
+ std::shared_ptr<const ArtifactLease> custody;
+};
+using CachedImageReadySink = std::function<void(const CachedImageReady&)>;
 using CachedImageValidator = std::function<void(std::uint64_t, std::span<const std::uint8_t>)>;
 struct CachedImageRejection {
  std::uint64_t image_id = 0U;
@@ -91,6 +100,7 @@ struct ArchiveExtractionRequest {
  std::size_t cache_write_workers = 1U;
  std::function<void(std::string_view)> activity = {};
  std::filesystem::path completion_path = {};
+ CachedImageReadySink image_ready = {};
 };
 [[nodiscard]] CachedImageDirectory extract_selected_archive_images(ArchiveExtractionRequest request);
 }  // namespace mmltk::backend::data::benchmark_internal

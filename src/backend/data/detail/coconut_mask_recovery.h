@@ -20,11 +20,27 @@ struct CoconutSegmentSupport {
  std::optional<NormalizedBox> recovered;
  bool carved = false;
 };
-// Borrows immutable normalized originals, indexed once by physical image. One
-// synchronous importer uses this owner at a time; RLE scratch retains capacity.
+// Immutable physical-ID lookup shared by concurrent importers. The normalized
+// originals must outlive this index and every borrowing recovery workspace.
+class CoconutRecoveryOriginals final {
+public:
+ CoconutRecoveryOriginals(const NormalizedAnnotationIndex* train, const NormalizedAnnotationIndex* validation,
+                         mmltk::common::concurrency::CancellationObservation cancellation = {});
+ CoconutRecoveryOriginals(const CoconutRecoveryOriginals&) = delete;
+ CoconutRecoveryOriginals& operator=(const CoconutRecoveryOriginals&) = delete;
+private:
+ friend class CoconutMaskRecovery;
+ struct Originals {
+  const NormalizedAnnotationIndex* index = nullptr;
+  std::unordered_map<std::uint64_t, const NormalizedImage*> images;
+ };
+ [[nodiscard]] const Originals* originals(CoconutImageNamespace source) const noexcept;
+ Originals train_, validation_;
+};
+// One synchronous importer owns this mutable, capacity-retaining workspace.
 class CoconutMaskRecovery final {
 public:
- CoconutMaskRecovery(const NormalizedAnnotationIndex* train, const NormalizedAnnotationIndex* validation, mmltk::common::concurrency::CancellationObservation cancellation = {});
+ explicit CoconutMaskRecovery(const CoconutRecoveryOriginals& originals) : originals_(originals) {}
  CoconutMaskRecovery(const CoconutMaskRecovery&) = delete;
  CoconutMaskRecovery& operator=(const CoconutMaskRecovery&) = delete;
  [[nodiscard]] std::string_view original_identity(CoconutImageNamespace source) const noexcept;
@@ -49,12 +65,7 @@ private:
  };
  [[nodiscard]] static bool candidate_mask(const NormalizedAnnotationIndex& index, std::uint32_t width, std::uint32_t height, Candidate& candidate, Cancellation cancellation);
  [[nodiscard]] static bool intersects(const CoconutSegmentSupport& support, const Candidate& candidate, Cancellation cancellation);
- struct Originals {
-  const NormalizedAnnotationIndex* index = nullptr;
-  std::unordered_map<std::uint64_t, const NormalizedImage*> images;
- };
- [[nodiscard]] const Originals* originals(CoconutImageNamespace source) const noexcept;
- Originals train_, validation_;
+ const CoconutRecoveryOriginals& originals_;
  // Flat image/group workspaces retain only high-water capacity, never historical keys.
  std::vector<Group> groups_;
  std::vector<std::size_t> ordinals_;

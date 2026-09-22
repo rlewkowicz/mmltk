@@ -435,7 +435,14 @@ public:
   const auto key = physical_key(physical.source, physical.image_id);
   if (!offered_.insert(key).second) invalid("duplicate offered physical member: " + physical.member);
   try {
-   normalize(record, physical, png);
+   if (std::ranges::find(request_.retained_sources, physical.source) != request_.retained_sources.end()) {
+    // Membership still participates in duplicate and expected-row admission.
+   } else if (request_.metadata_only) {
+    auto& component = component_for(physical.source);
+    component.index.images.push_back({physical.image_id, 0, 0, record.width, record.height, physical.shard, 0});
+    component.inventory.push_back({physical, record.image_id, record.source_ordinal});
+    if (component.recovery_policy) component.recovery.push_back({physical.image_id, 0, {}});
+   } else normalize(record, physical, png);
   } catch (const std::exception& error) { invalid(physical.member + ": " + error.what()); }
   ++rows_;
   if (request_.progress && rows_ % kProgressQuantum == 0) request_.progress(rows_);
@@ -485,6 +492,22 @@ private:
   const auto* found = request_.physical_membership->find(name.source, name.id);
   if (!found) throw CoconutPhysicalMembershipError(name.source, name.id, "missing physical Objects365 archive member: " + record.physical_stem);
   return *found;
+ }
+ CoconutComponent& component_for(CoconutImageNamespace source) {
+  auto [entry, inserted] = components_.try_emplace(source);
+  auto& component = entry->second;
+  if (inserted) {
+   component.edition = request_.edition;
+   component.source = source;
+   component.input_identity = coconut_component_input_identity(request_.input_identity, source, request_.recovery);
+   component.index.source = index_source(source);
+   component.index.split = component_split(request_.edition, source);
+   if (request_.recovery) {
+    component.original_annotation_identity = request_.recovery->original_identity(source);
+    if (!component.original_annotation_identity.empty()) component.recovery_policy = kCoconutRecoveryPolicy;
+   }
+  }
+  return component;
  }
  void normalize(const CoconutRecord& record, const CoconutPhysicalImage& physical, std::span<const std::uint8_t> png) {
   const auto& limits = request_.limits;
@@ -539,19 +562,7 @@ private:
    }
    begin = end;
   }
-  auto [entry, inserted] = components_.try_emplace(physical.source);
-  auto& component = entry->second;
-  if (inserted) {
-   component.edition = request_.edition;
-   component.source = physical.source;
-   component.input_identity = coconut_component_input_identity(request_.input_identity, physical.source, request_.recovery);
-   component.index.source = index_source(physical.source);
-   component.index.split = component_split(request_.edition, physical.source);
-   if (request_.recovery) {
-    component.original_annotation_identity = request_.recovery->original_identity(physical.source);
-    if (!component.original_annotation_identity.empty()) component.recovery_policy = kCoconutRecoveryPolicy;
-   }
-  }
+  auto& component = component_for(physical.source);
   CoconutRecoveryImage recovery{physical.image_id, 0, {}};
   if (request_.recovery)
    request_.recovery->apply(physical.source, record, static_cast<unsigned>(width), static_cast<unsigned>(height), std::span(support_).first(record.segments.size()), recovery, request_.cancellation);
@@ -929,10 +940,11 @@ std::vector<CoconutComponent> import_coconut_annotations(const CoconutImportRequ
  Importer importer(request);
  if (request.edition == CoconutEdition::Base || request.edition == CoconutEdition::RelabeledValidation) {
   if (request.parquet_shards.empty()) invalid("missing Parquet shards");
-  read_coconut_parquet(request.parquet_shards, request.limits, request.cancellation, [&](const CoconutRecord& record, std::span<const std::uint8_t> png) { importer.consume(record, png); });
+  read_coconut_parquet(request.parquet_shards, request.limits, request.cancellation, [&](const CoconutRecord& record, std::span<const std::uint8_t> png) { importer.consume(record, png); }, request.metadata_only);
  } else {
   auto records = request.edition == CoconutEdition::XLarge ? xlarge_records(request) : json_records(request);
-  consume_archive(request, records, importer);
+  if (request.metadata_only) for (const auto& record : records) importer.consume(record, {});
+  else consume_archive(request, records, importer);
  }
  return importer.finish();
 }

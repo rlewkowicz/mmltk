@@ -40,7 +40,7 @@ bool CoconutMaskRecovery::intersects(const CoconutSegmentSupport& support, const
  }
  return false;
 }
-CoconutMaskRecovery::CoconutMaskRecovery(const NormalizedAnnotationIndex* train, const NormalizedAnnotationIndex* validation, Cancellation cancellation) {
+CoconutRecoveryOriginals::CoconutRecoveryOriginals(const NormalizedAnnotationIndex* train, const NormalizedAnnotationIndex* validation, Cancellation cancellation) {
  throw_if_benchmark_cancelled(cancellation);
  const auto admit = [&](Originals& target, const NormalizedAnnotationIndex* index, std::string_view split) {
   if (!index || index->source != BenchmarkDatasetSource::kCoco2017 || index->split != split || index->annotation_sha256.empty()) return;
@@ -55,13 +55,13 @@ CoconutMaskRecovery::CoconutMaskRecovery(const NormalizedAnnotationIndex* train,
  admit(train_, train, "train2017");
  admit(validation_, validation, "val2017");
 }
-const CoconutMaskRecovery::Originals* CoconutMaskRecovery::originals(CoconutImageNamespace source) const noexcept {
+const CoconutRecoveryOriginals::Originals* CoconutRecoveryOriginals::originals(CoconutImageNamespace source) const noexcept {
  if (source == CoconutImageNamespace::CocoTrain) return &train_;
  if (source == CoconutImageNamespace::CocoValidation) return &validation_;
  return nullptr;
 }
 std::string_view CoconutMaskRecovery::original_identity(CoconutImageNamespace source) const noexcept {
- const auto* selected = originals(source);
+ const auto* selected = originals_.originals(source);
  return selected && selected->index ? std::string_view(selected->index->annotation_sha256) : std::string_view{};
 }
 void CoconutMaskRecovery::apply(CoconutImageNamespace source, const CoconutRecord& record, std::uint32_t width, std::uint32_t height, std::span<CoconutSegmentSupport> support,
@@ -76,7 +76,7 @@ void CoconutMaskRecovery::apply(CoconutImageNamespace source, const CoconutRecor
  union_.clear();
  scratch_.clear();
  throw_if_benchmark_cancelled(cancellation);
- const auto* selected = originals(source);
+ const auto* selected = originals_.originals(source);
  if (!selected || !selected->index) return;
  const auto found = selected->images.find(record.image_id);
  if (found == selected->images.end() || !found->second) return;

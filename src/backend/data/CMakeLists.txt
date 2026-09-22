@@ -94,6 +94,7 @@ mmltk_register_ordinary_sources(mmltk_backend_data
     staging_file_cleanup.cpp)
 mmltk_register_retained_module_importers(mmltk_backend_data
     compiled_image_stream.cpp
+    benchmark_pipeline.cpp
     benchmark_writer.cpp
     dataset_compiler.cpp
     dataset_compiler_layout.cpp
@@ -121,6 +122,7 @@ mmltk_register_private_headers(mmltk_backend_data
     detail/benchmark_images.h
     detail/benchmark_image_decoder.h
     detail/benchmark_sampling.h
+    detail/benchmark_pipeline.h
     detail/benchmark_writer.h
     detail/worker_queue.h
     detail/dataset_compiler_internal.h

@@ -11,6 +11,9 @@
 #include <filesystem>
 #include <functional>
 #include <list>
+#include <condition_variable>
+#include "src/common/concurrency/worker_pool.h"
+#include "src/common/system/cpu_affinity.h"
 #include <mutex>
 #include <new>
 #include <ranges>
@@ -965,7 +968,9 @@ struct SegmentTransfer {
 }
 }  // namespace
 std::vector<DownloadResult> download_artifacts(const std::vector<DownloadRequest>& requests, const std::size_t maximum_concurrency,
- mmltk::common::concurrency::CancellationObservation cancel_requested, const DownloadProgressSink& progress, const BenchmarkTraceSink& trace) {
+ mmltk::common::concurrency::CancellationObservation cancel_requested, const DownloadProgressSink& observer, const BenchmarkTraceSink& trace, const DownloadReadySink& ready) {
+ std::mutex progress_mutex;
+ const DownloadProgressSink progress = observer ? DownloadProgressSink{[&](const DownloadProgress& value) { const std::lock_guard lock(progress_mutex); observer(value); }} : DownloadProgressSink{};
  if (requests.empty()) { return {}; }
  if (maximum_concurrency == 0U) { throw std::runtime_error("benchmark download concurrency must be positive"); }
  for (const DownloadRequest& request : requests) {
@@ -981,9 +986,8 @@ std::vector<DownloadResult> download_artifacts(const std::vector<DownloadRequest
   lock_order[index] = index;
  }
  std::ranges::sort(lock_order, [&](const std::size_t left, const std::size_t right) { return requests[left].lock_path.string() < requests[right].lock_path.string(); });
- std::vector<ArtifactLease> leases;
- leases.reserve(requests.size());
- for (const std::size_t index : lock_order) { leases.push_back(ArtifactLease::acquire(requests[index].lock_path, cancel_requested)); }
+ std::vector<ArtifactLease> leases(requests.size());
+ for (const std::size_t index : lock_order) { leases[index] = ArtifactLease::acquire(requests[index].lock_path, cancel_requested); }
  std::vector<std::optional<DownloadResult>> results(requests.size());
  std::list<PendingTransfer> pending;
  for (std::size_t index = 0U; index < requests.size(); ++index) {
@@ -991,6 +995,8 @@ std::vector<DownloadResult> download_artifacts(const std::vector<DownloadRequest
   std::optional<DownloadResult>& result = results[index];
   result = validate_complete_artifact(requests[index], cancel_requested, progress, trace);
   if (result.has_value()) {
+   leases[index] = ArtifactLease{};
+   if (ready) ready({index, *result});
    const DownloadResult& completed_result = *result;
    if (progress) {
     progress(DownloadProgress{
@@ -1022,7 +1028,10 @@ std::vector<DownloadResult> download_artifacts(const std::vector<DownloadRequest
  }
  if (requests.size() == 1U && maximum_concurrency > 1U && requests.front().expected_size >= kSegmentedDownloadThreshold) {
   try {
-   return {download_segmented_artifact(requests.front(), maximum_concurrency, cancel_requested, progress, trace)};
+   auto result = download_segmented_artifact(requests.front(), maximum_concurrency, cancel_requested, progress, trace);
+   leases.front() = ArtifactLease{};
+   if (ready) ready({0, result});
+   return {std::move(result)};
   } catch (const SegmentedDownloadUnsupported& error) {
    std::error_code cleanup_error;
    pending.front().redownload = std::filesystem::remove(partial_path(requests.front()), cleanup_error);
@@ -1040,8 +1049,28 @@ std::vector<DownloadResult> download_artifacts(const std::vector<DownloadRequest
  if (!multi) { throw std::runtime_error("cannot allocate benchmark libcurl multi handle"); }
  const CURLMcode connection_limit = curl_multi_setopt(multi.get(), CURLMOPT_MAX_TOTAL_CONNECTIONS, checked_cast<long>(maximum_concurrency, "benchmark download concurrency overflow"));
  if (connection_limit != CURLM_OK) { throw std::runtime_error(std::string("cannot set benchmark transfer concurrency: ") + curl_multi_strerror(connection_limit)); }
+ CURLM* const wake_handle = multi.get();
  CurlMultiTransfers<Transfer> active(std::move(multi), "benchmark transfer");
  active.reserve(maximum_concurrency);
+ struct SettledTransfer {
+  std::shared_ptr<Transfer> transfer;
+  std::optional<DownloadResult> result;
+  std::exception_ptr error;
+ };
+ std::mutex settlement_mutex;
+ std::condition_variable settlement_ready;
+ std::vector<SettledTransfer> settlements, completed_settlements;
+ settlements.reserve(maximum_concurrency);
+ completed_settlements.reserve(maximum_concurrency);
+ std::size_t settling = 0;
+ // One bounded durable-publication lane owns completed descriptors. The curl
+ // controller keeps driving other sockets while fdatasync/rename settle.
+ std::unique_ptr<mmltk::common::concurrency::WorkerPool> publication;
+ // A single artifact has no other sockets to advance after completion. Batch
+ // callers allocate maximum_concurrency CPU lanes; two suffice for the
+ // controller and settlement worker regardless of the number of sockets.
+ if (requests.size() > 1 && maximum_concurrency > 1)
+  publication = std::make_unique<mmltk::common::concurrency::WorkerPool>(1, mmltk::common::system::allowed_cpu_set(), "bench_publish", maximum_concurrency);
  const auto schedule_retry = [&](Transfer& transfer, const std::size_t request_index, const bool reset_partial, const CURLcode curl_code, const std::string& detail) {
   // Completed handles have left the active set, so cancellation cleanup cannot
   // checkpoint them. Preserve their validators before propagating cancellation.
@@ -1066,10 +1095,24 @@ std::vector<DownloadResult> download_artifacts(const std::vector<DownloadRequest
   pending.push_back(PendingTransfer{request_index, transfer.attempt + 1U, Clock::now() + backoff, transfer.redownload || reset_partial});
  };
  try {
-  while (!pending.empty() || !active.empty()) {
+  while (!pending.empty() || !active.empty() || settling != 0) {
+   completed_settlements.clear();
+   { const std::lock_guard lock(settlement_mutex); completed_settlements.swap(settlements); }
+   for (auto& item : completed_settlements) {
+    --settling;
+    const auto index = static_cast<std::size_t>(&item.transfer->request - requests.data());
+    if (item.error) {
+     try { std::rethrow_exception(item.error); }
+     catch (const DownloadVerificationError& error) { schedule_retry(*item.transfer, index, true, CURLE_OK, error.what()); }
+    } else {
+     results[index] = std::move(*item.result);
+     leases[index] = ArtifactLease{};
+     if (ready) ready({index, *results[index]});
+    }
+   }
    throw_if_benchmark_cancelled(cancel_requested);
    const Clock::time_point now = Clock::now();
-   for (auto iterator = pending.begin(); iterator != pending.end() && active.size() < maximum_concurrency;) {
+   for (auto iterator = pending.begin(); iterator != pending.end() && active.size() + settling < maximum_concurrency;) {
     if (iterator->ready_at > now) {
      ++iterator;
      continue;
@@ -1101,9 +1144,18 @@ std::vector<DownloadResult> download_artifacts(const std::vector<DownloadRequest
                                           (transfer->http.response_code == 416L && transfer->response_total != 0U && regular_file_size(partial_path(transfer->request)) == transfer->response_total));
     const bool complete_range = transfer->http.response_code != 206L || (transfer->response_total != 0U && regular_file_size(partial_path(transfer->request)) == transfer->response_total);
     if (completion->result == CURLE_OK && successful_status && complete_range) {
-     try {
-      results[request_index] = publish_completed_transfer(*transfer);
-     } catch (const DownloadVerificationError& error) { schedule_retry(*transfer, request_index, true, completion->result, error.what()); }
+     auto owned = std::shared_ptr<Transfer>(std::move(transfer));
+     ++settling;
+     const auto publish = [&, owned] {
+      SettledTransfer item{owned, {}, {}};
+      try { item.result = publish_completed_transfer(*owned); }
+      catch (...) { item.error = std::current_exception(); }
+      { const std::lock_guard lock(settlement_mutex); settlements.push_back(std::move(item)); }
+      settlement_ready.notify_one();
+      (void)curl_multi_wakeup(wake_handle);
+     };
+     if (publication) publication->enqueue_detached(publish);
+     else publish();
      continue;
     }
     const std::string detail = completion->result == CURLE_OK && successful_status && !complete_range ? "resumed transfer did not reach the declared Content-Range total"
@@ -1114,6 +1166,9 @@ std::vector<DownloadResult> download_artifacts(const std::vector<DownloadRequest
    }
    if (!active.empty()) {
     active.poll(kBenchmarkTransferPollMilliseconds);
+   } else if (settling != 0) {
+    std::unique_lock lock(settlement_mutex);
+    settlement_ready.wait(lock, [&] { return !settlements.empty(); });
    } else if (!pending.empty()) {
     const Clock::time_point earliest = std::ranges::min_element(pending, {}, &PendingTransfer::ready_at)->ready_at;
     const auto delay = std::min(std::chrono::duration_cast<std::chrono::milliseconds>(std::max(earliest - Clock::now(), Clock::duration::zero())), std::chrono::milliseconds{250});
@@ -1127,6 +1182,7 @@ std::vector<DownloadResult> download_artifacts(const std::vector<DownloadRequest
   }
  } catch (...) {
   const std::exception_ptr original_error = std::current_exception();
+  if (publication) publication->wait_idle();
   std::exception_ptr cleanup_error;
   active.abandon_all([&cleanup_error](Transfer& transfer) {
    try {

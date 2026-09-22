@@ -80,10 +80,12 @@ struct CoconutImportLimits {
 using CoconutRecordConsumer = std::function<void(const CoconutRecord&, std::span<const std::uint8_t>)>;
 // PNG is borrowed for this call only. Reader and record batch remain alive through consumer.
 void read_coconut_parquet(
- std::span<const std::filesystem::path> shards, const CoconutImportLimits& limits, mmltk::common::concurrency::CancellationObservation cancellation, const CoconutRecordConsumer& consumer);
+ std::span<const std::filesystem::path> shards, const CoconutImportLimits& limits, mmltk::common::concurrency::CancellationObservation cancellation, const CoconutRecordConsumer& consumer, bool metadata_only = false);
 struct CoconutImportRequest {
  CoconutEdition edition = CoconutEdition::Base;
  std::string input_identity;
+ bool metadata_only = false;
+ std::span<const CoconutImageNamespace> retained_sources;
  std::vector<std::filesystem::path> parquet_shards;
  std::filesystem::path annotation_json;
  std::filesystem::path mask_archive;

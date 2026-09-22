@@ -74,8 +74,8 @@ la_ssize_t read_parallel_gzip(archive* archive_reader, void* opaque, const void*
 class CachedImageWritePool {
 public:
  CachedImageWritePool(const std::size_t worker_count, const std::size_t expected_writes, std::filesystem::path output_root, CachedImageProgress progress, const std::uint64_t initially_completed,
-  const mmltk::common::concurrency::CancellationObservation cancellation)
-     : output_root_(std::move(output_root)), progress_(std::move(progress), initially_completed, expected_writes), cancellation_(cancellation) {
+  const mmltk::common::concurrency::CancellationObservation cancellation, CachedImageReadySink ready)
+     : ready_(std::move(ready)), output_root_(std::move(output_root)), progress_(std::move(progress), initially_completed, expected_writes), cancellation_(cancellation) {
   const std::size_t bounded_workers = std::min<std::size_t>(8U, worker_count);
   inline_mode_ = bounded_workers == 0U;
   const std::size_t buffer_count = inline_mode_ ? 1U : bounded_workers * 2U + 2U;
@@ -109,6 +109,7 @@ public:
     throw std::runtime_error("selected archive image " + std::to_string(image_id) + " is not a complete JPEG or PNG");
    }
    write_cached_image_atomically(cached_image_path(output_root_, image_id), encoded, cancellation_);
+   if (ready_) ready_({output_root_, image_id});
    written_ids_.push_back(image_id);
    written_bytes_ = checked_byte_add(written_bytes_, bytes);
    const std::uint64_t completed = written_ids_.size();
@@ -156,6 +157,7 @@ public:
  }
 
 private:
+ CachedImageReadySink ready_;
  struct Task {
   std::uint64_t image_id = 0U;
   std::vector<std::uint8_t> encoded;
@@ -169,6 +171,7 @@ private:
     if (!has_complete_image_markers(task->encoded)) { throw std::runtime_error("selected archive image " + std::to_string(task->image_id) + " is not a complete JPEG or PNG"); }
     throw_if_benchmark_cancelled(cancellation_);
     write_cached_image_atomically(cached_image_path(output_root_, task->image_id), task->encoded, cancellation_);
+    if (ready_) ready_({output_root_, task->image_id});
     std::uint64_t completed = 0U;
     {
      const std::lock_guard lock(mutex_);
@@ -407,6 +410,9 @@ CachedImageDirectory extract_selected_archive_images(ArchiveExtractionRequest re
  std::vector<CachedImageRejection> quarantined;
  if (validate_cached_image_group(
       request.output_root, completion, identity, request.selected_image_ids, &image_bytes, request.cancel_requested, request.trace, request.quarantine_unavailable ? &quarantined : nullptr)) {
+  if (request.image_ready) for (const auto id : request.selected_image_ids) {
+   if (!std::ranges::binary_search(quarantined, id, {}, &CachedImageRejection::image_id)) request.image_ready({request.output_root, id});
+  }
   if (request.progress) { request.progress(request.selected_image_ids.size(), request.selected_image_ids.size()); }
   return make_cached_image_directory(request.source, request.shard, std::move(request.output_root), identity, request.selected_image_ids, image_bytes, true, std::move(quarantined));
  }
@@ -447,6 +453,7 @@ CachedImageDirectory extract_selected_archive_images(ArchiveExtractionRequest re
      continue;
     }
    }
+   if (request.image_ready) request.image_ready({request.output_root, image_id});
    completed.emplace(image_id);
    image_bytes = checked_byte_add(image_bytes, bytes);
   }
@@ -459,7 +466,7 @@ CachedImageDirectory extract_selected_archive_images(ArchiveExtractionRequest re
   request.activity(
    request.cache_write_workers == 0U ? "Preparing inline selected-image cache writes" : "Preparing bounded cache-write queue with " + std::to_string(request.cache_write_workers) + " workers");
  }
- CachedImageWritePool write_pool(request.cache_write_workers, pending_writes, request.output_root, request.progress, completed.size(), request.cancel_requested);
+ CachedImageWritePool write_pool(request.cache_write_workers, pending_writes, request.output_root, request.progress, completed.size(), request.cancel_requested, request.image_ready);
  std::unordered_set<std::uint64_t> scheduled;
  scheduled.reserve(pending_writes);
  ArchiveReader reader(archive_read_new());

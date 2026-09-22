@@ -20,6 +20,11 @@ ProgressReporter::ProgressReporter(BenchmarkProgressCallback callback, const Ben
 void ProgressReporter::phase(const DatasetCompilePhase phase, const std::uint64_t completed, const std::uint64_t total) {
  if (!callback_ && !*trace_) { return; }
  const std::lock_guard lock(mutex_);
+ // Acquisition remains the aggregate foreground while independently running
+ // annotation admission reports its own source activity. Pixels stay private
+ // until the compiler explicitly enters the settled pixel tail.
+ if (state_.phase == DatasetCompilePhase::Extracting &&
+     (phase == DatasetCompilePhase::Downloading || phase == DatasetCompilePhase::Indexing)) return;
  const bool phase_changed = state_.phase != phase;
  if (phase == DatasetCompilePhase::Extracting && state_.phase != DatasetCompilePhase::Extracting) {
   for (BenchmarkSourceProgress& source : state_.sources) {
@@ -36,7 +41,12 @@ void ProgressReporter::phase(const DatasetCompilePhase phase, const std::uint64_
   }
  }
  state_.phase = phase;
- state_.completed = completed;
+ if (phase == DatasetCompilePhase::Indexing) {
+  if (!completed || total != indexed_total_) indexed_completed_ = completed;
+  else indexed_completed_ = std::max(indexed_completed_, completed);
+  indexed_total_ = total;
+ }
+ state_.completed = phase == DatasetCompilePhase::Indexing ? indexed_completed_ : completed;
  state_.total = total;
  if (phase_changed || state_.activity.empty()) {
   state_.current_source.reset();
@@ -51,26 +61,29 @@ void ProgressReporter::activity(std::string activity) {
  set_activity_unlocked(std::move(activity));
  emit();
 }
-void ProgressReporter::pixel_attempt(const std::uint64_t completed, const std::uint64_t total, const std::string_view split, const std::uint64_t split_total) {
+void ProgressReporter::pixel_attempt(const std::uint64_t completed, const std::uint64_t total, const std::string_view split, const std::uint64_t split_total, bool foreground) {
  if (!pixel_observer_enabled()) { return; }
  const std::lock_guard lock(mutex_);
  if (callback_ && state_.pixel_attempt == std::numeric_limits<std::uint64_t>::max()) { throw std::overflow_error("benchmark pixel attempt counter overflow"); }
- state_.current_source.reset();
- state_.phase = DatasetCompilePhase::Pixels;
- set_activity_unlocked(default_phase_activity(DatasetCompilePhase::Pixels));
- activity_started_ = Clock::now();
- if (callback_) {
-  state_.completed = completed;
-  state_.total = total;
-  ++state_.pixel_attempt;
-  state_.pixel_attempt_offset = completed;
-  state_.activity_elapsed_seconds = 0U;
+ if (foreground) {
+  state_.current_source.reset();
+  state_.phase = DatasetCompilePhase::Pixels;
+  set_activity_unlocked(default_phase_activity(DatasetCompilePhase::Pixels));
+  activity_started_ = Clock::now();
+  if (callback_) {
+   state_.completed = completed;
+   state_.total = total;
+   ++state_.pixel_attempt;
+   state_.pixel_attempt_offset = completed;
+   state_.activity_elapsed_seconds = 0U;
+  }
  }
+ pixel_started_ = *trace_ ? Clock::now() : Clock::time_point{};
  pixel_completed_before_ = completed;
  pixel_split_ = split;
  pixel_split_total_ = split_total;
  pixel_completed_ = 0U;
- if (callback_) { emit(); }
+ if (callback_ && foreground) { emit(); }
 }
 void ProgressReporter::pixel_completed() {
  const std::lock_guard lock(mutex_);
@@ -78,12 +91,12 @@ void ProgressReporter::pixel_completed() {
  ++pixel_completed_;
  constexpr std::uint64_t kPixelProgressQuantum = 64U;
  if ((pixel_completed_ % kPixelProgressQuantum) != 0U && pixel_completed_ != pixel_split_total_) { return; }
- if (callback_) {
+ if (callback_ && state_.phase == DatasetCompilePhase::Pixels) {
   state_.completed = pixel_completed_before_ + pixel_completed_;
   emit();
  }
  if (trace_ != nullptr && *trace_) {
-  const double elapsed_seconds = std::chrono::duration<double>(Clock::now() - activity_started_).count();
+  const double elapsed_seconds = std::chrono::duration<double>(Clock::now() - pixel_started_).count();
   const double images_per_second = elapsed_seconds > 0.0 ? static_cast<double>(pixel_completed_) / elapsed_seconds : 0.0;
   const double eta_seconds = images_per_second > 0.0 ? static_cast<double>(pixel_split_total_ - pixel_completed_) / images_per_second : 0.0;
   trace_benchmark_event(*trace_, "benchmark.pixel_compile.throughput", [&] {
@@ -280,6 +293,25 @@ void ProgressReporter::update_source_phase_progress() {
   add_progress(state_.completed, scaled_completed, "benchmark extraction progress overflow");
   add_progress(state_.total, kSourceProgressScale, "benchmark extraction progress overflow");
  }
+}
+IndexingProgressTotals::IndexingProgressTotals(std::span<const std::uint64_t> totals) {
+ releases_.reserve(totals.size());
+ for (const auto total : totals) {
+  if (total > std::numeric_limits<std::uint64_t>::max() - total_) throw std::overflow_error("benchmark indexing total overflow");
+  total_ += total;
+  releases_.push_back({0, total});
+ }
+}
+void IndexingProgressTotals::update(std::size_t release, std::uint64_t completed, ProgressReporter& reporter) {
+ if (!reporter.normalization_observer_enabled()) return;
+ const std::lock_guard lock(mutex_);
+ auto& observation = releases_.at(release);
+ // A release-local repair may restart its parser. Already reported row work
+ // remains admitted until the preparation attempt itself is replaced.
+ const auto admitted = std::max(observation.completed, std::min(completed, observation.total));
+ completed_ += admitted - observation.completed;
+ observation.completed = admitted;
+ reporter.phase(DatasetCompilePhase::Indexing, completed_, total_);
 }
 void ArtifactProgressTotals::update(const DownloadProgress& update, ProgressReporter& reporter) {
  if (!reporter.transfer_observer_enabled()) { return; }

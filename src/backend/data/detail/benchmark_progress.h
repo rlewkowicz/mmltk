@@ -1,5 +1,6 @@
 #pragma once
 #include <chrono>
+#include <cstddef>
 #include <span>
 #include <cstdint>
 #include <mutex>
@@ -8,6 +9,7 @@
 #include <string_view>
 #include <map>
 #include <unordered_map>
+#include <vector>
 #include "src/backend/data/benchmark_dataset_compiler.h"
 #include "benchmark_cache.h"
 #include "benchmark_download.h"
@@ -17,7 +19,7 @@ public:
  ProgressReporter(BenchmarkProgressCallback callback, const BenchmarkTraceSink& trace, std::span<const BenchmarkDatasetSource> sources = {});
  void phase(const DatasetCompilePhase phase, const std::uint64_t completed = 0U, const std::uint64_t total = 0U);
  void activity(std::string activity);
- void pixel_attempt(const std::uint64_t completed, const std::uint64_t total, const std::string_view split, const std::uint64_t split_total);
+ void pixel_attempt(const std::uint64_t completed, const std::uint64_t total, const std::string_view split, const std::uint64_t split_total, bool foreground = true);
  void pixel_completed();
  void source_activity(const BenchmarkDatasetSource source, std::string activity);
  [[nodiscard]] bool transfer_observer_enabled() const noexcept;
@@ -45,10 +47,25 @@ private:
  const BenchmarkTraceSink* trace_ = nullptr;
  BenchmarkCompileProgress state_;
  std::chrono::steady_clock::time_point activity_started_{};
+ std::chrono::steady_clock::time_point pixel_started_{};
+ std::uint64_t indexed_completed_ = 0, indexed_total_ = 0;
  std::string_view pixel_split_;
  std::uint64_t pixel_split_total_ = 0U;
  std::uint64_t pixel_completed_ = 0U;
  std::uint64_t pixel_completed_before_ = 0U;
+ std::mutex mutex_;
+};
+// One instance belongs to one preparation attempt. Each release contributes
+// its full-import row count once; metadata projection does not count twice.
+class IndexingProgressTotals final {
+public:
+ explicit IndexingProgressTotals(std::span<const std::uint64_t> totals);
+ void update(std::size_t release, std::uint64_t completed, ProgressReporter& reporter);
+
+private:
+ struct Observation { std::uint64_t completed = 0, total = 0; };
+ std::vector<Observation> releases_;
+ std::uint64_t completed_ = 0, total_ = 0;
  std::mutex mutex_;
 };
 // One instance belongs to one acquisition scope (metadata, images, or repair).
