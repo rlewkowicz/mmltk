@@ -1808,6 +1808,7 @@ TEST_CASE("benchmark selections persist as one canonical nested value and reject
  namespace data = mmltk::backend::data;
  auto state = default_gui_settings_state();
  CHECK(state.workflows.train.benchmark_selection == data::BenchmarkDatasetSelection{});
+ CHECK_FALSE(state.workflows.train.benchmark_selection.recover_dropped_masks);
  mmltk::testsupport::ScopedTempDir root{"benchmark-settings"};
  const auto path = root.path() / "gui.json";
  for (const auto dataset : {data::BenchmarkDatasetVariant::CocoCustom, data::BenchmarkDatasetVariant::Coconut}) {
@@ -1819,7 +1820,15 @@ TEST_CASE("benchmark selections persist as one canonical nested value and reject
                           SettingsValueUpdate{.path = "workflows.train.benchmark_selection.validation",
                                               .value = *mmltk::frameworks::serialization::wire::FlatValue::text(validation_name, validation_name.size())}};
    REQUIRE(apply_gui_settings_values(state, edits));
-   CHECK(state.workflows.train.benchmark_selection == data::BenchmarkDatasetSelection{dataset, validation});
+   const std::array recovery_edit{SettingsValueUpdate{.path = "workflows.train.benchmark_selection.recover_dropped_masks",
+                                                     .value = mmltk::frameworks::serialization::wire::FlatValue{true}}};
+   REQUIRE(apply_gui_settings_values(state, recovery_edit));
+   CHECK(state.workflows.train.benchmark_selection == data::BenchmarkDatasetSelection{dataset, validation, true});
+   auto previous_format = snapshot_gui_settings(state);
+   previous_format["workflows"]["train"]["dataset_paths"]["benchmark_selection"].erase("recover_dropped_masks");
+   auto migrated = state;
+   apply_gui_settings(previous_format, migrated);
+   CHECK(migrated.workflows.train.benchmark_selection == data::BenchmarkDatasetSelection{dataset, validation, false});
    for (const bool enabled : {false, true}) {
     state.workflows.train.compile_benchmark_dataset_override = enabled;
     auto restored = default_gui_settings_state();

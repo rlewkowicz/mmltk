@@ -10,6 +10,7 @@ MMLTK_REFLECT_ENUM(CoconutValidation)
 struct BenchmarkDatasetSelection {
  BenchmarkDatasetVariant dataset = BenchmarkDatasetVariant::CocoCustom;
  CoconutValidation validation = CoconutValidation::Coconut;
+ bool recover_dropped_masks = false;
  bool operator==(const BenchmarkDatasetSelection&) const = default;
 };
 MMLTK_REFLECT_FIELDS(BenchmarkDatasetSelection)

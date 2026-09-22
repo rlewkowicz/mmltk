@@ -1,4 +1,5 @@
 #include "detail/coconut_annotations.h"
+#include "detail/coconut_mask_recovery.h"
 #include "detail/coconut_inventory.h"
 #include "detail/benchmark_storage.h"
 #include "src/frameworks/reflection/reflected_field_policy.h"
@@ -409,11 +410,6 @@ void retain_images(CoconutComponent& component, std::span<const std::size_t> ord
   throw;
  }
 }
-struct SegmentSupport {
- std::uint64_t area = 0;
- std::uint32_t min_x = UINT32_MAX, min_y = UINT32_MAX, max_x = 0, max_y = 0;
- std::vector<RLEPair> runs;
-};
 class Importer final {
 public:
  explicit Importer(const CoconutImportRequest& request) : request_(request) {
@@ -508,6 +504,8 @@ private:
    support.max_x = 0;
    support.max_y = 0;
    support.runs.clear();
+   support.recovered.reset();
+   support.carved = false;
   }
   const std::uint32_t count = static_cast<std::uint32_t>(static_cast<std::uint64_t>(width) * height);
   for (std::uint32_t begin = 0; begin < count;) {
@@ -547,7 +545,15 @@ private:
    component.input_identity = request_.input_identity;
    component.index.source = index_source(physical.source);
    component.index.split = component_split(request_.edition, physical.source);
+   if (request_.recovery) {
+    component.original_annotation_identity = request_.recovery->original_identity(physical.source);
+    if (!component.original_annotation_identity.empty()) component.recovery_policy = kCoconutRecoveryPolicy;
+   }
   }
+  CoconutRecoveryImage recovery{physical.image_id, 0, {}};
+  if (request_.recovery)
+   request_.recovery->apply(physical.source, record, static_cast<unsigned>(width), static_cast<unsigned>(height),
+                            std::span(support_).first(record.segments.size()), recovery, request_.cancellation);
   auto& index = component.index;
   NormalizedImage image{physical.image_id, index.boxes.size(), 0, static_cast<unsigned>(width), static_cast<unsigned>(height), physical.shard, 0};
   for (std::size_t ordinal = 0; ordinal < record.segments.size(); ++ordinal) {
@@ -560,7 +566,12 @@ private:
     invalid("unknown COCO80 thing category " + std::to_string(segment.category_id));
    if (segment.area && (!std::isfinite(*segment.area) || *segment.area < 0)) invalid("invalid supplied area");
    NormalizedBox box;
-   if (segment.bbox) {
+   if (support.recovered) {
+    box.x1 = support.recovered->x1;
+    box.y1 = support.recovered->y1;
+    box.x2 = support.recovered->x2;
+    box.y2 = support.recovered->y2;
+   } else if (segment.bbox) {
     const auto& supplied = *segment.bbox;
     if (!std::ranges::all_of(supplied, [](double value) { return std::isfinite(value); }) || supplied[2] <= 0 || supplied[3] <= 0 ||
         !std::isfinite(supplied[0] + supplied[2]) || !std::isfinite(supplied[1] + supplied[3]))
@@ -572,6 +583,7 @@ private:
    } else {
     if (support.area == 0) {
      ++index.rejected.degenerate_boxes;
+     ++recovery.unresolved;
      if (request_.rejected_object) {
       try {
        request_.rejected_object(physical, record, segment, "thing segment has neither mask pixels nor an authoritative bbox");
@@ -593,7 +605,8 @@ private:
    box.mask_rle_pairs = static_cast<std::uint32_t>(support.runs.size());
    box.class_id = static_cast<std::uint8_t>(categories[segment.category_id]);
    box.flags = kAnnotationMask | kAnnotationId | kAnnotationCategory | (segment.crowd ? kAnnotationCrowd : 0U) | (segment.ignore ? kAnnotationIgnore : 0U);
-   box.original_area = segment.area.value_or(static_cast<double>(support.area));
+   box.original_area = support.recovered ? support.recovered->original_area
+                                        : support.carved ? static_cast<double>(support.area) : segment.area.value_or(static_cast<double>(support.area));
    box.annotation_id = segment.id;
    box.source_category_id = segment.category_id;
    if (ordinal > UINT64_MAX - record.first_segment_ordinal) invalid("source ordinal overflow");
@@ -604,12 +617,13 @@ private:
   }
   index.images.push_back(image);
   component.inventory.push_back({physical, record.image_id, record.source_ordinal});
+  if (component.recovery_policy) component.recovery.push_back(std::move(recovery));
  }
  const CoconutImportRequest& request_;
  std::unordered_set<PhysicalKey, PhysicalKeyHash> offered_;
  std::map<CoconutImageNamespace, CoconutComponent> components_;
  std::unordered_map<std::uint32_t, std::size_t> segment_by_id_;
- std::vector<SegmentSupport> support_;
+ std::vector<CoconutSegmentSupport> support_;
  std::uint64_t rows_ = 0;
 };
 std::uint32_t dimension(const Json& image, std::string_view field, const CoconutImportLimits& limits) {

@@ -1737,6 +1737,7 @@ mod tests {
                     );
                     assert!(controller.driver.running());
                     let original = BenchmarkDatasetSelection {
+                        recoverdroppedmasks: false,
                         dataset,
                         validation,
                     };
@@ -1782,6 +1783,7 @@ mod tests {
                         let train = &mut snapshot.settingsstate.workflows.train;
                         train.compilebenchmarkdatasetoverride = !enabled;
                         train.benchmarkselection = BenchmarkDatasetSelection {
+                            recoverdroppedmasks: false,
                             dataset,
                             validation,
                         };

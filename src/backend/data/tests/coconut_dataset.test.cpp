@@ -1,5 +1,7 @@
 #include "detail/benchmark_annotation_cache.h"
 #include "detail/coconut_annotations.h"
+#include "detail/coconut_mask_recovery.h"
+#include "detail/mask_rle_utils.h"
 #include "detail/benchmark_recipe.h"
 #include "detail/benchmark_images.h"
 #include "detail/benchmark_image_decoder.h"
@@ -232,10 +234,40 @@ void expect_runs(const CoconutComponent& component, std::span<const RLEPair> exp
   CHECK(component.index.mask_rle_pairs[i].length == expected[i].length);
  }
 }
+NormalizedAnnotationIndex recovery_originals(unsigned image_id, std::span<const RLEPair> masks) {
+ NormalizedAnnotationIndex index;
+ index.annotation_sha256 = "original-instances-fixture";
+ index.split = "train2017";
+ index.images.push_back({.source_image_id = image_id, .box_count = static_cast<std::uint32_t>(masks.size()), .width = 3, .height = 3});
+ for (std::size_t i = 0; i < masks.size(); ++i) {
+  NormalizedBox box;
+  box.x1 = 0.1F; box.y1 = 0.2F; box.x2 = 0.8F; box.y2 = 0.9F;
+  box.mask_rle_offset = i;
+  box.mask_rle_pairs = 1;
+  box.class_id = 16;
+  box.flags = kAnnotationMask | kAnnotationId | kAnnotationCategory;
+  box.annotation_id = 200 - i * 100;
+  box.source_category_id = 18;
+  box.original_area = 42 + static_cast<double>(i);
+  index.boxes.push_back(box);
+  index.mask_rle_pairs.push_back(masks[i]);
+ }
+ return index;
+}
+CoconutSegmentSupport recovery_support(std::span<const RLEPair> runs) {
+ CoconutSegmentSupport support;
+ support.runs.assign(runs.begin(), runs.end());
+ const auto bounds = dataset::row_major_mask_bounds(runs, {3, 3});
+ support.min_x = bounds.min_x; support.min_y = bounds.min_y;
+ support.max_x = bounds.max_x; support.max_y = bounds.max_y;
+ for (const auto run : runs) support.area += run.length;
+ return support;
+}
 }  // namespace
 TEST_CASE("COCONut release selection and fixed catalog are pinned", "[coconut]") {
  CHECK(BenchmarkDatasetSelection{}.dataset == BenchmarkDatasetVariant::CocoCustom);
  CHECK(BenchmarkDatasetSelection{}.validation == CoconutValidation::Coconut);
+ CHECK_FALSE(BenchmarkDatasetSelection{}.recover_dropped_masks);
  CHECK_FALSE(valid_benchmark_selection({static_cast<BenchmarkDatasetVariant>(4), CoconutValidation::Coconut}));
  CHECK_FALSE(valid_benchmark_selection({BenchmarkDatasetVariant::Coconut, static_cast<CoconutValidation>(4)}));
  REQUIRE(coconut_release_catalog().size() == 5);
@@ -2105,4 +2137,190 @@ TEST_CASE("one stock request builds both splits and retains newly settled train 
  CHECK(completed == 2);
  CHECK(server.requests() == 1);
  server.Check();
+}
+
+TEST_CASE("COCONut recovers the complete dropped dog candidate set and carves source supporters", "[coconut][benchmark]") {
+ ScopedTempDir root("coconut-recovery");
+ unsigned image_id = 2212;
+ unsigned supporter_category = 63;
+ bool enabled = true;
+ bool empty_supporter = false;
+ std::vector<RLEPair> masks{{0, 2}, {1, 2}};  // Independent originals intentionally overlap.
+ SECTION("two dogs on couch") {}
+ SECTION("dog on boat") { image_id = 400; supporter_category = 9; masks.resize(1); }
+ SECTION("recovery off retains the previous omission and metadata") { enabled = false; }
+ SECTION("an emptied supporter is omitted without recursive recovery") { empty_supporter = true; }
+ auto originals = recovery_originals(image_id, masks);
+ CoconutMaskRecovery recovery(&originals, nullptr);
+ auto couch = segment(30, supporter_category);
+ couch["area"] = 99;
+ Json segments = Json::array({segment(20, 18), couch});
+ if (masks.size() == 2) segments.push_back(segment(10, 18));
+ std::array<std::uint32_t, 9> pixels{30, 30, 30, 30, 30, 30, 30, 30, 30};
+ if (empty_supporter) pixels = {30, 30, 30, 0, 0, 0, 0, 0, 0};
+ const std::array physical{coco(image_id)};
+ auto input = request(physical);
+ input.parquet_shards = {root.path() / "dogs.parquet"};
+ input.recovery = enabled ? &recovery : nullptr;
+ std::uint64_t rejected = 0;
+ input.rejected_object = [&](const auto&, const auto&, const auto&, auto) { ++rejected; };
+ parquet_file(input.parquet_shards[0], Json::array({hf_row(image_id, png(3, 3, pixels), segments)}));
+ const auto result = import_coconut_annotations(input);
+ REQUIRE(result.size() == 1);
+ const auto& component = result.front();
+ REQUIRE(component.index.images.size() == 1);
+ CHECK(component.index.images[0].source_image_id == image_id);
+ if (!enabled) {
+  REQUIRE(component.index.boxes.size() == 1);
+  CHECK(component.index.boxes[0].annotation_id == 30);
+  CHECK(component.index.boxes[0].original_area == 99);
+  CHECK(rejected == masks.size());
+  CHECK(component.recovery.empty());
+  const std::array<RLEPair, 1> unchanged{{{0, 9}}};
+  expect_runs(component, unchanged);
+  return;
+ }
+ REQUIRE(component.recovery.size() == 1);
+ const auto& facts = component.recovery.front();
+ CHECK(component.recovery_policy == kCoconutRecoveryPolicy);
+ CHECK(component.original_annotation_identity == originals.annotation_sha256);
+ CHECK(facts.image_id == image_id);
+ CHECK(facts.unresolved == (empty_supporter ? 1U : 0U));
+ CHECK(rejected == facts.unresolved);
+ REQUIRE(facts.objects.size() == masks.size());
+ CHECK(facts.objects.front().annotation_id == (masks.size() == 2 ? 10 : 20));
+ CHECK(facts.objects.front().original_annotation_id == (masks.size() == 2 ? 100 : 200));
+ REQUIRE(component.index.boxes.size() == masks.size() + (empty_supporter ? 0 : 1));
+ for (const auto& box : component.index.boxes) {
+  const auto runs = std::span(component.index.mask_rle_pairs).subspan(box.mask_rle_offset, box.mask_rle_pairs);
+  REQUIRE(runs.size() == 1);
+  if (box.annotation_id == 30) {
+   CHECK(box.original_area == (masks.size() == 2 ? 6 : 7));
+   CHECK(runs[0].start == (masks.size() == 2 ? 3 : 2));
+   CHECK(runs[0].start + runs[0].length == 9);
+   CHECK(box.y1 == (masks.size() == 2 ? 1.0F / 3.0F : 0.0F));
+  } else {
+   CHECK(box.source_category_id == 18);
+   CHECK(box.x1 == 0.1F);
+   CHECK(box.y1 == 0.2F);
+   CHECK(box.x2 == 0.8F);
+   CHECK(box.y2 == 0.9F);
+   CHECK(box.source_ordinal == (box.annotation_id == 20 ? 0 : 2));
+   CHECK(box.original_area == (box.annotation_id == 10 ? 43 : 42));
+   CHECK(runs[0].start == (box.annotation_id == 10 ? 1 : 0));
+   CHECK(runs[0].length == 2);
+  }
+ }
+}
+TEST_CASE("COCONut recovery requires a unique represented match and exact remaining candidate count", "[coconut][benchmark]") {
+ const std::array<RLEPair, 2> masks{{{0, 2}, {3, 2}}};
+ auto originals = recovery_originals(7, masks);
+ CoconutRecord record;
+ record.image_id = 7;
+ record.first_segment_ordinal = 5;
+ record.segments = {{.id = 20, .category_id = 18, .isthing = true}, {.id = 10, .category_id = 18, .isthing = true},
+                    {.id = 30, .category_id = 63, .isthing = true, .bbox = std::array<double, 4>{-1, 0, 5, 3}}};
+ const std::array<RLEPair, 1> whole{{{0, 9}}};
+ std::vector<CoconutSegmentSupport> support{recovery_support(std::span(masks).first(1)), {}, recovery_support(whole)};
+ auto source = CoconutImageNamespace::CocoTrain;
+ bool accepted = false;
+ bool unavailable = false;
+ bool wrong_split = false;
+ SECTION("represented dog excludes its original and boxed couch is carved") { accepted = true; }
+ SECTION("one survivor intersects both originals") { support[0] = recovery_support(std::array<RLEPair, 1>{{{0, 5}}}); }
+ SECTION("survivor has no positive match") { support[0] = recovery_support(std::array<RLEPair, 1>{{{6, 1}}}); }
+ SECTION("survivor has bbox but no usable mask") { support[0] = {}; record.segments[0].bbox = std::array<double, 4>{0, 0, 1, 1}; }
+ SECTION("two survivors claim one original") {
+  record.segments.push_back({.id = 40, .category_id = 18, .isthing = true});
+  support.push_back(support[0]);
+  originals.boxes.push_back(originals.boxes.back());
+  originals.boxes.back().annotation_id = 300;
+  ++originals.images[0].box_count;
+ }
+ SECTION("unrelated extra original is not recovered") {
+  originals.boxes.push_back(originals.boxes.back());
+  originals.boxes.back().annotation_id = 300;
+  ++originals.images[0].box_count;
+ }
+ SECTION("duplicate original identity") { originals.boxes[1].annotation_id = originals.boxes[0].annotation_id; }
+ SECTION("invalid candidate mask") { originals.mask_rle_pairs[1].length = 100; }
+ SECTION("candidate without mask presence") { originals.boxes[1].flags &= ~kAnnotationMask; }
+ SECTION("invalid original box") { originals.boxes[1].x2 = originals.boxes[1].x1; }
+ SECTION("mismatched dimensions") { originals.images[0].width = 4; }
+ SECTION("mismatched physical identity") { originals.images[0].source_image_id = 8; }
+ SECTION("duplicate physical identity") { originals.images.push_back(originals.images[0]); }
+ SECTION("originals unavailable") { unavailable = true; }
+ SECTION("unlabeled namespace cannot use train originals") { source = CoconutImageNamespace::CocoUnlabeled; }
+ SECTION("crowd mismatch remains omitted") { originals.boxes[1].flags |= kAnnotationCrowd; }
+ SECTION("ignore mismatch remains omitted") { originals.boxes[1].flags |= kAnnotationIgnore; }
+ SECTION("matching crowd and ignore group recovers") {
+  accepted = true;
+  record.segments[1].crowd = record.segments[1].ignore = true;
+  originals.boxes[1].flags |= kAnnotationCrowd | kAnnotationIgnore;
+ }
+ SECTION("an empty mask with an authoritative box is never a dropped slot") { record.segments[1].bbox = std::array<double, 4>{0, 0, 1, 1}; }
+ SECTION("validation uses its own original index") {
+  accepted = true;
+  source = CoconutImageNamespace::CocoValidation;
+  originals.split = "val2017";
+ }
+ SECTION("train rejects validation originals") { wrong_split = true; originals.split = "val2017"; }
+ SECTION("validation rejects train originals") { wrong_split = true; source = CoconutImageNamespace::CocoValidation; }
+ SECTION("train rejects a noncanonical split") { wrong_split = true; originals.split = "train"; }
+ SECTION("validation rejects a noncanonical split") {
+  wrong_split = true;
+  source = CoconutImageNamespace::CocoValidation;
+  originals.split = "validation";
+ }
+ const auto unchanged_support = support;
+ CoconutMaskRecovery recovery(unavailable ? nullptr : &originals, &originals);
+ CoconutRecoveryImage facts{7, 0, {}};
+ recovery.apply(source, record, 3, 3, support, facts);
+ CHECK(facts.objects.size() == (accepted ? 1 : 0));
+ if (wrong_split) {
+  CHECK(recovery.original_identity(source).empty());
+  REQUIRE(support.size() == unchanged_support.size());
+  for (std::size_t i = 0; i < support.size(); ++i) {
+   CHECK(support[i].area == unchanged_support[i].area);
+   CHECK(support[i].min_x == unchanged_support[i].min_x);
+   CHECK(support[i].min_y == unchanged_support[i].min_y);
+   CHECK(support[i].max_x == unchanged_support[i].max_x);
+   CHECK(support[i].max_y == unchanged_support[i].max_y);
+   CHECK_FALSE(support[i].recovered);
+   CHECK_FALSE(support[i].carved);
+   REQUIRE(support[i].runs.size() == unchanged_support[i].runs.size());
+   for (std::size_t run = 0; run < support[i].runs.size(); ++run) {
+    CHECK(support[i].runs[run].start == unchanged_support[i].runs[run].start);
+    CHECK(support[i].runs[run].length == unchanged_support[i].runs[run].length);
+   }
+  }
+ }
+ CHECK(support[1].recovered.has_value() == accepted);
+ CHECK(support[2].carved == accepted);
+ CHECK(support[0].area == (support[0].runs.empty() ? 0 : support[0].runs[0].length));
+ if (accepted) {
+  CHECK(recovery.original_identity(source) == originals.annotation_sha256);
+  CHECK(facts.objects[0].original_annotation_id == 100);
+  CHECK(facts.objects[0].annotation_id == 10);
+  CHECK(facts.objects[0].source_ordinal == 6);
+  CHECK(support[1].area == 2);
+  CHECK(support[2].area == 7);
+  REQUIRE(record.segments[2].bbox);
+  CHECK((*record.segments[2].bbox)[0] == -1);
+ }
+}
+TEST_CASE("COCONut recovery propagates cancellation before mutating masks", "[coconut][benchmark]") {
+ const std::array<RLEPair, 1> masks{{{0, 2}}};
+ const auto originals = recovery_originals(7, masks);
+ CoconutMaskRecovery recovery(&originals, nullptr);
+ CoconutRecord record;
+ record.image_id = 7;
+ record.segments = {{.id = 10, .category_id = 18, .isthing = true}};
+ std::vector<CoconutSegmentSupport> support(1);
+ CoconutRecoveryImage facts{7, 0, {}};
+ std::atomic<bool> cancelled{true};
+ CHECK_THROWS(recovery.apply(CoconutImageNamespace::CocoTrain, record, 3, 3, support, facts,
+                             mmltk::common::concurrency::CancellationObservation::Atomic(cancelled)));
+ CHECK(support[0].runs.empty());
+ CHECK(facts.objects.empty());
 }

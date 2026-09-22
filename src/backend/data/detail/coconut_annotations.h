@@ -40,11 +40,29 @@ public:
 private:
  std::unordered_map<CoconutImageNamespace, std::unordered_map<std::uint64_t, const CoconutPhysicalImage*>> namespaces_;
 };
+class CoconutMaskRecovery;
+struct CoconutRecoveredObject {
+ std::uint64_t annotation_id = 0;
+ std::uint64_t source_ordinal = 0;
+ std::uint64_t source_category_id = 0;
+ std::uint64_t original_annotation_id = 0;
+};
+MMLTK_REFLECT_FIELDS(CoconutRecoveredObject)
+struct CoconutRecoveryImage {
+ std::uint64_t image_id = 0;
+ std::uint64_t unresolved = 0;
+ std::vector<CoconutRecoveredObject> objects;
+};
+MMLTK_REFLECT_FIELDS(CoconutRecoveryImage)
 struct CoconutComponent {
  CoconutEdition edition = CoconutEdition::Base;
  CoconutImageNamespace source = CoconutImageNamespace::CocoTrain;
  std::string input_identity;
  NormalizedAnnotationIndex index;
+ std::uint32_t recovery_policy = 0;
+ std::string original_annotation_identity;
+ // Image-keyed recovery facts, independent of normalized storage offsets.
+ std::vector<CoconutRecoveryImage> recovery;
  // Exactly one entry per normalized image, in the same order.
  std::vector<CoconutInventoryImage> inventory;
 };
@@ -84,6 +102,8 @@ struct CoconutImportRequest {
  std::filesystem::path annotation_json;
  std::filesystem::path mask_archive;
  const CoconutPhysicalMembership* physical_membership = nullptr;
+ // Synchronous borrow; the owner and its original indexes outlive import.
+ CoconutMaskRecovery* recovery = nullptr;
  std::uint64_t expected_rows = 0;
  CoconutImportLimits limits;
  mmltk::common::concurrency::CancellationObservation cancellation;

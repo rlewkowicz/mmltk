@@ -166,7 +166,11 @@ struct JsonFieldReader {
  const nlohmann::json& json;
  template <typename T>
  void operator()(const char* key, T& value) const {
-  if constexpr (std::is_enum_v<T>) {
+  if constexpr (std::is_same_v<T, mmltk::backend::data::BenchmarkDatasetVariant> || std::is_same_v<T, mmltk::backend::data::CoconutValidation>) {
+   auto index = static_cast<std::underlying_type_t<T>>(value);
+   get_optional(json, key, index);
+   value = static_cast<T>(index);
+  } else if constexpr (std::is_enum_v<T>) {
    int index = static_cast<int>(value);
    get_optional(json, key, index);
    value = static_cast<T>(index);
@@ -254,15 +258,10 @@ struct JsonFieldReader {
   } else if constexpr (std::is_same_v<T, mmltk::backend::data::BenchmarkDatasetSelection>) {
    if (found == json.end()) return;
    if (!found->is_object()) throw std::runtime_error("benchmark_selection must be an object");
-   fields(value, [&]<class Enum>(const char* member, Enum& selection) {
-    const auto field = found->find(member);
-    if (field == found->end()) return;
-    std::underlying_type_t<Enum> index{};
-    mmltk::frameworks::serialization::decode_json_value_exact(*field, index);
-    const auto candidate = static_cast<Enum>(index);
-    if (!mmltk::frameworks::reflection::enum_contains(candidate)) throw std::runtime_error("benchmark selection is invalid");
-    selection = candidate;
-   });
+   T candidate{};
+   fields(candidate, JsonFieldReader{*found});
+   if (!mmltk::backend::data::valid_benchmark_selection(candidate)) throw std::runtime_error("benchmark selection is invalid");
+   value = candidate;
   } else if constexpr (std::is_same_v<T, mmltk::backend::models::rfdetr::MatchFreeSupervisionConfig> ||
                        std::is_same_v<T, mmltk::backend::models::rfdetr::DenoisingSupervisionConfig>) {
    if (found == json.end()) return;

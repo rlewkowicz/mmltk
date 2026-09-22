@@ -71,6 +71,7 @@ mmltk_register_ordinary_sources(mmltk_backend_data
     compiled_dataset.cpp
     benchmark_annotations.cpp
     coconut_annotations.cpp
+    coconut_mask_recovery.cpp
     coconut_parquet.cpp
     coconut_catalog.cpp
     benchmark_annotation_cache.cpp
@@ -105,6 +106,7 @@ mmltk_register_private_headers(mmltk_backend_data
     detail/benchmark_annotation_cache.h
     detail/benchmark_annotations.h
     detail/coconut_annotations.h
+    detail/coconut_mask_recovery.h
     detail/coconut_catalog.h
     detail/coconut_inventory.h
     detail/benchmark_cache.h

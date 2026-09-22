@@ -422,9 +422,10 @@ TEST_CASE("dataset compile observes the settled benchmark selection and retains 
  edit.updates = {{.path = "workflows.train.compile_benchmark_dataset_override", .value = FlatValue{true}},
                  {.path = "workflows.train.benchmark_selection.dataset", .value = *FlatValue::text("Coconut", 7U)},
                  {.path = "workflows.train.benchmark_selection.validation", .value = *FlatValue::text("CoconutStock", 12U)},
+                 {.path = "workflows.train.benchmark_selection.recover_dropped_masks", .value = FlatValue{true}},
                  {.path = "workflows.train.compiled_dataset_dir", .value = *FlatValue::text((root.path() / "output").string(), 4096U)}};
  const auto settled = settings.Update(std::move(edit));
- const data::BenchmarkDatasetSelection selected{data::BenchmarkDatasetVariant::Coconut, data::CoconutValidation::CoconutStock};
+ const data::BenchmarkDatasetSelection selected{data::BenchmarkDatasetVariant::Coconut, data::CoconutValidation::CoconutStock, true};
  REQUIRE(settled.settings_state.workflows.train.benchmark_selection == selected);
  UnusedWeightOperations weights;
  DiagnosticCompiler compiler;
@@ -441,7 +442,8 @@ TEST_CASE("dataset compile observes the settled benchmark selection and retains 
  CHECK(dataset.snapshot().active);
  CHECK(compiler.selection == selected);
  contracts::SettingsUpdateRequest later;
- later.updates = {{.path = "workflows.train.benchmark_selection.validation", .value = *FlatValue::text("Stock", 5U)},
+ later.updates = {{.path = "workflows.train.benchmark_selection.recover_dropped_masks", .value = FlatValue{false}},
+                  {.path = "workflows.train.benchmark_selection.validation", .value = *FlatValue::text("Stock", 5U)},
                   {.path = "workflows.train.compile_benchmark_dataset_override", .value = FlatValue{false}}};
  const auto changed = settings.Update(std::move(later));
  CHECK(changed.settings_state.workflows.train.benchmark_selection.validation == data::CoconutValidation::Stock);

@@ -26,6 +26,7 @@ pub const BENCHMARK_COCONUT_ID: &str = "train.dataset.benchmark.coconut";
 pub const COCONUT_VALIDATION_ID: &str = "train.dataset.validation.coconut";
 pub const STOCK_VALIDATION_ID: &str = "train.dataset.validation.stock";
 pub const COCONUT_STOCK_ID: &str = "train.dataset.validation.coconut_stock";
+pub const RECOVER_DROPPED_MASKS_ID: &str = "train.dataset.coconut.recover_dropped_masks";
 pub const MATCH_FREE_ASSIGNMENT_ID: &str = "train.advanced.assignment.match_free";
 
 #[derive(Debug, Clone)]

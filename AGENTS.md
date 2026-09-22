@@ -327,9 +327,16 @@ validation.
 
 - The main agent runs these ordered stages: full tidy, full build, every
   applicable cleanup profile, full tidy, cleanup review/remediation, final full
-  build, focused tests/acceptance. Cleanup never
+  build, the complete `all` suite, then Wayland acceptance. Cleanup never
   precedes successful initial tidy/build or follows the final build; tests
   require that final build to pass.
+- The final test and acceptance gate is always exactly
+  `./mmltk --test all`, followed by
+  `./mmltk --test workspace-wayland --headless-compositor`.
+  Both must pass. Do not replace or supplement them with focused tests,
+  individual executables, additional suites, or plan-specific acceptance
+  commands. Put required feature coverage in these existing suites; diagnostic
+  investigation does not create another acceptance gate.
 - Both builds use `./mmltk --build`. Both tidy passes use the complete
   configured `./mmltk --tidy` suite regardless of changed files or commits.
   Resolve every genuine finding before the initial build. Do not reuse earlier
@@ -368,12 +375,12 @@ validation.
 - After the reviewer returns `COMPLETE` and cleanup and tidy reruns are clean,
   commit all outstanding tracked cleanup, tidy, and remediation changes with
   the exact message `post cleanup`; keep `actionplan.md` uncommitted.
-- From `post cleanup`, run the final full build once, then the plan's focused
-  tests and acceptance sequence, with no intervening cleanup/tidy. If validation
-  fails, the main agent diagnoses and edits the cause, rebuilds affected product
-  code with `./mmltk --build`, and reruns the required tests. Do not add a review
-  or delegation step, repeat cleanup/tidy, or reopen cleanup review for these
-  fixes.
+- From `post cleanup`, run the final full build once, then the complete `all`
+  suite and Wayland acceptance above, with no intervening cleanup/tidy. If
+  validation fails, the main agent diagnoses and edits the cause, rebuilds
+  affected product code with `./mmltk --build`, and reruns both required commands
+  in that order. Do not add a review or delegation step, repeat cleanup/tidy,
+  or reopen cleanup review for these fixes.
 
 ### Workflow-agnostic verifier prompt
 
@@ -595,6 +602,7 @@ or `remediationplan.md`.
 
 Do not add regression tests. You may add standard tests that exercise required
 behavior, boundaries, failure handling, resource safety, and integration.
+Final test selection is fixed by [Final Validation](#final-validation-workflow).
 
 For hardware tests, correct an evidence-identified cause narrowly.
 Roll back only if the targeted failure persists or the test stays stuck at the

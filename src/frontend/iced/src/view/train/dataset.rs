@@ -10,6 +10,7 @@ pub enum Message {
     BenchmarkChanged(bool),
     DatasetChanged(BenchmarkDatasetVariant),
     ValidationChanged(CoconutValidation),
+    RecoverDroppedMasksChanged(bool),
     SourceChanged(String),
     CompiledDirectoryChanged(String),
     InferSplitsChanged(bool),
@@ -47,6 +48,9 @@ pub fn update(model: &mut SettingsModel, message: Message) -> Result<Outcome, St
         })?,
         Message::ValidationChanged(value) => model.edit(cadence, |draft| {
             crate::generated::edit_workflowstrainbenchmarkselectionvalidation(draft, value)
+        })?,
+        Message::RecoverDroppedMasksChanged(value) => model.edit(cadence, |draft| {
+            crate::generated::edit_workflowstrainbenchmarkselectionrecoverdroppedmasks(draft, value)
         })?,
         Message::SourceChanged(value) => model.edit(cadence, |draft| {
             crate::generated::edit_workflowstraindatasetsourcedir(draft, value)
@@ -348,6 +352,14 @@ fn benchmark_choices(
             ));
         }
         if train.benchmarkselection.dataset == BenchmarkDatasetVariant::Coconut {
+            choices = choices.push(
+                container(
+                    checkbox(train.benchmarkselection.recoverdroppedmasks)
+                        .label("Recover dropped masks from original annotations")
+                        .on_toggle_maybe(enabled.then_some(Message::RecoverDroppedMasksChanged)),
+                )
+                .id(super::RECOVER_DROPPED_MASKS_ID),
+            );
             for (label, description, id, value) in [
                 (
                     "Coconut validation",
@@ -405,6 +417,7 @@ mod tests {
                     super::super::COCONUT_VALIDATION_ID,
                     super::super::STOCK_VALIDATION_ID,
                     super::super::COCONUT_STOCK_ID,
+                    super::super::RECOVER_DROPPED_MASKS_ID,
                     "train.dataset.resize.letterbox",
                 ] {
                     if id == Some(&widget::Id::from(control)) {
@@ -436,7 +449,7 @@ mod tests {
         element
             .as_widget_mut()
             .operate(&mut tree, Layout::new(&node), &renderer, &mut bounds);
-        assert_eq!(bounds.0.len(), 6);
+        assert_eq!(bounds.0.len(), 7);
         for (control, rectangle) in &bounds.0 {
             let mut messages = Vec::new();
             let mut shell = Shell::new(
@@ -453,6 +466,10 @@ mod tests {
                 &mut shell,
                 &Rectangle::new(Point::ORIGIN, size),
             );
+            if control == super::super::RECOVER_DROPPED_MASKS_ID {
+                assert!(messages.is_empty());
+                continue;
+            }
             assert_eq!(messages.len(), 1);
             if control == "train.dataset.resize.letterbox" {
                 assert!(matches!(
@@ -477,6 +494,11 @@ mod tests {
             train.benchmarkselection.validation,
             CoconutValidation::Coconut
         );
+        assert!(!train.benchmarkselection.recoverdroppedmasks);
+        assert!(matches!(
+            update(&mut model, Message::RecoverDroppedMasksChanged(true)),
+            Ok(Outcome::SettingsEdited(EditSchedule::Debounce(_)))
+        ));
         for dataset in [
             BenchmarkDatasetVariant::Coconut,
             BenchmarkDatasetVariant::CocoCustom,
@@ -499,6 +521,7 @@ mod tests {
                     let train = &model.draft.as_ref().unwrap().workflows.train;
                     assert_eq!(train.benchmarkselection.dataset, dataset);
                     assert_eq!(train.benchmarkselection.validation, validation);
+                    assert!(train.benchmarkselection.recoverdroppedmasks);
                 }
             }
         }
