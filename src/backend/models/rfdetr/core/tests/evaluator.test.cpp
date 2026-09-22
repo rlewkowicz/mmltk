@@ -2,6 +2,7 @@
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/catch_approx.hpp>
 #include <array>
+#include <bit>
 #include <algorithm>
 #include <optional>
 #include <stdexcept>
@@ -359,4 +360,108 @@ TEST_CASE("COCO maxDets applies independently to each category", "[rfdetr][evalu
  CHECK(owner.evaluate(1, r::EvaluationDetailRetention::Detailed).bbox.ap == Approx(1.0));
  CHECK(r::resolve_evaluation_max_dets(0) == 500);
  CHECK(r::resolve_evaluation_max_dets(1) == 1);
+}
+
+TEST_CASE("packed mask words preserve scalar runs and exception-time state", "[rfdetr][evaluation]") {
+ r::EncodedMask scalar, packed;
+ for (const auto width : {0U, 1U, 7U, 8U, 9U, 63U, 64U, 65U, 127U}) {
+  for (const auto height : {0U, 1U, 3U}) {
+   const auto pixels = width * height;
+   for (unsigned pattern = 0U; pattern < 6U; ++pattern) {
+    const auto value = [=](std::uint32_t pixel) {
+     switch (pattern) {
+      case 0U: return false;
+      case 1U: return true;
+      case 2U: return pixel % 2U == 0U;
+      case 3U: return pixel == pixels / 2U;
+      case 4U: return pixel >= 6U && pixel < 130U;
+      default: return (pixel / 17U) % 2U != 0U;
+     }
+    };
+    // Deliberately unaligned start and nonzero padding bits in the final byte.
+    std::vector<std::uint8_t> bytes(1U + (pixels + 7U) / 8U, 255U);
+    for (std::uint32_t pixel = 0U; pixel < pixels; ++pixel)
+     if (!value(pixel)) bytes[1U + pixel / 8U] &= static_cast<std::uint8_t>(~(1U << (pixel % 8U)));
+    for (const auto allowance : {0U, 1U, 2U, 31U, 512U}) {
+     CAPTURE(width, height, pattern, allowance);
+     const auto encode = [](auto&& operation) {
+      try { operation(); } catch (const std::invalid_argument& error) { return std::string(error.what()); }
+      return std::string{};
+     };
+     const auto scalar_error = encode([&] { r::encode_mask_values_into(height, width, scalar, value, allowance); });
+     const auto packed_error = encode([&] { r::encode_mask_from_packed_data_into(bytes.data() + 1U, height, width, packed, allowance); });
+     CHECK(packed_error == scalar_error);
+     CHECK(packed.height == scalar.height);
+     CHECK(packed.width == scalar.width);
+     CHECK(packed.area == scalar.area);
+     CHECK(packed.runs == scalar.runs);
+     CHECK(packed.runs.capacity() == scalar.runs.capacity());
+    }
+   }
+  }
+ }
+ CHECK_THROWS_AS(r::encode_mask_from_packed_data_into(nullptr, 65536U, 65536U, packed, 0U), std::invalid_argument);
+ CHECK(packed.height == 65536U);
+ CHECK(packed.width == 65536U);
+ CHECK(packed.area == 0U);
+ CHECK(packed.runs.empty());
+ std::size_t remaining = 3U;
+ const std::array<std::uint8_t, 3U> masks{0x05U, 0x00U, 0xffU};
+ for (const auto byte : masks) {
+  r::encode_mask_from_packed_data_into(&byte, 1U, 7U, packed, remaining);
+  remaining -= packed.runs.size();
+ }
+ CHECK(remaining == 0U);
+ CHECK_THROWS_AS(r::encode_mask_from_packed_data_into(masks.data(), 1U, 7U, packed, remaining), std::invalid_argument);
+ CHECK(packed.area == 1U);
+ CHECK(packed.runs.empty());
+}
+TEST_CASE("evaluation retained prefixes preserve score bits records and metrics", "[rfdetr][evaluation][gpu]") {
+ const auto ordinary = box(0, {0, 0, 32, 32});
+ EvaluationFixture fixture({{ordinary, ordinary, box(0, {0, 0, 128, 128})}}, 128,
+  {{{{"area", 1024.0}}, {{"area", 9216.0}, {"ignore", true}}, {{"iscrowd", true}}}});
+ const std::array scores{0.0F, -0.0F, 1.0F, std::numeric_limits<float>::quiet_NaN(), std::numeric_limits<float>::infinity(), 1.0F,
+  -std::numeric_limits<float>::infinity(), std::numeric_limits<float>::quiet_NaN()};
+ const std::array<std::uint32_t, 8U> order{4U, 2U, 5U, 0U, 1U, 6U, 3U, 7U};
+ std::vector<r::Prediction> predictions;
+ for (std::size_t index = 0U; index < scores.size(); ++index)
+  predictions.push_back(box(0, {0, 0, index % 2U == 0U ? 32.0F : 24.0F, 32}, scores[index]));
+ r::EvaluationDatasetOwner full(*fixture.loader, r::EvaluationMetricSet::BBoxAndMask);
+ const auto full_matches = match(full, 0, predictions, predictions.size(), true);
+ REQUIRE(full_matches.mask);
+ for (const auto cap : {1U, 3U, 8U, 12U}) {
+  CAPTURE(cap);
+  r::EvaluationDatasetOwner owner(*fixture.loader, r::EvaluationMetricSet::BBoxAndMask);
+  auto matches = match(owner, 0, predictions, cap, true);
+  const auto count = std::min<std::size_t>(cap, predictions.size());
+  REQUIRE(matches.bbox.size() == count);
+  REQUIRE(matches.mask);
+  REQUIRE(matches.mask->size() == count);
+  CHECK(matches.bbox_iou_candidate_count == count * 3U);
+  CHECK(matches.mask_iou_candidate_count == count * 3U);
+  for (const bool masks : {false, true}) {
+   const auto& actual = masks ? *matches.mask : matches.bbox;
+   const auto& expected = masks ? *full_matches.mask : full_matches.bbox;
+   for (std::size_t index = 0U; index < count; ++index) {
+    CHECK(actual[index].prediction_ordinal == order[index]);
+    CHECK(std::bit_cast<std::uint32_t>(actual[index].score) == std::bit_cast<std::uint32_t>(scores[order[index]]));
+    CHECK(actual[index].image_ordinal == expected[index].image_ordinal);
+    CHECK(actual[index].category_index == expected[index].category_index);
+    CHECK(actual[index].category_rank == expected[index].category_rank);
+    CHECK(actual[index].area_matched_bits == expected[index].area_matched_bits);
+    CHECK(actual[index].area_ignored_bits == expected[index].area_ignored_bits);
+   }
+  }
+  std::vector<r::Prediction> prefix;
+  for (std::size_t index = 0U; index < count; ++index) prefix.push_back(predictions[order[index]]);
+  r::EvaluationDatasetOwner oracle(*fixture.loader, r::EvaluationMetricSet::BBoxAndMask);
+  oracle.merge_matches(match(oracle, 0, prefix, cap, true));
+  owner.merge_matches(std::move(matches));
+  const auto actual = mmltk::frameworks::serialization::reflected_value(owner.evaluate(cap, r::EvaluationDetailRetention::Detailed));
+  const auto expected = mmltk::frameworks::serialization::reflected_value(oracle.evaluate(cap, r::EvaluationDetailRetention::Detailed));
+  REQUIRE(actual);
+  REQUIRE(expected);
+  CHECK(*actual == *expected);
+ }
+ CHECK_THROWS_AS(match(full, 0, predictions, 0U, true), std::invalid_argument);
 }

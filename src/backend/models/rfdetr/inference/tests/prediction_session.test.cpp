@@ -32,6 +32,8 @@
 #include <unistd.h>
 #include "src/backend/models/rfdetr/core/gpu_batch_preprocessor.h"
 #include "src/backend/models/rfdetr/inference/prediction_capacity.h"
+#include "src/backend/models/rfdetr/core/detail/mask_pack_cuda.h"
+#include "src/backend/ml/cuda/numa_host_tensor.h"
 #include "src/backend/models/rfdetr/inference/prediction_count.h"
 #include "src/backend/models/rfdetr/inference/prediction_raw_preparation.h"
 import mmltk.backend.models.rfdetr.inference.prediction;
@@ -512,6 +514,8 @@ TEST_CASE("full HD prediction materializes masks only for threshold survivors", 
   REQUIRE(record.detections.size() == 2U);
   CHECK(record.detections[0].mask.area == 1920U * 1080U);
   CHECK(record.detections[1].mask.area == 0U);
+  CHECK(record.detections[0].mask.runs == std::vector<std::pair<std::uint32_t, std::uint32_t>>{{0U, 1920U * 1080U}});
+  CHECK(record.detections[1].mask.runs.empty());
   CHECK(annotations.count.value() == 0U);
   CHECK(annotations.boxes_xyxy.address == 0U);
   CHECK(annotations.class_references.address == 0U);
@@ -520,6 +524,53 @@ TEST_CASE("full HD prediction materializes masks only for threshold survivors", 
   CHECK(pixels.rgb8 == nullptr);
  }});
  CHECK(result.processed_images == 1U);
+ std::ifstream output(request.output_path);
+ const auto original = nlohmann::json::parse(output);
+ CHECK(original.at("records").at(0).at("detections").at(0).at("mask_rle") == "0:2073600");
+ CHECK(original.at("records").at(0).at("detections").at(1).at("mask_rle") == "");
+ request.include_masks = false;
+ for (const bool encoded : {false, true}) {
+  std::shared_ptr<void> custody;
+  const auto mode = session.Run(request, {reinterpret_cast<std::uintptr_t>(stream), true},
+   {.demand = [=](auto) { return rfdetr::PredictionDemand{.source_pixels = true, .encoded_masks = encoded, .preview_masks = true}; },
+    .completed = [&](const auto& record, auto pixels, const auto& annotations) {
+     REQUIRE(record.detections.size() == 2U);
+     CHECK(record.detections[0].has_mask == encoded);
+     CHECK(record.detections[1].has_mask == encoded);
+     REQUIRE(pixels.rgb8);
+     REQUIRE(pixels.custody);
+     custody = pixels.custody;
+     REQUIRE(annotations.masks_available);
+     REQUIRE(annotations.masks.address != 0U);
+     std::array<std::uint8_t, 2U> samples{};
+     const auto* masks = reinterpret_cast<const std::uint8_t*>(annotations.masks.address);
+     REQUIRE(cudaMemcpyAsync(samples.data(), masks, 1U, cudaMemcpyDeviceToHost, stream) == cudaSuccess);
+     REQUIRE(cudaMemcpyAsync(samples.data() + 1U, masks + 1920U * 1080U, 1U, cudaMemcpyDeviceToHost, stream) == cudaSuccess);
+     REQUIRE(cudaStreamSynchronize(stream) == cudaSuccess);
+     CHECK(samples == std::array<std::uint8_t, 2U>{1U, 0U});
+    }});
+  CHECK(mode.processed_images == 1U);
+  REQUIRE(custody);
+ }
+ request.include_masks = true;
+ request.image_inputs.push_back({image, "second", 43});
+ std::stop_source stop;
+ const auto cancelled = session.RunAndWrite(request, {reinterpret_cast<std::uintptr_t>(stream), true},
+  {.stop = stop.get_token(), .completed = [&](const auto& record, auto, const auto&) {
+    CHECK(record.image_id == 42);
+    REQUIRE(record.detections.size() == 2U);
+    CHECK(record.detections[0].mask.area == 1920U * 1080U);
+    stop.request_stop();
+   }});
+ CHECK(cancelled.cancelled);
+ CHECK(cancelled.processed_images == 1U);
+ std::ifstream preserved(request.output_path);
+ CHECK(nlohmann::json::parse(preserved) == original);
+ request.threshold = 1.0F;
+ const auto empty = session.Run(request, {reinterpret_cast<std::uintptr_t>(stream), true},
+  {.completed = [](const auto& record, auto, const auto&) { CHECK(record.detections.empty()); }});
+ CHECK(empty.processed_images == 2U);
+ CHECK_FALSE(session.HasUnsafeCustody());
 }
 TEST_CASE("bbox-only runtime consumers do not turn mask capacity into demand", "[model][rfdetr][prediction][gpu]") {
  namespace runtime = mmltk::backend::ml::runtime;
@@ -1350,4 +1401,89 @@ TEST_CASE("Analysis providers distinguish empty known and pending counts", "[mod
   CHECK(provider->retired);
   CHECK(output.count.empty());
  }
+}
+
+TEST_CASE("prediction packed readback preserves admission and charges every retained allocation", "[model][rfdetr][prediction]") {
+ using rfdetr::PredictionMaskChunk;
+ using rfdetr::PredictionMaskReadback;
+ const auto tiny = PredictionMaskChunk::Resolve(2U, 2U, 2U, 2U, 2U, 4U);
+ const auto tiny_read = PredictionMaskReadback::Resolve(tiny, 4U, true, {}, 0U);
+ CHECK_FALSE(tiny_read.packed);
+ CHECK(tiny_read.bytes_per_mask == 4U);
+ CHECK(tiny_read.capacity.bytes == tiny.capacity.bytes);
+ const auto hd = PredictionMaskChunk::Resolve(300U, 2U, 2U, 1080U, 1920U, 4U);
+ CHECK(hd.count == 1U);
+ const auto packed = PredictionMaskReadback::Resolve(hd, 1080U * 1920U, true, {}, 0U);
+ REQUIRE(packed.packed);
+ CHECK(packed.bytes_per_mask == 259200U);
+ CHECK(packed.device_bytes == hd.count * packed.bytes_per_mask);
+ CHECK(packed.capacity.bytes.back() == mmltk::common::system::page_rounded_bytes(packed.device_bytes));
+ CHECK(packed.FitsRetained({}, 0U, hd.retained_limit));
+ CHECK_FALSE(PredictionMaskReadback::Resolve(hd, 1080U * 1920U, false, {}, 0U).packed);
+ const auto odd = PredictionMaskChunk::Resolve(3U, 2U, 2U, 257U, 65U, 4U);
+ const auto odd_read = PredictionMaskReadback::Resolve(odd, 257U * 65U, true, {}, 0U);
+ REQUIRE(odd_read.packed);
+ CHECK(odd_read.bytes_per_mask == 2089U);
+ CHECK(odd_read.device_bytes == odd.count * 2089U);
+ // A previously retained bool host allocation can make new packing exceed
+ // the budget even though unchanged bool readback still fits exactly.
+ auto retained_bool = hd.capacity;
+ retained_bool.bytes[0] += hd.retained_limit - retained_bool.Total();
+ const auto fallback = PredictionMaskReadback::Resolve(hd, 1080U * 1920U, true, retained_bool, 0U);
+ CHECK_FALSE(fallback.packed);
+ CHECK(fallback.FitsRetained(retained_bool, 0U, hd.retained_limit));
+ CHECK_FALSE(fallback.FitsRetained(retained_bool, 1U, hd.retained_limit));
+ // Independent model/source/packed high waters are summed, not replaced by
+ // the latest active shape. Such a combination requires settled trimming.
+ const auto model = PredictionMaskChunk::Resolve(5000U, 256U, 256U, 1U, 1U, 4U);
+ CHECK_FALSE(packed.FitsRetained(model.capacity, packed.device_bytes, hd.retained_limit));
+ CHECK(packed.FitsRetained(packed.capacity, packed.device_bytes, hd.retained_limit));
+ CHECK_FALSE(packed.FitsRetained(packed.capacity, hd.retained_limit, hd.retained_limit));
+ CHECK(packed.FitsRetained({}, 0U, hd.retained_limit));
+}
+TEST_CASE("prediction mask packing retains exact odd-stride bytes through device and pinned reuse", "[model][rfdetr][prediction][gpu]") {
+ REQUIRE(cudaSetDevice(0) == cudaSuccess);
+ mmltk::backend::ml::cuda::NumaHostTensor host(0);
+ torch::Tensor packed, values;
+ std::size_t previous_device = 0U, previous_host = 0U;
+ for (const auto width : {65U, 129U, 7U, 65U}) {
+  constexpr std::size_t count = 3U, height = 67U;
+  const auto pixels = height * width;
+  const auto stride = (pixels + 7U) / 8U;
+  auto source = torch::empty({1, static_cast<std::int64_t>(count), static_cast<std::int64_t>(height), width}, torch::TensorOptions().dtype(torch::kBool));
+  auto* boolean = source.data_ptr<bool>();
+  for (std::size_t mask = 0U; mask < count; ++mask)
+   for (std::size_t pixel = 0U; pixel < pixels; ++pixel) boolean[mask * pixels + pixel] = mask == 0U || (mask == 2U && pixel % 3U == 0U);
+  const auto device = source.to(torch::kCUDA);
+  if (!packed.defined()) packed = torch::empty({0}, device.options().dtype(torch::kUInt8));
+  packed.resize_({1, static_cast<std::int64_t>(count), static_cast<std::int64_t>(stride)});
+  rfdetr::pack_bool_masks_cuda_into(device, packed);
+  values = torch::Tensor{};
+  values = host.view(packed.sizes(), torch::kUInt8);
+  values.copy_(packed, true);
+  REQUIRE(cudaStreamSynchronize(c10::cuda::getCurrentCUDAStream().stream()) == cudaSuccess);
+  CHECK(static_cast<std::size_t>(values.numel()) == count * stride);
+  CHECK(packed.storage().nbytes() == std::max(previous_device, count * stride));
+  CHECK(host.capacity_bytes() == std::max(previous_host, mmltk::common::system::page_rounded_bytes(count * stride)));
+  previous_device = packed.storage().nbytes();
+  previous_host = host.capacity_bytes();
+  for (std::size_t mask = 0U; mask < count; ++mask) {
+   const auto* bytes = values.data_ptr<std::uint8_t>() + mask * stride;
+   for (std::size_t byte = 0U; byte < stride; ++byte) {
+    std::uint8_t expected = 0U;
+    for (std::size_t bit = 0U; bit < 8U && byte * 8U + bit < pixels; ++bit)
+     if (boolean[mask * pixels + byte * 8U + bit]) expected |= static_cast<std::uint8_t>(1U << bit);
+    CHECK(bytes[byte] == expected);
+   }
+   rfdetr::EncodedMask expected;
+   rfdetr::encode_mask_values_into(height, width, expected, [&](auto pixel) { return boolean[mask * pixels + pixel]; });
+   const auto actual = rfdetr::encode_mask_from_packed_data(bytes, height, width);
+   CHECK(actual.area == expected.area);
+   CHECK(actual.runs == expected.runs);
+  }
+ }
+ CHECK(host.ReleaseSettled() == CUDA_ERROR_NOT_READY);
+ values = torch::Tensor{};
+ CHECK(host.ReleaseSettled() == CUDA_SUCCESS);
+ CHECK(host.capacity_bytes() == 0U);
 }

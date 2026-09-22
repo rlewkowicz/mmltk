@@ -42,6 +42,7 @@ module;
 #include "src/backend/models/rfdetr/contract/artifacts.h"
 #include "src/backend/models/rfdetr/contract/workflow_requests.h"
 #include "src/backend/models/rfdetr/core/evaluation.h"
+#include "src/backend/models/rfdetr/core/detail/mask_pack_cuda.h"
 #include "src/backend/models/rfdetr/inference/prediction_delivery.h"
 #include "src/backend/models/rfdetr/core/model_info.h"
 #include "src/backend/models/rfdetr/core/model_state.h"
@@ -384,7 +385,7 @@ struct PredictionReadback final {
   index_values = indices.view(batch.labels.sizes(), at::kLong);
  }
  mmltk::backend::ml::cuda::NumaHostTensor boxes, labels, scores, masks, indices;
- torch::Tensor device_indices, selected_queries;
+ torch::Tensor device_indices, selected_queries, packed_masks;
  SelectedMaskWorkspace mask_workspace;
  torch::Tensor box_values, label_values, score_values, mask_values, index_values;
 };
@@ -542,16 +543,19 @@ void deliver_prediction(const PredictionDelivery& delivery, const PredictionReco
   const auto pixels = checked_prediction_extent(width, height, kMaximumEncodedMaskPixels);
   const auto plan = PredictionMaskChunk::Resolve(result.size(), selection.mask_logits->size(2), selection.mask_logits->size(3), height, width, selection.mask_logits->element_size());
   const auto per_chunk = plan.count;
-  auto retained_capacity = storage.mask_workspace.RetainedCapacity(storage.masks.capacity_bytes());
-  for (std::size_t plane = 0U; plane < retained_capacity.bytes.size(); ++plane) retained_capacity.bytes[plane] = std::max(retained_capacity.bytes[plane], plan.capacity.bytes[plane]);
-  if (retained_capacity.Total() > plan.retained_limit) {
-   // Encoded-mask reads completed their host visibility wait; preview-only
-   // work has no pinned view. GPU scratch reuse stays on the inference
-   // stream. Drop retained storage when mixed shapes exceed the budget.
+  const auto retained_capacity = storage.mask_workspace.RetainedCapacity(storage.masks.capacity_bytes());
+  const auto packed_capacity = storage.packed_masks.defined() ? storage.packed_masks.storage().nbytes() : 0U;
+  auto readback = PredictionMaskReadback::Resolve(plan, pixels, batch.encoded_masks, retained_capacity, packed_capacity);
+  if (!readback.FitsRetained(retained_capacity, packed_capacity, plan.retained_limit)) {
+   // Host access has settled at the previous encoded chunk. Preview work and
+   // scratch destruction stay ordered on the inference stream. Clear every
+   // host alias before releasing the registered pages.
    storage.mask_values = torch::Tensor{};
    const auto released = storage.masks.ReleaseSettled();
    if (released != CUDA_SUCCESS) throw std::runtime_error("prediction mask scratch is still borrowed");
+   storage.packed_masks = torch::Tensor{};
    storage.mask_workspace.ResetSettled();
+   readback = PredictionMaskReadback::Resolve(plan, pixels, batch.encoded_masks, {}, 0U);
   }
   if (batch.preview_masks)
    raw_mask_work([&] {
@@ -569,14 +573,26 @@ void deliver_prediction(const PredictionDelivery& delivery, const PredictionReco
    if (batch.preview_masks) raw_mask_work([&] { batch.masks.narrow(0, static_cast<std::int64_t>(start), chunk).copy_(masks); });
    if (!batch.encoded_masks) continue;
    storage.mask_values = torch::Tensor{};
-   storage.mask_values = storage.masks.view(masks.sizes(), torch::kBool);
-   storage.mask_values.copy_(masks, true);
+   if (readback.packed) {
+    if (!storage.packed_masks.defined()) storage.packed_masks = torch::empty({0}, masks.options().dtype(torch::kUInt8));
+    storage.packed_masks.resize_({1, chunk, static_cast<std::int64_t>(readback.bytes_per_mask)});
+    pack_bool_masks_cuda_into(masks.unsqueeze(0), storage.packed_masks);
+    storage.mask_values = storage.masks.view(storage.packed_masks.sizes(), torch::kUInt8);
+    storage.mask_values.copy_(storage.packed_masks, true);
+   } else {
+    storage.mask_values = storage.masks.view(masks.sizes(), torch::kBool);
+    storage.mask_values.copy_(masks, true);
+   }
    const auto status = cudaStreamSynchronize(c10::cuda::getCurrentCUDAStream(batch.boxes.get_device()).stream());
    if (status != cudaSuccess) throw runtime::CudaOperationError{status, "prediction mask chunk completion"};
-   const auto* values = storage.mask_values.data_ptr<bool>();
    for (std::size_t offset = 0; offset < chunk_size; ++offset) {
     auto& prediction = result[start + offset];
-    encode_mask_values_into(height, width, prediction.mask, [values, offset, pixels](std::uint32_t pixel) { return values[offset * pixels + pixel]; }, remaining_runs);
+    if (readback.packed) {
+     encode_mask_from_packed_data_into(storage.mask_values.data_ptr<std::uint8_t>() + offset * readback.bytes_per_mask, height, width, prediction.mask, remaining_runs);
+    } else {
+     const auto* values = storage.mask_values.data_ptr<bool>();
+     encode_mask_values_into(height, width, prediction.mask, [values, offset, pixels](std::uint32_t pixel) { return values[offset * pixels + pixel]; }, remaining_runs);
+    }
     remaining_runs -= prediction.mask.runs.size();
     prediction.has_mask = true;
    }

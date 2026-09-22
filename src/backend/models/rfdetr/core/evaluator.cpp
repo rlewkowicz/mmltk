@@ -4,6 +4,8 @@
 #include "src/common/math/checked_arithmetic.h"
 #include <algorithm>
 #include <cmath>
+#include <bit>
+#include <cstring>
 #include <limits>
 #include <numeric>
 #include <stdexcept>
@@ -108,10 +110,40 @@ private:
 };
 }  // namespace mmltk::backend::models::rfdetr
 namespace mmltk::backend::models::rfdetr {
-void encode_mask_from_packed_data_into(const std::uint8_t* data, const uint32_t height, const uint32_t width, EncodedMask& mask) {
+void encode_mask_from_packed_data_into(const std::uint8_t* data, const uint32_t height, const uint32_t width, EncodedMask& mask, std::size_t maximum_runs) {
  mmltk::common::logging::ScopedNvtxRange nvtx_encode_mask_from_packed_data_into{"encode_mask_from_packed_data_into", mmltk::common::logging::nvtx_color_blue};
  mmltk::common::logging::ScopedProfile profile_rfdetr_native_eval_encode_mask_packed_reuse{"rfdetr.native.eval.encode_mask_packed_reuse"};
- encode_mask_values_into(height, width, mask, [data](const uint32_t index) { return (data[index >> 3U] & static_cast<std::uint8_t>(1U << (index & 7U))) != 0; });
+ mask.height = height;
+ mask.width = width;
+ mask.area = 0;
+ mask.runs.clear();
+ if (width == 0U || height == 0U) return;
+ const auto pixels = checked_prediction_extent(width, height, kMaximumEncodedMaskPixels);
+ maximum_runs = std::min(maximum_runs, kMaximumPredictionMaskRuns);
+ std::size_t run_start = 0U, run_length = 0U;
+ for (std::size_t base = 0U; base < pixels; base += 64U) {
+  const auto valid = std::min(std::size_t{64U}, pixels - base);
+  std::uint64_t word = 0U;
+  std::memcpy(&word, data + base / 8U, (valid + 7U) / 8U);
+  if constexpr (std::endian::native == std::endian::big) word = std::byteswap(word);
+  std::size_t offset = 0U;
+  while (offset < valid) {
+   const bool foreground = (word & 1U) != 0U;
+   const auto length = std::min(valid - offset, static_cast<std::size_t>(foreground ? std::countr_one(word) : std::countr_zero(word)));
+   if (foreground) {
+    if (run_length == 0U) run_start = base + offset;
+    run_length += length;
+    // Count only visited runs: a failed append must expose the scalar oracle's area.
+    mask.area += static_cast<std::uint32_t>(length);
+   } else if (run_length != 0U) {
+    mask.append_run(static_cast<std::uint32_t>(run_start), static_cast<std::uint32_t>(run_length), maximum_runs);
+    run_length = 0U;
+   }
+   offset += length;
+   if (length < 64U) word >>= length;
+  }
+ }
+ if (run_length != 0U) mask.append_run(static_cast<std::uint32_t>(run_start), static_cast<std::uint32_t>(run_length), maximum_runs);
 }
 EncodedMask encode_mask_from_packed_data(const std::uint8_t* data, const uint32_t height, const uint32_t width) {
  EncodedMask mask;
@@ -196,8 +228,12 @@ size_t group_staged_predictions_by_category(const BBoxPredictionView& prediction
   return lhs_score > rhs_score || ((lhs_score == rhs_score || std::isnan(lhs_score)) && lhs_index < rhs_index);
  };
  for (auto& category_predictions : scratch.predictions_by_category) {
-  std::ranges::sort(category_predictions, score_order);
-  if (category_predictions.size() > max_dets_per_image) category_predictions.resize(max_dets_per_image);
+  if (category_predictions.size() > max_dets_per_image) {
+   std::partial_sort(category_predictions.begin(), category_predictions.begin() + static_cast<std::ptrdiff_t>(max_dets_per_image), category_predictions.end(), score_order);
+   category_predictions.resize(max_dets_per_image);
+  } else {
+   std::ranges::sort(category_predictions, score_order);
+  }
   selected_count += category_predictions.size();
  }
  return selected_count;
@@ -239,7 +275,9 @@ void match_category_predictions(const std::vector<std::uint32_t>& prediction_ind
    // Nonignored GT always takes precedence over ignored GT, even if
    // the latter has a larger IoU. Every area owns independent state.
    for (const bool ignore_group : {false, true}) {
+    if (matched == kAllThresholdBits) break;
     for (const auto& candidate : scratch.candidates) {
+     if (matched == kAllThresholdBits) break;
      const bool is_crowd = crowd(candidate.ground_truth_index);
      if ((is_crowd || !evaluation_area_contains(area, ground_truth_area(candidate.ground_truth_index))) != ignore_group) continue;
      auto& unmatched = scratch.unmatched_threshold_bits[candidate.ground_truth_index][area];

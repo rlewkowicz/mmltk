@@ -48,4 +48,31 @@ struct PredictionMaskChunk final {
   return {count, limit + padding, capacity};
  }
 };
+// Physical readback layout is independent of the legacy survivor/chunk admission.
+struct PredictionMaskReadback final {
+ bool packed = false;
+ std::size_t bytes_per_mask = 0U;
+ SelectedMaskCapacity capacity;
+ std::size_t device_bytes = 0U;
+ [[nodiscard]] static PredictionMaskReadback Resolve(const PredictionMaskChunk& chunk, std::size_t pixels, bool encoded, const SelectedMaskCapacity& retained, std::size_t retained_packed_bytes) {
+  PredictionMaskReadback result{false, pixels, chunk.capacity, 0U};
+  if (!encoded) return result;
+  const auto stride = pixels / 8U + (pixels % 8U != 0U ? 1U : 0U);
+  const auto packed_bytes = checked_prediction_extent(chunk.count, stride, kMaximumPredictionTensorBytes);
+  const auto host_bytes = mmltk::common::system::page_rounded_bytes(packed_bytes);
+  if (packed_bytes + host_bytes < chunk.capacity.bytes.back()) {
+   result.packed = true;
+   result.bytes_per_mask = stride;
+   result.capacity.bytes.back() = host_bytes;
+   result.device_bytes = packed_bytes;
+   if (!result.FitsRetained(retained, retained_packed_bytes, chunk.retained_limit)) return {false, pixels, chunk.capacity, 0U};
+  }
+  return result;
+ }
+ [[nodiscard]] bool FitsRetained(SelectedMaskCapacity retained, std::size_t packed_device_bytes, std::size_t limit) const {
+  for (std::size_t plane = 0U; plane < retained.bytes.size(); ++plane) retained.bytes[plane] = std::max(retained.bytes[plane], capacity.bytes[plane]);
+  const auto total = retained.Total();
+  return total <= limit && std::max(packed_device_bytes, device_bytes) <= limit - total;
+ }
+};
 }  // namespace mmltk::backend::models::rfdetr
