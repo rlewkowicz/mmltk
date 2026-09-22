@@ -1850,6 +1850,36 @@ TEST_CASE("benchmark selections persist as one canonical nested value and reject
  auto loaded = default_gui_settings_state();
  apply_gui_settings(old, loaded);
  CHECK(loaded.workflows.train.benchmark_selection == data::BenchmarkDatasetSelection{});
+ const data::BenchmarkDatasetSelection retained{data::BenchmarkDatasetVariant::Coconut, data::CoconutValidation::Stock, true};
+ const auto selection_document = [](const nlohmann::json& dataset_paths) {
+  return nlohmann::json{{"schema_version", kGuiSettingsSchemaVersion}, {"workflows", {{"train", {{"dataset_paths", dataset_paths}}}}}};
+ };
+ struct PartialSelectionCase {
+  nlohmann::json members;
+  data::BenchmarkDatasetSelection expected;
+ };
+ for (const auto& partial : {
+       PartialSelectionCase{{{"dataset", 0}}, {data::BenchmarkDatasetVariant::CocoCustom, data::CoconutValidation::Stock, false}},
+       PartialSelectionCase{{{"validation", 2}}, {data::BenchmarkDatasetVariant::Coconut, data::CoconutValidation::CoconutStock, false}},
+       PartialSelectionCase{{{"recover_dropped_masks", true}}, retained},
+       PartialSelectionCase{{{"recover_dropped_masks", false}}, {retained.dataset, retained.validation, false}},
+       PartialSelectionCase{nlohmann::json::object(), {retained.dataset, retained.validation, false}},
+      }) {
+  CAPTURE(partial.members);
+  loaded.workflows.train.benchmark_selection = retained;
+  const nlohmann::json fields{{"benchmark_selection", partial.members}};
+  auto flat = loaded.workflows.train;
+  apply_gui_settings(selection_document(fields), loaded);
+  CHECK(loaded.workflows.train.benchmark_selection == partial.expected);
+  fields.get_to(flat);
+  CHECK(flat.benchmark_selection == partial.expected);
+ }
+ loaded.workflows.train.benchmark_selection = retained;
+ auto flat_absent = loaded.workflows.train;
+ apply_gui_settings(selection_document(nlohmann::json::object()), loaded);
+ CHECK(loaded.workflows.train.benchmark_selection == retained);
+ nlohmann::json::object().get_to(flat_absent);
+ CHECK(flat_absent.benchmark_selection == retained);
  for (const char* field : {"dataset", "validation"}) {
   for (const std::int64_t invalid : {-1LL, 3LL, 255LL, 256LL, 257LL, 258LL, 512LL, 4294967296LL}) {
    auto malformed = snapshot_gui_settings(state);
@@ -1863,7 +1893,31 @@ TEST_CASE("benchmark selections persist as one canonical nested value and reject
    CHECK(loaded == before);
    nlohmann::json flat = state.workflows.train;
    flat["benchmark_selection"][field] = invalid;
-   CHECK_THROWS(flat.get<TrainViewState>());
+   auto flat_loaded = loaded.workflows.train;
+   CHECK_THROWS(flat.get_to(flat_loaded));
+   CHECK(flat_loaded.benchmark_selection == retained);
+  }
+ }
+ for (const char* field : {"dataset", "validation", "recover_dropped_masks"}) {
+  auto invalid_values = nlohmann::json::array({nullptr, "1", 1.0, nlohmann::json::object(), nlohmann::json::array()});
+  if (std::string_view{field} == "recover_dropped_masks") {
+   invalid_values.push_back(0);
+   invalid_values.push_back(1);
+  } else {
+   invalid_values.push_back(true);
+   invalid_values.push_back(false);
+  }
+  for (const auto& invalid : invalid_values) {
+   CAPTURE(field, invalid);
+   const auto before = loaded;
+   nlohmann::json fields{{"benchmark_selection", {{"dataset", 0}, {"validation", 0}, {"recover_dropped_masks", false}}}};
+   fields["benchmark_selection"][field] = invalid;
+   fields["overwrite"] = !loaded.workflows.train.overwrite_compiled_dataset;
+   CHECK_THROWS(apply_gui_settings(selection_document(fields), loaded));
+   CHECK(loaded == before);
+   auto flat = loaded.workflows.train;
+   CHECK_THROWS(fields.get_to(flat));
+   CHECK(flat.benchmark_selection == retained);
   }
  }
 }

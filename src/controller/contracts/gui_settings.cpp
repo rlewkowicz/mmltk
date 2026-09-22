@@ -258,7 +258,8 @@ struct JsonFieldReader {
   } else if constexpr (std::is_same_v<T, mmltk::backend::data::BenchmarkDatasetSelection>) {
    if (found == json.end()) return;
    if (!found->is_object()) throw std::runtime_error("benchmark_selection must be an object");
-   T candidate{};
+   T candidate = value;
+   candidate.recover_dropped_masks = T{}.recover_dropped_masks;
    fields(candidate, JsonFieldReader{*found});
    if (!mmltk::backend::data::valid_benchmark_selection(candidate)) throw std::runtime_error("benchmark selection is invalid");
    value = candidate;
