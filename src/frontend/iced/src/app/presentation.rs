@@ -18,11 +18,11 @@ pub(super) struct Controller {
     retained: Option<Surface>,
     gallery: Option<GalleryRestoration>,
     selection: Option<(u64, GalleryIdentity)>,
-    gallery_blocked: Option<FrameReady>,
+    gallery_blocked: Option<GalleryHandoff>,
     // Monotonic physical receipt frontier; a deferred loss survives its request
     // acknowledgement without letting duplicate callbacks restart recovery.
     gallery_rejection_revision: u64,
-    gallery_recovery_needed: bool,
+    gallery_loss: Option<GalleryHandoff>,
     viewer: Option<(u64, u32)>,
     suspended: Option<SuspendedViewer>,
     pub(super) stop_requested: bool,
@@ -35,6 +35,19 @@ struct GalleryIdentity {
 }
 
 impl GalleryIdentity {
+    // Detail and a pending viewer transition retain the same Explore context.
+    // They suspend Gallery demand without abandoning a returning atlas receipt.
+    fn context(model: &ApplicationModel) -> Option<Self> {
+        let snapshot = model.explore.snapshot.as_ref()?;
+        (snapshot.dataset.identity != 0
+            && snapshot.frame.source.kind == PresentationSourceKind::Explore
+            && snapshot.frame.source.instance != 0)
+            .then(|| Self {
+                dataset: snapshot.dataset.identity,
+                frame: snapshot.frame.clone(),
+            })
+    }
+
     fn current(model: &ApplicationModel) -> Option<Self> {
         let snapshot = model.explore.snapshot.as_ref()?;
         (model.foreground_visual() == Some(PresentationSourceKind::Explore)
@@ -42,14 +55,35 @@ impl GalleryIdentity {
             && model.explore.requested_selection.is_none()
             && model.explore.desired_selection.is_none()
             && snapshot.mode == crate::generated::ExploreMode::Gallery)
-            .then(|| Self {
-                dataset: snapshot.dataset.identity,
-                frame: snapshot.frame.clone(),
-            })
+            .then(|| Self::context(model))
+            .flatten()
+    }
+
+    fn same_context(&self, other: &Self) -> bool {
+        self.dataset == other.dataset && self.frame.source == other.frame.source
+    }
+
+    fn contains(&self, content: &crate::presentation_surface::GalleryContent) -> bool {
+        content.metadata.dataset.identity == self.dataset
+            && content.metadata.frame.source == self.frame.source
     }
 
     fn matches(&self, content: &crate::presentation_surface::GalleryContent) -> bool {
-        content.metadata.dataset.identity == self.dataset && content.metadata.frame == self.frame
+        self.contains(content) && content.metadata.frame == self.frame
+    }
+}
+
+// Paired Gallery metadata supplies context independently of logical snapshots;
+// malformed receipts use retained Explore context. The physical receipt supplies
+// exact product identity and ordering, including retained older products.
+struct GalleryHandoff {
+    context: GalleryIdentity,
+    frame: FrameReady,
+}
+
+impl GalleryHandoff {
+    fn matches(&self, identity: &GalleryIdentity) -> bool {
+        self.context.same_context(identity) && self.frame.matches_content(&identity.frame)
     }
 }
 
@@ -539,6 +573,9 @@ impl App {
         }) {
             return;
         }
+        if gallery.is_some() && self.presentation.gallery_admission_blocked() {
+            return;
+        }
         let mut request = 0;
         let submitted = self.submit_intent(
             ApplicationIntentEndpoint::PresentationSelect,
@@ -550,6 +587,16 @@ impl App {
         if submitted {
             self.presentation.selection = gallery.clone().map(|identity| (request, identity));
             self.model.record_presentation_sent(frame);
+            for evidence in [
+                &mut self.presentation.gallery_loss,
+                &mut self.presentation.gallery_blocked,
+            ] {
+                if gallery.as_ref().is_some_and(|identity| {
+                    evidence.as_ref().is_some_and(|handoff| handoff.matches(identity))
+                }) {
+                    *evidence = None;
+                }
+            }
         }
         if let Some(identity) = gallery
             && let Some(demand) = self.presentation.gallery.as_mut()
@@ -576,7 +623,6 @@ impl App {
             && demand.status != GalleryStatus::Drawable
         {
             demand.status = GalleryStatus::Failed;
-            self.presentation.gallery_recovery_needed = false;
         }
     }
 
@@ -592,7 +638,7 @@ impl App {
             demand.status == GalleryStatus::Needed
         })
             && self.presentation.pending.is_none()
-            && self.presentation.gallery_blocked.is_none()
+            && !self.presentation.gallery_admission_blocked()
         {
             self.model.invalidate_presentation_selection();
         }
@@ -650,23 +696,34 @@ impl Controller {
     }
 
     fn reconcile_gallery(&mut self, model: &ApplicationModel, feature: FeatureId) {
+        let context = GalleryIdentity::context(model);
+        // Reconnect temporarily removes snapshots. The settled route and next
+        // authoritative context determine abandonment, not that transient gap.
+        for evidence in [&mut self.gallery_loss, &mut self.gallery_blocked] {
+            if feature != FeatureId::Explore
+                || context.as_ref().map_or(
+                    model.connection == crate::view_model::ConnectionState::Connected,
+                    |context| evidence.as_ref().is_some_and(|handoff| {
+                        !handoff.context.same_context(context)
+                    }),
+                )
+            {
+                *evidence = None;
+            }
+        }
         let identity = (feature == FeatureId::Explore)
             .then(|| GalleryIdentity::current(model))
             .flatten();
         let Some(identity) = identity else {
             self.gallery = None;
             self.selection = None;
-            self.gallery_blocked = None;
-            self.gallery_recovery_needed = false;
             return;
         };
         if self.gallery.as_ref().is_none_or(|demand| demand.identity != identity) {
             // Advancing the same gallery is native notification-driven. A new
             // dataset or return from Detail needs its own publication request.
             let status = self.gallery.as_ref().filter(|demand| {
-                demand.identity.dataset == identity.dataset
-                    && demand.identity.frame.source == identity.frame.source
-                    && demand.status != GalleryStatus::Failed
+                demand.identity.same_context(&identity) && demand.status != GalleryStatus::Failed
             }).map_or(GalleryStatus::Needed, |demand| {
                 if demand.status == GalleryStatus::Drawable {
                     GalleryStatus::Waiting
@@ -675,8 +732,6 @@ impl Controller {
                 }
             });
             self.gallery = Some(GalleryRestoration { identity, status });
-            self.gallery_blocked = None;
-            self.gallery_recovery_needed = false;
         }
         let demand = self.gallery.as_ref().expect("current gallery demand");
         if self.pending.is_some_and(|surface| {
@@ -698,19 +753,59 @@ impl Controller {
         self.observe_gallery_display();
     }
 
+    // Query only on ordinary notifications. Keep the receipt after settlement
+    // until its exact demand submits recovery, even if the snapshot arrives later.
+    fn gallery_admission_blocked(&self) -> bool {
+        self.gallery_blocked.as_ref().is_some_and(|handoff| {
+            crate::presentation_surface::publication_admission_blocked(handoff.frame)
+        }) || self.gallery_loss.as_ref().is_some_and(|handoff| {
+            // Metadata-less rejection becomes an admission fact only after its
+            // exact physical content matches the installed Gallery demand.
+            self.gallery.as_ref().is_some_and(|demand| handoff.matches(&demand.identity))
+                && crate::presentation_surface::publication_admission_blocked(handoff.frame)
+        })
+    }
+
+    fn supersede_gallery_handoffs(
+        &mut self,
+        frame: FrameReady,
+        content: &crate::presentation_surface::GalleryContent,
+    ) {
+        for evidence in [&mut self.gallery_loss, &mut self.gallery_blocked] {
+            if evidence.as_ref().is_some_and(|handoff| {
+                handoff.context.contains(content)
+                    && frame.presentation_revision >= handoff.frame.presentation_revision
+            }) {
+                *evidence = None;
+            }
+        }
+    }
+
     fn observe_gallery_display(&mut self) {
+        let displayed = crate::presentation_surface::gallery::displayed();
+        if let Some((surface, content)) = displayed.as_ref()
+            && let Some(frame) = surface.frame
+        {
+            self.supersede_gallery_handoffs(frame, content);
+        }
         let Some(demand) = self.gallery.as_mut() else {
             return;
         };
-        let displayed = crate::presentation_surface::gallery::displayed();
         if let Some((surface, _)) = displayed.as_ref()
             .filter(|(_, content)| demand.identity.matches(content))
         {
-            demand.status = GalleryStatus::Drawable;
+            // An older drawable receipt cannot satisfy a later loss of the same
+            // product, nor erase a blocked publication awaiting reader settlement.
+            if ![&self.gallery_loss, &self.gallery_blocked]
+                .into_iter()
+                .any(|evidence| {
+                    evidence.as_ref().is_some_and(|handoff| handoff.matches(&demand.identity))
+                })
+            {
+                demand.status = GalleryStatus::Drawable;
+            }
             self.retained = Some(*surface);
             self.surface = Some(*surface);
-            self.gallery_blocked = None;
-            self.gallery_recovery_needed = false;
         } else if demand.status == GalleryStatus::Drawable && displayed.is_none() {
             // A renderer loss is a new availability edge, not an acknowledgement.
             demand.status = GalleryStatus::Needed;
@@ -720,33 +815,76 @@ impl Controller {
     fn reject_gallery_handoff(&mut self, frame: FrameReady, model: &ApplicationModel) {
         let rejected_pending =
             self.pending_rejected && self.pending.and_then(|surface| surface.frame) == Some(frame);
-        if GalleryIdentity::current(model).is_none_or(|identity| !frame.matches_content(&identity.frame))
-            || frame.content_session
+        if frame.content_session
                 != crate::generated::presentation_source_session(PresentationSourceKind::Explore)
             || (!rejected_pending && frame.presentation_revision <= self.gallery_rejection_revision)
         {
             return;
         }
-        // Consume each rejection once, even if a valid handoff makes it irrelevant.
-        // Exact pending-sample failure still retires that sample if a newer malformed
-        // offer was ignored while it was pending. Its duplicate cannot match again.
-        // A rejection arriving before its Select acknowledgement is deferred below.
+        // Consume even irrelevant receipts. Exact pending-sample failure still
+        // retires that sample after a newer malformed offer, but cannot replace
+        // newer loss evidence or interrupt a useful newer gallery publication.
         self.gallery_rejection_revision = self
             .gallery_rejection_revision
             .max(frame.presentation_revision);
-        if (self.pending.is_some() && !rejected_pending)
-            || self.gallery_blocked.is_some()
-            || (!rejected_pending
-                && self
-                    .incumbent
-                    .and_then(|surface| surface.frame)
-                    .is_some_and(|previous| {
-                        previous.presentation_revision >= frame.presentation_revision
-                    }))
+        let content = crate::presentation_surface::gallery::matching(Some(frame));
+        let retained_context = GalleryIdentity::context(model);
+        let context = match content.as_ref() {
+            Some(content) => {
+                // Valid paired Gallery metadata is authoritative even during a
+                // reconnect snapshot gap. An installed context can disqualify
+                // a foreign dataset/source without gating independent graphics.
+                if retained_context.as_ref().is_some_and(|context| !context.contains(content)) {
+                    return;
+                }
+                GalleryIdentity {
+                    dataset: content.metadata.dataset.identity,
+                    frame: content.metadata.frame.clone(),
+                }
+            }
+            None => {
+                // A valid non-Gallery product never becomes gallery loss. With
+                // no metadata, only retained Explore context can qualify the
+                // receipt for exact matching against a later Gallery demand.
+                if crate::presentation_surface::metadata::surface(frame).is_some() {
+                    return;
+                }
+                let Some(context) = retained_context else {
+                    return;
+                };
+                context
+            }
+        };
+        if self.pending.and_then(|surface| surface.frame).is_some_and(|pending| {
+            !rejected_pending && pending.presentation_revision >= frame.presentation_revision
+        }) || self.gallery_loss.as_ref().is_some_and(|loss| {
+            loss.frame.presentation_revision >= frame.presentation_revision
+        }) || (!rejected_pending
+            && self.incumbent.and_then(|surface| surface.frame).is_some_and(|previous| {
+                previous.presentation_revision >= frame.presentation_revision
+            }))
         {
             return;
         }
-        self.gallery_recovery_needed = true;
+        if content.is_some()
+            && self.gallery_blocked.as_ref().is_none_or(|blocked| {
+                blocked.frame.presentation_revision < frame.presentation_revision
+            })
+            && crate::presentation_surface::publication_admission_blocked(frame)
+        {
+            self.gallery_blocked = Some(GalleryHandoff {
+                context: context.clone(),
+                frame,
+            });
+        }
+        let loss = GalleryHandoff { context, frame };
+        if let Some(demand) = self.gallery.as_mut()
+            && loss.matches(&demand.identity)
+            && demand.status != GalleryStatus::Failed
+        {
+            demand.status = GalleryStatus::Waiting;
+        }
+        self.gallery_loss = Some(loss);
     }
 
     fn present(&mut self, frame: FrameReady, model: &ApplicationModel) -> bool {
@@ -761,11 +899,15 @@ impl Controller {
         if self.gallery.as_ref().is_some_and(|demand| {
             self.pending.and_then(|pending| {
                 crate::presentation_surface::gallery::matching(pending.frame)
-            }).is_some_and(|content| demand.identity.matches(&content))
-        }) && GalleryIdentity::current(model).is_some()
-            && crate::presentation_surface::gallery::matching(Some(frame)).is_none()
+            }).is_some_and(|content| demand.identity.contains(&content))
+        }) && GalleryIdentity::current(model).is_some_and(|identity| {
+            crate::presentation_surface::gallery::matching(Some(frame))
+                .is_none_or(|content| !identity.contains(&content))
+        })
         {
-            // A delayed viewer offer cannot displace useful gallery admission.
+            // A delayed viewer/dataset offer cannot displace useful gallery
+            // admission. A requested Detail transition has no current gallery
+            // identity and remains admissible before its logical snapshot.
             crate::presentation_surface::release(frame);
             return false;
         }
@@ -778,25 +920,7 @@ impl Controller {
             return false;
         }
         if !crate::presentation_surface::accept_publication(frame) {
-            if crate::presentation_surface::gallery::matching(Some(frame)).is_some() {
-                if frame.presentation_revision > self.gallery_rejection_revision
-                    && self.pending.is_none()
-                    && self.gallery_blocked.is_none()
-                    && self
-                        .incumbent
-                        .and_then(|surface| surface.frame)
-                        .is_none_or(|previous| {
-                            previous.presentation_revision < frame.presentation_revision
-                        })
-                    && crate::presentation_surface::publication_admission_blocked(frame)
-                {
-                    self.gallery_blocked = Some(frame);
-                    if let Some(demand) = self.gallery.as_mut() {
-                        demand.status = GalleryStatus::Waiting;
-                    }
-                }
-                self.reject_gallery_handoff(frame, model);
-            }
+            self.reject_gallery_handoff(frame, model);
             crate::presentation_surface::release(frame);
             return false;
         }
@@ -819,13 +943,13 @@ impl Controller {
             ..surface
         });
         self.pending_rejected = false;
-        if let Some(content) = crate::presentation_surface::gallery::matching(Some(frame))
-            && let Some(demand) = self.gallery.as_mut()
-            && demand.identity.matches(&content)
-        {
-            demand.status = GalleryStatus::Waiting;
-            self.gallery_blocked = None;
-            self.gallery_recovery_needed = false;
+        if let Some(content) = crate::presentation_surface::gallery::matching(Some(frame)) {
+            self.supersede_gallery_handoffs(frame, &content);
+            if let Some(demand) = self.gallery.as_mut()
+                && demand.identity.matches(&content)
+            {
+                demand.status = GalleryStatus::Waiting;
+            }
         }
         self.incumbent = Some(surface);
         true
@@ -835,7 +959,7 @@ impl Controller {
         self.gallery = None;
         self.selection = None;
         self.gallery_blocked = None;
-        self.gallery_recovery_needed = false;
+        self.gallery_loss = None;
         // Keep the physical receipt frontier, like incumbent, across page changes:
         // a delayed rejection from the departed page cannot cancel re-entry.
         crate::presentation_surface::retire_samples();
@@ -878,23 +1002,8 @@ impl Controller {
         }
         let _ = recovery;
         self.reconcile_gallery(model, feature);
-        if self
-            .gallery_blocked
-            .is_some_and(|frame| !crate::presentation_surface::publication_admission_blocked(frame))
-        {
-            self.gallery_blocked = None;
-            self.retry_gallery();
-        }
         if self.pending_rejected {
             self.retire_pending();
-        }
-        if self.gallery_recovery_needed
-            && !model.has_pending(ApplicationIntentEndpoint::PresentationSelect)
-            && self.pending.is_none()
-            && self.gallery_blocked.is_none()
-        {
-            self.gallery_recovery_needed = false;
-            self.retry_gallery();
         }
         if let Some(surface) = self.pending {
             crate::presentation_surface::reconcile_completed(surface, model);
@@ -910,6 +1019,20 @@ impl Controller {
             crate::presentation_surface::reconcile_completed(retained, model);
         }
 
+        if self.gallery.as_ref().is_some_and(|demand| {
+            demand.status != GalleryStatus::Failed
+                && [&self.gallery_loss, &self.gallery_blocked]
+                    .into_iter()
+                    .any(|evidence| {
+                        evidence.as_ref().is_some_and(|handoff| handoff.matches(&demand.identity))
+                    })
+        })
+            && !model.has_pending(ApplicationIntentEndpoint::PresentationSelect)
+            && self.pending.is_none()
+            && !self.gallery_admission_blocked()
+        {
+            self.retry_gallery();
+        }
         self.observe_gallery_display();
         Ok(())
     }
