@@ -3,6 +3,10 @@
 #include <array>
 #include <cstdint>
 #include <fstream>
+#include <stdexcept>
+#include <string>
+#include <c10/cuda/CUDAGuard.h>
+#include "src/backend/ml/cuda/torch_autocast_scope.h"
 #include "src/backend/data/compiled_dataset.h"
 #include "src/backend/data/dataset_compiler.h"
 #include "src/backend/models/rfdetr/core/class_layout.h"
@@ -15,6 +19,42 @@ namespace mmltk::testsupport {
 namespace data = mmltk::backend::data;
 namespace rfdetr = mmltk::backend::models::rfdetr;
 namespace contracts = mmltk::controller::contracts;
+namespace {
+void prepare_caption_model(rfdetr::NativeRfDetrModel& model, const data::catalog::ClassCatalog& catalog) {
+ // Keep the real native detector and its six queries. Its fixture checkpoint
+ // must put Det captions over the synthetic GT boxes, not depend on randomly
+ // initialized proposal scores or geometry. Training can still update it.
+ const auto& config = model.config();
+ if (!config.bbox_reparam || !config.lite_refpoint_refine) throw std::logic_error("caption fixture requires reparameterized single-step box refinement");
+ const c10::cuda::CUDAGuard device(0);
+ const torch::NoGradGuard no_grad;
+ const mmltk::backend::ml::cuda::TorchAutocastScope precision(false, at::kFloat);
+ model.to(torch::Device(torch::kCUDA, 0));
+ model.eval();
+ auto parameters = model.named_parameters();
+ for (const auto& parameter : parameters) {
+  const auto& name = parameter.key();
+  if (name.starts_with("transformer.enc_out_class_embed.") || (name.starts_with("transformer.enc_out_bbox_embed.") && name.find(".layers.2.") != std::string::npos))
+   parameter.value().zero_();
+ }
+ const auto longest = std::ranges::max_element(catalog.names(), {}, [](const auto& name) { return name.size(); });
+ const auto category = catalog.resolve(*longest).value();
+ parameters["class_embed.weight"].zero_();
+ parameters["class_embed.bias"].fill_(-8.0);
+ parameters["class_embed.bias"][category].fill_(8.0);
+ // Read the model's actual selected proposals instead of mirroring its feature
+ // pyramid, proposal ordering, or top-k implementation in this fixture.
+ const auto options = torch::TensorOptions().device(torch::kCUDA).dtype(torch::kFloat);
+ const rfdetr::NestedTensor batch{torch::zeros({2, 3, config.resolution, config.resolution}, options), torch::zeros({2, config.resolution, config.resolution}, options.dtype(torch::kBool))};
+ const auto proposals = model.forward(batch, false).main.pred_boxes[0];
+ const auto extent = proposals.narrow(1, 2, 2);
+ const auto correction = torch::cat({(0.5 - proposals.narrow(1, 0, 2)) / extent, torch::log(0.5 / extent)}, 1);
+ parameters["refpoint_embed.weight"].view({-1, config.num_queries, 4}).copy_(correction.unsqueeze(0));
+ const auto boxes = model.forward(batch, false).main.pred_boxes;
+ if (!torch::allclose(boxes, torch::full_like(boxes, 0.5), 1e-5, 1e-5)) throw std::runtime_error("caption fixture did not produce its overlapping normalized boxes");
+ model.to(torch::kCPU);
+}
+}  // namespace
 WorkflowWaylandInputs::WorkflowWaylandInputs(const std::filesystem::path& root)
     // Keep real work outstanding across the trainer's one-second live-progress
     // publication interval, rather than observing only epoch-boundary records.
@@ -38,6 +78,7 @@ WorkflowWaylandInputs::WorkflowWaylandInputs(const std::filesystem::path& root)
  config.num_select = 6;
  config.segmentation = false;
  rfdetr::NativeRfDetrModel model{config, rfdetr::native_training_class_layout(*compiled.class_catalog())};
+ prepare_caption_model(model, *compiled.class_catalog());
  rfdetr::DecodedNativeModelState checkpoint;
  checkpoint.metadata.preset_name = config.preset_name;
  checkpoint.metadata.source_kind = "wayland-workflow-fixture";
@@ -91,6 +132,8 @@ void WorkflowWaylandInputs::Configure(contracts::GuiSettingsState& settings, con
  validate.request.compiled_path = compiled;
  validate.request.resolution = 64;
  validate.request.batch_size = 2;
+ // Match the calibrated native fixture's proposal selection and coordinates.
+ validate.request.allow_fp16 = false;
  validate.request.h2d_dataloader = true;
  validate.request.report_json_path = output / "validation.json";
  auto& export_state = settings.workflows.export_state;

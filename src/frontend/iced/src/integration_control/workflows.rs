@@ -345,6 +345,26 @@ fn validation_caption_patches(
             }
         }
     }
+    if patches.is_empty() {
+        reporting::emit(|sink| {
+            sink.record(
+                "integration.workflow.caption_geometry",
+                receipt.control,
+                "clip",
+                [clip.x, clip.y, clip.width, clip.height].map(f64::from),
+            );
+            for (layer, labels) in layers.iter().enumerate() {
+                for (bounds, _, has_text) in labels {
+                    sink.record(
+                        "integration.workflow.caption_geometry",
+                        receipt.control,
+                        &format!("layer={layer} text={has_text} scale={scale}"),
+                        [bounds.x, bounds.y, bounds.width, bounds.height].map(f64::from),
+                    );
+                }
+            }
+        });
+    }
 }
 
 fn source(index: u8) -> SourceKind {
