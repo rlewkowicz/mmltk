@@ -8,9 +8,17 @@ executing a plan, including the main agent's ownership of validation fixes and
 the single cleanup review before the final build. Successful required final
 build, tests, and acceptance lead to the implementation commit, documentation
 pass, and documentation commit; documentation does not reopen validation or
-introduce a whole-plan review.
-The commands below describe individual capabilities; they are not a substitute
-for the required stage ordering.
+introduce a whole-plan review. After the required final full build, the test
+and acceptance gate is exactly these commands, in order, and both must pass:
+
+```bash
+./mmltk --test all
+./mmltk --test workspace-wayland --headless-compositor
+```
+
+The remaining commands describe standalone capabilities. Focused filters,
+individual executables, browser-app, and additional suites do not replace or
+supplement this Final Validation gate.
 
 ## Formatting and static analysis
 
@@ -141,8 +149,9 @@ packaged application. Neither is a Firefox-specific test runner.
 
 `all` builds `mmltk_workspace_wayland_integration` but excludes it from its run
 list. It also does not execute `cuda-vulkan`, `browser-app`, the tooling suites,
-or the profile runner. Run those explicitly. `gui` and `tsan` suite names are
-currently unavailable even though other GUI/development build facilities exist.
+or the profile runner. Those have separate standalone routes outside the fixed
+Final Validation gate. `gui` and `tsan` suite names are currently unavailable
+even though other GUI/development build facilities exist.
 
 Some RF-DETR tests download model checkpoints and derive normalized weights,
 ONNX, and TensorRT engines in `.cache/tests/rfdetr` on first use. Hardware-gated
@@ -571,10 +580,27 @@ behavior independently of rendered UI acceptance:
 | [application_compute_services.test.cpp](../src/controller/subsystems/system/tests/application_compute_services.test.cpp), `mmltk_controller_data_compute_systems_tests` | Environment cache selection and staged/final output overlap through the artifact service, retained choices through materialization, and real HTTP progress projected into bounded artifact activity at an unchanged image fraction |
 | [dataset_system.test.cpp](../src/controller/subsystems/system/tests/dataset_system.test.cpp), same target | Explicit compile captures settled choices, later settings edits preserve the admitted request, owned diagnostics survive runtime reconstruction and stop/join, open-ended/recovered progress remains valid, and malformed progress is rejected |
 | [dataset_wiring.test.cpp](../src/controller/shell/tests/dataset_wiring.test.cpp), `mmltk_controller_shell_tests` | Production shell/factory propagation of enabled and disabled diagnostics through the staged compiler path |
-| [settings.test.cpp](../src/controller/services/tests/settings.test.cpp), `mmltk_controller_services_tests` | Native defaults, missing/invalid setting repair, and recipe/hidden validation persistence |
-| [Dataset component](../src/frontend/iced/src/view/train/dataset.rs) and [integration reporting](../src/frontend/iced/src/integration_control/reporting.rs), `browser-app` | Generated selection edits, visibility, disabling only the five new radios during compilation, and no passive visibility tasks or payload collection when reporting is disabled |
+| [settings.test.cpp](../src/controller/services/tests/settings.test.cpp), `mmltk_controller_services_tests` | Native defaults, missing/invalid setting repair, default-off recovery for settings missing that field, and recipe/hidden validation/recovery persistence |
+| [Dataset component](../src/frontend/iced/src/view/train/dataset.rs) and [integration reporting](../src/frontend/iced/src/integration_control/reporting.rs), `browser-app` | Generated selection edits, visibility, disabling the recipe/validation radios and recovery checkbox during compilation, and no passive visibility tasks or payload collection when reporting is disabled |
 
-For focused selection during the permitted testing stage:
+The existing [COCONut cases](../src/backend/data/tests/coconut_dataset.test.cpp)
+also cover conservative dropped-mask matching, independent source IDs, surviving
+mask subtraction, authoritative boxes, fully carved masks, and recovery-off
+behavior. [Bounded source fixtures](../src/backend/data/tests/fixtures/coconut_recovery/README.md)
+retain the exact two-dog masks for physical COCO image 2212 and the dog mask for
+image 400. They check source support and disjoint couch/boat support after both
+Stretch and Letterbox mask projection. They do not compile a production dataset
+or rewrite production JPEGs/bins.
+
+Cache cases cover recovery on/off across every validation choice, unchanged
+base/physical products, original-identity changes, independently unavailable
+original splits, later retry, reordered image provenance, cancellation, and
+fatal local parser/archive/publication failures. Current counts come from
+admitted recovery products, independently of historical failure-report lines.
+Dataset-system cases capture the recovery choice with the other settled compile
+settings, and later edits leave the admitted operation unchanged.
+
+For standalone focused selection outside the Final Validation gate:
 
 ```bash
 ./mmltk --test core --executable mmltk_backend_data_tests -- '[benchmark],[coconut]'

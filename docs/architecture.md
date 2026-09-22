@@ -105,8 +105,8 @@ The [benchmark recipes](benchmark-datasets.md) supply source membership and
 annotation policy to the same acquisition, resize, writer, and publication
 owners. Native
 [BenchmarkDatasetSelection](../src/backend/data/benchmark_dataset_options.h)
-owns the recipe/validation vocabulary and defaults. Settings persistence and
-generated Rust project that declaration; the Dataset component owns radio
+owns the recipe/validation/recovery vocabulary and defaults. Settings persistence
+and generated Rust project that declaration; the Dataset component owns control
 copy, visibility, and interaction.
 
 The shell supplies its shared `RuntimeDiagnosticTarget` to the dataset runtime

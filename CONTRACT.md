@@ -201,6 +201,10 @@ Coco custom retains the established sampled benchmark recipe. COCONut admits
 its full training membership, including images without foreground instances,
 with explicit validation membership and annotation choices. Physical image
 identity remains distinct from annotation edition and declared release identity.
+Optional COCONut recovery restores conservatively matched dropped foreground
+masks from original annotations and removes their pixels from surviving masks,
+retaining authoritative boxes and explicit recovery provenance. Carved masks
+retain their resulting visible source area.
 Progress exposes actual acquisition work and known or unknown totals; diagnostics
 observe that work independently of cache validity and completion.
 

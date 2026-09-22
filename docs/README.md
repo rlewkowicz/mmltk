@@ -8,7 +8,8 @@
   package outputs, Firefox staging, declaration isolation, target-local PCHs,
   private native Parquet dependencies, generated bindings, caches, and build timing.
 - [Commands](commands.md): wrapper operations, process snapshots, native CLI,
-  benchmark cache selection, desktop options, and model tooling.
+  benchmark cache selection and mask inspection/export, desktop options, and
+  model tooling.
 - [RF-DETR workflows and artifacts](rfdetr-workflows.md): model/class admission,
   GPU normalization, physical candidate ranking, separate candidate/COCO limits,
   shared weights selection, Transfer/Resume, automatic/manual output, training
@@ -22,8 +23,8 @@
   serialization ownership and lookup, generated bindings, frontend components,
   and vendor ownership.
 - [GUI interaction and presentation](gui-interaction.md): application wire
-  formats, workflow layout and navigation, Dataset recipe/validation controls,
-  the retained training dashboard,
+  formats, workflow layout and navigation, Dataset recipe/validation/recovery
+  controls, the retained training dashboard,
   fixed Validation metrics/atlas, the shared image viewer and primary actions,
   retained numeric editing and captions, shared immediate mouse input, native
   command settlement, Annotation content/damage, retained Explore measurements
@@ -40,8 +41,9 @@
   augmentation changes.
 - [Built-in benchmark datasets](benchmark-datasets.md): Coco custom and COCONut
   membership, three validation choices, native masks and physical provenance,
-  shared persistent cache/repair, stock annotation reuse, progress units,
-  partial downloads, and format/capacity limits.
+  optional original-annotation mask recovery, derived cache identity and current
+  counts, append-only rejection history, shared persistent cache/repair, stock
+  annotation reuse, progress units, partial downloads, and format/capacity limits.
 - [GPU execution and image loading](gpu-execution.md): device/NUMA placement,
   H2D and GDRCopy, reusable checkpoint/export readbacks, Vulkan allocation and
   CUDA import, independent display/compute selection and damage transfers,
@@ -50,8 +52,9 @@
 
 ## Engineering, validation, and operations
 
-- [Validation](validation.md): native/Rust formatting, cleanup, domain test
-  ownership and selection, standalone CUDA/Vulkan and native-link diagnostics,
+- [Validation](validation.md): the fixed final test/acceptance gate,
+  native/Rust formatting, cleanup, domain test ownership and selection,
+  standalone CUDA/Vulkan and native-link diagnostics,
   rendered workflow/layout/input and
   retained browser acceptance, evidence, and debugging.
 - [Headless Wayland](headless-wayland.md): the private NVIDIA Weston session,

@@ -33,8 +33,10 @@ Large and XL offer the same physical image. Images without selected foreground
 instances remain in the dataset. Validation membership is checked separately
 and cannot enter training. The nested S/B/L/XL releases are not concatenated as
 independent complete datasets, and COCONut does not apply supplemental sampling.
-Every offered image and required mask must be available after bounded recovery
-for publication to succeed.
+Every offered image and required panoptic mask must be available after bounded
+archive/image repair for publication to succeed. Optional
+[dropped-mask recovery](#optional-dropped-mask-recovery) preserves these recipe
+and validation memberships.
 
 The [pinned release catalog](../src/backend/data/coconut_catalog.cpp) owns exact
 URLs, revisions, expected sizes, available SHA-256 identities, and patch lists:
@@ -95,16 +97,22 @@ numeric thing-category ID. Admitted things use the existing COCO80 mapping.
 Masks retain exact pixel support, including holes and single pixels, as
 row-major runs. Supplied boxes stay authoritative; otherwise support supplies
 exclusive upper bounds. Supplied valid area, crowd, ignore, category, segment ID,
-and ordinal remain intact; absent/null area comes from mask support.
+and ordinal remain intact; absent/null area comes from mask support. Optional
+[recovery](#optional-dropped-mask-recovery) supplies original COCO geometry for
+recovered objects and updates visible area for masks it carves.
 An image with no admitted things still has an image record.
 
-A declared thing with neither mask pixels nor an authoritative box is omitted
-from normalized object metadata and counted as a dropped instance; its image
-and other objects remain. Compilation appends the image/member, physical and
-release image IDs, object/category IDs, release, and reason to `failed.txt` in
+A declared thing still lacking both mask pixels and an authoritative box after
+any selected recovery is omitted from normalized object metadata and counted
+as a dropped instance; its image and other objects remain. Compilation appends
+the image/member, physical and release image IDs, object/category IDs, release,
+and reason to `failed.txt` in
 the nearest `.cache` ancestor of the benchmark cache (normally
 `.cache/failed.txt`). A custom cache outside `.cache` keeps the report at its
 own root. The report uses one JSON object per line and retains earlier entries.
+It is append-only history: a later successful recovery does not remove an older
+rejection. Compiler decisions never read this report; current selected recovery
+counts come from the [annotation products and manifest](#recovery-derived-annotation-caches).
 The first rejection produces a concise progress warning; report-write failure
 does not interrupt compilation.
 
@@ -123,6 +131,59 @@ to 64 Mi pixels, each axis to 32,767, and each segment list to 65,535 entries.
 The canonical limits are in
 [CoconutImportLimits](../src/backend/data/detail/coconut_annotations.h).
 These precede the separate compiled-format capacity checks below.
+
+## Optional dropped-mask recovery
+
+For Coconut, **Recover dropped masks from original annotations** is off by
+default. Enable it in the [Dataset controls](gui-interaction.md#dataset-compilation-controls)
+before compiling. Existing datasets require recompilation to gain recovered
+objects; changing the setting does not modify an existing `.bin`, source JPEG,
+or panoptic PNG. Recovery runs before the ordinary Stretch/Letterbox projection
+and keeps compiled format 9.
+
+The original stock COCO train2017 instance annotations can recover dropped
+things in COCONut B's physical COCO train images. Stock val2017 originals serve
+the relabeled COCO validation component selected by Coconut validation or
+Coconut stock. Stock validation keeps its stock labels. COCO unlabeled and
+Objects365 components have no original-mask recovery source and retain their
+ordinary normalization.
+
+[CoconutMaskRecovery](../src/backend/data/coconut_mask_recovery.cpp) indexes
+admitted originals by physical image once and reuses bounded per-image RLE
+scratch. A dropped slot is a declared thing with zero panoptic support and no
+authoritative box. A boxed, present-empty mask is already a valid object and
+is not a dropped slot. Recovery requires matching physical namespace, image
+identity, and canvas dimensions, then admits each category/crowd/raw-ignore
+group conservatively:
+
+- Original candidates must have valid nonempty masks, boxes, area, and distinct
+  annotation IDs; their count must equal the group's COCONut thing count.
+- Every surviving thing must intersect exactly one original candidate, and
+  different survivors must identify different candidates.
+- The remaining original count must exactly equal the dropped-slot count.
+  Ambiguous, invalid, or incomplete groups remain unrecovered.
+
+COCO annotation IDs and COCONut segment IDs are independent. Within an admitted
+remaining set, sorted original annotation IDs pair with sorted dropped segment
+IDs. The recovered object keeps its COCONut category, flags, segment identity,
+and source ordinal while taking the original COCO mask, authoritative box, and
+area. [Recovery provenance](#recovery-derived-annotation-caches) records both IDs.
+
+The union of recovered pixels is subtracted from every surviving, unrecovered
+thing mask on that image. Its supplied COCONut box remains authoritative;
+otherwise its new support determines the box. A carved mask's stored source
+area becomes its remaining foreground count. A fully carved object with a box
+survives with a present-empty mask; one without a box is omitted. Carving does
+not recursively recover that new omission. Stuff segments are unchanged.
+
+Original splits are admitted independently through the shared COCO annotation
+cache. Unavailable downloads or unusable source archives/documents can leave
+optional originals unavailable after bounded source attempts, with a progress
+warning and the affected objects omitted. An admitted split remains usable
+when the other optional split fails. Stock validation still requires usable
+val2017 annotations. Cancellation, allocation/capacity failures, local file or
+I/O failures, and staging/publication failures remain fatal to the operation;
+they are not converted into optional-source omissions.
 
 ## Persistent cache and publication
 
@@ -190,14 +251,51 @@ ID. Opt-in `benchmark.images.validation_failed` records include the archive
 member, source/shard, image ID, encoded byte count, and rejection reason.
 
 [CocoAnnotationCache](../src/backend/data/detail/benchmark_annotation_cache.h)
-is the shared stock-annotation admission owner for Coco custom and Coconut's
-Stock validation. It discovers valid normalized indexes before requesting raw
-annotations, so a valid stock index remains usable with the raw archive/JSON
-absent. A missing split can be rebuilt while an already settled split is
-retained. Typed storage-capacity failures and cancellation propagate directly;
+is the shared stock-annotation admission owner for Coco custom, Coconut's
+Stock validation, and optional recovery originals. It discovers valid normalized
+indexes before requesting raw annotations, so a valid stock index remains usable
+with the raw archive/JSON absent. A missing split can be rebuilt while an already
+settled split is retained. Typed storage-capacity failures and cancellation propagate directly;
 they do not trigger corruption repair or needless re-downloads.
 [benchmark_storage.cpp](../src/backend/data/benchmark_storage.cpp) owns capacity
 checks and concurrent reservations.
+
+### Recovery-derived annotation caches
+
+Recovery-off components keep their existing normalized indexes. An eligible
+component with usable originals uses a separate
+`indexes/coconut-<release>/<physical-source>.recovery-<identity>.normalized.bin`
+with its own `.inventory` and `.complete.json`. The identity binds the base
+component inputs, physical namespace, recovery policy version (currently 1),
+and admitted original annotation identity. Changes to those facts require a
+different derived product. Original indexes, base components, physical
+inventories, downloads, image caches, and image-group proofs remain reusable.
+
+The canonical [inventory declarations](../src/backend/data/detail/coconut_inventory.h)
+derive the recovery trailer and its checked encoding. Each image retains
+recovered COCONut IDs, source ordinals/categories, original COCO IDs, and
+unresolved omissions. Joint index/inventory/completion admission verifies these
+facts; invalid or interrupted products rebuild. Unavailable originals select
+the base component without publishing a successful derived recovery cache.
+A later compilation attempts original admission again.
+
+`benchmark_manifest.json` keeps these current facts under `recipe`:
+
+| Field | Meaning |
+| --- | --- |
+| `recover_dropped_masks` | Selected compile option |
+| `original_annotations.train`, `.validation` | Present when recovery is enabled: admitted original annotation identities, or `null` when unavailable |
+| `recovered_objects`, `unresolved_objects` | Counts from the selected recovery-eligible COCO components |
+| `components[].recovery_policy`, `.original_annotation_identity` | Policy and original identity governing that component; zero/empty for base products |
+| `components[].recovered_objects`, `.unresolved_objects` | That component's current counts after membership reconciliation |
+
+These counts concern normalization's recovery outcome, not every historical
+`failed.txt` line or the later image/header geometry checks. Cached derived
+products retain the same counts and replay their unresolved omissions to the
+append-only report. Recovery-off compilation records zero recovery counts.
+When enabled, compilation exposes a concise recovered/unresolved progress
+summary. No diagnostic log is needed to establish cache validity or these
+product facts.
 
 ## Reading compilation progress
 
@@ -247,8 +345,8 @@ These formats have independent versions:
 | Compiled `train.bin` / `val.bin` | [Format 9](datasets.md#compiled-binary-format), with 64-bit mask byte offsets and 60-byte instance records |
 | Normalized annotation index | Version 3, 256-byte header, 32-byte image records, 64-byte annotation records, and source-mask RLE |
 | Download, extraction, and image-group metadata | Cache schema 2; the cache directory name remains `v1` |
-| COCONut physical/component inventory | Version 1 (`CNUTIVN1`), declaration-order little-endian encoding with checked strings/counts and a SHA-256 trailer |
-| `benchmark_manifest.json` | Schema 3 compilation facts, including recipe, source identities, mappings, resolution, resize/resampling policy, and cache root |
+| COCONut physical/component inventory | Version 1 (`CNUTIVN1`), declaration-order little-endian encoding with checked strings/counts and a SHA-256 trailer; derived components additionally bind the recovery-policy trailer |
+| `benchmark_manifest.json` | Schema 3 compilation facts, including recipe, source identities, recovery selection/counts, mappings, resolution, resize/resampling policy, and cache root |
 
 [benchmark_annotations.cpp](../src/backend/data/benchmark_annotations.cpp)
 owns normalized-index layout and staged publication. Its six

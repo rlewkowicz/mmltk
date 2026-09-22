@@ -374,10 +374,13 @@ and [evaluator](../src/backend/models/rfdetr/core/evaluator.cpp) define:
   threshold is reported; ties retain the first threshold. These confidence metrics use
   IoU 0.50 and are not averages across the AP IoU axis.
 
-The shared evaluator uses stored original annotation area for both box and mask
-area ranges. Compilation's [area fallback](datasets.md#instance-records) applies
-only when the source omitted area. Small, medium, and large ranges share the
-inclusive boundaries at `32²` and `96²` source pixels. Unmatched detections
+The shared evaluator uses stored source-area metadata for both box and mask
+area ranges. Generic compilation's [area fallback](datasets.md#instance-records)
+applies when the source omitted area; optional COCONut
+[mask recovery](benchmark-datasets.md#optional-dropped-mask-recovery) supplies
+the area of its recovered or carved annotations before resizing. Small, medium,
+and large ranges share the inclusive boundaries at `32²` and `96²` source pixels.
+Unmatched detections
 outside the current area range are ignored; their box or mask area is converted
 back to source units using the stored resize geometry.
 

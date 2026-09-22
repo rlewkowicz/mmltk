@@ -333,7 +333,8 @@ It shares the compiled layout, resizer, and loader described here.
 
 [Built-in benchmark datasets](benchmark-datasets.md) owns recipe membership,
 native import and physical provenance, persistent archive/JPEG/index reuse,
-bounded repair, progress units, partial downloads, and cache-format limits.
+optional original-annotation mask recovery, bounded archive/image repair,
+progress units, partial downloads, and cache-format limits.
 Use [Dataset controls](gui-interaction.md#dataset-compilation-controls) for GUI
 selection and [benchmark cache selection](commands.md#benchmark-cache-selection)
 for wrapper/CLI configuration.

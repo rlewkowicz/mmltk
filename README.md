@@ -76,7 +76,9 @@ it does not recover source resolution. See the
 
 The Dataset card's benchmark override offers Coco custom and Coconut.
 Coconut compiles the full COCONut training recipe with a choice of validation
-annotations and membership, reusing the persistent source cache. See the
+annotations and membership, reusing the persistent source cache. Its optional
+dropped-mask recovery is off by default; enable it before recompiling to recover
+eligible objects from original COCO annotations. See the
 [built-in dataset guide](docs/benchmark-datasets.md) for those choices and for
 reading download and extraction progress.
 

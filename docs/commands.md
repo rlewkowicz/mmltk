@@ -85,6 +85,22 @@ when metadata is available. They compile a bounded diagnostic helper with the
 existing development compiler, native Arrow libraries, and vendored PNG decoder;
 no Python Parquet package or new dependency is installed.
 
+`--export-mask-runs` requires exactly one `--index` and writes the selected
+image's normalized objects to
+`build/validation/benchmark-image/ID.originals.json`. It retains the annotation
+identity, dimensions, boxes, flags, source IDs/ordinals, area, and exact row-major
+runs. Export is bounded to 65,535 objects, 65,535 runs per object, and 1,048,576
+runs per image. For example:
+
+```bash
+./mmltk --diagnose-benchmark-image --image-id 2212 \
+  --index .cache/benchmark-dataset/v1/indexes/coco/train2017.normalized.bin \
+  --export-mask-runs
+```
+
+This inspects the selected retained index; it does not compile or enable
+[mask recovery](benchmark-datasets.md#optional-dropped-mask-recovery).
+
 The command runs in the existing development image with networking disabled,
 read-only source mounts, no image build or pull, and a ten-minute deadline. Optional
 `--export` copies the matched encoded image to
@@ -182,7 +198,8 @@ The CLI forwards its explicit `--cache-dir` to the compiler:
 
 `--compile-benchmark-dataset` takes the square resolution. This CLI route uses
 Coco custom; the GUI's [Dataset controls](gui-interaction.md#dataset-compilation-controls)
-expose Coconut and its validation choices. `--cache-dir` and `--overwrite`
+expose Coconut, its validation choices, and optional dropped-mask recovery.
+There is no CLI recovery switch. `--cache-dir` and `--overwrite`
 require benchmark mode. `--overwrite` replaces compiled output while preserving
 the separate persistent source cache. The
 [benchmark reference](benchmark-datasets.md#persistent-cache-and-publication)

@@ -86,17 +86,23 @@ is the native initial choice. The
 [recipe membership table](benchmark-datasets.md#recipes-and-validation-membership)
 defines exactly which images and labels each choice compiles.
 
-Both selections persist in settings. Returning to Coco custom or disabling the
-override hides the dependent radios without clearing their values. The hidden
-validation choice has no effect on Coco custom, and Directory compilation ignores
-both benchmark choices. Override mode disables source-directory text and Browse;
-turning it off restores those controls. Selecting a radio never starts work.
+Coconut also reveals **Recover dropped masks from original annotations**, off
+by default. Its [recovery policy](benchmark-datasets.md#optional-dropped-mask-recovery)
+uses eligible original COCO masks without changing validation membership.
+Recompile existing datasets to apply a changed recovery setting.
+
+The recipe, validation choice, and recovery setting persist. Returning to Coco
+custom or disabling the override hides the dependent controls without clearing
+their values. Hidden validation/recovery choices have no effect on Coco custom;
+Directory compilation ignores the benchmark selection. Override mode disables
+source-directory text and Browse; turning it off restores those controls.
+Changing these controls never starts work.
 
 **Compile Benchmark Dataset** or **Compile Dataset** requires settled settings
 and native admission. The accepted native request captures those settings for
-the entire operation. While compilation is active, the two recipe and three
-validation radios are disabled; the established Dataset controls keep their
-existing enablement rules. The action becomes **Cancel compilation**, using
+the entire operation. While compilation is active, the two recipe radios,
+three validation radios, and recovery checkbox are disabled; the other Dataset
+controls keep their existing enablement rules. The action becomes **Cancel compilation**, using
 the Dataset system's Stop operation. Progress uses native
 [acquisition and output facts](benchmark-datasets.md#reading-compilation-progress),
 and completion, cancellation, or failure comes from the native terminal result.
@@ -644,19 +650,27 @@ partially visible row in demand. Its measured viewport may alternate between
 N and N+1 rows while card raster extent remains unchanged.
 
 Native dataset readiness and a drawable atlas are independent. While a ready,
-nonempty gallery has no paired image and no active native work or failure, the
-GUI shows **Restoring gallery**. Logical match counts and the retained scroll
-row remain available. The gallery keeps its GPU/input surface mounted beneath
-the status overlay, so graphics binding can establish the first or replacement
-image without waiting for an already displayed atlas.
+nonempty gallery has no paired image and no active native work or failure, a
+pending restoration shows **Restoring gallery**. A presentation selection that
+cannot be admitted or returns failure shows **Gallery unavailable**. Logical
+match counts and the retained scroll row remain available. The gallery keeps
+its GPU/input surface mounted beneath the status overlay, so graphics binding
+can establish the first or replacement image without waiting for an already
+displayed atlas.
 
-[Presentation routing](../src/frontend/iced/src/app/presentation.rs) renews
-selection when a ready gallery has neither a drawable atlas nor an active
-handoff. A selection reply does not complete that graphics handoff. Capacity
-pressure waits for actual reader settlement and availability; rejected offers
-are consumed once, and delayed duplicate receipts cannot restart recovery or
-replace a newer valid image. Recovery uses retained native products and the
-existing graphics notifications without reopening the dataset or polling.
+[Presentation routing](../src/frontend/iced/src/app/presentation.rs) retains
+restoration demand for the current dataset and gallery frame. Returning from
+Detail or another tab requests publication of that retained product. A matching
+selection reply settles the request; only matching paired gallery metadata and
+a drawable image satisfy the demand. Logical retirement of an obsolete Detail
+publication leaves its live `SampleRead` and encoded GPU draws protected.
+
+Capacity pressure waits for actual reader settlement and availability. Rejected
+offers remain associated with their exact product across selection settlement
+or a temporary reconnect snapshot gap. Each rejection is consumed once; delayed
+duplicate receipts or viewer offers cannot displace useful newer gallery work.
+Recovery uses retained native products and ordinary graphics notifications
+without reopening the dataset or polling.
 
 The retained gallery sensor continues measuring beneath Detail. The component
 records the latest size, native capacity, column count, scroll row, and row
