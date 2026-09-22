@@ -162,6 +162,9 @@ impl App {
                 self.model.explore.desired_detail = None;
             }
         }
+        if context == Some(ApplicationIntentEndpoint::PresentationSelect) {
+            self.settle_presentation_select(reply.correlation, decoded.is_ok());
+        }
         let _ = self.model.reduce_reply(reply.correlation, decoded);
         self.workspace.sync_workflows(&self.model);
         let installed_settings = self

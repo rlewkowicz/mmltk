@@ -1,8 +1,17 @@
 use super::*;
 
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) enum GalleryPresentation {
+    #[default]
+    Inactive,
+    Restoring,
+    Unavailable,
+}
+
 #[derive(Debug, Clone, Default)]
 pub(super) struct PresentationModel {
     foreground: Option<PresentationSourceKind>,
+    gallery_presentation: GalleryPresentation,
     sent: Option<PresentationSourceIdentity>,
 }
 
@@ -39,6 +48,14 @@ impl PresentationModel {
 }
 
 impl ApplicationModel {
+    pub(crate) fn gallery_presentation(&self) -> GalleryPresentation {
+        self.presentation_model.gallery_presentation
+    }
+
+    pub(crate) fn set_gallery_presentation(&mut self, presentation: GalleryPresentation) {
+        self.presentation_model.gallery_presentation = presentation;
+    }
+
     pub(crate) fn foreground_visual(&self) -> Option<PresentationSourceKind> {
         self.presentation_model.foreground()
     }

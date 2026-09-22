@@ -186,14 +186,21 @@ pub(super) fn view<'a>(
     input: crate::workspace_input::Binding,
 ) -> Element<'a, Message> {
     let snapshot = model.explore.snapshot.as_ref();
-    let presentation_title = if paired.is_none()
+    let presentation_override = if paired.is_none()
         && snapshot.is_some_and(|value| {
             value.ready && !value.busy && value.failure.is_empty() && value.order.matchingcount != 0
-        }) {
-        "Restoring gallery"
+        })
+    {
+        match model.gallery_presentation() {
+            crate::view_model::GalleryPresentation::Restoring => Some("Restoring gallery"),
+            crate::view_model::GalleryPresentation::Unavailable => Some("Gallery unavailable"),
+            crate::view_model::GalleryPresentation::Inactive => None,
+        }
     } else {
-        model.explore.presentation_title()
+        None
     };
+    let presentation_title =
+        presentation_override.unwrap_or_else(|| model.explore.presentation_title());
     let columns = explore_columns(settings);
     let settings_available = settings.draft.is_some() && model.settings_edit_available();
     let mutation_available = !settings.has_local_edits() && model.explore_mutation_available();
@@ -327,7 +334,7 @@ pub(super) fn view<'a>(
     })
     .width(Fill)
     .height(Fill);
-    let status = container(text(gallery_status(&model.explore)).size(12))
+    let status = container(text(gallery_status(&model.explore, presentation_override)).size(12))
         .id(super::STATUS_CARD_ID)
         .padding(Padding::from([6, 10]))
         .width(Fill)
@@ -634,13 +641,13 @@ fn column_control(columns: u32, available: bool) -> Element<'static, Message> {
     }
 }
 
-fn gallery_status(model: &crate::view_model::ExploreModel) -> String {
+fn gallery_status(model: &crate::view_model::ExploreModel, title: Option<&str>) -> String {
     let status = model.snapshot.as_ref().map_or_else(
         || "Waiting for the current typed Explore snapshot".to_owned(),
         |value| {
             format!(
                 "{} · rows {}–{} · {} workers · revision {}",
-                model.presentation_title(),
+                title.unwrap_or_else(|| model.presentation_title()),
                 value.viewport.firstrow,
                 value
                     .viewport

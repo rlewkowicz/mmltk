@@ -16,8 +16,8 @@ pub(super) struct Controller {
     pending: Option<Surface>,
     pending_rejected: bool,
     retained: Option<Surface>,
-    // Selection acknowledgement does not complete the graphics handoff.
-    gallery_handoff: bool,
+    gallery: Option<GalleryRestoration>,
+    selection: Option<(u64, GalleryIdentity)>,
     gallery_blocked: Option<FrameReady>,
     // Monotonic physical receipt frontier; a deferred loss survives its request
     // acknowledgement without letting duplicate callbacks restart recovery.
@@ -26,6 +26,44 @@ pub(super) struct Controller {
     viewer: Option<(u64, u32)>,
     suspended: Option<SuspendedViewer>,
     pub(super) stop_requested: bool,
+}
+
+#[derive(Clone, PartialEq)]
+struct GalleryIdentity {
+    dataset: u64,
+    frame: VisualFrame,
+}
+
+impl GalleryIdentity {
+    fn current(model: &ApplicationModel) -> Option<Self> {
+        let snapshot = model.explore.snapshot.as_ref()?;
+        (model.foreground_visual() == Some(PresentationSourceKind::Explore)
+            && snapshot.ready
+            && model.explore.requested_selection.is_none()
+            && model.explore.desired_selection.is_none()
+            && snapshot.mode == crate::generated::ExploreMode::Gallery)
+            .then(|| Self {
+                dataset: snapshot.dataset.identity,
+                frame: snapshot.frame.clone(),
+            })
+    }
+
+    fn matches(&self, content: &crate::presentation_surface::GalleryContent) -> bool {
+        content.metadata.dataset.identity == self.dataset && content.metadata.frame == self.frame
+    }
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum GalleryStatus {
+    Needed,
+    Waiting,
+    Drawable,
+    Failed,
+}
+
+struct GalleryRestoration {
+    identity: GalleryIdentity,
+    status: GalleryStatus,
 }
 
 struct SuspendedViewer {
@@ -488,14 +526,57 @@ impl App {
     }
 
     pub(super) fn select_presentation(&mut self, frame: VisualFrame) {
+        if self.model.has_pending(ApplicationIntentEndpoint::PresentationSelect) {
+            return;
+        }
         let source = frame.source.clone();
-        if self.submit_intent(
+        let gallery = GalleryIdentity::current(&self.model)
+            .filter(|identity| identity.frame == frame);
+        if gallery.as_ref().is_some_and(|identity| {
+            self.presentation.gallery.as_ref().is_some_and(|demand| {
+                demand.identity == *identity && demand.status == GalleryStatus::Failed
+            })
+        }) {
+            return;
+        }
+        let mut request = 0;
+        let submitted = self.submit_intent(
             ApplicationIntentEndpoint::PresentationSelect,
-            move |correlation| crate::generated::encode_presentation_Select(correlation, source),
-        ) {
-            self.presentation.gallery_handoff =
-                frame.source.kind == PresentationSourceKind::Explore;
+            |correlation| {
+                request = correlation;
+                crate::generated::encode_presentation_Select(correlation, source)
+            },
+        );
+        if submitted {
+            self.presentation.selection = gallery.clone().map(|identity| (request, identity));
             self.model.record_presentation_sent(frame);
+        }
+        if let Some(identity) = gallery
+            && let Some(demand) = self.presentation.gallery.as_mut()
+            && demand.identity == identity
+            && demand.status != GalleryStatus::Drawable
+        {
+            demand.status = if submitted {
+                GalleryStatus::Waiting
+            } else {
+                GalleryStatus::Failed
+            };
+        }
+        self.model
+            .set_gallery_presentation(self.presentation.gallery_presentation());
+    }
+
+    pub(super) fn settle_presentation_select(&mut self, correlation: u64, succeeded: bool) {
+        if self.presentation.selection.as_ref().is_some_and(|(request, _)| *request == correlation)
+            && let Some((_, identity)) = self.presentation.selection.take()
+            && !succeeded
+            && let Some(demand) = self.presentation.gallery.as_mut()
+            && demand.identity.dataset == identity.dataset
+            && demand.identity.frame.source == identity.frame.source
+            && demand.status != GalleryStatus::Drawable
+        {
+            demand.status = GalleryStatus::Failed;
+            self.presentation.gallery_recovery_needed = false;
         }
     }
 
@@ -507,27 +588,24 @@ impl App {
             self.retire_peer(error);
             return;
         }
-        if self.workspace.active() == FeatureId::Explore
-            && self.model.foreground_visual() == Some(PresentationSourceKind::Explore)
-            && self
-                .model
-                .explore
-                .snapshot
-                .as_ref()
-                .is_some_and(|snapshot| {
-                    snapshot.ready && snapshot.mode == crate::generated::ExploreMode::Gallery
-                })
-            && !self.presentation.gallery_handoff
+        if self.presentation.gallery.as_ref().is_some_and(|demand| {
+            demand.status == GalleryStatus::Needed
+        })
             && self.presentation.pending.is_none()
-            && crate::presentation_surface::gallery::displayed().is_none()
+            && self.presentation.gallery_blocked.is_none()
         {
             self.model.invalidate_presentation_selection();
         }
+        self.model
+            .set_gallery_presentation(self.presentation.gallery_presentation());
     }
 
     pub(super) fn reconcile_presentation(&mut self, recovery: bool) {
         self.reconcile_viewer();
         self.dispatch_viewer_desired();
+        if recovery {
+            self.presentation.retry_gallery();
+        }
         self.reconcile_surface_frame();
         if recovery
             && let Err(error) =
@@ -556,10 +634,93 @@ impl App {
 }
 
 impl Controller {
+    fn gallery_presentation(&self) -> crate::view_model::GalleryPresentation {
+        use crate::view_model::GalleryPresentation;
+        match self.gallery.as_ref().map(|demand| demand.status) {
+            Some(GalleryStatus::Needed | GalleryStatus::Waiting) => GalleryPresentation::Restoring,
+            Some(GalleryStatus::Failed) => GalleryPresentation::Unavailable,
+            Some(GalleryStatus::Drawable) | None => GalleryPresentation::Inactive,
+        }
+    }
+
+    fn retry_gallery(&mut self) {
+        if let Some(demand) = self.gallery.as_mut() {
+            demand.status = GalleryStatus::Needed;
+        }
+    }
+
+    fn reconcile_gallery(&mut self, model: &ApplicationModel, feature: FeatureId) {
+        let identity = (feature == FeatureId::Explore)
+            .then(|| GalleryIdentity::current(model))
+            .flatten();
+        let Some(identity) = identity else {
+            self.gallery = None;
+            self.selection = None;
+            self.gallery_blocked = None;
+            self.gallery_recovery_needed = false;
+            return;
+        };
+        if self.gallery.as_ref().is_none_or(|demand| demand.identity != identity) {
+            // Advancing the same gallery is native notification-driven. A new
+            // dataset or return from Detail needs its own publication request.
+            let status = self.gallery.as_ref().filter(|demand| {
+                demand.identity.dataset == identity.dataset
+                    && demand.identity.frame.source == identity.frame.source
+                    && demand.status != GalleryStatus::Failed
+            }).map_or(GalleryStatus::Needed, |demand| {
+                if demand.status == GalleryStatus::Drawable {
+                    GalleryStatus::Waiting
+                } else {
+                    demand.status
+                }
+            });
+            self.gallery = Some(GalleryRestoration { identity, status });
+            self.gallery_blocked = None;
+            self.gallery_recovery_needed = false;
+        }
+        let demand = self.gallery.as_ref().expect("current gallery demand");
+        if self.pending.is_some_and(|surface| {
+            crate::presentation_surface::gallery::matching(surface.frame)
+                .is_none_or(|content| content.metadata.dataset.identity != demand.identity.dataset)
+        }) {
+            // Retiring logical publication leaves SampleRead/encoded draws alive.
+            self.retire_pending();
+        }
+        if self.retained.is_some_and(|surface| {
+            crate::presentation_surface::gallery::matching(surface.frame).is_none_or(|content| {
+                self.gallery.as_ref().is_some_and(|demand| {
+                    content.metadata.dataset.identity != demand.identity.dataset
+                })
+            })
+        }) {
+            self.retained = None;
+        }
+        self.observe_gallery_display();
+    }
+
+    fn observe_gallery_display(&mut self) {
+        let Some(demand) = self.gallery.as_mut() else {
+            return;
+        };
+        let displayed = crate::presentation_surface::gallery::displayed();
+        if let Some((surface, _)) = displayed.as_ref()
+            .filter(|(_, content)| demand.identity.matches(content))
+        {
+            demand.status = GalleryStatus::Drawable;
+            self.retained = Some(*surface);
+            self.surface = Some(*surface);
+            self.gallery_blocked = None;
+            self.gallery_recovery_needed = false;
+        } else if demand.status == GalleryStatus::Drawable && displayed.is_none() {
+            // A renderer loss is a new availability edge, not an acknowledgement.
+            demand.status = GalleryStatus::Needed;
+        }
+    }
+
     fn reject_gallery_handoff(&mut self, frame: FrameReady, model: &ApplicationModel) {
         let rejected_pending =
             self.pending_rejected && self.pending.and_then(|surface| surface.frame) == Some(frame);
-        if model.foreground_visual() != Some(PresentationSourceKind::Explore)
+        if GalleryIdentity::current(model).is_none_or(|identity| !frame.matches_content(&identity.frame))
             || frame.content_session
                 != crate::generated::presentation_source_session(PresentationSourceKind::Explore)
             || (!rejected_pending && frame.presentation_revision <= self.gallery_rejection_revision)
@@ -597,6 +758,17 @@ impl Controller {
             crate::presentation_surface::release(frame);
             return false;
         };
+        if self.gallery.as_ref().is_some_and(|demand| {
+            self.pending.and_then(|pending| {
+                crate::presentation_surface::gallery::matching(pending.frame)
+            }).is_some_and(|content| demand.identity.matches(&content))
+        }) && GalleryIdentity::current(model).is_some()
+            && crate::presentation_surface::gallery::matching(Some(frame)).is_none()
+        {
+            // A delayed viewer offer cannot displace useful gallery admission.
+            crate::presentation_surface::release(frame);
+            return false;
+        }
         if let Some(previous) = self.pending.and_then(|pending| pending.frame)
             && previous.presentation_revision >= frame.presentation_revision
         {
@@ -619,7 +791,9 @@ impl Controller {
                     && crate::presentation_surface::publication_admission_blocked(frame)
                 {
                     self.gallery_blocked = Some(frame);
-                    self.gallery_handoff = true;
+                    if let Some(demand) = self.gallery.as_mut() {
+                        demand.status = GalleryStatus::Waiting;
+                    }
                 }
                 self.reject_gallery_handoff(frame, model);
             }
@@ -645,8 +819,11 @@ impl Controller {
             ..surface
         });
         self.pending_rejected = false;
-        if crate::presentation_surface::gallery::matching(Some(frame)).is_some() {
-            self.gallery_handoff = false;
+        if let Some(content) = crate::presentation_surface::gallery::matching(Some(frame))
+            && let Some(demand) = self.gallery.as_mut()
+            && demand.identity.matches(&content)
+        {
+            demand.status = GalleryStatus::Waiting;
             self.gallery_blocked = None;
             self.gallery_recovery_needed = false;
         }
@@ -655,7 +832,8 @@ impl Controller {
     }
 
     pub(super) fn retire_frame(&mut self) {
-        self.gallery_handoff = false;
+        self.gallery = None;
+        self.selection = None;
         self.gallery_blocked = None;
         self.gallery_recovery_needed = false;
         // Keep the physical receipt frontier, like incumbent, across page changes:
@@ -699,12 +877,13 @@ impl Controller {
             return Ok(());
         }
         let _ = recovery;
+        self.reconcile_gallery(model, feature);
         if self
             .gallery_blocked
             .is_some_and(|frame| !crate::presentation_surface::publication_admission_blocked(frame))
         {
             self.gallery_blocked = None;
-            self.gallery_handoff = false;
+            self.retry_gallery();
         }
         if self.pending_rejected {
             self.retire_pending();
@@ -715,7 +894,7 @@ impl Controller {
             && self.gallery_blocked.is_none()
         {
             self.gallery_recovery_needed = false;
-            self.gallery_handoff = false;
+            self.retry_gallery();
         }
         if let Some(surface) = self.pending {
             crate::presentation_surface::reconcile_completed(surface, model);
@@ -731,6 +910,7 @@ impl Controller {
             crate::presentation_surface::reconcile_completed(retained, model);
         }
 
+        self.observe_gallery_display();
         Ok(())
     }
 }
@@ -1465,8 +1645,13 @@ mod tests {
                 app.presentation
                     .reconcile(&app.model, FeatureId::Explore, false)
                     .unwrap();
-                assert_eq!(app.presentation.retained, Some(retained));
-                assert_eq!(app.presentation.pending, Some(retained));
+                let logical = if GalleryIdentity::current(&app.model).is_some() {
+                    None // Gallery return retires obsolete logical Detail state.
+                } else {
+                    Some(retained)
+                };
+                assert_eq!(app.presentation.retained, logical);
+                assert_eq!(app.presentation.pending, logical);
                 assert!(test_releases().is_empty());
                 app.presentation.discard();
                 assert!(test_releases().is_empty());
