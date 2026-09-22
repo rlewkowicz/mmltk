@@ -2061,6 +2061,7 @@ TEST_CASE("Workspace damage retains bounded disjoint conservative patches", "[gp
  ImageWorkspaceRegion hull = input.front();
  for (const auto rectangle : input) {
   if (rectangle.x1 >= rectangle.x2 || rectangle.y1 >= rectangle.y2) continue;
+  // CLEANUP-IGNORE: Independent geometric oracle; reusing the production merge would make the coverage bound circular.
   hull.x1 = std::min(hull.x1, rectangle.x1);
   hull.y1 = std::min(hull.y1, rectangle.y1);
   hull.x2 = std::max(hull.x2, rectangle.x2);

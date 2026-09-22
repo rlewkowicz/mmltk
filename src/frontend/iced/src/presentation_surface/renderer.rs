@@ -1726,15 +1726,27 @@ impl SurfaceRenderer {
             })
     }
 
-    fn matching_import<'a>(
-        imported: &'a mut Option<Imported>,
-        pending: &'a mut Option<Imported>,
+    fn prepare_source(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
         surface: Surface,
-    ) -> Option<&'a mut Imported> {
-        imported
+    ) -> Option<&mut Imported> {
+        let imported = self
+            .imported
             .iter_mut()
-            .chain(pending.iter_mut())
-            .find(|candidate| same_allocation(candidate.image.surface, surface))
+            .chain(self.pending.iter_mut())
+            .find(|candidate| same_allocation(candidate.image.surface, surface))?;
+        let change = imported.ensure_source(device, queue, surface);
+        Self::propagate_source_views(
+            &mut self.draws,
+            device,
+            &self.layout,
+            &self.sampler,
+            imported,
+            change,
+        );
+        Some(imported)
     }
 
     fn propagate_source_views(
@@ -1765,18 +1777,7 @@ impl SurfaceRenderer {
         surface: Surface,
         placement: Placement,
     ) {
-        if let Some(imported) =
-            Self::matching_import(&mut self.imported, &mut self.pending, surface)
-        {
-            let change = imported.ensure_source(device, queue, surface);
-            Self::propagate_source_views(
-                &mut self.draws,
-                device,
-                &self.layout,
-                &self.sampler,
-                imported,
-                change,
-            );
+        if let Some(imported) = self.prepare_source(device, queue, surface) {
             imported.reconcile_sample(surface, placement);
             return;
         }
@@ -1916,18 +1917,7 @@ impl SurfaceRenderer {
         {
             self.discard_pending();
         }
-        if let Some(imported) =
-            Self::matching_import(&mut self.imported, &mut self.pending, surface)
-        {
-            let change = imported.ensure_source(device, queue, surface);
-            Self::propagate_source_views(
-                &mut self.draws,
-                device,
-                &self.layout,
-                &self.sampler,
-                imported,
-                change,
-            );
+        if let Some(imported) = self.prepare_source(device, queue, surface) {
             imported.prepare(surface, placement);
             return;
         }

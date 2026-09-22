@@ -754,23 +754,14 @@ mod tests {
                 let source = Source::Validation(content.clone(), flags & 4 != 0, flags & 8 != 0);
                 let gt_visible = flags & 5 == 5;
                 let det_visible = flags & 10 == 10;
+                let expected_caption = |index: usize| {
+                    let layer = usize::from(index % 2 == 0);
+                    [gt_visible, det_visible][layer]
+                        .then(|| content.labels[layer][index / 2].3.text.as_ptr())
+                };
                 let mut combined = Vec::new();
                 source.visit(|_, _, _, _, _, _, cached| combined.push(cached.text.as_ptr()));
-                let expected_combined: Vec<_> = (0..4)
-                    .filter(|index| {
-                        if index % 2 == 1 {
-                            gt_visible
-                        } else {
-                            det_visible
-                        }
-                    })
-                    .map(|index| {
-                        content.labels[usize::from(index % 2 == 0)][index / 2]
-                            .3
-                            .text
-                            .as_ptr()
-                    })
-                    .collect();
+                let expected_combined: Vec<_> = (0..4).filter_map(expected_caption).collect();
                 assert_eq!(combined, expected_combined);
                 let mut seen = Vec::new();
                 let mut paragraphs = Vec::new();
@@ -782,19 +773,7 @@ mod tests {
                 }
                 let expected_paragraphs: Vec<_> = [1, 3, 0, 2]
                     .into_iter()
-                    .filter(|index| {
-                        if index % 2 == 1 {
-                            gt_visible
-                        } else {
-                            det_visible
-                        }
-                    })
-                    .map(|index| {
-                        content.labels[usize::from(index % 2 == 0)][index / 2]
-                            .3
-                            .text
-                            .as_ptr()
-                    })
+                    .filter_map(expected_caption)
                     .collect();
                 assert_eq!(paragraphs, expected_paragraphs);
                 let expected: Vec<_> = (0..if gt_visible { 2 } else { 0 })

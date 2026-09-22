@@ -1,27 +1,32 @@
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/matchers/catch_matchers.hpp>
 #include "src/common/io/file_digest.h"
-#include "src/common/io/staging_directory.h"
+#include "src/test_support/filesystem_test_utils.hpp"
 #include <fstream>
 namespace io = mmltk::common::io;
-TEST_CASE("File digest shares MD5 and SHA256 traversal with stable admission", "[digest]") {
- io::StagingDirectory temporary(std::filesystem::temp_directory_path() / "digest", ".", "-XXXXXX", "digest fixture");
- const auto path = temporary.path() / "input";
- {
-  std::ofstream file(path);
-  file << "abc";
+namespace {
+class DigestFileFixture {
+private:
+ const mmltk::testsupport::ScopedTempDir temporary{"digest"};
+
+protected:
+ DigestFileFixture() { mmltk::testsupport::write_text_file(path, "abc"); }
+ void Replace() const {
+  const auto replacement = temporary.path() / "replacement";
+  mmltk::testsupport::write_text_file(replacement, "abc");
+  std::filesystem::rename(replacement, path);
  }
+ const std::filesystem::path path = temporary.path() / "input";
+};
+}  // namespace
+TEST_CASE_METHOD(DigestFileFixture, "File digest shares MD5 and SHA256 traversal with stable admission", "[digest]") {
  const auto digests = io::try_file_digests(path, true);
  REQUIRE(digests);
  CHECK(digests->md5 == "900150983cd24fb0d6963f7d28e17f72");
  CHECK(io::sha256_hex(digests->sha256) == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
  CHECK(io::parse_sha256_hex(io::sha256_hex(digests->sha256)) == digests->sha256);
  CHECK_NOTHROW(digests->snapshot.RequireUnchanged(path));
- {
-  std::ofstream file(temporary.path() / "replacement");
-  file << "abc";
- }
- std::filesystem::rename(temporary.path() / "replacement", path);
+ Replace();
  CHECK_THROWS(digests->snapshot.RequireUnchanged(path));
  CHECK_FALSE(io::try_sha256_file(path, [] { return true; }));
  CHECK_THROWS(io::parse_sha256_hex("not a digest"));
@@ -39,9 +44,7 @@ TEST_CASE("Incremental SHA256 preserves chunk boundaries and sealed finalization
  CHECK(io::sha256_hex(empty.Finish()) == "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
  CHECK(io::sha256_bytes(bytes) == io::parse_sha256_hex("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"));
 }
-TEST_CASE("File digest handles empty files and complete multi-chunk input", "[digest]") {
- io::StagingDirectory temporary(std::filesystem::temp_directory_path() / "digest", ".", "-XXXXXX", "digest fixture");
- const auto path = temporary.path() / "input";
+TEST_CASE_METHOD(DigestFileFixture, "File digest handles empty files and complete multi-chunk input", "[digest]") {
  { std::ofstream file(path, std::ios::binary); }
  const auto empty = io::try_file_digests(path, true);
  REQUIRE(empty);
@@ -75,13 +78,7 @@ TEST_CASE("File digest handles empty files and complete multi-chunk input", "[di
  }
  CHECK_THROWS_WITH(io::sha256_file(path, [] { return true; }), "file digest cancelled");
 }
-TEST_CASE("File digest rejects mutation and replacement during admission", "[digest]") {
- io::StagingDirectory temporary(std::filesystem::temp_directory_path() / "digest", ".", "-XXXXXX", "digest fixture");
- const auto path = temporary.path() / "input";
- {
-  std::ofstream file(path);
-  file << "abc";
- }
+TEST_CASE_METHOD(DigestFileFixture, "File digest rejects mutation and replacement during admission", "[digest]") {
  int checkpoints = 0;
  SECTION("truncation before the read cannot expose unwritten scratch") {
   CHECK_THROWS_WITH(io::try_file_digests(path, true,
@@ -104,14 +101,7 @@ TEST_CASE("File digest rejects mutation and replacement during admission", "[dig
  }
  SECTION("replacement before final admission fails pathname custody") {
   CHECK_THROWS(io::try_file_digests(path, true, [&] {
-   if (++checkpoints == 3) {
-    const auto replacement = temporary.path() / "replacement";
-    {
-     std::ofstream file(replacement);
-     file << "abc";
-    }
-    std::filesystem::rename(replacement, path);
-   }
+   if (++checkpoints == 3) Replace();
    return false;
   }));
  }

@@ -471,6 +471,7 @@ TEST_CASE("preview recapture invalidates retained scratch and destination region
   }
  }
 }
+// CLEANUP-IGNORE: This custody test shares only aliases and one existing execution-policy call with the independent validation pixel test.
 TEST_CASE("decoded compact preview retains bytes through retry and release without widening admission", "[controller][gpu]") {
  namespace gpu = mmltk::frameworks::gpu;
  namespace rfdetr = mmltk::backend::models::rfdetr;

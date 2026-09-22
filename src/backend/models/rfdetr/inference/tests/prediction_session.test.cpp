@@ -1,6 +1,7 @@
 #include "src/backend/ml/torch/tests/catch_support.h"
 #include "src/backend/models/rfdetr/core/tests/class_artifact_fixture.h"
 #include "src/test_support/cuda_test_utils.hpp"
+#include <catch2/generators/catch_generators.hpp>
 #include <c10/cuda/CUDAGuard.h>
 #include <ATen/cuda/CUDAContext.h>
 #include "src/backend/models/rfdetr/inference/prediction_delivery.h"
@@ -107,6 +108,19 @@ TEST_CASE("cancelled prediction does not bind an artifact or deliver records", "
  CHECK_FALSE(delivered);
 }
 namespace {
+class PredictionStream final {
+public:
+ explicit PredictionStream(bool nonblocking) : selected_(nonblocking ? c10::cuda::getStreamFromExternal(owned_.get(), 0) : c10::cuda::getDefaultCUDAStream(0)), guard_(selected_) {
+  if (!nonblocking) REQUIRE(get() == nullptr);
+  REQUIRE(c10::cuda::getCurrentCUDAStream().stream() == get());
+ }
+ [[nodiscard]] cudaStream_t get() const noexcept { return selected_.stream(); }
+
+private:
+ mmltk::testsupport::ScopedTestStream owned_;
+ c10::cuda::CUDAStream selected_;
+ c10::cuda::CUDAStreamGuard guard_;
+};
 void write_prediction_model(const std::filesystem::path& path, std::int64_t queries = 2, bool include_masks = true, std::optional<rfdetr::ModelClassLayout> layout = {}) {
  namespace onnx = mmltk_onnx;
  onnx::ModelProto model;
@@ -536,13 +550,8 @@ TEST_CASE("full HD prediction materializes masks only for threshold survivors", 
  }
  write_prediction_model(root / "model.onnx", 300);
  REQUIRE(cudaSetDevice(0) == cudaSuccess);
- const mmltk::testsupport::ScopedTestStream stream_owner;
- auto selected_stream = c10::cuda::getDefaultCUDAStream(0);
- SECTION("explicit default stream") { REQUIRE(selected_stream.stream() == nullptr); }
- SECTION("nonblocking stream") { selected_stream = c10::cuda::getStreamFromExternal(stream_owner.get(), 0); }
- const c10::cuda::CUDAStreamGuard stream_guard(selected_stream);
- const auto stream = selected_stream.stream();
- REQUIRE(c10::cuda::getCurrentCUDAStream().stream() == stream);
+ const PredictionStream stream_scope{GENERATE(false, true)};
+ const auto stream = stream_scope.get();
  rfdetr::PredictRequest request;
  request.source_kind = rfdetr::PredictSourceKind::ImageFiles;
  request.image_inputs = {{image, "full HD", 42}};
@@ -1488,13 +1497,8 @@ TEST_CASE("prediction packed readback preserves admission and charges every reta
 }
 TEST_CASE("prediction mask packing retains exact odd-stride bytes through device and pinned reuse", "[model][rfdetr][prediction][gpu]") {
  REQUIRE(cudaSetDevice(0) == cudaSuccess);
- const mmltk::testsupport::ScopedTestStream stream_owner;
- auto selected_stream = c10::cuda::getDefaultCUDAStream(0);
- SECTION("explicit default stream") { REQUIRE(selected_stream.stream() == nullptr); }
- SECTION("nonblocking stream") { selected_stream = c10::cuda::getStreamFromExternal(stream_owner.get(), 0); }
- const c10::cuda::CUDAStreamGuard stream_guard(selected_stream);
- const auto stream = selected_stream.stream();
- REQUIRE(c10::cuda::getCurrentCUDAStream().stream() == stream);
+ const PredictionStream stream_scope{GENERATE(false, true)};
+ const auto stream = stream_scope.get();
  mmltk::backend::ml::cuda::NumaHostTensor host(0);
  torch::Tensor packed, values;
  std::size_t previous_device = 0U, previous_host = 0U;
