@@ -1129,7 +1129,8 @@ TEST_CASE("Cross-device display damage copies cropped planes and matches complet
  using test_support::ImageWorkspaceTestAccess;
  const bool peer = GENERATE(false, true);
  const bool semantic = GENERATE(false, true);
- CAPTURE(peer, semantic);
+ const bool capability_copy = GENERATE(false, true);
+ CAPTURE(peer, semantic, capability_copy);
  ImageWorkspaceTestAccess::Reset();
  auto backend = std::make_shared<FakeImageBackend>();
  backend->peer_access = peer;
@@ -1168,8 +1169,17 @@ TEST_CASE("Cross-device display damage copies cropped planes and matches complet
   target.descriptor.width = width;
   target.descriptor.height = height;
   finalizer(complete.plane(0U).plane(), semantic ? complete.plane(1U).plane() : ImagePlaneView{}, target, {}, 0U);
+  // Model the unchanged browser delivery boundary: direct reads use the
+  // completed source; capability delivery copies its entire retained capacity.
+  std::vector<std::uint8_t> sampled;
+  const auto* visible = reinterpret_cast<const std::uint8_t*>(display.data);
+  if (capability_copy) {
+   sampled.resize(layout.required_allocation_bytes);
+   std::memcpy(sampled.data(), reinterpret_cast<const void*>(display.data - layout.offset_bytes), sampled.size());
+   visible = sampled.data() + layout.offset_bytes;
+  }
   for (std::uint32_t y = 0; y != height; ++y) {
-   const auto* actual = reinterpret_cast<const std::uint8_t*>(display.data) + y * display.descriptor.pitch_bytes;
+   const auto* actual = visible + y * display.descriptor.pitch_bytes;
    for (std::uint32_t x = 0; x != width * 4U; ++x) {
     CHECK(actual[x] == reference[y * target.descriptor.pitch_bytes + x]);
     CHECK(actual[x] == pixels[semantic ? 1U : 0U][y * 16U + x]);
@@ -1196,7 +1206,20 @@ TEST_CASE("Cross-device display damage copies cropped planes and matches complet
   if (expected_regions.empty() && expected_bytes != 0U) expected_regions = whole;
   backend->record_transfers = true;
   static_cast<void>(backend->TakeTransfers());
-  workspace->Finalize(source.Borrow(), coverage, finalizer);
+  workspace->Finalize(source.Borrow(), coverage, [&](auto clean, auto overlay, auto destination, auto submitted, auto stream) {
+   std::size_t finalized_bytes = 0U;
+   if (submitted.full_image) finalized_bytes = width * height * 4U;
+   else {
+    CHECK(submitted.regions.size() <= 8U);
+    for (const auto region : submitted.regions) {
+     const auto left = std::clamp(region.x1, 0, static_cast<int>(width)), right = std::clamp(region.x2, 0, static_cast<int>(width));
+     const auto top = std::clamp(region.y1, 0, static_cast<int>(height)), bottom = std::clamp(region.y2, 0, static_cast<int>(height));
+     if (left < right && top < bottom) finalized_bytes += static_cast<std::size_t>(right - left) * (bottom - top) * 4U;
+    }
+   }
+   CHECK(finalized_bytes == expected_bytes);
+   finalizer(clean, overlay, destination, submitted, stream);
+  });
   REQUIRE(workspace->revision() == source.revision());
   const auto transfers = backend->TakeTransfers();
   std::size_t downloaded = 0U, uploaded = 0U;
@@ -1237,18 +1260,26 @@ TEST_CASE("Cross-device display damage copies cropped planes and matches complet
  const auto warm = workspace->StorageFootprint();
  const std::array<ImageWorkspaceRegion, 2U> disjoint{{{0, 0, 1, 1}, {3, 2, 9, 7}}};
  auto baseline = workspace->Content();
+ ImageWorkspaceDamage history;
+ history.Record(baseline, {});
  for (auto& plane : pixels) {
   plane[0] = 99U;
   plane[44] = 171U;
  }
  publish();
  const std::array<ImageWorkspaceRegion, 2U> copied_disjoint{{{0, 0, 1, 1}, {3, 2, 4, 3}}};
- finalize({workspace->identity(), disjoint, false, baseline}, 8U, copied_disjoint);
+ const auto current_content = [&] {
+  const auto read = source.Borrow();
+  return ImageWorkspaceContent{read.plane(0U).plane().allocation.owner, read.plane(0U).revision()};
+ };
+ history.Record(current_content(), {.regions = disjoint, .full_image = false, .baseline = baseline});
+ finalize(history.Since(baseline, current_content(), workspace->identity()), 8U, copied_disjoint);
  CHECK(workspace->StorageFootprint().device_bytes == warm.device_bytes);
  CHECK(workspace->StorageFootprint().pinned_bytes == warm.pinned_bytes);
  baseline = workspace->Content();
  publish();
- finalize({workspace->identity(), {}, false, baseline}, 0U);
+ history.Record(current_content(), {.full_image = false, .baseline = baseline});
+ finalize(history.Since(baseline, current_content(), workspace->identity()), 0U);
  baseline = workspace->Content();
  const std::array<ImageWorkspaceRegion, 2U> clipped{{{-7, -4, 2, 1}, {9, 9, 12, 12}}};
  for (auto& plane : pixels) plane[4] = 81U;
@@ -1274,10 +1305,12 @@ TEST_CASE("Cross-device display damage copies cropped planes and matches complet
  }
  baseline = workspace->Content();
  publish();
+ history.Record(current_content(), {.regions = disjoint, .full_image = false, .baseline = baseline});
+ const auto failed_coverage = history.Since(baseline, current_content(), workspace->identity());
  backend->FailAfter(FakeImageBackend::FailurePoint::Copy, peer ? 1U : 2U);
- CHECK_THROWS(workspace->Finalize(source.Borrow(), {workspace->identity(), disjoint, false, baseline}, finalizer));
+ CHECK_THROWS(workspace->Finalize(source.Borrow(), failed_coverage, finalizer));
  CHECK_FALSE(workspace->Content().valid());
- finalize({workspace->identity(), disjoint, false, baseline}, 48U);
+ finalize(failed_coverage, 48U);
  CHECK(workspace->Settle().completion_reached);
 }
 TEST_CASE("Alternating displays accumulate skipped damage and recover from history overflow", "[gpu][workspace][copy]") {
@@ -1317,16 +1350,18 @@ TEST_CASE("Alternating displays accumulate skipped damage and recover from histo
  history.Record(content(), {});
  present(0U, true);
  present(1U, true);
- const std::array<ImageWorkspaceRegion, 1U> region{{{1, 1, 2, 2}}};
- const auto change = [&](std::uint8_t value) {
+ const auto change = [&](std::uint8_t value, int x = 1, int y = 1) {
   const auto baseline = content();
-  expected[20U] = value;
-  product.Publish(stream, 4U, 3U, [value](auto clean, auto, auto) { *(reinterpret_cast<std::uint8_t*>(clean.data) + clean.descriptor.pitch_bytes + 4U) = value; });
+  const std::array<ImageWorkspaceRegion, 1U> region{{{x, y, x + 1, y + 1}}};
+  expected[static_cast<std::size_t>(y) * 16U + x * 4U] = value;
+  product.Publish(stream, 4U, 3U, [value, x, y](auto clean, auto, auto) {
+   *(reinterpret_cast<std::uint8_t*>(clean.data) + y * clean.descriptor.pitch_bytes + x * 4U) = value;
+  });
   history.Record(content(), {.regions = region, .full_image = false, .baseline = baseline});
  };
- change(37U);
+ change(37U, 0, 0);
  present(0U, false);
- change(73U);
+ change(73U, 3, 2);
  present(1U, false);
  change(99U);
  present(0U, false);
@@ -1357,8 +1392,14 @@ TEST_CASE("Partial display copies retain raw reads until transfer settlement and
  auto blocked = backend->HoldStreamSettlements("partial display receiver settlement");
  backend->defer_notifications = true;
  auto copying = std::async(std::launch::async, [&] {
-  const std::array<ImageWorkspaceRegion, 1U> region{{{1, 1, 2, 2}}};
-  workspace->Finalize(source.Borrow(), {workspace->identity(), region, false, baseline}, finalize);
+  const std::array<ImageWorkspaceRegion, 2U> regions{{{0, 0, 1, 1}, {3, 2, 4, 3}}};
+  ImageWorkspaceDamage history;
+  const auto current = [&] {
+   const auto read = source.Borrow();
+   return ImageWorkspaceContent{read.plane(0U).plane().allocation.owner, read.plane(0U).revision()};
+  }();
+  history.Record(current, {.regions = regions, .full_image = false, .baseline = baseline});
+  workspace->Finalize(source.Borrow(), history.Since(baseline, current, workspace->identity()), finalize);
  });
  mmltk::testsupport::ScopedTestCleanup release{[&] { blocked->Release(); }};
  REQUIRE(blocked->WaitEntered(std::chrono::seconds{2}));
@@ -1952,9 +1993,12 @@ TEST_CASE("Workspace damage accumulates skipped raw revisions for each display b
  damage.Record({7U, 8U}, {.regions = {&second, 1U}, .full_image = false, .baseline = {7U, 3U}});
  const auto older = damage.Since({7U, 1U}, {7U, 8U}, 101U);
  REQUIRE_FALSE(older.full_image);
- REQUIRE(older.regions.size() == 1U);
+ REQUIRE(older.regions.size() == 3U);
  CHECK(older.allocation_identity == 101U);
- CHECK(older.regions.front() == ImageWorkspaceRegion{2, 1, 25, 15});
+ CHECK(older.baseline == ImageWorkspaceContent{7U, 1U});
+ CHECK(older.regions[0U] == first[0U]);
+ CHECK(older.regions[1U] == first[1U]);
+ CHECK(older.regions[2U] == second);
  const auto newer = damage.Since({7U, 3U}, {7U, 8U}, 102U);
  REQUIRE_FALSE(newer.full_image);
  CHECK(newer.regions.front() == second);
@@ -1965,6 +2009,118 @@ TEST_CASE("Workspace damage accumulates skipped raw revisions for each display b
  for (std::uint64_t revision = 10U; revision != 100U; ++revision) damage.Record({7U, revision}, {.regions = {&second, 1U}, .full_image = false, .baseline = {7U, revision - 1U}});
  CHECK(damage.Since({7U, 9U}, {7U, 99U}, 102U).full_image);
  CHECK_FALSE(damage.Since({7U, 98U}, {7U, 99U}, 102U).full_image);
+}
+TEST_CASE("Workspace damage retains bounded disjoint conservative patches", "[gpu][workspace]") {
+ const bool separate_revisions = GENERATE(false, true);
+ std::vector<ImageWorkspaceRegion> input, expected;
+ SECTION("distant and contained rectangles") {
+  input = {{0, 0, 4, 4}, {10, 10, 12, 12}, {1, 1, 2, 2}};
+  expected = {{0, 0, 4, 4}, {10, 10, 12, 12}};
+ }
+ SECTION("overlap requires rescanning previously disjoint rectangles") {
+  input = {{0, 0, 2, 2}, {3, 3, 5, 5}, {1, 4, 4, 6}, {0, 1, 2, 5}};
+  expected = {{0, 0, 5, 6}};
+ }
+ SECTION("matching edges merge without added area") {
+  input = {{0, 0, 2, 2}, {2, 0, 4, 2}, {0, 2, 4, 4}};
+  expected = {{0, 0, 4, 4}};
+ }
+ SECTION("partial edges and corners remain separate") {
+  input = {{0, 0, 2, 2}, {2, 1, 4, 3}, {4, 3, 6, 5}};
+  expected = input;
+ }
+ SECTION("empty and inverted patches contribute nothing") {
+  input = {{0, 0, 0, 1}, {0, 2, 1, 1}, {3, 3, 4, 4}};
+  expected = {{3, 3, 4, 4}};
+ }
+ SECTION("eight distant patches stay sparse") {
+  for (int index = 0; index != 8; ++index) input.push_back({index * 3, 0, index * 3 + 1, 1});
+  expected = input;
+ }
+ SECTION("overflow stays coarsened for later distant patches") {
+  for (int index = 0; index != 10; ++index) input.push_back({index * 3, 0, index * 3 + 1, 1});
+  expected = {{0, 0, 28, 1}};
+ }
+ ImageWorkspaceDamage damage;
+ ImageWorkspaceContent current{7U, 1U};
+ if (separate_revisions) {
+  for (const auto region : input) {
+   const auto baseline = current;
+   ++current.revision;
+   damage.Record(current, {.regions = {&region, 1U}, .full_image = false, .baseline = baseline});
+  }
+ } else {
+  ++current.revision;
+  damage.Record(current, {.regions = input, .full_image = false, .baseline = {7U, 1U}});
+ }
+ const auto coverage = damage.Since({7U, 1U}, current, 101U);
+ REQUIRE_FALSE(coverage.full_image);
+ REQUIRE(coverage.regions.size() == expected.size());
+ CHECK(coverage.regions.size() <= 8U);
+ for (const auto rectangle : expected) CHECK(std::ranges::find(coverage.regions, rectangle) != coverage.regions.end());
+ std::size_t area = 0U;
+ ImageWorkspaceRegion hull = input.front();
+ for (const auto rectangle : input) {
+  if (rectangle.x1 >= rectangle.x2 || rectangle.y1 >= rectangle.y2) continue;
+  hull.x1 = std::min(hull.x1, rectangle.x1);
+  hull.y1 = std::min(hull.y1, rectangle.y1);
+  hull.x2 = std::max(hull.x2, rectangle.x2);
+  hull.y2 = std::max(hull.y2, rectangle.y2);
+  for (auto y = rectangle.y1; y < rectangle.y2; ++y)
+   for (auto x = rectangle.x1; x < rectangle.x2; ++x)
+    CHECK(std::ranges::any_of(coverage.regions, [&](auto result) { return result.x1 <= x && x < result.x2 && result.y1 <= y && y < result.y2; }));
+ }
+ for (std::size_t index = 0U; index != coverage.regions.size(); ++index) {
+  const auto rectangle = coverage.regions[index];
+  area += static_cast<std::size_t>(rectangle.x2 - rectangle.x1) * (rectangle.y2 - rectangle.y1);
+  for (std::size_t other = index + 1U; other != coverage.regions.size(); ++other) {
+   const auto second = coverage.regions[other];
+   CHECK_FALSE((rectangle.x1 < second.x2 && second.x1 < rectangle.x2 && rectangle.y1 < second.y2 && second.y1 < rectangle.y2));
+  }
+ }
+ CHECK(area <= static_cast<std::size_t>(hull.x2 - hull.x1) * (hull.y2 - hull.y1));
+}
+TEST_CASE("Workspace damage preserves exact chains and empty coverage lifetime", "[gpu][workspace]") {
+ ImageWorkspaceDamage damage;
+ const ImageWorkspaceRegion patch{1, 2, 3, 4};
+ damage.Record({7U, 2U}, {.regions = {&patch, 1U}, .full_image = false, .baseline = {7U, 1U}});
+ damage.Record({7U, 2U}, {}); // Duplicate publication cannot replace the recorded change.
+ damage.Record({}, {});
+ auto coverage = damage.Since({7U, 1U}, {7U, 2U}, 31U);
+ REQUIRE_FALSE(coverage.full_image);
+ REQUIRE(coverage.regions.size() == 1U);
+ CHECK(coverage.regions.front() == patch);
+ damage.Record({7U, 3U}, {.full_image = false, .baseline = {7U, 2U}});
+ CHECK(coverage.regions.front() == patch); // Recording does not overwrite the retained result.
+ for (const auto baseline : {ImageWorkspaceContent{7U, 2U}, ImageWorkspaceContent{7U, 3U}}) {
+  coverage = damage.Since(baseline, {7U, 3U}, 32U);
+  REQUIRE_FALSE(coverage.full_image);
+  REQUIRE(coverage.regions.size() == 1U);
+  CHECK(coverage.regions.front() == ImageWorkspaceRegion{});
+  CHECK(coverage.allocation_identity == 32U);
+  CHECK(coverage.baseline == baseline);
+ }
+ CHECK(damage.Since({}, {7U, 3U}, 32U).full_image);
+ CHECK(damage.Since({7U, 3U}, {8U, 3U}, 32U).full_image);
+ damage.Record({7U, 5U}, {.full_image = false, .baseline = {7U, 4U}});
+ CHECK(damage.Since({7U, 3U}, {7U, 5U}, 32U).full_image);
+ ImageWorkspaceDamage bounded;
+ for (std::uint64_t revision = 2U; revision <= 65U; ++revision)
+  bounded.Record({7U, revision}, {.regions = {&patch, 1U}, .full_image = false, .baseline = {7U, revision - 1U}});
+ CHECK_FALSE(bounded.Since({7U, 1U}, {7U, 65U}, 33U).full_image);
+ bounded.Record({7U, 66U}, {.full_image = false, .baseline = {7U, 65U}});
+ CHECK(bounded.Since({7U, 1U}, {7U, 66U}, 33U).full_image);
+ CHECK_FALSE(bounded.Since({7U, 2U}, {7U, 66U}, 33U).full_image);
+}
+TEST_CASE("Workspace damage merges extreme coordinates without extent arithmetic", "[gpu][workspace]") {
+ const auto low = std::numeric_limits<std::int32_t>::min(), high = std::numeric_limits<std::int32_t>::max();
+ const std::array<ImageWorkspaceRegion, 2U> regions{{{low, low, 0, high}, {0, low, high, high}}};
+ ImageWorkspaceDamage damage;
+ damage.Record({7U, 2U}, {.regions = regions, .full_image = false, .baseline = {7U, 1U}});
+ const auto coverage = damage.Since({7U, 1U}, {7U, 2U}, 101U);
+ REQUIRE_FALSE(coverage.full_image);
+ REQUIRE(coverage.regions.size() == 1U);
+ CHECK(coverage.regions.front() == ImageWorkspaceRegion{low, low, high, high});
 }
 }  // namespace
 }  // namespace mmltk::frameworks::gpu

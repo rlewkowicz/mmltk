@@ -33,11 +33,43 @@ void merge_workspace_damage(ImageWorkspaceRegion& result, ImageWorkspaceRegion r
  result.y2 = std::max(result.y2, region.y2);
 }
 }  // namespace
+void ImageWorkspaceDamage::Regions::Insert(ImageWorkspaceRegion region) noexcept {
+ if (region.x1 >= region.x2 || region.y1 >= region.y2) return;
+ if (coarsened_) {
+  merge_workspace_damage(rectangles_[0U], region);
+  return;
+ }
+ for (std::size_t index = 0U; index < count_;) {
+  const auto existing = rectangles_[index];
+  const bool intersects = region.x1 < existing.x2 && existing.x1 < region.x2 && region.y1 < existing.y2 && existing.y1 < region.y2;
+  const bool rectangular_union =
+   (region.x1 == existing.x1 && region.x2 == existing.x2 && region.y1 <= existing.y2 && existing.y1 <= region.y2) ||
+   (region.y1 == existing.y1 && region.y2 == existing.y2 && region.x1 <= existing.x2 && existing.x1 <= region.x2);
+  if (!intersects && !rectangular_union) {
+   ++index;
+   continue;
+  }
+  merge_workspace_damage(region, existing);
+  rectangles_[index] = rectangles_[--count_];
+  // The enlarged hull can intersect an earlier rectangle.
+  index = 0U;
+ }
+ if (count_ == rectangles_.size()) {
+  for (const auto existing : rectangles_) merge_workspace_damage(region, existing);
+  count_ = 0U;
+  coarsened_ = true;
+ }
+ rectangles_[count_++] = region;
+}
+std::span<const ImageWorkspaceRegion> ImageWorkspaceDamage::Regions::Coverage() const noexcept {
+ // Preserve one empty rectangle so finalizers still validate empty work.
+ return {rectangles_.data(), std::max(count_, std::size_t{1U})};
+}
 void ImageWorkspaceDamage::Record(ImageWorkspaceContent current, ImageWorkspaceCoverage coverage) noexcept {
  if (!current.valid() || current == newest_) return;
  auto& change = changes_[next_];
  change = {.before = coverage.baseline, .after = current, .full = coverage.full_image};
- for (const auto region : coverage.regions) merge_workspace_damage(change.bounds, region);
+ for (const auto region : coverage.regions) change.regions.Insert(region);
  next_ = (next_ + 1U) % changes_.size();
  count_ = std::min(count_ + 1U, changes_.size());
  newest_ = current;
@@ -50,11 +82,11 @@ ImageWorkspaceCoverage ImageWorkspaceDamage::Since(ImageWorkspaceContent baselin
   const auto& change = changes_[(next_ + changes_.size() - count_ + index) % changes_.size()];
   if (change.before != cursor) continue;
   if (change.full) return {};
-  merge_workspace_damage(accumulated_, change.bounds);
+  for (const auto region : change.regions.Coverage()) accumulated_.Insert(region);
   cursor = change.after;
  }
  if (cursor != current) return {};
- return {.allocation_identity = allocation, .regions = {&accumulated_, 1U}, .full_image = false, .baseline = baseline};
+ return {.allocation_identity = allocation, .regions = accumulated_.Coverage(), .full_image = false, .baseline = baseline};
 }
 bool ImageWorkspaceLayout::valid() const noexcept {
  const auto maximum = std::numeric_limits<std::size_t>::max();

@@ -89,15 +89,25 @@ public:
  [[nodiscard]] ImageWorkspaceCoverage Since(ImageWorkspaceContent, ImageWorkspaceContent, std::uint64_t allocation) noexcept;
 
 private:
+ class Regions final {
+ public:
+  void Insert(ImageWorkspaceRegion) noexcept;
+  [[nodiscard]] std::span<const ImageWorkspaceRegion> Coverage() const noexcept;
+
+ private:
+  std::array<ImageWorkspaceRegion, 8U> rectangles_{};
+  std::size_t count_ = 0U;
+  bool coarsened_ = false;
+ };
  struct Change final {
   ImageWorkspaceContent before{}, after{};
-  ImageWorkspaceRegion bounds{};
+  Regions regions{};
   bool full = true;
  };
  std::array<Change, 64U> changes_{};
  std::size_t next_ = 0U, count_ = 0U;
  ImageWorkspaceContent newest_{};
- ImageWorkspaceRegion accumulated_{};
+ Regions accumulated_{};
 };
 using ImageWorkspaceFinalize = std::function<void(ImagePlaneView clean, ImagePlaneView semantic, ImagePlaneView destination, ImageWorkspaceCoverage, std::uintptr_t stream)>;
 // One physical Vulkan opaque-FD allocation, producer-context mappings, and
