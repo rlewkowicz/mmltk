@@ -674,7 +674,7 @@ TEST_CASE("Criterion losses and gradients share one assignment upload under both
  for (std::size_t index = 0; index < baseline.gradients.size(); ++index) REQUIRE(torch::allclose(observed.gradients[index], baseline.gradients[index], 1e-6, 1e-6));
  REQUIRE(observed.statistics.cost_submissions == 1);
  REQUIRE(observed.statistics.cost_dependencies == 1);
- REQUIRE(observed.statistics.cost_bytes == 4 * 1 * 4 * 1 * sizeof(float));
+ REQUIRE(observed.statistics.cost_bytes == (2 + 4 + 2 + 2) * sizeof(float));
  REQUIRE(observed.statistics.materializations == 1);
  REQUIRE(observed.statistics.assignment_bytes == 4 * group * 3 * sizeof(std::int64_t));
  REQUIRE(observed.statistics.uploads == 1);
@@ -868,4 +868,73 @@ TEST_CASE("matcher focal alpha changes dense and CUDA assignments consistently",
   assert_single_image_match_count(indices, 1);
   CHECK(indices[0].first.item<std::int64_t>() == (alpha == .25 ? 1 : 0));
  }
+}
+
+TEST_CASE("CUDA matcher keeps exact grouped assignments for repeated and reordered target ranges", "[model][rfdetr][matcher][cuda][numa]") {
+ namespace r = mmltk::backend::models::rfdetr;
+ if (mmltk::testsupport::checked_cuda_device_count() == 0) SKIP("CUDA unavailable; compact assignment coverage remains unverified");
+ const int groups = GENERATE(1, 2);
+ c10::cuda::CUDAGuard guard(static_cast<c10::DeviceIndex>(0));
+ const auto execution = mmltk::frameworks::gpu::test_support::selected_test_device(0, mmltk::common::system::NumaTopology::Capture());
+ const auto& p = execution.placement;
+ mmltk::common::system::ScopedExecutionPolicy policy({p.cpus, {}, 0, p.numa_node, -10, false});
+ const torch::Device device(torch::kCUDA, 0);
+ auto targets = make_single_image_targets(torch::full({6, 4}, .2F), torch::zeros({6}, torch::kInt64), torch::ones({6}));
+ targets.counts = {0, 4, 2, 4};
+ targets.offsets = {0, 2, 0, 2};
+ targets.targets.resize(4);
+ targets.all_labels = targets.all_labels.to(device);
+ targets.all_boxes = targets.all_boxes.to(device);
+ auto config = make_config();
+ config.group_detr = groups;
+ r::MatcherWorkspace workspace(p.numa_node, true);
+ workspace.enable_statistics();
+ r::ScopedRuntimeContext runtime(nullptr, 0, &workspace);
+ for (const int queries : {2, 6}) {
+  r::ModelOutputs outputs;
+  outputs.main.pred_logits = torch::zeros({4, queries, config.num_classes}, torch::TensorOptions().device(device));
+  outputs.main.pred_boxes = torch::full({4, queries, 4}, .2F, torch::TensorOptions().device(device));
+  const auto before = workspace.statistics();
+  const auto matches = r::matcher_indices(outputs, targets, config, true);
+  REQUIRE(matches.size() == 4);
+  for (size_t image = 0; image < targets.counts.size(); ++image) {
+   const auto count = std::min<int64_t>(queries / groups, targets.counts[image]);
+   const auto diagonal = torch::arange(count, torch::kInt64);
+   REQUIRE(matches[image].first.numel() == groups * count);
+   for (int group = 0; group < groups; ++group) {
+    REQUIRE(torch::equal(matches[image].first.narrow(0, group * count, count), diagonal + group * (queries / groups)));
+    REQUIRE(torch::equal(matches[image].second.narrow(0, group * count, count), diagonal));
+   }
+  }
+  REQUIRE(workspace.statistics().cost_bytes - before.cost_bytes == sizeof(float) * queries * 10);
+  REQUIRE(workspace.statistics().cost_submissions - before.cost_submissions == 1);
+  REQUIRE(workspace.statistics().cost_dependencies - before.cost_dependencies == 1);
+  auto invalid = targets;
+  invalid.offsets[1] = 4;
+  REQUIRE_THROWS(r::matcher_indices(outputs, invalid, config, true));
+  invalid = targets;
+  invalid.counts[1] = -1;
+  REQUIRE_THROWS(r::matcher_indices(outputs, invalid, config, true));
+  invalid = targets;
+  invalid.counts.pop_back();
+  REQUIRE_THROWS(r::matcher_indices(outputs, invalid, config, true));
+ }
+ r::ModelOutputs no_targets;
+ no_targets.main.pred_logits = torch::zeros({4, 2, config.num_classes}, torch::TensorOptions().device(device));
+ no_targets.main.pred_boxes = torch::zeros({4, 2, 4}, torch::TensorOptions().device(device));
+ targets.counts = {0, 0, 0, 0};
+ targets.offsets = {0, 0, 0, 0};
+ targets.all_labels = torch::Tensor{};
+ const auto no_target_matches = r::matcher_indices(no_targets, targets, config, true);
+ REQUIRE(no_target_matches.size() == 4);
+ for (const auto& match : no_target_matches) REQUIRE(match.first.numel() == 0);
+ r::ModelOutputs empty;
+ empty.main.pred_logits = torch::empty({0, 2, config.num_classes}, torch::TensorOptions().device(device));
+ empty.main.pred_boxes = torch::empty({0, 2, 4}, torch::TensorOptions().device(device));
+ targets.targets.clear();
+ targets.counts.clear();
+ targets.offsets.clear();
+ const auto before = workspace.statistics();
+ REQUIRE(r::matcher_indices(empty, targets, config, true).empty());
+ REQUIRE(workspace.statistics().cost_submissions == before.cost_submissions);
 }

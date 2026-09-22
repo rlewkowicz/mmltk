@@ -122,7 +122,7 @@ torch::Tensor ms_deform_attn_cuda_forward(
  const auto validated = validate_deform_attn_inputs(value, spatial_shapes, level_start_index, sampling_loc, attn_weight, im2col_step, "ms_deform_attn_cuda_forward");
  const auto& dims = validated.dims;
  c10::cuda::CUDAGuard device_guard(value.device());
- auto output = at::zeros({dims.batch, dims.num_query, dims.num_heads, dims.channels}, value.options());
+ auto output = at::empty({dims.batch, dims.num_query, dims.num_heads, dims.channels}, value.options());
  launch_ms_deform_attn_cuda_forward(ms_deform_attn_launch::ForwardLaunch{
   make_current_tensor_launch_common(value, validated.layout, sampling_loc, attn_weight, dims),
   output.data_ptr<float>(),

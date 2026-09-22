@@ -538,14 +538,14 @@ std::pair<torch::Tensor, torch::Tensor> target_metadata_on_device(const Prepared
  const auto options = torch::TensorOptions().dtype(torch::kInt64).device(device);
  return {torch::tensor(targets.offsets, options), torch::tensor(targets.counts, options)};
 }
-void build_cuda_matcher_cost_into(const OutputLayer& layer, const PreparedTargets& targets, const DetectionConfig& config, const torch::Tensor& target_indices, const torch::Tensor& compact_cost) {
+void build_cuda_matcher_cost_into(const OutputLayer& layer, const PreparedTargets& targets, const DetectionConfig& config, const torch::Tensor& target_indices, const torch::Tensor& compact_cost,
+ const torch::Tensor& target_offsets, const torch::Tensor& target_counts, const torch::Tensor& output_offsets, int64_t padded_queries, int64_t max_targets) {
  const auto device = layer.pred_logits.device();
- auto [target_offsets, target_counts] = target_metadata_on_device(targets, device);
  const auto pred_logits = layer.pred_logits.contiguous();
  const auto pred_boxes = layer.pred_boxes.contiguous();
  const auto target_labels = targets.all_labels.to(device, torch::kInt64, false, false).contiguous();
  const auto target_boxes = targets.all_boxes.to(device, torch::kFloat32, false, false).contiguous();
- pairwise_detection_cost_cuda_out(compact_cost, pred_logits, pred_boxes, target_labels, target_boxes, target_offsets.contiguous(), target_counts.contiguous(), config.set_cost_class,
+ pairwise_detection_cost_cuda_out(compact_cost, pred_logits, pred_boxes, target_labels, target_boxes, target_offsets, target_counts, output_offsets, padded_queries, max_targets, config.set_cost_class,
   config.set_cost_bbox, config.set_cost_giou, config.focal_alpha);
  if (!config.include_masks || !has_target_masks(targets)) { return; }
  mmltk::common::logging::ScopedProfile profile_rfdetr_matcher_cost_masks{"rfdetr.matcher.cost_masks"};
@@ -553,7 +553,7 @@ void build_cuda_matcher_cost_into(const OutputLayer& layer, const PreparedTarget
  const auto& all_masks = require_target_masks(targets, "native RF-DETR mask matcher");
  const auto target_masks = sample_target_masks(all_masks, target_indices, point_coords, "native RF-DETR mask matcher").to(torch::kFloat32).contiguous();
  pairwise_mask_cost_cuda_add_(
-  compact_cost, pred_masks_logits.contiguous(), target_masks, target_offsets.contiguous(), target_counts.contiguous(), config.mask_ce_loss_coef, config.mask_dice_loss_coef);
+  compact_cost, pred_masks_logits.contiguous(), target_masks, target_offsets, target_counts, output_offsets, padded_queries, max_targets, config.mask_ce_loss_coef, config.mask_dice_loss_coef);
 }
 void solve_matcher_indices_for_batch_cpu(const torch::Tensor& batch_cost_cpu, int64_t group_detr, LsapScratch& scratch, MatchIndices::value_type& result) {
  const int64_t num_queries = batch_cost_cpu.size(0);
@@ -585,8 +585,16 @@ std::vector<MatchIndices> compute_matcher_indices_for_layers(
  const auto bs = layers.front()->pred_logits.size(0);
  const auto device = layers.front()->pred_logits.device();
  if (bs != static_cast<int64_t>(targets.targets.size())) { throw std::runtime_error("target batch size does not match RF-DETR output batch size"); }
+ if (targets.counts.size() != static_cast<size_t>(bs) || targets.offsets.size() != targets.counts.size()) throw std::invalid_argument("matcher target metadata does not match batch size");
+ const auto available_targets = targets.all_labels.defined() ? targets.all_labels.numel() : 0;
  int64_t total_targets = 0;
- for (const auto count : targets.counts) { total_targets += count; }
+ for (size_t image = 0; image < targets.counts.size(); ++image) {
+  const auto count = targets.counts[image];
+  const auto offset = targets.offsets[image];
+  if (count < 0 || count > std::numeric_limits<int64_t>::max() - total_targets || offset < 0 ||
+      offset > available_targets || count > available_targets - offset) throw std::invalid_argument("matcher target range is invalid");
+  total_targets += count;
+ }
  int64_t max_queries = 0;
  int64_t max_targets_per_image = 0;
  int64_t assignment_extent = 0;
@@ -617,19 +625,23 @@ std::vector<MatchIndices> compute_matcher_indices_for_layers(
   std::vector<MatchIndices> empty(layers.size(), empty_matcher_indices(targets));
   return empty;
  }
- torch::Tensor compact_cost_cpu;
  std::vector<torch::Tensor> dense_cpu_costs;
  if (device.is_cuda()) {
   auto& scratch = workspace;
-  scratch.prepare_cost({static_cast<int64_t>(layers.size()), bs, max_queries, max_targets_per_image}, device);
+  scratch.prepare_cost(layer_query_counts, targets.counts, device);
+  auto [target_offsets, target_counts] = target_metadata_on_device(targets, device);
+  target_offsets = target_offsets.contiguous();
+  target_counts = target_counts.contiguous();
+  const auto output_offsets = scratch.output_offsets(targets.offsets, target_offsets);
   const auto target_indices =
-   targets.target_indices.defined() && targets.target_indices.device() == device ? targets.target_indices : torch::arange(total_targets, torch::TensorOptions().dtype(torch::kInt64).device(device));
+   targets.target_indices.defined() && targets.target_indices.device() == device ? targets.target_indices : torch::arange(targets.all_labels.numel(), torch::TensorOptions().dtype(torch::kInt64).device(device));
   for (size_t layer_index = 0; layer_index < layers.size(); ++layer_index) {
-   build_cuda_matcher_cost_into(*layers[layer_index], targets, config, target_indices, scratch.device_layer(static_cast<int64_t>(layer_index)));
+   build_cuda_matcher_cost_into(*layers[layer_index], targets, config, target_indices, scratch.device_layer(static_cast<int64_t>(layer_index)),
+    target_offsets, target_counts, output_offsets, max_queries, max_targets_per_image);
   }
   {
    mmltk::common::logging::ScopedProfile profile_rfdetr_matcher_cost_to_cpu{"rfdetr.matcher.cost_to_cpu"};
-   compact_cost_cpu = scratch.read_cost();
+   (void)scratch.read_cost();
   }
  } else {
   dense_cpu_costs.reserve(layers.size());
@@ -659,8 +671,7 @@ std::vector<MatchIndices> compute_matcher_indices_for_layers(
    if (target_count == 0) { continue; }
    torch::Tensor batch_cost_cpu;
    if (device.is_cuda()) {
-    batch_cost_cpu =
-     compact_cost_cpu.select(0, static_cast<int64_t>(layer_index)).select(0, static_cast<int64_t>(batch_index)).narrow(0, 0, layer_query_counts[layer_index]).narrow(1, 0, target_count);
+    batch_cost_cpu = workspace.cpu_matrix(static_cast<int64_t>(layer_index), static_cast<int64_t>(batch_index));
    } else {
     batch_cost_cpu = dense_cpu_costs[layer_index].select(0, static_cast<int64_t>(batch_index)).narrow(0, 0, layer_query_counts[layer_index]).narrow(1, targets.offsets[batch_index], target_count);
    }

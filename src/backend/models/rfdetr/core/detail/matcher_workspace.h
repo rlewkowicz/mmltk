@@ -27,7 +27,9 @@ public:
  ~MatcherWorkspace();
  MatcherWorkspace(const MatcherWorkspace&) = delete;
  MatcherWorkspace& operator=(const MatcherWorkspace&) = delete;
- void prepare_cost(at::IntArrayRef shape, const at::Device&);
+ void prepare_cost(at::IntArrayRef queries, at::IntArrayRef counts, const at::Device&);
+ [[nodiscard]] at::Tensor cpu_matrix(std::int64_t layer, std::int64_t image) const;
+ [[nodiscard]] at::Tensor output_offsets(at::IntArrayRef lookup_offsets, const at::Tensor& device_offsets);
  [[nodiscard]] at::Tensor device_layer(std::int64_t index) const;
  [[nodiscard]] at::Tensor read_cost();
  [[nodiscard]] at::Tensor cpu_indices(std::int64_t count);

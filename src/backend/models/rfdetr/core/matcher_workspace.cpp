@@ -98,7 +98,8 @@ struct AssignmentSlot final {
 struct MatcherCostResources final {
  std::shared_ptr<MatcherContext> context;
  std::unique_ptr<mmltk::backend::ml::cuda::NumaHostTensor> host;
- at::Tensor device_backing, device_cost, cpu_cost;
+ at::Tensor device_backing, device_cost, cpu_cost, output_prefixes;
+ std::vector<std::int64_t> queries, target_prefixes, layer_prefixes;
  CUevent complete{};
  bool pending = false;
  bool release() noexcept {
@@ -106,6 +107,7 @@ struct MatcherCostResources final {
    if (pending) check(cuCtxSynchronize(), "settle unfinished matcher cost generation");
    cpu_cost = at::Tensor{};
    if (host) check(host->ReleaseSettled(), "release matcher cost pages");
+   output_prefixes = at::Tensor{};
    device_cost = at::Tensor{};
    device_backing = at::Tensor{};
    if (complete) {
@@ -205,25 +207,73 @@ at::Tensor MatcherWorkspace::cpu_indices(std::int64_t count) {
  storage->ensure_bytes(std::max<std::size_t>(2 * count * sizeof(std::int64_t), 1));
  return at::from_blob(storage->data(), {2, count}, [storage](void*) {}, at::TensorOptions().dtype(at::kLong));
 }
-void MatcherWorkspace::prepare_cost(at::IntArrayRef shape, const at::Device& device) {
- if (shape.size() != 4 || !device.is_cuda() || !device.has_index()) throw std::invalid_argument("matcher cost storage requires four dimensions and an explicit CUDA device");
+void MatcherWorkspace::prepare_cost(at::IntArrayRef queries, at::IntArrayRef counts, const at::Device& device) {
+ if (!device.is_cuda() || !device.has_index()) throw std::invalid_argument("matcher cost storage requires an explicit CUDA device");
+ constexpr std::int64_t limit = std::numeric_limits<std::int64_t>::max() / sizeof(float);
+ auto product = [](std::int64_t lhs, std::int64_t rhs) {
+  if (lhs < 0 || rhs < 0 || (rhs && lhs > limit / rhs)) throw std::invalid_argument("matcher cost shape overflows");
+  return lhs * rhs;
+ };
+ std::vector<std::int64_t> prefixes{0}, layers{0};
+ std::int64_t max_targets = 0, max_queries = 0;
+ for (auto count : counts) {
+  if (count < 0 || count > limit - prefixes.back()) throw std::invalid_argument("matcher target prefix overflows");
+  prefixes.push_back(prefixes.back() + count);
+  max_targets = std::max(max_targets, count);
+ }
+ for (auto count : queries) {
+  const auto extent = product(count, prefixes.back());
+  if (extent > limit - layers.back()) throw std::invalid_argument("matcher layer prefix overflows");
+  layers.push_back(layers.back() + extent);
+  max_queries = std::max(max_queries, count);
+ }
+ // Retain the former padded allocation admission even though storage is compact.
+ (void)product(product(product(queries.size(), counts.size()), max_queries), max_targets);
  c10::cuda::CUDAGuard guard(device);
  state_->bind(device);
- std::int64_t elements = 1;
- for (auto size : shape) {
-  if (size < 0 || (size && elements > std::numeric_limits<std::int64_t>::max() / size)) throw std::invalid_argument("matcher cost shape overflows");
-  elements *= size;
+ auto& cost = *state_->cost;
+ if (cost.pending) {
+  check(cuCtxSynchronize(), "settle unfinished matcher cost generation before reuse");
+  cost.pending = false;
  }
- if (!state_->cost->device_backing.defined() || state_->cost->device_backing.numel() < elements) {
-  state_->cost->device_backing = at::empty({elements}, at::TensorOptions().dtype(at::kFloat).device(device));
+ const auto elements = layers.back();
+ if (!cost.device_backing.defined() || cost.device_backing.numel() < elements) {
+  cost.device_backing = at::empty({elements}, at::TensorOptions().dtype(at::kFloat).device(device));
   mmltk::common::logging::profile_add_value("rfdetr.matcher.cost_storage_growth", 1);
  }
- state_->cost->device_cost = state_->cost->device_backing.narrow(0, 0, elements).view(shape);
- state_->cost->cpu_cost = at::Tensor{};
- state_->cost->cpu_cost = state_->cost->host->view(shape, at::kFloat);
- state_->cost->pending = true;
+ cost.device_cost = cost.device_backing.narrow(0, 0, elements);
+ cost.cpu_cost = at::Tensor{};
+ cost.cpu_cost = cost.host->view({elements}, at::kFloat);
+ cost.output_prefixes = at::Tensor{};
+ cost.queries.assign(queries.begin(), queries.end());
+ cost.target_prefixes = std::move(prefixes);
+ cost.layer_prefixes = std::move(layers);
+ cost.pending = true;
 }
-at::Tensor MatcherWorkspace::device_layer(std::int64_t index) const { return state_->cost->device_cost.select(0, index); }
+at::Tensor MatcherWorkspace::device_layer(std::int64_t index) const {
+ const auto& cost = *state_->cost;
+ const auto begin = cost.layer_prefixes.at(index);
+ return cost.device_cost.narrow(0, begin, cost.layer_prefixes.at(index + 1) - begin);
+}
+at::Tensor MatcherWorkspace::cpu_matrix(std::int64_t layer, std::int64_t image) const {
+ const auto& cost = *state_->cost;
+ if (cost.pending) throw std::logic_error("matcher costs have not settled");
+ const auto queries = cost.queries.at(layer);
+ const auto prefix = cost.target_prefixes.at(image);
+ const auto count = cost.target_prefixes.at(image + 1) - prefix;
+ return cost.cpu_cost.narrow(0, cost.layer_prefixes.at(layer) + queries * prefix, queries * count).view({queries, count});
+}
+at::Tensor MatcherWorkspace::output_offsets(at::IntArrayRef lookup_offsets, const at::Tensor& device_offsets) {
+ auto& cost = *state_->cost;
+ const auto batch = cost.target_prefixes.size() - 1;
+ if (lookup_offsets.size() != batch) throw std::invalid_argument("matcher output metadata does not match batch size");
+ if (std::equal(lookup_offsets.begin(), lookup_offsets.end(), cost.target_prefixes.begin())) {
+  cost.output_prefixes = device_offsets;
+ } else {
+  cost.output_prefixes = at::tensor(at::IntArrayRef(cost.target_prefixes.data(), batch), device_offsets.options());
+ }
+ return cost.output_prefixes;
+}
 at::Tensor MatcherWorkspace::read_cost() {
  if (!state_->context || !state_->cost->device_cost.defined()) throw std::logic_error("matcher costs have not been prepared");
  c10::cuda::CUDAGuard guard(static_cast<c10::DeviceIndex>(state_->context->device));

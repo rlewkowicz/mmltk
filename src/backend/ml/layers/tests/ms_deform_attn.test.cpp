@@ -1,6 +1,8 @@
 #include "src/backend/ml/torch/tests/catch_support.h"
 #include "src/backend/ml/layers/ms_deform_attn.h"
 #include <torch/torch.h>
+#include <limits>
+#include <catch2/generators/catch_generators.hpp>
 #include "src/test_support/cuda_test_utils.hpp"
 namespace {
 void test_cuda_ms_deform_attn_matches_reference() {
@@ -27,3 +29,33 @@ void test_cuda_ms_deform_attn_matches_reference() {
 }
 }  // namespace
 TEST_CASE("test_cuda_ms_deform_attn_matches_reference", "[backend][ml][layers]") { test_cuda_ms_deform_attn_matches_reference(); }
+
+TEST_CASE("Deformable attention overwrites every output across chunks and empty support", "[backend][ml][layers]") {
+ if (mmltk::testsupport::checked_cuda_device_count() == 0) SKIP("CUDA unavailable; attention overwrite coverage remains unverified");
+ const int step = GENERATE(1, 2, 4, 64);
+ const int heads = GENERATE(1, 3);
+ const int channels = GENERATE(1, 7, 32);
+ const auto options = torch::TensorOptions().dtype(torch::kFloat32).device(torch::Device(torch::kCUDA, 0));
+ const auto shapes = torch::tensor({{2, 2}}, torch::kInt64);
+ const auto starts = torch::tensor({0}, torch::kInt64);
+ const auto value = torch::arange(4 * 4 * heads * channels, options).view({4, 4, heads, channels}) / 16;
+ const auto weights = torch::ones({4, 5, heads, 1, 1}, options);
+ auto locations = torch::empty({4, 5, heads, 1, 1, 2}, options);
+ for (int repeat = 0; repeat < 3; ++repeat) {
+  locations.fill_(.5F);
+  locations.select(1, 1).fill_(0.F);
+  locations.select(1, 2).fill_(1.F);
+  locations.select(1, 3).fill_(-.25F);
+  locations.select(1, 4).fill_(1.25F);
+  const auto output = mmltk::backend::ml::layers::ms_deform_attn_cuda_autograd(value, shapes, starts, locations, weights, step);
+  const auto expected = mmltk::backend::ml::layers::ms_deform_attn_reference(value, shapes, locations, weights);
+  REQUIRE(torch::equal(output, expected));
+  for (const float coordinate : {-2.F, 2.F, std::numeric_limits<float>::infinity(), -std::numeric_limits<float>::infinity(), std::numeric_limits<float>::quiet_NaN()}) {
+   locations.fill_(coordinate);
+   const auto empty = mmltk::backend::ml::layers::ms_deform_attn_cuda_autograd(value, shapes, starts, locations, weights, step);
+   REQUIRE(empty.numel() == 4 * 5 * heads * channels);
+   REQUIRE(empty.eq(0).all().item<bool>());
+   REQUIRE(torch::signbit(empty).any().item<bool>() == false);
+  }
+ }
+}

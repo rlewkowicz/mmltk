@@ -7,6 +7,9 @@
 #include <cuda_runtime_api.h>
 #include <unistd.h>
 #include <vector>
+#include <cstring>
+#include <limits>
+#include "detail/detr_matcher_cuda.h"
 #include <stdexcept>
 #include <string_view>
 #include "detail/matcher_workspace.h"
@@ -103,15 +106,19 @@ TEST_CASE("Matcher costs copy only compact active shapes after high-water growth
   const auto& p = device_scope.execution.placement;
   MatcherWorkspace workspace(p.numa_node, true);
   workspace.enable_statistics();
-  workspace.prepare_cost({3, 2, 8, 4}, at::Device(at::kCUDA, device_index));
+  workspace.prepare_cost({8, 3, 5}, {0, 4, 1}, at::Device(at::kCUDA, device_index));
   auto* const backing = workspace.device_layer(0).data_ptr();
   workspace.device_layer(0).fill_(7);
   workspace.device_layer(1).fill_(8);
   workspace.device_layer(2).fill_(9);
   auto large = workspace.read_cost();
-  REQUIRE(large.numel() == 192);
+  REQUIRE(large.numel() == 80);
+  REQUIRE(workspace.cpu_matrix(0, 0).numel() == 0);
+  REQUIRE(workspace.cpu_matrix(1, 1).sizes() == at::IntArrayRef({3, 4}));
+  REQUIRE(workspace.cpu_matrix(2, 2).stride(0) == 1);
+  REQUIRE(workspace.cpu_matrix(2, 2)[4][0].item<float>() == 9.F);
   large = at::Tensor{};
-  workspace.prepare_cost({1, 1, 2, 1}, at::Device(at::kCUDA, device_index));
+  workspace.prepare_cost({2}, {1}, at::Device(at::kCUDA, device_index));
   REQUIRE(workspace.device_layer(0).data_ptr() == backing);
   workspace.device_layer(0).fill_(11);
   const auto small = workspace.read_cost();
@@ -121,11 +128,27 @@ TEST_CASE("Matcher costs copy only compact active shapes after high-water growth
   const auto counters = workspace.statistics();
   REQUIRE(counters.cost_submissions == 2);
   REQUIRE(counters.cost_dependencies == 2);
-  REQUIRE(counters.cost_bytes == (192 + 2) * sizeof(float));
-  REQUIRE_THROWS(workspace.prepare_cost({1, -1}, at::Device(at::kCUDA, device_index)));
+  REQUIRE(counters.cost_bytes == (80 + 2) * sizeof(float));
+  REQUIRE_THROWS(workspace.prepare_cost({1}, {-1}, at::Device(at::kCUDA, device_index)));
+  REQUIRE_THROWS(workspace.prepare_cost({std::numeric_limits<int64_t>::max()}, {2}, at::Device(at::kCUDA, device_index)));
+  REQUIRE_THROWS(workspace.prepare_cost({2}, {1}, at::Device(at::kCPU)));
+  REQUIRE_THROWS(workspace.cpu_matrix(2, 0));
+  // An exception after queued writes leaves the workspace responsible for settlement.
+  try {
+   MatcherWorkspace pending(p.numa_node, true);
+   pending.prepare_cost({16}, {3}, at::Device(at::kCUDA, device_index));
+   pending.device_layer(0).fill_(13);
+   REQUIRE_THROWS(pending.cpu_matrix(0, 0));
+   pending.prepare_cost({2}, {1}, at::Device(at::kCUDA, device_index));
+   pending.device_layer(0).fill_(17);
+   REQUIRE(pending.read_cost()[0].item<float>() == 17.F);
+   pending.prepare_cost({16}, {3}, at::Device(at::kCUDA, device_index));
+   pending.device_layer(0).fill_(19);
+   throw std::runtime_error("abandon pending matcher generation");
+  } catch (const std::runtime_error& error) { REQUIRE(std::string_view(error.what()) == "abandon pending matcher generation"); }
   if (devices > 1) {
    const auto other_device = static_cast<c10::DeviceIndex>((device + 1) % devices);
-   REQUIRE_THROWS(workspace.prepare_cost({1, 1, 2, 1}, at::Device(at::kCUDA, other_device)));
+   REQUIRE_THROWS(workspace.prepare_cost({2}, {1}, at::Device(at::kCUDA, other_device)));
   }
  }
 }
@@ -185,4 +208,91 @@ TEST_CASE("Assignment transports retain autograd indices across overlapping resu
   escaped_loss.backward();
   REQUIRE(at::equal(mmltk::backend::ml::cuda::numa_readback(values.grad()), at::tensor({1.f, 0.f, 1.f, 0.f, 1.f, 0.f}).view({2, 3})));
  }
+}
+
+TEST_CASE("Compact matcher matrices preserve CUDA pair bits across independent lookup ranges", "[rfdetr][matcher][cuda][numa]") {
+ int devices = 0;
+ if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0) SKIP("CUDA unavailable; compact pair arithmetic remains unverified");
+ MatcherDeviceScope scope(0);
+ const at::Device device(at::kCUDA, scope.device_index);
+ const auto options = at::TensorOptions().dtype(at::kFloat).device(device);
+ const std::vector<int64_t> counts{0, 4, 2, 4}, offsets{0, 2, 0, 2}, queries{2, 5};
+ const auto lookup = at::tensor(offsets, options.dtype(at::kLong));
+ const auto device_counts = at::tensor(counts, options.dtype(at::kLong));
+ auto labels = at::tensor({0L, 1L, 0L, 1L, 0L, 1L}, options.dtype(at::kLong));
+ auto boxes = at::arange(24, options).view({6, 4}) / 32;
+ auto masks = at::arange(6 * 35, options).view({6, 35}).remainder(2);
+ MatcherWorkspace mixed(scope.execution.placement.numa_node, true);
+ mixed.enable_statistics();
+ mixed.prepare_cost(queries, counts, device);
+ auto prefixes = mixed.output_offsets(offsets, lookup);
+ REQUIRE(prefixes.data_ptr() != lookup.data_ptr());
+ REQUIRE(at::equal(mmltk::backend::ml::cuda::numa_readback(prefixes), longs({0, 0, 4, 6})));
+ std::vector<at::Tensor> logits, predictions, sampled;
+ for (size_t layer = 0; layer < queries.size(); ++layer) {
+  const auto q = queries[layer];
+  logits.push_back(at::arange(4 * q * 2, options).view({4, q, 2}) / 8 - 2);
+  predictions.push_back(at::arange(4 * q * 4, options).view({4, q, 4}) / 64);
+  sampled.push_back(at::arange(4 * q * 35, options).view({4, q, 35}) / 64 - 1);
+  logits.back()[1][0][0].fill_(std::numeric_limits<float>::infinity());
+  logits.back()[2][0][1].fill_(std::numeric_limits<float>::quiet_NaN());
+  predictions.back()[3][0][0].fill_(-0.F);
+  sampled.back()[3][0][0].fill_(-std::numeric_limits<float>::infinity());
+  pairwise_detection_cost_cuda_out(mixed.device_layer(layer), logits.back(), predictions.back(), labels, boxes, lookup, device_counts, prefixes, 5, 4, 1, 5, 2, .25);
+  pairwise_mask_cost_cuda_add_(mixed.device_layer(layer), sampled.back(), masks, lookup, device_counts, prefixes, 5, 4, 1, 1);
+ }
+ (void)mixed.read_cost();
+ REQUIRE(mixed.statistics().cost_submissions == 1);
+ REQUIRE(mixed.statistics().cost_dependencies == 1);
+ REQUIRE(mixed.statistics().cost_bytes == sizeof(float) * (2 + 5) * (0 + 4 + 2 + 4));
+ for (size_t layer = 0; layer < queries.size(); ++layer) {
+  for (size_t image = 1; image < counts.size(); ++image) {
+   MatcherWorkspace single(scope.execution.placement.numa_node, true);
+   single.prepare_cost({queries[layer]}, {counts[image]}, device);
+   const auto zero = longs({0}).to(device);
+   const auto count = longs({counts[image]}).to(device);
+   auto output = single.device_layer(0);
+   pairwise_detection_cost_cuda_out(output, logits[layer].narrow(0, image, 1), predictions[layer].narrow(0, image, 1), labels.narrow(0, offsets[image], counts[image]),
+    boxes.narrow(0, offsets[image], counts[image]), zero, count, zero, queries[layer], counts[image], 1, 5, 2, .25);
+   pairwise_mask_cost_cuda_add_(output, sampled[layer].narrow(0, image, 1), masks.narrow(0, offsets[image], counts[image]), zero, count, zero, queries[layer], counts[image], 1, 1);
+   const auto expected = single.read_cost();
+   const auto actual = mixed.cpu_matrix(layer, image);
+   REQUIRE(actual.is_contiguous());
+   REQUIRE(actual.nbytes() == expected.nbytes());
+   REQUIRE(std::memcmp(actual.data_ptr(), expected.data_ptr(), actual.nbytes()) == 0);
+  }
+ }
+ MatcherWorkspace canonical(scope.execution.placement.numa_node, true);
+ canonical.prepare_cost({2}, {0, 4, 2, 4}, device);
+ const auto canonical_offsets = longs({0, 0, 4, 6}).to(device);
+ REQUIRE(canonical.output_offsets({0, 0, 4, 6}, canonical_offsets).data_ptr() == canonical_offsets.data_ptr());
+ const auto out = canonical.device_layer(0);
+ const auto invoke = [&](const at::Tensor& destination, const at::Tensor& prediction, const at::Tensor& metadata, double coefficient, int64_t padded_queries, int64_t max_targets) {
+  pairwise_detection_cost_cuda_out(destination, prediction, predictions[0], labels, boxes, lookup, metadata, canonical_offsets, padded_queries, max_targets, coefficient, 5, 2, .25);
+ };
+ REQUIRE_THROWS(invoke(out.to(at::kDouble), logits[0], device_counts, 1, 5, 4));
+ REQUIRE_THROWS(invoke(out, logits[0].to(at::kCPU), device_counts, 1, 5, 4));
+ REQUIRE_THROWS(invoke(out, logits[0], device_counts.to(at::kFloat), 1, 5, 4));
+ REQUIRE_THROWS(invoke(out, logits[0].flatten(), device_counts, 1, 5, 4));
+ REQUIRE_THROWS(invoke(out, logits[0], device_counts, std::numeric_limits<double>::infinity(), 5, 4));
+ REQUIRE_THROWS(invoke(out, logits[0], device_counts, 1, 1, 4));
+ REQUIRE_THROWS(invoke(out, logits[0], device_counts, 1, 5, std::numeric_limits<int64_t>::max()));
+ REQUIRE_THROWS(pairwise_mask_cost_cuda_add_(out, sampled[0], masks, lookup, device_counts, canonical_offsets, 5, 4, std::numeric_limits<double>::quiet_NaN(), 1));
+ REQUIRE_THROWS(pairwise_mask_cost_cuda_add_(out, sampled[0], masks.narrow(1, 0, 34), lookup, device_counts, canonical_offsets, 5, 4, 1, 1));
+ // Device lookup counts cannot widen an output interval into the next image.
+ invoke(out, logits[0], device_counts, 1, 5, 4);
+ const auto guarded_expected = mmltk::backend::ml::cuda::numa_readback(out);
+ const auto wide_counts = longs({100, 100, 100, 100}).to(device);
+ out.fill_(23);
+ invoke(out, logits[0], wide_counts, 1, 5, 4);
+ const auto guarded_actual = mmltk::backend::ml::cuda::numa_readback(out);
+ REQUIRE(std::memcmp(guarded_actual.data_ptr(), guarded_expected.data_ptr(), guarded_actual.nbytes()) == 0);
+ const auto invalid_lookup = longs({-1, -1, 6, std::numeric_limits<int64_t>::max()}).to(device);
+ out.fill_(23);
+ pairwise_detection_cost_cuda_out(out, logits[0], predictions[0], labels, boxes, invalid_lookup, device_counts, canonical_offsets, 5, 4, 1, 5, 2, .25);
+ pairwise_mask_cost_cuda_add_(out, sampled[0], masks, invalid_lookup, device_counts, canonical_offsets, 5, 4, 1, 1);
+ REQUIRE(mmltk::backend::ml::cuda::numa_readback(out).eq(23).all().item<bool>());
+ auto invalid_labels = at::full_like(labels, 2);
+ pairwise_detection_cost_cuda_out(out, logits[0], predictions[0], invalid_labels, boxes, lookup, device_counts, canonical_offsets, 5, 4, 1, 5, 2, .25);
+ REQUIRE(mmltk::backend::ml::cuda::numa_readback(out).eq(23).all().item<bool>());
 }
