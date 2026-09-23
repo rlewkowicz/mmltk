@@ -1333,14 +1333,41 @@ mod tests {
         let (mut app, mut capture) = start_app();
         let mut settings = app.model.settings_snapshot.clone().unwrap();
         settings.revision += 1;
-        settings.settingsstate.workflows.train.output.automatic = false;
+        settings.settingsstate.workflows.train.output.automatic = true;
         settings.settingsstate.workflows.train.output.directory = "/saved/one".into();
-        app.model
-            .project_settings_snapshot(settings.clone())
-            .unwrap();
+        app.model.project_settings_snapshot(settings.clone()).unwrap();
+        app.settings.install(&settings);
+        app.advance_start();
+        assert!(capture.try_recv().is_err());
+
+        use crate::view::train::{Outcome, output::Message as Output};
+        let id = crate::generated::constraint_workflowstrainoutputdirectory().stable_field_id;
+        drop(app.on_train(Outcome::Output(Output::Browse(id))));
+        let dialog = next_intent(&mut capture, ApplicationIntentEndpoint::FileDialogOpen);
+        let target = crate::generated::FileDialogTarget::SettingsFieldTarget(
+            crate::generated::SettingsFieldTarget { stableid: id },
+        );
+        app.model.reduce_reply(dialog.correlation, Ok(crate::generated::ApplicationReply::FileDialogOpen(
+            crate::generated::FileDialogSnapshot {
+                generation: 1, active: false, cancellationrequested: false, target: target.clone(),
+                selection: Some(crate::generated::FileDialogSelection {
+                    target,
+                    result: crate::generated::FileDialogCancelledOrFileDialogSelectedVariant::FileDialogSelected(
+                        crate::generated::FileDialogSelected { path: "/saved/one".into() }),
+                }),
+            })));
+        app.advance_start();
+        assert!(capture.try_recv().is_err());
+        // The native settings owner settles the unchanged directory as a manual selection.
+        settings.revision += 1;
+        settings.settingsstate.workflows.train.output.automatic = false;
+        app.model.project_settings_snapshot(settings.clone()).unwrap();
         app.settings.install(&settings);
         app.advance_start();
         let opened = next_intent(&mut capture, ApplicationIntentEndpoint::TrainingOpenRun);
+        app.advance_start();
+        assert!(capture.try_recv().is_err());
+        assert!(app.model.workflow.pending_start.is_none());
         settings.revision += 1;
         settings.settingsstate.workflows.train.output.directory = "/saved/two".into();
         app.model

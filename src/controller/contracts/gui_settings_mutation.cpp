@@ -16,6 +16,7 @@
 #include <utility>
 #include <variant>
 #include <vector>
+#include "mmltk/frameworks/reflection/member_path.h"
 #include "src/backend/models/rfdetr/contract/preset_catalog.h"
 #include "src/backend/models/rfdetr/contract/training_supervision.h"
 #include "src/controller/contracts/gui_settings_states.h"
@@ -23,6 +24,7 @@
 #include "src/controller/contracts/settings_commands.h"
 #include "src/controller/contracts/settings_vocabulary.h"
 #include "src/controller/contracts/view_state.h"
+#include "src/controller/contracts/workflow_output.h"
 #include "src/frameworks/reflection/field_policy.h"
 #include "src/frameworks/reflection/reflected_field_policy.h"
 #include "src/frameworks/serialization/serialization.h"
@@ -245,6 +247,24 @@ void normalize_canonical_source_transitions(const GuiSettingsState& installed, G
  normalize_canonical_source_transition(installed.workflows.annotate, candidate.workflows.annotate);
  normalize_canonical_source_transition(installed.workflows.export_state, candidate.workflows.export_state);
 }
+void apply_output_selections(GuiSettingsState& candidate, const std::span<const std::string_view> supplied_paths) {
+ using namespace mmltk::frameworks::reflection;
+ visit_materialized_members<WorkflowSettingsState>([&]<class Workflow>(const auto&) {
+  visit_materialized_members<typename Workflow::member_type>([&]<class Member>(const auto&) {
+   if constexpr (std::same_as<typename Member::member_type, WorkflowOutputSelection>) {
+    constexpr auto directory = reflected_member_path<GuiSettingsState,
+     member_path<&GuiSettingsState::workflows, Workflow::pointer, Member::pointer, &WorkflowOutputSelection::directory>>();
+    constexpr auto automatic = reflected_member_path<GuiSettingsState,
+     member_path<&GuiSettingsState::workflows, Workflow::pointer, Member::pointer, &WorkflowOutputSelection::automatic>>();
+    // Supplying a directory is a manual selection even when its bytes are unchanged.
+    // An explicitly supplied policy takes precedence regardless of update order.
+    if (std::ranges::contains(supplied_paths, directory.view()) && !std::ranges::contains(supplied_paths, automatic.view())) {
+     (candidate.workflows.*Workflow::pointer.*Member::pointer).automatic = false;
+    }
+   }
+  });
+ });
+}
 }  // namespace
 std::expected<void, SettingsMutationError> apply_gui_settings_values(GuiSettingsState& state, const std::span<const SettingsValueUpdate> updates) {
  if (updates.empty() || updates.size() > kGuiSettingsMutableLeafCount) { return std::unexpected(SettingsMutationError::InvalidPath); }
@@ -264,13 +284,7 @@ std::expected<void, SettingsMutationError> apply_gui_settings_values(GuiSettings
  const auto& selected_train = candidate.workflows.train.request;
  if (selected_train.train_compiled_path != installed_train.train_compiled_path || selected_train.val_compiled_path != installed_train.val_compiled_path)
   candidate.workflows.train.use_compiled_directory_defaults = false;
- const auto normalize_output = [](const auto& installed, auto& selected) {
-  if (selected.output.directory != installed.output.directory && selected.output.automatic == installed.output.automatic) selected.output.automatic = false;
- };
- normalize_output(state.workflows.train, candidate.workflows.train);
- normalize_output(state.workflows.validate, candidate.workflows.validate);
- normalize_output(state.workflows.predict, candidate.workflows.predict);
- normalize_output(state.workflows.export_state, candidate.workflows.export_state);
+ apply_output_selections(candidate, std::span{paths.data(), count});
  apply_compiled_directory_defaults(candidate.workflows.train);
  normalize_canonical_source_transitions(state, candidate);
  if (!valid_settings(candidate)) return std::unexpected(SettingsMutationError::CrossFieldViolation);

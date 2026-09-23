@@ -39,6 +39,8 @@
 #include "src/controller/services/diagnostics_client.h"
 #include "src/controller/services/file_dialog_client.h"
 #include "src/controller/services/file_dialog_catalog.h"
+#include "src/controller/services/file_dialog_system.h"
+#include "src/controller/contracts/settings_vocabulary.h"
 #include "src/controller/services/firefox_process_owner.h"
 #include "src/controller/services/runtime_diagnostics.h"
 #include "src/backend/data/detail/benchmark_compiler.h"
@@ -984,6 +986,67 @@ TEST_CASE("file dialog client has typed pre-cancel and terminal outcomes", "[gui
  const auto missing = run_dialog(temporary.path() / "missing", temporary.path(), request);
  CHECK(missing.disposition == FileDialogDisposition::Failed);
  CHECK(missing.failure == FileDialogFailure::CapabilityUnavailable);
+}
+TEST_CASE("native output dialogs select remembered directories after Auto and preserve cancellation", "[gui][services][output]") {
+ using namespace mmltk::controller::contracts;
+ using Value = mmltk::frameworks::serialization::wire::FlatValue;
+ mmltk::testsupport::ScopedTempDir temporary{"mmltk-output-dialog"};
+ const auto selected = make_dialog_helper(temporary.path(), "selected", "printf '%s\\n' remembered");
+ const auto cancelled = make_dialog_helper(temporary.path(), "cancelled", "exit 1");
+ std::size_t outputs = 0;
+ for (const auto& descriptor : file_dialog_catalog().entries()) {
+  const auto path = descriptor.field_path.view();
+  if (!path.ends_with(".output.directory")) continue;
+  ++outputs;
+  CAPTURE(path);
+  const auto location = SettingsLocation{(temporary.path() / ("settings-" + std::to_string(outputs) + ".json")).string()};
+  mmltk::controller::SettingsSystem settings;
+  REQUIRE(settings.Load(location).applied());
+  const auto resolved = file_dialog_catalog().resolve(FileDialogOpen{.target = FileDialogTarget{SettingsFieldTarget{descriptor.stable_id}}});
+  REQUIRE(resolved);
+  REQUIRE_FALSE(descriptor.defer_apply());
+  const auto before = settings.snapshot().settings_state;
+  auto expected = before;
+  const auto directory = (temporary.path() / "remembered").string();
+  const std::string automatic = std::string{path.substr(0, path.size() - std::string_view{"directory"}.size())} + "automatic";
+  const auto verify = [&](const bool policy) {
+   REQUIRE(settings_vocabulary::visit_mutable_path(expected, path, [&](const auto, auto& leaf) {
+    if constexpr (std::same_as<std::remove_cvref_t<decltype(leaf)>, std::string>) leaf = directory;
+   }));
+   REQUIRE(settings_vocabulary::visit_mutable_path(expected, automatic, [&](const auto, auto& leaf) {
+    if constexpr (std::same_as<std::remove_cvref_t<decltype(leaf)>, bool>) leaf = policy;
+   }));
+   CHECK(settings.snapshot().settings_state == expected);
+   CHECK_FALSE(std::filesystem::exists(directory));
+  };
+  FileDialogClientOwner accepted_owner{selected.string(), temporary.path().string()};
+  mmltk::controller::NativeFileDialogRuntime accepted{accepted_owner.client(), settings};
+  FileDialogClientOwner cancelled_owner{cancelled.string(), temporary.path().string()};
+  mmltk::controller::NativeFileDialogRuntime cancellation{cancelled_owner.client(), settings};
+  for (int repeat = 0; repeat < 2; ++repeat) {
+   const auto result = accepted.Open(*resolved, {});
+   REQUIRE(std::holds_alternative<FileDialogSelected>(result.result));
+   CHECK(std::get<FileDialogSelected>(result.result).path == directory);
+   verify(false);
+   SettingsUpdateRequest enable;
+   enable.updates.push_back({.path = automatic, .value = Value{true}});
+   static_cast<void>(settings.Update(std::move(enable)));
+   verify(true);
+   const auto revision = settings.snapshot().revision;
+   CHECK(std::holds_alternative<FileDialogCancelled>(cancellation.Open(*resolved, {}).result));
+   verify(true);
+   CHECK(settings.snapshot().revision == revision);
+  }
+  mmltk::controller::SettingsSystem restored;
+  REQUIRE(restored.Load(location).applied());
+  CHECK(restored.snapshot().settings_state == expected);
+  mmltk::controller::NativeFileDialogRuntime reopened{accepted_owner.client(), restored};
+  REQUIRE(std::holds_alternative<FileDialogSelected>(reopened.Open(*resolved, {}).result));
+  static_cast<void>(accepted.Open(*resolved, {}));
+  verify(false);
+  CHECK(restored.snapshot().settings_state == expected);
+ }
+ CHECK(outputs == 4U);
 }
 TEST_CASE("file dialog capability is validated once and later exec failure is typed", "[gui][services]") {
  mmltk::testsupport::ScopedTempDir temporary{"mmltk-file-dialog-capability"};

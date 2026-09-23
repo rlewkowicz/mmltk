@@ -1625,19 +1625,75 @@ TEST_CASE("checkpoint restore preserves output policy and installs explicit inhe
   }
  }
 }
-TEST_CASE("manual output selection disables automatic output and Auto retains the manual selection", "[gui][settings][train]") {
- auto settings = mmltk::controller::contracts::default_gui_settings_state();
- REQUIRE(settings.workflows.train.output.automatic);
- REQUIRE(settings.workflows.train.output.directory.empty());
- const mmltk::controller::contracts::SettingsValueUpdate selected{
-  .path = "workflows.train.output.directory", .value = mmltk::frameworks::serialization::wire::FlatValue::text("/selected/output", mmltk::frameworks::reflection::kMaximumPathBytes).value()};
- REQUIRE(mmltk::controller::contracts::apply_gui_settings_values(settings, std::span{&selected, 1}));
- REQUIRE_FALSE(settings.workflows.train.output.automatic);
- REQUIRE(settings.workflows.train.output.directory == "/selected/output");
- const mmltk::controller::contracts::SettingsValueUpdate automatic{.path = "workflows.train.output.automatic", .value = mmltk::frameworks::serialization::wire::FlatValue{true}};
- REQUIRE(mmltk::controller::contracts::apply_gui_settings_values(settings, std::span{&automatic, 1}));
- REQUIRE(settings.workflows.train.output.automatic);
- REQUIRE(settings.workflows.train.output.directory == "/selected/output");
+TEST_CASE("explicit output selections preserve independent policies and transactional updates", "[gui][settings][output]") {
+ using Value = mmltk::frameworks::serialization::wire::FlatValue;
+ for (const std::string workflow : {"train", "validate", "predict", "export_state"}) {
+  CAPTURE(workflow);
+  auto state = default_gui_settings_state();
+  const std::string prefix = "workflows." + workflow + ".output.";
+  const SettingsValueUpdate selected{.path = prefix + "directory", .value = *Value::text("/selected/output", mmltk::frameworks::reflection::kMaximumPathBytes)};
+  const auto output = [&]() -> const WorkflowOutputSelection& {
+   if (workflow == "train") return state.workflows.train.output;
+   if (workflow == "validate") return state.workflows.validate.output;
+   if (workflow == "predict") return state.workflows.predict.output;
+   return state.workflows.export_state.output;
+  };
+  for (int repeat = 0; repeat < 2; ++repeat) {
+   REQUIRE(apply_gui_settings_values(state, std::span{&selected, 1}));
+   CHECK_FALSE(output().automatic);
+   CHECK(output().directory == "/selected/output");
+   const auto manual = state;
+   REQUIRE(apply_gui_settings_values(state, std::span{&selected, 1}));
+   CHECK(state == manual);
+   for (const bool automatic : {false, true}) {
+    const SettingsValueUpdate policy{.path = prefix + "automatic", .value = Value{automatic}};
+    REQUIRE(apply_gui_settings_values(state, std::span{&policy, 1}));
+    CHECK(output().automatic == automatic);
+    CHECK(output().directory == "/selected/output");
+   }
+  }
+  for (const bool automatic : {false, true}) {
+   for (const bool directory_first : {false, true}) {
+    for (const std::string_view directory : {"/other/output", "/selected/output"}) {
+     const SettingsValueUpdate policy{.path = prefix + "automatic", .value = Value{automatic}};
+     const SettingsValueUpdate destination{.path = selected.path, .value = *Value::text(directory, mmltk::frameworks::reflection::kMaximumPathBytes)};
+     std::array edits{destination, policy};
+     if (!directory_first) std::swap(edits[0], edits[1]);
+     REQUIRE(apply_gui_settings_values(state, edits));
+     CHECK(output().automatic == automatic);
+     CHECK(output().directory == directory);
+    }
+   }
+  }
+  const auto accepted = state;
+  const SettingsValueUpdate unrelated{.path = "workflows.train.request.epochs", .value = Value{std::int64_t{20}}};
+  REQUIRE(apply_gui_settings_values(state, std::span{&unrelated, 1}));
+  CHECK(output().automatic);
+  CHECK(output().directory == "/selected/output");
+  state = accepted;
+  for (const SettingsValueUpdate invalid : {
+        selected,
+        SettingsValueUpdate{.path = prefix + "automatic", .value = Value{std::int64_t{1}}},
+        SettingsValueUpdate{.path = prefix + "unknown", .value = Value{true}},
+        SettingsValueUpdate{.path = "workflows.train.request.epochs", .value = Value{std::int64_t{-1}}}}) {
+   const std::array edits{selected, invalid};
+   CHECK_FALSE(apply_gui_settings_values(state, edits));
+   CHECK(state == accepted);
+  }
+  auto expected = default_gui_settings_state();
+  if (workflow == "train") expected.workflows.train.output = output();
+  if (workflow == "validate") expected.workflows.validate.output = output();
+  if (workflow == "predict") expected.workflows.predict.output = output();
+  if (workflow == "export_state") expected.workflows.export_state.output = output();
+  CHECK(state == expected);
+  auto restored = default_gui_settings_state();
+  apply_gui_settings(snapshot_gui_settings(state), restored);
+  CHECK(restored == state);
+  REQUIRE(apply_gui_settings_values(restored, std::span{&selected, 1}));
+  REQUIRE(apply_gui_settings_values(state, std::span{&selected, 1}));
+  CHECK(restored == state);
+  CHECK_FALSE(output().automatic);
+ }
 }
 TEST_CASE("partial training settings retain an unspecified output policy", "[gui][settings][train]") {
  for (const bool automatic : {false, true}) {
@@ -1799,10 +1855,23 @@ TEST_CASE("all workflow output selections persist current controls and independe
  CHECK(state.workflows.validate.output.automatic);
  CHECK(state.workflows.predict.output.automatic);
  CHECK(state.workflows.export_state.output.automatic);
- state.workflows.train.output = {.automatic = false, .directory = "train-runs"};
- state.workflows.validate.output = {.automatic = false, .directory = "../validation-runs"};
- state.workflows.predict.output = {.automatic = false, .directory = "/prediction-runs"};
- state.workflows.export_state.output = {.automatic = false, .directory = "export-runs"};
+ using Value = mmltk::frameworks::serialization::wire::FlatValue;
+ const std::array directories{
+  SettingsValueUpdate{.path = "workflows.train.output.directory", .value = *Value::text("train-runs", mmltk::frameworks::reflection::kMaximumPathBytes)},
+  SettingsValueUpdate{.path = "workflows.validate.output.directory", .value = *Value::text("../validation-runs", mmltk::frameworks::reflection::kMaximumPathBytes)},
+  SettingsValueUpdate{.path = "workflows.predict.output.directory", .value = *Value::text("/prediction-runs", mmltk::frameworks::reflection::kMaximumPathBytes)},
+  SettingsValueUpdate{.path = "workflows.export_state.output.directory", .value = *Value::text("export-runs", mmltk::frameworks::reflection::kMaximumPathBytes)}};
+ REQUIRE(apply_gui_settings_values(state, directories));
+ CHECK_FALSE(state.workflows.train.output.automatic);
+ CHECK_FALSE(state.workflows.predict.output.automatic);
+ const std::array policies{
+  SettingsValueUpdate{.path = "workflows.train.output.automatic", .value = mmltk::frameworks::serialization::wire::FlatValue{true}},
+  SettingsValueUpdate{.path = "workflows.predict.output.automatic", .value = mmltk::frameworks::serialization::wire::FlatValue{true}}};
+ REQUIRE(apply_gui_settings_values(state, policies));
+ CHECK(state.workflows.train.output.directory == "train-runs");
+ CHECK(state.workflows.predict.output.directory == "/prediction-runs");
+ CHECK_FALSE(state.workflows.validate.output.automatic);
+ CHECK_FALSE(state.workflows.export_state.output.automatic);
  state.workflows.predict.write_report_json = false;
  auto restored = default_gui_settings_state();
  const auto document = snapshot_gui_settings(state);
