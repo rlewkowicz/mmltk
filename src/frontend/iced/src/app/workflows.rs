@@ -111,9 +111,9 @@ impl App {
             if !dialog.active
                 && let Some(selection) = &dialog.selection
                 && let crate::generated::FileDialogTarget::SettingsFieldTarget(target) = &selection.target
-                && target.stableid == crate::generated::constraint_workflowstrainrequestoutputdir().stable_field_id
+                && target.stableid == crate::generated::constraint_workflowstrainoutputdirectory().stable_field_id
                 && let crate::generated::FileDialogCancelledOrFileDialogSelectedVariant::FileDialogSelected(selected) = &selection.result
-                && !train.autooutput && selected.path == train.request.outputdir {
+                && !train.output.automatic && selected.path == train.output.directory {
                 Some(dialog.generation)
             } else { None }
         });
@@ -665,7 +665,7 @@ impl App {
                             .settings
                             .state_mut()
                             .edit(crate::view::settings::EditCadence::Immediate, |draft| {
-                                crate::generated::edit_workflowstrainautooutput(draft, value)
+                                crate::generated::edit_workflowstrainoutputautomatic(draft, value)
                             });
                         return match schedule {
                             Ok(schedule) => self.handle_settings_schedule(schedule),
@@ -1277,7 +1277,7 @@ mod tests {
         use crate::view::train::{Outcome, output::Message as Output};
         let (mut app, mut capture) = start_app();
         drop(app.on_train(Outcome::Output(Output::Auto(false))));
-        assert!(!app.settings.draft().unwrap().workflows.train.autooutput);
+        assert!(!app.settings.draft().unwrap().workflows.train.output.automatic);
         next_intent(&mut capture, ApplicationIntentEndpoint::SettingsUpdate);
         assert!(app.model.workflow.pending_start.is_none());
 
@@ -1288,10 +1288,10 @@ mod tests {
             .unwrap()
             .workflows
             .train
-            .request
-            .outputdir
+            .output
+            .directory
             .clone();
-        let id = crate::generated::constraint_workflowstrainrequestoutputdir().stable_field_id;
+        let id = crate::generated::constraint_workflowstrainoutputdirectory().stable_field_id;
         drop(app.on_train(Outcome::Output(Output::Browse(id))));
         let intent = next_intent(&mut capture, ApplicationIntentEndpoint::FileDialogOpen);
         let target = crate::generated::FileDialogTarget::SettingsFieldTarget(
@@ -1312,8 +1312,8 @@ mod tests {
                 .unwrap()
                 .workflows
                 .train
-                .request
-                .outputdir,
+                .output
+                .directory,
             before
         );
         assert!(app.model.error.is_none());
@@ -1333,8 +1333,8 @@ mod tests {
         let (mut app, mut capture) = start_app();
         let mut settings = app.model.settings_snapshot.clone().unwrap();
         settings.revision += 1;
-        settings.settingsstate.workflows.train.autooutput = false;
-        settings.settingsstate.workflows.train.request.outputdir = "/saved/one".into();
+        settings.settingsstate.workflows.train.output.automatic = false;
+        settings.settingsstate.workflows.train.output.directory = "/saved/one".into();
         app.model
             .project_settings_snapshot(settings.clone())
             .unwrap();
@@ -1342,7 +1342,7 @@ mod tests {
         app.advance_start();
         let opened = next_intent(&mut capture, ApplicationIntentEndpoint::TrainingOpenRun);
         settings.revision += 1;
-        settings.settingsstate.workflows.train.request.outputdir = "/saved/two".into();
+        settings.settingsstate.workflows.train.output.directory = "/saved/two".into();
         app.model
             .project_settings_snapshot(settings.clone())
             .unwrap();
@@ -1374,8 +1374,8 @@ mod tests {
                 }
                 let mut settings = app.model.settings_snapshot.clone().unwrap();
                 settings.revision += 1;
-                settings.settingsstate.workflows.train.autooutput = false;
-                settings.settingsstate.workflows.train.request.outputdir = "saved-output".into();
+                settings.settingsstate.workflows.train.output.automatic = false;
+                settings.settingsstate.workflows.train.output.directory = "saved-output".into();
                 app.model
                     .project_settings_snapshot(settings.clone())
                     .unwrap();

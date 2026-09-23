@@ -22,6 +22,7 @@ module;
 #include <array>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <stop_token>
 #include <mutex>
@@ -83,7 +84,7 @@ void assign_onnx_tensor_names(const std::shared_ptr<torch::jit::Graph>& graph, c
 }
 }  // namespace
 void export_model_onnx(NativeRfDetrModel& model, const std::filesystem::path& output_path, const int opset_version, const int batch_size, const bool simplify,
- const std::filesystem::path& explicit_descriptor, const std::stop_token stop, torch_cuda::TensorReadbackBuffers& readback) {
+ const std::filesystem::path& explicit_descriptor, const std::stop_token stop, torch_cuda::TensorReadbackBuffers& readback, const std::function<void(const std::filesystem::path&)>& published) {
  if (stop.stop_requested()) throw ArtifactPublicationCancelled{};
  validate_supported_onnx_export_opset(opset_version);
  ClassArtifactPublication publication(output_path, explicit_descriptor);
@@ -149,6 +150,7 @@ void export_model_onnx(NativeRfDetrModel& model, const std::filesystem::path& ou
   const auto reopened = load_onnx_model_info(staged_model);
   if (!reopened.class_layout || *reopened.class_layout != model.class_layout()->record()) throw std::runtime_error("ONNX export lost its class layout");
   publication.Publish({}, [&] { return stop.stop_requested(); });
+  if (published) published(output_path);
   restore_attention();
   mmltk::common::logging::info([&](auto& logger) { logger.info("exported RF-DETR ONNX model to {}", output_path.string()); });
  } catch (...) {
@@ -159,7 +161,7 @@ void export_model_onnx(NativeRfDetrModel& model, const std::filesystem::path& ou
 void export_onnx(NativeRfDetrModel& model, const ExportOnnxRequest& request) {
  validate_export_onnx_request(request);
  torch_cuda::TensorReadbackBuffers readback;
- export_model_onnx(model, request.output_path, request.opset_version, 1, request.simplify, request.class_layout_path, {}, readback);
+ export_model_onnx(model, request.output_path, request.opset_version, 1, request.simplify, request.class_layout_path, {}, readback, {});
 }
 void export_onnx(const ExportOnnxRequest& request) {
  ExportOnnxSession session;
@@ -178,7 +180,7 @@ struct ExportOnnxSession::State final {
  int device = -1;
  runtime::BorrowedCommandStream command_stream{};
  [[nodiscard]] cudaError_t Close() noexcept;
- void Run(const ExportOnnxRequest& request, runtime::BorrowedCommandStream execution_stream, std::stop_token stop);
+ void Run(const ExportOnnxRequest& request, runtime::BorrowedCommandStream execution_stream, std::stop_token stop, const std::function<void(const std::filesystem::path&)>& published);
 };
 ExportOnnxSession::ExportOnnxSession() : state_(std::make_shared<State>()) {}
 ExportOnnxSession::~ExportOnnxSession() { static_cast<void>(Close()); }
@@ -203,7 +205,7 @@ cudaError_t ExportOnnxSession::State::Close() noexcept {
  model.reset();
  return cudaSuccess;
 }
-void ExportOnnxSession::Run(const ExportOnnxRequest& request, const runtime::BorrowedCommandStream command_stream, const std::stop_token stop) {
+void ExportOnnxSession::Run(const ExportOnnxRequest& request, const runtime::BorrowedCommandStream command_stream, const std::stop_token stop, const std::function<void(const std::filesystem::path&)>& published) {
  if (!state_) throw std::runtime_error("RF-DETR export session is terminally closed");
  if (stop.stop_requested()) return;
  if (!command_stream) throw std::invalid_argument("RF-DETR ONNX export command stream is invalid");
@@ -213,16 +215,18 @@ void ExportOnnxSession::Run(const ExportOnnxRequest& request, const runtime::Bor
   const ExportOnnxRequest* request;
   runtime::BorrowedCommandStream command_stream;
   std::stop_token stop;
+  const std::function<void(const std::filesystem::path&)>* published;
  } call{
   .state = state_.get(),
   .request = &request,
   .command_stream = command_stream,
   .stop = stop,
+  .published = &published,
  };
  try {
   torch_cuda::run_on_torch_cuda_stream(request.device_id, command_stream.native_handle, &call, [](void* opaque) {
    auto& bound = *static_cast<BoundExportCall*>(opaque);
-   bound.state->Run(*bound.request, bound.command_stream, bound.stop);
+   bound.state->Run(*bound.request, bound.command_stream, bound.stop, *bound.published);
   });
  } catch (const ArtifactPublicationCancelled&) { static_cast<void>(Close()); } catch (...) {
   const auto failure = std::current_exception();
@@ -230,7 +234,7 @@ void ExportOnnxSession::Run(const ExportOnnxRequest& request, const runtime::Bor
   std::rethrow_exception(failure);
  }
 }
-void ExportOnnxSession::State::Run(const ExportOnnxRequest& request, const runtime::BorrowedCommandStream execution_stream, const std::stop_token stop) {
+void ExportOnnxSession::State::Run(const ExportOnnxRequest& request, const runtime::BorrowedCommandStream execution_stream, const std::stop_token stop, const std::function<void(const std::filesystem::path&)>& published) {
  if (stop.stop_requested()) return;
  if (!model || !admission->Matches(request.weights_path, request.class_layout_path) || command_stream != execution_stream || weights_path != request.weights_path ||
      preset_name != request.preset_name || resolution != request.resolution || device != request.device_id) {
@@ -256,7 +260,7 @@ void ExportOnnxSession::State::Run(const ExportOnnxRequest& request, const runti
   // Close can now settle this exact candidate even when completion rejects it.
   admission->RequireUnchanged(stop);
  }
- export_model_onnx(*model, request.output_path, request.opset_version, 1, request.simplify, request.class_layout_path, stop, readback);
+ export_model_onnx(*model, request.output_path, request.opset_version, 1, request.simplify, request.class_layout_path, stop, readback, published);
  readback.Release();
 }
 }  // namespace mmltk::backend::models::rfdetr

@@ -26,6 +26,7 @@ mmltk_register_public_headers(
         settings_store.h
         train_command.h
         train_process_client.h
+        run_output.h
         train_run_store.h
         vast_client.h
         vast_provider_owner.h)
@@ -42,6 +43,7 @@ mmltk_register_ordinary_sources(
     settings_store.cpp
     train_command.cpp
     train_process_client.cpp
+    run_output.cpp
     train_run_store.cpp
     vast_client.cpp
     vast_provider_owner.cpp
@@ -100,6 +102,7 @@ function(mmltk_add_controller_services_tests)
 
     set(mmltk_controller_services_ordinary_test_sources
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/application_services.test.cpp
+        ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/run_output.test.cpp
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/settings.test.cpp
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/settings_persistence.test.cpp
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/vast_runtime.test.cpp

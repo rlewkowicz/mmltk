@@ -2,16 +2,15 @@ use crate::view::shared::status_text;
 use crate::fluent_theme::Element;
 use crate::presentation_surface::Surface;
 use crate::view_model::ApplicationModel;
-use iced::widget::{button, column, container};
+use iced::widget::{button, column};
 
 #[derive(Debug, Clone)]
 pub enum Message {
+    Output(crate::view::workflow::output::Message),
     StartRequested,
     StopRequested,
     DialogRequested(u64),
     Model(crate::view::workflow::model_card::Message),
-    OnnxOutputPathChanged(String),
-    OutputPathChanged(String),
     OpsetChanged(i32),
     Fp16Changed(bool),
     SimplifyChanged(bool),
@@ -59,78 +58,7 @@ impl Component {
             || crate::generated::default_workflowsexportstatebuildtensorrt().unwrap_or_default(),
             |value| value.buildtensorrt,
         );
-        let branch_fields = |build_tensorrt| {
-            let relevant_dialogs = if build_tensorrt {
-                &[crate::generated::constraint_workflowsexportstateoutputpath().stable_field_id][..]
-            } else {
-                &[
-                    crate::generated::constraint_workflowsexportstateonnxoutputpath()
-                        .stable_field_id,
-                ][..]
-            };
-            let dialogs = model
-                .workflow
-                .dialogs(crate::generated::FeatureId::Export)
-                .filter(|fact| relevant_dialogs.contains(&fact.stable_field_id))
-                .fold(column![].spacing(6), |column, fact| {
-                    column.push(
-                        container(
-                            button(fact.title).on_press_maybe(
-                                model
-                                    .file_dialog_open_available(
-                                        fact,
-                                        crate::generated::FeatureId::Export,
-                                    )
-                                    .then_some(Message::DialogRequested(fact.stable_field_id)),
-                            ),
-                        )
-                        .id(format!("dialog.{}", fact.stable_field_id)),
-                    )
-                });
-            let fields: Element<'a, Message> = if build_tensorrt {
-                column![
-                    crate::view::workflow::fields::text_field(
-                        "TensorRT output",
-                        crate::generated::constraint_workflowsexportstateoutputpath()
-                            .stable_field_id,
-                        draft.map_or("", |value| value.outputpath.as_str()),
-                        settings_edit_available,
-                        Message::OutputPathChanged,
-                    ),
-                    dialogs,
-                ]
-                .spacing(crate::view::workflow::FIELD_SPACING)
-                .into()
-            } else {
-                column![
-                    crate::view::workflow::fields::text_field(
-                        "ONNX output",
-                        crate::generated::constraint_workflowsexportstateonnxoutputpath()
-                            .stable_field_id,
-                        draft.map_or("", |value| value.onnxoutputpath.as_str()),
-                        settings_edit_available,
-                        Message::OnnxOutputPathChanged,
-                    ),
-                    dialogs,
-                ]
-                .spacing(crate::view::workflow::FIELD_SPACING)
-                .into()
-            };
-            fields
-        };
         let operation = model.workflow.export.as_ref();
-        let branch_fields = column![
-            crate::view::shared::disclosure(
-                "export.output.tensorrt",
-                build_tensorrt,
-                branch_fields(true)
-            ),
-            crate::view::shared::disclosure(
-                "export.output.onnx",
-                !build_tensorrt,
-                branch_fields(false)
-            ),
-        ];
         let setup: Element<'a, Message> = column![
             self.model_card
                 .view(crate::view::workflow::model_card::State::from_settings(
@@ -150,7 +78,7 @@ impl Component {
                 ))
                 .map(Message::Model),
             crate::view::shared::identified(
-                "export.card.output",
+                "export.card.formats",
                 crate::view::shared::card(
                     "Export",
                     "Model artifacts, format, and output destination.",
@@ -165,11 +93,12 @@ impl Component {
                                 )
                             ),
                         ),
-                        branch_fields,
                     ]
                     .spacing(crate::view::workflow::FIELD_SPACING)
                 )
             ),
+            crate::view::workflow::output::view(crate::generated::FeatureId::Export, model, settings,
+                model.workflow.export.as_ref().map(|operation| &operation.output)).map(Message::Output),
             crate::view::workflow::primary_action(
                 crate::generated::FeatureId::Export,
                 model.primary_action_active(crate::generated::FeatureId::Export),
@@ -293,6 +222,9 @@ impl Component {
         message: Message,
     ) -> Result<Option<Outcome>, String> {
         let outcome = match message {
+            Message::Output(crate::view::workflow::output::Message::Browse(id)) => Outcome::DialogRequested(id),
+            Message::Output(crate::view::workflow::output::Message::Auto(value)) => Outcome::SettingsEdited(
+                crate::view::workflow::output::automatic(settings, crate::generated::FeatureId::Export, value)?),
             Message::StartRequested => Outcome::StartRequested,
             Message::StopRequested => Outcome::StopRequested,
             Message::DialogRequested(id) => Outcome::DialogRequested(id),
@@ -302,16 +234,6 @@ impl Component {
                 };
                 Outcome::Model(outcome)
             }
-            Message::OutputPathChanged(value) => Outcome::SettingsEdited(
-                settings.edit(crate::view::settings::EditCadence::Debounced, |draft| {
-                    crate::generated::edit_workflowsexportstateoutputpath(draft, value)
-                })?,
-            ),
-            Message::OnnxOutputPathChanged(value) => Outcome::SettingsEdited(
-                settings.edit(crate::view::settings::EditCadence::Debounced, |draft| {
-                    crate::generated::edit_workflowsexportstateonnxoutputpath(draft, value)
-                })?,
-            ),
             Message::OpsetChanged(value) => Outcome::SettingsEdited(
                 settings.edit(crate::view::settings::EditCadence::Debounced, |draft| {
                     crate::generated::edit_workflowsexportstateopsetversion(draft, value)

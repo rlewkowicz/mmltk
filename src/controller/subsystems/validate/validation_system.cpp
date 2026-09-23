@@ -1,4 +1,5 @@
 #include "validation_system.h"
+#include "src/controller/services/run_output.h"
 #include "validation_runtime.h"
 #include "detail/validation_samples.h"
 #include "src/controller/presentation/workspace_input.h"
@@ -27,6 +28,7 @@ CudaValidationRuntime::~CudaValidationRuntime() = default;
 ValidationRuntimeResult CudaValidationRuntime::Run(
  mmltk::backend::models::rfdetr::ValidateRequest operation, std::stop_token stop, const ComputeProgressSink& progress, const mmltk::backend::models::rfdetr::ValidationDelivery& delivery) {
  ValidationRuntimeResult result;
+ try {
  result.terminal = impl_->resources.Run(
   [this, &result, &progress, &delivery, stop, operation = std::move(operation)](const mmltk::backend::ml::runtime::BorrowedCommandStream stream) mutable {
    operation.device_id = impl_->resources.device();
@@ -40,10 +42,19 @@ ValidationRuntimeResult CudaValidationRuntime::Run(
    };
    auto evaluated = impl_->session.Run(operation, stream, callbacks);
    if (evaluated.backends.size() > 1U) throw std::logic_error("GUI validation requires one selected backend");
+   std::exception_ptr report_failure;
+   if (!evaluated.cancelled && operation.write_report_json && !operation.report_json_path.empty()) {
+    try {
+     mmltk::backend::models::rfdetr::write_validation_report(operation, evaluated);
+     result.report = operation.report_json_path;
+    } catch (...) { report_failure = std::current_exception(); }
+   }
    if (!evaluated.backends.empty()) result.evaluation = std::move(evaluated.backends.begin()->second);
+   if (report_failure) std::rethrow_exception(report_failure);
    return contracts::make_compute_terminal(evaluated.cancelled ? contracts::ComputeOperationOutcome::Cancelled : contracts::ComputeOperationOutcome::Succeeded, 0U, evaluated.processed_images);
   },
   stop);
+ } catch (...) { result.terminal = contracts::compute_failure_terminal(std::current_exception(), "validation runtime failed"); }
  return result;
 }
 class ValidationSystem::Impl final {
@@ -99,11 +110,20 @@ public:
       auto prepared = subsystems::system::ComputeIntentMaterializer::Validation(settings, inspection, selection);
       if (!prepared) throw contracts::InvalidIntentError(prepared.error().detail);
       if (stop.stop_requested()) return contracts::make_compute_terminal(contracts::ComputeOperationOutcome::Cancelled);
+      const auto& output = settings.workflows.validate.output;
+      const auto directory = services::reserve_run_output(contracts::workflow_output_root(output, contracts::FeatureId::Validate), !output.automatic);
+      if (!prepared->report_json_path.empty()) prepared->report_json_path = directory / prepared->report_json_path.filename();
+      {
+       std::scoped_lock lock(mutex_);
+       state_.output.directory = directory.string();
+      }
+      Changed();
       if (!runtime_) runtime_ = factory_();
       if (!runtime_) throw std::runtime_error("compute runtime is unavailable");
       auto result = runtime_->Run(std::move(*prepared), stop, progress, delivery);
       {
        std::scoped_lock lock(mutex_);
+       if (!result.report.empty()) state_.output.artifacts.push_back(std::move(result.report));
        evaluation_ = std::move(result.evaluation);
        evaluation_generation_ = state_.generation_frontier;
       }

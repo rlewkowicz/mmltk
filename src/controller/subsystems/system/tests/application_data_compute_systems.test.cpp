@@ -87,7 +87,7 @@ TEST_CASE("model and compute systems use direct facts, progress, Busy, Stop, and
   [&](ValidationSystem::event_type event) {
    if (std::holds_alternative<ValidationProgress>(event))
     ++progress;
-   else
+   else if (!std::get<ValidationChanged>(event).snapshot.operation.active)
     terminals.Publish(std::move(event));
   }};
  static_cast<void>(validation.Start({}));
@@ -351,7 +351,7 @@ TEST_CASE("export and predict wrappers share Busy Stop and failure isolation", "
  std::promise<ComputeSystemEvent> export_terminal;
  ExportSystem export_system{settings, dataset, model, [export_gate] { return std::make_unique<FakeNonvisualComputeRuntime>(ComputeScenario{.gate = export_gate}); },
   [&](ComputeSystemEvent event) {
-   if (!std::holds_alternative<ComputeProgressEvent>(event)) export_terminal.set_value(std::move(event));
+   if (const auto* changed = std::get_if<ComputeChanged>(&event); changed && !changed->snapshot.active) export_terminal.set_value(std::move(event));
   }};
  static_cast<void>(export_system.Start({}));
  CHECK_THROWS_AS(export_system.Start({}), contracts::BusyError);
@@ -492,18 +492,143 @@ TEST_CASE("CUDA export and validation preserve cancelled outcomes and prior arti
  r::ExportOnnxRequest onnx;
  onnx.weights_path = root.path() / "not-opened.pt";
  onnx.output_path = output;
- CHECK(exporter.Run(onnx, stop.get_token(), {}).outcome == controller::contracts::ComputeOperationOutcome::Cancelled);
+ std::size_t publications = 0U;
+ const ComputeArtifactSink published = [&](const std::filesystem::path&) { ++publications; };
+ CHECK(exporter.Run(onnx, stop.get_token(), {}, published).outcome == controller::contracts::ComputeOperationOutcome::Cancelled);
  r::BuildEngineRequest engine;
  engine.onnx_path = root.path() / "not-opened.onnx";
  engine.output_path = output;
- CHECK(exporter.Run(engine, stop.get_token(), {}).outcome == controller::contracts::ComputeOperationOutcome::Cancelled);
+ CHECK(exporter.Run(engine, stop.get_token(), {}, published).outcome == controller::contracts::ComputeOperationOutcome::Cancelled);
  r::ValidateRequest validation;
  validation.onnx_path = engine.onnx_path;
  validation.save_engine_path = output;
  validation.compiled_path = root.path() / "not-opened.bin";
  validation.eval_order = "tensorrt";
  CHECK(validator.Run(validation, stop.get_token(), {}, {}).terminal.outcome == controller::contracts::ComputeOperationOutcome::Cancelled);
+ CHECK(publications == 0U);
  bundle.CheckPreserved();
+}
+}  // namespace
+}  // namespace mmltk::controller
+
+namespace mmltk::controller {
+namespace {
+class CapturedOutputValidation final : public ValidationRuntime {
+public:
+ CapturedOutputValidation(std::promise<std::filesystem::path>& admitted, std::shared_ptr<mmltk::testsupport::StopGate> gate) : admitted_(admitted), gate_(std::move(gate)) {}
+ ValidationRuntimeResult Run(mmltk::backend::models::rfdetr::ValidateRequest request, std::stop_token stop, const ComputeProgressSink&, const mmltk::backend::models::rfdetr::ValidationDelivery&) override {
+  admitted_.set_value(request.report_json_path);
+  static_cast<void>(gate_->Wait(stop));
+  return {.terminal = contracts::make_compute_terminal(contracts::ComputeOperationOutcome::Cancelled)};
+ }
+private:
+ std::promise<std::filesystem::path>& admitted_;
+ std::shared_ptr<mmltk::testsupport::StopGate> gate_;
+};
+TEST_CASE("validation reserves after admission and retains the captured directory through settings edits and cancellation", "[controller][systems][output]") {
+ mmltk::testsupport::ScopedTempDir root{"validation-output-capture"};
+ ApplicationDataFixture fixture{root.path()};
+ fixture.PrepareModel(contracts::FeatureId::Validate);
+ auto [settings, dataset, model] = fixture.systems();
+ const auto initial = settings.snapshot().settings_state.workflows.validate.output.directory;
+ CHECK_FALSE(std::filesystem::exists(initial));
+ std::promise<std::filesystem::path> admitted;
+ std::promise<void> settled;
+ auto gate = std::make_shared<mmltk::testsupport::StopGate>();
+ ValidationSystem validation{settings, dataset, model,
+  [&] { return std::make_unique<CapturedOutputValidation>(admitted, gate); },
+  [&](ValidationSystem::event_type event) {
+   if (const auto* changed = std::get_if<ValidationChanged>(&event); changed && !changed->snapshot.operation.active) mmltk::testsupport::release_test_promise(settled);
+  }};
+ static_cast<void>(validation.Start({}));
+ auto future = admitted.get_future();
+ const auto report = mmltk::testsupport::await_test_future(future, "admitted validation output");
+ CHECK(report.parent_path() == std::filesystem::absolute(initial));
+ CHECK(validation.snapshot().operation.output.directory == report.parent_path().string());
+ const auto later = (root.path() / "later").string();
+ contracts::SettingsUpdateRequest edit;
+ edit.updates.push_back({.path = "workflows.validate.output.directory", .value = mmltk::frameworks::serialization::wire::FlatValue::text(later, mmltk::frameworks::reflection::kMaximumPathBytes).value()});
+ static_cast<void>(settings.Update(std::move(edit)));
+ static_cast<void>(validation.Stop());
+ mmltk::testsupport::await_test_promise(settled, "validation cancellation");
+ CHECK_FALSE(std::filesystem::exists(later));
+ CHECK(validation.snapshot().operation.output.directory == report.parent_path().string());
+ CHECK(validation.snapshot().operation.terminal.output.empty());
+ CHECK(validation.snapshot().operation.terminal.valid_worker_terminal());
+ CHECK(settings.snapshot().settings_state.workflows.validate.output.directory == later);
+}
+}  // namespace
+}  // namespace mmltk::controller
+
+namespace mmltk::controller {
+namespace {
+class PublishedThenFailedExport final : public ExportRuntime {
+public:
+ contracts::ComputeTerminal Run(mmltk::backend::models::rfdetr::ModelExportRequest request, std::stop_token, const ComputeProgressSink&, const ComputeArtifactSink& published) override {
+  const auto path = std::visit([](const auto& value) { return value.output_path; }, request);
+  std::ofstream(path) << "completed fixture artifact";
+  published(path);
+  return contracts::make_compute_terminal(contracts::ComputeOperationOutcome::Failed, 0U, 0U, {}, "failure after publication");
+ }
+};
+TEST_CASE("export keeps committed artifacts visible when later settlement fails", "[controller][systems][output]") {
+ mmltk::testsupport::ScopedTempDir root{"export-published-output"};
+ ApplicationDataFixture fixture{root.path()};
+ fixture.PrepareModel(contracts::FeatureId::Export);
+ auto [settings, dataset, model] = fixture.systems();
+ std::promise<contracts::ComputeUiState> settled;
+ ExportSystem exporter{settings, dataset, model, [] { return std::make_unique<PublishedThenFailedExport>(); },
+  [&](ComputeSystemEvent event) {
+   if (const auto* changed = std::get_if<ComputeChanged>(&event); changed && !changed->snapshot.active) settled.set_value(changed->snapshot);
+  }};
+ static_cast<void>(exporter.Start({}));
+ auto future = settled.get_future();
+ const auto result = mmltk::testsupport::await_test_future(future, "export output settlement");
+ CHECK(result.terminal.outcome == contracts::ComputeOperationOutcome::Failed);
+ CHECK(result.terminal.valid_worker_terminal());
+ CHECK(result.terminal.output.empty());
+ REQUIRE(result.output.artifacts.size() == 1U);
+ CHECK(result.output.artifacts.front() == std::filesystem::path(result.output.directory) / "model.engine");
+ CHECK(std::filesystem::is_regular_file(result.output.artifacts.front()));
+ CHECK(settings.snapshot().settings_state.workflows.export_state.output.directory == (root.path() / "export").string());
+}
+}  // namespace
+}  // namespace mmltk::controller
+
+namespace mmltk::controller {
+namespace {
+class CancelBeforePublicationExport final : public ExportRuntime {
+public:
+ explicit CancelBeforePublicationExport(std::promise<void>& started) : started_(started) {}
+ contracts::ComputeTerminal Run(mmltk::backend::models::rfdetr::ModelExportRequest, std::stop_token stop, const ComputeProgressSink&, const ComputeArtifactSink&) override {
+  started_.set_value();
+  mmltk::testsupport::StopGate gate;
+  static_cast<void>(gate.Wait(stop));
+  return contracts::make_compute_terminal(contracts::ComputeOperationOutcome::Cancelled);
+ }
+private:
+ std::promise<void>& started_;
+};
+TEST_CASE("export stopped during native work does not advertise an uncommitted artifact", "[controller][systems][output]") {
+ mmltk::testsupport::ScopedTempDir root{"export-unpublished-output"};
+ ApplicationDataFixture fixture{root.path()};
+ fixture.PrepareModel(contracts::FeatureId::Export);
+ auto [settings, dataset, model] = fixture.systems();
+ std::promise<void> started;
+ std::promise<contracts::ComputeUiState> settled;
+ ExportSystem exporter{settings, dataset, model, [&] { return std::make_unique<CancelBeforePublicationExport>(started); },
+  [&](ComputeSystemEvent event) {
+   if (const auto* changed = std::get_if<ComputeChanged>(&event); changed && !changed->snapshot.active) settled.set_value(changed->snapshot);
+  }};
+ static_cast<void>(exporter.Start({}));
+ mmltk::testsupport::await_test_promise(started, "export native work started");
+ static_cast<void>(exporter.Stop());
+ auto future = settled.get_future();
+ const auto result = mmltk::testsupport::await_test_future(future, "cancelled export");
+ CHECK(result.terminal.outcome == contracts::ComputeOperationOutcome::Cancelled);
+ CHECK(result.terminal.valid_worker_terminal());
+ CHECK(result.output.artifacts.empty());
+ CHECK_FALSE(std::filesystem::exists(std::filesystem::path(result.output.directory) / "model.engine"));
 }
 }  // namespace
 }  // namespace mmltk::controller

@@ -11,6 +11,7 @@ module;
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <fstream>
 #include "src/backend/models/rfdetr/core/artifact_publication.h"
 #include "src/common/io/file_digest.h"
@@ -501,7 +502,10 @@ std::shared_ptr<RfdetrRuntimeBackend> make_rfdetr_runtime_backend(const RfdetrRu
  auto layout = std::make_shared<const ResolvedClassLayout>(admission->Resolve(info.num_classes, embedded, options.stop));
  auto result = std::shared_ptr<RfdetrRuntimeBackend>(new RfdetrRuntimeBackend(std::move(lane), artifact.backend_name, resolution, options.maximum_detections, layout, output_roles, admission));
  admission->RequireUnchanged(options.stop);
- if (publication) publication->Publish(ModelClassDescriptor{1U, {}, layout->record(), output_roles}, [&] { return options.stop.stop_requested(); });
+ if (publication) {
+  publication->Publish(ModelClassDescriptor{1U, {}, layout->record(), output_roles}, [&] { return options.stop.stop_requested(); });
+  if (options.artifact_published) options.artifact_published(options.save_compiled_model_path);
+ }
  return result;
 }
 std::vector<std::shared_ptr<RfdetrRuntimeBackend>> make_rfdetr_runtime_backend_lanes(const RfdetrRuntimeBackendOptions& options, std::size_t lane_count) {
@@ -556,7 +560,7 @@ void build_tensorrt_engine(const BuildEngineRequest& request) {
  build_tensorrt_engine(request, {.native_handle = stream, .valid = true});
 }
 void build_tensorrt_engine(
- const BuildEngineRequest& request, const runtime::BorrowedCommandStream command_stream, std::shared_ptr<const ClassArtifactAdmission> admission, const std::stop_token stop) {
+ const BuildEngineRequest& request, const runtime::BorrowedCommandStream command_stream, std::shared_ptr<const ClassArtifactAdmission> admission, const std::stop_token stop, const std::function<void(const std::filesystem::path&)>& published) {
  if (stop.stop_requested()) return;
  validate_build_engine_request(request);
  try {
@@ -571,6 +575,7 @@ void build_tensorrt_engine(
    .allow_fp16 = request.allow_fp16,
    .admission = std::move(admission),
    .stop = stop,
+   .artifact_published = published,
   });
   close_runtime_backend(*backend, "RF-DETR TensorRT engine close");
  } catch (const ArtifactPublicationCancelled&) {

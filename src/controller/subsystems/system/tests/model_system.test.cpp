@@ -37,8 +37,6 @@ TEST_CASE("export materialization keeps ONNX branch input and output identities 
  auto settings = contracts::default_gui_settings_state();
  settings.workflows.train.request.train_compiled_path = "/tmp/train.bin";
  settings.workflows.export_state.onnx_input_path = "/tmp/source.onnx";
- settings.workflows.export_state.onnx_output_path = "/tmp/exported.onnx";
- settings.workflows.export_state.output_path = "/tmp/exported.engine";
  settings.workflows.export_state.weights_path = "/tmp/source.pt";
  const contracts::ArtifactInspection inspection{
   .compatible = true,
@@ -54,7 +52,7 @@ TEST_CASE("export materialization keeps ONNX branch input and output identities 
  REQUIRE(std::holds_alternative<mmltk::backend::models::rfdetr::BuildEngineRequest>(*engine));
  const auto& engine_request = std::get<mmltk::backend::models::rfdetr::BuildEngineRequest>(*engine);
  CHECK(engine_request.onnx_path == "/tmp/source.onnx");
- CHECK(engine_request.output_path == "/tmp/exported.engine");
+ CHECK(engine_request.output_path == "model.engine");
  settings.workflows.export_state.build_tensorrt = false;
  settings.workflows.export_state.model_input = contracts::ModelArtifactInputKind::Weights;
  const auto weight_model =
@@ -65,9 +63,8 @@ TEST_CASE("export materialization keeps ONNX branch input and output identities 
  REQUIRE(std::holds_alternative<mmltk::backend::models::rfdetr::ExportOnnxRequest>(*onnx));
  const auto& onnx_request = std::get<mmltk::backend::models::rfdetr::ExportOnnxRequest>(*onnx);
  CHECK(onnx_request.weights_path == "/tmp/source.pt");
- CHECK(onnx_request.output_path == "/tmp/exported.onnx");
+ CHECK(onnx_request.output_path == "model.onnx");
  CHECK(settings.workflows.export_state.onnx_input_path == "/tmp/source.onnx");
- CHECK(settings.workflows.export_state.onnx_output_path == "/tmp/exported.onnx");
 }
 TEST_CASE("model keys separate workflow artifacts from dataset splits and reject stale settings", "[controller][systems][compute][model]") {
  auto settings = contracts::default_gui_settings_state();
@@ -86,7 +83,6 @@ TEST_CASE("model keys separate workflow artifacts from dataset splits and reject
  settings.workflows.predict.model_input = contracts::ModelArtifactInputKind::Weights;
  settings.workflows.export_state.build_tensorrt = false;
  settings.workflows.export_state.weights_path = "/tmp/export.pt";
- settings.workflows.export_state.onnx_output_path = "/tmp/export.onnx";
  settings.workflows.export_state.model_source = contracts::ModelSelectionSource::Custom;
  settings.workflows.export_state.model_input = contracts::ModelArtifactInputKind::Weights;
  REQUIRE(contracts::gui_settings_valid(settings));
@@ -102,7 +98,7 @@ TEST_CASE("model keys separate workflow artifacts from dataset splits and reject
  CHECK(train_request->weights_path == "/tmp/train.pt");
  CHECK(train_request->test_compiled_path.empty());
  CHECK(settings.workflows.train.request.output_dir.empty());
- CHECK(train_request->output_dir == "./gui-train-output");
+ CHECK(train_request->output_dir == "./output/train");
  auto explicit_test = settings;
  explicit_test.workflows.train.request.test_compiled_path = "/independent/test.bin";
  CHECK_FALSE(subsystems::system::ComputeIntentMaterializer::LocalTrain(explicit_test, inspection, train));

@@ -1,52 +1,16 @@
 use crate::view::shared::status_text;
 use crate::fluent_theme::Element;
-use crate::generated::{self, FeatureId};
+use crate::generated::FeatureId;
 use crate::view_model::ApplicationModel;
-use iced::widget::{button, checkbox, column, container};
-#[derive(Debug, Clone)]
-pub enum Message {
-    Auto(bool),
-    Browse(u64),
-}
+pub use crate::view::workflow::output::Message;
 pub fn view<'a>(
     model: &'a ApplicationModel,
     settings: &'a crate::view::settings::SettingsModel,
     chart_omissions: u64,
 ) -> Element<'a, Message> {
-    let train = settings.draft.as_ref().map(|value| &value.workflows.train);
-    let automatic = train.is_none_or(|train| train.autooutput);
-    let selected = train.map_or("", |train| train.request.outputdir.as_str());
-    let active = model
-        .workflow
-        .training
-        .as_ref()
-        .filter(|snapshot| {
-            model.workflow.output.saved().is_none() && !snapshot.outputdirectory.is_empty()
-        })
-        .map(|snapshot| snapshot.outputdirectory.as_str());
-    let directory = active.unwrap_or(if automatic { "" } else { selected });
-    let fact = model.workflow.dialogs(FeatureId::Train).find(|fact| {
-        fact.stable_field_id
-            == generated::constraint_workflowstrainrequestoutputdir().stable_field_id
-    });
-    let mut content = column![
-        checkbox(automatic)
-            .label("Auto Output")
-            .on_toggle_maybe(model.settings_edit_available().then_some(Message::Auto)),
-        container(
-            button("Browse Output")
-                .style(crate::fluent_theme::button_primary)
-                .width(iced::Fill)
-                .on_press_maybe(
-                    fact.filter(|fact| !settings.has_local_edits()
-                        && model.file_dialog_open_available(fact, FeatureId::Train))
-                        .map(|fact| Message::Browse(fact.stable_field_id))
-                )
-        )
-        .id("train.output.browse"),
-        status_text(directory).size(12),
-    ]
-    .spacing(crate::view::workflow::FIELD_SPACING);
+    let facts = model.workflow.training.as_ref()
+        .filter(|_| model.workflow.output.saved().is_none()).map(|snapshot| &snapshot.local.output);
+    let mut content = crate::view::workflow::output::content(FeatureId::Train, model, settings, facts);
     if chart_omissions > 0 {
         content = content.push(status_text(format!("Charts omit {chart_omissions} older disconnected summaries; saved history remains unchanged.")));
     }
@@ -108,6 +72,7 @@ pub fn view<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::generated;
 
     fn count(tree: &iced::advanced::widget::Tree) -> usize {
         1 + tree.children.iter().map(count).sum::<usize>()

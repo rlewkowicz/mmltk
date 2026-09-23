@@ -56,15 +56,18 @@ inline constexpr bool is_mutable_leaf_v = [] {
   return std::is_arithmetic_v<U> || std::is_enum_v<U> || std::same_as<U, std::string> || std::same_as<U, std::filesystem::path>;
  }
 }();
-template <class Declaration>
-inline constexpr bool is_persistence_metadata_v = [] {
+template <class Declaration, class Marker>
+inline constexpr bool has_annotation_v = [] {
  std::size_t count = 0U;
- Declaration::VisitAnnotations([&]<class Annotation>(const Annotation&) { count += std::same_as<std::remove_cvref_t<Annotation>, reflection::PersistenceMetadata> ? 1U : 0U; });
- if (count > 1U) throw "settings declaration has duplicate persistence-metadata annotations";
+ Declaration::VisitAnnotations([&]<class Annotation>(const Annotation&) { count += std::same_as<std::remove_cvref_t<Annotation>, Marker> ? 1U : 0U; });
+ if (count > 1U) throw "settings declaration has duplicate ownership annotations";
  return count == 1U;
 }();
+template <class Declaration>
+inline constexpr bool is_persistence_metadata_v = has_annotation_v<Declaration, reflection::PersistenceMetadata>;
 template <class Declaration, class T>
-inline constexpr bool is_mutable_member_v = is_mutable_leaf_v<T> && !is_persistence_metadata_v<Declaration>;
+inline constexpr bool is_mutable_member_v = is_mutable_leaf_v<T> && !is_persistence_metadata_v<Declaration> &&
+ !has_annotation_v<Declaration, mmltk::frameworks::reflection::RuntimeDestination>;
 template <bool MutableOnly, class T>
 [[nodiscard]] consteval std::size_t count_leaves() {
  using U = std::remove_cvref_t<T>;

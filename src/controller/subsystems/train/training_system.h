@@ -59,7 +59,6 @@ struct TrainingSnapshot final {
  contracts::ComputeUiState local{};
  contracts::ProviderOfferState offers{};
  contracts::RemoteSessionState remote{};
- [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]] std::filesystem::path output_directory;
  std::optional<mmltk::backend::models::rfdetr::TrainingRecord> metrics;
  mmltk::backend::models::rfdetr::TrainingPersistence persistence{};
  mmltk::backend::models::rfdetr::TrainingCheckpointInspection inspection;

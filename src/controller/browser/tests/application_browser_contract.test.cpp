@@ -1171,11 +1171,11 @@ TEST_CASE("custom model dialogs derive from the canonical compatibility catalog"
  });
  CHECK(row_index == 9U);
 }
-TEST_CASE("export ONNX input and output publish distinct canonical dialogs", "[controller][browser][reflection][dialog]") {
+TEST_CASE("export ONNX input and output directory publish distinct canonical dialogs", "[controller][browser][reflection][dialog]") {
  const auto entries = services::file_dialog_catalog().entries();
  const auto find_path = [&](const std::string_view path) { return std::ranges::find(entries, path, [](const services::FileDialogDescriptor& entry) { return entry.field_path.view(); }); };
  const auto input = find_path("workflows.export_state.onnx_input_path");
- const auto output = find_path("workflows.export_state.onnx_output_path");
+ const auto output = find_path("workflows.export_state.output.directory");
  REQUIRE(input != entries.end());
  REQUIRE(output != entries.end());
  CHECK(input->stable_id == application_settings_field_stable_id(input->field_path.view()));
@@ -1183,7 +1183,7 @@ TEST_CASE("export ONNX input and output publish distinct canonical dialogs", "[c
  CHECK(input->stable_id != output->stable_id);
  CHECK(input->mode == contracts::FileDialogMode::OpenFile);
  CHECK(input->model_input == mmltk::backend::models::catalog::ModelArtifactInputKind::Onnx);
- CHECK(output->mode == contracts::FileDialogMode::SaveFile);
+ CHECK(output->mode == contracts::FileDialogMode::OpenFolder);
  CHECK_FALSE(output->model_input);
 }
 TEST_CASE("canonical schema projects typed catalog rows and settings defaults", "[controller][browser][reflection]") {
@@ -1442,3 +1442,35 @@ TEST_CASE("Predict scalar progress excludes full retained labels and keeps nativ
  CHECK(invalidated.snapshot_revision == 8U);
  CHECK(invalidated.frame != observed.frame);
 }
+
+namespace mmltk::controller::browser {
+TEST_CASE("workflow output destinations have one mutable directory authority", "[controller][browser][reflection][output]") {
+ const auto entries = services::file_dialog_catalog().entries();
+ for (const std::string_view path : {"workflows.train.output.directory", "workflows.validate.output.directory", "workflows.predict.output.directory", "workflows.export_state.output.directory"}) {
+  CAPTURE(path);
+  std::size_t matches = 0U;
+  VisitSettingsLeaves<contracts::GuiSettingsState>([&]<class Owner, class Declaration, class Member>(const ApplicationSettingsLeafFact& field) {
+   if (field.path != path) return;
+   ++matches;
+   CHECK(field.mutable_leaf);
+   CHECK(field.stable_id == application_settings_field_stable_id(path));
+  });
+  CHECK(matches == 1U);
+  const auto dialog = std::ranges::find(entries, path, [](const services::FileDialogDescriptor& entry) { return entry.field_path.view(); });
+  REQUIRE(dialog != entries.end());
+  CHECK(dialog->stable_id == application_settings_field_stable_id(path));
+  CHECK(dialog->mode == contracts::FileDialogMode::OpenFolder);
+ }
+ for (const std::string_view path : {"workflows.train.request.output_dir", "workflows.validate.request.report_json_path", "workflows.predict.request.output_path"}) {
+  CAPTURE(path);
+  std::size_t matches = 0U;
+  VisitSettingsLeaves<contracts::GuiSettingsState>([&]<class Owner, class Declaration, class Member>(const ApplicationSettingsLeafFact& field) {
+   if (field.path != path) return;
+   ++matches;
+   CHECK_FALSE(field.mutable_leaf);
+  });
+  CHECK(matches == 1U);
+  CHECK(std::ranges::none_of(entries, [&](const services::FileDialogDescriptor& entry) { return entry.field_path.view() == path; }));
+ }
+}
+}  // namespace mmltk::controller::browser

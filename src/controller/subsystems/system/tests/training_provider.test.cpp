@@ -148,7 +148,9 @@ TEST_CASE("checkpoint inspection replaces bounded worker work and guards cached 
  const auto policy = inspection_policy();
  std::atomic_bool worker_owned = false;
  std::atomic_bool placement_verified = false;
- const auto configuration = settings.snapshot().settings_state.workflows.train.request;
+ auto configuration = settings.snapshot().settings_state.workflows.train.request;
+ configuration.output_dir = root.path() / "saved-training-run";
+ const auto selected_output = settings.snapshot().settings_state.workflows.train.output.directory;
  auto inspect = [&](const std::filesystem::path& path, std::stop_token stop) {
   worker_owned = std::this_thread::get_id() != ingress;
   const auto placement = mmltk::common::system::capture_execution_policy_snapshot();
@@ -233,12 +235,14 @@ TEST_CASE("Resume reuses exact admitted checkpoint evidence across preparation a
  auto [settings, unused_dataset, model] = fixture.systems();
  contracts::SettingsUpdateRequest manual;
  manual.updates = {
-  {.path = "workflows.train.auto_output", .value = mmltk::frameworks::serialization::wire::FlatValue{false}},
-  {.path = "workflows.train.request.output_dir",
+  {.path = "workflows.train.output.automatic", .value = mmltk::frameworks::serialization::wire::FlatValue{false}},
+  {.path = "workflows.train.output.directory",
    .value = mmltk::frameworks::serialization::wire::FlatValue::text((root.path() / "output").string(), mmltk::frameworks::reflection::kMaximumPathBytes).value()},
  };
  (void)settings.Update(std::move(manual));
- const auto configuration = settings.snapshot().settings_state.workflows.train.request;
+ auto configuration = settings.snapshot().settings_state.workflows.train.request;
+ configuration.output_dir = root.path() / "saved-training-run";
+ const auto selected_output = settings.snapshot().settings_state.workflows.train.output.directory;
  const auto path = configuration.weights_path;
  const auto companion = std::filesystem::path(path.string() + ".classes.json");
  const auto layout = r::unresolved_class_layout(2);
@@ -298,7 +302,7 @@ TEST_CASE("Resume reuses exact admitted checkpoint evidence across preparation a
   if (mutation != 0) {
    CHECK_THROWS(training.Resume({path}));
    CHECK_FALSE(launched);
-   CHECK_FALSE(std::filesystem::exists(configuration.output_dir));
+   CHECK_FALSE(std::filesystem::exists(selected_output));
    return;
   }
  }
@@ -311,7 +315,7 @@ TEST_CASE("Resume reuses exact admitted checkpoint evidence across preparation a
  CHECK(result.local.terminal.outcome == (valid ? contracts::ComputeOperationOutcome::Succeeded : contracts::ComputeOperationOutcome::Failed));
  CHECK(launched.load() == valid);
  CHECK(inspections == (mutation == 6 ? 2 : 1));
- if (!valid) CHECK_FALSE(std::filesystem::exists(configuration.output_dir));
+ if (!valid) CHECK_FALSE(std::filesystem::exists(selected_output));
 }
 TEST_CASE("checkpoint inspection policy denial fails construction before runtime admission", "[controller][systems][training]") {
  CHECK(mmltk::common::system::test_support::with_denied_syscall(SYS_ioprio_set, [] {

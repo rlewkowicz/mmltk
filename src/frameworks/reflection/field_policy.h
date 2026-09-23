@@ -30,6 +30,8 @@ struct Annotation {
  static constexpr bool is_max_items = false;
  constexpr bool operator==(const Annotation&) const noexcept = default;
 };
+// Concrete execution destination; composed settings use their own output policy.
+struct RuntimeDestination : Annotation {};
 template <class Value>
 struct Minimum : Annotation {
  Value value;

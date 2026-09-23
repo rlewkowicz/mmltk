@@ -264,11 +264,16 @@ std::expected<void, SettingsMutationError> apply_gui_settings_values(GuiSettings
  const auto& selected_train = candidate.workflows.train.request;
  if (selected_train.train_compiled_path != installed_train.train_compiled_path || selected_train.val_compiled_path != installed_train.val_compiled_path)
   candidate.workflows.train.use_compiled_directory_defaults = false;
- if (selected_train.output_dir != installed_train.output_dir && candidate.workflows.train.auto_output == state.workflows.train.auto_output) candidate.workflows.train.auto_output = false;
+ const auto normalize_output = [](const auto& installed, auto& selected) {
+  if (selected.output.directory != installed.output.directory && selected.output.automatic == installed.output.automatic) selected.output.automatic = false;
+ };
+ normalize_output(state.workflows.train, candidate.workflows.train);
+ normalize_output(state.workflows.validate, candidate.workflows.validate);
+ normalize_output(state.workflows.predict, candidate.workflows.predict);
+ normalize_output(state.workflows.export_state, candidate.workflows.export_state);
  apply_compiled_directory_defaults(candidate.workflows.train);
  normalize_canonical_source_transitions(state, candidate);
  if (!valid_settings(candidate)) return std::unexpected(SettingsMutationError::CrossFieldViolation);
- if (candidate.workflows.train.auto_output) candidate.workflows.train.request.output_dir.clear();
  state = std::move(candidate);
  return {};
 }

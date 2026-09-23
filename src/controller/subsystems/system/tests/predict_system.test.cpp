@@ -77,7 +77,7 @@ public:
  }
  [[nodiscard]] bool HasUnsafeCustody() const noexcept override { return unsafe_; }
  contracts::ComputeTerminal Run(mmltk::backend::models::rfdetr::PredictRequest, std::stop_token, const ComputeProgressSink&, const ProductSink&, const PlaybackGate&, VisualExtent,
-  const ContextProvider&, const PreviewRetirement& retirement) override {
+  const ContextProvider&, const PreviewRetirement& retirement, const ComputeArtifactSink&) override {
   if (preview_terminal_) {
    auto lease = mmltk::frameworks::gpu::ReserveTerminalCudaLease(*retirement);
    auto retained = custody_;

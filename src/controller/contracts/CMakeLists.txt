@@ -68,6 +68,7 @@ mmltk_register_public_headers(
         settings_vocabulary.h
         terminal_presentation.h
         validation_display.h
+        workflow_output.h
         view_state.h
         workflow_path_dialogs.h
         workflows.h

@@ -109,9 +109,9 @@ void WorkflowWaylandInputs::Configure(contracts::GuiSettingsState& settings, con
  train.request.weights_path = weights_;
  train.request.train_compiled_path = compiled;
  train.request.val_compiled_path = compiled;
- train.auto_output = false;
- train.request.output_dir = output / "training";
- std::filesystem::create_directories(train.request.output_dir);
+ train.output.automatic = false;
+ train.output.directory = (output / "training").string();
+ std::filesystem::create_directories(train.output.directory);
  train.request.resolution = 64;
  train.request.num_queries = 6;
  train.request.eval_max_dets = 6;
@@ -134,14 +134,14 @@ void WorkflowWaylandInputs::Configure(contracts::GuiSettingsState& settings, con
  // Match the calibrated native fixture's proposal selection and coordinates.
  validate.request.allow_fp16 = false;
  validate.request.h2d_dataloader = true;
- validate.request.report_json_path = output / "validation.json";
+ validate.output = {.automatic = false, .directory = (output / "validation").string()};
  auto& export_state = settings.workflows.export_state;
  export_state.model_source = contracts::ModelSelectionSource::Custom;
  export_state.model_input = contracts::ModelArtifactInputKind::Weights;
  export_state.weights_path = weights_;
  export_state.model_resolution = 64;
  export_state.build_tensorrt = false;
- export_state.onnx_output_path = output / "cancelled-export.onnx";
+ export_state.output = {.automatic = false, .directory = (output / "export").string()};
  auto& predict = settings.workflows.predict;
  predict.model_source = contracts::ModelSelectionSource::Custom;
  predict.model_input = contracts::ModelArtifactInputKind::Weights;
@@ -150,7 +150,7 @@ void WorkflowWaylandInputs::Configure(contracts::GuiSettingsState& settings, con
  predict.request.threshold = 0.0F;
  predict.request.h2d_dataloader = true;
  predict.request.compilation_mode = rfdetr::CompilationMode::kNone;
- predict.request.output_path = output / "predictions.json";
+ predict.output = {.automatic = false, .directory = (output / "prediction").string()};
  predict.source.kind = contracts::SourceKind::CompiledDataset;
  predict.source.compiled_path = compiled;
  predict.source.single_image_path = (std::filesystem::path{data::testsupport::dataset_dir(fixture_)} / fixture_.split / "000001.png").string();

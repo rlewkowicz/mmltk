@@ -1,4 +1,5 @@
 #pragma once
+#include <filesystem>
 #include <functional>
 #include <optional>
 #include "src/common/system/execution_policy.h"
@@ -10,6 +11,7 @@ struct DirectComputeConfiguration final {
  [[nodiscard]] bool valid() const noexcept { return execution && execution->device >= 0 && execution->placement.numa_node >= 0 && !execution->placement.cpus.empty(); }
  [[nodiscard]] std::optional<mmltk::common::system::ExecutionPolicyRequest> worker_policy() const;
 };
+using ComputeArtifactSink = std::function<void(const std::filesystem::path&)>;
 using ComputeProgressSink = std::function<void(const contracts::ComputeProgress&)>;
 // The synchronous work boundary admits progress and one terminal. Runtime,
 // cancellation, domain results and publication remain with the calling system.

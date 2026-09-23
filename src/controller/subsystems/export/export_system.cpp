@@ -1,4 +1,5 @@
 #include "export_system.h"
+#include "src/controller/services/run_output.h"
 #include <algorithm>
 #include <exception>
 #include <mutex>
@@ -20,19 +21,19 @@ public:
 };
 CudaExportRuntime::CudaExportRuntime(DirectComputeConfiguration configuration) : impl_(std::make_unique<Impl>(configuration)) {}
 CudaExportRuntime::~CudaExportRuntime() = default;
-contracts::ComputeTerminal CudaExportRuntime::Run(mmltk::backend::models::rfdetr::ModelExportRequest operation, std::stop_token stop, const ComputeProgressSink&) {
+contracts::ComputeTerminal CudaExportRuntime::Run(mmltk::backend::models::rfdetr::ModelExportRequest operation, std::stop_token stop, const ComputeProgressSink&, const ComputeArtifactSink& published) {
  using mmltk::backend::models::rfdetr::BuildEngineRequest;
  using mmltk::backend::models::rfdetr::ExportOnnxRequest;
  return impl_->resources.Run(
-  [this, stop, operation = std::move(operation)](const mmltk::backend::ml::runtime::BorrowedCommandStream stream) mutable {
+  [this, stop, &published, operation = std::move(operation)](const mmltk::backend::ml::runtime::BorrowedCommandStream stream) mutable {
    if (auto* request = std::get_if<BuildEngineRequest>(&operation)) {
     request->device_id = impl_->resources.device();
-    mmltk::backend::models::rfdetr::build_tensorrt_engine(*request, stream, {}, stop);
+    mmltk::backend::models::rfdetr::build_tensorrt_engine(*request, stream, {}, stop, published);
     return contracts::make_compute_terminal(contracts::ComputeOperationOutcome::Succeeded, 0, 0, request->output_path.string());
    }
    auto& request = std::get<ExportOnnxRequest>(operation);
    request.device_id = impl_->resources.device();
-   impl_->session.Run(request, stream, stop);
+   impl_->session.Run(request, stream, stop, published);
    return contracts::make_compute_terminal(contracts::ComputeOperationOutcome::Succeeded, 0, 0,
     // CLEANUP-IGNORE: ONNX export publishes its domain output path from the validated request.
     request.output_path.string());
@@ -64,14 +65,21 @@ public:
      if (!next) throw contracts::FailedError("compute operation generation exhausted");
      contracts::begin_compute(state_, *next, {});
     },
-   .work = [this, prepared = std::move(prepared)](const std::stop_token stop) mutable -> direct::LocalRun::Notification {
+   .work = [this, prepared = std::move(prepared), output = settings.settings.workflows.export_state.output](const std::stop_token stop) mutable -> direct::LocalRun::Notification {
     auto terminal = run_checked_compute(
      [&](const ComputeProgressSink& progress) {
       if (stop.stop_requested()) return contracts::make_compute_terminal(contracts::ComputeOperationOutcome::Cancelled);
+      const auto directory = services::reserve_run_output(contracts::workflow_output_root(output, contracts::FeatureId::Export), !output.automatic);
+      std::visit([&](auto& request) { request.output_path = directory / request.output_path.filename(); }, *prepared);
+      {
+       std::scoped_lock lock(mutex_);
+       state_.output.directory = directory.string();
+      }
+      direct::PublishLazyNoexcept(events_, [&] { return ComputeSystemEvent{ComputeChanged{snapshot()}}; });
       if (!runtime_) runtime_ = factory_();
       if (!runtime_) throw std::runtime_error("compute runtime is unavailable");
       // CLEANUP-IGNORE: Export owns retirement and publication; LocalRun and run_checked_compute already share execution.
-      return runtime_->Run(std::move(*prepared), stop, progress);
+      return runtime_->Run(std::move(*prepared), stop, progress, [this](const auto& path) { Artifact(path); });
      },
      [this](const contracts::ComputeProgress& progress) { Progress(progress); });
     if (terminal.outcome == contracts::ComputeOperationOutcome::Failed) runtime_.reset();
@@ -100,6 +108,14 @@ public:
  }
 
 private:
+ void Artifact(const std::filesystem::path& path) {
+  {
+   std::scoped_lock lock(mutex_);
+   if (state_.output.artifacts.size() == contracts::kWorkflowArtifactCapacity) throw std::runtime_error("export artifact publication capacity exhausted");
+   state_.output.artifacts.push_back(path);
+  }
+  direct::PublishLazyNoexcept(events_, [&] { return ComputeSystemEvent{ComputeChanged{snapshot()}}; });
+ }
  [[nodiscard]] direct::LocalRun::Notification Complete(contracts::ComputeTerminal terminal) {
   contracts::ComputeUiState settled;
   {

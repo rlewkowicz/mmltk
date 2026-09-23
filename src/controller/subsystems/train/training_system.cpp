@@ -261,7 +261,9 @@ public:
      const auto next = contracts::next_compute_generation(state_.local.generation_frontier);
      if (!next) throw contracts::FailedError("training operation generation exhausted");
      state_.activity = TrainingActivity::Local;
-     state_.output_directory.clear();
+     state_.local.output = {};
+     state_.metrics.reset();
+     state_.persistence = {};
      state_.local.active = true;
      state_.local.generation_frontier = *next;
      state_.local.progress = {};
@@ -292,10 +294,10 @@ public:
        if (!continuation->resumable) throw contracts::InvalidIntentError("selected artifact is not resumable");
       }
       if (stop.stop_requested()) throw mmltk::backend::models::rfdetr::ArtifactPublicationCancelled{};
-      request->output_dir = services::TrainRunStore::ResolveOutput(request->output_dir, continuation, settings.workflows.train.auto_output);
+      request->output_dir = services::TrainRunStore::ResolveOutput(request->output_dir, continuation, settings.workflows.train.output.automatic);
       {
        std::scoped_lock lock(mutex_);
-       state_.output_directory = request->output_dir;
+       state_.local.output.directory = request->output_dir.string();
        state_.metrics.reset();
        state_.persistence = {};
        AdvanceObservation();

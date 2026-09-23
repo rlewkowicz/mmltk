@@ -25,10 +25,6 @@ template <auto Path>
   return WorkflowPathDialog{"Select validation dataset", "Compiled datasets", "*.mmltk *.bin", FileDialogMode::OpenFile};
  }
  if constexpr (std::same_as<std::remove_cv_t<decltype(Path)>, std::remove_cv_t<decltype(member_path<&GuiSettingsState::workflows, &WorkflowSettingsState::train, &TrainViewState::request,
-                                                               &mmltk::backend::models::rfdetr::TrainRequest::output_dir>)>>) {
-  return WorkflowPathDialog{"Select training output", "Directories", "*", FileDialogMode::OpenFolder};
- }
- if constexpr (std::same_as<std::remove_cv_t<decltype(Path)>, std::remove_cv_t<decltype(member_path<&GuiSettingsState::workflows, &WorkflowSettingsState::train, &TrainViewState::request,
                                                                &mmltk::backend::models::rfdetr::TrainRequest::resume_path>)>>) {
   return WorkflowPathDialog{"Select resume checkpoint", "Checkpoints", "*.pt *.pth *.ckpt", FileDialogMode::OpenFile};
  }

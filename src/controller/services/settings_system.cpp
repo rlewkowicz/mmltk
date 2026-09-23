@@ -13,7 +13,7 @@ void SettingsSystem::RestoreTrainingCheckpoint(mmltk::backend::models::rfdetr::T
  {
   std::scoped_lock mutation_lock(mutation_mutex_);
   auto candidate = mutation_candidate();
-  request.output_dir = candidate.workflows.train.request.output_dir;
+  request.output_dir.clear();
   request.resume_path = checkpoint;
   // Worker launch coordinates are process state, not a reusable GUI run.
   request.distributed_worker = false;

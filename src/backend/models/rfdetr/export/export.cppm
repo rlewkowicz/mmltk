@@ -2,6 +2,7 @@ module;
 #include <cstdint>
 #include "src/backend/models/rfdetr/core/model_info.h"
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <stop_token>
 #include <span>
@@ -24,7 +25,7 @@ public:
  ~ExportOnnxSession();
  ExportOnnxSession(const ExportOnnxSession&) = delete;
  ExportOnnxSession& operator=(const ExportOnnxSession&) = delete;
- void Run(const ExportOnnxRequest& request, mmltk::backend::ml::runtime::BorrowedCommandStream command_stream, std::stop_token stop = {});
+ void Run(const ExportOnnxRequest& request, mmltk::backend::ml::runtime::BorrowedCommandStream command_stream, std::stop_token stop = {}, const std::function<void(const std::filesystem::path&)>& published = {});
  [[nodiscard]] ModelExportStatus Close() noexcept;
 
 private:

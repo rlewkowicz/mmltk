@@ -87,7 +87,7 @@ void test_current_training_history_pages_and_attempt_configuration() {
  const auto fresh = TrainRunStore::ResolveOutput(temp.path());
  REQUIRE(fresh != temp.path());
  REQUIRE(fresh.filename() == "run-0001");
- REQUIRE(std::filesystem::is_empty(fresh));
+ REQUIRE(std::filesystem::is_directory(fresh / ".mmltk-run-claim"));
  r::TrainingCheckpoint continuation;
  continuation.path = temp.path() / "checkpoint.pt";
  continuation.attempt_id = manifest.checkpoint_attempt_id;
@@ -130,7 +130,7 @@ TEST_CASE("automatic output reserves increasing directories across owners", "[gu
  std::set<std::filesystem::path> paths;
  for (auto& start : starts) {
   const auto path = start.get();
-  CHECK(std::filesystem::is_empty(path));
+  CHECK(std::filesystem::is_directory(path / ".mmltk-run-claim"));
   CHECK(paths.insert(path).second);
  }
  CHECK(TrainRunStore::ResolveOutput(root, {}, true).filename() == "run-0052");

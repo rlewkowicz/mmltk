@@ -1896,6 +1896,11 @@ impl State {
                 }) =>
             {
                 let snapshot = validation.unwrap();
+                if snapshot.operation.output.directory.is_empty()
+                    || !snapshot.operation.output.artifacts.iter().any(|path| path.ends_with("/report.json")) {
+                    driver.fail("Validation did not publish its admitted output directory and completed report");
+                    return Task::none();
+                }
                 let mut identities = std::collections::BTreeSet::new();
                 if snapshot.metrics.is_none()
                     || !snapshot

@@ -26,6 +26,7 @@
 #include "src/controller/contracts/annotation.h"
 #include "src/controller/contracts/model_selection_types.h"
 #include "src/controller/contracts/workflows.h"
+#include "src/controller/contracts/workflow_output.h"
 namespace mmltk::controller::contracts {
 enum class SourceKind : std::uint8_t {
  CompiledDataset,
@@ -156,7 +157,7 @@ struct TrainViewState : TrainExecutionPaneState {
   .mode = mmltk::controller::contracts::FileDialogMode::OpenFolder}]] std::string dataset_source_dir = "./dataset";
  [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]][[= mmltk::controller::contracts::reflection::FileDialog<"Select compiled dataset", "Directories", "*">{
   .mode = mmltk::controller::contracts::FileDialogMode::OpenFolder}]] std::string compiled_dataset_dir = "./compiled";
- bool auto_output = true;
+ WorkflowOutputSelection output{};
  bool use_compiled_directory_defaults = true;
  bool overwrite_compiled_dataset = false;
  bool compile_dimensions = false;
@@ -169,25 +170,28 @@ struct TrainViewState : TrainExecutionPaneState {
 struct ValidateViewState {
  ValidateViewState() {
   request.log_mode = mmltk::backend::models::rfdetr::ValidationLogMode::Quiet;
-  request.report_json_path = "./rfdetr-validation-report.json";
+  request.report_json_path.clear();
   request.split = "val";
   request.preset_name = kDefaultModelPresetName;
   request.resolution = kDefaultModelResolution;
  }
  mmltk::backend::models::rfdetr::ValidateRequest request;
+ WorkflowOutputSelection output{};
  ValidationDisplaySettings display{};
  ModelSelectionSource model_source = ModelSelectionSource::Canonical;
  ModelArtifactInputKind model_input = ModelArtifactInputKind::Weights;
 };
 struct PredictViewState {
+ bool write_report_json = true;
  PredictViewState() {
-  request.output_path = "./predictions.json";
+  request.output_path.clear();
   request.batch_size = 1;
   request.threshold = 0.25F;
   request.preset_name = kDefaultModelPresetName;
   request.resolution = kDefaultModelResolution;
  }
  mmltk::backend::models::rfdetr::PredictRequest request;
+ WorkflowOutputSelection output{};
  SourceSelectionState source;
  ModelSelectionSource model_source = ModelSelectionSource::Canonical;
  ModelArtifactInputKind model_input = ModelArtifactInputKind::Weights;
@@ -220,15 +224,11 @@ struct AnnotateViewState : WorkflowModelSelectionState {
 };
 // CLEANUP-IGNORE: Export owns distinct reflected artifact inputs that share the canonical path constraint.
 struct ExportViewState : WorkflowModelSelectionState {
+ WorkflowOutputSelection output{};
  [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]][
   [= reflection::FileDialog<"Select class layout", "Class descriptors", "*.classes.json *.json">{.mode = FileDialogMode::OpenFile}]] std::string class_layout_path;
  [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]] std::string weights_path;
  [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]] std::string onnx_input_path;
- [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]][
-  [= mmltk::controller::contracts::reflection::FileDialog<"Choose ONNX export", "ONNX files", "*.onnx">{.mode = mmltk::controller::contracts::FileDialogMode::SaveFile}]] std::string onnx_output_path;
- [[= mmltk::frameworks::reflection::MaxBytes{
-  mmltk::frameworks::reflection::kMaximumPathBytes}]][[= mmltk::controller::contracts::reflection::FileDialog<"Choose TensorRT export", "TensorRT files", "*.engine *.trt">{
-  .mode = mmltk::controller::contracts::FileDialogMode::SaveFile}]] std::string output_path = "./rfdetr-engine.trt";
  [[= mmltk::frameworks::reflection::Minimum<int>{0}]] int device_id = 0;
  [[= mmltk::frameworks::reflection::Minimum<int>{1}]] int opset_version = 19;
  bool allow_fp16 = true;

@@ -1,8 +1,7 @@
 #include "train_run_store.h"
 #include <algorithm>
-#include <charconv>
+#include "run_output.h"
 #include <limits>
-#include <format>
 #include "src/frameworks/serialization/reflected_json.h"
 namespace mmltk::controller::services {
 namespace r = mmltk::backend::models::rfdetr;
@@ -105,27 +104,6 @@ std::filesystem::path TrainRunStore::ResolveOutput(const std::filesystem::path& 
    return root;
   (void)run;
  }
- if (!automatic && !resume && (!std::filesystem::exists(root) || std::filesystem::is_empty(root))) {
-  std::filesystem::create_directories(root);
-  return root;
- }
- std::filesystem::create_directories(root);
- std::uint64_t next = 1;
- for (const auto& entry : std::filesystem::directory_iterator(root)) {
-  const auto name = entry.path().filename().string();
-  if (!name.starts_with("run-")) continue;
-  std::uint64_t suffix = 0;
-  const auto parsed = std::from_chars(name.data() + 4, name.data() + name.size(), suffix);
-  if (parsed.ptr != name.data() + name.size()) continue;
-  if (parsed.ec == std::errc::result_out_of_range) throw std::runtime_error("training output suffix exhausted");
-  if (parsed.ec != std::errc{}) continue;
-  if (suffix == std::numeric_limits<std::uint64_t>::max()) throw std::runtime_error("training output suffix exhausted");
-  next = std::max(next, suffix + 1);
- }
- for (; next != std::numeric_limits<std::uint64_t>::max(); ++next) {
-  const auto candidate = root / std::format("run-{:04}", next);
-  if (std::filesystem::create_directory(candidate)) return candidate;
- }
- throw std::runtime_error("cannot allocate a fresh training output directory");
+ return reserve_run_output(root, !automatic && !resume);
 }
 }  // namespace mmltk::controller::services

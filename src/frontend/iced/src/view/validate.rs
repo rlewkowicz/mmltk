@@ -9,6 +9,7 @@ use iced::widget::{button, column, container, text};
 
 #[derive(Debug, Clone)]
 pub enum Message {
+    Output(crate::view::workflow::output::Message),
     Loading(crate::view::workflow::loading::Message),
     StartRequested,
     StopRequested,
@@ -142,6 +143,8 @@ impl Component {
                     .spacing(crate::view::workflow::FIELD_SPACING)
                 )
             ),
+            crate::view::workflow::output::view(crate::generated::FeatureId::Validate, model, settings,
+                model.workflow.validation.as_ref().map(|snapshot| &snapshot.operation.output)).map(Message::Output),
             crate::view::workflow::primary_action(
                 crate::generated::FeatureId::Validate,
                 model.primary_action_active(crate::generated::FeatureId::Validate),
@@ -277,6 +280,9 @@ impl Component {
         message: Message,
     ) -> Result<Option<Outcome>, String> {
         let outcome = match message {
+            Message::Output(crate::view::workflow::output::Message::Browse(id)) => Outcome::DialogRequested(id),
+            Message::Output(crate::view::workflow::output::Message::Auto(value)) => Outcome::SettingsEdited(
+                crate::view::workflow::output::automatic(settings, crate::generated::FeatureId::Validate, value)?),
             Message::Loading(message) => {
                 Outcome::SettingsEdited(crate::view::workflow::loading::update(
                     crate::generated::FeatureId::Validate,

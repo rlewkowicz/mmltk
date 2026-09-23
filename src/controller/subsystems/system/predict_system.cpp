@@ -18,6 +18,7 @@
 #include "src/controller/presentation/visual_diagnostics.h"
 #include "src/controller/presentation/workspace_input.h"
 #include "src/controller/subsystems/system/compute_intent_materializer.h"
+#include "src/controller/services/run_output.h"
 #include "src/controller/runtime/local_run.h"
 #include "src/frameworks/gpu/cuda_context_scope.h"
 #include "src/frameworks/gpu/image_failure.h"
@@ -41,11 +42,11 @@ void CudaPredictRuntime::Close() noexcept {
 }
 bool CudaPredictRuntime::HasUnsafeCustody() const noexcept { return impl_->close_failed || impl_->session.HasUnsafeCustody() || (impl_->preview && impl_->preview->HasUnsafeCustody()); }
 contracts::ComputeTerminal CudaPredictRuntime::Run(mmltk::backend::models::rfdetr::PredictRequest operation, const std::stop_token stop, const ComputeProgressSink& progress,
- const ProductSink& products, const PlaybackGate& gate, VisualExtent maximum, const ContextProvider& current_context, const PreviewRetirement& retirement) {
+ const ProductSink& products, const PlaybackGate& gate, VisualExtent maximum, const ContextProvider& current_context, const PreviewRetirement& retirement, const ComputeArtifactSink& published) {
  if (!retirement) throw std::invalid_argument("prediction preview retirement authority is unavailable");
  if (!retirement->admission_open()) throw contracts::UnavailableError("prediction receiver custody is unobservable");
  return impl_->resources.Run(
-  [this, &progress, &products, &gate, stop, operation, maximum, &current_context, &retirement](const mmltk::backend::ml::runtime::BorrowedCommandStream stream) mutable {
+  [this, &progress, &products, &gate, stop, operation, maximum, &current_context, &retirement, &published](const mmltk::backend::ml::runtime::BorrowedCommandStream stream) mutable {
    operation.device_id = impl_->resources.device();
    std::shared_ptr<const mmltk::backend::data::catalog::ClassCatalog> classes;
    int class_count = 0;
@@ -102,6 +103,7 @@ contracts::ComputeTerminal CudaPredictRuntime::Run(mmltk::backend::models::rfdet
        if (progress) progress({++sequence, decoded, total, "Decoded"});
       },
     });
+   if (!result.cancelled && !operation.output_path.empty() && published) published(operation.output_path);
    return contracts::make_compute_terminal(result.cancelled ? contracts::ComputeOperationOutcome::Cancelled : contracts::ComputeOperationOutcome::Succeeded, 0U, result.processed_images,
     result.cancelled ? std::string{} : operation.output_path.string());
   },
@@ -177,6 +179,20 @@ public:
       if (stop.stop_requested()) return [this, generation] { Settled(contracts::make_compute_terminal(contracts::ComputeOperationOutcome::Cancelled, generation)); };
       auto request = subsystems::system::ComputeIntentMaterializer::Predict(settings, inspection, selection);
       if (!request) throw contracts::InvalidIntentError(request.error().detail);
+      if (stop.stop_requested()) return [this, generation] { Settled(contracts::make_compute_terminal(contracts::ComputeOperationOutcome::Cancelled, generation)); };
+      if (request->source_kind == mmltk::backend::models::rfdetr::PredictSourceKind::ImageFiles &&
+          !std::filesystem::is_regular_file(request->image_inputs.front().image_path)) throw contracts::InvalidIntentError("prediction image is not a readable regular file");
+      if (request->source_kind == mmltk::backend::models::rfdetr::PredictSourceKind::VideoFile &&
+          !std::filesystem::is_regular_file(request->video_path)) throw contracts::InvalidIntentError("prediction video is not a readable regular file");
+      const auto& output = settings.workflows.predict.output;
+      const auto directory = services::reserve_run_output(contracts::workflow_output_root(output, contracts::FeatureId::Predict), !output.automatic);
+      if (!request->output_path.empty()) request->output_path = directory / request->output_path.filename();
+      {
+       std::scoped_lock lock(mutex_);
+       state_.operation.output.directory = directory.string();
+       if (const auto revision = detail::PredictRevision::Progress(state_.revision, state_.operation.terminal.outcome == contracts::ComputeOperationOutcome::CancellationRequested)) state_.revision = *revision;
+      }
+      Publish(PredictChanged{snapshot()});
       const bool initial_runtime = !runtime_;
       if (!runtime_) runtime_ = factory_();
       if (!runtime_) throw std::runtime_error("prediction runtime factory returned no runtime");
@@ -195,7 +211,7 @@ public:
         std::unique_lock context_lock(preview_context_mutex_, std::try_to_lock);
         return context_lock.owns_lock() ? preview_context_ : std::nullopt;
        },
-       preview_retirement_);
+       preview_retirement_, [this](const auto& path) { Artifact(path); });
       // Native source failures already fail RunAndWrite. Optional receiver
       // failure seals custody without changing a completed semantic result.
       if (runtime_->HasUnsafeCustody()) RetireRuntime();
@@ -419,6 +435,15 @@ private:
    preview_context_.reset();
   }
   PreviewFailed(visual_failure_detail(failure, "prediction rendering failed"));
+ }
+ void Artifact(const std::filesystem::path& path) {
+  {
+   std::scoped_lock lock(mutex_);
+   if (state_.operation.output.artifacts.size() == contracts::kWorkflowArtifactCapacity) throw std::runtime_error("prediction artifact publication capacity exhausted");
+   state_.operation.output.artifacts.push_back(path);
+   if (const auto revision = detail::PredictRevision::Progress(state_.revision, state_.operation.terminal.outcome == contracts::ComputeOperationOutcome::CancellationRequested)) state_.revision = *revision;
+  }
+  Publish(PredictChanged{snapshot()});
  }
  void Settled(contracts::ComputeTerminal terminal) noexcept {
   PredictSnapshot changed;

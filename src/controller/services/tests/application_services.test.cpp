@@ -1076,7 +1076,7 @@ TEST_CASE("file dialog selected results require an owned bounded nonempty path",
 }
 TEST_CASE("workflow path dialogs are projected from controller member paths", "[gui][services][dialogs]") {
  const auto entries = mmltk::controller::services::file_dialog_catalog().entries();
- for (const auto path : {"workflows.validate.request.compiled_path", "workflows.train.request.output_dir", "workflows.train.request.resume_path", "workflows.predict.source.compiled_path",
+ for (const auto path : {"workflows.validate.request.compiled_path", "workflows.train.output.directory", "workflows.train.request.resume_path", "workflows.predict.source.compiled_path",
        "workflows.predict.source.single_image_path"}) {
   const auto found = std::ranges::find_if(entries, [path](const auto& entry) { return entry.field_path.view() == path; });
   REQUIRE(found != entries.end());

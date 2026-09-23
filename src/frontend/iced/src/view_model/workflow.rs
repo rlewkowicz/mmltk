@@ -276,7 +276,7 @@ impl TrainingOutput {
         train: &crate::generated::TrainViewState,
         dialog_generation: Option<u64>,
     ) {
-        self.settings = Some((train.autooutput, train.request.outputdir.clone()));
+        self.settings = Some((train.output.automatic, train.output.directory.clone()));
         if let Some(generation) = dialog_generation {
             self.dialog_generation = generation;
         }
@@ -301,7 +301,7 @@ impl TrainingOutput {
         browse: Option<u64>,
     ) -> bool {
         let changed = self.settings.as_ref().is_none_or(|(automatic, path)| {
-            *automatic != train.autooutput || *path != train.request.outputdir
+            *automatic != train.output.automatic || *path != train.output.directory
         });
         let explicit = self.settings.is_some()
             && browse.is_some_and(|generation| generation != self.dialog_generation);
@@ -309,19 +309,19 @@ impl TrainingOutput {
             return false;
         }
         let bootstrap = self.settings.is_none();
-        self.settings = Some((train.autooutput, train.request.outputdir.clone()));
+        self.settings = Some((train.output.automatic, train.output.directory.clone()));
         if let Some(generation) = browse {
             self.dialog_generation = generation;
         }
         let native_live = native.is_some_and(|snapshot| {
             snapshot.activity != crate::generated::TrainingActivity::Idle
-                || !snapshot.outputdirectory.is_empty()
+                || !snapshot.local.output.directory.is_empty()
         });
-        if !train.autooutput
-            && !train.request.outputdir.is_empty()
+        if !train.output.automatic
+            && !train.output.directory.is_empty()
             && (explicit || !bootstrap || !native_live)
         {
-            self.select_saved(train.request.outputdir.clone());
+            self.select_saved(train.output.directory.clone());
         } else {
             self.live();
         }
@@ -1404,11 +1404,11 @@ mod training_history_tests {
             .settingsstate
             .workflows
             .train;
-        train.autooutput = false;
-        train.request.outputdir = "/configured".into();
+        train.output.automatic = false;
+        train.output.directory = "/configured".into();
         for active in [false, true] {
             let mut snapshot = model.workflow.training.clone().unwrap();
-            snapshot.outputdirectory = "/configured/run-0002".into();
+            snapshot.local.output.directory = "/configured/run-0002".into();
             if active {
                 snapshot.activity = crate::generated::TrainingActivity::Local;
             }

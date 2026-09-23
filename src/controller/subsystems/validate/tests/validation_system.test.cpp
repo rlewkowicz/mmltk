@@ -116,6 +116,8 @@ TEST_CASE("validation admits asynchronous selected-path inspection and cancels b
  CHECK(admitted.operation.active);
  observation->inspect_started.get_future().wait();
  CHECK(constructions == 0U);
+ CHECK(validation.snapshot().operation.output.directory.empty());
+ CHECK_FALSE(std::filesystem::exists(settings.snapshot().settings_state.workflows.validate.output.directory));
  CHECK_THROWS_AS(dataset.Compile({}), contracts::BusyError);
  static_cast<void>(validation.Stop());
  const auto terminal = settled.get_future().get();
@@ -693,3 +695,19 @@ TEST_CASE("validation semantic metrics survive optional preview refusal without 
  CHECK(runs == 1U);
 }
 }  // namespace mmltk::controller
+
+TEST_CASE("validation reports honor enablement and propagate file settlement failures", "[controller][validation][output]") {
+ namespace r = mmltk::backend::models::rfdetr;
+ mmltk::testsupport::ScopedTempDir root{"validation-report-output"};
+ r::ValidateRequest request;
+ request.report_json_path = root.path() / "report.json";
+ request.write_report_json = false;
+ r::ValidationRunResult result;
+ r::write_validation_report(request, result);
+ CHECK_FALSE(std::filesystem::exists(request.report_json_path));
+ request.write_report_json = true;
+ r::write_validation_report(request, result);
+ CHECK(std::filesystem::file_size(request.report_json_path) > 0U);
+ request.report_json_path = "/dev/full";
+ CHECK_THROWS(r::write_validation_report(request, result));
+}

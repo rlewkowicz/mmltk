@@ -499,6 +499,8 @@ void write_validation_report(const ValidateRequest& request, const ValidationRun
  std::ofstream stream(request.report_json_path);
  if (!stream) { throw std::runtime_error("failed to open RF-DETR validation report"); }
  stream << report.dump(2);
+ stream.close();
+ if (!stream) throw std::runtime_error("failed to finish RF-DETR validation report");
 }
 void print_model_metadata(const ModelInfo& info, std::size_t images, std::size_t categories, ValidationLogMode log_mode) {
  if (log_mode != ValidationLogMode::Interactive) return;

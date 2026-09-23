@@ -2,6 +2,7 @@ module;
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <span>
@@ -28,6 +29,7 @@ struct RfdetrRuntimeBackendOptions final {
  bool allow_fp16 = true;
  std::shared_ptr<const ClassArtifactAdmission> admission{};
  std::stop_token stop{};
+ std::function<void(const std::filesystem::path&)> artifact_published;
 };
 enum class InferenceArtifactKind : std::uint8_t {
  Weights,
@@ -94,5 +96,5 @@ private:
 [[nodiscard]] ModelInfo inspect_tensorrt_model(const ModelArtifactRequest& artifacts, int device_id, std::stop_token stop = {});
 void build_tensorrt_engine(const BuildEngineRequest& request);
 void build_tensorrt_engine(
- const BuildEngineRequest& request, mmltk::backend::ml::runtime::BorrowedCommandStream command_stream, std::shared_ptr<const ClassArtifactAdmission> admission = {}, std::stop_token stop = {});
+ const BuildEngineRequest& request, mmltk::backend::ml::runtime::BorrowedCommandStream command_stream, std::shared_ptr<const ClassArtifactAdmission> admission = {}, std::stop_token stop = {}, const std::function<void(const std::filesystem::path&)>& published = {});
 }  // namespace mmltk::backend::models::rfdetr

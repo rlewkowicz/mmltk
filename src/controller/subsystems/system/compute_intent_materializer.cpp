@@ -94,7 +94,7 @@ std::expected<ComputeIntentMaterializer::ModelInput, ComputeIntentMaterializer::
 std::expected<mmltk::backend::models::rfdetr::TrainRequest, ComputeIntentMaterializer::Refusal> ComputeIntentMaterializer::LocalTrain(
  const mmltk::controller::contracts::GuiSettingsState& settings, const mmltk::controller::contracts::ArtifactInspection& artifact, const mmltk::controller::contracts::ModelSelection& model) noexcept {
  auto request = settings.workflows.train.request;
- if (settings.workflows.train.auto_output) request.output_dir = "./gui-train-output";
+ request.output_dir = mmltk::controller::contracts::workflow_output_root(settings.workflows.train.output, mmltk::controller::contracts::FeatureId::Train);
  const auto selected = require_model(settings, mmltk::controller::contracts::FeatureId::Train, model);
  if (!selected) return std::unexpected(selected.error());
  const auto training = current_training_split(settings, artifact);
@@ -130,6 +130,7 @@ std::expected<mmltk::backend::models::rfdetr::TrainRequest, ComputeIntentMateria
 ComputeIntentMaterializer::ValidationMaterialization ComputeIntentMaterializer::Validation(
  const mmltk::controller::contracts::GuiSettingsState& settings, const mmltk::controller::contracts::ArtifactInspection& artifact, const mmltk::controller::contracts::ModelSelection& model) noexcept {
  auto request = settings.workflows.validate.request;
+ request.report_json_path = "report.json";
  const auto selected = require_model(settings, mmltk::controller::contracts::FeatureId::Validate, model);
  if (!selected) return std::unexpected(selected.error());
  const auto compiled = current_artifact_split(artifact, mmltk::controller::contracts::resolve_validation_source(settings), "selected validation artifact is unavailable");
@@ -156,7 +157,7 @@ ComputeIntentMaterializer::ExportMaterialization ComputeIntentMaterializer::Expo
   mmltk::backend::models::rfdetr::BuildEngineRequest request{};
   auto& output = static_cast<mmltk::backend::models::rfdetr::ModelArtifactOutputRequest&>(request);
   assign_model_artifact(output, model);
-  assign_export_output_facts(output, state, state.output_path);
+  assign_export_output_facts(output, state, "model.engine");
   request.allow_fp16 = state.allow_fp16;
   try {
    mmltk::backend::models::rfdetr::validate_build_engine_request(request);
@@ -167,7 +168,7 @@ ComputeIntentMaterializer::ExportMaterialization ComputeIntentMaterializer::Expo
  mmltk::backend::models::rfdetr::ExportOnnxRequest request{};
  auto& output = static_cast<mmltk::backend::models::rfdetr::ModelArtifactOutputRequest&>(request);
  assign_model_artifact(output, model);
- assign_export_output_facts(output, state, state.onnx_output_path.empty() ? std::filesystem::path{model.artifact}.replace_extension(".onnx") : std::filesystem::path{state.onnx_output_path});
+ assign_export_output_facts(output, state, "model.onnx");
  // CLEANUP-IGNORE: ONNX export validation consumes fields distinct from the TensorRT branch above.
  request.opset_version = state.opset_version;
  request.simplify = state.simplify;
@@ -183,6 +184,7 @@ ComputeIntentMaterializer::ExportMaterialization ComputeIntentMaterializer::Expo
 ComputeIntentMaterializer::PredictionMaterialization ComputeIntentMaterializer::Predict(
  const mmltk::controller::contracts::GuiSettingsState& settings, const mmltk::controller::contracts::ArtifactInspection& artifact, const mmltk::controller::contracts::ModelSelection& model) noexcept {
  auto request = settings.workflows.predict.request;
+ request.output_path = settings.workflows.predict.write_report_json ? "predictions.json" : "";
  const auto selected = require_model(settings, mmltk::controller::contracts::FeatureId::Predict, model);
  if (!selected) return std::unexpected(selected.error());
  request.compiled_path.clear();

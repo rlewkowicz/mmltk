@@ -15,6 +15,7 @@
 #include "mmltk/frameworks/reflection/materializer.h"
 #include "src/controller/contracts/terminal_presentation.h"
 #include "src/controller/contracts/workflows.h"
+#include "src/controller/contracts/workflow_output.h"
 #include "src/frameworks/serialization/serialization.h"
 namespace mmltk::controller::contracts {
 inline constexpr std::size_t kComputeStatusCapacity = std::size_t{4U} * 1024U;
@@ -91,6 +92,7 @@ struct ComputeUiState final {
  [[= reflection::OperationStateField{reflection::OperationStateSemantic::Active}]] bool active = false;
  [[= reflection::OperationStateField{reflection::OperationStateSemantic::Progress}]] ComputeProgress progress{};
  [[= reflection::OperationStateField{reflection::OperationStateSemantic::Terminal}]] ComputeTerminal terminal{};
+ WorkflowOutputFacts output{};
  bool operator==(const ComputeUiState&) const = default;
 };
 // Value transitions only. The caller owns admission, locking and publication.
@@ -99,6 +101,7 @@ inline void begin_compute(ComputeUiState& state, std::uint64_t generation, std::
  state.generation_frontier = generation;
  state.active = true;
  state.progress = {};
+ state.output = {};
  state.terminal = std::move(terminal);
 }
 inline void cancel_compute(ComputeUiState& state) {

@@ -1,4 +1,5 @@
 #pragma once
+#include <filesystem>
 #include <memory>
 #include <optional>
 #include <stop_token>
@@ -7,6 +8,7 @@
 namespace mmltk::controller {
 struct ValidationRuntimeResult final {
  contracts::ComputeTerminal terminal{};
+ std::filesystem::path report;
  std::optional<mmltk::backend::models::rfdetr::ValidationBackendResult> evaluation{};
 };
 class ValidationRuntime {
