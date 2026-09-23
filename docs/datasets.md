@@ -334,7 +334,9 @@ It shares the compiled layout, resizer, and loader described here.
 [Built-in benchmark datasets](benchmark-datasets.md) owns recipe membership,
 native import and physical provenance, persistent archive/JPEG/index reuse,
 optional original-annotation mask recovery, bounded archive/image repair,
-progress units, partial downloads, and cache-format limits.
+overlapping acquisition/labels/pixels, independent progress, partial downloads,
+and cache-format limits. The [progress reference](benchmark-datasets.md#reading-compilation-progress)
+also defines Directory compilation's image counts and unnecessary acquisition.
 Use [Dataset controls](gui-interaction.md#dataset-compilation-controls) for GUI
 selection and [benchmark cache selection](commands.md#benchmark-cache-selection)
 for wrapper/CLI configuration.
@@ -344,8 +346,8 @@ for wrapper/CLI configuration.
 Compilation and GPU augmentation each expose an independent
 `perceptual_downscale` setting, false by default. RF-DETR CLI compilation uses
 `--perceptual-downscale`, also exposed by root `compile`; training augmentation
-uses `--aug-perceptual-downscale` alongside enabled GPU augmentation. The normal
-resizing path and its pixels remain unchanged when the option is off.
+uses `--aug-perceptual-downscale` alongside enabled GPU augmentation. The
+ordinary resizing policy applies when the option is off.
 The option affects shrinking RGB pixels, not categorical masks, boxes, class
 identity, selected resize geometry, or compiled record layout.
 
@@ -358,6 +360,23 @@ with explicit byte strides and capacities. sRGB is decoded once, the filter
 works in linear-light Y/Cb/Cr, and the output is encoded once. RGBA filtering
 uses premultiplied linear color and area-averaged alpha, with safe
 unpremultiplication. Nonfinite/out-of-range float samples clamp deterministically.
+
+CPU moment accumulation uses AVX2/FMA across eight neighboring output cells for
+both integer and fractional shrink ratios. Fractional lanes retain their own
+footprint weights, scalar row-major traversal, and compensated sums; completed
+lanes retain both sum and compensation unchanged. Short rows and tails use the
+same scalar method. Packed RGB reads stay within their three-byte pixels and
+never consume row padding. Checked RGB8, RGBA8, and planar float layouts share
+these rules.
+
+Ordinary CPU shrinking and enlargement use the existing
+[AVIR float4 SSE backend](../third_party/avir/avir_float4_sse.h). Its signed
+half-integer rounding follows the scalar float policy without changing the
+thread's rounding mode. Resampling fixtures compare the selected SIMD path
+against scalar AVIR output within one RGB8 level; identity copies remain exact.
+Each compiler worker retains its own resizer and scratch, and resizing creates
+no nested worker pool. These execution choices apply to both compilers without
+changing mask geometry or the compiled format.
 
 The checked downscale operation rejects enlargement and overlapping nonidentity
 views; an identity copy is exact. The ordinary CPU resize entrypoint retains

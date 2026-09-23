@@ -14,6 +14,13 @@ Explore**. [navigation.rs](../src/frontend/iced/src/view/navigation.rs) owns
 that visual order; ordinary workflow traversal derives from it, excluding
 Explore.
 
+The destination page owns foreground source selection. Navigating directly from
+Validate to Explore restores Explore's native product even when Validation
+retains results or later publishes another update. A retained Upscale request
+survives only when it belongs to that destination's viewer. Dataset readiness
+and drawable-image readiness remain separate, as described under
+[gallery restoration](#explore-gallery-and-displayed-geometry).
+
 The [page canvas](../src/frontend/iced/src/view/mod.rs) is at least 1020 logical
 pixels wide and centers a page of at most 1500 logical pixels. A narrower
 window exposes horizontal scrolling, with space reserved for its scrollbar so
@@ -103,7 +110,8 @@ and native admission. The accepted native request captures those settings for
 the entire operation. While compilation is active, the two recipe radios,
 three validation radios, and recovery checkbox are disabled; the other Dataset
 controls keep their existing enablement rules. The action becomes **Cancel compilation**, using
-the Dataset system's Stop operation. Progress uses native
+the Dataset system's Stop operation. Progress shows separate **Acquisition**,
+**Labels/masks**, and **Pixels** tracks plus benchmark source details, using native
 [acquisition and output facts](benchmark-datasets.md#reading-compilation-progress),
 and completion, cancellation, or failure comes from the native terminal result.
 
@@ -171,11 +179,18 @@ the current selected sample; Annotation captures the exact displayed sample and
 view at dispatch. Annotation receives the sample's ground truth, including
 masks; detections remain a Validation viewer overlay.
 
-Validation's atlas and detail panel have **GT labels** and **Det labels**
-checkboxes. Each controls its entire ground-truth or detection layer—text,
+Validation's atlas and detail panel have **Groundtruth** and **Detections**
+groups. Each group checkbox controls its entire ground-truth or detection layer—text,
 boxes, and masks—while retaining that layer's finer Labels/Masks/Boxes choices.
 Fine label toggles stay local to Iced; layer and box/mask changes request native
 composition from retained products.
+
+The atlas groups sit beneath the preview half, leaving the metrics half clear.
+Shared viewer controls preserve natural text and control sizes and wrap complete
+groups with 20 logical pixels between them. Explore uses the same spacing
+between its Fit/Original and overlay groups. While Validation detail is open,
+the hidden atlas controls retain their measured footprint without exposing
+duplicate widget identities or input, so opening the modal preserves page bounds.
 
 For one class, GT RGB is `255 - Det RGB` per channel, preserving the established
 alpha. Overlapping native masks and box outlines use Direct Addition / Linear
@@ -194,6 +209,30 @@ captions. Prepared colors, contrast, text, and paragraphs are shared by retained
 draws; an upscale projects their bounds with the derived image. Combined
 diagnostic visits retain the original sample/label order independently of paint
 layer order.
+
+### Display confidence
+
+Validate's Advanced card contains **Display confidence** with **Preview only**
+help text. It accepts a finite value in `[0, 1]`, defaults to `0.4`, and uses the
+shared 450 ms settings debounce. Typed decimals such as `0.437` keep their
+entered precision within the native `float` representation; there is no 0.01
+quantization or button, wheel, or arrow-key increment. Empty or out-of-range
+input does not replace the last accepted setting. The
+[numeric editor](#numeric-editing) retains partial decimal text through view
+rebuilds.
+
+The canonical [ValidationDisplaySettings](../src/controller/contracts/validation_display.h)
+persists at `workflows.validate.display`, separately from `ValidateRequest`.
+Changing it recomposes retained atlas/detail detections whose score is greater
+than or equal to the threshold. It applies to detection labels, boxes, and
+masks; ground truth, raw retained predictions, inference, metrics, reports, and
+ground-truth import are unaffected. Lowering it can reveal the same retained
+detections without another evaluation.
+
+`ValidationImageMetadata.display` records the setting used for that completed
+image. Native overlays and Iced captions follow those paired facts, so a pending
+edit cannot filter the captions of an older displayed image with a newer
+threshold. Settings settlement and display completion remain independent.
 
 ## Original view and annotation import
 
@@ -347,6 +386,12 @@ retains its text-input and modifier child trees through diff and layout.
 Layout and widget operations share the modifier construction and reconcile
 existing child state, including row/column changes driven by padding. This
 preserves focus, selection, and editing state under the application policy above.
+It also retains incomplete or equivalent numeric spellings such as an empty
+string, `0.`, and `0.40` across unrelated rebuilds while the accepted value is
+unchanged. A different authoritative value replaces that retained edit; rejected
+numbers restore the accepted text. Validation's
+[typed decimal field](#display-confidence) additionally disables arrow-key
+increments.
 
 ## Typed application boundary
 
@@ -674,11 +719,13 @@ cache, tile geometry, priority, and physical atlas rules. The GUI includes every
 partially visible row in demand. Its measured viewport may alternate between
 N and N+1 rows while card raster extent remains unchanged.
 
-Native dataset readiness and a drawable atlas are independent. While a ready,
-nonempty gallery has no paired image and no active native work or failure, a
-pending restoration shows **Restoring gallery**. A presentation selection that
-cannot be admitted or returns failure shows **Gallery unavailable**. Logical
-match counts and the retained scroll row remain available. The gallery keeps
+Native dataset readiness and a drawable atlas are independent. A ready,
+nonempty gallery without a paired image shows **Preparing visible tiles** while
+native work or tile readiness is pending, otherwise **Restoring gallery**.
+A presentation selection that cannot be admitted or returns failure shows
+**Gallery unavailable**; an actual Explore failure retains its own error.
+The settled logical status is **Dataset ready**. Logical match counts and the
+retained scroll row remain available. The gallery keeps
 its GPU/input surface mounted beneath the status overlay, so graphics binding
 can establish the first or replacement image without waiting for an already
 displayed atlas.
@@ -704,6 +751,9 @@ do not submit gallery viewport changes while Detail is open. Returning to
 Gallery reconciles the retained measurement through the ordinary native-state
 event path, including repeated landscape-to-portrait and portrait-to-landscape
 changes, without requiring another resize or scroll.
+The first usable measurement also wakes a pending Open. A zero-capacity
+measurement leaves that request pending until usable geometry arrives; it does
+not require a second click or an unrelated native event.
 
 Explore retains independent completed gallery and detail handles in its shared
 output pool. An unchanged return selects the real retained gallery product
@@ -753,6 +803,10 @@ image's captions.
 
 Select, Next, Previous, and Close cancel the departed detail viewer's derived
 request while retaining the last displayed GPU frame for replacement.
+While another Explore request settles, Next/Previous accumulate a bounded net
+offset modulo the matching-image count. Opposite clicks cancel pending movement;
+explicit selection or Close clears it. The ordinary typed navigation route
+consumes the remaining movement after admission becomes available.
 Explicit route departure or component teardown retires its display custody.
 Transforms use component identity and paired image geometry. An accepted
 Original content preference stays with the same image through route changes

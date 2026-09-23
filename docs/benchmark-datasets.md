@@ -185,6 +185,52 @@ val2017 annotations. Cancellation, allocation/capacity failures, local file or
 I/O failures, and staging/publication failures remain fatal to the operation;
 they are not converted into optional-source omissions.
 
+## Overlapping acquisition, labels, and pixels
+
+The [compiler](../src/backend/data/benchmark_compiler.cpp) fixes selected split
+membership and reserves pixel storage before final labels are available.
+Acquisition, annotation preparation, and pixel compilation can then advance
+independently, subject to their actual input dependencies and one compile-wide
+CPU budget. Completion order does not change recipe membership, annotation
+order, or the final compiled image order.
+
+Coco custom prepares independent annotation sources while COCO image archives
+are acquired. An available archive can be inspected and extracted while another
+transfer is pending. Each settled source group can prepare its labels while
+later sources are still being acquired; admitted cached images can compile
+pixels while label work continues. Objects365's sampled shards still settle
+before that source's label plan chooses its available membership.
+
+COCONut acquires annotation inputs alongside physical archive inventories.
+Each managed release lane retains its own lifecycle lease through metadata and
+mask import. The metadata receiver can consume a ready release while another
+lane is acquiring inputs, waiting for its lease, or importing masks. Complete
+physical inventories still establish image joins, and the reconciled metadata
+establishes split membership before pixel slots are reserved. Full mask
+normalization can overlap selected-image extraction and pixel compilation.
+Warm components retain their admitted normalized data across the metadata and
+full-label handoff instead of reopening the same product.
+
+The [download boundary](../src/backend/data/detail/benchmark_download.h) returns
+typed durable artifact results; [image readiness](../src/backend/data/detail/benchmark_images.h)
+is emitted only after admitted cache reuse or an atomic image write. Queued and
+active pixel work retain the source generation's lease until their reads settle.
+[BenchmarkCompilePipeline](../src/backend/data/benchmark_pipeline.cpp) registers
+one slot per selected physical image before admission, ignores duplicate
+readiness, and queues those retained slots without per-image task allocations.
+Its consumers block on notifications. A single-worker compilation handles pixel
+readiness inline.
+
+Acquisition, parsing, decompression, cache writers, and pixel lanes receive
+bounded portions of the eligible CPUs. Each pixel lane owns reusable decoder
+and [resizer scratch](datasets.md#optional-perceptual-downscaling), with no nested
+resizer thread pool. [BenchmarkSplitWriter](../src/backend/data/benchmark_writer.cpp)
+retains successful pixel slots through final label preparation and compatible
+repair. It validates final source dimensions, metadata, masks, and persisted
+sections before publication. Failure or cancellation retires queued custody
+and joins active readers before their source generation or staged output can
+be replaced or destroyed.
+
 ## Persistent cache and publication
 
 Source-image validation and decoding recognize JPEG or PNG from the encoded
@@ -243,12 +289,15 @@ same release. Ordinary successful cache reuse still performs no routine hash.
 Repairs execute under the shared physical cache lease. They invalidate affected
 proofs and corrupt artifacts/JPEGs, retain unrelated valid JPEGs, and rebuild
 dependent inventories/labels at the compiler's preparation boundary after
-workers settle. COCONut's physical archive owner permits at most three structural
-admissions per archive across that recovery. COCONut never converts exhausted
-recovery into silent image loss; Coco custom retains its established quarantine
-behavior. Exhausted recovery includes the underlying failure and available image
-ID. Opt-in `benchmark.images.validation_failed` records include the archive
-member, source/shard, image ID, encoded byte count, and rejection reason.
+affected readers settle. Completed pixels from unaffected source generations
+remain reusable; repaired sources explicitly withdraw their completed pixel
+and annotation contributions. COCONut's physical archive owner permits at most
+three structural admissions per archive across that recovery. COCONut never
+converts exhausted recovery into silent image loss; Coco custom retains its
+established quarantine behavior. Exhausted recovery includes the underlying
+failure and available image ID. Opt-in `benchmark.images.validation_failed`
+records include the archive member, source/shard, image ID, encoded byte count,
+and rejection reason.
 
 [CocoAnnotationCache](../src/backend/data/detail/benchmark_annotation_cache.h)
 is the shared stock-annotation admission owner for Coco custom, Coconut's
@@ -299,42 +348,57 @@ product facts.
 
 ## Reading compilation progress
 
-[ProgressReporter](../src/backend/data/benchmark_progress.cpp) owns coherent
-phase, current-source, byte, image, and retry observations. Current source means
-the latest observed work during concurrent acquisition; it is not an exclusive
-scheduler owner. The artifact adapter preserves explicit global activity when
-no current source is selected. The GUI renders those facts through its existing
-artifact progress view.
+[DatasetCompileTracks](../src/backend/data/dataset_compile_progress.h) declares
+three independent tracks shared by benchmark and Directory compilation. Each
+has completed work, a known/unknown total, activity, active/completed state, and
+explicit invalidated work. The native declaration also supplies generated Rust;
+the GUI and CLI display the same facts.
 
-| Fact | Meaning |
+| Track | Benchmark units and completion |
 | --- | --- |
-| Downloading completed/total | Aggregated artifact bytes for the acquisition scope; any observed unknown-size contribution keeps the total unknown |
-| Extracting completed/total | Each participating source with a known denominator or completion contributes one million units; resolved-image counts take precedence over byte counts |
-| Current activity | Source, archive/artifact, operation, actual bytes and known total or explicit unknown-total text, with attempt/resume/re-download context |
-| Source image counts | Resolved selected images, including permitted quarantine outcomes; successful cache writes report only after physical writes settle |
-| Projected output bytes | Planned compiled-output upper bound used for storage admission, not bytes already written |
-| Pixels completed/total | Images compiled in the current output attempt; attempt changes retain explicit restart context |
+| Acquisition | Artifact bytes transferred or admitted from cache, aggregated once per artifact; completion additionally requires the owning acquisition work to settle |
+| Labels/masks | Normalization work plus completed source/component label plans; COCONut normalization counts full-import rows, while Coco custom uses index/sampling milestones |
+| Pixels | Successfully compiled image slots across train and validation, retaining compatible completed work through preparation retries |
 
-For example, completed COCO and Open Images sources plus 170,161 resolved
-Objects365 images out of 408,551 produce
-`1000000 + floor(170161 * 1000000 / 408551) + 1000000 = 2416498`
-out of `3000000`. This plateau identifies remaining Objects365 acquisition.
-It alone establishes neither deadlock nor external network liveness; archive
-byte progress can advance while the resolved-image fraction is unchanged.
+Label totals can grow when final plans become known; they are work units, not
+image counts or a time estimate. COCONut metadata-only preparation does not
+count full-import rows a second time. Directory compilation shows Acquisition
+as **unnecessary**, with a known `0 / 0`; its labels and pixels each count
+completed images. A completed acquisition track can coexist with active labels
+and pixels. All three completing still leaves validation, sync, and atomic
+publication to settle before the operation succeeds.
+
+[ProgressReporter](../src/backend/data/benchmark_progress.cpp) owns benchmark
+observations and compile-scoped artifact/indexing ledgers. An observed artifact
+with an unknown size makes its source and aggregate byte totals unknown; the
+GUI shows `?` and omits a determinate bar for that track. Totals can change as
+new artifacts are observed. The overall phase and current activity describe
+the latest observed work, not the only running lane.
+
+Per-source rows retain actual bytes, resolved/selected images, retry counts,
+cache reuse, resume, and invalidated-image facts. Resolved images include
+permitted quarantine outcomes; successful cache-write observations follow
+physical write settlement. Projected output bytes are a storage-admission
+bound, not bytes already written. After failure or cancellation, unfinished GUI
+tracks remain **incomplete** rather than showing successful completion.
 
 Fresh, resumed, retried, and re-downloaded transfers report bytes actually
 written. A resumed transfer distinguishes retained bytes from its new work.
 Segmented downloads add in-flight written bytes to durable completed ranges;
 the preallocated `.part` file length is not a transfer counter. `.part.json`
 retains resume identity and range progress. Range rejection or discarded
-attempt work can deliberately roll progress back. Source contributions are
-replaced rather than added twice, and extraction retry withdrawal is explicit.
-Unknown totals remain open-ended until the downloader establishes an exact size.
+attempt work can deliberately roll progress back. The compile-owned ledgers
+replace an artifact or release contribution rather than adding retries twice.
+Repair withdraws affected completed work and records the invalidation; unrelated
+completed work stays counted. Unknown totals remain open-ended until the
+downloader establishes an exact size.
 
 Transfer and scan observations use existing bounded observation points.
 Enabled [benchmark traces](logging.md#benchmark-compilation-traces) expose cache,
 archive, transfer, and retry context independently of pixel probes. Diagnostic
-records do not authorize cache reuse, completion, or publication.
+records do not authorize cache reuse, readiness, completion, or publication.
+An unchanged source-image count can coexist with advancing download bytes,
+labels, or pixels; it alone establishes neither a deadlock nor network liveness.
 
 ## Cache formats and capacity
 

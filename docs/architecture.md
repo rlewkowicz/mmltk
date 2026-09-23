@@ -115,6 +115,14 @@ owns the recipe/validation/recovery vocabulary and defaults. Settings persistenc
 and generated Rust project that declaration; the Dataset component owns control
 copy, visibility, and interaction.
 
+[dataset_compile_progress.h](../src/backend/data/dataset_compile_progress.h)
+owns the shared acquisition, labels/masks, and pixel tracks plus benchmark source
+observations. `ArtifactProgress` carries those declarations directly into generated
+Rust. The [benchmark guide](benchmark-datasets.md#overlapping-acquisition-labels-and-pixels)
+locates the ordinary readiness, generation-custody, and split-writer owners;
+its [progress reference](benchmark-datasets.md#reading-compilation-progress)
+defines the units for both benchmark and Directory compilation.
+
 The shell supplies its shared `RuntimeDiagnosticTarget` to the dataset runtime
 factory. `ArtifactDatasetRuntime` retains the target by value and creates its
 borrowed artifact observer only for synchronous `Compile`. The data layer
@@ -360,6 +368,10 @@ Annotation, Predict, Validate, Live, and Upscale. Predict's implementation is in
 
 Validation adds its own retained atlas/detail producer through
 [validation_samples.cpp](../src/controller/subsystems/validate/detail/validation_samples.cpp).
+Its canonical [display settings](../src/controller/contracts/validation_display.h)
+live beside the evaluation request in settings and travel with the composed
+image metadata. The [Validation viewer](gui-interaction.md#validation-workspace-and-shared-viewer)
+owns preview controls and their interaction policy.
 Train's charts are ordinary Iced drawing and use no native image workspace.
 
 [VisualDocument](../src/controller/presentation/visual_document.h) retains

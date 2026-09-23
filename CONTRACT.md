@@ -131,7 +131,9 @@ independently of application snapshot delivery.
 Rust owns presentation state and deliberate Iced views. Typed native replies
 and events update that state; UI actions submit typed operations to the owning
 C++ systems. Component-local interaction stays local, and routing composes
-pages through domain outcomes.
+pages through domain outcomes. The destination page selects its foreground
+source and retains only viewer work belonging to that page. Dataset availability
+and completed display readiness progress independently.
 
 ## Product interface
 
@@ -168,7 +170,8 @@ upscaling, and ground-truth import into Annotation. Validation independently
 controls its complete ground-truth and detection layers, uses complementary
 class colors, adds overlapping mask/outline RGB with unchanged alpha, and paints
 detection captions after ground-truth captions. Explore retains its own palette
-and overlay behavior.
+and overlay behavior. Preview confidence filters retained detections for display
+while preserving inference, evaluation metrics, reports, and ground-truth import.
 Prediction incrementally processes compiled images, ordinary images, and local
 video, retaining the latest completed preview through completion or cancellation.
 GUI prediction uses one image per batch; video has pause, resume, and stop.
@@ -197,6 +200,10 @@ RGB independently of retained preview pixels.
 
 Built-in dataset compilation shares acquisition, persistent source caching,
 annotation normalization, and atomic output publication across recipes.
+Eligible acquisition, annotation, and pixel work overlap within one bounded
+worker budget. Readers retain immutable source generations through completion;
+repair waits for affected readers to settle, and final publication admits only
+complete, consistent output.
 Coco custom retains the established sampled benchmark recipe. COCONut admits
 its full training membership, including images without foreground instances,
 with explicit validation membership and annotation choices. Physical image
@@ -205,8 +212,9 @@ Optional COCONut recovery restores conservatively matched dropped foreground
 masks from original annotations and removes their pixels from surviving masks,
 retaining authoritative boxes and explicit recovery provenance. Carved masks
 retain their resulting visible source area.
-Progress exposes actual acquisition work and known or unknown totals; diagnostics
-observe that work independently of cache validity and completion.
+Progress independently exposes acquisition, labels/masks, and pixels with actual
+completed work, known or unknown totals, and explicit repair withdrawals.
+Diagnostics observe that work independently of cache validity and completion.
 
 Images and their annotation meaning share source identity and geometry through
 preview, augmentation, upscale, and editing. Clean pixels and native semantic

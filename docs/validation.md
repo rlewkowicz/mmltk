@@ -154,6 +154,10 @@ list. It also does not execute `cuda-vulkan`, `browser-app`, the tooling suites,
 or the profile runner. Those have separate standalone routes outside the fixed
 Final Validation gate. `gui` and `tsan` suite names are currently unavailable
 even though other GUI/development build facilities exist.
+The full product build's `--no-run` frontend checks establish that the selected
+Rust test targets compile. They do not establish execution of `browser-app`,
+its Rust tests, or its direct JavaScript tests. Report those standalone runs
+only when their route was actually executed.
 
 Some RF-DETR tests download model checkpoints and derive normalized weights,
 ONNX, and TensorRT engines in `.cache/tests/rfdetr` on first use. Hardware-gated
@@ -335,7 +339,7 @@ standalone evidence-audit cases.
 | Hardware entrypoint | Process lifetimes and required behavior |
 | --- | --- |
 | `workspace_wayland_retained` | One H2D browser: square/capacity growth, full controls including integer typing/paste, cached and held-miss gallery/detail returns, Detail-open resizing in both orientations, augmentation retention, fractional rows, circular wrap, partial final row, wide/tall layouts, local labels/native semantics, light/dark copy with shared Annotate layout and long lists, FPS, rapid changes, then SIGINT |
-| `workspace_wayland_workflows` | One H2D browser: actual Train start, live progress pixels and hidden-tab progress, chart data/selection/aspects and retained camera/legend interaction, validation metrics and six sample/detail previews, compiled/image/video prediction, Pause/Resume/EOF/Stop, light/dark and minimum-width chart pixels, then SIGINT |
+| `workspace_wayland_workflows` | One H2D browser: actual Train start, live progress pixels and hidden-tab progress, chart data/selection/aspects and retained camera/legend interaction, validation metrics and six sample/detail previews, confidence editing/filtering and responsive groups, direct Validate-to-Explore pixels, compiled/image/video prediction, Pause/Resume/EOF/Stop, light/dark and minimum-width chart pixels, then SIGINT |
 | `workspace_wayland_dpi` | One H2D browser at DPI 1.5: light/dark copy and rapid changes |
 | `workspace_wayland_terminal` | Two H2D browsers: a real window close and abrupt browser-peer loss after an Annotation edit, exact completed draw, and independent redraw |
 | `workspace_wayland_probe_recovery` | Four H2D browsers with startup-latched allocation, reset, begin, or end probe failure; exact-content recovery and complete final pixel/semantic evidence |
@@ -369,6 +373,8 @@ all three Coconut validation radios. It waits for native settings settlement,
 checks the current widget tree for expected presence and absence, verifies that
 the disabled source Browse control is inert, and restores the baseline settings.
 The ordinary Directory compile handoff then uses the existing local fixture.
+Its measured widget tree must include all three independent compile tracks,
+with Acquisition shown as unnecessary at `0 / 0`.
 This exercises the packaged selection controls without acquiring a live
 benchmark release. Browser audit cases reject missing clicks, stale visibility,
 incomplete choice coverage, and unconfirmed restoration.
@@ -412,6 +418,22 @@ progress bar, all six thumbnails, detail, each prediction source, retained Stop
 output, and theme/narrow layouts. Progress evidence pairs the bar capture with
 observed native image counts during the Train phase; hidden-tab evidence then
 requires metric sequence advancement.
+
+The same browser first opens Explore, runs Validate, and returns directly to
+Explore through normal navigation. It requires a current paired gallery draw
+and actual colored pixels inside a ready compiled-image tile. There is no
+intermediate page or extra Open action on that return. The
+[pixel record](logging.md#rendered-ui-acceptance-evidence) carries the image and
+draw identities independently of logical dataset readiness.
+
+Validation checks its default display confidence, exact `0.437` entry, retained
+value after blank/out-of-range text and arrow/wheel input, and settled `0 → 1 → 0`
+edits. Metrics and the evaluation generation must stay unchanged. With ground
+truth hidden, independent canvas comparisons require detection pixels to
+disappear at 1 and return at 0 while raw detections and clean-image identity
+remain intact. The driver also measures Groundtruth/Detections groups beneath
+the preview at ordinary and narrow widths, requires the 20-pixel group spacing
+and narrow wrapping, and observes the Advanced confidence text.
 
 The workflow fixture keeps a real six-query native detector. It calibrates its
 checkpoint against the model's actual selected proposals so detection captions
@@ -525,8 +547,8 @@ sessions retain ordinary clipboard permissions.
 | Existing target | Evidence it owns |
 | --- | --- |
 | `mmltk_controller_annotation_tests` | Independent input/render progress, normalized-run hit testing, disk cleanup against scalar support, document/history/save behavior, immutable scene reuse, complete journal moves, packed upload reuse and allocation-local damage, stable target identity through Undo/Redo, retained input pressure, ordered command continuations, fractional raster boundaries, Original crop/aspect materialization, masks beyond boxes and present-empty masks, rejection, and cancellation |
-| `mmltk_controller_services_tests` | Counter-read interruption/size/error policies, reflected named settings including benchmark choices, independent optional-test settings, training command construction, current-format saved history, bounded cursor reads, directory replacement/truncation, and output/resume admission |
-| `mmltk_controller_data_compute_systems_tests` | Start/input admission including absent or incompatible optional test splits, selected validation results and retained sample/detail custody, compact RGB8 preview transfers/reuse and failure, incremental prediction, and video playback cancellation |
+| `mmltk_controller_services_tests` | Counter-read interruption/size/error policies, reflected named settings including benchmark choices and preview-confidence defaults/repair/persistence, independent optional-test settings, training command construction, current-format saved history, bounded cursor reads, directory replacement/truncation, and output/resume admission |
+| `mmltk_controller_data_compute_systems_tests` | Start/input admission including absent or incompatible optional test splits, selected validation results and retained sample/detail custody, preview-confidence recomposition without another evaluation, compact RGB8 preview transfers/reuse and failure, incremental prediction, and video playback cancellation |
 | `mmltk_controller_browser_tests` and `mmltk_frameworks_serialization_tests` | Reflected field/enum/schema and graphics ABI facts, nested/array metric projection fixtures, package fixtures, positional output versus named persistence, named-field lookup/error precedence, exact CBOR bytes and borrowed map keys, split owned/borrowed payloads, UTF-8 block/page tails, lossless compact input, and control receipts |
 | `mmltk_frameworks_transport_tests` | Peer replacement, reconnect, output continuity, ring wrap, and transport custody |
 | `mmltk_controller_explore_tests` | Explore domain admission, settings/filter persistence, thumbnail identity, viewport priority, augmentation refresh, staged replacement, cancellation, and failure |
@@ -541,10 +563,10 @@ sessions retain ordinary clipboard permissions.
 | `mmltk_backend_imaging_explore_tests` | Rendered-card geometry, semantic planes, filtered padding fringes, and exact two-sided copy evidence |
 | `mmltk_backend_imaging_annotation_tests` | Resolved-mask foreground support, tight bounds, empty masks, and HSV filtering against independent scalar expectations |
 | `mmltk_backend_imaging_upscale_tests` | Exact Basic sharpening bytes and guards, bitwise neural tile preparation, tile stitching, ONNX capture/replay, explicit allocation-counter ownership, and separate independent raster-oracle cases |
-| `mmltk_backend_imaging_resample_tests` | Independent CPU/CUDA perceptual-resampling values, bitwise quantized planar projection and CUDA accumulator traversal, allocation-local table reuse, checked views, completion, and resource custody |
-| `mmltk_backend_imaging_raster_tests` | Pitched BGR row orientation, exact RGB8/planar-float conversion with odd extents and pitch guards, overwrite painter order and independent blended/additive behavior, and clipped flat-mask runs |
+| `mmltk_backend_imaging_resample_tests` | Independent CPU/CUDA perceptual values including fractional SIMD lanes/tails, AVIR float4/scalar comparisons and signed rounding boundaries, bitwise quantized planar projection and CUDA accumulator traversal, worker-local reuse, checked views, completion, and resource custody |
+| `mmltk_backend_imaging_raster_tests` | Pitched BGR row orientation, exact RGB8/planar-float conversion with odd extents and pitch guards, inclusive detection-confidence filtering, overwrite painter order and independent blended/additive behavior, and clipped flat-mask runs |
 | `browser-app` | Primary-action preparation, independent optional-test/output editing, generated scalar selection, bounded live/saved chart histories and gaps, camera/legend retention and plot picking cancellation, live progress availability, validation viewer and video-control admission, shared immediate mouse input and transport retention, typed state reduction, component/crop identity, retained gallery measurements and reconciliation, exact integer/filter reduction, shared layout/navigation, image metadata independent of logical snapshots, encoded/submitted draw custody, completed fallback through navigation, local labels, FPS submission counting, exact displayed gallery interaction, quiet failure receipts, and JavaScript probe/input/callback settlement |
-| `workspace-wayland` | Real training/validation/prediction workflows and actual chart/progress/sample/preview pixels, dashboard aspect/retention/wheel behavior, packaged integer typing/paste and spinner/wheel policy, Detail-open resize returns, shared Annotate layout and long-list reachability, retained sessions, native-source/browser-arena identity, negotiated direct/copy draws, recovery, and shutdown |
+| `workspace-wayland` | Real training/validation/prediction workflows and actual chart/progress/sample/preview pixels, confidence editing/pixel filtering, Validation group placement/wrapping, direct Validate-to-Explore atlas pixels, dashboard aspect/retention/wheel behavior, packaged integer typing/paste and spinner/wheel policy, Detail-open resize returns, shared Annotate layout and long-list reachability, retained sessions, native-source/browser-arena identity, negotiated direct/copy draws, recovery, and shutdown |
 
 RF-DETR backend evidence is separately owned by the core evaluator/matcher/class
 layout cases, training checkpoint/continuation/EMA/telemetry and native image-count
@@ -585,12 +607,17 @@ source while Annotation import retains the exact drawn source, crop, and target
 extent. They verify shared paired caption colors and referenced-category
 membership, separated GT/Det collections, actual texture-view binding reuse and
 retirement, borrowed pending filter presentation, and redraw input cancellation.
+They also exercise destination-owned foreground routing from every page with
+and without retained Validation results, a first gallery measurement waking
+pending Open, bounded pending Next/Previous movement, paired preview-confidence
+caption filtering, exact debounced decimal edits, and responsive control groups.
 The iced_plot shader case compares every RGBA pixel against the prior three-pass
 sequence for fractional and opaque alpha, with separate fixed opaque-color,
 painter-order, and clip-guard checks. Plot cases also cover caption reconciliation
 after camera changes and quiet unchanged redraws. The selected iced_aw library
 cases exercise retained numeric-input trees, exact editing, focus/selection,
-button/wheel policy, and selection-list behavior.
+partial decimal spellings across rebuilds, button/wheel/typed-only arrow policy,
+and selection-list behavior.
 
 Use `--test all --executable TARGET` for targets not owned by a narrower suite.
 The source/CMake registrations and wrapper inventory define executable
@@ -607,8 +634,8 @@ behavior independently of rendered UI acceptance:
 
 | Owner | Evidence |
 | --- | --- |
-| [benchmark_dataset.test.cpp](../src/backend/data/tests/benchmark_dataset.test.cpp), `mmltk_backend_data_tests` | Cache-root precedence and staging/publication overlap, completed-group and individual-JPEG reuse, ordered write/source progress, explicit retry withdrawal, durable segmented resume, ordinary/unknown-total downloads, range fallback, cancellation, lazy diagnostics, and typed storage failure |
-| [coconut_dataset.test.cpp](../src/backend/data/tests/coconut_dataset.test.cpp), same target | Pinned recipe selection, all validation choices, independent exact-mask expectations, empty images, physical/release joins, canonical member paths, fixed inventory bytes, format limits, cross-recipe cache reuse, scoped physical recovery, stock normalized-cache reuse without raw metadata, and unchanged prior publication on failure/cancellation |
+| [benchmark_dataset.test.cpp](../src/backend/data/tests/benchmark_dataset.test.cpp), `mmltk_backend_data_tests` | Cache-root precedence and staging/publication overlap, completed-group and individual-JPEG reuse, typed artifact/image readiness, pixels during held labels/acquisition, single-worker execution, source-lease retirement, startup/failure unwinding, independent progress and retry withdrawal, durable segmented resume, unknown-total downloads, lazy diagnostics, and typed storage failure |
+| [coconut_dataset.test.cpp](../src/backend/data/tests/coconut_dataset.test.cpp), same target | Pinned recipe selection, all validation choices, exact masks and physical/release joins, empty images, canonical paths/inventory bytes, cross-recipe reuse, immutable cold/partial/warm admissions, ready metadata during held masks/leases, aggregate indexing through repair, stock cache reuse, and unchanged prior publication on failure/cancellation |
 | [application_compute_services.test.cpp](../src/controller/subsystems/system/tests/application_compute_services.test.cpp), `mmltk_controller_data_compute_systems_tests` | Environment cache selection and staged/final output overlap through the artifact service, retained choices through materialization, and real HTTP progress projected into bounded artifact activity at an unchanged image fraction |
 | [dataset_system.test.cpp](../src/controller/subsystems/system/tests/dataset_system.test.cpp), same target | Explicit compile captures settled choices, later settings edits preserve the admitted request, owned diagnostics survive runtime reconstruction and stop/join, open-ended/recovered progress remains valid, and malformed progress is rejected |
 | [dataset_wiring.test.cpp](../src/controller/shell/tests/dataset_wiring.test.cpp), `mmltk_controller_shell_tests` | Production shell/factory propagation of enabled and disabled diagnostics through the staged compiler path |
@@ -631,6 +658,16 @@ fatal local parser/archive/publication failures. Current counts come from
 admitted recovery products, independently of historical failure-report lines.
 Dataset-system cases capture the recovery choice with the other settled compile
 settings, and later edits leave the admitted operation unchanged.
+
+Pipeline cases hold a specific source, label, mask, or reader boundary and
+require independent eligible work to complete before releasing it. They cover
+duplicate readiness under queue pressure, retained pixels after quarantine,
+compatible pixel reuse through repair, release-reader retirement, and staged
+output capacity. These causal fixtures establish overlap and bounded custody;
+they do not measure production-release throughput or live-download duration.
+Progress cases retain one artifact/release contribution across interleaving,
+repair, and preparation replacement, with explicit withdrawals instead of
+counting repeated attempts as completed work.
 
 For standalone focused selection outside the Final Validation gate:
 

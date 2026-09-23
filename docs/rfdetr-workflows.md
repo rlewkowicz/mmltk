@@ -441,14 +441,20 @@ opening detail and changing overlays do not run inference again. Selection
 uses the identity paired with displayed pixels, including during replacement
 or partial progress.
 
+Validate's [Display confidence](gui-interaction.md#display-confidence) filters
+only those retained preview detections. It is independent of the evaluator's
+reported macro-F1 threshold, candidate selection, COCO accumulation, and CLI
+reports. Preview edits preserve the evaluation generation, results, and raw
+samples; ground-truth import remains unchanged.
+
 The GUI presents twelve fixed COCO summary rows: AP 50:95, AP50, AP75,
 AP small/medium/large, AR at each of the three recorded caps, and AR
 small/medium/large. Boxes and available Masks use separate columns; unavailable
 values show `—`. Native detail queries still support pages of at most four
 rows, while this view has no metric, IoU, recall, or detail-page controls.
 The [Validation workspace](gui-interaction.md#validation-workspace-and-shared-viewer)
-owns layout, shared viewer interaction, and the Validation-only GT/Det layer
-and compositing rules.
+owns layout, shared viewer interaction, and the Validation-only
+Groundtruth/Detections layer and compositing rules.
 
 Scheduled training evaluation separately writes `eval_samples/epoch_N.png`.
 [TrainingValidationRuntime](../src/backend/models/rfdetr/training/evaluation_run_owner.cpp)

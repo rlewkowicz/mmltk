@@ -150,7 +150,10 @@ artifact names and monotonic timestamps do not join different runs.
 | `benchmark.images.cache_scan`, `.cache_reuse`, `.progress` | `source`/`shard`, inspected/reused/resolved images, and selection counts |
 | `benchmark.images.validation_failed` | Rejected archive `member`, `image_id`, `source`/`shard`, encoded `bytes`, and `reason` |
 | `benchmark.archive.scan`, `.extracted`, `.extract_cache_hit` | Archive traversal or annotation-member extraction/reuse |
+| `benchmark.annotations.release_metadata`, `.release_complete` | COCONut release `edition` and `cache_hit` at metadata and full-mask completion respectively |
+| `benchmark.annotations.component_admitted` | Reused COCONut component `edition`, physical `source`, and `images` |
 | `benchmark.images.archive_retry`, `benchmark.pixel_compile.cache_repair` | Bounded image/archive repair context |
+| `benchmark.pixel_compile.throughput`, `.complete` | Completed/total images where available, `split`, elapsed seconds, images/second, and ETA observations |
 | `benchmark.storage.projection`, `benchmark.publication.complete` | Planned storage bounds, then actual successful publication facts |
 
 For a capture produced by [the GUI example](#capture-one-reproduction):
@@ -167,12 +170,18 @@ For a capture produced by [the GUI example](#capture-one-reproduction):
   -q '@event:benchmark.images OR @event:benchmark.archive' \
   --where 'source="objects365" AND shard="patch-17"' \
   --format timeline --limit 40
+./mmltk --logs .mmltk-data/logs/gui-trace.jsonl \
+  -q '@event:benchmark.annotations OR @event:benchmark.pixel_compile' \
+  --format timeline --limit 60
 ```
 
 `completed_bytes` follows actual accepted writes, not preallocated file length;
 zero `total_bytes` means unknown. Retry withdrawal can legitimately decrease
 the count. The [progress reference](benchmark-datasets.md#reading-compilation-progress)
-owns source aggregation, scaled image units, and projected-output semantics.
+owns the independent acquisition, labels/masks, and pixel tracks, source
+aggregation, repair withdrawals, and projected-output semantics. Release and
+pixel records can interleave with acquisition records; a phase name does not
+imply exclusive execution. They do not establish a measured performance gain.
 An unchanged image fraction or absent best-effort record cannot establish a
 deadlock or network liveness.
 
@@ -319,6 +328,7 @@ record UI interaction and pixels separately from physical resource custody:
 | Records | Evidence |
 | --- | --- |
 | `integration.benchmark_baseline`, `integration.benchmark_click`, `integration.benchmark_choice`, `integration.benchmark_visibility`, `integration.benchmark_inactive` | Baseline native settings, real radio clicks, settled choices/restoration, current-tree presence/absence, and disabled source-control behavior |
+| `integration.compile_track_text` | Measured Acquisition, Labels/masks, and Pixels text, including Directory's unnecessary `0 / 0` acquisition |
 | `integration.atlas_resize_measured`, `integration.atlas_resize` | Gallery measurements retained beneath Detail, then required/actual rows after each completed resized return |
 | `integration.atlas_ready_cell`, `integration.atlas_canvas_sample` | Exact drawn gallery identity, compiled image, selected canvas coordinates, patch counts, and sampled color |
 | `integration.explore_integer`, `integration.explore_integer_paste_baseline`, `integration.explore_integer_paste`, `integration.explore_integer_paste_restored` | Exact decimal integer values, native revision progression, typing/paste persistence, and restoration |
@@ -326,8 +336,11 @@ record UI interaction and pixels separately from physical resource custody:
 | `integration.annotation_layout`, `integration.annotation_reachable`, `integration.annotation_tail` | Shared columns, wide/narrow viewport behavior, fully revealed controls, and long-list final entries |
 | `integration.annotation_pixel` | Native geometry/palette expectation and actual canvas pixel at the current image scale |
 | `integration.workflow.completed` | Typed Train, dashboard interaction/aspect, Validate, compiled/image/video Predict, Stop, theme, and narrow-layout stage completion |
-| `integration.workflow.pixels` | Actual sampled/visible canvas pixel counts for charts, the live progress bar, validation atlas/detail, and prediction stages; image captures retain the expected source/presentation revisions |
+| `integration.workflow.pixels` | Actual sampled/visible canvas pixel counts for charts, the live progress bar, validation atlas/detail, direct Validate-to-Explore return, and prediction stages; image captures retain the expected source/presentation revisions |
 | `integration.workflow.progress` | Native completed/total image counts and epoch facts at the live progress capture |
+| `integration.validation_confidence_edit` | Nine settled decimal/invalid-input/arrow/wheel/endpoint stages, with the value, native settings revision, and unchanged evaluation generation |
+| `integration.validation_confidence_pixels` | Paired threshold, retained raw detection count/score range, clean identity, evaluation generation, settings revision, and canvas difference counts for `0 → 1 → 0` |
+| `integration.validation_layout`, `integration.validation_text` | Measured atlas and overlay-group bounds in ordinary/narrow layouts, plus Groundtruth/Detections and confidence-control text |
 | `integration.workflow.caption_pixels` | Caption case/stage, patch count, observed background/glyph pixels, compared pixels, and currently verified overlap patches from the actual canvas |
 | `integration.workflow.caption_geometry` | Opt-in bounded clip and candidate GT/Det label rectangles when the workflow finds no eligible overlapping caption patch |
 | `integration.metric_projection` | Finite sample count, connected-segment count, and total projected entries for a Train curve |
@@ -358,6 +371,22 @@ workflow case requires both semantic completion and actual canvas observations.
 A sparse chart can legitimately have finite samples but no connected segments
 when records are missing; its markers preserve those observations without
 joining gaps.
+
+For `integration.workflow.pixels` with `detail: "validate-to-explore"`, the
+browser samples a ready tile's interior after direct navigation. The record
+retains the compiled index, source/presentation revisions, physical canvas
+coordinates, and a patch at most 8×8 pixels. The independent audit requires
+nonzero identities, `ready_tile`, `matched`, and at least 12 colored pixels
+occupying at least half the patch. Dataset readiness or a status label alone
+cannot satisfy this check.
+
+The confidence oracle hides ground truth while comparing the retained atlas
+at thresholds 0, 1, and 0. Its fixture's raw scores are below 1, so the middle
+capture must remove detection pixels. A pixel counts as different when any RGB
+channel changes by more than two levels; at least 12 must differ at threshold 1
+and none may differ after returning to 0. Raw detection facts, clean identity,
+evaluation generation, and the paired settings revisions must also agree.
+This bounded fixture checks preview filtering, not model accuracy.
 
 Validation caption evidence uses seven cases: atlas cells 0–5 and detail case
 6. Stages 0–8 start with both layers, then repeat Det-only, hidden, GT-only, and
