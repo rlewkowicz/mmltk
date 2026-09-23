@@ -1,5 +1,5 @@
 use super::*;
-use crate::generated::{BenchmarkTransferProgress, DatasetCompilePhase};
+use crate::generated::BenchmarkTransferProgress;
 
 fn dataset() -> ArtifactUiState {
     crate::generated::application_snapshot_defaults().unwrap().into_iter()
@@ -136,6 +136,61 @@ fn tracks_preserve_independent_ratios_unknowns_zero_and_repair() {
     dataset.progress.tracks.pixels.totalknown = true;
     assert_eq!(track_ratio(&dataset.progress.tracks.labels), Some(0.3));
     assert_eq!(track_ratio(&dataset.progress.tracks.pixels), Some(0.85));
+    for (track, activity, caption) in [
+        (&mut dataset.progress.tracks.labels, DatasetCompileActivity::Preparing, "Preparing labels and masks"),
+        (&mut dataset.progress.tracks.pixels, DatasetCompileActivity::Compiling, "Compiling image pixels"),
+    ] {
+        track.activity = activity;
+        track.active = false;
+        track.complete = false;
+        assert!(track_caption(track, false).starts_with("Waiting · "));
+        track.active = true;
+        assert!(track_caption(track, false).starts_with(caption));
+        track.completed = track.total;
+        assert!(track_caption(track, false).starts_with(caption));
+        track.active = false;
+        track.complete = true;
+        assert_eq!(track_caption(track, false), format!("Complete · {}", count(track.total)));
+        assert_eq!(track.activity, activity);
+    }
+}
+
+#[test]
+fn current_work_preserves_phase_counts_and_units_independently_of_tracks() {
+    let mut dataset = dataset();
+    dataset.active = true;
+    assert_eq!(work_caption(&dataset), None);
+    dataset.progress.tracks.labels.completed = 345491;
+    dataset.progress.tracks.labels.total = 345491;
+    dataset.progress.tracks.labels.complete = true;
+    for (phase, total) in [(DatasetCompilePhase::Syncing, 4), (DatasetCompilePhase::Publishing, 1)] {
+        dataset.progress.phase = phase;
+        dataset.progress.total = total;
+        for completed in 0..=total {
+            dataset.progress.completed = completed;
+            assert_eq!(work_caption(&dataset), Some(format!("{phase:?} · {completed} / {total}")));
+            assert_eq!(heading(&dataset), format!("{phase:?}"));
+        }
+    }
+    dataset.progress.total = 0;
+    dataset.progress.completed = 12345;
+    assert_eq!(work_caption(&dataset).as_deref(), Some("Publishing · 12,345 / ?"));
+    dataset.progress.total = 23456;
+    assert_eq!(work_caption(&dataset).as_deref(), Some("Publishing · 12,345 / 23,456"));
+    for phase in [DatasetCompilePhase::Downloading, DatasetCompilePhase::Extracting] {
+        dataset.progress.phase = phase;
+        dataset.progress.completed = 1;
+        dataset.progress.total = 1024;
+        dataset.progress.throughputpersecond = 2048;
+        assert_eq!(work_caption(&dataset), Some(format!("{phase:?} · 0.001 KiB / 1.0 KiB")));
+        assert_eq!(metrics(&dataset.progress), "2.0 KiB/s");
+        dataset.progress.completed = 0;
+        dataset.progress.total = 0;
+        assert_eq!(work_caption(&dataset), Some(format!("{phase:?} · 0 KiB / ?")));
+    }
+    dataset.progress.phase = DatasetCompilePhase::Pixels;
+    dataset.progress.throughputpersecond = 12345;
+    assert_eq!(metrics(&dataset.progress), "12,345/s");
 }
 
 #[test]
@@ -156,12 +211,15 @@ fn native_lifecycle_controls_visibility_independently_of_retained_progress() {
     let mut dataset = dataset();
     assert_eq!(heading(&dataset), "");
     assert!(!show_tracks(&dataset));
+    assert_eq!(work_caption(&dataset), None);
     dataset.active = true;
     assert_eq!(heading(&dataset), "Preparing compilation");
     assert!(show_tracks(&dataset));
     dataset.progress.phase = DatasetCompilePhase::Planning;
     assert_eq!(heading(&dataset), "Planning");
     dataset.progress.phase = DatasetCompilePhase::Publishing;
+    dataset.progress.completed = 1;
+    dataset.progress.total = 1;
     dataset.progress.sources.push(source());
     for track in [&mut dataset.progress.tracks.acquisition, &mut dataset.progress.tracks.labels,
         &mut dataset.progress.tracks.pixels] {
@@ -170,10 +228,12 @@ fn native_lifecycle_controls_visibility_independently_of_retained_progress() {
     // All tracks completed is still active publication, never success.
     assert!(show_tracks(&dataset));
     assert_eq!(heading(&dataset), "Publishing");
+    assert_eq!(work_caption(&dataset).as_deref(), Some("Publishing · 1 / 1"));
     dataset.terminal.outcome = ArtifactTerminalOutcome::CancellationRequested;
     assert!(cancelling(Some(&dataset)));
     assert!(!show_tracks(&dataset));
     assert_eq!(heading(&dataset), "Cancelling…");
+    assert_eq!(work_caption(&dataset), None);
     let retained = dataset.progress.clone();
     dataset.active = false;
     for (outcome, caption) in [(ArtifactTerminalOutcome::Cancelled, "Cancelled"),
@@ -183,6 +243,7 @@ fn native_lifecycle_controls_visibility_independently_of_retained_progress() {
         assert_eq!(heading(&dataset), caption);
         assert!(!show_tracks(&dataset));
         assert!(!cancelling(Some(&dataset)));
+        assert_eq!(work_caption(&dataset), None);
         let _: Element<'static, ()> = view(Some(&dataset));
         assert_eq!(dataset.progress, retained);
     }
@@ -196,66 +257,84 @@ fn native_lifecycle_controls_visibility_independently_of_retained_progress() {
 fn measured_active_area_holds_shorter_updates_and_cancellation_removes_rows() {
     use iced::advanced::{Layout, layout, renderer::Headless, widget};
     use iced::{Rectangle, Size};
-    struct Rows(usize);
+    #[derive(Default)]
+    struct Rows { tracks: usize, work: usize, sources: usize }
     impl widget::Operation for Rows {
         fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn widget::Operation)) { operate(self); }
         fn container(&mut self, id: Option<&widget::Id>, _: Rectangle) {
-            if TRACK_IDS.iter().any(|name| id == Some(&widget::Id::from(*name))) { self.0 += 1; }
+            if TRACK_IDS.iter().any(|name| id == Some(&widget::Id::from(*name))) { self.tracks += 1; }
+            if id == Some(&widget::Id::from(WORK_ID)) { self.work += 1; }
+            if id == Some(&widget::Id::from(source_identity(BenchmarkDatasetSource::KObjects365V2).1)) {
+                self.sources += 1;
+            }
         }
     }
     let renderer = iced::futures::executor::block_on(<iced::Renderer as Headless>::new(
         Default::default(), Some("wgpu"),
     )).expect("dataset progress layout requires the container renderer");
-    let limits = layout::Limits::new(Size::ZERO, Size::new(200.0, 4000.0));
-    let mut dataset = dataset();
-    dataset.active = true;
-    dataset.generation = 1;
-    dataset.progress.phase = DatasetCompilePhase::Downloading;
-    dataset.progress.activity = "Downloading the current image archive".into();
-    dataset.progress.sources.push(source());
-    dataset.progress.projectedoutputbytes = 1024_u64.pow(4);
-    let mut element: Element<'static, ()> = view(Some(&dataset));
-    let mut tree = widget::Tree::new(&element);
-    tree.diff(&mut element);
-    let node = element.as_widget_mut().layout(&mut tree, &renderer, &limits);
-    let active_height = node.size().height;
-    let mut rows = Rows(0);
-    element.as_widget_mut().operate(&mut tree, Layout::new(&node), &renderer, &mut rows);
-    assert_eq!(rows.0, 3);
-    dataset.progress.activity.clear();
-    dataset.progress.projectedoutputbytes = 0;
-    dataset.progress.sources.clear();
-    for cancelling in [false, true] {
-        if cancelling { dataset.terminal.outcome = ArtifactTerminalOutcome::CancellationRequested; }
-        element = view(Some(&dataset));
+    for width in [200.0, 320.0] {
+        let limits = layout::Limits::new(Size::ZERO, Size::new(width, 4000.0));
+        let mut dataset = dataset();
+        dataset.active = true;
+        dataset.generation = 1;
+        dataset.progress.phase = DatasetCompilePhase::Downloading;
+        dataset.progress.activity = "Downloading the current image archive".into();
+        dataset.progress.sources.push(source());
+        dataset.progress.projectedoutputbytes = 1024_u64.pow(4);
+        dataset.progress.tracks.labels.activity = DatasetCompileActivity::Preparing;
+        dataset.progress.tracks.pixels.activity = DatasetCompileActivity::Compiling;
+        let mut element: Element<'static, ()> = view(Some(&dataset));
+        let mut tree = widget::Tree::new(&element);
         tree.diff(&mut element);
         let node = element.as_widget_mut().layout(&mut tree, &renderer, &limits);
-        assert_eq!(node.size().height, active_height);
-        let mut rows = Rows(0);
+        let active_height = node.size().height;
+        let mut rows = Rows::default();
         element.as_widget_mut().operate(&mut tree, Layout::new(&node), &renderer, &mut rows);
-        assert_eq!(rows.0, if cancelling { 0 } else { 3 });
+        assert_eq!((rows.tracks, rows.work, rows.sources), (3, 1, 1));
+        dataset.progress.activity.clear();
+        dataset.progress.projectedoutputbytes = 0;
+        dataset.progress.sources.clear();
+        for (phase, total, cancelling) in [
+            (DatasetCompilePhase::Syncing, 4, false),
+            (DatasetCompilePhase::Publishing, 1, false),
+            (DatasetCompilePhase::Publishing, 1, true),
+        ] {
+            dataset.progress.phase = phase;
+            dataset.progress.total = total;
+            dataset.progress.completed = total;
+            if cancelling { dataset.terminal.outcome = ArtifactTerminalOutcome::CancellationRequested; }
+            element = view(Some(&dataset));
+            tree.diff(&mut element);
+            let node = element.as_widget_mut().layout(&mut tree, &renderer, &limits);
+            assert_eq!(node.size().height, active_height);
+            let mut rows = Rows::default();
+            element.as_widget_mut().operate(&mut tree, Layout::new(&node), &renderer, &mut rows);
+            assert_eq!((rows.tracks, rows.work, rows.sources), if cancelling { (0, 0, 0) } else { (3, 1, 0) });
+        }
+        dataset.active = false;
+        dataset.terminal.outcome = ArtifactTerminalOutcome::Cancelled;
+        dataset.terminal.detail = "Stopped".into();
+        dataset.terminal.artifact = "/output/dataset".into();
+        // Reconnection installs the compact native terminal immediately; no source
+        // or track is resurrected by the retained non-idle phase.
+        element = view(Some(&dataset));
+        let mut reconnected = widget::Tree::new(&element);
+        let node = element.as_widget_mut().layout(&mut reconnected, &renderer, &limits);
+        assert!(node.size().height < active_height);
+        let mut rows = Rows::default();
+        element.as_widget_mut().operate(&mut reconnected, Layout::new(&node), &renderer, &mut rows);
+        assert_eq!((rows.tracks, rows.work, rows.sources), (0, 0, 0));
+        dataset.generation += 1;
+        dataset.active = true;
+        dataset.terminal.outcome = ArtifactTerminalOutcome::Idle;
+        element = view(Some(&dataset));
+        // A new generation uses current content rather than a prior run's tall
+        // source panel; shared disclosure tests also exercise retained-tree reset.
+        let mut restarted = widget::Tree::new(&element);
+        let node = element.as_widget_mut().layout(&mut restarted, &renderer, &limits);
+        assert!(node.size().height < active_height);
+        let mut rows = Rows::default();
+        element.as_widget_mut().operate(&mut restarted, Layout::new(&node), &renderer, &mut rows);
+        assert_eq!((rows.tracks, rows.work, rows.sources), (3, 1, 0));
     }
-    dataset.active = false;
-    dataset.terminal.outcome = ArtifactTerminalOutcome::Cancelled;
-    // Reconnection installs the compact native terminal immediately; no source
-    // or track is resurrected by the retained non-idle phase.
-    element = view(Some(&dataset));
-    let mut reconnected = widget::Tree::new(&element);
-    let node = element.as_widget_mut().layout(&mut reconnected, &renderer, &limits);
-    assert!(node.size().height < active_height);
-    let mut rows = Rows(0);
-    element.as_widget_mut().operate(&mut reconnected, Layout::new(&node), &renderer, &mut rows);
-    assert_eq!(rows.0, 0);
-    dataset.generation += 1;
-    dataset.active = true;
-    dataset.terminal.outcome = ArtifactTerminalOutcome::Idle;
-    element = view(Some(&dataset));
-    // A new generation uses current content rather than a prior run's tall
-    // source panel; shared disclosure tests also exercise retained-tree reset.
-    let mut restarted = widget::Tree::new(&element);
-    let node = element.as_widget_mut().layout(&mut restarted, &renderer, &limits);
-    assert!(node.size().height < active_height);
-    let mut rows = Rows(0);
-    element.as_widget_mut().operate(&mut restarted, Layout::new(&node), &renderer, &mut rows);
-    assert_eq!(rows.0, 3);
 }

@@ -1,11 +1,12 @@
 //! Dataset compilation presentation; native state alone decides settlement.
 use crate::fluent_theme::Element;
 use crate::generated::{ArtifactTerminalOutcome, ArtifactUiState, BenchmarkDatasetSource,
-    BenchmarkSourceProgress, DatasetCompileActivity, DatasetCompileTrack};
+    BenchmarkSourceProgress, DatasetCompileActivity, DatasetCompilePhase, DatasetCompileTrack};
 use iced::Fill;
 use iced::widget::{column, container, progress_bar, text, Space};
 
 pub(crate) const AREA_ID: &str = "train.dataset.progress.area";
+pub(crate) const WORK_ID: &str = "train.dataset.progress.work";
 pub(crate) const TRACK_IDS: [&str; 3] = [
     "train.dataset.progress.acquisition", "train.dataset.progress.labels", "train.dataset.progress.pixels",
 ];
@@ -81,14 +82,22 @@ fn quantity(completed: u64, total: Option<u64>, complete: bool, bytes: bool) -> 
 }
 
 fn track_caption(track: &DatasetCompileTrack, bytes: bool) -> String {
-    let activity = match track.activity {
-        DatasetCompileActivity::Waiting => "Waiting",
-        DatasetCompileActivity::Unnecessary => "No acquisition needed",
-        DatasetCompileActivity::Acquiring => "Acquiring sources",
-        DatasetCompileActivity::Normalizing => "Normalizing annotations",
-        DatasetCompileActivity::Preparing => "Preparing labels and masks",
-        DatasetCompileActivity::Compiling => "Compiling image pixels",
-        DatasetCompileActivity::Complete => "Complete",
+    let activity = if track.activity == DatasetCompileActivity::Unnecessary {
+        "No acquisition needed"
+    } else if track.complete {
+        "Complete"
+    } else if !track.active {
+        "Waiting"
+    } else {
+        match track.activity {
+            DatasetCompileActivity::Waiting => "Waiting",
+            DatasetCompileActivity::Unnecessary => "No acquisition needed",
+            DatasetCompileActivity::Acquiring => "Acquiring sources",
+            DatasetCompileActivity::Normalizing => "Normalizing annotations",
+            DatasetCompileActivity::Preparing => "Preparing labels and masks",
+            DatasetCompileActivity::Compiling => "Compiling image pixels",
+            DatasetCompileActivity::Complete => "Complete",
+        }
     };
     let mut caption = format!("{activity} · {}", quantity(track.completed,
         track.totalknown.then_some(track.total), track.complete, bytes));
@@ -166,11 +175,24 @@ fn source_details(source: &BenchmarkSourceProgress) -> String {
     details.join(" · ")
 }
 
+fn work_is_bytes(phase: DatasetCompilePhase) -> bool {
+    matches!(phase, DatasetCompilePhase::Downloading | DatasetCompilePhase::Extracting)
+}
+
+fn work_caption(state: &ArtifactUiState) -> Option<String> {
+    let progress = &state.progress;
+    (show_tracks(state) && progress.phase != DatasetCompilePhase::Idle).then(|| {
+        format!("{} · {}", heading(state), quantity(progress.completed,
+            (progress.total != 0).then_some(progress.total), false, work_is_bytes(progress.phase)))
+    })
+}
+
 fn metrics(progress: &crate::generated::ArtifactProgress) -> String {
+    let rate = if work_is_bytes(progress.phase) { size } else { count };
     [
         (progress.elapsedseconds != 0).then(|| format!("{}s elapsed", count(progress.elapsedseconds))),
         (progress.remainingseconds != 0).then(|| format!("{}s remaining", count(progress.remainingseconds))),
-        (progress.throughputpersecond != 0).then(|| format!("{}/s", count(progress.throughputpersecond))),
+        (progress.throughputpersecond != 0).then(|| format!("{}/s", rate(progress.throughputpersecond))),
         (progress.projectedoutputbytes != 0).then(|| format!("{} projected", size(progress.projectedoutputbytes))),
         (progress.droppedinstances != 0).then(|| format!("{} instances dropped", count(progress.droppedinstances))),
         (progress.quarantinedimages != 0).then(|| format!("{} images quarantined", count(progress.quarantinedimages))),
@@ -180,8 +202,12 @@ fn metrics(progress: &crate::generated::ArtifactProgress) -> String {
 pub(crate) fn view<Message: 'static>(state: Option<&ArtifactUiState>) -> Element<'static, Message> {
     let mut body = column![].spacing(6).width(Fill);
     if let Some(state) = state {
-        let title = heading(state);
-        if !title.is_empty() { body = body.push(text(title).size(12)); }
+        if let Some(work) = work_caption(state) {
+            body = body.push(container(text(work).size(12)).id(WORK_ID).width(Fill));
+        } else {
+            let title = heading(state);
+            if !title.is_empty() { body = body.push(text(title).size(12)); }
+        }
         if show_tracks(state) {
             let progress = &state.progress;
             if !progress.activity.is_empty() { body = body.push(text(progress.activity.clone()).size(12)); }
