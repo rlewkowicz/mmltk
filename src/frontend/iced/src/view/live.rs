@@ -1,7 +1,8 @@
+use crate::view::shared::status_text;
 use crate::fluent_theme::Element;
 use crate::presentation_surface::Surface;
 use crate::view_model::ApplicationModel;
-use iced::widget::{button, column, text};
+use iced::widget::{button, column};
 
 #[derive(Debug, Clone)]
 pub enum Message {
@@ -34,7 +35,7 @@ impl Component {
         let settings_edit_available = settings.draft.is_some() && model.settings_edit_available();
         let completed_frames: Element<'a, Message> = model.live_snapshot.as_ref().map_or_else(
             || column![].into(),
-            |snapshot| text(format!("Completed frames · {}", snapshot.completedframes)).into(),
+            |snapshot| status_text(format!("Completed frames · {}", snapshot.completedframes)).into(),
         );
         let state_label = model.live_snapshot.as_ref().map_or_else(
             || "Waiting for native Live state".to_owned(),
@@ -59,11 +60,11 @@ impl Component {
                     "Live capture",
                     "Start and Stop follow the typed Live snapshot.",
                     column![
-                        text(format!(
+                        status_text(format!(
                             "Requested viewport · {} × {} · {} fps",
                             model.window_width, model.window_height, requested_fps
                         )),
-                        text(state_label),
+                        status_text(state_label),
                         completed_frames,
                     ]
                     .spacing(8),
@@ -108,7 +109,7 @@ impl Component {
         let diagnostics = crate::view::shared::card(
             "Live status",
             "Capture remains active while this page is backgrounded.",
-            text(
+            status_text(
                 model
                     .live_snapshot
                     .as_ref()

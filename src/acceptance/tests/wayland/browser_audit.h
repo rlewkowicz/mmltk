@@ -252,6 +252,9 @@ struct BrowserAudit final {
  std::set<std::pair<bool, std::string>> dataset_coconut_layouts;
  std::set<std::pair<bool, std::string>> dataset_label_pixels;
  bool dataset_geometry_valid = true;
+ bool dataset_status_valid = true;
+ bool dataset_status_fitted = false;
+ std::optional<std::array<double, 4>> dataset_pixels_status_font;
  bool dataset_partial_clip = false;
  void audit_dataset_geometry(std::uint64_t key);
  std::map<std::uint64_t, std::vector<std::array<double, 9>>> dataset_transition_frames;

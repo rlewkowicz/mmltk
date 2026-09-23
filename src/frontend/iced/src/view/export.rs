@@ -1,7 +1,8 @@
+use crate::view::shared::status_text;
 use crate::fluent_theme::Element;
 use crate::presentation_surface::Surface;
 use crate::view_model::ApplicationModel;
-use iced::widget::{button, column, container, text};
+use iced::widget::{button, column, container};
 
 #[derive(Debug, Clone)]
 pub enum Message {
@@ -274,7 +275,7 @@ impl Component {
         let diagnostics = crate::view::shared::card(
             "Export status",
             "Canonical artifact outcome.",
-            text(crate::view::workflow::status::compute_status(operation)),
+            status_text(crate::view::workflow::status::compute_status(operation)),
         );
         crate::view::workflow::Regions::new(
             crate::generated::FeatureId::Export,

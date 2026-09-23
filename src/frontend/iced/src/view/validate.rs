@@ -1,3 +1,4 @@
+use crate::view::shared::status_text;
 pub mod results;
 pub mod samples;
 // CLEANUP-IGNORE: Validate declares the concrete dependencies required by its independent Iced component.
@@ -124,7 +125,7 @@ impl Component {
                     "Validation",
                     "",
                     column![
-                        text(
+                        status_text(
                             draft
                                 .filter(|value| !value.request.compiledpath.is_empty())
                                 .map(|value| value.request.compiledpath.as_str())
@@ -250,7 +251,7 @@ impl Component {
         let diagnostics = crate::view::shared::card(
             "Validation status",
             "Canonical native operation outcome.",
-            text(crate::view::workflow::status::compute_status(
+            status_text(crate::view::workflow::status::compute_status(
                 model
                     .workflow
                     .validation

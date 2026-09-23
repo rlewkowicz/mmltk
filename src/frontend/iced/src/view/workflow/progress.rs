@@ -1,6 +1,7 @@
+use crate::view::shared::status_text;
 use crate::fluent_theme::Element;
 use iced::Fill;
-use iced::widget::{column, progress_bar, text};
+use iced::widget::{column, progress_bar};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Presentation {
@@ -114,15 +115,15 @@ fn facts<Message: 'static>(
     completed: u64,
     total: u64,
 ) -> Element<'static, Message> {
-    let mut content = column![text(stage)].spacing(4).width(Fill);
+    let mut content = column![status_text(stage)].spacing(4).width(Fill);
     if !activity.is_empty() {
-        content = content.push(text(activity).size(12));
+        content = content.push(status_text(activity).size(12));
     }
     content = if total == 0 {
-        content.push(text(format!("{completed} completed")).size(12))
+        content.push(status_text(format!("{completed} completed")).size(12))
     } else {
         content
-            .push(text(format!("{completed} / {total}")).size(12))
+            .push(status_text(format!("{completed} / {total}")).size(12))
             .push(progress_bar(
                 0.0..=total as f32,
                 completed.min(total) as f32,
@@ -134,9 +135,9 @@ fn facts<Message: 'static>(
 fn render<Message: 'static>(presentation: Presentation) -> Element<'static, Message> {
     match presentation {
         Presentation::Hidden => return column![].into(),
-        Presentation::Active => return text("Active").size(12).into(),
+        Presentation::Active => return status_text("Active").size(12).into(),
         Presentation::Terminal { outcome, detail } => {
-            return text(if detail.is_empty() {
+            return status_text(if detail.is_empty() {
                 outcome
             } else {
                 format!("{outcome} · {detail}")

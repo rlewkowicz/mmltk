@@ -1,3 +1,5 @@
+pub mod status_text;
+pub use status_text::status_text;
 pub mod transition;
 pub use transition::disclosure;
 

@@ -1,4 +1,5 @@
 //! Dataset compilation presentation; native state alone decides settlement.
+use crate::view::shared::status_text;
 pub(crate) mod fixtures;
 
 use crate::fluent_theme::Element;
@@ -149,7 +150,7 @@ fn track<Message: 'static>(
     container(
         column![
             text(name).size(12),
-            text(track_caption(fact, bytes)).size(12),
+            status_text(track_caption(fact, bytes)).size(12),
             bar
         ]
         .spacing(4)
@@ -310,21 +311,21 @@ pub(crate) fn view<Message: 'static>(state: Option<&ArtifactUiState>) -> Element
     let mut body = column![].spacing(6).width(Fill);
     if let Some(state) = state {
         if let Some(work) = work_caption(state) {
-            body = body.push(container(text(work).size(12)).id(WORK_ID).width(Fill));
+            body = body.push(container(status_text(work).size(12)).id(WORK_ID).width(Fill));
         } else {
             let title = heading(state);
             if !title.is_empty() {
-                body = body.push(text(title).size(12));
+                body = body.push(status_text(title).size(12));
             }
         }
         if show_tracks(state) {
             let progress = &state.progress;
             if !progress.activity.is_empty() {
-                body = body.push(text(progress.activity.clone()).size(12));
+                body = body.push(status_text(progress.activity.clone()).size(12));
             }
             let facts = metrics(progress);
             if !facts.is_empty() {
-                body = body.push(text(facts).size(12));
+                body = body.push(status_text(facts).size(12));
             }
             for (index, name, fact) in [
                 (0, "Acquisition", &progress.tracks.acquisition),
@@ -335,17 +336,17 @@ pub(crate) fn view<Message: 'static>(state: Option<&ArtifactUiState>) -> Element
             }
             for source in &progress.sources {
                 let mut row = column![
-                    text(source_heading(source)).size(12),
-                    text(source_summary(source)).size(12)
+                    status_text(source_heading(source)).size(12),
+                    status_text(source_summary(source)).size(12)
                 ]
                 .spacing(2)
                 .width(Fill);
                 if !source.complete && !source.activity.is_empty() {
-                    row = row.push(text(source.activity.clone()).size(12));
+                    row = row.push(status_text(source.activity.clone()).size(12));
                 }
                 let detail = source_details(source);
                 if !detail.is_empty() {
-                    row = row.push(text(detail).size(12));
+                    row = row.push(status_text(detail).size(12));
                 }
                 body = body.push(
                     container(row)
@@ -356,7 +357,7 @@ pub(crate) fn view<Message: 'static>(state: Option<&ArtifactUiState>) -> Element
         } else if !state.active {
             for detail in [&state.terminal.detail, &state.terminal.artifact] {
                 if !detail.is_empty() {
-                    body = body.push(text(detail.clone()).size(12));
+                    body = body.push(status_text(detail.clone()).size(12));
                 }
             }
         }

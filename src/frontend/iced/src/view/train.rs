@@ -1,3 +1,4 @@
+use crate::view::shared::status_text;
 use crate::fluent_theme::Element;
 use crate::generated::ProviderOfferIdentity;
 use crate::view::settings::{EditSchedule, SettingsModel};
@@ -134,10 +135,10 @@ fn continuation_controls<'a>(
     if current {
         match &model.workflow.train_continuation.capability {
             crate::view_model::CheckpointCapability::Pending { .. } => {
-                controls = controls.push(text("Inspecting checkpoint…").size(12))
+                controls = controls.push(status_text("Inspecting checkpoint…").size(12))
             }
             crate::view_model::CheckpointCapability::Failed(detail) => {
-                controls = controls.push(text(detail).size(12))
+                controls = controls.push(status_text(detail).size(12))
             }
             _ => {}
         }
@@ -321,11 +322,11 @@ impl Component {
             "Training status",
             "Native dataset, local training, and provider facts.",
             column![
-                container(text(crate::view::workflow::status::artifact_status(
+                container(status_text(crate::view::workflow::status::artifact_status(
                     dataset
                 )))
                 .id(DATASET_STATUS_ID),
-                container(text(crate::view::workflow::status::compute_status(
+                container(status_text(crate::view::workflow::status::compute_status(
                     training
                 )))
                 .id("train.progress"),

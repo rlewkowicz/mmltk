@@ -647,6 +647,7 @@ bool BrowserAudit::dataset_transitions_complete() const {
         std::ranges::any_of(dataset_transition_frames.at(51U), [expanded](const auto& frame) { return frame[2] > 0.0 && frame[2] < expanded; });
 }
 bool BrowserAudit::dataset_presentation_complete() const {
+ if (!dataset_status_valid || !dataset_status_fitted) return false;
  if (!dataset_presentation_valid || dataset_custody_cases != 6U || dataset_custody_state != 0U || dataset_custody_drains != 3U || dataset_retired_scope != 0U || dataset_fixture_cases.size() != 36U ||
      dataset_fixture_pixels.size() != 36U)
   return false;
@@ -1042,6 +1043,15 @@ auto BrowserAudit::consume(const nlohmann::json& record) -> void {
   const auto key = scalar(record, "a");
   if (((key >= 2U && key <= 5U) || (key >= 121U && key <= 125U)) && numeric(record, "b") > 0.0 && numeric(record, "c") >= 20.0 && scalar(record, "d") == 1U)
    dataset_label_pixels.emplace(key >= 121U, record.value("control", ""));
+ } else if (event == "integration.dataset_status_font") {
+  const double size = numeric(record, "a"), normal = numeric(record, "b"), line = numeric(record, "c"), height = numeric(record, "d");
+  const bool valid = std::isfinite(size) && std::isfinite(normal) && std::isfinite(line) && std::isfinite(height) && size >= 8.0 && size <= normal &&
+                     std::abs((normal - size) * 2.0 - std::round((normal - size) * 2.0)) < 0.01 && std::abs(line - normal * 1.3) < 0.1 && height <= line + 0.1;
+  dataset_status_valid = dataset_status_valid && valid;
+  if (record.value("control", "") == "train.dataset.progress.pixels") {
+   if (dataset_pixels_status_font) dataset_status_valid = false;
+   dataset_pixels_status_font = std::array{size, normal, line, height};
+  }
  } else if (event == "integration.dataset_viewport") {
   dataset_viewport = std::array{numeric(record, "a"), numeric(record, "b"), numeric(record, "c"), numeric(record, "d")};
  } else if (event == "integration.dataset_label_reference") {
@@ -1162,6 +1172,16 @@ auto BrowserAudit::consume(const nlohmann::json& record) -> void {
    // Complete text is required on the final draw joined by the fixture receipt.
    if (captions) dataset_fixture_caption_frame = key;
   }
+  if (((key >= 200U && key <= 208U) || (key >= 218U && key <= 226U)) && (key - 200U) % 9U < 2U && dataset_pixels_status_font) {
+   const auto pixels = dataset_draw_rows.find("train.dataset.progress.pixels");
+   const auto& font = *dataset_pixels_status_font;
+   const bool narrow_compiling = pixels != dataset_draw_rows.end() &&
+    pixels->second.second == "Pixels\nCompiling image pixels · 2,345 / 9,876" &&
+    std::isfinite(pixels->second.first[2]) && pixels->second.first[2] > 0.0 && pixels->second.first[2] <= 200.1;
+   dataset_status_fitted = dataset_status_fitted || (dataset_status_valid && narrow_compiling &&
+    font[0] >= 8.0 && font[0] < 12.0 && font[1] == 12.0 && std::abs(font[2] - 15.6) < 0.1 && std::abs(font[3] - 15.6) < 0.1);
+  }
+  dataset_pixels_status_font.reset();
   dataset_viewport.reset();
   dataset_paints.clear();
   dataset_draw_rows.clear();

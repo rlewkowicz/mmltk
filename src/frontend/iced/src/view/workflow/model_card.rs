@@ -1,3 +1,4 @@
+use crate::view::shared::status_text;
 use crate::fluent_theme::Element;
 use crate::generated::{FeatureId, ModelArtifactInputKind, ModelSelectionSource, ModelUiState};
 use iced::widget::{button, column, container, row, rule, space, text};
@@ -655,17 +656,17 @@ fn status<'a>(state: Option<&ModelUiState>, workflow: FeatureId) -> Element<'a, 
         status.detail.clear();
     }
     let label = match status.tone {
-        StatusTone::Neutral => text(status.label).style(crate::fluent_theme::text_secondary),
-        StatusTone::Ready => text(status.label).style(crate::fluent_theme::text_success),
-        StatusTone::Active => text(status.label).style(crate::fluent_theme::text_warning),
-        StatusTone::Error => text(status.label),
+        StatusTone::Neutral => status_text(status.label).style(crate::fluent_theme::text_secondary),
+        StatusTone::Ready => status_text(status.label).style(crate::fluent_theme::text_success),
+        StatusTone::Active => status_text(status.label).style(crate::fluent_theme::text_warning),
+        StatusTone::Error => status_text(status.label),
     };
     let content = if status.detail.is_empty() {
         column![row![text("Status:"), label].spacing(5)]
     } else {
         column![
             row![text("Status:"), label].spacing(5),
-            text(status.detail).size(12)
+            status_text(status.detail).size(12)
         ]
         .spacing(4)
     };
@@ -841,7 +842,7 @@ fn view_with<'a, M: Clone + 'a>(
         });
     let artifact: Element<'_, Message> = if shared_weights_selector(state.workflow) {
         if state.source == ModelSelectionSource::Custom {
-            text(if state.artifact.is_empty() {
+            status_text(if state.artifact.is_empty() {
                 "No custom model selected".to_owned()
             } else {
                 state.artifact.clone()
@@ -855,7 +856,7 @@ fn view_with<'a, M: Clone + 'a>(
         && state.input != ModelArtifactInputKind::None
     {
         column![
-            text(if state.artifact.is_empty() {
+            status_text(if state.artifact.is_empty() {
                 "No custom model selected".to_owned()
             } else {
                 state.artifact.clone()
@@ -879,7 +880,7 @@ fn view_with<'a, M: Clone + 'a>(
     )
     .animate_resize();
     let progress: Element<'_, Message> = state.model.map_or_else(
-        || text("Model state unavailable").size(12).into(),
+        || status_text("Model state unavailable").size(12).into(),
         |model| {
             let progress = if shared_weights_selector(state.workflow)
                 && !model.active
@@ -930,7 +931,7 @@ fn view_with<'a, M: Clone + 'a>(
                         state.preset.as_deref().unwrap_or("Unspecified")
                     )),
                     text(format!("Resolution: {preset_resolution}")),
-                    text(path.clone()),
+                    status_text(path.clone()),
                     row![
                         button("Cancel").on_press(Message::CancelArtifact(generation)),
                         button("Confirm").on_press(Message::ConfirmArtifact { path, generation }),

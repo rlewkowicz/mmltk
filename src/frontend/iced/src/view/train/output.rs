@@ -1,7 +1,8 @@
+use crate::view::shared::status_text;
 use crate::fluent_theme::Element;
 use crate::generated::{self, FeatureId};
 use crate::view_model::ApplicationModel;
-use iced::widget::{button, checkbox, column, container, text};
+use iced::widget::{button, checkbox, column, container};
 #[derive(Debug, Clone)]
 pub enum Message {
     Auto(bool),
@@ -43,11 +44,11 @@ pub fn view<'a>(
                 )
         )
         .id("train.output.browse"),
-        text(directory).size(12),
+        status_text(directory).size(12),
     ]
     .spacing(crate::view::workflow::FIELD_SPACING);
     if chart_omissions > 0 {
-        content = content.push(text(format!("Charts omit {chart_omissions} older disconnected summaries; saved history remains unchanged.")));
+        content = content.push(status_text(format!("Charts omit {chart_omissions} older disconnected summaries; saved history remains unchanged.")));
     }
     if let Some(run) = model
         .workflow
@@ -56,7 +57,7 @@ pub fn view<'a>(
         .and_then(|opened| opened.run.as_ref())
         && !run.runid.is_empty()
     {
-        content = content.push(text(format!(
+        content = content.push(status_text(format!(
             "{} · {:?} weights",
             run.runid, run.evaluatedweights
         )));
@@ -76,7 +77,7 @@ pub fn view<'a>(
     };
     if let Some(record) = record {
         if record.droppedbefore > 0 {
-            content = content.push(text(format!(
+            content = content.push(status_text(format!(
                 "History incomplete: {} records dropped",
                 record.droppedbefore
             )));
@@ -86,13 +87,13 @@ pub fn view<'a>(
             ("Selected / epoch weights", &record.progress.checkpointpath),
         ] {
             if !path.is_empty() {
-                content = content.push(text(format!("{label}: {path}")));
+                content = content.push(status_text(format!("{label}: {path}")));
             }
         }
     }
     if let Some(snapshot) = &model.workflow.training {
         if snapshot.persistence.degraded {
-            content = content.push(text(format!(
+            content = content.push(status_text(format!(
                 "History incomplete: {} ({} dropped)",
                 snapshot.persistence.error, snapshot.persistence.droppedrecords
             )));
@@ -108,10 +109,11 @@ pub fn view<'a>(
 mod tests {
     use super::*;
 
+    fn count(tree: &iced::advanced::widget::Tree) -> usize {
+        1 + tree.children.iter().map(count).sum::<usize>()
+    }
+
     fn output_nodes(model: &ApplicationModel) -> usize {
-        fn count(tree: &iced::advanced::widget::Tree) -> usize {
-            1 + tree.children.iter().map(count).sum::<usize>()
-        }
         let settings = crate::view::settings::installed_settings_model();
         let mut output = view(model, &settings, 0);
         let mut tree = iced::advanced::widget::Tree::new(&output);
@@ -123,15 +125,21 @@ mod tests {
     fn output_facts_follow_live_and_saved_records_and_omit_empty_paths() {
         let mut model = crate::view_model::test_support::bootstrapped();
         let baseline = output_nodes(&model);
+        let status_nodes = {
+            let mut element: Element<'_, Message> = status_text("fact").into();
+            let mut tree = iced::advanced::widget::Tree::new(&element);
+            tree.diff(&mut element);
+            count(&tree)
+        };
         let mut live = crate::view::metrics::tests::record();
         model.workflow.training.as_mut().unwrap().metrics = Some(live.clone());
         assert_eq!(output_nodes(&model), baseline);
         live.progress.fullcheckpointpath = "/live/full.pt".into();
         model.workflow.training.as_mut().unwrap().metrics = Some(live.clone());
-        assert_eq!(output_nodes(&model), baseline + 1);
+        assert_eq!(output_nodes(&model), baseline + status_nodes);
         live.progress.checkpointpath = "/live/selected.pt".into();
         model.workflow.training.as_mut().unwrap().metrics = Some(live);
-        assert_eq!(output_nodes(&model), baseline + 2);
+        assert_eq!(output_nodes(&model), baseline + 2 * status_nodes);
         let configuration = model
             .settings_snapshot
             .as_ref()
@@ -151,7 +159,7 @@ mod tests {
             model.workflow.output.select_saved(opened.directory.clone());
             model.workflow.output.saved_mut().unwrap().run = Some(opened);
             // Only saved identity is visible; live checkpoint paths cannot leak.
-            assert_eq!(output_nodes(&model), baseline + 1);
+            assert_eq!(output_nodes(&model), baseline + status_nodes);
             for (full, selected) in [
                 ("", ""),
                 ("/saved/full.pt", ""),
@@ -171,9 +179,9 @@ mod tests {
                 assert_eq!(
                     output_nodes(&model),
                     baseline
-                        + 1
+                        + status_nodes * (1
                         + usize::from(!full.is_empty())
-                        + usize::from(!selected.is_empty())
+                        + usize::from(!selected.is_empty()))
                 );
             }
             let saved = model.workflow.output.saved_mut().unwrap();
@@ -190,6 +198,6 @@ mod tests {
             assert_eq!(output_nodes(&model), baseline);
         }
         model.workflow.output.live();
-        assert_eq!(output_nodes(&model), baseline + 2);
+        assert_eq!(output_nodes(&model), baseline + 2 * status_nodes);
     }
 }

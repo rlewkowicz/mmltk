@@ -1,6 +1,7 @@
+use crate::view::shared::status_text;
 use crate::fluent_theme::Element;
 use crate::presentation_surface::{Surface, SurfaceGesture};
-use iced::widget::{container, text};
+use iced::widget::{container};
 use iced::{Center, Fill, Length};
 
 pub const STABLE_ID: &str = "workflow.visual.workspace";
@@ -71,7 +72,7 @@ pub fn view(
     let content = if surface.is_none() {
         iced::widget::stack![
             content,
-            container(text("Waiting for a completed native frame"))
+            container(status_text("Waiting for a completed native frame").align_x(Center))
                 .center(Fill)
                 .width(Fill)
                 .height(Fill)

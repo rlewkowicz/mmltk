@@ -1,7 +1,8 @@
+use crate::view::shared::status_text;
 use crate::fluent_theme::Element;
 use crate::presentation_surface::Surface;
 use crate::view_model::ApplicationModel;
-use iced::widget::{button, column, container, text};
+use iced::widget::{button, column, container};
 
 #[derive(Debug, Clone)]
 pub enum Message {
@@ -110,7 +111,7 @@ impl Component {
                             ))
                         ))
                         .id("predict.source.video"),
-                        text(draft.map_or("", |value| match value.source.kind {
+                        status_text(draft.map_or("", |value| match value.source.kind {
                             crate::generated::SourceKind::CompiledDataset =>
                                 "Source: compiled dataset",
                             crate::generated::SourceKind::SingleImage => "Source: single image",
@@ -266,7 +267,7 @@ impl Component {
         let diagnostics = crate::view::shared::card(
             "Prediction status",
             "Canonical result and frame activity.",
-            text(crate::view::workflow::status::compute_status(operation)),
+            status_text(crate::view::workflow::status::compute_status(operation)),
         );
         crate::view::workflow::Regions::new(
             // CLEANUP-IGNORE: Predict supplies its generated page identity to the shared compositor.

@@ -1,3 +1,4 @@
+use crate::view::shared::status_text;
 use super::dataset::{class_checklist, class_selection, toggle_selection};
 use super::filter_edit;
 use crate::fluent_theme::Element;
@@ -66,7 +67,7 @@ pub(super) fn view<'a>(
         .map_or_else(
             || space::vertical().height(0).into(),
             |value| {
-                text(value.failure.as_str())
+                status_text(value.failure.as_str())
                     .style(crate::fluent_theme::text_secondary)
                     .into()
             },
@@ -76,7 +77,7 @@ pub(super) fn view<'a>(
         "Dataset details",
         column![
             text("Dataset metadata").size(20),
-            text(status).style(crate::fluent_theme::text_secondary),
+            status_text(status).style(crate::fluent_theme::text_secondary),
             failure,
             fact(
                 "Images",
@@ -111,7 +112,7 @@ pub(super) fn view<'a>(
             ),
             rule::horizontal(1),
             text("Selected sample").size(18),
-            text(snapshot.and_then(|value| value.selectedimage).map_or_else(
+            status_text(snapshot.and_then(|value| value.selectedimage).map_or_else(
                 || "None".to_owned(),
                 |index| format!("Compiled image #{index}")
             )),

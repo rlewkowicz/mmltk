@@ -257,7 +257,7 @@ where
                 if let Some((start, end)) = self.state.selection() {
                     shell.write_clipboard_for(
                         clipboard::Content::Text(
-                            self.state.paragraph.content()[start..end].to_owned(),
+                            self.state.copy_content()[start..end].to_owned(),
                         ),
                         "static.text",
                     );

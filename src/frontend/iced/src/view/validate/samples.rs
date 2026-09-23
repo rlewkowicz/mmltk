@@ -1,8 +1,9 @@
+use crate::view::shared::status_text;
 use crate::fluent_theme::Element;
 use crate::generated::{ValidationOverlays, ValidationSampleIdentity};
 use crate::presentation_surface::{self, Surface};
 use crate::view::workflow::overlay_controls;
-use iced::widget::{button, checkbox, column, container, row, text};
+use iced::widget::{button, checkbox, column, container, row};
 use iced::{Center, Fill};
 
 pub const ATLAS_ID: &str = "validate.samples.atlas";
@@ -129,7 +130,7 @@ impl Component {
         model: &crate::view_model::ApplicationModel,
     ) -> Vec<Element<'a, Message>> {
         let Some(snapshot) = model.workflow.validation.as_ref() else {
-            return vec![text("Waiting for validation").into()];
+            return vec![status_text("Waiting for validation").into()];
         };
         let overlays = snapshot.overlayselection.value.clone();
         let available = model.validation_navigation_available()

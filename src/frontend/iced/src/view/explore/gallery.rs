@@ -1,3 +1,9 @@
+use iced::advanced::{layout, Layout, mouse, overlay, renderer, Shell};
+use iced::advanced::widget::{Operation, Tree};
+use iced::{Event, Rectangle, Vector};
+use crate::fluent_theme::Theme;
+type Renderer = iced::Renderer;
+use crate::view::shared::status_text;
 use super::settings_edit;
 use crate::fluent_theme::Element;
 use crate::presentation_surface::Surface;
@@ -208,53 +214,51 @@ pub(super) fn view<'a>(
     } else {
         space::horizontal().width(Length::Shrink).into()
     };
-    let navigation = row![
-        text(snapshot.map_or_else(
+    let navigation = toolbar_row(vec![
+        (status_text(snapshot.map_or_else(
             || "No dataset open".to_owned(),
             |value| format!(
                 "{} of {} samples",
                 value.order.matchingcount, value.dataset.imagecount
             )
-        )),
-        space::horizontal(),
-        text("Columns"),
-        column_control(columns, settings_available),
-        space::horizontal(),
-        text(snapshot.map_or("Order unavailable", |value| {
+        )).compact()).into(),
+        (space::horizontal()).into(),
+        (text("Columns")).into(),
+        (column_control(columns, settings_available)).into(),
+        (space::horizontal()).into(),
+        (status_text(snapshot.map_or("Order unavailable", |value| {
             if value.order.shuffleseed == 0 {
                 "Sequential order"
             } else {
                 "Shuffled order"
             }
-        })),
-        reshuffle,
-        container(button("Earlier").on_press_maybe(snapshot.and_then(|value| {
+        })).compact()).into(),
+        (reshuffle).into(),
+        (container(button("Earlier").on_press_maybe(snapshot.and_then(|value| {
             mutation_available.then(|| page_message(state, value, columns, PageDirection::Earlier))
         })))
-        .id("explore.gallery.earlier"),
-        container(button("Later").on_press_maybe(snapshot.and_then(|value| {
+        .id("explore.gallery.earlier")).into(),
+        (container(button("Later").on_press_maybe(snapshot.and_then(|value| {
             mutation_available.then(|| page_message(state, value, columns, PageDirection::Later))
         })))
-        .id(super::GALLERY_LATER_ID),
-    ]
-    .spacing(7)
-    .align_y(Center);
+        .id(super::GALLERY_LATER_ID)).into(),
+    ], &[0, 5], 7);
     let augmentation_enabled = snapshot.is_some_and(|value| value.augmentation.enabled);
-    let augmentation = row![
-        container(
+    let augmentation = toolbar_row(vec![
+        (container(
             checkbox(augmentation_enabled)
                 .label("Augmentation preview")
                 .on_toggle_maybe(
                     augmentation_update_available.then_some(Message::AugmentationToggled),
                 )
         )
-        .id(super::AUGMENTATION_TOGGLE_ID),
-        container(text(snapshot.map_or_else(
+        .id(super::AUGMENTATION_TOGGLE_ID)).into(),
+        (container(status_text(snapshot.map_or_else(
             || "Seed unavailable".to_owned(),
             |value| format!("Seed {}", value.augmentation.seed),
-        )))
-        .id(super::AUGMENTATION_SEED_ID),
-        container(
+        )).compact())
+        .id(super::AUGMENTATION_SEED_ID)).into(),
+        (container(
             button("Reroll Augmentation")
                 .on_press_maybe(
                     (mutation_available && augmentation_enabled)
@@ -262,12 +266,10 @@ pub(super) fn view<'a>(
                 )
                 .style(crate::fluent_theme::button_secondary),
         )
-        .id(super::AUGMENTATION_REROLL_ID),
-    ]
-    .spacing(7)
-    .align_y(Center);
+        .id(super::AUGMENTATION_REROLL_ID)).into(),
+    ], &[1], 7);
     let overlay_controls = state.presented_filter(snapshot).map_or_else(
-        || text("Overlays unavailable").into(),
+        || status_text("Overlays unavailable").into(),
         |request| {
             super::overlay::view(request.overlay, mutation_available, false).map(Message::Overlay)
         },
@@ -275,15 +277,12 @@ pub(super) fn view<'a>(
     let progress: Element<'a, Message> = model.explore.gallery_progress().map_or_else(
         || text("").size(12).into(),
         |(ready, total)| {
-            row![
-                text(format!("{ready}/{total} ready")).size(12),
+            toolbar_row(vec![
+                status_text(format!("{ready}/{total} ready")).size(12).compact().into(),
                 container(progress_bar(0.0..=total.max(1) as f32, ready as f32))
                     .width(48)
-                    .height(5),
-            ]
-            .spacing(5)
-            .align_y(Center)
-            .into()
+                    .height(5).into(),
+            ], &[0], 5)
         },
     );
     let toolbar = container(
@@ -324,7 +323,7 @@ pub(super) fn view<'a>(
     })
     .width(Fill)
     .height(Fill);
-    let status = container(text(gallery_status(&model.explore, Some(presentation_title))).size(12))
+    let status = container(status_text(gallery_status(&model.explore, Some(presentation_title))).size(12))
         .id(super::STATUS_CARD_ID)
         .padding(Padding::from([6, 10]))
         .width(Fill)
@@ -422,7 +421,7 @@ fn gallery_viewport<'a>(
                     column![
                         space::vertical(),
                         text(presentation_title).size(22),
-                        text(snapshot.map_or("", |value| value.failure.as_str()))
+                        status_text(snapshot.map_or("", |value| value.failure.as_str()))
                             .size(12)
                             .style(crate::fluent_theme::text_secondary),
                         space::vertical()
@@ -577,7 +576,7 @@ fn gallery_viewport<'a>(
     let capacity_notice: Element<'a, Message> = capacity_copy.map_or_else(
         || space::horizontal().width(0).into(),
         |copy| {
-            container(text(copy))
+            container(status_text(copy).align_x(Center))
                 .id(super::GALLERY_CAPACITY_ID)
                 .center(Fill)
                 .width(Fill)
@@ -605,6 +604,175 @@ fn gallery_viewport<'a>(
             columns,
         })
         .into()
+}
+
+/// Reserve fixed controls before fitting compact captions; only the existing
+/// spacer cells receive slack. At ordinary widths this is the original row
+/// geometry, while narrow rows cannot give the progress bar's pixels to text.
+fn toolbar_row<'a>(children: Vec<Element<'a, Message>>, captions: &'static [usize], spacing: f32) -> Element<'a, Message> {
+    iced::Element::new(ToolbarRow { children, captions, spacing })
+}
+
+struct ToolbarRow<'a> {
+    children: Vec<Element<'a, Message>>,
+    captions: &'static [usize],
+    spacing: f32,
+}
+
+impl iced::advanced::Widget<Message, crate::fluent_theme::Theme, iced::Renderer> for ToolbarRow<'_> {
+    fn size(&self) -> Size<Length> {
+        Size::new(if self.children.iter().any(|child| child.as_widget().size().width.is_fill()) { Fill } else { Length::Shrink }, Length::Shrink)
+    }
+    fn diff(&mut self, tree: &mut iced::advanced::widget::Tree) { tree.diff_children(&mut self.children); }
+    fn layout(&mut self, tree: &mut iced::advanced::widget::Tree, renderer: &iced::Renderer, limits: &iced::advanced::layout::Limits) -> iced::advanced::layout::Node {
+        let spacing = self.spacing * self.children.len().saturating_sub(1) as f32;
+        let mut fixed = spacing;
+        let mut natural = 0.0;
+        let mut spacers = 0;
+        let mut nodes = Vec::with_capacity(self.children.len());
+        let natural_limits = layout::Limits::new(Size::ZERO, Size::new(f32::INFINITY, limits.max().height));
+        for (index, child) in self.children.iter_mut().enumerate() {
+            let node = if child.as_widget().size().width.is_fill() {
+                spacers += 1;
+                layout::Node::new(Size::ZERO)
+            } else {
+                child.as_widget_mut().layout(&mut tree.children[index], renderer, &natural_limits)
+            };
+            if self.captions.contains(&index) { natural += node.size().width; }
+            else { fixed += node.size().width; }
+            nodes.push(node);
+        }
+        let available = (limits.max().width - fixed).max(0.0);
+        if natural > available {
+            // A proportional budget preserves every caption rather than letting
+            // the first long string consume a later label's entire allocation.
+            for &index in self.captions {
+                let width = available * (nodes[index].size().width / natural);
+                nodes[index] = self.children[index].as_widget_mut().layout(&mut tree.children[index], renderer,
+                    &layout::Limits::new(Size::ZERO, Size::new(width, limits.max().height)));
+            }
+        }
+        let used = spacing + nodes.iter().map(|node| node.size().width).sum::<f32>();
+        let slack = if spacers > 0 && limits.max().width.is_finite() { (limits.max().width - used).max(0.0) / spacers as f32 } else { 0.0 };
+        let height = nodes.iter().map(|node| node.size().height).fold(0.0, f32::max);
+        let mut x = 0.0;
+        for (index, node) in nodes.iter_mut().enumerate() {
+            if self.children[index].as_widget().size().width.is_fill() { *node = layout::Node::new(Size::new(slack, height)); }
+            let size = node.size();
+            node.move_to_mut(iced::Point::new(x, (height - size.height) * 0.5));
+            x += size.width + self.spacing;
+        }
+        let width = (x - self.spacing).max(0.0);
+        layout::Node::with_children(limits.resolve(self.size().width, Length::Shrink, Size::new(width, height)), nodes)
+    }
+    fn operate(
+        &mut self,
+        tree: &mut Tree,
+        layout: Layout<'_>,
+        renderer: &Renderer,
+        operation: &mut dyn Operation,
+    ) {
+        operation.container(None, layout.bounds());
+        operation.traverse(&mut |operation| {
+            self.children
+                .iter_mut()
+                .zip(&mut tree.children)
+                .zip(layout.children())
+                .for_each(|((child, state), layout)| {
+                    child
+                        .as_widget_mut()
+                        .operate(state, layout, renderer, operation);
+                });
+        });
+    }
+
+    fn update(
+        &mut self,
+        tree: &mut Tree,
+        event: &Event,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        renderer: &Renderer,
+        shell: &mut Shell<'_, Message>,
+        viewport: &Rectangle,
+    ) {
+        for ((child, tree), layout) in self
+            .children
+            .iter_mut()
+            .zip(&mut tree.children)
+            .zip(layout.children())
+        {
+            child
+                .as_widget_mut()
+                .update(tree, event, layout, cursor, renderer, shell, viewport);
+        }
+    }
+
+    fn mouse_interaction(
+        &self,
+        tree: &Tree,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        viewport: &Rectangle,
+        renderer: &Renderer,
+    ) -> mouse::Interaction {
+        self.children
+            .iter()
+            .zip(&tree.children)
+            .zip(layout.children())
+            .map(|((child, tree), layout)| {
+                child
+                    .as_widget()
+                    .mouse_interaction(tree, layout, cursor, viewport, renderer)
+            })
+            .max()
+            .unwrap_or_default()
+    }
+
+    fn draw(
+        &self,
+        tree: &Tree,
+        renderer: &mut Renderer,
+        theme: &Theme,
+        style: &renderer::Style,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        viewport: &Rectangle,
+    ) {
+        if let Some(clipped_viewport) = layout.bounds().intersection(viewport) {
+            let _ = clipped_viewport;
+
+            for ((child, tree), layout) in self
+                .children
+                .iter()
+                .zip(&tree.children)
+                .zip(layout.children())
+                .filter(|(_, layout)| layout.bounds().intersects(viewport))
+            {
+                child
+                    .as_widget()
+                    .draw(tree, renderer, theme, style, layout, cursor, viewport);
+            }
+        }
+    }
+
+    fn overlay<'b>(
+        &'b mut self,
+        tree: &'b mut Tree,
+        layout: Layout<'b>,
+        renderer: &Renderer,
+        viewport: &Rectangle,
+        translation: Vector,
+    ) -> Option<overlay::Element<'b, Message, Theme, Renderer>> {
+        overlay::from_children(
+            &mut self.children,
+            tree,
+            layout,
+            renderer,
+            viewport,
+            translation,
+        )
+    }
 }
 
 fn explore_columns(settings: &SettingsModel) -> u32 {
@@ -659,6 +827,47 @@ mod tests {
     use super::super::state;
     use super::*;
     use crate::view_model::test_support::explore_snapshot;
+
+    #[test]
+    fn compact_toolbar_preserves_wide_positions_and_reserves_narrow_controls() {
+        use iced::advanced::renderer::Headless;
+        let renderer = iced::futures::executor::block_on(<iced::Renderer as Headless>::new(Default::default(), Some("wgpu"))).unwrap();
+        let children = |compact: bool| -> Vec<Element<'static, Message>> {
+            let caption = |value| -> Element<'static, Message> {
+                if compact { status_text(value).size(12).compact().into() } else { text(value).size(12).into() }
+            };
+            vec![caption("123456 of 234567 samples"), space::horizontal().into(),
+                text("Columns").into(), space::horizontal().width(42).into(), space::horizontal().into(),
+                caption("Sequential order"), button("Earlier").into(), button("Later").into()]
+        };
+        let measure = |mut element: Element<'_, Message>, width| {
+            let mut tree = Tree::new(&element);
+            tree.diff(&mut element);
+            element.as_widget_mut().layout(&mut tree, &renderer, &layout::Limits::new(Size::ZERO, Size::new(width, 100.0)))
+        };
+        let ordinary = measure(iced::widget::Row::from_vec(children(false)).spacing(7).align_y(Center).into(), 900.0);
+        let wide = measure(toolbar_row(children(true), &[0, 5], 7.0), 900.0);
+        for (before, after) in ordinary.children().iter().zip(wide.children()) {
+            assert!((before.bounds().x - after.bounds().x).abs() < 0.1);
+            assert!((before.size().width - after.size().width).abs() < 0.1);
+        }
+        let narrow = measure(toolbar_row(children(true), &[0, 5], 7.0), 330.0);
+        for index in [2, 3, 6, 7] {
+            assert_eq!(narrow.children()[index].size().width, wide.children()[index].size().width);
+        }
+        assert!(narrow.children()[7].bounds().x + narrow.children()[7].size().width <= 330.1);
+        for width in [400.0, 90.0] {
+            let progress = measure(toolbar_row(vec![
+                status_text("123456/234567 ready").size(12).compact().into(),
+                container(progress_bar(0.0..=1.0, 0.5)).width(48).height(5).into(),
+            ], &[0], 5.0), width);
+            let caption = &progress.children()[0];
+            let bar = &progress.children()[1];
+            assert_eq!(bar.size().width, 48.0);
+            assert!((bar.bounds().x - caption.size().width - 5.0).abs() < 0.1);
+            assert!(progress.size().width <= width + 0.1);
+        }
+    }
 
     #[test]
     fn native_viewport_tracks_real_scroll_and_stays_within_capacity() {

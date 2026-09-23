@@ -106,6 +106,7 @@ pub struct Frame {
     pub key: u16,
     pub native: Option<NativeFrame>,
     pub rows: Vec<Row>,
+    statuses: Vec<(&'static str, crate::view::shared::status_text::Measurement)>,
     pub offset: Vector,
     pub scale: f32,
     pub page: Rectangle,
@@ -137,6 +138,7 @@ impl Frame {
             && self.translation == other.translation
             && self.colors == other.colors
             && self.paints == other.paints
+            && self.statuses == other.statuses
             && self
                 .rows
                 .iter()
@@ -430,6 +432,7 @@ impl widget::Operation for Capture {
         self.pending_row = None;
         if id == Some(&widget::Id::from("integration.dataset.fixture")) {
             self.frame.rows.clear();
+            self.frame.statuses.clear();
             self.row = None;
         }
         if id == Some(&widget::Id::from("train.dataset.benchmark_choices")) {
@@ -488,6 +491,14 @@ impl widget::Operation for Capture {
                 bounds: self.translated(bounds),
                 text: state.text().into(),
             });
+        }
+    }
+    fn custom(&mut self, _id: Option<&widget::Id>, _bounds: Rectangle, state: &mut dyn std::any::Any) {
+        if let Some(index) = self.row
+            && let Some(measurement) = state.downcast_ref::<crate::view::shared::status_text::Measurement>()
+            && self.frame.statuses.len() < 64
+        {
+            self.frame.statuses.push((self.frame.rows[index].id, measurement.clone()));
         }
     }
     fn text(&mut self, _id: Option<&widget::Id>, bounds: Rectangle, text: &str) {
@@ -877,6 +888,12 @@ impl Widget<RootMessage, Theme, iced::Renderer> for Observed<'_> {
                             row.bounds.height.into(),
                         ],
                     );
+                }
+                for (id, measurement) in &frame.statuses {
+                    sink.record("integration.dataset_status_font", id, "one-line", [
+                        measurement.size.into(), measurement.normal.into(),
+                        measurement.line.into(), measurement.paragraph_height.into(),
+                    ]);
                 }
                 sink.record(
                     "integration.dataset_viewport",

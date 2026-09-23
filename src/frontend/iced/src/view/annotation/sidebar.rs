@@ -1,3 +1,4 @@
+use crate::view::shared::status_text;
 use crate::fluent_theme::Element;
 use crate::generated::{
     AnnotationColorRange, AnnotationEdit, AnnotationEditRequest, AnnotationHandleRole,
@@ -935,7 +936,7 @@ impl Component {
                 .vertical_spacing(6),
                 sidebar,
                 brush_control,
-                text(ui.map_or_else(
+                status_text(ui.map_or_else(
                     || "No document open".into(),
                     |state| format!(
                         "{} objects · {} classes · revision {}",
@@ -944,13 +945,13 @@ impl Component {
                         state.documentrevision
                     )
                 )),
-                text(ui.map_or("Open an image to begin", |state| tool_hint(
+                status_text(ui.map_or("Open an image to begin", |state| tool_hint(
                     state.editor.tool
                 )))
                 .size(12),
                 specialized,
                 container(
-                    text(model.snapshot.as_ref().map_or_else(
+                    status_text(model.snapshot.as_ref().map_or_else(
                         || "Operation unavailable".to_owned(),
                         |snapshot| format!(
                             "{} · {:?}",

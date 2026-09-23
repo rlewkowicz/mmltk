@@ -28,6 +28,7 @@ where
     fragment: text::Fragment<'a>,
     format: Format<Renderer::Font>,
     class: Theme::Class<'a>,
+    single_line: bool,
 }
 
 impl<'a, Theme, Renderer> Text<'a, Theme, Renderer>
@@ -40,7 +41,19 @@ where
             fragment: fragment.into_fragment(),
             format: Format::default(),
             class: Theme::default(),
+            single_line: false,
         }
+    }
+
+    /// Update layout formatting while preserving the retained interaction state.
+    pub fn set_format(&mut self, format: Format<Renderer::Font>) {
+        self.format = format;
+    }
+
+    /// Render line breaks as spaces while retaining the original selectable text.
+    pub fn single_line(mut self) -> Self {
+        self.single_line = true;
+        self
     }
 
         pub fn size(mut self, size: impl Into<Pixels>) -> Self {
@@ -134,8 +147,22 @@ where
     }
 }
 
+/// Flatten mandatory line breaks with whitespace of the same UTF-8 byte length.
+/// Selection offsets therefore remain valid in the unmodified source text.
+pub fn flatten_line_breaks(content: &str, output: &mut String) {
+    output.clear();
+    output.extend(content.chars().map(|character| match character {
+        '\n' | '\r' | '\u{000b}' | '\u{000c}' => ' ',
+        '\u{0085}' => '\u{00a0}',
+        '\u{2028}' | '\u{2029}' => '\u{202f}',
+        other => other,
+    }));
+}
+
 pub struct State<P: Paragraph> {
     paragraph: paragraph::Plain<P>,
+    source: Option<String>,
+    single_line_content: String,
     selection_bounds: Vec<Rectangle>,
     line_starts: Vec<usize>,
     anchor: usize,
@@ -157,6 +184,8 @@ impl<P: Paragraph> Default for State<P> {
     fn default() -> Self {
         Self {
             paragraph: paragraph::Plain::default(),
+            source: None,
+            single_line_content: String::new(),
             selection_bounds: Vec::new(),
             line_starts: Vec::new(),
             anchor: 0,
@@ -170,6 +199,10 @@ impl<P: Paragraph> Default for State<P> {
 }
 
 impl<P: Paragraph> State<P> {
+    fn copy_content(&self) -> &str {
+        self.source.as_deref().unwrap_or_else(|| self.paragraph.content())
+    }
+
         pub fn raw(&self) -> &P {
         self.paragraph.raw()
     }
@@ -266,13 +299,23 @@ where
         renderer: &Renderer,
         limits: &layout::Limits,
     ) -> layout::Node {
-        layout(
-            tree.state.downcast_mut::<State<Renderer::Paragraph>>(),
-            renderer,
-            limits,
-            &self.fragment,
-            self.format,
-        )
+        let state = tree.state.downcast_mut::<State<Renderer::Paragraph>>();
+        if self.single_line {
+            if state.source.as_deref() != Some(&self.fragment) {
+                state.clear_selection();
+                self.fragment.as_ref().clone_into(state.source.get_or_insert_with(String::new));
+                flatten_line_breaks(&self.fragment, &mut state.single_line_content);
+            }
+            // Move the retained scratch string out temporarily to allow layout
+            // to mutate selection and paragraph state without copying the text.
+            let content = std::mem::take(&mut state.single_line_content);
+            let node = layout(state, renderer, limits, &content, self.format);
+            state.single_line_content = content;
+            node
+        } else {
+            state.source = None;
+            layout(state, renderer, limits, &self.fragment, self.format)
+        }
     }
 
     fn update(
@@ -459,7 +502,7 @@ pub fn update_state<P: Paragraph, Message>(
             Some('c') if modifiers.command() => {
                 if let Some((start, end)) = state.selection() {
                     shell.write_clipboard_for(
-                        clipboard::Content::Text(state.paragraph.content()[start..end].to_owned()),
+                        clipboard::Content::Text(state.copy_content()[start..end].to_owned()),
                         "static.text",
                     );
                     shell.capture_event();

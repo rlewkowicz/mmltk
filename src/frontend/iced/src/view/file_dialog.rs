@@ -1,3 +1,4 @@
+use crate::view::shared::status_text;
 use crate::fluent_theme::Element;
 use crate::view_model::ApplicationModel;
 use iced::widget::{button, column, container, text};
@@ -33,7 +34,7 @@ pub fn view(model: &ApplicationModel) -> Option<Element<'_, Message>> {
             420.0,
             column![
                 text(context.title).size(24),
-                text("The native file chooser is open."),
+                status_text("The native file chooser is open."),
                 container(
                     button("Cancel file selection")
                         .on_press_maybe(

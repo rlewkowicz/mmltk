@@ -2558,6 +2558,7 @@ TEST_CASE("Dataset presentation requires complete scoped custody evidence", "[wo
   BrowserAudit audit;
   // Supply the independent existing fixture predicate; custody cannot borrow
   // success from those geometry/pixel cases or from native lifecycle facts.
+  audit.dataset_status_fitted = true;
   for (const auto base : {200U, 209U, 218U, 227U}) {
    for (unsigned stage = 0; stage < 9U; ++stage) {
     const auto key = base + stage;
@@ -2649,4 +2650,39 @@ TEST_CASE("Dataset presentation requires complete scoped custody evidence", "[wo
   CHECK(audit.dataset_presentation_complete() == (defect == "none"));
  }
 }
+
+TEST_CASE("status paragraphs retain one normal-height line with half-pixel fitting", "[workspace][audit]") {
+ for (const auto size : {12.0, 11.5, 8.0}) {
+  BrowserAudit audit;
+  audit.consume({{"event", "integration.dataset_status_font"}, {"control", "train.dataset.progress.pixels"}, {"a", size}, {"b", 12.0}, {"c", 15.6}, {"d", 15.6}});
+  CHECK(audit.dataset_status_valid);
+  CHECK_FALSE(audit.dataset_status_fitted);
+  audit.consume({{"event", "integration.dataset_draw"}, {"control", "train.dataset.progress.pixels"}, {"detail", "Pixels\nCompiling image pixels · 2,345 / 9,876"}, {"a", 12}, {"b", 30}, {"c", 200}, {"d", 43.2}});
+  audit.consume({{"event", "integration.dataset_frame"}, {"a", 200U}});
+  CHECK(audit.dataset_status_fitted == (size < 12.0));
+ }
+ for (const auto values : {std::array{7.5, 15.6, 15.6}, std::array{12.5, 15.6, 15.6}, std::array{11.25, 15.6, 15.6}, std::array{8.0, 10.4, 10.4}, std::array{8.0, 15.6, 31.2}}) {
+  BrowserAudit audit;
+  audit.consume({{"event", "integration.dataset_status_font"}, {"a", values[0]}, {"b", 12.0}, {"c", values[1]}, {"d", values[2]}});
+  CHECK_FALSE(audit.dataset_status_valid);
+ }
+}
+
+
+TEST_CASE("Dataset fitted pixels require the exact narrow compiling frame", "[workspace][audit]") {
+ for (const std::string defect : {"none", "wide-frame", "native-frame", "short-caption", "wrong-caption", "wide-row", "missing-fit", "normal-size", "wrong-step", "short-line", "wrapped", "stale-frame"}) {
+  BrowserAudit audit;
+  if (defect != "missing-fit")
+   audit.consume({{"event", "integration.dataset_status_font"}, {"control", "train.dataset.progress.pixels"},
+    {"a", defect == "normal-size" ? 12.0 : defect == "wrong-step" ? 9.25 : 9.5}, {"b", 12.0}, {"c", defect == "short-line" ? 12.35 : 15.6}, {"d", defect == "wrapped" ? 31.2 : 15.6}});
+  if (defect == "stale-frame") audit.consume({{"event", "integration.dataset_frame"}, {"a", 209U}});
+  audit.consume({{"event", "integration.dataset_draw"}, {"control", "train.dataset.progress.pixels"},
+   {"detail", defect == "short-caption" ? "Pixels\nComplete" : defect == "wrong-caption" ? "Pixels\nWaiting · 2,345 / 9,876" : "Pixels\nCompiling image pixels · 2,345 / 9,876"},
+   {"a", 12}, {"b", 30}, {"c", defect == "wide-row" ? 336.0 : 200.0}, {"d", 43.2}});
+  audit.consume({{"event", "integration.dataset_frame"}, {"a", defect == "wide-frame" ? 209U : defect == "native-frame" ? 100U : 200U}});
+  CHECK(audit.dataset_status_fitted == (defect == "none"));
+  CHECK_FALSE(audit.dataset_pixels_status_font);
+ }
+}
+
 }  // namespace mmltk::acceptance::wayland

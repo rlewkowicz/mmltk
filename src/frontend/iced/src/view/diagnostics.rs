@@ -1,3 +1,4 @@
+use crate::view::shared::status_text;
 use crate::fluent_theme::Element;
 use crate::view_model::ApplicationModel;
 use iced::Fill;
@@ -28,17 +29,17 @@ pub fn view<'a>(model: &'a ApplicationModel, component: &Component) -> Element<'
         let content = column![
             row![
                 text("Transport").size(typography.secondary),
-                text(model.connection.label()).size(typography.monospace),
+                status_text(model.connection.label()).size(typography.monospace),
             ]
             .spacing(10),
             row![
                 text("Pending intents").size(typography.secondary),
-                text(model.pending_count().to_string()).size(typography.monospace),
+                status_text(model.pending_count().to_string()).size(typography.monospace),
             ]
             .spacing(10),
             row![
                 text("Presentation").size(typography.secondary),
-                text(
+                status_text(
                     presentation
                         .map(|snapshot| format!(
                             "{:?} · selection revision {}",
