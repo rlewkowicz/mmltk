@@ -1027,6 +1027,7 @@ impl State {
                 if !self.presentation.settled(key) || self.presentation.pixels != Some(key) {
                     return Task::none();
                 }
+                if index == 0 && !self.presentation.custody_complete() { return Task::none(); }
                 reporting::emit(|sink| sink.record("integration.dataset_fixture", "dataset.presentation",
                     "rendered-component", [index.into(), key.into(), f64::from(self.presentation.frames), 1.0]));
                 if index + 1 < super::dataset_presentation::FIXTURE_COUNT {

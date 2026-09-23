@@ -113,6 +113,8 @@ test('ordinary execution constructs neither owner and schedules no input or prob
   assert.equal(browser.mmltkIntegrationProbe(gallery), undefined);
   assert.equal(browser.mmltkIntegrationClickAfterSurfaceDraw(10, 20, gallery, 7, false), 0);
   browser.mmltkIntegrationRenderedStyle('unused', 'unused', 0, 0, 0, 1, 10, 10);
+  browser.mmltkIntegrationDatasetPixels(200, null, null, null, 1, '', null,
+    () => assert.fail('disabled Dataset capture must collect nothing'));
   assert.deepEqual(f.microtasks, []);
   assert.deepEqual(f.frames, []);
   assert.deepEqual(f.events, []);
@@ -1187,7 +1189,7 @@ test('Dataset component probes read actual contrasting pixels after frames', t =
   f.frames.shift()();
   assert.deepEqual(result, []);
   f.flushFrames();
-  assert.deepEqual(result, [true]);
+  assert.deepEqual(result, ['observed']);
   assert.equal(f.allocations.copies, 1);
   assert.equal(f.reports.find(record => record.event === 'integration.dataset_pixels').a, '200');
 });
@@ -1197,11 +1199,11 @@ test('Dataset component probes reject blank output and cancelled ownership', t =
   const result = [];
   browser.mmltkIntegrationDatasetPixels(200, [10, 10, 224, 200], [10, 220, 200, 5, 10, 240, 200, 5], [0.5, 0.5, 0.5, 1, 1, 1, 1], 1, "", [], value => result.push(value));
   f.flushFrames(); f.flushFrames();
-  assert.deepEqual(result, [false]);
+  assert.deepEqual(result, ['failed']);
   browser.mmltkIntegrationDatasetPixels(201, [10, 10, 224, 200], [10, 220, 200, 5, 10, 240, 200, 5], [0.5, 0.5, 0.5, 1, 1, 1, 1], 1, "", [], value => result.push(value));
   browser.mmltkIntegrationInitialize(false);
   f.flushFrames(); f.flushFrames();
-  assert.deepEqual(result, [false, false]);
+  assert.deepEqual(result, ['failed', 'invalidated']);
 });
 
 
@@ -1236,8 +1238,130 @@ for (const blank of [false, true]) {
     if (!blank) f.sampling.raster = (x, y) => x % 8 < 4 ? [32, 32, 32, 255] : [240, 240, 240, 255];
     browser.mmltkIntegrationDatasetPixels(5, [], [], [], 1, 'train.dataset.validation.coconut.description', [10, 10, 200, 16], value => result.push(value));
     f.flushFrames(); f.flushFrames();
-    assert.deepEqual(result, [!blank]);
+    assert.deepEqual(result, [blank ? 'failed' : 'observed']);
     assert.equal(f.allocations.copies, 1);
     assert.equal(f.reports.find(record => record.event === 'integration.dataset_label_pixels').d, blank ? '0' : '1');
   });
 }
+
+for (const labels of [false, true]) {
+  test(`Dataset owns borrowed Wasm facts across reuse and growth: labels=${labels}`, t => {
+    const f = canvasFixture(t, true), results = [];
+    f.sampling.raster = (x, y) => y >= 220 ?
+      ((y === 222 || y === 242) && x >= 35 && x < 185 ? [128, 128, 128, 255] : [255, 255, 255, 255]) :
+      (x % 8 < 4 ? [32, 32, 32, 255] : [240, 240, 240, 255]);
+    const memory = new WebAssembly.Memory({initial: 1});
+    const borrowed = new Float64Array(memory.buffer, 0, 23);
+    borrowed.set([10, 10, 224, 200, 10, 220, 200, 5, 10, 240, 200, 5,
+      0.5, 0.5, 0.5, 1, 1, 1, 1, 10, 10, 200, 16]);
+    browser.mmltkIntegrationDatasetPixels(labels ? 5 : 200, borrowed.subarray(0, 4),
+      borrowed.subarray(4, 12), borrowed.subarray(12, 19), 1,
+      labels ? 'train.dataset.validation.coconut.description' : '',
+      borrowed.subarray(19, labels ? 23 : 19), (...values) => results.push(values));
+    borrowed.fill(-1000);
+    memory.grow(1);
+    f.flushFrames();
+    assert.deepEqual(results, [['observed', 0, 0]]);
+    assert.equal(f.allocations.copies, 1);
+    assert.equal(f.allocations.reads, 3);
+    f.flushFrames();
+    assert.equal(results.length, 1);
+  });
+}
+
+for (const retire of ['disable', 'replace', 'reset', 'resize', 'css']) {
+  test(`Dataset retired capture is inert and a fresh request works: ${retire}`, t => {
+    const f = canvasFixture(t, true), results = [];
+    f.sampling.raster = x => x % 8 < 4 ? [32, 32, 32, 255] : [240, 240, 240, 255];
+    const admit = () => browser.mmltkIntegrationDatasetPixels(5, [], [], [], 1,
+      'train.dataset.validation.coconut.description', [10, 10, 200, 16],
+      (...values) => results.push(values));
+    admit();
+    f.frames.shift()();
+    if (retire === 'disable' || retire === 'replace') browser.mmltkIntegrationInitialize(false);
+    if (retire === 'replace') browser.mmltkIntegrationInitialize(true);
+    if (retire === 'reset') browser.mmltkIntegrationResetScenario();
+    if (retire === 'resize') ++f.canvas.width;
+    if (retire === 'css') ++f.css.width;
+    f.flushFrames();
+    assert.deepEqual(results, [['invalidated', 0, 0]]);
+    assert.equal(f.allocations.copies, 0);
+    assert.equal(f.allocations.reads, 0);
+    assert.equal(f.allocations.scratch, 0);
+    assert.deepEqual(f.reports, []);
+    browser.mmltkIntegrationInitialize(true);
+    admit();
+    f.flushFrames();
+    assert.deepEqual(results, [['invalidated', 0, 0], ['observed', 0, 0]]);
+    assert.equal(f.allocations.copies, 1);
+  });
+}
+
+
+test('Dataset same-key supersession and reporting retirement have scoped zero-work receipts', t => {
+  const f = canvasFixture(t, true), results = [];
+  f.sampling.raster = (x, y) => y >= 220 ?
+    ((y === 222 || y === 242) && x >= 35 && x < 185 ? [128, 128, 128, 255] : [255, 255, 255, 255]) :
+    (x % 8 < 4 ? [32, 32, 32, 255] : [240, 240, 240, 255]);
+  const admit = step => browser.mmltkIntegrationDatasetPixels(200,
+    [10, 10, 224, 200], [10, 220, 200, 5, 10, 240, 200, 5],
+    [0.5, 0.5, 0.5, 1, 1, 1, 1], 1, '', [],
+    outcome => results.push([step, outcome]), 100 + step, step);
+  admit(2);
+  admit(3);
+  f.flushFrames();
+  admit(5);
+  browser.mmltkIntegrationDatasetCustody(5);
+  const before = {...f.allocations}, reportCount = f.reports.length;
+  f.flushFrames();
+  assert.deepEqual(f.allocations, before);
+  assert.deepEqual(f.reports.slice(reportCount).map(record => record.detail), ['deferred', 'drained']);
+  const retirement = f.reports.find(record => record.case === 5 && record.detail === 'drained');
+  assert.notEqual(retirement.owner, retirement.current_owner);
+  assert.equal(retirement.scratch_empty, true);
+  assert.equal(retirement.owner_reports, 0);
+  admit(6);
+  f.flushFrames();
+  assert.deepEqual(results, [[2, 'invalidated'], [3, 'observed'], [5, 'invalidated'], [6, 'observed']]);
+  const receipts = f.reports.filter(record => record.event === 'integration.dataset_custody');
+  for (const step of [2, 5]) {
+    const terminal = receipts.filter(record => record.case === step && record.detail === 'invalidated');
+    assert.equal(terminal.length, 1);
+    assert.deepEqual([terminal[0].snapshots, terminal[0].reads, terminal[0].reports], [0, 0, 0]);
+    assert.equal(terminal[0].stimulus, true);
+  }
+  for (const step of [3, 6]) {
+    const terminal = receipts.find(record => record.case === step && record.detail === 'observed');
+    assert.deepEqual([terminal.snapshots, terminal.reads, terminal.reports], [1, 3, 3]);
+    assert.equal(f.reports.filter(record => record.custody_scope === 100 + step).length, 3);
+  }
+});
+
+
+test('Dataset geometry custody rejects at the deferred check before restoration and notification', t => {
+  const f = canvasFixture(t, true), result = [];
+  f.canvas.getBoundingClientRect = () => ({...f.css,
+    width: parseFloat(f.canvas.style.getPropertyValue('width')) || f.css.width,
+    height: parseFloat(f.canvas.style.getPropertyValue('height')) || f.css.height});
+  browser.mmltkIntegrationDatasetPixels(200, [10, 10, 224, 200],
+    [10, 220, 200, 5, 10, 240, 200, 5], [0.5, 0.5, 0.5, 1, 1, 1, 1],
+    1, '', [], outcome => result.push(outcome), 104, 4);
+  browser.mmltkIntegrationDatasetCustody(4);
+  assert.equal(f.canvas.getBoundingClientRect().width, 641);
+  assert.deepEqual(result, []);
+  f.frames.shift()();
+  assert.deepEqual(result, []);
+  f.frames.shift()();
+  assert.deepEqual(result, []);
+  assert.equal(f.canvas.getBoundingClientRect().width, 640);
+  f.flushFrames();
+  assert.deepEqual(result, ['invalidated']);
+  assert.equal(f.allocations.copies, 0);
+  assert.equal(f.allocations.reads, 0);
+  const receipts = f.reports.filter(record => record.event === 'integration.dataset_custody');
+  assert.deepEqual(receipts.map(record => record.detail), ['admitted', 'stimulus', 'deferred', 'invalidated', 'restored', 'drained']);
+  assert.equal(receipts[2].geometry_current, false);
+  assert.equal(receipts[2].current_width, 641);
+  assert.equal(receipts.at(-1).scratch_unchanged, true);
+  assert.equal(receipts.at(-1).reports_unchanged, true);
+});

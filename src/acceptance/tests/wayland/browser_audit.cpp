@@ -629,7 +629,7 @@ bool BrowserAudit::dataset_transitions_complete() const {
 }
 
 bool BrowserAudit::dataset_presentation_complete() const {
- if (!dataset_presentation_valid || dataset_fixture_cases.size() != 36U || dataset_fixture_pixels.size() != 36U) return false;
+ if (!dataset_presentation_valid || dataset_custody_cases != 6U || dataset_custody_state != 0U || dataset_custody_drains != 3U || dataset_retired_scope != 0U || dataset_fixture_cases.size() != 36U || dataset_fixture_pixels.size() != 36U) return false;
  for (const auto base : {200U, 209U, 218U, 227U}) {
   for (std::uint64_t stage = 0U; stage < 9U; ++stage) {
    if (!dataset_fixture_heights.contains(base + stage)) return false;
@@ -673,6 +673,20 @@ auto BrowserAudit::consume(const nlohmann::json& record) -> void {
  }
  ++ordinal;
  const std::string event = record.value("event", "");
+ if (record.contains("custody_scope") || record.contains("custody_case")) {
+  const auto step = scalar(record, "custody_case");
+  const auto control = record.value("control", "");
+  const unsigned bit = event == "integration.dataset_pixels" && control == "dataset.presentation" ? 1U :
+   event == "integration.dataset_divider_pixels" && control == "train.dataset.benchmark_divider" ? 2U :
+   event == "integration.dataset_divider_pixels" && control == "train.dataset.dimensions_divider" ? 4U : 0U;
+  const bool valid = bit != 0U && (dataset_custody_reports & bit) == 0U &&
+   (step == 1U || step == 3U || step == 6U) && step == dataset_custody_cases + 1U &&
+   scalar(record, "custody_scope") == dataset_custody_scope && dataset_custody_state != 0U &&
+   scalar(record, "a") == 200U;
+  dataset_presentation_valid = dataset_presentation_valid && valid;
+  if (valid) dataset_custody_reports |= bit;
+ }
+
  if (event == "iced.surface.scroll_stage" && record.value("control", "") == "held-visible" && atlas_draws.valid && atlas_draws.held_stages.contains("held-visible")) held_visible_ordinal = ordinal;
  if (event == "iced.gallery.source") consume_gallery_generation(record);
  if (event == "integration.phase_progress") {
@@ -1126,6 +1140,68 @@ auto BrowserAudit::consume(const nlohmann::json& record) -> void {
   dataset_offscreen_release = record.value("detail", "") == "native-unchanged" && scalar(record, "a") != 0U && scalar(record, "b") == 1U;
  } else if (event == "integration.dataset_hidden_input") {
   dataset_hidden_input = record.value("detail", "") == "real-click-during-collapse" && scalar(record, "b") == 1U;
+ } else if (event == "integration.dataset_custody") {
+  const auto step = scalar(record, "case");
+  const auto scope = scalar(record, "scope");
+  const auto phase = record.value("detail", "");
+  const bool stimulus_case = step == 1U || step == 2U || step == 4U || step == 5U;
+  const bool observed_case = step == 1U || step == 3U || step == 6U;
+  const bool quiet = scalar(record, "snapshots") == 0U && scalar(record, "reads") == 0U && scalar(record, "reports") == 0U;
+  bool valid = step >= 1U && step <= 6U && step == dataset_custody_cases + 1U &&
+   scalar(record, "key") == 200U && record.value("control", "") == "dataset.presentation" &&
+   record.contains("snapshots") && record.contains("reads") && record.contains("reports") && record.contains("stimulus");
+  const auto owner = scalar(record, "owner");
+  if (phase == "deferred" || phase == "restored" || phase == "replaced" || phase == "drained") {
+   valid = record.value("control", "") == "dataset.presentation" && scalar(record, "key") == 200U &&
+    record.contains("snapshots") && record.contains("reads") && record.contains("reports") && record.value("stimulus", false) &&
+    step == dataset_retired_case && scope != 0U && scope == dataset_retired_scope && owner == dataset_retired_owner && quiet;
+   const auto current_owner = scalar(record, "current_owner");
+   if (phase == "deferred") {
+    valid = valid && (dataset_retired_checks & 1U) == 0U &&
+     record.value("owner_current", false) == (step != 5U) &&
+     record.value("request_current", false) == (step == 4U) &&
+     record.value("geometry_current", false) == (step != 4U) &&
+     current_owner == (step == 5U ? dataset_replacement_owner : owner);
+    if (step == 2U) valid = valid && scalar(record, "current_scope") > scope && scalar(record, "current_key") == 200U;
+    if (step == 4U) valid = valid && scalar(record, "current_scope") == scope && scalar(record, "current_key") == 200U && numeric(record, "original_width") == dataset_original_width && numeric(record, "current_width") == dataset_changed_width;
+    if (valid) dataset_retired_checks |= 1U;
+   } else if (phase == "restored") {
+    valid = valid && step == 4U && dataset_retired_checks == 1U &&
+     numeric(record, "original_width") == dataset_original_width && numeric(record, "current_width") == dataset_original_width;
+    if (valid) dataset_retired_checks |= 2U;
+   } else if (phase == "replaced") {
+    valid = valid && step == 5U && dataset_retired_checks == 0U && current_owner != 0U && current_owner != owner &&
+     record.value("scratch_empty", false) && record.contains("owner_reports") && scalar(record, "owner_reports") == 0U;
+    if (valid) { dataset_replacement_owner = current_owner; dataset_retired_checks |= 2U; }
+   } else {
+    valid = valid && dataset_retired_checks == (step == 2U ? 1U : 3U) &&
+     record.value("restored", false) && current_owner == (step == 5U ? dataset_replacement_owner : owner) &&
+     (step == 5U ? record.value("scratch_empty", false) && record.contains("owner_reports") && scalar(record, "owner_reports") == 0U :
+      record.value("scratch_unchanged", false) && record.value("reports_unchanged", false));
+    if (valid) { dataset_retired_scope = 0U; ++dataset_custody_drains; }
+   }
+  } else if (phase == "admitted") {
+   valid = valid && dataset_custody_state == 0U && owner != 0U && scope > dataset_custody_scope && quiet && !record.value("stimulus", false);
+   if (valid) { dataset_custody_scope = scope; dataset_custody_owner = owner; dataset_custody_state = 1U; dataset_custody_reports = 0U; }
+  } else if (phase == "stimulus") {
+   valid = valid && dataset_custody_state == 1U && scope == dataset_custody_scope && owner == dataset_custody_owner && stimulus_case && quiet && record.value("stimulus", false);
+   if (step != 1U) valid = valid && dataset_retired_scope == 0U;
+   if (step == 4U) valid = valid && numeric(record, "original_width") > 0.0 && numeric(record, "current_width") > 0.0 && numeric(record, "original_width") != numeric(record, "current_width");
+   if (valid) {
+    dataset_custody_state = 2U;
+    if (step != 1U) {
+     dataset_retired_scope = scope; dataset_retired_case = static_cast<unsigned>(step); dataset_retired_owner = owner; dataset_retired_checks = 0U;
+     dataset_original_width = numeric(record, "original_width"); dataset_changed_width = numeric(record, "current_width");
+    }
+   }
+  } else {
+   valid = valid && scope == dataset_custody_scope && owner == dataset_custody_owner && dataset_custody_state == (stimulus_case ? 2U : 1U) &&
+    record.value("stimulus", false) == stimulus_case && dataset_custody_reports == (observed_case ? 7U : 0U) && phase == (observed_case ? "observed" : "invalidated") &&
+    (observed_case ? scalar(record, "snapshots") == 1U && scalar(record, "reads") == 3U && scalar(record, "reports") == 3U : quiet);
+   if (observed_case) valid = valid && dataset_retired_scope == 0U;
+   if (valid) { ++dataset_custody_cases; dataset_custody_state = 0U; }
+  }
+  dataset_presentation_valid = dataset_presentation_valid && valid;
  } else if (event == "integration.dataset_divider_pixels") {
   const auto key = scalar(record, "a");
   const auto control = record.value("control", "");

@@ -163,7 +163,7 @@ const ANNOTATION_SURFACE: &str = annotation::WORKSPACE_ID;
 #[derive(Debug, Clone)]
 pub enum Message {
     DatasetDrawn(dataset_presentation::Frame),
-    DatasetPixels(u16, bool),
+    DatasetPixels(u64, u16, pixel_checks::ProbeOutcome),
     DatasetDisclosureToggle,
     DatasetInputDelivered(u8, bool),
     PrimaryActionPixels {
@@ -1725,12 +1725,13 @@ impl Controller {
             Message::DatasetDrawn(frame) => {
                 let bounded = !(100..=102).contains(&frame.key);
                 self.lifecycle.presentation.observe(frame);
-                if bounded && self.lifecycle.presentation.frames > 180 { self.driver.fail("Dataset observation exceeded its frame budget"); }
+                if bounded && self.lifecycle.presentation.frames > dataset_presentation::OBSERVATION_BUDGET { self.driver.fail("Dataset observation exceeded its frame budget"); }
                 return None;
             }
-            Message::DatasetPixels(key, valid) => {
-                if valid { self.lifecycle.presentation.pixels = Some(key); }
-                else { self.driver.fail("Dataset rendered pixel observation failed"); }
+            Message::DatasetPixels(request, key, outcome) => {
+                if self.lifecycle.presentation.complete(request, key, outcome) {
+                    self.driver.fail("Dataset rendered pixel observation failed");
+                }
                 return None;
             }
             Message::PrimaryActionMeasure { control, token } => {

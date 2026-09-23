@@ -1,4 +1,5 @@
 let integrationState;
+let integrationOwnerSequence = 0;
 let integrationDriver;
 
 export function mmltkIntegrationDriver(enabled) {
@@ -18,6 +19,7 @@ export function mmltkIntegrationDriver(enabled) {
 export function mmltkIntegrationInitialize(enabled) {
   if (!enabled) {
     if (integrationState) {
+      integrationState.datasetPixels?.finish('invalidated');
       for (const type of integrationState.inputTypes) {
         window.removeEventListener(type, integrationState.onInput, true);
       }
@@ -29,6 +31,8 @@ export function mmltkIntegrationInitialize(enabled) {
   }
   if (integrationState) return;
   integrationState = {
+    datasetOwner: ++integrationOwnerSequence,
+    datasetPixelReports: 0,
     integrationSurfaceDraws: new Map(),
     completions: new Set(),
     initialAtlasExpected: false,
@@ -1523,20 +1527,80 @@ export function mmltkIntegrationConfidenceInput(x, y, action, value, completed) 
 }
 
 // A bounded component probe, separate from native compile lifecycle receipts.
-export function mmltkIntegrationDatasetPixels(key, bounds, dividers, colors, scale, labelIds, labels, callback) {
+export function mmltkIntegrationDatasetPixels(key, bounds, dividers, colors, scale, labelIds, labels, callback, scope = 0, custody = 0, budget = 180) {
   if (!integrationState || !integrationDriver) return;
-  const complete = integrationCompletion(result => callback(result === true));
+  const owner = integrationState, geometry = canvasGeometry();
+  if (owner.datasetPixels?.custody === 2) owner.datasetPixels.stimulate();
+  owner.datasetPixels?.finish('invalidated');
+  const originalScratch = owner.canvasScratch, originalContext = owner.canvasContext, originalReports = owner.datasetPixelReports;
+  const request = {scope, custody, key, geometry, snapshots: 0, reads: 0, reports: 0, done: false, stimulus: false};
+  const evidence = (phase, facts = {}) => {
+    if (custody) report({event: 'integration.dataset_custody', control: 'dataset.presentation',
+      detail: phase, scope, case: custody, key, snapshots: request.snapshots,
+      reads: request.reads, reports: request.reports, stimulus: request.stimulus,
+      owner: owner.datasetOwner, ...facts});
+  };
+  request.notify = integrationCompletion(callback);
+  const complete = integrationCompletion(outcome => {
+    request.done = true;
+    if (owner.datasetPixels === request) owner.datasetPixels = undefined;
+    evidence(outcome);
+    request.outcome = outcome;
+    if (![2, 4, 5].includes(custody)) request.notify(outcome, 0, 0);
+  });
+  request.finish = complete;
+  request.stimulate = facts => { request.stimulus = true; evidence('stimulus', facts); };
+  request.transition = evidence;
+  request.owner = owner;
+  owner.datasetPixels = request;
+  evidence('admitted');
+  const emit = record => {
+    ++request.reports;
+    ++integrationState.datasetPixelReports;
+    if (custody) { record.custody_scope = scope; record.custody_case = custody; }
+    report(record);
+  };
+  // Bindgen slices borrow Wasm memory only until this call returns.
+  bounds = Array.from(bounds);
+  dividers = Array.from(dividers);
+  colors = Array.from(colors);
+  labels = Array.from(labels);
+  const drained = () => {
+    if (![2, 4, 5].includes(custody)) return;
+    const current = integrationState;
+    evidence('drained', {current_owner: current?.datasetOwner ?? 0,
+      scratch_empty: !current?.canvasScratch && !current?.canvasContext,
+      owner_reports: current?.datasetPixelReports ?? 0,
+      restored: sameGeometry(geometry, canvasGeometry()),
+      scratch_unchanged: current?.canvasScratch === originalScratch && current?.canvasContext === originalContext,
+      reports_unchanged: current?.datasetPixelReports === originalReports});
+    request.notify(request.outcome, 0, 0);
+  };
   integrationFrame(() => integrationFrame(() => {
     try {
-      const canvas = document.querySelector('canvas');
+      const ownerCurrent = integrationState === owner;
+      const geometryCurrent = sameGeometry(geometry, canvasGeometry());
+      if ([2, 4, 5].includes(custody)) evidence('deferred', {
+        current_owner: integrationState?.datasetOwner ?? 0,
+        owner_current: ownerCurrent, geometry_current: geometryCurrent,
+        request_current: owner.datasetPixels === request,
+        current_scope: integrationState?.datasetPixels?.scope ?? 0,
+        current_key: integrationState?.datasetPixels?.key ?? 0,
+        original_width: geometry.css[2], current_width: canvasGeometry().css?.[2] ?? 0});
+      if (request.done || !ownerCurrent || owner.datasetPixels !== request || !geometryCurrent) {
+        complete('invalidated'); return;
+      }
+      const canvas = geometry.canvas;
       const rect = canvas.getBoundingClientRect();
       const sx = canvas.width / rect.width, sy = canvas.height / rect.height;
       const context = canvasSnapshot(canvas);
+      ++request.snapshots;
       const read = bounds => {
         const x = Math.ceil(bounds[0] * sx), y = Math.ceil(bounds[1] * sy);
         const width = Math.floor(bounds[2] * sx), height = Math.floor(bounds[3] * sy);
         if (width <= 0 || height <= 0 || x < 0 || y < 0 || x + width > canvas.width || y + height > canvas.height)
           throw new Error('component outside rendered canvas');
+        ++request.reads;
         return {width, height, pixels: context.getImageData(x, y, width, height).data};
       };
       const textProbe = key >= 2 && key <= 5 || key >= 121 && key <= 125;
@@ -1551,7 +1615,7 @@ export function mmltkIntegrationDatasetPixels(key, bounds, dividers, colors, sca
         }
         const matched = maximum - minimum >= 20;
         valid &&= matched;
-        report({event: 'integration.dataset_label_pixels', control: ids[index], detail: 'drawn-label-canvas',
+        emit({event: 'integration.dataset_label_pixels', control: ids[index], detail: 'drawn-label-canvas',
           a: String(key), b: String(width * height), c: String(maximum - minimum), d: String(Number(matched))});
       }
       if (key >= 200) {
@@ -1563,7 +1627,7 @@ export function mmltkIntegrationDatasetPixels(key, bounds, dividers, colors, sca
           if (Math.max(pixels[i], pixels[i + 1], pixels[i + 2]) - Math.min(pixels[i], pixels[i + 1], pixels[i + 2]) > 30) ++colored;
         }
         valid &&= maximum - minimum >= 20;
-        report({event: 'integration.dataset_pixels', control: 'dataset.presentation', detail: 'component-canvas',
+        emit({event: 'integration.dataset_pixels', control: 'dataset.presentation', detail: 'component-canvas',
           a: String(key), b: String(width), c: String(height), d: String(maximum - minimum), colored});
       }
       for (let index = 0; index < dividers.length; index += 4) {
@@ -1591,17 +1655,64 @@ export function mmltkIntegrationDatasetPixels(key, bounds, dividers, colors, sca
         const matched = Math.abs(span - width * .75) <= 2 && Math.abs(first - (width - span) / 2) <= 1.5 &&
           Math.abs(stroke - sy * scale) <= .65 && gap <= .12;
         valid &&= matched;
-        report({event: 'integration.dataset_divider_pixels', control: index === 0 ? 'train.dataset.benchmark_divider' : 'train.dataset.dimensions_divider',
+        emit({event: 'integration.dataset_divider_pixels', control: index === 0 ? 'train.dataset.benchmark_divider' : 'train.dataset.dimensions_divider',
           detail: 'card-outline-canvas', a: String(key), b: String(width), c: String(span), d: String(stroke),
           scale: sy * scale, gap, matched});
       }
-      complete(valid);
+      complete(valid ? 'observed' : 'failed');
     } catch (error) {
-      report({event: 'integration.failure', control: 'dataset.presentation', detail: String(error),
+      emit({event: 'integration.failure', control: 'dataset.presentation', detail: String(error),
         a: String(key), b: '0', c: '0', d: '0'});
-      complete(false);
+      complete('failed');
+    } finally {
+      if (custody === 4) {
+        mmltkIntegrationRestoreCanvasSize();
+        // Follow actual backing/ResizeObserver settlement, under the existing
+        // observation frame budget and scenario lifetime.
+        const restored = () => {
+          if (!sameGeometry(geometry, canvasGeometry())) {
+            if (--budget <= 0) { request.notify('failed', 0, 0); return; }
+            integrationFrame(restored); return;
+          }
+          evidence('restored', {original_width: geometry.css[2], current_width: canvasGeometry().css[2]});
+          drained();
+        };
+        integrationFrame(restored);
+      } else drained();
     }
+
   }));
+}
+
+export function mmltkIntegrationDatasetRetire(scope) {
+  const request = integrationState?.datasetPixels;
+  if (request?.scope === scope) request.finish('invalidated');
+}
+
+// Bounded packaged acceptance stimuli act only on probe custody and temporary
+// canvas styling. Native control generations and application input stay intact.
+export function mmltkIntegrationDatasetCustody(action) {
+  const request = integrationState?.datasetPixels;
+  if (!integrationDriver || !request || request.custody !== action) return;
+  if (action === 1) request.stimulate();
+  else if (action === 4) {
+    const original = request.geometry;
+    const changed = mmltkIntegrationCanvasSize(original.css[2] + 1, original.css[3]);
+    if (changed && !sameGeometry(original, canvasGeometry())) {
+      request.stimulate({original_width: original.css[2], current_width: canvasGeometry().css[2]});
+    } else request.finish('failed');
+  } else if (action === 5) {
+    request.stimulate();
+    // Transfer only the deferred notification's reset cleanup. The capture
+    // itself remains with its original owner and is retired by initialization.
+    request.owner.completions.delete(request.notify);
+    mmltkIntegrationInitialize(false);
+    mmltkIntegrationInitialize(true);
+    request.notify = integrationCompletion(request.notify);
+    request.transition('replaced', {current_owner: integrationState.datasetOwner,
+      scratch_empty: !integrationState.canvasScratch && !integrationState.canvasContext,
+      owner_reports: integrationState.datasetPixelReports});
+  }
 }
 
 // Real pointer custody is retained across the requested wheel/release steps.

@@ -227,6 +227,19 @@ struct BrowserAudit final {
  std::set<std::uint64_t> dataset_fixture_pixels;
  std::set<std::pair<std::uint64_t, std::string>> dataset_divider_pixels;
  std::set<std::uint64_t> dataset_fixture_cases;
+ std::uint64_t dataset_custody_scope = 0;
+ unsigned dataset_custody_cases = 0;
+ unsigned dataset_custody_state = 0;
+ unsigned dataset_custody_reports = 0;
+ std::uint64_t dataset_custody_owner = 0;
+ std::uint64_t dataset_retired_scope = 0;
+ std::uint64_t dataset_retired_owner = 0;
+ std::uint64_t dataset_replacement_owner = 0;
+ unsigned dataset_retired_case = 0;
+ unsigned dataset_retired_checks = 0;
+ unsigned dataset_custody_drains = 0;
+ double dataset_original_width = 0.0;
+ double dataset_changed_width = 0.0;
  bool dataset_presentation_valid = true;
  struct DatasetPaint {
   std::array<double, 4> bounds{}, label{}, clip{}, font{};

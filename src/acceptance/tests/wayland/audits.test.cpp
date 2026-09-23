@@ -2504,4 +2504,90 @@ TEST_CASE("Dataset divider pixel audit requires both geometry and matching color
   CHECK(audit.dataset_divider_pixels.size() == (defect == "none" ? 1U : 0U));
  }
 }
+TEST_CASE("Dataset presentation requires complete scoped custody evidence", "[workspace][audit]") {
+ for (const std::string defect : {"none", "missing", "duplicate", "stale-scope", "wrong-key", "retired-read", "extra-snapshot", "missing-count", "missing-stimulus", "conflicting-outcome", "missing-rendered", "retired-rendered", "duplicate-rendered", "missing-deferred", "failed-restoration", "unchanged-owner", "missing-drain", "post-retirement-work", "replacement-scratch", "replacement-report"}) {
+  BrowserAudit audit;
+  // Supply the independent existing fixture predicate; custody cannot borrow
+  // success from those geometry/pixel cases or from native lifecycle facts.
+  for (const auto base : {200U, 209U, 218U, 227U}) {
+   for (unsigned stage = 0; stage < 9U; ++stage) {
+    const auto key = base + stage;
+    audit.dataset_fixture_cases.insert(key);
+    audit.dataset_fixture_pixels.insert(key);
+    audit.dataset_fixture_heights[key] = stage < 5U ? 100.0 : 20.0;
+    for (const auto* id : {"train.dataset.benchmark_divider", "train.dataset.dimensions_divider"}) audit.dataset_divider_pixels.emplace(key, id);
+   }
+   audit.dataset_fixture_frames[base + 5U] = {100.0, 60.0, 20.0};
+  }
+  CHECK_FALSE(audit.dataset_presentation_complete());
+  for (unsigned step = 1U; step <= 6U; ++step) {
+   const bool stimulus = step == 1U || step == 2U || step == 4U || step == 5U;
+   const bool observed = step == 1U || step == 3U || step == 6U;
+   nlohmann::json record{{"event", "integration.dataset_custody"}, {"control", "dataset.presentation"},
+    {"detail", "admitted"}, {"case", step}, {"scope", 100U + step}, {"key", 200U},
+    {"snapshots", 0U}, {"reads", 0U}, {"reports", 0U}, {"stimulus", false}, {"owner", step == 6U ? 2U : 1U}};
+   audit.consume(record);
+   if (stimulus) {
+    record["detail"] = "stimulus";
+    record["stimulus"] = true;
+    if (step == 4U) { record["original_width"] = 640U; record["current_width"] = 641U; }
+    if (!(defect == "missing-stimulus" && step == 1U)) audit.consume(record);
+   }
+   auto deferred = record;
+   deferred["detail"] = "deferred";
+   deferred["current_owner"] = step == 5U ? 2U : 1U;
+   deferred["owner_current"] = step != 5U;
+   deferred["request_current"] = step == 4U;
+   deferred["current_scope"] = step == 2U ? 103U : step == 4U ? 104U : 0U;
+   deferred["current_key"] = step == 5U ? 0U : 200U;
+   deferred["geometry_current"] = step != 4U;
+   if (step == 4U && defect != "missing-deferred") audit.consume(deferred);
+   if (observed || (step == 2U && defect == "retired-rendered")) {
+    for (unsigned index = 0U; index < 3U; ++index) {
+     if (defect == "missing-rendered" && step == 3U && index == 0U) continue;
+     audit.consume({{"event", index == 0U ? "integration.dataset_pixels" : "integration.dataset_divider_pixels"},
+      {"control", index == 0U ? "dataset.presentation" : index == 1U || defect == "duplicate-rendered" ? "train.dataset.benchmark_divider" : "train.dataset.dimensions_divider"},
+      {"a", 200U}, {"custody_scope", 100U + step}, {"custody_case", step}});
+    }
+   }
+   record["detail"] = observed ? "observed" : "invalidated";
+   record["snapshots"] = observed ? 1U : 0U;
+   record["reads"] = observed ? 3U : 0U;
+   record["reports"] = observed ? 3U : 0U;
+   if (step == 2U) {
+    if (defect == "stale-scope") record["scope"] = 101U;
+    if (defect == "wrong-key") record["key"] = 201U;
+    if (defect == "retired-read") record["reads"] = 1U;
+    if (defect == "missing-count") record.erase("reports");
+    if (defect == "conflicting-outcome") record["detail"] = "observed";
+   }
+   if (step == 3U && defect == "extra-snapshot") record["snapshots"] = 2U;
+   if (!(step == 2U && defect == "missing")) audit.consume(record);
+   if (step == 2U && defect == "duplicate") audit.consume(record);
+   if (!observed) {
+    auto extra = record;
+    extra["snapshots"] = 0U; extra["reads"] = 0U; extra["reports"] = 0U;
+    extra["current_owner"] = step == 5U ? 2U : 1U;
+    extra["scratch_empty"] = true; extra["owner_reports"] = 0U;
+    if (step == 5U) {
+     extra["detail"] = "replaced";
+     if (defect == "unchanged-owner") extra["current_owner"] = 1U;
+     audit.consume(extra);
+    }
+    if (step != 4U) audit.consume(deferred);
+    if (step == 4U) {
+     extra["detail"] = "restored"; extra["current_width"] = defect == "failed-restoration" ? 641U : 640U;
+     audit.consume(extra);
+    }
+    extra["detail"] = "drained";
+    extra["restored"] = true; extra["scratch_unchanged"] = true; extra["reports_unchanged"] = true;
+    if (step == 2U && defect == "post-retirement-work") extra["reads"] = 1U;
+    if (step == 5U && defect == "replacement-scratch") extra["scratch_empty"] = false;
+    if (step == 5U && defect == "replacement-report") extra["owner_reports"] = 1U;
+    if (!(step == 2U && defect == "missing-drain")) audit.consume(extra);
+   }
+  }
+  CHECK(audit.dataset_presentation_complete() == (defect == "none"));
+ }
+}
 }  // namespace mmltk::acceptance::wayland
