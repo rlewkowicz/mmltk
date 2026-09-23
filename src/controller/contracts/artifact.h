@@ -7,6 +7,7 @@
 #include <type_traits>
 #include <vector>
 #include "src/backend/data/dataset_compile_phase.h"
+#include "src/backend/data/dataset_compile_progress.h"
 #include "src/frameworks/reflection/field_policy.h"
 #include "src/frameworks/reflection/reflected_field_policy.h"
 #include "src/frameworks/reflection/reflection_metadata.h"
@@ -20,7 +21,7 @@ inline constexpr std::size_t kArtifactPathCapacity = 4096U;
 inline constexpr std::size_t kArtifactErrorCapacity = 4096U;
 inline constexpr std::size_t kArtifactPresetCapacity = 256U;
 inline constexpr std::size_t kArtifactUiStateByteBudget = 64U * 1024U;
-inline constexpr std::size_t kArtifactProgressTextCapacity = 1024U;
+inline constexpr std::size_t kArtifactProgressTextCapacity = mmltk::backend::data::kDatasetCompileProgressTextCapacity;
 [[nodiscard]] inline std::string bounded_artifact_detail(const std::string_view value) { return std::string{value.substr(0U, kArtifactErrorCapacity)}; }
 struct ArtifactSplitFact final {
  [[= mmltk::frameworks::reflection::MaxBytes{kArtifactPathCapacity}]] std::string path;
@@ -74,7 +75,11 @@ struct ArtifactProgress final {
  [[= reflection::ProgressField{reflection::ProgressFieldSemantic::ProjectedOutput}]] std::uint64_t projected_output_bytes = 0U;
  [[= reflection::ProgressField{reflection::ProgressFieldSemantic::Dropped}]] std::uint64_t dropped_instances = 0U;
  [[= reflection::ProgressField{reflection::ProgressFieldSemantic::Quarantined}]] std::uint64_t quarantined_images = 0U;
+ mmltk::backend::data::DatasetCompileTracks tracks{};
+ [[= mmltk::frameworks::reflection::MaxItems{5U}]] std::vector<mmltk::backend::data::BenchmarkSourceProgress> sources{};
  [[nodiscard]] bool valid() const noexcept {
+  if (!tracks.valid() || sources.size() > 5U) return false;
+  for (const auto& source : sources) if (source.activity.size() > kArtifactProgressTextCapacity) return false;
   const auto phase_value = static_cast<std::uint8_t>(phase);
   return phase_value > static_cast<std::uint8_t>(ArtifactCompilePhase::Idle) && phase_value <= static_cast<std::uint8_t>(ArtifactCompilePhase::Publishing) &&
          activity.size() <= kArtifactProgressTextCapacity && (total == 0U || completed <= total);

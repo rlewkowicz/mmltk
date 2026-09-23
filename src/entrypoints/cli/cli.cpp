@@ -117,7 +117,7 @@ void run_compile(const data::CompilerConfig& config) {
                                                                  progress_state.bar->add(progress.done - *progress_state.last_done);
                                                                  *progress_state.last_done = progress.done;
                                                                 }
-                                                                progress_state.bar->set_postfix("processed " + std::to_string(progress.done) + "/" + std::to_string(progress.total));
+                                                                progress_state.bar->set_postfix(data::format_dataset_compile_tracks(progress.tracks));
                                                                }}};
  data::DatasetCompiler::compile(plan, 0U, &telemetry);
  bar.close();

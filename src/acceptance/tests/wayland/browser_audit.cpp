@@ -795,6 +795,13 @@ auto BrowserAudit::consume(const nlohmann::json& record) -> void {
   compile_dropped = scalar(record, "d");
   progress = record.value("control", "") == COMPILE_PROGRESS && scalar(record, "a") != 0U && !record.value("detail", "").empty() && compile_total != 0U && compile_completed <= compile_total;
   if (progress && progress_ordinal == 0U) progress_ordinal = ordinal;
+ } else if (event == "integration.compile_track_text") {
+  const auto control = record.value("control", "");
+  const auto detail = record.value("detail", "");
+  const bool label = control == "Acquisition" || control == "Labels/masks" || control == "Pixels";
+  const bool zero_acquisition = control != "Acquisition" || detail == "Acquisition · unnecessary · 0 / 0";
+  if (label && zero_acquisition && detail.starts_with(control + " · ") && detail.find(" / ") != std::string::npos && numeric(record, "c") > 0 && numeric(record, "d") > 0)
+   compile_tracks.insert(control);
  } else if (event == "integration.compile_metrics") {
   const std::uint64_t elapsed = scalar(record, "a");
   const auto expected = mmltk::backend::data::estimate_progress(compile_completed, compile_total, elapsed);
@@ -1400,7 +1407,7 @@ auto BrowserAudit::readiness_blocker() const -> std::string_view {
   "annotation composition", workspace_fps_text && workspace_fps_pixels, "visible workspace FPS",
   settings_composition && settings_numeric_alignment && show_fps_round_trip && ui_scale_drag && ui_scale_released && ui_scale_restored && complete_pointer_drag && error_composition &&
    error_modal_usable,
-  "Settings composition", dataset_configured && progress && compile_metrics && dataset_complete && progress_ordinal < dataset_complete_ordinal, "Dataset lifecycle", explore_ready, "ready snapshot",
+  "Settings composition", dataset_configured && progress && compile_metrics && compile_tracks.size() == 3U && dataset_complete && progress_ordinal < dataset_complete_ordinal, "Dataset lifecycle", explore_ready, "ready snapshot",
   sweep, "viewport sweep", scrolled, "gallery scroll", detail, "detail selection", bounded_exact_grid, "bounded exact grid", newest_placeholder, "newest placeholder", pointer_inverse,
   "pointer inverse", pointer_dispatched, "pointer dispatch", pointer_selected, "pointer selection", gallery_shader_fill, "gallery shader fill", pointer_render_chain, "pointer render chain",
   atlas_identities, "atlas identities", augmentation_enabled, "augmentation enabled", augmentation_rerolled, "augmentation rerolled", reshuffle_order_only, "reshuffle order only", detail_source,

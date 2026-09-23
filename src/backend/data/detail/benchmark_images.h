@@ -50,7 +50,7 @@ private:
 struct CachedImageReady {
  std::filesystem::path root;
  std::uint64_t image_id = 0;
- std::shared_ptr<const ArtifactLease> custody;
+ std::shared_ptr<const ArtifactLease> custody{};
 };
 using CachedImageReadySink = std::function<void(const CachedImageReady&)>;
 using CachedImageValidator = std::function<void(std::uint64_t, std::span<const std::uint8_t>)>;

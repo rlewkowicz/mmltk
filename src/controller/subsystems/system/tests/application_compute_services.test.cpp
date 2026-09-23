@@ -371,6 +371,7 @@ TEST_CASE("artifact compile adapters preserve canonical ordinary and benchmark e
  CHECK(projected_ordinary.remaining_seconds == 12U);
  CHECK(projected_ordinary.throughput_per_second == 5U);
  CHECK(projected_ordinary.dropped_instances == 7U);
+ CHECK(projected_ordinary.tracks == ordinary.tracks);
  data::BenchmarkCompileProgress benchmark{
   .phase = data::DatasetCompilePhase::Pixels,
   .activity = "Downloading",
@@ -398,6 +399,8 @@ TEST_CASE("artifact compile adapters preserve canonical ordinary and benchmark e
  CHECK(projected_benchmark.projected_output_bytes == 4096U);
  CHECK(projected_benchmark.dropped_instances == 11U);
  CHECK(projected_benchmark.quarantined_images == 13U);
+ CHECK(projected_benchmark.sources == benchmark.sources);
+ CHECK(projected_benchmark.tracks == benchmark.tracks);
 }
 TEST_CASE("artifact service owns verified cache publication and cancellation cleanup", "[gui][services]") {
  mmltk::testsupport::ScopedTempDir temporary("mmltk-artifact-service-contract");
@@ -1093,8 +1096,8 @@ TEST_CASE("benchmark current transfer changes artifact activity at the exact ima
  reporter.source_images(Source::kOpenImagesV7, 56008U, 56008U);
  reporter.projected(1039610446176ULL);
  const auto check_plateau = [&] {
-  CHECK(displayed.completed == 2416498U);
-  CHECK(displayed.total == 3000000U);
+  CHECK(displayed.tracks.acquisition.active);
+  CHECK(displayed.sources.size() == 3U);
   CHECK(displayed.projected_output_bytes == 1039610446176ULL);
   CHECK(latest.sources[1].completed_images == 170161U);
  };
@@ -1108,7 +1111,7 @@ TEST_CASE("benchmark current transfer changes artifact activity at the exact ima
    update.cache_hit = false;
    update.total_bytes = 1000U;
    update.completed_bytes = 100U;
-   reporter.source_transfer(update, 100000U, 200000U);
+   reporter.transfers().update(update, reporter);
    check_plateau();
    CHECK(displayed.activity.find("Objects365 v2") != std::string::npos);
    CHECK(displayed.activity.find("objects365-patch-17") != std::string::npos);
@@ -1117,7 +1120,7 @@ TEST_CASE("benchmark current transfer changes artifact activity at the exact ima
    if (resumed) { CHECK(displayed.activity.find("retained 64 bytes") != std::string::npos); }
    const auto prior = displayed.activity;
    update.completed_bytes = 200U;
-   reporter.source_transfer(update, 100100U, 200000U);
+   reporter.transfers().update(update, reporter);
    check_plateau();
    CHECK(displayed.activity != prior);
    CHECK(displayed.activity.find("200 / 1000 bytes") != std::string::npos);
@@ -1126,23 +1129,23 @@ TEST_CASE("benchmark current transfer changes artifact activity at the exact ima
  update = DownloadProgress{"objects365-invalidated-archive", 16U, 1000U, 1U};
  update.source = Source::kObjects365V2;
  update.redownload = true;
- reporter.source_transfer(update, 105016U, 205000U);
+ reporter.transfers().update(update, reporter);
  CHECK(displayed.activity.find("Re-downloading objects365-invalidated-archive") != std::string::npos);
  CHECK(displayed.activity.find("attempt 1") != std::string::npos);
  check_plateau();
  update = DownloadProgress{"objects365-cached-patch", 5000U, 5000U, 0U, false, true};
  update.source = Source::kObjects365V2;
- reporter.source_transfer(update, 105000U, 205000U);
+ reporter.transfers().update(update, reporter);
  CHECK(displayed.activity.find("bytes reused") != std::string::npos);
  update = DownloadProgress{"objects365-live-patch", 32U, 0U, 1U};
  update.source = Source::kObjects365V2;
- reporter.source_transfer(update, 105032U, 205000U);
+ reporter.transfers().update(update, reporter);
  CHECK(displayed.activity.find("32 bytes (total unknown)") != std::string::npos);
  CHECK(displayed.activity.find("reused") == std::string::npos);
  check_plateau();
  for (const auto phase : {DownloadProgressPhase::kVerifyingCachedArtifact, DownloadProgressPhase::kVerifyingDownloadedArtifact}) {
   update.phase = phase;
-  reporter.source_transfer(update, 105032U, 205000U);
+  reporter.transfers().update(update, reporter);
   CHECK(displayed.activity.find(phase == DownloadProgressPhase::kVerifyingCachedArtifact ? "Verifying cached" : "Verifying downloaded") != std::string::npos);
   check_plateau();
  }
@@ -1151,15 +1154,15 @@ TEST_CASE("benchmark current transfer changes artifact activity at the exact ima
  reporter.phase(data::DatasetCompilePhase::Labels);
  reporter.source_images(Source::kCoco2017, 123U, 123U);
  CHECK(displayed.activity == "Preparing compiled labels");
- reporter.source_transfer(update, 105032U, 205000U);
+ reporter.transfers().update(update, reporter);
  CHECK(displayed.activity == "Preparing compiled labels");
  reporter.source_complete(Source::kObjects365V2, false);
- reporter.pixel_attempt(0U, 20U, "train", 20U);
+ reporter.pixels(0U, 20U);
  reporter.source_activity(Source::kObjects365V2, "Repairing patch-17");
  CHECK(displayed.activity.find("Repairing patch-17") != std::string::npos);
- reporter.pixel_attempt(0U, 20U, "train", 20U);
- CHECK(displayed.activity == "Compiling image pixels");
- CHECK_FALSE(latest.current_source);
+ reporter.pixels(0U, 20U);
+ CHECK(displayed.tracks.pixels.active);
+ CHECK(displayed.tracks.pixels.total == 20U);
  reporter.source_activity(Source::kObjects365V2, std::string(4096U, 'x'));
  CHECK(displayed.activity.size() <= domain::kArtifactProgressTextCapacity);
 }
@@ -1212,8 +1215,9 @@ TEST_CASE("real ranged HTTP restart reaches the bounded artifact activity as a r
  for (std::size_t i = 0U; i < observed.size(); ++i) {
   const auto& update = observed[i];
   CHECK(displayed[i].valid());
-  CHECK(displayed[i].completed == 2416498U);
-  CHECK(displayed[i].total == 3000000U);
+  CHECK(displayed[i].tracks.acquisition.completed == update.completed_bytes);
+  CHECK(displayed[i].tracks.acquisition.total == update.total_bytes);
+  CHECK(displayed[i].sources[1].completed_images == 170161U);
   CHECK(displayed[i].activity.size() <= domain::kArtifactProgressTextCapacity);
   if (update.resumed) {
    CHECK_FALSE(saw_restart);

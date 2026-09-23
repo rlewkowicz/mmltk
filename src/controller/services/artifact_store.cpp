@@ -59,23 +59,13 @@ contracts::ArtifactProgress project_artifact_progress(const mmltk::backend::data
   .elapsed_seconds = value.elapsed_seconds,
   .remaining_seconds = value.remaining_seconds,
   .throughput_per_second = value.throughput_per_second,
-  .dropped_instances = value.dropped_instances};
+  .dropped_instances = value.dropped_instances, .tracks = value.tracks};
 }
 contracts::ArtifactProgress project_artifact_progress(const mmltk::backend::data::BenchmarkCompileProgress& value) {
  std::string activity = value.activity;
  for (const auto& source : value.sources) {
   if (value.current_source == source.source) {
-   using Source = mmltk::backend::data::BenchmarkDatasetSource;
-   const std::string_view source_name = [source = source.source] {
-    switch (source) {
-     case Source::kCoco2017: return std::string_view{"COCO 2017"};
-     case Source::kObjects365V2: return std::string_view{"Objects365 v2"};
-     case Source::kOpenImagesV7: return std::string_view{"Open Images v7"};
-     case Source::kCoconut: return std::string_view{"COCONut"};
-     case Source::kObjects365V1: return std::string_view{"Objects365 v1"};
-    }
-    std::unreachable();
-   }();
+   const auto source_name = mmltk::backend::data::benchmark_source_label(source.source);
    activity = std::string{source_name} + " · " + mmltk::backend::data::format_benchmark_source_status(source, activity);
    break;
   }
@@ -90,7 +80,7 @@ contracts::ArtifactProgress project_artifact_progress(const mmltk::backend::data
   .throughput_per_second = estimate.throughput_per_second,
   .projected_output_bytes = value.projected_output_bytes,
   .dropped_instances = value.dropped_instances,
-  .quarantined_images = value.quarantined_images};
+  .quarantined_images = value.quarantined_images, .tracks = value.tracks, .sources = value.sources};
 }
 namespace {
 class RuntimeArtifactCompilerOperations final : public ArtifactCompilerOperations {

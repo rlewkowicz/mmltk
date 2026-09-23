@@ -259,7 +259,7 @@ void CocoAnnotationCache::settle(DownloadResult archive, ProgressReporter& progr
  for (const bool training : {!validation_first, validation_first}) {
   const auto admission = training ? selection_.train : selection_.validation;
   if (admission == CocoSplitAdmission::Unselected) continue;
-  ArtifactProgressTotals repair_progress;
+  auto& repair_progress = progress.transfers();
   try {
    for (unsigned attempt = 1;; ++attempt) {
     try {

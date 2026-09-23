@@ -846,7 +846,7 @@ struct SegmentTransfer {
  struct SegmentThreads {
   mmltk::common::concurrency::CancellationObservation external;
   std::atomic<bool> stopping{false};
-  std::vector<std::thread> threads;
+  std::vector<std::thread> threads{};
   [[nodiscard]] bool cancelled() const noexcept { return stopping.load(std::memory_order_relaxed) || external.requested(); }
   void join() noexcept {
    for (auto& thread : threads) if (thread.joinable()) thread.join();

@@ -56,18 +56,18 @@ CompileProgress CompileTelemetry::snapshot(const DatasetCompilePhase phase) cons
    .remaining_seconds = estimate.remaining_seconds,
    .throughput_per_second = estimate.throughput_per_second,
    .phase = phase,
-   .label_done = label_done,
-   .label_total = num_images,
-   .pixel_done = pixel_done,
-   .pixel_total = num_images,
+   .tracks = {
+    .acquisition = {.total_known = true, .complete = true, .activity = DatasetCompileActivity::Unnecessary},
+    .labels = {.completed = label_done, .total = num_images, .total_known = true, .active = phase != DatasetCompilePhase::Planning && label_done != num_images,
+     .complete = label_done == num_images, .activity = label_done == num_images ? DatasetCompileActivity::Complete : DatasetCompileActivity::Preparing},
+    .pixels = {.completed = pixel_done, .total = num_images, .total_known = true, .active = (pixel_active != 0 || phase == DatasetCompilePhase::Pixels) && pixel_done != num_images,
+     .complete = pixel_done == num_images, .activity = pixel_done == num_images ? DatasetCompileActivity::Complete : DatasetCompileActivity::Compiling}},
    .active_workers = label_active + pixel_active,
    .dropped_instances = dropped_instances_.load(std::memory_order_relaxed)};
  };
  if (phase == DatasetCompilePhase::Planning) { return progress(0U); }
  if (phase == DatasetCompilePhase::Syncing || phase == DatasetCompilePhase::Publishing) {
   CompileProgress complete = progress(total);
-  complete.label_done = num_images;
-  complete.pixel_done = num_images;
   complete.active_workers = 0U;
   return complete;
  }

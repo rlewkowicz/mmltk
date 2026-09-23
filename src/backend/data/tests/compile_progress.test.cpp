@@ -335,13 +335,18 @@ void test_compile_progress_reports_monotonic_updates() {
   const auto& progress = observed[index].progress;
   CHECK(progress.total == expected_total);
   CHECK(progress.done <= expected_total);
+  CHECK(progress.tracks.valid());
+  CHECK(progress.tracks.acquisition.total_known);
+  CHECK(progress.tracks.acquisition.total == 0);
+  CHECK(progress.tracks.acquisition.complete);
+  CHECK(progress.tracks.acquisition.activity == DatasetCompileActivity::Unnecessary);
   main_thread_observed |= observed[index].thread == main_thread_id;
   if (semantic_transitions.empty() || semantic_transitions.back() != progress.phase) semantic_transitions.push_back(progress.phase);
   if (index != 0U) {
    const auto& previous = observed[index - 1U].progress;
    CHECK(progress.done >= previous.done);
-   CHECK(progress.label_done >= previous.label_done);
-   CHECK(progress.pixel_done >= previous.pixel_done);
+   CHECK(progress.tracks.labels.completed >= previous.tracks.labels.completed);
+   CHECK(progress.tracks.pixels.completed >= previous.tracks.pixels.completed);
    CHECK(progress.elapsed_seconds >= previous.elapsed_seconds);
   }
   const auto estimate = estimate_progress(progress.done, progress.total, progress.elapsed_seconds);
@@ -352,9 +357,11 @@ void test_compile_progress_reports_monotonic_updates() {
  const auto& completed = observed.back().progress;
  CHECK(completed.done == expected_total);
  CHECK(completed.phase == DatasetCompilePhase::Publishing);
- CHECK(completed.label_done == expected_images);
- CHECK(completed.pixel_done == expected_images);
+ CHECK(completed.tracks.labels.completed == expected_images);
+ CHECK(completed.tracks.pixels.completed == expected_images);
  CHECK(completed.active_workers == 0U);
+ CHECK(completed.tracks.labels.complete);
+ CHECK(completed.tracks.pixels.complete);
  CHECK(completed.dropped_instances == 0U);
  CHECK(completed.remaining_seconds == 0U);
  CHECK(observed.front().progress.elapsed_seconds == 0U);

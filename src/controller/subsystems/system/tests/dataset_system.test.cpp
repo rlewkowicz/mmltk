@@ -342,7 +342,7 @@ TEST_CASE("dataset admits real open ended acquisition and successful HTTP recove
   [&](DatasetSystem::event_type event) {
    if (const auto* progress = std::get_if<DatasetProgress>(&event)) {
     delivered.push_back(progress->progress);
-    if (!notified && progress->progress.total == 0U && progress->progress.completed > (mixed ? payload.size() : 0U)) {
+    if (!notified && !progress->progress.tracks.acquisition.total_known && progress->progress.tracks.acquisition.completed > (mixed ? payload.size() : 0U)) {
      notified = true;
      open_ended.set_value();
     }
@@ -368,8 +368,8 @@ TEST_CASE("dataset admits real open ended acquisition and successful HTTP recove
  CHECK(delivered == produced);
  REQUIRE_FALSE(delivered.empty());
  for (const auto& progress : delivered) CHECK(progress.valid());
- CHECK(delivered.back().completed == payload.size() * (mixed ? 2U : 1U));
- CHECK(delivered.back().total == delivered.back().completed);
+ CHECK(delivered.back().tracks.acquisition.completed == payload.size() * (mixed ? 2U : 1U));
+ CHECK(delivered.back().tracks.acquisition.total == delivered.back().tracks.acquisition.completed);
  REQUIRE_FALSE(transfers.empty());
  for (const auto& transfer : transfers) {
   CHECK(transfer.completed_bytes <= payload.size());
@@ -386,6 +386,10 @@ TEST_CASE("dataset independently rejects each malformed progress invariant", "[c
  REQUIRE(settings.Load(install_settings(root.path())).applied());
  contracts::ArtifactProgress malformed{.phase = contracts::ArtifactCompilePhase::Downloading, .activity = "metadata", .completed = 1U, .total = 2U};
  SECTION("known total overrun") { malformed.completed = 3U; }
+ SECTION("track known-zero overrun") { malformed.tracks.acquisition.total_known = true; malformed.tracks.acquisition.completed = 1; }
+ SECTION("completed track remains active") { malformed.tracks.labels.active = true; malformed.tracks.labels.complete = true; }
+ SECTION("invalid track activity") { malformed.tracks.pixels.activity = static_cast<mmltk::backend::data::DatasetCompileActivity>(255); }
+ SECTION("oversized source activity") { malformed.sources.push_back({.activity = std::string(contracts::kArtifactProgressTextCapacity + 1, 'x')}); }
  SECTION("invalid phase") { malformed.phase = static_cast<contracts::ArtifactCompilePhase>(255U); }
  SECTION("oversized activity") { malformed.activity.assign(contracts::kArtifactProgressTextCapacity + 1U, 'x'); }
  CHECK_FALSE(malformed.valid());

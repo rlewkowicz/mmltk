@@ -1007,7 +1007,7 @@ impl State {
                         )
                     });
                     driver.phase = Phase::CompileProgress;
-                    return widgets.arm(driver, COMPILE_PROGRESS);
+                    return widgets.arm(driver, COMPILE_PROGRESS).chain(iced::advanced::widget::operate(CompileTrackText));
                 }
                 if compile_succeeded {
                     let split = dataset.inspection.splits.first();
@@ -1029,7 +1029,8 @@ impl State {
                 }
                 Task::none()
             }
-            Phase::CompileProgress => widgets.arm(driver, COMPILE_PROGRESS),
+            Phase::CompileProgress => widgets.arm(driver, COMPILE_PROGRESS)
+                .chain(iced::advanced::widget::operate(CompileTrackText)),
             Phase::CompileActionWithProgress => widgets.arm(driver, COMPILE_DATASET),
             Phase::DatasetStatus => widgets.arm(driver, DATASET_STATUS),
             _ => Task::none(),
@@ -1891,6 +1892,20 @@ mod tests {
                         assert!(capture.records().is_empty());
                     }
                 }
+            }
+        }
+    }
+}
+
+// Runs only in the opt-in packaged scenario, against the actual widget tree.
+struct CompileTrackText;
+impl iced::advanced::widget::Operation<RootMessage> for CompileTrackText {
+    fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn iced::advanced::widget::Operation<RootMessage>)) { operate(self); }
+    fn text(&mut self, _id: Option<&iced::advanced::widget::Id>, bounds: Rectangle, text: &str) {
+        for label in ["Acquisition", "Labels/masks", "Pixels"] {
+            if text.starts_with(&format!("{label} · ")) {
+                reporting::emit(|sink| sink.record("integration.compile_track_text", label, text,
+                    [bounds.x as f64, bounds.y as f64, bounds.width as f64, bounds.height as f64]));
             }
         }
     }

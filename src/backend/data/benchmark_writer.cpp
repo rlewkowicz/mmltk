@@ -252,9 +252,15 @@ bool BenchmarkSplitWriter::matches_membership(const PreparedBenchmarkSplit& spli
  return true;
 }
 void BenchmarkSplitWriter::invalidate_source(const std::filesystem::path& root) {
+ std::uint64_t invalidated = 0;
  for (std::size_t i = 0; i < impl_->images.size(); ++i) {
-  if (impl_->sources.at(impl_->images[i].source_index).root == root) { impl_->complete[i] = 0; impl_->header_known[i] = 0; }
+  if (impl_->sources.at(impl_->images[i].source_index).root == root) {
+   if (impl_->progress.images_invalidated) invalidated += impl_->complete[i] != 0;
+   impl_->complete[i] = 0;
+   impl_->header_known[i] = 0;
+  }
  }
+ if (invalidated && impl_->progress.images_invalidated) impl_->progress.images_invalidated(impl_->progress.context, invalidated);
 }
 void BenchmarkSplitWriter::retain_completed(const BenchmarkSplitWriter& previous) {
  const auto& before = *previous.impl_;

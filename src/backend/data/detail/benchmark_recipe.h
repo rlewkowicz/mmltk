@@ -93,6 +93,7 @@ private:
  bool attempted_ = false;
  bool warned_ = false;
 };
+[[nodiscard]] std::span<const CoconutImageNamespace> coconut_release_sources(CoconutEdition);
 [[nodiscard]] CoconutRecipeCatalog coconut_recipe_catalog(CoconutValidation);
 [[nodiscard]] CoconutRecipePreparation prepare_coconut_recipe(const BenchmarkCompilerConfig&, const BenchmarkCacheLayout&, const CoconutRecipeCatalog&, std::span<const AdmittedRecipeArchive>,
  const CoconutPhysicalMembership&, ProgressReporter&, CoconutFailureReport&, std::size_t, mmltk::common::concurrency::CancellationObservation, const BenchmarkTraceSink&,

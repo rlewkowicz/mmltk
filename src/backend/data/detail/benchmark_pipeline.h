@@ -32,7 +32,7 @@ private:
   std::size_t index;
   bool submitted = false;
   Slot* next = nullptr;
-  std::shared_ptr<const ArtifactLease> custody;
+  std::shared_ptr<const ArtifactLease> custody{};
  };
  void consume(std::size_t lane) noexcept;
  void execute(Slot&, std::size_t lane, std::shared_ptr<const ArtifactLease> custody) noexcept;

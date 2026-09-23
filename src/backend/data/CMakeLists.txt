@@ -60,6 +60,7 @@ mmltk_register_public_headers(
         compiled_format.h
         compiled_format_limits.h
         dataset_compile_phase.h
+        dataset_compile_progress.h
         dataset_compiler.h
         dataset_loader.h
         data_loading_options.h

@@ -2331,3 +2331,16 @@ TEST_CASE("cached viewport evidence joins initial readiness before new read admi
  }
 }
 }  // namespace mmltk::acceptance::wayland
+
+namespace mmltk::acceptance::wayland {
+TEST_CASE("packaged compilation exposes three laid-out track facts including known-zero acquisition", "[workspace][audit]") {
+ BrowserAudit audit;
+ for (const auto& [name, detail] : std::array<std::pair<const char*, const char*>, 3>{{
+  {"Acquisition", "Acquisition · unnecessary · 0 / 0"},
+  {"Labels/masks", "Labels/masks · active · 3 / 8"},
+  {"Pixels", "Pixels · active · 2 / 8"}}}) {
+  audit.consume({{"event", "integration.compile_track_text"}, {"control", name}, {"detail", detail}, {"a", 1}, {"b", 2}, {"c", 100}, {"d", 16}});
+ }
+ CHECK(audit.compile_tracks.size() == 3);
+}
+}  // namespace mmltk::acceptance::wayland

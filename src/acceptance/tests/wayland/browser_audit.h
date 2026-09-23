@@ -212,6 +212,7 @@ struct BrowserAudit final {
  bool bootstrap = false;
  bool dataset_configured = false;
  bool progress = false;
+ std::set<std::string, std::less<>> compile_tracks;
  bool compile_metrics = false;
  std::uint64_t compile_completed = 0U;
  std::uint64_t compile_total = 0U;

@@ -48,6 +48,7 @@ private:
 struct BenchmarkWriteProgressEvent final {
  void* context = nullptr;
  void (*image_completed)(void*) = nullptr;
+ void (*images_invalidated)(void*, std::uint64_t) = nullptr;
  void operator()() const {
   if (image_completed != nullptr) { image_completed(context); }
  }

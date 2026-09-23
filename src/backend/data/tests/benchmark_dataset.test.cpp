@@ -1672,20 +1672,20 @@ TEST_CASE("transfer observers are independent of trace-only pixel observers", "[
  ProgressReporter traced({}, trace);
  CHECK_FALSE(traced.transfer_observer_enabled());
  CHECK(traced.pixel_observer_enabled());
- traced.source_transfer(DownloadProgress{"coco-fixture", 1U, 2U, 2U}, 1U, 2U);
+ traced.transfers().update(DownloadProgress{"coco-fixture", 1U, 2U, 2U}, traced);
  CHECK(traces == 0U);
  ArtifactProgressTotals unobserved_totals;
  unobserved_totals.update(DownloadProgress{.artifact_id = "unobserved", .completed_bytes = 1U, .source = static_cast<BenchmarkDatasetSource>(255U)}, traced);
  CHECK(traces == 0U);
- traced.pixel_attempt(0U, 1U, "train", 1U);
+ traced.pixels(0U, 1U);
  traced.pixel_completed();
- CHECK(traces == 2U);
+ CHECK(traces == 1U);
  std::vector<BenchmarkCompileProgress> updates;
  ProgressReporter observed([&](const BenchmarkCompileProgress& update) { updates.push_back(update); }, quiet);
  CHECK(observed.transfer_observer_enabled());
  CHECK(observed.pixel_observer_enabled());
  observed.phase(DatasetCompilePhase::Downloading);
- observed.source_transfer(DownloadProgress{"coco-fixture", 5U, 11U, 3U, true}, 5U, 11U);
+ observed.transfers().update(DownloadProgress{"coco-fixture", 5U, 11U, 3U, true}, observed);
  REQUIRE_FALSE(updates.empty());
  CHECK(updates.back().sources[0].completed_bytes == 5U);
  CHECK(updates.back().sources[0].total_bytes == 11U);
@@ -1855,22 +1855,24 @@ TEST_CASE("source count additions serialize publication and permit retry withdra
   quiet);
  const auto source = BenchmarkDatasetSource::kObjects365V2;
  progress.phase(DatasetCompilePhase::Extracting);
- auto first_add = std::async(std::launch::async, [&] { progress.add_source_images(source, 128U, 512U); });
+ auto first_add = std::async(std::launch::async, [&] { progress.transfers().images(source, "first", 128U, 512U, progress); });
  const mmltk::testsupport::ScopedTestCleanup release([&] { first.Release(); });
  REQUIRE(first.WaitEntered(3s));
- auto second_add = std::async(std::launch::async, [&] { progress.add_source_images(source, 256U, 512U); });
+ auto second_add = std::async(std::launch::async, [&] { progress.transfers().images(source, "second", 256U, 512U, progress); });
  first.Release();
  mmltk::testsupport::await_test_future(first_add, "first source addition", 5s);
  mmltk::testsupport::await_test_future(second_add, "second source addition", 5s);
  CHECK(latest.sources[1].completed_images == 384U);
  CHECK(std::ranges::is_sorted(counts));
- progress.rollback_source_images(source, 128U, 512U);
+ progress.transfers().images(source, "first", 0U, 512U, progress);
  CHECK(latest.sources[1].completed_images == 256U);
- progress.add_source_images(source, 256U, 512U);
+ progress.transfers().images(source, "first", 256U, 512U, progress);
  CHECK(latest.sources[1].completed_images == 512U);
- CHECK_THROWS_AS(progress.rollback_source_images(source, 513U, 512U), std::underflow_error);
- progress.source_images(source, std::numeric_limits<std::uint64_t>::max(), std::numeric_limits<std::uint64_t>::max());
- CHECK_THROWS_AS(progress.add_source_images(source, 1U, std::numeric_limits<std::uint64_t>::max()), std::overflow_error);
+ CHECK(latest.sources[1].invalidated_images == 128U);
+ progress.transfers().images(source, "first", 256U, 512U, progress);
+ CHECK(latest.sources[1].completed_images == 512U); // Warm repeat contributes once.
+ CHECK_THROWS_AS(progress.transfers().images(source, "first", 513U, 512U, progress), std::overflow_error);
+ CHECK_THROWS_AS(progress.transfers().images(source, "first", std::numeric_limits<std::uint64_t>::max(), std::numeric_limits<std::uint64_t>::max(), progress), std::overflow_error);
 }
 TEST_CASE("archive image reuse reports initial and resolved counts without replacing valid JPEGs", "[backend][data][benchmark][images]") {
  for (const std::size_t workers : {0U, 3U}) {
@@ -1966,6 +1968,8 @@ TEST_CASE("Open Images local JPEG and complete group reuse preserve dimensions a
  for (auto& image : index.images) { image.width = image.height = 0U; }
  acquired = acquire_open_images(cache, index, &quarantined, {}, &progress, 1, 0U, quiet);
  CHECK(acquired.directory.cache_hit);
+ CHECK(latest.sources[2].completed_images == 2U);
+ CHECK(latest.sources[2].invalidated_images == 0U);
  CHECK(index.images[0].width == width);
  CHECK(index.images[0].height == height);
  const auto proof = images / ".groups" / "group-000000.complete.json";
@@ -2148,13 +2152,13 @@ TEST_CASE("artifact acquisition totals replace contributions without inventing u
  BenchmarkCompileProgress latest;
  const BenchmarkTraceSink trace;
  ProgressReporter reporter([&](const auto& update) { latest = update; }, trace);
- ArtifactProgressTotals totals;
+ auto& totals = reporter.transfers();
  reporter.phase(DatasetCompilePhase::Downloading);
  const auto observe = [&](const BenchmarkDatasetSource source, const char* artifact, const std::uint64_t completed, const std::uint64_t total, const std::uint64_t expected_completed,
                        const std::uint64_t expected_total) {
   totals.update(DownloadProgress{.artifact_id = artifact, .completed_bytes = completed, .total_bytes = total, .source = source}, reporter);
-  CHECK(latest.completed == expected_completed);
-  CHECK(latest.total == expected_total);
+  CHECK(latest.tracks.acquisition.completed == expected_completed);
+  CHECK(latest.tracks.acquisition.total == expected_total);
   CHECK(latest.current_source == source);
  };
  constexpr auto coco = BenchmarkDatasetSource::kCoco2017;
@@ -2173,9 +2177,9 @@ TEST_CASE("artifact acquisition totals replace contributions without inventing u
  observe(coco, "known", 0U, 10U, 15U, 37U);  // Restart of a known artifact.
  observe(coco, "known", 10U, 10U, 25U, 37U);
  totals.update(DownloadProgress{"known", 10U, 10U, 0U, false, true}, reporter);
- CHECK(latest.completed == 25U);
- CHECK(latest.total == 37U);
- CHECK(latest.sources[0].cache_hit);
+ CHECK(latest.tracks.acquisition.completed == 25U);
+ CHECK(latest.tracks.acquisition.total == 37U);
+ CHECK_FALSE(latest.sources[0].cache_hit); // Only one of this source's artifacts was reused.
  // A failed checked replacement leaves its prior contribution intact.
  CHECK_THROWS_AS(totals.update(DownloadProgress{"known", std::numeric_limits<std::uint64_t>::max(), 10U}, reporter), std::overflow_error);
  observe(coco, "known", 10U, 10U, 25U, 37U);
@@ -2416,6 +2420,13 @@ TEST_CASE("one-worker image readiness resizes before archive completion and reus
  membership.images = {{1, 16, 8, 0, 0, 0}};
  auto write = benchmark_write_request(membership, root.path() / "result.bin", 8);
  write.num_workers = 1;
+ BenchmarkCompileProgress observed;
+ const BenchmarkTraceSink quiet;
+ ProgressReporter progress([&](const auto& value) { observed = value; }, quiet);
+ progress.pixels(0, 1);
+ write.progress = {.context = &progress,
+  .image_completed = [](void* context) { static_cast<ProgressReporter*>(context)->pixel_completed(); },
+  .images_invalidated = [](void* context, std::uint64_t count) { static_cast<ProgressReporter*>(context)->invalidate_pixels(count); }};
  BenchmarkSplitWriter writer(write);
  BenchmarkCompilePipeline pipeline(1);
  pipeline.register_split(writer, membership);
@@ -2441,6 +2452,14 @@ TEST_CASE("one-worker image readiness resizes before archive completion and reus
  CHECK(warm.cache_hit);
  CHECK(ready_count == 2);
  CHECK(writer.completed() == 1);
+ CHECK(observed.tracks.pixels.completed == 1);
+ CHECK(observed.tracks.pixels.invalidated == 0);
+ writer.invalidate_source(images);
+ CHECK(observed.tracks.pixels.completed == 0);
+ CHECK(observed.tracks.pixels.invalidated == 1);
+ writer.write_pixel(0, 0);
+ CHECK(observed.tracks.pixels.completed == 1);
+ CHECK(observed.tracks.pixels.complete);
  writer.finish(write);
 }
 TEST_CASE("cache readiness failure joins held publication and retains completed bytes", "[backend][data][benchmark][images][pipeline]") {
@@ -2693,29 +2712,92 @@ TEST_CASE("settled writer tail expands from one overlap scratch lane to the full
  CHECK(writer.completed() == 2);
  writer.finish(request);
 }
-TEST_CASE("background pixels and annotation observations preserve coherent aggregate acquisition", "[backend][data][benchmark][progress]") {
- std::vector<BenchmarkCompileProgress> updates;
+TEST_CASE("concurrent tracks preserve unique work through repair and settlement", "[backend][data][benchmark][progress]") {
+ BenchmarkCompileProgress latest;
  const BenchmarkTraceSink quiet;
- ProgressReporter progress([&](const auto& update) { updates.push_back(update); }, quiet);
- progress.phase(DatasetCompilePhase::Indexing, 0, 6);
+ ProgressReporter progress([&](const auto& update) { latest = update; }, quiet);
  progress.phase(DatasetCompilePhase::Indexing, 4, 6);
- progress.phase(DatasetCompilePhase::Indexing, 3, 6);
- CHECK(updates.back().completed == 4);
  progress.phase(DatasetCompilePhase::Extracting);
- progress.source_images(BenchmarkDatasetSource::kCoco2017, 1, 2);
- const auto acquisition = updates.back();
- progress.pixel_attempt(0, 1, "train", 1, false);
+ progress.transfers().update(DownloadProgress{.artifact_id = "annotations", .completed_bytes = 8, .total_bytes = 10}, progress);
+ progress.pixels(0, 2);
  progress.pixel_completed();
- progress.phase(DatasetCompilePhase::Indexing, 1, 10);
- CHECK(updates.back().phase == DatasetCompilePhase::Extracting);
- CHECK(updates.back().completed == acquisition.completed);
- CHECK(updates.back().total == acquisition.total);
- progress.phase(DatasetCompilePhase::Labels, 1, 2);
- progress.pixel_attempt(0, 1, "train", 1, false);
+ CHECK(latest.tracks.acquisition.active);
+ CHECK(latest.tracks.labels.active);
+ CHECK(latest.tracks.pixels.active);
+ CHECK(latest.tracks.labels.completed == 4);
+ CHECK(latest.tracks.pixels.completed == 1);
+ progress.transfers().update(DownloadProgress{.artifact_id = "images", .completed_bytes = 3}, progress);
+ CHECK(latest.tracks.acquisition.completed == 11);
+ CHECK_FALSE(latest.tracks.acquisition.total_known);
+ const auto foreground = latest;
+ progress.phase(DatasetCompilePhase::Indexing, 3, 6);
+ progress.source_activity(BenchmarkDatasetSource::kCoconut, "Background masks", false);
+ CHECK(latest.phase == foreground.phase);
+ CHECK(latest.activity == foreground.activity);
+ CHECK(latest.completed == foreground.completed);
+ CHECK(latest.total == foreground.total);
+ CHECK(latest.tracks.labels.completed == 4);
+ CHECK(latest.tracks.pixels.completed == 1);
+ progress.invalidate_pixels(1);
+ CHECK(latest.tracks.pixels.completed == 0);
+ CHECK(latest.tracks.pixels.invalidated == 1);
  progress.pixel_completed();
- CHECK(updates.back().phase == DatasetCompilePhase::Labels);
- CHECK(updates.back().completed == 1);
- CHECK(updates.back().total == 2);
+ progress.pixels(1, 2); // Retained successful pixels, no attempt or copy contribution.
+ progress.pixel_completed();
+ CHECK(latest.tracks.pixels.completed == 2);
+ CHECK(latest.tracks.pixels.complete);
+ CHECK(latest.tracks.labels.active);
+ progress.phase(DatasetCompilePhase::Indexing, 6, 6);
+ progress.label_plans(2);
+ progress.label_plan_started(0);
+ progress.label_plan_completed(0);
+ progress.label_plan_started(1);
+ progress.label_plan_completed(1);
+ CHECK(latest.tracks.labels.completed == 8);
+ progress.discard_label_plans();
+ progress.label_plans(2);
+ CHECK(latest.tracks.labels.completed == 6);
+ CHECK(latest.tracks.labels.invalidated == 2);
+ progress.label_plan_started(0);
+ progress.label_plan_completed(0);
+ progress.label_plan_completed(0);
+ progress.label_plan_started(1);
+ progress.label_plan_completed(1);
+ CHECK(latest.tracks.labels.completed == 8);
+ CHECK(latest.tracks.labels.complete);
+ CHECK(latest.tracks.acquisition.active);
+ progress.acquisition_complete();
+ CHECK(latest.tracks.acquisition.complete);
+ progress.phase(DatasetCompilePhase::Publishing, 1, 1);
+ CHECK(latest.tracks.valid());
+ CHECK(latest.tracks.pixels.invalidated == 1);
+}
+
+TEST_CASE("compile-owned observations survive preparation replacement and source interleaving", "[backend][data][benchmark][progress]") {
+ BenchmarkCompileProgress latest;
+ const BenchmarkTraceSink quiet;
+ ProgressReporter reporter([&](const auto& update) { latest = update; }, quiet);
+ const std::array<std::uint64_t, 2> rows{100, 100};
+ auto* first = reporter.indexing(rows);
+ REQUIRE(first != nullptr);
+ first->update(0, 100, reporter);
+ auto* replacement = reporter.indexing(rows);
+ CHECK(replacement == first);
+ replacement->update(1, 100, reporter);
+ CHECK(latest.tracks.labels.completed == 200);
+ replacement->update(0, 100, reporter);
+ CHECK(latest.tracks.labels.completed == 200);
+ auto& transfers = reporter.transfers();
+ transfers.update(DownloadProgress{.artifact_id = "annotations", .completed_bytes = 8, .total_bytes = 8, .attempt = 3, .resumed = true}, reporter);
+ transfers.update(DownloadProgress{.artifact_id = "archive", .completed_bytes = 10, .total_bytes = 20, .attempt = 2}, reporter);
+ CHECK(latest.sources[0].retry_count == 3);
+ CHECK(latest.sources[0].resumed);
+ CHECK(latest.tracks.acquisition.completed == 18);
+ transfers.update(DownloadProgress{.artifact_id = "annotations", .completed_bytes = 8, .total_bytes = 8, .cache_hit = true}, reporter);
+ CHECK(latest.sources[0].retry_count == 3);
+ CHECK(latest.tracks.acquisition.completed == 18);
+ ProgressReporter disabled({}, quiet);
+ CHECK(disabled.indexing(rows) == nullptr);
 }
 
 TEST_CASE("insufficient pixel staging capacity preserves the published output", "[backend][data][benchmark][storage]") {
@@ -2740,7 +2822,7 @@ TEST_CASE("insufficient pixel staging capacity preserves the published output", 
  CHECK(mmltk::common::io::sha256_file(output) == published);
 }
 
-TEST_CASE("preparation indexing totals combine interleaved rows and reset with their owner", "[backend][data][benchmark][progress]") {
+TEST_CASE("preparation indexing totals preserve successful rows across owner replacement", "[backend][data][benchmark][progress]") {
  std::vector<BenchmarkCompileProgress> updates;
  const BenchmarkTraceSink quiet;
  ProgressReporter reporter([&](const auto& value) { updates.push_back(value); }, quiet);
@@ -2768,8 +2850,8 @@ TEST_CASE("preparation indexing totals combine interleaved rows and reset with t
  CHECK(updates.back().completed == updates.back().total);
  IndexingProgressTotals replacement(rows);
  replacement.update(0, 0, reporter);
- CHECK(updates.back().completed == 0);
- CHECK(updates.back().total == rows[0] + rows[1]);
+ CHECK(updates.back().tracks.labels.completed == rows[0] + rows[1]);
+ CHECK(updates.back().tracks.labels.total == rows[0] + rows[1]);
 }
 
 TEST_CASE("registered pixel readiness remains nonblocking under capacity pressure and duplicate delivery", "[backend][data][benchmark][pipeline]") {

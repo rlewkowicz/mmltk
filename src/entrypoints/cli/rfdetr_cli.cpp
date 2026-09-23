@@ -525,7 +525,13 @@ void run_compile(const CompileCliRequest& request) {
   config.resize_mode = request.resize_mode;
   config.cancel_requested = mmltk::common::concurrency::CancellationObservation::Atomic(benchmark_cancel_requested);
   config.progress = [](const data::BenchmarkCompileProgress& progress) {
+   spdmon::ProgressBar::log(data::format_dataset_compile_tracks(progress.tracks));
    if (!progress.activity.empty()) spdmon::ProgressBar::log(progress.activity);
+   for (const auto& source : progress.sources) if (!source.activity.empty()) {
+    spdmon::ProgressBar::log(std::string(data::benchmark_source_label(source.source)) + " · " + data::format_benchmark_source_status(source, "Acquiring") + " · " +
+     std::to_string(source.completed_bytes) + "/" + (source.byte_total_known ? std::to_string(source.total_bytes) : "?") + " bytes · " +
+     std::to_string(source.completed_images) + "/" + std::to_string(source.total_images) + " images · " + std::to_string(source.invalidated_images) + " invalidated");
+   }
   };
   if (logging::enabled(spdlog::level::trace)) {
    config.trace = [](const std::string_view event, const std::string_view fields) {
@@ -557,6 +563,7 @@ void run_compile(const CompileCliRequest& request) {
   data::CompileTelemetry telemetry{plan.splits[split_index].image_count, {.context = &state, .report = [](void* context, const data::CompileProgress& progress) noexcept {
                                                                            auto& progress_state = *static_cast<ProgressState*>(context);
                                                                            progress_state.bar->set_total(progress.total);
+                                                                           progress_state.bar->set_postfix(data::format_dataset_compile_tracks(progress.tracks));
                                                                            if (progress.done > *progress_state.completed) {
                                                                             progress_state.bar->add(progress.done - *progress_state.completed);
                                                                             *progress_state.completed = progress.done;

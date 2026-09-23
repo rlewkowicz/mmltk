@@ -1739,12 +1739,13 @@ TEST_CASE("one physical admission budget governs membership extraction and write
   tar(served.path, members);
   REQUIRE(std::filesystem::file_size(served.path) == served.payload.size());
  };
- bool exhausted = false;
+ bool exhausted = false, writer_recovery = false;
  SECTION("selected JPEG extraction refreshes physical and dependent identities") {
   replace_archive(7, corrupt_jpeg);
   std::filesystem::remove(jpeg);
  }
  SECTION("writer repair shares the same owner and refreshes dependent identities") {
+  writer_recovery = true;
   replace_archive(7, corrupt_jpeg);
   mmltk::testsupport::write_text_file(jpeg, corrupt_jpeg);
  }
@@ -1758,6 +1759,8 @@ TEST_CASE("one physical admission budget governs membership extraction and write
   std::filesystem::remove(component_path.string() + ".complete.json");
  }
  std::filesystem::remove(local.cache.source_indexes("coco") / (served.source.artifact.artifact_id + ".inventory.bin"));
+ std::vector<BenchmarkCompileProgress> observations;
+ config.progress = [&](const BenchmarkCompileProgress& value) { observations.push_back(value); };
  unsigned admissions = 0;
  config.trace = [&](std::string_view event, std::string_view fields) {
   if (event != "benchmark.download.cache_hit" && event != "benchmark.download.preseeded" && event != "benchmark.download.complete") return;
@@ -1772,6 +1775,33 @@ TEST_CASE("one physical admission budget governs membership extraction and write
  } else {
   compile_benchmark_recipe(config, &catalog);
   CHECK(admissions == 2);
+  REQUIRE_FALSE(observations.empty());
+  CHECK(std::ranges::all_of(observations.back().sources, &BenchmarkSourceProgress::complete));
+  if (writer_recovery) {
+   const auto invalidated = std::ranges::find_if(observations, [](const auto& value) { return value.tracks.labels.invalidated != 0; });
+   REQUIRE(invalidated != observations.end());
+   REQUIRE(invalidated != observations.begin());
+   const auto& before = (invalidated - 1)->tracks.labels;
+   CHECK(invalidated->tracks.labels.completed + invalidated->tracks.labels.invalidated == before.completed);
+   const auto replacement = std::ranges::find_if(invalidated, observations.end(), [&](const auto& value) {
+    return value.tracks.labels.total == before.total && value.tracks.labels.active;
+   });
+   REQUIRE(replacement != observations.end());
+   CHECK(replacement->tracks.labels.completed < replacement->tracks.labels.total);
+   CHECK(observations.back().tracks.labels.completed == before.completed);
+   const auto base_rows = std::ranges::find(catalog.releases, CoconutEdition::Base, &CoconutReleaseComponent::edition)->expected_rows;
+   const auto rows_withdrawn = std::ranges::find_if(invalidated + 1, observations.end(), [&](const auto& value) {
+    return value.tracks.labels.invalidated == invalidated->tracks.labels.invalidated + base_rows;
+   });
+   REQUIRE(rows_withdrawn != observations.end());
+   const auto& retained = (rows_withdrawn - 1)->tracks.labels;
+   CHECK(rows_withdrawn->tracks.labels.completed + base_rows == retained.completed);
+   CHECK(rows_withdrawn->tracks.labels.total == retained.total);
+   CHECK(rows_withdrawn->tracks.labels.active);
+   CHECK(rows_withdrawn->tracks.labels.activity == DatasetCompileActivity::Normalizing);
+   CHECK(rows_withdrawn->tracks.labels.completed > 0);
+   CHECK(observations.back().tracks.labels.invalidated == invalidated->tracks.labels.invalidated + base_rows);
+  }
   CHECK(served.server.requests() == 1);
   const auto completion = read_json_file(component_path.string() + ".complete.json");
   const auto input = completion["coconut"]["input_identity"].get<std::string>();
@@ -2857,6 +2887,12 @@ TEST_CASE("cached training labels start before pixel drain and overlap subsequen
  mmltk::testsupport::TestGate reader("early COCO training reader"), labels("same COCO training labels");
  const auto reader_receipt = reader.receipt(), labels_receipt = labels.receipt();
  std::atomic<bool> labels_started{false}, reader_seen{false}, delivered{false}, cancelled{false};
+ std::mutex observation_mutex;
+ BenchmarkCompileProgress observed;
+ config.progress = [&](const BenchmarkCompileProgress& update) {
+  const std::lock_guard lock(observation_mutex);
+  observed = update;
+ };
  std::promise<void> subsequent_pixels;
  config.num_workers = 4;
  config.cancel_requested = mmltk::common::concurrency::CancellationObservation::Atomic(cancelled);
@@ -2878,6 +2914,12 @@ TEST_CASE("cached training labels start before pixel drain and overlap subsequen
  REQUIRE(reader.WaitEntered(5s));
  REQUIRE(labels.WaitEntered(5s));
  CHECK_FALSE(delivered.load());
+ {
+  const std::lock_guard lock(observation_mutex);
+  CHECK(observed.tracks.labels.active);
+  CHECK(observed.tracks.labels.activity == DatasetCompileActivity::Preparing);
+  CHECK(observed.tracks.labels.completed < observed.tracks.labels.total);
+ }
  const mmltk::common::io::ScopedFd lease(::open((local.cache.locks / "coco-train2017.images.lock").c_str(), O_RDWR | O_CLOEXEC));
  REQUIRE(lease.get() >= 0);
  CHECK(::flock(lease.get(), LOCK_EX | LOCK_NB) == -1);
@@ -2892,6 +2934,12 @@ TEST_CASE("cached training labels start before pixel drain and overlap subsequen
   reader.Release();
   mmltk::testsupport::await_test_promise(subsequent_pixels, "new pixels after same-split label entry", 5s);
   CHECK(compiling.wait_for(0ms) == std::future_status::timeout);
+  {
+   const std::lock_guard lock(observation_mutex);
+   CHECK(observed.tracks.labels.active);
+   CHECK(observed.tracks.pixels.completed >= 64);
+   CHECK(observed.tracks.labels.completed < observed.tracks.labels.total);
+  }
   CHECK(file_bytes(local.output / "train.bin") == train);
   labels.Release();
   mmltk::testsupport::await_test_future(compiling, "production label settlement", 5s);
@@ -2972,7 +3020,10 @@ TEST_CASE("COCONut readable mismatched geometry survives a failed body and cache
  tar(archive, members);
  physical.artifact.expected_size = std::filesystem::file_size(archive);
  auto config = local.compiler_config({BenchmarkDatasetVariant::Coconut, CoconutValidation::CoconutStock}, true);
+ BenchmarkCompileProgress settled;
+ config.progress = [&](const BenchmarkCompileProgress& value) { settled = value; };
  compile_benchmark_recipe(config, &catalog);
+ CHECK(std::ranges::all_of(settled.sources, &BenchmarkSourceProgress::complete));
  const auto expected = file_bytes(config.output_dir / "train.bin");
  const std::array<std::uint32_t, 24> pixels{};
  auto bad_body = png(6, 4, pixels);
@@ -2983,6 +3034,7 @@ TEST_CASE("COCONut readable mismatched geometry survives a failed body and cache
  config.trace = [&](std::string_view event, std::string_view) { if (event == "benchmark.pixel_compile.cache_repair") ++repairs; };
  compile_benchmark_recipe(config, &catalog);
  CHECK(repairs == 1);
+ CHECK(std::ranges::all_of(settled.sources, &BenchmarkSourceProgress::complete));
  CHECK(file_bytes(config.output_dir / "train.bin") == expected);
  const auto train = CompiledDataset::open(config.output_dir / "train.bin");
  CHECK(train.image_labels(2).empty());
@@ -3267,6 +3319,39 @@ TEST_CASE("cold COCONut releases retain one aggregate indexing denominator", "[b
  ScopedTempDir root("coconut-indexing-interleave");
  LocalCoconutRecipe local(root.path());
  auto catalog = local.selected(CoconutValidation::CoconutStock);
+ bool repair_annotations = false;
+ SECTION("independent releases settle while extraction remains foreground") {}
+ SECTION("partial annotation replacement withdraws only its release rows") { repair_annotations = true; }
+ std::string annotation_payload;
+ std::unique_ptr<mmltk::backend::data::testsupport::HttpServer> annotation_server;
+ if (repair_annotations) {
+  auto& release = *std::ranges::find(catalog.releases, CoconutEdition::Base, &CoconutReleaseComponent::edition);
+  auto& physical = *std::ranges::find(catalog.images, CoconutImageNamespace::CocoTrain, &RecipeImageArchive::source);
+  const auto archive = local.cache.source_downloads("coco") / physical.artifact.filename;
+  const std::array<std::uint32_t, 9> pixels{1, 1, 1, 1, 1, 1, 1, 1, 1};
+  const auto mask = png(3, 3, pixels);
+  Json rows = Json::array();
+  std::vector<std::pair<std::string, std::string>> members;
+  for (unsigned id = 100; id < 165; ++id) {
+   rows.push_back(hf_row(id, mask, Json::array({segment()})));
+   members.emplace_back(coco(id).member, white_jpeg());
+  }
+  tar(archive, members);
+  physical.artifact.expected_size = std::filesystem::file_size(archive);
+  release.expected_rows = rows.size();
+  auto& artifact = release.annotations.front();
+  const auto path = local.cache.source_downloads("coconut-" + std::string(release.name)) / artifact.filename;
+  parquet_file(path, rows, hf_schema(), parquet::Compression::UNCOMPRESSED);
+  annotation_payload = file_bytes(path);
+  annotation_server = std::make_unique<mmltk::backend::data::testsupport::HttpServer>(annotation_payload);
+  artifact.url = annotation_server->url("release-repair");
+  artifact.expected_size = annotation_payload.size();
+  auto corrupt = mask;
+  corrupt.front() = 'x';
+  rows.back()["mask"]["bytes"] = corrupt;
+  parquet_file(path, rows, hf_schema(), parquet::Compression::UNCOMPRESSED);
+  REQUIRE(std::filesystem::file_size(path) == artifact.expected_size);
+ }
  auto config = local.compiler_config({BenchmarkDatasetVariant::Coconut, CoconutValidation::CoconutStock});
  config.num_workers = 3;
  std::uint64_t total = 0;
@@ -3282,13 +3367,25 @@ TEST_CASE("cold COCONut releases retain one aggregate indexing denominator", "[b
   } else if (edition == CoconutEdition::RelabeledValidation && boundary == CoconutReleaseBoundary::MasksStarted) validation_receipt.ArriveAndWait();
  };
  std::vector<BenchmarkCompileProgress> indexing;
- std::promise<void> independent_settled, all_settled;
+ std::promise<void> independent_settled, all_settled, extracting;
+ bool extracting_reported = false;
  bool independent_reported = false, all_reported = false;
+ bool foreground_preserved = true, background_observed = false;
+ std::optional<BenchmarkCompileProgress> previous_update;
  config.progress = [&](const BenchmarkCompileProgress& value) {
-  if (value.phase != DatasetCompilePhase::Indexing) return;
+  if (previous_update && previous_update->phase == DatasetCompilePhase::Extracting &&
+      value.tracks.labels.completed != previous_update->tracks.labels.completed) {
+   background_observed = true;
+   foreground_preserved = foreground_preserved && value.phase == previous_update->phase && value.activity == previous_update->activity &&
+    value.current_source == previous_update->current_source && value.completed == previous_update->completed && value.total == previous_update->total &&
+    value.activity_elapsed_seconds >= previous_update->activity_elapsed_seconds;
+  }
+  previous_update = value;
+  if (value.phase == DatasetCompilePhase::Extracting && !extracting_reported) { extracting_reported = true; extracting.set_value(); }
+  if (value.tracks.labels.total < total || value.tracks.labels.activity == DatasetCompileActivity::Preparing || value.tracks.labels.completed > total) return;
   indexing.push_back(value);
-  if (value.completed == total - base_rows && !independent_reported) { independent_reported = true; independent_settled.set_value(); }
-  if (value.completed == total && !all_reported) { all_reported = true; all_settled.set_value(); }
+  if (value.tracks.labels.completed == total - base_rows && !independent_reported) { independent_reported = true; independent_settled.set_value(); }
+  if (value.tracks.labels.completed == total && !all_reported) { all_reported = true; all_settled.set_value(); }
  };
  std::atomic<bool> cancelled{false};
  config.cancel_requested = mmltk::common::concurrency::CancellationObservation::Atomic(cancelled);
@@ -3297,6 +3394,8 @@ TEST_CASE("cold COCONut releases retain one aggregate indexing denominator", "[b
  REQUIRE(base.WaitEntered(5s));
  REQUIRE(validation.WaitEntered(5s));
  REQUIRE(receiver.WaitEntered(5s));
+ receiver.Release();
+ mmltk::testsupport::await_test_promise(extracting, "foreground extraction while masks remain active", 5s);
  validation.Release();
  mmltk::testsupport::await_test_promise(independent_settled, "independent cold releases indexed", 5s);
  base.Release();
@@ -3304,14 +3403,29 @@ TEST_CASE("cold COCONut releases retain one aggregate indexing denominator", "[b
  receiver.Release();
  mmltk::testsupport::await_test_future(compiling, "interleaved indexing compile", 5s);
  REQUIRE_FALSE(indexing.empty());
- CHECK(indexing.front().completed == 0);
- CHECK(indexing.back().completed == total);
+ CHECK(background_observed);
+ CHECK(foreground_preserved);
+ CHECK(indexing.front().tracks.labels.completed == 0);
+ CHECK(indexing.back().tracks.labels.completed == total);
+ const auto background = std::ranges::find_if(indexing, [&](const auto& value) {
+  return value.phase == DatasetCompilePhase::Extracting && value.tracks.labels.completed == total;
+ });
+ REQUIRE(background != indexing.end());
  std::uint64_t previous = 0;
  for (const auto& value : indexing) {
-  CHECK(value.total == total);
-  CHECK(value.completed >= previous);
-  CHECK(value.completed <= total);
-  previous = value.completed;
+  CHECK(value.tracks.labels.total >= total);
+  if (value.tracks.labels.completed < previous) {
+   CHECK(repair_annotations);
+   CHECK(previous - value.tracks.labels.completed == 64);
+   CHECK(value.tracks.labels.invalidated == 64);
+   CHECK(value.tracks.labels.completed == total - base_rows);
+   CHECK(value.tracks.labels.active);
+   CHECK(value.tracks.labels.activity == DatasetCompileActivity::Normalizing);
+  }
+  CHECK(value.tracks.labels.completed <= total);
+  previous = value.tracks.labels.completed;
  }
+ CHECK(indexing.back().tracks.labels.invalidated == (repair_annotations ? 64 : 0));
+ if (annotation_server) { CHECK(annotation_server->requests() == 1); annotation_server->Check(); }
  CHECK(CompiledDataset::open(local.output / "val.bin").image_entries().size() == 1);
 }

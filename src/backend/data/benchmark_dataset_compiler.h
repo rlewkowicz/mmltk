@@ -12,36 +12,15 @@
 #include <vector>
 #include "src/common/concurrency/cancellation_observation.h"
 #include "src/backend/data/dataset_compile_phase.h"
+#include "src/backend/data/dataset_compile_progress.h"
 namespace mmltk::backend::data {
-enum class BenchmarkDatasetSource : std::uint8_t {
- kCoco2017,
- kObjects365V2,
- kOpenImagesV7,
- kCoconut,
- kObjects365V1,
-};
-struct BenchmarkSourceProgress {
- BenchmarkDatasetSource source = BenchmarkDatasetSource::kCoco2017;
- std::string activity;
- std::uint64_t completed_bytes = 0;
- std::uint64_t total_bytes = 0;
- std::uint64_t completed_images = 0;
- std::uint64_t total_images = 0;
- std::uint32_t retry_count = 0;
- bool cache_hit = false;
- bool resumed = false;
- bool complete = false;
- // Unobserved sources are neutral; an observed unknown-size contribution clears this.
- bool byte_total_known = true;
-};
 struct BenchmarkCompileProgress {
  DatasetCompilePhase phase = DatasetCompilePhase::Planning;
  std::string activity;
  std::uint64_t activity_elapsed_seconds = 0;
  std::uint64_t completed = 0;
  std::uint64_t total = 0;
- std::uint64_t pixel_attempt = 0;
- std::uint64_t pixel_attempt_offset = 0;
+ DatasetCompileTracks tracks{};
  std::uint64_t projected_output_bytes = 0;
  std::uint64_t dropped_instances = 0;
  std::uint64_t quarantined_images = 0;

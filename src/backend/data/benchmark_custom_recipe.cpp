@@ -89,7 +89,7 @@ CustomRecipePreparation prepare_custom_recipe(const BenchmarkCompilerConfig&, co
   if (!open_images) { progress.source_activity(BenchmarkDatasetSource::kOpenImagesV7, "Downloading Open Images annotation metadata"); }
 
  }
- ArtifactProgressTotals annotation_repair_progress;
+ auto& annotation_repair_progress = progress.transfers();
  const auto repair_annotations = [&](const BenchmarkDatasetSource source, const std::vector<DownloadRequest>& requests, const std::string_view reason) {
   auto repaired = repair_annotation_artifacts(requests, source, reason, progress, annotation_repair_progress, parse_workers, cancel_requested, trace);
   for (std::size_t i = 0; i < requests.size(); ++i) annotation_downloads.at(requests[i].artifact_id) = std::move(repaired[i]);
@@ -98,7 +98,7 @@ CustomRecipePreparation prepare_custom_recipe(const BenchmarkCompilerConfig&, co
  const auto download_source = [&](BenchmarkDatasetSource source) {
   std::vector<DownloadRequest> requests;
   for (const auto& request : annotation_requests) if (request.source == source) requests.push_back(request);
-  ArtifactProgressTotals totals;
+  auto& totals = progress.transfers();
   const auto results = download_artifacts(requests, parse_workers, cancel_requested,
    progress.transfer_observer_enabled() ? DownloadProgressSink{[&](const auto& update) { totals.update(update, progress); }} : DownloadProgressSink{}, trace);
   for (std::size_t i = 0; i < requests.size(); ++i) annotation_downloads.at(requests[i].artifact_id) = results[i];

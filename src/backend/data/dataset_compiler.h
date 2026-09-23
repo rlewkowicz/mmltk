@@ -20,6 +20,7 @@
 #include "mmltk/frameworks/reflection/materializer.h"
 #include "src/backend/data/compiled_format.h"
 #include "src/backend/data/dataset_compile_phase.h"
+#include "src/backend/data/dataset_compile_progress.h"
 namespace mmltk::backend::data {
 namespace compiler_internal {
 struct ProgressCounter;
@@ -31,10 +32,7 @@ struct CompileProgress {
  std::uint64_t remaining_seconds = 0;
  std::uint64_t throughput_per_second = 0;
  DatasetCompilePhase phase = DatasetCompilePhase::Labels;
- size_t label_done = 0;
- size_t label_total = 0;
- size_t pixel_done = 0;
- size_t pixel_total = 0;
+ DatasetCompileTracks tracks{};
  size_t active_workers = 0;
  std::uint64_t dropped_instances = 0;
 };
