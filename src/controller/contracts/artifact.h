@@ -80,7 +80,7 @@ struct ArtifactProgress final {
  [[nodiscard]] bool valid() const noexcept {
   if (!tracks.valid() || sources.size() > 5U) return false;
   for (const auto& source : sources)
-   if (source.activity.size() > kArtifactProgressTextCapacity) return false;
+   if (source.activity.size() > kArtifactProgressTextCapacity || (source.transfer && !source.transfer->valid())) return false;
   const auto phase_value = static_cast<std::uint8_t>(phase);
   return phase_value > static_cast<std::uint8_t>(ArtifactCompilePhase::Idle) && phase_value <= static_cast<std::uint8_t>(ArtifactCompilePhase::Publishing) &&
          activity.size() <= kArtifactProgressTextCapacity && (total == 0U || completed <= total);

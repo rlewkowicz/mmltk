@@ -230,6 +230,7 @@ void ProgressReporter::source_activity(const BenchmarkDatasetSource source, std:
 void ProgressReporter::set_source_activity_unlocked(const BenchmarkDatasetSource source, std::string activity, bool foreground) {
  BenchmarkSourceProgress& source_state = source_progress(source);
  if (source_state.activity != activity || state_.current_source != source) { trace_activity(source, activity); }
+ if (source_state.activity != activity) source_state.transfer.reset();
  source_state.complete = false;
  source_state.activity = activity.substr(0, kDatasetCompileProgressTextCapacity);
  if (foreground) {
@@ -297,13 +298,9 @@ void ProgressReporter::source_transfer(const DownloadProgress& update, const Ben
   set_activity_unlocked(operation);
  }
  progress.complete = false;
- progress.activity = operation + " · " + std::to_string(update.completed_bytes);
- if (update.total_bytes != 0U) { progress.activity += " / " + std::to_string(update.total_bytes); }
- progress.activity += update.cache_hit ? " bytes reused" : " bytes";
- if (!update.cache_hit && update.total_bytes == 0U) { progress.activity += " (total unknown)"; }
- if (!update.cache_hit && update.attempt != 0U) { progress.activity += " · attempt " + std::to_string(update.attempt); }
- if (update.resumed) { progress.activity += " · retained " + std::to_string(update.retained_bytes) + " bytes"; }
- if (progress.activity.size() > kDatasetCompileProgressTextCapacity) progress.activity.resize(kDatasetCompileProgressTextCapacity);
+ progress.activity = operation.substr(0, kDatasetCompileProgressTextCapacity);
+ progress.transfer = BenchmarkTransferProgress{.completed_bytes = update.completed_bytes, .total_bytes = update.total_bytes,
+  .retained_bytes = update.retained_bytes, .attempt = update.attempt, .cache_hit = update.cache_hit, .resumed = update.resumed};
  progress.completed_bytes = aggregate.completed_bytes;
  progress.total_bytes = aggregate.total_bytes;
  progress.byte_total_known = aggregate.byte_total_known;
@@ -317,6 +314,7 @@ void ProgressReporter::source_complete(const BenchmarkDatasetSource source, cons
  if (!callback_) { return; }
  const std::lock_guard lock(mutex_);
  BenchmarkSourceProgress& progress = source_progress(source);
+ progress.transfer.reset();
  progress.complete = true;
  progress.cache_hit = cache_hit;
  progress.activity = cache_hit ? "Cache hit" : "Complete";

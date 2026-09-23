@@ -804,14 +804,16 @@ void test_benchmark_cli_source_status_preserves_active_transfer_state() {
  active.cache_hit = true;
  active.resumed = true;
  active.retry_count = 2U;
+ active.transfer = BenchmarkTransferProgress{.completed_bytes = 4096, .total_bytes = 8192, .retained_bytes = 1024, .attempt = 3, .resumed = true};
  const std::string status = format_benchmark_source_status(active, "extracting");
  REQUIRE(status.starts_with("Downloading objects365-train-patch-4"));
  REQUIRE(status.find("resumed") != std::string::npos);
  REQUIRE(status.find("2 retries") != std::string::npos);
+ REQUIRE(status.find("4096 / 8192 bytes · attempt 3 · retained 1024 bytes") != std::string::npos);
  active.activity = "Verifying cached objects365-train-patch-4";
  REQUIRE(format_benchmark_source_status(active, "extracting").starts_with("Verifying cached"));
  active.complete = true;
- REQUIRE(format_benchmark_source_status(active, "extracting") == "Cache hit");
+ REQUIRE(format_benchmark_source_status(active, "extracting") == "Cache hit · resumed · 2 retries");
 }
 }  // namespace
 TEST_CASE("benchmark cache roots share explicit environment and relative precedence", "[backend][data][benchmark][cache]") {
@@ -2996,4 +2998,39 @@ TEST_CASE("unrelated compile failure discards queued pixels before joining activ
  CHECK(writer.completed() == 1);
  for (std::size_t slot = 1; slot < membership.images.size(); ++slot) CHECK_FALSE(writer.image_complete(slot));
  CHECK(mmltk::common::io::sha256_file(output) == published);
+}
+
+TEST_CASE("source transfer facts follow represented activity independently of aggregate work", "[backend][data][benchmark][progress]") {
+ BenchmarkCompileProgress latest;
+ const BenchmarkTraceSink quiet;
+ ProgressReporter reporter([&](const auto& update) { latest = update; }, quiet);
+ reporter.phase(DatasetCompilePhase::Downloading);
+ const DownloadProgress download{.artifact_id = "train-patch", .completed_bytes = 4096, .total_bytes = 8192, .attempt = 2, .resumed = true, .retained_bytes = 1024};
+ reporter.transfers().update(download, reporter);
+ REQUIRE(latest.sources.front().transfer);
+ CHECK(latest.sources.front().transfer->valid());
+ CHECK(latest.sources.front().activity == "Resuming train-patch");
+ CHECK(latest.sources.front().transfer->attempt == 2);
+ CHECK(latest.sources.front().transfer->retained_bytes == 1024);
+ reporter.source_images(download.source, 2, 3);
+ CHECK(latest.sources.front().transfer.has_value());
+ reporter.source_activity(download.source, "Resuming train-patch");
+ CHECK(latest.sources.front().transfer.has_value());
+ reporter.source_activity(download.source, "Extracting train-patch");
+ CHECK_FALSE(latest.sources.front().transfer);
+ reporter.transfers().update(download, reporter);
+ reporter.source_images(download.source, 3, 3, "Normalizing annotations");
+ CHECK_FALSE(latest.sources.front().transfer);
+ reporter.transfers().update(DownloadProgress{.artifact_id = "metadata", .completed_bytes = 512}, reporter);
+ REQUIRE(latest.sources.front().transfer);
+ CHECK(latest.sources.front().transfer->total_bytes == 0);
+ CHECK(latest.sources.front().transfer->completed_bytes == 512);
+ CHECK(latest.sources.front().completed_bytes == 4608);
+ CHECK_FALSE(latest.sources.front().byte_total_known);
+ CHECK(format_benchmark_source_status(latest.sources.front(), "Acquiring").find("512 bytes (total unknown)") != std::string::npos);
+ reporter.source_complete(download.source, true);
+ CHECK_FALSE(latest.sources.front().transfer);
+ CHECK(latest.sources.front().complete);
+ CHECK(latest.sources.front().retry_count == 1);
+ CHECK(latest.sources.front().resumed);
 }

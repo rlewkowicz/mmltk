@@ -1,3 +1,5 @@
+pub(crate) mod progress;
+
 use crate::view::shared::{card_section_divider, disclosure};
 use crate::fluent_theme::Element;
 use crate::generated::{BenchmarkDatasetVariant, CoconutValidation, ImageResizeMode};
@@ -256,7 +258,7 @@ pub fn view<'a>(
     let dataset = model.workflow.dataset.as_ref();
     let active = dataset.is_some_and(|state| state.active);
     let action = if active {
-        button("Cancel compilation")
+        button(if progress::cancelling(dataset) { "Cancelling…" } else { "Cancel compilation" })
             .on_press_maybe(model.dataset_stop_available().then_some(Message::Stop))
     } else {
         button(if train.compilebenchmarkdatasetoverride {
@@ -276,7 +278,7 @@ pub fn view<'a>(
                     "Compile Size: {} x {}",
                     train.request.resolution, train.request.resolution
                 )),
-                container(crate::view::workflow::progress::artifact(dataset))
+                container(progress::view(dataset))
                     .id(super::COMPILE_PROGRESS_ID),
                 container(action.width(Fill)).id(super::COMPILE_DATASET_ID).width(Fill),
             ].spacing(crate::view::workflow::FIELD_SPACING)]

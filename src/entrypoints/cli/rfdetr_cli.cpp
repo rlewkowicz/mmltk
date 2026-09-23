@@ -528,7 +528,7 @@ void run_compile(const CompileCliRequest& request) {
    spdmon::ProgressBar::log(data::format_dataset_compile_tracks(progress.tracks));
    if (!progress.activity.empty()) spdmon::ProgressBar::log(progress.activity);
    for (const auto& source : progress.sources)
-    if (!source.activity.empty()) {
+    if (!source.activity.empty() || source.transfer || source.complete) {
      spdmon::ProgressBar::log(std::string(data::benchmark_source_label(source.source)) + " · " + data::format_benchmark_source_status(source, "Acquiring") + " · " +
                               std::to_string(source.completed_bytes) + "/" + (source.byte_total_known ? std::to_string(source.total_bytes) : "?") + " bytes · " +
                               std::to_string(source.completed_images) + "/" + std::to_string(source.total_images) + " images · " + std::to_string(source.invalidated_images) + " invalidated");

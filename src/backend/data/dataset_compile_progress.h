@@ -1,6 +1,7 @@
 #pragma once
 #include <cstdint>
 #include <cstddef>
+#include <optional>
 #include "src/frameworks/reflection/field_policy.h"
 #include <string>
 #include <string_view>
@@ -25,9 +26,23 @@ enum class BenchmarkDatasetSource : std::uint8_t {
  }
  return "Unknown source";
 }
+// The latest artifact is independent of cumulative source acquisition totals.
+struct BenchmarkTransferProgress final {
+ std::uint64_t completed_bytes = 0;
+ // Zero means unknown, matching the acquisition observer.
+ std::uint64_t total_bytes = 0;
+ std::uint64_t retained_bytes = 0;
+ std::uint32_t attempt = 0;
+ bool cache_hit = false;
+ bool resumed = false;
+ [[nodiscard]] bool valid() const noexcept { return retained_bytes <= completed_bytes && (total_bytes == 0 || completed_bytes <= total_bytes); }
+ bool operator==(const BenchmarkTransferProgress&) const = default;
+};
+MMLTK_REFLECT_FIELDS(BenchmarkTransferProgress)
 struct BenchmarkSourceProgress {
  BenchmarkDatasetSource source = BenchmarkDatasetSource::kCoco2017;
  [[= mmltk::frameworks::reflection::MaxBytes{kDatasetCompileProgressTextCapacity}]] std::string activity;
+ std::optional<BenchmarkTransferProgress> transfer{};
  std::uint64_t completed_bytes = 0;
  std::uint64_t total_bytes = 0;
  std::uint64_t completed_images = 0;

@@ -387,12 +387,17 @@ TEST_CASE("artifact compile adapters preserve canonical ordinary and benchmark e
  benchmark.sources.push_back({
   .source = data::BenchmarkDatasetSource::kOpenImagesV7,
   .activity = "Fetching shard",
+  .transfer = data::BenchmarkTransferProgress{.completed_bytes = 128U, .total_bytes = 1024U, .retained_bytes = 64U, .attempt = 2U, .resumed = true},
   .completed_bytes = 128U,
   .total_bytes = 1024U,
   .resumed = true,
  });
  const domain::ArtifactProgress projected_benchmark = project_artifact_progress(benchmark);
- CHECK(projected_benchmark.activity == "Open Images v7 · Fetching shard · resumed");
+ CHECK(projected_benchmark.activity == "Open Images v7 · Fetching shard");
+ CHECK(projected_benchmark.activity.find("128") == std::string::npos);
+ CHECK(projected_benchmark.activity.find("bytes") == std::string::npos);
+ CHECK(projected_benchmark.activity.find("attempt") == std::string::npos);
+ CHECK(projected_benchmark.activity.find("retained") == std::string::npos);
  CHECK(projected_benchmark.elapsed_seconds == 7U);
  CHECK(projected_benchmark.remaining_seconds == 63U);
  CHECK(projected_benchmark.throughput_per_second == 0U);

@@ -1678,8 +1678,17 @@ std::string format_benchmark_source_status(const BenchmarkSourceProgress& progre
  } else {
   status = default_status;
  }
- if (!progress.complete && progress.resumed) { status += " · resumed"; }
- if (!progress.complete && progress.retry_count != 0U) { status += " · " + std::to_string(progress.retry_count) + " retries"; }
+ if (!progress.complete && progress.transfer) {
+  const auto& transfer = *progress.transfer;
+  status += " · " + std::to_string(transfer.completed_bytes);
+  if (transfer.total_bytes != 0U) status += " / " + std::to_string(transfer.total_bytes);
+  status += transfer.cache_hit ? " bytes reused" : " bytes";
+  if (!transfer.cache_hit && transfer.total_bytes == 0U) status += " (total unknown)";
+  if (!transfer.cache_hit && transfer.attempt != 0U) status += " · attempt " + std::to_string(transfer.attempt);
+  if (transfer.resumed) status += " · retained " + std::to_string(transfer.retained_bytes) + " bytes";
+ }
+ if (progress.resumed) { status += " · resumed"; }
+ if (progress.retry_count != 0U) { status += " · " + std::to_string(progress.retry_count) + " retries"; }
  return status;
 }
 }  // namespace mmltk::backend::data

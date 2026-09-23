@@ -67,7 +67,7 @@ contracts::ArtifactProgress project_artifact_progress(const mmltk::backend::data
  for (const auto& source : value.sources) {
   if (value.current_source == source.source) {
    const auto source_name = mmltk::backend::data::benchmark_source_label(source.source);
-   activity = std::string{source_name} + " · " + mmltk::backend::data::format_benchmark_source_status(source, activity);
+   activity = std::string{source_name} + " · " + (source.activity.empty() ? activity : source.activity);
    break;
   }
  }
