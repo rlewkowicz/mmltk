@@ -174,7 +174,7 @@ pub enum Message {
         token: u32,
         bounds: [Rectangle; 3],
     },
-    #[cfg(target_arch = "wasm32")]
+    #[cfg(any(target_arch = "wasm32", test))]
     ConfidenceInputDelivered(u8, bool),
     WorkflowPixels {
         picture: workflows::Picture,
@@ -303,6 +303,8 @@ extern "C" {
     );
     #[wasm_bindgen::prelude::wasm_bindgen(js_name = mmltkIntegrationInitialize)]
     fn initialize_js(enabled: bool);
+    #[wasm_bindgen::prelude::wasm_bindgen(js_name = mmltkIntegrationExpectInitialAtlas)]
+    fn expect_initial_atlas_js();
     #[wasm_bindgen::prelude::wasm_bindgen(js_name = mmltkIntegrationDriver)]
     fn initialize_driver_js(enabled: bool);
     #[wasm_bindgen::prelude::wasm_bindgen(js_name = mmltkIntegrationDriverDraw)]
@@ -1697,7 +1699,7 @@ impl Controller {
                 }
                 return None;
             }
-            #[cfg(target_arch = "wasm32")]
+            #[cfg(any(target_arch = "wasm32", test))]
             Message::ConfidenceInputDelivered(stage, delivered) => {
                 self.workflows
                     .confidence_input_delivered(&mut self.driver, stage, delivered);

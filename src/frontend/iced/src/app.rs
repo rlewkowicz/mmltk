@@ -1832,19 +1832,19 @@ mod tests {
         assert!(app.model.error.is_none());
 
         let columns = authoritative_explore_columns(&app);
-        assert!(app.workspace.explore_measure_gallery(
-            601.0,
-            420.0,
-            gallery_capacity(601, 420),
-            columns,
-        ));
-        let measured = ExploreViewportUpdate {
-            viewport: app
-                .workspace
-                .explore_measured_viewport(columns, 0, 0)
-                .unwrap(),
+        let measured = |height| {
+            crate::view::router::Message::Explore(crate::view::explore::Message::Gallery(
+                crate::view::explore::gallery::Message::Measured {
+                    size: iced::Size::new(601.0, 420.0),
+                    maximum_extent: gallery_capacity(601, height),
+                    columns,
+                },
+            ))
         };
-        drop(app.request_explore_viewport(measured.clone()));
+        drop(app.on_workspace(measured(0)));
+        assert!(app.model.explore.desired_open);
+        assert_eq!(app.model.pending_count(), 0);
+        drop(app.on_workspace(measured(420)));
 
         assert!(!app.model.explore.desired_open);
         assert_eq!(
@@ -1854,7 +1854,7 @@ mod tests {
         assert_eq!(app.model.pending_count(), 1);
         assert!(app.model.error.is_none());
 
-        drop(app.request_explore_viewport(measured));
+        drop(app.on_workspace(measured(420)));
         assert_eq!(app.model.pending_count(), 1);
     }
 

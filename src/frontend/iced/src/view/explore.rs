@@ -102,6 +102,7 @@ pub enum Outcome {
     PreviousRequested,
     NextRequested,
     CloseDetailRequested,
+    LayoutMeasured,
     ViewportChanged(crate::generated::ExploreViewportUpdate),
 }
 
@@ -245,6 +246,7 @@ impl Component {
                             Outcome::AugmentationRerollRequested
                         }
                         gallery::Outcome::ImageSelected(index) => Outcome::ImageSelected(index),
+                        gallery::Outcome::LayoutMeasured => Outcome::LayoutMeasured,
                         gallery::Outcome::ViewportChanged(viewport) => {
                             Outcome::ViewportChanged(viewport)
                         }

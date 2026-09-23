@@ -31,6 +31,7 @@ export function mmltkIntegrationInitialize(enabled) {
   integrationState = {
     integrationSurfaceDraws: new Map(),
     completions: new Set(),
+    initialAtlasExpected: false,
     initialAtlasWithoutInput: false,
     initialAtlasInputCount: 0,
     initialAtlasCompleted: false,
@@ -63,6 +64,10 @@ export function mmltkIntegrationInitialize(enabled) {
   for (const type of integrationState.inputTypes) {
     window.addEventListener(type, integrationState.onInput, true);
   }
+}
+
+export function mmltkIntegrationExpectInitialAtlas() {
+  if (integrationState && !integrationState.initialAtlasCompleted) integrationState.initialAtlasExpected = true;
 }
 
 // Every asynchronous entry captures its scheduling owner. Reset settles all
@@ -191,7 +196,8 @@ export function mmltkIntegrationDriverDraw(control, sourceRevision, presentation
 function report(record, fields = '{}') {
   if (!integrationState) return;
   record.elapsed_ms = performance.now();
-  if (!integrationState.initialAtlasCompleted && record.event === 'integration.explore_open_submission' && record.detail === 'submitted') {
+  if (integrationState.initialAtlasExpected && !integrationState.initialAtlasCompleted
+      && record.event === 'integration.explore_open_submission' && record.detail === 'submitted') {
     integrationState.initialAtlasWithoutInput = true;
     integrationState.initialAtlasInputCount = 0;
   } else if (record.event === 'integration.initial_atlas_complete') {

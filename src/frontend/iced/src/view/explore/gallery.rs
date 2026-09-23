@@ -43,6 +43,7 @@ pub(super) enum Outcome {
     AugmentationUpdated(crate::generated::ExploreAugmentationUpdate),
     AugmentationRerollRequested,
     ImageSelected(u32),
+    LayoutMeasured,
     ViewportChanged(crate::generated::ExploreViewportUpdate),
 }
 
@@ -106,22 +107,23 @@ pub(super) fn update(
         } => {
             // The retained sensor also measures beneath Detail. Returning to
             // Gallery reconciles this geometry through the ordinary native event.
+            // A first measurement also wakes an Open awaiting usable geometry.
             let changed = state.measure_gallery(size.width, size.height, maximum_extent, columns);
-            let Some(snapshot) =
-                snapshot.filter(|value| value.mode == crate::generated::ExploreMode::Gallery)
-            else {
-                return Ok(None);
-            };
             if !changed {
                 return Ok(None);
             }
+            let Some(snapshot) =
+                snapshot.filter(|value| value.mode == crate::generated::ExploreMode::Gallery)
+            else {
+                return Ok(Some(Outcome::LayoutMeasured));
+            };
             let Some(request) = state.measured_layout_request(
                 Some(snapshot),
                 columns,
                 snapshot.order.matchingcount,
             ) else {
                 state.clear_viewport_admission();
-                return Ok(None);
+                return Ok(Some(Outcome::LayoutMeasured));
             };
             Outcome::ViewportChanged(request)
         }
@@ -806,11 +808,10 @@ mod tests {
             },
             columns: 4,
         };
-        assert!(
-            update(&mut state, None, &mut settings, measurement(0))
-                .unwrap()
-                .is_none()
-        );
+        assert!(matches!(
+            update(&mut state, None, &mut settings, measurement(0)).unwrap(),
+            Some(Outcome::LayoutMeasured)
+        ));
         assert_eq!(state.gallery_size(), Some(Size::new(601.5, 420.25)));
         assert!(
             state

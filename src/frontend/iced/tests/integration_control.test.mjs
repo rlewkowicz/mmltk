@@ -106,6 +106,7 @@ function assertQuiet(fixture) {
 
 test('ordinary execution constructs neither owner and schedules no input or probe work', t => {
   const f = canvasFixture(t, false, false);
+  browser.mmltkIntegrationExpectInitialAtlas();
   browser.mmltkIntegrationDriverDraw(gallery, 7, 11);
   browser.mmltkIntegrationReceipt(gallery, 'unused', 7, 11);
   assert.equal(browser.mmltkIntegrationProbe(gallery), undefined);
@@ -116,6 +117,26 @@ test('ordinary execution constructs neither owner and schedules no input or prob
   assert.deepEqual(f.events, []);
   assertQuiet(f);
 });
+
+for (const expected of [false, true]) {
+  test(`initial gallery input guard belongs to its requesting scenario: ${expected}`, t => {
+    const f = canvasFixture(t, true);
+    if (expected) browser.mmltkIntegrationExpectInitialAtlas();
+    f.input('pointerdown'); // The Open click precedes accepted submission.
+    const failures = () => f.reports.filter(record => record.event === 'integration.failure').length;
+    assert.equal(failures(), 0);
+    browser.mmltkIntegrationReport('integration.explore_open_submission', '', 'submitted', 0, 0, 0, 0);
+    f.input('keydown');
+    assert.equal(failures(), Number(expected));
+    browser.mmltkIntegrationReport('integration.initial_atlas_complete', gallery, 'no-input-canvas-pixels', 1, 1, 1, 1);
+    f.input('keydown');
+    assert.equal(failures(), Number(expected));
+    browser.mmltkIntegrationResetScenario();
+    browser.mmltkIntegrationReport('integration.explore_open_submission', '', 'submitted', 0, 0, 0, 0);
+    f.input('keydown');
+    assert.equal(failures(), Number(expected));
+  });
+}
 
 test('quiet draw-conditioned input uses direct readiness, once, independently of diagnostics', t => {
   const f = canvasFixture(t);

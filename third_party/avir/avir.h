@@ -2023,7 +2023,10 @@ class CImageResizerFilterStepINL : public CImageResizerFilterStep<fptype, fptype
             const int IntFltLen = UsePositionFilterLen ? rpos->fl : FilterLenBase;
             const fptype* const ftp2 = ftp + FilterLenBase;
             const fptype* Src = SrcLine + rpos->SrcOffs;
-            fptype sum[ElCount] = {};
+            fptype sum[ElCount];
+            for (int c = 0; c < ElCount; ++c) {
+                sum[c] = (fptype)0;
+            }
 
             for (int i = 0; i < IntFltLen; i += Step) {
                 const fptype xx = Linear ? ftp[i] + ftp2[i] * x : ftp[i];

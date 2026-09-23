@@ -3035,7 +3035,7 @@ TEST_CASE("COCONut readable mismatched geometry survives a failed body and cache
  const auto expected = file_bytes(config.output_dir / "train.bin");
  const std::array<std::uint32_t, 24> pixels{};
  auto bad_body = png(6, 4, pixels);
- bad_body.resize(33);  // Complete IHDR, no compressed image data.
+ bad_body.resize(41);  // Keep the IDAT header required by stbi_info, but no image data.
  const auto cached = cached_image_path(local.cache.source_images("objects365") / "patch-32", 1);
  mmltk::testsupport::write_text_file(cached, bad_body);
  unsigned repairs = 0;
@@ -3354,16 +3354,16 @@ TEST_CASE("cold COCONut releases retain one aggregate indexing denominator", "[b
  for (const auto& release : catalog.releases) total += release.expected_rows;
  REQUIRE(catalog.releases[0].expected_rows != catalog.releases[1].expected_rows);
  const auto base_rows = catalog.releases[0].expected_rows;
- mmltk::testsupport::TestGate base("base cold mask import"), validation("validation cold mask import"), receiver("metadata receiver before pixel phase");
- const auto base_receipt = base.receipt(), validation_receipt = validation.receipt(), receiver_receipt = receiver.receipt();
+ mmltk::testsupport::TestGate base("base cold mask import"), last_release("last independent cold mask import"), receiver("metadata receiver before pixel phase");
+ const auto base_receipt = base.receipt(), last_receipt = last_release.receipt(), receiver_receipt = receiver.receipt();
  catalog.release_observer = [&](CoconutEdition edition, CoconutReleaseBoundary boundary) {
   if (edition == CoconutEdition::Base) {
    if (boundary == CoconutReleaseBoundary::MasksStarted)
     base_receipt.ArriveAndWait();
    else
     receiver_receipt.ArriveAndWait();
-  } else if (edition == CoconutEdition::RelabeledValidation && boundary == CoconutReleaseBoundary::MasksStarted)
-   validation_receipt.ArriveAndWait();
+  } else if (edition == catalog.releases.back().edition && boundary == CoconutReleaseBoundary::MasksStarted)
+   last_receipt.ArriveAndWait();
  };
  std::vector<BenchmarkCompileProgress> indexing;
  std::promise<void> independent_settled, all_settled, extracting;
@@ -3399,15 +3399,15 @@ TEST_CASE("cold COCONut releases retain one aggregate indexing denominator", "[b
  const mmltk::testsupport::ScopedTestCleanup release([&] {
   cancelled.store(true);
   base.Release();
-  validation.Release();
+  last_release.Release();
   receiver.Release();
  });
  REQUIRE(base.WaitEntered(5s));
- REQUIRE(validation.WaitEntered(5s));
+ REQUIRE(last_release.WaitEntered(5s));
  REQUIRE(receiver.WaitEntered(5s));
  receiver.Release();
  mmltk::testsupport::await_test_promise(extracting, "foreground extraction while masks remain active", 5s);
- validation.Release();
+ last_release.Release();
  mmltk::testsupport::await_test_promise(independent_settled, "independent cold releases indexed", 5s);
  base.Release();
  mmltk::testsupport::await_test_promise(all_settled, "aggregate indexing settlement", 5s);

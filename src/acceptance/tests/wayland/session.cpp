@@ -604,6 +604,20 @@ void WaylandSession::RunWorkflows() {
   if (waits[2].revents & POLLIN) {
    const auto event = process.receive_explore_event();
    REQUIRE(event.has_value());
+   using Event = ExploreAcceptanceGate::ControlEvent;
+   using Command = ExploreAcceptanceGate::ControlCommand;
+   // Workflows exercise ordinary gallery opening, so release the fixture's
+   // read gates as they arrive. Retained scenarios own delayed-read evidence.
+   if (event->event == Event::InitialWait) {
+    REQUIRE(process.command_explore(static_cast<std::uint8_t>(Command::ReleaseAll)));
+    continue;
+   }
+   if (event->event == Event::HeldWait || event->event == Event::HeldProceed || event->event == Event::HeldStale) {
+    native.RecordHeldControlObservation(*event);
+    REQUIRE_FALSE(native.causal_inconsistent);
+    if (event->event == Event::HeldWait) REQUIRE(process.command_explore(static_cast<std::uint8_t>(Command::HeldRelease)));
+    continue;
+   }
    REQUIRE(event->event == ExploreAcceptanceGate::ControlEvent::Frontend);
    REQUIRE(event->generation == scenario_sequence_);
    using Kind = mmltk::controller::contracts::IntegrationControlKind;

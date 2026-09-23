@@ -236,7 +236,7 @@ impl App {
                 self.model.set_foreground_feature(FeatureId::Explore);
                 self.model.explore.requested_selection = Some(compiledindex);
                 self.model.explore.desired_selection = Some(compiledindex);
-                self.model.explore.desired_navigation = None;
+                self.model.explore.navigation_offset = 0;
                 self.model.explore.desired_close = false;
                 self.dispatch_explore_desired();
             }
@@ -249,7 +249,7 @@ impl App {
             crate::view::explore::Outcome::CloseDetailRequested => {
                 self.abandon_viewer();
                 self.model.set_foreground_feature(FeatureId::Explore);
-                self.model.explore.desired_navigation = None;
+                self.model.explore.navigation_offset = 0;
                 self.model.explore.desired_close = true;
                 self.dispatch_explore_desired();
             }
@@ -258,6 +258,9 @@ impl App {
                     crate::view::explore::GALLERY_WORKSPACE_ID,
                     iced::widget::operation::AbsoluteOffset { x: 0.0, y: offset },
                 );
+            }
+            crate::view::explore::Outcome::LayoutMeasured => {
+                self.dispatch_explore_open();
             }
             crate::view::explore::Outcome::ViewportChanged(request) => {
                 return self.request_explore_viewport(request);
@@ -365,16 +368,21 @@ impl App {
         {
             self.model.explore.desired_close = false;
         }
-        if !self.model.has_explore_pending()
-            && let Some(direction) = self.model.explore.desired_navigation
-            && self.submit_intent(ApplicationIntentEndpoint::ExploreNavigate, |correlation| {
+        let navigation = self.model.explore.navigation_offset.signum();
+        if !self.model.has_explore_pending() && navigation != 0 {
+            let direction = if navigation > 0 {
+                ExploreNavigation::Next
+            } else {
+                ExploreNavigation::Previous
+            };
+            if self.submit_intent(ApplicationIntentEndpoint::ExploreNavigate, |correlation| {
                 crate::generated::encode_explore_Navigate(
                     correlation,
                     ExploreNavigate { direction },
                 )
-            })
-        {
-            self.model.explore.desired_navigation = None;
+            }) {
+                self.model.explore.navigation_offset -= navigation;
+            }
         }
         if !self.model.has_explore_pending()
             && let Some(mut request) = self.model.explore.desired_filter.clone()
@@ -559,7 +567,18 @@ impl App {
         self.abandon_viewer();
         self.model.set_foreground_feature(FeatureId::Explore);
         self.model.explore.desired_close = false;
-        self.model.explore.desired_navigation = Some(direction);
+        let count = self
+            .model
+            .explore
+            .snapshot
+            .as_ref()
+            .map_or(1, |snapshot| i64::from(snapshot.order.matchingcount.max(1)));
+        let offset = match direction {
+            ExploreNavigation::Next => 1,
+            ExploreNavigation::Previous => -1,
+        };
+        self.model.explore.navigation_offset =
+            (self.model.explore.navigation_offset + offset) % count;
         self.dispatch_explore_desired();
     }
 

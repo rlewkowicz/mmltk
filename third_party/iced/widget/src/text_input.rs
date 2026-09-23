@@ -83,6 +83,11 @@ where
         }
     }
 
+    /// Replaces controlled text without changing the widget's configuration.
+    pub fn set_value(&mut self, value: &str) {
+        self.value = Value::new(value);
+    }
+
         pub fn id(mut self, id: impl Into<widget::Id>) -> Self {
         self.id = Some(id.into());
         self

@@ -834,6 +834,30 @@ mod tests {
     }
 
     #[test]
+    fn confidence_delivery_retains_scenario_and_stage_ownership() {
+        let mut fixture = crate::integration_control::ProbeFixture::new("workflows");
+        let controller = &mut fixture.controller;
+        controller.driver.phase = Phase::Workflows(Step::ConfidenceReady(0));
+        let generation = controller.driver.generation;
+        let delivered = |generation, stage, success| Message::Scoped {
+            generation,
+            receipt: None,
+            message: Box::new(Message::ConfidenceInputDelivered(stage, success)),
+        };
+        let _ = controller.update(delivered(generation.wrapping_sub(1), 0, true));
+        let _ = controller.update(delivered(generation, 1, true));
+        assert!(!controller.workflows.confidence_delivered);
+        let _ = controller.update(delivered(generation, 0, true));
+        assert!(controller.workflows.confidence_delivered);
+        assert_eq!(
+            controller.driver.phase,
+            Phase::Workflows(Step::ConfidenceReady(0))
+        );
+        let _ = controller.update(delivered(generation, 0, false));
+        assert_eq!(controller.driver.phase, Phase::Failed);
+    }
+
+    #[test]
     fn workflow_completion_requires_current_nonempty_canvas_evidence() {
         let mut fixture = crate::integration_control::ProbeFixture::new("workflows");
         let controller = &mut fixture.controller;
@@ -906,7 +930,7 @@ mod tests {
 }
 
 impl State {
-    #[cfg(target_arch = "wasm32")]
+    #[cfg(any(target_arch = "wasm32", test))]
     pub(super) fn confidence_input_delivered(
         &mut self,
         driver: &mut Driver,
@@ -1008,7 +1032,9 @@ impl State {
                     | Step::ChartReturn
                     | Step::Validate
                     | Step::PrepareExplore
+                    | Step::OpenGallery
                     | Step::Explore
+                    | Step::Pixels(Picture::Gallery, _)
                     | Step::Predict
                     | Step::Export
                     | Step::ExportReturn
@@ -1018,8 +1044,8 @@ impl State {
                     | Step::NoValidationAspect
             )
         ) {
-            // Navigation sits above the page scroller; absent-control checks
-            // also need the unmodified tree result, without scroll clipping.
+            // Navigation and Explore use their own layout/scroll owners;
+            // absent-control checks also need the unmodified tree result.
             locate(control, driver.generation)
         } else {
             reveal_control(control, driver.generation, AnnotationReveal::Control)
@@ -1934,7 +1960,13 @@ impl State {
                         .confidencethreshold
                         != expected
                 {
-                    driver.fail("Validation confidence changed through invalid input or increment interaction");
+                    driver.fail_detail(|| {
+                        format!(
+                            "Validation confidence edit {stage}: expected {expected}, native {}, draft {}",
+                            native.settingsstate.workflows.validate.display.confidencethreshold,
+                            settings.draft.as_ref().unwrap().workflows.validate.display.confidencethreshold,
+                        ).into()
+                    });
                     return Task::none();
                 }
                 let Some(snapshot) = validation else {

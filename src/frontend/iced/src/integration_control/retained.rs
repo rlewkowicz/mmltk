@@ -3102,10 +3102,11 @@ impl State {
                     return Task::none();
                 };
                 if snapshot.busy
+                    || snapshot.renderpending
                     || snapshot.selectedimage != Some(0)
                     || snapshot.revision <= revision
                     || model.has_explore_pending()
-                    || model.explore.desired_navigation.is_some()
+                    || model.explore.navigation_offset != 0
                 {
                     return Task::none();
                 }
@@ -3164,13 +3165,13 @@ impl State {
                     );
                 }
                 if driver.viewer_scenario == "rapid" {
-                    driver.phase = Phase::ViewerRapidSelection(
-                        model
-                            .explore
-                            .snapshot
-                            .as_ref()
-                            .map_or(0, |snapshot| snapshot.revision),
-                    );
+                    let Some(snapshot) = model.explore.snapshot.as_ref() else {
+                        return Task::none();
+                    };
+                    if snapshot.busy || snapshot.renderpending || model.has_explore_pending() {
+                        return Task::none();
+                    }
+                    driver.phase = Phase::ViewerRapidSelection(snapshot.revision);
                     return explore_message(explore::Message::Detail(
                         explore::detail::Message::NextRequested,
                     ))
@@ -4430,6 +4431,8 @@ impl State {
                     Phase::ExploreCloseDetail => Phase::AwaitExploreGallery,
                     Phase::ExploreOpen => {
                         COMPLETION_WITHOUT_INPUT.with(|active| active.set(true));
+                        #[cfg(target_arch = "wasm32")]
+                        super::expect_initial_atlas_js();
                         Phase::AwaitExploreReady
                     }
                     _ => driver.phase.clone(),

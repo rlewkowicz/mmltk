@@ -491,6 +491,8 @@ impl Requests {
                         // physical receipt changed while the browser was sampling.
                         Some(_) if matches!(message, Message::WorkspaceFpsPixels(_)) => true,
                         Some(receipt) => current_receipt(receipt.control).as_ref() == Some(receipt),
+                        #[cfg(any(target_arch = "wasm32", test))]
+                        None if matches!(message, Message::ConfidenceInputDelivered(..)) => true,
                         None => matches!(
                             message,
                             Message::ReportingDisabled

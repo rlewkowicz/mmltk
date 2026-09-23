@@ -235,6 +235,17 @@ where
     pub fn text(&self) -> &str {
         &self.text
     }
+
+    pub(crate) fn set_text(&mut self, text: &str) {
+        if self.text != text {
+            self.text.clear();
+            self.text.push_str(text);
+            self.text_input.set_value(text);
+            if let Ok(value) = T::from_str(text) {
+                self.value = value;
+            }
+        }
+    }
 }
 
 impl<'a, T, Message, Theme, Renderer> Widget<Message, Theme, Renderer>

@@ -218,7 +218,7 @@ impl Controller {
             route == FeatureId::Explore
                 && snapshot.mode == crate::generated::ExploreMode::Detail
                 && !model.explore.desired_close
-                && model.explore.desired_navigation.is_none()
+                && model.explore.navigation_offset == 0
                 && !model.has_pending(ApplicationIntentEndpoint::ExploreCloseDetail)
                 && !model.has_pending(ApplicationIntentEndpoint::ExploreNavigate)
                 && snapshot.selectedimage.is_some()
@@ -1318,6 +1318,39 @@ mod tests {
                 ..
             }))
         ));
+    }
+
+    #[test]
+    fn navigation_accumulates_while_another_explore_request_is_pending() {
+        let (mut app, _) = viewer_app();
+        let (sender, _receiver) = Connection::test_channel();
+        app.connection = Some(sender);
+        app.model
+            .explore
+            .snapshot
+            .as_mut()
+            .unwrap()
+            .order
+            .matchingcount = 300;
+        app.model
+            .begin_intent(ApplicationIntentEndpoint::ExploreUpdateDetail)
+            .unwrap();
+        for (outcome, expected) in [
+            (crate::view::explore::Outcome::NextRequested, 1),
+            (crate::view::explore::Outcome::PreviousRequested, 0),
+            (crate::view::explore::Outcome::NextRequested, 1),
+            (crate::view::explore::Outcome::NextRequested, 2),
+            (crate::view::explore::Outcome::PreviousRequested, 1),
+        ] {
+            drop(app.on_explore(outcome));
+            assert_eq!(app.model.explore.navigation_offset, expected);
+        }
+        drop(app.on_explore(crate::view::explore::Outcome::ImageSelected(0)));
+        assert_eq!(app.model.explore.navigation_offset, 0);
+        for _ in 0..300 {
+            drop(app.on_explore(crate::view::explore::Outcome::PreviousRequested));
+        }
+        assert_eq!(app.model.explore.navigation_offset, 0);
     }
 
     #[test]

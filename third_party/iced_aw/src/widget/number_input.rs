@@ -457,6 +457,14 @@ where
     }
 
     fn diff(&mut self, tree: &mut Tree) {
+        let retained = &mut tree.state.downcast_mut::<ModifierState>().edit;
+        if let Some(edit) = retained {
+            if edit.value == self.value.to_string() {
+                self.content.set_text(&edit.text);
+            } else {
+                *retained = None;
+            }
+        }
         tree.children.truncate(2);
         if let Some(content_tree) = tree.children.first_mut() {
             if content_tree.tag != self.content.tag() {
@@ -562,6 +570,7 @@ where
         if self.disabled() {
             return;
         }
+        let previous_value = self.value.clone();
         let can_decrease = self.can_decrease();
         let can_increase = self.can_increase();
 
@@ -821,6 +830,22 @@ where
         if invalidate_widgets {
             shell.invalidate_widgets();
         }
+        // Keep incomplete and equivalent spellings ("", "0.", "0.40")
+        // through unrelated view rebuilds, but discard rejected numbers.
+        let retained = &mut state.state.downcast_mut::<ModifierState>().edit;
+        if previous_value != self.value
+            || retained
+                .as_ref()
+                .is_none_or(|edit| edit.text != self.content.text())
+        {
+            if T::from_str(self.content.text()).is_ok_and(|value| value != self.value) {
+                self.content.set_text(&self.value.to_string());
+            }
+            let edit = retained.get_or_insert_default();
+            edit.value = self.value.to_string();
+            edit.text.clear();
+            edit.text.push_str(self.content.text());
+        }
     }
 
     fn mouse_interaction(
@@ -1005,6 +1030,13 @@ where
 pub struct ModifierState {
     pub decrease_pressed: bool,
     pub increase_pressed: bool,
+    edit: Option<RetainedEdit>,
+}
+
+#[derive(Default, Clone, Debug)]
+struct RetainedEdit {
+    value: String,
+    text: String,
 }
 
 impl<'a, T, Message, Theme, Renderer> From<NumberInput<'a, T, Message, Theme, Renderer>>
@@ -1142,6 +1174,60 @@ mod tests {
             text: text.map(Into::into),
             repeat,
         })
+    }
+
+    #[test]
+    fn decimal_edit_survives_rebuilds_and_external_values_replace_it() {
+        type DecimalInput<'a> = NumberInput<'a, f32, f32, iced_widget::Theme, Renderer>;
+        let mut value = 0.4;
+        let mut tree = Tree::empty();
+        for (index, (character, expected)) in [
+            ("0", 0.0),
+            (".", 0.0),
+            ("4", 0.4),
+            ("3", 0.43),
+            ("7", 0.437),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut input = DecimalInput::new(&value, 0.0..=1.0, |value| value).typed_only(true);
+            tree.diff(&mut input as &mut dyn Widget<f32, iced_widget::Theme, Renderer>);
+            let node = input.layout(
+                &mut tree,
+                &Renderer,
+                &Limits::new(Size::ZERO, Size::new(240.0, 100.0)),
+            );
+            if index == 0 {
+                let text = tree.children[0]
+                    .state
+                    .downcast_mut::<text_input::State<Paragraph>>();
+                text.focus();
+                text.select_all();
+            }
+            let mut messages = Vec::new();
+            let mut shell = Shell::new(
+                &iced_core::window::Headless,
+                iced_core::shell::Waker::new(|| {}),
+                &mut messages,
+            );
+            input.update(
+                &mut tree,
+                &key(keyboard::key::Named::Space, Some(character), false),
+                Layout::new(&node),
+                Cursor::Unavailable,
+                &Renderer,
+                &mut shell,
+                &Rectangle::with_size(Size::new(240.0, 100.0)),
+            );
+            value = messages.last().copied().unwrap_or(value);
+            assert_eq!(value, expected);
+        }
+        for (value, text) in [(0.437, "0.437"), (0.2, "0.2"), (0.437, "0.437")] {
+            let mut input = DecimalInput::new(&value, 0.0..=1.0, |value| value);
+            tree.diff(&mut input as &mut dyn Widget<f32, iced_widget::Theme, Renderer>);
+            assert_eq!(input.content.text(), text);
+        }
     }
 
     #[test]

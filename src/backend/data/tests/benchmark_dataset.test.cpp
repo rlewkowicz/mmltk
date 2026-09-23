@@ -2686,7 +2686,7 @@ TEST_CASE("writer retains readable source geometry when its body fails", "[backe
  const std::array<std::uint8_t, 6 * 4 * 3> rgb{};
  REQUIRE(stbi_write_png_to_func(append_bytes, &encoded, 6, 4, 3, rgb.data(), 6 * 3) != 0);
  const auto valid = encoded;
- encoded.resize(33);
+ encoded.resize(41);  // Keep the IDAT header required by stbi_info, but no image data.
  write_cached_image_atomically(cached_image_path(images, 1), encoded, {});
  PreparedBenchmarkSplit split;
  split.class_names = {"person"};
