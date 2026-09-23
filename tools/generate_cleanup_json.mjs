@@ -101,7 +101,7 @@ const CPP_PROFILE = {
   detectorExcludedPrefixes: NON_CPP_PREFIXES,
   duplo: {
     binary: DUPLO_BINARY,
-    minLines: 9,
+    minLines: 6,
     flags: ["-ip"],
     contentFilter:
       "comments, strings, and preprocessor-only lines excluded",

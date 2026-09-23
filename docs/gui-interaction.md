@@ -160,8 +160,8 @@ requests further redraws; settled or hidden sections remain quiet.
 
 The [shared section divider](../src/frontend/iced/src/view/shared.rs) draws a
 centered line one logical pixel thick across 75% of the available width, using
-the current theme's card outline color. It owns two logical pixels of empty space
-above and below, for a total height of five. Dataset places one after the entire
+the current theme's card outline color. It owns four logical pixels of empty space
+above and below, for a total height of nine. Dataset places one after the entire
 **Compile Benchmark Dataset Override** section, including its revealed choices,
 and before **Dataset source**. The other sits immediately after **Overwrite**
 and before **Compile dimensions**. Neither boundary adds outer spacing to the

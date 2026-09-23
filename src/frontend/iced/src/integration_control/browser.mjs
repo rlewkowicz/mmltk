@@ -1647,7 +1647,7 @@ export function mmltkIntegrationDatasetPixels(key, bounds, dividers, colors, sca
           const alpha = coverage(centerX, y);
           stroke += Math.max(0, alpha);
           if (alpha > peak) { peak = alpha; strongest = y; }
-          if (y + 1 <= 1.5 * sy * scale || y >= 3.5 * sy * scale) gap = Math.max(gap, Math.abs(alpha));
+          if (y + 1 <= 3.5 * sy * scale || y >= 5.5 * sy * scale) gap = Math.max(gap, Math.abs(alpha));
         }
         let first = width, last = -1;
         for (let x = 0; x < width; ++x) if (coverage(x, strongest) > 0.25) { first = Math.min(first, x); last = x; }

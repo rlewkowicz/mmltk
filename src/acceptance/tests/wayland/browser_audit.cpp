@@ -1093,7 +1093,7 @@ auto BrowserAudit::consume(const nlohmann::json& record) -> void {
    if (key < 50U)
     for (const auto* id : {"train.dataset.benchmark_divider", "train.dataset.dimensions_divider"}) {
      const auto divider = dataset_draw_rows.find(id);
-     dataset_dividers_valid = dataset_dividers_valid && divider != dataset_draw_rows.end() && std::abs(divider->second.first[3] - 5.0) < 0.01;
+     dataset_dividers_valid = dataset_dividers_valid && divider != dataset_draw_rows.end() && std::abs(divider->second.first[3] - 9.0) < 0.01;
     }
    const auto adjacent = [&](const char* before, const char* after) {
     const auto a = dataset_draw_rows.find(before), b = dataset_draw_rows.find(after);

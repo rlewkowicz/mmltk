@@ -51,10 +51,10 @@ pub fn modal<'a, Message: 'a>(
     .into()
 }
 
-/// A section break owns its entire five-pixel vertical extent.
+/// A section break owns its entire nine-pixel vertical extent.
 pub fn card_section_divider<'a, Message: 'a>() -> Element<'a, Message> {
     container(iced::widget::rule::horizontal(1).style(crate::fluent_theme::card_section_divider))
-        .padding([2, 0])
+        .padding([4, 0])
         .width(Fill)
         .into()
 }

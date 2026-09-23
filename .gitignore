@@ -96,3 +96,4 @@ CLAUDE.md
 .rtk
 remediationplan.md
 checkpoints
+.compiled*

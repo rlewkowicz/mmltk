@@ -1181,10 +1181,10 @@ for (const stage of [1, 3]) {
 test('Dataset component probes read actual contrasting pixels after frames', t => {
   const f = canvasFixture(t, true);
   f.sampling.raster = (x, y) => y >= 220 ?
-    ((y === 222 || y === 242) && x >= 35 && x < 185 ? [128, 128, 128, 255] : [255, 255, 255, 255]) :
+    ((y === 224 || y === 244) && x >= 35 && x < 185 ? [128, 128, 128, 255] : [255, 255, 255, 255]) :
     (x % 8 < 4 ? [32, 32, 32, 255] : [240, 240, 240, 255]);
   const result = [];
-  browser.mmltkIntegrationDatasetPixels(200, [10, 10, 224, 200], [10, 220, 200, 5, 10, 240, 200, 5], [0.5, 0.5, 0.5, 1, 1, 1, 1], 1, "", [], value => result.push(value));
+  browser.mmltkIntegrationDatasetPixels(200, [10, 10, 224, 200], [10, 220, 200, 9, 10, 240, 200, 9], [0.5, 0.5, 0.5, 1, 1, 1, 1], 1, "", [], value => result.push(value));
   assert.deepEqual(result, []);
   f.frames.shift()();
   assert.deepEqual(result, []);
@@ -1197,10 +1197,10 @@ test('Dataset component probes read actual contrasting pixels after frames', t =
 test('Dataset component probes reject blank output and cancelled ownership', t => {
   const f = canvasFixture(t, true);
   const result = [];
-  browser.mmltkIntegrationDatasetPixels(200, [10, 10, 224, 200], [10, 220, 200, 5, 10, 240, 200, 5], [0.5, 0.5, 0.5, 1, 1, 1, 1], 1, "", [], value => result.push(value));
+  browser.mmltkIntegrationDatasetPixels(200, [10, 10, 224, 200], [10, 220, 200, 9, 10, 240, 200, 9], [0.5, 0.5, 0.5, 1, 1, 1, 1], 1, "", [], value => result.push(value));
   f.flushFrames(); f.flushFrames();
   assert.deepEqual(result, ['failed']);
-  browser.mmltkIntegrationDatasetPixels(201, [10, 10, 224, 200], [10, 220, 200, 5, 10, 240, 200, 5], [0.5, 0.5, 0.5, 1, 1, 1, 1], 1, "", [], value => result.push(value));
+  browser.mmltkIntegrationDatasetPixels(201, [10, 10, 224, 200], [10, 220, 200, 9, 10, 240, 200, 9], [0.5, 0.5, 0.5, 1, 1, 1, 1], 1, "", [], value => result.push(value));
   browser.mmltkIntegrationInitialize(false);
   f.flushFrames(); f.flushFrames();
   assert.deepEqual(result, ['failed', 'invalidated']);
@@ -1248,11 +1248,11 @@ for (const labels of [false, true]) {
   test(`Dataset owns borrowed Wasm facts across reuse and growth: labels=${labels}`, t => {
     const f = canvasFixture(t, true), results = [];
     f.sampling.raster = (x, y) => y >= 220 ?
-      ((y === 222 || y === 242) && x >= 35 && x < 185 ? [128, 128, 128, 255] : [255, 255, 255, 255]) :
+      ((y === 224 || y === 244) && x >= 35 && x < 185 ? [128, 128, 128, 255] : [255, 255, 255, 255]) :
       (x % 8 < 4 ? [32, 32, 32, 255] : [240, 240, 240, 255]);
     const memory = new WebAssembly.Memory({initial: 1});
     const borrowed = new Float64Array(memory.buffer, 0, 23);
-    borrowed.set([10, 10, 224, 200, 10, 220, 200, 5, 10, 240, 200, 5,
+    borrowed.set([10, 10, 224, 200, 10, 220, 200, 9, 10, 240, 200, 9,
       0.5, 0.5, 0.5, 1, 1, 1, 1, 10, 10, 200, 16]);
     browser.mmltkIntegrationDatasetPixels(labels ? 5 : 200, borrowed.subarray(0, 4),
       borrowed.subarray(4, 12), borrowed.subarray(12, 19), 1,
@@ -1301,10 +1301,10 @@ for (const retire of ['disable', 'replace', 'reset', 'resize', 'css']) {
 test('Dataset same-key supersession and reporting retirement have scoped zero-work receipts', t => {
   const f = canvasFixture(t, true), results = [];
   f.sampling.raster = (x, y) => y >= 220 ?
-    ((y === 222 || y === 242) && x >= 35 && x < 185 ? [128, 128, 128, 255] : [255, 255, 255, 255]) :
+    ((y === 224 || y === 244) && x >= 35 && x < 185 ? [128, 128, 128, 255] : [255, 255, 255, 255]) :
     (x % 8 < 4 ? [32, 32, 32, 255] : [240, 240, 240, 255]);
   const admit = step => browser.mmltkIntegrationDatasetPixels(200,
-    [10, 10, 224, 200], [10, 220, 200, 5, 10, 240, 200, 5],
+    [10, 10, 224, 200], [10, 220, 200, 9, 10, 240, 200, 9],
     [0.5, 0.5, 0.5, 1, 1, 1, 1], 1, '', [],
     outcome => results.push([step, outcome]), 100 + step, step);
   admit(2);
@@ -1344,7 +1344,7 @@ test('Dataset geometry custody rejects at the deferred check before restoration 
     width: parseFloat(f.canvas.style.getPropertyValue('width')) || f.css.width,
     height: parseFloat(f.canvas.style.getPropertyValue('height')) || f.css.height});
   browser.mmltkIntegrationDatasetPixels(200, [10, 10, 224, 200],
-    [10, 220, 200, 5, 10, 240, 200, 5], [0.5, 0.5, 0.5, 1, 1, 1, 1],
+    [10, 220, 200, 9, 10, 240, 200, 9], [0.5, 0.5, 0.5, 1, 1, 1, 1],
     1, '', [], outcome => result.push(outcome), 104, 4);
   browser.mmltkIntegrationDatasetCustody(4);
   assert.equal(f.canvas.getBoundingClientRect().width, 641);
