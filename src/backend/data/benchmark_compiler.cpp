@@ -952,8 +952,7 @@ void benchmark_internal::compile_benchmark_recipe(BenchmarkCompilerConfig config
      auto& split = validation_split ? pixel_validation : pixel_train;
      std::unordered_map<std::uint16_t, std::uint16_t> source_slots;
      for (const auto& task : archive_tasks) {
-      if (physical_source ? task.image_namespace != *physical_source : task.source != index.source || (index.source == BenchmarkDatasetSource::kCoco2017 && task.shard != index.split))
-       continue;
+      if (physical_source ? task.image_namespace != *physical_source : task.source != index.source || (index.source == BenchmarkDatasetSource::kCoco2017 && task.shard != index.split)) continue;
       std::uint16_t numeric = task.numeric_shard;
       if (!physical_source && index.source == BenchmarkDatasetSource::kObjects365V2) {
        const auto number = std::string_view(task.shard).substr(6);

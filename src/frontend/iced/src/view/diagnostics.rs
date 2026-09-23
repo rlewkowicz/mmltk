@@ -55,10 +55,17 @@ pub fn view<'a>(model: &'a ApplicationModel, component: &Component) -> Element<'
     };
     // The shell anchors this card at the bottom: keep the trigger on that edge.
     let content = column![
-        crate::view::shared::disclosure("diagnostics.content", component.expanded,
-            container(content).padding(iced::Padding::ZERO.bottom(6))),
-        iced::widget::button(if component.expanded { "Hide diagnostics" } else { "Show diagnostics" })
-            .on_press(Message::Toggled),
+        crate::view::shared::disclosure(
+            "diagnostics.content",
+            component.expanded,
+            container(content).padding(iced::Padding::ZERO.bottom(6))
+        ),
+        iced::widget::button(if component.expanded {
+            "Hide diagnostics"
+        } else {
+            "Show diagnostics"
+        })
+        .on_press(Message::Toggled),
     ];
     container(content)
         .id("diagnostics.summary")

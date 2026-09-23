@@ -462,7 +462,10 @@ std::string dataset_size(std::uint64_t bytes) {
  constexpr std::array units{"KiB", "MiB", "GiB", "TiB"};
  std::uint64_t divisor = 1024U;
  std::size_t unit = 0U;
- while (unit + 1U < units.size() && bytes >= divisor * 1024U) { divisor *= 1024U; ++unit; }
+ while (unit + 1U < units.size() && bytes >= divisor * 1024U) {
+  divisor *= 1024U;
+  ++unit;
+ }
  const std::uint64_t precision = bytes < 1024U ? 1000U : 10U;
  const auto fraction = ((bytes % divisor) * precision + divisor / 2U) / divisor;
  const auto whole = bytes / divisor + fraction / precision;
@@ -478,8 +481,9 @@ std::string dataset_quantity(const nlohmann::json& facts, bool bytes, bool known
 }
 bool dataset_native_caption(const nlohmann::json& facts, std::string_view id, std::string_view actual) {
  using namespace mmltk::backend::data;
- if (!facts.is_object() || !facts.contains("generation") || !facts["generation"].is_number_unsigned() || facts["generation"] == 0U ||
-     !facts.contains("completed") || !facts["completed"].is_number_unsigned() || !facts.contains("total") || !facts["total"].is_number_unsigned()) return false;
+ if (!facts.is_object() || !facts.contains("generation") || !facts["generation"].is_number_unsigned() || facts["generation"] == 0U || !facts.contains("completed") ||
+     !facts["completed"].is_number_unsigned() || !facts.contains("total") || !facts["total"].is_number_unsigned())
+  return false;
  if (id == "train.dataset.progress.work") {
   if (!facts.contains("phase") || !facts["phase"].is_number_unsigned() || facts["phase"] == 0U || facts["phase"] > static_cast<std::uint8_t>(DatasetCompilePhase::Publishing)) return false;
   const auto phase = static_cast<DatasetCompilePhase>(facts["phase"].get<std::uint8_t>());
@@ -487,45 +491,51 @@ bool dataset_native_caption(const nlohmann::json& facts, std::string_view id, st
   label[0] = static_cast<char>(label[0] - 'a' + 'A');
   return actual == label + " · " + dataset_quantity(facts, phase == DatasetCompilePhase::Downloading || phase == DatasetCompilePhase::Extracting, facts["total"] != 0U, false);
  }
- if (!facts.contains("activity") || !facts["activity"].is_number_unsigned() || facts["activity"] > static_cast<std::uint8_t>(DatasetCompileActivity::Complete) ||
-     !facts.contains("known") || !facts["known"].is_boolean() || !facts.contains("active") || !facts["active"].is_boolean() ||
-     !facts.contains("complete") || !facts["complete"].is_boolean() || !facts.contains("invalidated") || !facts["invalidated"].is_number_unsigned()) return false;
+ if (!facts.contains("activity") || !facts["activity"].is_number_unsigned() || facts["activity"] > static_cast<std::uint8_t>(DatasetCompileActivity::Complete) || !facts.contains("known") ||
+     !facts["known"].is_boolean() || !facts.contains("active") || !facts["active"].is_boolean() || !facts.contains("complete") || !facts["complete"].is_boolean() || !facts.contains("invalidated") ||
+     !facts["invalidated"].is_number_unsigned())
+  return false;
  const bool acquisition = id == "train.dataset.progress.acquisition";
  const std::string label = acquisition ? "Acquisition" : id == "train.dataset.progress.labels" ? "Labels/masks" : "Pixels";
  const auto activity = static_cast<DatasetCompileActivity>(facts["activity"].get<std::uint8_t>());
  const bool known = facts["known"].get<bool>(), active = facts["active"].get<bool>(), complete = facts["complete"].get<bool>();
  if ((active && complete) || (known && facts["completed"] > facts["total"])) return false;
  std::string status;
- if (activity == DatasetCompileActivity::Unnecessary) status = "No acquisition needed";
- else if (complete) status = "Complete";
- else if (!active) status = "Waiting";
- else switch (activity) {
-  case DatasetCompileActivity::Waiting: status = "Waiting"; break;
-  case DatasetCompileActivity::Unnecessary: status = "No acquisition needed"; break;
-  case DatasetCompileActivity::Acquiring: status = "Acquiring sources"; break;
-  case DatasetCompileActivity::Normalizing: status = "Normalizing annotations"; break;
-  case DatasetCompileActivity::Preparing: status = "Preparing labels and masks"; break;
-  case DatasetCompileActivity::Compiling: status = "Compiling image pixels"; break;
-  case DatasetCompileActivity::Complete: status = "Complete"; break;
- }
+ if (activity == DatasetCompileActivity::Unnecessary)
+  status = "No acquisition needed";
+ else if (complete)
+  status = "Complete";
+ else if (!active)
+  status = "Waiting";
+ else
+  switch (activity) {
+   case DatasetCompileActivity::Waiting: status = "Waiting"; break;
+   case DatasetCompileActivity::Unnecessary: status = "No acquisition needed"; break;
+   case DatasetCompileActivity::Acquiring: status = "Acquiring sources"; break;
+   case DatasetCompileActivity::Normalizing: status = "Normalizing annotations"; break;
+   case DatasetCompileActivity::Preparing: status = "Preparing labels and masks"; break;
+   case DatasetCompileActivity::Compiling: status = "Compiling image pixels"; break;
+   case DatasetCompileActivity::Complete: status = "Complete"; break;
+  }
  std::string expected = label + "\n" + status + " · " + dataset_quantity(facts, acquisition, known, complete);
  const auto invalidated = facts["invalidated"].get<std::uint64_t>();
  if (invalidated != 0U) expected += " · " + dataset_count(invalidated) + " invalidated by repair";
  return actual == expected;
 }
 }  // namespace
-
 void BrowserAudit::audit_dataset_geometry(std::uint64_t key) {
  const bool narrow = key >= 80U;
  const auto finite = [](const auto& rectangle) { return std::ranges::all_of(rectangle, [](double value) { return std::isfinite(value); }); };
- if (!dataset_viewport || !finite(*dataset_viewport) || (*dataset_viewport)[2] <= 0.0 || (*dataset_viewport)[3] <= 0.0) { dataset_geometry_valid = false; return; }
+ if (!dataset_viewport || !finite(*dataset_viewport) || (*dataset_viewport)[2] <= 0.0 || (*dataset_viewport)[3] <= 0.0) {
+  dataset_geometry_valid = false;
+  return;
+ }
  const auto contains = [](const auto& outer, const auto& inner) {
   return inner[0] >= outer[0] - 0.1 && inner[1] >= outer[1] - 0.1 && inner[0] + inner[2] <= outer[0] + outer[2] + 0.1 && inner[1] + inner[3] <= outer[1] + outer[3] + 0.1;
  };
  const auto visible = [](const auto& bounds, const auto& clip) {
   const double left = std::max(bounds[0], clip[0]), top = std::max(bounds[1], clip[1]);
-  return std::array{left, top, std::max(0.0, std::min(bounds[0] + bounds[2], clip[0] + clip[2]) - left),
-      std::max(0.0, std::min(bounds[1] + bounds[3], clip[1] + clip[3]) - top)};
+  return std::array{left, top, std::max(0.0, std::min(bounds[0] + bounds[2], clip[0] + clip[2]) - left), std::max(0.0, std::min(bounds[1] + bounds[3], clip[1] + clip[3]) - top)};
  };
  const auto choices = dataset_draw_rows.find("train.dataset.benchmark_choices"), coconut = dataset_draw_rows.find("train.dataset.coconut_options");
  const auto custom = dataset_paints.find("train.dataset.benchmark.custom"), recipe = dataset_paints.find("train.dataset.benchmark.coconut");
@@ -534,18 +544,18 @@ void BrowserAudit::audit_dataset_geometry(std::uint64_t key) {
   // During an outer collapse its operation intentionally hides descendants;
   // its retained drawing still must remain inside that outer disclosure.
   const auto disclosure = peer || coconut == dataset_draw_rows.end() ? choices : coconut;
-  bool valid = paint.fields == 15U && finite(paint.bounds) && finite(paint.label) && finite(paint.clip) && finite(paint.font) &&
-      paint.bounds[2] > 0.0 && paint.bounds[3] > 0.0 && paint.label[2] > 0.0 && paint.label[3] > 0.0 &&
-      contains(paint.bounds, paint.label) && contains(*dataset_viewport, paint.clip) && disclosure != dataset_draw_rows.end();
+  bool valid = paint.fields == 15U && finite(paint.bounds) && finite(paint.label) && finite(paint.clip) && finite(paint.font) && paint.bounds[2] > 0.0 && paint.bounds[3] > 0.0 &&
+               paint.label[2] > 0.0 && paint.label[3] > 0.0 && contains(paint.bounds, paint.label) && contains(*dataset_viewport, paint.clip) && disclosure != dataset_draw_rows.end();
   if (disclosure != dataset_draw_rows.end()) valid = valid && contains(disclosure->second.first, paint.clip);
   const auto drawn = visible(paint.bounds, paint.clip);
   if (drawn[2] > 0.0 && drawn[3] > 0.0 && drawn[3] < paint.bounds[3] - 0.1) dataset_partial_clip = true;
   dataset_geometry_valid = dataset_geometry_valid && valid;
  }
  if (custom != dataset_paints.end() && recipe != dataset_paints.end()) {
-  const auto& a = custom->second; const auto& b = recipe->second;
-  const bool peers = std::abs(a.bounds[0] - b.bounds[0]) < 0.1 && std::abs(a.label[0] - b.label[0]) < 0.1 &&
-      a.font[0] > 0.0 && std::abs(a.font[0] - b.font[0]) < 0.1 && std::abs(a.font[1] - b.font[1]) < 0.1;
+  const auto& a = custom->second;
+  const auto& b = recipe->second;
+  const bool peers =
+   std::abs(a.bounds[0] - b.bounds[0]) < 0.1 && std::abs(a.label[0] - b.label[0]) < 0.1 && a.font[0] > 0.0 && std::abs(a.font[0] - b.font[0]) < 0.1 && std::abs(a.font[1] - b.font[1]) < 0.1;
   dataset_geometry_valid = dataset_geometry_valid && peers;
   if (peers) dataset_coconut_layouts.emplace(narrow, "peers");
  }
@@ -553,68 +563,76 @@ void BrowserAudit::audit_dataset_geometry(std::uint64_t key) {
  for (const auto* id : {"train.dataset.validation.coconut", "train.dataset.validation.stock", "train.dataset.validation.coconut_stock"}) {
   const auto radio = dataset_paints.find(id), description = dataset_paints.find(std::string(id) + ".description");
   if (radio == dataset_paints.end() || description == dataset_paints.end()) continue;
-  const auto& a = radio->second; const auto& b = description->second;
+  const auto& a = radio->second;
+  const auto& b = description->second;
   // The description starts at the actual radio label, and below the full radio.
-  bool valid = std::abs(b.bounds[0] - a.label[0]) < 0.1 && std::abs(b.bounds[1] - (a.bounds[1] + a.bounds[3] + 2.0)) < 0.1 &&
-      b.font[0] > 0.0 && b.font[0] <= 12.0 && b.font[0] < a.font[0] && b.font[1] > 0.0;
+  bool valid =
+   std::abs(b.bounds[0] - a.label[0]) < 0.1 && std::abs(b.bounds[1] - (a.bounds[1] + a.bounds[3] + 2.0)) < 0.1 && b.font[0] > 0.0 && b.font[0] <= 12.0 && b.font[0] < a.font[0] && b.font[1] > 0.0;
   const double lines = b.label[3] / b.font[1];
   valid = valid && lines >= 1.0 - 0.01 && std::abs(lines - std::round(lines)) < 0.01;
-  if (recipe != dataset_paints.end()) valid = valid && std::abs(a.bounds[0] - recipe->second.bounds[0] - 16.0) < 0.1;
-  else if (coconut != dataset_draw_rows.end()) valid = valid && std::abs(a.bounds[0] - coconut->second.first[0] - 16.0) < 0.1;
-  else continue;
+  if (recipe != dataset_paints.end())
+   valid = valid && std::abs(a.bounds[0] - recipe->second.bounds[0] - 16.0) < 0.1;
+  else if (coconut != dataset_draw_rows.end())
+   valid = valid && std::abs(a.bounds[0] - coconut->second.first[0] - 16.0) < 0.1;
+  else
+   continue;
   if (recovery != dataset_paints.end()) {
    const auto& c = recovery->second;
    const double recovery_lines = c.label[3] / b.font[1];
    valid = valid && std::abs(c.bounds[0] - a.bounds[0]) < 0.1 && recovery_lines >= 1.0 - 0.01 && std::abs(recovery_lines - std::round(recovery_lines)) < 0.01;
    if (dataset_draw_rows.contains("train.dataset.coconut.recover_dropped_masks")) {
-    valid = valid && c.reference && std::abs((*c.reference)[0] - c.label[2]) < 0.2 && std::abs((*c.reference)[1] - c.label[3]) < 0.2 &&
-        std::abs((*c.reference)[2] - b.font[0]) < 0.1 && std::abs((*c.reference)[3] - b.font[1]) < 0.1;
+    valid = valid && c.reference && std::abs((*c.reference)[0] - c.label[2]) < 0.2 && std::abs((*c.reference)[1] - c.label[3]) < 0.2 && std::abs((*c.reference)[2] - b.font[0]) < 0.1 &&
+            std::abs((*c.reference)[3] - b.font[1]) < 0.1;
    }
-   if (valid && c.reference) {
-    dataset_coconut_layouts.emplace(narrow, "recovery");
-   }
+   if (valid && c.reference) { dataset_coconut_layouts.emplace(narrow, "recovery"); }
   }
   dataset_geometry_valid = dataset_geometry_valid && valid;
   if (valid) dataset_coconut_layouts.emplace(narrow, id);
  }
  // A visible identified layout is not sufficient: it must have reached draw.
  for (const auto& [id, row] : dataset_draw_rows) {
-  if (id != "train.dataset.coconut.recover_dropped_masks" && !id.starts_with("train.dataset.validation.") &&
-      id != "train.dataset.benchmark.custom" && id != "train.dataset.benchmark.coconut") continue;
+  if (id != "train.dataset.coconut.recover_dropped_masks" && !id.starts_with("train.dataset.validation.") && id != "train.dataset.benchmark.custom" && id != "train.dataset.benchmark.coconut")
+   continue;
   const auto clipped = visible(row.first, *dataset_viewport);
   if (clipped[2] > 0.1 && clipped[3] > 0.1 && !dataset_paints.contains(id)) dataset_geometry_valid = false;
  }
 }
-
 bool BrowserAudit::dataset_transitions_complete() const {
  if (!dataset_geometry_valid || !dataset_partial_clip) return false;
- for (const bool narrow : {false, true}) for (const auto* id : {"train.dataset.benchmark.custom", "train.dataset.benchmark.coconut",
-      "train.dataset.coconut.recover_dropped_masks", "train.dataset.validation.coconut", "train.dataset.validation.stock", "train.dataset.validation.coconut_stock",
-      "train.dataset.validation.coconut.description", "train.dataset.validation.stock.description", "train.dataset.validation.coconut_stock.description"})
-  if (!dataset_label_pixels.contains({narrow, id})) return false;
- for (const bool narrow : {false, true}) for (const auto* id : {"peers", "recovery", "train.dataset.validation.coconut", "train.dataset.validation.stock", "train.dataset.validation.coconut_stock"})
-  if (!dataset_coconut_layouts.contains({narrow, id})) return false;
+ for (const bool narrow : {false, true})
+  for (const auto* id :
+   {"train.dataset.benchmark.custom", "train.dataset.benchmark.coconut", "train.dataset.coconut.recover_dropped_masks", "train.dataset.validation.coconut", "train.dataset.validation.stock",
+    "train.dataset.validation.coconut_stock", "train.dataset.validation.coconut.description", "train.dataset.validation.stock.description", "train.dataset.validation.coconut_stock.description"})
+   if (!dataset_label_pixels.contains({narrow, id})) return false;
+ for (const bool narrow : {false, true})
+  for (const auto* id : {"peers", "recovery", "train.dataset.validation.coconut", "train.dataset.validation.stock", "train.dataset.validation.coconut_stock"})
+   if (!dataset_coconut_layouts.contains({narrow, id})) return false;
  if (!dataset_dividers_valid || !dataset_hidden_input || !dataset_drag_edit || !dataset_offscreen_release) return false;
- for (const auto* id : {"train.dataset.benchmark_divider", "train.dataset.dimensions_divider"}) if (!dataset_divider_pixels.contains({12U, id})) return false;
+ for (const auto* id : {"train.dataset.benchmark_divider", "train.dataset.dimensions_divider"})
+  if (!dataset_divider_pixels.contains({12U, id})) return false;
  for (std::uint64_t index = 0U; index < 12U; ++index) {
   const auto before = dataset_transition_frames.find(20U + index), after = dataset_transition_frames.find(1U + index);
   if (before == dataset_transition_frames.end() || before->second.empty() || after == dataset_transition_frames.end() || after->second.empty()) return false;
   const auto baseline = before->second.back();
-  for (const auto& frame : after->second) if (std::abs(frame[0] - baseline[0]) > 1.0 || std::abs(frame[3] - baseline[3]) > 1.0 ||
-      !std::equal(frame.begin() + 4, frame.end(), baseline.begin() + 4, [](double a, double b) { return std::abs(a - b) < 0.1; })) return false;
+  for (const auto& frame : after->second)
+   if (std::abs(frame[0] - baseline[0]) > 1.0 || std::abs(frame[3] - baseline[3]) > 1.0 ||
+       !std::equal(frame.begin() + 4, frame.end(), baseline.begin() + 4, [](double a, double b) { return std::abs(a - b) < 0.1; }))
+    return false;
   const double target = after->second.back()[2];
-  if (index != 5U && std::abs(target - baseline[2]) > 1.0 && !std::ranges::any_of(after->second, [baseline, target](const auto& frame) {
-       return frame[2] > std::min(target, baseline[2]) && frame[2] < std::max(target, baseline[2]); })) return false;
+  if (index != 5U && std::abs(target - baseline[2]) > 1.0 &&
+      !std::ranges::any_of(after->second, [baseline, target](const auto& frame) { return frame[2] > std::min(target, baseline[2]) && frame[2] < std::max(target, baseline[2]); }))
+   return false;
  }
  for (const auto before_key : {40U, 80U}) {
   const auto before = dataset_transition_frames.find(before_key), after = dataset_transition_frames.find(before_key + 1U);
   if (before == dataset_transition_frames.end() || before->second.empty() || after == dataset_transition_frames.end() || after->second.empty()) return false;
   const auto& original = before->second.back();
-  for (const auto& frame : after->second) if (!std::equal(frame.begin() + 4, frame.end(), original.begin() + 4,
-      [](double a, double b) { return std::abs(a - b) < 0.1; })) return false;
+  for (const auto& frame : after->second)
+   if (!std::equal(frame.begin() + 4, frame.end(), original.begin() + 4, [](double a, double b) { return std::abs(a - b) < 0.1; })) return false;
   const double baseline = original[2], target = after->second.back()[2];
-  if (std::abs(target - baseline) > 1.0 && !std::ranges::any_of(after->second, [baseline, target](const auto& frame) {
-       return frame[2] > std::min(target, baseline) && frame[2] < std::max(target, baseline); })) return false;
+  if (std::abs(target - baseline) > 1.0 &&
+      !std::ranges::any_of(after->second, [baseline, target](const auto& frame) { return frame[2] > std::min(target, baseline) && frame[2] < std::max(target, baseline); }))
+   return false;
  }
  const auto& closing = dataset_transition_frames.at(6U);
  const double full = dataset_transition_frames.at(25U).back()[1];
@@ -622,14 +640,16 @@ bool BrowserAudit::dataset_transitions_complete() const {
  const auto& opening = dataset_transition_frames.at(7U);
  const double reversed = dataset_transition_frames.at(26U).back()[1];
  if (!std::ranges::any_of(opening, [reversed, full](const auto& frame) { return frame[1] > reversed && frame[1] < full; })) return false;
- for (const auto key : {50U, 51U, 52U}) if (!dataset_transition_frames.contains(key) || dataset_transition_frames.at(key).empty()) return false;
+ for (const auto key : {50U, 51U, 52U})
+  if (!dataset_transition_frames.contains(key) || dataset_transition_frames.at(key).empty()) return false;
  const double expanded = dataset_transition_frames.at(51U).back()[2];
  return expanded > 0.0 && dataset_transition_frames.at(52U).back()[2] == 0.0 &&
-  std::ranges::any_of(dataset_transition_frames.at(51U), [expanded](const auto& frame) { return frame[2] > 0.0 && frame[2] < expanded; });
+        std::ranges::any_of(dataset_transition_frames.at(51U), [expanded](const auto& frame) { return frame[2] > 0.0 && frame[2] < expanded; });
 }
-
 bool BrowserAudit::dataset_presentation_complete() const {
- if (!dataset_presentation_valid || dataset_custody_cases != 6U || dataset_custody_state != 0U || dataset_custody_drains != 3U || dataset_retired_scope != 0U || dataset_fixture_cases.size() != 36U || dataset_fixture_pixels.size() != 36U) return false;
+ if (!dataset_presentation_valid || dataset_custody_cases != 6U || dataset_custody_state != 0U || dataset_custody_drains != 3U || dataset_retired_scope != 0U || dataset_fixture_cases.size() != 36U ||
+     dataset_fixture_pixels.size() != 36U)
+  return false;
  for (const auto base : {200U, 209U, 218U, 227U}) {
   for (std::uint64_t stage = 0U; stage < 9U; ++stage) {
    if (!dataset_fixture_heights.contains(base + stage)) return false;
@@ -637,14 +657,14 @@ bool BrowserAudit::dataset_presentation_complete() const {
     if (!dataset_divider_pixels.contains({base + stage, id})) return false;
   }
   const double held = dataset_fixture_heights.at(base);
-  for (std::uint64_t stage = 1U; stage < 5U; ++stage) if (std::abs(dataset_fixture_heights.at(base + stage) - held) > 0.5) return false;
+  for (std::uint64_t stage = 1U; stage < 5U; ++stage)
+   if (std::abs(dataset_fixture_heights.at(base + stage) - held) > 0.5) return false;
   const double terminal = dataset_fixture_heights.at(base + 5U);
   if (terminal >= held || dataset_fixture_heights.at(base + 8U) >= held || !dataset_fixture_frames.contains(base + 5U)) return false;
   if (!std::ranges::any_of(dataset_fixture_frames.at(base + 5U), [held, terminal](double height) { return height > terminal && height < held; })) return false;
  }
  return true;
 }
-
 auto BrowserAudit::consume(const nlohmann::json& record) -> void {
  atlas_draws.consume(record);
  const auto surface_event = record.value("event", "");
@@ -676,17 +696,15 @@ auto BrowserAudit::consume(const nlohmann::json& record) -> void {
  if (record.contains("custody_scope") || record.contains("custody_case")) {
   const auto step = scalar(record, "custody_case");
   const auto control = record.value("control", "");
-  const unsigned bit = event == "integration.dataset_pixels" && control == "dataset.presentation" ? 1U :
-   event == "integration.dataset_divider_pixels" && control == "train.dataset.benchmark_divider" ? 2U :
-   event == "integration.dataset_divider_pixels" && control == "train.dataset.dimensions_divider" ? 4U : 0U;
-  const bool valid = bit != 0U && (dataset_custody_reports & bit) == 0U &&
-   (step == 1U || step == 3U || step == 6U) && step == dataset_custody_cases + 1U &&
-   scalar(record, "custody_scope") == dataset_custody_scope && dataset_custody_state != 0U &&
-   scalar(record, "a") == 200U;
+  const unsigned bit = event == "integration.dataset_pixels" && control == "dataset.presentation"                        ? 1U
+                       : event == "integration.dataset_divider_pixels" && control == "train.dataset.benchmark_divider"   ? 2U
+                        : event == "integration.dataset_divider_pixels" && control == "train.dataset.dimensions_divider" ? 4U
+                                                                                                                         : 0U;
+  const bool valid = bit != 0U && (dataset_custody_reports & bit) == 0U && (step == 1U || step == 3U || step == 6U) && step == dataset_custody_cases + 1U &&
+                     scalar(record, "custody_scope") == dataset_custody_scope && dataset_custody_state != 0U && scalar(record, "a") == 200U;
   dataset_presentation_valid = dataset_presentation_valid && valid;
   if (valid) dataset_custody_reports |= bit;
  }
-
  if (event == "iced.surface.scroll_stage" && record.value("control", "") == "held-visible" && atlas_draws.valid && atlas_draws.held_stages.contains("held-visible")) held_visible_ordinal = ordinal;
  if (event == "iced.gallery.source") consume_gallery_generation(record);
  if (event == "integration.phase_progress") {
@@ -1028,8 +1046,10 @@ auto BrowserAudit::consume(const nlohmann::json& record) -> void {
   dataset_viewport = std::array{numeric(record, "a"), numeric(record, "b"), numeric(record, "c"), numeric(record, "d")};
  } else if (event == "integration.dataset_label_reference") {
   const auto paint = dataset_paints.find(record.value("control", ""));
-  if (paint == dataset_paints.end() || paint->second.reference) dataset_geometry_valid = false;
-  else paint->second.reference = std::array{numeric(record, "a"), numeric(record, "b"), numeric(record, "c"), numeric(record, "d")};
+  if (paint == dataset_paints.end() || paint->second.reference)
+   dataset_geometry_valid = false;
+  else
+   paint->second.reference = std::array{numeric(record, "a"), numeric(record, "b"), numeric(record, "c"), numeric(record, "d")};
  } else if (event == "integration.dataset_paint" || event == "integration.dataset_label" || event == "integration.dataset_clip" || event == "integration.dataset_font") {
   if (dataset_paints.size() < 9U || dataset_paints.contains(record.value("control", ""))) {
    auto& paint = dataset_paints[record.value("control", "")];
@@ -1038,53 +1058,59 @@ auto BrowserAudit::consume(const nlohmann::json& record) -> void {
    if (paint.fields & field) dataset_geometry_valid = false;
    paint.fields |= field;
    (field == 1U ? paint.bounds : field == 2U ? paint.label : field == 4U ? paint.clip : paint.font) = values;
-  } else dataset_geometry_valid = false;
+  } else
+   dataset_geometry_valid = false;
  } else if (event == "integration.dataset_draw") {
   if (dataset_draw_rows.size() < 32U)
-   dataset_draw_rows.insert_or_assign(record.value("control", ""), std::pair{std::array{numeric(record, "a"), numeric(record, "b"), numeric(record, "c"), numeric(record, "d")}, record.value("detail", "")});
+   dataset_draw_rows.insert_or_assign(
+    record.value("control", ""), std::pair{std::array{numeric(record, "a"), numeric(record, "b"), numeric(record, "c"), numeric(record, "d")}, record.value("detail", "")});
  } else if (event == "integration.dataset_frame") {
   const auto key = scalar(record, "a");
   if ((key >= 1U && key <= 12U) || (key >= 20U && key <= 31U) || (key >= 80U && key <= 98U) || (key >= 120U && key <= 126U)) audit_dataset_geometry(key);
   constexpr std::array track_ids{"train.dataset.progress.acquisition", "train.dataset.progress.labels", "train.dataset.progress.pixels"};
   if ((key >= 1U && key <= 12U) || (key >= 20U && key <= 31U) || key == 40U || key == 41U || (key >= 50U && key <= 52U) || key == 80U || key == 81U) {
    const auto coconut = dataset_draw_rows.find("train.dataset.coconut_options");
-   const auto choices = dataset_draw_rows.find(key >= 80U ? "train.dataset.splits" : key >= 50U ? "diagnostics.content" :
-       key >= 40U ? "train.dataset.compile_size" : "train.dataset.benchmark_choices");
+   const auto choices = dataset_draw_rows.find(key >= 80U    ? "train.dataset.splits"
+                                               : key >= 50U  ? "diagnostics.content"
+                                                : key >= 40U ? "train.dataset.compile_size"
+                                                             : "train.dataset.benchmark_choices");
    const auto index = key >= 20U ? key - 20U : key - 1U;
    const auto trigger = dataset_draw_rows.find(index == 0U || index >= 10U ? "train.dataset.benchmark_override" : "train.dataset.benchmark.coconut");
    if (!dataset_viewport || (*dataset_viewport)[2] <= 0.0 || (*dataset_viewport)[3] <= 0.0) dataset_geometry_valid = false;
    const auto before_key = key >= 1U && key <= 12U ? key + 19U : key == 41U || key == 81U ? key - 1U : 0U;
    if (before_key != 0U && dataset_viewport && dataset_transition_frames.contains(before_key) && !dataset_transition_frames.at(before_key).empty()) {
     const auto& before = dataset_transition_frames.at(before_key).back();
-    if (!std::equal(dataset_viewport->begin(), dataset_viewport->end(), before.begin() + 4,
-        [](double a, double b) { return std::abs(a - b) < 0.1; }) || std::abs(numeric(record, "b") - before[8]) > 0.1) dataset_geometry_valid = false;
+    if (!std::equal(dataset_viewport->begin(), dataset_viewport->end(), before.begin() + 4, [](double a, double b) { return std::abs(a - b) < 0.1; }) ||
+        std::abs(numeric(record, "b") - before[8]) > 0.1)
+     dataset_geometry_valid = false;
    }
    auto& frames = dataset_transition_frames[key];
-   if (frames.size() < 180U) frames.push_back({numeric(record, "c"), coconut == dataset_draw_rows.end() ? 0.0 : coconut->second.first[3],
-       choices == dataset_draw_rows.end() ? 0.0 : choices->second.first[3], trigger == dataset_draw_rows.end() ? 0.0 : trigger->second.first[1],
-       dataset_viewport ? (*dataset_viewport)[0] : 0.0, dataset_viewport ? (*dataset_viewport)[1] : 0.0,
-       dataset_viewport ? (*dataset_viewport)[2] : 0.0, dataset_viewport ? (*dataset_viewport)[3] : 0.0, numeric(record, "b")});
-   if (key < 50U) for (const auto* id : {"train.dataset.benchmark_divider", "train.dataset.dimensions_divider"}) {
-    const auto divider = dataset_draw_rows.find(id);
-    dataset_dividers_valid = dataset_dividers_valid && divider != dataset_draw_rows.end() && std::abs(divider->second.first[3] - 5.0) < 0.01;
-   }
+   if (frames.size() < 180U)
+    frames.push_back({numeric(record, "c"), coconut == dataset_draw_rows.end() ? 0.0 : coconut->second.first[3], choices == dataset_draw_rows.end() ? 0.0 : choices->second.first[3],
+     trigger == dataset_draw_rows.end() ? 0.0 : trigger->second.first[1], dataset_viewport ? (*dataset_viewport)[0] : 0.0, dataset_viewport ? (*dataset_viewport)[1] : 0.0,
+     dataset_viewport ? (*dataset_viewport)[2] : 0.0, dataset_viewport ? (*dataset_viewport)[3] : 0.0, numeric(record, "b")});
+   if (key < 50U)
+    for (const auto* id : {"train.dataset.benchmark_divider", "train.dataset.dimensions_divider"}) {
+     const auto divider = dataset_draw_rows.find(id);
+     dataset_dividers_valid = dataset_dividers_valid && divider != dataset_draw_rows.end() && std::abs(divider->second.first[3] - 5.0) < 0.01;
+    }
    const auto adjacent = [&](const char* before, const char* after) {
     const auto a = dataset_draw_rows.find(before), b = dataset_draw_rows.find(after);
     return a != dataset_draw_rows.end() && b != dataset_draw_rows.end() && std::abs(a->second.first[1] + a->second.first[3] - b->second.first[1]) < 1.01;
    };
-   if (key < 50U) dataset_dividers_valid = dataset_dividers_valid &&
-    adjacent("train.dataset.benchmark_choices", "train.dataset.benchmark_divider") &&
-    adjacent("train.dataset.benchmark_divider", "train.dataset.source") &&
-    adjacent("train.dataset.overwrite.observed", "train.dataset.dimensions_divider") &&
-    adjacent("train.dataset.dimensions_divider", "train.dataset.compile_dimensions");
+   if (key < 50U)
+    dataset_dividers_valid = dataset_dividers_valid && adjacent("train.dataset.benchmark_choices", "train.dataset.benchmark_divider") &&
+                             adjacent("train.dataset.benchmark_divider", "train.dataset.source") && adjacent("train.dataset.overwrite.observed", "train.dataset.dimensions_divider") &&
+                             adjacent("train.dataset.dimensions_divider", "train.dataset.compile_dimensions");
   } else if (key == 100U && !dataset_native_facts.empty()) {
    bool valid = dataset_native_facts.size() == 4U && active_compile_generation != 0U;
    for (const auto* id : {"train.dataset.progress.work", track_ids[0], track_ids[1], track_ids[2]}) {
     const auto row = dataset_draw_rows.find(id);
     const auto facts = dataset_native_facts.find(id);
     valid = valid && row != dataset_draw_rows.end() && facts != dataset_native_facts.end();
-    if (row != dataset_draw_rows.end() && facts != dataset_native_facts.end()) valid = valid && row->second.first[2] > 0.0 && row->second.first[3] > 0.0 &&
-     scalar(facts->second, "generation") == active_compile_generation && dataset_native_caption(facts->second, id, row->second.second);
+    if (row != dataset_draw_rows.end() && facts != dataset_native_facts.end())
+     valid = valid && row->second.first[2] > 0.0 && row->second.first[3] > 0.0 && scalar(facts->second, "generation") == active_compile_generation &&
+             dataset_native_caption(facts->second, id, row->second.second);
    }
    dataset_native_valid = dataset_native_valid && valid;
    if (valid) {
@@ -1109,9 +1135,9 @@ auto BrowserAudit::consume(const nlohmann::json& record) -> void {
      dataset_presentation_valid = dataset_presentation_valid && work->second.second == phase + " · 1,234 / 5,678";
     }
     if (cached != dataset_draw_rows.end()) {
-     const std::string expected = stage == 1U ?
-      "Objects365 v2 · Active\n4.0 KiB / ? · 0 / ? images\nResuming train-patch\n4.0 KiB / ? · attempt 3 · 1.0 KiB retained · 2 retries · 1,234 images invalidated" :
-      "Objects365 v2 · Cached\n85.0 GiB · 345,491 images";
+     const std::string expected = stage == 1U
+                                   ? "Objects365 v2 · Active\n4.0 KiB / ? · 0 / ? images\nResuming train-patch\n4.0 KiB / ? · attempt 3 · 1.0 KiB retained · 2 retries · 1,234 images invalidated"
+                                   : "Objects365 v2 · Cached\n85.0 GiB · 345,491 images";
      dataset_presentation_valid = dataset_presentation_valid && cached->second.second == expected;
     }
     for (const auto* id : track_ids) {
@@ -1120,13 +1146,12 @@ auto BrowserAudit::consume(const nlohmann::json& record) -> void {
     }
     if (stage < 2U && dataset_draw_rows.contains(track_ids[0]) && dataset_draw_rows.contains(track_ids[1])) {
      dataset_presentation_valid = dataset_presentation_valid && dataset_draw_rows.at(track_ids[0]).second.find(" / ?") != std::string::npos &&
-      dataset_draw_rows.at(track_ids[1]).second.find("Waiting · 2,345 / 9,876") != std::string::npos;
+                                  dataset_draw_rows.at(track_ids[1]).second.find("Waiting · 2,345 / 9,876") != std::string::npos;
     }
    } else {
     dataset_presentation_valid = dataset_presentation_valid && work == dataset_draw_rows.end() && cached == dataset_draw_rows.end();
     for (const auto* id : track_ids) dataset_presentation_valid = dataset_presentation_valid && !dataset_draw_rows.contains(id);
-    const std::string terminal = stage == 4U ? "Cancelling…" : stage == 5U ? "Cancelled" :
-     stage == 6U ? "Failed\nLocal fixture publication failed" : "Completed\nLocal fixture output";
+    const std::string terminal = stage == 4U ? "Cancelling…" : stage == 5U ? "Cancelled" : stage == 6U ? "Failed\nLocal fixture publication failed" : "Completed\nLocal fixture output";
     if (area != dataset_draw_rows.end()) dataset_presentation_valid = dataset_presentation_valid && area->second.second == terminal;
    }
   }
@@ -1147,42 +1172,48 @@ auto BrowserAudit::consume(const nlohmann::json& record) -> void {
   const bool stimulus_case = step == 1U || step == 2U || step == 4U || step == 5U;
   const bool observed_case = step == 1U || step == 3U || step == 6U;
   const bool quiet = scalar(record, "snapshots") == 0U && scalar(record, "reads") == 0U && scalar(record, "reports") == 0U;
-  bool valid = step >= 1U && step <= 6U && step == dataset_custody_cases + 1U &&
-   scalar(record, "key") == 200U && record.value("control", "") == "dataset.presentation" &&
-   record.contains("snapshots") && record.contains("reads") && record.contains("reports") && record.contains("stimulus");
+  bool valid = step >= 1U && step <= 6U && step == dataset_custody_cases + 1U && scalar(record, "key") == 200U && record.value("control", "") == "dataset.presentation" &&
+               record.contains("snapshots") && record.contains("reads") && record.contains("reports") && record.contains("stimulus");
   const auto owner = scalar(record, "owner");
   if (phase == "deferred" || phase == "restored" || phase == "replaced" || phase == "drained") {
-   valid = record.value("control", "") == "dataset.presentation" && scalar(record, "key") == 200U &&
-    record.contains("snapshots") && record.contains("reads") && record.contains("reports") && record.value("stimulus", false) &&
-    step == dataset_retired_case && scope != 0U && scope == dataset_retired_scope && owner == dataset_retired_owner && quiet;
+   valid = record.value("control", "") == "dataset.presentation" && scalar(record, "key") == 200U && record.contains("snapshots") && record.contains("reads") && record.contains("reports") &&
+           record.value("stimulus", false) && step == dataset_retired_case && scope != 0U && scope == dataset_retired_scope && owner == dataset_retired_owner && quiet;
    const auto current_owner = scalar(record, "current_owner");
    if (phase == "deferred") {
-    valid = valid && (dataset_retired_checks & 1U) == 0U &&
-     record.value("owner_current", false) == (step != 5U) &&
-     record.value("request_current", false) == (step == 4U) &&
-     record.value("geometry_current", false) == (step != 4U) &&
-     current_owner == (step == 5U ? dataset_replacement_owner : owner);
+    valid = valid && (dataset_retired_checks & 1U) == 0U && record.value("owner_current", false) == (step != 5U) && record.value("request_current", false) == (step == 4U) &&
+            record.value("geometry_current", false) == (step != 4U) && current_owner == (step == 5U ? dataset_replacement_owner : owner);
     if (step == 2U) valid = valid && scalar(record, "current_scope") > scope && scalar(record, "current_key") == 200U;
-    if (step == 4U) valid = valid && scalar(record, "current_scope") == scope && scalar(record, "current_key") == 200U && numeric(record, "original_width") == dataset_original_width && numeric(record, "current_width") == dataset_changed_width;
+    if (step == 4U)
+     valid = valid && scalar(record, "current_scope") == scope && scalar(record, "current_key") == 200U && numeric(record, "original_width") == dataset_original_width &&
+             numeric(record, "current_width") == dataset_changed_width;
     if (valid) dataset_retired_checks |= 1U;
    } else if (phase == "restored") {
-    valid = valid && step == 4U && dataset_retired_checks == 1U &&
-     numeric(record, "original_width") == dataset_original_width && numeric(record, "current_width") == dataset_original_width;
+    valid = valid && step == 4U && dataset_retired_checks == 1U && numeric(record, "original_width") == dataset_original_width && numeric(record, "current_width") == dataset_original_width;
     if (valid) dataset_retired_checks |= 2U;
    } else if (phase == "replaced") {
-    valid = valid && step == 5U && dataset_retired_checks == 0U && current_owner != 0U && current_owner != owner &&
-     record.value("scratch_empty", false) && record.contains("owner_reports") && scalar(record, "owner_reports") == 0U;
-    if (valid) { dataset_replacement_owner = current_owner; dataset_retired_checks |= 2U; }
+    valid = valid && step == 5U && dataset_retired_checks == 0U && current_owner != 0U && current_owner != owner && record.value("scratch_empty", false) && record.contains("owner_reports") &&
+            scalar(record, "owner_reports") == 0U;
+    if (valid) {
+     dataset_replacement_owner = current_owner;
+     dataset_retired_checks |= 2U;
+    }
    } else {
-    valid = valid && dataset_retired_checks == (step == 2U ? 1U : 3U) &&
-     record.value("restored", false) && current_owner == (step == 5U ? dataset_replacement_owner : owner) &&
-     (step == 5U ? record.value("scratch_empty", false) && record.contains("owner_reports") && scalar(record, "owner_reports") == 0U :
-      record.value("scratch_unchanged", false) && record.value("reports_unchanged", false));
-    if (valid) { dataset_retired_scope = 0U; ++dataset_custody_drains; }
+    valid = valid && dataset_retired_checks == (step == 2U ? 1U : 3U) && record.value("restored", false) && current_owner == (step == 5U ? dataset_replacement_owner : owner) &&
+            (step == 5U ? record.value("scratch_empty", false) && record.contains("owner_reports") && scalar(record, "owner_reports") == 0U
+                        : record.value("scratch_unchanged", false) && record.value("reports_unchanged", false));
+    if (valid) {
+     dataset_retired_scope = 0U;
+     ++dataset_custody_drains;
+    }
    }
   } else if (phase == "admitted") {
    valid = valid && dataset_custody_state == 0U && owner != 0U && scope > dataset_custody_scope && quiet && !record.value("stimulus", false);
-   if (valid) { dataset_custody_scope = scope; dataset_custody_owner = owner; dataset_custody_state = 1U; dataset_custody_reports = 0U; }
+   if (valid) {
+    dataset_custody_scope = scope;
+    dataset_custody_owner = owner;
+    dataset_custody_state = 1U;
+    dataset_custody_reports = 0U;
+   }
   } else if (phase == "stimulus") {
    valid = valid && dataset_custody_state == 1U && scope == dataset_custody_scope && owner == dataset_custody_owner && stimulus_case && quiet && record.value("stimulus", false);
    if (step != 1U) valid = valid && dataset_retired_scope == 0U;
@@ -1190,29 +1221,36 @@ auto BrowserAudit::consume(const nlohmann::json& record) -> void {
    if (valid) {
     dataset_custody_state = 2U;
     if (step != 1U) {
-     dataset_retired_scope = scope; dataset_retired_case = static_cast<unsigned>(step); dataset_retired_owner = owner; dataset_retired_checks = 0U;
-     dataset_original_width = numeric(record, "original_width"); dataset_changed_width = numeric(record, "current_width");
+     dataset_retired_scope = scope;
+     dataset_retired_case = static_cast<unsigned>(step);
+     dataset_retired_owner = owner;
+     dataset_retired_checks = 0U;
+     dataset_original_width = numeric(record, "original_width");
+     dataset_changed_width = numeric(record, "current_width");
     }
    }
   } else {
-   valid = valid && scope == dataset_custody_scope && owner == dataset_custody_owner && dataset_custody_state == (stimulus_case ? 2U : 1U) &&
-    record.value("stimulus", false) == stimulus_case && dataset_custody_reports == (observed_case ? 7U : 0U) && phase == (observed_case ? "observed" : "invalidated") &&
-    (observed_case ? scalar(record, "snapshots") == 1U && scalar(record, "reads") == 3U && scalar(record, "reports") == 3U : quiet);
+   valid = valid && scope == dataset_custody_scope && owner == dataset_custody_owner && dataset_custody_state == (stimulus_case ? 2U : 1U) && record.value("stimulus", false) == stimulus_case &&
+           dataset_custody_reports == (observed_case ? 7U : 0U) && phase == (observed_case ? "observed" : "invalidated") &&
+           (observed_case ? scalar(record, "snapshots") == 1U && scalar(record, "reads") == 3U && scalar(record, "reports") == 3U : quiet);
    if (observed_case) valid = valid && dataset_retired_scope == 0U;
-   if (valid) { ++dataset_custody_cases; dataset_custody_state = 0U; }
+   if (valid) {
+    ++dataset_custody_cases;
+    dataset_custody_state = 0U;
+   }
   }
   dataset_presentation_valid = dataset_presentation_valid && valid;
  } else if (event == "integration.dataset_divider_pixels") {
   const auto key = scalar(record, "a");
   const auto control = record.value("control", "");
-  if ((key == 12U || (key >= 200U && key < 236U)) && record.value("matched", false) &&
-      (control == "train.dataset.benchmark_divider" || control == "train.dataset.dimensions_divider") &&
+  if ((key == 12U || (key >= 200U && key < 236U)) && record.value("matched", false) && (control == "train.dataset.benchmark_divider" || control == "train.dataset.dimensions_divider") &&
       std::abs(numeric(record, "c") - numeric(record, "b") * 0.75) <= 2.0 && std::abs(numeric(record, "d") - numeric(record, "scale")) <= 0.65 && numeric(record, "gap") <= 0.12)
    dataset_divider_pixels.emplace(key, control);
  } else if (event == "integration.dataset_pixels") {
   const auto key = scalar(record, "a");
-  if (key >= 200U && key < 236U && numeric(record, "b") > 0 && numeric(record, "c") > 0 && numeric(record, "d") >= 20 &&
-      record.contains("colored") && ((key - 200U) % 9U < 4U ? scalar(record, "colored") > 0U : scalar(record, "colored") == 0U)) dataset_fixture_pixels.insert(key);
+  if (key >= 200U && key < 236U && numeric(record, "b") > 0 && numeric(record, "c") > 0 && numeric(record, "d") >= 20 && record.contains("colored") &&
+      ((key - 200U) % 9U < 4U ? scalar(record, "colored") > 0U : scalar(record, "colored") == 0U))
+   dataset_fixture_pixels.insert(key);
  } else if (event == "integration.dataset_fixture") {
   const auto key = scalar(record, "b");
   if (key == scalar(record, "a") + 200U && key < 236U && scalar(record, "c") >= 4U && scalar(record, "d") == 1U) dataset_fixture_cases.insert(key);
@@ -1224,7 +1262,8 @@ auto BrowserAudit::consume(const nlohmann::json& record) -> void {
   compile_metrics = record.value("control", "") == COMPILE_PROGRESS && record.value("detail", "") == "elapsed-eta-throughput-dropped" && progress &&
                     scalar(record, "b") == expected.remaining_seconds && scalar(record, "c") == expected.throughput_per_second && scalar(record, "d") == compile_dropped;
  } else if (event == "integration.dataset_complete") {
-  dataset_complete = dataset_native_valid && dataset_native_generations.contains(cancelled_compile_generation) && dataset_native_generations.contains(active_compile_generation) && cancelled_compile_generation != 0U && scalar(record, "a") > cancelled_compile_generation && scalar(record, "a") == active_compile_generation;
+  dataset_complete = dataset_native_valid && dataset_native_generations.contains(cancelled_compile_generation) && dataset_native_generations.contains(active_compile_generation) &&
+                     cancelled_compile_generation != 0U && scalar(record, "a") > cancelled_compile_generation && scalar(record, "a") == active_compile_generation;
   dataset_complete_ordinal = ordinal;
   compiled_images = scalar(record, "b");
   compiled_width = scalar(record, "c");
@@ -1823,14 +1862,17 @@ auto BrowserAudit::readiness_blocker() const -> std::string_view {
   "annotation composition", workspace_fps_text && workspace_fps_pixels, "visible workspace FPS",
   settings_composition && settings_numeric_alignment && show_fps_round_trip && ui_scale_drag && ui_scale_released && ui_scale_restored && complete_pointer_drag && error_composition &&
    error_modal_usable,
-  "Settings composition", dataset_configured && progress && compile_metrics && dataset_native_valid && dataset_native_generations.contains(cancelled_compile_generation) && dataset_native_generations.contains(active_compile_generation) && compile_tracks.size() == 3U && dataset_presentation_complete() && dataset_transitions_complete() && dataset_complete && progress_ordinal < dataset_complete_ordinal, "Dataset lifecycle",
-  explore_ready, "ready snapshot", sweep, "viewport sweep", scrolled, "gallery scroll", detail, "detail selection", bounded_exact_grid, "bounded exact grid", newest_placeholder, "newest placeholder",
-  pointer_inverse, "pointer inverse", pointer_dispatched, "pointer dispatch", pointer_selected, "pointer selection", gallery_shader_fill, "gallery shader fill", pointer_render_chain,
-  "pointer render chain", atlas_identities, "atlas identities", augmentation_enabled, "augmentation enabled", augmentation_rerolled, "augmentation rerolled", reshuffle_order_only,
-  "reshuffle order only", detail_source, "detail source", detail_fit, "detail fit", detail_containers, "detail containers", padded_and_original_detail, "padded and original detail", upscale_growth,
-  "upscale growth", upscale_presentation, "upscale presentation", upscale_modes == expected_upscale_modes, "upscale modes", upscale_presentations == expected_upscale_presentations,
-  "upscale presentations", upscale_completed_pixels == expected_upscale_presentations, "upscale completed blue pixels", upscale_same_method == expected_upscale_presentations, "upscale exact re-click",
-  upscale_later_frame, "upscale later frame",
+  "Settings composition",
+  dataset_configured && progress && compile_metrics && dataset_native_valid && dataset_native_generations.contains(cancelled_compile_generation) &&
+   dataset_native_generations.contains(active_compile_generation) && compile_tracks.size() == 3U && dataset_presentation_complete() && dataset_transitions_complete() && dataset_complete &&
+   progress_ordinal < dataset_complete_ordinal,
+  "Dataset lifecycle", explore_ready, "ready snapshot", sweep, "viewport sweep", scrolled, "gallery scroll", detail, "detail selection", bounded_exact_grid, "bounded exact grid", newest_placeholder,
+  "newest placeholder", pointer_inverse, "pointer inverse", pointer_dispatched, "pointer dispatch", pointer_selected, "pointer selection", gallery_shader_fill, "gallery shader fill",
+  pointer_render_chain, "pointer render chain", atlas_identities, "atlas identities", augmentation_enabled, "augmentation enabled", augmentation_rerolled, "augmentation rerolled",
+  reshuffle_order_only, "reshuffle order only", detail_source, "detail source", detail_fit, "detail fit", detail_containers, "detail containers", padded_and_original_detail,
+  "padded and original detail", upscale_growth, "upscale growth", upscale_presentation, "upscale presentation", upscale_modes == expected_upscale_modes, "upscale modes",
+  upscale_presentations == expected_upscale_presentations, "upscale presentations", upscale_completed_pixels == expected_upscale_presentations, "upscale completed blue pixels",
+  upscale_same_method == expected_upscale_presentations, "upscale exact re-click", upscale_later_frame, "upscale later frame",
   std::ranges::all_of(
    viewer_navigation_draws, [this](const auto draw) { return draw != 0U && surface_draws.contains(draw); }),
   "Previous/Next automatic upscale draws", reopened, "dataset reopen", repeated_same_revision, "same-revision redraw", annotation_ready && annotation_tool && annotation_pointer,

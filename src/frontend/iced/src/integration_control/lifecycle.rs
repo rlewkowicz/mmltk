@@ -776,10 +776,18 @@ impl State {
                             4 => "train.dataset.validation.coconut.description",
                             _ => self.benchmark_choice(index).0,
                         };
-                        return widget_ops::scroll_control_into_view(reveal.to_owned(), AnnotationReveal::Control)
-                            .chain(driver.advance_to(Phase::BenchmarkChoice(index)));
+                        return widget_ops::scroll_control_into_view(
+                            reveal.to_owned(),
+                            AnnotationReveal::Control,
+                        )
+                        .chain(driver.advance_to(Phase::BenchmarkChoice(index)));
                     }
-                    if !self.presentation.frame.as_ref().is_some_and(|frame| frame.key == index as u16 + 20) {
+                    if !self
+                        .presentation
+                        .frame
+                        .as_ref()
+                        .is_some_and(|frame| frame.key == index as u16 + 20)
+                    {
                         return Task::none();
                     }
                     self.benchmark_frame = self.presentation.frame.clone();
@@ -813,23 +821,55 @@ impl State {
                 {
                     return driver.advance_to(Phase::AwaitBenchmarkChoice(index));
                 }
-                if super::reporting_enabled() { widgets.arm(driver, control) }
-                else { widget_ops::scroll_control_into_view(control.to_owned(), AnnotationReveal::Control)
-                    .chain(widgets.arm(driver, control)) }
+                if super::reporting_enabled() {
+                    widgets.arm(driver, control)
+                } else {
+                    widget_ops::scroll_control_into_view(
+                        control.to_owned(),
+                        AnnotationReveal::Control,
+                    )
+                    .chain(widgets.arm(driver, control))
+                }
             }
             Phase::AwaitBenchmarkChoice(index) => {
                 if super::reporting_enabled() {
-                    let reversing = index == 5 && self.benchmark_frame.as_ref().and_then(|frame|
-                        frame.row("train.dataset.coconut_options")).is_some_and(|row| row.bounds.height > 0.0);
+                    let reversing = index == 5
+                        && self
+                            .benchmark_frame
+                            .as_ref()
+                            .and_then(|frame| frame.row("train.dataset.coconut_options"))
+                            .is_some_and(|row| row.bounds.height > 0.0);
                     let observed = if reversing {
-                        self.presentation.frame.as_ref().filter(|frame| frame.key == index as u16 + 1)
-                            .and_then(|frame| frame.row("train.dataset.coconut_options")).is_some_and(|row|
-                                row.bounds.height > 0.0 && row.bounds.height < self.benchmark_frame.as_ref().unwrap()
-                                    .row("train.dataset.coconut_options").unwrap().bounds.height)
-                    } else { self.presentation.settled(index as u16 + 1) };
-                    if !observed { return Task::none(); }
+                        self.presentation
+                            .frame
+                            .as_ref()
+                            .filter(|frame| frame.key == index as u16 + 1)
+                            .and_then(|frame| frame.row("train.dataset.coconut_options"))
+                            .is_some_and(|row| {
+                                row.bounds.height > 0.0
+                                    && row.bounds.height
+                                        < self
+                                            .benchmark_frame
+                                            .as_ref()
+                                            .unwrap()
+                                            .row("train.dataset.coconut_options")
+                                            .unwrap()
+                                            .bounds
+                                            .height
+                            })
+                    } else {
+                        self.presentation.settled(index as u16 + 1)
+                    };
+                    if !observed {
+                        return Task::none();
+                    }
                 }
-                if (index == 11 || (1..=4).contains(&index)) && super::reporting_enabled() && self.presentation.pixels != Some(index as u16 + 1) { return Task::none(); }
+                if (index == 11 || (1..=4).contains(&index))
+                    && super::reporting_enabled()
+                    && self.presentation.pixels != Some(index as u16 + 1)
+                {
+                    return Task::none();
+                }
                 let Some(snapshot) = model.settings_snapshot.as_ref().filter(|snapshot| {
                     snapshot.revision >= self.settings_revision && !settings.has_local_edits()
                 }) else {
@@ -873,13 +913,29 @@ impl State {
                     });
                 }
                 if index == 5 && super::reporting_enabled() {
-                    if let Some(row) = self.benchmark_frame.as_ref().and_then(|frame| frame.row(train::RECOVER_DROPPED_MASKS_ID)) {
+                    if let Some(row) = self
+                        .benchmark_frame
+                        .as_ref()
+                        .and_then(|frame| frame.row(train::RECOVER_DROPPED_MASKS_ID))
+                    {
                         let scale = driver.input_scale;
-                        let bounds = Rectangle { x: row.bounds.x * scale, y: row.bounds.y * scale,
-                            width: row.bounds.width * scale, height: row.bounds.height * scale };
-                        if !click(bounds) { driver.fail("Hidden Coconut control pointer dispatch failed"); }
-                        reporting::emit(|sink| sink.record("integration.dataset_hidden_input", train::RECOVER_DROPPED_MASKS_ID,
-                            "real-click-during-collapse", [index as f64, 1.0, 0.0, 0.0]));
+                        let bounds = Rectangle {
+                            x: row.bounds.x * scale,
+                            y: row.bounds.y * scale,
+                            width: row.bounds.width * scale,
+                            height: row.bounds.height * scale,
+                        };
+                        if !click(bounds) {
+                            driver.fail("Hidden Coconut control pointer dispatch failed");
+                        }
+                        reporting::emit(|sink| {
+                            sink.record(
+                                "integration.dataset_hidden_input",
+                                train::RECOVER_DROPPED_MASKS_ID,
+                                "real-click-during-collapse",
+                                [index as f64, 1.0, 0.0, 0.0],
+                            )
+                        });
                     }
                 }
                 let visibility = reporting::benchmark_visibility(
@@ -947,14 +1003,23 @@ impl State {
                 driver.advance_to(Phase::CompileDimensions)
             }
             Phase::CompileDimensions => {
-                if super::reporting_enabled() && !self.presentation.frame.as_ref().is_some_and(|frame| frame.key == 40) { return Task::none(); }
+                if super::reporting_enabled()
+                    && !self
+                        .presentation
+                        .frame
+                        .as_ref()
+                        .is_some_and(|frame| frame.key == 40)
+                {
+                    return Task::none();
+                }
                 widgets.arm(driver, COMPILE_DIMENSIONS)
-            },
+            }
             Phase::AwaitCompileDimensions
-                if (!super::reporting_enabled() || self.presentation.settled(41)) && settings
-                    .draft
-                    .as_ref()
-                    .is_some_and(|draft| draft.workflows.train.compiledimensions) =>
+                if (!super::reporting_enabled() || self.presentation.settled(41))
+                    && settings
+                        .draft
+                        .as_ref()
+                        .is_some_and(|draft| draft.workflows.train.compiledimensions) =>
             {
                 driver.phase = Phase::CompileResizeMode;
                 widgets.arm(driver, COMPILE_LETTERBOX)
@@ -1010,13 +1075,19 @@ impl State {
                         [snapshot.revision as f64, 1.0, 0.0, 0.0],
                     )
                 });
-                if !self.fixtures_complete && super::reporting_enabled()
-                    && (driver.viewer_scenario.is_empty() || (driver.session.profile == "dpi" && driver.control_sequence == 0)) {
+                if !self.fixtures_complete
+                    && super::reporting_enabled()
+                    && (driver.viewer_scenario.is_empty()
+                        || (driver.session.profile == "dpi" && driver.control_sequence == 0))
+                {
                     self.presentation.install(0);
                     driver.advance_to(Phase::DatasetFixture(0))
                 } else if driver.reuse_compiled {
                     driver.phase = Phase::ExploreNavigation;
-                    widgets.arm(driver, crate::view::navigation::stable_id(FeatureId::Explore))
+                    widgets.arm(
+                        driver,
+                        crate::view::navigation::stable_id(FeatureId::Explore),
+                    )
                 } else {
                     driver.phase = Phase::Compile;
                     widgets.arm_scrolled(driver, COMPILE_DATASET, RelativeOffset::END)
@@ -1027,9 +1098,22 @@ impl State {
                 if !self.presentation.settled(key) || self.presentation.pixels != Some(key) {
                     return Task::none();
                 }
-                if index == 0 && !self.presentation.custody_complete() { return Task::none(); }
-                reporting::emit(|sink| sink.record("integration.dataset_fixture", "dataset.presentation",
-                    "rendered-component", [index.into(), key.into(), f64::from(self.presentation.frames), 1.0]));
+                if index == 0 && !self.presentation.custody_complete() {
+                    return Task::none();
+                }
+                reporting::emit(|sink| {
+                    sink.record(
+                        "integration.dataset_fixture",
+                        "dataset.presentation",
+                        "rendered-component",
+                        [
+                            index.into(),
+                            key.into(),
+                            f64::from(self.presentation.frames),
+                            1.0,
+                        ],
+                    )
+                });
                 if index + 1 < super::dataset_presentation::FIXTURE_COUNT {
                     self.presentation.install(index + 1);
                     driver.advance_to(Phase::DatasetFixture(index + 1))
@@ -1041,14 +1125,24 @@ impl State {
             }
             Phase::DatasetDisclosure(index) => {
                 let key = 50 + u16::from(index);
-                if !self.presentation.settled(key) { return Task::none(); }
+                if !self.presentation.settled(key) {
+                    return Task::none();
+                }
                 let frame = self.presentation.frame.as_ref().unwrap();
-                let Some(row) = frame.row("diagnostics.summary") else { return Task::none(); };
+                let Some(row) = frame.row("diagnostics.summary") else {
+                    return Task::none();
+                };
                 if index < 2 {
                     let scale = driver.input_scale;
-                    let bounds = Rectangle { x: (row.bounds.x + 12.0) * scale,
-                        y: (row.bounds.y + row.bounds.height - 32.0) * scale, width: 100.0 * scale, height: 20.0 * scale };
-                    if !click(bounds) { driver.fail("Non-Dataset disclosure click failed"); }
+                    let bounds = Rectangle {
+                        x: (row.bounds.x + 12.0) * scale,
+                        y: (row.bounds.y + row.bounds.height - 32.0) * scale,
+                        width: 100.0 * scale,
+                        height: 20.0 * scale,
+                    };
+                    if !click(bounds) {
+                        driver.fail("Non-Dataset disclosure click failed");
+                    }
                     driver.advance_to(Phase::DatasetDisclosure(index + 1))
                 } else {
                     driver.advance_to(Phase::DatasetInput(0))
@@ -1056,20 +1150,38 @@ impl State {
             }
             Phase::DatasetInput(index) => self.dataset_input(driver, model, settings, index),
             Phase::AwaitCompileCancelled => {
-                let Some(dataset) = model.workflow.dataset.as_ref() else { return Task::none(); };
-                if dataset.active { return Task::none(); }
-                if dataset.terminal.outcome != crate::generated::ArtifactTerminalOutcome::Cancelled {
+                let Some(dataset) = model.workflow.dataset.as_ref() else {
+                    return Task::none();
+                };
+                if dataset.active {
+                    return Task::none();
+                }
+                if dataset.terminal.outcome != crate::generated::ArtifactTerminalOutcome::Cancelled
+                {
                     driver.fail("Compile completed before real Stop settled");
                     return Task::none();
                 }
-                if !self.presentation.settled(101) || !self.presentation.frame.as_ref().is_some_and(|frame|
-                    frame.row(crate::view::train::dataset::progress::AREA_ID).is_some_and(|row| row.text.contains("Cancelled"))
-                    && crate::view::train::dataset::progress::TRACK_IDS.iter().all(|id| frame.row(id).is_none())) {
+                if !self.presentation.settled(101)
+                    || !self.presentation.frame.as_ref().is_some_and(|frame| {
+                        frame
+                            .row(crate::view::train::dataset::progress::AREA_ID)
+                            .is_some_and(|row| row.text.contains("Cancelled"))
+                            && crate::view::train::dataset::progress::TRACK_IDS
+                                .iter()
+                                .all(|id| frame.row(id).is_none())
+                    })
+                {
                     return Task::none();
                 }
                 self.cancelled_generation = dataset.generation;
-                reporting::emit(|sink| sink.record("integration.compile_cancelled", COMPILE_PROGRESS,
-                    "native-inactive", [dataset.generation as f64, 0.0, 0.0, 0.0]));
+                reporting::emit(|sink| {
+                    sink.record(
+                        "integration.compile_cancelled",
+                        COMPILE_PROGRESS,
+                        "native-inactive",
+                        [dataset.generation as f64, 0.0, 0.0, 0.0],
+                    )
+                });
                 driver.advance_to(Phase::Compile)
             }
             Phase::Compile => widgets.arm_scrolled(driver, COMPILE_DATASET, RelativeOffset::END),
@@ -1079,13 +1191,16 @@ impl State {
                 };
                 let compile_succeeded = dataset.terminal.outcome
                     == crate::generated::ArtifactTerminalOutcome::Succeeded;
-                if matches!(phase, Phase::AwaitCompileProgress) && compile_succeeded
-                    && dataset.generation > self.cancelled_generation {
+                if matches!(phase, Phase::AwaitCompileProgress)
+                    && compile_succeeded
+                    && dataset.generation > self.cancelled_generation
+                {
                     driver.fail("Native compile completed before active progress was observed");
                     return Task::none();
                 }
                 if matches!(phase, Phase::AwaitCompileProgress)
-                    && dataset.active && dataset.generation > self.cancelled_generation
+                    && dataset.active
+                    && dataset.generation > self.cancelled_generation
                     && (!dataset.progress.activity.is_empty() || dataset.progress.total != 0)
                 {
                     reporting::emit(|sink| {
@@ -1117,9 +1232,11 @@ impl State {
                     driver.phase = Phase::CompileProgress;
                     return driver.advance_to(Phase::CompileProgress);
                 }
-                if compile_succeeded && self.cancelled_generation != 0
+                if compile_succeeded
+                    && self.cancelled_generation != 0
                     && dataset.generation > self.cancelled_generation
-                    && matches!(phase, Phase::AwaitCompileCompletion) {
+                    && matches!(phase, Phase::AwaitCompileCompletion)
+                {
                     let split = dataset.inspection.splits.first();
                     reporting::emit(|sink| {
                         sink.record(
@@ -1140,38 +1257,71 @@ impl State {
                 Task::none()
             }
             Phase::CompileProgress => {
-                if model.workflow.dataset.as_ref().is_none_or(|dataset| !dataset.active) {
+                if model
+                    .workflow
+                    .dataset
+                    .as_ref()
+                    .is_none_or(|dataset| !dataset.active)
+                {
                     driver.fail("Bounded native fixture completed before active rendered evidence");
                     return Task::none();
                 }
-                if !self.presentation.frame.as_ref().is_some_and(|frame| frame.key == 100 &&
-                    frame.native.as_ref().is_some_and(|native| native.generation == model.workflow.dataset.as_ref().unwrap().generation)
-                    && frame.row(crate::view::train::dataset::progress::WORK_ID).is_some_and(|row| !row.text.is_empty()) &&
-                    crate::view::train::dataset::progress::TRACK_IDS.iter().all(|id| frame.row(id).is_some())) {
+                if !self.presentation.frame.as_ref().is_some_and(|frame| {
+                    frame.key == 100
+                        && frame.native.as_ref().is_some_and(|native| {
+                            native.generation == model.workflow.dataset.as_ref().unwrap().generation
+                        })
+                        && frame
+                            .row(crate::view::train::dataset::progress::WORK_ID)
+                            .is_some_and(|row| !row.text.is_empty())
+                        && crate::view::train::dataset::progress::TRACK_IDS
+                            .iter()
+                            .all(|id| frame.row(id).is_some())
+                }) {
                     return Task::none();
                 }
                 widgets.arm(driver, COMPILE_PROGRESS)
-            },
+            }
             Phase::CompileActionWithProgress => widgets.arm(driver, COMPILE_DATASET),
             Phase::DatasetStatus => widgets.arm(driver, DATASET_STATUS),
             _ => Task::none(),
         }
     }
-    fn dataset_input(&mut self, driver: &mut Driver, model: &ApplicationModel,
-        settings: &crate::view::settings::SettingsModel, index: u8) -> Task<RootMessage> {
-        if self.presentation.input_pending || !self.presentation.settled(super::dataset_presentation::input_key(index)) { return Task::none(); }
-        let Some(snapshot) = model.settings_snapshot.as_ref().filter(|_| !settings.has_local_edits()) else { return Task::none(); };
+    fn dataset_input(
+        &mut self,
+        driver: &mut Driver,
+        model: &ApplicationModel,
+        settings: &crate::view::settings::SettingsModel,
+        index: u8,
+    ) -> Task<RootMessage> {
+        if self.presentation.input_pending
+            || !self
+                .presentation
+                .settled(super::dataset_presentation::input_key(index))
+        {
+            return Task::none();
+        }
+        let Some(snapshot) = model
+            .settings_snapshot
+            .as_ref()
+            .filter(|_| !settings.has_local_edits())
+        else {
+            return Task::none();
+        };
         let train = &snapshot.settingsstate.workflows.train;
         let frame = self.presentation.frame.as_ref().unwrap().clone();
         let field = frame.row("train.dataset.split.input");
         let infer = frame.row("train.dataset.infer.observed");
-        let field_id = crate::generated::constraint_workflowstrainrequesttraincompiledpath().stable_field_id.to_string();
+        let field_id = crate::generated::constraint_workflowstrainrequesttraincompiledpath()
+            .stable_field_id
+            .to_string();
         let scale = driver.input_scale;
-        let dispatch = |state: &mut super::dataset_presentation::State, action, next, bounds, value: &str| {
-            state.input_pending = true;
-            super::dataset_presentation::input(action, next, bounds, scale, value);
-            Task::none()
-        };
+        let dispatch =
+            |state: &mut super::dataset_presentation::State, action, next, bounds, value: &str| {
+                state.input_pending = true;
+                super::dataset_presentation::input(action, next, bounds, scale, value);
+                Task::none()
+            };
         match index {
             0 => {
                 if self.presentation.input_original.is_empty() {
@@ -1182,114 +1332,239 @@ impl State {
                     return driver.advance_to(Phase::DatasetInput(0));
                 }
                 #[cfg(target_arch = "wasm32")]
-                if !super::canvas_size_settled_js(480.0, 900.0) { return Task::none(); }
-                let Some(row) = infer else { return Task::none(); };
-                if !click(Rectangle { x: row.bounds.x * scale, y: row.bounds.y * scale,
-                    width: row.bounds.width * scale, height: row.bounds.height * scale }) {
+                if !super::canvas_size_settled_js(480.0, 900.0) {
+                    return Task::none();
+                }
+                let Some(row) = infer else {
+                    return Task::none();
+                };
+                if !click(Rectangle {
+                    x: row.bounds.x * scale,
+                    y: row.bounds.y * scale,
+                    width: row.bounds.width * scale,
+                    height: row.bounds.height * scale,
+                }) {
                     driver.fail("Dataset split disclosure click failed");
                 }
                 driver.advance_to(Phase::DatasetInput(1))
             }
-            1 if !train.usecompileddirectorydefaults => widget_ops::scroll_control_into_view(field_id, AnnotationReveal::Control)
-                .chain(driver.advance_to(Phase::DatasetInput(2))),
-            2 => field.map_or_else(Task::none, |row| dispatch(&mut self.presentation, 4, 3, row.bounds, "48")),
-            3 if frame.offset.y > 0.0 => field.map_or_else(Task::none, |row| dispatch(&mut self.presentation, 6, 12, row.bounds, "8")),
-            12 if frame.offset.y > 0.0 && frame.horizontal > 0.0 => field.map_or_else(Task::none, |row| dispatch(&mut self.presentation, 0, 4, row.bounds, "")),
+            1 if !train.usecompileddirectorydefaults => {
+                widget_ops::scroll_control_into_view(field_id, AnnotationReveal::Control)
+                    .chain(driver.advance_to(Phase::DatasetInput(2)))
+            }
+            2 => field.map_or_else(Task::none, |row| {
+                dispatch(&mut self.presentation, 4, 3, row.bounds, "48")
+            }),
+            3 if frame.offset.y > 0.0 => field.map_or_else(Task::none, |row| {
+                dispatch(&mut self.presentation, 6, 12, row.bounds, "8")
+            }),
+            12 if frame.offset.y > 0.0 && frame.horizontal > 0.0 => field
+                .map_or_else(Task::none, |row| {
+                    dispatch(&mut self.presentation, 0, 4, row.bounds, "")
+                }),
             4 => {
-                let Some(selected) = frame.selected.as_ref().filter(|value| !value.is_empty()) else { return Task::none(); };
-                let Some(row) = field else { return Task::none(); };
+                let Some(selected) = frame.selected.as_ref().filter(|value| !value.is_empty())
+                else {
+                    return Task::none();
+                };
+                let Some(row) = field else {
+                    return Task::none();
+                };
                 self.presentation.input_expected = row.text.replacen(selected, "x", 1);
                 dispatch(&mut self.presentation, 1, 5, row.bounds, "")
             }
             5 if train.request.traincompiledpath == self.presentation.input_expected => {
-                reporting::emit(|sink| sink.record("integration.dataset_drag_edit", "train.dataset.split.input", "native-settled",
-                    [frame.offset.y.into(), frame.horizontal.into(), snapshot.revision as f64, 1.0]));
+                reporting::emit(|sink| {
+                    sink.record(
+                        "integration.dataset_drag_edit",
+                        "train.dataset.split.input",
+                        "native-settled",
+                        [
+                            frame.offset.y.into(),
+                            frame.horizontal.into(),
+                            snapshot.revision as f64,
+                            1.0,
+                        ],
+                    )
+                });
                 let original = self.presentation.input_original.clone();
-                field.map_or_else(Task::none, |row| dispatch(&mut self.presentation, 5, 6, row.bounds, &original))
+                field.map_or_else(Task::none, |row| {
+                    dispatch(&mut self.presentation, 5, 6, row.bounds, &original)
+                })
             }
-            6 if train.request.traincompiledpath == self.presentation.input_original =>
-                widget_ops::scroll_control_into_view(BENCHMARK_OVERRIDE.into(), AnnotationReveal::Control)
-                    .chain(driver.advance_to(Phase::DatasetInput(18))),
+            6 if train.request.traincompiledpath == self.presentation.input_original => {
+                widget_ops::scroll_control_into_view(
+                    BENCHMARK_OVERRIDE.into(),
+                    AnnotationReveal::Control,
+                )
+                .chain(driver.advance_to(Phase::DatasetInput(18)))
+            }
             18 => {
-                let Some(row) = frame.row(BENCHMARK_OVERRIDE) else { return Task::none(); };
-                if !click(Rectangle { x: row.bounds.x * scale, y: row.bounds.y * scale,
-                    width: row.bounds.width * scale, height: row.bounds.height * scale }) {
+                let Some(row) = frame.row(BENCHMARK_OVERRIDE) else {
+                    return Task::none();
+                };
+                if !click(Rectangle {
+                    x: row.bounds.x * scale,
+                    y: row.bounds.y * scale,
+                    width: row.bounds.width * scale,
+                    height: row.bounds.height * scale,
+                }) {
                     driver.fail("Coconut retained-input override click failed");
                 }
                 driver.advance_to(Phase::DatasetInput(13))
             }
             13 if train.compilebenchmarkdatasetoverride => {
-                let Some(row) = frame.row(crate::view::train::BENCHMARK_COCONUT_ID) else { return Task::none(); };
-                if !click(Rectangle { x: row.bounds.x * scale, y: row.bounds.y * scale,
-                    width: row.bounds.width * scale, height: row.bounds.height * scale }) {
+                let Some(row) = frame.row(crate::view::train::BENCHMARK_COCONUT_ID) else {
+                    return Task::none();
+                };
+                if !click(Rectangle {
+                    x: row.bounds.x * scale,
+                    y: row.bounds.y * scale,
+                    width: row.bounds.width * scale,
+                    height: row.bounds.height * scale,
+                }) {
                     driver.fail("Coconut retained-input recipe click failed");
                 }
                 driver.advance_to(Phase::DatasetInput(14))
             }
-            14 if train.benchmarkselection.dataset == crate::generated::BenchmarkDatasetVariant::Coconut => {
-                let Some(row) = frame.row(crate::view::train::RECOVER_DROPPED_MASKS_ID) else { return Task::none(); };
+            14 if train.benchmarkselection.dataset
+                == crate::generated::BenchmarkDatasetVariant::Coconut =>
+            {
+                let Some(row) = frame.row(crate::view::train::RECOVER_DROPPED_MASKS_ID) else {
+                    return Task::none();
+                };
                 self.presentation.pressed = row.bounds;
                 dispatch(&mut self.presentation, 2, 7, row.bounds, "")
             }
             7 => dispatch(&mut self.presentation, 4, 8, frame.page, "10000"),
             8 => {
-                let Some(row) = frame.row(crate::view::train::RECOVER_DROPPED_MASKS_ID) else { return Task::none(); };
-                if row.bounds.intersection(&frame.page).is_some() { return Task::none(); }
+                let Some(row) = frame.row(crate::view::train::RECOVER_DROPPED_MASKS_ID) else {
+                    return Task::none();
+                };
+                if row.bounds.intersection(&frame.page).is_some() {
+                    return Task::none();
+                }
                 let pressed = self.presentation.pressed;
                 dispatch(&mut self.presentation, 3, 9, pressed, "")
             }
-            9 if train.benchmarkselection.recoverdroppedmasks == self.presentation.input_selection.as_ref().unwrap().recoverdroppedmasks =>
-                widget_ops::scroll_control_into_view(BENCHMARK_OVERRIDE.into(), AnnotationReveal::Control)
-                    .chain(driver.advance_to(Phase::DatasetInput(10))),
-            10 if train.benchmarkselection.recoverdroppedmasks == self.presentation.input_selection.as_ref().unwrap().recoverdroppedmasks => {
-                reporting::emit(|sink| sink.record("integration.dataset_offscreen_release", crate::view::train::RECOVER_DROPPED_MASKS_ID, "native-unchanged",
-                    [snapshot.revision as f64, 1.0, 0.0, 0.0]));
+            9 if train.benchmarkselection.recoverdroppedmasks
+                == self
+                    .presentation
+                    .input_selection
+                    .as_ref()
+                    .unwrap()
+                    .recoverdroppedmasks =>
+            {
+                widget_ops::scroll_control_into_view(
+                    BENCHMARK_OVERRIDE.into(),
+                    AnnotationReveal::Control,
+                )
+                .chain(driver.advance_to(Phase::DatasetInput(10)))
+            }
+            10 if train.benchmarkselection.recoverdroppedmasks
+                == self
+                    .presentation
+                    .input_selection
+                    .as_ref()
+                    .unwrap()
+                    .recoverdroppedmasks =>
+            {
+                reporting::emit(|sink| {
+                    sink.record(
+                        "integration.dataset_offscreen_release",
+                        crate::view::train::RECOVER_DROPPED_MASKS_ID,
+                        "native-unchanged",
+                        [snapshot.revision as f64, 1.0, 0.0, 0.0],
+                    )
+                });
                 driver.advance_to(Phase::DatasetInput(19))
             }
             19..=23 => {
-                if index > 19 && self.presentation.pixels != Some(super::dataset_presentation::input_key(index)) { return Task::none(); }
-                let id = [crate::view::train::BENCHMARK_CUSTOM_ID, crate::view::train::RECOVER_DROPPED_MASKS_ID,
-                    crate::view::train::COCONUT_VALIDATION_ID, crate::view::train::STOCK_VALIDATION_ID,
-                    "train.dataset.validation.coconut_stock.description"][usize::from(index - 19)];
+                if index > 19
+                    && self.presentation.pixels
+                        != Some(super::dataset_presentation::input_key(index))
+                {
+                    return Task::none();
+                }
+                let id = [
+                    crate::view::train::BENCHMARK_CUSTOM_ID,
+                    crate::view::train::RECOVER_DROPPED_MASKS_ID,
+                    crate::view::train::COCONUT_VALIDATION_ID,
+                    crate::view::train::STOCK_VALIDATION_ID,
+                    "train.dataset.validation.coconut_stock.description",
+                ][usize::from(index - 19)];
                 widget_ops::scroll_control_into_view(id.into(), AnnotationReveal::Control)
                     .chain(driver.advance_to(Phase::DatasetInput(index + 1)))
             }
             24 => {
-                if self.presentation.pixels != Some(super::dataset_presentation::input_key(index)) { return Task::none(); }
-                widget_ops::scroll_control_into_view(crate::view::train::BENCHMARK_CUSTOM_ID.into(), AnnotationReveal::Control)
-                    .chain(driver.advance_to(Phase::DatasetInput(25)))
+                if self.presentation.pixels != Some(super::dataset_presentation::input_key(index)) {
+                    return Task::none();
+                }
+                widget_ops::scroll_control_into_view(
+                    crate::view::train::BENCHMARK_CUSTOM_ID.into(),
+                    AnnotationReveal::Control,
+                )
+                .chain(driver.advance_to(Phase::DatasetInput(25)))
             }
             25 => {
-                if self.presentation.input_selection.as_ref().unwrap().dataset == crate::generated::BenchmarkDatasetVariant::CocoCustom {
-                    let Some(row) = frame.row(crate::view::train::BENCHMARK_CUSTOM_ID) else { return Task::none(); };
-                    if !click(Rectangle { x: row.bounds.x * scale, y: row.bounds.y * scale,
-                        width: row.bounds.width * scale, height: row.bounds.height * scale }) {
+                if self.presentation.input_selection.as_ref().unwrap().dataset
+                    == crate::generated::BenchmarkDatasetVariant::CocoCustom
+                {
+                    let Some(row) = frame.row(crate::view::train::BENCHMARK_CUSTOM_ID) else {
+                        return Task::none();
+                    };
+                    if !click(Rectangle {
+                        x: row.bounds.x * scale,
+                        y: row.bounds.y * scale,
+                        width: row.bounds.width * scale,
+                        height: row.bounds.height * scale,
+                    }) {
                         driver.fail("Coconut retained-input recipe restoration failed");
                     }
                 }
                 driver.advance_to(Phase::DatasetInput(15))
             }
-            15 if train.benchmarkselection == *self.presentation.input_selection.as_ref().unwrap() => {
-                let Some(row) = frame.row(BENCHMARK_OVERRIDE) else { return Task::none(); };
-                if !click(Rectangle { x: row.bounds.x * scale, y: row.bounds.y * scale,
-                    width: row.bounds.width * scale, height: row.bounds.height * scale }) {
+            15 if train.benchmarkselection
+                == *self.presentation.input_selection.as_ref().unwrap() =>
+            {
+                let Some(row) = frame.row(BENCHMARK_OVERRIDE) else {
+                    return Task::none();
+                };
+                if !click(Rectangle {
+                    x: row.bounds.x * scale,
+                    y: row.bounds.y * scale,
+                    width: row.bounds.width * scale,
+                    height: row.bounds.height * scale,
+                }) {
                     driver.fail("Coconut retained-input override restoration failed");
                 }
                 driver.advance_to(Phase::DatasetInput(16))
             }
-            16 if !train.compilebenchmarkdatasetoverride => widget_ops::scroll_control_into_view(field_id, AnnotationReveal::Control)
-                .chain(iced::widget::operation::scroll_by(crate::view::PAGE_SCROLL_ID,
-                    iced::widget::operation::AbsoluteOffset { x: 0.0, y: -80.0 }))
-                .chain(driver.advance_to(Phase::DatasetInput(17))),
+            16 if !train.compilebenchmarkdatasetoverride => {
+                widget_ops::scroll_control_into_view(field_id, AnnotationReveal::Control)
+                    .chain(iced::widget::operation::scroll_by(
+                        crate::view::PAGE_SCROLL_ID,
+                        iced::widget::operation::AbsoluteOffset { x: 0.0, y: -80.0 },
+                    ))
+                    .chain(driver.advance_to(Phase::DatasetInput(17)))
+            }
             17 => {
-                let Some(row) = infer else { return Task::none(); };
-                if !click(Rectangle { x: row.bounds.x * scale, y: row.bounds.y * scale,
-                    width: row.bounds.width * scale, height: row.bounds.height * scale }) {
+                let Some(row) = infer else {
+                    return Task::none();
+                };
+                if !click(Rectangle {
+                    x: row.bounds.x * scale,
+                    y: row.bounds.y * scale,
+                    width: row.bounds.width * scale,
+                    height: row.bounds.height * scale,
+                }) {
                     driver.fail("Dataset infer-splits restoration click failed");
                 }
                 driver.advance_to(Phase::DatasetInput(11))
             }
-            11 if train.usecompileddirectorydefaults && train.request.traincompiledpath == self.presentation.input_original => {
+            11 if train.usecompileddirectorydefaults
+                && train.request.traincompiledpath == self.presentation.input_original =>
+            {
                 #[cfg(target_arch = "wasm32")]
                 super::restore_canvas_size_js();
                 driver.advance_to(Phase::AwaitDatasetSettings(snapshot.revision))
@@ -1685,7 +1960,9 @@ impl State {
             Phase::CompileActionWithProgress => {
                 if self.cancelled_generation == 0 {
                     driver.phase = Phase::AwaitCompileCancelled;
-                    if !click(input_bounds) { driver.fail("Firefox real Stop dispatch failed"); }
+                    if !click(input_bounds) {
+                        driver.fail("Firefox real Stop dispatch failed");
+                    }
                 } else {
                     driver.phase = Phase::AwaitCompileCompletion;
                 }

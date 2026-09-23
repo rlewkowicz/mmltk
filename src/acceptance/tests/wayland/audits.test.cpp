@@ -2379,18 +2379,23 @@ void native_dataset_frame(BrowserAudit& audit, std::uint64_t generation, std::st
  audit.consume({{"event", "integration.compile_progress"}, {"control", "train.compile_dataset.progress"}, {"detail", "pixels"}, {"a", generation}, {"b", 1234}, {"c", 5678}, {"d", 0}});
  const auto row = [&](const char* id, const std::string& caption, nlohmann::json facts, bool work = false) {
   facts["generation"] = defect == "wrong-generation" ? generation + 1U : generation;
-  if (!(work && defect == "missing-work"))
-   audit.consume({{"event", "integration.dataset_draw"}, {"control", id}, {"detail", caption}, {"a", 1}, {"b", 2}, {"c", 100}, {"d", 32}});
+  if (!(work && defect == "missing-work")) audit.consume({{"event", "integration.dataset_draw"}, {"control", id}, {"detail", caption}, {"a", 1}, {"b", 2}, {"c", 100}, {"d", 32}});
   if (defect != "missing-facts") audit.consume({{"event", work ? "integration.dataset_native_work" : "integration.dataset_native_track"}, {"control", id}, {"detail", facts.dump()}});
  };
- row("train.dataset.progress.work", defect == "wrong-work" ? "Pixels · 2,345 / 9,876" : defect == "wrong-grouping" ? "Pixels · 1234 / 5678" : "Pixels · 1,234 / 5,678",
-     {{"phase", 6U}, {"completed", 1234U}, {"total", 5678U}}, true);
+ row("train.dataset.progress.work",
+  defect == "wrong-work"       ? "Pixels · 2,345 / 9,876"
+  : defect == "wrong-grouping" ? "Pixels · 1234 / 5678"
+                               : "Pixels · 1,234 / 5,678",
+  {{"phase", 6U}, {"completed", 1234U}, {"total", 5678U}}, true);
  row("train.dataset.progress.acquisition", "Acquisition\nNo acquisition needed · 0 KiB",
-     {{"activity", 1U}, {"completed", 0U}, {"total", 0U}, {"known", true}, {"active", false}, {"complete", true}, {"invalidated", 0U}});
+  {{"activity", 1U}, {"completed", 0U}, {"total", 0U}, {"known", true}, {"active", false}, {"complete", true}, {"invalidated", 0U}});
  row("train.dataset.progress.labels", "Labels/masks\nWaiting · 2,345 / 9,876",
-     {{"activity", 0U}, {"completed", 2345U}, {"total", 9876U}, {"known", true}, {"active", false}, {"complete", false}, {"invalidated", 0U}});
- row("train.dataset.progress.pixels", defect == "empty-status" ? "" : defect == "wrong-status" ? "Pixels\nWaiting · 2,345 / 9,876" : "Pixels\nCompiling image pixels · 2,345 / 9,876",
-     {{"activity", 5U}, {"completed", 2345U}, {"total", 9876U}, {"known", true}, {"active", true}, {"complete", false}, {"invalidated", 0U}});
+  {{"activity", 0U}, {"completed", 2345U}, {"total", 9876U}, {"known", true}, {"active", false}, {"complete", false}, {"invalidated", 0U}});
+ row("train.dataset.progress.pixels",
+  defect == "empty-status"   ? ""
+  : defect == "wrong-status" ? "Pixels\nWaiting · 2,345 / 9,876"
+                             : "Pixels\nCompiling image pixels · 2,345 / 9,876",
+  {{"activity", 5U}, {"completed", 2345U}, {"total", 9876U}, {"known", true}, {"active", true}, {"complete", false}, {"invalidated", 0U}});
  audit.consume({{"event", "integration.dataset_frame"}, {"a", defect == "fixture" ? 200U : defect == "completed" ? 102U : 100U}});
 }
 }  // namespace
@@ -2415,51 +2420,53 @@ TEST_CASE("successful compile cannot replace real active cancellation and restar
  CHECK(audit.dataset_complete);
  CHECK_FALSE(audit.dataset_presentation_complete());
 }
-
 TEST_CASE("drawn Coconut geometry rejects clipping, alignment and text regressions", "[workspace][audit]") {
- for (const bool narrow : {false, true}) for (const std::string defect : {"none", "wrapped", "fractional-wrap", "missing-viewport", "missing-paint", "clip-leak", "non-peer", "wrong-indent", "description-alignment", "description-size", "recovery-size", "recovery-double-size", "recovery-fractional", "missing-reference", "recovery-reference", "recovery-line-height"}) {
-  BrowserAudit audit;
-  const auto rectangle = [&](const char* event, const std::string& id, std::array<double, 4> bounds) {
-   audit.consume({{"event", event}, {"control", id}, {"a", bounds[0]}, {"b", bounds[1]}, {"c", bounds[2]}, {"d", bounds[3]}});
-  };
-  if (defect != "missing-viewport") rectangle("integration.dataset_viewport", "dataset.presentation", {0, 0, 400, 400});
-  rectangle("integration.dataset_draw", "train.dataset.benchmark_choices", {10, 10, 380, 350});
-  rectangle("integration.dataset_draw", "train.dataset.coconut_options", {10, 80, 380, 250});
-  const auto paint = [&](const std::string& id, std::array<double, 4> bounds, std::array<double, 4> label, std::array<double, 4> clip, double size, double line) {
-   rectangle("integration.dataset_draw", id, bounds);
-   if (defect == "missing-paint") return;
-   rectangle("integration.dataset_paint", id, bounds);
-   rectangle("integration.dataset_label", id, label);
-   if (defect == "clip-leak") clip[1] -= 1.0;
-   rectangle("integration.dataset_clip", id, clip);
-   rectangle("integration.dataset_font", id, {size, line, 0, 0});
-  };
-  paint("train.dataset.benchmark.custom", {10, 10, 150, 20}, {34, 10.9, 126, 18.2}, {10, 10, 380, 350}, 14, 18.2);
-  const double peer_x = defect == "non-peer" ? 12.0 : 10.0;
-  paint("train.dataset.benchmark.coconut", {peer_x, 40, 150, 20}, {peer_x + 24, 40.9, 126, 18.2}, {10, 10, 380, 350}, 14, 18.2);
-  const double child_x = defect == "wrong-indent" ? 30.0 : 26.0;
-  // The real Setup sidebar leaves at most 205 pixels for this caption.
-  // Correct small text therefore wraps even in the ordinary-width window.
-  const double recovery_height = defect == "recovery-double-size" ? 62.4 : defect == "recovery-size" ? 36.4 : defect == "recovery-fractional" ? 39.0 : 31.2;
-  paint("train.dataset.coconut.recover_dropped_masks", {child_x, 90, 229, recovery_height}, {child_x + 24, 90, 205, recovery_height}, {10, 80, 380, 250}, 0, 0);
-  if (defect != "missing-paint" && defect != "missing-reference") rectangle("integration.dataset_label_reference", "train.dataset.coconut.recover_dropped_masks",
-      {defect == "recovery-reference" ? 204.0 : 205.0, defect == "recovery-fractional" ? 39.0 : 31.2, 12, defect == "recovery-line-height" ? 16.0 : 15.6});
-  double y = 160;
-  for (const auto* id : {"train.dataset.validation.coconut", "train.dataset.validation.stock", "train.dataset.validation.coconut_stock"}) {
-   paint(id, {child_x, y, 200, 20}, {child_x + 24, y + 0.9, 176, 18.2}, {10, 80, 380, 250}, 14, 18.2);
-   const double x = child_x + (defect == "description-alignment" ? 26 : 24);
-   const double height = defect == "wrapped" ? 31.2 : defect == "fractional-wrap" ? 23.4 : 15.6;
-   paint(std::string(id) + ".description", {x, y + 22, 205, height}, {x, y + 22, 205, height}, {10, 80, 380, 250}, defect == "description-size" ? 14 : 12, 15.6);
-   y += 60;
+ for (const bool narrow : {false, true})
+  for (const std::string defect : {"none", "wrapped", "fractional-wrap", "missing-viewport", "missing-paint", "clip-leak", "non-peer", "wrong-indent", "description-alignment", "description-size",
+        "recovery-size", "recovery-double-size", "recovery-fractional", "missing-reference", "recovery-reference", "recovery-line-height"}) {
+   BrowserAudit audit;
+   const auto rectangle = [&](const char* event, const std::string& id, std::array<double, 4> bounds) {
+    audit.consume({{"event", event}, {"control", id}, {"a", bounds[0]}, {"b", bounds[1]}, {"c", bounds[2]}, {"d", bounds[3]}});
+   };
+   if (defect != "missing-viewport") rectangle("integration.dataset_viewport", "dataset.presentation", {0, 0, 400, 400});
+   rectangle("integration.dataset_draw", "train.dataset.benchmark_choices", {10, 10, 380, 350});
+   rectangle("integration.dataset_draw", "train.dataset.coconut_options", {10, 80, 380, 250});
+   const auto paint = [&](const std::string& id, std::array<double, 4> bounds, std::array<double, 4> label, std::array<double, 4> clip, double size, double line) {
+    rectangle("integration.dataset_draw", id, bounds);
+    if (defect == "missing-paint") return;
+    rectangle("integration.dataset_paint", id, bounds);
+    rectangle("integration.dataset_label", id, label);
+    if (defect == "clip-leak") clip[1] -= 1.0;
+    rectangle("integration.dataset_clip", id, clip);
+    rectangle("integration.dataset_font", id, {size, line, 0, 0});
+   };
+   paint("train.dataset.benchmark.custom", {10, 10, 150, 20}, {34, 10.9, 126, 18.2}, {10, 10, 380, 350}, 14, 18.2);
+   const double peer_x = defect == "non-peer" ? 12.0 : 10.0;
+   paint("train.dataset.benchmark.coconut", {peer_x, 40, 150, 20}, {peer_x + 24, 40.9, 126, 18.2}, {10, 10, 380, 350}, 14, 18.2);
+   const double child_x = defect == "wrong-indent" ? 30.0 : 26.0;
+   // The real Setup sidebar leaves at most 205 pixels for this caption.
+   // Correct small text therefore wraps even in the ordinary-width window.
+   const double recovery_height = defect == "recovery-double-size" ? 62.4 : defect == "recovery-size" ? 36.4 : defect == "recovery-fractional" ? 39.0 : 31.2;
+   paint("train.dataset.coconut.recover_dropped_masks", {child_x, 90, 229, recovery_height}, {child_x + 24, 90, 205, recovery_height}, {10, 80, 380, 250}, 0, 0);
+   if (defect != "missing-paint" && defect != "missing-reference")
+    rectangle("integration.dataset_label_reference", "train.dataset.coconut.recover_dropped_masks",
+     {defect == "recovery-reference" ? 204.0 : 205.0, defect == "recovery-fractional" ? 39.0 : 31.2, 12, defect == "recovery-line-height" ? 16.0 : 15.6});
+   double y = 160;
+   for (const auto* id : {"train.dataset.validation.coconut", "train.dataset.validation.stock", "train.dataset.validation.coconut_stock"}) {
+    paint(id, {child_x, y, 200, 20}, {child_x + 24, y + 0.9, 176, 18.2}, {10, 80, 380, 250}, 14, 18.2);
+    const double x = child_x + (defect == "description-alignment" ? 26 : 24);
+    const double height = defect == "wrapped" ? 31.2 : defect == "fractional-wrap" ? 23.4 : 15.6;
+    paint(std::string(id) + ".description", {x, y + 22, 205, height}, {x, y + 22, 205, height}, {10, 80, 380, 250}, defect == "description-size" ? 14 : 12, 15.6);
+    y += 60;
+   }
+   audit.consume({{"event", "integration.dataset_frame"}, {"a", narrow ? 121U : 5U}});
+   CHECK(audit.dataset_geometry_valid == (defect == "none" || defect == "wrapped"));
+   if (defect == "none" || defect == "wrapped") {
+    CHECK(audit.dataset_coconut_layouts.contains({narrow, "recovery"}));
+    CHECK(audit.dataset_coconut_layouts.size() == 5U);
+   }
+   CHECK_FALSE(audit.dataset_transitions_complete());
   }
-  audit.consume({{"event", "integration.dataset_frame"}, {"a", narrow ? 121U : 5U}});
-  CHECK(audit.dataset_geometry_valid == (defect == "none" || defect == "wrapped"));
-  if (defect == "none" || defect == "wrapped") {
-   CHECK(audit.dataset_coconut_layouts.contains({narrow, "recovery"}));
-   CHECK(audit.dataset_coconut_layouts.size() == 5U);
-  }
-  CHECK_FALSE(audit.dataset_transitions_complete());
- }
 }
 TEST_CASE("Dataset transitions reject moved and resized absolute viewports", "[workspace][audit]") {
  for (std::size_t dimension = 0; dimension < 5U; ++dimension) {
@@ -2476,7 +2483,6 @@ TEST_CASE("Dataset transitions reject moved and resized absolute viewports", "[w
   CHECK_FALSE(audit.dataset_geometry_valid);
  }
 }
-
 TEST_CASE("Dataset component audit rejects source and lifecycle presentation substitutions", "[workspace][audit]") {
  for (const std::string defect : {"none", "raw-bytes", "duplicate-cache", "false-total", "wrong-work", "terminal-bars"}) {
   BrowserAudit audit;
@@ -2488,8 +2494,9 @@ TEST_CASE("Dataset component audit rejects source and lifecycle presentation sub
   row("train.dataset.progress.acquisition", defect == "false-total" ? "Acquisition\nAcquiring sources · 2.3 KiB / 9.6 KiB" : "Acquisition\nAcquiring sources · 2.3 KiB / ?");
   row("train.dataset.progress.labels", "Labels/masks\nWaiting · 2,345 / 9,876");
   row("train.dataset.progress.pixels", "Pixels\nCompiling image pixels · 2,345 / 9,876");
-  row("train.dataset.progress.source.objects365v2", defect == "raw-bytes" ? "Objects365 v2 · Cached\n91268055040 · 345491 images" :
-       defect == "duplicate-cache" ? "Objects365 v2 · Cached\n85.0 GiB · 345,491 images\nCache hit" : "Objects365 v2 · Cached\n85.0 GiB · 345,491 images");
+  row("train.dataset.progress.source.objects365v2", defect == "raw-bytes"         ? "Objects365 v2 · Cached\n91268055040 · 345491 images"
+                                                    : defect == "duplicate-cache" ? "Objects365 v2 · Cached\n85.0 GiB · 345,491 images\nCache hit"
+                                                                                  : "Objects365 v2 · Cached\n85.0 GiB · 345,491 images");
   audit.consume({{"event", "integration.dataset_frame"}, {"a", defect == "terminal-bars" ? 205 : 200}});
   CHECK(audit.dataset_presentation_valid == (defect == "none"));
   CHECK(audit.compile_tracks.empty());
@@ -2498,14 +2505,15 @@ TEST_CASE("Dataset component audit rejects source and lifecycle presentation sub
 TEST_CASE("Dataset divider pixel audit requires both geometry and matching color evidence", "[workspace][audit]") {
  for (const std::string defect : {"none", "missing-stroke", "full-span", "extra-gap", "wrong-color"}) {
   BrowserAudit audit;
-  audit.consume({{"event", "integration.dataset_divider_pixels"}, {"control", "train.dataset.benchmark_divider"}, {"a", 200}, {"b", 200},
-    {"c", defect == "full-span" ? 200 : 150}, {"d", defect == "missing-stroke" ? 0 : 1}, {"scale", 1},
-    {"gap", defect == "extra-gap" ? 1 : 0}, {"matched", defect != "wrong-color"}});
+  audit.consume({{"event", "integration.dataset_divider_pixels"}, {"control", "train.dataset.benchmark_divider"}, {"a", 200}, {"b", 200}, {"c", defect == "full-span" ? 200 : 150},
+   {"d", defect == "missing-stroke" ? 0 : 1}, {"scale", 1}, {"gap", defect == "extra-gap" ? 1 : 0}, {"matched", defect != "wrong-color"}});
   CHECK(audit.dataset_divider_pixels.size() == (defect == "none" ? 1U : 0U));
  }
 }
 TEST_CASE("Dataset presentation requires complete scoped custody evidence", "[workspace][audit]") {
- for (const std::string defect : {"none", "missing", "duplicate", "stale-scope", "wrong-key", "retired-read", "extra-snapshot", "missing-count", "missing-stimulus", "conflicting-outcome", "missing-rendered", "retired-rendered", "duplicate-rendered", "missing-deferred", "failed-restoration", "unchanged-owner", "missing-drain", "post-retirement-work", "replacement-scratch", "replacement-report"}) {
+ for (const std::string defect :
+  {"none", "missing", "duplicate", "stale-scope", "wrong-key", "retired-read", "extra-snapshot", "missing-count", "missing-stimulus", "conflicting-outcome", "missing-rendered", "retired-rendered",
+   "duplicate-rendered", "missing-deferred", "failed-restoration", "unchanged-owner", "missing-drain", "post-retirement-work", "replacement-scratch", "replacement-report"}) {
   BrowserAudit audit;
   // Supply the independent existing fixture predicate; custody cannot borrow
   // success from those geometry/pixel cases or from native lifecycle facts.
@@ -2523,14 +2531,16 @@ TEST_CASE("Dataset presentation requires complete scoped custody evidence", "[wo
   for (unsigned step = 1U; step <= 6U; ++step) {
    const bool stimulus = step == 1U || step == 2U || step == 4U || step == 5U;
    const bool observed = step == 1U || step == 3U || step == 6U;
-   nlohmann::json record{{"event", "integration.dataset_custody"}, {"control", "dataset.presentation"},
-    {"detail", "admitted"}, {"case", step}, {"scope", 100U + step}, {"key", 200U},
+   nlohmann::json record{{"event", "integration.dataset_custody"}, {"control", "dataset.presentation"}, {"detail", "admitted"}, {"case", step}, {"scope", 100U + step}, {"key", 200U},
     {"snapshots", 0U}, {"reads", 0U}, {"reports", 0U}, {"stimulus", false}, {"owner", step == 6U ? 2U : 1U}};
    audit.consume(record);
    if (stimulus) {
     record["detail"] = "stimulus";
     record["stimulus"] = true;
-    if (step == 4U) { record["original_width"] = 640U; record["current_width"] = 641U; }
+    if (step == 4U) {
+     record["original_width"] = 640U;
+     record["current_width"] = 641U;
+    }
     if (!(defect == "missing-stimulus" && step == 1U)) audit.consume(record);
    }
    auto deferred = record;
@@ -2546,7 +2556,9 @@ TEST_CASE("Dataset presentation requires complete scoped custody evidence", "[wo
     for (unsigned index = 0U; index < 3U; ++index) {
      if (defect == "missing-rendered" && step == 3U && index == 0U) continue;
      audit.consume({{"event", index == 0U ? "integration.dataset_pixels" : "integration.dataset_divider_pixels"},
-      {"control", index == 0U ? "dataset.presentation" : index == 1U || defect == "duplicate-rendered" ? "train.dataset.benchmark_divider" : "train.dataset.dimensions_divider"},
+      {"control", index == 0U                                     ? "dataset.presentation"
+                  : index == 1U || defect == "duplicate-rendered" ? "train.dataset.benchmark_divider"
+                                                                  : "train.dataset.dimensions_divider"},
       {"a", 200U}, {"custody_scope", 100U + step}, {"custody_case", step}});
     }
    }
@@ -2566,9 +2578,12 @@ TEST_CASE("Dataset presentation requires complete scoped custody evidence", "[wo
    if (step == 2U && defect == "duplicate") audit.consume(record);
    if (!observed) {
     auto extra = record;
-    extra["snapshots"] = 0U; extra["reads"] = 0U; extra["reports"] = 0U;
+    extra["snapshots"] = 0U;
+    extra["reads"] = 0U;
+    extra["reports"] = 0U;
     extra["current_owner"] = step == 5U ? 2U : 1U;
-    extra["scratch_empty"] = true; extra["owner_reports"] = 0U;
+    extra["scratch_empty"] = true;
+    extra["owner_reports"] = 0U;
     if (step == 5U) {
      extra["detail"] = "replaced";
      if (defect == "unchanged-owner") extra["current_owner"] = 1U;
@@ -2576,11 +2591,14 @@ TEST_CASE("Dataset presentation requires complete scoped custody evidence", "[wo
     }
     if (step != 4U) audit.consume(deferred);
     if (step == 4U) {
-     extra["detail"] = "restored"; extra["current_width"] = defect == "failed-restoration" ? 641U : 640U;
+     extra["detail"] = "restored";
+     extra["current_width"] = defect == "failed-restoration" ? 641U : 640U;
      audit.consume(extra);
     }
     extra["detail"] = "drained";
-    extra["restored"] = true; extra["scratch_unchanged"] = true; extra["reports_unchanged"] = true;
+    extra["restored"] = true;
+    extra["scratch_unchanged"] = true;
+    extra["reports_unchanged"] = true;
     if (step == 2U && defect == "post-retirement-work") extra["reads"] = 1U;
     if (step == 5U && defect == "replacement-scratch") extra["scratch_empty"] = false;
     if (step == 5U && defect == "replacement-report") extra["owner_reports"] = 1U;

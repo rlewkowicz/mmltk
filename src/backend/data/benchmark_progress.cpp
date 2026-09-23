@@ -286,7 +286,9 @@ void ProgressReporter::source_transfer(const DownloadProgress& update, const Ben
   operation = "Reusing cached ";
  } else {
   switch (update.phase) {
-   case DownloadProgressPhase::kDownloading: operation = update.redownload ? (update.transfer.resumed ? "Resuming re-download of " : "Re-downloading ") : (update.transfer.resumed ? "Resuming " : "Downloading "); break;
+   case DownloadProgressPhase::kDownloading:
+    operation = update.redownload ? (update.transfer.resumed ? "Resuming re-download of " : "Re-downloading ") : (update.transfer.resumed ? "Resuming " : "Downloading ");
+    break;
    case DownloadProgressPhase::kVerifyingCachedArtifact: operation = "Verifying cached "; break;
    case DownloadProgressPhase::kVerifyingDownloadedArtifact: operation = "Verifying downloaded "; break;
   }

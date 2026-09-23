@@ -556,7 +556,9 @@ pub const fn artifact_id(workflow: FeatureId) -> &'static str {
         FeatureId::Validate => "validate.card.model.artifact",
         FeatureId::Predict => "predict.card.model.artifact",
         FeatureId::Export => "export.card.model.artifact",
-        FeatureId::Live | FeatureId::Annotate | FeatureId::Explore => "workflow.card.model.artifact",
+        FeatureId::Live | FeatureId::Annotate | FeatureId::Explore => {
+            "workflow.card.model.artifact"
+        }
     }
 }
 
@@ -874,7 +876,8 @@ fn view_with<'a, M: Clone + 'a>(
         artifact_id(state.workflow),
         !shared_weights_selector(state.workflow) || state.source == ModelSelectionSource::Custom,
         artifact,
-    ).animate_resize();
+    )
+    .animate_resize();
     let progress: Element<'_, Message> = state.model.map_or_else(
         || text("Model state unavailable").size(12).into(),
         |model| {

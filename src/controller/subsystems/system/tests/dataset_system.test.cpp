@@ -377,11 +377,11 @@ TEST_CASE("dataset admits real open ended acquisition and successful HTTP recove
   CHECK(progress.activity.find(" bytes") == std::string::npos);
   CHECK(progress.activity.find(" · attempt ") == std::string::npos);
   CHECK(progress.activity.find(" · retained ") == std::string::npos);
-  for (const auto& source : progress.sources) {
-   if (source.activity.empty()) continue;
-   REQUIRE(source.transfer);
-   CHECK(source.transfer->valid());
-   CHECK(source.activity.find(" bytes") == std::string::npos);
+  for (const auto& observed_source : progress.sources) {
+   if (observed_source.activity.empty()) continue;
+   REQUIRE(observed_source.transfer);
+   CHECK(observed_source.transfer->valid());
+   CHECK(observed_source.activity.find(" bytes") == std::string::npos);
   }
  }
  for (const auto& observed : delivered.back().sources)
@@ -417,12 +417,8 @@ TEST_CASE("dataset independently rejects each malformed progress invariant", "[c
  }
  SECTION("invalid track activity") { malformed.tracks.pixels.activity = static_cast<mmltk::backend::data::DatasetCompileActivity>(255); }
  SECTION("oversized source activity") { malformed.sources.push_back({.activity = std::string(contracts::kArtifactProgressTextCapacity + 1, 'x')}); }
- SECTION("artifact transfer exceeds known total") {
-  malformed.sources.push_back({.transfer = mmltk::backend::data::BenchmarkTransferProgress{.completed_bytes = 3, .total_bytes = 2}});
- }
- SECTION("artifact retained prefix exceeds completed bytes") {
-  malformed.sources.push_back({.transfer = mmltk::backend::data::BenchmarkTransferProgress{.completed_bytes = 2, .retained_bytes = 3}});
- }
+ SECTION("artifact transfer exceeds known total") { malformed.sources.emplace_back().transfer = mmltk::backend::data::BenchmarkTransferProgress{.completed_bytes = 3, .total_bytes = 2}; }
+ SECTION("artifact retained prefix exceeds completed bytes") { malformed.sources.emplace_back().transfer = mmltk::backend::data::BenchmarkTransferProgress{.completed_bytes = 2, .retained_bytes = 3}; }
  SECTION("invalid phase") { malformed.phase = static_cast<contracts::ArtifactCompilePhase>(255U); }
  SECTION("oversized activity") { malformed.activity.assign(contracts::kArtifactProgressTextCapacity + 1U, 'x'); }
  CHECK_FALSE(malformed.valid());

@@ -1164,7 +1164,8 @@ TEST_CASE("benchmark current transfer advances typed facts at the exact image pl
  for (const auto phase : {DownloadProgressPhase::kVerifyingCachedArtifact, DownloadProgressPhase::kVerifyingDownloadedArtifact}) {
   update.phase = phase;
   reporter.transfers().update(update, reporter);
-  CHECK(displayed.activity == (phase == DownloadProgressPhase::kVerifyingCachedArtifact ? "Objects365 v2 · Verifying cached objects365-live-patch" : "Objects365 v2 · Verifying downloaded objects365-live-patch"));
+  CHECK(displayed.activity ==
+        (phase == DownloadProgressPhase::kVerifyingCachedArtifact ? "Objects365 v2 · Verifying cached objects365-live-patch" : "Objects365 v2 · Verifying downloaded objects365-live-patch"));
   check_plateau(update);
  }
  reporter.activity("Preparing labels");

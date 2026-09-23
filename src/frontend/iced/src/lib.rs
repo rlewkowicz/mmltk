@@ -12,6 +12,8 @@ mod message;
 #[cfg(any(target_arch = "wasm32", test))]
 mod presentation_surface;
 pub mod protocol;
+#[cfg(test)]
+mod test_support;
 #[cfg(any(target_arch = "wasm32", test))]
 mod transport;
 #[cfg(any(target_arch = "wasm32", test))]

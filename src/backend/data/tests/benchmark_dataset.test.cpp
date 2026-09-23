@@ -213,7 +213,8 @@ void test_benchmark_download_cache_lifecycle() {
  resume.source = BenchmarkDatasetSource::kCoco2017;
  const auto resumed = download_artifacts({resume}, 1U, mmltk::common::concurrency::CancellationObservation::Atomic(cancel), [&](const auto& update) { resumed_updates.push_back(update); });
  REQUIRE_FALSE(resumed_updates.empty());
- CHECK(std::ranges::any_of(resumed_updates, [](const auto& update) { return update.transfer.resumed && update.transfer.retained_bytes == HttpServer::partial_bytes && update.transfer.completed_bytes > update.transfer.retained_bytes; }));
+ CHECK(std::ranges::any_of(resumed_updates,
+  [](const auto& update) { return update.transfer.resumed && update.transfer.retained_bytes == HttpServer::partial_bytes && update.transfer.completed_bytes > update.transfer.retained_bytes; }));
  for (const auto& update : resumed_updates) {
   CHECK(update.transfer.completed_bytes >= HttpServer::partial_bytes);
   CHECK(update.transfer.completed_bytes <= payload.size());
@@ -2999,7 +3000,6 @@ TEST_CASE("unrelated compile failure discards queued pixels before joining activ
  for (std::size_t slot = 1; slot < membership.images.size(); ++slot) CHECK_FALSE(writer.image_complete(slot));
  CHECK(mmltk::common::io::sha256_file(output) == published);
 }
-
 TEST_CASE("source transfer facts follow represented activity independently of aggregate work", "[backend][data][benchmark][progress]") {
  BenchmarkCompileProgress latest;
  const BenchmarkTraceSink quiet;

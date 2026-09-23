@@ -66,7 +66,10 @@ mod tests {
         for dark in [false, true] {
             let theme = crate::fluent_theme::app_theme(dark);
             let style = crate::fluent_theme::card_section_divider(&theme);
-            assert_eq!(style.color, crate::fluent_theme::container_card(&theme).border.color);
+            assert_eq!(
+                style.color,
+                crate::fluent_theme::container_card(&theme).border.color
+            );
             for width in [160.0, 240.0] {
                 assert_eq!(style.fill_mode.fill(width), (width * 0.125, width * 0.75));
             }

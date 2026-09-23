@@ -62,7 +62,10 @@ impl Component {
             let relevant_dialogs = if build_tensorrt {
                 &[crate::generated::constraint_workflowsexportstateoutputpath().stable_field_id][..]
             } else {
-                &[crate::generated::constraint_workflowsexportstateonnxoutputpath().stable_field_id][..]
+                &[
+                    crate::generated::constraint_workflowsexportstateonnxoutputpath()
+                        .stable_field_id,
+                ][..]
             };
             let dialogs = model
                 .workflow
@@ -87,7 +90,8 @@ impl Component {
                 column![
                     crate::view::workflow::fields::text_field(
                         "TensorRT output",
-                        crate::generated::constraint_workflowsexportstateoutputpath().stable_field_id,
+                        crate::generated::constraint_workflowsexportstateoutputpath()
+                            .stable_field_id,
                         draft.map_or("", |value| value.outputpath.as_str()),
                         settings_edit_available,
                         Message::OutputPathChanged,
@@ -115,8 +119,16 @@ impl Component {
         };
         let operation = model.workflow.export.as_ref();
         let branch_fields = column![
-            crate::view::shared::disclosure("export.output.tensorrt", build_tensorrt, branch_fields(true)),
-            crate::view::shared::disclosure("export.output.onnx", !build_tensorrt, branch_fields(false)),
+            crate::view::shared::disclosure(
+                "export.output.tensorrt",
+                build_tensorrt,
+                branch_fields(true)
+            ),
+            crate::view::shared::disclosure(
+                "export.output.onnx",
+                !build_tensorrt,
+                branch_fields(false)
+            ),
         ];
         let setup: Element<'a, Message> = column![
             self.model_card
@@ -235,8 +247,16 @@ impl Component {
             fields
         };
         let branch_advanced = column![
-            crate::view::shared::disclosure("export.advanced.tensorrt", build_tensorrt, branch_advanced(true)),
-            crate::view::shared::disclosure("export.advanced.onnx", !build_tensorrt, branch_advanced(false)),
+            crate::view::shared::disclosure(
+                "export.advanced.tensorrt",
+                build_tensorrt,
+                branch_advanced(true)
+            ),
+            crate::view::shared::disclosure(
+                "export.advanced.onnx",
+                !build_tensorrt,
+                branch_advanced(false)
+            ),
         ];
         let advanced = crate::view::shared::card(
             "Advanced",
