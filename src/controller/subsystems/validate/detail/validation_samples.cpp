@@ -172,12 +172,16 @@ public:
    std::scoped_lock lock(pool_mutex_);
    raw = pool_->Capture(sample.pixels.chw, {sample.pixels.width, sample.pixels.height}, sample.pixels.stream, sample.prediction.detections, sample.annotations, sample.annotations.class_catalog,
     static_cast<int>(sample.annotations.class_catalog->size()), sample.pixels.rgb8, std::move(sample.pixels.custody), sample.pixels.stop_source, sample.pixels.source_control, sample.ground_truth,
-    true);
+    true, sample.pixels.device);
   }
   if (!raw) {
    Settle(generation, false);
    return;
   }
+  Adopt(generation, std::move(sample), std::move(raw));
+ }
+ void Adopt(std::uint64_t generation, rfdetr::ValidationSampleView sample, std::shared_ptr<const PredictionPreviewFrame> raw) {
+  if (!raw || sample.pixels.width > visual_.maximum_width || sample.pixels.height > visual_.maximum_height) { Settle(generation, false); return; }
   ValidationSampleMetadata metadata;
   metadata.available = true;
   metadata.pixel_extent = {sample.pixels.width, sample.pixels.height};
@@ -506,6 +510,15 @@ void ValidationSamples::Capture(std::uint64_t generation, rfdetr::ValidationSamp
   impl_->Settle(generation, false);
   throw;
  }
+}
+gpu::DeviceContext ValidationSamples::CaptureContext() {
+ impl_->EnsurePool();
+ std::scoped_lock lock(impl_->pool_mutex_);
+ return *impl_->context_;
+}
+void ValidationSamples::Adopt(std::uint64_t generation, rfdetr::ValidationSampleView sample, std::shared_ptr<const PredictionPreviewFrame> raw) {
+ try { impl_->Adopt(generation, std::move(sample), std::move(raw)); }
+ catch (...) { impl_->Settle(generation, false); throw; }
 }
 void ValidationSamples::Settle(std::uint64_t generation, bool succeeded) { impl_->Settle(generation, succeeded); }
 void ValidationSamples::Select(ValidationSampleIdentity identity) { impl_->Select(identity); }

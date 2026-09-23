@@ -1901,6 +1901,19 @@ impl State {
                     driver.fail("Validation did not publish its admitted output directory and completed report");
                     return Task::none();
                 }
+                if snapshot.operation.output.completedsamples != 6
+                    || snapshot.operation.output.samplesdirectory.is_empty()
+                    || snapshot.operation.output.recentsample.is_empty() {
+                    driver.fail("Validation did not publish its six required rendered samples");
+                    return Task::none();
+                }
+                reporting::emit(|sink| {
+                    for identity in &snapshot.sampleidentities {
+                        sink.record("integration.validation_saved_sample", &snapshot.operation.output.samplesdirectory,
+                            &format!("sample-{}.png", identity.datasetindex),
+                            [identity.generation as f64, identity.datasetindex as f64, snapshot.operation.output.completedsamples as f64, 0.0]);
+                    }
+                });
                 let mut identities = std::collections::BTreeSet::new();
                 if snapshot.metrics.is_none()
                     || !snapshot

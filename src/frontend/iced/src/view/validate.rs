@@ -53,6 +53,9 @@ impl Default for Component {
 }
 
 impl Component {
+    pub fn capture_preview(&self, snapshot: Option<&crate::generated::ValidationSnapshot>, display: crate::generated::ValidationDisplaySettings) -> crate::generated::ValidationRunPreview {
+        self.samples.capture_preview(snapshot, display)
+    }
     // CLEANUP-IGNORE: Validate owns this local view entry point.
     pub fn view<'a>(
         &'a self,

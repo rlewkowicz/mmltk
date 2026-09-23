@@ -1,10 +1,27 @@
 #pragma once
 #include "src/frameworks/reflection/field_policy.h"
 #include "src/frameworks/reflection/reflected_field_policy.h"
+namespace mmltk::controller {
+struct ValidationOverlays final {
+ bool prediction_boxes = true, prediction_masks = true;
+ bool ground_truth_boxes = true, ground_truth_masks = true;
+ bool prediction_layer = true, ground_truth_layer = true;
+ bool operator==(const ValidationOverlays&) const = default;
+};
+MMLTK_REFLECT_FIELDS(ValidationOverlays)
+}
 namespace mmltk::controller::contracts {
 struct ValidationDisplaySettings final {
  [[= mmltk::frameworks::reflection::Minimum<float>{0.0F}]][[= mmltk::frameworks::reflection::Maximum<float>{1.0F}]][[= mmltk::frameworks::reflection::Finite{}]] float confidence_threshold = 0.4F;
  bool operator==(const ValidationDisplaySettings&) const = default;
 };
+struct ValidationRunPreview final {
+ ValidationOverlays overlays{};
+ ValidationDisplaySettings display{};
+ bool ground_truth_labels = true;
+ bool prediction_labels = true;
+ bool operator==(const ValidationRunPreview&) const = default;
+};
+MMLTK_REFLECT_FIELDS(ValidationRunPreview)
 MMLTK_REFLECT_FIELDS(ValidationDisplaySettings)
 }  // namespace mmltk::controller::contracts

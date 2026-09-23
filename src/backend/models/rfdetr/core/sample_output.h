@@ -5,6 +5,8 @@
 #include <cstdint>
 #include <filesystem>
 #include <memory>
+#include <functional>
+#include "src/frameworks/gpu/image_buffer.h"
 namespace mmltk::backend::models::rfdetr {
 struct RenderSampleOptions final {
  std::filesystem::path output_path;
@@ -22,6 +24,20 @@ public:
  void Draw(const at::Tensor& image, const at::Tensor& boxes, const at::Tensor& labels, const at::Tensor& masks, const RenderSampleOptions& options);
  void Flush();
 
+private:
+ struct Impl;
+ std::unique_ptr<Impl> impl_;
+};
+// One reusable pinned image and one asynchronous file write. The borrowed
+// device image is copied completely before Write returns. Flush publishes the
+// completed path only after atomic rename; failed writes preserve prior files.
+class RenderedImageWriter final {
+public:
+ using PngEncoder = std::function<int(const char*, int, int, int, const void*, int)>;
+ explicit RenderedImageWriter(mmltk::frameworks::gpu::DeviceContext, PngEncoder = {});
+ ~RenderedImageWriter();
+ void Write(mmltk::frameworks::gpu::BorrowedImageProductReadView, const std::filesystem::path&);
+ [[nodiscard]] std::filesystem::path Flush();
 private:
  struct Impl;
  std::unique_ptr<Impl> impl_;

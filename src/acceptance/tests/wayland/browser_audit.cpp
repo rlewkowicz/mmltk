@@ -728,6 +728,8 @@ auto BrowserAudit::consume(const nlohmann::json& record) -> void {
   validate_to_explore_pixels = record.value("control", "") == kExploreGalleryControl && scalar(record, "a") != 0U && scalar(record, "b") != 0U && record.value("ready_tile", false) &&
                                record.value("matched", false) && record.contains("compiled_index") && width > 0U && width <= 8U && height > 0U && height <= 8U && sampled == width * height &&
                                colored >= 12U && colored <= sampled && colored * 2U >= sampled;
+ } else if (event == "integration.validation_saved_sample") {
+  validation_saved_samples.push_back(record);
  } else if (event == "integration.validation_layout") {
   validation_layout[{record.value("detail", ""), record.value("control", "")}] = {numeric(record, "a"), numeric(record, "b"), numeric(record, "c"), numeric(record, "d")};
  } else if (event == "integration.validation_text") {
@@ -2020,6 +2022,17 @@ bool BrowserAudit::benchmark_choices_complete() const {
   previous_dataset = dataset;
   previous_validation = validation;
   previous_enabled = enabled;
+ }
+ return true;
+}
+bool BrowserAudit::validation_samples_complete() const {
+ if (validation_saved_samples.size() != 6U) return false;
+ std::set<std::uint64_t> identities;
+ const auto& first = validation_saved_samples.front();
+ for (const auto& sample : validation_saved_samples) {
+  const auto index = scalar(sample,"b");
+  if (scalar(sample,"a") == 0U || scalar(sample,"a") != scalar(first,"a") || scalar(sample,"c") != 6U || !identities.insert(index).second ||
+      sample.value("control", "").empty() || sample.value("control", "") != first.value("control", "") || sample.value("detail", "") != "sample-" + std::to_string(index) + ".png") return false;
  }
  return true;
 }

@@ -1,4 +1,5 @@
 #include "src/backend/ml/cuda/numa_host_tensor.h"
+#include "src/frameworks/gpu/pinned_host_buffer.h"
 #include "src/backend/models/rfdetr/core/sample_output.h"
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
@@ -9,6 +10,7 @@
 #include <filesystem>
 #include <future>
 #include <memory>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -182,4 +184,45 @@ void EvaluationSampleWriter::Draw(const at::Tensor& image_chw, const at::Tensor&
 void EvaluationSampleWriter::Flush() {
  if (impl_ && impl_->future.valid()) impl_->future.get();
 }
+struct RenderedImageWriter::Impl final {
+ explicit Impl(mmltk::frameworks::gpu::DeviceContext owner, PngEncoder encoder) : context(std::move(owner)), stream(context), encode(encoder ? std::move(encoder) : PngEncoder{&stbi_write_png}) {
+  context.Bind();
+  pinned = mmltk::frameworks::gpu::PinnedHostBuffer::ForCurrentDevice();
+ }
+ mmltk::frameworks::gpu::DeviceContext context;
+ mmltk::frameworks::gpu::ImageStream stream;
+ std::unique_ptr<mmltk::frameworks::gpu::PinnedHostBuffer> pinned;
+ PngEncoder encode;
+ mmltk::common::concurrency::WorkerPool pool{1, {}, "samplewrite"};
+ std::future<std::filesystem::path> future;
+};
+RenderedImageWriter::RenderedImageWriter(mmltk::frameworks::gpu::DeviceContext context, PngEncoder encoder) : impl_(std::make_unique<Impl>(std::move(context),std::move(encoder))) {}
+RenderedImageWriter::~RenderedImageWriter() { impl_->pool.wait_idle(); }
+void RenderedImageWriter::Write(mmltk::frameworks::gpu::BorrowedImageProductReadView image, const std::filesystem::path& destination) {
+ if (impl_->future.valid()) throw std::logic_error("previous rendered image write has not been settled");
+ if (!image.valid() || !image.plane(0).UsesContext(impl_->context)) throw std::invalid_argument("rendered image context is invalid");
+ const auto plane = image.plane(0).plane();
+ const auto width = plane.descriptor.width, height = plane.descriptor.height;
+ if (width > static_cast<unsigned>(std::numeric_limits<int>::max() / 4) || height > static_cast<unsigned>(std::numeric_limits<int>::max())) throw std::invalid_argument("rendered PNG dimensions exceed writer limits");
+ impl_->context.Bind();
+ const auto pitch = static_cast<std::size_t>(width) * 4U;
+ impl_->pinned->ensure_bytes(pitch * height);
+ try {
+  impl_->stream.Await(image);
+  ensure_cuda_ok(cudaMemcpy2DAsync(impl_->pinned->data(), pitch, reinterpret_cast<const void*>(plane.data), plane.descriptor.pitch_bytes, pitch, height, cudaMemcpyDeviceToHost, reinterpret_cast<cudaStream_t>(impl_->stream.native_handle())), "copy rendered image for PNG");
+  impl_->stream.Synchronize();
+ } catch (...) { impl_->stream.RethrowAfterSettlement(std::current_exception()); }
+ // No borrowed source or CUDA API reaches the file worker.
+ impl_->future = impl_->pool.enqueue([owner = impl_.get(), destination, width, height, pitch] {
+  std::filesystem::create_directories(destination.parent_path());
+  auto temporary = destination;
+  temporary += ".partial";
+  try {
+   if (owner->encode(temporary.c_str(), static_cast<int>(width), static_cast<int>(height), 4, owner->pinned->data(), static_cast<int>(pitch)) == 0) throw std::runtime_error("failed to write rendered PNG: " + destination.string());
+   std::filesystem::rename(temporary, destination);
+  } catch (...) { std::error_code ignored; std::filesystem::remove(temporary, ignored); throw; }
+  return destination;
+ });
+}
+std::filesystem::path RenderedImageWriter::Flush() { return impl_->future.valid() ? impl_->future.get() : std::filesystem::path{}; }
 }  // namespace mmltk::backend::models::rfdetr

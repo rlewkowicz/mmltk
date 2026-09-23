@@ -2,6 +2,8 @@
 #include "src/controller/services/run_output.h"
 #include "validation_runtime.h"
 #include "detail/validation_samples.h"
+#include "detail/validation_sample_output.h"
+#include <cmath>
 #include "src/controller/presentation/workspace_input.h"
 #include <algorithm>
 #include <exception>
@@ -60,7 +62,7 @@ ValidationRuntimeResult CudaValidationRuntime::Run(
 class ValidationSystem::Impl final {
 public:
  Impl(SettingsSystem& settings, DatasetSystem& dataset, ModelSystem& model, ValidationRuntimeFactory factory, SystemEventSink<ValidationSystem::event_type> events,
-  std::optional<mmltk::frameworks::gpu::DeviceExecution> execution, VisualDeviceSettings visual)
+  std::optional<mmltk::frameworks::gpu::DeviceExecution> execution, VisualDeviceSettings visual, mmltk::backend::models::rfdetr::RenderedImageWriter::PngEncoder encoder)
      : settings_(settings),
        dataset_(dataset),
        model_(model),
@@ -68,25 +70,37 @@ public:
        events_(std::move(events)),
        configuration_{std::move(execution)},
        previews_(visual.valid()),
-       samples_(visual, [this] { Changed(); }) {
+       samples_(visual, [this] { Changed(); }),
+       sample_output_(configuration_, visual, [this](const auto& path) {
+        { std::scoped_lock lock(mutex_); state_.output.samples_directory = path.parent_path().string(); ++state_.output.completed_samples; state_.output.recent_sample = path.string(); }
+        Changed();
+       }, std::move(encoder)) {
   if (!factory_) throw contracts::UnavailableError("compute runtime factory is unavailable");
   samples_.SetDisplay(settings_.validation_display_settings());
  }
- mmltk::backend::models::rfdetr::ValidationDelivery Delivery(std::uint64_t generation) {
+ mmltk::backend::models::rfdetr::ValidationDelivery Delivery(std::uint64_t generation, const std::filesystem::path& directory, contracts::ValidationRunPreview preview) {
   mmltk::backend::models::rfdetr::ValidationDelivery delivery;
-  if (previews_) {
-   delivery.samples_selected = [this, generation](auto indices, auto) { samples_.Begin(generation, indices); };
-   delivery.sample = [this, generation](auto sample) {
-    try {
-     samples_.Capture(generation, std::move(sample));
-    } catch (const mmltk::backend::ml::runtime::CudaOperationError&) { throw; } catch (...) { /* Sample settlement retains the incumbent; metrics remain valid. */
-    }
-   };
-  }
+  delivery.samples_selected = [this, generation, directory, preview](auto indices, auto) {
+   sample_output_.Begin(directory, preview, indices);
+   if (previews_) {
+    try { sample_output_.UseCaptureContext(samples_.CaptureContext()); samples_.Begin(generation, indices); }
+    catch (const mmltk::backend::ml::runtime::CudaOperationError&) { throw; }
+    catch (...) { /* Interactive sample admission remains optional. */ }
+   }
+  };
+  delivery.sample = [this, generation](auto sample) {
+   auto raw = sample_output_.Capture(sample);
+   if (previews_ && raw) {
+    try { samples_.Adopt(generation, std::move(sample), std::move(raw)); }
+    catch (const mmltk::backend::ml::runtime::CudaOperationError&) { throw; }
+    catch (...) { /* Required output and metrics do not depend on display adoption. */ }
+   }
+  };
   return delivery;
  }
  ~Impl() { Shutdown(); }
- [[nodiscard]] contracts::ComputeUiState Start() {
+ [[nodiscard]] contracts::ComputeUiState Start(contracts::ValidationRunPreview preview) {
+  if (!std::isfinite(preview.display.confidence_threshold) || preview.display.confidence_threshold < 0.0F || preview.display.confidence_threshold > 1.0F) throw contracts::InvalidIntentError("validation preview confidence must be between zero and one");
   const auto settings = settings_.materialization_facts();
   if (!settings.loaded) throw contracts::UnavailableError("settings are unavailable");
   const auto selection = model_.selection();
@@ -99,9 +113,8 @@ public:
      if (!next) throw contracts::FailedError("compute operation generation exhausted");
      contracts::begin_compute(state_, *next, "Inspecting selected inputs");
     },
-   .work = [this, settings = settings.settings, selection](const std::stop_token stop) mutable -> direct::LocalRun::Notification {
+   .work = [this, settings = settings.settings, selection, preview](const std::stop_token stop) mutable -> direct::LocalRun::Notification {
     const auto generation = operation().generation_frontier;
-    auto delivery = Delivery(generation);
     auto terminal = run_checked_compute(
      [&](const ComputeProgressSink& progress) {
       if (stop.stop_requested()) return contracts::make_compute_terminal(contracts::ComputeOperationOutcome::Cancelled);
@@ -120,12 +133,28 @@ public:
       Changed();
       if (!runtime_) runtime_ = factory_();
       if (!runtime_) throw std::runtime_error("compute runtime is unavailable");
-      auto result = runtime_->Run(std::move(*prepared), stop, progress, delivery);
+      auto delivery = Delivery(generation, directory, preview);
+      auto result = [&] {
+       try { return runtime_->Run(std::move(*prepared), stop, progress, delivery); }
+       catch (...) {
+        const auto failure = std::current_exception();
+        // Publish any completed selected image before this run becomes terminal.
+        // A secondary save failure must not replace the runtime's original error.
+        try { sample_output_.Finish(false); } catch (...) {}
+        std::rethrow_exception(failure);
+       }
+      }();
       {
        std::scoped_lock lock(mutex_);
        if (!result.report.empty()) state_.output.artifacts.push_back(std::move(result.report));
        evaluation_ = std::move(result.evaluation);
        evaluation_generation_ = state_.generation_frontier;
+      }
+      try { sample_output_.Finish(result.terminal.outcome == contracts::ComputeOperationOutcome::Succeeded); }
+      catch (...) {
+       auto failure = contracts::compute_failure_terminal(std::current_exception(), "validation sample output failed");
+       failure.completed = result.terminal.completed;
+       return failure;
       }
       return std::move(result.terminal);
      },
@@ -202,13 +231,14 @@ public:
  WorkspaceInput input_;
  bool previews_ = false;
  detail::ValidationSamples samples_;
+ detail::ValidationSampleOutput sample_output_;
 };
 ValidationSystem::ValidationSystem(SettingsSystem& settings, DatasetSystem& dataset, ModelSystem& model, ValidationRuntimeFactory factory, SystemEventSink<event_type> events,
- std::optional<mmltk::frameworks::gpu::DeviceExecution> execution, VisualDeviceSettings visual)
-    : impl_(std::make_unique<Impl>(settings, dataset, model, std::move(factory), std::move(events), std::move(execution), visual)) {}
+ std::optional<mmltk::frameworks::gpu::DeviceExecution> execution, VisualDeviceSettings visual, mmltk::backend::models::rfdetr::RenderedImageWriter::PngEncoder encoder)
+    : impl_(std::make_unique<Impl>(settings, dataset, model, std::move(factory), std::move(events), std::move(execution), visual, std::move(encoder))) {}
 ValidationSystem::~ValidationSystem() = default;
-ValidationSnapshot ValidationSystem::Start(contracts::ValidateWorkflowIntent) {
- static_cast<void>(impl_->Start());
+ValidationSnapshot ValidationSystem::Start(contracts::ValidateWorkflowIntent intent) {
+ static_cast<void>(impl_->Start(intent.preview));
  return snapshot();
 }
 ValidationSnapshot ValidationSystem::Stop() noexcept {

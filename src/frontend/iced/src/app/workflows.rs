@@ -88,6 +88,7 @@ impl App {
         }
         self.model.workflow.pending_start = Some(crate::view_model::PendingStart {
             feature,
+            validation_preview: self.workspace.validation_preview(self.model.workflow.validation.as_ref(), self.settings.draft().unwrap().workflows.validate.display.clone()),
             inputs,
             preparation: if resume_checkpoint.is_some() {
                 StartPreparation::ResumeQueued
@@ -421,12 +422,9 @@ impl App {
             }
             return;
         }
-        let resume_checkpoint = self
-            .model
-            .workflow
-            .pending_start
-            .take()
-            .and_then(|pending| pending.resume_checkpoint);
+        let pending = self.model.workflow.pending_start.take().unwrap();
+        let resume_checkpoint = pending.resume_checkpoint;
+        let validation_preview = pending.validation_preview;
         match feature {
             FeatureId::Train => {
                 if let Some(path) = resume_checkpoint {
@@ -446,7 +444,7 @@ impl App {
                 self.submit_intent(ApplicationIntentEndpoint::ValidationStart, |correlation| {
                     crate::generated::encode_validation_Start(
                         correlation,
-                        crate::generated::ValidateWorkflowIntent {},
+                        crate::generated::ValidateWorkflowIntent { preview: validation_preview },
                     )
                 })
             }
@@ -1936,6 +1934,50 @@ mod tests {
         app.advance_start();
         next_intent(&mut capture, ApplicationIntentEndpoint::ModelSelect);
         assert!(capture.try_recv().is_err());
+    }
+
+    #[test]
+    fn validation_start_submits_captured_preview_after_settings_and_model_settlement() {
+        use crate::application_codec::FromApplicationValue;
+        let (mut app, mut capture) = start_app();
+        app.workspace.select(FeatureId::Validate);
+        app.settings.state_mut().edit(EditCadence::Debounced, |draft| {
+            crate::generated::edit_workflowsvalidatedisplayconfidencethreshold(draft, 0.437)
+        }).unwrap();
+        let expected = app.workspace.validation_preview(app.model.workflow.validation.as_ref(),
+            app.settings.draft().unwrap().workflows.validate.display.clone());
+        let mut saved = app.model.settings_snapshot.clone().unwrap();
+        saved.revision += 1;
+        saved.settingsstate = app.settings.draft().unwrap().clone();
+        app.request_start(FeatureId::Validate);
+        let update = next_intent(&mut capture, ApplicationIntentEndpoint::SettingsUpdate);
+        // Local label interaction stays live while the accepted Start waits.
+        drop(app.on_workspace(crate::view::router::Message::Validate(crate::view::validate::Message::Samples(
+            crate::view::validate::samples::Message::Labels(true, false)))));
+        app.model.settings_snapshot = Some(saved.clone());
+        app.model.workflow.install_settings(&saved);
+        app.advance_start();
+        assert!(capture.try_recv().is_err());
+        app.model.reduce_reply(update.correlation, Ok(crate::generated::ApplicationReply::SettingsUpdate(saved)));
+        app.settle_settings_reply(Some(ApplicationIntentEndpoint::SettingsUpdate), true, false);
+        app.advance_start();
+        let select = next_intent(&mut capture, ApplicationIntentEndpoint::ModelSelect);
+        let active = active_preparation(&app, FeatureId::Validate);
+        app.model.reduce_reply(select.correlation, Ok(crate::generated::ApplicationReply::ModelSelect(active)));
+        app.advance_start();
+        assert!(capture.try_recv().is_err());
+        drop(app.on_workspace(crate::view::router::Message::Validate(crate::view::validate::Message::Samples(
+            crate::view::validate::samples::Message::Labels(false, false)))));
+        let accepted = accepted_model_for(&app.model, app.settings.draft().unwrap(), FeatureId::Validate);
+        model_event(&mut app, accepted);
+        let start = next_intent(&mut capture, ApplicationIntentEndpoint::ValidationStart);
+        let encoded = crate::generated::encode_validation_Start(start.correlation,
+            crate::generated::ValidateWorkflowIntent { preview: expected.clone() });
+        assert_eq!(start.fields, encoded.record.fields);
+        let submitted = crate::generated::ValidationRunPreview::from_application_value(start.fields[0].value.clone()).unwrap();
+        assert_eq!(submitted, expected);
+        assert!(submitted.groundtruthlabels && submitted.predictionlabels);
+        assert!(app.model.workflow.pending_start.is_none());
     }
 
     fn active_preparation(app: &App, feature: FeatureId) -> crate::generated::ModelUiState {

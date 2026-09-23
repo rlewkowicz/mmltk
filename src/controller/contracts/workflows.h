@@ -1,4 +1,5 @@
 #pragma once
+#include "src/controller/contracts/validation_display.h"
 #include "src/frameworks/reflection/field_policy.h"
 #include "src/frameworks/reflection/reflected_field_policy.h"
 #include "src/frameworks/reflection/reflection_metadata.h"
@@ -174,7 +175,7 @@ struct[[= mmltk::controller::contracts::reflection::feature_scope(Features...)]]
  static constexpr std::array<mmltk::controller::contracts::FeatureId, sizeof...(Features)> features{Features...};
 };
 struct[[= reflection::feature_scope(FeatureId::Train)]] TrainWorkflowIntent final {};
-struct[[= reflection::feature_scope(FeatureId::Validate)]] ValidateWorkflowIntent final {};
+struct[[= reflection::feature_scope(FeatureId::Validate)]] ValidateWorkflowIntent final { ValidationRunPreview preview{}; };
 struct[[= reflection::feature_scope(FeatureId::Predict)]] PredictWorkflowIntent final {};
 struct[[= reflection::feature_scope(FeatureId::Annotate)]] AnnotateWorkflowIntent final {};
 struct[[= reflection::feature_scope(FeatureId::Export)]] ExportWorkflowIntent final {};

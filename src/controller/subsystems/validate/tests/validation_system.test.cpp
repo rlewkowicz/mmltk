@@ -1,6 +1,9 @@
 #include "src/controller/subsystems/system/tests/prediction_test_support.h"
 #include "src/test_support/async_test_utils.hpp"
 #include "src/controller/subsystems/validate/detail/validation_samples.h"
+#include "src/controller/subsystems/validate/detail/validation_sample_output.h"
+#include <stb_image.h>
+#include <stb_image_write.h>
 #include "src/frameworks/gpu/tests/device_execution_fixture.h"
 #include <catch2/catch_test_macros.hpp>
 #include <utility>
@@ -13,6 +16,9 @@
 #include "src/test_support/filesystem_test_utils.hpp"
 #include "src/controller/subsystems/system/tests/application_data_test_support.h"
 #include <future>
+#include <fstream>
+#include <limits>
+#include <cmath>
 using namespace mmltk::controller::test_support;
 namespace mmltk::controller {
 namespace {
@@ -614,16 +620,16 @@ TEST_CASE("retained validation preparation follows physical storage and changed 
  const std::array selected{Composition::Region{regions[0].frame, {0U, 0U, 2U, 2U}}};
  Composition::Draw(runtime, detail, {2U, 2U}, selected, options, &retained);
  static_cast<void>(runtime.CommitOutput(std::move(detail)));
- CHECK(fault.draws == 7U);
+ CHECK(fault.draws == 6U);
  draw(6U, options, {16U, 12U});
- CHECK(fault.draws == 7U);
+ CHECK(fault.draws == 6U);
 }
 namespace {
 class RefusedValidationPreview final : public ValidationRuntime {
 public:
- explicit RefusedValidationPreview(std::atomic_size_t& runs) : runs_(runs) {}
+ explicit RefusedValidationPreview(std::atomic_size_t& runs, bool file_failure) : runs_(runs), file_failure_(file_failure) {}
  ValidationRuntimeResult Run(
-  mmltk::backend::models::rfdetr::ValidateRequest, std::stop_token, const ComputeProgressSink& progress, const mmltk::backend::models::rfdetr::ValidationDelivery& delivery) override {
+  mmltk::backend::models::rfdetr::ValidateRequest request, std::stop_token, const ComputeProgressSink& progress, const mmltk::backend::models::rfdetr::ValidationDelivery& delivery) override {
   namespace rfdetr = mmltk::backend::models::rfdetr;
   ++runs_;
   const std::array<std::uint32_t, 1U> selected{3U};
@@ -631,7 +637,14 @@ public:
   delivery.samples_selected(selected, catalog);
   const rfdetr::PredictionRecord prediction{.dataset_index = 3U};
   const mmltk::backend::ml::runtime::AnalysisAnnotationStorage annotations{.class_catalog = catalog};
-  delivery.sample({prediction, {.preview_failure = "preview storage refused"}, annotations, {}});
+  if (file_failure_) {
+   const auto execution = mmltk::frameworks::gpu::resolve_device_execution(0,mmltk::common::system::NumaTopology::Capture());
+   auto source = PredictionSource::Device(execution,{32U,24U},std::vector<float>(32U*24U*3U,0.25F),{},catalog);
+   std::ofstream blocked(request.report_json_path.parent_path()/"samples");
+   blocked << "occupied";
+   blocked.close();
+   delivery.sample({prediction,{.chw=source.pixels(),.width=32U,.height=24U,.device=0,.custody=source.custody()},source.annotations(),{}});
+  } else delivery.sample({prediction, {.preview_failure = "preview storage refused"}, annotations, {}});
   progress({1U, 1U, 1U, "Validating"});
   ValidationRuntimeResult result{.terminal = contracts::make_compute_terminal(contracts::ComputeOperationOutcome::Succeeded, 0U, 1U)};
   result.evaluation.emplace();
@@ -643,9 +656,11 @@ public:
 
 private:
  std::atomic_size_t& runs_;
+ bool file_failure_;
 };
 }  // namespace
-TEST_CASE("validation semantic metrics survive optional preview refusal without reinference", "[controller][systems][gpu][validation]") {
+TEST_CASE("validation semantic metrics survive required sample refusal without reinference", "[controller][systems][gpu][validation]") {
+ const bool file_failure = GENERATE(false,true);
  const auto root = mmltk::testsupport::make_temp_root("validation-preview-refusal");
  ApplicationDataFixture fixture{root};
  fixture.PrepareModel(contracts::FeatureId::Validate);
@@ -658,12 +673,12 @@ TEST_CASE("validation semantic metrics survive optional preview refusal without 
  std::atomic_size_t runs = 0U;
  std::promise<ValidationSnapshot> finished;
  ValidationSystem validation(
-  settings, dataset, model, [&] { return std::make_unique<RefusedValidationPreview>(runs); },
+  settings, dataset, model, [&] { return std::make_unique<RefusedValidationPreview>(runs,file_failure); },
   [&](auto event) {
    std::scoped_lock lock(display_mutex);
    display_changed.notify_all();
    if (auto* changed = std::get_if<ValidationChanged>(&event);
-    changed && !changed->snapshot.operation.active && changed->snapshot.operation.terminal.outcome == contracts::ComputeOperationOutcome::Succeeded) {
+    changed && !changed->snapshot.operation.active && changed->snapshot.operation.terminal.outcome == contracts::ComputeOperationOutcome::Failed) {
     try {
      finished.set_value(changed->snapshot);
     } catch (const std::future_error&) {}
@@ -677,7 +692,7 @@ TEST_CASE("validation semantic metrics survive optional preview refusal without 
  CHECK(validation.ImageSnapshot(validation.snapshot().frame)->display.confidence_threshold == 0.437F);
  REQUIRE(result.metrics);
  CHECK(result.metrics->bbox.ap == 0.625);
- CHECK(result.operation.terminal.outcome == contracts::ComputeOperationOutcome::Succeeded);
+ CHECK(result.operation.terminal.outcome == contracts::ComputeOperationOutcome::Failed);
  CHECK(result.operation.terminal.completed == 1U);
  CHECK(std::ranges::none_of(result.sample_available, [](bool available) { return available; }));
  CHECK_THROWS_AS(validation.SelectSample({result.operation.generation_frontier, 3U}), contracts::InvalidIntentError);
@@ -710,4 +725,301 @@ TEST_CASE("validation reports honor enablement and propagate file settlement fai
  CHECK(std::filesystem::file_size(request.report_json_path) > 0U);
  request.report_json_path = "/dev/full";
  CHECK_THROWS(r::write_validation_report(request, result));
+}
+
+TEST_CASE("validation output saves the selected identities without presentation and retains receiver pixels", "[controller][validation][gpu][output]") {
+ namespace gpu = mmltk::frameworks::gpu;
+ namespace rfdetr = mmltk::backend::models::rfdetr;
+ using namespace mmltk::controller;
+ const auto execution = gpu::resolve_device_execution(0, mmltk::common::system::NumaTopology::Capture());
+ const mmltk::testsupport::ScopedTempDir directory("validation-native-output");
+ const auto count = GENERATE(0U, 2U, 6U);
+ const bool cancelled = GENERATE(false,true);
+ const auto saved_count = cancelled ? count/2U : count;
+ const std::array<std::uint32_t,6> selected{11U,2U,8U,4U,21U,3U};
+ std::vector<std::filesystem::path> published;
+ detail::ValidationSampleOutput output({execution}, {}, [&](const auto& path) { published.push_back(path); });
+ contracts::ValidationRunPreview options;
+ options.overlays = {false,false,false,false,false,false};
+ output.Begin(directory.path(), options, std::span(selected).first(count));
+ auto catalog = std::make_shared<const mmltk::backend::data::catalog::ClassCatalog>(std::vector<std::string>{"café"});
+ for (std::size_t index = 0; index < saved_count; ++index) {
+  std::vector<float> pixels(32U * 24U * 3U, 0.25F);
+  auto source = PredictionSource::Device(execution, {32U,24U}, pixels, {}, catalog);
+  rfdetr::PredictionRecord record{.dataset_index = selected[index]};
+  auto captured = output.Capture({record, {.chw=source.pixels(), .width=32U, .height=24U, .device=0, .custody=source.custody()}, source.annotations(), {}});
+  REQUIRE(captured);
+  REQUIRE(cudaMemset(const_cast<float*>(source.pixels()), 0, pixels.size()*sizeof(float)) == cudaSuccess);
+ }
+ output.Finish(!cancelled);
+ REQUIRE(published.size() == saved_count);
+ for (std::size_t index = 0; index < saved_count; ++index) {
+  CHECK(published[index] == directory.path()/"samples"/("sample-"+std::to_string(selected[index])+".png"));
+  int width=0,height=0,channels=0;
+  std::unique_ptr<stbi_uc, decltype(&stbi_image_free)> pixels(stbi_load(published[index].c_str(), &width,&height,&channels,4),stbi_image_free);
+  REQUIRE(pixels);
+  REQUIRE(width == 32);
+  REQUIRE(height == 24);
+  for (int pixel = 0; pixel < width*height; ++pixel) {
+   CHECK(pixels.get()[pixel*4] == 64U);
+   CHECK(pixels.get()[pixel*4+3] == 255U);
+  }
+  CHECK_FALSE(std::filesystem::exists(published[index].string()+".partial"));
+ }
+ // A new run can reuse the owner and its bounded transfer resource.
+ output.Begin(directory.path()/"restart", options, {});
+ output.Finish(true);
+}
+
+TEST_CASE("validation rendered output applies captured layers masks boxes and inclusive confidence", "[controller][validation][gpu][output]") {
+ namespace gpu=mmltk::frameworks::gpu;
+ namespace rfdetr=mmltk::backend::models::rfdetr;
+ using namespace mmltk::controller;
+ const auto execution=gpu::resolve_device_execution(0,mmltk::common::system::NumaTopology::Capture());
+ const mmltk::testsupport::ScopedTempDir directory("validation-output-layers");
+ const auto choice=GENERATE(0U,1U,2U,3U,4U,5U,6U,7U);
+ contracts::ValidationRunPreview options;
+ options.ground_truth_labels=options.prediction_labels=false;
+ options.display.confidence_threshold=choice==7U ? 0.438F : 0.437F;
+ options.overlays.prediction_layer=choice!=1U;
+ options.overlays.ground_truth_layer=choice!=2U;
+ options.overlays.prediction_masks=choice!=3U;
+ options.overlays.ground_truth_masks=choice!=4U;
+ options.overlays.prediction_boxes=choice!=5U;
+ options.overlays.ground_truth_boxes=choice!=6U;
+ auto catalog=std::make_shared<const mmltk::backend::data::catalog::ClassCatalog>(std::vector<std::string>{"object"});
+ rfdetr::Prediction detection{.class_reference=0,.score=0.437F,.bbox_xyxy={2,26,16,38}};
+ std::vector<std::uint8_t> masks(32U*40U);
+ masks[30U*32U+8U]=1U;
+ auto source=PredictionSource::Device(execution,{32U,40U},std::vector<float>(32U*40U*3U,0.25F),{detection},catalog,masks);
+ rfdetr::Prediction truth=detection;
+ truth.has_mask=true;
+ truth.mask.width=32U;truth.mask.height=40U;
+ truth.mask.runs={{30U*32U+8U,1U}};
+ truth.mask.area=1U;
+ const std::array truths{truth};
+ const std::array<std::uint32_t,1> selection{29U};
+ std::filesystem::path published;
+ detail::ValidationSampleOutput output({execution},{},[&](const auto& path){published=path;});
+ output.Begin(directory.path(),options,selection);
+ rfdetr::PredictionRecord record{.dataset_index=29U,.detections={detection}};
+ REQUIRE(output.Capture({record,{.chw=source.pixels(),.width=32U,.height=40U,.device=0,.custody=source.custody()},source.annotations(),truths}));
+ options.overlays={false,false,false,false,false,false}; // Later viewer policy cannot mutate the admitted save.
+ output.Finish(true);
+ int width=0,height=0,channels=0;
+ std::unique_ptr<stbi_uc,decltype(&stbi_image_free)> pixels(stbi_load(published.c_str(),&width,&height,&channels,4),stbi_image_free);
+ REQUIRE(pixels);
+ REQUIRE(width==32);REQUIRE(height==40);
+ const bool prediction=choice!=1U && choice!=7U;
+ const bool truth_visible=choice!=2U;
+ const bool pm=prediction && choice!=3U, gm=truth_visible && choice!=4U;
+ const auto* mask=pixels.get()+(30U*32U+8U)*4U;
+ const auto blend=[](unsigned color){return static_cast<unsigned>((64U*159U+color*96U+127U)/255U);};
+ CHECK(mask[0]==(pm||gm ? blend(pm?255U:0U) : 64U));
+ CHECK(mask[1]==(pm||gm ? blend(gm?255U:0U) : 64U));
+ CHECK(mask[2]==mask[1]);
+ const auto* box=pixels.get()+(26U*32U+8U)*4U;
+ const bool pb=prediction && choice!=5U, gb=truth_visible && choice!=6U;
+ CHECK(box[0]==(pb||gb ? (pb?255U:0U) : 64U));
+ CHECK(box[1]==(pb||gb ? (gb?255U:0U) : 64U));
+}
+
+TEST_CASE("validation PNG captions preserve names independent flags opaque order and native geometry", "[controller][validation][gpu][output]") {
+ namespace gpu=mmltk::frameworks::gpu;
+ namespace rfdetr=mmltk::backend::models::rfdetr;
+ using namespace mmltk::controller;
+ const auto execution=gpu::resolve_device_execution(0,mmltk::common::system::NumaTopology::Capture());
+ const mmltk::testsupport::ScopedTempDir directory("validation-caption-png");
+ std::filesystem::path published;
+ // This deliberately admits a much smaller optional browser envelope.
+ detail::ValidationSampleOutput output({execution},{.device=0,.maximum_width=8U,.maximum_height=9U},[&](const auto& path){published=path;});
+ unsigned serial=0;
+ const auto save=[&](bool gt,bool det,std::string name,float x) {
+  contracts::ValidationRunPreview options;
+  options.overlays.prediction_boxes=options.overlays.prediction_masks=false;
+  options.overlays.ground_truth_boxes=options.overlays.ground_truth_masks=false;
+  options.ground_truth_labels=gt;options.prediction_labels=det;
+  auto catalog=std::make_shared<const mmltk::backend::data::catalog::ClassCatalog>(std::vector<std::string>{std::move(name)});
+  rfdetr::Prediction detection{.class_reference=0,.score=0.8F,.bbox_xyxy={x,26,64,40}};
+  auto source=PredictionSource::Device(execution,{64U,48U},std::vector<float>(64U*48U*3U,0.25F),{detection},catalog);
+  const std::array truth{detection};
+  const std::array<std::uint32_t,1> selected{33U};
+  output.Begin(directory.path()/std::to_string(serial++),options,selected);
+  const rfdetr::PredictionRecord record{.dataset_index=33,.detections={detection}};
+  REQUIRE(output.Capture({record,{.chw=source.pixels(),.width=64U,.height=48U,.device=0,.custody=source.custody()},source.annotations(),truth}));
+  output.Finish(true);
+  int width=0,height=0,channels=0;
+  std::unique_ptr<stbi_uc,decltype(&stbi_image_free)> decoded(stbi_load(published.c_str(),&width,&height,&channels,4),stbi_image_free);
+  REQUIRE(decoded);REQUIRE(width==64);REQUIRE(height==48);
+  CHECK(published.filename()=="sample-33.png");
+  CHECK_FALSE(std::filesystem::exists(published.string()+".partial"));
+  return std::vector<std::uint8_t>(decoded.get(),decoded.get()+64U*48U*4U);
+ };
+ const auto clean=save(false,false,"café",2);
+ const auto truth=save(true,false,"café",2);
+ const auto prediction=save(false,true,"café",2);
+ const auto both=save(true,true,"café",2);
+ CHECK(both==prediction); // Detection background and glyphs are the last opaque painter.
+ CHECK(truth!=prediction);CHECK(truth!=clean);CHECK(prediction!=clean);
+ const auto origin=(4U*64U+2U)*4U;
+ CHECK(truth[origin]==0U);CHECK(truth[origin+1U]==255U);
+ CHECK(prediction[origin]==255U);CHECK(prediction[origin+1U]==0U);
+ std::size_t glyphs=0;
+ for(unsigned y=4;y<26;++y) for(unsigned x=2;x<42;++x) {
+  const auto offset=(y*64U+x)*4U;
+  if(prediction[offset]==255U && prediction[offset+1U]>0U) ++glyphs;
+ }
+ CHECK(glyphs>20U);
+ CHECK(save(false,true,"0",2)!=prediction);
+ CHECK(save(false,true,"cafe",2)!=prediction); // The accented scalar contributes actual saved glyph pixels.
+ const auto clipped=save(false,true,"café",62);
+ CHECK(clipped[(4U*64U+61U)*4U]==64U);
+ CHECK(clipped[(4U*64U+62U)*4U]==255U);
+ CHECK(clipped[(47U*64U+63U)*4U]==64U); // Full native extent survives the 8×9 visual envelope.
+}
+
+
+namespace {
+class PendingOutputRuntime final : public mmltk::controller::ValidationRuntime {
+public:
+ explicit PendingOutputRuntime(mmltk::frameworks::gpu::DeviceExecution execution, mmltk::controller::contracts::ComputeOperationOutcome outcome=mmltk::controller::contracts::ComputeOperationOutcome::Cancelled):execution_(std::move(execution)),outcome_(outcome){}
+ mmltk::controller::ValidationRuntimeResult Run(mmltk::backend::models::rfdetr::ValidateRequest,std::stop_token stop,const mmltk::controller::ComputeProgressSink&,
+  const mmltk::backend::models::rfdetr::ValidationDelivery& delivery) override {
+  namespace r=mmltk::backend::models::rfdetr;
+  auto catalog=std::make_shared<const mmltk::backend::data::catalog::ClassCatalog>(std::vector<std::string>{"café"});
+  if(outcome_==mmltk::controller::contracts::ComputeOperationOutcome::Succeeded) {
+   delivery.samples_selected({},catalog);
+   return {.terminal=mmltk::controller::contracts::make_compute_terminal(outcome_)};
+  }
+  const std::array<std::uint32_t,2> selected{7U,9U};
+  delivery.samples_selected(selected,catalog);
+  auto source=PredictionSource::Device(execution_,{32U,24U},std::vector<float>(32U*24U*3U,0.25F),{},catalog);
+  const r::PredictionRecord record{.dataset_index=7};
+  delivery.sample({record,{.chw=source.pixels(),.width=32U,.height=24U,.device=execution_.device,.custody=source.custody()},source.annotations(),{}});
+  if(outcome_==mmltk::controller::contracts::ComputeOperationOutcome::Failed) throw std::runtime_error("selected runtime failed after delivery");
+  mmltk::testsupport::StopGate stopped;
+  static_cast<void>(stopped.Wait(stop));
+  mmltk::controller::ValidationRuntimeResult result{.terminal=mmltk::controller::contracts::make_compute_terminal(mmltk::controller::contracts::ComputeOperationOutcome::Cancelled,0U,1U)};
+  result.evaluation.emplace();result.evaluation->class_catalog=catalog;
+  result.evaluation->summary.bbox.available=true;result.evaluation->summary.bbox.ap=0.625;
+  return result;
+ }
+private:
+ mmltk::frameworks::gpu::DeviceExecution execution_;
+ mmltk::controller::contracts::ComputeOperationOutcome outcome_;
+};
+}
+TEST_CASE("validation public Stop and Shutdown settle an engaged PNG before terminal output facts", "[controller][validation][gpu][output]") {
+ using namespace mmltk::controller;
+ const bool shutdown=GENERATE(false,true);
+ const auto root=mmltk::testsupport::make_temp_root("validation-stop-output");
+ ApplicationDataFixture fixture{root};fixture.PrepareModel(contracts::FeatureId::Validate);
+ auto [settings,dataset,model]=fixture.systems();
+ const auto execution=mmltk::frameworks::gpu::resolve_device_execution(0,mmltk::common::system::NumaTopology::Capture());
+ mmltk::testsupport::TestGate encoding("public validation PNG write");
+ std::promise<ValidationSnapshot> terminal;
+ ValidationSystem validation(settings,dataset,model,[&]{return std::make_unique<PendingOutputRuntime>(execution);},
+  [&](auto event){if(auto* changed=std::get_if<ValidationChanged>(&event);changed&&!changed->snapshot.operation.active&&changed->snapshot.operation.terminal.outcome==contracts::ComputeOperationOutcome::Cancelled){try{terminal.set_value(changed->snapshot);}catch(const std::future_error&) {}}},
+  execution,{},[gate=encoding.receipt()](const char* path,int width,int height,int channels,const void* pixels,int stride){gate.ArriveAndWait();return stbi_write_png(path,width,height,channels,pixels,stride);});
+ mmltk::testsupport::ScopedTestCleanup release([&]{encoding.Release();validation.Shutdown();});
+ static_cast<void>(validation.Start({}));
+ REQUIRE(encoding.WaitEntered(std::chrono::seconds(5)));
+ std::future<void> joining;
+ std::promise<void> shutdown_entered;
+ if(shutdown) joining=std::async(std::launch::async,[&]{shutdown_entered.set_value();validation.Shutdown();});
+ else CHECK(validation.Stop().operation.active);
+ mmltk::testsupport::ScopedTestCleanup unblock([&]{encoding.Release();});
+ if(shutdown) {
+  mmltk::testsupport::await_test_promise(shutdown_entered,"validation shutdown entered");
+  CHECK(joining.wait_for(std::chrono::milliseconds(0))==std::future_status::timeout);
+ }
+ CHECK(validation.snapshot().operation.active);
+ CHECK(validation.snapshot().operation.output.completed_samples==0U);
+ encoding.Release();
+ const auto settled=mmltk::testsupport::await_test_promise(terminal,"public stopped validation output",std::chrono::seconds(10));
+ if(joining.valid()) mmltk::testsupport::await_test_future(joining,"validation shutdown joined",std::chrono::seconds(10));
+ CHECK(settled.operation.output.completed_samples==1U);REQUIRE(settled.metrics);CHECK(settled.metrics->bbox.ap==0.625);
+ const auto path=std::filesystem::path(settled.operation.output.recent_sample);
+ CHECK(path.filename()=="sample-7.png");CHECK_FALSE(std::filesystem::exists(path.string()+".partial"));
+ int width=0,height=0,channels=0;
+ std::unique_ptr<stbi_uc,decltype(&stbi_image_free)> pixels(stbi_load(path.c_str(),&width,&height,&channels,4),stbi_image_free);
+ REQUIRE(pixels);CHECK(width==32);CHECK(height==24);CHECK(pixels.get()[0]==64U);
+}
+
+TEST_CASE("validation runtime throw settles selected PNG before failure and restart", "[controller][validation][gpu][output]") {
+ using namespace mmltk::controller;
+ const auto root=mmltk::testsupport::make_temp_root("validation-throw-output");
+ ApplicationDataFixture fixture{root};fixture.PrepareModel(contracts::FeatureId::Validate);
+ auto [settings,dataset,model]=fixture.systems();
+ const auto execution=mmltk::frameworks::gpu::resolve_device_execution(0,mmltk::common::system::NumaTopology::Capture());
+ mmltk::testsupport::TestGate encoding("throwing validation PNG write");
+ std::promise<ValidationSnapshot> failed, restarted;
+ auto failure=failed.get_future();
+ unsigned runs=0;
+ ValidationSystem validation(settings,dataset,model,[&]{return std::make_unique<PendingOutputRuntime>(execution,runs++==0 ? contracts::ComputeOperationOutcome::Failed : contracts::ComputeOperationOutcome::Succeeded);},
+  [&](auto event){if(auto* changed=std::get_if<ValidationChanged>(&event);changed&&!changed->snapshot.operation.active){
+   try {
+    if(changed->snapshot.operation.terminal.outcome==contracts::ComputeOperationOutcome::Failed) failed.set_value(changed->snapshot);
+    else if(changed->snapshot.operation.terminal.outcome==contracts::ComputeOperationOutcome::Succeeded) restarted.set_value(changed->snapshot);
+   } catch(const std::future_error&) {}
+  }},execution,{},[gate=encoding.receipt()](const char* path,int width,int height,int channels,const void* pixels,int stride){gate.ArriveAndWait();return stbi_write_png(path,width,height,channels,pixels,stride);});
+ mmltk::testsupport::ScopedTestCleanup release([&]{encoding.Release();validation.Shutdown();});
+ static_cast<void>(validation.Start({}));
+ REQUIRE(encoding.WaitEntered(std::chrono::seconds(5)));
+ CHECK(failure.wait_for(std::chrono::milliseconds(0))==std::future_status::timeout);
+ CHECK(validation.snapshot().operation.active);
+ encoding.Release();
+ const auto settled=mmltk::testsupport::await_test_future(failure,"throwing validation output",std::chrono::seconds(10));
+ CHECK(settled.operation.terminal.detail.find("selected runtime failed after delivery")!=std::string::npos);
+ CHECK(settled.operation.output.completed_samples==1U);
+ const auto path=std::filesystem::path(settled.operation.output.recent_sample);
+ CHECK(path.filename()=="sample-7.png");CHECK_FALSE(std::filesystem::exists(path.string()+".partial"));
+ int width=0,height=0,channels=0;
+ std::unique_ptr<stbi_uc,decltype(&stbi_image_free)> pixels(stbi_load(path.c_str(),&width,&height,&channels,4),stbi_image_free);
+ REQUIRE(pixels);CHECK(width==32);CHECK(height==24);CHECK(pixels.get()[0]==64U);
+ static_cast<void>(validation.Start({}));
+ const auto fresh=mmltk::testsupport::await_test_promise(restarted,"validation restart after throw",std::chrono::seconds(10));
+ CHECK(fresh.operation.output.completed_samples==0U);CHECK(fresh.operation.output.recent_sample.empty());
+ CHECK(fresh.operation.output.directory!=settled.operation.output.directory);
+ CHECK(std::filesystem::is_regular_file(path));CHECK(runs==2U);
+}
+
+TEST_CASE("validation caption anchors reject malformed coordinates and retain completed images", "[controller][validation][gpu][output]") {
+ namespace gpu=mmltk::frameworks::gpu;
+ namespace rfdetr=mmltk::backend::models::rfdetr;
+ using namespace mmltk::controller;
+ const bool ground_truth=GENERATE(false,true);
+ const unsigned axis=GENERATE(0U,1U);
+ const auto coordinate=GENERATE(std::numeric_limits<float>::quiet_NaN(),std::numeric_limits<float>::infinity(),std::numeric_limits<float>::max(),-std::numeric_limits<float>::max(),-2.0F,62.0F,static_cast<float>(std::numeric_limits<int>::min()));
+ const bool valid=std::isfinite(coordinate)&&static_cast<double>(coordinate)>=std::numeric_limits<int>::min()&&static_cast<double>(coordinate)<=std::numeric_limits<int>::max();
+ const auto execution=gpu::resolve_device_execution(0,mmltk::common::system::NumaTopology::Capture());
+ const mmltk::testsupport::ScopedTempDir directory("validation-caption-coordinate");
+ std::vector<std::filesystem::path> published;
+ detail::ValidationSampleOutput output({execution},{},[&](const auto& path){published.push_back(path);});
+ contracts::ValidationRunPreview options;
+ options.overlays.prediction_boxes=options.overlays.prediction_masks=false;
+ options.overlays.ground_truth_boxes=options.overlays.ground_truth_masks=false;
+ options.ground_truth_labels=ground_truth;options.prediction_labels=!ground_truth;
+ const std::array<std::uint32_t,2> selected{17U,19U};
+ output.Begin(directory.path(),options,selected);
+ auto catalog=std::make_shared<const mmltk::backend::data::catalog::ClassCatalog>(std::vector<std::string>{"café"});
+ for(unsigned index=0;index<2;++index) {
+  rfdetr::Prediction detection{.class_reference=0,.score=0.8F,.bbox_xyxy={2,26,64,40}};
+  if(index==1) detection.bbox_xyxy[axis]=coordinate;
+  auto source=PredictionSource::Device(execution,{64U,48U},std::vector<float>(64U*48U*3U,0.25F),{detection},catalog);
+  const std::array truth{detection};
+  const rfdetr::PredictionRecord record{.dataset_index=selected[index],.detections={detection}};
+  REQUIRE(output.Capture({record,{.chw=source.pixels(),.width=64U,.height=48U,.device=0,.custody=source.custody()},source.annotations(),truth}));
+ }
+ if(valid) output.Finish(true);
+ else CHECK_THROWS_WITH(output.Finish(true),"validation caption coordinate is not finite and int-representable");
+ REQUIRE(published.size()==(valid?2U:1U));
+ CHECK(published.front().filename()=="sample-17.png");
+ for(const auto& path:published) {
+  int width=0,height=0,channels=0;
+  std::unique_ptr<stbi_uc,decltype(&stbi_image_free)> pixels(stbi_load(path.c_str(),&width,&height,&channels,4),stbi_image_free);
+  REQUIRE(pixels);CHECK(width==64);CHECK(height==48);CHECK(pixels.get()[(47U*64U+63U)*4U]==64U);
+  CHECK_FALSE(std::filesystem::exists(path.string()+".partial"));
+ }
+ if(!valid) CHECK_FALSE(std::filesystem::exists(directory.path()/"samples"/"sample-19.png"));
 }

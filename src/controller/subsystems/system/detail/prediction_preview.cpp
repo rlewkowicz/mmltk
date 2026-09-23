@@ -172,7 +172,7 @@ PredictionPreviewPool::PredictionPreviewPool(
 }
 std::shared_ptr<const PredictionPreviewFrame> PredictionPreviewPool::Capture(const float* pixels, VisualExtent extent, std::uintptr_t source_stream, std::span<const rfdetr::Prediction> predictions,
  const mmltk::backend::ml::runtime::AnalysisAnnotationStorage& annotations, std::shared_ptr<const mmltk::backend::data::catalog::ClassCatalog> catalog, int classes, const std::uint8_t* rgb8,
- std::shared_ptr<void> source_custody, void (*stop_source)(void*), void* source_control, std::span<const rfdetr::Prediction> ground_truth, bool composition) {
+ std::shared_ptr<void> source_custody, void (*stop_source)(void*), void* source_control, std::span<const rfdetr::Prediction> ground_truth, bool composition, int source_device) {
  if (!retirement_->admission_open()) throw std::runtime_error("prediction preview CUDA retirement failed");
  auto available = std::ranges::find_if(slots_, [](const auto& slot) { return !slot || (slot.use_count() == 1 && slot->state_->unsafe == cudaSuccess); });
  if (available == slots_.end()) return {};
@@ -225,7 +225,12 @@ std::shared_ptr<const PredictionPreviewFrame> PredictionPreviewPool::Capture(con
   state.source_custody = source_custody;
   auto scope = (*available)->ContextScope();
   scope.Run([&] {
-   if (!state.source_context) { state.source_context.emplace(execution_.device, gpu::cuda_image_copy_backend(), gpu::DeviceContextMode::PrimaryInterop, execution_.placement.numa_node, execution_); }
+   if (!state.source_context) {
+    const auto device = source_device >= 0 ? source_device : execution_.device;
+    const auto source_execution = device == execution_.device ? execution_ : gpu::resolve_device_execution(device, mmltk::common::system::NumaTopology::Capture());
+    state.source_context.emplace(device, gpu::cuda_image_copy_backend(), gpu::DeviceContextMode::PrimaryInterop, source_execution.placement.numa_node, source_execution);
+   }
+   if (source_device >= 0 && state.source_context->device() != source_device) throw std::invalid_argument("prediction source device changed within a capture slot");
    if (!state.source_ready) {
     state.source_context->Bind();
     checked(cudaEventCreateWithFlags(&state.source_ready, cudaEventDisableTiming));
@@ -363,7 +368,7 @@ void PredictionPreviewFrame::Draw(gpu::SystemImageRuntime& runtime, gpu::SystemI
  PredictionPreviewComposition::Draw(runtime, candidate, state_->extent, regions, {});
 }
 void PredictionPreviewComposition::Draw(
- gpu::SystemImageRuntime& runtime, gpu::SystemImageRuntime::OutputCandidate& candidate, VisualExtent extent, std::span<const Region> regions, Options options, PredictionPreviewComposition* retained) {
+ gpu::SystemImageRuntime& runtime, gpu::SystemImageRuntime::OutputCandidate& candidate, VisualExtent extent, std::span<const Region> regions, Options options, PredictionPreviewComposition* retained, gpu::ImageProductBuffer::ProductSubmit finalize) {
  if (!extent.valid() || regions.size() > kMaximumFrames) throw std::invalid_argument("preview composition extent or count is invalid");
  if (retained && regions.size() > 6U) throw std::invalid_argument("retained preview exceeds six regions");
  std::shared_ptr<gpu::TerminalCudaRetirementOwner> retirement;
@@ -390,7 +395,7 @@ void PredictionPreviewComposition::Draw(
  Allocation staged;
  const auto prior_allocations = candidate.allocations();
  try {
-  runtime.PublishRetained(candidate, extent.width, extent.height, [submission, &runtime, retained, &allocation, &staged, prior_allocations](auto clean, auto semantic, auto stream) {
+  runtime.PublishRetained(candidate, extent.width, extent.height, [submission, &runtime, retained, &allocation, &staged, prior_allocations, &finalize](auto clean, auto semantic, auto stream) {
    const auto clear = [&](auto plane) {
     checked(cudaMemset2DAsync(reinterpret_cast<void*>(plane.data), plane.descriptor.pitch_bytes, 0, plane.descriptor.row_bytes(), plane.descriptor.height, reinterpret_cast<cudaStream_t>(stream)));
    };
@@ -453,6 +458,7 @@ void PredictionPreviewComposition::Draw(
       overlays.ground_truth_masks, overlays.complementary_layers, write_clean, write_semantic, overlays.confidence_threshold);
     if (allocation) staged.cells[index] = {region.frame, region.frame->state_->capture, region.crop, overlays, true, true};
    }
+   if (finalize) finalize(clean, semantic, stream);
   });
   if (allocation) *allocation = std::move(staged);
   // PublishRetained's completion, including its outer stream settlement,
@@ -516,22 +522,25 @@ void PredictionPreviewFrame::DrawRegion(gpu::SystemImageRuntime& runtime, gpu::I
    }
    const bool scale = clean.descriptor.width != state.extent.width || clean.descriptor.height != state.extent.height;
    if (scale && !state.composition) throw std::invalid_argument("preview composition storage was not admitted");
+   // Composition retains one native clean/semantic preparation for output,
+   // atlas and detail alike; changing destination geometry only resamples it.
+   const bool prepared_storage = state.composition;
    const auto pitch = static_cast<std::size_t>(state.extent.width) * 4U;
-   auto* clean_pixels = scale ? data + state.scratch_offset : reinterpret_cast<std::uint8_t*>(clean.data);
-   auto* semantic_pixels = scale ? data + state.scratch_offset + pitch * state.extent.height : reinterpret_cast<std::uint8_t*>(semantic.data);
-   const auto clean_pitch = scale ? pitch : clean.descriptor.pitch_bytes;
-   const auto semantic_pitch = scale ? pitch : semantic.descriptor.pitch_bytes;
+   auto* clean_pixels = prepared_storage ? data + state.scratch_offset : reinterpret_cast<std::uint8_t*>(clean.data);
+   auto* semantic_pixels = prepared_storage ? data + state.scratch_offset + pitch * state.extent.height : reinterpret_cast<std::uint8_t*>(semantic.data);
+   const auto clean_pitch = prepared_storage ? pitch : clean.descriptor.pitch_bytes;
+   const auto semantic_pitch = prepared_storage ? pitch : semantic.descriptor.pitch_bytes;
    raster::MutableBytes overlay{semantic_pixels, semantic_pitch, static_cast<int>(state.extent.width), static_cast<int>(state.extent.height)};
-   if (write_clean && (!scale || !state.prepared.clean)) {
-    if (scale) state.prepared.clean = false;
+   if (write_clean && (!prepared_storage || !state.prepared.clean)) {
+    if (prepared_storage) state.prepared.clean = false;
     const auto converted = state.pixels == State::Pixels::Rgb8 ? state.convert_rgb8(data, state.extent.width, state.extent.height, clean_pixels, clean_pitch, cuda_stream)
                                                                : state.convert(reinterpret_cast<const float*>(data), state.extent.width, state.extent.height, clean_pixels, clean_pitch, cuda_stream);
     checked(static_cast<cudaError_t>(converted));
-    if (scale) state.pending.clean = true;
+    if (prepared_storage) state.pending.clean = true;
    }
    const PredictionPreviewComposition::Options semantic_options{prediction_boxes, prediction_masks, ground_truth_boxes, ground_truth_masks, complementary_layers, false, confidence_threshold};
-   if (write_semantic && (!scale || !state.prepared.semantic || state.prepared.options != semantic_options)) {
-    if (scale) state.prepared.semantic = false;
+   if (write_semantic && (!prepared_storage || !state.prepared.semantic || state.prepared.options != semantic_options)) {
+    if (prepared_storage) state.prepared.semantic = false;
     checked(state.clear_semantic(semantic_pixels, semantic_pitch, 0, pitch, state.extent.height, cuda_stream));
     const auto draw_prediction = [&] {
      if (!state.predictions.empty() && (prediction_boxes || prediction_masks)) {
@@ -590,12 +599,12 @@ void PredictionPreviewFrame::DrawRegion(gpu::SystemImageRuntime& runtime, gpu::I
      word += gt.mask.runs.size() * 2U;
     }
     if (complementary_layers) draw_prediction();
-    if (scale) {
+    if (prepared_storage) {
      state.pending.semantic = true;
      state.pending.options = semantic_options;
     }
    }
-   if (scale) {
+   if (prepared_storage) {
     if (write_clean)
      checked(static_cast<cudaError_t>(raster::scale_rgba({clean_pixels, clean_pitch, overlay.width, overlay.height},
       {reinterpret_cast<std::uint8_t*>(clean.data), clean.descriptor.pitch_bytes, static_cast<int>(clean.descriptor.width), static_cast<int>(clean.descriptor.height)}, stream)));

@@ -1,5 +1,6 @@
 #pragma once
 #include <array>
+#include <functional>
 #include <cstddef>
 #include "src/backend/imaging/raster/chw_image.h"
 #include "src/frameworks/gpu/cuda_context_scope.h"
@@ -68,7 +69,7 @@ public:
   bool operator==(const Options&) const = default;
  };
  static void Draw(mmltk::frameworks::gpu::SystemImageRuntime&, mmltk::frameworks::gpu::SystemImageRuntime::OutputCandidate&, VisualExtent, std::span<const Region>, Options,
-  PredictionPreviewComposition* retained = nullptr);
+  PredictionPreviewComposition* retained = nullptr, mmltk::frameworks::gpu::ImageProductBuffer::ProductSubmit finalize = {});
 
 private:
  // Allocation-local validity only; weak source references never occupy raw slots.
@@ -111,7 +112,7 @@ public:
  [[nodiscard]] std::shared_ptr<const PredictionPreviewFrame> Capture(const float*, VisualExtent, std::uintptr_t source_stream, std::span<const mmltk::backend::models::rfdetr::Prediction>,
   const mmltk::backend::ml::runtime::AnalysisAnnotationStorage&, std::shared_ptr<const mmltk::backend::data::catalog::ClassCatalog>, int classes, const std::uint8_t* rgb8 = nullptr,
   std::shared_ptr<void> source_custody = {}, void (*stop_source)(void*) = nullptr, void* source_control = nullptr, std::span<const mmltk::backend::models::rfdetr::Prediction> ground_truth = {},
-  bool composition = false);
+  bool composition = false, int source_device = -1);
  [[nodiscard]] bool HasUnsafeSourceCustody() const noexcept { return unsafe_source_; }
  [[nodiscard]] bool HasUnsafeCustody() const noexcept { return !retirement_->admission_open(); }
 

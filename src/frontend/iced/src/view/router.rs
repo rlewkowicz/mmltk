@@ -56,6 +56,9 @@ impl Default for Router {
 }
 
 impl Router {
+    pub fn validation_preview(&self, snapshot: Option<&crate::generated::ValidationSnapshot>, display: crate::generated::ValidationDisplaySettings) -> crate::generated::ValidationRunPreview {
+        self.validate.capture_preview(snapshot, display)
+    }
     #[cfg(test)]
     pub(crate) fn explore_state_for_test(&mut self) -> &mut explore::state::State {
         self.explore.state_for_test()

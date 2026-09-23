@@ -29,6 +29,7 @@ target_compile_options(mmltk_cxx26_dialect INTERFACE
 add_library(stb STATIC
     third_party/stb/stb_image.cpp
     third_party/stb/stb_image_write.cpp
+    third_party/stb/stb_truetype.cpp
 )
 mmltk_configure_foreign_target(stb)
 target_include_directories(stb SYSTEM PUBLIC

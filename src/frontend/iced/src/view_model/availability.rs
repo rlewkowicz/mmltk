@@ -550,6 +550,7 @@ mod tests {
             },
         ] {
             model.workflow.pending_start = Some(PendingStart {
+                validation_preview: crate::generated::default_request_validationStartpreview().unwrap(),
                 feature: FeatureId::Train,
                 inputs: StartInputs::capture(
                     &model.settings_snapshot.as_ref().unwrap().settingsstate,

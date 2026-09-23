@@ -36,12 +36,6 @@ struct ValidationSampleMetadata final {
  VisualRegion content{};
  [[= mmltk::frameworks::reflection::MaxItems{2U * contracts::kAnnotationObjectCapacity}]] std::vector<ValidationLabel> labels;
 };
-struct ValidationOverlays final {
- bool prediction_boxes = true, prediction_masks = true;
- bool ground_truth_boxes = true, ground_truth_masks = true;
- bool prediction_layer = true, ground_truth_layer = true;
- bool operator==(const ValidationOverlays&) const = default;
-};
 struct ValidationOverlaySelection final {
  std::uint64_t revision = 0U;
  ValidationOverlays value{};
@@ -80,7 +74,6 @@ struct[[= contracts::reflection::Event{contracts::reflection::EventDelivery::Tra
 MMLTK_REFLECT_FIELDS(ValidationSampleIdentity)
 MMLTK_REFLECT_FIELDS(ValidationLabel)
 MMLTK_REFLECT_FIELDS(ValidationSampleMetadata)
-MMLTK_REFLECT_FIELDS(ValidationOverlays)
 MMLTK_REFLECT_FIELDS(ValidationOverlaySelection)
 MMLTK_REFLECT_FIELDS(ValidationImageMetadata)
 MMLTK_REFLECT_FIELDS(ValidationSnapshot)

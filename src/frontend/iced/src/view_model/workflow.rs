@@ -363,7 +363,9 @@ impl StartInputs {
                 settings: value,
                 inherited_source,
             } => {
-                value == &settings.workflows.validate
+                let mut current = settings.workflows.validate.clone();
+                current.display = value.display.clone();
+                value == &current
                     && inherited_source
                         .as_ref()
                         .map(|(inferred, path)| (*inferred, path.as_str()))
@@ -395,6 +397,7 @@ fn validation_inherited_source(
 
 #[derive(Debug, Clone)]
 pub struct PendingStart {
+    pub validation_preview: crate::generated::ValidationRunPreview,
     pub feature: FeatureId,
     pub inputs: StartInputs,
     pub preparation: StartPreparation,

@@ -16,6 +16,8 @@ public:
  ~ValidationSamples();
  void Begin(std::uint64_t generation, std::span<const std::uint32_t> indices);
  void Capture(std::uint64_t generation, mmltk::backend::models::rfdetr::ValidationSampleView);
+ void Adopt(std::uint64_t generation, mmltk::backend::models::rfdetr::ValidationSampleView, std::shared_ptr<const PredictionPreviewFrame>);
+ [[nodiscard]] mmltk::frameworks::gpu::DeviceContext CaptureContext();
  void Settle(std::uint64_t generation, bool succeeded);
  void Select(ValidationSampleIdentity);
  void CloseDetail();

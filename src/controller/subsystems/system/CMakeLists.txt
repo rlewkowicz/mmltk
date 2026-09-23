@@ -26,6 +26,7 @@ mmltk_register_ordinary_sources(
     detail/cuda_runtime_resources.cpp
     dataset_system.cpp
     ../validate/validation_system.cpp
+    ../validate/detail/validation_sample_output.cpp
     ../validate/detail/validation_samples.cpp
     ../train/training_system.cpp)
 mmltk_register_retained_module_importers(
@@ -39,6 +40,7 @@ mmltk_register_private_headers(
         detail/predict_revision.h
         detail/prediction_playback.h
         detail/prediction_preview.h
+        ../validate/detail/validation_sample_output.h
         ../validate/detail/validation_samples.h)
 target_include_directories(mmltk_controller_data_compute_systems PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(mmltk_controller_data_compute_systems
@@ -89,7 +91,7 @@ function(mmltk_add_controller_subsystems_system_tests)
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/application_data_test_support.h)
     mmltk_configure_component(mmltk_controller_data_compute_systems_tests PRIVATE_DECLARATIONS)
     target_include_directories(mmltk_controller_data_compute_systems_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)
-    target_link_libraries(mmltk_controller_data_compute_systems_tests PRIVATE
+    target_link_libraries(mmltk_controller_data_compute_systems_tests PRIVATE stb
         mmltk_controller_settings_test_support
         mmltk_backend_models_rfdetr_class_artifact_test_support
         mmltk_common_system_test_support

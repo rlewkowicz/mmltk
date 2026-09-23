@@ -2686,3 +2686,11 @@ TEST_CASE("Dataset fitted pixels require the exact narrow compiling frame", "[wo
 }
 
 }  // namespace mmltk::acceptance::wayland
+
+TEST_CASE("validation saved output audit requires six exact published sample identities", "[workspace][audit][output]") {
+ mmltk::acceptance::wayland::BrowserAudit audit;
+ for (unsigned index : {2U,9U,1U,15U,8U,3U}) audit.validation_saved_samples.push_back({{"a",4U},{"b",index},{"c",6U},{"control","output/validate/run-0001/samples"},{"detail","sample-"+std::to_string(index)+".png"}});
+ REQUIRE(audit.validation_samples_complete());
+ audit.validation_saved_samples.back()["b"] = 2U;
+ CHECK_FALSE(audit.validation_samples_complete());
+}
