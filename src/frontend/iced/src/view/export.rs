@@ -217,6 +217,7 @@ impl Component {
     pub fn update(
         &mut self,
         settings: &mut crate::view::settings::SettingsModel,
+        file_dialog: Option<&crate::generated::FileDialogSnapshot>,
         message: Message,
     ) -> Result<Option<Outcome>, String> {
         let outcome = match message {
@@ -227,7 +228,7 @@ impl Component {
             Message::StopRequested => Outcome::StopRequested,
             Message::DialogRequested(id) => Outcome::DialogRequested(id),
             Message::Model(message) => {
-                let Some(outcome) = self.model_card.update(message, settings)? else {
+                let Some(outcome) = self.model_card.update(message, file_dialog, settings)? else {
                     return Ok(None);
                 };
                 Outcome::Model(outcome)
@@ -286,6 +287,7 @@ mod tests {
         assert!(matches!(
             Component::default().update(
                 &mut crate::view::settings::SettingsModel::default(),
+                None,
                 Message::DialogRequested(id)
             ),
             Ok(Some(Outcome::DialogRequested(value))) if value == id
@@ -312,8 +314,8 @@ mod format_tests {
         let selected = model.model_snapshot.clone();
         for onnx in [false, true] {
             for engine in [false, true] {
-                component.update(&mut settings, Message::OnnxChanged(onnx)).unwrap();
-                component.update(&mut settings, Message::TensorRtChanged(engine)).unwrap();
+                component.update(&mut settings, None, Message::OnnxChanged(onnx)).unwrap();
+                component.update(&mut settings, None, Message::TensorRtChanged(engine)).unwrap();
                 let draft = settings.draft.as_ref().unwrap();
                 assert!(model.model_selection_matches(draft, FeatureId::Export));
                 assert_eq!(model.model_snapshot, selected);

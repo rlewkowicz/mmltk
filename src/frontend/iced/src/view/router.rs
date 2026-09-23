@@ -209,37 +209,25 @@ impl Router {
         settings: &mut crate::view::settings::Component,
         message: Message,
     ) -> Result<Option<Outcome>, String> {
-        let model_message = match &message {
-            Message::Train(train::Message::Model(value)) => Some((FeatureId::Train, value)),
-            Message::Validate(validate::Message::Model(value)) => Some((FeatureId::Validate, value)),
-            Message::Predict(predict::Message::Model(value)) => Some((FeatureId::Predict, value)),
-            Message::Export(export::Message::Model(value)) => Some((FeatureId::Export, value)),
-            _ => None,
-        };
-        if let Some((workflow, crate::view::workflow::model_card::Message::ConfirmArtifact { path, generation })) = model_message {
-            if !crate::view::workflow::model_card::confirmation_matches(model, settings.draft(), workflow, path, *generation) {
-                return Err("The custom model confirmation is stale.".to_owned());
-            }
-        }
         let outcome = match message {
             Message::Navigation(message) => match navigation::update(message) {
                 navigation::Outcome::PageSelected(feature) => Outcome::FeatureSelected(feature),
                 navigation::Outcome::SettingsRequested => Outcome::SettingsRequested,
             },
             Message::Train(message) => {
-                let Some(outcome) = self.train.update(settings.state_mut(), message)? else {
+                let Some(outcome) = self.train.update(settings.state_mut(), model.file_dialog.as_ref(), message)? else {
                     return Ok(None);
                 };
                 Outcome::Train(outcome)
             }
             Message::Validate(message) => {
-                let Some(outcome) = self.validate.update(settings.state_mut(), message)? else {
+                let Some(outcome) = self.validate.update(settings.state_mut(), model.file_dialog.as_ref(), message)? else {
                     return Ok(None);
                 };
                 Outcome::Validate(outcome)
             }
             Message::Predict(message) => {
-                let Some(outcome) = self.predict.update(settings.state_mut(), message)? else {
+                let Some(outcome) = self.predict.update(settings.state_mut(), model.file_dialog.as_ref(), message)? else {
                     return Ok(None);
                 };
                 Outcome::Predict(outcome)
@@ -251,7 +239,7 @@ impl Router {
                 Outcome::Live(outcome)
             }
             Message::Export(message) => {
-                let Some(outcome) = self.export.update(settings.state_mut(), message)? else {
+                let Some(outcome) = self.export.update(settings.state_mut(), model.file_dialog.as_ref(), message)? else {
                     return Ok(None);
                 };
                 Outcome::Export(outcome)
@@ -328,6 +316,67 @@ impl Router {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn routed_model_confirmations_share_component_admission_and_reset() {
+        use crate::view::workflow::model_card;
+        use crate::view_model::test_support::{bootstrapped, inadmissible_model_dialogs, selected_model_dialog};
+        let route = |workflow, message| match workflow {
+            FeatureId::Train => Message::Train(train::Message::Model(message)),
+            FeatureId::Validate => Message::Validate(validate::Message::Model(message)),
+            FeatureId::Predict => Message::Predict(predict::Message::Model(message)),
+            FeatureId::Export => Message::Export(export::Message::Model(message)),
+            _ => unreachable!(),
+        };
+        for workflow in [FeatureId::Train, FeatureId::Validate, FeatureId::Predict, FeatureId::Export] {
+            for row in crate::generated::MODEL_SELECTION_COMPATIBILITY_CATALOG.iter()
+                .filter(|row| row.workflow == workflow && row.customallowed) {
+                let mut router = Router::default();
+                let mut model = bootstrapped();
+                let mut settings = crate::view::settings::Component::default();
+                settings.install(model.settings_snapshot.as_ref().unwrap());
+                let path = format!("/tmp/model{}", row.dialogpattern.split_whitespace().next().unwrap().trim_start_matches('*'));
+                // The combined chooser opens on the current input, independently of the selected extension.
+                let dialog = selected_model_dialog(settings.draft().unwrap(), workflow, &path, 7);
+                let confirm = || route(workflow, model_card::Message::ConfirmArtifact { path: path.clone(), generation: 7 });
+                let before = settings.draft().cloned();
+                let queued = settings.state().clone().take_request();
+                for (case, invalid) in inadmissible_model_dialogs(&dialog) {
+                    model.file_dialog = invalid;
+                    assert!(router.update(&mut model, &mut settings, confirm()).is_err(), "{workflow:?}: {case}");
+                    assert_eq!(settings.draft(), before.as_ref(), "{case}");
+                    assert_eq!(settings.state().clone().take_request(), queued, "{case}");
+                }
+                model.file_dialog = Some(dialog.clone());
+                let outcome = router.update(&mut model, &mut settings, confirm()).unwrap();
+                assert!(matches!(outcome,
+                    Some(Outcome::Train(train::Outcome::Model(model_card::Outcome::ArtifactConfirmed(_))))
+                    | Some(Outcome::Validate(validate::Outcome::Model(model_card::Outcome::ArtifactConfirmed(_))))
+                    | Some(Outcome::Predict(predict::Outcome::Model(model_card::Outcome::ArtifactConfirmed(_))))
+                    | Some(Outcome::Export(export::Outcome::Model(model_card::Outcome::ArtifactConfirmed(_))))));
+                let projection = crate::view_model::model_settings_projection(settings.draft().unwrap(), workflow).unwrap();
+                assert_eq!(projection.selection.key.input, row.input);
+                assert_eq!(projection.selection.artifact, path);
+                let confirmed = settings.draft().cloned();
+                let edits = settings.state().clone().take_request();
+                router.update(&mut model, &mut settings, route(workflow, model_card::Message::CancelArtifact(3))).unwrap();
+                router.rebase(workflow, &model);
+                router.select(FeatureId::Explore);
+                router.select(workflow);
+                assert!(router.update(&mut model, &mut settings, confirm()).is_err());
+                assert_eq!(settings.draft(), confirmed.as_ref());
+                assert_eq!(settings.state().clone().take_request(), edits);
+                model.file_dialog = Some(selected_model_dialog(settings.draft().unwrap(), workflow, &path, 8));
+                assert!(router.update(&mut model, &mut settings, route(workflow,
+                    model_card::Message::ConfirmArtifact { path: path.clone(), generation: 8 })).is_ok());
+                // Reset retains the established new-transport generation frontier.
+                router.reset_transport(&model);
+                model.file_dialog = Some(selected_model_dialog(settings.draft().unwrap(), workflow, &path, 1));
+                assert!(router.update(&mut model, &mut settings, route(workflow,
+                    model_card::Message::ConfirmArtifact { path: path.clone(), generation: 1 })).is_ok());
+            }
+        }
+    }
 
     #[test]
     fn persistent_router_accepts_every_generated_feature() {

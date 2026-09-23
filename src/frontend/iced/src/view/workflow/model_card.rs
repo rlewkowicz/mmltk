@@ -64,6 +64,7 @@ impl Component {
     pub fn update(
         &mut self,
         message: Message,
+        file_dialog: Option<&crate::generated::FileDialogSnapshot>,
         settings: &mut crate::view::settings::SettingsModel,
     ) -> Result<Option<Outcome>, String> {
         use crate::view::settings::EditCadence;
@@ -107,13 +108,7 @@ impl Component {
                         ),
                         (
                             projection.fields.key_fields.classlayoutpath,
-                            crate::generated::SettingsFieldValue::String(
-                                if shared_weights_selector(self.workflow) {
-                                    String::new()
-                                } else {
-                                    projection.selection.key.classlayoutpath.clone()
-                                },
-                            ),
+                            crate::generated::SettingsFieldValue::String(String::new()),
                         ),
                     ],
                 )?;
@@ -132,20 +127,21 @@ impl Component {
                 ))
             }
             Message::ConfirmArtifact { path, generation } => {
-                if generation <= self.dismissed_dialog_generation {
-                    return Err("The custom model confirmation is stale.".to_owned());
-                }
                 let workflow = self.workflow;
                 let draft = settings
                     .draft
                     .as_ref()
                     .ok_or_else(|| "Model settings are unavailable.".to_owned())?;
                 let projection = projection(draft, workflow)?;
-                let row = if shared_weights_selector(workflow) {
-                    artifact_row(workflow, &path)?
-                } else {
-                    custom_compatible_row(&projection)?
-                };
+                let opening = dialog_for_row(custom_compatible_row(&projection)?)?;
+                if pending_artifact_selection(
+                    file_dialog,
+                    &opening.target,
+                    self.dismissed_dialog_generation,
+                ) != Some((path.as_str(), generation)) {
+                    return Err("The custom model confirmation is stale.".to_owned());
+                }
+                let row = artifact_row(workflow, &path)?;
                 let dialog = dialog_for_row(row)?;
                 let schedule = settings.edit_fields(
                     EditCadence::Debounced,
@@ -232,9 +228,8 @@ impl<'a> State<'a> {
     ) -> Self {
         let projection = settings
             .and_then(|settings| crate::view_model::model_settings_projection(settings, workflow));
-        let shared_custom_row = projection
+        let custom_row = projection
             .as_ref()
-            .filter(|_| shared_weights_selector(workflow))
             .and_then(|value| custom_compatible_row(value).ok());
         let source = projection
             .as_ref()
@@ -252,7 +247,7 @@ impl<'a> State<'a> {
                 }
             },
             |value| {
-                shared_custom_row
+                custom_row
                     .filter(|_| value.selection.key.input == ModelArtifactInputKind::None)
                     .map_or(value.selection.key.input, |row| row.input)
             },
@@ -263,7 +258,7 @@ impl<'a> State<'a> {
         let artifact_field_id = projection
             .as_ref()
             .and_then(|value| value.artifact_field)
-            .or_else(|| shared_custom_row.and_then(|row| dialog_for_row(row).ok()))
+            .or_else(|| custom_row.and_then(|row| dialog_for_row(row).ok()))
             .map_or(0, |dialog| dialog.stable_field_id);
         let artifact = projection.map_or_else(String::new, |value| value.selection.artifact);
         Self {
@@ -327,20 +322,13 @@ fn custom_compatible_row(
     let workflow = projection.fields.target.workflow;
     compatibility(workflow)
         .find(|row| row.input == projection.selection.key.input && row.customallowed)
-        .or_else(|| {
-            shared_weights_selector(workflow)
-                .then(|| {
-                    compatibility(workflow)
-                        .find(|row| row.customallowed)
-                })
-                .flatten()
-        })
+        .or_else(|| compatibility(workflow).find(|row| row.customallowed))
         .ok_or_else(|| {
             "Generated catalog has no custom row for the current model input.".to_owned()
         })
 }
 
-const fn shared_weights_selector(workflow: FeatureId) -> bool {
+const fn supported_workflow(workflow: FeatureId) -> bool {
     matches!(workflow, FeatureId::Train | FeatureId::Validate | FeatureId::Predict | FeatureId::Export)
 }
 
@@ -490,7 +478,7 @@ pub(crate) fn status_presentation(state: Option<&ModelUiState>) -> StatusPresent
 }
 
 pub(crate) const fn card_title(workflow: FeatureId) -> &'static str {
-    if shared_weights_selector(workflow) {
+    if supported_workflow(workflow) {
         "RF-DETR Weights"
     } else {
         "RF-DETR Model"
@@ -499,7 +487,7 @@ pub(crate) const fn card_title(workflow: FeatureId) -> &'static str {
 
 fn status<'a>(state: Option<&ModelUiState>, workflow: FeatureId) -> Element<'a, Message> {
     let mut status = status_presentation(state);
-    if shared_weights_selector(workflow) && status.tone == StatusTone::Ready {
+    if supported_workflow(workflow) && status.tone == StatusTone::Ready {
         status.detail.clear();
     }
     let label = match status.tone {
@@ -534,30 +522,19 @@ fn status<'a>(state: Option<&ModelUiState>, workflow: FeatureId) -> Element<'a, 
     }
 }
 
-pub(crate) fn confirmation_matches(
-    model: &crate::view_model::ApplicationModel,
-    settings: Option<&crate::generated::GuiSettingsState>,
-    workflow: FeatureId,
-    path: &str,
-    generation: u64,
-) -> bool {
-    let state = State::from_settings(workflow, settings, model.model_snapshot.as_ref(), model.file_dialog.as_ref(), true, false, false);
-    pending_artifact_confirmation(&state, 0).is_some_and(|current| current.0 == path && current.1 == generation)
-}
-
-fn pending_artifact_confirmation(
-    state: &State<'_>,
+fn pending_artifact_selection<'a>(
+    file_dialog: Option<&'a crate::generated::FileDialogSnapshot>,
+    target: &crate::generated::ModelArtifactTarget,
     dismissed_dialog_generation: u64,
-) -> Option<(String, u64)> {
-    let dialog = state.file_dialog.filter(|dialog| {
+) -> Option<(&'a str, u64)> {
+    let dialog = file_dialog.filter(|dialog| {
         !dialog.active
+            && !dialog.cancellationrequested
             && dialog.generation > dismissed_dialog_generation
             && matches!(
                 &dialog.target,
-                crate::generated::FileDialogTarget::ModelArtifactTarget(target)
-                    if target.stableid == state.artifact_field_id
-                        && target.workflow == state.workflow
-                        && target.input == state.input
+                crate::generated::FileDialogTarget::ModelArtifactTarget(current)
+                    if current == target
             )
     })?;
     let selection = dialog.selection.as_ref()?;
@@ -570,7 +547,19 @@ fn pending_artifact_confirmation(
     else {
         return None;
     };
-    Some((selected.path.clone(), dialog.generation))
+    Some((selected.path.as_str(), dialog.generation))
+}
+
+fn pending_artifact_confirmation<'a>(
+    state: &State<'a>,
+    dismissed_dialog_generation: u64,
+) -> Option<(&'a str, u64)> {
+    let target = crate::generated::MODEL_ARTIFACT_DIALOGS.iter().find(|dialog| {
+        dialog.target.workflow == state.workflow
+            && dialog.target.input == state.input
+            && dialog.stable_field_id == state.artifact_field_id
+    })?;
+    pending_artifact_selection(state.file_dialog, &target.target, dismissed_dialog_generation)
 }
 
 fn shared_selector<'a>(
@@ -674,32 +663,27 @@ fn view_with<'a, M: Clone + 'a>(
     } else {
         text(preset_label).into()
     };
-    let artifact: Element<'_, Message> = if shared_weights_selector(state.workflow) {
-        if state.source == ModelSelectionSource::Custom {
-            status_text(if state.artifact.is_empty() {
-                "No custom model selected".to_owned()
-            } else {
-                state.artifact.clone()
-            })
-            .size(12)
-            .into()
+    let artifact: Element<'_, Message> = if state.source == ModelSelectionSource::Custom {
+        status_text(if state.artifact.is_empty() {
+            "No custom model selected".to_owned()
         } else {
-            space::vertical().height(0).into()
-        }
+            state.artifact.clone()
+        })
+        .size(12)
+        .into()
     } else {
         space::vertical().height(0).into()
     };
     let artifact = crate::view::shared::disclosure(
         artifact_id(state.workflow),
-        !shared_weights_selector(state.workflow) || state.source == ModelSelectionSource::Custom,
+        state.source == ModelSelectionSource::Custom,
         artifact,
     )
     .animate_resize();
     let progress: Element<'_, Message> = state.model.map_or_else(
         || status_text("Model state unavailable").size(12).into(),
         |model| {
-            let progress = if shared_weights_selector(state.workflow)
-                && !model.active
+            let progress = if !model.active
                 && model.terminal.outcome == crate::generated::ModelSelectionOutcome::Accepted
             {
                 crate::view::workflow::progress::Presentation::Hidden
@@ -716,15 +700,6 @@ fn view_with<'a, M: Clone + 'a>(
             .on_press_maybe(state.prepare_enabled.then_some(Message::PrepareRequested))
             .style(crate::fluent_theme::button_primary)
     };
-    let mut presets = Some(presets);
-    let weights_selector: Option<Element<'_, Message>> = shared_weights_selector(state.workflow)
-        .then(|| {
-            shared_selector(
-                state.workflow,
-                presets.take().expect("one preset selector"),
-                state.settings_enabled,
-            )
-        });
     let confirmation = pending_artifact_confirmation(&state, dismissed_dialog_generation).map(
         |(path, generation)| {
             crate::view::shared::modal(
@@ -735,22 +710,18 @@ fn view_with<'a, M: Clone + 'a>(
                     text(format!("Workflow: {:?}", state.workflow)),
                     text(format!(
                         "Input: {}",
-                        input_label(if shared_weights_selector(state.workflow) {
-                            artifact_row(state.workflow, &path)
-                                .map_or(state.input, |row| row.input)
-                        } else {
-                            state.input
-                        })
+                        input_label(artifact_row(state.workflow, path)
+                            .map_or(state.input, |row| row.input))
                     )),
                     text(format!(
                         "Preset: {}",
                         state.preset.as_deref().unwrap_or("Unspecified")
                     )),
                     text(format!("Resolution: {preset_resolution}")),
-                    status_text(path.clone()),
+                    status_text(path.to_owned()),
                     row![
                         button("Cancel").on_press(Message::CancelArtifact(generation)),
-                        button("Confirm").on_press(Message::ConfirmArtifact { path, generation }),
+                        button("Confirm").on_press(Message::ConfirmArtifact { path: path.to_owned(), generation }),
                     ]
                     .spacing(8),
                     text("The selected artifact will be verified when you prepare the model."),
@@ -760,9 +731,10 @@ fn view_with<'a, M: Clone + 'a>(
         },
     );
     let title = card_title(state.workflow);
-    let body = if shared_weights_selector(state.workflow) {
+    let body = if supported_workflow(state.workflow) {
+        let weights_selector = shared_selector(state.workflow, presets, state.settings_enabled);
         column![
-            weights_selector.expect("shared weights selector"),
+            weights_selector,
             status(state.model, state.workflow),
             artifact,
             iced::widget::container(progress)
@@ -805,6 +777,28 @@ fn view_with<'a, M: Clone + 'a>(
 mod tests {
     use super::*;
     use crate::view::settings::installed_settings_model;
+    use crate::view_model::test_support::selected_model_dialog;
+
+    #[test]
+    fn unsupported_workflows_construct_the_unavailable_card() {
+        let settings = installed_settings_model();
+        for workflow in [FeatureId::Live, FeatureId::Annotate, FeatureId::Explore] {
+            let card = view(
+                State::from_settings(
+                    workflow,
+                    settings.draft.as_ref(),
+                    None,
+                    None,
+                    true,
+                    false,
+                    false,
+                ),
+                0,
+            );
+            let tree = iced::advanced::widget::Tree::new(&card);
+            assert!(!tree.children.is_empty());
+        }
+    }
 
     #[test]
     fn train_and_validate_have_the_same_common_selector_widget_shape() {
@@ -842,6 +836,42 @@ mod tests {
     }
 
     #[test]
+    fn component_admits_only_its_current_settled_selection() {
+        for workflow in [FeatureId::Train, FeatureId::Validate, FeatureId::Predict, FeatureId::Export] {
+            let mut settings = installed_settings_model();
+            let mut component = Component::new(workflow);
+            let path = "/tmp/model.pt";
+            let dialog = selected_model_dialog(settings.draft.as_ref().unwrap(), workflow, path, 7);
+            let confirm = || Message::ConfirmArtifact { path: path.into(), generation: 7 };
+            let before = settings.draft.clone();
+            let queued = settings.clone().take_request();
+            for (case, invalid) in crate::view_model::test_support::inadmissible_model_dialogs(&dialog) {
+                assert!(component.update(confirm(), invalid.as_ref(), &mut settings).is_err(), "{case}");
+                assert_eq!(settings.draft, before, "{case}");
+                assert_eq!(settings.clone().take_request(), queued, "{case}");
+                assert_eq!(component.dismissed_dialog_generation, 0, "{case}");
+            }
+            // Unavailable settings must leave the selection available for retry.
+            settings.draft = None;
+            assert!(component.update(confirm(), Some(&dialog), &mut settings).is_err());
+            assert_eq!(component.dismissed_dialog_generation, 0);
+            assert_eq!(settings.clone().take_request(), queued);
+            settings.draft = before;
+            let state = State::from_settings(workflow, settings.draft.as_ref(), None, Some(&dialog), true, false, false);
+            assert_eq!(pending_artifact_confirmation(&state, 0), Some((path, 7)));
+            assert!(matches!(component.update(confirm(), Some(&dialog), &mut settings).unwrap(), Some(Outcome::ArtifactConfirmed(_))));
+            let confirmed = settings.draft.clone();
+            let edits = settings.clone().take_request();
+            component.update(Message::CancelArtifact(3), Some(&dialog), &mut settings).unwrap();
+            component.rebase(&crate::view_model::ApplicationModel::default(), workflow);
+            assert!(component.update(confirm(), Some(&dialog), &mut settings).is_err());
+            assert_eq!(component.dismissed_dialog_generation, 7);
+            assert_eq!(settings.draft, confirmed);
+            assert_eq!(settings.clone().take_request(), edits);
+        }
+    }
+
+    #[test]
     fn only_successful_confirmation_emits_the_distinct_selection_outcome() {
         for workflow in [FeatureId::Train, FeatureId::Validate, FeatureId::Predict, FeatureId::Export] {
             let mut component = Component::new(workflow);
@@ -854,7 +884,7 @@ mod tests {
                                 path: "/tmp/same.pt".into(),
                                 generation,
                             },
-                            &mut settings
+                            Some(&selected_model_dialog(settings.draft.as_ref().unwrap(), component.workflow, "/tmp/same.pt", generation)), &mut settings
                         )
                         .unwrap(),
                     Some(Outcome::ArtifactConfirmed(_))
@@ -864,7 +894,7 @@ mod tests {
             let queued = settings.queued_len();
             assert!(
                 component
-                    .update(Message::CancelArtifact(3), &mut settings)
+                    .update(Message::CancelArtifact(3), None, &mut settings)
                     .unwrap()
                     .is_none()
             );
@@ -875,13 +905,13 @@ mod tests {
                             path: "/tmp/invalid.txt".into(),
                             generation: 4,
                         },
-                        &mut settings
+                        Some(&selected_model_dialog(settings.draft.as_ref().unwrap(), component.workflow, "/tmp/invalid.txt", 4)), &mut settings
                     )
                     .is_err()
             );
             assert_eq!(settings.draft, before);
             assert_eq!(settings.queued_len(), queued);
-            assert!(component.update(Message::ConfirmArtifact { path: "/tmp/stale.pt".into(), generation: 2 }, &mut settings).is_err());
+            assert!(component.update(Message::ConfirmArtifact { path: "/tmp/stale.pt".into(), generation: 2 }, Some(&selected_model_dialog(settings.draft.as_ref().unwrap(), component.workflow, "/tmp/stale.pt", 2)), &mut settings).is_err());
             assert_eq!(settings.draft, before);
             assert_eq!(settings.queued_len(), queued);
         }
@@ -890,7 +920,7 @@ mod tests {
     #[test]
     fn common_selector_infers_each_native_extension_without_companion_leakage() {
         for workflow in [FeatureId::Train, FeatureId::Validate, FeatureId::Predict, FeatureId::Export] {
-            assert!(shared_weights_selector(workflow));
+            assert!(supported_workflow(workflow));
             assert_eq!(card_title(workflow), "RF-DETR Weights");
             let mut component = Component::new(workflow);
             let mut settings = installed_settings_model();
@@ -914,7 +944,7 @@ mod tests {
                                 path: path.clone(),
                                 generation,
                             },
-                            &mut settings,
+                            Some(&selected_model_dialog(settings.draft.as_ref().unwrap(), component.workflow, &path, generation)), &mut settings,
                         )
                         .unwrap();
                     let selected = projection(settings.draft.as_ref().unwrap(), workflow).unwrap();
@@ -923,6 +953,17 @@ mod tests {
                     assert!(selected.selection.key.classlayoutpath.is_empty());
                 }
             }
+            let fields = projection(settings.draft.as_ref().unwrap(), workflow).unwrap().fields;
+            crate::generated::apply_settings_field(
+                settings.draft.as_mut().unwrap(),
+                fields.key_fields.classlayoutpath,
+                crate::generated::SettingsFieldValue::String("/old/classes.json".into()),
+            ).unwrap();
+            assert!(matches!(component.update(Message::PresetSelected(0), None, &mut settings).unwrap(),
+                Some(Outcome::SettingsEdited(_))));
+            let preset = projection(settings.draft.as_ref().unwrap(), workflow).unwrap();
+            assert_eq!(preset.selection.key.source, ModelSelectionSource::Canonical);
+            assert!(preset.selection.key.classlayoutpath.is_empty());
             let before = settings.draft.clone();
             assert!(
                 component
@@ -931,7 +972,7 @@ mod tests {
                             path: "/tmp/model.txt".into(),
                             generation: 2
                         },
-                        &mut settings
+                        Some(&selected_model_dialog(settings.draft.as_ref().unwrap(), component.workflow, "/tmp/model.txt", 2)), &mut settings
                     )
                     .is_err()
             );
@@ -944,8 +985,8 @@ mod tests {
                 .input,
             ModelArtifactInputKind::Onnx
         );
-        assert!(shared_weights_selector(FeatureId::Predict));
-        assert!(shared_weights_selector(FeatureId::Export));
+        assert!(supported_workflow(FeatureId::Predict));
+        assert!(supported_workflow(FeatureId::Export));
     }
 
     #[test]
@@ -954,7 +995,7 @@ mod tests {
         assert_eq!(compatibility(FeatureId::Export).count(), 1);
         let mut settings = crate::view::settings::SettingsModel::default();
         assert!(matches!(
-            Component::new(FeatureId::Train).update(Message::PrepareRequested, &mut settings),
+            Component::new(FeatureId::Train).update(Message::PrepareRequested, None, &mut settings),
             Ok(Some(Outcome::PrepareRequested))
         ));
         assert_eq!(stable_id(FeatureId::Train), "train.card.model");
@@ -966,7 +1007,7 @@ mod tests {
         let mut settings = installed_settings_model();
         let mut component = Component::new(FeatureId::Train);
         let browse = component
-            .update(Message::BrowseRequested, &mut settings)
+            .update(Message::BrowseRequested, None, &mut settings)
             .unwrap();
         assert!(matches!(
             browse,
@@ -980,7 +1021,7 @@ mod tests {
                     path: "/tmp/custom.pth".into(),
                     generation: 1,
                 },
-                &mut settings,
+                Some(&selected_model_dialog(settings.draft.as_ref().unwrap(), component.workflow, "/tmp/custom.pth", 1)), &mut settings,
             )
             .unwrap();
         let selected = projection(settings.draft.as_ref().unwrap(), FeatureId::Train).unwrap();
@@ -1066,7 +1107,7 @@ mod tests {
                         path: "/tmp/model.pt".into(),
                         generation: 1,
                     },
-                    &mut settings,
+                    Some(&selected_model_dialog(settings.draft.as_ref().unwrap(), canonical.workflow, "/tmp/model.pt", 1)), &mut settings,
                 )
                 .unwrap();
             let selected =
@@ -1084,7 +1125,7 @@ mod tests {
                             path: "/tmp/model".into(),
                             generation: 1,
                         },
-                        &mut settings,
+                        Some(&selected_model_dialog(settings.draft.as_ref().unwrap(), canonical.workflow, "/tmp/model", 1)), &mut settings,
                     )
                     .is_err()
             );
@@ -1120,7 +1161,7 @@ mod tests {
                         path: "/tmp/model".into(),
                         generation: 1,
                     },
-                    &mut settings,
+                    Some(&selected_model_dialog(settings.draft.as_ref().unwrap(), custom.workflow, "/tmp/model", 1)), &mut settings,
                 )
                 .is_err()
         );
@@ -1142,7 +1183,7 @@ mod tests {
                             path: "/tmp/model".into(),
                             generation: 1,
                         },
-                        &mut settings,
+                        Some(&selected_model_dialog(settings.draft.as_ref().unwrap(), unsupported.workflow, "/tmp/model", 1)), &mut settings,
                     )
                     .is_err()
             );
@@ -1165,7 +1206,7 @@ mod tests {
                     path: "/tmp/model.pt".into(),
                     generation: 7,
                 },
-                &mut settings,
+                Some(&selected_model_dialog(settings.draft.as_ref().unwrap(), component.workflow, "/tmp/model.pt", 7)), &mut settings,
             )
             .unwrap();
         component.rebase(
@@ -1173,29 +1214,8 @@ mod tests {
             FeatureId::Train,
         );
         assert_eq!(component.dismissed_dialog_generation, 7);
-        let fact = projection(settings.draft.as_ref().unwrap(), FeatureId::Train)
-            .unwrap()
-            .artifact_field
-            .unwrap();
         let snapshot = |generation, path: &str| {
-            crate::generated::FileDialogSnapshot {
-            generation,
-            active: false,
-            cancellationrequested: false,
-            target: crate::generated::FileDialogTarget::ModelArtifactTarget(
-                fact.target.clone(),
-            ),
-            selection: Some(crate::generated::FileDialogSelection {
-                target: crate::generated::FileDialogTarget::ModelArtifactTarget(
-                    fact.target.clone(),
-                ),
-                result: crate::generated::FileDialogCancelledOrFileDialogSelectedVariant::FileDialogSelected(
-                    crate::generated::FileDialogSelected {
-                        path: path.into(),
-                    },
-                ),
-            }),
-        }
+            selected_model_dialog(settings.draft.as_ref().unwrap(), FeatureId::Train, path, generation)
         };
         let settled = snapshot(7, "/tmp/model.pt");
         let state = State::from_settings(

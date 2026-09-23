@@ -184,6 +184,89 @@ pub(crate) fn annotation_object(category: u16) -> crate::generated::AnnotationOb
     }
 }
 
+pub(crate) fn selected_model_dialog(
+    settings: &GuiSettingsState,
+    workflow: FeatureId,
+    path: &str,
+    generation: u64,
+) -> crate::generated::FileDialogSnapshot {
+    let projection = model_settings_projection(settings, workflow).unwrap();
+    let row = crate::generated::MODEL_SELECTION_COMPATIBILITY_CATALOG.iter()
+        .filter(|row| row.workflow == workflow && row.customallowed)
+        .find(|row| row.input == projection.selection.key.input)
+        .or_else(|| crate::generated::MODEL_SELECTION_COMPATIBILITY_CATALOG.iter()
+            .find(|row| row.workflow == workflow && row.customallowed))
+        .expect("custom model compatibility");
+    let fact = crate::generated::MODEL_ARTIFACT_DIALOGS.iter().find(|fact| {
+        fact.target.workflow == workflow && fact.target.input == row.input
+            && fact.field_path == row.artifactfieldpath
+    }).expect("generated model dialog");
+    let target = crate::generated::FileDialogTarget::ModelArtifactTarget(fact.target.clone());
+    crate::generated::FileDialogSnapshot {
+        generation,
+        active: false,
+        cancellationrequested: false,
+        target: target.clone(),
+        selection: Some(crate::generated::FileDialogSelection {
+            target,
+            result: crate::generated::FileDialogCancelledOrFileDialogSelectedVariant::FileDialogSelected(
+                crate::generated::FileDialogSelected { path: path.into() },
+            ),
+        }),
+    }
+}
+
+pub(crate) fn inadmissible_model_dialogs(
+    selected: &crate::generated::FileDialogSnapshot,
+) -> Vec<(&'static str, Option<crate::generated::FileDialogSnapshot>)> {
+    let mut cases = vec![("missing dialog", None)];
+    let mut variant = |label, change: fn(&mut crate::generated::FileDialogSnapshot)| {
+        let mut snapshot = selected.clone();
+        change(&mut snapshot);
+        cases.push((label, Some(snapshot)));
+    };
+    variant("active", |dialog| dialog.active = true);
+    variant("cancellation requested", |dialog| dialog.cancellationrequested = true);
+    variant("missing selection", |dialog| dialog.selection = None);
+    variant("cancelled", |dialog| {
+        dialog.selection.as_mut().unwrap().result =
+            crate::generated::FileDialogCancelledOrFileDialogSelectedVariant::FileDialogCancelled(
+                crate::generated::FileDialogCancelled {},
+            );
+    });
+    variant("stale event", |dialog| dialog.generation += 1);
+    variant("stale snapshot", |dialog| dialog.generation -= 1);
+    variant("path mismatch", |dialog| {
+        let crate::generated::FileDialogCancelledOrFileDialogSelectedVariant::FileDialogSelected(value) =
+            &mut dialog.selection.as_mut().unwrap().result else { unreachable!() };
+        value.path.push_str(".other");
+    });
+    variant("selection target mismatch", |dialog| {
+        let crate::generated::FileDialogTarget::ModelArtifactTarget(target) =
+            &mut dialog.selection.as_mut().unwrap().target else { unreachable!() };
+        target.stableid = 0;
+    });
+    variant("stable field mismatch", |dialog| {
+        let crate::generated::FileDialogTarget::ModelArtifactTarget(target) =
+            &mut dialog.target else { unreachable!() };
+        target.stableid = 0;
+        dialog.selection.as_mut().unwrap().target = dialog.target.clone();
+    });
+    variant("workflow mismatch", |dialog| {
+        let crate::generated::FileDialogTarget::ModelArtifactTarget(target) =
+            &mut dialog.target else { unreachable!() };
+        target.workflow = FeatureId::Explore;
+        dialog.selection.as_mut().unwrap().target = dialog.target.clone();
+    });
+    variant("input mismatch", |dialog| {
+        let crate::generated::FileDialogTarget::ModelArtifactTarget(target) =
+            &mut dialog.target else { unreachable!() };
+        target.input = crate::generated::ModelArtifactInputKind::None;
+        dialog.selection.as_mut().unwrap().target = dialog.target.clone();
+    });
+    cases
+}
+
 pub(crate) fn accepted_model_for(
     model: &ApplicationModel,
     settings: &GuiSettingsState,

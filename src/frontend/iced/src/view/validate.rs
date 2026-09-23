@@ -277,6 +277,7 @@ impl Component {
     pub fn update(
         &mut self,
         settings: &mut crate::view::settings::SettingsModel,
+        file_dialog: Option<&crate::generated::FileDialogSnapshot>,
         message: Message,
     ) -> Result<Option<Outcome>, String> {
         let outcome = match message {
@@ -295,7 +296,7 @@ impl Component {
             // CLEANUP-IGNORE: Validate maps its dialog identity before the distinct model-card child outcome.
             Message::DialogRequested(id) => Outcome::DialogRequested(id),
             Message::Model(message) => {
-                let Some(outcome) = self.model_card.update(message, settings)? else {
+                let Some(outcome) = self.model_card.update(message, file_dialog, settings)? else {
                     return Ok(None);
                 };
                 Outcome::Model(outcome)
@@ -339,7 +340,7 @@ mod tests {
             let Some(Outcome::SettingsEdited(crate::view::settings::EditSchedule::Debounce(
                 generation,
             ))) = component
-                .update(&mut settings, Message::DisplayConfidenceChanged(value))
+                .update(&mut settings, None, Message::DisplayConfidenceChanged(value))
                 .unwrap()
             else {
                 panic!("shared debounce");
@@ -375,7 +376,7 @@ mod tests {
         ] {
             assert!(
                 component
-                    .update(&mut settings, Message::Samples(message))
+                    .update(&mut settings, None, Message::Samples(message))
                     .unwrap()
                     .is_none()
             );
@@ -385,7 +386,7 @@ mod tests {
             datasetindex: 42,
         };
         assert!(
-            matches!(component.update(&mut settings, Message::Samples(samples::Message::Select(identity.clone()))).unwrap(),
+            matches!(component.update(&mut settings, None, Message::Samples(samples::Message::Select(identity.clone()))).unwrap(),
             Some(Outcome::Sample(samples::Message::Select(actual))) if actual == identity)
         );
     }
@@ -395,6 +396,7 @@ mod tests {
         assert!(matches!(
             Component::default().update(
                 &mut crate::view::settings::SettingsModel::default(),
+                None,
                 Message::StartRequested
             ),
             Ok(Some(Outcome::StartRequested))

@@ -156,6 +156,7 @@ impl Component {
     pub fn update(
         &mut self,
         model: &mut SettingsModel,
+        file_dialog: Option<&crate::generated::FileDialogSnapshot>,
         message: Message,
     ) -> Result<Option<Outcome>, String> {
         let outcome = match message {
@@ -182,7 +183,7 @@ impl Component {
                 Outcome::SettingsEdited(advanced::update(model, message)?)
             }
             Message::Model(message) => {
-                let Some(outcome) = self.model_card.update(message, model)? else {
+                let Some(outcome) = self.model_card.update(message, file_dialog, model)? else {
                     return Ok(None);
                 };
                 Outcome::Model(outcome)
@@ -444,12 +445,12 @@ mod tests {
         let mut model = installed_settings_model();
         let mut component = Component::default();
         assert!(matches!(
-            component.update(&mut model, Message::Dataset(dataset::Message::Compile)),
+            component.update(&mut model, None, Message::Dataset(dataset::Message::Compile)),
             Ok(Some(Outcome::CompileRequested))
         ));
         assert!(matches!(
             component.update(
-                &mut model,
+                &mut model, None,
                 Message::Model(crate::view::workflow::model_card::Message::PrepareRequested)
             ),
             Ok(Some(Outcome::Model(
@@ -457,11 +458,11 @@ mod tests {
             )))
         ));
         assert!(matches!(
-            component.update(&mut model, Message::ClearOffersRequested),
+            component.update(&mut model, None, Message::ClearOffersRequested),
             Ok(Some(Outcome::ClearOffersRequested))
         ));
         assert!(matches!(
-            component.update(&mut model, Message::RetryReconciliationRequested),
+            component.update(&mut model, None, Message::RetryReconciliationRequested),
             Ok(Some(Outcome::RetryReconciliationRequested))
         ));
     }
@@ -475,7 +476,7 @@ mod tests {
             .expect("generated preset catalog");
         assert!(matches!(
             component.update(
-                &mut model,
+                &mut model, None,
                 Message::Model(crate::view::workflow::model_card::Message::PresetSelected(
                     0,
                 )),
@@ -499,9 +500,12 @@ mod tests {
         );
 
         let draft = "/tmp/selected-model.safetensors".to_owned();
+        let dialog = crate::view_model::test_support::selected_model_dialog(
+            model.draft.as_ref().unwrap(), FeatureId::Train, &draft, 1,
+        );
         component
             .update(
-                &mut model,
+                &mut model, Some(&dialog),
                 Message::Model(
                     crate::view::workflow::model_card::Message::ConfirmArtifact {
                         path: draft.clone(),
