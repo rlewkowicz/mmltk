@@ -282,11 +282,11 @@ void ProgressReporter::source_transfer(const DownloadProgress& update, const Ben
  const auto source = update.source;
  auto& progress = source_progress(source);
  std::string operation;
- if (update.cache_hit) {
+ if (update.transfer.cache_hit) {
   operation = "Reusing cached ";
  } else {
   switch (update.phase) {
-   case DownloadProgressPhase::kDownloading: operation = update.redownload ? (update.resumed ? "Resuming re-download of " : "Re-downloading ") : (update.resumed ? "Resuming " : "Downloading "); break;
+   case DownloadProgressPhase::kDownloading: operation = update.redownload ? (update.transfer.resumed ? "Resuming re-download of " : "Re-downloading ") : (update.transfer.resumed ? "Resuming " : "Downloading "); break;
    case DownloadProgressPhase::kVerifyingCachedArtifact: operation = "Verifying cached "; break;
    case DownloadProgressPhase::kVerifyingDownloadedArtifact: operation = "Verifying downloaded "; break;
   }
@@ -299,8 +299,7 @@ void ProgressReporter::source_transfer(const DownloadProgress& update, const Ben
  }
  progress.complete = false;
  progress.activity = operation.substr(0, kDatasetCompileProgressTextCapacity);
- progress.transfer = BenchmarkTransferProgress{.completed_bytes = update.completed_bytes, .total_bytes = update.total_bytes,
-  .retained_bytes = update.retained_bytes, .attempt = update.attempt, .cache_hit = update.cache_hit, .resumed = update.resumed};
+ progress.transfer = update.transfer;
  progress.completed_bytes = aggregate.completed_bytes;
  progress.total_bytes = aggregate.total_bytes;
  progress.byte_total_known = aggregate.byte_total_known;
@@ -409,15 +408,15 @@ void ArtifactProgressTotals::update(const DownloadProgress& update, ProgressRepo
  const auto previous = totals.artifacts.find(update.artifact_id);
  const bool observed = previous != totals.artifacts.end();
  const Observation old = observed ? previous->second : Observation{};
- const auto completed = replace_progress(totals.completed, old.completed, update.completed_bytes);
- const auto known_total = replace_progress(totals.known_total, old.total, update.total_bytes);
- const auto unknown_count = replace_progress(totals.unknown_count, observed && old.total == 0U ? 1U : 0U, update.total_bytes == 0U ? 1U : 0U);
- const auto retries = std::max(old.retries, update.attempt > 0 ? static_cast<std::uint64_t>(update.attempt - 1U) : 0U);
- const bool resumed = old.resumed || update.resumed;
+ const auto completed = replace_progress(totals.completed, old.completed, update.transfer.completed_bytes);
+ const auto known_total = replace_progress(totals.known_total, old.total, update.transfer.total_bytes);
+ const auto unknown_count = replace_progress(totals.unknown_count, observed && old.total == 0U ? 1U : 0U, update.transfer.total_bytes == 0U ? 1U : 0U);
+ const auto retries = std::max(old.retries, update.transfer.attempt > 0 ? static_cast<std::uint64_t>(update.transfer.attempt - 1U) : 0U);
+ const bool resumed = old.resumed || update.transfer.resumed;
  const auto source_retries = replace_progress(totals.retries, old.retries, retries);
  const auto source_resumed = replace_progress(totals.resumed, old.resumed, resumed);
- const auto source_cached = replace_progress(totals.cached, old.cached, update.cache_hit);
- totals.artifacts.insert_or_assign(update.artifact_id, Observation{update.completed_bytes, update.total_bytes, retries, resumed, update.cache_hit});
+ const auto source_cached = replace_progress(totals.cached, old.cached, update.transfer.cache_hit);
+ totals.artifacts.insert_or_assign(update.artifact_id, Observation{update.transfer.completed_bytes, update.transfer.total_bytes, retries, resumed, update.transfer.cache_hit});
  totals.retries = source_retries;
  totals.resumed = source_resumed;
  totals.cached = source_cached;

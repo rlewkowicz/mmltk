@@ -12,6 +12,7 @@
 #include <fcntl.h>
 #include <fstream>
 #include <iterator>
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <catch2/catch_test_macros.hpp>
@@ -336,6 +337,10 @@ TEST_CASE("dataset admits real open ended acquisition and successful HTTP recove
   (void)download_artifacts({request}, 1U, {}, [&](const auto& update) {
    transfers.push_back(update);
    totals.update(update, reporter);
+   const auto current = std::ranges::find(produced.back().sources, update.source, &data::BenchmarkSourceProgress::source);
+   REQUIRE(current != produced.back().sources.end());
+   REQUIRE(current->transfer);
+   CHECK(*current->transfer == update.transfer);
   });
  };
  DatasetSystem dataset{settings, [&] { return std::make_unique<AcquisitionDatasetRuntime>(work); },
@@ -388,10 +393,10 @@ TEST_CASE("dataset admits real open ended acquisition and successful HTTP recove
  CHECK(delivered.back().tracks.acquisition.total == delivered.back().tracks.acquisition.completed);
  REQUIRE_FALSE(transfers.empty());
  for (const auto& transfer : transfers) {
-  CHECK(transfer.completed_bytes <= payload.size());
-  if (retry && transfer.attempt == 1U) CHECK(transfer.completed_bytes == 0U);
+  CHECK(transfer.transfer.completed_bytes <= payload.size());
+  if (retry && transfer.transfer.attempt == 1U) CHECK(transfer.transfer.completed_bytes == 0U);
  }
- CHECK(transfers.back().attempt == (retry ? 2U : 1U));
+ CHECK(transfers.back().transfer.attempt == (retry ? 2U : 1U));
  CHECK(mmltk::common::io::sha256_file(request.destination) == mmltk::common::io::sha256_bytes(payload));
  CHECK(read_json_file(request.destination.string() + ".download.json").at("size") == payload.size());
  server.Check();

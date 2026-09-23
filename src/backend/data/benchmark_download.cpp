@@ -480,7 +480,7 @@ struct Transfer {
  void emit_progress(const std::uint64_t completed, const std::uint64_t total, const std::uint64_t durable) const {
   const std::uint64_t retained = response_restarted ? 0U : resume_offset;
   const bool retained_resume = resumed && !response_restarted;
-  if (progress) { progress(DownloadProgress{request.artifact_id, completed, total, attempt, retained_resume, false, DownloadProgressPhase::kDownloading, retained, redownload, request.source}); }
+  if (progress) { progress(DownloadProgress{request.artifact_id, {completed, total, retained, attempt, false, retained_resume}, DownloadProgressPhase::kDownloading, redownload, request.source}); }
   trace_transfer_progress(trace, request, completed, total, attempt, retained_resume, retained, durable, redownload);
  }
  [[nodiscard]] const std::string& effective_etag() const noexcept { return !response_headers_valid || http.etag.empty() ? resume_etag : http.etag; }
@@ -726,7 +726,7 @@ private:
   if (force || completed <= request_.expected_size) {
    if (progress_) {
     progress_(DownloadProgress{
-     request_.artifact_id, completed, request_.expected_size, attempts, retained_bytes_ != 0U, false, DownloadProgressPhase::kDownloading, retained_bytes_, request_.redownload, request_.source});
+     request_.artifact_id, {completed, request_.expected_size, retained_bytes_, attempts, false, retained_bytes_ != 0U}, DownloadProgressPhase::kDownloading, request_.redownload, request_.source});
    }
    trace_transfer_progress(trace_, request_, completed, request_.expected_size, attempts, retained_bytes_ != 0U, retained_bytes_, durable, request_.redownload);
   }
@@ -1021,13 +1021,8 @@ std::vector<DownloadResult> download_artifacts(const std::vector<DownloadRequest
    if (progress) {
     progress(DownloadProgress{
      requests[index].artifact_id,
-     completed_result.size,
-     completed_result.size,
-     completed_result.attempts,
-     false,
-     true,
+     {completed_result.size, completed_result.size, 0U, completed_result.attempts, true, false},
      DownloadProgressPhase::kDownloading,
-     0U,
      requests[index].redownload,
      requests[index].source,
     });

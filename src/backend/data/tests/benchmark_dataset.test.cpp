@@ -180,7 +180,7 @@ void test_benchmark_download_cache_lifecycle() {
  const auto retry_result = download_artifacts({retry}, 1U, {}, [&](const auto& update) { retry_updates.push_back(update); });
  REQUIRE(retry_result.size() == 1U);
  REQUIRE(retry_result[0].attempts == 2U);
- CHECK(std::ranges::any_of(retry_updates, [](const auto& update) { return update.attempt == 2U && update.completed_bytes > 0U; }));
+ CHECK(std::ranges::any_of(retry_updates, [](const auto& update) { return update.transfer.attempt == 2U && update.transfer.completed_bytes > 0U; }));
  DownloadRequest resume = request_for(root.path(), "resume", server.url("resume"), payload);
  std::atomic<bool> cancel{false};
  server.GateNextTransfer();
@@ -188,7 +188,7 @@ void test_benchmark_download_cache_lifecycle() {
  auto download = std::async(std::launch::async, [&] {
   try {
    (void)download_artifacts({resume}, 1U, mmltk::common::concurrency::CancellationObservation::Atomic(cancel), [&](const DownloadProgress& progress) {
-    if (progress.completed_bytes >= HttpServer::partial_bytes) received.receipt().ArriveAndWait();
+    if (progress.transfer.completed_bytes >= HttpServer::partial_bytes) received.receipt().ArriveAndWait();
    });
    return false;
   } catch (const std::exception&) { return true; }
@@ -213,11 +213,11 @@ void test_benchmark_download_cache_lifecycle() {
  resume.source = BenchmarkDatasetSource::kCoco2017;
  const auto resumed = download_artifacts({resume}, 1U, mmltk::common::concurrency::CancellationObservation::Atomic(cancel), [&](const auto& update) { resumed_updates.push_back(update); });
  REQUIRE_FALSE(resumed_updates.empty());
- CHECK(std::ranges::any_of(resumed_updates, [](const auto& update) { return update.resumed && update.retained_bytes == HttpServer::partial_bytes && update.completed_bytes > update.retained_bytes; }));
+ CHECK(std::ranges::any_of(resumed_updates, [](const auto& update) { return update.transfer.resumed && update.transfer.retained_bytes == HttpServer::partial_bytes && update.transfer.completed_bytes > update.transfer.retained_bytes; }));
  for (const auto& update : resumed_updates) {
-  CHECK(update.completed_bytes >= HttpServer::partial_bytes);
-  CHECK(update.completed_bytes <= payload.size());
-  CHECK(update.total_bytes == payload.size());
+  CHECK(update.transfer.completed_bytes >= HttpServer::partial_bytes);
+  CHECK(update.transfer.completed_bytes <= payload.size());
+  CHECK(update.transfer.total_bytes == payload.size());
  }
  REQUIRE(resumed[0].resumed);
  REQUIRE(server.ranged_requests() > 0U);
@@ -1567,8 +1567,8 @@ TEST_CASE("segmented downloads retain durable ranges through failure cancellatio
   updates.push_back(progress);
  }));
  REQUIRE_FALSE(updates.empty());
- CHECK(std::ranges::all_of(updates, [](const DownloadProgress& progress) { return progress.total_bytes == bytes && progress.completed_bytes <= bytes; }));
- CHECK(std::ranges::any_of(updates, [](const DownloadProgress& progress) { return progress.completed_bytes > 0U; }));
+ CHECK(std::ranges::all_of(updates, [](const DownloadProgress& progress) { return progress.transfer.total_bytes == bytes && progress.transfer.completed_bytes <= bytes; }));
+ CHECK(std::ranges::any_of(updates, [](const DownloadProgress& progress) { return progress.transfer.completed_bytes > 0U; }));
  REQUIRE_FALSE(fs::exists(request.destination));
  REQUIRE(fs::file_size(request.destination.string() + ".part") == bytes);
  const auto metadata_path = request.destination.string() + ".part.json";
@@ -1674,10 +1674,10 @@ TEST_CASE("transfer observers are independent of trace-only pixel observers", "[
  ProgressReporter traced({}, trace);
  CHECK_FALSE(traced.transfer_observer_enabled());
  CHECK(traced.pixel_observer_enabled());
- traced.transfers().update(DownloadProgress{"coco-fixture", 1U, 2U, 2U}, traced);
+ traced.transfers().update(DownloadProgress{"coco-fixture", {.completed_bytes = 1U, .total_bytes = 2U, .attempt = 2U}}, traced);
  CHECK(traces == 0U);
  ArtifactProgressTotals unobserved_totals;
- unobserved_totals.update(DownloadProgress{.artifact_id = "unobserved", .completed_bytes = 1U, .source = static_cast<BenchmarkDatasetSource>(255U)}, traced);
+ unobserved_totals.update(DownloadProgress{.artifact_id = "unobserved", .transfer = {.completed_bytes = 1U}, .source = static_cast<BenchmarkDatasetSource>(255U)}, traced);
  CHECK(traces == 0U);
  traced.pixels(0U, 1U);
  traced.pixel_completed();
@@ -1687,7 +1687,7 @@ TEST_CASE("transfer observers are independent of trace-only pixel observers", "[
  CHECK(observed.transfer_observer_enabled());
  CHECK(observed.pixel_observer_enabled());
  observed.phase(DatasetCompilePhase::Downloading);
- observed.transfers().update(DownloadProgress{"coco-fixture", 5U, 11U, 3U, true}, observed);
+ observed.transfers().update(DownloadProgress{"coco-fixture", {.completed_bytes = 5U, .total_bytes = 11U, .attempt = 3U, .resumed = true}}, observed);
  REQUIRE_FALSE(updates.empty());
  CHECK(updates.back().sources[0].completed_bytes == 5U);
  CHECK(updates.back().sources[0].total_bytes == 11U);
@@ -2097,26 +2097,26 @@ TEST_CASE("fresh segmented retries expose newly durable ranges without counting 
  CHECK(std::ranges::all_of(updates, [](const auto& update) { return update.source == BenchmarkDatasetSource::kObjects365V2; }));
  REQUIRE(downloaded.size() == 1U);
  REQUIRE_FALSE(updates.empty());
- CHECK(updates.front().completed_bytes == 0U);
- CHECK(updates.front().retained_bytes == 0U);
- CHECK_FALSE(updates.front().resumed);
+ CHECK(updates.front().transfer.completed_bytes == 0U);
+ CHECK(updates.front().transfer.retained_bytes == 0U);
+ CHECK_FALSE(updates.front().transfer.resumed);
  bool saw_retry = false;
  std::uint64_t previous = 0U;
  for (const auto& update : updates) {
-  CHECK(update.completed_bytes >= previous);
-  CHECK(update.completed_bytes <= bytes);
-  CHECK(update.total_bytes == bytes);
-  CHECK(update.retained_bytes <= update.completed_bytes);
+  CHECK(update.transfer.completed_bytes >= previous);
+  CHECK(update.transfer.completed_bytes <= bytes);
+  CHECK(update.transfer.total_bytes == bytes);
+  CHECK(update.transfer.retained_bytes <= update.transfer.completed_bytes);
   CHECK_FALSE(update.redownload);
-  if (update.attempt > 1U) {
+  if (update.transfer.attempt > 1U) {
    saw_retry = true;
-   CHECK(update.resumed);
-   CHECK(update.retained_bytes >= HttpServer::partial_bytes);
+   CHECK(update.transfer.resumed);
+   CHECK(update.transfer.retained_bytes >= HttpServer::partial_bytes);
   }
-  previous = update.completed_bytes;
+  previous = update.transfer.completed_bytes;
  }
  CHECK(saw_retry);
- CHECK(updates.back().completed_bytes == bytes);
+ CHECK(updates.back().transfer.completed_bytes == bytes);
  CHECK(has_generated_payload(request.destination, bytes));
  server.Check();
 }
@@ -2138,8 +2138,8 @@ TEST_CASE("discarded segmented state retains the typed re-download context durin
   [&](const DownloadProgress& update) {
    if (update.redownload) {
     saw_redownload = true;
-    CHECK(update.retained_bytes == 0U);
-    CHECK_FALSE(update.resumed);
+    CHECK(update.transfer.retained_bytes == 0U);
+    CHECK_FALSE(update.transfer.resumed);
    }
   },
   trace);
@@ -2158,7 +2158,7 @@ TEST_CASE("artifact acquisition totals replace contributions without inventing u
  reporter.phase(DatasetCompilePhase::Downloading);
  const auto observe = [&](const BenchmarkDatasetSource source, const char* artifact, const std::uint64_t completed, const std::uint64_t total, const std::uint64_t expected_completed,
                        const std::uint64_t expected_total) {
-  totals.update(DownloadProgress{.artifact_id = artifact, .completed_bytes = completed, .total_bytes = total, .source = source}, reporter);
+  totals.update(DownloadProgress{.artifact_id = artifact, .transfer = {.completed_bytes = completed, .total_bytes = total}, .source = source}, reporter);
   CHECK(latest.tracks.acquisition.completed == expected_completed);
   CHECK(latest.tracks.acquisition.total == expected_total);
   CHECK(latest.current_source == source);
@@ -2178,14 +2178,14 @@ TEST_CASE("artifact acquisition totals replace contributions without inventing u
  observe(objects, "unknown", 3U, 3U, 22U, 37U);
  observe(coco, "known", 0U, 10U, 15U, 37U);  // Restart of a known artifact.
  observe(coco, "known", 10U, 10U, 25U, 37U);
- totals.update(DownloadProgress{"known", 10U, 10U, 0U, false, true}, reporter);
+ totals.update(DownloadProgress{"known", {.completed_bytes = 10U, .total_bytes = 10U, .attempt = 0U, .cache_hit = true, .resumed = false}}, reporter);
  CHECK(latest.tracks.acquisition.completed == 25U);
  CHECK(latest.tracks.acquisition.total == 37U);
  CHECK_FALSE(latest.sources[0].cache_hit);  // Only one of this source's artifacts was reused.
  // A failed checked replacement leaves its prior contribution intact.
- CHECK_THROWS_AS(totals.update(DownloadProgress{"known", std::numeric_limits<std::uint64_t>::max(), 10U}, reporter), std::overflow_error);
+ CHECK_THROWS_AS(totals.update(DownloadProgress{"known", {.completed_bytes = std::numeric_limits<std::uint64_t>::max(), .total_bytes = 10U}}, reporter), std::overflow_error);
  observe(coco, "known", 10U, 10U, 25U, 37U);
- CHECK_THROWS_AS(totals.update(DownloadProgress{"known", 10U, std::numeric_limits<std::uint64_t>::max()}, reporter), std::overflow_error);
+ CHECK_THROWS_AS(totals.update(DownloadProgress{"known", {.completed_bytes = 10U, .total_bytes = std::numeric_limits<std::uint64_t>::max()}}, reporter), std::overflow_error);
  observe(coco, "known", 10U, 10U, 25U, 37U);
 }
 TEST_CASE("ordinary transfer observations exclude discarded bodies and settle unknown artifact sizes", "[backend][data][benchmark][download]") {
@@ -2252,14 +2252,14 @@ TEST_CASE("ordinary transfer observations exclude discarded bodies and settle un
  REQUIRE(downloaded.size() == 1U);
  REQUIRE_FALSE(updates.empty());
  for (const auto& update : updates) {
-  CHECK(update.completed_bytes <= payload.size());
-  CHECK((update.total_bytes == 0U || update.total_bytes == payload.size()));
-  CHECK(update.retained_bytes == retained);
-  CHECK(update.completed_bytes >= retained);
-  if (retry && update.attempt == 1U) CHECK(update.completed_bytes == retained);
+  CHECK(update.transfer.completed_bytes <= payload.size());
+  CHECK((update.transfer.total_bytes == 0U || update.transfer.total_bytes == payload.size()));
+  CHECK(update.transfer.retained_bytes == retained);
+  CHECK(update.transfer.completed_bytes >= retained);
+  if (retry && update.transfer.attempt == 1U) CHECK(update.transfer.completed_bytes == retained);
  }
- CHECK(updates.back().completed_bytes == payload.size());
- CHECK(updates.back().total_bytes == payload.size());
+ CHECK(updates.back().transfer.completed_bytes == payload.size());
+ CHECK(updates.back().transfer.total_bytes == payload.size());
  CHECK(downloaded.front().attempts == (retry ? 2U : 1U));
  CHECK(server.requests() == (retry || redirect ? 2U : 1U));
  CHECK(mmltk::common::io::sha256_file(request.destination) == mmltk::common::io::sha256_bytes(payload));
@@ -2270,9 +2270,9 @@ TEST_CASE("ordinary transfer observations exclude discarded bodies and settle un
  CHECK_FALSE(fs::exists(request.destination.string() + ".part.json"));
  const auto requests_before = server.requests();
  const auto cached = download_artifacts({request}, 1U, {}, [&](const auto& update) {
-  CHECK(update.cache_hit);
-  CHECK(update.completed_bytes == payload.size());
-  CHECK(update.total_bytes == payload.size());
+  CHECK(update.transfer.cache_hit);
+  CHECK(update.transfer.completed_bytes == payload.size());
+  CHECK(update.transfer.total_bytes == payload.size());
  });
  CHECK(cached.front().identity == downloaded.front().identity);
  CHECK(server.requests() == requests_before);
@@ -2742,7 +2742,7 @@ TEST_CASE("concurrent tracks preserve unique work through repair and settlement"
  ProgressReporter progress([&](const auto& update) { latest = update; }, quiet);
  progress.phase(DatasetCompilePhase::Indexing, 4, 6);
  progress.phase(DatasetCompilePhase::Extracting);
- progress.transfers().update(DownloadProgress{.artifact_id = "annotations", .completed_bytes = 8, .total_bytes = 10}, progress);
+ progress.transfers().update(DownloadProgress{.artifact_id = "annotations", .transfer = {.completed_bytes = 8, .total_bytes = 10}}, progress);
  progress.pixels(0, 2);
  progress.pixel_completed();
  CHECK(latest.tracks.acquisition.active);
@@ -2750,7 +2750,7 @@ TEST_CASE("concurrent tracks preserve unique work through repair and settlement"
  CHECK(latest.tracks.pixels.active);
  CHECK(latest.tracks.labels.completed == 4);
  CHECK(latest.tracks.pixels.completed == 1);
- progress.transfers().update(DownloadProgress{.artifact_id = "images", .completed_bytes = 3}, progress);
+ progress.transfers().update(DownloadProgress{.artifact_id = "images", .transfer = {.completed_bytes = 3}}, progress);
  CHECK(latest.tracks.acquisition.completed == 11);
  CHECK_FALSE(latest.tracks.acquisition.total_known);
  const auto foreground = latest;
@@ -2811,12 +2811,12 @@ TEST_CASE("compile-owned observations survive preparation replacement and source
  replacement->update(0, 100, reporter);
  CHECK(latest.tracks.labels.completed == 200);
  auto& transfers = reporter.transfers();
- transfers.update(DownloadProgress{.artifact_id = "annotations", .completed_bytes = 8, .total_bytes = 8, .attempt = 3, .resumed = true}, reporter);
- transfers.update(DownloadProgress{.artifact_id = "archive", .completed_bytes = 10, .total_bytes = 20, .attempt = 2}, reporter);
+ transfers.update(DownloadProgress{.artifact_id = "annotations", .transfer = {.completed_bytes = 8, .total_bytes = 8, .attempt = 3, .resumed = true}}, reporter);
+ transfers.update(DownloadProgress{.artifact_id = "archive", .transfer = {.completed_bytes = 10, .total_bytes = 20, .attempt = 2}}, reporter);
  CHECK(latest.sources[0].retry_count == 3);
  CHECK(latest.sources[0].resumed);
  CHECK(latest.tracks.acquisition.completed == 18);
- transfers.update(DownloadProgress{.artifact_id = "annotations", .completed_bytes = 8, .total_bytes = 8, .cache_hit = true}, reporter);
+ transfers.update(DownloadProgress{.artifact_id = "annotations", .transfer = {.completed_bytes = 8, .total_bytes = 8, .cache_hit = true}}, reporter);
  CHECK(latest.sources[0].retry_count == 3);
  CHECK(latest.tracks.acquisition.completed == 18);
  ProgressReporter disabled({}, quiet);
@@ -3005,23 +3005,22 @@ TEST_CASE("source transfer facts follow represented activity independently of ag
  const BenchmarkTraceSink quiet;
  ProgressReporter reporter([&](const auto& update) { latest = update; }, quiet);
  reporter.phase(DatasetCompilePhase::Downloading);
- const DownloadProgress download{.artifact_id = "train-patch", .completed_bytes = 4096, .total_bytes = 8192, .attempt = 2, .resumed = true, .retained_bytes = 1024};
+ const DownloadProgress download{.artifact_id = "train-patch", .transfer = {.completed_bytes = 4096, .total_bytes = 8192, .retained_bytes = 1024, .attempt = 2, .resumed = true}};
  reporter.transfers().update(download, reporter);
  REQUIRE(latest.sources.front().transfer);
  CHECK(latest.sources.front().transfer->valid());
  CHECK(latest.sources.front().activity == "Resuming train-patch");
- CHECK(latest.sources.front().transfer->attempt == 2);
- CHECK(latest.sources.front().transfer->retained_bytes == 1024);
+ CHECK(*latest.sources.front().transfer == download.transfer);
  reporter.source_images(download.source, 2, 3);
- CHECK(latest.sources.front().transfer.has_value());
+ CHECK(latest.sources.front().transfer == download.transfer);
  reporter.source_activity(download.source, "Resuming train-patch");
- CHECK(latest.sources.front().transfer.has_value());
+ CHECK(latest.sources.front().transfer == download.transfer);
  reporter.source_activity(download.source, "Extracting train-patch");
  CHECK_FALSE(latest.sources.front().transfer);
  reporter.transfers().update(download, reporter);
  reporter.source_images(download.source, 3, 3, "Normalizing annotations");
  CHECK_FALSE(latest.sources.front().transfer);
- reporter.transfers().update(DownloadProgress{.artifact_id = "metadata", .completed_bytes = 512}, reporter);
+ reporter.transfers().update(DownloadProgress{.artifact_id = "metadata", .transfer = {.completed_bytes = 512}}, reporter);
  REQUIRE(latest.sources.front().transfer);
  CHECK(latest.sources.front().transfer->total_bytes == 0);
  CHECK(latest.sources.front().transfer->completed_bytes == 512);

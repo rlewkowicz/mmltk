@@ -1,6 +1,7 @@
 #include <poll.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#include <algorithm>
 #include <array>
 #include <catch2/catch_test_macros.hpp>
 #include <cerrno>
@@ -1082,7 +1083,7 @@ TEST_CASE("artifact benchmark requests admit canonical selections and Directory 
 }
 }  // namespace mmltk::controller::subsystems::system
 namespace mmltk::controller::subsystems::system {
-TEST_CASE("benchmark current transfer changes artifact activity at the exact image plateau", "[gui][services][progress]") {
+TEST_CASE("benchmark current transfer advances typed facts at the exact image plateau", "[gui][services][progress]") {
  using namespace data::benchmark_internal;
  using Source = data::BenchmarkDatasetSource;
  const BenchmarkTraceSink quiet;
@@ -1100,59 +1101,71 @@ TEST_CASE("benchmark current transfer changes artifact activity at the exact ima
  reporter.source_images(Source::kObjects365V2, 170161U, 408551U);
  reporter.source_images(Source::kOpenImagesV7, 56008U, 56008U);
  reporter.projected(1039610446176ULL);
- const auto check_plateau = [&] {
+ const auto check_plateau = [&](const DownloadProgress& observation) {
+  REQUIRE(displayed.sources.size() == 3U);
+  REQUIRE(displayed.sources[1].transfer);
+  CHECK(*displayed.sources[1].transfer == observation.transfer);
+  CHECK(displayed.sources[1].source == observation.source);
+  CHECK(displayed.sources == latest.sources);
   CHECK(displayed.tracks.acquisition.active);
-  CHECK(displayed.sources.size() == 3U);
   CHECK(displayed.projected_output_bytes == 1039610446176ULL);
   CHECK(latest.sources[1].completed_images == 170161U);
  };
- DownloadProgress update{"objects365-patch-17", 100U, 1000U, 1U};
+ DownloadProgress update{"objects365-patch-17", {.completed_bytes = 100U, .total_bytes = 1000U, .attempt = 1U}};
  update.source = Source::kObjects365V2;
  for (const bool resumed : {false, true}) {
   for (const auto attempt : {1U, 2U}) {
-   update.attempt = attempt;
-   update.resumed = resumed;
-   update.retained_bytes = resumed ? 64U : 0U;
-   update.cache_hit = false;
-   update.total_bytes = 1000U;
-   update.completed_bytes = 100U;
+   update.transfer.attempt = attempt;
+   update.transfer.resumed = resumed;
+   update.transfer.retained_bytes = resumed ? 64U : 0U;
+   update.transfer.cache_hit = false;
+   update.transfer.total_bytes = 1000U;
+   update.transfer.completed_bytes = 100U;
    reporter.transfers().update(update, reporter);
-   check_plateau();
-   CHECK(displayed.activity.find("Objects365 v2") != std::string::npos);
-   CHECK(displayed.activity.find("objects365-patch-17") != std::string::npos);
-   CHECK(displayed.activity.find("100 / 1000 bytes") != std::string::npos);
-   CHECK(displayed.activity.find("attempt " + std::to_string(attempt)) != std::string::npos);
-   if (resumed) { CHECK(displayed.activity.find("retained 64 bytes") != std::string::npos); }
-   const auto prior = displayed.activity;
-   update.completed_bytes = 200U;
+   check_plateau(update);
+   const std::string operation = resumed ? "Resuming objects365-patch-17" : "Downloading objects365-patch-17";
+   CHECK(displayed.sources[1].activity == operation);
+   CHECK(displayed.activity == "Objects365 v2 · " + operation);
+   const auto detail = data::format_benchmark_source_status(displayed.sources[1], "Acquiring");
+   CHECK(detail.find("100 / 1000 bytes") != std::string::npos);
+   CHECK(detail.find("attempt " + std::to_string(attempt)) != std::string::npos);
+   if (resumed) { CHECK(detail.find("retained 64 bytes") != std::string::npos); }
+   const auto prior = displayed;
+   update.transfer.completed_bytes = 200U;
    reporter.transfers().update(update, reporter);
-   check_plateau();
-   CHECK(displayed.activity != prior);
-   CHECK(displayed.activity.find("200 / 1000 bytes") != std::string::npos);
+   check_plateau(update);
+   CHECK(displayed.activity == prior.activity);
+   CHECK(displayed.sources[1].activity == prior.sources[1].activity);
+   CHECK(displayed.sources[1].transfer != prior.sources[1].transfer);
+   CHECK(data::format_benchmark_source_status(displayed.sources[1], "Acquiring").find("200 / 1000 bytes") != std::string::npos);
   }
  }
- update = DownloadProgress{"objects365-invalidated-archive", 16U, 1000U, 1U};
+ update = DownloadProgress{"objects365-invalidated-archive", {.completed_bytes = 16U, .total_bytes = 1000U, .attempt = 1U}};
  update.source = Source::kObjects365V2;
  update.redownload = true;
  reporter.transfers().update(update, reporter);
- CHECK(displayed.activity.find("Re-downloading objects365-invalidated-archive") != std::string::npos);
- CHECK(displayed.activity.find("attempt 1") != std::string::npos);
- check_plateau();
- update = DownloadProgress{"objects365-cached-patch", 5000U, 5000U, 0U, false, true};
+ CHECK(displayed.activity == "Objects365 v2 · Re-downloading objects365-invalidated-archive");
+ CHECK(data::format_benchmark_source_status(displayed.sources[1], "Acquiring").find("attempt 1") != std::string::npos);
+ check_plateau(update);
+ update = DownloadProgress{"objects365-cached-patch", {.completed_bytes = 5000U, .total_bytes = 5000U, .attempt = 0U, .cache_hit = true, .resumed = false}};
  update.source = Source::kObjects365V2;
  reporter.transfers().update(update, reporter);
- CHECK(displayed.activity.find("bytes reused") != std::string::npos);
- update = DownloadProgress{"objects365-live-patch", 32U, 0U, 1U};
+ CHECK(displayed.activity == "Objects365 v2 · Reusing cached objects365-cached-patch");
+ check_plateau(update);
+ CHECK(data::format_benchmark_source_status(displayed.sources[1], "Acquiring").find("5000 / 5000 bytes reused") != std::string::npos);
+ update = DownloadProgress{"objects365-live-patch", {.completed_bytes = 32U, .total_bytes = 0U, .attempt = 1U}};
  update.source = Source::kObjects365V2;
  reporter.transfers().update(update, reporter);
- CHECK(displayed.activity.find("32 bytes (total unknown)") != std::string::npos);
- CHECK(displayed.activity.find("reused") == std::string::npos);
- check_plateau();
+ CHECK(displayed.activity == "Objects365 v2 · Downloading objects365-live-patch");
+ const auto detail = data::format_benchmark_source_status(displayed.sources[1], "Acquiring");
+ CHECK(detail.find("32 bytes (total unknown)") != std::string::npos);
+ CHECK(detail.find("reused") == std::string::npos);
+ check_plateau(update);
  for (const auto phase : {DownloadProgressPhase::kVerifyingCachedArtifact, DownloadProgressPhase::kVerifyingDownloadedArtifact}) {
   update.phase = phase;
   reporter.transfers().update(update, reporter);
-  CHECK(displayed.activity.find(phase == DownloadProgressPhase::kVerifyingCachedArtifact ? "Verifying cached" : "Verifying downloaded") != std::string::npos);
-  check_plateau();
+  CHECK(displayed.activity == (phase == DownloadProgressPhase::kVerifyingCachedArtifact ? "Objects365 v2 · Verifying cached objects365-live-patch" : "Objects365 v2 · Verifying downloaded objects365-live-patch"));
+  check_plateau(update);
  }
  reporter.activity("Preparing labels");
  CHECK(displayed.activity == "Preparing labels");
@@ -1220,22 +1233,26 @@ TEST_CASE("real ranged HTTP restart reaches the bounded artifact activity as a r
  for (std::size_t i = 0U; i < observed.size(); ++i) {
   const auto& update = observed[i];
   CHECK(displayed[i].valid());
-  CHECK(displayed[i].tracks.acquisition.completed == update.completed_bytes);
-  CHECK(displayed[i].tracks.acquisition.total == update.total_bytes);
+  CHECK(displayed[i].tracks.acquisition.completed == update.transfer.completed_bytes);
+  CHECK(displayed[i].tracks.acquisition.total == update.transfer.total_bytes);
+  REQUIRE(displayed[i].sources[1].transfer);
+  CHECK(*displayed[i].sources[1].transfer == update.transfer);
+  CHECK(displayed[i].sources[1].source == update.source);
   CHECK(displayed[i].sources[1].completed_images == 170161U);
   CHECK(displayed[i].activity.size() <= domain::kArtifactProgressTextCapacity);
-  if (update.resumed) {
+  if (update.transfer.resumed) {
    CHECK_FALSE(saw_restart);
    saw_retained = true;
-   CHECK(update.retained_bytes == retained);
-   CHECK(displayed[i].activity.find("Resuming objects365-restart") != std::string::npos);
+   CHECK(update.transfer.retained_bytes == retained);
+   CHECK(displayed[i].activity == "Objects365 v2 · Resuming objects365-restart");
+   CHECK(data::format_benchmark_source_status(displayed[i].sources[1], "Acquiring").find("retained 512 bytes") != std::string::npos);
   }
   if (update.redownload) {
    CHECK(saw_retained);
    saw_restart = true;
-   CHECK_FALSE(update.resumed);
-   CHECK(update.retained_bytes == 0U);
-   CHECK(displayed[i].activity.find("Re-downloading objects365-restart") != std::string::npos);
+   CHECK_FALSE(update.transfer.resumed);
+   CHECK(update.transfer.retained_bytes == 0U);
+   CHECK(displayed[i].activity == "Objects365 v2 · Re-downloading objects365-restart");
   }
  }
  CHECK(saw_retained);
@@ -1247,13 +1264,16 @@ TEST_CASE("real ranged HTTP restart reaches the bounded artifact activity as a r
  CHECK(read_json_file(request.destination.string() + ".download.json").at("identity") == completed.front().identity);
  const auto requests_before = server.requests();
  const auto cached = download_artifacts({request}, 1U, {}, [&](const auto& update) {
-  CHECK(update.cache_hit);
+  CHECK(update.transfer.cache_hit);
   CHECK_FALSE(update.redownload);
   totals.update(update, reporter);
+  REQUIRE(displayed.back().sources[1].transfer);
+  CHECK(*displayed.back().sources[1].transfer == update.transfer);
  });
  CHECK(cached.front().cache_hit);
  CHECK(cached.front().identity == completed.front().identity);
- CHECK(displayed.back().activity.find("bytes reused") != std::string::npos);
+ CHECK(displayed.back().activity == "Objects365 v2 · Reusing cached objects365-restart");
+ CHECK(data::format_benchmark_source_status(displayed.back().sources[1], "Acquiring").find("4096 / 4096 bytes reused") != std::string::npos);
  CHECK(server.requests() == requests_before);
  server.Check();
 }
@@ -1300,7 +1320,11 @@ TEST_CASE("real unknown metadata bytes remain open ended through artifact projec
  auto transfer = std::async(std::launch::async, [&] {
   return download_artifacts({unknown}, 1U, {}, [&](const auto& update) {
    totals.update(update, reporter);
-   if (!notified && update.completed_bytes > 0U && update.total_bytes == 0U) {
+   const auto current = std::ranges::find(displayed.back().sources, update.source, &data::BenchmarkSourceProgress::source);
+   REQUIRE(current != displayed.back().sources.end());
+   REQUIRE(current->transfer);
+   CHECK(*current->transfer == update.transfer);
+   if (!notified && update.transfer.completed_bytes > 0U && update.transfer.total_bytes == 0U) {
     notified = true;
     open_ended.set_value();
    }
@@ -1317,6 +1341,7 @@ TEST_CASE("real unknown metadata bytes remain open ended through artifact projec
  bool saw_open_ended = false;
  for (std::size_t i = 0U; i < native.size(); ++i) {
   CHECK(displayed[i].valid());
+  CHECK(displayed[i].sources == native[i].sources);
   CHECK(displayed[i].completed == native[i].completed);
   CHECK(displayed[i].total == native[i].total);
   std::uint64_t completed = 0U;
@@ -1331,7 +1356,13 @@ TEST_CASE("real unknown metadata bytes remain open ended through artifact projec
   CHECK(native[i].total == (known ? total : 0U));
   if (!known && native[i].completed > (mixed ? payload.size() : 0U)) {
    saw_open_ended = true;
-   CHECK(displayed[i].activity.contains("total unknown"));
+   CHECK(displayed[i].activity == std::string(data::benchmark_source_label(source)) + " · Downloading metadata-unknown");
+   const auto current = std::ranges::find(displayed[i].sources, source, &data::BenchmarkSourceProgress::source);
+   REQUIRE(current != displayed[i].sources.end());
+   REQUIRE(current->transfer);
+   CHECK(current->transfer->completed_bytes > 0U);
+   CHECK(current->transfer->total_bytes == 0U);
+   CHECK(data::format_benchmark_source_status(*current, "Acquiring").contains("total unknown"));
   }
  }
  CHECK(saw_open_ended);

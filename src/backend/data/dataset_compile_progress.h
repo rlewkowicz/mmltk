@@ -28,9 +28,11 @@ enum class BenchmarkDatasetSource : std::uint8_t {
 }
 // The latest artifact is independent of cumulative source acquisition totals.
 struct BenchmarkTransferProgress final {
+ // Retained prefix plus accepted artifact writes; discarded HTTP bodies never count.
  std::uint64_t completed_bytes = 0;
- // Zero means unknown, matching the acquisition observer.
+ // Zero remains unknown until an admitted response or successful settlement establishes size.
  std::uint64_t total_bytes = 0;
+ // Durable bytes retained before the active attempt; excludes in-flight observations.
  std::uint64_t retained_bytes = 0;
  std::uint32_t attempt = 0;
  bool cache_hit = false;
