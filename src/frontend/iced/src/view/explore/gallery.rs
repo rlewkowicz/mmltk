@@ -4,6 +4,7 @@ use iced::{Event, Rectangle, Vector};
 use crate::fluent_theme::Theme;
 type Renderer = iced::Renderer;
 use crate::view::shared::status_text;
+use crate::view::shared::status_text::{IntrinsicText, IntrinsicWidth, StatusText};
 use super::settings_edit;
 use crate::fluent_theme::Element;
 use crate::presentation_surface::Surface;
@@ -215,50 +216,49 @@ pub(super) fn view<'a>(
         space::horizontal().width(Length::Shrink).into()
     };
     let navigation = toolbar_row(vec![
-        (status_text(snapshot.map_or_else(
+        ToolbarEntry::caption(status_text(snapshot.map_or_else(
             || "No dataset open".to_owned(),
             |value| format!(
                 "{} of {} samples",
                 value.order.matchingcount, value.dataset.imagecount
             )
-        )).compact()).into(),
-        (space::horizontal()).into(),
-        (text("Columns")).into(),
-        (column_control(columns, settings_available)).into(),
-        (space::horizontal()).into(),
-        (status_text(snapshot.map_or("Order unavailable", |value| {
+        )).compact()),
+        ToolbarEntry::control(space::horizontal()),
+        ToolbarEntry::control(text("Columns")),
+        ToolbarEntry::control(column_control(columns, settings_available)),
+        ToolbarEntry::control(space::horizontal()),
+        ToolbarEntry::caption(status_text(snapshot.map_or("Order unavailable", |value| {
             if value.order.shuffleseed == 0 {
                 "Sequential order"
             } else {
                 "Shuffled order"
             }
-        })).compact()).into(),
-        (reshuffle).into(),
-        (container(button("Earlier").on_press_maybe(snapshot.and_then(|value| {
+        })).compact()),
+        ToolbarEntry::control(reshuffle),
+        ToolbarEntry::control(container(button("Earlier").on_press_maybe(snapshot.and_then(|value| {
             mutation_available.then(|| page_message(state, value, columns, PageDirection::Earlier))
         })))
-        .id("explore.gallery.earlier")).into(),
-        (container(button("Later").on_press_maybe(snapshot.and_then(|value| {
+        .id("explore.gallery.earlier")),
+        ToolbarEntry::control(container(button("Later").on_press_maybe(snapshot.and_then(|value| {
             mutation_available.then(|| page_message(state, value, columns, PageDirection::Later))
         })))
-        .id(super::GALLERY_LATER_ID)).into(),
-    ], &[0, 5], 7);
+        .id(super::GALLERY_LATER_ID)),
+    ], 7.0);
     let augmentation_enabled = snapshot.is_some_and(|value| value.augmentation.enabled);
     let augmentation = toolbar_row(vec![
-        (container(
+        ToolbarEntry::control(container(
             checkbox(augmentation_enabled)
                 .label("Augmentation preview")
                 .on_toggle_maybe(
                     augmentation_update_available.then_some(Message::AugmentationToggled),
                 )
         )
-        .id(super::AUGMENTATION_TOGGLE_ID)).into(),
-        (container(status_text(snapshot.map_or_else(
+        .id(super::AUGMENTATION_TOGGLE_ID)),
+        ToolbarEntry::caption(status_text(snapshot.map_or_else(
             || "Seed unavailable".to_owned(),
             |value| format!("Seed {}", value.augmentation.seed),
-        )).compact())
-        .id(super::AUGMENTATION_SEED_ID)).into(),
-        (container(
+        )).compact()).id(super::AUGMENTATION_SEED_ID),
+        ToolbarEntry::control(container(
             button("Reroll Augmentation")
                 .on_press_maybe(
                     (mutation_available && augmentation_enabled)
@@ -266,8 +266,8 @@ pub(super) fn view<'a>(
                 )
                 .style(crate::fluent_theme::button_secondary),
         )
-        .id(super::AUGMENTATION_REROLL_ID)).into(),
-    ], &[1], 7);
+        .id(super::AUGMENTATION_REROLL_ID)),
+    ], 7.0);
     let overlay_controls = state.presented_filter(snapshot).map_or_else(
         || status_text("Overlays unavailable").into(),
         |request| {
@@ -278,11 +278,11 @@ pub(super) fn view<'a>(
         || text("").size(12).into(),
         |(ready, total)| {
             toolbar_row(vec![
-                status_text(format!("{ready}/{total} ready")).size(12).compact().into(),
-                container(progress_bar(0.0..=total.max(1) as f32, ready as f32))
+                ToolbarEntry::caption(status_text(format!("{ready}/{total} ready")).size(12).compact()),
+                ToolbarEntry::control(container(progress_bar(0.0..=total.max(1) as f32, ready as f32))
                     .width(48)
-                    .height(5).into(),
-            ], &[0], 5)
+                    .height(5)),
+            ], 5.0)
         },
     );
     let toolbar = container(
@@ -609,46 +609,85 @@ fn gallery_viewport<'a>(
 /// Reserve fixed controls before fitting compact captions; only the existing
 /// spacer cells receive slack. At ordinary widths this is the original row
 /// geometry, while narrow rows cannot give the progress bar's pixels to text.
-fn toolbar_row<'a>(children: Vec<Element<'a, Message>>, captions: &'static [usize], spacing: f32) -> Element<'a, Message> {
-    iced::Element::new(ToolbarRow { children, captions, spacing })
+fn toolbar_row<'a>(children: Vec<ToolbarEntry<'a>>, spacing: f32) -> Element<'a, Message> {
+    iced::Element::new(ToolbarRow { children, spacing })
+}
+
+struct ToolbarEntry<'a> {
+    element: Element<'a, Message>,
+    intrinsic: Option<IntrinsicText<'a>>,
+}
+
+impl<'a> ToolbarEntry<'a> {
+    fn control(element: impl Into<Element<'a, Message>>) -> Self {
+        Self { element: element.into(), intrinsic: None }
+    }
+
+    fn caption(status: StatusText<'a>) -> Self {
+        let intrinsic = Some(status.intrinsic());
+        Self { element: status.into(), intrinsic }
+    }
+
+    fn id(mut self, id: &'static str) -> Self {
+        self.element = container(self.element).id(id).into();
+        self
+    }
 }
 
 struct ToolbarRow<'a> {
-    children: Vec<Element<'a, Message>>,
-    captions: &'static [usize],
+    children: Vec<ToolbarEntry<'a>>,
     spacing: f32,
 }
 
 impl iced::advanced::Widget<Message, crate::fluent_theme::Theme, iced::Renderer> for ToolbarRow<'_> {
-    fn size(&self) -> Size<Length> {
-        Size::new(if self.children.iter().any(|child| child.as_widget().size().width.is_fill()) { Fill } else { Length::Shrink }, Length::Shrink)
+    fn tag(&self) -> iced::advanced::widget::tree::Tag {
+        iced::advanced::widget::tree::Tag::of::<ToolbarRow<'static>>()
     }
-    fn diff(&mut self, tree: &mut iced::advanced::widget::Tree) { tree.diff_children(&mut self.children); }
-    fn layout(&mut self, tree: &mut iced::advanced::widget::Tree, renderer: &iced::Renderer, limits: &iced::advanced::layout::Limits) -> iced::advanced::layout::Node {
+    fn size(&self) -> Size<Length> {
+        Size::new(if self.children.iter().any(|child| child.element.as_widget().size().width.is_fill()) { Fill } else { Length::Shrink }, Length::Shrink)
+    }
+    fn diff(&mut self, tree: &mut Tree) {
+        // Each entry keeps its measurement beside its element's retained tree.
+        tree.diff_children_custom(&mut self.children, |tree, entry| {
+            let intrinsic = tree.state.downcast_mut::<Option<IntrinsicWidth>>();
+            if entry.intrinsic.is_none() { *intrinsic = None; }
+            else if intrinsic.is_none() { *intrinsic = Some(IntrinsicWidth::default()); }
+            tree.diff_children(&mut [&mut entry.element]);
+        }, |entry| Tree {
+            tag: iced::advanced::widget::tree::Tag::of::<Option<IntrinsicWidth>>(),
+            state: iced::advanced::widget::tree::State::new(entry.intrinsic.as_ref().map(|_| IntrinsicWidth::default())),
+            children: vec![Tree::new(&entry.element)],
+        });
+    }
+    fn layout(&mut self, tree: &mut Tree, renderer: &Renderer, limits: &layout::Limits) -> layout::Node {
         let spacing = self.spacing * self.children.len().saturating_sub(1) as f32;
         let mut fixed = spacing;
         let mut natural = 0.0;
         let mut spacers = 0;
         let mut nodes = Vec::with_capacity(self.children.len());
         let natural_limits = layout::Limits::new(Size::ZERO, Size::new(f32::INFINITY, limits.max().height));
-        for (index, child) in self.children.iter_mut().enumerate() {
-            let node = if child.as_widget().size().width.is_fill() {
+        for (entry, tree) in self.children.iter_mut().zip(&mut tree.children) {
+            let node = if let Some(input) = &entry.intrinsic {
+                let width = tree.state.downcast_mut::<Option<IntrinsicWidth>>().as_mut().unwrap().measure(input, renderer);
+                natural += width;
+                // A sizing placeholder only; the visible Text is laid out below.
+                layout::Node::new(Size::new(width, 0.0))
+            } else if entry.element.as_widget().size().width.is_fill() {
                 spacers += 1;
                 layout::Node::new(Size::ZERO)
             } else {
-                child.as_widget_mut().layout(&mut tree.children[index], renderer, &natural_limits)
+                let node = entry.element.as_widget_mut().layout(&mut tree.children[0], renderer, &natural_limits);
+                fixed += node.size().width;
+                node
             };
-            if self.captions.contains(&index) { natural += node.size().width; }
-            else { fixed += node.size().width; }
             nodes.push(node);
         }
         let available = (limits.max().width - fixed).max(0.0);
-        if natural > available {
-            // A proportional budget preserves every caption rather than letting
-            // the first long string consume a later label's entire allocation.
-            for &index in self.captions {
-                let width = available * (nodes[index].size().width / natural);
-                nodes[index] = self.children[index].as_widget_mut().layout(&mut tree.children[index], renderer,
+        for ((entry, tree), node) in self.children.iter_mut().zip(&mut tree.children).zip(&mut nodes) {
+            if entry.intrinsic.is_some() {
+                // Preserve the original proportional budgets and natural wide layout.
+                let width = if natural > available { available * (node.size().width / natural) } else { f32::INFINITY };
+                *node = entry.element.as_widget_mut().layout(&mut tree.children[0], renderer,
                     &layout::Limits::new(Size::ZERO, Size::new(width, limits.max().height)));
             }
         }
@@ -656,8 +695,8 @@ impl iced::advanced::Widget<Message, crate::fluent_theme::Theme, iced::Renderer>
         let slack = if spacers > 0 && limits.max().width.is_finite() { (limits.max().width - used).max(0.0) / spacers as f32 } else { 0.0 };
         let height = nodes.iter().map(|node| node.size().height).fold(0.0, f32::max);
         let mut x = 0.0;
-        for (index, node) in nodes.iter_mut().enumerate() {
-            if self.children[index].as_widget().size().width.is_fill() { *node = layout::Node::new(Size::new(slack, height)); }
+        for (entry, node) in self.children.iter().zip(&mut nodes) {
+            if entry.element.as_widget().size().width.is_fill() { *node = layout::Node::new(Size::new(slack, height)); }
             let size = node.size();
             node.move_to_mut(iced::Point::new(x, (height - size.height) * 0.5));
             x += size.width + self.spacing;
@@ -679,9 +718,9 @@ impl iced::advanced::Widget<Message, crate::fluent_theme::Theme, iced::Renderer>
                 .zip(&mut tree.children)
                 .zip(layout.children())
                 .for_each(|((child, state), layout)| {
-                    child
+                    child.element
                         .as_widget_mut()
-                        .operate(state, layout, renderer, operation);
+                        .operate(&mut state.children[0], layout, renderer, operation);
                 });
         });
     }
@@ -702,9 +741,9 @@ impl iced::advanced::Widget<Message, crate::fluent_theme::Theme, iced::Renderer>
             .zip(&mut tree.children)
             .zip(layout.children())
         {
-            child
+            child.element
                 .as_widget_mut()
-                .update(tree, event, layout, cursor, renderer, shell, viewport);
+                .update(&mut tree.children[0], event, layout, cursor, renderer, shell, viewport);
         }
     }
 
@@ -721,9 +760,9 @@ impl iced::advanced::Widget<Message, crate::fluent_theme::Theme, iced::Renderer>
             .zip(&tree.children)
             .zip(layout.children())
             .map(|((child, tree), layout)| {
-                child
+                child.element
                     .as_widget()
-                    .mouse_interaction(tree, layout, cursor, viewport, renderer)
+                    .mouse_interaction(&tree.children[0], layout, cursor, viewport, renderer)
             })
             .max()
             .unwrap_or_default()
@@ -749,9 +788,9 @@ impl iced::advanced::Widget<Message, crate::fluent_theme::Theme, iced::Renderer>
                 .zip(layout.children())
                 .filter(|(_, layout)| layout.bounds().intersects(viewport))
             {
-                child
+                child.element
                     .as_widget()
-                    .draw(tree, renderer, theme, style, layout, cursor, viewport);
+                    .draw(&tree.children[0], renderer, theme, style, layout, cursor, viewport);
             }
         }
     }
@@ -764,14 +803,11 @@ impl iced::advanced::Widget<Message, crate::fluent_theme::Theme, iced::Renderer>
         viewport: &Rectangle,
         translation: Vector,
     ) -> Option<overlay::Element<'b, Message, Theme, Renderer>> {
-        overlay::from_children(
-            &mut self.children,
-            tree,
-            layout,
-            renderer,
-            viewport,
-            translation,
-        )
+        let children = self.children.iter_mut().zip(&mut tree.children).zip(layout.children())
+            .filter_map(|((entry, tree), layout)| {
+                entry.element.as_widget_mut().overlay(&mut tree.children[0], layout, renderer, viewport, translation)
+            }).collect::<Vec<_>>();
+        (!children.is_empty()).then(|| overlay::Group::with_children(children).overlay())
     }
 }
 
@@ -832,41 +868,140 @@ mod tests {
     fn compact_toolbar_preserves_wide_positions_and_reserves_narrow_controls() {
         use iced::advanced::renderer::Headless;
         let renderer = iced::futures::executor::block_on(<iced::Renderer as Headless>::new(Default::default(), Some("wgpu"))).unwrap();
-        let children = |compact: bool| -> Vec<Element<'static, Message>> {
-            let caption = |value| -> Element<'static, Message> {
-                if compact { status_text(value).size(12).compact().into() } else { text(value).size(12).into() }
+        let children = |compact: bool| -> Vec<ToolbarEntry<'static>> {
+            let caption = |value| -> ToolbarEntry<'static> {
+                if compact { ToolbarEntry::caption(status_text(value).size(12).compact()) }
+                else { ToolbarEntry::control(text(value).size(12)) }
             };
-            vec![caption("123456 of 234567 samples"), space::horizontal().into(),
-                text("Columns").into(), space::horizontal().width(42).into(), space::horizontal().into(),
-                caption("Sequential order"), button("Earlier").into(), button("Later").into()]
+            vec![caption("123456 of 234567 samples"), ToolbarEntry::control(space::horizontal()),
+                ToolbarEntry::control(text("Columns")), ToolbarEntry::control(space::horizontal().width(42)),
+                ToolbarEntry::control(space::horizontal()), caption("Sequential order"),
+                ToolbarEntry::control(button("Earlier")), ToolbarEntry::control(button("Later"))]
         };
         let measure = |mut element: Element<'_, Message>, width| {
             let mut tree = Tree::new(&element);
             tree.diff(&mut element);
             element.as_widget_mut().layout(&mut tree, &renderer, &layout::Limits::new(Size::ZERO, Size::new(width, 100.0)))
         };
-        let ordinary = measure(iced::widget::Row::from_vec(children(false)).spacing(7).align_y(Center).into(), 900.0);
-        let wide = measure(toolbar_row(children(true), &[0, 5], 7.0), 900.0);
+        let ordinary = measure(iced::widget::Row::from_vec(children(false).into_iter().map(|entry| entry.element).collect()).spacing(7).align_y(Center).into(), 900.0);
+        let wide = measure(toolbar_row(children(true), 7.0), 900.0);
         for (before, after) in ordinary.children().iter().zip(wide.children()) {
             assert!((before.bounds().x - after.bounds().x).abs() < 0.1);
             assert!((before.size().width - after.size().width).abs() < 0.1);
         }
-        let narrow = measure(toolbar_row(children(true), &[0, 5], 7.0), 330.0);
+        assert_eq!(wide.children()[1].size().width, wide.children()[4].size().width);
+        let narrow = measure(toolbar_row(children(true), 7.0), 330.0);
         for index in [2, 3, 6, 7] {
             assert_eq!(narrow.children()[index].size().width, wide.children()[index].size().width);
         }
         assert!(narrow.children()[7].bounds().x + narrow.children()[7].size().width <= 330.1);
+        let augmentation = |compact| {
+            let caption = if compact {
+                ToolbarEntry::caption(status_text("Seed 18446744073709551615").compact()).id(super::super::AUGMENTATION_SEED_ID)
+            } else {
+                ToolbarEntry::control(container(text("Seed 18446744073709551615")).id(super::super::AUGMENTATION_SEED_ID))
+            };
+            vec![ToolbarEntry::control(checkbox(true).label("Augmentation preview")), caption,
+                ToolbarEntry::control(button("Reroll Augmentation"))]
+        };
+        let ordinary = measure(iced::widget::Row::from_vec(augmentation(false).into_iter().map(|entry| entry.element).collect()).spacing(7).align_y(Center).into(), 900.0);
+        for width in [900.0, 400.0, 0.0] {
+            let fitted = measure(toolbar_row(augmentation(true), 7.0), width);
+            for index in [0, 2] {
+                assert_eq!(fitted.children()[index].size(), ordinary.children()[index].size());
+            }
+            if width == 900.0 {
+                for (before, after) in ordinary.children().iter().zip(fitted.children()) {
+                    assert!((before.bounds().x - after.bounds().x).abs() < 0.1);
+                    assert!((before.size().width - after.size().width).abs() < 0.1);
+                }
+            } else {
+                let available = (width - ordinary.children()[0].size().width - ordinary.children()[2].size().width - 14.0).max(0.0);
+                assert!(fitted.children()[1].size().width <= available + 0.1);
+            }
+        }
         for width in [400.0, 90.0] {
             let progress = measure(toolbar_row(vec![
-                status_text("123456/234567 ready").size(12).compact().into(),
-                container(progress_bar(0.0..=1.0, 0.5)).width(48).height(5).into(),
-            ], &[0], 5.0), width);
+                ToolbarEntry::caption(status_text("123456/234567 ready").size(12).compact()),
+                ToolbarEntry::control(container(progress_bar(0.0..=1.0, 0.5)).width(48).height(5)),
+            ], 5.0), width);
             let caption = &progress.children()[0];
             let bar = &progress.children()[1];
             assert_eq!(bar.size().width, 48.0);
             assert!((bar.bounds().x - caption.size().width - 5.0).abs() < 0.1);
             assert!(progress.size().width <= width + 0.1);
         }
+    }
+
+    #[test]
+    fn toolbar_caption_measurements_and_visible_paragraphs_settle_independently() {
+        use iced::advanced::renderer::{Headless, Renderer as _};
+        use iced::advanced::text::Paragraph as _;
+        type Paragraph = <Renderer as iced::advanced::text::Renderer>::Paragraph;
+        fn visible(tree: &Tree) -> &Paragraph {
+            // Entry -> tooltip -> StatusText -> its one live Text.
+            tree.children[0].children[0].children[0].state
+                .downcast_ref::<iced::advanced::widget::text::State<Paragraph>>().raw()
+        }
+        fn intrinsic(tree: &Tree) -> &Paragraph {
+            tree.state.downcast_ref::<Option<IntrinsicWidth>>().as_ref().unwrap().paragraph()
+        }
+        let mut renderer = iced::futures::executor::block_on(<Renderer as Headless>::new(Default::default(), Some("wgpu"))).unwrap();
+        let build = |content: &'static str, normal| toolbar_row(vec![
+            ToolbarEntry::caption(status_text(content).size(normal).compact()),
+            ToolbarEntry::control(space::horizontal()),
+            ToolbarEntry::caption(status_text("東京 ready").size(12).compact()),
+            ToolbarEntry::control(space::horizontal()),
+            ToolbarEntry::control(button("Later")),
+        ], 7.0);
+        let original = "123456 of 234567 samples · café\nready";
+        let mut element = build(original, 12.0);
+        let mut tree = Tree::new(&element);
+        tree.diff(&mut element);
+        let mut previous: Option<(Paragraph, Paragraph)> = None;
+        for (content, normal, scale, width) in [
+            (original, 12.0, 1.0, 150.0),
+            (original, 12.0, 1.0, 100.0),
+            (original, 12.0, 1.0, 900.0),
+            (original, 12.0, 1.0, 0.0),
+            ("Changed 東京 status", 12.0, 1.0, 150.0),
+            ("Changed 東京 status", 14.0, 1.0, 150.0),
+            ("Changed 東京 status", 14.0, 2.0, 150.0),
+            ("", 12.0, 2.0, 150.0),
+            ("Done", 12.0, 2.0, 900.0),
+        ] {
+            renderer.hint(scale);
+            element = build(content, normal);
+            tree.diff(&mut element);
+            let limits = layout::Limits::new(Size::ZERO, Size::new(width, 100.0));
+            let node = element.as_widget_mut().layout(&mut tree, &renderer, &limits);
+            assert!((node.children()[0].size().height - normal * 1.3).abs() < 0.01);
+            assert_eq!(node.children()[1].size().width, node.children()[3].size().width);
+            let settled = [0, 2].map(|index| (intrinsic(&tree.children[index]).clone(), visible(&tree.children[index]).clone()));
+            if let Some((old_intrinsic, old_visible)) = &previous {
+                // Width alone changes only the visible paragraph; normal measurement survives.
+                if content == original {
+                    assert!(std::ptr::eq(old_intrinsic.buffer(), settled[0].0.buffer()));
+                    assert!(!std::ptr::eq(old_visible.buffer(), settled[0].1.buffer()));
+                } else {
+                    assert!(!std::ptr::eq(old_intrinsic.buffer(), settled[0].0.buffer()));
+                }
+            }
+            for rebuild in [false, false, true, false] {
+                if rebuild {
+                    element = build(content, normal);
+                    tree.diff(&mut element);
+                }
+                let repeated = element.as_widget_mut().layout(&mut tree, &renderer, &limits);
+                assert_eq!(node.size(), repeated.size());
+                for (index, (natural, live)) in [0, 2].into_iter().zip(&settled) {
+                    assert!(std::ptr::eq(natural.buffer(), intrinsic(&tree.children[index]).buffer()));
+                    assert!(std::ptr::eq(live.buffer(), visible(&tree.children[index]).buffer()));
+                }
+            }
+            previous = Some(settled[0].clone());
+        }
+        assert_eq!(visible(&tree.children[0]).size(), iced::Pixels(12.0));
     }
 
     #[test]

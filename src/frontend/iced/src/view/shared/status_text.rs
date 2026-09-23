@@ -25,6 +25,9 @@ pub struct StatusText<'a> {
 }
 
 impl<'a> StatusText<'a> {
+    pub(crate) fn intrinsic(&self) -> IntrinsicText<'a> {
+        IntrinsicText { content: self.content.clone(), normal: self.normal }
+    }
     pub fn size(mut self, size: impl Into<Pixels>) -> Self {
         self.normal = Some(size.into());
         self
@@ -43,6 +46,61 @@ impl<'a> StatusText<'a> {
         self
     }
 
+}
+
+/// Measurement input copied from the status declaration before element erasure.
+/// It never accesses the visible Text or its interaction state.
+pub(crate) struct IntrinsicText<'a> {
+    content: text::Fragment<'a>,
+    normal: Option<Pixels>,
+}
+
+#[derive(Default)]
+pub(crate) struct IntrinsicWidth {
+    content: String,
+    flat: String,
+    key: Option<(f32, Font, Option<f32>)>,
+    paragraph: text::paragraph::Plain<Paragraph>,
+}
+
+impl IntrinsicWidth {
+    pub(crate) fn measure(&mut self, input: &IntrinsicText<'_>, renderer: &iced::Renderer) -> f32 {
+        let key = (normal_size(input.normal, renderer), renderer.default_font(), renderer.scale_factor());
+        let changed = self.content != input.content.as_ref();
+        if changed {
+            input.content.as_ref().clone_into(&mut self.content);
+            widget::text::flatten_line_breaks(&input.content, &mut self.flat);
+        }
+        if changed || self.key != Some(key) {
+            self.paragraph.update(measurement(&self.flat, key.0, key.1, key.2));
+            self.key = Some(key);
+        }
+        self.paragraph.min_width()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn paragraph(&self) -> &Paragraph { self.paragraph.raw() }
+}
+
+fn normal_size(requested: Option<Pixels>, renderer: &iced::Renderer) -> f32 {
+    let requested = requested.unwrap_or_else(|| renderer.default_size()).0;
+    if requested.is_finite() { requested.max(8.0) } else { 12.0 }
+}
+
+fn measurement(content: &str, size: f32, font: Font, scale: Option<f32>) -> text::Text<&str> {
+    text::Text {
+        content,
+        bounds: Size::INFINITE,
+        size: Pixels(size),
+        line_height: text::LineHeight::default(),
+        font,
+        align_x: text::Alignment::Default,
+        align_y: iced::alignment::Vertical::Top,
+        shaping: text::Shaping::default(),
+        wrapping: text::Wrapping::None,
+        ellipsis: text::Ellipsis::None,
+        hint_factor: scale,
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -86,8 +144,7 @@ impl<Message> Widget<Message, Theme, iced::Renderer> for StatusText<'_> {
     }
     fn layout(&mut self, tree: &mut widget::Tree, renderer: &iced::Renderer, limits: &layout::Limits) -> layout::Node {
         let state = tree.state.downcast_mut::<State>();
-        let requested = self.normal.unwrap_or_else(|| renderer.default_size()).0;
-        let normal = if requested.is_finite() { requested.max(8.0) } else { 12.0 };
+        let normal = normal_size(self.normal, renderer);
         let width = limits.max().width.max(0.0);
         let font = renderer.default_font();
         let scale = renderer.scale_factor();
@@ -104,19 +161,7 @@ impl<Message> Widget<Message, Theme, iced::Renderer> for StatusText<'_> {
             state.resolved = resolved;
         } else {
             state.resolved = fit(normal, |size| {
-                state.measure.update(text::Text {
-                    content: &state.flat,
-                    bounds: Size::INFINITE,
-                    size: Pixels(size),
-                    line_height: text::LineHeight::default(),
-                    font,
-                    align_x: text::Alignment::Default,
-                    align_y: iced::alignment::Vertical::Top,
-                    shaping: text::Shaping::default(),
-                    wrapping: text::Wrapping::None,
-                    ellipsis: text::Ellipsis::None,
-                    hint_factor: scale,
-                });
+                state.measure.update(measurement(&state.flat, size, font, scale));
                 state.measure.min_width() <= width
             });
             state.key = Some(key);
@@ -222,7 +267,7 @@ mod tests {
                 assert!(paragraph.min_height() <= 15.7);
             }
         }
-        let node = element.as_widget_mut().layout(&mut tree, &renderer, &layout::Limits::new(Size::ZERO, Size::new(45.0, 100.0)));
+        let mut node = element.as_widget_mut().layout(&mut tree, &renderer, &layout::Limits::new(Size::ZERO, Size::new(45.0, 100.0)));
         {
             let paragraph = tree.children[0].children[0].state.downcast_ref::<widget::text::State<Paragraph>>().raw();
             assert_eq!(paragraph.size(), Pixels(8.0));
@@ -274,6 +319,18 @@ mod tests {
         element.as_widget_mut().update(&mut tree, &Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)), Layout::new(&node), mouse::Cursor::Available(position), &renderer, &mut shell, &viewport);
         for row in [1.0, 0.0] {
             element.as_widget_mut().update(&mut tree, &Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Right)), Layout::new(&node), mouse::Cursor::Available(position), &renderer, &mut shell, &viewport);
+            // Reconstruct the view and resize while the actual Text menu is open.
+            // Its selection and menu must survive both layout and ordinary diff.
+            element = status_text(original).size(12).into();
+            tree.diff(&mut element);
+            let limits = layout::Limits::new(Size::ZERO, Size::new(30.0 + row * 20.0, 100.0));
+            node = element.as_widget_mut().layout(&mut tree, &renderer, &limits);
+            let retained = tree.children[0].children[0].state.downcast_ref::<widget::text::State<Paragraph>>().raw().clone();
+            for _ in 0..3 {
+                node = element.as_widget_mut().layout(&mut tree, &renderer, &limits);
+                let current = tree.children[0].children[0].state.downcast_ref::<widget::text::State<Paragraph>>().raw();
+                assert!(std::ptr::eq(retained.buffer(), current.buffer()));
+            }
             let mut overlay = element.as_widget_mut().overlay(&mut tree, Layout::new(&node), &renderer, &viewport, Vector::ZERO).expect("Text context menu is open");
             let menu_layout = overlay.as_overlay_mut().layout(&renderer, viewport.size());
             let menu = menu_layout.children()[0].bounds();
@@ -288,6 +345,47 @@ mod tests {
         let node = element.as_widget_mut().layout(&mut tree, &renderer, &layout::Limits::new(Size::ZERO, Size::new(45.0, 100.0)));
         assert!((node.size().height - 15.6).abs() < 0.01);
         assert_eq!(tree.children[0].state.downcast_ref::<State>().resolved, 12.0);
+    }
+
+    #[test]
+    fn intrinsic_measurement_reuses_storage_and_tracks_the_renderer_font() {
+        use super::*;
+        use iced::advanced::renderer::Headless;
+        let renderer = iced::futures::executor::block_on(<iced::Renderer as Headless>::new(
+            Default::default(), Some("wgpu"),
+        )).expect("intrinsic measurement requires the container renderer");
+        let other = iced::futures::executor::block_on(<iced::Renderer as Headless>::new(
+            iced::advanced::renderer::Settings { default_font: Font::MONOSPACE, ..Default::default() }, Some("wgpu"),
+        )).expect("font invalidation requires the container renderer");
+        let mut retained = IntrinsicWidth::default();
+        for content in ["", "café\r\n東京\u{0085}ready\u{2028}done", "Done"] {
+            let status = status_text(content).size(12).compact();
+            let input = status.intrinsic();
+            let mut element: Element<'_, ()> = status.into();
+            let mut tree = widget::Tree::new(&element);
+            tree.diff(&mut element);
+            let limits = layout::Limits::new(Size::ZERO, Size::new(70.0, 100.0));
+            element.as_widget_mut().layout(&mut tree, &renderer, &limits);
+            let live = tree.children[0].children[0].state.downcast_ref::<widget::text::State<Paragraph>>().raw().clone();
+            element.as_widget_mut().layout(&mut tree, &other, &limits);
+            let current = tree.children[0].children[0].state.downcast_ref::<widget::text::State<Paragraph>>().raw().clone();
+            assert_eq!(current.font(), Font::MONOSPACE);
+            assert!(!std::ptr::eq(live.buffer(), current.buffer()));
+            element.as_widget_mut().layout(&mut tree, &other, &limits);
+            assert!(std::ptr::eq(current.buffer(), tree.children[0].children[0].state.downcast_ref::<widget::text::State<Paragraph>>().raw().buffer()));
+            let width = retained.measure(&input, &renderer);
+            let paragraph = retained.paragraph().clone();
+            for _ in 0..3 {
+                assert_eq!(retained.measure(&status_text(content).size(12).compact().intrinsic(), &renderer), width);
+                assert!(std::ptr::eq(paragraph.buffer(), retained.paragraph().buffer()));
+            }
+            retained.measure(&input, &other);
+            assert_eq!(retained.paragraph().font(), Font::MONOSPACE);
+            assert!(!std::ptr::eq(paragraph.buffer(), retained.paragraph().buffer()));
+            let paragraph = retained.paragraph().clone();
+            retained.measure(&input, &other);
+            assert!(std::ptr::eq(paragraph.buffer(), retained.paragraph().buffer()));
+        }
     }
 
     #[test]
