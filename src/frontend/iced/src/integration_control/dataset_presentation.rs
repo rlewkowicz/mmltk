@@ -308,21 +308,7 @@ impl State {
             state.progress.tracks.acquisition.activity = DatasetCompileActivity::Acquiring;
             state.progress.tracks.labels.active = false;
             state.progress.tracks.labels.activity = DatasetCompileActivity::Preparing;
-            state.progress.sources = vec![BenchmarkSourceProgress {
-                source: BenchmarkDatasetSource::KObjects365V2,
-                activity: "Cache hit".into(),
-                transfer: None,
-                completedbytes: 85 * 1024 * 1024 * 1024,
-                totalbytes: 85 * 1024 * 1024 * 1024,
-                completedimages: 345491,
-                totalimages: 345491,
-                invalidatedimages: 0,
-                retrycount: 0,
-                cachehit: true,
-                resumed: false,
-                complete: true,
-                bytetotalknown: true,
-            }];
+            state.progress.sources = vec![progress::fixtures::cached_source()];
         }
         match index % 9 {
             1 => {
@@ -334,25 +320,11 @@ impl State {
                 state.progress.droppedinstances = 0;
                 state.progress.quarantinedimages = 0;
                 let source = &mut state.progress.sources[0];
-                source.cachehit = false;
-                source.complete = false;
-                source.bytetotalknown = false;
+                progress::fixtures::resume_source(source);
                 source.completedbytes = 4096;
                 source.totalbytes = 0;
                 source.completedimages = 0;
                 source.totalimages = 0;
-                source.activity = "Resuming train-patch".into();
-                source.retrycount = 2;
-                source.resumed = true;
-                source.invalidatedimages = 1234;
-                source.transfer = Some(BenchmarkTransferProgress {
-                    completedbytes: 4096,
-                    totalbytes: 0,
-                    retainedbytes: 1024,
-                    attempt: 3,
-                    cachehit: false,
-                    resumed: true,
-                });
             }
             2 | 3 => {
                 let source = &mut state.progress.sources[0];
@@ -672,6 +644,7 @@ impl<M> Widget<M, Theme, iced::Renderer> for TextBoundary<'_, M> {
             .as_widget_mut()
             .update(tree, event, layout, cursor, renderer, shell, viewport);
     }
+    // CLEANUP-IGNORE: Iced requires this draw signature; this observer measures the existing control's painted text.
     fn draw(
         &self,
         tree: &widget::Tree,
@@ -851,6 +824,7 @@ impl Widget<RootMessage, Theme, iced::Renderer> for Observed<'_> {
             self.sent.set(false);
         }
     }
+    // CLEANUP-IGNORE: Iced requires this draw signature; this observer captures a scoped rendered frame.
     fn draw(
         &self,
         tree: &widget::Tree,

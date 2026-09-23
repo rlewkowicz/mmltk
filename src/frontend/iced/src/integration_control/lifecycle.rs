@@ -1322,6 +1322,18 @@ impl State {
                 super::dataset_presentation::input(action, next, bounds, scale, value);
                 Task::none()
             };
+        let click_row = |driver: &mut Driver,
+                         row: Option<&super::dataset_presentation::Row>,
+                         next,
+                         failure: &str| {
+            let Some(row) = row else {
+                return Task::none();
+            };
+            if !click(row.bounds * scale) {
+                driver.fail(failure);
+            }
+            driver.advance_to(Phase::DatasetInput(next))
+        };
         match index {
             0 => {
                 if self.presentation.input_original.is_empty() {
@@ -1335,18 +1347,7 @@ impl State {
                 if !super::canvas_size_settled_js(480.0, 900.0) {
                     return Task::none();
                 }
-                let Some(row) = infer else {
-                    return Task::none();
-                };
-                if !click(Rectangle {
-                    x: row.bounds.x * scale,
-                    y: row.bounds.y * scale,
-                    width: row.bounds.width * scale,
-                    height: row.bounds.height * scale,
-                }) {
-                    driver.fail("Dataset split disclosure click failed");
-                }
-                driver.advance_to(Phase::DatasetInput(1))
+                click_row(driver, infer, 1, "Dataset split disclosure click failed")
             }
             1 if !train.usecompileddirectorydefaults => {
                 widget_ops::scroll_control_into_view(field_id, AnnotationReveal::Control)
@@ -1399,34 +1400,18 @@ impl State {
                 )
                 .chain(driver.advance_to(Phase::DatasetInput(18)))
             }
-            18 => {
-                let Some(row) = frame.row(BENCHMARK_OVERRIDE) else {
-                    return Task::none();
-                };
-                if !click(Rectangle {
-                    x: row.bounds.x * scale,
-                    y: row.bounds.y * scale,
-                    width: row.bounds.width * scale,
-                    height: row.bounds.height * scale,
-                }) {
-                    driver.fail("Coconut retained-input override click failed");
-                }
-                driver.advance_to(Phase::DatasetInput(13))
-            }
-            13 if train.compilebenchmarkdatasetoverride => {
-                let Some(row) = frame.row(crate::view::train::BENCHMARK_COCONUT_ID) else {
-                    return Task::none();
-                };
-                if !click(Rectangle {
-                    x: row.bounds.x * scale,
-                    y: row.bounds.y * scale,
-                    width: row.bounds.width * scale,
-                    height: row.bounds.height * scale,
-                }) {
-                    driver.fail("Coconut retained-input recipe click failed");
-                }
-                driver.advance_to(Phase::DatasetInput(14))
-            }
+            18 => click_row(
+                driver,
+                frame.row(BENCHMARK_OVERRIDE),
+                13,
+                "Coconut retained-input override click failed",
+            ),
+            13 if train.compilebenchmarkdatasetoverride => click_row(
+                driver,
+                frame.row(crate::view::train::BENCHMARK_COCONUT_ID),
+                14,
+                "Coconut retained-input recipe click failed",
+            ),
             14 if train.benchmarkselection.dataset
                 == crate::generated::BenchmarkDatasetVariant::Coconut =>
             {
@@ -1510,35 +1495,25 @@ impl State {
                 if self.presentation.input_selection.as_ref().unwrap().dataset
                     == crate::generated::BenchmarkDatasetVariant::CocoCustom
                 {
-                    let Some(row) = frame.row(crate::view::train::BENCHMARK_CUSTOM_ID) else {
-                        return Task::none();
-                    };
-                    if !click(Rectangle {
-                        x: row.bounds.x * scale,
-                        y: row.bounds.y * scale,
-                        width: row.bounds.width * scale,
-                        height: row.bounds.height * scale,
-                    }) {
-                        driver.fail("Coconut retained-input recipe restoration failed");
-                    }
+                    click_row(
+                        driver,
+                        frame.row(crate::view::train::BENCHMARK_CUSTOM_ID),
+                        15,
+                        "Coconut retained-input recipe restoration failed",
+                    )
+                } else {
+                    driver.advance_to(Phase::DatasetInput(15))
                 }
-                driver.advance_to(Phase::DatasetInput(15))
             }
             15 if train.benchmarkselection
                 == *self.presentation.input_selection.as_ref().unwrap() =>
             {
-                let Some(row) = frame.row(BENCHMARK_OVERRIDE) else {
-                    return Task::none();
-                };
-                if !click(Rectangle {
-                    x: row.bounds.x * scale,
-                    y: row.bounds.y * scale,
-                    width: row.bounds.width * scale,
-                    height: row.bounds.height * scale,
-                }) {
-                    driver.fail("Coconut retained-input override restoration failed");
-                }
-                driver.advance_to(Phase::DatasetInput(16))
+                click_row(
+                    driver,
+                    frame.row(BENCHMARK_OVERRIDE),
+                    16,
+                    "Coconut retained-input override restoration failed",
+                )
             }
             16 if !train.compilebenchmarkdatasetoverride => {
                 widget_ops::scroll_control_into_view(field_id, AnnotationReveal::Control)
@@ -1548,20 +1523,12 @@ impl State {
                     ))
                     .chain(driver.advance_to(Phase::DatasetInput(17)))
             }
-            17 => {
-                let Some(row) = infer else {
-                    return Task::none();
-                };
-                if !click(Rectangle {
-                    x: row.bounds.x * scale,
-                    y: row.bounds.y * scale,
-                    width: row.bounds.width * scale,
-                    height: row.bounds.height * scale,
-                }) {
-                    driver.fail("Dataset infer-splits restoration click failed");
-                }
-                driver.advance_to(Phase::DatasetInput(11))
-            }
+            17 => click_row(
+                driver,
+                infer,
+                11,
+                "Dataset infer-splits restoration click failed",
+            ),
             11 if train.usecompileddirectorydefaults
                 && train.request.traincompiledpath == self.presentation.input_original =>
             {

@@ -486,6 +486,7 @@ impl<Message> Widget<Message, Theme, iced::Renderer> for Labelled<'_, Message> {
             renderer,
         )
     }
+    // CLEANUP-IGNORE: Iced requires this draw signature; workspace labels own their image geometry and retained surface state.
     fn draw(
         &self,
         tree: &widget::Tree,

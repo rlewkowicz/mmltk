@@ -1,5 +1,5 @@
+use super::fixtures::cached_source as source;
 use super::*;
-use crate::generated::BenchmarkTransferProgress;
 
 fn dataset() -> ArtifactUiState {
     crate::generated::application_snapshot_defaults()
@@ -10,24 +10,6 @@ fn dataset() -> ArtifactUiState {
             _ => None,
         })
         .unwrap()
-}
-
-fn source() -> BenchmarkSourceProgress {
-    BenchmarkSourceProgress {
-        source: BenchmarkDatasetSource::KObjects365V2,
-        activity: "Cache hit".into(),
-        transfer: None,
-        completedbytes: 85 * 1024 * 1024 * 1024,
-        totalbytes: 85 * 1024 * 1024 * 1024,
-        completedimages: 345491,
-        totalimages: 345491,
-        invalidatedimages: 0,
-        retrycount: 0,
-        cachehit: true,
-        resumed: false,
-        complete: true,
-        bytetotalknown: true,
-    }
 }
 
 #[test]
@@ -56,21 +38,7 @@ fn cached_and_downloaded_sources_keep_concise_independent_transfer_facts() {
     assert_eq!(source_heading(&source), "Objects365 v2 · Cached");
     assert_eq!(source_summary(&source), "85.0 GiB · 345,491 images");
     assert!(source_details(&source).is_empty());
-    source.complete = false;
-    source.cachehit = false;
-    source.bytetotalknown = false;
-    source.activity = "Resuming train-patch".into();
-    source.retrycount = 2;
-    source.resumed = true;
-    source.invalidatedimages = 1234;
-    source.transfer = Some(BenchmarkTransferProgress {
-        completedbytes: 4096,
-        totalbytes: 0,
-        retainedbytes: 1024,
-        attempt: 3,
-        cachehit: false,
-        resumed: true,
-    });
+    fixtures::resume_source(&mut source);
     assert_eq!(source_heading(&source), "Objects365 v2 · Active");
     assert!(source_summary(&source).starts_with("85.0 GiB / ?"));
     assert_eq!(

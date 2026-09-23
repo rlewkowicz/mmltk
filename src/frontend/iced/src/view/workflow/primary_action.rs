@@ -229,6 +229,7 @@ impl<Message> Widget<Message, Theme, iced::Renderer> for Decorated<'_, Message> 
             renderer,
         )
     }
+    // CLEANUP-IGNORE: Iced requires this draw signature; the primary action owns its independent button animation.
     fn draw(
         &self,
         tree: &widget::Tree,

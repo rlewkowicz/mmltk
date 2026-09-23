@@ -1,4 +1,6 @@
 //! Dataset compilation presentation; native state alone decides settlement.
+pub(crate) mod fixtures;
+
 use crate::fluent_theme::Element;
 use crate::generated::{
     ArtifactTerminalOutcome, ArtifactUiState, BenchmarkDatasetSource, BenchmarkSourceProgress,
