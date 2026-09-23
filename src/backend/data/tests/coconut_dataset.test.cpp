@@ -198,6 +198,11 @@ std::string file_bytes(const std::filesystem::path& path) {
  std::ifstream input(path, std::ios::binary);
  return {std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
 }
+void check_publication_bytes(const std::filesystem::path& output, std::string_view train, std::string_view validation, std::string_view manifest) {
+ CHECK(file_bytes(output / "train.bin") == train);
+ CHECK(file_bytes(output / "val.bin") == validation);
+ CHECK(file_bytes(output / "benchmark_manifest.json") == manifest);
+}
 void expect_runs(const CoconutComponent& component, std::span<const RLEPair> expected) {
  REQUIRE(component.index.mask_rle_pairs.size() == expected.size());
  for (std::size_t i = 0; i < expected.size(); ++i) {
@@ -898,12 +903,24 @@ TEST_CASE("COCONut cancellation after the last record covers consolidation and i
  }
 }
 namespace {
-std::string white_jpeg(int width = 3, int height = 3) {
+std::string white_jpeg(int width = 3, int height = 3, std::size_t minimum_bytes = 0) {
  const std::vector<unsigned char> pixels(static_cast<std::size_t>(width) * height * 3U, 255U);
  std::string bytes;
  REQUIRE(
   stbi_write_jpg_to_func([](void* context, void* data, int size) { static_cast<std::string*>(context)->append(static_cast<const char*>(data), size); }, &bytes, width, height, 3, pixels.data(), 100));
+ if (bytes.size() < minimum_bytes) {
+  bytes.resize(minimum_bytes, '\0');
+  bytes[bytes.size() - 2] = static_cast<char>(0xff);
+  bytes.back() = static_cast<char>(0xd9);
+ }
  return bytes;
+}
+void replace_physical_images(const BenchmarkCacheLayout& cache, CoconutRecipeCatalog& catalog, CoconutImageNamespace source, std::span<const std::pair<std::string, std::string>> members) {
+ const auto archive = std::ranges::find(catalog.images, source, &RecipeImageArchive::source);
+ REQUIRE(archive != catalog.images.end());
+ const auto path = cache.source_downloads(benchmark_source_name(archive->artifact.source)) / archive->artifact.filename;
+ tar(path, members);
+ archive->artifact.expected_size = std::filesystem::file_size(path);
 }
 struct ServedPhysicalArchive {
  RecipeImageArchive& source;
@@ -2008,9 +2025,7 @@ TEST_CASE("stock annotation cancellation preserves the previous recipe publicati
  CHECK_THROWS(compile_benchmark_recipe(config, &catalog));
  CHECK(cancel.load());
  CHECK_FALSE(std::filesystem::exists(index.string() + ".complete.json"));
- CHECK(file_bytes(config.output_dir / "train.bin") == train);
- CHECK(file_bytes(config.output_dir / "val.bin") == val);
- CHECK(file_bytes(config.output_dir / "benchmark_manifest.json") == manifest);
+ check_publication_bytes(config.output_dir, train, val, manifest);
 }
 TEST_CASE("both stock recipes repair malformed admitted archives through their production entry", "[benchmark][coconut][download]") {
  ScopedTempDir root("stock-recipe-repair");
@@ -2864,8 +2879,6 @@ TEST_CASE("cached training labels start before pixel drain and overlap subsequen
  SECTION("cancellation drains the held reader and retains the old generation") { cancel_reader = true; }
  ScopedTempDir root("custom-label-overlap");
  LocalCoconutRecipe local(root.path());
- auto& physical = *std::ranges::find(local.catalog.images, CoconutImageNamespace::CocoTrain, &RecipeImageArchive::source);
- const auto archive = local.cache.source_downloads("coco") / physical.artifact.filename;
  std::vector<unsigned> ids;
  std::vector<std::pair<std::string, std::string>> members;
  // Seventy selected images exceed both the former 3P readiness limit and the
@@ -2874,8 +2887,7 @@ TEST_CASE("cached training labels start before pixel drain and overlap subsequen
   ids.push_back(id);
   members.emplace_back(coco(id).member, white_jpeg());
  }
- tar(archive, members);
- physical.artifact.expected_size = std::filesystem::file_size(archive);
+ replace_physical_images(local.cache, local.catalog, CoconutImageNamespace::CocoTrain, members);
  auto custom = local_custom_catalog(local, ids);
  auto config = local.compiler_config({BenchmarkDatasetVariant::CocoCustom, CoconutValidation::CoconutStock}, true);
  compile_benchmark_recipe(config, nullptr, &custom);
@@ -2951,9 +2963,7 @@ TEST_CASE("cached training labels start before pixel drain and overlap subsequen
   mmltk::testsupport::await_test_future(compiling, "production label settlement", 5s);
  }
  CHECK(::flock(lease.get(), LOCK_EX | LOCK_NB) == 0);
- CHECK(file_bytes(local.output / "train.bin") == train);
- CHECK(file_bytes(local.output / "val.bin") == validation);
- CHECK(file_bytes(local.output / "benchmark_manifest.json") == manifest);
+ check_publication_bytes(local.output, train, validation, manifest);
 }
 TEST_CASE("COCONut annotation transfer settles while physical inventory acquisition is blocked", "[benchmark][coconut][pipeline]") {
  using namespace std::chrono_literals;
@@ -2964,20 +2974,10 @@ TEST_CASE("COCONut annotation transfer settles while physical inventory acquisit
  ScopedTempDir root("coconut-independent-inputs");
  LocalCoconutRecipe local(root.path());
  auto catalog = local.selected(CoconutValidation::CoconutStock);
- auto& physical = *std::ranges::find(catalog.images, CoconutImageNamespace::CocoTrain, &RecipeImageArchive::source);
- const auto image_archive = local.cache.source_downloads("coco") / physical.artifact.filename;
- auto encoded = white_jpeg();
- encoded.resize(1024 * 1024, '\0');
- encoded[encoded.size() - 2] = static_cast<char>(0xff);
- encoded.back() = static_cast<char>(0xd9);
- const std::array<std::pair<std::string, std::string>, 1> members{{{coco(7).member, encoded}}};
- tar(image_archive, members);
- physical.artifact.expected_size = std::filesystem::file_size(image_archive);
- const auto physical_bytes = file_bytes(image_archive);
- const std::vector<std::uint8_t> physical_payload(physical_bytes.begin(), physical_bytes.end());
- mmltk::backend::data::testsupport::HttpServer physical_server(physical_payload);
- physical.artifact.url = physical_server.url("physical");
- std::filesystem::remove(image_archive);
+ const std::array<std::pair<std::string, std::string>, 1> members{{{coco(7).member, white_jpeg(3, 3, 1024 * 1024)}}};
+ replace_physical_images(local.cache, catalog, CoconutImageNamespace::CocoTrain, members);
+ ServedPhysicalArchive physical(local.cache, catalog, CoconutImageNamespace::CocoTrain, "physical");
+ std::filesystem::remove(physical.path);
  auto& release = catalog.releases.front();
  auto& artifact = release.annotations.front();
  const auto annotation_path = local.cache.source_downloads("coconut-" + std::string(release.name)) / artifact.filename;
@@ -2986,7 +2986,7 @@ TEST_CASE("COCONut annotation transfer settles while physical inventory acquisit
  mmltk::backend::data::testsupport::HttpServer annotation_server(annotation_payload);
  artifact.url = annotation_server.url("annotation");
  std::filesystem::remove(annotation_path);
- physical_server.GateNextTransfer();
+ physical.server.GateNextTransfer();
  auto config = local.compiler_config({BenchmarkDatasetVariant::Coconut, CoconutValidation::CoconutStock});
  config.num_workers = 2;
  std::atomic<bool> cancelled{false};
@@ -2999,9 +2999,9 @@ TEST_CASE("COCONut annotation transfer settles while physical inventory acquisit
  auto compiling = std::async(std::launch::async, [&] { compile_benchmark_recipe(config, &catalog); });
  const mmltk::testsupport::ScopedTestCleanup release_transfer([&] {
   cancelled.store(true);
-  physical_server.ReleasePartial();
+  physical.server.ReleasePartial();
  });
- REQUIRE(physical_server.WaitPartial());
+ REQUIRE(physical.server.WaitPartial());
  mmltk::testsupport::await_test_promise(annotation_ready, "independent annotation transfer", 3s);
  CHECK(compiling.wait_for(0ms) == std::future_status::timeout);
  CHECK(std::filesystem::is_regular_file(annotation_path));
@@ -3010,12 +3010,12 @@ TEST_CASE("COCONut annotation transfer settles while physical inventory acquisit
   CHECK_THROWS(mmltk::testsupport::await_test_future(compiling, "pending release cancellation", 5s));
   CHECK_FALSE(std::filesystem::is_regular_file(local.output / "train.bin"));
  } else {
-  physical_server.ReleasePartial();
+  physical.server.ReleasePartial();
   mmltk::testsupport::await_test_future(compiling, "independent COCONut inputs", 5s);
   CHECK(CompiledDataset::open(local.output / "train.bin").image_entries().size() == 4);
  }
- physical_server.ReleasePartial();
- physical_server.Check();
+ physical.server.ReleasePartial();
+ physical.server.Check();
  annotation_server.Check();
 }
 TEST_CASE("COCONut readable mismatched geometry survives a failed body and cache repair", "[benchmark][coconut][pipeline]") {
@@ -3109,25 +3109,14 @@ TEST_CASE("custom production inspects a completed archive while an independent a
  if (mmltk::common::system::allowed_cpu_set().size() < 3) SKIP("requires three assigned CPU lanes");
  ScopedTempDir root("custom-independent-archives");
  LocalCoconutRecipe local(root.path());
- auto& physical = *std::ranges::find(local.catalog.images, CoconutImageNamespace::CocoTrain, &RecipeImageArchive::source);
- const auto train_archive = local.cache.source_downloads("coco") / physical.artifact.filename;
- auto encoded = white_jpeg();
- encoded.resize(1024 * 1024, '\0');
- encoded[encoded.size() - 2] = static_cast<char>(0xff);
- encoded.back() = static_cast<char>(0xd9);
- const std::array<std::pair<std::string, std::string>, 2> members{{{coco(7).member, encoded}, {coco(10).member, white_jpeg()}}};
- tar(train_archive, members);
- physical.artifact.expected_size = std::filesystem::file_size(train_archive);
+ const std::array<std::pair<std::string, std::string>, 2> members{{{coco(7).member, white_jpeg(3, 3, 1024 * 1024)}, {coco(10).member, white_jpeg()}}};
+ replace_physical_images(local.cache, local.catalog, CoconutImageNamespace::CocoTrain, members);
+ ServedPhysicalArchive train(local.cache, local.catalog, CoconutImageNamespace::CocoTrain, "train");
+ ServedPhysicalArchive validation(local.cache, local.catalog, CoconutImageNamespace::CocoValidation, "val");
  auto catalog = local_custom_catalog(local);
- const auto val_archive = local.cache.source_downloads("coco") / catalog.coco_val_images.filename;
- const auto train_bytes = file_bytes(train_archive), val_bytes = file_bytes(val_archive);
- const std::vector<std::uint8_t> train_payload(train_bytes.begin(), train_bytes.end()), val_payload(val_bytes.begin(), val_bytes.end());
- mmltk::backend::data::testsupport::HttpServer train_server(train_payload), val_server(val_payload);
- catalog.coco_train_images.url = train_server.url("train");
- catalog.coco_val_images.url = val_server.url("val");
- std::filesystem::remove(train_archive);
- std::filesystem::remove(val_archive);
- train_server.GateNextTransfer();
+ std::filesystem::remove(train.path);
+ std::filesystem::remove(validation.path);
+ train.server.GateNextTransfer();
  auto config = local.compiler_config({BenchmarkDatasetVariant::CocoCustom, CoconutValidation::CoconutStock});
  config.num_workers = 3;
  std::promise<void> inspected;
@@ -3137,16 +3126,16 @@ TEST_CASE("custom production inspects a completed archive while an independent a
    if (source == BenchmarkDatasetSource::kCoco2017 && split == "val2017" && !delivered.exchange(true)) inspected.set_value();
   });
  });
- const mmltk::testsupport::ScopedTestCleanup release([&] { train_server.ReleasePartial(); });
- REQUIRE(train_server.WaitPartial());
+ const mmltk::testsupport::ScopedTestCleanup release([&] { train.server.ReleasePartial(); });
+ REQUIRE(train.server.WaitPartial());
  mmltk::testsupport::await_test_promise(inspected, "independent validation archive inspection", 3s);
  CHECK(compiling.wait_for(0ms) == std::future_status::timeout);
  CHECK(std::filesystem::is_regular_file(cached_image_path(local.cache.source_images("coco") / "val2017", 9)));
- train_server.ReleasePartial();
+ train.server.ReleasePartial();
  mmltk::testsupport::await_test_future(compiling, "independent custom artifacts", 5s);
  CHECK(CompiledDataset::open(local.output / "train.bin").image_entries().size() == 4);
- train_server.Check();
- val_server.Check();
+ train.server.Check();
+ validation.server.Check();
 }
 TEST_CASE("COCONut consumes ready releases while an unrelated lifecycle lease is blocked", "[benchmark][coconut][pipeline]") {
  using namespace std::chrono_literals;
@@ -3199,17 +3188,13 @@ TEST_CASE("COCONut consumes ready releases while an unrelated lifecycle lease is
  });
  mmltk::testsupport::await_test_promise(ready_releases, "all independent release admissions", 5s);
  CHECK(compiling.wait_for(0ms) == std::future_status::timeout);
- CHECK(file_bytes(local.output / "train.bin") == train);
- CHECK(file_bytes(local.output / "val.bin") == validation);
- CHECK(file_bytes(local.output / "benchmark_manifest.json") == manifest);
+ check_publication_bytes(local.output, train, validation, manifest);
  lease.reset();
  if (fail_blocked_release)
   CHECK_THROWS(mmltk::testsupport::await_test_future(compiling, "failed release drain", 5s));
  else
   mmltk::testsupport::await_test_future(compiling, "canonical ready release merge", 5s);
- CHECK(file_bytes(local.output / "train.bin") == train);
- CHECK(file_bytes(local.output / "val.bin") == validation);
- CHECK(file_bytes(local.output / "benchmark_manifest.json") == manifest);
+ check_publication_bytes(local.output, train, validation, manifest);
  // No completed or failed release retains lifecycle custody after compilation.
  for (const auto& component : catalog.releases) {
   const auto path = local.cache.locks / (std::string(component.name) + ".annotations.lifecycle.lock");
@@ -3280,9 +3265,7 @@ TEST_CASE("cancellation retires release work while original annotations are lock
  CHECK(compiling.wait_for(0ms) == std::future_status::timeout);
  cancelled.store(true);
  CHECK_THROWS(mmltk::testsupport::await_test_future(compiling, "original-index cancellation drain", 5s));
- CHECK(file_bytes(local.output / "train.bin") == train);
- CHECK(file_bytes(local.output / "val.bin") == validation);
- CHECK(file_bytes(local.output / "benchmark_manifest.json") == manifest);
+ check_publication_bytes(local.output, train, validation, manifest);
 }
 TEST_CASE("COCONut receives metadata while a managed release lane is importing masks", "[benchmark][coconut][pipeline]") {
  using namespace std::chrono_literals;
@@ -3324,9 +3307,7 @@ TEST_CASE("COCONut receives metadata while a managed release lane is importing m
  CHECK(compiling.wait_for(0ms) == std::future_status::timeout);
  masks.Release();
  mmltk::testsupport::await_test_future(compiling, "metadata receiver completion", 5s);
- CHECK(file_bytes(local.output / "train.bin") == train);
- CHECK(file_bytes(local.output / "val.bin") == validation);
- CHECK(file_bytes(local.output / "benchmark_manifest.json") == manifest);
+ check_publication_bytes(local.output, train, validation, manifest);
 }
 TEST_CASE("cold COCONut releases retain one aggregate indexing denominator", "[benchmark][coconut][progress]") {
  using namespace std::chrono_literals;
