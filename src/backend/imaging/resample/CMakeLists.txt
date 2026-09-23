@@ -35,7 +35,7 @@ function(mmltk_add_backend_imaging_resample_tests)
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/image_resize.test.cpp)
     target_link_libraries(mmltk_backend_imaging_resample_tests PRIVATE
         mmltk_backend_imaging_resample_test_support
-        mmltk_test_support mmltk::backend::imaging::resample mmltk::frameworks::gpu)
+        mmltk_test_support mmltk::backend::imaging::resample mmltk::frameworks::gpu avir)
     if(BUILD_RFDETR_NATIVE)
         mmltk_register_ordinary_sources(mmltk_backend_imaging_resample_tests
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/image_resize_cuda.test.cpp

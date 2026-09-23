@@ -16,6 +16,7 @@
 #include <cstring>
 #include <new>
 #include <utility>
+#include "avir_float4_sse.h"
 namespace mmltk::backend::imaging::resample::perceptual {
 struct CpuDownscalerTestAccess {
  using Step = CpuDownscaler::PreparationStep;
@@ -77,17 +78,20 @@ void test_same_size_copy_preserves_pixels() {
 }
 void test_parallel_worker_local_resizers_are_stable() {
  const std::vector<uint8_t> source = make_test_image(211, 157);
- std::vector<std::vector<uint8_t>> outputs(8, std::vector<uint8_t>(static_cast<size_t>(332) * static_cast<size_t>(332) * 3U));
- std::vector<std::thread> threads;
- threads.reserve(outputs.size());
- for (auto& output : outputs) {
-  threads.emplace_back([&source, &output] {
-   RgbImageResizer resizer(1);
-   resizer.resize(source.data(), 211, 157, output.data(), 332, 332);
-  });
- }
- for (std::thread& thread : threads) { thread.join(); }
- for (size_t index = 1; index < outputs.size(); ++index) { REQUIRE(outputs[index] == outputs[0]); }
+ for (bool perceptual : {false, true})
+  for (const auto& dims : std::array<std::array<int, 2>, 3>{{{332, 332}, {97, 71}, {16, 1}}}) {
+   std::vector<std::vector<uint8_t>> outputs(8, std::vector<uint8_t>(static_cast<size_t>(dims[0]) * dims[1] * 3U));
+   std::vector<std::thread> threads;
+   threads.reserve(outputs.size());
+   for (auto& output : outputs) {
+    threads.emplace_back([&source, &output, dims, perceptual] {
+     RgbImageResizer resizer(1, perceptual);
+     resizer.resize(source.data(), 211, 157, output.data(), dims[0], dims[1]);
+    });
+   }
+   for (std::thread& thread : threads) { thread.join(); }
+   for (size_t index = 1; index < outputs.size(); ++index) { REQUIRE(outputs[index] == outputs[0]); }
+  }
 }
 }  // namespace
 TEST_CASE("resize plans respect worker budgets", "[backend][data][image_resize]") { test_resize_plan_respects_budget(); }
@@ -112,6 +116,69 @@ TEST_CASE("perceptual resampling matches independent moments and full-area geome
     resizer.downscale(source.read(), output.write());
     REQUIRE(std::memcmp(output.storage.data(), retained.data(), retained.size() * sizeof(float)) == 0);
    }
+}
+TEST_CASE("perceptual SIMD handles lane boundaries and unequal fractional footprints", "[backend][data][image_resize][perceptual]") {
+ using namespace test_perceptual;
+ RgbImageResizer resizer;
+ for (auto format : formats)
+  for (unsigned width : {1U, 7U, 8U, 9U, 15U, 16U, 17U})
+   for (const auto& dims : std::array<std::array<unsigned, 4>, 6>{{{width * 2 + 1, 11, width, 7}, {width * 2, 11, width, 7}, {width * 2 + 1, 12, width, 6},
+          {width * 2, 12, width, 6}, {width * 2 + 1, 1, width, 1}, {width * 3 - 1, 101, width, 7}}})
+    for (unsigned pattern : {0U, 3U, 5U, 6U, 7U}) {
+     INFO("format " << static_cast<int>(format) << " geometry " << dims[0] << "x" << dims[1] << " -> " << dims[2] << "x" << dims[3] << " pattern " << pattern);
+     Image source(dims[0], dims[1], format, 3), output(dims[2], dims[3], format, 5);
+     source.fill(pattern);
+     resizer.downscale(source.read(), output.write());
+     REQUIRE(maximum_error(output, reference(source, dims[2], dims[3])) <= reference_tolerance(format));
+     REQUIRE(padding_intact(source));
+     REQUIRE(padding_intact(output));
+    }
+}
+TEST_CASE("AVIR SIMD rounding matches scalar float arithmetic at signed half boundaries", "[backend][data][image_resize]") {
+ const auto check = [](const std::array<float, 4>& values) {
+  const auto mode = _MM_GET_ROUNDING_MODE();
+  std::array<float, 4> actual{};
+  avir::round(avir::float4::loadu(values.data())).storeu(actual.data());
+  REQUIRE(_MM_GET_ROUNDING_MODE() == mode);
+  for (unsigned lane = 0; lane < 4; ++lane) {
+   INFO("round input " << values[lane]);
+   REQUIRE(std::bit_cast<std::uint32_t>(actual[lane]) == std::bit_cast<std::uint32_t>(avir::round(values[lane])));
+  }
+ };
+ check({-0.0F, 0.0F, -0.125F, 0.125F});
+ for (int integer = -256; integer <= 256; ++integer) {
+  const float half = static_cast<float>(integer) + 0.5F;
+  check({std::nextafter(half, -std::numeric_limits<float>::infinity()), half, std::nextafter(half, std::numeric_limits<float>::infinity()), half + 0.125F});
+ }
+}
+TEST_CASE("AVIR float4 preserves scalar resize accuracy and production selection", "[backend][data][image_resize]") {
+ using namespace test_perceptual;
+ avir::CImageResizer<> scalar(8);
+ avir::CImageResizer<avir::fpclass_float4> simd(8);
+ RgbImageResizer production;
+ constexpr std::array<std::array<unsigned, 4>, 9> sizes{{{31, 23, 7, 5}, {31, 23, 8, 7}, {31, 23, 9, 13}, {31, 23, 17, 11}, {17, 13, 35, 29},
+  {17, 13, 17, 13}, {1, 17, 1, 9}, {19, 1, 33, 1}, {17, 13, 9, 19}}};
+ for (const auto& dims : sizes)
+  for (unsigned pattern = 0; pattern < 8; ++pattern) {
+   INFO("geometry " << dims[0] << "x" << dims[1] << " -> " << dims[2] << "x" << dims[3] << " pattern " << pattern);
+   Image source(dims[0], dims[1], RgbPixelFormat::RGB8, 3);
+   source.fill(pattern);
+   auto packed = make_test_image(static_cast<int>(dims[0]), static_cast<int>(dims[1]));
+   for (unsigned y = 0; y < dims[1]; ++y)
+    std::memcpy(packed.data() + std::size_t(y) * dims[0] * 3, reinterpret_cast<const std::uint8_t*>(source.storage.data()) + y * source.layout.row_stride_bytes, dims[0] * 3);
+   const auto count = std::size_t(dims[2]) * dims[3] * 3;
+   std::vector<std::uint8_t> expected(count + 8, 0xCD), actual(expected), selected(expected);
+   scalar.resizeImage(packed.data(), dims[0], dims[1], 0, expected.data(), dims[2], dims[3], 3, 0.0, nullptr);
+   simd.resizeImage(packed.data(), dims[0], dims[1], 0, actual.data(), dims[2], dims[3], 3, 0.0, nullptr);
+   production.resize(packed.data(), dims[0], dims[1], selected.data(), dims[2], dims[3]);
+   if (dims[0] == dims[2] && dims[1] == dims[3])
+    REQUIRE(std::equal(packed.begin(), packed.end(), selected.begin()));
+   else
+    REQUIRE(actual == selected);
+   for (std::size_t i = 0; i < count; ++i) REQUIRE(std::abs(int(actual[i]) - int(expected[i])) <= 1);
+   for (const auto* output : {&expected, &actual, &selected})
+    REQUIRE(std::all_of(output->begin() + count, output->end(), [](auto value) { return value == 0xCD; }));
+  }
 }
 namespace {
 void check_prepared_pixels(perceptual::CpuDownscaler& resizer, const test_perceptual::Image& source, test_perceptual::Image& output) {
@@ -258,10 +325,12 @@ TEST_CASE("perceptual low variance keeps the specified ratio-two threshold", "[b
    for (unsigned k = 0; k < 3; ++k) source.set(x, 0, k, oetf(0.3 + (x >= 2 ? delta : 0) + (x % 2 ? 0.01 : -0.01)));
   resizer.downscale(source.read(), output.write());
   REQUIRE(maximum_error(output, reference(source, 2, 1)) < 2e-6);
-  auto simd_source = threshold_source(34, 6, delta);
-  Image simd_output(17, 3, RgbPixelFormat::PlanarUnitSrgbF32);
-  resizer.downscale(simd_source.read(), simd_output.write());
-  REQUIRE(maximum_error(simd_output, reference(simd_source, 17, 3)) < 2e-6);
+  for (unsigned source_width : {34U, 35U}) {
+   auto simd_source = threshold_source(source_width, 6, delta);
+   Image simd_output(17, 3, RgbPixelFormat::PlanarUnitSrgbF32);
+   resizer.downscale(simd_source.read(), simd_output.write());
+   REQUIRE(maximum_error(simd_output, reference(simd_source, 17, 3)) < 2e-6);
+  }
  }
 }
 TEST_CASE("perceptual checked views reject unsafe geometry before writing", "[backend][data][image_resize][perceptual]") {
@@ -300,19 +369,21 @@ TEST_CASE("perceptual checked views reject unsafe geometry before writing", "[ba
 }
 TEST_CASE("perceptual float unit-domain sanitation remains finite", "[backend][data][image_resize][perceptual]") {
  using namespace test_perceptual;
- Image source(5, 1, RgbPixelFormat::PlanarUnitSrgbF32), output(2, 1, RgbPixelFormat::PlanarUnitSrgbF32);
- constexpr double values[]{-1, std::numeric_limits<double>::quiet_NaN(), 0.04045, 2, std::numeric_limits<double>::infinity()};
- for (unsigned x = 0; x < 5; ++x)
-  for (unsigned k = 0; k < 3; ++k) source.set(x, 0, k, values[x]);
  RgbImageResizer resizer;
- resizer.downscale(source.read(), output.write());
- REQUIRE(maximum_error(output, reference(source, 2, 1)) < 2e-6);
- for (unsigned x = 0; x < 2; ++x)
-  for (unsigned k = 0; k < 3; ++k) {
-   REQUIRE(std::isfinite(output.at(x, 0, k)));
-   REQUIRE(output.at(x, 0, k) >= 0);
-   REQUIRE(output.at(x, 0, k) <= 1);
-  }
+ constexpr double values[]{-1, std::numeric_limits<double>::quiet_NaN(), 0.04045, 2, std::numeric_limits<double>::infinity()};
+ for (const auto& dims : std::array<std::array<unsigned, 2>, 2>{{{5, 2}, {23, 9}}}) {
+  Image source(dims[0], 1, RgbPixelFormat::PlanarUnitSrgbF32), output(dims[1], 1, RgbPixelFormat::PlanarUnitSrgbF32);
+  for (unsigned x = 0; x < dims[0]; ++x)
+   for (unsigned k = 0; k < 3; ++k) source.set(x, 0, k, values[x % 5]);
+  resizer.downscale(source.read(), output.write());
+  REQUIRE(maximum_error(output, reference(source, dims[1], 1)) < 2e-6);
+  for (unsigned x = 0; x < dims[1]; ++x)
+   for (unsigned k = 0; k < 3; ++k) {
+    REQUIRE(std::isfinite(output.at(x, 0, k)));
+    REQUIRE(output.at(x, 0, k) >= 0);
+    REQUIRE(output.at(x, 0, k) <= 1);
+   }
+ }
 }
 TEST_CASE("perceptual logical admission preserves format alignment alias and overflow failures", "[backend][data][image_resize][perceptual]") {
  using namespace test_perceptual;
@@ -386,8 +457,8 @@ void check_compiler_projection(
 }
 }  // namespace
 TEST_CASE("compiler planar projection preserves every quantized RGB8 bit", "[backend][data][image_resize][perceptual]") {
- constexpr std::array<std::array<std::uint32_t, 4>, 13> sizes{{{32, 18, 16, 9}, {34, 18, 17, 9}, {16, 10, 8, 5}, {14, 10, 7, 5}, {17, 13, 9, 7}, {17, 13, 17, 5}, {17, 13, 7, 13}, {17, 13, 1, 1},
-  {1, 17, 1, 7}, {31, 3, 9, 11}, {17, 13, 17, 13}, {17, 13, 23, 19}, {17, 13, 9, 19}}};
+ constexpr std::array<std::array<std::uint32_t, 4>, 18> sizes{{{32, 18, 16, 9}, {34, 18, 17, 9}, {16, 10, 8, 5}, {14, 10, 7, 5}, {17, 13, 9, 7}, {17, 13, 17, 5}, {17, 13, 7, 13}, {17, 13, 1, 1},
+  {1, 17, 1, 7}, {31, 3, 9, 11}, {17, 13, 17, 13}, {17, 13, 23, 19}, {17, 13, 9, 19}, {15, 11, 7, 7}, {17, 11, 8, 7}, {31, 11, 15, 7}, {33, 11, 16, 7}, {35, 11, 17, 7}}};
  for (const bool enabled : {false, true}) {
   RgbImageResizer resizer(1, enabled);
   for (const auto& dims : sizes)

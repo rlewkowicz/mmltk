@@ -16,6 +16,8 @@
 #ifndef AVIR_FLOAT4_SSE_INCLUDED
 #define AVIR_FLOAT4_SSE_INCLUDED
 
+#include "avir.h"
+
 #if defined(_MSC_VER)
 #include <intrin.h>
 #else  // defined( _MSC_VER )
@@ -161,14 +163,14 @@ class float4 {
 };
 
 inline float4 round(const float4& v) {
-    unsigned int prevrm = _MM_GET_ROUNDING_MODE();
-    _MM_SET_ROUNDING_MODE(_MM_ROUND_NEAREST);
-
-    const __m128 res = _mm_cvtepi32_ps(_mm_cvtps_epi32(v.value));
-
-    _MM_SET_ROUNDING_MODE(prevrm);
-
-    return (res);
+    // Match scalar round<float>: add 0.5 to the positive magnitude, truncate,
+    // then restore the sign only when v < 0 (including a negative zero result).
+    // The addition must round as float, including neighbors just below halves.
+    const __m128 negative = _mm_cmplt_ps(v.value, _mm_setzero_ps());
+    const __m128 sign = _mm_and_ps(negative, _mm_set1_ps(-0.0f));
+    const __m128 magnitude = _mm_xor_ps(v.value, sign);
+    const __m128 rounded = _mm_cvtepi32_ps(_mm_cvttps_epi32(_mm_add_ps(magnitude, _mm_set1_ps(0.5f))));
+    return (_mm_xor_ps(rounded, sign));
 }
 
 inline float4 clamp(const float4& Value, const float4& minv, const float4& maxv) {

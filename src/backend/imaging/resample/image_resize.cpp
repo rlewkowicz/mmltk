@@ -11,9 +11,10 @@
 #include <mutex>
 #include <stdexcept>
 #include <vector>
-#include "avir.h"
+#include "avir_float4_sse.h"
 namespace mmltk::backend::imaging::resample {  // Model-independent resampling.
 namespace {
+using CpuAvirResizer = avir::CImageResizer<avir::fpclass_float4>;
 void warm_up_avir_rgb_resize_path() {
  std::array<std::uint8_t, 12> source{
   0U,
@@ -30,12 +31,12 @@ void warm_up_avir_rgb_resize_path() {
   176U,
  };
  std::array<std::uint8_t, 27> output{};
- avir::CImageResizer<> resizer{8};
+ CpuAvirResizer resizer{8};
  resizer.resizeImage(source.data(), 2, 2, 0, output.data(), 3, 3, 3, 0.0, nullptr);
 }
 }  // namespace
 struct RgbImageResizer::Impl {
- avir::CImageResizer<> resizer{8};
+ CpuAvirResizer resizer{8};
  bool perceptual_enabled = false;
  std::vector<std::uint8_t> byte_scratch;
  std::unique_ptr<perceptual::CpuDownscaler> perceptual;

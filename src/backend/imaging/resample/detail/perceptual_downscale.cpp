@@ -9,65 +9,113 @@
 #include <new>
 namespace mmltk::backend::imaging::resample::perceptual {
 namespace {
-void vector_add(__m256 value, __m256& sum, __m256& error) {
+// Mask both parts of the compensated state: adding zero can still consume a
+// previous error and is not a no-op for a completed lane.
+template <bool Masked = false>
+void vector_add(__m256 value, __m256& sum, __m256& error, __m256 active = {}) {
  const auto adjusted = _mm256_sub_ps(value, error), next = _mm256_add_ps(sum, adjusted);
- error = _mm256_sub_ps(_mm256_sub_ps(next, sum), adjusted);
- sum = next;
+ const auto next_error = _mm256_sub_ps(_mm256_sub_ps(next, sum), adjusted);
+ if constexpr (Masked) {
+  error = _mm256_blendv_ps(error, next_error, active);
+  sum = _mm256_blendv_ps(sum, next, active);
+ } else {
+  error = next_error;
+  sum = next;
+ }
 }
-// Eight neighboring output cells traverse their contiguous integer source
-// rectangle together. Even 2x2 reductions use eight active SIMD lanes. Byte
-// gathers never load a fourth byte beyond an RGB pixel or cross row padding.
-template <RgbPixelFormat Format>
-void integer_moments8(RgbConstImageView source, const TransferTable& transfer, std::uint32_t first_x, Footprint fy, std::uint32_t step, Moment* output, float* alpha_output) {
+// Lane addresses are valid even for inactive lanes. Packed RGB reads only its
+// three bytes; neither a fourth byte nor row padding is used by a gather.
+template <RgbPixelFormat Format, class SourceX>
+void load_colors8(RgbConstImageView source, const TransferTable& transfer, std::uint32_t y, SourceX source_x, __m256 (&colors)[3], __m256& alpha) {
+ __m256 rgb[3];
+ const auto* row = static_cast<const std::uint8_t*>(source.data) + std::size_t(y) * source.layout.row_stride_bytes;
+ constexpr unsigned channels = Format == RgbPixelFormat::RGBA8 ? 4 : 3;
+ for (unsigned k = 0; k < 3; ++k) {
+  if constexpr (Format == RgbPixelFormat::PlanarUnitSrgbF32) {
+   alignas(32) float linear[8];
+   const auto* plane = reinterpret_cast<const float*>(row + k * source.layout.plane_stride_bytes);
+   for (unsigned lane = 0; lane < 8; ++lane) linear[lane] = decode(unit(plane[source_x(lane)]));
+   rgb[k] = _mm256_load_ps(linear);
+  } else {
+   alignas(32) int indices[8];
+   for (unsigned lane = 0; lane < 8; ++lane) indices[lane] = row[std::size_t(source_x(lane)) * channels + k];
+   rgb[k] = _mm256_i32gather_ps(transfer.linear, _mm256_load_si256(reinterpret_cast<const __m256i*>(indices)), 4);
+  }
+ }
+ if constexpr (Format == RgbPixelFormat::RGBA8) {
+  alignas(32) int values[8];
+  for (unsigned lane = 0; lane < 8; ++lane) values[lane] = row[std::size_t(source_x(lane)) * 4 + 3];
+  alpha = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_load_si256(reinterpret_cast<const __m256i*>(values))), _mm256_set1_ps(1.0F / 255));
+  for (auto& channel : rgb) channel = _mm256_mul_ps(channel, alpha);
+ }
+ using C = ColorCoefficients;
+ const auto channel = [&](float r, float g, float b) { return _mm256_fmadd_ps(rgb[0], _mm256_set1_ps(r), _mm256_fmadd_ps(rgb[1], _mm256_set1_ps(g), _mm256_mul_ps(rgb[2], _mm256_set1_ps(b)))); };
+ colors[0] = channel(C::yr, C::yg, C::yb);
+ colors[1] = channel(C::cbr, C::cbg, C::cbb);
+ colors[2] = channel(C::crr, C::crg, C::crb);
+}
+// Eight neighboring cells traverse each footprint in scalar row-major order.
+// Integer specialization retains uniform addressing and one scalar reciprocal;
+// fractional lanes retain MomentAccumulator's weighted arithmetic and masking.
+template <RgbPixelFormat Format, bool Integer>
+void moments8(RgbConstImageView source, const TransferTable& transfer, const Footprint* fx, Footprint fy, Moment* output, float* alpha_output) {
  __m256 means[3]{}, variances[3]{}, mean_errors[3]{}, variance_errors[3]{};
- __m256 alpha_sum = _mm256_setzero_ps(), alpha_error = _mm256_setzero_ps();
+ __m256 alpha_sum{}, alpha_error{}, weight{}, weight_error{};
  std::uint64_t samples = 0;
+ std::uint32_t span = fx[0].end - fx[0].first;
+ if constexpr (!Integer)
+  for (unsigned lane = 1; lane < 8; ++lane) span = std::max(span, fx[lane].end - fx[lane].first);
  for (std::uint32_t y = fy.first; y < fy.end; ++y)
-  for (std::uint32_t dx = 0; dx < step; ++dx) {
-   __m256 rgb[3];
-   __m256 alpha = _mm256_set1_ps(1);
-   const auto* row = static_cast<const std::uint8_t*>(source.data) + std::size_t(y) * source.layout.row_stride_bytes;
-   constexpr unsigned channels = Format == RgbPixelFormat::RGBA8 ? 4 : 3;
-   for (unsigned k = 0; k < 3; ++k) {
-    if constexpr (Format == RgbPixelFormat::PlanarUnitSrgbF32) {
-     alignas(32) float linear[8];
-     const auto* plane = reinterpret_cast<const float*>(row + k * source.layout.plane_stride_bytes);
-     for (unsigned lane = 0; lane < 8; ++lane) linear[lane] = decode(unit(plane[first_x + lane * step + dx]));
-     rgb[k] = _mm256_load_ps(linear);
-    } else {
-     alignas(32) int indices[8];
-     for (unsigned lane = 0; lane < 8; ++lane) indices[lane] = row[std::size_t(first_x + lane * step + dx) * channels + k];
-     rgb[k] = _mm256_i32gather_ps(transfer.linear, _mm256_load_si256(reinterpret_cast<const __m256i*>(indices)), 4);
+  for (std::uint32_t dx = 0; dx < span; ++dx) {
+   __m256 sample_weight{}, active{}, fraction{}, colors[3], alpha{};
+   std::uint32_t positions[8];
+   if constexpr (Integer) {
+    fraction = _mm256_set1_ps(1.0F / static_cast<float>(++samples));
+    load_colors8<Format>(source, transfer, y, [&](unsigned lane) { return fx[0].first + lane * span + dx; }, colors, alpha);
+   } else {
+    alignas(32) float weights[8];
+    const float wy = fy.weight(y);
+    for (unsigned lane = 0; lane < 8; ++lane) {
+     const bool present = dx < fx[lane].end - fx[lane].first;
+     positions[lane] = fx[lane].first + (present ? dx : 0);
+     weights[lane] = present ? wy * fx[lane].weight(positions[lane]) : 0;
     }
+    sample_weight = _mm256_load_ps(weights);
+    active = _mm256_cmp_ps(sample_weight, _mm256_setzero_ps(), _CMP_GT_OQ);
+    vector_add<true>(sample_weight, weight, weight_error, active);
+    // Never divide by zero while evaluating a lane that will be discarded.
+    fraction = _mm256_div_ps(sample_weight, _mm256_blendv_ps(_mm256_set1_ps(1), weight, active));
+    load_colors8<Format>(source, transfer, y, [&](unsigned lane) { return positions[lane]; }, colors, alpha);
    }
    if constexpr (Format == RgbPixelFormat::RGBA8) {
-    alignas(32) int values[8];
-    for (unsigned lane = 0; lane < 8; ++lane) values[lane] = row[std::size_t(first_x + lane * step + dx) * 4 + 3];
-    alpha = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_load_si256(reinterpret_cast<const __m256i*>(values))), _mm256_set1_ps(1.0F / 255));
-    for (auto& channel : rgb) channel = _mm256_mul_ps(channel, alpha);
-    vector_add(alpha, alpha_sum, alpha_error);
+    if constexpr (!Integer) alpha = _mm256_mul_ps(sample_weight, alpha);
+    vector_add<!Integer>(alpha, alpha_sum, alpha_error, active);
    }
-   using C = ColorCoefficients;
-   const auto channel = [&](float r, float g, float b) { return _mm256_fmadd_ps(rgb[0], _mm256_set1_ps(r), _mm256_fmadd_ps(rgb[1], _mm256_set1_ps(g), _mm256_mul_ps(rgb[2], _mm256_set1_ps(b)))); };
-   const __m256 colors[]{channel(C::yr, C::yg, C::yb), channel(C::cbr, C::cbg, C::cbb), channel(C::crr, C::crg, C::crb)};
-   const auto inverse = _mm256_set1_ps(1.0F / static_cast<float>(++samples));
    for (int k = 0; k < 3; ++k) {
     const auto delta = _mm256_sub_ps(colors[k], means[k]);
-    vector_add(_mm256_mul_ps(delta, inverse), means[k], mean_errors[k]);
-    vector_add(_mm256_mul_ps(delta, _mm256_sub_ps(colors[k], means[k])), variances[k], variance_errors[k]);
+    vector_add<!Integer>(_mm256_mul_ps(delta, fraction), means[k], mean_errors[k], active);
+    auto weighted_delta = delta;
+    if constexpr (!Integer) weighted_delta = _mm256_mul_ps(sample_weight, delta);
+    vector_add<!Integer>(_mm256_mul_ps(weighted_delta, _mm256_sub_ps(colors[k], means[k])), variances[k], variance_errors[k], active);
    }
   }
- const auto inverse = _mm256_set1_ps(1.0F / static_cast<float>(samples));
+ const auto normalize = [&](__m256 value) {
+  if constexpr (Integer)
+   return _mm256_mul_ps(value, _mm256_set1_ps(1.0F / static_cast<float>(samples)));
+  else
+   return _mm256_div_ps(value, weight);
+ };
  alignas(32) float means_out[8], variances_out[8];
  for (int k = 0; k < 3; ++k) {
   _mm256_store_ps(means_out, means[k]);
-  _mm256_store_ps(variances_out, _mm256_max_ps(_mm256_setzero_ps(), _mm256_mul_ps(_mm256_sub_ps(variances[k], variance_errors[k]), inverse)));
+  _mm256_store_ps(variances_out, _mm256_max_ps(_mm256_setzero_ps(), normalize(_mm256_sub_ps(variances[k], variance_errors[k]))));
   for (unsigned lane = 0; lane < 8; ++lane) {
    output[lane].mean[k] = means_out[lane];
    output[lane].variance[k] = variances_out[lane];
   }
  }
- if constexpr (Format == RgbPixelFormat::RGBA8) _mm256_storeu_ps(alpha_output, _mm256_mul_ps(_mm256_sub_ps(alpha_sum, alpha_error), inverse));
+ if constexpr (Format == RgbPixelFormat::RGBA8)
+  _mm256_storeu_ps(alpha_output, _mm256_min_ps(_mm256_set1_ps(1), _mm256_max_ps(_mm256_setzero_ps(), normalize(_mm256_sub_ps(alpha_sum, alpha_error)))));
 }
 }  // namespace
 void copy_identity(RgbConstImageView source, RgbMutableImageView destination) {
@@ -131,12 +179,10 @@ void CpuDownscaler::execute(RgbConstImageView source, RgbMutableImageView destin
   const Footprint fy = y_[y];
   auto& row = moments_[y % 2];
   std::uint32_t x = 0;
-  if constexpr (Integer) {
-   for (; width - x >= 8; x += 8) {
-    float* alpha = nullptr;
-    if constexpr (Format == RgbPixelFormat::RGBA8) alpha = alpha_[y % 2].data() + x;
-    integer_moments8<Format>(source, transfer_, x_[x].first, fy, source.layout.width / width, row.data() + x, alpha);
-   }
+  for (; width - x >= 8; x += 8) {
+   float* alpha = nullptr;
+   if constexpr (Format == RgbPixelFormat::RGBA8) alpha = alpha_[y % 2].data() + x;
+   moments8<Format, Integer>(source, transfer_, x_.data() + x, fy, row.data() + x, alpha);
   }
   for (; x < width; ++x) {
    const Footprint fx = x_[x];
