@@ -13,6 +13,7 @@ mmltk_register_public_headers(
         ../validate/validation_types.h
         ../validate/validation_runtime.h
         ../export/export_system.h
+        ../export/export_run.h
         predict_system.h
         dataset_system.h
         model_system.h
@@ -21,6 +22,7 @@ mmltk_register_ordinary_sources(
     mmltk_controller_data_compute_systems
     compute_intent_materializer.cpp
     compute_runtime.cpp
+    ../export/export_run.cpp
     detail/cuda_runtime_resources.cpp
     dataset_system.cpp
     ../validate/validation_system.cpp

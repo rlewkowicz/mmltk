@@ -800,13 +800,6 @@ private:
    }
   });
  }
- template <class Relation>
- void EmitModelPredicate(const auto& row) {
-  if constexpr (std::tuple_size_v<decltype(Relation::predicate)> == 0U)
-   output_ << "true";
-  else
-   output_ << "settings." << RustMemberPath<Settings, std::get<0>(Relation::predicate)>() << " == " << (*row.required_export_build_tensorrt ? "true" : "false");
- }
  void EmitModelSelection() {
   using namespace mmltk::controller::contracts;
   symbols_.Reserve("module", "ModelSelectionFields", "canonical model key settings identities");
@@ -815,12 +808,12 @@ private:
   output_ << "}\nimpl ModelSelectionFields { pub fn all(&self) -> [u64; " << TrainWeightsModelSelection::key_relation::member_count << "] { [";
   TrainWeightsModelSelection::key_relation::VisitMembers([&]<class Entry>() { output_ << "self." << RustMemberPath<ModelSelectionKey, Entry::destination>() << ','; });
   output_ << "] } }\n";
-  ReserveGeneratedStruct("ModelArtifactDialogFact", "canonical model artifact dialogs", {"target", "stable_field_id", "key_fields", "predicate_field_id", "field_path", "dialog"});
+  ReserveGeneratedStruct("ModelArtifactDialogFact", "canonical model artifact dialogs", {"target", "stable_field_id", "key_fields", "field_path", "dialog"});
   symbols_.Reserve("module", "MODEL_ARTIFACT_DIALOGS", "canonical model artifact dialogs");
   output_ << "#[derive(Debug, Clone, PartialEq)]\n"
              "pub struct ModelArtifactDialogFact { pub target: ModelArtifactTarget, "
              "pub stable_field_id: u64, pub key_fields: ModelSelectionFields, "
-             "pub predicate_field_id: Option<u64>, pub field_path: &'static str, pub dialog: ModelArtifactDialog }\n"
+             "pub field_path: &'static str, pub dialog: ModelArtifactDialog }\n"
              "pub static MODEL_ARTIFACT_DIALOGS: &[ModelArtifactDialogFact] = &[\n";
   ModelSelectionRelation::VisitRows([&]<class Relation>(const auto& row) {
    constexpr auto path = mmltk::frameworks::reflection::reflected_member_path<Settings, Relation::artifact>();
@@ -830,33 +823,16 @@ private:
            << ", input: ModelArtifactInputKind::" << rust_identifier(mmltk::frameworks::reflection::enum_name(row.input), true) << " }, stable_field_id: " << stable_id
            << ", key_fields: ModelSelectionFields {";
    EmitModelKeyFields<Relation>(false);
-   output_ << "}, predicate_field_id: ";
-   if constexpr (std::tuple_size_v<decltype(Relation::predicate)> == 0U)
-    output_ << "None";
-   else {
-    constexpr auto predicate_path = mmltk::frameworks::reflection::reflected_member_path<Settings, std::get<0>(Relation::predicate)>();
-    output_ << "Some(" << mmltk::controller::browser::application_settings_field_stable_id(predicate_path.view()) << ')';
-   }
-   output_ << ", field_path: " << std::quoted(path.view()) << ", dialog: ";
+   output_ << "}, field_path: " << std::quoted(path.view()) << ", dialog: ";
    emit_catalog_value(output_, ModelArtifactDialog{row.dialog_title, row.dialog_filter, row.dialog_pattern});
    output_ << " },\n";
   });
   output_ << "];\n";
-  symbols_.Reserve("module", "model_dialog_predicate_matches", "canonical model selection predicate");
-  output_ << "pub fn model_dialog_predicate_matches(settings: &GuiSettingsState, dialog: &ModelArtifactDialogFact) -> bool { "
-             "match dialog.stable_field_id {\n";
-  ModelSelectionRelation::VisitRows([&]<class Relation>(const auto& row) {
-   output_ << mmltk::controller::browser::application_settings_field_stable_id(Relation::artifact_field_path.view()) << " => ";
-   EmitModelPredicate<Relation>(row);
-   output_ << ",\n";
-  });
-  output_ << "_ => false } }\n";
   symbols_.Reserve("module", "project_model_settings", "canonical model selection projection");
   output_ << "pub fn project_model_settings(settings: &GuiSettingsState, workflow: FeatureId) -> Option<ModelSettingsProjection> {\n"
              "let mut result: Option<ModelSettingsProjection> = None;\n";
   ModelSelectionRelation::VisitRows([&]<class Relation>(const auto& row) {
-   output_ << "if workflow == FeatureId::" << rust_identifier(mmltk::frameworks::reflection::enum_name(row.workflow), true) << " && ";
-   EmitModelPredicate<Relation>(row);
+   output_ << "if workflow == FeatureId::" << rust_identifier(mmltk::frameworks::reflection::enum_name(row.workflow), true) << " ";
    output_ << " {\nif result.is_none() { result = Some(ModelSettingsProjection { key: ModelSelectionKey {\n";
    output_ << RustMemberPath<ModelSelectionKey, Relation::workflow_destination>() << ": FeatureId::" << rust_identifier(mmltk::frameworks::reflection::enum_name(Relation::workflow), true) << ",\n";
    Relation::key_relation::VisitMembers([&]<class Entry>() {
@@ -869,11 +845,7 @@ private:
     }
     output_ << ",\n";
    });
-   output_ << "}, artifact: String::new(), compatible: false, exportbuildtensorrt: ";
-   if constexpr (std::tuple_size_v<decltype(Relation::predicate)> == 0U)
-    output_ << "false";
-   else
-    output_ << "settings." << RustMemberPath<Settings, std::get<0>(Relation::predicate)>();
+   output_ << "}, artifact: String::new(), compatible: false";
    output_ << " }); }\nif settings." << RustMemberPath<Settings, Relation::input>() << " == ModelArtifactInputKind::" << rust_identifier(mmltk::frameworks::reflection::enum_name(row.input), true)
            << " { let projection = result.as_mut().unwrap();\n";
    Relation::artifact_relation::VisitMembers(

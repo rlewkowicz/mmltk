@@ -108,7 +108,6 @@ public:
   std::ofstream(root_ / "train.bin").put('\0');
   std::ofstream(root_ / "val.bin").put('\0');
   std::ofstream(root_ / "weights.pt").put('\0');
-  std::ofstream(root_ / "model-input.onnx").put('\0');
   const auto settings = loaded_.settings.materialization_facts();
   REQUIRE(settings.loaded);
   const auto expected = subsystems::system::ComputeIntentMaterializer::ModelInputFor(settings.settings, workflow);

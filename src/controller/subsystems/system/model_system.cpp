@@ -71,6 +71,8 @@ contracts::ModelUiState ModelSystem::Select(const contracts::ModelSelectionReque
  }
  const auto settings = settings_.materialization_facts();
  if (!settings.loaded || settings.revision == 0U) throw contracts::UnavailableError("settings are unavailable");
+ if (request.workflow == contracts::FeatureId::Export && !settings.settings.workflows.export_state.export_onnx && !settings.settings.workflows.export_state.build_tensorrt)
+  throw contracts::InvalidIntentError("Select ONNX or TensorRT for export");
  auto input = subsystems::system::ComputeIntentMaterializer::ModelInputFor(settings.settings, request.workflow);
  if (!input) throw contracts::InvalidIntentError(input.error().detail);
  run_.Start({

@@ -33,7 +33,6 @@ pub(crate) fn model_settings_projection(
             .iter()
             .filter(|dialog| {
                 dialog.target.workflow == workflow
-                    && crate::generated::model_dialog_predicate_matches(settings, dialog)
             })
     };
     let fields = matching().next()?;
@@ -201,10 +200,7 @@ mod tests {
 
         for dialog in crate::generated::MODEL_ARTIFACT_DIALOGS {
             let row = compatibility_for_dialog(dialog).unwrap();
-            let build = row.requiredexportbuildtensorrt.unwrap_or(false);
-            if let Some(predicate) = dialog.predicate_field_id {
-                write_field(&mut settings, predicate, SettingsFieldValue::Bool(build));
-            }
+
             write_field(
                 &mut settings,
                 dialog.key_fields.input,
@@ -231,14 +227,7 @@ mod tests {
                     allowed
                 );
             }
-            if let Some(predicate) = dialog.predicate_field_id {
-                write_field(&mut settings, predicate, SettingsFieldValue::Bool(!build));
-                assert!(
-                    !model_settings_projection(&settings, FeatureId::Export)
-                        .expect("Export selection")
-                        .can_prepare()
-                );
-            }
+
         }
     }
 
@@ -253,13 +242,7 @@ mod tests {
             .clone();
         for dialog in crate::generated::MODEL_ARTIFACT_DIALOGS {
             let row = compatibility_for_dialog(dialog).unwrap();
-            if let Some(predicate) = dialog.predicate_field_id {
-                write_field(
-                    &mut settings,
-                    predicate,
-                    SettingsFieldValue::Bool(row.requiredexportbuildtensorrt.unwrap()),
-                );
-            }
+
             write_field(
                 &mut settings,
                 dialog.key_fields.input,

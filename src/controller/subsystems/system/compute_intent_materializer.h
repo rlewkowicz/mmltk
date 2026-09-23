@@ -1,5 +1,6 @@
 #pragma once
 #include <expected>
+#include "src/controller/subsystems/export/export_run.h"
 #include <string>
 #include "src/frameworks/reflection/field_policy.h"
 #include "src/backend/models/rfdetr/contract/workflow_requests.h"
@@ -16,7 +17,7 @@ struct ComputeIntentMaterializer final {
   [[= mmltk::frameworks::reflection::MaxBytes{mmltk::controller::contracts::kArtifactErrorCapacity}]] std::string detail;
  };
  using ValidationMaterialization = std::expected<mmltk::backend::models::rfdetr::ValidateRequest, Refusal>;
- using ExportMaterialization = std::expected<mmltk::backend::models::rfdetr::ModelExportRequest, Refusal>;
+ using ExportMaterialization = std::expected<mmltk::controller::ExportRunRequest, Refusal>;
  using PredictionMaterialization = std::expected<mmltk::backend::models::rfdetr::PredictRequest, Refusal>;
  // Validated selection settings plus native acquisition parameters.
  struct ModelInput final {

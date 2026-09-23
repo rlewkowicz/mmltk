@@ -46,7 +46,8 @@ impl ApplicationModel {
     }
 
     pub fn model_selection_available(&self, settings: &GuiSettingsState, page: FeatureId) -> bool {
-        if self.connection != ConnectionState::Connected {
+        if self.connection != ConnectionState::Connected
+            || (page == FeatureId::Export && !settings.workflows.exportstate.exportonnx && !settings.workflows.exportstate.buildtensorrt) {
             return false;
         }
         if self.settings_snapshot.is_none()
@@ -96,6 +97,9 @@ impl ApplicationModel {
     }
 
     pub fn compute_start_available(&self, settings: &GuiSettingsState, page: FeatureId) -> bool {
+        if page == FeatureId::Export && !settings.workflows.exportstate.exportonnx && !settings.workflows.exportstate.buildtensorrt {
+            return false;
+        }
         let orchestrated = matches!(
             page,
             FeatureId::Train | FeatureId::Validate | FeatureId::Predict

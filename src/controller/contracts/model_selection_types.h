@@ -28,7 +28,6 @@ struct ModelSettingsProjection final {
  ModelSelectionKey key{};
  [[= mmltk::frameworks::reflection::MaxBytes{kModelArtifactCapacity}]] std::string artifact;
  bool compatible = false;
- bool export_build_tensorrt = false;
  bool operator==(const ModelSettingsProjection&) const = default;
 };
 MMLTK_REFLECT_FIELDS(ModelSelectionKey)

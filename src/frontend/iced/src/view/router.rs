@@ -209,6 +209,18 @@ impl Router {
         settings: &mut crate::view::settings::Component,
         message: Message,
     ) -> Result<Option<Outcome>, String> {
+        let model_message = match &message {
+            Message::Train(train::Message::Model(value)) => Some((FeatureId::Train, value)),
+            Message::Validate(validate::Message::Model(value)) => Some((FeatureId::Validate, value)),
+            Message::Predict(predict::Message::Model(value)) => Some((FeatureId::Predict, value)),
+            Message::Export(export::Message::Model(value)) => Some((FeatureId::Export, value)),
+            _ => None,
+        };
+        if let Some((workflow, crate::view::workflow::model_card::Message::ConfirmArtifact { path, generation })) = model_message {
+            if !crate::view::workflow::model_card::confirmation_matches(model, settings.draft(), workflow, path, *generation) {
+                return Err("The custom model confirmation is stale.".to_owned());
+            }
+        }
         let outcome = match message {
             Message::Navigation(message) => match navigation::update(message) {
                 navigation::Outcome::PageSelected(feature) => Outcome::FeatureSelected(feature),

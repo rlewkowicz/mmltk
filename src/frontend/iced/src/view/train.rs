@@ -502,14 +502,6 @@ mod tests {
         component
             .update(
                 &mut model,
-                Message::Model(crate::view::workflow::model_card::Message::SourceSelected(
-                    crate::generated::ModelSelectionSource::Custom,
-                )),
-            )
-            .unwrap();
-        component
-            .update(
-                &mut model,
                 Message::Model(
                     crate::view::workflow::model_card::Message::ConfirmArtifact {
                         path: draft.clone(),

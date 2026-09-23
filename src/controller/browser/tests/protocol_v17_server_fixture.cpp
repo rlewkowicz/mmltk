@@ -173,8 +173,6 @@ int main(const int argument_count, char* const* const arguments) {
    Row::input(settings) = mode == 2U ? contracts::ModelArtifactInputKind::None : compatibility.input;
    Row::artifact(settings) = "/tmp/fixture-model";
    Row::class_layout(settings) = "/tmp/fixture-model.classes.json";
-   if constexpr (std::tuple_size_v<decltype(Row::predicate)> != 0U)
-    std::get<0>(Row::predicate)(settings) = mode == 3U ? !*compatibility.required_export_build_tensorrt : *compatibility.required_export_build_tensorrt;
    const auto projection = contracts::model_settings_projection(settings, compatibility.workflow);
    if (!projection) {
     model_projections_valid = false;

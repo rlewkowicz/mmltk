@@ -2,6 +2,7 @@
 #include "src/test_support/async_test_utils.hpp"
 #include "src/controller/services/file_dialog_system.h"
 #include "src/controller/services/settings_system.h"
+#include "src/controller/contracts/model_selection.h"
 #include "src/test_support/filesystem_test_utils.hpp"
 #include "mmltk/frameworks/reflection/member_relation.h"
 #include <catch2/catch_test_macros.hpp>
@@ -283,6 +284,33 @@ TEST_CASE("settings retry cannot overwrite a newer committed update", "[controll
  CHECK(snapshot.revision == 2U);
  CHECK_FALSE(snapshot.settings_state.ui.dark_mode);
  CHECK(snapshot.settings_state.ui.annotation_brush_radius == 9);
+}
+}  // namespace
+}  // namespace mmltk::controller
+
+namespace mmltk::controller {
+namespace {
+TEST_CASE("export formats persist independently without changing weights selection", "[controller][systems][settings][export]") {
+ mmltk::testsupport::ScopedTempDir root{"export-format-settings"};
+ SettingsSystem settings;
+ REQUIRE(settings.Load(install_settings(root.path())).applied());
+ const auto before = contracts::model_settings_projection(settings.snapshot().settings_state, contracts::FeatureId::Export);
+ REQUIRE(before);
+ for (const bool onnx : {false, true}) {
+  for (const bool engine : {false, true}) {
+   contracts::SettingsUpdateRequest edit;
+   edit.updates = {{.path = "workflows.export_state.export_onnx", .value = mmltk::frameworks::serialization::wire::FlatValue{onnx}},
+    {.path = "workflows.export_state.build_tensorrt", .value = mmltk::frameworks::serialization::wire::FlatValue{engine}}};
+   static_cast<void>(settings.Update(std::move(edit)));
+   SettingsSystem restored;
+   REQUIRE(restored.Load(services::SettingsLocation{(root.path() / "settings.json").string()}).applied());
+   const auto state = restored.snapshot().settings_state;
+   CHECK(state.workflows.export_state.export_onnx == onnx);
+   CHECK(state.workflows.export_state.build_tensorrt == engine);
+   CHECK(contracts::model_settings_projection(state, contracts::FeatureId::Export) == before);
+   CHECK_FALSE(std::filesystem::exists(root.path() / "export"));
+  }
+ }
 }
 }  // namespace
 }  // namespace mmltk::controller

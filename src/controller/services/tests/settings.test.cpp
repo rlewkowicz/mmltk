@@ -117,8 +117,6 @@ static_assert(
   "workflows.predict.request.tensorrt_path"));
 static_assert(settings_path_is<mmltk::frameworks::reflection::member_path<&GuiSettingsState::workflows, &WorkflowSettingsState::export_state, &ExportViewState::weights_path>>(
  "workflows.export_state.weights_path"));
-static_assert(settings_path_is<mmltk::frameworks::reflection::member_path<&GuiSettingsState::workflows, &WorkflowSettingsState::export_state, &ExportViewState::onnx_input_path>>(
- "workflows.export_state.onnx_input_path"));
 struct OptimizerFixture final {
  int persisted_id;
  TrainOptimizerKind native_value;
@@ -620,8 +618,9 @@ void test_ui_settings_round_trip() {
  annotate.output_dir = "/tmp/annotated-scenes";
  annotate.full_frame = true;
  export_state.weights_path = "/tmp/export.pt";
- export_state.onnx_input_path = "/tmp/export-input.onnx";
  export_state.allow_fp16 = false;
+ export_state.export_onnx = false;
+ export_state.build_tensorrt = true;
  train.visualize_augmentation_in_explore = true;
  explore.dataset_source = ExploreDatasetSource::Custom;
  explore.custom_compiled_path = "/tmp/explore.bin";
@@ -680,7 +679,6 @@ void test_ui_settings_round_trip() {
  REQUIRE((saved.at("workflows").at("validate").at("validation").at("candidate_count") == 211));
  REQUIRE((saved.at("workflows").at("validate").at("validation").at("eval_max_dets") == 213));
  REQUIRE((saved.at("workflows").at("annotate").at("annotate").at("output_dir") == "/tmp/annotated-scenes"));
- REQUIRE((saved.at("workflows").at("export").at("model_artifacts").at("onnx_input_path") == "/tmp/export-input.onnx"));
  const nlohmann::json& saved_explore = saved.at("workflows").at("explore");
  REQUIRE((saved_explore.at("device_id") == 2));
  REQUIRE((saved_explore.at("shuffle_seed") == 0x12345678U));
@@ -767,8 +765,9 @@ void test_ui_settings_round_trip() {
  REQUIRE((loaded_annotate.source.kind == SourceKind::ImageFolder));
  REQUIRE((loaded_annotate.source.image_directory == "/tmp/images"));
  REQUIRE((loaded_annotate.full_frame));
- REQUIRE((loaded_export.onnx_input_path == "/tmp/export-input.onnx"));
  REQUIRE((!loaded_export.allow_fp16));
+ CHECK_FALSE(loaded_export.export_onnx);
+ CHECK(loaded_export.build_tensorrt);
  REQUIRE((loaded_train.visualize_augmentation_in_explore));
  REQUIRE((loaded_explore.dataset_source == ExploreDatasetSource::Custom));
  REQUIRE((loaded_explore.custom_compiled_path == "/tmp/explore.bin"));
@@ -836,7 +835,7 @@ void test_fresh_defaults_use_capture_only_annotate() {
  REQUIRE((annotate.weights_path.empty()));
  REQUIRE((annotate.onnx_path.empty()));
  REQUIRE((annotate.tensorrt_path.empty()));
- REQUIRE((export_state.model_input == ModelArtifactInputKind::None));
+ REQUIRE((export_state.model_input == ModelArtifactInputKind::Weights));
 }
 TEST_CASE("explicit compiled selections override inferred directories and keep test input optional", "[gui][settings]") {
  auto state = default_gui_settings_state();
@@ -1138,7 +1137,7 @@ void test_model_selection_settings_validation_exhausts_canonical_compatibility()
    case FeatureId::Explore: FAIL("test case requires a ModelSystem workflow");
   }
   const bool expected =
-   input == ModelArtifactInputKind::None || (workflow == FeatureId::Export ? model_selection_compatible(workflow, source, input, build_tensorrt) : model_selection_compatible(workflow, source, input));
+   input == ModelArtifactInputKind::None || model_selection_compatible(workflow, source, input);
   CHECK(gui_settings_valid(state) == expected);
  };
  for (const auto workflow : {FeatureId::Train, FeatureId::Validate, FeatureId::Predict}) {

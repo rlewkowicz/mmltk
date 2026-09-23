@@ -128,7 +128,6 @@ fn validate_generated_surfaces() -> io::Result<()> {
                     .key_fields
                     .all()
                     .into_iter()
-                    .chain(dialog.predicate_field_id)
                     .all(|id| settings_ids.contains(&id))
                 && schema::MODEL_SELECTION_COMPATIBILITY_CATALOG
                     .iter()

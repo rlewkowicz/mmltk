@@ -27,7 +27,7 @@ void append_model_artifact_dialogs(FileDialogDescriptorStorage& dialogs) {
   descriptor.title = decltype(descriptor.title)::From(compatibility.dialog_title);
   descriptor.filter.name = decltype(descriptor.filter.name)::From(compatibility.dialog_filter);
   descriptor.filter.pattern = decltype(descriptor.filter.pattern)::From(compatibility.dialog_pattern);
-  if (compatibility.workflow == mmltk::controller::contracts::FeatureId::Train || compatibility.workflow == mmltk::controller::contracts::FeatureId::Validate) {
+  if (mmltk::controller::contracts::model_selection_workflow_supported(compatibility.workflow)) {
    std::string patterns;
    for (const auto& candidate : mmltk::controller::contracts::kModelSelectionCompatibility) {
     if (candidate.workflow != compatibility.workflow || !candidate.custom_allowed) continue;

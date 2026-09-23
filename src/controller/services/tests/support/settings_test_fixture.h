@@ -29,10 +29,9 @@ namespace mmltk::controller::test_support {
  settings.workflows.predict.model_source = contracts::ModelSelectionSource::Custom;
  settings.workflows.predict.model_input = contracts::ModelArtifactInputKind::Weights;
  settings.workflows.export_state.weights_path = root / "weights.pt";
- settings.workflows.export_state.onnx_input_path = root / "model-input.onnx";
  settings.workflows.export_state.output = {.automatic = false, .directory = (root / "export").string()};
  settings.workflows.export_state.model_source = contracts::ModelSelectionSource::Custom;
- settings.workflows.export_state.model_input = contracts::ModelArtifactInputKind::Onnx;
+ settings.workflows.export_state.model_input = contracts::ModelArtifactInputKind::Weights;
  REQUIRE(contracts::gui_settings_valid(settings));
  const services::SettingsLocation location{(root / "settings.json").string()};
  REQUIRE(services::SettingsStore::save(location.value(), settings, 1U).succeeded());

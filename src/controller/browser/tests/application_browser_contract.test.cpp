@@ -1158,23 +1158,18 @@ TEST_CASE("custom model dialogs derive from the canonical compatibility catalog"
   CHECK(found != entries.end());
   CHECK(found->stable_id == application_settings_field_stable_id(typed_path.view()));
   CHECK(found->field_path.view() == typed_path.view());
-  if (compatibility.workflow == contracts::FeatureId::Train || compatibility.workflow == contracts::FeatureId::Validate) {
-   CHECK(found->filter.pattern.view().contains(compatibility.dialog_pattern));
-   CHECK(found->filter.pattern.view().contains("*.pth"));
-   CHECK(found->filter.pattern.view().contains("*.onnx") == (compatibility.workflow == contracts::FeatureId::Validate));
-   CHECK(found->filter.pattern.view().contains("*.engine") == (compatibility.workflow == contracts::FeatureId::Validate));
-  } else {
-   CHECK(found->title.view() == compatibility.dialog_title);
-   CHECK(found->filter.name.view() == compatibility.dialog_filter);
-   CHECK(found->filter.pattern.view() == compatibility.dialog_pattern);
-  }
+  CHECK(found->filter.pattern.view().contains(compatibility.dialog_pattern));
+  CHECK(found->filter.pattern.view().contains("*.onnx") == (compatibility.workflow == contracts::FeatureId::Validate || compatibility.workflow == contracts::FeatureId::Predict));
+  CHECK(found->filter.pattern.view().contains("*.engine") == (compatibility.workflow == contracts::FeatureId::Validate || compatibility.workflow == contracts::FeatureId::Predict));
+  if (compatibility.workflow == contracts::FeatureId::Export) CHECK(found->filter.pattern.view() == "*.pt");
+
  });
- CHECK(row_index == 9U);
+ CHECK(row_index == 8U);
 }
-TEST_CASE("export ONNX input and output directory publish distinct canonical dialogs", "[controller][browser][reflection][dialog]") {
+TEST_CASE("export weights input and output directory publish distinct canonical dialogs", "[controller][browser][reflection][dialog]") {
  const auto entries = services::file_dialog_catalog().entries();
  const auto find_path = [&](const std::string_view path) { return std::ranges::find(entries, path, [](const services::FileDialogDescriptor& entry) { return entry.field_path.view(); }); };
- const auto input = find_path("workflows.export_state.onnx_input_path");
+ const auto input = find_path("workflows.export_state.weights_path");
  const auto output = find_path("workflows.export_state.output.directory");
  REQUIRE(input != entries.end());
  REQUIRE(output != entries.end());
@@ -1182,7 +1177,7 @@ TEST_CASE("export ONNX input and output directory publish distinct canonical dia
  CHECK(output->stable_id == application_settings_field_stable_id(output->field_path.view()));
  CHECK(input->stable_id != output->stable_id);
  CHECK(input->mode == contracts::FileDialogMode::OpenFile);
- CHECK(input->model_input == mmltk::backend::models::catalog::ModelArtifactInputKind::Onnx);
+ CHECK(input->model_input == mmltk::backend::models::catalog::ModelArtifactInputKind::Weights);
  CHECK(output->mode == contracts::FileDialogMode::OpenFolder);
  CHECK_FALSE(output->model_input);
 }

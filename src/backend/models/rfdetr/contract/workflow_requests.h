@@ -11,7 +11,6 @@
 #include <string>
 #include <string_view>
 #include <type_traits>
-#include <variant>
 #include <vector>
 #include "mmltk/frameworks/reflection/materializer.h"
 #include "mmltk/frameworks/reflection/member_relation.h"
@@ -54,7 +53,6 @@ struct ExportOnnxRequest : ModelArtifactOutputRequest {
  [[= mmltk::frameworks::reflection::Minimum<int>{1}]] int opset_version = 19;
  bool simplify = false;
 };
-using ModelExportRequest = std::variant<BuildEngineRequest, ExportOnnxRequest>;
 enum class PredictSourceKind : std::uint8_t {
  CompiledDataset,
  ImageFiles,

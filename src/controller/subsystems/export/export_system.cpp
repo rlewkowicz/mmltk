@@ -21,25 +21,14 @@ public:
 };
 CudaExportRuntime::CudaExportRuntime(DirectComputeConfiguration configuration) : impl_(std::make_unique<Impl>(configuration)) {}
 CudaExportRuntime::~CudaExportRuntime() = default;
-contracts::ComputeTerminal CudaExportRuntime::Run(mmltk::backend::models::rfdetr::ModelExportRequest operation, std::stop_token stop, const ComputeProgressSink&, const ComputeArtifactSink& published) {
- using mmltk::backend::models::rfdetr::BuildEngineRequest;
- using mmltk::backend::models::rfdetr::ExportOnnxRequest;
+contracts::ComputeTerminal CudaExportRuntime::Run(ExportRunRequest operation, std::stop_token stop, const ComputeProgressSink& progress, const ComputeArtifactSink& published) {
  return impl_->resources.Run(
-  [this, stop, &published, operation = std::move(operation)](const mmltk::backend::ml::runtime::BorrowedCommandStream stream) mutable {
-   if (auto* request = std::get_if<BuildEngineRequest>(&operation)) {
-    request->device_id = impl_->resources.device();
-    mmltk::backend::models::rfdetr::build_tensorrt_engine(*request, stream, {}, stop, published);
-    return contracts::make_compute_terminal(contracts::ComputeOperationOutcome::Succeeded, 0, 0, request->output_path.string());
-   }
-   auto& request = std::get<ExportOnnxRequest>(operation);
-   request.device_id = impl_->resources.device();
-   impl_->session.Run(request, stream, stop, published);
-   return contracts::make_compute_terminal(contracts::ComputeOperationOutcome::Succeeded, 0, 0,
-    // CLEANUP-IGNORE: ONNX export publishes its domain output path from the validated request.
-    request.output_path.string());
-  },
-  // CLEANUP-IGNORE: Export closes its own CUDA session run independently of prediction result ownership.
-  stop);
+  [this, stop, &progress, &published, operation = std::move(operation)](const mmltk::backend::ml::runtime::BorrowedCommandStream stream) mutable {
+   operation.onnx.device_id = impl_->resources.device();
+   return execute_export_run(operation, stop, progress, published,
+    [&](const auto& request, const auto& committed) { impl_->session.Run(request, stream, stop, committed); },
+    [&](const auto& request, const auto& committed) { mmltk::backend::models::rfdetr::build_tensorrt_engine(request, stream, {}, stop, committed); });
+  }, stop);
 }
 class ExportSystem::Impl final {
 public:
@@ -70,7 +59,7 @@ public:
      [&](const ComputeProgressSink& progress) {
       if (stop.stop_requested()) return contracts::make_compute_terminal(contracts::ComputeOperationOutcome::Cancelled);
       const auto directory = services::reserve_run_output(contracts::workflow_output_root(output, contracts::FeatureId::Export), !output.automatic);
-      std::visit([&](auto& request) { request.output_path = directory / request.output_path.filename(); }, *prepared);
+      prepared->output_directory = directory;
       {
        std::scoped_lock lock(mutex_);
        state_.output.directory = directory.string();

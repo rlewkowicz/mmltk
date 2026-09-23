@@ -198,9 +198,6 @@ template <class T>
    return std::nullopt;
   }();
   if (!valid_index || valid[*valid_index]) return;
-  if constexpr (std::tuple_size_v<decltype(Relation::predicate)> != 0U) {
-   if (!row.required_export_build_tensorrt || std::get<0>(Relation::predicate)(state) != *row.required_export_build_tensorrt) return;
-  }
   const auto source = Relation::source(state);
   const auto input = Relation::input(state);
   const auto& preset = Relation::preset(state);

@@ -33,38 +33,32 @@ namespace {
  REQUIRE(input);
  return {.key = input->key, .artifact = input->custom_artifact};
 }
-TEST_CASE("export materialization keeps ONNX branch input and output identities disjoint", "[controller][systems][compute][export]") {
+TEST_CASE("export materialization uses one weights identity across all format selections", "[controller][systems][compute][export]") {
  auto settings = contracts::default_gui_settings_state();
- settings.workflows.train.request.train_compiled_path = "/tmp/train.bin";
- settings.workflows.export_state.onnx_input_path = "/tmp/source.onnx";
- settings.workflows.export_state.weights_path = "/tmp/source.pt";
- const contracts::ArtifactInspection inspection{
-  .compatible = true,
-  .splits = {split("/tmp/train.bin")},
-  .detail = {},
- };
- settings.workflows.export_state.build_tensorrt = true;
- settings.workflows.export_state.model_source = contracts::ModelSelectionSource::Custom;
- settings.workflows.export_state.model_input = contracts::ModelArtifactInputKind::Onnx;
- const auto onnx_model = export_model_selection(settings, contracts::ModelArtifactInputKind::Onnx, "/tmp/source.onnx");
- const auto engine = subsystems::system::ComputeIntentMaterializer::Export(settings, inspection, onnx_model);
- REQUIRE(engine);
- REQUIRE(std::holds_alternative<mmltk::backend::models::rfdetr::BuildEngineRequest>(*engine));
- const auto& engine_request = std::get<mmltk::backend::models::rfdetr::BuildEngineRequest>(*engine);
- CHECK(engine_request.onnx_path == "/tmp/source.onnx");
- CHECK(engine_request.output_path == "model.engine");
- settings.workflows.export_state.build_tensorrt = false;
- settings.workflows.export_state.model_input = contracts::ModelArtifactInputKind::Weights;
- const auto weight_model =
-  // CLEANUP-IGNORE: The weight-to-ONNX branch asserts a different concrete request variant from TensorRT export.
-  export_model_selection(settings, contracts::ModelArtifactInputKind::Weights, "/tmp/source.pt");
- const auto onnx = subsystems::system::ComputeIntentMaterializer::Export(settings, inspection, weight_model);
- REQUIRE(onnx);
- REQUIRE(std::holds_alternative<mmltk::backend::models::rfdetr::ExportOnnxRequest>(*onnx));
- const auto& onnx_request = std::get<mmltk::backend::models::rfdetr::ExportOnnxRequest>(*onnx);
- CHECK(onnx_request.weights_path == "/tmp/source.pt");
- CHECK(onnx_request.output_path == "model.onnx");
- CHECK(settings.workflows.export_state.onnx_input_path == "/tmp/source.onnx");
+ auto& state = settings.workflows.export_state;
+ CHECK(state.export_onnx);
+ CHECK(state.build_tensorrt);
+ state.weights_path = "/tmp/source.pt";
+ state.model_source = contracts::ModelSelectionSource::Custom;
+ state.model_input = contracts::ModelArtifactInputKind::Weights;
+ const auto model = export_model_selection(settings, contracts::ModelArtifactInputKind::Weights, state.weights_path);
+ for (const bool onnx : {false, true}) {
+  for (const bool engine : {false, true}) {
+   state.export_onnx = onnx;
+   state.build_tensorrt = engine;
+   const auto projection = contracts::model_settings_projection(settings, contracts::FeatureId::Export);
+   REQUIRE(projection);
+   CHECK(projection->key == model.key);
+   const auto run = subsystems::system::ComputeIntentMaterializer::Export(settings, {}, model);
+   CHECK(run.has_value() == (onnx || engine));
+   if (!run) continue;
+   CHECK(run->onnx.weights_path == "/tmp/source.pt");
+   CHECK(run->onnx.onnx_path.empty());
+   CHECK(run->export_onnx == onnx);
+   CHECK(run->build_tensorrt == engine);
+   CHECK(run->output_directory.empty());
+  }
+ }
 }
 TEST_CASE("model keys separate workflow artifacts from dataset splits and reject stale settings", "[controller][systems][compute][model]") {
  auto settings = contracts::default_gui_settings_state();
@@ -260,7 +254,6 @@ TEST_CASE("model input materialization exhausts the canonical compatibility cata
                                      : workflow == contracts::FeatureId::Predict ? "predict"
                                                                                  : "export";
   CHECK(projection->key.class_layout_path == "/tmp/" + workflow_name + ".classes.json");
-  CHECK(projection->export_build_tensorrt == build_tensorrt);
   // Distinct raw drafts prove source meaning independently of relation-fed fixtures.
   auto draft = settings;
   draft.workflows.train.request.preset_name = "train-draft";
@@ -275,8 +268,7 @@ TEST_CASE("model input materialization exhausts the canonical compatibility cata
   REQUIRE(draft_projection);
   CHECK(draft_projection->key.preset == workflow_name + "-draft");
   CHECK(draft_projection->key.resolution == 100U + static_cast<std::uint32_t>(workflow));
-  const auto* compatibility = workflow == contracts::FeatureId::Export ? contracts::find_model_selection_compatibility(workflow, selected_input, build_tensorrt)
-                                                                       : contracts::find_model_selection_compatibility(workflow, selected_input);
+  const auto* compatibility = contracts::find_model_selection_compatibility(workflow, selected_input);
   const bool expected = selected_input != contracts::ModelArtifactInputKind::None && compatibility != nullptr && contracts::model_selection_source_allowed(*compatibility, source);
   CAPTURE(workflow, source, selected_input, build_tensorrt);
   const auto result = subsystems::system::ComputeIntentMaterializer::ModelInputFor(settings, workflow);

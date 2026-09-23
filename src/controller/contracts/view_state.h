@@ -224,14 +224,15 @@ struct AnnotateViewState : WorkflowModelSelectionState {
 };
 // CLEANUP-IGNORE: Export owns distinct reflected artifact inputs that share the canonical path constraint.
 struct ExportViewState : WorkflowModelSelectionState {
+ ExportViewState() { model_input = ModelArtifactInputKind::Weights; }
  WorkflowOutputSelection output{};
  [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]][
   [= reflection::FileDialog<"Select class layout", "Class descriptors", "*.classes.json *.json">{.mode = FileDialogMode::OpenFile}]] std::string class_layout_path;
  [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]] std::string weights_path;
- [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]] std::string onnx_input_path;
  [[= mmltk::frameworks::reflection::Minimum<int>{0}]] int device_id = 0;
  [[= mmltk::frameworks::reflection::Minimum<int>{1}]] int opset_version = 19;
  bool allow_fp16 = true;
+ bool export_onnx = true;
  bool build_tensorrt = true;
  bool simplify = false;
 };
@@ -309,9 +310,7 @@ template <ModelArtifactSelectionView State>
   .source = s.model_source,
   .input = s.model_input};
  if constexpr (requires { source.class_layout_path; }) { artifact_state.class_layout_path = path_text(source.class_layout_path); }
- if constexpr (requires { source.onnx_input_path; }) {
-  artifact_state.onnx_path = path_text(source.onnx_input_path);
- } else if constexpr (requires { source.onnx_path; }) {
+ if constexpr (requires { source.onnx_path; }) {
   artifact_state.onnx_path = path_text(source.onnx_path);
  }
  if constexpr (requires { source.tensorrt_path; }) { artifact_state.tensorrt_path = path_text(source.tensorrt_path); }
@@ -331,9 +330,7 @@ inline void apply_model_artifacts(State& s, const ModelArtifactSelectionState& a
  }
  s.model_source = artifact_state.source;
  s.model_input = artifact_state.input;
- if constexpr (requires { destination.onnx_input_path; }) {
-  destination.onnx_input_path = artifact_state.onnx_path;
- } else if constexpr (requires { destination.onnx_path; }) {
+ if constexpr (requires { destination.onnx_path; }) {
   destination.onnx_path = artifact_state.onnx_path;
  }
  if constexpr (requires { destination.tensorrt_path; }) { destination.tensorrt_path = artifact_state.tensorrt_path; }

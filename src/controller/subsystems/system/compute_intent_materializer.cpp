@@ -122,7 +122,7 @@ std::expected<mmltk::backend::models::rfdetr::TrainRequest, ComputeIntentMateria
   mmltk::backend::models::rfdetr::validate_train_request(request);
  } catch (const std::exception& error) { return std::unexpected(refused(error.what())); }
  // CLEANUP-IGNORE: Local training returns its fully validated multi-split request; export returns a distinct model
- // request variant below.
+ // export run below.
  return request;
 }
 // CLEANUP-IGNORE: Validation materialization is a direct typed workflow boundary; sharing its orchestration with
@@ -153,31 +153,18 @@ ComputeIntentMaterializer::ExportMaterialization ComputeIntentMaterializer::Expo
  const auto selected = require_model(settings, mmltk::controller::contracts::FeatureId::Export, model);
  if (!selected) return std::unexpected(selected.error());
  const auto& state = settings.workflows.export_state;
- if (state.build_tensorrt) {
-  mmltk::backend::models::rfdetr::BuildEngineRequest request{};
-  auto& output = static_cast<mmltk::backend::models::rfdetr::ModelArtifactOutputRequest&>(request);
-  assign_model_artifact(output, model);
-  assign_export_output_facts(output, state, "model.engine");
-  request.allow_fp16 = state.allow_fp16;
-  try {
-   mmltk::backend::models::rfdetr::validate_build_engine_request(request);
-  } catch (const std::exception& error) { return std::unexpected(refused(error.what())); }
-  request.device_id = -1;
-  return mmltk::backend::models::rfdetr::ModelExportRequest{std::in_place_type<mmltk::backend::models::rfdetr::BuildEngineRequest>, std::move(request)};
- }
- mmltk::backend::models::rfdetr::ExportOnnxRequest request{};
- auto& output = static_cast<mmltk::backend::models::rfdetr::ModelArtifactOutputRequest&>(request);
- assign_model_artifact(output, model);
- assign_export_output_facts(output, state, "model.onnx");
- // CLEANUP-IGNORE: ONNX export validation consumes fields distinct from the TensorRT branch above.
+ if (!state.export_onnx && !state.build_tensorrt) return std::unexpected(refused("Select ONNX or TensorRT for export"));
+ ExportRunRequest run{.export_onnx = state.export_onnx, .build_tensorrt = state.build_tensorrt, .allow_fp16 = state.allow_fp16};
+ auto& request = run.onnx;
+ assign_model_artifact(request, model);
+ assign_export_output_facts(request, state, "model.onnx");
  request.opset_version = state.opset_version;
  request.simplify = state.simplify;
  try {
   mmltk::backend::models::rfdetr::validate_export_onnx_request(request);
  } catch (const std::exception& error) { return std::unexpected(refused(error.what())); }
- // CLEANUP-IGNORE: Export materialization and prediction materialization cross distinct validated domain boundaries.
  request.device_id = -1;
- return mmltk::backend::models::rfdetr::ModelExportRequest{std::in_place_type<mmltk::backend::models::rfdetr::ExportOnnxRequest>, std::move(request)};
+ return run;
 }
 // CLEANUP-IGNORE: Prediction materialization owns source selection and prediction-only request fields after the shared
 // model and artifact primitives have validated their inputs.

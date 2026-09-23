@@ -11,6 +11,8 @@ pub enum Message {
     StopRequested,
     DialogRequested(u64),
     Model(crate::view::workflow::model_card::Message),
+    OnnxChanged(bool),
+    TensorRtChanged(bool),
     OpsetChanged(i32),
     Fp16Changed(bool),
     SimplifyChanged(bool),
@@ -84,15 +86,11 @@ impl Component {
                     "Model artifacts, format, and output destination.",
                     column![
                         crate::view::workflow::fields::toggle(
-                            "Build TensorRT",
-                            build_tensorrt,
-                            settings_edit_available,
-                            |value| Message::Model(
-                                crate::view::workflow::model_card::Message::ExportBuildChanged(
-                                    value
-                                )
-                            ),
-                        ),
+                            "ONNX", draft.map_or(true, |value| value.exportonnx),
+                            settings_edit_available, Message::OnnxChanged),
+                        crate::view::workflow::fields::toggle(
+                            "TensorRT", build_tensorrt,
+                            settings_edit_available, Message::TensorRtChanged),
                     ]
                     .spacing(crate::view::workflow::FIELD_SPACING)
                 )
@@ -184,7 +182,7 @@ impl Component {
             ),
             crate::view::shared::disclosure(
                 "export.advanced.onnx",
-                !build_tensorrt,
+                draft.is_some_and(|value| value.exportonnx || value.buildtensorrt),
                 branch_advanced(false)
             ),
         ];
@@ -234,6 +232,16 @@ impl Component {
                 };
                 Outcome::Model(outcome)
             }
+            Message::OnnxChanged(value) => Outcome::SettingsEdited(
+                settings.edit(crate::view::settings::EditCadence::Debounced, |draft| {
+                    crate::generated::edit_workflowsexportstateexportonnx(draft, value)
+                })?,
+            ),
+            Message::TensorRtChanged(value) => Outcome::SettingsEdited(
+                settings.edit(crate::view::settings::EditCadence::Debounced, |draft| {
+                    crate::generated::edit_workflowsexportstatebuildtensorrt(draft, value)
+                })?,
+            ),
             Message::OpsetChanged(value) => Outcome::SettingsEdited(
                 settings.edit(crate::view::settings::EditCadence::Debounced, |draft| {
                     crate::generated::edit_workflowsexportstateopsetversion(draft, value)
@@ -282,5 +290,38 @@ mod tests {
             ),
             Ok(Some(Outcome::DialogRequested(value))) if value == id
         ));
+    }
+}
+
+#[cfg(test)]
+mod format_tests {
+    use super::*;
+    use crate::generated::FeatureId;
+    use crate::view::settings::installed_settings_model;
+    use crate::view_model::test_support::{accepted_model_for, bootstrapped};
+
+    #[test]
+    fn format_controls_preserve_prepared_weights_and_reject_an_empty_run() {
+        let mut settings = installed_settings_model();
+        let mut component = Component::default();
+        let mut model = bootstrapped();
+        let initial = settings.draft.as_ref().unwrap();
+        assert!(initial.workflows.exportstate.exportonnx);
+        assert!(initial.workflows.exportstate.buildtensorrt);
+        model.model_snapshot = Some(accepted_model_for(&model, initial, FeatureId::Export));
+        let selected = model.model_snapshot.clone();
+        for onnx in [false, true] {
+            for engine in [false, true] {
+                component.update(&mut settings, Message::OnnxChanged(onnx)).unwrap();
+                component.update(&mut settings, Message::TensorRtChanged(engine)).unwrap();
+                let draft = settings.draft.as_ref().unwrap();
+                assert!(model.model_selection_matches(draft, FeatureId::Export));
+                assert_eq!(model.model_snapshot, selected);
+                if !onnx && !engine {
+                    assert!(!model.compute_start_available(draft, FeatureId::Export));
+                    assert!(!model.model_selection_available(draft, FeatureId::Export));
+                }
+            }
+        }
     }
 }

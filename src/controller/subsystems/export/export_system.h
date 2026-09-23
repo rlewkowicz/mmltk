@@ -1,5 +1,6 @@
 #pragma once
 #include <functional>
+#include "export_run.h"
 #include <memory>
 #include <optional>
 #include <variant>
@@ -16,13 +17,13 @@ class ModelSystem;
 class ExportRuntime {
 public:
  virtual ~ExportRuntime() = default;
- [[nodiscard]] virtual contracts::ComputeTerminal Run(mmltk::backend::models::rfdetr::ModelExportRequest, std::stop_token, const ComputeProgressSink&, const ComputeArtifactSink& = {}) = 0;
+ [[nodiscard]] virtual contracts::ComputeTerminal Run(ExportRunRequest, std::stop_token, const ComputeProgressSink&, const ComputeArtifactSink& = {}) = 0;
 };
 class CudaExportRuntime final : public ExportRuntime {
 public:
  explicit CudaExportRuntime(DirectComputeConfiguration);
  ~CudaExportRuntime() override;
- [[nodiscard]] contracts::ComputeTerminal Run(mmltk::backend::models::rfdetr::ModelExportRequest, std::stop_token, const ComputeProgressSink&, const ComputeArtifactSink& = {}) override;
+ [[nodiscard]] contracts::ComputeTerminal Run(ExportRunRequest, std::stop_token, const ComputeProgressSink&, const ComputeArtifactSink& = {}) override;
 
 private:
  class Impl;

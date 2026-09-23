@@ -489,18 +489,17 @@ TEST_CASE("CUDA export and validation preserve cancelled outcomes and prior arti
  controller::CudaValidationRuntime validator(configuration);
  std::stop_source stop;
  stop.request_stop();
- r::ExportOnnxRequest onnx;
- onnx.weights_path = root.path() / "not-opened.pt";
- onnx.output_path = output;
+ controller::ExportRunRequest onnx{.output_directory = root.path(), .export_onnx = true, .build_tensorrt = false};
+ onnx.onnx.weights_path = root.path() / "not-opened.pt";
  std::size_t publications = 0U;
  const ComputeArtifactSink published = [&](const std::filesystem::path&) { ++publications; };
  CHECK(exporter.Run(onnx, stop.get_token(), {}, published).outcome == controller::contracts::ComputeOperationOutcome::Cancelled);
- r::BuildEngineRequest engine;
- engine.onnx_path = root.path() / "not-opened.onnx";
- engine.output_path = output;
+ auto engine = onnx;
+ engine.export_onnx = false;
+ engine.build_tensorrt = true;
  CHECK(exporter.Run(engine, stop.get_token(), {}, published).outcome == controller::contracts::ComputeOperationOutcome::Cancelled);
  r::ValidateRequest validation;
- validation.onnx_path = engine.onnx_path;
+ validation.onnx_path = root.path() / "not-opened.onnx";
  validation.save_engine_path = output;
  validation.compiled_path = root.path() / "not-opened.bin";
  validation.eval_order = "tensorrt";
@@ -564,8 +563,8 @@ namespace mmltk::controller {
 namespace {
 class PublishedThenFailedExport final : public ExportRuntime {
 public:
- contracts::ComputeTerminal Run(mmltk::backend::models::rfdetr::ModelExportRequest request, std::stop_token, const ComputeProgressSink&, const ComputeArtifactSink& published) override {
-  const auto path = std::visit([](const auto& value) { return value.output_path; }, request);
+ contracts::ComputeTerminal Run(ExportRunRequest request, std::stop_token, const ComputeProgressSink&, const ComputeArtifactSink& published) override {
+  const auto path = request.output_directory / "model.onnx";
   std::ofstream(path) << "completed fixture artifact";
   published(path);
   return contracts::make_compute_terminal(contracts::ComputeOperationOutcome::Failed, 0U, 0U, {}, "failure after publication");
@@ -588,7 +587,7 @@ TEST_CASE("export keeps committed artifacts visible when later settlement fails"
  CHECK(result.terminal.valid_worker_terminal());
  CHECK(result.terminal.output.empty());
  REQUIRE(result.output.artifacts.size() == 1U);
- CHECK(result.output.artifacts.front() == std::filesystem::path(result.output.directory) / "model.engine");
+ CHECK(result.output.artifacts.front() == std::filesystem::path(result.output.directory) / "model.onnx");
  CHECK(std::filesystem::is_regular_file(result.output.artifacts.front()));
  CHECK(settings.snapshot().settings_state.workflows.export_state.output.directory == (root.path() / "export").string());
 }
@@ -600,7 +599,7 @@ namespace {
 class CancelBeforePublicationExport final : public ExportRuntime {
 public:
  explicit CancelBeforePublicationExport(std::promise<void>& started) : started_(started) {}
- contracts::ComputeTerminal Run(mmltk::backend::models::rfdetr::ModelExportRequest, std::stop_token stop, const ComputeProgressSink&, const ComputeArtifactSink&) override {
+ contracts::ComputeTerminal Run(ExportRunRequest, std::stop_token stop, const ComputeProgressSink&, const ComputeArtifactSink&) override {
   started_.set_value();
   mmltk::testsupport::StopGate gate;
   static_cast<void>(gate.Wait(stop));
@@ -628,7 +627,115 @@ TEST_CASE("export stopped during native work does not advertise an uncommitted a
  CHECK(result.terminal.outcome == contracts::ComputeOperationOutcome::Cancelled);
  CHECK(result.terminal.valid_worker_terminal());
  CHECK(result.output.artifacts.empty());
- CHECK_FALSE(std::filesystem::exists(std::filesystem::path(result.output.directory) / "model.engine"));
+ CHECK_FALSE(std::filesystem::exists(std::filesystem::path(result.output.directory) / "model.onnx"));
+}
+}  // namespace
+}  // namespace mmltk::controller
+
+namespace mmltk::controller {
+namespace {
+TEST_CASE("export dependency chain publishes selected formats and settles temporary companions", "[controller][systems][export]") {
+ enum class Interruption { None, BeforeOnnx, DuringOnnx, BetweenStages, DuringEngine, FailedOnnx, FailedOnnxAfterPublish, FailedEngine, FailedEngineAfterPublish };
+ for (const bool save_onnx : {false, true}) {
+  for (const bool save_engine : {false, true}) {
+   for (const auto interruption : {Interruption::None, Interruption::BeforeOnnx, Interruption::DuringOnnx, Interruption::BetweenStages,
+         Interruption::DuringEngine, Interruption::FailedOnnx, Interruption::FailedOnnxAfterPublish, Interruption::FailedEngine, Interruption::FailedEngineAfterPublish}) {
+    CAPTURE(save_onnx, save_engine, interruption);
+    mmltk::testsupport::ScopedTempDir root{"export-chain"};
+    ExportRunRequest request{.output_directory = root.path(), .export_onnx = save_onnx, .build_tensorrt = save_engine, .allow_fp16 = false};
+    request.onnx.weights_path = root.path() / "source.pt";
+    request.onnx.class_layout_path = root.path() / "source.classes.json";
+    request.onnx.opset_version = 19;
+    request.onnx.simplify = true;
+    std::stop_source stop;
+    unsigned onnx_calls = 0U, engine_calls = 0U;
+    std::filesystem::path intermediate;
+    std::vector<std::filesystem::path> published;
+    std::vector<contracts::ComputeProgress> stages;
+    const auto export_onnx = [&](const auto& onnx, const ComputeArtifactSink& committed) {
+     ++onnx_calls;
+     CHECK(onnx.weights_path == request.onnx.weights_path);
+     CHECK(onnx.class_layout_path == request.onnx.class_layout_path);
+     CHECK(onnx.opset_version == 19);
+     CHECK(onnx.simplify);
+     intermediate = onnx.output_path;
+     if (interruption == Interruption::DuringOnnx) { stop.request_stop(); return; }
+     if (interruption == Interruption::FailedOnnx) throw std::runtime_error("ONNX fixture failure");
+     std::ofstream(onnx.output_path) << "ONNX";
+     std::ofstream(onnx.output_path.string() + ".classes.json") << "class facts";
+     committed(onnx.output_path);
+     if (interruption == Interruption::FailedOnnxAfterPublish) throw std::runtime_error("ONNX close failure");
+     if (interruption == Interruption::BetweenStages) stop.request_stop();
+    };
+    const auto build = [&](const auto& engine, const ComputeArtifactSink& committed) {
+     ++engine_calls;
+     CHECK(engine.onnx_path == intermediate);
+     CHECK(engine.weights_path.empty());
+     CHECK(engine.class_layout_path.empty());
+     CHECK_FALSE(engine.allow_fp16);
+     CHECK(std::filesystem::exists(engine.onnx_path));
+     CHECK(std::filesystem::exists(engine.onnx_path.string() + ".classes.json"));
+     if (interruption == Interruption::DuringEngine) { stop.request_stop(); return; }
+     if (interruption == Interruption::FailedEngine) throw std::runtime_error("engine fixture failure");
+     std::ofstream(engine.output_path) << "engine";
+     committed(engine.output_path);
+     if (interruption == Interruption::FailedEngineAfterPublish) throw std::runtime_error("engine close failure");
+    };
+    const auto progress = [&](const contracts::ComputeProgress& value) {
+     CHECK(value.valid());
+     CHECK((stages.empty() || value.sequence > stages.back().sequence));
+     stages.push_back(value);
+     if (interruption == Interruption::BeforeOnnx) stop.request_stop();
+    };
+    const auto run = [&] { return execute_export_run(request, stop.get_token(), progress, [&](const auto& path) { published.push_back(path); }, export_onnx, build); };
+    const bool invalid = !save_onnx && !save_engine;
+    const bool failing = interruption == Interruption::FailedOnnx || interruption == Interruption::FailedOnnxAfterPublish ||
+     (save_engine && (interruption == Interruption::FailedEngine || interruption == Interruption::FailedEngineAfterPublish));
+    if (invalid || failing) {
+     CHECK_THROWS(run());
+    } else {
+     const auto result = run();
+     CHECK(result.valid_worker_terminal());
+     const bool cancelled = interruption == Interruption::BeforeOnnx || interruption == Interruption::DuringOnnx || interruption == Interruption::BetweenStages ||
+      (save_engine && interruption == Interruption::DuringEngine);
+     CHECK(result.outcome == (cancelled ? contracts::ComputeOperationOutcome::Cancelled : contracts::ComputeOperationOutcome::Succeeded));
+    }
+    CHECK(onnx_calls == (invalid || interruption == Interruption::BeforeOnnx ? 0U : 1U));
+    const bool reached_engine = !invalid && save_engine && interruption != Interruption::BeforeOnnx && interruption != Interruption::DuringOnnx &&
+     interruption != Interruption::BetweenStages && interruption != Interruption::FailedOnnx && interruption != Interruption::FailedOnnxAfterPublish;
+    CHECK(engine_calls == (reached_engine ? 1U : 0U));
+    if (!save_onnx && !intermediate.empty()) CHECK_FALSE(std::filesystem::exists(intermediate.parent_path()));
+    for (const auto& path : published) {
+     CHECK(path.parent_path() == root.path());
+     CHECK(std::filesystem::is_regular_file(path));
+    }
+    const bool onnx_completed = !invalid && interruption != Interruption::BeforeOnnx && interruption != Interruption::DuringOnnx && interruption != Interruption::FailedOnnx;
+    const bool engine_completed = reached_engine && interruption != Interruption::DuringEngine && interruption != Interruption::FailedEngine;
+    CHECK(published.size() == static_cast<std::size_t>(save_onnx && onnx_completed) + static_cast<std::size_t>(engine_completed));
+   }
+  }
+ }
+}
+TEST_CASE("export rejects empty format selection before native preparation or output reservation", "[controller][systems][export]") {
+ mmltk::testsupport::ScopedTempDir root{"export-empty-formats"};
+ ApplicationDataFixture fixture{root.path()};
+ auto [settings, dataset, model] = fixture.systems();
+ const auto generation = model.snapshot().generation;
+ const std::array changes{
+  contracts::SettingsValueUpdate{.path = "workflows.export_state.export_onnx", .value = mmltk::frameworks::serialization::wire::FlatValue{false}},
+  contracts::SettingsValueUpdate{.path = "workflows.export_state.build_tensorrt", .value = mmltk::frameworks::serialization::wire::FlatValue{false}},
+ };
+ contracts::SettingsUpdateRequest update;
+ for (const auto& change : changes) update.updates.push_back(change);
+ static_cast<void>(settings.Update(std::move(update)));
+ CHECK_THROWS_AS(model.Select({.workflow = contracts::FeatureId::Export}), contracts::InvalidIntentError);
+ unsigned runtime_creations = 0U;
+ ExportSystem exporter{settings, dataset, model, [&]() -> std::unique_ptr<ExportRuntime> { ++runtime_creations; return {}; }};
+ CHECK_THROWS_AS(exporter.Start({}), contracts::InvalidIntentError);
+ CHECK(runtime_creations == 0U);
+ CHECK(exporter.snapshot().generation_frontier == 0U);
+ CHECK(model.snapshot().generation == generation);
+ CHECK_FALSE(std::filesystem::exists(root.path() / "export"));
 }
 }  // namespace
 }  // namespace mmltk::controller

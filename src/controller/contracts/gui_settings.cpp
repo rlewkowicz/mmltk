@@ -72,8 +72,6 @@ struct ModelArtifactsShape {
  bool onnx = true;
  bool tensorrt = true;
  bool preserve_comparison_paths = false;
- bool preserve_unselected_paths = false;
- const char* onnx_key = "onnx_path";
 };
 void normalize_model_artifacts(ModelArtifactSelectionState& state, const ModelArtifactsShape& shape) {
  const mmltk::backend::models::rfdetr::PresetCatalogEntry* preset = mmltk::backend::models::rfdetr::find_preset_catalog_entry(state.preset_name);
@@ -85,7 +83,6 @@ void normalize_model_artifacts(ModelArtifactSelectionState& state, const ModelAr
  }
  if (state.resolution <= 0) { state.resolution = static_cast<int>(preset->resolution); }
  if (state.input == ModelArtifactInputKind::None) {
-  if (shape.preserve_unselected_paths) { return; }
   state.weights_path.clear();
   state.onnx_path.clear();
   state.tensorrt_path.clear();
@@ -108,14 +105,6 @@ ModelArtifactsShape train_model_artifacts_shape() {
 ModelArtifactsShape validate_model_artifacts_shape() {
  ModelArtifactsShape shape;
  shape.preserve_comparison_paths = true;
- return shape;
-}
-ModelArtifactsShape export_model_artifacts_shape() {
- ModelArtifactsShape shape;
- shape.tensorrt = false;
- shape.preserve_comparison_paths = true;
- shape.preserve_unselected_paths = true;
- shape.onnx_key = "onnx_input_path";
  return shape;
 }
 [[nodiscard]] const nlohmann::json* find_object(const nlohmann::json& parent, const char* key) {
@@ -393,7 +382,7 @@ constexpr auto model_artifact_fields = [](auto& state, const ModelArtifactsShape
  visit("input", state.input);
  visit("class_layout_path", state.class_layout_path);
  if (shape.weights) { visit("weights_path", state.weights_path); }
- if (shape.onnx) { visit(shape.onnx_key, state.onnx_path); }
+ if (shape.onnx) { visit("onnx_path", state.onnx_path); }
  if (shape.tensorrt) { visit("tensorrt_path", state.tensorrt_path); }
 };
 constexpr auto train_execution_fields = [](auto& request, const auto& visit) {
@@ -555,13 +544,13 @@ constexpr auto annotate_flat_fields = [](auto& state, const auto& visit) {
 };
 constexpr auto export_fields = [](auto& state, const auto& visit) {
  visit("opset_version", state.opset_version);
+ visit("export_onnx", state.export_onnx);
  visit("build_tensorrt", state.build_tensorrt);
  visit("simplify", state.simplify);
 };
 constexpr auto export_flat_fields = [](auto& state, const auto& visit) {
  visit("weights_path", state.weights_path);
  if constexpr (requires { state.class_layout_path; }) visit("class_layout_path", state.class_layout_path);
- visit("onnx_input_path", state.onnx_input_path);
  visit("device_id", state.device_id);
  visit("allow_fp16", state.allow_fp16);
  export_fields(state, visit);
@@ -816,7 +805,7 @@ nlohmann::json snapshot_workflows(const GuiSettingsState& settings) {
  }
  {
   const ExportViewState& s = settings.workflows.export_state;
-  nlohmann::json export_json = snapshot_workflow_artifacts_and_execution(s, export_model_artifacts_shape(), s, export_execution_fields);
+  nlohmann::json export_json = snapshot_workflow_artifacts_and_execution(s, train_model_artifacts_shape(), s, export_execution_fields);
   export_json[kExportKey] = snapshot_fields(s, export_fields);
   export_json["output"] = snapshot_fields(s.output, output_selection_fields);
   j["export"] = std::move(export_json);
@@ -857,7 +846,7 @@ void apply_workflows(const nlohmann::json& j, GuiSettingsState& settings) {
  apply_workflow(*workflows_json, &settings.workflows.annotate, "annotate",
   [](const nlohmann::json& annotate, AnnotateViewState& s) { apply_source_workflow(annotate, s, ModelArtifactsShape{}, s, annotate_execution_fields, kAnnotateKey, annotate_fields); });
  apply_workflow(*workflows_json, &settings.workflows.export_state, "export",
-  [](const nlohmann::json& export_json, ExportViewState& s) { apply_workflow_section(export_json, s.output, "output", output_selection_fields); apply_section_workflow(export_json, s, export_model_artifacts_shape(), s, export_execution_fields, kExportKey, export_fields); });
+  [](const nlohmann::json& export_json, ExportViewState& s) { apply_workflow_section(export_json, s.output, "output", output_selection_fields); apply_section_workflow(export_json, s, train_model_artifacts_shape(), s, export_execution_fields, kExportKey, export_fields); });
  apply_workflow(*workflows_json, &settings.workflows.explore, kExploreKey, [](const nlohmann::json& explore, ExploreViewState& s) { explore.get_to(s); });
 }
 nlohmann::json normalize_gui_settings_document(const nlohmann::json& j) { return normalize_gui_settings_document_impl(j); }
