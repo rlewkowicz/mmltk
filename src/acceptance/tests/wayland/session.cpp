@@ -1220,6 +1220,11 @@ void WaylandSession::RunScenario(const std::string& viewer_scenario, const bool 
   for (const auto& [id, surface] : surface_audit.surfaces)
    if (surface.candidate_withdrawn && surface.reconstruction) CHECK(browser.renderer_reconstructions[id] == 1U);
  }
+ if (viewer_scenario.empty() || (profile_ == "dpi" && viewer_scenario == "copy" && !dark)) {
+  CHECK(browser.dataset_presentation_complete());
+  CHECK(browser.dataset_drag_edit);
+  CHECK(browser.dataset_offscreen_release);
+ }
  if (!viewer_scenario.empty()) {
   if (last && termination != TerminationMode::AbruptPeerLoss) CHECK(terminal == 0);
   CHECK(browser.viewer_complete);

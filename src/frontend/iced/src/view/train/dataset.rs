@@ -1,3 +1,4 @@
+use crate::integration_control::{observe_dataset_text, DatasetTextKind};
 pub(crate) mod progress;
 
 use crate::view::shared::{card_section_divider, disclosure};
@@ -296,7 +297,7 @@ fn benchmark_radio<'a, T: Copy + Eq + 'a>(
     message: fn(T) -> Message,
 ) -> Element<'a, Message> {
     container(
-        radio(label, value, Some(selected), move |value| {
+        observe_dataset_text(id, DatasetTextKind::Radio, radio(label, value, Some(selected), move |value| {
             if enabled {
                 message(value)
             } else {
@@ -309,7 +310,7 @@ fn benchmark_radio<'a, T: Copy + Eq + 'a>(
             } else {
                 iced_fluent_theme::radio::disabled(theme, status)
             }
-        }),
+        })),
     )
     .id(id)
     .into()
@@ -321,23 +322,24 @@ fn benchmark_choices(
 ) -> Element<'_, Message> {
     let mut children = column![
         container(
-            checkbox(train.benchmarkselection.recoverdroppedmasks)
+            observe_dataset_text(super::RECOVER_DROPPED_MASKS_ID, DatasetTextKind::Checkbox,
+                checkbox(train.benchmarkselection.recoverdroppedmasks)
                 .label("Recover dropped masks from original annotations")
                 .text_size(12)
-                .on_toggle_maybe(enabled.then_some(Message::RecoverDroppedMasksChanged)),
+                .on_toggle_maybe(enabled.then_some(Message::RecoverDroppedMasksChanged))),
         ).id(super::RECOVER_DROPPED_MASKS_ID),
     ].spacing(crate::view::workflow::FIELD_SPACING);
-    for (label, description, id, value) in [
+    for (label, description, id, description_id, value) in [
         ("Coconut validation", "COCO val2017 and Objects365 validation with Coconut annotations.",
-            super::COCONUT_VALIDATION_ID, CoconutValidation::Coconut),
+            super::COCONUT_VALIDATION_ID, "train.dataset.validation.coconut.description", CoconutValidation::Coconut),
         ("Stock validation", "COCO val2017 with stock instance annotations.",
-            super::STOCK_VALIDATION_ID, CoconutValidation::Stock),
+            super::STOCK_VALIDATION_ID, "train.dataset.validation.stock.description", CoconutValidation::Stock),
         ("Coconut stock", "COCO val2017 with Coconut enhanced annotations.",
-            super::COCONUT_STOCK_ID, CoconutValidation::CoconutStock),
+            super::COCONUT_STOCK_ID, "train.dataset.validation.coconut_stock.description", CoconutValidation::CoconutStock),
     ] {
         children = children.push(column![
             benchmark_radio(label, id, value, train.benchmarkselection.validation, enabled, Message::ValidationChanged),
-            container(text(description).size(12))
+            container(observe_dataset_text(description_id, DatasetTextKind::Description, text(description).size(12)))
                 .padding(iced::Padding::ZERO.left(24)),
         ].spacing(2));
     }

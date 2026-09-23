@@ -6,6 +6,8 @@ use crate::view::{annotation, explore, train};
 use crate::view_model::{ApplicationModel, ConnectionState};
 use iced::{Rectangle, Task};
 mod lifecycle;
+mod dataset_presentation;
+pub(crate) use dataset_presentation::{observe_text as observe_dataset_text, TextKind as DatasetTextKind};
 mod pixel_checks;
 mod probe;
 mod retained;
@@ -160,6 +162,10 @@ const ANNOTATION_SURFACE: &str = annotation::WORKSPACE_ID;
 
 #[derive(Debug, Clone)]
 pub enum Message {
+    DatasetDrawn(dataset_presentation::Frame),
+    DatasetPixels(u16, bool),
+    DatasetDisclosureToggle,
+    DatasetInputDelivered(u8, bool),
     PrimaryActionPixels {
         control: String,
         active: bool,
@@ -707,6 +713,10 @@ enum Phase {
     CompileProgress,
     CompileActionWithProgress,
     AwaitCompileCompletion,
+    AwaitCompileCancelled,
+    DatasetFixture(u8),
+    DatasetDisclosure(u8),
+    DatasetInput(u8),
     DatasetStatus,
     ExploreNavigation,
     AwaitExplore,
@@ -1133,6 +1143,33 @@ struct Driver {
 }
 
 impl Controller {
+    pub(crate) fn view<'a>(&'a self, content: crate::fluent_theme::Element<'a, RootMessage>, model: &'a ApplicationModel)
+        -> crate::fluent_theme::Element<'a, RootMessage> {
+        if !reporting_enabled() { return content; }
+        let generation = self.driver.generation;
+        let content = if matches!(self.driver.phase, Phase::DatasetDisclosure(..)) {
+            iced::widget::stack![content, iced::widget::container(
+                crate::view::diagnostics::view(model, &self.lifecycle.presentation.diagnostics)
+                    .map(move |_| RootMessage::Integration(Message::Scoped { generation, receipt: None,
+                        message: Box::new(Message::DatasetDisclosureToggle) })))
+                .id("integration.dataset.fixture").width(360).style(crate::fluent_theme::container_shell)].into()
+        } else { content };
+        let (key, fixture, width) = match self.driver.phase {
+            Phase::DatasetInput(index) => (dataset_presentation::input_key(index), None, 0.0),
+            Phase::DatasetDisclosure(index) => (50 + u16::from(index), None, 0.0),
+            Phase::DatasetFixture(index) => (200 + u16::from(index), self.lifecycle.presentation.fixture.as_ref(),
+                if index % 18 < 9 { 224.0 } else { 360.0 }),
+            Phase::CompileDimensions => (40, None, 0.0),
+            Phase::AwaitCompileDimensions => (41, None, 0.0),
+            Phase::BenchmarkChoice(index) => (index as u16 + 20, None, 0.0),
+            Phase::AwaitBenchmarkChoice(index) => (index as u16 + 1, None, 0.0),
+            Phase::CompileProgress | Phase::CompileActionWithProgress => (100, None, 0.0),
+            Phase::AwaitCompileCancelled => (101, None, 0.0),
+            Phase::AwaitCompileCompletion => (102, None, 0.0),
+            _ => (0, None, 0.0),
+        };
+        dataset_presentation::wrap(content, key, fixture, width, self.driver.input_scale, model.workflow.dataset.as_ref())
+    }
     pub fn subscription(&self) -> iced::Subscription<Message> {
         if self.driver.running() {
             iced::Subscription::batch([
@@ -1675,6 +1712,27 @@ impl Controller {
             message => message,
         };
         let (control, bounds) = match message {
+            Message::DatasetInputDelivered(next, valid) => {
+                self.lifecycle.presentation.input_pending = false;
+                if valid { self.driver.phase = Phase::DatasetInput(next); }
+                else { self.driver.fail("Dataset input delivery was invalidated"); }
+                return None;
+            }
+            Message::DatasetDisclosureToggle => {
+                self.lifecycle.presentation.diagnostics.update(crate::view::diagnostics::Message::Toggled);
+                return None;
+            }
+            Message::DatasetDrawn(frame) => {
+                let bounded = !(100..=102).contains(&frame.key);
+                self.lifecycle.presentation.observe(frame);
+                if bounded && self.lifecycle.presentation.frames > 180 { self.driver.fail("Dataset observation exceeded its frame budget"); }
+                return None;
+            }
+            Message::DatasetPixels(key, valid) => {
+                if valid { self.lifecycle.presentation.pixels = Some(key); }
+                else { self.driver.fail("Dataset rendered pixel observation failed"); }
+                return None;
+            }
             Message::PrimaryActionMeasure { control, token } => {
                 self.driver.reporting.measure_primary(control, token);
                 return None;
@@ -2102,6 +2160,10 @@ impl Controller {
             | Phase::Compile
             | Phase::AwaitCompileProgress
             | Phase::AwaitCompileCompletion
+            | Phase::AwaitCompileCancelled
+            | Phase::DatasetFixture(..)
+            | Phase::DatasetDisclosure(..)
+            | Phase::DatasetInput(..)
             | Phase::CompileProgress
             | Phase::CompileActionWithProgress
             | Phase::DatasetStatus => self.lifecycle.advance_lifecycle(

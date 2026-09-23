@@ -47,6 +47,7 @@ function canvasFixture(t, diagnostics = false, driver = true) {
   install('performance', {now: () => { allocations.clock++; return 0; }});
   install('dump', line => { lines.push(line); reports.push(JSON.parse(line)); });
   install('PointerEvent', class { constructor(type, fields) { this.type = type; Object.assign(this, fields); } });
+  install('WheelEvent', class { static DOM_DELTA_PIXEL = 0; constructor(type, fields) { this.type = type; Object.assign(this, fields); } });
   install('KeyboardEvent', class { constructor(type, fields) { this.type = type; Object.assign(this, fields); } });
   install('queueMicrotask', callback => microtasks.push(callback));
   install('requestAnimationFrame', callback => frames.push(callback));
@@ -1171,5 +1172,72 @@ for (const stage of [1, 3]) {
       (stage === 1 ? [0, 255, 255, 255] : [255, 0, 0, 255]) : captionRaster(stage)(x, y);
     workflowCaption(f, stage, results);
     assert.equal(results.at(-1)[0], 'failed');
+  });
+}
+
+
+test('Dataset component probes read actual contrasting pixels after frames', t => {
+  const f = canvasFixture(t, true);
+  f.sampling.raster = (x, y) => y >= 220 ?
+    ((y === 222 || y === 242) && x >= 35 && x < 185 ? [128, 128, 128, 255] : [255, 255, 255, 255]) :
+    (x % 8 < 4 ? [32, 32, 32, 255] : [240, 240, 240, 255]);
+  const result = [];
+  browser.mmltkIntegrationDatasetPixels(200, [10, 10, 224, 200], [10, 220, 200, 5, 10, 240, 200, 5], [0.5, 0.5, 0.5, 1, 1, 1, 1], 1, "", [], value => result.push(value));
+  assert.deepEqual(result, []);
+  f.frames.shift()();
+  assert.deepEqual(result, []);
+  f.flushFrames();
+  assert.deepEqual(result, [true]);
+  assert.equal(f.allocations.copies, 1);
+  assert.equal(f.reports.find(record => record.event === 'integration.dataset_pixels').a, '200');
+});
+
+test('Dataset component probes reject blank output and cancelled ownership', t => {
+  const f = canvasFixture(t, true);
+  const result = [];
+  browser.mmltkIntegrationDatasetPixels(200, [10, 10, 224, 200], [10, 220, 200, 5, 10, 240, 200, 5], [0.5, 0.5, 0.5, 1, 1, 1, 1], 1, "", [], value => result.push(value));
+  f.flushFrames(); f.flushFrames();
+  assert.deepEqual(result, [false]);
+  browser.mmltkIntegrationDatasetPixels(201, [10, 10, 224, 200], [10, 220, 200, 5, 10, 240, 200, 5], [0.5, 0.5, 0.5, 1, 1, 1, 1], 1, "", [], value => result.push(value));
+  browser.mmltkIntegrationInitialize(false);
+  f.flushFrames(); f.flushFrames();
+  assert.deepEqual(result, [false, false]);
+});
+
+
+test('Dataset drag uses real held pointer movement and retires its release', t => {
+  const f = canvasFixture(t, true);
+  const delivered = [];
+  browser.mmltkIntegrationDatasetInput(0, [20, 40, 160, 24], '', value => delivered.push(value));
+  f.flushMicrotasks();
+  assert.deepEqual(f.events, ['pointermove', 'pointerdown']);
+  assert.deepEqual(delivered, []);
+  f.flushFrames();
+  assert.equal(f.events.filter(event => event === 'pointermove').length, 5);
+  assert.equal(f.events.at(-1), 'pointerup');
+  assert.deepEqual(delivered, [true]);
+});
+
+
+test('Dataset held input releases only after the real wheel stage', t => {
+  const f = canvasFixture(t, true);
+  const result = [];
+  for (const action of [2, 4, 3]) {
+    browser.mmltkIntegrationDatasetInput(action, [20, 40, 160, 24], '10000', value => result.push(value));
+    f.flushMicrotasks(); f.flushFrames();
+  }
+  assert.deepEqual(f.events, ['pointerdown', 'wheel', 'pointerup']);
+  assert.deepEqual(result, [true, true, true]);
+});
+
+for (const blank of [false, true]) {
+  test(`Dataset drawn label pixels reject blank=${blank}`, t => {
+    const f = canvasFixture(t, true), result = [];
+    if (!blank) f.sampling.raster = (x, y) => x % 8 < 4 ? [32, 32, 32, 255] : [240, 240, 240, 255];
+    browser.mmltkIntegrationDatasetPixels(5, [], [], [], 1, 'train.dataset.validation.coconut.description', [10, 10, 200, 16], value => result.push(value));
+    f.flushFrames(); f.flushFrames();
+    assert.deepEqual(result, [!blank]);
+    assert.equal(f.allocations.copies, 1);
+    assert.equal(f.reports.find(record => record.event === 'integration.dataset_label_pixels').d, blank ? '0' : '1');
   });
 }

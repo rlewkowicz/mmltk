@@ -1521,3 +1521,124 @@ export function mmltkIntegrationConfidenceInput(x, y, action, value, completed) 
   });
   return 1;
 }
+
+// A bounded component probe, separate from native compile lifecycle receipts.
+export function mmltkIntegrationDatasetPixels(key, bounds, dividers, colors, scale, labelIds, labels, callback) {
+  if (!integrationState || !integrationDriver) return;
+  const complete = integrationCompletion(result => callback(result === true));
+  integrationFrame(() => integrationFrame(() => {
+    try {
+      const canvas = document.querySelector('canvas');
+      const rect = canvas.getBoundingClientRect();
+      const sx = canvas.width / rect.width, sy = canvas.height / rect.height;
+      const context = canvasSnapshot(canvas);
+      const read = bounds => {
+        const x = Math.ceil(bounds[0] * sx), y = Math.ceil(bounds[1] * sy);
+        const width = Math.floor(bounds[2] * sx), height = Math.floor(bounds[3] * sy);
+        if (width <= 0 || height <= 0 || x < 0 || y < 0 || x + width > canvas.width || y + height > canvas.height)
+          throw new Error('component outside rendered canvas');
+        return {width, height, pixels: context.getImageData(x, y, width, height).data};
+      };
+      const textProbe = key >= 2 && key <= 5 || key >= 121 && key <= 125;
+      const ids = labelIds ? labelIds.split('\n') : [];
+      let valid = textProbe ? ids.length > 0 && ids.length <= 9 && labels.length === ids.length * 4 : dividers.length === 8;
+      if (textProbe) for (let index = 0; index < ids.length; ++index) {
+        const {width, height, pixels} = read(Array.from(labels.slice(index * 4, index * 4 + 4)));
+        let minimum = 255, maximum = 0;
+        for (let offset = 0; offset < pixels.length; offset += 4) {
+          const luminance = (pixels[offset] + pixels[offset + 1] + pixels[offset + 2]) / 3;
+          minimum = Math.min(minimum, luminance); maximum = Math.max(maximum, luminance);
+        }
+        const matched = maximum - minimum >= 20;
+        valid &&= matched;
+        report({event: 'integration.dataset_label_pixels', control: ids[index], detail: 'drawn-label-canvas',
+          a: String(key), b: String(width * height), c: String(maximum - minimum), d: String(Number(matched))});
+      }
+      if (key >= 200) {
+        const {width, height, pixels} = read(bounds);
+        let minimum = 255, maximum = 0, colored = 0;
+        for (let i = 0; i < pixels.length; i += 4) {
+          const luminance = (pixels[i] + pixels[i + 1] + pixels[i + 2]) / 3;
+          minimum = Math.min(minimum, luminance); maximum = Math.max(maximum, luminance);
+          if (Math.max(pixels[i], pixels[i + 1], pixels[i + 2]) - Math.min(pixels[i], pixels[i + 1], pixels[i + 2]) > 30) ++colored;
+        }
+        valid &&= maximum - minimum >= 20;
+        report({event: 'integration.dataset_pixels', control: 'dataset.presentation', detail: 'component-canvas',
+          a: String(key), b: String(width), c: String(height), d: String(maximum - minimum), colored});
+      }
+      for (let index = 0; index < dividers.length; index += 4) {
+        const rectangle = Array.from(dividers.slice(index, index + 4));
+        const {width, height, pixels} = read(rectangle);
+        const background = colors.slice(4, 7).map(value => value * 255);
+        const delta = colors.slice(0, 3).map((value, i) => (value * 255 - background[i]) * colors[3]);
+        const norm = delta.reduce((sum, value) => sum + value * value, 0);
+        if (norm < 1) throw new Error('indistinguishable divider outline');
+        const coverage = (x, y) => {
+          const offset = (y * width + x) * 4;
+          return delta.reduce((sum, value, i) => sum + value * (pixels[offset + i] - background[i]), 0) / norm;
+        };
+        const centerX = Math.floor(width / 2);
+        let stroke = 0, strongest = 0, peak = -Infinity, gap = 0;
+        for (let y = 0; y < height; ++y) {
+          const alpha = coverage(centerX, y);
+          stroke += Math.max(0, alpha);
+          if (alpha > peak) { peak = alpha; strongest = y; }
+          if (y + 1 <= 1.5 * sy * scale || y >= 3.5 * sy * scale) gap = Math.max(gap, Math.abs(alpha));
+        }
+        let first = width, last = -1;
+        for (let x = 0; x < width; ++x) if (coverage(x, strongest) > 0.25) { first = Math.min(first, x); last = x; }
+        const span = last - first + 1;
+        const matched = Math.abs(span - width * .75) <= 2 && Math.abs(first - (width - span) / 2) <= 1.5 &&
+          Math.abs(stroke - sy * scale) <= .65 && gap <= .12;
+        valid &&= matched;
+        report({event: 'integration.dataset_divider_pixels', control: index === 0 ? 'train.dataset.benchmark_divider' : 'train.dataset.dimensions_divider',
+          detail: 'card-outline-canvas', a: String(key), b: String(width), c: String(span), d: String(stroke),
+          scale: sy * scale, gap, matched});
+      }
+      complete(valid);
+    } catch (error) {
+      report({event: 'integration.failure', control: 'dataset.presentation', detail: String(error),
+        a: String(key), b: '0', c: '0', d: '0'});
+      complete(false);
+    }
+  }));
+}
+
+// Real pointer custody is retained across the requested wheel/release steps.
+export function mmltkIntegrationDatasetInput(action, bounds, value, callback) {
+  if (!integrationState || !integrationDriver) return;
+  const complete = integrationCompletion(result => callback(result === true));
+  const canvas = document.querySelector('canvas'), rect = canvas.getBoundingClientRect();
+  const [x, y, width, height] = bounds;
+  const pointer = (px, py, type, buttons) => canvas.dispatchEvent(integrationPointer(rect, px, py, type, buttons));
+  const finish = () => integrationFrame(() => integrationFrame(() => complete(true)));
+  integrationMicrotask(() => {
+    if (action === 0) {
+      pointer(x + width - 5, y + height / 2, 'pointermove', 0);
+      pointer(x + width - 5, y + height / 2, 'pointerdown', 1);
+      let step = 0;
+      const drag = () => {
+        ++step;
+        pointer(x + 5 + (width - 10) * (1 - step / 4), y + height / 2, 'pointermove', 1);
+        if (step < 4) integrationFrame(drag);
+        else { pointer(x + 5, y + height / 2, 'pointerup', 0); finish(); }
+      };
+      integrationFrame(drag);
+    } else if (action === 1) {
+      integrationKey(canvas, 'keydown', 'x', 'KeyX', false, false);
+      integrationKey(canvas, 'keyup', 'x', 'KeyX', false, false);
+      finish();
+    } else if (action === 2 || action === 3) {
+      pointer(x + width / 2, y + height / 2, action === 2 ? 'pointerdown' : 'pointerup', action === 2 ? 1 : 0);
+      finish();
+    } else if (action === 4 || action === 6) {
+      canvas.dispatchEvent(new WheelEvent('wheel', {bubbles: true, cancelable: true,
+        clientX: rect.left + x + width / 2, clientY: rect.top + y + height / 2,
+        deltaY: action === 4 ? Number(value) : 0, deltaX: action === 6 ? Number(value) : 0,
+        deltaMode: WheelEvent.DOM_DELTA_PIXEL}));
+      finish();
+    } else if (action === 5) {
+      integrationNumberEdit(x + width / 2, y + height / 2, value, value.length, complete);
+    } else complete(false);
+  });
+}

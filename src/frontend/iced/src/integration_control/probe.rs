@@ -495,7 +495,11 @@ impl Requests {
                         None if matches!(message, Message::ConfidenceInputDelivered(..)) => true,
                         None => matches!(
                             message,
-                            Message::ReportingDisabled
+                            Message::DatasetInputDelivered(..)
+                                | Message::DatasetDisclosureToggle
+                                | Message::DatasetDrawn(..)
+                                | Message::DatasetPixels(..)
+                                | Message::ReportingDisabled
                                 | Message::Advance
                                 | Message::Located { .. }
                                 | Message::NumberWheelDelivered

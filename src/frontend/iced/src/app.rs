@@ -748,13 +748,17 @@ mod route_tests {
 }
 
 pub fn view(app: &App) -> Element<'_, Message> {
-    crate::view::view(
+    let content = crate::view::view(
         &app.model,
         app.presentation.surface(),
         &app.diagnostics,
         &app.workspace,
         &app.settings,
-    )
+    );
+    match &app.integration {
+        Some(integration) => integration.view(content, &app.model),
+        None => content,
+    }
 }
 
 #[cfg(test)]
