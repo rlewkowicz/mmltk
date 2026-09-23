@@ -122,8 +122,8 @@ TEST_CASE("perceptual SIMD handles lane boundaries and unequal fractional footpr
  RgbImageResizer resizer;
  for (auto format : formats)
   for (unsigned width : {1U, 7U, 8U, 9U, 15U, 16U, 17U})
-   for (const auto& dims : std::array<std::array<unsigned, 4>, 6>{{{width * 2 + 1, 11, width, 7}, {width * 2, 11, width, 7}, {width * 2 + 1, 12, width, 6},
-          {width * 2, 12, width, 6}, {width * 2 + 1, 1, width, 1}, {width * 3 - 1, 101, width, 7}}})
+   for (const auto& dims : std::array<std::array<unsigned, 4>, 6>{
+         {{width * 2 + 1, 11, width, 7}, {width * 2, 11, width, 7}, {width * 2 + 1, 12, width, 6}, {width * 2, 12, width, 6}, {width * 2 + 1, 1, width, 1}, {width * 3 - 1, 101, width, 7}}})
     for (unsigned pattern : {0U, 3U, 5U, 6U, 7U}) {
      INFO("format " << static_cast<int>(format) << " geometry " << dims[0] << "x" << dims[1] << " -> " << dims[2] << "x" << dims[3] << " pattern " << pattern);
      Image source(dims[0], dims[1], format, 3), output(dims[2], dims[3], format, 5);
@@ -156,8 +156,8 @@ TEST_CASE("AVIR float4 preserves scalar resize accuracy and production selection
  avir::CImageResizer<> scalar(8);
  avir::CImageResizer<avir::fpclass_float4> simd(8);
  RgbImageResizer production;
- constexpr std::array<std::array<unsigned, 4>, 9> sizes{{{31, 23, 7, 5}, {31, 23, 8, 7}, {31, 23, 9, 13}, {31, 23, 17, 11}, {17, 13, 35, 29},
-  {17, 13, 17, 13}, {1, 17, 1, 9}, {19, 1, 33, 1}, {17, 13, 9, 19}}};
+ constexpr std::array<std::array<unsigned, 4>, 9> sizes{
+  {{31, 23, 7, 5}, {31, 23, 8, 7}, {31, 23, 9, 13}, {31, 23, 17, 11}, {17, 13, 35, 29}, {17, 13, 17, 13}, {1, 17, 1, 9}, {19, 1, 33, 1}, {17, 13, 9, 19}}};
  for (const auto& dims : sizes)
   for (unsigned pattern = 0; pattern < 8; ++pattern) {
    INFO("geometry " << dims[0] << "x" << dims[1] << " -> " << dims[2] << "x" << dims[3] << " pattern " << pattern);
@@ -176,8 +176,7 @@ TEST_CASE("AVIR float4 preserves scalar resize accuracy and production selection
    else
     REQUIRE(actual == selected);
    for (std::size_t i = 0; i < count; ++i) REQUIRE(std::abs(int(actual[i]) - int(expected[i])) <= 1);
-   for (const auto* output : {&expected, &actual, &selected})
-    REQUIRE(std::all_of(output->begin() + count, output->end(), [](auto value) { return value == 0xCD; }));
+   for (const auto* output : {&expected, &actual, &selected}) REQUIRE(std::all_of(output->begin() + count, output->end(), [](auto value) { return value == 0xCD; }));
   }
 }
 namespace {

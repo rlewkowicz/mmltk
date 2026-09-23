@@ -96,7 +96,6 @@ private:
  if (expected_first_label != split.labels.size()) { throw std::runtime_error("benchmark labels contain unreferenced records"); }
  return index;
 }
-
 }  // namespace
 BenchmarkImageReadError::BenchmarkImageReadError(const std::uint16_t source_index, const std::uint64_t source_image_id, std::string detail)
     : std::runtime_error("benchmark cached image " + std::to_string(source_image_id) + " cannot be read: " + std::move(detail)), source_index_(source_index), source_image_id_(source_image_id) {}
@@ -140,8 +139,17 @@ struct BenchmarkSplitWriter::Impl {
  bool perceptual;
  std::size_t stride;
  Impl(const BenchmarkWriteRequest& request, bool actual)
-     : images(request.split.images), sources(request.split.sources), complete(images.size()), header_known(images.size()), resolution(request.resolution), resize_mode(request.resize_mode),
-       cancellation(request.cancel_requested), progress(request.progress), image_opened(request.image_opened), actual_dimensions(actual), perceptual(request.perceptual_downscale),
+     : images(request.split.images),
+       sources(request.split.sources),
+       complete(images.size()),
+       header_known(images.size()),
+       resolution(request.resolution),
+       resize_mode(request.resize_mode),
+       cancellation(request.cancel_requested),
+       progress(request.progress),
+       image_opened(request.image_opened),
+       actual_dimensions(actual),
+       perceptual(request.perceptual_downscale),
        stride(common_math::checked_cast<std::size_t>(static_cast<std::uint64_t>(resolution) * resolution * 3U * sizeof(float), "benchmark image stride overflow")) {
   if (resolution == 0 || resolution > MAX_IMAGE_EXTENT || images.empty() || sources.empty()) throw std::runtime_error("benchmark pixel membership is incomplete");
   layout = compute_pixel_layout(common_math::checked_cast<std::uint32_t>(images.size(), "benchmark image count overflow"), stride);
@@ -218,8 +226,9 @@ void BenchmarkSplitWriter::write_pixel(std::size_t slot, std::size_t lane) {
  scratch.resizer.resize_to_planar(
   {scratch.decoded.data(), {header.width, header.height, static_cast<std::size_t>(header.width) * 3U, 0U, scratch.decoded.size(), mmltk::backend::imaging::resample::RgbPixelFormat::RGB8}},
   {state.pixels->image(common_math::checked_cast<std::uint32_t>(slot, "benchmark pixel slot overflow"), state.stride),
-   {state.resolution, state.resolution, static_cast<std::size_t>(state.resolution) * sizeof(float), static_cast<std::size_t>(state.resolution) * state.resolution * sizeof(float),
-    state.stride, mmltk::backend::imaging::resample::RgbPixelFormat::PlanarUnitSrgbF32}}, state.resize_mode);
+   {state.resolution, state.resolution, static_cast<std::size_t>(state.resolution) * sizeof(float), static_cast<std::size_t>(state.resolution) * state.resolution * sizeof(float), state.stride,
+    mmltk::backend::imaging::resample::RgbPixelFormat::PlanarUnitSrgbF32}},
+  state.resize_mode);
  image.source_width = header.width;
  image.source_height = header.height;
  state.complete[slot] = 1;
@@ -304,8 +313,8 @@ void BenchmarkSplitWriter::write_remaining(const BenchmarkWriteRequest& request)
  std::atomic<std::size_t> next{0};
  std::atomic<bool> failed{false};
  const auto cpus = request.worker_cpus.empty() ? mmltk::common::system::allowed_cpu_set() : std::vector<int>(request.worker_cpus.begin(), request.worker_cpus.end());
- const int workers = std::max(1, std::min({request.num_workers, common_math::checked_cast<int>(cpus.size(), "benchmark CPU count overflow"),
-                                        common_math::checked_cast<int>(slots.size(), "benchmark slot count overflow")}));
+ const int workers = std::max(
+  1, std::min({request.num_workers, common_math::checked_cast<int>(cpus.size(), "benchmark CPU count overflow"), common_math::checked_cast<int>(slots.size(), "benchmark slot count overflow")}));
  while (impl_->scratch.size() < static_cast<std::size_t>(workers)) impl_->scratch.push_back(std::make_unique<Impl::Scratch>(impl_->perceptual));
  const auto run = [&](int lane, int, int) {
   try {
@@ -314,10 +323,15 @@ void BenchmarkSplitWriter::write_remaining(const BenchmarkWriteRequest& request)
     if (index >= slots.size()) break;
     write_pixel(slots[index], static_cast<std::size_t>(lane));
    }
-  } catch (...) { failed.store(true, std::memory_order_relaxed); throw; }
+  } catch (...) {
+   failed.store(true, std::memory_order_relaxed);
+   throw;
+  }
  };
- if (request.worker_cpus.empty()) common_concurrency::parallel_for_range_indexed<int>(0, workers, workers, run);
- else common_concurrency::parallel_for_range_indexed<int>(0, workers, workers, request.worker_cpus, run);
+ if (request.worker_cpus.empty())
+  common_concurrency::parallel_for_range_indexed<int>(0, workers, workers, run);
+ else
+  common_concurrency::parallel_for_range_indexed<int>(0, workers, workers, request.worker_cpus, run);
 }
 void BenchmarkSplitWriter::finish(const BenchmarkWriteRequest& request) {
  auto& state = *impl_;
@@ -410,5 +424,4 @@ void write_benchmark_split(const BenchmarkWriteRequest& request) {
  writer.write_remaining(request);
  writer.finish(request);
 }
-
 }  // namespace mmltk::backend::data::benchmark_internal

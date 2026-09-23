@@ -91,6 +91,7 @@ public:
  // Final membership may only remove slots, preserving canonical order. This
  // performs one forward bounded compaction only when quarantine shrinks it.
  void finish(const BenchmarkWriteRequest&);
+
 private:
  struct Impl;
  std::unique_ptr<Impl> impl_;

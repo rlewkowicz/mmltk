@@ -250,14 +250,16 @@ impl ApplicationModel {
         let destination = Self::page_visual_source(feature);
         let foreground = self.foreground_visual();
         let viewer_page = matches!(feature, FeatureId::Explore | FeatureId::Validate);
-        let request_belongs = self.requested_upscale.as_ref().is_none_or(|request| {
-            Some(request.source.source.kind) == destination
-        });
+        let request_belongs = self
+            .requested_upscale
+            .as_ref()
+            .is_none_or(|request| Some(request.source.source.kind) == destination);
         let same_owner = (foreground == destination && request_belongs)
             || (foreground == Some(PresentationSourceKind::Upscale)
-                && self.requested_upscale.as_ref().is_some_and(|request| {
-                    Some(request.source.source.kind) == destination
-                }));
+                && self
+                    .requested_upscale
+                    .as_ref()
+                    .is_some_and(|request| Some(request.source.source.kind) == destination));
         if viewer_page && same_owner {
             return;
         }
@@ -370,7 +372,10 @@ mod tests {
                 }
                 model.abandon_viewer();
                 model.set_foreground_feature(FeatureId::Explore);
-                assert_eq!(model.foreground_visual(), Some(PresentationSourceKind::Explore));
+                assert_eq!(
+                    model.foreground_visual(),
+                    Some(PresentationSourceKind::Explore)
+                );
                 assert!(model.requested_upscale.is_none());
             }
         }
@@ -382,7 +387,10 @@ mod tests {
             let mut model = bootstrapped();
             model.set_foreground_visual(Some(PresentationSourceKind::Upscale));
             model.set_foreground_feature(page);
-            assert_eq!(model.foreground_visual(), ApplicationModel::page_visual_source(page));
+            assert_eq!(
+                model.foreground_visual(),
+                ApplicationModel::page_visual_source(page)
+            );
         }
     }
 
@@ -390,7 +398,10 @@ mod tests {
     fn same_page_preserves_only_its_own_upscale_request() {
         for page in [FeatureId::Explore, FeatureId::Validate] {
             let native = ApplicationModel::page_visual_source(page).unwrap();
-            for source in [PresentationSourceKind::Explore, PresentationSourceKind::Validation] {
+            for source in [
+                PresentationSourceKind::Explore,
+                PresentationSourceKind::Validation,
+            ] {
                 for foreground in [native, source, PresentationSourceKind::Upscale] {
                     let mut model = bootstrapped();
                     let request = crate::generated::UpscaleRequest {

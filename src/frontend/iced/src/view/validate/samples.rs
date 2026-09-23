@@ -124,7 +124,10 @@ impl Component {
     ) -> Element<'a, Message> {
         crate::view::image_viewer::control_groups(self.control_groups(model))
     }
-    fn control_groups<'a>(&self, model: &crate::view_model::ApplicationModel) -> Vec<Element<'a, Message>> {
+    fn control_groups<'a>(
+        &self,
+        model: &crate::view_model::ApplicationModel,
+    ) -> Vec<Element<'a, Message>> {
         let Some(snapshot) = model.workflow.validation.as_ref() else {
             return vec![text("Waiting for validation").into()];
         };
@@ -428,16 +431,24 @@ mod tests {
 
     #[test]
     fn rendered_groups_wrap_with_twenty_pixel_gaps_and_hidden_controls_keep_modal_bounds() {
-        use iced::advanced::{layout, renderer::Headless, widget, Layout};
-        let renderer = iced::futures::executor::block_on(<iced::Renderer as Headless>::new(Default::default(), Some("wgpu"))).unwrap();
+        use iced::advanced::{Layout, layout, renderer::Headless, widget};
+        let renderer = iced::futures::executor::block_on(<iced::Renderer as Headless>::new(
+            Default::default(),
+            Some("wgpu"),
+        ))
+        .unwrap();
         let component = Component::default();
         let model = crate::view_model::test_support::bootstrapped();
         struct Bounds(std::collections::BTreeMap<String, iced::Rectangle>);
         impl widget::Operation for Bounds {
-            fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn widget::Operation)) { operate(self); }
+            fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn widget::Operation)) {
+                operate(self);
+            }
             fn container(&mut self, id: Option<&widget::Id>, bounds: iced::Rectangle) {
                 for name in ["validate.gt.group", "validate.pred.group"] {
-                    if id == Some(&widget::Id::from(name)) { self.0.insert(name.to_owned(), bounds); }
+                    if id == Some(&widget::Id::from(name)) {
+                        self.0.insert(name.to_owned(), bounds);
+                    }
                 }
             }
         }
@@ -446,20 +457,37 @@ mod tests {
             let mut tree = widget::Tree::new(&controls);
             tree.diff(&mut controls);
             let limits = layout::Limits::new(iced::Size::ZERO, iced::Size::new(width, 1000.0));
-            let node = controls.as_widget_mut().layout(&mut tree, &renderer, &limits);
+            let node = controls
+                .as_widget_mut()
+                .layout(&mut tree, &renderer, &limits);
             let mut bounds = Bounds(Default::default());
-            controls.as_widget_mut().operate(&mut tree, Layout::new(&node), &renderer, &mut bounds);
+            controls
+                .as_widget_mut()
+                .operate(&mut tree, Layout::new(&node), &renderer, &mut bounds);
             let gt = bounds.0["validate.gt.group"];
             let det = bounds.0["validate.pred.group"];
-            if width > 500.0 { assert_eq!(det.x - gt.x - gt.width, 20.0); assert_eq!(det.y, gt.y); }
-            else { assert_eq!(det.y - gt.y - gt.height, 20.0); assert_eq!(det.x, gt.x); }
-            let mut footprint: Element<'_, Message> = crate::view::image_viewer::control_footprint(component.controls(&model));
+            if width > 500.0 {
+                assert_eq!(det.x - gt.x - gt.width, 20.0);
+                assert_eq!(det.y, gt.y);
+            } else {
+                assert_eq!(det.y - gt.y - gt.height, 20.0);
+                assert_eq!(det.x, gt.x);
+            }
+            let mut footprint: Element<'_, Message> =
+                crate::view::image_viewer::control_footprint(component.controls(&model));
             let mut tree = widget::Tree::new(&footprint);
             tree.diff(&mut footprint);
-            let hidden = footprint.as_widget_mut().layout(&mut tree, &renderer, &limits);
+            let hidden = footprint
+                .as_widget_mut()
+                .layout(&mut tree, &renderer, &limits);
             assert_eq!(hidden.size(), node.size());
             let mut hidden_ids = Bounds(Default::default());
-            footprint.as_widget_mut().operate(&mut tree, Layout::new(&hidden), &renderer, &mut hidden_ids);
+            footprint.as_widget_mut().operate(
+                &mut tree,
+                Layout::new(&hidden),
+                &renderer,
+                &mut hidden_ids,
+            );
             assert!(hidden_ids.0.is_empty());
         }
     }

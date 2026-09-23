@@ -3,7 +3,8 @@
 #include <stdexcept>
 #include "src/common/system/cpu_affinity.h"
 namespace mmltk::backend::data::benchmark_internal {
-BenchmarkCompilePipeline::BenchmarkCompilePipeline(std::size_t workers, std::span<const int> cpus) : workers_(std::max<std::size_t>(1, workers)), pixels_(workers_ == 1 ? 0 : std::max<std::size_t>(1, workers_ / 3)) {
+BenchmarkCompilePipeline::BenchmarkCompilePipeline(std::size_t workers, std::span<const int> cpus)
+    : workers_(std::max<std::size_t>(1, workers)), pixels_(workers_ == 1 ? 0 : std::max<std::size_t>(1, workers_ / 3)) {
  auto available = cpus.empty() ? mmltk::common::system::allowed_cpu_set() : std::vector<int>(cpus.begin(), cpus.end());
  if (available.size() < workers_) throw std::invalid_argument("benchmark worker budget exceeds assigned CPUs");
  available.resize(workers_);
@@ -14,8 +15,7 @@ BenchmarkCompilePipeline::BenchmarkCompilePipeline(std::size_t workers, std::spa
   try {
    // Exactly P borrowed consumers use the pool's preallocated P queue entries.
    // Image admission never submits work or allocates a per-image closure.
-   for (std::size_t lane = 0; lane < pixels_; ++lane)
-    pool_->enqueue_borrowed(this, lane, [](void* owner, std::size_t index) { static_cast<BenchmarkCompilePipeline*>(owner)->consume(index); });
+   for (std::size_t lane = 0; lane < pixels_; ++lane) pool_->enqueue_borrowed(this, lane, [](void* owner, std::size_t index) { static_cast<BenchmarkCompilePipeline*>(owner)->consume(index); });
   } catch (...) {
    stop();
    pool_.reset();
@@ -57,8 +57,10 @@ void BenchmarkCompilePipeline::image_ready(const CachedImageReady& ready) {
   ++pending_;
   if (pool_) {
    slot->custody = ready.custody;
-   if (ready_tail_) ready_tail_->next = slot;
-   else ready_head_ = slot;
+   if (ready_tail_)
+    ready_tail_->next = slot;
+   else
+    ready_head_ = slot;
    ready_tail_ = slot;
   }
  }
@@ -73,8 +75,9 @@ void BenchmarkCompilePipeline::image_ready(const CachedImageReady& ready) {
 }
 void BenchmarkCompilePipeline::execute(Slot& slot, std::size_t lane, std::shared_ptr<const ArtifactLease> custody) noexcept {
  std::exception_ptr failure;
- try { slot.writer->write_pixel(slot.index, lane); }
- catch (const BenchmarkImageReadError&) {
+ try {
+  slot.writer->write_pixel(slot.index, lane);
+ } catch (const BenchmarkImageReadError&) {
   // Failed source pixels remain unfinished for the existing bounded repair.
  } catch (...) { failure = std::current_exception(); }
  // Retirement is acknowledged only after the generation lease is released.
@@ -103,11 +106,15 @@ void BenchmarkCompilePipeline::consume(std::size_t lane) noexcept {
    custody = std::move(slot->custody);
    discard = stopping_ || static_cast<bool>(failure_);
   }
-  if (!discard) execute(*slot, lane, std::move(custody));
+  if (!discard)
+   execute(*slot, lane, std::move(custody));
   else {
    // A fatal write stops queued work, but every accepted lease still retires.
    custody.reset();
-   { const std::lock_guard lock(mutex_); --pending_; }
+   {
+    const std::lock_guard lock(mutex_);
+    --pending_;
+   }
    changed_.notify_all();
   }
  }
@@ -142,5 +149,4 @@ void BenchmarkCompilePipeline::drain() {
  changed_.wait(lock, [&] { return pending_ == 0; });
  if (failure_) std::rethrow_exception(failure_);
 }
-
 }  // namespace mmltk::backend::data::benchmark_internal

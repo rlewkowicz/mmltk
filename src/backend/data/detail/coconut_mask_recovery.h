@@ -24,10 +24,10 @@ struct CoconutSegmentSupport {
 // originals must outlive this index and every borrowing recovery workspace.
 class CoconutRecoveryOriginals final {
 public:
- CoconutRecoveryOriginals(const NormalizedAnnotationIndex* train, const NormalizedAnnotationIndex* validation,
-                         mmltk::common::concurrency::CancellationObservation cancellation = {});
+ CoconutRecoveryOriginals(const NormalizedAnnotationIndex* train, const NormalizedAnnotationIndex* validation, mmltk::common::concurrency::CancellationObservation cancellation = {});
  CoconutRecoveryOriginals(const CoconutRecoveryOriginals&) = delete;
  CoconutRecoveryOriginals& operator=(const CoconutRecoveryOriginals&) = delete;
+
 private:
  friend class CoconutMaskRecovery;
  struct Originals {

@@ -87,7 +87,6 @@ CustomRecipePreparation prepare_custom_recipe(const BenchmarkCompilerConfig&, co
   if (coco_cache.pending_download()) { progress.source_activity(BenchmarkDatasetSource::kCoco2017, "Downloading COCO annotation metadata"); }
   if (!objects) { progress.source_activity(BenchmarkDatasetSource::kObjects365V2, "Downloading Objects365 annotation metadata"); }
   if (!open_images) { progress.source_activity(BenchmarkDatasetSource::kOpenImagesV7, "Downloading Open Images annotation metadata"); }
-
  }
  auto& annotation_repair_progress = progress.transfers();
  const auto repair_annotations = [&](const BenchmarkDatasetSource source, const std::vector<DownloadRequest>& requests, const std::string_view reason) {
@@ -97,7 +96,8 @@ CustomRecipePreparation prepare_custom_recipe(const BenchmarkCompilerConfig&, co
  for (const auto& request : annotation_requests) annotation_downloads.emplace(request.artifact_id, DownloadResult{});
  const auto download_source = [&](BenchmarkDatasetSource source) {
   std::vector<DownloadRequest> requests;
-  for (const auto& request : annotation_requests) if (request.source == source) requests.push_back(request);
+  for (const auto& request : annotation_requests)
+   if (request.source == source) requests.push_back(request);
   auto& totals = progress.transfers();
   const auto results = download_artifacts(requests, parse_workers, cancel_requested,
    progress.transfer_observer_enabled() ? DownloadProgressSink{[&](const auto& update) { totals.update(update, progress); }} : DownloadProgressSink{}, trace);
@@ -113,55 +113,55 @@ CustomRecipePreparation prepare_custom_recipe(const BenchmarkCompilerConfig&, co
  };
  const auto prepare_objects = [&] {
   download_source(BenchmarkDatasetSource::kObjects365V2);
- if (!objects) {
-  retry_annotation_indexing(
-   cancel_requested,
-   [&] {
-    const DownloadResult& annotation_archive = annotation_downloads.at(catalog.objects_annotations.artifact_id);
-    const std::filesystem::path extracted_dir = cache.source_indexes("objects365") / "source-json";
-    std::filesystem::create_directories(extracted_dir);
-    const std::filesystem::path json_path = extracted_dir / "zhiyuan_objv2_train.json";
-    progress.source_activity(BenchmarkDatasetSource::kObjects365V2, "Extracting Objects365 train annotations");
-    const std::string annotation_digest =
-     extract_archive_member(annotation_archive.path, "zhiyuan_objv2_train.json", json_path, annotation_archive.identity, cache.locks / "objects365-train-json.extract.lock", cancel_requested, trace);
-    objects = load_or_build_index(cache, objects_index_path, BenchmarkDatasetSource::kObjects365V2, "train", annotation_digest, cancel_requested, trace, [&] {
-     progress.source_activity(BenchmarkDatasetSource::kObjects365V2, "Parsing and indexing Objects365 annotations");
-     return parse_coco_style_annotations(json_path, annotation_digest, objects365_category_mappings(), annotation_parse_options(BenchmarkDatasetSource::kObjects365V2, "train", 0U, false));
+  if (!objects) {
+   retry_annotation_indexing(
+    cancel_requested,
+    [&] {
+     const DownloadResult& annotation_archive = annotation_downloads.at(catalog.objects_annotations.artifact_id);
+     const std::filesystem::path extracted_dir = cache.source_indexes("objects365") / "source-json";
+     std::filesystem::create_directories(extracted_dir);
+     const std::filesystem::path json_path = extracted_dir / "zhiyuan_objv2_train.json";
+     progress.source_activity(BenchmarkDatasetSource::kObjects365V2, "Extracting Objects365 train annotations");
+     const std::string annotation_digest =
+      extract_archive_member(annotation_archive.path, "zhiyuan_objv2_train.json", json_path, annotation_archive.identity, cache.locks / "objects365-train-json.extract.lock", cancel_requested, trace);
+     objects = load_or_build_index(cache, objects_index_path, BenchmarkDatasetSource::kObjects365V2, "train", annotation_digest, cancel_requested, trace, [&] {
+      progress.source_activity(BenchmarkDatasetSource::kObjects365V2, "Parsing and indexing Objects365 annotations");
+      return parse_coco_style_annotations(json_path, annotation_digest, objects365_category_mappings(), annotation_parse_options(BenchmarkDatasetSource::kObjects365V2, "train", 0U, false));
+     });
+     ++completed_indexes;
+     progress.phase(DatasetCompilePhase::Indexing, completed_indexes.load(), kIndexCount);
+    },
+    [&](const std::exception& error) {
+     const std::filesystem::path json_path = cache.source_indexes("objects365") / "source-json" / "zhiyuan_objv2_train.json";
+     remove_cache_path(json_path.string() + ".extract.json");
+     remove_cache_path(json_path);
+     remove_normalized_annotation_index(objects_index_path);
+     repair_annotations(BenchmarkDatasetSource::kObjects365V2, {*objects_annotation_request}, error.what());
     });
-    ++completed_indexes;
-    progress.phase(DatasetCompilePhase::Indexing, completed_indexes.load(), kIndexCount);
-   },
-   [&](const std::exception& error) {
-    const std::filesystem::path json_path = cache.source_indexes("objects365") / "source-json" / "zhiyuan_objv2_train.json";
-    remove_cache_path(json_path.string() + ".extract.json");
-    remove_cache_path(json_path);
-    remove_normalized_annotation_index(objects_index_path);
-    repair_annotations(BenchmarkDatasetSource::kObjects365V2, {*objects_annotation_request}, error.what());
-   });
- }
+  }
  };
  const auto prepare_open_images = [&] {
   download_source(BenchmarkDatasetSource::kOpenImagesV7);
- if (!open_images) {
-  retry_annotation_indexing(
-   cancel_requested,
-   [&] {
-    const DownloadResult& boxes = annotation_downloads.at(catalog.open_images_boxes.artifact_id);
-    const DownloadResult& classes = annotation_downloads.at(catalog.open_images_classes.artifact_id);
-    const std::string annotation_identity = combined_artifact_digest(boxes.identity, classes.identity);
-    open_images = load_or_build_index(cache, open_images_index_path, BenchmarkDatasetSource::kOpenImagesV7, "train", annotation_identity, cancel_requested, trace, [&] {
-     progress.source_activity(BenchmarkDatasetSource::kOpenImagesV7, "Parsing and indexing Open Images annotations");
-     return parse_open_images_annotations(
-      boxes.path, classes.path, annotation_identity, open_images_category_mappings(), annotation_parse_options(BenchmarkDatasetSource::kOpenImagesV7, "train", 0U, false));
+  if (!open_images) {
+   retry_annotation_indexing(
+    cancel_requested,
+    [&] {
+     const DownloadResult& boxes = annotation_downloads.at(catalog.open_images_boxes.artifact_id);
+     const DownloadResult& classes = annotation_downloads.at(catalog.open_images_classes.artifact_id);
+     const std::string annotation_identity = combined_artifact_digest(boxes.identity, classes.identity);
+     open_images = load_or_build_index(cache, open_images_index_path, BenchmarkDatasetSource::kOpenImagesV7, "train", annotation_identity, cancel_requested, trace, [&] {
+      progress.source_activity(BenchmarkDatasetSource::kOpenImagesV7, "Parsing and indexing Open Images annotations");
+      return parse_open_images_annotations(
+       boxes.path, classes.path, annotation_identity, open_images_category_mappings(), annotation_parse_options(BenchmarkDatasetSource::kOpenImagesV7, "train", 0U, false));
+     });
+     ++completed_indexes;
+     progress.phase(DatasetCompilePhase::Indexing, completed_indexes.load(), kIndexCount);
+    },
+    [&](const std::exception& error) {
+     remove_normalized_annotation_index(open_images_index_path);
+     repair_annotations(BenchmarkDatasetSource::kOpenImagesV7, {*open_images_boxes_request, *open_images_classes_request}, error.what());
     });
-    ++completed_indexes;
-    progress.phase(DatasetCompilePhase::Indexing, completed_indexes.load(), kIndexCount);
-   },
-   [&](const std::exception& error) {
-    remove_normalized_annotation_index(open_images_index_path);
-    repair_annotations(BenchmarkDatasetSource::kOpenImagesV7, {*open_images_boxes_request, *open_images_classes_request}, error.what());
-   });
- }
+  }
  };
  const auto cpus = worker_cpus.empty() ? mmltk::common::system::allowed_cpu_set() : std::vector<int>(worker_cpus.begin(), worker_cpus.end());
  mmltk::common::concurrency::parallel_for_range_indexed<int>(0, 3, static_cast<int>(preparation_workers), cpus, [&](int lane, int begin, int end) {

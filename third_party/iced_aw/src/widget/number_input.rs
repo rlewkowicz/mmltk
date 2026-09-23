@@ -1377,11 +1377,25 @@ mod tests {
             )
             .is_empty()
         );
-        input = TestNumberInput::new(&value, 0..=100, TestMessage::Changed).typed_only(true).width(200);
+        input = TestNumberInput::new(&value, 0..=100, TestMessage::Changed)
+            .typed_only(true)
+            .width(200);
         let node = layout(&mut input, &mut tree);
-        for named in [keyboard::key::Named::ArrowUp, keyboard::key::Named::ArrowDown] {
+        for named in [
+            keyboard::key::Named::ArrowUp,
+            keyboard::key::Named::ArrowDown,
+        ] {
             for repeat in [false, true] {
-                assert!(deliver(&mut input, &mut tree, &node, key(named.clone(), None, repeat), Cursor::Unavailable).is_empty());
+                assert!(
+                    deliver(
+                        &mut input,
+                        &mut tree,
+                        &node,
+                        key(named.clone(), None, repeat),
+                        Cursor::Unavailable
+                    )
+                    .is_empty()
+                );
             }
         }
         input = TestNumberInput::new(&value, 42..=42, TestMessage::Changed).width(200);

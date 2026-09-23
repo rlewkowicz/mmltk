@@ -6,12 +6,11 @@
 namespace mmltk::backend::data::benchmark_internal {
 namespace {
 std::uint64_t replace_progress(const std::uint64_t aggregate, const std::uint64_t before, const std::uint64_t after) {
-  if (before > aggregate) { throw std::underflow_error("benchmark artifact progress underflow"); }
-  const auto remaining = aggregate - before;
-  if (after > std::numeric_limits<std::uint64_t>::max() - remaining) { throw std::overflow_error("benchmark artifact progress overflow"); }
-  return remaining + after;
+ if (before > aggregate) { throw std::underflow_error("benchmark artifact progress underflow"); }
+ const auto remaining = aggregate - before;
+ if (after > std::numeric_limits<std::uint64_t>::max() - remaining) { throw std::overflow_error("benchmark artifact progress overflow"); }
+ return remaining + after;
 }
-
 }  // namespace
 using Clock = std::chrono::steady_clock;
 ProgressReporter::ProgressReporter(BenchmarkProgressCallback callback, const BenchmarkTraceSink& trace, std::span<const BenchmarkDatasetSource> sources)
@@ -46,15 +45,17 @@ void ProgressReporter::invalidate_indexing(std::uint64_t count) {
 void ProgressReporter::phase(const DatasetCompilePhase phase, const std::uint64_t completed, const std::uint64_t total) {
  if (!callback_ && !*trace_) { return; }
  const std::lock_guard lock(mutex_);
- const bool background_indexing = phase == DatasetCompilePhase::Indexing &&
-  (state_.phase == DatasetCompilePhase::Extracting || state_.phase == DatasetCompilePhase::Pixels);
+ const bool background_indexing = phase == DatasetCompilePhase::Indexing && (state_.phase == DatasetCompilePhase::Extracting || state_.phase == DatasetCompilePhase::Pixels);
  if (phase == DatasetCompilePhase::Indexing) {
   indexed_completed_ = std::max(indexed_completed_, completed);
   indexed_total_ = std::max(indexed_total_, total);
   indexing_known_ = true;
   update_labels();
  }
- if (background_indexing) { emit(); return; }
+ if (background_indexing) {
+  emit();
+  return;
+ }
  const bool phase_changed = state_.phase != phase;
  state_.phase = phase;
  if ((phase == DatasetCompilePhase::Downloading || phase == DatasetCompilePhase::Extracting) && !state_.tracks.acquisition.complete) {
@@ -82,7 +83,10 @@ void ProgressReporter::phase(const DatasetCompilePhase phase, const std::uint64_
  emit();
 }
 void ProgressReporter::update_labels() {
- if (state_.phase == DatasetCompilePhase::Labels) { state_.completed = label_completed_; state_.total = label_plans_.size(); }
+ if (state_.phase == DatasetCompilePhase::Labels) {
+  state_.completed = label_completed_;
+  state_.total = label_plans_.size();
+ }
  auto& labels = state_.tracks.labels;
  labels.completed = indexed_completed_;
  add_progress(labels.completed, label_completed_, "benchmark labels completed overflow");
@@ -91,8 +95,10 @@ void ProgressReporter::update_labels() {
  labels.total_known = indexing_known_;
  labels.complete = labels_admitted_ && indexing_known_ && labels.completed == labels.total;
  labels.active = !labels.complete && (indexed_completed_ < indexed_total_ || label_active_ != 0);
- labels.activity = labels.complete ? DatasetCompileActivity::Complete : label_active_ != 0 ? DatasetCompileActivity::Preparing :
-  indexed_completed_ < indexed_total_ ? DatasetCompileActivity::Normalizing : DatasetCompileActivity::Waiting;
+ labels.activity = labels.complete                        ? DatasetCompileActivity::Complete
+                   : label_active_ != 0                   ? DatasetCompileActivity::Preparing
+                    : indexed_completed_ < indexed_total_ ? DatasetCompileActivity::Normalizing
+                                                          : DatasetCompileActivity::Waiting;
 }
 void ProgressReporter::label_plans(std::size_t total) {
  if (!callback_) return;
@@ -179,7 +185,10 @@ void ProgressReporter::pixel_completed() {
  auto& pixels = state_.tracks.pixels;
  if (pixels.completed >= pixels.total) throw std::overflow_error("benchmark pixel completion exceeds total");
  ++pixels.completed;
- if (state_.phase == DatasetCompilePhase::Pixels) { state_.completed = pixels.completed; state_.total = pixels.total; }
+ if (state_.phase == DatasetCompilePhase::Pixels) {
+  state_.completed = pixels.completed;
+  state_.total = pixels.total;
+ }
  pixels.complete = pixels.completed == pixels.total;
  pixels.active = !pixels.complete;
  pixels.activity = pixels.complete ? DatasetCompileActivity::Complete : DatasetCompileActivity::Compiling;
@@ -189,8 +198,8 @@ void ProgressReporter::pixel_completed() {
  if (*trace_) {
   const double elapsed = std::chrono::duration<double>(Clock::now() - pixel_started_).count();
   trace_benchmark_event(*trace_, "benchmark.pixel_compile.throughput", [&] {
-   return nlohmann::json{{"completed_images", pixels.completed}, {"total_images", pixels.total}, {"elapsed_seconds", elapsed},
-    {"split", "train and val"}, {"images_per_second", elapsed > 0 ? static_cast<double>(pixels.completed) / elapsed : 0},
+   return nlohmann::json{{"completed_images", pixels.completed}, {"total_images", pixels.total}, {"elapsed_seconds", elapsed}, {"split", "train and val"},
+    {"images_per_second", elapsed > 0 ? static_cast<double>(pixels.completed) / elapsed : 0},
     {"eta_seconds", pixels.completed != 0 ? static_cast<double>(pixels.total - pixels.completed) * elapsed / static_cast<double>(pixels.completed) : 0}};
   });
  }
@@ -209,7 +218,10 @@ void ProgressReporter::source_activity(const BenchmarkDatasetSource source, std:
  const std::lock_guard lock(mutex_);
  if (!callback_) {
   if (state_.activity != activity || state_.current_source != source) { trace_activity(source, activity); }
-  if (foreground) { state_.current_source = source; state_.activity = std::move(activity); }
+  if (foreground) {
+   state_.current_source = source;
+   state_.activity = std::move(activity);
+  }
   return;
  }
  set_source_activity_unlocked(source, std::move(activity), foreground);
@@ -220,7 +232,10 @@ void ProgressReporter::set_source_activity_unlocked(const BenchmarkDatasetSource
  if (source_state.activity != activity || state_.current_source != source) { trace_activity(source, activity); }
  source_state.complete = false;
  source_state.activity = activity.substr(0, kDatasetCompileProgressTextCapacity);
- if (foreground) { state_.current_source = source; set_activity_unlocked(std::move(activity)); }
+ if (foreground) {
+  state_.current_source = source;
+  set_activity_unlocked(std::move(activity));
+ }
 }
 bool ProgressReporter::transfer_observer_enabled() const noexcept { return static_cast<bool>(callback_); }
 bool ProgressReporter::normalization_observer_enabled() const noexcept { return static_cast<bool>(callback_); }
@@ -345,10 +360,8 @@ void ProgressReporter::update_acquisition() {
  acquisition.completed = 0;
  acquisition.total = 0;
  acquisition.total_known = true;
-
  for (const auto& source : state_.sources) {
   acquisition.total_known = acquisition.total_known && source.byte_total_known;
-
   add_progress(acquisition.completed, source.completed_bytes, "benchmark acquisition count overflow");
   add_progress(acquisition.total, source.total_bytes, "benchmark acquisition total overflow");
  }
@@ -413,9 +426,14 @@ void ArtifactProgressTotals::update(const DownloadProgress& update, ProgressRepo
  totals.completed = completed;
  totals.known_total = known_total;
  totals.unknown_count = unknown_count;
- reporter.source_transfer(update, BenchmarkSourceProgress{.source = source, .activity = {}, .completed_bytes = completed,
-  .total_bytes = unknown_count == 0U ? known_total : 0U, .retry_count = source_retries,
-  .cache_hit = source_cached == totals.artifacts.size(), .resumed = source_resumed != 0, .byte_total_known = unknown_count == 0U});
+ reporter.source_transfer(update, BenchmarkSourceProgress{.source = source,
+                                   .activity = {},
+                                   .completed_bytes = completed,
+                                   .total_bytes = unknown_count == 0U ? known_total : 0U,
+                                   .retry_count = source_retries,
+                                   .cache_hit = source_cached == totals.artifacts.size(),
+                                   .resumed = source_resumed != 0,
+                                   .byte_total_known = unknown_count == 0U});
 }
 void ArtifactProgressTotals::images(BenchmarkDatasetSource source, const std::string& artifact, std::uint64_t completed, std::uint64_t source_total, ProgressReporter& reporter, std::string activity) {
  if (!reporter.transfer_observer_enabled()) return;

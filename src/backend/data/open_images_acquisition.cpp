@@ -112,7 +112,6 @@ public:
  OpenImageCacheWorkers(const OpenImageCacheWorkers&) = delete;
  OpenImageCacheWorkers& operator=(const OpenImageCacheWorkers&) = delete;
  ~OpenImageCacheWorkers() { stop(); }
-
  void submit(const std::uint64_t image_id, const std::uint32_t attempt, std::vector<std::uint8_t> encoded) {
   throw_if_benchmark_cancelled(cancellation_);
   if (inline_validator_) {
@@ -235,7 +234,8 @@ private:
 };
 void download_open_images(const std::span<const std::uint64_t> expected_ids, const std::filesystem::path& image_root, NormalizedAnnotationIndex* annotation_index,
  std::vector<QuarantinedImage>* quarantined, mmltk::common::concurrency::CancellationObservation cancel_requested, ProgressReporter* progress, std::uint64_t* completed_images,
- const std::uint64_t total_images, std::uint64_t* cached_image_bytes, const std::size_t transfer_concurrency, const std::size_t cache_workers, const BenchmarkTraceSink& trace, const CachedImageReadySink& image_ready, const std::string& progress_group, std::uint64_t progress_begin) {
+ const std::uint64_t total_images, std::uint64_t* cached_image_bytes, const std::size_t transfer_concurrency, const std::size_t cache_workers, const BenchmarkTraceSink& trace,
+ const CachedImageReadySink& image_ready, const std::string& progress_group, std::uint64_t progress_begin) {
  ensure_curl_global();
  CurlMulti multi(curl_multi_init());
  if (!multi) { throw std::runtime_error("cannot allocate Open Images multi transfer"); }
@@ -270,7 +270,9 @@ void download_open_images(const std::span<const std::uint64_t> expected_ids, con
  const auto recycle_buffer = [&](std::unique_ptr<OpenImagesTransfer>& transfer) { recycle_encoded(std::move(transfer->encoded)); };
  const auto report_image_progress = [&] {
   constexpr std::uint64_t kProgressBatch = 64U;
-  if (*completed_images == total_images || *completed_images % kProgressBatch == 0U) { progress->transfers().images(BenchmarkDatasetSource::kOpenImagesV7, progress_group, *completed_images - progress_begin, total_images, *progress); }
+  if (*completed_images == total_images || *completed_images % kProgressBatch == 0U) {
+   progress->transfers().images(BenchmarkDatasetSource::kOpenImagesV7, progress_group, *completed_images - progress_begin, total_images, *progress);
+  }
  };
  const auto retry_or_quarantine = [&](const std::uint64_t image_id, const std::uint32_t attempt, std::string reason, const bool throttled = false) {
   trace_benchmark_event(trace, "benchmark.open_images.image_attempt_failed", [&] { return nlohmann::json{{"image_id", image_id}, {"attempt", attempt}, {"reason", reason}}; });
@@ -509,7 +511,8 @@ void complete_open_images_group(const std::filesystem::path& image_root, const s
    auto owned = image;
    owned.custody = lease;
    image_ready(owned);
-  }} : CachedImageReadySink{};
+  }}
+                                                         : CachedImageReadySink{};
   if (decode_probe && std::ranges::binary_search(group, decode_probe->image_id)) {
    progress->source_activity(BenchmarkDatasetSource::kOpenImagesV7, "Invalidating failed Open Images JPEG " + std::to_string(decode_probe->image_id) + " under the group lock");
    remove_cache_path(completion);
@@ -581,7 +584,8 @@ void complete_open_images_group(const std::filesystem::path& image_root, const s
   const std::size_t quarantine_begin = quarantined->size();
   if (!missing_downloads.empty()) {
    progress->source_activity(BenchmarkDatasetSource::kOpenImagesV7, "Downloading Open Images " + shard + " JPEGs");
-   download_open_images(missing_downloads, image_root, &index, quarantined, cancel_requested, progress, &completed_images, ids.size(), &cached_image_bytes, transfer_concurrency, cache_workers, trace, publish_image, shard, begin);
+   download_open_images(missing_downloads, image_root, &index, quarantined, cancel_requested, progress, &completed_images, ids.size(), &cached_image_bytes, transfer_concurrency, cache_workers, trace,
+    publish_image, shard, begin);
   }
   std::unordered_set<std::uint64_t> missing;
   for (std::size_t index_position = quarantine_begin; index_position < quarantined->size(); ++index_position) { missing.emplace((*quarantined)[index_position].image_id); }

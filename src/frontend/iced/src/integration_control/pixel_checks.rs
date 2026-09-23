@@ -569,21 +569,26 @@ impl AtlasDraw {
     pub(super) fn ready_tiles(&self) -> impl Iterator<Item = (u32, Rectangle)> + '_ {
         let columns = self.snapshot.viewport.columns.max(1);
         let side = self.image.width / columns as f32;
-        self.snapshot.gallery.slots.iter().enumerate().filter_map(move |(slot, ready)| {
-            if !*ready {
-                return None;
-            }
-            let compiled = *self.snapshot.order.visibleindices.get(slot)?;
-            // Exclude card/grid edges and intersect the real visible image clip.
-            let tile = Rectangle {
-                x: self.image.x + (slot as u32 % columns) as f32 * side + side * 0.2,
-                y: self.image.y + (slot as u32 / columns) as f32 * side + side * 0.2,
-                width: side * 0.6,
-                height: side * 0.6,
-            };
-            let visible = tile.intersection(&self.clip)?;
-            (visible.width >= 2.0 && visible.height >= 2.0).then_some((compiled, visible))
-        })
+        self.snapshot
+            .gallery
+            .slots
+            .iter()
+            .enumerate()
+            .filter_map(move |(slot, ready)| {
+                if !*ready {
+                    return None;
+                }
+                let compiled = *self.snapshot.order.visibleindices.get(slot)?;
+                // Exclude card/grid edges and intersect the real visible image clip.
+                let tile = Rectangle {
+                    x: self.image.x + (slot as u32 % columns) as f32 * side + side * 0.2,
+                    y: self.image.y + (slot as u32 / columns) as f32 * side + side * 0.2,
+                    width: side * 0.6,
+                    height: side * 0.6,
+                };
+                let visible = tile.intersection(&self.clip)?;
+                (visible.width >= 2.0 && visible.height >= 2.0).then_some((compiled, visible))
+            })
     }
 
     pub(super) fn visible_slot(&self, compiled_index: u32) -> Option<usize> {

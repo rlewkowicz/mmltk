@@ -59,7 +59,8 @@ contracts::ArtifactProgress project_artifact_progress(const mmltk::backend::data
   .elapsed_seconds = value.elapsed_seconds,
   .remaining_seconds = value.remaining_seconds,
   .throughput_per_second = value.throughput_per_second,
-  .dropped_instances = value.dropped_instances, .tracks = value.tracks};
+  .dropped_instances = value.dropped_instances,
+  .tracks = value.tracks};
 }
 contracts::ArtifactProgress project_artifact_progress(const mmltk::backend::data::BenchmarkCompileProgress& value) {
  std::string activity = value.activity;
@@ -80,7 +81,9 @@ contracts::ArtifactProgress project_artifact_progress(const mmltk::backend::data
   .throughput_per_second = estimate.throughput_per_second,
   .projected_output_bytes = value.projected_output_bytes,
   .dropped_instances = value.dropped_instances,
-  .quarantined_images = value.quarantined_images, .tracks = value.tracks, .sources = value.sources};
+  .quarantined_images = value.quarantined_images,
+  .tracks = value.tracks,
+  .sources = value.sources};
 }
 namespace {
 class RuntimeArtifactCompilerOperations final : public ArtifactCompilerOperations {

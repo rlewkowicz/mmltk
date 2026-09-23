@@ -1824,7 +1824,6 @@ TEST_CASE("benchmark selections persist as one canonical nested value and reject
   }
  }
 }
-
 TEST_CASE("validation display confidence has exact independent persisted settings", "[gui][settings][validation]") {
  auto state = default_gui_settings_state();
  CHECK(state.workflows.validate.display.confidence_threshold == 0.4F);

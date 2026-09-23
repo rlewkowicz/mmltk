@@ -26,6 +26,7 @@ public:
  void register_split(BenchmarkSplitWriter&, const PreparedBenchmarkSplit&);
  void image_ready(const CachedImageReady&);
  void drain();
+
 private:
  struct Slot {
   BenchmarkSplitWriter* writer;

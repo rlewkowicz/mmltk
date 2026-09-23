@@ -114,8 +114,7 @@ void moments8(RgbConstImageView source, const TransferTable& transfer, const Foo
    output[lane].variance[k] = variances_out[lane];
   }
  }
- if constexpr (Format == RgbPixelFormat::RGBA8)
-  _mm256_storeu_ps(alpha_output, _mm256_min_ps(_mm256_set1_ps(1), _mm256_max_ps(_mm256_setzero_ps(), normalize(_mm256_sub_ps(alpha_sum, alpha_error)))));
+ if constexpr (Format == RgbPixelFormat::RGBA8) _mm256_storeu_ps(alpha_output, _mm256_min_ps(_mm256_set1_ps(1), _mm256_max_ps(_mm256_setzero_ps(), normalize(_mm256_sub_ps(alpha_sum, alpha_error)))));
 }
 }  // namespace
 void copy_identity(RgbConstImageView source, RgbMutableImageView destination) {

@@ -174,6 +174,7 @@ pub enum Message {
         token: u32,
         bounds: [Rectangle; 3],
     },
+    #[cfg(target_arch = "wasm32")]
     ConfidenceInputDelivered(u8, bool),
     WorkflowPixels {
         picture: workflows::Picture,
@@ -429,7 +430,13 @@ extern "C" {
     #[wasm_bindgen::prelude::wasm_bindgen(js_name = mmltkIntegrationReplaceNumber)]
     fn replace_number_js(x: f64, y: f64, value: &str, selection_length: u32) -> u32;
     #[wasm_bindgen::prelude::wasm_bindgen(js_name = mmltkIntegrationConfidenceInput)]
-    fn confidence_input_js(x: f64, y: f64, action: u8, value: &str, completed: &wasm_bindgen::JsValue) -> u32;
+    fn confidence_input_js(
+        x: f64,
+        y: f64,
+        action: u8,
+        value: &str,
+        completed: &wasm_bindgen::JsValue,
+    ) -> u32;
     #[wasm_bindgen::prelude::wasm_bindgen(js_name = mmltkIntegrationPasteNumber)]
     fn paste_number_js(x: f64, y: f64, completed: &wasm_bindgen::JsValue) -> u32;
     #[wasm_bindgen::prelude::wasm_bindgen(js_name = mmltkIntegrationCancelNumberEdit)]
@@ -1690,8 +1697,10 @@ impl Controller {
                 }
                 return None;
             }
+            #[cfg(target_arch = "wasm32")]
             Message::ConfidenceInputDelivered(stage, delivered) => {
-                self.workflows.confidence_input_delivered(&mut self.driver, stage, delivered);
+                self.workflows
+                    .confidence_input_delivered(&mut self.driver, stage, delivered);
                 return None;
             }
             Message::WorkflowPixels {

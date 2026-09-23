@@ -28,30 +28,36 @@ namespace mmltk::acceptance::wayland {
 TEST_CASE("Validate to Explore requires real gallery pixel evidence", "[workspace][audit][pixel]") {
  const auto defect = GENERATE("none", "control", "source", "presentation", "sampled", "visible", "placeholder", "background", "missing_tile", "unbounded");
  BrowserAudit audit;
- nlohmann::json record{{"event", "integration.workflow.pixels"}, {"detail", "validate-to-explore"}, {"control", "explore.gallery.workspace"},
-  {"a", 7U}, {"b", 9U}, {"c", 64U}, {"d", 48U}, {"ready_tile", true}, {"matched", true}, {"compiled_index", 0U}, {"sample_width", 8U}, {"sample_height", 8U}};
+ nlohmann::json record{{"event", "integration.workflow.pixels"}, {"detail", "validate-to-explore"}, {"control", "explore.gallery.workspace"}, {"a", 7U}, {"b", 9U}, {"c", 64U}, {"d", 48U},
+  {"ready_tile", true}, {"matched", true}, {"compiled_index", 0U}, {"sample_width", 8U}, {"sample_height", 8U}};
  if (std::string_view{defect} == "control") record["control"] = "validate.detail.image";
  if (std::string_view{defect} == "source") record["a"] = 0U;
  if (std::string_view{defect} == "presentation") record["b"] = 0U;
  if (std::string_view{defect} == "sampled") record["c"] = 0U;
  if (std::string_view{defect} == "visible") record["d"] = 11U;
  if (std::string_view{defect} == "placeholder") record["ready_tile"] = false;
- if (std::string_view{defect} == "background") { record["d"] = 0U; record["matched"] = false; }
+ if (std::string_view{defect} == "background") {
+  record["d"] = 0U;
+  record["matched"] = false;
+ }
  if (std::string_view{defect} == "missing_tile") record.erase("compiled_index");
- if (std::string_view{defect} == "unbounded") { record["sample_width"] = 100U; record["c"] = 800U; record["d"] = 800U; }
+ if (std::string_view{defect} == "unbounded") {
+  record["sample_width"] = 100U;
+  record["c"] = 800U;
+  record["d"] = 800U;
+ }
  audit.consume(record);
  CHECK(audit.validate_to_explore_pixels == (std::string_view{defect} == "none"));
 }
-
 TEST_CASE("display confidence audit requires exact edits and reversible paired pixels", "[workspace][audit][validation]") {
  BrowserAudit audit;
  for (unsigned stage = 0U; stage < 9U; ++stage) {
   const double value = stage < 6U ? 0.437 : stage == 7U ? 1.0 : 0.0;
   const unsigned revision = stage < 6U ? 2U : stage - 3U;
   audit.consume({{"event", "integration.validation_confidence_edit"}, {"a", stage}, {"b", value}, {"c", revision}, {"d", 1U}});
-  if (stage >= 6U) audit.consume({{"event", "integration.validation_confidence_pixels"}, {"control", "validate.samples.atlas"},
-   {"stage", stage}, {"threshold", value}, {"detections", 300U}, {"minimum", 0.01}, {"maximum", 0.25}, {"clean", 8U},
-   {"generation", 1U}, {"revision", revision}, {"different", stage == 7U ? 50U : 0U}, {"matched", true}});
+  if (stage >= 6U)
+   audit.consume({{"event", "integration.validation_confidence_pixels"}, {"control", "validate.samples.atlas"}, {"stage", stage}, {"threshold", value}, {"detections", 300U}, {"minimum", 0.01},
+    {"maximum", 0.25}, {"clean", 8U}, {"generation", 1U}, {"revision", revision}, {"different", stage == 7U ? 50U : 0U}, {"matched", true}});
  }
  REQUIRE(audit.validation_confidence_complete());
  SECTION("rounded value") { audit.validation_confidence_edits[0]["b"] = 0.44; }
@@ -64,11 +70,9 @@ TEST_CASE("display confidence audit requires exact edits and reversible paired p
  SECTION("missing proof") { audit.validation_confidence_pixels.pop_back(); }
  CHECK_FALSE(audit.validation_confidence_complete());
 }
-
 TEST_CASE("validation controls require rendered names right-preview placement and narrow stacking", "[workspace][audit][validation]") {
  BrowserAudit audit;
- for (const char* label : {"Groundtruth", "Detections", "Display confidence", "Preview only"})
-  audit.consume({{"event", "integration.validation_text"}, {"control", label}});
+ for (const char* label : {"Groundtruth", "Detections", "Display confidence", "Preview only"}) audit.consume({{"event", "integration.validation_text"}, {"control", label}});
  for (const char* stage : {"atlas", "narrow"}) {
   audit.validation_layout[{stage, "validate.samples.atlas"}] = {500, 100, 300, 400};
   audit.validation_layout[{stage, "validate.gt.group"}] = {500, 510, 250, 47};
@@ -81,7 +85,6 @@ TEST_CASE("validation controls require rendered names right-preview placement an
  SECTION("unstacked narrow") { audit.validation_layout[{"narrow", "validate.pred.group"}] = {770, 510, 250, 47}; }
  CHECK_FALSE(audit.validation_layout_complete());
 }
-
 TEST_CASE("benchmark radio audit requires every real choice, current visibility and settled restoration", "[workspace][audit][benchmark]") {
  const bool baseline_enabled = GENERATE(false, true);
  const unsigned baseline_dataset = GENERATE(0U, 1U);
@@ -2370,14 +2373,11 @@ TEST_CASE("cached viewport evidence joins initial readiness before new read admi
  }
 }
 }  // namespace mmltk::acceptance::wayland
-
 namespace mmltk::acceptance::wayland {
 TEST_CASE("packaged compilation exposes three laid-out track facts including known-zero acquisition", "[workspace][audit]") {
  BrowserAudit audit;
- for (const auto& [name, detail] : std::array<std::pair<const char*, const char*>, 3>{{
-  {"Acquisition", "Acquisition · unnecessary · 0 / 0"},
-  {"Labels/masks", "Labels/masks · active · 3 / 8"},
-  {"Pixels", "Pixels · active · 2 / 8"}}}) {
+ for (const auto& [name, detail] : std::array<std::pair<const char*, const char*>, 3>{
+       {{"Acquisition", "Acquisition · unnecessary · 0 / 0"}, {"Labels/masks", "Labels/masks · active · 3 / 8"}, {"Pixels", "Pixels · active · 2 / 8"}}}) {
   audit.consume({{"event", "integration.compile_track_text"}, {"control", name}, {"detail", detail}, {"a", 1}, {"b", 2}, {"c", 100}, {"d", 16}});
  }
  CHECK(audit.compile_tracks.size() == 3);

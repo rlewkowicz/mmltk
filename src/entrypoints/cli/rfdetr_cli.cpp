@@ -527,11 +527,12 @@ void run_compile(const CompileCliRequest& request) {
   config.progress = [](const data::BenchmarkCompileProgress& progress) {
    spdmon::ProgressBar::log(data::format_dataset_compile_tracks(progress.tracks));
    if (!progress.activity.empty()) spdmon::ProgressBar::log(progress.activity);
-   for (const auto& source : progress.sources) if (!source.activity.empty()) {
-    spdmon::ProgressBar::log(std::string(data::benchmark_source_label(source.source)) + " · " + data::format_benchmark_source_status(source, "Acquiring") + " · " +
-     std::to_string(source.completed_bytes) + "/" + (source.byte_total_known ? std::to_string(source.total_bytes) : "?") + " bytes · " +
-     std::to_string(source.completed_images) + "/" + std::to_string(source.total_images) + " images · " + std::to_string(source.invalidated_images) + " invalidated");
-   }
+   for (const auto& source : progress.sources)
+    if (!source.activity.empty()) {
+     spdmon::ProgressBar::log(std::string(data::benchmark_source_label(source.source)) + " · " + data::format_benchmark_source_status(source, "Acquiring") + " · " +
+                              std::to_string(source.completed_bytes) + "/" + (source.byte_total_known ? std::to_string(source.total_bytes) : "?") + " bytes · " +
+                              std::to_string(source.completed_images) + "/" + std::to_string(source.total_images) + " images · " + std::to_string(source.invalidated_images) + " invalidated");
+    }
   };
   if (logging::enabled(spdlog::level::trace)) {
    config.trace = [](const std::string_view event, const std::string_view fields) {

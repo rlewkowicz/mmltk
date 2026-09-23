@@ -84,8 +84,8 @@ public:
   free_buffers_.resize(buffer_count);
   for (auto& buffer : free_buffers_) buffer.reserve(std::size_t{512U} * 1024U);
   try {
-   if (workers_) for (std::size_t lane = 0; lane < workers_->size(); ++lane)
-    workers_->enqueue_borrowed(this, lane, [](void* owner, std::size_t) { static_cast<CachedImageWritePool*>(owner)->run(); });
+   if (workers_)
+    for (std::size_t lane = 0; lane < workers_->size(); ++lane) workers_->enqueue_borrowed(this, lane, [](void* owner, std::size_t) { static_cast<CachedImageWritePool*>(owner)->run(); });
   } catch (...) {
    stop();
    throw;
@@ -427,9 +427,10 @@ CachedImageDirectory extract_selected_archive_images(ArchiveExtractionRequest re
  std::vector<CachedImageRejection> quarantined;
  if (validate_cached_image_group(
       request.output_root, completion, identity, request.selected_image_ids, &image_bytes, request.cancel_requested, request.trace, request.quarantine_unavailable ? &quarantined : nullptr)) {
-  if (request.image_ready) for (const auto id : request.selected_image_ids) {
-   if (!std::ranges::binary_search(quarantined, id, {}, &CachedImageRejection::image_id)) request.image_ready({request.output_root, id});
-  }
+  if (request.image_ready)
+   for (const auto id : request.selected_image_ids) {
+    if (!std::ranges::binary_search(quarantined, id, {}, &CachedImageRejection::image_id)) request.image_ready({request.output_root, id});
+   }
   if (request.progress) { request.progress(request.selected_image_ids.size(), request.selected_image_ids.size()); }
   return make_cached_image_directory(request.source, request.shard, std::move(request.output_root), identity, request.selected_image_ids, image_bytes, true, std::move(quarantined));
  }

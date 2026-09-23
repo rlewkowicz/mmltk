@@ -133,8 +133,14 @@ pub fn upscale_label(kernel: crate::generated::UpscaleKernel) -> &'static str {
 }
 
 /// Source owners provide cohesive groups; wrapping preserves natural typography sizes.
-pub fn control_groups<'a, Message: 'a>(groups: impl IntoIterator<Item = Element<'a, Message>>) -> Element<'a, Message> {
-    iced::widget::Row::with_children(groups).spacing(20).align_y(Center).wrap().into()
+pub fn control_groups<'a, Message: 'a>(
+    groups: impl IntoIterator<Item = Element<'a, Message>>,
+) -> Element<'a, Message> {
+    iced::widget::Row::with_children(groups)
+        .spacing(20)
+        .align_y(Center)
+        .wrap()
+        .into()
 }
 /// Reserve the exact responsive control layout beneath an opaque detail panel.
 /// This subtree supplies measurement only: no widget identities, input, or drawing
@@ -143,12 +149,34 @@ pub fn control_footprint<'a, Message: 'a>(controls: Element<'a, Message>) -> Ele
     Element::new(ControlFootprint(controls))
 }
 struct ControlFootprint<'a, Message>(Element<'a, Message>);
-impl<Message> iced::advanced::Widget<Message, crate::fluent_theme::Theme, iced::Renderer> for ControlFootprint<'_, Message> {
-    fn diff(&mut self, tree: &mut iced::advanced::widget::Tree) { tree.diff_children(std::slice::from_mut(&mut self.0)); }
-    fn size(&self) -> iced::Size<Length> { self.0.as_widget().size() }
-    fn layout(&mut self, tree: &mut iced::advanced::widget::Tree, renderer: &iced::Renderer, limits: &iced::advanced::layout::Limits) -> iced::advanced::layout::Node {
-        self.0.as_widget_mut().layout(&mut tree.children[0], renderer, limits)
+impl<Message> iced::advanced::Widget<Message, crate::fluent_theme::Theme, iced::Renderer>
+    for ControlFootprint<'_, Message>
+{
+    fn diff(&mut self, tree: &mut iced::advanced::widget::Tree) {
+        tree.diff_children(std::slice::from_mut(&mut self.0));
     }
-    fn draw(&self, _tree: &iced::advanced::widget::Tree, _renderer: &mut iced::Renderer, _theme: &crate::fluent_theme::Theme,
-        _style: &iced::advanced::renderer::Style, _layout: iced::advanced::Layout<'_>, _cursor: iced::advanced::mouse::Cursor, _viewport: &iced::Rectangle) {}
+    fn size(&self) -> iced::Size<Length> {
+        self.0.as_widget().size()
+    }
+    fn layout(
+        &mut self,
+        tree: &mut iced::advanced::widget::Tree,
+        renderer: &iced::Renderer,
+        limits: &iced::advanced::layout::Limits,
+    ) -> iced::advanced::layout::Node {
+        self.0
+            .as_widget_mut()
+            .layout(&mut tree.children[0], renderer, limits)
+    }
+    fn draw(
+        &self,
+        _tree: &iced::advanced::widget::Tree,
+        _renderer: &mut iced::Renderer,
+        _theme: &crate::fluent_theme::Theme,
+        _style: &iced::advanced::renderer::Style,
+        _layout: iced::advanced::Layout<'_>,
+        _cursor: iced::advanced::mouse::Cursor,
+        _viewport: &iced::Rectangle,
+    ) {
+    }
 }

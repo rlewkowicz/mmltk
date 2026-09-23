@@ -13,6 +13,7 @@
 #include <sys/file.h>
 #include <cerrno>
 #include "src/common/io/file_memory.h"
+#include "src/common/io/file_digest.h"
 #include "src/backend/data/benchmark_dataset_options.h"
 #include "src/test_support/filesystem_test_utils.hpp"
 #include "src/test_support/async_test_utils.hpp"
@@ -1781,18 +1782,15 @@ TEST_CASE("one physical admission budget governs membership extraction and write
    const auto invalidated = std::ranges::find_if(observations, [](const auto& value) { return value.tracks.labels.invalidated != 0; });
    REQUIRE(invalidated != observations.end());
    REQUIRE(invalidated != observations.begin());
-   const auto& before = (invalidated - 1)->tracks.labels;
-   CHECK(invalidated->tracks.labels.completed + invalidated->tracks.labels.invalidated == before.completed);
-   const auto replacement = std::ranges::find_if(invalidated, observations.end(), [&](const auto& value) {
-    return value.tracks.labels.total == before.total && value.tracks.labels.active;
-   });
+   const auto& previous_labels = (invalidated - 1)->tracks.labels;
+   CHECK(invalidated->tracks.labels.completed + invalidated->tracks.labels.invalidated == previous_labels.completed);
+   const auto replacement = std::ranges::find_if(invalidated, observations.end(), [&](const auto& value) { return value.tracks.labels.total == previous_labels.total && value.tracks.labels.active; });
    REQUIRE(replacement != observations.end());
    CHECK(replacement->tracks.labels.completed < replacement->tracks.labels.total);
-   CHECK(observations.back().tracks.labels.completed == before.completed);
+   CHECK(observations.back().tracks.labels.completed == previous_labels.completed);
    const auto base_rows = std::ranges::find(catalog.releases, CoconutEdition::Base, &CoconutReleaseComponent::edition)->expected_rows;
-   const auto rows_withdrawn = std::ranges::find_if(invalidated + 1, observations.end(), [&](const auto& value) {
-    return value.tracks.labels.invalidated == invalidated->tracks.labels.invalidated + base_rows;
-   });
+   const auto rows_withdrawn =
+    std::ranges::find_if(invalidated + 1, observations.end(), [&](const auto& value) { return value.tracks.labels.invalidated == invalidated->tracks.labels.invalidated + base_rows; });
    REQUIRE(rows_withdrawn != observations.end());
    const auto& retained = (rows_withdrawn - 1)->tracks.labels;
    CHECK(rows_withdrawn->tracks.labels.completed + base_rows == retained.completed);
@@ -2840,7 +2838,6 @@ TEST_CASE("COCONut recovery facts follow physical images when import rows are re
  store_coconut_component(roundtrip, rebuilt.front());
  CHECK(file_bytes(path.string() + ".inventory") == file_bytes(roundtrip.string() + ".inventory"));
 }
-
 TEST_CASE("COCONut metadata membership precedes mask payload admission", "[coconut]") {
  ScopedTempDir root("coconut-membership-first");
  const auto path = root.path() / "membership.parquet";
@@ -2859,7 +2856,6 @@ TEST_CASE("COCONut metadata membership precedes mask payload admission", "[cocon
  input.metadata_only = false;
  CHECK_THROWS(import_coconut_annotations(input));
 }
-
 TEST_CASE("cached training labels start before pixel drain and overlap subsequent pixels", "[benchmark][pipeline]") {
  using namespace std::chrono_literals;
  if (mmltk::common::system::allowed_cpu_set().size() < 4) SKIP("requires four assigned CPU lanes");
@@ -2874,7 +2870,10 @@ TEST_CASE("cached training labels start before pixel drain and overlap subsequen
  std::vector<std::pair<std::string, std::string>> members;
  // Seventy selected images exceed both the former 3P readiness limit and the
  // normal 64-image progress quantum. One pixel lane is assigned below.
- for (unsigned id = 100; id < 170; ++id) { ids.push_back(id); members.emplace_back(coco(id).member, white_jpeg()); }
+ for (unsigned id = 100; id < 170; ++id) {
+  ids.push_back(id);
+  members.emplace_back(coco(id).member, white_jpeg());
+ }
  tar(archive, members);
  physical.artifact.expected_size = std::filesystem::file_size(archive);
  auto custom = local_custom_catalog(local, ids);
@@ -2900,17 +2899,24 @@ TEST_CASE("cached training labels start before pixel drain and overlap subsequen
   if (event == "benchmark.pixel_compile.throughput" && labels_started.load() && Json::parse(fields).at("completed_images") >= 64 && !delivered.exchange(true)) subsequent_pixels.set_value();
  };
  auto compiling = std::async(std::launch::async, [&] {
-  compile_benchmark_recipe(config, nullptr, &custom, [&](BenchmarkDatasetSource source, std::string_view split) {
-   if (source == BenchmarkDatasetSource::kCoco2017 && split == "train2017") {
-    if (!reader.WaitEntered(5s)) throw std::runtime_error("same-split reader did not reach its open-file boundary");
-    labels_started.store(true);
-    labels_receipt.ArriveAndWait();
-   }
-  }, [&](const std::filesystem::path& source, std::uint64_t id) {
-   if (source == image_root && id == ids.front() && !reader_seen.exchange(true)) reader_receipt.ArriveAndWait();
-  });
+  compile_benchmark_recipe(
+   config, nullptr, &custom,
+   [&](BenchmarkDatasetSource source, std::string_view split) {
+    if (source == BenchmarkDatasetSource::kCoco2017 && split == "train2017") {
+     if (!reader.WaitEntered(5s)) throw std::runtime_error("same-split reader did not reach its open-file boundary");
+     labels_started.store(true);
+     labels_receipt.ArriveAndWait();
+    }
+   },
+   [&](const std::filesystem::path& source, std::uint64_t id) {
+    if (source == image_root && id == ids.front() && !reader_seen.exchange(true)) reader_receipt.ArriveAndWait();
+   });
  });
- const mmltk::testsupport::ScopedTestCleanup release([&] { cancelled.store(true); reader.Release(); labels.Release(); });
+ const mmltk::testsupport::ScopedTestCleanup release([&] {
+  cancelled.store(true);
+  reader.Release();
+  labels.Release();
+ });
  REQUIRE(reader.WaitEntered(5s));
  REQUIRE(labels.WaitEntered(5s));
  CHECK_FALSE(delivered.load());
@@ -2991,7 +2997,10 @@ TEST_CASE("COCONut annotation transfer settles while physical inventory acquisit
   if (event == "benchmark.download.complete" && Json::parse(fields).at("artifact") == artifact.artifact_id && !delivered.exchange(true)) annotation_ready.set_value();
  };
  auto compiling = std::async(std::launch::async, [&] { compile_benchmark_recipe(config, &catalog); });
- const mmltk::testsupport::ScopedTestCleanup release_transfer([&] { cancelled.store(true); physical_server.ReleasePartial(); });
+ const mmltk::testsupport::ScopedTestCleanup release_transfer([&] {
+  cancelled.store(true);
+  physical_server.ReleasePartial();
+ });
  REQUIRE(physical_server.WaitPartial());
  mmltk::testsupport::await_test_promise(annotation_ready, "independent annotation transfer", 3s);
  CHECK(compiling.wait_for(0ms) == std::future_status::timeout);
@@ -3009,7 +3018,6 @@ TEST_CASE("COCONut annotation transfer settles while physical inventory acquisit
  physical_server.Check();
  annotation_server.Check();
 }
-
 TEST_CASE("COCONut readable mismatched geometry survives a failed body and cache repair", "[benchmark][coconut][pipeline]") {
  ScopedTempDir root("coconut-header-repair");
  LocalCoconutRecipe local(root.path());
@@ -3027,11 +3035,13 @@ TEST_CASE("COCONut readable mismatched geometry survives a failed body and cache
  const auto expected = file_bytes(config.output_dir / "train.bin");
  const std::array<std::uint32_t, 24> pixels{};
  auto bad_body = png(6, 4, pixels);
- bad_body.resize(33); // Complete IHDR, no compressed image data.
+ bad_body.resize(33);  // Complete IHDR, no compressed image data.
  const auto cached = cached_image_path(local.cache.source_images("objects365") / "patch-32", 1);
  mmltk::testsupport::write_text_file(cached, bad_body);
  unsigned repairs = 0;
- config.trace = [&](std::string_view event, std::string_view) { if (event == "benchmark.pixel_compile.cache_repair") ++repairs; };
+ config.trace = [&](std::string_view event, std::string_view) {
+  if (event == "benchmark.pixel_compile.cache_repair") ++repairs;
+ };
  compile_benchmark_recipe(config, &catalog);
  CHECK(repairs == 1);
  CHECK(std::ranges::all_of(settled.sources, &BenchmarkSourceProgress::complete));
@@ -3059,14 +3069,14 @@ TEST_CASE("production output admission counts only unsettled format-9 extents", 
  CHECK(*additional == 0);
  CHECK(std::filesystem::file_size(config.output_dir / "train.bin") > 2 * 1024 * 1024);
 }
-
 TEST_CASE("COCONut cold partial and warm preparation admit each immutable product once", "[benchmark][coconut][pipeline]") {
  ScopedTempDir root("coconut-retained-admission");
  LocalCoconutRecipe local(root.path());
  const auto catalog = local.selected(CoconutValidation::CoconutStock);
  auto config = local.compiler_config({BenchmarkDatasetVariant::Coconut, CoconutValidation::CoconutStock}, true);
  std::vector<std::string> annotation_ids;
- for (const auto& release : catalog.releases) for (const auto& artifact : release.annotations) annotation_ids.push_back(artifact.artifact_id);
+ for (const auto& release : catalog.releases)
+  for (const auto& artifact : release.annotations) annotation_ids.push_back(artifact.artifact_id);
  std::size_t component_admissions = 0, artifact_admissions = 0;
  config.trace = [&](std::string_view event, std::string_view fields) {
   if (event == "benchmark.annotations.component_admitted") ++component_admissions;
@@ -3157,10 +3167,9 @@ TEST_CASE("COCONut consumes ready releases while an unrelated lifecycle lease is
  if (cold_ready_release) {
   const auto facts = Json::parse(manifest);
   for (const auto& component : facts.at("recipe").at("components"))
-   if (component.at("edition") == CoconutEdition::RelabeledValidation)
-    std::filesystem::remove(local.cache.root / component.at("imported_index").get<std::string>());
+   if (component.at("edition") == CoconutEdition::RelabeledValidation) std::filesystem::remove(local.cache.root / component.at("imported_index").get<std::string>());
  }
- REQUIRE(catalog.releases.size() > 2); // More releases than the two acquisition/parser lanes.
+ REQUIRE(catalog.releases.size() > 2);  // More releases than the two acquisition/parser lanes.
  const auto& blocked_release = catalog.releases.front();
  const auto lock_path = local.cache.locks / (std::string(blocked_release.name) + ".annotations.lifecycle.lock");
  std::optional<ArtifactLease> lease(ArtifactLease::acquire(lock_path, {}));
@@ -3184,21 +3193,26 @@ TEST_CASE("COCONut consumes ready releases while an unrelated lifecycle lease is
   if (value.at("edition") != blocked_release.edition && ++admitted == catalog.releases.size() - 1) ready_releases.set_value();
  };
  auto compiling = std::async(std::launch::async, [&] { compile_benchmark_recipe(config, &catalog); });
- const mmltk::testsupport::ScopedTestCleanup release([&] { cancelled.store(true); lease.reset(); });
+ const mmltk::testsupport::ScopedTestCleanup release([&] {
+  cancelled.store(true);
+  lease.reset();
+ });
  mmltk::testsupport::await_test_promise(ready_releases, "all independent release admissions", 5s);
  CHECK(compiling.wait_for(0ms) == std::future_status::timeout);
  CHECK(file_bytes(local.output / "train.bin") == train);
  CHECK(file_bytes(local.output / "val.bin") == validation);
  CHECK(file_bytes(local.output / "benchmark_manifest.json") == manifest);
  lease.reset();
- if (fail_blocked_release) CHECK_THROWS(mmltk::testsupport::await_test_future(compiling, "failed release drain", 5s));
- else mmltk::testsupport::await_test_future(compiling, "canonical ready release merge", 5s);
+ if (fail_blocked_release)
+  CHECK_THROWS(mmltk::testsupport::await_test_future(compiling, "failed release drain", 5s));
+ else
+  mmltk::testsupport::await_test_future(compiling, "canonical ready release merge", 5s);
  CHECK(file_bytes(local.output / "train.bin") == train);
  CHECK(file_bytes(local.output / "val.bin") == validation);
  CHECK(file_bytes(local.output / "benchmark_manifest.json") == manifest);
  // No completed or failed release retains lifecycle custody after compilation.
- for (const auto& release : catalog.releases) {
-  const auto path = local.cache.locks / (std::string(release.name) + ".annotations.lifecycle.lock");
+ for (const auto& component : catalog.releases) {
+  const auto path = local.cache.locks / (std::string(component.name) + ".annotations.lifecycle.lock");
   const mmltk::common::io::ScopedFd descriptor(::open(path.c_str(), O_RDWR | O_CLOEXEC));
   REQUIRE(descriptor.get() >= 0);
   CHECK(::flock(descriptor.get(), LOCK_EX | LOCK_NB) == 0);
@@ -3270,7 +3284,6 @@ TEST_CASE("cancellation retires release work while original annotations are lock
  CHECK(file_bytes(local.output / "val.bin") == validation);
  CHECK(file_bytes(local.output / "benchmark_manifest.json") == manifest);
 }
-
 TEST_CASE("COCONut receives metadata while a managed release lane is importing masks", "[benchmark][coconut][pipeline]") {
  using namespace std::chrono_literals;
  if (mmltk::common::system::allowed_cpu_set().size() < 3) SKIP("requires three assigned CPU lanes");
@@ -3283,8 +3296,7 @@ TEST_CASE("COCONut receives metadata while a managed release lane is importing m
  const auto train = file_bytes(local.output / "train.bin"), validation = file_bytes(local.output / "val.bin");
  const auto manifest = file_bytes(local.output / "benchmark_manifest.json");
  const auto facts = Json::parse(manifest);
- for (const auto& component : facts.at("recipe").at("components"))
-  std::filesystem::remove(local.cache.root / component.at("imported_index").get<std::string>());
+ for (const auto& component : facts.at("recipe").at("components")) std::filesystem::remove(local.cache.root / component.at("imported_index").get<std::string>());
  REQUIRE(catalog.releases.size() > 2);
  const auto blocked = catalog.releases.front().edition;
  const auto& delayed = catalog.releases.at(1);
@@ -3301,7 +3313,11 @@ TEST_CASE("COCONut receives metadata while a managed release lane is importing m
  std::atomic<bool> cancelled{false};
  config.cancel_requested = mmltk::common::concurrency::CancellationObservation::Atomic(cancelled);
  auto compiling = std::async(std::launch::async, [&] { compile_benchmark_recipe(config, &catalog); });
- const mmltk::testsupport::ScopedTestCleanup release([&] { cancelled.store(true); acquisition.reset(); masks.Release(); });
+ const mmltk::testsupport::ScopedTestCleanup release([&] {
+  cancelled.store(true);
+  acquisition.reset();
+  masks.Release();
+ });
  REQUIRE(masks.WaitEntered(5s));
  acquisition.reset();
  mmltk::testsupport::await_test_promise(received, "metadata consumption during independent full-mask work", 5s);
@@ -3312,7 +3328,6 @@ TEST_CASE("COCONut receives metadata while a managed release lane is importing m
  CHECK(file_bytes(local.output / "val.bin") == validation);
  CHECK(file_bytes(local.output / "benchmark_manifest.json") == manifest);
 }
-
 TEST_CASE("cold COCONut releases retain one aggregate indexing denominator", "[benchmark][coconut][progress]") {
  using namespace std::chrono_literals;
  if (mmltk::common::system::allowed_cpu_set().size() < 3) SKIP("requires three assigned CPU lanes");
@@ -3362,9 +3377,12 @@ TEST_CASE("cold COCONut releases retain one aggregate indexing denominator", "[b
  const auto base_receipt = base.receipt(), validation_receipt = validation.receipt(), receiver_receipt = receiver.receipt();
  catalog.release_observer = [&](CoconutEdition edition, CoconutReleaseBoundary boundary) {
   if (edition == CoconutEdition::Base) {
-   if (boundary == CoconutReleaseBoundary::MasksStarted) base_receipt.ArriveAndWait();
-   else receiver_receipt.ArriveAndWait();
-  } else if (edition == CoconutEdition::RelabeledValidation && boundary == CoconutReleaseBoundary::MasksStarted) validation_receipt.ArriveAndWait();
+   if (boundary == CoconutReleaseBoundary::MasksStarted)
+    base_receipt.ArriveAndWait();
+   else
+    receiver_receipt.ArriveAndWait();
+  } else if (edition == CoconutEdition::RelabeledValidation && boundary == CoconutReleaseBoundary::MasksStarted)
+   validation_receipt.ArriveAndWait();
  };
  std::vector<BenchmarkCompileProgress> indexing;
  std::promise<void> independent_settled, all_settled, extracting;
@@ -3373,24 +3391,36 @@ TEST_CASE("cold COCONut releases retain one aggregate indexing denominator", "[b
  bool foreground_preserved = true, background_observed = false;
  std::optional<BenchmarkCompileProgress> previous_update;
  config.progress = [&](const BenchmarkCompileProgress& value) {
-  if (previous_update && previous_update->phase == DatasetCompilePhase::Extracting &&
-      value.tracks.labels.completed != previous_update->tracks.labels.completed) {
+  if (previous_update && previous_update->phase == DatasetCompilePhase::Extracting && value.tracks.labels.completed != previous_update->tracks.labels.completed) {
    background_observed = true;
-   foreground_preserved = foreground_preserved && value.phase == previous_update->phase && value.activity == previous_update->activity &&
-    value.current_source == previous_update->current_source && value.completed == previous_update->completed && value.total == previous_update->total &&
-    value.activity_elapsed_seconds >= previous_update->activity_elapsed_seconds;
+   foreground_preserved = foreground_preserved && value.phase == previous_update->phase && value.activity == previous_update->activity && value.current_source == previous_update->current_source &&
+                          value.completed == previous_update->completed && value.total == previous_update->total && value.activity_elapsed_seconds >= previous_update->activity_elapsed_seconds;
   }
   previous_update = value;
-  if (value.phase == DatasetCompilePhase::Extracting && !extracting_reported) { extracting_reported = true; extracting.set_value(); }
+  if (value.phase == DatasetCompilePhase::Extracting && !extracting_reported) {
+   extracting_reported = true;
+   extracting.set_value();
+  }
   if (value.tracks.labels.total < total || value.tracks.labels.activity == DatasetCompileActivity::Preparing || value.tracks.labels.completed > total) return;
   indexing.push_back(value);
-  if (value.tracks.labels.completed == total - base_rows && !independent_reported) { independent_reported = true; independent_settled.set_value(); }
-  if (value.tracks.labels.completed == total && !all_reported) { all_reported = true; all_settled.set_value(); }
+  if (value.tracks.labels.completed == total - base_rows && !independent_reported) {
+   independent_reported = true;
+   independent_settled.set_value();
+  }
+  if (value.tracks.labels.completed == total && !all_reported) {
+   all_reported = true;
+   all_settled.set_value();
+  }
  };
  std::atomic<bool> cancelled{false};
  config.cancel_requested = mmltk::common::concurrency::CancellationObservation::Atomic(cancelled);
  auto compiling = std::async(std::launch::async, [&] { compile_benchmark_recipe(config, &catalog); });
- const mmltk::testsupport::ScopedTestCleanup release([&] { cancelled.store(true); base.Release(); validation.Release(); receiver.Release(); });
+ const mmltk::testsupport::ScopedTestCleanup release([&] {
+  cancelled.store(true);
+  base.Release();
+  validation.Release();
+  receiver.Release();
+ });
  REQUIRE(base.WaitEntered(5s));
  REQUIRE(validation.WaitEntered(5s));
  REQUIRE(receiver.WaitEntered(5s));
@@ -3407,9 +3437,7 @@ TEST_CASE("cold COCONut releases retain one aggregate indexing denominator", "[b
  CHECK(foreground_preserved);
  CHECK(indexing.front().tracks.labels.completed == 0);
  CHECK(indexing.back().tracks.labels.completed == total);
- const auto background = std::ranges::find_if(indexing, [&](const auto& value) {
-  return value.phase == DatasetCompilePhase::Extracting && value.tracks.labels.completed == total;
- });
+ const auto background = std::ranges::find_if(indexing, [&](const auto& value) { return value.phase == DatasetCompilePhase::Extracting && value.tracks.labels.completed == total; });
  REQUIRE(background != indexing.end());
  std::uint64_t previous = 0;
  for (const auto& value : indexing) {
@@ -3426,6 +3454,9 @@ TEST_CASE("cold COCONut releases retain one aggregate indexing denominator", "[b
   previous = value.tracks.labels.completed;
  }
  CHECK(indexing.back().tracks.labels.invalidated == (repair_annotations ? 64 : 0));
- if (annotation_server) { CHECK(annotation_server->requests() == 1); annotation_server->Check(); }
+ if (annotation_server) {
+  CHECK(annotation_server->requests() == 1);
+  annotation_server->Check();
+ }
  CHECK(CompiledDataset::open(local.output / "val.bin").image_entries().size() == 1);
 }

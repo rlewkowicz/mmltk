@@ -1090,7 +1090,10 @@ mod tests {
                     app.model.abandon_viewer();
                     if results {
                         app.model.workflow.validation.as_mut().unwrap().frame =
-                            crate::view_model::test_support::visual_frame(PresentationSourceKind::Validation, 9);
+                            crate::view_model::test_support::visual_frame(
+                                PresentationSourceKind::Validation,
+                                9,
+                            );
                     }
                     app.workspace.select(origin);
                     app.model.set_foreground_feature(origin);
@@ -1099,16 +1102,22 @@ mod tests {
                     } else {
                         navigate(&mut app, FeatureId::Explore);
                     }
-                    assert_eq!(app.model.foreground_visual(), Some(PresentationSourceKind::Explore));
+                    assert_eq!(
+                        app.model.foreground_visual(),
+                        Some(PresentationSourceKind::Explore)
+                    );
                     assert!(GalleryIdentity::current(&app.model).is_some());
                     assert!(app.model.requested_upscale.is_none());
                     let mut late = app.model.workflow.validation.clone().unwrap();
                     late.frame = crate::view_model::test_support::visual_frame(
-                        PresentationSourceKind::Validation, 10,
+                        PresentationSourceKind::Validation,
+                        10,
                     );
-                    app.model.reduce_event(crate::generated::ApplicationEvent::ValidationValidationChanged(
-                        crate::generated::ValidationChanged { snapshot: late },
-                    ));
+                    app.model.reduce_event(
+                        crate::generated::ApplicationEvent::ValidationValidationChanged(
+                            crate::generated::ValidationChanged { snapshot: late },
+                        ),
+                    );
                     app.reconcile_surface_frame();
                     assert!(GalleryIdentity::current(&app.model).is_some());
                 }
@@ -2018,7 +2027,10 @@ mod tests {
             let (mut app, frame) = viewer_app();
             navigate(&mut app, FeatureId::Validate);
             navigate(&mut app, FeatureId::Explore);
-            assert_eq!(app.model.foreground_visual(), Some(PresentationSourceKind::Explore));
+            assert_eq!(
+                app.model.foreground_visual(),
+                Some(PresentationSourceKind::Explore)
+            );
             let next = FrameReady {
                 content_sequence: 2,
                 presentation_revision: 6,

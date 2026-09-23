@@ -34,8 +34,7 @@ void prepare_caption_model(rfdetr::NativeRfDetrModel& model, const data::catalog
  auto parameters = model.named_parameters();
  for (const auto& parameter : parameters) {
   const auto& name = parameter.key();
-  if (name.starts_with("transformer.enc_out_class_embed.") || (name.starts_with("transformer.enc_out_bbox_embed.") && name.find(".layers.2.") != std::string::npos))
-   parameter.value().zero_();
+  if (name.starts_with("transformer.enc_out_class_embed.") || (name.starts_with("transformer.enc_out_bbox_embed.") && name.find(".layers.2.") != std::string::npos)) parameter.value().zero_();
  }
  const auto longest = std::ranges::max_element(catalog.names(), {}, [](const auto& name) { return name.size(); });
  const auto category = catalog.resolve(*longest).value();

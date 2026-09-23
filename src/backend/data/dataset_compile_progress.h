@@ -54,7 +54,9 @@ struct DatasetCompileTrack final {
  DatasetCompileActivity activity = DatasetCompileActivity::Waiting;
  // Successful contributions explicitly removed by repair, never attempts.
  std::uint64_t invalidated = 0;
- [[nodiscard]] bool valid() const noexcept { return static_cast<std::uint8_t>(activity) <= static_cast<std::uint8_t>(DatasetCompileActivity::Complete) && (!total_known || completed <= total) && !(active && complete); }
+ [[nodiscard]] bool valid() const noexcept {
+  return static_cast<std::uint8_t>(activity) <= static_cast<std::uint8_t>(DatasetCompileActivity::Complete) && (!total_known || completed <= total) && !(active && complete);
+ }
  bool operator==(const DatasetCompileTrack&) const = default;
 };
 struct DatasetCompileTracks final {
@@ -67,8 +69,11 @@ struct DatasetCompileTracks final {
 [[nodiscard]] inline std::string format_dataset_compile_tracks(const DatasetCompileTracks& tracks) {
  const auto format = [](std::string_view name, const DatasetCompileTrack& track) {
   return std::string(name) + " " + std::to_string(track.completed) + "/" + (track.total_known ? std::to_string(track.total) : "?") +
-   (track.activity == DatasetCompileActivity::Unnecessary ? " unnecessary" : track.complete ? " complete" : track.active ? " active" : " waiting") +
-   (track.invalidated ? " (" + std::to_string(track.invalidated) + " invalidated)" : "");
+         (track.activity == DatasetCompileActivity::Unnecessary ? " unnecessary"
+          : track.complete                                      ? " complete"
+           : track.active                                       ? " active"
+                                                                : " waiting") +
+         (track.invalidated ? " (" + std::to_string(track.invalidated) + " invalidated)" : "");
  };
  return format("Acquisition", tracks.acquisition) + " | " + format("Labels/masks", tracks.labels) + " | " + format("Pixels", tracks.pixels);
 }

@@ -442,7 +442,8 @@ public:
     component.index.images.push_back({physical.image_id, 0, 0, record.width, record.height, physical.shard, 0});
     component.inventory.push_back({physical, record.image_id, record.source_ordinal});
     if (component.recovery_policy) component.recovery.push_back({physical.image_id, 0, {}});
-   } else normalize(record, physical, png);
+   } else
+    normalize(record, physical, png);
   } catch (const std::exception& error) { invalid(physical.member + ": " + error.what()); }
   ++rows_;
   if (request_.progress && rows_ % kProgressQuantum == 0) request_.progress(rows_);
@@ -940,11 +941,14 @@ std::vector<CoconutComponent> import_coconut_annotations(const CoconutImportRequ
  Importer importer(request);
  if (request.edition == CoconutEdition::Base || request.edition == CoconutEdition::RelabeledValidation) {
   if (request.parquet_shards.empty()) invalid("missing Parquet shards");
-  read_coconut_parquet(request.parquet_shards, request.limits, request.cancellation, [&](const CoconutRecord& record, std::span<const std::uint8_t> png) { importer.consume(record, png); }, request.metadata_only);
+  read_coconut_parquet(
+   request.parquet_shards, request.limits, request.cancellation, [&](const CoconutRecord& record, std::span<const std::uint8_t> png) { importer.consume(record, png); }, request.metadata_only);
  } else {
   auto records = request.edition == CoconutEdition::XLarge ? xlarge_records(request) : json_records(request);
-  if (request.metadata_only) for (const auto& record : records) importer.consume(record, {});
-  else consume_archive(request, records, importer);
+  if (request.metadata_only)
+   for (const auto& record : records) importer.consume(record, {});
+  else
+   consume_archive(request, records, importer);
  }
  return importer.finish();
 }

@@ -493,10 +493,9 @@ auto BrowserAudit::consume(const nlohmann::json& record) -> void {
  } else if (event == "integration.workflow.pixels" && record.value("detail", "") == "validate-to-explore") {
   const auto sampled = scalar(record, "c"), colored = scalar(record, "d");
   const auto width = scalar(record, "sample_width"), height = scalar(record, "sample_height");
-  validate_to_explore_pixels = record.value("control", "") == kExploreGalleryControl && scalar(record, "a") != 0U && scalar(record, "b") != 0U &&
-                              record.value("ready_tile", false) && record.value("matched", false) && record.contains("compiled_index") &&
-                              width > 0U && width <= 8U && height > 0U && height <= 8U && sampled == width * height &&
-                              colored >= 12U && colored <= sampled && colored * 2U >= sampled;
+  validate_to_explore_pixels = record.value("control", "") == kExploreGalleryControl && scalar(record, "a") != 0U && scalar(record, "b") != 0U && record.value("ready_tile", false) &&
+                               record.value("matched", false) && record.contains("compiled_index") && width > 0U && width <= 8U && height > 0U && height <= 8U && sampled == width * height &&
+                               colored >= 12U && colored <= sampled && colored * 2U >= sampled;
  } else if (event == "integration.validation_layout") {
   validation_layout[{record.value("detail", ""), record.value("control", "")}] = {numeric(record, "a"), numeric(record, "b"), numeric(record, "c"), numeric(record, "d")};
  } else if (event == "integration.validation_text") {
@@ -805,10 +804,10 @@ auto BrowserAudit::consume(const nlohmann::json& record) -> void {
   if (progress && progress_ordinal == 0U) progress_ordinal = ordinal;
  } else if (event == "integration.compile_track_text") {
   const auto control = record.value("control", "");
-  const auto detail = record.value("detail", "");
+  const auto track_text = record.value("detail", "");
   const bool label = control == "Acquisition" || control == "Labels/masks" || control == "Pixels";
-  const bool zero_acquisition = control != "Acquisition" || detail == "Acquisition · unnecessary · 0 / 0";
-  if (label && zero_acquisition && detail.starts_with(control + " · ") && detail.find(" / ") != std::string::npos && numeric(record, "c") > 0 && numeric(record, "d") > 0)
+  const bool zero_acquisition = control != "Acquisition" || track_text == "Acquisition · unnecessary · 0 / 0";
+  if (label && zero_acquisition && track_text.starts_with(control + " · ") && track_text.find(" / ") != std::string::npos && numeric(record, "c") > 0 && numeric(record, "d") > 0)
    compile_tracks.insert(control);
  } else if (event == "integration.compile_metrics") {
   const std::uint64_t elapsed = scalar(record, "a");
@@ -1415,14 +1414,14 @@ auto BrowserAudit::readiness_blocker() const -> std::string_view {
   "annotation composition", workspace_fps_text && workspace_fps_pixels, "visible workspace FPS",
   settings_composition && settings_numeric_alignment && show_fps_round_trip && ui_scale_drag && ui_scale_released && ui_scale_restored && complete_pointer_drag && error_composition &&
    error_modal_usable,
-  "Settings composition", dataset_configured && progress && compile_metrics && compile_tracks.size() == 3U && dataset_complete && progress_ordinal < dataset_complete_ordinal, "Dataset lifecycle", explore_ready, "ready snapshot",
-  sweep, "viewport sweep", scrolled, "gallery scroll", detail, "detail selection", bounded_exact_grid, "bounded exact grid", newest_placeholder, "newest placeholder", pointer_inverse,
-  "pointer inverse", pointer_dispatched, "pointer dispatch", pointer_selected, "pointer selection", gallery_shader_fill, "gallery shader fill", pointer_render_chain, "pointer render chain",
-  atlas_identities, "atlas identities", augmentation_enabled, "augmentation enabled", augmentation_rerolled, "augmentation rerolled", reshuffle_order_only, "reshuffle order only", detail_source,
-  "detail source", detail_fit, "detail fit", detail_containers, "detail containers", padded_and_original_detail, "padded and original detail", upscale_growth, "upscale growth", upscale_presentation,
-  "upscale presentation", upscale_modes == expected_upscale_modes, "upscale modes", upscale_presentations == expected_upscale_presentations, "upscale presentations",
-  upscale_completed_pixels == expected_upscale_presentations, "upscale completed blue pixels", upscale_same_method == expected_upscale_presentations, "upscale exact re-click", upscale_later_frame,
-  "upscale later frame",
+  "Settings composition", dataset_configured && progress && compile_metrics && compile_tracks.size() == 3U && dataset_complete && progress_ordinal < dataset_complete_ordinal, "Dataset lifecycle",
+  explore_ready, "ready snapshot", sweep, "viewport sweep", scrolled, "gallery scroll", detail, "detail selection", bounded_exact_grid, "bounded exact grid", newest_placeholder, "newest placeholder",
+  pointer_inverse, "pointer inverse", pointer_dispatched, "pointer dispatch", pointer_selected, "pointer selection", gallery_shader_fill, "gallery shader fill", pointer_render_chain,
+  "pointer render chain", atlas_identities, "atlas identities", augmentation_enabled, "augmentation enabled", augmentation_rerolled, "augmentation rerolled", reshuffle_order_only,
+  "reshuffle order only", detail_source, "detail source", detail_fit, "detail fit", detail_containers, "detail containers", padded_and_original_detail, "padded and original detail", upscale_growth,
+  "upscale growth", upscale_presentation, "upscale presentation", upscale_modes == expected_upscale_modes, "upscale modes", upscale_presentations == expected_upscale_presentations,
+  "upscale presentations", upscale_completed_pixels == expected_upscale_presentations, "upscale completed blue pixels", upscale_same_method == expected_upscale_presentations, "upscale exact re-click",
+  upscale_later_frame, "upscale later frame",
   std::ranges::all_of(
    viewer_navigation_draws, [this](const auto draw) { return draw != 0U && surface_draws.contains(draw); }),
   "Previous/Next automatic upscale draws", reopened, "dataset reopen", repeated_same_revision, "same-revision redraw", annotation_ready && annotation_tool && annotation_pointer,
@@ -1544,8 +1543,9 @@ bool BrowserAudit::validation_confidence_complete() const {
   const auto& edit = validation_confidence_edits[index];
   const auto expected = index < 6U ? 0.437 : index == 7U ? 1.0 : 0.0;
   const auto current = scalar(edit, "c");
-  if (scalar(edit, "a") != index || std::abs(numeric(edit, "b") - expected) > 0.000001 || scalar(edit, "d") != generation ||
-      (index > 0U && index < 6U && current != revision) || (index >= 6U && current <= revision)) return false;
+  if (scalar(edit, "a") != index || std::abs(numeric(edit, "b") - expected) > 0.000001 || scalar(edit, "d") != generation || (index > 0U && index < 6U && current != revision) ||
+      (index >= 6U && current <= revision))
+   return false;
   revision = current;
  }
  const auto& first = validation_confidence_pixels.front();
@@ -1553,12 +1553,11 @@ bool BrowserAudit::validation_confidence_complete() const {
  for (std::size_t index = 0U; index < validation_confidence_pixels.size(); ++index) {
   const auto& pixels = validation_confidence_pixels[index];
   if (!pixels.value("matched", false) || pixels.value("control", "") != "validate.samples.atlas" || scalar(pixels, "stage") != index + 6U ||
-      numeric(pixels, "threshold") != (index == 1U ? 1.0 : 0.0) || scalar(pixels, "generation") != generation ||
-      scalar(pixels, "clean") != scalar(first, "clean") || scalar(pixels, "detections") != scalar(first, "detections") ||
-      numeric(pixels, "minimum") != numeric(first, "minimum") || numeric(pixels, "maximum") != numeric(first, "maximum") ||
-      !(numeric(pixels, "minimum") >= 0.0 && numeric(pixels, "maximum") < 1.0) ||
-      scalar(pixels, "revision") != scalar(validation_confidence_edits[index + 6U], "c") ||
-      (index == 1U ? scalar(pixels, "different") < 12U : scalar(pixels, "different") != 0U)) return false;
+      numeric(pixels, "threshold") != (index == 1U ? 1.0 : 0.0) || scalar(pixels, "generation") != generation || scalar(pixels, "clean") != scalar(first, "clean") ||
+      scalar(pixels, "detections") != scalar(first, "detections") || numeric(pixels, "minimum") != numeric(first, "minimum") || numeric(pixels, "maximum") != numeric(first, "maximum") ||
+      !(numeric(pixels, "minimum") >= 0.0 && numeric(pixels, "maximum") < 1.0) || scalar(pixels, "revision") != scalar(validation_confidence_edits[index + 6U], "c") ||
+      (index == 1U ? scalar(pixels, "different") < 12U : scalar(pixels, "different") != 0U))
+   return false;
  }
  return true;
 }
@@ -1573,8 +1572,9 @@ bool BrowserAudit::validation_layout_complete() const {
    return Bounds{b[0], b[1], b[2], b[3]};
   };
   const auto atlas = find("validate.samples.atlas"), gt = find("validate.gt.group"), det = find("validate.pred.group");
-  if (!atlas || !gt || !det || !atlas->valid() || !gt->valid() || !det->valid() || !atlas->contains_horizontally(*gt) || !atlas->contains_horizontally(*det) ||
-      gt->y < atlas->y + atlas->height || det->y < atlas->y + atlas->height) return false;
+  if (!atlas || !gt || !det || !atlas->valid() || !gt->valid() || !det->valid() || !atlas->contains_horizontally(*gt) || !atlas->contains_horizontally(*det) || gt->y < atlas->y + atlas->height ||
+      det->y < atlas->y + atlas->height)
+   return false;
   const bool stacked = std::abs(det->x - gt->x) < 1.0 && std::abs(det->y - gt->y - gt->height - 20.0) < 1.0;
   const bool horizontal = std::abs(det->y - gt->y) < 1.0 && std::abs(det->x - gt->x - gt->width - 20.0) < 1.0;
   if ((!stacked && !horizontal) || (std::string_view{stage} == "narrow" && !stacked)) return false;

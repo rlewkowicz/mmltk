@@ -234,14 +234,23 @@ pub fn artifact<Message: 'static>(
     let Some(progress) = state.map(|state| &state.progress) else {
         return presentation(Presentation::Hidden);
     };
-    let mut content = column![render(artifact_presentation(state), artifact_metrics(progress).into_iter().flatten())].spacing(4).width(Fill);
+    let mut content = column![render(
+        artifact_presentation(state),
+        artifact_metrics(progress).into_iter().flatten()
+    )]
+    .spacing(4)
+    .width(Fill);
     if progress.phase != crate::generated::DatasetCompilePhase::Idle {
         for (name, track) in [
             ("Acquisition", &progress.tracks.acquisition),
             ("Labels/masks", &progress.tracks.labels),
             ("Pixels", &progress.tracks.pixels),
         ] {
-            content = content.push(compile_track(name, track, state.is_some_and(|state| state.active)));
+            content = content.push(compile_track(
+                name,
+                track,
+                state.is_some_and(|state| state.active),
+            ));
         }
         for source in &progress.sources {
             let source_name = match source.source {
@@ -251,24 +260,54 @@ pub fn artifact<Message: 'static>(
                 crate::generated::BenchmarkDatasetSource::KCoconut => "COCONut",
                 crate::generated::BenchmarkDatasetSource::KObjects365V1 => "Objects365 v1",
             };
-            content = content.push(text(format!("{source_name}: {} · {} / {} bytes · {} / {} images · {} retries{}{}",
-                 source.activity, source.completedbytes,
-                if source.bytetotalknown { source.totalbytes.to_string() } else { "?".into() },
-                source.completedimages, source.totalimages, source.retrycount,
-                if source.resumed { " · resumed" } else { "" },
-                if source.cachehit { " · cached" } else { "" })).size(12));
+            content = content.push(
+                text(format!(
+                    "{source_name}: {} · {} / {} bytes · {} / {} images · {} retries{}{}",
+                    source.activity,
+                    source.completedbytes,
+                    if source.bytetotalknown {
+                        source.totalbytes.to_string()
+                    } else {
+                        "?".into()
+                    },
+                    source.completedimages,
+                    source.totalimages,
+                    source.retrycount,
+                    if source.resumed { " · resumed" } else { "" },
+                    if source.cachehit { " · cached" } else { "" }
+                ))
+                .size(12),
+            );
             if source.invalidatedimages != 0 {
-                content = content.push(text(format!("{} source images invalidated", source.invalidatedimages)).size(12));
+                content = content.push(
+                    text(format!(
+                        "{} source images invalidated",
+                        source.invalidatedimages
+                    ))
+                    .size(12),
+                );
             }
         }
     }
     content.into()
 }
 
-fn compile_track<Message: 'static>(name: &str, track: &crate::generated::DatasetCompileTrack, operation_active: bool) -> Element<'static, Message> {
+fn compile_track<Message: 'static>(
+    name: &str,
+    track: &crate::generated::DatasetCompileTrack,
+    operation_active: bool,
+) -> Element<'static, Message> {
     let status = if track.activity == crate::generated::DatasetCompileActivity::Unnecessary {
         "unnecessary"
-    } else if track.complete { "complete" } else if !operation_active { "incomplete" } else if track.active { "active" } else { "waiting" };
+    } else if track.complete {
+        "complete"
+    } else if !operation_active {
+        "incomplete"
+    } else if track.active {
+        "active"
+    } else {
+        "waiting"
+    };
     let activity = match track.activity {
         crate::generated::DatasetCompileActivity::Waiting => "Waiting",
         crate::generated::DatasetCompileActivity::Unnecessary => "No acquisition needed",
@@ -278,14 +317,27 @@ fn compile_track<Message: 'static>(name: &str, track: &crate::generated::Dataset
         crate::generated::DatasetCompileActivity::Compiling => "Compiling image pixels",
         crate::generated::DatasetCompileActivity::Complete => "Complete",
     };
-    let total = if track.totalknown { track.total.to_string() } else { "?".into() };
-    let mut content = column![text(format!("{name} · {status} · {} / {total}", track.completed)).size(12)].spacing(4).width(Fill);
-    if track.active && operation_active { content = content.push(text(activity).size(12)); }
+    let total = if track.totalknown {
+        track.total.to_string()
+    } else {
+        "?".into()
+    };
+    let mut content =
+        column![text(format!("{name} · {status} · {} / {total}", track.completed)).size(12)]
+            .spacing(4)
+            .width(Fill);
+    if track.active && operation_active {
+        content = content.push(text(activity).size(12));
+    }
     if track.totalknown && track.total != 0 {
-        content = content.push(progress_bar(0.0..=track.total as f32, track.completed.min(track.total) as f32));
+        content = content.push(progress_bar(
+            0.0..=track.total as f32,
+            track.completed.min(track.total) as f32,
+        ));
     }
     if track.invalidated != 0 {
-        content = content.push(text(format!("{} invalidated by repair", track.invalidated)).size(12));
+        content =
+            content.push(text(format!("{} invalidated by repair", track.invalidated)).size(12));
     }
     content.into()
 }

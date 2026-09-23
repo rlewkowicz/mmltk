@@ -204,9 +204,11 @@ ValidationSnapshot ValidationSystem::CloseDetail() {
  return snapshot();
 }
 void ValidationSystem::DisplaySettingsChanged() noexcept {
- try { impl_->samples_.SetDisplay(impl_->settings_.validation_display_settings()); }
- catch (const std::exception& error) { std::fprintf(stderr, "Validation display settings failed: %s\n", error.what()); }
- catch (...) { std::fputs("Validation display settings failed: unknown error\n", stderr); }
+ try {
+  impl_->samples_.SetDisplay(impl_->settings_.validation_display_settings());
+ } catch (const std::exception& error) { std::fprintf(stderr, "Validation display settings failed: %s\n", error.what()); } catch (...) {
+  std::fputs("Validation display settings failed: unknown error\n", stderr);
+ }
 }
 ValidationSnapshot ValidationSystem::SetOverlays(ValidationOverlays overlays) {
  impl_->samples_.SetOverlays(overlays);

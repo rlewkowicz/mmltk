@@ -849,7 +849,8 @@ struct SegmentTransfer {
   std::vector<std::thread> threads{};
   [[nodiscard]] bool cancelled() const noexcept { return stopping.load(std::memory_order_relaxed) || external.requested(); }
   void join() noexcept {
-   for (auto& thread : threads) if (thread.joinable()) thread.join();
+   for (auto& thread : threads)
+    if (thread.joinable()) thread.join();
   }
   ~SegmentThreads() {
    stopping.store(true, std::memory_order_relaxed);
@@ -985,7 +986,11 @@ struct SegmentTransfer {
 std::vector<DownloadResult> download_artifacts(const std::vector<DownloadRequest>& requests, const std::size_t maximum_concurrency,
  mmltk::common::concurrency::CancellationObservation cancel_requested, const DownloadProgressSink& observer, const BenchmarkTraceSink& trace, const DownloadReadySink& ready) {
  std::mutex progress_mutex;
- const DownloadProgressSink progress = observer ? DownloadProgressSink{[&](const DownloadProgress& value) { const std::lock_guard lock(progress_mutex); observer(value); }} : DownloadProgressSink{};
+ const DownloadProgressSink progress = observer ? DownloadProgressSink{[&](const DownloadProgress& value) {
+  const std::lock_guard lock(progress_mutex);
+  observer(value);
+ }}
+                                                : DownloadProgressSink{};
  if (requests.empty()) { return {}; }
  if (maximum_concurrency == 0U) { throw std::runtime_error("benchmark download concurrency must be positive"); }
  for (const DownloadRequest& request : requests) {
@@ -1112,13 +1117,17 @@ std::vector<DownloadResult> download_artifacts(const std::vector<DownloadRequest
  try {
   while (!pending.empty() || !active.empty() || settling != 0) {
    completed_settlements.clear();
-   { const std::lock_guard lock(settlement_mutex); completed_settlements.swap(settlements); }
+   {
+    const std::lock_guard lock(settlement_mutex);
+    completed_settlements.swap(settlements);
+   }
    for (auto& item : completed_settlements) {
     --settling;
     const auto index = static_cast<std::size_t>(&item.transfer->request - requests.data());
     if (item.error) {
-     try { std::rethrow_exception(item.error); }
-     catch (const DownloadVerificationError& error) { schedule_retry(*item.transfer, index, true, CURLE_OK, error.what()); }
+     try {
+      std::rethrow_exception(item.error);
+     } catch (const DownloadVerificationError& error) { schedule_retry(*item.transfer, index, true, CURLE_OK, error.what()); }
     } else {
      results[index] = std::move(*item.result);
      leases[index] = ArtifactLease{};
@@ -1163,14 +1172,20 @@ std::vector<DownloadResult> download_artifacts(const std::vector<DownloadRequest
      ++settling;
      const auto publish = [&, owned] {
       SettledTransfer item{owned, {}, {}};
-      try { item.result = publish_completed_transfer(*owned); }
-      catch (...) { item.error = std::current_exception(); }
-      { const std::lock_guard lock(settlement_mutex); settlements.push_back(std::move(item)); }
+      try {
+       item.result = publish_completed_transfer(*owned);
+      } catch (...) { item.error = std::current_exception(); }
+      {
+       const std::lock_guard lock(settlement_mutex);
+       settlements.push_back(std::move(item));
+      }
       settlement_ready.notify_one();
       (void)curl_multi_wakeup(wake_handle);
      };
-     if (publication) publication->enqueue_detached(publish);
-     else publish();
+     if (publication)
+      publication->enqueue_detached(publish);
+     else
+      publish();
      continue;
     }
     const std::string detail = completion->result == CURLE_OK && successful_status && !complete_range ? "resumed transfer did not reach the declared Content-Range total"

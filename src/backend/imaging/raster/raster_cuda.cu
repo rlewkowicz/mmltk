@@ -164,7 +164,8 @@ __device__ void apply_box_color<raster_math::RgbaPixelU8>(raster_math::RgbaPixel
  pixel.a = 255U;
 }
 template <typename PixelT>
-__device__ void apply_boxes_and_labels(int x, int y, const float* boxes, const uint8_t* colors, const int* labels, int num_instances, int box_thickness, PixelT& pixel, bool labels_enabled = true, const float* confidences = nullptr, float confidence_threshold = 0.0F) {
+__device__ void apply_boxes_and_labels(int x, int y, const float* boxes, const uint8_t* colors, const int* labels, int num_instances, int box_thickness, PixelT& pixel, bool labels_enabled = true,
+ const float* confidences = nullptr, float confidence_threshold = 0.0F) {
  if (box_thickness <= 0 && !labels_enabled) return;
  for (int i = num_instances; i-- > 0;) {
   if (confidences && !(confidences[i] >= confidence_threshold)) continue;

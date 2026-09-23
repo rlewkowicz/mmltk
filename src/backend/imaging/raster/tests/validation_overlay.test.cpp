@@ -58,9 +58,7 @@ TEST_CASE("validation adds completed layers once with unchanged alpha and ordina
  CHECK(draw(false) == std::array<std::uint8_t, 16>{10, 20, 30, 96, 10, 20, 30, 96, 0, 0, 0, 0, 10, 20, 30, 96});
  for (const float threshold : {0.0F, 0.4F, 0.437F, 1.0F, 0.0F}) {
   const auto output = draw(false, false, &threshold);
-  const auto expected = threshold <= 0.4F ? std::array<std::uint8_t, 4>{10, 20, 30, 96}
-                       : threshold <= 0.437F ? std::array<std::uint8_t, 4>{70, 80, 90, 96}
-                       : std::array<std::uint8_t, 4>{};
+  const auto expected = threshold <= 0.4F ? std::array<std::uint8_t, 4>{10, 20, 30, 96} : threshold <= 0.437F ? std::array<std::uint8_t, 4>{70, 80, 90, 96} : std::array<std::uint8_t, 4>{};
   CHECK(std::equal(expected.begin(), expected.end(), output.begin()));
  }
  input.count = 1;

@@ -69,7 +69,8 @@ struct CoconutRecipeCatalog {
 };
 struct CoconutRecipeInputs;
 [[nodiscard]] std::shared_ptr<CoconutRecipeInputs> acquire_coconut_recipe_inputs(const BenchmarkCacheLayout&, const CoconutRecipeCatalog&, ProgressReporter&, std::size_t,
- mmltk::common::concurrency::CancellationObservation, const BenchmarkTraceSink&, std::size_t download_connections = 0, std::span<const int> cpus = {}, std::function<void(std::exception_ptr)> failed = {});
+ mmltk::common::concurrency::CancellationObservation, const BenchmarkTraceSink&, std::size_t download_connections = 0, std::span<const int> cpus = {},
+ std::function<void(std::exception_ptr)> failed = {});
 struct CoconutRecipePreparation {
  std::shared_ptr<CoconutRecipeInputs> inputs;
  std::vector<CoconutComponent> components;

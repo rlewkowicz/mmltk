@@ -135,7 +135,6 @@ void read_batch(const arrow::RecordBatch& batch, const CoconutImportLimits& limi
   if (png.empty() || png.size() > limits.max_png_bytes || length < 0 || static_cast<std::uint64_t>(length) > limits.max_segments) malformed("record exceeds PNG/segment admission");
   read_image_record(*images, row, limits, row_ordinal, record);
   if (integer(*annotations, "image_id", row) != record.image_id) malformed("image_id join");
-
   const auto annotation_file = text(*annotations, "file_name", row);
   if (std::filesystem::path(record.file_name).stem() != std::filesystem::path(annotation_file).stem() || std::filesystem::path(annotation_file).extension() != ".png")
    malformed("mask/image filename join");
@@ -168,8 +167,8 @@ void read_batch(const arrow::RecordBatch& batch, const CoconutImportLimits& limi
  }
 }
 }  // namespace
-void read_coconut_parquet(
- std::span<const std::filesystem::path> shards, const CoconutImportLimits& limits, mmltk::common::concurrency::CancellationObservation cancellation, const CoconutRecordConsumer& consumer, bool metadata_only) {
+void read_coconut_parquet(std::span<const std::filesystem::path> shards, const CoconutImportLimits& limits, mmltk::common::concurrency::CancellationObservation cancellation,
+ const CoconutRecordConsumer& consumer, bool metadata_only) {
  std::uint64_t row_ordinal = 0, segment_ordinal = 0;
  for (const auto& path : shards) {
   throw_if_benchmark_cancelled(cancellation);

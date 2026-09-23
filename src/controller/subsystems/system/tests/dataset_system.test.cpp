@@ -386,8 +386,14 @@ TEST_CASE("dataset independently rejects each malformed progress invariant", "[c
  REQUIRE(settings.Load(install_settings(root.path())).applied());
  contracts::ArtifactProgress malformed{.phase = contracts::ArtifactCompilePhase::Downloading, .activity = "metadata", .completed = 1U, .total = 2U};
  SECTION("known total overrun") { malformed.completed = 3U; }
- SECTION("track known-zero overrun") { malformed.tracks.acquisition.total_known = true; malformed.tracks.acquisition.completed = 1; }
- SECTION("completed track remains active") { malformed.tracks.labels.active = true; malformed.tracks.labels.complete = true; }
+ SECTION("track known-zero overrun") {
+  malformed.tracks.acquisition.total_known = true;
+  malformed.tracks.acquisition.completed = 1;
+ }
+ SECTION("completed track remains active") {
+  malformed.tracks.labels.active = true;
+  malformed.tracks.labels.complete = true;
+ }
  SECTION("invalid track activity") { malformed.tracks.pixels.activity = static_cast<mmltk::backend::data::DatasetCompileActivity>(255); }
  SECTION("oversized source activity") { malformed.sources.push_back({.activity = std::string(contracts::kArtifactProgressTextCapacity + 1, 'x')}); }
  SECTION("invalid phase") { malformed.phase = static_cast<contracts::ArtifactCompilePhase>(255U); }

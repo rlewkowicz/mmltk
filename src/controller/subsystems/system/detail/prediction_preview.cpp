@@ -189,7 +189,9 @@ std::shared_ptr<const PredictionPreviewFrame> PredictionPreviewPool::Capture(con
   if (category >= 0 && static_cast<std::size_t>(category) < catalog->size() && catalog->names()[category].size() > mmltk::frameworks::reflection::kMaximumNameBytes)
    throw std::invalid_argument("prediction label exceeds the visual name capacity");
  }
- if (count && (annotations.count.value() != count || !annotations.confidences.address || annotations.confidences.capacity_bytes < count * sizeof(float) || (annotations.masks_available && !annotations.masks.address))) throw std::invalid_argument("prediction annotations disagree with produced values");
+ if (count && (annotations.count.value() != count || !annotations.confidences.address || annotations.confidences.capacity_bytes < count * sizeof(float) ||
+               (annotations.masks_available && !annotations.masks.address)))
+  throw std::invalid_argument("prediction annotations disagree with produced values");
  const auto pixel_count = rfdetr::checked_prediction_extent(extent.width, extent.height, rfdetr::kMaximumEncodedMaskPixels);
  const auto pixel_bytes = rfdetr::checked_prediction_extent(pixel_count, 3U * sizeof(float), rfdetr::kMaximumPredictionTensorBytes);
  const auto mask_bytes = annotations.masks_available && annotations.masks.address && count ? rfdetr::checked_prediction_extent(pixel_count, count, rfdetr::kMaximumPredictionTensorBytes) : 0U;

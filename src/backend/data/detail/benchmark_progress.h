@@ -105,7 +105,9 @@ public:
  void invalidate(std::size_t release, ProgressReporter& reporter);
 
 private:
- struct Observation { std::uint64_t completed = 0, total = 0; };
+ struct Observation {
+  std::uint64_t completed = 0, total = 0;
+ };
  std::vector<Observation> releases_;
  std::uint64_t completed_ = 0, total_ = 0;
  std::mutex mutex_;

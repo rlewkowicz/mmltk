@@ -102,7 +102,6 @@ pub(super) fn view<'a>(
                 .on_toggle_maybe(available.then_some(Message::DetailSourceSelected))
         )
         .id(super::DETAIL_ORIGINAL_ID),
-
     ]
     .spacing(7)
     .align_y(Center);

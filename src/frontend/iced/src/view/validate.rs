@@ -181,7 +181,8 @@ impl Component {
             .as_ref()
             .is_some_and(|(_, content)| content.metadata.detail)
         {
-            crate::view::image_viewer::control_footprint(self.samples.controls(model)).map(Message::Samples)
+            crate::view::image_viewer::control_footprint(self.samples.controls(model))
+                .map(Message::Samples)
         } else {
             self.samples.controls(model).map(Message::Samples)
         };
@@ -299,11 +300,12 @@ impl Component {
                 })?,
                 // CLEANUP-IGNORE: Validate closes its local settings outcome before workspace routing.
             ),
-            Message::DisplayConfidenceChanged(value) => Outcome::SettingsEdited(
-                settings.edit(crate::view::settings::EditCadence::Debounced, |draft| {
+            Message::DisplayConfidenceChanged(value) => Outcome::SettingsEdited(settings.edit(
+                crate::view::settings::EditCadence::Debounced,
+                |draft| {
                     crate::generated::edit_workflowsvalidatedisplayconfidencethreshold(draft, value)
-                })?,
-            ),
+                },
+            )?),
             Message::Samples(message) => {
                 let Some(message) = self.samples.update(message) else {
                     return Ok(None);
@@ -327,12 +329,30 @@ mod tests {
         let mut component = Component::default();
         let mut previous = None;
         for value in [0.0, 1.0, 0.437] {
-            let Some(Outcome::SettingsEdited(crate::view::settings::EditSchedule::Debounce(generation))) =
-                component.update(&mut settings, Message::DisplayConfidenceChanged(value)).unwrap() else { panic!("shared debounce"); };
-            if let Some(stale) = previous { assert!(!settings.debounce_elapsed(stale)); }
+            let Some(Outcome::SettingsEdited(crate::view::settings::EditSchedule::Debounce(
+                generation,
+            ))) = component
+                .update(&mut settings, Message::DisplayConfidenceChanged(value))
+                .unwrap()
+            else {
+                panic!("shared debounce");
+            };
+            if let Some(stale) = previous {
+                assert!(!settings.debounce_elapsed(stale));
+            }
             assert!(settings.debounce_elapsed(generation));
             previous = Some(generation);
-            assert_eq!(settings.draft.as_ref().unwrap().workflows.validate.display.confidencethreshold, value);
+            assert_eq!(
+                settings
+                    .draft
+                    .as_ref()
+                    .unwrap()
+                    .workflows
+                    .validate
+                    .display
+                    .confidencethreshold,
+                value
+            );
         }
         assert_eq!(settings.take_request().unwrap().updates.len(), 1);
     }

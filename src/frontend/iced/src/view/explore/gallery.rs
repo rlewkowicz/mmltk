@@ -186,7 +186,9 @@ pub(super) fn view<'a>(
     input: crate::workspace_input::Binding,
 ) -> Element<'a, Message> {
     let snapshot = model.explore.snapshot.as_ref();
-    let presentation_title = model.explore.gallery_title(paired.is_some(), model.gallery_presentation());
+    let presentation_title = model
+        .explore
+        .gallery_title(paired.is_some(), model.gallery_presentation());
     let columns = explore_columns(settings);
     let settings_available = settings.draft.is_some() && model.settings_edit_available();
     let mutation_available = !settings.has_local_edits() && model.explore_mutation_available();
