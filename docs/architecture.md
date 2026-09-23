@@ -330,8 +330,13 @@ width, scrolling, and ordinary column composition, including Annotate.
 [navigation.rs](../src/frontend/iced/src/view/navigation.rs) owns visual order.
 [workflow/fields.rs](../src/frontend/iced/src/view/workflow/fields.rs) supplies
 typed numeric widgets; Explore's local controls retain their domain-specific
-filter editing. The [interaction guide](gui-interaction.md#workflow-layout-and-navigation)
-owns the layout and input policies.
+filter editing. [view/shared/transition.rs](../src/frontend/iced/src/view/shared/transition.rs)
+owns retained form expansion, clipping, and input visibility; Dataset, model
+cards, Export, and diagnostics use that same widget. Dataset's
+[progress component](../src/frontend/iced/src/view/train/dataset/progress.rs)
+formats native facts and reserves active presentation height. The
+[interaction guide](gui-interaction.md#shared-form-expansion-and-dividers)
+owns these presentation policies alongside page layout and input behavior.
 
 Train's [metrics component](../src/frontend/iced/src/view/metrics.rs) owns chart
 selection and expansion. Its [catalog](../src/frontend/iced/src/view/metrics/catalog.rs)

@@ -97,6 +97,10 @@ Coconut also reveals **Recover dropped masks from original annotations**, off
 by default. Its [recovery policy](benchmark-datasets.md#optional-dropped-mask-recovery)
 uses eligible original COCO masks without changing validation membership.
 Recompile existing datasets to apply a changed recovery setting.
+The recovery checkbox and validation choices form one group indented 16 logical
+pixels beneath Coconut. Recovery text and the validation descriptions use
+text at 12 logical pixels; each description sits beneath its radio, aligned
+with its label.
 
 The recipe, validation choice, and recovery setting persist. Returning to Coco
 custom or disabling the override hides the dependent controls without clearing
@@ -109,11 +113,59 @@ Changing these controls never starts work.
 and native admission. The accepted native request captures those settings for
 the entire operation. While compilation is active, the two recipe radios,
 three validation radios, and recovery checkbox are disabled; the other Dataset
-controls keep their existing enablement rules. The action becomes **Cancel compilation**, using
-the Dataset system's Stop operation. Progress shows separate **Acquisition**,
-**Labels/masks**, and **Pixels** tracks plus benchmark source details, using native
-[acquisition and output facts](benchmark-datasets.md#reading-compilation-progress),
-and completion, cancellation, or failure comes from the native terminal result.
+controls keep their existing enablement rules. The action becomes **Cancel
+compilation**, using the Dataset system's Stop operation. Progress shows the
+current work, separate **Acquisition**, **Labels/masks**, and **Pixels** tracks,
+and benchmark source details. The [progress reference](benchmark-datasets.md#reading-compilation-progress)
+defines their units, readable quantities, and source summaries.
+
+The progress area grows when needed and retains its greatest measured height
+for the active native generation at the current width. Shorter updates therefore
+leave the action in place. A changed width remeasures the content, and a new
+generation starts a fresh reservation. Once native Stop reports cancellation
+requested, both the action and progress say **Cancelling…**; live work, tracks,
+and source rows disappear immediately, while the reserved space remains until
+the native system becomes inactive. Duplicate cancellation is disabled.
+
+Only the native terminal result settles the operation. **Completed**,
+**Cancelled**, **Failed**, or **Compilation refused** replaces live progress,
+with the supplied detail and artifact path when present. Releasing the active
+reservation animates the area to that result's natural height. Retained late
+progress cannot revive settled bars or turn a cancellation into success.
+
+## Shared form expansion and dividers
+
+The shared [height transition](../src/frontend/iced/src/view/shared/transition.rs)
+keeps conditional form bodies mounted with stable widget identities. It reveals
+their natural layout through a clip fixed at the top over 200 ms with ease-in/out
+motion; text and controls retain their normal scale. Reversal starts at the
+currently displayed height. The first layout and width changes measure directly;
+ordinary updates do not restart unchanged motion. Nested sections follow their
+children's reflow without applying the same animation twice.
+
+Dataset uses it for benchmark choices, Coconut options, manual split paths,
+Compile size, and progress reflow. The [model card](../src/frontend/iced/src/view/workflow/model_card.rs)
+uses it for custom-artifact controls and replacement content; [Export](../src/frontend/iced/src/view/export.rs)
+uses it for conditional TensorRT/ONNX output and Advanced fields. The
+[diagnostics card](../src/frontend/iced/src/view/diagnostics.rs) uses the same
+transition while retaining its Show/Hide trigger at the card's bottom edge.
+
+Drawing and pointer input share the revealed clip and the enclosing scroller's
+viewport. Closing content stops accepting input immediately, retires held
+gestures without activating controls, and releases focus from hidden or partly
+clipped controls. Focus traversal and widget operations expose only eligible
+controls; popups require a fully revealed body. Scrolling a pressed control
+offscreen still delivers its release for local cleanup. Only visible motion
+requests further redraws; settled or hidden sections remain quiet.
+
+The [shared section divider](../src/frontend/iced/src/view/shared.rs) draws a
+centered line one logical pixel thick across 75% of the available width, using
+the current theme's card outline color. It owns two logical pixels of empty space
+above and below, for a total height of five. Dataset places one after the entire
+**Compile Benchmark Dataset Override** section, including its revealed choices,
+and before **Dataset source**. The other sits immediately after **Overwrite**
+and before **Compile dimensions**. Neither boundary adds outer spacing to the
+divider's gaps.
 
 ## Shared primary actions
 

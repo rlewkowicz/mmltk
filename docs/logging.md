@@ -327,8 +327,7 @@ record UI interaction and pixels separately from physical resource custody:
 
 | Records | Evidence |
 | --- | --- |
-| `integration.benchmark_baseline`, `integration.benchmark_click`, `integration.benchmark_choice`, `integration.benchmark_visibility`, `integration.benchmark_inactive` | Baseline native settings, real radio clicks, settled choices/restoration, current-tree presence/absence, and disabled source-control behavior |
-| `integration.compile_track_text` | Measured Acquisition, Labels/masks, and Pixels text, including Directory's unnecessary `0 / 0` acquisition |
+| Dataset selection, draw, caption, pixel, and cancellation records | [Dataset presentation evidence](#dataset-presentation-evidence) below |
 | `integration.atlas_resize_measured`, `integration.atlas_resize` | Gallery measurements retained beneath Detail, then required/actual rows after each completed resized return |
 | `integration.atlas_ready_cell`, `integration.atlas_canvas_sample` | Exact drawn gallery identity, compiled image, selected canvas coordinates, patch counts, and sampled color |
 | `integration.explore_integer`, `integration.explore_integer_paste_baseline`, `integration.explore_integer_paste`, `integration.explore_integer_paste_restored` | Exact decimal integer values, native revision progression, typing/paste persistence, and restoration |
@@ -435,6 +434,60 @@ Clipboard acceptance and its opt-in permission gate are documented in
 [validation](validation.md#synthetic-clipboard-input). Enabled harness captures
 include Mozilla `Clipboard` and `WidgetClipboard` module logs alongside the
 existing graphics modules.
+
+### Dataset presentation evidence
+
+The opt-in [Dataset observer](../src/frontend/iced/src/integration_control/dataset_presentation.rs)
+captures the ordinary component at actual draws. The
+[validation guide](validation.md#dataset-presentation-and-lifecycle) owns its
+fixture matrix, real input, and native cancellation/restart requirements.
+
+| Records | Evidence |
+| --- | --- |
+| `integration.benchmark_baseline`, `.benchmark_click`, `.benchmark_choice`, `.benchmark_visibility`, `.benchmark_inactive` | Native settings baseline, real clicks, settled choices/restoration, current-tree presence/absence, and disabled source-control behavior |
+| `integration.dataset_draw`, `.dataset_viewport`, `.dataset_frame` | Row text/bounds and absolute page viewport from one draw; the final frame record carries observation key, horizontal/vertical scroll offsets, and theme |
+| `integration.dataset_paint`, `.dataset_label`, `.dataset_clip`, `.dataset_font`, `.dataset_label_reference` | Actual control/label bounds and clip, available resolved paragraph metrics, and recovery-label shaping using the description's small-text metrics |
+| `integration.dataset_native_work`, `.dataset_native_track` | Native generation and exact current-work/track facts captured with the draw; `detail` contains JSON with decimal integer values |
+| `integration.compile_progress`, `.compile_metrics`, `.compile_cancelled`, `.dataset_complete` | Real native activity, metrics, inactive cancellation, and the later successful generation |
+| `integration.dataset_fixture`, `.dataset_pixels`, `.dataset_label_pixels`, `.dataset_divider_pixels` | Settled local fixture receipt, canvas contrast, visible label samples, and measured divider color/span/stroke/gaps |
+| `integration.dataset_reversal`, `.dataset_hidden_input`, `.dataset_drag_edit`, `.dataset_offscreen_release` | Actual interrupted motion, rejected outgoing input, settled drag-selection editing, and unchanged native value after offscreen release |
+| `integration.dataset_custody` | Probe admission/stimulus/outcome and retired-callback drain, with request scope, owner, geometry, snapshot/read/report counts, and replacement-owner isolation |
+
+In this table a leading dot continues the `integration` prefix. The draw,
+viewport, paint, label, and clip records put `x`, `y`, `width`, and `height` in
+string-valued `a`, `b`, `c`, and `d`. Font records use `a`/`b` for size/line height;
+label-reference records use `a`/`b` for measured width/height and `c`/`d` for those
+small-text metrics. Observation keys and probe scopes belong only to acceptance
+diagnostics. They never become native operation generations, settings revisions,
+or resource-lifetime state.
+
+The frame record closes the preceding row, paint, viewport, and native-fact
+observations. The audit compares complete work/track captions with the native
+facts for both real compile generations. A local fixture's completion receipt
+must join its fully exposed expected caption draw. Intermediate clipped text
+can demonstrate motion but cannot establish caption correctness. Canvas contrast
+establishes visible drawing; it is not OCR and does not replace exact text or
+shaped-label geometry. Divider probes compare the observed card-outline color,
+centered span, stroke coverage, and empty gaps at the actual scale.
+
+The JavaScript probe copies bounds, divider rectangles, colors, and label
+rectangles borrowed from Wasm into owned arrays before deferring work. Before
+taking a canvas snapshot it checks the reporting owner, current request, and canvas
+geometry. Invalidated callbacks leave the replacement owner's canvas scratch
+and pixel-report count unchanged. Supersession, geometry restoration, and owner
+replacement retain an explicit drain before that observation settles. Disabled
+reporting creates no Dataset fixture/paint/probe collection.
+
+Select the retained or DPI archive using [capture selection](#select-captures-and-histories),
+then replace `ARCHIVE_ID` with that run's identity:
+
+```bash
+./mmltk --logs --family latest-wayland-test --run ARCHIVE_ID \
+  -q '@event:integration.dataset_ OR @event:integration.compile_' \
+  --fields @event,control,detail,a,b,c,d --format jsonl --limit 80
+./mmltk --logs --family latest-wayland-test --run ARCHIVE_ID \
+  -q '@event=integration.dataset_custody' --format jsonl --limit 40
+```
 
 ## Start with a bounded investigation
 

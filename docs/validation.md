@@ -338,9 +338,9 @@ standalone evidence-audit cases.
 
 | Hardware entrypoint | Process lifetimes and required behavior |
 | --- | --- |
-| `workspace_wayland_retained` | One H2D browser: square/capacity growth, full controls including integer typing/paste, cached and held-miss gallery/detail returns, Detail-open resizing in both orientations, augmentation retention, fractional rows, circular wrap, partial final row, wide/tall layouts, local labels/native semantics, light/dark copy with shared Annotate layout and long lists, FPS, rapid changes, then SIGINT |
+| `workspace_wayland_retained` | One H2D browser: Dataset presentation/disclosure/input and real cancel/restart, square/capacity growth, full controls including integer typing/paste, cached and held-miss gallery/detail returns, Detail-open resizing in both orientations, augmentation retention, fractional rows, circular wrap, partial final row, wide/tall layouts, local labels/native semantics, light/dark copy with shared Annotate layout and long lists, FPS, rapid changes, then SIGINT |
 | `workspace_wayland_workflows` | One H2D browser: actual Train start, live progress pixels and hidden-tab progress, chart data/selection/aspects and retained camera/legend interaction, validation metrics and six sample/detail previews, confidence editing/filtering and responsive groups, direct Validate-to-Explore pixels, compiled/image/video prediction, Pause/Resume/EOF/Stop, light/dark and minimum-width chart pixels, then SIGINT |
-| `workspace_wayland_dpi` | One H2D browser at DPI 1.5: light/dark copy and rapid changes |
+| `workspace_wayland_dpi` | One H2D browser at DPI 1.5: Dataset presentation fixtures, light/dark copy, and rapid changes |
 | `workspace_wayland_terminal` | Two H2D browsers: a real window close and abrupt browser-peer loss after an Annotation edit, exact completed draw, and independent redraw |
 | `workspace_wayland_probe_recovery` | Four H2D browsers with startup-latched allocation, reset, begin, or end probe failure; exact-content recovery and complete final pixel/semantic evidence |
 | `workspace_wayland_quiet` | Two H2D browsers: blocked reads and a completed gesture with diagnostics/reporting/probes inactive |
@@ -368,16 +368,10 @@ fixture uses the ordinary Stretch default. Padding observations therefore
 remain evidence for the selected geometry rather than assumptions about every
 compiled dataset.
 
-The initial Dataset interaction also clicks both benchmark recipe radios and
-all three Coconut validation radios. It waits for native settings settlement,
-checks the current widget tree for expected presence and absence, verifies that
-the disabled source Browse control is inert, and restores the baseline settings.
-The ordinary Directory compile handoff then uses the existing local fixture.
-Its measured widget tree must include all three independent compile tracks,
-with Acquisition shown as unnecessary at `0 / 0`.
-This exercises the packaged selection controls without acquiring a live
-benchmark release. Browser audit cases reject missing clicks, stale visibility,
-incomplete choice coverage, and unconfirmed restoration.
+The initial [Dataset scenario](#dataset-presentation-and-lifecycle) combines
+real control input, bounded presentation fixtures, and native Directory
+compilation. Benchmark release acquisition remains owned by the independent
+[native fixture cases](#benchmark-compilation-evidence).
 
 The native harness is split by evidence responsibility under
 [tests/wayland](../src/acceptance/tests/wayland):
@@ -396,8 +390,9 @@ The native harness is split by evidence responsibility under
 exercise those evidence owners in the same executable. The Rust
 [integration driver](../src/frontend/iced/src/integration_control.rs) retains
 separate `lifecycle`, `retained`, `annotation_product`, and `workflows`
-scenario modules, with shared widget, pixel, and probe helpers. Its private
-reporting owner remains effect-only.
+scenario modules. `dataset_presentation` observes Dataset drawing and owns
+bounded presentation fixtures alongside the shared widget, pixel, and probe
+helpers. Its private reporting owner remains effect-only.
 
 The JSONL cursor reads one captured file extent in 16 KiB chunks, appending
 newline-delimited segments into a retained buffer capped at 64 KiB per line.
@@ -418,6 +413,9 @@ progress bar, all six thumbnails, detail, each prediction source, retained Stop
 output, and theme/narrow layouts. Progress evidence pairs the bar capture with
 observed native image counts during the Train phase; hidden-tab evidence then
 requires metric sequence advancement.
+Validation waits for all six samples to be available with identities from the
+completed evaluation generation before advancing to their canvas checks.
+Native metric completion can precede the asynchronous sample renderer.
 
 The same browser first opens Explore, runs Validate, and returns directly to
 Explore through normal navigation. It requires a current paired gallery draw
@@ -530,6 +528,59 @@ shutdown, and virtual-output limits. The [logging guide](logging.md#delivery-and
 owns diagnostic delivery and artifact-family layout. Query one captured run
 at a time.
 
+### Dataset presentation and lifecycle
+
+The [lifecycle driver](../src/frontend/iced/src/integration_control/lifecycle.rs)
+clicks both benchmark recipes and all three Coconut validation choices through
+ordinary browser input. It requires native settings settlement, expected
+current-tree visibility, an inert disabled source Browse control, and restoration.
+Actual draws additionally establish Coconut indentation, aligned descriptions,
+small recovery typography, the revealed
+clip, and label pixels at ordinary and narrow widths. The narrow input case
+uses a 480-pixel canvas with the normal horizontal page scroll.
+
+The same driver checks opening, closing, and interrupted reversal of nested
+choices, plus the manual split paths and Compile size disclosures. Diagnostics
+expansion supplies a non-Dataset consumer of the
+[shared transition](gui-interaction.md#shared-form-expansion-and-dividers).
+It observes stable absolute viewport/scroll geometry across disclosure changes,
+rejects clicks into outgoing controls, edits a split path through drag selection
+under simultaneous vertical/horizontal offsets, and releases a held checkbox
+after scrolling it offscreen without changing its native value. Baseline
+settings and the actual restored canvas layout must settle before navigation.
+
+[dataset_presentation.rs](../src/frontend/iced/src/integration_control/dataset_presentation.rs)
+renders the production progress component in 36 bounded cases: nine successive
+states at widths 224 and 360 in both themes. They cover unknown totals, grouped
+work counts, cached/resumed sources, shorter updates during reserved active
+height, completed tracks during Syncing/Publishing, cancellation requested,
+Cancelled, Failed, Completed, and late progress after settlement. These local
+values never enter the application model or count as native compile work.
+Canvas observations check the progress area and both shared dividers. Fixture
+completion must join a settled draw containing the complete expected captions;
+intermediate clipped frames establish reflow without replacing that proof.
+The DPI scenario repeats these presentation fixtures at scale 1.5.
+
+The retained scenario separately starts the real local Directory compilation,
+observes its active work and all three tracks, and clicks Cancel. It waits until
+native compilation is inactive and reports Cancelled, with a settled result
+without live rows, then starts a new generation and requires success. The
+independent browser audit reconstructs exact work and track captions from each
+generation's native facts. Both the cancelled generation and the successful
+restart must supply fully exposed
+matching captions. A fast successful compile cannot substitute for cancellation
+or active-progress evidence. Directory's acquisition caption follows the
+[progress formatting policy](benchmark-datasets.md#reading-compilation-progress).
+
+The opt-in asynchronous canvas probe also exercises reuse of borrowed inputs,
+superseding a request with the same fixture key, changing/restoring canvas
+geometry, and reporting owner replacement. Retired callbacks must leave the
+replacement owner's canvas scratch and evidence unchanged. The
+[record reference](logging.md#dataset-presentation-evidence)
+defines the separate draw, caption, pixel, and probe-custody observations.
+These packaged cases acquire no live benchmark release and make no production
+download-throughput or full-release-capacity claim.
+
 ### Synthetic clipboard input
 
 The packaged harness sets `MMLTK_RUN_WORKSPACE_WAYLAND_INTEGRATION=1`.
@@ -636,11 +687,11 @@ behavior independently of rendered UI acceptance:
 | --- | --- |
 | [benchmark_dataset.test.cpp](../src/backend/data/tests/benchmark_dataset.test.cpp), `mmltk_backend_data_tests` | Cache-root precedence and staging/publication overlap, completed-group and individual-JPEG reuse, typed artifact/image readiness, pixels during held labels/acquisition, single-worker execution, source-lease retirement, startup/failure unwinding, independent progress and retry withdrawal, durable segmented resume, unknown-total downloads, lazy diagnostics, and typed storage failure |
 | [coconut_dataset.test.cpp](../src/backend/data/tests/coconut_dataset.test.cpp), same target | Pinned recipe selection, all validation choices, exact masks and physical/release joins, empty images, canonical paths/inventory bytes, cross-recipe reuse, immutable cold/partial/warm admissions, ready metadata during held masks/leases, aggregate indexing through repair, stock cache reuse, and unchanged prior publication on failure/cancellation |
-| [application_compute_services.test.cpp](../src/controller/subsystems/system/tests/application_compute_services.test.cpp), `mmltk_controller_data_compute_systems_tests` | Environment cache selection and staged/final output overlap through the artifact service, retained choices through materialization, and real HTTP progress projected into bounded artifact activity at an unchanged image fraction |
-| [dataset_system.test.cpp](../src/controller/subsystems/system/tests/dataset_system.test.cpp), same target | Explicit compile captures settled choices, later settings edits preserve the admitted request, owned diagnostics survive runtime reconstruction and stop/join, open-ended/recovered progress remains valid, and malformed progress is rejected |
+| [application_compute_services.test.cpp](../src/controller/subsystems/system/tests/application_compute_services.test.cpp), `mmltk_controller_data_compute_systems_tests` | Environment cache selection and staged/final output overlap through the artifact service, retained choices through materialization, and real resumed/restarted/unknown-total HTTP observations projected as typed transfer facts separately from bounded activity at an unchanged image fraction |
+| [dataset_system.test.cpp](../src/controller/subsystems/system/tests/dataset_system.test.cpp), same target | Explicit compile captures settled choices, later settings edits preserve the admitted request, owned diagnostics survive runtime reconstruction and stop/join, open-ended/recovered progress remains valid, and malformed progress including transfer/retained-byte bounds is rejected |
 | [dataset_wiring.test.cpp](../src/controller/shell/tests/dataset_wiring.test.cpp), `mmltk_controller_shell_tests` | Production shell/factory propagation of enabled and disabled diagnostics through the staged compiler path |
 | [settings.test.cpp](../src/controller/services/tests/settings.test.cpp), `mmltk_controller_services_tests` | Native defaults, missing/invalid setting repair, default-off recovery for settings missing that field, and recipe/hidden validation/recovery persistence |
-| [Dataset component](../src/frontend/iced/src/view/train/dataset.rs) and [integration reporting](../src/frontend/iced/src/integration_control/reporting.rs), `browser-app` | Generated selection edits, visibility, disabling the recipe/validation radios and recovery checkbox during compilation, and no passive visibility tasks or payload collection when reporting is disabled |
+| [Dataset component](../src/frontend/iced/src/view/train/dataset.rs), [progress cases](../src/frontend/iced/src/view/train/dataset/progress/tests.rs), and [integration reporting](../src/frontend/iced/src/integration_control/reporting.rs), `browser-app` | Generated selection edits, visibility/active-control policy, exact grouped/IEC quantities, independent transfer/track semantics, native terminal visibility, measured height reservation, and disabled-reporting quietness |
 
 The existing [COCONut cases](../src/backend/data/tests/coconut_dataset.test.cpp)
 also cover conservative dropped-mask matching, independent source IDs, surviving
@@ -668,6 +719,17 @@ they do not measure production-release throughput or live-download duration.
 Progress cases retain one artifact/release contribution across interleaving,
 repair, and preparation replacement, with explicit withdrawals instead of
 counting repeated attempts as completed work.
+They also preserve the latest artifact transfer independently of source totals,
+clear it on changed activity/completion, and retain the CLI's detailed status.
+
+The standalone `browser-app` route additionally owns
+[shared transition cases](../src/frontend/iced/src/view/shared/transition/tests.rs)
+for reversal, intrinsic reflow, retained widget identity, redraw quietness,
+focus/overlay clipping, mouse/touch cancellation, and composed-scroller input.
+Its integration-driver and JavaScript cases cover asynchronous array ownership,
+request retirement, and replacement-owner isolation. The full build compiles
+the selected Rust test targets; execution of these standalone Rust/JavaScript
+cases is separate from the fixed Final Validation gate.
 
 For standalone focused selection outside the Final Validation gate:
 
@@ -677,8 +739,9 @@ For standalone focused selection outside the Final Validation gate:
 ./mmltk --test application-systems --executable mmltk_controller_shell_tests -- '[dataset]'
 ```
 
-The [packaged Dataset scenario](#packaged-wayland-acceptance) separately proves
-real clicks, native settlement, restoration, and Directory handoff.
+The [packaged Dataset scenario](#dataset-presentation-and-lifecycle) separately
+proves rendered presentation, real input, cancellation/restart, and native
+caption agreement.
 [Benchmark capacity and live-download limits](benchmark-datasets.md#cache-formats-and-capacity)
 define what these bounded fixtures do not establish. Runtime trace encoder
 and serialization suites additionally cover benchmark timestamps, effect-only

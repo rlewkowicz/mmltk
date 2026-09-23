@@ -25,7 +25,8 @@
   and vendor ownership.
 - [GUI interaction and presentation](gui-interaction.md): application wire
   formats, workflow layout and navigation, Dataset recipe/validation/recovery
-  controls, the retained training dashboard, fixed Validation metrics/atlas,
+  controls and cancellation, shared form expansion/dividers, the retained
+  training dashboard, fixed Validation metrics/atlas,
   responsive overlay groups, the shared image viewer and primary actions,
   retained integer/decimal editing, prepared captions and texture bindings,
   shared immediate mouse input, native command settlement, Annotation mask work
@@ -46,7 +47,8 @@
   optional original-annotation mask recovery, derived cache identity and current
   counts, append-only rejection history, shared persistent cache/repair, stock
   annotation reuse, overlapping acquisition/labels/pixels, independent progress,
-  partial downloads, and format/capacity limits.
+  typed transfer versus source totals, readable quantities, partial downloads,
+  and format/capacity limits.
 - [GPU execution and image loading](gpu-execution.md): device/NUMA placement,
   H2D and GDRCopy, RGB8 preview storage, reusable checkpoint/export readbacks,
   Vulkan allocation and CUDA import, independent display/compute selection,
@@ -58,14 +60,15 @@
 - [Validation](validation.md): the fixed final test/acceptance gate,
   native/Rust formatting, cleanup, domain test ownership and selection,
   standalone CUDA/Vulkan and native-link diagnostics, retained browser workflow
-  acceptance, confidence/layout/input and direct Validate-to-Explore pixel
-  evidence, and debugging.
+  acceptance, Dataset presentation/cancel/restart, confidence/layout/input and
+  direct Validate-to-Explore pixel evidence, and debugging.
 - [Headless Wayland](headless-wayland.md): the private NVIDIA Weston session,
   input seat, readiness, deadlines, shutdown, and artifacts.
 - [Logging](logging.md): fatal stderr reports, explicit diagnostic activation,
   benchmark cache/archive/transfer and release traces, pixel probes, artifact
-  ownership, rendered UI and caption evidence, archived-run selection,
-  nested-field queries, Vulkan/FD provenance, correlation, and triage.
+  ownership, rendered UI and caption evidence, Dataset draw and probe records,
+  archived-run selection, nested-field queries, Vulkan/FD provenance,
+  correlation, and triage.
 - [Planned work](roadmap.md): future directions rather than current capability.
 
 `CONTRACT.md` owns high-level architecture and component handoffs. This wiki

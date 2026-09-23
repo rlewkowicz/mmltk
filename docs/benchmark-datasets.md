@@ -352,7 +352,7 @@ product facts.
 three independent tracks shared by benchmark and Directory compilation. Each
 has completed work, a known/unknown total, activity, active/completed state, and
 explicit invalidated work. The native declaration also supplies generated Rust;
-the GUI and CLI display the same facts.
+the GUI and CLI format the same typed facts for their respective displays.
 
 | Track | Benchmark units and completion |
 | --- | --- |
@@ -362,11 +362,11 @@ the GUI and CLI display the same facts.
 
 Label totals can grow when final plans become known; they are work units, not
 image counts or a time estimate. COCONut metadata-only preparation does not
-count full-import rows a second time. Directory compilation shows Acquisition
-as **unnecessary**, with a known `0 / 0`; its labels and pixels each count
-completed images. A completed acquisition track can coexist with active labels
-and pixels. All three completing still leaves validation, sync, and atomic
-publication to settle before the operation succeeds.
+count full-import rows a second time. Directory compilation marks Acquisition
+as unnecessary, with known zero completed and total work; its labels and pixels
+each count completed images. A completed acquisition track can coexist with
+active labels and pixels. All three completing still leaves validation, sync,
+and atomic publication to settle before the operation succeeds.
 
 [ProgressReporter](../src/backend/data/benchmark_progress.cpp) owns benchmark
 observations and compile-scoped artifact/indexing ledgers. An observed artifact
@@ -379,8 +379,16 @@ Per-source rows retain actual bytes, resolved/selected images, retry counts,
 cache reuse, resume, and invalidated-image facts. Resolved images include
 permitted quarantine outcomes; successful cache-write observations follow
 physical write settlement. Projected output bytes are a storage-admission
-bound, not bytes already written. After failure or cancellation, unfinished GUI
-tracks remain **incomplete** rather than showing successful completion.
+bound, not bytes already written.
+
+The canonical `BenchmarkTransferProgress` separately describes the latest
+observed artifact transfer: completed and total bytes, retained bytes, attempt,
+cache reuse, and resume state. It is optional within `BenchmarkSourceProgress`;
+the source counters continue to aggregate artifact contributions. A zero transfer
+total means unknown. Retained bytes cannot exceed completed bytes, and completed
+bytes cannot exceed a known total. A changed source activity or source completion
+clears the latest transfer. Concurrent sources can advance independently; the
+latest transfer does not enumerate every in-flight artifact.
 
 Fresh, resumed, retried, and re-downloaded transfers report bytes actually
 written. A resumed transfer distinguishes retained bytes from its new work.
@@ -392,6 +400,35 @@ replace an artifact or release contribution rather than adding retries twice.
 Repair withdraws affected completed work and records the invalidation; unrelated
 completed work stays counted. Unknown totals remain open-ended until the
 downloader establishes an exact size.
+
+The [Dataset progress component](../src/frontend/iced/src/view/train/dataset/progress.rs)
+formats byte quantities as KiB, MiB, GiB, or TiB, including byte throughput and
+projected storage. Values at least one KiB use one decimal place; smaller nonzero
+values use three so that one byte remains visible. Zero is `0 KiB`.
+Counts use comma grouping without converting the integer text through floating
+point. Completed quantities whose total matches appear once; unknown totals
+remain `?`. Directory acquisition consequently reads **No acquisition needed ·
+0 KiB** and has no determinate bar.
+
+Source headings distinguish **Cached**, **Complete**, **Active**, and **Waiting**.
+For example, a completed cached source can read **Objects365 v2 · Cached** above
+**85.0 GiB · 345,491 images**. Active sources retain their activity and current
+transfer, with attempt, retained-byte, retry, resume, and repair details when
+present. Completed sources drop obsolete transfer activity while retaining
+aggregate retry/resume/repair facts. Neutral planning rows do not claim a known
+empty total before size or completion establishes it. The current-work caption
+uses bytes for Downloading/Extracting and grouped work counts for other phases;
+it remains separate from the three tracks. Known positive track totals support
+bars; unknown, zero, and unnecessary work preserve the bar's space without
+inventing a percentage.
+
+Native activity and terminal results control the
+[progress area's cancellation and settlement](gui-interaction.md#dataset-compilation-controls).
+Its animation never decides completion. The CLI retains exact byte counts,
+unknown-total text, transfer attempts, retained bytes, resume, and retry details
+through [its source-status formatter](../src/backend/data/benchmark_compiler.cpp);
+native activity strings carry the operation description rather than a second
+encoded copy of the transfer quantities.
 
 Transfer and scan observations use existing bounded observation points.
 Enabled [benchmark traces](logging.md#benchmark-compilation-traces) expose cache,
