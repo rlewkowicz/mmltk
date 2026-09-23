@@ -80,6 +80,7 @@ mmltk_register_ordinary_sources(mmltk_backend_data
     benchmark_compiler.cpp
     benchmark_custom_recipe.cpp
     coconut_recipe.cpp
+    benchmark_pipeline.cpp
     benchmark_progress.cpp
     benchmark_storage.cpp
     open_images_acquisition.cpp
@@ -94,7 +95,6 @@ mmltk_register_ordinary_sources(mmltk_backend_data
     staging_file_cleanup.cpp)
 mmltk_register_retained_module_importers(mmltk_backend_data
     compiled_image_stream.cpp
-    benchmark_pipeline.cpp
     benchmark_writer.cpp
     dataset_compiler.cpp
     dataset_compiler_layout.cpp

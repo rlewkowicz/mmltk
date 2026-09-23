@@ -91,13 +91,13 @@ FileHandle FileHandle::create_unique_output(std::string& path_template, const st
  writable.push_back('\0');
  const int fd = ::mkostemp(writable.data(), O_CLOEXEC);
  if (fd < 0) throw errno_error("mkostemp failed", path_template);
- path_template.assign(writable.data());
  FileHandle file(fd);
  try {
+  path_template.assign(writable.data());
   if (::fchmod(fd, 0644) != 0) throw errno_error("fchmod failed", path_template);
   file.preallocate(bytes);
  } catch (...) {
-  (void)::unlink(path_template.c_str());
+  (void)::unlink(writable.data());
   throw;
  }
  return file;

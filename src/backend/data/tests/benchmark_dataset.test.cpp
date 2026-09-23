@@ -2443,6 +2443,56 @@ TEST_CASE("one-worker image readiness resizes before archive completion and reus
  CHECK(writer.completed() == 1);
  writer.finish(write);
 }
+TEST_CASE("cache readiness failure joins held publication and retains completed bytes", "[backend][data][benchmark][images][pipeline]") {
+ if (mmltk::common::system::allowed_cpu_set().size() < 2) SKIP("concurrent cache publication requires two eligible CPUs");
+ mmltk::testsupport::ScopedTempDir root("cache-ready-failure");
+ const auto archive = root.path() / "images.tar";
+ const auto images = root.path() / "images";
+ const auto jpeg = make_jpeg(240, 8, 8);
+ {
+  std::ofstream output(archive, std::ios::binary);
+  for (const auto id : {1U, 2U}) write_jpeg_tar_entry(output, id, jpeg);
+  const std::array<char, 1024> terminator{};
+  output.write(terminator.data(), static_cast<std::streamsize>(terminator.size()));
+  REQUIRE(output.good());
+ }
+ const std::array<std::uint64_t, 2> ids{1, 2};
+ mmltk::testsupport::TestGate failing("failing cache publication"), held("held cache publication");
+ std::promise<void> failure_delivered;
+ ArchiveExtractionRequest request{.archive_path = archive, .source_identity = "ready-failure-fixture", .output_root = images,
+  .source = "coco", .shard = "train2017", .selected_image_ids = ids,
+  .image_id_parser = [](std::string_view name) -> std::optional<std::uint64_t> {
+   if (name.ends_with("/1.jpg")) return 1;
+   if (name.ends_with("/2.jpg")) return 2;
+   return std::nullopt;
+  }, .decompression_workers = 0, .cache_write_workers = 2};
+ request.image_ready = [&](const CachedImageReady& image) {
+  require_condition(fs::file_size(cached_image_path(image.root, image.image_id)) == jpeg.size(), "readiness preceded durable image publication");
+  if (image.image_id == 1) {
+   failing.receipt().ArriveAndWait();
+   failure_delivered.set_value();
+   throw std::runtime_error("injected cache readiness failure");
+  }
+  held.receipt().ArriveAndWait();
+ };
+ auto extraction = std::async(std::launch::async, [&] { return extract_selected_archive_images(request); });
+ const mmltk::testsupport::ScopedTestCleanup release([&] { failing.Release(); held.Release(); });
+ REQUIRE(failing.WaitEntered(2s));
+ REQUIRE(held.WaitEntered(2s));
+ failing.Release();
+ mmltk::testsupport::await_test_promise(failure_delivered, "cache readiness failure");
+ CHECK(extraction.wait_for(0ms) == std::future_status::timeout);
+ CHECK_FALSE(fs::exists(images / ".complete.json"));
+ held.Release();
+ CHECK_THROWS_WITH(mmltk::testsupport::await_test_future(extraction, "cache writer retirement"), "injected cache readiness failure");
+ CHECK_FALSE(fs::exists(images / ".complete.json"));
+ for (const auto id : ids) CHECK(fs::file_size(cached_image_path(images, id)) == jpeg.size());
+ request.image_ready = {};
+ const auto reused = extract_selected_archive_images(request);
+ CHECK_FALSE(reused.cache_hit);
+ CHECK(fs::is_regular_file(images / ".complete.json"));
+ CHECK(extract_selected_archive_images(request).cache_hit);
+}
 TEST_CASE("cached pixels finish while label preparation is blocked", "[backend][data][benchmark][pipeline]") {
  mmltk::testsupport::ScopedTempDir root("blocked-labels");
  const auto images = root.path() / "images";

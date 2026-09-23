@@ -839,9 +839,27 @@ struct SegmentTransfer {
  SegmentedDownloadState state(request, identity, segment_count, progress, trace, descriptor, cancel_requested);
  trace_benchmark_event(trace, "benchmark.download.segmented_start",
   [&] { return nlohmann::json{{"artifact", request.artifact_id}, {"segments", segment_count}, {"bytes", request.expected_size}, {"resumed", state.resumed()}}; });
- const auto download_segment = [&](const std::size_t segment_index) {
+ std::exception_ptr transfer_error;
+ std::mutex transfer_error_mutex;
+ // Network connection concurrency is independent of CPU worker allocation.
+ // This scope also retires partial launches before state and the descriptor.
+ struct SegmentThreads {
+  mmltk::common::concurrency::CancellationObservation external;
+  std::atomic<bool> stopping{false};
+  std::vector<std::thread> threads;
+  [[nodiscard]] bool cancelled() const noexcept { return stopping.load(std::memory_order_relaxed) || external.requested(); }
+  void join() noexcept {
+   for (auto& thread : threads) if (thread.joinable()) thread.join();
+  }
+  ~SegmentThreads() {
+   stopping.store(true, std::memory_order_relaxed);
+   join();
+  }
+ } transfers{cancel_requested};
+ const auto transfer_cancellation = mmltk::common::concurrency::CancellationObservation::Borrow(transfers);
+ const auto download_segment = [&, transfer_cancellation](const std::size_t segment_index) {
   while (true) {
-   throw_if_benchmark_cancelled(cancel_requested);
+   throw_if_benchmark_cancelled(transfer_cancellation);
    const DownloadSegment segment = state.segment(segment_index);
    const std::uint64_t segment_size = segment.end + 1U - segment.begin;
    if (segment.completed == segment_size) { break; }
@@ -849,7 +867,7 @@ struct SegmentTransfer {
    if (attempt > request.maximum_attempts) { throw BenchmarkDownloadUnavailable("segmented benchmark download exhausted retries for " + request.artifact_id); }
    const std::uint64_t attempt_begin = segment.begin + segment.completed;
    state.begin_attempt(attempt);
-   SegmentTransfer transfer(request, identity, state, segment_index, attempt_begin, segment.end, attempt, descriptor, cancel_requested);
+   SegmentTransfer transfer(request, identity, state, segment_index, attempt_begin, segment.end, attempt, descriptor, transfer_cancellation);
    const CURLcode result = curl_easy_perform(transfer.easy.get());
    (void)curl_easy_getinfo(transfer.easy.get(), CURLINFO_RESPONSE_CODE, &transfer.http.response_code);
    if (transfer.callback_error) {
@@ -870,7 +888,7 @@ struct SegmentTransfer {
    } else {
     state.abandon_attempt(segment_index, attempt);
    }
-   throw_if_benchmark_cancelled(cancel_requested);
+   throw_if_benchmark_cancelled(transfer_cancellation);
    reject_local_curl_failure(result);
    if (transfer.http.response_code == 200L) { throw SegmentedDownloadUnsupported("server ignored a segmented byte range"); }
    if (complete) { break; }
@@ -880,17 +898,14 @@ struct SegmentTransfer {
    });
    if (attempt == request.maximum_attempts) { throw BenchmarkDownloadUnavailable("segmented benchmark download failed after retries for " + request.artifact_id); }
    // The remote segment retry is intentionally deadline-based HTTP backoff.
-   throw_if_benchmark_cancelled(cancel_requested);
+   throw_if_benchmark_cancelled(transfer_cancellation);
    std::this_thread::sleep_for(std::chrono::milliseconds{std::min<std::uint64_t>(4000U, 250U << std::min<std::uint32_t>(attempt - 1U, 4U))});
-   throw_if_benchmark_cancelled(cancel_requested);
+   throw_if_benchmark_cancelled(transfer_cancellation);
   }
  };
- std::exception_ptr transfer_error;
- std::mutex transfer_error_mutex;
- std::vector<std::thread> transfer_threads;
- transfer_threads.reserve(segment_count);
+ transfers.threads.reserve(segment_count);
  for (std::size_t segment_index = 0U; segment_index < segment_count; ++segment_index) {
-  transfer_threads.emplace_back([&, segment_index] {
+  transfers.threads.emplace_back([&, segment_index, download_segment] {
    try {
     download_segment(segment_index);
    } catch (...) {
@@ -899,7 +914,7 @@ struct SegmentTransfer {
    }
   });
  }
- for (std::thread& thread : transfer_threads) { thread.join(); }
+ transfers.join();
  if (transfer_error) { std::rethrow_exception(transfer_error); }
  if (::fdatasync(descriptor) != 0) { throw errno_error("cannot flush segmented benchmark download", partial_path(request).string()); }
  partial = ScopedFd{};

@@ -959,7 +959,8 @@ void benchmark_internal::compile_benchmark_recipe(BenchmarkCompilerConfig config
    if (!staging_owner) staging_owner = std::make_unique<common_io::StagingDirectory>(config.output_dir, ".", ".benchmark.tmp.XXXXXX", "cannot create benchmark dataset staging directory");
    const std::filesystem::path& staging_dir = staging_owner->path();
    const auto pipeline_workers = effective_num_workers - (coconut ? input_budget : custom_transfer_budget);
-   const auto pixel_lanes = pipeline_workers == 1 ? 1 : std::max<std::size_t>(1, pipeline_workers / 3);
+   BenchmarkCompilePipeline pipeline(pipeline_workers, std::span(compile_cpus).last(pipeline_workers));
+   const auto pixel_lanes = pipeline.pixel_workers();
    const BenchmarkWriteProgressEvent pixel_progress = progress.pixel_observer_enabled()
     ? BenchmarkWriteProgressEvent{.context = &progress, .image_completed = [](void* context) { static_cast<ProgressReporter*>(context)->pixel_completed(); }}
     : BenchmarkWriteProgressEvent{};
@@ -978,7 +979,6 @@ void benchmark_internal::compile_benchmark_recipe(BenchmarkCompilerConfig config
    reserve_pixels(retained_validation_pixels, validation_pixel_request, coconut && config.selection.validation != CoconutValidation::Stock);
    auto& train_writer = *retained_train_pixels;
    auto& validation_writer = *retained_validation_pixels;
-   BenchmarkCompilePipeline pipeline(pipeline_workers, std::span(compile_cpus).last(pipeline_workers));
    pipeline.register_split(train_writer, pixel_train);
    pipeline.register_split(validation_writer, pixel_validation);
    const CachedImageReadySink image_ready = [&](const CachedImageReady& image) { pipeline.image_ready(image); };

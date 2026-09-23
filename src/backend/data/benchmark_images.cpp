@@ -18,7 +18,8 @@
 #include <rapidgzip/ParallelGzipReader.hpp>
 #include <span>
 #include <string_view>
-#include <thread>
+#include "src/common/concurrency/worker_pool.h"
+#include "src/common/system/cpu_affinity.h"
 #include <unordered_set>
 #include "src/backend/data/benchmark_hash.h"
 #include "src/common/io/file_digest.h"
@@ -78,12 +79,16 @@ public:
      : ready_(std::move(ready)), output_root_(std::move(output_root)), progress_(std::move(progress), initially_completed, expected_writes), cancellation_(cancellation) {
   const std::size_t bounded_workers = std::min<std::size_t>(8U, worker_count);
   inline_mode_ = bounded_workers == 0U;
-  const std::size_t buffer_count = inline_mode_ ? 1U : bounded_workers * 2U + 2U;
+  if (!inline_mode_) workers_ = std::make_unique<mmltk::common::concurrency::WorkerPool>(bounded_workers, mmltk::common::system::allowed_cpu_set(), "cache_write", bounded_workers);
+  const std::size_t buffer_count = inline_mode_ ? 1U : workers_->size() * 2U + 2U;
   free_buffers_.resize(buffer_count);
-  for (std::vector<std::uint8_t>& buffer : free_buffers_) { buffer.reserve(std::size_t{512U} * 1024U); }
-  workers_.reserve(bounded_workers);
-  for (std::size_t worker = 0U; worker < bounded_workers; ++worker) {
-   workers_.emplace_back([this] { run(); });
+  for (auto& buffer : free_buffers_) buffer.reserve(std::size_t{512U} * 1024U);
+  try {
+   if (workers_) for (std::size_t lane = 0; lane < workers_->size(); ++lane)
+    workers_->enqueue_borrowed(this, lane, [](void* owner, std::size_t) { static_cast<CachedImageWritePool*>(owner)->run(); });
+  } catch (...) {
+   stop();
+   throw;
   }
  }
  CachedImageWritePool(const CachedImageWritePool&) = delete;
@@ -163,10 +168,18 @@ private:
   std::vector<std::uint8_t> encoded;
  };
  void run() noexcept {
-  while (true) {
-   std::optional<Task> task = wait_pop_task(mutex_, pending_, stopping_, tasks_, cancellation_, [&] { ++active_; });
-   if (!task) { return; }
-   try {
+  bool active = false;
+  try {
+   while (true) {
+    auto task = wait_pop_task(mutex_, pending_, stopping_, tasks_, cancellation_, [&] {
+     ++active_;
+     active = true;
+    });
+    if (!task) {
+     available_.notify_all();
+     finished_.notify_all();
+     return;
+    }
     const std::uint64_t bytes = task->encoded.size();
     if (!has_complete_image_markers(task->encoded)) { throw std::runtime_error("selected archive image " + std::to_string(task->image_id) + " is not a complete JPEG or PNG"); }
     throw_if_benchmark_cancelled(cancellation_);
@@ -180,32 +193,37 @@ private:
      completed = written_ids_.size();
     }
     progress_.completed(completed);
-   } catch (...) {
-    const std::lock_guard lock(mutex_);
-    if (!failure_) { failure_ = std::current_exception(); }
+    if (task->encoded.capacity() > kMaximumRetainedImageBufferBytes) {
+     task->encoded = {};
+    } else {
+     task->encoded.clear();
+    }
+    {
+     const std::lock_guard lock(mutex_);
+     free_buffers_.push_back(std::move(task->encoded));
+     --active_;
+     active = false;
+    }
+    available_.notify_one();
+    finished_.notify_one();
    }
-   if (task->encoded.capacity() > kMaximumRetainedImageBufferBytes) {
-    task->encoded = {};
-   } else {
-    task->encoded.clear();
-   }
+  } catch (...) {
    {
     const std::lock_guard lock(mutex_);
-    free_buffers_.push_back(std::move(task->encoded));
-    --active_;
+    if (active) --active_;
+    if (!failure_) failure_ = std::current_exception();
+    stopping_ = true;
+    tasks_.clear();
    }
-   available_.notify_one();
-   finished_.notify_one();
+   pending_.notify_all();
+   available_.notify_all();
+   finished_.notify_all();
   }
  }
  void rethrow_failure_locked() const {
   if (failure_) { std::rethrow_exception(failure_); }
  }
- void join() noexcept {
-  for (std::thread& worker : workers_) {
-   if (worker.joinable()) { worker.join(); }
-  }
- }
+ void join() noexcept { workers_.reset(); }
  void stop() noexcept {
   {
    const std::lock_guard lock(mutex_);
@@ -213,6 +231,8 @@ private:
    tasks_.clear();
   }
   pending_.notify_all();
+  available_.notify_all();
+  finished_.notify_all();
   join();
  }
  std::filesystem::path output_root_;
@@ -224,7 +244,7 @@ private:
  std::condition_variable finished_;
  std::deque<Task> tasks_;
  std::vector<std::vector<std::uint8_t>> free_buffers_;
- std::vector<std::thread> workers_;
+ std::unique_ptr<mmltk::common::concurrency::WorkerPool> workers_;
  std::vector<std::uint64_t> written_ids_;
  std::uint64_t written_bytes_ = 0U;
  std::size_t active_ = 0U;
@@ -316,17 +336,14 @@ void write_cached_image_atomically(const std::filesystem::path& path, const std:
  writable_path.push_back('\0');
  const int descriptor = ::mkostemp(writable_path.data(), O_CLOEXEC);
  if (descriptor < 0) { throw errno_error("cannot create cached benchmark image", staging_text); }
- staging_text.assign(writable_path.data());
  FileHandle staging(descriptor);
- staging.pwrite_all(encoded.data(), encoded.size(), 0U);
- staging = FileHandle{};
- const std::filesystem::path staging_path(staging_text);
  try {
+  staging.pwrite_all(encoded.data(), encoded.size(), 0U);
+  staging = FileHandle{};
   throw_if_benchmark_cancelled(cancellation);
-  std::filesystem::rename(staging_path, path);
+  std::filesystem::rename(writable_path.data(), path);
  } catch (...) {
-  std::error_code ignored;
-  std::filesystem::remove(staging_path, ignored);
+  (void)::unlink(writable_path.data());
   throw;
  }
 }

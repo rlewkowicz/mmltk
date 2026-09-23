@@ -18,6 +18,8 @@
 #include <span>
 #include <string_view>
 #include <thread>
+#include "src/common/concurrency/worker_pool.h"
+#include "src/common/system/cpu_affinity.h"
 #include <unordered_set>
 namespace mmltk::backend::data::benchmark_internal {
 namespace common_math = mmltk::common::math;
@@ -88,32 +90,29 @@ public:
   std::exception_ptr fatal_error;
  };
  OpenImageCacheWorkers(const std::size_t worker_count, std::filesystem::path image_root, const mmltk::common::concurrency::CancellationObservation cancellation, CachedImageReadySink ready)
-     : ready_(std::move(ready)), image_root_(std::move(image_root)), cancellation_(cancellation) {
+     : image_ready_(std::move(ready)), image_root_(std::move(image_root)), cancellation_(cancellation) {
   if (worker_count == 0U) {
    inline_validator_ = std::make_unique<BenchmarkImageValidator>();
    return;
   }
-  std::vector<std::unique_ptr<BenchmarkImageValidator>> validators;
-  validators.reserve(worker_count);
-  for (std::size_t worker = 0U; worker < worker_count; ++worker) { validators.push_back(std::make_unique<BenchmarkImageValidator>()); }
-  workers_.reserve(worker_count);
-  for (std::size_t worker = 0U; worker < worker_count; ++worker) {
-   workers_.emplace_back([this, validator = std::move(validators[worker])] { run(validator.get()); });
+  workers_ = std::make_unique<mmltk::common::concurrency::WorkerPool>(worker_count, mmltk::common::system::allowed_cpu_set(), "open_cache", worker_count);
+  validators_.reserve(workers_->size());
+  for (std::size_t lane = 0; lane < workers_->size(); ++lane) validators_.push_back(std::make_unique<BenchmarkImageValidator>());
+  try {
+   for (std::size_t lane = 0; lane < workers_->size(); ++lane)
+    workers_->enqueue_borrowed(this, lane, [](void* owner, std::size_t index) {
+     auto& self = *static_cast<OpenImageCacheWorkers*>(owner);
+     self.run(self.validators_[index].get());
+    });
+  } catch (...) {
+   stop();
+   throw;
   }
  }
  OpenImageCacheWorkers(const OpenImageCacheWorkers&) = delete;
  OpenImageCacheWorkers& operator=(const OpenImageCacheWorkers&) = delete;
- ~OpenImageCacheWorkers() {
-  {
-   const std::lock_guard lock(mutex_);
-   stopping_ = true;
-   tasks_.clear();
-  }
-  pending_.notify_all();
-  for (std::thread& worker : workers_) {
-   if (worker.joinable()) { worker.join(); }
-  }
- }
+ ~OpenImageCacheWorkers() { stop(); }
+
  void submit(const std::uint64_t image_id, const std::uint32_t attempt, std::vector<std::uint8_t> encoded) {
   throw_if_benchmark_cancelled(cancellation_);
   if (inline_validator_) {
@@ -123,11 +122,12 @@ public:
     results_.push_back(std::move(result));
     ++outstanding_;
    }
-   ready_.notify_one();
+   result_ready_.notify_one();
    return;
   }
   {
    const std::lock_guard lock(mutex_);
+   rethrow_failure_locked();
    tasks_.push_back(Task{image_id, attempt, std::move(encoded)});
    ++outstanding_;
   }
@@ -136,6 +136,7 @@ public:
  [[nodiscard]] bool try_pop(Result* output) {
   const std::lock_guard lock(mutex_);
   throw_if_benchmark_cancelled(cancellation_);
+  rethrow_failure_locked();
   if (results_.empty()) { return false; }
   *output = std::move(results_.front());
   results_.pop_front();
@@ -148,18 +149,19 @@ public:
  }
  void wait_for_result() {
   std::unique_lock lock(mutex_);
-  ready_.wait(lock, [&] { return cancellation_.requested() || !results_.empty() || stopping_; });
+  result_ready_.wait(lock, [&] { return cancellation_.requested() || !results_.empty() || stopping_; });
+  rethrow_failure_locked();
   throw_if_benchmark_cancelled(cancellation_);
  }
 
 private:
- CachedImageReadySink ready_;
+ CachedImageReadySink image_ready_;
  struct Task {
   std::uint64_t image_id = 0U;
   std::uint32_t attempt = 0U;
   std::vector<std::uint8_t> encoded;
  };
- [[nodiscard]] Result process(Task task, BenchmarkImageValidator* validator) const noexcept {
+ [[nodiscard]] Result process(Task task, BenchmarkImageValidator* validator) const {
   Result result;
   result.image_id = task.image_id;
   result.attempt = task.attempt;
@@ -170,29 +172,51 @@ private:
    result.width = width;
    result.height = height;
    write_cached_image_atomically(cached_image_path(image_root_, result.image_id), result.encoded, cancellation_);
-   if (ready_) ready_({image_root_, result.image_id});
+   if (image_ready_) image_ready_({image_root_, result.image_id});
    throw_if_benchmark_cancelled(cancellation_);
   } catch (const InvalidImageError& error) { result.retry_reason = error.what(); } catch (...) {
    result.fatal_error = std::current_exception();
   }
   return result;
  }
+ void rethrow_failure_locked() const {
+  if (failure_) std::rethrow_exception(failure_);
+ }
+ void stop() noexcept {
+  {
+   const std::lock_guard lock(mutex_);
+   stopping_ = true;
+   tasks_.clear();
+  }
+  pending_.notify_all();
+  result_ready_.notify_all();
+  workers_.reset();
+ }
  void run(BenchmarkImageValidator* validator) noexcept {
-  while (true) {
-   std::optional<Task> task = wait_pop_task(mutex_, pending_, stopping_, tasks_, cancellation_);
-   if (!task) { return; }
-   Result result = process(std::move(*task), validator);
-   {
-    const std::lock_guard lock(mutex_);
-    if (cancellation_.requested()) {
-     stopping_ = true;
-     tasks_.clear();
-     ready_.notify_all();
+  try {
+   while (true) {
+    auto task = wait_pop_task(mutex_, pending_, stopping_, tasks_, cancellation_);
+    if (!task) {
+     result_ready_.notify_all();
      return;
     }
-    results_.push_back(std::move(result));
+    Result result = process(std::move(*task), validator);
+    if (result.fatal_error) std::rethrow_exception(result.fatal_error);
+    {
+     const std::lock_guard lock(mutex_);
+     results_.push_back(std::move(result));
+    }
+    result_ready_.notify_one();
    }
-   ready_.notify_one();
+  } catch (...) {
+   {
+    const std::lock_guard lock(mutex_);
+    if (!failure_) failure_ = std::current_exception();
+    stopping_ = true;
+    tasks_.clear();
+   }
+   pending_.notify_all();
+   result_ready_.notify_all();
   }
  }
  std::filesystem::path image_root_;
@@ -200,10 +224,12 @@ private:
  std::unique_ptr<BenchmarkImageValidator> inline_validator_;
  mutable std::mutex mutex_;
  std::condition_variable pending_;
- std::condition_variable ready_;
+ std::condition_variable result_ready_;
  std::deque<Task> tasks_;
  std::deque<Result> results_;
- std::vector<std::thread> workers_;
+ std::vector<std::unique_ptr<BenchmarkImageValidator>> validators_;
+ std::unique_ptr<mmltk::common::concurrency::WorkerPool> workers_;
+ std::exception_ptr failure_;
  std::size_t outstanding_ = 0U;
  bool stopping_ = false;
 };

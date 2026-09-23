@@ -149,8 +149,13 @@ struct BenchmarkSplitWriter::Impl {
   staging_text = request.output_path.string() + ".tmp.XXXXXX";
   require_storage(request.output_path, layout.pixel_offset + layout.pixel_blob_size, "benchmark pixel staging", {});
   output = common_io::FileHandle::create_unique_output(staging_text, layout.pixel_offset + layout.pixel_blob_size);
-  staging_path = staging_text;
-  cleanup = std::make_unique<StagingFileCleanup>(staging_path);
+  try {
+   staging_path = staging_text;
+   cleanup = std::make_unique<StagingFileCleanup>(staging_path);
+  } catch (...) {
+   (void)::unlink(staging_text.c_str());
+   throw;
+  }
   pixels = std::make_unique<WritablePixelRange>(output.get(), layout.pixel_offset, layout.pixel_blob_size);
   const auto lanes = std::max(1, request.num_workers);
   scratch.reserve(lanes);
