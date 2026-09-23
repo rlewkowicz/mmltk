@@ -1,3 +1,6 @@
+pub mod transition;
+pub use transition::disclosure;
+
 use crate::fluent_theme::Element;
 use iced::widget::{column, container, text};
 use iced::{Fill, Length};
@@ -46,4 +49,27 @@ pub fn modal<'a, Message: 'a>(
     .width(Fill)
     .height(Fill)
     .into()
+}
+
+/// A section break owns its entire five-pixel vertical extent.
+pub fn card_section_divider<'a, Message: 'a>() -> Element<'a, Message> {
+    container(iced::widget::rule::horizontal(1).style(crate::fluent_theme::card_section_divider))
+        .padding([2, 0])
+        .width(Fill)
+        .into()
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn divider_uses_the_current_card_outline_and_centered_proportion() {
+        for dark in [false, true] {
+            let theme = crate::fluent_theme::app_theme(dark);
+            let style = crate::fluent_theme::card_section_divider(&theme);
+            assert_eq!(style.color, crate::fluent_theme::container_card(&theme).border.color);
+            for width in [160.0, 240.0] {
+                assert_eq!(style.fill_mode.fill(width), (width * 0.125, width * 0.75));
+            }
+        }
+    }
 }

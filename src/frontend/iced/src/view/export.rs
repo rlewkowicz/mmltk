@@ -58,59 +58,66 @@ impl Component {
             || crate::generated::default_workflowsexportstatebuildtensorrt().unwrap_or_default(),
             |value| value.buildtensorrt,
         );
-        let relevant_dialogs = if build_tensorrt {
-            &[crate::generated::constraint_workflowsexportstateoutputpath().stable_field_id][..]
-        } else {
-            &[crate::generated::constraint_workflowsexportstateonnxoutputpath().stable_field_id][..]
-        };
-        let dialogs = model
-            .workflow
-            .dialogs(crate::generated::FeatureId::Export)
-            .filter(|fact| relevant_dialogs.contains(&fact.stable_field_id))
-            .fold(column![].spacing(6), |column, fact| {
-                column.push(
-                    container(
-                        button(fact.title).on_press_maybe(
-                            model
-                                .file_dialog_open_available(
-                                    fact,
-                                    crate::generated::FeatureId::Export,
-                                )
-                                .then_some(Message::DialogRequested(fact.stable_field_id)),
-                        ),
+        let branch_fields = |build_tensorrt| {
+            let relevant_dialogs = if build_tensorrt {
+                &[crate::generated::constraint_workflowsexportstateoutputpath().stable_field_id][..]
+            } else {
+                &[crate::generated::constraint_workflowsexportstateonnxoutputpath().stable_field_id][..]
+            };
+            let dialogs = model
+                .workflow
+                .dialogs(crate::generated::FeatureId::Export)
+                .filter(|fact| relevant_dialogs.contains(&fact.stable_field_id))
+                .fold(column![].spacing(6), |column, fact| {
+                    column.push(
+                        container(
+                            button(fact.title).on_press_maybe(
+                                model
+                                    .file_dialog_open_available(
+                                        fact,
+                                        crate::generated::FeatureId::Export,
+                                    )
+                                    .then_some(Message::DialogRequested(fact.stable_field_id)),
+                            ),
+                        )
+                        .id(format!("dialog.{}", fact.stable_field_id)),
                     )
-                    .id(format!("dialog.{}", fact.stable_field_id)),
-                )
-            });
-        let operation = model.workflow.export.as_ref();
-        let branch_fields: Element<'a, Message> = if build_tensorrt {
-            column![
-                crate::view::workflow::fields::text_field(
-                    "TensorRT output",
-                    crate::generated::constraint_workflowsexportstateoutputpath().stable_field_id,
-                    draft.map_or("", |value| value.outputpath.as_str()),
-                    settings_edit_available,
-                    Message::OutputPathChanged,
-                ),
-                dialogs,
-            ]
-            .spacing(crate::view::workflow::FIELD_SPACING)
-            .into()
-        } else {
-            column![
-                crate::view::workflow::fields::text_field(
-                    "ONNX output",
-                    crate::generated::constraint_workflowsexportstateonnxoutputpath()
-                        .stable_field_id,
-                    draft.map_or("", |value| value.onnxoutputpath.as_str()),
-                    settings_edit_available,
-                    Message::OnnxOutputPathChanged,
-                ),
-                dialogs,
-            ]
-            .spacing(crate::view::workflow::FIELD_SPACING)
-            .into()
+                });
+            let fields: Element<'a, Message> = if build_tensorrt {
+                column![
+                    crate::view::workflow::fields::text_field(
+                        "TensorRT output",
+                        crate::generated::constraint_workflowsexportstateoutputpath().stable_field_id,
+                        draft.map_or("", |value| value.outputpath.as_str()),
+                        settings_edit_available,
+                        Message::OutputPathChanged,
+                    ),
+                    dialogs,
+                ]
+                .spacing(crate::view::workflow::FIELD_SPACING)
+                .into()
+            } else {
+                column![
+                    crate::view::workflow::fields::text_field(
+                        "ONNX output",
+                        crate::generated::constraint_workflowsexportstateonnxoutputpath()
+                            .stable_field_id,
+                        draft.map_or("", |value| value.onnxoutputpath.as_str()),
+                        settings_edit_available,
+                        Message::OnnxOutputPathChanged,
+                    ),
+                    dialogs,
+                ]
+                .spacing(crate::view::workflow::FIELD_SPACING)
+                .into()
+            };
+            fields
         };
+        let operation = model.workflow.export.as_ref();
+        let branch_fields = column![
+            crate::view::shared::disclosure("export.output.tensorrt", build_tensorrt, branch_fields(true)),
+            crate::view::shared::disclosure("export.output.onnx", !build_tensorrt, branch_fields(false)),
+        ];
         let setup: Element<'a, Message> = column![
             self.model_card
                 .view(crate::view::workflow::model_card::State::from_settings(
@@ -180,50 +187,57 @@ impl Component {
             Message::Workspace,
             crate::workspace_input::Binding::default(),
         );
-        let branch_advanced: Element<'a, Message> = if build_tensorrt {
-            crate::view::workflow::fields::toggle(
-                "Allow FP16",
-                draft.map_or_else(
-                    || {
-                        crate::generated::default_workflowsexportstateallowfp16()
-                            .unwrap_or_default()
-                    },
-                    |value| value.allowfp16,
-                ),
-                settings_edit_available,
-                Message::Fp16Changed,
-            )
-        } else {
-            column![
-                crate::view::workflow::fields::number_i32(
-                    "ONNX opset",
-                    draft.map_or_else(
-                        || {
-                            crate::generated::default_workflowsexportstateopsetversion()
-                                .unwrap_or_default()
-                        },
-                        |value| value.opsetversion,
-                    ),
-                    crate::generated::constraint_workflowsexportstateopsetversion(),
-                    settings_edit_available,
-                    Message::OpsetChanged,
-                ),
+        let branch_advanced = |build_tensorrt| {
+            let fields: Element<'a, Message> = if build_tensorrt {
                 crate::view::workflow::fields::toggle(
-                    "Simplify ONNX",
+                    "Allow FP16",
                     draft.map_or_else(
                         || {
-                            crate::generated::default_workflowsexportstatesimplify()
+                            crate::generated::default_workflowsexportstateallowfp16()
                                 .unwrap_or_default()
                         },
-                        |value| value.simplify,
+                        |value| value.allowfp16,
                     ),
                     settings_edit_available,
-                    Message::SimplifyChanged,
-                ),
-            ]
-            .spacing(crate::view::workflow::FIELD_SPACING)
-            .into()
+                    Message::Fp16Changed,
+                )
+            } else {
+                column![
+                    crate::view::workflow::fields::number_i32(
+                        "ONNX opset",
+                        draft.map_or_else(
+                            || {
+                                crate::generated::default_workflowsexportstateopsetversion()
+                                    .unwrap_or_default()
+                            },
+                            |value| value.opsetversion,
+                        ),
+                        crate::generated::constraint_workflowsexportstateopsetversion(),
+                        settings_edit_available,
+                        Message::OpsetChanged,
+                    ),
+                    crate::view::workflow::fields::toggle(
+                        "Simplify ONNX",
+                        draft.map_or_else(
+                            || {
+                                crate::generated::default_workflowsexportstatesimplify()
+                                    .unwrap_or_default()
+                            },
+                            |value| value.simplify,
+                        ),
+                        settings_edit_available,
+                        Message::SimplifyChanged,
+                    ),
+                ]
+                .spacing(crate::view::workflow::FIELD_SPACING)
+                .into()
+            };
+            fields
         };
+        let branch_advanced = column![
+            crate::view::shared::disclosure("export.advanced.tensorrt", build_tensorrt, branch_advanced(true)),
+            crate::view::shared::disclosure("export.advanced.onnx", !build_tensorrt, branch_advanced(false)),
+        ];
         let advanced = crate::view::shared::card(
             "Advanced",
             "Export precision, optimization, and packaging.",

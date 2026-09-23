@@ -186,9 +186,10 @@ Fine label toggles stay local to Iced; layer and box/mask changes request native
 composition from retained products.
 
 The atlas groups sit beneath the preview half, leaving the metrics half clear.
-Shared viewer controls preserve natural text and control sizes and wrap complete
-groups with 20 logical pixels between them. Explore uses the same spacing
-between its Fit/Original and overlay groups. While Validation detail is open,
+Validation viewer controls preserve natural text and control sizes and wrap
+complete groups with 20 logical pixels between them. Explore keeps Fit/Original
+on the left and Labels/Masks/Boxes on the right, with at least 20 logical pixels
+between the groups. While Validation detail is open,
 the hidden atlas controls retain their measured footprint without exposing
 duplicate widget identities or input, so opening the modal preserves page bounds.
 

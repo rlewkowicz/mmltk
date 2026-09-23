@@ -22,7 +22,7 @@ impl Component {
 }
 
 pub fn view<'a>(model: &'a ApplicationModel, component: &Component) -> Element<'a, Message> {
-    let content: Element<'_, Message> = if component.expanded {
+    let content = {
         let presentation = model.presentation.as_ref();
         let typography = model.typography();
         let content = column![
@@ -51,17 +51,15 @@ pub fn view<'a>(model: &'a ApplicationModel, component: &Component) -> Element<'
             .spacing(10),
         ]
         .spacing(6);
-        column![
-            content,
-            iced::widget::button("Hide diagnostics").on_press(Message::Toggled)
-        ]
-        .spacing(6)
-        .into()
-    } else {
-        iced::widget::button("Show diagnostics")
-            .on_press(Message::Toggled)
-            .into()
+        content
     };
+    // The shell anchors this card at the bottom: keep the trigger on that edge.
+    let content = column![
+        crate::view::shared::disclosure("diagnostics.content", component.expanded,
+            container(content).padding(iced::Padding::ZERO.bottom(6))),
+        iced::widget::button(if component.expanded { "Hide diagnostics" } else { "Show diagnostics" })
+            .on_press(Message::Toggled),
+    ];
     container(content)
         .id("diagnostics.summary")
         .padding(12)

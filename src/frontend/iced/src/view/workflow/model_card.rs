@@ -550,6 +550,16 @@ pub const fn progress_id(workflow: FeatureId) -> &'static str {
     }
 }
 
+pub const fn artifact_id(workflow: FeatureId) -> &'static str {
+    match workflow {
+        FeatureId::Train => "train.card.model.artifact",
+        FeatureId::Validate => "validate.card.model.artifact",
+        FeatureId::Predict => "predict.card.model.artifact",
+        FeatureId::Export => "export.card.model.artifact",
+        FeatureId::Live | FeatureId::Annotate | FeatureId::Explore => "workflow.card.model.artifact",
+    }
+}
+
 fn selector_id(workflow: FeatureId, train: &'static str, validate: &'static str) -> &'static str {
     if workflow == FeatureId::Train {
         train
@@ -860,6 +870,11 @@ fn view_with<'a, M: Clone + 'a>(
     } else {
         text("The catalog-owned weights are verified and cached locally.").into()
     };
+    let artifact = crate::view::shared::disclosure(
+        artifact_id(state.workflow),
+        !shared_weights_selector(state.workflow) || state.source == ModelSelectionSource::Custom,
+        artifact,
+    ).animate_resize();
     let progress: Element<'_, Message> = state.model.map_or_else(
         || text("Model state unavailable").size(12).into(),
         |model| {

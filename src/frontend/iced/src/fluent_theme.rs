@@ -480,3 +480,12 @@ mod tests {
 pub const CARD_PADDING: f32 = 10.0;
 pub const FIELD_SPACING: f32 = 4.0;
 pub const MODAL_PADDING: f32 = 24.0;
+
+pub fn card_section_divider(theme: &Theme) -> iced::widget::rule::Style {
+    iced::widget::rule::Style {
+        color: container_card(theme).border.color,
+        radius: 0.0.into(),
+        fill_mode: iced::widget::rule::FillMode::Percent(75.0),
+        snap: false,
+    }
+}

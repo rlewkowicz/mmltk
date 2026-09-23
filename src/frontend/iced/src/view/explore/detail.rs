@@ -1,8 +1,8 @@
 use crate::fluent_theme::Element;
 use crate::presentation_surface::Surface;
 use crate::view_model::ApplicationModel;
-use iced::Center;
 use iced::widget::{button, checkbox, container, row};
+use iced::{Center, Fill};
 
 #[derive(Debug, Clone)]
 pub enum Message {
@@ -105,10 +105,13 @@ pub(super) fn view<'a>(
     ]
     .spacing(7)
     .align_y(Center);
-    let source = crate::view::image_viewer::control_groups([
-        fit.into(),
-        super::overlay::view(overlay, available, true).map(Message::Overlay),
-    ]);
+    let source = row![
+        fit,
+        container(super::overlay::view(overlay, available, true).map(Message::Overlay))
+            .align_right(Fill),
+    ]
+    .spacing(20)
+    .align_y(Center);
     crate::view::image_viewer::panel(
         selected,
         image,

@@ -91,6 +91,10 @@ pub fn view<'a>(
             if router.active() == crate::generated::FeatureId::Explore {
                 page.width(Fill).height(Fill).into()
             } else {
+                // Iced stores wheel offsets absolutely and unsnaps scrollbar
+                // drags immediately. Keep this scroll tree/identity mounted:
+                // intrinsic form reflow preserves the viewport, with ordinary
+                // content-boundary clamping and no automatic reveal operation.
                 scrollable(page)
                     .id(PAGE_SCROLL_ID)
                     .direction(Direction::Vertical(compact_scrollbar()))
