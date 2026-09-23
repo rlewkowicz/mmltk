@@ -686,7 +686,7 @@ function workflowCaptionPixels(owner, canvas, snapshot, control, stage, caseInde
 }
 
 export function mmltkIntegrationWorkflowPixels(control, cssBounds, chart, progress, source, presentation,
-  captionStage, captionCase, captionPatches, completed, galleryTile) {
+  captionStage, captionCase, captionPatches, completed, galleryTile, confidence) {
   completed = integrationCompletion(completed);
   const owner = integrationState;
   if (!owner || !integrationDriver) { completed('failed'); return; }
@@ -695,6 +695,7 @@ export function mmltkIntegrationWorkflowPixels(control, cssBounds, chart, progre
   cssBounds = Array.from(cssBounds);
   captionPatches = Array.from(captionPatches);
   galleryTile = Array.from(galleryTile);
+  confidence = Array.from(confidence);
   // Widget layout precedes the browser compositor. Sample the completed canvas
   // after two presentation opportunities, with bounded retries owned by Rust.
   integrationFrame(() => integrationFrame(() => {
@@ -738,6 +739,32 @@ export function mmltkIntegrationWorkflowPixels(control, cssBounds, chart, progre
       const bottom = Math.min(canvas.height, Math.floor(y + h * (progress ? 1 : 0.88)));
       if (right <= left || bottom <= top) throw new Error('workflow canvas region is not visible');
       const snapshot = canvasSnapshot(canvas);
+      if (confidence.length) {
+        if (confidence.length !== 7 || !confidence.every(Number.isFinite) || confidence[1] <= 0
+            || confidence[2] < 0 || confidence[3] >= 1 || confidence[4] <= 0 || confidence[5] <= 0) {
+          throw new Error('missing paired raw detection confidence facts');
+        }
+        const pixels = snapshot.getImageData(x, y, w, h).data;
+        const prior = owner.validationConfidence;
+        let different = 0;
+        if (captionCase === 6) {
+          if (confidence[0] !== 0) throw new Error('confidence baseline is not zero');
+          owner.validationConfidence = {pixels: new Uint8ClampedArray(pixels), width:w, height:h, clean:confidence[4], generation:confidence[5]};
+        } else {
+          if (!prior || prior.width !== w || prior.height !== h || prior.pixels.length !== pixels.length
+              || prior.clean !== confidence[4] || prior.generation !== confidence[5]) throw new Error('confidence lost clean image or geometry');
+          for (let i=0; i<pixels.length; i+=4) {
+            if (Math.abs(pixels[i]-prior.pixels[i]) > 2 || Math.abs(pixels[i+1]-prior.pixels[i+1]) > 2 || Math.abs(pixels[i+2]-prior.pixels[i+2]) > 2) ++different;
+          }
+          if (captionCase === 7 && (confidence[0] !== 1 || different < 12)) throw new Error('confidence did not hide detection pixels');
+          if (captionCase === 8 && (confidence[0] !== 0 || different !== 0)) throw new Error('lower confidence did not restore exact retained pixels');
+        }
+        report({event:'integration.validation_confidence_pixels', control, stage:captionCase,
+          threshold:confidence[0], detections:confidence[1], minimum:confidence[2], maximum:confidence[3],
+          clean:confidence[4], generation:confidence[5], revision:confidence[6], different, matched:true});
+        completed('observed', pixels.length/4, pixels.length/4);
+        return;
+      }
       workflowCaptionPixels(owner, canvas, snapshot, control, captionStage, captionCase, captionPatches);
       const pixels = snapshot.getImageData(left, top, right-left, bottom-top).data;
       let visible = 0;
@@ -1401,6 +1428,9 @@ function integrationNumberEdit(x, y, value, selectionLength, completed) {
               keyResult += key('keydown', 'v', 'KeyV', true);
               keyResult += key('keyup', 'v', 'KeyV', true);
               keyResult += key('keyup', 'Control', 'ControlLeft', false);
+            } else if (value.length === 0) {
+              keyResult += key('keydown', 'Backspace', 'Backspace', false);
+              keyResult += key('keyup', 'Backspace', 'Backspace', false);
             } else if (characterIndex < value.length) {
               const character = value[characterIndex++];
               const code = character === '.' ? 'Period' :
@@ -1462,5 +1492,26 @@ export function mmltkIntegrationAnnotationPointer(x, y, width, height, startX, s
 
 export function mmltkIntegrationWindowClose() {
   integrationMicrotask(() => integrationFrame(() => integrationFrame(() => window.close())));
+  return 1;
+}
+
+// Completion follows actual keyboard/wheel delivery and Iced presentation opportunities.
+export function mmltkIntegrationConfidenceInput(x, y, action, value, completed) {
+  const completion = completed;
+  completed = integrationCompletion(success => completion(success === true));
+  const finish = success => integrationFrame(() => integrationFrame(() => completed(success)));
+  if (action === 0) return integrationNumberEdit(x, y, value, 32, finish);
+  const canvas = document.querySelector('canvas');
+  if (!integrationDriver || !canvas) return 0;
+  integrationMicrotask(() => {
+    if (action === 3) {
+      finish(mmltkIntegrationWheel(x, y, -96, false, true) === 1);
+    } else {
+      const key = action === 1 ? 'ArrowUp' : 'ArrowDown';
+      integrationKey(canvas, 'keydown', key, key, false, false);
+      integrationKey(canvas, 'keyup', key, key, false, false);
+      finish(true);
+    }
+  });
   return 1;
 }

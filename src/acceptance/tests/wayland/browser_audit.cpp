@@ -497,6 +497,14 @@ auto BrowserAudit::consume(const nlohmann::json& record) -> void {
                               record.value("ready_tile", false) && record.value("matched", false) && record.contains("compiled_index") &&
                               width > 0U && width <= 8U && height > 0U && height <= 8U && sampled == width * height &&
                               colored >= 12U && colored <= sampled && colored * 2U >= sampled;
+ } else if (event == "integration.validation_layout") {
+  validation_layout[{record.value("detail", ""), record.value("control", "")}] = {numeric(record, "a"), numeric(record, "b"), numeric(record, "c"), numeric(record, "d")};
+ } else if (event == "integration.validation_text") {
+  validation_text.insert(record.value("control", ""));
+ } else if (event == "integration.validation_confidence_edit") {
+  validation_confidence_edits.push_back(record);
+ } else if (event == "integration.validation_confidence_pixels") {
+  validation_confidence_pixels.push_back(record);
  } else if (event == "integration.workflow.operation_progress") {
   constexpr std::array<std::string_view, 4U> primary_controls{"train.primary", "validate.primary", "predict.primary", "export.primary"};
   const auto control = std::ranges::find(primary_controls, record.value("control", ""));
@@ -1524,6 +1532,52 @@ bool BrowserAudit::benchmark_choices_complete() const {
   previous_dataset = dataset;
   previous_validation = validation;
   previous_enabled = enabled;
+ }
+ return true;
+}
+bool BrowserAudit::validation_confidence_complete() const {
+ if (validation_confidence_edits.size() != 9U || validation_confidence_pixels.size() != 3U) return false;
+ const auto generation = scalar(validation_confidence_edits.front(), "d");
+ auto revision = scalar(validation_confidence_edits.front(), "c");
+ if (!generation || !revision) return false;
+ for (std::size_t index = 0U; index < validation_confidence_edits.size(); ++index) {
+  const auto& edit = validation_confidence_edits[index];
+  const auto expected = index < 6U ? 0.437 : index == 7U ? 1.0 : 0.0;
+  const auto current = scalar(edit, "c");
+  if (scalar(edit, "a") != index || std::abs(numeric(edit, "b") - expected) > 0.000001 || scalar(edit, "d") != generation ||
+      (index > 0U && index < 6U && current != revision) || (index >= 6U && current <= revision)) return false;
+  revision = current;
+ }
+ const auto& first = validation_confidence_pixels.front();
+ if (!scalar(first, "clean") || !scalar(first, "detections")) return false;
+ for (std::size_t index = 0U; index < validation_confidence_pixels.size(); ++index) {
+  const auto& pixels = validation_confidence_pixels[index];
+  if (!pixels.value("matched", false) || pixels.value("control", "") != "validate.samples.atlas" || scalar(pixels, "stage") != index + 6U ||
+      numeric(pixels, "threshold") != (index == 1U ? 1.0 : 0.0) || scalar(pixels, "generation") != generation ||
+      scalar(pixels, "clean") != scalar(first, "clean") || scalar(pixels, "detections") != scalar(first, "detections") ||
+      numeric(pixels, "minimum") != numeric(first, "minimum") || numeric(pixels, "maximum") != numeric(first, "maximum") ||
+      !(numeric(pixels, "minimum") >= 0.0 && numeric(pixels, "maximum") < 1.0) ||
+      scalar(pixels, "revision") != scalar(validation_confidence_edits[index + 6U], "c") ||
+      (index == 1U ? scalar(pixels, "different") < 12U : scalar(pixels, "different") != 0U)) return false;
+ }
+ return true;
+}
+bool BrowserAudit::validation_layout_complete() const {
+ for (const auto* label : {"Groundtruth", "Detections", "Display confidence", "Preview only"})
+  if (!validation_text.contains(label)) return false;
+ for (const auto* stage : {"atlas", "narrow"}) {
+  const auto find = [&](const char* control) -> std::optional<Bounds> {
+   const auto found = validation_layout.find({stage, control});
+   if (found == validation_layout.end()) return std::nullopt;
+   const auto& b = found->second;
+   return Bounds{b[0], b[1], b[2], b[3]};
+  };
+  const auto atlas = find("validate.samples.atlas"), gt = find("validate.gt.group"), det = find("validate.pred.group");
+  if (!atlas || !gt || !det || !atlas->valid() || !gt->valid() || !det->valid() || !atlas->contains_horizontally(*gt) || !atlas->contains_horizontally(*det) ||
+      gt->y < atlas->y + atlas->height || det->y < atlas->y + atlas->height) return false;
+  const bool stacked = std::abs(det->x - gt->x) < 1.0 && std::abs(det->y - gt->y - gt->height - 20.0) < 1.0;
+  const bool horizontal = std::abs(det->y - gt->y) < 1.0 && std::abs(det->x - gt->x - gt->width - 20.0) < 1.0;
+  if ((!stacked && !horizontal) || (std::string_view{stage} == "narrow" && !stacked)) return false;
  }
  return true;
 }

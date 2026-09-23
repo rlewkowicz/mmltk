@@ -22,6 +22,7 @@ pub enum Picture {
     Progress,
     Train,
     Validation,
+    Confidence,
     Gallery,
     Detail,
     Compiled,
@@ -37,6 +38,7 @@ impl Picture {
             Self::Progress => "progress",
             Self::Train => "train",
             Self::Validation => "validation",
+            Self::Confidence => "confidence",
             Self::Gallery => "validate-to-explore",
             Self::Detail => "detail",
             Self::Compiled => "compiled",
@@ -54,7 +56,7 @@ impl Picture {
         match self {
             Self::Progress => "train.progress.bar".into(),
             Self::Train | Self::Theme | Self::Narrow => "train.metrics.plot".into(),
-            Self::Validation => crate::view::validate::samples::ATLAS_ID.into(),
+            Self::Validation | Self::Confidence => crate::view::validate::samples::ATLAS_ID.into(),
             Self::Detail => "validate.detail.image".into(),
             Self::Gallery => crate::view::explore::GALLERY_WORKSPACE_ID.into(),
             _ => "workflow.visual.workspace".into(),
@@ -130,6 +132,13 @@ pub(super) enum Step {
     StartValidate,
     Validating,
     NoValidationAspect,
+    ConfidenceEdit(u8),
+    ConfidenceReady(u8),
+    ConfidenceLayer(bool),
+    ConfidenceLayerReady(bool),
+    ConfidenceLayoutResize,
+    ConfidenceLayoutReady,
+    ConfidenceLayoutRestore,
     OpenSample,
     Sample,
     ValidationOriginal,
@@ -186,6 +195,10 @@ pub(super) struct State {
     pixel_attempts: u8,
     progress_epoch: Option<u64>,
     validation_layer: u8,
+    confidence_delivered: bool,
+    confidence_facts: Vec<f64>,
+    confidence_metrics: Option<crate::generated::EvalSummary>,
+    confidence_generation: u64,
     caption_patches: Vec<f64>,
     caption_receipt: Option<super::probe::ProbeReceipt>,
     gallery_tile: Vec<f64>,
@@ -892,6 +905,12 @@ mod tests {
 }
 
 impl State {
+    pub(super) fn confidence_input_delivered(&mut self, driver: &mut Driver, stage: u8, delivered: bool) {
+        if driver.phase != Phase::Workflows(Step::ConfidenceReady(stage)) { return; }
+        if delivered { self.confidence_delivered = true; }
+        else { driver.fail("Validation confidence input was not delivered"); }
+    }
+
     pub(super) fn wheel_delivered(&mut self, driver: &mut Driver) {
         if let Phase::Workflows(Step::ChartWheelPending(index, expanded)) = driver.phase {
             driver.phase = Phase::Workflows(Step::ChartWheelSettle(index, expanded));
@@ -1015,7 +1034,7 @@ impl State {
             }
             ProbeOutcome::Observed(sampled, visible) if sampled > 0 && visible >= 12 => {
                 self.pixel_attempts = 0;
-                if picture != Picture::Gallery {
+                if !matches!(picture, Picture::Gallery | Picture::Confidence) {
                     reporting::emit(|sink| {
                         sink.record(
                             "integration.workflow.pixels",
@@ -1031,6 +1050,8 @@ impl State {
                     });
                 }
                 driver.phase = Phase::Workflows(match picture {
+                    Picture::Confidence if index < 8 => Step::ConfidenceEdit(index + 1),
+                    Picture::Confidence => Step::ConfidenceLayer(true),
                     Picture::Progress => Step::LeaveTrain,
                     Picture::Train => Step::NoImageWorkspace,
                     Picture::Validation if index < 5 => Step::Pixels(picture, index + 1),
@@ -1235,15 +1256,33 @@ impl State {
         let bounds = match step {
             Step::Pixels(Picture::Validation, index) => atlas_cell(bounds, index),
             Step::OpenSample => atlas_cell(bounds, 0),
-            Step::ValidationOriginal | Step::ValidationLayer(..) => Rectangle {
+            Step::ValidationOriginal | Step::ValidationLayer(..) | Step::ConfidenceLayer(_) => Rectangle {
                 width: bounds.width.min(bounds.height),
                 ..bounds
             },
             _ => bounds,
         };
         let input = crate::presentation_surface::physical_bounds(bounds, driver.input_scale);
+        if let Step::ConfidenceEdit(stage) = step {
+            self.confidence_delivered = false;
+            driver.phase = Phase::Workflows(Step::ConfidenceReady(stage));
+            #[cfg(target_arch = "wasm32")]
+            {
+                let Some(mut output) = scenario_output() else { driver.fail("Missing confidence input owner"); return; };
+                output.receipt = None;
+                let callback = wasm_bindgen::closure::Closure::once_into_js(move |delivered: bool| {
+                    output.send(Message::ConfidenceInputDelivered(stage, delivered));
+                });
+                let action = match stage { 3 => 1, 4 => 2, 5 => 3, _ => 0 };
+                let value = match stage { 0 => "0.437", 1 => "", 2 => "2", 7 => "1", _ => "0" };
+                if super::confidence_input_js((input.x + input.width * 0.5) as f64, (input.y + input.height * 0.5) as f64, action, value, &callback) != 1 {
+                    driver.fail("Confidence input bridge refused delivery");
+                }
+            }
+            return;
+        }
         if let Step::Pixels(picture, index) = step {
-            if matches!(picture, Picture::Validation | Picture::Detail | Picture::Gallery)
+            if matches!(picture, Picture::Validation | Picture::Detail | Picture::Confidence | Picture::Gallery)
                 && self.caption_receipt != super::probe::current_receipt(control)
             {
                 return;
@@ -1294,6 +1333,7 @@ impl State {
                     &self.caption_patches,
                     &callback,
                     &self.gallery_tile,
+                    &self.confidence_facts,
                 );
             }
             return;
@@ -1317,6 +1357,7 @@ impl State {
             Step::Validate => Step::StartValidate,
             Step::StartValidate => Step::Validating,
             Step::OpenSample => Step::Sample,
+            Step::ConfidenceLayer(shown) => Step::ConfidenceLayerReady(shown),
             Step::ValidationOriginal => Step::ValidationOriginalReady,
             Step::HideBoxes => Step::HiddenBoxes,
             Step::ValidationLayer(detail, index) => Step::ValidationLayerReady(detail, index),
@@ -1801,6 +1842,60 @@ impl State {
                         0.0,
                     ],
                 );
+                self.confidence_metrics = snapshot.metrics.clone();
+                self.confidence_generation = snapshot.operation.generationfrontier;
+                if settings.draft.as_ref().unwrap().workflows.validate.display.confidencethreshold != 0.4 {
+                    driver.fail("Validation confidence did not start at its default");
+                    return Task::none();
+                }
+                self.workflow_step(driver, Step::ConfidenceEdit(0))
+                    .chain(iced::advanced::widget::operate(ValidationLayout::new("atlas")))
+            }
+            Step::ConfidenceEdit(_) => self.workflow_control(widgets, driver,
+                crate::generated::constraint_workflowsvalidatedisplayconfidencethreshold().stable_field_id.to_string()),
+            Step::ConfidenceReady(stage) if settled && self.confidence_delivered => {
+                let expected = match stage { 0..=5 => 0.437, 7 => 1.0, _ => 0.0 };
+                let Some(native) = model.settings_snapshot.as_ref() else { return Task::none(); };
+                if native.settingsstate.workflows.validate.display.confidencethreshold != expected
+                    || settings.draft.as_ref().unwrap().workflows.validate.display.confidencethreshold != expected {
+                    driver.fail("Validation confidence changed through invalid input or increment interaction");
+                    return Task::none();
+                }
+                let Some(snapshot) = validation else { return Task::none(); };
+                if snapshot.metrics != self.confidence_metrics || snapshot.operation.generationfrontier != self.confidence_generation {
+                    driver.fail("Display confidence changed validation results or restarted inference");
+                    return Task::none();
+                }
+                reporting::emit(|sink| sink.record("integration.validation_confidence_edit", "Display confidence", "native-settled",
+                    [stage as f64, expected as f64, native.revision as f64, snapshot.operation.generationfrontier as f64]));
+                self.workflow_step(driver, match stage {
+                    0..=5 => Step::ConfidenceEdit(stage + 1),
+                    6 => Step::ConfidenceLayer(false),
+                    _ => Step::Pixels(Picture::Confidence, stage),
+                })
+            }
+            Step::ConfidenceLayer(_) if model.validation_navigation_available() =>
+                self.workflow_control(widgets, driver, "validate.gt.layer"),
+            Step::ConfidenceLayerReady(shown) if validation.is_some_and(|snapshot| {
+                snapshot.overlays.groundtruthlayer == shown && snapshot.overlayselection.value == snapshot.overlays
+            }) => self.workflow_step(driver, if shown { Step::ConfidenceLayoutResize } else { Step::Pixels(Picture::Confidence, 6) }),
+            Step::ConfidenceLayoutResize => {
+                driver.phase = Phase::Workflows(Step::ConfidenceLayoutReady);
+                #[cfg(target_arch = "wasm32")]
+                if !super::canvas_size_js(1200.0, 1000.0) { driver.fail("Cannot resize validation for narrow controls"); }
+                Task::none()
+            }
+            Step::ConfidenceLayoutReady => {
+                #[cfg(target_arch = "wasm32")]
+                if !super::canvas_size_settled_js(1200.0, 1000.0) || model.window_width != 1200 || model.window_height != 1000 {
+                    return Task::none();
+                }
+                driver.phase = Phase::Workflows(Step::ConfidenceLayoutRestore);
+                iced::advanced::widget::operate(ValidationLayout::new("narrow"))
+            }
+            Step::ConfidenceLayoutRestore => {
+                #[cfg(target_arch = "wasm32")]
+                super::restore_canvas_size_js();
                 self.workflow_step(driver, Step::NoValidationAspect)
             }
             Step::OpenSample if model.validation_navigation_available() => {
@@ -2163,6 +2258,7 @@ impl State {
                 self.caption_patches.clear();
                 self.caption_receipt = None;
                 self.gallery_tile.clear();
+                self.confidence_facts.clear();
                 if picture.chart() || picture == Picture::Progress {
                     self.pixel_source = 0;
                     self.pixel_presentation = 0;
@@ -2170,17 +2266,19 @@ impl State {
                     let Some(surface) = surface else {
                         return Task::none();
                     };
-                    let drawn = if matches!(picture, Picture::Validation | Picture::Detail) {
+                    let drawn = if matches!(picture, Picture::Validation | Picture::Detail | Picture::Confidence) {
                         crate::presentation_surface::drawable_validation(surface)
                             .filter(|(_, content)| {
                                 // Native completion can precede the graphics handoff.
                                 // Measure the view only when its paired image has
                                 // the requested atlas/detail shape and overlay state.
                                 content.metadata.detail == (picture == Picture::Detail)
-                                    && (
+                                    && (picture != Picture::Confidence || (content.metadata.display.confidencethreshold == if index == 7 { 1.0 } else { 0.0 }
+                                        && !content.metadata.overlays.groundtruthlayer && content.metadata.overlays.predictionlayer))
+                                    && (picture == Picture::Confidence || (
                                         content.metadata.overlays.groundtruthlayer,
                                         content.metadata.overlays.predictionlayer,
-                                    ) == layer_selection(self.validation_layer)
+                                    ) == layer_selection(self.validation_layer))
                                     && validation.is_some_and(|snapshot| {
                                         content.metadata.overlays == snapshot.overlays
                                     })
@@ -2192,6 +2290,17 @@ impl State {
                                     super::probe::current_receipt(&picture.control(index))?;
                                 if receipt.surface.frame != surface.frame {
                                     return None;
+                                }
+                                if picture == Picture::Confidence {
+                                    let scores: Vec<_> = content.metadata.samples.iter().filter(|s| s.available)
+                                        .flat_map(|s| &s.labels).filter(|l| !l.groundtruth).map(|l| l.confidence).collect();
+                                    self.confidence_facts.extend([
+                                        content.metadata.display.confidencethreshold as f64, scores.len() as f64,
+                                        scores.iter().copied().fold(f32::INFINITY, f32::min) as f64,
+                                        scores.iter().copied().fold(f32::NEG_INFINITY, f32::max) as f64,
+                                        content.metadata.frame.cleanrevision as f64, self.confidence_generation as f64,
+                                        model.settings_snapshot.as_ref().unwrap().revision as f64,
+                                    ]);
                                 }
                                 validation_caption_patches(
                                     &content,
@@ -2223,5 +2332,35 @@ impl State {
             }
             _ => Task::none(),
         }
+    }
+}
+
+struct ValidationLayout {
+    stage: &'static str,
+    bounds: std::collections::BTreeMap<String, Rectangle>,
+    labels: std::collections::BTreeSet<String>,
+}
+impl ValidationLayout {
+    fn new(stage: &'static str) -> Self { Self { stage, bounds: Default::default(), labels: Default::default() } }
+}
+impl iced::advanced::widget::Operation<RootMessage> for ValidationLayout {
+    fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn iced::advanced::widget::Operation<RootMessage>)) { operate(self); }
+    fn container(&mut self, id: Option<&iced::advanced::widget::Id>, bounds: Rectangle) {
+        for control in ["validate.samples.atlas", "validate.gt.group", "validate.pred.group"] {
+            if id == Some(&iced::advanced::widget::Id::from(control)) { self.bounds.insert(control.to_owned(), bounds); }
+        }
+    }
+    fn text(&mut self, _id: Option<&iced::advanced::widget::Id>, _bounds: Rectangle, text: &str) {
+        if ["Groundtruth", "Detections", "Display confidence", "Preview only"].contains(&text) { self.labels.insert(text.to_owned()); }
+    }
+    fn finish(&self) -> iced::advanced::widget::operation::Outcome<RootMessage> {
+        for (control, bounds) in &self.bounds {
+            reporting::emit(|sink| sink.record("integration.validation_layout", control, self.stage,
+                [bounds.x as f64, bounds.y as f64, bounds.width as f64, bounds.height as f64]));
+        }
+        for label in &self.labels {
+            reporting::emit(|sink| sink.record("integration.validation_text", label, self.stage, [1.0, 0.0, 0.0, 0.0]));
+        }
+        iced::advanced::widget::operation::Outcome::None
     }
 }

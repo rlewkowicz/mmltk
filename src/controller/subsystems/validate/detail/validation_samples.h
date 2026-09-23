@@ -20,6 +20,7 @@ public:
  void Select(ValidationSampleIdentity);
  void CloseDetail();
  void SetOverlays(ValidationOverlays);
+ void SetDisplay(contracts::ValidationDisplaySettings);
  [[nodiscard]] ValidationSnapshot snapshot() const;
  [[nodiscard]] std::optional<ValidationImageMetadata> ImageSnapshot(const VisualFrame&) const;
  [[nodiscard]] mmltk::frameworks::gpu::BorrowedImageProductReadView BorrowFrame() const;

@@ -1824,3 +1824,33 @@ TEST_CASE("benchmark selections persist as one canonical nested value and reject
   }
  }
 }
+
+TEST_CASE("validation display confidence has exact independent persisted settings", "[gui][settings][validation]") {
+ auto state = default_gui_settings_state();
+ CHECK(state.workflows.validate.display.confidence_threshold == 0.4F);
+ const auto request = snapshot_gui_settings(state)["workflows"]["validate"]["validation"];
+ for (const double threshold : {0.0, 1.0, 0.437}) {
+  const std::array edits{SettingsValueUpdate{.path = "workflows.validate.display.confidence_threshold", .value = mmltk::frameworks::serialization::wire::FlatValue{threshold}}};
+  REQUIRE(apply_gui_settings_values(state, edits));
+  CHECK(state.workflows.validate.display.confidence_threshold == static_cast<float>(threshold));
+  const auto stored = snapshot_gui_settings(state);
+  CHECK(stored["workflows"]["validate"]["validation"] == request);
+  CHECK(stored["workflows"]["validate"]["display"]["confidence_threshold"].get<float>() == static_cast<float>(threshold));
+  auto restored = default_gui_settings_state();
+  apply_gui_settings(stored, restored);
+  CHECK(restored.workflows.validate.display == state.workflows.validate.display);
+  const nlohmann::json flat = state.workflows.validate;
+  CHECK(flat.get<ValidateViewState>().display == state.workflows.validate.display);
+ }
+ const auto accepted = snapshot_gui_settings(state);
+ for (const double invalid : {-0.01, 1.01, std::numeric_limits<double>::infinity(), std::numeric_limits<double>::quiet_NaN()}) {
+  const std::array edits{SettingsValueUpdate{.path = "workflows.validate.display.confidence_threshold", .value = mmltk::frameworks::serialization::wire::FlatValue{invalid}}};
+  CHECK_FALSE(apply_gui_settings_values(state, edits));
+  CHECK(snapshot_gui_settings(state) == accepted);
+ }
+ auto legacy = accepted;
+ legacy["workflows"]["validate"].erase("display");
+ auto restored = default_gui_settings_state();
+ apply_gui_settings(legacy, restored);
+ CHECK(restored.workflows.validate.display.confidence_threshold == 0.4F);
+}

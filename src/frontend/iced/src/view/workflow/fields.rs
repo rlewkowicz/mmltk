@@ -106,6 +106,20 @@ pub fn number_f32<'a, Message: Clone + 'a>(
     enabled: bool,
     on_input: impl Fn(f32) -> Message + Copy + 'a,
 ) -> Element<'a, Message> {
+    number_f32_input(label, value, constraint, enabled, false, on_input)
+}
+
+pub fn decimal_f32<'a, Message: Clone + 'a>(
+    label: &'static str, value: f32, constraint: crate::generated::SettingsLeafConstraint,
+    enabled: bool, on_input: impl Fn(f32) -> Message + Copy + 'a,
+) -> Element<'a, Message> {
+    number_f32_input(label, value, constraint, enabled, true, on_input)
+}
+
+fn number_f32_input<'a, Message: Clone + 'a>(
+    label: &'static str, value: f32, constraint: crate::generated::SettingsLeafConstraint,
+    enabled: bool, typed_only: bool, on_input: impl Fn(f32) -> Message + Copy + 'a,
+) -> Element<'a, Message> {
     let stable_field_id = constraint.stable_field_id;
     let minimum = constraint.minimum.map_or(f32::MIN, |value| value as f32);
     let maximum = constraint.maximum.map_or(f32::MAX, |value| value as f32);
@@ -114,6 +128,7 @@ pub fn number_f32<'a, Message: Clone + 'a>(
         iced_aw::number_input(&value, minimum..=maximum, on_input)
             .id(stable_field_id.to_string())
             .step(0.01)
+            .typed_only(typed_only)
             .ignore_scroll(true)
             .ignore_buttons(true)
             .on_input_maybe(enabled.then_some(on_input))

@@ -59,6 +59,7 @@ public:
  [[= contracts::reflection::direct::IntentEndpoint{}]] [[nodiscard]] contracts::SettingsUiState Reset(contracts::SettingsResetRequest);
  [[nodiscard]] services::SettingsMutationResult Retry();
  [[= contracts::reflection::Snapshot{contracts::kSettingsUiStateByteBudget}]] [[nodiscard]] contracts::SettingsUiState snapshot() const;
+ [[nodiscard]] contracts::ValidationDisplaySettings validation_display_settings() const;
  void require_loaded() const;
  [[nodiscard]] contracts::SettingsMaterializationFacts materialization_facts() const;
  [[nodiscard]] contracts::ProviderPreferences provider_preferences() const;

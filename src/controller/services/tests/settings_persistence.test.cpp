@@ -45,6 +45,18 @@ private:
  std::shared_ptr<mmltk::testsupport::StopGate> gate_;
  bool fail_ = false;
 };
+TEST_CASE("accepted display confidence survives Settings reconstruction", "[controller][systems][settings]") {
+ const auto root = mmltk::testsupport::make_temp_root("validation-display-settings");
+ SettingsSystem settings;
+ REQUIRE(settings.Load(install_settings(root)).applied());
+ CHECK(settings.validation_display_settings().confidence_threshold == 0.4F);
+ contracts::SettingsUpdateRequest edit;
+ edit.updates.push_back({.path = "workflows.validate.display.confidence_threshold", .value = mmltk::frameworks::serialization::wire::FlatValue{0.437}});
+ static_cast<void>(settings.Update(std::move(edit)));
+ SettingsSystem restored;
+ REQUIRE(restored.Load(services::SettingsLocation{(root / "settings.json").string()}).applied());
+ CHECK(restored.validation_display_settings().confidence_threshold == 0.437F);
+}
 TEST_CASE("ordinary settings and file dialog expose direct state, Busy, Stop, and reconstruction", "[controller][systems][services]") {
  const auto root = mmltk::testsupport::make_temp_root("ordinary-services");
  std::size_t settings_events = 0U;

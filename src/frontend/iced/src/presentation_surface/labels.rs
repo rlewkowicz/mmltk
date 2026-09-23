@@ -173,6 +173,9 @@ impl ValidationContent {
                 && (!metadata.detail || metadata.selected.as_ref() == Some(&sample.identity))
         }) {
             for (label_index, label) in sample.labels.iter().enumerate() {
+                if !label.groundtruth && !(label.confidence >= metadata.display.confidencethreshold) {
+                    continue;
+                }
                 let mut bounds = label.box_.clone();
                 for point in [&mut bounds.first, &mut bounds.second] {
                     point.x = sample.crop.x as f32
@@ -675,6 +678,21 @@ mod tests {
                     Color::WHITE
                 }
             );
+        }
+    }
+
+    #[test]
+    fn validation_confidence_uses_paired_settings_inclusively_and_retains_raw_labels() {
+        let original = crate::view_model::test_support::validation_image_metadata();
+        for threshold in [0.0, 0.4, 0.75, 1.0, 0.437, 0.0] {
+            let mut metadata = original.clone();
+            metadata.display.confidencethreshold = threshold;
+            let expected = metadata.samples.iter().filter(|s| s.available).flat_map(|s| &s.labels)
+                .filter(|label| !label.groundtruth && label.confidence >= threshold).count();
+            let content = ValidationContent::new(metadata);
+            assert_eq!(content.labels[1].len(), expected);
+            assert_eq!(content.labels[0].len(), 1);
+            assert_eq!(content.metadata.samples, original.samples);
         }
     }
 

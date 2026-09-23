@@ -27,13 +27,14 @@ TEST_CASE("validation adds completed layers once with unchanged alpha and ordina
   std::array<std::uint8_t, 6> colors{70, 80, 90, 10, 20, 30};
   std::array<int, 2> labels{0, 1};
   std::array<bool, 8> masks{true, true, false, true, true, true, false, true};
+  std::array<float, 2> confidences{0.437F, 0.4F};
   std::int64_t count = 2;
  } input;
  Input* device = nullptr;
  REQUIRE(cudaMalloc(reinterpret_cast<void**>(&device), sizeof(Input)) == cudaSuccess);
  auto release = [](Input* value) { static_cast<void>(cudaFree(value)); };
  std::unique_ptr<Input, decltype(release)> storage(device, release);
- const auto draw = [&](bool add, bool device_count = false) {
+ const auto draw = [&](bool add, bool device_count = false, const float* threshold = nullptr) {
   REQUIRE(cudaMemcpyAsync(device, &input, sizeof(input), cudaMemcpyHostToDevice, stream.get()) == cudaSuccess);
   REQUIRE(raster::raster_instance_overlay_rgba({.overlay = {reinterpret_cast<std::uint8_t*>(device), 16U, 4, 1},
            .instances = {reinterpret_cast<const float*>(reinterpret_cast<std::uint8_t*>(device) + offsetof(Input, boxes)), reinterpret_cast<const std::uint8_t*>(device) + offsetof(Input, colors),
@@ -44,7 +45,9 @@ TEST_CASE("validation adds completed layers once with unchanged alpha and ordina
            .box_thickness = 0,
            .stream = {stream.get()},
            .labels = false,
-           .add_rgb_to_existing = add}) == cudaSuccess);
+           .add_rgb_to_existing = add,
+           .confidences = threshold ? reinterpret_cast<const float*>(reinterpret_cast<std::uint8_t*>(device) + offsetof(Input, confidences)) : nullptr,
+           .confidence_threshold = threshold ? *threshold : 0.0F}) == cudaSuccess);
   std::array<std::uint8_t, 16> output{};
   REQUIRE(cudaMemcpyAsync(output.data(), device, output.size(), cudaMemcpyDeviceToHost, stream.get()) == cudaSuccess);
   REQUIRE(cudaStreamSynchronize(stream.get()) == cudaSuccess);
@@ -53,6 +56,13 @@ TEST_CASE("validation adds completed layers once with unchanged alpha and ordina
  CHECK(raster::raster_instance_overlay_rgba({}) == cudaSuccess);  // Empty static count preserves its no-op contract.
  CHECK(draw(true) == std::array<std::uint8_t, 16>{255, 255, 255, 96, 255, 60, 40, 177, 3, 4, 5, 81, 10, 20, 30, 96});
  CHECK(draw(false) == std::array<std::uint8_t, 16>{10, 20, 30, 96, 10, 20, 30, 96, 0, 0, 0, 0, 10, 20, 30, 96});
+ for (const float threshold : {0.0F, 0.4F, 0.437F, 1.0F, 0.0F}) {
+  const auto output = draw(false, false, &threshold);
+  const auto expected = threshold <= 0.4F ? std::array<std::uint8_t, 4>{10, 20, 30, 96}
+                       : threshold <= 0.437F ? std::array<std::uint8_t, 4>{70, 80, 90, 96}
+                       : std::array<std::uint8_t, 4>{};
+  CHECK(std::equal(expected.begin(), expected.end(), output.begin()));
+ }
  input.count = 1;
  CHECK(draw(false, true) == std::array<std::uint8_t, 16>{70, 80, 90, 96, 70, 80, 90, 96, 0, 0, 0, 0, 70, 80, 90, 96});
  input.count = 0;

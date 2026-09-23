@@ -81,7 +81,7 @@ struct PredictionPreviewFrame::State final {
  gpu::CudaHighWaterAllocation<void*> storage;
  std::size_t capacity = 0U;
  VisualExtent extent;
- std::size_t boxes_offset{}, labels_offset{}, masks_offset{}, colors_offset{};
+ std::size_t boxes_offset{}, confidences_offset{}, labels_offset{}, masks_offset{}, colors_offset{};
  bool masks = false;
  int category_count = 0;
  std::shared_ptr<const mmltk::backend::data::catalog::ClassCatalog> catalog;
@@ -189,7 +189,7 @@ std::shared_ptr<const PredictionPreviewFrame> PredictionPreviewPool::Capture(con
   if (category >= 0 && static_cast<std::size_t>(category) < catalog->size() && catalog->names()[category].size() > mmltk::frameworks::reflection::kMaximumNameBytes)
    throw std::invalid_argument("prediction label exceeds the visual name capacity");
  }
- if (count && (annotations.count.value() != count || (annotations.masks_available && !annotations.masks.address))) throw std::invalid_argument("prediction annotations disagree with produced values");
+ if (count && (annotations.count.value() != count || !annotations.confidences.address || annotations.confidences.capacity_bytes < count * sizeof(float) || (annotations.masks_available && !annotations.masks.address))) throw std::invalid_argument("prediction annotations disagree with produced values");
  const auto pixel_count = rfdetr::checked_prediction_extent(extent.width, extent.height, rfdetr::kMaximumEncodedMaskPixels);
  const auto pixel_bytes = rfdetr::checked_prediction_extent(pixel_count, 3U * sizeof(float), rfdetr::kMaximumPredictionTensorBytes);
  const auto mask_bytes = annotations.masks_available && annotations.masks.address && count ? rfdetr::checked_prediction_extent(pixel_count, count, rfdetr::kMaximumPredictionTensorBytes) : 0U;
@@ -199,7 +199,7 @@ std::shared_ptr<const PredictionPreviewFrame> PredictionPreviewPool::Capture(con
   if (gt.mask.runs.size() > rfdetr::kMaximumPredictionMaskRuns - ground_truth_words / 2U) throw std::invalid_argument("preview ground truth RLE exceeds capacity");
   ground_truth_words += gt.mask.runs.size() * 2U;
  }
- const auto raw_bytes = pixel_bytes + count * (4U * sizeof(float) + sizeof(std::int32_t) + 3U) + mask_bytes;
+ const auto raw_bytes = pixel_bytes + count * (5U * sizeof(float) + sizeof(std::int32_t) + 3U) + mask_bytes;
  const auto admitted_ground_truth_offset = (raw_bytes + 3U) & ~std::size_t{3U};
  const auto admitted_scratch_offset = admitted_ground_truth_offset + ground_truth_words * sizeof(std::uint32_t);
  const auto admitted_bytes = admitted_scratch_offset + (composition ? pixel_count * 8U : 0U);
@@ -251,7 +251,8 @@ std::shared_ptr<const PredictionPreviewFrame> PredictionPreviewPool::Capture(con
    state.placement = execution_.placement;
    state.extent = extent;
    state.boxes_offset = boxes_offset;
-   state.labels_offset = state.boxes_offset + count * 4U * sizeof(float);
+   state.confidences_offset = state.boxes_offset + count * 4U * sizeof(float);
+   state.labels_offset = state.confidences_offset + count * sizeof(float);
    state.masks_offset = state.labels_offset + count * sizeof(std::int32_t);
    state.colors_offset = state.masks_offset + mask_bytes;
    state.masks = mask_bytes != 0U;
@@ -302,6 +303,7 @@ std::shared_ptr<const PredictionPreviewFrame> PredictionPreviewPool::Capture(con
      if (pixels) copy(destination, pixels, pixel_bytes);
      if (count) {
       copy(destination + state.boxes_offset, reinterpret_cast<const void*>(annotations.boxes_xyxy.address), count * 4U * sizeof(float));
+      copy(destination + state.confidences_offset, reinterpret_cast<const void*>(annotations.confidences.address), count * sizeof(float));
       copy(destination + state.labels_offset, reinterpret_cast<const void*>(annotations.class_references.address), count * sizeof(std::int32_t));
       if (mask_bytes) copy(destination + state.masks_offset, reinterpret_cast<const void*>(annotations.masks.address), mask_bytes);
      }
@@ -446,7 +448,7 @@ void PredictionPreviewComposition::Draw(
     }
     if (write_clean || write_semantic)
      region.frame->DrawRegion(runtime, plane_region(clean, region.crop), plane_region(semantic, region.crop), stream, overlays.prediction_boxes, overlays.prediction_masks, overlays.ground_truth_boxes,
-      overlays.ground_truth_masks, overlays.complementary_layers, write_clean, write_semantic);
+      overlays.ground_truth_masks, overlays.complementary_layers, write_clean, write_semantic, overlays.confidence_threshold);
     if (allocation) staged.cells[index] = {region.frame, region.frame->state_->capture, region.crop, overlays, true, true};
    }
   });
@@ -487,7 +489,7 @@ void PredictionPreviewComposition::Draw(
  }
 }
 void PredictionPreviewFrame::DrawRegion(gpu::SystemImageRuntime& runtime, gpu::ImagePlaneView clean, gpu::ImagePlaneView semantic, std::uintptr_t stream, bool prediction_boxes, bool prediction_masks,
- bool ground_truth_boxes, bool ground_truth_masks, bool complementary_layers, bool write_clean, bool write_semantic) const {
+ bool ground_truth_boxes, bool ground_truth_masks, bool complementary_layers, bool write_clean, bool write_semantic, std::optional<float> confidence_threshold) const {
  if (!CompatibleWith(runtime)) throw std::runtime_error("Preview belongs to a retired visual context");
  auto& state = *state_;
  std::lock_guard state_lock(state.mutex);
@@ -525,7 +527,7 @@ void PredictionPreviewFrame::DrawRegion(gpu::SystemImageRuntime& runtime, gpu::I
     checked(static_cast<cudaError_t>(converted));
     if (scale) state.pending.clean = true;
    }
-   const PredictionPreviewComposition::Options semantic_options{prediction_boxes, prediction_masks, ground_truth_boxes, ground_truth_masks, complementary_layers};
+   const PredictionPreviewComposition::Options semantic_options{prediction_boxes, prediction_masks, ground_truth_boxes, ground_truth_masks, complementary_layers, false, confidence_threshold};
    if (write_semantic && (!scale || !state.prepared.semantic || state.prepared.options != semantic_options)) {
     if (scale) state.prepared.semantic = false;
     checked(state.clear_semantic(semantic_pixels, semantic_pitch, 0, pitch, state.extent.height, cuda_stream));
@@ -544,7 +546,9 @@ void PredictionPreviewFrame::DrawRegion(gpu::SystemImageRuntime& runtime, gpu::I
        .box_thickness = prediction_boxes ? 2 : 0,
        .stream = {reinterpret_cast<void*>(stream)},
        .labels = !state.composition,
-       .add_rgb_to_existing = complementary_layers && !state.ground_truth.empty() && (ground_truth_boxes || ground_truth_masks)})));
+       .add_rgb_to_existing = complementary_layers && !state.ground_truth.empty() && (ground_truth_boxes || ground_truth_masks),
+       .confidences = confidence_threshold ? reinterpret_cast<const float*>(data + state.confidences_offset) : nullptr,
+       .confidence_threshold = confidence_threshold.value_or(0.0F)})));
      }
     };
     if (!complementary_layers) draw_prediction();

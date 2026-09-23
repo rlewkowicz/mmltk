@@ -164,9 +164,10 @@ __device__ void apply_box_color<raster_math::RgbaPixelU8>(raster_math::RgbaPixel
  pixel.a = 255U;
 }
 template <typename PixelT>
-__device__ void apply_boxes_and_labels(int x, int y, const float* boxes, const uint8_t* colors, const int* labels, int num_instances, int box_thickness, PixelT& pixel, bool labels_enabled = true) {
+__device__ void apply_boxes_and_labels(int x, int y, const float* boxes, const uint8_t* colors, const int* labels, int num_instances, int box_thickness, PixelT& pixel, bool labels_enabled = true, const float* confidences = nullptr, float confidence_threshold = 0.0F) {
  if (box_thickness <= 0 && !labels_enabled) return;
  for (int i = num_instances; i-- > 0;) {
+  if (confidences && !(confidences[i] >= confidence_threshold)) continue;
   const int x1 = static_cast<int>(boxes[i * 4 + 0]);
   const int y1 = static_cast<int>(boxes[i * 4 + 1]);
   const int x2 = static_cast<int>(boxes[i * 4 + 2]);
@@ -249,13 +250,14 @@ __global__ void draw_analysis_overlay_rgba_pitched_kernel(const draw_launch::Ana
  raster_math::RgbaPixelU8 pixel{};
  if (instances.masks != nullptr) {
   for (int i = count; i-- > 0;) {
+   if (launch.confidences && !(launch.confidences[i] >= launch.confidence_threshold)) continue;
    if (!instances.masks[i * overlay.width * overlay.height + y * overlay.width + x]) { continue; }
    raster_math::apply_rgb(&pixel.r, &pixel.g, &pixel.b, instances.colors, i * 3);
    pixel.a = launch.mask_alpha;
    break;
   }
  }
- apply_boxes_and_labels(x, y, instances.boxes, instances.colors, instances.labels, count, launch.box_thickness, pixel, launch.labels);
+ apply_boxes_and_labels(x, y, instances.boxes, instances.colors, instances.labels, count, launch.box_thickness, pixel, launch.labels, launch.confidences, launch.confidence_threshold);
  if (launch.add_rgb_to_existing) {
   const auto existing = raster_math::load_rgba_pixel(overlay.pixels, overlay.pitch_bytes, x, y);
   pixel = raster_math::add_layer_rgb(existing, pixel);

@@ -22,6 +22,7 @@
 #include "src/backend/models/rfdetr/contract/preset_catalog.h"
 #include "src/backend/models/rfdetr/contract/workflow_requests.h"
 #include "src/controller/contracts/explore_filter.h"
+#include "src/controller/contracts/validation_display.h"
 #include "src/controller/contracts/annotation.h"
 #include "src/controller/contracts/model_selection_types.h"
 #include "src/controller/contracts/workflows.h"
@@ -174,6 +175,7 @@ struct ValidateViewState {
   request.resolution = kDefaultModelResolution;
  }
  mmltk::backend::models::rfdetr::ValidateRequest request;
+ ValidationDisplaySettings display{};
  ModelSelectionSource model_source = ModelSelectionSource::Canonical;
  ModelArtifactInputKind model_input = ModelArtifactInputKind::Weights;
 };

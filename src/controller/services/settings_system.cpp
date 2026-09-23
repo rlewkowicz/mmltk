@@ -268,6 +268,10 @@ contracts::SettingsUiState SettingsSystem::snapshot() const {
  result.explore_source = contracts::resolve_explore_source(result.settings_state);
  return result;
 }
+contracts::ValidationDisplaySettings SettingsSystem::validation_display_settings() const {
+ std::scoped_lock lock(mutex_);
+ return state_.settings_state.workflows.validate.display;
+}
 void SettingsSystem::require_loaded() const {
  std::scoped_lock lock(mutex_);
  if (!loaded_) throw contracts::UnavailableError("settings are not loaded");

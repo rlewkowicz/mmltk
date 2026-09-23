@@ -635,6 +635,8 @@ void WaylandSession::RunWorkflows() {
                             "chart_wheel_expanded_3", "chart_wheel_expanded_4", "chart_wheel_expanded_5"}));
  CHECK((workflow_pixels_ == std::set<std::string>{"progress", "train", "validation", "validate-to-explore", "detail", "compiled", "image", "video", "stop", "theme", "narrow"}));
  CHECK(browser.validate_to_explore_pixels);
+ CHECK(browser.validation_confidence_complete());
+ CHECK(browser.validation_layout_complete());
  CHECK(browser.primary_phase_progress.contains("train.primary:light"));
  CHECK(browser.primary_phase_progress.contains("validate.primary:light"));
  CHECK(browser.primary_phase_progress.contains("predict.primary:light"));

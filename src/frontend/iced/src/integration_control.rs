@@ -174,6 +174,7 @@ pub enum Message {
         token: u32,
         bounds: [Rectangle; 3],
     },
+    ConfidenceInputDelivered(u8, bool),
     WorkflowPixels {
         picture: workflows::Picture,
         index: u8,
@@ -396,6 +397,7 @@ extern "C" {
         caption_patches: &[f64],
         completed: &wasm_bindgen::JsValue,
         gallery_tile: &[f64],
+        confidence: &[f64],
     );
     #[wasm_bindgen::prelude::wasm_bindgen(js_name = mmltkIntegrationClickAfterSurfaceDraw)]
     fn click_after_surface_draw_js(
@@ -426,6 +428,8 @@ extern "C" {
     fn slider_drag_js(x: f64, y: f64, width: f64, height: f64) -> u32;
     #[wasm_bindgen::prelude::wasm_bindgen(js_name = mmltkIntegrationReplaceNumber)]
     fn replace_number_js(x: f64, y: f64, value: &str, selection_length: u32) -> u32;
+    #[wasm_bindgen::prelude::wasm_bindgen(js_name = mmltkIntegrationConfidenceInput)]
+    fn confidence_input_js(x: f64, y: f64, action: u8, value: &str, completed: &wasm_bindgen::JsValue) -> u32;
     #[wasm_bindgen::prelude::wasm_bindgen(js_name = mmltkIntegrationPasteNumber)]
     fn paste_number_js(x: f64, y: f64, completed: &wasm_bindgen::JsValue) -> u32;
     #[wasm_bindgen::prelude::wasm_bindgen(js_name = mmltkIntegrationCancelNumberEdit)]
@@ -1684,6 +1688,10 @@ impl Controller {
                     self.workflows
                         .primary_action_pixels(&self.driver, &control, active);
                 }
+                return None;
+            }
+            Message::ConfidenceInputDelivered(stage, delivered) => {
+                self.workflows.confidence_input_delivered(&mut self.driver, stage, delivered);
                 return None;
             }
             Message::WorkflowPixels {

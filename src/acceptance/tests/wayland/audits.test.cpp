@@ -43,6 +43,45 @@ TEST_CASE("Validate to Explore requires real gallery pixel evidence", "[workspac
  CHECK(audit.validate_to_explore_pixels == (std::string_view{defect} == "none"));
 }
 
+TEST_CASE("display confidence audit requires exact edits and reversible paired pixels", "[workspace][audit][validation]") {
+ BrowserAudit audit;
+ for (unsigned stage = 0U; stage < 9U; ++stage) {
+  const double value = stage < 6U ? 0.437 : stage == 7U ? 1.0 : 0.0;
+  const unsigned revision = stage < 6U ? 2U : stage - 3U;
+  audit.consume({{"event", "integration.validation_confidence_edit"}, {"a", stage}, {"b", value}, {"c", revision}, {"d", 1U}});
+  if (stage >= 6U) audit.consume({{"event", "integration.validation_confidence_pixels"}, {"control", "validate.samples.atlas"},
+   {"stage", stage}, {"threshold", value}, {"detections", 300U}, {"minimum", 0.01}, {"maximum", 0.25}, {"clean", 8U},
+   {"generation", 1U}, {"revision", revision}, {"different", stage == 7U ? 50U : 0U}, {"matched", true}});
+ }
+ REQUIRE(audit.validation_confidence_complete());
+ SECTION("rounded value") { audit.validation_confidence_edits[0]["b"] = 0.44; }
+ SECTION("arrow increment") { audit.validation_confidence_edits[3]["b"] = 1.0; }
+ SECTION("extra persistence") { audit.validation_confidence_edits[4]["c"] = 3U; }
+ SECTION("inference restarted") { audit.validation_confidence_pixels[1]["generation"] = 2U; }
+ SECTION("clean regenerated") { audit.validation_confidence_pixels[1]["clean"] = 9U; }
+ SECTION("no removed pixels") { audit.validation_confidence_pixels[1]["different"] = 0U; }
+ SECTION("lower threshold did not restore") { audit.validation_confidence_pixels[2]["different"] = 20U; }
+ SECTION("missing proof") { audit.validation_confidence_pixels.pop_back(); }
+ CHECK_FALSE(audit.validation_confidence_complete());
+}
+
+TEST_CASE("validation controls require rendered names right-preview placement and narrow stacking", "[workspace][audit][validation]") {
+ BrowserAudit audit;
+ for (const char* label : {"Groundtruth", "Detections", "Display confidence", "Preview only"})
+  audit.consume({{"event", "integration.validation_text"}, {"control", label}});
+ for (const char* stage : {"atlas", "narrow"}) {
+  audit.validation_layout[{stage, "validate.samples.atlas"}] = {500, 100, 300, 400};
+  audit.validation_layout[{stage, "validate.gt.group"}] = {500, 510, 250, 47};
+  audit.validation_layout[{stage, "validate.pred.group"}] = {500, 577, 250, 47};
+ }
+ REQUIRE(audit.validation_layout_complete());
+ SECTION("old label") { audit.validation_text.erase("Groundtruth"); }
+ SECTION("left preview") { audit.validation_layout[{"atlas", "validate.gt.group"}][0] = 100; }
+ SECTION("missing spacing") { audit.validation_layout[{"atlas", "validate.pred.group"}][1] = 557; }
+ SECTION("unstacked narrow") { audit.validation_layout[{"narrow", "validate.pred.group"}] = {770, 510, 250, 47}; }
+ CHECK_FALSE(audit.validation_layout_complete());
+}
+
 TEST_CASE("benchmark radio audit requires every real choice, current visibility and settled restoration", "[workspace][audit][benchmark]") {
  const bool baseline_enabled = GENERATE(false, true);
  const unsigned baseline_dataset = GENERATE(0U, 1U);

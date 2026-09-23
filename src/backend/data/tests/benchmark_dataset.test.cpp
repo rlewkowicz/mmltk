@@ -2731,7 +2731,7 @@ TEST_CASE("concurrent tracks preserve unique work through repair and settlement"
  CHECK_FALSE(latest.tracks.acquisition.total_known);
  const auto foreground = latest;
  progress.phase(DatasetCompilePhase::Indexing, 3, 6);
- progress.source_activity(BenchmarkDatasetSource::kCoconut, "Background masks", false);
+ progress.source_activity(BenchmarkDatasetSource::kCoco2017, "Background masks", false);
  CHECK(latest.phase == foreground.phase);
  CHECK(latest.activity == foreground.activity);
  CHECK(latest.completed == foreground.completed);

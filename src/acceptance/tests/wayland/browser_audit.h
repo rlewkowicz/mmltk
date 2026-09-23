@@ -82,6 +82,11 @@ struct AtlasDrawAudit final {
 };
 struct BrowserAudit final {
  bool validate_to_explore_pixels = false;
+ std::vector<nlohmann::json> validation_confidence_edits, validation_confidence_pixels;
+ [[nodiscard]] bool validation_confidence_complete() const;
+ std::map<std::pair<std::string, std::string>, std::array<double, 4>> validation_layout;
+ std::set<std::string> validation_text;
+ [[nodiscard]] bool validation_layout_complete() const;
  AtlasDrawAudit atlas_draws;
  bool owned_atlas_seen = false;
  bool owned_atlas_current = false;

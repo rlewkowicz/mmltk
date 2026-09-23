@@ -15,6 +15,7 @@ pub enum Message {
     Model(crate::view::workflow::model_card::Message),
     // CLEANUP-IGNORE: Validate retains its generated batch-size message before its workspace child message.
     BatchSizeChanged(u64),
+    DisplayConfidenceChanged(f32),
     Samples(samples::Message),
 }
 
@@ -180,7 +181,7 @@ impl Component {
             .as_ref()
             .is_some_and(|(_, content)| content.metadata.detail)
         {
-            iced::widget::space::horizontal().height(47).into()
+            crate::view::image_viewer::control_footprint(self.samples.controls(model)).map(Message::Samples)
         } else {
             self.samples.controls(model).map(Message::Samples)
         };
@@ -191,7 +192,10 @@ impl Component {
                 container(atlas).width(half)
             ]
             .height(center * 9.0 / 16.0),
-            controls,
+            iced::widget::row![
+                iced::widget::space::horizontal().width(half),
+                container(controls).width(half),
+            ],
         ]
         .spacing(crate::view::workflow::SECTION_SPACING)
         .width(center);
@@ -211,7 +215,7 @@ impl Component {
         };
         let advanced = crate::view::shared::card(
             "Advanced",
-            "Validation execution and generated constraints.",
+            "Adjust validation and preview options.",
             column![
                 crate::view::workflow::loading::view(
                     crate::generated::FeatureId::Validate,
@@ -226,6 +230,14 @@ impl Component {
                     settings_edit_available,
                     Message::BatchSizeChanged,
                 ),
+                crate::view::workflow::fields::decimal_f32(
+                    "Display confidence",
+                    draft.map_or(0.4, |value| value.display.confidencethreshold),
+                    crate::generated::constraint_workflowsvalidatedisplayconfidencethreshold(),
+                    settings_edit_available,
+                    Message::DisplayConfidenceChanged,
+                ),
+                text("Preview only").size(12),
                 button("Stop").on_press_maybe(
                     model
                         .compute_stop_available(crate::generated::FeatureId::Validate)
@@ -287,6 +299,11 @@ impl Component {
                 })?,
                 // CLEANUP-IGNORE: Validate closes its local settings outcome before workspace routing.
             ),
+            Message::DisplayConfidenceChanged(value) => Outcome::SettingsEdited(
+                settings.edit(crate::view::settings::EditCadence::Debounced, |draft| {
+                    crate::generated::edit_workflowsvalidatedisplayconfidencethreshold(draft, value)
+                })?,
+            ),
             Message::Samples(message) => {
                 let Some(message) = self.samples.update(message) else {
                     return Ok(None);
@@ -301,6 +318,24 @@ impl Component {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn confidence_edits_keep_exact_values_and_use_the_shared_debounce() {
+        let model = crate::view_model::test_support::bootstrapped();
+        let mut settings = crate::view::settings::SettingsModel::default();
+        settings.install(model.settings_snapshot.as_ref().unwrap());
+        let mut component = Component::default();
+        let mut previous = None;
+        for value in [0.0, 1.0, 0.437] {
+            let Some(Outcome::SettingsEdited(crate::view::settings::EditSchedule::Debounce(generation))) =
+                component.update(&mut settings, Message::DisplayConfidenceChanged(value)).unwrap() else { panic!("shared debounce"); };
+            if let Some(stale) = previous { assert!(!settings.debounce_elapsed(stale)); }
+            assert!(settings.debounce_elapsed(generation));
+            previous = Some(generation);
+            assert_eq!(settings.draft.as_ref().unwrap().workflows.validate.display.confidencethreshold, value);
+        }
+        assert_eq!(settings.take_request().unwrap().updates.len(), 1);
+    }
 
     #[test]
     fn labels_and_fit_are_local_while_sample_selection_keeps_displayed_identity() {

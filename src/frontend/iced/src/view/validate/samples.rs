@@ -122,8 +122,11 @@ impl Component {
         &self,
         model: &crate::view_model::ApplicationModel,
     ) -> Element<'a, Message> {
+        crate::view::image_viewer::control_groups(self.control_groups(model))
+    }
+    fn control_groups<'a>(&self, model: &crate::view_model::ApplicationModel) -> Vec<Element<'a, Message>> {
         let Some(snapshot) = model.workflow.validation.as_ref() else {
-            return text("Waiting for validation").into();
+            return vec![text("Waiting for validation").into()];
         };
         let overlays = snapshot.overlayselection.value.clone();
         let available = model.validation_navigation_available()
@@ -141,7 +144,7 @@ impl Component {
                         "validate.gt.masks",
                         "validate.gt.boxes",
                     ],
-                    "GT labels",
+                    "Groundtruth",
                 )
             } else {
                 (
@@ -154,7 +157,7 @@ impl Component {
                         "validate.pred.masks",
                         "validate.pred.boxes",
                     ],
-                    "Det labels",
+                    "Detections",
                 )
             };
             let full = overlays.clone();
@@ -209,7 +212,10 @@ impl Component {
         };
         let gt: Element<'a, Message> = group(true);
         let pred: Element<'a, Message> = group(false);
-        row![gt, pred].spacing(12).align_y(Center).into()
+        vec![
+            container(gt).id("validate.gt.group").into(),
+            container(pred).id("validate.pred.group").into(),
+        ]
     }
     pub fn atlas<'a>(
         &self,
@@ -320,7 +326,7 @@ impl Component {
             crate::workspace_fps::enabled(settings),
             "validate.detail.image",
         );
-        let source = row![
+        let fit = row![
             container(button("Fit").on_press(Message::Fit)).id("validate.detail.fit"),
             container(
                 checkbox(self.original)
@@ -328,10 +334,12 @@ impl Component {
                     .on_toggle(Message::Original)
             )
             .id("validate.detail.original"),
-            self.controls(model)
         ]
         .spacing(7)
         .align_y(Center);
+        let source = crate::view::image_viewer::control_groups(
+            std::iter::once(fit.into()).chain(self.control_groups(model)),
+        );
         crate::view::image_viewer::panel(
             selected.datasetindex,
             image,
@@ -417,6 +425,44 @@ fn neighbors(
 mod tests {
     use super::*;
     use presentation_surface::SurfaceGestureKind;
+
+    #[test]
+    fn rendered_groups_wrap_with_twenty_pixel_gaps_and_hidden_controls_keep_modal_bounds() {
+        use iced::advanced::{layout, renderer::Headless, widget, Layout};
+        let renderer = iced::futures::executor::block_on(<iced::Renderer as Headless>::new(Default::default(), Some("wgpu"))).unwrap();
+        let component = Component::default();
+        let model = crate::view_model::test_support::bootstrapped();
+        struct Bounds(std::collections::BTreeMap<String, iced::Rectangle>);
+        impl widget::Operation for Bounds {
+            fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn widget::Operation)) { operate(self); }
+            fn container(&mut self, id: Option<&widget::Id>, bounds: iced::Rectangle) {
+                for name in ["validate.gt.group", "validate.pred.group"] {
+                    if id == Some(&widget::Id::from(name)) { self.0.insert(name.to_owned(), bounds); }
+                }
+            }
+        }
+        for width in [600.0, 300.0] {
+            let mut controls = component.controls(&model);
+            let mut tree = widget::Tree::new(&controls);
+            tree.diff(&mut controls);
+            let limits = layout::Limits::new(iced::Size::ZERO, iced::Size::new(width, 1000.0));
+            let node = controls.as_widget_mut().layout(&mut tree, &renderer, &limits);
+            let mut bounds = Bounds(Default::default());
+            controls.as_widget_mut().operate(&mut tree, Layout::new(&node), &renderer, &mut bounds);
+            let gt = bounds.0["validate.gt.group"];
+            let det = bounds.0["validate.pred.group"];
+            if width > 500.0 { assert_eq!(det.x - gt.x - gt.width, 20.0); assert_eq!(det.y, gt.y); }
+            else { assert_eq!(det.y - gt.y - gt.height, 20.0); assert_eq!(det.x, gt.x); }
+            let mut footprint: Element<'_, Message> = crate::view::image_viewer::control_footprint(component.controls(&model));
+            let mut tree = widget::Tree::new(&footprint);
+            tree.diff(&mut footprint);
+            let hidden = footprint.as_widget_mut().layout(&mut tree, &renderer, &limits);
+            assert_eq!(hidden.size(), node.size());
+            let mut hidden_ids = Bounds(Default::default());
+            footprint.as_widget_mut().operate(&mut tree, Layout::new(&hidden), &renderer, &mut hidden_ids);
+            assert!(hidden_ids.0.is_empty());
+        }
+    }
 
     fn source(metadata: &crate::generated::ValidationImageMetadata) -> AtlasSource {
         AtlasSource {

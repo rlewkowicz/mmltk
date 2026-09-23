@@ -88,6 +88,8 @@ struct InstanceOverlayRgbaWork final {
  NativeStream stream{};
  bool labels = true;
  bool add_rgb_to_existing = false;
+ const float* confidences = nullptr;
+ float confidence_threshold = 0.0F;
 };
 struct CompositeRgbaOverBgrWork final {
  MutableBytes base_bgr{};

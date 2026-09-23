@@ -4,6 +4,7 @@
 #include "src/controller/presentation/workspace_input.h"
 #include <algorithm>
 #include <exception>
+#include <cstdio>
 #include <mutex>
 #include <stdexcept>
 #include <utility>
@@ -58,6 +59,7 @@ public:
        previews_(visual.valid()),
        samples_(visual, [this] { Changed(); }) {
   if (!factory_) throw contracts::UnavailableError("compute runtime factory is unavailable");
+  samples_.SetDisplay(settings_.validation_display_settings());
  }
  mmltk::backend::models::rfdetr::ValidationDelivery Delivery(std::uint64_t generation) {
   mmltk::backend::models::rfdetr::ValidationDelivery delivery;
@@ -200,6 +202,11 @@ ValidationSnapshot ValidationSystem::SelectSample(ValidationSampleIdentity ident
 ValidationSnapshot ValidationSystem::CloseDetail() {
  impl_->samples_.CloseDetail();
  return snapshot();
+}
+void ValidationSystem::DisplaySettingsChanged() noexcept {
+ try { impl_->samples_.SetDisplay(impl_->settings_.validation_display_settings()); }
+ catch (const std::exception& error) { std::fprintf(stderr, "Validation display settings failed: %s\n", error.what()); }
+ catch (...) { std::fputs("Validation display settings failed: unknown error\n", stderr); }
 }
 ValidationSnapshot ValidationSystem::SetOverlays(ValidationOverlays overlays) {
  impl_->samples_.SetOverlays(overlays);

@@ -38,6 +38,7 @@ public:
   std::shared_ptr<Set> atlas;
   std::optional<ValidationSampleIdentity> detail;
   ValidationOverlays overlays;
+  contracts::ValidationDisplaySettings display;
  };
  Impl(VisualDeviceSettings visual, std::function<void()> changed, PredictionPreviewPool::TransferOperations transfers)
      : visual_(visual),
@@ -295,6 +296,16 @@ public:
   ++overlay_revision_;
   requested_.overlays = overlays;
  }
+ void SetDisplay(contracts::ValidationDisplaySettings display) {
+  {
+   std::scoped_lock lock(mutex_);
+   if (requested_.display == display && (!dirty_ || image_.display == display)) return;
+   requested_.display = display;
+   if (!requested_.atlas) return;
+   RequestRender();
+  }
+  static_cast<void>(worker_.NotifyContinuation());
+ }
  void SetOverlays(ValidationOverlays overlays) {
   {
    std::scoped_lock lock(mutex_);
@@ -316,6 +327,7 @@ public:
    std::shared_ptr<Set> set;
    std::optional<ValidationSampleIdentity> selected;
    ValidationOverlays overlays;
+   contracts::ValidationDisplaySettings display;
    {
     std::scoped_lock lock(mutex_);
     if (!dirty_ || !render_requested_) return {};
@@ -331,6 +343,7 @@ public:
     if (!set || !render_requested_) return {};
     selected = requested_.detail;
     overlays = requested_.overlays;
+    display = requested_.display;
     *drawing = *set;
     attempt = request_revision_;
     render_requested_ = false;
@@ -343,6 +356,7 @@ public:
    image.detail = selected.has_value();
    image.selected = selected;
    image.overlays = overlays;
+   image.display = display;
    auto clean_revision = drawing->clean_revision;
    if (selected) {
     const auto found = std::ranges::find_if(drawing->samples, [&](const auto& slot) { return slot && slot->raw && slot->metadata.identity == *selected; });
@@ -368,7 +382,7 @@ public:
    }
    PredictionPreviewComposition::Draw(runtime, candidate, extent, std::span(regions).first(region_count),
     {overlays.prediction_layer && overlays.prediction_boxes, overlays.prediction_layer && overlays.prediction_masks, overlays.ground_truth_layer && overlays.ground_truth_boxes,
-     overlays.ground_truth_layer && overlays.ground_truth_masks, true, !selected},
+     overlays.ground_truth_layer && overlays.ground_truth_masks, true, !selected, display.confidence_threshold},
     &preparation_);
    image.frame = visual_frame({PresentationSourceKind::Validation, 1U}, extent, candidate.revision());
    image.frame.content = {0U, 0U, extent.width, extent.height};
@@ -496,6 +510,7 @@ void ValidationSamples::Capture(std::uint64_t generation, rfdetr::ValidationSamp
 void ValidationSamples::Settle(std::uint64_t generation, bool succeeded) { impl_->Settle(generation, succeeded); }
 void ValidationSamples::Select(ValidationSampleIdentity identity) { impl_->Select(identity); }
 void ValidationSamples::CloseDetail() { impl_->CloseDetail(); }
+void ValidationSamples::SetDisplay(contracts::ValidationDisplaySettings display) { impl_->SetDisplay(display); }
 void ValidationSamples::SetOverlays(ValidationOverlays overlays) { impl_->SetOverlays(overlays); }
 ValidationSnapshot ValidationSamples::snapshot() const {
  std::scoped_lock lock(impl_->mutex_);

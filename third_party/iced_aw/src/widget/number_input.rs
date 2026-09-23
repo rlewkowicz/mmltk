@@ -54,6 +54,7 @@ where
     font: Renderer::Font,
     ignore_scroll_events: bool,
     ignore_buttons: bool,
+    typed_only: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -96,6 +97,7 @@ where
             font: Renderer::Font::default(),
             ignore_scroll_events: false,
             ignore_buttons: false,
+            typed_only: false,
         }
     }
 
@@ -285,6 +287,15 @@ where
     #[must_use]
     pub fn step(mut self, step: T) -> Self {
         self.step = step;
+        self
+    }
+
+    #[must_use]
+    /// Retains numeric text editing while disabling buttons, wheel and arrow increments.
+    pub fn typed_only(mut self, enabled: bool) -> Self {
+        self.typed_only = enabled;
+        self.ignore_buttons = enabled;
+        self.ignore_scroll_events = enabled;
         self
     }
 
@@ -682,14 +693,14 @@ where
                                 }
                             }
                             keyboard::Key::Named(keyboard::key::Named::ArrowDown)
-                                if can_decrease && !has_value =>
+                                if can_decrease && !has_value && !self.typed_only =>
                             {
                                 shell.capture_event();
                                 shell.request_redraw();
                                 self.decrease_value(shell);
                             }
                             keyboard::Key::Named(keyboard::key::Named::ArrowUp)
-                                if can_increase && !has_value =>
+                                if can_increase && !has_value && !self.typed_only =>
                             {
                                 shell.capture_event();
                                 shell.request_redraw();
@@ -1366,6 +1377,13 @@ mod tests {
             )
             .is_empty()
         );
+        input = TestNumberInput::new(&value, 0..=100, TestMessage::Changed).typed_only(true).width(200);
+        let node = layout(&mut input, &mut tree);
+        for named in [keyboard::key::Named::ArrowUp, keyboard::key::Named::ArrowDown] {
+            for repeat in [false, true] {
+                assert!(deliver(&mut input, &mut tree, &node, key(named.clone(), None, repeat), Cursor::Unavailable).is_empty());
+            }
+        }
         input = TestNumberInput::new(&value, 42..=42, TestMessage::Changed).width(200);
         let node = layout(&mut input, &mut tree);
         assert!(

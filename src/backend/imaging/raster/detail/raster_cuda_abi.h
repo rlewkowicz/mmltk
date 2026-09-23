@@ -131,6 +131,8 @@ struct AnalysisOverlayRgbaPitchedLaunch {
  cudaStream_t stream = nullptr;
  bool labels = true;
  bool add_rgb_to_existing = false;
+ const float* confidences = nullptr;
+ float confidence_threshold = 0.0F;
 };
 struct CompositeRgbaOverBgrPitchedLaunch {
  MutableSurfaceU8 base_bgr;

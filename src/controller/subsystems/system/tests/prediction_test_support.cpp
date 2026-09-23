@@ -54,16 +54,19 @@ PredictionSource PredictionSource::Device(
  const auto boxes_bytes = detections.size() * 4U * sizeof(float);
  const auto label_bytes = detections.size() * sizeof(std::int32_t);
  if (!masks.empty() && masks.size() != static_cast<std::size_t>(extent.width) * extent.height * detections.size()) throw std::invalid_argument("test mask data does not match its geometry");
- const auto bytes = pixel_bytes + boxes_bytes + label_bytes + masks.size();
+ const auto confidence_bytes = detections.size() * sizeof(float);
+ const auto confidence_offset = pixel_bytes + boxes_bytes + label_bytes;
+ const auto bytes = confidence_offset + confidence_bytes + masks.size();
  if (bytes > rfdetr::kMaximumPredictionTensorBytes) throw std::invalid_argument("test source is too large");
  std::vector<std::byte> packed(bytes);
  std::memcpy(packed.data(), pixels.data(), pixel_bytes);
  for (std::size_t index = 0; index < detections.size(); ++index) {
   std::memcpy(packed.data() + pixel_bytes + index * 4U * sizeof(float), detections[index].bbox_xyxy.data(), 4U * sizeof(float));
+  std::memcpy(packed.data() + confidence_offset + index * sizeof(float), &detections[index].score, sizeof(float));
   const std::int32_t category = detections[index].class_reference;
   std::memcpy(packed.data() + pixel_bytes + boxes_bytes + index * sizeof(category), &category, sizeof(category));
  }
- if (!masks.empty()) std::memcpy(packed.data() + pixel_bytes + boxes_bytes + label_bytes, masks.data(), masks.size());
+ if (!masks.empty()) std::memcpy(packed.data() + confidence_offset + confidence_bytes, masks.data(), masks.size());
  checked(cudaSetDevice(execution.device));
  auto allocation = std::shared_ptr<DeviceAllocation>(new DeviceAllocation(execution), &DeviceAllocation::Release);
  allocation->context.Bind();
@@ -78,8 +81,9 @@ PredictionSource PredictionSource::Device(
  result.annotations_.count.SetKnown(result.detections_.size(), result.annotations_.value_capacity);
  result.annotations_.boxes_xyxy = {.address = address + pixel_bytes, .capacity_bytes = boxes_bytes};
  result.annotations_.class_references = {.address = address + pixel_bytes + boxes_bytes, .capacity_bytes = label_bytes};
+ result.annotations_.confidences = {.address = address + confidence_offset, .capacity_bytes = confidence_bytes};
  result.annotations_.masks_available = !masks.empty();
- if (!masks.empty()) result.annotations_.masks = {.address = address + pixel_bytes + boxes_bytes + label_bytes, .capacity_bytes = masks.size()};
+ if (!masks.empty()) result.annotations_.masks = {.address = address + confidence_offset + confidence_bytes, .capacity_bytes = masks.size()};
  return result;
 }
 PredictionSource PredictionSource::Decoded(VisualExtent extent, std::span<const std::uint8_t> pixels, Catalog classes) {

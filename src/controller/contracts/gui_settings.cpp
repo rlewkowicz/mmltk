@@ -274,6 +274,7 @@ void visit_record_fields(State& state, const Visitor& visit) {
  mmltk::frameworks::reflection::visit_materialized_members<Record>([&]<class Declaration>(const auto& field) { visit(field.member_name.data(), state.*Declaration::pointer); });
 }
 constexpr auto benchmark_selection_fields = [](auto& selection, const auto& fields) { visit_record_fields<mmltk::backend::data::BenchmarkDatasetSelection>(selection, fields); };
+constexpr auto validation_display_fields = [](auto& state, const auto& visit) { visit_record_fields<ValidationDisplaySettings>(state, visit); };
 constexpr auto source_fields = [](auto& state, const auto& visit) { visit_record_fields<SourceSelectionState>(state, visit); };
 constexpr auto train_dataset_fields = [](auto& state, const auto& visit) {
  visit("source_dir", state.dataset_source_dir);
@@ -716,12 +717,14 @@ void convert(JsonWrite<ValidateViewState> value) {
  auto& j = value.json;
  const auto& s = value.state;
  j = snapshot_fields(s.request, validate_flat_fields);
+ JsonFieldWriter{j}.nested("display", s.display, validation_display_fields);
  add_model_selection_json(j, s);
 }
 void convert(JsonRead<ValidateViewState> value) {
  const auto& j = value.json;
  auto& s = value.state;
  validate_flat_fields(s.request, JsonFieldReader{j});
+ JsonFieldReader{j}.nested("display", s.display, validation_display_fields);
  apply_model_selection_json(j, s);
 }
 void convert(JsonWrite<PredictViewState> value) {
@@ -784,6 +787,7 @@ nlohmann::json snapshot_workflows(const GuiSettingsState& settings) {
   nlohmann::json validate_json = snapshot_workflow_artifacts_and_execution(s, validate_model_artifacts_shape(), s.request, validate_execution_fields);
   validate_json[kDatasetPathsKey] = snapshot_fields(s.request, validate_dataset_fields);
   validate_json[kValidationKey] = snapshot_fields(s.request, validation_fields);
+  validate_json["display"] = snapshot_fields(s.display, validation_display_fields);
   j["validate"] = std::move(validate_json);
  }
  {
@@ -830,6 +834,7 @@ void apply_workflows(const nlohmann::json& j, GuiSettingsState& settings) {
  apply_workflow(*workflows_json, &settings.workflows.validate, "validate", [](const nlohmann::json& validate, ValidateViewState& s) {
   apply_dataset_workflow(validate, s, validate_model_artifacts_shape(), s.request, validate_dataset_fields, s.request, validate_execution_fields);
   apply_workflow_section(validate, s.request, kValidationKey, validation_fields);
+  apply_workflow_section(validate, s.display, "display", validation_display_fields);
  });
  apply_workflow(*workflows_json, &settings.workflows.predict, "predict", [](const nlohmann::json& predict, PredictViewState& s) {
   if (const nlohmann::json* source = find_object(predict, "source")) { source_fields(s.source, JsonFieldReader{*source}); }

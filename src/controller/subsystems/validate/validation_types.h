@@ -1,5 +1,6 @@
 #pragma once
 #include <array>
+#include "src/controller/contracts/validation_display.h"
 #include <compare>
 #include <cstdint>
 #include <optional>
@@ -47,6 +48,7 @@ struct ValidationOverlaySelection final {
  bool operator==(const ValidationOverlaySelection&) const = default;
 };
 struct ValidationImageMetadata {
+ contracts::ValidationDisplaySettings display{};
  VisualFrame frame{};
  ValidationOverlays overlays{};
  std::uint64_t content_identity = 0U;

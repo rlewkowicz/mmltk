@@ -31,6 +31,7 @@ public:
  [[= contracts::reflection::direct::IntentEndpoint{}]] [[nodiscard]] mmltk::backend::models::rfdetr::EvaluationDetailPage Details(mmltk::backend::models::rfdetr::EvaluationDetailQuery) const;
  [[= contracts::reflection::direct::InteractionEndpoint{}]] void Input(WorkspaceMouse);
  void SetInputPeer(std::uint64_t);
+ void DisplaySettingsChanged() noexcept;
  void Shutdown() noexcept;
  // CLEANUP-IGNORE: Validation's sealed read API uses shared rendering without sharing another system's state.
  [[= contracts::reflection::Snapshot{64U * 1024U}]] [[nodiscard]] ValidationSnapshot snapshot() const;

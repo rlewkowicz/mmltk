@@ -355,8 +355,8 @@ TEST_CASE("prediction transfer faults settle or retain exact source custody", "[
  PredictionTransferFault fault;
  const auto operations = PredictionTransferFault::Operations();
  auto pool = std::make_unique<controller::detail::PredictionPreviewPool>(execution, context, operations);
- for (int stage : {1, 2, 3, 4}) {
-  fault.Reset({.fail_copy = stage < 4 ? stage : 0, .fail_record = stage == 4});
+ for (int stage : {1, 2, 3, 4, 5}) {
+  fault.Reset({.fail_copy = stage < 5 ? stage : 0, .fail_record = stage == 5});
   CHECK_THROWS_AS(pool->Capture(source, {2, 2}, 0, predictions, annotations, classes, 1, nullptr, custody), std::runtime_error);
   CHECK(fault.settlements == 1);
   CHECK(custody.use_count() == 1);
@@ -512,11 +512,12 @@ TEST_CASE("decoded compact preview retains bytes through retry and release witho
  CHECK_FALSE(lifetime.expired());
  CHECK(fault.uploaded_bytes == rgb.size());
  const auto storage = fault.upload_destination.load();
- REQUIRE(transfer.copies == 3);
+ REQUIRE(transfer.copies == 4);
  CHECK(transfer.destinations[0] == storage + 28U);
  CHECK(transfer.destinations[1] == storage + 44U);
  CHECK(transfer.destinations[2] == storage + 48U);
- CHECK(transfer.copy_bytes == std::array<std::size_t, 4U>{16U, 4U, 9U, 0U});
+ CHECK(transfer.destinations[3] == storage + 52U);
+ CHECK(transfer.copy_bytes == std::array<std::size_t, 4U>{16U, 4U, 4U, 9U});
  CHECK(transfer.destinations[0] % alignof(float) == 0U);
  CHECK(transfer.destinations[1] % alignof(std::int32_t) == 0U);
  const auto staging = fault.upload_staging.load();
@@ -543,7 +544,7 @@ TEST_CASE("decoded compact preview retains bytes through retry and release witho
  }
  CHECK(fault.uploads == 3U);  // RGB failure, RGB retry, and once-only ground truth.
  CHECK(fault.uploaded_bytes == rgb.size() * 2U + 2U * sizeof(std::uint32_t));
- CHECK(fault.upload_destination == storage + 60U);  // 28 + 16 + 4 + 9 + 3, already word-aligned.
+ CHECK(fault.upload_destination == storage + 64U);  // Aligned pixels, boxes, confidence, labels, mask, and colors.
  CHECK(fault.upload_destination.load() % alignof(std::uint32_t) == 0U);
  // Pinned storage may grow for GT, but repeated settled draws never upload again.
  CHECK(staging != 0U);

@@ -121,7 +121,7 @@ std::int32_t raster_instance_overlay_rgba(const InstanceOverlayRgbaWork& work) n
  }
  const MaskBoxLabelInputs launch_instances{work.masks, work.instances.boxes, work.instances.colors, work.instances.labels, work.instances.instance_count, work.instances.device_instance_count};
  return detail::launch_draw_analysis_overlay_rgba_pitched(
-  {as_launch_surface(work.overlay), launch_instances, work.mask_alpha, work.box_thickness, as_stream(work.stream), work.labels, work.add_rgb_to_existing});
+  {as_launch_surface(work.overlay), launch_instances, work.mask_alpha, work.box_thickness, as_stream(work.stream), work.labels, work.add_rgb_to_existing, work.confidences, work.confidence_threshold});
 }
 std::int32_t composite_rgba_over_bgr(const CompositeRgbaOverBgrWork& work) noexcept {
  if (!work.base_bgr.valid(3U) || !work.overlay_rgba.valid(4U) || !same_extent(work.base_bgr.width, work.base_bgr.height, work.overlay_rgba.width, work.overlay_rgba.height) || !work.stream) {

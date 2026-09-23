@@ -48,6 +48,7 @@ ApplicationSystemStorage::ApplicationSystemStorage(ApplicationSystemConfiguratio
  settings_ = std::make_unique<SettingsSystem>([this, publisher = browser::ApplicationEventPublisher<&ApplicationSystems::settings>(events_, continuity_)](SettingsSystem::event_type event) noexcept {
   publisher(event);
   if (explore_) explore_->ExecutionSettingsChanged();
+  if (validation_) validation_->DisplaySettingsChanged();
  });
  const auto initial_settings = settings_->Load(configuration.settings_location, configuration.h2d_dataloader);
  if (!initial_settings.applied()) throw std::runtime_error(initial_settings.detail.empty() ? "initial settings load was not applied" : initial_settings.detail);

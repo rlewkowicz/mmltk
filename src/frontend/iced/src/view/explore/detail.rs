@@ -2,7 +2,7 @@ use crate::fluent_theme::Element;
 use crate::presentation_surface::Surface;
 use crate::view_model::ApplicationModel;
 use iced::Center;
-use iced::widget::{button, checkbox, container, row, space};
+use iced::widget::{button, checkbox, container, row};
 
 #[derive(Debug, Clone)]
 pub enum Message {
@@ -94,7 +94,7 @@ pub(super) fn view<'a>(
                 .as_ref()
                 .map(|request| request.kernel)
         });
-    let source = row![
+    let fit = row![
         container(button("Fit").on_press(Message::FitRequested)).id(super::DETAIL_FIT_ID),
         container(
             checkbox(original)
@@ -102,11 +102,14 @@ pub(super) fn view<'a>(
                 .on_toggle_maybe(available.then_some(Message::DetailSourceSelected))
         )
         .id(super::DETAIL_ORIGINAL_ID),
-        space::horizontal(),
-        super::overlay::view(overlay, available, true).map(Message::Overlay),
+
     ]
     .spacing(7)
     .align_y(Center);
+    let source = crate::view::image_viewer::control_groups([
+        fit.into(),
+        super::overlay::view(overlay, available, true).map(Message::Overlay),
+    ]);
     crate::view::image_viewer::panel(
         selected,
         image,

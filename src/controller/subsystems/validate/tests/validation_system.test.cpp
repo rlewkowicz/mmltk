@@ -123,6 +123,16 @@ TEST_CASE("validation admits asynchronous selected-path inspection and cancels b
  CHECK(constructions == 0U);
  CHECK(observation->compile_calls == 0);
 }
+TEST_CASE("display settings install quietly before any validation atlas or GPU device exists", "[controller][validation]") {
+ std::atomic_size_t notifications = 0U;
+ detail::ValidationSamples samples({}, [&] { ++notifications; });
+ samples.SetDisplay({0.437F});
+ samples.SetDisplay({1.0F});
+ CHECK(samples.snapshot().frame.revision == 0U);
+ CHECK(notifications == 0U);
+ samples.Shutdown();
+ CHECK(notifications == 0U);
+}
 TEST_CASE("validation retains the limited sample atlas and selects detail without a producer", "[controller][gpu][validation]") {
  namespace gpu = mmltk::frameworks::gpu;
  namespace rfdetr = mmltk::backend::models::rfdetr;
@@ -264,10 +274,19 @@ TEST_CASE("validation retains the limited sample atlas and selects detail withou
  CHECK(samples.snapshot().overlay_selection.value == preserved.overlays);
  CHECK(samples.snapshot().overlay_selection.revision > preserved.overlay_selection.revision);
  CHECK(samples.ImageSnapshot(preserved.frame)->overlays == preserved.overlays);
+ {
+  std::scoped_lock lock(mutex);
+  failure_notifications = notifications + 2U;
+ }
+ samples.SetDisplay({0.437F});
+ await_validation(mutex, changed, [&] { return notifications >= failure_notifications; });
+ CHECK(samples.snapshot().frame == preserved.frame);
+ CHECK(samples.ImageSnapshot(preserved.frame)->display.confidence_threshold == 0.4F);
  fault.partial_semantic = false;
  samples.SetOverlays({true, true, true, true});  // Repeating a refused request is an explicit retry.
  await_validation(mutex, changed, [&] { return samples.snapshot().frame.revision > preserved.frame.revision; });
  check_retained_atlas();
+ CHECK(samples.ImageSnapshot(samples.snapshot().frame)->display.confidence_threshold == 0.437F);
  fault.draw_failures_remaining = 1U;
  capture(3U);  // Last capture's ordinary draw failure retries without another producer callback.
  await_validation(mutex, changed, [&] { return samples.snapshot().sample_identities[0].generation == 9U; });
@@ -449,6 +468,7 @@ TEST_CASE("validation composition preserves independent nonempty box and mask pi
  const auto execution = gpu::resolve_device_execution(0, mmltk::common::system::NumaTopology::Capture());
  const bool complementary = GENERATE(false, true);
  const bool same_class = GENERATE(false, true);
+ const auto threshold = GENERATE(0.0F, 0.4F, 0.437F, 0.75F, 1.0F);
  const auto catalog = std::make_shared<const mmltk::backend::data::catalog::ClassCatalog>(std::vector<std::string>{"prediction", "truth"});
  const std::array<float, 12U * 12U * 3U> pixels{};
  std::array<std::uint8_t, 12U * 12U> mask{};
@@ -469,7 +489,8 @@ TEST_CASE("validation composition preserves independent nonempty box and mask pi
  const std::array regions{Composition::Region{frame, {0U, 0U, 12U, 12U}}};
  gpu::SystemImageRuntime runtime({.device = 0, .output_layout = gpu::ImageProductLayout::CleanAndSemantic, .output_buffer_count = 2U, .adopted_context = context});
  for (unsigned flags = 0U; flags < 16U; ++flags) {
-  const Composition::Options options{bool(flags & 1U), bool(flags & 2U), bool(flags & 4U), bool(flags & 8U), complementary};
+  const Composition::Options options{bool(flags & 1U), bool(flags & 2U), bool(flags & 4U), bool(flags & 8U), complementary, false, threshold};
+  const bool prediction_visible = threshold <= prediction.score;
   auto candidate = runtime.AcquireOutput();
   Composition::Draw(runtime, candidate, {12U, 12U}, regions, options);
   auto completed = runtime.CommitOutput(std::move(candidate));
@@ -486,15 +507,15 @@ TEST_CASE("validation composition preserves independent nonempty box and mask pi
   // Disjoint known probes: red prediction, cyan truth, and untouched background.
   // These expected values do not call the production palette or rasterizer.
   const std::array<std::uint8_t, 4U> empty{};
-  CHECK(pixel(1U, 3U) == (options.prediction_boxes ? std::array<std::uint8_t, 4U>{255, 0, 0, 255} : empty));
+  CHECK(pixel(1U, 3U) == (options.prediction_boxes && prediction_visible ? std::array<std::uint8_t, 4U>{255, 0, 0, 255} : empty));
   const bool cyan = same_class == complementary;
   const std::array<std::uint8_t, 4U> truth_mask{static_cast<std::uint8_t>(cyan ? 0 : 255), static_cast<std::uint8_t>(cyan ? 255 : 0), static_cast<std::uint8_t>(cyan ? 255 : 0), 96};
   auto truth_box = truth_mask;
   truth_box[3] = 255;
-  auto overlap = options.prediction_masks ? std::array<std::uint8_t, 4U>{255, 0, 0, 96} : empty;
+  auto overlap = options.prediction_masks && prediction_visible ? std::array<std::uint8_t, 4U>{255, 0, 0, 96} : empty;
   if (options.ground_truth_masks) {
    overlap = truth_mask;
-   if (complementary && options.prediction_masks) overlap[0] = 255;
+   if (complementary && options.prediction_masks && prediction_visible) overlap[0] = 255;
   }
   CHECK(pixel(3U, 3U) == overlap);
   CHECK(pixel(7U, 8U) == (options.ground_truth_boxes ? truth_box : empty));
@@ -568,6 +589,7 @@ TEST_CASE("retained validation preparation follows physical storage and changed 
  CHECK(fault.semantic_writes == unchanged_semantics);
  for (unsigned iteration = 0U; iteration < 6U; ++iteration) {
   options.ground_truth_masks = iteration % 2U == 0U;
+  options.confidence_threshold = iteration % 2U == 0U ? 0.437F : 1.0F;
   draw(6U, options);
   CHECK(fault.draws == 6U);
  }
@@ -626,11 +648,18 @@ TEST_CASE("validation semantic metrics survive optional preview refusal without 
  ApplicationDataFixture fixture{root};
  fixture.PrepareModel(contracts::FeatureId::Validate);
  auto [settings, dataset, model] = fixture.systems();
+ contracts::SettingsUpdateRequest initial_display;
+ initial_display.updates.push_back({.path = "workflows.validate.display.confidence_threshold", .value = mmltk::frameworks::serialization::wire::FlatValue{0.437}});
+ static_cast<void>(settings.Update(std::move(initial_display)));
+ std::mutex display_mutex;
+ std::condition_variable display_changed;
  std::atomic_size_t runs = 0U;
  std::promise<ValidationSnapshot> finished;
  ValidationSystem validation(
   settings, dataset, model, [&] { return std::make_unique<RefusedValidationPreview>(runs); },
   [&](auto event) {
+   std::scoped_lock lock(display_mutex);
+   display_changed.notify_all();
    if (auto* changed = std::get_if<ValidationChanged>(&event);
     changed && !changed->snapshot.operation.active && changed->snapshot.operation.terminal.outcome == contracts::ComputeOperationOutcome::Succeeded) {
     try {
@@ -641,6 +670,9 @@ TEST_CASE("validation semantic metrics survive optional preview refusal without 
   {}, {.device = 0, .maximum_width = 768U, .maximum_height = 512U});
  static_cast<void>(validation.Start({}));
  const auto result = finished.get_future().get();
+ await_validation(display_mutex, display_changed, [&] { return validation.snapshot().frame.revision != 0U; });
+ REQUIRE(validation.ImageSnapshot(validation.snapshot().frame));
+ CHECK(validation.ImageSnapshot(validation.snapshot().frame)->display.confidence_threshold == 0.437F);
  REQUIRE(result.metrics);
  CHECK(result.metrics->bbox.ap == 0.625);
  CHECK(result.operation.terminal.outcome == contracts::ComputeOperationOutcome::Succeeded);
@@ -648,6 +680,15 @@ TEST_CASE("validation semantic metrics survive optional preview refusal without 
  CHECK(std::ranges::none_of(result.sample_available, [](bool available) { return available; }));
  CHECK_THROWS_AS(validation.SelectSample({result.operation.generation_frontier, 3U}), contracts::InvalidIntentError);
  static_cast<void>(validation.CloseDetail());
+ for (const double threshold : {0.0, 1.0, 0.437, 0.4}) {
+  contracts::SettingsUpdateRequest edit;
+  edit.updates.push_back({.path = "workflows.validate.display.confidence_threshold", .value = mmltk::frameworks::serialization::wire::FlatValue{threshold}});
+  static_cast<void>(settings.Update(std::move(edit)));
+  validation.DisplaySettingsChanged();
+  CHECK(validation.snapshot().metrics->bbox.ap == result.metrics->bbox.ap);
+  CHECK(validation.snapshot().operation.terminal.completed == result.operation.terminal.completed);
+  CHECK(runs == 1U);
+ }
  validation.Shutdown();
  CHECK(runs == 1U);
 }
