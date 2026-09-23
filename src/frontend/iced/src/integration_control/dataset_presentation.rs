@@ -158,6 +158,7 @@ pub(super) struct State {
     pub diagnostics: crate::view::diagnostics::Component,
     pub input_pending: bool,
     pub input_original: String,
+    pub input_viewport: Rectangle,
     pub input_selection: Option<BenchmarkDatasetSelection>,
     pub input_expected: String,
     pub pressed: Rectangle,

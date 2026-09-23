@@ -479,27 +479,27 @@ std::string dataset_quantity(const nlohmann::json& facts, bool bytes, bool known
  if (known && complete && completed == total) return format(completed);
  return format(completed) + " / " + (known ? format(total) : "?");
 }
-bool dataset_native_caption(const nlohmann::json& facts, std::string_view id, std::string_view actual) {
+std::optional<std::string> dataset_native_caption(const nlohmann::json& facts, std::string_view id) {
  using namespace mmltk::backend::data;
  if (!facts.is_object() || !facts.contains("generation") || !facts["generation"].is_number_unsigned() || facts["generation"] == 0U || !facts.contains("completed") ||
      !facts["completed"].is_number_unsigned() || !facts.contains("total") || !facts["total"].is_number_unsigned())
-  return false;
+  return std::nullopt;
  if (id == "train.dataset.progress.work") {
-  if (!facts.contains("phase") || !facts["phase"].is_number_unsigned() || facts["phase"] == 0U || facts["phase"] > static_cast<std::uint8_t>(DatasetCompilePhase::Publishing)) return false;
+  if (!facts.contains("phase") || !facts["phase"].is_number_unsigned() || facts["phase"] == 0U || facts["phase"] > static_cast<std::uint8_t>(DatasetCompilePhase::Publishing)) return std::nullopt;
   const auto phase = static_cast<DatasetCompilePhase>(facts["phase"].get<std::uint8_t>());
   std::string label(dataset_compile_phase_label(phase));
   label[0] = static_cast<char>(label[0] - 'a' + 'A');
-  return actual == label + " · " + dataset_quantity(facts, phase == DatasetCompilePhase::Downloading || phase == DatasetCompilePhase::Extracting, facts["total"] != 0U, false);
+  return label + " · " + dataset_quantity(facts, phase == DatasetCompilePhase::Downloading || phase == DatasetCompilePhase::Extracting, facts["total"] != 0U, false);
  }
  if (!facts.contains("activity") || !facts["activity"].is_number_unsigned() || facts["activity"] > static_cast<std::uint8_t>(DatasetCompileActivity::Complete) || !facts.contains("known") ||
      !facts["known"].is_boolean() || !facts.contains("active") || !facts["active"].is_boolean() || !facts.contains("complete") || !facts["complete"].is_boolean() || !facts.contains("invalidated") ||
      !facts["invalidated"].is_number_unsigned())
-  return false;
+  return std::nullopt;
  const bool acquisition = id == "train.dataset.progress.acquisition";
  const std::string label = acquisition ? "Acquisition" : id == "train.dataset.progress.labels" ? "Labels/masks" : "Pixels";
  const auto activity = static_cast<DatasetCompileActivity>(facts["activity"].get<std::uint8_t>());
  const bool known = facts["known"].get<bool>(), active = facts["active"].get<bool>(), complete = facts["complete"].get<bool>();
- if ((active && complete) || (known && facts["completed"] > facts["total"])) return false;
+ if ((active && complete) || (known && facts["completed"] > facts["total"])) return std::nullopt;
  std::string status;
  if (activity == DatasetCompileActivity::Unnecessary)
   status = "No acquisition needed";
@@ -520,7 +520,7 @@ bool dataset_native_caption(const nlohmann::json& facts, std::string_view id, st
  std::string expected = label + "\n" + status + " · " + dataset_quantity(facts, acquisition, known, complete);
  const auto invalidated = facts["invalidated"].get<std::uint64_t>();
  if (invalidated != 0U) expected += " · " + dataset_count(invalidated) + " invalidated by repair";
- return actual == expected;
+ return expected;
 }
 }  // namespace
 void BrowserAudit::audit_dataset_geometry(std::uint64_t key) {
@@ -607,7 +607,7 @@ bool BrowserAudit::dataset_transitions_complete() const {
  for (const bool narrow : {false, true})
   for (const auto* id : {"peers", "recovery", "train.dataset.validation.coconut", "train.dataset.validation.stock", "train.dataset.validation.coconut_stock"})
    if (!dataset_coconut_layouts.contains({narrow, id})) return false;
- if (!dataset_dividers_valid || !dataset_hidden_input || !dataset_drag_edit || !dataset_offscreen_release) return false;
+ if (!dataset_dividers_valid || !dataset_hidden_input || !dataset_reversal || !dataset_drag_edit || !dataset_offscreen_release) return false;
  for (const auto* id : {"train.dataset.benchmark_divider", "train.dataset.dimensions_divider"})
   if (!dataset_divider_pixels.contains({12U, id})) return false;
  for (std::uint64_t index = 0U; index < 12U; ++index) {
@@ -1066,6 +1066,7 @@ auto BrowserAudit::consume(const nlohmann::json& record) -> void {
     record.value("control", ""), std::pair{std::array{numeric(record, "a"), numeric(record, "b"), numeric(record, "c"), numeric(record, "d")}, record.value("detail", "")});
  } else if (event == "integration.dataset_frame") {
   const auto key = scalar(record, "a");
+  dataset_fixture_caption_frame.reset();
   if ((key >= 1U && key <= 12U) || (key >= 20U && key <= 31U) || (key >= 80U && key <= 98U) || (key >= 120U && key <= 126U)) audit_dataset_geometry(key);
   constexpr std::array track_ids{"train.dataset.progress.acquisition", "train.dataset.progress.labels", "train.dataset.progress.pixels"};
   if ((key >= 1U && key <= 12U) || (key >= 20U && key <= 31U) || key == 40U || key == 41U || (key >= 50U && key <= 52U) || key == 80U || key == 81U) {
@@ -1104,16 +1105,18 @@ auto BrowserAudit::consume(const nlohmann::json& record) -> void {
                              adjacent("train.dataset.dimensions_divider", "train.dataset.compile_dimensions");
   } else if (key == 100U && !dataset_native_facts.empty()) {
    bool valid = dataset_native_facts.size() == 4U && active_compile_generation != 0U;
+   bool exposed = true;
    for (const auto* id : {"train.dataset.progress.work", track_ids[0], track_ids[1], track_ids[2]}) {
     const auto row = dataset_draw_rows.find(id);
     const auto facts = dataset_native_facts.find(id);
-    valid = valid && row != dataset_draw_rows.end() && facts != dataset_native_facts.end();
-    if (row != dataset_draw_rows.end() && facts != dataset_native_facts.end())
-     valid = valid && row->second.first[2] > 0.0 && row->second.first[3] > 0.0 && scalar(facts->second, "generation") == active_compile_generation &&
-             dataset_native_caption(facts->second, id, row->second.second);
+    const auto caption = facts == dataset_native_facts.end() ? std::nullopt : dataset_native_caption(facts->second, id);
+    valid = valid && caption && scalar(facts->second, "generation") == active_compile_generation;
+    // A disclosure's intermediate draws intentionally omit clipped text and
+    // rows. They supply no complete caption proof, but do not corrupt facts.
+    exposed = exposed && caption && row != dataset_draw_rows.end() && row->second.first[2] > 0.0 && row->second.first[3] > 0.0 && row->second.second == *caption;
    }
    dataset_native_valid = dataset_native_valid && valid;
-   if (valid) {
+   if (valid && exposed) {
     dataset_native_generations.insert(active_compile_generation);
     for (const auto* id : track_ids) compile_tracks.insert(id);
    }
@@ -1123,37 +1126,41 @@ auto BrowserAudit::consume(const nlohmann::json& record) -> void {
    const auto cached = dataset_draw_rows.find("train.dataset.progress.source.objects365v2");
    const auto stage = (key - 200U) % 9U;
    dataset_presentation_valid = dataset_presentation_valid && area != dataset_draw_rows.end();
+   bool captions = area != dataset_draw_rows.end();
    if (area != dataset_draw_rows.end()) {
     dataset_fixture_heights.insert_or_assign(key, area->second.first[3]);
     auto& frames = dataset_fixture_frames[key];
     if (frames.size() < 180U) frames.push_back(area->second.first[3]);
    }
    if (stage < 4U) {
-    dataset_presentation_valid = dataset_presentation_valid && work != dataset_draw_rows.end() && cached != dataset_draw_rows.end();
+    captions = captions && work != dataset_draw_rows.end() && cached != dataset_draw_rows.end();
     if (work != dataset_draw_rows.end()) {
      const std::string phase = stage == 2U ? "Syncing" : stage == 3U ? "Publishing" : "Pixels";
-     dataset_presentation_valid = dataset_presentation_valid && work->second.second == phase + " · 1,234 / 5,678";
+     captions = captions && work->second.second == phase + " · 1,234 / 5,678";
     }
     if (cached != dataset_draw_rows.end()) {
      const std::string expected = stage == 1U
                                    ? "Objects365 v2 · Active\n4.0 KiB / ? · 0 / ? images\nResuming train-patch\n4.0 KiB / ? · attempt 3 · 1.0 KiB retained · 2 retries · 1,234 images invalidated"
                                    : "Objects365 v2 · Cached\n85.0 GiB · 345,491 images";
-     dataset_presentation_valid = dataset_presentation_valid && cached->second.second == expected;
+     captions = captions && cached->second.second == expected;
     }
     for (const auto* id : track_ids) {
-     dataset_presentation_valid = dataset_presentation_valid && dataset_draw_rows.contains(id);
-     if (stage >= 2U && dataset_draw_rows.contains(id)) dataset_presentation_valid = dataset_presentation_valid && dataset_draw_rows.at(id).second.find("Complete · ") != std::string::npos;
+     captions = captions && dataset_draw_rows.contains(id);
+     if (stage >= 2U && dataset_draw_rows.contains(id)) captions = captions && dataset_draw_rows.at(id).second.find("Complete · ") != std::string::npos;
     }
     if (stage < 2U && dataset_draw_rows.contains(track_ids[0]) && dataset_draw_rows.contains(track_ids[1])) {
-     dataset_presentation_valid = dataset_presentation_valid && dataset_draw_rows.at(track_ids[0]).second.find(" / ?") != std::string::npos &&
-                                  dataset_draw_rows.at(track_ids[1]).second.find("Waiting · 2,345 / 9,876") != std::string::npos;
+     captions = captions && dataset_draw_rows.at(track_ids[0]).second.find(" / ?") != std::string::npos &&
+                dataset_draw_rows.at(track_ids[1]).second.find("Waiting · 2,345 / 9,876") != std::string::npos;
     }
    } else {
     dataset_presentation_valid = dataset_presentation_valid && work == dataset_draw_rows.end() && cached == dataset_draw_rows.end();
     for (const auto* id : track_ids) dataset_presentation_valid = dataset_presentation_valid && !dataset_draw_rows.contains(id);
     const std::string terminal = stage == 4U ? "Cancelling…" : stage == 5U ? "Cancelled" : stage == 6U ? "Failed\nLocal fixture publication failed" : "Completed\nLocal fixture output";
-    if (area != dataset_draw_rows.end()) dataset_presentation_valid = dataset_presentation_valid && area->second.second == terminal;
+    if (area != dataset_draw_rows.end()) captions = captions && area->second.second == terminal;
    }
+   // Intermediate frames prove reflow and immediate removal of stale bars.
+   // Complete text is required on the final draw joined by the fixture receipt.
+   if (captions) dataset_fixture_caption_frame = key;
   }
   dataset_viewport.reset();
   dataset_paints.clear();
@@ -1163,6 +1170,14 @@ auto BrowserAudit::consume(const nlohmann::json& record) -> void {
   dataset_drag_edit = record.value("detail", "") == "native-settled" && numeric(record, "a") > 0.0 && numeric(record, "b") > 0.0 && scalar(record, "c") != 0U && scalar(record, "d") == 1U;
  } else if (event == "integration.dataset_offscreen_release") {
   dataset_offscreen_release = record.value("detail", "") == "native-unchanged" && scalar(record, "a") != 0U && scalar(record, "b") == 1U;
+ } else if (event == "integration.dataset_reversal") {
+  const auto baseline = dataset_transition_frames.find(25U), observed = dataset_transition_frames.find(6U);
+  const double full = numeric(record, "a"), closing = numeric(record, "b"), reopening = numeric(record, "c");
+  dataset_reversal = !dataset_reversal && record.value("control", "") == "train.dataset.coconut_options" && record.value("detail", "") == "actual-draw" && scalar(record, "d") == 1U &&
+                     closing > 0.0 && closing < reopening && reopening < full && baseline != dataset_transition_frames.end() && !baseline->second.empty() &&
+                     std::abs(baseline->second.back()[1] - full) < 0.1 && observed != dataset_transition_frames.end() && !observed->second.empty() &&
+                     std::abs(observed->second.back()[1] - reopening) < 0.1 &&
+                     std::ranges::any_of(observed->second, [closing](const auto& frame) { return std::abs(frame[1] - closing) < 0.1; });
  } else if (event == "integration.dataset_hidden_input") {
   dataset_hidden_input = record.value("detail", "") == "real-click-during-collapse" && scalar(record, "b") == 1U;
  } else if (event == "integration.dataset_custody") {
@@ -1253,7 +1268,10 @@ auto BrowserAudit::consume(const nlohmann::json& record) -> void {
    dataset_fixture_pixels.insert(key);
  } else if (event == "integration.dataset_fixture") {
   const auto key = scalar(record, "b");
-  if (key == scalar(record, "a") + 200U && key < 236U && scalar(record, "c") >= 4U && scalar(record, "d") == 1U) dataset_fixture_cases.insert(key);
+  if (key == scalar(record, "a") + 200U && key < 236U && scalar(record, "c") >= 4U && scalar(record, "d") == 1U) {
+   dataset_presentation_valid = dataset_presentation_valid && dataset_fixture_caption_frame == key;
+   dataset_fixture_cases.insert(key);
+  }
  } else if (event == "integration.compile_cancelled") {
   if (record.value("detail", "") == "native-inactive" && scalar(record, "b") == 0U) cancelled_compile_generation = scalar(record, "a");
  } else if (event == "integration.compile_metrics") {
@@ -1863,9 +1881,9 @@ auto BrowserAudit::readiness_blocker() const -> std::string_view {
   settings_composition && settings_numeric_alignment && show_fps_round_trip && ui_scale_drag && ui_scale_released && ui_scale_restored && complete_pointer_drag && error_composition &&
    error_modal_usable,
   "Settings composition",
-  dataset_configured && progress && compile_metrics && dataset_native_valid && dataset_native_generations.contains(cancelled_compile_generation) &&
-   dataset_native_generations.contains(active_compile_generation) && compile_tracks.size() == 3U && dataset_presentation_complete() && dataset_transitions_complete() && dataset_complete &&
-   progress_ordinal < dataset_complete_ordinal,
+  dataset_native_valid && dataset_native_generations.contains(cancelled_compile_generation) && dataset_native_generations.contains(active_compile_generation) && compile_tracks.size() == 3U,
+  "Dataset native captions", dataset_presentation_complete(), "Dataset presentation", dataset_transitions_complete(), "Dataset transitions",
+  dataset_configured && progress && compile_metrics && dataset_complete && progress_ordinal < dataset_complete_ordinal,
   "Dataset lifecycle", explore_ready, "ready snapshot", sweep, "viewport sweep", scrolled, "gallery scroll", detail, "detail selection", bounded_exact_grid, "bounded exact grid", newest_placeholder,
   "newest placeholder", pointer_inverse, "pointer inverse", pointer_dispatched, "pointer dispatch", pointer_selected, "pointer selection", gallery_shader_fill, "gallery shader fill",
   pointer_render_chain, "pointer render chain", atlas_identities, "atlas identities", augmentation_enabled, "augmentation enabled", augmentation_rerolled, "augmentation rerolled",

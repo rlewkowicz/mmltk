@@ -1742,10 +1742,10 @@ export function mmltkIntegrationDatasetInput(action, bounds, value, callback) {
     } else if (action === 2 || action === 3) {
       pointer(x + width / 2, y + height / 2, action === 2 ? 'pointerdown' : 'pointerup', action === 2 ? 1 : 0);
       finish();
-    } else if (action === 4 || action === 6) {
+    } else if (action === 4) {
       canvas.dispatchEvent(new WheelEvent('wheel', {bubbles: true, cancelable: true,
         clientX: rect.left + x + width / 2, clientY: rect.top + y + height / 2,
-        deltaY: action === 4 ? Number(value) : 0, deltaX: action === 6 ? Number(value) : 0,
+        deltaY: Number(value), deltaX: 0,
         deltaMode: WheelEvent.DOM_DELTA_PIXEL}));
       finish();
     } else if (action === 5) {

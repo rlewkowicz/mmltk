@@ -276,19 +276,23 @@ fn hidden_and_clipped_controls_reject_input_and_focus_and_settled_motion_is_quie
     }
     for (visible, height, cursor_y, expected_messages, expected_focus) in [
         (false, 0.0, 80.0, 0, 0),
-        (false, 120.0, 80.0, 0, 0),
+        (false, 120.2, 80.0, 0, 0),
         (true, 40.0, 80.0, 0, 0),
         (true, 40.0, 20.0, 1, 0),
-        (true, 120.0, 80.0, 1, 1),
+        (true, 120.2, 80.0, 1, 1),
     ] {
         let mut element: Element<'_, (), (), ()> = section(visible).into();
         let mut tree = widget::Tree::new(&element);
         tree.diff(&mut element);
         element.as_widget_mut().layout(&mut tree, &(), &limits());
+        // Fractional extents at a scrolled origin must retain focus admission;
+        // intersecting and subtracting coordinates can round those extents.
+        let origin = Point::new(20.2, 894.2);
         let node = layout::Node::with_children(
             Size::new(200.0, height),
-            vec![layout::Node::new(Size::new(200.0, 120.0))],
-        );
+            vec![layout::Node::new(Size::new(200.0, 120.2))],
+        )
+        .move_to(origin);
         let mut count = FocusCount(0);
         element
             .as_widget_mut()
@@ -300,12 +304,12 @@ fn hidden_and_clipped_controls_reject_input_and_focus_and_settled_motion_is_quie
             iced_runtime::core::shell::Waker::new(|| {}),
             &mut messages,
         );
-        let viewport = Rectangle::new(Point::ORIGIN, Size::new(200.0, 1000.0));
+        let viewport = Rectangle::new(origin, Size::new(200.0, 1000.0));
         element.as_widget_mut().update(
             &mut tree,
             &Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
             Layout::new(&node),
-            mouse::Cursor::Available(Point::new(10.0, cursor_y)),
+            mouse::Cursor::Available(Point::new(origin.x + 10.0, origin.y + cursor_y)),
             &(),
             &mut shell,
             &viewport,

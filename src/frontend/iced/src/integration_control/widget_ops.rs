@@ -219,22 +219,22 @@ pub(super) fn scroll_control_into_view(
         let Some(target) = bounds.requested(reveal) else {
             return Task::none();
         };
-        let x = reveal_axis(
-            target.x,
-            target.width,
-            bounds.horizontal.x,
-            bounds.horizontal.width,
-        );
-        let y = reveal_axis(target.y, target.height, bounds.page.y, bounds.page.height);
-        iced::widget::operation::scroll_by(
-            crate::view::PAGE_SCROLL_ID,
-            AbsoluteOffset { x: 0.0, y },
-        )
+        scroll_target_into_view(target, bounds.page, bounds.horizontal)
+    })
+}
+
+pub(super) fn scroll_target_into_view(
+    target: Rectangle,
+    page: Rectangle,
+    horizontal: Rectangle,
+) -> Task<RootMessage> {
+    let x = reveal_axis(target.x, target.width, horizontal.x, horizontal.width);
+    let y = reveal_axis(target.y, target.height, page.y, page.height);
+    iced::widget::operation::scroll_by(crate::view::PAGE_SCROLL_ID, AbsoluteOffset { x: 0.0, y })
         .chain(iced::widget::operation::scroll_by(
             crate::view::HORIZONTAL_SCROLL_ID,
             AbsoluteOffset { x, y: 0.0 },
         ))
-    })
 }
 
 pub(super) fn reveal_control(

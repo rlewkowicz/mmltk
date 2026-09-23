@@ -1379,13 +1379,14 @@ TEST_CASE("Background visual work yields until requested display pixels physical
  fixture::ImageWorkspaceTestAccess::Reset();
  auto backend = std::make_shared<FakeImageBackend>();
  ProducerWorkspaceRequest display{.workspace = fixture::ImageWorkspaceTestAccess::CreateAdmitted(backend, fixture::ImageWorkspaceTestAccess::Layout(0))};
- std::promise<void> published, entered, preempted, release, resumed;
+ std::promise<void> published, entered, preempted, release;
  auto released = release.get_future().share();
  std::atomic_uint runs{0U};
  std::atomic_bool resumed_with_pixels{false};
  detail::VisualRuntimeOwner owner(
   RuntimeFactory(0, backend, gpu::ImageProductLayout::Clean, {}, 1U, fixture::FakeWorkspaceFinalizer(backend)), [](auto) { FAIL("background display fixture unexpectedly failed"); });
  auto settle = settle_visual_on_exit(owner, release);
+ mmltk::testsupport::TestGate resumed("background preparation finalized");
  owner.RegisterContinuation(
   [&](auto&, std::stop_token stop) {
    if (runs.fetch_add(1U) == 0U) {
@@ -1395,7 +1396,9 @@ TEST_CASE("Background visual work yields until requested display pixels physical
     static_cast<void>(owner.NotifyContinuation());
    } else {
     resumed_with_pixels = display.workspace->Contains(display.content);
-    resumed.set_value();
+    // BorrowWorkspace is nonblocking. Hold the finalized notification outside
+    // the owner lock while the test examines the completed display.
+    return detail::VisualRuntimeOwner::Notification{[receipt = resumed.receipt()] { receipt.ArriveAndWait(); }};
    }
    return detail::VisualRuntimeOwner::Notification{};
   },
@@ -1412,10 +1415,11 @@ TEST_CASE("Background visual work yields until requested display pixels physical
  CHECK(runs == 1U);
  CHECK_FALSE(display.workspace->Contains(display.content));
  backend->CompleteNotifications(stream);
+ REQUIRE(resumed.WaitEntered(2s));
  display.CheckCompleted(owner);
- mmltk::testsupport::await_test_promise(resumed, "background preparation resumed");
  CHECK(runs == 2U);
  CHECK(resumed_with_pixels);
+ resumed.Release();
  display.workspace.reset();
  owner.StopAndWait();
  CHECK(backend->planes_allocated == backend->planes_freed);

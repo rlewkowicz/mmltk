@@ -419,7 +419,7 @@ fn clipped_cursor(cursor: mouse::Cursor, clip: Rectangle) -> mouse::Cursor {
 }
 
 fn contains(clip: Rectangle, bounds: Rectangle) -> bool {
-    bounds.height > 0.0 && bounds.width > 0.0 && clip.intersection(&bounds) == Some(bounds)
+    bounds.height > 0.0 && bounds.width > 0.0 && bounds.is_within(&clip)
 }
 
 struct UnfocusClipped(Option<Rectangle>);

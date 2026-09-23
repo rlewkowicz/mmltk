@@ -1574,8 +1574,10 @@ impl Controller {
                     [0.0; 4],
                 )
             });
-            self.driver
-                .fail("Iced widget operation could not locate the stable identity");
+            let phase = self.driver.phase.clone();
+            self.driver.fail_detail(|| {
+                format!("Iced widget operation could not locate {control} during {phase:?}").into()
+            });
             return None;
         }
         self.driver

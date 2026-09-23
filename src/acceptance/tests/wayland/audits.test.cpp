@@ -2379,7 +2379,8 @@ void native_dataset_frame(BrowserAudit& audit, std::uint64_t generation, std::st
  audit.consume({{"event", "integration.compile_progress"}, {"control", "train.compile_dataset.progress"}, {"detail", "pixels"}, {"a", generation}, {"b", 1234}, {"c", 5678}, {"d", 0}});
  const auto row = [&](const char* id, const std::string& caption, nlohmann::json facts, bool work = false) {
   facts["generation"] = defect == "wrong-generation" ? generation + 1U : generation;
-  if (!(work && defect == "missing-work")) audit.consume({{"event", "integration.dataset_draw"}, {"control", id}, {"detail", caption}, {"a", 1}, {"b", 2}, {"c", 100}, {"d", 32}});
+  if (!(work && defect == "missing-work") && !(defect == "opening" && std::string_view(id) == "train.dataset.progress.pixels"))
+   audit.consume({{"event", "integration.dataset_draw"}, {"control", id}, {"detail", caption}, {"a", 1}, {"b", 2}, {"c", 100}, {"d", 32}});
   if (defect != "missing-facts") audit.consume({{"event", work ? "integration.dataset_native_work" : "integration.dataset_native_track"}, {"control", id}, {"detail", facts.dump()}});
  };
  row("train.dataset.progress.work",
@@ -2387,7 +2388,7 @@ void native_dataset_frame(BrowserAudit& audit, std::uint64_t generation, std::st
   : defect == "wrong-grouping" ? "Pixels · 1234 / 5678"
                                : "Pixels · 1,234 / 5,678",
   {{"phase", 6U}, {"completed", 1234U}, {"total", 5678U}}, true);
- row("train.dataset.progress.acquisition", "Acquisition\nNo acquisition needed · 0 KiB",
+ row("train.dataset.progress.acquisition", defect == "opening" ? "Acquisition" : "Acquisition\nNo acquisition needed · 0 KiB",
   {{"activity", 1U}, {"completed", 0U}, {"total", 0U}, {"known", true}, {"active", false}, {"complete", true}, {"invalidated", 0U}});
  row("train.dataset.progress.labels", "Labels/masks\nWaiting · 2,345 / 9,876",
   {{"activity", 0U}, {"completed", 2345U}, {"total", 9876U}, {"known", true}, {"active", false}, {"complete", false}, {"invalidated", 0U}});
@@ -2400,23 +2401,34 @@ void native_dataset_frame(BrowserAudit& audit, std::uint64_t generation, std::st
 }
 }  // namespace
 TEST_CASE("native drawn work requires correlated exact captions and track meaning", "[workspace][audit]") {
- for (const std::string defect : {"none", "missing-work", "wrong-work", "wrong-grouping", "empty-status", "wrong-status", "wrong-generation", "missing-facts", "fixture", "completed"}) {
+ for (const std::string defect : {"none", "opening", "missing-work", "wrong-work", "wrong-grouping", "empty-status", "wrong-status", "wrong-generation", "missing-facts", "fixture", "completed"}) {
   BrowserAudit audit;
   native_dataset_frame(audit, 1U, defect);
   CHECK(audit.compile_tracks.size() == (defect == "none" ? 3U : 0U));
   CHECK(audit.dataset_native_generations.contains(1U) == (defect == "none"));
  }
 }
+TEST_CASE("native captions wait for complete exposure without forgiving corrupt facts", "[workspace][audit]") {
+ for (const std::string defect : {"opening", "wrong-generation"}) {
+  BrowserAudit audit;
+  native_dataset_frame(audit, 1U, defect);
+  CHECK_FALSE(audit.dataset_native_generations.contains(1U));
+  CHECK(audit.dataset_native_valid == (defect == "opening"));
+  native_dataset_frame(audit, 1U);
+  CHECK(audit.dataset_native_generations.contains(1U));
+  CHECK(audit.dataset_native_valid == (defect == "opening"));
+ }
+}
 TEST_CASE("successful compile cannot replace real active cancellation and restart", "[workspace][audit]") {
  BrowserAudit audit;
- audit.consume({{"event", "integration.dataset_complete"}, {"a", 1}});
+ audit.consume({{"event", "integration.dataset_complete"}, {"a", 1U}});
  CHECK_FALSE(audit.dataset_complete);
  native_dataset_frame(audit, 1U);
- audit.consume({{"event", "integration.compile_cancelled"}, {"detail", "native-inactive"}, {"a", 1}, {"b", 0}});
- audit.consume({{"event", "integration.dataset_complete"}, {"a", 2}});
+ audit.consume({{"event", "integration.compile_cancelled"}, {"detail", "native-inactive"}, {"a", 1U}, {"b", 0U}});
+ audit.consume({{"event", "integration.dataset_complete"}, {"a", 2U}});
  CHECK_FALSE(audit.dataset_complete);
  native_dataset_frame(audit, 2U);
- audit.consume({{"event", "integration.dataset_complete"}, {"a", 2}});
+ audit.consume({{"event", "integration.dataset_complete"}, {"a", 2U}});
  CHECK(audit.dataset_complete);
  CHECK_FALSE(audit.dataset_presentation_complete());
 }
@@ -2483,6 +2495,19 @@ TEST_CASE("Dataset transitions reject moved and resized absolute viewports", "[w
   CHECK_FALSE(audit.dataset_geometry_valid);
  }
 }
+TEST_CASE("Dataset reversal joins actual closing and reopening draws before settlement", "[workspace][audit]") {
+ for (const std::string defect : {"none", "missing-baseline", "missing-closing", "missing-reopening", "settled-close", "wrong-full", "duplicate"}) {
+  BrowserAudit audit;
+  if (defect != "missing-baseline") audit.dataset_transition_frames[25U].push_back({0, 217, 0, 0, 0, 0, 0, 0, 0});
+  if (defect != "missing-closing") audit.dataset_transition_frames[6U].push_back({0, 180, 0, 0, 0, 0, 0, 0, 0});
+  if (defect != "missing-reopening") audit.dataset_transition_frames[6U].push_back({0, 190, 0, 0, 0, 0, 0, 0, 0});
+  const nlohmann::json record{{"event", "integration.dataset_reversal"}, {"control", "train.dataset.coconut_options"}, {"detail", "actual-draw"},
+                            {"a", defect == "wrong-full" ? 218 : 217}, {"b", defect == "settled-close" ? 0 : 180}, {"c", 190}, {"d", 1U}};
+  audit.consume(record);
+  if (defect == "duplicate") audit.consume(record);
+  CHECK(audit.dataset_reversal == (defect == "none"));
+ }
+}
 TEST_CASE("Dataset component audit rejects source and lifecycle presentation substitutions", "[workspace][audit]") {
  for (const std::string defect : {"none", "raw-bytes", "duplicate-cache", "false-total", "wrong-work", "terminal-bars"}) {
   BrowserAudit audit;
@@ -2497,15 +2522,31 @@ TEST_CASE("Dataset component audit rejects source and lifecycle presentation sub
   row("train.dataset.progress.source.objects365v2", defect == "raw-bytes"         ? "Objects365 v2 · Cached\n91268055040 · 345491 images"
                                                     : defect == "duplicate-cache" ? "Objects365 v2 · Cached\n85.0 GiB · 345,491 images\nCache hit"
                                                                                   : "Objects365 v2 · Cached\n85.0 GiB · 345,491 images");
-  audit.consume({{"event", "integration.dataset_frame"}, {"a", defect == "terminal-bars" ? 205 : 200}});
+  audit.consume({{"event", "integration.dataset_frame"}, {"a", defect == "terminal-bars" ? 205U : 200U}});
+  audit.consume({{"event", "integration.dataset_fixture"}, {"a", defect == "terminal-bars" ? 5U : 0U}, {"b", defect == "terminal-bars" ? 205U : 200U}, {"c", 4U}, {"d", 1U}});
   CHECK(audit.dataset_presentation_valid == (defect == "none"));
   CHECK(audit.compile_tracks.empty());
+ }
+}
+TEST_CASE("Dataset terminal captions require a complete final draw after their reveal", "[workspace][audit]") {
+ for (const bool complete : {false, true}) {
+  BrowserAudit audit;
+  const auto draw = [&](std::string_view caption, double height) {
+   audit.consume({{"event", "integration.dataset_draw"}, {"control", "train.dataset.progress.area"}, {"detail", caption}, {"a", 10}, {"b", 10}, {"c", 200}, {"d", height}});
+   audit.consume({{"event", "integration.dataset_frame"}, {"a", 206U}});
+  };
+  draw("Failed", 15.6);
+  CHECK(audit.dataset_presentation_valid);
+  CHECK_FALSE(audit.dataset_fixture_caption_frame);
+  if (complete) draw("Failed\nLocal fixture publication failed", 37.2);
+  audit.consume({{"event", "integration.dataset_fixture"}, {"a", 6U}, {"b", 206U}, {"c", 4U}, {"d", 1U}});
+  CHECK(audit.dataset_presentation_valid == complete);
  }
 }
 TEST_CASE("Dataset divider pixel audit requires both geometry and matching color evidence", "[workspace][audit]") {
  for (const std::string defect : {"none", "missing-stroke", "full-span", "extra-gap", "wrong-color"}) {
   BrowserAudit audit;
-  audit.consume({{"event", "integration.dataset_divider_pixels"}, {"control", "train.dataset.benchmark_divider"}, {"a", 200}, {"b", 200}, {"c", defect == "full-span" ? 200 : 150},
+  audit.consume({{"event", "integration.dataset_divider_pixels"}, {"control", "train.dataset.benchmark_divider"}, {"a", 200U}, {"b", 200}, {"c", defect == "full-span" ? 200 : 150},
    {"d", defect == "missing-stroke" ? 0 : 1}, {"scale", 1}, {"gap", defect == "extra-gap" ? 1 : 0}, {"matched", defect != "wrong-color"}});
   CHECK(audit.dataset_divider_pixels.size() == (defect == "none" ? 1U : 0U));
  }

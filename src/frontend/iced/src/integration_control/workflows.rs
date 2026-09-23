@@ -1884,11 +1884,20 @@ impl State {
             {
                 self.workflow_control(widgets, driver, primary(FeatureId::Validate))
             }
-            Step::Validating if validation.is_some_and(|value| success(&value.operation)) => {
+            // Native metrics finish before the asynchronous sample renderer
+            // necessarily publishes its final atlas. Await that same generation.
+            Step::Validating
+                if validation.is_some_and(|value| {
+                    success(&value.operation)
+                        && value.sampleavailable.iter().all(|available| *available)
+                        && value.sampleidentities.iter().all(|identity| {
+                            identity.generation == value.operation.generationfrontier
+                        })
+                }) =>
+            {
                 let snapshot = validation.unwrap();
                 let mut identities = std::collections::BTreeSet::new();
                 if snapshot.metrics.is_none()
-                    || !snapshot.sampleavailable.iter().all(|value| *value)
                     || !snapshot
                         .sampleidentities
                         .iter()

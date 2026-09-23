@@ -227,6 +227,7 @@ struct BrowserAudit final {
  std::set<std::uint64_t> dataset_fixture_pixels;
  std::set<std::pair<std::uint64_t, std::string>> dataset_divider_pixels;
  std::set<std::uint64_t> dataset_fixture_cases;
+ std::optional<std::uint64_t> dataset_fixture_caption_frame;
  std::uint64_t dataset_custody_scope = 0;
  unsigned dataset_custody_cases = 0;
  unsigned dataset_custody_state = 0;
@@ -256,6 +257,7 @@ struct BrowserAudit final {
  std::map<std::uint64_t, std::vector<std::array<double, 9>>> dataset_transition_frames;
  bool dataset_dividers_valid = true;
  bool dataset_hidden_input = false;
+ bool dataset_reversal = false;
  bool dataset_drag_edit = false;
  bool dataset_offscreen_release = false;
  [[nodiscard]] bool dataset_transitions_complete() const;

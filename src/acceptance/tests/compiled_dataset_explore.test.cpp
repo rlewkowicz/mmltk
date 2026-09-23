@@ -96,6 +96,8 @@ public:
       audit.tile_.Observe(sequence, fact);
       audit.last_tile_cumulative_.store(fact.value, std::memory_order_release);
       audit.reused_tiles_.fetch_add(fact.detail, std::memory_order_acq_rel);
+     } else if (fact.operation == controller::VisualDiagnosticOperation::ExploreCacheStorage) {
+      audit.pinned_storage_.store(fact.context.staging_bytes, std::memory_order_release);
      } else if (fact.operation == controller::VisualDiagnosticOperation::ExploreAugmentationBatchPrepared) {
       audit.augmentation_count_.fetch_add(1U, std::memory_order_acq_rel);
       audit.last_augmentation_seed_.store(fact.detail, std::memory_order_release);
@@ -169,7 +171,7 @@ public:
  [[nodiscard]] std::uint64_t last_placeholder_generation() const noexcept { return placeholder_.last_generation.load(std::memory_order_acquire); }
  [[nodiscard]] std::uint64_t last_tile_generation() const noexcept { return tile_.last_generation.load(std::memory_order_acquire); }
  [[nodiscard]] std::uint64_t last_tile_cumulative() const noexcept { return last_tile_cumulative_.load(std::memory_order_acquire); }
- [[nodiscard]] std::size_t last_tile_staging() const noexcept { return tile_.staging.load(std::memory_order_acquire); }
+ [[nodiscard]] std::size_t pinned_storage() const noexcept { return pinned_storage_.load(std::memory_order_acquire); }
  // CLEANUP-IGNORE: Failure state and semantic/image diagnostic counters are independent observations.
  [[nodiscard]] bool failed() const noexcept {
   return failed_.load(std::memory_order_acquire);  // CLEANUP-IGNORE: Failure status and indexed image checksums
@@ -257,6 +259,7 @@ private:
  std::atomic_uint64_t last_ready_frame_{0U};
  PublicationObservation placeholder_;
  PublicationObservation tile_;
+ std::atomic_size_t pinned_storage_{0U};
  std::atomic_uint64_t last_tile_cumulative_{0U};
  std::atomic_uint64_t augmentation_count_{0U};
  std::atomic_uint64_t last_augmentation_seed_{0U};
@@ -566,13 +569,16 @@ void test_compiled_dataset_explore_projection_navigation_and_streaming() {
  wait_for_native_gallery(audit, system, placeholder_count, tile_count);
  CHECK(system.snapshot().order.visible_indices == std::vector<std::uint32_t>{10U, 11U});
  CHECK(audit.observed_semantic_diagnostics());
- const auto retained_staging = audit.last_tile_staging();
+ // Storage facts include idle lane allocations; publication facts report only
+ // currently active reads and can decrease as those reads finish.
+ const auto retained_pinned_bytes = audit.pinned_storage();
+ REQUIRE(retained_pinned_bytes > 0U);
  placeholder_count = audit.placeholder_count();
  tile_count = audit.tile_count();
  static_cast<void>(system.Open({.viewport = first_view, .compiled_source = compiled.string()}));
  wait_for_native_gallery(audit, system, placeholder_count, tile_count);
  CHECK(system.snapshot().ready);
- CHECK(audit.last_tile_staging() >= retained_staging);
+ CHECK(audit.pinned_storage() >= retained_pinned_bytes);
  CHECK_FALSE(audit.failed());
  placeholder_count = audit.placeholder_count();
  tile_count = audit.tile_count();

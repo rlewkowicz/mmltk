@@ -13,6 +13,14 @@ use crate::view_model::ApplicationModel;
 use iced::widget::operation::RelativeOffset;
 use iced::{Rectangle, Task};
 
+#[derive(Default)]
+enum BenchmarkReversal {
+    #[default]
+    Closing,
+    Reopening(f32),
+    Complete,
+}
+
 /// Mutable observations owned by this scenario or mechanism.
 pub(super) struct State {
     pub(super) presentation: super::dataset_presentation::State,
@@ -34,6 +42,7 @@ pub(super) struct State {
     fixtures_complete: bool,
     benchmark_prepared: Option<usize>,
     benchmark_frame: Option<super::dataset_presentation::Frame>,
+    benchmark_reversal: BenchmarkReversal,
 }
 impl Default for State {
     fn default() -> Self {
@@ -57,6 +66,7 @@ impl Default for State {
             fixtures_complete: false,
             benchmark_prepared: None,
             benchmark_frame: None,
+            benchmark_reversal: BenchmarkReversal::default(),
         }
     }
 }
@@ -137,6 +147,98 @@ impl State {
             }
         };
         (control, enabled, selection)
+    }
+
+    fn reverse_benchmark(
+        &mut self,
+        driver: &mut Driver,
+        settings: &crate::view::settings::SettingsModel,
+    ) -> bool {
+        use crate::generated::BenchmarkDatasetVariant as Dataset;
+        if matches!(self.benchmark_reversal, BenchmarkReversal::Complete) {
+            return true;
+        }
+        let Some(frame) = self
+            .presentation
+            .frame
+            .as_ref()
+            .filter(|frame| frame.key == 6)
+        else {
+            return false;
+        };
+        let Some(baseline) = self.benchmark_frame.as_ref() else {
+            return false;
+        };
+        let Some(full) = baseline.row("train.dataset.coconut_options") else {
+            return false;
+        };
+        let height = frame
+            .row("train.dataset.coconut_options")
+            .map_or(0.0, |row| row.bounds.height);
+        let Some(draft) = settings.draft.as_ref() else {
+            return false;
+        };
+        let dataset = draft.workflows.train.benchmarkselection.dataset;
+        match self.benchmark_reversal {
+            BenchmarkReversal::Closing
+                if dataset == Dataset::CocoCustom
+                    && height > 0.0
+                    && height < full.bounds.height =>
+            {
+                let (Some(hidden), Some(recipe)) = (
+                    baseline.row(train::RECOVER_DROPPED_MASKS_ID),
+                    frame.row(train::BENCHMARK_COCONUT_ID),
+                ) else {
+                    return false;
+                };
+                if !click(hidden.bounds * driver.input_scale) {
+                    driver.fail("Hidden Coconut control pointer dispatch failed");
+                    return false;
+                }
+                reporting::emit(|sink| {
+                    sink.record(
+                        "integration.dataset_hidden_input",
+                        train::RECOVER_DROPPED_MASKS_ID,
+                        "real-click-during-collapse",
+                        [5.0, 1.0, 0.0, 0.0],
+                    )
+                });
+                if !click(recipe.bounds * driver.input_scale) {
+                    driver.fail("Coconut reversal click failed");
+                    return false;
+                }
+                self.benchmark_reversal = BenchmarkReversal::Reopening(height);
+            }
+            BenchmarkReversal::Reopening(closing)
+                if dataset == Dataset::Coconut
+                    && height > closing
+                    && height < full.bounds.height =>
+            {
+                let Some(recipe) = frame.row(train::BENCHMARK_CUSTOM_ID) else {
+                    return false;
+                };
+                reporting::emit(|sink| {
+                    sink.record(
+                        "integration.dataset_reversal",
+                        "train.dataset.coconut_options",
+                        "actual-draw",
+                        [
+                            full.bounds.height.into(),
+                            closing.into(),
+                            height.into(),
+                            1.0,
+                        ],
+                    )
+                });
+                if !click(recipe.bounds * driver.input_scale) {
+                    driver.fail("Coconut reversal restoration click failed");
+                    return false;
+                }
+                self.benchmark_reversal = BenchmarkReversal::Complete;
+            }
+            _ => {}
+        }
+        false
     }
 
     pub(super) fn primary_action_pixels(&mut self, control: &str, active: bool) {
@@ -833,34 +935,13 @@ impl State {
             }
             Phase::AwaitBenchmarkChoice(index) => {
                 if super::reporting_enabled() {
-                    let reversing = index == 5
-                        && self
-                            .benchmark_frame
-                            .as_ref()
-                            .and_then(|frame| frame.row("train.dataset.coconut_options"))
-                            .is_some_and(|row| row.bounds.height > 0.0);
-                    let observed = if reversing {
-                        self.presentation
-                            .frame
-                            .as_ref()
-                            .filter(|frame| frame.key == index as u16 + 1)
-                            .and_then(|frame| frame.row("train.dataset.coconut_options"))
-                            .is_some_and(|row| {
-                                row.bounds.height > 0.0
-                                    && row.bounds.height
-                                        < self
-                                            .benchmark_frame
-                                            .as_ref()
-                                            .unwrap()
-                                            .row("train.dataset.coconut_options")
-                                            .unwrap()
-                                            .bounds
-                                            .height
-                            })
-                    } else {
-                        self.presentation.settled(index as u16 + 1)
-                    };
-                    if !observed {
+                    // Reverse the local disclosure before waiting for the
+                    // debounced native setting. Then complete the ordinary
+                    // native-settled choice, including retained recovery policy.
+                    if index == 5 && !self.reverse_benchmark(driver, settings) {
+                        return Task::none();
+                    }
+                    if !self.presentation.settled(index as u16 + 1) {
                         return Task::none();
                     }
                 }
@@ -911,32 +992,6 @@ impl State {
                             [7.0, 1.0, snapshot.revision as f64, 0.0],
                         )
                     });
-                }
-                if index == 5 && super::reporting_enabled() {
-                    if let Some(row) = self
-                        .benchmark_frame
-                        .as_ref()
-                        .and_then(|frame| frame.row(train::RECOVER_DROPPED_MASKS_ID))
-                    {
-                        let scale = driver.input_scale;
-                        let bounds = Rectangle {
-                            x: row.bounds.x * scale,
-                            y: row.bounds.y * scale,
-                            width: row.bounds.width * scale,
-                            height: row.bounds.height * scale,
-                        };
-                        if !click(bounds) {
-                            driver.fail("Hidden Coconut control pointer dispatch failed");
-                        }
-                        reporting::emit(|sink| {
-                            sink.record(
-                                "integration.dataset_hidden_input",
-                                train::RECOVER_DROPPED_MASKS_ID,
-                                "real-click-during-collapse",
-                                [index as f64, 1.0, 0.0, 0.0],
-                            )
-                        });
-                    }
                 }
                 let visibility = reporting::benchmark_visibility(
                     index,
@@ -1015,7 +1070,8 @@ impl State {
                 widgets.arm(driver, COMPILE_DIMENSIONS)
             }
             Phase::AwaitCompileDimensions
-                if (!super::reporting_enabled() || self.presentation.settled(41))
+                if !settings.has_local_edits()
+                    && (!super::reporting_enabled() || self.presentation.settled(41))
                     && settings
                         .draft
                         .as_ref()
@@ -1078,7 +1134,7 @@ impl State {
                 if !self.fixtures_complete
                     && super::reporting_enabled()
                     && (driver.viewer_scenario.is_empty()
-                        || (driver.session.profile == "dpi" && driver.control_sequence == 0))
+                        || (driver.session.profile == "dpi" && driver.control_sequence == 1))
                 {
                     self.presentation.install(0);
                     driver.advance_to(Phase::DatasetFixture(0))
@@ -1266,6 +1322,11 @@ impl State {
                     driver.fail("Bounded native fixture completed before active rendered evidence");
                     return Task::none();
                 }
+                // Container presence precedes its revealed captions. Observe
+                // the settled draw before either Stop or the completion check.
+                if !self.presentation.settled(100) {
+                    return Task::none();
+                }
                 if !self.presentation.frame.as_ref().is_some_and(|frame| {
                     frame.key == 100
                         && frame.native.as_ref().is_some_and(|native| {
@@ -1329,6 +1390,10 @@ impl State {
             let Some(row) = row else {
                 return Task::none();
             };
+            if !widget_ops::contains_rectangle(frame.page, row.bounds) {
+                // The next observed draw supplies the translated target before input.
+                return widget_ops::scroll_target_into_view(row.bounds, frame.page, frame.page);
+            }
             if !click(row.bounds * scale) {
                 driver.fail(failure);
             }
@@ -1338,6 +1403,7 @@ impl State {
             0 => {
                 if self.presentation.input_original.is_empty() {
                     self.presentation.input_original = train.request.traincompiledpath.clone();
+                    self.presentation.input_viewport = frame.page;
                     self.presentation.input_selection = Some(train.benchmarkselection.clone());
                     #[cfg(target_arch = "wasm32")]
                     super::canvas_size_js(480.0, 900.0);
@@ -1356,9 +1422,15 @@ impl State {
             2 => field.map_or_else(Task::none, |row| {
                 dispatch(&mut self.presentation, 4, 3, row.bounds, "48")
             }),
-            3 if frame.offset.y > 0.0 => field.map_or_else(Task::none, |row| {
-                dispatch(&mut self.presentation, 6, 12, row.bounds, "8")
-            }),
+            3 if frame.offset.y > 0.0 => {
+                // Establish the second scroll offset without starting another
+                // wheel gesture inside the vertical scroller's transaction.
+                iced::widget::operation::scroll_by(
+                    crate::view::HORIZONTAL_SCROLL_ID,
+                    iced::widget::operation::AbsoluteOffset { x: 8.0, y: 0.0 },
+                )
+                .chain(driver.advance_to(Phase::DatasetInput(12)))
+            }
             12 if frame.offset.y > 0.0 && frame.horizontal > 0.0 => field
                 .map_or_else(Task::none, |row| {
                     dispatch(&mut self.presentation, 0, 4, row.bounds, "")
@@ -1534,6 +1606,11 @@ impl State {
             {
                 #[cfg(target_arch = "wasm32")]
                 super::restore_canvas_size_js();
+                driver.advance_to(Phase::DatasetInput(26))
+            }
+            26 if frame.page == self.presentation.input_viewport => {
+                // Navigation must use the restored Iced layout, after the
+                // browser's canvas resize has reached an actual settled draw.
                 driver.advance_to(Phase::AwaitDatasetSettings(snapshot.revision))
             }
             _ => Task::none(),
