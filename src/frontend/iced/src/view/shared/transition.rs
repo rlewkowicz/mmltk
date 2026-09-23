@@ -181,16 +181,28 @@ where Renderer: renderer::Renderer {
             self.content.as_widget_mut().operate(&mut tree.children[0], layout.children().next().unwrap(), renderer,
                 &mut UnfocusClipped(self.visible.then_some(bounds)));
         }
-        let Some(clip) = clip else { return; };
+        let clip = match clip {
+            Some(clip) => clip,
+            // Scrolling can remove a still-mounted control before its accepted
+            // gesture ends. Retire that custody without offering a hit target;
+            // nested disclosures must deliver the same release to their child.
+            None if self.visible && matches!(event,
+                Event::Mouse(mouse::Event::ButtonReleased(_))
+                    | Event::Touch(iced::touch::Event::FingerLifted { .. })) => Rectangle::default(),
+            None => return,
+        };
+        let cursor = clipped_cursor(cursor, clip);
         match event {
-            Event::Touch(iced::touch::Event::FingerPressed { position, .. }
-                | iced::touch::Event::FingerMoved { position, .. })
-                | Event::Mouse(mouse::Event::CursorMoved { position })
-                if !clip.contains(*position) => return,
+            Event::Touch(iced::touch::Event::FingerPressed { .. }
+                | iced::touch::Event::FingerMoved { .. })
+                | Event::Mouse(mouse::Event::CursorMoved { .. })
+                // Iced scrollers translate the cursor and viewport, while the
+                // original event remains in the child's normal event convention.
+                if cursor.position().is_none() => return,
             _ => {}
         }
         self.content.as_widget_mut().update(&mut tree.children[0], event, layout.children().next().unwrap(),
-            clipped_cursor(cursor, clip), renderer, shell, &clip);
+            cursor, renderer, shell, &clip);
     }
 
     fn draw(&self, tree: &widget::Tree, renderer: &mut Renderer, theme: &Theme, style: &renderer::Style,

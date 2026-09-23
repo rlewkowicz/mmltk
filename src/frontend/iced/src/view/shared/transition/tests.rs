@@ -225,98 +225,249 @@ fn redraw_replay_invalidates_once_and_hidden_ancestors_do_not_schedule_motion() 
     assert!(shell.is_layout_invalid().is_none());
 }
 
-#[test]
-fn outgoing_real_controls_retire_mouse_and_touch_presses_before_reopening() {
+fn real_control(checkbox: bool) -> crate::fluent_theme::Element<'static, bool> {
+    if checkbox {
+        iced::widget::checkbox(false).label("Retained option").on_toggle(|value| value).into()
+    } else {
+        iced::widget::button("Retained action").on_press(true).into()
+    }
+}
+
+fn retained(visible: bool, nested: bool, content: crate::fluent_theme::Element<'static, bool>)
+    -> crate::fluent_theme::Element<'static, bool> {
+    let content = if nested { disclosure("test.retained.inner", true, content).into() } else { content };
+    disclosure("test.retained.outer", visible, content).into()
+}
+
+fn pointer_event(pressed: bool, touch: bool, position: Point) -> Event {
+    if touch {
+        let id = iced::touch::Finger(1);
+        Event::Touch(if pressed {
+            iced::touch::Event::FingerPressed { id, position }
+        } else {
+            iced::touch::Event::FingerLifted { id, position }
+        })
+    } else {
+        Event::Mouse(if pressed {
+            mouse::Event::ButtonPressed(mouse::Button::Left)
+        } else {
+            mouse::Event::ButtonReleased(mouse::Button::Left)
+        })
+    }
+}
+
+fn renderer() -> iced::Renderer {
     use iced::advanced::renderer::Headless;
+    iced::futures::executor::block_on(<iced::Renderer as Headless>::new(
+        Default::default(), Some("wgpu"),
+    )).expect("retained controls require the container renderer")
+}
 
-    fn control(visible: bool, nested: bool, checkbox: bool) -> crate::fluent_theme::Element<'static, bool> {
-        let content: crate::fluent_theme::Element<'static, bool> = if checkbox {
-            iced::widget::checkbox(false)
-                .label("Retained option")
-                .on_toggle(|value| value)
-                .into()
-        } else {
-            iced::widget::button("Retained action").on_press(true).into()
-        };
-        let content = if nested {
-            disclosure("test.retained.inner", true, content).into()
-        } else {
-            content
-        };
-        disclosure("test.retained.outer", visible, content).into()
+struct InputHarness<'a> {
+    element: crate::fluent_theme::Element<'static, bool>,
+    tree: widget::Tree,
+    node: layout::Node,
+    renderer: &'a iced::Renderer,
+}
+
+impl<'a> InputHarness<'a> {
+    fn new(mut element: crate::fluent_theme::Element<'static, bool>, renderer: &'a iced::Renderer) -> Self {
+        let mut tree = widget::Tree::new(&element);
+        tree.diff(&mut element);
+        let node = element.as_widget_mut().layout(&mut tree, renderer, &limits());
+        Self { element, tree, node, renderer }
     }
 
-    fn pointer_event(pressed: bool, touch: bool) -> Event {
-        if touch {
-            let id = iced::touch::Finger(1);
-            let position = Point::new(8.0, 8.0);
-            Event::Touch(if pressed {
-                iced::touch::Event::FingerPressed { id, position }
-            } else {
-                iced::touch::Event::FingerLifted { id, position }
-            })
-        } else {
-            Event::Mouse(if pressed {
-                mouse::Event::ButtonPressed(mouse::Button::Left)
-            } else {
-                mouse::Event::ButtonReleased(mouse::Button::Left)
-            })
-        }
+    fn replace(&mut self, element: crate::fluent_theme::Element<'static, bool>) {
+        self.element = element;
+        self.tree.diff(&mut self.element);
+        self.layout();
     }
 
-    fn send(
-        element: &mut crate::fluent_theme::Element<'_, bool>,
-        tree: &mut widget::Tree,
-        node: &layout::Node,
-        renderer: &iced::Renderer,
-        event: Event,
-    ) -> Vec<bool> {
+    fn layout(&mut self) {
+        self.node = self.element.as_widget_mut().layout(&mut self.tree, self.renderer, &limits());
+    }
+
+    fn send(&mut self, event: Event, cursor: mouse::Cursor) -> Vec<bool> {
         let mut messages = Vec::new();
         let mut shell = Shell::new(
             &window::Headless,
             iced_runtime::core::shell::Waker::new(|| {}),
             &mut messages,
         );
-        element.as_widget_mut().update(
-            tree,
+        self.element.as_widget_mut().update(
+            &mut self.tree,
             &event,
-            Layout::new(node),
-            mouse::Cursor::Available(Point::new(8.0, 8.0)),
-            renderer,
+            Layout::new(&self.node),
+            cursor,
+            self.renderer,
             &mut shell,
             &Rectangle::new(Point::ORIGIN, Size::new(200.0, 1000.0)),
         );
         messages
     }
 
-    let renderer = iced::futures::executor::block_on(<iced::Renderer as Headless>::new(
-        Default::default(), Some("wgpu"),
-    )).expect("retained controls require the container renderer");
+    fn scroll(&mut self, offset: Vector) {
+        use iced::advanced::widget::operation::scrollable::{AbsoluteOffset, scroll_to};
+        for id in ["test.horizontal", "test.vertical"] {
+            self.element.as_widget_mut().operate(&mut self.tree, Layout::new(&self.node), self.renderer,
+                &mut scroll_to(widget::Id::from(id), AbsoluteOffset { x: Some(offset.x), y: Some(offset.y) }));
+        }
+    }
+
+    fn text_cursor(&mut self) -> iced::widget::text_input::Cursor {
+        type TextState = iced::widget::text_input::State<<iced::Renderer as iced::advanced::text::Renderer>::Paragraph>;
+        tree_with_tag(&mut self.tree, widget::tree::Tag::of::<TextState>())
+            .unwrap().state.downcast_ref::<TextState>().cursor()
+    }
+}
+
+fn tree_with_tag(tree: &mut widget::Tree, tag: widget::tree::Tag) -> Option<&mut widget::Tree> {
+    if tree.tag == tag { Some(tree) } else {
+        tree.children.iter_mut().find_map(|child| tree_with_tag(child, tag))
+    }
+}
+
+fn scrolled(content: crate::fluent_theme::Element<'static, bool>, nested: bool, horizontal: bool)
+    -> crate::fluent_theme::Element<'static, bool> {
+    use iced::widget::{Space, column, row, scrollable};
+    let body = column![
+        Space::new().height(300),
+        row![Space::new().width(if horizontal { 300 } else { 0 }), retained(true, nested, content)],
+        Space::new().height(600),
+    ].width(600);
+    scrollable(scrollable(body).id("test.vertical").width(600).height(190))
+        .id("test.horizontal")
+        .direction(iced::widget::scrollable::Direction::Horizontal(Default::default()))
+        .width(200).height(200).into()
+}
+
+#[test]
+fn outgoing_real_controls_retire_mouse_and_touch_presses_before_reopening() {
+    let renderer = renderer();
+    let position = Point::new(8.0, 8.0);
+    let cursor = mouse::Cursor::Available(position);
     // Checkbox mouse activation is release-based; button presses retain both
     // mouse and touch custody. Checkbox touch activation is immediate instead.
     for (checkbox, touch) in [(true, false), (false, false), (false, true)] {
         for nested in [false, true] {
-            let mut element = control(true, nested, checkbox);
-            let mut tree = widget::Tree::new(&element);
-            tree.diff(&mut element);
-            let initial = element.as_widget_mut().layout(&mut tree, &renderer, &limits());
-            assert!(send(&mut element, &mut tree, &initial, &renderer, pointer_event(true, touch)).is_empty());
+            let mut input = InputHarness::new(retained(true, nested, real_control(checkbox)), &renderer);
+            let height = input.node.size().height;
+            assert!(input.send(pointer_event(true, touch, position), cursor).is_empty());
 
-            element = control(false, nested, checkbox);
-            tree.diff(&mut element);
-            let hidden = element.as_widget_mut().layout(&mut tree, &renderer, &limits());
-            assert!(send(&mut element, &mut tree, &hidden, &renderer,
-                Event::Window(window::Event::RedrawRequested(Instant::now()))).is_empty());
+            input.replace(retained(false, nested, real_control(checkbox)));
+            assert!(input.send(Event::Window(window::Event::RedrawRequested(Instant::now())), cursor).is_empty());
 
-            element = control(true, nested, checkbox);
-            tree.diff(&mut element);
+            input.replace(retained(true, nested, real_control(checkbox)));
             // Sample the revealed endpoint without a sleep or rebuilding the
             // retained child. Geometry timing has separate component coverage.
-            tree.state.downcast_mut::<State>().motion = animation(initial.size().height);
-            let reopened = element.as_widget_mut().layout(&mut tree, &renderer, &limits());
-            assert!(send(&mut element, &mut tree, &reopened, &renderer, pointer_event(false, touch)).is_empty());
-            assert!(send(&mut element, &mut tree, &reopened, &renderer, pointer_event(true, touch)).is_empty());
-            assert_eq!(send(&mut element, &mut tree, &reopened, &renderer, pointer_event(false, touch)), vec![true]);
+            input.tree.state.downcast_mut::<State>().motion = animation(height);
+            input.layout();
+            assert!(input.send(pointer_event(false, touch, position), cursor).is_empty());
+            assert!(input.send(pointer_event(true, touch, position), cursor).is_empty());
+            assert_eq!(input.send(pointer_event(false, touch, position), cursor), vec![true]);
+        }
+    }
+}
+
+#[test]
+fn composed_scrollers_admit_visible_touch_and_settle_offscreen_control_releases() {
+    let renderer = renderer();
+    for nested in [false, true] {
+        for horizontal in [false, true] {
+            let offset = Vector::new(if horizontal { 200.0 } else { 0.0 }, 200.0);
+            let position = Point::new(if horizontal { 108.0 } else { 8.0 }, 108.0);
+            let cursor = mouse::Cursor::Available(position);
+            for checkbox in [false, true] {
+                for touch in [false, true] {
+                    let mut input = InputHarness::new(scrolled(real_control(checkbox), nested, horizontal), &renderer);
+                    input.scroll(offset);
+                    for unavailable in [mouse::Cursor::Unavailable, mouse::Cursor::Levitating(position)] {
+                        assert!(input.send(pointer_event(true, touch, position), unavailable).is_empty());
+                        assert!(input.send(pointer_event(false, touch, position), cursor).is_empty());
+                    }
+                    let pressed = input.send(pointer_event(true, touch, position), cursor);
+                    // Checkbox touch activation occurs on press; all other
+                    // combinations complete only on an admitted release.
+                    assert_eq!(pressed, if checkbox && touch { vec![true] } else { vec![] });
+                    input.scroll(Vector::new(offset.x, 500.0));
+                    assert!(input.send(pointer_event(false, touch, position), cursor).is_empty());
+                    assert!(input.send(pointer_event(true, touch, position), cursor).is_empty());
+                    input.scroll(offset);
+                    assert!(input.send(pointer_event(false, touch, position), cursor).is_empty());
+                    let pressed = input.send(pointer_event(true, touch, position), cursor);
+                    let released = input.send(pointer_event(false, touch, position), cursor);
+                    assert_eq!([pressed, released].concat(), vec![true]);
+
+                    input.send(pointer_event(true, touch, position), cursor);
+                    input.scroll(Vector::new(offset.x, 500.0));
+                    let loss = if checkbox && !touch {
+                        Event::Window(window::Event::Unfocused)
+                    } else {
+                        Event::Touch(iced::touch::Event::FingerLost { id: iced::touch::Finger(1), position })
+                    };
+                    assert!(input.send(loss, mouse::Cursor::Unavailable).is_empty());
+                    input.scroll(offset);
+                    assert!(input.send(pointer_event(false, touch, position), cursor).is_empty());
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn scrolled_text_selection_obeys_reveal_and_cursor_availability_and_retires_on_release() {
+    let renderer = renderer();
+    let value = iced::widget::text_input::Value::new("A retained editable value");
+    for nested in [false, true] {
+        for touch in [false, true] {
+            for lost in [false, true] {
+                let text = iced::widget::text_input("", "A retained editable value").width(160).on_input(|_| true);
+                let mut input = InputHarness::new(scrolled(text.into(), nested, false), &renderer);
+                let start = Point::new(6.0, 108.0);
+                let end = Point::new(120.0, 108.0);
+                let moved = |position| if touch {
+                    Event::Touch(iced::touch::Event::FingerMoved { id: iced::touch::Finger(1), position })
+                } else { Event::Mouse(mouse::Event::CursorMoved { position }) };
+                input.scroll(Vector::new(0.0, 200.0));
+                input.send(pointer_event(true, touch, start), mouse::Cursor::Available(start));
+                let initial = input.text_cursor();
+                for cursor in [mouse::Cursor::Unavailable, mouse::Cursor::Levitating(end)] {
+                    input.send(moved(end), cursor);
+                    assert_eq!(input.text_cursor(), initial);
+                }
+                input.send(moved(end), mouse::Cursor::Available(end));
+                let selected = input.text_cursor();
+                assert!(selected.selection(&value).is_some());
+
+                // Sample an in-progress reveal using its retained animation;
+                // events still pass through both real scrollers and disclosures.
+                let state = tree_with_tag(&mut input.tree, widget::tree::Tag::of::<State>())
+                    .unwrap().state.downcast_mut::<State>();
+                let height = state.motion.value();
+                state.motion = animation(0.0).go(height, Instant::now() - Duration::from_millis(100));
+                input.layout();
+                let clipped = Point::new(20.0, 100.0 + height - 1.0);
+                input.send(moved(clipped), mouse::Cursor::Available(clipped));
+                assert_eq!(input.text_cursor(), selected);
+
+                input.scroll(Vector::new(0.0, 500.0));
+                let release = if lost {
+                    Event::Touch(iced::touch::Event::FingerLost { id: iced::touch::Finger(1), position: end })
+                } else { pointer_event(false, touch, end) };
+                assert!(input.send(release, mouse::Cursor::Available(end)).is_empty());
+                input.scroll(Vector::new(0.0, 200.0));
+                tree_with_tag(&mut input.tree, widget::tree::Tag::of::<State>())
+                    .unwrap().state.downcast_mut::<State>().motion = animation(height);
+                input.layout();
+                input.send(moved(start), mouse::Cursor::Available(start));
+                assert_eq!(input.text_cursor(), selected);
+                // A different click location avoids the double-click gesture.
+                input.send(pointer_event(true, touch, end), mouse::Cursor::Available(end));
+                let fresh = input.text_cursor();
+                input.send(moved(start), mouse::Cursor::Available(start));
+                assert_ne!(input.text_cursor(), fresh);
+            }
         }
     }
 }
