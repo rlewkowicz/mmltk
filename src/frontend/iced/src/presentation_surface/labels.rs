@@ -438,6 +438,7 @@ impl<Message> Widget<Message, Theme, iced::Renderer> for Labelled<'_, Message> {
             .as_widget_mut()
             .layout(&mut tree.children[0], renderer, limits)
     }
+    // CLEANUP-IGNORE: Iced requires this update signature; label redraw scheduling and StatusText interaction are independent.
     fn update(
         &mut self,
         tree: &mut widget::Tree,

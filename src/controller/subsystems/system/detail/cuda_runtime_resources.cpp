@@ -1,11 +1,36 @@
 #include "cuda_runtime_resources.h"
 #include <cstdint>
+#include <exception>
 #include <stdexcept>
 #include <utility>
 #include "src/common/system/execution_policy.h"
 #include "src/controller/contracts/application_boundary.h"
 #include "src/frameworks/gpu/cuda_device_scope.h"
+#include "src/frameworks/gpu/cuda_context_scope.h"
+#include "src/frameworks/gpu/image_failure.h"
+#include "src/frameworks/gpu/terminal_cuda_retirement_authority.h"
 namespace mmltk::controller::detail {
+void RunWithRetainedCudaContext(std::shared_ptr<void> state, frameworks::gpu::TerminalCudaRetirementAuthority& retirement, std::string_view operation_name, std::function_ref<void()> operation) {
+ namespace gpu = frameworks::gpu;
+ auto lease = gpu::ReserveTerminalCudaLease(retirement);
+ struct Custody {
+  std::shared_ptr<void> state;
+  gpu::TerminalCudaRetirementLease& lease;
+ } custody{std::move(state), lease};
+ gpu::CudaContextScope scope({&custody, [](void* value) noexcept {
+                               auto& owner = *static_cast<Custody*>(value);
+                               std::move(owner.lease).Install(gpu::TerminalCudaCustody::Share(std::move(owner.state)), cudaErrorUnknown);
+                              }});
+ try {
+  scope.Run(operation);
+ } catch (...) {
+  if (!retirement.admission_open() || gpu::is_image_execution_failure(std::current_exception())) {
+   if (lease) std::move(lease).Install(gpu::TerminalCudaCustody::Share(std::move(custody.state)), cudaErrorUnknown);
+   throw mmltk::backend::ml::runtime::CudaOperationError{cudaErrorUnknown, operation_name};
+  }
+  throw;
+ }
+}
 CudaRuntimeResources::CudaRuntimeResources(const DirectComputeConfiguration config, Close close)
     : configuration_(config), device_(config.execution ? config.execution->device : -1), close_(std::move(close)) {
  if (!config.valid()) throw contracts::UnavailableError("compute CUDA device is unavailable");

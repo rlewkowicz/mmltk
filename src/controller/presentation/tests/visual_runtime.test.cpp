@@ -46,6 +46,7 @@
 #include <string_view>
 #include <utility>
 #include <vector>
+// CLEANUP-IGNORE: Namespace and using declarations provide test-local names; the fixture algorithms already have shared owners.
 namespace mmltk::controller {
 namespace {
 using namespace visual_test_support;
@@ -1242,6 +1243,7 @@ TEST_CASE("Deferred product completion reports terminal failure without addition
  const auto expected = std::make_exception_ptr(std::runtime_error("deferred product terminal failure"));
  std::promise<std::exception_ptr> failed;
  std::promise<void> submitted;
+ // CLEANUP-IGNORE: The tests own separate concurrency counters and ordered submissions; their injected work and settlement paths differ.
  std::atomic_uint failures{0U}, completions{0U};
  detail::VisualRuntimeOwner owner(RuntimeFactory(0, backend), first_visual_failure(failures, failed));
  auto admitted = backend->ObserveNextNotificationStream();

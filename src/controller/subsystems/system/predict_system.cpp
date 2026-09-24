@@ -172,8 +172,7 @@ public:
           .product_revisions = std::move(revisions),
           .adopted_context = PreviewContext(*execution),
          };
-         configure_visual_workspace_finalization(config);
-         return std::make_unique<mmltk::frameworks::gpu::SystemImageRuntime>(std::move(config));
+         return make_visual_runtime(std::move(config));
         },
         [this](const std::exception_ptr failure) { RenderingFailed(failure); }) {
   if (!visual_.valid()) throw contracts::UnavailableError("prediction visual device is unavailable");

@@ -2,9 +2,10 @@
 #include "src/common/system/numa_topology.h"
 #include "src/frameworks/gpu/system_image_runtime.h"
 #include "src/frameworks/gpu/cuda_error.h"
+#include <utility>
 import mmltk.backend.imaging.raster;
 namespace mmltk::controller {
-void configure_visual_workspace_finalization(mmltk::frameworks::gpu::SystemImageRuntimeConfig& config) {
+std::unique_ptr<mmltk::frameworks::gpu::SystemImageRuntime> make_visual_runtime(mmltk::frameworks::gpu::SystemImageRuntimeConfig config) {
  config.workspace_finalize = [](const auto clean, const auto semantic, const auto destination, const auto coverage, std::uintptr_t stream) {
   namespace raster = mmltk::backend::imaging::raster;
   const auto source = [](const auto plane) -> raster::ConstBytes {
@@ -27,6 +28,7 @@ void configure_visual_workspace_finalization(mmltk::frameworks::gpu::SystemImage
    submit();
   }
  };
+ return std::make_unique<mmltk::frameworks::gpu::SystemImageRuntime>(std::move(config));
 }
 mmltk::frameworks::gpu::DeviceExecution resolve_visual_device_execution(const VisualDeviceSettings& settings) {
  return mmltk::frameworks::gpu::resolve_device_execution(settings.device, mmltk::common::system::NumaTopology::Capture(), settings.numa_node);

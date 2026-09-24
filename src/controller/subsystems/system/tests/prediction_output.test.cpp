@@ -1,3 +1,4 @@
+#include "src/frameworks/gpu/tests/device_execution_fixture.h"
 #include "src/controller/subsystems/system/detail/prediction_output.h"
 #include "src/controller/subsystems/system/tests/prediction_test_support.h"
 #include "src/test_support/filesystem_test_utils.hpp"
@@ -20,6 +21,11 @@ namespace gpu = mmltk::frameworks::gpu;
 namespace rfdetr = mmltk::backend::models::rfdetr;
 using namespace mmltk::controller;
 using namespace mmltk::controller::test_support;
+void capture_decoded_sample(detail::PredictionOutput& output, int index, const std::shared_ptr<const mmltk::backend::data::catalog::ClassCatalog>& catalog) {
+ std::vector<std::uint8_t> pixels(16U * 16U * 3U, 80U);
+ auto source = PredictionSource::Decoded({16, 16}, pixels, catalog);
+ REQUIRE(output.Capture({.dataset_index = index}, {.width = 16, .height = 16, .device = 0, .rgb8 = source.rgb8(), .custody = source.custody()}, source.annotations()));
+}
 TEST_CASE("prediction samples capture native pixels independently of browser and inference population", "[controller][prediction][output][gpu]") {
  if (!mmltk::testsupport::checked_cuda_device_count()) SKIP("no CUDA device available");
  const auto execution = gpu::resolve_device_execution(0, mmltk::common::system::NumaTopology::Capture());
@@ -88,9 +94,7 @@ TEST_CASE("video reservoir shortfall retains completed disk samples", "[controll
  output.Begin({.class_catalog = catalog, .class_domain = mmltk::backend::data::catalog::ClassReferenceDomain::Foreground});
  for (int index = 0; index < 3; ++index) {
   REQUIRE(output.Wants(index));
-  std::vector<std::uint8_t> pixels(16U * 16U * 3U, 80U);
-  auto source = PredictionSource::Decoded({16, 16}, pixels, catalog);
-  REQUIRE(output.Capture({.dataset_index = index}, {.width = 16, .height = 16, .device = 0, .rgb8 = source.rgb8(), .custody = source.custody()}, source.annotations()));
+  capture_decoded_sample(output, index, catalog);
  }
  CHECK_THROWS_WITH(output.Finish(true), "Requested 100 samples; the video contained 3 frames. Saved 3.");
  CHECK(facts.completed_samples == 3);
@@ -111,17 +115,12 @@ TEST_CASE("failed reservoir replacement preserves the published incumbent", "[co
   [&](const char* path, int width, int height, int channels, const void* pixels, int stride) { return ++writes == 1U ? stbi_write_png(path, width, height, channels, pixels, stride) : 0; }, 0U);
  auto catalog = std::make_shared<const mmltk::backend::data::catalog::ClassCatalog>(std::vector<std::string>{"frame"});
  output.Begin({.class_catalog = catalog, .class_domain = mmltk::backend::data::catalog::ClassReferenceDomain::Foreground});
- const auto capture = [&](int index) {
-  std::vector<std::uint8_t> pixels(16U * 16U * 3U, 80U);
-  auto source = PredictionSource::Decoded({16, 16}, pixels, catalog);
-  REQUIRE(output.Capture({.dataset_index = index}, {.width = 16, .height = 16, .device = 0, .rgb8 = source.rgb8(), .custody = source.custody()}, source.annotations()));
- };
  REQUIRE(output.Wants(0));
- capture(0);
+ capture_decoded_sample(output, 0, catalog);
  int replacement = 1;
  while (replacement < 10000 && !output.Wants(replacement)) ++replacement;
  REQUIRE(replacement < 10000);
- capture(replacement);
+ capture_decoded_sample(output, replacement, catalog);
  CHECK_THROWS(output.Finish(false));
  CHECK(facts.completed_samples == 1);
  CHECK(std::filesystem::exists(directory.path() / "samples" / "frame-0.png"));
@@ -140,9 +139,7 @@ TEST_CASE("compiled samples select actual processing order under an unchanged li
  const std::array<int, 10> order{97, 4, 81, 0, 9, 53, 10, 86, 22, 78};
  for (const auto index : order) {
   REQUIRE(output.Wants(index));
-  std::vector<std::uint8_t> pixels(16U * 16U * 3U, 80U);
-  auto source = PredictionSource::Decoded({16, 16}, pixels, catalog);
-  REQUIRE(output.Capture({.dataset_index = index}, {.width = 16, .height = 16, .device = 0, .rgb8 = source.rgb8(), .custody = source.custody()}, source.annotations()));
+  capture_decoded_sample(output, index, catalog);
  }
  output.Finish(true);
  CHECK(facts.completed_samples == order.size());
@@ -171,10 +168,12 @@ TEST_CASE("prediction composition reaches decoded rotated annotated video withou
  enum class Settlement { Complete, Cancelled, Failed };
  const auto settlement = GENERATE(Settlement::Complete, Settlement::Cancelled, Settlement::Failed);
  const bool complete = settlement == Settlement::Complete;
+ // CLEANUP-IGNORE: Shared device fixture owns construction; stream and media source lifetimes remain local to this scenario.
  if (!mmltk::testsupport::checked_cuda_device_count()) SKIP("no CUDA device available");
  namespace media = mmltk::backend::media::video;
- const auto execution = gpu::resolve_device_execution(0, mmltk::common::system::NumaTopology::Capture());
- gpu::DeviceContext context(0, gpu::cuda_image_copy_backend(), gpu::DeviceContextMode::Isolated, execution.placement.numa_node, execution);
+ gpu::test_support::IsolatedTestDevice device;
+ const auto& execution = device.execution;
+ auto& context = device.context;
  context.Bind();
  gpu::ImageStream stream(context);
  mmltk::testsupport::ScopedTempDir temporary("prediction-video-composition");
@@ -261,8 +260,9 @@ TEST_CASE("prediction composition reaches decoded rotated annotated video withou
 TEST_CASE("video samples use actual decoded population despite AVI count metadata", "[controller][prediction][output][video][gpu]") {
  if (!mmltk::testsupport::checked_cuda_device_count()) SKIP("no CUDA device available");
  namespace media = mmltk::backend::media::video;
- const auto execution = gpu::resolve_device_execution(0, mmltk::common::system::NumaTopology::Capture());
- gpu::DeviceContext context(0, gpu::cuda_image_copy_backend(), gpu::DeviceContextMode::Isolated, execution.placement.numa_node, execution);
+ gpu::test_support::IsolatedTestDevice device;
+ const auto& execution = device.execution;
+ auto& context = device.context;
  context.Bind();
  gpu::ImageStream stream(context);
  mmltk::testsupport::ScopedTempDir temporary("prediction-video-count");

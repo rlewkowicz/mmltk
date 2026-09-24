@@ -25,7 +25,7 @@ namespace mmltk::backend::models::rfdetr {
 namespace runtime = mmltk::backend::ml::runtime;
 class RfdetrAnalysisProvider final : public runtime::AnalysisProvider {
 public:
- explicit RfdetrAnalysisProvider(const RfdetrAnalysisOptions& options);
+ explicit RfdetrAnalysisProvider(const RfdetrRuntimeBackendOptions& options);
  ~RfdetrAnalysisProvider() override;
 
 protected:
@@ -44,18 +44,8 @@ namespace {
 }
 }  // namespace
 struct RfdetrAnalysisProvider::Impl final {
- explicit Impl(const RfdetrAnalysisOptions& options)
-     : backend(make_rfdetr_runtime_backend({.artifacts = options.artifacts,
-        .backend = options.backend,
-        .device = options.device,
-        .command_stream = options.command_stream,
-        .static_resolution = options.static_resolution,
-        .maximum_detections = options.maximum_detections,
-        .save_compiled_model_path = {},
-        .allow_fp16 = options.allow_fp16})),
-       resolution(backend->static_resolution()),
-       device(backend->device()),
-       stream(reinterpret_cast<cudaStream_t>(backend->stream())) {
+ explicit Impl(const RfdetrRuntimeBackendOptions& options)
+     : backend(make_rfdetr_runtime_backend(options)), resolution(backend->static_resolution()), device(backend->device()), stream(reinterpret_cast<cudaStream_t>(backend->stream())) {
   using element_type = runtime::RuntimeElementType;
   if (resolution == 0U || device < 0 || stream == nullptr || (backend->input_element_type() != element_type::Float16 && backend->input_element_type() != element_type::Float32)) {
    throw std::invalid_argument("RF-DETR analysis requires a static float runtime lane");
@@ -84,9 +74,9 @@ struct RfdetrAnalysisProvider::Impl final {
  std::int32_t device = -1;
  cudaStream_t stream = nullptr;
 };
-RfdetrAnalysisProvider::RfdetrAnalysisProvider(const RfdetrAnalysisOptions& options) : impl_(std::make_unique<Impl>(options)) {}
+RfdetrAnalysisProvider::RfdetrAnalysisProvider(const RfdetrRuntimeBackendOptions& options) : impl_(std::make_unique<Impl>(options)) {}
 RfdetrAnalysisProvider::~RfdetrAnalysisProvider() = default;
-std::shared_ptr<runtime::AnalysisProvider> MakeRfdetrAnalysisProvider(const RfdetrAnalysisOptions& options) { return std::make_shared<RfdetrAnalysisProvider>(options); }
+std::shared_ptr<runtime::AnalysisProvider> MakeRfdetrAnalysisProvider(const RfdetrRuntimeBackendOptions& options) { return std::make_shared<RfdetrAnalysisProvider>(options); }
 RfdetrAnalysisProvider::ProviderWorkResult RfdetrAnalysisProvider::DoAnalyze(const runtime::AnalysisRequest& request) noexcept {
  try {
   if (request.source.device != impl_->device || request.source.channels != 3U || request.regions.size() > runtime::kMaximumAnalysisRegions || impl_->active_submission.has_value()) {

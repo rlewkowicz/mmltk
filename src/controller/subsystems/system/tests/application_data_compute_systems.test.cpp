@@ -438,16 +438,7 @@ TEST_CASE("export and predict wrappers share Busy Stop and failure isolation", "
    display.Bind();
    std::array<std::uint8_t, 4U * 4U * 4U> pixels{};
    const auto plane = completed.plane();
-   CUDA_MEMCPY2D copy{};
-   copy.srcMemoryType = CU_MEMORYTYPE_DEVICE;
-   copy.srcDevice = plane.data;
-   copy.srcPitch = plane.descriptor.pitch_bytes;
-   copy.dstMemoryType = CU_MEMORYTYPE_HOST;
-   copy.dstHost = pixels.data();
-   copy.dstPitch = 4U * 4U;
-   copy.WidthInBytes = 4U * 4U;
-   copy.Height = 4U;
-   REQUIRE(cuMemcpy2D(&copy) == CUDA_SUCCESS);
+   mmltk::frameworks::gpu::test_support::read_plane(plane, std::as_writable_bytes(std::span(pixels)));
    CHECK(std::ranges::all_of(pixels, [](auto value) { return value == 255U; }));
   }
   ready = request();

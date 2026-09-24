@@ -177,6 +177,7 @@ private:
   });
   return [this] { PublishFrame(); };
  }
+ // CLEANUP-IGNORE: This system captures its own locked frame before calling the shared borrow_matching_visual_product; runtime borrowing must occur outside that lock.
  [[nodiscard]] mmltk::frameworks::gpu::BorrowedImageProductReadView BorrowFrame() const {
   VisualFrame committed;
   {

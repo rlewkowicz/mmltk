@@ -424,6 +424,12 @@ public:
   }
   return advanced;
  }
+ void SetBoxes(bool enabled) {
+  plan.overlay.show_boxes = enabled;
+  ++plan.generation;
+  demand->store(plan.generation);
+  static_cast<void>(Begin());
+ }
  void Drain() {
   for (;;) {
    const auto observed = evidence.Epoch();
@@ -939,10 +945,7 @@ TEST_CASE("Native gallery retains slot products across hot reuse semantic change
  CHECK(gallery.Pixels(0U) == original);
  const auto stable_seed_identity = gallery.plan.dataset_identity;
  gallery.plan.overlay.show_masks = true;
- gallery.plan.overlay.show_boxes = false;
- ++gallery.plan.generation;
- gallery.demand->store(gallery.plan.generation);
- gallery.Begin();
+ gallery.SetBoxes(false);
  const auto old_masks = gallery.Pixels(1U);
  const auto replacement = directory.path() / "replacement.bin";
  write_gallery_artifact(replacement, 0.75F, 17U);
@@ -1923,10 +1926,7 @@ TEST_CASE("Native detail class selection reuses exact clean pixels and unchanged
  gallery.Drain();
  gallery.plan.mode = ExploreMode::Detail;
  gallery.plan.selected_image = 0U;
- gallery.plan.overlay.show_boxes = false;
- ++gallery.plan.generation;
- gallery.demand->store(gallery.plan.generation);
- gallery.Begin();
+ gallery.SetBoxes(false);
  const auto clean = gallery.Pixels(0U);
  const auto semantic = gallery.Pixels(1U);
  const auto reads = gallery.evidence.Count(VisualDiagnosticOperation::GalleryReadStarted);
@@ -1988,10 +1988,7 @@ TEST_CASE("Native superseded background work preserves incumbent planes and mean
  NativeGallery gallery{4U, false, true};
  gallery.Open(path);
  gallery.Drain();
- gallery.plan.overlay.show_boxes = false;
- ++gallery.plan.generation;
- gallery.demand->store(gallery.plan.generation);
- gallery.Begin();
+ gallery.SetBoxes(false);
  const auto clean = gallery.Pixels(0U);
  const auto semantic = gallery.Pixels(1U);
  // Initial demand retains 0..23. Row four is hot; new speculative rows

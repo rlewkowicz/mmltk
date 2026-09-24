@@ -1,4 +1,4 @@
-#include "src/backend/ml/torch/tests/catch_support.h"
+#include "src/backend/ml/torch/tests/tensor_fixture.h"
 #include "src/backend/models/rfdetr/training/detail/native_optimizer_private.h"
 #include "src/backend/models/rfdetr/training/detail/training_step.h"
 #include "src/backend/models/rfdetr/core/detection_ops.h"
@@ -16,13 +16,25 @@
 #include "src/backend/ml/torch/archive.h"
 namespace {
 namespace rf = mmltk::backend::models::rfdetr;
+namespace tensor_fixture = mmltk::backend::ml::testsupport;
+torch::serialize::InputArchive optimizer_checkpoint(rf::NativeOptimizer& optimizer) {
+ mmltk::backend::ml::cuda::TensorReadbackBuffers readback;
+ readback.Begin();
+ optimizer.reserve_checkpoint(readback, 0);
+ torch::serialize::OutputArchive archive;
+ optimizer.save(archive, readback, 0);
+ readback.Complete();
+ std::stringstream bytes;
+ archive.save_to(bytes);
+ torch::serialize::InputArchive restored;
+ restored.load_from(bytes);
+ return restored;
+}
 // Independent equations: RF-DETR e9a138f module_model.py:607-611,1296;
 // Lightning 2.6.0 ClosureResult; PyTorch 2.9 Adam and AveragedModel.
 // Native FP32/FP64 policy, no TF32 changes, no epoch-trajectory/AP claim.
 TEST_CASE("Stock AdamW owns each parameter age and double accumulation division", "[rfdetr][training][parity]") {
- std::vector<torch::Device> devices{torch::Device(torch::kCPU)};
- if (mmltk::testsupport::checked_cuda_device_count()) devices.emplace_back(torch::kCUDA);
- for (const auto device : devices)
+ for (const auto device : tensor_fixture::available_devices())
   for (const auto backend : {rf::NativeOptimizerBackend::eager, rf::NativeOptimizerBackend::foreach, rf::NativeOptimizerBackend::fused}) {
    if (backend == rf::NativeOptimizerBackend::fused && device.is_cpu()) continue;
    for (const int count : {1, 4})
@@ -85,16 +97,7 @@ TEST_CASE("Stock AdamW owns each parameter age and double accumulation division"
       REQUIRE(torch::allclose(b, reference[1], 2e-6, 2e-8));
       if (step == 1) {
        // Save and reload genuinely unequal ages (2 versus 1), including moments.
-       mmltk::backend::ml::cuda::TensorReadbackBuffers readback;
-       readback.Begin();
-       optimizer.reserve_checkpoint(readback, 0);
-       torch::serialize::OutputArchive archive;
-       optimizer.save(archive, readback, 0);
-       readback.Complete();
-       std::stringstream bytes;
-       archive.save_to(bytes);
-       torch::serialize::InputArchive restored;
-       restored.load_from(bytes);
+       auto restored = optimizer_checkpoint(optimizer);
        optimizer.load(restored);
       }
      }
@@ -195,17 +198,6 @@ TEST_CASE("Recoverable AMP overflow preserves AdamW and advances EMA attempts", 
   REQUIRE(torch::allclose(ema.shadow_params()[0], expected, 1e-6, 1e-7));
  }
 }
-struct MatrixPrecision {
- bool cudnn = at::globalContext().allowTF32CuDNN(), cublas = at::globalContext().allowTF32CuBLAS();
- MatrixPrecision() {
-  at::globalContext().setAllowTF32CuDNN(false);
-  at::globalContext().setAllowTF32CuBLAS(false);
- }
- ~MatrixPrecision() {
-  at::globalContext().setAllowTF32CuDNN(cudnn);
-  at::globalContext().setAllowTF32CuBLAS(cublas);
- }
-};
 class FullPrecisionProbe : public torch::autograd::Function<FullPrecisionProbe> {
 public:
  static torch::Tensor forward(torch::autograd::AutogradContext* ctx, const torch::Tensor& input, const torch::Tensor& weight) {
@@ -221,7 +213,7 @@ public:
 };
 TEST_CASE("Main backward and parallel gradient harvesting execute FP32 probe derivatives outside AMP", "[rfdetr][training][parity]") {
  if (!mmltk::testsupport::checked_cuda_device_count()) SKIP("CUDA unavailable; backward dispatch evidence unverified");
- MatrixPrecision precision;
+ tensor_fixture::FullMatrixPrecision precision;
  for (const auto dtype : {torch::kFloat16, torch::kBFloat16})
   for (const bool parallel : {false, true})
    for (int count : {1, 4}) {
@@ -247,9 +239,7 @@ TEST_CASE("Main backward and parallel gradient harvesting execute FP32 probe der
    }
 }
 TEST_CASE("Production step and canonical groups match distributed stock AdamW with resumed warmup", "[rfdetr][training][parity]") {
- std::vector<torch::Device> devices{torch::Device(torch::kCPU)};
- if (mmltk::testsupport::checked_cuda_device_count()) devices.emplace_back(torch::kCUDA);
- for (const auto device : devices)
+ for (const auto device : tensor_fixture::available_devices())
   for (int count : {1, 4})
    for (bool parallel : {false, true}) {
     rf::TrainRequest request;
@@ -376,16 +366,7 @@ TEST_CASE("Production step and canonical groups match distributed stock AdamW wi
      scaler.update(false);
      for (size_t i = 0; i < 4; ++i) REQUIRE(torch::allclose(optimizer.parameters()[i], reference[i], 2e-5, 2e-6));
      if (update == 2) {
-      mmltk::backend::ml::cuda::TensorReadbackBuffers readback;
-      readback.Begin();
-      optimizer.reserve_checkpoint(readback, 0);
-      torch::serialize::OutputArchive archive;
-      optimizer.save(archive, readback, 0);
-      readback.Complete();
-      std::stringstream bytes;
-      archive.save_to(bytes);
-      torch::serialize::InputArchive restored;
-      restored.load_from(bytes);
+      auto restored = optimizer_checkpoint(optimizer);
       auto candidate = optimizer.stage_load(restored);
       optimizer.commit(std::move(candidate));
       // Next update is epoch 1 * three steps/epoch, still inside floor(4.5).

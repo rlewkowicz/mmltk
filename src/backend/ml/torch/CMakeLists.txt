@@ -116,6 +116,6 @@ endfunction()
 add_library(mmltk_backend_ml_torch_test_support INTERFACE)
 mmltk_register_public_headers(mmltk_backend_ml_torch_test_support
     BASE_DIRS ${CMAKE_SOURCE_DIR}
-    FILES tests/catch_support.h)
+    FILES tests/catch_support.h tests/tensor_fixture.h)
 target_link_libraries(mmltk_backend_ml_torch_test_support INTERFACE
     mmltk::backend::ml::torch_dependencies mmltk_test_support)

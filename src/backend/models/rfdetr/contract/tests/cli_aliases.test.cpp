@@ -90,7 +90,7 @@ void test_normalize_weights_requires_paths() {
  REQUIRE((result.exit_code == 1));
  REQUIRE((result.output_text.find("rfdetr normalize-weights requires --input and --output") != std::string::npos));
 }
-void test_train_help_lists_optimizer_controls() {
+void test_train_help_lists_training_controls() {
  const SubprocessResult result = run_subprocess_capture_output({
   mmltk_cli_path(),
   "rfdetr",
@@ -109,15 +109,6 @@ void test_train_help_lists_optimizer_controls() {
  REQUIRE((single != std::string::npos));
  REQUIRE((multiple != std::string::npos));
  REQUIRE((single < multiple));
-}
-void test_train_help_lists_canonical_supervision_controls() {
- const SubprocessResult result = run_subprocess_capture_output({
-  mmltk_cli_path(),
-  "rfdetr",
-  "train",
-  "--help",
- });
- REQUIRE((result.exit_code == 0));
  for (const char* option : {
        "--assignment",
        "--match-free-rho",
@@ -210,8 +201,7 @@ TEST_CASE("test_top_level_help_lists_primary_commands", "[model][rfdetr][cli_ali
 TEST_CASE("test_predict_help_lists_model_inputs", "[model][rfdetr][cli_aliases][cli]") { test_predict_help_lists_model_inputs(); }
 TEST_CASE("test_info_requires_exactly_one_model_input", "[model][rfdetr][cli_aliases][cli]") { test_info_requires_exactly_one_model_input(); }
 TEST_CASE("test_normalize_weights_requires_paths", "[model][rfdetr][cli_aliases][cli]") { test_normalize_weights_requires_paths(); }
-TEST_CASE("test_train_help_lists_optimizer_controls", "[model][rfdetr][cli_aliases][cli]") { test_train_help_lists_optimizer_controls(); }
-TEST_CASE("test_train_help_lists_canonical_supervision_controls", "[model][rfdetr][cli_aliases][cli][training_supervision]") { test_train_help_lists_canonical_supervision_controls(); }
+TEST_CASE("test_train_help_lists_training_controls", "[model][rfdetr][cli_aliases][cli][training_supervision]") { test_train_help_lists_training_controls(); }
 TEST_CASE("test_train_assignment_spellings_parse_through_the_canonical_descriptor", "[model][rfdetr][cli_aliases][cli][training_supervision]") {
  test_train_assignment_spellings_parse_through_the_canonical_descriptor();
 }

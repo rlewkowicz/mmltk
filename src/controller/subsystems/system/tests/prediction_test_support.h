@@ -9,6 +9,7 @@
 #include "src/controller/subsystems/export/export_system.h"
 #include "src/controller/subsystems/system/predict_system.h"
 #include "src/controller/subsystems/system/detail/prediction_preview.h"
+#include "src/frameworks/gpu/tests/device_execution_fixture.h"
 #include <atomic>
 #include <array>
 #include <condition_variable>
@@ -86,6 +87,11 @@ public:
 
 private:
  PredictionReceiverFault* previous_;
+};
+struct PredictionReceiverFixture final {
+ mmltk::frameworks::gpu::test_support::IsolatedTestDevice device;
+ PredictionReceiverFault fault;
+ ScopedPredictionReceiverFault receiver{fault};
 };
 // Delegates real allocations/events/streams to CUDA. Failure is reported only
 // after the actual output stream settles, preserving a safe test process.

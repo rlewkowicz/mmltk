@@ -42,19 +42,13 @@ void publish_staged_path_atomically(const std::filesystem::path& staging, const 
  const auto status = std::filesystem::symlink_status(destination, status_error);
  if (status_error && status_error != std::errc::no_such_file_or_directory) { throw std::filesystem::filesystem_error("failed to inspect publication destination", destination, status_error); }
  const bool exists = !status_error && status.type() != std::filesystem::file_type::not_found;
- if (!overwrite) {
-  if (exists) throw std::runtime_error("publication destination already exists: " + destination.string());
-  if (::syscall(SYS_renameat2, AT_FDCWD, staging.c_str(), AT_FDCWD, destination.c_str(), RENAME_NOREPLACE) != 0) { throw errno_error("atomic no-replace publication failed", destination.string()); }
-  try {
-   sync_parent_directory(destination);
-  } catch (...) {
-   std::filesystem::rename(destination, staging);
-   throw;
+ if (!overwrite || !exists) {
+  if (!overwrite) {
+   if (exists) throw std::runtime_error("publication destination already exists: " + destination.string());
+   if (::syscall(SYS_renameat2, AT_FDCWD, staging.c_str(), AT_FDCWD, destination.c_str(), RENAME_NOREPLACE) != 0) { throw errno_error("atomic no-replace publication failed", destination.string()); }
+  } else {
+   std::filesystem::rename(staging, destination);
   }
-  return;
- }
- if (!exists) {
-  std::filesystem::rename(staging, destination);
   try {
    sync_parent_directory(destination);
   } catch (...) {

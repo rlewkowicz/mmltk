@@ -342,6 +342,15 @@ impl<'a, Message: 'a> From<StatusText<'a>> for Element<'a, Message> {
 #[cfg(test)]
 mod tests {
     use super::fit;
+    fn paragraph_text(paragraph: &super::Paragraph) -> String {
+        paragraph
+            .buffer()
+            .lines
+            .iter()
+            .map(|line| line.text())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
     #[test]
     fn largest_half_pixel_fit_preserves_normal_and_floor() {
         for (width, expected) in [
@@ -486,16 +495,7 @@ mod tests {
             .state
             .downcast_ref::<widget::text::State<Paragraph>>()
             .raw();
-        assert_eq!(
-            hover
-                .buffer()
-                .lines
-                .iter()
-                .map(|line| line.text())
-                .collect::<Vec<_>>()
-                .join("\n"),
-            original
-        );
+        assert_eq!(paragraph_text(hover), original);
         assert!(hover.min_height() > node.size().height);
         element.as_widget_mut().update(
             &mut tree,
@@ -756,16 +756,7 @@ mod tests {
             .downcast_ref::<widget::text::State<Paragraph>>()
             .raw();
         assert_eq!(hover.wrapping(), text::Wrapping::WordOrGlyph);
-        assert_eq!(
-            hover
-                .buffer()
-                .lines
-                .iter()
-                .map(|line| line.text())
-                .collect::<Vec<_>>()
-                .join("\n"),
-            original
-        );
+        assert_eq!(paragraph_text(hover), original);
         assert!(hover.buffer().layout_runs().count() > 1);
         assert!(hover.min_width() <= hover.bounds().width + 0.1);
         assert!(hover.min_height() <= hover.bounds().height + 0.1);

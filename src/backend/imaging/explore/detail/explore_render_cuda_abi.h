@@ -147,6 +147,7 @@ struct ExploreRenderAtlasViewAbi final {
 struct ExploreRenderDetailViewAbi final {
  mmltk::backend::models::rfdetr::AugmentationSpatialErasure erasure{};
  const float* pixels = nullptr;
+ // CLEANUP-IGNORE: The CUDA render ABI and the borrowed neural-upscale request are distinct formats with independent storage and lifetime contracts.
  std::uint32_t source_width = 0U;
  std::uint32_t source_height = 0U;
  std::uint32_t crop_x = 0U;

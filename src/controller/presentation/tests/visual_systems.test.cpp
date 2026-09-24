@@ -32,6 +32,7 @@
 #include <span>
 #include <variant>
 #include <vector>
+// CLEANUP-IGNORE: Namespace and using declarations provide test-local names; the fixture algorithms already have shared owners.
 namespace mmltk::controller {
 namespace {
 using namespace visual_test_support;

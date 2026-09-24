@@ -766,11 +766,7 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
      mmltk::common::logging::ScopedProfile profile_benchmark_rfdetr_train_augmentation{"benchmark.rfdetr.train.augmentation"};
      normalized = single_lane_augmenter->run(*batch, static_cast<std::uint64_t>(options.seed), epoch, distributed.rank, local_full_batches - 1);
     }
-    torch::Tensor loss;
-    torch::Tensor class_loss;
-    torch::Tensor box_loss;
-    scalar_packet::Tensors scalar_values;
-    TensorMap loss_dict;
+    RoutedTrainingLoss loss_result;
     auto& model_owner = (model);
     PreparedTargets prepared;
     {
@@ -808,41 +804,37 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
       SupervisionTimingLease criterion_timing(model_owner, true, SupervisionTimingLease::Kind::Criterion);
       auto routed = compute_routed_training_loss(model, training_route, outputs, prepared, *active_normalizer, detection_config);
       criterion_timing.finish();
-      loss = std::move(routed.total);
-      class_loss = std::move(routed.classification);
-      box_loss = std::move(routed.box);
-      loss_dict = std::move(routed.ordinary_terms);
-      scalar_values = std::move(routed.scalars);
+      loss_result = std::move(routed);
      } else {
       mmltk::common::logging::ScopedProfile profile_rfdetr_train_forward{"rfdetr.train.forward"};
       outputs = model.forward(NestedTensor{normalized, prepared.nested_mask}, true);
       mmltk::common::logging::ScopedProfile profile_rfdetr_train_targets_handoff{"rfdetr.train.targets_handoff"};
       target_consumer.handoff();
       mmltk::common::logging::ScopedProfile profile_rfdetr_train_loss_dict{"rfdetr.train.loss_dict"};
-      loss_dict = detection_loss_dict(outputs, prepared, detection_config, true, distributed.enabled,
+      loss_result.ordinary_terms = detection_loss_dict(outputs, prepared, detection_config, true, distributed.enabled,
        distributed.enabled ? AllReduceTensorFn([&distributed](torch::Tensor& value) { distributed_all_reduce_tensor(distributed, value); }) : AllReduceTensorFn{});
      }
      if (!route_is_active(training_route)) {
       mmltk::common::logging::ScopedProfile profile_rfdetr_train_loss_total{"rfdetr.train.loss_total"};
       torch::Tensor auxiliary;
-      loss = weighted_detection_loss(loss_dict, detection_config, normalized.device(), &auxiliary);
-      scalar_values = ordinary_scalar_tensors(loss_dict, loss, auxiliary);
-      class_loss = loss_value_or_zero(loss_dict, normalized.device(), "loss_ce");
-      box_loss = loss_value_or_zero(loss_dict, normalized.device(), "loss_bbox");
+      loss_result.total = weighted_detection_loss(loss_result.ordinary_terms, detection_config, normalized.device(), &auxiliary);
+      loss_result.scalars = ordinary_scalar_tensors(loss_result.ordinary_terms, loss_result.total, auxiliary);
+      loss_result.classification = loss_value_or_zero(loss_result.ordinary_terms, normalized.device(), "loss_ce");
+      loss_result.box = loss_value_or_zero(loss_result.ordinary_terms, normalized.device(), "loss_bbox");
      }
     });
-    metric_handoff.accumulate(loss, class_loss, box_loss, scalar_values);
+    metric_handoff.accumulate(loss_result.total, loss_result.classification, loss_result.box, loss_result.scalars);
     ++local_micro_batches;
     ++local_waves;
     {
      mmltk::common::logging::ScopedProfile profile_rfdetr_train_backward{"rfdetr.train.backward"};
-     step.backward(loss);
+     step.backward(loss_result.total);
      train_runtime.matcher_workspace().complete_assignments(torch_cuda::getCurrentCUDAStream(torch_cuda::checked_device_index(options.device_id)).stream());
     }
     target_consumer.retire();
     step_timing.finish();
     if (local_waves % options.grad_accum_steps == 0) {
-     run_optimizer_step([] {}, &loss_dict, 1);
+     run_optimizer_step([] {}, &loss_result.ordinary_terms, 1);
      static_cast<void>(model.harvest_supervision_timing());
     }
     if (progress) { progress->add(static_cast<size_t>(options.batch_size)); }

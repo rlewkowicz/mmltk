@@ -133,8 +133,7 @@ VisualRuntimeFactory make_native_live_runtime_factory(const VisualDeviceSettings
    .execution = execution,
    .product_revisions = std::move(revisions),
   };
-  configure_visual_workspace_finalization(config);
-  return std::make_unique<mmltk::frameworks::gpu::SystemImageRuntime>(std::move(config));
+  return make_visual_runtime(std::move(config));
  };
 }
 }  // namespace mmltk::controller

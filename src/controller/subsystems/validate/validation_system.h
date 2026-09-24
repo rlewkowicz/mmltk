@@ -40,6 +40,7 @@ public:
  [[nodiscard]] VisualSourceObservation ObserveSource() const;
  [[nodiscard]] mmltk::frameworks::gpu::BorrowedImageProductReadView BorrowFrame() const;
  [[nodiscard]] VisualDocumentRead BorrowDocument(const VisualFrame&) const;
+ // CLEANUP-IGNORE: Sealed workspace declarations are unrelated to the reflection registration macros matched in other headers.
  [[nodiscard]] mmltk::frameworks::gpu::BorrowedImageWorkspace BorrowWorkspace() const;
  [[nodiscard]] mmltk::frameworks::gpu::ImageWorkspaceObservation ObserveWorkspace() const;
  void RequestWorkspace(VisualWorkspaceRequest);

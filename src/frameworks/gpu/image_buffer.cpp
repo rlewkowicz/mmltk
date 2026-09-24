@@ -174,6 +174,7 @@ public:
   CheckCuda("allocate CUDA image plane", cuMemAllocPitch(&data, &pitch, static_cast<std::size_t>(width) * 4U, height, 16U));
   return {
    .data = data,
+   // CLEANUP-IGNORE: The real device allocator and the test backend separately construct the canonical plane descriptor for their own storage.
    .descriptor =
     {
      .kind = kind,

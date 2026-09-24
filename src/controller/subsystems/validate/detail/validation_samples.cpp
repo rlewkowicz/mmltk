@@ -54,8 +54,7 @@ public:
           .execution = execution_,
           .product_revisions = std::move(revisions),
           .adopted_context = context_};
-         configure_visual_workspace_finalization(config);
-         return std::make_unique<gpu::SystemImageRuntime>(std::move(config));
+         return make_visual_runtime(std::move(config));
         },
         [this](std::exception_ptr) {
          {

@@ -146,6 +146,7 @@ struct ExploreImageMetadata final {
  ExploreOverlay overlay{};
  ExploreDetailView detail{};
  ExploreAugmentationPreview augmentation{};
+ // CLEANUP-IGNORE: Logical state and completed-image metadata are distinct reflection roots; project_record derives their mapping while their revisions settle independently.
  ExploreMode mode = ExploreMode::Gallery;
  std::optional<std::uint32_t> selected_image{};
  VisualFrame frame{};

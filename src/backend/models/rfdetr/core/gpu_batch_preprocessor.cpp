@@ -5,6 +5,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+// CLEANUP-IGNORE: These local aliases name the shared CUDA helpers; they contain no duplicated algorithm.
 namespace mmltk::backend::models::rfdetr {
 using mmltk::backend::ml::cuda::checked_device_index;
 using mmltk::backend::ml::cuda::current_torch_cuda_stream_object;

@@ -31,7 +31,7 @@ struct VisualWorkspaceRequest final {
  std::function<void()> ready;
  std::shared_ptr<const VisualWorkspaceDiagnostics> diagnostics{};
 };
-void configure_visual_workspace_finalization(mmltk::frameworks::gpu::SystemImageRuntimeConfig&);
+[[nodiscard]] std::unique_ptr<mmltk::frameworks::gpu::SystemImageRuntime> make_visual_runtime(mmltk::frameworks::gpu::SystemImageRuntimeConfig);
 [[nodiscard]] mmltk::frameworks::gpu::DeviceExecution resolve_visual_device_execution(const VisualDeviceSettings&);
 MMLTK_REFLECT_FIELDS(VisualDeviceSettings)
 }  // namespace mmltk::controller

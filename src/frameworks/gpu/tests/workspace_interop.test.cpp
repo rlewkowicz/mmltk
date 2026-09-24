@@ -1,3 +1,4 @@
+#include "src/frameworks/gpu/tests/device_execution_fixture.h"
 #include "src/frameworks/gpu/cuda_context_scope.h"
 #include "src/frameworks/gpu/tests/vulkan_workspace_fixture.h"
 #include "src/test_support/async_test_utils.hpp"
@@ -545,6 +546,7 @@ TEST_CASE("Producer mapping replacement reports release failure and retains back
  ImageWorkspaceTestAccess::Reset();
 }
 TEST_CASE("Delayed attached product release reports physical failure through producer custody", "[gpu][workspace]") {
+ // CLEANUP-IGNORE: WorkspaceTestFixture already owns this setup; local aliases expose resources used by different interop scenarios.
  using test_support::ImageWorkspaceTestAccess;
  mmltk::frameworks::gpu::test_support::WorkspaceTestFixture resources{true};
  REQUIRE(resources.prepared);
@@ -1493,16 +1495,7 @@ TEST_CASE("Late workspace admission preserves raw storage then aliases the next 
  const auto check_pixels = [](ImagePlaneView plane, DeviceContext context) {
   context.Bind();
   std::vector<std::byte> pixels(plane.descriptor.row_bytes() * plane.descriptor.height);
-  CUDA_MEMCPY2D copy{};
-  copy.srcMemoryType = CU_MEMORYTYPE_DEVICE;
-  copy.srcDevice = plane.data;
-  copy.srcPitch = plane.descriptor.pitch_bytes;
-  copy.dstMemoryType = CU_MEMORYTYPE_HOST;
-  copy.dstHost = pixels.data();
-  copy.dstPitch = plane.descriptor.row_bytes();
-  copy.WidthInBytes = plane.descriptor.row_bytes();
-  copy.Height = plane.descriptor.height;
-  REQUIRE(cuMemcpy2D(&copy) == CUDA_SUCCESS);
+  mmltk::frameworks::gpu::test_support::read_plane(plane, std::as_writable_bytes(std::span(pixels)));
   CHECK(std::ranges::all_of(pixels, [](auto byte) { return byte == std::byte{37U}; }));
  };
  const auto prepare = [&](const std::shared_ptr<ImageWorkspace>& target) {
@@ -1630,15 +1623,7 @@ TEST_CASE("Display damage transfers preserve complete pixels in both physical de
   display.Bind();
   std::array<std::uint8_t, 48U> bytes{};
   const auto plane = workspace->plane(4U, 3U);
-  CUDA_MEMCPY2D read{};
-  read.srcMemoryType = CU_MEMORYTYPE_DEVICE;
-  read.srcDevice = plane.data;
-  read.srcPitch = plane.descriptor.pitch_bytes;
-  read.dstMemoryType = CU_MEMORYTYPE_HOST;
-  read.dstHost = bytes.data();
-  read.dstPitch = read.WidthInBytes = 16U;
-  read.Height = 3U;
-  REQUIRE(cuMemcpy2D(&read) == CUDA_SUCCESS);
+  mmltk::frameworks::gpu::test_support::read_plane(plane, std::as_writable_bytes(std::span(bytes)));
   for (std::size_t index = 0U; index != bytes.size(); ++index) CHECK(bytes[index] == (changed && index >= 20U && index < 28U ? 173U : semantic ? 91U : 37U));
  };
  publish(false);

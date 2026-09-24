@@ -128,6 +128,7 @@ function(mmltk_add_backend_models_rfdetr_training_tests)
     target_link_libraries(
         mmltk_backend_models_rfdetr_training_tests PRIVATE
         mmltk_backend_models_rfdetr_augmentation_test_support
+        mmltk_backend_models_rfdetr_training_fixture
         mmltk::backend::models::rfdetr::export
         mmltk_backend_ml_torch_test_support
         mmltk::backend::models::rfdetr::augmentation

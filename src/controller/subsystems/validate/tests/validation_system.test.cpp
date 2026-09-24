@@ -540,15 +540,14 @@ TEST_CASE("validation composition preserves independent nonempty box and mask pi
   CHECK(frame->classes()[1] == "truth");
  }
 }
-// CLEANUP-IGNORE: This storage-reuse case shares only aliases and one policy call with the independent pixel-oracle case.
 TEST_CASE("retained validation preparation follows physical storage and changed regions", "[controller][gpu][validation]") {
  namespace gpu = mmltk::frameworks::gpu;
  namespace rfdetr = mmltk::backend::models::rfdetr;
  using Composition = detail::PredictionPreviewComposition;
- const auto execution = gpu::resolve_device_execution(0, mmltk::common::system::NumaTopology::Capture());
- gpu::DeviceContext context(0, gpu::cuda_image_copy_backend(), gpu::DeviceContextMode::Isolated, execution.placement.numa_node, execution);
- PredictionReceiverFault fault;
- ScopedPredictionReceiverFault receiver(fault);
+ PredictionReceiverFixture receiver;
+ const auto& execution = receiver.device.execution;
+ auto& context = receiver.device.context;
+ auto& fault = receiver.fault;
  detail::PredictionPreviewPool pool(execution, context, PredictionReceiverFault::Operations(), {}, 6U);
  gpu::SystemImageRuntime runtime({.device = 0, .output_layout = gpu::ImageProductLayout::CleanAndSemantic, .output_buffer_count = 2U, .adopted_context = context});
  Composition retained;
@@ -959,6 +958,41 @@ private:
  mmltk::controller::contracts::ComputeOperationOutcome outcome_;
 };
 }  // namespace
+namespace {
+mmltk::backend::imaging::raster::RenderedImageWriter::PngEncoder pending_png_encoder(mmltk::testsupport::TestGate& encoding) {
+ return [gate = encoding.receipt()](const char* path, int width, int height, int channels, const void* pixels, int stride) {
+  gate.ArriveAndWait();
+  return stbi_write_png(path, width, height, channels, pixels, stride);
+ };
+}
+class PendingValidationRun final {
+ struct Release {
+  mmltk::controller::ValidationSystem& validation;
+  mmltk::testsupport::TestGate& encoding;
+  void operator()() const {
+   encoding.Release();
+   validation.Shutdown();
+  }
+ };
+ mmltk::testsupport::ScopedTestCleanup<Release> release_;
+
+public:
+ PendingValidationRun(mmltk::controller::ValidationSystem& validation, mmltk::testsupport::TestGate& encoding) : release_(Release{validation, encoding}) {
+  static_cast<void>(validation.Start({}));
+  REQUIRE(encoding.WaitEntered(std::chrono::seconds(5)));
+ }
+};
+void check_validation_sample(const std::filesystem::path& path) {
+ CHECK(path.filename() == "sample-7.png");
+ CHECK_FALSE(std::filesystem::exists(path.string() + ".partial"));
+ int width = 0, height = 0, channels = 0;
+ std::unique_ptr<stbi_uc, decltype(&stbi_image_free)> pixels(stbi_load(path.c_str(), &width, &height, &channels, 4), stbi_image_free);
+ REQUIRE(pixels);
+ CHECK(width == 32);
+ CHECK(height == 24);
+ CHECK(pixels.get()[0] == 64U);
+}
+}  // namespace
 TEST_CASE("validation public Stop and Shutdown settle an engaged PNG before terminal output facts", "[controller][validation][gpu][output]") {
  using namespace mmltk::controller;
  const bool shutdown = GENERATE(false, true);
@@ -979,17 +1013,8 @@ TEST_CASE("validation public Stop and Shutdown settle an engaged PNG before term
     } catch (const std::future_error&) {}
    }
   },
-  execution, {},
-  [gate = encoding.receipt()](const char* path, int width, int height, int channels, const void* pixels, int stride) {
-   gate.ArriveAndWait();
-   return stbi_write_png(path, width, height, channels, pixels, stride);
-  });
- mmltk::testsupport::ScopedTestCleanup release([&] {
-  encoding.Release();
-  validation.Shutdown();
- });
- static_cast<void>(validation.Start({}));
- REQUIRE(encoding.WaitEntered(std::chrono::seconds(5)));
+  execution, {}, pending_png_encoder(encoding));
+ PendingValidationRun run(validation, encoding);
  std::future<void> joining;
  std::promise<void> shutdown_entered;
  if (shutdown)
@@ -1013,14 +1038,7 @@ TEST_CASE("validation public Stop and Shutdown settle an engaged PNG before term
  REQUIRE(settled.metrics);
  CHECK(settled.metrics->bbox.ap == 0.625);
  const auto path = std::filesystem::path(settled.operation.output.recent_sample);
- CHECK(path.filename() == "sample-7.png");
- CHECK_FALSE(std::filesystem::exists(path.string() + ".partial"));
- int width = 0, height = 0, channels = 0;
- std::unique_ptr<stbi_uc, decltype(&stbi_image_free)> pixels(stbi_load(path.c_str(), &width, &height, &channels, 4), stbi_image_free);
- REQUIRE(pixels);
- CHECK(width == 32);
- CHECK(height == 24);
- CHECK(pixels.get()[0] == 64U);
+ check_validation_sample(path);
 }
 TEST_CASE("validation runtime throw settles selected PNG before failure and restart", "[controller][validation][gpu][output]") {
  using namespace mmltk::controller;
@@ -1045,17 +1063,8 @@ TEST_CASE("validation runtime throw settles selected PNG before failure and rest
     } catch (const std::future_error&) {}
    }
   },
-  execution, {},
-  [gate = encoding.receipt()](const char* path, int width, int height, int channels, const void* pixels, int stride) {
-   gate.ArriveAndWait();
-   return stbi_write_png(path, width, height, channels, pixels, stride);
-  });
- mmltk::testsupport::ScopedTestCleanup release([&] {
-  encoding.Release();
-  validation.Shutdown();
- });
- static_cast<void>(validation.Start({}));
- REQUIRE(encoding.WaitEntered(std::chrono::seconds(5)));
+  execution, {}, pending_png_encoder(encoding));
+ PendingValidationRun run(validation, encoding);
  CHECK(failure.wait_for(std::chrono::milliseconds(0)) == std::future_status::timeout);
  CHECK(validation.snapshot().operation.active);
  encoding.Release();
@@ -1063,14 +1072,7 @@ TEST_CASE("validation runtime throw settles selected PNG before failure and rest
  CHECK(settled.operation.terminal.detail.find("selected runtime failed after delivery") != std::string::npos);
  CHECK(settled.operation.output.completed_samples == 1U);
  const auto path = std::filesystem::path(settled.operation.output.recent_sample);
- CHECK(path.filename() == "sample-7.png");
- CHECK_FALSE(std::filesystem::exists(path.string() + ".partial"));
- int width = 0, height = 0, channels = 0;
- std::unique_ptr<stbi_uc, decltype(&stbi_image_free)> pixels(stbi_load(path.c_str(), &width, &height, &channels, 4), stbi_image_free);
- REQUIRE(pixels);
- CHECK(width == 32);
- CHECK(height == 24);
- CHECK(pixels.get()[0] == 64U);
+ check_validation_sample(path);
  static_cast<void>(validation.Start({}));
  const auto fresh = mmltk::testsupport::await_test_promise(restarted, "validation restart after throw", std::chrono::seconds(10));
  CHECK(fresh.operation.output.completed_samples == 0U);

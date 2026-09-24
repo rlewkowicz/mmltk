@@ -10,6 +10,7 @@
 */
 #include <ATen/cuda/Atomic.cuh>
 #include <algorithm>
+#include <cstddef>
 #include <cstdint>
 namespace mmltk::backend::ml::layers {
 #define MMLTK_ML_LAYERS_CUDA_KERNEL_LOOP(i, n) \
@@ -218,18 +219,18 @@ struct SharedLinearGradientReduction {
   cache_grad_attn_weight[0] = grad_a;
  }
 };
+template <typename scalar_t>
+__device__ void add_cached_gradient(scalar_t* sampling, scalar_t* attention, std::size_t destination, std::size_t source) {
+ attention[destination] += attention[source];
+ sampling[destination * 2U] += sampling[source * 2U];
+ sampling[destination * 2U + 1U] += sampling[source * 2U + 1U];
+}
 template <typename scalar_t, typename SizeT>
 struct SharedTreeGradientReduction {
  SizeT thread_count = 0;
  __device__ void operator()(scalar_t* cache_grad_sampling_loc, scalar_t* cache_grad_attn_weight, const unsigned int tid) const {
   for (SizeT s = thread_count / 2; s > 0; s >>= 1) {
-   if (tid < s) {
-    const unsigned int xid1 = tid << 1;
-    const unsigned int xid2 = (tid + s) << 1;
-    cache_grad_attn_weight[tid] += cache_grad_attn_weight[tid + s];
-    cache_grad_sampling_loc[xid1] += cache_grad_sampling_loc[xid2];
-    cache_grad_sampling_loc[xid1 + 1] += cache_grad_sampling_loc[xid2 + 1];
-   }
+   if (tid < s) { add_cached_gradient(cache_grad_sampling_loc, cache_grad_attn_weight, tid, tid + s); }
    __syncthreads();
   }
  }
@@ -240,16 +241,8 @@ struct SharedTreeGradientReductionV2 {
  __device__ void operator()(scalar_t* cache_grad_sampling_loc, scalar_t* cache_grad_attn_weight, const unsigned int tid) const {
   for (SizeT s = thread_count / 2, spre = thread_count; s > 0; s >>= 1, spre >>= 1) {
    if (tid < s) {
-    const unsigned int xid1 = tid << 1;
-    const unsigned int xid2 = (tid + s) << 1;
-    cache_grad_attn_weight[tid] += cache_grad_attn_weight[tid + s];
-    cache_grad_sampling_loc[xid1] += cache_grad_sampling_loc[xid2];
-    cache_grad_sampling_loc[xid1 + 1] += cache_grad_sampling_loc[xid2 + 1];
-    if (tid + (s << 1) < spre) {
-     cache_grad_attn_weight[tid] += cache_grad_attn_weight[tid + (s << 1)];
-     cache_grad_sampling_loc[xid1] += cache_grad_sampling_loc[xid2 + (s << 1)];
-     cache_grad_sampling_loc[xid1 + 1] += cache_grad_sampling_loc[xid2 + 1 + (s << 1)];
-    }
+    add_cached_gradient(cache_grad_sampling_loc, cache_grad_attn_weight, tid, tid + s);
+    if (tid + (s << 1) < spre) { add_cached_gradient(cache_grad_sampling_loc, cache_grad_attn_weight, tid, tid + (s << 1)); }
    }
    __syncthreads();
   }
@@ -449,19 +442,13 @@ __global__ void ms_deformable_col2im_gpu_kernel_gm(const int n, MMLTK_ML_LAYERS_
  }
 }
 template <typename scalar_t>
-struct MsDeformableCol2ImLaunchArgs {
+struct MsDeformableCol2ImLaunchArgs : ms_deform_attn_launch::AttentionShape {
  const scalar_t* grad_col = nullptr;
  const scalar_t* data_value = nullptr;
  ms_deform_attn_launch::DeviceLayout data_layout{};
  const scalar_t* data_sampling_loc = nullptr;
  const scalar_t* data_attn_weight = nullptr;
  int batch_size = 0;
- int spatial_size = 0;
- int num_heads = 0;
- int channels = 0;
- int num_levels = 0;
- int num_query = 0;
- int num_point = 0;
  int num_threads = 0;
  scalar_t* grad_value = nullptr;
  scalar_t* grad_sampling_loc = nullptr;
@@ -481,11 +468,12 @@ inline int ms_deformable_col2im_dynamic_shared_bytes(const MsDeformableCol2ImLau
 #define MMLTK_ML_LAYERS_LAUNCH_COL2IM_KERNEL_2(args, stream, shared_bytes, kernel, block_size) \
  kernel<scalar_t, block_size><<<MMLTK_ML_LAYERS_COL2IM_LAUNCH_CONFIG(args, shared_bytes, stream)>>>(MMLTK_ML_LAYERS_COL2IM_KERNEL_ARGS(args))
 template <typename scalar_t>
-void ms_deformable_im2col_cuda(cudaStream_t stream, MMLTK_ML_LAYERS_DEFORM_IM2COL_PARAMS(scalar_t)) {
- const int num_kernels = batch_size * num_query * num_heads * channels;
+void ms_deformable_im2col_cuda(cudaStream_t stream, const scalar_t* data_value, ms_deform_attn_launch::DeviceLayout data_layout, const scalar_t* data_sampling_loc, const scalar_t* data_attn_weight,
+ int batch_size, const ms_deform_attn_launch::AttentionShape& shape, scalar_t* data_col) {
+ const int num_kernels = batch_size * shape.num_query * shape.num_heads * shape.channels;
  const int num_threads = kMsDeformAttnCudaThreads;
- ms_deformable_im2col_gpu_kernel<scalar_t><<<ms_deform_attn_cuda_blocks(num_kernels, num_threads), num_threads, 0, stream>>>(
-  num_kernels, data_value, data_layout, data_sampling_loc, data_attn_weight, batch_size, spatial_size, num_heads, channels, num_levels, num_query, num_point, data_col);
+ ms_deformable_im2col_gpu_kernel<scalar_t><<<ms_deform_attn_cuda_blocks(num_kernels, num_threads), num_threads, 0, stream>>>(num_kernels, data_value, data_layout, data_sampling_loc, data_attn_weight,
+  batch_size, shape.spatial_size, shape.num_heads, shape.channels, shape.num_levels, shape.num_query, shape.num_point, data_col);
 }
 #define MMLTK_ML_LAYERS_DEFINE_COL2IM_BLOCKSIZE_AWARE_LAUNCHER(launcher_name, kernel_name)            \
  template <typename scalar_t, unsigned int blockSize>                                                 \
@@ -541,21 +529,17 @@ inline void launch_ms_deformable_col2im_cuda_dynamic_reduce(const MsDeformableCo
  MMLTK_ML_LAYERS_DISPATCH_COL2IM_CASE(512, launch_ms_deformable_col2im_cuda_shm_blocksize_aware_reduce_v2); \
  MMLTK_ML_LAYERS_DISPATCH_COL2IM_CASE(1024, launch_ms_deformable_col2im_cuda_shm_blocksize_aware_reduce_v2)
 template <typename scalar_t>
-void ms_deformable_col2im_cuda(cudaStream_t stream, MMLTK_ML_LAYERS_DEFORM_COL2IM_PARAMS(scalar_t)) {
- const int num_threads = (channels > kMsDeformAttnCudaThreads) ? kMsDeformAttnCudaThreads : channels;
+void ms_deformable_col2im_cuda(cudaStream_t stream, const scalar_t* grad_col, const scalar_t* data_value, ms_deform_attn_launch::DeviceLayout data_layout, const scalar_t* data_sampling_loc,
+ const scalar_t* data_attn_weight, int batch_size, const ms_deform_attn_launch::AttentionShape& shape, scalar_t* grad_value, scalar_t* grad_sampling_loc, scalar_t* grad_attn_weight) {
+ const int num_threads = (shape.channels > kMsDeformAttnCudaThreads) ? kMsDeformAttnCudaThreads : shape.channels;
  const MsDeformableCol2ImLaunchArgs<scalar_t> args{
+  shape,
   grad_col,
   data_value,
   data_layout,
   data_sampling_loc,
   data_attn_weight,
   batch_size,
-  spatial_size,
-  num_heads,
-  channels,
-  num_levels,
-  num_query,
-  num_point,
   num_threads,
   grad_value,
   grad_sampling_loc,

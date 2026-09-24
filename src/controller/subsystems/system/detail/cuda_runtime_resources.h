@@ -1,13 +1,21 @@
 #pragma once
 #include <cuda_runtime_api.h>
 #include <functional>
+#include <memory>
 #include <optional>
 #include <stop_token>
+#include <string_view>
 #include "src/backend/ml/runtime/backend_factory.h"
 #include "src/controller/contracts/compute.h"
 #include "src/controller/subsystems/system/compute_runtime.h"
 #include "src/frameworks/gpu/device_execution.h"
+namespace mmltk::frameworks::gpu {
+class TerminalCudaRetirementAuthority;
+}
 namespace mmltk::controller::detail {
+// Reserve terminal custody before entering CUDA; retain the complete output
+// owner if execution or caller-context restoration cannot be settled.
+void RunWithRetainedCudaContext(std::shared_ptr<void>, mmltk::frameworks::gpu::TerminalCudaRetirementAuthority&, std::string_view, std::function_ref<void()>);
 class CudaRuntimeResources final {
 public:
  using Close = std::move_only_function<void()>;

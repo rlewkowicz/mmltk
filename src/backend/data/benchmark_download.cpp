@@ -367,6 +367,7 @@ struct Transfer {
  void prepare_easy() {
   easy.reset(curl_easy_init());
   if (!easy) { throw std::runtime_error("cannot allocate benchmark libcurl handle"); }
+  // CLEANUP-IGNORE: Independent CURL transfer modes initialize the common transfer-setup record; their callbacks and ownership differ.
   configure_curl_transfer(easy.get(),
    CurlTransferSetup{
     .url = request.url.c_str(),
@@ -522,6 +523,7 @@ struct IdentityProbe {
  std::exception_ptr callback_error;
  IdentityProbe(const DownloadRequest& request_value, mmltk::common::concurrency::CancellationObservation cancel) : request(request_value), cancel_requested(cancel), easy(curl_easy_init()) {
   if (!easy) { throw std::runtime_error("cannot allocate segmented download identity probe"); }
+  // CLEANUP-IGNORE: Independent CURL transfer modes initialize the common transfer-setup record; their callbacks and ownership differ.
   configure_curl_transfer(easy.get(),
    CurlTransferSetup{
     .url = request.url.c_str(),
@@ -787,6 +789,7 @@ struct SegmentTransfer {
   curl_slist* appended = curl_slist_append(nullptr, ("If-Range: " + identity.if_range_value()).c_str());
   if (appended == nullptr) { throw std::runtime_error("cannot allocate segmented If-Range header"); }
   headers.reset(appended);
+  // CLEANUP-IGNORE: Independent CURL transfer modes initialize the common transfer-setup record; their callbacks and ownership differ.
   configure_curl_transfer(easy.get(),
    CurlTransferSetup{
     .url = request.url.c_str(),

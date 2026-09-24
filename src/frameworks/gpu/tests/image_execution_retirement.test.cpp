@@ -205,13 +205,14 @@ TEST_CASE("context creation failure retains the adopted model and original typed
  custody.reset();
  CHECK_FALSE(model_destroyed->load(std::memory_order_acquire));
 }
-TEST_CASE("checked model release failure retains custody after safe stream completion") {
+TEST_CASE("retained model release reports explicit and fallback failures without releasing custody") {
+ const bool reported = GENERATE(false, true);
  auto backend = std::make_shared<FakeImageBackend>();
  auto model_destroyed = std::make_shared<std::atomic_bool>(false);
  auto runtime = std::make_unique<SystemImageRuntime>(SystemImageRuntimeConfig{
   .device = 0,
   .backend = backend,
-  .model = std::make_unique<FailingReleaseModel>(model_destroyed, false),
+  .model = std::make_unique<FailingReleaseModel>(model_destroyed, false, reported),
  });
  const auto retirement = runtime->Retire();
  CHECK_FALSE(retirement.safe_to_destroy);
@@ -223,23 +224,6 @@ TEST_CASE("checked model release failure retains custody after safe stream compl
  CHECK(runtime->model() == nullptr);
  CHECK_THROWS(runtime->Borrow());
  CHECK_THROWS(runtime->OutputFacts());
- runtime.reset();
- CHECK(backend->streams_destroyed == 0U);
-}
-TEST_CASE("retained model identity receives a typed fallback failure") {
- auto backend = std::make_shared<FakeImageBackend>();
- auto model_destroyed = std::make_shared<std::atomic_bool>(false);
- auto runtime = std::make_unique<SystemImageRuntime>(SystemImageRuntimeConfig{
-  .device = 0,
-  .backend = backend,
-  .model = std::make_unique<FailingReleaseModel>(model_destroyed, false, false),
- });
- const auto retirement = runtime->Retire();
- CHECK_FALSE(retirement.safe_to_destroy);
- CHECK(retirement.failure);
- CHECK(retirement.custody.valid());
- CHECK(retirement.custody.failure());
- CHECK_FALSE(model_destroyed->load(std::memory_order_acquire));
  runtime.reset();
  CHECK(backend->streams_destroyed == 0U);
 }

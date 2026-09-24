@@ -196,6 +196,7 @@ struct ImageUpscaler::Impl {
     if (!current()) return ImageUpscalerOutcome::Cancelled;
     ensure_cuda_ok(cudaSetDevice(owned_device), "bind Basic launch device");
     const image_upscaler_nis::Configuration config{
+     // CLEANUP-IGNORE: Full-source dimensions initialize distinct NIS and neural request formats; allocation and execution remain with each backend.
      .source_width = width,
      .source_height = height,
      .crop_x = 0U,

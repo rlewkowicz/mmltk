@@ -1,3 +1,4 @@
+#include "src/backend/models/rfdetr/core/tests/training_fixture.h"
 #include "src/backend/models/rfdetr/core/detail/training_mask_loss.h"
 #include "src/backend/models/rfdetr/contract/training_metrics.h"
 #include "src/frameworks/serialization/reflected_json.h"
@@ -77,6 +78,54 @@ struct GpuBatchAugmenterTestAccess final {
 }  // namespace mmltk::backend::models::rfdetr::test_support
 namespace {
 namespace rfdetr = mmltk::backend::models::rfdetr;
+rfdetr::NativeRfDetrConfig tiny_native_training_config() {
+ auto config = rfdetr::native_config_from_preset(rfdetr::model_presets().front());
+ config.resolution = 64;
+ config.num_classes = 3;
+ config.num_queries = 3;
+ config.num_select = 3;
+ config.group_detr = 2;
+ config.dec_layers = 2;
+ config.aux_loss = true;
+ config.two_stage = true;
+ return config;
+}
+rfdetr::DetectionConfig training_detection_fixture(const rfdetr::NativeRfDetrConfig& config) {
+ auto detection = rfdetr::testsupport::detection_fixture_base(config);
+ rfdetr::project_loss_coefficients(detection, config);
+ detection.include_masks = config.segmentation;
+ detection.mask_point_sample_ratio = config.mask_point_sample_ratio;
+ rfdetr::populate_default_detection_weight_dict(detection);
+ return detection;
+}
+rfdetr::TrainRequest gradient_update_request(double learning_rate = 1e-3) {
+ rfdetr::TrainRequest request;
+ request.optimizer = rfdetr::TrainOptimizerKind::AdamW;
+ request.lr = learning_rate;
+ // Zero decay separates inactive gradients from legitimate AdamW decay.
+ request.weight_decay = 0.0;
+ return request;
+}
+using TrainingParameters = torch::OrderedDict<std::string, torch::Tensor>;
+using ParameterValues = std::unordered_map<std::string, torch::Tensor>;
+torch::Tensor capture_update_parameter(const TrainingParameters& parameters, const rfdetr::NativeOptimizer& optimizer, const std::string& name, bool active) {
+ const auto* parameter = parameters.find(name);
+ REQUIRE(parameter);
+ REQUIRE(parameter->grad().defined());
+ REQUIRE(torch::isfinite(parameter->grad()).all().item<bool>());
+ REQUIRE((parameter->grad().abs().sum().item<float>() > 0.F) == active);
+ REQUIRE(std::find(optimizer.parameter_names().begin(), optimizer.parameter_names().end(), name) != optimizer.parameter_names().end());
+ return parameter->detach().clone();
+}
+void check_parameter_update(rfdetr::NativeOptimizer& optimizer, const TrainingParameters& parameters, const ParameterValues& before_update, std::function_ref<bool(std::string_view)> active) {
+ optimizer.step();
+ for (const auto& [name, before] : before_update) {
+  const auto* parameter = parameters.find(name);
+  REQUIRE(parameter);
+  REQUIRE(torch::isfinite(*parameter).all().item<bool>());
+  REQUIRE(torch::equal(before, *parameter) == !active(name));
+ }
+}
 [[nodiscard]] c10::cuda::CUDAStream training_test_stream() {
  REQUIRE(cudaSetDevice(0) == cudaSuccess);
  return c10::cuda::getStreamFromPool(false, 0);
@@ -1831,15 +1880,7 @@ TEST_CASE("Production Match-Free masks retain AMP accumulation gradients and cur
  for (const int mode : {0, 1, 2, 3, 4})
   for (const bool dn : {false, true})
    for (const auto dtype : {torch::kFloat32, torch::kFloat16, torch::kBFloat16}) {
-    auto config = rfdetr::native_config_from_preset(rfdetr::model_presets().front());
-    config.resolution = 64;
-    config.num_classes = 3;
-    config.num_queries = 3;
-    config.num_select = 3;
-    config.group_detr = 2;
-    config.dec_layers = 2;
-    config.aux_loss = true;
-    config.two_stage = true;
+    auto config = tiny_native_training_config();
     config.segmentation = mode != 0;
     config.mask_ce_loss_coef = mode == 2 || mode == 4 ? 1.7 : 0.0;
     config.mask_dice_loss_coef = mode == 3 || mode == 4 ? 2.3 : 0.0;
@@ -1894,35 +1935,17 @@ TEST_CASE("Production Match-Free masks retain AMP accumulation gradients and cur
       REQUIRE((query.grad()[0].abs().sum().item<float>() > 0.0F) == (mode >= 2));
      }
     auto parameters = model.named_parameters(true);
-    rfdetr::TrainRequest optimizer_request;
-    optimizer_request.optimizer = rfdetr::TrainOptimizerKind::AdamW;
-    optimizer_request.lr = 1e-3;
-    // Zero decay separates inactive mask gradients from legitimate AdamW decay.
-    optimizer_request.weight_decay = 0.0;
+    auto optimizer_request = gradient_update_request();
     auto built = rfdetr::build_optimizer(parameters, optimizer_request);
-    std::unordered_map<std::string, torch::Tensor> before_update;
+    ParameterValues before_update;
     const auto is_mask_parameter = [](std::string_view name) { return name.starts_with("segmentation_head.") || name == "training_supervision.mask_projection.weight"; };
     for (const auto name : {"segmentation_head.bias", "segmentation_head.spatial_features_proj.weight", "segmentation_head.query_features_proj.weight", "training_supervision.mask_projection.weight",
           "training_supervision.ground_truth_mlp.linear1.weight", "class_embed.weight", "bbox_embed.layers.2.weight"}) {
      const bool mask_parameter = is_mask_parameter(name);
      if (!config.segmentation && mask_parameter) continue;
-     auto* parameter = parameters.find(name);
-     REQUIRE(parameter);
-     REQUIRE(parameter->grad().defined());
-     REQUIRE(torch::isfinite(parameter->grad()).all().item<bool>());
-     const bool active = !mask_parameter || mode >= 2;
-     REQUIRE((parameter->grad().abs().sum().item<float>() > 0.F) == active);
-     REQUIRE(std::find(built.optimizer.parameter_names().begin(), built.optimizer.parameter_names().end(), name) != built.optimizer.parameter_names().end());
-     before_update.emplace(name, parameter->detach().clone());
+     before_update.emplace(name, capture_update_parameter(parameters, built.optimizer, name, !mask_parameter || mode >= 2));
     }
-    built.optimizer.step();
-    for (const auto& [name, before] : before_update) {
-     const auto* parameter = parameters.find(name);
-     REQUIRE(parameter);
-     const bool active = !is_mask_parameter(name) || mode >= 2;
-     REQUIRE(torch::isfinite(*parameter).all().item<bool>());
-     REQUIRE(torch::equal(before, *parameter) == !active);
-    }
+    check_parameter_update(built.optimizer, parameters, before_update, [&](std::string_view name) { return !is_mask_parameter(name) || mode >= 2; });
     const auto timing = model.harvest_supervision_timing();
     REQUIRE(timing.completed_leases == 0);
     REQUIRE(timing.outstanding_leases == 0);
@@ -1956,23 +1979,13 @@ TEST_CASE("Production Match-Free masks retain AMP accumulation gradients and cur
 }
 TEST_CASE("Production Hungarian DN masks preserve stock draws and accumulated training updates", "[rfdetr][training_supervision][cuda]") {
  if (mmltk::testsupport::checked_cuda_device_count() == 0) SKIP("CUDA unavailable; Hungarian DN mask training remains unverified");
- const auto topology = mmltk::common::system::NumaTopology::Capture();
- const auto placement = mmltk::common::system::resolve_placement(topology, topology.permitted_nodes.front());
- mmltk::common::system::ScopedExecutionPolicy policy({placement.cpus, {}, 0, placement.numa_node, -10, false});
- rfdetr::MatcherWorkspace workspace(placement.numa_node, true);
+ rfdetr::testsupport::MatcherExecutionFixture fixture;
+ auto& workspace = fixture.workspace;
  rfdetr::ScopedRuntimeContext runtime(nullptr, 0, &workspace);
  const auto options = torch::TensorOptions().device(torch::kCUDA).dtype(torch::kFloat32);
  for (const auto dtype : {torch::kFloat32, torch::kFloat16, torch::kBFloat16}) {
-  auto config = rfdetr::native_config_from_preset(rfdetr::model_presets().front());
-  config.resolution = 64;
+  auto config = tiny_native_training_config();
   config.segmentation = true;
-  config.num_classes = 3;
-  config.num_queries = 3;
-  config.num_select = 3;
-  config.group_detr = 2;
-  config.dec_layers = 2;
-  config.aux_loss = true;
-  config.two_stage = true;
   config.training_supervision.denoising.enabled = true;
   config.training_supervision.denoising.groups = 2;
   rfdetr::NativeRfDetrModel active(config, rfdetr::testsupport::synthetic_training_layout(2));
@@ -1990,22 +2003,7 @@ TEST_CASE("Production Hungarian DN masks preserve stock draws and accumulated tr
   stock.to(torch::Device(torch::kCUDA));
   stock.train(true);
   stock.set_force_pytorch_deformable_attn(true);
-  rfdetr::DetectionConfig detection;
-  rfdetr::project_loss_coefficients(detection, config);
-  detection.num_classes = config.num_classes;
-  detection.group_detr = config.group_detr;
-  detection.dec_layers = config.dec_layers;
-  detection.num_select = config.num_select;
-  detection.two_stage = config.two_stage;
-  detection.aux_loss = config.aux_loss;
-  detection.include_masks = true;
-  detection.mask_point_sample_ratio = config.mask_point_sample_ratio;
-  detection.ia_bce_loss = config.ia_bce_loss;
-  detection.focal_alpha = config.focal_alpha;
-  detection.set_cost_class = config.set_cost_class;
-  detection.set_cost_bbox = config.set_cost_bbox;
-  detection.set_cost_giou = config.set_cost_giou;
-  rfdetr::populate_default_detection_weight_dict(detection);
+  auto detection = training_detection_fixture(config);
   rfdetr::PreparedTargets targets;
   targets.all_boxes = torch::tensor({{0.3F, 0.3F, 0.2F, 0.2F}, {0.7F, 0.6F, 0.2F, 0.3F}, {0.2F, 0.7F, 0.1F, 0.2F}, {0.5F, 0.4F, 0.3F, 0.1F}}, options);
   targets.all_labels = torch::tensor({0, 1, 0, 1}, options.dtype(torch::kInt64));
@@ -2055,37 +2053,20 @@ TEST_CASE("Production Hungarian DN masks preserve stock draws and accumulated tr
    }
   }
   const auto parameters = active.named_parameters(true);
-  rfdetr::TrainRequest optimizer_request;
-  optimizer_request.optimizer = rfdetr::TrainOptimizerKind::AdamW;
-  optimizer_request.lr = 1e-3;
-  optimizer_request.weight_decay = 0.0;
+  auto optimizer_request = gradient_update_request();
   auto built = rfdetr::build_optimizer(parameters, optimizer_request);
-  std::unordered_map<std::string, torch::Tensor> before_update;
+  ParameterValues before_update;
   for (const auto name : {"segmentation_head.bias", "segmentation_head.spatial_features_proj.weight", "segmentation_head.query_features_proj.weight",
         "training_supervision.denoising_label_embedding.weight", "class_embed.weight", "bbox_embed.layers.2.weight"}) {
-   const auto* parameter = parameters.find(name);
-   REQUIRE(parameter);
-   REQUIRE(parameter->grad().defined());
-   REQUIRE(torch::isfinite(parameter->grad()).all().item<bool>());
-   REQUIRE(parameter->grad().abs().sum().item<float>() > 0.0F);
-   REQUIRE(std::find(built.optimizer.parameter_names().begin(), built.optimizer.parameter_names().end(), name) != built.optimizer.parameter_names().end());
-   before_update.emplace(name, parameter->detach().clone());
+   before_update.emplace(name, capture_update_parameter(parameters, built.optimizer, name, true));
   }
-  built.optimizer.step();
-  for (const auto& [name, before] : before_update) {
-   const auto* parameter = parameters.find(name);
-   REQUIRE(parameter);
-   REQUIRE(torch::isfinite(*parameter).all().item<bool>());
-   REQUIRE_FALSE(torch::equal(before, *parameter));
-  }
+  check_parameter_update(built.optimizer, parameters, before_update, [](std::string_view) { return true; });
  }
 }
 TEST_CASE("Selective native training retains routed objectives gradients optimizer updates and RNG", "[rfdetr][training_supervision][compilation][cuda]") {
  if (mmltk::testsupport::checked_cuda_device_count() == 0) SKIP("CUDA unavailable; selective training remains unverified");
- const auto topology = mmltk::common::system::NumaTopology::Capture();
- const auto placement = mmltk::common::system::resolve_placement(topology, topology.permitted_nodes.front());
- mmltk::common::system::ScopedExecutionPolicy policy({placement.cpus, {}, 0, placement.numa_node, -10, false});
- rfdetr::MatcherWorkspace workspace(placement.numa_node, true);
+ rfdetr::testsupport::MatcherExecutionFixture fixture;
+ auto& workspace = fixture.workspace;
  rfdetr::ScopedRuntimeContext runtime(nullptr, 0, &workspace);
  const auto floats = torch::TensorOptions().device(torch::kCUDA).dtype(torch::kFloat32);
  const auto integers = floats.dtype(torch::kInt64);
@@ -2095,15 +2076,7 @@ TEST_CASE("Selective native training retains routed objectives gradients optimiz
     for (const auto dtype : {torch::kFloat32, torch::kFloat16, torch::kBFloat16}) {
      if (dtype == torch::kBFloat16 && at::cuda::getCurrentDeviceProperties()->major < 8) continue;
      CAPTURE(segmentation, match_free, denoising, dtype);
-     auto config = rfdetr::native_config_from_preset(rfdetr::model_presets().front());
-     config.resolution = 64;
-     config.num_classes = 3;
-     config.num_queries = 3;
-     config.num_select = 3;
-     config.group_detr = 2;
-     config.dec_layers = 2;
-     config.aux_loss = true;
-     config.two_stage = true;
+     auto config = tiny_native_training_config();
      config.segmentation = segmentation;
      config.training_supervision.assignment = match_free ? rfdetr::TrainAssignmentKind::MatchFree : rfdetr::TrainAssignmentKind::Hungarian;
      config.training_supervision.denoising.enabled = denoising;
@@ -2126,22 +2099,7 @@ TEST_CASE("Selective native training retains routed objectives gradients optimiz
       for (auto* model : {&eager, &selective})
        for (auto& item : model->named_parameters(true))
         if (item.key().starts_with("backbone.0.encoder.")) item.value().set_requires_grad(false);
-     rfdetr::DetectionConfig detection;
-     rfdetr::project_loss_coefficients(detection, config);
-     detection.num_classes = config.num_classes;
-     detection.group_detr = config.group_detr;
-     detection.dec_layers = config.dec_layers;
-     detection.num_select = config.num_select;
-     detection.two_stage = config.two_stage;
-     detection.aux_loss = config.aux_loss;
-     detection.include_masks = segmentation;
-     detection.mask_point_sample_ratio = config.mask_point_sample_ratio;
-     detection.ia_bce_loss = config.ia_bce_loss;
-     detection.focal_alpha = config.focal_alpha;
-     detection.set_cost_class = config.set_cost_class;
-     detection.set_cost_bbox = config.set_cost_bbox;
-     detection.set_cost_giou = config.set_cost_giou;
-     rfdetr::populate_default_detection_weight_dict(detection);
+     auto detection = training_detection_fixture(config);
      rfdetr::PreparedTargets targets;
      targets.all_boxes = torch::tensor({{0.3F, 0.3F, 0.2F, 0.2F}, {0.7F, 0.6F, 0.2F, 0.3F}}, floats);
      targets.all_labels = torch::tensor({0, 1}, integers);
@@ -2158,10 +2116,7 @@ TEST_CASE("Selective native training retains routed objectives gradients optimiz
      if (segmentation) targets.packed_masks = rfdetr::PackedTargetMasks{torch::tensor({{int64_t{0x3333}}, {int64_t{0xcccc}}}, integers), 4, 4};
      auto input = torch::rand({2, 3, 64, 64}, floats).set_requires_grad(true);
      auto compiled_input = input.detach().clone().set_requires_grad(true);
-     rfdetr::TrainRequest optimizer_request;
-     optimizer_request.optimizer = rfdetr::TrainOptimizerKind::AdamW;
-     optimizer_request.lr = 1e-4;
-     optimizer_request.weight_decay = 0.0;
+     auto optimizer_request = gradient_update_request(1e-4);
      auto eager_optimizer = rfdetr::build_optimizer(eager.named_parameters(true), optimizer_request);
      auto selective_optimizer = rfdetr::build_optimizer(selective.named_parameters(true), optimizer_request);
      // Four accumulated microbatches cover recording, initial executor reuse and

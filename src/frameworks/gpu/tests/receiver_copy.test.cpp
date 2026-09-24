@@ -1,3 +1,4 @@
+#include "src/frameworks/gpu/tests/device_execution_fixture.h"
 #include "src/frameworks/gpu/cuda_context_scope.h"
 #include "src/frameworks/gpu/tests/vulkan_workspace_fixture.h"
 #include "src/test_support/async_test_utils.hpp"
@@ -75,16 +76,7 @@ TEST_CASE("Native image handoffs preserve both planes between every visible GPU 
      CHECK(copied.plane(index).device() == receiver_device);
      copied.plane(index).context().Bind();
      std::array<unsigned char, 13U * 5U * 4U> bytes{};
-     CUDA_MEMCPY2D read{};
-     read.srcMemoryType = CU_MEMORYTYPE_DEVICE;
-     read.srcDevice = plane.data;
-     read.srcPitch = plane.descriptor.pitch_bytes;
-     read.dstMemoryType = CU_MEMORYTYPE_HOST;
-     read.dstHost = bytes.data();
-     read.dstPitch = plane.descriptor.row_bytes();
-     read.WidthInBytes = read.dstPitch;
-     read.Height = plane.descriptor.height;
-     REQUIRE(cuMemcpy2D(&read) == CUDA_SUCCESS);
+     mmltk::frameworks::gpu::test_support::read_plane(plane, std::as_writable_bytes(std::span(bytes)));
      const auto fill = static_cast<unsigned char>(width + (index == 0U ? 17U : 83U));
      CHECK(std::all_of(bytes.begin(), bytes.begin() + width * 5U * 4U, [fill](auto value) { return value == fill; }));
     }
@@ -309,6 +301,22 @@ TEST_CASE("scalar receiver copies settle an enqueued read before event-record fa
  CHECK_FALSE(receiver.Borrow().valid());
  CHECK(receiver.CopyFrom(stream, source.Borrow()) == ImageCopyPath::SameDevice);
 }
+struct DeferredProducer final {
+ std::shared_ptr<FakeImageBackend> backend = [] {
+  auto result = std::make_shared<FakeImageBackend>();
+  result->defer_events = true;
+  return result;
+ }();
+ std::unique_ptr<mmltk::testsupport::TestGate> event_gate = backend->HoldEventWaits("deferred producer event wait");
+ SystemImageRuntime source = make_clean_semantic_runtime(backend);
+ DeferredProducer() {
+  source.Publish(8U, 8U, [](auto, auto, auto) {});
+ }
+ void Complete() {
+  event_gate->Release();
+  backend->CompleteEvents();
+ }
+};
 void check_deferred_source_custody(SystemImageRuntime& source, const mmltk::testsupport::TestGate& event_gate) {
  REQUIRE(event_gate.WaitEntered(std::chrono::seconds{1}));
  CHECK(source.OutputFacts().revision == 1U);
@@ -319,11 +327,9 @@ void check_deferred_source_custody(SystemImageRuntime& source, const mmltk::test
 }
 TEST_CASE("external image readers await a delayed producer while retaining its exact product") {
  using namespace std::chrono_literals;
- auto backend = std::make_shared<FakeImageBackend>();
- backend->defer_events = true;
- auto event_gate = backend->HoldEventWaits("deferred producer event wait");
- auto source = make_clean_semantic_runtime(backend);
- source.Publish(8U, 8U, [](auto, auto, auto) {});
+ DeferredProducer producer;
+ const auto& backend = producer.backend;
+ auto& source = producer.source;
  DeviceContext context{0, backend};
  ImageStream stream{context};
  auto reading = std::async(std::launch::async, [&stream, &source] {
@@ -331,13 +337,9 @@ TEST_CASE("external image readers await a delayed producer while retaining its e
   stream.Await(product);
   return product.plane(0U).revision();
  });
- mmltk::testsupport::ScopedTestCleanup release_reader{[&] {
-  event_gate->Release();
-  backend->CompleteEvents();
- }};
- check_deferred_source_custody(source, *event_gate);
- event_gate->Release();
- backend->CompleteEvents();
+ mmltk::testsupport::ScopedTestCleanup release_reader{[&] { producer.Complete(); }};
+ check_deferred_source_custody(source, *producer.event_gate);
+ producer.Complete();
  CHECK(mmltk::testsupport::await_test_future(reading, "external reader completion") == 1U);
  CHECK_THROWS_AS(stream.Await(BorrowedImageProductReadView{}), std::invalid_argument);
  auto other = make_clean_semantic_runtime(std::make_shared<FakeImageBackend>());
@@ -448,23 +450,16 @@ TEST_CASE("a quarantined scalar read retains its allocation after source destruc
  borrowed = {};
  CHECK(backend->planes_freed == 1U);
 }
-// CLEANUP-IGNORE: This receiver-copy case owns its gate and lease through copy completion; the other case tests a direct reader.
 TEST_CASE("receiver retains a product lease through deferred source completion") {
  using namespace std::chrono_literals;
- auto backend = std::make_shared<FakeImageBackend>();
- backend->defer_events = true;
- auto event_gate = backend->HoldEventWaits("deferred producer event wait");
- auto source = make_clean_semantic_runtime(backend);
- source.Publish(8U, 8U, [](auto, auto, auto) {});
+ DeferredProducer producer;
+ const auto& backend = producer.backend;
+ auto& source = producer.source;
  auto receiver = make_clean_semantic_runtime(backend);
  auto copy = std::async(std::launch::async, [&] { return receiver.CopyFrom(source.Borrow()); });
- mmltk::testsupport::ScopedTestCleanup release_copy{[&] {
-  event_gate->Release();
-  backend->CompleteEvents();
- }};
- check_deferred_source_custody(source, *event_gate);
- event_gate->Release();
- backend->CompleteEvents();
+ mmltk::testsupport::ScopedTestCleanup release_copy{[&] { producer.Complete(); }};
+ check_deferred_source_custody(source, *producer.event_gate);
+ producer.Complete();
  static_cast<void>(mmltk::testsupport::await_test_future(copy, "deferred receiver copy"));
  CHECK(receiver.OutputFacts().revision == 1U);
 }

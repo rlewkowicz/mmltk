@@ -1,4 +1,5 @@
 #include "validation_sample_output.h"
+#include "src/controller/subsystems/system/detail/cuda_runtime_resources.h"
 #include "src/backend/imaging/raster/caption_raster.h"
 #include "src/backend/imaging/raster/class_palette.h"
 #include "src/backend/imaging/raster/rendered_image_writer.h"
@@ -134,29 +135,14 @@ std::shared_ptr<const PredictionPreviewFrame> ValidationSampleOutput::Capture(rf
   if (!sample.pixels.preview_failure.empty()) throw std::runtime_error("validation sample pixels unavailable: " + std::string(sample.pixels.preview_failure));
   if (!sample.annotations.class_catalog) throw std::invalid_argument("validation sample class catalog is unavailable");
   impl_->Ensure();
+  // CLEANUP-IGNORE: Validation maps its sample view into the shared Capture API; allocation, transfer and custody are already centralized in the pool.
   raw = impl_->pool_->Capture(sample.pixels.chw, {sample.pixels.width, sample.pixels.height}, sample.pixels.stream, sample.prediction.detections, sample.annotations, sample.annotations.class_catalog,
    static_cast<int>(sample.annotations.class_catalog->size()), sample.pixels.rgb8, std::move(sample.pixels.custody), sample.pixels.stop_source, sample.pixels.source_control, sample.ground_truth, true,
    sample.pixels.device);
   if (!raw) throw std::runtime_error("validation sample capture capacity is exhausted");
   if (!impl_->failure_) {
-   auto lease = gpu::ReserveTerminalCudaLease(*impl_->retirement_);
-   struct Custody {
-    std::shared_ptr<Impl> state;
-    gpu::TerminalCudaRetirementLease& lease;
-   } custody{impl_, lease};
-   gpu::CudaContextScope scope({&custody, [](void* value) noexcept {
-                                 auto& owner = *static_cast<Custody*>(value);
-                                 std::move(owner.lease).Install(gpu::TerminalCudaCustody::Share(std::move(owner.state)), cudaErrorUnknown);
-                                }});
-   try {
-    scope.Run([&] { impl_->Draw(raw, {sample.pixels.width, sample.pixels.height}, static_cast<std::uint32_t>(sample.prediction.dataset_index)); });
-   } catch (...) {
-    if (!impl_->retirement_->admission_open() || gpu::is_image_execution_failure(std::current_exception())) {
-     if (lease) std::move(lease).Install(gpu::TerminalCudaCustody::Share(std::shared_ptr<Impl>(impl_)), cudaErrorUnknown);
-     throw mmltk::backend::ml::runtime::CudaOperationError{cudaErrorUnknown, "validation rendered output custody"};
-    }
-    throw;
-   }
+   RunWithRetainedCudaContext(impl_, *impl_->retirement_, "validation rendered output custody",
+    [&] { impl_->Draw(raw, {sample.pixels.width, sample.pixels.height}, static_cast<std::uint32_t>(sample.prediction.dataset_index)); });
   }
  } catch (const mmltk::backend::ml::runtime::CudaOperationError&) { throw; } catch (...) {
   if (!impl_->failure_) impl_->failure_ = std::current_exception();

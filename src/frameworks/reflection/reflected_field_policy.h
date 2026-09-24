@@ -309,10 +309,8 @@ struct MaterializedBaseList final {
   (visitor.template operator()<Bases>(), ...);
  }
 };
-template <auto Member, auto... Annotations>
-struct MaterializedMemberDeclaration final {
- using member_type = RemoveCvRef<decltype(std::declval<typename MemberPointerOwner<RemoveCvRef<decltype(Member)>>::type&>().*Member)>;
- static constexpr auto pointer = Member;
+template <auto... Annotations>
+struct MaterializedAnnotations {
  static constexpr std::size_t annotation_count = sizeof...(Annotations);
  template <class Visitor>
  static constexpr void VisitAnnotations(Visitor&& visitor) {
@@ -323,10 +321,14 @@ struct MaterializedMemberDeclaration final {
   (visitor.template operator()<Annotations>(), ...);
  }
 };
+template <auto Member, auto... Annotations>
+struct MaterializedMemberDeclaration final : MaterializedAnnotations<Annotations...> {
+ using member_type = RemoveCvRef<decltype(std::declval<typename MemberPointerOwner<RemoveCvRef<decltype(Member)>>::type&>().*Member)>;
+ static constexpr auto pointer = Member;
+};
 template <class Member, auto... Annotations>
-struct MaterializedOpaqueMemberDeclaration final {
+struct MaterializedOpaqueMemberDeclaration final : MaterializedAnnotations<Annotations...> {
  using member_type = Member;
- static constexpr std::size_t annotation_count = sizeof...(Annotations);
  inline static constexpr FieldConstraint constraint = [] {
   FieldConstraint result{};
   (apply_field_constraint(result, Annotations), ...);
@@ -348,14 +350,6 @@ struct MaterializedOpaqueMemberDeclaration final {
   return minima <= 1U && maxima <= 1U && finite <= 1U && (!constraint.has_minimum || numeric) && (!constraint.has_maximum || numeric) && (!constraint.finite || std::is_floating_point_v<Member>) &&
          (!constraint.has_minimum || !constraint.has_maximum || constraint.minimum <= constraint.maximum);
  }();
- template <class Visitor>
- static constexpr void VisitAnnotations(Visitor&& visitor) {
-  (visitor(Annotations), ...);
- }
- template <class Visitor>
- static constexpr void VisitAnnotationValues(Visitor&& visitor) {
-  (visitor.template operator()<Annotations>(), ...);
- }
 };
 template <class BaseList, class... Members>
 struct MaterializedFieldPolicyProduct final {

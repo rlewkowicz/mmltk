@@ -418,47 +418,29 @@ void test_snapshot_overlaps_compile_reset() {
  CHECK(completed.elapsed_seconds == 10U);
  CHECK(completed.remaining_seconds == 0U);
 }
-void test_compile_observes_event_cancellation_without_progress() {
- const mmltk::testsupport::ScopedTempDir root("mmltk_compile_event_cancellation");
- const FixtureSpec fixture{
-  root.path().string(),
-  "train",
-  32,
-  32,
-  4,
- };
+void test_compile_event_cancellation(bool publishing) {
+ const mmltk::testsupport::ScopedTempDir root(publishing ? "mmltk_compile_publish_cancellation" : "mmltk_compile_event_cancellation");
+ const FixtureSpec fixture{root.path().string(), "train", 32, 32, 4};
  struct CancellationTag;
  using CancellationSource = mmltk::common::concurrency::EventCancellationSource<CancellationTag, false>;
  auto [source, token] = CancellationSource::Mint();
  const DatasetCompilePlan plan = prepare_cancellation_compile(fixture);
- REQUIRE(source.RequestCancel());
- REQUIRE_THROWS_AS(DatasetCompiler::compile(plan, 0U, nullptr, mmltk::common::concurrency::CancellationObservation::Borrow(token)), std::runtime_error);
-}
-void test_compile_reobserves_cancellation_after_publishing_event() {
- const mmltk::testsupport::ScopedTempDir root("mmltk_compile_publish_cancellation");
- const FixtureSpec fixture{
-  root.path().string(),
-  "train",
-  32,
-  32,
-  4,
- };
- struct CancellationTag;
- using CancellationSource = mmltk::common::concurrency::EventCancellationSource<CancellationTag, false>;
- auto [source, token] = CancellationSource::Mint();
- const DatasetCompilePlan plan = prepare_cancellation_compile(fixture);
- CompileTelemetry telemetry{plan.splits.front().image_count, {.context = &source, .report = [](void* context, const CompileProgress& progress) noexcept {
-                                                               if (progress.phase == DatasetCompilePhase::Publishing) { static_cast<void>(static_cast<CancellationSource*>(context)->RequestCancel()); }
-                                                              }}};
- REQUIRE_THROWS_AS(DatasetCompiler::compile(plan, 0U, &telemetry, mmltk::common::concurrency::CancellationObservation::Borrow(token)), std::runtime_error);
- REQUIRE_FALSE(std::filesystem::exists(std::filesystem::path(plan.config.output_dir) / "train.bin"));
+ if (publishing) {
+  CompileTelemetry telemetry{plan.splits.front().image_count, {.context = &source, .report = [](void* context, const CompileProgress& progress) noexcept {
+                                                                if (progress.phase == DatasetCompilePhase::Publishing) static_cast<void>(static_cast<CancellationSource*>(context)->RequestCancel());
+                                                               }}};
+  REQUIRE_THROWS_AS(DatasetCompiler::compile(plan, 0U, &telemetry, mmltk::common::concurrency::CancellationObservation::Borrow(token)), std::runtime_error);
+  REQUIRE_FALSE(std::filesystem::exists(std::filesystem::path(plan.config.output_dir) / "train.bin"));
+ } else {
+  REQUIRE(source.RequestCancel());
+  REQUIRE_THROWS_AS(DatasetCompiler::compile(plan, 0U, nullptr, mmltk::common::concurrency::CancellationObservation::Borrow(token)), std::runtime_error);
+ }
 }
 TEST_CASE("compiler progress remains monotonic", "[backend][data][compile_progress]") {
  test_checked_progress_estimates();
  test_compile_progress_reports_monotonic_updates();
  test_snapshot_overlaps_compile_reset();
- test_compile_observes_event_cancellation_without_progress();
- test_compile_reobserves_cancellation_after_publishing_event();
+ for (bool publishing : {false, true}) test_compile_event_cancellation(publishing);
 }
 TEST_CASE("Compiler source IDs preserve catalog meaning through reordered dense tables", "[data][catalog]") {
  const auto root = mmltk::testsupport::make_temp_root("compiler-class-catalog");

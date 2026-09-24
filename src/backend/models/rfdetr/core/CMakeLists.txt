@@ -162,6 +162,17 @@ set_target_properties(mmltk_backend_models_rfdetr_core PROPERTIES
 mmltk_target_precompiled_headers(mmltk_backend_models_rfdetr_core std torch)
 
 function(mmltk_add_backend_models_rfdetr_core_tests)
+    add_library(mmltk_backend_models_rfdetr_training_fixture INTERFACE)
+    mmltk_register_public_headers(
+        mmltk_backend_models_rfdetr_training_fixture
+        BASE_DIRS ${CMAKE_SOURCE_DIR}
+        FILES ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/training_fixture.h)
+    target_link_libraries(mmltk_backend_models_rfdetr_training_fixture INTERFACE
+        mmltk::backend::models::rfdetr::core
+        mmltk::common::system
+        mmltk_backend_ml_torch_test_support)
+    mmltk_register_header_isolation(mmltk_backend_models_rfdetr_training_fixture)
+
     add_library(mmltk_backend_models_rfdetr_class_artifact_test_support INTERFACE)
     mmltk_register_public_headers(
         mmltk_backend_models_rfdetr_class_artifact_test_support
@@ -228,6 +239,7 @@ function(mmltk_add_backend_models_rfdetr_core_tests)
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests)
     target_link_libraries(mmltk_backend_models_rfdetr_core_tests PRIVATE
+        mmltk_backend_models_rfdetr_training_fixture
         mmltk::backend::models::rfdetr::augmentation
         mmltk_common_system_test_support
         mmltk_frameworks_gpu_test_support

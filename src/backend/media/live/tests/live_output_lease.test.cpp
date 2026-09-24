@@ -144,7 +144,8 @@ struct CallbackWakeProbe final {
  std::size_t wakes = 0U;
  static void Wake(void* context) noexcept { ++static_cast<CallbackWakeProbe*>(context)->wakes; }
 };
-TEST_CASE("Live output callback guard protects post-Free source work") {
+TEST_CASE("Live output callback guard protects source work after slot release") {
+ const auto released = GENERATE(SlotState::Free, SlotState::Terminal);
  CallbackWakeProbe wake;
  LiveOutputCallbackLifetime lifetime{1U, &wake, &CallbackWakeProbe::Wake};
  REQUIRE(lifetime.acquire());
@@ -152,23 +153,8 @@ TEST_CASE("Live output callback guard protects post-Free source work") {
  {
   LiveOutputCallbackGuard callback{lifetime};
   REQUIRE(claim_live_slot(state, SlotState::Acquired));
-  publish_live_owner_slot(state, SlotState::Free, [] noexcept {});
-  CHECK(slot_state_is(state, SlotState::Free));
-  CHECK_FALSE(lifetime.idle());
- }
- CHECK(lifetime.idle());
- CHECK(wake.wakes == 1U);
-}
-TEST_CASE("Live output callback guard protects post-Terminal source work") {
- CallbackWakeProbe wake;
- LiveOutputCallbackLifetime lifetime{1U, &wake, &CallbackWakeProbe::Wake};
- REQUIRE(lifetime.acquire());
- std::atomic<std::uint32_t> state{slot_state_value(SlotState::Acquired)};
- {
-  LiveOutputCallbackGuard callback{lifetime};
-  REQUIRE(claim_live_slot(state, SlotState::Acquired));
-  publish_live_owner_slot(state, SlotState::Terminal, [] noexcept {});
-  CHECK(slot_state_is(state, SlotState::Terminal));
+  publish_live_owner_slot(state, released, [] noexcept {});
+  CHECK(slot_state_is(state, released));
   CHECK_FALSE(lifetime.idle());
  }
  CHECK(lifetime.idle());

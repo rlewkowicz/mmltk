@@ -12,14 +12,8 @@
 #include "detail/ms_deform_attn_cuda_launch.h"
 namespace mmltk::backend::ml::layers {
 namespace {
-struct DeformAttnDims {
+struct DeformAttnDims : ms_deform_attn_launch::AttentionShape {
  int batch;
- int spatial_size;
- int num_heads;
- int channels;
- int num_levels;
- int num_query;
- int num_point;
  int im2col_step;
 };
 int checked_dimension(const int64_t value, const char* name) {
@@ -105,12 +99,11 @@ ValidatedDeformAttn validate_deform_attn_inputs(const torch::Tensor& value, cons
  TORCH_CHECK(product_fits({im2col_step_, num_query, num_heads, channels}, std::numeric_limits<int>::max()), "deformable attention launch extent exceeds CUDA integer range");
  TORCH_CHECK(product_fits({im2col_step_, spatial_size, num_heads, channels}, std::numeric_limits<int>::max()), "deformable attention value pointer range exceeds CUDA integer range");
  TORCH_CHECK(product_fits({im2col_step_, num_query, num_heads, num_levels, num_point, 2}, std::numeric_limits<int>::max()), "deformable attention sampling pointer range exceeds CUDA integer range");
- return {{batch, spatial_size, num_heads, channels, num_levels, num_query, num_point, im2col_step_}, layout};
+ return {{{spatial_size, num_heads, channels, num_levels, num_query, num_point}, batch, im2col_step_}, layout};
 }
 [[nodiscard]] ms_deform_attn_launch::CommonLaunch make_tensor_launch_common(
  const torch::Tensor& value, const ms_deform_attn_launch::DeviceLayout& layout, const torch::Tensor& sampling_loc, const torch::Tensor& attn_weight, const DeformAttnDims& dims, cudaStream_t stream) {
- return ms_deform_attn_launch::make_common_launch(value.data_ptr<float>(), layout, sampling_loc.data_ptr<float>(), attn_weight.data_ptr<float>(), dims.batch, dims.spatial_size, dims.num_heads,
-  dims.channels, dims.num_levels, dims.num_query, dims.num_point, dims.im2col_step, stream);
+ return ms_deform_attn_launch::make_common_launch(value.data_ptr<float>(), layout, sampling_loc.data_ptr<float>(), attn_weight.data_ptr<float>(), dims.batch, dims, dims.im2col_step, stream);
 }  // namespace
 [[nodiscard]] ms_deform_attn_launch::CommonLaunch make_current_tensor_launch_common(
  const torch::Tensor& value, const ms_deform_attn_launch::DeviceLayout& layout, const torch::Tensor& sampling_loc, const torch::Tensor& attn_weight, const DeformAttnDims& dims) {

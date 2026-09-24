@@ -1289,6 +1289,16 @@ TEST_CASE("benchmark annotations retain provenance crowd area masks and determin
  CHECK_FALSE(valid_open_images_category(0U));
  CHECK_FALSE(valid_open_images_category(0x610062U));
 }
+std::pair<NormalizedAnnotationIndex, NormalizedAnnotationIndex> parse_serial_and_parallel(
+ const fs::path& path, const std::string& digest, std::span<const NumericCategoryMapping> mappings, BenchmarkDatasetSource source) {
+ AnnotationParseOptions options;
+ options.source = source;
+ options.split = "train";
+ options.num_workers = 1;
+ auto sequential = parse_coco_style_annotations(path, digest, mappings, options);
+ options.num_workers = 4;
+ return {std::move(sequential), parse_coco_style_annotations(path, digest, mappings, options)};
+}
 TEST_CASE("benchmark semantic admission isolates malformed masks and numeric overflow", "[backend][data][benchmark][annotations]") {
  mmltk::testsupport::ScopedTempDir root("benchmark-admission");
  const auto path = root.path() / "annotations.json";
@@ -1327,13 +1337,7 @@ TEST_CASE("benchmark semantic admission isolates malformed masks and numeric ove
  const std::array<NumericCategoryMapping, 1> mappings{{{1U, 0U, "person"}}};
  const auto digest = mmltk::common::io::sha256_hex(mmltk::common::io::sha256_file(path));
  for (const auto source : {BenchmarkDatasetSource::kCoco2017, BenchmarkDatasetSource::kObjects365V2}) {
-  AnnotationParseOptions options;
-  options.source = source;
-  options.split = "train";
-  options.num_workers = 1;
-  const auto sequential = parse_coco_style_annotations(path, digest, mappings, options);
-  options.num_workers = 4;
-  const auto parallel = parse_coco_style_annotations(path, digest, mappings, options);
+  const auto [sequential, parallel] = parse_serial_and_parallel(path, digest, mappings, source);
   REQUIRE(sequential.boxes.size() == 3U);
   REQUIRE(parallel.boxes.size() == sequential.boxes.size());
   CHECK(parallel.rejected.raw_records == 9U + rejected_capacity);
@@ -1447,13 +1451,7 @@ TEST_CASE("benchmark supplied bbox admission precedes mask materialization", "[b
  const auto digest = mmltk::common::io::sha256_hex(mmltk::common::io::sha256_file(path));
  const std::array<NumericCategoryMapping, 1> mappings{{{1U, 0U, "person"}}};
  for (const auto source : {BenchmarkDatasetSource::kCoco2017, BenchmarkDatasetSource::kObjects365V2}) {
-  AnnotationParseOptions options;
-  options.source = source;
-  options.split = "train";
-  options.num_workers = 1;
-  const auto sequential = parse_coco_style_annotations(path, digest, mappings, options);
-  options.num_workers = 4;
-  const auto parallel = parse_coco_style_annotations(path, digest, mappings, options);
+  const auto [sequential, parallel] = parse_serial_and_parallel(path, digest, mappings, source);
   CHECK(parallel.rejected.raw_records == 19U);
   CHECK(parallel.rejected.degenerate_boxes == 8U);
   CHECK(parallel.rejected.malformed_records == 7U);
@@ -2564,14 +2562,18 @@ TEST_CASE("cached pixels finish while label preparation is blocked", "[backend][
  writer.finish(request);
  CHECK(fs::is_regular_file(request.output_path));
 }
-TEST_CASE("queued pixel custody retains the source lease until its reader drains", "[backend][data][benchmark][pipeline]") {
- mmltk::testsupport::ScopedTempDir root("pixel-custody");
- const auto images = root.path() / "images";
+PreparedBenchmarkSplit cached_pixel_membership(const fs::path& images) {
  prepare_cached_image_directory(images);
  write_cached_image_atomically(cached_image_path(images, 1), make_jpeg(240, 8, 8), {});
  PreparedBenchmarkSplit membership;
  membership.class_names = {"person"};
  membership.sources = {{images}};
+ return membership;
+}
+TEST_CASE("queued pixel custody retains the source lease until its reader drains", "[backend][data][benchmark][pipeline]") {
+ mmltk::testsupport::ScopedTempDir root("pixel-custody");
+ const auto images = root.path() / "images";
+ auto membership = cached_pixel_membership(images);
  membership.images = {{1, 16, 8, 0, 0, 0}};
  mmltk::testsupport::TestGate reader("pixel reader retirement");
  auto receipt = reader.receipt();
@@ -2599,11 +2601,7 @@ TEST_CASE("queued pixel custody retains the source lease until its reader drains
 TEST_CASE("cancelled progressive pixels leave the previously published file intact", "[backend][data][benchmark][writer]") {
  mmltk::testsupport::ScopedTempDir root("pixel-cancellation");
  const auto images = root.path() / "images";
- prepare_cached_image_directory(images);
- write_cached_image_atomically(cached_image_path(images, 1), make_jpeg(240, 8, 8), {});
- PreparedBenchmarkSplit membership;
- membership.class_names = {"person"};
- membership.sources = {{images}};
+ auto membership = cached_pixel_membership(images);
  membership.images = {{1, 16, 8, 0, 0, 0}, {2, 16, 8, 0, 0, 0}};
  const auto output = root.path() / "result.bin";
  write_text(output, "old generation");

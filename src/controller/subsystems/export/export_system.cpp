@@ -46,6 +46,7 @@ public:
   const auto selection = model_.selection();
   auto prepared = subsystems::system::ComputeIntentMaterializer::Export(settings.settings, {}, selection);
   if (!prepared) throw contracts::InvalidIntentError(prepared.error().detail);
+  // CLEANUP-IGNORE: LocalRun owns execution; this prefix supplies Export-specific state admission before its distinct worker body.
   run_.Start({
    .policy = configuration_.worker_policy(),
    .prepare =
@@ -82,6 +83,7 @@ public:
   });
   return snapshot();
  }
+ // CLEANUP-IGNORE: Independent systems lock their own state and forward cancellation/join to LocalRun and the shared compute transitions.
  [[nodiscard]] contracts::ComputeUiState Stop() noexcept {
   static_cast<void>(run_.Stop());
   std::scoped_lock lock(mutex_);

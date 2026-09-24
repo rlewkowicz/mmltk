@@ -1,4 +1,5 @@
 #include "prediction_output.h"
+#include "cuda_runtime_resources.h"
 #include "prediction_sampling.h"
 #include "src/backend/imaging/raster/caption_raster.h"
 #include "src/backend/imaging/raster/rendered_image_writer.h"
@@ -202,29 +203,6 @@ struct PredictionOutput::Impl final {
   }
  }
 };
-namespace {
-template <class Owner, class Operation>
-void with_output_context(const std::shared_ptr<Owner>& state, Operation&& operation) {
- auto lease = gpu::ReserveTerminalCudaLease(*state->retirement);
- struct Custody {
-  std::shared_ptr<Owner> state;
-  gpu::TerminalCudaRetirementLease& lease;
- } custody{state, lease};
- gpu::CudaContextScope scope({&custody, [](void* value) noexcept {
-                               auto& owner = *static_cast<Custody*>(value);
-                               std::move(owner.lease).Install(gpu::TerminalCudaCustody::Share(std::move(owner.state)), cudaErrorUnknown);
-                              }});
- try {
-  scope.Run(std::forward<Operation>(operation));
- } catch (...) {
-  if (!state->retirement->admission_open() || gpu::is_image_execution_failure(std::current_exception())) {
-   if (lease) std::move(lease).Install(gpu::TerminalCudaCustody::Share(std::shared_ptr<Owner>(state)), cudaErrorUnknown);
-   throw mmltk::backend::ml::runtime::CudaOperationError{cudaErrorUnknown, "prediction output CUDA custody"};
-  }
-  throw;
- }
-}
-}  // namespace
 PredictionOutput::PredictionOutput(DirectComputeConfiguration config, rfdetr::PredictSourceKind source, PredictionRunOutput options, std::optional<gpu::DeviceContext> context,
  raster::RenderedImageWriter::PngEncoder encoder, std::optional<std::uint64_t> seed)
     : impl_(std::make_shared<Impl>(std::move(config), source, std::move(options), std::move(context), std::move(encoder), seed)) {}
@@ -260,14 +238,14 @@ void PredictionOutput::Begin(const rfdetr::PredictionRunResult& result) {
   s.names = {"Raw slot"};
  s.catalog_ready = true;
  if (s.captions)
-  with_output_context(impl_, [&] {
+  RunWithRetainedCudaContext(impl_, *impl_->retirement, "prediction output CUDA custody", [&] {
    s.runtime->BindContext();
    s.PrepareCaptions();
   });
 }
 void PredictionOutput::Media(const media::VideoMediaInfo& info) {
  if (!Enabled() || !impl_->full_video) return;
- with_output_context(impl_, [&] {
+ RunWithRetainedCudaContext(impl_, *impl_->retirement, "prediction output CUDA custody", [&] {
   impl_->Ensure();
   impl_->runtime->BindContext();
   try {
@@ -293,7 +271,7 @@ std::shared_ptr<const PredictionPreviewFrame> PredictionOutput::Capture(
  if (!Wants(record.dataset_index)) return {};
  if (!pixels.preview_failure.empty()) throw std::runtime_error("prediction saving pixels unavailable: " + std::string(pixels.preview_failure));
  std::shared_ptr<const PredictionPreviewFrame> raw;
- with_output_context(impl_, [&] {
+ RunWithRetainedCudaContext(impl_, *impl_->retirement, "prediction output CUDA custody", [&] {
   impl_->Ensure();
   raw = impl_->pool->Capture(pixels.chw, {pixels.width, pixels.height}, pixels.stream, record.detections, annotations, impl_->catalog, impl_->classes, pixels.rgb8, pixels.custody, pixels.stop_source,
    pixels.source_control, {}, true, pixels.device);
@@ -315,7 +293,7 @@ void PredictionOutput::Finish(bool success) {
   throw std::runtime_error("Requested " + std::to_string(impl_->options.saving.video_samples) + " samples; the video contained " + std::to_string(impl_->reservoir->observed()) + " frames. Saved " +
                            std::to_string(impl_->facts.completed_samples) + ".");
  if (impl_->video) {
-  with_output_context(impl_, [&] {
+  RunWithRetainedCudaContext(impl_, *impl_->retirement, "prediction output CUDA custody", [&] {
    impl_->runtime->BindContext();
    impl_->video->Complete();
   });

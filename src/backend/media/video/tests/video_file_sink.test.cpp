@@ -34,8 +34,10 @@ void input_video(const std::filesystem::path& path) {
  REQUIRE(input.good());
 }
 void encode(const std::filesystem::path& directory, bool complete, bool software, int ready = -1, bool obstruct_rename = false) {
- const auto execution = gpu::test_support::selected_test_device(0, mmltk::common::system::NumaTopology::Capture());
- gpu::DeviceContext context(0, gpu::cuda_image_copy_backend(), gpu::DeviceContextMode::Isolated, execution.placement.numa_node, execution);
+ // CLEANUP-IGNORE: Device construction is shared; each media scenario owns its stream and source lifetimes.
+ gpu::test_support::IsolatedTestDevice device(gpu::test_support::selected_test_device(0, mmltk::common::system::NumaTopology::Capture()));
+ const auto& execution = device.execution;
+ auto& context = device.context;
  context.Bind();
  gpu::ImageStream stream(context);
  const auto input = directory / (std::filesystem::exists(directory / "source.mkv") ? "source.mkv" : "source.y4m");
@@ -135,8 +137,8 @@ TEST_CASE("native H264 output preserves frame timing odd geometry and recoverabl
 }
 TEST_CASE("Matroska propagates full-disk write failure and retains its partial path", "[video][sink][gpu]") {
  if (!mmltk::testsupport::checked_cuda_device_count()) SKIP("no CUDA device available");
- const auto execution = gpu::test_support::selected_test_device(0, mmltk::common::system::NumaTopology::Capture());
- gpu::DeviceContext context(0, gpu::cuda_image_copy_backend(), gpu::DeviceContextMode::Isolated, execution.placement.numa_node, execution);
+ gpu::test_support::IsolatedTestDevice device(gpu::test_support::selected_test_device(0, mmltk::common::system::NumaTopology::Capture()));
+ auto& context = device.context;
  context.Bind();
  gpu::ImageStream stream(context);
  mmltk::testsupport::ScopedTempDir temporary("video-full-disk");

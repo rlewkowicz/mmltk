@@ -44,6 +44,7 @@
 #include <utility>
 #include <variant>
 #include <vector>
+// CLEANUP-IGNORE: Namespace and using declarations provide test-local names; the fixture algorithms already have shared owners.
 namespace mmltk::controller {
 namespace {
 using namespace visual_test_support;
@@ -2187,14 +2188,21 @@ TEST_CASE("Explore cancellation during saved-filter preparation discards the unp
  SECTION("first Open") { run(0U); }
  SECTION("reopen") { run(1U); }
 }
-// CLEANUP-IGNORE: This settings-capture scenario and the overlay-retention scenario require independent fixture owners.
-TEST_CASE("Explore newest desired work renders the captured current Settings augmentation configuration") {
- auto backend = std::make_shared<FakeImageBackend>();
- auto probe = std::make_shared<ExploreWorkProbe>();
+struct AugmentedExploreFixture final {
+ std::shared_ptr<FakeImageBackend> backend = std::make_shared<FakeImageBackend>();
+ std::shared_ptr<ExploreWorkProbe> probe = std::make_shared<ExploreWorkProbe>();
  LoadedSettings settings;
  ExploreScenario scenario{settings, backend, ExploreScenario::TrackWork(probe)};
- static_cast<void>(scenario.system().UpdateAugmentation({.enabled = true}));
- scenario.OpenAndWait({.extent = {64U, 32U}, .row_count = 1U, .columns = 2U});
+ AugmentedExploreFixture() {
+  static_cast<void>(scenario.system().UpdateAugmentation({.enabled = true}));
+  scenario.OpenAndWait({.extent = {64U, 32U}, .row_count = 1U, .columns = 2U});
+ }
+};
+TEST_CASE("Explore newest desired work renders the captured current Settings augmentation configuration") {
+ AugmentedExploreFixture fixture;
+ auto& probe = fixture.probe;
+ auto& settings = fixture.settings;
+ auto& scenario = fixture.scenario;
  const float original = probe->rendered_copy_paste_probability.load(std::memory_order_acquire);
  const float requested = original == 0.75F ? 0.25F : 0.75F;
  contracts::SettingsUpdateRequest update;
@@ -2322,12 +2330,10 @@ TEST_CASE("Explore preserves selected transport classification through safe and 
  CHECK_FALSE(scenario.system().snapshot().ready);
 }
 TEST_CASE("Explore visibility preserves active augmentation and labels preserve the product") {
- auto backend = std::make_shared<FakeImageBackend>();
- auto probe = std::make_shared<ExploreWorkProbe>();
- LoadedSettings settings;
- ExploreScenario scenario{settings, backend, ExploreScenario::TrackWork(probe)};
- static_cast<void>(scenario.system().UpdateAugmentation({.enabled = true}));
- scenario.OpenAndWait({.extent = {64U, 32U}, .row_count = 1U, .columns = 2U});
+ AugmentedExploreFixture fixture;
+ auto& probe = fixture.probe;
+ auto& settings = fixture.settings;
+ auto& scenario = fixture.scenario;
  const auto before = scenario.system().snapshot();
  auto overlay = before.overlay;
  overlay.show_labels = !overlay.show_labels;

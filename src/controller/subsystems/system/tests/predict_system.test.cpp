@@ -602,10 +602,10 @@ TEST_CASE("preview recapture invalidates retained scratch and destination region
  // CLEANUP-IGNORE: An alias and ordinary policy/context construction precede independently owned test resources.
  using Composition = detail::PredictionPreviewComposition;
  const bool decoded = GENERATE(false, true);
- const auto execution = gpu::resolve_device_execution(0, mmltk::common::system::NumaTopology::Capture());
- gpu::DeviceContext context(0, gpu::cuda_image_copy_backend(), gpu::DeviceContextMode::Isolated, execution.placement.numa_node, execution);
- PredictionReceiverFault fault;
- ScopedPredictionReceiverFault receiver(fault);
+ PredictionReceiverFixture receiver;
+ const auto& execution = receiver.device.execution;
+ auto& context = receiver.device.context;
+ auto& fault = receiver.fault;
  detail::PredictionPreviewPool pool(execution, context, PredictionReceiverFault::Operations(), {}, 1U);
  gpu::SystemImageRuntime runtime({.device = 0, .output_layout = gpu::ImageProductLayout::CleanAndSemantic, .output_buffer_count = 2U, .adopted_context = context});
  Composition retained;
@@ -641,15 +641,15 @@ TEST_CASE("preview recapture invalidates retained scratch and destination region
   }
  }
 }
-// CLEANUP-IGNORE: This custody test shares only aliases and one existing execution-policy call with the independent validation pixel test.
 TEST_CASE("decoded compact preview retains bytes through retry and release without widening admission", "[controller][gpu]") {
+ // CLEANUP-IGNORE: Shared receiver fixture owns construction; these aliases retain each scenario's local resource names.
  namespace gpu = mmltk::frameworks::gpu;
  namespace rfdetr = mmltk::backend::models::rfdetr;
  using Composition = detail::PredictionPreviewComposition;
- const auto execution = gpu::resolve_device_execution(0, mmltk::common::system::NumaTopology::Capture());
- gpu::DeviceContext context(0, gpu::cuda_image_copy_backend(), gpu::DeviceContextMode::Isolated, execution.placement.numa_node, execution);
- PredictionReceiverFault fault;
- ScopedPredictionReceiverFault receiver(fault);
+ PredictionReceiverFixture receiver;
+ const auto& execution = receiver.device.execution;
+ auto& context = receiver.device.context;
+ auto& fault = receiver.fault;
  PredictionTransferFault transfer;
  auto operations = PredictionReceiverFault::Operations();
  operations.copy = PredictionTransferFault::Operations().copy;

@@ -435,50 +435,33 @@ mod tests {
                 assert!(router.update(&mut model, &mut settings, confirm()).is_err());
                 assert_eq!(settings.draft(), confirmed.as_ref());
                 assert_eq!(settings.state().clone().take_request(), edits);
-                model.file_dialog = Some(selected_model_dialog(
-                    settings.draft().unwrap(),
-                    workflow,
-                    &path,
-                    8,
-                ));
-                assert!(
-                    router
-                        .update(
-                            &mut model,
-                            &mut settings,
-                            route(
-                                workflow,
-                                model_card::Message::ConfirmArtifact {
-                                    path: path.clone(),
-                                    generation: 8
-                                }
+                for generation in [8, 1] {
+                    if generation == 1 {
+                        // A new transport resets the component's generation frontier.
+                        router.reset_transport(&model);
+                    }
+                    model.file_dialog = Some(selected_model_dialog(
+                        settings.draft().unwrap(),
+                        workflow,
+                        &path,
+                        generation,
+                    ));
+                    assert!(
+                        router
+                            .update(
+                                &mut model,
+                                &mut settings,
+                                route(
+                                    workflow,
+                                    model_card::Message::ConfirmArtifact {
+                                        path: path.clone(),
+                                        generation,
+                                    }
+                                ),
                             )
-                        )
-                        .is_ok()
-                );
-                // Reset retains the established new-transport generation frontier.
-                router.reset_transport(&model);
-                model.file_dialog = Some(selected_model_dialog(
-                    settings.draft().unwrap(),
-                    workflow,
-                    &path,
-                    1,
-                ));
-                assert!(
-                    router
-                        .update(
-                            &mut model,
-                            &mut settings,
-                            route(
-                                workflow,
-                                model_card::Message::ConfirmArtifact {
-                                    path: path.clone(),
-                                    generation: 1
-                                }
-                            )
-                        )
-                        .is_ok()
-                );
+                            .is_ok()
+                    );
+                }
             }
         }
     }

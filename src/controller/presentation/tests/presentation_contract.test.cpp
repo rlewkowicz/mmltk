@@ -43,6 +43,7 @@
 #include <utility>
 #include <variant>
 #include <vector>
+// CLEANUP-IGNORE: Namespace and using declarations provide test-local names; the fixture algorithms already have shared owners.
 namespace mmltk::controller {
 namespace {
 using namespace visual_test_support;
@@ -530,6 +531,7 @@ private:
  }
 };
 TEST_CASE("Retired source admission does not retire its occupied sample arena", "[workspace][protocol]") {
+ // CLEANUP-IGNORE: This case aliases an existing shared workspace fixture; the following retirement scenario is independent.
  namespace abi = presentation::detail::workspace_surface_import;
  using mmltk::testsupport::receive_workspace_record;
  using mmltk::testsupport::send_workspace_record;
@@ -1491,6 +1493,7 @@ TEST_CASE("Native display-last retirement consumes physical cleanup and its diag
  namespace fixture = gpu::test_support;
  using Access = test_support::NativePresentationWriterTestAccess;
  const bool terminal = GENERATE(false, true);
+ // CLEANUP-IGNORE: This case aliases an existing shared workspace fixture; the following presentation scenario is independent.
  const bool fail_release = GENERATE(false, true);
  mmltk::frameworks::gpu::test_support::WorkspaceTestFixture resources{true};
  REQUIRE(resources.prepared);
@@ -1598,6 +1601,7 @@ TEST_CASE("Native display release hands retained receiver cleanup to producer cu
  retirement.custody.SetRetirementSink({});
 }
 TEST_CASE("Native pending allocation release wakes retirement without treating a wake as completion", "[presentation][workspace]") {
+ // CLEANUP-IGNORE: These fixture aliases and observation call precede separate presentation fault paths.
  namespace gpu = mmltk::frameworks::gpu;
  namespace fixture = gpu::test_support;
  mmltk::frameworks::gpu::test_support::WorkspaceTestFixture resources;

@@ -752,6 +752,7 @@ TEST_CASE("COCONut JSON requires canonical categories and exact validation image
  json_file(input.annotation_json, document);
  const std::array<std::uint32_t, 1> ids{1};
  const std::array<std::pair<std::string, std::string>, 1> members{{{"panoptic_o365val_v3/objects365_v1_00000001.png", png(1, 1, ids)}}};
+ // CLEANUP-IGNORE: These independent malformed-input matrices assert admission around the shared importer; their valid records and expected category mappings differ.
  tar(input.mask_archive, members);
  if (!valid) {
   CHECK_THROWS(import_coconut_annotations(input));

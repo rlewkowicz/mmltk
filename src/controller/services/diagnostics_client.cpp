@@ -119,12 +119,7 @@ bool DiagnosticsClient::State::flush_locked() noexcept {
   const Record& record = terminal_record_active ? terminal_record : records[head];
   const bool wrote = mmltk::common::io::try_write_all_noexcept(descriptor.get(), {record.bytes.data(), record.size}) && mmltk::common::io::try_write_all_noexcept(descriptor.get(), "\n");
   if (!wrote) {
-   write_failures.fetch_add(1U, std::memory_order_relaxed);
-   failed = true;
-   enabled.store(false, std::memory_order_release);
-   discard_locked();
-   descriptor.reset();
-   drained.notify_all();
+   fail_writer_locked();
    return false;
   }
   if (terminal_record_active)

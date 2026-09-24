@@ -4,6 +4,7 @@
 #include "src/backend/imaging/raster/rendered_image_writer.h"
 #include "src/backend/imaging/raster/detail/checked_png.h"
 #include "src/frameworks/gpu/system_image_runtime.h"
+#include "src/frameworks/gpu/tests/device_execution_fixture.h"
 #include "src/test_support/filesystem_test_utils.hpp"
 #include "src/test_support/async_test_utils.hpp"
 #include <catch2/catch_test_macros.hpp>
@@ -30,34 +31,44 @@
 #include <limits>
 #include <utility>
 namespace fs = std::filesystem;
-TEST_CASE("rendered image writer atomically publishes owned pixels and preserves completed files on failure", "[raster][cuda][rendered_image_writer]") {
- namespace gpu = mmltk::frameworks::gpu;
- const auto execution = gpu::resolve_device_execution(0, mmltk::common::system::NumaTopology::Capture());
- gpu::DeviceContext context(0, gpu::cuda_image_copy_backend(), gpu::DeviceContextMode::Isolated, execution.placement.numa_node, execution);
- gpu::SystemImageRuntime runtime({.device = 0, .numa_node = execution.placement.numa_node, .execution = execution, .adopted_context = context});
- mmltk::backend::imaging::raster::RenderedImageWriter writer(context);
- const mmltk::testsupport::ScopedTempDir directory("rendered-image-writer");
- const auto fill = [&](int value) {
+namespace {
+namespace gpu = mmltk::frameworks::gpu;
+struct RenderedImageFixture final {
+ gpu::test_support::IsolatedTestDevice device;
+ gpu::SystemImageRuntime runtime{{.device = 0, .numa_node = device.execution.placement.numa_node, .execution = device.execution, .adopted_context = device.context}};
+ void Fill(int value) {
   auto candidate = runtime.AcquireOutput();
   runtime.PublishRetained(candidate, 7U, 5U, [&](auto clean, auto, auto stream) {
    REQUIRE(cudaMemset2DAsync(reinterpret_cast<void*>(clean.data), clean.descriptor.pitch_bytes, value, clean.descriptor.row_bytes(), clean.descriptor.height, reinterpret_cast<cudaStream_t>(stream)) ==
            cudaSuccess);
   });
   static_cast<void>(runtime.CommitOutput(std::move(candidate)));
- };
- fill(73);
+ }
+};
+void check_writer_pixels(const fs::path& path, unsigned char expected) {
+ int width = 0, height = 0, channels = 0;
+ std::unique_ptr<stbi_uc, decltype(&stbi_image_free)> pixels(stbi_load(path.c_str(), &width, &height, &channels, 4), stbi_image_free);
+ REQUIRE(pixels);
+ REQUIRE(width == 7);
+ REQUIRE(height == 5);
+ for (int index = 0; index < width * height * 4; ++index) CHECK(pixels.get()[index] == expected);
+}
+}  // namespace
+TEST_CASE("rendered image writer atomically publishes owned pixels and preserves completed files on failure", "[raster][cuda][rendered_image_writer]") {
+ namespace gpu = mmltk::frameworks::gpu;
+ RenderedImageFixture fixture;
+ auto& context = fixture.device.context;
+ auto& runtime = fixture.runtime;
+ mmltk::backend::imaging::raster::RenderedImageWriter writer(context);
+ const mmltk::testsupport::ScopedTempDir directory("rendered-image-writer");
+ fixture.Fill(73);
  const auto destination = directory.path() / "samples" / "sample-7.png";
  CHECK(writer.Flush().empty());
  writer.Write(runtime.Borrow(), destination);
  CHECK_THROWS_AS(writer.Write(runtime.Borrow(), destination), std::logic_error);
- fill(201);  // Source is reusable before the asynchronous file worker finishes.
+ fixture.Fill(201);  // Source is reusable before the asynchronous file worker finishes.
  REQUIRE(writer.Flush() == destination);
- int width = 0, height = 0, channels = 0;
- std::unique_ptr<stbi_uc, decltype(&stbi_image_free)> pixels(stbi_load(destination.c_str(), &width, &height, &channels, 4), stbi_image_free);
- REQUIRE(pixels);
- CHECK(width == 7);
- CHECK(height == 5);
- for (int index = 0; index < width * height * 4; ++index) CHECK(pixels.get()[index] == 73U);
+ check_writer_pixels(destination, 73U);
  // Pre-existing staging entries belong to someone else, even if they point at
  // the incumbent. Failure may remove only this writer's exclusive attempt.
  const bool symlink = GENERATE(false, true);
@@ -83,12 +94,7 @@ TEST_CASE("rendered image writer atomically publishes owned pixels and preserves
   CHECK(std::string(std::istreambuf_iterator<char>(prior), {}) == "earlier staging");
  }
  CHECK(std::distance(fs::directory_iterator(destination.parent_path()), fs::directory_iterator{}) == 2);
- int preserved_width = 0, preserved_height = 0, preserved_channels = 0;
- std::unique_ptr<stbi_uc, decltype(&stbi_image_free)> preserved(stbi_load(destination.c_str(), &preserved_width, &preserved_height, &preserved_channels, 4), stbi_image_free);
- REQUIRE(preserved);
- CHECK(preserved_width == 7);
- CHECK(preserved_height == 5);
- for (int index = 0; index < 7 * 5 * 4; ++index) CHECK(preserved.get()[index] == 73U);
+ check_writer_pixels(destination, 73U);
  // Staging creation cannot traverse a regular file as its parent.
  const auto blocked_parent = directory.path() / "blocked";
  {
@@ -125,9 +131,9 @@ TEST_CASE("rendered image writer atomically publishes owned pixels and preserves
 }
 TEST_CASE("rendered image writer shutdown retains engaged encoder pixels through atomic publication", "[raster][cuda][rendered_image_writer]") {
  namespace gpu = mmltk::frameworks::gpu;
- const auto execution = gpu::resolve_device_execution(0, mmltk::common::system::NumaTopology::Capture());
- gpu::DeviceContext context(0, gpu::cuda_image_copy_backend(), gpu::DeviceContextMode::Isolated, execution.placement.numa_node, execution);
- gpu::SystemImageRuntime runtime({.device = 0, .numa_node = execution.placement.numa_node, .execution = execution, .adopted_context = context});
+ RenderedImageFixture fixture;
+ auto& context = fixture.device.context;
+ auto& runtime = fixture.runtime;
  mmltk::testsupport::TestGate encoding("rendered writer pending encode");
  auto writer =
   std::make_unique<mmltk::backend::imaging::raster::RenderedImageWriter>(context, [gate = encoding.receipt()](const char* path, int width, int height, int channels, const void* pixels, int stride) {
@@ -137,12 +143,7 @@ TEST_CASE("rendered image writer shutdown retains engaged encoder pixels through
  mmltk::testsupport::ScopedTestCleanup release([&] { encoding.Release(); });
  const mmltk::testsupport::ScopedTempDir directory("writer-shutdown-output");
  const auto path = directory.path() / "sample.png";
- auto candidate = runtime.AcquireOutput();
- runtime.PublishRetained(candidate, 7U, 5U, [](auto clean, auto, auto stream) {
-  REQUIRE(cudaMemset2DAsync(reinterpret_cast<void*>(clean.data), clean.descriptor.pitch_bytes, 73, clean.descriptor.row_bytes(), clean.descriptor.height, reinterpret_cast<cudaStream_t>(stream)) ==
-          cudaSuccess);
- });
- static_cast<void>(runtime.CommitOutput(std::move(candidate)));
+ fixture.Fill(73);
  writer->Write(runtime.Borrow(), path);
  REQUIRE(encoding.WaitEntered(std::chrono::seconds(5)));
  std::promise<void> destroying;
@@ -158,12 +159,7 @@ TEST_CASE("rendered image writer shutdown retains engaged encoder pixels through
  mmltk::testsupport::await_test_future(stopped, "writer destruction drained", std::chrono::seconds(5));
  CHECK_FALSE(fs::exists(path.string() + ".partial"));
  CHECK(std::distance(fs::directory_iterator(directory.path()), fs::directory_iterator{}) == 1);
- int width = 0, height = 0, channels = 0;
- std::unique_ptr<stbi_uc, decltype(&stbi_image_free)> pixels(stbi_load(path.c_str(), &width, &height, &channels, 4), stbi_image_free);
- REQUIRE(pixels);
- CHECK(width == 7);
- CHECK(height == 5);
- for (int index = 0; index < width * height * 4; ++index) CHECK(pixels.get()[index] == 73U);
+ check_writer_pixels(path, 73U);
 }
 namespace {
 // Real glibc FILE operations reach these device-like streams. This exercises
@@ -280,19 +276,11 @@ TEST_CASE("concurrent PNG writers retain independent staging and settle only the
  namespace gpu = mmltk::frameworks::gpu;
  namespace raster = mmltk::backend::imaging::raster;
  const bool fail_first = GENERATE(false, true);
- const auto execution = gpu::resolve_device_execution(0, mmltk::common::system::NumaTopology::Capture());
- gpu::DeviceContext context(0, gpu::cuda_image_copy_backend(), gpu::DeviceContextMode::Isolated, execution.placement.numa_node, execution);
- gpu::SystemImageRuntime runtime({.device = 0, .numa_node = execution.placement.numa_node, .execution = execution, .adopted_context = context});
+ RenderedImageFixture fixture;
+ auto& context = fixture.device.context;
+ auto& runtime = fixture.runtime;
  const mmltk::testsupport::ScopedTempDir directory("concurrent-png-output");
  const auto destination = directory.path() / "sample.png";
- const auto fill = [&](int value) {
-  auto candidate = runtime.AcquireOutput();
-  runtime.PublishRetained(candidate, 7U, 5U, [&](auto clean, auto, auto stream) {
-   REQUIRE(cudaMemset2DAsync(reinterpret_cast<void*>(clean.data), clean.descriptor.pitch_bytes, value, clean.descriptor.row_bytes(), clean.descriptor.height, reinterpret_cast<cudaStream_t>(stream)) ==
-           cudaSuccess);
-  });
-  static_cast<void>(runtime.CommitOutput(std::move(candidate)));
- };
  mmltk::testsupport::TestGate first_encoding("first independent PNG encoder");
  std::promise<fs::path> pending_path;
  bool first_call = true;
@@ -306,26 +294,18 @@ TEST_CASE("concurrent PNG writers retain independent staging and settle only the
  });
  raster::RenderedImageWriter second(context);
  mmltk::testsupport::ScopedTestCleanup release([&] { first_encoding.Release(); });
- fill(73);
+ fixture.Fill(73);
  first.Write(runtime.Borrow(), destination);
  REQUIRE(first_encoding.WaitEntered(std::chrono::seconds(5)));
  const auto staging = mmltk::testsupport::await_test_promise(pending_path, "first PNG staging path");
  CHECK(staging != destination);
  CHECK(fs::is_regular_file(staging));
- fill(201);
+ fixture.Fill(201);
  second.Write(runtime.Borrow(), destination);
  REQUIRE(second.Flush() == destination);
  CHECK(fs::is_regular_file(staging));
  CHECK(std::distance(fs::directory_iterator(directory.path()), fs::directory_iterator{}) == 2);
- const auto check_pixels = [&](unsigned char value) {
-  int w = 0, h = 0, channels = 0;
-  std::unique_ptr<stbi_uc, decltype(&stbi_image_free)> decoded(stbi_load(destination.c_str(), &w, &h, &channels, 4), stbi_image_free);
-  REQUIRE(decoded);
-  REQUIRE(w == 7);
-  REQUIRE(h == 5);
-  for (int index = 0; index < w * h * 4; ++index) CHECK(decoded.get()[index] == value);
- };
- check_pixels(201U);
+ check_writer_pixels(destination, 201U);
  first_encoding.Release();
  if (fail_first)
   CHECK_THROWS_AS(first.Flush(), std::runtime_error);
@@ -333,9 +313,9 @@ TEST_CASE("concurrent PNG writers retain independent staging and settle only the
   CHECK(first.Flush() == destination);
  CHECK_FALSE(fs::exists(staging));
  CHECK(std::distance(fs::directory_iterator(directory.path()), fs::directory_iterator{}) == 1);
- check_pixels(fail_first ? 201U : 73U);
+ check_writer_pixels(destination, fail_first ? 201U : 73U);
  first.Write(runtime.Borrow(), destination);
  CHECK(first.Flush() == destination);
- check_pixels(201U);
+ check_writer_pixels(destination, 201U);
  CHECK(std::distance(fs::directory_iterator(directory.path()), fs::directory_iterator{}) == 1);
 }

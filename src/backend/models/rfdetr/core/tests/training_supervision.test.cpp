@@ -1,7 +1,8 @@
 #include "src/backend/models/rfdetr/core/detail/decoder_attention.h"
+#include "src/backend/models/rfdetr/core/tests/training_fixture.h"
 #include "src/backend/models/rfdetr/core/detail/training_mask_loss.h"
 #include "src/backend/models/rfdetr/core/detail/detection_sampling.h"
-#include "src/backend/ml/torch/tests/catch_support.h"
+#include "src/backend/ml/torch/tests/tensor_fixture.h"
 #include <torch/utils.h>
 #include "src/backend/models/rfdetr/core/model.h"
 // RF-DETR Match-Free mathematical and topology coverage.
@@ -150,24 +151,13 @@ rfdetr::PreparedTargets batched_targets(const std::vector<torch::Tensor>& boxes,
  return targets;
 }
 rfdetr::DetectionConfig detection_config(const rfdetr::NativeRfDetrConfig& model) {
- rfdetr::DetectionConfig config;
- config.num_classes = model.num_classes;
- config.group_detr = model.group_detr;
- config.dec_layers = model.dec_layers;
- config.num_select = model.num_select;
+ auto config = rfdetr::testsupport::detection_fixture_base(model);
  config.sum_group_losses = model.sum_group_losses;
  config.use_varifocal_loss = model.use_varifocal_loss;
  config.use_position_supervised_loss = model.use_position_supervised_loss;
- config.ia_bce_loss = model.ia_bce_loss;
- config.aux_loss = model.aux_loss;
- config.two_stage = model.two_stage;
- config.focal_alpha = model.focal_alpha;
  config.cls_loss_coef = model.cls_loss_coef;
  config.bbox_loss_coef = model.bbox_loss_coef;
  config.giou_loss_coef = model.giou_loss_coef;
- config.set_cost_class = model.set_cost_class;
- config.set_cost_bbox = model.set_cost_bbox;
- config.set_cost_giou = model.set_cost_giou;
  rfdetr::populate_default_detection_weight_dict(config);
  return config;
 }
@@ -1934,6 +1924,7 @@ TEST_CASE("Foreground-free focal classification uses one explicit group divisor 
    outputs.aux_outputs = {make_layer()};
    outputs.enc_outputs = make_layer();
    const auto targets = batched_targets({torch::empty({0, 4}), torch::empty({0, 4})}, {torch::empty({0}, torch::kInt64), torch::empty({0}, torch::kInt64)});
+   // CLEANUP-IGNORE: This oracle checks RNG around its own foreground-free input; the other case checks a distinct DN mask input through the same loss API.
    const auto rng = at::detail::getDefaultCPUGenerator().get_state();
    const auto loss = owner.loss(outputs, targets, {torch::tensor(0.F)}, true);
    REQUIRE(torch::equal(rng, at::detail::getDefaultCPUGenerator().get_state()));
@@ -2177,10 +2168,7 @@ TEST_CASE("DN private mask sampling replays owned outputs without changing ordin
   REQUIRE(torch::isnan(loss.mask_dice).item<bool>() == nonfinite);
   if (!nonfinite) {
    loss.total.backward();
-   for (const auto& operand : {sparse.spatial_features, sparse.query_features, sparse.bias}) {
-    REQUIRE(operand.grad().defined());
-    REQUIRE(operand.grad().count_nonzero().item<int64_t>() == 0);
-   }
+   mmltk::backend::ml::testsupport::require_zero_gradients({sparse.spatial_features, sparse.query_features, sparse.bias});
   }
  }
 }
@@ -2229,11 +2217,7 @@ TEST_CASE("Disabled DN masks admit missing target masks in direct and combined o
   loss.total.backward();
   std::vector<rfdetr::SparsePredMasks> selected{*outputs.denoising->main.sparse_pred_masks, *outputs.denoising->aux_outputs.front().sparse_pred_masks};
   if (assignment == rfdetr::TrainAssignmentKind::MatchFree) selected.push_back(*outputs.main.sparse_pred_masks);
-  for (const auto& mask : selected)
-   for (const auto& operand : {mask.spatial_features, mask.query_features, mask.bias}) {
-    REQUIRE(operand.grad().defined());
-    REQUIRE(operand.grad().count_nonzero().item<int64_t>() == 0);
-   }
+  for (const auto& mask : selected) mmltk::backend::ml::testsupport::require_zero_gradients({mask.spatial_features, mask.query_features, mask.bias});
   outputs.denoising->main.sparse_pred_masks->query_features = torch::ones({1, 1, 2});
   REQUIRE_THROWS(owner.loss(outputs, targets, {torch::tensor(1.F)}, true));
  }

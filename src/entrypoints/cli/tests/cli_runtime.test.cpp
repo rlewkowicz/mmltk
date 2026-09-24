@@ -383,6 +383,7 @@ void test_reflected_cli_policy_boundaries_and_diagnostics() {
 }
 void test_reflected_cli_optional_repeatable_negation_positionals_environment_and_roundtrip() {
  const auto parsed = parse_parser_request(std::array<std::string_view, 13U>{
+  // CLEANUP-IGNORE: Literal valid and invalid CLI argument vectors are independent boundary inputs, not a repeated parser.
   "--no-enabled",
   "--path",
   "/tmp/image.png",

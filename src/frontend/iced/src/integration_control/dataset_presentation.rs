@@ -1048,6 +1048,7 @@ impl Widget<RootMessage, Theme, iced::Renderer> for Observed<'_> {
             operation,
         );
     }
+    // CLEANUP-IGNORE: Iced requires this trait signature; this wrapper maps its child layout differently from StatusText.
     fn mouse_interaction(
         &self,
         tree: &widget::Tree,

@@ -241,6 +241,14 @@ struct WorkspaceSurfaceImportChannel::Impl {
  void erase_admission(const WorkspaceSurfaceImportId id) {
   std::erase_if(admitted, [id](const AdmissionRecord& record) { return record.first == id; });
  }
+ void settle_retirement(const WorkspaceSurfaceImportId id) {
+  erase_admission(id);
+  erase_id(committed, id);
+  erase_id(replied, id);
+  erase_id(withdrawn, id);
+  std::erase_if(retired, [id](const RetirementRecord& record) { return record.first == id; });
+  // The identity remains seen until presentation consumes the retirement.
+ }
  std::filesystem::path path;
  ScopedFd listener;
  ScopedFd peer;
@@ -513,11 +521,7 @@ struct WorkspaceSurfaceImportChannel::Impl {
      return;
     }
     retirements.push_back(WorkspaceSurfaceRetired{.id = id, .generation = retirement->second});
-    erase_admission(id);
-    erase_id(committed, id);
-    erase_id(replied, id);
-    erase_id(withdrawn, id);
-    std::erase_if(retired, [id](const RetirementRecord& value) { return value.first == id; });
+    settle_retirement(id);
     continue;
    }
    if (record.opcode == Opcode::Available || record.opcode == Opcode::Presented || record.opcode == Opcode::Completed) {
@@ -600,11 +604,7 @@ struct WorkspaceSurfaceImportChannel::Impl {
       return;
      }
      retirements.push_back(WorkspaceSurfaceRetired{.id = id, .generation = admission->second.generation});
-     erase_admission(id);
-     erase_id(committed, id);
-     erase_id(replied, id);
-     erase_id(withdrawn, id);
-     std::erase_if(retired, [id](const RetirementRecord& value) { return value.first == id; });
+     settle_retirement(id);
     }
     continue;
    }
