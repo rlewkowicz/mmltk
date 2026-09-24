@@ -86,6 +86,54 @@ The [logging module](../src/common/logging/mmltk_logging.cppm) and
 `report_fatal` is for ordinary terminal boundaries, **not signal handlers**;
 it must not be called from a fatal signal handler.
 
+## Local training failures
+
+[TrainProcessClient](../src/controller/services/train_process_client.cpp) scans
+the child's consumed output for line-start `fatal: ` envelopes even after the
+64 KiB console-retention budget fills. Its current-line and retained-cause
+buffers are each bounded to 3072 bytes. It finishes chunked and unterminated
+fatal lines before publishing the terminal and preserves a useful worker cause
+when a later parent line reports only generic distributed failure. Progress
+text and allocator warnings do not select a cause.
+
+[NativeTrainingRuntime](../src/controller/subsystems/train/training_system.cpp)
+projects the decoded exit/signal status and UTF-8-safe cause into the existing
+`ComputeTerminal.detail` for Train's UI. An explicit CUDA OOM cause adds the
+[batch-size/lane guidance](rfdetr-workflows.md#local-training-failures).
+`TrainingSystem` owns the single settled fatal stderr report when it hosts the
+runtime, including preparation failures; standalone runtime use retains its
+own reporting responsibility. Cancellation and process-group retirement are
+independent of diagnostic activation.
+
+With native GUI tracing enabled, training's `child.exited`, `child.signaled`,
+or `training.failed` records include bounded batch/lane, output, selected-device,
+and available run/attempt context. Disabled tracing does not construct that
+diagnostic payload.
+
+The query tool also recognizes the canonical external
+[TrainingRecord format 2](rfdetr-workflows.md#saved-history-and-plots). It
+projects valid role/phase observations as `training.<role>.<phase>` in lowercase.
+`Terminal` with `progress.phase: "Error"` is an explicit failure and triage
+anchor; every `Terminal` record is terminal evidence. Progress counters such
+as `class_error` do not imply failure. Bounded triage preserves `run_id`,
+`attempt_id`, role, sequence, and phase before optional configuration payloads
+and follows the run/attempt identity. These observations do not participate in
+generic begin/end suffix balancing.
+
+For an existing captured run:
+
+```bash
+./mmltk --logs output/train/run-0002/metrics.jsonl --errors --format timeline
+./mmltk --logs output/train/run-0002/metrics.jsonl --triage
+./mmltk --logs --family latest-wayland-test \
+  -q '@owner=training AND (@event=child.exited OR @event=child.signaled OR @event=training.failed)' \
+  --format timeline --limit 20
+```
+
+Replace the run path with the selected Output directory. A Terminal/Error
+record establishes failed training; use the owning operation's terminal detail
+or captured fatal stderr to establish the cause.
+
 ## Capture one reproduction
 
 ```bash
@@ -357,6 +405,34 @@ replace these draw and lifetime records. The
 [FPS behavior](gui-interaction.md#browser-redraws-and-fps) and asynchronous
 acceptance canvas probe have separate activation and ownership.
 
+## Workflow GPU evidence
+
+Enabled native `workflow.gpu_execution` records describe the actual
+Validate/Predict/Export runtime device, or each launched Train rank. `participant`
+names the workflow, `sequence` carries its admitted generation, `device` is the
+CUDA ordinal, `value` is rank, and `detail` is rank count. These are effect-only
+observations; neither logging nor a diagnostic identity owns execution or
+resource lifetime.
+
+The packaged workflow driver emits `integration.workflow_gpu_selected` after
+ordinary settings settlement, `integration.workflow_gpu_layout` for the shared
+Output/GPU/Status bounds, and `integration.workflow.operation_admitted` from
+native-backed operation snapshots. The independent audit joins admitted
+generations and actual execution in both directions, including cancellation
+before progress. All four cards have light-layout evidence; Train additionally
+has dark and narrow layout evidence. Native/controller fixtures separately
+cover ordered multi-rank selection and missing devices.
+
+```bash
+./mmltk --logs --family latest-wayland-test --run ARCHIVE_ID \
+  -q '@event=workflow.gpu_execution OR @event:integration.workflow_gpu_ OR @event=integration.workflow.operation_admitted' \
+  --format timeline --limit 60
+```
+
+Select the workflow capture with [archive discovery](#select-captures-and-histories).
+CUDA ordinals and graphics/NVML indices have distinct meaning; the
+[GPU reference](gpu-execution.md#workflow-device-selection) owns that boundary.
+
 ## Rendered UI acceptance evidence
 
 The opt-in [browser driver](../src/frontend/iced/src/integration_control.rs),
@@ -379,6 +455,8 @@ record UI interaction and pixels separately from physical resource custody:
 | `integration.validation_confidence_edit` | Nine settled decimal/invalid-input/arrow/wheel/endpoint stages, with the value, native settings revision, and unchanged evaluation generation |
 | `integration.validation_confidence_pixels` | Paired threshold, retained raw detection count/score range, clean identity, evaluation generation, settings revision, and canvas difference counts for `0 → 1 → 0` |
 | `integration.validation_layout`, `integration.validation_text` | Measured atlas and overlay-group bounds in ordinary/narrow layouts, plus Groundtruth/Detections and confidence-control text |
+| `integration.validation_progressive` | Selected generation and available population when detail opens during capture, then the complete retained population after closing detail on successful settlement |
+| `integration.validation_restored_tile` | Generation, tile index, current image revision, and actual colored pixels for each returned Validation tile |
 | `integration.workflow.caption_pixels` | Caption case/stage, patch count, observed background/glyph pixels, compared pixels, and currently verified overlap patches from the actual canvas |
 | `integration.workflow.caption_geometry` | Opt-in bounded clip and candidate GT/Det label rectangles when the workflow finds no eligible overlapping caption patch |
 | `integration.metric_projection` | Finite sample count, connected-segment count, and total projected entries for a Train curve |
@@ -619,6 +697,31 @@ Use the [test-selection syntax](validation.md#selection-environment-deadlines-an
 for a comma-separated union of case names, and inspect the selected command's
 actual terminal result.
 
+### JavaScript and Rust outcomes
+
+TAP records normalize to `tap.test_started`, `tap.test_passed`,
+`tap.test_failed`, and `tap.test_skipped`; `SKIP` and `TODO` remain skipped
+observations. `tap.summary` marks nonzero failures/cancellations or zero tests
+as failure candidates. Indented TAP diagnostic fragments, including assertion
+objects and diffs, remain searchable transcript context under the named test
+instead of becoming malformed JSON.
+
+Rust libtest results normalize to `libtest.test_passed`, `libtest.test_failed`,
+and `libtest.test_skipped`, with `libtest.summary` preserving the overall
+result. Named stdout/stderr sections restore test context for following panic,
+assertion, and left/right values. Query `@test` to collect that context:
+
+```bash
+./mmltk --logs build/validation/workflow-frontend-rerun-2.log --errors --format timeline
+./mmltk --logs build/validation/workflow-frontend-rerun-2.log \
+  -q '@test:"atlas_pixel_evidence"' --format timeline --limit 40
+```
+
+Use the actual command transcript path. Failure-related words inside passed or
+skipped test names, successful summaries, compiler progress, and numbered
+compiler source excerpts are not failures. Explicit failing outcomes, compiler
+errors, and failed build terminals retain their error classification.
+
 ## Query expressions
 
 ```bash
@@ -686,7 +789,8 @@ Useful metadata includes:
 | `@proximity_ns`, `@time_link` | Pasted-error proximity and its time-link method |
 | `@triage_reason`, `@triage_payload_truncated`, `@discovery` | Triage inclusion and limits |
 
-`@event` resolves wrapped `fields.event`/`fields.name` before top-level names.
+`@event` projects canonical [training records](#local-training-failures);
+otherwise it resolves wrapped `fields.event`/`fields.name` before top-level names.
 Bare searches also examine test/tag/run/signal metadata. Catch INFO copies keep
 their original timestamps and are labeled as copies. A `child.signaled` value
 of 139 decodes to SIGSEGV and 143 to SIGTERM; the signal does not establish
@@ -924,6 +1028,7 @@ The tool uses the existing build image, no GPU or network, and a read-only
 repository mount. It reads files only up to captured sizes; multi-pass
 correlation requires unchanged inputs. There is no follow mode or persistent
 index. Implementation and current help live in
-[tools/log_query.py](../tools/log_query.py). Run
-`./mmltk --test log-query-tool` during the permitted testing stage for its
-fixture suite.
+[tools/log_query.py](../tools/log_query.py). Unfiltered `./mmltk --test all`
+includes its fixture suite. The standalone `./mmltk --test log-query-tool`
+route and focused selectors are documented under
+[test selection](validation.md#selection-environment-deadlines-and-debugging).

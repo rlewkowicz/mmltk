@@ -79,6 +79,12 @@ The frontend check target compiles, with `--no-run`, the host Rust suites
 selected by the [browser-app test route](validation.md#native-and-browser-suites),
 including its explicit iced_aw library selection. These host checks and tests
 remain separate from the optimized `trunk build --release` Wasm bundle.
+The plot crate declares its native test dependencies in its own manifest so
+package-selected tests and doctests retain their renderer dependencies.
+`--no-run` checks compile tests without executing them; the unfiltered
+`./mmltk --test all` route executes the browser JavaScript/Rust fixtures along
+with native suites and log-query fixtures. See
+[suite selection](validation.md#native-and-browser-suites) for focused routes.
 
 [CMakeLists.txt](../CMakeLists.txt) requires exactly CMake 4.4.3.
 [MmltkToolchain.cmake](../cmake/MmltkToolchain.cmake) enforces compiler paths

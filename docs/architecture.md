@@ -47,7 +47,10 @@ translation, and event policy. Visual workers use the separate presentation
 runtime described below.
 
 [SettingsSystem](../src/controller/services/settings_system.h) owns live
-settings and mutation admission.
+settings and mutation admission, plus the immutable native CUDA inventory
+supplied by the shell outside persisted preferences. The
+[GPU execution reference](gpu-execution.md#workflow-device-selection) owns
+device facts, workflow selection, admission, and runtime retirement.
 [SettingsStore](../src/controller/services/settings_store.h) owns parsing,
 repair, revision admission, durable writes, and persistence failures;
 [SettingsLocation](../src/controller/services/settings_location.h) carries the
@@ -181,11 +184,15 @@ The [shared weights card](../src/frontend/iced/src/view/workflow/model_card.rs)
 owns dialog confirmation and pending selection; the
 [Output card](../src/frontend/iced/src/view/workflow/output.rs) owns common
 presentation, with Train history and Predict saving in their local components.
+The [GPU card](../src/frontend/iced/src/view/workflow/gpu.rs) owns selection
+interaction; the shared compositor supplies its
+[Output/GPU/Status placement](gui-interaction.md#gpu-selection).
 
 [ValidationSampleOutput](../src/controller/subsystems/validate/detail/validation_sample_output.h)
 captures selected borrowed samples into receiver-owned immutable products.
 Interactive `ValidationSamples` can adopt those same products without another
-copy. [PredictionOutput](../src/controller/subsystems/system/detail/prediction_output.h)
+copy and retains progressive capture separately from displayed detail
+membership. [PredictionOutput](../src/controller/subsystems/system/detail/prediction_output.h)
 owns sampled/full saving and publication; its
 [selection helpers](../src/controller/subsystems/system/detail/prediction_sampling.h)
 own compiled subsets and observed-frame reservoirs. Both output owners reuse

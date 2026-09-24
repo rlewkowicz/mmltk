@@ -12,7 +12,9 @@ start request and leaves its typed error visible.
 Train launches the packaged sibling CLI through `TrainingSystem`. Validate and
 Predict own independent native sessions, GPU work, cancellation, and retained
 image products. See the [source guide](architecture.md#native-domain-work) for
-their locations.
+their locations. Each workflow captures its own
+[GPU selection](gpu-execution.md#workflow-device-selection) at admission;
+Train retains ordered multi-device execution and remote-provider behavior.
 
 ## Backend ownership
 
@@ -165,7 +167,7 @@ cancellation; each workflow retains independent widget identities and state.
 
 ## Run output directories
 
-Each workflow's **Output** card is at the top of the right column, above status.
+Each workflow uses the shared [right-column layout](gui-interaction.md#training-validation-and-prediction).
 **Auto Output** is enabled initially. Accepted execution reserves the next
 `run-NNNN` beneath the workflow root, starting at `run-0001` and growing beyond
 four digits when needed. Existing entries are never overwritten.
@@ -252,6 +254,21 @@ is empty, its compact effective path follows Train's validation split, including
 inferred paths. Native settings own this resolution. Changing an inherited
 source cancels an unstarted Validate request just as changing an explicit
 selection does.
+
+## Local training failures
+
+An unsuccessful local run shows the child's bounded useful failure cause and
+exit status in Train. Signal termination retains the signal number. An
+explicit **CUDA out of memory** cause includes available allocator detail and
+guidance to reduce **batch size** or **training lanes**, then start again.
+The application preserves the configured workload and does not retry or tune
+training automatically. A signal or generic unsuccessful exit alone is not
+classified as CUDA OOM.
+
+The [failure reporting reference](logging.md#local-training-failures) owns
+process-output extraction, terminal projection, and quiet fatal reporting.
+Training equations, Match-Free/DN objectives, AMP, and batch admission retain
+the [training reference](rfdetr-training.md) contracts.
 
 ## Training and query limits
 
@@ -495,10 +512,24 @@ it is not a constant-memory statistic.
 Validation chooses up to six distinct random images from the evaluated
 population and captures their pixels, predictions, and ground truth during the
 same evaluation pass. A smaller population leaves empty cells. The fixed
-two-column/three-row atlas and its detail viewer reuse those retained products;
-opening detail and changing overlays do not run inference again. Selection
-uses the identity paired with displayed pixels, including during replacement
-or partial progress.
+two-column/three-row atlas and its detail viewer reuse those retained products.
+[ValidationSamples](../src/controller/subsystems/validate/detail/validation_samples.cpp)
+keeps progressive population membership separate from the immutable membership
+used by displayed detail. Opening detail freezes that view while capture
+continues. Successful settlement retains all useful captures, and closing
+detail returns to that population without repeating inference or source
+preparation. Selection uses the identity paired with displayed pixels,
+including during replacement or partial progress.
+
+A detail view from an earlier generation keeps its incumbent return atlas
+while a newer run is incomplete. A failed or cancelled replacement restores
+the incumbent products. Render refusal keeps the last completed image and its
+paired metadata, permits one automatic retry per request, and allows an
+explicit close retry after ordinary refusal is exhausted. Native render
+completion retires current capture bookkeeping only when its atlas matches
+the full requested population. Logical settlement and browser consumption
+remain independent. [GPU execution](gpu-execution.md#workflow-runtime-retirement) owns physical
+retirement and borrowed-frame lifetime.
 
 Validate's [Display confidence](gui-interaction.md#display-confidence) filters
 only those retained preview detections. It is independent of the evaluator's

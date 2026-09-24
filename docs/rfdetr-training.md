@@ -29,6 +29,11 @@ Torch `2.14.0a0+4fdf77b940`. Versioned upstream dependency references below
 explain particular equations; they do not identify the installed payload's
 complete implementation.
 
+Workflow [GPU selection](gpu-execution.md#workflow-device-selection) and
+[local-training failure guidance](rfdetr-workflows.md#local-training-failures)
+are independent of these equations. CUDA OOM reporting preserves the admitted
+workload; changing batch size or lane count requires the user's next run.
+
 ## Stock objective and mask mathematics
 
 [NativeRfDetrConfig](../src/backend/models/rfdetr/contract/model_config.h) and

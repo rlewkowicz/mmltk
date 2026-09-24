@@ -46,8 +46,9 @@ editor widget identities survive ordinary layout and native-state updates.
 ## Training, validation, and prediction
 
 Train, Validate, Predict and Export place **Output** at the top of the right
-column, above operation status. Their shared card provides Auto Output,
-Browse Output and admitted/completed paths; Train adds saved history and
+column, **GPU** immediately below it, and **Status** below GPU. Their shared
+Output card provides Auto Output, Browse Output and admitted/completed paths;
+Train adds saved history and
 Predict adds its source-specific saving controls. Setup and the primary action
 remain in the left column. The [output reference](rfdetr-workflows.md#run-output-directories)
 owns reservation, defaults and artifact names.
@@ -99,6 +100,25 @@ Validation and prediction also retain the save-preview options captured at
 that accepted Start through preparation. Later viewer edits do not mutate the
 admitted save payload. Predict inspection replies enter the same revision-aware
 snapshot reduction as events, so a late reply cannot replace newer source facts.
+
+### GPU selection
+
+The shared [GPU card](../src/frontend/iced/src/view/workflow/gpu.rs) displays
+each native CUDA ordinal, device name, and total VRAM in GiB. Validate, Export,
+and Predict select one device. Train uses checkboxes for an ordered device
+list and displays **Rank order**; adding a GPU appends a rank, removing one
+preserves the remaining order and associated NUMA choices. At least one
+training GPU remains selected.
+
+Selections use ordinary generated settings edits, preserve other pending
+drafts, and are disabled while the owning primary action is active or settings
+are unavailable. A saved device absent from the native inventory remains
+visible as **unavailable**; an empty inventory shows **No CUDA GPUs available**.
+The card does not silently choose a replacement. Native admission and
+device-dependent model preparation use the settled selection. The
+[GPU execution reference](gpu-execution.md#workflow-device-selection) owns
+inventory, persistence, locality, runtime replacement, and the independent
+graphics-device boundary.
 
 ### Dataset compilation controls
 
@@ -254,7 +274,10 @@ surface border, spacing, placeholder, and hit geometry. Source images retain
 their aspect rather than stretching into cells. Shared
 [image containment](../src/backend/imaging/raster/image_containment.h) has no
 Explore scheduler or dataset dependency. Validation keeps its own bounded
-sample products and composition owner.
+sample products and composition owner. Capture continues while detail is open;
+closing detail after successful validation reveals the retained completed
+population. [Sample retention](rfdetr-workflows.md#evaluation-metrics-and-retained-samples)
+defines the separate progressive and displayed memberships and retry behavior.
 
 Explore and Validation call the complete
 [image-viewer panel](../src/frontend/iced/src/view/image_viewer.rs): Sample

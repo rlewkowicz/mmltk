@@ -8,15 +8,16 @@
   package outputs, Firefox staging, declaration isolation, target-local PCHs,
   private native Parquet dependencies, embedded caption font, video encoders,
   generated bindings, caches, and build timing.
-- [Commands](commands.md): wrapper operations, process snapshots, native CLI,
-  benchmark cache selection and mask inspection/export, desktop options, and
-  model tooling.
+- [Commands](commands.md): wrapper operations, complete and focused test routes,
+  process snapshots, native CLI, benchmark cache selection and mask
+  inspection/export, desktop options, and model tooling.
 - [RF-DETR workflows and artifacts](rfdetr-workflows.md): model/class admission,
   GPU normalization, physical candidate ranking, separate candidate/COCO limits,
   shared weights selection, Transfer/Resume, reserved workflow outputs, independent
   ONNX/TensorRT export, captured validation PNGs, prediction samples and recoverable
-  Full video, training inputs and live progress, EMA, saved history, compact matcher costs,
-  evaluation metrics and samples, preview-only confidence, packed mask delivery,
+  Full video, training inputs, actionable local failures and live progress,
+  EMA, saved history, compact matcher costs, evaluation metrics and samples,
+  preview-only confidence, packed mask delivery,
   deterministic export ordering, and incremental image/video prediction.
 
 ## Architecture and frameworks
@@ -28,7 +29,8 @@
 - [GUI interaction and presentation](gui-interaction.md): application wire
   formats, workflow layout and navigation, Dataset recipe/validation/recovery
   controls and cancellation, shared form expansion/dividers, compact status
-  fitting, Output-card placement, the retained training dashboard, fixed Validation metrics/atlas,
+  fitting, shared Output/GPU/Status placement and GPU selection, the retained
+  training dashboard, fixed Validation metrics/atlas and progressive detail return,
   responsive overlay groups, the shared image viewer and primary actions,
   retained integer/decimal editing, prepared captions and texture bindings,
   shared immediate mouse input, native command settlement, Annotation mask work
@@ -55,7 +57,9 @@
   annotation reuse, overlapping acquisition/labels/pixels, independent progress,
   typed transfer versus source totals, readable quantities, partial downloads,
   and format/capacity limits.
-- [GPU execution and image loading](gpu-execution.md): device/NUMA placement,
+- [GPU execution and image loading](gpu-execution.md): native inventory and
+  persisted workflow GPU selection, device/NUMA placement, complete session and
+  stream retirement, escaped pinned-storage authority, shared batch count storage,
   H2D and GDRCopy, RGB8 preview storage, reusable checkpoint/export readbacks,
   Vulkan allocation and CUDA import, independent display/compute selection,
   bounded sparse damage transfers, Upscale input preparation and warming,
@@ -63,7 +67,8 @@
 
 ## Engineering, validation, and operations
 
-- [Validation](validation.md): the fixed final test/acceptance gate,
+- [Validation](validation.md): the fixed final test/acceptance gate, unfiltered
+  `all` native/JavaScript/Rust/log-query coverage and focused selectors,
   native/Rust formatting, cleanup, domain test ownership and selection,
   standalone CUDA/Vulkan and native-link diagnostics, retained browser workflow
   acceptance, Dataset presentation/cancel/restart, confidence/layout/input and
@@ -71,7 +76,9 @@
   coverage and limits, media settlement/recovery, and debugging.
 - [Headless Wayland](headless-wayland.md): the private NVIDIA Weston session,
   input seat, readiness, deadlines, shutdown, and artifacts.
-- [Logging](logging.md): fatal stderr reports, explicit diagnostic activation,
+- [Logging](logging.md): fatal stderr and actionable training causes, format-2
+  training terminals, Catch/TAP/Rust outcomes, workflow GPU evidence,
+  explicit diagnostic activation,
   benchmark cache/archive/transfer and release traces, pixel probes, artifact
   ownership, rendered UI and caption evidence, Dataset draw and probe records,
   archived-run selection, nested-field queries, Vulkan/FD provenance,

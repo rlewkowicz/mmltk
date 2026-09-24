@@ -8,13 +8,56 @@ The settings below select concrete devices, placement, and loading transport.
 The [GUI interaction guide](gui-interaction.md#native-gpu-custody-and-completion)
 owns producer/raw/display inventories, completion, and redraw mechanics.
 
+## Workflow device selection
+
+Train, Validate, Export, and Predict share the
+[GPU selector card](gui-interaction.md#gpu-selection), while each workflow owns
+its persisted choice. Native
+[CudaDeviceFact](../src/frameworks/gpu/device_inventory.h) declares the CUDA
+ordinal, name, and total VRAM. The shell discovers the process-visible inventory
+once; `SettingsSystem` retains it as immutable `SettingsUiState.cuda_devices`,
+outside saved settings. C++ reflection projects these facts into generated Rust.
+
+| Workflow | Persisted selection |
+| --- | --- |
+| Train | `workflows.train.request.device_ids`, in rank order |
+| Validate | `workflows.validate.request.device_id` |
+| Predict | `workflows.predict.request.device_id` |
+| Export | `workflows.export_state.device_id` |
+
+These IDs are CUDA ordinals in the current process-visible inventory. NVML
+indices, including those printed by `nvidia-smi` and the environment diagnostic,
+can use a different order; compare physical identities before interpreting an
+index across tools. A missing persisted GPU produces an explicit admission
+error rather than selecting another device.
+
+The [request materializer](../src/controller/subsystems/system/compute_intent_materializer.cpp)
+captures each workflow's selection. Validate and Predict resolve that device
+and their saved NUMA override; Export resolves automatic locality. Validation's
+source-compilation request uses the same device. The resulting
+`DirectComputeConfiguration` owns the admitted execution placement and worker
+policy. Native model preparation, inference, ONNX export, and TensorRT engine
+building use the admitted compute device. Device-dependent TensorRT inspection
+records its device in the native model selection; changing it requires
+reinspection before Start. Device-independent weight and ONNX inspection remain
+reusable.
+
+Train preserves ordered device ranks and matching per-rank NUMA settings in its
+child command, including a single remaining rank. The shared selector preserves
+existing remote-provider requests and behavior. Desktop `--device-id` selects
+the native visual device; it does not overwrite these workflow choices or
+select Firefox's graphics device. Firefox follows the Wayland graphics session.
+The [shared-workspace path](#shared-workspace-interoperability) handles products
+whose compute, native receiver, and graphics devices differ.
+
 ## Device and NUMA placement
 
 ```bash
 ./mmltk --gui --device-id 0 --numa-node -1
 ```
 
-`--device-id` uses the CUDA-visible device index. `--numa-node -1` requests
+This desktop `--device-id` uses the CUDA-visible visual device ordinal.
+`--numa-node -1` requests
 automatic GPU-local placement. Resolution uses the GPU's PCI identity,
 permitted local CPUs, and memory node. A single-node machine can resolve
 unknown reported locality; on a multi-node machine, unknown locality needs an
@@ -58,7 +101,7 @@ transport configuration changes. GDRCopy selection has no automatic transport
 fallback.
 
 Train, Validate, and Predict hide the H2D/NUMA widgets; their saved settings,
-desktop startup overrides, and native execution remain supported. Explore
+desktop transport override, and native execution remain supported. Explore
 retains its controls. GUI prediction's fixed batch size 1 is independent of
 transport selection.
 
@@ -73,6 +116,41 @@ mapped allocation.
 `MMLTK_GDR_TRACE_FILE` enables mapped-buffer JSONL diagnostics and is forwarded
 with host-path rewriting. `MMLTK_NUMA_TRANSFER_TRACE_FILE` provides the separate
 NUMA transfer trace. See [logging](logging.md) for joining captured identities.
+
+## Workflow runtime retirement
+
+Validate, Export, and Predict compare the complete captured execution
+configuration before reusing a runtime. Replacement first retires the actual
+shared session and stream through
+[CudaRuntimeResources](../src/controller/subsystems/system/detail/cuda_runtime_resources.cpp):
+bind the owning device, prove stream completion, close session resources,
+destroy the stream, and restore the caller's device. Retirement is idempotent
+after successful completion and refuses further work on the retired session.
+An ordinary work failure remains retryable after safe settlement and release.
+
+Unproved CUDA completion, release, or caller-context restoration retains the
+exact resource aggregate in bounded terminal custody and seals admission for
+that workflow owner. This includes failures during construction before a
+runtime object is returned. Terminal leases are reserved before CUDA work;
+diagnostic identities and object destruction do not establish safe retirement.
+
+Inference session close explicitly retires count, readback, and annotation storage.
+[PinnedHostBuffer](../src/frameworks/gpu/pinned_host_buffer.cpp) shares its
+terminal authority with the owning session/output and retained tensor views.
+Both explicit release failures and last-borrower unregister or context failures
+retain the storage and reach that same admission authority.
+[PredictionCountStorage](../src/backend/models/rfdetr/inference/prediction_count.cpp)
+uses one registered host allocation for a batch's scalar count views. Compatible
+unborrowed storage retains capacity; a live borrower or changed device requires
+independent storage before the next batch writes.
+
+[ValidationSampleOutput](../src/controller/subsystems/validate/detail/validation_sample_output.cpp)
+keeps one shared retirement authority across receiver replacement. It flushes
+prior saved-image writes before replacing a changed headless receiver; a valid
+graphics receiver stays fixed. Retained frames independently hold their context
+and storage, so replacing a pool cannot invalidate borrowed samples. The
+[logical sample lifecycle](rfdetr-workflows.md#evaluation-metrics-and-retained-samples)
+continues independently of renderer availability.
 
 ## Prediction preview storage
 
@@ -90,6 +168,9 @@ decoded source is released; decoded ownership, pinned staging, and device
 storage remain protected until their respective copies and conversions settle.
 This preview path is independent of model-input normalization and
 [encoded prediction-mask readback](rfdetr-workflows.md#incremental-prediction).
+Replacement resolves source execution before mutating a free slot; ordinary
+pre-submission refusal preserves its receiver allocation and decoded source.
+Retained frames expose the actual receiver device independently of diagnostics.
 
 The [raster backend](../src/backend/imaging/raster/raster_cuda.cu) scans
 overwrite-only box/digit and analysis-mask colors from the last object backward,

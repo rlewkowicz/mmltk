@@ -150,7 +150,12 @@ Train, Validate, Predict and Export share artifact-selection and output
 presentation while keeping workflow controls and admission independent.
 Each workflow admits its automatic or manual output at accepted
 execution, preserves completed artifacts on failure, and separates configured
-destinations from run results. Output cards lead the right column above status.
+destinations from run results. Output cards lead the right column, followed by
+shared GPU selection and status. Each workflow retains its compute-device
+preference from the native available-device inventory. Admission captures that
+selection for model preparation and execution; local training retains ordered
+multi-device ranks and their placement. Unavailable selections produce useful
+errors. The browser's graphics device remains independently selected.
 Training additionally owns current-format history, fresh transfer initialization,
 and validated checkpoint continuation. Selecting inputs, continuation mode, or an
 output directory never starts a run. Compact operational text fits a stable
@@ -171,7 +176,10 @@ calculated or plotted by the GUI.
 Validation presents fixed COCO summaries and up to six retained samples from its
 evaluation pass in a fixed metrics/preview workspace. It shares atlas containment
 and the complete image viewer with Explore, while retaining its own sample
-selection and overlay policy. Both viewers support navigation, fit, pan, zoom,
+selection and overlay policy. Progressive capture continues independently of
+the selected detail view. Successful validation retains all captured samples
+for the return to its atlas, including through asynchronous presentation and
+retry. Both viewers support navigation, fit, pan, zoom,
 upscaling, and ground-truth import into Annotation. Validation independently
 controls its complete ground-truth and detection layers, uses complementary
 class colors, adds overlapping mask/outline RGB with unchanged alpha, and paints
@@ -355,7 +363,10 @@ Duplicate discrete jobs report busy. Ordered document commands retain their
 admitted sequence, and cancellation requests the owning system's stop mechanism.
 Synchronous exceptions propagate through direct calls
 and become typed failures once at the nearest operation, worker, or external
-service boundary. A failed system preserves valid snapshots, reports failure,
+service boundary. Local training preserves the child's useful failure cause
+and exit status in the owning UI; an explicit CUDA memory failure identifies
+batch size and training lanes as user-controlled ways to reduce memory demand.
+A failed system preserves valid snapshots, reports failure,
 and retires its failed resources safely. Recoverable runtimes reconstruct
 lazily within that system, while independent systems continue operating.
 Persisted settings retain their named format. Compiled datasets use format 9

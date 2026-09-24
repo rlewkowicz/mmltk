@@ -22,6 +22,7 @@ reuse a repository-scoped container and stream the application output.
 | `./mmltk --tidy` | Format native sources and Iced application Rust; run configured native analysis |
 | `./mmltk --cleanup-report cpp\|frontend\|all` | Generate the selected deduplication reports |
 | `./mmltk --test list` | List supported suites and test options |
+| `./mmltk --test all` | Run ordinary native, browser JavaScript/Rust, and log-query fixtures |
 | `./mmltk --test cuda-vulkan -- --help` | Build/select the standalone CUDA/Vulkan diagnostic and show its positional options |
 | `./mmltk --logs --help` | Show log-query grammar and options |
 | `./mmltk --diagnose-processes [WRAPPER_MODE]` | Inspect processes in this repository's running wrapper containers |
@@ -45,6 +46,9 @@ CUDA/Vulkan cases and argument meanings; [logging](logging.md) owns query,
 Vulkan-message, and descriptor-lineage examples. See
 [native link diagnostics](validation.md#native-symbol-and-link-diagnostics)
 for symbol filters, linker maps, and saved LTO intermediates.
+The [test-selection reference](validation.md#selection-environment-deadlines-and-debugging)
+owns focused native filters, browser JavaScript/Rust package selection, and
+log-query fixture selectors.
 
 ### Process snapshots
 
@@ -222,7 +226,10 @@ owns cache reuse, output/cache overlap rejection, and publication behavior.
 ```
 
 Desktop startup accepts `--device-id`, `--numa-node`, and `--gdrcopy`.
-The [GPU execution guide](gpu-execution.md) explains locality and transport.
+Its device option selects native visual execution. The Train, Validate,
+Export, and Predict cards retain their own compute selections; Firefox's
+graphics device follows the Wayland session. The
+[GPU execution guide](gpu-execution.md) explains selection, locality, and transport.
 The wrapper discovers the active Wayland socket and forwards the matching
 runtime/session paths. `XDG_RUNTIME_DIR`, `WAYLAND_DISPLAY`, and, when needed,
 `__NV_PRIME_RENDER_OFFLOAD` can be supplied from the same working host session.

@@ -16,9 +16,10 @@ and acceptance gate is exactly these commands, in order, and both must pass:
 ./mmltk --test workspace-wayland --headless-compositor
 ```
 
-The remaining commands describe standalone capabilities. Focused filters,
-individual executables, browser-app, and additional suites do not replace or
-supplement this Final Validation gate.
+The unfiltered `all` route includes native executables, browser JavaScript/Rust
+tests, and log-query fixtures. The remaining commands describe standalone
+capabilities. Focused filters, individual executables, and additional suite
+invocations do not replace or supplement this Final Validation gate.
 
 ## Formatting and static analysis
 
@@ -123,6 +124,12 @@ plus an explicit `iced_aw --lib` invocation with `--no-default-features` and
 library tests; dependency-generated illustrative icon doctests are outside that
 selection. The [frontend CMake registration](../src/frontend/iced/CMakeLists.txt)
 owns both execution and the corresponding `--no-run` check commands.
+The browser test route explicitly requests NVIDIA graphics access, selects the
+container's NVIDIA Vulkan ICD files, and sets the renderer backend to Vulkan.
+It applies this setup whether called directly or from `all`; missing NVIDIA
+Vulkan ICDs fail the route. `iced_plot` owns its native test dependencies in
+its [manifest](../third_party/iced_plot/Cargo.toml), including package-selected
+tests and doctests.
 
 These are first-party application suites. `browser-runtime` exercises desktop
 startup and process ownership with fixtures; `workspace-wayland` runs the
@@ -147,17 +154,20 @@ outside the permitted test set.
 | `cleanup-tool` | Cleanup-report tooling fixtures |
 | `log-query-tool` | Log parser/query/correlation/triage fixtures |
 | `build` | Build the configured native test targets without running them |
-| `all` | Build the native test targets; run the ordinary native executables |
+| `all` | Build native test targets; run ordinary native executables, browser JavaScript/Rust tests, and log-query fixtures |
 
 `all` builds `mmltk_workspace_wayland_integration` but excludes it from its run
-list. It also does not execute `cuda-vulkan`, `browser-app`, the tooling suites,
-or the profile runner. Those have separate standalone routes outside the fixed
-Final Validation gate. `gui` and `tsan` suite names are currently unavailable
-even though other GUI/development build facilities exist.
+list. With no native executable or runner-argument filter, it then executes
+`browser-app` and `log-query-tool`, retaining the first nonzero status while
+running the remaining groups. `all --executable TARGET` and `all -- FILTER`
+remain native selections and do not append those fixture groups. `all` does not
+execute `cuda-vulkan`, the compositor/cleanup tooling suites, or the profile
+runner. `gui` and `tsan` suite names are currently unavailable even though other
+GUI/development build facilities exist.
 The full product build's `--no-run` frontend checks establish that the selected
 Rust test targets compile. They do not establish execution of `browser-app`,
-its Rust tests, or its direct JavaScript tests. Report those standalone runs
-only when their route was actually executed.
+its Rust tests, or its direct JavaScript tests. Report execution only when the
+fixtures ran through unfiltered `all` or the standalone `browser-app` route.
 
 Some RF-DETR tests download model checkpoints and derive normalized weights,
 ONNX, and TensorRT engines in `.cache/tests/rfdetr` on first use. Hardware-gated
@@ -172,6 +182,10 @@ Put test-runner arguments after `--`:
 ./mmltk --test core -- --list-tests
 ./mmltk --test rfdetr -- '~[optin]'
 ./mmltk --test browser-app -- presentation
+./mmltk --test browser-app -- --js-test-name-pattern 'probe'
+./mmltk --test browser-app -- --rust-package mmltk-browser-app view::workflow::gpu::tests
+./mmltk --test browser-app -- --rust-package iced_plot --doc
+./mmltk --test log-query-tool -- FileQueryTests.test_training_failure_is_an_explicit_triage_anchor
 ./mmltk --test application-systems --executable mmltk_frameworks_gpu_tests \
   --env MMLTK_GDR_TEST_DEVICE=0 -- '[gdr][hardware]'
 ./mmltk --test all --executable mmltk_backend_imaging_explore_tests
@@ -229,12 +243,24 @@ Compositor startup and process-group teardown have their own bounded waits in
 
 `workspace-wayland` requires the packaged Release graph and rejects GDB.
 `browser-app` accepts Cargo test arguments after `--` but does not support
-native executable, environment, or debugger options. Its JavaScript suite
-always runs in full, even when Cargo receives a test filter. The filter is
-forwarded to both Cargo invocations, including iced_aw.
+native executable, environment, or debugger options. Optional prefix selectors
+must precede ordinary Cargo arguments:
+
+| Browser selector | Behavior |
+| --- | --- |
+| No prefix | Run all JavaScript cases, then the ordinary Cargo selections; Cargo filters apply to both Rust invocations |
+| `--js-test-name-pattern PATTERN` | Filter JavaScript case names while retaining both ordinary Rust invocations and any following Cargo arguments |
+| `--rust-package PACKAGE` | Omit JavaScript and select `mmltk-browser-app`, `iced_plot`, or `iced_aw` |
+
+The two prefixes are mutually exclusive. `iced_aw` always retains its existing
+`--lib --no-default-features --features number_input,selection_list` selection.
+For example, the JavaScript `probe` command above still runs the ordinary Rust
+suites; the `iced_plot --doc` command selects only that package's doctests.
 `headless-compositor` accepts a command after `--` and owns its runtime.
-`headless-compositor-tool`, `log-query-tool`, and `cleanup-tool` own their
-fixture invocations and reject extra arguments and native test options.
+`log-query-tool` accepts one or more `Class.test_method` selectors after `--`;
+with none it runs full discovery. It rejects native test options.
+`headless-compositor-tool` and `cleanup-tool` reject extra arguments and native
+test options.
 
 ## Native symbol and link diagnostics
 
@@ -345,7 +371,7 @@ standalone evidence-audit cases.
 | Hardware entrypoint | Process lifetimes and required behavior |
 | --- | --- |
 | `workspace_wayland_retained` | One H2D browser: Dataset presentation/disclosure/input and real cancel/restart, square/capacity growth, full controls including integer typing/paste, cached and held-miss gallery/detail returns, Detail-open resizing in both orientations, augmentation retention, fractional rows, circular wrap, partial final row, wide/tall layouts, local labels/native semantics, light/dark copy with shared Annotate layout and long lists, FPS, rapid changes, then SIGINT |
-| `workspace_wayland_workflows` | One H2D browser: actual Train start, live progress pixels and hidden-tab progress, chart data/selection/aspects and retained camera/legend interaction, validation metrics and six sample/detail previews, confidence editing/filtering and responsive groups, direct Validate-to-Explore pixels, compiled/image/video prediction, Pause/Resume/EOF/Stop, light/dark and minimum-width chart pixels, then SIGINT |
+| `workspace_wayland_workflows` | One H2D browser: GPU selection and execution for Train/Validate/Predict/Export, actual Train start, live progress pixels and hidden-tab progress, retained chart interaction, validation metrics and progressive sample/detail returns, confidence editing/filtering and responsive groups, direct Validate-to-Explore pixels, compiled/image/video prediction, Pause/Resume/EOF/Stop, export/cancellation, light/dark and minimum-width pixels, then SIGINT |
 | `workspace_wayland_dpi` | One H2D browser at DPI 1.5: Dataset presentation fixtures, light/dark copy, and rapid changes |
 | `workspace_wayland_terminal` | Two H2D browsers: a real window close and abrupt browser-peer loss after an Annotation edit, exact completed draw, and independent redraw |
 | `workspace_wayland_probe_recovery` | Four H2D browsers with startup-latched allocation, reset, begin, or end probe failure; exact-content recovery and complete final pixel/semantic evidence |
@@ -422,6 +448,20 @@ requires metric sequence advancement.
 Validation waits for all six samples to be available with identities from the
 completed evaluation generation before advancing to their canvas checks.
 Native metric completion can precede the asynchronous sample renderer.
+The validation run opens detail during progressive capture, waits for
+successful native settlement with detail retained, closes it, and requires all
+six samples from that generation in the returned atlas. This uses completed
+products from that run without another evaluation.
+
+For each of the four workflows, the driver selects a native inventory device
+through the shared GPU card and checks settled settings. It measures the
+Output/GPU/Status order for all four cards in the light layout and for Train in
+dark and narrow layouts. The independent browser audit joins each admitted
+native generation to actual
+`workflow.gpu_execution` records in both directions, checks device/rank facts,
+and covers cancellation before progress is published. Selection labels alone
+cannot satisfy the execution check. The
+[logging reference](logging.md#workflow-gpu-evidence) owns those records.
 
 The workflow scenario also verifies the individual saved Validation PNGs,
 Predict saving-control state, compiled/image samples, completed video, and
@@ -616,8 +656,8 @@ sessions retain ordinary clipboard permissions.
 | Existing target | Evidence it owns |
 | --- | --- |
 | `mmltk_controller_annotation_tests` | Independent input/render progress, normalized-run hit testing, disk cleanup against scalar support, document/history/save behavior, immutable scene reuse, complete journal moves, packed upload reuse and allocation-local damage, stable target identity through Undo/Redo, retained input pressure, ordered command continuations, fractional raster boundaries, Original crop/aspect materialization, masks beyond boxes and present-empty masks, rejection, and cancellation |
-| `mmltk_controller_services_tests` | Counter-read interruption/size/error policies, reflected named settings including benchmark choices and preview-confidence defaults/repair/persistence, independent optional-test settings, training command construction, current-format saved history, bounded cursor reads, directory replacement/truncation, and output/resume admission |
-| `mmltk_controller_data_compute_systems_tests` | Start/input admission including absent or incompatible optional test splits, selected validation results and retained sample/detail custody, preview-confidence recomposition without another evaluation, compact RGB8 preview transfers/reuse and failure, incremental prediction, and video playback cancellation |
+| `mmltk_controller_services_tests` | Counter-read interruption/size/error policies, reflected named settings including benchmark choices and preview-confidence defaults/repair/persistence, immutable CUDA inventory versus saved device IDs, independent optional-test settings, training command construction and bounded child failure causes, current-format saved history, bounded cursor reads, directory replacement/truncation, and output/resume admission |
+| `mmltk_controller_data_compute_systems_tests` | Start/input admission including absent or incompatible optional test splits, selected-GPU admission and missing devices, TensorRT reinspection, captured NUMA placement, complete session/stream retirement and sealed unsafe custody, selected validation results and progressive/detail retention through settlement/refusal/retry, preview-confidence recomposition without another evaluation, compact RGB8 preview transfers/reuse and failure, incremental prediction, and video playback cancellation |
 | `mmltk_controller_browser_tests` and `mmltk_frameworks_serialization_tests` | Reflected field/enum/schema and graphics ABI facts, nested/array metric projection fixtures, package fixtures, positional output versus named persistence, named-field lookup/error precedence, exact CBOR bytes and borrowed map keys, split owned/borrowed payloads, UTF-8 block/page tails, lossless compact input, and control receipts |
 | `mmltk_frameworks_transport_tests` | Peer replacement, reconnect, output continuity, ring wrap, and transport custody |
 | `mmltk_controller_explore_tests` | Explore domain admission, settings/filter persistence, thumbnail identity, viewport priority, augmentation refresh, staged replacement, cancellation, and failure |
@@ -755,8 +795,8 @@ capabilities are unavailable; BF16 branches require compatible hardware.
 GDRCopy mappings additionally need a usable `gdrdrv` or CUDA DMA-BUF mmap route.
 A host lacking both cannot supply successful GDRCopy mapping evidence even
 when ordinary CUDA and Wayland pass. Product builds compile selected frontend
-test targets without executing the separate browser-app suite, as described
-[above](#native-and-browser-suites).
+test targets; unfiltered `all` and standalone `browser-app` execute them, as
+described [above](#native-and-browser-suites).
 
 ## Benchmark compilation evidence
 
@@ -804,14 +844,14 @@ counting repeated attempts as completed work.
 They also preserve the latest artifact transfer independently of source totals,
 clear it on changed activity/completion, and retain the CLI's detailed status.
 
-The standalone `browser-app` route additionally owns
+The `browser-app` fixture group additionally owns
 [shared transition cases](../src/frontend/iced/src/view/shared/transition/tests.rs)
 for reversal, intrinsic reflow, retained widget identity, redraw quietness,
 focus/overlay clipping, mouse/touch cancellation, and composed-scroller input.
 Its integration-driver and JavaScript cases cover asynchronous array ownership,
 request retirement, and replacement-owner isolation. The full build compiles
-the selected Rust test targets; execution of these standalone Rust/JavaScript
-cases is separate from the fixed Final Validation gate.
+the selected Rust test targets; unfiltered `all` executes this group as part of
+the Final Validation gate. The standalone route supports focused investigation.
 
 For standalone focused selection outside the Final Validation gate:
 

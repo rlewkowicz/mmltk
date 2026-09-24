@@ -19,7 +19,8 @@ not rebuild or replace the packaged application or Firefox.
 
 The [workflow case](validation.md#packaged-wayland-acceptance) runs real local
 training through the packaged sibling CLI, evaluation with six retained
-samples, and compiled/image/video prediction. It requires actual canvas
+samples, compiled/image/video prediction, and export. It checks each workflow's
+selected GPU against native execution evidence and requires actual canvas
 observations for charts, the live progress bar, and image viewers in addition
 to typed operation completion and physical graphics settlement. It uses the
 same private compositor and progress deadlines as other packaged acceptance.

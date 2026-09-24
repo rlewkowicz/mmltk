@@ -55,17 +55,24 @@ Train prepares the selected model and starts the run from its primary action.
 Its center shows a selectable chart dashboard with a separate live progress
 card. Train and validation inputs are required; the final-test split is optional.
 Choose Transfer or Resume in the weights card. Train, Validate, Predict, and
-Export put Output at the top of the right column. Auto Output creates a fresh
+Export put Output at the top of the right column, with GPU selection immediately
+below it and Status below that. Each workflow remembers its compute GPU;
+Train supports multiple GPUs in rank order. Auto Output creates a fresh
 run beneath `output/<workflow>` at Start; Browse Output selects a manual
 destination and, for Train, loads saved charts. EMA is optional and off by default.
 Validate shows twelve COCO summaries beside six sample tiles and uses Explore's
-viewer, including Upscale and Open in Annotation. Groundtruth and Detections
-switch the two annotation layers independently. Advanced includes Display
-confidence for filtering preview detections. It also saves the selected samples
+viewer, including Upscale and Open in Annotation. Samples captured while detail
+is open remain available when you close it after validation completes.
+Groundtruth and Detections switch the two annotation layers independently.
+Advanced includes Display confidence for filtering preview detections. It also
+saves the selected samples
 as individual PNGs with the display choices captured at Start. Predict handles
 compiled data, an image, or a local video, with source-specific sample saving
 and Full annotated H.264/MKV output. Video has Pause/Resume/Stop and retains
 partial media after interruption. Export can save ONNX, TensorRT, or both.
+Local training failures show the reported cause and exit status. CUDA
+out-of-memory errors point to batch size and training lanes; restarting remains
+an explicit action.
 
 The [RF-DETR workflow guide](docs/rfdetr-workflows.md) covers class identity,
 metrics, output files, and continuation. Current native checkpoints use version
@@ -104,6 +111,9 @@ Start with the [dataset format and compiler](docs/datasets.md) for your own
 data, or the [command reference](docs/commands.md) for CLI and GUI operations.
 [Validation](docs/validation.md) covers tidy, cleanup, focused tests, and
 hardware acceptance; [logging](docs/logging.md) explains captured evidence.
+`./mmltk --test all` runs the ordinary native suites, browser JavaScript/Rust
+tests, and log-query fixtures. Packaged Wayland acceptance has its own command
+in the validation guide.
 
 ## Codebase
 
