@@ -405,6 +405,7 @@ fn measured_active_area_holds_shorter_updates_and_cancellation_removes_rows() {
         // or track is resurrected by the retained non-idle phase.
         element = view(Some(&dataset));
         let mut reconnected = widget::Tree::new(&element);
+        reconnected.diff(&mut element);
         let node = element
             .as_widget_mut()
             .layout(&mut reconnected, &renderer, &limits);
@@ -421,6 +422,7 @@ fn measured_active_area_holds_shorter_updates_and_cancellation_removes_rows() {
         // A new generation uses current content rather than a prior run's tall
         // source panel; shared disclosure tests also exercise retained-tree reset.
         let mut restarted = widget::Tree::new(&element);
+        restarted.diff(&mut element);
         let node = element
             .as_widget_mut()
             .layout(&mut restarted, &renderer, &limits);

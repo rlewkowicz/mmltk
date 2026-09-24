@@ -821,7 +821,7 @@ mod tests {
     fn unsupported_workflows_construct_the_unavailable_card() {
         let settings = installed_settings_model();
         for workflow in [FeatureId::Live, FeatureId::Annotate, FeatureId::Explore] {
-            let card = view(
+            let mut card = view(
                 State::from_settings(
                     workflow,
                     settings.draft.as_ref(),
@@ -833,7 +833,8 @@ mod tests {
                 ),
                 0,
             );
-            let tree = iced::advanced::widget::Tree::new(&card);
+            let mut tree = iced::advanced::widget::Tree::new(&card);
+            tree.diff(&mut card);
             assert!(!tree.children.is_empty());
         }
     }

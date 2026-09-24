@@ -25,6 +25,10 @@ canvas  = ["iced/canvas"]
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 getrandom = { version = "0.4", features = ["wasm_js"] }
 
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+iced = { path = "../iced", default-features = false, features = ["fira-sans", "thread-pool", "wayland", "web-colors"] }
+wgpu = { version = "29", default-features = false, features = ["std", "wgsl", "vulkan"] }
+
 
 [package.metadata.vendor]
 revision = "56290b6eacf4fcd74a7cd3c6ea2ec3a2d1a4944c"

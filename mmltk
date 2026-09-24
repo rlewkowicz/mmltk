@@ -338,7 +338,7 @@ run_owned_toolchain_command() {
     local owned_container_name="$1"
     local command="$2"
     run_owned_container_command "${owned_container_name}" \
-        run_toolchain_command "${command}" "${owned_container_name}"
+        run_toolchain_command "${command}" "${owned_container_name}" "${3:-}"
 }
 
 run_owned_docker_command() {
@@ -2007,6 +2007,7 @@ prepare_compiler_cache_dirs() {
 run_toolchain_command() {
     local command="$1"
     local owned_container_name="${2:-}"
+    local driver_capabilities="${3:-}"
     prepare_compiler_cache_dirs
     local toolchain_identity
     toolchain_identity="$(docker image inspect "${build_image_name}" \
@@ -2070,8 +2071,8 @@ run_toolchain_command() {
             docker_args+=(--gpus all --env NVIDIA_DRIVER_CAPABILITIES=compute,utility)
         fi
     fi
-    if [[ "${invocation_mode}" == "test" && "${test_suite}" == "browser-app" ]]; then
-        docker_args+=(--gpus all --env NVIDIA_DRIVER_CAPABILITIES=graphics,utility --env WGPU_BACKEND=vulkan)
+    if [[ -n "${driver_capabilities}" ]]; then
+        docker_args+=(--gpus all --env "NVIDIA_DRIVER_CAPABILITIES=${driver_capabilities}")
     fi
     docker_args+=("${build_image_name}" -lc "${command}")
     docker "${docker_args[@]}"
@@ -2548,6 +2549,9 @@ print_test_suites() {
         '' \
         'Use: ./mmltk --test <suite> [test options] [-- <Catch2 args...>]' \
         'For browser-app, arguments after -- are Cargo test arguments.' \
+        '  Prefix --js-test-name-pattern <pattern> to select JavaScript cases, or' \
+        '  --rust-package <package> to run one Rust package without JavaScript.' \
+        'For log-query-tool, arguments after -- select Class.test_method cases.' \
         'For headless-compositor, arguments after -- run a command in the private compositor.' \
         'For cuda-vulkan, arguments after -- are width height allocation-pairs transfers validation context-mode memory-owner process-mode; use -- --help.' \
         'Test options:' \
@@ -2582,8 +2586,20 @@ run_log_tool() {
     append_wrapper_labels diagnostic_args "logs"
     if [[ "${tool_mode}" == "test" ]]; then
         diagnostic_args+=(--tmpfs /tmp:rw,nosuid,nodev,size=32m)
-        diagnostic_args+=("${diagnostic_image_id}" -m unittest discover
-            -s /workspace/tools/tests -p test_log_query.py -v)
+        if (($# == 0)); then
+            diagnostic_args+=("${diagnostic_image_id}" -m unittest discover
+                -s /workspace/tools/tests -p test_log_query.py -v)
+        else
+            local log_test_case
+            local -a log_test_cases=()
+            for log_test_case in "$@"; do
+                [[ "${log_test_case}" =~ ^[A-Za-z_][A-Za-z0-9_]*\.[A-Za-z_][A-Za-z0-9_]*$ ]] ||
+                    die "--test log-query-tool expects Class.test_method selectors"
+                log_test_cases+=("test_log_query.${log_test_case}")
+            done
+            diagnostic_args+=(--env PYTHONPATH=/workspace/tools/tests
+                "${diagnostic_image_id}" -m unittest -v "${log_test_cases[@]}")
+        fi
     else
         diagnostic_args+=("${diagnostic_image_id}" /workspace/tools/log_query.py "$@")
     fi
@@ -3169,6 +3185,21 @@ run_workspace_wayland_test_executable() {
 run_browser_app_tests() {
     local -n browser_fixture_status="$1"
     shift
+    local browser_js_pattern=""
+    local browser_rust_package=""
+    while (($# > 0)); do
+        case "$1" in
+            --js-test-name-pattern|--rust-package)
+                (($# >= 2)) && [[ -n "$2" ]] || die "$1 requires a value"
+                if [[ "$1" == "--js-test-name-pattern" ]]; then browser_js_pattern="$2"
+                else browser_rust_package="$2"; fi
+                shift 2
+                ;;
+            *) break ;;
+        esac
+    done
+    [[ -z "${browser_js_pattern}" || -z "${browser_rust_package}" ]] ||
+        die "select JavaScript cases or a Rust package in one browser-app invocation"
     browser_fixture_status=0
     acquire_mutation_locks
     ensure_docker
@@ -3181,7 +3212,10 @@ run_browser_app_tests() {
         browser_test_arguments+="${browser_test_arguments:+;}${browser_test_argument}"
     done
     local browser_test_configuration
-    printf -v browser_test_configuration '%q' "-DMMLTK_ICED_TEST_ARGUMENTS=${browser_test_arguments}"
+    printf -v browser_test_configuration '%q %q %q' \
+        "-DMMLTK_ICED_TEST_ARGUMENTS=${browser_test_arguments}" \
+        "-DMMLTK_ICED_JS_TEST_PATTERN=${browser_js_pattern//;/\\;}" \
+        "-DMMLTK_ICED_TEST_PACKAGE=${browser_rust_package}"
     if (( ! gui_diagnostics_quiet )); then log "running iced browser application tests"; fi
     run_owned_toolchain_command "${test_run_container_name}" \
         'set -euo pipefail
@@ -3192,16 +3226,17 @@ run_browser_app_tests() {
              fi
          done
          if [[ -z "${browser_test_icds}" ]]; then
-             printf "%s\n" "browser-app GPU acceptance requires a container NVIDIA Vulkan ICD" >&2
+             printf "%s\n" "browser-app tests failed: container NVIDIA Vulkan ICD is unavailable" >&2
              exit 1
          fi
          export VK_DRIVER_FILES="${browser_test_icds}"
+         export WGPU_BACKEND=vulkan
          /workspace/tools/configure_cmake_graph.sh \
              gui "${MMLTK_CONTAINER_CACHE_ROOT}/cmake/gui" '"${browser_test_configuration}"'
          cmake --build "${MMLTK_CONTAINER_CACHE_ROOT}/cmake/gui" \
              --parallel "${MMLTK_JOBS}" --target mmltk_frontend_iced_tests
          python3 /workspace/tools/check_toolchain_invariants.py \
-             --repo-root /workspace --build-dir "${MMLTK_CONTAINER_CACHE_ROOT}/cmake/gui"' || browser_fixture_status=$?
+             --repo-root /workspace --build-dir "${MMLTK_CONTAINER_CACHE_ROOT}/cmake/gui"' graphics,utility || browser_fixture_status=$?
     release_mutation_locks
 }
 
@@ -3279,7 +3314,6 @@ run_tests() {
         return 0
     fi
     if [[ "${suite}" == "log-query-tool" ]]; then
-        (($# == 0)) || die "--test log-query-tool does not accept additional arguments"
         (( ! test_config_explicit )) ||
             die "--test log-query-tool does not accept --config"
         [[ -z "${test_executable}" ]] ||
@@ -3289,7 +3323,7 @@ run_tests() {
         ((${#test_environment[@]} == 0)) ||
             die "--test log-query-tool does not accept --env"
         if (( ! gui_diagnostics_quiet )); then log "running log query tooling fixture tests"; fi
-        run_log_tool test
+        run_log_tool test "$@"
         return 0
     fi
     if [[ "${suite}" == "rfdetr-profile" ]]; then

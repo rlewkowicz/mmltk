@@ -1331,7 +1331,8 @@ test('Dataset same-key supersession and reporting retirement have scoped zero-wo
   browser.mmltkIntegrationDatasetCustody(5);
   const before = {...f.allocations}, reportCount = f.reports.length;
   f.flushFrames();
-  assert.deepEqual(f.allocations, before);
+  // Deferred and drained custody receipts each retain a diagnostic timestamp.
+  assert.deepEqual(f.allocations, {...before, clock: before.clock + 2});
   assert.deepEqual(f.reports.slice(reportCount).map(record => record.detail), ['deferred', 'drained']);
   const retirement = f.reports.find(record => record.case === 5 && record.detail === 'drained');
   assert.notEqual(retirement.owner, retirement.current_owner);

@@ -2773,6 +2773,63 @@ class FileQueryTests(unittest.TestCase):
         self.assertEqual(status, 1, diagnostics)
         self.assertNotIn("pixel-chain-divergence", output)
 
+    def test_tap_outcomes_keep_failed_test_and_diagnostic_context(self):
+        self.write("node.log", "\n".join([
+            "TAP version 13",
+            "# Subtest: expected failure stays quiet",
+            "ok 1 - expected failure stays quiet",
+            "# Subtest: scoped retirement",
+            "not ok 2 - scoped retirement",
+            "  ---",
+            "  error: |-",
+            "      {",
+            "    +   clock: 16,",
+            "    -   clock: 14,",
+            "      }",
+            "  ...",
+            "ok 3 - optional failure fixture # SKIP unavailable",
+            "# tests 3",
+            "# pass 1",
+            "# fail 1",
+            "# skipped 1",
+        ]))
+        status, rows, diagnostics = self.exported("node.log", "--errors", "--no-auto-correlate")
+        self.assertEqual(status, 0, diagnostics)
+        self.assertEqual([row["data"]["event"] for row in rows], ["tap.test_failed", "tap.summary"])
+        self.assertEqual(rows[0]["_log"]["test"], "scoped retirement")
+        self.assertEqual(rows[1]["data"]["count"], 1)
+        _, context, diagnostics = self.exported("node.log", "-q", '@test="scoped retirement"', "--no-auto-correlate")
+        self.assertTrue(any("clock: 16" in row["text"] for row in context))
+        self.assertTrue(all(not row["_log"]["parse_error"] for row in context), diagnostics)
+        for message in ("ok 1 - expected failure", "# fail 0", "not ok 3 - pending # TODO not implemented"):
+            self.assertFalse(logs.parse_record("node.log", 1, message).get("@error"))
+        self.assertTrue(logs.parse_record("node.log", 1, "# tests 0").get("@error"))
+
+    def test_libtest_failures_keep_named_panic_output(self):
+        self.write("rust.log", "\n".join([
+            "test view::failed_input ... ok",
+            "test view::retirement ... FAILED",
+            "test view::layout ... ok",
+            "---- view::retirement stdout ----",
+            "thread 'view::retirement' (123) panicked at src/view.rs:20:5:",
+            "assertion failed: retained_owner",
+            "  left: 0",
+            " right: 12",
+            "test result: FAILED. 2 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out",
+        ]))
+        status, rows, diagnostics = self.exported("rust.log", "--errors", "--no-auto-correlate")
+        self.assertEqual(status, 0, diagnostics)
+        failed = [row for row in rows if row["data"].get("event") == "libtest.test_failed"]
+        self.assertEqual(len(failed), 1)
+        self.assertEqual(failed[0]["_log"]["test"], "view::retirement")
+        self.assertEqual(rows[-1]["data"]["event"], "libtest.summary")
+        _, context, _ = self.exported("rust.log", "-q", '@test="view::retirement"', "--no-auto-correlate")
+        self.assertTrue(any("src/view.rs:20:5" in row["text"] for row in context))
+        self.assertTrue(any("left: 0" in row["text"] for row in context))
+        for message in ("test view::failure ... ok", "test view::failure ... ignored, no device",
+                        "test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out"):
+            self.assertFalse(logs.parse_record("rust.log", 1, message).get("@error"))
+
     def test_training_failure_is_an_explicit_triage_anchor(self):
         self.write("metrics.jsonl", [
             {"format_version": 2, "role": "Live", "run_id": "run-a", "attempt_id": "attempt-b",
@@ -2787,7 +2844,8 @@ class FileQueryTests(unittest.TestCase):
         self.assertEqual(rows[0]["_log"]["line"], 2)
         status, output, diagnostics = self.run_query("metrics.jsonl", "--triage")
         self.assertEqual(status, 0, diagnostics)
-        self.assertIn("explicit-failure", output)
+        self.assertIn("anchor-failure", output)
+        self.assertIn("failed outcome/span", output)
         self.assertIn("run-a", output)
         self.assertIn("attempt-b", output)
         self.assertIn("training.live.train", output)
@@ -2806,7 +2864,8 @@ class FileQueryTests(unittest.TestCase):
         ])
         status, output, diagnostics = self.run_query("metrics.jsonl", "--triage")
         self.assertEqual(status, 0, diagnostics)
-        self.assertIn("explicit-failure", output)
+        self.assertIn("anchor-failure", output)
+        self.assertIn("failed outcome/span", output)
         self.assertNotIn("unmatched-end", output)
         self.assertNotIn("missing-counterpart", output)
         self.assertIn("1:training.boundary.starting", output)

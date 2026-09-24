@@ -1177,7 +1177,7 @@ mod tests {
         let mut element = build(original, 12.0);
         let mut tree = Tree::new(&element);
         tree.diff(&mut element);
-        let mut previous: Option<(Paragraph, Paragraph)> = None;
+        let mut previous: Option<(&str, f32, Paragraph, Paragraph)> = None;
         for (content, normal, scale, width) in [
             (original, 12.0, 1.0, 150.0),
             (original, 12.0, 1.0, 100.0),
@@ -1207,13 +1207,16 @@ mod tests {
                     visible(&tree.children[index]).clone(),
                 )
             });
-            if let Some((old_intrinsic, old_visible)) = &previous {
-                // Width alone changes only the visible paragraph; normal measurement survives.
+            if let Some((old_content, old_normal, old_intrinsic, old_visible)) = &previous {
+                // The unhinted renderer retains logical shaping across DPI changes.
+                assert_eq!(
+                    std::ptr::eq(old_intrinsic.buffer(), settled[0].0.buffer()),
+                    content == *old_content && normal == *old_normal,
+                    "intrinsic content={content:?}, size={normal}, scale={scale}"
+                );
+                // Width alone changes only the visible paragraph.
                 if content == original {
-                    assert!(std::ptr::eq(old_intrinsic.buffer(), settled[0].0.buffer()));
                     assert!(!std::ptr::eq(old_visible.buffer(), settled[0].1.buffer()));
-                } else {
-                    assert!(!std::ptr::eq(old_intrinsic.buffer(), settled[0].0.buffer()));
                 }
             }
             for rebuild in [false, false, true, false] {
@@ -1236,7 +1239,7 @@ mod tests {
                     ));
                 }
             }
-            previous = Some(settled[0].clone());
+            previous = Some((content, normal, settled[0].0.clone(), settled[0].1.clone()));
         }
         assert_eq!(visible(&tree.children[0]).size(), iced::Pixels(12.0));
     }

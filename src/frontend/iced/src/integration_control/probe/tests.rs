@@ -916,6 +916,7 @@ fn atlas_pixel_evidence_covers_only_ready_interiors_inside_the_real_clip() {
     snapshot.viewport.columns = 2;
     snapshot.viewport.rowcount = 2;
     snapshot.gallery.slots = vec![true, true, false, true];
+    snapshot.order.visibleindices = vec![0, 1, 2, 3];
     let mut draw = AtlasDraw {
         surface: crate::presentation_surface::Surface {
             high: 1,

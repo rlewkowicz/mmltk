@@ -9,6 +9,10 @@ set(MMLTK_TRUNK_VERSION "0.21.14" CACHE STRING
     "Required Trunk version for reproducible iced WebAssembly builds")
 set(MMLTK_ICED_TEST_ARGUMENTS "" CACHE STRING
     "Additional Cargo test arguments for focused Iced validation")
+set(MMLTK_ICED_JS_TEST_PATTERN "" CACHE STRING
+    "JavaScript test-name pattern for focused Iced validation")
+set(MMLTK_ICED_TEST_PACKAGE "" CACHE STRING
+    "Select one existing Rust package and omit JavaScript fixtures")
 
 add_library(mmltk_frontend_iced INTERFACE)
 add_library(mmltk::frontend::iced ALIAS mmltk_frontend_iced)
@@ -207,30 +211,53 @@ if(BUILD_MMLTK_BROWSER_APP AND BUILD_RFDETR_NATIVE)
         mmltk_controller_browser_protocol_v17_boundary
     )
 
+    set(_mmltk_frontend_test_packages mmltk-browser-app iced_plot iced_aw)
+    if(MMLTK_ICED_TEST_PACKAGE AND NOT MMLTK_ICED_TEST_PACKAGE IN_LIST _mmltk_frontend_test_packages)
+        message(FATAL_ERROR "Unsupported frontend test package: ${MMLTK_ICED_TEST_PACKAGE}")
+    endif()
+    set(_mmltk_frontend_test_commands)
+    if(NOT MMLTK_ICED_TEST_PACKAGE)
+        list(APPEND _mmltk_frontend_test_commands
+            COMMAND "${MMLTK_FRONTEND_NODE_EXECUTABLE}" --test
+                "--test-name-pattern=${MMLTK_ICED_JS_TEST_PATTERN}"
+                "${MMLTK_FRONTEND_ICED_SOURCE_DIR}/tests/integration_control.test.mjs"
+                "${MMLTK_FRONTEND_ICED_SOURCE_DIR}/tests/workspace_graphics.test.mjs"
+        )
+    endif()
+    if(NOT MMLTK_ICED_TEST_PACKAGE STREQUAL "iced_aw")
+        if(MMLTK_ICED_TEST_PACKAGE)
+            set(_mmltk_frontend_cargo_packages --package "${MMLTK_ICED_TEST_PACKAGE}")
+        else()
+            set(_mmltk_frontend_cargo_packages --package mmltk-browser-app --package iced_plot)
+        endif()
+        list(APPEND _mmltk_frontend_test_commands
+            COMMAND "${CMAKE_COMMAND}" -E env
+                ${_mmltk_frontend_environment}
+                "${MMLTK_CARGO_EXECUTABLE}" test
+                --manifest-path "${MMLTK_FRONTEND_ICED_SOURCE_DIR}/Cargo.toml"
+                ${_mmltk_frontend_cargo_packages}
+                --locked
+                --frozen
+                ${MMLTK_ICED_TEST_ARGUMENTS}
+        )
+    endif()
+    if(NOT MMLTK_ICED_TEST_PACKAGE OR MMLTK_ICED_TEST_PACKAGE STREQUAL "iced_aw")
+        list(APPEND _mmltk_frontend_test_commands
+            COMMAND "${CMAKE_COMMAND}" -E env
+                ${_mmltk_frontend_environment}
+                "${MMLTK_CARGO_EXECUTABLE}" test
+                --manifest-path "${MMLTK_FRONTEND_ICED_SOURCE_DIR}/Cargo.toml"
+                --package iced_aw
+                --lib
+                --no-default-features
+                --features number_input,selection_list
+                --locked
+                --frozen
+                ${MMLTK_ICED_TEST_ARGUMENTS}
+        )
+    endif()
     add_custom_target(mmltk_frontend_iced_tests
-        COMMAND "${MMLTK_FRONTEND_NODE_EXECUTABLE}" --test
-            "${MMLTK_FRONTEND_ICED_SOURCE_DIR}/tests/integration_control.test.mjs"
-            "${MMLTK_FRONTEND_ICED_SOURCE_DIR}/tests/workspace_graphics.test.mjs"
-        COMMAND "${CMAKE_COMMAND}" -E env
-            ${_mmltk_frontend_environment}
-            "${MMLTK_CARGO_EXECUTABLE}" test
-            --manifest-path "${MMLTK_FRONTEND_ICED_SOURCE_DIR}/Cargo.toml"
-            --package mmltk-browser-app
-            --package iced_plot
-            --locked
-            --frozen
-            ${MMLTK_ICED_TEST_ARGUMENTS}
-        COMMAND "${CMAKE_COMMAND}" -E env
-            ${_mmltk_frontend_environment}
-            "${MMLTK_CARGO_EXECUTABLE}" test
-            --manifest-path "${MMLTK_FRONTEND_ICED_SOURCE_DIR}/Cargo.toml"
-            --package iced_aw
-            --lib
-            --no-default-features
-            --features number_input,selection_list
-            --locked
-            --frozen
-            ${MMLTK_ICED_TEST_ARGUMENTS}
+        ${_mmltk_frontend_test_commands}
         DEPENDS
             ${_mmltk_frontend_build_inputs}
         WORKING_DIRECTORY "${MMLTK_FRONTEND_ICED_SOURCE_DIR}"

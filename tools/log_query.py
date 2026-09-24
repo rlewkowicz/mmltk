@@ -94,6 +94,12 @@ LEVEL_NAMES = {
     "warn": "warning", "e": "error", "err": "error", "f": "fatal",
 }
 TEST_STATUS = re.compile(r"^\[\s*(RUN|FAILED|OK|SKIPPED)\s*\]\s+(.+)$")
+TAP_STATUS = re.compile(r"^\s*(not ok|ok)\s+\d+(?:\s+-)?\s+(.+?)(?:\s+#\s*(SKIP|TODO)\b.*)?$", re.IGNORECASE)
+LIBTEST_STATUS = re.compile(r"^test (.+?) \.\.\. (ok|FAILED|ignored)(?:,.*)?$")
+TEST_EVENTS = tuple(f"{runner}.test_{state}" for runner in ("catch", "tap", "libtest")
+                    for state in ("started", "passed", "failed", "skipped"))
+TEST_START_EVENTS = tuple(event for event in TEST_EVENTS if event.endswith("started"))
+TEST_TERMINAL_EVENTS = tuple(event for event in TEST_EVENTS if event not in TEST_START_EVENTS)
 CATCH_FAILURE = re.compile(r"^(.+?):(\d+): (failed|skipped|warning|fatal error): (.*)$")
 CONTEXT_LABEL = re.compile(
     r"(?:^['\"]?|['\"] and ['\"]|\bwith \d+ messages?:\s*['\"])"
@@ -644,8 +650,10 @@ class Record:
                 return True
             if self.get("@level") in ("error", "critical", "fatal", "panic"):
                 return True
-            if self.format == "transcript" and self.get("@event") in ("build.progress", "build.source"):
-                return False
+            if self.format == "transcript":
+                event = self.get("@event")
+                if event in TEST_EVENTS or event in ("build.progress", "build.source", "tap.summary", "tap.diagnostic", "libtest.summary", "libtest.output"):
+                    return False
             # Pixel error=0, failed=false, and similar numeric metrics are not failures.
             values = (self.get("@event"), value_from(self.data, "message", "fields.message", "detail", "error"))
             return any(isinstance(value, str) and FAILURE_WORD.search(value) for value in values)
@@ -665,9 +673,10 @@ class Record:
             except ValueError:
                 return f"SIG{number}"
         if name == "@terminal":
-            return (self.training_record() and self.data["role"] == "Terminal") or self.get("@event") in (
+            event = self.get("@event")
+            return (self.training_record() and self.data["role"] == "Terminal") or event in TEST_TERMINAL_EVENTS or event in (
                 "child.signaled", "child.exited", "shutdown.complete", "shutdown.firefox_terminal",
-                "catch.test_failed", "catch.test_passed", "catch.test_skipped", "catch.test_selection_failed", "catch.summary",
+                "catch.test_selection_failed", "catch.summary", "tap.summary", "libtest.summary",
                 "process.terminal", "build.image", "build.failed",
             )
         if name.startswith("@"):
@@ -730,6 +739,30 @@ def transcript_data(text):
         event = {"RUN": "started", "FAILED": "failed", "OK": "passed", "SKIPPED": "skipped"}[status[1]]
         return {"event": "catch.test_" + event, "test": status[2],
                 "level": "error" if event == "failed" else "info", "message": text}
+    tap = TAP_STATUS.match(text)
+    if tap:
+        state = "skipped" if tap[3] else "failed" if tap[1].lower() == "not ok" else "passed"
+        return {"event": "tap.test_" + state, "test": tap[2],
+                "level": "error" if state == "failed" else "info", "message": text}
+    if text.lstrip().startswith("# Subtest: "):
+        return {"event": "tap.test_started", "test": text.lstrip().removeprefix("# Subtest: "),
+                "level": "info", "message": text}
+    summary = re.match(r"^\s*# (tests|pass|fail|cancelled|skipped|todo) (\d+)\s*$", text)
+    if summary:
+        metric, count = summary[1], int(summary[2])
+        failed = (metric in ("fail", "cancelled") and count != 0) or (metric == "tests" and count == 0)
+        return {"event": "tap.summary", "metric": metric, "count": count,
+                "level": "error" if failed else "info", "message": text}
+    rust = LIBTEST_STATUS.match(text)
+    if rust:
+        state = {"ok": "passed", "FAILED": "failed", "ignored": "skipped"}[rust[2]]
+        return {"event": "libtest.test_" + state, "test": rust[1],
+                "level": "error" if state == "failed" else "info", "message": text}
+    output = re.match(r"^---- (.+) (?:stdout|stderr) ----$", text)
+    if output:
+        return {"event": "libtest.output", "test": output[1], "message": text}
+    if text.startswith(("test result: ok.", "test result: FAILED.")):
+        return {"event": "libtest.summary", "level": "error" if text.startswith("test result: FAILED.") else "info", "message": text}
     failure = CATCH_FAILURE.match(text)
     if failure:
         return {
@@ -949,6 +982,7 @@ class TranscriptContext:
 
     def __init__(self):
         self.test = ""
+        self.tap_test = False
         self.tags = []
         self.context = ""
         self.active_run = None
@@ -959,18 +993,20 @@ class TranscriptContext:
         event = record.get("@event")
         if event == "catch.filters":
             self.tags = re.findall(r"\[([^]]+)\]", record.data["filters"])
-        if event in ("catch.test_started", "catch.test_failed", "catch.test_passed", "catch.test_skipped"):
+        if event in TEST_EVENTS or event == "libtest.output":
             self.test = record.data["test"]
-        if event == "catch.test_started":
+            self.tap_test = event.startswith("tap.")
+        if event in ("tap.summary", "libtest.summary"):
+            self.test = ""
+            self.tap_test = False
+        if event in TEST_START_EVENTS:
             self.active_run = None
             self.capture += 1
             self.last_timestamp = None
         label = CONTEXT_LABEL.search(record.raw)
         if label:
             self.context = label[1]
-        if record.raw.startswith("workspace-wayland[") or event in (
-            "catch.test_started", "catch.test_failed", "catch.test_passed", "catch.test_skipped", "process.terminal"
-        ):
+        if record.raw.startswith("workspace-wayland[") or event in TEST_EVENTS or event == "process.terminal":
             self.context = ""
         if record.raw.startswith("workspace-wayland:") and "acceptance deadline armed" in record.raw:
             self.active_run = None
@@ -1000,7 +1036,12 @@ class TranscriptContext:
             record.metadata["near_clock"], record.metadata["near_time_ns"] = self.last_timestamp
 
     def parse_line(self, source, line, raw, metadata, anchors, truncated=False):
-        primary = parse_record(source, line, raw, truncated)
+        if self.tap_test and raw.startswith("  ") and not raw.lstrip().startswith(("ok ", "not ok ", "# ")):
+            primary = Record(source, line, raw.rstrip("\r\n"),
+                             {"event": "tap.diagnostic", "message": raw.rstrip("\r\n")}, "transcript",
+                             "line exceeds byte limit; text is truncated" if truncated else "")
+        else:
+            primary = parse_record(source, line, raw, truncated)
         self.decorate(primary, metadata, anchors)
         yield primary
         if primary.format == "transcript" and primary.get("@event").startswith("catch.assertion_"):
@@ -1041,8 +1082,8 @@ class LogFile:
 
         def parse_message(first, last, text, error):
             if line_hint is not None and not line_hint(text) and not (
-                ANCHOR_HINT.search(text) or TEST_STATUS.match(text)
-                or text.startswith(("Filters:", "workspace-wayland:"))
+                ANCHOR_HINT.search(text) or TEST_STATUS.match(text) or TAP_STATUS.match(text) or LIBTEST_STATUS.match(text)
+                or text.lstrip().startswith(("Filters:", "workspace-wayland:", "# Subtest:", "---- "))
             ):
                 return
             for row in context.parse_line(self.source, first, text, metadata, anchors):
