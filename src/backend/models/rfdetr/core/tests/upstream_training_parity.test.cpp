@@ -718,6 +718,8 @@ TEST_CASE("DN masks use stock direct equations for fixed samples gradients and u
    rf::TrainingSupervisionImpl owner(config, 1); owner.initialize(173); owner.to(device);
    auto gt = targets(torch::full({population + 1, 4}, 0.2F, options), torch::zeros({population + 1}, integers));
    gt.counts = {population, 0, 1}; gt.offsets = {0, population, population}; gt.targets.clear();
+   gt.target_counts = torch::tensor(gt.counts, integers);
+   gt.target_offsets = torch::tensor(gt.offsets, integers);
    auto words = torch::zeros({population + 1, 1}, torch::kInt64);
    auto dense_targets = torch::zeros({population + 1, 1, 4, 4});
    for (int64_t row = 0; row <= population; ++row) if (row % 2 == 0) {

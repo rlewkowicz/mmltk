@@ -2,6 +2,7 @@
 #include <torch/torch.h>
 #include <torch/nn/functional/vision.h>
 #include <cstdint>
+#include <optional>
 #include "../detection_types.h"
 namespace mmltk::backend::models::rfdetr {
 struct LayerMaskSamples;
@@ -15,7 +16,6 @@ torch::Tensor sigmoid_ce_loss(const torch::Tensor& inputs, const torch::Tensor& 
 torch::Tensor dice_loss(const torch::Tensor& inputs, const torch::Tensor& targets, const torch::Tensor& count, bool traced, const torch::Tensor& valid = {});
 torch::Tensor batch_dice_loss(const torch::Tensor& inputs, const torch::Tensor& targets, bool traced);
 torch::Tensor batch_sigmoid_ce_loss(const torch::Tensor& inputs, const torch::Tensor& targets, bool traced);
-torch::Tensor get_uncertain_point_coords_with_randomness(const torch::Tensor& logits, int64_t points, int64_t oversample, double importance, const LayerMaskSamples& samples);
 // Direct reconstruction materializes only selected queries before bilinear
 // sampling. Pairwise matching deliberately uses a different operation order.
 torch::Tensor empty_sparse_pred_masks(const SparsePredMasks& sparse);
@@ -25,8 +25,13 @@ struct DirectMaskSamples {
  torch::Tensor logits;
  torch::Tensor targets;
 };
+// Seeds apply only to omitted operands; omission uses the default generator.
+struct DirectMaskRandomSeeds {
+ std::uint64_t candidates;
+ std::uint64_t remainder;
+};
 DirectMaskSamples sample_direct_masks(const torch::Tensor& masks, const PreparedTargets& targets,
- const torch::Tensor& indices, int64_t ratio, const LayerMaskSamples& samples);
+ const torch::Tensor& indices, int64_t ratio, const LayerMaskSamples& samples, std::optional<DirectMaskRandomSeeds> seeds = std::nullopt);
 // One uniform draw shared by all image, query and target operands in a layer.
 // Spatial and predicted samples retain autograd; categorical targets do not.
 struct PairwiseMaskSamples {

@@ -6,6 +6,7 @@
 // RF-DETR Match-Free mathematical and topology coverage.
 #include <ATen/Context.h>
 #include <ATen/CPUGeneratorImpl.h>
+#include <ATen/cuda/CUDAGeneratorImpl.h>
 #include "src/backend/models/rfdetr/core/runtime.h"
 #include "detail/matcher_workspace.h"
 #include "src/common/system/numa_topology.h"
@@ -16,6 +17,7 @@
 #include <cstdint>
 #include <initializer_list>
 #include <limits>
+#include <optional>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -1855,6 +1857,53 @@ TEST_CASE("Foreground-free focal classification uses one explicit group divisor 
  }
 }
 
+TEST_CASE("Direct mask sampling preserves explicit operands and default or private draw streams", "[rfdetr][training_supervision]") {
+ std::vector<torch::Device> devices{torch::Device(torch::kCPU)};
+ if (mmltk::testsupport::checked_cuda_device_count() > 0) devices.emplace_back(torch::kCUDA, 0);
+ for (const auto& device : devices) {
+  const auto options = torch::TensorOptions().device(device).dtype(torch::kFloat32);
+  const auto masks = torch::arange(30, options).reshape({2, 3, 5}) * 0.17 - 2.1;
+  rfdetr::PreparedTargets targets;
+  targets.packed_masks = rfdetr::PackedTargetMasks{torch::tensor({{int64_t{0x5555}}, {int64_t{0x3333}}}, options.dtype(torch::kInt64)), 3, 5};
+  const auto indices = torch::arange(2, options.dtype(torch::kInt64));
+  auto global = device.is_cuda() ? at::cuda::detail::getDefaultCUDAGenerator(device.index()) : at::detail::getDefaultCPUGenerator();
+  const auto initial = global.get_state();
+  const rfdetr::DirectMaskRandomSeeds seeds{281, 947};
+  auto private_generator = device.is_cuda() ? at::cuda::detail::createCUDAGenerator(device.index()) : at::detail::createCPUGenerator();
+  private_generator.set_current_seed(seeds.candidates);
+  const auto candidates = at::rand({2, 15, 2}, private_generator, options);
+  private_generator.set_current_seed(seeds.remainder);
+  const auto remainder = at::rand({2, 2, 2}, private_generator, options);
+  for (const bool seeded : {false, true}) for (const int injection : {0, 1, 2, 3}) {
+   global.set_state(initial);
+   rfdetr::LayerMaskSamples supplied;
+   if (injection & 1) supplied.uncertain_candidates = 1.0 - candidates;
+   if (injection & 2) supplied.uncertain_random = 1.0 - remainder;
+   auto expected_samples = supplied;
+   if (!expected_samples.uncertain_candidates.defined()) expected_samples.uncertain_candidates = seeded ? candidates : torch::rand({2, 15, 2}, options);
+   if (!expected_samples.uncertain_random.defined()) expected_samples.uncertain_random = seeded ? remainder : torch::rand({2, 2, 2}, options);
+   const auto expected_state = global.get_state();
+   const auto expected = rfdetr::sample_direct_masks(masks, targets, indices, 3, expected_samples);
+   global.set_state(initial);
+   const auto actual = rfdetr::sample_direct_masks(masks, targets, indices, 3, supplied,
+    seeded ? std::optional{seeds} : std::nullopt);
+   REQUIRE(torch::equal(actual.logits, expected.logits));
+   REQUIRE(torch::equal(actual.targets, expected.targets));
+   REQUIRE(torch::equal(global.get_state(), expected_state));
+  }
+  for (const bool candidate : {false, true}) for (const int invalid_kind : {0, 1, 2}) {
+   if (invalid_kind == 2 && device.is_cpu()) continue;
+   rfdetr::LayerMaskSamples invalid{{}, candidates, remainder};
+   auto& operand = candidate ? invalid.uncertain_candidates : invalid.uncertain_random;
+   if (invalid_kind == 0) operand = operand.narrow(1, 0, 1);
+   if (invalid_kind == 1) operand = operand.to(torch::kFloat64);
+   if (invalid_kind == 2) operand = operand.cpu();
+   REQUIRE_THROWS_AS(rfdetr::sample_direct_masks(masks, targets, indices, 3, invalid, seeds), std::invalid_argument);
+  }
+  global.set_state(initial);
+ }
+}
+
 TEST_CASE("DN private mask sampling replays owned outputs without changing ordinary draws", "[rfdetr][training_supervision]") {
  auto config = denoising_config(); config.segmentation = true; config.aux_loss = true; config.dec_layers = 2;
  config.mask_ce_loss_coef = 1.3; config.mask_dice_loss_coef = 2.1; config.mask_point_sample_ratio = 2;
@@ -1884,8 +1933,57 @@ TEST_CASE("DN private mask sampling replays owned outputs without changing ordin
   dn.main = make_layer(); dn.aux_outputs.push_back(make_layer()); result.denoising = std::move(dn);
   return result;
  };
+ // Independently spell the retained output/layer/draw schedule, then generate
+ // both operands explicitly. This oracle never asks the production sampler
+ // for coordinates or uses the supervision owner's seed helper.
+ const auto tag_seed = [](std::uint64_t value, std::uint64_t tag) {
+  value ^= tag + 0x9e3779b97f4a7c15ULL + (value << 6U) + (value >> 2U);
+  value = (value ^ (value >> 30U)) * 0xbf58476d1ce4e5b9ULL;
+  value = (value ^ (value >> 27U)) * 0x94d049bb133111ebULL;
+  return value ^ (value >> 31U);
+ };
+ const auto explicit_samples = [&](const rfdetr::ModelOutputs& output) {
+  std::array<rfdetr::LayerMaskSamples, 2> samples;
+  for (size_t layer = 0; layer < samples.size(); ++layer) {
+   const auto seed = tag_seed(tag_seed(output.denoising->mask_sampling_seed, 0x4c41594552ULL), layer);
+   auto candidates = at::detail::createCPUGenerator(tag_seed(seed, 0x43414e4449444154ULL));
+   auto remainder = at::detail::createCPUGenerator(tag_seed(seed, 0x52414e444f4dULL));
+   samples[layer].uncertain_candidates = at::rand({6, 24, 2}, candidates, torch::kFloat32);
+   samples[layer].uncertain_random = at::rand({6, 2, 2}, remainder, torch::kFloat32);
+  }
+  return samples;
+ };
  const auto before = at::detail::getDefaultCPUGenerator().get_state();
  auto first = make_outputs(owner, identity);
+ const auto fixed_samples = explicit_samples(first);
+ auto fixed_output = make_outputs(owner, identity);
+ const auto fixed_loss = owner.loss(fixed_output, targets, {torch::tensor(3.F)}, true, fixed_samples);
+ fixed_loss.total.backward();
+ for (const int injection : {0, 1, 2, 3}) {
+  auto supplied = fixed_samples;
+  for (auto& sample : supplied) {
+   if (!(injection & 1)) sample.uncertain_candidates = {};
+   if (!(injection & 2)) sample.uncertain_random = {};
+  }
+  auto output = make_outputs(owner, identity);
+  const auto actual = owner.loss(output, targets, {torch::tensor(3.F)}, true, supplied);
+  REQUIRE(torch::equal(actual.total, fixed_loss.total));
+  actual.total.backward();
+  for (const auto index : {0, 1}) {
+   const auto& actual_masks = *(index == 0 ? output.denoising->main : output.denoising->aux_outputs.front()).sparse_pred_masks;
+   const auto& expected_masks = *(index == 0 ? fixed_output.denoising->main : fixed_output.denoising->aux_outputs.front()).sparse_pred_masks;
+   REQUIRE(torch::equal(actual_masks.spatial_features.grad(), expected_masks.spatial_features.grad()));
+   REQUIRE(torch::equal(actual_masks.query_features.grad(), expected_masks.query_features.grad()));
+   REQUIRE(torch::equal(actual_masks.bias.grad(), expected_masks.bias.grad()));
+  }
+ }
+ for (const bool candidates : {false, true}) for (const bool wrong_dtype : {false, true}) {
+  auto invalid = fixed_samples;
+  auto& operand = candidates ? invalid[0].uncertain_candidates : invalid[0].uncertain_random;
+  operand = wrong_dtype ? operand.to(torch::kFloat64) : operand.narrow(0, 0, 1);
+  REQUIRE_THROWS_AS(owner.loss(first, targets, {torch::tensor(3.F)}, true, invalid), std::invalid_argument);
+ }
+ REQUIRE(torch::equal(before, at::detail::getDefaultCPUGenerator().get_state()));
  const auto original = owner.loss(first, targets, {torch::tensor(3.F)}, true);
  auto next_identity = identity; ++next_identity.batch_sequence;
  auto next = make_outputs(owner, next_identity);
@@ -1907,6 +2005,12 @@ TEST_CASE("DN private mask sampling replays owned outputs without changing ordin
  auto lane_identity = identity; lane_identity.rank = 1;
  auto lane = make_outputs(restarted, lane_identity);
  const auto lane_loss = restarted.loss(lane, targets, {torch::tensor(3.F)}, true);
+ REQUIRE(torch::equal(lane_loss.total, restarted.loss(lane, targets, {torch::tensor(3.F)}, true, explicit_samples(lane)).total));
+ auto epoch_identity = identity; ++epoch_identity.epoch;
+ auto epoch = make_outputs(owner, epoch_identity);
+ const auto epoch_loss = owner.loss(epoch, targets, {torch::tensor(3.F)}, true);
+ REQUIRE_FALSE(torch::equal(original.mask_ce, epoch_loss.mask_ce));
+ REQUIRE(torch::equal(epoch_loss.total, owner.loss(epoch, targets, {torch::tensor(3.F)}, true, explicit_samples(epoch)).total));
  REQUIRE_FALSE(torch::equal(original.mask_ce, lane_loss.mask_ce));
  // Reverse outstanding-loss order after another preparation, as accumulation
  // scratch can be reused or a later admitted step cancelled before backward.
@@ -1932,6 +2036,33 @@ TEST_CASE("DN private mask sampling replays owned outputs without changing ordin
  REQUIRE(empty_masks.spatial_features.grad().defined());
  REQUIRE(empty_masks.query_features.grad().count_nonzero().item<int64_t>() == 0);
  REQUIRE(empty_masks.bias.grad().item<float>() == 0);
+ for (const bool nonfinite : {false, true}) {
+  auto empty = make_outputs(owner, identity);
+  empty.denoising->valid_slots = torch::zeros_like(empty.denoising->valid_slots);
+  auto empty_targets = targets;
+  empty_targets.counts = {0, 0}; empty_targets.offsets = {0, 0}; empty_targets.targets.clear();
+  empty_targets.target_counts = torch::zeros({2}, torch::kInt64);
+  empty_targets.target_offsets = torch::zeros({2}, torch::kInt64);
+  empty_targets.all_labels = torch::empty({0}, torch::kInt64);
+  empty_targets.all_boxes = torch::empty({0, 4});
+  empty_targets.packed_masks = rfdetr::PackedTargetMasks{torch::empty({0, 1}, torch::kInt64), 4, 4};
+  auto& sparse = *empty.denoising->main.sparse_pred_masks;
+  if (nonfinite) {
+   torch::NoGradGuard no_grad;
+   sparse.spatial_features[1][1][3][3] = std::numeric_limits<float>::quiet_NaN();
+  }
+  const auto state = at::detail::getDefaultCPUGenerator().get_state();
+  const auto loss = owner.loss(empty, empty_targets, {torch::tensor(0.F)}, true);
+  REQUIRE(torch::equal(state, at::detail::getDefaultCPUGenerator().get_state()));
+  REQUIRE(torch::isnan(loss.mask_ce).item<bool>() == nonfinite);
+  REQUIRE(torch::isnan(loss.mask_dice).item<bool>() == nonfinite);
+  if (!nonfinite) {
+   loss.total.backward();
+   for (const auto& operand : {sparse.spatial_features, sparse.query_features, sparse.bias}) {
+    REQUIRE(operand.grad().defined()); REQUIRE(operand.grad().count_nonzero().item<int64_t>() == 0);
+   }
+  }
+ }
 }
 
 TEST_CASE("Disabled DN masks admit missing target masks in direct and combined objectives", "[rfdetr][training_supervision]") {

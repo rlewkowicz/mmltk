@@ -1,6 +1,8 @@
 #include "detail/training_mask_loss.h"
 #include "detail/detection_sampling.h"
 #include <torch/nn/functional/loss.h>
+#include <ATen/CPUGeneratorImpl.h>
+#include <ATen/cuda/CUDAGeneratorImpl.h>
 #include "detail/training_mask_ops_cuda.h"
 #include "detail/matcher_workspace.h"
 #include "runtime.h"
@@ -177,16 +179,25 @@ torch::Tensor point_sample(const torch::Tensor& input, const torch::Tensor& poin
  if (add_dim) { output = output.squeeze(3); }
  return output;
 }
-torch::Tensor get_uncertain_point_coords_with_randomness(const torch::Tensor& coarse_logits, int64_t num_points, int64_t oversample_ratio, double importance_sample_ratio, const LayerMaskSamples& samples) {
- if (oversample_ratio < 1) { throw std::runtime_error("mask oversample_ratio must be at least 1"); }
- if (importance_sample_ratio < 0.0 || importance_sample_ratio > 1.0) { throw std::runtime_error("mask importance_sample_ratio must be in [0, 1]"); }
+namespace {
+torch::Tensor get_uncertain_point_coords_with_randomness(const torch::Tensor& coarse_logits, int64_t num_points, const LayerMaskSamples& samples, const std::optional<DirectMaskRandomSeeds>& seeds) {
  const int64_t num_boxes = coarse_logits.size(0);
- const int64_t num_sampled = num_points * oversample_ratio;
- auto point_coords = mask_coordinates(samples.uncertain_candidates, num_boxes, num_sampled, coarse_logits.device());
+ const int64_t num_sampled = num_points * 3;
+ const auto num_uncertain_points = static_cast<int64_t>(0.75 * static_cast<double>(num_points));
+ const int64_t num_random_points = num_points - num_uncertain_points;
+ std::optional<at::Generator> generator;
+ const auto coordinates = [&](const torch::Tensor& supplied, int64_t count, std::uint64_t seed) {
+  if (supplied.defined() || !seeds) return mask_coordinates(supplied, num_boxes, count, coarse_logits.device());
+  // Missing draws share only this invocation's generator; each stream starts
+  // from its own seed, independently of explicit operands and global RNG state.
+  if (!generator) generator = coarse_logits.is_cuda()
+   ? at::cuda::detail::createCUDAGenerator(coarse_logits.device().index()) : at::detail::createCPUGenerator();
+  generator->set_current_seed(seed);
+  return at::rand({num_boxes, count, 2}, *generator, coarse_logits.options().dtype(torch::kFloat32));
+ };
+ auto point_coords = coordinates(samples.uncertain_candidates, num_sampled, seeds ? seeds->candidates : 0);
  const auto point_logits = point_sample(coarse_logits, point_coords, torch::kBilinear);
  const auto point_uncertainties = -torch::abs(point_logits);
- const auto num_uncertain_points = static_cast<int64_t>(importance_sample_ratio * static_cast<double>(num_points));
- const int64_t num_random_points = num_points - num_uncertain_points;
  torch::Tensor sampled_coords;
  if (num_uncertain_points > 0) {
   auto idx = std::get<1>(point_uncertainties.index({Slice(), 0, Slice()}).topk(num_uncertain_points, 1));
@@ -200,24 +211,26 @@ torch::Tensor get_uncertain_point_coords_with_randomness(const torch::Tensor& co
   sampled_coords = torch::cat(
    {
     sampled_coords,
-    mask_coordinates(samples.uncertain_random, num_boxes, num_random_points, coarse_logits.device()),
+    coordinates(samples.uncertain_random, num_random_points, seeds ? seeds->remainder : 0),
    },
    1);
  }
  return sampled_coords;
 }
 
+} // namespace
+
 int64_t direct_mask_point_count(const torch::Tensor& masks, int64_t ratio) {
  if (ratio <= 0) throw std::invalid_argument("direct mask sampling requires a positive ratio");
  return std::max<int64_t>(masks.size(-2), masks.size(-2) * masks.size(-1) / ratio);
 }
 DirectMaskSamples sample_direct_masks(const torch::Tensor& masks, const PreparedTargets& targets,
- const torch::Tensor& indices, int64_t ratio, const LayerMaskSamples& samples) {
+ const torch::Tensor& indices, int64_t ratio, const LayerMaskSamples& samples, std::optional<DirectMaskRandomSeeds> seeds) {
  const auto logits = masks.unsqueeze(1);
  torch::Tensor coordinates;
  {
   torch::NoGradGuard no_grad;
-  coordinates = get_uncertain_point_coords_with_randomness(logits, direct_mask_point_count(masks, ratio), 3, 0.75, samples);
+  coordinates = get_uncertain_point_coords_with_randomness(logits, direct_mask_point_count(masks, ratio), samples, seeds);
  }
  const auto point_logits = point_sample(logits, coordinates, torch::kBilinear).squeeze(1);
  torch::Tensor labels;

@@ -785,23 +785,9 @@ TrainingLoss TrainingSupervisionImpl::denoising_loss(const DenoisingOutputs& out
      }
      LayerMaskSamples samples;
      if (!mask_samples.empty()) samples = mask_samples[layer_index];
-     if (!samples.uncertain_candidates.defined() || !samples.uncertain_random.defined()) {
-      // A generator local to this owned output/layer makes replay independent
-      // of later preparation, loss ordering, ordinary sampling and other lanes.
-      auto generator = masks.is_cuda() ? at::cuda::detail::createCUDAGenerator(masks.device().index()) : at::detail::createCPUGenerator();
-      const auto layer_seed = tagged_seed(tagged_seed(outputs.mask_sampling_seed, 0x4c41594552ULL), layer_index);
-      const auto points = direct_mask_point_count(masks, config_.mask_point_sample_ratio);
-      const auto options = masks.options().dtype(torch::kFloat32);
-      if (!samples.uncertain_candidates.defined()) {
-       generator.set_current_seed(tagged_seed(layer_seed, 0x43414e4449444154ULL));
-       samples.uncertain_candidates = at::rand({masks.size(0), points * 3, 2}, generator, options);
-      }
-      if (!samples.uncertain_random.defined()) {
-       generator.set_current_seed(tagged_seed(layer_seed, 0x52414e444f4dULL));
-       samples.uncertain_random = at::rand({masks.size(0), points - static_cast<int64_t>(0.75 * static_cast<double>(points)), 2}, generator, options);
-      }
-     }
-     const auto sampled = sample_direct_masks(masks, target_inventory, mask_indices, config_.mask_point_sample_ratio, samples);
+     const auto layer_seed = tagged_seed(tagged_seed(outputs.mask_sampling_seed, 0x4c41594552ULL), layer_index);
+     const DirectMaskRandomSeeds seeds{tagged_seed(layer_seed, 0x43414e4449444154ULL), tagged_seed(layer_seed, 0x52414e444f4dULL)};
+     const auto sampled = sample_direct_masks(masks, target_inventory, mask_indices, config_.mask_point_sample_ratio, samples, seeds);
      const auto mask_zero = config_.mask_ce_loss_coef == 0.0 || config_.mask_dice_loss_coef == 0.0 ? sampled.logits.sum() * 0.0 : torch::Tensor{};
      result.mask_ce = result.mask_ce + (config_.mask_ce_loss_coef == 0.0 ? mask_zero :
       config_.mask_ce_loss_coef * sigmoid_ce_loss(sampled.logits, sampled.targets, divisor, false, mask_valid));
