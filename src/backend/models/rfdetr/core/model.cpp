@@ -1090,7 +1090,7 @@ ModelOutputs NativeRfDetrModel::Impl::forward_impl(const NestedTensor& batch, co
   outputs.main.pred_boxes = out_dict.at("pred_boxes").toTensor();
   if (include_masks && out_dict.contains("pred_masks")) { outputs.main.pred_masks = out_dict.at("pred_masks").toTensor(); }
   if (out_dict.contains("sparse_spatial")) {
-   OutputLayer::SparsePredMasks sparse;
+   SparsePredMasks sparse;
    sparse.spatial_features = out_dict.at("sparse_spatial").toTensor();
    sparse.query_features = out_dict.at("sparse_query").toTensor();
    sparse.bias = out_dict.at("sparse_bias").toTensor();
@@ -1102,7 +1102,7 @@ ModelOutputs NativeRfDetrModel::Impl::forward_impl(const NestedTensor& batch, co
    enc_out.pred_boxes = out_dict.at("enc_boxes").toTensor();
    if (include_masks && out_dict.contains("enc_masks")) { enc_out.pred_masks = out_dict.at("enc_masks").toTensor(); }
    if (out_dict.contains("enc_sparse_spatial")) {
-    OutputLayer::SparsePredMasks sparse;
+    SparsePredMasks sparse;
     sparse.spatial_features = out_dict.at("enc_sparse_spatial").toTensor();
     sparse.query_features = out_dict.at("enc_sparse_query").toTensor();
     sparse.bias = out_dict.at("enc_sparse_bias").toTensor();
@@ -1118,7 +1118,7 @@ ModelOutputs NativeRfDetrModel::Impl::forward_impl(const NestedTensor& batch, co
    aux_out.pred_boxes = out_dict.at("aux_boxes_" + std::to_string(i)).toTensor();
    if (include_masks && out_dict.contains("aux_masks_" + std::to_string(i))) { aux_out.pred_masks = out_dict.at("aux_masks_" + std::to_string(i)).toTensor(); }
    if (out_dict.contains("aux_sparse_spatial_" + std::to_string(i))) {
-    OutputLayer::SparsePredMasks sparse;
+    SparsePredMasks sparse;
     sparse.spatial_features = out_dict.at("aux_sparse_spatial_" + std::to_string(i)).toTensor();
     sparse.query_features = out_dict.at("aux_sparse_query_" + std::to_string(i)).toTensor();
     sparse.bias = out_dict.at("aux_sparse_bias_" + std::to_string(i)).toTensor();
@@ -1172,10 +1172,12 @@ ModelOutputs NativeRfDetrModel::Impl::forward_impl(const NestedTensor& batch, co
   mmltk::common::logging::ScopedProfile profile_rfdetr_model_forward_transformer{"rfdetr.model.forward.transformer"};
   transformed = transformer->forward(srcs, masks, poss, ref_weights, query_weights, is_training(), denoising, training_supervision_.get());
  }
+ std::vector<torch::Tensor> combined_query_features;
  std::vector<torch::Tensor> decoder_query_features;
  std::vector<torch::Tensor> denoising_query_features;
  if (transformed.hidden_states.defined()) {
-  auto states = transformed.hidden_states.unbind(0);
+  combined_query_features = transformed.hidden_states.unbind(0);
+  const auto& states = combined_query_features;
   decoder_query_features.reserve(states.size());
   denoising_query_features.reserve(states.size());
   for (const auto& state : states) {
@@ -1184,13 +1186,13 @@ ModelOutputs NativeRfDetrModel::Impl::forward_impl(const NestedTensor& batch, co
   }
  }
  std::vector<torch::Tensor> dense_masks;
- std::vector<OutputLayer::SparsePredMasks> sparse_masks;
+ std::vector<SparsePredMasks> sparse_masks;
  auto* segmentation_head = dynamic_cast<SegmentationHeadImpl*>(segmentation_head_.get());
  if (include_masks && segmentation_head_ && !decoder_query_features.empty()) {
   mmltk::common::logging::ScopedProfile profile_rfdetr_model_forward_segmentation{"rfdetr.model.forward.segmentation"};
   if (!segmentation_head) { throw std::runtime_error("RF-DETR segmentation head is not initialized"); }
   if (is_training() || capture_match_free_features) {
-   sparse_masks = segmentation_head->sparse_forward(features.front().tensors, decoder_query_features, {samples.tensors.size(2), samples.tensors.size(3)});
+   sparse_masks = segmentation_head->sparse_forward(features.front().tensors, combined_query_features, {samples.tensors.size(2), samples.tensors.size(3)});
   } else {
    dense_masks = segmentation_head->forward(features.front().tensors, decoder_query_features, {samples.tensors.size(2), samples.tensors.size(3)});
   }
@@ -1202,6 +1204,7 @@ ModelOutputs NativeRfDetrModel::Impl::forward_impl(const NestedTensor& batch, co
   dn_outputs.original_boxes = denoising->original_boxes;
   dn_outputs.valid_slots = denoising->valid_slots;
   dn_outputs.target_indices = denoising->target_indices;
+  dn_outputs.mask_sampling_seed = denoising->mask_sampling_seed;
   dn_outputs.groups = denoising->layout.denoising_groups;
   dn_outputs.queries_per_group = denoising->layout.denoising_queries_per_group;
   outputs.denoising = std::move(dn_outputs);
@@ -1232,7 +1235,8 @@ ModelOutputs NativeRfDetrModel::Impl::forward_impl(const NestedTensor& batch, co
    }
    if (include_masks && segmentation_head_) {
     if (is_training() || capture_match_free_features) {
-     layer.sparse_pred_masks = sparse_masks[index];
+     const auto& masks = sparse_masks[index];
+     layer.sparse_pred_masks = SparsePredMasks{masks.spatial_features, masks.query_features.narrow(1, 0, active_query_count), masks.bias};
     } else {
      layer.pred_masks = dense_masks[index];
     }
@@ -1249,6 +1253,11 @@ ModelOutputs NativeRfDetrModel::Impl::forward_impl(const NestedTensor& batch, co
     DenoisingOutputLayer dn_layer;
     dn_layer.pred_logits = class_embed->forward(dn_hs).view({dn_hs.size(0), denoising->layout.denoising_groups, denoising->layout.denoising_queries_per_group, config_.num_classes});
     dn_layer.pred_boxes = dn_boxes.view({dn_hs.size(0), denoising->layout.denoising_groups, denoising->layout.denoising_queries_per_group, 4});
+    if (include_masks && segmentation_head_) {
+     const auto& masks = sparse_masks[index];
+     dn_layer.sparse_pred_masks = SparsePredMasks{masks.spatial_features,
+      masks.query_features.narrow(1, denoising->layout.ordinary.total_queries(), denoising->layout.denoising_queries()), masks.bias};
+    }
     if (final_decoder_layer) {
      outputs.denoising->main = std::move(dn_layer);
     } else {

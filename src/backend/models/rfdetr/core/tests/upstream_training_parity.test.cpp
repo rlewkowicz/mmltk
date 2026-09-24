@@ -1,4 +1,5 @@
 #include "src/backend/models/rfdetr/core/detail/training_mask_loss.h"
+#include "src/backend/models/rfdetr/core/detail/training_supervision.h"
 #include "src/backend/ml/torch/tests/catch_support.h"
 #include "src/backend/models/rfdetr/core/detection_ops.h"
 #include "src/backend/models/rfdetr/core/detail/detection_sampling.h"
@@ -111,7 +112,7 @@ TEST_CASE("Empty stock masks retain representation-specific connected expression
   spatial.set_requires_grad(true);
   auto query = torch::ones({1, 2, 2}).set_requires_grad(true);
   auto bias = torch::zeros({1}).set_requires_grad(true);
-  if (sparse) outputs.main.sparse_pred_masks = rf::OutputLayer::SparsePredMasks{spatial, query, bias};
+  if (sparse) outputs.main.sparse_pred_masks = rf::SparsePredMasks{spatial, query, bias};
   else outputs.main.pred_masks = spatial;
   outputs.aux_outputs = {outputs.main}; outputs.enc_outputs = outputs.main;
   rf::DetectionConfig config; config.num_classes = 2; config.group_detr = 1; config.include_masks = true;
@@ -316,7 +317,7 @@ TEST_CASE("Stock dense and sparse masks share explicit CPU CUDA samples and reta
    if(route<2) {
     config.use_jit_traced_loss_ops=route==0;
     rf::ModelOutputs output; output.main.pred_logits=logits; output.main.pred_boxes=gt.all_boxes.unsqueeze(0);
-    if(sparse) output.main.sparse_pred_masks=rf::OutputLayer::SparsePredMasks{spatial,query,bias}; else output.main.pred_masks=spatial;
+    if(sparse) output.main.sparse_pred_masks=rf::SparsePredMasks{spatial,query,bias}; else output.main.pred_masks=spatial;
     output.aux_outputs={output.main}; output.enc_outputs=output.main;
     const auto losses=rf::detection_loss_dict(output,gt,config,true,torch::full({},denominator,options),samples);
     totals[route]=rf::weighted_detection_loss(losses,config,device);
@@ -497,7 +498,7 @@ TEST_CASE("Weighted matcher preserves nonfinite costs until full-domain sanitiza
    const auto dice = 1-(2*(probabilities.unsqueeze(1)*labels.unsqueeze(0)).sum(-1)+1)/(probabilities.sum(-1).unsqueeze(1)+labels.sum(-1).unsqueeze(0)+1);
    cost += config.mask_ce_loss_coef*ce + config.mask_dice_loss_coef*dice;
    if(sparse) {
-    outputs.main.sparse_pred_masks=rf::OutputLayer::SparsePredMasks{*outputs.main.pred_masks,torch::eye(4,outputs.main.pred_logits.options()).unsqueeze(0).expand({2,4,4}),torch::zeros({1},outputs.main.pred_logits.options())};
+    outputs.main.sparse_pred_masks=rf::SparsePredMasks{*outputs.main.pred_masks,torch::eye(4,outputs.main.pred_logits.options()).unsqueeze(0).expand({2,4,4}),torch::zeros({1},outputs.main.pred_logits.options())};
     outputs.main.pred_masks.reset();
    }
   }
@@ -698,5 +699,149 @@ TEST_CASE("Explicit criterion samples reject incompatible invocation metadata", 
  for(int fault:{0,1}) {
   rf::LayerMaskSamples samples; samples.matcher=fault==0?torch::zeros({1,3,2}):torch::zeros({1,4,2},torch::kFloat64);
   REQUIRE_THROWS_AS(rf::matcher_indices(output,gt,config,true,samples),std::invalid_argument);
+ }
+}
+
+TEST_CASE("DN masks use stock direct equations for fixed samples gradients and updates", "[rfdetr][parity][training_supervision]") {
+ PrecisionPolicy precision;
+ for (const auto device : parity_devices()) for (const auto amp : {torch::kFloat32, torch::kFloat16, torch::kBFloat16}) {
+  if (device.is_cpu() && amp != torch::kFloat32) continue;
+  for (const int64_t population : {1, 3, 5}) for (const int groups : {1, 2}) for (const int mode : {0, 1, 2, 3}) {
+   const auto options = torch::TensorOptions().device(device).dtype(torch::kFloat32);
+   const auto integers = options.dtype(torch::kInt64);
+   rf::NativeRfDetrConfig config;
+   config.num_classes = 2; config.num_queries = 3; config.hidden_dim = 4; config.group_detr = 1;
+   config.segmentation = true; config.aux_loss = true; config.dec_layers = 2; config.two_stage = true;
+   config.training_supervision.denoising.enabled = true; config.training_supervision.denoising.groups = groups;
+   config.mask_ce_loss_coef = mode & 1 ? 1.7 : 0.0; config.mask_dice_loss_coef = mode & 2 ? 2.3 : 0.0;
+   config.mask_point_sample_ratio = population == 1 ? 32 : 2;
+   rf::TrainingSupervisionImpl owner(config, 1); owner.initialize(173); owner.to(device);
+   auto gt = targets(torch::full({population + 1, 4}, 0.2F, options), torch::zeros({population + 1}, integers));
+   gt.counts = {population, 0, 1}; gt.offsets = {0, population, population}; gt.targets.clear();
+   auto words = torch::zeros({population + 1, 1}, torch::kInt64);
+   auto dense_targets = torch::zeros({population + 1, 1, 4, 4});
+   for (int64_t row = 0; row <= population; ++row) if (row % 2 == 0) {
+    words[row][0] = int64_t{0x5a5a};
+    dense_targets[row][0] = torch::tensor({{0.F, 1.F, 0.F, 1.F}, {1.F, 0.F, 1.F, 0.F}, {0.F, 1.F, 0.F, 1.F}, {1.F, 0.F, 1.F, 0.F}});
+   }
+   gt.packed_masks = rf::PackedTargetMasks{words.to(device), 4, 4}; dense_targets = dense_targets.to(device);
+   const auto prepared = owner.prepare_denoising(gt, {173, 2, 1, 7}, device, torch::kFloat32);
+   REQUIRE(prepared);
+   const auto make_output = [&] {
+    rf::ModelOutputs result;
+    rf::DenoisingOutputs dn;
+    dn.original_labels = prepared->original_labels; dn.original_boxes = prepared->original_boxes;
+    dn.valid_slots = prepared->valid_slots; dn.target_indices = prepared->target_indices;
+    dn.groups = groups; dn.queries_per_group = population; dn.mask_sampling_seed = prepared->mask_sampling_seed;
+    const auto layer = [&](float shift) {
+     rf::DenoisingOutputLayer value;
+     value.pred_logits = torch::full({3, groups, population, 2}, shift, options).set_requires_grad(true);
+     value.pred_boxes = (prepared->original_boxes + shift * 0.1).detach().set_requires_grad(true);
+     value.sparse_pred_masks = rf::SparsePredMasks{
+      (torch::arange(96, options).reshape({3, 2, 4, 4}) * 0.037 - 1.1 + shift).set_requires_grad(true),
+      (torch::arange(3 * groups * population * 2, options).reshape({3, groups * population, 2}) * 0.043 - 0.7).set_requires_grad(true),
+      torch::full({1}, 0.173, options).set_requires_grad(true)};
+     return value;
+    };
+    dn.main = layer(0.31F); dn.aux_outputs.push_back(layer(0.47F)); result.denoising = std::move(dn);
+    result.enc_outputs = rf::OutputLayer{};
+    result.enc_outputs->pred_masks = torch::ones({3, 3, 4, 4}, options).set_requires_grad(true);
+    return result;
+   };
+   auto actual = make_output(), reference = make_output();
+   const int64_t rows = (population + 1) * groups;
+   const int64_t points = std::max<int64_t>(4, 16 / config.mask_point_sample_ratio);
+   const int64_t important = static_cast<int64_t>(0.75 * points);
+   const auto coordinates = [&](int64_t count, float shift) {
+    return (torch::arange(rows * count * 2, options) * 0.137 + shift).remainder(1.2).sub(0.1).reshape({rows, count, 2});
+   };
+   const std::array<rf::LayerMaskSamples, 2> samples{{{{}, coordinates(points * 3, 0.03F), coordinates(points - important, 0.21F)},
+                                                     {{}, coordinates(points * 3, 0.17F), coordinates(points - important, 0.41F)}}};
+   const auto count = torch::full({}, population + 1, options);
+   rf::TrainingLoss loss;
+   torch::Tensor expected = torch::zeros({}, options), expected_ce = torch::zeros({}, options), expected_dice = torch::zeros({}, options);
+   {
+    mmltk::backend::ml::cuda::TorchAutocastScope scope(amp != torch::kFloat32, amp);
+    loss = owner.loss(actual, gt, {count}, true, samples);
+    const std::array<const rf::DenoisingOutputLayer*, 2> layers{&reference.denoising->main, &reference.denoising->aux_outputs.front()};
+    for (size_t index = 0; index < layers.size(); ++index) {
+     const auto& layer = *layers[index];
+     {
+      mmltk::backend::ml::cuda::TorchAutocastScope fp32(false, torch::kFloat32);
+      const auto probabilities = layer.pred_logits.sigmoid();
+      const auto labels = torch::tensor({1.F, 0.F}, options);
+      const auto classes = labels * config.focal_alpha * (1 - probabilities).square() * torch::softplus(-layer.pred_logits)
+       + (1 - labels) * (1 - config.focal_alpha) * probabilities.square() * torch::softplus(layer.pred_logits);
+      const auto valid = prepared->valid_slots;
+      const auto class_rows = torch::where(valid, classes.sum(-1), torch::zeros_like(valid, options));
+      const auto box_rows = torch::where(valid, (layer.pred_boxes - prepared->original_boxes).abs().sum(-1), torch::zeros_like(valid, options));
+      const auto giou_rows = torch::where(valid, 1 - reference_giou(reference_corners(layer.pred_boxes), reference_corners(prepared->original_boxes)), torch::zeros_like(valid, options));
+      expected = expected + (config.cls_loss_coef * class_rows.sum() + config.bbox_loss_coef * box_rows.sum() + config.giou_loss_coef * giou_rows.sum()) / (count * groups);
+     }
+     const auto& sparse = *layer.sparse_pred_masks;
+     std::vector<torch::Tensor> selected, selected_targets;
+     for (int64_t image = 0; image < 3; ++image) for (int64_t group = 0; group < groups; ++group) {
+      const auto n = gt.counts[image]; if (n == 0) continue;
+      const auto query = sparse.query_features[image].narrow(0, group * population, n);
+      selected.push_back(torch::matmul(query, sparse.spatial_features[image].flatten(1)).reshape({n, 1, 4, 4}) + sparse.bias);
+      selected_targets.push_back(dense_targets.narrow(0, gt.offsets[image], n));
+     }
+     auto masks = torch::cat(selected), labels = torch::cat(selected_targets);
+     const auto sample = [](const torch::Tensor& value, const torch::Tensor& coords, bool nearest) {
+      auto settings = F::GridSampleFuncOptions().padding_mode(torch::kBorder).align_corners(false);
+      if (nearest) settings.mode(torch::kNearest); else settings.mode(torch::kBilinear);
+      return F::grid_sample(value, (2 * coords - 1).unsqueeze(2), settings).squeeze(3).squeeze(1);
+     };
+     const auto uncertainty = -sample(masks.detach(), samples[index].uncertain_candidates, false).abs();
+     const auto top = std::get<1>(uncertainty.topk(important, 1));
+     const auto coords = torch::cat({samples[index].uncertain_candidates.gather(1, top.unsqueeze(-1).expand({rows, important, 2})), samples[index].uncertain_random}, 1);
+     const auto logits = sample(masks, coords, false), truth = sample(labels, coords, true);
+     const auto ce = (truth * torch::softplus(-logits) + (1 - truth) * torch::softplus(logits)).mean(1).sum() / (count * groups);
+     const auto probabilities = logits.sigmoid();
+     const auto dice = (1 - (2 * (probabilities * truth).sum(1) + 1) / (probabilities.sum(1) + truth.sum(1) + 1)).sum() / (count * groups);
+     const auto zero = (sparse.spatial_features.sum() + sparse.query_features.sum() + sparse.bias.sum()) * 0.0;
+     expected_ce = expected_ce + (config.mask_ce_loss_coef == 0 ? zero : config.mask_ce_loss_coef * ce);
+     expected_dice = expected_dice + (config.mask_dice_loss_coef == 0 ? zero : config.mask_dice_loss_coef * dice);
+    }
+    expected = expected + expected_ce + expected_dice;
+   }
+   const double tolerance = amp == torch::kFloat32 ? 2e-5 : 3e-2;
+   REQUIRE(torch::allclose(loss.mask_ce, expected_ce, tolerance, tolerance));
+   REQUIRE(torch::allclose(loss.mask_dice, expected_dice, tolerance, tolerance));
+   REQUIRE(torch::allclose(loss.total, expected, tolerance, tolerance));
+   REQUIRE(torch::equal(loss.total, loss.denoising));
+   loss.total.backward(); expected.backward();
+   REQUIRE_FALSE(actual.enc_outputs->pred_masks->grad().defined());
+   const auto check_layer = [&](const rf::DenoisingOutputLayer& a, const rf::DenoisingOutputLayer& b) {
+    const std::array left{a.pred_logits, a.pred_boxes, a.sparse_pred_masks->spatial_features, a.sparse_pred_masks->query_features, a.sparse_pred_masks->bias};
+    const std::array right{b.pred_logits, b.pred_boxes, b.sparse_pred_masks->spatial_features, b.sparse_pred_masks->query_features, b.sparse_pred_masks->bias};
+    for (size_t i = 0; i < left.size(); ++i) {
+     REQUIRE(left[i].grad().defined()); REQUIRE(torch::isfinite(left[i].grad()).all().item<bool>());
+     REQUIRE(torch::allclose(left[i].grad(), right[i].grad(), tolerance, tolerance));
+     torch::NoGradGuard no_grad;
+     REQUIRE(torch::allclose(left[i] - 0.01 * left[i].grad(), right[i] - 0.01 * right[i].grad(), tolerance, tolerance));
+    }
+    const auto query_gradient = a.sparse_pred_masks->query_features.grad().view({3, groups, population, 2});
+    REQUIRE(query_gradient[1].count_nonzero().item<int64_t>() == 0);
+    if (population > 1) REQUIRE(query_gradient[2].narrow(1, 1, population - 1).count_nonzero().item<int64_t>() == 0);
+   };
+   check_layer(actual.denoising->main, reference.denoising->main);
+   check_layer(actual.denoising->aux_outputs.front(), reference.denoising->aux_outputs.front());
+   auto missing = gt; missing.packed_masks.reset();
+   if (mode == 0) {
+    auto disabled = make_output();
+    const auto without_masks = owner.loss(disabled, missing, {count}, true);
+    REQUIRE(torch::equal(without_masks.total, without_masks.classification + without_masks.box + without_masks.giou));
+    REQUIRE(torch::allclose(without_masks.total, loss.total, tolerance, tolerance));
+    without_masks.total.backward();
+    for (const auto* layer : {&disabled.denoising->main, &disabled.denoising->aux_outputs.front()}) {
+     const auto& masks = *layer->sparse_pred_masks;
+     for (const auto& operand : {masks.spatial_features, masks.query_features, masks.bias}) {
+      REQUIRE(operand.grad().defined());
+      REQUIRE(operand.grad().count_nonzero().item<int64_t>() == 0);
+     }
+    }
+   } else REQUIRE_THROWS(owner.loss(actual, missing, {count}, true));
+  }
  }
 }

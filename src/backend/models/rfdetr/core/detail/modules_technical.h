@@ -71,7 +71,7 @@ class SegmentationHeadImpl : public torch::nn::Module {
 public:
  SegmentationHeadImpl(int64_t in_dim, int64_t num_blocks, c10::optional<int64_t> bottleneck_ratio = 1, int64_t downsample_ratio = 4);
  std::vector<torch::Tensor> forward(const torch::Tensor& spatial_features, const std::vector<torch::Tensor>& query_features, std::pair<int64_t, int64_t> image_size, bool skip_blocks = false);
- std::vector<OutputLayer::SparsePredMasks> sparse_forward(
+ std::vector<SparsePredMasks> sparse_forward(
   const torch::Tensor& spatial_features, const std::vector<torch::Tensor>& query_features, std::pair<int64_t, int64_t> image_size, bool skip_blocks = false);
  torch::nn::ModuleList blocks{nullptr};
  torch::nn::Conv2d spatial_features_proj{nullptr};

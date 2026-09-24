@@ -135,6 +135,16 @@ void test_request_and_model_boundaries_reject_unsupported_feature_combinations()
  model.giou_loss_coef = 0.0;
  CHECK_FALSE(training_supervision_model_config_valid(model));
  model.cls_loss_coef = 1.0;
+ model.segmentation = true;
+ CHECK(training_supervision_model_config_valid(model));
+ model.mask_ce_loss_coef = -1.0;
+ CHECK_FALSE(training_supervision_model_config_valid(model));
+ model.mask_ce_loss_coef = 0.0;
+ model.mask_dice_loss_coef = 0.0;
+ CHECK(training_supervision_model_config_valid(model));
+ model.mask_point_sample_ratio = 0;
+ CHECK_FALSE(training_supervision_model_config_valid(model));
+ model.mask_point_sample_ratio = 16;
  model.focal_alpha = std::numeric_limits<double>::infinity();
  CHECK_FALSE(training_supervision_model_config_valid(model));
 }

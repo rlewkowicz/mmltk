@@ -96,6 +96,11 @@ struct DecoderQueryLayout {
  [[nodiscard]] int64_t denoising_queries() const noexcept { return denoising_groups * denoising_queries_per_group; }
  [[nodiscard]] int64_t total_queries() const noexcept { return ordinary.total_queries() + denoising_queries(); }
 };
+struct SparsePredMasks {
+ torch::Tensor spatial_features;
+ torch::Tensor query_features;
+ torch::Tensor bias;
+};
 struct DenoisingQueryBatch {
  torch::Tensor content;
  torch::Tensor normalized_references;
@@ -104,10 +109,12 @@ struct DenoisingQueryBatch {
  torch::Tensor valid_slots;
  torch::Tensor target_indices;
  DecoderQueryLayout layout;
+ std::uint64_t mask_sampling_seed = 0;
 };
 struct DenoisingOutputLayer {
  torch::Tensor pred_logits;
  torch::Tensor pred_boxes;
+ std::optional<SparsePredMasks> sparse_pred_masks;
 };
 struct DenoisingOutputs {
  DenoisingOutputLayer main;
@@ -118,13 +125,9 @@ struct DenoisingOutputs {
  torch::Tensor target_indices;
  int64_t groups = 0;
  int64_t queries_per_group = 0;
+ std::uint64_t mask_sampling_seed = 0;
 };
 struct OutputLayer {
- struct SparsePredMasks {
-  torch::Tensor spatial_features;
-  torch::Tensor query_features;
-  torch::Tensor bias;
- };
  torch::Tensor pred_logits;
  torch::Tensor pred_boxes;
  std::optional<torch::Tensor> query_features;

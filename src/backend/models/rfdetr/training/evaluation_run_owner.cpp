@@ -385,7 +385,7 @@ OutputLayer narrow_output_layer_batch(const OutputLayer& layer, int64_t count) {
  narrowed.query_layout = layer.query_layout;
  if (layer.pred_masks.has_value()) { narrowed.pred_masks = layer.pred_masks->narrow(0, 0, count); }
  if (layer.sparse_pred_masks.has_value()) {
-  narrowed.sparse_pred_masks = OutputLayer::SparsePredMasks{
+  narrowed.sparse_pred_masks = SparsePredMasks{
    layer.sparse_pred_masks->spatial_features.narrow(0, 0, count),
    layer.sparse_pred_masks->query_features.narrow(0, 0, count),
    layer.sparse_pred_masks->bias,

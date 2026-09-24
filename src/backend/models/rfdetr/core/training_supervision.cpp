@@ -1,6 +1,8 @@
 #include "detail/training_supervision.h"
 #include "detail/training_mask_loss.h"
+#include "detail/detection_sampling.h"
 #include <ATen/Context.h>
+#include <ATen/autocast_mode.h>
 #include <ATen/CPUGeneratorImpl.h>
 #include <ATen/TensorIndexing.h>
 #include <ATen/cuda/CUDAGeneratorImpl.h>
@@ -59,7 +61,13 @@ void initialize_embedding(torch::nn::Embedding& embedding, const std::uint64_t s
  auto generator = at::detail::createCPUGenerator(seed);
  embedding->weight.normal_(0.0, 1.0, generator);
 }
-torch::Tensor scalar_edge(const torch::Tensor& tensor) { return tensor.reshape({-1}).narrow(0, 0, 1).sum() * 0.0F; }
+torch::Tensor scalar_edge(const torch::Tensor& tensor) {
+ if (tensor.numel() == 0) return tensor.sum() * 0.0F;
+ auto scalar = tensor;
+ // Select views rather than flattening potentially strided query slices.
+ for (int64_t dimension = tensor.dim(); dimension > 0; --dimension) scalar = scalar.select(0, 0);
+ return scalar * 0.0F;
+}
 void require_denoising_variates(const DenoisingVariates& variates, const std::vector<int64_t>& slot_shape, const torch::Device& device, const int64_t object_classes) {
  const std::vector<int64_t> coordinate_shape{slot_shape[0], slot_shape[1], slot_shape[2], 2};
  const auto require = [&](const torch::Tensor& tensor, const std::vector<int64_t>& expected, const c10::ScalarType dtype, const char* name) {
@@ -540,6 +548,7 @@ std::optional<DenoisingQueryBatch> TrainingSupervisionImpl::prepare_denoising(
    valid,
    target_indices,
    std::move(layout),
+   tagged_seed(denoising_step_seed(identity), 0x444e5f4d41534bULL),
   };
  };
  if (!timing_) { return operation(); }
@@ -653,7 +662,7 @@ TrainingLoss TrainingSupervisionImpl::empty_loss(const ModelOutputs& outputs) co
  for (const auto& parameter : parameters()) { zero = zero + scalar_edge(parameter); }
  return {zero, zero, zero, zero, zero, zero, config_.aux_loss ? zero : torch::Tensor{}, {zero, zero, zero}};
 }
-TrainingLoss TrainingSupervisionImpl::denoising_loss(const DenoisingOutputs& outputs, const DeviceLossNormalizer& normalizer) const {
+TrainingLoss TrainingSupervisionImpl::denoising_loss(const DenoisingOutputs& outputs, const PreparedTargets& target_inventory, const DeviceLossNormalizer& normalizer, std::span<const LayerMaskSamples> mask_samples) const {
  if (!denoising_enabled() || !initialized_) { throw std::runtime_error("DN loss requires active initialized supervision"); }
  if (!normalizer.target_count.defined() || normalizer.target_count.dim() != 0 || normalizer.target_count.scalar_type() != torch::kFloat32 ||
      normalizer.target_count.device() != outputs.main.pred_logits.device()) {
@@ -664,6 +673,8 @@ TrainingLoss TrainingSupervisionImpl::denoising_loss(const DenoisingOutputs& out
      outputs.original_boxes.sizes().vec() != std::vector<int64_t>{target_shape[0], target_shape[1], target_shape[2], 4} || outputs.valid_slots.sizes().vec() != target_shape) {
   throw std::runtime_error("DN outputs do not match their direct-target layout");
  }
+ const bool mask_autocast = at::autocast::is_autocast_enabled(at::kCUDA);
+ const auto mask_dtype = at::autocast::get_autocast_dtype(at::kCUDA);
  mmltk::backend::ml::cuda::TorchAutocastScope fp32_scope(false, torch::kFloat32);
  // CLEANUP-OFF: DN loss layers exclude encoder outputs and have a distinct prediction type.
  auto divisor = (normalizer.target_count.to(torch::kFloat32).reshape({}) * outputs.groups).clamp_min(1.0F);
@@ -674,11 +685,56 @@ TrainingLoss TrainingSupervisionImpl::denoising_loss(const DenoisingOutputs& out
   for (const auto& layer : outputs.aux_outputs) { layers.push_back(&layer); }
  }
  // CLEANUP-ON
+ if (!mask_samples.empty() && mask_samples.size() != layers.size()) throw std::invalid_argument("DN mask samples must cover every selected decoder layer");
+ const bool reconstruct_masks = config_.segmentation && (config_.mask_ce_loss_coef != 0.0 || config_.mask_dice_loss_coef != 0.0);
+ if (config_.segmentation) {
+  result.mask_ce = zero;
+  result.mask_dice = zero;
+ }
  const auto valid = outputs.valid_slots;
  const auto labels = outputs.original_labels;
  const auto targets = outputs.original_boxes.to(torch::kFloat32);
  auto objective = [&]() {
-  for (const auto* layer : layers) {
+  // Mask DINO appendix B.2 and its criterion's DN routing motivate mask
+  // reconstruction from noisy labels/boxes. Here RF-DETR's own mask head and
+  // stock uncertain-point BCE/Dice remain authoritative. We retain positive-only
+  // DN groups, additive task embeddings and complete ordinary/group isolation;
+  // no contrastive negative queries or Mask DINO architecture are introduced.
+  std::vector<torch::Tensor> query_indices;
+  torch::Tensor mask_indices;
+  torch::Tensor mask_valid;
+  if (reconstruct_masks) {
+   const auto& masks = require_target_masks(target_inventory, "DN mask reconstruction");
+   validate_packed_mask_extent(masks, "DN mask reconstruction");
+   if (target_inventory.counts.size() != static_cast<size_t>(target_shape[0]) ||
+       outputs.target_indices.sizes().vec() != target_shape || outputs.target_indices.scalar_type() != torch::kInt64 ||
+       outputs.target_indices.device() != outputs.main.pred_logits.device() ||
+       outputs.valid_slots.scalar_type() != torch::kBool || outputs.valid_slots.device() != outputs.main.pred_logits.device() ||
+       masks.bits.size(0) < target_inventory.all_labels.size(0))
+    throw std::invalid_argument("DN masks do not match their owned target inventory");
+   const auto integer_options = outputs.target_indices.options();
+   const auto group_offsets = torch::arange(outputs.groups, integer_options).unsqueeze(1) * outputs.queries_per_group;
+   std::vector<torch::Tensor> indices;
+   std::vector<torch::Tensor> validity;
+   query_indices.reserve(target_inventory.counts.size());
+   for (int64_t batch = 0; batch < target_shape[0]; ++batch) {
+    const auto count = target_inventory.counts[static_cast<size_t>(batch)];
+    if (count < 0 || count > outputs.queries_per_group) throw std::invalid_argument("DN mask target count exceeds the owned query layout");
+    // Host admission counts enumerate real slots without a device nonzero or
+    // readback. The output's retained validity and original identities control
+    // reconstruction; construction scratch is never consulted here.
+    auto queries = (group_offsets + torch::arange(count, integer_options)).reshape({-1});
+    query_indices.push_back(queries);
+    indices.push_back(outputs.target_indices[batch].reshape({-1}).index_select(0, queries));
+    validity.push_back(outputs.valid_slots[batch].reshape({-1}).index_select(0, queries));
+   }
+   mask_indices = torch::cat(indices);
+   mask_valid = torch::cat(validity);
+   mask_indices = torch::where(mask_valid, mask_indices, torch::zeros_like(mask_indices));
+  }
+
+  for (size_t layer_index = 0; layer_index < layers.size(); ++layer_index) {
+   const auto* layer = layers[layer_index];
    if (layer->pred_logits.sizes().vec() != std::vector<int64_t>{target_shape[0], target_shape[1], target_shape[2], config_.num_classes} ||
        layer->pred_boxes.sizes().vec() != std::vector<int64_t>{target_shape[0], target_shape[1], target_shape[2], 4}) {
     throw std::runtime_error("DN prediction layer does not match its target layout");
@@ -696,8 +752,66 @@ TrainingLoss TrainingSupervisionImpl::denoising_loss(const DenoisingOutputs& out
    result.classification = result.classification + config_.cls_loss_coef * classification.sum() / divisor;
    result.box = result.box + config_.bbox_loss_coef * box.sum() / divisor;
    result.giou = result.giou + config_.giou_loss_coef * giou.sum() / divisor;
+   if (config_.segmentation) {
+    // Keep the stock mask projection/grid dispatch under the forward AMP
+    // policy while DN class/box reconstruction remains explicitly FP32.
+    mmltk::backend::ml::cuda::TorchAutocastScope mask_scope(mask_autocast, mask_dtype);
+    if (!layer->sparse_pred_masks) throw std::invalid_argument("DN segmentation requires sparse mask outputs");
+    const auto& sparse = *layer->sparse_pred_masks;
+    if (sparse.spatial_features.dim() != 4 || sparse.spatial_features.size(0) != target_shape[0] ||
+        sparse.query_features.sizes().vec() != std::vector<int64_t>{target_shape[0], outputs.groups * outputs.queries_per_group, sparse.spatial_features.size(1)})
+     throw std::invalid_argument("DN mask projections do not match their query layout");
+    if (!reconstruct_masks || mask_indices.numel() == 0) {
+     // Disabled reconstruction needs only autograd edges, not target admission
+     // or a full field reduction. Enabled empty reconstruction retains the
+     // stock sparse sum/nonfinite semantics.
+     const auto mask_zero = !reconstruct_masks
+      ? scalar_edge(sparse.spatial_features) + scalar_edge(sparse.query_features) + scalar_edge(sparse.bias)
+      : (sparse.spatial_features.sum() + sparse.query_features.sum() + sparse.bias.sum()) * 0.0;
+     result.mask_ce = result.mask_ce + mask_zero;
+     result.mask_dice = result.mask_dice + mask_zero;
+    } else {
+     std::vector<torch::Tensor> selected;
+     selected.reserve(query_indices.size());
+     for (size_t batch = 0; batch < query_indices.size(); ++batch) {
+      if (query_indices[batch].numel() != 0) selected.push_back(matched_sparse_pred_masks_for_batch(sparse, static_cast<int64_t>(batch), query_indices[batch]));
+     }
+     auto masks = selected.size() == 1 ? selected.front() : torch::cat(selected);
+     if (masks.numel() == 0) {
+      const auto mask_zero = masks.sum();
+      result.mask_ce = result.mask_ce + mask_zero;
+      result.mask_dice = result.mask_dice + mask_zero;
+      continue;
+     }
+     LayerMaskSamples samples;
+     if (!mask_samples.empty()) samples = mask_samples[layer_index];
+     if (!samples.uncertain_candidates.defined() || !samples.uncertain_random.defined()) {
+      // A generator local to this owned output/layer makes replay independent
+      // of later preparation, loss ordering, ordinary sampling and other lanes.
+      auto generator = masks.is_cuda() ? at::cuda::detail::createCUDAGenerator(masks.device().index()) : at::detail::createCPUGenerator();
+      const auto layer_seed = tagged_seed(tagged_seed(outputs.mask_sampling_seed, 0x4c41594552ULL), layer_index);
+      const auto points = direct_mask_point_count(masks, config_.mask_point_sample_ratio);
+      const auto options = masks.options().dtype(torch::kFloat32);
+      if (!samples.uncertain_candidates.defined()) {
+       generator.set_current_seed(tagged_seed(layer_seed, 0x43414e4449444154ULL));
+       samples.uncertain_candidates = at::rand({masks.size(0), points * 3, 2}, generator, options);
+      }
+      if (!samples.uncertain_random.defined()) {
+       generator.set_current_seed(tagged_seed(layer_seed, 0x52414e444f4dULL));
+       samples.uncertain_random = at::rand({masks.size(0), points - static_cast<int64_t>(0.75 * static_cast<double>(points)), 2}, generator, options);
+      }
+     }
+     const auto sampled = sample_direct_masks(masks, target_inventory, mask_indices, config_.mask_point_sample_ratio, samples);
+     const auto mask_zero = config_.mask_ce_loss_coef == 0.0 || config_.mask_dice_loss_coef == 0.0 ? sampled.logits.sum() * 0.0 : torch::Tensor{};
+     result.mask_ce = result.mask_ce + (config_.mask_ce_loss_coef == 0.0 ? mask_zero :
+      config_.mask_ce_loss_coef * sigmoid_ce_loss(sampled.logits, sampled.targets, divisor, false, mask_valid));
+     result.mask_dice = result.mask_dice + (config_.mask_dice_loss_coef == 0.0 ? mask_zero :
+      config_.mask_dice_loss_coef * dice_loss(sampled.logits, sampled.targets, divisor, false, mask_valid));
+    }
+   }
   }
   result.total = result.classification + result.box + result.giou;
+  if (config_.segmentation) result.total = result.total + result.mask_ce + result.mask_dice;
   result.denoising = result.total;
  };
  if (!timing_) {
@@ -707,10 +821,10 @@ TrainingLoss TrainingSupervisionImpl::denoising_loss(const DenoisingOutputs& out
  timing_->measure(TimingState::Stage::DenoisingObjective, objective);
  return result;
 }
-TrainingLoss TrainingSupervisionImpl::loss(const ModelOutputs& outputs, const PreparedTargets& targets, const DeviceLossNormalizer& normalizer, const bool training_mode) {
+TrainingLoss TrainingSupervisionImpl::loss(const ModelOutputs& outputs, const PreparedTargets& targets, const DeviceLossNormalizer& normalizer, const bool training_mode, std::span<const LayerMaskSamples> mask_samples) {
  if (!initialized_) { throw std::runtime_error("RF-DETR supervision loss requires one-shot initialization"); }
  if (!match_free_enabled()) {
-  if (outputs.denoising) { return denoising_loss(*outputs.denoising, normalizer); }
+  if (outputs.denoising) { return denoising_loss(*outputs.denoising, targets, normalizer, mask_samples); }
   return empty_loss(outputs);
  }
  if (!normalizer.target_count.defined() || normalizer.target_count.dim() != 0 || normalizer.target_count.scalar_type() != torch::kFloat32) {
@@ -720,6 +834,8 @@ TrainingLoss TrainingSupervisionImpl::loss(const ModelOutputs& outputs, const Pr
  if (timing_ && (!outputs.main.pred_logits.is_cuda() || timing_->device_id != outputs.main.pred_logits.get_device())) {
   throw std::runtime_error("Match-Free timing leases must match the prediction CUDA device");
  }
+ const bool forward_autocast = at::autocast::is_autocast_enabled(at::kCUDA);
+ const auto forward_dtype = at::autocast::get_autocast_dtype(at::kCUDA);
  mmltk::backend::ml::cuda::TorchAutocastScope fp32_scope(false, torch::kFloat32);
  const int64_t batch = outputs.main.pred_logits.size(0);
  const auto padded = pad_targets(targets, outputs.main.pred_logits.device(), batch, false);
@@ -818,11 +934,16 @@ TrainingLoss TrainingSupervisionImpl::loss(const ModelOutputs& outputs, const Pr
  }
  result.total = result.classification + result.box + result.giou + result.mask_ce + result.mask_dice;
  if (outputs.denoising) {
-  const auto dn = denoising_loss(*outputs.denoising, normalizer);
+  mmltk::backend::ml::cuda::TorchAutocastScope forward_scope(forward_autocast, forward_dtype);
+  const auto dn = denoising_loss(*outputs.denoising, targets, normalizer, mask_samples);
   result.total = result.total + dn.total;
   result.classification = result.classification + dn.classification;
   result.box = result.box + dn.box;
   result.giou = result.giou + dn.giou;
+  if (config_.segmentation) {
+   result.mask_ce = result.mask_ce + dn.mask_ce;
+   result.mask_dice = result.mask_dice + dn.mask_dice;
+  }
   result.denoising = dn.denoising;
  }
  if (mmltk::common::logging::profile_enabled()) {

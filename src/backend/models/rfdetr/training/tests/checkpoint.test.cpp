@@ -411,6 +411,7 @@ void test_strict_model_state_admission_is_duplicate_free_and_atomic() {
  config.num_select = 3;
  config.group_detr = 1;
  config.training_supervision.assignment = rfdetr::TrainAssignmentKind::MatchFree;
+ config.training_supervision.denoising.enabled = true;
  rfdetr::NativeRfDetrModel model(config, rfdetr::testsupport::synthetic_training_layout(config.num_classes - 1));
  auto& module = (model);
  auto state = clone_normalized_model_state(module);

@@ -174,22 +174,6 @@ torch::Tensor concat_target_boxes(const PreparedTargets& targets, const MatcherL
  return targets.all_boxes.to(device, torch::kFloat32).index({indices.global_targets});
 }
 bool has_target_masks(const PreparedTargets& targets) { return targets.packed_masks.has_value() && targets.packed_masks->bits.defined(); }
-// The zero-query result of a sparse mask projection: no masks, but the spatial extent, dtype, and
-// device the projection would have produced. Both projection entry points return this one shape.
-torch::Tensor empty_sparse_pred_masks(const OutputLayer::SparsePredMasks& sparse) {
- return torch::empty({0, sparse.spatial_features.size(-2), sparse.spatial_features.size(-1)}, torch::TensorOptions().dtype(sparse.spatial_features.dtype()).device(sparse.spatial_features.device()));
-}
-torch::Tensor matched_sparse_pred_masks_for_batch(const OutputLayer::SparsePredMasks& sparse, int64_t batch_index, const torch::Tensor& query_indices) {
- if (query_indices.dim() != 1) { throw std::runtime_error("native RF-DETR sparse mask projection expects 1D query indices"); }
- if (query_indices.numel() == 0) { return empty_sparse_pred_masks(sparse); }
- auto device_query_indices = query_indices.to(sparse.query_features.device(), torch::kInt64, false, false);
- const auto batch_spatial_features = sparse.spatial_features.index({batch_index});
- auto batch_query_features = sparse.query_features.index({batch_index, device_query_indices});
- if (batch_query_features.scalar_type() != batch_spatial_features.scalar_type()) { batch_query_features = batch_query_features.to(batch_spatial_features.scalar_type()); }
- const auto bias = sparse.bias.to(batch_spatial_features.dtype());
- const auto flattened_spatial = batch_spatial_features.flatten(1).contiguous();
- return torch::matmul(batch_query_features, flattened_spatial).view({batch_query_features.size(0), batch_spatial_features.size(-2), batch_spatial_features.size(-1)}) + bias;
-}
 torch::Tensor matched_pred_masks(const OutputLayer& layer, const MatcherLayerIndices& indices) {
  const auto& idx = indices.source;
  if (layer.pred_masks.has_value()) {
@@ -643,23 +627,11 @@ TensorMap loss_masks(const OutputLayer& layer, const PreparedTargets& targets, c
   losses["loss_mask_dice"] = src_masks.sum();
   return losses;
  }
- src_masks = src_masks.unsqueeze(1);
- const int64_t num_points = std::max<int64_t>(src_masks.size(-2), src_masks.size(-2) * src_masks.size(-1) / config.mask_point_sample_ratio);
  mmltk::common::logging::profile_add_value("rfdetr.criterion.matched_pairs", idx.first.size(0));
- mmltk::common::logging::profile_set_value("rfdetr.criterion.mask_points", static_cast<size_t>(num_points));
- torch::Tensor point_coords;
- {
-  torch::NoGradGuard no_grad;
-  point_coords = get_uncertain_point_coords_with_randomness(src_masks, num_points, 3, 0.75, samples);
- }
- const auto point_logits = point_sample(src_masks, point_coords, torch::kBilinear).squeeze(1);
- torch::Tensor point_labels;
- {
-  torch::NoGradGuard no_grad;
-  const auto& all_masks = require_target_masks(targets, "native RF-DETR mask loss");
-  const auto global_indices = indices.global_targets;
-  point_labels = sample_target_masks(all_masks, global_indices, point_coords, "native RF-DETR mask loss").to(point_logits.dtype());
- }
+ mmltk::common::logging::profile_set_value("rfdetr.criterion.mask_points", static_cast<size_t>(direct_mask_point_count(src_masks, config.mask_point_sample_ratio)));
+ const auto sampled = sample_direct_masks(src_masks, targets, indices.global_targets, config.mask_point_sample_ratio, samples);
+ const auto& point_logits = sampled.logits;
+ const auto& point_labels = sampled.targets;
  losses["loss_mask_ce"] = sigmoid_ce_loss(point_logits, point_labels, num_boxes, config.use_jit_traced_loss_ops);
  losses["loss_mask_dice"] = dice_loss(point_logits, point_labels, num_boxes, config.use_jit_traced_loss_ops);
  return losses;

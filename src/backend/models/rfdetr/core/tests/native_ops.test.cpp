@@ -435,7 +435,7 @@ void test_sparse_mask_loss_matches_dense_reference() {
  mmltk::backend::models::rfdetr::ModelOutputs sparse_outputs;
  sparse_outputs.main.pred_logits = dense_outputs.main.pred_logits.clone();
  sparse_outputs.main.pred_boxes = dense_outputs.main.pred_boxes.clone();
- sparse_outputs.main.sparse_pred_masks = mmltk::backend::models::rfdetr::OutputLayer::SparsePredMasks{
+ sparse_outputs.main.sparse_pred_masks = mmltk::backend::models::rfdetr::SparsePredMasks{
   spatial_features,
   query_features,
   bias,

@@ -311,9 +311,9 @@ std::vector<torch::Tensor> SegmentationHeadImpl::forward(
  return collect_head_outputs<torch::Tensor>(
   spatial_features, query_features, image_size, skip_blocks, [this](const torch::Tensor& spatial, const torch::Tensor& queries) { return torch::einsum("bchw,bnc->bnhw", {spatial, queries}) + bias; });
 }
-std::vector<OutputLayer::SparsePredMasks> SegmentationHeadImpl::sparse_forward(
+std::vector<SparsePredMasks> SegmentationHeadImpl::sparse_forward(
  const torch::Tensor& spatial_features, const std::vector<torch::Tensor>& query_features, std::pair<int64_t, int64_t> image_size, bool skip_blocks) {
- return collect_head_outputs<OutputLayer::SparsePredMasks>(spatial_features, query_features, image_size, skip_blocks,
-  [this](torch::Tensor spatial, torch::Tensor queries) { return OutputLayer::SparsePredMasks{std::move(spatial), std::move(queries), bias}; });
+ return collect_head_outputs<SparsePredMasks>(spatial_features, query_features, image_size, skip_blocks,
+  [this](torch::Tensor spatial, torch::Tensor queries) { return SparsePredMasks{std::move(spatial), std::move(queries), bias}; });
 }
 }  // namespace mmltk::backend::models::rfdetr

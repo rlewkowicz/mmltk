@@ -15,6 +15,22 @@
 namespace mmltk::backend::models::rfdetr {
 namespace F = torch::nn::functional;
 using namespace torch::indexing;
+// The zero-query result of a sparse mask projection: no masks, but the spatial extent, dtype, and
+// device the projection would have produced. Both projection entry points return this one shape.
+torch::Tensor empty_sparse_pred_masks(const SparsePredMasks& sparse) {
+ return torch::empty({0, sparse.spatial_features.size(-2), sparse.spatial_features.size(-1)}, torch::TensorOptions().dtype(sparse.spatial_features.dtype()).device(sparse.spatial_features.device()));
+}
+torch::Tensor matched_sparse_pred_masks_for_batch(const SparsePredMasks& sparse, int64_t batch_index, const torch::Tensor& query_indices) {
+ if (query_indices.dim() != 1) { throw std::runtime_error("native RF-DETR sparse mask projection expects 1D query indices"); }
+ if (query_indices.numel() == 0) { return empty_sparse_pred_masks(sparse); }
+ auto device_query_indices = query_indices.to(sparse.query_features.device(), torch::kInt64, false, false);
+ const auto batch_spatial_features = sparse.spatial_features.index({batch_index});
+ auto batch_query_features = sparse.query_features.index({batch_index, device_query_indices});
+ if (batch_query_features.scalar_type() != batch_spatial_features.scalar_type()) { batch_query_features = batch_query_features.to(batch_spatial_features.scalar_type()); }
+ const auto bias = sparse.bias.to(batch_spatial_features.dtype());
+ const auto flattened_spatial = batch_spatial_features.flatten(1).contiguous();
+ return torch::matmul(batch_query_features, flattened_spatial).view({batch_query_features.size(0), batch_spatial_features.size(-2), batch_spatial_features.size(-1)}) + bias;
+}
 const PackedTargetMasks& require_target_masks(const PreparedTargets& targets, const char* context) {
  if (!targets.packed_masks.has_value() || !targets.packed_masks->bits.defined()) { throw std::runtime_error(std::string(context) + " requires target masks"); }
  return *targets.packed_masks;
@@ -108,24 +124,24 @@ torch::Tensor run_binary_traced_or_direct(
 torch::Tensor binary_cross_entropy_with_logits_none(const torch::Tensor& inputs, const torch::Tensor& targets) {
  return F::binary_cross_entropy_with_logits(inputs, targets, F::BinaryCrossEntropyWithLogitsFuncOptions().reduction(torch::kNone));
 }
-torch::Tensor sigmoid_ce_loss(const torch::Tensor& inputs, const torch::Tensor& targets, const torch::Tensor& num_masks, bool use_jit_traced_loss_ops) {
- return run_binary_traced_or_direct(
+torch::Tensor sigmoid_ce_loss(const torch::Tensor& inputs, const torch::Tensor& targets, const torch::Tensor& num_masks, bool use_jit_traced_loss_ops, const torch::Tensor& valid) {
+ const auto rows = run_binary_traced_or_direct(
          &TracedLossOpCache::sigmoid_ce, "__torch__.NativeRfDetrSigmoidCeLoss", use_jit_traced_loss_ops,
-         [](const torch::Tensor& a, const torch::Tensor& b) { return binary_cross_entropy_with_logits_none(a, b).mean(1).sum(); }, inputs, targets) /
-        num_masks;
+         [](const torch::Tensor& a, const torch::Tensor& b) { return binary_cross_entropy_with_logits_none(a, b).mean(1); }, inputs, targets);
+ return (valid.defined() ? torch::where(valid, rows, torch::zeros_like(rows)) : rows).sum() / num_masks;
 }
-torch::Tensor dice_loss(const torch::Tensor& inputs, const torch::Tensor& targets, const torch::Tensor& num_masks, bool use_jit_traced_loss_ops) {
- return run_binary_traced_or_direct(
+torch::Tensor dice_loss(const torch::Tensor& inputs, const torch::Tensor& targets, const torch::Tensor& num_masks, bool use_jit_traced_loss_ops, const torch::Tensor& valid) {
+ const auto rows = run_binary_traced_or_direct(
          &TracedLossOpCache::dice, "__torch__.NativeRfDetrDiceLoss", use_jit_traced_loss_ops,
          [](const torch::Tensor& a, const torch::Tensor& b) {
           const auto probs = a.sigmoid().flatten(1);
           const auto flat_targets = b.flatten(1);
           const auto numerator = 2 * (probs * flat_targets).sum(-1);
           const auto denominator = probs.sum(-1) + flat_targets.sum(-1);
-          return (1 - (numerator + 1) / (denominator + 1)).sum();
+          return 1 - (numerator + 1) / (denominator + 1);
          },
-         inputs, targets) /
-        num_masks;
+         inputs, targets);
+ return (valid.defined() ? torch::where(valid, rows, torch::zeros_like(rows)) : rows).sum() / num_masks;
 }
 torch::Tensor batch_dice_loss(const torch::Tensor& inputs, const torch::Tensor& targets, bool use_jit_traced_loss_ops) {
  return run_binary_traced_or_direct(
@@ -189,6 +205,27 @@ torch::Tensor get_uncertain_point_coords_with_randomness(const torch::Tensor& co
    1);
  }
  return sampled_coords;
+}
+
+int64_t direct_mask_point_count(const torch::Tensor& masks, int64_t ratio) {
+ if (ratio <= 0) throw std::invalid_argument("direct mask sampling requires a positive ratio");
+ return std::max<int64_t>(masks.size(-2), masks.size(-2) * masks.size(-1) / ratio);
+}
+DirectMaskSamples sample_direct_masks(const torch::Tensor& masks, const PreparedTargets& targets,
+ const torch::Tensor& indices, int64_t ratio, const LayerMaskSamples& samples) {
+ const auto logits = masks.unsqueeze(1);
+ torch::Tensor coordinates;
+ {
+  torch::NoGradGuard no_grad;
+  coordinates = get_uncertain_point_coords_with_randomness(logits, direct_mask_point_count(masks, ratio), 3, 0.75, samples);
+ }
+ const auto point_logits = point_sample(logits, coordinates, torch::kBilinear).squeeze(1);
+ torch::Tensor labels;
+ {
+  torch::NoGradGuard no_grad;
+  labels = sample_target_masks(require_target_masks(targets, "direct mask reconstruction"), indices, coordinates, "direct mask reconstruction").to(point_logits.dtype());
+ }
+ return {point_logits, labels};
 }
 
 PairwiseMaskSamples sample_pairwise_masks(const OutputLayer& layer, const PreparedTargets& targets,

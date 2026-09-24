@@ -5,6 +5,11 @@
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
 #include <ATen/cuda/CUDAContext.h>
+#include <ATen/cuda/CUDAGeneratorImpl.h>
+#include "src/backend/models/rfdetr/core/detail/matcher_workspace.h"
+#include "src/backend/models/rfdetr/core/runtime.h"
+#include "src/common/system/execution_policy.h"
+#include "src/common/system/numa_topology.h"
 #include "src/backend/models/rfdetr/augmentation/sampling.h"
 #include <cuda_runtime.h>
 #include <catch2/matchers/catch_matchers.hpp>
@@ -1842,24 +1847,57 @@ TEST_CASE("Production Match-Free masks retain AMP accumulation gradients and cur
   const auto image=torch::rand({2,3,64,64},floats);
   const rfdetr::TrainingStep step(2,1.0,dtype!=torch::kFloat32,dtype);
   std::array<rfdetr::TrainingLoss,2> retained;
+  std::array<std::vector<torch::Tensor>, 2> dn_mask_queries;
   for (std::size_t micro=0;micro<retained.size();++micro) step.forward([&] {
    auto outputs=dn ? model.forward_with_denoising(rfdetr::nested_tensor_from_tensor_list({image[0],image[1]}),targets,{910,0,0,micro}) : model.forward_for_match_free(rfdetr::nested_tensor_from_tensor_list({image[0],image[1]}));
    REQUIRE(outputs.main.sparse_pred_masks.has_value()==config.segmentation); REQUIRE(outputs.aux_outputs.front().sparse_pred_masks.has_value()==config.segmentation); REQUIRE(outputs.enc_outputs->sparse_pred_masks.has_value()==config.segmentation);
+   if (dn && config.segmentation) {
+    REQUIRE(outputs.denoising->main.sparse_pred_masks.has_value());
+    REQUIRE(outputs.denoising->aux_outputs.front().sparse_pred_masks.has_value());
+    dn_mask_queries[micro] = {outputs.denoising->main.sparse_pred_masks->query_features, outputs.denoising->aux_outputs.front().sparse_pred_masks->query_features};
+    for (auto& query : dn_mask_queries[micro]) query.retain_grad();
+   }
    retained[micro]=model.supervision_loss(outputs,targets,{torch::tensor(4.F,floats)},true);
    REQUIRE(torch::isfinite(retained[micro].total).item<bool>());
    REQUIRE((retained[micro].mask_ce.item<float>()>0.F)==(config.mask_ce_loss_coef!=0)); REQUIRE((retained[micro].mask_dice.item<float>()>0.F)==(config.mask_dice_loss_coef!=0));
    REQUIRE(torch::allclose(retained[micro].total,retained[micro].classification+retained[micro].box+retained[micro].giou+retained[micro].mask_ce+retained[micro].mask_dice,1e-5,1e-5));
   });
   for (const auto& loss : retained) step.backward(loss.total);
+
+  for (const auto& layer_queries : dn_mask_queries) for (const auto& query : layer_queries) {
+   REQUIRE(query.grad().defined()); REQUIRE(torch::isfinite(query.grad()).all().item<bool>());
+   REQUIRE(query.grad()[1].count_nonzero().item<int64_t>() == 0);
+   REQUIRE((query.grad()[0].abs().sum().item<float>() > 0) == (mode >= 2));
+  }
   auto parameters=model.named_parameters(true);
-  for (const auto name : {"segmentation_head.bias","segmentation_head.query_features_proj.weight","training_supervision.mask_projection.weight","training_supervision.ground_truth_mlp.linear1.weight"}) {
-   const bool mask_parameter=std::string_view(name)!="training_supervision.ground_truth_mlp.linear1.weight";
+  rfdetr::TrainRequest optimizer_request;
+  optimizer_request.optimizer = rfdetr::TrainOptimizerKind::AdamW;
+  optimizer_request.lr = 1e-3;
+  // Zero decay separates inactive mask gradients from legitimate AdamW decay.
+  optimizer_request.weight_decay = 0.0;
+  auto built = rfdetr::build_optimizer(parameters, optimizer_request);
+  std::unordered_map<std::string, torch::Tensor> before_update;
+  const auto is_mask_parameter = [](std::string_view name) {
+   return name.starts_with("segmentation_head.") || name == "training_supervision.mask_projection.weight";
+  };
+
+  for (const auto name : {"segmentation_head.bias", "segmentation_head.spatial_features_proj.weight", "segmentation_head.query_features_proj.weight",
+       "training_supervision.mask_projection.weight", "training_supervision.ground_truth_mlp.linear1.weight", "class_embed.weight", "bbox_embed.layers.2.weight"}) {
+   const bool mask_parameter = is_mask_parameter(name);
    if (!config.segmentation && mask_parameter) continue;
    auto* parameter=parameters.find(name); REQUIRE(parameter);
    REQUIRE(parameter->grad().defined()); REQUIRE(torch::isfinite(parameter->grad()).all().item<bool>());
    const bool active=!mask_parameter || mode>=2;
    REQUIRE((parameter->grad().abs().sum().item<float>()>0.F)==active);
-   auto before=parameter->detach().clone(); torch::NoGradGuard no_grad; parameter->sub_(parameter->grad()*0.01F); REQUIRE(torch::equal(before,*parameter)==!active);
+   REQUIRE(std::find(built.optimizer.parameter_names().begin(), built.optimizer.parameter_names().end(), name) != built.optimizer.parameter_names().end());
+   before_update.emplace(name, parameter->detach().clone());
+  }
+  built.optimizer.step();
+  for (const auto& [name, before] : before_update) {
+   const auto* parameter = parameters.find(name); REQUIRE(parameter);
+   const bool active = !is_mask_parameter(name) || mode >= 2;
+   REQUIRE(torch::isfinite(*parameter).all().item<bool>());
+   REQUIRE(torch::equal(before, *parameter) == !active);
   }
   const auto timing=model.harvest_supervision_timing(); REQUIRE(timing.completed_leases==0); REQUIRE(timing.outstanding_leases==0);
   auto state=rfdetr::testsupport::clone_normalized_model_state(model);
@@ -1868,5 +1906,111 @@ TEST_CASE("Production Match-Free masks retain AMP accumulation gradients and cur
   const auto restored=resumed.named_parameters(true);
   const auto state_parameter=config.segmentation ? "training_supervision.mask_projection.weight" : "training_supervision.ground_truth_mlp.linear1.weight";
   REQUIRE(torch::equal(*restored.find(state_parameter),*parameters.find(state_parameter)));
+  if (dn && mode == 4) {
+   resumed.train(true); resumed.set_force_pytorch_deformable_attn(true);
+   step.forward([&] {
+    const auto batch = rfdetr::nested_tensor_from_tensor_list({image[0], image[1]});
+    const auto random = at::cuda::detail::getDefaultCUDAGenerator().get_state();
+    const auto continued = model.forward_with_denoising(batch, targets, {910, 1, 0, 0});
+    const auto continued_loss = model.supervision_loss(continued, targets, {torch::tensor(4.F, floats)}, true);
+    auto generator = at::cuda::detail::getDefaultCUDAGenerator(); generator.set_state(random);
+    const auto restored_output = resumed.forward_with_denoising(batch, targets, {910, 1, 0, 0});
+    const auto restored_loss = resumed.supervision_loss(restored_output, targets, {torch::tensor(4.F, floats)}, true);
+    REQUIRE(continued.denoising->mask_sampling_seed == restored_output.denoising->mask_sampling_seed);
+    REQUIRE(torch::equal(continued.denoising->main.sparse_pred_masks->query_features, restored_output.denoising->main.sparse_pred_masks->query_features));
+    REQUIRE(torch::equal(continued_loss.total, restored_loss.total));
+   });
+  }
+ }
+}
+
+TEST_CASE("Production Hungarian DN masks preserve stock draws and accumulated training updates", "[rfdetr][training_supervision][cuda]") {
+ if (mmltk::testsupport::checked_cuda_device_count() == 0) SKIP("CUDA unavailable; Hungarian DN mask training remains unverified");
+ const auto topology = mmltk::common::system::NumaTopology::Capture();
+ const auto placement = mmltk::common::system::resolve_placement(topology, topology.permitted_nodes.front());
+ mmltk::common::system::ScopedExecutionPolicy policy({placement.cpus, {}, 0, placement.numa_node, -10, false});
+ rfdetr::MatcherWorkspace workspace(placement.numa_node, true);
+ rfdetr::ScopedRuntimeContext runtime(nullptr, 0, &workspace);
+ const auto options = torch::TensorOptions().device(torch::kCUDA).dtype(torch::kFloat32);
+ for (const auto dtype : {torch::kFloat32, torch::kFloat16, torch::kBFloat16}) {
+  auto config = rfdetr::native_config_from_preset(rfdetr::model_presets().front());
+  config.resolution = 64; config.segmentation = true; config.num_classes = 3; config.num_queries = 3; config.num_select = 3;
+  config.group_detr = 2; config.dec_layers = 2; config.aux_loss = true; config.two_stage = true;
+  config.training_supervision.denoising.enabled = true; config.training_supervision.denoising.groups = 2;
+  rfdetr::NativeRfDetrModel active(config, rfdetr::testsupport::synthetic_training_layout(2));
+  active.initialize_training_supervision(815); active.to(torch::Device(torch::kCUDA)); active.train(true); active.set_force_pytorch_deformable_attn(true);
+  auto stock_config = config; stock_config.training_supervision = {};
+  rfdetr::NativeRfDetrModel stock(stock_config, rfdetr::testsupport::synthetic_training_layout(2));
+  std::vector<rfdetr::NormalizedModelStateEntry> state;
+  for (const auto& entry : rfdetr::testsupport::clone_normalized_model_state(active)) if (!entry.name.starts_with("training_supervision.")) state.push_back(entry);
+  static_cast<void>(stock.load_normalized_state(state, true)); stock.to(torch::Device(torch::kCUDA)); stock.train(true); stock.set_force_pytorch_deformable_attn(true);
+  rfdetr::DetectionConfig detection;
+  rfdetr::project_loss_coefficients(detection, config);
+  detection.num_classes = config.num_classes; detection.group_detr = config.group_detr; detection.dec_layers = config.dec_layers;
+  detection.num_select = config.num_select; detection.two_stage = config.two_stage; detection.aux_loss = config.aux_loss;
+  detection.include_masks = true; detection.mask_point_sample_ratio = config.mask_point_sample_ratio;
+  detection.ia_bce_loss = config.ia_bce_loss; detection.focal_alpha = config.focal_alpha;
+  detection.set_cost_class = config.set_cost_class; detection.set_cost_bbox = config.set_cost_bbox; detection.set_cost_giou = config.set_cost_giou;
+  rfdetr::populate_default_detection_weight_dict(detection);
+  rfdetr::PreparedTargets targets;
+  targets.all_boxes = torch::tensor({{0.3F, 0.3F, 0.2F, 0.2F}, {0.7F, 0.6F, 0.2F, 0.3F}, {0.2F, 0.7F, 0.1F, 0.2F}, {0.5F, 0.4F, 0.3F, 0.1F}}, options);
+  targets.all_labels = torch::tensor({0, 1, 0, 1}, options.dtype(torch::kInt64)); targets.counts = {4, 0}; targets.offsets = {0, 4};
+  targets.target_counts = torch::tensor(targets.counts, options.dtype(torch::kInt64)); targets.target_offsets = torch::tensor(targets.offsets, options.dtype(torch::kInt64));
+  targets.targets.resize(2);
+  for (size_t image = 0; image < targets.targets.size(); ++image) {
+   targets.targets[image].boxes = targets.all_boxes.narrow(0, targets.offsets[image], targets.counts[image]);
+   targets.targets[image].labels = targets.all_labels.narrow(0, targets.offsets[image], targets.counts[image]);
+  }
+  targets.packed_masks = rfdetr::PackedTargetMasks{torch::tensor({{int64_t{0x3333}}, {int64_t{0xcccc}}, {int64_t{0xffff}}, {int64_t{0}}}, options.dtype(torch::kInt64)), 4, 4};
+  const auto image = torch::rand({2, 3, 64, 64}, options);
+  const rfdetr::TrainingStep step(2, 1.0, dtype != torch::kFloat32, dtype);
+  std::array<rfdetr::ModelOutputs, 2> outputs;
+  std::array<torch::Tensor, 2> losses;
+  for (size_t micro = 0; micro < outputs.size(); ++micro) step.forward([&] {
+   const auto batch = rfdetr::nested_tensor_from_tensor_list({image[0], image[1]});
+   outputs[micro] = active.forward_with_denoising(batch, targets, {815, 3, 0, micro});
+   const auto ordinary = stock.forward(batch, true);
+   REQUIRE_FALSE(ordinary.denoising);
+   REQUIRE(torch::allclose(outputs[micro].main.sparse_pred_masks->query_features, ordinary.main.sparse_pred_masks->query_features, 2e-3, 2e-3));
+   const auto rng = at::cuda::detail::getDefaultCUDAGenerator().get_state();
+   const auto routed = rfdetr::compute_routed_training_loss(active, rfdetr::TrainingSupervisionRoute::HungarianDenoising, outputs[micro], targets, {torch::tensor(4.F, options)}, detection);
+   const auto after_dn = at::cuda::detail::getDefaultCUDAGenerator().get_state();
+   auto generator = at::cuda::detail::getDefaultCUDAGenerator(); generator.set_state(rng);
+   const auto stock_loss = rfdetr::compute_routed_training_loss(stock, rfdetr::TrainingSupervisionRoute::Hungarian, ordinary, targets, {torch::tensor(4.F, options)}, detection);
+   REQUIRE(torch::equal(after_dn, at::cuda::detail::getDefaultCUDAGenerator().get_state()));
+   for (const auto& [name, value] : routed.ordinary_terms) REQUIRE(torch::allclose(value, stock_loss.ordinary_terms.at(name), 2e-3, 2e-3));
+   REQUIRE(routed.total.item<float>() > stock_loss.total.item<float>());
+   outputs[micro].denoising->main.sparse_pred_masks->query_features.retain_grad();
+   outputs[micro].denoising->aux_outputs.front().sparse_pred_masks->query_features.retain_grad();
+   losses[micro] = routed.total;
+  });
+  // K=2 uses the production K-squared scale after leaving forward autocast.
+  for (const auto& loss : losses) step.backward(loss);
+  for (const auto& output : outputs) {
+   for (const auto* layer : {&output.denoising->main, &output.denoising->aux_outputs.front()}) {
+    const auto gradient = layer->sparse_pred_masks->query_features.grad();
+    REQUIRE(gradient.defined()); REQUIRE(torch::isfinite(gradient).all().item<bool>());
+    REQUIRE(gradient[0].abs().sum().item<float>() > 0); REQUIRE(gradient[1].count_nonzero().item<int64_t>() == 0);
+   }
+  }
+  const auto parameters = active.named_parameters(true);
+  rfdetr::TrainRequest optimizer_request;
+  optimizer_request.optimizer = rfdetr::TrainOptimizerKind::AdamW;
+  optimizer_request.lr = 1e-3; optimizer_request.weight_decay = 0.0;
+  auto built = rfdetr::build_optimizer(parameters, optimizer_request);
+  std::unordered_map<std::string, torch::Tensor> before_update;
+  for (const auto name : {"segmentation_head.bias", "segmentation_head.spatial_features_proj.weight", "segmentation_head.query_features_proj.weight",
+       "training_supervision.denoising_label_embedding.weight", "class_embed.weight", "bbox_embed.layers.2.weight"}) {
+   const auto* parameter = parameters.find(name); REQUIRE(parameter); REQUIRE(parameter->grad().defined());
+   REQUIRE(torch::isfinite(parameter->grad()).all().item<bool>()); REQUIRE(parameter->grad().abs().sum().item<float>() > 0);
+   REQUIRE(std::find(built.optimizer.parameter_names().begin(), built.optimizer.parameter_names().end(), name) != built.optimizer.parameter_names().end());
+   before_update.emplace(name, parameter->detach().clone());
+  }
+  built.optimizer.step();
+  for (const auto& [name, before] : before_update) {
+   const auto* parameter = parameters.find(name); REQUIRE(parameter);
+   REQUIRE(torch::isfinite(*parameter).all().item<bool>());
+   REQUIRE_FALSE(torch::equal(before, *parameter));
+  }
  }
 }

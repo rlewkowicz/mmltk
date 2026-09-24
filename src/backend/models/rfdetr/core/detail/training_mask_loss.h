@@ -11,11 +11,22 @@ torch::Tensor mask_coordinates(const torch::Tensor& supplied, int64_t batch, int
 torch::Tensor sample_target_masks(const PackedTargetMasks& masks, const torch::Tensor& indices, const torch::Tensor& coordinates, const char* context);
 torch::Tensor point_sample(const torch::Tensor& input, const torch::Tensor& coordinates, torch::nn::functional::GridSampleFuncOptions::mode_t mode = torch::kBilinear);
 torch::Tensor binary_cross_entropy_with_logits_none(const torch::Tensor& inputs, const torch::Tensor& targets);
-torch::Tensor sigmoid_ce_loss(const torch::Tensor& inputs, const torch::Tensor& targets, const torch::Tensor& count, bool traced);
-torch::Tensor dice_loss(const torch::Tensor& inputs, const torch::Tensor& targets, const torch::Tensor& count, bool traced);
+torch::Tensor sigmoid_ce_loss(const torch::Tensor& inputs, const torch::Tensor& targets, const torch::Tensor& count, bool traced, const torch::Tensor& valid = {});
+torch::Tensor dice_loss(const torch::Tensor& inputs, const torch::Tensor& targets, const torch::Tensor& count, bool traced, const torch::Tensor& valid = {});
 torch::Tensor batch_dice_loss(const torch::Tensor& inputs, const torch::Tensor& targets, bool traced);
 torch::Tensor batch_sigmoid_ce_loss(const torch::Tensor& inputs, const torch::Tensor& targets, bool traced);
 torch::Tensor get_uncertain_point_coords_with_randomness(const torch::Tensor& logits, int64_t points, int64_t oversample, double importance, const LayerMaskSamples& samples);
+// Direct reconstruction materializes only selected queries before bilinear
+// sampling. Pairwise matching deliberately uses a different operation order.
+torch::Tensor empty_sparse_pred_masks(const SparsePredMasks& sparse);
+torch::Tensor matched_sparse_pred_masks_for_batch(const SparsePredMasks& sparse, int64_t batch_index, const torch::Tensor& query_indices);
+int64_t direct_mask_point_count(const torch::Tensor& masks, int64_t ratio);
+struct DirectMaskSamples {
+ torch::Tensor logits;
+ torch::Tensor targets;
+};
+DirectMaskSamples sample_direct_masks(const torch::Tensor& masks, const PreparedTargets& targets,
+ const torch::Tensor& indices, int64_t ratio, const LayerMaskSamples& samples);
 // One uniform draw shared by all image, query and target operands in a layer.
 // Spatial and predicted samples retain autograd; categorical targets do not.
 struct PairwiseMaskSamples {
