@@ -14,10 +14,13 @@
 #include <cerrno>
 #include <chrono>
 #include <csignal>
+#include <cstddef>
+#include <cstdint>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <future>
+#include <limits>
 #include <mutex>
 #include <nlohmann/json.hpp>
 #include <optional>
@@ -50,6 +53,29 @@
 #include "src/common/io/noexcept_io.h"
 namespace mmltk::controller::services {
 namespace {
+constexpr std::array kDiagnosticOwners{
+ std::pair{contracts::DiagnosticOwner::BrowserRuntime, std::string_view{"browser_runtime"}},
+ std::pair{contracts::DiagnosticOwner::BrowserServer, std::string_view{"browser_server"}},
+ std::pair{contracts::DiagnosticOwner::FirefoxProcess, std::string_view{"firefox_process"}},
+ std::pair{contracts::DiagnosticOwner::Explore, std::string_view{"explore"}},
+ std::pair{contracts::DiagnosticOwner::Annotation, std::string_view{"annotation"}},
+ std::pair{contracts::DiagnosticOwner::Upscale, std::string_view{"upscale"}},
+ std::pair{contracts::DiagnosticOwner::Live, std::string_view{"live"}},
+ std::pair{contracts::DiagnosticOwner::Presentation, std::string_view{"presentation"}},
+ std::pair{contracts::DiagnosticOwner::AnnotationResource, std::string_view{"annotation_resource"}},
+ std::pair{contracts::DiagnosticOwner::Training, std::string_view{"training"}},
+};
+static_assert(kDiagnosticOwners.size() == mmltk::frameworks::reflection::enum_entries<contracts::DiagnosticOwner>().size());
+static_assert([] {
+ for (std::size_t index = 0U; index < kDiagnosticOwners.size(); ++index) {
+  const auto [owner, label] = kDiagnosticOwners[index];
+  if (static_cast<std::size_t>(owner) != index || contracts::diagnostic_owner_name(owner) != label) return false;
+ }
+ for (std::size_t value = kDiagnosticOwners.size(); value <= std::numeric_limits<std::uint8_t>::max(); ++value) {
+  if (!contracts::diagnostic_owner_name(static_cast<contracts::DiagnosticOwner>(value)).empty()) return false;
+ }
+ return true;
+}());
 struct DiagnosticCountingClock final {
  using time_point = std::chrono::steady_clock::time_point;
  static inline std::uint64_t reads = 0U;
@@ -315,14 +341,57 @@ TEST_CASE("diagnostics disabled producers perform no submission work", "[gui][se
                                                                                                       return std::pair{RuntimeDiagnosticFact{}, RuntimeDiagnosticFact{}};
                                                                                                      }};
  span.FinishWith([&](auto&) { ++collections; });
- target.Emit([&] {
-  ++collections;
-  static_cast<void>(DiagnosticCountingClock::now());
-  return RuntimeDiagnosticFact{.owner = contracts::DiagnosticOwner::Training, .event = "child.exited"};
- });
+ std::array<RuntimeDiagnosticFact, kDiagnosticOwners.size()> facts{};
+ for (std::size_t index = 0U; index < facts.size(); ++index) {
+  facts[index] = {.owner = kDiagnosticOwners[index].first, .event = "disabled"};
+  target.Emit([&] {
+   ++collections;
+   static_cast<void>(DiagnosticCountingClock::now());
+   return facts[index];
+  });
+  target.write(facts[index]);
+ }
+ target.write_batch(facts);
  CHECK(collections == 0U);
  CHECK(DiagnosticCountingClock::reads == 0U);
  CHECK(DiagnosticSpanIds::issued() == ids);
+ CHECK(diagnostics.counters().accepted == 0U);
+}
+TEST_CASE("runtime diagnostics preserve every owner label and reject unknown owners atomically", "[gui][services]") {
+ mmltk::testsupport::ScopedTempDir temporary{"mmltk-diagnostics-owners"};
+ const auto path = temporary.path() / "trace.jsonl";
+ const int descriptor = ::open(path.c_str(), O_WRONLY | O_CREAT | O_CLOEXEC, S_IRUSR | S_IWUSR);
+ REQUIRE(descriptor >= 0);
+ DiagnosticsClient diagnostics{ScopedFd{descriptor}, DiagnosticsExecutionPolicy::CallerDriven};
+ RuntimeDiagnostics runtime{diagnostics.producer()};
+ const auto target = runtime.target();
+ std::array<RuntimeDiagnosticFact, kDiagnosticOwners.size()> facts{};
+ for (std::size_t index = 0U; index < facts.size(); ++index) {
+  facts[index] = {.owner = kDiagnosticOwners[index].first, .event = "owner.accepted", .sequence = index};
+ }
+ SECTION("single records") {
+  for (const auto& fact : facts) target.write(fact);
+ }
+ SECTION("one batch") { target.write_batch(facts); }
+ REQUIRE(diagnostics.counters().accepted == facts.size());
+ for (std::size_t value = kDiagnosticOwners.size(); value <= std::numeric_limits<std::uint8_t>::max(); ++value) {
+  const RuntimeDiagnosticFact invalid{.owner = static_cast<contracts::DiagnosticOwner>(value), .event = "owner.rejected"};
+  target.write(invalid);
+  const std::array invalid_batch{facts.front(), invalid, facts.back()};
+  target.write_batch(invalid_batch);
+ }
+ CHECK(diagnostics.counters().accepted == facts.size());
+ diagnostics.close();
+ std::ifstream input{path};
+ std::string line;
+ for (std::size_t index = 0U; index < facts.size(); ++index) {
+  REQUIRE(static_cast<bool>(std::getline(input, line)));
+  const auto record = nlohmann::json::parse(line);
+  CHECK(record["owner"] == kDiagnosticOwners[index].second);
+  CHECK(record["sequence"] == index);
+  CHECK(record["event"] == "owner.accepted");
+ }
+ CHECK_FALSE(static_cast<bool>(std::getline(input, line)));
 }
 TEST_CASE("diagnostic spans pair overlapping intervals and explicit asynchronous parents", "[gui][services]") {
  struct Capture final {

@@ -1,5 +1,9 @@
 #pragma once
+#include <array>
+#include <cstddef>
 #include <cstdint>
+#include <meta>
+#include <string>
 #include <string_view>
 #include "src/common/types/strong_id.h"
 #include "src/frameworks/reflection/reflection_metadata.h"
@@ -175,6 +179,37 @@ struct DiagnosticContext final {
  DiagnosticPixel pixel{};
 };
 MMLTK_REFLECT_ENUM(DiagnosticOwner)
+namespace detail {
+inline constexpr auto kDiagnosticOwnerNames = [] consteval {
+ constexpr auto entries = mmltk::frameworks::reflection::enum_entries<DiagnosticOwner>();
+ std::array<std::string_view, entries.size()> names{};
+ for (const auto& entry : entries) {
+  const auto index = static_cast<std::size_t>(entry.value);
+  if (index >= names.size() || !names[index].empty()) throw "diagnostic owners must have dense unique ordinals";
+  std::string label;
+  for (const char character : entry.name) {
+   if (character >= 'A' && character <= 'Z') {
+    if (!label.empty()) label += '_';
+    label += static_cast<char>(character - 'A' + 'a');
+   } else if (character >= 'a' && character <= 'z') {
+    label += character;
+   } else {
+    throw "diagnostic owner identifiers must use alphabetic words";
+   }
+  }
+  if (label.empty()) throw "diagnostic owner labels must not be empty";
+  for (const auto existing : names) {
+   if (existing == label) throw "diagnostic owner labels must be unique";
+  }
+  names[index] = std::define_static_string(label);
+ }
+ return names;
+}();
+}  // namespace detail
+[[nodiscard]] constexpr std::string_view diagnostic_owner_name(const DiagnosticOwner owner) noexcept {
+ const auto index = static_cast<std::size_t>(owner);
+ return index < detail::kDiagnosticOwnerNames.size() ? detail::kDiagnosticOwnerNames[index] : std::string_view{};
+}
 MMLTK_REFLECT_ENUM(DiagnosticSpanOutcome)
 MMLTK_REFLECT_FIELDS(DiagnosticSource)
 MMLTK_REFLECT_FIELDS(DiagnosticDemand)

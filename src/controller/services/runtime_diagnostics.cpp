@@ -11,21 +11,6 @@
 #include <variant>
 namespace mmltk::controller::services {
 namespace {
-[[nodiscard]] std::string_view owner_name(const contracts::DiagnosticOwner owner) noexcept {
- switch (owner) {
-  case contracts::DiagnosticOwner::BrowserRuntime: return "browser_runtime";
-  case contracts::DiagnosticOwner::BrowserServer: return "browser_server";
-  case contracts::DiagnosticOwner::FirefoxProcess: return "firefox_process";
-  case contracts::DiagnosticOwner::Explore: return "explore";
-  case contracts::DiagnosticOwner::Annotation: return "annotation";
-  case contracts::DiagnosticOwner::Upscale: return "upscale";
-  case contracts::DiagnosticOwner::Live: return "live";
-  case contracts::DiagnosticOwner::Presentation: return "presentation";
-  case contracts::DiagnosticOwner::Training: return "training";
-  case contracts::DiagnosticOwner::AnnotationResource: return "annotation_resource";
- }
- return {};
-}
 [[nodiscard]] bool valid_event_name(const std::string_view event) noexcept {
  if (event.empty() || event.size() > 96U) return false;
  for (const unsigned char character : event) {
@@ -91,7 +76,7 @@ private:
     valid = append(",") && string(field.member_name) && append(":");
     if (!valid) return;
     if constexpr (std::is_same_v<Value, contracts::DiagnosticOwner>)
-     valid = string(owner_name(value));
+     valid = string(contracts::diagnostic_owner_name(value));
     else if constexpr (std::is_same_v<Value, std::string_view>)
      valid = string(value);
     else if constexpr (std::is_enum_v<Value>)
@@ -303,7 +288,7 @@ void RuntimeDiagnosticTarget::State::write(const RuntimeDiagnosticFact fact, con
  write(operation, fact, required);
 }
 void RuntimeDiagnosticTarget::State::write(const DiagnosticsProducer::Operation& operation, const RuntimeDiagnosticFact fact, const bool required) const noexcept {
- const std::string_view owner = owner_name(fact.owner);
+ const std::string_view owner = contracts::diagnostic_owner_name(fact.owner);
  if (owner.empty() || !valid_event_name(fact.event) || (!fact.participant.empty() && !valid_event_name(fact.participant))) {
   fail_delivery();
   return;
@@ -331,7 +316,7 @@ void RuntimeDiagnosticTarget::State::write_batch(const std::span<const RuntimeDi
   return;
  }
  for (const auto& fact : facts) {
-  const std::string_view owner = owner_name(fact.owner);
+  const std::string_view owner = contracts::diagnostic_owner_name(fact.owner);
   if (owner.empty() || !valid_event_name(fact.event) || (!fact.participant.empty() && !valid_event_name(fact.participant)) || !valid_message_size(fact)) {
    fail_delivery();
    return;
