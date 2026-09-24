@@ -885,15 +885,16 @@ public:
     auto output_memory_group =
      enc_output_norm->at<torch::nn::LayerNormImpl>(static_cast<size_t>(group_index)).forward(enc_output->at<torch::nn::LinearImpl>(static_cast<size_t>(group_index)).forward(output_memory));
     auto enc_outputs_class = enc_out_class_embed->at<torch::nn::LinearImpl>(static_cast<size_t>(group_index)).forward(output_memory_group);
-    const auto coord_delta = enc_out_bbox_embed->at<RfDetrMlpImpl>(static_cast<size_t>(group_index)).forward(output_memory_group);
-    const torch::Tensor enc_outputs_coord = config_.bbox_reparam ? reparam_box_refine(output_proposals, coord_delta) : coord_delta + output_proposals;
     auto proposal_scores = std::get<0>(enc_outputs_class.max(-1));
     const int64_t topk = std::min<int64_t>(config_.num_queries, enc_outputs_class.size(1));
     auto topk_indices = std::get<1>(proposal_scores.topk(topk, 1));
-    auto gathered_boxes = enc_outputs_coord.gather(1, topk_indices.unsqueeze(-1).expand({batch, topk, 4}));
+    auto selected_memory = output_memory_group.gather(1, topk_indices.unsqueeze(-1).expand({batch, topk, config_.hidden_dim}));
+    const auto selected_proposals = output_proposals.gather(1, topk_indices.unsqueeze(-1).expand({batch, topk, 4}));
+    const auto coord_delta = enc_out_bbox_embed->at<RfDetrMlpImpl>(static_cast<size_t>(group_index)).forward(selected_memory);
+    auto gathered_boxes = config_.bbox_reparam ? reparam_box_refine(selected_proposals, coord_delta) : coord_delta + selected_proposals;
     refpoint_embed_ts.push_back(gathered_boxes.detach());
     boxes_ts.push_back(gathered_boxes);
-    memory_ts.push_back(output_memory_group.gather(1, topk_indices.unsqueeze(-1).expand({batch, topk, config_.hidden_dim})));
+    memory_ts.push_back(std::move(selected_memory));
    }
    enc_memory = torch::cat(memory_ts, 1);
    enc_boxes = config_.bbox_reparam ? torch::cat(boxes_ts, 1) : torch::cat(boxes_ts, 1).sigmoid();

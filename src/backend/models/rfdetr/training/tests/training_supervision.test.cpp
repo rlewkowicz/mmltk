@@ -215,7 +215,7 @@ void test_ema_selection_restores_identity_and_mode() {
   rfdetr::ModelEma::Selection selection(ema, module);
   module.eval();
   REQUIRE(parameters.front().unsafeGetTensorImpl() == identity);
-  REQUIRE(torch::allclose(parameters.front(), original + 1.0));
+  REQUIRE(torch::allclose(parameters.front(), original + 2.0));
   REQUIRE_THROWS(ema.update());
   REQUIRE(ema.completed_updates() == 1);
   throw std::runtime_error("selected evaluation failed");
@@ -240,7 +240,7 @@ void test_ema_tau_updates_continue_after_restore() {
  const auto advance = [&](int64_t next) {
   parameters.front().fill_(static_cast<double>(next));
   const double decay = base_decay * (1.0 - std::exp(-static_cast<double>(next) / tau));
-  expected = decay * expected + (1.0 - decay) * static_cast<double>(next);
+  expected = next == 1 ? 1.0 : decay * expected + (1.0 - decay) * static_cast<double>(next);
   ema.update();
   REQUIRE(ema.completed_updates() == next);
   REQUIRE(torch::allclose(ema.shadow_params().front(), torch::full_like(parameters.front(), expected), 1e-12, 1e-12));

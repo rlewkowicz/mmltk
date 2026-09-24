@@ -70,6 +70,7 @@ mmltk_register_retained_module_importers(
     training_supervision.cpp)
 mmltk_register_ordinary_sources(
     mmltk_backend_models_rfdetr_core
+    segmentation_depthwise.cpp
     gpu_batch_preprocessor.cpp
     detection_geometry.cpp
     detection_types.cpp
@@ -83,12 +84,14 @@ mmltk_register_private_headers(
     detail/lsap_scratch.h
     detail/matcher_workspace.h
     detail/runtime_workspace_fwd.h
+    detail/detection_sampling.h
     detail/traced_loss_cache.h
     detail/detr_matcher_cuda.h
     detail/detection_geometry.h
     detail/mask_pack_cuda.h
     detail/class_tensor_axes.h
     detail/modules_technical.h
+    detail/segmentation_depthwise.h
     detail/scipy_rectangular_lsap.h
     detail/training_mask_ops_cuda.h
     detail/training_mask_ops_cuda_launch.h
@@ -196,6 +199,7 @@ function(mmltk_add_backend_models_rfdetr_core_tests)
     endif()
 
     set(sources
+        ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/upstream_training_parity.test.cpp
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/evaluator.test.cpp
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/matcher_workspace.test.cpp
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/native_ops.test.cpp

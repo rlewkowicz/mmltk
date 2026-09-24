@@ -3,6 +3,7 @@
 #include <optional>
 #include <string>
 #include "src/backend/models/rfdetr/contract/workflow_requests.h"
+#include "src/backend/models/rfdetr/contract/model_config.h"
 #include <torch/types.h>
 #include <torch/serialize.h>
 namespace mmltk::backend::models::rfdetr {
@@ -36,6 +37,8 @@ void write_training_continuation(torch::serialize::OutputArchive&, const TrainRe
 // Empty only for weights-only archives. Requires complete, consistent scalar
 // continuation; the caller admits the optimizer and ordered EMA tensor state.
 [[nodiscard]] std::optional<TrainingContinuation> read_training_continuation(torch::serialize::InputArchive&);
+// Admits the active run before changing its resolved model configuration.
+[[nodiscard]] std::optional<TrainingContinuation> admit_training_configuration(NativeRfDetrConfig&, torch::serialize::InputArchive*, const TrainRequest&);
 void require_active_training_continuation(const TrainingContinuation&, const TrainRequest&);
 }  // namespace detail
 }  // namespace mmltk::backend::models::rfdetr

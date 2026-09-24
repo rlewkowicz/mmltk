@@ -21,6 +21,18 @@ void validate_resume_continuation_manifest(const ResumeContinuationManifest& man
  }
 }
 namespace detail {
+std::optional<TrainingContinuation> admit_training_configuration(NativeRfDetrConfig& config, torch::serialize::InputArchive* archive, const TrainRequest& options) {
+ std::optional<TrainingContinuation> continuation;
+ if (!options.resume_path.empty()) {
+  if (!archive) throw std::runtime_error("--resume requires a native RF-DETR .pt checkpoint: " + options.resume_path.string());
+  continuation = read_training_continuation(*archive);
+  if (!continuation) throw std::runtime_error("--resume requires a full training checkpoint");
+  require_active_training_continuation(*continuation, options);
+ }
+ if (!continuation) apply_stock_training_coefficients(config);
+ config.training_supervision = options.training_supervision;
+ return continuation;
+}
 namespace serialization = mmltk::frameworks::serialization;
 namespace {
 // The flat archive contains only this subset of TrainRequest. Its relation to

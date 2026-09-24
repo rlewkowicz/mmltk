@@ -3,16 +3,18 @@
 #include <format>
 #include <ATen/cuda/CUDAContext.h>
 #include <ATen/ops/_fused_adamw.h>
+#include <ATen/ops/_foreach_norm.h>
+#include <ATen/ops/_foreach_pow.h>
 #include <unordered_set>
 #include <meta>
 #include <type_traits>
 #include <cmath>
 #include <map>
+#include <optional>
 #include <sstream>
 #include <string_view>
 #include <variant>
 #include "src/backend/ml/torch/archive.h"
-#include "src/backend/models/rfdetr/core/model.h"
 #include "src/backend/models/rfdetr/contract/train_recipe.h"
 #include "src/backend/models/rfdetr/core/model_state.h"
 #include <torch/types.h>
@@ -305,16 +307,22 @@ void apply_foreach_adamw_batch(AdamWBatch& batch, const NativeAdamWGroupConfig& 
  torch::_foreach_add_(batch.exp_avgs, batch.grads, 1.0 - kAdamBeta1);
  torch::_foreach_mul_(batch.exp_avg_sqs, kAdamBeta2);
  torch::_foreach_addcmul_(batch.exp_avg_sqs, batch.grads, batch.grads, 1.0 - kAdamBeta2);
- const auto step_value = batch.steps[0].item<double>();
- const double bias_correction1 = 1.0 - std::pow(kAdamBeta1, step_value);
- const double bias_correction2 = 1.0 - std::pow(kAdamBeta2, step_value);
- const double step_size = config.lr / bias_correction1;
- const double bias_correction2_sqrt = std::sqrt(bias_correction2);
+ // Each tensor owns its successful-update age, including delayed gradients and Resume.
+ auto correction1 = at::_foreach_pow(kAdamBeta1, batch.steps);
+ auto correction2 = at::_foreach_pow(kAdamBeta2, batch.steps);
+ torch::_foreach_neg_(correction1);
+ torch::_foreach_add_(correction1, 1.0);
+ torch::_foreach_neg_(correction2);
+ torch::_foreach_add_(correction2, 1.0);
+ torch::_foreach_sqrt_(correction2);
  if (config.amsgrad) { torch::_foreach_maximum_(batch.max_exp_avg_sqs, batch.exp_avg_sqs); }
  auto denoms = torch::_foreach_sqrt(config.amsgrad ? batch.max_exp_avg_sqs : batch.exp_avg_sqs);
- torch::_foreach_div_(denoms, bias_correction2_sqrt);
+ torch::_foreach_div_(denoms, correction2);
  torch::_foreach_add_(denoms, kAdamEps);
- torch::_foreach_addcdiv_(batch.params, batch.exp_avgs, denoms, -step_size);
+ // Fold the first bias correction into the denominator, retaining scalar-list
+ // tensor operations and avoiding any device-to-host age read.
+ torch::_foreach_mul_(denoms, correction1);
+ torch::_foreach_addcdiv_(batch.params, batch.exp_avgs, denoms, -config.lr);
 }
 void apply_fused_adamw_batch(AdamWBatch& batch, const NativeAdamWGroupConfig& config) {
  torch::_foreach_add_(batch.steps, 1.0);
@@ -751,6 +759,30 @@ void NativeMuonWithAuxAdam::read_checkpoint(torch::serialize::InputArchive& arch
 std::vector<std::string> NativeMuonWithAuxAdam::InspectCheckpoint(torch::serialize::InputArchive& archive, const std::unordered_map<std::string, torch::Tensor>& tensors, std::stop_token stop) {
  return inspect_checkpoint<NativeMuonWithAuxAdam>(archive, tensors, stop);
 }
+void NativeOptimizer::clip_grad_norm_(const double max_norm) {
+ torch::NoGradGuard guard;
+ for (auto& [key, bucket] : gradient_buckets_) bucket.clear();
+ gradient_norms_.clear();
+ for (const auto& parameter : parameters()) {
+  const auto& gradient = parameter.grad();
+  if (gradient.defined()) gradient_buckets_[{gradient.device().type(), gradient.device().index(), gradient.scalar_type()}].push_back(gradient);
+ }
+ std::optional<torch::Device> device;
+ for (const auto& [key, gradients] : gradient_buckets_) {
+  if (gradients.empty()) continue;
+  if (!device) device = gradients.front().device();
+  auto local = at::_foreach_norm(gradients, 2.0);
+  for (auto& norm : local) gradient_norms_.push_back(norm.to(*device));
+ }
+ if (gradient_norms_.empty()) return;
+ const auto norm = torch::stack(gradient_norms_).norm(2.0);
+ const auto coefficient = (max_norm / (norm + 1e-6)).clamp_max(1.0);
+ for (auto& [key, gradients] : gradient_buckets_) {
+  if (!gradients.empty()) torch::_foreach_mul_(gradients, coefficient.to(gradients.front().device()));
+  gradients.clear();
+ }
+ gradient_norms_.clear();
+}
 NativeOptimizer::NativeOptimizer(NativeAdamW optimizer) : storage_(std::move(optimizer)) {}
 NativeOptimizer::NativeOptimizer(NativeMuonWithAuxAdam optimizer) : storage_(std::move(optimizer)) {}
 TrainOptimizerKind NativeOptimizer::kind() const { return std::holds_alternative<NativeAdamW>(storage_) ? TrainOptimizerKind::AdamW : TrainOptimizerKind::Muon; }
@@ -856,7 +888,7 @@ std::pair<std::vector<typename Optimizer::Group>, std::vector<typename Optimizer
  }
  return {std::move(optimizer_groups), std::move(optimizer_params)};
 }
-OptimizerBuildResult build_optimizer(NativeRfDetrModel& model, const TrainRequest& options) {
+OptimizerBuildResult build_optimizer(const torch::OrderedDict<std::string, torch::Tensor>& parameters, const TrainRequest& options) {
  struct GroupSpec {
   double lr = 0.0;
   double weight_decay = 0.0;
@@ -866,7 +898,7 @@ OptimizerBuildResult build_optimizer(NativeRfDetrModel& model, const TrainReques
  std::unordered_map<std::string, size_t> group_index;
  std::vector<GroupSpec> groups;
  std::vector<std::pair<std::string, torch::Tensor>> named_params;
- for (const auto& item : model.named_parameters(true)) {
+ for (const auto& item : parameters) {
   const auto& param = item.value();
   if (!param.requires_grad()) { continue; }
   const double lr = parameter_lr(item.key(), options);

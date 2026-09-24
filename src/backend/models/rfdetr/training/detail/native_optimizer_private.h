@@ -1,6 +1,8 @@
 #pragma once
 #include <stop_token>
-#include "src/backend/models/rfdetr/core/model.h"
+#include <map>
+#include <tuple>
+#include <torch/ordered_dict.h>
 #include "src/backend/models/rfdetr/contract/workflow_requests.h"
 #include <cstddef>
 #include <cstdint>
@@ -139,6 +141,7 @@ public:
  void set_lrs(const std::vector<double>& base_lrs, double scale);
  void set_muon_momentum(double momentum);
  void step();
+ void clip_grad_norm_(double max_norm);
  void reserve_checkpoint(mmltk::backend::ml::cuda::TensorReadbackBuffers& readback, std::size_t first_slot) const;
  void save(torch::serialize::OutputArchive& archive, mmltk::backend::ml::cuda::TensorReadbackBuffers& readback, std::size_t first_slot) const;
  void load(torch::serialize::InputArchive& archive);
@@ -147,11 +150,14 @@ public:
 
 private:
  std::variant<NativeAdamW, NativeMuonWithAuxAdam> storage_;
+ using GradientBucketKey = std::tuple<c10::DeviceType, c10::DeviceIndex, c10::ScalarType>;
+ std::map<GradientBucketKey, std::vector<torch::Tensor>> gradient_buckets_;
+ std::vector<torch::Tensor> gradient_norms_;
 };
 struct OptimizerBuildResult {
  NativeOptimizer optimizer;
  std::vector<double> base_lrs;
 };
 bool is_encoder_param(std::string_view name);
-OptimizerBuildResult build_optimizer(NativeRfDetrModel& model, const TrainRequest& options);
+OptimizerBuildResult build_optimizer(const torch::OrderedDict<std::string, torch::Tensor>& parameters, const TrainRequest& options);
 }  // namespace mmltk::backend::models::rfdetr

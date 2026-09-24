@@ -56,6 +56,7 @@ mmltk_register_private_headers(
     detail/training_continuation.h
     detail/model_ema.h
     detail/checkpoint_private.h
+    detail/training_step.h
     detail/training_lanes.h
     detail/training_snapshot.h
     detail/training_metrics.h)
@@ -91,6 +92,7 @@ mmltk_target_precompiled_headers(mmltk_backend_models_rfdetr_training std torch)
 
 function(mmltk_add_backend_models_rfdetr_training_tests)
     set(sources
+        ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/stock_training_parity.test.cpp
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/distributed_placement.test.cpp
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/training_supervision.test.cpp)
     set(ordinary_sources

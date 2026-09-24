@@ -20,4 +20,4 @@ set_target_properties(mmltk_backend_ml_ops PROPERTIES
     CUDA_SEPARABLE_COMPILATION ON
 )
 
-mmltk_register_public_headers(mmltk_backend_ml_ops BASE_DIRS ${CMAKE_SOURCE_DIR} FILES box_iou.h)
+mmltk_register_public_headers(mmltk_backend_ml_ops BASE_DIRS ${CMAKE_SOURCE_DIR} FILES box_iou.h box_geometry.cuh)

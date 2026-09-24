@@ -1,3 +1,4 @@
+#include "detail/segmentation_depthwise.h"
 #include <ATen/TensorIndexing.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
@@ -226,7 +227,7 @@ DepthwiseConvBlockImpl::DepthwiseConvBlockImpl(int64_t dim, double layer_scale_i
 }
 torch::Tensor DepthwiseConvBlockImpl::forward(torch::Tensor x) {
  const auto residual = x;
- x = dwconv->forward(x);
+ x = segmentation_depthwise(x, dwconv->weight, dwconv->bias);
  x = x.permute({0, 2, 3, 1});
  x = norm->forward(x);
  x = pwconv1->forward(x);
@@ -302,7 +303,7 @@ std::vector<Output> SegmentationHeadImpl::collect_head_outputs(
   return outputs;
  }
  if (query_features.size() != 1) { throw std::runtime_error("SegmentationHead skip_blocks mode requires exactly one query feature tensor"); }
- outputs.push_back(make_output(resized_features, project_query_features(query_features.front())));
+ outputs.push_back(make_output(project_spatial_features(resized_features), project_query_features(query_features.front())));
  return outputs;
 }
 std::vector<torch::Tensor> SegmentationHeadImpl::forward(

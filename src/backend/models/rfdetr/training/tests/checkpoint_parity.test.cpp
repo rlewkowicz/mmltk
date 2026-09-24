@@ -4,6 +4,7 @@
 #include <filesystem>
 #include "src/backend/models/rfdetr/contract/model_config.h"
 #include "src/backend/models/rfdetr/training/checkpoint.h"
+#include "src/backend/models/rfdetr/training/detail/training_continuation.h"
 // RF-DETR training checkpoint parity coverage.
 #include <optional>
 #include <sstream>
@@ -59,6 +60,7 @@ void assert_clean_summary(const ModelStateLoadSummary& summary, const std::strin
 }
 void write_module_upstream_checkpoint(const fs::path& path, const NativeRfDetrModel& module) {
  mmltk::backend::models::rfdetr::DecodedNativeModelState state;
+ state.metadata.cls_loss_coef=7.3; state.metadata.bbox_loss_coef=9.1; state.metadata.mask_ce_loss_coef=8.2;
  const auto& technical_module = (module);
  mmltk::backend::models::rfdetr::testsupport::set_synthetic_model_state(state, clone_normalized_model_state(technical_module, true));
  mmltk::backend::models::rfdetr::write_upstream_model_state(path, state);
@@ -108,6 +110,15 @@ void run_checkpoint_parity_case(const ParityFixtureCase& fixture, size_t index, 
  if (!fs::exists(native_path)) { throw std::runtime_error("failed to write native checkpoint parity fixture"); }
  if (normalized.metadata.preset_name != fixture.preset_name) { throw std::runtime_error("normalized checkpoint preset mismatch for parity fixture"); }
  const auto artifacts = mmltk::backend::models::rfdetr::resolve_model_artifacts(upstream_path, {}, 0);
+ REQUIRE(artifacts.config.cls_loss_coef==7.3); REQUIRE(artifacts.config.bbox_loss_coef==9.1); REQUIRE(artifacts.config.mask_ce_loss_coef==8.2);
+ for(const auto& path:{upstream_path,native_path}) {
+  auto admitted=mmltk::backend::models::rfdetr::resolve_model_state(path,{},0);
+  mmltk::backend::models::rfdetr::TrainRequest fresh; fresh.weights_path=path;
+  REQUIRE_FALSE(model_detail::admit_training_configuration(admitted.artifacts.config,admitted.model_state.admitted_archive(),fresh).has_value());
+  REQUIRE(admitted.artifacts.config.cls_loss_coef==1.0); REQUIRE(admitted.artifacts.config.bbox_loss_coef==5.0);
+  REQUIRE(admitted.artifacts.config.mask_ce_loss_coef==(admitted.artifacts.config.segmentation?5.0:1.0));
+  REQUIRE(admitted.model_state.metadata.cls_loss_coef==7.3);
+ }
  NativeRfDetrModel upstream_model(artifacts.config);
  NativeRfDetrModel native_model(artifacts.config);
  log_fixture_phase("test_rfdetr_checkpoint_parity", index, total, "load", fixture.preset_name);

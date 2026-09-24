@@ -603,8 +603,8 @@ MatchFreeCost TrainingSupervisionImpl::broadcast_cost(const torch::Tensor& padde
  const auto correction = (positive - negative).gather(-1, label_index).permute({0, 1, 3, 2});
  auto classification = negative_sum + correction;
  auto box = (boxes.unsqueeze(-3) - padded_boxes.unsqueeze(1).unsqueeze(-2)).abs().sum(-1);
- auto giou = 1.0F - batched_pairwise_generalized_box_iou(box_cxcywh_to_xyxy(padded_boxes.unsqueeze(1).expand({batch, layout.groups, padded_boxes.size(1), 4}), BoxExtentPolicy::Preserve),
-                     box_cxcywh_to_xyxy(boxes, BoxExtentPolicy::Preserve));
+ auto giou = 1.0F - batched_pairwise_generalized_box_iou(box_cxcywh_to_xyxy(padded_boxes.unsqueeze(1).expand({batch, layout.groups, padded_boxes.size(1), 4})),
+                     box_cxcywh_to_xyxy(boxes));
  const auto valid = valid_rows.unsqueeze(1).unsqueeze(-1);
  classification = torch::where(valid, classification, torch::zeros_like(classification));
  box = torch::where(valid, box, torch::zeros_like(box));
@@ -676,7 +676,7 @@ TrainingLoss TrainingSupervisionImpl::denoising_loss(const DenoisingOutputs& out
    const auto positive = config_.focal_alpha * (1.0 - probability).square() * F::softplus(-logits);
    auto classification = negative.sum(-1) + (positive - negative).gather(-1, labels.unsqueeze(-1)).squeeze(-1);
    auto box = (layer->pred_boxes.to(torch::kFloat32) - targets).abs().sum(-1);
-   auto giou = 1.0F - aligned_generalized_box_iou(box_cxcywh_to_xyxy(layer->pred_boxes.to(torch::kFloat32), BoxExtentPolicy::Preserve), box_cxcywh_to_xyxy(targets, BoxExtentPolicy::Preserve));
+   auto giou = 1.0F - aligned_generalized_box_iou(box_cxcywh_to_xyxy(layer->pred_boxes.to(torch::kFloat32)), box_cxcywh_to_xyxy(targets));
    classification = torch::where(valid, classification, torch::zeros_like(classification));
    box = torch::where(valid, box, torch::zeros_like(box));
    giou = torch::where(valid, giou, torch::zeros_like(giou));

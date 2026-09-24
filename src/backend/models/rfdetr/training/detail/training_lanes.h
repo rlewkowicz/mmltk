@@ -48,7 +48,7 @@ public:
  TrainingLanes& operator=(const TrainingLanes&) = delete;
  // CLEANUP-IGNORE: This API declaration repeats its out-of-line definition's parameter types, not implementation.
  std::future<TrainLaneResult> enqueue(RuntimeContext* runtime, mmltk::backend::data::DatasetLoader& loader, const mmltk::backend::data::Batch& batch,
-  const mmltk::backend::ml::cuda::CudaEventPool::Lease* params_ready, mmltk::backend::ml::cuda::CudaEventPool& event_pool, double scaled_loss_factor, size_t parameter_version,
+  const mmltk::backend::ml::cuda::CudaEventPool::Lease* params_ready, mmltk::backend::ml::cuda::CudaEventPool& event_pool, std::size_t admitted_microbatches, double gradient_scale, size_t parameter_version,
   const DetectionConfig& detection_config, const NativeRfDetrModel& model, int device_id, int image_height, int image_width, std::uint64_t seed, int epoch, int rank,
   std::uint64_t augmentation_sequence, bool amp_enabled, at::ScalarType autocast_dtype, TrainingSupervisionRoute route, std::shared_ptr<WaveTargetNormalizer> wave_normalizer, std::size_t lane_index);
  void merge(TrainLaneResult&, std::vector<torch::Tensor>&, int device_id);

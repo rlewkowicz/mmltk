@@ -1,5 +1,7 @@
 #include "src/backend/models/rfdetr/contract/model_config.h"
+#include <algorithm>
 #include <array>
+#include <meta>
 #include <cctype>
 #include <cstddef>
 #include <filesystem>
@@ -85,6 +87,14 @@ const PresetCatalogEntry* infer_model_preset_from_path(const std::filesystem::pa
   consider_known_aliases(preset, normalized, best, best_score);
  }
  return best;
+}
+void apply_stock_training_coefficients(NativeRfDetrConfig& config) {
+ // Weight metadata describes its artifact. A fresh run takes the current recipe;
+ // exact Resume never enters this operation.
+ const auto task = config.segmentation ? ModelTask::Segmentation : ModelTask::Detection;
+ const auto preset = std::ranges::find(kPresetCatalog, task, &PresetCatalogEntry::task);
+ const auto stock = native_config_from_preset(*preset);
+ project_loss_coefficients(config, stock);
 }
 NativeRfDetrConfig native_config_from_preset(const PresetCatalogEntry& preset) {
  return {

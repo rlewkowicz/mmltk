@@ -1,11 +1,11 @@
 #include "src/backend/ml/cuda/torch_cuda_utils.h"
 #include "detail/training_snapshot.h"
 #include "detail/training_lanes.h"
+#include "detail/training_step.h"
 #include "detail/training_metrics.h"
 #include <ATen/cuda/CUDAContext.h>
 #include <torch/version.h>
 #include <torch/csrc/autograd/autograd.h>
-#include <torch/nn/utils/clip_grad.h>
 #include <c10/core/InferenceMode.h>
 #include "src/backend/models/rfdetr/core/evaluator.h"
 #include "src/backend/models/rfdetr/core/class_layout.h"
@@ -211,8 +211,6 @@ void apply_detection_scale(DetectionConfig& detection_config, const NativeRfDetr
 void apply_detection_mask_supervision(DetectionConfig& detection_config, const NativeRfDetrConfig& config) {
  detection_config.include_masks = config.segmentation;
  detection_config.mask_point_sample_ratio = config.mask_point_sample_ratio;
- detection_config.mask_ce_loss_coef = config.mask_ce_loss_coef;
- detection_config.mask_dice_loss_coef = config.mask_dice_loss_coef;
 }
 // Which classification loss formulation the criterion evaluates, and how its ops are executed.
 void apply_detection_loss_terms(DetectionConfig& detection_config, const NativeRfDetrConfig& config, const CompilationMode compilation_mode) {
@@ -226,15 +224,13 @@ void apply_detection_loss_terms(DetectionConfig& detection_config, const NativeR
 }
 // Box loss weights and the matching costs that pair predictions with targets.
 void apply_detection_box_weights(DetectionConfig& detection_config, const NativeRfDetrConfig& config) {
- detection_config.cls_loss_coef = config.cls_loss_coef;
- detection_config.bbox_loss_coef = config.bbox_loss_coef;
- detection_config.giou_loss_coef = config.giou_loss_coef;
  detection_config.set_cost_class = config.set_cost_class;
  detection_config.set_cost_bbox = config.set_cost_bbox;
  detection_config.set_cost_giou = config.set_cost_giou;
 }
 DetectionConfig make_detection_config(const NativeRfDetrConfig& config, int64_t world_size, CompilationMode compilation_mode) {
  DetectionConfig detection_config;
+ project_loss_coefficients(detection_config, config);
  apply_detection_scale(detection_config, config, world_size);
  apply_detection_mask_supervision(detection_config, config);
  apply_detection_loss_terms(detection_config, config, compilation_mode);
@@ -312,6 +308,9 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
  DistributedContext distributed = make_distributed_context(options);
  const bool main_process = is_rank_zero(distributed);
  const int train_lane_count = train_runtime.split().lane_threads;
+ // RF-DETR returns loss/K and Lightning's accumulation closure divides by K
+ // again. Keep this common loop scale independent of criterion normalization.
+ const auto admitted_microbatches = micro_batches_per_optimizer_step(options, train_lane_count);
  TrainingEventOwner training_events(options.device_id, static_cast<std::size_t>(train_lane_count) + 1U);
  ScopedRuntimeContext worker_scope(&train_runtime);
  auto make_loader_config_for = [&](const std::filesystem::path& compiled_path, size_t loader_batch_size, bool shuffle, int prefetch_factor, bool shard_batches, bool drop_last) {
@@ -351,15 +350,8 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
  auto admitted = resolve_model_state(artifact_request.weights_path, artifact_request.preset_name, artifact_request.resolution, options.class_layout_path);
  auto artifacts = admitted.artifacts;
  auto original_descriptor = options.class_layout_path;
- std::optional<detail::TrainingContinuation> continuation;
- if (!options.resume_path.empty()) {
-  if (!admitted.model_state.admitted_archive()) { throw std::runtime_error("--resume requires a native RF-DETR .pt checkpoint: " + options.resume_path.string()); }
-  continuation = detail::read_training_continuation(*admitted.model_state.admitted_archive());
-  if (!continuation) throw std::runtime_error("--resume requires a full training checkpoint");
-  detail::require_active_training_continuation(*continuation, options);
-  original_descriptor = continuation->values.training_original_descriptor;
- }
- artifacts.config.training_supervision = options.training_supervision;
+ auto continuation = detail::admit_training_configuration(artifacts.config, admitted.model_state.admitted_archive(), options);
+ if (continuation) original_descriptor = continuation->values.training_original_descriptor;
  dataset_limits.automatic_num_queries_cap = checked_cast<std::size_t>(artifacts.automatic_num_queries_cap, "RF-DETR automatic query cap exceeds size_t");
  const ResolvedDatasetLimit required_query_limit = resolve_dataset_query_limit(dataset_limits.largest_max_instances, 0U, dataset_limits.automatic_num_queries_cap);
  const ResolvedDatasetLimit requested_query_limit = resolve_dataset_query_limit(dataset_limits.largest_max_instances, options.num_queries, dataset_limits.automatic_num_queries_cap);
@@ -459,7 +451,7 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
    if (is_encoder_param(item.key())) { item.value().set_requires_grad(false); }
   }
  }
- auto optimizer_build = build_optimizer(model, options);
+ auto optimizer_build = build_optimizer(model.named_parameters(true), options);
  auto& optimizer = optimizer_build.optimizer;
  auto& all_params = optimizer.parameters();
  const auto& all_param_names = optimizer.parameter_names();
@@ -699,7 +691,7 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
    apply_optimizer_schedule(current_step);
    average_gradients(distributed, all_params);
    const auto found_inf = grad_scaler.check_and_unscale_(optimizer);
-   if (options.clip_max_norm > 0.0) { torch::nn::utils::clip_grad_norm_(all_params, options.clip_max_norm); }
+   if (options.clip_max_norm > 0.0) { optimizer.clip_grad_norm_(options.clip_max_norm); }
    const TrainingMetricSnapshot metrics = metric_handoff.complete_step(found_inf, wave_micro_batches, local_micro_batches);
    auto scalars = metrics.scalars;
    scalars.learning_rate = last_training_progress.scalars.learning_rate;
@@ -726,12 +718,12 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
    if (gradient_overflow) {
     const TensorMap empty_loss_report;
     const auto& report = loss_report != nullptr ? *loss_report : empty_loss_report;
-    overflow_details = format_nonfinite_loss_report(report, all_params, all_param_names);
+    mmltk::common::logging::warn([&](auto&) { overflow_details = format_nonfinite_loss_report(report, all_params, all_param_names); });
    }
    grad_scaler.step(optimizer, gradient_overflow);
    grad_scaler.update(gradient_overflow);
    optimizer.zero_grad(true);
-   if (ema.has_value() && !gradient_overflow) { ema->update(); }
+   if (ema.has_value()) { ema->update(); }
    if (gradient_overflow) {
     mmltk::common::logging::warn([&](auto& logger) { logger.warn("skipped RF-DETR optimizer update after gradient overflow{}", overflow_details); });
    }
@@ -798,52 +790,53 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
      active_normalizer = DeviceLossNormalizer{target_count.select(0, 0)};
     }
     SupervisionTimingLease step_timing(model_owner, route_is_active(training_route), SupervisionTimingLease::Kind::Step);
-    mmltk::backend::ml::cuda::TorchAutocastScope autocast_guard(amp_enabled, autocast_dtype);
     TargetConsumerLease target_consumer(target_scratch, prepared, options.device_id);
-    ModelOutputs outputs;
-    if (route_is_active(training_route)) {
-     if (route_uses_denoising(training_route)) {
-      mmltk::common::logging::ScopedProfile profile_rfdetr_train_targets_handoff{"rfdetr.train.targets_handoff"};
-      target_consumer.handoff();
-      outputs = model.forward_with_denoising(NestedTensor{normalized, prepared.nested_mask}, prepared,
-       TrainingStepIdentity{static_cast<std::uint64_t>(options.seed), static_cast<std::uint64_t>(epoch), static_cast<std::uint32_t>(distributed.rank), local_full_batches - 1});
+    const TrainingStep step(admitted_microbatches, grad_scaler.enabled() ? grad_scaler.current_scale() : 1.0, amp_enabled, autocast_dtype);
+    step.forward([&] {
+     ModelOutputs outputs;
+     if (route_is_active(training_route)) {
+      if (route_uses_denoising(training_route)) {
+       mmltk::common::logging::ScopedProfile profile_rfdetr_train_targets_handoff{"rfdetr.train.targets_handoff"};
+       target_consumer.handoff();
+       outputs = model.forward_with_denoising(NestedTensor{normalized, prepared.nested_mask}, prepared,
+        TrainingStepIdentity{static_cast<std::uint64_t>(options.seed), static_cast<std::uint64_t>(epoch), static_cast<std::uint32_t>(distributed.rank), local_full_batches - 1});
+      } else {
+       mmltk::common::logging::ScopedProfile profile_rfdetr_train_forward{"rfdetr.train.forward"};
+       outputs = model.forward_for_match_free(NestedTensor{normalized, prepared.nested_mask});
+       target_consumer.handoff();
+      }
+      SupervisionTimingLease criterion_timing(model_owner, true, SupervisionTimingLease::Kind::Criterion);
+      auto routed = compute_routed_training_loss(model, training_route, outputs, prepared, *active_normalizer, detection_config);
+      criterion_timing.finish();
+      loss = std::move(routed.total);
+      class_loss = std::move(routed.classification);
+      box_loss = std::move(routed.box);
+      loss_dict = std::move(routed.ordinary_terms);
+      scalar_values = std::move(routed.scalars);
      } else {
       mmltk::common::logging::ScopedProfile profile_rfdetr_train_forward{"rfdetr.train.forward"};
-      outputs = model.forward_for_match_free(NestedTensor{normalized, prepared.nested_mask});
+      outputs = model.forward(NestedTensor{normalized, prepared.nested_mask}, true);
+      mmltk::common::logging::ScopedProfile profile_rfdetr_train_targets_handoff{"rfdetr.train.targets_handoff"};
       target_consumer.handoff();
+      mmltk::common::logging::ScopedProfile profile_rfdetr_train_loss_dict{"rfdetr.train.loss_dict"};
+      loss_dict = detection_loss_dict(outputs, prepared, detection_config, true, distributed.enabled,
+       distributed.enabled ? AllReduceTensorFn([&distributed](torch::Tensor& value) { distributed_all_reduce_tensor(distributed, value); }) : AllReduceTensorFn{});
      }
-     SupervisionTimingLease criterion_timing(model_owner, true, SupervisionTimingLease::Kind::Criterion);
-     auto routed = compute_routed_training_loss(model, training_route, outputs, prepared, *active_normalizer, detection_config);
-     criterion_timing.finish();
-     loss = std::move(routed.total);
-     class_loss = std::move(routed.classification);
-     box_loss = std::move(routed.box);
-     loss_dict = std::move(routed.ordinary_terms);
-     scalar_values = std::move(routed.scalars);
-    } else {
-     mmltk::common::logging::ScopedProfile profile_rfdetr_train_forward{"rfdetr.train.forward"};
-     outputs = model.forward(NestedTensor{normalized, prepared.nested_mask}, true);
-     mmltk::common::logging::ScopedProfile profile_rfdetr_train_targets_handoff{"rfdetr.train.targets_handoff"};
-     target_consumer.handoff();
-     mmltk::common::logging::ScopedProfile profile_rfdetr_train_loss_dict{"rfdetr.train.loss_dict"};
-     loss_dict = detection_loss_dict(outputs, prepared, detection_config, true, distributed.enabled,
-      distributed.enabled ? AllReduceTensorFn([&distributed](torch::Tensor& value) { distributed_all_reduce_tensor(distributed, value); }) : AllReduceTensorFn{});
-    }
-    if (!route_is_active(training_route)) {
-     mmltk::common::logging::ScopedProfile profile_rfdetr_train_loss_total{"rfdetr.train.loss_total"};
-     torch::Tensor auxiliary;
-     loss = weighted_detection_loss(loss_dict, detection_config, normalized.device(), &auxiliary);
-     scalar_values = ordinary_scalar_tensors(loss_dict, loss, auxiliary);
-     class_loss = loss_value_or_zero(loss_dict, normalized.device(), "loss_ce");
-     box_loss = loss_value_or_zero(loss_dict, normalized.device(), "loss_bbox");
-    }
+     if (!route_is_active(training_route)) {
+      mmltk::common::logging::ScopedProfile profile_rfdetr_train_loss_total{"rfdetr.train.loss_total"};
+      torch::Tensor auxiliary;
+      loss = weighted_detection_loss(loss_dict, detection_config, normalized.device(), &auxiliary);
+      scalar_values = ordinary_scalar_tensors(loss_dict, loss, auxiliary);
+      class_loss = loss_value_or_zero(loss_dict, normalized.device(), "loss_ce");
+      box_loss = loss_value_or_zero(loss_dict, normalized.device(), "loss_bbox");
+     }
+    });
     metric_handoff.accumulate(loss, class_loss, box_loss, scalar_values);
     ++local_micro_batches;
     ++local_waves;
-    const auto scaled_loss = grad_scaler.scale(loss.div(static_cast<double>(options.grad_accum_steps)));
     {
      mmltk::common::logging::ScopedProfile profile_rfdetr_train_backward{"rfdetr.train.backward"};
-     scaled_loss.backward();
+     step.backward(loss);
      train_runtime.matcher_workspace().complete_assignments(torch_cuda::getCurrentCUDAStream(torch_cuda::checked_device_index(options.device_id)).stream());
     }
     target_consumer.retire();
@@ -859,12 +852,11 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
    while (local_full_batches < usable_full_batches) {
     metric_handoff.begin_wave();
     const double current_scale = grad_scaler.enabled() ? static_cast<double>(grad_scaler.current_scale()) : 1.0;
-    const double scaled_loss_factor = current_scale / static_cast<double>(micro_batches_per_optimizer_step(options, train_lane_count));
     ParallelTrainingWave<TrainLaneResult> wave(static_cast<std::size_t>(train_lane_count), route_is_active(training_route) || distributed.enabled, options.device_id, distributed);
     for (int lane_index = 0; lane_index < train_lane_count; ++lane_index) {
      auto batch = next_train_full_batch();
      if (!batch.has_value()) { throw std::runtime_error("native RF-DETR training ended an epoch with an incomplete parallel train wave"); }
-     wave.add(train_lanes.enqueue(&train_runtime, train_loader, *batch, params_ready ? &*params_ready : nullptr, training_events.pool(), scaled_loss_factor, parameter_version, detection_config, model,
+     wave.add(train_lanes.enqueue(&train_runtime, train_loader, *batch, params_ready ? &*params_ready : nullptr, training_events.pool(), admitted_microbatches, current_scale, parameter_version, detection_config, model,
       options.device_id, static_cast<int>(train_loader.image_height()), static_cast<int>(train_loader.image_width()), static_cast<std::uint64_t>(options.seed), epoch, distributed.rank,
       local_full_batches - 1, amp_enabled, autocast_dtype, training_route, wave.normalizer(), static_cast<std::size_t>(lane_index)));
     }

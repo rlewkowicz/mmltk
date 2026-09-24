@@ -12,5 +12,6 @@ std::vector<std::pair<torch::Tensor, torch::Tensor>> matcher_indices(const Model
 TensorMap detection_loss_dict(
  const ModelOutputs& outputs, const PreparedTargets& targets, const DetectionConfig& config, bool training_mode, bool distributed_enabled, const AllReduceTensorFn& distributed_all_reduce = {});
 TensorMap detection_loss_dict(const ModelOutputs& outputs, const PreparedTargets& targets, const DetectionConfig& config, bool training_mode, double num_boxes_value);
+TensorMap detection_loss_dict(const ModelOutputs& outputs, const PreparedTargets& targets, const DetectionConfig& config, bool training_mode, const torch::Tensor& num_boxes_value);
 torch::Tensor weighted_detection_loss(const TensorMap& loss_dict, const DetectionConfig& config, const torch::Device& device, torch::Tensor* auxiliary_weighted = nullptr);
 }  // namespace mmltk::backend::models::rfdetr

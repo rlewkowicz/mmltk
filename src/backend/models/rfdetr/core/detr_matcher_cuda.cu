@@ -1,4 +1,5 @@
 #include "detail/detr_matcher_cuda.h"
+#include "src/backend/ml/ops/box_geometry.cuh"
 #include <ATen/ATen.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -12,26 +13,10 @@
 namespace mmltk::backend::models::rfdetr {
 __device__ __forceinline__ float stable_softplus(float value) { return fmaxf(value, 0.0f) + log1pf(expf(-fabsf(value))); }
 __device__ __forceinline__ float cxcywh_generalized_iou(const float* lhs, const float* rhs) {
- const float lhs_x1 = lhs[0] - lhs[2] * 0.5f;
- const float lhs_y1 = lhs[1] - lhs[3] * 0.5f;
- const float lhs_x2 = lhs[0] + lhs[2] * 0.5f;
- const float lhs_y2 = lhs[1] + lhs[3] * 0.5f;
- const float rhs_x1 = rhs[0] - rhs[2] * 0.5f;
- const float rhs_y1 = rhs[1] - rhs[3] * 0.5f;
- const float rhs_x2 = rhs[0] + rhs[2] * 0.5f;
- const float rhs_y2 = rhs[1] + rhs[3] * 0.5f;
- const float intersection_width = fmaxf(0.0f, fminf(lhs_x2, rhs_x2) - fmaxf(lhs_x1, rhs_x1));
- const float intersection_height = fmaxf(0.0f, fminf(lhs_y2, rhs_y2) - fmaxf(lhs_y1, rhs_y1));
- const float intersection = intersection_width * intersection_height;
- const float lhs_area = fmaxf(0.0f, lhs_x2 - lhs_x1) * fmaxf(0.0f, lhs_y2 - lhs_y1);
- const float rhs_area = fmaxf(0.0f, rhs_x2 - rhs_x1) * fmaxf(0.0f, rhs_y2 - rhs_y1);
- const float union_area = lhs_area + rhs_area - intersection;
- const float enclosing_width = fmaxf(lhs_x2, rhs_x2) - fminf(lhs_x1, rhs_x1);
- const float enclosing_height = fmaxf(lhs_y2, rhs_y2) - fminf(lhs_y1, rhs_y1);
- const float enclosing_area = fmaxf(0.0f, enclosing_width) * fmaxf(0.0f, enclosing_height);
- const float iou = union_area > 0.0f ? intersection / union_area : 0.0f;
- const float result = enclosing_area > 0.0f ? iou - (enclosing_area - union_area) / enclosing_area : iou;
- return isfinite(result) ? result : 0.0f;
+ float a[4], b[4];
+ mmltk::backend::ml::ops::box_geometry::corners(lhs, a);
+ mmltk::backend::ml::ops::box_geometry::corners(rhs, b);
+ return mmltk::backend::ml::ops::box_geometry::pair(a, b).giou();
 }
 namespace {
 struct MatcherPair final {
@@ -77,7 +62,7 @@ __global__ void matcher_cost_kernel(float* output, const Logit* pred_logits, con
  const float l1 = fabsf(prediction_float[0] - target[0]) + fabsf(prediction_float[1] - target[1]) + fabsf(prediction_float[2] - target[2]) + fabsf(prediction_float[3] - target[3]);
  const float giou = cxcywh_generalized_iou(prediction_float, target);
  const float cost = class_cost * (positive_class_cost - negative_class_cost) + bbox_cost * l1 - giou_cost * giou;
- output[output_index] = isfinite(cost) ? cost : 0.0f;
+ output[output_index] = cost;
 }
 template <typename Logit>
 __global__ void matcher_mask_cost_kernel(float* output, const Logit* pred_logits, const float* target_masks, const int64_t* target_offsets, const int64_t* target_counts, const int64_t* output_offsets,
@@ -112,9 +97,9 @@ __global__ void matcher_mask_cost_kernel(float* output, const Logit* pred_logits
  if (lane == 0) {
   const float ce = ce_sum / static_cast<float>(point_count);
   const float dice = 1.0f - (2.0f * intersection + 1.0f) / (probability_sum + target_sum + 1.0f);
-  const float current = isfinite(output[output_index]) ? output[output_index] : 0.0f;
+  const float current = output[output_index];
   const float updated = current + ce_cost * ce + dice_cost * dice;
-  output[output_index] = isfinite(updated) ? updated : current;
+  output[output_index] = updated;
  }
 }
 void check_matcher_tensor(const torch::Tensor& tensor, c10::ScalarType dtype, int64_t dimensions, const char* name) {
@@ -229,7 +214,6 @@ void pairwise_mask_cost_cuda_add_(const torch::Tensor& output, const torch::Tens
  constexpr int warps_per_block = threads / 32;
  const int64_t pair_count = checked_extent({batch, queries, max_targets}, static_cast<int64_t>(std::numeric_limits<int>::max()) * warps_per_block, "matcher mask cost");
  if (pair_count == 0) { return; }
- if (pred_mask_logits.size(2) == 0) { return; }
  const int blocks = static_cast<int>((pair_count + warps_per_block - 1) / warps_per_block);
  AT_DISPATCH_FLOATING_TYPES_AND2(at::ScalarType::Half, at::ScalarType::BFloat16, pred_mask_logits.scalar_type(), "pairwise_mask_cost", [&] {
   matcher_mask_cost_kernel<scalar_t><<<blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(output.data_ptr<float>(), pred_mask_logits.data_ptr<scalar_t>(), target_masks.data_ptr<float>(),

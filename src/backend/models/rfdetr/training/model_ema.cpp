@@ -20,8 +20,12 @@ void ModelEma::update() {
  const double updates = static_cast<double>(completed_updates_ + 1);
  const double decay = tau_ > 0.0 ? decay_ * (1.0 - std::exp(-updates / tau_)) : decay_;
  torch::NoGradGuard guard;
- at::_foreach_mul_(shadow_, decay);
- at::_foreach_add_(shadow_, source_, 1.0 - decay);
+ if (completed_updates_ == 0) {
+  for (std::size_t index = 0; index < shadow_.size(); ++index) shadow_[index].copy_(source_[index]);
+ } else {
+  at::_foreach_mul_(shadow_, decay);
+  at::_foreach_add_(shadow_, source_, 1.0 - decay);
+ }
  ++completed_updates_;
 }
 ModelEma::ModelEma(const std::vector<torch::Tensor>& parameters, ShadowCandidate candidate, double decay, double tau, int64_t completed_updates)

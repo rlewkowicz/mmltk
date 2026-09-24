@@ -133,7 +133,7 @@ void GradScaler::ensure_device_state(const torch::Device& device) {
  inverse_scale_device_ = torch::ones({}, options);
 }
 double compute_lr_scale(const LrScheduleConfig& config, const int64_t step, const int64_t steps_per_epoch, const int64_t total_steps) {
- const double warmup = static_cast<double>(steps_per_epoch) * config.warmup_epochs;
+ const double warmup = std::trunc(static_cast<double>(steps_per_epoch) * config.warmup_epochs);
  if (warmup > 0.0 && static_cast<double>(step) < warmup) return static_cast<double>(step) / std::max(1.0, warmup);
  if (config.lr_scheduler == TrainLrSchedulerKind::Cosine) {
   const double progress = static_cast<double>(step) - warmup;
@@ -185,7 +185,7 @@ RoutedTrainingLoss compute_routed_training_loss(NativeRfDetrModel& model, const 
   return {loss.total, loss.classification, loss.box + loss.giou, {}, std::move(scalars)};
  }
  const double group_divisor = detection_config.sum_group_losses ? 1.0 : static_cast<double>(detection_config.group_detr);
- const double num_boxes = torch::clamp_min(normalizer.target_count * group_divisor, 1.0).item<double>();
+ const auto num_boxes = torch::clamp_min(normalizer.target_count * group_divisor, 1.0);
  auto ordinary_terms = detection_loss_dict(outputs, targets, detection_config, true, num_boxes);
  torch::Tensor auxiliary;
  auto total = weighted_detection_loss(ordinary_terms, detection_config, outputs.main.pred_logits.device(), &auxiliary);

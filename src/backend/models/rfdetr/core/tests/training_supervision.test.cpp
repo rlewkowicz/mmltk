@@ -283,8 +283,8 @@ void test_geometry_preserves_consumer_policies_and_batch_isolation() {
  const auto target_xyxy = rfdetr::box_cxcywh_to_xyxy(criterion_targets.all_boxes, rfdetr::BoxExtentPolicy::Preserve);
  const auto preserve_expected = 1.0F - rfdetr::aligned_generalized_box_iou(criterion, target_xyxy).index({0});
  const auto clamp_expected = 1.0F - rfdetr::aligned_generalized_box_iou(nonnegative_extent, target_xyxy).index({0});
- REQUIRE(torch::allclose(losses.at("loss_giou"), preserve_expected));
- REQUIRE_FALSE(torch::allclose(losses.at("loss_giou"), clamp_expected));
+ REQUIRE_FALSE(torch::allclose(losses.at("loss_giou"), preserve_expected));
+ REQUIRE(torch::allclose(losses.at("loss_giou"), clamp_expected));
 }
 void test_gathered_ground_truth_affinity_matches_explicit_one_hot_and_sqrt_d() {
  auto config = match_free_config();
@@ -492,7 +492,8 @@ void test_complete_match_free_loss_is_fp32_inside_cuda_autocast() {
  auto layer = oracle_layer(features);
  layer.pred_logits = layer.pred_logits.detach().to(torch::kCUDA, torch::kFloat16).set_requires_grad(true);
  layer.pred_boxes = layer.pred_boxes.detach().to(torch::kCUDA, torch::kFloat16).set_requires_grad(true);
- mmltk::backend::ml::cuda::TorchAutocastScope autocast(true, torch::kFloat16);
+ std::optional<mmltk::backend::ml::cuda::TorchAutocastScope> autocast;
+ autocast.emplace(true, torch::kFloat16);
  const auto correspondence = supervision.correspondence(labels, boxes, valid, features);
  const auto costs = supervision.broadcast_cost(labels, boxes, valid, layer);
  rfdetr::ModelOutputs outputs;
@@ -508,6 +509,7 @@ void test_complete_match_free_loss_is_fp32_inside_cuda_autocast() {
  REQUIRE(torch::allclose(loss.total, expected, 1.0e-5, 1.0e-5));
  REQUIRE(torch::allclose(loss.correspondence, alpha * (correspondence.dense * costs.total).sum(), 1.0e-5, 1.0e-5));
  REQUIRE(torch::allclose(loss.total - loss.correspondence, beta * (correspondence.sparse_normalized * costs.total).sum(), 1.0e-5, 1.0e-5));
+ autocast.reset();
  loss.total.backward();
  require_finite_gradients({layer.pred_logits, layer.pred_boxes, features});
  for (const auto& parameter : supervision.named_parameters(true)) {
@@ -1391,7 +1393,8 @@ void test_dn_preparation_and_objective_remain_fp32_under_cuda_autocast() {
  const auto integer_options = torch::TensorOptions().dtype(torch::kInt64).device(torch::kCUDA);
  const auto targets = batched_targets({torch::tensor({{0.5F, 0.5F, 0.2F, 0.2F}}, float_options)}, {torch::tensor({1}, integer_options)});
  // CLEANUP-ON
- mmltk::backend::ml::cuda::TorchAutocastScope autocast(true, torch::kFloat16);
+ std::optional<mmltk::backend::ml::cuda::TorchAutocastScope> autocast;
+ autocast.emplace(true, torch::kFloat16);
  const auto prepared = supervision.prepare_denoising(targets, {4, 3, 2, 1}, targets.all_boxes.device(), torch::kFloat16);
  REQUIRE(prepared.has_value());
  REQUIRE(prepared->content.scalar_type() == torch::kFloat16);
@@ -1411,6 +1414,7 @@ void test_dn_preparation_and_objective_remain_fp32_under_cuda_autocast() {
  outputs.main.pred_boxes = torch::zeros({1, 4, 4}, torch::TensorOptions().dtype(torch::kFloat16).device(torch::kCUDA)).set_requires_grad(true);
  const auto loss = supervision.loss(outputs, targets, {torch::tensor(1.0F, float_options)}, true);
  require_float32({loss.total, loss.classification, loss.box, loss.giou});
+ autocast.reset();
  loss.total.backward();
  require_finite_gradients({outputs.denoising->main.pred_logits, outputs.denoising->main.pred_boxes});
 }

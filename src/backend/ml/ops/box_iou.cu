@@ -8,68 +8,20 @@
 #include "src/frameworks/gpu/cuda_launch.cuh"
 #include <limits>
 #include "box_iou.h"
+#include "box_geometry.cuh"
 namespace mmltk::backend::ml::ops {
 namespace {
 template <typename T>
-__device__ inline T box_area(const T* box) {
- const T width = box[2] - box[0];
- const T height = box[3] - box[1];
- return width > 0 && height > 0 ? width * height : static_cast<T>(0);
-}
-template <typename T>
-struct BoxPairGeometry {
- const T* first = nullptr;
- const T* second = nullptr;
- T first_area = 0;
- T second_area = 0;
- T intersection = 0;
- T union_area = 0;
-};
-template <typename T>
-__device__ inline BoxPairGeometry<T> make_box_pair_geometry(const T* boxes1, const T* boxes2, const std::int64_t index, const std::int64_t second_count) {
- const std::int64_t first_index = index / second_count;
- const std::int64_t second_index = index % second_count;
- const T* first = boxes1 + first_index * 4;
- const T* second = boxes2 + second_index * 4;
- const T left = max(first[0], second[0]);
- const T top = max(first[1], second[1]);
- const T right = min(first[2], second[2]);
- const T bottom = min(first[3], second[3]);
- const T intersection = max(static_cast<T>(0), right - left) * max(static_cast<T>(0), bottom - top);
- const T first_area = box_area(first);
- const T second_area = box_area(second);
- return {
-  first,
-  second,
-  first_area,
-  second_area,
-  intersection,
-  first_area + second_area - intersection,
- };
-}
-template <typename T>
 __global__ void box_iou_kernel(const T* boxes1, const T* boxes2, T* iou, const int pair_count, const int second_count) {
  const int index = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
- if (index >= pair_count) { return; }
- const BoxPairGeometry<T> geometry = make_box_pair_geometry(boxes1, boxes2, static_cast<std::int64_t>(index), static_cast<std::int64_t>(second_count));
- const T result = geometry.union_area > static_cast<T>(0) ? geometry.intersection / geometry.union_area : static_cast<T>(0);
- iou[index] = isfinite(result) ? result : static_cast<T>(0);
+ if (index >= pair_count) return;
+ iou[index] = box_geometry::pair(boxes1 + (index / second_count) * 4, boxes2 + (index % second_count) * 4).iou();
 }
 template <typename T>
-__global__ void generalized_box_iou_kernel(const T* boxes1, const T* boxes2, T* generalized_iou, const int pair_count, const int second_count) {
+__global__ void generalized_box_iou_kernel(const T* boxes1, const T* boxes2, T* giou, const int pair_count, const int second_count) {
  const int index = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
- if (index >= pair_count) { return; }
- const BoxPairGeometry<T> geometry = make_box_pair_geometry(boxes1, boxes2, static_cast<std::int64_t>(index), static_cast<std::int64_t>(second_count));
- const T enclosing_left = min(geometry.first[0], geometry.second[0]);
- const T enclosing_top = min(geometry.first[1], geometry.second[1]);
- const T enclosing_right = max(geometry.first[2], geometry.second[2]);
- const T enclosing_bottom = max(geometry.first[3], geometry.second[3]);
- const T enclosing_width = enclosing_right - enclosing_left;
- const T enclosing_height = enclosing_bottom - enclosing_top;
- const T enclosing_area = enclosing_width > 0 && enclosing_height > 0 ? enclosing_width * enclosing_height : static_cast<T>(0);
- const T iou = geometry.union_area > static_cast<T>(0) ? geometry.intersection / geometry.union_area : static_cast<T>(0);
- const T result = enclosing_area > static_cast<T>(0) ? iou - (enclosing_area - geometry.union_area) / enclosing_area : iou;
- generalized_iou[index] = isfinite(result) ? result : static_cast<T>(0);
+ if (index >= pair_count) return;
+ giou[index] = box_geometry::pair(boxes1 + (index / second_count) * 4, boxes2 + (index % second_count) * 4).giou();
 }
 enum class BoxIouKind : std::uint8_t {
  Standard,

@@ -77,7 +77,7 @@ TEST_CASE("RF-DETR preset projection preserves every architecture field", "[back
  REQUIRE(preset->group_count == 13);
  REQUIRE(preset->two_stage);
  REQUIRE(preset->task == ModelTask::Segmentation);
- REQUIRE(preset->classification_loss_coefficient == 5.0);
+ REQUIRE(preset->classification_loss_coefficient == 1.0);
  REQUIRE(preset->bounding_box_loss_coefficient == 5.0);
  REQUIRE(preset->generalized_iou_loss_coefficient == 2.0);
  REQUIRE(preset->mask_cross_entropy_loss_coefficient == 5.0);

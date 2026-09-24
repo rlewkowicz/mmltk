@@ -1,4 +1,3 @@
-#include "src/backend/imaging/sampling.h"
 #include <c10/cuda/CUDAException.h>
 #include <cuda_runtime.h>
 #include "detail/training_mask_ops_cuda_launch.h"
@@ -8,7 +7,15 @@ namespace {
 constexpr int kCudaThreads = 256;
 int ceil_div(int64_t value, int divisor) { return static_cast<int>((value + divisor - 1) / divisor); }
 __device__ float clamp_coord(float value, float limit) { return fminf(fmaxf(value, 0.0f), limit); }
-__device__ int64_t nearest_grid_sample_index(float coord, int64_t size) { return mmltk::backend::imaging::sampling::support_pixel_index(coord, size); }
+__device__ float grid_sample_source(float coord, int64_t size) {
+ // Keep the two tensor normalization operations and grid_sample's unnormalization
+ // separate: fusion changes categorical identities at half-pixel boundaries.
+ const float grid = __fsub_rn(__fmul_rn(2.0f, coord), 1.0f);
+ return __fdiv_rn(__fsub_rn(__fmul_rn(__fadd_rn(grid, 1.0f), static_cast<float>(size)), 1.0f), 2.0f);
+}
+__device__ int64_t nearest_grid_sample_index(float coord, int64_t size) {
+ return static_cast<int64_t>(nearbyintf(clamp_coord(grid_sample_source(coord, size), static_cast<float>(size - 1))));
+}
 __global__ void matcher_point_sample_kernel(
  const float* input, const float* coords, float* output, int64_t batch_size, int64_t coord_batches, int64_t channels, int64_t height, int64_t width, int64_t point_count, bool nearest) {
  const int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -28,8 +35,8 @@ __global__ void matcher_point_sample_kernel(
   output[index] = input[input_base + y * width + x];
   return;
  }
- const float x = clamp_coord(coord_x * static_cast<float>(width) - 0.5f, static_cast<float>(width - 1));
- const float y = clamp_coord(coord_y * static_cast<float>(height) - 0.5f, static_cast<float>(height - 1));
+ const float x = clamp_coord(grid_sample_source(coord_x, width), static_cast<float>(width - 1));
+ const float y = clamp_coord(grid_sample_source(coord_y, height), static_cast<float>(height - 1));
  const int64_t x0 = static_cast<int64_t>(floorf(x));
  const int64_t y0 = static_cast<int64_t>(floorf(y));
  const int64_t x1 = x0 + 1 < width ? x0 + 1 : width - 1;

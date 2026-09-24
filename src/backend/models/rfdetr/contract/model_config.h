@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <limits>
+#include <meta>
 #include <span>
 #include <string>
 #include <string_view>
@@ -88,6 +89,17 @@ struct NativeRfDetrConfig {
 [[nodiscard]] const PresetCatalogEntry* find_model_preset_by_weight_filename(std::string_view filename) noexcept;
 [[nodiscard]] const PresetCatalogEntry* infer_model_preset_from_path(const std::filesystem::path& path);
 [[nodiscard]] NativeRfDetrConfig native_config_from_preset(const PresetCatalogEntry& preset);
+template<class Destination>
+void project_loss_coefficients(Destination& destination, const NativeRfDetrConfig& source) {
+ template for (constexpr auto member : std::define_static_array(std::meta::nonstatic_data_members_of(^^NativeRfDetrConfig, std::meta::access_context::current()))) {
+  if constexpr (std::meta::identifier_of(member).ends_with("_loss_coef")) {
+   template for (constexpr auto target : std::define_static_array(std::meta::nonstatic_data_members_of(^^Destination, std::meta::access_context::current()))) {
+    if constexpr (std::meta::identifier_of(member) == std::meta::identifier_of(target)) destination.[:target:] = source.[:member:];
+   }
+  }
+ }
+}
+void apply_stock_training_coefficients(NativeRfDetrConfig& config);
 inline std::string infer_train_recipe_preset_name_from_path(const std::filesystem::path& path) {
  if (path.empty()) { return {}; }
  if (const auto* preset = infer_model_preset_from_path(path)) { return std::string(preset->preset_name); }

@@ -1,8 +1,8 @@
+#include "detail/training_step.h"
 #include "src/backend/ml/cuda/torch_cuda_utils.h"
 #include "detail/training_lanes.h"
 #include "src/backend/models/rfdetr/core/detection_ops.h"
 #include "src/backend/models/rfdetr/core/detail/matcher_workspace.h"
-#include "src/backend/ml/cuda/torch_autocast_scope.h"
 #include "src/frameworks/gpu/cuda_priority.h"
 #include <torch/csrc/autograd/autograd.h>
 #include <algorithm>
@@ -132,12 +132,12 @@ TrainingLanes::TrainingLanes(const TrainRequest& options, RuntimeContext& train_
 }
 TrainingLanes::~TrainingLanes() = default;
 std::future<TrainLaneResult> TrainingLanes::enqueue(RuntimeContext* runtime, mmltk::backend::data::DatasetLoader& loader, const mmltk::backend::data::Batch& batch,
- const mmltk::backend::ml::cuda::CudaEventPool::Lease* params_ready, mmltk::backend::ml::cuda::CudaEventPool& event_pool, double scaled_loss_factor, size_t parameter_version,
+ const mmltk::backend::ml::cuda::CudaEventPool::Lease* params_ready, mmltk::backend::ml::cuda::CudaEventPool& event_pool, std::size_t admitted_microbatches, double gradient_scale, size_t parameter_version,
  const DetectionConfig& detection_config, const NativeRfDetrModel& model, int device_id, int image_height, int image_width, std::uint64_t seed, int epoch, int rank,
  std::uint64_t augmentation_sequence, bool amp_enabled, at::ScalarType autocast_dtype, TrainingSupervisionRoute route, std::shared_ptr<WaveTargetNormalizer> wave_normalizer, std::size_t lane_index) {
  auto& lane = impl_->lanes.at(lane_index);
  auto& lane_pool = *impl_->pool;
- return lane_pool.enqueue([runtime, &loader, &lane, batch, params_ready, &event_pool, scaled_loss_factor, parameter_version, &detection_config, &model, device_id, image_height, image_width, seed,
+ return lane_pool.enqueue([runtime, &loader, &lane, batch, params_ready, &event_pool, admitted_microbatches, gradient_scale, parameter_version, &detection_config, &model, device_id, image_height, image_width, seed,
                            epoch, rank, augmentation_sequence, amp_enabled, autocast_dtype, route, wave_normalizer = std::move(wave_normalizer), lane_index]() mutable {
   try {
    ScopedRuntimeContext worker_scope(runtime, lane_index + 1);
@@ -179,53 +179,55 @@ std::future<TrainLaneResult> TrainingLanes::enqueue(RuntimeContext* runtime, mml
     torch::Tensor loss;
     torch::Tensor class_loss;
     torch::Tensor box_loss;
-    mmltk::backend::ml::cuda::TorchAutocastScope autocast_guard(amp_enabled, autocast_dtype);
     TargetConsumerLease target_consumer(lane.target_scratch, prepared, device_id);
-    ModelOutputs outputs;
     auto& lane_owner = (*lane.model);
     SupervisionTimingLease step_timing(lane_owner, route_is_active(route), SupervisionTimingLease::Kind::Step);
-    if (route_uses_denoising(route)) {
-     mmltk::common::logging::ScopedProfile profile_rfdetr_train_parallel_targets_handoff{"rfdetr.train.parallel.targets_handoff"};
-     target_consumer.handoff();
-     outputs = (*lane.model)
-                .forward_with_denoising(
-                 NestedTensor{normalized, prepared.nested_mask}, prepared, TrainingStepIdentity{seed, static_cast<std::uint64_t>(epoch), static_cast<std::uint32_t>(rank), augmentation_sequence});
-    } else {
-     mmltk::common::logging::ScopedProfile profile_rfdetr_train_parallel_forward{"rfdetr.train.parallel.forward"};
-     outputs =
-      route_uses_match_free(route) ? (*lane.model).forward_for_match_free(NestedTensor{normalized, prepared.nested_mask}) : (*lane.model).forward(NestedTensor{normalized, prepared.nested_mask}, true);
-    }
-    if (!route_uses_denoising(route)) {
-     mmltk::common::logging::ScopedProfile profile_rfdetr_train_parallel_targets_handoff{"rfdetr.train.parallel.targets_handoff"};
-     target_consumer.handoff();
-    }
-    if (route_is_active(route) || wave_normalizer) {
-     if (!wave_normalizer) { throw std::runtime_error("active RF-DETR lane is missing its wave target normalizer"); }
-     auto normalizer = wave_normalizer->consume(lane_index, lane.stream.stream());
-     SupervisionTimingLease criterion_timing(lane_owner, route_is_active(route), SupervisionTimingLease::Kind::Criterion);
-     // CLEANUP-IGNORE: The parallel lane unpacks into detached gradient work owned by this lane.
-     auto routed = compute_routed_training_loss(*lane.model, route, outputs, prepared, normalizer, detection_config);
-     criterion_timing.finish();
-     loss = std::move(routed.total);
-     class_loss = std::move(routed.classification);
-     box_loss = std::move(routed.box);
-     loss_dict = std::move(routed.ordinary_terms);
-     scalar_values = std::move(routed.scalars);
-    } else {
-     mmltk::common::logging::ScopedProfile profile_rfdetr_train_parallel_loss_dict{"rfdetr.train.parallel.loss_dict"};
-     const double group_divisor = detection_config.sum_group_losses ? 1.0 : static_cast<double>(detection_config.group_detr);
-     const double num_boxes_value = std::max(static_cast<double>(target_count) * group_divisor / static_cast<double>(std::max<int64_t>(1, detection_config.world_size)), 1.0);
-     loss_dict = detection_loss_dict(outputs, prepared, detection_config, true, num_boxes_value);
-     mmltk::common::logging::ScopedProfile profile_rfdetr_train_parallel_loss_total{"rfdetr.train.parallel.loss_total"};
-     torch::Tensor auxiliary;
-     loss = weighted_detection_loss(loss_dict, detection_config, normalized.device(), &auxiliary);
-     scalar_values = ordinary_scalar_tensors(loss_dict, loss, auxiliary);
-     class_loss = loss_value_or_zero(loss_dict, normalized.device(), "loss_ce");
-     box_loss = loss_value_or_zero(loss_dict, normalized.device(), "loss_bbox");
-    }
+    const TrainingStep step(admitted_microbatches, gradient_scale, amp_enabled, autocast_dtype);
+    step.forward([&] {
+     ModelOutputs outputs;
+     if (route_uses_denoising(route)) {
+      mmltk::common::logging::ScopedProfile profile_rfdetr_train_parallel_targets_handoff{"rfdetr.train.parallel.targets_handoff"};
+      target_consumer.handoff();
+      outputs = (*lane.model)
+                 .forward_with_denoising(
+                  NestedTensor{normalized, prepared.nested_mask}, prepared, TrainingStepIdentity{seed, static_cast<std::uint64_t>(epoch), static_cast<std::uint32_t>(rank), augmentation_sequence});
+     } else {
+      mmltk::common::logging::ScopedProfile profile_rfdetr_train_parallel_forward{"rfdetr.train.parallel.forward"};
+      outputs =
+       route_uses_match_free(route) ? (*lane.model).forward_for_match_free(NestedTensor{normalized, prepared.nested_mask}) : (*lane.model).forward(NestedTensor{normalized, prepared.nested_mask}, true);
+     }
+     if (!route_uses_denoising(route)) {
+      mmltk::common::logging::ScopedProfile profile_rfdetr_train_parallel_targets_handoff{"rfdetr.train.parallel.targets_handoff"};
+      target_consumer.handoff();
+     }
+     if (route_is_active(route) || wave_normalizer) {
+      if (!wave_normalizer) { throw std::runtime_error("active RF-DETR lane is missing its wave target normalizer"); }
+      auto normalizer = wave_normalizer->consume(lane_index, lane.stream.stream());
+      SupervisionTimingLease criterion_timing(lane_owner, route_is_active(route), SupervisionTimingLease::Kind::Criterion);
+      // CLEANUP-IGNORE: The parallel lane unpacks into detached gradient work owned by this lane.
+      auto routed = compute_routed_training_loss(*lane.model, route, outputs, prepared, normalizer, detection_config);
+      criterion_timing.finish();
+      loss = std::move(routed.total);
+      class_loss = std::move(routed.classification);
+      box_loss = std::move(routed.box);
+      loss_dict = std::move(routed.ordinary_terms);
+      scalar_values = std::move(routed.scalars);
+     } else {
+      mmltk::common::logging::ScopedProfile profile_rfdetr_train_parallel_loss_dict{"rfdetr.train.parallel.loss_dict"};
+      const double group_divisor = detection_config.sum_group_losses ? 1.0 : static_cast<double>(detection_config.group_detr);
+      const double num_boxes_value = std::max(static_cast<double>(target_count) * group_divisor / static_cast<double>(std::max<int64_t>(1, detection_config.world_size)), 1.0);
+      loss_dict = detection_loss_dict(outputs, prepared, detection_config, true, num_boxes_value);
+      mmltk::common::logging::ScopedProfile profile_rfdetr_train_parallel_loss_total{"rfdetr.train.parallel.loss_total"};
+      torch::Tensor auxiliary;
+      loss = weighted_detection_loss(loss_dict, detection_config, normalized.device(), &auxiliary);
+      scalar_values = ordinary_scalar_tensors(loss_dict, loss, auxiliary);
+      class_loss = loss_value_or_zero(loss_dict, normalized.device(), "loss_ce");
+      box_loss = loss_value_or_zero(loss_dict, normalized.device(), "loss_bbox");
+     }
+    });
     {
      mmltk::common::logging::ScopedProfile profile_rfdetr_train_parallel_grad{"rfdetr.train.parallel.grad"};
-     gradients = torch::autograd::grad({loss * scaled_loss_factor}, lane.grad_params, {}, std::nullopt, false, true);
+     gradients = step.gradients(loss, lane.grad_params);
      runtime->matcher_workspace().complete_assignments(lane.stream.stream());
     }
     target_consumer.retire();

@@ -62,23 +62,23 @@ inline constexpr std::array<PresetCatalogEntry, 10U> kPresetCatalog{{
   // CLEANUP-IGNORE: Each immutable preset row remains a complete independently audited catalog record.
   4U, 300U, 300U, 91U, 256U, 13U, true, 1.0, 5.0, 2.0, 1.0, 1.0},
  {"rf-detr-seg-nano", "RF-DETR Seg Nano", "N", ModelTask::Segmentation, 312U, "dinov2_windowed_small", "rf-detr-seg-nano.pt", "https://storage.googleapis.com/rfdetr/rf-detr-seg-n-ft.pth",
-  "9995497791d0ff1664a1d9ddee9cfd20", 12U, 1U, 26U, 4U, 100U, 100U, 91U, 256U, 13U, true, 5.0, 5.0, 2.0, 5.0, 5.0},
+  "9995497791d0ff1664a1d9ddee9cfd20", 12U, 1U, 26U, 4U, 100U, 100U, 91U, 256U, 13U, true, 1.0, 5.0, 2.0, 5.0, 5.0},
  {"rf-detr-seg-small", "RF-DETR Seg Small", "S", ModelTask::Segmentation, 384U, "dinov2_windowed_small", "rf-detr-seg-small.pt", "https://storage.googleapis.com/rfdetr/rf-detr-seg-s-ft.pth",
   "0a2a3006381d0c42853907e700eadd08", 12U, 2U, 32U,
   // CLEANUP-IGNORE: Each immutable preset row remains a complete independently audited catalog record.
-  4U, 100U, 100U, 91U, 256U, 13U, true, 5.0, 5.0, 2.0, 5.0, 5.0},
+  4U, 100U, 100U, 91U, 256U, 13U, true, 1.0, 5.0, 2.0, 5.0, 5.0},
  {"rf-detr-seg-medium", "RF-DETR Seg Medium", "M", ModelTask::Segmentation, 432U, "dinov2_windowed_small", "rf-detr-seg-medium.pt", "https://storage.googleapis.com/rfdetr/rf-detr-seg-m-ft.pth",
-  "a49af1562c3719227ad43d0ca53b4c7a", 12U, 2U, 36U, 5U, 200U, 200U, 91U, 256U, 13U, true, 5.0, 5.0, 2.0, 5.0, 5.0},
+  "a49af1562c3719227ad43d0ca53b4c7a", 12U, 2U, 36U, 5U, 200U, 200U, 91U, 256U, 13U, true, 1.0, 5.0, 2.0, 5.0, 5.0},
  {"rf-detr-seg-large", "RF-DETR Seg Large", "L", ModelTask::Segmentation, 504U, "dinov2_windowed_small", "rf-detr-seg-large.pt", "https://storage.googleapis.com/rfdetr/rf-detr-seg-l-ft.pth",
   "275f7b094909544ed2841c94a677d07e", 12U, 2U, 42U,
   // CLEANUP-IGNORE: Each immutable preset row remains a complete independently audited catalog record.
-  5U, 200U, 200U, 91U, 256U, 13U, true, 5.0, 5.0, 2.0, 5.0, 5.0},
+  5U, 200U, 200U, 91U, 256U, 13U, true, 1.0, 5.0, 2.0, 5.0, 5.0},
  {"rf-detr-seg-xlarge", "RF-DETR Seg XLarge", "XL", ModelTask::Segmentation, 624U, "dinov2_windowed_small", "rf-detr-seg-xlarge.pt", "https://storage.googleapis.com/rfdetr/rf-detr-seg-xl-ft.pth",
-  "3693b35d0eea86ebb3e0444f4a611fba", 12U, 2U, 52U, 6U, 300U, 300U, 91U, 256U, 13U, true, 5.0, 5.0, 2.0, 5.0, 5.0},
+  "3693b35d0eea86ebb3e0444f4a611fba", 12U, 2U, 52U, 6U, 300U, 300U, 91U, 256U, 13U, true, 1.0, 5.0, 2.0, 5.0, 5.0},
  {"rf-detr-seg-xxlarge", "RF-DETR Seg 2XLarge", "2XL", ModelTask::Segmentation, 768U, "dinov2_windowed_small", "rf-detr-seg-xxlarge.pt", "https://storage.googleapis.com/rfdetr/rf-detr-seg-2xl-ft.pth",
   "040bc3412af840fa8a47e0ff69b552ba", 12U, 2U, 64U,
   // CLEANUP-IGNORE: Each immutable preset row remains a complete independently audited catalog record.
-  6U, 300U, 300U, 91U, 256U, 13U, true, 5.0, 5.0, 2.0, 5.0, 5.0},
+  6U, 300U, 300U, 91U, 256U, 13U, true, 1.0, 5.0, 2.0, 5.0, 5.0},
 }};
 [[nodiscard]] consteval bool preset_catalog_is_valid() {
  for (std::size_t index = 0U; index < kPresetCatalog.size(); ++index) {

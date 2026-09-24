@@ -1,5 +1,8 @@
 #pragma once
 #include <torch/script.h>
+#include <torch/csrc/jit/api/function_impl.h>
+#include <torch/csrc/jit/frontend/tracer.h>
+#include <utility>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -45,6 +48,33 @@ struct TracedParametricBinaryLossOp : TracedBinaryLossOp {
  double alpha = std::numeric_limits<double>::quiet_NaN();
  double gamma = std::numeric_limits<double>::quiet_NaN();
 };
+template <size_t Arity, typename TraceFn, typename... Tensors>
+void ensure_loss_trace(TracedLossOp<Arity>& cache, const char* class_name, TraceFn&& fn, const Tensors&... tensors) {
+ static_assert(sizeof...(Tensors) == Arity);
+ if (cache.matches(tensors...)) { return; }
+ auto cu = std::make_shared<torch::jit::CompilationUnit>();
+ auto cls = torch::jit::ClassType::create(class_name, cu, true);
+ TracedLossOp<Arity> candidate;
+ candidate.module = torch::jit::Module(cu, cls);
+ auto trace_res = torch::jit::tracer::trace(
+  {tensors.detach().contiguous()...},
+  [&](
+   torch::jit::Stack args) -> torch::jit::Stack { return [&]<size_t... I>(std::index_sequence<I...>) -> torch::jit::Stack { return {fn(args[I].toTensor()...)}; }(std::make_index_sequence<Arity>{}); },
+  [](const torch::autograd::Variable&) { return ""; }, false, false, &candidate.module);
+ candidate.module.type()->addMethod(cu->create_function("forward", trace_res.first->graph, true));
+ candidate.record_signature(tensors...);
+ cache = std::move(candidate);
+}
+template <typename TraceFn>
+void ensure_parametric_binary_loss_trace(
+ TracedParametricBinaryLossOp& cache, const char* class_name, const torch::Tensor& input, const torch::Tensor& target, double alpha, double gamma, TraceFn&& fn) {
+ if (cache.matches(input, target) && cache.alpha == alpha && cache.gamma == gamma) return;
+ TracedParametricBinaryLossOp candidate;
+ ensure_loss_trace(candidate, class_name, std::forward<TraceFn>(fn), input, target);
+ candidate.alpha = alpha;
+ candidate.gamma = gamma;
+ cache = std::move(candidate);
+}
 struct TracedLossOpCache {
  TracedBinaryLossOp sigmoid_ce;
  TracedBinaryLossOp dice;
