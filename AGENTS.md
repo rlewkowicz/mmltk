@@ -179,8 +179,8 @@ next agent cannot access.
   trace what it does through its callers, callees, persisted forms, and tests;
   reuse cohesive behavior where possible and carry all required outcomes into
   the replacement.
-- Spawn exactly one new astra medium executor for each implementation phase's
-  first pass; reuse it for remediation. Within implementation phases, the main
+- Spawn exactly one new astra xhigh executor for each implementation phase's
+  first pass; use a low subagent for followup remediation within implementation phases, the main
   agent handles small evidence-driven follow-up fixes and delegates large
   missing implementation. Final Validation follows its separate main-agent
   workflow regardless of a fix's size.
@@ -488,7 +488,7 @@ paths; require one cohesive correction before phase closure.
 ## remediationplan.md
 
 `remediationplan.md` is the reviewer's executable phased plan for the executor.
-After main-agent scope/architecture review, the same astra medium executor
+After main-agent scope/architecture review, the same astra xhigh executor
 completes and updates it until no phases remain. Only then begin additional review.
 The scheduled cleanup review is the exception: the main agent implements and
 updates its remediation plan under Final Validation's ownership rules.
