@@ -1,4 +1,5 @@
 #include "detail/caption_raster_cuda.h"
+#include "native_caption_metrics.h"
 #include <cuda_runtime.h>
 namespace mmltk::backend::imaging::raster::detail {
 namespace {
@@ -18,7 +19,7 @@ template <bool Paint>
 __global__ void captions(std::uint8_t* pixels, std::size_t pitch, unsigned width, unsigned height,
  const std::uint8_t* atlas, std::size_t atlas_pitch, const CaptionCommand* commands, std::uint32_t* winners, std::size_t winner_pitch) {
  const auto item = commands[blockIdx.x];
- constexpr unsigned rows = 22U;
+ constexpr unsigned rows = kNativeCaptionHeight;
  for (unsigned offset = threadIdx.x; offset < item.width * rows; offset += blockDim.x) {
   const unsigned x = offset % item.width, y = offset / item.width;
   const auto px = static_cast<long long>(item.x) + x, py = static_cast<long long>(item.y) + y;
@@ -30,7 +31,20 @@ __global__ void captions(std::uint8_t* pixels, std::size_t pitch, unsigned width
    auto* output = pixels + py * pitch + px * 4U;
    const unsigned r = item.color & 255U, g = (item.color >> 8U) & 255U, b = (item.color >> 16U) & 255U;
    const unsigned foreground = r * 2126U + g * 7152U + b * 722U > 1402500U ? 0U : 255U;
-   const unsigned alpha = atlas[(item.name * rows + y) * atlas_pitch + x * 4U];
+   unsigned alpha = x < item.name_width ? atlas[(item.name * rows + y) * atlas_pitch + x * 4U] : 0U;
+   if (item.suffix_count && x >= item.name_width - 4U) {
+    alpha = 0U;
+    // At most 32 sorted glyph intervals, independent of catalog/history size.
+    unsigned low = 0U, high = item.suffix_count;
+    while (low < high) {
+     const unsigned middle = (low + high) / 2U;
+     if (x >= item.suffix[middle].end) low = middle + 1U; else high = middle;
+    }
+    if (low < item.suffix_count) {
+     const auto glyph = item.suffix[low];
+     if (x >= glyph.begin) alpha = atlas[(glyph.row * rows + y) * atlas_pitch + (x - glyph.begin + 4U) * 4U];
+    }
+   }
    for (unsigned channel = 0; channel < 3U; ++channel) {
     const unsigned background = (item.color >> (channel * 8U)) & 255U;
     output[channel] = static_cast<std::uint8_t>((background * (255U - alpha) + foreground * alpha + 127U) / 255U);

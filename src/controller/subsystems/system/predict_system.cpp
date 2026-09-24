@@ -12,6 +12,8 @@
 #include "detail/predict_revision.h"
 #include "detail/prediction_playback.h"
 #include "detail/prediction_preview.h"
+#include "detail/prediction_output.h"
+#include "detail/prediction_sampling.h"
 #include "src/backend/ml/runtime/backend_factory.h"
 #include "src/common/system/execution_policy.h"
 #include "src/controller/presentation/visual_runtime_owner.h"
@@ -42,24 +44,38 @@ void CudaPredictRuntime::Close() noexcept {
 }
 bool CudaPredictRuntime::HasUnsafeCustody() const noexcept { return impl_->close_failed || impl_->session.HasUnsafeCustody() || (impl_->preview && impl_->preview->HasUnsafeCustody()); }
 contracts::ComputeTerminal CudaPredictRuntime::Run(mmltk::backend::models::rfdetr::PredictRequest operation, const std::stop_token stop, const ComputeProgressSink& progress,
- const ProductSink& products, const PlaybackGate& gate, VisualExtent maximum, const ContextProvider& current_context, const PreviewRetirement& retirement, const ComputeArtifactSink& published) {
+ const ProductSink& products, const PlaybackGate& gate, VisualExtent maximum, const ContextProvider& current_context, const PreviewRetirement& retirement, const ComputeArtifactSink& published, const PredictionRunOutput& output) {
  if (!retirement) throw std::invalid_argument("prediction preview retirement authority is unavailable");
  if (!retirement->admission_open()) throw contracts::UnavailableError("prediction receiver custody is unobservable");
  return impl_->resources.Run(
-  [this, &progress, &products, &gate, stop, operation, maximum, &current_context, &retirement, &published](const mmltk::backend::ml::runtime::BorrowedCommandStream stream) mutable {
+  [this, &progress, &products, &gate, stop, operation, maximum, &current_context, &retirement, &published, &output](const mmltk::backend::ml::runtime::BorrowedCommandStream stream) mutable {
    operation.device_id = impl_->resources.device();
    std::shared_ptr<const mmltk::backend::data::catalog::ClassCatalog> classes;
    int class_count = 0;
    std::uint64_t sequence = 0U;
-   const auto result = impl_->session.RunAndWrite(operation, stream,
+   detail::PredictionOutput media(impl_->config,operation.source_kind,output,current_context ? current_context() : std::nullopt);
+   const bool full_video=operation.source_kind==mmltk::backend::models::rfdetr::PredictSourceKind::VideoFile && media.Enabled() && output.saving.video_mode==contracts::PredictionVideoSaving::Full;
+   using MediaBegin=std::function<void(const mmltk::backend::media::video::VideoMediaInfo&)>;
+   using AudioDelivery=std::function<void(const mmltk::backend::media::video::VideoAudioPacket&)>;
+   std::unique_ptr<mmltk::backend::models::rfdetr::PredictionJsonWriter> json;
+   if (operation.source_kind != mmltk::backend::models::rfdetr::PredictSourceKind::VideoFile && !operation.output_path.empty())
+    json = std::make_unique<mmltk::backend::models::rfdetr::PredictionJsonWriter>(operation);
+   mmltk::backend::models::rfdetr::PredictionRunResult result;
+   try { result = impl_->session.Run(operation, stream,
     {
      .stop = stop,
      .source_pixels = static_cast<bool>(products),
-     .maximum_pixel_width = maximum.width,
-     .maximum_pixel_height = maximum.height,
+     .encoded_masks = static_cast<bool>(json),
+     .demand = [&](std::int64_t index) { const bool save=media.Wants(index); return mmltk::backend::models::rfdetr::PredictionDemand{.source_pixels=save,.preview_masks=save && output.preview.masks}; },
+     .maximum_pixel_width = media.Enabled() ? UINT32_MAX : maximum.width,
+     .maximum_pixel_height = media.Enabled() ? UINT32_MAX : maximum.height,
      .before_frame = gate,
+     .media_begin = full_video ? MediaBegin{[&](const auto& info) { media.Media(info); }} : MediaBegin{},
+     .audio = full_video ? AudioDelivery{[&](const auto& packet) { media.Audio(packet); }} : AudioDelivery{},
      .begin =
       [&](const auto& summary) {
+       media.Begin(summary);
+       if (json) json->Begin(summary);
        if (!products) return;
        try {
         classes = summary.class_catalog;
@@ -70,6 +86,8 @@ contracts::ComputeTerminal CudaPredictRuntime::Run(mmltk::backend::models::rfdet
       },
      .completed =
       [&](const auto& record, const auto pixels, const auto& annotations) {
+       auto saved_raw=media.Capture(record,pixels,annotations);
+       if (json) json->Append(record);
        if (!products || !classes) return;
        try {
         const auto context = current_context ? current_context() : std::nullopt;
@@ -80,6 +98,10 @@ contracts::ComputeTerminal CudaPredictRuntime::Run(mmltk::backend::models::rfdet
         if (!retirement->admission_open()) throw std::runtime_error("prediction preview retirement admission is closed");
         if (!pixels.preview_failure.empty()) throw std::runtime_error(std::string{pixels.preview_failure});
         if (pixels.width > maximum.width || pixels.height > maximum.height) throw std::runtime_error("Prediction preview exceeds the visual dimensions");
+        if (saved_raw) {
+         products(Product{.extent={pixels.width,pixels.height},.raw=std::move(saved_raw),.image_id=record.image_id,.source_index=record.dataset_index});
+         return;
+        }
         if (impl_->preview && impl_->preview->HasUnsafeSourceCustody()) throw mmltk::backend::ml::runtime::CudaOperationError{cudaErrorUnknown, "prediction preview source custody"};
         if (!impl_->preview || impl_->preview_context != context) {
          auto candidate = std::make_unique<detail::PredictionPreviewPool>(
@@ -103,9 +125,16 @@ contracts::ComputeTerminal CudaPredictRuntime::Run(mmltk::backend::models::rfdet
        if (progress) progress({++sequence, decoded, total, "Decoded"});
       },
     });
-   if (!result.cancelled && !operation.output_path.empty() && published) published(operation.output_path);
+   } catch (...) {
+    const auto failure=std::current_exception();
+    media.Finish(false);
+    std::rethrow_exception(failure);
+   }
+   result.cancelled=result.cancelled || stop.stop_requested();
+   media.Finish(!result.cancelled);
+   if (!result.cancelled && json) { json->Complete(); if (published) published(operation.output_path); }
    return contracts::make_compute_terminal(result.cancelled ? contracts::ComputeOperationOutcome::Cancelled : contracts::ComputeOperationOutcome::Succeeded, 0U, result.processed_images,
-    result.cancelled ? std::string{} : operation.output_path.string());
+    result.cancelled || !json ? std::string{} : operation.output_path.string());
   },
   {}, false);  // PredictionSession owns the atomic output completion boundary.
 }
@@ -141,7 +170,7 @@ public:
   worker_.RegisterContinuation([this](auto& runtime, auto stop) { return Render(runtime, stop); }, {}, true);
  }
  ~Impl() { Shutdown(); }
- [[nodiscard]] PredictSnapshot Start() {
+ [[nodiscard]] PredictSnapshot Start(contracts::PredictWorkflowIntent intent) {
   {
    std::scoped_lock lock(mutex_);
    RequireStartAdmissionLocked();
@@ -171,12 +200,13 @@ public:
    playback_.Reset();
    try {
     run_.Start({
-     .work = [this, settings = settings.settings, selection, source_key = key, video = state_.video, generation = *generation](const std::stop_token stop) mutable -> direct::LocalRun::Notification {
+     .work = [this, settings = settings.settings, intent, selection, source_key = key, video = state_.video, generation = *generation](const std::stop_token stop) mutable -> direct::LocalRun::Notification {
       if (!preview_retirement_->admission_open()) throw contracts::UnavailableError("prediction receiver custody is unobservable");
       contracts::ArtifactInspection inspection;
       if (!stop.stop_requested() && settings.workflows.predict.source.kind == contracts::SourceKind::CompiledDataset)
        inspection = dataset_.Inspect({settings.workflows.predict.source.compiled_path, {}, {}}, selection.key.preset, selection.key.resolution, stop);
       if (stop.stop_requested()) return [this, generation] { Settled(contracts::make_compute_terminal(contracts::ComputeOperationOutcome::Cancelled, generation)); };
+      settings.workflows.predict.saving=intent.saving;
       auto request = subsystems::system::ComputeIntentMaterializer::Predict(settings, inspection, selection);
       if (!request) throw contracts::InvalidIntentError(request.error().detail);
       if (stop.stop_requested()) return [this, generation] { Settled(contracts::make_compute_terminal(contracts::ComputeOperationOutcome::Cancelled, generation)); };
@@ -184,8 +214,34 @@ public:
           !std::filesystem::is_regular_file(request->image_inputs.front().image_path)) throw contracts::InvalidIntentError("prediction image is not a readable regular file");
       if (request->source_kind == mmltk::backend::models::rfdetr::PredictSourceKind::VideoFile &&
           !std::filesystem::is_regular_file(request->video_path)) throw contracts::InvalidIntentError("prediction video is not a readable regular file");
+      PredictionRunOutput media_output;
+      media_output.saving=intent.saving; media_output.preview=intent.preview;
+      if (request->source_kind==mmltk::backend::models::rfdetr::PredictSourceKind::CompiledDataset) {
+       if (inspection.splits.empty()) throw contracts::InvalidIntentError("prediction dataset is empty");
+       media_output.population=inspection.splits.front().image_count;
+       if (intent.compiled_population && intent.compiled_population!=media_output.population) throw contracts::InvalidIntentError("prediction dataset count changed after inspection");
+       if (!intent.compiled_population) media_output.saving.compiled_total=std::min(media_output.saving.compiled_total,media_output.population);
+       if (intent.saving.compiled_enabled && intent.saving.compiled_mode==contracts::PredictionCompiledSampling::Total && media_output.saving.compiled_total>media_output.population)
+        throw contracts::InvalidIntentError("prediction Total exceeds the admitted dataset count");
+       if (media_output.saving.compiled_enabled) {
+        const auto count=media_output.saving.compiled_mode==contracts::PredictionCompiledSampling::Percent
+         ? detail::PredictionSelection::Percent(media_output.population,media_output.saving.compiled_percent) : media_output.saving.compiled_total;
+        media_output.processing_population=detail::PredictionSelection::Eligible(media_output.population,request->limit_images,count);
+       }
+      }
       const auto& output = settings.workflows.predict.output;
       const auto directory = services::reserve_run_output(contracts::workflow_output_root(output, contracts::FeatureId::Predict), !output.automatic);
+      media_output.directory=directory;
+      media_output.progress=[this](const auto& facts) {
+       {
+        std::scoped_lock lock(mutex_);
+        auto artifacts=std::move(state_.operation.output.artifacts);
+        state_.operation.output=facts;
+        if (const auto revision=detail::PredictRevision::Progress(state_.revision,state_.operation.terminal.outcome==contracts::ComputeOperationOutcome::CancellationRequested)) state_.revision=*revision;
+        for (const auto& path : artifacts) if (std::find(state_.operation.output.artifacts.begin(),state_.operation.output.artifacts.end(),path)==state_.operation.output.artifacts.end() && state_.operation.output.artifacts.size()<contracts::kWorkflowArtifactCapacity) state_.operation.output.artifacts.push_back(path);
+       }
+       Publish(PredictChanged{snapshot()});
+      };
       if (!request->output_path.empty()) request->output_path = directory / request->output_path.filename();
       {
        std::scoped_lock lock(mutex_);
@@ -211,7 +267,7 @@ public:
         std::unique_lock context_lock(preview_context_mutex_, std::try_to_lock);
         return context_lock.owns_lock() ? preview_context_ : std::nullopt;
        },
-       preview_retirement_, [this](const auto& path) { Artifact(path); });
+       preview_retirement_, [this](const auto& path) { Artifact(path); }, media_output);
       // Native source failures already fail RunAndWrite. Optional receiver
       // failure seals custody without changing a completed semantic result.
       if (runtime_->HasUnsafeCustody()) RetireRuntime();
@@ -249,6 +305,7 @@ public:
   return snapshot();
  }
  void Shutdown() noexcept {
+  inspection_run_.StopAndJoin();
   run_.StopAndJoin();
   worker_.StopAndWait();
   pending_product_.reset();
@@ -276,7 +333,7 @@ public:
 
 private:
  void RequireStartAdmissionLocked() const {
-  if (state_.operation.active) throw contracts::BusyError("prediction is busy");
+  if (state_.operation.active || state_.inspection.active) throw contracts::BusyError("prediction is busy");
   if (!retirement_.admission_open() || !preview_retirement_->admission_open()) throw contracts::UnavailableError("prediction has unobservable CUDA custody");
  }
  mmltk::frameworks::gpu::DeviceContext PreviewContext(const mmltk::frameworks::gpu::DeviceExecution& execution) {
@@ -498,12 +555,54 @@ private:
  PredictRuntime::PreviewRetirement preview_retirement_ = std::make_shared<mmltk::frameworks::gpu::TerminalCudaRetirementOwner>(detail::PredictionPreviewPool::kSlotCapacity + 4U);
  std::shared_ptr<PredictRuntime> runtime_;
  direct::LocalRun run_;
+ direct::LocalRun inspection_run_;
  detail::VisualRuntimeOwner worker_;
 };
 PredictSystem::PredictSystem(SettingsSystem& settings, DatasetSystem& dataset, ModelSystem& model, const VisualDeviceSettings visual, PredictRuntimeFactory factory, SystemEventSink<event_type> events)
     : impl_(std::make_unique<Impl>(settings, dataset, model, visual, std::move(factory), std::move(events))) {}
 PredictSystem::~PredictSystem() = default;
-PredictSnapshot PredictSystem::Start(contracts::PredictWorkflowIntent) { return impl_->Start(); }
+PredictSnapshot PredictSystem::Inspect(PredictionSourceQuery query) {
+ if (query.path.empty()) throw contracts::InvalidIntentError("prediction dataset path is empty");
+ const auto selected=impl_->model_.selection();
+ {
+  std::scoped_lock lock(impl_->mutex_);
+  if (impl_->state_.operation.active || impl_->state_.inspection.active) throw contracts::BusyError("prediction dataset inspection is busy");
+  impl_->state_.revision=detail::PredictRevision::Admit(impl_->state_.revision);
+  impl_->state_.inspection={query.path,0U,true,{}};
+ }
+ try {
+  impl_->inspection_run_.Start({
+   .work=[this,path=query.path,selected](std::stop_token stop) -> direct::LocalRun::Notification {
+    auto result=impl_->dataset_.Inspect({path,{},{}},selected.key.preset,selected.key.resolution,stop);
+    return [this,path,result=std::move(result)] {
+     {
+      std::scoped_lock lock(impl_->mutex_);
+      if (impl_->state_.inspection.path!=path) return;
+      impl_->state_.revision=detail::PredictRevision::Admit(impl_->state_.revision);
+      auto& facts=impl_->state_.inspection; facts.active=false;
+      if (result.available() && result.splits.size()==1U) facts.count=result.splits.front().image_count;
+      else facts.error=result.detail.empty() ? "prediction dataset is unavailable" : result.detail;
+     }
+     impl_->Publish(PredictChanged{snapshot()});
+    };
+   },
+   .failure=[this,path=query.path](std::exception_ptr error) -> direct::LocalRun::Notification {
+    return [this,path,error] {
+     {
+      std::scoped_lock lock(impl_->mutex_);
+      if (impl_->state_.inspection.path!=path) return;
+      impl_->state_.revision=detail::PredictRevision::Admit(impl_->state_.revision);
+      impl_->state_.inspection.active=false;
+      impl_->state_.inspection.error=visual_failure_detail(error,"prediction dataset inspection failed");
+     }
+     impl_->Publish(PredictChanged{snapshot()});
+    };
+   }
+  });
+ } catch (...) { std::scoped_lock lock(impl_->mutex_); impl_->state_.inspection.active=false; throw; }
+ return snapshot();
+}
+PredictSnapshot PredictSystem::Start(contracts::PredictWorkflowIntent intent) { return impl_->Start(intent); }
 PredictSnapshot PredictSystem::Pause(PredictPauseIntent intent) {
  {
   std::scoped_lock lock(impl_->mutex_);

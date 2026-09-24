@@ -398,6 +398,9 @@ fn validation_inherited_source(
 #[derive(Debug, Clone)]
 pub struct PendingStart {
     pub validation_preview: crate::generated::ValidationRunPreview,
+    pub prediction_preview: crate::generated::PredictionRunPreview,
+    pub prediction_saving: crate::generated::PredictionOutputSettings,
+    pub prediction_population: u64,
     pub feature: FeatureId,
     pub inputs: StartInputs,
     pub preparation: StartPreparation,

@@ -314,7 +314,7 @@ ValidationRuntimeResult FakeNonvisualComputeRuntime::Run(rfdetr::ValidateRequest
 contracts::ComputeTerminal FakeNonvisualComputeRuntime::Run(ExportRunRequest, std::stop_token stop, const ComputeProgressSink& progress, const ComputeArtifactSink&) { return sequence_.Run(stop, progress); }
 FakePredictRuntime::FakePredictRuntime(PredictionScenario scenario) : sequence_(std::move(scenario.compute)), scenario_(std::move(scenario)) {}
 contracts::ComputeTerminal FakePredictRuntime::Run(rfdetr::PredictRequest, std::stop_token stop, const ComputeProgressSink& progress, const ProductSink& products, const PlaybackGate&, VisualExtent,
- const ContextProvider& current_context, const PreviewRetirement& retirement, const ComputeArtifactSink&) {
+ const ContextProvider& current_context, const PreviewRetirement& retirement, const ComputeArtifactSink&, const PredictionRunOutput&) {
  if (scenario_.predictions) ++*scenario_.predictions;
  auto terminal = sequence_.Run(stop, progress);
  if (terminal.outcome != contracts::ComputeOperationOutcome::Succeeded) return terminal;

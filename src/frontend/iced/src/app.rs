@@ -169,6 +169,7 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
             }
         }
     }
+    let prediction_settings_task = app.settle_prediction_total();
     app.advance_start();
     app.reconcile_surface_frame();
     let surface = app.presentation.surface();
@@ -192,7 +193,7 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
     } else {
         Task::none()
     };
-    Task::batch([task, presentation_task, integration_task])
+    Task::batch([task, prediction_settings_task, presentation_task, integration_task])
 }
 #[cfg(test)]
 mod route_tests {

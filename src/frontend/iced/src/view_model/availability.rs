@@ -146,7 +146,7 @@ impl ApplicationModel {
                     .map(|snapshot| &snapshot.operation),
                 ApplicationIntentEndpoint::ValidationStart,
             ),
-            FeatureId::Predict => self.compute_start_available_for(
+            FeatureId::Predict => !self.predict_snapshot.as_ref().is_some_and(|snapshot| snapshot.inspection.active) && self.compute_start_available_for(
                 self.predict_snapshot
                     .as_ref()
                     .map(|snapshot| &snapshot.operation),
@@ -551,6 +551,9 @@ mod tests {
         ] {
             model.workflow.pending_start = Some(PendingStart {
                 validation_preview: crate::generated::default_request_validationStartpreview().unwrap(),
+                prediction_preview: crate::generated::default_request_predictStartpreview().unwrap(),
+                prediction_saving: crate::generated::default_request_predictStartsaving().unwrap(),
+                prediction_population: 0,
                 feature: FeatureId::Train,
                 inputs: StartInputs::capture(
                     &model.settings_snapshot.as_ref().unwrap().settingsstate,

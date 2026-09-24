@@ -2,6 +2,15 @@ use super::*;
 use crate::view_model::StartPreparation;
 
 impl App {
+    pub(super) fn settle_prediction_total(&mut self) -> Task<Message> {
+        if !self.model.settings_edit_available() { return Task::none(); }
+        match crate::view::predict::output::settle_total(&self.model, self.settings.state_mut()) {
+            Ok(Some(schedule)) => self.handle_settings_schedule(schedule),
+            Ok(None) => Task::none(),
+            Err(detail) => { self.model.error = Some(UiError::invalid(detail)); Task::none() }
+        }
+    }
+
     pub(super) fn on_workspace(&mut self, message: crate::view::router::Message) -> Task<Message> {
         let outcome = match self
             .workspace
@@ -88,6 +97,14 @@ impl App {
         }
         self.model.workflow.pending_start = Some(crate::view_model::PendingStart {
             feature,
+            prediction_preview: crate::generated::PredictionRunPreview { labels: true, boxes: true, masks: self.settings.draft().unwrap().workflows.predict.request.includemasks, confidencethreshold: self.settings.draft().unwrap().workflows.predict.request.threshold },
+            prediction_population: crate::view::predict::output::matching_count(&self.model,&self.settings.draft().unwrap().workflows.predict).unwrap_or(0),
+            prediction_saving: {
+                let predict=&self.settings.draft().unwrap().workflows.predict;
+                let mut saving=predict.saving.clone();
+                if let Some(count)=crate::view::predict::output::matching_count(&self.model,predict) { saving.compiledtotal=saving.compiledtotal.min(count); }
+                saving
+            },
             validation_preview: self.workspace.validation_preview(self.model.workflow.validation.as_ref(), self.settings.draft().unwrap().workflows.validate.display.clone()),
             inputs,
             preparation: if resume_checkpoint.is_some() {
@@ -452,7 +469,7 @@ impl App {
                 self.submit_intent(ApplicationIntentEndpoint::PredictStart, |correlation| {
                     crate::generated::encode_predict_Start(
                         correlation,
-                        crate::generated::PredictWorkflowIntent {},
+                        crate::generated::PredictWorkflowIntent { preview: pending.prediction_preview, saving: pending.prediction_saving, compiledpopulation: pending.prediction_population },
                     )
                 })
             }
@@ -918,6 +935,9 @@ impl App {
 
     pub(super) fn on_predict(&mut self, outcome: crate::view::predict::Outcome) -> Task<Message> {
         match outcome {
+            crate::view::predict::Outcome::Inspect(path) => {
+                self.submit_intent(ApplicationIntentEndpoint::PredictInspect, |correlation| crate::generated::encode_predict_Inspect(correlation, crate::generated::PredictionSourceQuery { path }));
+            }
             crate::view::predict::Outcome::DialogRequested(id) => self.open_dialog(id),
             crate::view::predict::Outcome::StartRequested => {
                 self.request_start(FeatureId::Predict);
@@ -927,7 +947,7 @@ impl App {
                     self.submit_intent(ApplicationIntentEndpoint::PredictStop, |correlation| {
                         crate::generated::encode_predict_Stop(
                             correlation,
-                            crate::generated::PredictWorkflowIntent {},
+                            crate::generated::PredictWorkflowIntent { preview: crate::generated::default_request_predictStartpreview().unwrap(), saving: crate::generated::default_request_predictStartsaving().unwrap(), compiledpopulation: 0 },
                         )
                     });
                 }

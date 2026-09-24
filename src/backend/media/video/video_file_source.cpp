@@ -1,5 +1,6 @@
 #include "video_file_source.h"
 #include "video_frame_convert.h"
+#include "video_media_detail.h"
 #include "src/common/system/numa_memory.h"
 #include "src/frameworks/gpu/cuda_context_scope.h"
 #include "src/frameworks/gpu/pinned_host_buffer.h"
@@ -129,6 +130,8 @@ struct VideoFileSource::State final {
  bool hardware_attempt = false;
  bool failed = false;
  std::filesystem::path path;
+ std::function<void(const VideoAudioPacket&)> audio;
+ std::vector<std::uint64_t> audio_read, audio_delivered;
  int device_id = 0;
  void Open(bool hardware);
  unsigned Rotation() const {
@@ -267,6 +270,8 @@ struct VideoFileSource::State final {
    const auto seconds = static_cast<double>(frame->best_effort_timestamp) * av_q2d(format->streams[video_stream]->time_base);
    if (std::isfinite(seconds)) result.presentation_seconds = seconds;
   }
+  result.timing = {frame->best_effort_timestamp == AV_NOPTS_VALUE ? std::nullopt : std::optional{frame->best_effort_timestamp},
+   frame->duration, track->time_base.num, track->time_base.den};
   return result;
  }
 };
@@ -479,6 +484,8 @@ void VideoFileSource::State::Open(bool hardware) {
  fps = av_q2d(track->avg_frame_rate);
  if (!std::isfinite(fps) || fps <= 0.0) fps = av_q2d(track->r_frame_rate);
  if (!std::isfinite(fps) || fps <= 0.0) fps = 0.0;
+ audio_read.assign(format->nb_streams, 0U);
+ if (audio_delivered.empty()) audio_delivered.resize(format->nb_streams, 0U);
  total = track->nb_frames > 0 ? static_cast<std::uint64_t>(track->nb_frames) : 0U;
 }
 VideoFileSource::~VideoFileSource() = default;
@@ -517,6 +524,21 @@ std::optional<VideoFrame> VideoFileSource::Next() {
     do {
      av_packet_unref(state.packet);
      read = av_read_frame(state.format, state.packet);
+     if (read >= 0 && state.audio && state.format->streams[state.packet->stream_index]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) {
+      const auto track = static_cast<std::size_t>(state.packet->stream_index);
+      if (track >= state.audio_read.size()) throw std::runtime_error("video stream set changed during decoding");
+      const auto ordinal = ++state.audio_read[track];
+      if (ordinal > state.audio_delivered[track]) {
+       if (state.packet->size<0 || state.packet->size>16*1024*1024) throw std::runtime_error("prediction audio packet exceeds bounded capacity");
+       auto owned = std::make_shared<VideoAudioPacket::State>();
+       if (!owned->packet) throw std::bad_alloc();
+       check(av_packet_ref(owned->packet, state.packet), "retain prediction audio packet");
+       VideoAudioPacket packet;
+       packet.state_ = std::move(owned);
+       state.audio(packet);
+       state.audio_delivered[track] = ordinal;
+      }
+     }
     } while (read >= 0 && state.packet->stream_index != state.video_stream && !state.stop.stop_requested());
     if (state.stop.stop_requested()) return {};
     if (read == AVERROR_EOF) {
@@ -541,6 +563,40 @@ std::optional<VideoFrame> VideoFileSource::Next() {
   if (entered) state.failed = true;
   throw;
  }
+}
+VideoMediaInfo VideoFileSource::media_info() const {
+ const auto& source = *owner_->state;
+ const auto* track = source.format->streams[source.video_stream];
+ VideoMediaInfo result;
+ const auto rotation = source.Rotation();
+ result.width = static_cast<std::uint32_t>(rotation % 2U ? track->codecpar->height : track->codecpar->width);
+ result.height = static_cast<std::uint32_t>(rotation % 2U ? track->codecpar->width : track->codecpar->height);
+ const auto rate = track->avg_frame_rate.num > 0 && track->avg_frame_rate.den > 0 ? track->avg_frame_rate : track->r_frame_rate;
+ result.rate_numerator = rate.num;
+ result.rate_denominator = rate.den;
+ auto facts = std::make_shared<VideoMediaInfo::State>();
+ facts->time_base = track->time_base;
+ facts->origin_us = source.format->start_time == AV_NOPTS_VALUE ? 0 : source.format->start_time;
+ for (unsigned index = 0; index < source.format->nb_streams; ++index) {
+  const auto* input = source.format->streams[index];
+  if (input->codecpar->codec_type != AVMEDIA_TYPE_AUDIO) continue;
+  if (facts->audio.size() == 64U) throw std::runtime_error("video exceeds supported audio track capacity");
+  if (input->codecpar->extradata_size<0 || input->codecpar->extradata_size>1024*1024) throw std::runtime_error("prediction audio format exceeds bounded capacity");
+  auto copy = std::make_unique<VideoMediaInfo::State::Track>();
+  if (!copy->parameters) throw std::bad_alloc();
+  check(avcodec_parameters_copy(copy->parameters,input->codecpar), "copy prediction audio format");
+  check(av_dict_copy(&copy->metadata,input->metadata,0), "copy prediction audio metadata");
+  copy->source = static_cast<int>(index);
+  copy->disposition = input->disposition;
+  copy->time_base = input->time_base;
+  facts->audio.push_back(std::move(copy));
+ }
+ result.state_ = std::move(facts);
+ return result;
+}
+void VideoFileSource::SetAudioConsumer(std::function<void(const VideoAudioPacket&)> consumer) {
+ if (owner_->state->index) throw std::logic_error("audio delivery must be attached before decoding");
+ owner_->state->audio = std::move(consumer);
 }
 double VideoFileSource::frames_per_second() const noexcept { return owner_->state->fps; }
 std::uint64_t VideoFileSource::frame_count() const noexcept { return owner_->state->total; }

@@ -190,6 +190,7 @@ ComputeIntentMaterializer::PredictionMaterialization ComputeIntentMaterializer::
  } else if (source.kind == mmltk::controller::contracts::SourceKind::VideoFile) {
   if (source.video_file_path.empty()) return std::unexpected(refused("prediction video is unavailable"));
   request.source_kind = mmltk::backend::models::rfdetr::PredictSourceKind::VideoFile;
+  request.output_path.clear();
   request.video_path = source.video_file_path;
  } else {
   return std::unexpected(refused("select a compiled dataset, image, or local video file"));

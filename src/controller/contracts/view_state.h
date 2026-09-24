@@ -1,4 +1,5 @@
 #pragma once
+#include "prediction_output.h"
 #include "src/backend/data/benchmark_dataset_options.h"
 #include <array>
 #include "src/backend/imaging/resample/image_resize.h"
@@ -182,6 +183,7 @@ struct ValidateViewState {
  ModelArtifactInputKind model_input = ModelArtifactInputKind::Weights;
 };
 struct PredictViewState {
+ PredictionOutputSettings saving{};
  bool write_report_json = true;
  PredictViewState() {
   request.output_path.clear();

@@ -235,3 +235,9 @@ TEST_CASE("compiled image commands expose opt-in GDRCopy and reject the removed 
   CHECK(removed.output_text.find("unknown option") != std::string::npos);
  }
 }
+
+TEST_CASE("prediction CLI rejects an omitted JSON destination before model work", "[cli][prediction]") {
+ const auto result=mmltk::testsupport::run_subprocess_capture_output({mmltk_cli_path(),"rfdetr","predict","--image","/not-opened.png","--weights","/not-opened.pt"});
+ CHECK(result.exit_code==1);
+ CHECK(result.output_text.find("requires --output")!=std::string::npos);
+}

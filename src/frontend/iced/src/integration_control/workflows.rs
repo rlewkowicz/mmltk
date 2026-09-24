@@ -154,8 +154,18 @@ pub(super) enum Step {
     Predict,
     Source(u8),
     SourceReady(u8),
+    InspectPrediction,
+    InspectedPrediction,
+    SavingControl(u8),
+    SavingReady(u8),
+    PredictionReport(u8),
     StartPredict(u8),
     Predicting(u8),
+    WithoutMediaConfigure(u8),
+    WithoutMediaReady(u8),
+    StartWithoutMedia(u8),
+    WithoutMediaRunning(u8),
+    RestoreMedia(u8),
     Pause,
     Paused,
     Resume,
@@ -436,6 +446,17 @@ fn source(index: u8) -> SourceKind {
 fn primary(feature: FeatureId) -> &'static str {
     workflow::Composition::new(feature, 0.0).stable_id(workflow::Region::PrimaryAction)
 }
+fn prediction_output_evidence(snapshot: &crate::generated::PredictSnapshot, stage: &str) -> bool {
+    let output=&snapshot.operation.output;
+    let video=stage == "video" || stage == "stop";
+    let json=output.artifacts.iter().filter(|path| path.ends_with(".json")).count();
+    let path=if stage == "video" { output.artifacts.iter().find(|path| path.ends_with("/prediction.mkv")).map(String::as_str).unwrap_or("") }
+        else if stage == "stop" { output.partialvideo.as_str() } else { output.recentsample.as_str() };
+    reporting::emit(|sink| sink.record("integration.prediction.output",path,stage,
+        [output.completedsamples as f64,snapshot.operation.terminal.completed as f64,json as f64,if output.directory.is_empty() { 0.0 } else { 1.0 }]));
+    !path.is_empty() && !output.directory.is_empty() && (if video { json == 0 } else { output.completedsamples > 0 && json == 0 })
+}
+
 fn completed(stage: &str, facts: [f64; 4]) {
     reporting::emit(|sink| sink.record("integration.workflow.completed", "", stage, facts));
 }
@@ -1429,7 +1450,11 @@ impl State {
             Step::Explore => Step::Gallery,
             Step::Predict => Step::Source(0),
             Step::Source(index) => Step::SourceReady(index),
+            Step::InspectPrediction => Step::InspectedPrediction,
+            Step::SavingControl(index) => Step::SavingReady(index),
+            Step::PredictionReport(index) => Step::SavingReady(index),
             Step::StartPredict(index) => Step::Predicting(index),
+            Step::StartWithoutMedia(index) => Step::WithoutMediaRunning(index),
             Step::Pause => Step::Paused,
             Step::Resume => Step::VideoEnd,
             Step::Restart => Step::Restarted,
@@ -1475,7 +1500,7 @@ impl State {
                     train.map(|value| (FeatureId::Train, &value.local))
                 }
                 Step::Validating => validation.map(|value| (FeatureId::Validate, &value.operation)),
-                Step::Predicting(_) | Step::VideoEnd | Step::Restarted | Step::Stopped => {
+                Step::Predicting(_) | Step::WithoutMediaRunning(_) | Step::VideoEnd | Step::Restarted | Step::Stopped => {
                     prediction.map(|value| (FeatureId::Predict, &value.operation))
                 }
                 Step::Exporting | Step::ExportStopped => model
@@ -2222,6 +2247,30 @@ impl State {
                     }) =>
             {
                 self.generation = prediction.map_or(0, |value| value.operation.generationfrontier);
+                self.workflow_step(driver, if index == 0 { Step::InspectPrediction } else { Step::SavingControl(index) })
+            }
+            Step::InspectPrediction => self.workflow_control(widgets, driver, "predict.save.inspect"),
+            Step::InspectedPrediction if prediction.is_some_and(|value| !value.inspection.active) => {
+                let count = settings.draft.as_ref().and_then(|draft| crate::view::predict::output::matching_count(model, &draft.workflows.predict));
+                if count.is_none() { driver.fail("prediction dataset saving inspection did not return the selected source count"); return Task::none(); }
+                self.workflow_step(driver, Step::SavingControl(0))
+            }
+            Step::SavingControl(index) => {
+                if index == 1 { self.workflow_step(driver, Step::SavingReady(index)) }
+                else { self.workflow_control(widgets, driver, if index == 0 { "predict.save.percent" } else { "predict.save.video.full" }) }
+            }
+            Step::PredictionReport(_) => self.workflow_control(widgets, driver, "predict.save.json"),
+            Step::SavingReady(index) if settled => {
+                let Some(draft) = settings.draft.as_ref() else { return Task::none(); };
+                if index < 2 && draft.workflows.predict.writereportjson { return self.workflow_step(driver, Step::PredictionReport(index)); }
+                let saving = &draft.workflows.predict.saving;
+                let valid = match index {
+                    0 => saving.compiledenabled && saving.compiledmode == crate::generated::PredictionCompiledSampling::Percent && saving.compiledpercent == 10,
+                    1 => saving.singleenabled,
+                    _ => saving.videoenabled && saving.videomode == crate::generated::PredictionVideoSaving::Full,
+                };
+                if !valid { driver.fail("prediction saving controls did not preserve source defaults"); return Task::none(); }
+                reporting::emit(|sink| sink.record("integration.prediction.saving", "", "source-default", [f64::from(index), 1.0, 0.0, 0.0]));
                 self.workflow_step(driver, Step::StartPredict(index))
             }
             Step::StartPredict(_) | Step::Restart
@@ -2251,6 +2300,10 @@ impl State {
                         driver.fail("Prediction has no class labels or confidence values");
                         return Task::none();
                     }
+                    if !prediction_output_evidence(snapshot,if index == 0 { "compiled" } else { "image" }) {
+                        driver.fail("Prediction samples did not publish their completed output");
+                        return Task::none();
+                    }
                     completed(
                         picture.name(),
                         [
@@ -2260,10 +2313,42 @@ impl State {
                             0.0,
                         ],
                     );
-                    return self.workflow_step(driver, Step::Pixels(picture, 0));
+                    return self.workflow_step(driver, Step::WithoutMediaConfigure(index));
                 }
                 Task::none()
             }
+            Step::WithoutMediaConfigure(index) => {
+                self.generation = prediction.map_or(0, |value| value.operation.generationfrontier);
+                self.workflow_step(driver, Step::WithoutMediaReady(index)).chain(Task::done(RootMessage::Workspace(
+                    crate::view::router::Message::Predict(crate::view::predict::Message::Saving(if index == 0 {
+                        crate::view::predict::output::Message::CompiledEnabled(false)
+                    } else { crate::view::predict::output::Message::Single(false) })),
+                )))
+            }
+            Step::WithoutMediaReady(index) if settled && settings.draft.as_ref().is_some_and(|draft| {
+                let saving = &draft.workflows.predict.saving;
+                !(if index == 0 { saving.compiledenabled } else { saving.singleenabled })
+            }) => self.workflow_step(driver, Step::StartWithoutMedia(index)),
+            Step::StartWithoutMedia(_) if settings.draft.as_ref().is_some_and(|draft| model.compute_start_available(draft, FeatureId::Predict)) =>
+                self.workflow_control(widgets, driver, primary(FeatureId::Predict)),
+            Step::WithoutMediaRunning(index) if prediction.is_some_and(|value| value.operation.generationfrontier > self.generation && success(&value.operation)) => {
+                let snapshot = prediction.unwrap();
+                let output = &snapshot.operation.output;
+                if output.directory.is_empty() || output.completedsamples != 0 || !output.artifacts.is_empty() {
+                    driver.fail("Media-disabled prediction lost its directory or unexpectedly wrote output"); return Task::none();
+                }
+                reporting::emit(|sink| sink.record("integration.prediction.no_output", &output.directory, if index == 0 { "compiled" } else { "image" },
+                    [snapshot.operation.terminal.completed as f64, 0.0, 0.0, 0.0]));
+                self.workflow_step(driver, Step::RestoreMedia(index)).chain(Task::done(RootMessage::Workspace(
+                    crate::view::router::Message::Predict(crate::view::predict::Message::Saving(if index == 0 {
+                        crate::view::predict::output::Message::CompiledEnabled(true)
+                    } else { crate::view::predict::output::Message::Single(true) })),
+                )))
+            }
+            Step::RestoreMedia(index) if settled && settings.draft.as_ref().is_some_and(|draft| {
+                let saving = &draft.workflows.predict.saving;
+                if index == 0 { saving.compiledenabled } else { saving.singleenabled }
+            }) => self.workflow_step(driver, Step::Pixels(if index == 0 { Picture::Compiled } else { Picture::Image }, 0)),
             Step::Pause | Step::Resume if model.predict_pause_available() => {
                 self.workflow_control(widgets, driver, "predict.pause")
             }
@@ -2278,6 +2363,10 @@ impl State {
                     driver.fail("Video did not continue through EOF after resuming");
                     return Task::none();
                 }
+                if !prediction_output_evidence(snapshot,"video") {
+                    driver.fail("Video did not publish Matroska without JSON");
+                    return Task::none();
+                }
                 completed(
                     "video",
                     [snapshot.operation.terminal.completed as f64, 0.0, 0.0, 0.0],
@@ -2289,7 +2378,9 @@ impl State {
                 if prediction.is_some_and(|value| {
                     value.operation.generationfrontier > self.generation
                         && value.operation.active
-                        && value.operation.progress.completed > 0
+                        // The fixture is 2 fps: pass a source-time keyframe so
+                        // Stop tests a completed cluster, not an unfinished tail.
+                        && value.operation.progress.completed >= 4
                 }) =>
             {
                 self.workflow_step(driver, Step::Stop)
@@ -2303,6 +2394,10 @@ impl State {
                         && value.operation.terminal.outcome == ComputeOperationOutcome::Cancelled
                 }) =>
             {
+                if !prediction_output_evidence(prediction.unwrap(),"stop") {
+                    driver.fail("Stopped video did not retain its partial Matroska output");
+                    return Task::none();
+                }
                 completed(
                     "stop",
                     [

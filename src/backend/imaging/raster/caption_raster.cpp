@@ -1,4 +1,5 @@
 #include "caption_raster.h"
+#include "src/common/types/utf8.h"
 #include "detail/caption_raster_cuda.h"
 #include "caption_font_data.h"
 #include "src/frameworks/gpu/cuda_error.h"
@@ -10,26 +11,26 @@
 #include <cmath>
 #include <stdexcept>
 #include <utility>
+#include <iterator>
 #include <vector>
 namespace mmltk::backend::imaging::raster {
 namespace gpu = mmltk::frameworks::gpu;
 namespace {
-constexpr unsigned kHeight = 22U;
+constexpr std::string_view kSuffixGlyphs = " 0123456789.-+e";
 std::vector<int> codepoints(const std::string& text) {
  std::vector<int> result;
- for (std::size_t offset = 0; offset < text.size();) {
-  unsigned value = static_cast<unsigned char>(text[offset++]);
-  unsigned count = 0;
-  if (value >= 0xF0U) { value &= 7U; count = 3; }
-  else if (value >= 0xE0U) { value &= 15U; count = 2; }
-  else if (value >= 0xC0U) { value &= 31U; count = 1; }
-  else if (value >= 0x80U) throw std::invalid_argument("invalid UTF-8 class caption");
-  for (unsigned index = 0; index < count; ++index) {
-   if (offset == text.size() || (static_cast<unsigned char>(text[offset]) & 0xC0U) != 0x80U) throw std::invalid_argument("invalid UTF-8 class caption");
-   value = (value << 6U) | (static_cast<unsigned char>(text[offset++]) & 63U);
+ std::string_view remaining(text);
+ while (!remaining.empty()) {
+  const auto length = mmltk::common::types::utf8_prefix_length(remaining);
+  if (!length) throw std::invalid_argument("invalid UTF-8 class caption");
+  unsigned value = static_cast<unsigned char>(remaining.front());
+  if (length > 1U) {
+   value &= (1U << (7U - length)) - 1U;
+   for (std::size_t index = 1; index < length; ++index)
+    value = (value << 6U) | (static_cast<unsigned char>(remaining[index]) & 63U);
   }
-  if (value > 0x10FFFFU || (value >= 0xD800U && value <= 0xDFFFU) || (count && value < (count == 1 ? 0x80U : count == 2 ? 0x800U : 0x10000U))) throw std::invalid_argument("invalid UTF-8 class caption");
   result.push_back(static_cast<int>(value));
+  remaining.remove_prefix(length);
  }
  return result;
 }
@@ -49,6 +50,7 @@ struct CaptionRaster::Impl final {
  stbtt_fontinfo face{};
  std::vector<std::string> names;
  std::vector<unsigned> widths;
+ std::array<unsigned, kSuffixGlyphs.size()> suffix_widths{};
  gpu::ImageBuffer atlas, commands, winners;
  std::unique_ptr<gpu::PinnedHostBuffer> atlas_source, command_source;
  gpu::ImageStream upload;
@@ -57,13 +59,15 @@ struct CaptionRaster::Impl final {
 CaptionRaster::CaptionRaster(gpu::DeviceContext context) : impl_(std::make_unique<Impl>(std::move(context))) {}
 CaptionRaster::~CaptionRaster() = default;
 void CaptionRaster::Prepare(std::span<const std::string> names) {
- if (std::ranges::equal(names, impl_->names)) return;
+ if (impl_->retained.valid() && std::ranges::equal(names, impl_->names)) return;
  if (names.empty() || names.size() > 65536U) throw std::invalid_argument("caption catalog is empty or too large");
  std::vector<std::vector<int>> points;
  std::vector<unsigned> widths;
+ std::vector<std::string> catalog(names.begin(), names.end());
+ for (const char glyph : kSuffixGlyphs) catalog.emplace_back(1U, glyph);
  const float scale = stbtt_ScaleForPixelHeight(&impl_->face, 16.0F);
  unsigned maximum = 1U;
- for (const auto& name : names) {
+ for (const auto& name : catalog) {
   if (name.size() > 256U) throw std::invalid_argument("caption name exceeds its bound");
   points.push_back(codepoints(name));
   float advance = 0;
@@ -73,7 +77,7 @@ void CaptionRaster::Prepare(std::span<const std::string> names) {
  }
  // Store coverage in the first byte of each RGBA texel. ImageBuffer owns
  // context-aware allocation, upload settlement and high-water reuse.
- const auto coverage_bytes = static_cast<std::size_t>(maximum) * kHeight * names.size() * 4U;
+ const auto coverage_bytes = static_cast<std::size_t>(maximum) * kNativeCaptionHeight * catalog.size() * 4U;
  if (coverage_bytes > 64U * 1024U * 1024U) throw std::invalid_argument("caption atlas exceeds its bounded storage");
  std::vector<std::uint8_t> pixels(coverage_bytes);
  std::vector<std::uint8_t> glyph;
@@ -88,8 +92,8 @@ void CaptionRaster::Prepare(std::span<const std::string> names) {
    if (width && height) stbtt_MakeCodepointBitmap(&impl_->face, glyph.data(), width, height, width, scale, scale, point);
    for (int y = 0; y < height; ++y) for (int x = 0; x < width; ++x) {
     const int target_x = static_cast<int>(pen) + x0 + x, target_y = 17 + y0 + y;
-    if (target_x >= 0 && target_x < static_cast<int>(widths[row]) && target_y >= 0 && target_y < static_cast<int>(kHeight)) {
-     auto& pixel = pixels[((row * kHeight + static_cast<unsigned>(target_y)) * maximum + static_cast<unsigned>(target_x)) * 4U];
+    if (target_x >= 0 && target_x < static_cast<int>(widths[row]) && target_y >= 0 && target_y < static_cast<int>(kNativeCaptionHeight)) {
+     auto& pixel = pixels[((row * kNativeCaptionHeight + static_cast<unsigned>(target_y)) * maximum + static_cast<unsigned>(target_x)) * 4U];
      pixel = std::max(pixel, glyph[static_cast<std::size_t>(y) * static_cast<unsigned>(width) + static_cast<unsigned>(x)]);
     }
    }
@@ -102,7 +106,7 @@ void CaptionRaster::Prepare(std::span<const std::string> names) {
  std::memcpy(impl_->atlas_source->data(),pixels.data(),pixels.size());
  impl_->retained = {};
  try {
-  impl_->atlas.Write(impl_->upload, gpu::ImagePlaneKind::Clean, maximum, static_cast<unsigned>(names.size()) * kHeight, [&](auto plane, auto stream) {
+  impl_->atlas.Write(impl_->upload, gpu::ImagePlaneKind::Clean, maximum, static_cast<unsigned>(catalog.size()) * kNativeCaptionHeight, [&](auto plane, auto stream) {
    gpu::ensure_cuda_ok(cudaMemcpy2DAsync(reinterpret_cast<void*>(plane.data), plane.descriptor.pitch_bytes, impl_->atlas_source->data(), maximum * 4U, maximum * 4U, plane.descriptor.height, cudaMemcpyHostToDevice, reinterpret_cast<cudaStream_t>(stream)), "upload bundled caption atlas");
   });
   // A catalog changes rarely. Settle this upload once before advertising it;
@@ -111,6 +115,11 @@ void CaptionRaster::Prepare(std::span<const std::string> names) {
  } catch (...) { impl_->upload.RethrowAfterSettlement(std::current_exception()); }
  impl_->retained = impl_->atlas.Borrow();
  impl_->widths = std::move(widths);
+ for (std::size_t index = 0; index < kSuffixGlyphs.size(); ++index) {
+  int advance = 0, bearing = 0;
+  stbtt_GetCodepointHMetrics(&impl_->face, kSuffixGlyphs[index], &advance, &bearing);
+  impl_->suffix_widths[index] = std::max(1U, static_cast<unsigned>(std::ceil(static_cast<float>(advance) * scale)));
+ }
  impl_->names.assign(names.begin(), names.end());
 }
 void CaptionRaster::Draw(gpu::ImagePlaneView target, std::span<const NamedCaption> captions, std::uintptr_t stream) const {
@@ -125,8 +134,23 @@ void CaptionRaster::Draw(gpu::ImagePlaneView target, std::span<const NamedCaptio
  auto* commands = static_cast<detail::CaptionCommand*>(impl_->command_source->data());
  for (std::size_t index=0; index<captions.size(); ++index) {
   const auto& item=captions[index];
-  if (item.name >= impl_->widths.size()) throw std::invalid_argument("caption category is absent");
+  if (item.name >= impl_->names.size()) throw std::invalid_argument("caption category is absent");
   commands[index] = {item.name,impl_->widths[item.name],unsigned(item.background[0]) | (unsigned(item.background[1])<<8U) | (unsigned(item.background[2])<<16U),item.x,item.y};
+  auto& command = commands[index];
+  command.name_width = command.width;
+  if (item.suffix.size() > std::size(command.suffix)) throw std::invalid_argument("caption suffix exceeds its bound");
+  unsigned pen = command.width - 4U;
+  for (const char glyph : item.suffix) {
+   const auto ordinal = kSuffixGlyphs.find(glyph);
+   if (ordinal == std::string_view::npos) throw std::invalid_argument("caption suffix must contain numeric ASCII glyphs");
+   const auto row = static_cast<unsigned>(impl_->names.size() + ordinal);
+   // Atlas rows have four-pixel margins. Advance is independent of the
+   // minimum background width retained for ordinary class-only captions.
+   const auto width = impl_->suffix_widths[ordinal];
+   command.suffix[command.suffix_count++] = {row, pen, pen + width};
+   pen += width;
+  }
+  if (command.suffix_count) command.width = pen + 4U;
  }
  impl_->Allocate(impl_->commands,impl_->command_read,static_cast<unsigned>((bytes+3U)/4U),1U);
  impl_->Allocate(impl_->winners,impl_->winner_read,target.descriptor.width,target.descriptor.height);

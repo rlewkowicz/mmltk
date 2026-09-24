@@ -20,6 +20,8 @@ mmltk_register_public_headers(
         ../train/training_system.h)
 mmltk_register_ordinary_sources(
     mmltk_controller_data_compute_systems
+    detail/prediction_output.cpp
+    detail/prediction_sampling.cpp
     compute_intent_materializer.cpp
     compute_runtime.cpp
     ../export/export_run.cpp
@@ -37,6 +39,8 @@ mmltk_register_retained_module_importers(
     detail/prediction_preview.cpp)
 mmltk_register_private_headers(
     mmltk_controller_data_compute_systems detail/cuda_runtime_resources.h
+        detail/prediction_output.h
+        detail/prediction_sampling.h
         detail/predict_revision.h
         detail/prediction_playback.h
         detail/prediction_preview.h
@@ -60,6 +64,7 @@ target_link_libraries(mmltk_controller_data_compute_systems
         mmltk::backend::models::rfdetr::inference
         mmltk::backend::models::rfdetr::training
         mmltk::controller::visual_runtime
+        mmltk::backend::media::video
         mmltk::backend::imaging::raster
         mmltk::backend::imaging::resample
         mmltk::backend::imaging::explore
@@ -80,13 +85,16 @@ function(mmltk_add_controller_subsystems_system_tests)
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/application_data_compute_systems.test.cpp
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/dataset_system.test.cpp
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/model_system.test.cpp
-        ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/predict_system.test.cpp
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/training_provider.test.cpp
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/runtime_placement.test.cpp
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/../validate/tests/validation_system.test.cpp
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/application_compute_services.test.cpp
+        ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/prediction_output.test.cpp
+        ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/prediction_sampling.test.cpp
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/prediction_playback.test.cpp
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/prediction_test_support.cpp)
+    mmltk_register_retained_module_importers(mmltk_controller_data_compute_systems_tests
+        ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/predict_system.test.cpp)
     mmltk_register_private_headers(mmltk_controller_data_compute_systems_tests
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/prediction_test_support.h
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/application_data_test_support.h)
@@ -100,6 +108,8 @@ function(mmltk_add_controller_subsystems_system_tests)
         mmltk_test_support
         mmltk::backend::data
         mmltk::backend::models::rfdetr::contract
+        mmltk::backend::models::rfdetr::inference
+        mmltk::backend::media::video
         mmltk::common::io
         mmltk::controller::data_compute_systems
         mmltk::controller::runtime

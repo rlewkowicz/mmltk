@@ -396,7 +396,7 @@ void execute_prediction_batch(const PredictRequest& options, PredictionBackend& 
  bool masks = false, pixels = false;
  for (std::size_t image = 0; image < batch_size; ++image) {
   auto demand = delivery.demand ? delivery.demand(indices.empty() ? first_index + static_cast<std::int64_t>(image) : indices[image]) : PredictionDemand{};
-  demand.encoded_masks = (options.include_masks || demand.encoded_masks) && backend.has_masks();
+  demand.encoded_masks = ((delivery.encoded_masks && options.include_masks) || demand.encoded_masks) && backend.has_masks();
   demand.source_pixels = (delivery.source_pixels || demand.source_pixels) && static_cast<bool>(delivery.completed);
   demand.preview_masks =
    demand.source_pixels && (options.include_masks || demand.preview_masks) && backend.has_masks() && width <= delivery.maximum_pixel_width && height <= delivery.maximum_pixel_height;
@@ -688,6 +688,8 @@ void complete_prediction_record(PredictionRecord& record, std::size_t index, con
  const auto bytes_per_pixel = checked_prediction_extent(3U, sizeof(float), kMaximumPredictionTensorBytes);
  const mmltk::backend::media::video::VideoFrameCapacity capacity{kMaximumPredictionTensorBytes / bytes_per_pixel};
  auto source = std::make_shared<mmltk::backend::media::video::VideoFileSource>(options.video_path, capacity, options.device_id, command_stream.native_handle, delivery.stop, source_retirement);
+ if (delivery.media_begin) delivery.media_begin(source->media_info());
+ source->SetAudioConsumer(delivery.audio);
  if (delivery.begin) delivery.begin(result);
  const auto cuda = torch::TensorOptions().dtype(at::kFloat).device(torch::kCUDA, options.device_id);
  const auto resolution = static_cast<int>(backend.resolution());
@@ -708,7 +710,7 @@ void complete_prediction_record(PredictionRecord& record, std::size_t index, con
   preprocessor.record_consumer(reinterpret_cast<cudaStream_t>(command_stream.native_handle));
   PredictionRecord record{.dataset_index = static_cast<std::int64_t>(frame->index), .image_id = static_cast<std::int64_t>(frame->index + 1U), .source_name = options.video_path.string()};
   complete_prediction_record(
-   record, 0U, options, backend, annotations, readback, delivery, result, total, {frame->chw, frame->width, frame->height, options.device_id, command_stream.native_handle}, source);
+   record, 0U, options, backend, annotations, readback, delivery, result, total, {.chw=frame->chw, .width=frame->width, .height=frame->height, .device=options.device_id, .stream=command_stream.native_handle, .timing=frame->timing}, source);
  }
  result.cancelled = delivery.stop.stop_requested();
  finish_prediction_run(result, started);
@@ -799,6 +801,7 @@ PredictionRunResult run_prediction(const PredictRequest& request) {
  PredictionJsonWriter writer(request);
  const auto result = session.Run(request, {.native_handle = stream, .valid = true},
   {
+   .encoded_masks = true,
    .begin = [&](const auto& summary) { writer.Begin(summary); },
    .completed = [&](const auto& record, auto, const auto&) { writer.Append(record); },
   });
@@ -862,6 +865,7 @@ PredictionRunResult PredictionSession::RunResolved(
 PredictionRunResult PredictionSession::RunAndWrite(const PredictRequest& request, const runtime::BorrowedCommandStream command_stream, const PredictionDelivery& delivery) {
  PredictionJsonWriter writer(request);
  auto combined = delivery;
+ combined.encoded_masks = true;
  combined.begin = [&](const auto& summary) {
   writer.Begin(summary);
   if (delivery.begin) delivery.begin(summary);
@@ -903,6 +907,7 @@ PredictionRunResult PredictionSession::State::RunResolved(
  if (loader->image_width() != bound_backend.resolution() || loader->image_height() != bound_backend.resolution()) {
   throw std::invalid_argument("compiled dataset resolution does not match RF-DETR artifact");
  }
+ result.source_images=loader->num_images();
  if (delivery.begin) delivery.begin(result);
  const auto total = options.limit_images == 0U ? loader->num_images() : std::min(options.limit_images, loader->num_images());
  const auto image_ids = EvaluationDatasetOwner(*loader, EvaluationMetricSet::BBox).image_ids();
@@ -960,7 +965,10 @@ struct PredictionJsonWriter::State final {
  bool begun = false;
  bool committed = false;
 };
-PredictionJsonWriter::PredictionJsonWriter(const PredictRequest& request) : state_(std::make_unique<State>()) { state_->request = request; }
+PredictionJsonWriter::PredictionJsonWriter(const PredictRequest& request) : state_(std::make_unique<State>()) {
+ if (request.output_path.empty()) throw std::invalid_argument("prediction JSON requires an output path");
+ state_->request = request;
+}
 PredictionJsonWriter::~PredictionJsonWriter() {
  try {
   if (state_->stream.is_open()) state_->stream.close();

@@ -59,4 +59,15 @@ TEST_CASE("bundled named captions retain Unicode glyphs painter order and clippe
  dense.push_back(first[0]);
  CHECK_THROWS(draw(dense));
  CHECK_THROWS(captions.Prepare(std::array<std::string,1>{std::string(257,'x')}));
+ CHECK_THROWS(captions.Prepare(std::array<std::string,1>{"\xF8\x90\x80\x80"}));
+ captions.Prepare(names);
+ CHECK(draw(first)==white);
+ auto numeric = first;
+ numeric[0].suffix = " 0.25";
+ const auto confidence = draw(numeric);
+ numeric[0].suffix = " 0.75";
+ CHECK(draw(numeric) != confidence);
+ captions.Prepare(names);
+ numeric[0].suffix = " 0.25";
+ CHECK(draw(numeric) == confidence);
 }

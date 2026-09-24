@@ -588,6 +588,7 @@ void run_compile(const CompileCliRequest& request) {
  throw std::system_error(errno, std::generic_category(), "failed to exec ONNX info helper");
 }
 void finalize_predict_request(PredictCliRequest& state) {
+ if (state.request.output_path.empty()) throw std::invalid_argument("rfdetr predict requires --output");
  state.request.image_inputs.clear();
  const auto count = state.image_paths.size();
  const auto source_kind = count == 0U ? rfdetr::PredictSourceKind::CompiledDataset : rfdetr::PredictSourceKind::ImageFiles;

@@ -93,7 +93,7 @@ TEST_CASE("cancelled prediction does not bind an artifact or deliver records", "
  request.source_kind = rfdetr::PredictSourceKind::ImageFiles;
  request.image_inputs.push_back({"/not-opened.png", "frame", 9});
  request.weights_path = "/not-opened.pt";
- request.output_path = "/not-written.json";
+ request.output_path.clear();
  std::stop_source stop;
  stop.request_stop();
  rfdetr::PredictionSession session;
@@ -319,6 +319,8 @@ TEST_CASE("prediction delivers bounded ordered images masks and receiver-owned p
  }});
  CHECK(without_masks.processed_images == 1U);
  CHECK_FALSE(without_masks.cancelled);
+ const auto report_path=request.output_path;
+ request.output_path.clear(); // Direct delivery has no JSON destination.
  request.limit_images = 3U;
  std::size_t selected_count = 0U;
  const auto selective = session.Run(request, command,
@@ -355,6 +357,7 @@ TEST_CASE("prediction delivers bounded ordered images masks and receiver-owned p
   }
  request.limit_images = 1U;
  std::size_t preview_refusals = 0U;
+ request.output_path=report_path;
  const auto preview_limited = session.RunAndWrite(request, command,
   {
    .source_pixels = true,

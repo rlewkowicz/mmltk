@@ -1,3 +1,4 @@
+pub(crate) mod output;
 use crate::view::shared::status_text;
 use crate::fluent_theme::Element;
 use crate::presentation_surface::Surface;
@@ -6,6 +7,7 @@ use iced::widget::{button, column, container};
 
 #[derive(Debug, Clone)]
 pub enum Message {
+    Saving(output::Message),
     Output(crate::view::workflow::output::Message),
     ReportChanged(bool),
     Loading(crate::view::workflow::loading::Message),
@@ -24,6 +26,7 @@ pub enum Message {
 
 #[derive(Debug, Clone)]
 pub enum Outcome {
+    Inspect(String),
     DialogRequested(u64),
     StartRequested,
     // CLEANUP-IGNORE: Predict retains its local domain outcome and workflow-bound child component ownership.
@@ -173,8 +176,10 @@ impl Component {
             crate::view::shared::identified("predict.card.output", crate::view::shared::card("Output", "", column![
                 Element::from(crate::view::workflow::output::content(crate::generated::FeatureId::Predict, model, settings,
                     model.predict_snapshot.as_ref().map(|snapshot| &snapshot.operation.output))).map(Message::Output),
-                crate::view::workflow::fields::toggle("Save prediction JSON", draft.is_none_or(|value| value.writereportjson),
-                    settings_edit_available, Message::ReportChanged),
+                output::view(model,draft,settings_edit_available).map(Message::Saving),
+                crate::view::shared::disclosure("predict.save.json",draft.is_none_or(|value| value.source.kind != crate::generated::SourceKind::VideoFile),
+                    crate::view::workflow::fields::toggle("Save prediction JSON", draft.is_none_or(|value| value.writereportjson),
+                    settings_edit_available, Message::ReportChanged)),
             ].spacing(crate::view::workflow::FIELD_SPACING))),
             crate::view::workflow::primary_action(
                 crate::generated::FeatureId::Predict,
@@ -287,6 +292,9 @@ impl Component {
         message: Message,
     ) -> Result<Option<Outcome>, String> {
         let outcome = match message {
+            Message::Saving(output::Message::Ignore) => return Ok(None),
+            Message::Saving(output::Message::Inspect(path)) => Outcome::Inspect(path),
+            Message::Saving(message) => Outcome::SettingsEdited(output::update(settings,message)?),
             Message::ReportChanged(value) => Outcome::SettingsEdited(settings.edit(crate::view::settings::EditCadence::Immediate,
                 |draft| crate::generated::edit_workflowspredictwritereportjson(draft, value))?),
             Message::Output(crate::view::workflow::output::Message::Browse(id)) => Outcome::DialogRequested(id),

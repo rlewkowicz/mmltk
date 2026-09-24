@@ -22,7 +22,7 @@ mmltk_register_ordinary_sources(
     chw_image.cu
     raster_cuda.cu
     mask_pack_cuda.cu)
-mmltk_register_public_headers(mmltk_backend_imaging_raster BASE_DIRS ${CMAKE_SOURCE_DIR} FILES rendered_image_writer.h caption_raster.h chw_image.h image_operations.h image_containment.h)
+mmltk_register_public_headers(mmltk_backend_imaging_raster BASE_DIRS ${CMAKE_SOURCE_DIR} FILES native_caption_metrics.h rendered_image_writer.h caption_raster.h chw_image.h image_operations.h image_containment.h)
 mmltk_register_private_headers(
     mmltk_backend_imaging_raster
     detail/checked_png.h
@@ -71,3 +71,9 @@ set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${CMAKE_SOURCE_D
 file(READ "${CMAKE_SOURCE_DIR}/src/frontend/iced/assets/SourceSansPro-Regular.otf" MMLTK_CAPTION_FONT_HEX HEX)
 string(REGEX REPLACE "(..)" "0x\\1," MMLTK_CAPTION_FONT_BYTES "${MMLTK_CAPTION_FONT_HEX}")
 file(CONFIGURE OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/caption_font_data.h" CONTENT "static constexpr unsigned char kCaptionFont[] = {${MMLTK_CAPTION_FONT_BYTES}};\n" @ONLY)
+
+# The face is embedded in native code; its notices must accompany native installs.
+install(FILES "${CMAKE_SOURCE_DIR}/src/frontend/iced/assets/OFL.txt"
+    DESTINATION share/licenses/mmltk/caption-font)
+install(FILES "${CMAKE_SOURCE_DIR}/third_party/stb/stb_truetype.h"
+    DESTINATION share/licenses/mmltk/stb-truetype)

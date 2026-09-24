@@ -264,6 +264,7 @@ void visit_record_fields(State& state, const Visitor& visit) {
 }
 constexpr auto benchmark_selection_fields = [](auto& selection, const auto& fields) { visit_record_fields<mmltk::backend::data::BenchmarkDatasetSelection>(selection, fields); };
 constexpr auto output_selection_fields = [](auto& state, const auto& visit) { visit_record_fields<WorkflowOutputSelection>(state, visit); };
+constexpr auto prediction_output_fields = [](auto& state, const auto& visit) { visit_record_fields<PredictionOutputSettings>(state, visit); };
 constexpr auto validation_display_fields = [](auto& state, const auto& visit) { visit_record_fields<ValidationDisplaySettings>(state, visit); };
 constexpr auto source_fields = [](auto& state, const auto& visit) { visit_record_fields<SourceSelectionState>(state, visit); };
 constexpr auto train_dataset_fields = [](auto& state, const auto& visit) {
@@ -790,6 +791,7 @@ nlohmann::json snapshot_workflows(const GuiSettingsState& settings) {
   const PredictViewState& s = settings.workflows.predict;
   nlohmann::json predict_json = snapshot_workflow_artifacts_and_execution(s, ModelArtifactsShape{}, s.request, predict_execution_fields);
   predict_json["source"] = s.source;
+  predict_json["saving"] = snapshot_fields(s.saving, prediction_output_fields);
   predict_json[kPredictKey] = snapshot_fields(s.request, predict_fields);
   predict_json[kPredictKey]["live_split_count"] = s.live_split_count;
   predict_json[kPredictKey]["write_report_json"] = s.write_report_json;
@@ -838,6 +840,7 @@ void apply_workflows(const nlohmann::json& j, GuiSettingsState& settings) {
  });
  apply_workflow(*workflows_json, &settings.workflows.predict, "predict", [](const nlohmann::json& predict, PredictViewState& s) {
   apply_workflow_section(predict, s.output, "output", output_selection_fields);
+  apply_workflow_section(predict, s.saving, "saving", prediction_output_fields);
   if (const nlohmann::json* source = find_object(predict, "source")) { source_fields(s.source, JsonFieldReader{*source}); }
   apply_workflow_artifacts_and_execution(predict, s, ModelArtifactsShape{}, s.request, predict_execution_fields);
   apply_workflow_section(predict, s.request, kPredictKey, predict_fields);

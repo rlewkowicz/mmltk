@@ -8,6 +8,7 @@
 #include <string>
 #include <string_view>
 #include <vector>
+#include "src/backend/media/video/video_file_source.h"
 #include "src/backend/ml/runtime/analysis_provider.h"
 #include "src/backend/models/rfdetr/contract/artifacts.h"
 #include "src/backend/models/rfdetr/core/evaluation.h"
@@ -27,6 +28,7 @@ struct PredictionRunResult {
  bool masks_available = false;
  bool cancelled = false;
  std::size_t processed_images = 0;
+ std::uint64_t source_images = 0;
  PhaseTiming timing{};
 };
 // Current-record pixels are either CHW device storage or owned decoded RGB8.
@@ -45,6 +47,7 @@ struct PredictionPixels final {
  void (*stop_source)(void*) = nullptr;
  void* source_control = nullptr;
  std::string_view preview_failure{};
+ mmltk::backend::media::video::VideoTiming timing{};
 };
 struct PredictionDemand final {
  bool source_pixels = false;
@@ -57,11 +60,16 @@ struct PredictionDelivery final {
  // raw preview demand, completed still receives every semantic record (including RLE),
  // while its annotation storage has no available device planes.
  bool source_pixels = false;
+ // Standalone semantic delivery retains its mask contract. Application
+ // consumers explicitly disable this when no JSON/RLE sink is attached.
+ bool encoded_masks = true;
  // Additional per-source demand is resolved before the native batch forward.
  std::function<PredictionDemand(std::int64_t)> demand{};
  std::uint32_t maximum_pixel_width = UINT32_MAX;
  std::uint32_t maximum_pixel_height = UINT32_MAX;
  std::function<bool(std::optional<double>, double)> before_frame{};
+ std::function<void(const mmltk::backend::media::video::VideoMediaInfo&)> media_begin{};
+ std::function<void(const mmltk::backend::media::video::VideoAudioPacket&)> audio{};
  std::function<void(const PredictionRunResult&)> begin{};
  std::function<void(const PredictionRecord&, PredictionPixels, const mmltk::backend::ml::runtime::AnalysisAnnotationStorage&)> completed{};
  std::function<void(std::size_t completed, std::size_t total)> progress{};

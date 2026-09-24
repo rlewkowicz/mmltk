@@ -3,9 +3,14 @@
 #include "src/controller/subsystems/system/tests/prediction_test_support.h"
 #include "src/test_support/async_test_utils.hpp"
 #include "src/test_support/filesystem_test_utils.hpp"
+#include "src/test_support/cuda_test_utils.hpp"
 #include "src/controller/subsystems/system/predict_system.h"
 #include "src/controller/subsystems/system/detail/prediction_preview.h"
 #include "src/controller/subsystems/system/detail/predict_revision.h"
+#include "src/controller/subsystems/system/detail/prediction_output.h"
+#include "src/backend/models/rfdetr/inference/prediction_delivery.h"
+#include "src/backend/models/rfdetr/core/class_layout.h"
+#include <stb_image_write.h>
 #include "src/backend/ml/runtime/backend_factory.h"
 #include "src/backend/data/catalog/class_catalog.h"
 #include "src/common/system/numa_topology.h"
@@ -27,6 +32,7 @@
 #include <cuda_runtime_api.h>
 #include <exception>
 #include <future>
+#include <fstream>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -37,6 +43,7 @@
 #include <utility>
 #include <variant>
 #include <vector>
+import mmltk.backend.models.rfdetr.inference.prediction;
 using namespace mmltk::controller::test_support;
 namespace mmltk::controller {
 namespace {
@@ -77,7 +84,7 @@ public:
  }
  [[nodiscard]] bool HasUnsafeCustody() const noexcept override { return unsafe_; }
  contracts::ComputeTerminal Run(mmltk::backend::models::rfdetr::PredictRequest, std::stop_token, const ComputeProgressSink&, const ProductSink&, const PlaybackGate&, VisualExtent,
-  const ContextProvider&, const PreviewRetirement& retirement, const ComputeArtifactSink&) override {
+  const ContextProvider&, const PreviewRetirement& retirement, const ComputeArtifactSink&, const PredictionRunOutput&) override {
   if (preview_terminal_) {
    auto lease = mmltk::frameworks::gpu::ReserveTerminalCudaLease(*retirement);
    auto retained = custody_;
@@ -122,6 +129,137 @@ TEST_CASE("Predict seals unsafe execution and close custody across repeated admi
   custody.reset();
  }
  CHECK_FALSE(retained.expired());
+}
+TEST_CASE("prediction count inspection preserves source identity and revalidates Start before output admission", "[controller][systems][predict][output]") {
+ const auto root=mmltk::testsupport::make_temp_root("predict-count-inspection");
+ ApplicationDataFixture fixture{root};
+ fixture.PrepareModel(contracts::FeatureId::Predict);
+ auto [settings,dataset,model]=fixture.systems();
+ std::promise<void> inspected,failed;
+ std::atomic_size_t constructions=0U;
+ const auto path=(root/"train.bin").string();
+ PredictSystem prediction{settings,dataset,model,{.device=0,.maximum_width=64U,.maximum_height=64U},
+  [&] { ++constructions; return std::make_unique<UnsafePredictRuntime>(false,std::make_shared<int>(0)); },
+  [&](PredictSystem::event_type event) {
+   if (const auto* changed=std::get_if<PredictChanged>(&event); changed && changed->snapshot.inspection.path==path && !changed->snapshot.inspection.active)
+    mmltk::testsupport::release_test_promise(inspected);
+   if (const auto* failure=std::get_if<PredictFailed>(&event); failure && !failure->snapshot.operation.active)
+    mmltk::testsupport::release_test_promise(failed);
+  }};
+ CHECK_THROWS_AS(prediction.Inspect({}),contracts::InvalidIntentError);
+ static_cast<void>(prediction.Inspect({path}));
+ mmltk::testsupport::await_test_promise(inspected,"prediction source inspection");
+ const auto snapshot=prediction.snapshot();
+ CHECK(snapshot.inspection.path==path);
+ CHECK(snapshot.inspection.count==1U);
+ CHECK(snapshot.inspection.error.empty());
+ CHECK_FALSE(snapshot.operation.active);
+ CHECK(snapshot.operation.output.directory.empty());
+ CHECK(constructions==0U);
+ contracts::PredictWorkflowIntent intent;
+ intent.compiled_population=2U;
+ static_cast<void>(prediction.Start(intent));
+ mmltk::testsupport::await_test_promise(failed,"prediction replacement admission");
+ CHECK_FALSE(prediction.snapshot().operation.active);
+ CHECK(prediction.snapshot().operation.output.directory.empty());
+ CHECK(constructions==0U);
+}
+class OutputDatasetRuntime final : public DatasetRuntime {
+public:
+ services::ArtifactCompileResult Compile(const services::ArtifactCompileRequest&,std::stop_token,const std::function<void(const contracts::ArtifactProgress&)>&) override { throw std::logic_error("unexpected compilation"); }
+ contracts::ArtifactInspection Inspect(const std::array<std::filesystem::path,contracts::kArtifactSplitCapacity>& paths,std::string_view,std::uint32_t,std::stop_token) override {
+  auto result=successful_inspection(paths);
+  for (auto& item : result.splits) item.image_count=100;
+  return result;
+ }
+};
+class OutputPredictRuntime final : public PredictRuntime {
+public:
+ contracts::ComputeTerminal Run(mmltk::backend::models::rfdetr::PredictRequest request,std::stop_token,const ComputeProgressSink&,const ProductSink&,const PlaybackGate&,VisualExtent,
+  const ContextProvider&,const PreviewRetirement&,const ComputeArtifactSink& published,const PredictionRunOutput& options) override {
+  namespace rfdetr=mmltk::backend::models::rfdetr;
+  namespace gpu=mmltk::frameworks::gpu;
+  const bool compiled=request.source_kind==rfdetr::PredictSourceKind::CompiledDataset;
+  const bool saving=compiled ? options.saving.compiled_enabled : options.saving.single_enabled;
+  DirectComputeConfiguration config;
+  if (saving) config.execution=gpu::resolve_device_execution(0,mmltk::common::system::NumaTopology::Capture());
+  detail::PredictionOutput output(config,request.source_kind,options,{});
+  auto catalog=std::make_shared<const mmltk::backend::data::catalog::ClassCatalog>(std::vector<std::string>{"object"});
+  rfdetr::PredictionRunResult summary{.class_catalog=catalog,.class_domain=mmltk::backend::data::catalog::ClassReferenceDomain::Foreground,.source_images=compiled ? 100U:1U};
+  summary.artifacts.class_layout=rfdetr::native_training_class_layout(*catalog);
+  output.Begin(summary);
+  std::unique_ptr<rfdetr::PredictionJsonWriter> json;
+  if (!request.output_path.empty()) { json=std::make_unique<rfdetr::PredictionJsonWriter>(request); json->Begin(summary); }
+  const auto total=compiled ? std::min<std::size_t>(100U,request.limit_images ? request.limit_images:100U):1U;
+  for (std::size_t ordinal=0;ordinal<total;++ordinal) {
+   rfdetr::PredictionRecord record{.dataset_index=static_cast<std::int64_t>(compiled ? 99U-ordinal:0U)};
+   if (output.Wants(record.dataset_index)) {
+    std::vector<std::uint8_t> pixels(16U*16U*3U,80U);
+    auto source=PredictionSource::Decoded({16,16},pixels,catalog);
+    static_cast<void>(output.Capture(record,{.width=16,.height=16,.device=0,.rgb8=source.rgb8(),.custody=source.custody()},source.annotations()));
+   }
+   if (json) json->Append(record);
+  }
+  output.Finish(true);
+  if (json) { json->Complete(); if (published) published(request.output_path); }
+  return contracts::make_compute_terminal(contracts::ComputeOperationOutcome::Succeeded,0U,total,request.output_path.string());
+ }
+};
+TEST_CASE("prediction application retains admitted outputs with independent media and JSON consumers", "[controller][systems][predict][output][gpu]") {
+ const bool saving=GENERATE(false,true);
+ if (saving && !mmltk::testsupport::checked_cuda_device_count()) SKIP("no CUDA device available");
+ const bool json=GENERATE(false,true);
+ const bool compiled=GENERATE(false,true);
+ const auto root=mmltk::testsupport::make_temp_root("predict-output-admission");
+ ApplicationDataFixture fixture{root};
+ auto [settings,unused_dataset,model]=fixture.systems();
+ contracts::SettingsUpdateRequest edit;
+ using Value=mmltk::frameworks::serialization::wire::FlatValue;
+ edit.updates.push_back({"workflows.predict.write_report_json",Value{json}});
+ edit.updates.push_back({"workflows.predict.request.limit_images",Value{std::uint64_t{2}}});
+ if (!compiled) {
+  const std::array<std::uint8_t,16U*16U*3U> pixels{};
+  REQUIRE(stbi_write_png((root/"image.png").c_str(),16,16,3,pixels.data(),16*3)!=0);
+  edit.updates.push_back({"workflows.predict.source.kind",Value{std::string{"SingleImage"}}});
+  edit.updates.push_back({"workflows.predict.source.single_image_path",Value{(root/"image.png").string()}});
+ }
+ static_cast<void>(settings.Update(std::move(edit)));
+ fixture.PrepareModel(contracts::FeatureId::Predict);
+ DatasetSystem dataset{settings,[] { return std::make_unique<OutputDatasetRuntime>(); }};
+ std::promise<void> terminal;
+ PredictSystem prediction{settings,dataset,model,{.device=0,.maximum_width=64U,.maximum_height=64U},[] { return std::make_unique<OutputPredictRuntime>(); },
+  [&](PredictSystem::event_type event) { if (const auto* changed=std::get_if<PredictChanged>(&event); changed && changed->snapshot.operation.terminal.outcome==contracts::ComputeOperationOutcome::Succeeded) mmltk::testsupport::release_test_promise(terminal); else if (std::holds_alternative<PredictFailed>(event)) mmltk::testsupport::release_test_promise(terminal); }};
+ contracts::PredictWorkflowIntent intent;
+ intent.saving.compiled_enabled=saving; intent.saving.single_enabled=saving; intent.saving.compiled_percent=1;
+ static_cast<void>(prediction.Start(intent));
+ mmltk::testsupport::await_test_promise(terminal,"prediction output terminal");
+ const auto snapshot=prediction.snapshot();
+ REQUIRE(snapshot.operation.terminal.outcome==contracts::ComputeOperationOutcome::Succeeded);
+ CHECK(snapshot.operation.terminal.completed==(compiled ? 2U:1U));
+ REQUIRE_FALSE(snapshot.operation.output.directory.empty());
+ CHECK(std::filesystem::is_directory(snapshot.operation.output.directory));
+ CHECK(snapshot.operation.output.completed_samples==(saving ? 1U:0U));
+ CHECK(snapshot.operation.output.artifacts.size()==(json ? 1U:0U));
+ if (json) CHECK(std::filesystem::is_regular_file(snapshot.operation.output.artifacts.front()));
+ if (saving) CHECK(std::filesystem::is_regular_file(snapshot.operation.output.recent_sample));
+}
+TEST_CASE("impossible compiled saving under inference limit fails before reservation", "[controller][systems][predict][output]") {
+ const auto root=mmltk::testsupport::make_temp_root("predict-impossible-limit");
+ ApplicationDataFixture fixture{root};
+ fixture.PrepareModel(contracts::FeatureId::Predict);
+ auto [settings,unused_dataset,model]=fixture.systems();
+ contracts::SettingsUpdateRequest edit;
+ edit.updates.push_back({"workflows.predict.request.limit_images",mmltk::frameworks::serialization::wire::FlatValue{std::uint64_t{9}}});
+ static_cast<void>(settings.Update(std::move(edit)));
+ DatasetSystem dataset{settings,[] { return std::make_unique<OutputDatasetRuntime>(); }};
+ std::promise<void> failed; std::atomic_size_t constructions=0;
+ PredictSystem prediction{settings,dataset,model,{.device=0,.maximum_width=64U,.maximum_height=64U},[&] { ++constructions; return std::make_unique<OutputPredictRuntime>(); },
+  [&](PredictSystem::event_type event) { if (std::holds_alternative<PredictFailed>(event)) mmltk::testsupport::release_test_promise(failed); }};
+ static_cast<void>(prediction.Start({}));
+ mmltk::testsupport::await_test_promise(failed,"prediction impossible saving count");
+ CHECK(constructions==0U);
+ CHECK(prediction.snapshot().operation.output.directory.empty());
+ CHECK_FALSE(std::filesystem::exists(root/"prediction"));
 }
 TEST_CASE("receiver retirement outlives concurrent preview pool destruction", "[controller][gpu][custody]") {
  namespace gpu = mmltk::frameworks::gpu;

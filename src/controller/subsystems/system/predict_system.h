@@ -1,4 +1,6 @@
 #pragma once
+#include "src/controller/contracts/prediction_output.h"
+#include "src/controller/contracts/workflow_output.h"
 #include <cstdint>
 #include <expected>
 #include <functional>
@@ -27,6 +29,14 @@
 #include "src/frameworks/gpu/image_workspace.h"
 #include "src/frameworks/gpu/terminal_cuda_retirement_owner.h"
 namespace mmltk::controller {
+struct PredictionRunOutput final {
+ std::filesystem::path directory;
+ contracts::PredictionOutputSettings saving{};
+ contracts::PredictionRunPreview preview{};
+ std::uint64_t population = 0;
+ std::uint64_t processing_population = 0;
+ std::function<void(const contracts::WorkflowOutputFacts&)> progress;
+};
 struct PredictLabel final {
  contracts::AnnotationBox box{};
  int class_reference = 0;
@@ -54,7 +64,7 @@ public:
  virtual void Close() noexcept {}
  [[nodiscard]] virtual bool HasUnsafeCustody() const noexcept { return false; }
  [[nodiscard]] virtual contracts::ComputeTerminal Run(mmltk::backend::models::rfdetr::PredictRequest, std::stop_token, const ComputeProgressSink&, const ProductSink&, const PlaybackGate&,
-  VisualExtent maximum, const ContextProvider&, const PreviewRetirement&, const ComputeArtifactSink& = {}) = 0;
+  VisualExtent maximum, const ContextProvider&, const PreviewRetirement&, const ComputeArtifactSink& = {}, const PredictionRunOutput& = {}) = 0;
 };
 class CudaPredictRuntime final : public PredictRuntime {
 public:
@@ -63,7 +73,7 @@ public:
  void Close() noexcept override;
  [[nodiscard]] bool HasUnsafeCustody() const noexcept override;
  [[nodiscard]] contracts::ComputeTerminal Run(mmltk::backend::models::rfdetr::PredictRequest, std::stop_token, const ComputeProgressSink&, const ProductSink&, const PlaybackGate&,
-  VisualExtent maximum, const ContextProvider&, const PreviewRetirement&, const ComputeArtifactSink& = {}) override;
+  VisualExtent maximum, const ContextProvider&, const PreviewRetirement&, const ComputeArtifactSink& = {}, const PredictionRunOutput& = {}) override;
 
 private:
  class Impl;
@@ -79,7 +89,19 @@ struct PredictImageMetadata final {
  [[= mmltk::frameworks::reflection::MaxItems{contracts::kAnnotationObjectCapacity}]] std::vector<PredictLabel> labels{};
  std::int64_t image_id = 0;
 };
+struct PredictionSourceQuery final {
+ [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]] std::string path;
+};
+struct PredictionSourceInspection final {
+ [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]] std::string path;
+ std::uint64_t count = 0;
+ bool active = false;
+ [[= mmltk::frameworks::reflection::MaxBytes{contracts::kArtifactErrorCapacity}]] std::string error;
+};
+MMLTK_REFLECT_FIELDS(PredictionSourceQuery)
+MMLTK_REFLECT_FIELDS(PredictionSourceInspection)
 struct PredictSnapshot final {
+ PredictionSourceInspection inspection{};
  std::uint64_t content_identity = 0U;
  std::uint64_t revision = 0U;
  // CLEANUP-IGNORE: Predict composes compute facts with its private visual frame in one canonical snapshot.
@@ -121,6 +143,7 @@ public:
  using event_type = std::variant<PredictProgress, PredictChanged, PredictFailed>;
  PredictSystem(SettingsSystem&, DatasetSystem&, ModelSystem&, VisualDeviceSettings, PredictRuntimeFactory, SystemEventSink<event_type> = {});
  ~PredictSystem();
+ [[= contracts::reflection::direct::IntentEndpoint{}]] [[nodiscard]] PredictSnapshot Inspect(PredictionSourceQuery);
  [[= contracts::reflection::direct::IntentEndpoint{}]] [[nodiscard]] PredictSnapshot Start(contracts::PredictWorkflowIntent);
  [[= contracts::reflection::direct::IntentEndpoint{}]] [[nodiscard]] PredictSnapshot Pause(PredictPauseIntent);
  [[= contracts::reflection::direct::IntentEndpoint{}]] [[nodiscard]] PredictSnapshot Stop(contracts::PredictWorkflowIntent) noexcept;

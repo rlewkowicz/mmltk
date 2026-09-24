@@ -60,7 +60,7 @@ public:
      return static_cast<int>(std::floor(position));
     };
     const int x = coordinate(prediction.bbox_xyxy[0]), y = coordinate(prediction.bbox_xyxy[1]);
-    labels_.push_back({static_cast<std::uint32_t>(category), x, y > 22 ? y - 22 : 0, color});
+    labels_.push_back({static_cast<std::uint32_t>(category), x, y > static_cast<int>(raster::kNativeCaptionHeight) ? y - static_cast<int>(raster::kNativeCaptionHeight) : 0, color});
    }
   };
   const auto& overlays = options_.overlays;

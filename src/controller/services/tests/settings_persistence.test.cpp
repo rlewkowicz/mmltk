@@ -46,6 +46,25 @@ private:
  std::shared_ptr<mmltk::testsupport::StopGate> gate_;
  bool fail_ = false;
 };
+TEST_CASE("prediction source saving choices persist independently", "[controller][systems][settings][prediction]") {
+ const auto root = mmltk::testsupport::make_temp_root("prediction-saving-settings");
+ SettingsSystem settings;
+ REQUIRE(settings.Load(install_settings(root)).applied());
+ const auto defaults=settings.snapshot().settings_state.workflows.predict.saving;
+ CHECK(defaults.single_enabled); CHECK(defaults.compiled_enabled); CHECK(defaults.compiled_percent==10U);
+ CHECK(defaults.video_enabled); CHECK(defaults.video_mode==contracts::PredictionVideoSaving::Full);
+ contracts::SettingsUpdateRequest edit;
+ edit.updates.push_back({.path="workflows.predict.saving.single_enabled",.value=mmltk::frameworks::serialization::wire::FlatValue{false}});
+ edit.updates.push_back({.path="workflows.predict.saving.compiled_percent",.value=mmltk::frameworks::serialization::wire::FlatValue{std::uint64_t{37}}});
+ edit.updates.push_back({.path="workflows.predict.saving.compiled_total",.value=mmltk::frameworks::serialization::wire::FlatValue{std::uint64_t{3}}});
+ edit.updates.push_back({.path="workflows.predict.saving.video_samples",.value=mmltk::frameworks::serialization::wire::FlatValue{std::uint64_t{17}}});
+ static_cast<void>(settings.Update(std::move(edit)));
+ SettingsSystem restored;
+ REQUIRE(restored.Load(services::SettingsLocation{(root / "settings.json").string()}).applied());
+ const auto saved=restored.snapshot().settings_state.workflows.predict.saving;
+ CHECK_FALSE(saved.single_enabled); CHECK(saved.compiled_enabled); CHECK(saved.compiled_percent==37U); CHECK(saved.compiled_total==3U);
+ CHECK(saved.video_samples==17U); CHECK(saved.video_mode==contracts::PredictionVideoSaving::Full);
+}
 TEST_CASE("accepted display confidence survives Settings reconstruction", "[controller][systems][settings]") {
  const auto root = mmltk::testsupport::make_temp_root("validation-display-settings");
  SettingsSystem settings;

@@ -1,6 +1,10 @@
 #include "audit_facts.h"
 #include <nlohmann/json.hpp>
 #include <catch2/generators/catch_generators.hpp>
+#include <stb_image_write.h>
+#include <fstream>
+#include "src/test_support/filesystem_test_utils.hpp"
+#include "src/test_support/subprocess_test_utils.hpp"
 #include <cctype>
 #include "src/controller/contracts/diagnostic_context.h"
 #include "src/controller/contracts/workspace_input.h"
@@ -2693,4 +2697,39 @@ TEST_CASE("validation saved output audit requires six exact published sample ide
  REQUIRE(audit.validation_samples_complete());
  audit.validation_saved_samples.back()["b"] = 2U;
  CHECK_FALSE(audit.validation_samples_complete());
+}
+
+namespace mmltk::acceptance::wayland {
+TEST_CASE("prediction output evidence decodes real files and rejects suffix-only claims", "[workspace][audit][prediction]") {
+ mmltk::testsupport::ScopedTempDir temporary("prediction-output-audit");
+ const auto root=temporary.path();
+ std::filesystem::create_directory(root/"samples");
+ const std::array<std::uint8_t,12> pixels{255,0,0,0,255,0,0,0,255,255,255,255};
+ REQUIRE(stbi_write_png((root/"sample.png").c_str(),2,2,3,pixels.data(),6)!=0);
+ REQUIRE(stbi_write_png((root/"samples"/"sample-3.png").c_str(),2,2,3,pixels.data(),6)!=0);
+ const auto generated=mmltk::testsupport::run_subprocess_capture_output({"ffmpeg","-v","error","-f","lavfi","-i","color=red:size=16x16:rate=4:duration=2","-c:v","libx264","-bf","0","-f","matroska","-live","1",(root/"prediction.mkv").string()});
+ REQUIRE(generated.exit_code==0);
+ std::filesystem::copy_file(root/"prediction.mkv",root/"prediction.partial.mkv");
+ BrowserAudit audit;
+ audit.consume({{"event","integration.prediction.output"},{"detail","compiled"},{"control",(root/"samples"/"sample-3.png").string()},{"a",1.0},{"b",1.0},{"c",0.0},{"d",1.0}});
+ audit.consume({{"event","integration.prediction.output"},{"detail","image"},{"control",(root/"sample.png").string()},{"a",1.0},{"b",1.0},{"c",0.0},{"d",1.0}});
+ audit.consume({{"event","integration.prediction.output"},{"detail","video"},{"control",(root/"prediction.mkv").string()},{"b",8.0},{"c",0.0},{"d",1.0}});
+ audit.consume({{"event","integration.prediction.output"},{"detail","stop"},{"control",(root/"prediction.partial.mkv").string()},{"c",0.0},{"d",1.0}});
+ CHECK(std::ranges::all_of(audit.prediction_outputs,[](bool value){return value;}));
+ for (int index=0;index<3;++index) audit.consume({{"event","integration.prediction.saving"},{"a",index},{"b",1.0}});
+ CHECK(std::ranges::all_of(audit.prediction_saving_controls,[](bool value){return value;}));
+ std::filesystem::create_directory(root/"empty");
+ for (const auto* stage : {"compiled","image"}) audit.consume({{"event","integration.prediction.no_output"},{"detail",stage},{"control",(root/"empty").string()},{"a",1.0}});
+ CHECK(std::ranges::all_of(audit.prediction_no_outputs,[](bool value){return value;}));
+ std::ofstream(root/"empty"/"unexpected.json")<<"{}";
+ audit.consume({{"event","integration.prediction.no_output"},{"detail","image"},{"control",(root/"empty").string()},{"a",1.0}});
+ CHECK_FALSE(audit.prediction_no_outputs[1]);
+ std::ofstream(root/"prediction.mkv",std::ios::trunc)<<"not video";
+ audit.consume({{"event","integration.prediction.output"},{"detail","video"},{"control",(root/"prediction.mkv").string()},{"b",8.0},{"c",0.0},{"d",1.0}});
+ CHECK_FALSE(audit.prediction_outputs[2]);
+ std::filesystem::remove(root/"sample.png");
+ audit.consume({{"event","integration.prediction.output"},{"detail","image"},{"control",(root/"sample.png").string()},{"a",1.0},{"b",1.0},{"c",0.0},{"d",1.0}});
+ CHECK_FALSE(audit.prediction_outputs[1]);
+
+}
 }

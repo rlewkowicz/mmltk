@@ -383,6 +383,10 @@ struct BrowserAudit final {
  std::size_t phase_progress_revision = 0U;
  std::size_t work_progress_revision = 0U;
  std::array<std::pair<std::uint64_t, std::uint64_t>, 4U> workflow_progress{};
+ std::array<bool,4U> prediction_outputs{};
+ std::array<bool,3U> prediction_saving_controls{};
+ std::array<bool,2U> prediction_no_outputs{};
+ std::array<std::uint64_t,2U> prediction_processed{};
  std::uint64_t reopen_snapshot_progress = 0U;
  std::uint64_t reopen_draw_progress = 0U;
  std::string phase_progress_class;

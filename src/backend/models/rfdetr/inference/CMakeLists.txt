@@ -42,13 +42,13 @@ target_include_directories(mmltk_backend_models_rfdetr_inference PRIVATE
 )
 target_link_libraries(mmltk_backend_models_rfdetr_inference
     PUBLIC
+        mmltk::backend::media::video
         mmltk::backend::ml::runtime
         mmltk::backend::models::rfdetr::contract
         mmltk::backend::models::rfdetr::core
     PRIVATE
         mmltk::backend::models::rfdetr::export
         mmltk::common::io
-        mmltk::backend::media::video
         mmltk::backend::data
         mmltk::backend::imaging::resample
         mmltk::backend::imaging::raster
