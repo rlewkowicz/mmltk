@@ -102,13 +102,27 @@ void test_request_and_model_boundaries_reject_unsupported_feature_combinations()
  request.training_supervision.assignment = TrainAssignmentKind::MatchFree;
  validate_train_request(request);
  request.preset_name = "rf-detr-seg-nano";
- CHECK_THROWS(validate_train_request(request));
+ CHECK_NOTHROW(validate_train_request(request));
  request = valid_train_request();
  request.training_supervision.denoising.enabled = true;
  request.compilation_mode = CompilationMode::kFullTrace;
  CHECK_THROWS(validate_train_request(request));
  NativeRfDetrConfig model = native_config_from_preset(*find_preset_catalog_entry("rf-detr-nano"));
  model.training_supervision.assignment = TrainAssignmentKind::MatchFree;
+ CHECK(training_supervision_model_config_valid(model));
+ model.segmentation = true;
+ for (const double coefficient : {-1.0, std::numeric_limits<double>::infinity(), std::numeric_limits<double>::quiet_NaN()}) {
+  model.mask_ce_loss_coef = coefficient;
+  CHECK_FALSE(training_supervision_model_config_valid(model));
+  model.mask_ce_loss_coef = 1.0;
+  model.mask_dice_loss_coef = coefficient;
+  CHECK_FALSE(training_supervision_model_config_valid(model));
+  model.mask_dice_loss_coef = 1.0;
+ }
+ model.mask_point_sample_ratio = 0;
+ CHECK_FALSE(training_supervision_model_config_valid(model));
+ model.mask_point_sample_ratio = 16;
+ model.mask_ce_loss_coef = model.mask_dice_loss_coef = 0.0;
  CHECK(training_supervision_model_config_valid(model));
  model.set_cost_class = 0.0;
  model.set_cost_bbox = 0.0;

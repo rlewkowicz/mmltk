@@ -40,6 +40,7 @@
 #include "src/backend/models/rfdetr/training/checkpoint.h"
 #include "detail/native_optimizer_private.h"
 #include "detail/training_ops_private.h"
+#include "detail/training_step.h"
 #include "detail/model_ema.h"
 #include "detail/training_continuation.h"
 #include "training_continuation_fixture.h"
@@ -112,7 +113,8 @@ rfdetr::NativeRfDetrConfig supervision_config() {
  return config;
 }
 void test_training_supervision_runtime_replication_is_one_shot() {
- const auto config = supervision_config();
+ auto config = supervision_config();
+ config.segmentation = true;
  rfdetr::TrainingSupervisionImpl source(config, config.num_classes - 1);
  rfdetr::TrainingSupervisionImpl replica(config, config.num_classes - 1);
  source.initialize(71U);
@@ -132,7 +134,7 @@ void test_checkpoint_supervision_config_and_deployment_pruning() {
  config.denoising.groups = 7U;
  mmltk::backend::ml::cuda::TensorReadbackBuffers readback;
  readback.Begin();
- const std::vector<rfdetr::NormalizedModelStateEntry> entries{{"backbone.weight", torch::ones({1})}, {"training_supervision.query_projection.weight", torch::ones({1})}};
+ const std::vector<rfdetr::NormalizedModelStateEntry> entries{{"backbone.weight", torch::ones({1})}, {"training_supervision.query_projection.weight", torch::ones({1})}, {"training_supervision.mask_projection.weight", torch::ones({2,2})}};
  rfdetr::detail::reserve_state_archive(entries, readback, 0);
  torch::serialize::OutputArchive output;
  rfdetr::detail::write_training_supervision_config(output, config);
@@ -1814,4 +1816,49 @@ TEST_CASE("training excludes crowds and retains continuous targets with known em
  CHECK(plan.images[0].cache_source_ordinal == -1);
  labels[1].flags = 0;
  CHECK_THROWS_AS(rfdetr::build_targets(batch, 8, 8, true, true, 0, scratch, "train", 8, rfdetr::TrainingSupervisionConfig{}, 2), std::runtime_error);
+}
+
+TEST_CASE("Production Match-Free masks retain AMP accumulation gradients and current state", "[rfdetr][training_supervision][cuda]") {
+ if (mmltk::testsupport::checked_cuda_device_count() == 0) SKIP("CUDA unavailable; segmentation training remains unverified");
+ const auto floats = torch::TensorOptions().device(torch::kCUDA).dtype(torch::kFloat32);
+ const auto integers = floats.dtype(torch::kInt64);
+ for (const bool dn : {false,true}) for (const auto dtype : {torch::kFloat32,torch::kFloat16,torch::kBFloat16}) {
+  auto config = rfdetr::native_config_from_preset(rfdetr::model_presets().front());
+  config.resolution=64; config.num_classes=3; config.num_queries=3; config.num_select=3;
+  config.group_detr=2; config.dec_layers=2; config.aux_loss=true; config.two_stage=true; config.segmentation=true;
+  config.training_supervision.assignment=rfdetr::TrainAssignmentKind::MatchFree;
+  config.training_supervision.denoising.enabled=dn; config.training_supervision.denoising.groups=2;
+  rfdetr::NativeRfDetrModel model(config,rfdetr::testsupport::synthetic_training_layout(2));
+  model.initialize_training_supervision(910); model.to(torch::Device(torch::kCUDA)); model.train(true); model.set_force_pytorch_deformable_attn(true);
+  model.configure_supervision_timing({torch::Device(torch::kCUDA),2,false});
+  rfdetr::PreparedTargets targets;
+  targets.all_boxes=torch::tensor({{0.5F,0.5F,0.4F,0.4F},{0.5F,0.5F,0.4F,0.4F},{0.2F,0.3F,0.1F,0.2F},{0.7F,0.6F,0.2F,0.1F}},floats);
+  targets.all_labels=torch::tensor({0,0,1,1},integers); targets.counts={4,0}; targets.offsets={0,4}; targets.resolved_query_count=3;
+  targets.target_counts=torch::tensor({4,0},integers); targets.target_offsets=torch::tensor({0,4},integers);
+  targets.packed_masks=rfdetr::PackedTargetMasks{torch::tensor({{int64_t{0x3333}},{int64_t{0xcccc}},{int64_t{0xffff}},{int64_t{0}}},integers),4,4};
+  const auto image=torch::rand({2,3,64,64},floats);
+  const rfdetr::TrainingStep step(2,1.0,dtype!=torch::kFloat32,dtype);
+  std::array<rfdetr::TrainingLoss,2> retained;
+  for (std::size_t micro=0;micro<retained.size();++micro) step.forward([&] {
+   auto outputs=dn ? model.forward_with_denoising(rfdetr::nested_tensor_from_tensor_list({image[0],image[1]}),targets,{910,0,0,micro}) : model.forward_for_match_free(rfdetr::nested_tensor_from_tensor_list({image[0],image[1]}));
+   REQUIRE(outputs.main.sparse_pred_masks.has_value()); REQUIRE(outputs.aux_outputs.front().sparse_pred_masks.has_value()); REQUIRE(outputs.enc_outputs->sparse_pred_masks.has_value());
+   retained[micro]=model.supervision_loss(outputs,targets,{torch::tensor(4.F,floats)},true);
+   REQUIRE(torch::isfinite(retained[micro].total).item<bool>());
+   REQUIRE(retained[micro].main.mask_ce.item<float>()>0.F); REQUIRE(retained[micro].main.mask_dice.item<float>()>0.F);
+   REQUIRE(torch::allclose(retained[micro].total,retained[micro].classification+retained[micro].box+retained[micro].giou+retained[micro].mask_ce+retained[micro].mask_dice,1e-5,1e-5));
+  });
+  for (const auto& loss : retained) step.backward(loss.total);
+  auto parameters=model.named_parameters(true);
+  for (const auto name : {"segmentation_head.bias","segmentation_head.query_features_proj.weight","training_supervision.mask_projection.weight"}) {
+   auto* parameter=parameters.find(name); REQUIRE(parameter);
+   REQUIRE(parameter->grad().defined()); REQUIRE(torch::isfinite(parameter->grad()).all().item<bool>()); REQUIRE(parameter->grad().abs().sum().item<float>()>0.F);
+   auto before=parameter->detach().clone(); torch::NoGradGuard no_grad; parameter->sub_(parameter->grad()*0.01F); REQUIRE_FALSE(torch::equal(before,*parameter));
+  }
+  const auto timing=model.harvest_supervision_timing(); REQUIRE(timing.completed_leases==0); REQUIRE(timing.outstanding_leases==0);
+  auto state=rfdetr::testsupport::clone_normalized_model_state(model);
+  rfdetr::NativeRfDetrModel resumed(config,rfdetr::testsupport::synthetic_training_layout(2)); resumed.initialize_training_supervision(911); resumed.to(torch::Device(torch::kCUDA));
+  auto candidate=resumed.stage_normalized_state(state,rfdetr::detail::NormalizedModelStateAdmission::Exact); resumed.commit_normalized_state(std::move(candidate));
+  const auto restored=resumed.named_parameters(true);
+  REQUIRE(torch::equal(*restored.find("training_supervision.mask_projection.weight"),*parameters.find("training_supervision.mask_projection.weight")));
+ }
 }

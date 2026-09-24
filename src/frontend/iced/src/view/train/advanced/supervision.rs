@@ -1,5 +1,5 @@
 use crate::fluent_theme::Element;
-use crate::generated::{ModelSelectionSource, ModelTask, TrainAssignmentKind};
+use crate::generated::TrainAssignmentKind;
 use crate::view::settings::{EditCadence, EditSchedule, SettingsModel};
 use crate::view::workflow::fields;
 use iced::widget::{button, checkbox, column, container, row, text};
@@ -26,14 +26,6 @@ const fn assignment_label(assignment: TrainAssignmentKind) -> &'static str {
 
 const fn match_free_controls_visible(assignment: TrainAssignmentKind) -> bool {
     matches!(assignment, TrainAssignmentKind::MatchFree)
-}
-
-fn canonical_segmentation_preset(train: &crate::generated::TrainViewState) -> bool {
-    train.modelsource == ModelSelectionSource::Canonical
-        && crate::generated::RFDETR_PRESET_CATALOG
-            .iter()
-            .find(|preset| preset.presetname.as_ref() == train.request.presetname)
-            .is_some_and(|preset| preset.task == ModelTask::Segmentation)
 }
 
 pub fn update(model: &mut SettingsModel, message: Message) -> Result<EditSchedule, String> {
@@ -71,13 +63,11 @@ pub fn update(model: &mut SettingsModel, message: Message) -> Result<EditSchedul
 
 pub fn view(train: &crate::generated::TrainViewState, enabled: bool) -> Element<'_, Message> {
     let supervision = &train.request.trainingsupervision;
-    let segmentation = canonical_segmentation_preset(train);
     let assignment_choices = crate::generated::TRAIN_ASSIGNMENT_KIND_VALUES
         .iter()
         .copied()
         .fold(row![].spacing(6), |choices, assignment| {
-            let available =
-                enabled && !(segmentation && assignment == TrainAssignmentKind::MatchFree);
+            let available = enabled;
             let choice = button(assignment_label(assignment))
                 .on_press_maybe(available.then_some(Message::Assignment(assignment)))
                 .style(if supervision.assignment == assignment {
@@ -292,18 +282,4 @@ mod tests {
         }
     }
 
-    #[test]
-    fn only_catalog_resolved_segmentation_disables_match_free_selection() {
-        let mut model = installed_settings_model();
-        let train = &mut model.draft.as_mut().unwrap().workflows.train;
-        let segmentation = crate::generated::RFDETR_PRESET_CATALOG
-            .iter()
-            .find(|preset| preset.task == ModelTask::Segmentation)
-            .unwrap();
-        train.request.presetname = segmentation.presetname.to_string();
-        train.modelsource = ModelSelectionSource::Canonical;
-        assert!(canonical_segmentation_preset(train));
-        train.modelsource = ModelSelectionSource::Custom;
-        assert!(!canonical_segmentation_preset(train));
-    }
 }

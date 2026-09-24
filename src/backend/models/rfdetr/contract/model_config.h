@@ -71,8 +71,10 @@ struct NativeRfDetrConfig {
       !training_supervision_query_layout_valid(config.training_supervision, static_cast<std::size_t>(config.num_queries), static_cast<std::size_t>(config.group_detr), 0U))) {
   return false;
  }
+ if (config.segmentation && training_supervision_enabled(config.training_supervision) &&
+     (!std::isfinite(config.mask_ce_loss_coef) || config.mask_ce_loss_coef < 0.0 || !std::isfinite(config.mask_dice_loss_coef) || config.mask_dice_loss_coef < 0.0 || config.mask_point_sample_ratio <= 0)) return false;
  if (config.training_supervision.assignment == TrainAssignmentKind::MatchFree) {
-  if (config.segmentation || !std::isfinite(config.set_cost_class) || config.set_cost_class < 0.0 || !std::isfinite(config.set_cost_bbox) || config.set_cost_bbox < 0.0 ||
+  if (!std::isfinite(config.set_cost_class) || config.set_cost_class < 0.0 || !std::isfinite(config.set_cost_bbox) || config.set_cost_bbox < 0.0 ||
       !std::isfinite(config.set_cost_giou) || config.set_cost_giou < 0.0 || (config.set_cost_class == 0.0 && config.set_cost_bbox == 0.0 && config.set_cost_giou == 0.0)) {
    return false;
   }

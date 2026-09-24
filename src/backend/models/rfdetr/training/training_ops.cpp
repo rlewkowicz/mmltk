@@ -179,6 +179,8 @@ RoutedTrainingLoss compute_routed_training_loss(NativeRfDetrModel& model, const 
   scalar_packet::set<^^TrainingScalars::classification>(scalars, loss.main.classification);
   scalar_packet::set<^^TrainingScalars::l1>(scalars, loss.main.box);
   scalar_packet::set<^^TrainingScalars::giou>(scalars, loss.main.giou);
+  scalar_packet::set<^^TrainingScalars::mask_ce>(scalars, loss.main.mask_ce);
+  scalar_packet::set<^^TrainingScalars::mask_dice>(scalars, loss.main.mask_dice);
   scalar_packet::set<^^TrainingScalars::correspondence_weighted>(scalars, loss.correspondence);
   scalar_packet::set<^^TrainingScalars::auxiliary_weighted>(scalars, loss.auxiliary);
   if (route_uses_denoising(route)) scalar_packet::set<^^TrainingScalars::denoising_weighted>(scalars, loss.denoising);

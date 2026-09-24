@@ -57,7 +57,8 @@ mmltk_register_ordinary_sources(
     class_artifact.cpp
     class_layout.cpp
     python_checkpoint_bridge.cpp
-    model_state.cpp)
+    model_state.cpp
+    training_mask_loss.cpp)
 mmltk_register_retained_module_importers(
     mmltk_backend_models_rfdetr_core
     evaluator.cpp
@@ -85,6 +86,7 @@ mmltk_register_private_headers(
     detail/matcher_workspace.h
     detail/runtime_workspace_fwd.h
     detail/detection_sampling.h
+    detail/training_mask_loss.h
     detail/traced_loss_cache.h
     detail/detr_matcher_cuda.h
     detail/detection_geometry.h

@@ -1,5 +1,6 @@
 #pragma once
 #include <torch/torch.h>
+#include "training_mask_loss.h"
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -46,7 +47,7 @@ public:
  [[nodiscard]] bool denoising_enabled() const noexcept;
  [[nodiscard]] std::optional<DenoisingQueryBatch> prepare_denoising(
   const PreparedTargets& targets, const TrainingStepIdentity& identity, const torch::Device& device, c10::ScalarType decoder_dtype, const DenoisingVariates* injected_variates = nullptr);
- [[nodiscard]] MatchFreeCorrespondence correspondence(const torch::Tensor& padded_labels, const torch::Tensor& padded_boxes, const torch::Tensor& valid_rows, const torch::Tensor& query_features);
+ [[nodiscard]] MatchFreeCorrespondence correspondence(const torch::Tensor& padded_labels, const torch::Tensor& padded_boxes, const torch::Tensor& valid_rows, const torch::Tensor& query_features, const PairwiseMaskSamples* masks = nullptr);
  [[nodiscard]] MatchFreeCost broadcast_cost(const torch::Tensor& padded_labels, const torch::Tensor& padded_boxes, const torch::Tensor& valid_rows, const OutputLayer& layer) const;
  [[nodiscard]] TrainingLoss loss(const ModelOutputs& outputs, const PreparedTargets& targets, const DeviceLossNormalizer& normalizer, bool training_mode);
  void configure_timing(const SupervisionTimingSetup& setup);
@@ -64,7 +65,7 @@ private:
  class ProbeMlpImpl;
  struct TimingState;
  [[nodiscard]] PaddedTargets pad_targets(const PreparedTargets& targets, const torch::Device& device, int64_t batch, bool reuse_construction_scratch);
- [[nodiscard]] torch::Tensor project_ground_truth(const torch::Tensor& labels, const torch::Tensor& boxes);
+ [[nodiscard]] torch::Tensor project_ground_truth(const torch::Tensor& labels, const torch::Tensor& boxes, const PairwiseMaskSamples* masks = nullptr);
  [[nodiscard]] torch::Tensor dense_correspondence(const torch::Tensor& probes, const torch::Tensor& query_features);
  [[nodiscard]] TrainingLoss empty_loss(const ModelOutputs& outputs) const;
  [[nodiscard]] TrainingLoss denoising_loss(const DenoisingOutputs& outputs, const DeviceLossNormalizer& normalizer) const;
@@ -74,6 +75,7 @@ private:
  std::shared_ptr<ProbeMlpImpl> query_mlp_;
  torch::nn::Linear query_projection_{nullptr};
  torch::nn::Linear key_projection_{nullptr};
+ torch::nn::Linear mask_projection_{nullptr};
  torch::nn::Embedding denoising_label_embedding_{nullptr};
  torch::nn::Embedding denoising_task_embedding_{nullptr};
  std::optional<at::Generator> denoising_generator_;

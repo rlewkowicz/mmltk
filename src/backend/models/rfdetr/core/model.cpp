@@ -1019,7 +1019,7 @@ ModelOutputs NativeRfDetrModel::Impl::forward_for_match_free(const NestedTensor&
  if (!training_supervision_ || !training_supervision_->match_free_enabled() || !training_supervision_->initialized()) {
   throw std::runtime_error("Match-Free forward requires active initialized supervision");
  }
- return forward_impl(batch, false, true);
+ return forward_impl(batch, config_.segmentation, true);
 }
 ModelOutputs NativeRfDetrModel::Impl::forward_with_denoising(const NestedTensor& batch, const PreparedTargets& targets, const TrainingStepIdentity& identity) {
  if (!is_training() || !training_supervision_ || !training_supervision_->denoising_enabled() || !training_supervision_->initialized()) {
@@ -1189,7 +1189,7 @@ ModelOutputs NativeRfDetrModel::Impl::forward_impl(const NestedTensor& batch, co
  if (include_masks && segmentation_head_ && !decoder_query_features.empty()) {
   mmltk::common::logging::ScopedProfile profile_rfdetr_model_forward_segmentation{"rfdetr.model.forward.segmentation"};
   if (!segmentation_head) { throw std::runtime_error("RF-DETR segmentation head is not initialized"); }
-  if (is_training()) {
+  if (is_training() || capture_match_free_features) {
    sparse_masks = segmentation_head->sparse_forward(features.front().tensors, decoder_query_features, {samples.tensors.size(2), samples.tensors.size(3)});
   } else {
    dense_masks = segmentation_head->forward(features.front().tensors, decoder_query_features, {samples.tensors.size(2), samples.tensors.size(3)});
@@ -1231,7 +1231,7 @@ ModelOutputs NativeRfDetrModel::Impl::forward_impl(const NestedTensor& batch, co
     layer.query_layout = SupervisedQueryLayout{groups, queries_per_group};
    }
    if (include_masks && segmentation_head_) {
-    if (is_training()) {
+    if (is_training() || capture_match_free_features) {
      layer.sparse_pred_masks = sparse_masks[index];
     } else {
      layer.pred_masks = dense_masks[index];
@@ -1270,7 +1270,7 @@ ModelOutputs NativeRfDetrModel::Impl::forward_impl(const NestedTensor& batch, co
   }
   if (include_masks && segmentation_head_) {
    if (!segmentation_head) { throw std::runtime_error("RF-DETR segmentation head is not initialized"); }
-   if (is_training()) {
+   if (is_training() || capture_match_free_features) {
     enc_output.sparse_pred_masks = segmentation_head->sparse_forward(features.front().tensors, {transformed.enc_memory}, {samples.tensors.size(2), samples.tensors.size(3)}, true)[0];
    } else {
     enc_output.pred_masks = segmentation_head->forward(features.front().tensors, {transformed.enc_memory}, {samples.tensors.size(2), samples.tensors.size(3)}, true)[0];

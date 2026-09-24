@@ -160,6 +160,8 @@ struct TrainingLossComponents {
  torch::Tensor classification;
  torch::Tensor box;
  torch::Tensor giou;
+ torch::Tensor mask_ce;
+ torch::Tensor mask_dice;
 };
 struct TrainingLoss {
  torch::Tensor total;
@@ -170,6 +172,8 @@ struct TrainingLoss {
  torch::Tensor denoising;
  torch::Tensor auxiliary;
  TrainingLossComponents main;
+ torch::Tensor mask_ce;
+ torch::Tensor mask_dice;
 };
 struct OutputTensors {
  torch::Tensor pred_logits;

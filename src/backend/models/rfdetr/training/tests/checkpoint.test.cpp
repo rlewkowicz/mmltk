@@ -403,7 +403,7 @@ void test_strict_model_state_admission_is_duplicate_free_and_atomic() {
  namespace rfdetr = mmltk::backend::models::rfdetr;
  auto config = rfdetr::native_config_from_preset(rfdetr::model_presets().front());
  config.resolution = 64;
- config.segmentation = false;
+ config.segmentation = true;
  config.aux_loss = false;
  config.two_stage = false;
  config.dec_layers = 1;
@@ -483,7 +483,7 @@ TEST_CASE("Fresh transfer maps actual classifier and supervision axes by class i
  config.num_queries = config.num_select = 3;
  config.group_detr = 1;
  config.dec_layers = 1;
- config.segmentation = false;
+ config.segmentation = true;
  config.training_supervision.assignment = r::TrainAssignmentKind::MatchFree;
  config.training_supervision.denoising.enabled = true;
  const r::ResolvedClassLayout source_layout(r::native_training_class_layout(c::ClassCatalog({"a", "b", "c"})));
@@ -501,12 +501,19 @@ TEST_CASE("Fresh transfer maps actual classifier and supervision axes by class i
   REQUIRE(entry != source.end());
   for (std::int64_t row = 0; row < entry->tensor.size(dimension); ++row) entry->tensor.select(dimension, row).fill_(10. + static_cast<double>(row));
  }
+ auto mask_projection = std::ranges::find(source, "training_supervision.mask_projection.weight", &r::NormalizedModelStateEntry::name);
+ REQUIRE(mask_projection != source.end());
+ mask_projection->tensor.fill_(0.375F);
  const auto transfer = [&](r::NativeRfDetrModel& destination) {
   const auto random_before = at::detail::getDefaultCPUGenerator().get_state();
   auto candidate = destination.stage_normalized_state(source, r::detail::NormalizedModelStateAdmission::FreshTransfer, &source_layout);
   destination.commit_normalized_state(std::move(candidate));
   CHECK(torch::equal(random_before, at::detail::getDefaultCPUGenerator().get_state()));
-  return destination.named_parameters(true);
+  auto parameters = destination.named_parameters(true);
+  const auto* mask = parameters.find("training_supervision.mask_projection.weight");
+  REQUIRE(mask);
+  REQUIRE(torch::equal(*mask, torch::full_like(*mask, 0.375F)));
+  return parameters;
  };
  const auto after = transfer(owner);
  for (const auto& [name, dimension] : axes) {

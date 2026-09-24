@@ -20,7 +20,8 @@ MMLTK_REFLECT_ENUM(EvaluatedWeights)
 MMLTK_REFLECT_ENUM(TrainingPhase)
 MMLTK_REFLECT_ENUM(TrainingRecordRole)
 // Hungarian components are raw main-output losses; Match-Free components are
-// weighted main-output losses. TrainingRun.configuration selects the convention.
+// weighted main-output losses, including mask CE/Dice for segmentation.
+// TrainingRun.configuration selects the convention.
 // Auxiliary and DN are separate weighted groups, excluded from main components.
 // Dense correspondence is an explicitly overlapping diagnostic breakdown.
 // Total alone represents the complete optimized objective; raw main components
