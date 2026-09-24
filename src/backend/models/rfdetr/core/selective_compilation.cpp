@@ -11,19 +11,20 @@
 #include <algorithm>
 #include <stdexcept>
 #include <utility>
+#include <vector>
 import mmltk.common.logging.mmltk_logging;
 namespace mmltk::backend::models::rfdetr::detail {
 namespace {
 struct TensorSignature {
- c10::Device device;
- c10::ScalarType dtype;
+ c10::Device device{torch::kCPU};
+ c10::ScalarType dtype = c10::ScalarType::Undefined;
  std::array<int64_t, 4> sizes{};
  int64_t rank = 0;
  bool requires_grad = false;
  bool operator==(const TensorSignature&) const = default;
 };
 struct Signature {
- std::array<TensorSignature, 2> tensors{{{c10::Device(torch::kCPU), c10::ScalarType::Undefined}, {c10::Device(torch::kCPU), c10::ScalarType::Undefined}}};
+ std::array<TensorSignature, SelectiveTensorRegion::Tensors::capacity()> tensors{};
  size_t count = 0;
  bool grad = torch::GradMode::is_enabled();
  bool amp = false;
@@ -57,7 +58,9 @@ private:
 };
 SelectiveTensorRegion::Tensors unpack(const c10::IValue& value) {
  SelectiveTensorRegion::Tensors result;
- for (const auto& item : value.toTupleRef().elements()) result.push_back(item.toTensor());
+ const auto& elements = value.toTupleRef().elements();
+ TORCH_CHECK(!elements.empty() && elements.size() <= SelectiveTensorRegion::Tensors::capacity(), "selective tensor region requires one or two outputs");
+ for (const auto& item : elements) result.push_back(item.toTensor());
  return result;
 }
 }
@@ -89,10 +92,10 @@ void SelectiveTensorRegion::invalidate() {
  }
 }
 const void* SelectiveTensorRegion::identity(bool training) const noexcept { return slots_[training].state.get(); }
-SelectiveTensorRegion::Tensors SelectiveTensorRegion::invoke(bool training, const Tensors& inputs, std::initializer_list<torch::nn::Module*> owners, const Operation& ordinary) {
+SelectiveTensorRegion::Tensors SelectiveTensorRegion::invoke(bool training, const Tensors& inputs, std::initializer_list<torch::nn::Module*> owners, Operation ordinary) {
  auto& slot = slots_[training];
  if (!slot.enabled) return ordinary(inputs);
- TORCH_CHECK(!inputs.empty() && inputs.size() <= 2, "selective tensor region requires one or two inputs");
+ TORCH_CHECK(!inputs.empty() && inputs.size() <= Tensors::capacity(), "selective tensor region requires one or two inputs");
  bool compatible_extents = true;
  if (dynamic_batch_queries_) {
   for (const auto& input : inputs) compatible_extents &= input.dim() == 3 && input.sizes() == inputs.front().sizes() && input.device() == inputs.front().device();
