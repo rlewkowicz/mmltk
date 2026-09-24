@@ -29,7 +29,6 @@ public:
  NativeRfDetrModel& operator=(NativeRfDetrModel&&) noexcept;
  [[nodiscard]] const NativeRfDetrConfig& config() const noexcept;
  [[nodiscard]] const std::shared_ptr<const ResolvedClassLayout>& class_layout() const noexcept;
- [[nodiscard]] bool is_compiled(bool for_training) const noexcept;
  void optimize_for_inference(std::int32_t batch_size = 1, bool for_training = false, CompilationMode mode = CompilationMode::kSelective);
  [[nodiscard]] ModelOutputs forward(const NestedTensor& batch, bool include_masks);
  [[nodiscard]] ModelOutputs forward_for_match_free(const NestedTensor& batch);

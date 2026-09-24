@@ -226,8 +226,9 @@ DepthwiseConvBlockImpl::DepthwiseConvBlockImpl(int64_t dim, double layer_scale_i
  if (layer_scale_init_value > 0.0) { gamma = register_parameter("gamma", torch::full({dim}, layer_scale_init_value, torch::kFloat32)); }
 }
 torch::Tensor DepthwiseConvBlockImpl::forward(torch::Tensor x) {
- const auto residual = x;
- x = segmentation_depthwise(x, dwconv->weight, dwconv->bias);
+ return pointwise_tail(x, segmentation_depthwise(x, dwconv->weight, dwconv->bias));
+}
+torch::Tensor DepthwiseConvBlockImpl::pointwise_tail(const torch::Tensor& residual, torch::Tensor x) {
  x = x.permute({0, 2, 3, 1});
  x = norm->forward(x);
  x = pwconv1->forward(x);
@@ -261,7 +262,10 @@ SegmentationHeadImpl::SegmentationHeadImpl(int64_t in_dim, int64_t num_blocks, c
  if (num_blocks < 0) { throw std::runtime_error("SegmentationHead requires num_blocks >= 0"); }
  if (downsample_ratio_ <= 0) { throw std::runtime_error("SegmentationHead requires downsample_ratio > 0"); }
  if (bottleneck_ratio.has_value() && *bottleneck_ratio <= 0) { throw std::runtime_error("SegmentationHead bottleneck_ratio must be positive when set"); }
- for (int64_t index = 0; index < num_blocks; ++index) { blocks->push_back(DepthwiseConvBlock(in_dim)); }
+ for (int64_t index = 0; index < num_blocks; ++index) {
+  blocks->push_back(DepthwiseConvBlock(in_dim));
+  spatial_regions_.push_back(std::make_unique<detail::SelectiveTensorRegion>("segmentation_spatial_" + std::to_string(index)));
+ }
  if (bottleneck_ratio.has_value()) {
   spatial_features_proj = register_module("spatial_features_proj", torch::nn::Conv2d(torch::nn::Conv2dOptions(in_dim, interaction_dim_, 1)));
   query_features_proj = register_module("query_features_proj", torch::nn::Linear(in_dim, interaction_dim_));
@@ -270,14 +274,25 @@ SegmentationHeadImpl::SegmentationHeadImpl(int64_t in_dim, int64_t num_blocks, c
   use_query_identity_ = true;
  }
 }
+void SegmentationHeadImpl::prepare_selective(bool training, bool enabled, int batch_size) {
+ query_region_.prepare(training, enabled, batch_size);
+ for (auto& region : spatial_regions_) region->prepare(training, enabled, batch_size);
+}
+void SegmentationHeadImpl::invalidate_selective() {
+ query_region_.invalidate();
+ for (auto& region : spatial_regions_) region->invalidate();
+}
 torch::Tensor SegmentationHeadImpl::project_spatial_features(const torch::Tensor& spatial_features) {
  if (use_spatial_identity_) { return spatial_features; }
  return spatial_features_proj->forward(spatial_features);
 }
 torch::Tensor SegmentationHeadImpl::project_query_features(const torch::Tensor& query_features) {
- auto projected = query_features_block->forward(query_features);
- if (use_query_identity_) { return projected; }
- return query_features_proj->forward(projected);
+ return query_region_.invoke(is_training(), {query_features}, {query_features_block.get(), query_features_proj ? static_cast<torch::nn::Module*>(query_features_proj.get()) : nullptr},
+  [this](const auto& inputs) {
+   auto projected = query_features_block->forward(inputs[0]);
+   if (!use_query_identity_) projected = query_features_proj->forward(projected);
+   return detail::SelectiveTensorRegion::Tensors{projected};
+  }).front();
 }
 torch::Tensor SegmentationHeadImpl::resize_spatial_features(const torch::Tensor& spatial_features, std::pair<int64_t, int64_t> image_size) const {
  return F::interpolate(spatial_features, F::InterpolateFuncOptions()
@@ -297,8 +312,15 @@ std::vector<Output> SegmentationHeadImpl::collect_head_outputs(
  if (!skip_blocks) {
   if (query_features.size() != blocks->size()) { throw std::runtime_error("SegmentationHead query_features size must match block count"); }
   for (int64_t index = 0; index < static_cast<int64_t>(query_features.size()); ++index) {
-   resized_features = blocks[index]->as<DepthwiseConvBlock>()->forward(resized_features);
-   outputs.push_back(make_output(project_spatial_features(resized_features), project_query_features(query_features[static_cast<size_t>(index)])));
+   auto* block = blocks[index]->as<DepthwiseConvBlock>();
+   auto convolved = segmentation_depthwise(resized_features, block->dwconv->weight, block->dwconv->bias);
+   auto stage = spatial_regions_[static_cast<size_t>(index)]->invoke(is_training(), {resized_features, convolved},
+    {block, spatial_features_proj ? static_cast<torch::nn::Module*>(spatial_features_proj.get()) : nullptr}, [&](const auto& inputs) {
+     auto next = block->pointwise_tail(inputs[0], inputs[1]);
+     return detail::SelectiveTensorRegion::Tensors{next, project_spatial_features(next)};
+    });
+   resized_features = stage[0];
+   outputs.push_back(make_output(stage[1], project_query_features(query_features[static_cast<size_t>(index)])));
   }
   return outputs;
  }

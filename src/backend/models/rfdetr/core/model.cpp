@@ -24,6 +24,8 @@
 #include <vector>
 #include "model.h"
 #include "detail/class_tensor_axes.h"
+#include "detail/decoder_attention.h"
+#include "detail/selective_compilation.h"
 #include "detail/modules_technical.h"
 #include "detail/training_supervision.h"
 #include "src/backend/ml/layers/ms_deform_attn.h"
@@ -56,7 +58,6 @@ struct NativeRfDetrModel::Impl final : torch::nn::Module {
  void optimize_for_inference(int batch_size, bool for_training, CompilationMode mode);
  void set_force_pytorch_deformable_attn(bool value);
  [[nodiscard]] const NativeRfDetrConfig& config() const noexcept { return config_; }
- [[nodiscard]] bool is_compiled(const bool for_training) const noexcept { return for_training ? is_compiled_train_ : is_compiled_eval_; }
  struct TrainingSupervisionRuntimeState {
   TrainingSupervisionConfig config;
   bool has_owner = false;
@@ -80,10 +81,7 @@ struct NativeRfDetrModel::Impl final : torch::nn::Module {
  bool is_compiled_train_ = false;
  torch::jit::Module traced_model_eval_;
  torch::jit::Module traced_model_train_;
- bool has_traced_backbone_eval_ = false;
- bool has_traced_backbone_train_ = false;
- torch::jit::Module traced_backbone_eval_;
- torch::jit::Module traced_backbone_train_;
+ detail::SelectiveTensorRegion backbone_region_{"backbone"};
 };
 namespace {
 using namespace torch::indexing;
@@ -497,23 +495,8 @@ class NativeBackboneImpl : public torch::nn::Module {
 public:
  explicit NativeBackboneImpl(const NativeRfDetrConfig& config)
      : encoder(register_module("encoder", DinoV2Wrapper(config))), projector(register_module("projector", NativeBackboneProjector(config.hidden_dim))) {}
- std::vector<NestedTensor> forward(const NestedTensor& samples) {
-  mmltk::common::logging::ScopedProfile profile_rfdetr_model_backbone{"rfdetr.model.backbone"};
-  std::vector<torch::Tensor> projected = projector->forward(encoder->forward(samples.tensors));
-  std::vector<NestedTensor> out;
-  out.reserve(projected.size());
-  for (auto& feature : projected) {
-   torch::Tensor mask;
-   if (samples.mask.defined()) {
-    mask = resize_mask_to_feature(samples.mask, feature);
-   } else {
-    mask = torch::zeros({feature.size(0), feature.size(2), feature.size(3)}, torch::TensorOptions().dtype(torch::kBool).device(feature.device()));
-   }
-   out.push_back(NestedTensor{std::move(feature), std::move(mask)});
-  }
-  return out;
- }
  torch::Tensor forward_features(const torch::Tensor& pixel_values) {
+  mmltk::common::logging::ScopedProfile profile_rfdetr_model_backbone{"rfdetr.model.backbone"};
   auto projected = projector->forward(encoder->forward(pixel_values));
   return projected[0];
  }
@@ -623,9 +606,8 @@ public:
 TORCH_MODULE(MSDeformAttn);
 class NativeDecoderLayerImpl : public torch::nn::Module {
 public:
- NativeDecoderLayerImpl(int64_t d_model, int64_t sa_nhead, int64_t ca_nhead, int64_t dim_feedforward, int64_t group_detr, int64_t num_feature_levels, int64_t dec_n_points)
-     : group_detr_(std::max<int64_t>(1, group_detr)),
-       self_attn(register_module("self_attn", torch::nn::MultiheadAttention(torch::nn::MultiheadAttentionOptions(d_model, sa_nhead).dropout(0.0)))),
+ NativeDecoderLayerImpl(int64_t d_model, int64_t sa_nhead, int64_t ca_nhead, int64_t dim_feedforward, int64_t num_feature_levels, int64_t dec_n_points)
+     : self_attn(register_module("self_attn", torch::nn::MultiheadAttention(torch::nn::MultiheadAttentionOptions(d_model, sa_nhead).dropout(0.0)))),
        dropout1(register_module("dropout1", torch::nn::Dropout(0.0))),
        norm1(register_module("norm1", torch::nn::LayerNorm(std::vector<int64_t>{d_model}))),
        cross_attn(register_module("cross_attn", MSDeformAttn(d_model, num_feature_levels, ca_nhead, dec_n_points))),
@@ -638,37 +620,26 @@ public:
        dropout3(register_module("dropout3", torch::nn::Dropout(0.0))) {}
  torch::Tensor forward(const torch::Tensor& tgt, const torch::Tensor& memory, const torch::Tensor& memory_key_padding_mask, const torch::Tensor& query_pos, const torch::Tensor& reference_points,
   const FeatureLayout& feature_layout, const DecoderQueryLayout& query_layout) {
-  const int64_t batch = tgt.size(0);
-  const int64_t num_queries = tgt.size(1);
-  if (query_layout.has_denoising()) {
-   const auto tgt2 = isolated_group_self_attention(self_attn, tgt, query_pos, query_layout);
-   auto output = norm1->forward(tgt + dropout1->forward(tgt2));
-   auto cross_output = cross_attn->forward(output + query_pos, reference_points, memory, feature_layout, memory_key_padding_mask);
-   output = norm2->forward(output + dropout2->forward(cross_output));
-   auto feed_forward = linear2->forward(dropout->forward(torch::relu(linear1->forward(output))));
-   return norm3->forward(output + dropout3->forward(feed_forward));
-  }
-  auto q = (tgt + query_pos).transpose(0, 1);
-  auto k = q;
-  auto v = tgt.transpose(0, 1);
-  if (is_training() && group_detr_ > 1) {
-   const int64_t group_queries = num_queries / group_detr_;
-   q = torch::cat(q.split(group_queries, 0), 1);
-   k = torch::cat(k.split(group_queries, 0), 1);
-   v = torch::cat(v.split(group_queries, 0), 1);
-  }
-  auto tgt2 = std::get<0>(self_attn->forward(q, k, v, {}, false));
-  if (is_training() && group_detr_ > 1) { tgt2 = torch::cat(tgt2.split(batch, 1), 0); }
-  tgt2 = tgt2.transpose(0, 1);
-  auto output = norm1->forward(tgt + dropout1->forward(tgt2));
-  tgt2 = cross_attn->forward(output + query_pos, reference_points, memory, feature_layout, memory_key_padding_mask);
-  output = norm2->forward(output + dropout2->forward(tgt2));
-  tgt2 = linear2->forward(dropout->forward(torch::relu(linear1->forward(output))));
-  return norm3->forward(output + dropout3->forward(tgt2));
+  const auto attended = isolated_group_self_attention(self_attn, tgt, query_pos, query_layout);
+  auto output = norm1->forward(tgt + dropout1->forward(attended));
+  auto cross = cross_attn->forward(output + query_pos, reference_points, memory, feature_layout, memory_key_padding_mask);
+  return post_cross_attention(output, cross);
  }
+ void prepare_selective(bool training, bool enabled, int batch_size) { tail_region_.prepare(training, enabled, batch_size); }
+ void invalidate_selective() { tail_region_.invalidate(); }
 
 private:
- int64_t group_detr_ = 1;
+ friend struct test_support::DecoderTailTestAccess;
+ torch::Tensor post_cross_attention(const torch::Tensor& residual, const torch::Tensor& cross) {
+  return tail_region_.invoke(is_training(), {residual, cross}, {norm2.get(), linear1.get(), linear2.get(), norm3.get()},
+   [this](const auto& inputs) { return detail::SelectiveTensorRegion::Tensors{ordinary_post_cross_attention(inputs[0], inputs[1])}; }).front();
+ }
+ torch::Tensor ordinary_post_cross_attention(const torch::Tensor& residual, const torch::Tensor& cross) {
+  auto output = norm2->forward(residual + dropout2->forward(cross));
+  auto feed_forward = linear2->forward(dropout->forward(torch::relu(linear1->forward(output))));
+  return norm3->forward(output + dropout3->forward(feed_forward));
+ }
+ detail::SelectiveTensorRegion tail_region_{"decoder_tail", true};
  torch::nn::MultiheadAttention self_attn{nullptr};
  torch::nn::Dropout dropout1{nullptr};
  torch::nn::LayerNorm norm1{nullptr};
@@ -693,7 +664,7 @@ public:
        norm(register_module("norm", torch::nn::LayerNorm(std::vector<int64_t>{config.hidden_dim}))),
        ref_point_head(register_module("ref_point_head", std::make_shared<RfDetrMlpImpl>(2 * config.hidden_dim, config.hidden_dim, config.hidden_dim, 2))) {
   for (int64_t index = 0; index < num_layers_; ++index) {
-   layers->push_back(NativeDecoderLayer(config.hidden_dim, config.sa_nheads, config.ca_nheads, config.dim_feedforward, config.group_detr, 1, config.dec_n_points));
+   layers->push_back(NativeDecoderLayer(config.hidden_dim, config.sa_nheads, config.ca_nheads, config.dim_feedforward, 1, config.dec_n_points));
   }
  }
  void set_bbox_embed(const std::shared_ptr<RfDetrMlpImpl>& bbox_embed) { bbox_embed_ = bbox_embed; }
@@ -1014,6 +985,14 @@ std::vector<detail::ClassTensorAxis> NativeRfDetrModel::Impl::class_axes() const
  if (training_supervision_) training_supervision_->append_class_axes(axes);
  return axes;
 }
+std::shared_ptr<torch::nn::Module> test_support::DecoderTailTestAccess::make(int64_t width, int64_t feedforward) {
+ return std::make_shared<NativeDecoderLayerImpl>(width, 2, 2, feedforward, 1, 2);
+}
+torch::Tensor test_support::DecoderTailTestAccess::invoke(torch::nn::Module& module, const torch::Tensor& residual, const torch::Tensor& cross, bool selective) {
+ auto& layer = dynamic_cast<NativeDecoderLayerImpl&>(module);
+ layer.prepare_selective(layer.is_training(), selective, residual.size(0));
+ return layer.post_cross_attention(residual, cross);
+}
 ModelOutputs NativeRfDetrModel::Impl::forward(const NestedTensor& batch, bool include_masks) { return forward_impl(batch, include_masks, false); }
 ModelOutputs NativeRfDetrModel::Impl::forward_for_match_free(const NestedTensor& batch) {
  if (!training_supervision_ || !training_supervision_->match_free_enabled() || !training_supervision_->initialized()) {
@@ -1137,15 +1116,10 @@ ModelOutputs NativeRfDetrModel::Impl::forward_impl(const NestedTensor& batch, co
  std::vector<NestedTensor> features;
  {
   mmltk::common::logging::ScopedProfile profile_rfdetr_model_forward_backbone{"rfdetr.model.forward.backbone"};
-  const bool use_traced_backbone = is_train ? has_traced_backbone_train_ : has_traced_backbone_eval_;
-  if (use_traced_backbone) {
-   auto& traced = is_train ? traced_backbone_train_ : traced_backbone_eval_;
-   auto feature = traced.forward({samples.tensors}).toTensor();
-   torch::Tensor mask = resize_mask_to_feature(samples.mask, feature);
-   features.push_back(NestedTensor{std::move(feature), std::move(mask)});
-  } else {
-   features = backbone_->at<NativeBackboneImpl>(0).forward(samples);
-  }
+  auto& backbone = backbone_->at<NativeBackboneImpl>(0);
+  auto feature = backbone_region_.invoke(is_train, {samples.tensors}, {&backbone},
+   [&](const auto& inputs) { return detail::SelectiveTensorRegion::Tensors{backbone.forward_features(inputs[0])}; }).front();
+  features.push_back(NestedTensor{feature, resize_mask_to_feature(samples.mask, feature)});
  }
  std::vector<torch::Tensor> srcs;
  std::vector<torch::Tensor> masks;
@@ -1404,7 +1378,7 @@ void NativeRfDetrModel::Impl::commit_normalized_state(detail::NormalizedModelSta
  }
 }
 namespace {
-// Tracing and ONNX export both drive the model with a zero batch shaped like real input and bound to
+// Full-model tracing and ONNX export both drive the model with a zero batch shaped like real input and bound to
 // the model's own parameter device and dtype; that probe input has one definition.
 torch::Tensor make_dummy_pixel_values(const torch::nn::Module& model, const int64_t resolution, const int64_t batch_size) {
  const torch::Tensor reference = model.parameters().front();
@@ -1412,48 +1386,21 @@ torch::Tensor make_dummy_pixel_values(const torch::nn::Module& model, const int6
 }
 }  // namespace
 void NativeRfDetrModel::Impl::optimize_for_inference(int batch_size, bool for_training, CompilationMode mode) {
- const bool already_compiled = for_training ? (is_compiled_train_ || has_traced_backbone_train_) : (is_compiled_eval_ || has_traced_backbone_eval_);
- if (already_compiled) return;
- if (for_training) {
-  this->train();
- } else {
-  this->eval();
+ this->train(for_training);
+ const bool selective = mode == CompilationMode::kSelective;
+ backbone_region_.prepare(for_training, selective, batch_size);
+ for (const auto& module : modules(false)) {
+  if (auto* layer = dynamic_cast<NativeDecoderLayerImpl*>(module.get())) layer->prepare_selective(for_training, selective, batch_size);
+  if (auto* head = dynamic_cast<SegmentationHeadImpl*>(module.get())) head->prepare_selective(for_training, selective, batch_size);
  }
- if (mode == CompilationMode::kNone) {
-  mmltk::common::logging::info([&](auto& logger) { logger.info("rfdetr: compilation disabled, using raw C++ forward for {}", for_training ? "training" : "evaluation"); });
+ auto& full_compiled = for_training ? is_compiled_train_ : is_compiled_eval_;
+ if (mode != CompilationMode::kFullTrace) {
+  full_compiled = false;
   return;
  }
+ if (full_compiled) return;
  auto device = this->parameters().front().device();
  auto dummy_pixel_values = make_dummy_pixel_values(*this, config_.resolution, batch_size);
- if (mode == CompilationMode::kSelective) {
-  mmltk::common::logging::info([&](auto& logger) { logger.info("rfdetr: selectively compiling backbone for {} via torch::jit...", for_training ? "training" : "evaluation"); });
-  auto& backbone = backbone_->at<NativeBackboneImpl>(0);
-  auto cu = std::make_shared<torch::jit::CompilationUnit>();
-  auto cls_name = for_training ? "__torch__.NativeRfDetrBackboneTrain" : "__torch__.NativeRfDetrBackboneEval";
-  auto cls = torch::jit::ClassType::create(cls_name, cu, true);
-  auto* target = for_training ? &traced_backbone_train_ : &traced_backbone_eval_;
-  *target = torch::jit::Module(cu, cls);
-  for (const auto& kv : backbone.named_parameters(true)) {
-   std::string name = kv.key();
-   std::replace(name.begin(), name.end(), '.', '_');
-   target->register_parameter(name, kv.value(), false);
-  }
-  for (const auto& kv : backbone.named_buffers(true)) {
-   std::string name = kv.key();
-   std::replace(name.begin(), name.end(), '.', '_');
-   target->register_buffer(name, kv.value());
-  }
-  auto trace_res = torch::jit::tracer::trace(
-   {dummy_pixel_values}, [&](torch::jit::Stack args) -> torch::jit::Stack { return {backbone.forward_features(args[0].toTensor())}; }, [](const torch::autograd::Variable&) { return ""; }, false,
-   false, target);
-  target->type()->addMethod(cu->create_function("forward", trace_res.first->graph, true));
-  if (for_training) {
-   has_traced_backbone_train_ = true;
-  } else {
-   has_traced_backbone_eval_ = true;
-  }
-  return;
- }
  mmltk::common::logging::info([&](auto& logger) { logger.info("rfdetr: compiling entire model {} graph via torch::jit...", for_training ? "training" : "evaluation"); });
  auto dummy_mask = torch::zeros({batch_size, config_.resolution, config_.resolution}, torch::TensorOptions().dtype(torch::kBool).device(device));
  auto cu = std::make_shared<torch::jit::CompilationUnit>();
@@ -1530,12 +1477,22 @@ NativeRfDetrModel::~NativeRfDetrModel() = default;
 NativeRfDetrModel::NativeRfDetrModel(NativeRfDetrModel&&) noexcept = default;
 NativeRfDetrModel& NativeRfDetrModel::operator=(NativeRfDetrModel&&) noexcept = default;
 const NativeRfDetrConfig& NativeRfDetrModel::config() const noexcept { return impl_->config(); }
-bool NativeRfDetrModel::is_compiled(const bool for_training) const noexcept { return impl_->is_compiled(for_training); }
 void NativeRfDetrModel::optimize_for_inference(const std::int32_t batch_size, const bool for_training, const CompilationMode mode) { impl_->optimize_for_inference(batch_size, for_training, mode); }
 void NativeRfDetrModel::train(bool enabled) { impl_->train(enabled); }
 void NativeRfDetrModel::eval() { impl_->eval(); }
 bool NativeRfDetrModel::is_training() const noexcept { return impl_->is_training(); }
-void NativeRfDetrModel::to(const torch::Device& device) { impl_->to(device); }
+void NativeRfDetrModel::to(const torch::Device& device) {
+ if (impl_->parameters().front().device() != device) {
+  impl_->backbone_region_.invalidate();
+  impl_->is_compiled_train_ = false;
+  impl_->is_compiled_eval_ = false;
+  for (const auto& module : impl_->modules(false)) {
+   if (auto* layer = dynamic_cast<NativeDecoderLayerImpl*>(module.get())) layer->invalidate_selective();
+   if (auto* head = dynamic_cast<SegmentationHeadImpl*>(module.get())) head->invalidate_selective();
+  }
+ }
+ impl_->to(device);
+}
 std::vector<torch::Tensor> NativeRfDetrModel::parameters(bool recurse) const { return impl_->parameters(recurse); }
 torch::OrderedDict<std::string, torch::Tensor> NativeRfDetrModel::named_parameters(bool recurse) const { return impl_->named_parameters(recurse); }
 torch::OrderedDict<std::string, torch::Tensor> NativeRfDetrModel::named_buffers(bool recurse) const { return impl_->named_buffers(recurse); }

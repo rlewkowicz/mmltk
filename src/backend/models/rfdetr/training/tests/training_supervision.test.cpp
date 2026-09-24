@@ -1448,7 +1448,7 @@ void test_all_supervision_routes_execute_fixture_backed_training() {
    request.epochs = 1;
    request.workers = 4;
    request.lanes = lanes;
-   request.compilation_mode = rfdetr::CompilationMode::kNone;
+   request.compilation_mode = lanes == 2 ? rfdetr::CompilationMode::kSelective : rfdetr::CompilationMode::kNone;
    request.amp = false;
    request.progress_bar = false;
    request.validation_loss = true;
@@ -1607,7 +1607,7 @@ void test_all_supervision_routes_execute_fixture_backed_training() {
      request.epochs = 1;
      request.workers = 2;
      request.lanes = 2;
-     request.compilation_mode = rfdetr::CompilationMode::kNone;
+     request.compilation_mode = rfdetr::CompilationMode::kSelective;
      request.amp = false;
      request.progress_bar = false;
      request.validation_loss = true;
@@ -1839,6 +1839,7 @@ TEST_CASE("Production Match-Free masks retain AMP accumulation gradients and cur
   rfdetr::NativeRfDetrModel model(config,rfdetr::testsupport::synthetic_training_layout(2));
   model.initialize_training_supervision(910); model.to(torch::Device(torch::kCUDA)); model.train(true); model.set_force_pytorch_deformable_attn(true);
   model.configure_supervision_timing({torch::Device(torch::kCUDA),2,false});
+  model.optimize_for_inference(2, true, mode == 1 || mode == 4 ? rfdetr::CompilationMode::kSelective : rfdetr::CompilationMode::kNone);
   rfdetr::PreparedTargets targets;
   targets.all_boxes=torch::tensor({{0.5F,0.5F,0.4F,0.4F},{0.5F,0.5F,0.4F,0.4F},{0.2F,0.3F,0.1F,0.2F},{0.7F,0.6F,0.2F,0.1F}},floats);
   targets.all_labels=torch::tensor({0,0,1,1},integers); targets.counts={4,0}; targets.offsets={0,4}; targets.resolved_query_count=3;
@@ -2012,5 +2013,141 @@ TEST_CASE("Production Hungarian DN masks preserve stock draws and accumulated tr
    REQUIRE(torch::isfinite(*parameter).all().item<bool>());
    REQUIRE_FALSE(torch::equal(before, *parameter));
   }
+ }
+}
+
+TEST_CASE("Selective native training retains routed objectives gradients optimizer updates and RNG", "[rfdetr][training_supervision][compilation][cuda]") {
+ if (mmltk::testsupport::checked_cuda_device_count() == 0) SKIP("CUDA unavailable; selective training remains unverified");
+ const auto topology = mmltk::common::system::NumaTopology::Capture();
+ const auto placement = mmltk::common::system::resolve_placement(topology, topology.permitted_nodes.front());
+ mmltk::common::system::ScopedExecutionPolicy policy({placement.cpus, {}, 0, placement.numa_node, -10, false});
+ rfdetr::MatcherWorkspace workspace(placement.numa_node, true);
+ rfdetr::ScopedRuntimeContext runtime(nullptr, 0, &workspace);
+ const auto floats = torch::TensorOptions().device(torch::kCUDA).dtype(torch::kFloat32);
+ const auto integers = floats.dtype(torch::kInt64);
+ for (const bool segmentation : {false, true}) for (const bool match_free : {false, true}) for (const bool denoising : {false, true})
+ for (const auto dtype : {torch::kFloat32, torch::kFloat16, torch::kBFloat16}) {
+  if (dtype == torch::kBFloat16 && at::cuda::getCurrentDeviceProperties()->major < 8) continue;
+  CAPTURE(segmentation, match_free, denoising, dtype);
+  auto config = rfdetr::native_config_from_preset(rfdetr::model_presets().front());
+  config.resolution = 64; config.num_classes = 3; config.num_queries = 3; config.num_select = 3;
+  config.group_detr = 2; config.dec_layers = 2; config.aux_loss = true; config.two_stage = true; config.segmentation = segmentation;
+  config.training_supervision.assignment = match_free ? rfdetr::TrainAssignmentKind::MatchFree : rfdetr::TrainAssignmentKind::Hungarian;
+  config.training_supervision.denoising.enabled = denoising; config.training_supervision.denoising.groups = 2;
+  rfdetr::NativeRfDetrModel eager(config, rfdetr::testsupport::synthetic_training_layout(2));
+  rfdetr::NativeRfDetrModel selective(config, rfdetr::testsupport::synthetic_training_layout(2));
+  eager.initialize_training_supervision(937); selective.initialize_training_supervision(937);
+  static_cast<void>(selective.load_normalized_state(rfdetr::testsupport::clone_normalized_model_state(eager), true));
+  for (auto* model : {&eager, &selective}) {
+   model->to(torch::Device(torch::kCUDA)); model->train(true); model->set_force_pytorch_deformable_attn(true);
+  }
+  selective.optimize_for_inference(2, true, rfdetr::CompilationMode::kSelective);
+  // Preparation precedes freeze exactly as in production; recording must observe
+  // the final parameter policy, rather than a speculative dummy execution.
+  const bool frozen_encoder = !denoising;
+  if (frozen_encoder) for (auto* model : {&eager, &selective}) for (auto& item : model->named_parameters(true))
+   if (item.key().starts_with("backbone.0.encoder.")) item.value().set_requires_grad(false);
+  rfdetr::DetectionConfig detection;
+  rfdetr::project_loss_coefficients(detection, config);
+  detection.num_classes = config.num_classes; detection.group_detr = config.group_detr; detection.dec_layers = config.dec_layers;
+  detection.num_select = config.num_select; detection.two_stage = config.two_stage; detection.aux_loss = config.aux_loss;
+  detection.include_masks = segmentation; detection.mask_point_sample_ratio = config.mask_point_sample_ratio;
+  detection.ia_bce_loss = config.ia_bce_loss; detection.focal_alpha = config.focal_alpha;
+  detection.set_cost_class = config.set_cost_class; detection.set_cost_bbox = config.set_cost_bbox; detection.set_cost_giou = config.set_cost_giou;
+  rfdetr::populate_default_detection_weight_dict(detection);
+  rfdetr::PreparedTargets targets;
+  targets.all_boxes = torch::tensor({{0.3F, 0.3F, 0.2F, 0.2F}, {0.7F, 0.6F, 0.2F, 0.3F}}, floats);
+  targets.all_labels = torch::tensor({0, 1}, integers); targets.counts = {2, 0}; targets.offsets = {0, 2}; targets.resolved_query_count = 3;
+  targets.target_counts = torch::tensor(targets.counts, integers); targets.target_offsets = torch::tensor(targets.offsets, integers);
+  targets.targets.resize(2);
+  for (size_t image = 0; image < targets.targets.size(); ++image) {
+   targets.targets[image].boxes = targets.all_boxes.narrow(0, targets.offsets[image], targets.counts[image]);
+   targets.targets[image].labels = targets.all_labels.narrow(0, targets.offsets[image], targets.counts[image]);
+  }
+  if (segmentation) targets.packed_masks = rfdetr::PackedTargetMasks{torch::tensor({{int64_t{0x3333}}, {int64_t{0xcccc}}}, integers), 4, 4};
+  auto input = torch::rand({2, 3, 64, 64}, floats).set_requires_grad(true);
+  auto compiled_input = input.detach().clone().set_requires_grad(true);
+  rfdetr::TrainRequest optimizer_request;
+  optimizer_request.optimizer = rfdetr::TrainOptimizerKind::AdamW;
+  optimizer_request.lr = 1e-4; optimizer_request.weight_decay = 0.0;
+  auto eager_optimizer = rfdetr::build_optimizer(eager.named_parameters(true), optimizer_request);
+  auto selective_optimizer = rfdetr::build_optimizer(selective.named_parameters(true), optimizer_request);
+  // Four accumulated microbatches cover recording, initial executor reuse and
+  // the later optimized executor path where the installed payload supports it.
+  // K includes accumulation and lanes; the production owner applies both divisions.
+  const rfdetr::TrainingStep step(2 * 2, 1.0, dtype != torch::kFloat32, dtype);
+  std::array<torch::Tensor, 4> eager_losses, selective_losses;
+  const auto route = match_free ? (denoising ? rfdetr::TrainingSupervisionRoute::MatchFreeDenoising : rfdetr::TrainingSupervisionRoute::MatchFree)
+                               : (denoising ? rfdetr::TrainingSupervisionRoute::HungarianDenoising : rfdetr::TrainingSupervisionRoute::Hungarian);
+  for (size_t micro = 0; micro < eager_losses.size(); ++micro) step.forward([&] {
+   const auto forward = [&](rfdetr::NativeRfDetrModel& model, const torch::Tensor& images) {
+    const auto batch = rfdetr::nested_tensor_from_tensor_list({images[0], images[1]});
+    if (denoising) return model.forward_with_denoising(batch, targets, {937, 0, 0, micro});
+    return match_free ? model.forward_for_match_free(batch) : model.forward(batch, segmentation);
+   };
+   auto generator = at::cuda::detail::getDefaultCUDAGenerator();
+   const auto state = generator.get_state();
+   const auto ordinary = forward(eager, input);
+   eager_losses[micro] = rfdetr::compute_routed_training_loss(eager, route, ordinary, targets, {torch::tensor(2.F, floats)}, detection).total;
+   const auto after = generator.get_state();
+   generator.set_state(state);
+   const auto compiled = forward(selective, compiled_input);
+   selective_losses[micro] = rfdetr::compute_routed_training_loss(selective, route, compiled, targets, {torch::tensor(2.F, floats)}, detection).total;
+   REQUIRE(torch::equal(after, generator.get_state()));
+   REQUIRE(torch::allclose(ordinary.main.pred_logits, compiled.main.pred_logits, 4e-3, 4e-3));
+   REQUIRE(torch::allclose(ordinary.main.pred_boxes, compiled.main.pred_boxes, 4e-3, 4e-3));
+   REQUIRE(torch::allclose(eager_losses[micro], selective_losses[micro], 4e-3, 4e-3));
+   if (segmentation) {
+    REQUIRE(torch::allclose(ordinary.main.sparse_pred_masks->spatial_features, compiled.main.sparse_pred_masks->spatial_features, 4e-3, 4e-3));
+    REQUIRE(torch::allclose(ordinary.main.sparse_pred_masks->query_features, compiled.main.sparse_pred_masks->query_features, 4e-3, 4e-3));
+    if (denoising) {
+     REQUIRE(compiled.main.sparse_pred_masks->spatial_features.is_same(compiled.denoising->main.sparse_pred_masks->spatial_features));
+     REQUIRE(compiled.main.sparse_pred_masks->bias.is_same(compiled.denoising->main.sparse_pred_masks->bias));
+     REQUIRE(compiled.main.sparse_pred_masks->query_features.storage().unsafeGetStorageImpl() == compiled.denoising->main.sparse_pred_masks->query_features.storage().unsafeGetStorageImpl());
+    }
+   }
+  });
+  for (size_t micro = 0; micro < eager_losses.size(); ++micro) { step.backward(eager_losses[micro]); step.backward(selective_losses[micro]); }
+  REQUIRE(torch::allclose(input.grad(), compiled_input.grad(), 1e-2, 4e-3));
+  const auto compiled_parameters = selective.named_parameters(true);
+  for (const auto& item : eager.named_parameters(true)) {
+   CAPTURE(item.key());
+   const auto& other = compiled_parameters[item.key()];
+   REQUIRE(item.value().grad().defined() == other.grad().defined());
+   if (item.value().grad().defined()) REQUIRE(torch::allclose(item.value().grad(), other.grad(), 1e-2, 4e-3));
+  }
+  const auto before = eager.named_parameters(true)["class_embed.weight"].detach().clone();
+  eager_optimizer.optimizer.step(); selective_optimizer.optimizer.step();
+  REQUIRE_FALSE(torch::equal(before, eager.named_parameters(true)["class_embed.weight"]));
+  for (const auto& item : eager.named_parameters(true)) REQUIRE(torch::allclose(item.value(), compiled_parameters[item.key()], 1e-3, 3e-4));
+  // Current-format state copies must remain live in already-recorded regions.
+  selective.commit_normalized_state(selective.stage_normalized_state(rfdetr::testsupport::clone_normalized_model_state(eager), rfdetr::detail::NormalizedModelStateAdmission::Exact));
+  step.forward([&] {
+   const auto expected = eager.forward({input, {}}, segmentation);
+   const auto actual = selective.forward({compiled_input, {}}, segmentation);
+   REQUIRE(torch::allclose(actual.main.pred_logits, expected.main.pred_logits, 4e-3, 4e-3));
+   REQUIRE(torch::allclose(actual.main.pred_boxes, expected.main.pred_boxes, 4e-3, 4e-3));
+  });
+  for (auto* model : {&eager, &selective}) model->eval();
+  selective.optimize_for_inference(2, false, rfdetr::CompilationMode::kSelective);
+  torch::NoGradGuard no_grad;
+  const auto padded = torch::cat({input.detach().narrow(0, 0, 1), torch::zeros_like(input.detach().narrow(0, 0, 1))}, 0);
+  const auto padded_expected = eager.forward({padded, {}}, segmentation);
+  const auto padded_actual = selective.forward({padded, {}}, segmentation);
+  REQUIRE(torch::allclose(padded_actual.main.pred_logits.narrow(0, 0, 1), padded_expected.main.pred_logits.narrow(0, 0, 1), 2e-4, 2e-4));
+  REQUIRE(torch::allclose(padded_actual.main.pred_logits.narrow(0, 0, 1), eager.forward({input.detach().narrow(0, 0, 1), {}}, segmentation).main.pred_logits, 2e-4, 2e-4));
+  for (const auto count : {2, 1, 2}) {
+   const auto image = input.detach().narrow(0, 0, count);
+   const rfdetr::NestedTensor batch{image, {}};
+   const auto expected = eager.forward(batch, false);
+   const auto actual = selective.forward(batch, false);
+   REQUIRE_FALSE(actual.main.sparse_pred_masks);
+   REQUIRE(torch::allclose(actual.main.pred_logits, expected.main.pred_logits, 2e-4, 2e-4));
+  }
+  const auto changed_spatial = torch::zeros({2, 3, 96, 96}, floats);
+  REQUIRE_THROWS(eager.forward({changed_spatial, {}}, false));
+  REQUIRE_THROWS(selective.forward({changed_spatial, {}}, false));
+  selective.optimize_for_inference(2, false, rfdetr::CompilationMode::kNone);
+  REQUIRE(torch::allclose(selective.forward({input.detach(), {}}, false).main.pred_boxes, eager.forward({input.detach(), {}}, false).main.pred_boxes));
  }
 }

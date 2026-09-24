@@ -9,6 +9,7 @@ module;
 #include <cuda_runtime.h>
 #include <c10/cuda/CUDAStream.h>
 #include "src/common/system/execution_policy.h"
+#include "src/common/math/checked_arithmetic.h"
 #include "src/frameworks/gpu/device_execution.h"
 #include "src/frameworks/gpu/terminal_cuda_retirement_owner.h"
 #include "dataset_batch_lease.h"
@@ -177,6 +178,7 @@ public:
     static_cast<void>(technical_model.load_normalized_state(resolved.model_state.entries(), false));
     technical_model.to(torch::Device(torch::kCUDA, static_cast<c10::DeviceIndex>(device_)));
     technical_model.eval();
+    technical_model.optimize_for_inference(mmltk::common::math::checked_cast<int>(options.batch_size, "native inference batch exceeds supported compilation range"), false, options.compilation_mode);
     native_precision_ = options.allow_fp16 ? torch_cuda::preferred_torch_cuda_precision(device_) : torch_cuda::TorchCudaPrecision::Float32;
     switch (native_precision_) {
      case torch_cuda::TorchCudaPrecision::Float32: native_input_type_ = at::kFloat; break;

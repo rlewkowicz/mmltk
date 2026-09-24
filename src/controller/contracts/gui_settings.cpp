@@ -395,22 +395,16 @@ constexpr auto train_execution_fields = [](auto& request, const auto& visit) {
  visit("progress_bar", request.progress_bar);
  visit("compile_mode", request.compilation_mode);
 };
-constexpr auto validate_execution_fields = [](auto& request, const auto& visit) {
- visit_record_fields<mmltk::backend::data::DataLoadingOptions>(request, visit);
- visit("cpu_affinity", request.cpu_affinity);
- visit("device_id", request.device_id);
- visit("workers", request.workers);
- visit("allow_fp16", request.allow_fp16);
+constexpr auto inference_execution_fields = [](auto& request, const auto& visit) {
+ visit_record_fields<mmltk::backend::models::rfdetr::InferenceExecutionConfig>(request, [&](const char* name, auto& field) {
+  visit(std::string_view{name} == "compilation_mode" ? "compile_mode" : name, field);
+ });
 };
+constexpr auto validate_execution_fields = inference_execution_fields;
 constexpr auto predict_execution_fields = [](auto& request, const auto& visit) {
- visit_record_fields<mmltk::backend::data::DataLoadingOptions>(request, visit);
- visit("cpu_affinity", request.cpu_affinity);
- visit("device_id", request.device_id);
- visit("workers", request.workers);
+ inference_execution_fields(request, visit);
  visit("lanes", request.lanes);
- visit("allow_fp16", request.allow_fp16);
  visit("progress_bar", request.progress_bar);
- visit("compile_mode", request.compilation_mode);
 };
 constexpr auto annotate_execution_fields = [](auto& state, const auto& visit) {
  visit("device_id", state.device_id);
@@ -490,17 +484,13 @@ constexpr auto validation_fields = [](auto& state, const auto& visit) {
  visit("log_mode", state.log_mode);
 };
 constexpr auto validate_flat_fields = [](auto& state, const auto& visit) {
- visit_record_fields<mmltk::backend::data::DataLoadingOptions>(state, visit);
+ inference_execution_fields(state, visit);
  visit("compiled_path", state.compiled_path);
  visit("source_dir", state.source_dir);
  visit("weights_path", state.weights_path);
  if constexpr (requires { state.class_layout_path; }) visit("class_layout_path", state.class_layout_path);
  visit("onnx_path", state.onnx_path);
  visit("tensorrt_path", state.tensorrt_path);
- visit("cpu_affinity", state.cpu_affinity);
- visit("device_id", state.device_id);
- visit("workers", state.workers);
- visit("allow_fp16", state.allow_fp16);
  validation_fields(state, visit);
 };
 constexpr auto predict_fields = [](auto& state, const auto& visit) {

@@ -37,7 +37,6 @@ struct DenoisingTransform {
 [[nodiscard]] torch::Tensor sparse_match_free_correspondence(const torch::Tensor& dense, const torch::Tensor& valid_rows, float rho);
 [[nodiscard]] DenoisingTransform transform_denoising_targets(const torch::Tensor& original_labels, const torch::Tensor& original_boxes, const torch::Tensor& valid_slots, int64_t object_classes,
  const DenoisingSupervisionConfig& config, const DenoisingVariates& variates);
-[[nodiscard]] torch::Tensor isolated_group_self_attention(torch::nn::MultiheadAttention& attention, const torch::Tensor& target, const torch::Tensor& query_position, const DecoderQueryLayout& layout);
 class TrainingSupervisionImpl final : public torch::nn::Module {
 public:
  explicit TrainingSupervisionImpl(const NativeRfDetrConfig& config, std::int64_t foreground_count);

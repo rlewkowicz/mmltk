@@ -1,3 +1,4 @@
+#include "src/backend/models/rfdetr/core/detail/decoder_attention.h"
 #include "src/backend/models/rfdetr/core/detail/training_mask_loss.h"
 #include "src/backend/models/rfdetr/core/detail/detection_sampling.h"
 #include "src/backend/ml/torch/tests/catch_support.h"

@@ -39,6 +39,7 @@ struct DeviceExecutionConfig {
  [[= mmltk::frameworks::reflection::Minimum<int>{0}]] int device_id = 0;
 };
 struct InferenceExecutionConfig : DeviceExecutionConfig, mmltk::backend::data::DataLoadingOptions {
+ CompilationMode compilation_mode = CompilationMode::kSelective;
  [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumNameBytes}]] std::string cpu_affinity;
  [[= mmltk::frameworks::reflection::Minimum<int>{0}]] int workers = 0;
  bool allow_fp16 = true;
@@ -77,7 +78,6 @@ struct PredictRequest : ModelArtifactRequest, InferenceExecutionConfig {
  std::size_t limit_images = 0U;
  bool include_masks = true;
  bool progress_bar = true;
- CompilationMode compilation_mode = CompilationMode::kSelective;
 };
 enum class ValidationLogMode : std::uint8_t {
  Quiet,

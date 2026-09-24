@@ -585,6 +585,8 @@ void test_ui_settings_round_trip() {
  validate.request.candidate_count = 211;
  validate.request.eval_max_dets = 213;
  validate.request.profile = true;
+ validate.request.compilation_mode = mmltk::backend::models::rfdetr::CompilationMode::kNone;
+ predict.request.compilation_mode = mmltk::backend::models::rfdetr::CompilationMode::kSelective;
  predict.source.kind = SourceKind::SingleImage;
  predict.source.single_image_path = "/tmp/input.png";
  predict.source.compiled_path = "/tmp/source.bin";
@@ -728,6 +730,8 @@ void test_ui_settings_round_trip() {
  CHECK(loaded_validate.request.numa_node == 3);
  CHECK(loaded_predict.request.h2d_dataloader);
  CHECK(loaded_predict.request.numa_node == 2);
+ CHECK(loaded_validate.request.compilation_mode == mmltk::backend::models::rfdetr::CompilationMode::kNone);
+ CHECK(loaded_predict.request.compilation_mode == mmltk::backend::models::rfdetr::CompilationMode::kSelective);
  CHECK(loaded_explore.h2d_dataloader);
  CHECK(loaded_explore.numa_node == 1);
  REQUIRE((loaded_train.request.train_compiled_path == "/tmp/train.bin"));

@@ -65,6 +65,20 @@ TEST_CASE("prediction source saving choices persist independently", "[controller
  CHECK_FALSE(saved.single_enabled); CHECK(saved.compiled_enabled); CHECK(saved.compiled_percent==37U); CHECK(saved.compiled_total==3U);
  CHECK(saved.video_samples==17U); CHECK(saved.video_mode==contracts::PredictionVideoSaving::Full);
 }
+TEST_CASE("Shared native inference compilation policies survive settings reconstruction", "[controller][settings][compilation]") {
+ const auto root = mmltk::testsupport::make_temp_root("compilation-settings");
+ SettingsSystem settings;
+ REQUIRE(settings.Load(install_settings(root)).applied());
+ contracts::SettingsUpdateRequest edit;
+ edit.updates.push_back({.path = "workflows.predict.request.compilation_mode", .value = mmltk::frameworks::serialization::wire::FlatValue{std::uint64_t{0}}});
+ edit.updates.push_back({.path = "workflows.validate.request.compilation_mode", .value = mmltk::frameworks::serialization::wire::FlatValue{std::uint64_t{0}}});
+ static_cast<void>(settings.Update(std::move(edit)));
+ SettingsSystem restored;
+ REQUIRE(restored.Load(services::SettingsLocation{(root / "settings.json").string()}).applied());
+ const auto state = restored.snapshot().settings_state;
+ CHECK(state.workflows.predict.request.compilation_mode == mmltk::backend::models::rfdetr::CompilationMode::kNone);
+ CHECK(state.workflows.validate.request.compilation_mode == mmltk::backend::models::rfdetr::CompilationMode::kNone);
+}
 TEST_CASE("accepted display confidence survives Settings reconstruction", "[controller][systems][settings]") {
  const auto root = mmltk::testsupport::make_temp_root("validation-display-settings");
  SettingsSystem settings;

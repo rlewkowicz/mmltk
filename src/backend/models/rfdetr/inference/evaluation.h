@@ -19,7 +19,6 @@ struct EvaluateRequest : ModelArtifactRequest, InferenceExecutionConfig {
  std::size_t batch_size = 1U;
  int lanes = 0;
  bool progress_bar = true;
- CompilationMode compilation_mode = CompilationMode::kSelective;
 };
 MMLTK_REFLECT_FIELDS(EvaluateRequest)
 struct EvaluationRunResult {

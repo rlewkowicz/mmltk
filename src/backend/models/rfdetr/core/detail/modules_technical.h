@@ -1,5 +1,6 @@
 #pragma once
 #include <torch/torch.h>
+#include "src/backend/models/rfdetr/core/detail/selective_compilation.h"
 #include <memory>
 #include <utility>
 #include <vector>
@@ -49,6 +50,7 @@ class DepthwiseConvBlockImpl : public torch::nn::Module {
 public:
  explicit DepthwiseConvBlockImpl(int64_t dim, double layer_scale_init_value = 0.0);
  torch::Tensor forward(torch::Tensor x);
+ torch::Tensor pointwise_tail(const torch::Tensor& residual, torch::Tensor convolved);
  torch::nn::Conv2d dwconv{nullptr};
  torch::nn::LayerNorm norm{nullptr};
  torch::nn::Linear pwconv1{nullptr};
@@ -69,6 +71,8 @@ using SegmentationMlpBlockImpl = MlpBlockImpl;
 using SegmentationMlpBlock = MlpBlock;
 class SegmentationHeadImpl : public torch::nn::Module {
 public:
+ void prepare_selective(bool training, bool enabled, int batch_size);
+ void invalidate_selective();
  SegmentationHeadImpl(int64_t in_dim, int64_t num_blocks, c10::optional<int64_t> bottleneck_ratio = 1, int64_t downsample_ratio = 4);
  std::vector<torch::Tensor> forward(const torch::Tensor& spatial_features, const std::vector<torch::Tensor>& query_features, std::pair<int64_t, int64_t> image_size, bool skip_blocks = false);
  std::vector<SparsePredMasks> sparse_forward(
@@ -88,6 +92,8 @@ private:
  torch::Tensor project_spatial_features(const torch::Tensor& spatial_features);
  torch::Tensor project_query_features(const torch::Tensor& query_features);
  torch::Tensor resize_spatial_features(const torch::Tensor& spatial_features, std::pair<int64_t, int64_t> image_size) const;
+ detail::SelectiveTensorRegion query_region_{"segmentation_query", true};
+ std::vector<std::unique_ptr<detail::SelectiveTensorRegion>> spatial_regions_;
  int64_t downsample_ratio_ = 4;
  int64_t interaction_dim_ = 0;
  bool use_spatial_identity_ = false;

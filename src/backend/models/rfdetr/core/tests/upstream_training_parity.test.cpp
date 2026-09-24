@@ -173,9 +173,10 @@ TEST_CASE("Depthwise VJP uses original weight precision outside forward autocast
 }
 TEST_CASE("Encoder mask projection follows learned upstream skip-block equations", "[rfdetr][parity]") {
  PrecisionPolicy precision;
- for (const auto device : parity_devices()) {
+ for (const bool selective : {false, true}) for (const auto device : parity_devices()) {
   rf::SegmentationHead head(2, 1, 1, 1);
   head->to(device);
+  head->prepare_selective(true, selective, 1);
   { torch::NoGradGuard guard;
    for (const auto& parameter : head->named_parameters()) {
     parameter.value().copy_((torch::arange(parameter.value().numel(), parameter.value().options()) * 0.0317 - 0.17).reshape_as(parameter.value()));
@@ -571,9 +572,11 @@ TEST_CASE("Selected encoder memory reduces pointwise head work with equal all-po
 
 TEST_CASE("Full mask block retains upstream AMP derivatives through an AdamW update", "[rfdetr][parity]") {
  PrecisionPolicy precision;
- for (const auto device : parity_devices()) for (const auto dtype : {torch::kFloat32,torch::kFloat16,torch::kBFloat16}) {
+ for (const bool selective : {false, true}) for (const auto device : parity_devices()) for (const auto dtype : {torch::kFloat32,torch::kFloat16,torch::kBFloat16}) {
   if (device.is_cpu() && dtype != torch::kFloat32) continue;
   rf::DepthwiseConvBlock block(2,0.3);
+  rf::detail::SelectiveTensorRegion region("depthwise_tail_oracle");
+  region.prepare(true, selective, 1);
   block->to(device);
   { torch::NoGradGuard guard;
    for (const auto& parameter : block->named_parameters()) parameter.value().copy_((torch::arange(parameter.value().numel(),parameter.value().options()) * 0.031713 + 0.113719).reshape_as(parameter.value()));
@@ -584,7 +587,12 @@ TEST_CASE("Full mask block retains upstream AMP derivatives through an AdamW upd
   for (const auto& parameter : block->named_parameters()) weights.emplace(parameter.key(),parameter.value().detach().clone().set_requires_grad(true));
   torch::Tensor actual, rounded;
   { mmltk::backend::ml::cuda::TorchAutocastScope scope(dtype != torch::kFloat32,dtype);
-   actual = block->forward(input);
+   const auto convolved = rf::segmentation_depthwise(input, block->dwconv->weight, block->dwconv->bias);
+   for (int execution = 0; execution < (selective ? 4 : 1); ++execution) {
+    actual = region.invoke(true, {input, convolved}, {block.get()}, [&](const auto& tensors) {
+     return rf::detail::SelectiveTensorRegion::Tensors{block->pointwise_tail(tensors[0], tensors[1])};
+    }).front();
+   }
    rounded = F::conv2d(x,weights.at("dwconv.weight"),F::Conv2dFuncOptions().bias(weights.at("dwconv.bias")).padding(1).groups(2)).detach();
   }
   // Reference custom derivative: original FP32 operands differentiated by

@@ -241,3 +241,11 @@ TEST_CASE("prediction CLI rejects an omitted JSON destination before model work"
  CHECK(result.exit_code==1);
  CHECK(result.output_text.find("requires --output")!=std::string::npos);
 }
+
+TEST_CASE("Native prediction and evaluation retain compilation CLI spellings", "[rfdetr][cli][compilation]") {
+ for (const char* command : {"predict", "evaluate"}) {
+  const auto result = mmltk::testsupport::run_subprocess_capture_output({mmltk::testsupport::mmltk_cli_path(), "rfdetr", command, "--help"});
+  REQUIRE(result.exit_code == 0);
+  CHECK(result.output_text.find("--compile-mode") != std::string::npos);
+ }
+}

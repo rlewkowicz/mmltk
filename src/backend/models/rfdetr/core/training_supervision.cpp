@@ -407,42 +407,6 @@ DenoisingTransform transform_denoising_targets(const torch::Tensor& original_lab
  }
  return {noised_labels, noised_boxes, center_offset, extent_scale};
 }
-torch::Tensor isolated_group_self_attention(torch::nn::MultiheadAttention& attention, const torch::Tensor& target, const torch::Tensor& query_position, const DecoderQueryLayout& layout) {
- if (target.dim() != 3 || query_position.sizes() != target.sizes() || target.size(1) != layout.total_queries() || layout.ordinary.groups <= 0 || layout.ordinary.queries_per_group <= 0) {
-  throw std::runtime_error("decoder query tensors do not match their typed group layout");
- }
- const int64_t batch = target.size(0);
- const int64_t width = target.size(2);
- const int64_t ordinary_count = layout.ordinary.total_queries();
- // DN-DETR Equation 7 blocks matching queries from observing DN queries and
- // blocks cross-DN-group traffic. RF-DETR deliberately makes the boundary
- // symmetric and retains its pre-existing isolation between ordinary
- // Group-DETR groups; reshaping groups into the batch dimension realizes
- // those blocks without a quadratic all-query mask.
- const auto ordinary_target = target.narrow(1, 0, ordinary_count).view({batch, layout.ordinary.groups, layout.ordinary.queries_per_group, width});
- const auto ordinary_position = query_position.narrow(1, 0, ordinary_count).view({batch, layout.ordinary.groups, layout.ordinary.queries_per_group, width});
- const auto ordinary_q = (ordinary_target + ordinary_position).permute({2, 0, 1, 3}).reshape({layout.ordinary.queries_per_group, batch * layout.ordinary.groups, width});
- const auto ordinary_v = ordinary_target.permute({2, 0, 1, 3}).reshape({layout.ordinary.queries_per_group, batch * layout.ordinary.groups, width});
- auto ordinary_output = std::get<0>(attention->forward(ordinary_q, ordinary_q, ordinary_v, {}, false));
- ordinary_output = ordinary_output.view({layout.ordinary.queries_per_group, batch, layout.ordinary.groups, width}).permute({1, 2, 0, 3}).reshape({batch, ordinary_count, width});
- if (!layout.has_denoising()) { return ordinary_output; }
- const std::vector<int64_t> expected_padding{batch, layout.denoising_groups, layout.denoising_queries_per_group};
- if (!layout.denoising_key_padding.defined() || layout.denoising_key_padding.sizes().vec() != expected_padding || layout.denoising_key_padding.scalar_type() != torch::kBool ||
-     layout.denoising_key_padding.device() != target.device() || !layout.denoising_valid_slots.defined() || layout.denoising_valid_slots.sizes().vec() != expected_padding ||
-     layout.denoising_valid_slots.scalar_type() != torch::kBool || layout.denoising_valid_slots.device() != target.device()) {
-  throw std::runtime_error("DN key padding does not match its typed group layout");
- }
- auto denoising_target = target.narrow(1, ordinary_count, layout.denoising_queries()).view({batch, layout.denoising_groups, layout.denoising_queries_per_group, width});
- auto denoising_position = query_position.narrow(1, ordinary_count, layout.denoising_queries()).view({batch, layout.denoising_groups, layout.denoising_queries_per_group, width});
- denoising_target = torch::where(layout.denoising_valid_slots.unsqueeze(-1), denoising_target, torch::zeros_like(denoising_target));
- denoising_position = torch::where(layout.denoising_valid_slots.unsqueeze(-1), denoising_position, torch::zeros_like(denoising_position));
- const auto denoising_q = (denoising_target + denoising_position).permute({2, 0, 1, 3}).reshape({layout.denoising_queries_per_group, batch * layout.denoising_groups, width});
- const auto denoising_v = denoising_target.permute({2, 0, 1, 3}).reshape({layout.denoising_queries_per_group, batch * layout.denoising_groups, width});
- const auto key_padding = layout.denoising_key_padding.reshape({batch * layout.denoising_groups, layout.denoising_queries_per_group});
- auto denoising_output = std::get<0>(attention->forward(denoising_q, denoising_q, denoising_v, key_padding, false));
- denoising_output = denoising_output.view({layout.denoising_queries_per_group, batch, layout.denoising_groups, width}).permute({1, 2, 0, 3}).reshape({batch, layout.denoising_queries(), width});
- return torch::cat({ordinary_output, denoising_output}, 1);
-}
 void TrainingSupervisionImpl::initialize(const std::uint64_t request_seed) {
  if (initialized_) { throw std::runtime_error("RF-DETR training supervision may only be initialized once"); }
  torch::NoGradGuard no_grad;
