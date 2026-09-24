@@ -696,7 +696,7 @@ function workflowCaptionPixels(owner, canvas, snapshot, control, stage, caseInde
 }
 
 export function mmltkIntegrationWorkflowPixels(control, cssBounds, chart, progress, source, presentation,
-  captionStage, captionCase, captionPatches, completed, galleryTile, confidence) {
+  captionStage, captionCase, captionPatches, completed, galleryTile, confidence, restoredAtlas = false) {
   completed = integrationCompletion(completed);
   const owner = integrationState;
   if (!owner || !integrationDriver) { completed('failed'); return; }
@@ -773,6 +773,14 @@ export function mmltkIntegrationWorkflowPixels(control, cssBounds, chart, progre
           threshold:confidence[0], detections:confidence[1], minimum:confidence[2], maximum:confidence[3],
           clean:confidence[4], generation:confidence[5], revision:confidence[6], different, matched:true});
         completed('observed', pixels.length/4, pixels.length/4);
+        return;
+      }
+      if (restoredAtlas) {
+        // The clear atlas background is nonblack. Require chromatic image
+        // pixels in each restored cell instead of counting that placeholder.
+        const sample = sampleReadyCard(snapshot, [left, top, right-left, bottom-top], true);
+        completed(sample.matched && sample.colored >= 12 ? 'observed' : 'failed',
+          sample.width * sample.height, sample.colored);
         return;
       }
       workflowCaptionPixels(owner, canvas, snapshot, control, captionStage, captionCase, captionPatches);

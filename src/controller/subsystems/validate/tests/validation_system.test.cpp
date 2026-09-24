@@ -31,6 +31,15 @@ void await_validation(std::mutex& mutex, std::condition_variable& changed, Predi
  std::unique_lock lock(mutex);
  REQUIRE(changed.wait_for(lock, std::chrono::seconds(20), predicate));
 }
+std::array<std::uint8_t, 4U> validation_tile_pixel(const mmltk::frameworks::gpu::BorrowedImageProductReadView& image, VisualRegion crop) {
+ const auto& read = image.plane(0U);
+ read.context().Bind();
+ const auto plane = read.plane();
+ std::array<std::uint8_t, 4U> pixel{};
+ REQUIRE(cudaMemcpy(pixel.data(), reinterpret_cast<const void*>(plane.data + (crop.y + crop.height / 2U) * plane.descriptor.pitch_bytes + (crop.x + crop.width / 2U) * 4U), 4U,
+          cudaMemcpyDeviceToHost) == cudaSuccess);
+ return pixel;
+}
 }  // namespace
 // CLEANUP-IGNORE: Independent custody test preamble; aliases and one execution-policy call are not a shared algorithm.
 TEST_CASE("composed preview retains every source after the outer draw callback", "[controller][gpu][validation]") {
@@ -150,6 +159,7 @@ TEST_CASE("validation retains the limited sample atlas and selects detail withou
  namespace rfdetr = mmltk::backend::models::rfdetr;
  const bool labelled = GENERATE(false, true);
  const auto sample_count = GENERATE(std::size_t{2U}, std::size_t{6U});
+ const auto close_stage = GENERATE(0U, 1U, 2U);
  const auto execution = gpu::resolve_device_execution(0, mmltk::common::system::NumaTopology::Capture());
  REQUIRE(cudaSetDevice(0) == cudaSuccess);
  std::mutex mutex;
@@ -173,10 +183,30 @@ TEST_CASE("validation retains the limited sample atlas and selects detail withou
  std::vector<rfdetr::Prediction> detections;
  if (labelled) detections.push_back({.class_reference = 0, .score = 0.5F, .bbox_xyxy = {0, 0, 1, 1}});
  auto source = PredictionSource::Device(execution, {2U, 2U}, pixels, detections, classes);
- for (const auto index : selected_indices) {
+ const auto capture_initial = [&](std::uint32_t index) {
   const rfdetr::PredictionRecord record{.dataset_index = index, .detections = source.detections()};
   samples.Capture(7U, {record, {.chw = source.pixels(), .width = 2U, .height = 2U, .device = 0, .custody = source.custody()}, source.annotations(), source.detections()});
- }
+ };
+ capture_initial(selected_indices.front());
+ await_validation(mutex, changed, [&] { return samples.snapshot().sample_available[0]; });
+ auto first_atlas_reader = samples.BorrowFrame();
+ REQUIRE(first_atlas_reader.valid());
+ samples.Select({7U, selected_indices.front()});
+ await_validation(mutex, changed, [&] { return samples.snapshot().detail; });
+ auto detail_reader = samples.BorrowFrame();
+ REQUIRE(detail_reader.valid());
+ const auto first_detail = samples.snapshot();
+ const auto close_progressive = [&] {
+  samples.CloseDetail();
+  CHECK(samples.snapshot().frame == first_detail.frame);  // Both physical outputs are still borrowed.
+  first_atlas_reader = {};
+  await_validation(mutex, changed, [&] { return !samples.snapshot().detail; });
+  detail_reader = {};
+ };
+ if (close_stage == 0U) close_progressive();
+ for (const auto index : selected_indices.subspan(1)) capture_initial(index);
+ if (close_stage == 2U) samples.Settle(7U, true);
+ if (close_stage != 0U) close_progressive();
  await_validation(mutex, changed, [&] {
   const auto snapshot = samples.snapshot();
   return std::cmp_equal(std::count(snapshot.sample_available.begin(), snapshot.sample_available.end(), true), sample_count);
@@ -200,6 +230,15 @@ TEST_CASE("validation retains the limited sample atlas and selects detail withou
   CHECK(crop.x == (index % 2U) * cell_width + (cell_width - crop.width) / 2U);
   CHECK(crop.y == (index / 2U) * cell_height);
  }
+ {
+  auto image = samples.BorrowFrame();
+  REQUIRE(image.valid());
+  for (std::size_t index = 0; index < sample_count; ++index)
+   CHECK(validation_tile_pixel(image, atlas_metadata->samples[index].crop) == std::array<std::uint8_t, 4U>{255U, 0U, 0U, 255U});
+ }
+ const auto unchanged_revision = samples.snapshot().frame.revision;
+ samples.CloseDetail();
+ CHECK(samples.snapshot().frame.revision == unchanged_revision);
  CHECK(std::cmp_equal(std::count(atlas.sample_available.begin(), atlas.sample_available.end(), true), sample_count));
  REQUIRE(samples.ImageSnapshot(atlas.frame));
  CHECK(samples.ImageSnapshot(atlas.frame)->samples[0].labels.empty() == !labelled);
@@ -411,13 +450,27 @@ TEST_CASE("validation preview generations settle to retained source custody with
  const auto metadata = samples.ImageSnapshot(samples.snapshot().frame);
  REQUIRE(metadata);
  const auto& sample = metadata->samples[metadata->samples[0].available ? 0U : 1U];
- const auto& read = image.plane(0U);
- read.context().Bind();
- std::array<std::uint8_t, 4U> pixel{};
- const auto plane = read.plane();
- REQUIRE(cudaMemcpy(pixel.data(), reinterpret_cast<const void*>(plane.data + sample.crop.y * plane.descriptor.pitch_bytes + sample.crop.x * 4U), 4U, cudaMemcpyDeviceToHost) == cudaSuccess);
- CHECK(pixel == (restored ? std::array<std::uint8_t, 4U>{255U, 0U, 0U, 255U} : std::array<std::uint8_t, 4U>{0U, 255U, 0U, 255U}));
+ CHECK(validation_tile_pixel(image, sample.crop) == (restored ? std::array<std::uint8_t, 4U>{255U, 0U, 0U, 255U} : std::array<std::uint8_t, 4U>{0U, 255U, 0U, 255U}));
  image = {};
+ if (detail_open) {
+  // A successful newer set survives another Begin while incumbent detail is
+  // still open; unsuccessful/stale work cannot discard that retained atlas.
+  samples.Begin(3U, indices);
+  samples.Settle(2U, false);
+  samples.CloseDetail();
+  const bool replacement = !refuse && outcome == contracts::ComputeOperationOutcome::Succeeded;
+  await_validation(mutex, changed, [&] {
+   const auto state = samples.snapshot();
+   return !state.detail && state.sample_identities[replacement ? 1U : 0U].generation == (replacement ? 2U : 1U);
+  });
+  auto closed = samples.BorrowFrame();
+  REQUIRE(closed.valid());
+  const auto closed_metadata = samples.ImageSnapshot(samples.snapshot().frame);
+  REQUIRE(closed_metadata);
+  const auto& crop = closed_metadata->samples[replacement ? 1U : 0U].crop;
+  CHECK(validation_tile_pixel(closed, crop) == (replacement ? std::array<std::uint8_t, 4U>{0U, 255U, 0U, 255U} : std::array<std::uint8_t, 4U>{255U, 0U, 0U, 255U}));
+  samples.Settle(3U, false);
+ }
  samples.Shutdown();
 }
 TEST_CASE("Validation documents preserve off-box empty and missing masks through crop and upscale", "[controller][gpu][validation]") {

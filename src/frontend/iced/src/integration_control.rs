@@ -410,6 +410,7 @@ extern "C" {
         completed: &wasm_bindgen::JsValue,
         gallery_tile: &[f64],
         confidence: &[f64],
+        restored_atlas: bool,
     );
     #[wasm_bindgen::prelude::wasm_bindgen(js_name = mmltkIntegrationClickAfterSurfaceDraw)]
     fn click_after_surface_draw_js(

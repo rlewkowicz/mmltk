@@ -656,6 +656,8 @@ void WaylandSession::RunWorkflows() {
    {"media_disabled", browser.prediction_no_outputs}, {"saving_controls", browser.prediction_saving_controls}, {"saved_media", browser.prediction_outputs}});
  INFO(prediction_output_blocker);
  CHECK(prediction_output_blocker.empty());
+ INFO(browser.validation_progressive);
+ INFO(browser.validation_restored_tiles);
  REQUIRE(browser.validation_samples_complete());
  for (const auto& record : browser.validation_saved_samples) {
   const auto directory = std::filesystem::path(record.value("control", ""));

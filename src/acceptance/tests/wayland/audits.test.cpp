@@ -2697,8 +2697,21 @@ TEST_CASE("validation saved output audit requires six exact published sample ide
  mmltk::acceptance::wayland::BrowserAudit audit;
  for (unsigned index : {2U, 9U, 1U, 15U, 8U, 3U})
   audit.validation_saved_samples.push_back({{"a", 4U}, {"b", index}, {"c", 6U}, {"control", "output/validate/run-0001/samples"}, {"detail", "sample-" + std::to_string(index) + ".png"}});
+ audit.consume({{"event", "integration.validation_progressive"}, {"detail", "opened"}, {"control", "4:2"}, {"a", 4U}, {"b", 1U}, {"c", 1U}, {"d", 7U}});
+ audit.consume({{"event", "integration.validation_progressive"}, {"detail", "closed"}, {"a", 4U}, {"b", 6U}, {"c", 0U}, {"d", 8U}});
+ for (unsigned index = 0U; index < 6U; ++index)
+  audit.consume({{"event", "integration.validation_restored_tile"}, {"a", 4U}, {"b", index}, {"c", 20U}, {"d", 20U}});
  REQUIRE(audit.validation_samples_complete());
- audit.validation_saved_samples.back()["b"] = 2U;
+ SECTION("duplicate saved identity") { audit.validation_saved_samples.back()["b"] = 2U; }
+ SECTION("detail opened with no later sample") { audit.validation_progressive.front()["b"] = 6U; }
+ SECTION("selected sample from another generation") { audit.validation_progressive.front()["control"] = "3:2"; }
+ SECTION("selected sample absent from closed atlas") { audit.validation_progressive.front()["control"] = "4:99"; }
+ SECTION("detail opened after completion") { audit.validation_progressive.front()["c"] = 0U; }
+ SECTION("close retained the old frame") { audit.validation_progressive.back()["d"] = 7U; }
+ SECTION("close restored another generation") { audit.validation_progressive.back()["a"] = 3U; }
+ SECTION("missing tile pixels") { audit.validation_restored_tiles.pop_back(); }
+ SECTION("black tile pixels") { audit.validation_restored_tiles.back()["d"] = 0U; }
+ SECTION("duplicate tile pixels") { audit.validation_restored_tiles.back()["b"] = 0U; }
  CHECK_FALSE(audit.validation_samples_complete());
 }
 namespace mmltk::acceptance::wayland {

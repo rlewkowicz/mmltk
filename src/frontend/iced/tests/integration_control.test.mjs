@@ -1009,6 +1009,23 @@ test('workflow gallery proof requires a ready tile, exact receipt and image pixe
   assert.ok(proof.sample_width <= 8 && proof.sample_height <= 8);
 });
 
+test('restored validation cells reject black and tinted atlas placeholders', t => {
+  const f = canvasFixture(t, true);
+  for (const [rgb, expected] of [
+    [[48, 80, 112, 255], 'observed'],
+    [[0, 0, 0, 255], 'failed'],
+    [[24, 18, 35, 255], 'failed'],
+  ]) {
+    const outcomes = [];
+    f.sampling.raster = () => rgb;
+    browser.mmltkIntegrationReceipt('validate.samples.atlas', 'restored', 7, 11);
+    browser.mmltkIntegrationWorkflowPixels('validate.samples.atlas', [0, 0, 100, 80], false, false,
+      7, 11, -1, 0, [], (...values) => outcomes.push(values), [], [], true);
+    f.flushFrames();
+    assert.equal(outcomes.at(-1)[0], expected);
+  }
+});
+
 const validationWorkspace = 'validate.detail.image';
 const captionPatch = [20, 20, 24, 12, 0, 255, 255, 255, 0, 0];
 function captionRaster(stage, broken = false) {

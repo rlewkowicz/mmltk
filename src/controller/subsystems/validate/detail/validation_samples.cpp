@@ -36,6 +36,9 @@ public:
  };
  struct Composition final {
   std::shared_ptr<Set> atlas;
+  // Detail renders from displayed immutable membership; atlas can continue
+  // growing or retain a newer successful population independently.
+  std::shared_ptr<Set> detail_atlas;
   std::optional<ValidationSampleIdentity> detail;
   ValidationOverlays overlays;
   contracts::ValidationDisplaySettings display;
@@ -128,6 +131,7 @@ public:
   if (rollback_.atlas) {
    requested_.atlas = rollback_.atlas;
    requested_.detail = rollback_.detail;
+   requested_.detail_atlas = rollback_.detail_atlas;
    RequestRender();
   }
   current_.reset();
@@ -140,11 +144,11 @@ public:
    if (!succeeded)
     RestoreIncumbent();
    else {
-    // Keep an incumbent detail open. Atlas previews already point
-    // at the complete mutable set, whose capture phase ends here.
-    if (!requested_.detail && std::ranges::any_of(current_->samples, [](const auto& sample) { return sample && bool(sample->raw); })) {
+    // Logical success retains all useful captures independently of the
+    // frozen detail and of physical output completion.
+    if (std::ranges::any_of(current_->samples, [](const auto& sample) { return sample && bool(sample->raw); })) {
      requested_.atlas = current_;
-     RequestRender();
+     if (!requested_.detail) RequestRender();
     }
     if (requested_.atlas == current_)
      settled_success_ = true;
@@ -276,9 +280,16 @@ public:
    if (!displayed_) throw contracts::InvalidIntentError("validation sample is not displayed");
    const auto found = std::ranges::find_if(displayed_->samples, [&](const auto& sample) { return sample && sample->raw && sample->metadata.identity == identity; });
    if (found == displayed_->samples.end()) throw contracts::InvalidIntentError("validation sample identity is stale");
-   requested_.atlas = displayed_;
+   requested_.detail_atlas = displayed_;
+   // An active different generation must not replace the selected incumbent
+   // with a partial population when detail closes. Same-run capture remains
+   // reachable through current_; settled useful atlases remain in atlas.
+   if (current_ && !settled_success_ && current_->generation != identity.generation) requested_.atlas = displayed_;
    requested_.detail = identity;
-   if (rollback_.atlas && rollback_.atlas->generation == identity.generation) rollback_.detail = identity;
+   if (rollback_.atlas && rollback_.atlas->generation == identity.generation) {
+    rollback_.detail = identity;
+    rollback_.detail_atlas = displayed_;
+   }
    RequestRender();
   }
   static_cast<void>(worker_.NotifyContinuation());
@@ -286,11 +297,12 @@ public:
  void CloseDetail() {
   {
    std::scoped_lock lock(mutex_);
-   // Keep the atlas retained by a pending/committed detail selection.
-   // Begin and partial captures never substitute their current set.
-   if (!requested_.detail) requested_.atlas = displayed_;
+   if (!requested_.detail) return;
+   if (current_ && current_->generation == requested_.detail->generation) requested_.atlas = current_;
    requested_.detail.reset();
+   requested_.detail_atlas.reset();
    rollback_.detail.reset();
+   rollback_.detail_atlas.reset();
    if (!requested_.atlas) return;
    RequestRender();
   }
@@ -317,11 +329,6 @@ public:
    std::scoped_lock lock(mutex_);
    if (!dirty_ && image_.overlays == overlays) return;
    SelectOverlays(overlays);
-   if (displayed_) {
-    requested_.atlas = displayed_;
-    requested_.detail.reset();
-    if (image_.detail) { requested_.detail = image_.selected; }
-   }
    if (requested_.atlas) RequestRender();
   }
   static_cast<void>(worker_.NotifyContinuation());
@@ -345,7 +352,7 @@ public:
    auto drawing = std::make_shared<Set>();
    {
     std::scoped_lock lock(mutex_);
-    set = requested_.atlas;
+    set = requested_.detail ? requested_.detail_atlas : requested_.atlas;
     if (!set || !render_requested_) return {};
     selected = requested_.detail;
     overlays = requested_.overlays;
@@ -411,7 +418,7 @@ public:
      displayed_ = std::move(drawing);
      image_ = std::move(image);
      dirty_ = false;
-     if (current_ && settled_success_ && displayed_->generation == current_->generation) {
+     if (current_ && settled_success_ && !image_.detail && requested_.atlas == current_ && displayed_->clean_revision == current_->clean_revision) {
       current_.reset();
       rollback_ = {};
      }
@@ -443,7 +450,8 @@ public:
      if (!retry) {
       SelectOverlays(image_.overlays);
       // A refused preview is not a successful replacement.
-      if (current_ && requested_.atlas && requested_.atlas->generation == current_->generation) {
+      const auto& failed_set = requested_.detail ? requested_.detail_atlas : requested_.atlas;
+      if (current_ && failed_set && failed_set->generation == current_->generation) {
        RestoreIncumbent();
        retry = true;
       }
@@ -464,7 +472,7 @@ public:
    std::scoped_lock lock(mutex_);
    current_.reset();
    displayed_.reset();
-   requested_.atlas.reset();
+   requested_ = {};
    rollback_ = {};
   }
   {

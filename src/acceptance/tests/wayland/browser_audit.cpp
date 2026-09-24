@@ -798,6 +798,10 @@ auto BrowserAudit::consume(const nlohmann::json& record) -> void {
   validate_to_explore_pixels = record.value("control", "") == kExploreGalleryControl && scalar(record, "a") != 0U && scalar(record, "b") != 0U && record.value("ready_tile", false) &&
                                record.value("matched", false) && record.contains("compiled_index") && width > 0U && width <= 8U && height > 0U && height <= 8U && sampled == width * height &&
                                colored >= 12U && colored <= sampled && colored * 2U >= sampled;
+ } else if (event == "integration.validation_progressive") {
+  validation_progressive.push_back(record);
+ } else if (event == "integration.validation_restored_tile") {
+  validation_restored_tiles.push_back(record);
  } else if (event == "integration.validation_saved_sample") {
   validation_saved_samples.push_back(record);
  } else if (event == "integration.validation_layout") {
@@ -2165,16 +2169,29 @@ bool BrowserAudit::benchmark_choices_complete() const {
  return true;
 }
 bool BrowserAudit::validation_samples_complete() const {
- if (validation_saved_samples.size() != 6U) return false;
+ if (validation_saved_samples.size() != 6U || validation_progressive.size() != 2U || validation_restored_tiles.size() != 6U) return false;
+ const auto& opened = validation_progressive[0];
+ const auto& closed = validation_progressive[1];
+ const auto generation = scalar(opened, "a");
+ if (!generation || !scalar(opened, "d") || opened.value("detail", "") != "opened" || scalar(opened, "c") != 1U || !scalar(opened, "b") || scalar(opened, "b") >= 6U ||
+     closed.value("detail", "") != "closed" || scalar(closed, "a") != generation || scalar(closed, "b") != 6U || scalar(closed, "c") != 0U ||
+     scalar(closed, "d") <= scalar(opened, "d")) return false;
+ for (std::size_t index = 0U; index < validation_restored_tiles.size(); ++index) {
+  const auto& tile = validation_restored_tiles[index];
+  if (scalar(tile, "a") != generation || scalar(tile, "b") != index || !scalar(tile, "c") || scalar(tile, "d") < 12U) return false;
+ }
+ if (scalar(validation_saved_samples.front(), "a") != generation) return false;
+ bool selected_identity = false;
  std::set<std::uint64_t> identities;
  const auto& first = validation_saved_samples.front();
  for (const auto& sample : validation_saved_samples) {
   const auto index = scalar(sample, "b");
+  selected_identity = selected_identity || opened.value("control", "") == std::to_string(generation) + ":" + std::to_string(index);
   if (scalar(sample, "a") == 0U || scalar(sample, "a") != scalar(first, "a") || scalar(sample, "c") != 6U || !identities.insert(index).second || sample.value("control", "").empty() ||
       sample.value("control", "") != first.value("control", "") || sample.value("detail", "") != "sample-" + std::to_string(index) + ".png")
    return false;
  }
- return true;
+ return selected_identity;
 }
 bool BrowserAudit::validation_confidence_complete() const {
  if (validation_confidence_edits.size() != 9U || validation_confidence_pixels.size() != 3U) return false;

@@ -131,6 +131,11 @@ pub(super) enum Step {
     Validate,
     StartValidate,
     Validating,
+    ProgressiveOpen(u8),
+    ProgressiveDetail,
+    ProgressiveSettling,
+    ProgressiveClose,
+    ProgressiveClosed,
     NoValidationAspect,
     ConfidenceEdit(u8),
     ConfidenceReady(u8),
@@ -207,6 +212,11 @@ pub(super) struct State {
     pixel_attempts: u8,
     progress_epoch: Option<u64>,
     validation_layer: u8,
+    progressive_opened: bool,
+    progressive_selection: Option<crate::generated::ValidationSampleIdentity>,
+    progressive_receipt: Option<super::probe::ProbeReceipt>,
+    restoration_pixels: bool,
+    restoration_revision: u64,
     confidence_delivered: bool,
     confidence_facts: Vec<f64>,
     confidence_metrics: Option<crate::generated::EvalSummary>,
@@ -258,6 +268,21 @@ fn ready_gallery_tile(model: &ApplicationModel) -> Option<(super::probe::ProbeRe
             f64::from(tile.height),
         ],
     ))
+}
+
+fn paired_validation(control: &str) -> Option<(super::probe::ProbeReceipt, std::sync::Arc<crate::generated::ValidationImageMetadata>)> {
+    let receipt = super::probe::current_receipt(control)?;
+    let (surface, content) = crate::presentation_surface::drawable_validation(receipt.surface)?;
+    (surface.frame == receipt.surface.frame).then(|| (receipt, content.metadata.clone()))
+}
+
+fn progressive_tile(metadata: &crate::generated::ValidationImageMetadata, generation: u64) -> Option<u8> {
+    let ready = metadata.samples.iter().filter(|sample| sample.available).count();
+    if metadata.detail || generation == 0 || ready == 0 || ready >= metadata.samples.len()
+        || metadata.samples.iter().any(|sample| sample.identity.generation != generation) {
+        return None;
+    }
+    metadata.samples.iter().position(|sample| sample.available).map(|index| index as u8)
 }
 
 fn atlas_cell(bounds: Rectangle, index: u8) -> Rectangle {
@@ -527,6 +552,43 @@ mod tests {
     }
 
     #[test]
+    fn progressive_atlas_selection_requires_current_partial_graphics_membership() {
+        let mut metadata = crate::view_model::test_support::validation_image_metadata();
+        assert_eq!(super::progressive_tile(&metadata, 7), Some(0));
+        assert_eq!(super::progressive_tile(&metadata, 8), None);
+        metadata.samples[0].available = false;
+        assert_eq!(super::progressive_tile(&metadata, 7), Some(1));
+        metadata.samples[1].identity.generation = 6;
+        assert_eq!(super::progressive_tile(&metadata, 7), None);
+        metadata.samples[1].identity.generation = 7;
+        metadata.detail = true;
+        assert_eq!(super::progressive_tile(&metadata, 7), None);
+        metadata.detail = false;
+        for sample in &mut metadata.samples { sample.available = true; }
+        assert_eq!(super::progressive_tile(&metadata, 7), None);
+        for sample in &mut metadata.samples { sample.available = false; }
+        assert_eq!(super::progressive_tile(&metadata, 7), None);
+    }
+
+    #[test]
+    fn logical_sample_readiness_waits_for_a_paired_graphics_receipt() {
+        for step in [Step::Validating, Step::ProgressiveOpen(0)] {
+            let mut fixture = crate::integration_control::ProbeFixture::new("workflows");
+            let controller = &mut fixture.controller;
+            controller.driver.phase = Phase::Workflows(step);
+            controller.workflows.primary_pixels[1] = true;
+            let mut model = crate::view_model::test_support::bootstrapped();
+            let snapshot = model.workflow.validation.as_mut().unwrap();
+            snapshot.operation.active = true;
+            snapshot.operation.generationfrontier = 7;
+            snapshot.sampleavailable[0] = true;
+            assert_eq!(advance_workflow(controller, &model, step, FeatureId::Validate), 0);
+            assert!(!controller.widgets.location_pending());
+            assert_eq!(controller.driver.phase, Phase::Workflows(step));
+        }
+    }
+
+    #[test]
     fn caption_patch_oracle_uses_paired_native_bounds_and_explicit_rgb() {
         let mut metadata = crate::view_model::test_support::validation_image_metadata();
         let mut gt = metadata.samples[0].labels[0].clone();
@@ -680,6 +742,7 @@ mod tests {
     fn validation_controls_wait_for_the_sample_selection_reply() {
         for step in [
             Step::OpenSample,
+            Step::ProgressiveClose,
             Step::HideBoxes,
             Step::ValidationLayer(true, 1),
             Step::CloseSample,
@@ -1151,12 +1214,23 @@ impl State {
                         )
                     });
                 }
+                if picture == Picture::Validation && self.restoration_pixels {
+                    reporting::emit(|sink| sink.record(
+                        "integration.validation_restored_tile", &picture.control(index), "pixels",
+                        [self.confidence_generation as f64, index as f64,
+                         sampled as f64, visible as f64],
+                    ));
+                }
                 driver.phase = Phase::Workflows(match picture {
                     Picture::Confidence if index < 8 => Step::ConfidenceEdit(index + 1),
                     Picture::Confidence => Step::ConfidenceLayer(true),
                     Picture::Progress => Step::LeaveTrain,
                     Picture::Train => Step::NoImageWorkspace,
                     Picture::Validation if index < 5 => Step::Pixels(picture, index + 1),
+                    Picture::Validation if self.restoration_pixels => {
+                        self.restoration_pixels = false;
+                        Step::ConfidenceEdit(0)
+                    },
                     Picture::Validation if self.validation_layer < 8 => Step::ValidationLayer(false, self.validation_layer + 1),
                     Picture::Validation => { self.validation_layer = 0; Step::OpenSample },
                     Picture::Detail if self.validation_layer < 8 => Step::ValidationLayer(true, self.validation_layer + 1),
@@ -1363,6 +1437,7 @@ impl State {
         let bounds = match step {
             Step::Pixels(Picture::Validation, index) => atlas_cell(bounds, index),
             Step::OpenSample => atlas_cell(bounds, 0),
+            Step::ProgressiveOpen(index) => atlas_cell(bounds, index),
             Step::ValidationOriginal | Step::ValidationLayer(..) | Step::ConfidenceLayer(_) => {
                 Rectangle {
                     width: bounds.width.min(bounds.height),
@@ -1372,6 +1447,10 @@ impl State {
             _ => bounds,
         };
         let input = crate::presentation_surface::physical_bounds(bounds, driver.input_scale);
+        if matches!(step, Step::ProgressiveOpen(_))
+            && (self.progressive_receipt.is_none() || self.progressive_receipt != super::probe::current_receipt(control)) {
+            return;
+        }
         if let Step::ConfidenceEdit(stage) = step {
             self.confidence_delivered = false;
             driver.phase = Phase::Workflows(Step::ConfidenceReady(stage));
@@ -1467,6 +1546,7 @@ impl State {
                     &callback,
                     &self.gallery_tile,
                     &self.confidence_facts,
+                    self.restoration_pixels,
                 );
             }
             return;
@@ -1490,6 +1570,8 @@ impl State {
             Step::Validate => Step::StartValidate,
             Step::StartValidate => Step::Validating,
             Step::OpenSample => Step::Sample,
+            Step::ProgressiveOpen(_) => Step::ProgressiveDetail,
+            Step::ProgressiveClose => Step::ProgressiveClosed,
             Step::ConfidenceLayer(shown) => Step::ConfidenceLayerReady(shown),
             Step::ValidationOriginal => Step::ValidationOriginalReady,
             Step::HideBoxes => Step::HiddenBoxes,
@@ -1959,6 +2041,85 @@ impl State {
             {
                 self.workflow_control(widgets, driver, primary(FeatureId::Validate))
             }
+            Step::Validating
+                if !self.progressive_opened
+                    && validation.is_some_and(|value| value.operation.active) =>
+            {
+                let Some((receipt, metadata)) = paired_validation(crate::view::validate::samples::ATLAS_ID) else {
+                    return Task::none();
+                };
+                let Some(index) = progressive_tile(&metadata, validation.unwrap().operation.generationfrontier) else {
+                    return Task::none();
+                };
+                self.progressive_selection = Some(metadata.samples[index as usize].identity.clone());
+                self.progressive_receipt = Some(receipt);
+                self.workflow_step(driver, Step::ProgressiveOpen(index))
+            }
+            Step::ProgressiveOpen(index) if model.validation_navigation_available() => {
+                let Some(snapshot) = validation.filter(|value| value.operation.active) else {
+                    driver.fail("Validation finished before progressive selection");
+                    return Task::none();
+                };
+                let Some((receipt, metadata)) = paired_validation(crate::view::validate::samples::ATLAS_ID) else {
+                    return Task::none();
+                };
+                if progressive_tile(&metadata, snapshot.operation.generationfrontier) != Some(index)
+                    || self.progressive_selection.as_ref() != Some(&metadata.samples[index as usize].identity) {
+                    return self.workflow_step(driver, Step::Validating);
+                }
+                self.progressive_receipt = Some(receipt);
+                self.workflow_control(widgets, driver, crate::view::validate::samples::ATLAS_ID)
+            }
+            Step::ProgressiveDetail if validation.is_some_and(|value| value.detail) => {
+                let snapshot = validation.unwrap();
+                let Some((_, metadata)) = paired_validation("validate.detail.image") else {
+                    return Task::none();
+                };
+                if !metadata.detail { return Task::none(); }
+                let Some(identity) = self.progressive_selection.as_ref() else {
+                    driver.fail("Missing progressive selection identity");
+                    return Task::none();
+                };
+                let ready = metadata.samples.iter().filter(|sample| sample.available).count();
+                if !snapshot.operation.active || identity.generation != snapshot.operation.generationfrontier
+                    || snapshot.selected.as_ref() != Some(identity) || metadata.selected.as_ref() != Some(identity)
+                    || ready == 0 || ready >= metadata.samples.len() {
+                    driver.fail("Validation detail did not open on the selected progressive generation");
+                    return Task::none();
+                }
+                self.progressive_opened = true;
+                reporting::emit(|sink| sink.record(
+                    "integration.validation_progressive", &format!("{}:{}", identity.generation, identity.datasetindex), "opened",
+                    [snapshot.operation.generationfrontier as f64, ready as f64,
+                     1.0, metadata.frame.revision as f64],
+                ));
+                self.workflow_step(driver, Step::ProgressiveSettling)
+            }
+            Step::ProgressiveSettling if validation.is_some_and(|value| success(&value.operation)) => {
+                self.workflow_step(driver, Step::ProgressiveClose)
+            }
+            Step::ProgressiveClose if model.validation_navigation_available() => {
+                self.workflow_control(widgets, driver, "validate.detail.close")
+            }
+            Step::ProgressiveClosed if validation.is_some_and(|value| !value.detail
+                && value.sampleavailable.iter().all(|ready| *ready)) =>
+            {
+                let snapshot = validation.unwrap();
+                let Some((_, metadata)) = paired_validation(crate::view::validate::samples::ATLAS_ID) else {
+                    return Task::none();
+                };
+                if metadata.detail || metadata.samples.iter().any(|sample| !sample.available
+                    || sample.identity.generation != snapshot.operation.generationfrontier) {
+                    return Task::none();
+                }
+                self.restoration_revision = metadata.frame.revision;
+                reporting::emit(|sink| sink.record(
+                    "integration.validation_progressive", crate::view::validate::samples::ATLAS_ID, "closed",
+                    [snapshot.operation.generationfrontier as f64, metadata.samples.len() as f64,
+                     0.0, metadata.frame.revision as f64],
+                ));
+                self.workflow_step(driver, Step::Validating)
+            }
             // Native metrics finish before the asynchronous sample renderer
             // necessarily publishes its final atlas. Await that same generation.
             Step::Validating
@@ -1971,6 +2132,10 @@ impl State {
                 }) =>
             {
                 let snapshot = validation.unwrap();
+                if !self.progressive_opened {
+                    driver.fail("Validation completed without active detail coverage");
+                    return Task::none();
+                }
                 if snapshot.operation.output.directory.is_empty()
                     || !snapshot
                         .operation
@@ -2040,7 +2205,8 @@ impl State {
                     driver.fail("Validation confidence did not start at its default");
                     return Task::none();
                 }
-                self.workflow_step(driver, Step::ConfidenceEdit(0)).chain(
+                self.restoration_pixels = true;
+                self.workflow_step(driver, Step::Pixels(Picture::Validation, 0)).chain(
                     iced::advanced::widget::operate(ValidationLayout::new("atlas")),
                 )
             }
@@ -2737,6 +2903,7 @@ impl State {
                                 // Measure the view only when its paired image has
                                 // the requested atlas/detail shape and overlay state.
                                 content.metadata.detail == (picture == Picture::Detail)
+                                    && (!self.restoration_pixels || content.metadata.frame.revision == self.restoration_revision)
                                     && (picture != Picture::Confidence
                                         || (content.metadata.display.confidencethreshold
                                             == if index == 7 { 1.0 } else { 0.0 }
