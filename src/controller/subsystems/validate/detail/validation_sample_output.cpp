@@ -19,7 +19,7 @@ namespace raster = mmltk::backend::imaging::raster;
 class ValidationSampleOutput::Impl final {
 public:
  Impl(DirectComputeConfiguration configuration, VisualDeviceSettings visual, ComputeArtifactSink published, raster::RenderedImageWriter::PngEncoder encoder)
-     : configuration_(std::move(configuration)), visual_(visual), published_(std::move(published)), encoder_(std::move(encoder)) {}
+     : configuration_(std::move(configuration)), visual_(visual), published_(std::move(published)), encoder_(std::move(encoder)), fixed_receiver_(visual.valid()) {}
  void Ensure() {
   if (pool_) return;
   const auto execution = context_ ? *context_->execution() : visual_.valid() ? resolve_visual_device_execution(visual_) : configuration_.execution.value_or(gpu::DeviceExecution{});
@@ -88,6 +88,7 @@ public:
  VisualDeviceSettings visual_;
  ComputeArtifactSink published_;
  raster::RenderedImageWriter::PngEncoder encoder_;
+ bool fixed_receiver_ = false;
  std::shared_ptr<gpu::TerminalCudaRetirementOwner> retirement_ = std::make_shared<gpu::TerminalCudaRetirementOwner>(21U);
  std::optional<gpu::DeviceContext> context_;
  std::unique_ptr<PredictionPreviewPool> pool_;
@@ -105,11 +106,18 @@ public:
 ValidationSampleOutput::ValidationSampleOutput(DirectComputeConfiguration configuration, VisualDeviceSettings visual, ComputeArtifactSink published, raster::RenderedImageWriter::PngEncoder encoder)
     : impl_(std::make_shared<Impl>(std::move(configuration), visual, std::move(published), std::move(encoder))) {}
 ValidationSampleOutput::~ValidationSampleOutput() = default;
-void ValidationSampleOutput::Begin(std::filesystem::path directory, contracts::ValidationRunPreview options, std::span<const std::uint32_t> indices) {
+void ValidationSampleOutput::Begin(std::filesystem::path directory, contracts::ValidationRunPreview options, std::span<const std::uint32_t> indices, DirectComputeConfiguration configuration) {
  if (indices.size() > rfdetr::kValidationSampleCapacity) throw std::invalid_argument("validation sample selection exceeds six");
  if (!std::isfinite(options.display.confidence_threshold) || options.display.confidence_threshold < 0 || options.display.confidence_threshold > 1)
   throw std::invalid_argument("validation preview confidence must be between zero and one");
  impl_->Flush();
+ if (!impl_->retirement_->admission_open()) throw std::runtime_error("validation output CUDA custody is unproved");
+ if (!impl_->fixed_receiver_ && impl_->context_ && configuration.execution && impl_->configuration_.execution != configuration.execution) {
+  // Frames share their context and retirement owner independently of the pool.
+  // Flush above settles the previous writer before replacing this headless group.
+  impl_ = std::make_shared<Impl>(configuration, impl_->visual_, impl_->published_, impl_->encoder_);
+ }
+ if (configuration.execution) impl_->configuration_ = std::move(configuration);
  impl_->directory_ = std::move(directory) / "samples";
  impl_->options_ = options;
  impl_->count_ = indices.size();
@@ -122,6 +130,7 @@ void ValidationSampleOutput::Begin(std::filesystem::path directory, contracts::V
 void ValidationSampleOutput::UseCaptureContext(gpu::DeviceContext context) {
  if (impl_->context_ && *impl_->context_ != context) throw std::logic_error("validation capture context changed while output is retained");
  impl_->context_ = std::move(context);
+ impl_->fixed_receiver_ = true;
 }
 std::shared_ptr<const PredictionPreviewFrame> ValidationSampleOutput::Capture(rfdetr::ValidationSampleView sample) {
  const auto end = impl_->indices_.begin() + impl_->count_;

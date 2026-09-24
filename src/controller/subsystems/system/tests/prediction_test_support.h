@@ -168,8 +168,8 @@ private:
 class FakeNonvisualComputeRuntime final : public ValidationRuntime, public ExportRuntime {
 public:
  explicit FakeNonvisualComputeRuntime(ComputeScenario scenario) : sequence_(std::move(scenario)) {}
- ValidationRuntimeResult Run(mmltk::backend::models::rfdetr::ValidateRequest, std::stop_token, const ComputeProgressSink&, const mmltk::backend::models::rfdetr::ValidationDelivery&) override;
- contracts::ComputeTerminal Run(ExportRunRequest, std::stop_token, const ComputeProgressSink&, const ComputeArtifactSink& = {}) override;
+ ValidationRuntimeResult Run(mmltk::backend::models::rfdetr::ValidateRequest, std::stop_token, const ComputeProgressSink&, const mmltk::backend::models::rfdetr::ValidationDelivery&, std::uint64_t = 0) override;
+ contracts::ComputeTerminal Run(ExportRunRequest, std::stop_token, const ComputeProgressSink&, const ComputeArtifactSink& = {}, std::uint64_t = 0) override;
 
 private:
  ComputeSequence sequence_;
@@ -187,7 +187,7 @@ class FakePredictRuntime final : public PredictRuntime {
 public:
  explicit FakePredictRuntime(PredictionScenario);
  contracts::ComputeTerminal Run(mmltk::backend::models::rfdetr::PredictRequest, std::stop_token, const ComputeProgressSink&, const ProductSink&, const PlaybackGate&, VisualExtent,
-  const ContextProvider&, const PreviewRetirement&, const ComputeArtifactSink& = {}, const PredictionRunOutput& = {}) override;
+  const ContextProvider&, const PreviewRetirement&, const ComputeArtifactSink& = {}, const PredictionRunOutput& = {}, std::uint64_t = 0) override;
 
 private:
  ComputeSequence sequence_;

@@ -43,7 +43,8 @@ add_library(mmltk_controller_contracts STATIC)
 add_library(mmltk::controller::contracts ALIAS mmltk_controller_contracts)
 mmltk_configure_component(mmltk_controller_contracts PUBLIC_DECLARATIONS)
 mmltk_link_declarations(mmltk_controller_contracts PUBLIC
-    mmltk::backend::imaging::resample)
+    mmltk::backend::imaging::resample
+    mmltk::frameworks::gpu)
 
 mmltk_register_public_headers(
     mmltk_controller_contracts

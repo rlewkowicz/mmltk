@@ -1,4 +1,6 @@
 #pragma once
+#include <optional>
+#include <cstdint>
 #include <expected>
 #include "src/controller/subsystems/export/export_run.h"
 #include <string>
@@ -23,7 +25,7 @@ struct ComputeIntentMaterializer final {
  struct ModelInput final {
   mmltk::controller::contracts::ModelSelectionKey key{};
   std::string custom_artifact;
-  int inspection_device = 0;
+  std::optional<std::int32_t> inspection_device{};
  };
  [[nodiscard]] static std::expected<ModelInput, Refusal> ModelInputFor(const mmltk::controller::contracts::GuiSettingsState& settings, mmltk::controller::contracts::FeatureId workflow) noexcept;
  [[nodiscard]] static std::expected<mmltk::backend::models::rfdetr::TrainRequest, Refusal> LocalTrain(

@@ -1,3 +1,4 @@
+#include "src/frameworks/gpu/device_inventory.h"
 #include "src/frameworks/gpu/device_execution.h"
 #include "src/frameworks/gpu/tests/device_execution_fixture.h"
 #include "src/test_support/cuda_test_utils.hpp"
@@ -50,10 +51,19 @@ TEST_CASE("CUDA-visible placement resolves the device PCI identity", "[framework
  int count = 0;
  REQUIRE(cuDeviceGetCount(&count) == CUDA_SUCCESS);
  if (!count) SKIP("No CUDA-visible device; placement hardware remains unverified");
+ const auto inventory = mmltk::frameworks::gpu::discover_cuda_devices();
+ REQUIRE(inventory.size() == static_cast<std::size_t>(count));
  const auto topology = mmltk::common::system::NumaTopology::Capture();
  for (int ordinal = 0; ordinal < count; ++ordinal) {
   CUdevice device;
   REQUIRE(cuDeviceGet(&device, ordinal) == CUDA_SUCCESS);
+  std::array<char, 256> name{};
+  std::size_t total_vram = 0U;
+  REQUIRE(cuDeviceGetName(name.data(), name.size(), device) == CUDA_SUCCESS);
+  REQUIRE(cuDeviceTotalMem(&total_vram, device) == CUDA_SUCCESS);
+  CHECK(inventory[ordinal].ordinal == ordinal);
+  CHECK(inventory[ordinal].name == name.data());
+  CHECK(inventory[ordinal].total_vram == total_vram);
   std::array<char, 32> pci{};
   REQUIRE(cuDeviceGetPCIBusId(pci.data(), pci.size(), device) == CUDA_SUCCESS);
   std::string expected(pci.data());

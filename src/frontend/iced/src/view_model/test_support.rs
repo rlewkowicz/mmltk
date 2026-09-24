@@ -311,6 +311,7 @@ pub(crate) fn accepted_model_for(
     } else {
         effective.selection.artifact.into()
     };
+    snapshot.selection.inspectiondevice = effective.selection.inspectiondevice;
     snapshot.selection.key = effective.selection.key;
     snapshot.selection.artifact = artifact;
     snapshot.terminal.outcome = ModelSelectionOutcome::Accepted;

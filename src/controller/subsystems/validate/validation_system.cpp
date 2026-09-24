@@ -6,6 +6,7 @@
 #include <cmath>
 #include "src/controller/presentation/workspace_input.h"
 #include <algorithm>
+#include <atomic>
 #include <exception>
 #include <cstdio>
 #include <mutex>
@@ -20,21 +21,27 @@
 #include "src/controller/contracts/application_boundary.h"
 #include "src/controller/contracts/gui_settings_mutation.h"
 #include "src/common/system/execution_policy.h"
+#include "src/frameworks/gpu/image_failure.h"
 namespace mmltk::controller {
 class CudaValidationRuntime::Impl final : public detail::CudaSessionRuntimeState<mmltk::backend::models::rfdetr::ValidationSession> {
 public:
  using CudaSessionRuntimeState::CudaSessionRuntimeState;
 };
-CudaValidationRuntime::CudaValidationRuntime(DirectComputeConfiguration c) : impl_(std::make_unique<Impl>(c)) {}
+CudaValidationRuntime::CudaValidationRuntime(DirectComputeConfiguration c, services::RuntimeDiagnosticTarget diagnostics) : diagnostics_(std::move(diagnostics)), impl_(std::make_unique<Impl>(c)) {}
 CudaValidationRuntime::~CudaValidationRuntime() = default;
+void CudaValidationRuntime::Close() { impl_->resources.CloseSession(); }
+bool CudaValidationRuntime::HasUnsafeCustody() const noexcept { return impl_->resources.HasUnsafeCustody(); }
 ValidationRuntimeResult CudaValidationRuntime::Run(
- mmltk::backend::models::rfdetr::ValidateRequest operation, std::stop_token stop, const ComputeProgressSink& progress, const mmltk::backend::models::rfdetr::ValidationDelivery& delivery) {
+ mmltk::backend::models::rfdetr::ValidateRequest operation, std::stop_token stop, const ComputeProgressSink& progress, const mmltk::backend::models::rfdetr::ValidationDelivery& delivery, std::uint64_t generation) {
  ValidationRuntimeResult result;
  try {
   result.terminal = impl_->resources.Run(
-   [this, &result, &progress, &delivery, stop, operation = std::move(operation)](const mmltk::backend::ml::runtime::BorrowedCommandStream stream) mutable {
-    operation.device_id = impl_->resources.device();
-    operation.compile_cuda_device_id = impl_->resources.device();
+   [this, generation, &result, &progress, &delivery, stop, operation = std::move(operation)](const mmltk::backend::ml::runtime::BorrowedCommandStream stream) mutable {
+    if (operation.device_id != impl_->resources.device() || operation.compile_cuda_device_id != operation.device_id) throw std::invalid_argument("validation device disagrees with admitted execution");
+    diagnostics_.Emit([&] {
+     return services::RuntimeDiagnosticFact{.owner = contracts::DiagnosticOwner::Validation, .event = "workflow.gpu_execution", .participant = "validate",
+      .sequence = generation, .value = 0U, .detail = 1U, .device = impl_->resources.device()};
+    });
     operation = mmltk::backend::models::rfdetr::finalize_validate_request(std::move(operation));
     std::uint64_t sequence = 0U;
     auto callbacks = delivery;
@@ -62,17 +69,17 @@ ValidationRuntimeResult CudaValidationRuntime::Run(
 class ValidationSystem::Impl final {
 public:
  Impl(SettingsSystem& settings, DatasetSystem& dataset, ModelSystem& model, ValidationRuntimeFactory factory, SystemEventSink<ValidationSystem::event_type> events,
-  std::optional<mmltk::frameworks::gpu::DeviceExecution> execution, VisualDeviceSettings visual, mmltk::backend::imaging::raster::RenderedImageWriter::PngEncoder encoder)
+  DirectComputeResolver resolver, VisualDeviceSettings visual, mmltk::backend::imaging::raster::RenderedImageWriter::PngEncoder encoder)
      : settings_(settings),
        dataset_(dataset),
        model_(model),
        factory_(std::move(factory)),
        events_(std::move(events)),
-       configuration_{std::move(execution)},
+       resolver_(std::move(resolver)),
        previews_(visual.valid()),
        samples_(visual, [this] { Changed(); }),
        sample_output_(
-        configuration_, visual,
+        {}, visual,
         [this](const auto& path) {
          {
           std::scoped_lock lock(mutex_);
@@ -83,13 +90,13 @@ public:
          Changed();
         },
         std::move(encoder)) {
-  if (!factory_) throw contracts::UnavailableError("compute runtime factory is unavailable");
+  if (!factory_ || !resolver_) throw contracts::UnavailableError("compute runtime factory or placement resolver is unavailable");
   samples_.SetDisplay(settings_.validation_display_settings());
  }
- mmltk::backend::models::rfdetr::ValidationDelivery Delivery(std::uint64_t generation, const std::filesystem::path& directory, contracts::ValidationRunPreview preview) {
+ mmltk::backend::models::rfdetr::ValidationDelivery Delivery(std::uint64_t generation, const std::filesystem::path& directory, contracts::ValidationRunPreview preview, DirectComputeConfiguration configuration) {
   mmltk::backend::models::rfdetr::ValidationDelivery delivery;
-  delivery.samples_selected = [this, generation, directory, preview](auto indices, auto) {
-   sample_output_.Begin(directory, preview, indices);
+  delivery.samples_selected = [this, generation, directory, preview, configuration](auto indices, auto) {
+   sample_output_.Begin(directory, preview, indices, configuration);
    if (previews_) {
     try {
      sample_output_.UseCaptureContext(samples_.CaptureContext());
@@ -111,13 +118,17 @@ public:
  }
  ~Impl() { Shutdown(); }
  [[nodiscard]] contracts::ComputeUiState Start(contracts::ValidationRunPreview preview) {
+  if (run_.active()) throw contracts::BusyError("compute operation is active");
   if (!std::isfinite(preview.display.confidence_threshold) || preview.display.confidence_threshold < 0.0F || preview.display.confidence_threshold > 1.0F)
    throw contracts::InvalidIntentError("validation preview confidence must be between zero and one");
+  if (retirement_failed_) throw contracts::UnavailableError("compute session retirement failed");
   const auto settings = settings_.materialization_facts();
   if (!settings.loaded) throw contracts::UnavailableError("settings are unavailable");
   const auto selection = model_.selection();
+  const auto& request = settings.settings.workflows.validate.request;
+  const auto configuration = resolver_(request.device_id, request.numa_node);
   run_.Start({
-   .policy = configuration_.worker_policy(),
+   .policy = configuration.worker_policy(),
    .prepare =
     [this] {
      std::scoped_lock lock(mutex_);
@@ -125,7 +136,7 @@ public:
      if (!next) throw contracts::FailedError("compute operation generation exhausted");
      contracts::begin_compute(state_, *next, "Inspecting selected inputs");
     },
-   .work = [this, settings = settings.settings, selection, preview](const std::stop_token stop) mutable -> direct::LocalRun::Notification {
+   .work = [this, settings = settings.settings, selection, preview, configuration](const std::stop_token stop) mutable -> direct::LocalRun::Notification {
     const auto generation = operation().generation_frontier;
     auto terminal = run_checked_compute(
      [&](const ComputeProgressSink& progress) {
@@ -143,12 +154,23 @@ public:
        state_.output.directory = directory.string();
       }
       Changed();
-      if (!runtime_) runtime_ = factory_();
+      if (runtime_ && runtime_configuration_ != configuration) {
+       RetireRuntime();
+       if (retirement_failed_) throw contracts::UnavailableError("compute CUDA retirement is unproved");
+      }
+      if (!runtime_) {
+       try { runtime_ = factory_(configuration); }
+       catch (...) {
+        if (mmltk::frameworks::gpu::is_image_execution_failure(std::current_exception())) retirement_failed_ = true;
+        throw;
+       }
+       runtime_configuration_ = configuration;
+      }
       if (!runtime_) throw std::runtime_error("compute runtime is unavailable");
-      auto delivery = Delivery(generation, directory, preview);
+      auto delivery = Delivery(generation, directory, preview, configuration);
       auto result = [&] {
        try {
-        return runtime_->Run(std::move(*prepared), stop, progress, delivery);
+        return runtime_->Run(std::move(*prepared), stop, progress, delivery, generation);
        } catch (...) {
         const auto failure = std::current_exception();
         // Publish any completed selected image before this run becomes terminal.
@@ -175,11 +197,11 @@ public:
       return std::move(result.terminal);
      },
      [this](const contracts::ComputeProgress& progress) { Progress(progress); });
-    if (terminal.outcome == contracts::ComputeOperationOutcome::Failed) runtime_.reset();
+    if (terminal.outcome == contracts::ComputeOperationOutcome::Failed || (runtime_ && runtime_->HasUnsafeCustody())) RetireRuntime();
     return Complete(generation, std::move(terminal));
    },
    .failure = [this](const std::exception_ptr failure) -> direct::LocalRun::Notification {
-    runtime_.reset();
+    RetireRuntime();
     return Complete(operation().generation_frontier, contracts::compute_failure_terminal(failure, "compute worker failed"));
    },
   });
@@ -191,9 +213,13 @@ public:
   contracts::cancel_compute(state_);
   return state_;
  }
+ void RetireRuntime() noexcept {
+  if (!retirement_failed_ && !retire_compute_runtime(runtime_)) retirement_failed_ = true;
+ }
  void Shutdown() noexcept {
   static_cast<void>(Stop());
   run_.StopAndJoin();
+  RetireRuntime();
   samples_.Shutdown();
  }
  [[nodiscard]] contracts::ComputeUiState operation() const {
@@ -240,7 +266,9 @@ public:
  mutable std::mutex mutex_;
  contracts::ComputeUiState state_{};
  std::unique_ptr<ValidationRuntime> runtime_;
- DirectComputeConfiguration configuration_;
+ DirectComputeResolver resolver_;
+ std::optional<DirectComputeConfiguration> runtime_configuration_;
+ std::atomic_bool retirement_failed_ = false;
  direct::LocalRun run_;
  std::optional<mmltk::backend::models::rfdetr::ValidationBackendResult> evaluation_;
  std::uint64_t evaluation_generation_ = 0U;
@@ -250,8 +278,8 @@ public:
  detail::ValidationSampleOutput sample_output_;
 };
 ValidationSystem::ValidationSystem(SettingsSystem& settings, DatasetSystem& dataset, ModelSystem& model, ValidationRuntimeFactory factory, SystemEventSink<event_type> events,
- std::optional<mmltk::frameworks::gpu::DeviceExecution> execution, VisualDeviceSettings visual, mmltk::backend::imaging::raster::RenderedImageWriter::PngEncoder encoder)
-    : impl_(std::make_unique<Impl>(settings, dataset, model, std::move(factory), std::move(events), std::move(execution), visual, std::move(encoder))) {}
+ DirectComputeResolver resolver, VisualDeviceSettings visual, mmltk::backend::imaging::raster::RenderedImageWriter::PngEncoder encoder)
+    : impl_(std::make_unique<Impl>(settings, dataset, model, std::move(factory), std::move(events), std::move(resolver), visual, std::move(encoder))) {}
 ValidationSystem::~ValidationSystem() = default;
 ValidationSnapshot ValidationSystem::Start(contracts::ValidateWorkflowIntent intent) {
  static_cast<void>(impl_->Start(intent.preview));

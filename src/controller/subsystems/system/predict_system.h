@@ -1,4 +1,5 @@
 #pragma once
+#include "src/controller/services/runtime_diagnostics.h"
 #include "prediction_run_output.h"
 #include "src/controller/contracts/prediction_output.h"
 #include "src/controller/contracts/workflow_output.h"
@@ -57,22 +58,23 @@ public:
  virtual void Close() noexcept {}
  [[nodiscard]] virtual bool HasUnsafeCustody() const noexcept { return false; }
  [[nodiscard]] virtual contracts::ComputeTerminal Run(mmltk::backend::models::rfdetr::PredictRequest, std::stop_token, const ComputeProgressSink&, const ProductSink&, const PlaybackGate&,
-  VisualExtent maximum, const ContextProvider&, const PreviewRetirement&, const ComputeArtifactSink& = {}, const PredictionRunOutput& = {}) = 0;
+  VisualExtent maximum, const ContextProvider&, const PreviewRetirement&, const ComputeArtifactSink& = {}, const PredictionRunOutput& = {}, std::uint64_t generation = 0) = 0;
 };
 class CudaPredictRuntime final : public PredictRuntime {
 public:
- explicit CudaPredictRuntime(DirectComputeConfiguration);
+ explicit CudaPredictRuntime(DirectComputeConfiguration, services::RuntimeDiagnosticTarget = {});
  ~CudaPredictRuntime() override;
  void Close() noexcept override;
  [[nodiscard]] bool HasUnsafeCustody() const noexcept override;
  [[nodiscard]] contracts::ComputeTerminal Run(mmltk::backend::models::rfdetr::PredictRequest, std::stop_token, const ComputeProgressSink&, const ProductSink&, const PlaybackGate&,
-  VisualExtent maximum, const ContextProvider&, const PreviewRetirement&, const ComputeArtifactSink& = {}, const PredictionRunOutput& = {}) override;
+  VisualExtent maximum, const ContextProvider&, const PreviewRetirement&, const ComputeArtifactSink& = {}, const PredictionRunOutput& = {}, std::uint64_t generation = 0) override;
 
 private:
+ services::RuntimeDiagnosticTarget diagnostics_;
  class Impl;
  std::unique_ptr<Impl> impl_;
 };
-using PredictRuntimeFactory = std::function<std::unique_ptr<PredictRuntime>()>;
+using PredictRuntimeFactory = std::function<std::unique_ptr<PredictRuntime>(DirectComputeConfiguration)>;
 struct PredictPauseIntent final {
  bool paused = false;
 };
@@ -134,7 +136,7 @@ public:
   mmltk::frameworks::reflection::member_path<&PredictSnapshot::frame, &VisualFrame::revision>, PredictImageMetadata>;
  using progress_type = PredictProgressState;
  using event_type = std::variant<PredictProgress, PredictChanged, PredictFailed>;
- PredictSystem(SettingsSystem&, DatasetSystem&, ModelSystem&, VisualDeviceSettings, PredictRuntimeFactory, SystemEventSink<event_type> = {});
+ PredictSystem(SettingsSystem&, DatasetSystem&, ModelSystem&, VisualDeviceSettings, PredictRuntimeFactory, SystemEventSink<event_type> = {}, DirectComputeResolver = resolve_compute_configuration);
  ~PredictSystem();
  [[= contracts::reflection::direct::IntentEndpoint{}]] [[nodiscard]] PredictSnapshot Inspect(PredictionSourceQuery);
  [[= contracts::reflection::direct::IntentEndpoint{}]] [[nodiscard]] PredictSnapshot Start(contracts::PredictWorkflowIntent);

@@ -1,3 +1,4 @@
+#include "src/frameworks/gpu/device_inventory.h"
 #include "src/frameworks/gpu/device_execution.h"
 #include <cuda.h>
 #include <algorithm>
@@ -9,6 +10,24 @@
 #include "src/common/system/cpu_affinity.h"
 #include "src/frameworks/gpu/cuda_error.h"
 namespace mmltk::frameworks::gpu {
+std::vector<CudaDeviceFact> discover_cuda_devices() {
+ ensure_cuda_driver_ok(cuInit(0), "initialize CUDA device inventory");
+ int count = 0;
+ ensure_cuda_driver_ok(cuDeviceGetCount(&count), "enumerate CUDA devices");
+ if (count < 0 || static_cast<std::size_t>(count) > kCudaDeviceCapacity) throw std::runtime_error("CUDA device inventory exceeds capacity");
+ std::vector<CudaDeviceFact> result;
+ result.reserve(static_cast<std::size_t>(count));
+ for (int ordinal = 0; ordinal < count; ++ordinal) {
+  CUdevice device;
+  std::array<char, 256U> name{};
+  std::size_t bytes = 0U;
+  ensure_cuda_driver_ok(cuDeviceGet(&device, ordinal), "resolve CUDA device ordinal");
+  ensure_cuda_driver_ok(cuDeviceGetName(name.data(), name.size(), device), "read CUDA device name");
+  ensure_cuda_driver_ok(cuDeviceTotalMem(&bytes, device), "read CUDA device memory");
+  result.push_back({ordinal, name.data(), bytes});
+ }
+ return result;
+}
 int resolve_device_uuid(const std::array<std::uint8_t, 16U>& expected) {
  ensure_cuda_driver_ok(cuInit(0), "initialize graphics device discovery");
  int count = 0;

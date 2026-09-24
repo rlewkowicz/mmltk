@@ -32,6 +32,7 @@ pub const MATCH_FREE_ASSIGNMENT_ID: &str = "train.advanced.assignment.match_free
 
 #[derive(Debug, Clone)]
 pub enum Message {
+    Gpu(crate::view::workflow::gpu::Message),
     Continuation(ContinuationMode),
     AspectSelected(crate::generated::WorkspaceAspectRatio),
     StartRequested,
@@ -160,6 +161,7 @@ impl Component {
         message: Message,
     ) -> Result<Option<Outcome>, String> {
         let outcome = match message {
+            Message::Gpu(message) => Outcome::SettingsEdited(crate::view::workflow::gpu::update(crate::generated::FeatureId::Train, model, message)?),
             Message::Continuation(mode) => Outcome::Continuation(mode),
             Message::AspectSelected(aspect) => {
                 Outcome::SettingsEdited(crate::view::workspace::edit_aspect(model, aspect)?)
@@ -387,7 +389,8 @@ impl Component {
             column![
                 output::view(model, settings, self.metrics.omitted_summaries())
                     .map(Message::Output),
-                diagnostics
+                crate::view::workflow::gpu::view(crate::generated::FeatureId::Train, model, settings).map(Message::Gpu),
+                crate::view::shared::identified("train.card.status", diagnostics)
             ]
             .spacing(crate::view::workflow::SECTION_SPACING)
             .into(),

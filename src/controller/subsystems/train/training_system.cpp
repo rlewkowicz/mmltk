@@ -35,7 +35,7 @@ void TrainingRuntime::ReportFailure(const std::string_view detail, const std::op
 }
 NativeTrainingRuntime::NativeTrainingRuntime(NativeTrainingConfiguration configuration) : config_(std::move(configuration)) {}
 contracts::ComputeTerminal NativeTrainingRuntime::Train(
- mmltk::backend::models::rfdetr::TrainRequest request, const std::stop_token stop, const std::function<void(const services::TrainProcessProgress&)>& progress) {
+ mmltk::backend::models::rfdetr::TrainRequest request, const std::stop_token stop, const std::function<void(const services::TrainProcessProgress&)>& progress, std::uint64_t generation) {
  const auto emit_terminal = [&](const services::TrainProcessExit* terminal, const std::string_view failure) {
   std::string diagnostic_message;
   config_.diagnostics.Emit([&] {
@@ -64,6 +64,12 @@ contracts::ComputeTerminal NativeTrainingRuntime::Train(
  try {
   if (config_.training_executable.empty()) throw contracts::UnavailableError("local training executable is unavailable");
   auto process = services::TrainProcessClient::launch(request, config_.training_executable);
+  if (config_.diagnostics.valid()) {
+   const std::span<const int> ranks = request.device_ids.empty() ? std::span<const int>{&request.device_id, 1U} : std::span<const int>{request.device_ids};
+   for (std::size_t rank = 0; rank < ranks.size(); ++rank)
+    config_.diagnostics.Emit([&] { return services::RuntimeDiagnosticFact{.owner = contracts::DiagnosticOwner::Training, .event = "workflow.gpu_execution", .participant = "train",
+     .sequence = generation, .value = rank, .detail = ranks.size(), .device = ranks[rank]}; });
+  }
   mmltk::common::concurrency::ScopedEventCancellation<services::TrainProcessStopSource> cancellation{stop};
   struct Observer final {
    const std::function<void(const services::TrainProcessProgress&)>* sink;
@@ -348,6 +354,7 @@ public:
       }
       direct::PublishLazyNoexcept(events_, [&] { return event_type{TrainingChanged{snapshot()}}; });
       if (admission) admission->RequireUnchanged(stop);
+      const auto generation = [this] { std::scoped_lock lock(mutex_); return state_.local.generation_frontier; }();
       terminal = runtime().Train(std::move(*request), stop, [this, &malformed_progress](const services::TrainProcessProgress& update) {
        const auto& progress = update.progress;
        if (!progress.valid()) {
@@ -372,7 +379,7 @@ public:
         };
        }
        direct::PublishLazyNoexcept(events_, [&] { return event_type{std::move(observation)}; });
-      });
+      }, generation);
      }
      if (malformed_progress.load(std::memory_order_relaxed) || !terminal.valid_worker_terminal()) throw std::runtime_error("local training runtime returned an invalid result");
      failed = terminal.outcome == contracts::ComputeOperationOutcome::Failed;

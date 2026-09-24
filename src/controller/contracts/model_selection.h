@@ -163,6 +163,7 @@ struct ValidateOnnxModelSelection final
 struct ValidateTensorRtModelSelection final
     : ValidateModelSelection<member_path<&GuiSettingsState::workflows, &WorkflowSettingsState::validate, &ValidateViewState::request, &mmltk::backend::models::rfdetr::ValidateRequest::tensorrt_path>,
        ModelArtifactInputKind::TensorRt> {
+ inline static constexpr auto inspection_device = member_path<&GuiSettingsState::workflows, &WorkflowSettingsState::validate, &ValidateViewState::request, &mmltk::backend::models::rfdetr::ValidateRequest::device_id>;
  inline static constexpr ModelSelectionCompatibility compatibility =
   // CLEANUP-IGNORE: Compatibility rows retain distinct stable identities and artifact policies.
   custom_model_compatibility("validate.tensorrt", workflow, input_kind, false, artifact_field_path.view());
@@ -194,6 +195,7 @@ struct PredictOnnxModelSelection final
 struct PredictTensorRtModelSelection final
     : PredictModelSelection<member_path<&GuiSettingsState::workflows, &WorkflowSettingsState::predict, &PredictViewState::request, &mmltk::backend::models::rfdetr::PredictRequest::tensorrt_path>,
        ModelArtifactInputKind::TensorRt> {
+ inline static constexpr auto inspection_device = member_path<&GuiSettingsState::workflows, &WorkflowSettingsState::predict, &PredictViewState::request, &mmltk::backend::models::rfdetr::PredictRequest::device_id>;
  inline static constexpr ModelSelectionCompatibility compatibility = custom_model_compatibility("predict.tensorrt", workflow, input_kind, false, artifact_field_path.view());
 };
 struct ExportWeightsModelSelection final : ModelSelectionRelationRow<FeatureId::Export, member_path<&GuiSettingsState::workflows, &WorkflowSettingsState::export_state, &ExportViewState::model_source>,
@@ -301,6 +303,7 @@ struct ModelSelectionCompatibilityCatalog final {
   }
   if (Row::input(settings) != row.input) return;
   Row::artifact_relation::Project(settings, *result);
+  if constexpr (requires { Row::inspection_device; }) result->inspection_device = Row::inspection_device(settings);
   result->compatible = model_selection_source_allowed(row, result->key.source);
  });
  return result;

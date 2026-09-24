@@ -539,6 +539,7 @@ WaylandSession::WaylandSession(std::shared_ptr<PreparedWaylandInputs> inputs, co
 }
 void WaylandSession::ConsumeRecords(const bool final) {
  native_cursor_->consume(native, [&](const auto& record) {
+  browser.consume_native_gpu(record);
   surface_audit.native(record);
   pixel_audit.consume(record);
   report_consumed_record(record, "native");
@@ -673,6 +674,14 @@ void WaylandSession::RunWorkflows() {
  }
  CHECK(browser.validation_confidence_complete());
  CHECK(browser.validation_layout_complete());
+ CHECK(browser.workflow_gpus_complete());
+ mmltk::controller::contracts::GuiSettingsState persisted;
+ REQUIRE(mmltk::controller::contracts::load_gui_settings_file((working.path() / ".mmltk-data" / "gui.json").string(), persisted));
+ REQUIRE(persisted.workflows.train.request.device_ids.size() == 1U);
+ CHECK(persisted.workflows.train.request.device_ids.front() == browser.workflow_gpu_selected.at("train")[0]);
+ CHECK(persisted.workflows.validate.request.device_id == browser.workflow_gpu_selected.at("validate")[0]);
+ CHECK(persisted.workflows.predict.request.device_id == browser.workflow_gpu_selected.at("predict")[0]);
+ CHECK(persisted.workflows.export_state.device_id == browser.workflow_gpu_selected.at("export")[0]);
  CHECK(browser.primary_phase_progress.contains("train.primary:light"));
  CHECK(browser.primary_phase_progress.contains("validate.primary:light"));
  CHECK(browser.primary_phase_progress.contains("predict.primary:light"));

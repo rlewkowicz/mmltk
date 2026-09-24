@@ -10,6 +10,7 @@ mmltk_register_public_headers(mmltk_frameworks_gpu
         cuda_launch.cuh
         cuda_error.h
         device_execution.h
+        device_inventory.h
         pinned_host_buffer.h
         gdr_mapped_buffer.h
         image_geometry.h
@@ -59,6 +60,7 @@ target_link_libraries(mmltk_frameworks_gpu
         mmltk::common::logging
         mmltk::common::system
         mmltk::common::types
+        mmltk::frameworks::reflection
         CUDA::cudart
     PRIVATE
         CUDA::cuda_driver

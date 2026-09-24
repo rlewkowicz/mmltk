@@ -17,6 +17,7 @@
 #include "src/controller/presentation/visual_system_types.h"
 #include "src/frameworks/gpu/system_image_runtime.h"
 #include "src/frameworks/gpu/image_types.h"
+#include "src/frameworks/gpu/image_buffer.h"
 #include "src/frameworks/gpu/terminal_cuda_retirement_owner.h"
 namespace mmltk::controller::detail {
 [[nodiscard]] mmltk::frameworks::gpu::DeviceContext CreatePredictionPreviewContext(
@@ -33,6 +34,7 @@ public:
  [[nodiscard]] std::span<const mmltk::backend::models::rfdetr::Prediction> predictions() const noexcept;
  [[nodiscard]] std::span<const std::string> classes() const noexcept;
  [[nodiscard]] int class_count() const noexcept;
+ [[nodiscard]] int receiver_device() const noexcept;
 
 private:
  friend class PredictionPreviewPool;
@@ -105,6 +107,10 @@ public:
   decltype(&cudaStreamWaitEvent) wait = &cudaStreamWaitEvent;
   decltype(&cudaMemset2DAsync) clear_semantic = &cudaMemset2DAsync;
   decltype(&mmltk::backend::imaging::raster::rgb8_to_rgba) convert_rgb8 = &mmltk::backend::imaging::raster::rgb8_to_rgba;
+  mmltk::frameworks::gpu::DeviceContext (*source_context)(const mmltk::frameworks::gpu::DeviceExecution&) = [](const auto& execution) {
+   namespace gpu = mmltk::frameworks::gpu;
+   return gpu::DeviceContext(execution.device, gpu::cuda_image_copy_backend(), gpu::DeviceContextMode::PrimaryInterop, execution.placement.numa_node, execution);
+  };
  };
  PredictionPreviewPool(mmltk::frameworks::gpu::DeviceExecution, mmltk::frameworks::gpu::DeviceContext);
  PredictionPreviewPool(mmltk::frameworks::gpu::DeviceExecution, mmltk::frameworks::gpu::DeviceContext, TransferOperations operations,

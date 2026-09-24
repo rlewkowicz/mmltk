@@ -27,6 +27,7 @@
 #include "src/common/system/numa_topology.h"
 #include "src/backend/data/catalog/class_catalog.h"
 #include <algorithm>
+#include <nlohmann/json.hpp>
 #include <array>
 #include <atomic>
 #include <catch2/catch_test_macros.hpp>
@@ -73,14 +74,16 @@ TEST_CASE("production direct adapters reject unavailable physical dependencies",
 }
 TEST_CASE("native training projects a child OOM into the GUI terminal and shared diagnostics", "[controller][systems][production-adapters]") {
  const bool enabled = GENERATE(false, true);
+ const bool multiple = GENERATE(false, true);
  const auto root = mmltk::testsupport::make_temp_root("native-training-oom");
  std::filesystem::create_directories(root);
  const auto executable = root / "trainer.sh";
  {
   std::ofstream script{executable};
   script << "#!/bin/sh\n"
-   "batch=''; lanes=''; while [ $# -gt 0 ]; do case \"$1\" in --batch-size) batch=$2;; --lanes) lanes=$2;; esac; shift; done\n"
+   "batch=''; lanes=''; devices=''; while [ $# -gt 0 ]; do case \"$1\" in --batch-size) batch=$2;; --lanes) lanes=$2;; --device-id|--device-ids) devices=$2;; esac; shift; done\n"
    "[ \"$batch\" = 16 ] && [ \"$lanes\" = 3 ] || { printf 'fatal: unexpected training argv\\n'; exit 9; }\n"
+   "[ \"$devices\" = \"" << (multiple ? "3,1" : "7") << "\" ] || { printf 'fatal: unexpected GPU argv\\n'; exit 9; }\n"
    "printf 'fatal: mmltk rfdetr error: CUDA out of memory. Tried to allocate 24.00 MiB. GPU 0 has a total capacity of 11.62 GiB of which 42.00 MiB is free.\\n'\nexit 1\n";
  }
  std::filesystem::permissions(executable, std::filesystem::perms::owner_all);
@@ -96,8 +99,10 @@ TEST_CASE("native training projects a child OOM into the GUI terminal and shared
  request.resolution = 384;
  request.batch_size = 16;
  request.lanes = 3;
+ request.device_id = 7;
+ if (multiple) request.device_ids = {3, 1};
  mmltk::testsupport::console_output::ScopedStderrCapture capture;
- const auto terminal = training.Train(request, {}, {});
+ const auto terminal = training.Train(request, {}, {}, 42U);
  const auto stderr_text = capture.finish();
  CHECK(std::ranges::count(stderr_text, '\n') == 1);
  CHECK(stderr_text.find("fatal: local training:") == 0);
@@ -109,7 +114,7 @@ TEST_CASE("native training projects a child OOM into the GUI terminal and shared
  CHECK(terminal.detail.find("42.00 MiB") != std::string::npos);
  CHECK(terminal.detail.find("Reduce batch size or training lanes") != std::string::npos);
  CHECK(terminal.output.empty());
- CHECK(diagnostics.counters().accepted == (enabled ? 1U : 0U));
+ CHECK(diagnostics.counters().accepted == (enabled ? (multiple ? 3U : 2U) : 0U));
  diagnostics.close();
  if (!enabled) {
   CHECK_FALSE(std::filesystem::exists(diagnostic_path));
@@ -117,6 +122,17 @@ TEST_CASE("native training projects a child OOM into the GUI terminal and shared
  }
  std::ifstream input{diagnostic_path};
  std::string line;
+ const auto devices = multiple ? std::vector<int>{3, 1} : std::vector<int>{7};
+ for (std::size_t rank = 0U; rank < devices.size(); ++rank) {
+  REQUIRE(static_cast<bool>(std::getline(input, line)));
+  const auto record = nlohmann::json::parse(line);
+  CHECK(record["event"] == "workflow.gpu_execution");
+  CHECK(record["participant"] == "train");
+  CHECK(record["sequence"] == 42U);
+  CHECK(record["value"] == rank);
+  CHECK(record["detail"] == devices.size());
+  CHECK(record["device"] == devices[rank]);
+ }
  REQUIRE(static_cast<bool>(std::getline(input, line)));
  CHECK(line.find("training") != std::string::npos);
  CHECK(line.find("child.exited") != std::string::npos);
@@ -169,7 +185,7 @@ TEST_CASE("model and compute systems use direct facts, progress, Busy, Stop, and
  TerminalSequence<ValidationSystem::event_type> terminals;
  std::atomic_size_t progress = 0U;
  ValidationSystem validation{settings, dataset, model,
-  [&] {
+  [&](DirectComputeConfiguration){
    const bool fail = constructions++ == 0U;
    return std::make_unique<FakeNonvisualComputeRuntime>(ComputeScenario{.gate = gate, .fail = fail});
   },
@@ -178,7 +194,7 @@ TEST_CASE("model and compute systems use direct facts, progress, Busy, Stop, and
     ++progress;
    else if (!std::get<ValidationChanged>(event).snapshot.operation.active)
     terminals.Publish(std::move(event));
-  }};
+  }, [](int, int) { return DirectComputeConfiguration{}; }};
  static_cast<void>(validation.Start({}));
  // CLEANUP-IGNORE: Validation Busy evidence is independent from file-dialog and dataset admission evidence.
  CHECK_THROWS_AS(validation.Start({}), contracts::BusyError);
@@ -299,7 +315,7 @@ TEST_CASE("Predict materialized routing keeps one producer across input changes 
  PresentationSnapshot displayed;
  std::string routing_failure;
  PredictSystem prediction{settings, dataset, model, {.device = 0, .maximum_width = 64U, .maximum_height = 64U},
-  [&] { return std::make_unique<FakePredictRuntime>(PredictionScenario{.compute = {.gate = gate, .fail = invalid_first && constructions++ == 0U}, .source_index = index}); },
+  [&](DirectComputeConfiguration){ return std::make_unique<FakePredictRuntime>(PredictionScenario{.compute = {.gate = gate, .fail = invalid_first && constructions++ == 0U}, .source_index = index}); },
   [&](PredictSystem::event_type event) {
    if (auto* presentation = route.load()) presentation->SourceChanged({PresentationSourceKind::Predict, 1U});
    std::visit(
@@ -311,7 +327,7 @@ TEST_CASE("Predict materialized routing keeps one producer across input changes 
      }
     },
     event);
-  }};
+  }, [](int, int) { return DirectComputeConfiguration{}; }};
  const auto readers = browser::materialize_visual_source_readers(PredictReaderComposition{&settings, &prediction});
  REQUIRE(readers.size() == 1U);
  CHECK((readers[0].source == PresentationSourceIdentity{PresentationSourceKind::Predict, 1U}));
@@ -388,11 +404,11 @@ TEST_CASE("Predict compact publication and source observation do not reread reta
    if (auto* selected = route.load()) selected->SourceChanged(source);
   }};
  PredictSystem prediction{settings, dataset, model, {.device = 0, .maximum_width = 64U, .maximum_height = 64U},
-  [&] { return std::make_unique<FakePredictRuntime>(PredictionScenario{.compute = {.gate = begin}, .labels = contracts::kAnnotationObjectCapacity, .after_product = after_image}); },
+  [&](DirectComputeConfiguration){ return std::make_unique<FakePredictRuntime>(PredictionScenario{.compute = {.gate = begin}, .labels = contracts::kAnnotationObjectCapacity, .after_product = after_image}); },
   [&](PredictSystem::event_type event) {
    if (const auto* progress = std::get_if<PredictProgress>(&event); progress && progress->snapshot.operation.progress.sequence == 2U) scalar_sent = true;
    publisher(event);
-  }};
+  }, [](int, int) { return DirectComputeConfiguration{}; }};
  auto readers = browser::materialize_visual_source_readers(PredictReaderComposition{&settings, &prediction});
  auto observe = std::move(readers[0].observe);
  readers[0].observe = [&, observe = std::move(observe)] {
@@ -443,10 +459,10 @@ TEST_CASE("export and predict wrappers share Busy Stop and failure isolation", "
  auto [settings, dataset, model] = fixture.systems();
  auto export_gate = std::make_shared<mmltk::testsupport::StopGate>();
  std::promise<ComputeSystemEvent> export_terminal;
- ExportSystem export_system{settings, dataset, model, [export_gate] { return std::make_unique<FakeNonvisualComputeRuntime>(ComputeScenario{.gate = export_gate}); },
+ ExportSystem export_system{settings, dataset, model, [export_gate](DirectComputeConfiguration){ return std::make_unique<FakeNonvisualComputeRuntime>(ComputeScenario{.gate = export_gate}); },
   [&](ComputeSystemEvent event) {
    if (const auto* changed = std::get_if<ComputeChanged>(&event); changed && !changed->snapshot.active) export_terminal.set_value(std::move(event));
-  }};
+  }, [](int, int) { return DirectComputeConfiguration{}; }};
  static_cast<void>(export_system.Start({}));
  CHECK_THROWS_AS(export_system.Start({}), contracts::BusyError);
  static_cast<void>(export_system.Stop());
@@ -463,7 +479,7 @@ TEST_CASE("export and predict wrappers share Busy Stop and failure isolation", "
  std::atomic_bool frame_seen = false;
  std::atomic_size_t predict_terminals = 0U;
  PredictSystem predict{settings, dataset, model, {.device = 0, .maximum_width = 64U, .maximum_height = 64U},
-  [&] {
+  [&](DirectComputeConfiguration){
    const bool fail = constructions++ == 0U;
    return std::make_unique<FakePredictRuntime>(PredictionScenario{.compute = {.gate = predict_gate, .fail = fail}, .predictions = predictions});
   },
@@ -476,7 +492,7 @@ TEST_CASE("export and predict wrappers share Busy Stop and failure isolation", "
     predict_succeeded.set_value(std::move(event));
    else if (terminal == contracts::ComputeOperationOutcome::Cancelled)
     predict_cancelled.set_value(std::move(event));
-  }};
+  }, [](int, int) { return DirectComputeConfiguration{}; }};
  CHECK_FALSE(predict.BorrowFrame().valid());
  const auto first_admitted = predict.Start({});
  CHECK(first_admitted.revision > 0U);
@@ -600,7 +616,7 @@ class CapturedOutputValidation final : public ValidationRuntime {
 public:
  CapturedOutputValidation(std::promise<std::filesystem::path>& admitted, std::shared_ptr<mmltk::testsupport::StopGate> gate) : admitted_(admitted), gate_(std::move(gate)) {}
  ValidationRuntimeResult Run(
-  mmltk::backend::models::rfdetr::ValidateRequest request, std::stop_token stop, const ComputeProgressSink&, const mmltk::backend::models::rfdetr::ValidationDelivery&) override {
+  mmltk::backend::models::rfdetr::ValidateRequest request, std::stop_token stop, const ComputeProgressSink&, const mmltk::backend::models::rfdetr::ValidationDelivery&, std::uint64_t) override {
   admitted_.set_value(request.report_json_path);
   static_cast<void>(gate_->Wait(stop));
   return {.terminal = contracts::make_compute_terminal(contracts::ComputeOperationOutcome::Cancelled)};
@@ -620,10 +636,10 @@ TEST_CASE("validation reserves after admission and retains the captured director
  std::promise<std::filesystem::path> admitted;
  std::promise<void> settled;
  auto gate = std::make_shared<mmltk::testsupport::StopGate>();
- ValidationSystem validation{settings, dataset, model, [&] { return std::make_unique<CapturedOutputValidation>(admitted, gate); },
+ ValidationSystem validation{settings, dataset, model, [&](DirectComputeConfiguration){ return std::make_unique<CapturedOutputValidation>(admitted, gate); },
   [&](ValidationSystem::event_type event) {
    if (const auto* changed = std::get_if<ValidationChanged>(&event); changed && !changed->snapshot.operation.active) mmltk::testsupport::release_test_promise(settled);
-  }};
+  }, [](int, int) { return DirectComputeConfiguration{}; }};
  static_cast<void>(validation.Start({}));
  auto future = admitted.get_future();
  const auto report = mmltk::testsupport::await_test_future(future, "admitted validation output");
@@ -648,7 +664,7 @@ namespace mmltk::controller {
 namespace {
 class PublishedThenFailedExport final : public ExportRuntime {
 public:
- contracts::ComputeTerminal Run(ExportRunRequest request, std::stop_token, const ComputeProgressSink&, const ComputeArtifactSink& published) override {
+ contracts::ComputeTerminal Run(ExportRunRequest request, std::stop_token, const ComputeProgressSink&, const ComputeArtifactSink& published, std::uint64_t) override {
   const auto path = request.output_directory / "model.onnx";
   std::ofstream(path) << "completed fixture artifact";
   published(path);
@@ -661,10 +677,10 @@ TEST_CASE("export keeps committed artifacts visible when later settlement fails"
  fixture.PrepareModel(contracts::FeatureId::Export);
  auto [settings, dataset, model] = fixture.systems();
  std::promise<contracts::ComputeUiState> settled;
- ExportSystem exporter{settings, dataset, model, [] { return std::make_unique<PublishedThenFailedExport>(); },
+ ExportSystem exporter{settings, dataset, model, [](DirectComputeConfiguration){ return std::make_unique<PublishedThenFailedExport>(); },
   [&](ComputeSystemEvent event) {
    if (const auto* changed = std::get_if<ComputeChanged>(&event); changed && !changed->snapshot.active) settled.set_value(changed->snapshot);
-  }};
+  }, [](int, int) { return DirectComputeConfiguration{}; }};
  static_cast<void>(exporter.Start({}));
  auto future = settled.get_future();
  const auto result = mmltk::testsupport::await_test_future(future, "export output settlement");
@@ -683,7 +699,7 @@ namespace {
 class CancelBeforePublicationExport final : public ExportRuntime {
 public:
  explicit CancelBeforePublicationExport(std::promise<void>& started) : started_(started) {}
- contracts::ComputeTerminal Run(ExportRunRequest, std::stop_token stop, const ComputeProgressSink&, const ComputeArtifactSink&) override {
+ contracts::ComputeTerminal Run(ExportRunRequest, std::stop_token stop, const ComputeProgressSink&, const ComputeArtifactSink&, std::uint64_t) override {
   started_.set_value();
   mmltk::testsupport::StopGate gate;
   static_cast<void>(gate.Wait(stop));
@@ -700,10 +716,10 @@ TEST_CASE("export stopped during native work does not advertise an uncommitted a
  auto [settings, dataset, model] = fixture.systems();
  std::promise<void> started;
  std::promise<contracts::ComputeUiState> settled;
- ExportSystem exporter{settings, dataset, model, [&] { return std::make_unique<CancelBeforePublicationExport>(started); },
+ ExportSystem exporter{settings, dataset, model, [&](DirectComputeConfiguration){ return std::make_unique<CancelBeforePublicationExport>(started); },
   [&](ComputeSystemEvent event) {
    if (const auto* changed = std::get_if<ComputeChanged>(&event); changed && !changed->snapshot.active) settled.set_value(changed->snapshot);
-  }};
+  }, [](int, int) { return DirectComputeConfiguration{}; }};
  static_cast<void>(exporter.Start({}));
  mmltk::testsupport::await_test_promise(started, "export native work started");
  static_cast<void>(exporter.Stop());
@@ -820,10 +836,10 @@ TEST_CASE("export rejects empty format selection before native preparation or ou
  static_cast<void>(settings.Update(std::move(update)));
  CHECK_THROWS_AS(model.Select({.workflow = contracts::FeatureId::Export}), contracts::InvalidIntentError);
  unsigned runtime_creations = 0U;
- ExportSystem exporter{settings, dataset, model, [&]() -> std::unique_ptr<ExportRuntime> {
+ ExportSystem exporter{settings, dataset, model, [&](DirectComputeConfiguration) -> std::unique_ptr<ExportRuntime> {
                         ++runtime_creations;
                         return {};
-                       }};
+                       }, {}, [](int, int) { return DirectComputeConfiguration{}; }};
  CHECK_THROWS_AS(exporter.Start({}), contracts::InvalidIntentError);
  CHECK(runtime_creations == 0U);
  CHECK(exporter.snapshot().generation_frontier == 0U);

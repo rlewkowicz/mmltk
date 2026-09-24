@@ -95,7 +95,7 @@ contracts::ModelUiState ModelSystem::Select(const contracts::ModelSelectionReque
    try {
     if (!runtime_) runtime_ = factory_();
     if (!runtime_) throw std::runtime_error("model runtime is unavailable");
-    auto artifact = runtime_->Acquire(input.key, input.custom_artifact, input.inspection_device, stop, [this, &malformed_progress](const contracts::ModelProgress& value) {
+    auto artifact = runtime_->Acquire(input.key, input.custom_artifact, input.inspection_device.value_or(0), stop, [this, &malformed_progress](const contracts::ModelProgress& value) {
      if (!value.valid()) {
       malformed_progress.store(true, std::memory_order_relaxed);
      } else {
@@ -106,7 +106,7 @@ contracts::ModelUiState ModelSystem::Select(const contracts::ModelSelectionReque
     if (stop.stop_requested()) {
      terminal.outcome = contracts::ModelSelectionOutcome::Cancelled;
     } else {
-     selection = {.key = std::move(input.key), .artifact = std::move(artifact.artifact), .class_layout = std::move(artifact.class_layout)};
+     selection = {.key = std::move(input.key), .inspection_device = input.inspection_device, .artifact = std::move(artifact.artifact), .class_layout = std::move(artifact.class_layout)};
      if (!selection.valid()) throw std::runtime_error("model runtime returned an invalid selection");
      terminal.outcome = contracts::ModelSelectionOutcome::Accepted;
     }

@@ -64,6 +64,7 @@ struct PredictionPreviewFrame::State final {
  gpu::DeviceContext context;
  gpu::CudaContextApi context_api;
  std::optional<gpu::DeviceContext> source_context;
+ std::optional<gpu::DeviceContext> candidate_source_context;
  cudaEvent_t source_ready = nullptr;
  bool source_recorded = false;
  enum class Pixels { ChwFloat, Rgb8 };
@@ -164,7 +165,7 @@ PredictionPreviewPool::PredictionPreviewPool(
       slots_(preview_slot_count(slots)) {
  if (!retirement_->admission_open()) throw std::runtime_error("prediction preview retirement admission is closed");
  if (!operations_.wait || !operations_.copy || !operations_.record || !operations_.settle || !operations_.register_host || !operations_.upload || !operations_.clear_semantic || !operations_.convert ||
-     !operations_.convert_rgb8 || !operations_.context_api.get || !operations_.context_api.set)
+     !operations_.convert_rgb8 || !operations_.source_context || !operations_.context_api.get || !operations_.context_api.set)
   throw std::invalid_argument("prediction transfer operations are incomplete");
  // Compatibility follows the retained context, device and execution owner.
  // A backend decorating CUDA operations does not create a different context.
@@ -216,31 +217,48 @@ std::shared_ptr<const PredictionPreviewFrame> PredictionPreviewPool::Capture(con
  const auto scratch_offset = ground_truth_offset + ground_truth_words * sizeof(std::uint32_t);
  const auto bytes = scratch_offset + (composition ? pixel_count * 8U : 0U);
  if (bytes > admitted_bytes) throw std::invalid_argument("prediction compact preview exceeds admitted storage");
+ const auto device = source_device >= 0 ? source_device : execution_.device;
+ // Resolve policy before touching a reusable receiver slot. An unavailable
+ // source does not invalidate its settled high-water allocation.
+ std::optional<gpu::DeviceExecution> source_execution;
+ if (!*available || !(*available)->state_->source_context || (*available)->state_->source_context->device() != device)
+  source_execution = device == execution_.device ? execution_ : gpu::resolve_device_execution(device, mmltk::common::system::NumaTopology::Capture());
+ bool slot_mutated = false;
  try {
   if (!*available) *available = std::shared_ptr<PredictionPreviewFrame>(new PredictionPreviewFrame(context_, retirement_, source_custody, operations_.context_api));
   auto& state = *(*available)->state_;
   std::unique_lock state_lock(state.mutex, std::try_to_lock);
   if (!state_lock) return {};
   checked(state.unsafe);
-  state.source_custody = source_custody;
   auto scope = (*available)->ContextScope();
   scope.Run([&] {
-   if (!state.source_context) {
-    const auto device = source_device >= 0 ? source_device : execution_.device;
-    const auto source_execution = device == execution_.device ? execution_ : gpu::resolve_device_execution(device, mmltk::common::system::NumaTopology::Capture());
-    state.source_context.emplace(device, gpu::cuda_image_copy_backend(), gpu::DeviceContextMode::PrimaryInterop, source_execution.placement.numa_node, source_execution);
+   if (source_execution)
+    state.candidate_source_context.emplace(operations_.source_context(*source_execution));
+   slot_mutated = true;
+   // A free slot has no CPU readers, but its previous source may still be
+   // writing. Keep that source's custody and context through physical settlement.
+   if (state.source_context) {
+    state.source_context->Bind();
+    if (state.source_recorded) checked(cudaEventSynchronize(state.source_ready));
+    state.source_custody.reset();
+    state.decoded_source.reset();
+    state.rgb8 = nullptr;
+    if (state.source_context->device() != device) {
+     if (state.source_ready) checked(cudaEventDestroy(state.source_ready));
+     state.source_ready = nullptr;
+     state.source_recorded = false;
+     state.context.Bind();
+     state.source_context.reset();
+    }
    }
-   if (source_device >= 0 && state.source_context->device() != source_device) throw std::invalid_argument("prediction source device changed within a capture slot");
+   if (state.candidate_source_context) {
+    state.source_context = std::move(state.candidate_source_context);
+    state.candidate_source_context.reset();
+   }
+   state.source_custody = source_custody;
    if (!state.source_ready) {
     state.source_context->Bind();
     checked(cudaEventCreateWithFlags(&state.source_ready, cudaEventDisableTiming));
-   }
-   if (bytes > state.capacity && state.source_recorded) {
-    auto source_scope = (*available)->ContextScope();
-    source_scope.Run([&] {
-     state.source_context->Bind();
-     checked(cudaEventSynchronize(state.source_ready));
-    });
    }
    state.context.Bind();
    state.Reserve(bytes);
@@ -343,13 +361,12 @@ std::shared_ptr<const PredictionPreviewFrame> PredictionPreviewPool::Capture(con
     std::rethrow_exception(failure);
    }
   });
-  state.source_custody.reset();
   return *available;
  } catch (...) {
   const auto failure = std::current_exception();
   // Destruction itself can discover an unproved source/restore outcome.
   // Inspect authority only after that exact owner has settled or retained.
-  available->reset();
+  if (slot_mutated || !retirement_->admission_open()) available->reset();
   if (!retirement_->admission_open()) {
    unsafe_source_ = true;
    if (stop_source) {
@@ -362,6 +379,7 @@ std::shared_ptr<const PredictionPreviewFrame> PredictionPreviewPool::Capture(con
   std::rethrow_exception(failure);
  }
 }
+int PredictionPreviewFrame::receiver_device() const noexcept { return state_->context.device(); }
 bool PredictionPreviewFrame::CompatibleWith(const gpu::SystemImageRuntime& runtime) const noexcept { return runtime.UsesContext(state_->context); }
 void PredictionPreviewFrame::Draw(gpu::SystemImageRuntime& runtime, gpu::SystemImageRuntime::OutputCandidate& candidate) const {
  const std::array regions{PredictionPreviewComposition::Region{shared_from_this(), {0U, 0U, state_->extent.width, state_->extent.height}}};
@@ -470,10 +488,10 @@ void PredictionPreviewComposition::Draw(gpu::SystemImageRuntime& runtime, gpu::S
    scope.Run([&] {
     frame.state_->prepared = frame.state_->pending;
     frame.state_->rgb8 = nullptr;
-    if (frame.state_->decoded_source) {
-     frame.state_->source_context->Bind();
-     frame.state_->decoded_source.reset();
-    }
+    frame.state_->source_context->Bind();
+    frame.state_->decoded_source.reset();
+    frame.state_->source_custody.reset();
+    frame.state_->source_recorded = false;
    });
   }
  } catch (...) {

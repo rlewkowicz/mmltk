@@ -298,7 +298,7 @@ contracts::ComputeTerminal ComputeSequence::Run(std::stop_token stop, const Comp
    .detail = std::string(contracts::kComputeErrorCapacity + 1U, 'x')};
  return contracts::make_compute_terminal(contracts::ComputeOperationOutcome::Succeeded, 0U, 2U, "result");
 }
-ValidationRuntimeResult FakeNonvisualComputeRuntime::Run(rfdetr::ValidateRequest, std::stop_token stop, const ComputeProgressSink& progress, const rfdetr::ValidationDelivery&) {
+ValidationRuntimeResult FakeNonvisualComputeRuntime::Run(rfdetr::ValidateRequest, std::stop_token stop, const ComputeProgressSink& progress, const rfdetr::ValidationDelivery&, std::uint64_t) {
  ValidationRuntimeResult result{.terminal = sequence_.Run(stop, progress)};
  if (result.terminal.outcome == contracts::ComputeOperationOutcome::Succeeded) {
   result.evaluation.emplace();
@@ -311,12 +311,12 @@ ValidationRuntimeResult FakeNonvisualComputeRuntime::Run(rfdetr::ValidateRequest
  }
  return result;
 }
-contracts::ComputeTerminal FakeNonvisualComputeRuntime::Run(ExportRunRequest, std::stop_token stop, const ComputeProgressSink& progress, const ComputeArtifactSink&) {
+contracts::ComputeTerminal FakeNonvisualComputeRuntime::Run(ExportRunRequest, std::stop_token stop, const ComputeProgressSink& progress, const ComputeArtifactSink&, std::uint64_t) {
  return sequence_.Run(stop, progress);
 }
 FakePredictRuntime::FakePredictRuntime(PredictionScenario scenario) : sequence_(std::move(scenario.compute)), scenario_(std::move(scenario)) {}
 contracts::ComputeTerminal FakePredictRuntime::Run(rfdetr::PredictRequest, std::stop_token stop, const ComputeProgressSink& progress, const ProductSink& products, const PlaybackGate&, VisualExtent,
- const ContextProvider& current_context, const PreviewRetirement& retirement, const ComputeArtifactSink&, const PredictionRunOutput&) {
+ const ContextProvider& current_context, const PreviewRetirement& retirement, const ComputeArtifactSink&, const PredictionRunOutput&, std::uint64_t) {
  if (scenario_.predictions) ++*scenario_.predictions;
  auto terminal = sequence_.Run(stop, progress);
  if (terminal.outcome != contracts::ComputeOperationOutcome::Succeeded) return terminal;

@@ -1,8 +1,17 @@
 #include "compute_runtime.h"
+#include "src/controller/contracts/application_boundary.h"
 #include <atomic>
 #include <exception>
 #include <stdexcept>
 namespace mmltk::controller {
+DirectComputeConfiguration resolve_compute_configuration(int device, int numa_node) {
+ if (device < 0) throw contracts::UnavailableError("selected CUDA device is unavailable");
+ try {
+  return {mmltk::frameworks::gpu::resolve_device_execution(device, mmltk::common::system::NumaTopology::Capture(), numa_node), numa_node};
+ } catch (const std::exception& error) {
+  throw contracts::UnavailableError("selected CUDA GPU " + std::to_string(device) + " is unavailable: " + error.what());
+ }
+}
 std::optional<mmltk::common::system::ExecutionPolicyRequest> DirectComputeConfiguration::worker_policy() const {
  if (!execution) return std::nullopt;
  return mmltk::common::system::ExecutionPolicyRequest{execution->placement.cpus, {}, 0, execution->placement.numa_node, -10, false};

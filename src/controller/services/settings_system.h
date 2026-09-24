@@ -53,7 +53,7 @@ class SettingsSystem final {
 public:
  using event_type = std::variant<SettingsChanged>;
  using settings_surface = SettingsSurface<&contracts::SettingsUiState::settings_state, &contracts::default_gui_settings_state>;
- explicit SettingsSystem(SystemEventSink<event_type> events = {});
+ explicit SettingsSystem(SystemEventSink<event_type> events = {}, std::vector<mmltk::frameworks::gpu::CudaDeviceFact> devices = {});
  [[nodiscard]] services::SettingsMutationResult Load(services::SettingsLocation, std::optional<bool> h2d_dataloader_override = std::nullopt);
  [[= contracts::reflection::direct::IntentEndpoint{}]] [[nodiscard]] contracts::SettingsUiState Update(contracts::SettingsUpdateRequest);
  [[= contracts::reflection::direct::IntentEndpoint{}]] [[nodiscard]] contracts::SettingsUiState Reset(contracts::SettingsResetRequest);

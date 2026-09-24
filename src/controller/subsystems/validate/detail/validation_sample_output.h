@@ -16,7 +16,7 @@ class ValidationSampleOutput final {
 public:
  ValidationSampleOutput(DirectComputeConfiguration, VisualDeviceSettings, ComputeArtifactSink, mmltk::backend::imaging::raster::RenderedImageWriter::PngEncoder = {});
  ~ValidationSampleOutput();
- void Begin(std::filesystem::path, contracts::ValidationRunPreview, std::span<const std::uint32_t>);
+ void Begin(std::filesystem::path, contracts::ValidationRunPreview, std::span<const std::uint32_t>, DirectComputeConfiguration = {});
  void UseCaptureContext(mmltk::frameworks::gpu::DeviceContext);
  [[nodiscard]] std::shared_ptr<const PredictionPreviewFrame> Capture(mmltk::backend::models::rfdetr::ValidationSampleView);
  void Finish(bool require_complete);

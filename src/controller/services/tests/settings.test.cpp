@@ -1893,3 +1893,27 @@ TEST_CASE("all workflow output selections persist current controls and independe
  CHECK_FALSE(document["workflows"]["predict"]["predict"].contains("output_path"));
  CHECK_FALSE(document["workflows"]["validate"]["validation"].contains("report_json_path"));
 }
+
+TEST_CASE("workflow GPU preferences persist independently of immutable CUDA inventory", "[gui][settings][gpu]") {
+ mmltk::testsupport::ScopedTempDir root{"workflow-gpu-settings"};
+ const SettingsLocation location{(root.path() / "gui.json").string()};
+ const std::vector<mmltk::frameworks::gpu::CudaDeviceFact> devices{{0, "First CUDA device", 12ULL << 30U}, {1, "Second CUDA device", 24ULL << 30U}};
+ mmltk::controller::SettingsSystem settings({}, devices);
+ REQUIRE(settings.Load(location).applied());
+ SettingsUpdateRequest update;
+ using Value = mmltk::frameworks::serialization::wire::FlatValue;
+ update.updates = {{.path = "workflows.validate.request.device_id", .value = Value{std::int64_t{7}}},
+  {.path = "workflows.predict.request.device_id", .value = Value{std::int64_t{5}}},
+  {.path = "workflows.export_state.device_id", .value = Value{std::int64_t{3}}}};
+ const auto changed = settings.Update(std::move(update));
+ CHECK(changed.cuda_devices == devices);
+ CHECK(changed.settings_state.workflows.validate.request.device_id == 7);
+ mmltk::controller::SettingsSystem reloaded;
+ REQUIRE(reloaded.Load(location).applied());
+ CHECK(reloaded.snapshot().settings_state == changed.settings_state);
+ CHECK(reloaded.snapshot().cuda_devices.empty());
+ CHECK(settings.materialization_facts().settings.workflows.predict.request.device_id == 5);
+ const auto persisted = snapshot_gui_settings(changed.settings_state).dump();
+ CHECK(persisted.find("CUDA device") == std::string::npos);
+ CHECK(persisted.find("cuda_devices") == std::string::npos);
+}

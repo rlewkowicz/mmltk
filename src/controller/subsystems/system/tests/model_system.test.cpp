@@ -7,6 +7,8 @@
 #include "src/controller/contracts/model_selection.h"
 #include "src/controller/services/settings_system.h"
 #include <atomic>
+#include <array>
+#include <vector>
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/matchers/catch_matchers.hpp>
 #include <cstdint>
@@ -31,7 +33,7 @@ namespace {
 [[nodiscard]] contracts::ModelSelection selected_model(const contracts::GuiSettingsState& settings, const contracts::FeatureId workflow) {
  const auto input = subsystems::system::ComputeIntentMaterializer::ModelInputFor(settings, workflow);
  REQUIRE(input);
- return {.key = input->key, .artifact = input->custom_artifact};
+ return {.key = input->key, .inspection_device = input->inspection_device, .artifact = input->custom_artifact};
 }
 TEST_CASE("export materialization uses one weights identity across all format selections", "[controller][systems][compute][export]") {
  auto settings = contracts::default_gui_settings_state();
@@ -75,6 +77,11 @@ TEST_CASE("model keys separate workflow artifacts from dataset splits and reject
  settings.workflows.predict.request.weights_path = "/tmp/predict.pt";
  settings.workflows.predict.model_source = contracts::ModelSelectionSource::Custom;
  settings.workflows.predict.model_input = contracts::ModelArtifactInputKind::Weights;
+ settings.workflows.train.request.device_ids = {3, 1};
+ settings.workflows.train.request.numa_nodes = {2, -1};
+ settings.workflows.validate.request.device_id = 5;
+ settings.workflows.predict.request.device_id = 7;
+ settings.workflows.export_state.device_id = 9;
  settings.workflows.export_state.build_tensorrt = false;
  settings.workflows.export_state.weights_path = "/tmp/export.pt";
  settings.workflows.export_state.model_source = contracts::ModelSelectionSource::Custom;
@@ -88,6 +95,8 @@ TEST_CASE("model keys separate workflow artifacts from dataset splits and reject
  const auto train = selected_model(settings, contracts::FeatureId::Train);
  const auto train_request = subsystems::system::ComputeIntentMaterializer::LocalTrain(settings, inspection, train);
  REQUIRE(train_request);
+ CHECK(train_request->device_ids == std::vector<int>{3, 1});
+ CHECK(train_request->numa_nodes == std::vector<int>{2, -1});
  CHECK(train_request->train_compiled_path == "/tmp/train.bin");
  CHECK(train_request->weights_path == "/tmp/train.pt");
  CHECK(train_request->test_compiled_path.empty());
@@ -116,6 +125,9 @@ TEST_CASE("model keys separate workflow artifacts from dataset splits and reject
  const auto validation = selected_model(settings, contracts::FeatureId::Validate);
  const auto validation_request = subsystems::system::ComputeIntentMaterializer::Validation(settings, inspection, validation);
  REQUIRE(validation_request);
+ CHECK(validation_request->device_id == 5);
+ CHECK(validation_request->compile_cuda_device_id == 5);
+ CHECK_FALSE(subsystems::system::ComputeIntentMaterializer::ModelInputFor(settings, contracts::FeatureId::Validate)->inspection_device);
  CHECK(validation_request->compiled_path == "/tmp/val.bin");
  CHECK(validation_request->weights_path.empty());
  CHECK(validation_request->onnx_path == "/tmp/validate.onnx");
@@ -124,6 +136,13 @@ TEST_CASE("model keys separate workflow artifacts from dataset splits and reject
  const auto predict = selected_model(settings, contracts::FeatureId::Predict);
  const auto predict_request = subsystems::system::ComputeIntentMaterializer::Predict(settings, inspection, predict);
  REQUIRE(predict_request);
+ CHECK(predict_request->device_id == 7);
+ CHECK_FALSE(subsystems::system::ComputeIntentMaterializer::ModelInputFor(settings, contracts::FeatureId::Predict)->inspection_device);
+ const auto export_model = selected_model(settings, contracts::FeatureId::Export);
+ const auto export_request = subsystems::system::ComputeIntentMaterializer::Export(settings, {}, export_model);
+ REQUIRE(export_request);
+ CHECK(export_request->onnx.device_id == 9);
+ CHECK_FALSE(subsystems::system::ComputeIntentMaterializer::ModelInputFor(settings, contracts::FeatureId::Export)->inspection_device);
  CHECK(predict_request->compiled_path == "/tmp/train.bin");
  CHECK(predict_request->weights_path == "/tmp/predict.pt");
  auto stale = settings;
@@ -142,6 +161,85 @@ TEST_CASE("model keys separate workflow artifacts from dataset splits and reject
  auto inconsistent = inspection;
  inconsistent.splits[1].class_names[0].value = "different";
  CHECK_FALSE(subsystems::system::ComputeIntentMaterializer::LocalTrain(settings, inconsistent, train));
+}
+TEST_CASE("ModelSystem records the CUDA ordinal used to inspect TensorRT", "[controller][systems][model]") {
+ class Inspector final : public ModelRuntime {
+ public:
+  explicit Inspector(std::vector<int>& devices) : devices_(devices) {}
+  ModelArtifactAdmission Acquire(const contracts::ModelSelectionKey&, const std::filesystem::path& artifact, int device, std::stop_token,
+   const std::function<void(const contracts::ModelProgress&)>&) override {
+   devices_.push_back(device);
+   return {.artifact = artifact.string()};
+  }
+ private:
+  std::vector<int>& devices_;
+ };
+ mmltk::testsupport::ScopedTempDir root{"model-inspection-device"};
+ auto draft = contracts::default_gui_settings_state();
+ draft.workflows.validate.model_source = contracts::ModelSelectionSource::Custom;
+ draft.workflows.validate.model_input = contracts::ModelArtifactInputKind::TensorRt;
+ draft.workflows.validate.request.tensorrt_path = "/tmp/model.engine";
+ draft.workflows.validate.request.device_id = 3;
+ const services::SettingsLocation location{(root.path() / "settings.json").string()};
+ REQUIRE(services::SettingsStore::save(location.value(), draft, 1U).succeeded());
+ SettingsSystem settings;
+ REQUIRE(settings.Load(location).applied());
+ std::vector<int> devices;
+ std::array<std::promise<contracts::ModelUiState>, 2> settled;
+ ModelSystem model{settings, [&] { return std::make_unique<Inspector>(devices); }, [&](const ModelSystem::event_type& event) {
+  if (const auto* changed = std::get_if<ModelChanged>(&event); changed && !changed->snapshot.active) settled.at(changed->snapshot.generation - 1U).set_value(changed->snapshot);
+ }};
+ contracts::ModelSelectionKey key;
+ for (const int device : {3, 7}) {
+  contracts::SettingsUpdateRequest edit;
+  edit.updates.push_back({.path = "workflows.validate.request.device_id", .value = mmltk::frameworks::serialization::wire::FlatValue{std::int64_t{device}}});
+  static_cast<void>(settings.Update(std::move(edit)));
+  static_cast<void>(model.Select({.workflow = contracts::FeatureId::Validate}));
+  const auto result = mmltk::testsupport::await_test_promise(settled[device == 3 ? 0U : 1U], "TensorRT inspection selection");
+  REQUIRE(result.terminal.outcome == contracts::ModelSelectionOutcome::Accepted);
+  CHECK(result.selection.inspection_device == device);
+  if (device == 3) key = result.selection.key;
+  else CHECK(result.selection.key == key);
+ }
+ CHECK(devices == std::vector<int>{3, 7});
+}
+TEST_CASE("TensorRT inspection is refused after only the selected GPU changes", "[controller][systems][compute][model]") {
+ for (const auto workflow : {contracts::FeatureId::Validate, contracts::FeatureId::Predict}) {
+  for (const auto input : {contracts::ModelArtifactInputKind::Weights, contracts::ModelArtifactInputKind::Onnx, contracts::ModelArtifactInputKind::TensorRt}) {
+   auto settings = contracts::default_gui_settings_state();
+   auto& validate = settings.workflows.validate;
+   auto& predict = settings.workflows.predict;
+   validate.model_source = predict.model_source = contracts::ModelSelectionSource::Custom;
+   validate.model_input = predict.model_input = input;
+   validate.request.weights_path = predict.request.weights_path = "/tmp/model.pt";
+   validate.request.onnx_path = predict.request.onnx_path = "/tmp/model.onnx";
+   validate.request.tensorrt_path = predict.request.tensorrt_path = "/tmp/model.engine";
+   validate.request.device_id = predict.request.device_id = 3;
+   validate.request.compiled_path = "/tmp/val.bin";
+   predict.source.kind = contracts::SourceKind::SingleImage;
+   predict.source.single_image_path = "/tmp/image.png";
+   const contracts::ArtifactInspection inspection{.compatible = true, .splits = {split("/tmp/val.bin")}, .detail = {}};
+   const auto admitted = selected_model(settings, workflow);
+   const auto materializes = [&](const auto& model) {
+    return workflow == contracts::FeatureId::Validate ? bool(subsystems::system::ComputeIntentMaterializer::Validation(settings, inspection, model))
+                                                     : bool(subsystems::system::ComputeIntentMaterializer::Predict(settings, {}, model));
+   };
+   REQUIRE(materializes(admitted));
+   validate.request.device_id = predict.request.device_id = 7;
+   const auto replacement = selected_model(settings, workflow);
+   CHECK(admitted.key == replacement.key);
+   CHECK(admitted.artifact == replacement.artifact);
+   CHECK(materializes(admitted) == (input != contracts::ModelArtifactInputKind::TensorRt));
+   CHECK(materializes(replacement));
+   if (input == contracts::ModelArtifactInputKind::TensorRt) {
+    CHECK(admitted.inspection_device == 3);
+    CHECK(replacement.inspection_device == 7);
+   } else {
+    CHECK_FALSE(admitted.inspection_device);
+    CHECK_FALSE(replacement.inspection_device);
+   }
+  }
+ }
 }
 TEST_CASE("validation materializes inherited and independent dataset sources", "[controller][systems][compute]") {
  auto settings = contracts::default_gui_settings_state();

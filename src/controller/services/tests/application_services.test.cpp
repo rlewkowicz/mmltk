@@ -64,6 +64,9 @@ constexpr std::array kDiagnosticOwners{
  std::pair{contracts::DiagnosticOwner::Presentation, std::string_view{"presentation"}},
  std::pair{contracts::DiagnosticOwner::AnnotationResource, std::string_view{"annotation_resource"}},
  std::pair{contracts::DiagnosticOwner::Training, std::string_view{"training"}},
+ std::pair{contracts::DiagnosticOwner::Validation, std::string_view{"validation"}},
+ std::pair{contracts::DiagnosticOwner::Export, std::string_view{"export"}},
+ std::pair{contracts::DiagnosticOwner::Prediction, std::string_view{"prediction"}},
 };
 static_assert(kDiagnosticOwners.size() == mmltk::frameworks::reflection::enum_entries<contracts::DiagnosticOwner>().size());
 static_assert([] {

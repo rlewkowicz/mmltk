@@ -2,6 +2,7 @@
 #include <cstdint>
 #include <cstddef>
 #include <string>
+#include <optional>
 #include "src/controller/contracts/workflows.h"
 #include "src/frameworks/reflection/field_policy.h"
 #include "mmltk/frameworks/reflection/materializer.h"
@@ -26,6 +27,7 @@ struct ModelSelectionKey final {
 // A draft projection is not an admitted model; its key may be incomplete.
 struct ModelSettingsProjection final {
  ModelSelectionKey key{};
+ std::optional<std::int32_t> inspection_device{};
  [[= mmltk::frameworks::reflection::MaxBytes{kModelArtifactCapacity}]] std::string artifact;
  bool compatible = false;
  bool operator==(const ModelSettingsProjection&) const = default;

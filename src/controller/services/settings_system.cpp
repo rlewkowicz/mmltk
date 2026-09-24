@@ -1,5 +1,6 @@
 #include "src/controller/services/settings_system.h"
 #include <concepts>
+#include <stdexcept>
 #include <span>
 #include <string_view>
 #include <variant>
@@ -123,7 +124,10 @@ void select_data_loading(contracts::GuiSettingsState& state, const bool h2d) {
  });
 }
 }  // namespace
-SettingsSystem::SettingsSystem(SystemEventSink<event_type> events) : events_(std::move(events)) {}
+SettingsSystem::SettingsSystem(SystemEventSink<event_type> events, std::vector<mmltk::frameworks::gpu::CudaDeviceFact> devices) : events_(std::move(events)) {
+ if (devices.size() > mmltk::frameworks::gpu::kCudaDeviceCapacity) throw std::invalid_argument("CUDA device inventory exceeds capacity");
+ state_.cuda_devices = std::move(devices);
+}
 services::SettingsMutationResult SettingsSystem::Load(services::SettingsLocation location, const std::optional<bool> h2d_dataloader_override) {
  services::SettingsMutationResult result;
  {

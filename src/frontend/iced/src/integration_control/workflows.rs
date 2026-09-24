@@ -86,6 +86,8 @@ impl Retention {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Step {
+    GpuSelect(FeatureId, i32),
+    GpuReady(FeatureId),
     Train,
     StartTrain,
     Training,
@@ -197,6 +199,11 @@ pub(super) enum Step {
 
 #[derive(Default)]
 pub(super) struct State {
+    gpu_completed: [bool; 4],
+    gpu_admitted: [u64; 4],
+    gpu_return: Option<Step>,
+    gpu_target: i32,
+    gpu_revision: u64,
     chart_bounds: Rectangle,
     chart_view: Option<crate::view::metrics::ChartView>,
     chart_sequence: Option<u64>,
@@ -1590,6 +1597,7 @@ impl State {
             return;
         }
         driver.phase = Phase::Workflows(match step {
+            Step::GpuSelect(feature, _) => Step::GpuReady(feature),
             Step::ExpandChart => Step::ExpandedBounds,
             Step::BackToCharts => Step::ChartSettle(Retention::Back),
             Step::ChartSelector => Step::ChartHide,
@@ -1658,11 +1666,62 @@ impl State {
         router: &crate::view::router::Router,
     ) -> Task<RootMessage> {
         let settled = !settings.has_local_edits();
+        let entry = match step {
+            Step::StartTrain => Some(FeatureId::Train),
+            Step::StartValidate => Some(FeatureId::Validate),
+            Step::Source(0) => Some(FeatureId::Predict),
+            Step::PrepareExport => Some(FeatureId::Export),
+            _ => None,
+        };
+        if let Some(feature) = entry.filter(|feature| active == *feature && settled && !self.gpu_completed[gpu_index(*feature)]) {
+            let Some(inventory) = model.settings_snapshot.as_ref().map(|snapshot| &snapshot.cudadevices) else { return Task::none(); };
+            let Some(device) = inventory.last() else { driver.fail("Workflow GPU inventory is empty"); return Task::none(); };
+            self.gpu_target = device.ordinal;
+            self.gpu_revision = 0;
+            self.gpu_return = Some(step);
+            return self.workflow_step(driver, Step::GpuReady(feature));
+        }
+        if let Step::GpuReady(feature) = step {
+            if !settled { return Task::none(); }
+            let Some(snapshot) = model.settings_snapshot.as_ref() else { return Task::none(); };
+            if self.gpu_revision != 0 && snapshot.revision <= self.gpu_revision { return Task::none(); }
+            self.gpu_revision = 0;
+            let selected = workflow::gpu::selected(feature, &snapshot.settingsstate);
+            if selected != [self.gpu_target] {
+                let device = if selected.contains(&self.gpu_target) { *selected.iter().find(|device| **device != self.gpu_target).unwrap() } else { self.gpu_target };
+                return self.workflow_step(driver, Step::GpuSelect(feature, device));
+            }
+            self.gpu_completed[gpu_index(feature)] = true;
+            reporting::emit(|sink| sink.record("integration.workflow_gpu_selected", gpu_name(feature), "settled", [self.gpu_target as f64, snapshot.revision as f64, snapshot.cudadevices.len() as f64, 1.0]));
+            let Some(next) = self.gpu_return.take() else { driver.fail("Missing GPU selection continuation"); return Task::none(); };
+            return Task::batch([self.workflow_step(driver, next), iced::advanced::widget::operate(GpuLayout::new(feature, "light"))]);
+        }
+        if let Step::GpuSelect(feature, device) = step {
+            self.gpu_revision = model.settings_snapshot.as_ref().map_or(0, |snapshot| snapshot.revision);
+            return self.workflow_control(widgets, driver, format!("{}.gpu.device.{device}", gpu_name(feature)));
+        }
         let train = model.workflow.training.as_ref();
         let validation = model.workflow.validation.as_ref();
         let prediction = model.predict_snapshot.as_ref();
         let record = train.and_then(|value| value.metrics.as_ref());
         if crate::integration_control::reporting_enabled() {
+            for (feature, operation) in [
+                (FeatureId::Train, train.map(|value| &value.local)),
+                (FeatureId::Validate, validation.map(|value| &value.operation)),
+                (FeatureId::Predict, prediction.map(|value| &value.operation)),
+                (FeatureId::Export, model.workflow.export.as_ref()),
+            ] {
+                if let Some(operation) = operation {
+                    let generation = operation.generationfrontier;
+                    let previous = &mut self.gpu_admitted[gpu_index(feature)];
+                    if generation > *previous {
+                        *previous = generation;
+                        reporting::emit(|sink| sink.record(
+                            "integration.workflow.operation_admitted", gpu_name(feature), "snapshot",
+                            [generation as f64, 0.0, 0.0, 0.0]));
+                    }
+                }
+            }
             let work = match step {
                 Step::Training | Step::HiddenTrain | Step::Trained => {
                     train.map(|value| (FeatureId::Train, &value.local))
@@ -1692,6 +1751,7 @@ impl State {
                 );
                 if self.work_progress != Some(current) {
                     self.work_progress = Some(current);
+
                     reporting::emit(|sink| {
                         sink.record(
                             "integration.workflow.operation_progress",
@@ -2895,7 +2955,7 @@ impl State {
                         .is_some_and(|value| value.ui.darkmode) =>
             {
                 completed("theme", [1.0, 0.0, 0.0, 0.0]);
-                self.workflow_step(driver, Step::Pixels(Picture::Theme, 0))
+                Task::batch([self.workflow_step(driver, Step::Pixels(Picture::Theme, 0)), iced::advanced::widget::operate(GpuLayout::new(FeatureId::Train, "dark"))])
             }
             Step::Narrow => {
                 match annotation_layout_scale(driver.input_scale, model.window_width as f32, true) {
@@ -2919,7 +2979,7 @@ impl State {
                 if settled && (driver.input_scale - self.narrow_scale).abs() < 0.001 =>
             {
                 self.export_narrow = true;
-                self.workflow_step(driver, Step::Export)
+                Task::batch([self.workflow_step(driver, Step::Export), iced::advanced::widget::operate(GpuLayout::new(FeatureId::Train, "narrow"))])
             }
             Step::Pixels(picture, index) => {
                 self.caption_patches.clear();
@@ -3089,6 +3149,36 @@ impl iced::advanced::widget::Operation<RootMessage> for ValidationLayout {
                     [1.0, 0.0, 0.0, 0.0],
                 )
             });
+        }
+        iced::advanced::widget::operation::Outcome::None
+    }
+}
+
+fn gpu_index(feature: FeatureId) -> usize {
+    match feature { FeatureId::Train => 0, FeatureId::Validate => 1, FeatureId::Predict => 2, FeatureId::Export => 3, _ => unreachable!() }
+}
+fn gpu_name(feature: FeatureId) -> &'static str {
+    match feature { FeatureId::Train => "train", FeatureId::Validate => "validate", FeatureId::Predict => "predict", FeatureId::Export => "export", _ => unreachable!() }
+}
+struct GpuLayout {
+    feature: FeatureId,
+    stage: &'static str,
+    bounds: std::collections::BTreeMap<String, Rectangle>,
+}
+impl GpuLayout {
+    fn new(feature: FeatureId, stage: &'static str) -> Self { Self { feature, stage, bounds: Default::default() } }
+}
+impl iced::advanced::widget::Operation<RootMessage> for GpuLayout {
+    fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn iced::advanced::widget::Operation<RootMessage>)) { operate(self); }
+    fn container(&mut self, id: Option<&iced::advanced::widget::Id>, bounds: Rectangle) {
+        for card in ["output", "gpu", "status"] {
+            let control = format!("{}.card.{card}", gpu_name(self.feature));
+            if id == Some(&iced::advanced::widget::Id::from(control.clone())) { self.bounds.insert(control, bounds); }
+        }
+    }
+    fn finish(&self) -> iced::advanced::widget::operation::Outcome<RootMessage> {
+        for (control, bounds) in &self.bounds {
+            reporting::emit(|sink| sink.record("integration.workflow_gpu_layout", control, self.stage, [bounds.x as f64, bounds.y as f64, bounds.width as f64, bounds.height as f64]));
         }
         iced::advanced::widget::operation::Outcome::None
     }

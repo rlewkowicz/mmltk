@@ -1,4 +1,5 @@
 #pragma once
+#include "src/controller/services/runtime_diagnostics.h"
 #include <filesystem>
 #include <memory>
 #include <optional>
@@ -14,17 +15,22 @@ struct ValidationRuntimeResult final {
 class ValidationRuntime {
 public:
  virtual ~ValidationRuntime() = default;
+ virtual void Close() {}
+ [[nodiscard]] virtual bool HasUnsafeCustody() const noexcept { return false; }
  [[nodiscard]] virtual ValidationRuntimeResult Run(
-  mmltk::backend::models::rfdetr::ValidateRequest, std::stop_token, const ComputeProgressSink&, const mmltk::backend::models::rfdetr::ValidationDelivery&) = 0;
+  mmltk::backend::models::rfdetr::ValidateRequest, std::stop_token, const ComputeProgressSink&, const mmltk::backend::models::rfdetr::ValidationDelivery&, std::uint64_t generation = 0) = 0;
 };
 class CudaValidationRuntime final : public ValidationRuntime {
 public:
- explicit CudaValidationRuntime(DirectComputeConfiguration);
+ explicit CudaValidationRuntime(DirectComputeConfiguration, services::RuntimeDiagnosticTarget = {});
  ~CudaValidationRuntime() override;
+ void Close() override;
+ [[nodiscard]] bool HasUnsafeCustody() const noexcept override;
  [[nodiscard]] ValidationRuntimeResult Run(
-  mmltk::backend::models::rfdetr::ValidateRequest, std::stop_token, const ComputeProgressSink&, const mmltk::backend::models::rfdetr::ValidationDelivery&) override;
+  mmltk::backend::models::rfdetr::ValidateRequest, std::stop_token, const ComputeProgressSink&, const mmltk::backend::models::rfdetr::ValidationDelivery&, std::uint64_t generation = 0) override;
 
 private:
+ services::RuntimeDiagnosticTarget diagnostics_;
  class Impl;
  std::unique_ptr<Impl> impl_;
 };

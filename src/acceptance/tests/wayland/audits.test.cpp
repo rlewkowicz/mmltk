@@ -2748,3 +2748,49 @@ TEST_CASE("prediction output evidence decodes real files and rejects suffix-only
  CHECK_FALSE(audit.prediction_outputs[1]);
 }
 }  // namespace mmltk::acceptance::wayland
+
+TEST_CASE("workflow GPU evidence requires ordered cards and selected native runs", "[workspace][audit][gpu]") {
+ mmltk::acceptance::wayland::BrowserAudit audit;
+ for (const std::string name : {"train", "validate", "predict", "export"}) {
+  audit.workflow_gpu_selected[name] = {1, 3, 2, 1};
+  audit.workflow_gpu_operations[name].insert(1U);
+  audit.consume({{"event", "integration.workflow.operation_admitted"}, {"control", name}, {"a", 1U}});
+  audit.consume_native_gpu({{"event", "workflow.gpu_execution"}, {"participant", name},
+   {"owner", name == "train" ? "training" : name == "validate" ? "validation" : name == "predict" ? "prediction" : "export"},
+   {"sequence", 1U}, {"value", 0U}, {"detail", 1U}, {"device", 1}});
+  for (const std::string stage : {"light", "dark", "narrow"}) {
+   audit.workflow_gpu_layout[{stage, name + ".card.output"}] = {100, 100, 200, 70};
+   audit.workflow_gpu_layout[{stage, name + ".card.gpu"}] = {100, 180, 200, 120};
+   audit.workflow_gpu_layout[{stage, name + ".card.status"}] = {100, 310, 200, 200};
+  }
+ }
+ REQUIRE(audit.workflow_gpus_complete());
+ SECTION("admitted cancellation without progress needs no invented execution") {
+  audit.consume({{"event", "integration.workflow.operation_admitted"}, {"control", "export"}, {"a", 2U}});
+  CHECK(audit.workflow_gpus_complete());
+  return;
+ }
+ SECTION("admitted execution before progress is accepted") {
+  audit.consume({{"event", "integration.workflow.operation_admitted"}, {"control", "export"}, {"a", 2U}});
+  audit.consume_native_gpu({{"event", "workflow.gpu_execution"}, {"participant", "export"}, {"owner", "export"}, {"sequence", 2U}, {"value", 0U}, {"detail", 1U}, {"device", 1}});
+  CHECK(audit.workflow_gpus_complete());
+  return;
+ }
+ SECTION("extra native generation has no admission") {
+  audit.consume_native_gpu({{"event", "workflow.gpu_execution"}, {"participant", "export"}, {"owner", "export"}, {"sequence", 2U}, {"value", 0U}, {"detail", 1U}, {"device", 1}});
+ }
+ SECTION("missing workflow") { audit.workflow_gpu_runs.erase({"export", 1U}); }
+ SECTION("wrong native selection") { audit.workflow_gpu_runs[{"predict", 1U}][0] = 0; }
+ SECTION("unobserved operation cannot satisfy evidence") { audit.workflow_gpu_operations["export"] = {2U}; }
+ SECTION("frontend selector echo is not native evidence") {
+  audit.workflow_gpu_runs.erase({"export", 1U});
+  audit.consume({{"event", "integration.workflow_gpu_run"}, {"control", "export"}, {"a", 1}, {"b", 1}, {"c", 1}, {"d", 1}});
+ }
+ SECTION("duplicate native rank") { audit.consume_native_gpu({{"event", "workflow.gpu_execution"}, {"participant", "train"}, {"owner", "training"}, {"sequence", 1U}, {"value", 0U}, {"detail", 1U}, {"device", 1}}); }
+ SECTION("missing native rank") { audit.workflow_gpu_runs[{"train", 1U}] = {1, -1}; }
+ SECTION("card above output") { audit.workflow_gpu_layout[{"light", "validate.card.gpu"}][1] = 0; }
+ SECTION("status before GPU") { audit.workflow_gpu_layout[{"light", "train.card.status"}][1] = 100; }
+ SECTION("narrow missing") { audit.workflow_gpu_layout.erase({"narrow", "train.card.gpu"}); }
+ SECTION("multi GPU falls back to zero") { audit.workflow_gpu_selected["export"][0] = audit.workflow_gpu_runs[{"export", 1U}][0] = 0; }
+ CHECK_FALSE(audit.workflow_gpus_complete());
+}

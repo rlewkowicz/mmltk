@@ -50,7 +50,7 @@ public:
  mmltk::backend::models::rfdetr::TrainingCheckpointAdmission InspectCheckpoint(const std::filesystem::path& path, std::stop_token stop) override {
   return inspection_ ? inspection_(path, stop) : TrainingRuntime::InspectCheckpoint(path, stop);
  }
- contracts::ComputeTerminal Train(mmltk::backend::models::rfdetr::TrainRequest, const std::stop_token stop, const std::function<void(const services::TrainProcessProgress&)>& progress) override {
+ contracts::ComputeTerminal Train(mmltk::backend::models::rfdetr::TrainRequest, const std::stop_token stop, const std::function<void(const services::TrainProcessProgress&)>& progress, std::uint64_t) override {
   progress({.progress = fail_ ? contracts::ComputeProgress{.sequence = 0U, .status = std::string(contracts::kComputeStatusCapacity + 1U, 'x')}
                               : contracts::ComputeProgress{.sequence = 1U, .completed = 1U, .total = 1U, .status = "trained"}});
   if (!gate_->Wait(stop)) return contracts::make_compute_terminal(contracts::ComputeOperationOutcome::Cancelled);
@@ -94,7 +94,7 @@ struct QueryCancellationProbe final {
 class BlockingCancellationTrainingRuntime final : public TrainingRuntime {
 public:
  explicit BlockingCancellationTrainingRuntime(std::shared_ptr<QueryCancellationProbe> probe) : probe_(std::move(probe)) {}
- contracts::ComputeTerminal Train(mmltk::backend::models::rfdetr::TrainRequest, std::stop_token, const std::function<void(const services::TrainProcessProgress&)>&) override {
+ contracts::ComputeTerminal Train(mmltk::backend::models::rfdetr::TrainRequest, std::stop_token, const std::function<void(const services::TrainProcessProgress&)>&, std::uint64_t) override {
   return contracts::make_compute_terminal(contracts::ComputeOperationOutcome::Succeeded);
  }
  contracts::ProviderQueryResult Query(const contracts::ProviderPreferences&, const std::stop_token stop) override {
@@ -118,7 +118,7 @@ private:
 class BlockingRemoteRuntime final : public TrainingRuntime {
 public:
  explicit BlockingRemoteRuntime(std::shared_ptr<mmltk::testsupport::StopGate> remote_gate) : remote_gate_(std::move(remote_gate)) {}
- contracts::ComputeTerminal Train(mmltk::backend::models::rfdetr::TrainRequest, std::stop_token, const std::function<void(const services::TrainProcessProgress&)>&) override {
+ contracts::ComputeTerminal Train(mmltk::backend::models::rfdetr::TrainRequest, std::stop_token, const std::function<void(const services::TrainProcessProgress&)>&, std::uint64_t) override {
   return contracts::make_compute_terminal(contracts::ComputeOperationOutcome::Succeeded);
  }
  contracts::ProviderQueryResult Query(const contracts::ProviderPreferences&, std::stop_token) override { return {.outcome = contracts::ProviderQueryOutcome::Succeeded, .offers = {provider_offer()}}; }

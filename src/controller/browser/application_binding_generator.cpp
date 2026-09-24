@@ -845,11 +845,13 @@ private:
     }
     output_ << ",\n";
    });
-   output_ << "}, artifact: String::new(), compatible: false";
+   output_ << "}, inspectiondevice: None, artifact: String::new(), compatible: false";
    output_ << " }); }\nif settings." << RustMemberPath<Settings, Relation::input>() << " == ModelArtifactInputKind::" << rust_identifier(mmltk::frameworks::reflection::enum_name(row.input), true)
            << " { let projection = result.as_mut().unwrap();\n";
    Relation::artifact_relation::VisitMembers(
     [&]<class Entry>() { output_ << "projection." << RustMemberPath<ModelSettingsProjection, Entry::destination>() << " = settings." << RustMemberPath<Settings, Entry::source>() << ".clone();\n"; });
+   if constexpr (requires { Relation::inspection_device; })
+    output_ << "projection.inspectiondevice = Some(settings." << RustMemberPath<Settings, Relation::inspection_device>() << ");\n";
    output_ << "projection.compatible = match projection.key.source { ModelSelectionSource::Canonical => " << (row.canonical_allowed ? "true" : "false") << ", ModelSelectionSource::Custom => "
            << (row.custom_allowed ? "true" : "false") << " };\n} }\n";
   });

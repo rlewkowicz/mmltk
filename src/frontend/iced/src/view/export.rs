@@ -6,6 +6,7 @@ use iced::widget::{button, column};
 
 #[derive(Debug, Clone)]
 pub enum Message {
+    Gpu(crate::view::workflow::gpu::Message),
     Output(crate::view::workflow::output::Message),
     StartRequested,
     StopRequested,
@@ -223,7 +224,7 @@ impl Component {
             setup,
             workspace,
             advanced,
-            column![output_card, diagnostics]
+            column![output_card, crate::view::workflow::gpu::view(crate::generated::FeatureId::Export, model, settings).map(Message::Gpu), crate::view::shared::identified("export.card.status", diagnostics)]
                 .spacing(crate::view::workflow::SECTION_SPACING)
                 .into(),
         )
@@ -237,6 +238,7 @@ impl Component {
         message: Message,
     ) -> Result<Option<Outcome>, String> {
         let outcome = match message {
+            Message::Gpu(message) => Outcome::SettingsEdited(crate::view::workflow::gpu::update(crate::generated::FeatureId::Export, settings, message)?),
             Message::Output(crate::view::workflow::output::Message::Browse(id)) => {
                 Outcome::DialogRequested(id)
             }

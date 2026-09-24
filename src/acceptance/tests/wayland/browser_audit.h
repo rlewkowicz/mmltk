@@ -81,6 +81,13 @@ struct AtlasDrawAudit final {
  void consume(const nlohmann::json& record);
 };
 struct BrowserAudit final {
+ std::map<std::pair<std::string, std::string>, std::array<double, 4>> workflow_gpu_layout;
+ std::map<std::string, std::array<double, 4>> workflow_gpu_selected;
+ std::map<std::pair<std::string, std::uint64_t>, std::vector<std::int64_t>> workflow_gpu_runs;
+ std::map<std::string, std::set<std::uint64_t>> workflow_gpu_operations, workflow_gpu_admissions;
+ bool workflow_gpu_invalid = false;
+ void consume_native_gpu(const nlohmann::json& record);
+ [[nodiscard]] bool workflow_gpus_complete() const;
  bool validate_to_explore_pixels = false;
  std::vector<nlohmann::json> validation_saved_samples;
  std::vector<nlohmann::json> validation_progressive, validation_restored_tiles;

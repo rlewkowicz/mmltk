@@ -804,6 +804,10 @@ auto BrowserAudit::consume(const nlohmann::json& record) -> void {
   validation_restored_tiles.push_back(record);
  } else if (event == "integration.validation_saved_sample") {
   validation_saved_samples.push_back(record);
+ } else if (event == "integration.workflow_gpu_layout") {
+  workflow_gpu_layout[{record.value("detail", ""), record.value("control", "")}] = {numeric(record, "a"), numeric(record, "b"), numeric(record, "c"), numeric(record, "d")};
+ } else if (event == "integration.workflow_gpu_selected") {
+  workflow_gpu_selected[record.value("control", "")] = {numeric(record, "a"), numeric(record, "b"), numeric(record, "c"), numeric(record, "d")};
  } else if (event == "integration.validation_layout") {
   validation_layout[{record.value("detail", ""), record.value("control", "")}] = {numeric(record, "a"), numeric(record, "b"), numeric(record, "c"), numeric(record, "d")};
  } else if (event == "integration.validation_text") {
@@ -868,12 +872,26 @@ auto BrowserAudit::consume(const nlohmann::json& record) -> void {
    prediction_failure.capture("prediction saved-media verification failed", record, [&] {
     return nlohmann::json{{"directory_admitted", directory}, {"no_json", no_json}, {"samples", samples}, {"processed", processed}};
    });
+ } else if (event == "integration.workflow.operation_admitted") {
+  const auto name = record.value("control", "");
+  const auto generation = scalar(record, "a");
+  if ((name != "train" && name != "validate" && name != "predict" && name != "export") || generation == 0U) workflow_gpu_invalid = true;
+  else {
+   auto& admissions = workflow_gpu_admissions[name];
+   if (admissions.size() >= 64U && !admissions.contains(generation)) workflow_gpu_invalid = true;
+   else admissions.insert(generation);
+  }
  } else if (event == "integration.workflow.operation_progress") {
   constexpr std::array<std::string_view, 4U> primary_controls{"train.primary", "validate.primary", "predict.primary", "export.primary"};
   const auto control = std::ranges::find(primary_controls, record.value("control", ""));
   const auto native_progress = std::pair{scalar(record, "a"), scalar(record, "b")};
   if (control != primary_controls.end() && native_progress.first != 0U && native_progress.second != 0U && phase_progress_class == "work" &&
       phase_progress_name == "Workflows(" + record.value("detail", "") + ")") {
+   auto name = std::string{*control};
+   name.resize(name.find('.'));
+   auto& observed = workflow_gpu_operations[name];
+   if (observed.size() >= 64U && !observed.contains(native_progress.first)) workflow_gpu_invalid = true;
+   else observed.insert(native_progress.first);
    auto& prior = workflow_progress[static_cast<std::size_t>(control - primary_controls.begin())];
    if (native_progress > prior) {
     prior = native_progress;
@@ -2217,6 +2235,59 @@ bool BrowserAudit::validation_confidence_complete() const {
       !(numeric(pixels, "minimum") >= 0.0 && numeric(pixels, "maximum") < 1.0) || scalar(pixels, "revision") != scalar(validation_confidence_edits[index + 6U], "c") ||
       (index == 1U ? scalar(pixels, "different") < 12U : scalar(pixels, "different") != 0U))
    return false;
+ }
+ return true;
+}
+void BrowserAudit::consume_native_gpu(const nlohmann::json& record) {
+ if (record.value("event", "") != "workflow.gpu_execution") return;
+ const auto name = record.value("participant", "");
+ const auto owner = record.value("owner", "");
+ const bool valid_owner = (name == "train" && owner == "training") || (name == "validate" && owner == "validation") ||
+  (name == "predict" && owner == "prediction") || (name == "export" && owner == "export");
+ const auto generation = scalar(record, "sequence"), rank = scalar(record, "value"), count = scalar(record, "detail");
+ const auto device = record.value("device", std::int64_t{-1});
+ const auto key = std::pair{name, generation};
+ if (!valid_owner || generation == 0U || count == 0U || count > 64U || rank >= count || device < 0 ||
+     (name != "train" && count != 1U) || (workflow_gpu_runs.size() >= 256U && !workflow_gpu_runs.contains(key))) {
+  workflow_gpu_invalid = true;
+  return;
+ }
+ auto found = workflow_gpu_runs.try_emplace(key, count, -1).first;
+ auto& ranks = found->second;
+ if (ranks.size() != count || ranks[rank] != -1) { workflow_gpu_invalid = true; return; }
+ ranks[rank] = device;
+}
+bool BrowserAudit::workflow_gpus_complete() const {
+ if (workflow_gpu_invalid) return false;
+ for (const auto& [key, ranks] : workflow_gpu_runs) {
+  const auto& [name, generation] = key;
+  const auto admission = workflow_gpu_admissions.find(name);
+  const auto selection = workflow_gpu_selected.find(name);
+  if (admission == workflow_gpu_admissions.end() || !admission->second.contains(generation) || selection == workflow_gpu_selected.end() ||
+      ranks.size() != 1U || ranks.front() != selection->second[0]) return false;
+ }
+ for (const std::string name : {"train", "validate", "predict", "export"}) {
+  const auto selected = workflow_gpu_selected.find(name);
+  const auto operations = workflow_gpu_operations.find(name);
+  if (selected == workflow_gpu_selected.end() || operations == workflow_gpu_operations.end() || operations->second.empty()) return false;
+  const auto& choice = selected->second;
+  if (!std::isfinite(choice[0]) || choice[0] < 0 || choice[0] != std::floor(choice[0]) || choice[1] <= 0 || choice[2] <= 0 || choice[3] != 1 ||
+      (choice[2] > 1 && choice[0] == 0)) return false;
+  for (const auto generation : operations->second) {
+   const auto run = workflow_gpu_runs.find({name, generation});
+   if (run == workflow_gpu_runs.end() || run->second.size() != 1U || run->second.front() != choice[0]) return false;
+  }
+  for (const std::string stage : {"light", "dark", "narrow"}) {
+   if (stage != "light" && name != "train") continue;
+   const auto output = workflow_gpu_layout.find({stage, name + ".card.output"});
+   const auto gpu = workflow_gpu_layout.find({stage, name + ".card.gpu"});
+   const auto status = workflow_gpu_layout.find({stage, name + ".card.status"});
+   if (output == workflow_gpu_layout.end() || gpu == workflow_gpu_layout.end() || status == workflow_gpu_layout.end()) return false;
+   const auto bounds = [](const auto& values) { return Bounds{values[0], values[1], values[2], values[3]}; };
+   const auto a = bounds(output->second), b = bounds(gpu->second), c = bounds(status->second);
+   if (!a.valid() || !b.valid() || !c.valid() || std::abs(a.x - b.x) > 1 || std::abs(b.x - c.x) > 1 || std::abs(a.width - b.width) > 1 || std::abs(b.width - c.width) > 1 ||
+       std::abs(b.y - a.y - a.height - 10) > 1 || std::abs(c.y - b.y - b.height - 10) > 1) return false;
+  }
  }
  return true;
 }

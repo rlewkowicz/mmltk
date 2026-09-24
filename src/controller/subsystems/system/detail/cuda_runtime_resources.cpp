@@ -31,61 +31,108 @@ void RunWithRetainedCudaContext(std::shared_ptr<void> state, frameworks::gpu::Te
   throw;
  }
 }
-CudaRuntimeResources::CudaRuntimeResources(const DirectComputeConfiguration config, Close close)
-    : configuration_(config), device_(config.execution ? config.execution->device : -1), close_(std::move(close)) {
+struct CudaRuntimeResources::State final {
+ DirectComputeConfiguration configuration;
+ Operations operations;
+ int device = -1;
+ cudaStream_t stream = nullptr;
+ Close close;
+ cudaError_t failure = cudaSuccess;
+ void RecordFailure(cudaError_t status) noexcept { if (failure == cudaSuccess) failure = status; }
+};
+CudaRuntimeResources::CudaRuntimeResources(const DirectComputeConfiguration config, Close close) : CudaRuntimeResources(config, std::move(close), Operations{}) {}
+CudaRuntimeResources::CudaRuntimeResources(const DirectComputeConfiguration config, Close close, Operations operations)
+    : state_(std::make_shared<State>(State{config, operations, config.execution ? config.execution->device : -1, nullptr, std::move(close)})),
+      lease_(frameworks::gpu::ReserveTerminalCudaLease(retirement_)) {
  if (!config.valid()) throw contracts::UnavailableError("compute CUDA device is unavailable");
- WithExecution([this] {
-  const auto status = cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking);
-  if (status != cudaSuccess) throw std::runtime_error(cudaGetErrorString(status));
- });
+ if (!operations.create || !operations.synchronize || !operations.destroy) throw std::invalid_argument("compute CUDA operations are unavailable");
+ try { WithExecution([this] {
+  const auto status = state_->operations.create(state_->operations.context, &state_->stream, cudaStreamNonBlocking);
+  if (status != cudaSuccess) {
+   if (state_->stream) Retain(status);
+   throw mmltk::backend::ml::runtime::CudaOperationError{status, "compute stream creation"};
+  }
+ }); } catch (...) {
+  const auto failure = std::current_exception();
+  if (state_->stream) Release();
+  if (HasUnsafeCustody()) throw frameworks::gpu::ImageStreamExecutionFailure(failure);
+  std::rethrow_exception(failure);
+ }
 }
-CudaRuntimeResources::~CudaRuntimeResources() noexcept {
+CudaRuntimeResources::~CudaRuntimeResources() noexcept { Release(); }
+void CudaRuntimeResources::Release() noexcept {
+ if (HasUnsafeCustody()) return;
  try {
+  CloseSession();
   WithDevice([this] {
-   if (close_) {
-    try {
-     close_();
-    } catch (...) {}
-   }
-   if (stream_ != nullptr) {
-    static_cast<void>(cudaStreamSynchronize(stream_));
-    static_cast<void>(cudaStreamDestroy(stream_));
-    stream_ = nullptr;
-   }
+   if (!state_->stream) return;
+   const auto status = state_->operations.destroy(state_->operations.context, state_->stream);
+   if (status != cudaSuccess) { Retain(status); throw mmltk::backend::ml::runtime::CudaOperationError{status, "compute stream destruction"}; }
+   state_->stream = nullptr;
   });
- } catch (...) {}
+ } catch (...) { Retain(cudaErrorUnknown); }
+}
+int CudaRuntimeResources::device() const noexcept { return state_->device; }
+bool CudaRuntimeResources::HasUnsafeCustody() const noexcept { return !retirement_.admission_open(); }
+void CudaRuntimeResources::Retain(cudaError_t failure) noexcept {
+ state_->RecordFailure(failure);
+ if (lease_) std::move(lease_).Install(frameworks::gpu::TerminalCudaCustody::Share(std::shared_ptr<State>{state_}), failure);
+}
+void CudaRuntimeResources::Settle() {
+ if (!state_->stream) return;
+ const auto status = state_->operations.synchronize(state_->operations.context, state_->stream);
+ if (status != cudaSuccess) { Retain(status); throw mmltk::backend::ml::runtime::CudaOperationError{status, "compute stream settlement"}; }
 }
 contracts::ComputeTerminal CudaRuntimeResources::Run(Work work, const std::stop_token stop, bool settle) {
+ if (HasUnsafeCustody()) throw contracts::UnavailableError("compute CUDA custody is unproved");
  if (stop.stop_requested()) return contracts::make_compute_terminal(contracts::ComputeOperationOutcome::Cancelled);
  contracts::ComputeTerminal result;
  WithExecution([&] {
-  result = work({.native_handle = reinterpret_cast<std::uintptr_t>(stream_), .valid = true});
-  if (settle) {
-   const auto status = cudaStreamSynchronize(stream_);
-   if (status != cudaSuccess) throw std::runtime_error(cudaGetErrorString(status));
+  try { result = work({.native_handle = reinterpret_cast<std::uintptr_t>(state_->stream), .valid = true}); }
+  catch (...) {
+   const auto failure = std::current_exception();
+   bool unproved = frameworks::gpu::is_image_execution_failure(failure);
+   try { std::rethrow_exception(failure); }
+   catch (const mmltk::backend::ml::runtime::CudaOperationError& error) {
+    unproved = unproved || frameworks::gpu::cuda_custody_unproved(static_cast<cudaError_t>(error.status()));
+   }
+   catch (const frameworks::gpu::CudaContextFailure& error) { unproved = unproved || error.terminal(); }
+   catch (...) {}
+   if (unproved) { Retain(cudaErrorUnknown); std::rethrow_exception(failure); }
+   // Ordinary work can throw after submission. Prove completion before reset;
+   // terminal context failures above must not issue another CUDA operation.
+   Settle();
+   std::rethrow_exception(failure);
   }
+  if (settle) Settle();
  });
  return stop.stop_requested() ? contracts::make_compute_terminal(contracts::ComputeOperationOutcome::Cancelled, 0U, result.completed) : result;
 }
 void CudaRuntimeResources::CloseSession() {
+ if (HasUnsafeCustody()) throw contracts::UnavailableError("compute CUDA custody is unproved");
  WithDevice([this] {
-  if (close_) close_();
+  Settle();
+  try { if (state_->close) state_->close(); }
+  catch (...) { Retain(cudaErrorUnknown); throw; }
  });
 }
 void CudaRuntimeResources::WithExecution(Command work) {
- mmltk::common::system::ScopedExecutionPolicy policy(*configuration_.worker_policy());
+ mmltk::common::system::ScopedExecutionPolicy policy(*state_->configuration.worker_policy());
  WithDevice(std::move(work));
 }
 void CudaRuntimeResources::WithDevice(Command work) {
- frameworks::gpu::CudaDeviceScope scope{device_};
- if (!scope) throw std::runtime_error(cudaGetErrorString(scope.status()));
- try {
-  work();
- } catch (...) {
-  static_cast<void>(scope.Finalize());
-  throw;
+ namespace gpu = frameworks::gpu;
+ gpu::CudaDeviceScope scope{gpu::make_cuda_device_owner<State, &State::RecordFailure>(state_.get(), state_->device), state_->operations.device};
+ std::exception_ptr failure;
+ if (scope) {
+  try { work(); } catch (...) { failure = std::current_exception(); }
+ } else {
+  state_->RecordFailure(scope.status());
  }
  const auto status = scope.Finalize();
- if (status != cudaSuccess) throw std::runtime_error(cudaGetErrorString(status));
+ if (!scope.restored() || state_->failure != cudaSuccess) Retain(state_->failure != cudaSuccess ? state_->failure : status);
+ if (failure) std::rethrow_exception(failure);
+ if (status != cudaSuccess) throw mmltk::backend::ml::runtime::CudaOperationError{status, "compute device restoration"};
+ if (HasUnsafeCustody()) throw contracts::UnavailableError("compute CUDA custody is unproved");
 }
 }  // namespace mmltk::controller::detail

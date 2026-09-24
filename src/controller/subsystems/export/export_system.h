@@ -1,4 +1,5 @@
 #pragma once
+#include "src/controller/services/runtime_diagnostics.h"
 #include <functional>
 #include "export_run.h"
 #include <memory>
@@ -17,15 +18,20 @@ class ModelSystem;
 class ExportRuntime {
 public:
  virtual ~ExportRuntime() = default;
- [[nodiscard]] virtual contracts::ComputeTerminal Run(ExportRunRequest, std::stop_token, const ComputeProgressSink&, const ComputeArtifactSink& = {}) = 0;
+ virtual void Close() {}
+ [[nodiscard]] virtual bool HasUnsafeCustody() const noexcept { return false; }
+ [[nodiscard]] virtual contracts::ComputeTerminal Run(ExportRunRequest, std::stop_token, const ComputeProgressSink&, const ComputeArtifactSink& = {}, std::uint64_t generation = 0) = 0;
 };
 class CudaExportRuntime final : public ExportRuntime {
 public:
- explicit CudaExportRuntime(DirectComputeConfiguration);
+ explicit CudaExportRuntime(DirectComputeConfiguration, services::RuntimeDiagnosticTarget = {});
  ~CudaExportRuntime() override;
- [[nodiscard]] contracts::ComputeTerminal Run(ExportRunRequest, std::stop_token, const ComputeProgressSink&, const ComputeArtifactSink& = {}) override;
+ void Close() override;
+ [[nodiscard]] bool HasUnsafeCustody() const noexcept override;
+ [[nodiscard]] contracts::ComputeTerminal Run(ExportRunRequest, std::stop_token, const ComputeProgressSink&, const ComputeArtifactSink& = {}, std::uint64_t generation = 0) override;
 
 private:
+ services::RuntimeDiagnosticTarget diagnostics_;
  class Impl;
  std::unique_ptr<Impl> impl_;
 };
@@ -36,11 +42,11 @@ struct[[= contracts::reflection::Event{contracts::reflection::EventDelivery::Cri
  contracts::ComputeUiState snapshot{};
 };
 using ComputeSystemEvent = std::variant<ComputeProgressEvent, ComputeChanged>;
-using ExportRuntimeFactory = std::function<std::unique_ptr<ExportRuntime>()>;
+using ExportRuntimeFactory = std::function<std::unique_ptr<ExportRuntime>(DirectComputeConfiguration)>;
 class ExportSystem final {
 public:
  using event_type = ComputeSystemEvent;
- ExportSystem(SettingsSystem&, DatasetSystem&, ModelSystem&, ExportRuntimeFactory, SystemEventSink<event_type> = {}, std::optional<mmltk::frameworks::gpu::DeviceExecution> = {});
+ ExportSystem(SettingsSystem&, DatasetSystem&, ModelSystem&, ExportRuntimeFactory, SystemEventSink<event_type> = {}, DirectComputeResolver = resolve_compute_configuration);
  ~ExportSystem();
  [[= contracts::reflection::direct::IntentEndpoint{}]] [[nodiscard]] contracts::ComputeUiState Start(contracts::ExportWorkflowIntent);
  // CLEANUP-IGNORE: Export exposes its own reflected typed action surface; Validation remains an independently sealed

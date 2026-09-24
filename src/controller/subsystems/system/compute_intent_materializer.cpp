@@ -44,7 +44,8 @@ namespace {
  const mmltk::controller::contracts::GuiSettingsState& settings, const mmltk::controller::contracts::FeatureId workflow, const mmltk::controller::contracts::ModelSelection& model) noexcept {
  const auto current = ComputeIntentMaterializer::ModelInputFor(settings, workflow);
  if (!current) return std::unexpected(current.error());
- if (!model.valid() || model.key != current->key || (model.key.source == mmltk::controller::contracts::ModelSelectionSource::Custom && model.artifact != current->custom_artifact))
+ if (!model.valid() || model.key != current->key ||
+     model.inspection_device != current->inspection_device || (model.key.source == mmltk::controller::contracts::ModelSelectionSource::Custom && model.artifact != current->custom_artifact))
   return std::unexpected(refused("model selection does not match current workflow settings"));
  return {};
 }
@@ -77,17 +78,12 @@ std::expected<ComputeIntentMaterializer::ModelInput, ComputeIntentMaterializer::
  ModelInput materialized{
   .key = std::move(projection->key),
   .custom_artifact = custom ? std::move(projection->artifact) : std::string{},
+  .inspection_device = projection->inspection_device,
  };
  if (materialized.key.source == mmltk::controller::contracts::ModelSelectionSource::Custom) {
   if (materialized.custom_artifact.empty() || materialized.custom_artifact.size() > mmltk::controller::contracts::kModelArtifactCapacity)
    return std::unexpected(refused("custom model artifact is unavailable"));
  }
- if (workflow == mmltk::controller::contracts::FeatureId::Validate)
-  materialized.inspection_device = settings.workflows.validate.request.device_id;
- else if (workflow == mmltk::controller::contracts::FeatureId::Predict)
-  materialized.inspection_device = settings.workflows.predict.request.device_id;
- else if (workflow == mmltk::controller::contracts::FeatureId::Export)
-  materialized.inspection_device = settings.workflows.export_state.device_id;
  if (!materialized.key.valid()) return std::unexpected(refused("model selection key is invalid"));
  return materialized;
 }
@@ -143,8 +139,7 @@ ComputeIntentMaterializer::ValidationMaterialization ComputeIntentMaterializer::
  request.eval_order = model.key.input == mmltk::controller::contracts::ModelArtifactInputKind::Weights ? "weights"
                       : model.key.input == mmltk::controller::contracts::ModelArtifactInputKind::Onnx  ? "onnx"
                                                                                                        : "tensorrt";
- request.device_id = -1;
- request.compile_cuda_device_id = -1;
+ request.compile_cuda_device_id = request.device_id;
  return request;
 }
 ComputeIntentMaterializer::ExportMaterialization ComputeIntentMaterializer::Export(
@@ -158,12 +153,12 @@ ComputeIntentMaterializer::ExportMaterialization ComputeIntentMaterializer::Expo
  auto& request = run.onnx;
  assign_model_artifact(request, model);
  assign_export_output_facts(request, state, "model.onnx");
+ request.device_id = state.device_id;
  request.opset_version = state.opset_version;
  request.simplify = state.simplify;
  try {
   mmltk::backend::models::rfdetr::validate_export_onnx_request(request);
  } catch (const std::exception& error) { return std::unexpected(refused(error.what())); }
- request.device_id = -1;
  return run;
 }
 // CLEANUP-IGNORE: Prediction materialization owns source selection and prediction-only request fields after the shared
@@ -198,7 +193,6 @@ ComputeIntentMaterializer::PredictionMaterialization ComputeIntentMaterializer::
  assign_model_artifact(request, model);
  request.backend = "auto";
  request.batch_size = 1U;
- request.device_id = -1;
  return request;
 }
 }  // namespace mmltk::controller::subsystems::system

@@ -246,3 +246,14 @@ TEST_CASE("training command forwards only an explicitly selected test dataset", 
  request.test_compiled_path.clear();
  assert_flag_absent(build_train_command_arguments(request), "--test-compiled");
 }
+
+TEST_CASE("training GPU membership preserves command rank order and matching NUMA overrides", "[gui][train_command]") {
+ auto request = make_train_request({3, 1});
+ request.numa_nodes = {2, -1};
+ const auto args = build_train_command_arguments(request);
+ assert_flag_with_value(args, "--device-ids", "3,1");
+ assert_flag_with_value(args, "--numa-nodes", "2,-1");
+ request.device_ids = {1};
+ request.numa_nodes = {-1};
+ assert_flag_with_value(build_train_command_arguments(request), "--device-id", "1");
+}

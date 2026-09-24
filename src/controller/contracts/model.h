@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <optional>
 #include <string_view>
 #include <type_traits>
 #include "src/frameworks/reflection/field_policy.h"
@@ -40,6 +41,7 @@ struct[[= reflection::feature_scope(FeatureId::Train, FeatureId::Validate, Featu
 };
 struct ModelSelection final {
  ModelSelectionKey key{};
+ std::optional<std::int32_t> inspection_device{};
  [[= mmltk::frameworks::reflection::MaxBytes{kModelArtifactCapacity}]] std::string artifact;
  mmltk::backend::models::rfdetr::ModelClassLayoutSummary class_layout{};
  [[nodiscard]] bool valid() const noexcept { return key.valid() && !artifact.empty() && artifact.size() <= kModelArtifactCapacity; }
