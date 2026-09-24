@@ -6,14 +6,16 @@
 
 - [Build and reusable state](build.md): prerequisites, container toolchains,
   package outputs, Firefox staging, declaration isolation, target-local PCHs,
-  private native Parquet dependencies, generated bindings, caches, and build timing.
+  private native Parquet dependencies, embedded caption font, video encoders,
+  generated bindings, caches, and build timing.
 - [Commands](commands.md): wrapper operations, process snapshots, native CLI,
   benchmark cache selection and mask inspection/export, desktop options, and
   model tooling.
 - [RF-DETR workflows and artifacts](rfdetr-workflows.md): model/class admission,
   GPU normalization, physical candidate ranking, separate candidate/COCO limits,
-  shared weights selection, Transfer/Resume, automatic/manual output, training
-  inputs and live progress, EMA, saved history, compact matcher costs,
+  shared weights selection, Transfer/Resume, reserved workflow outputs, independent
+  ONNX/TensorRT export, captured validation PNGs, prediction samples and recoverable
+  Full video, training inputs and live progress, EMA, saved history, compact matcher costs,
   evaluation metrics and samples, preview-only confidence, packed mask delivery,
   deterministic export ordering, and incremental image/video prediction.
 
@@ -25,8 +27,8 @@
   and vendor ownership.
 - [GUI interaction and presentation](gui-interaction.md): application wire
   formats, workflow layout and navigation, Dataset recipe/validation/recovery
-  controls and cancellation, shared form expansion/dividers, the retained
-  training dashboard, fixed Validation metrics/atlas,
+  controls and cancellation, shared form expansion/dividers, compact status
+  fitting, Output-card placement, the retained training dashboard, fixed Validation metrics/atlas,
   responsive overlay groups, the shared image viewer and primary actions,
   retained integer/decimal editing, prepared captions and texture bindings,
   shared immediate mouse input, native command settlement, Annotation mask work
@@ -37,6 +39,10 @@
 
 ## Data and backend systems
 
+- [RF-DETR training and selective compilation](rfdetr-training.md): pinned
+  stock equations, K-squared accumulation, optimizer/EMA policy, Match-Free/DN
+  mask adaptations, native LibTorch/TorchScript regions, live parameters,
+  signatures and ordinary fallback.
 - [Datasets and compilation](datasets.md): source annotations and provenance,
   format 9 and recompilation, Stretch/Letterbox geometry, optional perceptual
   downscaling, CPU SIMD resizing, quantized planar preparation, local batch
@@ -61,14 +67,16 @@
   native/Rust formatting, cleanup, domain test ownership and selection,
   standalone CUDA/Vulkan and native-link diagnostics, retained browser workflow
   acceptance, Dataset presentation/cancel/restart, confidence/layout/input and
-  direct Validate-to-Explore pixel evidence, and debugging.
+  direct Validate-to-Explore pixel evidence, training mathematical/compilation
+  coverage and limits, media settlement/recovery, and debugging.
 - [Headless Wayland](headless-wayland.md): the private NVIDIA Weston session,
   input seat, readiness, deadlines, shutdown, and artifacts.
 - [Logging](logging.md): fatal stderr reports, explicit diagnostic activation,
   benchmark cache/archive/transfer and release traces, pixel probes, artifact
   ownership, rendered UI and caption evidence, Dataset draw and probe records,
   archived-run selection, nested-field queries, Vulkan/FD provenance,
-  correlation, and triage.
+  correlation, native compilation graph/fusion diagnostics, prediction media
+  acceptance failures, empty test selections, and triage.
 - [Planned work](roadmap.md): future directions rather than current capability.
 
 `CONTRACT.md` owns high-level architecture and component handoffs. This wiki

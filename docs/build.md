@@ -150,6 +150,27 @@ directories and the captured Boost notices. The
 [runtime package inventory](../tools/runtime_package.sh) includes this tree at
 `/opt/mmltk/share/mmltk/licenses/arrow`; [NOTICE](../NOTICE) records the attribution.
 
+### Native caption and video assets
+
+The [raster target](../src/backend/imaging/raster/CMakeLists.txt) embeds the
+existing `src/frontend/iced/assets/SourceSansPro-Regular.otf` into generated
+`caption_font_data.h` in that component's CMake build directory. The font is a
+configure dependency; native saved-caption rendering has no runtime font-path
+lookup. Its OFL installs under `share/licenses/mmltk/caption-font`.
+The shared `stb` target includes unmodified stb_truetype 1.26; its header and
+MIT license install under `share/licenses/mmltk/stb-truetype`. See the
+[vendored addition note](../third_party/stb/README.mmltk.md). Application caption
+policy remains in the raster owner, while Iced keeps interactive layout.
+
+The [video target](../src/backend/media/video/CMakeLists.txt) consumes
+`libavformat`, `libavcodec`, `libavutil` and `libswscale` through pkg-config.
+Development installs their headers; both the development and independent
+runtime base install FFmpeg and `libx264-164`. Native prediction Full-video
+output selects `h264_nvenc` when admitted, with `libx264` as the pre-write
+software fallback. A built runtime therefore carries the software encoder as
+well as the GPU-dependent path; [workflow behavior](rfdetr-workflows.md#prediction-samples-and-full-video)
+owns selection and settlement.
+
 ## Target declarations and precompiled headers
 
 Component `CMakeLists.txt` files register sources, ordinary declaration headers,

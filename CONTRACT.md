@@ -48,7 +48,7 @@ bindings project native facts; mutation remains with the owning system.
 | Local and remote training runs, saved history, and continuation inspection | Training system |
 | Validation runs, metrics, and retained sample products | Validation system |
 | Model export and engine preparation | Export system |
-| Prediction runs and latest image products | Prediction system |
+| Prediction runs, saved media, and latest image products | Prediction system |
 | Dataset exploration, preview products, and exploration work | Exploration system |
 | Editable annotation documents and editing history | Annotation system |
 | Upscale work and derived image products | Upscale system |
@@ -146,11 +146,17 @@ work. Completion and failure come from typed native results and events.
 
 Training, validation, and prediction start through their primary action,
 including required settings settlement, model preparation, and input inspection.
-Train and Validate share artifact-selection presentation while keeping their
-workflow controls and admission independent. Training owns automatic or manual
-output reservation, current-format history, fresh transfer initialization, and
-validated checkpoint continuation. Selecting inputs, continuation mode, or an
-output directory never starts a run.
+Train, Validate, Predict and Export share artifact-selection and output
+presentation while keeping workflow controls and admission independent.
+Each workflow admits its automatic or manual output at accepted
+execution, preserves completed artifacts on failure, and separates configured
+destinations from run results. Output cards lead the right column above status.
+Training additionally owns current-format history, fresh transfer initialization,
+and validated checkpoint continuation. Selecting inputs, continuation mode, or an
+output directory never starts a run. Compact operational text fits a stable
+single line while preserving complete accessible and copyable content.
+Export independently selects interchange and engine artifacts through one
+shared model-conversion chain with complete intermediate resource custody.
 Rust/Iced owns a bounded retained chart dashboard in the aspect-selected center
 workspace, defaulting to 16:9. Selected charts fit the available workspace without
 internal scrolling and expand within that same region; wheel input belongs to
@@ -175,13 +181,25 @@ while preserving inference, evaluation metrics, reports, and ground-truth import
 Prediction incrementally processes compiled images, ordinary images, and local
 video, retaining the latest completed preview through completion or cancellation.
 GUI prediction uses one image per batch; video has pause, resume, and stop.
+Validation saves the selected evaluation samples with run-captured display
+choices. Prediction independently selects image samples or complete annotated
+video without reducing admitted inference coverage. Saved media uses native
+source geometry independently of viewer state or browser availability.
+Video output preserves source timing and audio, completed partial media survives
+interruption, and successful settlement waits for required writes. Native media
+facilities own demux, timestamps, packet custody, encoding and container lifetime;
+prediction owns sampling and annotation policy.
 
 Primary execution actions expose their owning cancellation while active, with
 shared visual feedback driven by visible browser redraws. Annotation's primary
 action remains save-only and prevents duplicate accepted saves.
 
-Training admits target populations above the model's query count while retaining
-the established assignment and loss semantics. Optional EMA remains GPU-resident;
+Training admits target populations above the model's query count. Stock
+supervision retains its pinned reference mathematics for equivalent admitted
+inputs and settings. Optional learned correspondence and denoising supervise
+boxes and masks while preserving ordinary deployment outputs. Selective native
+compilation retains guarded tensor regions, live parameter ownership, ordinary
+fallback and equivalent training behavior. Optional EMA remains GPU-resident;
 each scheduled validation and best-weight decision use one selected weight set.
 Metric publication and persistence progress independently of browser rendering
 and telemetry storage pressure, with incomplete history explicitly visible.

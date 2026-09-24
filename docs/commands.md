@@ -124,6 +124,8 @@ wrapper operations. Commands expose their own reflected argument help:
 ./mmltk rfdetr predict --help
 ./mmltk rfdetr evaluate --help
 ./mmltk rfdetr validate --help
+./mmltk rfdetr export-onnx --help
+./mmltk rfdetr build-engine --help
 ```
 
 The wrapper prevents raw native CLI invocation while its GUI is active,
@@ -166,6 +168,13 @@ respectively. Training exposes `--eval-max-dets`; prediction has its separate
 `--max-dets-per-image`. See [count semantics](rfdetr-workflows.md#model-input-and-detection-selection).
 The [workflow/artifact reference](rfdetr-workflows.md) explains these distinctions,
 current checkpoints, metrics, and saved history.
+Train, predict and evaluate accept `--compile-mode none|selective|full`.
+The [native selective contract](rfdetr-training.md#native-selective-compilation)
+describes the default selective path, its guards and inference propagation;
+the separate full-trace route is outside that evidence. CLI `export-onnx` and
+`build-engine` keep explicit destinations. GUI Export combines independent
+ONNX/TensorRT selections through one conversion and reserves its output beside
+the other [workflow runs](rfdetr-workflows.md#run-output-directories).
 
 The native CLI also accepts `--log-level`, `--log-file`, and `--log-dir`.
 See [logging activation](logging.md#activation-and-quiet-execution), especially

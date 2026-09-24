@@ -57,9 +57,9 @@ owned path bytes across worker calls.
 | --- | --- |
 | [DatasetSystem](../src/controller/subsystems/system/dataset_system.cpp) | Captures explicit compile settings, owns compile/inspect admission and cancellation, and invokes `ArtifactStore` through its retained runtime |
 | [TrainingSystem](../src/controller/subsystems/train/training_system.cpp) | Starts the sibling CLI through `TrainProcessClient`, owns run inspection/history through `TrainRunStore`, and admits checkpoint resume |
-| [ValidationSystem](../src/controller/subsystems/validate/validation_system.cpp) | Owns the selected evaluation session, detailed result pages, and retained samples through `ValidationSamples` |
-| [PredictSystem](../src/controller/subsystems/system/predict_system.cpp) | Owns incremental prediction, video playback control, and latest preview products |
-| [ExportSystem](../src/controller/subsystems/export/export_system.cpp) | Owns model export and engine preparation |
+| [ValidationSystem](../src/controller/subsystems/validate/validation_system.cpp) | Owns the selected evaluation session, result pages, retained samples and captured sample saving |
+| [PredictSystem](../src/controller/subsystems/system/predict_system.cpp) | Owns incremental prediction, video playback control, latest previews and source-specific saved output |
+| [ExportSystem](../src/controller/subsystems/export/export_system.cpp) | Owns the requested ONNX/TensorRT chain and artifact publication |
 
 [RF-DETR workflows](rfdetr-workflows.md) owns model/class admission, metrics,
 checkpoint and history formats, and prediction behavior. Canonical
@@ -89,7 +89,7 @@ The implementation layers below those systems are:
 | [src/backend/models/rfdetr](../src/backend/models/rfdetr) | RF-DETR contract, architecture, augmentation, export, inference, training |
 | [src/backend/ml](../src/backend/ml) | Torch/CUDA layers and model-runtime integration |
 | [src/backend/imaging](../src/backend/imaging) | Shared image primitives, resampling, annotation, raster, Explore rendering, and upscaling algorithms |
-| [src/backend/media](../src/backend/media) | Capture and Live media implementations |
+| [src/backend/media](../src/backend/media) | Capture, Live, video decoding, timing/audio delivery, encoding and muxing |
 | [src/frameworks](../src/frameworks) | GPU, process, transport, serialization, and reflection facilities |
 | [src/common](../src/common) | Shared types, math, I/O, concurrency, logging, and Linux system support |
 
@@ -149,6 +149,9 @@ defaults come from the existing preset/configuration owner, while evaluation
 defaults come from the metric contract. The
 [workflow reference](rfdetr-workflows.md#model-input-and-detection-selection)
 defines their distinct counts, normalization, and annotation semantics.
+The [training reference](rfdetr-training.md) locates stock mathematics,
+supervision adaptations and guarded tensor execution; resource state remains
+with the model, supervision, lane and optimizer owners.
 
 Capture's ordinary [capture_session.h](../src/backend/media/capture/capture_session.h)
 owns device/session access and depends on the GPU framework.
@@ -157,6 +160,56 @@ connects capture, analysis, overlays, fanout, and compositing through private
 owners under `media/live/detail/`. Its public declarations directly name
 capture, annotation, ML-runtime, and GPU dependencies; raster composition
 remains private to the implementation.
+
+## Workflow output and media handoffs
+
+Canonical [WorkflowOutputSelection/WorkflowOutputFacts](../src/controller/contracts/workflow_output.h)
+separate configured destinations from run directory, committed artifacts,
+sample summaries and partial-video facts. The shared
+[run reservation](../src/controller/services/run_output.h) is an ordinary
+filesystem utility; workflow systems retain admission, execution and failure
+policy. `TrainRunStore` additionally owns current-format history and Resume.
+[ExportRunRequest](../src/controller/subsystems/export/export_run.h) retains
+independent format choices through one weights-to-ONNX-to-engine chain.
+
+Rust's [PendingStart owner](../src/frontend/iced/src/app/workflows.rs) captures
+typed [validation](../src/controller/contracts/validation_display.h) and
+[prediction](../src/controller/contracts/prediction_output.h) save-preview
+options before settings/model preparation. Native systems retain them for the
+accepted run; viewer settings continue to evolve independently.
+The [shared weights card](../src/frontend/iced/src/view/workflow/model_card.rs)
+owns dialog confirmation and pending selection; the
+[Output card](../src/frontend/iced/src/view/workflow/output.rs) owns common
+presentation, with Train history and Predict saving in their local components.
+
+[ValidationSampleOutput](../src/controller/subsystems/validate/detail/validation_sample_output.h)
+captures selected borrowed samples into receiver-owned immutable products.
+Interactive `ValidationSamples` can adopt those same products without another
+copy. [PredictionOutput](../src/controller/subsystems/system/detail/prediction_output.h)
+owns sampled/full saving and publication; its
+[selection helpers](../src/controller/subsystems/system/detail/prediction_sampling.h)
+own compiled subsets and observed-frame reservoirs. Both output owners reuse
+`PredictionPreviewComposition`, with display admission optional.
+
+[PredictionDelivery](../src/backend/models/rfdetr/inference/prediction_delivery.h)
+keeps semantic/JSON, interactive-preview and save demands distinct. It requests
+native pixels/masks only for their actual consumers and carries timing/audio
+through the same inference pass. Borrowed source reads settle before release.
+[VideoFileSource](../src/backend/media/video/video_file_source.h) owns demux,
+decode, timestamps and typed audio delivery;
+[VideoFileSink](../src/backend/media/video/video_file_sink.h) owns admitted
+encoder, conversion storage, packet custody, audio remux and incremental MKV
+publication. These media declarations depend on image/GPU facilities rather
+than RF-DETR or GUI policy. Worker-side backpressure bounds queued work.
+
+[CaptionRaster](../src/backend/imaging/raster/caption_raster.h) retains a native
+glyph atlas and ordered batched painting for saved output.
+[RenderedImageWriter](../src/backend/imaging/raster/rendered_image_writer.h)
+owns a bounded PNG worker, reusable pinned transfer, private staging and checked
+atomic publication. Their [build inputs](build.md#native-caption-and-video-assets)
+include the embedded font and packaged encoder dependencies. Interactive caption
+layout/cache remains with Iced. The [workflow guide](rfdetr-workflows.md)
+owns output filenames, sampling semantics and partial-media behavior.
 
 ## Shared native facilities
 
@@ -332,7 +385,9 @@ width, scrolling, and ordinary column composition, including Annotate.
 typed numeric widgets; Explore's local controls retain their domain-specific
 filter editing. [view/shared/transition.rs](../src/frontend/iced/src/view/shared/transition.rs)
 owns retained form expansion, clipping, and input visibility; Dataset, model
-cards, Export, and diagnostics use that same widget. Dataset's
+cards, Predict saving, Export, and diagnostics use that same widget.
+[status_text.rs](../src/frontend/iced/src/view/shared/status_text.rs) owns retained
+single-line fitting and intrinsic status measurement. Dataset's
 [progress component](../src/frontend/iced/src/view/train/dataset/progress.rs)
 formats native facts and reserves active presentation height. The
 [interaction guide](gui-interaction.md#shared-form-expansion-and-dividers)

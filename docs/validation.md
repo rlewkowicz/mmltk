@@ -178,6 +178,12 @@ Put test-runner arguments after `--`:
 ./mmltk --test all --executable mmltk_backend_imaging_upscale_tests -- '[capture],[probe]'
 ```
 
+For several Catch case names, pass one quoted comma-separated union filter,
+for example `-- 'first case name,second case name'`. Separate positional names
+do not express that union. An unmatched selection or **No tests ran** is failed
+selection evidence, not a passing run; [log parsing](logging.md#catch-selection-and-terminal-evidence)
+exposes both under `--errors`.
+
 | Option | Behavior |
 | --- | --- |
 | `--executable TARGET` | Select one target owned by the suite |
@@ -417,6 +423,18 @@ Validation waits for all six samples to be available with identities from the
 completed evaluation generation before advancing to their canvas checks.
 Native metric completion can precede the asynchronous sample renderer.
 
+The workflow scenario also verifies the individual saved Validation PNGs,
+Predict saving-control state, compiled/image samples, completed video, and
+playable cancelled partial video. Media-disabled fixtures independently disable
+the image/compiled report and require only the empty `.mmltk-run-claim`
+reservation marker in the directory, with unchanged processing coverage.
+Native media cases separately exercise timestamps/audio, write failures,
+shortfall and crash-prefix recovery. The retained scenario measures all four
+Output cards at the top of the right column and checks the left-column cards
+preceding each primary action; Predict keeps its saving controls. Exact
+[failure records](logging.md#prediction-media-acceptance) distinguish invalid
+observations from missing terminal evidence.
+
 The same browser first opens Explore, runs Validate, and returns directly to
 Explore through normal navigation. It requires a current paired gallery draw
 and actual colored pixels inside a ready compiled-image tile. There is no
@@ -615,7 +633,8 @@ sessions retain ordinary clipboard permissions.
 | `mmltk_backend_imaging_annotation_tests` | Resolved-mask foreground support, tight bounds, empty masks, and HSV filtering against independent scalar expectations |
 | `mmltk_backend_imaging_upscale_tests` | Exact Basic sharpening bytes and guards, bitwise neural tile preparation, tile stitching, ONNX capture/replay, explicit allocation-counter ownership, and separate independent raster-oracle cases |
 | `mmltk_backend_imaging_resample_tests` | Independent CPU/CUDA perceptual values including fractional SIMD lanes/tails, AVIR float4/scalar comparisons and signed rounding boundaries, bitwise quantized planar projection and CUDA accumulator traversal, worker-local reuse, checked views, completion, and resource custody |
-| `mmltk_backend_imaging_raster_tests` | Pitched BGR row orientation, exact RGB8/planar-float conversion with odd extents and pitch guards, inclusive detection-confidence filtering, overwrite painter order and independent blended/additive behavior, and clipped flat-mask runs |
+| `mmltk_backend_imaging_raster_tests` | Pitched BGR row orientation, exact RGB8/planar-float conversion with odd extents and pitch guards, inclusive detection-confidence filtering, overwrite painter order and independent blended/additive behavior, clipped flat-mask runs, native named captions, and owned PNG staging/publication/failure settlement |
+| `mmltk_backend_media_video_tests` | Packaged encoder availability, odd geometry, variable timestamps, multiple audio tracks/dispositions, write/rename failures, cancelled partial settlement, and a decodable flushed MKV prefix after SIGKILL without a trailer |
 | `browser-app` | Primary-action preparation, independent optional-test/output editing, generated scalar selection, bounded live/saved chart histories and gaps, camera/legend retention and plot picking cancellation, live progress availability, validation viewer and video-control admission, shared immediate mouse input and transport retention, typed state reduction, component/crop identity, retained gallery measurements and reconciliation, exact integer/filter reduction, shared layout/navigation, image metadata independent of logical snapshots, encoded/submitted draw custody, completed fallback through navigation, local labels, FPS submission counting, exact displayed gallery interaction, quiet failure receipts, and JavaScript probe/input/callback settlement |
 | `workspace-wayland` | Real training/validation/prediction workflows and actual chart/progress/sample/preview pixels, confidence editing/pixel filtering, Validation group placement/wrapping, direct Validate-to-Explore atlas pixels, dashboard aspect/retention/wheel behavior, packaged integer typing/paste and spinner/wheel policy, Detail-open resize returns, shared Annotate layout and long-list reachability, retained sessions, native-source/browser-arena identity, negotiated direct/copy draws, recovery, and shutdown |
 
@@ -627,6 +646,13 @@ by `--test rfdetr`.
 compiled-catalog cases; `--test core` also selects the separate resampling
 target above. These checks cover functional values, boundaries, failure, and
 custody; they do not substitute for the real rendered workflow case.
+
+The data/compute target additionally owns the captured validation sample payload,
+required PNG failures with retained metrics, independent export combinations,
+prediction subset/reservoir selection, unchanged inference coverage, shortfall,
+failed replacement preservation and browser-independent saved composition.
+The service target owns exclusive run claims, numbered-directory races and
+the separation between current selections and admitted output facts.
 
 The data cases also cover locally scheduled batch capacity, empty shards,
 categorical RLE sampling, parser scratch reuse, both resize modes, authoritative
@@ -676,7 +702,63 @@ membership; `--test core` includes image resampling, while the imaging
 Annotation, Explore, and Upscale executables require `all` or explicit
 `all --executable` selection. Raster is also in `rfdetr`.
 
-### Benchmark compilation evidence
+## Training mathematics and compilation evidence
+
+The [training reference](rfdetr-training.md) owns the pinned equations and
+native adaptations. Coverage is colocated with these existing suites, selected
+by `all` and the standalone `rfdetr` route:
+
+| Source | Required evidence |
+| --- | --- |
+| [core/tests/upstream_training_parity.test.cpp](../src/backend/models/rfdetr/core/tests/upstream_training_parity.test.cpp) | Independent geometry/epsilon/promotion equations and VJPs; categorical half-pixel sampling; representation-specific empty masks; learned encoder projection; grouped classification/box and dense/sparse mask objectives; full-domain nonfinite matcher sanitization; depthwise AMP derivatives and updates; direct DN mask equations |
+| [training/tests/stock_training_parity.test.cpp](../src/backend/models/rfdetr/training/tests/stock_training_parity.test.cpp) | Literal two-stage K-squared scaling, per-parameter AdamW ages, managed warmup, device clipping, first/later/resumed EMA, recoverable AMP overflow cadence, backward outside autocast and distributed group/update equations |
+| [core/tests/training_supervision.test.cpp](../src/backend/models/rfdetr/core/tests/training_supervision.test.cpp) | Match-Free correspondence/probes and mask costs, background-only images, DN layout/noise/leakage protection, invalid and empty boundaries, direct mask gradients and sampling behavior |
+| [core/tests/selective_compilation.test.cpp](../src/backend/models/rfdetr/core/tests/selective_compilation.test.cpp) | First recording and retained live weights, signature/tail fallback, transactional replacement, dynamic query extents, direct grouped/DN SDPA and independent decoder-tail derivatives with outstanding backwards |
+| [training/tests/training_supervision.test.cpp](../src/backend/models/rfdetr/training/tests/training_supervision.test.cpp) | Production routed Hungarian/Match-Free and optional DN for boxes/masks; FP32/FP16/BF16; empty images, accumulated gradients and actual optimizer updates; current-format continuation; eager/selective values, recording/reuse/optimized execution, RNG and live state copies |
+| [inference/tests/prediction_session.test.cpp](../src/backend/models/rfdetr/inference/tests/prediction_session.test.cpp) | Native weights compilation-request propagation and incremental inference behavior |
+
+The complete-model selective fixture compares four accumulated microbatches
+using the production `TrainingStep`, including the K-squared divisor, frozen
+and trainable parameter policy, then an optimizer update. It preserves exact
+RNG state across matched eager/selective forwards and losses, and exercises
+training/evaluation mode changes, padded evaluation, `2 → 1 → 2` batches,
+explicit disable and changed-state copies. It forces the reference deformable
+attention implementation to isolate the bounded tensor regions; custom CUDA
+attention has separate ML-layer evidence.
+
+For that composed fixture, logits/boxes/losses use relative and absolute
+tolerances of `0.004`; BF16 spatial features use `0.02` for both. FP32 gradients
+use elementwise relative `0.01` and absolute `0.004`. AMP gradient comparisons
+require finite L2 norms and bound both L2 error and maximum element error by
+`0.02 * corresponding_reference_scale + 0.004` per tensor. Updated parameters
+use relative `0.001` and absolute `0.0003`. Independent primitive/criterion
+fixtures retain their tighter elementwise equation checks and explicit samples.
+The source assertions own the exact bounds for each case; a composed AMP
+tolerance is not a universal tolerance for arbitrary training inputs.
+
+The validated NGC payload's compilation capture contained 1,163 executor-reuse
+records: 26 evaluation-backbone records each contained 33 TensorExpr groups;
+the other 1,137 records, including reported training-region graphs, had no
+counted fusion group. The bounded extracted evidence is
+`build/validation/compilation-execution-evidence-attempt7.jsonl`, retaining
+original log provenance. This observation establishes graph fusion in that
+evaluation backbone only. Graph capture, executor reuse, available fuser flags
+and fused ATen operations do not establish training graph fusion or throughput.
+The [diagnostic fields](logging.md#native-selective-compilation) distinguish
+those facts.
+
+These are controlled functional, numerical, update and lifetime checks, not a
+full upstream Python training run or measured COCO accuracy/convergence study.
+Native data membership and TF32 policy remain as documented in the reference.
+GPU-gated cases explicitly skip when their required CUDA or physical
+capabilities are unavailable; BF16 branches require compatible hardware.
+GDRCopy mappings additionally need a usable `gdrdrv` or CUDA DMA-BUF mmap route.
+A host lacking both cannot supply successful GDRCopy mapping evidence even
+when ordinary CUDA and Wayland pass. Product builds compile selected frontend
+test targets without executing the separate browser-app suite, as described
+[above](#native-and-browser-suites).
+
+## Benchmark compilation evidence
 
 The existing native suites exercise bounded release fixtures through the
 production compiler and local HTTP server. They establish cache identity,
@@ -747,7 +829,7 @@ define what these bounded fixtures do not establish. Runtime trace encoder
 and serialization suites additionally cover benchmark timestamps, effect-only
 delivery failures, Unicode scalar handling, and malformed wire-text rejection.
 
-### Shared fixtures and evidence
+## Shared fixtures and evidence
 
 Neutral fixtures and the shared Catch runner belong to
 [src/test_support](../src/test_support). Domain fixture targets live with

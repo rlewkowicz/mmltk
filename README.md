@@ -54,14 +54,18 @@ policy, generated bindings, and build timing.
 Train prepares the selected model and starts the run from its primary action.
 Its center shows a selectable chart dashboard with a separate live progress
 card. Train and validation inputs are required; the final-test split is optional.
-Choose Transfer or Resume in the weights card. Auto Output creates a fresh run
-directory at Start; Browse Output selects a manual destination and loads its
-saved charts. EMA is optional and off by default.
+Choose Transfer or Resume in the weights card. Train, Validate, Predict, and
+Export put Output at the top of the right column. Auto Output creates a fresh
+run beneath `output/<workflow>` at Start; Browse Output selects a manual
+destination and, for Train, loads saved charts. EMA is optional and off by default.
 Validate shows twelve COCO summaries beside six sample tiles and uses Explore's
 viewer, including Upscale and Open in Annotation. Groundtruth and Detections
 switch the two annotation layers independently. Advanced includes Display
-confidence for filtering preview detections. Predict is a quick visual check for
-compiled data, an image, or a local video, with Pause/Resume/Stop for video.
+confidence for filtering preview detections. It also saves the selected samples
+as individual PNGs with the display choices captured at Start. Predict handles
+compiled data, an image, or a local video, with source-specific sample saving
+and Full annotated H.264/MKV output. Video has Pause/Resume/Stop and retains
+partial media after interruption. Export can save ONNX, TensorRT, or both.
 
 The [RF-DETR workflow guide](docs/rfdetr-workflows.md) covers class identity,
 metrics, output files, and continuation. Current native checkpoints use version
@@ -74,6 +78,11 @@ Every Upscale method prepares stretched compiled input at source aspect first.
 The shared viewer's Original option changes how retained pixels are displayed;
 it does not recover source resolution. See the
 [viewer guide](docs/gui-interaction.md#original-view-and-annotation-import).
+
+The [training reference](docs/rfdetr-training.md) explains the pinned stock
+mathematics, optional Match-Free and denoising mask supervision, and native
+selective compilation. Its evidence covers controlled losses, gradients and
+updates; it does not establish AP, convergence or throughput equivalence.
 
 The Dataset card's benchmark override offers Coco custom and Coconut.
 Coconut compiles the full COCONut training recipe with a choice of validation

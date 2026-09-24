@@ -45,6 +45,13 @@ editor widget identities survive ordinary layout and native-state updates.
 
 ## Training, validation, and prediction
 
+Train, Validate, Predict and Export place **Output** at the top of the right
+column, above operation status. Their shared card provides Auto Output,
+Browse Output and admitted/completed paths; Train adds saved history and
+Predict adds its source-specific saving controls. Setup and the primary action
+remain in the left column. The [output reference](rfdetr-workflows.md#run-output-directories)
+owns reservation, defaults and artifact names.
+
 Train uses the [retained dashboard](#training-dashboard) in the center column,
 with the shared workspace aspect selector and a separate live progress card.
 It has no native GPU image workspace. Its
@@ -58,13 +65,24 @@ augmentation/perceptual-downscaling settings. The
 [workflow reference](rfdetr-workflows.md) owns the metric conventions, current
 file formats, input admission, live progress, and continuation requirements.
 
-Train and Validate share the weights-selector presentation and native artifact
-compatibility facts. Validate's Open Dataset shows its explicit path or the
+All four workflows share the **RF-DETR Weights** selector, its custom-selection
+confirmation, preparation and cancellation, using native artifact compatibility
+facts. Only Train has Transfer/Resume. Predict infers weights/ONNX/TensorRT from
+the custom path; Export's custom chooser accepts `.pt`. There are no manual
+artifact-kind or Class layout controls on these cards. Validate's Open Dataset
+shows its explicit path or the
 effective inherited Train validation split. It uses the
 [fixed Validation workspace](#validation-workspace-and-shared-viewer) below.
 
 Predict offers compiled-dataset, single-image, and local-video inputs, a preview
-threshold, optional output JSON, and video Pause/Resume/Stop. It retains the
+threshold, and video Pause/Resume/Stop. Its Output card offers Save sample for
+an image, Save samples with Percent %/Total and dataset-count inspection for
+compiled input, and Save video with Samples/Full for video. Conditional choices
+use the shared disclosure; switching source retains that source's settings.
+The [saving reference](rfdetr-workflows.md#prediction-samples-and-full-video)
+defines counts, media and failure behavior. Export's left-column format card
+offers independent ONNX and TensorRT checkboxes; Run Export requires at least
+one. Predict retains the
 workspace aspect selector. Every GUI prediction request uses batch size 1;
 there is no batch-size field on this page. Train, Validate, and Predict hide
 H2D/NUMA controls while preserving the generated settings and backend support.
@@ -77,6 +95,10 @@ duplicate starts. Progress shows the preparation stage and then the owning
 operation's completed work; unknown totals stay indeterminate. Video controls
 use the same pending-system admission as their typed requests, including an
 event arriving before its reply.
+Validation and prediction also retain the save-preview options captured at
+that accepted Start through preparation. Later viewer edits do not mutate the
+admitted save payload. Predict inspection replies enter the same revision-aware
+snapshot reduction as events, so a late reply cannot replace newer source facts.
 
 ### Dataset compilation controls
 
@@ -146,7 +168,8 @@ children's reflow without applying the same animation twice.
 Dataset uses it for benchmark choices, Coconut options, manual split paths,
 Compile size, and progress reflow. The [model card](../src/frontend/iced/src/view/workflow/model_card.rs)
 uses it for custom-artifact controls and replacement content; [Export](../src/frontend/iced/src/view/export.rs)
-uses it for conditional TensorRT/ONNX output and Advanced fields. The
+uses it for conditional Advanced fields, and [Predict saving](../src/frontend/iced/src/view/predict/output.rs)
+uses it for source and sampling choices. The
 [diagnostics card](../src/frontend/iced/src/view/diagnostics.rs) uses the same
 transition while retaining its Show/Hide trigger at the card's bottom edge.
 
@@ -166,6 +189,24 @@ above and below, for a total height of nine. Dataset places one after the entire
 and before **Dataset source**. The other sits immediately after **Overwrite**
 and before **Compile dimensions**. Neither boundary adds outer spacing to the
 divider's gaps.
+
+## Compact operational text
+
+Shared [status text](../src/frontend/iced/src/view/shared/status_text.rs) keeps
+operational status, progress/activity, compact warnings and output paths on one
+normal-height line. It starts at the caller's normal font size and fits width
+in 0.5 logical-pixel steps down to 8; short text never grows. At the minimum it
+ellipsizes, while hover exposes the complete original message. Line breaks
+display as spacing; selection and copy preserve the original text, including
+its line breaks. Semantic colors and retained text-widget identities survive
+fitting. Headings, descriptions, editable fields, tables and full error-modal
+prose retain their ordinary wrapping and typography.
+
+Fitting uses a bounded binary search over the size steps. Retained measurements
+key content, width, normal size, renderer font and scale; finite/intrinsic
+layouts keep separate cached sizes. Compact toolbar intrinsic widths also
+retain their own paragraph. Unchanged redraws reuse these measurements and do
+not restart disclosure or Dataset progress-height reservations.
 
 ## Shared primary actions
 

@@ -127,6 +127,45 @@ readback markers; undefined buffer-alias samples cannot prove image contents.
 
 GPU-specific trace variables are covered in [GPU execution](gpu-execution.md).
 
+## Native selective compilation
+
+Native application logging at `debug` enables the
+[selective region diagnostics](../src/backend/models/rfdetr/core/selective_compilation.cpp).
+These are `rfdetr compilation` messages, separate from GUI lifecycle JSONL.
+The query tool extracts their named fields from the native log:
+
+```bash
+./mmltk --logs .mmltk-data/logs/rfdetr.log \
+  -q '"rfdetr compilation"' \
+  --fields region,owner,reason,training,signature,grad,amp,amp_dtype,torch,graph_available,operators,fusion_groups,tensor_expr_groups \
+  --format jsonl --limit 40
+```
+
+Supply the actual captured native application file. `region` identifies the
+backbone, per-layer decoder tail or segmentation spatial/query region; `owner`
+distinguishes instances within the process. `preparation` reports armed,
+disabled or identical requests. Execution `reason` distinguishes recorded
+graphs, reuse with an optimized graph when available, signature/prepared-batch
+fallback and owner-device invalidation. `signature`, `training`, `grad`, `amp`
+and numeric `amp_dtype` describe actual invocation state. `torch` is the
+compiled version macro, while the [payload manifest](../docker/nvidia-payload.json)
+owns the complete pinned build identity.
+
+`executor_optimize`, `fuse_cpu`, `fuse_gpu`, `tf32_matmul` and `tf32_cudnn`
+report runtime policy. `graph_available` and `operators` describe the inspected
+graph. `fusion_groups` recursively counts `prim::FusionGroup`,
+`prim::CudaFusionGroup` and `prim::TensorExprGroup`; `tensor_expr_groups`
+separately counts the last form. Reuse queries inspect the last executed
+optimized graph when available, rather than treating the recorded graph as
+optimization evidence. Enabled graph inspection is diagnostic work; disabled
+debug logging collects and formats none of it.
+
+Capture/reuse, fuser availability and graph fusion are different facts. Fused
+ATen operators such as SDPA are not graph fusion groups. Neither these counts
+nor the native TorchScript path establish a throughput advantage over upstream
+Dynamo/Inductor. [Validation](validation.md#training-mathematics-and-compilation-evidence)
+owns the actual observed fusion boundary.
+
 ## Benchmark compilation traces
 
 The [dataset runtime's owned target](architecture.md#native-domain-work) connects
@@ -435,6 +474,36 @@ Clipboard acceptance and its opt-in permission gate are documented in
 include Mozilla `Clipboard` and `WidgetClipboard` module logs alongside the
 existing graphics modules.
 
+### Prediction media acceptance
+
+The existing [BrowserAudit](../src/acceptance/tests/wayland/browser_audit.cpp)
+checks `integration.prediction.saving`, `integration.prediction.no_output`
+and `integration.prediction.output` in the workflow that creates the media.
+Its first invalid observation emits gated `acceptance.prediction.failed` once.
+The record retains the observed fields, `observed_event`, `reason`,
+`audit_context`, and the Firefox `observed_file`/`observed_line`.
+Stage/path remain in `detail`/`control`; generic `a`/`b`/`c`/`d` slots retain
+the original integration observation. Media context includes admitted-directory,
+JSON absence, sample and processed counts. Disabled-output context includes
+`claim_only`, `processed`, `expected_processed`, `filesystem_error` and
+`unexpected_entry`. A reserved empty run contains its empty
+`.mmltk-run-claim` directory; that marker is not a saved media product.
+
+When terminal evidence is missing without an earlier invalid observation,
+`acceptance.prediction.incomplete` reports `level: "error"`, the blocker in
+`detail`, and `media_disabled`, `saving_controls` and `saved_media` inventories.
+These records observe acceptance and never control product execution.
+
+```bash
+./mmltk --logs --family latest-wayland-test \
+  -q '@event:acceptance.prediction OR @event:integration.prediction' \
+  --format timeline --limit 40
+```
+
+Select the workflow's archived run when the latest family belongs to a later
+browser lifetime. [Validation](validation.md#packaged-wayland-acceptance)
+owns the media assertions and their relation to native media tests.
+
 ### Dataset presentation evidence
 
 The opt-in [Dataset observer](../src/frontend/iced/src/integration_control/dataset_presentation.rs)
@@ -529,6 +598,26 @@ copied Catch context, and focuses the earliest matching capture by file
 modification time. It preserves original file/line and timestamp/clock data.
 Combine it with `--triage` for automatic identity investigation around that
 error.
+
+## Catch selection and terminal evidence
+
+The [log parser](../tools/log_query.py) treats Catch's **No test cases matched**
+as `catch.test_selection_failed` with error level. **No tests ran** becomes an
+error `catch.summary` with `tests: 0`. Both appear under `--errors` and in
+terminal context, alongside existing Catch assertion failures. The original
+selection text remains in `message`; `catch.filters` retains the requested
+filter. A normal summary or successful log parsing does not establish that the
+intended cases ran.
+
+```bash
+./mmltk --logs build/logs --errors \
+  -q '@event:catch.test_selection OR @event=catch.summary' \
+  --format timeline --limit 20
+```
+
+Use the [test-selection syntax](validation.md#selection-environment-deadlines-and-debugging)
+for a comma-separated union of case names, and inspect the selected command's
+actual terminal result.
 
 ## Query expressions
 

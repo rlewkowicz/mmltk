@@ -1,8 +1,8 @@
 # RF-DETR workflows and artifacts
 
-[Wiki index](README.md) · [Commands](commands.md) · [Datasets](datasets.md) · [GUI layout](gui-interaction.md#training-validation-and-prediction)
+[Wiki index](README.md) · [Commands](commands.md) · [Datasets](datasets.md) · [Training reference](rfdetr-training.md) · [GUI layout](gui-interaction.md#training-validation-and-prediction)
 
-Train, Validate, and Predict use the same native model selection and preparation
+Train, Validate, Predict, and Export use the same native model selection and preparation
 facts. Their primary action settles settings, selects the requested model,
 prepares missing weights, inspects the selected compiled inputs where needed,
 and starts the owning system. Preparation progress belongs to the model card;
@@ -146,19 +146,71 @@ selection count. It does not change COCO evaluation policy.
 
 ## Shared weights selection
 
-Train and Validate use the same **RF-DETR Weights** card: catalog presets and
-**Custom Weights**, with a compact selected path, active preparation progress,
+Train, Validate, Predict, and Export use the same **RF-DETR Weights** card:
+catalog presets and **Custom Weights**, with a compact selected path, active preparation progress,
 and actionable errors. Train accepts trainable weights (`.pt`, `.pth`, `.ckpt`,
-`.safetensors`). Validate also accepts ONNX (`.onnx`) and TensorRT
-(`.engine`, `.trt`). The selected extension identifies an input kind through
+`.safetensors`). Validate and Predict also accept ONNX (`.onnx`) and TensorRT
+(`.engine`, `.trt`). Export's custom chooser accepts `.pt` weights. The selected
+extension identifies an input kind through
 the native [compatibility catalog](../src/controller/contracts/model_selection.h);
 normal artifact and class admission still apply.
 
 The shared card has no separate backend-kind or companion class-layout control
-for these two workflows. A new custom selection clears an unrelated descriptor
+for these workflows. A new custom selection clears an unrelated descriptor
 path. Native descriptors and CLI `--class-layout` retain their supported
 admission route. Only Train adds Transfer/Resume controls; Validate has no
-continuation preparation or training-output state.
+continuation preparation or training-output state. The shared component owns
+custom-selection confirmation, pending dialog admission, preparation, and
+cancellation; each workflow retains independent widget identities and state.
+
+## Run output directories
+
+Each workflow's **Output** card is at the top of the right column, above status.
+**Auto Output** is enabled initially. Accepted execution reserves the next
+`run-NNNN` beneath the workflow root, starting at `run-0001` and growing beyond
+four digits when needed. Existing entries are never overwritten.
+
+| Workflow | Automatic root | Products within a run |
+| --- | --- | --- |
+| Train | `./output/train` | [Checkpoints](#checkpoints-and-continuation), [history](#saved-history-and-plots), epoch samples, and training-owned evaluation |
+| Validate | `./output/validate` | `report.json`, up to six `samples/sample-<dataset-index>.png` |
+| Predict | `./output/predict` | Image/compiled `predictions.json` when enabled, plus the source-specific [saved media](#prediction-samples-and-full-video) |
+| Export | `./output/export` | Requested `model.onnx` and/or `model.engine`, with applicable class companions |
+
+**Browse Output** selects a manual directory. A new or empty selection is used
+directly; an occupied directory receives a fresh numbered child. An exclusive
+`.mmltk-run-claim` directory reserves the destination, including a run with
+media/report saving disabled. Selecting or preparing inputs never reserves a
+run. Reservation follows native input admission, and filesystem errors refuse
+execution without overwriting earlier products. The shared
+[reservation utility](../src/controller/services/run_output.cpp) owns the
+filesystem algorithm; each workflow owns its run and terminal outcome.
+
+Configured selections remain distinct from active/completed paths. The card
+shows the admitted directory, committed artifacts, sample count/directory and
+recent sample, or a recoverable partial-video path. A different manual selection
+appears as **Next output**. Re-enabling Auto clears the manual selection without
+deleting files. Settings persist current selections rather than an automatic
+run's resolved path. Current-format Train history and Resume have the extra
+admission described below; older application settings and saves have no
+migration route. CLI output arguments remain explicit and independent of these
+GUI reservations.
+
+## Export formats
+
+**ONNX** and **TensorRT** are independent checkboxes, both initially enabled.
+Selecting neither disables **Run Export**; native admission also rejects that
+request before directory reservation or model work.
+
+The [export run](../src/controller/subsystems/export/export_run.cpp) converts
+the prepared weights to ONNX once. TensorRT consumes that same ONNX. ONNX-only
+retains `model.onnx`; both formats retain `model.onnx` and `model.engine`.
+TensorRT-only keeps the ONNX and its class companions in a private temporary
+directory until engine readers settle, then removes the intermediate.
+Failure or cancellation preserves already committed requested artifacts,
+including ONNX when a later engine build fails. Format choices do not change
+the prepared model identity. Native `export-onnx` and `build-engine` remain
+separate reusable CLI operations.
 
 ## Training inputs and output destination
 
@@ -176,12 +228,8 @@ validation, or native admission rejects the start. The
 and [dataset inspection](../src/controller/subsystems/system/dataset_system.cpp)
 own these checks.
 
-The Output card owns **Auto Output**, initially enabled, **Browse Output**, and
-a compact selected or active path. Auto keeps the saved destination empty until
-Start reserves `gui-train-output/run-0001`, `run-0002`, and so on. The next suffix
-comes from existing entries and directory creation reserves it atomically, so
-new automatic runs remain distinct after relaunch. A resolved automatic path is
-a runtime fact rather than a restored manual destination.
+Train uses the shared [output reservation](#run-output-directories). Its Output
+card additionally owns saved-history selection.
 
 Browse Output switches to manual selection and loads supported saved charts.
 An empty or unrelated folder clears the saved charts; a folder claiming history
@@ -240,16 +288,19 @@ and one settled D2H copy exposes the complete active payload to the existing
 solver. The former padded-shape overflow admission remains enforced.
 
 The [CUDA cost kernels](../src/backend/models/rfdetr/core/detr_matcher_cuda.cu)
-keep their padded launch indexing, float arithmetic, mask-point lane assignment,
-and reduction order while writing compact addresses. Solver traversal, ties,
-loss accumulation, and assignment lifetime are unchanged. Separately, the
+write those compact addresses while retaining full-domain nonfinite
+sanitization before group/image assignment. The
+[training reference](rfdetr-training.md#stock-objective-and-mask-mathematics)
+owns the stock cost and loss equations and exceptional cases. Separately, the
 [deformable-attention forward wrapper](../src/backend/ml/layers/ms_deform_attn_cuda_wrapper.cpp)
 allocates overwrite-only output because the forward kernel fills every active
 element; backward accumulation retains its required zero initialization.
 
 EMA is optional and **off by default**. The GUI's **Exponential moving average**
-setting and CLI `--use-ema` enable persistent GPU shadow weights, updated at the existing
-optimizer-update boundary. `--no-ema` disables them. Disabled EMA creates no
+setting and CLI `--use-ema` enable persistent GPU shadow weights, updated at the
+completed optimizer-attempt boundary, including recoverable AMP skips.
+The [training reference](rfdetr-training.md#accumulation-optimizer-and-ema)
+defines first-copy, later averaging, and continuation behavior. `--no-ema` disables them. Disabled EMA creates no
 shadow storage or update work.
 
 Each scheduled validation evaluates exactly one weight set: EMA when enabled,
@@ -258,6 +309,14 @@ set. Evaluation temporarily selects EMA weights with restoration of the working
 weights and training mode. There is one validation trajectory, identified by
 `evaluated_weights`, rather than a separate EMA chart. An optional final test
 uses the selected best checkpoint.
+
+Stock Hungarian training follows the pinned upstream mathematics for equivalent
+admitted tensors and settings, including its extra accumulation divisor.
+Match-Free and DN are opt-in training extensions supporting both boxes and
+segmentation masks. See [RF-DETR training and selective compilation](rfdetr-training.md)
+for reference scope, native batch policy, mask adaptations, actual traced regions,
+and guard/fallback behavior; [validation](validation.md#training-mathematics-and-compilation-evidence)
+states what the mathematical and integration evidence establishes.
 
 ## Checkpoints and continuation
 
@@ -456,6 +515,20 @@ The [Validation workspace](gui-interaction.md#validation-workspace-and-shared-vi
 owns layout, shared viewer interaction, and the Validation-only
 Groundtruth/Detections layer and compositing rules.
 
+At the accepted primary Start, Validate captures layer visibility, label
+visibility, boxes/masks, and Display confidence in a typed
+[ValidationRunPreview](../src/controller/contracts/validation_display.h).
+That payload survives settings settlement and model preparation. The native
+[sample-output owner](../src/controller/subsystems/validate/detail/validation_sample_output.cpp)
+saves each selected identity once as `samples/sample-<dataset-index>.png`, at
+the sample's complete native geometry. It uses actual class names, complementary
+GT/Det colors, additive mask/outline overlap, and GT-before-Det captions.
+Later viewer edits, pan, zoom, scrolling, and browser availability do not change
+the captured save. Required PNG writes settle before successful completion.
+A save failure preserves computed metrics, the completed report and PNGs,
+and reports the image-output error. Optional interactive adoption does not
+control metrics or required saves.
+
 Scheduled training evaluation separately writes `eval_samples/epoch_N.png`.
 [TrainingValidationRuntime](../src/backend/models/rfdetr/training/evaluation_run_owner.cpp)
 owns an [EvaluationSampleWriter](../src/backend/models/rfdetr/core/sample_output.h)
@@ -463,6 +536,9 @@ that lazily retains its CUDA device, worker, settlement stream, and event across
 epochs. One pending future bounds output; explicit `Flush` propagates errors,
 and destruction settles queued image custody. Independent validation runtimes
 can write on different devices without sharing a process-global writer.
+These training-owned mosaics retain their numeric-category caption behavior;
+they are separate from standalone Validate's individual named PNGs and do not
+reserve a standalone Validate run.
 
 ## Incremental prediction
 
@@ -506,9 +582,65 @@ Controls share the owning system's pending-operation admission, including when
 a pause event arrives before its reply. EOF completes the run; Stop cancels it.
 The latest completed preview remains available after either outcome.
 
-Output JSON is optional for GUI viewing. When selected, records are streamed
+Image and compiled-dataset JSON is enabled by default through the native
+`write_report_json` setting, independently of the media-saving controls.
+When enabled, `predictions.json` is streamed
 to a temporary sibling file and published by rename only on success.
 Cancellation/failure removes the temporary file and preserves an existing
 destination. The document records source/model/backend facts, `class_domain`,
 `class_layout`, and per-image records. Masks use
 `row_major_start_length`; semantic names come only from the admitted catalog.
+Video writes no prediction JSON, including with media saving disabled.
+
+## Prediction samples and Full video
+
+Predict's Output card retains independent saving choices for each source:
+
+| Source | Initial choice | Saved product |
+| --- | --- | --- |
+| Single image | **Save sample** enabled | `sample.png` |
+| Compiled dataset | Saving enabled, **Percent %** = 10 | `samples/sample-<dataset-index>.png` |
+| Video | Saving enabled, **Full** selected; Samples count = 6 | `prediction.mkv`, or `samples/frame-<decoded-index>.png` in Samples mode |
+
+Compiled **Percent %** accepts integers 1–100 and saves
+`ceil(dataset_count * percent / 100)`. **Total** accepts 1 through the matching
+inspected dataset count and initially clamps 6 to that count. The input is
+disabled until that source's count is known; source changes clamp it and native
+Start revalidates the population. Smaller selections are uniform subsets
+without replacement; a full selection needs no random index storage.
+Selection retains the smaller of the selected and excluded index sets.
+Saving leaves inference order and `limit_images` unchanged. If an independent
+inference limit admits fewer images than the requested sample count, Start
+refuses that combination instead of changing coverage.
+
+Video **Samples** uses reservoir sampling over actually decoded frames, with
+bounded storage proportional to the requested count. Declared frame totals
+are advisory. A replacement PNG publishes completely before the previous slot
+file is removed. A request larger than the decoded population preserves all
+available samples and fails with an explicit requested/observed/saved shortfall.
+Decode and write failures retain their own cause and completed output.
+
+The accepted run captures labels, boxes, masks, colors, and confidence for
+saving. Media is composed at native source geometry from the same incremental
+prediction delivery; it requires neither a visible browser nor another inference
+pass. Semantic captions use class names; unresolved output identities remain
+explicit **Raw slot** labels. PNG publication is atomic, and its writer retains
+owned staging and reusable pinned readback storage through settlement.
+
+**Full** writes H.264 in Matroska, preserving source presentation timestamps,
+frame durations and original audio tracks. Source audio must be admitted by the
+container format. The native media owner tries hardware encoding, then selects
+software H.264 before opening output if hardware admission fails; it never
+changes encoders within a file. No codec/container/bitrate control is exposed.
+Inference pauses affect wall-clock progress rather than output timing.
+Encoder, audio packet, and GPU-read custody stay bounded under worker-side
+backpressure. The [media source and sink](architecture.md#workflow-output-and-media-handoffs)
+own demux, timing and mux policy separately from prediction.
+
+During execution the file is `prediction.partial.mkv`. Successful draining,
+trailer/file settlement and rename publish `prediction.mkv`. Cancellation or
+failure retains the partial path and completed PNGs. Incrementally flushed MKV
+clusters remain available after interruption without a final rename or trailer;
+an unfinished buffered tail can be lost. A failure before any usable cluster
+does not guarantee playable media. The Output card exposes the retained partial
+path without describing it as a completed artifact.
