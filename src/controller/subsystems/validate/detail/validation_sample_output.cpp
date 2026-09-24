@@ -1,7 +1,7 @@
 #include "validation_sample_output.h"
 #include "src/backend/imaging/raster/caption_raster.h"
 #include "src/backend/imaging/raster/class_palette.h"
-#include "src/backend/models/rfdetr/core/sample_output.h"
+#include "src/backend/imaging/raster/rendered_image_writer.h"
 #include "src/frameworks/gpu/image_failure.h"
 #include <algorithm>
 #include <array>
@@ -17,7 +17,7 @@ namespace rfdetr = mmltk::backend::models::rfdetr;
 namespace raster = mmltk::backend::imaging::raster;
 class ValidationSampleOutput::Impl final {
 public:
- Impl(DirectComputeConfiguration configuration, VisualDeviceSettings visual, ComputeArtifactSink published, rfdetr::RenderedImageWriter::PngEncoder encoder)
+ Impl(DirectComputeConfiguration configuration, VisualDeviceSettings visual, ComputeArtifactSink published, raster::RenderedImageWriter::PngEncoder encoder)
  : configuration_(std::move(configuration)), visual_(visual), published_(std::move(published)), encoder_(std::move(encoder)) {}
  void Ensure() {
   if (pool_) return;
@@ -39,7 +39,7 @@ public:
   }
   runtime_->BindContext();
   if (!captions_) captions_ = std::make_unique<raster::CaptionRaster>(*context_);
-  if (!writer_) writer_ = std::make_unique<rfdetr::RenderedImageWriter>(*context_,encoder_);
+  if (!writer_) writer_ = std::make_unique<raster::RenderedImageWriter>(*context_,encoder_);
   // Prepare settles changed catalog uploads before any output candidate can
   // publish; Draw batches descriptor upload and painting on its image stream.
   captions_->Prepare(raw->classes());
@@ -78,13 +78,13 @@ public:
  DirectComputeConfiguration configuration_;
  VisualDeviceSettings visual_;
  ComputeArtifactSink published_;
- rfdetr::RenderedImageWriter::PngEncoder encoder_;
+ raster::RenderedImageWriter::PngEncoder encoder_;
  std::shared_ptr<gpu::TerminalCudaRetirementOwner> retirement_ = std::make_shared<gpu::TerminalCudaRetirementOwner>(21U);
  std::optional<gpu::DeviceContext> context_;
  std::unique_ptr<PredictionPreviewPool> pool_;
  std::unique_ptr<gpu::SystemImageRuntime> runtime_;
  std::unique_ptr<raster::CaptionRaster> captions_;
- std::unique_ptr<rfdetr::RenderedImageWriter> writer_;
+ std::unique_ptr<raster::RenderedImageWriter> writer_;
  std::filesystem::path directory_;
  contracts::ValidationRunPreview options_;
  std::vector<raster::NamedCaption> labels_;
@@ -93,7 +93,7 @@ public:
  std::size_t count_ = 0;
  std::exception_ptr failure_;
 };
-ValidationSampleOutput::ValidationSampleOutput(DirectComputeConfiguration configuration, VisualDeviceSettings visual, ComputeArtifactSink published, rfdetr::RenderedImageWriter::PngEncoder encoder)
+ValidationSampleOutput::ValidationSampleOutput(DirectComputeConfiguration configuration, VisualDeviceSettings visual, ComputeArtifactSink published, raster::RenderedImageWriter::PngEncoder encoder)
  : impl_(std::make_shared<Impl>(std::move(configuration), visual, std::move(published),std::move(encoder))) {}
 ValidationSampleOutput::~ValidationSampleOutput() = default;
 void ValidationSampleOutput::Begin(std::filesystem::path directory, contracts::ValidationRunPreview options, std::span<const std::uint32_t> indices) {

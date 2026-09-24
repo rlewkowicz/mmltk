@@ -62,7 +62,7 @@ ValidationRuntimeResult CudaValidationRuntime::Run(
 class ValidationSystem::Impl final {
 public:
  Impl(SettingsSystem& settings, DatasetSystem& dataset, ModelSystem& model, ValidationRuntimeFactory factory, SystemEventSink<ValidationSystem::event_type> events,
-  std::optional<mmltk::frameworks::gpu::DeviceExecution> execution, VisualDeviceSettings visual, mmltk::backend::models::rfdetr::RenderedImageWriter::PngEncoder encoder)
+  std::optional<mmltk::frameworks::gpu::DeviceExecution> execution, VisualDeviceSettings visual, mmltk::backend::imaging::raster::RenderedImageWriter::PngEncoder encoder)
      : settings_(settings),
        dataset_(dataset),
        model_(model),
@@ -234,7 +234,7 @@ public:
  detail::ValidationSampleOutput sample_output_;
 };
 ValidationSystem::ValidationSystem(SettingsSystem& settings, DatasetSystem& dataset, ModelSystem& model, ValidationRuntimeFactory factory, SystemEventSink<event_type> events,
- std::optional<mmltk::frameworks::gpu::DeviceExecution> execution, VisualDeviceSettings visual, mmltk::backend::models::rfdetr::RenderedImageWriter::PngEncoder encoder)
+ std::optional<mmltk::frameworks::gpu::DeviceExecution> execution, VisualDeviceSettings visual, mmltk::backend::imaging::raster::RenderedImageWriter::PngEncoder encoder)
     : impl_(std::make_unique<Impl>(settings, dataset, model, std::move(factory), std::move(events), std::move(execution), visual, std::move(encoder))) {}
 ValidationSystem::~ValidationSystem() = default;
 ValidationSnapshot ValidationSystem::Start(contracts::ValidateWorkflowIntent intent) {

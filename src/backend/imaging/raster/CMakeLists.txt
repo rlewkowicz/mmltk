@@ -15,15 +15,17 @@ mmltk_register_retained_module_implementation_units(
 mmltk_register_ordinary_sources(
     mmltk_backend_imaging_raster
     caption_raster.cpp
+    rendered_image_writer.cpp
     caption_raster.cu
     image_operations.cpp
     image_operations.cu
     chw_image.cu
     raster_cuda.cu
     mask_pack_cuda.cu)
-mmltk_register_public_headers(mmltk_backend_imaging_raster BASE_DIRS ${CMAKE_SOURCE_DIR} FILES caption_raster.h chw_image.h image_operations.h image_containment.h)
+mmltk_register_public_headers(mmltk_backend_imaging_raster BASE_DIRS ${CMAKE_SOURCE_DIR} FILES rendered_image_writer.h caption_raster.h chw_image.h image_operations.h image_containment.h)
 mmltk_register_private_headers(
     mmltk_backend_imaging_raster
+    detail/checked_png.h
     detail/caption_raster_cuda.h
     detail/mask_pack_cuda_abi.h
     detail/raster_math.cuh
@@ -40,21 +42,25 @@ target_link_libraries(mmltk_backend_imaging_raster
         CUDA::cudart
     PRIVATE
         stb
+        mmltk::common::concurrency
         mmltk::backend::imaging::primitives
 )
 set_target_properties(mmltk_backend_imaging_raster PROPERTIES
     CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}"
 )
 
+mmltk_register_header_isolation(mmltk_backend_imaging_raster)
+
 function(mmltk_add_backend_imaging_raster_tests)
     add_executable(mmltk_backend_imaging_raster_tests EXCLUDE_FROM_ALL)
     mmltk_configure_component(mmltk_backend_imaging_raster_tests PRIVATE_DECLARATIONS)
-    mmltk_register_ordinary_sources(mmltk_backend_imaging_raster_tests ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/caption_raster.test.cpp)
+    mmltk_register_ordinary_sources(mmltk_backend_imaging_raster_tests ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/caption_raster.test.cpp
+        ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/rendered_image_writer.test.cpp)
     mmltk_register_retained_module_importers(mmltk_backend_imaging_raster_tests
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/image_operations.test.cpp
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/validation_overlay.test.cpp)
     target_link_libraries(mmltk_backend_imaging_raster_tests PRIVATE
-        mmltk_test_support mmltk_frameworks_gpu_test_support mmltk::backend::imaging::raster)
+        stb mmltk_test_support mmltk_frameworks_gpu_test_support mmltk::backend::imaging::raster)
     mmltk_enable_native_runtime_rpath(mmltk_backend_imaging_raster_tests)
     catch_discover_tests(mmltk_backend_imaging_raster_tests
         TEST_PREFIX "backend::imaging::raster::" DISCOVERY_MODE PRE_TEST ADD_TAGS_AS_LABELS)

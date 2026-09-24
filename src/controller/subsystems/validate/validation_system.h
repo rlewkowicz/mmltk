@@ -6,7 +6,7 @@
 #include "src/controller/contracts/application_boundary.h"
 #include "src/frameworks/gpu/device_execution.h"
 #include "validation_types.h"
-#include "src/backend/models/rfdetr/core/sample_output.h"
+#include "src/backend/imaging/raster/rendered_image_writer.h"
 #include "src/controller/contracts/workspace_input.h"
 #include "src/controller/presentation/visual_runtime.h"
 #include "src/controller/presentation/visual_source_projection.h"
@@ -22,7 +22,7 @@ public:
  using visual_source = VisualSourceProjection<ValidationSnapshot, PresentationSourceKind::Validation, mmltk::frameworks::reflection::member_path<&ValidationSnapshot::frame>,
   mmltk::frameworks::reflection::member_path<&ValidationSnapshot::frame, &VisualFrame::revision>, ValidationImageMetadata>;
  ValidationSystem(
-  SettingsSystem&, DatasetSystem&, ModelSystem&, ValidationRuntimeFactory, SystemEventSink<event_type> = {}, std::optional<mmltk::frameworks::gpu::DeviceExecution> = {}, VisualDeviceSettings = {}, mmltk::backend::models::rfdetr::RenderedImageWriter::PngEncoder = {});
+  SettingsSystem&, DatasetSystem&, ModelSystem&, ValidationRuntimeFactory, SystemEventSink<event_type> = {}, std::optional<mmltk::frameworks::gpu::DeviceExecution> = {}, VisualDeviceSettings = {}, mmltk::backend::imaging::raster::RenderedImageWriter::PngEncoder = {});
  ~ValidationSystem();
  [[= contracts::reflection::direct::IntentEndpoint{}]] [[nodiscard]] ValidationSnapshot Start(contracts::ValidateWorkflowIntent);
  [[= contracts::reflection::direct::IntentEndpoint{}]] [[nodiscard]] ValidationSnapshot Stop() noexcept;

@@ -66,6 +66,7 @@ target_link_libraries(mmltk_controller_data_compute_systems
         mmltk::backend::ml::runtime
         mmltk::backend::models::rfdetr::export)
 mmltk_link_declarations(mmltk_controller_data_compute_systems PUBLIC
+    mmltk::backend::imaging::raster
     mmltk::backend::models::rfdetr::training
     mmltk::controller::visual_runtime
     mmltk::backend::models::rfdetr::inference)

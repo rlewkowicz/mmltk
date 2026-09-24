@@ -2,6 +2,9 @@
 #include "src/test_support/async_test_utils.hpp"
 #include "src/controller/subsystems/validate/detail/validation_samples.h"
 #include "src/controller/subsystems/validate/detail/validation_sample_output.h"
+#include "src/backend/imaging/raster/detail/checked_png.h"
+#include <cstdio>
+#include <iterator>
 #include <stb_image.h>
 #include <stb_image_write.h>
 #include "src/frameworks/gpu/tests/device_execution_fixture.h"
@@ -627,26 +630,35 @@ TEST_CASE("retained validation preparation follows physical storage and changed 
 namespace {
 class RefusedValidationPreview final : public ValidationRuntime {
 public:
- explicit RefusedValidationPreview(std::atomic_size_t& runs, bool file_failure) : runs_(runs), file_failure_(file_failure) {}
+ explicit RefusedValidationPreview(std::atomic_size_t& runs, unsigned failure) : runs_(runs), failure_(failure) {}
  ValidationRuntimeResult Run(
   mmltk::backend::models::rfdetr::ValidateRequest request, std::stop_token, const ComputeProgressSink& progress, const mmltk::backend::models::rfdetr::ValidationDelivery& delivery) override {
   namespace rfdetr = mmltk::backend::models::rfdetr;
   ++runs_;
-  const std::array<std::uint32_t, 1U> selected{3U};
+  const std::array<std::uint32_t, 2U> selected{3U, 5U};
   const auto catalog = std::make_shared<const mmltk::backend::data::catalog::ClassCatalog>(std::vector<std::string>{"measured"});
-  delivery.samples_selected(selected, catalog);
+  delivery.samples_selected(std::span(selected).first(failure_ == 2U ? 2U : 1U), catalog);
   const rfdetr::PredictionRecord prediction{.dataset_index = 3U};
   const mmltk::backend::ml::runtime::AnalysisAnnotationStorage annotations{.class_catalog = catalog};
-  if (file_failure_) {
+  if (failure_ != 0U) {
    const auto execution = mmltk::frameworks::gpu::resolve_device_execution(0,mmltk::common::system::NumaTopology::Capture());
    auto source = PredictionSource::Device(execution,{32U,24U},std::vector<float>(32U*24U*3U,0.25F),{},catalog);
-   std::ofstream blocked(request.report_json_path.parent_path()/"samples");
-   blocked << "occupied";
-   blocked.close();
+   const auto directory = request.report_json_path.parent_path()/"samples";
+   if (failure_ == 1U) {
+    std::ofstream blocked(directory);
+    blocked << "occupied";
+   } else {
+    std::filesystem::create_directories(directory);
+   }
    delivery.sample({prediction,{.chw=source.pixels(),.width=32U,.height=24U,.device=0,.custody=source.custody()},source.annotations(),{}});
+   if (failure_ == 2U) {
+    const rfdetr::PredictionRecord second{.dataset_index = 5U};
+    delivery.sample({second,{.chw=source.pixels(),.width=32U,.height=24U,.device=0,.custody=source.custody()},source.annotations(),{}});
+   }
   } else delivery.sample({prediction, {.preview_failure = "preview storage refused"}, annotations, {}});
-  progress({1U, 1U, 1U, "Validating"});
-  ValidationRuntimeResult result{.terminal = contracts::make_compute_terminal(contracts::ComputeOperationOutcome::Succeeded, 0U, 1U)};
+  const auto completed = failure_ == 2U ? 2U : 1U;
+  progress({completed, completed, completed, "Validating"});
+  ValidationRuntimeResult result{.terminal = contracts::make_compute_terminal(contracts::ComputeOperationOutcome::Succeeded, 0U, completed)};
   result.evaluation.emplace();
   result.evaluation->summary.bbox.available = true;
   result.evaluation->summary.bbox.ap = 0.625;
@@ -656,11 +668,11 @@ public:
 
 private:
  std::atomic_size_t& runs_;
- bool file_failure_;
+ unsigned failure_;
 };
 }  // namespace
 TEST_CASE("validation semantic metrics survive required sample refusal without reinference", "[controller][systems][gpu][validation]") {
- const bool file_failure = GENERATE(false,true);
+ const unsigned failure = GENERATE(0U,1U,2U);
  const auto root = mmltk::testsupport::make_temp_root("validation-preview-refusal");
  ApplicationDataFixture fixture{root};
  fixture.PrepareModel(contracts::FeatureId::Validate);
@@ -672,8 +684,9 @@ TEST_CASE("validation semantic metrics survive required sample refusal without r
  std::condition_variable display_changed;
  std::atomic_size_t runs = 0U;
  std::promise<ValidationSnapshot> finished;
+ unsigned encoded_samples = 0;
  ValidationSystem validation(
-  settings, dataset, model, [&] { return std::make_unique<RefusedValidationPreview>(runs,file_failure); },
+  settings, dataset, model, [&] { return std::make_unique<RefusedValidationPreview>(runs,failure); },
   [&](auto event) {
    std::scoped_lock lock(display_mutex);
    display_changed.notify_all();
@@ -684,7 +697,15 @@ TEST_CASE("validation semantic metrics survive required sample refusal without r
     } catch (const std::future_error&) {}
    }
   },
-  {}, {.device = 0, .maximum_width = 768U, .maximum_height = 512U});
+  {}, {.device = 0, .maximum_width = 768U, .maximum_height = 512U},
+  [&](const char* path, int width, int height, int channels, const void* pixels, int stride) {
+   if (failure == 2U && ++encoded_samples == 2U) {
+    auto* full = std::fopen("/dev/full", "wb");
+    if (!full) throw std::runtime_error("open validation PNG failure stream");
+    return mmltk::backend::imaging::raster::detail::write_png_stream(full, path, width, height, channels, pixels, stride);
+   }
+   return mmltk::backend::imaging::raster::detail::write_png_file(path, width, height, channels, pixels, stride);
+  });
  static_cast<void>(validation.Start({}));
  const auto result = finished.get_future().get();
  await_validation(display_mutex, display_changed, [&] { return validation.snapshot().frame.revision != 0U; });
@@ -693,9 +714,24 @@ TEST_CASE("validation semantic metrics survive required sample refusal without r
  REQUIRE(result.metrics);
  CHECK(result.metrics->bbox.ap == 0.625);
  CHECK(result.operation.terminal.outcome == contracts::ComputeOperationOutcome::Failed);
- CHECK(result.operation.terminal.completed == 1U);
- CHECK(std::ranges::none_of(result.sample_available, [](bool available) { return available; }));
- CHECK_THROWS_AS(validation.SelectSample({result.operation.generation_frontier, 3U}), contracts::InvalidIntentError);
+ CHECK(result.operation.terminal.completed == (failure == 2U ? 2U : 1U));
+ CHECK(result.operation.output.completed_samples == (failure == 2U ? 1U : 0U));
+ if (failure == 2U) {
+  const auto directory = std::filesystem::path(result.operation.output.directory)/"samples";
+  CHECK(result.operation.output.recent_sample == (directory/"sample-3.png").string());
+  CHECK(result.operation.terminal.detail.find("rendered PNG") != std::string::npos);
+  CHECK(result.operation.terminal.detail.find("sample-5.png.partial") != std::string::npos);
+  CHECK_FALSE(std::filesystem::exists(directory/"sample-5.png"));
+  CHECK_FALSE(std::filesystem::exists(directory/"sample-5.png.partial"));
+  CHECK_FALSE(std::filesystem::exists(directory/"sample-3.png.partial"));
+  CHECK(std::distance(std::filesystem::directory_iterator(directory), std::filesystem::directory_iterator{}) == 1);
+  int width=0,height=0,channels=0;
+  std::unique_ptr<stbi_uc,decltype(&stbi_image_free)> pixels(stbi_load((directory/"sample-3.png").c_str(),&width,&height,&channels,4),stbi_image_free);
+  REQUIRE(pixels);CHECK(width==32);CHECK(height==24);CHECK(pixels.get()[0]==64U);
+ } else {
+  CHECK(std::ranges::none_of(result.sample_available, [](bool available) { return available; }));
+  CHECK_THROWS_AS(validation.SelectSample({result.operation.generation_frontier, 3U}), contracts::InvalidIntentError);
+ }
  static_cast<void>(validation.CloseDetail());
  for (const double threshold : {0.0, 1.0, 0.437, 0.4}) {
   contracts::SettingsUpdateRequest edit;
