@@ -281,6 +281,8 @@ TEST_CASE("Stock dense and sparse masks share explicit CPU CUDA samples and reta
   return F::grid_sample(image, (2 * points - 1).unsqueeze(2), options).squeeze(3).squeeze(1);
  };
  for (const auto device : parity_devices()) for (bool sparse : {false,true}) for (int change : {0,1,2,3,4,5,6}) {
+  const auto prior_identity = workspace.loss_cache().sigmoid_focal.identity();
+  const auto amp = change == 1 || change == 3 ? torch::kFloat16 : change == 2 ? torch::kBFloat16 : torch::kFloat32;
   const int64_t ratio=change==1?4:2; const double alpha=change==3?0.6:0.25, denominator=change==5?3.0:1.0;
   rf::DetectionConfig config; config.num_classes=2; config.group_detr=1; config.include_masks=true; config.ia_bce_loss=false;
   config.mask_point_sample_ratio=ratio; config.focal_alpha=alpha;
@@ -301,12 +303,15 @@ TEST_CASE("Stock dense and sparse masks share explicit CPU CUDA samples and reta
   std::array<std::vector<torch::Tensor>,3> leaves;
   std::array<torch::Tensor,3> totals;
   for (int route=0;route<3;++route) {
+   mmltk::backend::ml::cuda::TorchAutocastScope forward_scope(amp != torch::kFloat32, amp);
    auto logits=torch::tensor({{{0.37,-0.61}}},options).set_requires_grad(true);
    auto spatial=(torch::arange(16,options).reshape({1,1,4,4})*0.13-0.9).set_requires_grad(true);
    auto query=torch::full({1,1,1},0.83,options).set_requires_grad(true);
    auto bias=torch::full({1},0.17,options).set_requires_grad(true);
    leaves[route]={logits,spatial}; if(sparse) { leaves[route].push_back(query); leaves[route].push_back(bias); }
-   const auto dense=sparse ? spatial*query.reshape({1,1,1,1})+bias : spatial;
+   // The independent sparse equation is a contraction, so actual AMP rounds
+   // its operands and result before the FP32 bias promotes the mask again.
+   const auto dense=sparse ? torch::matmul(query[0],spatial[0].flatten(1)).reshape({1,1,4,4})+bias : spatial;
    if(route<2) {
     config.use_jit_traced_loss_ops=route==0;
     rf::ModelOutputs output; output.main.pred_logits=logits; output.main.pred_boxes=gt.all_boxes.unsqueeze(0);
@@ -317,33 +322,45 @@ TEST_CASE("Stock dense and sparse masks share explicit CPU CUDA samples and reta
     if(route==0) {
      // Exercise failure and old-signature reuse in this very criterion workspace.
      auto& slot=workspace.loss_cache().sigmoid_focal;
-     const auto original=slot.module._ivalue();
+     const auto original=slot.identity();
+     if(change>0) {
+      const bool changed_context = device.is_cuda() && change<=4;
+      const bool changed_alpha = change==3 || change==4;
+      if(changed_context || changed_alpha) REQUIRE(original!=prior_identity);
+      else REQUIRE(original==prior_identity);
+     }
      const auto labels=torch::tensor({{{1.,0.}}},options);
-     REQUIRE_THROWS(rf::ensure_parametric_binary_loss_trace(slot,"__torch__.RejectedCriterionTrace",logits.to(torch::kFloat64),labels.to(torch::kFloat64),alpha+0.1,3.0,
-      [](const torch::Tensor&,const torch::Tensor&) -> torch::Tensor { throw std::runtime_error("replacement failure"); }));
-     REQUIRE(slot.module._ivalue()==original); REQUIRE(slot.alpha==alpha); REQUIRE(slot.gamma==2.0); REQUIRE(slot.matches(logits,labels));
+     {
+      mmltk::backend::ml::cuda::TorchAutocastScope rejected_scope(amp == torch::kFloat32, torch::kBFloat16);
+      REQUIRE_THROWS(slot.invoke("__torch__.RejectedCriterionTrace", {alpha+0.1,3.0},
+       [](const torch::Tensor&,const torch::Tensor&) -> torch::Tensor { throw std::runtime_error("replacement failure"); },
+       logits.to(torch::kFloat64),labels.to(torch::kFloat64)));
+     }
+     REQUIRE(slot.identity()==original);
      const auto reused=rf::detection_loss_dict(output,gt,config,true,torch::full({},denominator,options),samples);
-     REQUIRE(slot.module._ivalue()==original);
+     REQUIRE(slot.identity()==original);
      REQUIRE(torch::allclose(totals[route],rf::weighted_detection_loss(reused,config,device),1e-5,1e-6));
      // Gamma is fixed at two by the criterion. Mutate the same slot through its
      // ordinary semantic API, then prove criterion restoration replaces it.
      if(change==3) {
-      rf::ensure_parametric_binary_loss_trace(slot,"__torch__.ChangedCriterionGamma",logits,labels,alpha,3.0,
-       [alpha](const torch::Tensor& x,const torch::Tensor& y) { const auto p=x.sigmoid(); return ((y*torch::softplus(-x)+(1-y)*torch::softplus(x))*torch::pow(1-(p*y+(1-p)*(1-y)),3)*(alpha*y+(1-alpha)*(1-y))).mean(1).sum(); });
-      REQUIRE(slot.gamma==3.0);
-      const auto changed=slot.module.forward({logits,labels}).toTensor();
+      const auto changed=slot.invoke("__torch__.ChangedCriterionGamma", {alpha,3.0},
+       [alpha](const torch::Tensor& x,const torch::Tensor& y) { const auto p=x.sigmoid(); return ((y*torch::softplus(-x)+(1-y)*torch::softplus(x))*torch::pow(1-(p*y+(1-p)*(1-y)),3)*(alpha*y+(1-alpha)*(1-y))).mean(1).sum(); }, logits, labels);
+      REQUIRE(slot.identity()!=original);
       const auto p=logits.sigmoid();
       const auto reference=((labels*torch::softplus(-logits)+(1-labels)*torch::softplus(logits))*torch::pow(1-(p*labels+(1-p)*(1-labels)),3)*(alpha*labels+(1-alpha)*(1-labels))).mean(1).sum();
       REQUIRE(torch::allclose(changed,reference,1e-5,1e-6));
+      mmltk::backend::ml::cuda::TorchAutocastScope backward_scope(false, torch::kFloat32);
       REQUIRE(torch::allclose(torch::autograd::grad({changed},{logits},{},true)[0],torch::autograd::grad({reference},{logits},{},true)[0],1e-5,1e-6));
      }
      const auto restored=rf::detection_loss_dict(output,gt,config,true,torch::full({},denominator,options),samples);
-     REQUIRE(slot.gamma==2.0); REQUIRE(slot.alpha==alpha);
+     if(change!=3) REQUIRE(slot.identity()==original);
      const auto restored_total=rf::weighted_detection_loss(restored,config,device), reused_total=rf::weighted_detection_loss(reused,config,device);
      REQUIRE(torch::allclose(totals[route],restored_total,1e-5,1e-6));
+     mmltk::backend::ml::cuda::TorchAutocastScope backward_scope(false, torch::kFloat32);
      const auto reused_gradients=torch::autograd::grad({reused_total},leaves[route],{},true), restored_gradients=torch::autograd::grad({restored_total},leaves[route],{},true);
      for(size_t i=0;i<leaves[route].size();++i) REQUIRE(torch::allclose(reused_gradients[i],restored_gradients[i],2e-5,2e-6));
-     totals[route]=restored_total;
+     const auto original_gradients=torch::autograd::grad({totals[route]},leaves[route],{},true);
+     for(size_t i=0;i<leaves[route].size();++i) REQUIRE(torch::allclose(original_gradients[i],restored_gradients[i],2e-5,2e-6));
     }
    } else {
     const auto uncertainty=sample(dense.detach(),supplied.uncertain_candidates,false).abs().neg();
@@ -364,6 +381,77 @@ TEST_CASE("Stock dense and sparse masks share explicit CPU CUDA samples and reta
   for(int route=0;route<2;++route) {
    REQUIRE(torch::allclose(totals[route],totals[2],2e-5,2e-6));
    for(size_t i=0;i<leaves[route].size();++i) REQUIRE(torch::allclose(gradients[route][i],gradients[2][i],2e-5,2e-6));
+  }
+ }
+}
+
+TEST_CASE("Loss contraction cache follows effective CUDA precision with outstanding backwards", "[rfdetr][parity]") {
+ PrecisionPolicy precision;
+ const auto topology = mmltk::common::system::NumaTopology::Capture();
+ const auto placement = mmltk::common::system::resolve_placement(topology, topology.permitted_nodes.front());
+ mmltk::common::system::ScopedExecutionPolicy policy({placement.cpus, {}, 0, placement.numa_node, -10, false});
+ rf::MatcherWorkspace workspace(placement.numa_node, true);
+ struct Context { bool enabled; c10::ScalarType dtype; };
+ const std::array<Context,7> contexts{{{false,torch::kFloat16}, {false,torch::kBFloat16},
+  {true,torch::kFloat16}, {true,torch::kFloat16}, {true,torch::kBFloat16}, {true,torch::kFloat16}, {false,torch::kFloat16}}};
+ const auto recorded = [](const torch::Tensor& x, const torch::Tensor& y) {
+  const auto p=x.sigmoid();
+  return 1-(2*torch::einsum("nc,mc->nm",{p,y})+1)/(p.sum(1).unsqueeze(1)+y.sum(1).unsqueeze(0)+1);
+ };
+ for(const auto device:parity_devices()) {
+  struct Pending {
+   torch::Tensor actual, expected;
+   std::vector<torch::Tensor> inputs, reference;
+  };
+  std::vector<Pending> pending;
+  auto& slot=workspace.loss_cache().batch_dice;
+  for(size_t index=0;index<contexts.size();++index) {
+   const auto context=contexts[index];
+   const auto options=torch::TensorOptions().device(device).dtype(torch::kFloat32);
+   const int64_t points=3+static_cast<int64_t>(index%2);
+   auto x=(torch::arange(2*points,options).reshape({2,points})*0.13713-0.61917).set_requires_grad(true);
+   auto y=(torch::arange(3*points,options).reshape({3,points})*0.03171+0.17319).set_requires_grad(true);
+   auto a=x.detach().clone().set_requires_grad(true), b=y.detach().clone().set_requires_grad(true);
+   torch::Tensor actual, expected;
+   {
+    // Set the inactive dtype explicitly as well: it must not cause replacement.
+    mmltk::backend::ml::cuda::TorchAutocastScope dtype_scope(true,context.dtype);
+    mmltk::backend::ml::cuda::TorchAutocastScope forward_scope(context.enabled,context.dtype);
+    const auto previous=slot.identity();
+    actual=slot.invoke("__torch__.PrecisionBatchDice",recorded,x,y);
+    if(index>0) {
+     const auto prior=contexts[index-1];
+     const bool incompatible=device.is_cuda() && (prior.enabled!=context.enabled || (context.enabled && prior.dtype!=context.dtype));
+     if(incompatible) REQUIRE(slot.identity()!=previous);
+     else REQUIRE(slot.identity()==previous);
+    }
+    const auto identity=slot.identity();
+    const auto reused=slot.invoke("__torch__.PrecisionBatchDice",recorded,x,y);
+    REQUIRE(slot.identity()==identity);
+    REQUIRE(torch::equal(actual,reused));
+    const auto p=a.sigmoid();
+    expected=1-(2*torch::matmul(p,b.transpose(0,1))+1)/(p.sum(1).unsqueeze(1)+b.sum(1).unsqueeze(0)+1);
+    REQUIRE(torch::allclose(actual,expected,2e-5,2e-6));
+    if(device.is_cuda()) {
+     // Change only execution context: failure must leave the full prior key usable.
+     {
+      mmltk::backend::ml::cuda::TorchAutocastScope rejected_scope(!context.enabled,torch::kBFloat16);
+      REQUIRE_THROWS(slot.invoke("__torch__.RejectedPrecisionBatchDice",
+       [](const torch::Tensor&,const torch::Tensor&) -> torch::Tensor { throw std::runtime_error("precision candidate failure"); },x,y));
+     }
+     REQUIRE(slot.identity()==identity);
+     const auto after_failure=slot.invoke("__torch__.PrecisionBatchDice",recorded,x,y);
+     REQUIRE(slot.identity()==identity);
+     REQUIRE(torch::equal(after_failure,actual));
+    }
+   }
+   pending.push_back({actual,expected,{x,y},{a,b}});
+  }
+  // Every old graph remains differentiable after its slot has been replaced.
+  for(const auto& value:pending) {
+   const auto actual=torch::autograd::grad({value.actual.sum()},value.inputs);
+   const auto expected=torch::autograd::grad({value.expected.sum()},value.reference);
+   for(size_t i=0;i<actual.size();++i) REQUIRE(torch::allclose(actual[i],expected[i],2e-5,2e-6));
   }
  }
 }

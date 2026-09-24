@@ -176,8 +176,7 @@ torch::Tensor run_binary_traced_or_direct(
  TracedLossOp<2> TracedLossOpCache::* cache_member, const char* class_name, const bool use_jit_traced, const BinaryLossFn& direct_fn, const torch::Tensor& first, const torch::Tensor& second) {
  if (use_jit_traced) {
   auto& slot = traced_loss_op_cache().*cache_member;
-  ensure_loss_trace(slot, class_name, direct_fn, first, second);
-  return slot.module.forward({first, second}).toTensor();
+  return slot.invoke(class_name, direct_fn, first, second);
  }
  return direct_fn(first, second);
 }
@@ -185,8 +184,7 @@ torch::Tensor run_ternary_traced_or_direct(TracedLossOp<3> TracedLossOpCache::* 
  const torch::Tensor& first, const torch::Tensor& second, const torch::Tensor& third) {
  if (use_jit_traced) {
   auto& slot = traced_loss_op_cache().*cache_member;
-  ensure_loss_trace(slot, class_name, direct_fn, first, second, third);
-  return slot.module.forward({first, second, third}).toTensor();
+  return slot.invoke(class_name, direct_fn, first, second, third);
  }
  return direct_fn(first, second, third);
 }
@@ -194,8 +192,7 @@ torch::Tensor run_parametric_traced_or_direct(TracedParametricBinaryLossOp Trace
  const double alpha, const double gamma, const bool use_jit_traced, const BinaryLossFn& direct_fn) {
  if (use_jit_traced) {
   auto& slot = traced_loss_op_cache().*cache_member;
-  ensure_parametric_binary_loss_trace(slot, class_name, inputs, targets, alpha, gamma, direct_fn);
-  return slot.module.forward({inputs, targets}).toTensor();
+  return slot.invoke(class_name, {alpha, gamma}, direct_fn, inputs, targets);
  }
  return direct_fn(inputs, targets);
 }
