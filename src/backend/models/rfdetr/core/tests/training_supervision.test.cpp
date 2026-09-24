@@ -1,3 +1,4 @@
+#include "src/backend/models/rfdetr/core/detail/training_mask_loss.h"
 #include "src/backend/ml/torch/tests/catch_support.h"
 #include <torch/utils.h>
 #include "src/backend/models/rfdetr/core/model.h"
@@ -596,7 +597,7 @@ void test_timing_leases_are_explicit_bounded_and_harvested_once() {
  for (const auto& loss : mask_losses) loss.total.backward();
  static_cast<void>(cudaDeviceSynchronize());
  const auto mask_handoff = masks.harvest_timing();
- REQUIRE(mask_handoff.completed_leases == 34); REQUIRE(mask_handoff.outstanding_leases == 0);
+ REQUIRE(mask_handoff.completed_leases == 36); REQUIRE(mask_handoff.outstanding_leases == 0);
  REQUIRE(masks.harvest_timing().completed_leases == 0);
  auto dn_config = production_denoising_config(rfdetr::TrainAssignmentKind::Hungarian, true);
  dn_config.dec_layers = 2;
@@ -1651,42 +1652,160 @@ TEST_CASE("Sampled mask content distinguishes probes and retains projection grad
  const auto padded_samples = rfdetr::sample_pairwise_masks(layer, targets, indices, padded, 1, coords);
  REQUIRE(padded_samples.targets[0][2].sum().item<float>() == 0.F);
 }
-TEST_CASE("Mask supervision groups layers and disabled terms preserve the box objective", "[rfdetr][training_supervision]") {
+TEST_CASE("Mask supervision groups layers and disabled terms preserve the box objective", "[rfdetr][training_supervision][parity]") {
  const auto topology = mmltk::common::system::NumaTopology::Capture();
  rfdetr::MatcherWorkspace matcher(topology.permitted_nodes.front(), true); matcher.enable_statistics();
  rfdetr::ScopedRuntimeContext scope(nullptr,0,&matcher);
- for (const int groups : {1, 2}) for (const bool masks_enabled : {false, true}) {
-  auto config = match_free_config(); config.segmentation = true; config.group_detr = groups;
+ // A one-pixel field fixes every sampled value independently of coordinates.
+ // Distinct layer contents still require distinct conditioned probe graphs.
+ for (const int groups : {1, 2}) for (const bool sum_groups : {false, true}) for (const int mode : {0,1,2,3,4}) {
+  auto config = match_free_config(); config.segmentation = mode != 0; config.group_detr = groups; config.sum_group_losses = sum_groups;
   config.aux_loss = true; config.two_stage = true; config.dec_layers = 2; config.mask_point_sample_ratio = 1;
-  if (!masks_enabled) config.mask_ce_loss_coef = config.mask_dice_loss_coef = 0;
+  config.mask_ce_loss_coef = mode == 2 || mode == 4 ? 1.7 : 0.0;
+  config.mask_dice_loss_coef = mode == 3 || mode == 4 ? 2.3 : 0.0;
+  const bool masks_enabled = mode >= 2;
   rfdetr::TrainingSupervisionImpl owner(config, 2); owner.initialize(817); install_oracle_projections(owner);
-  auto features = torch::ones({1, groups, 3, 2}).set_requires_grad(true);
-  auto make_layer = [&] {
+  if (config.segmentation) set_parameter(owner,"mask_projection.weight",torch::tensor({{0.7F,-0.2F},{0.1F,0.9F}}));
+  set_parameter(owner,"query_projection.weight",torch::tensor({{0.8F,0.3F},{-0.2F,1.1F}}));
+  auto parameters = owner.named_parameters();
+  torch::OrderedDict<std::string,torch::Tensor> reference_parameters;
+  for (const auto& parameter : parameters) reference_parameters.insert(parameter.key(),parameter.value().detach().clone().set_requires_grad(true));
+  auto make_layer = [&](float content) {
+   auto features = torch::tensor({{{{0.8F,0.1F},{0.2F,0.9F},{0.4F,0.3F}}}}).repeat({1,groups,1,1}).set_requires_grad(true);
    auto layer = oracle_layer(features);
-   layer.pred_logits = layer.pred_logits.repeat({1,groups,1}); layer.pred_boxes = layer.pred_boxes.repeat({1,groups,1});
+   layer.pred_logits = layer.pred_logits.detach().repeat({1,groups,1}).set_requires_grad(true);
+   layer.pred_boxes = layer.pred_boxes.detach().repeat({1,groups,1}).set_requires_grad(true);
    layer.query_layout = rfdetr::SupervisedQueryLayout{groups,3};
-   layer.sparse_pred_masks = rfdetr::OutputLayer::SparsePredMasks{torch::ones({1,2,1,1}).set_requires_grad(true), torch::ones({1,groups*3,2}).set_requires_grad(true), torch::zeros({1}).set_requires_grad(true)};
+   if (config.segmentation) layer.sparse_pred_masks = rfdetr::OutputLayer::SparsePredMasks{
+    torch::tensor({content,0.4F-content}).view({1,2,1,1}).set_requires_grad(true),
+    features.detach().squeeze(1).reshape({1,groups*3,2}).clone().set_requires_grad(true),torch::zeros({1}).set_requires_grad(true)};
    return layer;
   };
-  rfdetr::ModelOutputs outputs; outputs.main = make_layer(); outputs.aux_outputs = {make_layer()}; outputs.enc_outputs = make_layer();
+  rfdetr::ModelOutputs outputs; outputs.main = make_layer(0.3F); outputs.aux_outputs = {make_layer(0.8F)}; outputs.enc_outputs = make_layer(-0.2F);
   auto targets = one_image_targets(torch::full({4,4},0.25F), torch::zeros({4},torch::kInt64));
-  if (masks_enabled) targets.packed_masks = rfdetr::PackedTargetMasks{torch::ones({4,1},torch::kInt64),1,1};
+  if (masks_enabled) targets.packed_masks = rfdetr::PackedTargetMasks{torch::tensor({{int64_t{1}},{int64_t{1}},{int64_t{1}},{int64_t{0}}},torch::kInt64),1,1};
   const auto rng = at::detail::getDefaultCPUGenerator().get_state();
   const auto loss = owner.loss(outputs, targets, {torch::tensor(4.F)}, true);
-  if (!masks_enabled) REQUIRE(torch::equal(rng, at::detail::getDefaultCPUGenerator().get_state()));
-  REQUIRE(torch::allclose(loss.mask_ce, loss.main.mask_ce*3));
-  REQUIRE(torch::allclose(loss.mask_dice, loss.main.mask_dice*3));
-  REQUIRE(torch::allclose(loss.total, loss.main.classification+loss.main.box+loss.main.giou+loss.main.mask_ce+loss.main.mask_dice+loss.auxiliary));
-  REQUIRE((loss.mask_ce.item<float>() > 0.F) == masks_enabled);
-  loss.total.backward();
-  for (const auto* layer : {&outputs.main, &outputs.aux_outputs.front(), &*outputs.enc_outputs}) {
-   const auto& sparse = *layer->sparse_pred_masks;
-   require_finite_gradients({sparse.spatial_features,sparse.query_features,sparse.bias});
-   REQUIRE((sparse.bias.grad().abs().sum().item<float>() > 0.F) == masks_enabled);
+  const auto after = at::detail::getDefaultCPUGenerator().get_state();
+  auto generator = at::detail::getDefaultCPUGenerator(); generator.set_state(rng);
+  if (masks_enabled) for (int layer=0;layer<3;++layer) static_cast<void>(torch::rand({1,1,2}));
+  REQUIRE(torch::equal(after,generator.get_state()));
+  // Retain a second invocation before either backward: base encoding must be
+  // local to each invocation, including all parameter and layer dependencies.
+  const auto second = owner.loss(outputs, targets, {torch::tensor(4.F)}, true);
+  std::vector<std::pair<torch::Tensor,torch::Tensor>> operands;
+  const auto clone = [&](const torch::Tensor& tensor) {
+   auto copy=tensor.detach().clone().set_requires_grad(true); operands.emplace_back(tensor,copy); return copy;
+  };
+  const auto linear = [&](const torch::Tensor& input,const std::string& name,bool bias) {
+   auto value=torch::matmul(input,reference_parameters[name+".weight"].transpose(0,1));
+   return bias ? value+reference_parameters[name+".bias"] : value;
+  };
+  const auto base=linear(torch::relu(linear(torch::cat({torch::one_hot(targets.all_labels,2).to(torch::kFloat32),targets.all_boxes},-1),"ground_truth_mlp.linear1",true)),"ground_truth_mlp.linear2",true);
+  auto expected=torch::zeros({}); auto expected_ce=torch::zeros({}); auto expected_dice=torch::zeros({});
+  auto expected_class=torch::zeros({}); auto expected_box=torch::zeros({}); auto expected_giou=torch::zeros({}); auto expected_correspondence=torch::zeros({});
+  const double divisor=4.0*(sum_groups?1:groups);
+  for (const auto* layer : {&outputs.main,&outputs.aux_outputs.front(),&*outputs.enc_outputs}) {
+   const auto features=clone(*layer->query_features), logits=clone(layer->pred_logits), boxes=clone(layer->pred_boxes);
+   auto probe=base;
+   torch::Tensor mask_logits;
+   if (config.segmentation) {
+    const auto spatial=clone(layer->sparse_pred_masks->spatial_features);
+    const auto query=clone(layer->sparse_pred_masks->query_features);
+    const auto bias=clone(layer->sparse_pred_masks->bias);
+    // Preserve explicit zero edges even when the layer does not sample masks.
+    expected=expected+(spatial.sum()+query.sum()+bias.sum())*0.0F;
+    if (masks_enabled) {
+     const auto support=torch::tensor({{1.F},{1.F},{1.F},{0.F}});
+     probe=probe+linear(support*spatial.reshape({1,2}),"mask_projection",false);
+     mask_logits=(query*spatial.reshape({1,1,2})).sum(-1)+bias;
+    }
+   }
+   probe=linear(probe,"query_projection",false);
+   const auto keys=linear(linear(torch::relu(linear(features,"query_mlp.linear1",true)),"query_mlp.linear2",true),"key_projection",false);
+   const auto dense=torch::softmax(torch::matmul(probe,keys.transpose(-1,-2))/std::sqrt(2.0),-1);
+   const auto topology=dense.detach();
+   const auto winner_mask=torch::one_hot(topology.argmax(-1),3).to(torch::kBool);
+   const auto column_max=std::get<0>(torch::where(winner_mask,topology,torch::zeros_like(topology)).max(-2,true));
+   const auto selected=(column_max>0)&(topology>=config.training_supervision.match_free.rho*column_max);
+   const auto retained=torch::where(selected,dense,torch::zeros_like(dense));
+   const auto sparse=retained/(retained.sum(-1,true)+1.0e-8F);
+   const auto objective=[&](const torch::Tensor& cost) {
+    return (config.training_supervision.match_free.correspondence_weight*(dense*cost).sum()+config.training_supervision.match_free.query_weight*(sparse*cost).sum())/divisor;
+   };
+   const auto grouped_logits=logits.reshape({1,groups,3,3});
+   const auto probability=grouped_logits.sigmoid();
+   const auto negative=(1-config.focal_alpha)*probability.square()*torch::softplus(grouped_logits);
+   const auto positive=config.focal_alpha*(1-probability.select(-1,0)).square()*torch::softplus(-grouped_logits.select(-1,0));
+   const auto classification=config.set_cost_class*(negative.sum(-1)+positive-negative.select(-1,0)).unsqueeze(-2).expand({1,groups,4,3});
+   const auto grouped_boxes=boxes.reshape({1,groups,3,4});
+   const auto box=config.set_cost_bbox*(grouped_boxes-0.25F).abs().sum(-1).unsqueeze(-2).expand({1,groups,4,3});
+   const auto lo=grouped_boxes.slice(-1,0,2)-grouped_boxes.slice(-1,2,4)*0.5F;
+   const auto hi=grouped_boxes.slice(-1,0,2)+grouped_boxes.slice(-1,2,4)*0.5F;
+   const auto intersection=(torch::minimum(hi,torch::full_like(hi,0.375F))-torch::maximum(lo,torch::full_like(lo,0.125F))).clamp_min(0).prod(-1);
+   const auto union_area=grouped_boxes.slice(-1,2,4).prod(-1)+0.0625F-intersection;
+   const auto enclosing=(torch::maximum(hi,torch::full_like(hi,0.375F))-torch::minimum(lo,torch::full_like(lo,0.125F))).prod(-1);
+   const auto giou=config.set_cost_giou*(1-intersection/union_area+(enclosing-union_area)/enclosing).unsqueeze(-2).expand({1,groups,4,3});
+   auto cost=classification+box+giou;
+   auto ce=torch::zeros({}),dice=torch::zeros({});
+   if (masks_enabled) {
+    const auto predicted=mask_logits.reshape({1,groups,1,3});
+    const auto truth=torch::tensor({1.F,1.F,1.F,0.F}).reshape({1,1,4,1});
+    if (config.mask_ce_loss_coef!=0) {
+     const auto pair=config.mask_ce_loss_coef*(truth*torch::softplus(-predicted)+(1-truth)*torch::softplus(predicted)); ce=objective(pair); cost=cost+pair;
+    }
+    if (config.mask_dice_loss_coef!=0) {
+     const auto pair=config.mask_dice_loss_coef*(1-(2*predicted.sigmoid()*truth+1)/(predicted.sigmoid()+truth+1)); dice=objective(pair); cost=cost+pair;
+    }
+   }
+   const auto cls=objective(classification), l1=objective(box), generalized=objective(giou);
+   expected_class=expected_class+cls; expected_box=expected_box+l1; expected_giou=expected_giou+generalized;
+   expected_correspondence=expected_correspondence+config.training_supervision.match_free.correspondence_weight*(dense*cost).sum()/divisor;
+   expected=expected+cls+l1+generalized+ce+dice; expected_ce=expected_ce+ce; expected_dice=expected_dice+dice;
+   if (layer==&outputs.main) {
+    REQUIRE(torch::allclose(loss.main.classification,cls,1e-5,1e-6));
+    if (config.segmentation) { REQUIRE(torch::allclose(loss.main.mask_ce,ce,1e-5,1e-6)); REQUIRE(torch::allclose(loss.main.mask_dice,dice,1e-5,1e-6)); }
+   }
   }
-  for (const auto& parameter : owner.named_parameters()) REQUIRE(parameter.value().grad().defined());
-  REQUIRE(matcher.statistics().cost_submissions == 0);
-  REQUIRE(matcher.statistics().materializations == 0);
+  for (const auto& parameter : reference_parameters) expected=expected+parameter.value().sum()*0.0F;
+  REQUIRE(torch::allclose(loss.total,expected,1e-5,1e-6));
+  REQUIRE(torch::allclose(loss.classification,expected_class,1e-5,1e-6)); REQUIRE(torch::allclose(loss.box,expected_box,1e-5,1e-6)); REQUIRE(torch::allclose(loss.giou,expected_giou,1e-5,1e-6));
+  REQUIRE(torch::allclose(loss.correspondence,expected_correspondence,1e-5,1e-6));
+  REQUIRE(torch::allclose(loss.mask_ce,expected_ce,1e-5,1e-6)); REQUIRE(torch::allclose(loss.mask_dice,expected_dice,1e-5,1e-6));
+  REQUIRE(torch::allclose(loss.total,loss.main.classification+loss.main.box+loss.main.giou+loss.auxiliary+(config.segmentation?loss.main.mask_ce+loss.main.mask_dice:torch::zeros({})),1e-5,1e-6));
+  loss.total.backward(); second.total.backward(); (expected*2).backward();
+  for (const auto& [actual,reference] : operands) { REQUIRE(actual.grad().defined()); REQUIRE(reference.grad().defined()); REQUIRE(torch::allclose(actual.grad(),reference.grad(),2e-4,2e-5)); }
+  for (const auto& parameter : parameters) {
+   auto reference=reference_parameters[parameter.key()];
+   REQUIRE(parameter.value().grad().defined()); REQUIRE(reference.grad().defined());
+   REQUIRE(torch::allclose(parameter.value().grad(),reference.grad(),2e-4,2e-5));
+   torch::NoGradGuard no_grad;
+   parameter.value().sub_(parameter.value().grad()*0.01F); reference.sub_(reference.grad()*0.01F);
+   REQUIRE(torch::allclose(parameter.value(),reference,1e-5,1e-6));
+  }
+  REQUIRE(matcher.statistics().cost_submissions == 0); REQUIRE(matcher.statistics().materializations == 0);
+ }
+}
+TEST_CASE("Inactive mask scalars retain full correspondence nonfinite and gradient edges", "[rfdetr][training_supervision]") {
+ for (const bool nonfinite : {false,true}) {
+  auto config=match_free_config(); config.segmentation=true; config.mask_ce_loss_coef=0; config.mask_dice_loss_coef=0;
+  rfdetr::TrainingSupervisionImpl owner(config,2); owner.initialize(817); install_oracle_projections(owner);
+  auto features=torch::ones({2,1,3,2});
+  if (nonfinite) features.index_put_({1,0,2,1},std::numeric_limits<float>::quiet_NaN());
+  features.set_requires_grad(true);
+  rfdetr::ModelOutputs outputs; outputs.main=oracle_layer(features);
+  outputs.main.pred_logits=outputs.main.pred_logits.detach().repeat({2,1,1}).set_requires_grad(true);
+  outputs.main.pred_boxes=outputs.main.pred_boxes.detach().repeat({2,1,1}).set_requires_grad(true);
+  const auto targets=batched_targets({torch::full({1,4},0.25F),torch::full({1,4},0.25F)},{torch::zeros({1},torch::kInt64),torch::zeros({1},torch::kInt64)});
+  const auto loss=owner.loss(outputs,targets,{torch::tensor(2.F)},true);
+  REQUIRE(torch::isnan(loss.mask_ce).item<bool>()==nonfinite); REQUIRE(torch::isnan(loss.mask_dice).item<bool>()==nonfinite);
+  if (!nonfinite) {
+   (loss.mask_ce+loss.mask_dice).backward();
+   REQUIRE(features.grad().defined()); REQUIRE(features.grad().abs().sum().item<float>()==0.F);
+   for (const auto& parameter : owner.named_parameters()) if (parameter.key()!="mask_projection.weight") {
+    REQUIRE(parameter.value().grad().defined()); REQUIRE(parameter.value().grad().abs().sum().item<float>()==0.F);
+   }
+  }
  }
 }
 TEST_CASE("Foreground-free focal classification uses one explicit group divisor and analytic gradient", "[rfdetr][training_supervision][parity]") {

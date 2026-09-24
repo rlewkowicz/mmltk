@@ -1,4 +1,5 @@
 #include "detail/training_supervision.h"
+#include "detail/training_mask_loss.h"
 #include <ATen/Context.h>
 #include <ATen/CPUGeneratorImpl.h>
 #include <ATen/TensorIndexing.h>
@@ -559,7 +560,7 @@ void TrainingSupervisionImpl::configure_timing(const SupervisionTimingSetup& set
  if (match_free_enabled()) {
   const bool masks = config_.segmentation && (config_.mask_ce_loss_coef != 0.0 || config_.mask_dice_loss_coef != 0.0);
   auto projection_scopes = mmltk::common::math::checked_multiply(masks ? std::uint64_t{5} : std::uint64_t{4}, supervised_layers, "RF-DETR supervision timing scope capacity overflow");
-  if (!masks) projection_scopes = mmltk::common::math::checked_add(projection_scopes, 1U, "RF-DETR supervision timing scope capacity overflow");
+  projection_scopes = mmltk::common::math::checked_add(projection_scopes, 1U, "RF-DETR supervision timing scope capacity overflow");
   scopes_per_loss = mmltk::common::math::checked_add(scopes_per_loss, projection_scopes, "RF-DETR supervision timing scope capacity overflow");
  }
  if (denoising_enabled()) { scopes_per_loss = mmltk::common::math::checked_add(scopes_per_loss, 3U, "RF-DETR supervision timing scope capacity overflow"); }
@@ -571,8 +572,11 @@ void TrainingSupervisionImpl::configure_timing(const SupervisionTimingSetup& set
  if (timing_ && timing_->outstanding() != 0) { throw std::runtime_error("RF-DETR supervision timing cannot be reconfigured with outstanding leases"); }
  timing_ = std::make_unique<TimingState>(device_id, setup.maximum_accumulated_losses, static_cast<std::size_t>(lease_capacity));
 }
-torch::Tensor TrainingSupervisionImpl::project_ground_truth(const torch::Tensor& labels, const torch::Tensor& boxes, const PairwiseMaskSamples* masks) {
- auto probes = ground_truth_mlp_->forward_ground_truth(labels, boxes, foreground_count_);
+torch::Tensor TrainingSupervisionImpl::encode_ground_truth(const torch::Tensor& labels, const torch::Tensor& boxes) {
+ return ground_truth_mlp_->forward_ground_truth(labels, boxes, foreground_count_);
+}
+torch::Tensor TrainingSupervisionImpl::project_ground_truth(const torch::Tensor& encoding, const PairwiseMaskSamples* masks) {
+ auto probes = encoding;
  if (masks) {
   if (!mask_projection_ || masks->spatial.size(1) != config_.hidden_dim) throw std::invalid_argument("Match-Free mask features must have the configured hidden width");
   // RF-DETR extension to the box-only paper: content-conditioned GT probes.
@@ -589,7 +593,7 @@ MatchFreeCorrespondence TrainingSupervisionImpl::correspondence(
  const torch::Tensor& padded_labels, const torch::Tensor& padded_boxes, const torch::Tensor& valid_rows, const torch::Tensor& query_features, const PairwiseMaskSamples* masks) {
  if (!initialized_) { throw std::runtime_error("Match-Free supervision was used before one-shot initialization"); }
  mmltk::backend::ml::cuda::TorchAutocastScope fp32_scope(false, torch::kFloat32);
- const auto probes = project_ground_truth(padded_labels, padded_boxes, masks);
+ const auto probes = project_ground_truth(encode_ground_truth(padded_labels, padded_boxes), masks);
  const auto dense = dense_correspondence(probes, query_features);
  return {dense, sparse_match_free_correspondence(dense, valid_rows, config_.training_supervision.match_free.rho)};
 }
@@ -728,8 +732,11 @@ TrainingLoss TrainingSupervisionImpl::loss(const ModelOutputs& outputs, const Pr
   return timing_->measure(stage, std::forward<decltype(operation)>(operation));
  };
  const bool use_masks = config_.segmentation && (config_.mask_ce_loss_coef != 0.0 || config_.mask_dice_loss_coef != 0.0);
- torch::Tensor box_probes;
- if (!use_masks && padded.maximum_count != 0) box_probes = timed(TimingState::Stage::GroundTruthProjection, [&] { return project_ground_truth(padded.labels, padded.boxes); });
+ torch::Tensor encoding, box_probes;
+ if (padded.maximum_count != 0) timed(TimingState::Stage::GroundTruthProjection, [&] {
+  encoding = encode_ground_truth(padded.labels, padded.boxes);
+  if (!use_masks) box_probes = project_ground_truth(encoding);
+ });
  auto zero = scalar_edge(outputs.main.pred_logits);
  TrainingLoss result = empty_loss(outputs);
  result.mask_ce = zero;
@@ -759,41 +766,46 @@ TrainingLoss TrainingSupervisionImpl::loss(const ModelOutputs& outputs, const Pr
   std::optional<PairwiseMaskSamples> masks;
   if (use_masks)
    masks = sample_pairwise_masks(*layer, targets, padded.indices, padded.valid, config_.mask_point_sample_ratio);
-  const auto probes = masks ? timed(TimingState::Stage::GroundTruthProjection, [&] { return project_ground_truth(padded.labels, padded.boxes, &*masks); }) : box_probes;
+  const auto probes = masks ? timed(TimingState::Stage::GroundTruthProjection, [&] { return project_ground_truth(encoding, &*masks); }) : box_probes;
   const auto dense = timed(TimingState::Stage::Affinity, [&] { return dense_correspondence(probes, *layer->query_features); });
   const auto sparse = timed(TimingState::Stage::Sparse, [&] { return sparse_match_free_correspondence(dense, padded.valid, config_.training_supervision.match_free.rho); });
   const auto costs = timed(TimingState::Stage::BroadcastCost, [&] { return broadcast_cost(padded.labels, padded.boxes, padded.valid, *layer); });
   const auto alpha = config_.training_supervision.match_free.correspondence_weight;
   const auto beta = config_.training_supervision.match_free.query_weight;
   auto objective = [&](const torch::Tensor& term) { return (alpha * (dense * term).sum() + beta * (sparse * term).sum()) / divisor; };
-  auto mask_ce = torch::zeros_like(costs.classification);
-  auto mask_dice = torch::zeros_like(costs.classification);
-  if (masks) {
-   const auto grouped = [&](const torch::Tensor& costs) {
-    return costs.transpose(1, 2).reshape({batch, padded.maximum_count, groups, layer->query_layout->queries_per_group}).permute({0, 2, 1, 3});
-   };
-   // Batched contractions produce B x Q x M costs without cross-image pairs.
-   if (config_.mask_ce_loss_coef != 0.0) mask_ce = config_.mask_ce_loss_coef * grouped(batch_sigmoid_ce_loss(masks->logits, masks->targets, false));
-   if (config_.mask_dice_loss_coef != 0.0) mask_dice = config_.mask_dice_loss_coef * grouped(batch_dice_loss(masks->logits, masks->targets, false));
-   mask_ce = torch::where(padded.valid.unsqueeze(1).unsqueeze(-1), mask_ce, torch::zeros_like(mask_ce));
-   mask_dice = torch::where(padded.valid.unsqueeze(1).unsqueeze(-1), mask_dice, torch::zeros_like(mask_dice));
-  }
-  const auto ce_term = objective(mask_ce);
-  const auto dice_term = objective(mask_dice);
-  result.mask_ce = result.mask_ce + ce_term;
-  result.mask_dice = result.mask_dice + dice_term;
+  torch::Tensor ce_term, dice_term;
   const auto terms = timed(TimingState::Stage::Objective, [&] {
+   auto total_cost = costs.total;
+   // A single scalar edge preserves inactive mask-result autograd and NaN
+   // propagation through every correspondence row, without zero pair costs.
+   const auto inactive = (!masks || config_.mask_ce_loss_coef == 0.0 || config_.mask_dice_loss_coef == 0.0)
+    ? (alpha * (dense.sum() * 0.0F) + beta * (sparse.sum() * 0.0F)) / divisor : zero;
+   ce_term = inactive;
+   dice_term = inactive;
+   if (masks) {
+    const auto admit = [&](const torch::Tensor& pair_cost, double coefficient) {
+     const auto grouped = pair_cost.transpose(1, 2).reshape({batch, padded.maximum_count, groups, layer->query_layout->queries_per_group}).permute({0, 2, 1, 3});
+     const auto weighted = coefficient * grouped;
+     const auto cost = torch::where(padded.valid.unsqueeze(1).unsqueeze(-1), weighted, torch::zeros_like(weighted));
+     total_cost = total_cost + cost;
+     return objective(cost);
+    };
+    if (config_.mask_ce_loss_coef != 0.0) ce_term = admit(batch_sigmoid_ce_loss(masks->logits, masks->targets, false), config_.mask_ce_loss_coef);
+    if (config_.mask_dice_loss_coef != 0.0) dice_term = admit(batch_dice_loss(masks->logits, masks->targets, false), config_.mask_dice_loss_coef);
+   }
    return TrainingLoss{
     {},
     objective(costs.classification),
     objective(costs.box),
     objective(costs.giou),
-    alpha * (dense * (costs.total + mask_ce + mask_dice)).sum() / divisor,
+    alpha * (dense * total_cost).sum() / divisor,
     {},
     {},
     {},
    };
   });
+  result.mask_ce = result.mask_ce + ce_term;
+  result.mask_dice = result.mask_dice + dice_term;
   if (layer == &outputs.main) result.main = {terms.classification + background, terms.box, terms.giou, config_.segmentation ? ce_term : torch::Tensor{}, config_.segmentation ? dice_term : torch::Tensor{}};
   if (layer != &outputs.main) {
    auto auxiliary = terms.classification + terms.box + terms.giou + ce_term + dice_term;

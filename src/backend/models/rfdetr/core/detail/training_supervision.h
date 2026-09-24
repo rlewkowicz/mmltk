@@ -1,13 +1,14 @@
 #pragma once
 #include <torch/torch.h>
-#include "training_mask_loss.h"
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <vector>
 #include "src/backend/models/rfdetr/core/detection_types.h"
 #include "src/backend/models/rfdetr/core/detail/class_tensor_axes.h"
 #include "src/backend/models/rfdetr/contract/model_config.h"
 namespace mmltk::backend::models::rfdetr {
+struct PairwiseMaskSamples;
 inline constexpr float kSparseCorrespondenceEpsilon = 1.0e-8F;
 struct MatchFreeCorrespondence {
  torch::Tensor dense;
@@ -65,7 +66,8 @@ private:
  class ProbeMlpImpl;
  struct TimingState;
  [[nodiscard]] PaddedTargets pad_targets(const PreparedTargets& targets, const torch::Device& device, int64_t batch, bool reuse_construction_scratch);
- [[nodiscard]] torch::Tensor project_ground_truth(const torch::Tensor& labels, const torch::Tensor& boxes, const PairwiseMaskSamples* masks = nullptr);
+ [[nodiscard]] torch::Tensor encode_ground_truth(const torch::Tensor& labels, const torch::Tensor& boxes);
+ [[nodiscard]] torch::Tensor project_ground_truth(const torch::Tensor& encoding, const PairwiseMaskSamples* masks = nullptr);
  [[nodiscard]] torch::Tensor dense_correspondence(const torch::Tensor& probes, const torch::Tensor& query_features);
  [[nodiscard]] TrainingLoss empty_loss(const ModelOutputs& outputs) const;
  [[nodiscard]] TrainingLoss denoising_loss(const DenoisingOutputs& outputs, const DeviceLossNormalizer& normalizer) const;

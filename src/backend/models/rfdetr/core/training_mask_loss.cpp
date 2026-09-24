@@ -1,4 +1,5 @@
 #include "detail/training_mask_loss.h"
+#include "detail/detection_sampling.h"
 #include <torch/nn/functional/loss.h>
 #include "detail/training_mask_ops_cuda.h"
 #include "detail/matcher_workspace.h"

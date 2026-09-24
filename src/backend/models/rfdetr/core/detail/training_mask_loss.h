@@ -1,8 +1,10 @@
 #pragma once
 #include <torch/torch.h>
 #include <torch/nn/functional/vision.h>
-#include "detection_sampling.h"
+#include <cstdint>
+#include "../detection_types.h"
 namespace mmltk::backend::models::rfdetr {
+struct LayerMaskSamples;
 const PackedTargetMasks& require_target_masks(const PreparedTargets& targets, const char* context);
 void validate_packed_mask_extent(const PackedTargetMasks& masks, const char* context);
 torch::Tensor mask_coordinates(const torch::Tensor& supplied, int64_t batch, int64_t count, const torch::Device& device);
