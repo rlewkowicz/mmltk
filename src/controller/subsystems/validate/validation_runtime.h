@@ -15,6 +15,7 @@ struct ValidationRuntimeResult final {
 class ValidationRuntime {
 public:
  virtual ~ValidationRuntime() = default;
+ // Complete physical retirement; successful repeated Close is inert.
  virtual void Close() {}
  [[nodiscard]] virtual bool HasUnsafeCustody() const noexcept { return false; }
  [[nodiscard]] virtual ValidationRuntimeResult Run(

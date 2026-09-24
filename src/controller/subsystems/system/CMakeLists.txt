@@ -88,7 +88,6 @@ function(mmltk_add_controller_subsystems_system_tests)
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/dataset_system.test.cpp
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/model_system.test.cpp
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/training_provider.test.cpp
-        ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/runtime_placement.test.cpp
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/../validate/tests/validation_system.test.cpp
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/application_compute_services.test.cpp
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/prediction_output.test.cpp
@@ -96,6 +95,7 @@ function(mmltk_add_controller_subsystems_system_tests)
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/prediction_playback.test.cpp
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/prediction_test_support.cpp)
     mmltk_register_retained_module_importers(mmltk_controller_data_compute_systems_tests
+        ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/runtime_placement.test.cpp
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/predict_system.test.cpp)
     mmltk_register_private_headers(mmltk_controller_data_compute_systems_tests
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/prediction_test_support.h

@@ -29,7 +29,7 @@ public:
 };
 CudaValidationRuntime::CudaValidationRuntime(DirectComputeConfiguration c, services::RuntimeDiagnosticTarget diagnostics) : diagnostics_(std::move(diagnostics)), impl_(std::make_unique<Impl>(c)) {}
 CudaValidationRuntime::~CudaValidationRuntime() = default;
-void CudaValidationRuntime::Close() { impl_->resources.CloseSession(); }
+void CudaValidationRuntime::Close() { impl_->resources.Retire(); }
 bool CudaValidationRuntime::HasUnsafeCustody() const noexcept { return impl_->resources.HasUnsafeCustody(); }
 ValidationRuntimeResult CudaValidationRuntime::Run(
  mmltk::backend::models::rfdetr::ValidateRequest operation, std::stop_token stop, const ComputeProgressSink& progress, const mmltk::backend::models::rfdetr::ValidationDelivery& delivery, std::uint64_t generation) {
@@ -69,7 +69,8 @@ ValidationRuntimeResult CudaValidationRuntime::Run(
 class ValidationSystem::Impl final {
 public:
  Impl(SettingsSystem& settings, DatasetSystem& dataset, ModelSystem& model, ValidationRuntimeFactory factory, SystemEventSink<ValidationSystem::event_type> events,
-  DirectComputeResolver resolver, VisualDeviceSettings visual, mmltk::backend::imaging::raster::RenderedImageWriter::PngEncoder encoder)
+  DirectComputeResolver resolver, VisualDeviceSettings visual, mmltk::backend::imaging::raster::RenderedImageWriter::PngEncoder encoder,
+  std::shared_ptr<mmltk::frameworks::gpu::TerminalCudaRetirementOwner> retirement)
      : settings_(settings),
        dataset_(dataset),
        model_(model),
@@ -89,12 +90,13 @@ public:
          }
          Changed();
         },
-        std::move(encoder)) {
+        std::move(encoder), std::move(retirement)) {
   if (!factory_ || !resolver_) throw contracts::UnavailableError("compute runtime factory or placement resolver is unavailable");
   samples_.SetDisplay(settings_.validation_display_settings());
  }
  mmltk::backend::models::rfdetr::ValidationDelivery Delivery(std::uint64_t generation, const std::filesystem::path& directory, contracts::ValidationRunPreview preview, DirectComputeConfiguration configuration) {
   mmltk::backend::models::rfdetr::ValidationDelivery delivery;
+  delivery.retirement = sample_output_.RetirementAuthority();
   delivery.samples_selected = [this, generation, directory, preview, configuration](auto indices, auto) {
    sample_output_.Begin(directory, preview, indices, configuration);
    if (previews_) {
@@ -121,7 +123,7 @@ public:
   if (run_.active()) throw contracts::BusyError("compute operation is active");
   if (!std::isfinite(preview.display.confidence_threshold) || preview.display.confidence_threshold < 0.0F || preview.display.confidence_threshold > 1.0F)
    throw contracts::InvalidIntentError("validation preview confidence must be between zero and one");
-  if (retirement_failed_) throw contracts::UnavailableError("compute session retirement failed");
+  if (retirement_failed_ || sample_output_.HasUnsafeCustody()) throw contracts::UnavailableError("compute or sample output retirement failed");
   const auto settings = settings_.materialization_facts();
   if (!settings.loaded) throw contracts::UnavailableError("settings are unavailable");
   const auto selection = model_.selection();
@@ -156,8 +158,9 @@ public:
       Changed();
       if (runtime_ && runtime_configuration_ != configuration) {
        RetireRuntime();
-       if (retirement_failed_) throw contracts::UnavailableError("compute CUDA retirement is unproved");
+       if (retirement_failed_ || sample_output_.HasUnsafeCustody()) throw contracts::UnavailableError("compute CUDA retirement is unproved");
       }
+      if (sample_output_.HasUnsafeCustody()) throw contracts::UnavailableError("validation output CUDA custody is unproved");
       if (!runtime_) {
        try { runtime_ = factory_(configuration); }
        catch (...) {
@@ -214,7 +217,7 @@ public:
   return state_;
  }
  void RetireRuntime() noexcept {
-  if (!retirement_failed_ && !retire_compute_runtime(runtime_)) retirement_failed_ = true;
+  if (!retirement_failed_ && !retire_compute_runtime(runtime_, [this] { return sample_output_.HasUnsafeCustody(); })) retirement_failed_ = true;
  }
  void Shutdown() noexcept {
   static_cast<void>(Stop());
@@ -278,8 +281,9 @@ public:
  detail::ValidationSampleOutput sample_output_;
 };
 ValidationSystem::ValidationSystem(SettingsSystem& settings, DatasetSystem& dataset, ModelSystem& model, ValidationRuntimeFactory factory, SystemEventSink<event_type> events,
- DirectComputeResolver resolver, VisualDeviceSettings visual, mmltk::backend::imaging::raster::RenderedImageWriter::PngEncoder encoder)
-    : impl_(std::make_unique<Impl>(settings, dataset, model, std::move(factory), std::move(events), std::move(resolver), visual, std::move(encoder))) {}
+ DirectComputeResolver resolver, VisualDeviceSettings visual, mmltk::backend::imaging::raster::RenderedImageWriter::PngEncoder encoder,
+  std::shared_ptr<mmltk::frameworks::gpu::TerminalCudaRetirementOwner> retirement)
+    : impl_(std::make_unique<Impl>(settings, dataset, model, std::move(factory), std::move(events), std::move(resolver), visual, std::move(encoder), std::move(retirement))) {}
 ValidationSystem::~ValidationSystem() = default;
 ValidationSnapshot ValidationSystem::Start(contracts::ValidateWorkflowIntent intent) {
  static_cast<void>(impl_->Start(intent.preview));

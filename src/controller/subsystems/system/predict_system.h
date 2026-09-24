@@ -55,6 +55,7 @@ public:
  using PreviewRetirement = std::shared_ptr<mmltk::frameworks::gpu::TerminalCudaRetirementOwner>;
  using PlaybackGate = std::function<bool(std::optional<double>, double)>;
  virtual ~PredictRuntime() = default;
+ // Complete physical retirement; successful repeated Close is inert.
  virtual void Close() noexcept {}
  [[nodiscard]] virtual bool HasUnsafeCustody() const noexcept { return false; }
  [[nodiscard]] virtual contracts::ComputeTerminal Run(mmltk::backend::models::rfdetr::PredictRequest, std::stop_token, const ComputeProgressSink&, const ProductSink&, const PlaybackGate&,

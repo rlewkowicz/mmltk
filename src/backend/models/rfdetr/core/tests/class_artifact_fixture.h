@@ -3,11 +3,14 @@
 #include "src/common/io/file_digest.h"
 #include <catch2/catch_test_macros.hpp>
 #include <filesystem>
+#include <cstdint>
+#include <optional>
 #include <fstream>
 #include <string>
 #include <string_view>
 #include <utility>
 namespace mmltk::backend::models::rfdetr::test_support {
+void write_prediction_model(const std::filesystem::path&, std::int64_t queries = 2, bool include_masks = true, std::optional<ModelClassLayout> layout = {});
 class ClassArtifactFixture final {
 public:
  ClassArtifactFixture(std::filesystem::path artifact, std::string_view bytes, const ModelClassLayout& layout) : artifact_(std::move(artifact)), companion_(artifact_.string() + ".classes.json") {

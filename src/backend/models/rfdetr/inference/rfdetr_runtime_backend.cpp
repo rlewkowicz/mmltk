@@ -232,9 +232,12 @@ ResolvedModelArtifacts describe_inference_artifact(const ModelArtifactRequest& r
 struct OutputStorage final {
  std::vector<torch::Tensor> tensors;
  std::vector<runtime::RuntimeTensorBuffer> buffers;
- std::vector<std::shared_ptr<PredictionCountStorage>> counts;
+ std::shared_ptr<PredictionCountStorage> counts;
 };
 struct RfdetrRuntimeBackend::State final {
+ std::shared_ptr<mmltk::frameworks::gpu::TerminalCudaRetirementOwner> retirement;
+ mmltk::frameworks::gpu::PinnedHostBuffer::Operations operations;
+ bool closed = false;
  std::shared_ptr<const ResolvedClassLayout> layout;
  std::vector<RfdetrNamedOutputRole> output_roles;
  std::string artifact_sha256;
@@ -247,8 +250,11 @@ struct RfdetrRuntimeBackend::State final {
  std::vector<std::shared_ptr<PostprocessedSelection>> selections;
 };
 RfdetrRuntimeBackend::RfdetrRuntimeBackend(std::shared_ptr<runtime::RuntimeBackend> lane, std::string backend_name, std::uint32_t static_resolution, std::size_t maximum_detections,
- std::shared_ptr<const ResolvedClassLayout> layout, std::vector<RfdetrNamedOutputRole> output_roles, std::shared_ptr<const ClassArtifactAdmission> admission)
+ std::shared_ptr<const ResolvedClassLayout> layout, std::vector<RfdetrNamedOutputRole> output_roles, std::shared_ptr<const ClassArtifactAdmission> admission,
+ std::shared_ptr<mmltk::frameworks::gpu::TerminalCudaRetirementOwner> retirement, mmltk::frameworks::gpu::PinnedHostBuffer::Operations operations)
     : lane_(std::move(lane)), backend_name_(std::move(backend_name)), static_resolution_(static_resolution), maximum_detections_(maximum_detections), state_(std::make_unique<State>()) {
+ state_->retirement = retirement ? std::move(retirement) : std::make_shared<mmltk::frameworks::gpu::TerminalCudaRetirementOwner>(4U);
+ state_->operations = operations;
  validate_prediction_candidates(maximum_detections_);
  if (!lane_) { throw std::invalid_argument("invalid RF-DETR runtime options"); }
  state_->layout = std::move(layout);
@@ -312,7 +318,7 @@ runtime::RuntimeSubmission RfdetrRuntimeBackend::Run(
  const std::int64_t batch = input.shape.extents[0];
  const auto output_storage = state_->outputs;
  if (!selections.empty()) state_->selections.resize(selections.size());
- output_storage->counts.resize(annotations.size());
+ if (state_->closed || !state_->retirement->admission_open()) throw std::runtime_error("RF-DETR runtime storage is retired");
  for (auto& annotation : annotations) {
   const auto& logits = lane_->model_info().outputs[state_->logits];
   const auto capacity = PredictionCapacity::Resolve(std::min(maximum_detections_, annotation.value_capacity), static_cast<std::size_t>(batch), logits.shape.extents[1], logits.shape.extents[2],
@@ -379,6 +385,7 @@ runtime::RuntimeSubmission RfdetrRuntimeBackend::Run(
      auto& bound_owner = *bound_call.owner;
      const auto bound_device = bound_owner.lane_->device();
      const auto bound_stream = bound_owner.lane_->command_stream().native_handle;
+     PredictionCountStorage::Prepare(bound_call.outputs->counts, bound_call.annotations.size(), bound_device, bound_owner.state_->retirement, bound_owner.state_->operations);
      auto logits = bound_call.outputs->tensors[bound_owner.state_->logits];
      auto all_boxes = bound_call.outputs->tensors[bound_owner.state_->boxes];
      for (std::size_t index = 0U; index < bound_call.annotations.size(); ++index) {
@@ -397,7 +404,7 @@ runtime::RuntimeSubmission RfdetrRuntimeBackend::Run(
          bound_call.include_masks && bound_owner.state_->masks ? std::optional{bound_call.outputs->tensors[*bound_owner.state_->masks].narrow(0, static_cast<std::int64_t>(index), 1)} : std::nullopt,
        },
        region.height, region.width, static_cast<std::int64_t>(limit), bound_call.include_masks, bound_owner.state_->classes.get());
-      publish_prediction_count(bound_call.outputs->counts[index], selected.counts, annotation, bound_device);
+      bound_call.outputs->counts->Publish(index, selected.counts, annotation);
       PostprocessedBatch processed{selected.scores, selected.labels, selected.boxes, std::nullopt};
       if (!bound_call.selections.empty()) {
        auto& custody = bound_owner.state_->selections[index];
@@ -455,11 +462,27 @@ runtime::RuntimeSubmission RfdetrRuntimeBackend::Run(
  }
 }
 void RfdetrRuntimeBackend::ReleaseAfterCompletion(runtime::RuntimeSubmission&& submission) { lane_->ReleaseAfterCompletion(std::move(submission)); }
-runtime::RuntimeStatus RfdetrRuntimeBackend::Close() noexcept { return lane_->Close(); }
+runtime::RuntimeStatus RfdetrRuntimeBackend::Close() noexcept {
+ if (!state_->retirement->admission_open()) return static_cast<runtime::RuntimeStatus>(cudaErrorUnknown);
+ if (state_->closed) return runtime::kRuntimeSuccess;
+ const auto status = lane_->Close();
+ if (status != runtime::kRuntimeSuccess) return status;
+ try {
+  if (state_->outputs && state_->outputs->counts) {
+   const auto released = state_->outputs->counts->ReleaseSettled();
+   if (released != CUDA_SUCCESS && released != CUDA_ERROR_NOT_READY) return static_cast<runtime::RuntimeStatus>(released);
+  }
+  state_->selections.clear();
+  state_->outputs.reset();
+  state_->classes.reset();
+  state_->closed = true;
+ } catch (...) { return static_cast<runtime::RuntimeStatus>(cudaErrorUnknown); }
+ return runtime::kRuntimeSuccess;
+}
 std::span<const RfdetrNamedOutputRole> RfdetrRuntimeBackend::output_roles() const noexcept { return state_->output_roles; }
 std::shared_ptr<RfdetrRuntimeBackend> RfdetrRuntimeBackend::MakeLane() const {
  return std::shared_ptr<RfdetrRuntimeBackend>(
-  new RfdetrRuntimeBackend(lane_->MakeLane(), backend_name_, static_resolution_, maximum_detections_, state_->layout, state_->output_roles, state_->admission));
+  new RfdetrRuntimeBackend(lane_->MakeLane(), backend_name_, static_resolution_, maximum_detections_, state_->layout, state_->output_roles, state_->admission, state_->retirement, state_->operations));
 }
 std::shared_ptr<RfdetrRuntimeBackend> make_rfdetr_runtime_backend(const RfdetrRuntimeBackendOptions& options) {
  if (options.stop.stop_requested()) throw ArtifactPublicationCancelled{};
@@ -500,7 +523,7 @@ std::shared_ptr<RfdetrRuntimeBackend> make_rfdetr_runtime_backend(const RfdetrRu
  static_cast<void>(validate_rfdetr_output_layout(info));
  output_roles = rfdetr_output_roles(info);
  auto layout = std::make_shared<const ResolvedClassLayout>(admission->Resolve(info.num_classes, embedded, options.stop));
- auto result = std::shared_ptr<RfdetrRuntimeBackend>(new RfdetrRuntimeBackend(std::move(lane), artifact.backend_name, resolution, options.maximum_detections, layout, output_roles, admission));
+ auto result = std::shared_ptr<RfdetrRuntimeBackend>(new RfdetrRuntimeBackend(std::move(lane), artifact.backend_name, resolution, options.maximum_detections, layout, output_roles, admission, options.retirement, options.registered_host_operations));
  admission->RequireUnchanged(options.stop);
  if (publication) {
   publication->Publish(ModelClassDescriptor{1U, {}, layout->record(), output_roles}, [&] { return options.stop.stop_requested(); });

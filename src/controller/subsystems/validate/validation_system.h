@@ -1,5 +1,7 @@
 #pragma once
 #include <functional>
+#include "src/controller/subsystems/system/compute_runtime.h"
+#include "src/frameworks/gpu/terminal_cuda_retirement_owner.h"
 #include <memory>
 #include <optional>
 #include <variant>
@@ -22,7 +24,8 @@ public:
  using visual_source = VisualSourceProjection<ValidationSnapshot, PresentationSourceKind::Validation, mmltk::frameworks::reflection::member_path<&ValidationSnapshot::frame>,
   mmltk::frameworks::reflection::member_path<&ValidationSnapshot::frame, &VisualFrame::revision>, ValidationImageMetadata>;
  ValidationSystem(SettingsSystem&, DatasetSystem&, ModelSystem&, ValidationRuntimeFactory, SystemEventSink<event_type> = {}, DirectComputeResolver = resolve_compute_configuration,
-  VisualDeviceSettings = {}, mmltk::backend::imaging::raster::RenderedImageWriter::PngEncoder = {});
+  VisualDeviceSettings = {}, mmltk::backend::imaging::raster::RenderedImageWriter::PngEncoder = {},
+  std::shared_ptr<mmltk::frameworks::gpu::TerminalCudaRetirementOwner> = {});
  ~ValidationSystem();
  [[= contracts::reflection::direct::IntentEndpoint{}]] [[nodiscard]] ValidationSnapshot Start(contracts::ValidateWorkflowIntent);
  [[= contracts::reflection::direct::IntentEndpoint{}]] [[nodiscard]] ValidationSnapshot Stop() noexcept;

@@ -19,13 +19,14 @@ using DirectComputeResolver = std::function<DirectComputeConfiguration(int devic
 using ComputeArtifactSink = std::function<void(const std::filesystem::path&)>;
 using ComputeProgressSink = std::function<void(const contracts::ComputeProgress&)>;
 // Failed work and device replacement share the same physical retirement rule.
+// Close must finish settlement, session/stream release and caller restoration.
 // False preserves the exact runtime and tells its system to seal admission.
-template <class Runtime>
-[[nodiscard]] bool retire_compute_runtime(std::unique_ptr<Runtime>& runtime) noexcept {
+template <class Runtime, class Unsafe = decltype([] { return false; })>
+[[nodiscard]] bool retire_compute_runtime(std::unique_ptr<Runtime>& runtime, Unsafe unsafe = {}) noexcept {
  if (!runtime) return true;
- if (runtime->HasUnsafeCustody()) return false;
+ if (runtime->HasUnsafeCustody() || unsafe()) return false;
  try { runtime->Close(); } catch (...) { return false; }
- if (runtime->HasUnsafeCustody()) return false;
+ if (runtime->HasUnsafeCustody() || unsafe()) return false;
  runtime.reset();
  return true;
 }

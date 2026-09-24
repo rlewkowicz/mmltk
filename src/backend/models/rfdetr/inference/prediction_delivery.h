@@ -1,4 +1,5 @@
 #pragma once
+#include "src/frameworks/gpu/pinned_host_buffer.h"
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -77,5 +78,7 @@ struct PredictionDelivery final {
  std::function<void(const PredictionRecord&, PredictionPixels, const mmltk::backend::ml::runtime::AnalysisAnnotationStorage&)> completed{};
  std::function<void(std::size_t completed, std::size_t total)> progress{};
  std::function<void(std::size_t decoded, std::size_t total)> decoded{};
+ std::shared_ptr<mmltk::frameworks::gpu::TerminalCudaRetirementOwner> retirement{};
+ mmltk::frameworks::gpu::PinnedHostBuffer::Operations registered_host_operations{};
 };
 }  // namespace mmltk::backend::models::rfdetr

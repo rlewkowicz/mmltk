@@ -47,6 +47,7 @@
 import mmltk.backend.models.rfdetr.inference.prediction;
 import mmltk.backend.models.rfdetr.model_export;
 namespace rfdetr = mmltk::backend::models::rfdetr;
+using rfdetr::test_support::write_prediction_model;
 TEST_CASE("shared preprocessing normalizes every RGB channel without mutating borrowed pixels", "[model][rfdetr][prediction][gpu]") {
  const auto original = torch::tensor({0.0F, 0.25F, 0.5F, 0.75F, 1.0F, 0.125F});
  const auto source = original.to(torch::kCUDA);
@@ -133,66 +134,7 @@ private:
  c10::cuda::CUDAStream selected_;
  c10::cuda::CUDAStreamGuard guard_;
 };
-void write_prediction_model(const std::filesystem::path& path, std::int64_t queries = 2, bool include_masks = true, std::optional<rfdetr::ModelClassLayout> layout = {}) {
- namespace onnx = mmltk_onnx;
- onnx::ModelProto model;
- model.set_ir_version(8);
- model.add_opset_import()->set_version(13);
- if (layout) {
-  auto* metadata = model.add_metadata_props();
-  metadata->set_key("mmltk.rfdetr.class_layout");
-  metadata->set_value(rfdetr::encode_class_layout(*layout));
- }
- auto* graph = model.mutable_graph();
- graph->set_name("prediction-delivery");
- const auto value = [](onnx::ValueInfoProto* destination, const std::string& name, std::span<const std::int64_t> dimensions) {
-  destination->set_name(name);
-  auto* type = destination->mutable_type()->mutable_tensor_type();
-  type->set_elem_type(onnx::TensorProto::FLOAT);
-  for (auto extent : dimensions) type->mutable_shape()->add_dim()->set_dim_value(extent);
- };
- value(graph->add_input(), "images", std::array<std::int64_t, 4>{1, 3, 8, 8});
- auto* mean = graph->add_node();
- mean->set_op_type("ReduceMean");
- mean->add_input("images");
- mean->add_output("mean");
- auto* keepdims = mean->add_attribute();
- keepdims->set_name("keepdims");
- keepdims->set_type(onnx::AttributeProto::INT);
- keepdims->set_i(0);
- auto* zero = graph->add_initializer();
- zero->set_name("zero");
- zero->set_data_type(onnx::TensorProto::FLOAT);
- zero->add_float_data(0.0F);
- auto* multiply = graph->add_node();
- multiply->set_op_type("Mul");
- multiply->add_input("mean");
- multiply->add_input("zero");
- multiply->add_output("offset");
- const auto output = [&](const std::string& name, std::span<const std::int64_t> dimensions, std::span<const float> values) {
-  value(graph->add_output(), name, dimensions);
-  auto* constants = graph->add_initializer();
-  constants->set_name(name + "_values");
-  constants->set_data_type(onnx::TensorProto::FLOAT);
-  for (auto extent : dimensions) constants->add_dims(extent);
-  for (auto scalar : values) constants->add_float_data(scalar);
-  auto* add = graph->add_node();
-  add->set_op_type("Add");
-  add->add_input(constants->name());
-  add->add_input("offset");
-  add->add_output(name);
- };
- std::vector<float> logits(queries * 2, -10.F), boxes(queries * 4, .5F), masks(queries * 4, -1.F);
- logits[0] = 10.F;
- logits[3] = 9.F;
- boxes[2] = boxes[3] = 1.F;
- std::fill_n(masks.begin(), 4, 1.F);
- output("pred_logits", std::array<std::int64_t, 3>{1, queries, 2}, logits);
- output("pred_boxes", std::array<std::int64_t, 3>{1, queries, 4}, boxes);
- if (include_masks) output("pred_masks", std::array<std::int64_t, 4>{1, queries, 2, 2}, masks);
- std::ofstream file(path, std::ios::binary);
- REQUIRE(model.SerializeToOstream(&file));
-}
+
 }  // namespace
 TEST_CASE("prediction delivers bounded ordered images masks and receiver-owned pixels", "[model][rfdetr][prediction][gpu]") {
  const auto root = std::filesystem::temp_directory_path() / ("prediction-delivery-" + std::to_string(::getpid()));
@@ -689,6 +631,73 @@ TEST_CASE("full HD prediction materializes masks only for threshold survivors", 
  CHECK(empty.processed_images == 2U);
  CHECK_FALSE(session.HasUnsafeCustody());
  CHECK(session.Close() == mmltk::backend::ml::runtime::kRuntimeSuccess);
+}
+TEST_CASE("prediction close releases batch counts and readbacks while borrowed tensor views retain late custody", "[model][rfdetr][prediction][gpu]") {
+ namespace gpu = mmltk::frameworks::gpu;
+ const int failure = GENERATE(0, 1, 2, 3, 4);
+ const mmltk::testsupport::ScopedTempDir root("prediction-complete-close");
+ write_prediction_model(root.path() / "rf-detr-nano.onnx");
+ const auto image = root.path() / "sample.ppm";
+ { std::ofstream file(image, std::ios::binary); file << "P6\n2 2\n255\n" << std::string(12, char{64}); }
+ const PredictionStream stream_scope{true};
+ rfdetr::PredictRequest request;
+ request.onnx_path = root.path() / "rf-detr-nano.onnx";
+ request.source_kind = rfdetr::PredictSourceKind::ImageFiles;
+ request.image_inputs.push_back({image, "sample", 1});
+ request.resolution = 8;
+ request.allow_fp16 = false;
+ request.max_dets_per_image = 2;
+ struct Fault { bool armed = false; unsigned calls = 0; int failure = 0; unsigned restores = 0; } fault{false, 0U, failure};
+ auto retirement = std::make_shared<gpu::TerminalCudaRetirementOwner>(20U);
+ const gpu::PinnedHostBuffer::Operations operations{
+  .context = {&fault, [](void*, CUcontext* value) noexcept { return cuCtxGetCurrent(value); },
+   [](void* value, CUcontext context) noexcept {
+    auto& fault = *static_cast<Fault*>(value);
+    return fault.armed && fault.failure == 3 && ++fault.restores == 2U ? CUDA_ERROR_CONTEXT_IS_DESTROYED : cuCtxSetCurrent(context);
+   }},
+  .unregister = [](void* value, void* address) {
+   auto& fault = *static_cast<Fault*>(value);
+   if (fault.armed && (++fault.calls == static_cast<unsigned>(fault.failure) || fault.failure == 4)) return CUDA_ERROR_UNKNOWN;
+   return cuMemHostUnregister(address);
+  },
+ };
+ rfdetr::PredictionSession session;
+ std::shared_ptr<void> borrowed;
+ const rfdetr::PredictionDelivery delivery{
+  .source_pixels = true,
+  .completed = [&](const auto&, auto pixels, const auto&) { if (failure == 4) borrowed = pixels.custody; },
+  .retirement = retirement,
+  .registered_host_operations = operations,
+ };
+ const mmltk::backend::ml::runtime::BorrowedCommandStream stream{reinterpret_cast<std::uintptr_t>(stream_scope.get()), true};
+ CHECK(session.Run(request, stream, delivery).processed_images == 1U);
+ if (failure != 4) {
+  // Ordinary same-artifact reuse retains all active high-water buffers.
+  const auto reservations = retirement->fact().reservations;
+  CHECK(session.Run(request, stream, delivery).processed_images == 1U);
+  CHECK(retirement->fact().reservations == reservations);
+ }
+ fault.armed = failure != 4;
+ const auto status = session.Close();
+ if (failure == 0 || failure == 4) {
+  CHECK(status == mmltk::backend::ml::runtime::kRuntimeSuccess);
+  CHECK_FALSE(session.HasUnsafeCustody());
+  CHECK(session.Close() == mmltk::backend::ml::runtime::kRuntimeSuccess);
+  if (failure == 4) {
+   REQUIRE(borrowed);
+   fault.armed = true;
+   borrowed.reset();
+   CHECK(session.HasUnsafeCustody());
+  }
+ } else {
+  CHECK(status != mmltk::backend::ml::runtime::kRuntimeSuccess);
+  CHECK(session.HasUnsafeCustody());
+  const auto calls = fault.calls;
+  CHECK(session.Close() != mmltk::backend::ml::runtime::kRuntimeSuccess);
+  CHECK(fault.calls == calls);
+ }
+ CHECK(retirement->admission_open() == (failure == 0));
+ if (failure != 0) CHECK_THROWS(session.Run(request, stream, delivery));
 }
 TEST_CASE("bbox-only runtime consumers do not turn mask capacity into demand", "[model][rfdetr][prediction][gpu]") {
  namespace runtime = mmltk::backend::ml::runtime;
@@ -1377,8 +1386,13 @@ TEST_CASE("Prediction counts settle at readback and retain exact device custody"
  REQUIRE(cudaSetDevice(0) == cudaSuccess);
  std::shared_ptr<rfdetr::PredictionCountStorage> storage;
  runtime::AnalysisAnnotationStorage output{.value_capacity = 4};
+ const auto publish = [&](const torch::Tensor& value, int device) {
+  output.count.Reset();
+  rfdetr::PredictionCountStorage::Prepare(storage, 1U, device);
+  storage->Publish(0U, value, output);
+ };
  const auto options = torch::TensorOptions().dtype(torch::kInt64).device(torch::kCUDA, 0);
- rfdetr::publish_prediction_count(storage, torch::tensor({2L}, options), output, 0);
+ publish(torch::tensor({2L}, options), 0);
  CHECK(output.count.value() == 0);
  CHECK(output.count.pending());
  auto previous = output;
@@ -1386,7 +1400,7 @@ TEST_CASE("Prediction counts settle at readback and retain exact device custody"
  REQUIRE(cudaStreamSynchronize(c10::cuda::getCurrentCUDAStream(0).stream()) == cudaSuccess);
  output.count.SettleAfterCompletion(output.value_capacity);
  CHECK(output.count.value() == 2);
- rfdetr::publish_prediction_count(storage, torch::tensor({0L}, options), output, 0);
+ publish(torch::tensor({0L}, options), 0);
  CHECK(storage != first_storage.lock());
  REQUIRE(cudaStreamSynchronize(c10::cuda::getCurrentCUDAStream(0).stream()) == cudaSuccess);
  output.count.SettleAfterCompletion(output.value_capacity);
@@ -1397,26 +1411,58 @@ TEST_CASE("Prediction counts settle at readback and retain exact device custody"
  previous.count.Reset();
  CHECK(first_storage.expired());
  const auto reusable = storage.get();
- rfdetr::publish_prediction_count(storage, torch::tensor({1L}, options), output, 0);
+ publish(torch::tensor({1L}, options), 0);
  CHECK(storage.get() == reusable);
  // Abandoning the published view cannot free the execution owner's queued copy.
  output.count.Reset();
  CHECK(storage.use_count() == 1);
  REQUIRE(cudaStreamSynchronize(c10::cuda::getCurrentCUDAStream(0).stream()) == cudaSuccess);
  for (const auto invalid : {-1L, 5L}) {
-  rfdetr::publish_prediction_count(storage, torch::tensor({invalid}, options), output, 0);
+  publish(torch::tensor({invalid}, options), 0);
   REQUIRE(cudaStreamSynchronize(c10::cuda::getCurrentCUDAStream(0).stream()) == cudaSuccess);
   CHECK_THROWS(output.count.SettleAfterCompletion(output.value_capacity));
   CHECK(output.count.pending());
  }
  output.count.Reset();
- CHECK_THROWS(rfdetr::publish_prediction_count(storage, torch::Tensor{}, output, 0));
- CHECK_THROWS(rfdetr::publish_prediction_count(storage, torch::zeros({2}, options), output, 0));
- CHECK_THROWS(rfdetr::publish_prediction_count(storage, torch::zeros({1}, options.dtype(at::kFloat)), output, 0));
- CHECK_THROWS(rfdetr::publish_prediction_count(storage, torch::zeros({1}, options.device(torch::kCPU)), output, 0));
- CHECK_THROWS(rfdetr::publish_prediction_count(storage, torch::zeros({1, 1}, options), output, 0));
- CHECK_THROWS(rfdetr::publish_prediction_count(storage, torch::zeros({1}, options), output, 1));
+ CHECK_THROWS(publish(torch::Tensor{}, 0));
+ CHECK_THROWS(publish(torch::zeros({2}, options), 0));
+ CHECK_THROWS(publish(torch::zeros({1}, options.dtype(at::kFloat)), 0));
+ CHECK_THROWS(publish(torch::zeros({1}, options.device(torch::kCPU)), 0));
+ CHECK_THROWS(publish(torch::zeros({1, 1}, options), 0));
+ CHECK_THROWS(publish(torch::zeros({1}, options), 1));
  CHECK(output.count.empty());
+ REQUIRE(storage->ReleaseSettled() == CUDA_SUCCESS);
+ CHECK(storage->ReleaseSettled() == CUDA_SUCCESS);
+}
+TEST_CASE("batch counts share one registered extent independently of batch size", "[model][rfdetr][prediction][gpu]") {
+ namespace gpu = mmltk::frameworks::gpu;
+ namespace runtime = mmltk::backend::ml::runtime;
+ REQUIRE(cudaSetDevice(0) == cudaSuccess);
+ auto retirement = std::make_shared<gpu::TerminalCudaRetirementOwner>(2U);
+ std::shared_ptr<rfdetr::PredictionCountStorage> storage;
+ constexpr std::size_t batch = 129U;
+ rfdetr::PredictionCountStorage::Prepare(storage, batch, 0, retirement);
+ std::vector<runtime::AnalysisAnnotationStorage> outputs(batch);
+ const auto count = torch::ones({1}, torch::TensorOptions().dtype(torch::kInt64).device(torch::kCUDA, 0));
+ for (std::size_t index = 0; index < batch; ++index) {
+  outputs[index].value_capacity = 1;
+  storage->Publish(index, count, outputs[index]);
+ }
+ REQUIRE(cudaStreamSynchronize(c10::cuda::getCurrentCUDAStream(0).stream()) == cudaSuccess);
+ CHECK(retirement->fact().reservations == 1U);
+ for (auto& output : outputs) {
+  output.count.SettleAfterCompletion(1U);
+  CHECK(output.count.value() == 1U);
+ }
+ CHECK(storage->ReleaseSettled() == CUDA_ERROR_NOT_READY);
+ auto escaped = outputs.back().count;
+ outputs.clear();
+ storage.reset();
+ CHECK(escaped.value() == 1U);
+ CHECK(retirement->fact().reservations == 1U);
+ escaped.Reset();
+ CHECK(retirement->fact().reservations == 0U);
+ CHECK(retirement->admission_open());
 }
 TEST_CASE("Analysis providers distinguish empty known and pending counts", "[model][rfdetr][prediction]") {
  namespace runtime = mmltk::backend::ml::runtime;

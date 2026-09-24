@@ -131,6 +131,50 @@ TEST_CASE("Predict seals unsafe execution and close custody across repeated admi
  }
  CHECK_FALSE(retained.expired());
 }
+TEST_CASE("Predict observes receiver retirement discovered while releasing a replaced runtime", "[controller][systems][predict][custody]") {
+ class ReleasingRuntime final : public PredictRuntime {
+ public:
+  ~ReleasingRuntime() override {
+   if (lease_) std::move(lease_).Install(mmltk::frameworks::gpu::TerminalCudaCustody::Share(std::move(custody_)), cudaErrorUnknown);
+  }
+  contracts::ComputeTerminal Run(mmltk::backend::models::rfdetr::PredictRequest, std::stop_token, const ComputeProgressSink&, const ProductSink&, const PlaybackGate&, VisualExtent,
+   const ContextProvider&, const PreviewRetirement& retirement, const ComputeArtifactSink&, const PredictionRunOutput&, std::uint64_t) override {
+   retirement_ = retirement;
+   lease_ = mmltk::frameworks::gpu::ReserveTerminalCudaLease(*retirement_);
+   return contracts::make_compute_terminal(contracts::ComputeOperationOutcome::Succeeded);
+  }
+ private:
+  PreviewRetirement retirement_;
+  mmltk::frameworks::gpu::TerminalCudaRetirementLease lease_;
+  std::shared_ptr<int> custody_ = std::make_shared<int>(1);
+ };
+ ApplicationDataFixture fixture{mmltk::testsupport::make_temp_root("predict-release-admission")};
+ fixture.PrepareModel(contracts::FeatureId::Predict);
+ auto [settings, dataset, model] = fixture.systems();
+ unsigned constructions = 0;
+ std::array<std::promise<void>, 2> settled;
+ PredictSystem prediction{settings, dataset, model, {.device = 0, .maximum_width = 64U, .maximum_height = 64U},
+  [&](DirectComputeConfiguration) { ++constructions; return std::make_unique<ReleasingRuntime>(); },
+  [&](const PredictSystem::event_type& event) {
+   std::visit([&](const auto& value) {
+    if (!value.snapshot.operation.active && value.snapshot.operation.generation_frontier)
+     mmltk::testsupport::release_test_promise(settled.at(value.snapshot.operation.generation_frontier - 1U));
+   }, event);
+  }, [](int device, int numa) { return DirectComputeConfiguration{.numa_node = device + numa}; }};
+ static_cast<void>(prediction.Start({}));
+ mmltk::testsupport::await_test_promise(settled[0], "initial receiver run");
+ REQUIRE(prediction.snapshot().operation.terminal.outcome == contracts::ComputeOperationOutcome::Succeeded);
+ contracts::SettingsUpdateRequest edit;
+ edit.updates.push_back({.path = "workflows.predict.request.device_id", .value = mmltk::frameworks::serialization::wire::FlatValue{std::int64_t{7}}});
+ static_cast<void>(settings.Update(std::move(edit)));
+ static_cast<void>(prediction.Start({}));
+ mmltk::testsupport::await_test_promise(settled[1], "receiver release failure");
+ CHECK(prediction.snapshot().operation.terminal.outcome == contracts::ComputeOperationOutcome::Failed);
+ CHECK(constructions == 1U);
+ for (unsigned attempt = 0; attempt < 3; ++attempt) CHECK_THROWS_AS(prediction.Start({}), contracts::UnavailableError);
+ static_cast<void>(prediction.Stop({}));
+ prediction.Shutdown();
+}
 TEST_CASE("Predict distinguishes ordinary from terminal runtime construction failure", "[controller][systems][predict][custody]") {
  const bool terminal = GENERATE(false, true);
  ApplicationDataFixture fixture{mmltk::testsupport::make_temp_root("predict-construction-admission")};

@@ -3,6 +3,7 @@
 #include "src/frameworks/gpu/device_execution.h"
 #include "src/frameworks/gpu/tests/device_execution_fixture.h"
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 #include <cuda.h>
 #include <limits>
 #include "src/common/system/numa_memory.h"
@@ -59,5 +60,53 @@ TEST_CASE("Registered local storage preserves portable high-water registration",
  check_portable(first);
  REQUIRE(host.ReleaseSettled() == CUDA_SUCCESS);
  CHECK(host.data() == nullptr);
+}
+TEST_CASE("registered pages report explicit and final-borrower retirement through one authority", "[frameworks][gpu][pinned][hardware]") {
+ namespace gpu = mmltk::frameworks::gpu;
+ gpu::test_support::IsolatedTestDevice device;
+ device.context.Bind();
+ struct Fault { bool armed = false; int failure = 0; unsigned unregisters = 0, synchronizations = 0, restores = 0; } fault;
+ fault.failure = GENERATE(0, 1, 2, 3);
+ auto authority = std::make_shared<gpu::TerminalCudaRetirementOwner>(3U);
+ const gpu::PinnedHostBuffer::Operations operations{
+  .context = {&fault, [](void*, CUcontext* current) noexcept { return cuCtxGetCurrent(current); },
+   [](void* value, CUcontext current) noexcept {
+    auto& fault = *static_cast<Fault*>(value);
+    return fault.armed && fault.failure == 3 && ++fault.restores == 2U ? CUDA_ERROR_CONTEXT_IS_DESTROYED : cuCtxSetCurrent(current);
+   }},
+  .synchronize = [](void* value) { auto& fault = *static_cast<Fault*>(value); ++fault.synchronizations; return fault.armed && fault.failure == 1 ? CUDA_ERROR_UNKNOWN : cuCtxSynchronize(); },
+  .unregister = [](void* value, void* address) {
+   auto& fault = *static_cast<Fault*>(value);
+   ++fault.unregisters;
+   return fault.armed && fault.failure == 2 ? CUDA_ERROR_UNKNOWN : cuMemHostUnregister(address);
+  },
+ };
+ CUcontext context{};
+ REQUIRE(cuCtxGetCurrent(&context) == CUDA_SUCCESS);
+ auto owner = std::make_unique<gpu::PinnedHostBuffer>(context, device.execution.placement, true, &cuMemHostRegister, authority, operations);
+ owner->ensure_bytes(64U);
+ const auto address = owner->data();
+ REQUIRE(address);
+ fault.armed = true;
+ if (fault.failure == 1) {
+  owner.reset();
+  CHECK(fault.synchronizations == 1U);
+  CHECK(fault.unregisters == 0U);
+ } else if (fault.failure == 0) {
+  CHECK(owner->ReleaseSettled() == CUDA_SUCCESS);
+  CHECK(owner->ReleaseSettled() == CUDA_SUCCESS);
+  owner.reset();
+  CHECK(fault.unregisters == 1U);
+  CHECK(fault.synchronizations == 0U);
+ } else {
+  CHECK(owner->ReleaseSettled() != CUDA_SUCCESS);
+  CHECK(owner->data() == address);
+  const auto calls = fault.unregisters;
+  CHECK(owner->ReleaseSettled() != CUDA_SUCCESS);
+  owner.reset();
+  CHECK(fault.unregisters == calls);
+ }
+ CHECK(authority->admission_open() == (fault.failure == 0));
+ CHECK(authority->fact().occupancy == (fault.failure == 0 ? 0U : 1U));
 }
 }  // namespace

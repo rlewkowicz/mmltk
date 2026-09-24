@@ -37,6 +37,8 @@ struct CudaRuntimeResources::State final {
  int device = -1;
  cudaStream_t stream = nullptr;
  Close close;
+ bool session_closed = false;
+ bool retired = false;
  cudaError_t failure = cudaSuccess;
  void RecordFailure(cudaError_t status) noexcept { if (failure == cudaSuccess) failure = status; }
 };
@@ -62,15 +64,7 @@ CudaRuntimeResources::CudaRuntimeResources(const DirectComputeConfiguration conf
 CudaRuntimeResources::~CudaRuntimeResources() noexcept { Release(); }
 void CudaRuntimeResources::Release() noexcept {
  if (HasUnsafeCustody()) return;
- try {
-  CloseSession();
-  WithDevice([this] {
-   if (!state_->stream) return;
-   const auto status = state_->operations.destroy(state_->operations.context, state_->stream);
-   if (status != cudaSuccess) { Retain(status); throw mmltk::backend::ml::runtime::CudaOperationError{status, "compute stream destruction"}; }
-   state_->stream = nullptr;
-  });
- } catch (...) { Retain(cudaErrorUnknown); }
+ try { Retire(); } catch (...) { Retain(cudaErrorUnknown); }
 }
 int CudaRuntimeResources::device() const noexcept { return state_->device; }
 bool CudaRuntimeResources::HasUnsafeCustody() const noexcept { return !retirement_.admission_open(); }
@@ -85,6 +79,7 @@ void CudaRuntimeResources::Settle() {
 }
 contracts::ComputeTerminal CudaRuntimeResources::Run(Work work, const std::stop_token stop, bool settle) {
  if (HasUnsafeCustody()) throw contracts::UnavailableError("compute CUDA custody is unproved");
+ if (state_->session_closed) throw contracts::UnavailableError("compute CUDA resources are retired");
  if (stop.stop_requested()) return contracts::make_compute_terminal(contracts::ComputeOperationOutcome::Cancelled);
  contracts::ComputeTerminal result;
  WithExecution([&] {
@@ -108,13 +103,24 @@ contracts::ComputeTerminal CudaRuntimeResources::Run(Work work, const std::stop_
  });
  return stop.stop_requested() ? contracts::make_compute_terminal(contracts::ComputeOperationOutcome::Cancelled, 0U, result.completed) : result;
 }
-void CudaRuntimeResources::CloseSession() {
+void CudaRuntimeResources::Retire() {
+ if (state_->retired) return;
  if (HasUnsafeCustody()) throw contracts::UnavailableError("compute CUDA custody is unproved");
  WithDevice([this] {
   Settle();
-  try { if (state_->close) state_->close(); }
+  try {
+   if (!state_->session_closed && state_->close) state_->close();
+   state_->session_closed = true;
+  }
   catch (...) { Retain(cudaErrorUnknown); throw; }
+  if (state_->stream) {
+   const auto status = state_->operations.destroy(state_->operations.context, state_->stream);
+   if (status != cudaSuccess) { Retain(status); throw mmltk::backend::ml::runtime::CudaOperationError{status, "compute stream destruction"}; }
+   state_->stream = nullptr;
+  }
  });
+ // WithDevice has finalized caller restoration before retirement is observable.
+ state_->retired = true;
 }
 void CudaRuntimeResources::WithExecution(Command work) {
  mmltk::common::system::ScopedExecutionPolicy policy(*state_->configuration.worker_policy());

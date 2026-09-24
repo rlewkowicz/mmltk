@@ -18,6 +18,7 @@ class ModelSystem;
 class ExportRuntime {
 public:
  virtual ~ExportRuntime() = default;
+ // Complete physical retirement; successful repeated Close is inert.
  virtual void Close() {}
  [[nodiscard]] virtual bool HasUnsafeCustody() const noexcept { return false; }
  [[nodiscard]] virtual contracts::ComputeTerminal Run(ExportRunRequest, std::stop_token, const ComputeProgressSink&, const ComputeArtifactSink& = {}, std::uint64_t generation = 0) = 0;

@@ -40,7 +40,9 @@ CudaPredictRuntime::CudaPredictRuntime(DirectComputeConfiguration configuration,
 CudaPredictRuntime::~CudaPredictRuntime() = default;
 void CudaPredictRuntime::Close() noexcept {
  try {
-  impl_->resources.CloseSession();
+  impl_->resources.Retire();
+  impl_->preview.reset();
+  impl_->preview_context.reset();
  } catch (...) { impl_->close_failed = true; }
 }
 bool CudaPredictRuntime::HasUnsafeCustody() const noexcept { return impl_->resources.HasUnsafeCustody() || impl_->close_failed || impl_->session.HasUnsafeCustody() || (impl_->preview && impl_->preview->HasUnsafeCustody()); }
@@ -136,6 +138,7 @@ contracts::ComputeTerminal CudaPredictRuntime::Run(mmltk::backend::models::rfdet
        [&](std::size_t decoded, std::size_t total) {
         if (progress) progress({++sequence, decoded, total, "Decoded"});
        },
+      .retirement = retirement,
      });
    } catch (...) {
     const auto failure = std::current_exception();
@@ -278,7 +281,7 @@ public:
       }
       Publish(PredictChanged{snapshot()});
       if (runtime_ && runtime_configuration_ != configuration) RetireRuntime();
-      if (!retirement_.admission_open()) throw contracts::UnavailableError("prediction runtime retirement failed");
+      if (!retirement_.admission_open() || !preview_retirement_->admission_open()) throw contracts::UnavailableError("prediction runtime retirement failed");
       const bool initial_runtime = !runtime_;
       if (!runtime_) {
        try { runtime_ = factory_(configuration); }
@@ -591,8 +594,9 @@ private:
  std::optional<DirectComputeConfiguration> runtime_configuration_;
  mmltk::frameworks::gpu::TerminalCudaRetirementOwner retirement_{1U};
  mmltk::frameworks::gpu::TerminalCudaRetirementLease retirement_lease_ = mmltk::frameworks::gpu::ReserveTerminalCudaLease(retirement_);
- // Current pool, in-flight/old pending frames, context construction, and whole submission.
- PredictRuntime::PreviewRetirement preview_retirement_ = std::make_shared<mmltk::frameworks::gpu::TerminalCudaRetirementOwner>(detail::PredictionPreviewPool::kSlotCapacity + 4U);
+ // Frames and borrowed index buffers (2 * slots), six session host buffers,
+ // two source claims, four receiver/context claims and two growth claims.
+ PredictRuntime::PreviewRetirement preview_retirement_ = std::make_shared<mmltk::frameworks::gpu::TerminalCudaRetirementOwner>(2U * detail::PredictionPreviewPool::kSlotCapacity + 14U);
  std::shared_ptr<PredictRuntime> runtime_;
  direct::LocalRun run_;
  direct::LocalRun inspection_run_;

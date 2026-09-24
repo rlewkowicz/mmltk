@@ -4,6 +4,7 @@ module;
 #include <filesystem>
 #include <functional>
 #include <memory>
+#include "src/frameworks/gpu/pinned_host_buffer.h"
 #include <optional>
 #include <span>
 #include <stop_token>
@@ -30,6 +31,8 @@ struct RfdetrRuntimeBackendOptions final {
  std::shared_ptr<const ClassArtifactAdmission> admission{};
  std::stop_token stop{};
  std::function<void(const std::filesystem::path&)> artifact_published{};
+ std::shared_ptr<mmltk::frameworks::gpu::TerminalCudaRetirementOwner> retirement{};
+ mmltk::frameworks::gpu::PinnedHostBuffer::Operations registered_host_operations{};
 };
 enum class InferenceArtifactKind : std::uint8_t {
  Weights,
@@ -83,7 +86,8 @@ public:
 private:
  struct State;
  explicit RfdetrRuntimeBackend(std::shared_ptr<mmltk::backend::ml::runtime::RuntimeBackend> lane, std::string backend_name, std::uint32_t static_resolution, std::size_t maximum_detections,
-  std::shared_ptr<const ResolvedClassLayout> layout, std::vector<RfdetrNamedOutputRole> output_roles, std::shared_ptr<const ClassArtifactAdmission> admission);
+  std::shared_ptr<const ResolvedClassLayout> layout, std::vector<RfdetrNamedOutputRole> output_roles, std::shared_ptr<const ClassArtifactAdmission> admission,
+  std::shared_ptr<mmltk::frameworks::gpu::TerminalCudaRetirementOwner> retirement, mmltk::frameworks::gpu::PinnedHostBuffer::Operations operations);
  std::shared_ptr<mmltk::backend::ml::runtime::RuntimeBackend> lane_;
  std::string backend_name_;
  std::uint32_t static_resolution_ = 0U;

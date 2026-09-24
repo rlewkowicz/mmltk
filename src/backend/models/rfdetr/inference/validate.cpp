@@ -145,6 +145,8 @@ struct AlignmentSample final {
      }
     },
    .progress = delivery.progress,
+   .retirement = delivery.retirement,
+   .registered_host_operations = delivery.registered_host_operations,
   });
  ValidationBackendResult result;
  result.artifacts = predictions.artifacts;
@@ -209,21 +211,26 @@ template <class T>
 }
 }  // namespace
 struct ValidationSession::State final {
+ mmltk::frameworks::gpu::TerminalCudaRetirementOwner terminal{1U};
+ mmltk::frameworks::gpu::TerminalCudaRetirementLease lease = mmltk::frameworks::gpu::ReserveTerminalCudaLease(terminal);
  std::array<PredictionSession, 3U> predictions;
  // At most three selected artifacts and one consumed source; no batch-time I/O.
  std::array<std::shared_ptr<const ClassArtifactAdmission>, 4U> admissions;
  [[nodiscard]] PredictionSession& For(const InferenceArtifactKind kind) noexcept { return predictions[static_cast<std::size_t>(kind)]; }
  [[nodiscard]] ValidationRunResult Run(ValidateRequest& options, runtime::BorrowedCommandStream command_stream, const ValidationDelivery& delivery);
 };
-ValidationSession::ValidationSession() : state_(std::make_unique<State>()) {}
+ValidationSession::ValidationSession() : state_(std::make_shared<State>()) {}
 ValidationSession::~ValidationSession() { static_cast<void>(Close()); }
 mmltk::backend::ml::runtime::RuntimeStatus ValidationSession::Close() noexcept {
- mmltk::backend::ml::runtime::RuntimeStatus first = mmltk::backend::ml::runtime::kRuntimeSuccess;
+ if (!state_) return static_cast<runtime::RuntimeStatus>(cudaErrorUnknown);
  for (auto& prediction : state_->predictions) {
   const auto status = prediction.Close();
-  if (first == mmltk::backend::ml::runtime::kRuntimeSuccess && status != mmltk::backend::ml::runtime::kRuntimeSuccess) first = status;
+  if (status == runtime::kRuntimeSuccess) continue;
+  auto lease = std::move(state_->lease);
+  std::move(lease).Install(mmltk::frameworks::gpu::TerminalCudaCustody::Share(std::move(state_)), cudaErrorUnknown);
+  return status;
  }
- return first;
+ return runtime::kRuntimeSuccess;
 }
 ValidateRequest finalize_validate_request(ValidateRequest request) {
  validate_validate_request(request);
@@ -242,6 +249,7 @@ ValidationRunResult run_validation(const ValidateRequest& request) {
  return session.Run(request, {.native_handle = stream, .valid = true});
 }
 ValidationRunResult ValidationSession::Run(const ValidateRequest& request, const runtime::BorrowedCommandStream command_stream, const ValidationDelivery& delivery) {
+ if (!state_) throw runtime::CudaOperationError{cudaErrorUnknown, "validation session retirement failed"};
  if (delivery.stop.stop_requested()) return {.cancelled = true};
  if (!command_stream) throw std::invalid_argument("RF-DETR validation command stream is invalid");
  auto options = finalize_validate_request(request);

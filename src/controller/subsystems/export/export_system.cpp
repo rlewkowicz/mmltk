@@ -23,7 +23,7 @@ public:
 };
 CudaExportRuntime::CudaExportRuntime(DirectComputeConfiguration configuration, services::RuntimeDiagnosticTarget diagnostics) : diagnostics_(std::move(diagnostics)), impl_(std::make_unique<Impl>(configuration)) {}
 CudaExportRuntime::~CudaExportRuntime() = default;
-void CudaExportRuntime::Close() { impl_->resources.CloseSession(); }
+void CudaExportRuntime::Close() { impl_->resources.Retire(); }
 bool CudaExportRuntime::HasUnsafeCustody() const noexcept { return impl_->resources.HasUnsafeCustody(); }
 contracts::ComputeTerminal CudaExportRuntime::Run(ExportRunRequest operation, std::stop_token stop, const ComputeProgressSink& progress, const ComputeArtifactSink& published, std::uint64_t generation) {
  return impl_->resources.Run(

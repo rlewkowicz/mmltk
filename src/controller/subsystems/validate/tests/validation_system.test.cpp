@@ -1143,6 +1143,71 @@ TEST_CASE("headless validation receivers follow selected execution while graphic
  }
  retained.clear();
 }
+TEST_CASE("validation receiver authority survives group replacement and late borrowed release", "[controller][validation][gpu][custody]") {
+ namespace gpu = mmltk::frameworks::gpu;
+ namespace rfdetr = mmltk::backend::models::rfdetr;
+ using namespace mmltk::controller;
+ const bool borrowed = GENERATE(false, true);
+ const auto execution = gpu::resolve_device_execution(0, mmltk::common::system::NumaTopology::Capture());
+ auto replacement = execution;
+ // A changed execution descriptor exercises receiver replacement on one GPU too.
+ replacement.placement.cpus.push_back(replacement.placement.cpus.front());
+ bool fail_restore = false;
+ const gpu::CudaContextApi context_api{&fail_restore,
+  [](void*, CUcontext* value) noexcept { return cuCtxGetCurrent(value); },
+  [](void* fault, CUcontext value) noexcept { return *static_cast<bool*>(fault) ? CUDA_ERROR_CONTEXT_IS_DESTROYED : cuCtxSetCurrent(value); }};
+ auto retirement = std::make_shared<gpu::TerminalCudaRetirementOwner>(21U);
+ const mmltk::testsupport::ScopedTempDir root("validation-late-receiver");
+ ApplicationDataFixture fixture(root.path());
+ fixture.PrepareModel(contracts::FeatureId::Validate);
+ auto [settings, dataset, model] = fixture.systems();
+ unsigned factories = 0;
+ ValidationSystem validation(settings, dataset, model, [&](DirectComputeConfiguration) {
+  ++factories;
+  return std::make_unique<FakeNonvisualComputeRuntime>(ComputeScenario{});
+ }, {}, [](int, int) { return DirectComputeConfiguration{}; }, {}, {}, retirement);
+ std::vector<std::filesystem::path> published;
+ detail::ValidationSampleOutput output({execution}, {}, [&](const auto& path) { published.push_back(path); }, {}, retirement, context_api);
+ const std::array<std::uint32_t, 1> selected{0U};
+ contracts::ValidationRunPreview options;
+ options.overlays = {false, false, false, false, false, false};
+ auto catalog = std::make_shared<const mmltk::backend::data::catalog::ClassCatalog>(std::vector<std::string>{"retained"});
+ auto source = PredictionSource::Device(execution, {32U, 24U}, std::vector<float>(32U * 24U * 3U, .25F), {}, catalog);
+ rfdetr::PredictionRecord record{.dataset_index = 0};
+ const auto sample = [&] { return rfdetr::ValidationSampleView{record,
+  {.chw = source.pixels(), .width = 32U, .height = 24U, .device = execution.device, .custody = source.custody()}, source.annotations(), {}}; };
+ output.Begin(root.path() / "first", options, selected, {execution});
+ auto old = output.Capture(sample());
+ REQUIRE(old);
+ if (!borrowed) old.reset();
+ fail_restore = !borrowed;
+ if (borrowed) {
+  output.Begin(root.path() / "second", options, selected, {replacement});
+  REQUIRE_FALSE(output.HasUnsafeCustody());
+  REQUIRE(published.size() == 1U);
+  CHECK(old->receiver_device() == execution.device);
+  CHECK(old->classes().front() == "retained");
+  // The old image remains usable after its receiver pool has been released.
+  int width = 0, height = 0, channels = 0;
+  std::unique_ptr<stbi_uc, decltype(&stbi_image_free)> pixels(stbi_load(published.front().c_str(), &width, &height, &channels, 4), stbi_image_free);
+  REQUIRE(pixels);
+  CHECK(width == 32);
+  CHECK(height == 24);
+  CHECK(pixels.get()[0] == 64U);
+  fail_restore = true;
+  old.reset();
+ } else {
+  CHECK_THROWS_AS(output.Begin(root.path() / "second", options, selected, {replacement}), contracts::UnavailableError);
+  CHECK(published.size() == 1U);
+ }
+ REQUIRE(output.HasUnsafeCustody());
+ CHECK_THROWS_AS(output.Capture(sample()), contracts::UnavailableError);
+ CHECK_THROWS_AS(output.Begin(root.path() / "third", options, selected, {execution}), contracts::UnavailableError);
+ for (unsigned attempt = 0; attempt < 3; ++attempt) CHECK_THROWS_AS(validation.Start({}), contracts::UnavailableError);
+ CHECK(factories == 0U);
+ static_cast<void>(validation.Stop());
+ validation.Shutdown();
+}
 TEST_CASE("validation rendered output applies captured layers masks boxes and inclusive confidence", "[controller][validation][gpu][output]") {
  namespace gpu = mmltk::frameworks::gpu;
  namespace rfdetr = mmltk::backend::models::rfdetr;

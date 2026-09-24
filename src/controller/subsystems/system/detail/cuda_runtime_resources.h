@@ -36,7 +36,7 @@ public:
  CudaRuntimeResources(const CudaRuntimeResources&) = delete;
  CudaRuntimeResources& operator=(const CudaRuntimeResources&) = delete;
  [[nodiscard]] contracts::ComputeTerminal Run(Work, std::stop_token, bool settle = true);
- void CloseSession();
+ void Retire();
  [[nodiscard]] int device() const noexcept;
  [[nodiscard]] bool HasUnsafeCustody() const noexcept;
 

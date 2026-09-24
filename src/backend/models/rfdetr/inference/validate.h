@@ -1,4 +1,5 @@
 #pragma once
+#include "src/frameworks/gpu/pinned_host_buffer.h"
 #include <cstddef>
 #include "src/backend/imaging/resample/image_resize.h"
 #include <cstdint>
@@ -54,6 +55,8 @@ struct ValidationDelivery final {
  bool mask_metrics = true;
  std::function<void(std::span<const std::uint32_t>, std::shared_ptr<const mmltk::backend::data::catalog::ClassCatalog>)> samples_selected{};
  std::function<void(ValidationSampleView)> sample{};
+ std::shared_ptr<mmltk::frameworks::gpu::TerminalCudaRetirementOwner> retirement{};
+ mmltk::frameworks::gpu::PinnedHostBuffer::Operations registered_host_operations{};
 };
 struct ValidationRunResult {
  bool cancelled = false;
@@ -79,7 +82,7 @@ public:
 
 private:
  struct State;
- std::unique_ptr<State> state_;
+ std::shared_ptr<State> state_;
 };
 [[nodiscard]] ValidateRequest finalize_validate_request(ValidateRequest request);
 ValidationRunResult run_validation(const ValidateRequest& request);

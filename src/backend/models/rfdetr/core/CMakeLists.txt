@@ -173,15 +173,18 @@ function(mmltk_add_backend_models_rfdetr_core_tests)
         mmltk_backend_ml_torch_test_support)
     mmltk_register_header_isolation(mmltk_backend_models_rfdetr_training_fixture)
 
-    add_library(mmltk_backend_models_rfdetr_class_artifact_test_support INTERFACE)
+    add_library(mmltk_backend_models_rfdetr_class_artifact_test_support STATIC EXCLUDE_FROM_ALL
+        ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/class_artifact_fixture.cpp)
+    mmltk_configure_component(mmltk_backend_models_rfdetr_class_artifact_test_support PRIVATE_DECLARATIONS)
     mmltk_register_public_headers(
         mmltk_backend_models_rfdetr_class_artifact_test_support
         BASE_DIRS ${CMAKE_SOURCE_DIR}
         FILES ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/class_artifact_fixture.h)
-    target_link_libraries(mmltk_backend_models_rfdetr_class_artifact_test_support INTERFACE
+    target_link_libraries(mmltk_backend_models_rfdetr_class_artifact_test_support PUBLIC
         mmltk::backend::models::rfdetr::core
         mmltk::common::io
-        Catch2::Catch2)
+        Catch2::Catch2
+        PRIVATE ONNX::onnx "${Protobuf_LIBRARY}")
     mmltk_register_header_isolation(mmltk_backend_models_rfdetr_class_artifact_test_support)
 
     if(BUILD_RFDETR_PYTHON_CHECKPOINT_LOADER)

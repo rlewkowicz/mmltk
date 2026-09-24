@@ -160,8 +160,9 @@ struct AnnotationBatch final {
 };
 class PredictionBackend final {
 public:
- PredictionBackend(const PredictRequest& options, ResolvedInferenceArtifact artifact, const runtime::BorrowedCommandStream command_stream, std::stop_token stop)
-     : artifact_(std::move(artifact)), maximum_detections_(options.max_dets_per_image), device_(options.device_id), command_stream_(command_stream) {
+ PredictionBackend(const PredictRequest& options, ResolvedInferenceArtifact artifact, const runtime::BorrowedCommandStream command_stream, std::stop_token stop,
+  std::shared_ptr<mmltk::frameworks::gpu::TerminalCudaRetirementOwner> retirement, mmltk::frameworks::gpu::PinnedHostBuffer::Operations operations)
+     : retirement_(std::move(retirement)), operations_(operations), artifact_(std::move(artifact)), maximum_detections_(options.max_dets_per_image), device_(options.device_id), command_stream_(command_stream) {
   if (maximum_detections_ != 0) validate_prediction_candidates(maximum_detections_);
   switch (artifact_.kind) {
    case InferenceArtifactKind::Weights: {
@@ -206,6 +207,8 @@ public:
    .allow_fp16 = options.allow_fp16,
    .admission = artifact_.admission,
    .stop = stop,
+   .retirement = retirement_,
+   .registered_host_operations = operations_,
   });
   artifact_.admission = runtime_->class_artifact();
   resolution_ = runtime_->static_resolution();
@@ -275,6 +278,11 @@ public:
    if (selected != cudaSuccess) return static_cast<runtime::RuntimeStatus>(selected);
    const auto settled = cudaStreamSynchronize(reinterpret_cast<cudaStream_t>(command_stream_.native_handle));
    if (settled != cudaSuccess) return static_cast<runtime::RuntimeStatus>(settled);
+   if (count_storage_) {
+    const auto status = count_storage_->ReleaseSettled();
+    if (status != CUDA_SUCCESS && status != CUDA_ERROR_NOT_READY) return static_cast<runtime::RuntimeStatus>(status);
+    count_storage_.reset();
+   }
    class_postprocess_.reset();
    native_.reset();
   }
@@ -286,7 +294,7 @@ private:
   auto mask = torch::zeros({input.size(0), input.size(2), input.size(3)}, input.options().dtype(torch::kBool));
   const ModelOutputs outputs = (*native_).forward(NestedTensor{input, std::move(mask)}, annotations.want_masks);
   assert_inference_output_dtype(outputs.main.pred_logits, outputs.main.pred_boxes, native_input_type_, "native RF-DETR inference");
-  count_storage_.resize(annotations.storage.size());
+  PredictionCountStorage::Prepare(count_storage_, annotations.storage.size(), device_, retirement_, operations_);
   for (std::size_t index = 0U; index < annotations.storage.size(); ++index) {
    auto& storage = annotations.storage[index];
    const auto count = std::min({maximum_detections_, storage.value_capacity, static_cast<std::size_t>(outputs.main.pred_logits.size(1) * outputs.main.pred_logits.size(2))});
@@ -310,17 +318,19 @@ private:
    annotations.labels[index].narrow(0, 0, active).copy_(processed.labels[0].to(at::kInt));
    annotations.scores[index].narrow(0, 0, active).copy_(processed.scores[0].to(at::kFloat));
    annotations.selections[index] = processed;
-   publish_prediction_count(count_storage_[index], processed.counts, storage, device_);
+   count_storage_->Publish(index, processed.counts, storage);
    storage.class_catalog = native_->class_layout()->catalog();
    storage.class_domain = native_->class_layout()->domain();
   }
  }
+ std::shared_ptr<mmltk::frameworks::gpu::TerminalCudaRetirementOwner> retirement_;
+ mmltk::frameworks::gpu::PinnedHostBuffer::Operations operations_;
  ResolvedInferenceArtifact artifact_;
  ResolvedModelArtifacts artifacts_;
  std::shared_ptr<RfdetrRuntimeBackend> runtime_;
  std::unique_ptr<NativeRfDetrModel> native_;
  std::unique_ptr<ClassPostprocessLane> class_postprocess_;
- std::vector<std::shared_ptr<PredictionCountStorage>> count_storage_;
+ std::shared_ptr<PredictionCountStorage> count_storage_;
  std::size_t maximum_detections_ = 0U;
  std::uint32_t resolution_ = 0U;
  int device_ = 0;
@@ -378,7 +388,20 @@ void prepare_annotations(AnnotationBatch& result, std::size_t batch, std::size_t
  }
 }
 struct PredictionReadback final {
- explicit PredictionReadback(int device) : boxes(device), labels(device), scores(device), masks(device), indices(device) {}
+ explicit PredictionReadback(int device, const std::shared_ptr<mmltk::frameworks::gpu::TerminalCudaRetirementOwner>& retirement,
+  mmltk::frameworks::gpu::PinnedHostBuffer::Operations operations)
+  : boxes(device, {}, retirement, operations), labels(device, {}, retirement, operations), scores(device, {}, retirement, operations),
+    masks(device, {}, retirement, operations), indices(device, {}, retirement, operations) {}
+ [[nodiscard]] CUresult Close() {
+  box_values = label_values = score_values = mask_values = index_values = {};
+  for (auto* host : {&boxes, &labels, &scores, &masks, &indices}) {
+   const auto status = host->ReleaseSettled();
+   if (status != CUDA_SUCCESS && status != CUDA_ERROR_NOT_READY) return status;
+  }
+  device_indices = selected_queries = packed_masks = {};
+  mask_workspace.ResetSettled();
+  return CUDA_SUCCESS;
+ }
  void Read(AnnotationBatch& batch) {
   box_values = boxes.view(batch.boxes.sizes(), at::kFloat);
   label_values = labels.view(batch.labels.sizes(), at::kInt);
@@ -744,7 +767,7 @@ void complete_prediction_record(PredictionRecord& record, std::size_t index, con
 }  // namespace
 struct PredictionSession::State final {
  std::shared_ptr<mmltk::frameworks::gpu::TerminalCudaRetirementOwner> source_retirement =
-  std::make_shared<mmltk::frameworks::gpu::TerminalCudaRetirementOwner>(DatasetBatchLease::kSourceRetirementCapacity);
+  std::make_shared<mmltk::frameworks::gpu::TerminalCudaRetirementOwner>(16U);
  mmltk::frameworks::gpu::TerminalCudaRetirementOwner retirement{1U};
  mmltk::frameworks::gpu::TerminalCudaRetirementLease retirement_lease = mmltk::frameworks::gpu::ReserveTerminalCudaLease(retirement);
  std::unique_ptr<PredictionBackend> backend;
@@ -759,7 +782,10 @@ struct PredictionSession::State final {
  std::uintptr_t command_stream = 0U;
  bool allow_fp16 = false;
  bool poisoned = false;
- [[nodiscard]] PredictionBackend& Bind(const PredictRequest& options, const ResolvedInferenceArtifact& selected, const runtime::BorrowedCommandStream stream, std::stop_token stop) {
+ bool authority_adopted = false;
+ mmltk::frameworks::gpu::PinnedHostBuffer::Operations operations;
+ [[nodiscard]] runtime::RuntimeStatus Close() noexcept;
+ [[nodiscard]] PredictionBackend& Bind(const PredictRequest& options, const ResolvedInferenceArtifact& selected, const runtime::BorrowedCommandStream stream, std::stop_token stop, int node) {
   if (selected.admission) {
    selected.admission->RequireUnchanged(stop);
    if (!selected.admission->Matches(selected.path, options.class_layout_path)) throw std::runtime_error("prediction admission does not match selected artifact");
@@ -767,20 +793,18 @@ struct PredictionSession::State final {
   const auto requested_resolution = options.resolution > 0 ? static_cast<std::uint32_t>(options.resolution) : 0U;
   if (!backend || !readback || !backend->class_artifact()->Matches(selected.path, options.class_layout_path) || artifact.kind != selected.kind || artifact.backend_name != selected.backend_name ||
       artifact.path != selected.path || preset_name != options.preset_name || resolution != requested_resolution || maximum_detections != options.max_dets_per_image || device != options.device_id ||
-      command_stream != stream.native_handle || allow_fp16 != options.allow_fp16) {
+      command_stream != stream.native_handle || allow_fp16 != options.allow_fp16 ||
+      readback_node != node) {
    auto next_artifact = selected;
    auto next_preset_name = options.preset_name;
-   if (backend) {
-    const auto status = backend->Close();
-    if (status != cudaSuccess) throw runtime::CudaOperationError{status, "RF-DETR prediction session rebind"};
-    backend.reset();
-   }
-   // A failed completion stays session-owned and cannot reuse stale identity.
-   readback.reset();
-   device = -1;
-   backend = std::make_unique<PredictionBackend>(options, selected, stream, stop);
+   const auto status = Close();
+   if (status != runtime::kRuntimeSuccess) throw runtime::CudaOperationError{status, "RF-DETR prediction session rebind"};
+   device = options.device_id;
+   command_stream = stream.native_handle;
+   backend = std::make_unique<PredictionBackend>(options, selected, stream, stop, source_retirement, operations);
    backend->class_artifact()->RequireUnchanged(stop);
-   readback = std::make_unique<PredictionReadback>(options.device_id);
+   readback = std::make_unique<PredictionReadback>(options.device_id, source_retirement, operations);
+   readback_node = node;
    artifact = std::move(next_artifact);
    preset_name = std::move(next_preset_name);
    resolution = requested_resolution;
@@ -804,15 +828,34 @@ PredictionSession::~PredictionSession() {
  }
 }
 bool PredictionSession::HasUnsafeCustody() const noexcept { return state_->poisoned || !state_->source_retirement->admission_open(); }
-mmltk::backend::ml::runtime::RuntimeStatus PredictionSession::Close() noexcept {
- if (HasUnsafeCustody()) return static_cast<runtime::RuntimeStatus>(cudaErrorUnknown);
- if (!state_->backend) return mmltk::backend::ml::runtime::kRuntimeSuccess;
- const auto status = state_->backend->Close();
- if (status == cudaSuccess)
-  state_->backend.reset();
- else
-  state_->poisoned = true;
- return static_cast<mmltk::backend::ml::runtime::RuntimeStatus>(status);
+mmltk::backend::ml::runtime::RuntimeStatus PredictionSession::Close() noexcept { return state_->Close(); }
+runtime::RuntimeStatus PredictionSession::State::Close() noexcept {
+ if (poisoned || !source_retirement->admission_open()) return static_cast<runtime::RuntimeStatus>(cudaErrorUnknown);
+ if (!backend && !readback) return runtime::kRuntimeSuccess;
+ runtime::RuntimeStatus status = runtime::kRuntimeSuccess;
+ struct CloseCall { State* state; runtime::RuntimeStatus* status; } call{this, &status};
+ try {
+  torch_cuda::run_on_torch_cuda_stream(device, command_stream, &call, [](void* value) {
+   auto& call = *static_cast<CloseCall*>(value);
+   auto& owner = *call.state;
+   *call.status = static_cast<runtime::RuntimeStatus>(cudaStreamSynchronize(reinterpret_cast<cudaStream_t>(owner.command_stream)));
+   if (*call.status != runtime::kRuntimeSuccess) return;
+   owner.annotations = {};
+   if (owner.backend) {
+    *call.status = owner.backend->Close();
+    if (*call.status != runtime::kRuntimeSuccess) return;
+    owner.backend.reset();
+   }
+   if (owner.readback) {
+    *call.status = static_cast<runtime::RuntimeStatus>(owner.readback->Close());
+    if (*call.status != runtime::kRuntimeSuccess) return;
+    owner.readback.reset();
+   }
+  });
+ } catch (...) { status = static_cast<runtime::RuntimeStatus>(cudaErrorUnknown); }
+ if (!source_retirement->admission_open()) status = static_cast<runtime::RuntimeStatus>(cudaErrorUnknown);
+ if (status != runtime::kRuntimeSuccess) poisoned = true;
+ return status;
 }
 PredictRequest finalize_predict_request(PredictRequest request) {
  validate_predict_request(request);
@@ -852,6 +895,13 @@ PredictionRunResult PredictionSession::RunResolved(
   result.cancelled = true;
   return result;
  }
+ if (delivery.retirement && delivery.retirement != state_->source_retirement) {
+  if (state_->authority_adopted) throw std::invalid_argument("prediction session retirement authority cannot change");
+  state_->source_retirement = delivery.retirement;
+ }
+ state_->authority_adopted = true;
+ if (!state_->backend && !state_->readback) state_->operations = delivery.registered_host_operations;
+ if (HasUnsafeCustody()) throw runtime::CudaOperationError{cudaErrorUnknown, "prediction delivery custody is unproved"};
  struct BoundPredictionCall final {
   State* state;
   const PredictRequest* options;
@@ -914,11 +964,7 @@ PredictionRunResult PredictionSession::State::RunResolved(
                                                                 ? std::unique_ptr<mmltk::backend::data::DatasetLoader>{}
                                                                 : inference_detail::make_loader(options.compiled_path, options.batch_size, options, 2U, source_retirement);
  mmltk::common::system::ScopedExecutionPolicy policy({placement.cpus, "predict", 0, placement.numa_node, -10, false});
- if (readback_node != placement.numa_node) {
-  readback = std::make_unique<PredictionReadback>(options.device_id);
-  readback_node = placement.numa_node;
- }
- auto& bound_backend = Bind(options, selected_artifact, execution_stream, delivery.stop);
+ auto& bound_backend = Bind(options, selected_artifact, execution_stream, delivery.stop, placement.numa_node);
  PredictionRunResult result;
  result.backend_name = bound_backend.name();
  result.artifacts = bound_backend.artifacts();

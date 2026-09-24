@@ -3,12 +3,14 @@
 #include <cuda_runtime_api.h>
 #include "src/frameworks/gpu/device_execution.h"
 namespace mmltk::backend::ml::cuda {
-NumaHostTensor::NumaHostTensor(int device, std::shared_ptr<void> context_custody) : device_(device), context_custody_(std::move(context_custody)) {
+NumaHostTensor::NumaHostTensor(int device, std::shared_ptr<void> context_custody,
+ std::shared_ptr<mmltk::frameworks::gpu::TerminalCudaRetirementOwner> retirement, mmltk::frameworks::gpu::PinnedHostBuffer::Operations operations)
+ : retirement_(std::move(retirement)), operations_(operations), device_(device), context_custody_(std::move(context_custody)) {
  if (device_ < 0 && cudaGetDevice(&device_) != cudaSuccess) throw std::runtime_error("resolve NUMA host tensor device");
  c10::cuda::CUDAGuard guard(checked_device_index(device_));
  CUcontext context{};
  if (cuCtxGetCurrent(&context) != CUDA_SUCCESS || !context) throw std::runtime_error("NUMA host tensor requires a current CUDA context");
- storage_ = mmltk::frameworks::gpu::PinnedHostBuffer::ForCurrentDevice();
+ storage_ = mmltk::frameworks::gpu::PinnedHostBuffer::ForCurrentDevice(true, retirement_, operations_);
 }
 at::Tensor NumaHostTensor::view(at::IntArrayRef shape, at::ScalarType dtype) {
  std::size_t bytes = c10::elementSize(dtype);
@@ -18,7 +20,7 @@ at::Tensor NumaHostTensor::view(at::IntArrayRef shape, at::ScalarType dtype) {
  }
  // Existing tensor views must never be invalidated by high-water growth.
  if (bytes > storage_->capacity_bytes() && storage_.use_count() != 1) {
-  NumaHostTensor replacement(device_, context_custody_);
+  NumaHostTensor replacement(device_, context_custody_, retirement_, operations_);
   replacement.storage_->ensure_bytes(std::max<std::size_t>(bytes, 1));
   storage_.swap(replacement.storage_);
  } else {
