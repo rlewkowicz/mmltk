@@ -23,12 +23,6 @@ extern "C" {
 }
 namespace mmltk::backend::media::video {
 namespace {
-void require_media(int result, const char* operation) {
- if (result >= 0) return;
- char message[AV_ERROR_MAX_STRING_SIZE]{};
- av_strerror(result,message,sizeof(message));
- throw std::runtime_error(std::string(operation)+": "+message);
-}
 std::int64_t shifted_time(std::int64_t value, AVRational base, std::int64_t origin, AVRational output) {
  if (base.num<=0 || base.den<=0 || output.num<=0 || output.den<=0) throw std::invalid_argument("video has an invalid rational time base");
  const auto converted=av_rescale_q(value,base,output);
@@ -175,7 +169,7 @@ struct VideoFileSink::State final {
   }
  }
 };
-VideoFileSink::VideoFileSink(const std::filesystem::path& directory, const VideoMediaInfo& info, int device, bool software_only, FileWrite file_write)
+VideoFileSink::VideoFileSink(const std::filesystem::path& partial, const std::filesystem::path& completed, const VideoMediaInfo& info, int device, bool software_only, FileWrite file_write)
  : state_(std::make_unique<State>()) {
  auto& s = *state_;
  s.file_write=std::move(file_write);
@@ -183,7 +177,8 @@ VideoFileSink::VideoFileSink(const std::filesystem::path& directory, const Video
   throw std::invalid_argument("video output source geometry is unavailable or excessive");
  if (!s.frame || !s.packet) throw std::bad_alloc();
  s.width=info.width; s.height=info.height; s.rate={info.rate_numerator,info.rate_denominator}; s.source=info.state_;
- s.partial=directory/"prediction.partial.mkv"; s.complete=directory/"prediction.mkv";
+ s.partial=partial; s.complete=completed;
+ if (s.partial.empty() || s.complete.empty() || s.partial==s.complete) throw std::invalid_argument("video output paths must be distinct and nonempty");
  if (std::filesystem::exists(s.partial) || std::filesystem::exists(s.complete)) throw std::runtime_error("prediction video output already exists");
  require_media(avformat_alloc_output_context2(&s.format,nullptr,"matroska",s.partial.c_str()),"allocate Matroska output");
  if (!s.format) throw std::bad_alloc();
@@ -222,7 +217,6 @@ VideoFileSink::VideoFileSink(const std::filesystem::path& directory, const Video
  s.FlushIo();
 }
 VideoFileSink::~VideoFileSink() = default;
-const std::filesystem::path& VideoFileSink::partial_path() const noexcept { return state_->partial; }
 void VideoFileSink::Write(mmltk::frameworks::gpu::ImagePlaneView image, VideoTiming timing, std::uintptr_t stream) {
  auto& s=*state_;
  if (s.closed || !image.valid() || image.descriptor.width!=s.width || image.descriptor.height!=s.height) throw std::invalid_argument("prediction video frame geometry changed");

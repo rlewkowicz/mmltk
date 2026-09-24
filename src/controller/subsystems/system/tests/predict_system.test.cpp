@@ -10,6 +10,7 @@
 #include "src/controller/subsystems/system/detail/prediction_output.h"
 #include "src/backend/models/rfdetr/inference/prediction_delivery.h"
 #include "src/backend/models/rfdetr/core/class_layout.h"
+#include <stb_image.h>
 #include <stb_image_write.h>
 #include "src/backend/ml/runtime/backend_factory.h"
 #include "src/backend/data/catalog/class_catalog.h"
@@ -227,7 +228,7 @@ TEST_CASE("prediction application retains admitted outputs with independent medi
  fixture.PrepareModel(contracts::FeatureId::Predict);
  DatasetSystem dataset{settings,[] { return std::make_unique<OutputDatasetRuntime>(); }};
  std::promise<void> terminal;
- PredictSystem prediction{settings,dataset,model,{.device=0,.maximum_width=64U,.maximum_height=64U},[] { return std::make_unique<OutputPredictRuntime>(); },
+ PredictSystem prediction{settings,dataset,model,{.device=0,.maximum_width=8U,.maximum_height=8U},[] { return std::make_unique<OutputPredictRuntime>(); },
   [&](PredictSystem::event_type event) { if (const auto* changed=std::get_if<PredictChanged>(&event); changed && changed->snapshot.operation.terminal.outcome==contracts::ComputeOperationOutcome::Succeeded) mmltk::testsupport::release_test_promise(terminal); else if (std::holds_alternative<PredictFailed>(event)) mmltk::testsupport::release_test_promise(terminal); }};
  contracts::PredictWorkflowIntent intent;
  intent.saving.compiled_enabled=saving; intent.saving.single_enabled=saving; intent.saving.compiled_percent=1;
@@ -241,7 +242,13 @@ TEST_CASE("prediction application retains admitted outputs with independent medi
  CHECK(snapshot.operation.output.completed_samples==(saving ? 1U:0U));
  CHECK(snapshot.operation.output.artifacts.size()==(json ? 1U:0U));
  if (json) CHECK(std::filesystem::is_regular_file(snapshot.operation.output.artifacts.front()));
- if (saving) CHECK(std::filesystem::is_regular_file(snapshot.operation.output.recent_sample));
+ if (saving) {
+  CHECK(std::filesystem::is_regular_file(snapshot.operation.output.recent_sample));
+  if (!compiled) CHECK(std::filesystem::path(snapshot.operation.output.recent_sample).filename()=="sample.png");
+  int width=0,height=0,channels=0;
+  REQUIRE(stbi_info(snapshot.operation.output.recent_sample.c_str(),&width,&height,&channels));
+  CHECK(width==16); CHECK(height==16);
+ }
 }
 TEST_CASE("impossible compiled saving under inference limit fails before reservation", "[controller][systems][predict][output]") {
  const auto root=mmltk::testsupport::make_temp_root("predict-impossible-limit");

@@ -135,6 +135,12 @@ void finish_prediction_run(PredictionRunResult& result, const std::chrono::stead
   .element_type = runtime_type(input.scalar_type()),
  };
 }
+struct ResolvedPredictionDemand final {
+ bool pixels_requested = false;
+ bool pixels_admitted = false;
+ bool encoded_masks = false;
+ bool preview_masks = false;
+};
 struct AnnotationBatch final {
  torch::Tensor boxes;
  torch::Tensor labels;
@@ -147,7 +153,7 @@ struct AnnotationBatch final {
  bool want_masks = false;
  bool encoded_masks = false;
  bool preview_masks = false;
- std::vector<PredictionDemand> demand;
+ std::vector<ResolvedPredictionDemand> demand;
  bool raw_preview = false;
  std::string preview_failure;
 };
@@ -395,14 +401,19 @@ void execute_prediction_batch(const PredictRequest& options, PredictionBackend& 
  annotations.demand.resize(batch_size);
  bool masks = false, pixels = false;
  for (std::size_t image = 0; image < batch_size; ++image) {
-  auto demand = delivery.demand ? delivery.demand(indices.empty() ? first_index + static_cast<std::int64_t>(image) : indices[image]) : PredictionDemand{};
-  demand.encoded_masks = ((delivery.encoded_masks && options.include_masks) || demand.encoded_masks) && backend.has_masks();
-  demand.source_pixels = (delivery.source_pixels || demand.source_pixels) && static_cast<bool>(delivery.completed);
-  demand.preview_masks =
-   demand.source_pixels && (options.include_masks || demand.preview_masks) && backend.has_masks() && width <= delivery.maximum_pixel_width && height <= delivery.maximum_pixel_height;
+  const auto requested = delivery.demand ? delivery.demand(indices.empty() ? first_index + static_cast<std::int64_t>(image) : indices[image]) : PredictionDemand{};
+  const bool bounded = width <= delivery.maximum_pixel_width && height <= delivery.maximum_pixel_height;
+  const bool requested_pixels = (delivery.source_pixels || requested.source_pixels || requested.native_pixels) && static_cast<bool>(delivery.completed);
+  const bool admitted_pixels = requested_pixels && (requested.native_pixels || bounded);
+  const ResolvedPredictionDemand demand{
+   .pixels_requested = requested_pixels,
+   .pixels_admitted = admitted_pixels,
+   .encoded_masks = ((delivery.encoded_masks && options.include_masks) || requested.encoded_masks) && backend.has_masks(),
+   .preview_masks = admitted_pixels && ((bounded && (delivery.source_pixels || requested.source_pixels) && options.include_masks) || requested.preview_masks) && backend.has_masks(),
+  };
   annotations.demand[image] = demand;
   masks = masks || demand.encoded_masks || demand.preview_masks;
-  pixels = pixels || (demand.source_pixels && width <= delivery.maximum_pixel_width && height <= delivery.maximum_pixel_height);
+  pixels = pixels || demand.pixels_admitted;
  }
  prepare_annotations(annotations, batch_size, backend.capacity(batch_size, width, height, masks), width, height, options.device_id, masks, pixels);
  backend.Execute(input, annotations);
@@ -422,11 +433,11 @@ struct PredictionSourceStorage final {
 void deliver_prediction(const PredictionDelivery& delivery, const PredictionRecord& record, PredictionPixels pixels, const AnnotationBatch& annotations, std::size_t index,
  const PredictionReadback& readback, std::shared_ptr<void> source) {
  if (!delivery.completed) return;
- if (!annotations.demand[index].source_pixels)
+ if (!annotations.demand[index].pixels_requested)
   pixels = {};
  else if (!annotations.preview_failure.empty())
   pixels = {.preview_failure = annotations.preview_failure};
- else if (pixels.width > delivery.maximum_pixel_width || pixels.height > delivery.maximum_pixel_height)
+ else if (!annotations.demand[index].pixels_admitted)
   pixels = {.preview_failure = "Prediction preview exceeds the visual dimensions"};
  else if (pixels.chw || pixels.rgb8) {
   try {
@@ -619,7 +630,7 @@ void complete_prediction_record(PredictionRecord& record, std::size_t index, con
  annotations.encoded_masks = annotations.demand[index].encoded_masks;
  annotations.preview_masks = annotations.demand[index].preview_masks;
  annotations.want_masks = annotations.encoded_masks || annotations.preview_masks;
- annotations.raw_preview = annotations.demand[index].source_pixels && pixels.width <= delivery.maximum_pixel_width && pixels.height <= delivery.maximum_pixel_height;
+ annotations.raw_preview = annotations.demand[index].pixels_admitted;
  record.detections = copy_predictions(
   annotations, index, options.threshold, readback, static_cast<int>(backend.class_layout()->semantic() ? backend.class_layout()->catalog()->size() : backend.class_layout()->output_width()));
  for (auto& detection : record.detections) {
@@ -629,7 +640,7 @@ void complete_prediction_record(PredictionRecord& record, std::size_t index, con
  if (delivery.completed) {
   // Decoded images keep unique ownership until semantics are complete and
   // pixels are requested. The shared control block is optional preview work.
-  if (decoded_source && annotations.demand[index].source_pixels) {
+  if (decoded_source && annotations.demand[index].pixels_admitted) {
    try {
     std::shared_ptr<stbi_uc> decoded = std::move(*decoded_source);
     pixels.rgb8 = decoded.get();
@@ -685,12 +696,24 @@ void complete_prediction_record(PredictionRecord& record, std::size_t index, con
 [[nodiscard]] PredictionRunResult run_video_prediction(const PredictRequest& options, PredictionBackend& backend, runtime::BorrowedCommandStream command_stream, PredictionRunResult result,
  PredictionReadback& readback, AnnotationBatch& annotations, const PredictionDelivery& delivery, const std::shared_ptr<mmltk::frameworks::gpu::TerminalCudaRetirementOwner>& source_retirement) {
  const auto started = std::chrono::steady_clock::now();
+ const auto cancelled = [&] {
+  result.cancelled = true;
+  finish_prediction_run(result, started);
+  return std::move(result);
+ };
  const auto bytes_per_pixel = checked_prediction_extent(3U, sizeof(float), kMaximumPredictionTensorBytes);
  const mmltk::backend::media::video::VideoFrameCapacity capacity{kMaximumPredictionTensorBytes / bytes_per_pixel};
  auto source = std::make_shared<mmltk::backend::media::video::VideoFileSource>(options.video_path, capacity, options.device_id, command_stream.native_handle, delivery.stop, source_retirement);
- if (delivery.media_begin) delivery.media_begin(source->media_info());
+ if (delivery.stop.stop_requested()) return cancelled();
+ if (delivery.media_begin) {
+  const auto info = source->media_info();
+  if (!info || delivery.stop.stop_requested()) return cancelled();
+  delivery.media_begin(*info);
+ }
+ if (delivery.stop.stop_requested()) return cancelled();
  source->SetAudioConsumer(delivery.audio);
  if (delivery.begin) delivery.begin(result);
+ if (delivery.stop.stop_requested()) return cancelled();
  const auto cuda = torch::TensorOptions().dtype(at::kFloat).device(torch::kCUDA, options.device_id);
  const auto resolution = static_cast<int>(backend.resolution());
  auto normalized = torch::empty({1, 3, resolution, resolution}, cuda);

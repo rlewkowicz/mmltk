@@ -8,7 +8,7 @@
 #include <string>
 #include <string_view>
 #include <vector>
-#include "src/backend/media/video/video_file_source.h"
+#include "src/backend/media/video/video_media.h"
 #include "src/backend/ml/runtime/analysis_provider.h"
 #include "src/backend/models/rfdetr/contract/artifacts.h"
 #include "src/backend/models/rfdetr/core/evaluation.h"
@@ -50,7 +50,10 @@ struct PredictionPixels final {
  mmltk::backend::media::video::VideoTiming timing{};
 };
 struct PredictionDemand final {
+ // Bounded preview pixels follow the delivery's visual extent limits.
  bool source_pixels = false;
+ // Selected saved products use source geometry within physical storage bounds.
+ bool native_pixels = false;
  bool encoded_masks = false;
  bool preview_masks = false;
 };

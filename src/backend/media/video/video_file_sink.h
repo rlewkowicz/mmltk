@@ -4,7 +4,7 @@
 #include <memory>
 #include <functional>
 #include <cstddef>
-#include "video_file_source.h"
+#include "video_media.h"
 #include "src/frameworks/gpu/image_types.h"
 namespace mmltk::backend::media::video {
 // Synchronous worker-side backpressure. Each call settles its borrowed device
@@ -12,7 +12,7 @@ namespace mmltk::backend::media::video {
 class VideoFileSink final {
 public:
  using FileWrite = std::function<std::ptrdiff_t(int, const void*, std::size_t)>;
- VideoFileSink(const std::filesystem::path& directory, const VideoMediaInfo&, int device, bool software_only = false, FileWrite = {});
+ VideoFileSink(const std::filesystem::path& partial, const std::filesystem::path& completed, const VideoMediaInfo&, int device, bool software_only = false, FileWrite = {});
  ~VideoFileSink();
  VideoFileSink(const VideoFileSink&) = delete;
  VideoFileSink& operator=(const VideoFileSink&) = delete;
@@ -20,7 +20,6 @@ public:
  void Audio(const VideoAudioPacket&);
  void Complete();
  void ClosePartial();
- [[nodiscard]] const std::filesystem::path& partial_path() const noexcept;
 private:
  struct State;
  std::unique_ptr<State> state_;

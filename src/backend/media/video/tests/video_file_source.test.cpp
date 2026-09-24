@@ -104,6 +104,7 @@ TEST_CASE("local YUV video delivers sequential colors timing and EOF", "[video][
   auto source = std::make_unique<mmltk::backend::media::video::VideoFileSource>(
    path, mmltk::backend::media::video::VideoFrameCapacity{4U}, 0, reinterpret_cast<std::uintptr_t>(stream), std::stop_token{}, retirement);
   REQUIRE(source->frames_per_second() == 4.0);
+  const auto metadata=source->media_info(); REQUIRE(metadata);
   for (std::uint64_t index = 0U; index < 2U; ++index) {
    const auto frame = source->Next();
    REQUIRE(frame.has_value());
@@ -123,6 +124,8 @@ TEST_CASE("local YUV video delivers sequential colors timing and EOF", "[video][
   CUcontext before{};
   REQUIRE(cuCtxGetCurrent(&before) == CUDA_SUCCESS);
   source.reset();
+  CHECK(metadata->width==2U); CHECK(metadata->height==2U);
+  CHECK(metadata->rate_numerator==4); CHECK(metadata->rate_denominator==1);
   CUcontext after{};
   REQUIRE(cuCtxGetCurrent(&after) == CUDA_SUCCESS);
   CHECK(after == before);
@@ -149,6 +152,7 @@ TEST_CASE("local YUV video delivers sequential colors timing and EOF", "[video][
  stop.request_stop();
  mmltk::backend::media::video::VideoFileSource cancelled(path, {4U}, 0, reinterpret_cast<std::uintptr_t>(stream), stop.get_token());
  CHECK_FALSE(cancelled.Next().has_value());
+ CHECK_FALSE(cancelled.media_info().has_value());
 }
 namespace {
 void write_rotated_video(const std::filesystem::path& path, double rotation, int width = 64, int height = 32, const char* muxer = "mp4", AVCodecID codec_id = AV_CODEC_ID_MPEG4) {
@@ -645,4 +649,44 @@ TEST_CASE("video exact context transitions seal the existing owner before furthe
  CHECK(authority->admission_open() == !terminal);
  CHECK(authority->fact().occupancy == (terminal ? 1U : 0U));
  CHECK(authority->fact().reservations == 0U);
+}
+
+TEST_CASE("cancelled video context admission publishes no metadata and releases reservations", "[video][gpu][context]") {
+ namespace gpu = mmltk::frameworks::gpu;
+ namespace media = mmltk::backend::media::video;
+ const bool at_entry = GENERATE(false, true);
+ const auto path = std::filesystem::temp_directory_path() / ("mmltk-video-stop-entry-" + std::to_string(::getpid()) + ".y4m");
+ const mmltk::testsupport::ScopedTestCleanup remove{[&] { std::filesystem::remove(path); }};
+ {
+  std::ofstream file(path, std::ios::binary);
+  file << "YUV4MPEG2 W2 H2 F4:1 Ip A1:1 C444\nFRAME\n";
+  for (auto value : {16, 128, 128}) for (unsigned pixel=0; pixel<4; ++pixel) file.put(static_cast<char>(value));
+ }
+ const auto execution = gpu::resolve_device_execution(0, mmltk::common::system::NumaTopology::Capture());
+ mmltk::common::system::ScopedExecutionPolicy policy({execution.placement.cpus, "video-stop-entry", 0, execution.placement.numa_node, -10, false});
+ REQUIRE(cudaSetDevice(0) == cudaSuccess);
+ const mmltk::testsupport::ScopedTestStream stream;
+ struct Driver final { std::stop_source stop; bool at_entry; unsigned queries=0; } driver{{},at_entry};
+ gpu::CudaContextApi api{&driver,
+  [](void* opaque, CUcontext* value) noexcept {
+   auto& driver=*static_cast<Driver*>(opaque);
+   const auto result=cuCtxGetCurrent(value);
+   if (++driver.queries==1U && !driver.at_entry) driver.stop.request_stop();
+   return result;
+  },
+  [](void* opaque, CUcontext value) noexcept {
+   auto& driver=*static_cast<Driver*>(opaque);
+   if (driver.at_entry) driver.stop.request_stop();
+   return cuCtxSetCurrent(value);
+  }};
+ auto retirement=std::make_shared<gpu::TerminalCudaRetirementOwner>(1U);
+ {
+  auto source=media::test_support::VideoFileSourceTestAccess::Create(path,{4U},0,reinterpret_cast<std::uintptr_t>(stream.get()),driver.stop.get_token(),retirement,api);
+  REQUIRE(driver.stop.stop_requested());
+  CHECK_FALSE(source->media_info());
+  CHECK_FALSE(source->Next());
+ }
+ CHECK(retirement->admission_open());
+ CHECK(retirement->fact().occupancy==0U);
+ CHECK(retirement->fact().reservations==0U);
 }

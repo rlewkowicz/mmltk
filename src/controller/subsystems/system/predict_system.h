@@ -1,4 +1,5 @@
 #pragma once
+#include "prediction_run_output.h"
 #include "src/controller/contracts/prediction_output.h"
 #include "src/controller/contracts/workflow_output.h"
 #include <cstdint>
@@ -29,14 +30,6 @@
 #include "src/frameworks/gpu/image_workspace.h"
 #include "src/frameworks/gpu/terminal_cuda_retirement_owner.h"
 namespace mmltk::controller {
-struct PredictionRunOutput final {
- std::filesystem::path directory;
- contracts::PredictionOutputSettings saving{};
- contracts::PredictionRunPreview preview{};
- std::uint64_t population = 0;
- std::uint64_t processing_population = 0;
- std::function<void(const contracts::WorkflowOutputFacts&)> progress;
-};
 struct PredictLabel final {
  contracts::AnnotationBox box{};
  int class_reference = 0;

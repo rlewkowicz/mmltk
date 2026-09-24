@@ -90,7 +90,8 @@ TEST_CASE("unfinished prediction output preserves the completed file", "[model][
 }
 TEST_CASE("cancelled prediction does not bind an artifact or deliver records", "[model][rfdetr][prediction]") {
  rfdetr::PredictRequest request;
- request.source_kind = rfdetr::PredictSourceKind::ImageFiles;
+ request.source_kind = GENERATE(rfdetr::PredictSourceKind::ImageFiles, rfdetr::PredictSourceKind::VideoFile);
+ request.video_path = "/not-opened.mkv";
  request.image_inputs.push_back({"/not-opened.png", "frame", 9});
  request.weights_path = "/not-opened.pt";
  request.output_path.clear();
@@ -101,6 +102,9 @@ TEST_CASE("cancelled prediction does not bind an artifact or deliver records", "
  const auto result = session.RunResolved(request, {}, {.native_handle = 1U, .valid = true},
   {
    .stop = stop.get_token(),
+   .media_begin = [](const auto&) { FAIL("stopped prediction exposed media"); },
+   .audio = [](const auto&) { FAIL("stopped prediction delivered audio"); },
+   .begin = [](const auto&) { FAIL("stopped prediction began execution"); },
    .completed = [&](const auto&, auto, const auto&) { delivered = true; },
   });
  CHECK(result.cancelled);
@@ -463,6 +467,53 @@ TEST_CASE("prediction delivers bounded ordered images masks and receiver-owned p
  CHECK(empty_result.processed_images == 2);
  CHECK(empty_deliveries == 2);
  CHECK_FALSE(empty_result.cancelled);
+ // Every source gets one demand decision and one semantic delivery. Only the
+ // selected oversized record bypasses the small preview extent, independently
+ // of encoded semantic masks and GPU planes, including an empty model output.
+ for (const bool empty : {false, true})
+  for (const bool reverse : {false, true})
+   for (const bool encoded : {false, true})
+    for (const bool gpu_masks : {false, true}) {
+     auto mixed_request = empty ? empty_request : request;
+     mixed_request.include_masks = false;
+     mixed_request.threshold = 0.0F;
+     mixed_request.output_path.clear();
+     mixed_request.image_inputs = {{image, "bounded", 11}, {oversized, "refused", 12}, {oversized, "saved", 13}};
+     if (reverse) std::reverse(mixed_request.image_inputs.begin(), mixed_request.image_inputs.end());
+     std::vector<std::int64_t> decisions, records;
+     const auto mixed = session.Run(mixed_request, command,
+      {.source_pixels = true,
+       .encoded_masks = false,
+       .demand = [&](std::int64_t index) {
+        decisions.push_back(index);
+        return rfdetr::PredictionDemand{.native_pixels = mixed_request.image_inputs[index].image_id == 13, .encoded_masks = encoded, .preview_masks = gpu_masks};
+       },
+       .maximum_pixel_width = 2U,
+       .maximum_pixel_height = 2U,
+       .completed = [&](const auto& record, auto pixels, const auto& annotations) {
+        records.push_back(record.image_id);
+        const bool admitted = record.image_id != 12;
+        CHECK((pixels.rgb8 != nullptr) == admitted);
+        CHECK(pixels.preview_failure.empty() == admitted);
+        CHECK(annotations.masks_available == (admitted && gpu_masks && !empty));
+        CHECK((annotations.masks.address != 0U) == (admitted && gpu_masks && !empty));
+        CHECK(record.detections.empty() == empty);
+        for (const auto& detection : record.detections) CHECK(detection.has_mask == encoded);
+        if (admitted) {
+         CHECK(pixels.width == (record.image_id == 11 ? 2U : 3U));
+         CHECK(pixels.height == 2U);
+         REQUIRE(pixels.custody);
+        } else {
+         CHECK_FALSE(pixels.custody);
+         CHECK(annotations.boxes_xyxy.address == 0U);
+        }
+       }});
+     CHECK(mixed.processed_images == 3U);
+     CHECK_FALSE(mixed.cancelled);
+     CHECK(decisions == std::vector<std::int64_t>{0, 1, 2});
+     CHECK(records == (reverse ? std::vector<std::int64_t>{13, 12, 11} : std::vector<std::int64_t>{11, 12, 13}));
+    }
+
  rfdetr::PredictionSession context_poisoned;
  CHECK_THROWS_AS(context_poisoned.Run(request, command, {.completed = [](const auto&, auto, const auto&) { throw mmltk::frameworks::gpu::CudaContextFailure(true); }}),
   mmltk::backend::ml::runtime::CudaOperationError);

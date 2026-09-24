@@ -76,7 +76,7 @@ struct AlignmentSample final {
    .demand =
     [&](std::int64_t index) {
      const bool selected = delivery.sample && is_sample(index);
-     return PredictionDemand{.source_pixels = selected, .encoded_masks = masks, .preview_masks = selected};
+     return PredictionDemand{.native_pixels = selected, .encoded_masks = masks, .preview_masks = selected};
     },
    .begin =
     [&](const PredictionRunResult& result) {

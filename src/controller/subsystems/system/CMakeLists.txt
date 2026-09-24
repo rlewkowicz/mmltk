@@ -15,6 +15,7 @@ mmltk_register_public_headers(
         ../export/export_system.h
         ../export/export_run.h
         predict_system.h
+        prediction_run_output.h
         dataset_system.h
         model_system.h
         ../train/training_system.h)

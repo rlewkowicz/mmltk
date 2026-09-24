@@ -54,13 +54,6 @@ void video_log(void*, int level, const char* format, va_list arguments) {
   });
  } catch (...) {}
 }
-void check(int result, const char* operation) {
- if (result < 0) {
-  char text[AV_ERROR_MAX_STRING_SIZE]{};
-  av_strerror(result, text, sizeof(text));
-  throw std::runtime_error(std::string(operation) + ": " + text);
- }
-}
 void cuda_check(cudaError_t result) {
  if (result != cudaSuccess) throw std::runtime_error(cudaGetErrorString(result));
 }
@@ -128,6 +121,7 @@ struct VideoFileSource::State final {
  std::uint64_t index = 0U;
  bool draining = false;
  bool hardware_attempt = false;
+ bool admitted = false;
  bool failed = false;
  std::filesystem::path path;
  std::function<void(const VideoAudioPacket&)> audio;
@@ -179,7 +173,7 @@ struct VideoFileSource::State final {
    pixel_format = reinterpret_cast<const AVHWFramesContext*>(frame->hw_frames_ctx->data)->sw_format;
   }
   int rows[4]{};
-  check(av_image_fill_linesizes(rows, pixel_format, frame->width), "validate video row extents");
+  require_media(av_image_fill_linesizes(rows, pixel_format, frame->width), "validate video row extents");
   for (unsigned plane = 0U; plane < 4U; ++plane) {
    const auto stride = static_cast<std::int64_t>(frame->linesize[plane]);
    if (rows[plane] > 0 && (!frame->data[plane] || std::abs(stride) < rows[plane] || (frame->format == AV_PIX_FMT_CUDA && stride < 0)))
@@ -250,7 +244,7 @@ struct VideoFileSource::State final {
    if (!scaler) throw std::runtime_error("video color converter unavailable");
    const auto color_space = frame->colorspace == AVCOL_SPC_UNSPECIFIED ? SWS_CS_DEFAULT : frame->colorspace;
    const auto* coefficients = sws_getCoefficients(color_space);
-   check(sws_setColorspaceDetails(scaler, coefficients, frame->color_range == AVCOL_RANGE_JPEG, coefficients, 1, 0, 1 << 16, 1 << 16), "video color conversion");
+   require_media(sws_setColorspaceDetails(scaler, coefficients, frame->color_range == AVCOL_RANGE_JPEG, coefficients, 1, 0, 1 << 16, 1 << 16), "video color conversion");
    std::uint8_t* destination[]{static_cast<std::uint8_t*>(pinned->data()), nullptr, nullptr, nullptr};
    int strides[]{frame->width * 3, 0, 0, 0};
    if (sws_scale(scaler, frame->data, frame->linesize, 0, frame->height, destination, strides) != frame->height) throw std::runtime_error("video conversion returned incomplete pixels");
@@ -365,12 +359,15 @@ VideoFileSource::VideoFileSource(const std::filesystem::path& path, VideoFrameCa
   if (stop.stop_requested()) return;
   owner_->Run([&] { state.Open(false); });
  }
+ if (stop.stop_requested()) return;
  owner_->Run([&] {
   cuda_check(cudaEventCreateWithFlags(&state.decoder_ready, cudaEventDisableTiming));
   cuda_check(cudaEventCreateWithFlags(&state.source_read, cudaEventDisableTiming));
  });
 }
 void VideoFileSource::State::Open(bool hardware) {
+ admitted = false;
+ if (stop.stop_requested()) return;
  if (source_read_pending) cuda_check(cudaEventSynchronize(source_read));
  source_read_pending = false;
  av_frame_unref(frame);
@@ -386,7 +383,7 @@ void VideoFileSource::State::Open(bool hardware) {
  const auto opened = avformat_open_input(&format, path.c_str(), nullptr, &options);
  av_dict_free(&options);
  if (stop.stop_requested()) return;
- check(opened, "open prediction video");
+ require_media(opened, "open prediction video");
  const auto log_tracks = [&](const char* phase) {
   mmltk::common::logging::log_if_enabled("video", spdlog::level::debug, [&](auto& logger) {
    for (unsigned stream_index = 0; stream_index < format->nb_streams; ++stream_index) {
@@ -419,20 +416,20 @@ void VideoFileSource::State::Open(bool hardware) {
    AVPacket borrowed{};
    borrowed.side_data = parameters->coded_side_data;
    borrowed.side_data_elems = parameters->nb_coded_side_data;
-   check(av_packet_copy_props(declaration, &borrowed), "retain prediction video metadata");
+   require_media(av_packet_copy_props(declaration, &borrowed), "retain prediction video metadata");
   }
-  check(av_dict_set_int(&probe.streams[stream_index], "max_pixels", static_cast<std::int64_t>(limits.maximum_pixels), 0), "bound prediction probe decoder");
+  require_media(av_dict_set_int(&probe.streams[stream_index], "max_pixels", static_cast<std::int64_t>(limits.maximum_pixels), 0), "bound prediction probe decoder");
  }
  // New tracks discovered during find_stream_info have no per-stream option
  // slot. Disable its internal decoders for every track, retaining demuxing,
  // parsers, timing/extradata discovery, and the existing buffered packets.
  // Only the selected codec below may allocate decoded frames, under its limit.
- check(av_opt_set(format, "codec_whitelist", "", 0), "bound prediction stream discovery");
+ require_media(av_opt_set(format, "codec_whitelist", "", 0), "bound prediction stream discovery");
  const auto inspected = avformat_find_stream_info(format, probe.streams.data());
  log_tracks("inspected");
  if (stop.stop_requested()) return;
- check(inspected, "inspect prediction video");
- if (format->pb && format->pb->error < 0 && format->pb->error != AVERROR_EOF) check(format->pb->error, "read prediction video metadata");
+ require_media(inspected, "inspect prediction video");
+ if (format->pb && format->pb->error < 0 && format->pb->error != AVERROR_EOF) require_media(format->pb->error, "read prediction video metadata");
  // Failed probe-codec admission may clear container side data before FFmpeg
  // republishes codec parameters. Restore missing declarations without replacing
  // discovered facts or enabling unbounded probe decoding.
@@ -451,12 +448,12 @@ void VideoFileSource::State::Open(bool hardware) {
  log_tracks("ready");
  const AVCodec* decoder = nullptr;
  video_stream = av_find_best_stream(format, AVMEDIA_TYPE_VIDEO, -1, -1, &decoder, 0);
- check(video_stream, "select prediction video stream");
+ require_media(video_stream, "select prediction video stream");
  auto* track = format->streams[video_stream];
  limits.Declared(track->codecpar->width, track->codecpar->height);
  codec = avcodec_alloc_context3(decoder);
  if (!codec) throw std::bad_alloc();
- check(avcodec_parameters_to_context(codec, track->codecpar), "configure prediction decoder");
+ require_media(avcodec_parameters_to_context(codec, track->codecpar), "configure prediction decoder");
  codec->max_pixels = static_cast<std::int64_t>(limits.maximum_pixels);
  hardware_attempt = false;
  if (hardware)
@@ -480,13 +477,14 @@ void VideoFileSource::State::Open(bool hardware) {
   }
   return AV_PIX_FMT_NONE;
  };
- check(avcodec_open2(codec, decoder, nullptr), "open prediction decoder");
+ require_media(avcodec_open2(codec, decoder, nullptr), "open prediction decoder");
  fps = av_q2d(track->avg_frame_rate);
  if (!std::isfinite(fps) || fps <= 0.0) fps = av_q2d(track->r_frame_rate);
  if (!std::isfinite(fps) || fps <= 0.0) fps = 0.0;
  audio_read.assign(format->nb_streams, 0U);
  if (audio_delivered.empty()) audio_delivered.resize(format->nb_streams, 0U);
  total = track->nb_frames > 0 ? static_cast<std::uint64_t>(track->nb_frames) : 0U;
+ admitted = true;
 }
 VideoFileSource::~VideoFileSource() = default;
 std::optional<VideoFrame> VideoFileSource::Next() {
@@ -518,7 +516,7 @@ std::optional<VideoFrame> VideoFileSource::Next() {
      continue;
     }
     if (received == AVERROR_EOF) return {};
-    check(received == AVERROR(EAGAIN) ? 0 : received, "decode prediction video");
+    require_media(received == AVERROR(EAGAIN) ? 0 : received, "decode prediction video");
     if (state.draining) throw std::runtime_error("video decoder requested input after draining");
     int read;
     do {
@@ -532,7 +530,7 @@ std::optional<VideoFrame> VideoFileSource::Next() {
        if (state.packet->size<0 || state.packet->size>16*1024*1024) throw std::runtime_error("prediction audio packet exceeds bounded capacity");
        auto owned = std::make_shared<VideoAudioPacket::State>();
        if (!owned->packet) throw std::bad_alloc();
-       check(av_packet_ref(owned->packet, state.packet), "retain prediction audio packet");
+       require_media(av_packet_ref(owned->packet, state.packet), "retain prediction audio packet");
        VideoAudioPacket packet;
        packet.state_ = std::move(owned);
        state.audio(packet);
@@ -543,15 +541,15 @@ std::optional<VideoFrame> VideoFileSource::Next() {
     if (state.stop.stop_requested()) return {};
     if (read == AVERROR_EOF) {
      state.draining = true;
-     check(owner_->Run([&] { return avcodec_send_packet(state.codec, nullptr); }), "drain prediction video");
+     require_media(owner_->Run([&] { return avcodec_send_packet(state.codec, nullptr); }), "drain prediction video");
     } else {
-     check(read, "read prediction video");
+     require_media(read, "read prediction video");
      const auto submitted = owner_->Run([&] { return avcodec_send_packet(state.codec, state.packet); });
      if (submitted < 0 && state.hardware_attempt && state.index == 0U) {
       owner_->Run([&] { state.Open(false); });
       continue;
      }
-     check(submitted, "submit prediction video packet");
+     require_media(submitted, "submit prediction video packet");
     }
    }
    return {};
@@ -564,8 +562,13 @@ std::optional<VideoFrame> VideoFileSource::Next() {
   throw;
  }
 }
-VideoMediaInfo VideoFileSource::media_info() const {
+std::optional<VideoMediaInfo> VideoFileSource::media_info() const {
  const auto& source = *owner_->state;
+ if (source.stop.stop_requested()) return std::nullopt;
+ if (owner_->terminal || !source.admitted || !source.format || !source.codec || source.video_stream < 0 ||
+     static_cast<unsigned>(source.video_stream) >= source.format->nb_streams ||
+     !source.format->streams[source.video_stream] || !source.format->streams[source.video_stream]->codecpar)
+  throw std::logic_error("video metadata requires completed decoder admission");
  const auto* track = source.format->streams[source.video_stream];
  VideoMediaInfo result;
  const auto rotation = source.Rotation();
@@ -584,8 +587,8 @@ VideoMediaInfo VideoFileSource::media_info() const {
   if (input->codecpar->extradata_size<0 || input->codecpar->extradata_size>1024*1024) throw std::runtime_error("prediction audio format exceeds bounded capacity");
   auto copy = std::make_unique<VideoMediaInfo::State::Track>();
   if (!copy->parameters) throw std::bad_alloc();
-  check(avcodec_parameters_copy(copy->parameters,input->codecpar), "copy prediction audio format");
-  check(av_dict_copy(&copy->metadata,input->metadata,0), "copy prediction audio metadata");
+  require_media(avcodec_parameters_copy(copy->parameters,input->codecpar), "copy prediction audio format");
+  require_media(av_dict_copy(&copy->metadata,input->metadata,0), "copy prediction audio metadata");
   copy->source = static_cast<int>(index);
   copy->disposition = input->disposition;
   copy->time_base = input->time_base;

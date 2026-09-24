@@ -25,13 +25,14 @@ TEST_CASE("prediction samples capture native pixels independently of browser and
  mmltk::testsupport::ScopedTempDir directory("prediction-samples");
  const auto kind=GENERATE(rfdetr::PredictSourceKind::ImageFiles,rfdetr::PredictSourceKind::CompiledDataset,rfdetr::PredictSourceKind::VideoFile);
  const bool enabled=GENERATE(false,true);
+ const bool empty=GENERATE(false,true);
  PredictionRunOutput options{.directory=directory.path(),.population=8};
  options.saving.single_enabled=enabled; options.saving.compiled_enabled=enabled; options.saving.video_enabled=enabled;
  options.saving.compiled_percent=25; options.saving.video_mode=contracts::PredictionVideoSaving::Samples; options.saving.video_samples=2;
  contracts::WorkflowOutputFacts facts;
  options.progress=[&](const auto& value) { facts=value; };
  detail::PredictionOutput output({execution},kind,options,{});
- auto catalog=std::make_shared<const mmltk::backend::data::catalog::ClassCatalog>(std::vector<std::string>{"café"});
+ auto catalog=std::make_shared<const mmltk::backend::data::catalog::ClassCatalog>(empty ? std::vector<std::string>{} : std::vector<std::string>{"café"});
  output.Begin({.class_catalog=catalog,.class_domain=mmltk::backend::data::catalog::ClassReferenceDomain::Foreground,.source_images=8});
  const auto total=kind==rfdetr::PredictSourceKind::ImageFiles ? 1U:8U;
  for (unsigned index=0;index<total;++index) {
@@ -40,8 +41,9 @@ TEST_CASE("prediction samples capture native pixels independently of browser and
   rfdetr::Prediction detection;
   detection.class_reference=0; detection.score=0.75F; detection.bbox_xyxy={4,24,40,44};
   std::vector<float> pixels(64U*48U*3U,0.25F);
-  auto source=PredictionSource::Device(execution,{64,48},pixels,{detection},catalog);
-  auto raw=output.Capture({.dataset_index=index,.detections={detection}},
+  const auto detections=empty ? std::vector<rfdetr::Prediction>{} : std::vector<rfdetr::Prediction>{detection};
+  auto source=PredictionSource::Device(execution,{64,48},pixels,detections,catalog);
+  auto raw=output.Capture({.dataset_index=index,.detections=detections},
    {.chw=source.pixels(),.width=64,.height=48,.device=0,.custody=source.custody()},source.annotations());
   REQUIRE(raw);
   REQUIRE(cudaMemset(const_cast<float*>(source.pixels()),0,pixels.size()*sizeof(float))==cudaSuccess);
@@ -56,7 +58,7 @@ TEST_CASE("prediction samples capture native pixels independently of browser and
  CHECK(saved.get()[(47U*64U+63U)*4U]==64U);
  bool annotated=false;
  for (unsigned pixel=0;pixel<64U*48U;++pixel) annotated |= saved.get()[pixel*4U]!=64U || saved.get()[pixel*4U+1U]!=64U || saved.get()[pixel*4U+2U]!=64U;
- CHECK(annotated);
+ CHECK(annotated==!empty);
  unsigned pngs=0;
  for (const auto& item : std::filesystem::recursive_directory_iterator(directory.path())) {
   CHECK(item.path().extension()!=".json");
@@ -151,6 +153,9 @@ void prediction_video_fixture(const std::filesystem::path& directory) {
  REQUIRE(made.exit_code==0);
 }
 TEST_CASE("prediction composition reaches decoded rotated annotated video without a browser", "[controller][prediction][output][video][gpu]") {
+ enum class Settlement { Complete, Cancelled, Failed };
+ const auto settlement=GENERATE(Settlement::Complete,Settlement::Cancelled,Settlement::Failed);
+ const bool complete=settlement==Settlement::Complete;
  if (!mmltk::testsupport::checked_cuda_device_count()) SKIP("no CUDA device available");
  namespace media=mmltk::backend::media::video;
  const auto execution=gpu::resolve_device_execution(0,mmltk::common::system::NumaTopology::Capture());
@@ -167,13 +172,18 @@ TEST_CASE("prediction composition reaches decoded rotated annotated video withou
   contracts::WorkflowOutputFacts facts; options.progress=[&](const auto& value) { facts=value; };
   context.Bind();
   media::VideoFileSource source(temporary.path()/"rotated.mov",{95U*63U},0,stream.native_handle(),{});
-  const auto info=source.media_info(); REQUIRE(info.width==63U); REQUIRE(info.height==95U);
+  const auto info=source.media_info(); REQUIRE(info); REQUIRE(info->width==63U); REQUIRE(info->height==95U);
   detail::PredictionOutput output({execution},rfdetr::PredictSourceKind::VideoFile,options,context);
-  output.Media(info);
+  output.Media(*info);
   output.Begin({.class_catalog=catalog,.class_domain=mmltk::backend::data::catalog::ClassReferenceDomain::Foreground});
   std::vector<float> original(63U*95U*3U);
   std::size_t processed=0;
   while (auto frame=source.Next()) {
+   if (settlement==Settlement::Failed && processed==4U) {
+    CHECK_THROWS_WITH(output.Capture({.dataset_index=static_cast<std::int64_t>(frame->index)},
+     {.preview_failure="injected source preparation failure"},{}),"prediction saving pixels unavailable: injected source preparation failure");
+    break;
+   }
    context.Bind();
    read_video_pixels(frame->chw,original,stream.native_handle());
    rfdetr::Prediction detection{.class_reference=0,.score=.75F,.bbox_xyxy={4,30,42,72}};
@@ -183,12 +193,15 @@ TEST_CASE("prediction composition reaches decoded rotated annotated video withou
    REQUIRE(output.Capture({.dataset_index=static_cast<std::int64_t>(frame->index),.detections={detection}},
     {.chw=annotated.pixels(),.width=63,.height=95,.device=0,.custody=annotated.custody(),.timing=frame->timing},annotated.annotations()));
    ++processed; context.Bind();
+   if (settlement==Settlement::Cancelled && processed==4U) break;
   }
-  output.Finish(true); REQUIRE(processed==8U);
-  REQUIRE(facts.partial_video.empty()); REQUIRE(facts.artifacts.size()==1U);
+  output.Finish(complete); REQUIRE(processed==(complete ? 8U:4U));
+  REQUIRE(facts.partial_video.empty()==complete); REQUIRE(facts.artifacts.size()==(complete ? 1U:0U));
+  if (complete) CHECK(facts.artifacts.front()==directory/"prediction.mkv");
+  else CHECK(facts.partial_video==(directory/"prediction.partial.mkv").string());
   CHECK_FALSE(std::filesystem::exists(directory/"predictions.json"));
   context.Bind();
-  media::VideoFileSource decoded(directory/"prediction.mkv",{64U*96U},0,stream.native_handle(),{});
+  media::VideoFileSource decoded(directory/(complete ? "prediction.mkv":"prediction.partial.mkv"),{64U*96U},0,stream.native_handle(),{});
   std::vector<float> pixels(64U*96U*3U); std::size_t frames=0;
   while (auto frame=decoded.Next()) {
    REQUIRE(frame->width==64U); REQUIRE(frame->height==96U);

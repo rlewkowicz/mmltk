@@ -1,11 +1,12 @@
 #pragma once
-#include "video_file_source.h"
+#include "video_media.h"
 #include <vector>
 extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
 }
 namespace mmltk::backend::media::video {
+void require_media(int result, const char* operation);
 struct VideoMediaInfo::State final {
  struct Track final {
   int source = -1, disposition = 0;

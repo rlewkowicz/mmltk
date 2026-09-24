@@ -1,5 +1,4 @@
 #include "prediction_output.h"
-#include "src/controller/subsystems/system/predict_system.h"
 #include "prediction_sampling.h"
 #include "src/backend/imaging/raster/caption_raster.h"
 #include "src/backend/imaging/raster/rendered_image_writer.h"
@@ -15,6 +14,8 @@
 #include <stdexcept>
 #include <unordered_map>
 #include <utility>
+#include <string>
+#include <vector>
 namespace mmltk::controller::detail {
 namespace gpu = mmltk::frameworks::gpu;
 namespace raster = mmltk::backend::imaging::raster;
@@ -25,6 +26,10 @@ struct PredictionOutput::Impl final {
  rfdetr::PredictSourceKind kind;
  PredictionRunOutput options;
  bool enabled = false;
+ bool full_video = false;
+ bool catalog_ready = false;
+ bool captions_ready = false;
+ std::filesystem::path partial_path, completed_path;
  std::mt19937_64 random;
  raster::RenderedImageWriter::PngEncoder png_encoder;
  std::optional<PredictionSelection> selection;
@@ -57,28 +62,40 @@ struct PredictionOutput::Impl final {
   enabled=!options.directory.empty() && (kind==rfdetr::PredictSourceKind::CompiledDataset ? saving.compiled_enabled : kind==rfdetr::PredictSourceKind::VideoFile ? saving.video_enabled : saving.single_enabled);
   facts.directory=options.directory.string();
   if (!enabled) return;
-  if (seed) random.seed(*seed); else { std::random_device entropy; random.seed((static_cast<std::uint64_t>(entropy())<<32U)|entropy()); }
+  full_video=kind==rfdetr::PredictSourceKind::VideoFile && saving.video_mode==contracts::PredictionVideoSaving::Full;
+  if (full_video) { partial_path=options.directory/"prediction.partial.mkv"; completed_path=options.directory/"prediction.mkv"; }
+  const auto seed_random=[&] {
+   if (seed) random.seed(*seed); else { std::random_device entropy; random.seed((static_cast<std::uint64_t>(entropy())<<32U)|entropy()); }
+  };
   if (mmltk::frameworks::reflection::validate_reflected_fields(saving) || mmltk::frameworks::reflection::validate_reflected_fields(options.preview)) throw std::invalid_argument("invalid prediction saving options");
   if (kind==rfdetr::PredictSourceKind::CompiledDataset) {
    const auto count=saving.compiled_mode==contracts::PredictionCompiledSampling::Percent ? PredictionSelection::Percent(options.population,saving.compiled_percent) : saving.compiled_total;
-   selection.emplace(options.processing_population ? options.processing_population : options.population,count,random); expected_samples=count;
+   const auto population=options.processing_population ? options.processing_population : options.population;
+   if (count<population) seed_random();
+   selection.emplace(population,count,random); expected_samples=count;
   }
-  if (kind==rfdetr::PredictSourceKind::VideoFile && saving.video_mode==contracts::PredictionVideoSaving::Samples) reservoir.emplace(saving.video_samples);
+  if (kind==rfdetr::PredictSourceKind::VideoFile && saving.video_mode==contracts::PredictionVideoSaving::Samples) { seed_random(); reservoir.emplace(saving.video_samples); }
   if (kind!=rfdetr::PredictSourceKind::VideoFile || reservoir) facts.samples_directory=(kind==rfdetr::PredictSourceKind::ImageFiles ? options.directory : options.directory/"samples").string();
  }
+ void PrepareCaptions() {
+  if (!captions_ready && captions && catalog_ready) {
+   if (!names.empty()) captions->Prepare(names);
+   captions_ready=true;
+  }
+ }
  void Ensure() {
-  if (runtime) return;
   if (!context) {
    if (!configuration.execution) throw std::runtime_error("prediction output has no admitted device");
    context.emplace(CreatePredictionPreviewContext(*configuration.execution,retirement));
   }
   const auto execution=*context->execution();
-  pool=std::make_unique<PredictionPreviewPool>(execution,*context,PredictionPreviewPool::TransferOperations{&cuMemcpyPeerAsync,&cudaEventRecord,&cudaStreamSynchronize,&cuMemHostRegister},retirement);
-  runtime=std::make_unique<gpu::SystemImageRuntime>(gpu::SystemImageRuntimeConfig{.device=context->device(),.output_layout=gpu::ImageProductLayout::CleanAndSemantic,
+  if (!pool) pool=std::make_unique<PredictionPreviewPool>(execution,*context,PredictionPreviewPool::TransferOperations{&cuMemcpyPeerAsync,&cudaEventRecord,&cudaStreamSynchronize,&cuMemHostRegister},retirement);
+  if (!runtime) runtime=std::make_unique<gpu::SystemImageRuntime>(gpu::SystemImageRuntimeConfig{.device=context->device(),.output_layout=gpu::ImageProductLayout::CleanAndSemantic,
    .numa_node=execution.placement.numa_node,.execution=execution,.adopted_context=*context});
-  encode_stream=std::make_unique<gpu::ImageStream>(*context);
-  captions=std::make_unique<raster::CaptionRaster>(*context);
-  writer=std::make_unique<raster::RenderedImageWriter>(*context,png_encoder);
+  if (full_video && !encode_stream) encode_stream=std::make_unique<gpu::ImageStream>(*context);
+  if (!captions) captions=std::make_unique<raster::CaptionRaster>(*context);
+  if (!full_video && !writer) writer=std::make_unique<raster::RenderedImageWriter>(*context,png_encoder);
+  PrepareCaptions();
  }
  void Publish(bool force=false) {
   const auto now=std::chrono::steady_clock::now();
@@ -106,7 +123,6 @@ struct PredictionOutput::Impl final {
  void Draw(const std::shared_ptr<const PredictionPreviewFrame>& raw, const rfdetr::PredictionRecord& record, rfdetr::PredictionPixels pixels) {
   Flush();
   runtime->BindContext();
-  if (!names.empty()) captions->Prepare(names);
   labels.clear(); suffixes.clear();
   suffixes.resize(raw->predictions().size()); labels.reserve(raw->predictions().size());
   std::size_t suffix_index=0;
@@ -201,21 +217,23 @@ void PredictionOutput::Begin(const rfdetr::PredictionRunResult& result) {
  s.classes=s.foreground ? static_cast<int>(result.class_catalog->size()) : result.artifacts.config.num_classes;
  if (s.foreground) for (const auto& name : result.class_catalog->names()) s.names.push_back(name);
  else s.names={"Raw slot"};
+ s.catalog_ready=true;
+ if (s.captions) with_output_context(impl_,[&] { s.runtime->BindContext(); s.PrepareCaptions(); });
 }
 void PredictionOutput::Media(const media::VideoMediaInfo& info) {
- if (!Enabled() || impl_->reservoir) return;
+ if (!Enabled() || !impl_->full_video) return;
  with_output_context(impl_,[&] {
   impl_->Ensure();
   impl_->runtime->BindContext();
-  try { impl_->video=std::make_unique<media::VideoFileSink>(impl_->options.directory,info,impl_->context->device()); }
+  try { impl_->video=std::make_unique<media::VideoFileSink>(impl_->partial_path,impl_->completed_path,info,impl_->context->device()); }
   catch (...) {
-   const auto partial=impl_->options.directory/"prediction.partial.mkv";
+   const auto& partial=impl_->partial_path;
    std::error_code error;
    if (std::filesystem::is_regular_file(partial,error)) { impl_->facts.partial_video=partial.string(); impl_->Publish(true); }
    throw;
   }
  });
- impl_->facts.partial_video=impl_->video->partial_path().string(); impl_->Publish(true);
+ impl_->facts.partial_video=impl_->partial_path.string(); impl_->Publish(true);
 }
 void PredictionOutput::Audio(const media::VideoAudioPacket& packet) { if (impl_->video) impl_->video->Audio(packet); }
 std::shared_ptr<const PredictionPreviewFrame> PredictionOutput::Capture(const rfdetr::PredictionRecord& record,rfdetr::PredictionPixels pixels,const mmltk::backend::ml::runtime::AnalysisAnnotationStorage& annotations) {
@@ -239,7 +257,7 @@ void PredictionOutput::Finish(bool success) {
   throw std::runtime_error("Requested "+std::to_string(impl_->options.saving.video_samples)+" samples; the video contained "+std::to_string(impl_->reservoir->observed())+" frames. Saved "+std::to_string(impl_->facts.completed_samples)+".");
  if (impl_->video) {
   with_output_context(impl_,[&] { impl_->runtime->BindContext(); impl_->video->Complete(); });
-  impl_->facts.partial_video.clear(); impl_->facts.artifacts.push_back(impl_->options.directory/"prediction.mkv"); impl_->Publish(true);
+  impl_->facts.partial_video.clear(); impl_->facts.artifacts.push_back(impl_->completed_path); impl_->Publish(true);
  }
 }
 }

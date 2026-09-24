@@ -1,4 +1,5 @@
 #include "src/backend/media/video/video_file_sink.h"
+#include "src/backend/media/video/video_file_source.h"
 #include "src/frameworks/gpu/system_image_runtime.h"
 #include "src/frameworks/gpu/tests/device_execution_fixture.h"
 #include "src/test_support/filesystem_test_utils.hpp"
@@ -37,8 +38,14 @@ void encode(const std::filesystem::path& directory,bool complete,bool software,i
  gpu::DeviceContext context(0,gpu::cuda_image_copy_backend(),gpu::DeviceContextMode::Isolated,execution.placement.numa_node,execution);
  context.Bind();
  gpu::ImageStream stream(context);
- media::VideoFileSource source(directory/(std::filesystem::exists(directory/"source.mkv") ? "source.mkv":"source.y4m"),{15U},0,stream.native_handle(),{});
- media::VideoFileSink sink(directory,source.media_info(),0,software);
+ const auto input=directory/(std::filesystem::exists(directory/"source.mkv") ? "source.mkv":"source.y4m");
+ media::VideoFileSource source(input,{15U},0,stream.native_handle(),{});
+ const auto info=[&] {
+  media::VideoFileSource metadata_source(input,{15U},0,stream.native_handle(),{});
+  return metadata_source.media_info();
+ }();
+ REQUIRE(info); // The opaque audio/format facts outlive their decoder owner.
+ media::VideoFileSink sink(directory/"recording.partial.mkv",directory/"recording.mkv",*info,0,software);
  source.SetAudioConsumer([&](const auto& packet) { sink.Audio(packet); });
  gpu::SystemImageRuntime runtime({.device=0,.numa_node=execution.placement.numa_node,.execution=execution,.adopted_context=context});
  while (auto frame=source.Next()) {
@@ -55,7 +62,7 @@ void encode(const std::filesystem::path& directory,bool complete,bool software,i
   if (::write(ready,&byte,1)!=1) ::_exit(125);
   for (;;) ::pause();
  }
- if (obstruct_rename) std::filesystem::create_directory(directory/"prediction.mkv");
+ if (obstruct_rename) std::filesystem::create_directory(directory/"recording.mkv");
  if (complete) sink.Complete();
 }
 struct Decode final {
@@ -107,10 +114,10 @@ TEST_CASE("native H264 output preserves frame timing odd geometry and recoverabl
  mmltk::testsupport::ScopedTempDir temporary("video-output");
  input_video(temporary.path()/"source.y4m");
  encode(temporary.path(),complete,software);
- CHECK(std::filesystem::exists(temporary.path()/"prediction.partial.mkv")==!complete);
- CHECK(std::filesystem::exists(temporary.path()/"prediction.mkv")==complete);
+ CHECK(std::filesystem::exists(temporary.path()/"recording.partial.mkv")==!complete);
+ CHECK(std::filesystem::exists(temporary.path()/"recording.mkv")==complete);
  Decode decoded;
- decoded.Run(temporary.path()/(complete ? "prediction.mkv":"prediction.partial.mkv"),complete);
+ decoded.Run(temporary.path()/(complete ? "recording.mkv":"recording.partial.mkv"),complete);
 }
 TEST_CASE("Matroska propagates full-disk write failure and retains its partial path", "[video][sink][gpu]") {
  if (!mmltk::testsupport::checked_cuda_device_count()) SKIP("no CUDA device available");
@@ -119,18 +126,19 @@ TEST_CASE("Matroska propagates full-disk write failure and retains its partial p
  context.Bind(); gpu::ImageStream stream(context);
  mmltk::testsupport::ScopedTempDir temporary("video-full-disk"); input_video(temporary.path()/"source.y4m");
  media::VideoFileSource source(temporary.path()/"source.y4m",{15U},0,stream.native_handle(),{});
- CHECK_THROWS(media::VideoFileSink(temporary.path(),source.media_info(),0,true,
+ const auto info=source.media_info(); REQUIRE(info);
+ CHECK_THROWS(media::VideoFileSink(temporary.path()/"recording.partial.mkv",temporary.path()/"recording.mkv",*info,0,true,
   [](int,const void*,std::size_t)->std::ptrdiff_t { errno=ENOSPC; return -1; }));
- CHECK(std::filesystem::exists(temporary.path()/"prediction.partial.mkv"));
- CHECK_FALSE(std::filesystem::exists(temporary.path()/"prediction.mkv"));
+ CHECK(std::filesystem::exists(temporary.path()/"recording.partial.mkv"));
+ CHECK_FALSE(std::filesystem::exists(temporary.path()/"recording.mkv"));
 }
 TEST_CASE("video rename failure retains the completed partial file", "[video][sink][gpu]") {
  if (!mmltk::testsupport::checked_cuda_device_count()) SKIP("no CUDA device available");
  mmltk::testsupport::ScopedTempDir temporary("video-rename-failure");
  input_video(temporary.path()/"source.y4m");
  CHECK_THROWS(encode(temporary.path(),true,true,-1,true));
- CHECK(std::filesystem::is_directory(temporary.path()/"prediction.mkv"));
- Decode decoded; decoded.Run(temporary.path()/"prediction.partial.mkv",true);
+ CHECK(std::filesystem::is_directory(temporary.path()/"recording.mkv"));
+ Decode decoded; decoded.Run(temporary.path()/"recording.partial.mkv",true);
 }
 TEST_CASE("packaged FFmpeg exposes both selected H264 encoders", "[video][sink]") {
  REQUIRE(avcodec_find_encoder_by_name("h264_nvenc")!=nullptr);
@@ -158,7 +166,7 @@ TEST_CASE("annotated video retains variable source timestamp progression", "[vid
  const auto original=times(temporary.path()/"source.mkv");
  REQUIRE(original.size()==16U);
  CHECK(original[3].first-original[2].first!=original[2].first-original[1].first);
- CHECK(times(temporary.path()/"prediction.mkv")==original);
+ CHECK(times(temporary.path()/"recording.mkv")==original);
 }
 TEST_CASE("annotated Matroska copies multiple audio tracks and their dispositions", "[video][sink][gpu]") {
  if (!mmltk::testsupport::checked_cuda_device_count()) SKIP("no CUDA device available");
@@ -171,7 +179,7 @@ TEST_CASE("annotated Matroska copies multiple audio tracks and their disposition
  encode(temporary.path(),true,true);
  AVFormatContext* input=nullptr; AVFormatContext* output=nullptr;
  REQUIRE(avformat_open_input(&input,(temporary.path()/"source.mkv").c_str(),nullptr,nullptr)>=0);
- REQUIRE(avformat_open_input(&output,(temporary.path()/"prediction.mkv").c_str(),nullptr,nullptr)>=0);
+ REQUIRE(avformat_open_input(&output,(temporary.path()/"recording.mkv").c_str(),nullptr,nullptr)>=0);
  struct Cleanup { AVFormatContext*& input; AVFormatContext*& output; ~Cleanup(){avformat_close_input(&input);avformat_close_input(&output);} } cleanup{input,output};
  REQUIRE(avformat_find_stream_info(input,nullptr)>=0); REQUIRE(avformat_find_stream_info(output,nullptr)>=0);
  REQUIRE(input->nb_streams==3U); REQUIRE(output->nb_streams==3U);
@@ -224,6 +232,6 @@ TEST_CASE("flushed Matroska prefix decodes after SIGKILL without a trailer", "[v
  ::kill(child,SIGKILL);
  int status=0; REQUIRE(::waitpid(child,&status,0)==child);
  REQUIRE(ready=='R'); REQUIRE(WIFSIGNALED(status));
- Decode decoded; decoded.Run(temporary.path()/"prediction.partial.mkv",false);
- CHECK_FALSE(std::filesystem::exists(temporary.path()/"prediction.mkv"));
+ Decode decoded; decoded.Run(temporary.path()/"recording.partial.mkv",false);
+ CHECK_FALSE(std::filesystem::exists(temporary.path()/"recording.mkv"));
 }

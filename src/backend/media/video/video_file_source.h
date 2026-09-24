@@ -1,4 +1,5 @@
 #pragma once
+#include "video_media.h"
 #include <cstddef>
 #include <cstdarg>
 #include <cuda_runtime_api.h>
@@ -16,30 +17,6 @@ namespace mmltk::backend::media::video {
 namespace test_support {
 struct VideoFileSourceTestAccess;
 }
-struct VideoTiming final {
- std::optional<std::int64_t> pts;
- std::int64_t duration = 0;
- int time_base_numerator = 0, time_base_denominator = 1;
-};
-class VideoFileSink;
-class VideoMediaInfo final {
-public:
- struct State;
- std::uint32_t width = 0, height = 0;
- int rate_numerator = 0, rate_denominator = 1;
-private:
- std::shared_ptr<const State> state_;
- friend class VideoFileSource;
- friend class VideoFileSink;
-};
-class VideoAudioPacket final {
-public:
- struct State;
-private:
- std::shared_ptr<const State> state_;
- friend class VideoFileSource;
- friend class VideoFileSink;
-};
 struct VideoFrame final {
  const float* chw = nullptr;
  std::uint32_t width = 0U;
@@ -67,7 +44,9 @@ public:
  VideoFileSource(const VideoFileSource&) = delete;
  VideoFileSource& operator=(const VideoFileSource&) = delete;
  [[nodiscard]] std::optional<VideoFrame> Next();
- [[nodiscard]] VideoMediaInfo media_info() const;
+ // Cancellation returns no metadata; an invalid noncancelled admission throws.
+ // Returned facts retain independent immutable format and audio custody.
+ [[nodiscard]] std::optional<VideoMediaInfo> media_info() const;
  void SetAudioConsumer(std::function<void(const VideoAudioPacket&)>);
  [[nodiscard]] double frames_per_second() const noexcept;
  [[nodiscard]] std::uint64_t frame_count() const noexcept;

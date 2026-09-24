@@ -1,16 +1,13 @@
 #pragma once
-#include <filesystem>
 #include <cstdint>
-#include <functional>
 #include <memory>
 #include <optional>
-#include "src/controller/contracts/prediction_output.h"
-#include "src/controller/contracts/workflow_output.h"
 #include "src/controller/subsystems/system/compute_runtime.h"
+#include "src/backend/models/rfdetr/contract/workflow_requests.h"
 #include "src/backend/models/rfdetr/inference/prediction_delivery.h"
 #include "prediction_preview.h"
 #include "src/backend/imaging/raster/rendered_image_writer.h"
-namespace mmltk::controller { struct PredictionRunOutput; }
+#include "src/controller/subsystems/system/prediction_run_output.h"
 namespace mmltk::controller::detail {
 
 class PredictionOutput final {
