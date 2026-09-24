@@ -161,7 +161,7 @@ void prediction_video_fixture(const std::filesystem::path& directory) {
   {"ffmpeg", "-v", "error", "-loop", "1", "-framerate", "4", "-i", (directory / "source.png").string(), "-frames:v", "8", "-c:v", "png", (directory / "source.mov").string()});
  REQUIRE(made.exit_code == 0);
  made = mmltk::testsupport::run_subprocess_capture_output(
-  {"ffmpeg", "-v", "error", "-i", (directory / "source.mov").string(), "-c", "copy", "-metadata:s:v:0", "rotate=90", (directory / "rotated.mov").string()});
+  {"ffmpeg", "-v", "error", "-display_rotation", "90", "-i", (directory / "source.mov").string(), "-c", "copy", (directory / "rotated.mov").string()});
  REQUIRE(made.exit_code == 0);
 }
 TEST_CASE("prediction composition reaches decoded rotated annotated video without a browser", "[controller][prediction][output][video][gpu]") {
@@ -181,6 +181,7 @@ TEST_CASE("prediction composition reaches decoded rotated annotated video withou
  auto catalog = std::make_shared<const mmltk::backend::data::catalog::ClassCatalog>(std::vector<std::string>{"café"});
  // Isolate each semantic layer as well as the complete saved composition.
  for (unsigned layer = 0; layer < 4; ++layer) {
+  CAPTURE(settlement, layer);
   const auto directory = temporary.path() / std::to_string(layer);
   std::filesystem::create_directory(directory);
   PredictionRunOutput options{.directory = directory};
@@ -243,7 +244,10 @@ TEST_CASE("prediction composition reaches decoded rotated annotated video withou
     for (unsigned channel = 0; channel < 3; ++channel) difference = std::max(difference, std::abs(pixels[channel * 64U * 96U + y * 64U + x] - original[channel * 63U * 95U + y * 63U + x]));
     return difference;
    };
-   CHECK((changed(4, 40) > .12F) == options.preview.boxes);
+   // Outlines occupy exterior pixels; x=4 is inside this box and only
+   // receives incidental H.264 chroma bleed from the border at x=3.
+   CAPTURE(frames, changed(3, 40));
+   CHECK((changed(3, 40) > .12F) == options.preview.boxes);
    CHECK((changed(24, 55) > .08F) == options.preview.masks);
    bool caption = false;
    for (unsigned y = 10; y < 28; ++y)
@@ -263,8 +267,11 @@ TEST_CASE("video samples use actual decoded population despite AVI count metadat
  gpu::test_support::IsolatedTestDevice device;
  const auto& execution = device.execution;
  auto& context = device.context;
- context.Bind();
- gpu::ImageStream stream(context);
+ // PredictionSession decodes on its primary CUDA context; the output receiver
+ // retains its own isolated context and copies from that producer stream.
+ gpu::DeviceContext source_context(0, gpu::cuda_image_copy_backend(), gpu::DeviceContextMode::PrimaryInterop, execution.placement.numa_node, execution);
+ source_context.Bind();
+ gpu::ImageStream stream(source_context);
  mmltk::testsupport::ScopedTempDir temporary("prediction-video-count");
  prediction_video_fixture(temporary.path());
  const auto made =
@@ -288,7 +295,7 @@ TEST_CASE("video samples use actual decoded population despite AVI count metadat
    file.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
    REQUIRE(file.good());
   }
-  context.Bind();
+  source_context.Bind();
   auto source = std::make_shared<media::VideoFileSource>(path, media::VideoFrameCapacity{95U * 63U}, 0, stream.native_handle(), std::stop_token{});
   CHECK(source->frame_count() != 8U);
   PredictionRunOutput options{.directory = directory};

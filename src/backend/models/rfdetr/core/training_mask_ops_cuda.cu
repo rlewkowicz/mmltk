@@ -8,10 +8,10 @@ constexpr int kCudaThreads = 256;
 int ceil_div(int64_t value, int divisor) { return static_cast<int>((value + divisor - 1) / divisor); }
 __device__ float clamp_coord(float value, float limit) { return fminf(fmaxf(value, 0.0f), limit); }
 __device__ float grid_sample_source(float coord, int64_t size) {
- // Keep the two tensor normalization operations and grid_sample's unnormalization
- // separate: fusion changes categorical identities at half-pixel boundaries.
+ // Tensor normalization uses two separately rounded kernels. The CUDA
+ // grid_sample kernel then contracts its own multiply/subtract into an FMA.
  const float grid = __fsub_rn(__fmul_rn(2.0f, coord), 1.0f);
- return __fdiv_rn(__fsub_rn(__fmul_rn(__fadd_rn(grid, 1.0f), static_cast<float>(size)), 1.0f), 2.0f);
+ return __fmaf_rn(__fadd_rn(grid, 1.0f), static_cast<float>(size), -1.0f) * 0.5f;
 }
 __device__ int64_t nearest_grid_sample_index(float coord, int64_t size) { return static_cast<int64_t>(nearbyintf(clamp_coord(grid_sample_source(coord, size), static_cast<float>(size - 1)))); }
 __global__ void matcher_point_sample_kernel(

@@ -282,8 +282,16 @@ std::shared_ptr<const PredictionPreviewFrame> PredictionOutput::Capture(
 }
 void PredictionOutput::Finish(bool success) {
  impl_->Flush();
+ if (impl_->video) {
+  RunWithRetainedCudaContext(impl_, *impl_->retirement, "prediction output CUDA custody", [&] {
+   impl_->runtime->BindContext();
+   if (success)
+    impl_->video->Complete();
+   else
+    impl_->video->ClosePartial();
+  });
+ }
  if (!success) {
-  if (impl_->video) impl_->video->ClosePartial();
   impl_->Publish(true);
   return;
  }
@@ -293,10 +301,6 @@ void PredictionOutput::Finish(bool success) {
   throw std::runtime_error("Requested " + std::to_string(impl_->options.saving.video_samples) + " samples; the video contained " + std::to_string(impl_->reservoir->observed()) + " frames. Saved " +
                            std::to_string(impl_->facts.completed_samples) + ".");
  if (impl_->video) {
-  RunWithRetainedCudaContext(impl_, *impl_->retirement, "prediction output CUDA custody", [&] {
-   impl_->runtime->BindContext();
-   impl_->video->Complete();
-  });
   impl_->facts.partial_video.clear();
   impl_->facts.artifacts.push_back(impl_->completed_path);
   impl_->Publish(true);

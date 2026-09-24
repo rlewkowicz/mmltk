@@ -182,6 +182,7 @@ private:
 TEST_CASE("Predict materialized routing keeps one producer across input changes and ordinary restart", "[controller][systems][predict][presentation]") {
  const bool invalid_first = GENERATE(false, true);
  const auto kind = GENERATE(contracts::SourceKind::CompiledDataset, contracts::SourceKind::SingleImage, contracts::SourceKind::VideoFile);
+ CAPTURE(invalid_first, kind);
  const auto root = mmltk::testsupport::make_temp_root("predict-materialized-routing");
  ApplicationDataFixture fixture{root};
  fixture.PrepareModel(contracts::FeatureId::Predict);
@@ -190,6 +191,8 @@ TEST_CASE("Predict materialized routing keeps one producer across input changes 
                     : kind == contracts::SourceKind::SingleImage   ? "workflows.predict.source.single_image_path"
                                                                    : "workflows.predict.source.video_file_path";
  const auto select = [&](std::string path) {
+  // The fake runtime owns decoding, while Predict admits ordinary input files.
+  std::ofstream(path).put('x');
   contracts::SettingsUpdateRequest update;
   update.updates = {{.path = "workflows.predict.source.kind", .value = static_cast<std::int64_t>(kind)},
    {.path = field, .value = mmltk::frameworks::serialization::wire::FlatValue::text(path, mmltk::frameworks::reflection::kMaximumPathBytes).value()}};
@@ -244,8 +247,10 @@ TEST_CASE("Predict materialized routing keeps one producer across input changes 
   const auto previous = prediction.ObserveSource().frame.revision;
   const auto admitted = prediction.Start({});
   std::unique_lock lock(mutex);
-  REQUIRE(changed.wait_for(lock, std::chrono::seconds{2},
-   [&] { return !routing_failure.empty() || (terminal_generation >= admitted.operation.generation_frontier && (!expect_image || displayed.completed.revision > previous)); }));
+  const auto settled = changed.wait_for(lock, std::chrono::seconds{2},
+   [&] { return !routing_failure.empty() || (terminal_generation >= admitted.operation.generation_frontier && (!expect_image || displayed.completed.revision > previous)); });
+  CAPTURE(previous, terminal_generation, admitted.operation.generation_frontier, displayed.completed.revision, prediction.snapshot().operation.terminal.detail);
+  REQUIRE(settled);
   REQUIRE(routing_failure.empty());
   lock.unlock();
   return prediction.snapshot();

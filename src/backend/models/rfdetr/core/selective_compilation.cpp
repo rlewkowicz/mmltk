@@ -109,11 +109,14 @@ SelectiveTensorRegion::Tensors SelectiveTensorRegion::invoke(bool training, cons
    for (const auto& input : inputs) metadata << input.device() << ':' << input.scalar_type() << ':' << input.sizes() << ';';
    std::size_t operators = 0;
    std::size_t fusion_groups = 0;
+   std::size_t tensor_expr_groups = 0;
    if (graph) {
     const auto count = [&](const auto& self, const torch::jit::Block* block) -> void {
      for (const auto* node : block->nodes()) {
       ++operators;
-      if (node->kind().toQualString() == std::string_view("prim::FusionGroup") || node->kind().toQualString() == std::string_view("prim::CudaFusionGroup")) ++fusion_groups;
+      const std::string_view kind = node->kind().toQualString();
+      if (kind == "prim::TensorExprGroup") ++tensor_expr_groups;
+      if (kind == "prim::FusionGroup" || kind == "prim::CudaFusionGroup" || kind == "prim::TensorExprGroup") ++fusion_groups;
       for (const auto* nested : node->blocks()) self(self, nested);
       if (node->hasAttribute(torch::jit::attr::Subgraph)) self(self, node->g(torch::jit::attr::Subgraph)->block());
      }
@@ -122,10 +125,10 @@ SelectiveTensorRegion::Tensors SelectiveTensorRegion::invoke(bool training, cons
    }
    logger.debug(
     "rfdetr compilation region={} owner={} reason={} training={} signature={} grad={} amp={} amp_dtype={} torch={} executor_optimize={} fuse_cpu={} fuse_gpu={} tf32_matmul={} tf32_cudnn={} "
-    "graph_available={} operators={} fusion_groups={}",
+    "graph_available={} operators={} fusion_groups={} tensor_expr_groups={}",
     name_, static_cast<const void*>(this), reason, training, metadata.str(), signature.grad, signature.amp, static_cast<int>(signature.amp_dtype), TORCH_VERSION,
     torch::jit::getGraphExecutorOptimize(), torch::jit::canFuseOnCPU(), torch::jit::canFuseOnGPU(), at::globalContext().allowTF32CuBLAS(), at::globalContext().allowTF32CuDNN(),
-    static_cast<bool>(graph), operators, fusion_groups);
+    static_cast<bool>(graph), operators, fusion_groups, tensor_expr_groups);
   });
  };
  if (!compatible_extents) {

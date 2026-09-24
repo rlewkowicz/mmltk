@@ -57,6 +57,7 @@ private:
  struct StorageLimits final {
   explicit StorageLimits(VideoFrameCapacity);
   [[nodiscard]] std::size_t Pixels(int width, int height) const;
+  [[nodiscard]] std::int64_t DecoderPixels(int stride_alignment) const;
   void Declared(int width, int height) const;
   std::size_t maximum_pixels;
   std::size_t chw_bytes;

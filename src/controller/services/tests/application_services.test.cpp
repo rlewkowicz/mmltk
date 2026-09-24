@@ -1009,14 +1009,14 @@ TEST_CASE("native output dialogs select remembered directories after Auto and pr
   auto expected = before;
   const auto directory = (temporary.path() / "remembered").string();
   const std::string automatic = std::string{path.substr(0, path.size() - std::string_view{"directory"}.size())} + "automatic";
-  const auto verify = [&](const bool policy) {
+  const auto verify = [&](const mmltk::controller::SettingsSystem& owner, const bool policy) {
    REQUIRE(settings_vocabulary::visit_mutable_path(expected, path, [&](const auto, auto& leaf) {
     if constexpr (std::same_as<std::remove_cvref_t<decltype(leaf)>, std::string>) leaf = directory;
    }));
    REQUIRE(settings_vocabulary::visit_mutable_path(expected, automatic, [&](const auto, auto& leaf) {
     if constexpr (std::same_as<std::remove_cvref_t<decltype(leaf)>, bool>) leaf = policy;
    }));
-   CHECK(settings.snapshot().settings_state == expected);
+   CHECK(owner.snapshot().settings_state == expected);
    CHECK_FALSE(std::filesystem::exists(directory));
   };
   FileDialogClientOwner accepted_owner{selected.string(), temporary.path().string()};
@@ -1027,14 +1027,14 @@ TEST_CASE("native output dialogs select remembered directories after Auto and pr
    const auto result = accepted.Open(*resolved, {});
    REQUIRE(std::holds_alternative<FileDialogSelected>(result.result));
    CHECK(std::get<FileDialogSelected>(result.result).path == directory);
-   verify(false);
+   verify(settings, false);
    SettingsUpdateRequest enable;
    enable.updates.push_back({.path = automatic, .value = Value{true}});
    static_cast<void>(settings.Update(std::move(enable)));
-   verify(true);
+   verify(settings, true);
    const auto revision = settings.snapshot().revision;
    CHECK(std::holds_alternative<FileDialogCancelled>(cancellation.Open(*resolved, {}).result));
-   verify(true);
+   verify(settings, true);
    CHECK(settings.snapshot().revision == revision);
   }
   mmltk::controller::SettingsSystem restored;
@@ -1042,8 +1042,7 @@ TEST_CASE("native output dialogs select remembered directories after Auto and pr
   CHECK(restored.snapshot().settings_state == expected);
   mmltk::controller::NativeFileDialogRuntime reopened{accepted_owner.client(), restored};
   REQUIRE(std::holds_alternative<FileDialogSelected>(reopened.Open(*resolved, {}).result));
-  static_cast<void>(accepted.Open(*resolved, {}));
-  verify(false);
+  verify(restored, false);
   CHECK(restored.snapshot().settings_state == expected);
  }
  CHECK(outputs == 4U);

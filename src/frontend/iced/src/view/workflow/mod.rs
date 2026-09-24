@@ -28,11 +28,12 @@ pub enum Region {
     PrimaryAction,
     Status,
     PrimaryCard,
+    OutputCard,
 }
 
 const SHELL_REGIONS: [Region; 3] = [Region::Setup, Region::Center, Region::Diagnostics];
 const CENTER_REGIONS: [Region; 2] = [Region::Workspace, Region::Advanced];
-const AUDIT_REGIONS: [Region; 9] = [
+const AUDIT_REGIONS: [Region; 10] = [
     Region::Setup,
     Region::Center,
     Region::Workspace,
@@ -42,6 +43,7 @@ const AUDIT_REGIONS: [Region; 9] = [
     Region::PrimaryAction,
     Region::Status,
     Region::PrimaryCard,
+    Region::OutputCard,
 ];
 pub fn ordinary_pages() -> impl Iterator<Item = crate::generated::FeatureId> {
     crate::view::navigation::ORDER
@@ -115,8 +117,15 @@ impl Composition {
                 crate::generated::FeatureId::Train => "train.card.dataset",
                 crate::generated::FeatureId::Validate => "validate.card.inputs",
                 crate::generated::FeatureId::Predict => "predict.card.inputs",
-                crate::generated::FeatureId::Export => "export.card.output",
+                crate::generated::FeatureId::Export => "export.card.formats",
                 _ => panic!("this workflow does not audit a preceding primary card"),
+            },
+            Region::OutputCard => match self.page {
+                crate::generated::FeatureId::Train => "train.card.output",
+                crate::generated::FeatureId::Validate => "validate.card.output",
+                crate::generated::FeatureId::Predict => "predict.card.output",
+                crate::generated::FeatureId::Export => "export.card.output",
+                _ => panic!("this workflow does not have an Output card"),
             },
             Region::PrimaryProgress => match self.page {
                 crate::generated::FeatureId::Train => "train.primary.progress",
@@ -349,6 +358,7 @@ mod tests {
                 Region::PrimaryAction,
                 Region::Status,
                 Region::PrimaryCard,
+                Region::OutputCard,
             ]
         );
     }
@@ -378,7 +388,7 @@ mod tests {
                 ) {
                     8
                 } else {
-                    9
+                    10
                 }
             );
             assert!(!composition.stable_id(Region::PrimaryAction).is_empty());

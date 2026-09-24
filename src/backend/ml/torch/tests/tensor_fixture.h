@@ -3,6 +3,7 @@
 #include "src/test_support/cuda_test_utils.hpp"
 #include <ATen/Context.h>
 #include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAFunctions.h>
 #include <inplace_vector>
 #include <initializer_list>
 #include <cstdint>
@@ -27,7 +28,7 @@ private:
 };
 [[nodiscard]] inline std::inplace_vector<torch::Device, 2> available_devices(c10::DeviceIndex cuda_index = -1) {
  std::inplace_vector<torch::Device, 2> result{torch::Device(torch::kCPU)};
- if (mmltk::testsupport::checked_cuda_device_count()) result.emplace_back(torch::kCUDA, cuda_index);
+ if (mmltk::testsupport::checked_cuda_device_count()) result.emplace_back(torch::kCUDA, cuda_index < 0 ? c10::cuda::current_device() : cuda_index);
  return result;
 }
 [[nodiscard]] inline std::inplace_vector<std::pair<torch::Device, c10::ScalarType>, 4> available_amp_precisions() {

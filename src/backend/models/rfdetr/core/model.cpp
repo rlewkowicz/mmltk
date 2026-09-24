@@ -249,8 +249,7 @@ public:
        position_embeddings(register_parameter("position_embeddings", torch::randn({1, config.positional_encoding_size * config.positional_encoding_size + 1, kDinoHiddenSize}, torch::kFloat32))),
        patch_embeddings(register_module("patch_embeddings", Dinov2PatchEmbeddings(config.patch_size))),
        patch_size_(config.patch_size),
-       num_windows_(std::max<int64_t>(1, config.num_windows)),
-       dropout(register_module("dropout", torch::nn::Dropout(0.0))) {}
+       num_windows_(std::max<int64_t>(1, config.num_windows)) {}
  torch::Tensor interpolate_pos_encoding(const torch::Tensor& embeddings, int64_t height, int64_t width) const {
   const int64_t num_patches = embeddings.size(1) - 1;
   const int64_t num_positions = position_embeddings.size(1) - 1;
@@ -290,7 +289,7 @@ public:
    auto windowed_cls_token_with_pos_embed = cls_token_with_pos_embed.repeat({num_windows_ * num_windows_, 1, 1});
    embeddings = torch::cat({windowed_cls_token_with_pos_embed, windowed_pixel_tokens}, 1);
   }
-  return dropout->forward(embeddings);
+  return embeddings;
  }
  torch::Tensor cls_token;
  torch::Tensor mask_token;
@@ -300,7 +299,6 @@ public:
 private:
  int64_t patch_size_ = 0;
  int64_t num_windows_ = 1;
- torch::nn::Dropout dropout{nullptr};
 };
 TORCH_MODULE(WindowedDinov2Embeddings);
 class Dinov2SelfAttentionImpl : public torch::nn::Module {
@@ -308,8 +306,7 @@ public:
  Dinov2SelfAttentionImpl()
      : query(register_module("query", torch::nn::Linear(kDinoHiddenSize, kDinoHiddenSize))),
        key(register_module("key", torch::nn::Linear(kDinoHiddenSize, kDinoHiddenSize))),
-       value(register_module("value", torch::nn::Linear(kDinoHiddenSize, kDinoHiddenSize))),
-       dropout(register_module("dropout", torch::nn::Dropout(0.0))) {}
+       value(register_module("value", torch::nn::Linear(kDinoHiddenSize, kDinoHiddenSize))) {}
  torch::Tensor forward(const torch::Tensor& hidden_states) {
   const int64_t batch = hidden_states.size(0);
   const int64_t seq_len = hidden_states.size(1);
@@ -319,8 +316,7 @@ public:
   auto key_layer = reshape(key->forward(hidden_states));
   auto value_layer = reshape(value->forward(hidden_states));
   const double scale = 1.0 / std::sqrt(static_cast<double>(head_dim));
-  const double dropout_p = is_training() ? dropout->options.p() : 0.0;
-  auto context = at::scaled_dot_product_attention(query_layer, key_layer, value_layer, c10::nullopt, dropout_p, false, scale);
+  auto context = at::scaled_dot_product_attention(query_layer, key_layer, value_layer, c10::nullopt, 0.0, false, scale);
   return context.permute({0, 2, 1, 3}).contiguous().view({batch, seq_len, kDinoHiddenSize});
  }
 
@@ -328,17 +324,13 @@ private:
  torch::nn::Linear query{nullptr};
  torch::nn::Linear key{nullptr};
  torch::nn::Linear value{nullptr};
- torch::nn::Dropout dropout{nullptr};
 };
 TORCH_MODULE(Dinov2SelfAttention);
 class Dinov2SelfOutputImpl : public torch::nn::Module {
 public:
- Dinov2SelfOutputImpl() : dense(register_module("dense", torch::nn::Linear(kDinoHiddenSize, kDinoHiddenSize))), dropout(register_module("dropout", torch::nn::Dropout(0.0))) {}
- torch::Tensor forward(const torch::Tensor& hidden_states) { return dropout->forward(dense->forward(hidden_states)); }
+ Dinov2SelfOutputImpl() : dense(register_module("dense", torch::nn::Linear(kDinoHiddenSize, kDinoHiddenSize))) {}
+ torch::Tensor forward(const torch::Tensor& hidden_states) { return dense->forward(hidden_states); }
  torch::nn::Linear dense{nullptr};
-
-private:
- torch::nn::Dropout dropout{nullptr};
 };
 TORCH_MODULE(Dinov2SelfOutput);
 class Dinov2AttentionImpl : public torch::nn::Module {
@@ -608,20 +600,16 @@ class NativeDecoderLayerImpl : public torch::nn::Module {
 public:
  NativeDecoderLayerImpl(int64_t d_model, int64_t sa_nhead, int64_t ca_nhead, int64_t dim_feedforward, int64_t num_feature_levels, int64_t dec_n_points)
      : self_attn(register_module("self_attn", torch::nn::MultiheadAttention(torch::nn::MultiheadAttentionOptions(d_model, sa_nhead).dropout(0.0)))),
-       dropout1(register_module("dropout1", torch::nn::Dropout(0.0))),
        norm1(register_module("norm1", torch::nn::LayerNorm(std::vector<int64_t>{d_model}))),
        cross_attn(register_module("cross_attn", MSDeformAttn(d_model, num_feature_levels, ca_nhead, dec_n_points))),
        linear1(register_module("linear1", torch::nn::Linear(d_model, dim_feedforward))),
-       dropout(register_module("dropout", torch::nn::Dropout(0.0))),
        linear2(register_module("linear2", torch::nn::Linear(dim_feedforward, d_model))),
        norm2(register_module("norm2", torch::nn::LayerNorm(std::vector<int64_t>{d_model}))),
-       norm3(register_module("norm3", torch::nn::LayerNorm(std::vector<int64_t>{d_model}))),
-       dropout2(register_module("dropout2", torch::nn::Dropout(0.0))),
-       dropout3(register_module("dropout3", torch::nn::Dropout(0.0))) {}
+       norm3(register_module("norm3", torch::nn::LayerNorm(std::vector<int64_t>{d_model}))) {}
  torch::Tensor forward(const torch::Tensor& tgt, const torch::Tensor& memory, const torch::Tensor& memory_key_padding_mask, const torch::Tensor& query_pos, const torch::Tensor& reference_points,
   const FeatureLayout& feature_layout, const DecoderQueryLayout& query_layout) {
   const auto attended = isolated_group_self_attention(self_attn, tgt, query_pos, query_layout);
-  auto output = norm1->forward(tgt + dropout1->forward(attended));
+  auto output = norm1->forward(tgt + attended);
   auto cross = cross_attn->forward(output + query_pos, reference_points, memory, feature_layout, memory_key_padding_mask);
   return post_cross_attention(output, cross);
  }
@@ -637,22 +625,20 @@ private:
    .front();
  }
  torch::Tensor ordinary_post_cross_attention(const torch::Tensor& residual, const torch::Tensor& cross) {
-  auto output = norm2->forward(residual + dropout2->forward(cross));
-  auto feed_forward = linear2->forward(dropout->forward(torch::relu(linear1->forward(output))));
-  return norm3->forward(output + dropout3->forward(feed_forward));
+  // These RF-DETR dropout probabilities are permanently zero. Calling dropout
+  // still records it, and JIT autodiff's native_dropout consumes CUDA RNG at p=0.
+  auto output = norm2->forward(residual + cross);
+  auto feed_forward = linear2->forward(torch::relu(linear1->forward(output)));
+  return norm3->forward(output + feed_forward);
  }
  detail::SelectiveTensorRegion tail_region_{"decoder_tail", true};
  torch::nn::MultiheadAttention self_attn{nullptr};
- torch::nn::Dropout dropout1{nullptr};
  torch::nn::LayerNorm norm1{nullptr};
  MSDeformAttn cross_attn{nullptr};
  torch::nn::Linear linear1{nullptr};
- torch::nn::Dropout dropout{nullptr};
  torch::nn::Linear linear2{nullptr};
  torch::nn::LayerNorm norm2{nullptr};
  torch::nn::LayerNorm norm3{nullptr};
- torch::nn::Dropout dropout2{nullptr};
- torch::nn::Dropout dropout3{nullptr};
 };
 TORCH_MODULE(NativeDecoderLayer);
 class NativeDecoderImpl : public torch::nn::Module {

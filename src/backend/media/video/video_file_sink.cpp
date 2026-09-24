@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cstring>
 #include <deque>
+#include <exception>
 #include <cerrno>
 #include <fcntl.h>
 #include <unistd.h>
@@ -187,6 +188,24 @@ struct VideoFileSink::State final {
    av_packet_unref(packet);
   }
  }
+ void Finish() {
+  std::exception_ptr failure;
+  try {
+   require_media(avcodec_send_frame(encoder, nullptr), "drain annotated video encoder");
+   Drain();
+   if (!pending_frames.empty()) throw std::runtime_error("H.264 encoder did not drain every annotated frame");
+   // An orderly stop also settles the last cluster and buffered audio. Only
+   // Complete publishes the finished filename; a crash still needs no trailer.
+   require_media(av_write_trailer(format), "finish prediction Matroska output");
+   FlushIo();
+  } catch (...) { failure = std::current_exception(); }
+  try {
+   CloseFile();
+  } catch (...) {
+   if (!failure) failure = std::current_exception();
+  }
+  if (failure) std::rethrow_exception(failure);
+ }
 };
 VideoFileSink::VideoFileSink(const std::filesystem::path& partial, const std::filesystem::path& completed, const VideoMediaInfo& info, int device, bool software_only, FileWrite file_write)
     : state_(std::make_unique<State>()) {
@@ -322,17 +341,12 @@ void VideoFileSink::Audio(const VideoAudioPacket& audio) {
  throw std::runtime_error("audio track changed after output admission");
 }
 void VideoFileSink::ClosePartial() {
- if (!state_->closed) state_->CloseFile();
+ if (!state_->closed) state_->Finish();
 }
 void VideoFileSink::Complete() {
  auto& s = *state_;
  if (s.closed) throw std::logic_error("video output already closed");
- require_media(avcodec_send_frame(s.encoder, nullptr), "drain annotated video encoder");
- s.Drain();
- if (!s.pending_frames.empty()) throw std::runtime_error("H.264 encoder did not drain every annotated frame");
- require_media(av_write_trailer(s.format), "finish prediction Matroska output");
- s.FlushIo();
- s.CloseFile();
+ s.Finish();
  std::filesystem::rename(s.partial, s.complete);
 }
 }  // namespace mmltk::backend::media::video

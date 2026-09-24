@@ -203,6 +203,7 @@ pub enum Message {
         message: Box<Message>,
     },
     Advance,
+    WorkflowRedraw,
     NumberWheelDelivered,
     ChartInputDelivered(bool),
     NumberInvalidDelivered,
@@ -1202,6 +1203,20 @@ impl Controller {
     pub fn subscription(&self) -> iced::Subscription<Message> {
         if self.driver.running() {
             iced::Subscription::batch([
+                if matches!(
+                    self.driver.phase,
+                    Phase::Workflows(workflows::Step::SavingControl(_))
+                ) {
+                    iced::window::frames()
+                        .with(self.driver.generation)
+                        .map(|(generation, _)| Message::Scoped {
+                            generation,
+                            receipt: None,
+                            message: Box::new(Message::WorkflowRedraw),
+                        })
+                } else {
+                    iced::Subscription::none()
+                },
                 if reporting_enabled()
                     || matches!(
                         self.driver.phase,
@@ -1823,6 +1838,10 @@ impl Controller {
                 ) {
                     self.pixel_checks.cancel_workspace_fps(&mut self.driver);
                 }
+                return None;
+            }
+            Message::WorkflowRedraw => {
+                self.workflows.redraw(&self.driver);
                 return None;
             }
             Message::Scoped { .. } | Message::ProbeCompleted { .. } | Message::Advance => {

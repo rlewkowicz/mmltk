@@ -551,6 +551,7 @@ void WaylandSession::ConsumeRecords(const bool final) {
    pixel_audit.consume(record);
    browser.atlas_draws.failure.report(acceptance_log, "acceptance.atlas_draw.failed", firefox_log, browser_cursor_->line());
    browser.owned_atlas_failure.report(acceptance_log, "acceptance.owned_atlas.failed", firefox_log, browser_cursor_->line());
+   if (logging) browser.prediction_failure.report(acceptance_log, "acceptance.prediction.failed", firefox_log, browser_cursor_->line());
    const auto event = record.value("event", "");
    if (event == "firefox.adapter.selected") display_adapter_seen_ = true;
    if (event == "integration.workflow.completed") workflow_steps_.insert(record.value("detail", ""));
@@ -649,6 +650,12 @@ void WaylandSession::RunWorkflows() {
                             "chart_wheel_expanded_3", "chart_wheel_expanded_4", "chart_wheel_expanded_5"}));
  CHECK((workflow_pixels_ == std::set<std::string>{"progress", "train", "validation", "validate-to-explore", "detail", "compiled", "image", "video", "stop", "theme", "narrow"}));
  CHECK(browser.validate_to_explore_pixels);
+ const auto prediction_output_blocker = browser.prediction_output_blocker();
+ if (logging && !prediction_output_blocker.empty() && browser.prediction_failure.record().is_null())
+  append_acceptance_record(acceptance_log, {{"event", "acceptance.prediction.incomplete"}, {"level", "error"}, {"detail", prediction_output_blocker},
+   {"media_disabled", browser.prediction_no_outputs}, {"saving_controls", browser.prediction_saving_controls}, {"saved_media", browser.prediction_outputs}});
+ INFO(prediction_output_blocker);
+ CHECK(prediction_output_blocker.empty());
  REQUIRE(browser.validation_samples_complete());
  for (const auto& record : browser.validation_saved_samples) {
   const auto directory = std::filesystem::path(record.value("control", ""));

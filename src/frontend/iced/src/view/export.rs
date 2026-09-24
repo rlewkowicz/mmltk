@@ -100,17 +100,6 @@ impl Component {
                     .spacing(crate::view::workflow::FIELD_SPACING)
                 )
             ),
-            crate::view::workflow::output::view(
-                crate::generated::FeatureId::Export,
-                model,
-                settings,
-                model
-                    .workflow
-                    .export
-                    .as_ref()
-                    .map(|operation| &operation.output)
-            )
-            .map(Message::Output),
             crate::view::workflow::primary_action(
                 crate::generated::FeatureId::Export,
                 model.primary_action_active(crate::generated::FeatureId::Export),
@@ -213,6 +202,17 @@ impl Component {
             ]
             .spacing(crate::view::workflow::FIELD_SPACING),
         );
+        let output_card = crate::view::workflow::output::view(
+            crate::generated::FeatureId::Export,
+            model,
+            settings,
+            model
+                .workflow
+                .export
+                .as_ref()
+                .map(|operation| &operation.output),
+        )
+        .map(Message::Output);
         let diagnostics = crate::view::shared::card(
             "Export status",
             "Canonical artifact outcome.",
@@ -223,7 +223,9 @@ impl Component {
             setup,
             workspace,
             advanced,
-            diagnostics,
+            column![output_card, diagnostics]
+                .spacing(crate::view::workflow::SECTION_SPACING)
+                .into(),
         )
         .render(width)
     }

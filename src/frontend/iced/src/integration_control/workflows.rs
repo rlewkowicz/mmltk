@@ -198,6 +198,8 @@ pub(super) struct State {
     wheel_y: f32,
     hidden_sequence: u64,
     generation: u64,
+    inspection_revision: u64,
+    saving_redraw_ready: bool,
     video_index: u64,
     narrow_scale: f32,
     pixel_source: u64,
@@ -986,6 +988,12 @@ mod tests {
 }
 
 impl State {
+    pub(super) fn redraw(&mut self, driver: &Driver) {
+        if matches!(driver.phase, Phase::Workflows(Step::SavingControl(_))) {
+            self.saving_redraw_ready = true;
+        }
+    }
+
     #[cfg(any(target_arch = "wasm32", test))]
     pub(super) fn confidence_input_delivered(
         &mut self,
@@ -1224,6 +1232,11 @@ impl State {
             return;
         }
         if bounds.width <= 0.0 || bounds.height <= 0.0 {
+            if matches!(step, Step::SavingControl(_)) {
+                // A newly opened disclosure exposes only its current clip.
+                // The next redraw retries discovery; the phase deadline stays armed.
+                return;
+            }
             driver.fail(&format!(
                 "Workflow control {control} is missing from the rendered Iced tree in {step:?}"
             ));
@@ -2299,20 +2312,32 @@ impl State {
                     }) =>
             {
                 self.generation = prediction.map_or(0, |value| value.operation.generationfrontier);
-                self.workflow_step(
+                self.saving_redraw_ready = true;
+                widget_ops::scroll_control_into_view(
+                    "predict.card.output".into(),
+                    AnnotationReveal::Control,
+                )
+                .chain(self.workflow_step(
                     driver,
                     if index == 0 {
                         Step::InspectPrediction
                     } else {
                         Step::SavingControl(index)
                     },
-                )
+                ))
             }
             Step::InspectPrediction => {
+                self.inspection_revision = prediction.map_or(0, |value| value.revision);
                 self.workflow_control(widgets, driver, "predict.save.inspect")
             }
             Step::InspectedPrediction
-                if prediction.is_some_and(|value| !value.inspection.active) =>
+                if prediction.is_some_and(|value| {
+                    value.revision > self.inspection_revision
+                        && !value.inspection.active
+                        && settings.draft.as_ref().is_some_and(|draft| {
+                            value.inspection.path == draft.workflows.predict.source.compiledpath
+                        })
+                }) =>
             {
                 let count = settings.draft.as_ref().and_then(|draft| {
                     crate::view::predict::output::matching_count(model, &draft.workflows.predict)
@@ -2326,6 +2351,8 @@ impl State {
             Step::SavingControl(index) => {
                 if index == 1 {
                     self.workflow_step(driver, Step::SavingReady(index))
+                } else if !std::mem::take(&mut self.saving_redraw_ready) {
+                    Task::none()
                 } else {
                     self.workflow_control(
                         widgets,

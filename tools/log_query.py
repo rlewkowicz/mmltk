@@ -649,7 +649,7 @@ class Record:
         if name == "@terminal":
             return self.get("@event") in (
                 "child.signaled", "child.exited", "shutdown.complete", "shutdown.firefox_terminal",
-                "catch.test_failed", "catch.test_passed", "catch.test_skipped", "catch.summary",
+                "catch.test_failed", "catch.test_passed", "catch.test_skipped", "catch.test_selection_failed", "catch.summary",
                 "process.terminal", "build.image", "build.failed",
             )
         if name.startswith("@"):
@@ -722,6 +722,10 @@ def transcript_data(text):
         }
     if text.startswith("Filters:"):
         return {"event": "catch.filters", "filters": text.removeprefix("Filters:").strip(), "message": text}
+    if text.startswith("No test cases matched "):
+        return {"event": "catch.test_selection_failed", "level": "error", "message": text}
+    if text == "No tests ran":
+        return {"event": "catch.summary", "level": "error", "tests": 0, "message": text}
     if text.startswith(("test cases:", "assertions:")):
         return {"event": "catch.summary", "message": text}
     terminal = re.search(r"(?:terminal status:\s*exit|exit(?:ed with)?(?:\s+status|\s+code))\s*[=:]?\s*(\d+)", text)

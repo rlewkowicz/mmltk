@@ -129,6 +129,7 @@ const c10::Symbol kAtenArgmax = c10::Symbol::fromQualString("aten::argmax");
 const c10::Symbol kAtenTopk = c10::Symbol::fromQualString("aten::topk");
 const c10::Symbol kAtenMax = c10::Symbol::fromQualString("aten::max");
 const c10::Symbol kAtenMatmul = c10::Symbol::fromQualString("aten::matmul");
+const c10::Symbol kAtenLinear = c10::Symbol::fromQualString("aten::linear");
 const c10::Symbol kAtenBmm = c10::Symbol::fromQualString("aten::bmm");
 const c10::Symbol kAtenEinsum = c10::Symbol::fromQualString("aten::einsum");
 const c10::Symbol kAtenSplit = c10::Symbol::fromQualString("aten::split");
@@ -1653,6 +1654,15 @@ void lower_matmul_node(torch::jit::Node* node) {
  auto* matmul = node->owningGraph()->create(kOnnxMatMul, {node->input(0), node->input(1)}, 1);
  replace_node_with(node, matmul);
 }
+void lower_linear_node(torch::jit::Node* node) {
+ require_input_count(node, 3);
+ if (value_tensor_rank(node->input(1)) != 2) throw_lowering_error(node, "linear weight must have rank two");
+ LoweredNodeChain chain(node);
+ auto* weight = chain.append_transpose(node->input(1), {1, 0});
+ auto* output = chain.append(kOnnxMatMul, {node->input(0), weight->output()});
+ if (!is_none_value(node->input(2))) output = chain.append(kOnnxAdd, {output->output(), node->input(2)});
+ replace_node_with(node, output->output());
+}
 void lower_creation_node(torch::jit::Node* node, double fill_value) {
  const auto output_scalar_type = value_scalar_type(node->output()).value_or(at::kFloat);
  auto replacement = create_constant_of_shape(node, make_scalar_tensor(fill_value, output_scalar_type));
@@ -1913,6 +1923,7 @@ using LoweringFactory = void (*)(torch::jit::Node*, const LoweringContext&);
  NODE(kAtenArgmax, lower_argmax_node)                                \
  NODE(kAtenTopk, lower_topk_node)                                    \
  NODE(kAtenMatmul, lower_matmul_node)                                \
+ NODE(kAtenLinear, lower_linear_node)                                \
  NODE(kAtenBmm, lower_matmul_node)                                   \
  CREATE(kAtenOnesLike, 1.0)                                          \
  CREATE(kAtenNewOnes, 1.0)                                           \

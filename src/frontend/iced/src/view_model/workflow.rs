@@ -877,7 +877,8 @@ impl crate::generated::PredictApplicationProjection<UiError> for ApplicationMode
 
     fn project_predict_reply(&mut self, _correlation: u64, reply: ApplicationReply) {
         let snapshot = match reply {
-            ApplicationReply::PredictStart(snapshot)
+            ApplicationReply::PredictInspect(snapshot)
+            | ApplicationReply::PredictStart(snapshot)
             | ApplicationReply::PredictStop(snapshot)
             | ApplicationReply::PredictPause(snapshot) => snapshot,
             _ => unreachable!("generated Predict dispatch supplied another system reply"),

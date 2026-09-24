@@ -173,38 +173,6 @@ impl Component {
                     .spacing(crate::view::workflow::FIELD_SPACING),
                 )
             ),
-            crate::view::shared::identified(
-                "predict.card.output",
-                crate::view::shared::card(
-                    "Output",
-                    "",
-                    column![
-                        Element::from(crate::view::workflow::output::content(
-                            crate::generated::FeatureId::Predict,
-                            model,
-                            settings,
-                            model
-                                .predict_snapshot
-                                .as_ref()
-                                .map(|snapshot| &snapshot.operation.output)
-                        ))
-                        .map(Message::Output),
-                        output::view(model, draft, settings_edit_available).map(Message::Saving),
-                        crate::view::shared::disclosure(
-                            "predict.save.json",
-                            draft.is_none_or(|value| value.source.kind
-                                != crate::generated::SourceKind::VideoFile),
-                            crate::view::workflow::fields::toggle(
-                                "Save prediction JSON",
-                                draft.is_none_or(|value| value.writereportjson),
-                                settings_edit_available,
-                                Message::ReportChanged
-                            )
-                        ),
-                    ]
-                    .spacing(crate::view::workflow::FIELD_SPACING)
-                )
-            ),
             crate::view::workflow::primary_action(
                 crate::generated::FeatureId::Predict,
                 model.primary_action_active(crate::generated::FeatureId::Predict),
@@ -292,6 +260,39 @@ impl Component {
             ]
             .spacing(crate::view::workflow::FIELD_SPACING),
         );
+        let output_card = crate::view::shared::identified(
+            "predict.card.output",
+            crate::view::shared::card(
+                "Output",
+                "",
+                column![
+                    Element::from(crate::view::workflow::output::content(
+                        crate::generated::FeatureId::Predict,
+                        model,
+                        settings,
+                        model
+                            .predict_snapshot
+                            .as_ref()
+                            .map(|snapshot| &snapshot.operation.output),
+                    ))
+                    .map(Message::Output),
+                    output::view(model, draft, settings_edit_available).map(Message::Saving),
+                    crate::view::shared::disclosure(
+                        "predict.save.json",
+                        draft
+                            .is_none_or(|value| value.source.kind
+                                != crate::generated::SourceKind::VideoFile),
+                        crate::view::workflow::fields::toggle(
+                            "Save prediction JSON",
+                            draft.is_none_or(|value| value.writereportjson),
+                            settings_edit_available,
+                            Message::ReportChanged,
+                        ),
+                    ),
+                ]
+                .spacing(crate::view::workflow::FIELD_SPACING),
+            ),
+        );
         let diagnostics = crate::view::shared::card(
             "Prediction status",
             "Canonical result and frame activity.",
@@ -304,7 +305,9 @@ impl Component {
             setup,
             workspace,
             advanced,
-            diagnostics,
+            column![output_card, diagnostics]
+                .spacing(crate::view::workflow::SECTION_SPACING)
+                .into(),
         )
         .render(width)
     }

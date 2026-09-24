@@ -2,6 +2,8 @@
 #include "src/backend/models/rfdetr/training/detail/native_optimizer_private.h"
 #include "src/backend/models/rfdetr/training/detail/training_step.h"
 #include "src/backend/models/rfdetr/core/detection_ops.h"
+#include "src/backend/models/rfdetr/core/tests/training_fixture.h"
+#include "src/backend/models/rfdetr/core/runtime.h"
 #include <ATen/Context.h>
 #include "src/backend/models/rfdetr/training/detail/model_ema.h"
 #include "src/backend/models/rfdetr/training/detail/training_ops_private.h"
@@ -49,7 +51,9 @@ TEST_CASE("Stock AdamW owns each parameter age and double accumulation division"
      auto maximum = moment;
      std::array<int, 2> age{};
      for (int step = 0; step < 4; ++step) {
+      CAPTURE(device, backend, count, parallel, step);
       optimizer.zero_grad(true);
+      const std::array<torch::Tensor, 2> operands{a.detach().clone(), b.detach().clone()};
       std::array<torch::Tensor, 2> gradients{torch::zeros_like(a), torch::zeros_like(b)};
       for (int micro = 0; micro < count; ++micro) {
        // Nonuniform local target denominators are criterion policy, independent
@@ -67,12 +71,12 @@ TEST_CASE("Stock AdamW owns each parameter age and double accumulation division"
           if (parameter.grad().defined())
            parameter.mutable_grad().add_(harvested[i]);
           else
-           parameter.mutable_grad() = harvested[i];
+           parameter.mutable_grad() = harvested[i].detach().clone();
          }
        } else
         execution.backward(loss);
-       gradients[0] += 2 * reference[0] * std::pow(0.3 + micro, 2) / targets / count / count;
-       if (step && step != 2) gradients[1] += 2 * reference[1] / targets / count / count;
+       gradients[0] += 2 * operands[0] * std::pow(0.3 + micro, 2) / targets / count / count;
+       if (step && step != 2) gradients[1] += 2 * operands[1] / targets / count / count;
       }
       REQUIRE(torch::allclose(a.grad(), gradients[0], 1e-10, 1e-10));
       if (step)
@@ -239,6 +243,8 @@ TEST_CASE("Main backward and parallel gradient harvesting execute FP32 probe der
    }
 }
 TEST_CASE("Production step and canonical groups match distributed stock AdamW with resumed warmup", "[rfdetr][training][parity]") {
+ rf::testsupport::MatcherExecutionFixture fixture;
+ rf::ScopedRuntimeContext runtime(nullptr, 0, &fixture.workspace);
  for (const auto device : tensor_fixture::available_devices())
   for (int count : {1, 4})
    for (bool parallel : {false, true}) {
@@ -282,9 +288,10 @@ TEST_CASE("Production step and canonical groups match distributed stock AdamW wi
     schedule.lr_scheduler = rf::TrainLrSchedulerKind::Step;
     rf::GradScaler scaler(device.is_cuda(), 128.0F);
     for (int update = 0; update < 5; ++update) {
+     CAPTURE(device, count, parallel, update);
      optimizer.zero_grad(true);
      std::vector<torch::Tensor> expected_parameters;
-     for (const auto& value : reference) expected_parameters.push_back(value.detach().clone().set_requires_grad(true));
+     for (const auto& value : optimizer.parameters()) expected_parameters.push_back(value.detach().clone().set_requires_grad(true));
      auto expected_loss = torch::zeros({}, options);
      for (int rank = 0; rank < 2; ++rank)
       for (int micro = 0; micro < count; ++micro) {
@@ -324,7 +331,7 @@ TEST_CASE("Production step and canonical groups match distributed stock AdamW wi
          if (p.grad().defined())
           p.mutable_grad().add_(gradients[i]);
          else
-          p.mutable_grad() = gradients[i];
+          p.mutable_grad() = gradients[i].detach().clone();
         }
        } else
         execution.backward(loss);
@@ -347,6 +354,7 @@ TEST_CASE("Production step and canonical groups match distributed stock AdamW wi
      REQUIRE(scaler.check_and_unscale_(optimizer).item<float>() == 0.0F);
      auto squared = torch::zeros({}, options);
      for (size_t i = 0; i < 4; ++i) {
+      CAPTURE(i, optimizer.parameters()[i].grad(), gradients[i]);
       REQUIRE(torch::allclose(optimizer.parameters()[i].grad(), gradients[i], 2e-5, 2e-6));
       squared += gradients[i].square().sum();
      }

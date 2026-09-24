@@ -150,17 +150,6 @@ impl Component {
                     .spacing(crate::view::workflow::FIELD_SPACING)
                 )
             ),
-            crate::view::workflow::output::view(
-                crate::generated::FeatureId::Validate,
-                model,
-                settings,
-                model
-                    .workflow
-                    .validation
-                    .as_ref()
-                    .map(|snapshot| &snapshot.operation.output)
-            )
-            .map(Message::Output),
             crate::view::workflow::primary_action(
                 crate::generated::FeatureId::Validate,
                 model.primary_action_active(crate::generated::FeatureId::Validate),
@@ -267,6 +256,17 @@ impl Component {
             ]
             .spacing(crate::view::workflow::FIELD_SPACING),
         );
+        let output_card = crate::view::workflow::output::view(
+            crate::generated::FeatureId::Validate,
+            model,
+            settings,
+            model
+                .workflow
+                .validation
+                .as_ref()
+                .map(|snapshot| &snapshot.operation.output),
+        )
+        .map(Message::Output);
         let diagnostics = crate::view::shared::card(
             "Validation status",
             "Canonical native operation outcome.",
@@ -285,7 +285,9 @@ impl Component {
             setup,
             workspace,
             advanced,
-            diagnostics,
+            column![output_card, diagnostics]
+                .spacing(crate::view::workflow::SECTION_SPACING)
+                .into(),
         )
         .render(width)
     }

@@ -809,35 +809,61 @@ auto BrowserAudit::consume(const nlohmann::json& record) -> void {
  } else if (event == "integration.validation_confidence_pixels") {
   validation_confidence_pixels.push_back(record);
  } else if (event == "integration.prediction.saving") {
-  const auto index = record.value("a", -1.0);
-  if (index >= 0.0 && index < 3.0 && index == std::floor(index) && record.value("b", 0.0) == 1.0) prediction_saving_controls[static_cast<std::size_t>(index)] = true;
+  const auto index = numeric(record, "a", -1.0);
+  if (index >= 0.0 && index < 3.0 && index == std::floor(index) && numeric(record, "b") == 1.0)
+   prediction_saving_controls[static_cast<std::size_t>(index)] = true;
+  else
+   prediction_failure.capture("prediction saving-control evidence is invalid", record, [] { return nlohmann::json::object(); });
  } else if (event == "integration.prediction.no_output") {
   const auto stage = record.value("detail", "");
   const std::filesystem::path directory = record.value("control", "");
+  const auto claim = directory / ".mmltk-run-claim";
+  const auto processed = scalar(record, "a");
   std::error_code error;
-  const bool empty = std::filesystem::is_directory(directory, error) && std::filesystem::is_empty(directory, error) && !error && record.value("a", 0.0) > 0.0;
-  if (stage == "compiled")
-   prediction_no_outputs[0] = empty && record.value("a", 0.0) == static_cast<double>(prediction_processed[0]);
-  else if (stage == "image")
-   prediction_no_outputs[1] = empty && record.value("a", 0.0) == static_cast<double>(prediction_processed[1]);
+  bool claim_only = std::filesystem::is_directory(claim, error) && std::filesystem::is_empty(claim, error) && !error;
+  std::filesystem::path unexpected_entry;
+  if (claim_only) {
+   for (std::filesystem::directory_iterator entries(directory, error), end; !error && entries != end; entries.increment(error)) {
+    if (entries->path() != claim) {
+     unexpected_entry = entries->path();
+     claim_only = false;
+     break;
+    }
+   }
+   claim_only = claim_only && !error;
+  }
+  const std::size_t index = stage == "compiled" ? 0U : stage == "image" ? 1U : prediction_no_outputs.size();
+  const auto expected = index < prediction_processed.size() ? prediction_processed[index] : 0U;
+  const bool valid = claim_only && processed > 0U && processed == expected;
+  if (index < prediction_no_outputs.size()) prediction_no_outputs[index] = valid;
+  if (!valid)
+   prediction_failure.capture("prediction media-disabled output differs from its reserved run", record, [&] {
+    return nlohmann::json{{"claim_only", claim_only}, {"processed", processed}, {"expected_processed", expected}, {"filesystem_error", error.message()}, {"unexpected_entry", unexpected_entry.string()}};
+   });
  } else if (event == "integration.prediction.output") {
   const auto stage = record.value("detail", "");
   const auto path = record.value("control", "");
-  const auto directory = record.value("d", 0.0) > 0.0;
-  if (stage == "compiled")
-   prediction_outputs[0] =
-    directory && record.value("c", -1.0) == 0.0 && path.ends_with(".png") && record.value("a", 0.0) > 0.0 && saved_prediction_file(path, stage, static_cast<std::uint64_t>(record.value("a", 0.0)));
-  else if (stage == "image")
-   prediction_outputs[1] = directory && record.value("c", -1.0) == 0.0 && path.ends_with("/sample.png") && record.value("a", 0.0) == 1.0 && saved_prediction_file(path, stage, 1U);
-  else if (stage == "video")
-   prediction_outputs[2] = directory && path.ends_with("/prediction.mkv") && record.value("b", 0.0) > 0.0 && record.value("c", -1.0) == 0.0 &&
-                           saved_prediction_file(path, stage, static_cast<std::uint64_t>(record.value("b", 0.0)));
-  else if (stage == "stop")
-   prediction_outputs[3] = directory && path.ends_with("/prediction.partial.mkv") && record.value("c", -1.0) == 0.0 && saved_prediction_file(path, stage, 0U);
-  if (stage == "compiled" && prediction_outputs[0])
-   prediction_processed[0] = static_cast<std::uint64_t>(record.value("b", 0.0));
-  else if (stage == "image" && prediction_outputs[1])
-   prediction_processed[1] = static_cast<std::uint64_t>(record.value("b", 0.0));
+  const bool directory = numeric(record, "d") > 0.0;
+  const bool no_json = numeric(record, "c", -1.0) == 0.0;
+  const auto samples = scalar(record, "a");
+  const auto processed = scalar(record, "b");
+  const std::size_t index = stage == "compiled" ? 0U : stage == "image" ? 1U : stage == "video" ? 2U : stage == "stop" ? 3U : prediction_outputs.size();
+  if (index == 0U)
+   prediction_outputs[0] = directory && no_json && path.ends_with(".png") && samples > 0U && saved_prediction_file(path, stage, samples);
+  else if (index == 1U)
+   prediction_outputs[1] = directory && no_json && path.ends_with("/sample.png") && samples == 1U && saved_prediction_file(path, stage, 1U);
+  else if (index == 2U)
+   prediction_outputs[2] = directory && path.ends_with("/prediction.mkv") && processed > 0U && no_json && saved_prediction_file(path, stage, processed);
+  else if (index == 3U)
+   prediction_outputs[3] = directory && path.ends_with("/prediction.partial.mkv") && no_json && saved_prediction_file(path, stage, 0U);
+  if (index == 0U && prediction_outputs[0])
+   prediction_processed[0] = processed;
+  else if (index == 1U && prediction_outputs[1])
+   prediction_processed[1] = processed;
+  if (index >= prediction_outputs.size() || !prediction_outputs[index])
+   prediction_failure.capture("prediction saved-media verification failed", record, [&] {
+    return nlohmann::json{{"directory_admitted", directory}, {"no_json", no_json}, {"samples", samples}, {"processed", processed}};
+   });
  } else if (event == "integration.workflow.operation_progress") {
   constexpr std::array<std::string_view, 4U> primary_controls{"train.primary", "validate.primary", "predict.primary", "export.primary"};
   const auto control = std::ranges::find(primary_controls, record.value("control", ""));
@@ -1858,7 +1884,7 @@ auto BrowserAudit::readiness_blocker() const -> std::string_view {
    if (!above || !action) return std::nullopt;
    return action->y - above->y - above->height;
   };
-  const auto reference = gap("Export", "export.card.output");
+  const auto reference = gap("Export", "export.card.formats");
   if (!reference || *reference <= 0.0) return false;
   for (const auto& [page, card] : std::array{std::pair{"Train", "train.card.dataset"}, std::pair{"Validate", "validate.card.inputs"}, std::pair{"Predict", "predict.card.inputs"}}) {
    const auto measured = gap(page, card);
@@ -1866,6 +1892,14 @@ auto BrowserAudit::readiness_blocker() const -> std::string_view {
   }
   return true;
  }();
+ const bool output_card_placement = std::ranges::all_of(std::array{"Train", "Validate", "Predict", "Export"}, [&page_bound, &page_prefix](const std::string_view page) {
+  const Bounds* const output = page_bound(page, std::string{page_prefix(page)} + ".card.output");
+  const Bounds* const diagnostics = page_bound(page, "workflow.diagnostics");
+  const Bounds* const center = page_bound(page, "workflow.workspace_and_advanced");
+  return output && diagnostics && center && output->valid() && diagnostics->valid() && center->valid() && diagnostics->contains(*output) &&
+         std::abs(output->y - diagnostics->y) < 1.0 && std::abs(output->x - diagnostics->x - 10.0) < 1.0 && std::abs(output->width - diagnostics->width + 20.0) < 1.0 &&
+         diagnostics->x >= center->x + center->width - 1.0;
+ });
  const bool compile_progress_placement = immediately_above(compile_progress, compile_action);
  const bool model_progress_placement = model_card.valid() && model_progress.valid() && model_card.contains(model_progress);
  const bool model_composition = [&] {
@@ -1987,14 +2021,13 @@ auto BrowserAudit::readiness_blocker() const -> std::string_view {
  };
  const bool uniform_primary = !shared_primary_colors.empty() && std::ranges::all_of(shared_primary_colors, [this](const auto& style) { return style.second == shared_primary_colors.begin()->second; });
  static const std::array expected_primary_labels{"Start Training", "Start Validation", "Run Predict", "Run Export", "Start Live", "Save Annotations"};
- return first_failed_check(std::ranges::all_of(prediction_no_outputs, [](bool retained) { return retained; }), "prediction media-disabled directories",
-  std::ranges::all_of(prediction_saving_controls, [](bool present) { return present; }), "prediction source saving controls", std::ranges::all_of(prediction_outputs, [](bool saved) { return saved; }),
-  "prediction saved media and interrupted output", std::ranges::all_of(expected_primary_labels, [this](const char* label) { return primary_idle_labels.contains(label); }),
+ return first_failed_check(std::ranges::all_of(expected_primary_labels, [this](const char* label) { return primary_idle_labels.contains(label); }),
   "primary action rendered labels",
   bootstrap && fluent && uniform_primary && benchmark_purple && rendered_controls.contains(BENCHMARK_OVERRIDE) &&
    std::ranges::all_of(expected_primary, [this](const std::string_view id) { return shared_primary.contains(id) && rendered_controls.contains(id); }),
   "shell and style", every_region, "ordinary workflow regions", primary_progress_placement, "primary progress placement", primary_action_geometry, "primary action geometry", primary_card_gaps,
-  "primary card gaps match Export", reference_columns, "workflow column geometry", vertical_composition, "workflow vertical composition", advanced_composition, "Advanced composition",
+  "primary card gaps match Export", output_card_placement, "Output cards at top of right column", reference_columns, "workflow column geometry", vertical_composition, "workflow vertical composition",
+  advanced_composition, "Advanced composition",
   advanced_compact, "Advanced compact controls", explore_integer_controls.size() == 5U && explore_integer_precision, "Explore integer editing and spinner suppression", explore_paste_restored,
   "Explore clipboard paste persistence and restoration", spinnerless_integer, "integer spinner suppression", spinnerless_floating, "floating spinner suppression", advanced_integer_persisted,
   "Advanced integer persistence", advanced_floating_persisted, "Advanced floating persistence", compile_progress_placement, "Dataset progress placement", model_progress_placement,
@@ -2020,6 +2053,11 @@ auto BrowserAudit::readiness_blocker() const -> std::string_view {
   "annotation lifecycle", complete && surface_draws.contains(presentation_receipt) && surface_redraws.contains(presentation_receipt), "presentation completion",
   bounds_valid && !failed_before_termination(), "browser validity", firefox_import && firefox_claim && firefox_ready, "Firefox integration",
   std::ranges::all_of(expected, [this](const std::string_view id) { return controls.contains(id); }), "expected controls");
+}
+auto BrowserAudit::prediction_output_blocker() const -> std::string_view {
+ return first_failed_check(prediction_no_outputs[0], "compiled prediction media-disabled output", prediction_no_outputs[1], "single-image prediction media-disabled output",
+  prediction_saving_controls[0], "compiled prediction saving controls", prediction_saving_controls[1], "single-image prediction saving controls", prediction_saving_controls[2], "video prediction saving controls",
+  prediction_outputs[0], "compiled prediction saved PNGs", prediction_outputs[1], "single-image prediction saved PNG", prediction_outputs[2], "completed prediction video", prediction_outputs[3], "interrupted prediction video");
 }
 auto BrowserAudit::product_ready() const -> bool { return readiness_blocker().empty(); }
 auto BrowserAudit::terminal_evidence_settled() const noexcept -> bool {

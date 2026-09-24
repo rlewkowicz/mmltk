@@ -1228,7 +1228,7 @@ TEST_CASE("canonical schema projects typed catalog rows and settings defaults", 
  ApplicationSchema<TestSystems>::VisitRequestFields([&]<class Owner, class Declaration>(const ApplicationRequestFieldFact&) { ++request_field_count; });
  CHECK(request_default_count == request_field_count);
 }
-TEST_CASE("model selection compatibility is a reachable deterministic nine-row catalog", "[controller][browser][reflection][model]") {
+TEST_CASE("model selection compatibility is a reachable deterministic eight-row catalog", "[controller][browser][reflection][model]") {
  constexpr std::array expected_keys{
   std::string_view{"train.weights"},
   std::string_view{"validate.weights"},
@@ -1238,7 +1238,6 @@ TEST_CASE("model selection compatibility is a reachable deterministic nine-row c
   std::string_view{"predict.onnx"},
   std::string_view{"predict.tensorrt"},
   std::string_view{"export.weights"},
-  std::string_view{"export.onnx"},
  };
  STATIC_REQUIRE(contracts::ModelSelectionCompatibilityCatalog::identity == "model.selection.compatibility");
  STATIC_REQUIRE(contracts::ModelSelectionCompatibilityCatalog::valid());

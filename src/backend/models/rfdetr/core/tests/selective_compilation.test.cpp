@@ -158,7 +158,7 @@ torch::Tensor dense_attention(torch::nn::MultiheadAttention& module, const torch
  const auto width = target.size(-1);
  const auto heads = module->options.num_heads();
  const auto project = [&](const torch::Tensor& x, int64_t offset) {
-  return torch::matmul(x, module->in_proj_weight.narrow(0, offset * width, width).t()) + module->in_proj_bias.narrow(0, offset * width, width);
+  return torch::linear(x, module->in_proj_weight.narrow(0, offset * width, width), module->in_proj_bias.narrow(0, offset * width, width));
  };
  const auto split = [&](const torch::Tensor& x) { return x.view({x.size(0), x.size(1), heads, width / heads}).transpose(1, 2); };
  const auto q = split(project(target + position, 0));
@@ -168,7 +168,7 @@ torch::Tensor dense_attention(torch::nn::MultiheadAttention& module, const torch
  if (admitted.defined()) scores = scores.masked_fill(~admitted.unsqueeze(1), -std::numeric_limits<float>::infinity());
  const auto probabilities = torch::softmax(scores, -1);
  const auto joined = torch::matmul(probabilities, v).transpose(1, 2).reshape_as(target);
- return torch::matmul(joined, module->out_proj->weight.t()) + module->out_proj->bias;
+ return torch::linear(joined, module->out_proj->weight, module->out_proj->bias);
 }
 TEST_CASE("Decoder SDPA preserves independent positional and target gradients including coincident values", "[rfdetr][attention][compilation]") {
  for (const auto& [device, dtype] : tensor_fixture::available_amp_precisions()) {

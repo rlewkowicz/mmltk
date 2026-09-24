@@ -21,7 +21,10 @@ extern "C" {
 #include <libswscale/swscale.h>
 }
 #include <cmath>
+#include <algorithm>
+#include <array>
 #include <cstdarg>
+#include <cerrno>
 #include <cstdio>
 #include <mutex>
 #include <spdlog/spdlog.h>
@@ -95,6 +98,14 @@ std::size_t VideoFileSource::StorageLimits::Pixels(int width, int height) const 
 void VideoFileSource::StorageLimits::Declared(int width, int height) const {
  // Zero means not yet discovered. Known axes still impose a lower bound.
  static_cast<void>(Pixels(width == 0 ? 1 : width, height == 0 ? 1 : height));
+}
+std::int64_t VideoFileSource::StorageLimits::DecoderPixels(int stride_alignment) const {
+ if (stride_alignment <= 0) throw std::invalid_argument("video decoder stride alignment is invalid");
+ // FFmpeg checks its SIMD-aligned row width against max_pixels. A logical
+ // one-pixel row is the worst case; this is an admission ceiling, not an
+ // allocation. get_format/get_buffer2 independently enforce logical pixels.
+ const auto maximum = std::numeric_limits<std::int64_t>::max();
+ return maximum_pixels > static_cast<std::size_t>(maximum / stride_alignment) ? maximum : static_cast<std::int64_t>(maximum_pixels) * stride_alignment;
 }
 struct VideoFileSource::State final {
  explicit State(VideoFrameCapacity requested_capacity) : limits(requested_capacity) {}
@@ -390,8 +401,8 @@ void VideoFileSource::State::Open(bool hardware) {
     const auto* parameters = track->codecpar;
     const auto* matrix = av_packet_side_data_get(parameters->coded_side_data, parameters->nb_coded_side_data, AV_PKT_DATA_DISPLAYMATRIX);
     const bool has_matrix = matrix && matrix->size == 9U * sizeof(std::int32_t);
-    logger.debug("video source phase={} hardware={} stream={} codec={} width={} height={} frames={} side_data={} display_matrix={} rotation={}", phase, hardware, stream_index,
-     avcodec_get_name(parameters->codec_id), parameters->width, parameters->height, track->nb_frames, parameters->nb_coded_side_data, has_matrix,
+    logger.debug("video source phase={} hardware={} stream={} codec={} width={} height={} frames={} extradata={} format={} side_data={} display_matrix={} rotation={}", phase, hardware, stream_index,
+     avcodec_get_name(parameters->codec_id), parameters->width, parameters->height, track->nb_frames, parameters->extradata_size, parameters->format, parameters->nb_coded_side_data, has_matrix,
      has_matrix ? av_display_rotation_get(reinterpret_cast<const std::int32_t*>(matrix->data)) : 0.0);
    }
   });
@@ -453,7 +464,17 @@ void VideoFileSource::State::Open(bool hardware) {
  codec = avcodec_alloc_context3(decoder);
  if (!codec) throw std::bad_alloc();
  require_media(avcodec_parameters_to_context(codec, track->codecpar), "configure prediction decoder");
- codec->max_pixels = static_cast<std::int64_t>(limits.maximum_pixels);
+ int aligned_width = 1, aligned_height = 1;
+ std::array<int, AV_NUM_DATA_POINTERS> stride_alignment{};
+ avcodec_align_dimensions2(codec, &aligned_width, &aligned_height, stride_alignment.data());
+ codec->max_pixels = limits.DecoderPixels(*std::max_element(stride_alignment.begin(), stride_alignment.end()));
+ codec->opaque = this;
+ codec->get_buffer2 = [](AVCodecContext* decoder_context, AVFrame* decoded, int flags) {
+  try {
+   static_cast<void>(static_cast<const State*>(decoder_context->opaque)->limits.Pixels(decoder_context->width, decoder_context->height));
+  } catch (...) { return AVERROR(EINVAL); }
+  return avcodec_default_get_buffer2(decoder_context, decoded, flags);
+ };
  hardware_attempt = false;
  if (hardware)
   for (int config_index = 0; const auto* config = avcodec_get_hw_config(decoder, config_index); ++config_index) {
@@ -467,7 +488,12 @@ void VideoFileSource::State::Open(bool hardware) {
    break;
   }
  codec->get_format = [](AVCodecContext* decoder_context, const AVPixelFormat* formats) {
-  if (decoder_context->hw_device_ctx)
+  try {
+   static_cast<const State*>(decoder_context->opaque)->limits.Declared(decoder_context->width, decoder_context->height);
+  } catch (...) { return AV_PIX_FMT_NONE; }
+  // MPEG-4 can negotiate its format before publishing dimensions. The
+  // software allocator checks them once known; hardware needs them now.
+  if (decoder_context->hw_device_ctx && decoder_context->width > 0 && decoder_context->height > 0)
    for (auto* candidate = formats; *candidate != AV_PIX_FMT_NONE; ++candidate)
     if (*candidate == AV_PIX_FMT_CUDA) return *candidate;
   for (auto* candidate = formats; *candidate != AV_PIX_FMT_NONE; ++candidate) {

@@ -387,6 +387,7 @@ struct BrowserAudit final {
  std::array<bool, 3U> prediction_saving_controls{};
  std::array<bool, 2U> prediction_no_outputs{};
  std::array<std::uint64_t, 2U> prediction_processed{};
+ FirstAuditFailure prediction_failure;
  std::uint64_t reopen_snapshot_progress = 0U;
  std::uint64_t reopen_draw_progress = 0U;
  std::string phase_progress_class;
@@ -400,6 +401,7 @@ struct BrowserAudit final {
  [[nodiscard]] bool held_placeholder_motion(const std::uint64_t index, const std::uint64_t generation) const;
  void consume_gallery_generation(const nlohmann::json& record);
  void consume(const nlohmann::json& record);
+ [[nodiscard]] std::string_view prediction_output_blocker() const;
  [[nodiscard]] std::string_view readiness_blocker() const;
  [[nodiscard]] bool product_ready() const;
  [[nodiscard]] bool terminal_evidence_settled() const noexcept;

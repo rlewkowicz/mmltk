@@ -35,15 +35,15 @@ template <typename... Remaining>
  const auto found = value.find(field);
  return found != value.end() && found->is_string() ? std::string_view{found->get_ref<const std::string&>()} : std::string_view{};
 }
-[[nodiscard]] inline double numeric(const nlohmann::json& value, const char* const field) noexcept {
+[[nodiscard]] inline double numeric(const nlohmann::json& value, const char* const field, const double fallback = 0.0) noexcept {
  const auto found = value.find(field);
- if (found == value.end()) return 0.0;
+ if (found == value.end()) return fallback;
  if (found->is_number()) return found->get<double>();
- if (!found->is_string()) return 0.0;
+ if (!found->is_string()) return fallback;
  const std::string& text = found->get_ref<const std::string&>();
  double result = 0.0;
  const auto parsed = std::from_chars(text.data(), text.data() + text.size(), result);
- return parsed.ec == std::errc{} && parsed.ptr == text.data() + text.size() ? result : 0.0;
+ return parsed.ec == std::errc{} && parsed.ptr == text.data() + text.size() ? result : fallback;
 }
 // Native and browser files are drained independently. Validate ordering within
 // each producer stream, then join their facts by the physical capability; file

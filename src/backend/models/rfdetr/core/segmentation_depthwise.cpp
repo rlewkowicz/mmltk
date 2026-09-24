@@ -4,6 +4,7 @@
 #include <ATen/ops/conv2d.h>
 #include <torch/csrc/autograd/custom_function.h>
 #include <array>
+#include <optional>
 namespace mmltk::backend::models::rfdetr {
 namespace {
 // RF-DETR e9a138f, models/heads/segmentation.py::_DepthwiseConvWithoutCuDNN.
@@ -11,10 +12,10 @@ namespace {
 // change process-global cuDNN state.
 class SegmentationDepthwise final : public torch::autograd::Function<SegmentationDepthwise> {
 public:
- static torch::Tensor forward(torch::autograd::AutogradContext* ctx, const torch::Tensor& input, const torch::Tensor& weight, const torch::Tensor& bias) {
+ static torch::Tensor forward(torch::autograd::AutogradContext* ctx, const torch::Tensor& input, const torch::Tensor& weight, const std::optional<torch::Tensor>& bias) {
   ctx->save_for_backward({input, weight});
-  ctx->saved_data["has_bias"] = bias.defined();
-  return at::conv2d(input, weight, bias.defined() ? std::optional<torch::Tensor>{bias} : std::nullopt, {1, 1}, {1, 1}, {1, 1}, input.size(1));
+  ctx->saved_data["has_bias"] = bias.has_value();
+  return at::conv2d(input, weight, bias, {1, 1}, {1, 1}, {1, 1}, input.size(1));
  }
  static torch::autograd::variable_list backward(torch::autograd::AutogradContext* ctx, torch::autograd::variable_list gradients) {
   if (!gradients[0].defined()) return {{}, {}, {}};
@@ -38,5 +39,7 @@ public:
  }
 };
 }  // namespace
-torch::Tensor segmentation_depthwise(const torch::Tensor& input, const torch::Tensor& weight, const torch::Tensor& bias) { return SegmentationDepthwise::apply(input, weight, bias); }
+torch::Tensor segmentation_depthwise(const torch::Tensor& input, const torch::Tensor& weight, const torch::Tensor& bias) {
+ return SegmentationDepthwise::apply(input, weight, bias.defined() ? std::optional<torch::Tensor>{bias} : std::nullopt);
+}
 }  // namespace mmltk::backend::models::rfdetr

@@ -674,6 +674,7 @@ private:
 }  // namespace
 TEST_CASE("validation semantic metrics survive required sample refusal without reinference", "[controller][systems][gpu][validation]") {
  const unsigned failure = GENERATE(0U, 1U, 2U);
+ CAPTURE(failure);
  const auto root = mmltk::testsupport::make_temp_root("validation-preview-refusal");
  ApplicationDataFixture fixture{root};
  fixture.PrepareModel(contracts::FeatureId::Validate);
@@ -709,7 +710,13 @@ TEST_CASE("validation semantic metrics survive required sample refusal without r
   });
  static_cast<void>(validation.Start({}));
  const auto result = finished.get_future().get();
- await_validation(display_mutex, display_changed, [&] { return validation.snapshot().frame.revision != 0U; });
+ // Operation settlement schedules preview rollback; its terminal snapshot may
+ // still describe the previously displayed image until the renderer publishes.
+ await_validation(display_mutex, display_changed, [&] {
+  const auto displayed = validation.snapshot();
+  return displayed.frame.revision != 0U && std::ranges::none_of(displayed.sample_available, [](bool available) { return available; });
+ });
+ const auto displayed = validation.snapshot();
  REQUIRE(validation.ImageSnapshot(validation.snapshot().frame));
  CHECK(validation.ImageSnapshot(validation.snapshot().frame)->display.confidence_threshold == 0.437F);
  REQUIRE(result.metrics);
@@ -733,7 +740,7 @@ TEST_CASE("validation semantic metrics survive required sample refusal without r
   CHECK(height == 24);
   CHECK(pixels.get()[0] == 64U);
  } else {
-  CHECK(std::ranges::none_of(result.sample_available, [](bool available) { return available; }));
+  CHECK(std::ranges::none_of(displayed.sample_available, [](bool available) { return available; }));
   CHECK_THROWS_AS(validation.SelectSample({result.operation.generation_frontier, 3U}), contracts::InvalidIntentError);
  }
  static_cast<void>(validation.CloseDetail());
@@ -815,6 +822,7 @@ TEST_CASE("validation rendered output applies captured layers masks boxes and in
  const auto execution = gpu::resolve_device_execution(0, mmltk::common::system::NumaTopology::Capture());
  const mmltk::testsupport::ScopedTempDir directory("validation-output-layers");
  const auto choice = GENERATE(0U, 1U, 2U, 3U, 4U, 5U, 6U, 7U);
+ CAPTURE(choice);
  contracts::ValidationRunPreview options;
  options.ground_truth_labels = options.prediction_labels = false;
  options.display.confidence_threshold = choice == 7U ? 0.438F : 0.437F;
@@ -857,7 +865,8 @@ TEST_CASE("validation rendered output applies captured layers masks boxes and in
  CHECK(mask[0] == (pm || gm ? blend(pm ? 255U : 0U) : 64U));
  CHECK(mask[1] == (pm || gm ? blend(gm ? 255U : 0U) : 64U));
  CHECK(mask[2] == mask[1]);
- const auto* box = pixels.get() + (26U * 32U + 8U) * 4U;
+ // The shared raster places the outline outside the continuous box extent.
+ const auto* box = pixels.get() + (25U * 32U + 8U) * 4U;
  const bool pb = prediction && choice != 5U, gb = truth_visible && choice != 6U;
  CHECK(box[0] == (pb || gb ? (pb ? 255U : 0U) : 64U));
  CHECK(box[1] == (pb || gb ? (gb ? 255U : 0U) : 64U));

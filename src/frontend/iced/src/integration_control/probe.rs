@@ -501,6 +501,7 @@ impl Requests {
                                 | Message::DatasetPixels(..)
                                 | Message::ReportingDisabled
                                 | Message::Advance
+                                | Message::WorkflowRedraw
                                 | Message::Located { .. }
                                 | Message::NumberWheelDelivered
                                 | Message::NumberInvalidDelivered

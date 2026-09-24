@@ -54,6 +54,8 @@ TEST_CASE("video capacity admits checked pixels and bounded replacement storage"
  const auto limits = Access::Limits({4U});
  CHECK(limits.Pixels(1, 1) == 1U);
  CHECK(limits.Pixels(2, 2) == 4U);
+ CHECK(limits.DecoderPixels(64) == 256);
+ CHECK_THROWS_AS(limits.DecoderPixels(0), std::invalid_argument);
  CHECK_THROWS_AS(limits.Pixels(1, 5), std::invalid_argument);
  CHECK_THROWS_AS(limits.Pixels(0, 2), std::invalid_argument);
  CHECK_THROWS_AS(limits.Pixels(-1, 2), std::invalid_argument);
@@ -73,6 +75,7 @@ TEST_CASE("video capacity admits checked pixels and bounded replacement storage"
  CHECK_THROWS_AS(Access::Limits({std::numeric_limits<std::size_t>::max() / 36U + 1U}), std::invalid_argument);
  const auto large = Access::Limits({(std::numeric_limits<std::size_t>::max() - 8U * page) / 36U});
  CHECK(large.owned_bytes <= std::numeric_limits<std::size_t>::max());
+ CHECK(large.DecoderPixels(64) == std::numeric_limits<std::int64_t>::max());
  CHECK_THROWS_AS(large.Pixels(std::numeric_limits<int>::max() / 3 + 1, 1), std::invalid_argument);
 }
 TEST_CASE("local YUV video delivers sequential colors timing and EOF", "[video][gpu]") {
