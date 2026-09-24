@@ -1,8 +1,8 @@
 pub mod fields;
+pub mod gpu;
 pub mod loading;
 pub mod model_card;
 pub mod output;
-pub mod gpu;
 pub mod overlay_controls;
 mod primary_action;
 pub mod progress;

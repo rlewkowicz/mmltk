@@ -36,7 +36,8 @@ public:
  std::unique_ptr<detail::PredictionPreviewPool> preview;
  std::optional<mmltk::frameworks::gpu::DeviceContext> preview_context;
 };
-CudaPredictRuntime::CudaPredictRuntime(DirectComputeConfiguration configuration, services::RuntimeDiagnosticTarget diagnostics) : diagnostics_(std::move(diagnostics)), impl_(std::make_unique<Impl>(configuration)) {}
+CudaPredictRuntime::CudaPredictRuntime(DirectComputeConfiguration configuration, services::RuntimeDiagnosticTarget diagnostics)
+    : diagnostics_(std::move(diagnostics)), impl_(std::make_unique<Impl>(configuration)) {}
 CudaPredictRuntime::~CudaPredictRuntime() = default;
 void CudaPredictRuntime::Close() noexcept {
  try {
@@ -45,19 +46,27 @@ void CudaPredictRuntime::Close() noexcept {
   impl_->preview_context.reset();
  } catch (...) { impl_->close_failed = true; }
 }
-bool CudaPredictRuntime::HasUnsafeCustody() const noexcept { return impl_->resources.HasUnsafeCustody() || impl_->close_failed || impl_->session.HasUnsafeCustody() || (impl_->preview && impl_->preview->HasUnsafeCustody()); }
+bool CudaPredictRuntime::HasUnsafeCustody() const noexcept {
+ return impl_->resources.HasUnsafeCustody() || impl_->close_failed || impl_->session.HasUnsafeCustody() || (impl_->preview && impl_->preview->HasUnsafeCustody());
+}
 contracts::ComputeTerminal CudaPredictRuntime::Run(mmltk::backend::models::rfdetr::PredictRequest operation, const std::stop_token stop, const ComputeProgressSink& progress,
  const ProductSink& products, const PlaybackGate& gate, VisualExtent maximum, const ContextProvider& current_context, const PreviewRetirement& retirement, const ComputeArtifactSink& published,
  const PredictionRunOutput& output, std::uint64_t generation) {
  if (!retirement) throw std::invalid_argument("prediction preview retirement authority is unavailable");
  if (!retirement->admission_open()) throw contracts::UnavailableError("prediction receiver custody is unobservable");
  return impl_->resources.Run(
-  [this, generation, &progress, &products, &gate, stop, operation, maximum, &current_context, &retirement, &published, &output](const mmltk::backend::ml::runtime::BorrowedCommandStream stream) mutable {
+  [this, generation, &progress, &products, &gate, stop, operation, maximum, &current_context, &retirement, &published, &output](
+   const mmltk::backend::ml::runtime::BorrowedCommandStream stream) mutable {
    if (operation.device_id != impl_->resources.device()) throw std::invalid_argument("prediction device disagrees with admitted execution");
-    diagnostics_.Emit([&] {
-     return services::RuntimeDiagnosticFact{.owner = contracts::DiagnosticOwner::Prediction, .event = "workflow.gpu_execution", .participant = "predict",
-      .sequence = generation, .value = 0U, .detail = 1U, .device = impl_->resources.device()};
-    });
+   diagnostics_.Emit([&] {
+    return services::RuntimeDiagnosticFact{.owner = contracts::DiagnosticOwner::Prediction,
+     .event = "workflow.gpu_execution",
+     .participant = "predict",
+     .sequence = generation,
+     .value = 0U,
+     .detail = 1U,
+     .device = impl_->resources.device()};
+   });
    std::shared_ptr<const mmltk::backend::data::catalog::ClassCatalog> classes;
    int class_count = 0;
    std::uint64_t sequence = 0U;
@@ -123,8 +132,8 @@ contracts::ComputeTerminal CudaPredictRuntime::Run(mmltk::backend::models::rfdet
           impl_->preview = std::move(candidate);
           impl_->preview_context = context;
          }
-         auto raw = impl_->preview->Capture(
-          pixels.chw, {pixels.width, pixels.height}, pixels.stream, record.detections, annotations, classes, class_count, pixels.rgb8, pixels.custody, pixels.stop_source, pixels.source_control, {}, false, pixels.device);
+         auto raw = impl_->preview->Capture(pixels.chw, {pixels.width, pixels.height}, pixels.stream, record.detections, annotations, classes, class_count, pixels.rgb8, pixels.custody,
+          pixels.stop_source, pixels.source_control, {}, false, pixels.device);
          if (raw) products(Product{.extent = {pixels.width, pixels.height}, .raw = std::move(raw), .image_id = record.image_id, .source_index = record.dataset_index});
         } catch (const mmltk::backend::ml::runtime::CudaOperationError&) { throw; } catch (const std::exception& error) {
          products(std::unexpected{std::string{error.what()}});
@@ -161,7 +170,8 @@ class PredictSystem::Impl final {
  WorkspaceInput input_;
 
 public:
- Impl(SettingsSystem& settings, DatasetSystem& dataset, ModelSystem& model, const VisualDeviceSettings visual, PredictRuntimeFactory factory, SystemEventSink<event_type> events, DirectComputeResolver resolver)
+ Impl(SettingsSystem& settings, DatasetSystem& dataset, ModelSystem& model, const VisualDeviceSettings visual, PredictRuntimeFactory factory, SystemEventSink<event_type> events,
+  DirectComputeResolver resolver)
      : settings_(settings),
        dataset_(dataset),
        model_(model),
@@ -199,8 +209,8 @@ public:
   if (!settings.loaded) throw contracts::UnavailableError("settings are unavailable");
   // CLEANUP-IGNORE: Predict materialization additionally owns private visual admission and publication.
   const auto selection = model_.selection();
-  const auto& request = settings.settings.workflows.predict.request;
-  const auto configuration = resolver_(request.device_id, request.numa_node);
+  const auto& configured_request = settings.settings.workflows.predict.request;
+  const auto configuration = resolver_(configured_request.device_id, configured_request.numa_node);
   const auto receiver_execution = resolve_visual_device_execution(visual_);
   PredictSnapshot admitted;
   {
@@ -284,8 +294,9 @@ public:
       if (!retirement_.admission_open() || !preview_retirement_->admission_open()) throw contracts::UnavailableError("prediction runtime retirement failed");
       const bool initial_runtime = !runtime_;
       if (!runtime_) {
-       try { runtime_ = factory_(configuration); }
-       catch (...) {
+       try {
+        runtime_ = factory_(configuration);
+       } catch (...) {
         if (mmltk::frameworks::gpu::is_image_execution_failure(std::current_exception())) construction_failed_ = true;
         throw;
        }
@@ -602,7 +613,8 @@ private:
  direct::LocalRun inspection_run_;
  detail::VisualRuntimeOwner worker_;
 };
-PredictSystem::PredictSystem(SettingsSystem& settings, DatasetSystem& dataset, ModelSystem& model, const VisualDeviceSettings visual, PredictRuntimeFactory factory, SystemEventSink<event_type> events, DirectComputeResolver resolver)
+PredictSystem::PredictSystem(SettingsSystem& settings, DatasetSystem& dataset, ModelSystem& model, const VisualDeviceSettings visual, PredictRuntimeFactory factory, SystemEventSink<event_type> events,
+ DirectComputeResolver resolver)
     : impl_(std::make_unique<Impl>(settings, dataset, model, visual, std::move(factory), std::move(events), std::move(resolver))) {}
 PredictSystem::~PredictSystem() = default;
 PredictSnapshot PredictSystem::Inspect(PredictionSourceQuery query) {

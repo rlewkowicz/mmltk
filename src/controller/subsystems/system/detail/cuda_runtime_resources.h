@@ -57,6 +57,7 @@ private:
 template <class Session>
 class CudaSessionRuntimeState {
  std::shared_ptr<Session> session_owner_ = std::make_shared<Session>();
+
 public:
  explicit CudaSessionRuntimeState(const DirectComputeConfiguration config)
      : session(*session_owner_), resources(config, [owner = session_owner_] {

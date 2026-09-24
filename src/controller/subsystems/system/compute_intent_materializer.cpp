@@ -44,8 +44,8 @@ namespace {
  const mmltk::controller::contracts::GuiSettingsState& settings, const mmltk::controller::contracts::FeatureId workflow, const mmltk::controller::contracts::ModelSelection& model) noexcept {
  const auto current = ComputeIntentMaterializer::ModelInputFor(settings, workflow);
  if (!current) return std::unexpected(current.error());
- if (!model.valid() || model.key != current->key ||
-     model.inspection_device != current->inspection_device || (model.key.source == mmltk::controller::contracts::ModelSelectionSource::Custom && model.artifact != current->custom_artifact))
+ if (!model.valid() || model.key != current->key || model.inspection_device != current->inspection_device ||
+     (model.key.source == mmltk::controller::contracts::ModelSelectionSource::Custom && model.artifact != current->custom_artifact))
   return std::unexpected(refused("model selection does not match current workflow settings"));
  return {};
 }

@@ -26,11 +26,13 @@ class TrainingRuntime {
 public:
  virtual ~TrainingRuntime() = default;
  [[nodiscard]] virtual mmltk::backend::models::rfdetr::TrainingCheckpointAdmission InspectCheckpoint(const std::filesystem::path&, std::stop_token);
- [[nodiscard]] virtual contracts::ComputeTerminal Train(mmltk::backend::models::rfdetr::TrainRequest, std::stop_token, const std::function<void(const services::TrainProcessProgress&)>&, std::uint64_t generation = 0) = 0;
+ [[nodiscard]] virtual contracts::ComputeTerminal Train(
+  mmltk::backend::models::rfdetr::TrainRequest, std::stop_token, const std::function<void(const services::TrainProcessProgress&)>&, std::uint64_t generation = 0) = 0;
  [[nodiscard]] virtual contracts::ProviderQueryResult Query(const contracts::ProviderPreferences&, std::stop_token) = 0;
  [[nodiscard]] virtual contracts::ProviderEffectResult Mutate(
   contracts::ProviderMutation, const contracts::ProviderPreferences&, contracts::ProviderOfferIdentity, int instance_id, std::string_view launch_token, std::stop_token) = 0;
  [[nodiscard]] virtual contracts::ProviderEffectResult Reconcile(const services::VastReconciliationRequest&, std::stop_token) = 0;
+
 protected:
  void ReportFailure(std::string_view detail, std::optional<int> status = std::nullopt) const noexcept;
 
@@ -48,7 +50,8 @@ struct NativeTrainingConfiguration final {
 class NativeTrainingRuntime final : public TrainingRuntime {
 public:
  explicit NativeTrainingRuntime(NativeTrainingConfiguration);
- [[nodiscard]] contracts::ComputeTerminal Train(mmltk::backend::models::rfdetr::TrainRequest, std::stop_token, const std::function<void(const services::TrainProcessProgress&)>&, std::uint64_t generation = 0) override;
+ [[nodiscard]] contracts::ComputeTerminal Train(
+  mmltk::backend::models::rfdetr::TrainRequest, std::stop_token, const std::function<void(const services::TrainProcessProgress&)>&, std::uint64_t generation = 0) override;
  [[nodiscard]] contracts::ProviderQueryResult Query(const contracts::ProviderPreferences&, std::stop_token) override;
  [[nodiscard]] contracts::ProviderEffectResult Mutate(
   contracts::ProviderMutation, const contracts::ProviderPreferences&, contracts::ProviderOfferIdentity, int, std::string_view, std::stop_token) override;

@@ -8,9 +8,7 @@ DirectComputeConfiguration resolve_compute_configuration(int device, int numa_no
  if (device < 0) throw contracts::UnavailableError("selected CUDA device is unavailable");
  try {
   return {mmltk::frameworks::gpu::resolve_device_execution(device, mmltk::common::system::NumaTopology::Capture(), numa_node), numa_node};
- } catch (const std::exception& error) {
-  throw contracts::UnavailableError("selected CUDA GPU " + std::to_string(device) + " is unavailable: " + error.what());
- }
+ } catch (const std::exception& error) { throw contracts::UnavailableError("selected CUDA GPU " + std::to_string(device) + " is unavailable: " + error.what()); }
 }
 std::optional<mmltk::common::system::ExecutionPolicyRequest> DirectComputeConfiguration::worker_policy() const {
  if (!execution) return std::nullopt;

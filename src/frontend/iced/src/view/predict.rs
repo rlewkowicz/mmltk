@@ -306,9 +306,18 @@ impl Component {
             setup,
             workspace,
             advanced,
-            column![output_card, crate::view::workflow::gpu::view(crate::generated::FeatureId::Predict, model, settings).map(Message::Gpu), crate::view::shared::identified("predict.card.status", diagnostics)]
-                .spacing(crate::view::workflow::SECTION_SPACING)
-                .into(),
+            column![
+                output_card,
+                crate::view::workflow::gpu::view(
+                    crate::generated::FeatureId::Predict,
+                    model,
+                    settings
+                )
+                .map(Message::Gpu),
+                crate::view::shared::identified("predict.card.status", diagnostics)
+            ]
+            .spacing(crate::view::workflow::SECTION_SPACING)
+            .into(),
         )
         .render(width)
     }
@@ -320,7 +329,11 @@ impl Component {
         message: Message,
     ) -> Result<Option<Outcome>, String> {
         let outcome = match message {
-            Message::Gpu(message) => Outcome::SettingsEdited(crate::view::workflow::gpu::update(crate::generated::FeatureId::Predict, settings, message)?),
+            Message::Gpu(message) => Outcome::SettingsEdited(crate::view::workflow::gpu::update(
+                crate::generated::FeatureId::Predict,
+                settings,
+                message,
+            )?),
             Message::Saving(output::Message::Ignore) => return Ok(None),
             Message::Saving(output::Message::Inspect(path)) => Outcome::Inspect(path),
             Message::Saving(message) => Outcome::SettingsEdited(output::update(settings, message)?),

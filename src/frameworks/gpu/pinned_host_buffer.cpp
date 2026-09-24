@@ -28,15 +28,19 @@ struct PinnedHostBuffer::Retention {
  std::shared_ptr<TerminalCudaRetirementOwner> terminal;
  TerminalCudaRetirementLease lease;
  mmltk::common::io::ScopedFd trace;
- Retention(std::shared_ptr<TerminalCudaRetirementOwner> owner)
-  : terminal(owner ? std::move(owner) : std::make_shared<TerminalCudaRetirementOwner>(2U)), lease(ReserveTerminalCudaLease(*terminal)) {
+ Retention(std::shared_ptr<TerminalCudaRetirementOwner> owner) : terminal(owner ? std::move(owner) : std::make_shared<TerminalCudaRetirementOwner>(2U)), lease(ReserveTerminalCudaLease(*terminal)) {
   if (const auto* path = std::getenv("MMLTK_NUMA_TRANSFER_TRACE_FILE"); path && *path) trace.reset(::open(path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0600));
  }
 };
-PinnedHostBuffer::PinnedHostBuffer(CUcontext context, const mmltk::common::system::ExecutionPlacement& placement, bool portable, Register registration,
- std::shared_ptr<TerminalCudaRetirementOwner> retirement, Operations operations)
-    : operations_(operations), registration_(registration), placement_(placement), retention_(std::make_unique<Retention>(std::move(retirement))), state_(std::make_shared<State>(context, placement.numa_node, portable)) {
- if (!context || !registration || !operations.synchronize || !operations.unregister || placement.cpus.empty()) throw std::invalid_argument("pinned host buffer requires an owning context and placement");
+PinnedHostBuffer::PinnedHostBuffer(
+ CUcontext context, const mmltk::common::system::ExecutionPlacement& placement, bool portable, Register registration, std::shared_ptr<TerminalCudaRetirementOwner> retirement, Operations operations)
+    : operations_(operations),
+      registration_(registration),
+      placement_(placement),
+      retention_(std::make_unique<Retention>(std::move(retirement))),
+      state_(std::make_shared<State>(context, placement.numa_node, portable)) {
+ if (!context || !registration || !operations.synchronize || !operations.unregister || placement.cpus.empty())
+  throw std::invalid_argument("pinned host buffer requires an owning context and placement");
 }
 PinnedHostBuffer::~PinnedHostBuffer() noexcept {
  if (!state_->registered || state_->unsafe) return;
@@ -92,7 +96,10 @@ CUresult PinnedHostBuffer::Release(bool synchronize) noexcept {
   state_->memory.reset();
   return CUDA_SUCCESS;
  }
- if (!retention_->terminal->admission_open()) { Retain(); return CUDA_ERROR_UNKNOWN; }
+ if (!retention_->terminal->admission_open()) {
+  Retain();
+  return CUDA_ERROR_UNKNOWN;
+ }
  CUresult result = CUDA_SUCCESS;
  try {
   CudaContextScope scope({this, [](void* owner) noexcept { static_cast<PinnedHostBuffer*>(owner)->Retain(); }}, operations_.context);
@@ -106,7 +113,10 @@ CUresult PinnedHostBuffer::Release(bool synchronize) noexcept {
    log("unregistered");
   });
  } catch (...) { result = CUDA_ERROR_UNKNOWN; }
- if (result != CUDA_SUCCESS) { Retain(); return result; }
+ if (result != CUDA_SUCCESS) {
+  Retain();
+  return result;
+ }
  state_->memory.reset();
  return CUDA_SUCCESS;
 }

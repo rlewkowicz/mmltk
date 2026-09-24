@@ -1,4 +1,5 @@
 #include "validation_sample_output.h"
+#include "src/controller/contracts/application_boundary.h"
 #include "src/controller/subsystems/system/detail/cuda_runtime_resources.h"
 #include "src/backend/imaging/raster/caption_raster.h"
 #include "src/backend/imaging/raster/class_palette.h"
@@ -18,8 +19,15 @@ namespace rfdetr = mmltk::backend::models::rfdetr;
 namespace raster = mmltk::backend::imaging::raster;
 class ValidationSampleOutput::Impl final {
 public:
- Impl(DirectComputeConfiguration configuration, VisualDeviceSettings visual, ComputeArtifactSink published, raster::RenderedImageWriter::PngEncoder encoder, std::shared_ptr<gpu::TerminalCudaRetirementOwner> retirement, gpu::CudaContextApi context_api)
-     : configuration_(std::move(configuration)), visual_(visual), published_(std::move(published)), encoder_(std::move(encoder)), fixed_receiver_(visual.valid()), retirement_(std::move(retirement)), context_api_(context_api) {}
+ Impl(DirectComputeConfiguration configuration, VisualDeviceSettings visual, ComputeArtifactSink published, raster::RenderedImageWriter::PngEncoder encoder,
+  std::shared_ptr<gpu::TerminalCudaRetirementOwner> retirement, gpu::CudaContextApi context_api)
+     : configuration_(std::move(configuration)),
+       visual_(visual),
+       published_(std::move(published)),
+       encoder_(std::move(encoder)),
+       fixed_receiver_(visual.valid()),
+       retirement_(std::move(retirement)),
+       context_api_(context_api) {}
  void Ensure() {
   if (pool_) return;
   const auto execution = context_ ? *context_->execution() : visual_.valid() ? resolve_visual_device_execution(visual_) : configuration_.execution.value_or(gpu::DeviceExecution{});

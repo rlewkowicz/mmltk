@@ -2544,7 +2544,7 @@ print_test_suites() {
         '  rfdetr  RF-DETR native/model Catch2 suite' \
         '  rfdetr-profile  Opt-in RF-DETR training profile runner' \
         '  build   Build every available native release test target without running tests' \
-        '  all     Build and run every available suite' \
+        '  all     Build native targets; run ordinary native, browser-app, and log-query suites' \
         '' \
         'Use: ./mmltk --test <suite> [test options] [-- <Catch2 args...>]' \
         'For browser-app, arguments after -- are Cargo test arguments.' \
@@ -3166,6 +3166,45 @@ run_workspace_wayland_test_executable() {
     return "${test_status}"
 }
 
+run_browser_app_tests() {
+    local -n browser_fixture_status="$1"
+    shift
+    browser_fixture_status=0
+    acquire_mutation_locks
+    ensure_docker
+    prepare_cache_layout
+    ensure_build_image
+    local browser_test_arguments=""
+    local browser_test_argument
+    for browser_test_argument in "$@"; do
+        browser_test_argument="${browser_test_argument//;/\\;}"
+        browser_test_arguments+="${browser_test_arguments:+;}${browser_test_argument}"
+    done
+    local browser_test_configuration
+    printf -v browser_test_configuration '%q' "-DMMLTK_ICED_TEST_ARGUMENTS=${browser_test_arguments}"
+    if (( ! gui_diagnostics_quiet )); then log "running iced browser application tests"; fi
+    run_owned_toolchain_command "${test_run_container_name}" \
+        'set -euo pipefail
+         browser_test_icds=""
+         for browser_test_icd in /etc/vulkan/icd.d/*nvidia*.json /usr/share/vulkan/icd.d/*nvidia*.json; do
+             if [[ -r "${browser_test_icd}" ]]; then
+                 browser_test_icds+="${browser_test_icds:+:}${browser_test_icd}"
+             fi
+         done
+         if [[ -z "${browser_test_icds}" ]]; then
+             printf "%s\n" "browser-app GPU acceptance requires a container NVIDIA Vulkan ICD" >&2
+             exit 1
+         fi
+         export VK_DRIVER_FILES="${browser_test_icds}"
+         /workspace/tools/configure_cmake_graph.sh \
+             gui "${MMLTK_CONTAINER_CACHE_ROOT}/cmake/gui" '"${browser_test_configuration}"'
+         cmake --build "${MMLTK_CONTAINER_CACHE_ROOT}/cmake/gui" \
+             --parallel "${MMLTK_JOBS}" --target mmltk_frontend_iced_tests
+         python3 /workspace/tools/check_toolchain_invariants.py \
+             --repo-root /workspace --build-dir "${MMLTK_CONTAINER_CACHE_ROOT}/cmake/gui"' || browser_fixture_status=$?
+    release_mutation_locks
+}
+
 run_tests() {
     local suite="$1"
     shift
@@ -3214,40 +3253,9 @@ run_tests() {
             die "--test browser-app does not accept --gdb"
         ((${#test_environment[@]} == 0)) ||
             die "--test browser-app does not yet consume native test environments"
-        acquire_mutation_locks
-        ensure_docker
-        prepare_cache_layout
-        ensure_build_image
-        local browser_test_arguments=""
-        local browser_test_argument
-        for browser_test_argument in "$@"; do
-            browser_test_argument="${browser_test_argument//;/\\;}"
-            browser_test_arguments+="${browser_test_arguments:+;}${browser_test_argument}"
-        done
-        local browser_test_configuration
-        printf -v browser_test_configuration '%q' "-DMMLTK_ICED_TEST_ARGUMENTS=${browser_test_arguments}"
-        if (( ! gui_diagnostics_quiet )); then log "running iced browser application tests"; fi
-        run_owned_toolchain_command "${test_run_container_name}" \
-            'set -euo pipefail
-             browser_test_icds=""
-             for browser_test_icd in /etc/vulkan/icd.d/*nvidia*.json /usr/share/vulkan/icd.d/*nvidia*.json; do
-                 if [[ -r "${browser_test_icd}" ]]; then
-                     browser_test_icds+="${browser_test_icds:+:}${browser_test_icd}"
-                 fi
-             done
-             if [[ -z "${browser_test_icds}" ]]; then
-                 printf "%s\n" "browser-app GPU acceptance requires a container NVIDIA Vulkan ICD" >&2
-                 exit 1
-             fi
-             export VK_DRIVER_FILES="${browser_test_icds}"
-             /workspace/tools/configure_cmake_graph.sh \
-                 gui "${MMLTK_CONTAINER_CACHE_ROOT}/cmake/gui" '"${browser_test_configuration}"'
-             cmake --build "${MMLTK_CONTAINER_CACHE_ROOT}/cmake/gui" \
-                 --parallel "${MMLTK_JOBS}" --target mmltk_frontend_iced_tests
-             python3 /workspace/tools/check_toolchain_invariants.py \
-                 --repo-root /workspace --build-dir "${MMLTK_CONTAINER_CACHE_ROOT}/cmake/gui"'
-        release_mutation_locks
-        return 0
+        local browser_status=0
+        run_browser_app_tests browser_status "$@"
+        return "${browser_status}"
     fi
     if [[ "${suite}" == "cleanup-tool" ]]; then
         (($# == 0)) || die "--test cleanup-tool does not accept additional arguments"
@@ -3587,6 +3595,15 @@ run_tests() {
         fi
     done
     release_mutation_locks
+    if [[ "${suite}" == "all" && -z "${test_executable}" ]] && ((${#suite_args[@]} == 0)); then
+        local browser_status=0
+        run_browser_app_tests browser_status
+        if (( first_failure == 0 )); then first_failure="${browser_status}"; fi
+        local log_query_status=0
+        if (( ! gui_diagnostics_quiet )); then log "running log query tooling fixture tests"; fi
+        run_log_tool test || log_query_status=$?
+        if (( first_failure == 0 )); then first_failure="${log_query_status}"; fi
+    fi
     return "${first_failure}"
 }
 

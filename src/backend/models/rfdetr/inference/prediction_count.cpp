@@ -2,11 +2,11 @@
 #include <stdexcept>
 #include <utility>
 namespace mmltk::backend::models::rfdetr {
-PredictionCountStorage::PredictionCountStorage(int device, std::size_t capacity,
- std::shared_ptr<mmltk::frameworks::gpu::TerminalCudaRetirementOwner> retirement, mmltk::frameworks::gpu::PinnedHostBuffer::Operations operations)
- : storage_(device, {}, std::move(retirement), operations), host_(storage_.view({static_cast<std::int64_t>(capacity)}, at::kLong)), devices_(capacity), device_index_(device) {}
-void PredictionCountStorage::Prepare(std::shared_ptr<PredictionCountStorage>& storage, std::size_t count, int device,
- std::shared_ptr<mmltk::frameworks::gpu::TerminalCudaRetirementOwner> retirement, mmltk::frameworks::gpu::PinnedHostBuffer::Operations operations) {
+PredictionCountStorage::PredictionCountStorage(
+ int device, std::size_t capacity, std::shared_ptr<mmltk::frameworks::gpu::TerminalCudaRetirementOwner> retirement, mmltk::frameworks::gpu::PinnedHostBuffer::Operations operations)
+    : storage_(device, {}, std::move(retirement), operations), host_(storage_.view({static_cast<std::int64_t>(capacity)}, at::kLong)), devices_(capacity), device_index_(device) {}
+void PredictionCountStorage::Prepare(std::shared_ptr<PredictionCountStorage>& storage, std::size_t count, int device, std::shared_ptr<mmltk::frameworks::gpu::TerminalCudaRetirementOwner> retirement,
+ mmltk::frameworks::gpu::PinnedHostBuffer::Operations operations) {
  if (!storage || storage.use_count() != 1 || storage->device_index_ != device || storage->devices_.size() < count)
   storage = std::make_shared<PredictionCountStorage>(device, count, std::move(retirement), operations);
 }
@@ -22,7 +22,7 @@ void PredictionCountStorage::Publish(std::size_t index, const torch::Tensor& cou
 }
 CUresult PredictionCountStorage::ReleaseSettled() noexcept {
  if (weak_from_this().use_count() != 1) return CUDA_ERROR_NOT_READY;
- host_ = {};
+ host_ = torch::Tensor{};
  const auto status = storage_.ReleaseSettled();
  if (status != CUDA_SUCCESS) return status;
  devices_.clear();

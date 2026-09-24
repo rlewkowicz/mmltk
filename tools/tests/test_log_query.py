@@ -290,6 +290,22 @@ class LogFormatTests(unittest.TestCase):
                 self.assertEqual(row.format, "text")
                 self.assertEqual(row.get("@text"), text)
 
+    def test_compiler_progress_and_source_keep_failure_vocabulary_as_context(self):
+        for text in ("[3/594] Building CXX object image_failure.h.cpp.o",
+                     "[8/594] Building CXX object cuda_error.h.cpp.o",
+                     "   25 | host_ = {};",
+                     " 1120 | capture({}, {}); // error path"):
+            with self.subTest(text=text):
+                row = logs.parse_record("tidy.log", 1, text)
+                self.assertFalse(row.get("@error"))
+                self.assertFalse(row.parse_error)
+                self.assertEqual(row.get("message"), text)
+        for text in ("FAILED: [code=1] image_failure.h.cpp.o",
+                     "predict.cpp:25:11: error: ambiguous overload for operator=",
+                     "ninja: build stopped: cannot make progress due to previous errors."):
+            with self.subTest(text=text):
+                self.assertTrue(logs.parse_record("tidy.log", 2, text).get("@error"))
+
     def test_clock_domains_and_nanosecond_precision(self):
         self.assertEqual(logs.timestamp_ns("1970-01-01T01:00:01.123456789+01:00"), ("wall", 1123456789))
         self.assertEqual(record({"timestamp_ns": 9007199254740993}).time_ns, 9007199254740993)

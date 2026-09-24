@@ -7,8 +7,8 @@ namespace mmltk::backend::ml::cuda {
 // its original owner. Shapes describe active elements, never reserved capacity.
 class NumaHostTensor final {
 public:
- explicit NumaHostTensor(int device, std::shared_ptr<void> context_custody = {},
-  std::shared_ptr<mmltk::frameworks::gpu::TerminalCudaRetirementOwner> retirement = {}, mmltk::frameworks::gpu::PinnedHostBuffer::Operations operations = {});
+ explicit NumaHostTensor(int device, std::shared_ptr<void> context_custody = {}, std::shared_ptr<mmltk::frameworks::gpu::TerminalCudaRetirementOwner> retirement = {},
+  mmltk::frameworks::gpu::PinnedHostBuffer::Operations operations = {});
  [[nodiscard]] at::Tensor view(at::IntArrayRef shape, at::ScalarType dtype);
  [[nodiscard]] std::size_t capacity_bytes() const noexcept;
  // Only an owner that has completed all CUDA work may use this. Escaped

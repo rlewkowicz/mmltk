@@ -8,9 +8,9 @@
 namespace mmltk::frameworks::gpu {
 // Callback state must outlive the buffer and every escaped tensor view.
 struct PinnedHostBufferOperations final {
-  CudaContextApi context{};
-  CUresult (*synchronize)(void*) = [](void*) { return cuCtxSynchronize(); };
-  CUresult (*unregister)(void*, void*) = [](void*, void* address) { return cuMemHostUnregister(address); };
+ CudaContextApi context{};
+ CUresult (*synchronize)(void*) = [](void*) { return cuCtxSynchronize(); };
+ CUresult (*unregister)(void*, void*) = [](void*, void* address) { return cuMemHostUnregister(address); };
 };
 // Owner calls ReleaseSettled only after every asynchronous borrower completes.
 // Growth and destruction settle the owning context; failed resources enter the

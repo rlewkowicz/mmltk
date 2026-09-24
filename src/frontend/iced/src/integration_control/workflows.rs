@@ -277,19 +277,42 @@ fn ready_gallery_tile(model: &ApplicationModel) -> Option<(super::probe::ProbeRe
     ))
 }
 
-fn paired_validation(control: &str) -> Option<(super::probe::ProbeReceipt, std::sync::Arc<crate::generated::ValidationImageMetadata>)> {
+fn paired_validation(
+    control: &str,
+) -> Option<(
+    super::probe::ProbeReceipt,
+    std::sync::Arc<crate::generated::ValidationImageMetadata>,
+)> {
     let receipt = super::probe::current_receipt(control)?;
     let (surface, content) = crate::presentation_surface::drawable_validation(receipt.surface)?;
     (surface.frame == receipt.surface.frame).then(|| (receipt, content.metadata.clone()))
 }
 
-fn progressive_tile(metadata: &crate::generated::ValidationImageMetadata, generation: u64) -> Option<u8> {
-    let ready = metadata.samples.iter().filter(|sample| sample.available).count();
-    if metadata.detail || generation == 0 || ready == 0 || ready >= metadata.samples.len()
-        || metadata.samples.iter().any(|sample| sample.identity.generation != generation) {
+fn progressive_tile(
+    metadata: &crate::generated::ValidationImageMetadata,
+    generation: u64,
+) -> Option<u8> {
+    let ready = metadata
+        .samples
+        .iter()
+        .filter(|sample| sample.available)
+        .count();
+    if metadata.detail
+        || generation == 0
+        || ready == 0
+        || ready >= metadata.samples.len()
+        || metadata
+            .samples
+            .iter()
+            .any(|sample| sample.identity.generation != generation)
+    {
         return None;
     }
-    metadata.samples.iter().position(|sample| sample.available).map(|index| index as u8)
+    metadata
+        .samples
+        .iter()
+        .position(|sample| sample.available)
+        .map(|index| index as u8)
 }
 
 fn atlas_cell(bounds: Rectangle, index: u8) -> Rectangle {
@@ -571,9 +594,13 @@ mod tests {
         metadata.detail = true;
         assert_eq!(super::progressive_tile(&metadata, 7), None);
         metadata.detail = false;
-        for sample in &mut metadata.samples { sample.available = true; }
+        for sample in &mut metadata.samples {
+            sample.available = true;
+        }
         assert_eq!(super::progressive_tile(&metadata, 7), None);
-        for sample in &mut metadata.samples { sample.available = false; }
+        for sample in &mut metadata.samples {
+            sample.available = false;
+        }
         assert_eq!(super::progressive_tile(&metadata, 7), None);
     }
 
@@ -627,7 +654,10 @@ mod tests {
             snapshot.operation.active = true;
             snapshot.operation.generationfrontier = 7;
             snapshot.sampleavailable[0] = true;
-            assert_eq!(advance_workflow(controller, &model, step, FeatureId::Validate), 0);
+            assert_eq!(
+                advance_workflow(controller, &model, step, FeatureId::Validate),
+                0
+            );
             assert!(!controller.widgets.location_pending());
             assert_eq!(controller.driver.phase, Phase::Workflows(step));
         }
@@ -1493,7 +1523,9 @@ impl State {
         };
         let input = crate::presentation_surface::physical_bounds(bounds, driver.input_scale);
         if matches!(step, Step::ProgressiveOpen(_))
-            && (self.progressive_receipt.is_none() || self.progressive_receipt != super::probe::current_receipt(control)) {
+            && (self.progressive_receipt.is_none()
+                || self.progressive_receipt != super::probe::current_receipt(control))
+        {
             return;
         }
         if let Step::ConfidenceEdit(stage) = step {
@@ -1673,32 +1705,81 @@ impl State {
             Step::PrepareExport => Some(FeatureId::Export),
             _ => None,
         };
-        if let Some(feature) = entry.filter(|feature| active == *feature && settled && !self.gpu_completed[gpu_index(*feature)]) {
-            let Some(inventory) = model.settings_snapshot.as_ref().map(|snapshot| &snapshot.cudadevices) else { return Task::none(); };
-            let Some(device) = inventory.last() else { driver.fail("Workflow GPU inventory is empty"); return Task::none(); };
+        if let Some(feature) = entry.filter(|feature| {
+            active == *feature && settled && !self.gpu_completed[gpu_index(*feature)]
+        }) {
+            let Some(inventory) = model
+                .settings_snapshot
+                .as_ref()
+                .map(|snapshot| &snapshot.cudadevices)
+            else {
+                return Task::none();
+            };
+            let Some(device) = inventory.last() else {
+                driver.fail("Workflow GPU inventory is empty");
+                return Task::none();
+            };
             self.gpu_target = device.ordinal;
             self.gpu_revision = 0;
             self.gpu_return = Some(step);
             return self.workflow_step(driver, Step::GpuReady(feature));
         }
         if let Step::GpuReady(feature) = step {
-            if !settled { return Task::none(); }
-            let Some(snapshot) = model.settings_snapshot.as_ref() else { return Task::none(); };
-            if self.gpu_revision != 0 && snapshot.revision <= self.gpu_revision { return Task::none(); }
+            if !settled {
+                return Task::none();
+            }
+            let Some(snapshot) = model.settings_snapshot.as_ref() else {
+                return Task::none();
+            };
+            if self.gpu_revision != 0 && snapshot.revision <= self.gpu_revision {
+                return Task::none();
+            }
             self.gpu_revision = 0;
             let selected = workflow::gpu::selected(feature, &snapshot.settingsstate);
             if selected != [self.gpu_target] {
-                let device = if selected.contains(&self.gpu_target) { *selected.iter().find(|device| **device != self.gpu_target).unwrap() } else { self.gpu_target };
+                let device = if selected.contains(&self.gpu_target) {
+                    *selected
+                        .iter()
+                        .find(|device| **device != self.gpu_target)
+                        .unwrap()
+                } else {
+                    self.gpu_target
+                };
                 return self.workflow_step(driver, Step::GpuSelect(feature, device));
             }
             self.gpu_completed[gpu_index(feature)] = true;
-            reporting::emit(|sink| sink.record("integration.workflow_gpu_selected", gpu_name(feature), "settled", [self.gpu_target as f64, snapshot.revision as f64, snapshot.cudadevices.len() as f64, 1.0]));
-            let Some(next) = self.gpu_return.take() else { driver.fail("Missing GPU selection continuation"); return Task::none(); };
-            return Task::batch([self.workflow_step(driver, next), iced::advanced::widget::operate(GpuLayout::new(feature, "light"))]);
+            reporting::emit(|sink| {
+                sink.record(
+                    "integration.workflow_gpu_selected",
+                    gpu_name(feature),
+                    "settled",
+                    [
+                        self.gpu_target as f64,
+                        snapshot.revision as f64,
+                        snapshot.cudadevices.len() as f64,
+                        1.0,
+                    ],
+                )
+            });
+            let Some(next) = self.gpu_return.take() else {
+                driver.fail("Missing GPU selection continuation");
+                return Task::none();
+            };
+            return Task::batch([
+                self.workflow_step(driver, next),
+                iced::advanced::widget::operate(GpuLayout::new(feature, "light")),
+            ]);
         }
         if let Step::GpuSelect(feature, device) = step {
-            self.gpu_revision = model.settings_snapshot.as_ref().map_or(0, |snapshot| snapshot.revision);
-            return self.workflow_control(widgets, driver, format!("{}.gpu.device.{device}", gpu_name(feature)));
+            self.gpu_revision = model
+                .settings_snapshot
+                .as_ref()
+                .map_or(0, |snapshot| snapshot.revision);
+            return self.workflow_control(
+                widgets,
+                driver,
+                format!("{}.gpu.device.{device}", gpu_name(feature)),
+            );
         }
         let train = model.workflow.training.as_ref();
         let validation = model.workflow.validation.as_ref();
@@ -1707,7 +1788,10 @@ impl State {
         if crate::integration_control::reporting_enabled() {
             for (feature, operation) in [
                 (FeatureId::Train, train.map(|value| &value.local)),
-                (FeatureId::Validate, validation.map(|value| &value.operation)),
+                (
+                    FeatureId::Validate,
+                    validation.map(|value| &value.operation),
+                ),
                 (FeatureId::Predict, prediction.map(|value| &value.operation)),
                 (FeatureId::Export, model.workflow.export.as_ref()),
             ] {
@@ -1716,9 +1800,14 @@ impl State {
                     let previous = &mut self.gpu_admitted[gpu_index(feature)];
                     if generation > *previous {
                         *previous = generation;
-                        reporting::emit(|sink| sink.record(
-                            "integration.workflow.operation_admitted", gpu_name(feature), "snapshot",
-                            [generation as f64, 0.0, 0.0, 0.0]));
+                        reporting::emit(|sink| {
+                            sink.record(
+                                "integration.workflow.operation_admitted",
+                                gpu_name(feature),
+                                "snapshot",
+                                [generation as f64, 0.0, 0.0, 0.0],
+                            )
+                        });
                     }
                 }
             }
@@ -2145,13 +2234,18 @@ impl State {
                 if !self.progressive_opened
                     && validation.is_some_and(|value| value.operation.active) =>
             {
-                let Some((receipt, metadata)) = paired_validation(crate::view::validate::samples::ATLAS_ID) else {
+                let Some((receipt, metadata)) =
+                    paired_validation(crate::view::validate::samples::ATLAS_ID)
+                else {
                     return Task::none();
                 };
-                let Some(index) = progressive_tile(&metadata, validation.unwrap().operation.generationfrontier) else {
+                let Some(index) =
+                    progressive_tile(&metadata, validation.unwrap().operation.generationfrontier)
+                else {
                     return Task::none();
                 };
-                self.progressive_selection = Some(metadata.samples[index as usize].identity.clone());
+                self.progressive_selection =
+                    Some(metadata.samples[index as usize].identity.clone());
                 self.progressive_receipt = Some(receipt);
                 self.workflow_step(driver, Step::ProgressiveOpen(index))
             }
@@ -2160,11 +2254,15 @@ impl State {
                     driver.fail("Validation finished before progressive selection");
                     return Task::none();
                 };
-                let Some((receipt, metadata)) = paired_validation(crate::view::validate::samples::ATLAS_ID) else {
+                let Some((receipt, metadata)) =
+                    paired_validation(crate::view::validate::samples::ATLAS_ID)
+                else {
                     return Task::none();
                 };
                 if progressive_tile(&metadata, snapshot.operation.generationfrontier) != Some(index)
-                    || self.progressive_selection.as_ref() != Some(&metadata.samples[index as usize].identity) {
+                    || self.progressive_selection.as_ref()
+                        != Some(&metadata.samples[index as usize].identity)
+                {
                     return self.workflow_step(driver, Step::Validating);
                 }
                 self.progressive_receipt = Some(receipt);
@@ -2175,49 +2273,87 @@ impl State {
                 let Some((_, metadata)) = paired_validation("validate.detail.image") else {
                     return Task::none();
                 };
-                if !metadata.detail { return Task::none(); }
+                if !metadata.detail {
+                    return Task::none();
+                }
                 let Some(identity) = self.progressive_selection.as_ref() else {
                     driver.fail("Missing progressive selection identity");
                     return Task::none();
                 };
-                let ready = metadata.samples.iter().filter(|sample| sample.available).count();
-                if !snapshot.operation.active || identity.generation != snapshot.operation.generationfrontier
-                    || snapshot.selected.as_ref() != Some(identity) || metadata.selected.as_ref() != Some(identity)
-                    || ready == 0 || ready >= metadata.samples.len() {
-                    driver.fail("Validation detail did not open on the selected progressive generation");
+                let ready = metadata
+                    .samples
+                    .iter()
+                    .filter(|sample| sample.available)
+                    .count();
+                if !snapshot.operation.active
+                    || identity.generation != snapshot.operation.generationfrontier
+                    || snapshot.selected.as_ref() != Some(identity)
+                    || metadata.selected.as_ref() != Some(identity)
+                    || ready == 0
+                    || ready >= metadata.samples.len()
+                {
+                    driver.fail(
+                        "Validation detail did not open on the selected progressive generation",
+                    );
                     return Task::none();
                 }
                 self.progressive_opened = true;
-                reporting::emit(|sink| sink.record(
-                    "integration.validation_progressive", &format!("{}:{}", identity.generation, identity.datasetindex), "opened",
-                    [snapshot.operation.generationfrontier as f64, ready as f64,
-                     1.0, metadata.frame.revision as f64],
-                ));
+                reporting::emit(|sink| {
+                    sink.record(
+                        "integration.validation_progressive",
+                        &format!("{}:{}", identity.generation, identity.datasetindex),
+                        "opened",
+                        [
+                            snapshot.operation.generationfrontier as f64,
+                            ready as f64,
+                            1.0,
+                            metadata.frame.revision as f64,
+                        ],
+                    )
+                });
                 self.workflow_step(driver, Step::ProgressiveSettling)
             }
-            Step::ProgressiveSettling if validation.is_some_and(|value| success(&value.operation)) => {
+            Step::ProgressiveSettling
+                if validation.is_some_and(|value| success(&value.operation)) =>
+            {
                 self.workflow_step(driver, Step::ProgressiveClose)
             }
             Step::ProgressiveClose if model.validation_navigation_available() => {
                 self.workflow_control(widgets, driver, "validate.detail.close")
             }
-            Step::ProgressiveClosed if validation.is_some_and(|value| !value.detail
-                && value.sampleavailable.iter().all(|ready| *ready)) =>
+            Step::ProgressiveClosed
+                if validation.is_some_and(|value| {
+                    !value.detail && value.sampleavailable.iter().all(|ready| *ready)
+                }) =>
             {
                 let snapshot = validation.unwrap();
-                let Some((_, metadata)) = paired_validation(crate::view::validate::samples::ATLAS_ID) else {
+                let Some((_, metadata)) =
+                    paired_validation(crate::view::validate::samples::ATLAS_ID)
+                else {
                     return Task::none();
                 };
-                if metadata.detail || metadata.samples.iter().any(|sample| !sample.available
-                    || sample.identity.generation != snapshot.operation.generationfrontier) {
+                if metadata.detail
+                    || metadata.samples.iter().any(|sample| {
+                        !sample.available
+                            || sample.identity.generation != snapshot.operation.generationfrontier
+                    })
+                {
                     return Task::none();
                 }
                 self.restoration_revision = metadata.frame.revision;
-                reporting::emit(|sink| sink.record(
-                    "integration.validation_progressive", crate::view::validate::samples::ATLAS_ID, "closed",
-                    [snapshot.operation.generationfrontier as f64, metadata.samples.len() as f64,
-                     0.0, metadata.frame.revision as f64],
-                ));
+                reporting::emit(|sink| {
+                    sink.record(
+                        "integration.validation_progressive",
+                        crate::view::validate::samples::ATLAS_ID,
+                        "closed",
+                        [
+                            snapshot.operation.generationfrontier as f64,
+                            metadata.samples.len() as f64,
+                            0.0,
+                            metadata.frame.revision as f64,
+                        ],
+                    )
+                });
                 self.workflow_step(driver, Step::Validating)
             }
             // Native metrics finish before the asynchronous sample renderer
@@ -2306,9 +2442,10 @@ impl State {
                     return Task::none();
                 }
                 self.restoration_pixels = true;
-                self.workflow_step(driver, Step::Pixels(Picture::Validation, 0)).chain(
-                    iced::advanced::widget::operate(ValidationLayout::new("atlas")),
-                )
+                self.workflow_step(driver, Step::Pixels(Picture::Validation, 0))
+                    .chain(iced::advanced::widget::operate(ValidationLayout::new(
+                        "atlas",
+                    )))
             }
             Step::ConfidenceEdit(_) => self.workflow_control(
                 widgets,
@@ -2955,7 +3092,10 @@ impl State {
                         .is_some_and(|value| value.ui.darkmode) =>
             {
                 completed("theme", [1.0, 0.0, 0.0, 0.0]);
-                Task::batch([self.workflow_step(driver, Step::Pixels(Picture::Theme, 0)), iced::advanced::widget::operate(GpuLayout::new(FeatureId::Train, "dark"))])
+                Task::batch([
+                    self.workflow_step(driver, Step::Pixels(Picture::Theme, 0)),
+                    iced::advanced::widget::operate(GpuLayout::new(FeatureId::Train, "dark")),
+                ])
             }
             Step::Narrow => {
                 match annotation_layout_scale(driver.input_scale, model.window_width as f32, true) {
@@ -2979,7 +3119,10 @@ impl State {
                 if settled && (driver.input_scale - self.narrow_scale).abs() < 0.001 =>
             {
                 self.export_narrow = true;
-                Task::batch([self.workflow_step(driver, Step::Export), iced::advanced::widget::operate(GpuLayout::new(FeatureId::Train, "narrow"))])
+                Task::batch([
+                    self.workflow_step(driver, Step::Export),
+                    iced::advanced::widget::operate(GpuLayout::new(FeatureId::Train, "narrow")),
+                ])
             }
             Step::Pixels(picture, index) => {
                 self.caption_patches.clear();
@@ -3003,7 +3146,9 @@ impl State {
                                 // Measure the view only when its paired image has
                                 // the requested atlas/detail shape and overlay state.
                                 content.metadata.detail == (picture == Picture::Detail)
-                                    && (!self.restoration_pixels || content.metadata.frame.revision == self.restoration_revision)
+                                    && (!self.restoration_pixels
+                                        || content.metadata.frame.revision
+                                            == self.restoration_revision)
                                     && (picture != Picture::Confidence
                                         || (content.metadata.display.confidencethreshold
                                             == if index == 7 { 1.0 } else { 0.0 }
@@ -3155,10 +3300,22 @@ impl iced::advanced::widget::Operation<RootMessage> for ValidationLayout {
 }
 
 fn gpu_index(feature: FeatureId) -> usize {
-    match feature { FeatureId::Train => 0, FeatureId::Validate => 1, FeatureId::Predict => 2, FeatureId::Export => 3, _ => unreachable!() }
+    match feature {
+        FeatureId::Train => 0,
+        FeatureId::Validate => 1,
+        FeatureId::Predict => 2,
+        FeatureId::Export => 3,
+        _ => unreachable!(),
+    }
 }
 fn gpu_name(feature: FeatureId) -> &'static str {
-    match feature { FeatureId::Train => "train", FeatureId::Validate => "validate", FeatureId::Predict => "predict", FeatureId::Export => "export", _ => unreachable!() }
+    match feature {
+        FeatureId::Train => "train",
+        FeatureId::Validate => "validate",
+        FeatureId::Predict => "predict",
+        FeatureId::Export => "export",
+        _ => unreachable!(),
+    }
 }
 struct GpuLayout {
     feature: FeatureId,
@@ -3166,19 +3323,44 @@ struct GpuLayout {
     bounds: std::collections::BTreeMap<String, Rectangle>,
 }
 impl GpuLayout {
-    fn new(feature: FeatureId, stage: &'static str) -> Self { Self { feature, stage, bounds: Default::default() } }
+    fn new(feature: FeatureId, stage: &'static str) -> Self {
+        Self {
+            feature,
+            stage,
+            bounds: Default::default(),
+        }
+    }
 }
 impl iced::advanced::widget::Operation<RootMessage> for GpuLayout {
-    fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn iced::advanced::widget::Operation<RootMessage>)) { operate(self); }
+    fn traverse(
+        &mut self,
+        operate: &mut dyn FnMut(&mut dyn iced::advanced::widget::Operation<RootMessage>),
+    ) {
+        operate(self);
+    }
     fn container(&mut self, id: Option<&iced::advanced::widget::Id>, bounds: Rectangle) {
         for card in ["output", "gpu", "status"] {
             let control = format!("{}.card.{card}", gpu_name(self.feature));
-            if id == Some(&iced::advanced::widget::Id::from(control.clone())) { self.bounds.insert(control, bounds); }
+            if id == Some(&iced::advanced::widget::Id::from(control.clone())) {
+                self.bounds.insert(control, bounds);
+            }
         }
     }
     fn finish(&self) -> iced::advanced::widget::operation::Outcome<RootMessage> {
         for (control, bounds) in &self.bounds {
-            reporting::emit(|sink| sink.record("integration.workflow_gpu_layout", control, self.stage, [bounds.x as f64, bounds.y as f64, bounds.width as f64, bounds.height as f64]));
+            reporting::emit(|sink| {
+                sink.record(
+                    "integration.workflow_gpu_layout",
+                    control,
+                    self.stage,
+                    [
+                        bounds.x as f64,
+                        bounds.y as f64,
+                        bounds.width as f64,
+                        bounds.height as f64,
+                    ],
+                )
+            });
         }
         iced::advanced::widget::operation::Outcome::None
     }

@@ -66,4 +66,4 @@ void write_prediction_model(const std::filesystem::path& path, std::int64_t quer
  std::ofstream file(path, std::ios::binary);
  REQUIRE(model.SerializeToOstream(&file));
 }
-}
+}  // namespace mmltk::backend::models::rfdetr::test_support

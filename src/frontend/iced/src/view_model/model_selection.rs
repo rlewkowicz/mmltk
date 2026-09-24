@@ -315,30 +315,62 @@ mod tests {
     #[test]
     fn device_only_edits_reprepare_tensorrt_but_keep_weights_and_onnx() {
         let mut model = bootstrapped();
-        let mut settings = model.settings_snapshot.as_ref().unwrap().settingsstate.clone();
-        for dialog in crate::generated::MODEL_ARTIFACT_DIALOGS.iter().filter(|dialog| {
-            matches!(dialog.target.workflow, FeatureId::Validate | FeatureId::Predict)
-        }) {
-            write_field(&mut settings, dialog.key_fields.source,
-                SettingsFieldValue::ModelSelectionSource(ModelSelectionSource::Custom));
-            write_field(&mut settings, dialog.key_fields.input,
-                SettingsFieldValue::ModelArtifactInputKind(dialog.target.input));
-            write_field(&mut settings, dialog.stable_field_id,
-                SettingsFieldValue::String("/tmp/model".into()));
+        let mut settings = model
+            .settings_snapshot
+            .as_ref()
+            .unwrap()
+            .settingsstate
+            .clone();
+        for dialog in crate::generated::MODEL_ARTIFACT_DIALOGS
+            .iter()
+            .filter(|dialog| {
+                matches!(
+                    dialog.target.workflow,
+                    FeatureId::Validate | FeatureId::Predict
+                )
+            })
+        {
+            write_field(
+                &mut settings,
+                dialog.key_fields.source,
+                SettingsFieldValue::ModelSelectionSource(ModelSelectionSource::Custom),
+            );
+            write_field(
+                &mut settings,
+                dialog.key_fields.input,
+                SettingsFieldValue::ModelArtifactInputKind(dialog.target.input),
+            );
+            write_field(
+                &mut settings,
+                dialog.stable_field_id,
+                SettingsFieldValue::String("/tmp/model".into()),
+            );
             settings.workflows.validate.request.deviceid = 3;
             settings.workflows.predict.request.deviceid = 3;
-            model.model_snapshot = Some(accepted_model_for(&model, &settings, dialog.target.workflow));
+            model.model_snapshot = Some(accepted_model_for(
+                &model,
+                &settings,
+                dialog.target.workflow,
+            ));
             assert!(model.model_selection_matches(&settings, dialog.target.workflow));
             let key = model.model_snapshot.as_ref().unwrap().selection.key.clone();
             settings.workflows.validate.request.deviceid = 7;
             settings.workflows.predict.request.deviceid = 7;
-            assert_eq!(model.model_selection_matches(&settings, dialog.target.workflow),
-                dialog.target.input != ModelArtifactInputKind::TensorRt);
+            assert_eq!(
+                model.model_selection_matches(&settings, dialog.target.workflow),
+                dialog.target.input != ModelArtifactInputKind::TensorRt
+            );
             let expected = model_settings_projection(&settings, dialog.target.workflow).unwrap();
             assert_eq!(expected.selection.key, key);
-            assert_eq!(expected.selection.inspectiondevice,
-                (dialog.target.input == ModelArtifactInputKind::TensorRt).then_some(7));
-            model.model_snapshot = Some(accepted_model_for(&model, &settings, dialog.target.workflow));
+            assert_eq!(
+                expected.selection.inspectiondevice,
+                (dialog.target.input == ModelArtifactInputKind::TensorRt).then_some(7)
+            );
+            model.model_snapshot = Some(accepted_model_for(
+                &model,
+                &settings,
+                dialog.target.workflow,
+            ));
             assert!(model.model_selection_matches(&settings, dialog.target.workflow));
         }
     }

@@ -1381,7 +1381,6 @@ TEST_CASE("real unknown metadata bytes remain open ended through artifact projec
  server.Check();
 }
 }  // namespace mmltk::controller::subsystems::system
-
 namespace mmltk::controller::subsystems::system {
 TEST_CASE("Train process retains bounded late fatal causes independently of console output", "[gui][services]") {
  mmltk::testsupport::ScopedTempDir temp("mmltk-train-fatal");
@@ -1440,5 +1439,4 @@ TEST_CASE("Train process distinguishes fatal causes from warnings and generic pa
   CHECK(result.terminal.error.find("Reduce batch") == std::string::npos);
  }
 }
-
 }  // namespace mmltk::controller::subsystems::system

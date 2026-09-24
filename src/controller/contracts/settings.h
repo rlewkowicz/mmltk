@@ -18,7 +18,7 @@ struct ExploreSourceFact final {
  bool operator==(const ExploreSourceFact&) const = default;
 };
 struct SettingsUiState final {
- [[= mmltk::frameworks::reflection::MaxItems{mmltk::frameworks::gpu::kCudaDeviceCapacity}]] std::vector<mmltk::frameworks::gpu::CudaDeviceFact> cuda_devices;
+ [[= mmltk::frameworks::reflection::MaxItems{mmltk::frameworks::gpu::kCudaDeviceCapacity}]] std::vector<mmltk::frameworks::gpu::CudaDeviceFact> cuda_devices{};
  std::uint64_t revision = 0U;
  GuiSettingsState settings_state{};
  ExploreSourceFact explore_source{};

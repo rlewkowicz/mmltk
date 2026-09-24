@@ -523,7 +523,8 @@ std::shared_ptr<RfdetrRuntimeBackend> make_rfdetr_runtime_backend(const RfdetrRu
  static_cast<void>(validate_rfdetr_output_layout(info));
  output_roles = rfdetr_output_roles(info);
  auto layout = std::make_shared<const ResolvedClassLayout>(admission->Resolve(info.num_classes, embedded, options.stop));
- auto result = std::shared_ptr<RfdetrRuntimeBackend>(new RfdetrRuntimeBackend(std::move(lane), artifact.backend_name, resolution, options.maximum_detections, layout, output_roles, admission, options.retirement, options.registered_host_operations));
+ auto result = std::shared_ptr<RfdetrRuntimeBackend>(
+  new RfdetrRuntimeBackend(std::move(lane), artifact.backend_name, resolution, options.maximum_detections, layout, output_roles, admission, options.retirement, options.registered_host_operations));
  admission->RequireUnchanged(options.stop);
  if (publication) {
   publication->Publish(ModelClassDescriptor{1U, {}, layout->record(), output_roles}, [&] { return options.stop.stop_requested(); });

@@ -166,11 +166,12 @@ TEST_CASE("ModelSystem records the CUDA ordinal used to inspect TensorRT", "[con
  class Inspector final : public ModelRuntime {
  public:
   explicit Inspector(std::vector<int>& devices) : devices_(devices) {}
-  ModelArtifactAdmission Acquire(const contracts::ModelSelectionKey&, const std::filesystem::path& artifact, int device, std::stop_token,
-   const std::function<void(const contracts::ModelProgress&)>&) override {
+  ModelArtifactAdmission Acquire(
+   const contracts::ModelSelectionKey&, const std::filesystem::path& artifact, int device, std::stop_token, const std::function<void(const contracts::ModelProgress&)>&) override {
    devices_.push_back(device);
    return {.artifact = artifact.string()};
   }
+
  private:
   std::vector<int>& devices_;
  };
@@ -186,9 +187,10 @@ TEST_CASE("ModelSystem records the CUDA ordinal used to inspect TensorRT", "[con
  REQUIRE(settings.Load(location).applied());
  std::vector<int> devices;
  std::array<std::promise<contracts::ModelUiState>, 2> settled;
- ModelSystem model{settings, [&] { return std::make_unique<Inspector>(devices); }, [&](const ModelSystem::event_type& event) {
-  if (const auto* changed = std::get_if<ModelChanged>(&event); changed && !changed->snapshot.active) settled.at(changed->snapshot.generation - 1U).set_value(changed->snapshot);
- }};
+ ModelSystem model{settings, [&] { return std::make_unique<Inspector>(devices); },
+  [&](const ModelSystem::event_type& event) {
+   if (const auto* changed = std::get_if<ModelChanged>(&event); changed && !changed->snapshot.active) settled.at(changed->snapshot.generation - 1U).set_value(changed->snapshot);
+  }};
  contracts::ModelSelectionKey key;
  for (const int device : {3, 7}) {
   contracts::SettingsUpdateRequest edit;
@@ -198,8 +200,10 @@ TEST_CASE("ModelSystem records the CUDA ordinal used to inspect TensorRT", "[con
   const auto result = mmltk::testsupport::await_test_promise(settled[device == 3 ? 0U : 1U], "TensorRT inspection selection");
   REQUIRE(result.terminal.outcome == contracts::ModelSelectionOutcome::Accepted);
   CHECK(result.selection.inspection_device == device);
-  if (device == 3) key = result.selection.key;
-  else CHECK(result.selection.key == key);
+  if (device == 3)
+   key = result.selection.key;
+  else
+   CHECK(result.selection.key == key);
  }
  CHECK(devices == std::vector<int>{3, 7});
 }
@@ -222,7 +226,7 @@ TEST_CASE("TensorRT inspection is refused after only the selected GPU changes", 
    const auto admitted = selected_model(settings, workflow);
    const auto materializes = [&](const auto& model) {
     return workflow == contracts::FeatureId::Validate ? bool(subsystems::system::ComputeIntentMaterializer::Validation(settings, inspection, model))
-                                                     : bool(subsystems::system::ComputeIntentMaterializer::Predict(settings, {}, model));
+                                                      : bool(subsystems::system::ComputeIntentMaterializer::Predict(settings, {}, model));
    };
    REQUIRE(materializes(admitted));
    validate.request.device_id = predict.request.device_id = 7;

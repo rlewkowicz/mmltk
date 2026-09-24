@@ -452,10 +452,16 @@ std::optional<TrainProcessExit> TrainProcessClient::consume_exit(std::string* re
    exit.error += ": ";
    while (!cause.empty()) {
     const auto length = mmltk::common::types::utf8_prefix_length(cause);
-    if (length == 0U) { exit.error += '?'; cause.remove_prefix(1U); continue; }
+    if (length == 0U) {
+     exit.error += '?';
+     cause.remove_prefix(1U);
+     continue;
+    }
     const auto byte = static_cast<unsigned char>(cause.front());
-    if (length == 1U && (byte < 32U || byte == 127U)) exit.error += ' ';
-    else exit.error.append(cause.substr(0, length));
+    if (length == 1U && (byte < 32U || byte == 127U))
+     exit.error += ' ';
+    else
+     exit.error.append(cause.substr(0, length));
     cause.remove_prefix(length);
    }
    if (oom) exit.error += " Reduce batch size or training lanes to lower GPU memory use, then start again.";

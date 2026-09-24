@@ -134,7 +134,6 @@ private:
  c10::cuda::CUDAStream selected_;
  c10::cuda::CUDAStreamGuard guard_;
 };
-
 }  // namespace
 TEST_CASE("prediction delivers bounded ordered images masks and receiver-owned pixels", "[model][rfdetr][prediction][gpu]") {
  const auto root = std::filesystem::temp_directory_path() / ("prediction-delivery-" + std::to_string(::getpid()));
@@ -638,7 +637,10 @@ TEST_CASE("prediction close releases batch counts and readbacks while borrowed t
  const mmltk::testsupport::ScopedTempDir root("prediction-complete-close");
  write_prediction_model(root.path() / "rf-detr-nano.onnx");
  const auto image = root.path() / "sample.ppm";
- { std::ofstream file(image, std::ios::binary); file << "P6\n2 2\n255\n" << std::string(12, char{64}); }
+ {
+  std::ofstream file(image, std::ios::binary);
+  file << "P6\n2 2\n255\n" << std::string(12, char{64});
+ }
  const PredictionStream stream_scope{true};
  rfdetr::PredictRequest request;
  request.onnx_path = root.path() / "rf-detr-nano.onnx";
@@ -647,25 +649,34 @@ TEST_CASE("prediction close releases batch counts and readbacks while borrowed t
  request.resolution = 8;
  request.allow_fp16 = false;
  request.max_dets_per_image = 2;
- struct Fault { bool armed = false; unsigned calls = 0; int failure = 0; unsigned restores = 0; } fault{false, 0U, failure};
+ struct Fault {
+  bool armed = false;
+  unsigned calls = 0;
+  int failure = 0;
+  unsigned restores = 0;
+ } fault{false, 0U, failure};
  auto retirement = std::make_shared<gpu::TerminalCudaRetirementOwner>(20U);
  const gpu::PinnedHostBuffer::Operations operations{
   .context = {&fault, [](void*, CUcontext* value) noexcept { return cuCtxGetCurrent(value); },
    [](void* value, CUcontext context) noexcept {
-    auto& fault = *static_cast<Fault*>(value);
-    return fault.armed && fault.failure == 3 && ++fault.restores == 2U ? CUDA_ERROR_CONTEXT_IS_DESTROYED : cuCtxSetCurrent(context);
+    auto& state = *static_cast<Fault*>(value);
+    return state.armed && state.failure == 3 && ++state.restores == 2U ? CUDA_ERROR_CONTEXT_IS_DESTROYED : cuCtxSetCurrent(context);
    }},
-  .unregister = [](void* value, void* address) {
-   auto& fault = *static_cast<Fault*>(value);
-   if (fault.armed && (++fault.calls == static_cast<unsigned>(fault.failure) || fault.failure == 4)) return CUDA_ERROR_UNKNOWN;
-   return cuMemHostUnregister(address);
-  },
+  .unregister =
+   [](void* value, void* address) {
+    auto& state = *static_cast<Fault*>(value);
+    if (state.armed && (++state.calls == static_cast<unsigned>(state.failure) || state.failure == 4)) return CUDA_ERROR_UNKNOWN;
+    return cuMemHostUnregister(address);
+   },
  };
  rfdetr::PredictionSession session;
  std::shared_ptr<void> borrowed;
  const rfdetr::PredictionDelivery delivery{
   .source_pixels = true,
-  .completed = [&](const auto&, auto pixels, const auto&) { if (failure == 4) borrowed = pixels.custody; },
+  .completed =
+   [&](const auto&, auto pixels, const auto&) {
+    if (failure == 4) borrowed = pixels.custody;
+   },
   .retirement = retirement,
   .registered_host_operations = operations,
  };

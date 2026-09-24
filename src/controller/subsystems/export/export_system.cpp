@@ -21,18 +21,20 @@ class CudaExportRuntime::Impl final : public detail::CudaSessionRuntimeState<mml
 public:
  using CudaSessionRuntimeState::CudaSessionRuntimeState;
 };
-CudaExportRuntime::CudaExportRuntime(DirectComputeConfiguration configuration, services::RuntimeDiagnosticTarget diagnostics) : diagnostics_(std::move(diagnostics)), impl_(std::make_unique<Impl>(configuration)) {}
+CudaExportRuntime::CudaExportRuntime(DirectComputeConfiguration configuration, services::RuntimeDiagnosticTarget diagnostics)
+    : diagnostics_(std::move(diagnostics)), impl_(std::make_unique<Impl>(configuration)) {}
 CudaExportRuntime::~CudaExportRuntime() = default;
 void CudaExportRuntime::Close() { impl_->resources.Retire(); }
 bool CudaExportRuntime::HasUnsafeCustody() const noexcept { return impl_->resources.HasUnsafeCustody(); }
-contracts::ComputeTerminal CudaExportRuntime::Run(ExportRunRequest operation, std::stop_token stop, const ComputeProgressSink& progress, const ComputeArtifactSink& published, std::uint64_t generation) {
+contracts::ComputeTerminal CudaExportRuntime::Run(
+ ExportRunRequest operation, std::stop_token stop, const ComputeProgressSink& progress, const ComputeArtifactSink& published, std::uint64_t generation) {
  return impl_->resources.Run(
   [this, generation, stop, &progress, &published, operation = std::move(operation)](const mmltk::backend::ml::runtime::BorrowedCommandStream stream) mutable {
    if (operation.onnx.device_id != impl_->resources.device()) throw std::invalid_argument("export device disagrees with admitted execution");
-    diagnostics_.Emit([&] {
-     return services::RuntimeDiagnosticFact{.owner = contracts::DiagnosticOwner::Export, .event = "workflow.gpu_execution", .participant = "export",
-      .sequence = generation, .value = 0U, .detail = 1U, .device = impl_->resources.device()};
-    });
+   diagnostics_.Emit([&] {
+    return services::RuntimeDiagnosticFact{
+     .owner = contracts::DiagnosticOwner::Export, .event = "workflow.gpu_execution", .participant = "export", .sequence = generation, .value = 0U, .detail = 1U, .device = impl_->resources.device()};
+   });
    return execute_export_run(
     operation, stop, progress, published, [&](const auto& request, const auto& committed) { impl_->session.Run(request, stream, stop, committed); },
     [&](const auto& request, const auto& committed) { mmltk::backend::models::rfdetr::build_tensorrt_engine(request, stream, {}, stop, committed); });
@@ -41,8 +43,7 @@ contracts::ComputeTerminal CudaExportRuntime::Run(ExportRunRequest operation, st
 }
 class ExportSystem::Impl final {
 public:
- Impl(SettingsSystem& settings, DatasetSystem&, ModelSystem& model, ExportRuntimeFactory factory, SystemEventSink<ExportSystem::event_type> events,
-  DirectComputeResolver resolver)
+ Impl(SettingsSystem& settings, DatasetSystem&, ModelSystem& model, ExportRuntimeFactory factory, SystemEventSink<ExportSystem::event_type> events, DirectComputeResolver resolver)
      : settings_(settings), model_(model), factory_(std::move(factory)), events_(std::move(events)), resolver_(std::move(resolver)) {
   if (!factory_ || !resolver_) throw contracts::UnavailableError("compute runtime factory or placement resolver is unavailable");
   // CLEANUP-IGNORE: Export and validation have distinct admission and worker preparation after this common settings guard.
@@ -83,8 +84,9 @@ public:
        if (retirement_failed_) throw contracts::UnavailableError("compute CUDA retirement is unproved");
       }
       if (!runtime_) {
-       try { runtime_ = factory_(configuration); }
-       catch (...) {
+       try {
+        runtime_ = factory_(configuration);
+       } catch (...) {
         if (mmltk::frameworks::gpu::is_image_execution_failure(std::current_exception())) retirement_failed_ = true;
         throw;
        }
@@ -92,7 +94,10 @@ public:
       }
       if (!runtime_) throw std::runtime_error("compute runtime is unavailable");
       // CLEANUP-IGNORE: Export owns retirement and publication; LocalRun and run_checked_compute already share execution.
-      const auto generation = [this] { std::scoped_lock lock(mutex_); return state_.generation_frontier; }();
+      const auto generation = [this] {
+       std::scoped_lock lock(mutex_);
+       return state_.generation_frontier;
+      }();
       return runtime_->Run(std::move(*prepared), stop, progress, [this](const auto& path) { Artifact(path); }, generation);
      },
      [this](const contracts::ComputeProgress& progress) { Progress(progress); });
@@ -166,8 +171,7 @@ private:
  std::atomic_bool retirement_failed_ = false;
  direct::LocalRun run_;
 };
-ExportSystem::ExportSystem(SettingsSystem& settings, DatasetSystem& dataset, ModelSystem& model, ExportRuntimeFactory factory, SystemEventSink<event_type> events,
- DirectComputeResolver resolver)
+ExportSystem::ExportSystem(SettingsSystem& settings, DatasetSystem& dataset, ModelSystem& model, ExportRuntimeFactory factory, SystemEventSink<event_type> events, DirectComputeResolver resolver)
     : impl_(std::make_unique<Impl>(settings, dataset, model, std::move(factory), std::move(events), std::move(resolver))) {}
 ExportSystem::~ExportSystem() = default;
 contracts::ComputeUiState ExportSystem::Start(contracts::ExportWorkflowIntent) { return impl_->Start(); }

@@ -8,7 +8,7 @@
 #include "src/frameworks/gpu/device_execution.h"
 namespace mmltk::controller {
 struct DirectComputeConfiguration final {
- std::optional<mmltk::frameworks::gpu::DeviceExecution> execution;
+ std::optional<mmltk::frameworks::gpu::DeviceExecution> execution{};
  int numa_node = -1;
  bool operator==(const DirectComputeConfiguration&) const = default;
  [[nodiscard]] bool valid() const noexcept { return execution && execution->device >= 0 && execution->placement.numa_node >= 0 && !execution->placement.cpus.empty(); }
@@ -25,7 +25,9 @@ template <class Runtime, class Unsafe = decltype([] { return false; })>
 [[nodiscard]] bool retire_compute_runtime(std::unique_ptr<Runtime>& runtime, Unsafe unsafe = {}) noexcept {
  if (!runtime) return true;
  if (runtime->HasUnsafeCustody() || unsafe()) return false;
- try { runtime->Close(); } catch (...) { return false; }
+ try {
+  runtime->Close();
+ } catch (...) { return false; }
  if (runtime->HasUnsafeCustody() || unsafe()) return false;
  runtime.reset();
  return true;

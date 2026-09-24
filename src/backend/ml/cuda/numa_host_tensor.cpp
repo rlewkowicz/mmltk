@@ -3,9 +3,9 @@
 #include <cuda_runtime_api.h>
 #include "src/frameworks/gpu/device_execution.h"
 namespace mmltk::backend::ml::cuda {
-NumaHostTensor::NumaHostTensor(int device, std::shared_ptr<void> context_custody,
- std::shared_ptr<mmltk::frameworks::gpu::TerminalCudaRetirementOwner> retirement, mmltk::frameworks::gpu::PinnedHostBuffer::Operations operations)
- : retirement_(std::move(retirement)), operations_(operations), device_(device), context_custody_(std::move(context_custody)) {
+NumaHostTensor::NumaHostTensor(
+ int device, std::shared_ptr<void> context_custody, std::shared_ptr<mmltk::frameworks::gpu::TerminalCudaRetirementOwner> retirement, mmltk::frameworks::gpu::PinnedHostBuffer::Operations operations)
+    : retirement_(std::move(retirement)), operations_(operations), device_(device), context_custody_(std::move(context_custody)) {
  if (device_ < 0 && cudaGetDevice(&device_) != cudaSuccess) throw std::runtime_error("resolve NUMA host tensor device");
  c10::cuda::CUDAGuard guard(checked_device_index(device_));
  CUcontext context{};

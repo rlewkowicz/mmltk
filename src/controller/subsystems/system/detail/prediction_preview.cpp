@@ -232,8 +232,7 @@ std::shared_ptr<const PredictionPreviewFrame> PredictionPreviewPool::Capture(con
   checked(state.unsafe);
   auto scope = (*available)->ContextScope();
   scope.Run([&] {
-   if (source_execution)
-    state.candidate_source_context.emplace(operations_.source_context(*source_execution));
+   if (source_execution) state.candidate_source_context.emplace(operations_.source_context(*source_execution));
    slot_mutated = true;
    // A free slot has no CPU readers, but its previous source may still be
    // writing. Keep that source's custody and context through physical settlement.

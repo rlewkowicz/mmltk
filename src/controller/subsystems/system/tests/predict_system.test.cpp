@@ -114,13 +114,14 @@ TEST_CASE("Predict seals unsafe execution and close custody across repeated admi
  std::promise<void> failed;
  {
   PredictSystem prediction{settings, dataset, model, {.device = 0, .maximum_width = 64U, .maximum_height = 64U},
-   [&](DirectComputeConfiguration){
+   [&](DirectComputeConfiguration) {
     ++constructions;
     return std::make_unique<UnsafePredictRuntime>(on_close, custody, preview_terminal);
    },
    [&](PredictSystem::event_type event) {
     if (const auto* failure = std::get_if<PredictFailed>(&event); failure && !failure->snapshot.operation.active) mmltk::testsupport::release_test_promise(failed);
-   }, [](int, int) { return DirectComputeConfiguration{}; }};
+   },
+   [](int, int) { return DirectComputeConfiguration{}; }};
   static_cast<void>(prediction.Start({}));
   mmltk::testsupport::await_test_promise(failed, "unsafe Predict settlement");
   REQUIRE_FALSE(prediction.snapshot().operation.active);
@@ -143,6 +144,7 @@ TEST_CASE("Predict observes receiver retirement discovered while releasing a rep
    lease_ = mmltk::frameworks::gpu::ReserveTerminalCudaLease(*retirement_);
    return contracts::make_compute_terminal(contracts::ComputeOperationOutcome::Succeeded);
   }
+
  private:
   PreviewRetirement retirement_;
   mmltk::frameworks::gpu::TerminalCudaRetirementLease lease_;
@@ -154,13 +156,18 @@ TEST_CASE("Predict observes receiver retirement discovered while releasing a rep
  unsigned constructions = 0;
  std::array<std::promise<void>, 2> settled;
  PredictSystem prediction{settings, dataset, model, {.device = 0, .maximum_width = 64U, .maximum_height = 64U},
-  [&](DirectComputeConfiguration) { ++constructions; return std::make_unique<ReleasingRuntime>(); },
+  [&](DirectComputeConfiguration) {
+   ++constructions;
+   return std::make_unique<ReleasingRuntime>();
+  },
   [&](const PredictSystem::event_type& event) {
-   std::visit([&](const auto& value) {
-    if (!value.snapshot.operation.active && value.snapshot.operation.generation_frontier)
-     mmltk::testsupport::release_test_promise(settled.at(value.snapshot.operation.generation_frontier - 1U));
-   }, event);
-  }, [](int device, int numa) { return DirectComputeConfiguration{.numa_node = device + numa}; }};
+   std::visit(
+    [&](const auto& value) {
+     if (!value.snapshot.operation.active && value.snapshot.operation.generation_frontier) mmltk::testsupport::release_test_promise(settled.at(value.snapshot.operation.generation_frontier - 1U));
+    },
+    event);
+  },
+  [](int device, int numa) { return DirectComputeConfiguration{.numa_node = device + numa}; }};
  static_cast<void>(prediction.Start({}));
  mmltk::testsupport::await_test_promise(settled[0], "initial receiver run");
  REQUIRE(prediction.snapshot().operation.terminal.outcome == contracts::ComputeOperationOutcome::Succeeded);
@@ -192,10 +199,12 @@ TEST_CASE("Predict distinguishes ordinary from terminal runtime construction fai
   [&](PredictSystem::event_type event) {
    if (const auto* value = std::get_if<PredictFailed>(&event); value && !value->snapshot.operation.active)
     mmltk::testsupport::release_test_promise(failed.at(value->snapshot.operation.generation_frontier - 1U));
-  }, [](int, int) { return DirectComputeConfiguration{}; }};
+  },
+  [](int, int) { return DirectComputeConfiguration{}; }};
  static_cast<void>(prediction.Start({}));
  mmltk::testsupport::await_test_promise(failed[0], "prediction construction refusal");
- if (terminal) CHECK_THROWS_AS(prediction.Start({}), contracts::UnavailableError);
+ if (terminal)
+  CHECK_THROWS_AS(prediction.Start({}), contracts::UnavailableError);
  else {
   static_cast<void>(prediction.Start({}));
   mmltk::testsupport::await_test_promise(failed[1], "prediction ordinary construction retry");
@@ -212,7 +221,7 @@ TEST_CASE("prediction count inspection preserves source identity and revalidates
  std::atomic_size_t constructions = 0U;
  const auto path = (root / "train.bin").string();
  PredictSystem prediction{settings, dataset, model, {.device = 0, .maximum_width = 64U, .maximum_height = 64U},
-  [&](DirectComputeConfiguration){
+  [&](DirectComputeConfiguration) {
    ++constructions;
    return std::make_unique<UnsafePredictRuntime>(false, std::make_shared<int>(0));
   },
@@ -220,7 +229,8 @@ TEST_CASE("prediction count inspection preserves source identity and revalidates
    if (const auto* changed = std::get_if<PredictChanged>(&event); changed && changed->snapshot.inspection.path == path && !changed->snapshot.inspection.active)
     mmltk::testsupport::release_test_promise(inspected);
    if (const auto* failure = std::get_if<PredictFailed>(&event); failure && !failure->snapshot.operation.active) mmltk::testsupport::release_test_promise(failed);
-  }, [](int, int) { return DirectComputeConfiguration{}; }};
+  },
+  [](int, int) { return DirectComputeConfiguration{}; }};
  CHECK_THROWS_AS(prediction.Inspect({}), contracts::InvalidIntentError);
  static_cast<void>(prediction.Inspect({path}));
  mmltk::testsupport::await_test_promise(inspected, "prediction source inspection");
@@ -310,13 +320,14 @@ TEST_CASE("prediction application retains admitted outputs with independent medi
  fixture.PrepareModel(contracts::FeatureId::Predict);
  DatasetSystem dataset{settings, [] { return std::make_unique<OutputDatasetRuntime>(); }};
  std::promise<void> terminal;
- PredictSystem prediction{settings, dataset, model, {.device = 0, .maximum_width = 8U, .maximum_height = 8U}, [](DirectComputeConfiguration){ return std::make_unique<OutputPredictRuntime>(); },
+ PredictSystem prediction{settings, dataset, model, {.device = 0, .maximum_width = 8U, .maximum_height = 8U}, [](DirectComputeConfiguration) { return std::make_unique<OutputPredictRuntime>(); },
   [&](PredictSystem::event_type event) {
    if (const auto* changed = std::get_if<PredictChanged>(&event); changed && changed->snapshot.operation.terminal.outcome == contracts::ComputeOperationOutcome::Succeeded)
     mmltk::testsupport::release_test_promise(terminal);
    else if (std::holds_alternative<PredictFailed>(event))
     mmltk::testsupport::release_test_promise(terminal);
-  }, [](int, int) { return DirectComputeConfiguration{}; }};
+  },
+  [](int, int) { return DirectComputeConfiguration{}; }};
  contracts::PredictWorkflowIntent intent;
  intent.saving.compiled_enabled = saving;
  intent.saving.single_enabled = saving;
@@ -352,13 +363,14 @@ TEST_CASE("impossible compiled saving under inference limit fails before reserva
  std::promise<void> failed;
  std::atomic_size_t constructions = 0;
  PredictSystem prediction{settings, dataset, model, {.device = 0, .maximum_width = 64U, .maximum_height = 64U},
-  [&](DirectComputeConfiguration){
+  [&](DirectComputeConfiguration) {
    ++constructions;
    return std::make_unique<OutputPredictRuntime>();
   },
   [&](PredictSystem::event_type event) {
    if (std::holds_alternative<PredictFailed>(event)) mmltk::testsupport::release_test_promise(failed);
-  }, [](int, int) { return DirectComputeConfiguration{}; }};
+  },
+  [](int, int) { return DirectComputeConfiguration{}; }};
  static_cast<void>(prediction.Start({}));
  mmltk::testsupport::await_test_promise(failed, "prediction impossible saving count");
  CHECK(constructions == 0U);
@@ -428,7 +440,7 @@ TEST_CASE("late receiver custody seals Predict admission while optional visual f
  std::promise<void> first_frame, first_done, second_done, visual_failure, recovered;
  {
   PredictSystem prediction{settings, dataset, model, {.device = 0, .maximum_width = 64U, .maximum_height = 64U},
-   [&](DirectComputeConfiguration){
+   [&](DirectComputeConfiguration) {
     ++constructions;
     return std::make_unique<FakePredictRuntime>(PredictionScenario{.compute = {.gate = gate}, .receiver_fault = fault});
    },
@@ -443,7 +455,8 @@ TEST_CASE("late receiver custody seals Predict admission while optional visual f
      if (state.operation.generation_frontier == 3U && state.frame.revision > 1U) mmltk::testsupport::release_test_promise(recovered);
     }
     if (std::holds_alternative<PredictFailed>(event)) mmltk::testsupport::release_test_promise(visual_failure);
-   }, [](int, int) { return DirectComputeConfiguration{}; }};
+   },
+   [](int, int) { return DirectComputeConfiguration{}; }};
   const mmltk::testsupport::ScopedTestCleanup stop{[&] {
    fault->upload.Release();
    prediction.Shutdown();
@@ -495,11 +508,12 @@ TEST_CASE("prediction preview refusal preserves successful inference completion"
  std::promise<PredictSnapshot> completed;
  std::promise<PredictFailed> preview_failed;
  PredictSystem prediction{settings, dataset, model, {.device = 0, .maximum_width = 64U, .maximum_height = 64U},
-  [gate](DirectComputeConfiguration){ return std::make_unique<FakePredictRuntime>(PredictionScenario{.compute = {.gate = gate}, .refuse_preview = true}); },
+  [gate](DirectComputeConfiguration) { return std::make_unique<FakePredictRuntime>(PredictionScenario{.compute = {.gate = gate}, .refuse_preview = true}); },
   [&](PredictSystem::event_type event) {
    if (auto* failure = std::get_if<PredictFailed>(&event)) preview_failed.set_value(std::move(*failure));
    if (auto* changed = std::get_if<PredictChanged>(&event); changed && !changed->snapshot.operation.active) completed.set_value(std::move(changed->snapshot));
-  }, [](int, int) { return DirectComputeConfiguration{}; }};
+  },
+  [](int, int) { return DirectComputeConfiguration{}; }};
  static_cast<void>(prediction.Start({}));
  const auto failure = mmltk::testsupport::await_test_promise(preview_failed, "prediction preview refusal");
  CHECK(failure.snapshot.operation.terminal.outcome != contracts::ComputeOperationOutcome::Failed);
@@ -933,7 +947,7 @@ TEST_CASE("Predict replacement pressure coalesces without overwriting its select
  std::atomic_size_t published = 0U;
  std::atomic_uint64_t last_revision = 0U;
  PredictSystem prediction{settings, dataset, model, {.device = 0, .maximum_width = 64U, .maximum_height = 64U},
-  [&](DirectComputeConfiguration){ return std::make_unique<FakePredictRuntime>(PredictionScenario{.compute = {.gate = gate}, .source_index = source_index, .labels = 1U}); },
+  [&](DirectComputeConfiguration) { return std::make_unique<FakePredictRuntime>(PredictionScenario{.compute = {.gate = gate}, .source_index = source_index, .labels = 1U}); },
   [&](PredictSystem::event_type event) {
    if (const auto* changed = std::get_if<PredictChanged>(&event)) {
     const auto& snapshot = changed->snapshot;
@@ -945,7 +959,8 @@ TEST_CASE("Predict replacement pressure coalesces without overwriting its select
     }
    }
    if (std::holds_alternative<PredictFailed>(event)) mmltk::testsupport::release_test_promise(failed);
-  }, [](int, int) { return DirectComputeConfiguration{}; }};
+  },
+  [](int, int) { return DirectComputeConfiguration{}; }};
  const mmltk::testsupport::ScopedTestCleanup stop{[&] { prediction.Shutdown(); }};
  const auto run = [&](std::size_t index) {
   source_index->store(static_cast<std::int64_t>(index));
@@ -1053,7 +1068,6 @@ TEST_CASE("preview context construction publishes only after exact caller restor
 }
 }  // namespace
 }  // namespace mmltk::controller
-
 namespace mmltk::controller {
 TEST_CASE("preview source rebinding preserves borrowed frames through a failed replacement", "[controller][gpu]") {
  namespace gpu = mmltk::frameworks::gpu;
@@ -1084,7 +1098,7 @@ TEST_CASE("preview source rebinding preserves borrowed frames through a failed r
  const std::array<float, 12> green{0, 0, 0, 0, 1, 1, 1, 1, 0, 0, 0, 0};
  auto first = test_support::PredictionSource::Device(receiver_execution, {2U, 2U}, red, {}, classes);
  auto second = test_support::PredictionSource::Device(alternate, {2U, 2U}, green, {}, classes);
- const auto capture = [&](const auto& source, int device) {
+ const auto capture = [&](auto& source, int device) {
   return pool.Capture(source.pixels(), {2U, 2U}, 0U, {}, source.annotations(), classes, 1, nullptr, source.custody(), nullptr, nullptr, {}, true, device);
  };
  auto borrowed = capture(first, receiver_execution.device);
@@ -1132,4 +1146,4 @@ TEST_CASE("preview source rebinding preserves borrowed frames through a failed r
  CHECK(retry.get() == slot);
  CHECK(last_destination == allocation);
 }
-}
+}  // namespace mmltk::controller

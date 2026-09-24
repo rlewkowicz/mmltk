@@ -653,8 +653,8 @@ void WaylandSession::RunWorkflows() {
  CHECK(browser.validate_to_explore_pixels);
  const auto prediction_output_blocker = browser.prediction_output_blocker();
  if (logging && !prediction_output_blocker.empty() && browser.prediction_failure.record().is_null())
-  append_acceptance_record(acceptance_log, {{"event", "acceptance.prediction.incomplete"}, {"level", "error"}, {"detail", prediction_output_blocker},
-   {"media_disabled", browser.prediction_no_outputs}, {"saving_controls", browser.prediction_saving_controls}, {"saved_media", browser.prediction_outputs}});
+  append_acceptance_record(acceptance_log, {{"event", "acceptance.prediction.incomplete"}, {"level", "error"}, {"detail", prediction_output_blocker}, {"media_disabled", browser.prediction_no_outputs},
+                                            {"saving_controls", browser.prediction_saving_controls}, {"saved_media", browser.prediction_outputs}});
  INFO(prediction_output_blocker);
  CHECK(prediction_output_blocker.empty());
  INFO(browser.validation_progressive);

@@ -3,6 +3,7 @@
 #include <chrono>
 #include "src/test_support/filesystem_test_utils.hpp"
 #include "src/controller/subsystems/validate/validation_runtime.h"
+#include "src/controller/subsystems/validate/validation_system.h"
 #include "src/backend/models/rfdetr/core/tests/class_artifact_fixture.h"
 #include "src/backend/models/rfdetr/inference/prediction_delivery.h"
 #include "src/controller/subsystems/system/predict_system.h"
@@ -203,21 +204,24 @@ TEST_CASE("Compute policy denial precedes admission and CUDA construction", "[co
 }
 }  // namespace
 }  // namespace mmltk::controller
-
 namespace mmltk::controller {
 namespace {
 struct RuntimeRetirementProbe {
-  int current = 9;
-  unsigned created = 0, destroyed = 0, closed = 0, sessions_destroyed = 0, synchronized = 0;
-  bool restore_failure = false, construction_restore_failure = false, sync_failure = false, close_failure = false, destroy_failure = false;
- };
+ int current = 9;
+ unsigned created = 0, destroyed = 0, closed = 0, sessions_destroyed = 0, synchronized = 0;
+ bool restore_failure = false, construction_restore_failure = false, sync_failure = false, close_failure = false, destroy_failure = false;
+};
 struct RuntimeRetirementSession {
-  std::shared_ptr<RuntimeRetirementProbe> probe;
-  ~RuntimeRetirementSession() { ++probe->sessions_destroyed; }
- };
+ std::shared_ptr<RuntimeRetirementProbe> probe;
+ ~RuntimeRetirementSession() { ++probe->sessions_destroyed; }
+};
 detail::CudaRuntimeResources::Operations retirement_operations(const std::shared_ptr<RuntimeRetirementProbe>& probe) {
  return detail::CudaRuntimeResources::Operations{
-  .device = {probe.get(), [](void* value, int* device) noexcept { *device = static_cast<RuntimeRetirementProbe*>(value)->current; return cudaSuccess; },
+  .device = {probe.get(),
+   [](void* value, int* device) noexcept {
+    *device = static_cast<RuntimeRetirementProbe*>(value)->current;
+    return cudaSuccess;
+   },
    [](void* value, int device) noexcept {
     auto& state = *static_cast<RuntimeRetirementProbe*>(value);
     if (device == 9 && state.restore_failure) return cudaErrorUnknown;
@@ -225,20 +229,27 @@ detail::CudaRuntimeResources::Operations retirement_operations(const std::shared
     return cudaSuccess;
    }},
   .context = probe.get(),
-  .create = [](void* value, cudaStream_t* stream, unsigned) {
-   auto& state = *static_cast<RuntimeRetirementProbe*>(value);
-   ++state.created;
-   *stream = reinterpret_cast<cudaStream_t>(value);
-   if (state.construction_restore_failure) state.restore_failure = true;
-   return cudaSuccess;
-  },
-  .synchronize = [](void* value, cudaStream_t) { auto& state = *static_cast<RuntimeRetirementProbe*>(value); ++state.synchronized; return state.sync_failure ? cudaErrorUnknown : cudaSuccess; },
-  .destroy = [](void* value, cudaStream_t) {
-   auto& state = *static_cast<RuntimeRetirementProbe*>(value);
-   if (state.destroy_failure) return cudaErrorUnknown;
-   ++state.destroyed;
-   return cudaSuccess;
-  },
+  .create =
+   [](void* value, cudaStream_t* stream, unsigned) {
+    auto& state = *static_cast<RuntimeRetirementProbe*>(value);
+    ++state.created;
+    *stream = reinterpret_cast<cudaStream_t>(value);
+    if (state.construction_restore_failure) state.restore_failure = true;
+    return cudaSuccess;
+   },
+  .synchronize =
+   [](void* value, cudaStream_t) {
+    auto& state = *static_cast<RuntimeRetirementProbe*>(value);
+    ++state.synchronized;
+    return state.sync_failure ? cudaErrorUnknown : cudaSuccess;
+   },
+  .destroy =
+   [](void* value, cudaStream_t) {
+    auto& state = *static_cast<RuntimeRetirementProbe*>(value);
+    if (state.destroy_failure) return cudaErrorUnknown;
+    ++state.destroyed;
+    return cudaSuccess;
+   },
  };
 }
 TEST_CASE("direct CUDA resources preserve the exact session and stream on unproved settlement", "[controller][compute][custody]") {
@@ -279,7 +290,13 @@ TEST_CASE("direct CUDA resources preserve the exact session and stream on unprov
    CHECK(resources->Run([](auto) { return contracts::make_compute_terminal(contracts::ComputeOperationOutcome::Succeeded); }, {}).outcome == contracts::ComputeOperationOutcome::Succeeded);
    std::stop_source stopped;
    stopped.request_stop();
-   CHECK(resources->Run([](auto) -> contracts::ComputeTerminal { FAIL("cancelled work ran"); return {}; }, stopped.get_token()).outcome == contracts::ComputeOperationOutcome::Cancelled);
+   const auto cancelled = resources->Run(
+    [](auto) -> contracts::ComputeTerminal {
+     FAIL("cancelled work ran");
+     return {};
+    },
+    stopped.get_token());
+   CHECK(cancelled.outcome == contracts::ComputeOperationOutcome::Cancelled);
    resources->Retire();
    const auto synchronized = probe->synchronized;
    resources->Retire();
@@ -306,14 +323,19 @@ public:
  SelectedWorkflowRuntime(DirectComputeConfiguration configuration, std::vector<int>& runs, unsigned& closes, std::function<void()> before)
      : configuration_(std::move(configuration)), runs_(runs), closes_(closes), before_(std::move(before)) {}
  void Close() noexcept override { ++closes_; }
- ValidationRuntimeResult Run(mmltk::backend::models::rfdetr::ValidateRequest request, std::stop_token, const ComputeProgressSink&,
-  const mmltk::backend::models::rfdetr::ValidationDelivery&, std::uint64_t generation) override {
+ ValidationRuntimeResult Run(
+  mmltk::backend::models::rfdetr::ValidateRequest request, std::stop_token, const ComputeProgressSink&, const mmltk::backend::models::rfdetr::ValidationDelivery&, std::uint64_t generation) override {
   CHECK(request.compile_cuda_device_id == request.device_id);
   return {.terminal = Record(request.device_id, generation)};
  }
- contracts::ComputeTerminal Run(ExportRunRequest request, std::stop_token, const ComputeProgressSink&, const ComputeArtifactSink&, std::uint64_t generation) override { return Record(request.onnx.device_id, generation); }
+ contracts::ComputeTerminal Run(ExportRunRequest request, std::stop_token, const ComputeProgressSink&, const ComputeArtifactSink&, std::uint64_t generation) override {
+  return Record(request.onnx.device_id, generation);
+ }
  contracts::ComputeTerminal Run(mmltk::backend::models::rfdetr::PredictRequest request, std::stop_token, const ComputeProgressSink&, const ProductSink&, const PlaybackGate&, VisualExtent,
-  const ContextProvider&, const PreviewRetirement&, const ComputeArtifactSink&, const PredictionRunOutput&, std::uint64_t generation) override { return Record(request.device_id, generation); }
+  const ContextProvider&, const PreviewRetirement&, const ComputeArtifactSink&, const PredictionRunOutput&, std::uint64_t generation) override {
+  return Record(request.device_id, generation);
+ }
+
 private:
  contracts::ComputeTerminal Record(int device, std::uint64_t generation) {
   CHECK(generation == runs_.size() + 1U);
@@ -332,8 +354,13 @@ public:
  RetiringWorkflowRuntime(DirectComputeConfiguration configuration, std::vector<int>& runs, unsigned& closes, std::shared_ptr<RuntimeRetirementProbe> probe)
      : SelectedWorkflowRuntime(configuration, runs, closes, [] {}),
        resources_(configuration, [session = std::make_shared<RuntimeRetirementSession>(probe)] { ++session->probe->closed; }, retirement_operations(probe)) {}
- void Close() noexcept override { try { resources_.Retire(); } catch (...) {} }
+ void Close() noexcept override {
+  try {
+   resources_.Retire();
+  } catch (...) {}
+ }
  bool HasUnsafeCustody() const noexcept override { return resources_.HasUnsafeCustody(); }
+
 private:
  detail::CudaRuntimeResources resources_;
 };
@@ -359,13 +386,20 @@ TEST_CASE("workflow replacement observes complete stream retirement before anoth
  const auto observe = [&](const contracts::ComputeUiState& value) {
   if (!value.active && value.generation_frontier) terminals.at(value.generation_frontier - 1U).set_value(value);
  };
- ValidationSystem validation(settings, dataset, model, factory, [&](const ValidationSystem::event_type& event) {
-  if (const auto* changed = std::get_if<ValidationChanged>(&event)) observe(changed->snapshot.operation);
- }, resolver);
- ExportSystem exporter(settings, dataset, model, factory, [&](const ExportSystem::event_type& event) {
-  if (const auto* changed = std::get_if<ComputeChanged>(&event)) observe(changed->snapshot);
- }, resolver);
- PredictSystem prediction(settings, dataset, model, {.device = 0, .maximum_width = 64U, .maximum_height = 64U}, factory,
+ ValidationSystem validation(
+  settings, dataset, model, factory,
+  [&](const ValidationSystem::event_type& event) {
+   if (const auto* changed = std::get_if<ValidationChanged>(&event)) observe(changed->snapshot.operation);
+  },
+  resolver);
+ ExportSystem exporter(
+  settings, dataset, model, factory,
+  [&](const ExportSystem::event_type& event) {
+   if (const auto* changed = std::get_if<ComputeChanged>(&event)) observe(changed->snapshot);
+  },
+  resolver);
+ PredictSystem prediction(
+  settings, dataset, model, {.device = 0, .maximum_width = 64U, .maximum_height = 64U}, factory,
   [&](const PredictSystem::event_type& event) { std::visit([&](const auto& value) { observe(value.snapshot.operation); }, event); }, resolver);
  const auto start = [&] {
   switch (feature) {
@@ -380,8 +414,9 @@ TEST_CASE("workflow replacement observes complete stream retirement before anoth
  probe->restore_failure = restore;
  probe->destroy_failure = !restore;
  contracts::SettingsUpdateRequest edit;
- edit.updates.push_back({.path = feature == contracts::FeatureId::Validate ? "workflows.validate.request.device_id" :
-  feature == contracts::FeatureId::Predict ? "workflows.predict.request.device_id" : "workflows.export_state.device_id",
+ edit.updates.push_back({.path = feature == contracts::FeatureId::Validate  ? "workflows.validate.request.device_id"
+                                 : feature == contracts::FeatureId::Predict ? "workflows.predict.request.device_id"
+                                                                            : "workflows.export_state.device_id",
   .value = mmltk::frameworks::serialization::wire::FlatValue{std::int64_t{7}}});
  static_cast<void>(settings.Update(std::move(edit)));
  start();
@@ -407,7 +442,11 @@ TEST_CASE("workflow replacement observes production session registered-page reti
  namespace gpu = mmltk::frameworks::gpu;
  const auto feature = GENERATE(contracts::FeatureId::Validate, contracts::FeatureId::Predict);
  const int failure = GENERATE(1, 2, 3);
- struct Probe { int failure = 0; unsigned calls = 0, streams_destroyed = 0, restores = 0; bool armed = false; };
+ struct Probe {
+  int failure = 0;
+  unsigned calls = 0, streams_destroyed = 0, restores = 0;
+  bool armed = false;
+ };
  auto probe = std::make_shared<Probe>();
  probe->failure = failure;
  const mmltk::testsupport::ScopedTempDir root("workflow-session-retirement");
@@ -416,7 +455,10 @@ TEST_CASE("workflow replacement observes production session registered-page reti
  auto [settings, dataset, model] = fixture.systems();
  rfdetr::test_support::write_prediction_model(root.path() / "rf-detr-nano.onnx");
  const auto image = root.path() / "sample.ppm";
- { std::ofstream file(image, std::ios::binary); file << "P6\n2 2\n255\n" << std::string(12, char{64}); }
+ {
+  std::ofstream file(image, std::ios::binary);
+  file << "P6\n2 2\n255\n" << std::string(12, char{64});
+ }
  rfdetr::PredictRequest request;
  request.onnx_path = root.path() / "rf-detr-nano.onnx";
  request.source_kind = rfdetr::PredictSourceKind::ImageFiles;
@@ -427,23 +469,38 @@ TEST_CASE("workflow replacement observes production session registered-page reti
  class SessionRuntime final : public ValidationRuntime, public PredictRuntime {
  public:
   SessionRuntime(DirectComputeConfiguration configuration, std::shared_ptr<Probe> probe, rfdetr::PredictRequest request, std::shared_ptr<rfdetr::PredictionSession> session)
-   : session_(std::move(session)), probe_(std::move(probe)), request_(std::move(request)),
-     resources_(configuration, [session = session_, probe = probe_] {
-      static_cast<void>(probe);
-      if (session->Close() != mmltk::backend::ml::runtime::kRuntimeSuccess) throw std::runtime_error("production session close failed");
-     }, StreamOperations(probe_.get())) {}
-  void Close() noexcept override { try { resources_.Retire(); } catch (...) {} }
+      : session_(std::move(session)),
+        probe_(std::move(probe)),
+        request_(std::move(request)),
+        resources_(
+         configuration,
+         [session = session_, probe = probe_] {
+          static_cast<void>(probe);
+          if (session->Close() != mmltk::backend::ml::runtime::kRuntimeSuccess) throw std::runtime_error("production session close failed");
+         },
+         StreamOperations(probe_.get())) {}
+  void Close() noexcept override {
+   try {
+    resources_.Retire();
+   } catch (...) {}
+  }
   bool HasUnsafeCustody() const noexcept override { return resources_.HasUnsafeCustody() || session_->HasUnsafeCustody(); }
   ValidationRuntimeResult Run(rfdetr::ValidateRequest, std::stop_token, const ComputeProgressSink&, const rfdetr::ValidationDelivery& delivery, std::uint64_t) override {
    return {.terminal = Execute(delivery.retirement)};
   }
-  contracts::ComputeTerminal Run(rfdetr::PredictRequest, std::stop_token, const ComputeProgressSink&, const ProductSink&, const PlaybackGate&, VisualExtent,
-   const ContextProvider&, const PreviewRetirement& retirement, const ComputeArtifactSink&, const PredictionRunOutput&, std::uint64_t) override { return Execute(retirement); }
+  contracts::ComputeTerminal Run(rfdetr::PredictRequest, std::stop_token, const ComputeProgressSink&, const ProductSink&, const PlaybackGate&, VisualExtent, const ContextProvider&,
+   const PreviewRetirement& retirement, const ComputeArtifactSink&, const PredictionRunOutput&, std::uint64_t) override {
+   return Execute(retirement);
+  }
+
  private:
   static detail::CudaRuntimeResources::Operations StreamOperations(Probe* probe) {
    detail::CudaRuntimeResources::Operations operations;
    operations.context = probe;
-   operations.destroy = [](void* value, cudaStream_t stream) { ++static_cast<Probe*>(value)->streams_destroyed; return cudaStreamDestroy(stream); };
+   operations.destroy = [](void* value, cudaStream_t stream) {
+    ++static_cast<Probe*>(value)->streams_destroyed;
+    return cudaStreamDestroy(stream);
+   };
    return operations;
   }
   contracts::ComputeTerminal Execute(const PredictRuntime::PreviewRetirement& retirement) {
@@ -453,16 +510,19 @@ TEST_CASE("workflow replacement observes production session registered-page reti
       auto& probe = *static_cast<Probe*>(value);
       return probe.armed && probe.failure == 3 && ++probe.restores == 2U ? CUDA_ERROR_CONTEXT_IS_DESTROYED : cuCtxSetCurrent(context);
      }},
-    .unregister = [](void* value, void* address) {
-     auto& probe = *static_cast<Probe*>(value);
-     if (probe.armed && ++probe.calls == static_cast<unsigned>(probe.failure)) return CUDA_ERROR_UNKNOWN;
-     return cuMemHostUnregister(address);
-    },
+    .unregister =
+     [](void* value, void* address) {
+      auto& probe = *static_cast<Probe*>(value);
+      if (probe.armed && ++probe.calls == static_cast<unsigned>(probe.failure)) return CUDA_ERROR_UNKNOWN;
+      return cuMemHostUnregister(address);
+     },
    };
-   return resources_.Run([&](auto stream) {
-    const auto result = session_->Run(request_, stream, {.retirement = retirement, .registered_host_operations = operations});
-    return contracts::make_compute_terminal(contracts::ComputeOperationOutcome::Succeeded, 0U, result.processed_images);
-   }, {});
+   return resources_.Run(
+    [&](auto stream) {
+     const auto result = session_->Run(request_, stream, {.retirement = retirement, .registered_host_operations = operations});
+     return contracts::make_compute_terminal(contracts::ComputeOperationOutcome::Succeeded, 0U, result.processed_images);
+    },
+    {});
   }
   std::shared_ptr<rfdetr::PredictionSession> session_;
   std::shared_ptr<Probe> probe_;
@@ -485,14 +545,20 @@ TEST_CASE("workflow replacement observes production session registered-page reti
  const auto observe = [&](const contracts::ComputeUiState& value) {
   if (!value.active && value.generation_frontier) settled.at(value.generation_frontier - 1U).set_value(value);
  };
- ValidationSystem validation(settings, dataset, model, factory, [&](const ValidationSystem::event_type& event) {
-  if (const auto* value = std::get_if<ValidationChanged>(&event)) observe(value->snapshot.operation);
- }, resolver);
- PredictSystem prediction(settings, dataset, model, {.device = 0, .maximum_width = 64U, .maximum_height = 64U}, factory,
+ ValidationSystem validation(
+  settings, dataset, model, factory,
+  [&](const ValidationSystem::event_type& event) {
+   if (const auto* value = std::get_if<ValidationChanged>(&event)) observe(value->snapshot.operation);
+  },
+  resolver);
+ PredictSystem prediction(
+  settings, dataset, model, {.device = 0, .maximum_width = 64U, .maximum_height = 64U}, factory,
   [&](const PredictSystem::event_type& event) { std::visit([&](const auto& value) { observe(value.snapshot.operation); }, event); }, resolver);
  const auto start = [&] {
-  if (feature == contracts::FeatureId::Validate) static_cast<void>(validation.Start({}));
-  else static_cast<void>(prediction.Start({}));
+  if (feature == contracts::FeatureId::Validate)
+   static_cast<void>(validation.Start({}));
+  else
+   static_cast<void>(prediction.Start({}));
  };
  start();
  REQUIRE(mmltk::testsupport::await_test_promise(settled[0], "production session run").terminal.outcome == contracts::ComputeOperationOutcome::Succeeded);
@@ -521,13 +587,21 @@ TEST_CASE("Validate and Export seal replacement retry and shutdown after unsafe 
   UnsafeRuntime(std::shared_ptr<unsigned> count, bool fail) : destroyed(std::move(count)), fail_run(fail) {}
   ~UnsafeRuntime() override { ++*destroyed; }
   bool HasUnsafeCustody() const noexcept override { return unsafe; }
-  void Close() override { unsafe = true; throw std::runtime_error("injected unproved close"); }
+  void Close() override {
+   unsafe = true;
+   throw std::runtime_error("injected unproved close");
+  }
   contracts::ComputeTerminal Result() {
-   if (fail_run) { unsafe = true; throw std::runtime_error("injected unproved run"); }
+   if (fail_run) {
+    unsafe = true;
+    throw std::runtime_error("injected unproved run");
+   }
    return contracts::make_compute_terminal(contracts::ComputeOperationOutcome::Succeeded);
   }
-  ValidationRuntimeResult Run(mmltk::backend::models::rfdetr::ValidateRequest, std::stop_token, const ComputeProgressSink&,
-   const mmltk::backend::models::rfdetr::ValidationDelivery&, std::uint64_t) override { return {.terminal = Result()}; }
+  ValidationRuntimeResult Run(
+   mmltk::backend::models::rfdetr::ValidateRequest, std::stop_token, const ComputeProgressSink&, const mmltk::backend::models::rfdetr::ValidationDelivery&, std::uint64_t) override {
+   return {.terminal = Result()};
+  }
   contracts::ComputeTerminal Run(ExportRunRequest, std::stop_token, const ComputeProgressSink&, const ComputeArtifactSink&, std::uint64_t) override { return Result(); }
  };
  const auto feature = GENERATE(contracts::FeatureId::Validate, contracts::FeatureId::Export);
@@ -556,15 +630,23 @@ TEST_CASE("Validate and Export seal replacement retry and shutdown after unsafe 
  const auto observe = [&](const contracts::ComputeUiState& value) {
   if (!value.active) terminal.at(value.generation_frontier - 1U).set_value(value);
  };
- ValidationSystem validation(settings, dataset, model, factory, [&](const ValidationSystem::event_type& event) {
-  if (const auto* changed = std::get_if<ValidationChanged>(&event)) observe(changed->snapshot.operation);
- }, resolver);
- ExportSystem exporter(settings, dataset, model, factory, [&](const ExportSystem::event_type& event) {
-  if (const auto* changed = std::get_if<ComputeChanged>(&event)) observe(changed->snapshot);
- }, resolver);
+ ValidationSystem validation(
+  settings, dataset, model, factory,
+  [&](const ValidationSystem::event_type& event) {
+   if (const auto* changed = std::get_if<ValidationChanged>(&event)) observe(changed->snapshot.operation);
+  },
+  resolver);
+ ExportSystem exporter(
+  settings, dataset, model, factory,
+  [&](const ExportSystem::event_type& event) {
+   if (const auto* changed = std::get_if<ComputeChanged>(&event)) observe(changed->snapshot);
+  },
+  resolver);
  const auto start = [&] {
-  if (feature == contracts::FeatureId::Validate) static_cast<void>(validation.Start({}));
-  else static_cast<void>(exporter.Start({}));
+  if (feature == contracts::FeatureId::Validate)
+   static_cast<void>(validation.Start({}));
+  else
+   static_cast<void>(exporter.Start({}));
  };
  start();
  auto result = mmltk::testsupport::await_test_promise(terminal[0], "unsafe compute first run");
@@ -636,16 +718,28 @@ TEST_CASE("workflow factories receive captured nonzero GPUs and reuse only compl
   settled = operation.generation_frontier;
   condition.notify_all();
  };
- ValidationSystem validation(settings, dataset, model, factory,
-  [&](const auto& event) { std::visit([&](const auto& value) {
-   if constexpr (std::same_as<std::remove_cvref_t<decltype(value)>, ValidationProgress>) terminal(value.operation);
-   else terminal(value.snapshot.operation);
-  }, event); }, resolver);
- ExportSystem exporter(settings, dataset, model, factory,
-  [&](const auto& event) { std::visit([&](const auto& value) { terminal(value.snapshot); }, event); }, resolver);
- PredictSystem prediction(settings, dataset, model, {.device = 0, .maximum_width = 8U, .maximum_height = 8U}, factory,
+ ValidationSystem validation(
+  settings, dataset, model, factory,
+  [&](const auto& event) {
+   std::visit(
+    [&](const auto& value) {
+     if constexpr (std::same_as<std::remove_cvref_t<decltype(value)>, ValidationProgress>)
+      terminal(value.operation);
+     else
+      terminal(value.snapshot.operation);
+    },
+    event);
+  },
+  resolver);
+ ExportSystem exporter(settings, dataset, model, factory, [&](const auto& event) { std::visit([&](const auto& value) { terminal(value.snapshot); }, event); }, resolver);
+ PredictSystem prediction(
+  settings, dataset, model, {.device = 0, .maximum_width = 8U, .maximum_height = 8U}, factory,
   [&](const auto& event) { std::visit([&](const auto& value) { terminal(value.snapshot.operation); }, event); }, resolver);
- mmltk::testsupport::ScopedTestCleanup unblock([&] { try { release.set_value(); } catch (const std::future_error&) {} });
+ mmltk::testsupport::ScopedTestCleanup unblock([&] {
+  try {
+   release.set_value();
+  } catch (const std::future_error&) {}
+ });
  const auto start = [&] {
   switch (feature) {
    case contracts::FeatureId::Validate: static_cast<void>(validation.Start({})); break;
@@ -654,7 +748,9 @@ TEST_CASE("workflow factories receive captured nonzero GPUs and reuse only compl
    default: throw std::logic_error("unexpected workflow");
   }
  };
- const auto path = feature == contracts::FeatureId::Validate ? "workflows.validate.request.device_id" : feature == contracts::FeatureId::Predict ? "workflows.predict.request.device_id" : "workflows.export_state.device_id";
+ const auto path = feature == contracts::FeatureId::Validate  ? "workflows.validate.request.device_id"
+                   : feature == contracts::FeatureId::Predict ? "workflows.predict.request.device_id"
+                                                              : "workflows.export_state.device_id";
  for (const auto device : {7, 7, 3}) {
   const auto expected = settled + 1;
   contracts::SettingsUpdateRequest edit;
@@ -697,5 +793,5 @@ TEST_CASE("workflow factories receive captured nonzero GPUs and reuse only compl
  exporter.Shutdown();
  validation.Shutdown();
 }
-}
-}
+}  // namespace
+}  // namespace mmltk::controller

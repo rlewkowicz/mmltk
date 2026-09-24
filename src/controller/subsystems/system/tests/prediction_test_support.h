@@ -168,7 +168,8 @@ private:
 class FakeNonvisualComputeRuntime final : public ValidationRuntime, public ExportRuntime {
 public:
  explicit FakeNonvisualComputeRuntime(ComputeScenario scenario) : sequence_(std::move(scenario)) {}
- ValidationRuntimeResult Run(mmltk::backend::models::rfdetr::ValidateRequest, std::stop_token, const ComputeProgressSink&, const mmltk::backend::models::rfdetr::ValidationDelivery&, std::uint64_t = 0) override;
+ ValidationRuntimeResult Run(
+  mmltk::backend::models::rfdetr::ValidateRequest, std::stop_token, const ComputeProgressSink&, const mmltk::backend::models::rfdetr::ValidationDelivery&, std::uint64_t = 0) override;
  contracts::ComputeTerminal Run(ExportRunRequest, std::stop_token, const ComputeProgressSink&, const ComputeArtifactSink& = {}, std::uint64_t = 0) override;
 
 private:

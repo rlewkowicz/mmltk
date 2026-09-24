@@ -2699,8 +2699,7 @@ TEST_CASE("validation saved output audit requires six exact published sample ide
   audit.validation_saved_samples.push_back({{"a", 4U}, {"b", index}, {"c", 6U}, {"control", "output/validate/run-0001/samples"}, {"detail", "sample-" + std::to_string(index) + ".png"}});
  audit.consume({{"event", "integration.validation_progressive"}, {"detail", "opened"}, {"control", "4:2"}, {"a", 4U}, {"b", 1U}, {"c", 1U}, {"d", 7U}});
  audit.consume({{"event", "integration.validation_progressive"}, {"detail", "closed"}, {"a", 4U}, {"b", 6U}, {"c", 0U}, {"d", 8U}});
- for (unsigned index = 0U; index < 6U; ++index)
-  audit.consume({{"event", "integration.validation_restored_tile"}, {"a", 4U}, {"b", index}, {"c", 20U}, {"d", 20U}});
+ for (unsigned index = 0U; index < 6U; ++index) audit.consume({{"event", "integration.validation_restored_tile"}, {"a", 4U}, {"b", index}, {"c", 20U}, {"d", 20U}});
  REQUIRE(audit.validation_samples_complete());
  SECTION("duplicate saved identity") { audit.validation_saved_samples.back()["b"] = 2U; }
  SECTION("detail opened with no later sample") { audit.validation_progressive.front()["b"] = 6U; }
@@ -2748,7 +2747,6 @@ TEST_CASE("prediction output evidence decodes real files and rejects suffix-only
  CHECK_FALSE(audit.prediction_outputs[1]);
 }
 }  // namespace mmltk::acceptance::wayland
-
 TEST_CASE("workflow GPU evidence requires ordered cards and selected native runs", "[workspace][audit][gpu]") {
  mmltk::acceptance::wayland::BrowserAudit audit;
  for (const std::string name : {"train", "validate", "predict", "export"}) {
@@ -2756,7 +2754,10 @@ TEST_CASE("workflow GPU evidence requires ordered cards and selected native runs
   audit.workflow_gpu_operations[name].insert(1U);
   audit.consume({{"event", "integration.workflow.operation_admitted"}, {"control", name}, {"a", 1U}});
   audit.consume_native_gpu({{"event", "workflow.gpu_execution"}, {"participant", name},
-   {"owner", name == "train" ? "training" : name == "validate" ? "validation" : name == "predict" ? "prediction" : "export"},
+   {"owner", name == "train"      ? "training"
+             : name == "validate" ? "validation"
+              : name == "predict" ? "prediction"
+                                  : "export"},
    {"sequence", 1U}, {"value", 0U}, {"detail", 1U}, {"device", 1}});
   for (const std::string stage : {"light", "dark", "narrow"}) {
    audit.workflow_gpu_layout[{stage, name + ".card.output"}] = {100, 100, 200, 70};
@@ -2786,11 +2787,16 @@ TEST_CASE("workflow GPU evidence requires ordered cards and selected native runs
   audit.workflow_gpu_runs.erase({"export", 1U});
   audit.consume({{"event", "integration.workflow_gpu_run"}, {"control", "export"}, {"a", 1}, {"b", 1}, {"c", 1}, {"d", 1}});
  }
- SECTION("duplicate native rank") { audit.consume_native_gpu({{"event", "workflow.gpu_execution"}, {"participant", "train"}, {"owner", "training"}, {"sequence", 1U}, {"value", 0U}, {"detail", 1U}, {"device", 1}}); }
+ SECTION("duplicate native rank") {
+  audit.consume_native_gpu({{"event", "workflow.gpu_execution"}, {"participant", "train"}, {"owner", "training"}, {"sequence", 1U}, {"value", 0U}, {"detail", 1U}, {"device", 1}});
+ }
  SECTION("missing native rank") { audit.workflow_gpu_runs[{"train", 1U}] = {1, -1}; }
  SECTION("card above output") { audit.workflow_gpu_layout[{"light", "validate.card.gpu"}][1] = 0; }
  SECTION("status before GPU") { audit.workflow_gpu_layout[{"light", "train.card.status"}][1] = 100; }
  SECTION("narrow missing") { audit.workflow_gpu_layout.erase({"narrow", "train.card.gpu"}); }
- SECTION("multi GPU falls back to zero") { audit.workflow_gpu_selected["export"][0] = audit.workflow_gpu_runs[{"export", 1U}][0] = 0; }
+ SECTION("multi GPU falls back to zero") {
+  audit.workflow_gpu_selected["export"][0] = 0;
+  audit.workflow_gpu_runs[{"export", 1U}][0] = 0;
+ }
  CHECK_FALSE(audit.workflow_gpus_complete());
 }

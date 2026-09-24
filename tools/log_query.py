@@ -644,6 +644,8 @@ class Record:
                 return True
             if self.get("@level") in ("error", "critical", "fatal", "panic"):
                 return True
+            if self.format == "transcript" and self.get("@event") in ("build.progress", "build.source"):
+                return False
             # Pixel error=0, failed=false, and similar numeric metrics are not failures.
             values = (self.get("@event"), value_from(self.data, "message", "fields.message", "detail", "error"))
             return any(isinstance(value, str) and FAILURE_WORD.search(value) for value in values)
@@ -753,6 +755,10 @@ def transcript_data(text):
         return {"event": "build.image", "owner": "build", "message": text}
     if text.startswith(("FAILED:", "ERROR: failed to build", "ninja: build stopped")):
         return {"event": "build.failed", "owner": "build", "level": "error", "message": text}
+    if re.match(r"\[\d+/\d+\] (?:Building|Linking|Generating|Scanning|Re-checking)\b", text):
+        return {"event": "build.progress", "owner": "build", "message": text}
+    if re.match(r"\s*\d+\s*\|", text):
+        return {"event": "build.source", "owner": "build", "message": text}
     return None
 
 

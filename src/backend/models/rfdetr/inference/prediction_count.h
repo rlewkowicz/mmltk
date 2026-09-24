@@ -10,14 +10,14 @@ namespace mmltk::backend::models::rfdetr {
 // batch, including its source tensors, until their final borrower settles.
 class PredictionCountStorage final : public std::enable_shared_from_this<PredictionCountStorage> {
 public:
- PredictionCountStorage(int device, std::size_t capacity,
-  std::shared_ptr<mmltk::frameworks::gpu::TerminalCudaRetirementOwner> = {}, mmltk::frameworks::gpu::PinnedHostBuffer::Operations = {});
+ PredictionCountStorage(int device, std::size_t capacity, std::shared_ptr<mmltk::frameworks::gpu::TerminalCudaRetirementOwner> = {}, mmltk::frameworks::gpu::PinnedHostBuffer::Operations = {});
  PredictionCountStorage(const PredictionCountStorage&) = delete;
  PredictionCountStorage& operator=(const PredictionCountStorage&) = delete;
- static void Prepare(std::shared_ptr<PredictionCountStorage>&, std::size_t count, int device,
-  std::shared_ptr<mmltk::frameworks::gpu::TerminalCudaRetirementOwner> = {}, mmltk::frameworks::gpu::PinnedHostBuffer::Operations = {});
+ static void Prepare(std::shared_ptr<PredictionCountStorage>&, std::size_t count, int device, std::shared_ptr<mmltk::frameworks::gpu::TerminalCudaRetirementOwner> = {},
+  mmltk::frameworks::gpu::PinnedHostBuffer::Operations = {});
  void Publish(std::size_t index, const torch::Tensor&, mmltk::backend::ml::runtime::AnalysisAnnotationStorage&);
  [[nodiscard]] CUresult ReleaseSettled() noexcept;
+
 private:
  mmltk::backend::ml::cuda::NumaHostTensor storage_;
  torch::Tensor host_;

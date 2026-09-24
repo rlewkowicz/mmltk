@@ -65,21 +65,31 @@ TEST_CASE("registered pages report explicit and final-borrower retirement throug
  namespace gpu = mmltk::frameworks::gpu;
  gpu::test_support::IsolatedTestDevice device;
  device.context.Bind();
- struct Fault { bool armed = false; int failure = 0; unsigned unregisters = 0, synchronizations = 0, restores = 0; } fault;
+ struct Fault {
+  bool armed = false;
+  int failure = 0;
+  unsigned unregisters = 0, synchronizations = 0, restores = 0;
+ } fault;
  fault.failure = GENERATE(0, 1, 2, 3);
  auto authority = std::make_shared<gpu::TerminalCudaRetirementOwner>(3U);
  const gpu::PinnedHostBuffer::Operations operations{
   .context = {&fault, [](void*, CUcontext* current) noexcept { return cuCtxGetCurrent(current); },
    [](void* value, CUcontext current) noexcept {
-    auto& fault = *static_cast<Fault*>(value);
-    return fault.armed && fault.failure == 3 && ++fault.restores == 2U ? CUDA_ERROR_CONTEXT_IS_DESTROYED : cuCtxSetCurrent(current);
+    auto& state = *static_cast<Fault*>(value);
+    return state.armed && state.failure == 3 && ++state.restores == 2U ? CUDA_ERROR_CONTEXT_IS_DESTROYED : cuCtxSetCurrent(current);
    }},
-  .synchronize = [](void* value) { auto& fault = *static_cast<Fault*>(value); ++fault.synchronizations; return fault.armed && fault.failure == 1 ? CUDA_ERROR_UNKNOWN : cuCtxSynchronize(); },
-  .unregister = [](void* value, void* address) {
-   auto& fault = *static_cast<Fault*>(value);
-   ++fault.unregisters;
-   return fault.armed && fault.failure == 2 ? CUDA_ERROR_UNKNOWN : cuMemHostUnregister(address);
-  },
+  .synchronize =
+   [](void* value) {
+    auto& state = *static_cast<Fault*>(value);
+    ++state.synchronizations;
+    return state.armed && state.failure == 1 ? CUDA_ERROR_UNKNOWN : cuCtxSynchronize();
+   },
+  .unregister =
+   [](void* value, void* address) {
+    auto& state = *static_cast<Fault*>(value);
+    ++state.unregisters;
+    return state.armed && state.failure == 2 ? CUDA_ERROR_UNKNOWN : cuMemHostUnregister(address);
+   },
  };
  CUcontext context{};
  REQUIRE(cuCtxGetCurrent(&context) == CUDA_SUCCESS);

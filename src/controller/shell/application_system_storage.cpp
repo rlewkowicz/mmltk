@@ -46,11 +46,13 @@ ApplicationSystemStorage::ApplicationSystemStorage(ApplicationSystemConfiguratio
  const auto source_changed = [this](const PresentationSourceIdentity source) {
   if (auto* presentation = presentation_notifications_.load(std::memory_order_acquire)) presentation->SourceChanged(source);
  };
- settings_ = std::make_unique<SettingsSystem>([this, publisher = browser::ApplicationEventPublisher<&ApplicationSystems::settings>(events_, continuity_)](SettingsSystem::event_type event) noexcept {
-  publisher(event);
-  if (explore_) explore_->ExecutionSettingsChanged();
-  if (validation_) validation_->DisplaySettingsChanged();
- }, mmltk::frameworks::gpu::discover_cuda_devices());
+ settings_ = std::make_unique<SettingsSystem>(
+  [this, publisher = browser::ApplicationEventPublisher<&ApplicationSystems::settings>(events_, continuity_)](SettingsSystem::event_type event) noexcept {
+   publisher(event);
+   if (explore_) explore_->ExecutionSettingsChanged();
+   if (validation_) validation_->DisplaySettingsChanged();
+  },
+  mmltk::frameworks::gpu::discover_cuda_devices());
  const auto initial_settings = settings_->Load(configuration.settings_location, configuration.h2d_dataloader);
  if (!initial_settings.applied()) throw std::runtime_error(initial_settings.detail.empty() ? "initial settings load was not applied" : initial_settings.detail);
  file_dialog_ = std::make_unique<FileDialogSystem>([client = configuration.file_dialog, settings = settings_.get()] { return std::make_unique<NativeFileDialogRuntime>(client, *settings); },
@@ -83,10 +85,11 @@ ApplicationSystemStorage::ApplicationSystemStorage(ApplicationSystemConfiguratio
   *settings_, *dataset_, *model_, [diagnostics = configuration.runtime_diagnostics](DirectComputeConfiguration selected) { return std::make_unique<CudaValidationRuntime>(selected, diagnostics); },
   browser::ApplicationEventPublisher<&ApplicationSystems::validation>(events_, continuity_, source_changed), resolve_compute_configuration, configuration.base_visual);
  export_ = std::make_unique<ExportSystem>(
-  *settings_, *dataset_, *model_, [diagnostics = configuration.runtime_diagnostics](DirectComputeConfiguration selected) { return std::make_unique<CudaExportRuntime>(selected, diagnostics); }, browser::ApplicationEventPublisher<&ApplicationSystems::export_system>(events_, continuity_),
-  resolve_compute_configuration);
+  *settings_, *dataset_, *model_, [diagnostics = configuration.runtime_diagnostics](DirectComputeConfiguration selected) { return std::make_unique<CudaExportRuntime>(selected, diagnostics); },
+  browser::ApplicationEventPublisher<&ApplicationSystems::export_system>(events_, continuity_), resolve_compute_configuration);
  predict_ = std::make_unique<PredictSystem>(
-  *settings_, *dataset_, *model_, configuration.base_visual, [diagnostics = configuration.runtime_diagnostics](DirectComputeConfiguration selected) { return std::make_unique<CudaPredictRuntime>(selected, diagnostics); },
+  *settings_, *dataset_, *model_, configuration.base_visual,
+  [diagnostics = configuration.runtime_diagnostics](DirectComputeConfiguration selected) { return std::make_unique<CudaPredictRuntime>(selected, diagnostics); },
   browser::ApplicationEventPublisher<&ApplicationSystems::predict>(events_, continuity_, source_changed));
  mmltk::backend::imaging::upscale::ImageUpscalerExecutionCheckpoint upscale_checkpoint;
  if (diagnostics.valid()) {

@@ -369,9 +369,7 @@ TEST_CASE("runtime diagnostics preserve every owner label and reject unknown own
  RuntimeDiagnostics runtime{diagnostics.producer()};
  const auto target = runtime.target();
  std::array<RuntimeDiagnosticFact, kDiagnosticOwners.size()> facts{};
- for (std::size_t index = 0U; index < facts.size(); ++index) {
-  facts[index] = {.owner = kDiagnosticOwners[index].first, .event = "owner.accepted", .sequence = index};
- }
+ for (std::size_t index = 0U; index < facts.size(); ++index) { facts[index] = {.owner = kDiagnosticOwners[index].first, .event = "owner.accepted", .sequence = index}; }
  SECTION("single records") {
   for (const auto& fact : facts) target.write(fact);
  }

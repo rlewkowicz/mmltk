@@ -846,7 +846,8 @@ auto BrowserAudit::consume(const nlohmann::json& record) -> void {
   if (index < prediction_no_outputs.size()) prediction_no_outputs[index] = valid;
   if (!valid)
    prediction_failure.capture("prediction media-disabled output differs from its reserved run", record, [&] {
-    return nlohmann::json{{"claim_only", claim_only}, {"processed", processed}, {"expected_processed", expected}, {"filesystem_error", error.message()}, {"unexpected_entry", unexpected_entry.string()}};
+    return nlohmann::json{
+     {"claim_only", claim_only}, {"processed", processed}, {"expected_processed", expected}, {"filesystem_error", error.message()}, {"unexpected_entry", unexpected_entry.string()}};
    });
  } else if (event == "integration.prediction.output") {
   const auto stage = record.value("detail", "");
@@ -869,17 +870,19 @@ auto BrowserAudit::consume(const nlohmann::json& record) -> void {
   else if (index == 1U && prediction_outputs[1])
    prediction_processed[1] = processed;
   if (index >= prediction_outputs.size() || !prediction_outputs[index])
-   prediction_failure.capture("prediction saved-media verification failed", record, [&] {
-    return nlohmann::json{{"directory_admitted", directory}, {"no_json", no_json}, {"samples", samples}, {"processed", processed}};
-   });
+   prediction_failure.capture(
+    "prediction saved-media verification failed", record, [&] { return nlohmann::json{{"directory_admitted", directory}, {"no_json", no_json}, {"samples", samples}, {"processed", processed}}; });
  } else if (event == "integration.workflow.operation_admitted") {
   const auto name = record.value("control", "");
   const auto generation = scalar(record, "a");
-  if ((name != "train" && name != "validate" && name != "predict" && name != "export") || generation == 0U) workflow_gpu_invalid = true;
+  if ((name != "train" && name != "validate" && name != "predict" && name != "export") || generation == 0U)
+   workflow_gpu_invalid = true;
   else {
    auto& admissions = workflow_gpu_admissions[name];
-   if (admissions.size() >= 64U && !admissions.contains(generation)) workflow_gpu_invalid = true;
-   else admissions.insert(generation);
+   if (admissions.size() >= 64U && !admissions.contains(generation))
+    workflow_gpu_invalid = true;
+   else
+    admissions.insert(generation);
   }
  } else if (event == "integration.workflow.operation_progress") {
   constexpr std::array<std::string_view, 4U> primary_controls{"train.primary", "validate.primary", "predict.primary", "export.primary"};
@@ -890,8 +893,10 @@ auto BrowserAudit::consume(const nlohmann::json& record) -> void {
    auto name = std::string{*control};
    name.resize(name.find('.'));
    auto& observed = workflow_gpu_operations[name];
-   if (observed.size() >= 64U && !observed.contains(native_progress.first)) workflow_gpu_invalid = true;
-   else observed.insert(native_progress.first);
+   if (observed.size() >= 64U && !observed.contains(native_progress.first))
+    workflow_gpu_invalid = true;
+   else
+    observed.insert(native_progress.first);
    auto& prior = workflow_progress[static_cast<std::size_t>(control - primary_controls.begin())];
    if (native_progress > prior) {
     prior = native_progress;
@@ -1918,9 +1923,8 @@ auto BrowserAudit::readiness_blocker() const -> std::string_view {
   const Bounds* const output = page_bound(page, std::string{page_prefix(page)} + ".card.output");
   const Bounds* const diagnostics = page_bound(page, "workflow.diagnostics");
   const Bounds* const center = page_bound(page, "workflow.workspace_and_advanced");
-  return output && diagnostics && center && output->valid() && diagnostics->valid() && center->valid() && diagnostics->contains(*output) &&
-         std::abs(output->y - diagnostics->y) < 1.0 && std::abs(output->x - diagnostics->x - 10.0) < 1.0 && std::abs(output->width - diagnostics->width + 20.0) < 1.0 &&
-         diagnostics->x >= center->x + center->width - 1.0;
+  return output && diagnostics && center && output->valid() && diagnostics->valid() && center->valid() && diagnostics->contains(*output) && std::abs(output->y - diagnostics->y) < 1.0 &&
+         std::abs(output->x - diagnostics->x - 10.0) < 1.0 && std::abs(output->width - diagnostics->width + 20.0) < 1.0 && diagnostics->x >= center->x + center->width - 1.0;
  });
  const bool compile_progress_placement = immediately_above(compile_progress, compile_action);
  const bool model_progress_placement = model_card.valid() && model_progress.valid() && model_card.contains(model_progress);
@@ -2043,19 +2047,17 @@ auto BrowserAudit::readiness_blocker() const -> std::string_view {
  };
  const bool uniform_primary = !shared_primary_colors.empty() && std::ranges::all_of(shared_primary_colors, [this](const auto& style) { return style.second == shared_primary_colors.begin()->second; });
  static const std::array expected_primary_labels{"Start Training", "Start Validation", "Run Predict", "Run Export", "Start Live", "Save Annotations"};
- return first_failed_check(std::ranges::all_of(expected_primary_labels, [this](const char* label) { return primary_idle_labels.contains(label); }),
-  "primary action rendered labels",
+ return first_failed_check(std::ranges::all_of(expected_primary_labels, [this](const char* label) { return primary_idle_labels.contains(label); }), "primary action rendered labels",
   bootstrap && fluent && uniform_primary && benchmark_purple && rendered_controls.contains(BENCHMARK_OVERRIDE) &&
    std::ranges::all_of(expected_primary, [this](const std::string_view id) { return shared_primary.contains(id) && rendered_controls.contains(id); }),
   "shell and style", every_region, "ordinary workflow regions", primary_progress_placement, "primary progress placement", primary_action_geometry, "primary action geometry", primary_card_gaps,
   "primary card gaps match Export", output_card_placement, "Output cards at top of right column", reference_columns, "workflow column geometry", vertical_composition, "workflow vertical composition",
-  advanced_composition, "Advanced composition",
-  advanced_compact, "Advanced compact controls", explore_integer_controls.size() == 5U && explore_integer_precision, "Explore integer editing and spinner suppression", explore_paste_restored,
-  "Explore clipboard paste persistence and restoration", spinnerless_integer, "integer spinner suppression", spinnerless_floating, "floating spinner suppression", advanced_integer_persisted,
-  "Advanced integer persistence", advanced_floating_persisted, "Advanced floating persistence", compile_progress_placement, "Dataset progress placement", model_progress_placement,
-  "Model progress containment", model_composition && model_copy, "Model card composition", benchmark_override.valid() && benchmark_round_trip && benchmark_choices_complete(),
-  "benchmark override interaction", perceptual_controls_round_trip, "independent perceptual controls round trip", explore_composition, "Explore composition", annotation_composition,
-  "annotation composition", workspace_fps_text && workspace_fps_pixels, "visible workspace FPS",
+  advanced_composition, "Advanced composition", advanced_compact, "Advanced compact controls", explore_integer_controls.size() == 5U && explore_integer_precision,
+  "Explore integer editing and spinner suppression", explore_paste_restored, "Explore clipboard paste persistence and restoration", spinnerless_integer, "integer spinner suppression",
+  spinnerless_floating, "floating spinner suppression", advanced_integer_persisted, "Advanced integer persistence", advanced_floating_persisted, "Advanced floating persistence",
+  compile_progress_placement, "Dataset progress placement", model_progress_placement, "Model progress containment", model_composition && model_copy, "Model card composition",
+  benchmark_override.valid() && benchmark_round_trip && benchmark_choices_complete(), "benchmark override interaction", perceptual_controls_round_trip, "independent perceptual controls round trip",
+  explore_composition, "Explore composition", annotation_composition, "annotation composition", workspace_fps_text && workspace_fps_pixels, "visible workspace FPS",
   settings_composition && settings_numeric_alignment && show_fps_round_trip && ui_scale_drag && ui_scale_released && ui_scale_restored && complete_pointer_drag && error_composition &&
    error_modal_usable,
   "Settings composition",
@@ -2078,8 +2080,9 @@ auto BrowserAudit::readiness_blocker() const -> std::string_view {
 }
 auto BrowserAudit::prediction_output_blocker() const -> std::string_view {
  return first_failed_check(prediction_no_outputs[0], "compiled prediction media-disabled output", prediction_no_outputs[1], "single-image prediction media-disabled output",
-  prediction_saving_controls[0], "compiled prediction saving controls", prediction_saving_controls[1], "single-image prediction saving controls", prediction_saving_controls[2], "video prediction saving controls",
-  prediction_outputs[0], "compiled prediction saved PNGs", prediction_outputs[1], "single-image prediction saved PNG", prediction_outputs[2], "completed prediction video", prediction_outputs[3], "interrupted prediction video");
+  prediction_saving_controls[0], "compiled prediction saving controls", prediction_saving_controls[1], "single-image prediction saving controls", prediction_saving_controls[2],
+  "video prediction saving controls", prediction_outputs[0], "compiled prediction saved PNGs", prediction_outputs[1], "single-image prediction saved PNG", prediction_outputs[2],
+  "completed prediction video", prediction_outputs[3], "interrupted prediction video");
 }
 auto BrowserAudit::product_ready() const -> bool { return readiness_blocker().empty(); }
 auto BrowserAudit::terminal_evidence_settled() const noexcept -> bool {
@@ -2192,8 +2195,8 @@ bool BrowserAudit::validation_samples_complete() const {
  const auto& closed = validation_progressive[1];
  const auto generation = scalar(opened, "a");
  if (!generation || !scalar(opened, "d") || opened.value("detail", "") != "opened" || scalar(opened, "c") != 1U || !scalar(opened, "b") || scalar(opened, "b") >= 6U ||
-     closed.value("detail", "") != "closed" || scalar(closed, "a") != generation || scalar(closed, "b") != 6U || scalar(closed, "c") != 0U ||
-     scalar(closed, "d") <= scalar(opened, "d")) return false;
+     closed.value("detail", "") != "closed" || scalar(closed, "a") != generation || scalar(closed, "b") != 6U || scalar(closed, "c") != 0U || scalar(closed, "d") <= scalar(opened, "d"))
+  return false;
  for (std::size_t index = 0U; index < validation_restored_tiles.size(); ++index) {
   const auto& tile = validation_restored_tiles[index];
   if (scalar(tile, "a") != generation || scalar(tile, "b") != index || !scalar(tile, "c") || scalar(tile, "d") < 12U) return false;
@@ -2242,19 +2245,22 @@ void BrowserAudit::consume_native_gpu(const nlohmann::json& record) {
  if (record.value("event", "") != "workflow.gpu_execution") return;
  const auto name = record.value("participant", "");
  const auto owner = record.value("owner", "");
- const bool valid_owner = (name == "train" && owner == "training") || (name == "validate" && owner == "validation") ||
-  (name == "predict" && owner == "prediction") || (name == "export" && owner == "export");
+ const bool valid_owner =
+  (name == "train" && owner == "training") || (name == "validate" && owner == "validation") || (name == "predict" && owner == "prediction") || (name == "export" && owner == "export");
  const auto generation = scalar(record, "sequence"), rank = scalar(record, "value"), count = scalar(record, "detail");
  const auto device = record.value("device", std::int64_t{-1});
  const auto key = std::pair{name, generation};
- if (!valid_owner || generation == 0U || count == 0U || count > 64U || rank >= count || device < 0 ||
-     (name != "train" && count != 1U) || (workflow_gpu_runs.size() >= 256U && !workflow_gpu_runs.contains(key))) {
+ if (!valid_owner || generation == 0U || count == 0U || count > 64U || rank >= count || device < 0 || (name != "train" && count != 1U) ||
+     (workflow_gpu_runs.size() >= 256U && !workflow_gpu_runs.contains(key))) {
   workflow_gpu_invalid = true;
   return;
  }
  auto found = workflow_gpu_runs.try_emplace(key, count, -1).first;
  auto& ranks = found->second;
- if (ranks.size() != count || ranks[rank] != -1) { workflow_gpu_invalid = true; return; }
+ if (ranks.size() != count || ranks[rank] != -1) {
+  workflow_gpu_invalid = true;
+  return;
+ }
  ranks[rank] = device;
 }
 bool BrowserAudit::workflow_gpus_complete() const {
@@ -2263,19 +2269,19 @@ bool BrowserAudit::workflow_gpus_complete() const {
   const auto& [name, generation] = key;
   const auto admission = workflow_gpu_admissions.find(name);
   const auto selection = workflow_gpu_selected.find(name);
-  if (admission == workflow_gpu_admissions.end() || !admission->second.contains(generation) || selection == workflow_gpu_selected.end() ||
-      ranks.size() != 1U || ranks.front() != selection->second[0]) return false;
+  if (admission == workflow_gpu_admissions.end() || !admission->second.contains(generation) || selection == workflow_gpu_selected.end() || ranks.size() != 1U ||
+      static_cast<double>(ranks.front()) != selection->second[0])
+   return false;
  }
  for (const std::string name : {"train", "validate", "predict", "export"}) {
   const auto selected = workflow_gpu_selected.find(name);
   const auto operations = workflow_gpu_operations.find(name);
   if (selected == workflow_gpu_selected.end() || operations == workflow_gpu_operations.end() || operations->second.empty()) return false;
   const auto& choice = selected->second;
-  if (!std::isfinite(choice[0]) || choice[0] < 0 || choice[0] != std::floor(choice[0]) || choice[1] <= 0 || choice[2] <= 0 || choice[3] != 1 ||
-      (choice[2] > 1 && choice[0] == 0)) return false;
+  if (!std::isfinite(choice[0]) || choice[0] < 0 || choice[0] != std::floor(choice[0]) || choice[1] <= 0 || choice[2] <= 0 || choice[3] != 1 || (choice[2] > 1 && choice[0] == 0)) return false;
   for (const auto generation : operations->second) {
    const auto run = workflow_gpu_runs.find({name, generation});
-   if (run == workflow_gpu_runs.end() || run->second.size() != 1U || run->second.front() != choice[0]) return false;
+   if (run == workflow_gpu_runs.end() || run->second.size() != 1U || static_cast<double>(run->second.front()) != choice[0]) return false;
   }
   for (const std::string stage : {"light", "dark", "narrow"}) {
    if (stage != "light" && name != "train") continue;
@@ -2286,7 +2292,8 @@ bool BrowserAudit::workflow_gpus_complete() const {
    const auto bounds = [](const auto& values) { return Bounds{values[0], values[1], values[2], values[3]}; };
    const auto a = bounds(output->second), b = bounds(gpu->second), c = bounds(status->second);
    if (!a.valid() || !b.valid() || !c.valid() || std::abs(a.x - b.x) > 1 || std::abs(b.x - c.x) > 1 || std::abs(a.width - b.width) > 1 || std::abs(b.width - c.width) > 1 ||
-       std::abs(b.y - a.y - a.height - 10) > 1 || std::abs(c.y - b.y - b.height - 10) > 1) return false;
+       std::abs(b.y - a.y - a.height - 10) > 1 || std::abs(c.y - b.y - b.height - 10) > 1)
+    return false;
   }
  }
  return true;

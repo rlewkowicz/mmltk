@@ -54,11 +54,14 @@ contracts::ComputeTerminal NativeTrainingRuntime::Train(
    }
    diagnostic_message.resize(size);
    return services::RuntimeDiagnosticFact{.owner = contracts::DiagnosticOwner::Training,
-    .event = terminal == nullptr ? "training.failed" : terminal->signal_number != 0 ? "child.signaled" : "child.exited",
+    .event = terminal == nullptr            ? "training.failed"
+             : terminal->signal_number != 0 ? "child.signaled"
+                                            : "child.exited",
     .value = terminal ? static_cast<std::uint64_t>(terminal->exit_code) : 0U,
     .detail = terminal ? static_cast<std::uint64_t>(terminal->signal_number) : 0U,
     .device = request.device_ids.empty() ? request.device_id : request.device_ids.front(),
-    .context = {.document_resource = request.output_dir.native()}, .message = diagnostic_message};
+    .context = {.document_resource = request.output_dir.native()},
+    .message = diagnostic_message};
   });
  };
  try {
@@ -67,8 +70,10 @@ contracts::ComputeTerminal NativeTrainingRuntime::Train(
   if (config_.diagnostics.valid()) {
    const std::span<const int> ranks = request.device_ids.empty() ? std::span<const int>{&request.device_id, 1U} : std::span<const int>{request.device_ids};
    for (std::size_t rank = 0; rank < ranks.size(); ++rank)
-    config_.diagnostics.Emit([&] { return services::RuntimeDiagnosticFact{.owner = contracts::DiagnosticOwner::Training, .event = "workflow.gpu_execution", .participant = "train",
-     .sequence = generation, .value = rank, .detail = ranks.size(), .device = ranks[rank]}; });
+    config_.diagnostics.Emit([&] {
+     return services::RuntimeDiagnosticFact{
+      .owner = contracts::DiagnosticOwner::Training, .event = "workflow.gpu_execution", .participant = "train", .sequence = generation, .value = rank, .detail = ranks.size(), .device = ranks[rank]};
+    });
   }
   mmltk::common::concurrency::ScopedEventCancellation<services::TrainProcessStopSource> cancellation{stop};
   struct Observer final {
@@ -85,8 +90,7 @@ contracts::ComputeTerminal NativeTrainingRuntime::Train(
                                                                                                  : contracts::ComputeOperationOutcome::Failed;
   auto terminal = contracts::make_compute_terminal(outcome, 0, result.terminal.final_progress ? result.terminal.final_progress->progress.completed : 0, {}, result.terminal.error);
   emit_terminal(&result.terminal, result.terminal.error);
-  if (outcome == contracts::ComputeOperationOutcome::Failed)
-   ReportFailure(result.terminal.error, result.terminal.exit_code);
+  if (outcome == contracts::ComputeOperationOutcome::Failed) ReportFailure(result.terminal.error, result.terminal.exit_code);
   return terminal;
  } catch (const std::exception& error) {
   emit_terminal(nullptr, error.what());
@@ -94,7 +98,6 @@ contracts::ComputeTerminal NativeTrainingRuntime::Train(
   throw;
  }
 }
-
 contracts::ProviderQueryResult NativeTrainingRuntime::Query(const contracts::ProviderPreferences& preferences, const std::stop_token stop) {
  if (!config_.provider.valid()) throw contracts::UnavailableError("provider access is unavailable");
  mmltk::common::concurrency::ScopedEventCancellation<services::VastCancellationSource> cancellation{stop};
@@ -354,32 +357,38 @@ public:
       }
       direct::PublishLazyNoexcept(events_, [&] { return event_type{TrainingChanged{snapshot()}}; });
       if (admission) admission->RequireUnchanged(stop);
-      const auto generation = [this] { std::scoped_lock lock(mutex_); return state_.local.generation_frontier; }();
-      terminal = runtime().Train(std::move(*request), stop, [this, &malformed_progress](const services::TrainProcessProgress& update) {
-       const auto& progress = update.progress;
-       if (!progress.valid()) {
-        malformed_progress.store(true, std::memory_order_relaxed);
-        return;
-       }
-       TrainingProgress observation;
-       {
-        std::scoped_lock lock(mutex_);
-        if (!state_.local.active || !contracts::compute_progress_follows(progress, state_.local.progress.sequence)) return;
-        state_.local.progress = progress;
-        if (update.metrics) state_.metrics = update.metrics;
-        state_.persistence = update.persistence;
-        if (state_.local.terminal.outcome == contracts::ComputeOperationOutcome::Running) state_.local.terminal.detail.clear();
-        AdvanceObservation();
-        observation = {
-         .revision = state_.revision,
-         .activity = state_.activity,
-         .local = state_.local,
-         .metrics = state_.metrics,
-         .persistence = state_.persistence,
-        };
-       }
-       direct::PublishLazyNoexcept(events_, [&] { return event_type{std::move(observation)}; });
-      }, generation);
+      const auto generation = [this] {
+       std::scoped_lock lock(mutex_);
+       return state_.local.generation_frontier;
+      }();
+      terminal = runtime().Train(
+       std::move(*request), stop,
+       [this, &malformed_progress](const services::TrainProcessProgress& update) {
+        const auto& progress = update.progress;
+        if (!progress.valid()) {
+         malformed_progress.store(true, std::memory_order_relaxed);
+         return;
+        }
+        TrainingProgress observation;
+        {
+         std::scoped_lock lock(mutex_);
+         if (!state_.local.active || !contracts::compute_progress_follows(progress, state_.local.progress.sequence)) return;
+         state_.local.progress = progress;
+         if (update.metrics) state_.metrics = update.metrics;
+         state_.persistence = update.persistence;
+         if (state_.local.terminal.outcome == contracts::ComputeOperationOutcome::Running) state_.local.terminal.detail.clear();
+         AdvanceObservation();
+         observation = {
+          .revision = state_.revision,
+          .activity = state_.activity,
+          .local = state_.local,
+          .metrics = state_.metrics,
+          .persistence = state_.persistence,
+         };
+        }
+        direct::PublishLazyNoexcept(events_, [&] { return event_type{std::move(observation)}; });
+       },
+       generation);
      }
      if (malformed_progress.load(std::memory_order_relaxed) || !terminal.valid_worker_terminal()) throw std::runtime_error("local training runtime returned an invalid result");
      failed = terminal.outcome == contracts::ComputeOperationOutcome::Failed;

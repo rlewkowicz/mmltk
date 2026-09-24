@@ -162,7 +162,12 @@ class PredictionBackend final {
 public:
  PredictionBackend(const PredictRequest& options, ResolvedInferenceArtifact artifact, const runtime::BorrowedCommandStream command_stream, std::stop_token stop,
   std::shared_ptr<mmltk::frameworks::gpu::TerminalCudaRetirementOwner> retirement, mmltk::frameworks::gpu::PinnedHostBuffer::Operations operations)
-     : retirement_(std::move(retirement)), operations_(operations), artifact_(std::move(artifact)), maximum_detections_(options.max_dets_per_image), device_(options.device_id), command_stream_(command_stream) {
+     : retirement_(std::move(retirement)),
+       operations_(operations),
+       artifact_(std::move(artifact)),
+       maximum_detections_(options.max_dets_per_image),
+       device_(options.device_id),
+       command_stream_(command_stream) {
   if (maximum_detections_ != 0) validate_prediction_candidates(maximum_detections_);
   switch (artifact_.kind) {
    case InferenceArtifactKind::Weights: {
@@ -388,17 +393,19 @@ void prepare_annotations(AnnotationBatch& result, std::size_t batch, std::size_t
  }
 }
 struct PredictionReadback final {
- explicit PredictionReadback(int device, const std::shared_ptr<mmltk::frameworks::gpu::TerminalCudaRetirementOwner>& retirement,
-  mmltk::frameworks::gpu::PinnedHostBuffer::Operations operations)
-  : boxes(device, {}, retirement, operations), labels(device, {}, retirement, operations), scores(device, {}, retirement, operations),
-    masks(device, {}, retirement, operations), indices(device, {}, retirement, operations) {}
+ explicit PredictionReadback(int device, const std::shared_ptr<mmltk::frameworks::gpu::TerminalCudaRetirementOwner>& retirement, mmltk::frameworks::gpu::PinnedHostBuffer::Operations operations)
+     : boxes(device, {}, retirement, operations),
+       labels(device, {}, retirement, operations),
+       scores(device, {}, retirement, operations),
+       masks(device, {}, retirement, operations),
+       indices(device, {}, retirement, operations) {}
  [[nodiscard]] CUresult Close() {
-  box_values = label_values = score_values = mask_values = index_values = {};
+  box_values = label_values = score_values = mask_values = index_values = torch::Tensor{};
   for (auto* host : {&boxes, &labels, &scores, &masks, &indices}) {
    const auto status = host->ReleaseSettled();
    if (status != CUDA_SUCCESS && status != CUDA_ERROR_NOT_READY) return status;
   }
-  device_indices = selected_queries = packed_masks = {};
+  device_indices = selected_queries = packed_masks = torch::Tensor{};
   mask_workspace.ResetSettled();
   return CUDA_SUCCESS;
  }
@@ -766,8 +773,7 @@ void complete_prediction_record(PredictionRecord& record, std::size_t index, con
 }
 }  // namespace
 struct PredictionSession::State final {
- std::shared_ptr<mmltk::frameworks::gpu::TerminalCudaRetirementOwner> source_retirement =
-  std::make_shared<mmltk::frameworks::gpu::TerminalCudaRetirementOwner>(16U);
+ std::shared_ptr<mmltk::frameworks::gpu::TerminalCudaRetirementOwner> source_retirement = std::make_shared<mmltk::frameworks::gpu::TerminalCudaRetirementOwner>(16U);
  mmltk::frameworks::gpu::TerminalCudaRetirementOwner retirement{1U};
  mmltk::frameworks::gpu::TerminalCudaRetirementLease retirement_lease = mmltk::frameworks::gpu::ReserveTerminalCudaLease(retirement);
  std::unique_ptr<PredictionBackend> backend;
@@ -793,8 +799,7 @@ struct PredictionSession::State final {
   const auto requested_resolution = options.resolution > 0 ? static_cast<std::uint32_t>(options.resolution) : 0U;
   if (!backend || !readback || !backend->class_artifact()->Matches(selected.path, options.class_layout_path) || artifact.kind != selected.kind || artifact.backend_name != selected.backend_name ||
       artifact.path != selected.path || preset_name != options.preset_name || resolution != requested_resolution || maximum_detections != options.max_dets_per_image || device != options.device_id ||
-      command_stream != stream.native_handle || allow_fp16 != options.allow_fp16 ||
-      readback_node != node) {
+      command_stream != stream.native_handle || allow_fp16 != options.allow_fp16 || readback_node != node) {
    auto next_artifact = selected;
    auto next_preset_name = options.preset_name;
    const auto status = Close();
@@ -833,9 +838,12 @@ runtime::RuntimeStatus PredictionSession::State::Close() noexcept {
  if (poisoned || !source_retirement->admission_open()) return static_cast<runtime::RuntimeStatus>(cudaErrorUnknown);
  if (!backend && !readback) return runtime::kRuntimeSuccess;
  runtime::RuntimeStatus status = runtime::kRuntimeSuccess;
- struct CloseCall { State* state; runtime::RuntimeStatus* status; } call{this, &status};
+ struct CloseCall {
+  State* state;
+  runtime::RuntimeStatus* status;
+ } context{this, &status};
  try {
-  torch_cuda::run_on_torch_cuda_stream(device, command_stream, &call, [](void* value) {
+  torch_cuda::run_on_torch_cuda_stream(device, command_stream, &context, [](void* value) {
    auto& call = *static_cast<CloseCall*>(value);
    auto& owner = *call.state;
    *call.status = static_cast<runtime::RuntimeStatus>(cudaStreamSynchronize(reinterpret_cast<cudaStream_t>(owner.command_stream)));

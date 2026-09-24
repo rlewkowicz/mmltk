@@ -1443,8 +1443,10 @@ mod tests {
         let retained = &local.workflow.training.as_ref().unwrap().local;
         assert_eq!(retained.terminal.detail, failure);
         assert!(crate::view::workflow::status::compute_status(Some(retained)).contains(failure));
-        assert!(matches!(crate::view::workflow::progress::compute_presentation(Some(retained)),
-            crate::view::workflow::progress::Presentation::Terminal { detail, .. } if detail == failure));
+        assert!(
+            matches!(crate::view::workflow::progress::compute_presentation(Some(retained)),
+            crate::view::workflow::progress::Presentation::Terminal { detail, .. } if detail == failure)
+        );
 
         let mut provider = bootstrapped();
         let query = provider
