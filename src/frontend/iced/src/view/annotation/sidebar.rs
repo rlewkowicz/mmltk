@@ -1,10 +1,10 @@
-use crate::view::shared::status_text;
 use crate::fluent_theme::Element;
 use crate::generated::{
     AnnotationColorRange, AnnotationEdit, AnnotationEditRequest, AnnotationHandleRole,
     AnnotationMaskColorsEdit, AnnotationObject, AnnotationPoint, AnnotationPointerTarget,
     AnnotationShape, AnnotationSplineHandleEdit, AnnotationSplineHandleMode,
 };
+use crate::view::shared::status_text;
 use iced::Fill;
 use iced::widget::{button, checkbox, column, container, row, text, text_input};
 

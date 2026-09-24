@@ -652,15 +652,15 @@ void WaylandSession::RunWorkflows() {
  REQUIRE(browser.validation_samples_complete());
  for (const auto& record : browser.validation_saved_samples) {
   const auto directory = std::filesystem::path(record.value("control", ""));
-  const auto file = (directory.is_absolute() ? directory : working.path()/directory) / record.value("detail", "");
+  const auto file = (directory.is_absolute() ? directory : working.path() / directory) / record.value("detail", "");
   INFO(file.string());
   REQUIRE(std::filesystem::is_regular_file(file));
   REQUIRE(std::filesystem::file_size(file) > 32U);
-  std::ifstream png(file,std::ios::binary);
-  std::array<unsigned char,8> signature{};
-  png.read(reinterpret_cast<char*>(signature.data()),signature.size());
-  CHECK(signature == std::array<unsigned char,8>{137U,80U,78U,71U,13U,10U,26U,10U});
-  CHECK_FALSE(std::filesystem::exists(file.string()+".partial"));
+  std::ifstream png(file, std::ios::binary);
+  std::array<unsigned char, 8> signature{};
+  png.read(reinterpret_cast<char*>(signature.data()), signature.size());
+  CHECK(signature == std::array<unsigned char, 8>{137U, 80U, 78U, 71U, 13U, 10U, 26U, 10U});
+  CHECK_FALSE(std::filesystem::exists(file.string() + ".partial"));
  }
  CHECK(browser.validation_confidence_complete());
  CHECK(browser.validation_layout_complete());

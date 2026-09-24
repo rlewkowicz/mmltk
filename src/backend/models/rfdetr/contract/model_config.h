@@ -72,10 +72,12 @@ struct NativeRfDetrConfig {
   return false;
  }
  if (config.segmentation && training_supervision_enabled(config.training_supervision) &&
-     (!std::isfinite(config.mask_ce_loss_coef) || config.mask_ce_loss_coef < 0.0 || !std::isfinite(config.mask_dice_loss_coef) || config.mask_dice_loss_coef < 0.0 || config.mask_point_sample_ratio <= 0)) return false;
+     (!std::isfinite(config.mask_ce_loss_coef) || config.mask_ce_loss_coef < 0.0 || !std::isfinite(config.mask_dice_loss_coef) || config.mask_dice_loss_coef < 0.0 ||
+      config.mask_point_sample_ratio <= 0))
+  return false;
  if (config.training_supervision.assignment == TrainAssignmentKind::MatchFree) {
-  if (!std::isfinite(config.set_cost_class) || config.set_cost_class < 0.0 || !std::isfinite(config.set_cost_bbox) || config.set_cost_bbox < 0.0 ||
-      !std::isfinite(config.set_cost_giou) || config.set_cost_giou < 0.0 || (config.set_cost_class == 0.0 && config.set_cost_bbox == 0.0 && config.set_cost_giou == 0.0)) {
+  if (!std::isfinite(config.set_cost_class) || config.set_cost_class < 0.0 || !std::isfinite(config.set_cost_bbox) || config.set_cost_bbox < 0.0 || !std::isfinite(config.set_cost_giou) ||
+      config.set_cost_giou < 0.0 || (config.set_cost_class == 0.0 && config.set_cost_bbox == 0.0 && config.set_cost_giou == 0.0)) {
    return false;
   }
  }
@@ -91,7 +93,7 @@ struct NativeRfDetrConfig {
 [[nodiscard]] const PresetCatalogEntry* find_model_preset_by_weight_filename(std::string_view filename) noexcept;
 [[nodiscard]] const PresetCatalogEntry* infer_model_preset_from_path(const std::filesystem::path& path);
 [[nodiscard]] NativeRfDetrConfig native_config_from_preset(const PresetCatalogEntry& preset);
-template<class Destination>
+template <class Destination>
 void project_loss_coefficients(Destination& destination, const NativeRfDetrConfig& source) {
  template for (constexpr auto member : std::define_static_array(std::meta::nonstatic_data_members_of(^^NativeRfDetrConfig, std::meta::access_context::current()))) {
   if constexpr (std::meta::identifier_of(member).ends_with("_loss_coef")) {

@@ -249,10 +249,8 @@ void apply_output_selections(GuiSettingsState& candidate, const std::span<const 
  visit_materialized_members<WorkflowSettingsState>([&]<class Workflow>(const auto&) {
   visit_materialized_members<typename Workflow::member_type>([&]<class Member>(const auto&) {
    if constexpr (std::same_as<typename Member::member_type, WorkflowOutputSelection>) {
-    constexpr auto directory = reflected_member_path<GuiSettingsState,
-     member_path<&GuiSettingsState::workflows, Workflow::pointer, Member::pointer, &WorkflowOutputSelection::directory>>();
-    constexpr auto automatic = reflected_member_path<GuiSettingsState,
-     member_path<&GuiSettingsState::workflows, Workflow::pointer, Member::pointer, &WorkflowOutputSelection::automatic>>();
+    constexpr auto directory = reflected_member_path<GuiSettingsState, member_path<&GuiSettingsState::workflows, Workflow::pointer, Member::pointer, &WorkflowOutputSelection::directory>>();
+    constexpr auto automatic = reflected_member_path<GuiSettingsState, member_path<&GuiSettingsState::workflows, Workflow::pointer, Member::pointer, &WorkflowOutputSelection::automatic>>();
     // Supplying a directory is a manual selection even when its bytes are unchanged.
     // An explicitly supplied policy takes precedence regardless of update order.
     if (std::ranges::contains(supplied_paths, directory.view()) && !std::ranges::contains(supplied_paths, automatic.view())) {

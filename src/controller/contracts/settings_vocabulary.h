@@ -66,8 +66,7 @@ inline constexpr bool has_annotation_v = [] {
 template <class Declaration>
 inline constexpr bool is_persistence_metadata_v = has_annotation_v<Declaration, reflection::PersistenceMetadata>;
 template <class Declaration, class T>
-inline constexpr bool is_mutable_member_v = is_mutable_leaf_v<T> && !is_persistence_metadata_v<Declaration> &&
- !has_annotation_v<Declaration, mmltk::frameworks::reflection::RuntimeDestination>;
+inline constexpr bool is_mutable_member_v = is_mutable_leaf_v<T> && !is_persistence_metadata_v<Declaration> && !has_annotation_v<Declaration, mmltk::frameworks::reflection::RuntimeDestination>;
 template <bool MutableOnly, class T>
 [[nodiscard]] consteval std::size_t count_leaves() {
  using U = std::remove_cvref_t<T>;

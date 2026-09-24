@@ -396,9 +396,8 @@ constexpr auto train_execution_fields = [](auto& request, const auto& visit) {
  visit("compile_mode", request.compilation_mode);
 };
 constexpr auto inference_execution_fields = [](auto& request, const auto& visit) {
- visit_record_fields<mmltk::backend::models::rfdetr::InferenceExecutionConfig>(request, [&](const char* name, auto& field) {
-  visit(std::string_view{name} == "compilation_mode" ? "compile_mode" : name, field);
- });
+ visit_record_fields<mmltk::backend::models::rfdetr::InferenceExecutionConfig>(
+  request, [&](const char* name, auto& field) { visit(std::string_view{name} == "compilation_mode" ? "compile_mode" : name, field); });
 };
 constexpr auto validate_execution_fields = inference_execution_fields;
 constexpr auto predict_execution_fields = [](auto& request, const auto& visit) {
@@ -815,7 +814,6 @@ void apply_workflows(const nlohmann::json& j, GuiSettingsState& settings) {
    const JsonFieldReader read{*training};
    train_training_fields(s, read);
    train_execution_target_fields(s, read);
-
   }
   if (const nlohmann::json* augmentation = find_object(train, kAugmentationKey)) {
    apply_gpu_augmentation_json(*augmentation, s.request.gpu_augmentation);
@@ -834,12 +832,17 @@ void apply_workflows(const nlohmann::json& j, GuiSettingsState& settings) {
   if (const nlohmann::json* source = find_object(predict, "source")) { source_fields(s.source, JsonFieldReader{*source}); }
   apply_workflow_artifacts_and_execution(predict, s, ModelArtifactsShape{}, s.request, predict_execution_fields);
   apply_workflow_section(predict, s.request, kPredictKey, predict_fields);
-  if (const nlohmann::json* values = find_object(predict, kPredictKey)) { get_optional(*values, "live_split_count", s.live_split_count); get_optional(*values, "write_report_json", s.write_report_json); }
+  if (const nlohmann::json* values = find_object(predict, kPredictKey)) {
+   get_optional(*values, "live_split_count", s.live_split_count);
+   get_optional(*values, "write_report_json", s.write_report_json);
+  }
  });
  apply_workflow(*workflows_json, &settings.workflows.annotate, "annotate",
   [](const nlohmann::json& annotate, AnnotateViewState& s) { apply_source_workflow(annotate, s, ModelArtifactsShape{}, s, annotate_execution_fields, kAnnotateKey, annotate_fields); });
- apply_workflow(*workflows_json, &settings.workflows.export_state, "export",
-  [](const nlohmann::json& export_json, ExportViewState& s) { apply_workflow_section(export_json, s.output, "output", output_selection_fields); apply_section_workflow(export_json, s, train_model_artifacts_shape(), s, export_execution_fields, kExportKey, export_fields); });
+ apply_workflow(*workflows_json, &settings.workflows.export_state, "export", [](const nlohmann::json& export_json, ExportViewState& s) {
+  apply_workflow_section(export_json, s.output, "output", output_selection_fields);
+  apply_section_workflow(export_json, s, train_model_artifacts_shape(), s, export_execution_fields, kExportKey, export_fields);
+ });
  apply_workflow(*workflows_json, &settings.workflows.explore, kExploreKey, [](const nlohmann::json& explore, ExploreViewState& s) { explore.get_to(s); });
 }
 nlohmann::json normalize_gui_settings_document(const nlohmann::json& j) { return normalize_gui_settings_document_impl(j); }

@@ -11,4 +11,4 @@ void require_media(int result, const char* operation) {
  av_strerror(result, message, sizeof(message));
  throw std::runtime_error(std::string(operation) + ": " + message);
 }
-}
+}  // namespace mmltk::backend::media::video

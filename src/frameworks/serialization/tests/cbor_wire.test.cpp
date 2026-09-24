@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <array>
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 #include <concepts>
 #include <cstddef>
 #include <cstdint>
@@ -369,6 +370,39 @@ TEST_CASE("opaque named values preserve ordered admission and nested error prece
   CHECK(result.error().path == (known_first ? "overrides.unknown" : "overrides.mask"));
   CHECK(result.error().offset == 0U);
   CHECK(destination == before);
+ }
+}
+TEST_CASE("reflected text sequences bound each leaf and reject oversized paths before materialization", "[frameworks][serialization][reflection][bounds]") {
+ namespace cbor = mmltk::frameworks::serialization;
+ using namespace cbor::test;
+ STATIC_REQUIRE(kPathsFullBytes == 18U);
+ STATIC_REQUIRE(kTextContainersFullBytes == 55U);
+ BoundPaths paths{{"abcd", "efgh"}};
+ wire::ByteBuffer encoded;
+ REQUIRE(cbor::encode(paths, encoded, test_limits(kPathsFullBytes)));
+ CHECK(encoded.size() == kPathsFullBytes);
+ auto decoded = cbor::decode<BoundPaths>({encoded, {}}, test_limits(kPathsFullBytes));
+ REQUIRE(decoded);
+ CHECK(decoded->paths == paths.paths);
+ const bool excess_items = GENERATE(false, true);
+ paths.paths = excess_items ? std::vector<std::filesystem::path>{"a", "b", "c"} : std::vector<std::filesystem::path>{"abcde"};
+ CHECK_FALSE(cbor::encode(paths, encoded, test_limits(1024U)));
+ wire::Value::Array raw_paths;
+ for (const auto& path : paths.paths) raw_paths.emplace_back(path.native());
+ wire::ByteBuffer invalid;
+ REQUIRE(wire::encode(wire::Value(wire::Value::Object{{"paths", wire::Value(std::move(raw_paths))}}), invalid, test_limits(1024U)));
+ auto rejected = cbor::decode<BoundPaths>({invalid, {}}, test_limits(1024U));
+ REQUIRE_FALSE(rejected);
+ CHECK(rejected.error().code == wire::ErrorCode::LimitExceeded);
+ CHECK(rejected.error().path == "paths");
+ std::array<std::string, 2U> borrowed{"abcd", "efgh"};
+ BoundTextContainers containers{{"abcd", "efgh"}, {"abcd", "efgh"}, borrowed};
+ REQUIRE(cbor::encode(containers, encoded, test_limits(kTextContainersFullBytes)));
+ CHECK(encoded.size() == kTextContainersFullBytes);
+ for (auto* leaf : {&containers.fixed[0], &containers.local[0], &borrowed[0]}) {
+  leaf->push_back('x');
+  CHECK_FALSE(cbor::encode(containers, encoded, test_limits(1024U)));
+  leaf->pop_back();
  }
 }
 TEST_CASE("reflected structural bounds retain inherited fields and declaration owned bytes", "[frameworks][serialization][reflection][bounds]") {

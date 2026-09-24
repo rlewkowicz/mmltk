@@ -15,14 +15,15 @@ template <size_t Arity, size_t Coefficients = 0>
 class TracedLossOp final {
 public:
  template <typename TraceFn, typename... Tensors>
- torch::Tensor invoke(const char* class_name, TraceFn&& fn, const Tensors&... tensors) requires (Coefficients == 0 && sizeof...(Tensors) == Arity) {
+ torch::Tensor invoke(const char* class_name, TraceFn&& fn, const Tensors&... tensors)
+  requires(Coefficients == 0 && sizeof...(Tensors) == Arity)
+ {
   return invoke(class_name, std::array<double, 0>{}, std::forward<TraceFn>(fn), tensors...);
  }
  template <typename TraceFn, typename... Tensors>
  torch::Tensor invoke(const char* class_name, const std::array<double, Coefficients>& coefficients, TraceFn&& fn, const Tensors&... tensors) {
   static_assert(sizeof...(Tensors) == Arity);
-  const Signature signature{{tensors.device().type()...}, {tensors.scalar_type()...}, {tensors.dim()...}, coefficients,
-                            (... || tensors.is_cuda())};
+  const Signature signature{{tensors.device().type()...}, {tensors.scalar_type()...}, {tensors.dim()...}, coefficients, (... || tensors.is_cuda())};
   if (!state_ || state_->signature != signature) {
    auto cu = std::make_shared<torch::jit::CompilationUnit>();
    auto cls = torch::jit::ClassType::create(class_name, cu, true);
@@ -49,9 +50,11 @@ private:
   std::array<double, Coefficients> coefficients;
   bool cuda_autocast;
   c10::ScalarType autocast_dtype;
-  Signature(std::array<c10::DeviceType, Arity> devices, std::array<c10::ScalarType, Arity> types,
-            std::array<int64_t, Arity> ranks, std::array<double, Coefficients> parameters, bool uses_cuda)
-      : device_types(devices), dtypes(types), dims(ranks), coefficients(parameters),
+  Signature(std::array<c10::DeviceType, Arity> devices, std::array<c10::ScalarType, Arity> types, std::array<int64_t, Arity> ranks, std::array<double, Coefficients> parameters, bool uses_cuda)
+      : device_types(devices),
+        dtypes(types),
+        dims(ranks),
+        coefficients(parameters),
         cuda_autocast(uses_cuda && at::autocast::is_autocast_enabled(at::kCUDA)),
         autocast_dtype(cuda_autocast ? at::autocast::get_autocast_dtype(at::kCUDA) : c10::ScalarType::Undefined) {}
   bool operator==(const Signature&) const = default;

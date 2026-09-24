@@ -47,7 +47,10 @@ impl ApplicationModel {
 
     pub fn model_selection_available(&self, settings: &GuiSettingsState, page: FeatureId) -> bool {
         if self.connection != ConnectionState::Connected
-            || (page == FeatureId::Export && !settings.workflows.exportstate.exportonnx && !settings.workflows.exportstate.buildtensorrt) {
+            || (page == FeatureId::Export
+                && !settings.workflows.exportstate.exportonnx
+                && !settings.workflows.exportstate.buildtensorrt)
+        {
             return false;
         }
         if self.settings_snapshot.is_none()
@@ -97,7 +100,10 @@ impl ApplicationModel {
     }
 
     pub fn compute_start_available(&self, settings: &GuiSettingsState, page: FeatureId) -> bool {
-        if page == FeatureId::Export && !settings.workflows.exportstate.exportonnx && !settings.workflows.exportstate.buildtensorrt {
+        if page == FeatureId::Export
+            && !settings.workflows.exportstate.exportonnx
+            && !settings.workflows.exportstate.buildtensorrt
+        {
             return false;
         }
         let orchestrated = matches!(
@@ -146,12 +152,18 @@ impl ApplicationModel {
                     .map(|snapshot| &snapshot.operation),
                 ApplicationIntentEndpoint::ValidationStart,
             ),
-            FeatureId::Predict => !self.predict_snapshot.as_ref().is_some_and(|snapshot| snapshot.inspection.active) && self.compute_start_available_for(
-                self.predict_snapshot
+            FeatureId::Predict => {
+                !self
+                    .predict_snapshot
                     .as_ref()
-                    .map(|snapshot| &snapshot.operation),
-                ApplicationIntentEndpoint::PredictStart,
-            ),
+                    .is_some_and(|snapshot| snapshot.inspection.active)
+                    && self.compute_start_available_for(
+                        self.predict_snapshot
+                            .as_ref()
+                            .map(|snapshot| &snapshot.operation),
+                        ApplicationIntentEndpoint::PredictStart,
+                    )
+            }
             FeatureId::Export => self.compute_start_available_for(
                 self.workflow.export.as_ref(),
                 ApplicationIntentEndpoint::ExportSystemStart,
@@ -550,8 +562,10 @@ mod tests {
             },
         ] {
             model.workflow.pending_start = Some(PendingStart {
-                validation_preview: crate::generated::default_request_validationStartpreview().unwrap(),
-                prediction_preview: crate::generated::default_request_predictStartpreview().unwrap(),
+                validation_preview: crate::generated::default_request_validationStartpreview()
+                    .unwrap(),
+                prediction_preview: crate::generated::default_request_predictStartpreview()
+                    .unwrap(),
                 prediction_saving: crate::generated::default_request_predictStartsaving().unwrap(),
                 prediction_population: 0,
                 feature: FeatureId::Train,

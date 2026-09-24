@@ -38,13 +38,11 @@ const PackedTargetMasks& require_target_masks(const PreparedTargets& targets, co
  return *targets.packed_masks;
 }
 void validate_packed_mask_extent(const PackedTargetMasks& masks, const char* context) {
- if (!masks.bits.defined() || masks.bits.dim() != 2 || masks.bits.scalar_type() != torch::kInt64)
-  throw std::invalid_argument(std::string(context) + " requires a 2D int64 packed mask inventory");
+ if (!masks.bits.defined() || masks.bits.dim() != 2 || masks.bits.scalar_type() != torch::kInt64) throw std::invalid_argument(std::string(context) + " requires a 2D int64 packed mask inventory");
  if (masks.height <= 0 || masks.width <= 0 || masks.height > std::numeric_limits<int64_t>::max() / masks.width)
   throw std::invalid_argument(std::string(context) + " has invalid packed mask dimensions");
  const auto pixels = masks.height * masks.width;
- if (masks.bits.size(1) < pixels / 64 + (pixels % 64 != 0))
-  throw std::invalid_argument(std::string(context) + " packed mask words do not cover the image");
+ if (masks.bits.size(1) < pixels / 64 + (pixels % 64 != 0)) throw std::invalid_argument(std::string(context) + " packed mask words do not cover the image");
 }
 // Explicit samples belong to one invocation. The ordinary path draws only the
 // original random tensor, with no additional storage or host inspection.
@@ -97,7 +95,7 @@ torch::Tensor sample_packed_target_masks_cpu(const PackedTargetMasks& masks, con
  }
  return output;
 }
-} // namespace
+}  // namespace
 torch::Tensor sample_target_masks(const PackedTargetMasks& masks, const torch::Tensor& mask_indices, const torch::Tensor& point_coords, const char* context) {
  validate_packed_mask_extent(masks, context);
  const auto indices = mask_indices.scalar_type() == torch::kInt64 ? mask_indices.contiguous() : mask_indices.to(torch::kInt64).contiguous();
@@ -122,27 +120,27 @@ torch::Tensor run_binary_traced_or_direct(
  }
  return direct_fn(first, second);
 }
-}
+}  // namespace
 torch::Tensor binary_cross_entropy_with_logits_none(const torch::Tensor& inputs, const torch::Tensor& targets) {
  return F::binary_cross_entropy_with_logits(inputs, targets, F::BinaryCrossEntropyWithLogitsFuncOptions().reduction(torch::kNone));
 }
 torch::Tensor sigmoid_ce_loss(const torch::Tensor& inputs, const torch::Tensor& targets, const torch::Tensor& num_masks, bool use_jit_traced_loss_ops, const torch::Tensor& valid) {
  const auto rows = run_binary_traced_or_direct(
-         &TracedLossOpCache::sigmoid_ce, "__torch__.NativeRfDetrSigmoidCeLoss", use_jit_traced_loss_ops,
-         [](const torch::Tensor& a, const torch::Tensor& b) { return binary_cross_entropy_with_logits_none(a, b).mean(1); }, inputs, targets);
+  &TracedLossOpCache::sigmoid_ce, "__torch__.NativeRfDetrSigmoidCeLoss", use_jit_traced_loss_ops,
+  [](const torch::Tensor& a, const torch::Tensor& b) { return binary_cross_entropy_with_logits_none(a, b).mean(1); }, inputs, targets);
  return (valid.defined() ? torch::where(valid, rows, torch::zeros_like(rows)) : rows).sum() / num_masks;
 }
 torch::Tensor dice_loss(const torch::Tensor& inputs, const torch::Tensor& targets, const torch::Tensor& num_masks, bool use_jit_traced_loss_ops, const torch::Tensor& valid) {
  const auto rows = run_binary_traced_or_direct(
-         &TracedLossOpCache::dice, "__torch__.NativeRfDetrDiceLoss", use_jit_traced_loss_ops,
-         [](const torch::Tensor& a, const torch::Tensor& b) {
-          const auto probs = a.sigmoid().flatten(1);
-          const auto flat_targets = b.flatten(1);
-          const auto numerator = 2 * (probs * flat_targets).sum(-1);
-          const auto denominator = probs.sum(-1) + flat_targets.sum(-1);
-          return 1 - (numerator + 1) / (denominator + 1);
-         },
-         inputs, targets);
+  &TracedLossOpCache::dice, "__torch__.NativeRfDetrDiceLoss", use_jit_traced_loss_ops,
+  [](const torch::Tensor& a, const torch::Tensor& b) {
+   const auto probs = a.sigmoid().flatten(1);
+   const auto flat_targets = b.flatten(1);
+   const auto numerator = 2 * (probs * flat_targets).sum(-1);
+   const auto denominator = probs.sum(-1) + flat_targets.sum(-1);
+   return 1 - (numerator + 1) / (denominator + 1);
+  },
+  inputs, targets);
  return (valid.defined() ? torch::where(valid, rows, torch::zeros_like(rows)) : rows).sum() / num_masks;
 }
 torch::Tensor batch_dice_loss(const torch::Tensor& inputs, const torch::Tensor& targets, bool use_jit_traced_loss_ops) {
@@ -159,14 +157,15 @@ torch::Tensor batch_dice_loss(const torch::Tensor& inputs, const torch::Tensor& 
 }
 torch::Tensor batch_sigmoid_ce_loss(const torch::Tensor& inputs, const torch::Tensor& targets, bool use_jit_traced_loss_ops) {
  return run_binary_traced_or_direct(
-  &TracedLossOpCache::batch_sigmoid_ce, "__torch__.NativeRfDetrBatchSigmoidCeLoss", use_jit_traced_loss_ops,
-  [](const torch::Tensor& a, const torch::Tensor& b) {
-   const auto flat_targets = b;
-   const auto positives = binary_cross_entropy_with_logits_none(a, torch::ones_like(a));
-   const auto negatives = binary_cross_entropy_with_logits_none(a, torch::zeros_like(a));
-   return (torch::matmul(positives, flat_targets.transpose(-1, -2)) + torch::matmul(negatives, (1 - flat_targets).transpose(-1, -2)));
-  },
-  inputs, targets) / static_cast<double>(targets.size(-1));
+         &TracedLossOpCache::batch_sigmoid_ce, "__torch__.NativeRfDetrBatchSigmoidCeLoss", use_jit_traced_loss_ops,
+         [](const torch::Tensor& a, const torch::Tensor& b) {
+          const auto flat_targets = b;
+          const auto positives = binary_cross_entropy_with_logits_none(a, torch::ones_like(a));
+          const auto negatives = binary_cross_entropy_with_logits_none(a, torch::zeros_like(a));
+          return (torch::matmul(positives, flat_targets.transpose(-1, -2)) + torch::matmul(negatives, (1 - flat_targets).transpose(-1, -2)));
+         },
+         inputs, targets) /
+        static_cast<double>(targets.size(-1));
 }
 torch::Tensor point_sample(const torch::Tensor& input, const torch::Tensor& point_coords, F::GridSampleFuncOptions::mode_t mode) {
  torch::Tensor grid = point_coords;
@@ -190,8 +189,7 @@ torch::Tensor get_uncertain_point_coords_with_randomness(const torch::Tensor& co
   if (supplied.defined() || !seeds) return mask_coordinates(supplied, num_boxes, count, coarse_logits.device());
   // Missing draws share only this invocation's generator; each stream starts
   // from its own seed, independently of explicit operands and global RNG state.
-  if (!generator) generator = coarse_logits.is_cuda()
-   ? at::cuda::detail::createCUDAGenerator(coarse_logits.device().index()) : at::detail::createCPUGenerator();
+  if (!generator) generator = coarse_logits.is_cuda() ? at::cuda::detail::createCUDAGenerator(coarse_logits.device().index()) : at::detail::createCPUGenerator();
   generator->set_current_seed(seed);
   return at::rand({num_boxes, count, 2}, *generator, coarse_logits.options().dtype(torch::kFloat32));
  };
@@ -217,15 +215,13 @@ torch::Tensor get_uncertain_point_coords_with_randomness(const torch::Tensor& co
  }
  return sampled_coords;
 }
-
-} // namespace
-
+}  // namespace
 int64_t direct_mask_point_count(const torch::Tensor& masks, int64_t ratio) {
  if (ratio <= 0) throw std::invalid_argument("direct mask sampling requires a positive ratio");
  return std::max<int64_t>(masks.size(-2), masks.size(-2) * masks.size(-1) / ratio);
 }
-DirectMaskSamples sample_direct_masks(const torch::Tensor& masks, const PreparedTargets& targets,
- const torch::Tensor& indices, int64_t ratio, const LayerMaskSamples& samples, std::optional<DirectMaskRandomSeeds> seeds) {
+DirectMaskSamples sample_direct_masks(
+ const torch::Tensor& masks, const PreparedTargets& targets, const torch::Tensor& indices, int64_t ratio, const LayerMaskSamples& samples, std::optional<DirectMaskRandomSeeds> seeds) {
  const auto logits = masks.unsqueeze(1);
  torch::Tensor coordinates;
  {
@@ -240,16 +236,15 @@ DirectMaskSamples sample_direct_masks(const torch::Tensor& masks, const Prepared
  }
  return {point_logits, labels};
 }
-
-PairwiseMaskSamples sample_pairwise_masks(const OutputLayer& layer, const PreparedTargets& targets,
- const torch::Tensor& indices, const torch::Tensor& valid, int64_t point_ratio, const torch::Tensor& coordinates) {
+PairwiseMaskSamples sample_pairwise_masks(
+ const OutputLayer& layer, const PreparedTargets& targets, const torch::Tensor& indices, const torch::Tensor& valid, int64_t point_ratio, const torch::Tensor& coordinates) {
  if (!layer.sparse_pred_masks) throw std::invalid_argument("Match-Free masks require sparse spatial/query projections");
  const auto& sparse = *layer.sparse_pred_masks;
  const auto& spatial = sparse.spatial_features;
  if (point_ratio <= 0 || spatial.dim() != 4 || spatial.size(2) <= 0 || spatial.size(3) <= 0 || spatial.size(2) > std::numeric_limits<int64_t>::max() / spatial.size(3))
   throw std::invalid_argument("invalid Match-Free mask sampling dimensions or ratio");
- if (sparse.query_features.dim() != 3 || sparse.query_features.size(0) != spatial.size(0) || sparse.query_features.size(2) != spatial.size(1) ||
-     indices.dim() != 2 || indices.size(0) != spatial.size(0) || indices.scalar_type() != torch::kInt64 || valid.sizes() != indices.sizes() || valid.scalar_type() != torch::kBool)
+ if (sparse.query_features.dim() != 3 || sparse.query_features.size(0) != spatial.size(0) || sparse.query_features.size(2) != spatial.size(1) || indices.dim() != 2 ||
+     indices.size(0) != spatial.size(0) || indices.scalar_type() != torch::kInt64 || valid.sizes() != indices.sizes() || valid.scalar_type() != torch::kBool)
   throw std::invalid_argument("incompatible Match-Free mask projections or target layout");
  const auto& masks = require_target_masks(targets, "Match-Free");
  validate_packed_mask_extent(masks, "Match-Free");
@@ -262,4 +257,4 @@ PairwiseMaskSamples sample_pairwise_masks(const OutputLayer& layer, const Prepar
  sampled_targets = torch::where(valid.unsqueeze(-1), sampled_targets, torch::zeros_like(sampled_targets));
  return {features, logits, sampled_targets};
 }
-} // namespace mmltk::backend::models::rfdetr
+}  // namespace mmltk::backend::models::rfdetr

@@ -10,11 +10,12 @@ namespace {
 torch::Tensor projected_attention(torch::nn::MultiheadAttention& attention, const torch::Tensor& query, const torch::Tensor& value, const torch::Tensor& excluded_keys) {
  const auto width = value.size(2);
  const auto heads = attention->options.num_heads();
- TORCH_CHECK(heads > 0 && width == attention->options.embed_dim() && width % heads == 0 && attention->in_proj_weight.defined() && !attention->bias_k.defined() && !attention->bias_v.defined() && !attention->options.add_zero_attn() && attention->options.dropout() == 0.0, "decoder attention requires packed equal-width zero-dropout projections");
+ TORCH_CHECK(heads > 0 && width == attention->options.embed_dim() && width % heads == 0 && attention->in_proj_weight.defined() && !attention->bias_k.defined() && !attention->bias_v.defined() &&
+              !attention->options.add_zero_attn() && attention->options.dropout() == 0.0,
+  "decoder attention requires packed equal-width zero-dropout projections");
  const auto project = [&](const torch::Tensor& input, int64_t part) {
   const auto bias = attention->in_proj_bias.defined() ? attention->in_proj_bias.narrow(0, part * width, width) : torch::Tensor{};
-  return torch::linear(input, attention->in_proj_weight.narrow(0, part * width, width), bias)
-   .view({input.size(0), input.size(1), heads, width / heads}).permute({1, 2, 0, 3});
+  return torch::linear(input, attention->in_proj_weight.narrow(0, part * width, width), bias).view({input.size(0), input.size(1), heads, width / heads}).permute({1, 2, 0, 3});
  };
  const auto q = project(query, 0);
  const auto k = project(query, 1);
@@ -32,7 +33,7 @@ torch::Tensor grouped_attention(torch::nn::MultiheadAttention& attention, const 
  const auto output = projected_attention(attention, query, value, key_padding);
  return output.view({queries, batch, groups, width}).permute({1, 2, 0, 3}).reshape({batch, groups * queries, width});
 }
-}
+}  // namespace
 torch::Tensor isolated_group_self_attention(torch::nn::MultiheadAttention& attention, const torch::Tensor& target, const torch::Tensor& query_position, const DecoderQueryLayout& layout) {
  if (target.dim() != 3 || query_position.sizes() != target.sizes() || target.size(1) != layout.total_queries() || layout.ordinary.groups <= 0 || layout.ordinary.queries_per_group <= 0) {
   throw std::runtime_error("decoder query tensors do not match their typed group layout");
@@ -64,4 +65,4 @@ torch::Tensor isolated_group_self_attention(torch::nn::MultiheadAttention& atten
  const auto denoising_output = grouped_attention(attention, denoising_target, denoising_position, key_padding);
  return torch::cat({ordinary_output, denoising_output}, 1);
 }
-}
+}  // namespace mmltk::backend::models::rfdetr

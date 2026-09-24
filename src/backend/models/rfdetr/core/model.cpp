@@ -625,14 +625,16 @@ public:
   auto cross = cross_attn->forward(output + query_pos, reference_points, memory, feature_layout, memory_key_padding_mask);
   return post_cross_attention(output, cross);
  }
- void prepare_selective(bool training, bool enabled, int batch_size) { tail_region_.prepare(training, enabled, batch_size); }
+ void prepare_selective(bool training, bool enabled, std::int64_t batch_size) { tail_region_.prepare(training, enabled, batch_size); }
  void invalidate_selective() { tail_region_.invalidate(); }
 
 private:
  friend struct test_support::DecoderTailTestAccess;
  torch::Tensor post_cross_attention(const torch::Tensor& residual, const torch::Tensor& cross) {
-  return tail_region_.invoke(is_training(), {residual, cross}, {norm2.get(), linear1.get(), linear2.get(), norm3.get()},
-   [this](const auto& inputs) { return detail::SelectiveTensorRegion::Tensors{ordinary_post_cross_attention(inputs[0], inputs[1])}; }).front();
+  return tail_region_
+   .invoke(is_training(), {residual, cross}, {norm2.get(), linear1.get(), linear2.get(), norm3.get()},
+    [this](const auto& inputs) { return detail::SelectiveTensorRegion::Tensors{ordinary_post_cross_attention(inputs[0], inputs[1])}; })
+   .front();
  }
  torch::Tensor ordinary_post_cross_attention(const torch::Tensor& residual, const torch::Tensor& cross) {
   auto output = norm2->forward(residual + dropout2->forward(cross));
@@ -985,9 +987,7 @@ std::vector<detail::ClassTensorAxis> NativeRfDetrModel::Impl::class_axes() const
  if (training_supervision_) training_supervision_->append_class_axes(axes);
  return axes;
 }
-std::shared_ptr<torch::nn::Module> test_support::DecoderTailTestAccess::make(int64_t width, int64_t feedforward) {
- return std::make_shared<NativeDecoderLayerImpl>(width, 2, 2, feedforward, 1, 2);
-}
+std::shared_ptr<torch::nn::Module> test_support::DecoderTailTestAccess::make(int64_t width, int64_t feedforward) { return std::make_shared<NativeDecoderLayerImpl>(width, 2, 2, feedforward, 1, 2); }
 torch::Tensor test_support::DecoderTailTestAccess::invoke(torch::nn::Module& module, const torch::Tensor& residual, const torch::Tensor& cross, bool selective) {
  auto& layer = dynamic_cast<NativeDecoderLayerImpl&>(module);
  layer.prepare_selective(layer.is_training(), selective, residual.size(0));
@@ -1117,21 +1117,21 @@ ModelOutputs NativeRfDetrModel::Impl::forward_impl(const NestedTensor& batch, co
  {
   mmltk::common::logging::ScopedProfile profile_rfdetr_model_forward_backbone{"rfdetr.model.forward.backbone"};
   auto& backbone = backbone_->at<NativeBackboneImpl>(0);
-  auto feature = backbone_region_.invoke(is_train, {samples.tensors}, {&backbone},
-   [&](const auto& inputs) { return detail::SelectiveTensorRegion::Tensors{backbone.forward_features(inputs[0])}; }).front();
+  auto feature =
+   backbone_region_.invoke(is_train, {samples.tensors}, {&backbone}, [&](const auto& inputs) { return detail::SelectiveTensorRegion::Tensors{backbone.forward_features(inputs[0])}; }).front();
   features.push_back(NestedTensor{feature, resize_mask_to_feature(samples.mask, feature)});
  }
  std::vector<torch::Tensor> srcs;
- std::vector<torch::Tensor> masks;
+ std::vector<torch::Tensor> feature_masks;
  std::vector<torch::Tensor> poss;
  srcs.reserve(features.size());
- masks.reserve(features.size());
+ feature_masks.reserve(features.size());
  poss.reserve(features.size());
  {
   mmltk::common::logging::ScopedProfile profile_rfdetr_model_forward_position_embeddings{"rfdetr.model.forward.position_embeddings"};
   for (const auto& feature : features) {
    srcs.push_back(feature.tensors);
-   masks.push_back(feature.mask);
+   feature_masks.push_back(feature.mask);
    poss.push_back(backbone_->at<PositionEmbeddingSineImpl>(1).forward_full_valid(feature.tensors.size(0), feature.tensors.size(2), feature.tensors.size(3), feature.tensors.device()));
   }
  }
@@ -1144,7 +1144,7 @@ ModelOutputs NativeRfDetrModel::Impl::forward_impl(const NestedTensor& batch, co
  NativeTransformerOutput transformed;
  {
   mmltk::common::logging::ScopedProfile profile_rfdetr_model_forward_transformer{"rfdetr.model.forward.transformer"};
-  transformed = transformer->forward(srcs, masks, poss, ref_weights, query_weights, is_training(), denoising, training_supervision_.get());
+  transformed = transformer->forward(srcs, feature_masks, poss, ref_weights, query_weights, is_training(), denoising, training_supervision_.get());
  }
  std::vector<torch::Tensor> combined_query_features;
  std::vector<torch::Tensor> decoder_query_features;
@@ -1229,8 +1229,8 @@ ModelOutputs NativeRfDetrModel::Impl::forward_impl(const NestedTensor& batch, co
     dn_layer.pred_boxes = dn_boxes.view({dn_hs.size(0), denoising->layout.denoising_groups, denoising->layout.denoising_queries_per_group, 4});
     if (include_masks && segmentation_head_) {
      const auto& masks = sparse_masks[index];
-     dn_layer.sparse_pred_masks = SparsePredMasks{masks.spatial_features,
-      masks.query_features.narrow(1, denoising->layout.ordinary.total_queries(), denoising->layout.denoising_queries()), masks.bias};
+     dn_layer.sparse_pred_masks =
+      SparsePredMasks{masks.spatial_features, masks.query_features.narrow(1, denoising->layout.ordinary.total_queries(), denoising->layout.denoising_queries()), masks.bias};
     }
     if (final_decoder_layer) {
      outputs.denoising->main = std::move(dn_layer);

@@ -21,8 +21,8 @@ public:
  using event_type = std::variant<ValidationChanged, ValidationProgress>;
  using visual_source = VisualSourceProjection<ValidationSnapshot, PresentationSourceKind::Validation, mmltk::frameworks::reflection::member_path<&ValidationSnapshot::frame>,
   mmltk::frameworks::reflection::member_path<&ValidationSnapshot::frame, &VisualFrame::revision>, ValidationImageMetadata>;
- ValidationSystem(
-  SettingsSystem&, DatasetSystem&, ModelSystem&, ValidationRuntimeFactory, SystemEventSink<event_type> = {}, std::optional<mmltk::frameworks::gpu::DeviceExecution> = {}, VisualDeviceSettings = {}, mmltk::backend::imaging::raster::RenderedImageWriter::PngEncoder = {});
+ ValidationSystem(SettingsSystem&, DatasetSystem&, ModelSystem&, ValidationRuntimeFactory, SystemEventSink<event_type> = {}, std::optional<mmltk::frameworks::gpu::DeviceExecution> = {},
+  VisualDeviceSettings = {}, mmltk::backend::imaging::raster::RenderedImageWriter::PngEncoder = {});
  ~ValidationSystem();
  [[= contracts::reflection::direct::IntentEndpoint{}]] [[nodiscard]] ValidationSnapshot Start(contracts::ValidateWorkflowIntent);
  [[= contracts::reflection::direct::IntentEndpoint{}]] [[nodiscard]] ValidationSnapshot Stop() noexcept;

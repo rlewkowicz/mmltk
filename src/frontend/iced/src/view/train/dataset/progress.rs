@@ -311,7 +311,11 @@ pub(crate) fn view<Message: 'static>(state: Option<&ArtifactUiState>) -> Element
     let mut body = column![].spacing(6).width(Fill);
     if let Some(state) = state {
         if let Some(work) = work_caption(state) {
-            body = body.push(container(status_text(work).size(12)).id(WORK_ID).width(Fill));
+            body = body.push(
+                container(status_text(work).size(12))
+                    .id(WORK_ID)
+                    .width(Fill),
+            );
         } else {
             let title = heading(state);
             if !title.is_empty() {

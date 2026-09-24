@@ -8,12 +8,11 @@ std::uint64_t PredictionSelection::Percent(std::uint64_t population, unsigned pe
  return (population / 100U) * percent + ((population % 100U) * percent + 99U) / 100U;
 }
 std::uint64_t PredictionSelection::Eligible(std::uint64_t population, std::uint64_t limit, std::uint64_t count) {
- const auto eligible=limit ? std::min(population,limit) : population;
- if (!count || count>eligible) throw std::invalid_argument("prediction sample count exceeds the images eligible under the inference limit");
+ const auto eligible = limit ? std::min(population, limit) : population;
+ if (!count || count > eligible) throw std::invalid_argument("prediction sample count exceeds the images eligible under the inference limit");
  return eligible;
 }
-PredictionSelection::PredictionSelection(std::uint64_t population, std::uint64_t count, std::mt19937_64& random)
- : population_(population), excluded_(count > population / 2U) {
+PredictionSelection::PredictionSelection(std::uint64_t population, std::uint64_t count, std::mt19937_64& random) : population_(population), excluded_(count > population / 2U) {
  if (!population || !count || count > population) throw std::invalid_argument("prediction sample count is outside the admitted population");
  const auto stored = std::min(count, population - count);
  if (stored > indices_.max_size()) throw std::length_error("prediction selection exceeds index capacity");
@@ -34,8 +33,8 @@ std::optional<std::uint64_t> PredictionReservoir::Observe(std::mt19937_64& rando
  if (observed_ == std::numeric_limits<std::uint64_t>::max()) throw std::overflow_error("decoded video population exhausted");
  const auto index = observed_++;
  if (index < capacity_) return index;
- const auto slot = std::uniform_int_distribution<std::uint64_t>(0,index)(random);
+ const auto slot = std::uniform_int_distribution<std::uint64_t>(0, index)(random);
  return slot < capacity_ ? std::optional{slot} : std::nullopt;
 }
 std::uint64_t PredictionReservoir::selected() const noexcept { return std::min(capacity_, observed_); }
-}
+}  // namespace mmltk::controller::detail

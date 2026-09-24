@@ -493,12 +493,20 @@ impl widget::Operation for Capture {
             });
         }
     }
-    fn custom(&mut self, _id: Option<&widget::Id>, _bounds: Rectangle, state: &mut dyn std::any::Any) {
+    fn custom(
+        &mut self,
+        _id: Option<&widget::Id>,
+        _bounds: Rectangle,
+        state: &mut dyn std::any::Any,
+    ) {
         if let Some(index) = self.row
-            && let Some(measurement) = state.downcast_ref::<crate::view::shared::status_text::Measurement>()
+            && let Some(measurement) =
+                state.downcast_ref::<crate::view::shared::status_text::Measurement>()
             && self.frame.statuses.len() < 64
         {
-            self.frame.statuses.push((self.frame.rows[index].id, measurement.clone()));
+            self.frame
+                .statuses
+                .push((self.frame.rows[index].id, measurement.clone()));
         }
     }
     fn text(&mut self, _id: Option<&widget::Id>, bounds: Rectangle, text: &str) {
@@ -890,10 +898,17 @@ impl Widget<RootMessage, Theme, iced::Renderer> for Observed<'_> {
                     );
                 }
                 for (id, measurement) in &frame.statuses {
-                    sink.record("integration.dataset_status_font", id, "one-line", [
-                        measurement.size.into(), measurement.normal.into(),
-                        measurement.line.into(), measurement.paragraph_height.into(),
-                    ]);
+                    sink.record(
+                        "integration.dataset_status_font",
+                        id,
+                        "one-line",
+                        [
+                            measurement.size.into(),
+                            measurement.normal.into(),
+                            measurement.line.into(),
+                            measurement.paragraph_height.into(),
+                        ],
+                    );
                 }
                 sink.record(
                     "integration.dataset_viewport",

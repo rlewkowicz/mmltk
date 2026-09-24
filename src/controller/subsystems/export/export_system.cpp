@@ -25,10 +25,11 @@ contracts::ComputeTerminal CudaExportRuntime::Run(ExportRunRequest operation, st
  return impl_->resources.Run(
   [this, stop, &progress, &published, operation = std::move(operation)](const mmltk::backend::ml::runtime::BorrowedCommandStream stream) mutable {
    operation.onnx.device_id = impl_->resources.device();
-   return execute_export_run(operation, stop, progress, published,
-    [&](const auto& request, const auto& committed) { impl_->session.Run(request, stream, stop, committed); },
+   return execute_export_run(
+    operation, stop, progress, published, [&](const auto& request, const auto& committed) { impl_->session.Run(request, stream, stop, committed); },
     [&](const auto& request, const auto& committed) { mmltk::backend::models::rfdetr::build_tensorrt_engine(request, stream, {}, stop, committed); });
-  }, stop);
+  },
+  stop);
 }
 class ExportSystem::Impl final {
 public:

@@ -225,9 +225,7 @@ DepthwiseConvBlockImpl::DepthwiseConvBlockImpl(int64_t dim, double layer_scale_i
       act(register_module("act", torch::nn::GELU())) {
  if (layer_scale_init_value > 0.0) { gamma = register_parameter("gamma", torch::full({dim}, layer_scale_init_value, torch::kFloat32)); }
 }
-torch::Tensor DepthwiseConvBlockImpl::forward(torch::Tensor x) {
- return pointwise_tail(x, segmentation_depthwise(x, dwconv->weight, dwconv->bias));
-}
+torch::Tensor DepthwiseConvBlockImpl::forward(torch::Tensor x) { return pointwise_tail(x, segmentation_depthwise(x, dwconv->weight, dwconv->bias)); }
 torch::Tensor DepthwiseConvBlockImpl::pointwise_tail(const torch::Tensor& residual, torch::Tensor x) {
  x = x.permute({0, 2, 3, 1});
  x = norm->forward(x);
@@ -287,12 +285,14 @@ torch::Tensor SegmentationHeadImpl::project_spatial_features(const torch::Tensor
  return spatial_features_proj->forward(spatial_features);
 }
 torch::Tensor SegmentationHeadImpl::project_query_features(const torch::Tensor& query_features) {
- return query_region_.invoke(is_training(), {query_features}, {query_features_block.get(), query_features_proj ? static_cast<torch::nn::Module*>(query_features_proj.get()) : nullptr},
-  [this](const auto& inputs) {
-   auto projected = query_features_block->forward(inputs[0]);
-   if (!use_query_identity_) projected = query_features_proj->forward(projected);
-   return detail::SelectiveTensorRegion::Tensors{projected};
-  }).front();
+ return query_region_
+  .invoke(is_training(), {query_features}, {query_features_block.get(), query_features_proj ? static_cast<torch::nn::Module*>(query_features_proj.get()) : nullptr},
+   [this](const auto& inputs) {
+    auto projected = query_features_block->forward(inputs[0]);
+    if (!use_query_identity_) projected = query_features_proj->forward(projected);
+    return detail::SelectiveTensorRegion::Tensors{projected};
+   })
+  .front();
 }
 torch::Tensor SegmentationHeadImpl::resize_spatial_features(const torch::Tensor& spatial_features, std::pair<int64_t, int64_t> image_size) const {
  return F::interpolate(spatial_features, F::InterpolateFuncOptions()
@@ -314,8 +314,8 @@ std::vector<Output> SegmentationHeadImpl::collect_head_outputs(
   for (int64_t index = 0; index < static_cast<int64_t>(query_features.size()); ++index) {
    auto* block = blocks[index]->as<DepthwiseConvBlock>();
    auto convolved = segmentation_depthwise(resized_features, block->dwconv->weight, block->dwconv->bias);
-   auto stage = spatial_regions_[static_cast<size_t>(index)]->invoke(is_training(), {resized_features, convolved},
-    {block, spatial_features_proj ? static_cast<torch::nn::Module*>(spatial_features_proj.get()) : nullptr}, [&](const auto& inputs) {
+   auto stage = spatial_regions_[static_cast<size_t>(index)]->invoke(
+    is_training(), {resized_features, convolved}, {block, spatial_features_proj ? static_cast<torch::nn::Module*>(spatial_features_proj.get()) : nullptr}, [&](const auto& inputs) {
      auto next = block->pointwise_tail(inputs[0], inputs[1]);
      return detail::SelectiveTensorRegion::Tensors{next, project_spatial_features(next)};
     });
@@ -335,7 +335,7 @@ std::vector<torch::Tensor> SegmentationHeadImpl::forward(
 }
 std::vector<SparsePredMasks> SegmentationHeadImpl::sparse_forward(
  const torch::Tensor& spatial_features, const std::vector<torch::Tensor>& query_features, std::pair<int64_t, int64_t> image_size, bool skip_blocks) {
- return collect_head_outputs<SparsePredMasks>(spatial_features, query_features, image_size, skip_blocks,
-  [this](torch::Tensor spatial, torch::Tensor queries) { return SparsePredMasks{std::move(spatial), std::move(queries), bias}; });
+ return collect_head_outputs<SparsePredMasks>(
+  spatial_features, query_features, image_size, skip_blocks, [this](torch::Tensor spatial, torch::Tensor queries) { return SparsePredMasks{std::move(spatial), std::move(queries), bias}; });
 }
 }  // namespace mmltk::backend::models::rfdetr

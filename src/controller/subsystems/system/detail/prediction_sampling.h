@@ -14,6 +14,7 @@ public:
  [[nodiscard]] std::size_t retained_indices() const noexcept { return indices_.size(); }
  [[nodiscard]] static std::uint64_t Percent(std::uint64_t population, unsigned percent);
  [[nodiscard]] static std::uint64_t Eligible(std::uint64_t population, std::uint64_t limit, std::uint64_t count);
+
 private:
  std::uint64_t population_;
  bool excluded_;
@@ -27,7 +28,8 @@ public:
  [[nodiscard]] std::optional<std::uint64_t> Observe(std::mt19937_64&);
  [[nodiscard]] std::uint64_t observed() const noexcept { return observed_; }
  [[nodiscard]] std::uint64_t selected() const noexcept;
+
 private:
  std::uint64_t capacity_, observed_ = 0;
 };
-}
+}  // namespace mmltk::controller::detail

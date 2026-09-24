@@ -25,4 +25,4 @@ struct PredictionRunPreview final {
 };
 MMLTK_REFLECT_FIELDS(PredictionOutputSettings)
 MMLTK_REFLECT_FIELDS(PredictionRunPreview)
-}
+}  // namespace mmltk::controller::contracts

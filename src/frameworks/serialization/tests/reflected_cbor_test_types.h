@@ -2,6 +2,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <filesystem>
 #include <inplace_vector>
 #include <optional>
 #include <span>
@@ -32,10 +33,20 @@ struct BoundContainers final {
 struct BoundFlat final {
  [[= policy::MaxBytes{4U}]][[= policy::MaxItems{2U}]] wire::FlatValue flat;
 };
+struct BoundPaths final {
+ [[= policy::MaxBytes{4U}]][[= policy::MaxItems{2U}]] std::vector<std::filesystem::path> paths;
+};
+struct BoundTextContainers final {
+ [[= policy::MaxBytes{4U}]] std::array<std::string, 2U> fixed;
+ [[= policy::MaxBytes{4U}]] std::inplace_vector<std::string, 2U> local;
+ [[= policy::MaxBytes{4U}]][[= policy::MaxItems{2U}]] std::span<const std::string> borrowed;
+};
 MMLTK_REFLECT_FIELDS(BoundBase)
 MMLTK_REFLECT_FIELDS(BoundLeaf)
 MMLTK_REFLECT_FIELDS(BoundContainers)
 MMLTK_REFLECT_FIELDS(BoundFlat)
+MMLTK_REFLECT_FIELDS(BoundPaths)
+MMLTK_REFLECT_FIELDS(BoundTextContainers)
 using BoundVariant = std::variant<BoundLeaf, BoundContainers>;
 // Materialize each query beside its ordinary canonical declaration.
 inline constexpr auto kLeafFullBytes = reflected_maximum_cbor_bytes<BoundLeaf>();
@@ -45,4 +56,6 @@ inline constexpr auto kContainersStructuralBytes = reflected_structural_cbor_byt
 inline constexpr auto kVariantStructuralBytes = reflected_structural_cbor_bytes<BoundVariant>();
 inline constexpr auto kFlatFullBytes = reflected_maximum_cbor_bytes<BoundFlat>();
 inline constexpr auto kFlatStructuralBytes = reflected_structural_cbor_bytes<BoundFlat>();
+inline constexpr auto kPathsFullBytes = reflected_maximum_cbor_bytes<BoundPaths>();
+inline constexpr auto kTextContainersFullBytes = reflected_maximum_cbor_bytes<BoundTextContainers>();
 }  // namespace mmltk::frameworks::serialization::test

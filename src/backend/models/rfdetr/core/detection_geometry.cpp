@@ -57,14 +57,16 @@ torch::Tensor box_cxcywh_to_xyxy(const torch::Tensor& boxes, const BoxExtentPoli
 }
 torch::Tensor pairwise_box_iou(const torch::Tensor& boxes1, const torch::Tensor& boxes2) {
  require_pairwise_prefix(boxes1, boxes2, "pairwise_box_iou");
- if (boxes1.dim() == 2 && boxes1.is_cuda() && boxes2.is_cuda() && boxes1.scalar_type() == torch::kFloat32 && boxes2.scalar_type() == torch::kFloat32 && !boxes1.requires_grad() && !boxes2.requires_grad()) {
+ if (boxes1.dim() == 2 && boxes1.is_cuda() && boxes2.is_cuda() && boxes1.scalar_type() == torch::kFloat32 && boxes2.scalar_type() == torch::kFloat32 && !boxes1.requires_grad() &&
+     !boxes2.requires_grad()) {
   return mmltk::backend::ml::ops::box_iou_cuda(boxes1, boxes2);
  }
  return generic_pairwise_iou(boxes1, boxes2).first;
 }
 torch::Tensor pairwise_generalized_box_iou(const torch::Tensor& boxes1, const torch::Tensor& boxes2) {
  require_pairwise_prefix(boxes1, boxes2, "pairwise_generalized_box_iou");
- if (boxes1.dim() == 2 && boxes1.is_cuda() && boxes2.is_cuda() && boxes1.scalar_type() == torch::kFloat32 && boxes2.scalar_type() == torch::kFloat32 && !boxes1.requires_grad() && !boxes2.requires_grad()) {
+ if (boxes1.dim() == 2 && boxes1.is_cuda() && boxes2.is_cuda() && boxes1.scalar_type() == torch::kFloat32 && boxes2.scalar_type() == torch::kFloat32 && !boxes1.requires_grad() &&
+     !boxes2.requires_grad()) {
   return mmltk::backend::ml::ops::generalized_box_iou_cuda(boxes1, boxes2);
  }
  const auto [iou, union_area] = generic_pairwise_iou(boxes1, boxes2);

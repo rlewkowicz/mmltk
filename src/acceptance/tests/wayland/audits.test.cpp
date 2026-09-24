@@ -2505,8 +2505,8 @@ TEST_CASE("Dataset reversal joins actual closing and reopening draws before sett
   if (defect != "missing-baseline") audit.dataset_transition_frames[25U].push_back({0, 217, 0, 0, 0, 0, 0, 0, 0});
   if (defect != "missing-closing") audit.dataset_transition_frames[6U].push_back({0, 180, 0, 0, 0, 0, 0, 0, 0});
   if (defect != "missing-reopening") audit.dataset_transition_frames[6U].push_back({0, 190, 0, 0, 0, 0, 0, 0, 0});
-  const nlohmann::json record{{"event", "integration.dataset_reversal"}, {"control", "train.dataset.coconut_options"}, {"detail", "actual-draw"},
-                            {"a", defect == "wrong-full" ? 218 : 217}, {"b", defect == "settled-close" ? 0 : 180}, {"c", 190}, {"d", 1U}};
+  const nlohmann::json record{{"event", "integration.dataset_reversal"}, {"control", "train.dataset.coconut_options"}, {"detail", "actual-draw"}, {"a", defect == "wrong-full" ? 218 : 217},
+   {"b", defect == "settled-close" ? 0 : 180}, {"c", 190}, {"d", 1U}};
   audit.consume(record);
   if (defect == "duplicate") audit.consume(record);
   CHECK(audit.dataset_reversal == (defect == "none"));
@@ -2654,14 +2654,14 @@ TEST_CASE("Dataset presentation requires complete scoped custody evidence", "[wo
   CHECK(audit.dataset_presentation_complete() == (defect == "none"));
  }
 }
-
 TEST_CASE("status paragraphs retain one normal-height line with half-pixel fitting", "[workspace][audit]") {
  for (const auto size : {12.0, 11.5, 8.0}) {
   BrowserAudit audit;
   audit.consume({{"event", "integration.dataset_status_font"}, {"control", "train.dataset.progress.pixels"}, {"a", size}, {"b", 12.0}, {"c", 15.6}, {"d", 15.6}});
   CHECK(audit.dataset_status_valid);
   CHECK_FALSE(audit.dataset_status_fitted);
-  audit.consume({{"event", "integration.dataset_draw"}, {"control", "train.dataset.progress.pixels"}, {"detail", "Pixels\nCompiling image pixels · 2,345 / 9,876"}, {"a", 12}, {"b", 30}, {"c", 200}, {"d", 43.2}});
+  audit.consume(
+   {{"event", "integration.dataset_draw"}, {"control", "train.dataset.progress.pixels"}, {"detail", "Pixels\nCompiling image pixels · 2,345 / 9,876"}, {"a", 12}, {"b", 30}, {"c", 200}, {"d", 43.2}});
   audit.consume({{"event", "integration.dataset_frame"}, {"a", 200U}});
   CHECK(audit.dataset_status_fitted == (size < 12.0));
  }
@@ -2671,65 +2671,67 @@ TEST_CASE("status paragraphs retain one normal-height line with half-pixel fitti
   CHECK_FALSE(audit.dataset_status_valid);
  }
 }
-
-
 TEST_CASE("Dataset fitted pixels require the exact narrow compiling frame", "[workspace][audit]") {
- for (const std::string defect : {"none", "wide-frame", "native-frame", "short-caption", "wrong-caption", "wide-row", "missing-fit", "normal-size", "wrong-step", "short-line", "wrapped", "stale-frame"}) {
+ for (const std::string defect :
+  {"none", "wide-frame", "native-frame", "short-caption", "wrong-caption", "wide-row", "missing-fit", "normal-size", "wrong-step", "short-line", "wrapped", "stale-frame"}) {
   BrowserAudit audit;
   if (defect != "missing-fit")
    audit.consume({{"event", "integration.dataset_status_font"}, {"control", "train.dataset.progress.pixels"},
-    {"a", defect == "normal-size" ? 12.0 : defect == "wrong-step" ? 9.25 : 9.5}, {"b", 12.0}, {"c", defect == "short-line" ? 12.35 : 15.6}, {"d", defect == "wrapped" ? 31.2 : 15.6}});
+    {"a", defect == "normal-size"  ? 12.0
+          : defect == "wrong-step" ? 9.25
+                                   : 9.5},
+    {"b", 12.0}, {"c", defect == "short-line" ? 12.35 : 15.6}, {"d", defect == "wrapped" ? 31.2 : 15.6}});
   if (defect == "stale-frame") audit.consume({{"event", "integration.dataset_frame"}, {"a", 209U}});
   audit.consume({{"event", "integration.dataset_draw"}, {"control", "train.dataset.progress.pixels"},
-   {"detail", defect == "short-caption" ? "Pixels\nComplete" : defect == "wrong-caption" ? "Pixels\nWaiting · 2,345 / 9,876" : "Pixels\nCompiling image pixels · 2,345 / 9,876"},
+   {"detail", defect == "short-caption"   ? "Pixels\nComplete"
+              : defect == "wrong-caption" ? "Pixels\nWaiting · 2,345 / 9,876"
+                                          : "Pixels\nCompiling image pixels · 2,345 / 9,876"},
    {"a", 12}, {"b", 30}, {"c", defect == "wide-row" ? 336.0 : 200.0}, {"d", 43.2}});
   audit.consume({{"event", "integration.dataset_frame"}, {"a", defect == "wide-frame" ? 209U : defect == "native-frame" ? 100U : 200U}});
   CHECK(audit.dataset_status_fitted == (defect == "none"));
   CHECK_FALSE(audit.dataset_pixels_status_font);
  }
 }
-
 }  // namespace mmltk::acceptance::wayland
-
 TEST_CASE("validation saved output audit requires six exact published sample identities", "[workspace][audit][output]") {
  mmltk::acceptance::wayland::BrowserAudit audit;
- for (unsigned index : {2U,9U,1U,15U,8U,3U}) audit.validation_saved_samples.push_back({{"a",4U},{"b",index},{"c",6U},{"control","output/validate/run-0001/samples"},{"detail","sample-"+std::to_string(index)+".png"}});
+ for (unsigned index : {2U, 9U, 1U, 15U, 8U, 3U})
+  audit.validation_saved_samples.push_back({{"a", 4U}, {"b", index}, {"c", 6U}, {"control", "output/validate/run-0001/samples"}, {"detail", "sample-" + std::to_string(index) + ".png"}});
  REQUIRE(audit.validation_samples_complete());
  audit.validation_saved_samples.back()["b"] = 2U;
  CHECK_FALSE(audit.validation_samples_complete());
 }
-
 namespace mmltk::acceptance::wayland {
 TEST_CASE("prediction output evidence decodes real files and rejects suffix-only claims", "[workspace][audit][prediction]") {
  mmltk::testsupport::ScopedTempDir temporary("prediction-output-audit");
- const auto root=temporary.path();
- std::filesystem::create_directory(root/"samples");
- const std::array<std::uint8_t,12> pixels{255,0,0,0,255,0,0,0,255,255,255,255};
- REQUIRE(stbi_write_png((root/"sample.png").c_str(),2,2,3,pixels.data(),6)!=0);
- REQUIRE(stbi_write_png((root/"samples"/"sample-3.png").c_str(),2,2,3,pixels.data(),6)!=0);
- const auto generated=mmltk::testsupport::run_subprocess_capture_output({"ffmpeg","-v","error","-f","lavfi","-i","color=red:size=16x16:rate=4:duration=2","-c:v","libx264","-bf","0","-f","matroska","-live","1",(root/"prediction.mkv").string()});
- REQUIRE(generated.exit_code==0);
- std::filesystem::copy_file(root/"prediction.mkv",root/"prediction.partial.mkv");
+ const auto root = temporary.path();
+ std::filesystem::create_directory(root / "samples");
+ const std::array<std::uint8_t, 12> pixels{255, 0, 0, 0, 255, 0, 0, 0, 255, 255, 255, 255};
+ REQUIRE(stbi_write_png((root / "sample.png").c_str(), 2, 2, 3, pixels.data(), 6) != 0);
+ REQUIRE(stbi_write_png((root / "samples" / "sample-3.png").c_str(), 2, 2, 3, pixels.data(), 6) != 0);
+ const auto generated = mmltk::testsupport::run_subprocess_capture_output(
+  {"ffmpeg", "-v", "error", "-f", "lavfi", "-i", "color=red:size=16x16:rate=4:duration=2", "-c:v", "libx264", "-bf", "0", "-f", "matroska", "-live", "1", (root / "prediction.mkv").string()});
+ REQUIRE(generated.exit_code == 0);
+ std::filesystem::copy_file(root / "prediction.mkv", root / "prediction.partial.mkv");
  BrowserAudit audit;
- audit.consume({{"event","integration.prediction.output"},{"detail","compiled"},{"control",(root/"samples"/"sample-3.png").string()},{"a",1.0},{"b",1.0},{"c",0.0},{"d",1.0}});
- audit.consume({{"event","integration.prediction.output"},{"detail","image"},{"control",(root/"sample.png").string()},{"a",1.0},{"b",1.0},{"c",0.0},{"d",1.0}});
- audit.consume({{"event","integration.prediction.output"},{"detail","video"},{"control",(root/"prediction.mkv").string()},{"b",8.0},{"c",0.0},{"d",1.0}});
- audit.consume({{"event","integration.prediction.output"},{"detail","stop"},{"control",(root/"prediction.partial.mkv").string()},{"c",0.0},{"d",1.0}});
- CHECK(std::ranges::all_of(audit.prediction_outputs,[](bool value){return value;}));
- for (int index=0;index<3;++index) audit.consume({{"event","integration.prediction.saving"},{"a",index},{"b",1.0}});
- CHECK(std::ranges::all_of(audit.prediction_saving_controls,[](bool value){return value;}));
- std::filesystem::create_directory(root/"empty");
- for (const auto* stage : {"compiled","image"}) audit.consume({{"event","integration.prediction.no_output"},{"detail",stage},{"control",(root/"empty").string()},{"a",1.0}});
- CHECK(std::ranges::all_of(audit.prediction_no_outputs,[](bool value){return value;}));
- std::ofstream(root/"empty"/"unexpected.json")<<"{}";
- audit.consume({{"event","integration.prediction.no_output"},{"detail","image"},{"control",(root/"empty").string()},{"a",1.0}});
+ audit.consume({{"event", "integration.prediction.output"}, {"detail", "compiled"}, {"control", (root / "samples" / "sample-3.png").string()}, {"a", 1.0}, {"b", 1.0}, {"c", 0.0}, {"d", 1.0}});
+ audit.consume({{"event", "integration.prediction.output"}, {"detail", "image"}, {"control", (root / "sample.png").string()}, {"a", 1.0}, {"b", 1.0}, {"c", 0.0}, {"d", 1.0}});
+ audit.consume({{"event", "integration.prediction.output"}, {"detail", "video"}, {"control", (root / "prediction.mkv").string()}, {"b", 8.0}, {"c", 0.0}, {"d", 1.0}});
+ audit.consume({{"event", "integration.prediction.output"}, {"detail", "stop"}, {"control", (root / "prediction.partial.mkv").string()}, {"c", 0.0}, {"d", 1.0}});
+ CHECK(std::ranges::all_of(audit.prediction_outputs, [](bool value) { return value; }));
+ for (int index = 0; index < 3; ++index) audit.consume({{"event", "integration.prediction.saving"}, {"a", index}, {"b", 1.0}});
+ CHECK(std::ranges::all_of(audit.prediction_saving_controls, [](bool value) { return value; }));
+ std::filesystem::create_directory(root / "empty");
+ for (const auto* stage : {"compiled", "image"}) audit.consume({{"event", "integration.prediction.no_output"}, {"detail", stage}, {"control", (root / "empty").string()}, {"a", 1.0}});
+ CHECK(std::ranges::all_of(audit.prediction_no_outputs, [](bool value) { return value; }));
+ std::ofstream(root / "empty" / "unexpected.json") << "{}";
+ audit.consume({{"event", "integration.prediction.no_output"}, {"detail", "image"}, {"control", (root / "empty").string()}, {"a", 1.0}});
  CHECK_FALSE(audit.prediction_no_outputs[1]);
- std::ofstream(root/"prediction.mkv",std::ios::trunc)<<"not video";
- audit.consume({{"event","integration.prediction.output"},{"detail","video"},{"control",(root/"prediction.mkv").string()},{"b",8.0},{"c",0.0},{"d",1.0}});
+ std::ofstream(root / "prediction.mkv", std::ios::trunc) << "not video";
+ audit.consume({{"event", "integration.prediction.output"}, {"detail", "video"}, {"control", (root / "prediction.mkv").string()}, {"b", 8.0}, {"c", 0.0}, {"d", 1.0}});
  CHECK_FALSE(audit.prediction_outputs[2]);
- std::filesystem::remove(root/"sample.png");
- audit.consume({{"event","integration.prediction.output"},{"detail","image"},{"control",(root/"sample.png").string()},{"a",1.0},{"b",1.0},{"c",0.0},{"d",1.0}});
+ std::filesystem::remove(root / "sample.png");
+ audit.consume({{"event", "integration.prediction.output"}, {"detail", "image"}, {"control", (root / "sample.png").string()}, {"a", 1.0}, {"b", 1.0}, {"c", 0.0}, {"d", 1.0}});
  CHECK_FALSE(audit.prediction_outputs[1]);
-
 }
-}
+}  // namespace mmltk::acceptance::wayland

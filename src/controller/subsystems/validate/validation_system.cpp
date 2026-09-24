@@ -31,31 +31,31 @@ ValidationRuntimeResult CudaValidationRuntime::Run(
  mmltk::backend::models::rfdetr::ValidateRequest operation, std::stop_token stop, const ComputeProgressSink& progress, const mmltk::backend::models::rfdetr::ValidationDelivery& delivery) {
  ValidationRuntimeResult result;
  try {
- result.terminal = impl_->resources.Run(
-  [this, &result, &progress, &delivery, stop, operation = std::move(operation)](const mmltk::backend::ml::runtime::BorrowedCommandStream stream) mutable {
-   operation.device_id = impl_->resources.device();
-   operation.compile_cuda_device_id = impl_->resources.device();
-   operation = mmltk::backend::models::rfdetr::finalize_validate_request(std::move(operation));
-   std::uint64_t sequence = 0U;
-   auto callbacks = delivery;
-   callbacks.stop = stop;
-   callbacks.progress = [&](std::size_t completed, std::size_t total) {
-    if (progress) progress({++sequence, completed, total, "Validating"});
-   };
-   auto evaluated = impl_->session.Run(operation, stream, callbacks);
-   if (evaluated.backends.size() > 1U) throw std::logic_error("GUI validation requires one selected backend");
-   std::exception_ptr report_failure;
-   if (!evaluated.cancelled && operation.write_report_json && !operation.report_json_path.empty()) {
-    try {
-     mmltk::backend::models::rfdetr::write_validation_report(operation, evaluated);
-     result.report = operation.report_json_path;
-    } catch (...) { report_failure = std::current_exception(); }
-   }
-   if (!evaluated.backends.empty()) result.evaluation = std::move(evaluated.backends.begin()->second);
-   if (report_failure) std::rethrow_exception(report_failure);
-   return contracts::make_compute_terminal(evaluated.cancelled ? contracts::ComputeOperationOutcome::Cancelled : contracts::ComputeOperationOutcome::Succeeded, 0U, evaluated.processed_images);
-  },
-  stop);
+  result.terminal = impl_->resources.Run(
+   [this, &result, &progress, &delivery, stop, operation = std::move(operation)](const mmltk::backend::ml::runtime::BorrowedCommandStream stream) mutable {
+    operation.device_id = impl_->resources.device();
+    operation.compile_cuda_device_id = impl_->resources.device();
+    operation = mmltk::backend::models::rfdetr::finalize_validate_request(std::move(operation));
+    std::uint64_t sequence = 0U;
+    auto callbacks = delivery;
+    callbacks.stop = stop;
+    callbacks.progress = [&](std::size_t completed, std::size_t total) {
+     if (progress) progress({++sequence, completed, total, "Validating"});
+    };
+    auto evaluated = impl_->session.Run(operation, stream, callbacks);
+    if (evaluated.backends.size() > 1U) throw std::logic_error("GUI validation requires one selected backend");
+    std::exception_ptr report_failure;
+    if (!evaluated.cancelled && operation.write_report_json && !operation.report_json_path.empty()) {
+     try {
+      mmltk::backend::models::rfdetr::write_validation_report(operation, evaluated);
+      result.report = operation.report_json_path;
+     } catch (...) { report_failure = std::current_exception(); }
+    }
+    if (!evaluated.backends.empty()) result.evaluation = std::move(evaluated.backends.begin()->second);
+    if (report_failure) std::rethrow_exception(report_failure);
+    return contracts::make_compute_terminal(evaluated.cancelled ? contracts::ComputeOperationOutcome::Cancelled : contracts::ComputeOperationOutcome::Succeeded, 0U, evaluated.processed_images);
+   },
+   stop);
  } catch (...) { result.terminal = contracts::compute_failure_terminal(std::current_exception(), "validation runtime failed"); }
  return result;
 }
@@ -71,10 +71,18 @@ public:
        configuration_{std::move(execution)},
        previews_(visual.valid()),
        samples_(visual, [this] { Changed(); }),
-       sample_output_(configuration_, visual, [this](const auto& path) {
-        { std::scoped_lock lock(mutex_); state_.output.samples_directory = path.parent_path().string(); ++state_.output.completed_samples; state_.output.recent_sample = path.string(); }
-        Changed();
-       }, std::move(encoder)) {
+       sample_output_(
+        configuration_, visual,
+        [this](const auto& path) {
+         {
+          std::scoped_lock lock(mutex_);
+          state_.output.samples_directory = path.parent_path().string();
+          ++state_.output.completed_samples;
+          state_.output.recent_sample = path.string();
+         }
+         Changed();
+        },
+        std::move(encoder)) {
   if (!factory_) throw contracts::UnavailableError("compute runtime factory is unavailable");
   samples_.SetDisplay(settings_.validation_display_settings());
  }
@@ -83,24 +91,28 @@ public:
   delivery.samples_selected = [this, generation, directory, preview](auto indices, auto) {
    sample_output_.Begin(directory, preview, indices);
    if (previews_) {
-    try { sample_output_.UseCaptureContext(samples_.CaptureContext()); samples_.Begin(generation, indices); }
-    catch (const mmltk::backend::ml::runtime::CudaOperationError&) { throw; }
-    catch (...) { /* Interactive sample admission remains optional. */ }
+    try {
+     sample_output_.UseCaptureContext(samples_.CaptureContext());
+     samples_.Begin(generation, indices);
+    } catch (const mmltk::backend::ml::runtime::CudaOperationError&) { throw; } catch (...) { /* Interactive sample admission remains optional. */
+    }
    }
   };
   delivery.sample = [this, generation](auto sample) {
    auto raw = sample_output_.Capture(sample);
    if (previews_ && raw) {
-    try { samples_.Adopt(generation, std::move(sample), std::move(raw)); }
-    catch (const mmltk::backend::ml::runtime::CudaOperationError&) { throw; }
-    catch (...) { /* Required output and metrics do not depend on display adoption. */ }
+    try {
+     samples_.Adopt(generation, std::move(sample), std::move(raw));
+    } catch (const mmltk::backend::ml::runtime::CudaOperationError&) { throw; } catch (...) { /* Required output and metrics do not depend on display adoption. */
+    }
    }
   };
   return delivery;
  }
  ~Impl() { Shutdown(); }
  [[nodiscard]] contracts::ComputeUiState Start(contracts::ValidationRunPreview preview) {
-  if (!std::isfinite(preview.display.confidence_threshold) || preview.display.confidence_threshold < 0.0F || preview.display.confidence_threshold > 1.0F) throw contracts::InvalidIntentError("validation preview confidence must be between zero and one");
+  if (!std::isfinite(preview.display.confidence_threshold) || preview.display.confidence_threshold < 0.0F || preview.display.confidence_threshold > 1.0F)
+   throw contracts::InvalidIntentError("validation preview confidence must be between zero and one");
   const auto settings = settings_.materialization_facts();
   if (!settings.loaded) throw contracts::UnavailableError("settings are unavailable");
   const auto selection = model_.selection();
@@ -135,12 +147,15 @@ public:
       if (!runtime_) throw std::runtime_error("compute runtime is unavailable");
       auto delivery = Delivery(generation, directory, preview);
       auto result = [&] {
-       try { return runtime_->Run(std::move(*prepared), stop, progress, delivery); }
-       catch (...) {
+       try {
+        return runtime_->Run(std::move(*prepared), stop, progress, delivery);
+       } catch (...) {
         const auto failure = std::current_exception();
         // Publish any completed selected image before this run becomes terminal.
         // A secondary save failure must not replace the runtime's original error.
-        try { sample_output_.Finish(false); } catch (...) {}
+        try {
+         sample_output_.Finish(false);
+        } catch (...) {}
         std::rethrow_exception(failure);
        }
       }();
@@ -150,8 +165,9 @@ public:
        evaluation_ = std::move(result.evaluation);
        evaluation_generation_ = state_.generation_frontier;
       }
-      try { sample_output_.Finish(result.terminal.outcome == contracts::ComputeOperationOutcome::Succeeded); }
-      catch (...) {
+      try {
+       sample_output_.Finish(result.terminal.outcome == contracts::ComputeOperationOutcome::Succeeded);
+      } catch (...) {
        auto failure = contracts::compute_failure_terminal(std::current_exception(), "validation sample output failed");
        failure.completed = result.terminal.completed;
        return failure;

@@ -264,8 +264,7 @@ struct VideoFileSource::State final {
    const auto seconds = static_cast<double>(frame->best_effort_timestamp) * av_q2d(format->streams[video_stream]->time_base);
    if (std::isfinite(seconds)) result.presentation_seconds = seconds;
   }
-  result.timing = {frame->best_effort_timestamp == AV_NOPTS_VALUE ? std::nullopt : std::optional{frame->best_effort_timestamp},
-   frame->duration, track->time_base.num, track->time_base.den};
+  result.timing = {frame->best_effort_timestamp == AV_NOPTS_VALUE ? std::nullopt : std::optional{frame->best_effort_timestamp}, frame->duration, track->time_base.num, track->time_base.den};
   return result;
  }
 };
@@ -527,7 +526,7 @@ std::optional<VideoFrame> VideoFileSource::Next() {
       if (track >= state.audio_read.size()) throw std::runtime_error("video stream set changed during decoding");
       const auto ordinal = ++state.audio_read[track];
       if (ordinal > state.audio_delivered[track]) {
-       if (state.packet->size<0 || state.packet->size>16*1024*1024) throw std::runtime_error("prediction audio packet exceeds bounded capacity");
+       if (state.packet->size < 0 || state.packet->size > 16 * 1024 * 1024) throw std::runtime_error("prediction audio packet exceeds bounded capacity");
        auto owned = std::make_shared<VideoAudioPacket::State>();
        if (!owned->packet) throw std::bad_alloc();
        require_media(av_packet_ref(owned->packet, state.packet), "retain prediction audio packet");
@@ -565,8 +564,7 @@ std::optional<VideoFrame> VideoFileSource::Next() {
 std::optional<VideoMediaInfo> VideoFileSource::media_info() const {
  const auto& source = *owner_->state;
  if (source.stop.stop_requested()) return std::nullopt;
- if (owner_->terminal || !source.admitted || !source.format || !source.codec || source.video_stream < 0 ||
-     static_cast<unsigned>(source.video_stream) >= source.format->nb_streams ||
+ if (owner_->terminal || !source.admitted || !source.format || !source.codec || source.video_stream < 0 || static_cast<unsigned>(source.video_stream) >= source.format->nb_streams ||
      !source.format->streams[source.video_stream] || !source.format->streams[source.video_stream]->codecpar)
   throw std::logic_error("video metadata requires completed decoder admission");
  const auto* track = source.format->streams[source.video_stream];
@@ -584,11 +582,11 @@ std::optional<VideoMediaInfo> VideoFileSource::media_info() const {
   const auto* input = source.format->streams[index];
   if (input->codecpar->codec_type != AVMEDIA_TYPE_AUDIO) continue;
   if (facts->audio.size() == 64U) throw std::runtime_error("video exceeds supported audio track capacity");
-  if (input->codecpar->extradata_size<0 || input->codecpar->extradata_size>1024*1024) throw std::runtime_error("prediction audio format exceeds bounded capacity");
+  if (input->codecpar->extradata_size < 0 || input->codecpar->extradata_size > 1024 * 1024) throw std::runtime_error("prediction audio format exceeds bounded capacity");
   auto copy = std::make_unique<VideoMediaInfo::State::Track>();
   if (!copy->parameters) throw std::bad_alloc();
-  require_media(avcodec_parameters_copy(copy->parameters,input->codecpar), "copy prediction audio format");
-  require_media(av_dict_copy(&copy->metadata,input->metadata,0), "copy prediction audio metadata");
+  require_media(avcodec_parameters_copy(copy->parameters, input->codecpar), "copy prediction audio format");
+  require_media(av_dict_copy(&copy->metadata, input->metadata, 0), "copy prediction audio metadata");
   copy->source = static_cast<int>(index);
   copy->disposition = input->disposition;
   copy->time_base = input->time_base;

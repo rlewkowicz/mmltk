@@ -11,5 +11,5 @@ struct DecoderTailTestAccess {
  static std::shared_ptr<torch::nn::Module> make(int64_t width, int64_t feedforward);
  static torch::Tensor invoke(torch::nn::Module& layer, const torch::Tensor& residual, const torch::Tensor& cross, bool selective);
 };
-}
-}
+}  // namespace test_support
+}  // namespace mmltk::backend::models::rfdetr

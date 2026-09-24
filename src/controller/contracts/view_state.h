@@ -312,9 +312,7 @@ template <ModelArtifactSelectionView State>
   .source = s.model_source,
   .input = s.model_input};
  if constexpr (requires { source.class_layout_path; }) { artifact_state.class_layout_path = path_text(source.class_layout_path); }
- if constexpr (requires { source.onnx_path; }) {
-  artifact_state.onnx_path = path_text(source.onnx_path);
- }
+ if constexpr (requires { source.onnx_path; }) { artifact_state.onnx_path = path_text(source.onnx_path); }
  if constexpr (requires { source.tensorrt_path; }) { artifact_state.tensorrt_path = path_text(source.tensorrt_path); }
  return artifact_state;
 }
@@ -332,9 +330,7 @@ inline void apply_model_artifacts(State& s, const ModelArtifactSelectionState& a
  }
  s.model_source = artifact_state.source;
  s.model_input = artifact_state.input;
- if constexpr (requires { destination.onnx_path; }) {
-  destination.onnx_path = artifact_state.onnx_path;
- }
+ if constexpr (requires { destination.onnx_path; }) { destination.onnx_path = artifact_state.onnx_path; }
  if constexpr (requires { destination.tensorrt_path; }) { destination.tensorrt_path = artifact_state.tensorrt_path; }
 }
 // CLEANUP-IGNORE: The view-state reflection inventory is authoritative declarative schema, not executable duplication.

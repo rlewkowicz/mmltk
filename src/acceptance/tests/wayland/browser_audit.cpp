@@ -38,58 +38,65 @@ namespace {
 // Inspect terminal files in the packaged process's shared filesystem. Decoding
 // holds one reusable frame and packet regardless of recording duration.
 struct SavedVideoDecode final {
- AVFormatContext* format=nullptr;
- AVCodecContext* codec=nullptr;
- AVFrame* frame=av_frame_alloc();
- AVPacket* packet=av_packet_alloc();
- ~SavedVideoDecode() { av_packet_free(&packet); av_frame_free(&frame); avcodec_free_context(&codec); avformat_close_input(&format); }
+ AVFormatContext* format = nullptr;
+ AVCodecContext* codec = nullptr;
+ AVFrame* frame = av_frame_alloc();
+ AVPacket* packet = av_packet_alloc();
+ ~SavedVideoDecode() {
+  av_packet_free(&packet);
+  av_frame_free(&frame);
+  avcodec_free_context(&codec);
+  avformat_close_input(&format);
+ }
  std::uint64_t Count(const std::filesystem::path& path) {
-  if (!frame || !packet || avformat_open_input(&format,path.c_str(),nullptr,nullptr)<0 || avformat_find_stream_info(format,nullptr)<0) return 0;
-  const AVCodec* decoder=nullptr;
-  const int track=av_find_best_stream(format,AVMEDIA_TYPE_VIDEO,-1,-1,&decoder,0);
-  if (track<0 || format->streams[track]->codecpar->codec_id!=AV_CODEC_ID_H264) return 0;
-  codec=avcodec_alloc_context3(decoder);
-  if (!codec || avcodec_parameters_to_context(codec,format->streams[track]->codecpar)<0 || avcodec_open2(codec,decoder,nullptr)<0) return 0;
-  std::uint64_t count=0;
-  const auto receive=[&] {
+  if (!frame || !packet || avformat_open_input(&format, path.c_str(), nullptr, nullptr) < 0 || avformat_find_stream_info(format, nullptr) < 0) return 0;
+  const AVCodec* decoder = nullptr;
+  const int track = av_find_best_stream(format, AVMEDIA_TYPE_VIDEO, -1, -1, &decoder, 0);
+  if (track < 0 || format->streams[track]->codecpar->codec_id != AV_CODEC_ID_H264) return 0;
+  codec = avcodec_alloc_context3(decoder);
+  if (!codec || avcodec_parameters_to_context(codec, format->streams[track]->codecpar) < 0 || avcodec_open2(codec, decoder, nullptr) < 0) return 0;
+  std::uint64_t count = 0;
+  const auto receive = [&] {
    for (;;) {
-    const int status=avcodec_receive_frame(codec,frame);
-    if (status==AVERROR_EOF || status==AVERROR(EAGAIN)) return true;
-    if (status<0 || frame->width<=0 || frame->height<=0) return false;
-    ++count; av_frame_unref(frame);
+    const int status = avcodec_receive_frame(codec, frame);
+    if (status == AVERROR_EOF || status == AVERROR(EAGAIN)) return true;
+    if (status < 0 || frame->width <= 0 || frame->height <= 0) return false;
+    ++count;
+    av_frame_unref(frame);
    }
   };
-  while (av_read_frame(format,packet)>=0) {
-   const bool accepted=packet->stream_index!=track || (avcodec_send_packet(codec,packet)>=0 && receive());
+  while (av_read_frame(format, packet) >= 0) {
+   const bool accepted = packet->stream_index != track || (avcodec_send_packet(codec, packet) >= 0 && receive());
    av_packet_unref(packet);
    if (!accepted) return 0;
   }
-  if (avcodec_send_packet(codec,nullptr)<0 || !receive()) return 0;
+  if (avcodec_send_packet(codec, nullptr) < 0 || !receive()) return 0;
   return count;
  }
 };
-bool saved_prediction_file(const std::string& name,const std::string& stage,std::uint64_t expected) {
+bool saved_prediction_file(const std::string& name, const std::string& stage, std::uint64_t expected) {
  const std::filesystem::path path{name};
  std::error_code error;
- if (!std::filesystem::is_regular_file(path,error) || std::filesystem::file_size(path,error)==0 || error) return false;
- if (stage=="video" || stage=="stop") {
+ if (!std::filesystem::is_regular_file(path, error) || std::filesystem::file_size(path, error) == 0 || error) return false;
+ if (stage == "video" || stage == "stop") {
   SavedVideoDecode decoded;
-  const auto count=decoded.Count(path);
-  if (!count || (stage=="video" && count!=expected)) return false;
-  for (const auto& entry : std::filesystem::directory_iterator(path.parent_path(),error)) if (entry.path().extension()==".json") return false;
+  const auto count = decoded.Count(path);
+  if (!count || (stage == "video" && count != expected)) return false;
+  for (const auto& entry : std::filesystem::directory_iterator(path.parent_path(), error))
+   if (entry.path().extension() == ".json") return false;
   return !error;
  }
- std::uint64_t count=0;
- for (const auto& entry : std::filesystem::directory_iterator(path.parent_path(),error)) {
-  if (entry.path().extension()!=".png") continue;
-  int width=0,height=0,channels=0;
-  std::unique_ptr<stbi_uc,decltype(&stbi_image_free)> pixels(stbi_load(entry.path().c_str(),&width,&height,&channels,4),stbi_image_free);
-  if (!pixels || width<=0 || height<=0) return false;
+ std::uint64_t count = 0;
+ for (const auto& entry : std::filesystem::directory_iterator(path.parent_path(), error)) {
+  if (entry.path().extension() != ".png") continue;
+  int width = 0, height = 0, channels = 0;
+  std::unique_ptr<stbi_uc, decltype(&stbi_image_free)> pixels(stbi_load(entry.path().c_str(), &width, &height, &channels, 4), stbi_image_free);
+  if (!pixels || width <= 0 || height <= 0) return false;
   ++count;
  }
- return !error && count==expected;
+ return !error && count == expected;
 }
-}
+}  // namespace
 auto AtlasDrawAudit::acquisition_for(const SampleKey& key) const -> const nlohmann::json* {
  const auto found = acquisitions.find(key);
  return found != acquisitions.end() ? &found->second : nullptr;
@@ -802,26 +809,35 @@ auto BrowserAudit::consume(const nlohmann::json& record) -> void {
  } else if (event == "integration.validation_confidence_pixels") {
   validation_confidence_pixels.push_back(record);
  } else if (event == "integration.prediction.saving") {
-  const auto index=record.value("a",-1.0);
-  if (index>=0.0 && index<3.0 && index==std::floor(index) && record.value("b",0.0)==1.0)
-   prediction_saving_controls[static_cast<std::size_t>(index)]=true;
+  const auto index = record.value("a", -1.0);
+  if (index >= 0.0 && index < 3.0 && index == std::floor(index) && record.value("b", 0.0) == 1.0) prediction_saving_controls[static_cast<std::size_t>(index)] = true;
  } else if (event == "integration.prediction.no_output") {
-  const auto stage=record.value("detail","");
-  const std::filesystem::path directory=record.value("control","");
+  const auto stage = record.value("detail", "");
+  const std::filesystem::path directory = record.value("control", "");
   std::error_code error;
-  const bool empty=std::filesystem::is_directory(directory,error) && std::filesystem::is_empty(directory,error) && !error && record.value("a",0.0)>0.0;
-  if (stage=="compiled") prediction_no_outputs[0]=empty && record.value("a",0.0)==static_cast<double>(prediction_processed[0]);
-  else if (stage=="image") prediction_no_outputs[1]=empty && record.value("a",0.0)==static_cast<double>(prediction_processed[1]);
+  const bool empty = std::filesystem::is_directory(directory, error) && std::filesystem::is_empty(directory, error) && !error && record.value("a", 0.0) > 0.0;
+  if (stage == "compiled")
+   prediction_no_outputs[0] = empty && record.value("a", 0.0) == static_cast<double>(prediction_processed[0]);
+  else if (stage == "image")
+   prediction_no_outputs[1] = empty && record.value("a", 0.0) == static_cast<double>(prediction_processed[1]);
  } else if (event == "integration.prediction.output") {
-  const auto stage=record.value("detail","");
-  const auto path=record.value("control","");
-  const auto directory=record.value("d",0.0)>0.0;
-  if (stage=="compiled") prediction_outputs[0]=directory && record.value("c",-1.0)==0.0 && path.ends_with(".png") && record.value("a",0.0)>0.0 && saved_prediction_file(path,stage,static_cast<std::uint64_t>(record.value("a",0.0)));
-  else if (stage=="image") prediction_outputs[1]=directory && record.value("c",-1.0)==0.0 && path.ends_with("/sample.png") && record.value("a",0.0)==1.0 && saved_prediction_file(path,stage,1U);
-  else if (stage=="video") prediction_outputs[2]=directory && path.ends_with("/prediction.mkv") && record.value("b",0.0)>0.0 && record.value("c",-1.0)==0.0 && saved_prediction_file(path,stage,static_cast<std::uint64_t>(record.value("b",0.0)));
-  else if (stage=="stop") prediction_outputs[3]=directory && path.ends_with("/prediction.partial.mkv") && record.value("c",-1.0)==0.0 && saved_prediction_file(path,stage,0U);
-  if (stage=="compiled" && prediction_outputs[0]) prediction_processed[0]=static_cast<std::uint64_t>(record.value("b",0.0));
-  else if (stage=="image" && prediction_outputs[1]) prediction_processed[1]=static_cast<std::uint64_t>(record.value("b",0.0));
+  const auto stage = record.value("detail", "");
+  const auto path = record.value("control", "");
+  const auto directory = record.value("d", 0.0) > 0.0;
+  if (stage == "compiled")
+   prediction_outputs[0] =
+    directory && record.value("c", -1.0) == 0.0 && path.ends_with(".png") && record.value("a", 0.0) > 0.0 && saved_prediction_file(path, stage, static_cast<std::uint64_t>(record.value("a", 0.0)));
+  else if (stage == "image")
+   prediction_outputs[1] = directory && record.value("c", -1.0) == 0.0 && path.ends_with("/sample.png") && record.value("a", 0.0) == 1.0 && saved_prediction_file(path, stage, 1U);
+  else if (stage == "video")
+   prediction_outputs[2] = directory && path.ends_with("/prediction.mkv") && record.value("b", 0.0) > 0.0 && record.value("c", -1.0) == 0.0 &&
+                           saved_prediction_file(path, stage, static_cast<std::uint64_t>(record.value("b", 0.0)));
+  else if (stage == "stop")
+   prediction_outputs[3] = directory && path.ends_with("/prediction.partial.mkv") && record.value("c", -1.0) == 0.0 && saved_prediction_file(path, stage, 0U);
+  if (stage == "compiled" && prediction_outputs[0])
+   prediction_processed[0] = static_cast<std::uint64_t>(record.value("b", 0.0));
+  else if (stage == "image" && prediction_outputs[1])
+   prediction_processed[1] = static_cast<std::uint64_t>(record.value("b", 0.0));
  } else if (event == "integration.workflow.operation_progress") {
   constexpr std::array<std::string_view, 4U> primary_controls{"train.primary", "validate.primary", "predict.primary", "export.primary"};
   const auto control = std::ranges::find(primary_controls, record.value("control", ""));
@@ -1245,8 +1261,8 @@ auto BrowserAudit::consume(const nlohmann::json& record) -> void {
      if (stage >= 2U && dataset_draw_rows.contains(id)) captions = captions && dataset_draw_rows.at(id).second.find("Complete · ") != std::string::npos;
     }
     if (stage < 2U && dataset_draw_rows.contains(track_ids[0]) && dataset_draw_rows.contains(track_ids[1])) {
-     captions = captions && dataset_draw_rows.at(track_ids[0]).second.find(" / ?") != std::string::npos &&
-                dataset_draw_rows.at(track_ids[1]).second.find("Waiting · 2,345 / 9,876") != std::string::npos;
+     captions =
+      captions && dataset_draw_rows.at(track_ids[0]).second.find(" / ?") != std::string::npos && dataset_draw_rows.at(track_ids[1]).second.find("Waiting · 2,345 / 9,876") != std::string::npos;
     }
    } else {
     dataset_presentation_valid = dataset_presentation_valid && work == dataset_draw_rows.end() && cached == dataset_draw_rows.end();
@@ -1261,11 +1277,10 @@ auto BrowserAudit::consume(const nlohmann::json& record) -> void {
   if (((key >= 200U && key <= 208U) || (key >= 218U && key <= 226U)) && (key - 200U) % 9U < 2U && dataset_pixels_status_font) {
    const auto pixels = dataset_draw_rows.find("train.dataset.progress.pixels");
    const auto& font = *dataset_pixels_status_font;
-   const bool narrow_compiling = pixels != dataset_draw_rows.end() &&
-    pixels->second.second == "Pixels\nCompiling image pixels · 2,345 / 9,876" &&
-    std::isfinite(pixels->second.first[2]) && pixels->second.first[2] > 0.0 && pixels->second.first[2] <= 200.1;
-   dataset_status_fitted = dataset_status_fitted || (dataset_status_valid && narrow_compiling &&
-    font[0] >= 8.0 && font[0] < 12.0 && font[1] == 12.0 && std::abs(font[2] - 15.6) < 0.1 && std::abs(font[3] - 15.6) < 0.1);
+   const bool narrow_compiling = pixels != dataset_draw_rows.end() && pixels->second.second == "Pixels\nCompiling image pixels · 2,345 / 9,876" && std::isfinite(pixels->second.first[2]) &&
+                                 pixels->second.first[2] > 0.0 && pixels->second.first[2] <= 200.1;
+   dataset_status_fitted =
+    dataset_status_fitted || (dataset_status_valid && narrow_compiling && font[0] >= 8.0 && font[0] < 12.0 && font[1] == 12.0 && std::abs(font[2] - 15.6) < 0.1 && std::abs(font[3] - 15.6) < 0.1);
   }
   dataset_pixels_status_font.reset();
   dataset_viewport.reset();
@@ -1279,10 +1294,9 @@ auto BrowserAudit::consume(const nlohmann::json& record) -> void {
  } else if (event == "integration.dataset_reversal") {
   const auto baseline = dataset_transition_frames.find(25U), observed = dataset_transition_frames.find(6U);
   const double full = numeric(record, "a"), closing = numeric(record, "b"), reopening = numeric(record, "c");
-  dataset_reversal = !dataset_reversal && record.value("control", "") == "train.dataset.coconut_options" && record.value("detail", "") == "actual-draw" && scalar(record, "d") == 1U &&
-                     closing > 0.0 && closing < reopening && reopening < full && baseline != dataset_transition_frames.end() && !baseline->second.empty() &&
-                     std::abs(baseline->second.back()[1] - full) < 0.1 && observed != dataset_transition_frames.end() && !observed->second.empty() &&
-                     std::abs(observed->second.back()[1] - reopening) < 0.1 &&
+  dataset_reversal = !dataset_reversal && record.value("control", "") == "train.dataset.coconut_options" && record.value("detail", "") == "actual-draw" && scalar(record, "d") == 1U && closing > 0.0 &&
+                     closing < reopening && reopening < full && baseline != dataset_transition_frames.end() && !baseline->second.empty() && std::abs(baseline->second.back()[1] - full) < 0.1 &&
+                     observed != dataset_transition_frames.end() && !observed->second.empty() && std::abs(observed->second.back()[1] - reopening) < 0.1 &&
                      std::ranges::any_of(observed->second, [closing](const auto& frame) { return std::abs(frame[1] - closing) < 0.1; });
  } else if (event == "integration.dataset_hidden_input") {
   dataset_hidden_input = record.value("detail", "") == "real-click-during-collapse" && scalar(record, "b") == 1U;
@@ -1973,7 +1987,10 @@ auto BrowserAudit::readiness_blocker() const -> std::string_view {
  };
  const bool uniform_primary = !shared_primary_colors.empty() && std::ranges::all_of(shared_primary_colors, [this](const auto& style) { return style.second == shared_primary_colors.begin()->second; });
  static const std::array expected_primary_labels{"Start Training", "Start Validation", "Run Predict", "Run Export", "Start Live", "Save Annotations"};
- return first_failed_check(std::ranges::all_of(prediction_no_outputs,[](bool retained){return retained;}), "prediction media-disabled directories", std::ranges::all_of(prediction_saving_controls,[](bool present){return present;}), "prediction source saving controls", std::ranges::all_of(prediction_outputs,[](bool saved){return saved;}), "prediction saved media and interrupted output", std::ranges::all_of(expected_primary_labels, [this](const char* label) { return primary_idle_labels.contains(label); }), "primary action rendered labels",
+ return first_failed_check(std::ranges::all_of(prediction_no_outputs, [](bool retained) { return retained; }), "prediction media-disabled directories",
+  std::ranges::all_of(prediction_saving_controls, [](bool present) { return present; }), "prediction source saving controls", std::ranges::all_of(prediction_outputs, [](bool saved) { return saved; }),
+  "prediction saved media and interrupted output", std::ranges::all_of(expected_primary_labels, [this](const char* label) { return primary_idle_labels.contains(label); }),
+  "primary action rendered labels",
   bootstrap && fluent && uniform_primary && benchmark_purple && rendered_controls.contains(BENCHMARK_OVERRIDE) &&
    std::ranges::all_of(expected_primary, [this](const std::string_view id) { return shared_primary.contains(id) && rendered_controls.contains(id); }),
   "shell and style", every_region, "ordinary workflow regions", primary_progress_placement, "primary progress placement", primary_action_geometry, "primary action geometry", primary_card_gaps,
@@ -1989,14 +2006,14 @@ auto BrowserAudit::readiness_blocker() const -> std::string_view {
   "Settings composition",
   dataset_native_valid && dataset_native_generations.contains(cancelled_compile_generation) && dataset_native_generations.contains(active_compile_generation) && compile_tracks.size() == 3U,
   "Dataset native captions", dataset_presentation_complete(), "Dataset presentation", dataset_transitions_complete(), "Dataset transitions",
-  dataset_configured && progress && compile_metrics && dataset_complete && progress_ordinal < dataset_complete_ordinal,
-  "Dataset lifecycle", explore_ready, "ready snapshot", sweep, "viewport sweep", scrolled, "gallery scroll", detail, "detail selection", bounded_exact_grid, "bounded exact grid", newest_placeholder,
-  "newest placeholder", pointer_inverse, "pointer inverse", pointer_dispatched, "pointer dispatch", pointer_selected, "pointer selection", gallery_shader_fill, "gallery shader fill",
-  pointer_render_chain, "pointer render chain", atlas_identities, "atlas identities", augmentation_enabled, "augmentation enabled", augmentation_rerolled, "augmentation rerolled",
-  reshuffle_order_only, "reshuffle order only", detail_source, "detail source", detail_fit, "detail fit", detail_containers, "detail containers", padded_and_original_detail,
-  "padded and original detail", upscale_growth, "upscale growth", upscale_presentation, "upscale presentation", upscale_modes == expected_upscale_modes, "upscale modes",
-  upscale_presentations == expected_upscale_presentations, "upscale presentations", upscale_completed_pixels == expected_upscale_presentations, "upscale completed blue pixels",
-  upscale_same_method == expected_upscale_presentations, "upscale exact re-click", upscale_later_frame, "upscale later frame",
+  dataset_configured && progress && compile_metrics && dataset_complete && progress_ordinal < dataset_complete_ordinal, "Dataset lifecycle", explore_ready, "ready snapshot", sweep, "viewport sweep",
+  scrolled, "gallery scroll", detail, "detail selection", bounded_exact_grid, "bounded exact grid", newest_placeholder, "newest placeholder", pointer_inverse, "pointer inverse", pointer_dispatched,
+  "pointer dispatch", pointer_selected, "pointer selection", gallery_shader_fill, "gallery shader fill", pointer_render_chain, "pointer render chain", atlas_identities, "atlas identities",
+  augmentation_enabled, "augmentation enabled", augmentation_rerolled, "augmentation rerolled", reshuffle_order_only, "reshuffle order only", detail_source, "detail source", detail_fit, "detail fit",
+  detail_containers, "detail containers", padded_and_original_detail, "padded and original detail", upscale_growth, "upscale growth", upscale_presentation, "upscale presentation",
+  upscale_modes == expected_upscale_modes, "upscale modes", upscale_presentations == expected_upscale_presentations, "upscale presentations",
+  upscale_completed_pixels == expected_upscale_presentations, "upscale completed blue pixels", upscale_same_method == expected_upscale_presentations, "upscale exact re-click", upscale_later_frame,
+  "upscale later frame",
   std::ranges::all_of(
    viewer_navigation_draws, [this](const auto draw) { return draw != 0U && surface_draws.contains(draw); }),
   "Previous/Next automatic upscale draws", reopened, "dataset reopen", repeated_same_revision, "same-revision redraw", annotation_ready && annotation_tool && annotation_pointer,
@@ -2114,9 +2131,10 @@ bool BrowserAudit::validation_samples_complete() const {
  std::set<std::uint64_t> identities;
  const auto& first = validation_saved_samples.front();
  for (const auto& sample : validation_saved_samples) {
-  const auto index = scalar(sample,"b");
-  if (scalar(sample,"a") == 0U || scalar(sample,"a") != scalar(first,"a") || scalar(sample,"c") != 6U || !identities.insert(index).second ||
-      sample.value("control", "").empty() || sample.value("control", "") != first.value("control", "") || sample.value("detail", "") != "sample-" + std::to_string(index) + ".png") return false;
+  const auto index = scalar(sample, "b");
+  if (scalar(sample, "a") == 0U || scalar(sample, "a") != scalar(first, "a") || scalar(sample, "c") != 6U || !identities.insert(index).second || sample.value("control", "").empty() ||
+      sample.value("control", "") != first.value("control", "") || sample.value("detail", "") != "sample-" + std::to_string(index) + ".png")
+   return false;
  }
  return true;
 }

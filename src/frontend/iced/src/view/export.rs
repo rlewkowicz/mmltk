@@ -1,6 +1,6 @@
-use crate::view::shared::status_text;
 use crate::fluent_theme::Element;
 use crate::presentation_surface::Surface;
+use crate::view::shared::status_text;
 use crate::view_model::ApplicationModel;
 use iced::widget::{button, column};
 
@@ -9,7 +9,6 @@ pub enum Message {
     Output(crate::view::workflow::output::Message),
     StartRequested,
     StopRequested,
-    DialogRequested(u64),
     Model(crate::view::workflow::model_card::Message),
     OnnxChanged(bool),
     TensorRtChanged(bool),
@@ -86,17 +85,32 @@ impl Component {
                     "Model artifacts, format, and output destination.",
                     column![
                         crate::view::workflow::fields::toggle(
-                            "ONNX", draft.map_or(true, |value| value.exportonnx),
-                            settings_edit_available, Message::OnnxChanged),
+                            "ONNX",
+                            draft.map_or(true, |value| value.exportonnx),
+                            settings_edit_available,
+                            Message::OnnxChanged
+                        ),
                         crate::view::workflow::fields::toggle(
-                            "TensorRT", build_tensorrt,
-                            settings_edit_available, Message::TensorRtChanged),
+                            "TensorRT",
+                            build_tensorrt,
+                            settings_edit_available,
+                            Message::TensorRtChanged
+                        ),
                     ]
                     .spacing(crate::view::workflow::FIELD_SPACING)
                 )
             ),
-            crate::view::workflow::output::view(crate::generated::FeatureId::Export, model, settings,
-                model.workflow.export.as_ref().map(|operation| &operation.output)).map(Message::Output),
+            crate::view::workflow::output::view(
+                crate::generated::FeatureId::Export,
+                model,
+                settings,
+                model
+                    .workflow
+                    .export
+                    .as_ref()
+                    .map(|operation| &operation.output)
+            )
+            .map(Message::Output),
             crate::view::workflow::primary_action(
                 crate::generated::FeatureId::Export,
                 model.primary_action_active(crate::generated::FeatureId::Export),
@@ -221,12 +235,18 @@ impl Component {
         message: Message,
     ) -> Result<Option<Outcome>, String> {
         let outcome = match message {
-            Message::Output(crate::view::workflow::output::Message::Browse(id)) => Outcome::DialogRequested(id),
-            Message::Output(crate::view::workflow::output::Message::Auto(value)) => Outcome::SettingsEdited(
-                crate::view::workflow::output::automatic(settings, crate::generated::FeatureId::Export, value)?),
+            Message::Output(crate::view::workflow::output::Message::Browse(id)) => {
+                Outcome::DialogRequested(id)
+            }
+            Message::Output(crate::view::workflow::output::Message::Auto(value)) => {
+                Outcome::SettingsEdited(crate::view::workflow::output::automatic(
+                    settings,
+                    crate::generated::FeatureId::Export,
+                    value,
+                )?)
+            }
             Message::StartRequested => Outcome::StartRequested,
             Message::StopRequested => Outcome::StopRequested,
-            Message::DialogRequested(id) => Outcome::DialogRequested(id),
             Message::Model(message) => {
                 let Some(outcome) = self.model_card.update(message, file_dialog, settings)? else {
                     return Ok(None);
@@ -276,19 +296,12 @@ mod tests {
 
     #[test]
     fn export_dialog_retains_generated_identity() {
-        let id = crate::generated::FILE_DIALOGS
-            .iter()
-            .find(|fact| {
-                fact.workflows
-                    .contains(&crate::generated::FeatureId::Export)
-            })
-            .expect("generated Export dialog")
-            .stable_field_id;
+        let id = crate::generated::constraint_workflowsexportstateoutputdirectory().stable_field_id;
         assert!(matches!(
             Component::default().update(
                 &mut crate::view::settings::SettingsModel::default(),
                 None,
-                Message::DialogRequested(id)
+                Message::Output(crate::view::workflow::output::Message::Browse(id))
             ),
             Ok(Some(Outcome::DialogRequested(value))) if value == id
         ));
@@ -314,8 +327,12 @@ mod format_tests {
         let selected = model.model_snapshot.clone();
         for onnx in [false, true] {
             for engine in [false, true] {
-                component.update(&mut settings, None, Message::OnnxChanged(onnx)).unwrap();
-                component.update(&mut settings, None, Message::TensorRtChanged(engine)).unwrap();
+                component
+                    .update(&mut settings, None, Message::OnnxChanged(onnx))
+                    .unwrap();
+                component
+                    .update(&mut settings, None, Message::TensorRtChanged(engine))
+                    .unwrap();
                 let draft = settings.draft.as_ref().unwrap();
                 assert!(model.model_selection_matches(draft, FeatureId::Export));
                 assert_eq!(model.model_snapshot, selected);

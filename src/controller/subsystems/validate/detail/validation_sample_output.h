@@ -20,8 +20,9 @@ public:
  void UseCaptureContext(mmltk::frameworks::gpu::DeviceContext);
  [[nodiscard]] std::shared_ptr<const PredictionPreviewFrame> Capture(mmltk::backend::models::rfdetr::ValidationSampleView);
  void Finish(bool require_complete);
+
 private:
  class Impl;
  std::shared_ptr<Impl> impl_;
 };
-}
+}  // namespace mmltk::controller::detail

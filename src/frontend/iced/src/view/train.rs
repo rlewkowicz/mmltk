@@ -1,7 +1,7 @@
-use crate::view::shared::status_text;
 use crate::fluent_theme::Element;
 use crate::generated::ProviderOfferIdentity;
 use crate::view::settings::{EditSchedule, SettingsModel};
+use crate::view::shared::status_text;
 use crate::view_model::ApplicationModel;
 use iced::widget::{button, column, container, text};
 
@@ -445,12 +445,17 @@ mod tests {
         let mut model = installed_settings_model();
         let mut component = Component::default();
         assert!(matches!(
-            component.update(&mut model, None, Message::Dataset(dataset::Message::Compile)),
+            component.update(
+                &mut model,
+                None,
+                Message::Dataset(dataset::Message::Compile)
+            ),
             Ok(Some(Outcome::CompileRequested))
         ));
         assert!(matches!(
             component.update(
-                &mut model, None,
+                &mut model,
+                None,
                 Message::Model(crate::view::workflow::model_card::Message::PrepareRequested)
             ),
             Ok(Some(Outcome::Model(
@@ -476,7 +481,8 @@ mod tests {
             .expect("generated preset catalog");
         assert!(matches!(
             component.update(
-                &mut model, None,
+                &mut model,
+                None,
                 Message::Model(crate::view::workflow::model_card::Message::PresetSelected(
                     0,
                 )),
@@ -501,11 +507,15 @@ mod tests {
 
         let draft = "/tmp/selected-model.safetensors".to_owned();
         let dialog = crate::view_model::test_support::selected_model_dialog(
-            model.draft.as_ref().unwrap(), FeatureId::Train, &draft, 1,
+            model.draft.as_ref().unwrap(),
+            crate::generated::FeatureId::Train,
+            &draft,
+            1,
         );
         component
             .update(
-                &mut model, Some(&dialog),
+                &mut model,
+                Some(&dialog),
                 Message::Model(
                     crate::view::workflow::model_card::Message::ConfirmArtifact {
                         path: draft.clone(),

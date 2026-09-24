@@ -1,5 +1,5 @@
-use crate::view::shared::status_text;
 use crate::fluent_theme::Element;
+use crate::view::shared::status_text;
 use crate::view_model::ApplicationModel;
 use iced::Fill;
 use iced::widget::{column, container, row, text};

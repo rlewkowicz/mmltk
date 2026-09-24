@@ -1,16 +1,21 @@
-use crate::view::shared::status_text;
 use crate::fluent_theme::Element;
 use crate::generated::FeatureId;
-use crate::view_model::ApplicationModel;
+use crate::view::shared::status_text;
 pub use crate::view::workflow::output::Message;
+use crate::view_model::ApplicationModel;
 pub fn view<'a>(
     model: &'a ApplicationModel,
     settings: &'a crate::view::settings::SettingsModel,
     chart_omissions: u64,
 ) -> Element<'a, Message> {
-    let facts = model.workflow.training.as_ref()
-        .filter(|_| model.workflow.output.saved().is_none()).map(|snapshot| &snapshot.local.output);
-    let mut content = crate::view::workflow::output::content(FeatureId::Train, model, settings, facts);
+    let facts = model
+        .workflow
+        .training
+        .as_ref()
+        .filter(|_| model.workflow.output.saved().is_none())
+        .map(|snapshot| &snapshot.local.output);
+    let mut content =
+        crate::view::workflow::output::content(FeatureId::Train, model, settings, facts);
     if chart_omissions > 0 {
         content = content.push(status_text(format!("Charts omit {chart_omissions} older disconnected summaries; saved history remains unchanged.")));
     }
@@ -144,9 +149,9 @@ mod tests {
                 assert_eq!(
                     output_nodes(&model),
                     baseline
-                        + status_nodes * (1
-                        + usize::from(!full.is_empty())
-                        + usize::from(!selected.is_empty()))
+                        + status_nodes
+                            * (1 + usize::from(!full.is_empty())
+                                + usize::from(!selected.is_empty()))
                 );
             }
             let saved = model.workflow.output.saved_mut().unwrap();

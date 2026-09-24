@@ -53,7 +53,11 @@ impl Default for Component {
 }
 
 impl Component {
-    pub fn capture_preview(&self, snapshot: Option<&crate::generated::ValidationSnapshot>, display: crate::generated::ValidationDisplaySettings) -> crate::generated::ValidationRunPreview {
+    pub fn capture_preview(
+        &self,
+        snapshot: Option<&crate::generated::ValidationSnapshot>,
+        display: crate::generated::ValidationDisplaySettings,
+    ) -> crate::generated::ValidationRunPreview {
         self.samples.capture_preview(snapshot, display)
     }
     // CLEANUP-IGNORE: Validate owns this local view entry point.
@@ -146,8 +150,17 @@ impl Component {
                     .spacing(crate::view::workflow::FIELD_SPACING)
                 )
             ),
-            crate::view::workflow::output::view(crate::generated::FeatureId::Validate, model, settings,
-                model.workflow.validation.as_ref().map(|snapshot| &snapshot.operation.output)).map(Message::Output),
+            crate::view::workflow::output::view(
+                crate::generated::FeatureId::Validate,
+                model,
+                settings,
+                model
+                    .workflow
+                    .validation
+                    .as_ref()
+                    .map(|snapshot| &snapshot.operation.output)
+            )
+            .map(Message::Output),
             crate::view::workflow::primary_action(
                 crate::generated::FeatureId::Validate,
                 model.primary_action_active(crate::generated::FeatureId::Validate),
@@ -284,9 +297,16 @@ impl Component {
         message: Message,
     ) -> Result<Option<Outcome>, String> {
         let outcome = match message {
-            Message::Output(crate::view::workflow::output::Message::Browse(id)) => Outcome::DialogRequested(id),
-            Message::Output(crate::view::workflow::output::Message::Auto(value)) => Outcome::SettingsEdited(
-                crate::view::workflow::output::automatic(settings, crate::generated::FeatureId::Validate, value)?),
+            Message::Output(crate::view::workflow::output::Message::Browse(id)) => {
+                Outcome::DialogRequested(id)
+            }
+            Message::Output(crate::view::workflow::output::Message::Auto(value)) => {
+                Outcome::SettingsEdited(crate::view::workflow::output::automatic(
+                    settings,
+                    crate::generated::FeatureId::Validate,
+                    value,
+                )?)
+            }
             Message::Loading(message) => {
                 Outcome::SettingsEdited(crate::view::workflow::loading::update(
                     crate::generated::FeatureId::Validate,
@@ -343,7 +363,11 @@ mod tests {
             let Some(Outcome::SettingsEdited(crate::view::settings::EditSchedule::Debounce(
                 generation,
             ))) = component
-                .update(&mut settings, None, Message::DisplayConfidenceChanged(value))
+                .update(
+                    &mut settings,
+                    None,
+                    Message::DisplayConfidenceChanged(value),
+                )
                 .unwrap()
             else {
                 panic!("shared debounce");

@@ -11,6 +11,6 @@ struct PredictionRunOutput final {
  contracts::PredictionRunPreview preview{};
  std::uint64_t population = 0;
  std::uint64_t processing_population = 0;
- std::function<void(const contracts::WorkflowOutputFacts&)> progress;
+ std::function<void(const contracts::WorkflowOutputFacts&)> progress{};
 };
-}
+}  // namespace mmltk::controller

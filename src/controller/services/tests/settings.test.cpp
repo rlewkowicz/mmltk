@@ -1140,8 +1140,7 @@ void test_model_selection_settings_validation_exhausts_canonical_compatibility()
    case FeatureId::Live:
    case FeatureId::Explore: FAIL("test case requires a ModelSystem workflow");
   }
-  const bool expected =
-   input == ModelArtifactInputKind::None || model_selection_compatible(workflow, source, input);
+  const bool expected = input == ModelArtifactInputKind::None || model_selection_compatible(workflow, source, input);
   CHECK(gui_settings_valid(state) == expected);
  };
  for (const auto workflow : {FeatureId::Train, FeatureId::Validate, FeatureId::Predict}) {
@@ -1674,11 +1673,8 @@ TEST_CASE("explicit output selections preserve independent policies and transact
   CHECK(output().automatic);
   CHECK(output().directory == "/selected/output");
   state = accepted;
-  for (const SettingsValueUpdate invalid : {
-        selected,
-        SettingsValueUpdate{.path = prefix + "automatic", .value = Value{std::int64_t{1}}},
-        SettingsValueUpdate{.path = prefix + "unknown", .value = Value{true}},
-        SettingsValueUpdate{.path = "workflows.train.request.epochs", .value = Value{std::int64_t{-1}}}}) {
+  for (const SettingsValueUpdate& invalid : {selected, SettingsValueUpdate{.path = prefix + "automatic", .value = Value{std::int64_t{1}}},
+        SettingsValueUpdate{.path = prefix + "unknown", .value = Value{true}}, SettingsValueUpdate{.path = "workflows.train.request.epochs", .value = Value{std::int64_t{-1}}}}) {
    const std::array edits{selected, invalid};
    CHECK_FALSE(apply_gui_settings_values(state, edits));
    CHECK(state == accepted);
@@ -1851,7 +1847,6 @@ TEST_CASE("validation display confidence has exact independent persisted setting
  apply_gui_settings(legacy, restored);
  CHECK(restored.workflows.validate.display.confidence_threshold == 0.4F);
 }
-
 TEST_CASE("all workflow output selections persist current controls and independent defaults", "[gui][settings][output]") {
  auto state = default_gui_settings_state();
  CHECK(state.workflows.train.output.automatic);
@@ -1859,16 +1854,14 @@ TEST_CASE("all workflow output selections persist current controls and independe
  CHECK(state.workflows.predict.output.automatic);
  CHECK(state.workflows.export_state.output.automatic);
  using Value = mmltk::frameworks::serialization::wire::FlatValue;
- const std::array directories{
-  SettingsValueUpdate{.path = "workflows.train.output.directory", .value = *Value::text("train-runs", mmltk::frameworks::reflection::kMaximumPathBytes)},
+ const std::array directories{SettingsValueUpdate{.path = "workflows.train.output.directory", .value = *Value::text("train-runs", mmltk::frameworks::reflection::kMaximumPathBytes)},
   SettingsValueUpdate{.path = "workflows.validate.output.directory", .value = *Value::text("../validation-runs", mmltk::frameworks::reflection::kMaximumPathBytes)},
   SettingsValueUpdate{.path = "workflows.predict.output.directory", .value = *Value::text("/prediction-runs", mmltk::frameworks::reflection::kMaximumPathBytes)},
   SettingsValueUpdate{.path = "workflows.export_state.output.directory", .value = *Value::text("export-runs", mmltk::frameworks::reflection::kMaximumPathBytes)}};
  REQUIRE(apply_gui_settings_values(state, directories));
  CHECK_FALSE(state.workflows.train.output.automatic);
  CHECK_FALSE(state.workflows.predict.output.automatic);
- const std::array policies{
-  SettingsValueUpdate{.path = "workflows.train.output.automatic", .value = mmltk::frameworks::serialization::wire::FlatValue{true}},
+ const std::array policies{SettingsValueUpdate{.path = "workflows.train.output.automatic", .value = mmltk::frameworks::serialization::wire::FlatValue{true}},
   SettingsValueUpdate{.path = "workflows.predict.output.automatic", .value = mmltk::frameworks::serialization::wire::FlatValue{true}}};
  REQUIRE(apply_gui_settings_values(state, policies));
  CHECK(state.workflows.train.output.directory == "train-runs");
@@ -1890,8 +1883,7 @@ TEST_CASE("all workflow output selections persist current controls and independe
  CHECK(restored == state);
  for (const std::string_view destination : {"workflows.train.request.output_dir", "workflows.validate.request.report_json_path", "workflows.predict.request.output_path"}) {
   CAPTURE(destination);
-  const std::array edits{
-   SettingsValueUpdate{.path = "workflows.train.output.automatic", .value = mmltk::frameworks::serialization::wire::FlatValue{true}},
+  const std::array edits{SettingsValueUpdate{.path = "workflows.train.output.automatic", .value = mmltk::frameworks::serialization::wire::FlatValue{true}},
    SettingsValueUpdate{.path = std::string(destination), .value = *mmltk::frameworks::serialization::wire::FlatValue::text("ignored-output", mmltk::frameworks::reflection::kMaximumPathBytes)}};
   CHECK_FALSE(apply_gui_settings_values(restored, edits));
   CHECK(restored == state);

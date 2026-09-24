@@ -29,7 +29,7 @@ struct RfdetrRuntimeBackendOptions final {
  bool allow_fp16 = true;
  std::shared_ptr<const ClassArtifactAdmission> admission{};
  std::stop_token stop{};
- std::function<void(const std::filesystem::path&)> artifact_published;
+ std::function<void(const std::filesystem::path&)> artifact_published{};
 };
 enum class InferenceArtifactKind : std::uint8_t {
  Weights,
@@ -95,6 +95,6 @@ private:
 [[nodiscard]] std::vector<std::shared_ptr<RfdetrRuntimeBackend>> make_rfdetr_runtime_backend_lanes(const RfdetrRuntimeBackendOptions& options, std::size_t lane_count);
 [[nodiscard]] ModelInfo inspect_tensorrt_model(const ModelArtifactRequest& artifacts, int device_id, std::stop_token stop = {});
 void build_tensorrt_engine(const BuildEngineRequest& request);
-void build_tensorrt_engine(
- const BuildEngineRequest& request, mmltk::backend::ml::runtime::BorrowedCommandStream command_stream, std::shared_ptr<const ClassArtifactAdmission> admission = {}, std::stop_token stop = {}, const std::function<void(const std::filesystem::path&)>& published = {});
+void build_tensorrt_engine(const BuildEngineRequest& request, mmltk::backend::ml::runtime::BorrowedCommandStream command_stream, std::shared_ptr<const ClassArtifactAdmission> admission = {},
+ std::stop_token stop = {}, const std::function<void(const std::filesystem::path&)>& published = {});
 }  // namespace mmltk::backend::models::rfdetr

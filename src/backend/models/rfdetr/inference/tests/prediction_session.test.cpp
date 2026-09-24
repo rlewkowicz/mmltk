@@ -96,8 +96,10 @@ TEST_CASE("unfinished prediction output preserves the completed file", "[model][
 TEST_CASE("cancelled prediction does not bind an artifact or deliver records", "[model][rfdetr][prediction]") {
  rfdetr::PredictRequest request;
  request.source_kind = GENERATE(rfdetr::PredictSourceKind::ImageFiles, rfdetr::PredictSourceKind::VideoFile);
- if (request.source_kind == rfdetr::PredictSourceKind::VideoFile) request.video_path = "/not-opened.mkv";
- else request.image_inputs.push_back({"/not-opened.png", "frame", 9});
+ if (request.source_kind == rfdetr::PredictSourceKind::VideoFile)
+  request.video_path = "/not-opened.mkv";
+ else
+  request.image_inputs.push_back({"/not-opened.png", "frame", 9});
  request.weights_path = "/not-opened.pt";
  request.compilation_mode = GENERATE(rfdetr::CompilationMode::kNone, rfdetr::CompilationMode::kSelective);
  request.output_path.clear();
@@ -329,8 +331,8 @@ TEST_CASE("prediction delivers bounded ordered images masks and receiver-owned p
  }});
  CHECK(without_masks.processed_images == 1U);
  CHECK_FALSE(without_masks.cancelled);
- const auto report_path=request.output_path;
- request.output_path.clear(); // Direct delivery has no JSON destination.
+ const auto report_path = request.output_path;
+ request.output_path.clear();  // Direct delivery has no JSON destination.
  request.limit_images = 3U;
  std::size_t selected_count = 0U;
  const auto selective = session.Run(request, command,
@@ -367,7 +369,7 @@ TEST_CASE("prediction delivers bounded ordered images masks and receiver-owned p
   }
  request.limit_images = 1U;
  std::size_t preview_refusals = 0U;
- request.output_path=report_path;
+ request.output_path = report_path;
  const auto preview_limited = session.RunAndWrite(request, command,
   {
    .source_pixels = true,
@@ -490,36 +492,37 @@ TEST_CASE("prediction delivers bounded ordered images masks and receiver-owned p
      const auto mixed = session.Run(mixed_request, command,
       {.source_pixels = true,
        .encoded_masks = false,
-       .demand = [&](std::int64_t index) {
-        decisions.push_back(index);
-        return rfdetr::PredictionDemand{.native_pixels = mixed_request.image_inputs[index].image_id == 13, .encoded_masks = encoded, .preview_masks = gpu_masks};
-       },
+       .demand =
+        [&](std::int64_t index) {
+         decisions.push_back(index);
+         return rfdetr::PredictionDemand{.native_pixels = mixed_request.image_inputs[index].image_id == 13, .encoded_masks = encoded, .preview_masks = gpu_masks};
+        },
        .maximum_pixel_width = 2U,
        .maximum_pixel_height = 2U,
-       .completed = [&](const auto& record, auto pixels, const auto& annotations) {
-        records.push_back(record.image_id);
-        const bool admitted = record.image_id != 12;
-        CHECK((pixels.rgb8 != nullptr) == admitted);
-        CHECK(pixels.preview_failure.empty() == admitted);
-        CHECK(annotations.masks_available == (admitted && gpu_masks && !empty));
-        CHECK((annotations.masks.address != 0U) == (admitted && gpu_masks && !empty));
-        CHECK(record.detections.empty() == empty);
-        for (const auto& detection : record.detections) CHECK(detection.has_mask == encoded);
-        if (admitted) {
-         CHECK(pixels.width == (record.image_id == 11 ? 2U : 3U));
-         CHECK(pixels.height == 2U);
-         REQUIRE(pixels.custody);
-        } else {
-         CHECK_FALSE(pixels.custody);
-         CHECK(annotations.boxes_xyxy.address == 0U);
-        }
-       }});
+       .completed =
+        [&](const auto& record, auto pixels, const auto& annotations) {
+         records.push_back(record.image_id);
+         const bool admitted = record.image_id != 12;
+         CHECK((pixels.rgb8 != nullptr) == admitted);
+         CHECK(pixels.preview_failure.empty() == admitted);
+         CHECK(annotations.masks_available == (admitted && gpu_masks && !empty));
+         CHECK((annotations.masks.address != 0U) == (admitted && gpu_masks && !empty));
+         CHECK(record.detections.empty() == empty);
+         for (const auto& detection : record.detections) CHECK(detection.has_mask == encoded);
+         if (admitted) {
+          CHECK(pixels.width == (record.image_id == 11 ? 2U : 3U));
+          CHECK(pixels.height == 2U);
+          REQUIRE(pixels.custody);
+         } else {
+          CHECK_FALSE(pixels.custody);
+          CHECK(annotations.boxes_xyxy.address == 0U);
+         }
+        }});
      CHECK(mixed.processed_images == 3U);
      CHECK_FALSE(mixed.cancelled);
      CHECK(decisions == std::vector<std::int64_t>{0, 1, 2});
      CHECK(records == (reverse ? std::vector<std::int64_t>{13, 12, 11} : std::vector<std::int64_t>{11, 12, 13}));
     }
-
  rfdetr::PredictionSession context_poisoned;
  CHECK_THROWS_AS(context_poisoned.Run(request, command, {.completed = [](const auto&, auto, const auto&) { throw mmltk::frameworks::gpu::CudaContextFailure(true); }}),
   mmltk::backend::ml::runtime::CudaOperationError);
@@ -1603,7 +1606,6 @@ TEST_CASE("prediction mask packing retains exact odd-stride bytes through device
  CHECK(host.ReleaseSettled() == CUDA_SUCCESS);
  CHECK(host.capacity_bytes() == 0U);
 }
-
 TEST_CASE("Native prediction consumes shared compilation policy with full batches and source tails", "[model][rfdetr][prediction][compilation][gpu]") {
  if (!mmltk::testsupport::checked_cuda_device_count()) SKIP("CUDA unavailable; native prediction compilation remains unverified");
  const mmltk::testsupport::ScopedTempDir root("native-selective-prediction");
@@ -1611,7 +1613,10 @@ TEST_CASE("Native prediction consumes shared compilation policy with full batche
  mmltk::backend::data::testsupport::create_synthetic_dataset(dataset);
  mmltk::backend::data::testsupport::compile_existing_fixture(dataset);
  auto config = rfdetr::native_config_from_preset(rfdetr::model_presets().front());
- config.resolution = 64; config.num_classes = 7; config.num_queries = 3; config.num_select = 3;
+ config.resolution = 64;
+ config.num_classes = 7;
+ config.num_queries = 3;
+ config.num_select = 3;
  const auto layout = rfdetr::native_training_class_layout(mmltk::backend::data::catalog::ClassCatalog({"person", "ret", "scope", "iron_sight", "anchor_dot", "glint"}));
  rfdetr::NativeRfDetrModel model(config, layout);
  std::vector<rfdetr::NormalizedModelStateEntry> entries;
@@ -1619,66 +1624,91 @@ TEST_CASE("Native prediction consumes shared compilation policy with full batche
  for (const auto& item : model.named_buffers(true)) entries.push_back({item.key(), item.value().detach()});
  rfdetr::DecodedNativeModelState checkpoint(std::move(entries));
  rfdetr::ResolvedModelArtifacts artifacts;
- artifacts.config = config; artifacts.class_layout = layout;
+ artifacts.config = config;
+ artifacts.class_layout = layout;
  checkpoint.metadata = rfdetr::make_native_checkpoint_metadata(artifacts, config.num_classes);
  const auto weights = root.path() / "model.native.pt";
  rfdetr::save_native_checkpoint(weights, checkpoint);
  const auto image = root.path() / "frame.ppm";
- { std::ofstream output(image, std::ios::binary); output << "P6\n4 4\n255\n"; const std::string pixels(4 * 4 * 3, char{81}); output.write(pixels.data(), pixels.size()); }
+ {
+  std::ofstream output(image, std::ios::binary);
+  output << "P6\n4 4\n255\n";
+  const std::string pixels(4 * 4 * 3, char{81});
+  output.write(pixels.data(), pixels.size());
+ }
  REQUIRE(cudaSetDevice(0) == cudaSuccess);
  const mmltk::testsupport::ScopedTestStream stream;
  rfdetr::PredictRequest request;
- request.weights_path = weights; request.preset_name = config.preset_name; request.resolution = 64;
- request.source_kind = rfdetr::PredictSourceKind::ImageFiles; request.batch_size = 2; request.allow_fp16 = false;
- request.include_masks = false; request.max_dets_per_image = 3; request.progress_bar = false;
+ request.weights_path = weights;
+ request.preset_name = config.preset_name;
+ request.resolution = 64;
+ request.source_kind = rfdetr::PredictSourceKind::ImageFiles;
+ request.batch_size = 2;
+ request.allow_fp16 = false;
+ request.include_masks = false;
+ request.max_dets_per_image = 3;
+ request.progress_bar = false;
  for (int64_t index = 0; index < 7; ++index) request.image_inputs.push_back({image, "frame", index});
  const auto image_inputs = request.image_inputs;
  for (const auto source : {rfdetr::PredictSourceKind::ImageFiles, rfdetr::PredictSourceKind::CompiledDataset}) {
- request.source_kind = source;
- if (source == rfdetr::PredictSourceKind::ImageFiles) { request.compiled_path.clear(); request.image_inputs = image_inputs; }
- else { request.compiled_path = mmltk::backend::data::testsupport::compiled_bin_path(dataset); request.image_inputs.clear(); }
- std::vector<rfdetr::PredictionRecord> expected;
- for (const auto mode : {rfdetr::CompilationMode::kNone, rfdetr::CompilationMode::kSelective}) {
-  request.compilation_mode = mode;
-  std::vector<rfdetr::PredictionRecord> records;
-  rfdetr::PredictionSession session;
-  const auto result = session.Run(request, {reinterpret_cast<std::uintptr_t>(stream.get()), true}, {
-   .encoded_masks = false,
-   .demand = [](int64_t index) { return rfdetr::PredictionDemand{.source_pixels = index == 1}; },
-   .completed = [&](const auto& record, const auto pixels, const auto&) {
-    CHECK((pixels.rgb8 != nullptr || pixels.chw != nullptr) == (record.dataset_index == 1));
-    records.push_back(record);
-   },
-  });
-  REQUIRE(result.processed_images == 7);
-  if (mode == rfdetr::CompilationMode::kNone) expected = records;
-  else {
-   REQUIRE(records.size() == expected.size());
-   for (size_t index = 0; index < records.size(); ++index) {
-    CHECK(records[index].image_id == expected[index].image_id);
-    REQUIRE(records[index].detections.size() == expected[index].detections.size());
-    for (size_t detection = 0; detection < records[index].detections.size(); ++detection) {
-     const auto& actual = records[index].detections[detection];
-     const auto& reference = expected[index].detections[detection];
-     CHECK(actual.class_reference == reference.class_reference);
-     CHECK(std::abs(actual.score - reference.score) < 2e-4);
-     for (size_t axis = 0; axis < 4; ++axis) CHECK(std::abs(actual.bbox_xyxy[axis] - reference.bbox_xyxy[axis]) < 2e-3);
+  request.source_kind = source;
+  if (source == rfdetr::PredictSourceKind::ImageFiles) {
+   request.compiled_path.clear();
+   request.image_inputs = image_inputs;
+  } else {
+   request.compiled_path = mmltk::backend::data::testsupport::compiled_bin_path(dataset);
+   request.image_inputs.clear();
+  }
+  std::vector<rfdetr::PredictionRecord> expected;
+  for (const auto mode : {rfdetr::CompilationMode::kNone, rfdetr::CompilationMode::kSelective}) {
+   request.compilation_mode = mode;
+   std::vector<rfdetr::PredictionRecord> records;
+   rfdetr::PredictionSession session;
+   const auto result = session.Run(request, {reinterpret_cast<std::uintptr_t>(stream.get()), true},
+    {
+     .encoded_masks = false,
+     .demand = [](int64_t index) { return rfdetr::PredictionDemand{.source_pixels = index == 1}; },
+     .completed =
+      [&](const auto& record, const auto pixels, const auto&) {
+       CHECK((pixels.rgb8 != nullptr || pixels.chw != nullptr) == (record.dataset_index == 1));
+       records.push_back(record);
+      },
+    });
+   REQUIRE(result.processed_images == 7);
+   if (mode == rfdetr::CompilationMode::kNone)
+    expected = records;
+   else {
+    REQUIRE(records.size() == expected.size());
+    for (size_t index = 0; index < records.size(); ++index) {
+     CHECK(records[index].image_id == expected[index].image_id);
+     REQUIRE(records[index].detections.size() == expected[index].detections.size());
+     for (size_t detection = 0; detection < records[index].detections.size(); ++detection) {
+      const auto& actual = records[index].detections[detection];
+      const auto& reference = expected[index].detections[detection];
+      CHECK(actual.class_reference == reference.class_reference);
+      CHECK(std::abs(actual.score - reference.score) < 2e-4);
+      for (size_t axis = 0; axis < 4; ++axis) CHECK(std::abs(actual.bbox_xyxy[axis] - reference.bbox_xyxy[axis]) < 2e-3);
+     }
     }
    }
   }
- }
  }
  // Evaluate -> Validate -> Predict inherits exactly one current-format policy.
  std::optional<double> reference_ap;
  for (const auto mode : {rfdetr::CompilationMode::kNone, rfdetr::CompilationMode::kSelective}) {
   rfdetr::EvaluateRequest evaluation;
   static_cast<rfdetr::ModelArtifactRequest&>(evaluation) = request;
-  evaluation.compilation_mode = mode; evaluation.allow_fp16 = false;
-  evaluation.compiled_path = request.compiled_path; evaluation.batch_size = 2;
-  evaluation.backend = "weights"; evaluation.progress_bar = false;
+  evaluation.compilation_mode = mode;
+  evaluation.allow_fp16 = false;
+  evaluation.compiled_path = request.compiled_path;
+  evaluation.batch_size = 2;
+  evaluation.backend = "weights";
+  evaluation.progress_bar = false;
   const auto result = rfdetr::run_evaluation(evaluation);
   REQUIRE(result.image_count == 7);
-  if (!reference_ap) reference_ap = result.result.summary.bbox.ap;
-  else CHECK(result.result.summary.bbox.ap == *reference_ap);
+  if (!reference_ap)
+   reference_ap = result.result.summary.bbox.ap;
+  else
+   CHECK(result.result.summary.bbox.ap == *reference_ap);
  }
 }

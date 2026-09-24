@@ -200,7 +200,7 @@ template <class Root, class Current = Root>
 template <class T>
 inline constexpr bool kByteBoundedMember = std::is_same_v<OptionalValueT<T>, std::string> || std::is_same_v<OptionalValueT<T>, std::filesystem::path> || kByteSequence<OptionalValueT<T>>;
 template <class T>
-inline constexpr bool kNeedsByteLimit = kByteBoundedMember<T> && !kIsArray<OptionalValueT<T>>;
+inline constexpr bool kNeedsByteLimit = (kByteBoundedMember<T> && !kIsArray<OptionalValueT<T>>) || mmltk::frameworks::reflection::kTextSequence<OptionalValueT<T>>;
 template <class T>
 inline constexpr bool kItemBoundedMember =
  !kByteSequence<OptionalValueT<T>> && (kIsVector<OptionalValueT<T>> || kIsArray<OptionalValueT<T>> || kIsSpan<OptionalValueT<T>> || kIsInplaceVector<OptionalValueT<T>>);
@@ -953,6 +953,15 @@ template <class T, DynamicValueBound Mode = DynamicValueBound::Full>
  const std::size_t array = cbor_size_add(wire::head_size(maximum_items), cbor_size_multiply(maximum_items, scalar));
  return cbor_maximum(scalar, array);
 }
+template <class Declaration, class Item, DynamicValueBound Mode>
+[[nodiscard]] consteval std::size_t maximum_sequence_element_bytes() {
+ using U = RemoveCvRef<Item>;
+ if constexpr (std::is_same_v<U, std::string> || std::is_same_v<U, std::filesystem::path>) {
+  return cbor_text_size(maximum_member_bytes<Declaration>());
+ } else {
+  return maximum_cbor_bytes<U, Mode>();
+ }
+}
 template <class Declaration, class Value, DynamicValueBound Mode = DynamicValueBound::Full>
 [[nodiscard]] consteval std::size_t maximum_member_cbor_bytes() {
  using U = RemoveCvRef<Value>;
@@ -979,15 +988,15 @@ template <class Declaration, class Value, DynamicValueBound Mode = DynamicValueB
   }
  } else if constexpr (kIsVector<U>) {
   const std::size_t items = maximum_member_items<Declaration>();
-  return cbor_size_add(wire::head_size(items), cbor_size_multiply(items, maximum_cbor_bytes<typename IsVector<U>::value_type, Mode>()));
+  return cbor_size_add(wire::head_size(items), cbor_size_multiply(items, maximum_sequence_element_bytes<Declaration, typename IsVector<U>::value_type, Mode>()));
  } else if constexpr (kIsArray<U>) {
-  return cbor_size_add(wire::head_size(IsArray<U>::size), cbor_size_multiply(IsArray<U>::size, maximum_cbor_bytes<typename IsArray<U>::value_type, Mode>()));
+  return cbor_size_add(wire::head_size(IsArray<U>::size), cbor_size_multiply(IsArray<U>::size, maximum_sequence_element_bytes<Declaration, typename IsArray<U>::value_type, Mode>()));
  } else if constexpr (kIsSpan<U>) {
   const std::size_t items = IsSpan<U>::extent == std::dynamic_extent ? maximum_member_items<Declaration>() : IsSpan<U>::extent;
-  return cbor_size_add(wire::head_size(items), cbor_size_multiply(items, maximum_cbor_bytes<std::remove_const_t<typename IsSpan<U>::value_type>, Mode>()));
+  return cbor_size_add(wire::head_size(items), cbor_size_multiply(items, maximum_sequence_element_bytes<Declaration, typename IsSpan<U>::value_type, Mode>()));
  } else if constexpr (kIsInplaceVector<U>) {
   const std::size_t items = maximum_member_items_or_capacity<Declaration>(IsInplaceVector<U>::capacity);
-  return cbor_size_add(wire::head_size(items), cbor_size_multiply(items, maximum_cbor_bytes<typename IsInplaceVector<U>::value_type, Mode>()));
+  return cbor_size_add(wire::head_size(items), cbor_size_multiply(items, maximum_sequence_element_bytes<Declaration, typename IsInplaceVector<U>::value_type, Mode>()));
  } else {
   return maximum_cbor_bytes<U, Mode>();
  }

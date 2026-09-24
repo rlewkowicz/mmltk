@@ -734,8 +734,8 @@ void complete_prediction_record(PredictionRecord& record, std::size_t index, con
   execute_prediction_batch(options, backend, model_input, 1U, frame->width, frame->height, delivery, annotations, readback, {}, static_cast<std::int64_t>(result.processed_images));
   preprocessor.record_consumer(reinterpret_cast<cudaStream_t>(command_stream.native_handle));
   PredictionRecord record{.dataset_index = static_cast<std::int64_t>(frame->index), .image_id = static_cast<std::int64_t>(frame->index + 1U), .source_name = options.video_path.string()};
-  complete_prediction_record(
-   record, 0U, options, backend, annotations, readback, delivery, result, total, {.chw=frame->chw, .width=frame->width, .height=frame->height, .device=options.device_id, .stream=command_stream.native_handle, .timing=frame->timing}, source);
+  complete_prediction_record(record, 0U, options, backend, annotations, readback, delivery, result, total,
+   {.chw = frame->chw, .width = frame->width, .height = frame->height, .device = options.device_id, .stream = command_stream.native_handle, .timing = frame->timing}, source);
  }
  result.cancelled = delivery.stop.stop_requested();
  finish_prediction_run(result, started);
@@ -932,7 +932,7 @@ PredictionRunResult PredictionSession::State::RunResolved(
  if (loader->image_width() != bound_backend.resolution() || loader->image_height() != bound_backend.resolution()) {
   throw std::invalid_argument("compiled dataset resolution does not match RF-DETR artifact");
  }
- result.source_images=loader->num_images();
+ result.source_images = loader->num_images();
  if (delivery.begin) delivery.begin(result);
  const auto total = options.limit_images == 0U ? loader->num_images() : std::min(options.limit_images, loader->num_images());
  const auto image_ids = EvaluationDatasetOwner(*loader, EvaluationMetricSet::BBox).image_ids();

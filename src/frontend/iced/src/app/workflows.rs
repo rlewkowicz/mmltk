@@ -3,11 +3,16 @@ use crate::view_model::StartPreparation;
 
 impl App {
     pub(super) fn settle_prediction_total(&mut self) -> Task<Message> {
-        if !self.model.settings_edit_available() { return Task::none(); }
+        if !self.model.settings_edit_available() {
+            return Task::none();
+        }
         match crate::view::predict::output::settle_total(&self.model, self.settings.state_mut()) {
             Ok(Some(schedule)) => self.handle_settings_schedule(schedule),
             Ok(None) => Task::none(),
-            Err(detail) => { self.model.error = Some(UiError::invalid(detail)); Task::none() }
+            Err(detail) => {
+                self.model.error = Some(UiError::invalid(detail));
+                Task::none()
+            }
         }
     }
 
@@ -97,15 +102,51 @@ impl App {
         }
         self.model.workflow.pending_start = Some(crate::view_model::PendingStart {
             feature,
-            prediction_preview: crate::generated::PredictionRunPreview { labels: true, boxes: true, masks: self.settings.draft().unwrap().workflows.predict.request.includemasks, confidencethreshold: self.settings.draft().unwrap().workflows.predict.request.threshold },
-            prediction_population: crate::view::predict::output::matching_count(&self.model,&self.settings.draft().unwrap().workflows.predict).unwrap_or(0),
+            prediction_preview: crate::generated::PredictionRunPreview {
+                labels: true,
+                boxes: true,
+                masks: self
+                    .settings
+                    .draft()
+                    .unwrap()
+                    .workflows
+                    .predict
+                    .request
+                    .includemasks,
+                confidencethreshold: self
+                    .settings
+                    .draft()
+                    .unwrap()
+                    .workflows
+                    .predict
+                    .request
+                    .threshold,
+            },
+            prediction_population: crate::view::predict::output::matching_count(
+                &self.model,
+                &self.settings.draft().unwrap().workflows.predict,
+            )
+            .unwrap_or(0),
             prediction_saving: {
-                let predict=&self.settings.draft().unwrap().workflows.predict;
-                let mut saving=predict.saving.clone();
-                if let Some(count)=crate::view::predict::output::matching_count(&self.model,predict) { saving.compiledtotal=saving.compiledtotal.min(count); }
+                let predict = &self.settings.draft().unwrap().workflows.predict;
+                let mut saving = predict.saving.clone();
+                if let Some(count) =
+                    crate::view::predict::output::matching_count(&self.model, predict)
+                {
+                    saving.compiledtotal = saving.compiledtotal.min(count);
+                }
                 saving
             },
-            validation_preview: self.workspace.validation_preview(self.model.workflow.validation.as_ref(), self.settings.draft().unwrap().workflows.validate.display.clone()),
+            validation_preview: self.workspace.validation_preview(
+                self.model.workflow.validation.as_ref(),
+                self.settings
+                    .draft()
+                    .unwrap()
+                    .workflows
+                    .validate
+                    .display
+                    .clone(),
+            ),
             inputs,
             preparation: if resume_checkpoint.is_some() {
                 StartPreparation::ResumeQueued
@@ -461,7 +502,9 @@ impl App {
                 self.submit_intent(ApplicationIntentEndpoint::ValidationStart, |correlation| {
                     crate::generated::encode_validation_Start(
                         correlation,
-                        crate::generated::ValidateWorkflowIntent { preview: validation_preview },
+                        crate::generated::ValidateWorkflowIntent {
+                            preview: validation_preview,
+                        },
                     )
                 })
             }
@@ -469,7 +512,11 @@ impl App {
                 self.submit_intent(ApplicationIntentEndpoint::PredictStart, |correlation| {
                     crate::generated::encode_predict_Start(
                         correlation,
-                        crate::generated::PredictWorkflowIntent { preview: pending.prediction_preview, saving: pending.prediction_saving, compiledpopulation: pending.prediction_population },
+                        crate::generated::PredictWorkflowIntent {
+                            preview: pending.prediction_preview,
+                            saving: pending.prediction_saving,
+                            compiledpopulation: pending.prediction_population,
+                        },
                     )
                 })
             }
@@ -676,12 +723,12 @@ impl App {
                 use crate::view::train::output::Message as Output;
                 match message {
                     Output::Auto(value) => {
-                        let schedule = self
-                            .settings
-                            .state_mut()
-                            .edit(crate::view::settings::EditCadence::Immediate, |draft| {
+                        let schedule = self.settings.state_mut().edit(
+                            crate::view::settings::EditCadence::Immediate,
+                            |draft| {
                                 crate::generated::edit_workflowstrainoutputautomatic(draft, value)
-                            });
+                            },
+                        );
                         return match schedule {
                             Ok(schedule) => self.handle_settings_schedule(schedule),
                             Err(error) => {
@@ -936,7 +983,12 @@ impl App {
     pub(super) fn on_predict(&mut self, outcome: crate::view::predict::Outcome) -> Task<Message> {
         match outcome {
             crate::view::predict::Outcome::Inspect(path) => {
-                self.submit_intent(ApplicationIntentEndpoint::PredictInspect, |correlation| crate::generated::encode_predict_Inspect(correlation, crate::generated::PredictionSourceQuery { path }));
+                self.submit_intent(ApplicationIntentEndpoint::PredictInspect, |correlation| {
+                    crate::generated::encode_predict_Inspect(
+                        correlation,
+                        crate::generated::PredictionSourceQuery { path },
+                    )
+                });
             }
             crate::view::predict::Outcome::DialogRequested(id) => self.open_dialog(id),
             crate::view::predict::Outcome::StartRequested => {
@@ -947,7 +999,13 @@ impl App {
                     self.submit_intent(ApplicationIntentEndpoint::PredictStop, |correlation| {
                         crate::generated::encode_predict_Stop(
                             correlation,
-                            crate::generated::PredictWorkflowIntent { preview: crate::generated::default_request_predictStartpreview().unwrap(), saving: crate::generated::default_request_predictStartsaving().unwrap(), compiledpopulation: 0 },
+                            crate::generated::PredictWorkflowIntent {
+                                preview: crate::generated::default_request_predictStartpreview()
+                                    .unwrap(),
+                                saving: crate::generated::default_request_predictStartsaving()
+                                    .unwrap(),
+                                compiledpopulation: 0,
+                            },
                         )
                     });
                 }
@@ -1295,7 +1353,15 @@ mod tests {
         use crate::view::train::{Outcome, output::Message as Output};
         let (mut app, mut capture) = start_app();
         drop(app.on_train(Outcome::Output(Output::Auto(false))));
-        assert!(!app.settings.draft().unwrap().workflows.train.output.automatic);
+        assert!(
+            !app.settings
+                .draft()
+                .unwrap()
+                .workflows
+                .train
+                .output
+                .automatic
+        );
         next_intent(&mut capture, ApplicationIntentEndpoint::SettingsUpdate);
         assert!(app.model.workflow.pending_start.is_none());
 
@@ -1353,7 +1419,9 @@ mod tests {
         settings.revision += 1;
         settings.settingsstate.workflows.train.output.automatic = true;
         settings.settingsstate.workflows.train.output.directory = "/saved/one".into();
-        app.model.project_settings_snapshot(settings.clone()).unwrap();
+        app.model
+            .project_settings_snapshot(settings.clone())
+            .unwrap();
         app.settings.install(&settings);
         app.advance_start();
         assert!(capture.try_recv().is_err());
@@ -1379,7 +1447,9 @@ mod tests {
         // The native settings owner settles the unchanged directory as a manual selection.
         settings.revision += 1;
         settings.settingsstate.workflows.train.output.automatic = false;
-        app.model.project_settings_snapshot(settings.clone()).unwrap();
+        app.model
+            .project_settings_snapshot(settings.clone())
+            .unwrap();
         app.settings.install(&settings);
         app.advance_start();
         let opened = next_intent(&mut capture, ApplicationIntentEndpoint::TrainingOpenRun);
@@ -1961,40 +2031,74 @@ mod tests {
         use crate::application_codec::FromApplicationValue;
         let (mut app, mut capture) = start_app();
         app.workspace.select(FeatureId::Validate);
-        app.settings.state_mut().edit(EditCadence::Debounced, |draft| {
-            crate::generated::edit_workflowsvalidatedisplayconfidencethreshold(draft, 0.437)
-        }).unwrap();
-        let expected = app.workspace.validation_preview(app.model.workflow.validation.as_ref(),
-            app.settings.draft().unwrap().workflows.validate.display.clone());
+        app.settings
+            .state_mut()
+            .edit(EditCadence::Debounced, |draft| {
+                crate::generated::edit_workflowsvalidatedisplayconfidencethreshold(draft, 0.437)
+            })
+            .unwrap();
+        let expected = app.workspace.validation_preview(
+            app.model.workflow.validation.as_ref(),
+            app.settings
+                .draft()
+                .unwrap()
+                .workflows
+                .validate
+                .display
+                .clone(),
+        );
         let mut saved = app.model.settings_snapshot.clone().unwrap();
         saved.revision += 1;
         saved.settingsstate = app.settings.draft().unwrap().clone();
         app.request_start(FeatureId::Validate);
         let update = next_intent(&mut capture, ApplicationIntentEndpoint::SettingsUpdate);
         // Local label interaction stays live while the accepted Start waits.
-        drop(app.on_workspace(crate::view::router::Message::Validate(crate::view::validate::Message::Samples(
-            crate::view::validate::samples::Message::Labels(true, false)))));
+        drop(app.on_workspace(crate::view::router::Message::Validate(
+            crate::view::validate::Message::Samples(
+                crate::view::validate::samples::Message::Labels(true, false),
+            ),
+        )));
         app.model.settings_snapshot = Some(saved.clone());
         app.model.workflow.install_settings(&saved);
         app.advance_start();
         assert!(capture.try_recv().is_err());
-        app.model.reduce_reply(update.correlation, Ok(crate::generated::ApplicationReply::SettingsUpdate(saved)));
+        app.model.reduce_reply(
+            update.correlation,
+            Ok(crate::generated::ApplicationReply::SettingsUpdate(saved)),
+        );
         app.settle_settings_reply(Some(ApplicationIntentEndpoint::SettingsUpdate), true, false);
         app.advance_start();
         let select = next_intent(&mut capture, ApplicationIntentEndpoint::ModelSelect);
         let active = active_preparation(&app, FeatureId::Validate);
-        app.model.reduce_reply(select.correlation, Ok(crate::generated::ApplicationReply::ModelSelect(active)));
+        app.model.reduce_reply(
+            select.correlation,
+            Ok(crate::generated::ApplicationReply::ModelSelect(active)),
+        );
         app.advance_start();
         assert!(capture.try_recv().is_err());
-        drop(app.on_workspace(crate::view::router::Message::Validate(crate::view::validate::Message::Samples(
-            crate::view::validate::samples::Message::Labels(false, false)))));
-        let accepted = accepted_model_for(&app.model, app.settings.draft().unwrap(), FeatureId::Validate);
+        drop(app.on_workspace(crate::view::router::Message::Validate(
+            crate::view::validate::Message::Samples(
+                crate::view::validate::samples::Message::Labels(false, false),
+            ),
+        )));
+        let accepted = accepted_model_for(
+            &app.model,
+            app.settings.draft().unwrap(),
+            FeatureId::Validate,
+        );
         model_event(&mut app, accepted);
         let start = next_intent(&mut capture, ApplicationIntentEndpoint::ValidationStart);
-        let encoded = crate::generated::encode_validation_Start(start.correlation,
-            crate::generated::ValidateWorkflowIntent { preview: expected.clone() });
+        let encoded = crate::generated::encode_validation_Start(
+            start.correlation,
+            crate::generated::ValidateWorkflowIntent {
+                preview: expected.clone(),
+            },
+        );
         assert_eq!(start.fields, encoded.record.fields);
-        let submitted = crate::generated::ValidationRunPreview::from_application_value(start.fields[0].value.clone()).unwrap();
+        let submitted = crate::generated::ValidationRunPreview::from_application_value(
+            start.fields[0].value.clone(),
+        )
+        .unwrap();
         assert_eq!(submitted, expected);
         assert!(submitted.groundtruthlabels && submitted.predictionlabels);
         assert!(app.model.workflow.pending_start.is_none());

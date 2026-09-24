@@ -49,10 +49,12 @@ public:
  [[nodiscard]] bool denoising_enabled() const noexcept;
  [[nodiscard]] std::optional<DenoisingQueryBatch> prepare_denoising(
   const PreparedTargets& targets, const TrainingStepIdentity& identity, const torch::Device& device, c10::ScalarType decoder_dtype, const DenoisingVariates* injected_variates = nullptr);
- [[nodiscard]] MatchFreeCorrespondence correspondence(const torch::Tensor& padded_labels, const torch::Tensor& padded_boxes, const torch::Tensor& valid_rows, const torch::Tensor& query_features, const PairwiseMaskSamples* masks = nullptr);
+ [[nodiscard]] MatchFreeCorrespondence correspondence(
+  const torch::Tensor& padded_labels, const torch::Tensor& padded_boxes, const torch::Tensor& valid_rows, const torch::Tensor& query_features, const PairwiseMaskSamples* masks = nullptr);
  [[nodiscard]] MatchFreeCost broadcast_cost(const torch::Tensor& padded_labels, const torch::Tensor& padded_boxes, const torch::Tensor& valid_rows, const OutputLayer& layer) const;
  // Optional fixed DN samples follow main/auxiliary decoder order; omitted draws remain private.
- [[nodiscard]] TrainingLoss loss(const ModelOutputs& outputs, const PreparedTargets& targets, const DeviceLossNormalizer& normalizer, bool training_mode, std::span<const LayerMaskSamples> mask_samples = {});
+ [[nodiscard]] TrainingLoss loss(
+  const ModelOutputs& outputs, const PreparedTargets& targets, const DeviceLossNormalizer& normalizer, bool training_mode, std::span<const LayerMaskSamples> mask_samples = {});
  void configure_timing(const SupervisionTimingSetup& setup);
  void begin_supervised_step_timing();
  void end_supervised_step_timing();
@@ -72,7 +74,8 @@ private:
  [[nodiscard]] torch::Tensor project_ground_truth(const torch::Tensor& encoding, const PairwiseMaskSamples* masks = nullptr);
  [[nodiscard]] torch::Tensor dense_correspondence(const torch::Tensor& probes, const torch::Tensor& query_features);
  [[nodiscard]] TrainingLoss empty_loss(const ModelOutputs& outputs) const;
- [[nodiscard]] TrainingLoss denoising_loss(const DenoisingOutputs& outputs, const PreparedTargets& targets, const DeviceLossNormalizer& normalizer, std::span<const LayerMaskSamples> mask_samples) const;
+ [[nodiscard]] TrainingLoss denoising_loss(
+  const DenoisingOutputs& outputs, const PreparedTargets& targets, const DeviceLossNormalizer& normalizer, std::span<const LayerMaskSamples> mask_samples) const;
  NativeRfDetrConfig config_;
  std::int64_t foreground_count_;
  std::shared_ptr<ProbeMlpImpl> ground_truth_mlp_;

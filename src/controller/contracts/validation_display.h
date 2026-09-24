@@ -9,7 +9,7 @@ struct ValidationOverlays final {
  bool operator==(const ValidationOverlays&) const = default;
 };
 MMLTK_REFLECT_FIELDS(ValidationOverlays)
-}
+}  // namespace mmltk::controller
 namespace mmltk::controller::contracts {
 struct ValidationDisplaySettings final {
  [[= mmltk::frameworks::reflection::Minimum<float>{0.0F}]][[= mmltk::frameworks::reflection::Maximum<float>{1.0F}]][[= mmltk::frameworks::reflection::Finite{}]] float confidence_threshold = 0.4F;

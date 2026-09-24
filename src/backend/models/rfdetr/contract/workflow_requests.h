@@ -69,7 +69,7 @@ struct PredictRequest : ModelArtifactRequest, InferenceExecutionConfig {
  [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]] std::filesystem::path video_path;
  [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]] std::filesystem::path compiled_path;
  [[= mmltk::frameworks::reflection::MaxItems{mmltk::backend::models::rfdetr::kMaximumCliImageInputs}]] std::vector<PredictImageInput> image_inputs;
- [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]] [[= mmltk::frameworks::reflection::RuntimeDestination{}]] std::filesystem::path output_path;
+ [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]][[= mmltk::frameworks::reflection::RuntimeDestination{}]] std::filesystem::path output_path;
  [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumNameBytes}]] std::string backend = "auto";
  [[= mmltk::frameworks::reflection::Minimum<std::size_t>{1U}]] std::size_t batch_size = 1U;
  [[= mmltk::frameworks::reflection::Minimum<std::size_t>{0U}]][[= mmltk::frameworks::reflection::Maximum<std::size_t>{kMaximumPredictionCandidates}]] std::size_t max_dets_per_image = 500U;
@@ -89,7 +89,7 @@ struct ValidateRequest : ModelArtifactRequest, InferenceExecutionConfig {
  [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]] std::filesystem::path compiled_path;
  [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]] std::filesystem::path source_dir;
  [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]] std::filesystem::path save_engine_path;
- [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]] [[= mmltk::frameworks::reflection::RuntimeDestination{}]] std::filesystem::path report_json_path;
+ [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]][[= mmltk::frameworks::reflection::RuntimeDestination{}]] std::filesystem::path report_json_path;
  [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumNameBytes}]] std::string eval_order = "onnx,tensorrt";
  [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumNameBytes}]] std::string split;
  [[= mmltk::frameworks::reflection::Minimum<std::size_t>{1U}]] std::size_t batch_size = 1U;
@@ -159,7 +159,7 @@ struct TrainRequest : mmltk::backend::data::DataLoadingOptions {
  [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]] std::filesystem::path weights_path;
  [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]] std::filesystem::path class_layout_path;
  [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]] std::filesystem::path resume_path;
- [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]] [[= mmltk::frameworks::reflection::RuntimeDestination{}]] std::filesystem::path output_dir;
+ [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]][[= mmltk::frameworks::reflection::RuntimeDestination{}]] std::filesystem::path output_dir;
  [[= mmltk::frameworks::reflection::MaxBytes{
   mmltk::frameworks::reflection::kMaximumNameBytes}]][[= mmltk::frameworks::reflection::Presentation<mmltk::frameworks::reflection::PresentationKind::Preset>{}]]
                                                      // CLEANUP-IGNORE: Preset metadata is deliberately repeated on the Train field consumed by reflection.

@@ -1,5 +1,5 @@
-use crate::view::shared::status_text;
 use crate::fluent_theme::Element;
+use crate::view::shared::status_text;
 use iced::Fill;
 use iced::widget::{column, progress_bar};
 

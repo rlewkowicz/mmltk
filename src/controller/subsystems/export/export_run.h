@@ -7,8 +7,8 @@
 namespace mmltk::controller {
 // One admitted GUI run. Backend requests retain their independent CLI contracts.
 struct ExportRunRequest final {
- mmltk::backend::models::rfdetr::ExportOnnxRequest onnx;
- std::filesystem::path output_directory;
+ mmltk::backend::models::rfdetr::ExportOnnxRequest onnx{};
+ std::filesystem::path output_directory{};
  bool export_onnx = true;
  bool build_tensorrt = true;
  bool allow_fp16 = true;

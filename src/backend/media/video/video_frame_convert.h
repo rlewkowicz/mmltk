@@ -24,6 +24,6 @@ struct VideoColorConversion final {
 [[nodiscard]] int convert_video_chw(VideoColorConversion, std::uint32_t width, std::uint32_t height, float* target, cudaStream_t stream) noexcept;
 }  // namespace mmltk::backend::media::video
 namespace mmltk::backend::media::video {
-[[nodiscard]] int convert_video_nv12(const std::uint8_t* rgba, std::size_t pitch, unsigned width, unsigned height,
- std::uint8_t* y, std::size_t y_pitch, std::uint8_t* uv, std::size_t uv_pitch, cudaStream_t stream) noexcept;
+[[nodiscard]] int convert_video_nv12(
+ const std::uint8_t* rgba, std::size_t pitch, unsigned width, unsigned height, std::uint8_t* y, std::size_t y_pitch, std::uint8_t* uv, std::size_t uv_pitch, cudaStream_t stream) noexcept;
 }

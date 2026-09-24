@@ -205,7 +205,8 @@ cudaError_t ExportOnnxSession::State::Close() noexcept {
  model.reset();
  return cudaSuccess;
 }
-void ExportOnnxSession::Run(const ExportOnnxRequest& request, const runtime::BorrowedCommandStream command_stream, const std::stop_token stop, const std::function<void(const std::filesystem::path&)>& published) {
+void ExportOnnxSession::Run(
+ const ExportOnnxRequest& request, const runtime::BorrowedCommandStream command_stream, const std::stop_token stop, const std::function<void(const std::filesystem::path&)>& published) {
  if (!state_) throw std::runtime_error("RF-DETR export session is terminally closed");
  if (stop.stop_requested()) return;
  if (!command_stream) throw std::invalid_argument("RF-DETR ONNX export command stream is invalid");
@@ -234,7 +235,8 @@ void ExportOnnxSession::Run(const ExportOnnxRequest& request, const runtime::Bor
   std::rethrow_exception(failure);
  }
 }
-void ExportOnnxSession::State::Run(const ExportOnnxRequest& request, const runtime::BorrowedCommandStream execution_stream, const std::stop_token stop, const std::function<void(const std::filesystem::path&)>& published) {
+void ExportOnnxSession::State::Run(
+ const ExportOnnxRequest& request, const runtime::BorrowedCommandStream execution_stream, const std::stop_token stop, const std::function<void(const std::filesystem::path&)>& published) {
  if (stop.stop_requested()) return;
  if (!model || !admission->Matches(request.weights_path, request.class_layout_path) || command_stream != execution_stream || weights_path != request.weights_path ||
      preset_name != request.preset_name || resolution != request.resolution || device != request.device_id) {

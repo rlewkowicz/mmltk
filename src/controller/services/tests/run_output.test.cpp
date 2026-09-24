@@ -67,7 +67,6 @@ TEST_CASE("output publication remains independent of failed and cancelled comput
   CHECK(state.output.partial_video == "/run/prediction.partial.mkv");
  }
 }
-
 TEST_CASE("manual reservations exclusively claim absent and empty directories", "[controller][output]") {
  mmltk::testsupport::ScopedTempDir temp{"manual-output-collisions"};
  for (const bool existing : {false, true}) {

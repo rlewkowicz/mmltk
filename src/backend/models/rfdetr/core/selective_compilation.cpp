@@ -53,6 +53,7 @@ class RecordingAutocastCache final {
 public:
  RecordingAutocastCache() : previous_(at::autocast::is_autocast_cache_enabled()) { at::autocast::set_autocast_cache_enabled(false); }
  ~RecordingAutocastCache() { at::autocast::set_autocast_cache_enabled(previous_); }
+
 private:
  bool previous_;
 };
@@ -63,7 +64,7 @@ SelectiveTensorRegion::Tensors unpack(const c10::IValue& value) {
  for (const auto& item : elements) result.push_back(item.toTensor());
  return result;
 }
-}
+}  // namespace
 struct SelectiveTensorRegion::State {
  torch::jit::Module module;
  Signature signature;
@@ -119,8 +120,12 @@ SelectiveTensorRegion::Tensors SelectiveTensorRegion::invoke(bool training, cons
     };
     count(count, graph->block());
    }
-   logger.debug("rfdetr compilation region={} owner={} reason={} training={} signature={} grad={} amp={} amp_dtype={} torch={} executor_optimize={} fuse_cpu={} fuse_gpu={} tf32_matmul={} tf32_cudnn={} graph_available={} operators={} fusion_groups={}",
-    name_, static_cast<const void*>(this), reason, training, metadata.str(), signature.grad, signature.amp, static_cast<int>(signature.amp_dtype), TORCH_VERSION, torch::jit::getGraphExecutorOptimize(), torch::jit::canFuseOnCPU(), torch::jit::canFuseOnGPU(), at::globalContext().allowTF32CuBLAS(), at::globalContext().allowTF32CuDNN(), static_cast<bool>(graph), operators, fusion_groups);
+   logger.debug(
+    "rfdetr compilation region={} owner={} reason={} training={} signature={} grad={} amp={} amp_dtype={} torch={} executor_optimize={} fuse_cpu={} fuse_gpu={} tf32_matmul={} tf32_cudnn={} "
+    "graph_available={} operators={} fusion_groups={}",
+    name_, static_cast<const void*>(this), reason, training, metadata.str(), signature.grad, signature.amp, static_cast<int>(signature.amp_dtype), TORCH_VERSION,
+    torch::jit::getGraphExecutorOptimize(), torch::jit::canFuseOnCPU(), torch::jit::canFuseOnGPU(), at::globalContext().allowTF32CuBLAS(), at::globalContext().allowTF32CuDNN(),
+    static_cast<bool>(graph), operators, fusion_groups);
   });
  };
  if (!compatible_extents) {
@@ -152,41 +157,46 @@ SelectiveTensorRegion::Tensors SelectiveTensorRegion::invoke(bool training, cons
   return output;
  }
  try {
- auto cu = std::make_shared<torch::jit::CompilationUnit>();
- auto type = torch::jit::ClassType::create("__torch__.SelectiveTensorRegion", cu, true);
- auto candidate = std::make_unique<State>(torch::jit::Module(cu, type), signature);
- std::size_t member = 0;
- for (auto* owner : owners) {
-  if (!owner) continue;
-  for (const auto& parameter : owner->named_parameters(true)) {
-   candidate->module.register_parameter("parameter_" + std::to_string(member++), parameter.value(), false);
-   if (!candidate->live_reference.defined()) candidate->live_reference = parameter.value();
+  auto cu = std::make_shared<torch::jit::CompilationUnit>();
+  auto type = torch::jit::ClassType::create("__torch__.SelectiveTensorRegion", cu, true);
+  auto candidate = std::make_unique<State>(torch::jit::Module(cu, type), signature);
+  std::size_t member = 0;
+  for (auto* owner : owners) {
+   if (!owner) continue;
+   for (const auto& parameter : owner->named_parameters(true)) {
+    candidate->module.register_parameter("parameter_" + std::to_string(member++), parameter.value(), false);
+    if (!candidate->live_reference.defined()) candidate->live_reference = parameter.value();
+   }
+   for (const auto& buffer : owner->named_buffers(true)) {
+    candidate->module.register_buffer("buffer_" + std::to_string(member++), buffer.value());
+    if (!candidate->live_reference.defined()) candidate->live_reference = buffer.value();
+   }
   }
-  for (const auto& buffer : owner->named_buffers(true)) {
-   candidate->module.register_buffer("buffer_" + std::to_string(member++), buffer.value());
-   if (!candidate->live_reference.defined()) candidate->live_reference = buffer.value();
-  }
- }
- if (candidate->live_reference.defined()) candidate->parameter_device = candidate->live_reference.device();
- torch::jit::Stack arguments;
- for (const auto& input : inputs) arguments.emplace_back(input);
- const auto recording = [&] {
- RecordingAutocastCache cache;
- return torch::jit::tracer::trace(std::move(arguments), [&](torch::jit::Stack values) {
-  Tensors tensors;
-  for (const auto& value : values) tensors.push_back(value.toTensor());
-  std::vector<c10::IValue> outputs;
-  for (auto& output : ordinary(tensors)) outputs.emplace_back(std::move(output));
-  return torch::jit::Stack{c10::ivalue::Tuple::create(std::move(outputs))};
- }, [](const torch::autograd::Variable&) { return ""; }, false, false, &candidate->module);
- }();
- candidate->module.type()->addMethod(cu->create_function("forward", recording.first->graph, true));
- auto output = unpack(recording.second.front());
- diagnostic("prepared; recorded graph", recording.first->graph);
- candidate->preparation_batch = slot.batch_size;
- slot.state = std::move(candidate);
- slot.armed = false;
- return output;
+  if (candidate->live_reference.defined()) candidate->parameter_device = candidate->live_reference.device();
+  torch::jit::Stack arguments;
+  for (const auto& input : inputs) arguments.emplace_back(input);
+  const auto recording = [&] {
+   RecordingAutocastCache cache;
+   return torch::jit::tracer::trace(
+    std::move(arguments),
+    [&](torch::jit::Stack values) {
+     Tensors tensors;
+     for (const auto& value : values) tensors.push_back(value.toTensor());
+     std::vector<c10::IValue> outputs;
+     for (auto& output : ordinary(tensors)) outputs.emplace_back(std::move(output));
+     values.clear();
+     values.emplace_back(c10::ivalue::Tuple::create(std::move(outputs)));
+     return values;
+    },
+    [](const torch::autograd::Variable&) { return ""; }, false, false, &candidate->module);
+  }();
+  candidate->module.type()->addMethod(cu->create_function("forward", recording.first->graph, true));
+  auto output = unpack(recording.second.front());
+  diagnostic("prepared; recorded graph", recording.first->graph);
+  candidate->preparation_batch = slot.batch_size;
+  slot.state = std::move(candidate);
+  slot.armed = false;
+  return output;
  } catch (...) {
   // A failed replacement leaves the previous admitted request and graph usable.
   // The failing operation is never replayed as ordinary GPU work.
@@ -197,4 +207,4 @@ SelectiveTensorRegion::Tensors SelectiveTensorRegion::invoke(bool training, cons
   throw;
  }
 }
-}
+}  // namespace mmltk::backend::models::rfdetr::detail

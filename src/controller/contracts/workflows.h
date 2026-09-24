@@ -176,8 +176,14 @@ struct[[= mmltk::controller::contracts::reflection::feature_scope(Features...)]]
  static constexpr std::array<mmltk::controller::contracts::FeatureId, sizeof...(Features)> features{Features...};
 };
 struct[[= reflection::feature_scope(FeatureId::Train)]] TrainWorkflowIntent final {};
-struct[[= reflection::feature_scope(FeatureId::Validate)]] ValidateWorkflowIntent final { ValidationRunPreview preview{}; };
-struct[[= reflection::feature_scope(FeatureId::Predict)]] PredictWorkflowIntent final { PredictionRunPreview preview{}; PredictionOutputSettings saving{}; std::uint64_t compiled_population = 0; };
+struct[[= reflection::feature_scope(FeatureId::Validate)]] ValidateWorkflowIntent final {
+ ValidationRunPreview preview{};
+};
+struct[[= reflection::feature_scope(FeatureId::Predict)]] PredictWorkflowIntent final {
+ PredictionRunPreview preview{};
+ PredictionOutputSettings saving{};
+ std::uint64_t compiled_population = 0;
+};
 struct[[= reflection::feature_scope(FeatureId::Annotate)]] AnnotateWorkflowIntent final {};
 struct[[= reflection::feature_scope(FeatureId::Export)]] ExportWorkflowIntent final {};
 struct[[= reflection::feature_scope(FeatureId::Live)]] LiveWorkflowIntent final {};

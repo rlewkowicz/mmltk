@@ -28,8 +28,9 @@ public:
  void Prepare(std::span<const std::string> names);
  void Draw(mmltk::frameworks::gpu::ImagePlaneView, std::span<const NamedCaption>, std::uintptr_t stream) const;
  static void Composite(mmltk::frameworks::gpu::ImagePlaneView clean, mmltk::frameworks::gpu::ImagePlaneView semantic, std::uintptr_t stream);
+
 private:
  struct Impl;
  std::unique_ptr<Impl> impl_;
 };
-}
+}  // namespace mmltk::backend::imaging::raster

@@ -181,7 +181,10 @@ public:
   Adopt(generation, std::move(sample), std::move(raw));
  }
  void Adopt(std::uint64_t generation, rfdetr::ValidationSampleView sample, std::shared_ptr<const PredictionPreviewFrame> raw) {
-  if (!raw || sample.pixels.width > visual_.maximum_width || sample.pixels.height > visual_.maximum_height) { Settle(generation, false); return; }
+  if (!raw || sample.pixels.width > visual_.maximum_width || sample.pixels.height > visual_.maximum_height) {
+   Settle(generation, false);
+   return;
+  }
   ValidationSampleMetadata metadata;
   metadata.available = true;
   metadata.pixel_extent = {sample.pixels.width, sample.pixels.height};
@@ -517,8 +520,12 @@ gpu::DeviceContext ValidationSamples::CaptureContext() {
  return *impl_->context_;
 }
 void ValidationSamples::Adopt(std::uint64_t generation, rfdetr::ValidationSampleView sample, std::shared_ptr<const PredictionPreviewFrame> raw) {
- try { impl_->Adopt(generation, std::move(sample), std::move(raw)); }
- catch (...) { impl_->Settle(generation, false); throw; }
+ try {
+  impl_->Adopt(generation, std::move(sample), std::move(raw));
+ } catch (...) {
+  impl_->Settle(generation, false);
+  throw;
+ }
 }
 void ValidationSamples::Settle(std::uint64_t generation, bool succeeded) { impl_->Settle(generation, succeeded); }
 void ValidationSamples::Select(ValidationSampleIdentity identity) { impl_->Select(identity); }

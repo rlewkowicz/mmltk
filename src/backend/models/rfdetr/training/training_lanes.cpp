@@ -132,13 +132,13 @@ TrainingLanes::TrainingLanes(const TrainRequest& options, RuntimeContext& train_
 }
 TrainingLanes::~TrainingLanes() = default;
 std::future<TrainLaneResult> TrainingLanes::enqueue(RuntimeContext* runtime, mmltk::backend::data::DatasetLoader& loader, const mmltk::backend::data::Batch& batch,
- const mmltk::backend::ml::cuda::CudaEventPool::Lease* params_ready, mmltk::backend::ml::cuda::CudaEventPool& event_pool, std::size_t admitted_microbatches, double gradient_scale, size_t parameter_version,
- const DetectionConfig& detection_config, const NativeRfDetrModel& model, int device_id, int image_height, int image_width, std::uint64_t seed, int epoch, int rank,
+ const mmltk::backend::ml::cuda::CudaEventPool::Lease* params_ready, mmltk::backend::ml::cuda::CudaEventPool& event_pool, std::size_t admitted_microbatches, double gradient_scale,
+ size_t parameter_version, const DetectionConfig& detection_config, const NativeRfDetrModel& model, int device_id, int image_height, int image_width, std::uint64_t seed, int epoch, int rank,
  std::uint64_t augmentation_sequence, bool amp_enabled, at::ScalarType autocast_dtype, TrainingSupervisionRoute route, std::shared_ptr<WaveTargetNormalizer> wave_normalizer, std::size_t lane_index) {
  auto& lane = impl_->lanes.at(lane_index);
  auto& lane_pool = *impl_->pool;
- return lane_pool.enqueue([runtime, &loader, &lane, batch, params_ready, &event_pool, admitted_microbatches, gradient_scale, parameter_version, &detection_config, &model, device_id, image_height, image_width, seed,
-                           epoch, rank, augmentation_sequence, amp_enabled, autocast_dtype, route, wave_normalizer = std::move(wave_normalizer), lane_index]() mutable {
+ return lane_pool.enqueue([runtime, &loader, &lane, batch, params_ready, &event_pool, admitted_microbatches, gradient_scale, parameter_version, &detection_config, &model, device_id, image_height,
+                           image_width, seed, epoch, rank, augmentation_sequence, amp_enabled, autocast_dtype, route, wave_normalizer = std::move(wave_normalizer), lane_index]() mutable {
   try {
    ScopedRuntimeContext worker_scope(runtime, lane_index + 1);
    torch_cuda::TorchCudaDeviceGuard device_guard(torch_cuda::checked_device_index(device_id));
@@ -193,8 +193,8 @@ std::future<TrainLaneResult> TrainingLanes::enqueue(RuntimeContext* runtime, mml
                   NestedTensor{normalized, prepared.nested_mask}, prepared, TrainingStepIdentity{seed, static_cast<std::uint64_t>(epoch), static_cast<std::uint32_t>(rank), augmentation_sequence});
      } else {
       mmltk::common::logging::ScopedProfile profile_rfdetr_train_parallel_forward{"rfdetr.train.parallel.forward"};
-      outputs =
-       route_uses_match_free(route) ? (*lane.model).forward_for_match_free(NestedTensor{normalized, prepared.nested_mask}) : (*lane.model).forward(NestedTensor{normalized, prepared.nested_mask}, true);
+      outputs = route_uses_match_free(route) ? (*lane.model).forward_for_match_free(NestedTensor{normalized, prepared.nested_mask})
+                                             : (*lane.model).forward(NestedTensor{normalized, prepared.nested_mask}, true);
      }
      if (!route_uses_denoising(route)) {
       mmltk::common::logging::ScopedProfile profile_rfdetr_train_parallel_targets_handoff{"rfdetr.train.parallel.targets_handoff"};

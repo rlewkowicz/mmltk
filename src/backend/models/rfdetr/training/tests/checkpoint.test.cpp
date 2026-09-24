@@ -502,7 +502,7 @@ TEST_CASE("Fresh transfer maps actual classifier and supervision axes by class i
   REQUIRE(entry != source.end());
   for (std::int64_t row = 0; row < entry->tensor.size(dimension); ++row) entry->tensor.select(dimension, row).fill_(10. + static_cast<double>(row));
  }
- auto mask_projection = std::ranges::find(source, "training_supervision.mask_projection.weight", &r::NormalizedModelStateEntry::name);
+ auto mask_projection = std::ranges::find_if(source, [](const auto& entry) { return entry.name == "training_supervision.mask_projection.weight"; });
  REQUIRE(mask_projection != source.end());
  mask_projection->tensor.fill_(0.375F);
  const auto transfer = [&](r::NativeRfDetrModel& destination) {

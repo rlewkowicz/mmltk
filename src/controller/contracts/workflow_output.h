@@ -13,15 +13,17 @@ namespace mmltk::controller::contracts {
 inline constexpr std::size_t kWorkflowArtifactCapacity = 8U;
 struct WorkflowOutputSelection final {
  bool automatic = true;
- [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]]
- [[= reflection::FileDialog<"Select output directory", "Directories", "*">{.mode = FileDialogMode::OpenFolder}]] std::string directory;
+ [[= mmltk::frameworks::reflection::MaxBytes{
+  mmltk::frameworks::reflection::kMaximumPathBytes}]][[= reflection::FileDialog<"Select output directory", "Directories", "*">{.mode = FileDialogMode::OpenFolder}]] std::string directory;
  bool operator==(const WorkflowOutputSelection&) const = default;
 };
 // Collections remain bounded independently of the number of processed images.
 // A recoverable in-progress video is never advertised as a completed artifact.
 struct WorkflowOutputFacts final {
  [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]] std::string directory;
- [[= mmltk::frameworks::reflection::MaxItems{kWorkflowArtifactCapacity}]] std::vector<std::filesystem::path> artifacts;
+ [[= mmltk::frameworks::reflection::MaxItems{
+  kWorkflowArtifactCapacity}]][[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]] std::vector<std::filesystem::path>
+  artifacts;
  [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]] std::string samples_directory;
  std::uint64_t completed_samples = 0;
  [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]] std::string recent_sample;

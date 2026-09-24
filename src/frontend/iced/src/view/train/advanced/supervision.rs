@@ -281,5 +281,4 @@ mod tests {
             assert_ne!(constraint.stable_field_id, 0);
         }
     }
-
 }

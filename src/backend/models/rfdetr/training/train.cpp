@@ -856,9 +856,9 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
     for (int lane_index = 0; lane_index < train_lane_count; ++lane_index) {
      auto batch = next_train_full_batch();
      if (!batch.has_value()) { throw std::runtime_error("native RF-DETR training ended an epoch with an incomplete parallel train wave"); }
-     wave.add(train_lanes.enqueue(&train_runtime, train_loader, *batch, params_ready ? &*params_ready : nullptr, training_events.pool(), admitted_microbatches, current_scale, parameter_version, detection_config, model,
-      options.device_id, static_cast<int>(train_loader.image_height()), static_cast<int>(train_loader.image_width()), static_cast<std::uint64_t>(options.seed), epoch, distributed.rank,
-      local_full_batches - 1, amp_enabled, autocast_dtype, training_route, wave.normalizer(), static_cast<std::size_t>(lane_index)));
+     wave.add(train_lanes.enqueue(&train_runtime, train_loader, *batch, params_ready ? &*params_ready : nullptr, training_events.pool(), admitted_microbatches, current_scale, parameter_version,
+      detection_config, model, options.device_id, static_cast<int>(train_loader.image_height()), static_cast<int>(train_loader.image_width()), static_cast<std::uint64_t>(options.seed), epoch,
+      distributed.rank, local_full_batches - 1, amp_enabled, autocast_dtype, training_route, wave.normalizer(), static_cast<std::size_t>(lane_index)));
     }
     wave.settle(mmltk::backend::ml::cuda::cuda_device(options.device_id), [&](TrainLaneResult& lane_result) {
      train_lanes.merge(lane_result, all_params, options.device_id);

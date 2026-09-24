@@ -367,8 +367,8 @@ void PredictionPreviewFrame::Draw(gpu::SystemImageRuntime& runtime, gpu::SystemI
  const std::array regions{PredictionPreviewComposition::Region{shared_from_this(), {0U, 0U, state_->extent.width, state_->extent.height}}};
  PredictionPreviewComposition::Draw(runtime, candidate, state_->extent, regions, {});
 }
-void PredictionPreviewComposition::Draw(
- gpu::SystemImageRuntime& runtime, gpu::SystemImageRuntime::OutputCandidate& candidate, VisualExtent extent, std::span<const Region> regions, Options options, PredictionPreviewComposition* retained, gpu::ImageProductBuffer::ProductSubmit finalize) {
+void PredictionPreviewComposition::Draw(gpu::SystemImageRuntime& runtime, gpu::SystemImageRuntime::OutputCandidate& candidate, VisualExtent extent, std::span<const Region> regions, Options options,
+ PredictionPreviewComposition* retained, gpu::ImageProductBuffer::ProductSubmit finalize) {
  if (!extent.valid() || regions.size() > kMaximumFrames) throw std::invalid_argument("preview composition extent or count is invalid");
  if (retained && regions.size() > 6U) throw std::invalid_argument("retained preview exceeds six regions");
  std::shared_ptr<gpu::TerminalCudaRetirementOwner> retirement;

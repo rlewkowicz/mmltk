@@ -21,6 +21,7 @@
 #include <utility>
 namespace mmltk::backend::imaging::raster {
 namespace {
+using FileStream = std::unique_ptr<std::FILE, decltype([](std::FILE* file) noexcept { std::fclose(file); })>;
 struct PngSink final {
  std::FILE* file;
  int error = 0;
@@ -32,9 +33,7 @@ struct PngSink final {
   if (written != static_cast<std::size_t>(count) || std::ferror(sink.file)) sink.error = errno != 0 ? errno : EIO;
  }
 };
-[[noreturn]] void png_io_failure(const char* operation, const char* path, int error) {
- throw std::system_error(error, std::generic_category(), std::string(operation) + " rendered PNG: " + path);
-}
+[[noreturn]] void png_io_failure(const char* operation, const char* path, int error) { throw std::system_error(error, std::generic_category(), std::string(operation) + " rendered PNG: " + path); }
 // A PNG attempt owns one exclusive sibling and its open stream. No fixed
 // staging entry is opened, followed, truncated, or removed.
 class PngStagingFile final {
@@ -56,13 +55,11 @@ public:
  }
  PngStagingFile(const PngStagingFile&) = delete;
  PngStagingFile& operator=(const PngStagingFile&) = delete;
- void Encode(const RenderedImageWriter::PngEncoder& encoder, const std::filesystem::path& destination,
-             int width, int height, const void* pixels, int stride) {
+ void Encode(const RenderedImageWriter::PngEncoder& encoder, const std::filesystem::path& destination, int width, int height, const void* pixels, int stride) {
   if (encoder) {
    // The optional encoder owns opening/closing this attempt's exclusive path.
    if (std::fclose(file_.release()) != 0) png_io_failure("close staging stream for", destination.c_str(), errno);
-   if (encoder(path_.c_str(), width, height, 4, pixels, stride) == 0)
-    throw std::runtime_error("failed to write rendered PNG: " + destination.string());
+   if (encoder(path_.c_str(), width, height, 4, pixels, stride) == 0) throw std::runtime_error("failed to write rendered PNG: " + destination.string());
   } else {
    detail::write_png_stream(file_.release(), destination.c_str(), width, height, 4, pixels, stride);
   }
@@ -71,12 +68,12 @@ public:
   std::filesystem::rename(path_, destination);
   path_.clear();
  }
+
 private:
  std::string path_;
- std::unique_ptr<std::FILE, decltype(&std::fclose)> file_{nullptr, &std::fclose};
+ FileStream file_;
 };
-
-}
+}  // namespace
 void detail::validate_png_extent(std::size_t width, std::size_t height, std::size_t channels, std::size_t stride, const char* path) {
  constexpr auto limit = static_cast<std::size_t>(std::numeric_limits<int>::max());
  const auto invalid = [&] { throw std::invalid_argument(std::string("unsupported rendered PNG extent: ") + path); };
@@ -96,7 +93,7 @@ void detail::validate_png_extent(std::size_t width, std::size_t height, std::siz
 int detail::write_png_stream(std::FILE* stream, const char* path, int width, int height, int channels, const void* pixels, int stride) {
  // Own the stream immediately, including exceptional encoder exit. The callback
  // cannot throw through stb: report only after it has released encoded storage.
- std::unique_ptr<std::FILE, decltype(&std::fclose)> file(stream, &std::fclose);
+ FileStream file(stream);
  validate_png_extent(width, height, channels, stride, path);
  PngSink sink{file.get()};
  const int encoded = stbi_write_png_to_func(&PngSink::Write, &sink, width, height, channels, pixels, stride);
@@ -138,7 +135,7 @@ struct RenderedImageWriter::Impl final {
  mmltk::common::concurrency::WorkerPool pool{1, {}, "samplewrite"};
  std::future<std::filesystem::path> future;
 };
-RenderedImageWriter::RenderedImageWriter(mmltk::frameworks::gpu::DeviceContext context, PngEncoder encoder) : impl_(std::make_unique<Impl>(std::move(context),std::move(encoder))) {}
+RenderedImageWriter::RenderedImageWriter(mmltk::frameworks::gpu::DeviceContext context, PngEncoder encoder) : impl_(std::make_unique<Impl>(std::move(context), std::move(encoder))) {}
 RenderedImageWriter::~RenderedImageWriter() { impl_->pool.wait_idle(); }
 void RenderedImageWriter::Write(mmltk::frameworks::gpu::BorrowedImageProductReadView image, const std::filesystem::path& destination) {
  if (impl_->future.valid()) throw std::logic_error("previous rendered image write has not been settled");
@@ -151,7 +148,9 @@ void RenderedImageWriter::Write(mmltk::frameworks::gpu::BorrowedImageProductRead
  impl_->pinned->ensure_bytes(pitch * height);
  try {
   impl_->stream.Await(image);
-  ensure_cuda_ok(cudaMemcpy2DAsync(impl_->pinned->data(), pitch, reinterpret_cast<const void*>(plane.data), plane.descriptor.pitch_bytes, pitch, height, cudaMemcpyDeviceToHost, reinterpret_cast<cudaStream_t>(impl_->stream.native_handle())), "copy rendered image for PNG");
+  ensure_cuda_ok(cudaMemcpy2DAsync(impl_->pinned->data(), pitch, reinterpret_cast<const void*>(plane.data), plane.descriptor.pitch_bytes, pitch, height, cudaMemcpyDeviceToHost,
+                  reinterpret_cast<cudaStream_t>(impl_->stream.native_handle())),
+   "copy rendered image for PNG");
   impl_->stream.Synchronize();
  } catch (...) { impl_->stream.RethrowAfterSettlement(std::current_exception()); }
  // No borrowed source or CUDA API reaches the file worker.

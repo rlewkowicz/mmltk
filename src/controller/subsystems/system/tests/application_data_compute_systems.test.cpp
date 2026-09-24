@@ -509,17 +509,18 @@ TEST_CASE("CUDA export and validation preserve cancelled outcomes and prior arti
 }
 }  // namespace
 }  // namespace mmltk::controller
-
 namespace mmltk::controller {
 namespace {
 class CapturedOutputValidation final : public ValidationRuntime {
 public:
  CapturedOutputValidation(std::promise<std::filesystem::path>& admitted, std::shared_ptr<mmltk::testsupport::StopGate> gate) : admitted_(admitted), gate_(std::move(gate)) {}
- ValidationRuntimeResult Run(mmltk::backend::models::rfdetr::ValidateRequest request, std::stop_token stop, const ComputeProgressSink&, const mmltk::backend::models::rfdetr::ValidationDelivery&) override {
+ ValidationRuntimeResult Run(
+  mmltk::backend::models::rfdetr::ValidateRequest request, std::stop_token stop, const ComputeProgressSink&, const mmltk::backend::models::rfdetr::ValidationDelivery&) override {
   admitted_.set_value(request.report_json_path);
   static_cast<void>(gate_->Wait(stop));
   return {.terminal = contracts::make_compute_terminal(contracts::ComputeOperationOutcome::Cancelled)};
  }
+
 private:
  std::promise<std::filesystem::path>& admitted_;
  std::shared_ptr<mmltk::testsupport::StopGate> gate_;
@@ -534,8 +535,7 @@ TEST_CASE("validation reserves after admission and retains the captured director
  std::promise<std::filesystem::path> admitted;
  std::promise<void> settled;
  auto gate = std::make_shared<mmltk::testsupport::StopGate>();
- ValidationSystem validation{settings, dataset, model,
-  [&] { return std::make_unique<CapturedOutputValidation>(admitted, gate); },
+ ValidationSystem validation{settings, dataset, model, [&] { return std::make_unique<CapturedOutputValidation>(admitted, gate); },
   [&](ValidationSystem::event_type event) {
    if (const auto* changed = std::get_if<ValidationChanged>(&event); changed && !changed->snapshot.operation.active) mmltk::testsupport::release_test_promise(settled);
   }};
@@ -546,7 +546,8 @@ TEST_CASE("validation reserves after admission and retains the captured director
  CHECK(validation.snapshot().operation.output.directory == report.parent_path().string());
  const auto later = (root.path() / "later").string();
  contracts::SettingsUpdateRequest edit;
- edit.updates.push_back({.path = "workflows.validate.output.directory", .value = mmltk::frameworks::serialization::wire::FlatValue::text(later, mmltk::frameworks::reflection::kMaximumPathBytes).value()});
+ edit.updates.push_back(
+  {.path = "workflows.validate.output.directory", .value = mmltk::frameworks::serialization::wire::FlatValue::text(later, mmltk::frameworks::reflection::kMaximumPathBytes).value()});
  static_cast<void>(settings.Update(std::move(edit)));
  static_cast<void>(validation.Stop());
  mmltk::testsupport::await_test_promise(settled, "validation cancellation");
@@ -558,7 +559,6 @@ TEST_CASE("validation reserves after admission and retains the captured director
 }
 }  // namespace
 }  // namespace mmltk::controller
-
 namespace mmltk::controller {
 namespace {
 class PublishedThenFailedExport final : public ExportRuntime {
@@ -593,7 +593,6 @@ TEST_CASE("export keeps committed artifacts visible when later settlement fails"
 }
 }  // namespace
 }  // namespace mmltk::controller
-
 namespace mmltk::controller {
 namespace {
 class CancelBeforePublicationExport final : public ExportRuntime {
@@ -605,6 +604,7 @@ public:
   static_cast<void>(gate.Wait(stop));
   return contracts::make_compute_terminal(contracts::ComputeOperationOutcome::Cancelled);
  }
+
 private:
  std::promise<void>& started_;
 };
@@ -631,15 +631,14 @@ TEST_CASE("export stopped during native work does not advertise an uncommitted a
 }
 }  // namespace
 }  // namespace mmltk::controller
-
 namespace mmltk::controller {
 namespace {
 TEST_CASE("export dependency chain publishes selected formats and settles temporary companions", "[controller][systems][export]") {
  enum class Interruption { None, BeforeOnnx, DuringOnnx, BetweenStages, DuringEngine, FailedOnnx, FailedOnnxAfterPublish, FailedEngine, FailedEngineAfterPublish };
  for (const bool save_onnx : {false, true}) {
   for (const bool save_engine : {false, true}) {
-   for (const auto interruption : {Interruption::None, Interruption::BeforeOnnx, Interruption::DuringOnnx, Interruption::BetweenStages,
-         Interruption::DuringEngine, Interruption::FailedOnnx, Interruption::FailedOnnxAfterPublish, Interruption::FailedEngine, Interruption::FailedEngineAfterPublish}) {
+   for (const auto interruption : {Interruption::None, Interruption::BeforeOnnx, Interruption::DuringOnnx, Interruption::BetweenStages, Interruption::DuringEngine, Interruption::FailedOnnx,
+         Interruption::FailedOnnxAfterPublish, Interruption::FailedEngine, Interruption::FailedEngineAfterPublish}) {
     CAPTURE(save_onnx, save_engine, interruption);
     mmltk::testsupport::ScopedTempDir root{"export-chain"};
     ExportRunRequest request{.output_directory = root.path(), .export_onnx = save_onnx, .build_tensorrt = save_engine, .allow_fp16 = false};
@@ -659,7 +658,10 @@ TEST_CASE("export dependency chain publishes selected formats and settles tempor
      CHECK(onnx.opset_version == 19);
      CHECK(onnx.simplify);
      intermediate = onnx.output_path;
-     if (interruption == Interruption::DuringOnnx) { stop.request_stop(); return; }
+     if (interruption == Interruption::DuringOnnx) {
+      stop.request_stop();
+      return;
+     }
      if (interruption == Interruption::FailedOnnx) throw std::runtime_error("ONNX fixture failure");
      std::ofstream(onnx.output_path) << "ONNX";
      std::ofstream(onnx.output_path.string() + ".classes.json") << "class facts";
@@ -675,7 +677,10 @@ TEST_CASE("export dependency chain publishes selected formats and settles tempor
      CHECK_FALSE(engine.allow_fp16);
      CHECK(std::filesystem::exists(engine.onnx_path));
      CHECK(std::filesystem::exists(engine.onnx_path.string() + ".classes.json"));
-     if (interruption == Interruption::DuringEngine) { stop.request_stop(); return; }
+     if (interruption == Interruption::DuringEngine) {
+      stop.request_stop();
+      return;
+     }
      if (interruption == Interruption::FailedEngine) throw std::runtime_error("engine fixture failure");
      std::ofstream(engine.output_path) << "engine";
      committed(engine.output_path);
@@ -690,19 +695,19 @@ TEST_CASE("export dependency chain publishes selected formats and settles tempor
     const auto run = [&] { return execute_export_run(request, stop.get_token(), progress, [&](const auto& path) { published.push_back(path); }, export_onnx, build); };
     const bool invalid = !save_onnx && !save_engine;
     const bool failing = interruption == Interruption::FailedOnnx || interruption == Interruption::FailedOnnxAfterPublish ||
-     (save_engine && (interruption == Interruption::FailedEngine || interruption == Interruption::FailedEngineAfterPublish));
+                         (save_engine && (interruption == Interruption::FailedEngine || interruption == Interruption::FailedEngineAfterPublish));
     if (invalid || failing) {
      CHECK_THROWS(run());
     } else {
      const auto result = run();
      CHECK(result.valid_worker_terminal());
      const bool cancelled = interruption == Interruption::BeforeOnnx || interruption == Interruption::DuringOnnx || interruption == Interruption::BetweenStages ||
-      (save_engine && interruption == Interruption::DuringEngine);
+                            (save_engine && interruption == Interruption::DuringEngine);
      CHECK(result.outcome == (cancelled ? contracts::ComputeOperationOutcome::Cancelled : contracts::ComputeOperationOutcome::Succeeded));
     }
     CHECK(onnx_calls == (invalid || interruption == Interruption::BeforeOnnx ? 0U : 1U));
-    const bool reached_engine = !invalid && save_engine && interruption != Interruption::BeforeOnnx && interruption != Interruption::DuringOnnx &&
-     interruption != Interruption::BetweenStages && interruption != Interruption::FailedOnnx && interruption != Interruption::FailedOnnxAfterPublish;
+    const bool reached_engine = !invalid && save_engine && interruption != Interruption::BeforeOnnx && interruption != Interruption::DuringOnnx && interruption != Interruption::BetweenStages &&
+                                interruption != Interruption::FailedOnnx && interruption != Interruption::FailedOnnxAfterPublish;
     CHECK(engine_calls == (reached_engine ? 1U : 0U));
     if (!save_onnx && !intermediate.empty()) CHECK_FALSE(std::filesystem::exists(intermediate.parent_path()));
     for (const auto& path : published) {
@@ -730,7 +735,10 @@ TEST_CASE("export rejects empty format selection before native preparation or ou
  static_cast<void>(settings.Update(std::move(update)));
  CHECK_THROWS_AS(model.Select({.workflow = contracts::FeatureId::Export}), contracts::InvalidIntentError);
  unsigned runtime_creations = 0U;
- ExportSystem exporter{settings, dataset, model, [&]() -> std::unique_ptr<ExportRuntime> { ++runtime_creations; return {}; }};
+ ExportSystem exporter{settings, dataset, model, [&]() -> std::unique_ptr<ExportRuntime> {
+                        ++runtime_creations;
+                        return {};
+                       }};
  CHECK_THROWS_AS(exporter.Start({}), contracts::InvalidIntentError);
  CHECK(runtime_creations == 0U);
  CHECK(exporter.snapshot().generation_frontier == 0U);

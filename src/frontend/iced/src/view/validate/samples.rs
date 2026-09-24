@@ -1,7 +1,7 @@
-use crate::view::shared::status_text;
 use crate::fluent_theme::Element;
 use crate::generated::{ValidationOverlays, ValidationSampleIdentity};
 use crate::presentation_surface::{self, Surface};
+use crate::view::shared::status_text;
 use crate::view::workflow::overlay_controls;
 use iced::widget::{button, checkbox, column, container, row};
 use iced::{Center, Fill};
@@ -97,10 +97,16 @@ impl Default for Component {
     }
 }
 impl Component {
-    pub fn capture_preview(&self, snapshot: Option<&crate::generated::ValidationSnapshot>, display: crate::generated::ValidationDisplaySettings) -> crate::generated::ValidationRunPreview {
+    pub fn capture_preview(
+        &self,
+        snapshot: Option<&crate::generated::ValidationSnapshot>,
+        display: crate::generated::ValidationDisplaySettings,
+    ) -> crate::generated::ValidationRunPreview {
         let mut preview = crate::generated::default_request_validationStartpreview()
             .expect("canonical validation Start preview default");
-        if let Some(snapshot) = snapshot { preview.overlays = snapshot.overlayselection.value.clone(); }
+        if let Some(snapshot) = snapshot {
+            preview.overlays = snapshot.overlayselection.value.clone();
+        }
         preview.display = display;
         preview.groundtruthlabels = self.ground_truth;
         preview.predictionlabels = self.prediction;
@@ -441,13 +447,23 @@ mod tests {
     fn accepted_preview_keeps_local_labels_and_threshold_after_viewer_edits() {
         let mut component = Component::default();
         component.update(Message::Labels(true, false));
-        let captured = component.capture_preview(None, crate::generated::ValidationDisplaySettings { confidencethreshold: 0.437 });
+        let captured = component.capture_preview(
+            None,
+            crate::generated::ValidationDisplaySettings {
+                confidencethreshold: 0.437,
+            },
+        );
         component.update(Message::Labels(true, true));
         component.update(Message::Labels(false, false));
         assert!(!captured.groundtruthlabels);
         assert!(captured.predictionlabels);
         assert_eq!(captured.display.confidencethreshold, 0.437);
-        let later = component.capture_preview(None, crate::generated::default_request_validationStartpreview().unwrap().display);
+        let later = component.capture_preview(
+            None,
+            crate::generated::default_request_validationStartpreview()
+                .unwrap()
+                .display,
+        );
         assert!(later.groundtruthlabels);
         assert!(!later.predictionlabels);
     }

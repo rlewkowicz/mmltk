@@ -31,9 +31,7 @@ pub(crate) fn model_settings_projection(
     let matching = || {
         crate::generated::MODEL_ARTIFACT_DIALOGS
             .iter()
-            .filter(|dialog| {
-                dialog.target.workflow == workflow
-            })
+            .filter(|dialog| dialog.target.workflow == workflow)
     };
     let fields = matching().next()?;
     let artifact_field = matching().find(|dialog| dialog.target.input == selection.key.input);
@@ -227,7 +225,6 @@ mod tests {
                     allowed
                 );
             }
-
         }
     }
 

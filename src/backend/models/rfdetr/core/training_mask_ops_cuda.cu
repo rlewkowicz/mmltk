@@ -13,9 +13,7 @@ __device__ float grid_sample_source(float coord, int64_t size) {
  const float grid = __fsub_rn(__fmul_rn(2.0f, coord), 1.0f);
  return __fdiv_rn(__fsub_rn(__fmul_rn(__fadd_rn(grid, 1.0f), static_cast<float>(size)), 1.0f), 2.0f);
 }
-__device__ int64_t nearest_grid_sample_index(float coord, int64_t size) {
- return static_cast<int64_t>(nearbyintf(clamp_coord(grid_sample_source(coord, size), static_cast<float>(size - 1))));
-}
+__device__ int64_t nearest_grid_sample_index(float coord, int64_t size) { return static_cast<int64_t>(nearbyintf(clamp_coord(grid_sample_source(coord, size), static_cast<float>(size - 1)))); }
 __global__ void matcher_point_sample_kernel(
  const float* input, const float* coords, float* output, int64_t batch_size, int64_t coord_batches, int64_t channels, int64_t height, int64_t width, int64_t point_count, bool nearest) {
  const int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;

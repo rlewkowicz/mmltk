@@ -25,7 +25,8 @@ public:
  ~ExportOnnxSession();
  ExportOnnxSession(const ExportOnnxSession&) = delete;
  ExportOnnxSession& operator=(const ExportOnnxSession&) = delete;
- void Run(const ExportOnnxRequest& request, mmltk::backend::ml::runtime::BorrowedCommandStream command_stream, std::stop_token stop = {}, const std::function<void(const std::filesystem::path&)>& published = {});
+ void Run(const ExportOnnxRequest& request, mmltk::backend::ml::runtime::BorrowedCommandStream command_stream, std::stop_token stop = {},
+  const std::function<void(const std::filesystem::path&)>& published = {});
  [[nodiscard]] ModelExportStatus Close() noexcept;
 
 private:

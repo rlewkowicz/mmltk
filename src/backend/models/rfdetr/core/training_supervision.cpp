@@ -589,8 +589,7 @@ MatchFreeCost TrainingSupervisionImpl::broadcast_cost(const torch::Tensor& padde
  const auto correction = (positive - negative).gather(-1, label_index).permute({0, 1, 3, 2});
  auto classification = negative_sum + correction;
  auto box = (boxes.unsqueeze(-3) - padded_boxes.unsqueeze(1).unsqueeze(-2)).abs().sum(-1);
- auto giou = 1.0F - batched_pairwise_generalized_box_iou(box_cxcywh_to_xyxy(padded_boxes.unsqueeze(1).expand({batch, layout.groups, padded_boxes.size(1), 4})),
-                     box_cxcywh_to_xyxy(boxes));
+ auto giou = 1.0F - batched_pairwise_generalized_box_iou(box_cxcywh_to_xyxy(padded_boxes.unsqueeze(1).expand({batch, layout.groups, padded_boxes.size(1), 4})), box_cxcywh_to_xyxy(boxes));
  const auto valid = valid_rows.unsqueeze(1).unsqueeze(-1);
  classification = torch::where(valid, classification, torch::zeros_like(classification));
  box = torch::where(valid, box, torch::zeros_like(box));
@@ -626,7 +625,8 @@ TrainingLoss TrainingSupervisionImpl::empty_loss(const ModelOutputs& outputs) co
  for (const auto& parameter : parameters()) { zero = zero + scalar_edge(parameter); }
  return {zero, zero, zero, zero, zero, zero, config_.aux_loss ? zero : torch::Tensor{}, {zero, zero, zero}};
 }
-TrainingLoss TrainingSupervisionImpl::denoising_loss(const DenoisingOutputs& outputs, const PreparedTargets& target_inventory, const DeviceLossNormalizer& normalizer, std::span<const LayerMaskSamples> mask_samples) const {
+TrainingLoss TrainingSupervisionImpl::denoising_loss(
+ const DenoisingOutputs& outputs, const PreparedTargets& target_inventory, const DeviceLossNormalizer& normalizer, std::span<const LayerMaskSamples> mask_samples) const {
  if (!denoising_enabled() || !initialized_) { throw std::runtime_error("DN loss requires active initialized supervision"); }
  if (!normalizer.target_count.defined() || normalizer.target_count.dim() != 0 || normalizer.target_count.scalar_type() != torch::kFloat32 ||
      normalizer.target_count.device() != outputs.main.pred_logits.device()) {
@@ -670,10 +670,8 @@ TrainingLoss TrainingSupervisionImpl::denoising_loss(const DenoisingOutputs& out
   if (reconstruct_masks) {
    const auto& masks = require_target_masks(target_inventory, "DN mask reconstruction");
    validate_packed_mask_extent(masks, "DN mask reconstruction");
-   if (target_inventory.counts.size() != static_cast<size_t>(target_shape[0]) ||
-       outputs.target_indices.sizes().vec() != target_shape || outputs.target_indices.scalar_type() != torch::kInt64 ||
-       outputs.target_indices.device() != outputs.main.pred_logits.device() ||
-       outputs.valid_slots.scalar_type() != torch::kBool || outputs.valid_slots.device() != outputs.main.pred_logits.device() ||
+   if (target_inventory.counts.size() != static_cast<size_t>(target_shape[0]) || outputs.target_indices.sizes().vec() != target_shape || outputs.target_indices.scalar_type() != torch::kInt64 ||
+       outputs.target_indices.device() != outputs.main.pred_logits.device() || outputs.valid_slots.scalar_type() != torch::kBool || outputs.valid_slots.device() != outputs.main.pred_logits.device() ||
        masks.bits.size(0) < target_inventory.all_labels.size(0))
     throw std::invalid_argument("DN masks do not match their owned target inventory");
    const auto integer_options = outputs.target_indices.options();
@@ -696,7 +694,6 @@ TrainingLoss TrainingSupervisionImpl::denoising_loss(const DenoisingOutputs& out
    mask_valid = torch::cat(validity);
    mask_indices = torch::where(mask_valid, mask_indices, torch::zeros_like(mask_indices));
   }
-
   for (size_t layer_index = 0; layer_index < layers.size(); ++layer_index) {
    const auto* layer = layers[layer_index];
    if (layer->pred_logits.sizes().vec() != std::vector<int64_t>{target_shape[0], target_shape[1], target_shape[2], config_.num_classes} ||
@@ -729,9 +726,8 @@ TrainingLoss TrainingSupervisionImpl::denoising_loss(const DenoisingOutputs& out
      // Disabled reconstruction needs only autograd edges, not target admission
      // or a full field reduction. Enabled empty reconstruction retains the
      // stock sparse sum/nonfinite semantics.
-     const auto mask_zero = !reconstruct_masks
-      ? scalar_edge(sparse.spatial_features) + scalar_edge(sparse.query_features) + scalar_edge(sparse.bias)
-      : (sparse.spatial_features.sum() + sparse.query_features.sum() + sparse.bias.sum()) * 0.0;
+     const auto mask_zero = !reconstruct_masks ? scalar_edge(sparse.spatial_features) + scalar_edge(sparse.query_features) + scalar_edge(sparse.bias)
+                                               : (sparse.spatial_features.sum() + sparse.query_features.sum() + sparse.bias.sum()) * 0.0;
      result.mask_ce = result.mask_ce + mask_zero;
      result.mask_dice = result.mask_dice + mask_zero;
     } else {
@@ -753,10 +749,8 @@ TrainingLoss TrainingSupervisionImpl::denoising_loss(const DenoisingOutputs& out
      const DirectMaskRandomSeeds seeds{tagged_seed(layer_seed, 0x43414e4449444154ULL), tagged_seed(layer_seed, 0x52414e444f4dULL)};
      const auto sampled = sample_direct_masks(masks, target_inventory, mask_indices, config_.mask_point_sample_ratio, samples, seeds);
      const auto mask_zero = config_.mask_ce_loss_coef == 0.0 || config_.mask_dice_loss_coef == 0.0 ? sampled.logits.sum() * 0.0 : torch::Tensor{};
-     result.mask_ce = result.mask_ce + (config_.mask_ce_loss_coef == 0.0 ? mask_zero :
-      config_.mask_ce_loss_coef * sigmoid_ce_loss(sampled.logits, sampled.targets, divisor, false, mask_valid));
-     result.mask_dice = result.mask_dice + (config_.mask_dice_loss_coef == 0.0 ? mask_zero :
-      config_.mask_dice_loss_coef * dice_loss(sampled.logits, sampled.targets, divisor, false, mask_valid));
+     result.mask_ce = result.mask_ce + (config_.mask_ce_loss_coef == 0.0 ? mask_zero : config_.mask_ce_loss_coef * sigmoid_ce_loss(sampled.logits, sampled.targets, divisor, false, mask_valid));
+     result.mask_dice = result.mask_dice + (config_.mask_dice_loss_coef == 0.0 ? mask_zero : config_.mask_dice_loss_coef * dice_loss(sampled.logits, sampled.targets, divisor, false, mask_valid));
     }
    }
   }
@@ -771,7 +765,8 @@ TrainingLoss TrainingSupervisionImpl::denoising_loss(const DenoisingOutputs& out
  timing_->measure(TimingState::Stage::DenoisingObjective, objective);
  return result;
 }
-TrainingLoss TrainingSupervisionImpl::loss(const ModelOutputs& outputs, const PreparedTargets& targets, const DeviceLossNormalizer& normalizer, const bool training_mode, std::span<const LayerMaskSamples> mask_samples) {
+TrainingLoss TrainingSupervisionImpl::loss(
+ const ModelOutputs& outputs, const PreparedTargets& targets, const DeviceLossNormalizer& normalizer, const bool training_mode, std::span<const LayerMaskSamples> mask_samples) {
  if (!initialized_) { throw std::runtime_error("RF-DETR supervision loss requires one-shot initialization"); }
  if (!match_free_enabled()) {
   if (outputs.denoising) { return denoising_loss(*outputs.denoising, targets, normalizer, mask_samples); }
@@ -789,7 +784,6 @@ TrainingLoss TrainingSupervisionImpl::loss(const ModelOutputs& outputs, const Pr
  mmltk::backend::ml::cuda::TorchAutocastScope fp32_scope(false, torch::kFloat32);
  const int64_t batch = outputs.main.pred_logits.size(0);
  const auto padded = pad_targets(targets, outputs.main.pred_logits.device(), batch, false);
-
  const int64_t groups = training_mode ? config_.group_detr : 1;
  auto divisor = normalizer.target_count.to(torch::kFloat32).reshape({}).clamp_min(1.0F);
  if (!config_.sum_group_losses) { divisor = divisor * groups; }
@@ -799,15 +793,19 @@ TrainingLoss TrainingSupervisionImpl::loss(const ModelOutputs& outputs, const Pr
  };
  const bool use_masks = config_.segmentation && (config_.mask_ce_loss_coef != 0.0 || config_.mask_dice_loss_coef != 0.0);
  torch::Tensor encoding, box_probes;
- if (padded.maximum_count != 0) timed(TimingState::Stage::GroundTruthProjection, [&] {
-  encoding = encode_ground_truth(padded.labels, padded.boxes);
-  if (!use_masks) box_probes = project_ground_truth(encoding);
- });
+ if (padded.maximum_count != 0)
+  timed(TimingState::Stage::GroundTruthProjection, [&] {
+   encoding = encode_ground_truth(padded.labels, padded.boxes);
+   if (!use_masks) box_probes = project_ground_truth(encoding);
+  });
  auto zero = scalar_edge(outputs.main.pred_logits);
  TrainingLoss result = empty_loss(outputs);
  result.mask_ce = zero;
  result.mask_dice = zero;
- if (config_.segmentation) { result.main.mask_ce = zero; result.main.mask_dice = zero; }
+ if (config_.segmentation) {
+  result.main.mask_ce = zero;
+  result.main.mask_dice = zero;
+ }
  std::vector<const OutputLayer*> layers{&outputs.main};
  if (config_.aux_loss) {
   for (const auto& layer : outputs.aux_outputs) { layers.push_back(&layer); }
@@ -826,12 +824,13 @@ TrainingLoss TrainingSupervisionImpl::loss(const ModelOutputs& outputs, const Pr
    background = background + config_.set_cost_class * ((1.0 - config_.focal_alpha) * logits.sigmoid().square() * F::softplus(logits)).sum() / divisor;
   }
   result.classification = result.classification + background;
-  if (layer == &outputs.main) result.main.classification = background;
-  else result.auxiliary = result.auxiliary.defined() ? result.auxiliary + background : background;
+  if (layer == &outputs.main)
+   result.main.classification = background;
+  else
+   result.auxiliary = result.auxiliary.defined() ? result.auxiliary + background : background;
   if (padded.maximum_count == 0) continue;
   std::optional<PairwiseMaskSamples> masks;
-  if (use_masks)
-   masks = sample_pairwise_masks(*layer, targets, padded.indices, padded.valid, config_.mask_point_sample_ratio);
+  if (use_masks) masks = sample_pairwise_masks(*layer, targets, padded.indices, padded.valid, config_.mask_point_sample_ratio);
   const auto probes = masks ? timed(TimingState::Stage::GroundTruthProjection, [&] { return project_ground_truth(encoding, &*masks); }) : box_probes;
   const auto dense = timed(TimingState::Stage::Affinity, [&] { return dense_correspondence(probes, *layer->query_features); });
   const auto sparse = timed(TimingState::Stage::Sparse, [&] { return sparse_match_free_correspondence(dense, padded.valid, config_.training_supervision.match_free.rho); });
@@ -844,8 +843,7 @@ TrainingLoss TrainingSupervisionImpl::loss(const ModelOutputs& outputs, const Pr
    auto total_cost = costs.total;
    // A single scalar edge preserves inactive mask-result autograd and NaN
    // propagation through every correspondence row, without zero pair costs.
-   const auto inactive = (!masks || config_.mask_ce_loss_coef == 0.0 || config_.mask_dice_loss_coef == 0.0)
-    ? (alpha * (dense.sum() * 0.0F) + beta * (sparse.sum() * 0.0F)) / divisor : zero;
+   const auto inactive = (!masks || config_.mask_ce_loss_coef == 0.0 || config_.mask_dice_loss_coef == 0.0) ? (alpha * (dense.sum() * 0.0F) + beta * (sparse.sum() * 0.0F)) / divisor : zero;
    ce_term = inactive;
    dice_term = inactive;
    if (masks) {
@@ -872,7 +870,8 @@ TrainingLoss TrainingSupervisionImpl::loss(const ModelOutputs& outputs, const Pr
   });
   result.mask_ce = result.mask_ce + ce_term;
   result.mask_dice = result.mask_dice + dice_term;
-  if (layer == &outputs.main) result.main = {terms.classification + background, terms.box, terms.giou, config_.segmentation ? ce_term : torch::Tensor{}, config_.segmentation ? dice_term : torch::Tensor{}};
+  if (layer == &outputs.main)
+   result.main = {terms.classification + background, terms.box, terms.giou, config_.segmentation ? ce_term : torch::Tensor{}, config_.segmentation ? dice_term : torch::Tensor{}};
   if (layer != &outputs.main) {
    auto auxiliary = terms.classification + terms.box + terms.giou + ce_term + dice_term;
    result.auxiliary = result.auxiliary.defined() ? result.auxiliary + auxiliary : auxiliary;

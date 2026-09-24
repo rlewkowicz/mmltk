@@ -1,6 +1,6 @@
-use crate::view::shared::status_text;
 use crate::fluent_theme::Element;
 use crate::presentation_surface::Surface;
+use crate::view::shared::status_text;
 use crate::view_model::ApplicationModel;
 use iced::widget::{button, column};
 
@@ -35,7 +35,9 @@ impl Component {
         let settings_edit_available = settings.draft.is_some() && model.settings_edit_available();
         let completed_frames: Element<'a, Message> = model.live_snapshot.as_ref().map_or_else(
             || column![].into(),
-            |snapshot| status_text(format!("Completed frames · {}", snapshot.completedframes)).into(),
+            |snapshot| {
+                status_text(format!("Completed frames · {}", snapshot.completedframes)).into()
+            },
         );
         let state_label = model.live_snapshot.as_ref().map_or_else(
             || "Waiting for native Live state".to_owned(),

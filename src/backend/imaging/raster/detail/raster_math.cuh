@@ -1,5 +1,6 @@
 #pragma once
 #include <cuda_runtime.h>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 namespace mmltk::backend::imaging::raster::math {

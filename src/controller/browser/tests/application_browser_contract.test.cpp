@@ -1162,7 +1162,6 @@ TEST_CASE("custom model dialogs derive from the canonical compatibility catalog"
   CHECK(found->filter.pattern.view().contains("*.onnx") == (compatibility.workflow == contracts::FeatureId::Validate || compatibility.workflow == contracts::FeatureId::Predict));
   CHECK(found->filter.pattern.view().contains("*.engine") == (compatibility.workflow == contracts::FeatureId::Validate || compatibility.workflow == contracts::FeatureId::Predict));
   if (compatibility.workflow == contracts::FeatureId::Export) CHECK(found->filter.pattern.view() == "*.pt");
-
  });
  CHECK(row_index == 8U);
 }
@@ -1437,7 +1436,6 @@ TEST_CASE("Predict scalar progress excludes full retained labels and keeps nativ
  CHECK(invalidated.snapshot_revision == 8U);
  CHECK(invalidated.frame != observed.frame);
 }
-
 namespace mmltk::controller::browser {
 TEST_CASE("workflow output destinations have one mutable directory authority", "[controller][browser][reflection][output]") {
  const auto entries = services::file_dialog_catalog().entries();

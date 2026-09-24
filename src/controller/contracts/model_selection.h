@@ -49,8 +49,8 @@ MMLTK_REFLECT_FIELDS(ModelArtifactDialog)
  }
  return {};
 }
-[[nodiscard]] constexpr ModelSelectionCompatibility custom_model_compatibility(const std::string_view key, const FeatureId workflow, const ModelArtifactInputKind input, const bool canonical_allowed,
- const std::string_view artifact_field_path) noexcept {
+[[nodiscard]] constexpr ModelSelectionCompatibility custom_model_compatibility(
+ const std::string_view key, const FeatureId workflow, const ModelArtifactInputKind input, const bool canonical_allowed, const std::string_view artifact_field_path) noexcept {
  const auto dialog = model_artifact_dialog(input);
  return {
   key,
@@ -128,7 +128,6 @@ struct ModelSelectionRelationRow {
   });
   return complete && count == key_relation::member_count + 1U;
  }
-
 };
 using mmltk::frameworks::reflection::reflected_member_path;
 struct TrainWeightsModelSelection final
@@ -197,13 +196,12 @@ struct PredictTensorRtModelSelection final
        ModelArtifactInputKind::TensorRt> {
  inline static constexpr ModelSelectionCompatibility compatibility = custom_model_compatibility("predict.tensorrt", workflow, input_kind, false, artifact_field_path.view());
 };
-struct ExportWeightsModelSelection final
-    : ModelSelectionRelationRow<FeatureId::Export, member_path<&GuiSettingsState::workflows, &WorkflowSettingsState::export_state, &ExportViewState::model_source>,
-       member_path<&GuiSettingsState::workflows, &WorkflowSettingsState::export_state, &ExportViewState::model_input>,
-       member_path<&GuiSettingsState::workflows, &WorkflowSettingsState::export_state, &ExportViewState::preset_name>,
-       member_path<&GuiSettingsState::workflows, &WorkflowSettingsState::export_state, &ExportViewState::model_resolution>,
-       member_path<&GuiSettingsState::workflows, &WorkflowSettingsState::export_state, &ExportViewState::weights_path>,
-       member_path<&GuiSettingsState::workflows, &WorkflowSettingsState::export_state, &ExportViewState::class_layout_path>> {
+struct ExportWeightsModelSelection final : ModelSelectionRelationRow<FeatureId::Export, member_path<&GuiSettingsState::workflows, &WorkflowSettingsState::export_state, &ExportViewState::model_source>,
+                                            member_path<&GuiSettingsState::workflows, &WorkflowSettingsState::export_state, &ExportViewState::model_input>,
+                                            member_path<&GuiSettingsState::workflows, &WorkflowSettingsState::export_state, &ExportViewState::preset_name>,
+                                            member_path<&GuiSettingsState::workflows, &WorkflowSettingsState::export_state, &ExportViewState::model_resolution>,
+                                            member_path<&GuiSettingsState::workflows, &WorkflowSettingsState::export_state, &ExportViewState::weights_path>,
+                                            member_path<&GuiSettingsState::workflows, &WorkflowSettingsState::export_state, &ExportViewState::class_layout_path>> {
  inline static constexpr ModelArtifactInputKind input_kind = ModelArtifactInputKind::Weights;
  inline static constexpr ModelSelectionCompatibility compatibility = [] {
   auto result = custom_model_compatibility("export.weights", workflow, input_kind, true, artifact_field_path.view());
@@ -243,9 +241,8 @@ inline constexpr std::array<ModelSelectionCompatibility, 8U> kModelSelectionComp
  if (kModelSelectionCompatibility.size() != 8U) return false;
  for (std::size_t index = 0U; index < kModelSelectionCompatibility.size(); ++index) {
   const auto& row = kModelSelectionCompatibility[index];
-  if (row.key.empty() || (!row.canonical_allowed && !row.custom_allowed) || (row.canonical_allowed && row.input != ModelArtifactInputKind::Weights) ||
-      row.input == ModelArtifactInputKind::None || row.artifact_field_path.empty() ||
-      row.dialog_title.empty() || row.dialog_filter.empty() || row.dialog_pattern.empty()) {
+  if (row.key.empty() || (!row.canonical_allowed && !row.custom_allowed) || (row.canonical_allowed && row.input != ModelArtifactInputKind::Weights) || row.input == ModelArtifactInputKind::None ||
+      row.artifact_field_path.empty() || row.dialog_title.empty() || row.dialog_filter.empty() || row.dialog_pattern.empty()) {
    return false;
   }
   for (std::size_t sibling = index + 1U; sibling < kModelSelectionCompatibility.size(); ++sibling) {

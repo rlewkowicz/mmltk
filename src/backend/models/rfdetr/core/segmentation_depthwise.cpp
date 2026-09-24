@@ -28,8 +28,8 @@ public:
   const bool bias_grad = ctx->saved_data["has_bias"].toBool() && ctx->needs_input_grad(2);
   torch::Tensor dx, dw, db;
   if (input_grad || weight_grad) {
-   const auto derivatives = at::convolution_backward(incoming, input.to(weight.scalar_type()), weight, std::nullopt,
-    {1, 1}, {1, 1}, {1, 1}, false, {0, 0}, input.size(1), {input_grad, weight_grad, false});
+   const auto derivatives =
+    at::convolution_backward(incoming, input.to(weight.scalar_type()), weight, std::nullopt, {1, 1}, {1, 1}, {1, 1}, false, {0, 0}, input.size(1), {input_grad, weight_grad, false});
    dx = std::get<0>(derivatives);
    dw = std::get<1>(derivatives);
   }
@@ -37,8 +37,6 @@ public:
   return {dx, dw, db};
  }
 };
-}
-torch::Tensor segmentation_depthwise(const torch::Tensor& input, const torch::Tensor& weight, const torch::Tensor& bias) {
- return SegmentationDepthwise::apply(input, weight, bias);
-}
-}
+}  // namespace
+torch::Tensor segmentation_depthwise(const torch::Tensor& input, const torch::Tensor& weight, const torch::Tensor& bias) { return SegmentationDepthwise::apply(input, weight, bias); }
+}  // namespace mmltk::backend::models::rfdetr

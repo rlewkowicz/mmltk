@@ -559,8 +559,8 @@ void build_tensorrt_engine(const BuildEngineRequest& request) {
  const auto stream = mmltk::backend::ml::cuda::current_torch_cuda_stream(request.device_id);
  build_tensorrt_engine(request, {.native_handle = stream, .valid = true});
 }
-void build_tensorrt_engine(
- const BuildEngineRequest& request, const runtime::BorrowedCommandStream command_stream, std::shared_ptr<const ClassArtifactAdmission> admission, const std::stop_token stop, const std::function<void(const std::filesystem::path&)>& published) {
+void build_tensorrt_engine(const BuildEngineRequest& request, const runtime::BorrowedCommandStream command_stream, std::shared_ptr<const ClassArtifactAdmission> admission, const std::stop_token stop,
+ const std::function<void(const std::filesystem::path&)>& published) {
  if (stop.stop_requested()) return;
  validate_build_engine_request(request);
  try {

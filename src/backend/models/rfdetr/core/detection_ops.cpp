@@ -362,8 +362,8 @@ void solve_matcher_indices_for_batch_cpu(const torch::Tensor& batch_cost_cpu, in
  std::ranges::copy(scratch.batch_rows, result.first.data_ptr<int64_t>());
  std::ranges::copy(scratch.batch_cols, result.second.data_ptr<int64_t>());
 }
-std::vector<MatchIndices> compute_matcher_indices_for_layers(
- const std::vector<const OutputLayer*>& layers, const PreparedTargets& targets, const DetectionConfig& config, int64_t group_detr, MatcherWorkspace& workspace, std::span<const LayerMaskSamples> samples = {}) {
+std::vector<MatchIndices> compute_matcher_indices_for_layers(const std::vector<const OutputLayer*>& layers, const PreparedTargets& targets, const DetectionConfig& config, int64_t group_detr,
+ MatcherWorkspace& workspace, std::span<const LayerMaskSamples> samples = {}) {
  mmltk::common::logging::ScopedProfile profile_rfdetr_matcher_total{"rfdetr.matcher.total"};
  torch::NoGradGuard no_grad;
  if (layers.empty()) { return {}; }
@@ -385,8 +385,7 @@ std::vector<MatchIndices> compute_matcher_indices_for_layers(
   const auto offset = targets.offsets[image];
   if (count < 0 || count > std::numeric_limits<int64_t>::max() - total_targets || offset < 0 || offset > available_targets || count > available_targets - offset)
    throw std::invalid_argument("matcher target range is invalid");
-  if (masks && (offset > masks->bits.size(0) || count > masks->bits.size(0) - offset))
-   throw std::invalid_argument("matcher target range exceeds the packed mask inventory");
+  if (masks && (offset > masks->bits.size(0) || count > masks->bits.size(0) - offset)) throw std::invalid_argument("matcher target range exceeds the packed mask inventory");
   total_targets += count;
  }
  int64_t max_queries = 0;
@@ -421,7 +420,8 @@ std::vector<MatchIndices> compute_matcher_indices_for_layers(
  }
  std::vector<torch::Tensor> dense_cpu_costs;
  std::vector<torch::Tensor> retained_coords(layers.size());
- if (!samples.empty()) for (size_t i = 0; i < layers.size(); ++i) retained_coords[i] = samples[i].matcher;
+ if (!samples.empty())
+  for (size_t i = 0; i < layers.size(); ++i) retained_coords[i] = samples[i].matcher;
  std::vector<int64_t> logical_offsets(targets.counts.size());
  std::exclusive_scan(targets.counts.begin(), targets.counts.end(), logical_offsets.begin(), int64_t{0});
  if (device.is_cuda()) {
@@ -435,8 +435,8 @@ std::vector<MatchIndices> compute_matcher_indices_for_layers(
                                ? targets.target_indices
                                : torch::arange(targets.all_labels.numel(), torch::TensorOptions().dtype(torch::kInt64).device(device));
   for (size_t layer_index = 0; layer_index < layers.size(); ++layer_index) {
-   build_cuda_matcher_cost_into(
-    *layers[layer_index], targets, config, target_indices, scratch.device_layer(static_cast<int64_t>(layer_index)), target_offsets, target_counts, output_offsets, max_queries, max_targets_per_image, retained_coords[layer_index]);
+   build_cuda_matcher_cost_into(*layers[layer_index], targets, config, target_indices, scratch.device_layer(static_cast<int64_t>(layer_index)), target_offsets, target_counts, output_offsets,
+    max_queries, max_targets_per_image, retained_coords[layer_index]);
   }
   {
    mmltk::common::logging::ScopedProfile profile_rfdetr_matcher_cost_to_cpu{"rfdetr.matcher.cost_to_cpu"};
@@ -479,10 +479,12 @@ std::vector<MatchIndices> compute_matcher_indices_for_layers(
    for (int64_t image = 0; image < bs; ++image) {
     auto matrix = workspace.cpu_matrix(static_cast<int64_t>(layer_index), image);
     auto* data = matrix.data_ptr<float>();
-    for (int64_t index = 0; index < matrix.numel(); ++index) if (!std::isfinite(data[index])) data[index] = sentinel;
+    for (int64_t index = 0; index < matrix.numel(); ++index)
+     if (!std::isfinite(data[index])) data[index] = sentinel;
    }
   } else {
-   for (int64_t index = 0; index < full.numel(); ++index) if (!std::isfinite(values[index])) values[index] = sentinel;
+   for (int64_t index = 0; index < full.numel(); ++index)
+    if (!std::isfinite(values[index])) values[index] = sentinel;
   }
  }
  const auto cpu_indices = workspace.cpu_indices(assignment_extent);
@@ -609,14 +611,16 @@ TensorMap loss_boxes(const OutputLayer& layer, const PreparedTargets& targets, c
  losses["loss_giou"] = loss_giou.sum() / num_boxes;
  return losses;
 }
-TensorMap loss_masks(const OutputLayer& layer, const PreparedTargets& targets, const MatcherLayerIndices& indices, const DetectionConfig& config, const torch::Tensor& num_boxes, const LayerMaskSamples& samples) {
+TensorMap loss_masks(
+ const OutputLayer& layer, const PreparedTargets& targets, const MatcherLayerIndices& indices, const DetectionConfig& config, const torch::Tensor& num_boxes, const LayerMaskSamples& samples) {
  mmltk::common::logging::ScopedProfile profile_rfdetr_criterion_loss_masks{"rfdetr.criterion.loss_masks"};
  TensorMap losses;
  const auto idx = indices.source;
  if (idx.first.numel() == 0) {
   const auto zero = layer.pred_masks.has_value() ? layer.pred_masks->index({idx.first, idx.second}).sum()
-   : layer.sparse_pred_masks.has_value() ? (layer.sparse_pred_masks->spatial_features.sum() + layer.sparse_pred_masks->query_features.sum() + layer.sparse_pred_masks->bias.sum()) * 0.0
-   : throw std::runtime_error("native RF-DETR empty mask loss requires mask outputs");
+                    : layer.sparse_pred_masks.has_value()
+                      ? (layer.sparse_pred_masks->spatial_features.sum() + layer.sparse_pred_masks->query_features.sum() + layer.sparse_pred_masks->bias.sum()) * 0.0
+                      : throw std::runtime_error("native RF-DETR empty mask loss requires mask outputs");
   losses["loss_mask_ce"] = zero;
   losses["loss_mask_dice"] = zero;
   return losses;
@@ -649,8 +653,8 @@ std::vector<std::pair<torch::Tensor, torch::Tensor>> matcher_indices(const Model
  mmltk::common::logging::ScopedProfile profile_rfdetr_matcher_public{"rfdetr.matcher.public"};
  return compute_matcher_indices(outputs.main, targets, config, training_mode ? config.group_detr : 1);
 }
-std::vector<std::pair<torch::Tensor, torch::Tensor>> matcher_indices(const ModelOutputs& outputs, const PreparedTargets& targets, const DetectionConfig& config,
- bool training_mode, const LayerMaskSamples& samples) {
+std::vector<std::pair<torch::Tensor, torch::Tensor>> matcher_indices(
+ const ModelOutputs& outputs, const PreparedTargets& targets, const DetectionConfig& config, bool training_mode, const LayerMaskSamples& samples) {
  MatcherAccess access(outputs.main.pred_logits.device());
  return compute_matcher_indices_for_layers({&outputs.main}, targets, config, training_mode ? config.group_detr : 1, access.get(), {&samples, 1}).front();
 }
@@ -673,8 +677,8 @@ TensorMap detection_loss_dict(const ModelOutputs& outputs, const PreparedTargets
 TensorMap detection_loss_dict(const ModelOutputs& outputs, const PreparedTargets& targets, const DetectionConfig& config, bool training_mode, const torch::Tensor& num_boxes_value) {
  return detection_loss_dict(outputs, targets, config, training_mode, num_boxes_value, {});
 }
-TensorMap detection_loss_dict(const ModelOutputs& outputs, const PreparedTargets& targets, const DetectionConfig& config, bool training_mode,
- const torch::Tensor& num_boxes_value, std::span<const LayerMaskSamples> samples) {
+TensorMap detection_loss_dict(
+ const ModelOutputs& outputs, const PreparedTargets& targets, const DetectionConfig& config, bool training_mode, const torch::Tensor& num_boxes_value, std::span<const LayerMaskSamples> samples) {
  mmltk::common::logging::ScopedProfile profile_rfdetr_criterion_total_resolved_num_boxes{"rfdetr.criterion.total_resolved_num_boxes"};
  const int64_t group_detr = training_mode ? config.group_detr : 1;
  std::vector<const OutputLayer*> matcher_layers;
@@ -703,7 +707,9 @@ TensorMap detection_loss_dict(const ModelOutputs& outputs, const PreparedTargets
    update_losses(losses, loss_labels(outputs.aux_outputs[aux_index], targets, aux_indices, config, num_boxes_value, false), "_" + std::to_string(aux_index));
    update_losses(losses, loss_cardinality(outputs.aux_outputs[aux_index], targets), "_" + std::to_string(aux_index));
    update_losses(losses, loss_boxes(outputs.aux_outputs[aux_index], targets, aux_indices, num_boxes_value), "_" + std::to_string(aux_index));
-   if (config.include_masks) { update_losses(losses, loss_masks(outputs.aux_outputs[aux_index], targets, aux_indices, config, num_boxes_value, layer_samples(aux_index + 1)), "_" + std::to_string(aux_index)); }
+   if (config.include_masks) {
+    update_losses(losses, loss_masks(outputs.aux_outputs[aux_index], targets, aux_indices, config, num_boxes_value, layer_samples(aux_index + 1)), "_" + std::to_string(aux_index));
+   }
   }
  }
  if (outputs.enc_outputs.has_value()) {

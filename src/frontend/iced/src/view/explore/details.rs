@@ -1,7 +1,7 @@
-use crate::view::shared::status_text;
 use super::dataset::{class_checklist, class_selection, toggle_selection};
 use super::filter_edit;
 use crate::fluent_theme::Element;
+use crate::view::shared::status_text;
 use crate::view_model::{ApplicationModel, ExploreModel};
 use iced::Center;
 use iced::widget::{column, container, row, rule, space, text};

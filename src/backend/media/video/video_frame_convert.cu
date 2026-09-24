@@ -62,28 +62,30 @@ int convert_video_chw(VideoColorConversion input, std::uint32_t width, std::uint
 namespace mmltk::backend::media::video {
 namespace {
 __device__ float output_component(const std::uint8_t* rgba, std::size_t pitch, unsigned width, unsigned height, unsigned x, unsigned y, unsigned channel) {
- return rgba[static_cast<std::size_t>(min(y,height-1U))*pitch+min(x,width-1U)*4U+channel];
+ return rgba[static_cast<std::size_t>(min(y, height - 1U)) * pitch + static_cast<std::size_t>(min(x, width - 1U)) * 4U + channel];
 }
-__device__ std::uint8_t output_byte(float value) { return static_cast<std::uint8_t>(fminf(255.0F,fmaxf(0.0F,roundf(value)))); }
-__global__ void encode_nv12(const std::uint8_t* rgba, std::size_t pitch, unsigned width, unsigned height,
- std::uint8_t* luma, std::size_t y_pitch, std::uint8_t* chroma, std::size_t uv_pitch) {
- const unsigned x = (blockIdx.x*blockDim.x+threadIdx.x)*2U, y = (blockIdx.y*blockDim.y+threadIdx.y)*2U;
+__device__ std::uint8_t output_byte(float value) { return static_cast<std::uint8_t>(fminf(255.0F, fmaxf(0.0F, roundf(value)))); }
+__global__ void encode_nv12(const std::uint8_t* rgba, std::size_t pitch, unsigned width, unsigned height, std::uint8_t* luma, std::size_t y_pitch, std::uint8_t* chroma, std::size_t uv_pitch) {
+ const unsigned x = (blockIdx.x * blockDim.x + threadIdx.x) * 2U, y = (blockIdx.y * blockDim.y + threadIdx.y) * 2U;
  if (x >= width || y >= height) return;
  float red = 0, green = 0, blue = 0;
- for (unsigned dy=0; dy<2U; ++dy) for (unsigned dx=0; dx<2U; ++dx) {
-  const float r=output_component(rgba,pitch,width,height,x+dx,y+dy,0);
-  const float g=output_component(rgba,pitch,width,height,x+dx,y+dy,1);
-  const float b=output_component(rgba,pitch,width,height,x+dx,y+dy,2);
-  luma[(y+dy)*y_pitch+x+dx]=output_byte(16.0F+0.182586F*r+0.614231F*g+0.062007F*b);
-  red+=r; green+=g; blue+=b;
- }
- chroma[(y/2U)*uv_pitch+x]=output_byte(128.0F+(-0.100644F*red-0.338572F*green+0.439216F*blue)*0.25F);
- chroma[(y/2U)*uv_pitch+x+1U]=output_byte(128.0F+(0.439216F*red-0.398942F*green-0.040274F*blue)*0.25F);
+ for (unsigned dy = 0; dy < 2U; ++dy)
+  for (unsigned dx = 0; dx < 2U; ++dx) {
+   const float r = output_component(rgba, pitch, width, height, x + dx, y + dy, 0);
+   const float g = output_component(rgba, pitch, width, height, x + dx, y + dy, 1);
+   const float b = output_component(rgba, pitch, width, height, x + dx, y + dy, 2);
+   luma[(y + dy) * y_pitch + x + dx] = output_byte(16.0F + 0.182586F * r + 0.614231F * g + 0.062007F * b);
+   red += r;
+   green += g;
+   blue += b;
+  }
+ chroma[(y / 2U) * uv_pitch + x] = output_byte(128.0F + (-0.100644F * red - 0.338572F * green + 0.439216F * blue) * 0.25F);
+ chroma[(y / 2U) * uv_pitch + x + 1U] = output_byte(128.0F + (0.439216F * red - 0.398942F * green - 0.040274F * blue) * 0.25F);
 }
-}
-int convert_video_nv12(const std::uint8_t* rgba, std::size_t pitch, unsigned width, unsigned height,
- std::uint8_t* y, std::size_t y_pitch, std::uint8_t* uv, std::size_t uv_pitch, cudaStream_t stream) noexcept {
- encode_nv12<<<dim3((width+31U)/32U,(height+31U)/32U),dim3(16,16),0,stream>>>(rgba,pitch,width,height,y,y_pitch,uv,uv_pitch);
+}  // namespace
+int convert_video_nv12(
+ const std::uint8_t* rgba, std::size_t pitch, unsigned width, unsigned height, std::uint8_t* y, std::size_t y_pitch, std::uint8_t* uv, std::size_t uv_pitch, cudaStream_t stream) noexcept {
+ encode_nv12<<<dim3((width + 31U) / 32U, (height + 31U) / 32U), dim3(16, 16), 0, stream>>>(rgba, pitch, width, height, y, y_pitch, uv, uv_pitch);
  return cudaGetLastError();
 }
-}
+}  // namespace mmltk::backend::media::video

@@ -30,15 +30,15 @@ struct DirectMaskRandomSeeds {
  std::uint64_t candidates;
  std::uint64_t remainder;
 };
-DirectMaskSamples sample_direct_masks(const torch::Tensor& masks, const PreparedTargets& targets,
- const torch::Tensor& indices, int64_t ratio, const LayerMaskSamples& samples, std::optional<DirectMaskRandomSeeds> seeds = std::nullopt);
+DirectMaskSamples sample_direct_masks(
+ const torch::Tensor& masks, const PreparedTargets& targets, const torch::Tensor& indices, int64_t ratio, const LayerMaskSamples& samples, std::optional<DirectMaskRandomSeeds> seeds = std::nullopt);
 // One uniform draw shared by all image, query and target operands in a layer.
 // Spatial and predicted samples retain autograd; categorical targets do not.
 struct PairwiseMaskSamples {
- torch::Tensor spatial; // [B, C, P]
- torch::Tensor logits; // [B, Q, P]
- torch::Tensor targets; // [B, M, P], padded rows zero
+ torch::Tensor spatial;  // [B, C, P]
+ torch::Tensor logits;   // [B, Q, P]
+ torch::Tensor targets;  // [B, M, P], padded rows zero
 };
-PairwiseMaskSamples sample_pairwise_masks(const OutputLayer& layer, const PreparedTargets& targets,
- const torch::Tensor& indices, const torch::Tensor& valid, int64_t point_ratio, const torch::Tensor& coordinates = {});
-} // namespace mmltk::backend::models::rfdetr
+PairwiseMaskSamples sample_pairwise_masks(
+ const OutputLayer& layer, const PreparedTargets& targets, const torch::Tensor& indices, const torch::Tensor& valid, int64_t point_ratio, const torch::Tensor& coordinates = {});
+}  // namespace mmltk::backend::models::rfdetr

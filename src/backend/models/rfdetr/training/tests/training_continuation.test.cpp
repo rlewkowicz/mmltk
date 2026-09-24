@@ -187,62 +187,121 @@ void test_ordered_cpu_ema_admission() {
 TEST_CASE("test_current_continuation_required_fields", "[model][rfdetr][training][continuation]") { test_current_continuation_required_fields(); }
 TEST_CASE("test_current_continuation_scalar_boundaries", "[model][rfdetr][training][continuation]") { test_current_continuation_scalar_boundaries(); }
 TEST_CASE("test_ordered_cpu_ema_admission", "[model][rfdetr][training][continuation][ema]") { test_ordered_cpu_ema_admission(); }
-
 TEST_CASE("Resolved current Resume preserves recipe optimizer EMA and an unfinished stock warmup", "[model][rfdetr][training][continuation][parity]") {
  const mmltk::testsupport::ScopedTempDir root("stock-resume-admission");
- const auto path=root.path()/"resume.pt";
+ const auto path = root.path() / "resume.pt";
  r::DecodedNativeModelState state;
- state.metadata.preset_name="rf-detr-seg-medium"; state.metadata.source_kind="stock-admission-fixture"; state.metadata.source_path=path.string();
- state.metadata.num_classes=3; state.metadata.num_queries=2; state.metadata.num_select=2; state.metadata.class_layout=r::testsupport::synthetic_training_layout(2);
- state.replace_entries({{"query_feat.weight",torch::zeros({26,256})},{"refpoint_embed.weight",torch::zeros({26,4})},{"class_embed.weight",torch::zeros({3,256})},{"class_embed.bias",torch::tensor({0.3F,-0.2F,0.7F})}});
- state.metadata.cls_loss_coef=7.3; state.metadata.bbox_loss_coef=9.1; state.metadata.giou_loss_coef=3.2; state.metadata.mask_ce_loss_coef=8.2; state.metadata.mask_dice_loss_coef=6.4;
- const std::string name="class_embed.bias";
+ state.metadata.preset_name = "rf-detr-seg-medium";
+ state.metadata.source_kind = "stock-admission-fixture";
+ state.metadata.source_path = path.string();
+ state.metadata.num_classes = 3;
+ state.metadata.num_queries = 2;
+ state.metadata.num_select = 2;
+ state.metadata.class_layout = r::testsupport::synthetic_training_layout(2);
+ state.replace_entries({{"query_feat.weight", torch::zeros({26, 256})}, {"refpoint_embed.weight", torch::zeros({26, 4})}, {"class_embed.weight", torch::zeros({3, 256})},
+  {"class_embed.bias", torch::tensor({0.3F, -0.2F, 0.7F})}});
+ state.metadata.cls_loss_coef = 7.3;
+ state.metadata.bbox_loss_coef = 9.1;
+ state.metadata.giou_loss_coef = 3.2;
+ state.metadata.mask_ce_loss_coef = 8.2;
+ state.metadata.mask_dice_loss_coef = 6.4;
+ const std::string name = "class_embed.bias";
  torch::Tensor weight;
- for(const auto& entry:state.entries()) if(entry.name==name) weight=entry.tensor;
- REQUIRE(weight.defined()); weight.set_requires_grad(true);
- auto request=saved_request(); request.use_ema=true; request.warmup_epochs=1.5; request.ema_decay=0.9; request.ema_tau=3;
- torch::OrderedDict<std::string,torch::Tensor> inventory; inventory.insert(name,weight);
- auto built=r::build_optimizer(inventory,request); r::ModelEma ema({weight},request.ema_decay,request.ema_tau);
- for(int attempt=0;attempt<3;++attempt) { weight.mutable_grad()=torch::full_like(weight,0.2+attempt*0.1); built.optimizer.step(); built.optimizer.zero_grad(true); ema.update(); }
- const auto saved_weight=weight.detach().clone(), saved_shadow=ema.shadow_params()[0].clone();
- const std::vector<r::NormalizedModelStateEntry> shadow{{name,saved_shadow}};
- mmltk::backend::ml::cuda::TensorReadbackBuffers readback; readback.Begin();
- r::detail::reserve_state_archive(state.entries(),readback,0); r::detail::reserve_state_archive(shadow,readback,state.entries().size());
- built.optimizer.reserve_checkpoint(readback,state.entries().size()+1);
- torch::serialize::OutputArchive archive; r::detail::write_native_checkpoint_metadata(archive,state.metadata);
- r::detail::write_training_continuation(archive,request,{.epoch=0,.best_regular_metric=0.2,.best_ema_metric=0.3,.grad_scaler_scale=128,.grad_scaler_growth_tracker=7,.ema_completed_updates=3,.training_attempt_id="stock-admission",.training_original_descriptor="original.json"});
- r::detail::write_resume_state_archive(archive,"state",state.entries(),readback,0);
- r::detail::write_resume_state_archive(archive,"ema_state",shadow,readback,state.entries().size());
- torch::serialize::OutputArchive optimizer_archive; built.optimizer.save(optimizer_archive,readback,state.entries().size()+1); archive.write("optimizer",optimizer_archive);
- readback.Complete(); r::detail::publish_native_checkpoint_archive(archive,path);
- auto admitted=r::resolve_model_state(path,{},0);
- auto active=request; active.resume_path=path;
- const auto continuation=r::detail::admit_training_configuration(admitted.artifacts.config,admitted.model_state.admitted_archive(),active);
- REQUIRE(continuation.has_value()); REQUIRE(admitted.artifacts.config.cls_loss_coef==7.3); REQUIRE(admitted.artifacts.config.bbox_loss_coef==9.1);
- REQUIRE(admitted.artifacts.config.giou_loss_coef==3.2); REQUIRE(admitted.artifacts.config.mask_ce_loss_coef==8.2); REQUIRE(admitted.artifacts.config.mask_dice_loss_coef==6.4);
- auto resumed_weight=saved_weight.clone().set_requires_grad(true); torch::OrderedDict<std::string,torch::Tensor> resumed_inventory; resumed_inventory.insert(name,resumed_weight);
- auto resumed=r::build_optimizer(resumed_inventory,active);
- auto admitted_resume=r::load_resume_checkpoint_state(path,admitted.model_state,*continuation,resumed.optimizer,active,{name},{resumed_weight},true);
- REQUIRE(admitted_resume.start_epoch==1); REQUIRE(admitted_resume.scaler_scale==128); REQUIRE(admitted_resume.scaler_growth_tracker==7);
- REQUIRE(admitted_resume.restored_ema.has_value()); REQUIRE(admitted_resume.restored_ema->completed_updates()==3);
- REQUIRE(torch::equal(admitted_resume.restored_ema->shadow_params()[0],saved_shadow)); REQUIRE(torch::equal(resumed_weight,saved_weight));
+ for (const auto& entry : state.entries())
+  if (entry.name == name) weight = entry.tensor;
+ REQUIRE(weight.defined());
+ weight.set_requires_grad(true);
+ auto request = saved_request();
+ request.use_ema = true;
+ request.warmup_epochs = 1.5;
+ request.ema_decay = 0.9;
+ request.ema_tau = 3;
+ torch::OrderedDict<std::string, torch::Tensor> inventory;
+ inventory.insert(name, weight);
+ auto built = r::build_optimizer(inventory, request);
+ r::ModelEma ema({weight}, request.ema_decay, request.ema_tau);
+ for (int attempt = 0; attempt < 3; ++attempt) {
+  weight.mutable_grad() = torch::full_like(weight, 0.2 + attempt * 0.1);
+  built.optimizer.step();
+  built.optimizer.zero_grad(true);
+  ema.update();
+ }
+ const auto saved_weight = weight.detach().clone(), saved_shadow = ema.shadow_params()[0].clone();
+ const std::vector<r::NormalizedModelStateEntry> shadow{{name, saved_shadow}};
+ mmltk::backend::ml::cuda::TensorReadbackBuffers readback;
+ readback.Begin();
+ r::detail::reserve_state_archive(state.entries(), readback, 0);
+ r::detail::reserve_state_archive(shadow, readback, state.entries().size());
+ built.optimizer.reserve_checkpoint(readback, state.entries().size() + 1);
+ torch::serialize::OutputArchive archive;
+ r::detail::write_native_checkpoint_metadata(archive, state.metadata);
+ r::detail::write_training_continuation(archive, request,
+  {.epoch = 0,
+   .best_regular_metric = 0.2,
+   .best_ema_metric = 0.3,
+   .grad_scaler_scale = 128,
+   .grad_scaler_growth_tracker = 7,
+   .ema_completed_updates = 3,
+   .training_attempt_id = "stock-admission",
+   .training_original_descriptor = "original.json"});
+ r::detail::write_resume_state_archive(archive, "state", state.entries(), readback, 0);
+ r::detail::write_resume_state_archive(archive, "ema_state", shadow, readback, state.entries().size());
+ torch::serialize::OutputArchive optimizer_archive;
+ built.optimizer.save(optimizer_archive, readback, state.entries().size() + 1);
+ archive.write("optimizer", optimizer_archive);
+ readback.Complete();
+ r::detail::publish_native_checkpoint_archive(archive, path);
+ auto admitted = r::resolve_model_state(path, {}, 0);
+ auto active = request;
+ active.resume_path = path;
+ const auto continuation = r::detail::admit_training_configuration(admitted.artifacts.config, admitted.model_state.admitted_archive(), active);
+ REQUIRE(continuation.has_value());
+ REQUIRE(admitted.artifacts.config.cls_loss_coef == 7.3);
+ REQUIRE(admitted.artifacts.config.bbox_loss_coef == 9.1);
+ REQUIRE(admitted.artifacts.config.giou_loss_coef == 3.2);
+ REQUIRE(admitted.artifacts.config.mask_ce_loss_coef == 8.2);
+ REQUIRE(admitted.artifacts.config.mask_dice_loss_coef == 6.4);
+ auto resumed_weight = saved_weight.clone().set_requires_grad(true);
+ torch::OrderedDict<std::string, torch::Tensor> resumed_inventory;
+ resumed_inventory.insert(name, resumed_weight);
+ auto resumed = r::build_optimizer(resumed_inventory, active);
+ auto admitted_resume = r::load_resume_checkpoint_state(path, admitted.model_state, *continuation, resumed.optimizer, active, {name}, {resumed_weight}, true);
+ REQUIRE(admitted_resume.start_epoch == 1);
+ REQUIRE(admitted_resume.scaler_scale == 128);
+ REQUIRE(admitted_resume.scaler_growth_tracker == 7);
+ REQUIRE(admitted_resume.restored_ema.has_value());
+ REQUIRE(admitted_resume.restored_ema->completed_updates() == 3);
+ REQUIRE(torch::equal(admitted_resume.restored_ema->shadow_params()[0], saved_shadow));
+ REQUIRE(torch::equal(resumed_weight, saved_weight));
  resumed.optimizer.commit(std::move(*admitted_resume.optimizer_candidate));
- r::LrScheduleConfig schedule; schedule.warmup_epochs=continuation->configuration.warmup_epochs; schedule.lr_scheduler=r::TrainLrSchedulerKind::Step; schedule.lr_drop=10;
- const auto resumed_step=admitted_resume.start_epoch*3;
- REQUIRE(r::compute_lr_scale(schedule,resumed_step,3,12)==0.75); // floor(3*1.5)=4.
- built.optimizer.set_lrs(built.base_lrs,0.75); resumed.optimizer.set_lrs(resumed.base_lrs,r::compute_lr_scale(schedule,resumed_step,3,12));
- weight.mutable_grad()=torch::full_like(weight,0.43); resumed_weight.mutable_grad()=torch::full_like(resumed_weight,0.43);
- built.optimizer.step(); resumed.optimizer.step(); ema.update(); admitted_resume.restored_ema->update();
- REQUIRE(torch::equal(weight,resumed_weight)); REQUIRE(torch::equal(ema.shadow_params()[0],admitted_resume.restored_ema->shadow_params()[0]));
- auto invalid=active; invalid.warmup_epochs=2.0;
- REQUIRE_THROWS(r::detail::admit_training_configuration(admitted.artifacts.config,admitted.model_state.admitted_archive(),invalid));
- REQUIRE(admitted.artifacts.config.cls_loss_coef==7.3);
- REQUIRE_THROWS(r::detail::admit_training_configuration(admitted.artifacts.config,nullptr,active));
- torch::serialize::OutputArchive weights_only; mmltk::backend::ml::serialization::write_string(weights_only,"source_kind","weights-only");
- auto input=r::testsupport::checkpoint_input(weights_only);
- REQUIRE_THROWS(r::detail::admit_training_configuration(admitted.artifacts.config,&input,active));
- REQUIRE(admitted.artifacts.config.mask_ce_loss_coef==8.2);
+ r::LrScheduleConfig schedule;
+ schedule.warmup_epochs = continuation->configuration.warmup_epochs;
+ schedule.lr_scheduler = r::TrainLrSchedulerKind::Step;
+ schedule.lr_drop = 10;
+ const auto resumed_step = admitted_resume.start_epoch * 3;
+ REQUIRE(r::compute_lr_scale(schedule, resumed_step, 3, 12) == 0.75);  // floor(3*1.5)=4.
+ built.optimizer.set_lrs(built.base_lrs, 0.75);
+ resumed.optimizer.set_lrs(resumed.base_lrs, r::compute_lr_scale(schedule, resumed_step, 3, 12));
+ weight.mutable_grad() = torch::full_like(weight, 0.43);
+ resumed_weight.mutable_grad() = torch::full_like(resumed_weight, 0.43);
+ built.optimizer.step();
+ resumed.optimizer.step();
+ ema.update();
+ admitted_resume.restored_ema->update();
+ REQUIRE(torch::equal(weight, resumed_weight));
+ REQUIRE(torch::equal(ema.shadow_params()[0], admitted_resume.restored_ema->shadow_params()[0]));
+ auto invalid = active;
+ invalid.warmup_epochs = 2.0;
+ REQUIRE_THROWS(r::detail::admit_training_configuration(admitted.artifacts.config, admitted.model_state.admitted_archive(), invalid));
+ REQUIRE(admitted.artifacts.config.cls_loss_coef == 7.3);
+ REQUIRE_THROWS(r::detail::admit_training_configuration(admitted.artifacts.config, nullptr, active));
+ torch::serialize::OutputArchive weights_only;
+ mmltk::backend::ml::serialization::write_string(weights_only, "source_kind", "weights-only");
+ auto input = r::testsupport::checkpoint_input(weights_only);
+ REQUIRE_THROWS(r::detail::admit_training_configuration(admitted.artifacts.config, &input, active));
+ REQUIRE(admitted.artifacts.config.mask_ce_loss_coef == 8.2);
  // Starting a new run from this full archive deliberately ignores continuation.
- REQUIRE_FALSE(r::detail::admit_training_configuration(admitted.artifacts.config,admitted.model_state.admitted_archive(),request).has_value());
- REQUIRE(admitted.artifacts.config.cls_loss_coef==1.0); REQUIRE(admitted.model_state.metadata.cls_loss_coef==7.3);
+ REQUIRE_FALSE(r::detail::admit_training_configuration(admitted.artifacts.config, admitted.model_state.admitted_archive(), request).has_value());
+ REQUIRE(admitted.artifacts.config.cls_loss_coef == 1.0);
+ REQUIRE(admitted.model_state.metadata.cls_loss_coef == 7.3);
 }

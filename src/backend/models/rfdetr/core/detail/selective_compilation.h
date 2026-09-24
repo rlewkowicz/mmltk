@@ -22,6 +22,7 @@ public:
  void invalidate();
  Tensors invoke(bool training, const Tensors& inputs, std::initializer_list<torch::nn::Module*> owners, Operation ordinary);
  [[nodiscard]] const void* identity(bool training) const noexcept;
+
 private:
  struct State;
  struct Slot {
@@ -34,4 +35,4 @@ private:
  bool dynamic_batch_queries_;
  std::array<Slot, 2> slots_;
 };
-}
+}  // namespace mmltk::backend::models::rfdetr::detail

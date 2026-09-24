@@ -1,7 +1,7 @@
-use crate::view::shared::status_text;
 use crate::fluent_theme::Element;
 use crate::presentation_surface::{Surface, SurfaceGesture};
-use iced::widget::{container};
+use crate::view::shared::status_text;
+use iced::widget::container;
 use iced::{Center, Fill, Length};
 
 pub const STABLE_ID: &str = "workflow.visual.workspace";

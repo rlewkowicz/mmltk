@@ -114,7 +114,7 @@ struct DenoisingQueryBatch {
 struct DenoisingOutputLayer {
  torch::Tensor pred_logits;
  torch::Tensor pred_boxes;
- std::optional<SparsePredMasks> sparse_pred_masks;
+ std::optional<SparsePredMasks> sparse_pred_masks{};
 };
 struct DenoisingOutputs {
  DenoisingOutputLayer main;
@@ -163,8 +163,8 @@ struct TrainingLossComponents {
  torch::Tensor classification;
  torch::Tensor box;
  torch::Tensor giou;
- torch::Tensor mask_ce;
- torch::Tensor mask_dice;
+ torch::Tensor mask_ce{};
+ torch::Tensor mask_dice{};
 };
 struct TrainingLoss {
  torch::Tensor total;
@@ -175,8 +175,8 @@ struct TrainingLoss {
  torch::Tensor denoising;
  torch::Tensor auxiliary;
  TrainingLossComponents main;
- torch::Tensor mask_ce;
- torch::Tensor mask_dice;
+ torch::Tensor mask_ce{};
+ torch::Tensor mask_dice{};
 };
 struct OutputTensors {
  torch::Tensor pred_logits;

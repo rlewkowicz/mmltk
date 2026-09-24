@@ -8,7 +8,7 @@
 namespace mmltk::controller {
 struct ValidationRuntimeResult final {
  contracts::ComputeTerminal terminal{};
- std::filesystem::path report;
+ std::filesystem::path report{};
  std::optional<mmltk::backend::models::rfdetr::ValidationBackendResult> evaluation{};
 };
 class ValidationRuntime {

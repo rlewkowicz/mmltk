@@ -20,8 +20,9 @@ public:
  void Audio(const VideoAudioPacket&);
  void Complete();
  void ClosePartial();
+
 private:
  struct State;
  std::unique_ptr<State> state_;
 };
-}
+}  // namespace mmltk::backend::media::video

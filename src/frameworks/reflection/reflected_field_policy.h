@@ -79,6 +79,21 @@ template <class Byte, std::size_t Count>
 struct IsByteSequence<std::span<Byte, Count>> : std::true_type {};
 template <class T>
 inline constexpr bool kByteSequence = IsByteSequence<RemoveCvRef<T>>::value;
+// Text sequences use MaxItems for the container and MaxBytes for each leaf.
+template <class T>
+inline constexpr bool kTextSequence = [] {
+ using U = RemoveCvRef<T>;
+ if constexpr (requires(const U& value) {
+                typename U::value_type;
+                value.size();
+                value.begin();
+                value.end();
+               }) {
+  using Item = RemoveCvRef<typename U::value_type>;
+  return std::is_same_v<Item, std::string> || std::is_same_v<Item, std::filesystem::path>;
+ }
+ return false;
+}();
 // Boundary owners specialize this semantics-free policy for types that are
 // opaque leaves to reflected field traversal and require both byte and item
 // budgets. Reflection owns the policy shape; it knows no wire vocabulary.
@@ -264,11 +279,11 @@ template <std::meta::info Member>
  constexpr bool numeric = std::is_arithmetic_v<MemberType> && !std::is_same_v<MemberType, bool>;
  constexpr bool dynamic_value = kBoundedDynamicLeaf<MemberType>;
  constexpr bool minimum_byte_bounded = std::is_same_v<MemberType, std::string> || std::is_same_v<MemberType, std::filesystem::path> || kByteSequence<MemberType>;
- constexpr bool byte_bounded = minimum_byte_bounded || dynamic_value;
+ constexpr bool byte_bounded = minimum_byte_bounded || dynamic_value || kTextSequence<MemberType>;
  constexpr bool item_bounded = (requires(const MemberType& value) {
   typename MemberType::value_type;
   value.size();
- } && (!byte_bounded || kByteSequence<MemberType>)) || dynamic_value;
+ } && (!byte_bounded || kByteSequence<MemberType> || kTextSequence<MemberType>)) || dynamic_value;
  const FieldConstraint policy = policy_of<Member>();
  const bool fixed_sequence_capacity = fixed_sequence_capacity_is_valid<MemberType>(policy.maximum_items);
  return minima <= 1U && maxima <= 1U && finite_markers <= 1U && byte_minima <= 1U && byte_limits <= 1U && item_limits <= 1U && presentation_markers <= 1U && catalog_markers <= 1U &&
@@ -522,7 +537,14 @@ template <class Value>
                        typename V::value_type;
                        value.size();
                       } && !std::is_same_v<V, std::string> && !std::is_same_v<V, std::filesystem::path>) {
-  return satisfies_item_count(value, constraint) ? std::nullopt : std::optional{Violation::TooManyItems};
+  if (!satisfies_item_count(value, constraint)) return Violation::TooManyItems;
+  if constexpr (kTextSequence<V>) {
+   if (constraint.maximum_bytes != 0U) {
+    for (const auto& item : value)
+     if (const auto violation = field_value_violation(item, constraint)) return violation;
+   }
+  }
+  return std::nullopt;
  } else if constexpr (std::is_same_v<V, std::string>) {
   if (value.size() < constraint.minimum_bytes) return Violation::TooFewBytes;
   return satisfies(std::string_view(value), constraint) ? std::nullopt : std::optional{Violation::TooManyBytes};
@@ -742,6 +764,8 @@ template <class Declaration, class Owner>
   return policy.finite;
  } else if constexpr (std::is_same_v<MemberType, std::string> || std::is_same_v<MemberType, std::filesystem::path>) {
   return policy.maximum_bytes != 0U;
+ } else if constexpr (kTextSequence<MemberType>) {
+  return policy.maximum_bytes != 0U && (policy.maximum_items != 0U || kInplaceVector<MemberType> || requires { std::tuple_size<MemberType>::value; });
  } else if constexpr (requires { typename MemberType::value_type; } && !requires { std::tuple_size<MemberType>::value; }) {
   return policy.maximum_items != 0U;
  }

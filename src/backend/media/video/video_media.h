@@ -14,6 +14,7 @@ public:
  struct State;
  std::uint32_t width = 0, height = 0;
  int rate_numerator = 0, rate_denominator = 1;
+
 private:
  std::shared_ptr<const State> state_;
  friend class VideoFileSource;
@@ -22,9 +23,10 @@ private:
 class VideoAudioPacket final {
 public:
  struct State;
+
 private:
  std::shared_ptr<const State> state_;
  friend class VideoFileSource;
  friend class VideoFileSink;
 };
-}
+}  // namespace mmltk::backend::media::video

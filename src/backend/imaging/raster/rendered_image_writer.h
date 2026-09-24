@@ -14,6 +14,7 @@ public:
  ~RenderedImageWriter();
  void Write(mmltk::frameworks::gpu::BorrowedImageProductReadView, const std::filesystem::path&);
  [[nodiscard]] std::filesystem::path Flush();
+
 private:
  struct Impl;
  std::unique_ptr<Impl> impl_;
