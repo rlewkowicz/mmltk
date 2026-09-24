@@ -26,7 +26,7 @@ struct ApplicationSystemConfiguration final {
  services::FileDialogClient file_dialog{};
  services::VastProviderClient provider{};
  std::filesystem::path training_executable{};
- services::RuntimeDiagnosticTarget dataset_diagnostics{};
+ services::RuntimeDiagnosticTarget runtime_diagnostics{};
 };
 [[nodiscard]] std::unique_ptr<ExploreSystem> make_shell_explore_system(
  SettingsSystem&, const ApplicationSystemConfiguration&, const mmltk::frameworks::gpu::DeviceExecution&, SystemEventSink<ExploreSystem::event_type> = {}, VisualDiagnosticSink = {});

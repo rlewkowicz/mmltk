@@ -8,6 +8,7 @@
 #include <optional>
 #include <stop_token>
 #include <string>
+#include <string_view>
 #include <variant>
 #include "src/controller/contracts/application_boundary.h"
 #include "src/controller/contracts/compute.h"
@@ -15,6 +16,7 @@
 #include "src/controller/services/settings_system.h"
 #include "src/controller/services/vast_client.h"
 #include "src/controller/services/train_process_client.h"
+#include "src/controller/services/runtime_diagnostics.h"
 #include "src/backend/models/rfdetr/contract/training_metrics.h"
 #include "src/controller/subsystems/system/dataset_system.h"
 #include "src/controller/runtime/local_run.h"
@@ -29,10 +31,19 @@ public:
  [[nodiscard]] virtual contracts::ProviderEffectResult Mutate(
   contracts::ProviderMutation, const contracts::ProviderPreferences&, contracts::ProviderOfferIdentity, int instance_id, std::string_view launch_token, std::stop_token) = 0;
  [[nodiscard]] virtual contracts::ProviderEffectResult Reconcile(const services::VastReconciliationRequest&, std::stop_token) = 0;
+protected:
+ void ReportFailure(std::string_view detail, std::optional<int> status = std::nullopt) const noexcept;
+
+private:
+ // The enclosing operation selects reporting once, before using this runtime.
+ // This policy affects stderr only, never results, cancellation, or lifetime.
+ bool report_failures_ = true;
+ friend class TrainingSystem;
 };
 struct NativeTrainingConfiguration final {
  services::VastProviderClient provider{};
  std::filesystem::path training_executable;
+ services::RuntimeDiagnosticTarget diagnostics{};
 };
 class NativeTrainingRuntime final : public TrainingRuntime {
 public:

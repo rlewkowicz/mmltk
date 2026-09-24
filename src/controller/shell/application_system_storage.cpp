@@ -55,7 +55,7 @@ ApplicationSystemStorage::ApplicationSystemStorage(ApplicationSystemConfiguratio
  file_dialog_ = std::make_unique<FileDialogSystem>([client = configuration.file_dialog, settings = settings_.get()] { return std::make_unique<NativeFileDialogRuntime>(client, *settings); },
   browser::ApplicationEventPublisher<&ApplicationSystems::file_dialog>(events_, continuity_));
  dataset_ = std::make_unique<DatasetSystem>(
-  *settings_, [diagnostics = std::move(configuration.dataset_diagnostics)] { return std::make_unique<ArtifactDatasetRuntime>(services::ArtifactStore{}, diagnostics); },
+  *settings_, [diagnostics = configuration.runtime_diagnostics] { return std::make_unique<ArtifactDatasetRuntime>(services::ArtifactStore{}, diagnostics); },
   browser::ApplicationEventPublisher<&ApplicationSystems::dataset>(events_, continuity_));
  model_ = std::make_unique<ModelSystem>(*settings_, [] { return std::make_unique<ArtifactModelRuntime>(); }, browser::ApplicationEventPublisher<&ApplicationSystems::model>(events_, continuity_));
  const DirectComputeConfiguration compute{
@@ -70,10 +70,11 @@ ApplicationSystemStorage::ApplicationSystemStorage(ApplicationSystemConfiguratio
  };
  training_ = std::make_unique<TrainingSystem>(
   *settings_, *dataset_, *model_, inspection_policy,
-  [provider = configuration.provider, executable = std::move(configuration.training_executable)] {
+  [provider = configuration.provider, executable = std::move(configuration.training_executable), diagnostics = configuration.runtime_diagnostics] {
    return std::make_unique<NativeTrainingRuntime>(NativeTrainingConfiguration{
     .provider = provider,
     .training_executable = executable,
+    .diagnostics = diagnostics,
    });
   },
   browser::ApplicationEventPublisher<&ApplicationSystems::training>(events_, continuity_));

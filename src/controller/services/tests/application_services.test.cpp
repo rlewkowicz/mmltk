@@ -318,7 +318,7 @@ TEST_CASE("diagnostics disabled producers perform no submission work", "[gui][se
  target.Emit([&] {
   ++collections;
   static_cast<void>(DiagnosticCountingClock::now());
-  return RuntimeDiagnosticFact{.event = "disabled.lazy"};
+  return RuntimeDiagnosticFact{.owner = contracts::DiagnosticOwner::Training, .event = "child.exited"};
  });
  CHECK(collections == 0U);
  CHECK(DiagnosticCountingClock::reads == 0U);

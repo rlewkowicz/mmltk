@@ -15,6 +15,7 @@ enum class DiagnosticOwner : std::uint8_t {
  Live,
  Presentation,
  AnnotationResource,
+ Training,
  // CLEANUP-IGNORE: Closing the diagnostic-owner enum before the source schema is a canonical reflected boundary,
  // not a reusable scalar record shared with kernel ABIs.
 };

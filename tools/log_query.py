@@ -592,6 +592,18 @@ class Record:
     def __post_init__(self):
         self.clock, self.time_ns = record_time(self.data, self.source)
 
+    def training_record(self):
+        # External RF-DETR TrainingRecord format 2: use exact enum spellings
+        # and bounded identities, never metric names or arbitrary status text.
+        return (type(self.data.get("format_version")) is int and self.data["format_version"] == 2
+                and self.data.get("role") in ("Live", "Boundary", "Epoch", "Terminal")
+                and all(isinstance(self.data.get(name), str)
+                        and 0 < len(self.data[name]) <= 64 and self.data[name].strip()
+                        for name in ("run_id", "attempt_id"))
+                and isinstance(self.data.get("progress"), dict)
+                and self.data["progress"].get("phase") in
+                    ("Starting", "Train", "Validate", "EpochComplete", "Completed", "Error"))
+
     def get(self, name):
         if name == "@file":
             return self.source
@@ -614,6 +626,8 @@ class Record:
         if name == "@workspace_source":
             return workspace_source_identity(self.data)
         if name == "@event":
+            if self.training_record():
+                return "training." + self.data["role"].lower() + "." + self.data["progress"]["phase"].lower()
             return value_from(self.data, "fields.event", "fields.name", "event", "name")
         if name == "@owner":
             owner = value_from(self.data, "owner", "fields.owner", "component", "system", "module", "logger")
@@ -623,6 +637,8 @@ class Record:
             value = value_from(self.data, "level", "severity", "fields.level")
             return LEVEL_NAMES.get(str(value).lower(), str(value).lower()) if value is not MISSING else MISSING
         if name == "@error":
+            if self.training_record():
+                return self.data["role"] == "Terminal" and self.data["progress"]["phase"] == "Error"
             code = self.get("@exit_code")
             if code is not MISSING and code != 0:
                 return True
@@ -647,7 +663,7 @@ class Record:
             except ValueError:
                 return f"SIG{number}"
         if name == "@terminal":
-            return self.get("@event") in (
+            return (self.training_record() and self.data["role"] == "Terminal") or self.get("@event") in (
                 "child.signaled", "child.exited", "shutdown.complete", "shutdown.firefox_terminal",
                 "catch.test_failed", "catch.test_passed", "catch.test_skipped", "catch.test_selection_failed", "catch.summary",
                 "process.terminal", "build.image", "build.failed",
@@ -1806,6 +1822,7 @@ def triage_snapshot(record):
     """Bound retained payloads too, not just row counts. Matching uses the full row."""
     budget = [96]
     shortened = [False]
+    training = record.training_record()
 
     def trim(value, depth=0):
         if isinstance(value, str):
@@ -1821,8 +1838,18 @@ def triage_snapshot(record):
                 # A large earlier array/context must not consume the budget
                 # before the same record's event, reason and exact identities.
                 # Inspect at most the remaining budget plus one dictionary key.
-                items = list(islice(value.items(), budget[0] + 1))
+                priority = ()
+                if training and value is record.data:
+                    priority = ("format_version", "run_id", "attempt_id", "role", "sequence", "progress")
+                elif training and value is record.data["progress"]:
+                    priority = ("phase",)
+                # Reserve canonical short facts through direct lookups, even
+                # when large optional configuration precedes them in the file.
+                leading = [(name, value[name]) for name in priority if name in value]
+                items = [(name, child) for name, child in islice(value.items(), budget[0] + 1)
+                         if name not in priority]
                 items.sort(key=lambda item: isinstance(item[1], (dict, list)))
+                items = leading + items
             else:
                 items = enumerate(value)
             result = {}
@@ -1876,6 +1903,8 @@ def strong_identities(record, explicit=()):
         add(names)
     # Source instance numbers are only meaningful within a source session.
     add(("source_session", "source_instance"))
+    if record.training_record():
+        add(("run_id", "attempt_id"))
     fields = record.data.get("fields")
     values = {**record.data, **(fields if isinstance(fields, dict) else {})}
     for name, value in values.items():
@@ -1914,6 +1943,11 @@ def strong_identities(record, explicit=()):
 
 
 def event_stage(record):
+    # Training role/phase labels describe observations, not the generic
+    # event-name begin/end protocol. Their explicit terminals are handled by
+    # Record and anchor_rank independently of suffix balancing.
+    if record.training_record():
+        return "", ""
     event = record.get("@event")
     match = STAGE_SUFFIX.fullmatch(event) if isinstance(event, str) else None
     return (match[1], match[2].lower()) if match else ("", "")
@@ -1924,6 +1958,8 @@ def triage_terminal(record):
 
 
 def anchor_rank(record, identities=()):
+    if record.training_record():
+        return (110, "failed outcome/span") if record.get("@error") else (0, "training progress")
     family, stage = event_stage(record)
     event = record.get("@event")
     exit_code = record.get("@exit_code")
@@ -3270,7 +3306,7 @@ def render_triage(result, options, output, diagnostics):
                 ordered.setdefault(row.source, []).append(row)
             for source, rows in sorted(ordered.items())[:2]:
                 sequence = sorted(rows, key=physical_position)[:7]
-                stages = " -> ".join(f"{row.line}:{row.get('@event')}" for row in sequence)
+                stages = " -> ".join(f"{row.line}:{compact(row.get('@event'))}" for row in sequence)
                 print("    source-order " + compact(source, 130) + ": " + compact(stages, 520) +
                       " (distinct-stage sample)", file=report)
         if len(result.identities) > options.top:
@@ -3302,6 +3338,8 @@ def render_triage(result, options, output, diagnostics):
 
 
 def compact(value, width=180):
+    if value is MISSING:
+        return "(not recorded)"
     text = value if isinstance(value, str) else encoded(value)
     text = text.replace("\t", "\\t").replace("\r", "\\r").replace("\n", "\\n")
     text = "".join(character if character.isprintable() else f"\\x{ord(character):02x}" for character in text)
@@ -3359,6 +3397,8 @@ def render_record(item, options):
     if detail is MISSING and event is MISSING:
         detail = record.raw
     facts = []
+    if record.training_record():
+        facts.extend(f"{name}={compact(record.get(name), 70)}" for name in ("run_id", "attempt_id"))
     if "representative_count" in record.metadata:
         facts.append(f"occurrences={record.metadata['representative_count']}")
     if event == "vulkan.validation":

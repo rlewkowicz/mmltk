@@ -84,6 +84,55 @@ class ParserTests(unittest.TestCase):
 
 
 class LogFormatTests(unittest.TestCase):
+    def test_training_terminal_errors_keep_run_and_attempt(self):
+        for role, phase, failed in (("Terminal", "Error", True),
+                                    ("Terminal", "Completed", False),
+                                    ("Live", "Train", False), ("Live", "Validate", False)):
+            row = record({"format_version": 2, "role": role, "run_id": "run-a",
+                          "attempt_id": "attempt-b", "progress": {"phase": phase,
+                          "class_error": 42.0}}, "metrics.jsonl", 3)
+            self.assertEqual(bool(row.get("@error")), failed)
+            self.assertEqual(bool(row.get("@terminal")), role == "Terminal")
+            self.assertEqual(row.get("@owner"), "training")
+            self.assertEqual(row.get("@event"), f"training.{role.lower()}.{phase.lower()}")
+            self.assertEqual(row.get("run_id"), "run-a")
+            self.assertEqual(row.get("attempt_id"), "attempt-b")
+            self.assertEqual(row.get("@line"), 3)
+        self.assertFalse(record({"role": "Terminal", "progress": {"phase": "Error"}}).get("@error"))
+
+    def test_training_record_near_misses_do_not_project_lifecycle(self):
+        base = {"format_version": 2, "role": "Terminal", "run_id": "run-a",
+                "attempt_id": "attempt-b", "progress": {"phase": "Error"}}
+        for mutation in ({"format_version": 1}, {"format_version": True}, {"role": "terminal"},
+                         {"run_id": ""}, {"attempt_id": " "}, {"attempt_id": 1},
+                         {"progress": {"phase": "Unknown"}}, {"progress": "Error"}):
+            with self.subTest(mutation=mutation):
+                row = record({**base, **mutation})
+                self.assertFalse(row.training_record())
+                self.assertIs(row.get("@event"), logs.MISSING)
+                self.assertFalse(row.get("@error"))
+                self.assertFalse(row.get("@terminal"))
+        self.assertEqual(logs.compact(logs.MISSING), "(not recorded)")
+
+    def test_training_snapshot_reserves_canonical_facts_before_optional_payloads(self):
+        for role, phase in (("Boundary", "Starting"), ("Terminal", "Completed"), ("Live", "Validate")):
+            row = record({"attempt_configuration": {str(i): "x" * 4096 for i in range(200)},
+                          "progress": {"metrics": list(range(200)), "phase": phase},
+                          "format_version": 2, "role": role, "sequence": 7,
+                          "run_id": "run-a", "attempt_id": "attempt-b"}, "metrics.jsonl", 1)
+            retained = logs.triage_snapshot(row)
+            self.assertEqual(retained.get("@event"), f"training.{role.lower()}.{phase.lower()}")
+            for name in ("format_version", "role", "sequence", "run_id", "attempt_id", "progress.phase"):
+                self.assertEqual(retained.get(name), row.get(name))
+            self.assertEqual(logs.event_stage(retained), ("", ""))
+            self.assertFalse(retained.get("@error"))
+            self.assertEqual(retained.source, "metrics.jsonl")
+            self.assertEqual(retained.line, 1)
+            self.assertTrue(retained.metadata["triage_payload_truncated"])
+            self.assertLess(len(json.dumps(retained.data)), 96 * (2 * logs.MAX_TRIAGE_TEXT + 16))
+            self.assertEqual(len(row.data["attempt_configuration"]), 200)
+            self.assertEqual(len(row.data["progress"]["metrics"]), 200)
+
     def test_complete_jsonl_decodes_each_payload_once(self):
         data = {"event": "sample", "fields": {"nested": list(range(100))}}
         with patch.object(logs.JSON_DECODER, "raw_decode", wraps=logs.JSON_DECODER.raw_decode) as decoded:
@@ -2707,6 +2756,67 @@ class FileQueryTests(unittest.TestCase):
         status, output, diagnostics = self.run_query("input.jsonl", "--triage")
         self.assertEqual(status, 1, diagnostics)
         self.assertNotIn("pixel-chain-divergence", output)
+
+    def test_training_failure_is_an_explicit_triage_anchor(self):
+        self.write("metrics.jsonl", [
+            {"format_version": 2, "role": "Live", "run_id": "run-a", "attempt_id": "attempt-b",
+             "progress": {"phase": "Train", "class_error": 99.0}},
+            {"format_version": 2, "role": "Terminal", "run_id": "run-a", "attempt_id": "attempt-b",
+             "progress": {"phase": "Error"}},
+        ])
+        status, rows, diagnostics = self.exported("metrics.jsonl", "--errors")
+        self.assertEqual(status, 0, diagnostics)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["data"]["attempt_id"], "attempt-b")
+        self.assertEqual(rows[0]["_log"]["line"], 2)
+        status, output, diagnostics = self.run_query("metrics.jsonl", "--triage")
+        self.assertEqual(status, 0, diagnostics)
+        self.assertIn("explicit-failure", output)
+        self.assertIn("run-a", output)
+        self.assertIn("attempt-b", output)
+        self.assertIn("training.live.train", output)
+        self.assertIn("training.terminal.error", output)
+        self.assertIn("owners: training", output)
+        self.assertNotIn("<object object", output)
+
+    def test_training_observations_do_not_invent_generic_begin_end_pairs(self):
+        identity = {"format_version": 2, "run_id": "run-a", "attempt_id": "attempt-b"}
+        self.write("metrics.jsonl", [
+            {**identity, "role": "Boundary", "sequence": 1,
+             "attempt_configuration": {str(i): i for i in range(200)},
+             "progress": {"phase": "Starting"}},
+            {**identity, "role": "Boundary", "sequence": 2, "progress": {"phase": "Train"}},
+            {**identity, "role": "Terminal", "sequence": 3, "progress": {"phase": "Error"}},
+        ])
+        status, output, diagnostics = self.run_query("metrics.jsonl", "--triage")
+        self.assertEqual(status, 0, diagnostics)
+        self.assertIn("explicit-failure", output)
+        self.assertNotIn("unmatched-end", output)
+        self.assertNotIn("missing-counterpart", output)
+        self.assertIn("1:training.boundary.starting", output)
+        self.assertIn("training.boundary.train", output)
+        self.assertIn("training.terminal.error", output)
+        self.assertIn("run-a", output)
+        self.assertIn("attempt-b", output)
+        _, rows, _ = self.exported("metrics.jsonl", "--triage")
+        first = next(row for row in rows if row["_log"]["line"] == 1)
+        self.assertEqual(first["data"]["progress"]["phase"], "Starting")
+        self.assertEqual(first["data"]["sequence"], 1)
+        self.assertEqual(first["data"]["run_id"], "run-a")
+        self.write("ordinary.jsonl", [{"event": "job.failed", "request_id": "ordinary-a"}])
+        status, output, diagnostics = self.run_query("ordinary.jsonl", "--triage")
+        self.assertEqual(status, 0, diagnostics)
+        self.assertIn("unmatched-end", output)
+
+    def test_triage_missing_events_have_stable_display(self):
+        self.write("input.jsonl", [
+            {"request_id": "request-a", "detail": "plain observation"},
+            {"request_id": "request-a", "event": "job.failed"},
+        ])
+        status, output, diagnostics = self.run_query("input.jsonl", "--triage")
+        self.assertEqual(status, 0, diagnostics)
+        self.assertIn("(not recorded)", output)
+        self.assertNotIn("<object object", output)
 
     def test_triage_groups_repeated_anomalies_without_losing_counts_or_context(self):
         self.write("input.jsonl", [

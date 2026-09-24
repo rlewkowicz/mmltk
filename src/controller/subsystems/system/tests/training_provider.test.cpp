@@ -1,3 +1,4 @@
+#include "src/test_support/console_output.h"
 #include "src/controller/subsystems/system/tests/application_data_test_support.h"
 #include "src/test_support/async_test_utils.hpp"
 #include "src/test_support/filesystem_test_utils.hpp"
@@ -11,6 +12,7 @@
 #include <sched.h>
 #include <system_error>
 #include <atomic>
+#include <algorithm>
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/generators/catch_generators.hpp>
 #include <chrono>
@@ -420,6 +422,7 @@ TEST_CASE("local training resets progress and supports failure Stop and reconstr
                           if (const auto* changed = std::get_if<TrainingChanged>(&event); changed && changed->snapshot.local.active) return;
                           terminals.Publish(std::move(event));
                          }};  // CLEANUP-IGNORE: Local training and validation start evidence targets independently typed terminal state.
+ mmltk::testsupport::console_output::ScopedStderrCapture capture;
  static_cast<void>(training.Start({}));
  CHECK_THROWS_AS(training.Start({}), contracts::BusyError);
  gate->Release();
@@ -443,6 +446,9 @@ TEST_CASE("local training resets progress and supports failure Stop and reconstr
  CHECK(training.snapshot().local.terminal.outcome == contracts::ComputeOperationOutcome::Succeeded);
  CHECK(sequence_one_progress == 2U);
  CHECK(constructions == 2U);
+ const auto stderr_text = capture.finish();
+ CHECK(std::ranges::count(stderr_text, '\n') == 1);
+ CHECK(stderr_text.find("local training runtime returned an invalid result") != std::string::npos);
 }
 TEST_CASE("remote training rejects duplicate starts and reconciles an inconclusive create", "[controller][systems][training][provider]") {
  const auto root = mmltk::testsupport::make_temp_root("ordinary-training-reconcile");

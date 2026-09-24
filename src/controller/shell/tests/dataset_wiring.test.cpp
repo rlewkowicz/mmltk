@@ -48,7 +48,7 @@ TEST_CASE("production dataset factory connects optional tracing through staged o
  };
  if (enabled) {
   services::RuntimeDiagnostics creator{client.producer()};
-  configuration.dataset_diagnostics = creator.target();
+  configuration.runtime_diagnostics = creator.target();
  }
  const auto changed = browser::encode_system_event<&ApplicationSystems::dataset>(DatasetChanged{});
  std::promise<void> settled;

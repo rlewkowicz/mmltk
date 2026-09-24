@@ -30,11 +30,11 @@ mmltk_register_ordinary_sources(
     dataset_system.cpp
     ../validate/validation_system.cpp
     ../validate/detail/validation_sample_output.cpp
-    ../validate/detail/validation_samples.cpp
-    ../train/training_system.cpp)
+    ../validate/detail/validation_samples.cpp)
 mmltk_register_retained_module_importers(
     mmltk_controller_data_compute_systems
     ../export/export_system.cpp
+    ../train/training_system.cpp
     model_system.cpp
     predict_system.cpp
     detail/prediction_preview.cpp)
@@ -61,6 +61,7 @@ target_link_libraries(mmltk_controller_data_compute_systems
         mmltk::frameworks::gpu
         mmltk::frameworks::reflection
     PRIVATE
+        mmltk::common::logging
         mmltk::common::concurrency
         mmltk::backend::models::rfdetr::inference
         mmltk::backend::models::rfdetr::training

@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <array>
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 #include <cerrno>
 #include <chrono>
 #include <csignal>
@@ -34,6 +35,7 @@
 #include "src/backend/models/rfdetr/contract/workflow_requests.h"
 #include "src/controller/services/artifact_store.h"
 #include "src/controller/services/train_process_client.h"
+#include "src/common/types/utf8.h"
 #include "src/controller/services/vast_client.h"
 #include "src/controller/services/vast_provider_owner.h"
 #include "src/backend/data/tests/test_fixture.h"
@@ -902,6 +904,8 @@ TEST_CASE("Train process client exposes setup failure and one terminal", "[gui][
  const auto terminal = client.consume_exit();
  REQUIRE(terminal.has_value());
  CHECK(terminal->setup_failure);
+ CHECK(terminal->exit_code != 0);
+ CHECK(terminal->error.find("local training") != std::string::npos);
  CHECK_FALSE(client.consume_exit().has_value());
 }
 TEST_CASE("Train process run owns its stop token, forwards progress, and reaps success", "[gui][services]") {
@@ -919,6 +923,9 @@ TEST_CASE("Train process run owns its stop token, forwards progress, and reaps s
  const auto result = client.Run(std::move(token), {.context = &progress_reports, .report = [](void* context, const TrainProcessProgress&) noexcept { ++*static_cast<std::size_t*>(context); }});
  CHECK(result.terminal.outcome == services::TrainProcessExitOutcome::Succeeded);
  CHECK_FALSE(result.terminal.setup_failure);
+ CHECK(result.terminal.exit_code == 0);
+ CHECK(result.terminal.signal_number == 0);
+ CHECK(result.terminal.error.empty());
  CHECK_FALSE(client.active());
  CHECK(progress_reports >= 1U);
  CHECK(source.RequestCancel());
@@ -1373,4 +1380,65 @@ TEST_CASE("real unknown metadata bytes remain open ended through artifact projec
  CHECK(read_json_file(unknown.destination.string() + ".download.json").at("identity") == downloaded.front().identity);
  server.Check();
 }
+}  // namespace mmltk::controller::subsystems::system
+
+namespace mmltk::controller::subsystems::system {
+TEST_CASE("Train process retains bounded late fatal causes independently of console output", "[gui][services]") {
+ mmltk::testsupport::ScopedTempDir temp("mmltk-train-fatal");
+ const auto executable = script(temp,
+  "head -c 131072 /dev/zero; printf '\\n'\n"
+  "printf 'fatal: mmltk rfdetr error: CUDA out of memory. Tried to allocate 24.00 MiB. GPU 0 has a total capacity of 11.62 GiB of which 42.00 MiB is free.\n'\n"
+  "exit 1\n");
+ auto client = TrainProcessClient::launch(train_request(temp.path() / "output"), executable);
+ auto [source, token] = TrainProcessStopSource::Mint();
+ const auto result = client.Run(std::move(token));
+ CHECK(result.output.size() == services::kTrainProcessReadBudget);
+ CHECK(result.terminal.exit_code == 1);
+ CHECK(result.terminal.signal_number == 0);
+ CHECK(result.terminal.error.find("CUDA out of memory") != std::string::npos);
+ CHECK(result.terminal.error.find("42.00 MiB") != std::string::npos);
+ CHECK(result.terminal.error.find("Reduce batch size or training lanes") != std::string::npos);
+ CHECK_FALSE(client.consume_exit().has_value());
+}
+TEST_CASE("Train process distinguishes fatal causes from warnings and generic parent failures", "[gui][services]") {
+ const auto scenario = GENERATE(0, 1, 2, 3, 4, 5);
+ mmltk::testsupport::ScopedTempDir temp("mmltk-train-fatal-order");
+ std::string body;
+ if (scenario == 0) body = "printf 'allocator warning: CUDA out of memory\\nfat'; printf 'al: mmltk rfdetr error: invalid checkpoint\\n'\nexit 7\n";
+ if (scenario == 1) body = "printf 'fatal: mmltk rfdetr error: CUDA out of memory. 42 MiB free.\\nfatal: distributed training failed\\n'\nexit 7\n";
+ if (scenario == 2) body = "exit 7\n";
+ if (scenario == 3) body = "kill -TERM $$\n";
+ if (scenario == 4) body = "printf 'fatal: mmltk rfdetr error: invalid \\377\\000 text '; head -c 131072 /dev/zero\nexit 7\n";
+ if (scenario == 5) body = "printf 'nonfatal: CUDA out of memory warning\\n'\nexit 7\n";
+ auto client = TrainProcessClient::launch(train_request(temp.path() / "output"), script(temp, body));
+ // Single-byte reads force every envelope and UTF-8 boundary across calls.
+ std::string discarded;
+ while (client.stdout_fd() >= 0) {
+  REQUIRE(ready(client.stdout_fd()));
+  client.consume_output(discarded, scenario == 4 ? 4096U : 1U, 0U);
+ }
+ auto [source, token] = TrainProcessStopSource::Mint();
+ const auto result = client.Run(std::move(token));
+ REQUIRE(result.terminal.outcome == services::TrainProcessExitOutcome::Failed);
+ CHECK(result.terminal.error.size() <= contracts::kComputeErrorCapacity);
+ CHECK(mmltk::common::types::valid_utf8(result.terminal.error));
+ if (scenario == 0) {
+  CHECK(result.terminal.error.find("invalid checkpoint") != std::string::npos);
+  CHECK(result.terminal.error.find("out of memory") == std::string::npos);
+ }
+ if (scenario == 1) CHECK(result.terminal.error.find("CUDA out of memory") != std::string::npos);
+ if (scenario == 2) CHECK(result.terminal.error.find("status 7") != std::string::npos);
+ if (scenario == 3) {
+  CHECK(result.terminal.signal_number == SIGTERM);
+  CHECK(result.terminal.exit_code == 128 + SIGTERM);
+  CHECK(result.terminal.error.find("signal 15") != std::string::npos);
+ }
+ if (scenario == 4) CHECK(result.terminal.error.find("invalid ?  text") != std::string::npos);
+ if (scenario == 5) {
+  CHECK(result.terminal.error.find("status 7") != std::string::npos);
+  CHECK(result.terminal.error.find("out of memory") == std::string::npos);
+  CHECK(result.terminal.error.find("Reduce batch") == std::string::npos);
+ }
+}
+
 }  // namespace mmltk::controller::subsystems::system

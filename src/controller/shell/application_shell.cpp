@@ -65,7 +65,7 @@ ApplicationShell::ApplicationShell(ApplicationShellConfig config)
    .file_dialog = file_dialog_owner_.client(),
    .provider = provider_owner_.client(),
    .training_executable = std::move(config.training_executable),
-   .dataset_diagnostics = runtime_diagnostics_.target()},
+   .runtime_diagnostics = runtime_diagnostics_.target()},
   [this](browser::SystemEvent event) { browser_host_.publish(std::move(event)); }, diagnostics, [this] { browser_host_.continuity_lost(); });
  if (!browser_host_.install(systems_->application_systems())) {
   browser_host_.close_admission();

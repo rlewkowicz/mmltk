@@ -3,6 +3,7 @@
 #include "src/controller/subsystems/system/tests/application_data_test_support.h"
 #include "src/controller/subsystems/system/tests/prediction_test_support.h"
 #include "src/test_support/async_test_utils.hpp"
+#include "src/test_support/console_output.h"
 #include "src/test_support/filesystem_test_utils.hpp"
 #include "src/controller/browser/application_materializer.h"
 #include "src/controller/browser/application_event_publisher.h"
@@ -69,6 +70,94 @@ TEST_CASE("production direct adapters reject unavailable physical dependencies",
  NativeTrainingRuntime training({.provider = {}, .training_executable = root / "missing-trainer"});
  CHECK_THROWS_AS(training.Query(settings.provider_preferences(), {}), contracts::UnavailableError);
  CHECK_THROWS(training.Train({}, {}, {}));
+}
+TEST_CASE("native training projects a child OOM into the GUI terminal and shared diagnostics", "[controller][systems][production-adapters]") {
+ const bool enabled = GENERATE(false, true);
+ const auto root = mmltk::testsupport::make_temp_root("native-training-oom");
+ std::filesystem::create_directories(root);
+ const auto executable = root / "trainer.sh";
+ {
+  std::ofstream script{executable};
+  script << "#!/bin/sh\n"
+   "batch=''; lanes=''; while [ $# -gt 0 ]; do case \"$1\" in --batch-size) batch=$2;; --lanes) lanes=$2;; esac; shift; done\n"
+   "[ \"$batch\" = 16 ] && [ \"$lanes\" = 3 ] || { printf 'fatal: unexpected training argv\\n'; exit 9; }\n"
+   "printf 'fatal: mmltk rfdetr error: CUDA out of memory. Tried to allocate 24.00 MiB. GPU 0 has a total capacity of 11.62 GiB of which 42.00 MiB is free.\\n'\nexit 1\n";
+ }
+ std::filesystem::permissions(executable, std::filesystem::perms::owner_all);
+ const auto diagnostic_path = root / "training.jsonl";
+ services::DiagnosticsClient diagnostics = enabled ? services::DiagnosticsClient{diagnostic_path} : services::DiagnosticsClient{};
+ services::RuntimeDiagnostics runtime_diagnostics{diagnostics.producer()};
+ NativeTrainingRuntime training({.training_executable = executable, .diagnostics = runtime_diagnostics.target()});
+ mmltk::backend::models::rfdetr::TrainRequest request;
+ request.output_dir = root / "output";
+ request.train_compiled_path = root / "train.bin";
+ request.val_compiled_path = root / "val.bin";
+ request.weights_path = root / "weights.pt";
+ request.resolution = 384;
+ request.batch_size = 16;
+ request.lanes = 3;
+ mmltk::testsupport::console_output::ScopedStderrCapture capture;
+ const auto terminal = training.Train(request, {}, {});
+ const auto stderr_text = capture.finish();
+ CHECK(std::ranges::count(stderr_text, '\n') == 1);
+ CHECK(stderr_text.find("fatal: local training:") == 0);
+ CHECK(stderr_text.find("CUDA out of memory") != std::string::npos);
+ CHECK(stderr_text.find("status=1") != std::string::npos);
+ CHECK(terminal.outcome == contracts::ComputeOperationOutcome::Failed);
+ CHECK(terminal.detail.find("CUDA out of memory") != std::string::npos);
+ CHECK(terminal.detail.find("24.00 MiB") != std::string::npos);
+ CHECK(terminal.detail.find("42.00 MiB") != std::string::npos);
+ CHECK(terminal.detail.find("Reduce batch size or training lanes") != std::string::npos);
+ CHECK(terminal.output.empty());
+ CHECK(diagnostics.counters().accepted == (enabled ? 1U : 0U));
+ diagnostics.close();
+ if (!enabled) {
+  CHECK_FALSE(std::filesystem::exists(diagnostic_path));
+  return;
+ }
+ std::ifstream input{diagnostic_path};
+ std::string line;
+ REQUIRE(static_cast<bool>(std::getline(input, line)));
+ CHECK(line.find("training") != std::string::npos);
+ CHECK(line.find("child.exited") != std::string::npos);
+ CHECK(line.find("CUDA out of memory") != std::string::npos);
+ CHECK(line.find("batch_size=16 lanes=3") != std::string::npos);
+ CHECK_FALSE(static_cast<bool>(std::getline(input, line)));
+}
+TEST_CASE("training operation reports preparation and native failures exactly once", "[controller][systems][training]") {
+ const int failure_stage = GENERATE(0, 1, 2, 3);
+ const auto root = mmltk::testsupport::make_temp_root("training-failure-reporting");
+ ApplicationDataFixture fixture{root};
+ if (failure_stage != 0) fixture.PrepareModel();
+ auto [settings, dataset, model] = fixture.systems();
+ const auto executable = root / "failed-trainer.sh";
+ if (failure_stage == 3) {
+  std::ofstream script{executable};
+  script << "#!/bin/sh\nprintf 'fatal: mmltk rfdetr error: invalid checkpoint\\n'\nexit 7\n";
+  script.close();
+  std::filesystem::permissions(executable, std::filesystem::perms::owner_all);
+ }
+ std::atomic_size_t constructions = 0;
+ std::promise<TrainingSnapshot> settled;
+ mmltk::testsupport::console_output::ScopedStderrCapture capture;
+ TrainingSystem training{settings, dataset, model, std::nullopt, [&]() -> std::unique_ptr<TrainingRuntime> {
+  ++constructions;
+  if (failure_stage == 1) throw std::runtime_error("training fixture construction failed");
+  return std::make_unique<NativeTrainingRuntime>(NativeTrainingConfiguration{.training_executable = failure_stage == 3 ? executable : std::filesystem::path{}});
+ }, [&](TrainingSystem::event_type event) {
+  if (auto* changed = std::get_if<TrainingChanged>(&event); changed && !changed->snapshot.local.active)
+   settled.set_value(std::move(changed->snapshot));
+ }};
+ static_cast<void>(training.Start({}));
+ const auto terminal = settled.get_future().get().local.terminal;
+ training.Shutdown();
+ const auto stderr_text = capture.finish();
+ CHECK(terminal.outcome == contracts::ComputeOperationOutcome::Failed);
+ CHECK(constructions == (failure_stage == 0 ? 0U : 1U));
+ CHECK(std::ranges::count(stderr_text, '\n') == 1);
+ CHECK(stderr_text.find("fatal: local training:") == 0);
+ CHECK(stderr_text.find(terminal.detail) != std::string::npos);
+ if (failure_stage == 3) CHECK(terminal.detail.find("status 7") != std::string::npos);
 }
 TEST_CASE("model and compute systems use direct facts, progress, Busy, Stop, and lazy runtime reconstruction", "[controller][systems][compute]") {
  const auto root = mmltk::testsupport::make_temp_root("ordinary-compute");

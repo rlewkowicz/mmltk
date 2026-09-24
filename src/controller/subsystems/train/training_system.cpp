@@ -1,5 +1,6 @@
 #include "src/controller/subsystems/train/training_system.h"
 #include <algorithm>
+#include "src/common/types/utf8.h"
 #include "src/frameworks/reflection/record_projection.h"
 #include <atomic>
 #include <condition_variable>
@@ -14,6 +15,7 @@
 #include "src/backend/models/rfdetr/training/checkpoint.h"
 #include "src/backend/models/rfdetr/core/artifact_publication.h"
 #include "src/controller/subsystems/system/compute_intent_materializer.h"
+import mmltk.common.logging.mmltk_logging;
 namespace mmltk::controller {
 namespace {
 [[nodiscard]] contracts::ProviderEffectResult reconcile_result(const services::VastReconciliation& result, const int fallback) {
@@ -28,26 +30,65 @@ namespace {
 mmltk::backend::models::rfdetr::TrainingCheckpointAdmission TrainingRuntime::InspectCheckpoint(const std::filesystem::path& path, std::stop_token stop) {
  return mmltk::backend::models::rfdetr::inspect_training_checkpoint(path, stop);
 }
+void TrainingRuntime::ReportFailure(const std::string_view detail, const std::optional<int> status) const noexcept {
+ if (report_failures_) mmltk::common::logging::report_fatal("local training", detail, status);
+}
 NativeTrainingRuntime::NativeTrainingRuntime(NativeTrainingConfiguration configuration) : config_(std::move(configuration)) {}
 contracts::ComputeTerminal NativeTrainingRuntime::Train(
  mmltk::backend::models::rfdetr::TrainRequest request, const std::stop_token stop, const std::function<void(const services::TrainProcessProgress&)>& progress) {
- if (config_.training_executable.empty()) throw contracts::UnavailableError("local training executable is unavailable");
- auto process = services::TrainProcessClient::launch(request, config_.training_executable);
- mmltk::common::concurrency::ScopedEventCancellation<services::TrainProcessStopSource> cancellation{stop};
- struct Observer final {
-  const std::function<void(const services::TrainProcessProgress&)>* sink;
-  static void Report(void* context, const services::TrainProcessProgress& value) noexcept {
-   try {
-    (*static_cast<Observer*>(context)->sink)(value);
-   } catch (...) {}
-  }
- } observer{&progress};
- const auto result = process.Run(cancellation.ConsumeToken(), {.context = &observer, .report = &Observer::Report});
- const auto outcome = result.terminal.outcome == services::TrainProcessExitOutcome::Succeeded   ? contracts::ComputeOperationOutcome::Succeeded
-                      : result.terminal.outcome == services::TrainProcessExitOutcome::Cancelled ? contracts::ComputeOperationOutcome::Cancelled
-                                                                                                : contracts::ComputeOperationOutcome::Failed;
- return contracts::make_compute_terminal(outcome, 0, result.terminal.final_progress ? result.terminal.final_progress->progress.completed : 0, {}, result.terminal.error);
+ const auto emit_terminal = [&](const services::TrainProcessExit* terminal, const std::string_view failure) {
+  std::string diagnostic_message;
+  config_.diagnostics.Emit([&] {
+   diagnostic_message = "batch_size=" + std::to_string(request.batch_size) + " lanes=" + std::to_string(request.lanes);
+   if (terminal && terminal->final_progress && terminal->final_progress->metrics) {
+    const auto& metrics = *terminal->final_progress->metrics;
+    diagnostic_message += " run_id=" + metrics.run_id + " attempt_id=" + metrics.attempt_id;
+   }
+   diagnostic_message += ' ';
+   diagnostic_message.append(failure.substr(0, contracts::kComputeErrorCapacity));
+   std::size_t size = 0;
+   while (size < diagnostic_message.size()) {
+    const auto length = mmltk::common::types::utf8_prefix_length(std::string_view{diagnostic_message}.substr(size));
+    if (length == 0 || size + length > 1024U) break;
+    size += length;
+   }
+   diagnostic_message.resize(size);
+   return services::RuntimeDiagnosticFact{.owner = contracts::DiagnosticOwner::Training,
+    .event = terminal == nullptr ? "training.failed" : terminal->signal_number != 0 ? "child.signaled" : "child.exited",
+    .value = terminal ? static_cast<std::uint64_t>(terminal->exit_code) : 0U,
+    .detail = terminal ? static_cast<std::uint64_t>(terminal->signal_number) : 0U,
+    .device = request.device_ids.empty() ? request.device_id : request.device_ids.front(),
+    .context = {.document_resource = request.output_dir.native()}, .message = diagnostic_message};
+  });
+ };
+ try {
+  if (config_.training_executable.empty()) throw contracts::UnavailableError("local training executable is unavailable");
+  auto process = services::TrainProcessClient::launch(request, config_.training_executable);
+  mmltk::common::concurrency::ScopedEventCancellation<services::TrainProcessStopSource> cancellation{stop};
+  struct Observer final {
+   const std::function<void(const services::TrainProcessProgress&)>* sink;
+   static void Report(void* context, const services::TrainProcessProgress& value) noexcept {
+    try {
+     (*static_cast<Observer*>(context)->sink)(value);
+    } catch (...) {}
+   }
+  } observer{&progress};
+  const auto result = process.Run(cancellation.ConsumeToken(), {.context = &observer, .report = &Observer::Report});
+  const auto outcome = result.terminal.outcome == services::TrainProcessExitOutcome::Succeeded   ? contracts::ComputeOperationOutcome::Succeeded
+                       : result.terminal.outcome == services::TrainProcessExitOutcome::Cancelled ? contracts::ComputeOperationOutcome::Cancelled
+                                                                                                 : contracts::ComputeOperationOutcome::Failed;
+  auto terminal = contracts::make_compute_terminal(outcome, 0, result.terminal.final_progress ? result.terminal.final_progress->progress.completed : 0, {}, result.terminal.error);
+  emit_terminal(&result.terminal, result.terminal.error);
+  if (outcome == contracts::ComputeOperationOutcome::Failed)
+   ReportFailure(result.terminal.error, result.terminal.exit_code);
+  return terminal;
+ } catch (const std::exception& error) {
+  emit_terminal(nullptr, error.what());
+  ReportFailure(error.what());
+  throw;
+ }
 }
+
 contracts::ProviderQueryResult NativeTrainingRuntime::Query(const contracts::ProviderPreferences& preferences, const std::stop_token stop) {
  if (!config_.provider.valid()) throw contracts::UnavailableError("provider access is unavailable");
  mmltk::common::concurrency::ScopedEventCancellation<services::VastCancellationSource> cancellation{stop};
@@ -225,7 +266,10 @@ public:
   return admission;
  }
  TrainingRuntime& runtime() {
-  if (!runtime_) runtime_ = factory_();
+  if (!runtime_) {
+   runtime_ = factory_();
+   if (runtime_) runtime_->report_failures_ = false;
+  }
   if (!runtime_) throw std::runtime_error("training runtime is unavailable");
   return *runtime_;
  }
@@ -347,9 +391,11 @@ public:
      AdvanceObservation();
     }
     auto settled = snapshot();
-    return notification(event_type{TrainingChanged{std::move(settled)}});
+    auto publish = notification(event_type{TrainingChanged{std::move(settled)}});
+    if (failed) mmltk::common::logging::report_fatal("local training", terminal.detail);
+    return publish;
    },
-   .failure = [this](std::exception_ptr) { return FailLocal(); },
+   .failure = [this](std::exception_ptr failure) { return FailLocal(failure); },
   });
   return snapshot();
  }
@@ -455,7 +501,9 @@ public:
   });
   return snapshot();
  }
- [[nodiscard]] direct::LocalRun::Notification FailLocal() {
+ [[nodiscard]] direct::LocalRun::Notification FailLocal(std::exception_ptr failure) {
+  const auto terminal = contracts::compute_failure_terminal(failure, "local training worker failed");
+  mmltk::common::logging::report_fatal("local training", terminal.detail);
   runtime_.reset();
   {
    std::scoped_lock lock(mutex_);
@@ -465,7 +513,7 @@ public:
    state_.local.terminal.generation = state_.local.generation_frontier;
    state_.local.terminal.completed = 0;
    state_.local.terminal.output.clear();
-   state_.local.terminal.detail = "local training worker failed";
+   state_.local.terminal.detail = terminal.detail;
    AdvanceObservation();
   }
   return notification(event_type{TrainingChanged{snapshot()}});

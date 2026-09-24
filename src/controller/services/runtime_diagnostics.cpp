@@ -21,6 +21,7 @@ namespace {
   case contracts::DiagnosticOwner::Upscale: return "upscale";
   case contracts::DiagnosticOwner::Live: return "live";
   case contracts::DiagnosticOwner::Presentation: return "presentation";
+  case contracts::DiagnosticOwner::Training: return "training";
   case contracts::DiagnosticOwner::AnnotationResource: return "annotation_resource";
  }
  return {};

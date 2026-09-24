@@ -1,5 +1,6 @@
 #include "src/controller/services/train_process_client.h"
 #include "src/frameworks/serialization/reflected_json.h"
+#include "src/common/types/utf8.h"
 #include <dirent.h>
 #include <fcntl.h>
 #include <poll.h>
@@ -115,6 +116,42 @@ void read_json_value(const nlohmann::json& object, const char* key, T& value) {
  return relevant;
 }
 }  // namespace
+// Only the fatal envelope selects a cause. Allocator warnings and progress
+// are deliberately ignored. Every byte is scanned even after retention fills.
+void TrainProcessClient::State::consume_failure_byte(const char byte) {
+ constexpr std::string_view marker = "fatal: ";
+ if (byte == '\n' || byte == '\r') {
+  finish_failure_line();
+  fatal_marker = 0;
+  failure_line_start = true;
+  return;
+ }
+ if (capturing_failure && failure_line.size() < kFailureCapacity) failure_line.push_back(byte);
+ if (!failure_line_start) return;
+ if (byte != marker[fatal_marker]) {
+  failure_line_start = false;
+  fatal_marker = 0;
+  return;
+ }
+ if (++fatal_marker == marker.size()) {
+  if (failure_line.capacity() < kFailureCapacity) failure_line.reserve(kFailureCapacity);
+  if (failure_cause.capacity() < kFailureCapacity) failure_cause.reserve(kFailureCapacity);
+  capturing_failure = true;
+  failure_line_start = false;
+  fatal_marker = 0;
+ }
+}
+void TrainProcessClient::State::finish_failure_line() {
+ if (!capturing_failure) return;
+ capturing_failure = false;
+ std::string_view cause = failure_line;
+ constexpr std::string_view envelope = "mmltk rfdetr error: ";
+ if (cause.starts_with(envelope)) cause.remove_prefix(envelope.size());
+ // A generic parent observation adds no cause to a worker's fatal report.
+ const bool generic = cause == "local training exited unsuccessfully" || cause == "distributed training failed";
+ if (!cause.empty() && !(generic && !failure_cause.empty())) failure_cause.assign(cause);
+ failure_line.clear();
+}
 bool TrainProcessClient::State::tracks(const pid_t candidate) const noexcept {
  return std::ranges::any_of(group_members, [candidate](const GroupMember& member) { return member.pid == candidate; });
 }
@@ -281,6 +318,7 @@ std::size_t TrainProcessClient::consume_output(std::string& output, const std::s
    constexpr auto marker = mmltk::backend::models::rfdetr::kTrainingPersistenceFailureLine;
    for (std::size_t index = 0; index < static_cast<std::size_t>(count); ++index) {
     const char byte = bytes[index];
+    state_->consume_failure_byte(byte);
     if (byte == marker[state_->persistence_marker])
      ++state_->persistence_marker;
     else
@@ -389,9 +427,12 @@ std::optional<TrainProcessExit> TrainProcessClient::consume_exit(std::string* re
  while (state_->stdout_fd.get() >= 0) {
   if (!consume_output(output, kTrainProcessReadBudget, retained_output ? kTrainProcessReadBudget : 0)) break;
  }
+ state_->finish_failure_line();
  auto final_progress = read_progress();
  TrainProcessExit exit{.outcome = TrainProcessExitOutcome::Failed, .wait_status = state_->wait_status, .setup_failure = setup.has_value(), .final_progress = std::move(final_progress), .error = {}};
- if (setup) exit.error = bounded_error(mmltk::frameworks::process::format_child_setup_failure(*setup, "local training"));
+ exit.exit_code = WIFEXITED(state_->wait_status) ? WEXITSTATUS(state_->wait_status) : 128 + WTERMSIG(state_->wait_status);
+ exit.signal_number = WIFSIGNALED(state_->wait_status) ? WTERMSIG(state_->wait_status) : 0;
+ if (setup) exit.error = bounded_error(mmltk::frameworks::process::format_child_setup_failure(*setup, "local training") + " (exit status " + std::to_string(exit.exit_code) + ")");
  if (setup)
   exit.outcome = TrainProcessExitOutcome::Failed;
  else if (state_->stop_requested)
@@ -400,7 +441,25 @@ std::optional<TrainProcessExit> TrainProcessClient::consume_exit(std::string* re
   exit.outcome = TrainProcessExitOutcome::Succeeded;
  else {
   exit.outcome = TrainProcessExitOutcome::Failed;
-  exit.error = bounded_error("local training exited unsuccessfully");
+  exit.error = "local training " + (exit.signal_number != 0 ? "terminated by signal " + std::to_string(exit.signal_number) : "exited with status " + std::to_string(exit.exit_code));
+  if (!state_->failure_cause.empty()) {
+   std::string_view cause = state_->failure_cause;
+   const bool oom = cause.starts_with("CUDA out of memory");
+   if (oom) {
+    const auto advice = cause.find(" If reserved");
+    if (advice != std::string_view::npos) cause = cause.substr(0, advice);
+   }
+   exit.error += ": ";
+   while (!cause.empty()) {
+    const auto length = mmltk::common::types::utf8_prefix_length(cause);
+    if (length == 0U) { exit.error += '?'; cause.remove_prefix(1U); continue; }
+    const auto byte = static_cast<unsigned char>(cause.front());
+    if (length == 1U && (byte < 32U || byte == 127U)) exit.error += ' ';
+    else exit.error.append(cause.substr(0, length));
+    cause.remove_prefix(length);
+   }
+   if (oom) exit.error += " Reduce batch size or training lanes to lower GPU memory use, then start again.";
+  }
  }
  state_->terminal_consumed = true;
  state_->group = -1;

@@ -32,6 +32,8 @@ enum class TrainProcessExitOutcome : std::uint8_t { Succeeded, Failed, Cancelled
 struct TrainProcessExit final {
  TrainProcessExitOutcome outcome = TrainProcessExitOutcome::Failed;
  std::int32_t wait_status = 0;
+ std::int32_t exit_code = 0;
+ std::int32_t signal_number = 0;
  bool setup_failure = false;
  std::optional<TrainProcessProgress> final_progress;
  std::string error;
@@ -94,6 +96,14 @@ private:
   [[nodiscard]] bool tracks(pid_t candidate) const noexcept;
   void refresh_group_members();
   [[nodiscard]] bool consume_lifecycle();
+  static constexpr std::size_t kFailureCapacity = 3072U;
+  void consume_failure_byte(char byte);
+  void finish_failure_line();
+  std::string failure_line;
+  std::string failure_cause;
+  std::size_t fatal_marker = 0;
+  bool capturing_failure = false;
+  bool failure_line_start = true;
   pid_t pid = -1;
   pid_t group = -1;
   mmltk::common::io::ScopedFd pidfd;

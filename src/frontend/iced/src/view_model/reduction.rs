@@ -1433,11 +1433,18 @@ mod tests {
         training.activity = crate::generated::TrainingActivity::Idle;
         training.local.active = false;
         training.local.terminal.outcome = ComputeOperationOutcome::Failed;
-        training.local.terminal.detail = "local failed".into();
+        let failure = "CUDA out of memory. Tried to allocate 24 MiB; 42 MiB free of 11.62 GiB. Reduce batch size or training lanes.";
+        training.local.terminal.detail = failure.into();
         local.reduce_event(ApplicationEvent::TrainingTrainingChanged(
             crate::generated::TrainingChanged { snapshot: training },
         ));
-        assert_eq!(local.error.as_ref().unwrap().detail, "local failed");
+        assert_eq!(local.error.as_ref().unwrap().title, "Operation failed");
+        assert_eq!(local.error.as_ref().unwrap().detail, failure);
+        let retained = &local.workflow.training.as_ref().unwrap().local;
+        assert_eq!(retained.terminal.detail, failure);
+        assert!(crate::view::workflow::status::compute_status(Some(retained)).contains(failure));
+        assert!(matches!(crate::view::workflow::progress::compute_presentation(Some(retained)),
+            crate::view::workflow::progress::Presentation::Terminal { detail, .. } if detail == failure));
 
         let mut provider = bootstrapped();
         let query = provider

@@ -21,66 +21,7 @@ using ProgressTimePoint = ProgressClock::time_point;
 ProgressClock::duration::rep g_progress_elapsed_ticks = 0;
 ProgressTimePoint test_progress_now() { return ProgressTimePoint{ProgressClock::duration{g_progress_elapsed_ticks}}; }
 void set_progress_now(const std::chrono::milliseconds elapsed) { g_progress_elapsed_ticks = std::chrono::duration_cast<ProgressClock::duration>(elapsed).count(); }
-class ScopedStderrCapture final {
-public:
- ScopedStderrCapture() {
-  std::fflush(stderr);
-  if (::pipe(pipe_fds_.data()) != 0) { throw std::runtime_error("pipe failed: " + std::string{std::strerror(errno)}); }
-  saved_stderr_ = ::dup(STDERR_FILENO);
-  if (saved_stderr_ < 0) {
-   close_pipe();
-   throw std::runtime_error("stderr capture failed: " + std::string{std::strerror(errno)});
-  }
-  if (::dup2(pipe_fds_[1], STDERR_FILENO) < 0) {
-   static_cast<void>(::close(saved_stderr_));
-   saved_stderr_ = -1;
-   close_pipe();
-   throw std::runtime_error("stderr capture failed: " + std::string{std::strerror(errno)});
-  }
-  static_cast<void>(::close(pipe_fds_[1]));
-  pipe_fds_[1] = -1;
- }
- ~ScopedStderrCapture() noexcept {
-  if (finished_) return;
-  try {
-   static_cast<void>(finish());
-  } catch (...) {
-   restore_stderr();
-   close_pipe();
-  }
- }
- ScopedStderrCapture(const ScopedStderrCapture&) = delete;
- ScopedStderrCapture& operator=(const ScopedStderrCapture&) = delete;
- std::string finish() {
-  if (finished_) return output_;
-  std::fflush(stderr);
-  restore_stderr();
-  output_ = mmltk::testsupport::console_output::read_fd(pipe_fds_[0], "read failed: ");
-  static_cast<void>(::close(pipe_fds_[0]));
-  pipe_fds_[0] = -1;
-  finished_ = true;
-  return output_;
- }
-
-private:
- std::array<int, 2U> pipe_fds_{-1, -1};
- int saved_stderr_ = -1;
- bool finished_ = false;
- std::string output_;
- void restore_stderr() noexcept {
-  if (saved_stderr_ < 0) return;
-  static_cast<void>(::dup2(saved_stderr_, STDERR_FILENO));
-  static_cast<void>(::close(saved_stderr_));
-  saved_stderr_ = -1;
- }
- void close_pipe() noexcept {
-  for (int& descriptor : pipe_fds_) {
-   if (descriptor < 0) continue;
-   static_cast<void>(::close(descriptor));
-   descriptor = -1;
-  }
- }
-};
+using mmltk::testsupport::console_output::ScopedStderrCapture;
 std::vector<std::string> normalize_terminal_output(const std::string& output) {
  std::vector<std::string> lines;
  std::string current;
