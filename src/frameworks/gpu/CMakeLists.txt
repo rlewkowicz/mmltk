@@ -71,7 +71,7 @@ mmltk_register_header_isolation(mmltk_frameworks_gpu)
 add_library(mmltk_frameworks_gpu_test_support INTERFACE)
 mmltk_register_public_headers(mmltk_frameworks_gpu_test_support
     BASE_DIRS ${CMAKE_SOURCE_DIR}
-    FILES tests/fake_image_backend.h tests/device_execution_fixture.h)
+    FILES tests/fake_image_backend.h tests/device_execution_fixture.h tests/pinned_host_fault.h)
 target_link_libraries(mmltk_frameworks_gpu_test_support INTERFACE
     mmltk::frameworks::gpu mmltk_test_support)
 

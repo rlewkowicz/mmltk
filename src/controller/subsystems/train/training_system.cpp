@@ -98,6 +98,7 @@ contracts::ComputeTerminal NativeTrainingRuntime::Train(
   throw;
  }
 }
+// CLEANUP-IGNORE: Query and reconciliation share only the provider guard and scoped cancellation; their provider operations and failure policies differ.
 contracts::ProviderQueryResult NativeTrainingRuntime::Query(const contracts::ProviderPreferences& preferences, const std::stop_token stop) {
  if (!config_.provider.valid()) throw contracts::UnavailableError("provider access is unavailable");
  mmltk::common::concurrency::ScopedEventCancellation<services::VastCancellationSource> cancellation{stop};

@@ -294,12 +294,7 @@ public:
       if (!retirement_.admission_open() || !preview_retirement_->admission_open()) throw contracts::UnavailableError("prediction runtime retirement failed");
       const bool initial_runtime = !runtime_;
       if (!runtime_) {
-       try {
-        runtime_ = factory_(configuration);
-       } catch (...) {
-        if (mmltk::frameworks::gpu::is_image_execution_failure(std::current_exception())) construction_failed_ = true;
-        throw;
-       }
+       runtime_ = construct_compute_runtime(factory_, configuration, construction_failed_);
        runtime_configuration_ = configuration;
       }
       if (!runtime_) throw std::runtime_error("prediction runtime factory returned no runtime");

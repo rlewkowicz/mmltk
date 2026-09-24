@@ -16,6 +16,7 @@
 #include "src/frameworks/gpu/image_failure.h"
 import mmltk.backend.models.rfdetr.model_export;
 import mmltk.backend.models.rfdetr.inference.runtime_backend;
+// CLEANUP-IGNORE: Distinct CUDA adapter Pimpl declarations delegate their resource lifetime to CudaSessionRuntimeState.
 namespace mmltk::controller {
 class CudaExportRuntime::Impl final : public detail::CudaSessionRuntimeState<mmltk::backend::models::rfdetr::ExportOnnxSession> {
 public:
@@ -84,12 +85,7 @@ public:
        if (retirement_failed_) throw contracts::UnavailableError("compute CUDA retirement is unproved");
       }
       if (!runtime_) {
-       try {
-        runtime_ = factory_(configuration);
-       } catch (...) {
-        if (mmltk::frameworks::gpu::is_image_execution_failure(std::current_exception())) retirement_failed_ = true;
-        throw;
-       }
+       runtime_ = construct_compute_runtime(factory_, configuration, retirement_failed_);
        runtime_configuration_ = configuration;
       }
       if (!runtime_) throw std::runtime_error("compute runtime is unavailable");

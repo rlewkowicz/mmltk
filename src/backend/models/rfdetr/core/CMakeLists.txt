@@ -182,6 +182,7 @@ function(mmltk_add_backend_models_rfdetr_core_tests)
         FILES ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/class_artifact_fixture.h)
     target_link_libraries(mmltk_backend_models_rfdetr_class_artifact_test_support PUBLIC
         mmltk::backend::models::rfdetr::core
+        mmltk::backend::models::rfdetr::contract
         mmltk::common::io
         Catch2::Catch2
         PRIVATE ONNX::onnx "${Protobuf_LIBRARY}")

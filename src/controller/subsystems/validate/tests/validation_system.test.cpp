@@ -24,12 +24,29 @@
 #include <limits>
 #include <cmath>
 using namespace mmltk::controller::test_support;
+namespace {
+void check_validation_png_pixels(const std::filesystem::path& path) {
+ int width = 0, height = 0, channels = 0;
+ std::unique_ptr<stbi_uc, decltype(&stbi_image_free)> pixels(stbi_load(path.c_str(), &width, &height, &channels, 4), stbi_image_free);
+ REQUIRE(pixels);
+ CHECK(width == 32);
+ CHECK(height == 24);
+ CHECK(pixels.get()[0] == 64U);
+}
+}  // namespace
 namespace mmltk::controller {
 namespace {
 template <class Predicate>
 void await_validation(std::mutex& mutex, std::condition_variable& changed, Predicate predicate) {
  std::unique_lock lock(mutex);
  REQUIRE(changed.wait_for(lock, std::chrono::seconds(20), predicate));
+}
+auto borrow_validation_frame(detail::ValidationSamples& samples) {
+ auto image = samples.BorrowFrame();
+ REQUIRE(image.valid());
+ auto metadata = samples.ImageSnapshot(samples.snapshot().frame);
+ REQUIRE(metadata);
+ return std::pair{std::move(image), std::move(metadata)};
 }
 std::array<std::uint8_t, 4U> validation_tile_pixel(const mmltk::frameworks::gpu::BorrowedImageProductReadView& image, VisualRegion crop) {
  const auto& read = image.plane(0U);
@@ -490,10 +507,7 @@ TEST_CASE("validation preview generations settle to retained source custody with
   CHECK(samples.snapshot().sample_available[0]);
   CHECK(samples.snapshot().sample_available[1]);
  }
- auto image = samples.BorrowFrame();
- REQUIRE(image.valid());
- const auto metadata = samples.ImageSnapshot(samples.snapshot().frame);
- REQUIRE(metadata);
+ auto [image, metadata] = borrow_validation_frame(samples);
  const auto& sample = metadata->samples[metadata->samples[0].available ? 0U : 1U];
  CHECK(validation_tile_pixel(image, sample.crop) == (restored ? std::array<std::uint8_t, 4U>{255U, 0U, 0U, 255U} : std::array<std::uint8_t, 4U>{0U, 255U, 0U, 255U}));
  image = {};
@@ -514,10 +528,7 @@ TEST_CASE("validation preview generations settle to retained source custody with
    const auto state = samples.snapshot();
    return !state.detail && state.sample_identities[replacement ? 1U : 0U].generation == (replacement ? 2U : 1U);
   });
-  auto closed = samples.BorrowFrame();
-  REQUIRE(closed.valid());
-  const auto closed_metadata = samples.ImageSnapshot(samples.snapshot().frame);
-  REQUIRE(closed_metadata);
+  auto [closed, closed_metadata] = borrow_validation_frame(samples);
   for (const auto& tile : std::span(closed_metadata->samples).first(2)) {
    CHECK(tile.identity.generation == (replacement ? 2U : 1U));
    CHECK(validation_tile_pixel(closed, tile.crop) == (replacement ? std::array<std::uint8_t, 4U>{0U, 255U, 0U, 255U} : std::array<std::uint8_t, 4U>{255U, 0U, 0U, 255U}));
@@ -1139,14 +1150,7 @@ TEST_CASE("headless validation receivers follow selected execution while graphic
  REQUIRE(published.size() == 3U);
  CHECK(retained.front()->receiver_device() == first.device);
  CHECK(retained.front()->classes().front() == "sample");
- for (const auto& path : published) {
-  int width = 0, height = 0, channels = 0;
-  std::unique_ptr<stbi_uc, decltype(&stbi_image_free)> pixels(stbi_load(path.c_str(), &width, &height, &channels, 4), stbi_image_free);
-  REQUIRE(pixels);
-  CHECK(width == 32);
-  CHECK(height == 24);
-  CHECK(pixels.get()[0] == 64U);
- }
+ for (const auto& path : published) { check_validation_png_pixels(path); }
  retained.clear();
 }
 TEST_CASE("validation receiver authority survives group replacement and late borrowed release", "[controller][validation][gpu][custody]") {
@@ -1396,12 +1400,7 @@ public:
 void check_validation_sample(const std::filesystem::path& path) {
  CHECK(path.filename() == "sample-7.png");
  CHECK_FALSE(std::filesystem::exists(path.string() + ".partial"));
- int width = 0, height = 0, channels = 0;
- std::unique_ptr<stbi_uc, decltype(&stbi_image_free)> pixels(stbi_load(path.c_str(), &width, &height, &channels, 4), stbi_image_free);
- REQUIRE(pixels);
- CHECK(width == 32);
- CHECK(height == 24);
- CHECK(pixels.get()[0] == 64U);
+ check_validation_png_pixels(path);
 }
 }  // namespace
 TEST_CASE("validation public Stop and Shutdown settle an engaged PNG before terminal output facts", "[controller][validation][gpu][output]") {

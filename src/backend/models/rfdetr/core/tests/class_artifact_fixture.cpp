@@ -6,6 +6,22 @@
 #include <vector>
 namespace mmltk::backend::models::rfdetr::test_support {
 namespace rfdetr = mmltk::backend::models::rfdetr;
+PredictRequest prediction_image_fixture(const std::filesystem::path& directory) {
+ PredictRequest request;
+ request.onnx_path = directory / "rf-detr-nano.onnx";
+ write_prediction_model(request.onnx_path);
+ const auto image = directory / "sample.ppm";
+ {
+  std::ofstream file(image, std::ios::binary);
+  file << "P6\n2 2\n255\n" << std::string(12, char{64});
+ }
+ request.source_kind = PredictSourceKind::ImageFiles;
+ request.image_inputs.push_back({image, "sample", 1});
+ request.resolution = 8;
+ request.allow_fp16 = false;
+ request.max_dets_per_image = 2;
+ return request;
+}
 void write_prediction_model(const std::filesystem::path& path, std::int64_t queries, bool include_masks, std::optional<ModelClassLayout> layout) {
  namespace onnx = mmltk_onnx;
  onnx::ModelProto model;

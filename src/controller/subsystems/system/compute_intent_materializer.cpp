@@ -114,6 +114,7 @@ std::expected<mmltk::backend::models::rfdetr::TrainRequest, ComputeIntentMateria
   if ((*training)->class_names != (*test)->class_names) return std::unexpected(refused("training and test class order differs"));
   request.test_compiled_path = (*test)->path;
  }
+ // CLEANUP-IGNORE: This Train validator/return and the following Validation declaration resemble an unrelated Export/Predict boundary.
  try {
   mmltk::backend::models::rfdetr::validate_train_request(request);
  } catch (const std::exception& error) { return std::unexpected(refused(error.what())); }

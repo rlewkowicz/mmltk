@@ -190,6 +190,31 @@ impl<'a, Message: 'a> Regions<'a, Message> {
         }
     }
 
+    /// Add Output and GPU above this workflow's status card.
+    pub fn with_run_cards(
+        mut self,
+        model: &'a crate::view_model::ApplicationModel,
+        settings: &'a crate::view::settings::SettingsModel,
+        output: Element<'a, Message>,
+        gpu_message: impl Fn(gpu::Message) -> Message + 'a,
+    ) -> Self {
+        let status_id = match self.page {
+            crate::generated::FeatureId::Train => "train.card.status",
+            crate::generated::FeatureId::Validate => "validate.card.status",
+            crate::generated::FeatureId::Predict => "predict.card.status",
+            crate::generated::FeatureId::Export => "export.card.status",
+            _ => unreachable!("this workflow does not select an execution GPU"),
+        };
+        self.diagnostics = iced::widget::column![
+            output,
+            gpu::view(self.page, model, settings).map(gpu_message),
+            crate::view::shared::identified(status_id, self.diagnostics),
+        ]
+        .spacing(SECTION_SPACING)
+        .into();
+        self
+    }
+
     pub fn render(self, page_width: f32) -> Element<'a, Message> {
         view(page_width, self)
     }

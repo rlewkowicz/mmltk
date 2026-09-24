@@ -390,19 +390,13 @@ impl Component {
             setup,
             workspace,
             advanced,
-            column![
-                output::view(model, settings, self.metrics.omitted_summaries())
-                    .map(Message::Output),
-                crate::view::workflow::gpu::view(
-                    crate::generated::FeatureId::Train,
-                    model,
-                    settings
-                )
-                .map(Message::Gpu),
-                crate::view::shared::identified("train.card.status", diagnostics)
-            ]
-            .spacing(crate::view::workflow::SECTION_SPACING)
-            .into(),
+            diagnostics,
+        )
+        .with_run_cards(
+            model,
+            settings,
+            output::view(model, settings, self.metrics.omitted_summaries()).map(Message::Output),
+            Message::Gpu,
         )
         .render(width)
     }

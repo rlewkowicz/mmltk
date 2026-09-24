@@ -1,3 +1,4 @@
+#include "src/frameworks/gpu/tests/pinned_host_fault.h"
 #include "src/backend/ml/torch/tests/catch_support.h"
 #include "src/backend/models/rfdetr/core/tests/class_artifact_fixture.h"
 #include "src/test_support/cuda_test_utils.hpp"
@@ -635,40 +636,11 @@ TEST_CASE("prediction close releases batch counts and readbacks while borrowed t
  namespace gpu = mmltk::frameworks::gpu;
  const int failure = GENERATE(0, 1, 2, 3, 4);
  const mmltk::testsupport::ScopedTempDir root("prediction-complete-close");
- write_prediction_model(root.path() / "rf-detr-nano.onnx");
- const auto image = root.path() / "sample.ppm";
- {
-  std::ofstream file(image, std::ios::binary);
-  file << "P6\n2 2\n255\n" << std::string(12, char{64});
- }
+ const auto request = rfdetr::test_support::prediction_image_fixture(root.path());
  const PredictionStream stream_scope{true};
- rfdetr::PredictRequest request;
- request.onnx_path = root.path() / "rf-detr-nano.onnx";
- request.source_kind = rfdetr::PredictSourceKind::ImageFiles;
- request.image_inputs.push_back({image, "sample", 1});
- request.resolution = 8;
- request.allow_fp16 = false;
- request.max_dets_per_image = 2;
- struct Fault {
-  bool armed = false;
-  unsigned calls = 0;
-  int failure = 0;
-  unsigned restores = 0;
- } fault{false, 0U, failure};
+ gpu::test_support::PinnedHostFault fault({.unregister_call = failure ? std::optional<unsigned>{failure == 4 ? 0U : static_cast<unsigned>(failure)} : std::nullopt, .restore = failure == 3});
  auto retirement = std::make_shared<gpu::TerminalCudaRetirementOwner>(20U);
- const gpu::PinnedHostBuffer::Operations operations{
-  .context = {&fault, [](void*, CUcontext* value) noexcept { return cuCtxGetCurrent(value); },
-   [](void* value, CUcontext context) noexcept {
-    auto& state = *static_cast<Fault*>(value);
-    return state.armed && state.failure == 3 && ++state.restores == 2U ? CUDA_ERROR_CONTEXT_IS_DESTROYED : cuCtxSetCurrent(context);
-   }},
-  .unregister =
-   [](void* value, void* address) {
-    auto& state = *static_cast<Fault*>(value);
-    if (state.armed && (++state.calls == static_cast<unsigned>(state.failure) || state.failure == 4)) return CUDA_ERROR_UNKNOWN;
-    return cuMemHostUnregister(address);
-   },
- };
+ const auto operations = fault.operations();
  rfdetr::PredictionSession session;
  std::shared_ptr<void> borrowed;
  const rfdetr::PredictionDelivery delivery{
@@ -688,7 +660,7 @@ TEST_CASE("prediction close releases batch counts and readbacks while borrowed t
   CHECK(session.Run(request, stream, delivery).processed_images == 1U);
   CHECK(retirement->fact().reservations == reservations);
  }
- fault.armed = failure != 4;
+ fault.Arm(failure != 4);
  const auto status = session.Close();
  if (failure == 0 || failure == 4) {
   CHECK(status == mmltk::backend::ml::runtime::kRuntimeSuccess);
@@ -696,16 +668,16 @@ TEST_CASE("prediction close releases batch counts and readbacks while borrowed t
   CHECK(session.Close() == mmltk::backend::ml::runtime::kRuntimeSuccess);
   if (failure == 4) {
    REQUIRE(borrowed);
-   fault.armed = true;
+   fault.Arm();
    borrowed.reset();
    CHECK(session.HasUnsafeCustody());
   }
  } else {
   CHECK(status != mmltk::backend::ml::runtime::kRuntimeSuccess);
   CHECK(session.HasUnsafeCustody());
-  const auto calls = fault.calls;
+  const auto calls = fault.unregisters();
   CHECK(session.Close() != mmltk::backend::ml::runtime::kRuntimeSuccess);
-  CHECK(fault.calls == calls);
+  CHECK(fault.unregisters() == calls);
  }
  CHECK(retirement->admission_open() == (failure == 0));
  if (failure != 0) CHECK_THROWS(session.Run(request, stream, delivery));

@@ -3,9 +3,12 @@
 #include <functional>
 #include <optional>
 #include <memory>
+#include <atomic>
+#include <exception>
 #include "src/common/system/execution_policy.h"
 #include "src/controller/contracts/compute.h"
 #include "src/frameworks/gpu/device_execution.h"
+#include "src/frameworks/gpu/image_failure.h"
 namespace mmltk::controller {
 struct DirectComputeConfiguration final {
  std::optional<mmltk::frameworks::gpu::DeviceExecution> execution{};
@@ -18,6 +21,18 @@ struct DirectComputeConfiguration final {
 using DirectComputeResolver = std::function<DirectComputeConfiguration(int device, int numa_node)>;
 using ComputeArtifactSink = std::function<void(const std::filesystem::path&)>;
 using ComputeProgressSink = std::function<void(const contracts::ComputeProgress&)>;
+// Construction can fail after acquiring resources but before returning an
+// object. Preserve that terminal custody decision alongside the owning system.
+template <class Runtime>
+[[nodiscard]] std::unique_ptr<Runtime> construct_compute_runtime(
+ const std::function<std::unique_ptr<Runtime>(DirectComputeConfiguration)>& factory, const DirectComputeConfiguration& configuration, std::atomic_bool& unsafe) {
+ try {
+  return factory(configuration);
+ } catch (...) {
+  if (mmltk::frameworks::gpu::is_image_execution_failure(std::current_exception())) unsafe = true;
+  throw;
+ }
+}
 // Failed work and device replacement share the same physical retirement rule.
 // Close must finish settlement, session/stream release and caller restoration.
 // False preserves the exact runtime and tells its system to seal admission.

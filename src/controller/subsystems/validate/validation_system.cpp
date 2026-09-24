@@ -167,12 +167,7 @@ public:
       }
       if (sample_output_.HasUnsafeCustody()) throw contracts::UnavailableError("validation output CUDA custody is unproved");
       if (!runtime_) {
-       try {
-        runtime_ = factory_(configuration);
-       } catch (...) {
-        if (mmltk::frameworks::gpu::is_image_execution_failure(std::current_exception())) retirement_failed_ = true;
-        throw;
-       }
+       runtime_ = construct_compute_runtime(factory_, configuration, retirement_failed_);
        runtime_configuration_ = configuration;
       }
       if (!runtime_) throw std::runtime_error("compute runtime is unavailable");
