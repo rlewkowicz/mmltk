@@ -994,7 +994,7 @@ test('workflow gallery proof requires a ready tile, exact receipt and image pixe
     f.sampling.raster = raster;
     browser.mmltkIntegrationReceipt(control, 'gallery-proof', 7, 11);
     browser.mmltkIntegrationWorkflowPixels(control, [0, 0, 100, 80], false, false,
-      7, 11, -1, 0, [], (...values) => outcomes.push(values), tile);
+      7, 11, -1, 0, [], (...values) => outcomes.push(values), tile, [], false);
     if (stale) browser.mmltkIntegrationReceipt(control, 'replaced-gallery', 8, 12);
     f.flushFrames();
     return outcomes.at(-1)[0];
@@ -1043,7 +1043,7 @@ function captionRaster(stage, broken = false) {
 function workflowCaption(fixture, stage, results, patches = captionPatch, caseIndex = 6) {
   browser.mmltkIntegrationReceipt(validationWorkspace, `caption-geometry-${stage}`, 7 + stage, 11 + stage);
   browser.mmltkIntegrationWorkflowPixels(validationWorkspace, [0, 0, 100, 80], false, false,
-    7 + stage, 11 + stage, stage, caseIndex, patches, (...values) => results.push(values), []);
+    7 + stage, 11 + stage, stage, caseIndex, patches, (...values) => results.push(values), [], [], false);
   fixture.flushFrames();
 }
 
@@ -1077,7 +1077,7 @@ test('workflow caption probes keep invalidation and disabled execution independe
   const f = canvasFixture(t, true), results = [];
   browser.mmltkIntegrationReceipt(validationWorkspace, 'before', 7, 11);
   browser.mmltkIntegrationWorkflowPixels(validationWorkspace, [0, 0, 100, 80], false, false,
-    7, 11, 1, 6, captionPatch, (...values) => results.push(values), []);
+    7, 11, 1, 6, captionPatch, (...values) => results.push(values), [], [], false);
   browser.mmltkIntegrationReceipt(validationWorkspace, 'after', 8, 12);
   f.flushFrames();
   assert.deepEqual(results, [['invalidated', 0, 0]]);
@@ -1085,7 +1085,7 @@ test('workflow caption probes keep invalidation and disabled execution independe
   browser.mmltkIntegrationInitialize(false);
   browser.mmltkIntegrationWorkflowPixels(validationWorkspace, [0, 0, 100, 80], false, false,
     8, 12, 1, 6, { [Symbol.iterator]() { throw new Error('disabled caption collection'); } },
-    (...values) => results.push(values), []);
+    (...values) => results.push(values), [], [], false);
   assert.equal(f.allocations.reads, 0);
   assert.equal(f.frames.length, 0);
 });

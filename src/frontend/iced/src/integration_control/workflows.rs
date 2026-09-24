@@ -571,6 +571,44 @@ mod tests {
     }
 
     #[test]
+    fn validation_waits_report_only_actual_enabled_operation_progress() {
+        for enabled in [false, true] {
+            let mut fixture = crate::integration_control::ProbeFixture::new("workflows");
+            let capture = super::reporting::Capture::new(enabled);
+            let controller = &mut fixture.controller;
+            let mut model = crate::view_model::test_support::bootstrapped();
+            for (step, sequence) in [
+                (Step::Validating, 1),
+                (Step::Validating, 2),
+                (Step::ProgressiveSettling, 3),
+                (Step::ProgressiveSettling, 4),
+            ] {
+                controller.driver.phase = Phase::Workflows(step);
+                let operation = &mut model.workflow.validation.as_mut().unwrap().operation;
+                operation.active = true;
+                operation.generationfrontier = 7;
+                operation.progress.sequence = sequence;
+                for _ in 0..2 {
+                    advance_workflow(controller, &model, step, FeatureId::Validate);
+                }
+                let records = capture.records();
+                let progress: Vec<_> = records
+                    .iter()
+                    .filter(|record| record.0 == "integration.workflow.operation_progress")
+                    .collect();
+                assert_eq!(progress.len(), usize::from(enabled));
+                if enabled {
+                    assert_eq!(progress[0].2, format!("{step:?}"));
+                    assert_eq!(progress[0].3, [7.0, sequence as f64, 0.0, 0.0]);
+                } else {
+                    assert!(records.is_empty());
+                    assert_eq!(controller.workflows.work_progress, None);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn logical_sample_readiness_waits_for_a_paired_graphics_receipt() {
         for step in [Step::Validating, Step::ProgressiveOpen(0)] {
             let mut fixture = crate::integration_control::ProbeFixture::new("workflows");
@@ -1629,7 +1667,9 @@ impl State {
                 Step::Training | Step::HiddenTrain | Step::Trained => {
                     train.map(|value| (FeatureId::Train, &value.local))
                 }
-                Step::Validating => validation.map(|value| (FeatureId::Validate, &value.operation)),
+                Step::Validating | Step::ProgressiveSettling => {
+                    validation.map(|value| (FeatureId::Validate, &value.operation))
+                }
                 Step::Predicting(_)
                 | Step::WithoutMediaRunning(_)
                 | Step::VideoEnd

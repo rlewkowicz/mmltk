@@ -272,7 +272,7 @@ public:
   if (request_revision_ == std::numeric_limits<std::uint64_t>::max()) throw contracts::FailedError("validation composition revision exhausted");
   ++request_revision_;
   dirty_ = render_requested_ = true;
-  retry_remaining_ = 1U;
+  attempts_remaining_ = 2U;
  }
  void Select(ValidationSampleIdentity identity) {
   {
@@ -284,7 +284,7 @@ public:
    // An active different generation must not replace the selected incumbent
    // with a partial population when detail closes. Same-run capture remains
    // reachable through current_; settled useful atlases remain in atlas.
-   if (current_ && !settled_success_ && current_->generation != identity.generation) requested_.atlas = displayed_;
+   if (current_ && !settled_success_ && current_->generation != identity.generation) requested_.atlas = rollback_.atlas;
    requested_.detail = identity;
    if (rollback_.atlas && rollback_.atlas->generation == identity.generation) {
     rollback_.detail = identity;
@@ -297,8 +297,10 @@ public:
  void CloseDetail() {
   {
    std::scoped_lock lock(mutex_);
-   if (!requested_.detail) return;
-   if (current_ && current_->generation == requested_.detail->generation) requested_.atlas = current_;
+   // A pending close remains admitted through output waits and both draw
+   // attempts. Only exhausted ordinary refusal permits an explicit retry.
+   if (!requested_.detail && (!dirty_ || !image_.detail || attempts_remaining_ != 0U)) return;
+   if (current_ && requested_.detail && current_->generation == requested_.detail->generation) requested_.atlas = current_;
    requested_.detail.reset();
    requested_.detail_atlas.reset();
    rollback_.detail.reset();
@@ -444,14 +446,17 @@ public:
    {
     std::scoped_lock lock(mutex_);
     if ((attempt == 0U || attempt == request_revision_) && dirty_) {
-     retry = retry_remaining_ != 0U;
-     retry_remaining_ = 0U;
+     if (attempts_remaining_ != 0U) --attempts_remaining_;
+     retry = attempts_remaining_ != 0U;
      render_requested_ = retry;
      if (!retry) {
       SelectOverlays(image_.overlays);
-      // A refused preview is not a successful replacement.
+      // Selection and layout changes reuse the displayed population even
+      // when the selected image has its own clean revision. Only newly
+      // captured population content can reject the current replacement.
       const auto& failed_set = requested_.detail ? requested_.detail_atlas : requested_.atlas;
-      if (current_ && failed_set && failed_set->generation == current_->generation) {
+      const bool replacement = failed_set && (!displayed_ || failed_set->clean_revision != displayed_->clean_revision);
+      if (current_ && failed_set && failed_set->generation == current_->generation && replacement) {
        RestoreIncumbent();
        retry = true;
       }
@@ -505,7 +510,7 @@ public:
  std::uint64_t content_frontier_ = 0U, clean_frontier_ = 0U;
  PredictionPreviewComposition preparation_;
  std::uint64_t request_revision_ = 0U;
- unsigned retry_remaining_ = 0U;
+ unsigned attempts_remaining_ = 0U;
  bool dirty_ = false, render_requested_ = false, settled_success_ = false;
  VisualRuntimeOwner worker_;
 };

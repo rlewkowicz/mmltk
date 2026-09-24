@@ -195,22 +195,60 @@ TEST_CASE("validation retains the limited sample atlas and selects detail withou
  await_validation(mutex, changed, [&] { return samples.snapshot().detail; });
  auto detail_reader = samples.BorrowFrame();
  REQUIRE(detail_reader.valid());
- const auto first_detail = samples.snapshot();
  const auto close_progressive = [&] {
+  const auto closing = samples.snapshot();
   samples.CloseDetail();
-  CHECK(samples.snapshot().frame == first_detail.frame);  // Both physical outputs are still borrowed.
+  CHECK(samples.snapshot().frame == closing.frame);  // Both physical outputs are still borrowed.
   first_atlas_reader = {};
   await_validation(mutex, changed, [&] { return !samples.snapshot().detail; });
   detail_reader = {};
  };
  if (close_stage == 0U) close_progressive();
  for (const auto index : selected_indices.subspan(1)) capture_initial(index);
- if (close_stage == 2U) samples.Settle(7U, true);
+ if (close_stage == 2U) {
+  samples.Settle(7U, true);
+  // Refuse both automatic attempts after settlement, while the displayed
+  // detail still has the first capture's immutable membership.
+  first_atlas_reader = {};
+  const auto applied = samples.snapshot();
+  const auto refuse_edit = [&](auto edit) {
+   std::size_t target = 0U;
+   {
+    std::scoped_lock lock(mutex);
+    target = notifications + 2U;
+   }
+   const auto semantic_writes = fault.semantic_writes.load();
+   fault.partial_semantic = true;
+   edit();
+   await_validation(mutex, changed, [&] { return notifications >= target; });
+   CHECK(fault.semantic_writes == semantic_writes + 2U);
+   CHECK(samples.snapshot().frame == applied.frame);
+   CHECK(samples.snapshot().document == applied.document);
+   REQUIRE(samples.ImageSnapshot(applied.frame));
+   CHECK(samples.ImageSnapshot(applied.frame)->display.confidence_threshold == 0.4F);
+   CHECK(samples.snapshot().overlays == applied.overlays);
+  };
+  refuse_edit([&] { samples.SetOverlays({false, false, false, false}); });
+  CHECK(samples.snapshot().overlay_selection.value == applied.overlays);
+  refuse_edit([&] { samples.SetDisplay({0.437F}); });
+  fault.partial_semantic = false;
+  samples.SetDisplay({0.437F});  // Explicit retry requires no new Capture.
+  await_validation(mutex, changed, [&] { return samples.snapshot().frame.revision > applied.frame.revision; });
+  CHECK(samples.ImageSnapshot(samples.snapshot().frame)->display.confidence_threshold == 0.437F);
+  first_atlas_reader = std::move(detail_reader);
+  detail_reader = samples.BorrowFrame();
+  REQUIRE(detail_reader.valid());
+ }
  if (close_stage != 0U) close_progressive();
  await_validation(mutex, changed, [&] {
   const auto snapshot = samples.snapshot();
   return std::cmp_equal(std::count(snapshot.sample_available.begin(), snapshot.sample_available.end(), true), sample_count);
  });
+ if (close_stage == 2U) {
+  const auto revision = samples.snapshot().frame.revision;
+  samples.SetDisplay({0.4F});
+  await_validation(mutex, changed, [&] { return samples.snapshot().frame.revision > revision; });
+ }
  const auto atlas = samples.snapshot();
  const auto check_retained_atlas = [&] {
   const auto current = samples.snapshot();
@@ -394,8 +432,10 @@ TEST_CASE("validation preview generations settle to retained source custody with
   samples.Capture(generation, {record, {.chw = source.pixels(), .width = 2U, .height = 2U, .device = 0, .custody = source.custody()}, source.annotations(), {}});
  };
  capture(1U, 3U);
+ capture(1U, 7U);
  samples.Settle(1U, true);
- await_validation(mutex, changed, [&] { return samples.snapshot().sample_available[0]; });
+ await_validation(mutex, changed, [&] { return samples.snapshot().sample_available[0] && samples.snapshot().sample_available[1]; });
+ const auto original_atlas = samples.snapshot();
  if (detail_open) {
   samples.Select({1U, 3U});
   await_validation(mutex, changed, [&] { return samples.snapshot().detail; });
@@ -409,7 +449,11 @@ TEST_CASE("validation preview generations settle to retained source custody with
  samples.Begin(1U, indices);  // A stale selection callback cannot restart an older generation.
  capture(1U, 7U);             // A stale producer cannot fill the new set's matching slot.
  capture(2U, 7U);
- if (!detail_open) await_validation(mutex, changed, [&] { return samples.snapshot().sample_identities[1].generation == 2U; });
+ capture(2U, 3U);
+ if (!detail_open) await_validation(mutex, changed, [&] {
+  const auto state = samples.snapshot();
+  return state.sample_identities[1].generation == 2U && state.sample_available[0] && state.sample_available[1];
+ });
  const auto preview = samples.snapshot();
  if (!detail_open) CHECK(preview.frame.clean_revision != incumbent.frame.clean_revision);
  samples.Settle(1U, false);  // A stale terminal cannot roll back this generation.
@@ -442,7 +486,7 @@ TEST_CASE("validation preview generations settle to retained source custody with
   await_validation(mutex, changed, [&] { return samples.snapshot().frame.revision > preview.frame.revision; });
   CHECK(samples.snapshot().frame.clean_revision == preview.frame.clean_revision);
   CHECK(samples.snapshot().sample_identities[1].generation == 2U);
-  CHECK_FALSE(samples.snapshot().sample_available[0]);
+  CHECK(samples.snapshot().sample_available[0]);
   CHECK(samples.snapshot().sample_available[1]);
  }
  auto image = samples.BorrowFrame();
@@ -455,8 +499,14 @@ TEST_CASE("validation preview generations settle to retained source custody with
  if (detail_open) {
   // A successful newer set survives another Begin while incumbent detail is
   // still open; unsuccessful/stale work cannot discard that retained atlas.
+  const auto next_outcome = GENERATE(contracts::ComputeOperationOutcome::Succeeded, contracts::ComputeOperationOutcome::Failed, contracts::ComputeOperationOutcome::Cancelled);
   samples.Begin(3U, indices);
   samples.Settle(2U, false);
+  samples.Select({1U, 7U});  // Navigating frozen A must not demote retained B.
+  await_validation(mutex, changed, [&] { return samples.snapshot().selected == ValidationSampleIdentity{1U, 7U}; });
+  auto old_detail = samples.BorrowFrame();
+  REQUIRE(old_detail.valid());
+  capture(3U, 3U);
   samples.CloseDetail();
   const bool replacement = !refuse && outcome == contracts::ComputeOperationOutcome::Succeeded;
   await_validation(mutex, changed, [&] {
@@ -467,10 +517,191 @@ TEST_CASE("validation preview generations settle to retained source custody with
   REQUIRE(closed.valid());
   const auto closed_metadata = samples.ImageSnapshot(samples.snapshot().frame);
   REQUIRE(closed_metadata);
-  const auto& crop = closed_metadata->samples[replacement ? 1U : 0U].crop;
-  CHECK(validation_tile_pixel(closed, crop) == (replacement ? std::array<std::uint8_t, 4U>{0U, 255U, 0U, 255U} : std::array<std::uint8_t, 4U>{255U, 0U, 0U, 255U}));
-  samples.Settle(3U, false);
+  for (const auto& tile : std::span(closed_metadata->samples).first(2)) {
+   CHECK(tile.identity.generation == (replacement ? 2U : 1U));
+   CHECK(validation_tile_pixel(closed, tile.crop) == (replacement ? std::array<std::uint8_t, 4U>{0U, 255U, 0U, 255U} : std::array<std::uint8_t, 4U>{255U, 0U, 0U, 255U}));
+  }
+  const auto returned = samples.snapshot();
+  CHECK(std::ranges::all_of(std::span(returned.sample_available).first(2), [](bool available) { return available; }));
+  if (replacement)
+   CHECK(returned.frame.clean_revision != original_atlas.frame.clean_revision);
+  else
+   CHECK(returned.frame.clean_revision == original_atlas.frame.clean_revision);
+  closed = {};
+  old_detail = {};
+  const auto generation = replacement ? 2U : 1U;
+  samples.Select({generation, 7U});
+  await_validation(mutex, changed, [&] { return samples.snapshot().detail; });
+  {
+   auto document = samples.BorrowDocument(samples.snapshot().frame);
+   REQUIRE(document.valid());
+   CHECK(document.document->scene.frame_index == 7U);
+   CHECK(document.document->scene.categories[0].value == (replacement ? "replacement" : "retained"));
+  }
+  samples.Settle(3U, next_outcome == contracts::ComputeOperationOutcome::Succeeded);
+  samples.CloseDetail();
+  await_validation(mutex, changed, [&] { return !samples.snapshot().detail; });
+  const auto final = samples.snapshot();
+  if (next_outcome == contracts::ComputeOperationOutcome::Succeeded) {
+   CHECK(final.sample_identities[0].generation == 3U);
+   CHECK(final.sample_available[0]);
+   CHECK_FALSE(final.sample_available[1]);
+  } else {
+   CHECK(final.content_identity == returned.content_identity);
+   CHECK(final.frame.clean_revision == returned.frame.clean_revision);
+   CHECK(final.sample_available == returned.sample_available);
+   CHECK(final.sample_identities == returned.sample_identities);
+  }
  }
+ samples.Shutdown();
+}
+TEST_CASE("validation presentation refusals preserve settled populations and explicit retry", "[controller][gpu][validation]") {
+ namespace gpu = mmltk::frameworks::gpu;
+ namespace rfdetr = mmltk::backend::models::rfdetr;
+ const bool navigate = GENERATE(false, true);
+ const auto execution = gpu::resolve_device_execution(0, mmltk::common::system::NumaTopology::Capture());
+ std::mutex mutex;
+ std::condition_variable changed;
+ std::size_t notifications = 0U;
+ PredictionReceiverFault fault;
+ ScopedPredictionReceiverFault receiver(fault);
+ static std::atomic<mmltk::testsupport::TestGate*> pending_draw = nullptr;
+ mmltk::testsupport::TestGate draw_gate("validation close composition");
+ auto operations = PredictionReceiverFault::Operations();
+ operations.clear_semantic = +[](void* destination, std::size_t pitch, int value, std::size_t width, std::size_t height, cudaStream_t stream) {
+  if (auto* gate = pending_draw.exchange(nullptr)) gate->receipt().ArriveAndWait();
+  return PredictionReceiverFault::Operations().clear_semantic(destination, pitch, value, width, height, stream);
+ };
+ detail::ValidationSamples samples({.device = 0, .maximum_width = 512U, .maximum_height = 576U}, [&] {
+  std::scoped_lock lock(mutex);
+  ++notifications;
+  changed.notify_all();
+ }, operations);
+ mmltk::testsupport::ScopedTestCleanup release([&] {
+  pending_draw = nullptr;
+  draw_gate.Release();
+ });
+ const std::array<std::uint32_t, 2U> indices{3U, 7U};
+ const auto classes = std::make_shared<const mmltk::backend::data::catalog::ClassCatalog>(std::vector<std::string>{"retained"});
+ const std::array<float, 12U> red{1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0};
+ auto source = PredictionSource::Device(execution, {2U, 2U}, red, {}, classes);
+ const auto capture = [&](std::uint64_t generation) {
+  for (const auto index : indices) {
+   const rfdetr::PredictionRecord record{.dataset_index = index};
+   samples.Capture(generation, {record, {.chw = source.pixels(), .width = 2U, .height = 2U, .device = 0, .custody = source.custody()}, source.annotations(), {}});
+  }
+ };
+ samples.Begin(1U, indices);
+ capture(1U);
+ samples.Settle(1U, true);
+ await_validation(mutex, changed, [&] { return samples.snapshot().sample_available[0] && samples.snapshot().sample_available[1]; });
+ samples.Begin(2U, indices);
+ capture(2U);
+ await_validation(mutex, changed, [&] {
+  const auto state = samples.snapshot();
+  return state.sample_identities[0].generation == 2U && state.sample_available[0] && state.sample_available[1];
+ });
+ const auto population = samples.snapshot();
+ auto atlas_reader = samples.BorrowFrame();
+ REQUIRE(atlas_reader.valid());
+ samples.Select({2U, 3U});
+ await_validation(mutex, changed, [&] { return samples.snapshot().detail; });
+ samples.Settle(2U, true);
+ const auto applied = samples.snapshot();
+ auto detail_reader = samples.BorrowFrame();
+ REQUIRE(detail_reader.valid());
+ const auto request = [&] {
+  if (navigate) samples.Select({2U, 7U});
+  else samples.CloseDetail();
+ };
+ std::size_t target = 0U;
+ {
+  std::scoped_lock lock(mutex);
+  target = notifications + 2U;
+ }
+ fault.partial_semantic = true;
+ // Hold both physical outputs while composing the presentation request. The
+ // changed confidence forces semantic work without introducing raw content.
+ samples.SetDisplay({0.437F});
+ request();
+ CHECK(samples.snapshot().frame == applied.frame);
+ atlas_reader = {};
+ await_validation(mutex, changed, [&] { return notifications >= target; });
+ CHECK(samples.snapshot().frame == applied.frame);
+ CHECK(samples.snapshot().selected == applied.selected);
+ CHECK(samples.snapshot().document == applied.document);
+ REQUIRE(samples.ImageSnapshot(applied.frame));
+ CHECK(samples.ImageSnapshot(applied.frame)->display.confidence_threshold == 0.4F);
+ fault.partial_semantic = false;
+ request();  // Selection and CloseDetail both explicitly retry refused draws.
+ await_validation(mutex, changed, [&] { return samples.snapshot().frame.revision > applied.frame.revision; });
+ detail_reader = {};
+ if (navigate) {
+  auto document = samples.BorrowDocument(samples.snapshot().frame);
+  REQUIRE(document.valid());
+  CHECK(document.document->scene.frame_index == 7U);
+  CHECK(document.document->scene.categories[0].value == "retained");
+  CHECK(samples.snapshot().selected == ValidationSampleIdentity{2U, 7U});
+  document = {};
+  samples.CloseDetail();
+  await_validation(mutex, changed, [&] { return !samples.snapshot().detail; });
+ }
+ // One close must survive duplicate intents while outputs are borrowed
+ // and while its actual semantic composition is executing.
+ atlas_reader = samples.BorrowFrame();
+ REQUIRE(atlas_reader.valid());
+ samples.Select({2U, 3U});
+ await_validation(mutex, changed, [&] { return samples.snapshot().detail; });
+ detail_reader = samples.BorrowFrame();
+ REQUIRE(detail_reader.valid());
+ const auto before_close = samples.snapshot();
+ const auto writes_before_close = fault.semantic_writes.load();
+ pending_draw = &draw_gate;
+ samples.SetDisplay({0.75F});
+ samples.CloseDetail();
+ samples.CloseDetail();
+ samples.CloseDetail();
+ CHECK(samples.snapshot().frame == before_close.frame);
+ CHECK(fault.semantic_writes == writes_before_close);
+ atlas_reader = {};
+ REQUIRE(draw_gate.WaitEntered(std::chrono::seconds(20)));
+ samples.CloseDetail();
+ samples.CloseDetail();
+ CHECK(samples.snapshot().frame == before_close.frame);
+ draw_gate.Release();
+ await_validation(mutex, changed, [&] { return !samples.snapshot().detail; });
+ // Each published composition consumes one product revision, including a
+ // superseded candidate: this exact successor proves no discarded redraw.
+ CHECK(samples.snapshot().frame.revision == before_close.frame.revision + 1U);
+ CHECK(fault.semantic_writes == writes_before_close + indices.size());
+ detail_reader = {};
+ const auto restored = samples.snapshot();
+ CHECK_FALSE(restored.detail);
+ CHECK(restored.content_identity == population.content_identity);
+ CHECK(restored.frame.clean_revision == population.frame.clean_revision);
+ CHECK(restored.sample_identities == population.sample_identities);
+ CHECK(restored.sample_available == population.sample_available);
+ {
+  const auto metadata = samples.ImageSnapshot(restored.frame);
+  REQUIRE(metadata);
+  auto image = samples.BorrowFrame();
+  REQUIRE(image.valid());
+  for (const auto& tile : std::span(metadata->samples).first(2))
+   CHECK(validation_tile_pixel(image, tile.crop) == std::array<std::uint8_t, 4U>{255U, 0U, 0U, 255U});
+ }
+ // A genuinely new raw population still rolls back after both refused draws.
+ samples.Begin(3U, indices);
+ fault.partial_draw = true;
+ capture(3U);
+ await_validation(mutex, changed, [&] {
+  const auto state = samples.snapshot();
+  return state.frame.revision > restored.frame.revision && state.sample_identities == restored.sample_identities;
+ });
+ CHECK(samples.snapshot().frame.clean_revision == restored.frame.clean_revision);
+ CHECK(samples.snapshot().sample_available == restored.sample_available);
+ fault.partial_draw = false;
+ samples.Settle(3U, true);
+ CHECK(samples.snapshot().sample_identities == restored.sample_identities);
  samples.Shutdown();
 }
 TEST_CASE("Validation documents preserve off-box empty and missing masks through crop and upscale", "[controller][gpu][validation]") {
