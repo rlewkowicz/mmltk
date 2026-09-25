@@ -92,20 +92,20 @@ void save_snapshot_checkpoint(const std::filesystem::path& path, const NativeChe
 }
 void save_resume_checkpoint(const std::filesystem::path& checkpoint_path, const NativeCheckpointMetadata& metadata, const NativeOptimizer& optimizer, const GradScaler& grad_scaler,
  const TrainRequest& options, int epoch, double best_regular, double best_ema, int64_t ema_completed_updates, const std::vector<NormalizedModelStateEntry>& model_state,
- const std::vector<NormalizedModelStateEntry>& ema_state, std::string_view attempt_id, const std::filesystem::path& original_descriptor, torch_cuda::TensorReadbackBuffers& readback) {
+ const std::vector<NormalizedModelStateEntry>& ema_state, std::string_view attempt_id, const std::filesystem::path& original_descriptor, torch_cuda::TensorReadbackBuffers& readback, detail::TrainingContinuationValues continuation) {
  mmltk::common::logging::ScopedProfile profile_rfdetr_train_save_resume_total{"rfdetr.train.save.resume.total"};
  std::filesystem::create_directories(checkpoint_path.parent_path());
  torch::serialize::OutputArchive archive;
  detail::write_native_checkpoint_metadata(archive, metadata);
- detail::write_training_continuation(archive, options,
-  {.epoch = epoch,
-   .best_regular_metric = best_regular,
-   .best_ema_metric = best_ema,
-   .grad_scaler_scale = static_cast<double>(grad_scaler.current_scale()),
-   .grad_scaler_growth_tracker = grad_scaler.growth_tracker(),
-   .ema_completed_updates = ema_completed_updates,
-   .training_attempt_id = std::string(attempt_id),
-   .training_original_descriptor = original_descriptor.string()});
+ continuation.epoch = epoch;
+ continuation.best_regular_metric = best_regular;
+ continuation.best_ema_metric = best_ema;
+ continuation.grad_scaler_scale = static_cast<double>(grad_scaler.current_scale());
+ continuation.grad_scaler_growth_tracker = grad_scaler.growth_tracker();
+ continuation.ema_completed_updates = ema_completed_updates;
+ continuation.training_attempt_id = std::string(attempt_id);
+ continuation.training_original_descriptor = original_descriptor.string();
+ detail::write_training_continuation(archive, options, continuation);
  optimizer.reserve_checkpoint(readback, model_state.size() + ema_state.size());
  {
   mmltk::common::logging::ScopedProfile profile_rfdetr_train_save_resume_write_state{"rfdetr.train.save.resume.write_state"};
@@ -135,12 +135,12 @@ ResumeState load_resume_checkpoint_state(const std::filesystem::path& checkpoint
  if (!retained || !admitted.class_artifact) throw std::invalid_argument("full resume requires an admitted current native archive");
  admitted.class_artifact->RequireUnchanged();
  auto& archive = *retained;
- if (cli_enum_spelling(continuation.configuration.optimizer) != optimizer.kind_name())
+ if (cli_enum_spelling(continuation.configuration.recipe.optimizer) != optimizer.kind_name())
   throw std::runtime_error("native RF-DETR resume checkpoint optimizer_kind does not match current training options");
  if (parameter_names.size() != parameters.size()) throw std::runtime_error("native RF-DETR active optimizer parameter inventory is inconsistent");
  ResumeState state;
  state.attempt_id = continuation.values.training_attempt_id;
- state.start_epoch = static_cast<int>(continuation.values.epoch + 1);
+ state.start_epoch = static_cast<int>(continuation.values.data.epoch);
  state.best_regular = continuation.values.best_regular_metric;
  state.best_ema = continuation.values.best_ema_metric;
  if (continuation.configuration.use_ema) {
@@ -179,8 +179,8 @@ void TrainingSnapshot::save_weights(const std::filesystem::path& path, const Nat
  save_snapshot_checkpoint(path, metadata, ordinary_, selected ? ema_ : no_ema, readback_, descriptor);
 }
 void TrainingSnapshot::save_resume(const std::filesystem::path& path, const NativeCheckpointMetadata& metadata, const NativeOptimizer& optimizer, const GradScaler& scaler, const TrainRequest& options,
- int epoch, double best_regular, double best_ema, int64_t ema_completed_updates, std::string_view attempt_id, const std::filesystem::path& descriptor) {
- save_resume_checkpoint(path, metadata, optimizer, scaler, options, epoch, best_regular, best_ema, ema_completed_updates, ordinary_, ema_, attempt_id, descriptor, readback_);
+ int epoch, double best_regular, double best_ema, int64_t ema_completed_updates, std::string_view attempt_id, const std::filesystem::path& descriptor, const detail::TrainingContinuationValues& continuation) {
+ save_resume_checkpoint(path, metadata, optimizer, scaler, options, epoch, best_regular, best_ema, ema_completed_updates, ordinary_, ema_, attempt_id, descriptor, readback_, continuation);
 }
 void TrainingSnapshot::release() {
  readback_.Release();

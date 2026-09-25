@@ -1,6 +1,8 @@
 #pragma once
 #include <algorithm>
 #include <array>
+#include <bit>
+#include "src/common/math/deterministic_sampling.h"
 #include <span>
 #include "augmentation_plan.h"
 namespace mmltk::backend::models::rfdetr {
@@ -36,4 +38,36 @@ struct AugmentationAnnotationSupport {
  };
 }
 [[nodiscard]] inline float augmentation_box_area(const std::array<float, 4>& box) noexcept { return std::max(0.0F, box[2] - box[0]) * std::max(0.0F, box[3] - box[1]); }
+struct AugmentationMappedInstance {
+ std::array<float, 4> source_box_xyxy{};
+ std::array<float, 4> output_box_xyxy{};
+ std::array<float, 4> mask_bounds{};
+ float source_area_pixels = 0.0F;
+ float output_area = 0.0F;
+ bool visible = false;
+};
+[[nodiscard]] inline AugmentationMappedInstance map_augmentation_instance(
+ const mmltk::backend::data::PackedInstance& instance, int image_width, int image_height, const AugmentationImagePlan* plan, std::span<const mmltk::backend::data::RLEPair> mask = {}) {
+ const float inverse_width = 1.0F / static_cast<float>(image_width);
+ const float inverse_height = 1.0F / static_cast<float>(image_height);
+ AugmentationMappedInstance mapped;
+ mapped.source_box_xyxy = {
+  static_cast<float>(instance.bbox_x1) * inverse_width,
+  static_cast<float>(instance.bbox_y1) * inverse_height,
+  static_cast<float>(instance.bbox_x2) * inverse_width,
+  static_cast<float>(instance.bbox_y2) * inverse_height,
+ };
+ mapped.source_area_pixels = augmentation_box_area(mapped.source_box_xyxy) * static_cast<float>(image_width) * static_cast<float>(image_height);
+ const auto support = resolve_augmentation_annotation_support(mapped.source_box_xyxy, mask, image_width, image_height, plan, false, instance.has_mask());
+ mapped.output_box_xyxy = support.box_xyxy;
+ mapped.mask_bounds = support.mask_bounds;
+ mapped.output_area = support.area_pixels;
+ mapped.visible = support.present;
+ return mapped;
+}
+[[nodiscard]] inline bool augmentation_reservoir_select(float choice, std::int64_t candidates, std::int64_t ordinal) {
+ if (candidates <= 1) return true;
+ const auto key = static_cast<std::uint64_t>(std::bit_cast<std::uint32_t>(choice));
+ return mmltk::common::math::deterministic_mix64(key ^ (static_cast<std::uint64_t>(ordinal) * 0xd2b74407b1ce6e93ULL)) % static_cast<std::uint64_t>(candidates) == 0;
+}
 }  // namespace mmltk::backend::models::rfdetr

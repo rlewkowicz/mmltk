@@ -81,6 +81,11 @@ mmltk_register_header_isolation(mmltk_controller_data_compute_systems)
 
 function(mmltk_add_controller_subsystems_system_tests)
     find_package(Vulkan REQUIRED)
+    add_executable(mmltk_train_request_fixture EXCLUDE_FROM_ALL)
+    mmltk_configure_component(mmltk_train_request_fixture PRIVATE_DECLARATIONS)
+    mmltk_register_ordinary_sources(mmltk_train_request_fixture
+        ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/train_request_fixture.cpp)
+    target_link_libraries(mmltk_train_request_fixture PRIVATE mmltk::backend::models::rfdetr::contract)
     add_executable(mmltk_controller_data_compute_systems_tests EXCLUDE_FROM_ALL)
     mmltk_register_ordinary_sources(
         mmltk_controller_data_compute_systems_tests
@@ -122,6 +127,9 @@ function(mmltk_add_controller_subsystems_system_tests)
         mmltk_frameworks_gpu_hardware_test_support)
     mmltk_link_declarations(mmltk_controller_data_compute_systems_tests PRIVATE
         mmltk::backend::ml::runtime)
+    add_dependencies(mmltk_controller_data_compute_systems_tests mmltk_train_request_fixture)
+    target_compile_definitions(mmltk_controller_data_compute_systems_tests PRIVATE
+        MMLTK_TRAIN_REQUEST_FIXTURE="$<TARGET_FILE:mmltk_train_request_fixture>")
     mmltk_register_header_isolation(mmltk_controller_data_compute_systems_tests)
     catch_discover_tests(
         mmltk_controller_data_compute_systems_tests

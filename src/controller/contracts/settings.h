@@ -21,6 +21,10 @@ struct SettingsUiState final {
  [[= mmltk::frameworks::reflection::MaxItems{mmltk::frameworks::gpu::kCudaDeviceCapacity}]] std::vector<mmltk::frameworks::gpu::CudaDeviceFact> cuda_devices{};
  std::uint64_t revision = 0U;
  GuiSettingsState settings_state{};
+ mmltk::backend::models::rfdetr::ExecutionFacts train_execution;
+ mmltk::backend::models::rfdetr::ExecutionFacts training_validation_execution;
+ mmltk::backend::models::rfdetr::ExecutionFacts validation_execution;
+ mmltk::backend::models::rfdetr::ExecutionFacts prediction_execution;
  ExploreSourceFact explore_source{};
  [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]] std::string validation_source;
  bool operator==(const SettingsUiState&) const = default;

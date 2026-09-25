@@ -496,7 +496,7 @@ mod route_tests {
                 crate::generated::edit_currentview(draft, FeatureId::Export)
             })
             .unwrap();
-        assert!(app.settings.state_mut().take_request().is_some());
+        assert!(app.settings.state_mut().take_request(false).is_some());
         let correlation = app
             .model
             .begin_intent(ApplicationIntentEndpoint::SettingsUpdate)
@@ -1747,7 +1747,7 @@ mod tests {
                 crate::generated::edit_workflowsexploregridwidth(draft, 5)
             })
             .unwrap();
-        assert!(success.settings.state_mut().take_request().is_some());
+        assert!(success.settings.state_mut().take_request(false).is_some());
         let draft_request = ExploreViewportUpdate {
             viewport: success
                 .workspace
@@ -1775,7 +1775,7 @@ mod tests {
                 crate::generated::edit_workflowsexploregridwidth(draft, 5)
             })
             .unwrap();
-        assert!(rejected.settings.state_mut().take_request().is_some());
+        assert!(rejected.settings.state_mut().take_request(false).is_some());
         let draft_request = ExploreViewportUpdate {
             viewport: rejected
                 .workspace

@@ -22,6 +22,7 @@ mmltk_register_public_headers(
         model_config.h
         preset_catalog.h
         prediction_limits.h
+        execution_plan.h
         train_recipe.h
         training_supervision.h
         weight_catalog.h
@@ -30,6 +31,7 @@ mmltk_register_ordinary_sources(
     mmltk_backend_models_rfdetr_contract
     model_config.cpp
     weight_catalog.cpp
+    execution_plan.cpp
     workflow_requests.cpp
 )
 target_link_libraries(mmltk_backend_models_rfdetr_contract
@@ -38,7 +40,9 @@ target_link_libraries(mmltk_backend_models_rfdetr_contract
         mmltk::backend::data::catalog
         mmltk::frameworks::reflection
     PRIVATE
+        mmltk::frameworks::serialization
         mmltk::common::types
+        mmltk::common::math
 )
 
 mmltk_link_declarations(mmltk_backend_models_rfdetr_contract PUBLIC

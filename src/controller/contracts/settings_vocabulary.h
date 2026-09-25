@@ -1,5 +1,6 @@
 #pragma once
 #include <array>
+#include "src/backend/models/rfdetr/contract/execution_plan.h"
 #include <concepts>
 #include <cstddef>
 #include <filesystem>
@@ -37,7 +38,7 @@ struct is_array<std::array<T, Size>> : std::true_type {
 template <class T>
 inline constexpr bool is_leaf_v = [] {
  using U = std::remove_cvref_t<T>;
- return std::is_arithmetic_v<U> || std::is_enum_v<U> || std::same_as<U, std::string> || std::same_as<U, std::string_view> || std::same_as<U, std::filesystem::path> || is_optional<U>::value ||
+ return std::same_as<U, mmltk::backend::models::rfdetr::TrainLaneConfiguration> || std::is_arithmetic_v<U> || std::is_enum_v<U> || std::same_as<U, std::string> || std::same_as<U, std::string_view> || std::same_as<U, std::filesystem::path> || is_optional<U>::value ||
         is_vector<U>::value || is_array<U>::value;
 }();
 // Storage aggregates may contain leaf-shaped runtime values (for example a

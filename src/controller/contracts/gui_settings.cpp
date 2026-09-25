@@ -17,6 +17,7 @@
 #include "src/controller/contracts/view_state.h"
 #include "src/controller/contracts/workflows.h"
 #include "src/frameworks/reflection/reflected_field_policy.h"
+#include "src/frameworks/serialization/reflected_json.h"
 #include "src/frameworks/serialization/serialization.h"
 import mmltk.common.logging.mmltk_logging;
 namespace mmltk::controller::contracts {
@@ -124,7 +125,10 @@ struct JsonFieldWriter {
  nlohmann::json& json;
  template <typename T>
  void operator()(const char* key, const T& value) const {
-  if constexpr (std::is_enum_v<T>) {
+  if constexpr (std::same_as<T, mmltk::backend::models::rfdetr::TrainRecipeSettings> || std::same_as<T, mmltk::backend::models::rfdetr::TrainLaneConfiguration> || std::same_as<T, mmltk::backend::models::rfdetr::TrainDataPolicy>) {
+   std::array<std::byte, mmltk::backend::models::rfdetr::kMaximumTrainRequestJsonBytes> scratch;
+   json[key] = mmltk::frameworks::serialization::reflected_json(value, scratch, {.max_bytes = scratch.size(), .max_items = 4096, .max_depth = 32});
+  } else if constexpr (std::is_enum_v<T>) {
    json[key] = static_cast<int>(value);
   } else {
    json[key] = value;
@@ -144,11 +148,28 @@ struct JsonFieldWriter {
   json[key] = std::move(child);
  }
 };
+void apply_known_json_fields(nlohmann::json& destination, const nlohmann::json& patch) {
+ if (!patch.is_object()) throw std::runtime_error("settings record must be an object");
+ for (auto& [key, value] : destination.items()) {
+  const auto found = patch.find(key);
+  if (found == patch.end()) continue;
+  if (value.is_object()) apply_known_json_fields(value, *found);
+  else value = *found;
+ }
+}
 struct JsonFieldReader {
  const nlohmann::json& json;
  template <typename T>
  void operator()(const char* key, T& value) const {
-  if constexpr (std::is_same_v<T, mmltk::backend::data::BenchmarkDatasetVariant> || std::is_same_v<T, mmltk::backend::data::CoconutValidation>) {
+  if constexpr (std::same_as<T, mmltk::backend::models::rfdetr::TrainRecipeSettings> || std::same_as<T, mmltk::backend::models::rfdetr::TrainLaneConfiguration> || std::same_as<T, mmltk::backend::models::rfdetr::TrainDataPolicy>) {
+   const auto found = json.find(key);
+   if (found != json.end()) {
+    std::array<std::byte, mmltk::backend::models::rfdetr::kMaximumTrainRequestJsonBytes> scratch;
+    auto candidate = mmltk::frameworks::serialization::reflected_json(value, scratch, {.max_bytes = scratch.size(), .max_items = 4096, .max_depth = 32});
+    apply_known_json_fields(candidate, *found);
+    value = mmltk::frameworks::serialization::decode_reflected_json<T>(candidate.dump(), {.max_bytes = scratch.size(), .max_items = 4096, .max_depth = 32});
+   }
+  } else if constexpr (std::is_same_v<T, mmltk::backend::data::BenchmarkDatasetVariant> || std::is_same_v<T, mmltk::backend::data::CoconutValidation>) {
    auto index = static_cast<std::underlying_type_t<T>>(value);
    get_optional(json, key, index);
    value = static_cast<T>(index);
@@ -286,35 +307,14 @@ constexpr auto validate_dataset_fields = [](auto& request, const auto& visit) {
  visit("source_dir", request.source_dir);
 };
 constexpr auto train_execution_target_fields = [](auto& state, const auto& visit) { visit_record_fields<TrainExecutionPaneState>(state, visit); };
-// Recipe scalars persisted under the same JSON keys by both the train pane and the per-preset recipe
-// overrides. Both visitors below delegate here so the key/member pairs cannot drift apart.
-constexpr auto recipe_scalar_fields = [](auto& state, const auto& visit) {
- visit("lr", state.lr);
- visit("lr_encoder", state.lr_encoder);
- visit("lr_component_decay", state.lr_component_decay);
- visit("encoder_layer_decay", state.encoder_layer_decay);
- visit("momentum", state.momentum);
- visit("weight_decay", state.weight_decay);
- visit("warmup_epochs", state.warmup_epochs);
- visit("warmup_momentum", state.warmup_momentum);
- visit("lr_min_factor", state.lr_min_factor);
-};
-constexpr auto recipe_override_fields = [](auto& overrides, const auto& visit) {
- using Relation = mmltk::frameworks::reflection::catalog_provider_relation<mmltk::backend::models::rfdetr::TrainRecipeCatalog>;
- Relation::VisitMembers([&]<class Entry>() {
-  bool explicit_override = Relation::template overridden<Entry::destination>(overrides);
-  constexpr auto terminal = std::remove_cvref_t<decltype(Entry::destination)>::terminal_member;
-  visit(mmltk::frameworks::reflection::materialized_member_name<terminal>().data(), explicit_override);
-  if constexpr (!std::is_const_v<std::remove_reference_t<decltype(overrides)>>) {
-   if (explicit_override)
-    Relation::template set_override<Entry::destination>(overrides);
-   else
-    Relation::template clear_override<Entry::destination>(overrides);
-  }
- });
-};
 constexpr auto train_training_fields = [](auto& state, const auto& visit) {
  auto& request = state.request;
+ visit("recipe", request.recipe);
+ visit("lane_configuration", request.lane_configuration);
+ visit("data_policy", request.data_policy);
+ visit("validation_lanes", request.validation_lanes);
+ visit("unfreeze_encoder_last_epochs", request.unfreeze_encoder_last_epochs);
+ visit("disable_augmentation_last_epochs", request.disable_augmentation_last_epochs);
  visit("resume_path", request.resume_path);
  visit("batch_size", request.batch_size);
  visit("val_batch_size", request.val_batch_size);
@@ -322,22 +322,18 @@ constexpr auto train_training_fields = [](auto& state, const auto& visit) {
  visit("grad_accum_steps", request.grad_accum_steps);
  visit("num_queries", request.num_queries);
  visit("eval_max_dets", request.eval_max_dets);
- visit("lr_drop", request.lr_drop);
  visit("ema_tau", request.ema_tau);
  visit("print_freq", request.print_freq);
  visit("prefetch_factor", request.prefetch_factor);
  visit("seed", request.seed);
- recipe_scalar_fields(request, visit);
  visit("clip_max_norm", request.clip_max_norm);
  visit("ema_decay", request.ema_decay);
- visit("lr_scheduler", request.lr_scheduler);
  visit("use_ema", request.use_ema);
  visit("validation_loss", request.validation_loss);
  visit("validation_profile", request.validation_profile);
  visit("amp", request.amp);
  visit("freeze_encoder", request.freeze_encoder);
  visit("fused_optimizer", request.fused_optimizer);
- visit("optimizer", request.optimizer);
  visit("distributed_store_path", request.distributed_store_path);
  visit("distributed_rank", request.distributed_rank);
  visit("distributed_world_size", request.distributed_world_size);
@@ -358,7 +354,6 @@ constexpr auto train_training_fields = [](auto& state, const auto& visit) {
    field("size_noise_scale", denoising.size_noise_scale);
   });
  });
- visit.nested("recipe_overrides", request.recipe_overrides, recipe_override_fields);
 };
 constexpr auto augmentation_group_fields = [](auto& group, const auto& visit) {
  visit("probability", Hundredths{group.probability});
@@ -399,7 +394,10 @@ constexpr auto inference_execution_fields = [](auto& request, const auto& visit)
  visit_record_fields<mmltk::backend::models::rfdetr::InferenceExecutionConfig>(
   request, [&](const char* name, auto& field) { visit(std::string_view{name} == "compilation_mode" ? "compile_mode" : name, field); });
 };
-constexpr auto validate_execution_fields = inference_execution_fields;
+constexpr auto validate_execution_fields = [](auto& request, const auto& visit) {
+ inference_execution_fields(request, visit);
+ visit("lanes", request.lanes);
+};
 constexpr auto predict_execution_fields = [](auto& request, const auto& visit) {
  inference_execution_fields(request, visit);
  visit("lanes", request.lanes);
@@ -483,7 +481,7 @@ constexpr auto validation_fields = [](auto& state, const auto& visit) {
  visit("log_mode", state.log_mode);
 };
 constexpr auto validate_flat_fields = [](auto& state, const auto& visit) {
- inference_execution_fields(state, visit);
+ validate_execution_fields(state, visit);
  visit("compiled_path", state.compiled_path);
  visit("source_dir", state.source_dir);
  visit("weights_path", state.weights_path);

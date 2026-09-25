@@ -153,19 +153,29 @@ template <class T>
  return (source.crop_width == 0 || (source.crop_width <= source.capture_width && source.crop_x <= source.capture_width - source.crop_width)) &&
         (source.crop_height == 0 || (source.crop_height <= source.capture_height && source.crop_y <= source.capture_height - source.crop_height));
 }
+template <class Request>
+[[nodiscard]] bool valid_execution_products(const Request& request) noexcept {
+ try {
+  (void)mmltk::backend::models::rfdetr::derive_execution_facts(request, 0);
+  if constexpr (std::same_as<Request, mmltk::backend::models::rfdetr::TrainRequest>)
+   (void)mmltk::backend::models::rfdetr::derive_training_validation_facts(request, 0);
+  return true;
+ } catch (...) { return false; }
+}
 [[nodiscard]] bool valid_train(const TrainViewState& train) noexcept {
  const auto& request = train.request;
+ if (!valid_execution_products(request)) return false;
  const bool valid_distributed = request.distributed_worker ? request.distributed_rank >= 0 && request.distributed_world_size > 1 && !request.distributed_store_path.empty()
                                                            : request.distributed_rank == 0 && request.distributed_world_size == 1 && request.distributed_store_path.empty();
  return !request.device_ids.empty() && request.resolution > 0 && !mmltk::frameworks::reflection::validate_reflected_fields(request) &&
-        mmltk::frameworks::reflection::unique_nonnegative_identifiers(request.device_ids) && mmltk::frameworks::reflection::enum_contains(request.lr_scheduler) &&
+        mmltk::frameworks::reflection::unique_nonnegative_identifiers(request.device_ids) && mmltk::backend::models::rfdetr::train_recipe_valid(request.recipe) &&
         mmltk::backend::models::rfdetr::gpu_augmentation_relationships_valid(request.gpu_augmentation) &&
         mmltk::backend::models::rfdetr::training_supervision_config_valid(request.training_supervision) && valid_distributed;
 }
-[[nodiscard]] bool valid_validate(const ValidateViewState& validate) noexcept { return !mmltk::frameworks::reflection::validate_reflected_fields(validate.request); }
+[[nodiscard]] bool valid_validate(const ValidateViewState& validate) noexcept { return valid_execution_products(validate.request) && !mmltk::frameworks::reflection::validate_reflected_fields(validate.request); }
 [[nodiscard]] bool valid_predict(const PredictViewState& predict) noexcept {
  const auto& request = predict.request;
- return !mmltk::frameworks::reflection::validate_reflected_fields(request) && request.resolution > 0 && request.compiled_path.empty() && request.image_inputs.empty() && predict.live_split_count > 0 &&
+ return valid_execution_products(request) && !mmltk::frameworks::reflection::validate_reflected_fields(request) && request.resolution > 0 && request.compiled_path.empty() && request.image_inputs.empty() && predict.live_split_count > 0 &&
         valid_source(predict.source);
 }
 [[nodiscard]] bool selected_model_artifact_available(const ModelArtifactSelectionState& artifacts) noexcept {
@@ -261,7 +271,7 @@ void apply_output_selections(GuiSettingsState& candidate, const std::span<const 
  });
 }
 }  // namespace
-std::expected<void, SettingsMutationError> apply_gui_settings_values(GuiSettingsState& state, const std::span<const SettingsValueUpdate> updates) {
+std::expected<void, SettingsMutationError> apply_gui_settings_values(GuiSettingsState& state, const std::span<const SettingsValueUpdate> updates, const bool validate) {
  if (updates.empty() || updates.size() > kGuiSettingsMutableLeafCount) { return std::unexpected(SettingsMutationError::InvalidPath); }
  GuiSettingsState candidate = state;
  std::array<std::string_view, kGuiSettingsMutableLeafCount> paths{};
@@ -282,7 +292,7 @@ std::expected<void, SettingsMutationError> apply_gui_settings_values(GuiSettings
  apply_output_selections(candidate, std::span{paths.data(), count});
  apply_compiled_directory_defaults(candidate.workflows.train);
  normalize_canonical_source_transitions(state, candidate);
- if (!valid_settings(candidate)) return std::unexpected(SettingsMutationError::CrossFieldViolation);
+ if (validate && !valid_settings(candidate)) return std::unexpected(SettingsMutationError::CrossFieldViolation);
  state = std::move(candidate);
  return {};
 }

@@ -1,6 +1,7 @@
 #include "src/backend/ml/cuda/torch_cuda_utils.h"
 #include "src/backend/ml/cuda/numa_host_tensor.h"
 #include <algorithm>
+#include <cstring>
 #include <cstdint>
 #include <span>
 #include <stdexcept>
@@ -132,19 +133,77 @@ cudaError_t GpuBatchAugmenter::release_copy_paste_resources() noexcept {
  }
  return cudaSuccess;
 }
-torch::Tensor GpuBatchAugmenter::run(const mmltk::backend::data::Batch& batch, const std::uint64_t seed, const int epoch, const int rank, const std::uint64_t sequence) {
+void GpuBatchAugmenter::materialize_donors(const mmltk::backend::data::DatasetLoader& source, std::span<const TrainingDonorDescriptor> descriptors) {
+ require(descriptors.size() <= static_cast<std::size_t>(batch_capacity_), "logical donor batch exceeds physical capacity");
+ if (!resources_->donor_images_cpu_.defined()) {
+  resources_->donor_images_cpu_ = mmltk::backend::ml::cuda::numa_empty({batch_capacity_, 3, height_, width_}, torch::kFloat32, device_id_);
+  materialized_donors_.resize(static_cast<std::size_t>(batch_capacity_));
+ }
+ const auto stream = current_torch_cuda_stream_object(checked_device_index(device_id_)).stream();
+ // The prior launch may still read this cache on another stream. Retain all
+ // backing allocations and settle only before overwriting cached originals.
+ if (cache_upload_pending_) {
+  CheckSettlement(event_wait_(resources_->cache_upload_complete_), "settle logical donor staging");
+  cache_upload_pending_ = false;
+ }
+ if (batch_run_pending_) throw std::logic_error("logical donor cache changed before batch completion");
+ if (current_batch_size_ > 0) CheckSettlement(cudaStreamWaitEvent(stream, resources_->image_read_complete_, 0), "wait for logical donor readers");
+ const auto image_values = static_cast<std::size_t>(height_) * width_ * 3;
+ bool changed = false;
+ try {
+  for (std::size_t slot = 0; slot < descriptors.size(); ++slot) {
+   const auto& descriptor = descriptors[slot];
+   if (descriptor == materialized_donors_[slot]) continue;
+   changed = true;
+   const auto donor = resolve_training_donor(source, descriptor);
+   donor_metadata_[slot] = donor.metadata;
+   donor_support_[slot].assign(donor.support.begin(), donor.support.end());
+   if (descriptor.valid) {
+    auto* image = resources_->donor_images_cpu_.data_ptr<float>() + slot * image_values;
+    const bool image_changed = !materialized_donors_[slot].valid || materialized_donors_[slot].image_index != descriptor.image_index;
+    if (image_changed) {
+     std::memcpy(image, reinterpret_cast<const std::byte*>(source.pixel_blob()) + descriptor.image_index * source.image_stride(), image_values * sizeof(float));
+     ensure_cuda_ok(cudaMemcpyAsync(resources_->donor_images_.data_ptr<float>() + slot * image_values, image, image_values * sizeof(float), cudaMemcpyHostToDevice, stream), "upload logical donor image");
+    }
+    auto* mask = resources_->donor_masks_cpu_.data_ptr<std::int64_t>() + slot * mask_words_;
+    pack_compiled_rle_pairs(donor.support, {mask, static_cast<std::size_t>(mask_words_)});
+    auto* box = resources_->donor_boxes_cpu_.data_ptr<float>() + slot * 4;
+    std::copy(donor.metadata.box.begin(), donor.metadata.box.end(), box);
+    ensure_cuda_ok(cudaMemcpyAsync(resources_->donor_masks_.data_ptr<std::int64_t>() + slot * mask_words_, mask, mask_words_ * sizeof(std::int64_t), cudaMemcpyHostToDevice, stream), "upload logical donor support");
+    ensure_cuda_ok(cudaMemcpyAsync(resources_->donor_boxes_gpu_.data_ptr<float>() + slot * 4, box, 4 * sizeof(float), cudaMemcpyHostToDevice, stream), "upload logical donor box");
+   }
+   materialized_donors_[slot] = descriptor;
+  }
+  if (changed) {
+   ensure_cuda_ok(cudaEventRecord(resources_->cache_upload_complete_, stream), "record logical donor staging custody");
+   cache_upload_pending_ = true;
+  }
+ } catch (...) {
+  CheckSettlement(stream_wait_(stream), "settle failed logical donor publication");
+  std::fill(materialized_donors_.begin(), materialized_donors_.end(), TrainingDonorDescriptor{});
+  for (auto& donor : donor_metadata_) donor.label = -1;
+  throw;
+ }
+}
+torch::Tensor GpuBatchAugmenter::run(const mmltk::backend::data::Batch& batch, const std::uint64_t seed, const int epoch, const int rank, const std::uint64_t sequence, const mmltk::backend::data::DatasetLoader* source, std::span<const TrainingDonorDescriptor> supplied_donors) {
  RequireActive();
  require(static_cast<std::int64_t>(batch.num_images) <= batch_capacity_, "GPU augmentation batch exceeds preallocated capacity");
  require(batch.num_images == 0U || (batch.device_images != nullptr && batch.image_indices != nullptr), "GPU augmentation requires loader device images and identities");
+ const auto device_index = checked_device_index(device_id_);
+ TorchCudaDeviceGuard device_guard(device_index);
+ const cudaStream_t stream = current_torch_cuda_stream_object(device_index).stream();
+ logical_donors_ = source != nullptr;
+ if (source && executor_->copy_paste_enabled()) {
+  require(supplied_donors.size() == batch.num_images, "logical donors must align with the local image batch");
+  require(source->image_width() == static_cast<std::uint32_t>(width_) && source->image_height() == static_cast<std::uint32_t>(height_), "logical donor source geometry differs");
+  materialize_donors(*source, supplied_donors);
+ }
  current_batch_size_ = static_cast<std::int64_t>(batch.num_images);
  current_epoch_ = epoch;
  current_rank_ = rank;
  current_sequence_ = sequence;
  batch_run_pending_ = false;
  cache_consumer_prepared_ = false;
- const auto device_index = checked_device_index(device_id_);
- TorchCudaDeviceGuard device_guard(device_index);
- const cudaStream_t stream = current_torch_cuda_stream_object(device_index).stream();
  if (cache_ready_pending_) {
   CheckSettlement(cudaStreamWaitEvent(stream, resources_->cache_ready_, 0), "cudaStreamWaitEvent for donor cache readiness");
   cache_ready_pending_ = false;
@@ -166,13 +225,14 @@ torch::Tensor GpuBatchAugmenter::run(const mmltk::backend::data::Batch& batch, c
   .masks = executor_->copy_paste_enabled() && resources_->donor_masks_.defined() ? resources_->donor_masks_.data_ptr<std::int64_t>() : nullptr,
   .boxes = executor_->copy_paste_enabled() ? resources_->donor_boxes_gpu_.data_ptr<float>() : nullptr,
   .mask_words = mask_words_,
-  .selection = GpuAugmentationDonorSelection::Cached,
+  .selection = logical_donors_ ? GpuAugmentationDonorSelection::Aligned : GpuAugmentationDonorSelection::Cached,
   .image_custody = resources_,
   .image_capacity_bytes = tensor_bytes(resources_->donor_images_),
  };
  {
   mmltk::common::logging::ScopedProfile profile_rfdetr_augment_plan{"rfdetr.augment.plan"};
-  batch_plan_ = executor_->RunTraining(raw_batch, seed, epoch, rank, sequence, donor_metadata_, donors, stream, sequence % 2U);
+  batch_plan_ = batch.draw_keys.empty() ? executor_->RunTraining(raw_batch, seed, epoch, rank, sequence, donor_metadata_, donors, stream, sequence % 2U)
+                                      : executor_->Run(raw_batch, batch.draw_keys, donor_metadata_, donors, stream, sequence % 2U);
  }
  for (auto& image : batch_plan_.images) {
   if (image.paste_donor_slot < 0) continue;
@@ -231,7 +291,7 @@ cudaStream_t GpuBatchAugmenter::finish_batch(const mmltk::backend::data::Batch& 
    }
   });
  };
- if (!executor_->copy_paste_enabled() || current_batch_size_ == 0) {
+ if (logical_donors_ || !executor_->copy_paste_enabled() || current_batch_size_ == 0) {
   batch_run_pending_ = false;
   trace_batch_plan();
   return current_stream;
@@ -287,6 +347,7 @@ cudaStream_t GpuBatchAugmenter::finish_batch(const mmltk::backend::data::Batch& 
     metadata.area = plan.cache_source_area;
     metadata.box = plan.cache_source_box;
     metadata.has_mask = instance.has_mask();
+    metadata.sampling_identity = (static_cast<std::uint64_t>(plan.cache_source_dataset_index) << 32) | static_cast<std::uint32_t>(plan.cache_source_ordinal);
    }
   }
   float* donor_boxes = resources_->donor_boxes_cpu_.data_ptr<float>();

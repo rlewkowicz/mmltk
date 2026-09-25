@@ -42,6 +42,8 @@ struct PackedTargetMasks {
  torch::Tensor erasure;
 };
 struct PreparedTargets {
+ torch::Tensor sampling_keys;
+ std::uint64_t microbatch_key = 0;
  std::vector<PreparedTarget> targets;
  torch::Tensor all_image_ids;
  torch::Tensor orig_sizes;
@@ -62,6 +64,7 @@ struct PreparedTargets {
   const auto record = [&stream](const torch::Tensor& tensor) {
    if (tensor.defined() && tensor.device().is_cuda()) { tensor.record_stream(stream); }
   };
+  record(sampling_keys);
   record(all_image_ids);
   record(orig_sizes);
   record(nested_mask);

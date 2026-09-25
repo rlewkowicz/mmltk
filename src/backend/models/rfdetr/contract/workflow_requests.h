@@ -6,6 +6,7 @@
 #include "src/frameworks/reflection/reflected_field_policy.h"
 #include "src/frameworks/reflection/reflection_metadata.h"
 #include <cstddef>
+#include "src/backend/models/rfdetr/contract/execution_plan.h"
 #include <cstdint>
 #include <filesystem>
 #include <string>
@@ -73,7 +74,7 @@ struct PredictRequest : ModelArtifactRequest, InferenceExecutionConfig {
  [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumNameBytes}]] std::string backend = "auto";
  [[= mmltk::frameworks::reflection::Minimum<std::size_t>{1U}]] std::size_t batch_size = 1U;
  [[= mmltk::frameworks::reflection::Minimum<std::size_t>{0U}]][[= mmltk::frameworks::reflection::Maximum<std::size_t>{kMaximumPredictionCandidates}]] std::size_t max_dets_per_image = 500U;
- [[= mmltk::frameworks::reflection::Minimum<int>{0}]] int lanes = 0;
+ [[= mmltk::frameworks::reflection::Minimum<int>{1}]] int lanes = 1;
  [[= mmltk::frameworks::reflection::Minimum<float>{0.0F}]][[= mmltk::frameworks::reflection::Maximum<float>{1.0F}]][[= mmltk::frameworks::reflection::Finite{}]] float threshold = 0.0F;
  std::size_t limit_images = 0U;
  bool include_masks = true;
@@ -85,6 +86,7 @@ enum class ValidationLogMode : std::uint8_t {
 };
 // CLEANUP-IGNORE: Validation and training are distinct canonical requests even where their reflected path fields align.
 struct ValidateRequest : ModelArtifactRequest, InferenceExecutionConfig {
+ [[= mmltk::frameworks::reflection::Minimum<int>{1}]] int lanes = 1;
  // CLEANUP-IGNORE: Distinct canonical path fields share constraints, not duplicated runtime behavior.
  [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]] std::filesystem::path compiled_path;
  [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]] std::filesystem::path source_dir;
@@ -135,15 +137,6 @@ struct GpuAugmentationConfig {
  [[= mmltk::frameworks::reflection::Minimum<float>{kAugmentationScalarMinimum}]][[= mmltk::frameworks::reflection::Maximum<float>{kAugmentationScalarMaximum}]][
   [= mmltk::frameworks::reflection::Finite{}]][[= mmltk::frameworks::reflection::Presentation<mmltk::frameworks::reflection::PresentationKind::UnitInterval>{}]] float copy_paste_probability = 0.80F;
 };
-class[[= mmltk::frameworks::reflection::OpaqueRelationStorage{}]] TrainRecipeOverrideState final {
-public:
- constexpr TrainRecipeOverrideState() noexcept = default;
- constexpr bool operator==(const TrainRecipeOverrideState&) const noexcept = default;
-
-private:
- [[= mmltk::frameworks::reflection::Maximum<std::uint16_t>{std::uint16_t{0x07ffU}}]] std::uint16_t mask = 0U;
- friend struct mmltk::frameworks::reflection::catalog_provider_relation<TrainRecipeCatalog>;
-};
 // CLEANUP-IGNORE: Train is the canonical reflected training request; coincident field shapes remain domain-named.
 struct TrainRequest : mmltk::backend::data::DataLoadingOptions {
  bool operator==(const TrainRequest&) const = default;
@@ -168,20 +161,18 @@ struct TrainRequest : mmltk::backend::data::DataLoadingOptions {
  [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]] std::filesystem::path test_compiled_path;
  [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]] std::filesystem::path distributed_store_path;
  [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumNameBytes}]] std::string cpu_affinity;
- TrainLrSchedulerKind lr_scheduler = TrainLrSchedulerKind::Step;
  [[= mmltk::frameworks::reflection::Minimum<std::size_t>{1U}]] std::size_t batch_size = 1U;
  std::size_t val_batch_size = 0U;
  std::size_t num_queries = 0U;
  std::size_t eval_max_dets = 0U;
  [[= mmltk::frameworks::reflection::Minimum<int>{1}]] int epochs = 1;
  [[= mmltk::frameworks::reflection::Minimum<int>{1}]] int grad_accum_steps = 1;
- [[= mmltk::frameworks::reflection::Minimum<int>{0}]] int lr_drop = 100;
  [[= mmltk::frameworks::reflection::Minimum<int>{1}]] int print_freq = 100;
  [[= mmltk::frameworks::reflection::Minimum<int>{1}]] int prefetch_factor = 2;
  // CLEANUP-IGNORE: Seed and worker settings are separate generated fields despite adjacent scalar defaults.
  int seed = 42;
  [[= mmltk::frameworks::reflection::Minimum<int>{0}]] int workers = 0;
- [[= mmltk::frameworks::reflection::Minimum<int>{0}]] int lanes = 0;
+ [[= mmltk::frameworks::reflection::Minimum<int>{1}]] int lanes = 1;
  [[= mmltk::frameworks::reflection::Minimum<int>{0}]] int resolution = 0;
  [[= mmltk::frameworks::reflection::Minimum<int>{0}]] int device_id = 0;
  [[= mmltk::frameworks::reflection::MaxItems{mmltk::backend::models::rfdetr::kMaximumTrainingDevices}]] std::vector<int> device_ids;
@@ -190,35 +181,20 @@ struct TrainRequest : mmltk::backend::data::DataLoadingOptions {
  // CLEANUP-IGNORE: EMA and optimizer fields retain explicit reflected constraints at their canonical declarations.
  [[= mmltk::frameworks::reflection::Minimum<int>{0}]] int ema_tau = 100;
  [[= mmltk::frameworks::reflection::Minimum<double>{
-  0.0}]][[= mmltk::frameworks::reflection::Finite{}]][[= mmltk::frameworks::reflection::Presentation<mmltk::frameworks::reflection::PresentationKind::LearningRate>{}]] double lr = 1.0e-4;
- [[= mmltk::frameworks::reflection::Minimum<double>{0.0}]][[= mmltk::frameworks::reflection::Finite{}]][[= mmltk::frameworks::reflection::Presentation<
-  // CLEANUP-IGNORE: Each learning-rate field needs an independently addressable generated identity.
-  mmltk::frameworks::reflection::PresentationKind::LearningRate>{}]] double lr_encoder = 1.5e-4;
- [[= mmltk::frameworks::reflection::Minimum<double>{0.0}]][[= mmltk::frameworks::reflection::Maximum<double>{1.0}]][[= mmltk::frameworks::reflection::Finite{}]][
-  [= mmltk::frameworks::reflection::Presentation<mmltk::frameworks::reflection::PresentationKind::Decay>{}]] double lr_component_decay = 0.7;
- [[= mmltk::frameworks::reflection::Minimum<double>{0.0}]][[= mmltk::frameworks::reflection::Maximum<double>{1.0}]][[= mmltk::frameworks::reflection::Finite{}]][
-  [= mmltk::frameworks::reflection::Presentation<mmltk::frameworks::reflection::PresentationKind::Decay>{}]] double encoder_layer_decay = 0.8;
- [[= mmltk::frameworks::reflection::Minimum<double>{0.0}]][[= mmltk::frameworks::reflection::Maximum<double>{1.0}]][[= mmltk::frameworks::reflection::Finite{}]][
-  [= mmltk::frameworks::reflection::Presentation<mmltk::frameworks::reflection::PresentationKind::Decay>{}]] double momentum = 0.95;
- [[= mmltk::frameworks::reflection::Minimum<double>{
-  0.0}]][[= mmltk::frameworks::reflection::Finite{}]][[= mmltk::frameworks::reflection::Presentation<mmltk::frameworks::reflection::PresentationKind::Decay>{}]] double weight_decay = 1.0e-4;
- // CLEANUP-IGNORE: Warmup remains a separate constrained setting rather than an indexed optimizer scalar.
- [[= mmltk::frameworks::reflection::Minimum<double>{0.0}]][[= mmltk::frameworks::reflection::Finite{}]] double warmup_epochs = 0.0;
- [[= mmltk::frameworks::reflection::Minimum<double>{0.0}]][[= mmltk::frameworks::reflection::Maximum<double>{1.0}]][[= mmltk::frameworks::reflection::Finite{}]][
-  [= mmltk::frameworks::reflection::Presentation<mmltk::frameworks::reflection::PresentationKind::Decay>{}]] double warmup_momentum = 0.0;
- [[= mmltk::frameworks::reflection::Minimum<double>{0.0}]][[= mmltk::frameworks::reflection::Maximum<double>{1.0}]][[= mmltk::frameworks::reflection::Finite{}]][
-  [= mmltk::frameworks::reflection::Presentation<mmltk::frameworks::reflection::PresentationKind::Decay>{}]] double lr_min_factor = 0.0;
- [[= mmltk::frameworks::reflection::Minimum<double>{
   0.0}]][[= mmltk::frameworks::reflection::Finite{}]][[= mmltk::frameworks::reflection::Presentation<mmltk::frameworks::reflection::PresentationKind::Norm>{}]] double
   // CLEANUP-IGNORE: Gradient clipping is a nonnegative norm; adjacent optimizer scalars are bounded decay
   // fractions.
   clip_max_norm = 0.1;
  [[= mmltk::frameworks::reflection::Minimum<double>{0.0}]][[= mmltk::frameworks::reflection::Maximum<double>{1.0}]][[= mmltk::frameworks::reflection::Finite{}]][
   [= mmltk::frameworks::reflection::Presentation<mmltk::frameworks::reflection::PresentationKind::Decay>{}]] double ema_decay = 0.993;
- [[= mmltk::frameworks::reflection::CatalogProvider<TrainRecipeCatalog>{}]] TrainOptimizerKind optimizer = TrainOptimizerKind::AdamW;
+ TrainRecipeSettings recipe;
+ TrainLaneConfiguration lane_configuration;
+ TrainDataPolicy data_policy;
+ [[= mmltk::frameworks::reflection::Minimum<int>{1}]] int validation_lanes = 1;
+ [[= mmltk::frameworks::reflection::Minimum<int>{0}]] int unfreeze_encoder_last_epochs = 0;
+ [[= mmltk::frameworks::reflection::Minimum<int>{0}]] int disable_augmentation_last_epochs = 0;
  GpuAugmentationConfig gpu_augmentation;
  TrainingSupervisionConfig training_supervision;
- TrainRecipeOverrideState recipe_overrides;
  bool use_ema = false;
  bool validation_loss = false;
  bool validation_profile = false;
@@ -229,77 +205,10 @@ struct TrainRequest : mmltk::backend::data::DataLoadingOptions {
  bool distributed_worker = false;
  CompilationMode compilation_mode = CompilationMode::kSelective;
 };
-MMLTK_REFLECT_FIELDS(TrainRecipeOverrideState)
+[[nodiscard]] std::string encode_train_request_json(const TrainRequest&);
+[[nodiscard]] TrainRequest decode_train_request_json(std::string_view);
 MMLTK_REFLECT_FIELDS(TrainRequest)
 }  // namespace mmltk::backend::models::rfdetr
-namespace mmltk::frameworks::reflection {
-template <>
-struct catalog_provider_relation<mmltk::backend::models::rfdetr::TrainRecipeCatalog>
-    : StaticMemberRelation<mmltk::backend::models::rfdetr::TrainRecipeCatalogEntry, mmltk::backend::models::rfdetr::TrainRequest, 11U,
-       MemberRelationEntry<member_path<&mmltk::backend::models::rfdetr::TrainRecipeCatalogEntry::lr>, member_path<&mmltk::backend::models::rfdetr::TrainRequest::lr>>,
-       MemberRelationEntry<member_path<&mmltk::backend::models::rfdetr::TrainRecipeCatalogEntry::lr_encoder>, member_path<&mmltk::backend::models::rfdetr::TrainRequest::lr_encoder>>,
-       MemberRelationEntry<member_path<&mmltk::backend::models::rfdetr::TrainRecipeCatalogEntry::lr_component_decay>, member_path<&mmltk::backend::models::rfdetr::TrainRequest::lr_component_decay>>,
-       MemberRelationEntry<member_path<&mmltk::backend::models::rfdetr::TrainRecipeCatalogEntry::encoder_layer_decay>, member_path<&mmltk::backend::models::rfdetr::TrainRequest::encoder_layer_decay>>,
-       MemberRelationEntry<member_path<&mmltk::backend::models::rfdetr::TrainRecipeCatalogEntry::momentum>, member_path<&mmltk::backend::models::rfdetr::TrainRequest::momentum>>,
-       MemberRelationEntry<member_path<&mmltk::backend::models::rfdetr::TrainRecipeCatalogEntry::weight_decay>,
-        member_path<&mmltk::backend::models::rfdetr::TrainRequest::weight_decay>>,  // CLEANUP-IGNORE: Each
-                                                                                    // relation row names a
-                                                                                    // distinct canonical source
-                                                                                    // and destination identity.
-       MemberRelationEntry<member_path<&mmltk::backend::models::rfdetr::TrainRecipeCatalogEntry::warmup_epochs>, member_path<&mmltk::backend::models::rfdetr::TrainRequest::warmup_epochs>>,
-       MemberRelationEntry<member_path<&mmltk::backend::models::rfdetr::TrainRecipeCatalogEntry::warmup_momentum>, member_path<&mmltk::backend::models::rfdetr::TrainRequest::warmup_momentum>>,
-       MemberRelationEntry<member_path<&mmltk::backend::models::rfdetr::TrainRecipeCatalogEntry::lr_min_factor>, member_path<&mmltk::backend::models::rfdetr::TrainRequest::lr_min_factor>>,
-       MemberRelationEntry<member_path<&mmltk::backend::models::rfdetr::TrainRecipeCatalogEntry::lr_drop>, member_path<&mmltk::backend::models::rfdetr::TrainRequest::lr_drop>>,
-       MemberRelationEntry<member_path<&mmltk::backend::models::rfdetr::TrainRecipeCatalogEntry::lr_scheduler>, member_path<&mmltk::backend::models::rfdetr::TrainRequest::lr_scheduler>>> {
- using provider_type = mmltk::backend::models::rfdetr::TrainRecipeCatalog;
- using override_state_type = mmltk::backend::models::rfdetr::TrainRecipeOverrideState;
- inline static constexpr auto source_selector = member_path<&mmltk::backend::models::rfdetr::TrainRecipeCatalogEntry::optimizer>;
- inline static constexpr auto destination_selector = member_path<&mmltk::backend::models::rfdetr::TrainRequest::optimizer>;
- inline static constexpr auto destination_override_state = member_path<&mmltk::backend::models::rfdetr::TrainRequest::recipe_overrides>;
- inline static constexpr std::uint16_t valid_bits = 0x07ffU;
- template <auto Destination>
- [[nodiscard]] static constexpr bool overridden(const override_state_type& state) noexcept {
-  return (state.mask & bit<Destination>()) != 0U;
- }
- template <auto Destination>
- static constexpr void set_override(override_state_type& state) noexcept {
-  state.mask = static_cast<std::uint16_t>(state.mask | bit<Destination>());
- }
- template <auto Destination>
- static constexpr void clear_override(override_state_type& state) noexcept {
-  state.mask = static_cast<std::uint16_t>(state.mask & ~bit<Destination>());
- }
- [[nodiscard]] static consteval bool audit() {
-  if (!valid() || member_count != 11U) return false;
-  if constexpr (!std::same_as<accessor_value_t<source_type, source_selector>, accessor_value_t<destination_type, destination_selector>>) return false;
-  const auto source_selector_identity = accessor_member_identity<source_type, source_selector>();
-  const auto destination_selector_identity = accessor_member_identity<destination_type, destination_selector>();
-  bool selectors_are_not_members = true;
-  std::uint16_t claimed = 0U;
-  VisitMembers([&]<class Entry>() {
-   selectors_are_not_members = selectors_are_not_members && accessor_member_identity<source_type, Entry::source>() != source_selector_identity &&
-                               accessor_member_identity<destination_type, Entry::destination>() != destination_selector_identity;
-   claimed = static_cast<std::uint16_t>(claimed | bit<Entry::destination>());
-  });
-  return selectors_are_not_members && claimed == valid_bits;
- }
-
-private:
- template <auto Destination>
- [[nodiscard]] static consteval std::uint16_t bit() {
-  const auto identity = accessor_member_identity<destination_type, Destination>();
-  std::size_t ordinal = 0U;
-  std::size_t found = member_count;
-  VisitMembers([&]<class Entry>() {
-   if (accessor_member_identity<destination_type, Entry::destination>() == identity) found = ordinal;
-   ++ordinal;
-  });
-  if (found == member_count) throw "destination accessor is not a Train recipe relation member";
-  return static_cast<std::uint16_t>(std::uint16_t{1U} << found);
- }
-};
-static_assert(catalog_provider_relation<mmltk::backend::models::rfdetr::TrainRecipeCatalog>::audit());
-}  // namespace mmltk::frameworks::reflection
 namespace mmltk::backend::models::rfdetr {
 MMLTK_REFLECT_FIELDS(ModelArtifactRequest)
 MMLTK_REFLECT_FIELDS(DeviceExecutionConfig)
@@ -343,13 +252,4 @@ void validate_predict_request(const PredictRequest& request);
 void validate_validate_request(const ValidateRequest& request);
 void validate_train_placement(const TrainRequest& request);
 void validate_train_request(const TrainRequest& request);
-inline void apply_train_recipe(TrainRequest& target, const TrainRecipeCatalogEntry& recipe, const TrainRecipeOverrideState& overrides = {}) {
- using Relation = mmltk::frameworks::reflection::catalog_provider_relation<TrainRecipeCatalog>;
- Relation::VisitMembers([&]<class Entry>() {
-  if (!Relation::template overridden<Entry::destination>(overrides)) {
-   Entry::transform::apply(
-    mmltk::frameworks::reflection::access<TrainRequest, Entry::destination>(target), mmltk::frameworks::reflection::access<const TrainRecipeCatalogEntry, Entry::source>(recipe));
-  }
- });
-}
 }  // namespace mmltk::backend::models::rfdetr

@@ -1,3 +1,4 @@
+#include "src/backend/models/rfdetr/augmentation/annotation_support.h"
 #include "src/backend/models/rfdetr/core/tests/training_fixture.h"
 #include "src/backend/models/rfdetr/core/detail/training_mask_loss.h"
 #include "src/backend/models/rfdetr/contract/training_metrics.h"
@@ -101,10 +102,10 @@ rfdetr::DetectionConfig training_detection_fixture(const rfdetr::NativeRfDetrCon
 }
 rfdetr::TrainRequest gradient_update_request(double learning_rate = 1e-3) {
  rfdetr::TrainRequest request;
- request.optimizer = rfdetr::TrainOptimizerKind::AdamW;
- request.lr = learning_rate;
+ request.recipe.optimizer = rfdetr::TrainOptimizerKind::AdamW;
+ request.recipe.lr = learning_rate;
  // Zero decay separates inactive gradients from legitimate AdamW decay.
- request.weight_decay = 0.0;
+ request.recipe.weight_decay = 0.0;
  return request;
 }
 using TrainingParameters = torch::OrderedDict<std::string, torch::Tensor>;
@@ -1503,7 +1504,7 @@ void test_all_supervision_routes_execute_fixture_backed_training() {
    request.amp = false;
    request.progress_bar = false;
    request.validation_loss = true;
-   request.optimizer = route_index == 0 && lanes == 1 ? rfdetr::TrainOptimizerKind::Muon : rfdetr::TrainOptimizerKind::AdamW;
+   request.recipe.optimizer = route_index == 0 && lanes == 1 ? rfdetr::TrainOptimizerKind::Muon : rfdetr::TrainOptimizerKind::AdamW;
    request.use_ema = route_index == routes.size() - 1 && lanes == 2;
    if ((route_index == 0 && lanes == 1) || request.use_ema) request.test_compiled_path = request.val_compiled_path;
    if (route_index == routes.size() - 1 && lanes == 2) {

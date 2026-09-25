@@ -101,7 +101,7 @@ void test_train_help_lists_training_controls() {
  REQUIRE((result.output_text.find("--optimizer") != std::string::npos));
  REQUIRE((result.output_text.find("--momentum") != std::string::npos));
  REQUIRE((result.output_text.find("--warmup-momentum") != std::string::npos));
- REQUIRE((result.output_text.find("adamw or muon") != std::string::npos));
+ REQUIRE((result.output_text.find("adamw, muon, or sgd") != std::string::npos));
  REQUIRE((result.output_text.find("fused AdamW backend") != std::string::npos));
  REQUIRE((result.output_text.find("AdamW only") != std::string::npos));
  const auto single = result.output_text.find("--device-id");
@@ -236,4 +236,33 @@ TEST_CASE("Native prediction and evaluation retain compilation CLI spellings", "
   REQUIRE(result.exit_code == 0);
   CHECK(result.output_text.find("--compile-mode") != std::string::npos);
  }
+}
+
+TEST_CASE("Training JSON is mutually exclusive bounded and shares scalar recipe admission", "[rfdetr][cli][training]") {
+ for (const auto options : {
+  std::initializer_list<const char*>{"--request-json", "{}", "--epochs", "4"},
+  std::initializer_list<const char*>{"--optimizer", "sgd", "--request-json", "{}"},
+  std::initializer_list<const char*>{"--request-json", "{}", "--no-amp"}}) {
+  const auto result = run_train_options(options);
+  CHECK(result.exit_code == 1);
+  CHECK(result.output_text.find("mutually exclusive") != std::string::npos);
+ }
+ const auto oversized = run_subprocess_capture_output({mmltk_cli_path(), "rfdetr", "train", "--request-json", std::string(65537, ' ')});
+ CHECK(oversized.exit_code == 1);
+ const auto malformed = run_train_options({"--request-json", "{broken"});
+ CHECK(malformed.exit_code == 1);
+ for (const auto scheduler : {"step", "cosine", "ultralytics-linear"}) {
+  const auto parsed = run_train_options({"--optimizer", "sgd", "--lr-scheduler", scheduler, "--warmup-bias-lr", "0.1", "--nesterov"});
+  CHECK(parsed.exit_code == 1);
+  CHECK(parsed.output_text.find("requires --train-compiled") != std::string::npos);
+ }
+ const auto incompatible = run_train_options({"--optimizer", "adamw", "--lr-scheduler", "ultralytics-linear"});
+ CHECK(incompatible.exit_code == 1);
+ CHECK(incompatible.output_text.find("requires --train-compiled") == std::string::npos);
+ const auto invalid = run_train_options({"--optimizer", "sgd", "--momentum", "0", "--nesterov"});
+ CHECK(invalid.exit_code == 1);
+ CHECK(invalid.output_text.find("requires --train-compiled") == std::string::npos);
+ const auto help = run_train_options({"--help"});
+ CHECK(help.output_text.find("--request-json") != std::string::npos);
+ CHECK(help.output_text.find("ultralytics-linear") != std::string::npos);
 }

@@ -45,24 +45,24 @@ namespace {
 [[nodiscard]] bool apply_train_recipe_relation(contracts::GuiSettingsState& candidate, const std::span<const contracts::SettingsValueUpdate> updates) {
  using Relation = mmltk::frameworks::reflection::catalog_provider_relation<mmltk::backend::models::rfdetr::TrainRecipeCatalog>;
  constexpr auto selector = mmltk::frameworks::reflection::member_path<&contracts::GuiSettingsState::workflows, &contracts::WorkflowSettingsState::train, &contracts::TrainViewState::request,
-  &mmltk::backend::models::rfdetr::TrainRequest::optimizer>;
+  &mmltk::backend::models::rfdetr::TrainRequest::recipe, &mmltk::backend::models::rfdetr::TrainRecipeSettings::optimizer>;
  auto& request = candidate.workflows.train.request;
- const auto& recipe = mmltk::backend::models::rfdetr::train_recipe(request.optimizer);
+ const auto& recipe = mmltk::backend::models::rfdetr::train_recipe(request.recipe.optimizer);
  bool valid = true;
  std::array<bool, contracts::kMaxSettingsUpdates> relation_updates{};
  Relation::VisitMembers([&]<class Entry>() {
-  constexpr auto destination = mmltk::frameworks::reflection::rebase_member_path<contracts::GuiSettingsState, mmltk::backend::models::rfdetr::TrainRequest>(selector, Entry::destination);
+  constexpr auto destination = mmltk::frameworks::reflection::rebase_member_path<contracts::GuiSettingsState, mmltk::backend::models::rfdetr::TrainRecipeSettings>(selector, Entry::destination);
   constexpr auto path = mmltk::frameworks::reflection::reflected_member_path<contracts::GuiSettingsState, destination>();
   for (std::size_t update_index = 0U; update_index < updates.size(); ++update_index) {
    const auto& update = updates[update_index];
    if (update.path != path.view()) continue;
    relation_updates[update_index] = true;
    if (flat_value_is_null(update.value)) {
-    Entry::transform::apply(mmltk::frameworks::reflection::access<mmltk::backend::models::rfdetr::TrainRequest, Entry::destination>(request),
+    Entry::transform::apply(mmltk::frameworks::reflection::access<mmltk::backend::models::rfdetr::TrainRecipeSettings, Entry::destination>(request.recipe),
      mmltk::frameworks::reflection::access<const mmltk::backend::models::rfdetr::TrainRecipeCatalogEntry, Entry::source>(recipe));
-    Relation::template clear_override<Entry::destination>(request.recipe_overrides);
+    Relation::template clear_override<Entry::destination>(request.recipe.overrides);
    } else {
-    Relation::template set_override<Entry::destination>(request.recipe_overrides);
+    Relation::template set_override<Entry::destination>(request.recipe.overrides);
    }
   }
  });
@@ -70,6 +70,7 @@ namespace {
   if (flat_value_is_null(updates[index].value) && !relation_updates[index]) valid = false;
   for (std::size_t prior = 0U; prior < index; ++prior) valid = valid && updates[index].path != updates[prior].path;
  }
+ mmltk::backend::models::rfdetr::resolve_train_recipe(request.recipe);
  return valid;
 }
 [[nodiscard]] ExploreFilterPreferences explore_preferences(const contracts::ExploreViewState& explore) {
@@ -166,18 +167,31 @@ services::SettingsMutationResult SettingsSystem::Load(services::SettingsLocation
  return result;
 }
 contracts::SettingsUiState SettingsSystem::Update(contracts::SettingsUpdateRequest request) {
- if (request.updates.empty()) throw contracts::InvalidIntentError("invalid settings update");
+ if (request.updates.empty() && !request.lane_configuration) throw contracts::InvalidIntentError("invalid settings update");
  services::SettingsMutationResult result;
  {
   std::scoped_lock mutation_lock(mutation_mutex_);
   auto candidate = mutation_candidate();
+  if (request.lane_configuration) {
+   const auto& previous = candidate.workflows.train.request.lane_configuration;
+   const auto& replacement = *request.lane_configuration;
+   if (mmltk::frameworks::reflection::validate_reflected_fields(replacement)) throw contracts::InvalidIntentError("invalid typed training lane configuration");
+   if (replacement.next_model_id < previous.next_model_id) throw contracts::InvalidIntentError("training model identity counter cannot move backwards");
+   for (const auto& model : replacement.models) {
+    const bool existed = std::ranges::any_of(previous.models, [&](const auto& prior) { return prior.model_id == model.model_id; });
+    if (!existed && model.model_id < previous.next_model_id) throw contracts::InvalidIntentError("retired training model identities cannot be reused");
+   }
+   candidate.workflows.train.request.lane_configuration = std::move(*request.lane_configuration);
+   for (auto& model : candidate.workflows.train.request.lane_configuration.models) mmltk::backend::models::rfdetr::resolve_train_recipe(model.recipe);
+  }
   contracts::SettingsUpdateRequest ordinary;
   for (const auto& update : request.updates) {
    if (!flat_value_is_null(update.value)) ordinary.updates.push_back(update);
   }
-  if ((!ordinary.updates.empty() && !contracts::apply_gui_settings_values(candidate, std::span{ordinary.updates})) || !apply_train_recipe_relation(candidate, std::span{request.updates}) ||
+  if ((!ordinary.updates.empty() && !contracts::apply_gui_settings_values(candidate, std::span{ordinary.updates}, false)) || !apply_train_recipe_relation(candidate, std::span{request.updates}) ||
       !contracts::gui_settings_valid(candidate))
    throw contracts::InvalidIntentError("invalid settings update");
+  (void)mmltk::backend::models::rfdetr::derive_execution_facts(candidate.workflows.train.request, 0);
   result = persist(std::move(candidate));
  }
  publish(result);
@@ -270,6 +284,10 @@ contracts::SettingsUiState SettingsSystem::snapshot() const {
  if (h2d_dataloader_override_) select_data_loading(result.settings_state, *h2d_dataloader_override_);
  result.validation_source = contracts::resolve_validation_source(result.settings_state).native();
  result.explore_source = contracts::resolve_explore_source(result.settings_state);
+ result.train_execution = mmltk::backend::models::rfdetr::derive_execution_facts(result.settings_state.workflows.train.request, result.revision);
+ result.training_validation_execution = mmltk::backend::models::rfdetr::derive_training_validation_facts(result.settings_state.workflows.train.request, result.revision);
+ result.validation_execution = mmltk::backend::models::rfdetr::derive_execution_facts(result.settings_state.workflows.validate.request, result.revision);
+ result.prediction_execution = mmltk::backend::models::rfdetr::derive_execution_facts(result.settings_state.workflows.predict.request, result.revision);
  return result;
 }
 contracts::ValidationDisplaySettings SettingsSystem::validation_display_settings() const {

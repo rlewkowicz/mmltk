@@ -18,7 +18,7 @@ enum class SettingsMutationError : std::uint8_t {
  state.apply_defaults();
  return state;
 }
-[[nodiscard]] std::expected<void, SettingsMutationError> apply_gui_settings_values(GuiSettingsState& state, std::span<const SettingsValueUpdate> updates);
+[[nodiscard]] std::expected<void, SettingsMutationError> apply_gui_settings_values(GuiSettingsState& state, std::span<const SettingsValueUpdate> updates, bool validate = true);
 [[nodiscard]] bool gui_settings_valid(const GuiSettingsState& state) noexcept;
 [[nodiscard]] std::filesystem::path resolve_validation_source(const GuiSettingsState& state);
 [[nodiscard]] ExploreSourceFact resolve_explore_source(const GuiSettingsState& state);

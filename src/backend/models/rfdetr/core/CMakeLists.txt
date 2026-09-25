@@ -89,6 +89,7 @@ mmltk_register_private_headers(
     detail/lsap_scratch.h
     detail/matcher_workspace.h
     detail/runtime_workspace_fwd.h
+    detail/semantic_sampling.h
     detail/detection_sampling.h
     detail/training_mask_loss.h
     detail/traced_loss_cache.h

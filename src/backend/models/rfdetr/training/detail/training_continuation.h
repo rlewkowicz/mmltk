@@ -1,5 +1,8 @@
 #pragma once
 #include <cstdint>
+#include "training_schedule.h"
+#include "training_epoch_policy.h"
+#include "training_data_plan.h"
 #include <optional>
 #include <string>
 #include "src/backend/models/rfdetr/contract/workflow_requests.h"
@@ -24,9 +27,14 @@ struct TrainingContinuationValues {
  double grad_scaler_scale = 1.0;
  int64_t grad_scaler_growth_tracker = 0;
  int64_t ema_completed_updates = 0;
- std::string training_attempt_id;
- std::string training_original_descriptor;
+ [[= mmltk::frameworks::reflection::MaxBytes{64}]] std::string training_attempt_id;
+ [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]] std::string training_original_descriptor;
+ TrainingScheduleState schedule;
+ TrainingEpochPolicyState epoch_policy;
+ TrainingDataContinuation data;
+ ExecutionFacts execution;
 };
+MMLTK_REFLECT_FIELDS(TrainingContinuationValues)
 struct TrainingContinuation {
  TrainRequest configuration;
  TrainingContinuationValues values;

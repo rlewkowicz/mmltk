@@ -7,7 +7,7 @@
 #include "src/controller/contracts/gui_settings_mutation.h"
 #include "src/controller/contracts/view_state.h"
 namespace mmltk::controller::contracts {
-inline constexpr std::uint32_t kGuiSettingsSchemaVersion = 8U;
+inline constexpr std::uint32_t kGuiSettingsSchemaVersion = 9U;
 [[nodiscard]] nlohmann::json normalize_gui_settings_document(const nlohmann::json& j);
 namespace settings_json_detail {
 // Membership follows the canonical persisted aggregate, its workflows and their

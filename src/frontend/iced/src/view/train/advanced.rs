@@ -37,13 +37,14 @@ fn recipe(optimizer: TrainOptimizerKind) -> &'static crate::generated::TrainReci
 }
 
 fn effective_scheduler(request: &crate::generated::TrainRequest) -> TrainLrSchedulerKind {
-    crate::generated::effective_workflowstrainrequestlrscheduler(request)
+    crate::generated::effective_workflowstrainrequestrecipelrscheduler(&request.recipe)
 }
 
 const fn optimizer_label(optimizer: TrainOptimizerKind) -> &'static str {
     match optimizer {
         TrainOptimizerKind::AdamW => "AdamW",
         TrainOptimizerKind::Muon => "Muon",
+        TrainOptimizerKind::SGD => "SGD",
     }
 }
 
@@ -51,6 +52,7 @@ const fn scheduler_label(scheduler: TrainLrSchedulerKind) -> &'static str {
     match scheduler {
         TrainLrSchedulerKind::Step => "Step",
         TrainLrSchedulerKind::Cosine => "Cosine",
+        TrainLrSchedulerKind::UltralyticsLinear => "Ultralytics linear",
     }
 }
 
@@ -75,22 +77,22 @@ pub fn update(model: &mut SettingsModel, message: Message) -> Result<EditSchedul
             crate::generated::edit_workflowstrainrequestgradaccumsteps(draft, value)
         }),
         Message::Optimizer(value) => model.edit(cadence, |draft| {
-            crate::generated::edit_workflowstrainrequestoptimizer(draft, value)
+            crate::generated::edit_workflowstrainrequestrecipeoptimizer(draft, value)
         }),
         Message::DecoderLearningRate(value) => model.edit(cadence, |draft| {
-            crate::generated::edit_relation_workflowstrainrequestlr(draft, value)
+            crate::generated::edit_relation_workflowstrainrequestrecipelr(draft, value)
         }),
         Message::EncoderLearningRate(value) => model.edit(cadence, |draft| {
-            crate::generated::edit_relation_workflowstrainrequestlrencoder(draft, value)
+            crate::generated::edit_relation_workflowstrainrequestrecipelrencoder(draft, value)
         }),
         Message::Scheduler(value) => model.edit(cadence, |draft| {
-            crate::generated::edit_relation_workflowstrainrequestlrscheduler(draft, value)
+            crate::generated::edit_relation_workflowstrainrequestrecipelrscheduler(draft, value)
         }),
         Message::WeightDecay(value) => model.edit(cadence, |draft| {
-            crate::generated::edit_relation_workflowstrainrequestweightdecay(draft, value)
+            crate::generated::edit_relation_workflowstrainrequestrecipeweightdecay(draft, value)
         }),
         Message::Momentum(value) => model.edit(cadence, |draft| {
-            crate::generated::edit_relation_workflowstrainrequestmomentum(draft, value)
+            crate::generated::edit_relation_workflowstrainrequestrecipemomentum(draft, value)
         }),
         Message::Amp(value) => model.edit(cadence, |draft| {
             crate::generated::edit_workflowstrainrequestamp(draft, value)
@@ -110,15 +112,7 @@ pub fn update(model: &mut SettingsModel, message: Message) -> Result<EditSchedul
             crate::generated::edit_workflowstrainrequestfreezeencoder(draft, value)
         }),
         Message::Supervision(message) => supervision::update(model, message),
-        Message::UseOptimizerDefaults => model.edit_group(cadence, |draft| {
-            [
-                crate::generated::clear_relation_workflowstrainrequestlr(draft),
-                crate::generated::clear_relation_workflowstrainrequestlrencoder(draft),
-                crate::generated::clear_relation_workflowstrainrequestlrscheduler(draft),
-                crate::generated::clear_relation_workflowstrainrequestweightdecay(draft),
-                crate::generated::clear_relation_workflowstrainrequestmomentum(draft),
-            ]
-        }),
+        Message::UseOptimizerDefaults => model.edit_group(cadence, crate::generated::reset_relation_trainrecipesettings),
     }
 }
 
@@ -135,11 +129,11 @@ pub fn view<'a>(
         );
     };
     let request = &train.request;
-    let lr = crate::generated::effective_workflowstrainrequestlr(request);
-    let lr_encoder = crate::generated::effective_workflowstrainrequestlrencoder(request);
+    let lr = crate::generated::effective_workflowstrainrequestrecipelr(&request.recipe);
+    let lr_encoder = crate::generated::effective_workflowstrainrequestrecipelrencoder(&request.recipe);
     let scheduler = effective_scheduler(request);
-    let weight_decay = crate::generated::effective_workflowstrainrequestweightdecay(request);
-    let momentum = crate::generated::effective_workflowstrainrequestmomentum(request);
+    let weight_decay = crate::generated::effective_workflowstrainrequestrecipeweightdecay(&request.recipe);
+    let momentum = crate::generated::effective_workflowstrainrequestrecipemomentum(&request.recipe);
     let optimizer_choices =
         crate::generated::TRAIN_RECIPE_CATALOG
             .iter()
@@ -147,7 +141,7 @@ pub fn view<'a>(
                 choices.push(
                     button(optimizer_label(recipe.optimizer))
                         .on_press_maybe(enabled.then_some(Message::Optimizer(recipe.optimizer)))
-                        .style(if request.optimizer == recipe.optimizer {
+                        .style(if request.recipe.optimizer == recipe.optimizer {
                             crate::fluent_theme::button_selected
                         } else {
                             crate::fluent_theme::button_secondary
@@ -213,28 +207,28 @@ pub fn view<'a>(
                 .push(fields::number_f64(
                     "Decoder learning rate",
                     lr,
-                    crate::generated::constraint_workflowstrainrequestlr(),
+                    crate::generated::constraint_workflowstrainrequestrecipelr(),
                     enabled,
                     Message::DecoderLearningRate,
                 ))
                 .push(fields::number_f64(
                     "Encoder learning rate",
                     lr_encoder,
-                    crate::generated::constraint_workflowstrainrequestlrencoder(),
+                    crate::generated::constraint_workflowstrainrequestrecipelrencoder(),
                     enabled,
                     Message::EncoderLearningRate,
                 ))
                 .push(fields::number_f64(
                     "Weight decay",
                     weight_decay,
-                    crate::generated::constraint_workflowstrainrequestweightdecay(),
+                    crate::generated::constraint_workflowstrainrequestrecipeweightdecay(),
                     enabled,
                     Message::WeightDecay,
                 ))
                 .push(fields::number_f64(
                     "Momentum",
                     momentum,
-                    crate::generated::constraint_workflowstrainrequestmomentum(),
+                    crate::generated::constraint_workflowstrainrequestrecipemomentum(),
                     enabled,
                     Message::Momentum,
                 )),
@@ -372,10 +366,10 @@ mod tests {
         let mut model = installed_settings_model();
         update(&mut model, Message::DecoderLearningRate(0.002)).unwrap();
         let request = &model.draft.as_ref().unwrap().workflows.train.request;
-        assert_eq!(request.lr, 0.002);
+        assert_eq!(request.recipe.lr, 0.002);
         assert!(
             request
-                .recipeoverrides
+                .recipe.overrides
                 .overridden(TrainRecipeCatalogRelationField::Lr)
         );
 
@@ -387,7 +381,7 @@ mod tests {
             .workflows
             .train
             .request
-            .recipeoverrides;
+            .recipe.overrides;
         assert!(!overrides.overridden(TrainRecipeCatalogRelationField::Lr));
         assert!(!overrides.overridden(TrainRecipeCatalogRelationField::LrEncoder));
         assert!(!overrides.overridden(TrainRecipeCatalogRelationField::LrScheduler));
@@ -410,7 +404,7 @@ mod tests {
         let request = &model.draft.as_ref().unwrap().workflows.train.request;
         assert!(
             request
-                .recipeoverrides
+                .recipe.overrides
                 .overridden(TrainRecipeCatalogRelationField::LrScheduler)
         );
         assert_eq!(effective_scheduler(request), TrainLrSchedulerKind::Cosine);

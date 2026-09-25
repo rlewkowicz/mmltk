@@ -26,6 +26,7 @@ struct BatchStaticTensors {
  [[nodiscard]] torch::Tensor nested_mask_view(int64_t batch_size) const;
 };
 struct TargetStagingSlot {
+ torch::Tensor sampling_keys;
  torch::Tensor boxes;
  torch::Tensor labels;
  torch::Tensor area;

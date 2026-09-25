@@ -109,15 +109,8 @@ int checked_inference_batch_size(size_t batch_size) {
 }
 std::string phase_progress_label(const char* phase, int epoch, int total_epochs) { return std::format("{} {}/{}", phase, epoch + 1, total_epochs); }
 int effective_train_lanes(const TrainRequest& options) {
- if (options.lanes < 0) { throw std::runtime_error("RF-DETR train --lanes must be non-negative"); }
- return std::max(1, options.lanes);
-}
-size_t micro_batches_per_optimizer_step(const TrainRequest& options, int train_lane_count) {
- return static_cast<size_t>(std::max(1, options.grad_accum_steps)) * static_cast<size_t>(std::max(1, train_lane_count));
-}
-size_t effective_batch_per_rank(const TrainRequest& options, int train_lane_count) { return static_cast<size_t>(options.batch_size) * micro_batches_per_optimizer_step(options, train_lane_count); }
-size_t effective_batch_global(const TrainRequest& options, const DistributedContext& distributed, int train_lane_count) {
- return effective_batch_per_rank(options, train_lane_count) * static_cast<size_t>(std::max(1, distributed.world_size));
+ if (options.lanes < 1) throw std::runtime_error("RF-DETR train --lanes must be positive");
+ return options.lanes;
 }
 bool is_rank_zero(const DistributedContext& distributed) { return distributed.rank == 0; }
 std::string train_progress_postfix(double average_class_loss, double average_box_loss, double average_loss, double step_class_loss, double step_box_loss, double step_loss, double images_per_second,
@@ -238,12 +231,6 @@ DetectionConfig make_detection_config(const NativeRfDetrConfig& config, int64_t 
  populate_default_detection_weight_dict(detection_config);
  return detection_config;
 }
-size_t full_batches_per_rank(size_t total_images, size_t batch_size, size_t world_size, int grad_accum_steps, int train_lane_count) {
- const size_t total_full_batches = total_images / batch_size;
- const size_t local_full_batches = total_full_batches / std::max<size_t>(1, world_size);
- const size_t batches_per_step = static_cast<size_t>(std::max(1, grad_accum_steps)) * static_cast<size_t>(std::max(1, train_lane_count));
- return (local_full_batches / batches_per_step) * batches_per_step;
-}
 void average_gradients(const DistributedContext& distributed, const std::vector<torch::Tensor>& parameters) {
  if (!distributed.enabled) { return; }
  std::vector<torch::Tensor> gradients;
@@ -274,7 +261,6 @@ TrainRequest finalize_train_request(TrainRequest request) {
   const auto& source = request.resume_path.empty() ? request.weights_path : request.resume_path;
   request.preset_name = infer_train_recipe_preset_name_from_path(source);
  }
- apply_train_recipe(request, train_recipe(request.optimizer), request.recipe_overrides);
  if (!request.device_ids.empty()) {
   const auto partitions = select_distributed_training_partitions(request);
   const auto rank = static_cast<std::size_t>(request.distributed_rank);
@@ -310,7 +296,10 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
  const int train_lane_count = train_runtime.split().lane_threads;
  // RF-DETR returns loss/K and Lightning's accumulation closure divides by K
  // again. Keep this common loop scale independent of criterion normalization.
- const auto admitted_microbatches = micro_batches_per_optimizer_step(options, train_lane_count);
+ auto execution_facts = derive_execution_facts(options, 0);
+ execution_facts.admitted_capacity = train_lane_count;
+ const auto admitted_microbatches = static_cast<std::size_t>(execution_facts.microbatches_per_attempt);
+ const std::size_t local_batch_size = options.batch_size / distributed.world_size + (static_cast<std::size_t>(distributed.rank) < options.batch_size % distributed.world_size);
  TrainingEventOwner training_events(options.device_id, static_cast<std::size_t>(train_lane_count) + 1U);
  ScopedRuntimeContext worker_scope(&train_runtime);
  auto make_loader_config_for = [&](const std::filesystem::path& compiled_path, size_t loader_batch_size, bool shuffle, int prefetch_factor, bool shard_batches, bool drop_last) {
@@ -327,7 +316,11 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
   return config;
  };
  const size_t val_batch_size = options.val_batch_size > 0 ? options.val_batch_size : options.batch_size;
- mmltk::backend::data::DatasetLoader train_loader(make_loader_config_for(options.train_compiled_path, options.batch_size, true, options.prefetch_factor, true, true));
+ mmltk::backend::data::DatasetLoader train_loader(make_loader_config_for(options.train_compiled_path, std::max<std::size_t>(1, local_batch_size), false, options.prefetch_factor, false, true));
+ TrainingDataPlan data_plan(train_loader, options);
+ // Admit every logical model before training publishes or updates any state.
+ auto epoch_draws = data_plan.epoch(0, 0);
+ for (std::size_t model_index = 1; model_index < data_plan.shards().size(); ++model_index) (void)data_plan.epoch(model_index, 0);
  std::unique_ptr<mmltk::backend::data::DatasetLoader> val_loader;
  if (main_process) {
   val_loader = std::make_unique<mmltk::backend::data::DatasetLoader>(make_loader_config_for(options.val_compiled_path, val_batch_size, false, options.prefetch_factor, false, false));
@@ -351,6 +344,11 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
  auto artifacts = admitted.artifacts;
  auto original_descriptor = options.class_layout_path;
  auto continuation = detail::admit_training_configuration(artifacts.config, admitted.model_state.admitted_archive(), options);
+ TrainingDonorHistory donor_history(options.lane_configuration.mode == TrainLaneMode::SharedGradients ? options.lanes : 1, options.batch_size);
+ if (continuation) {
+  if (continuation->values.data.plan_hash != data_plan.hash() || continuation->values.data.shards != data_plan.shards()) throw std::runtime_error("resume data plan differs from compiled training membership");
+  donor_history.restore(train_loader, continuation->values.data.donors);
+ }
  if (continuation) original_descriptor = continuation->values.training_original_descriptor;
  dataset_limits.automatic_num_queries_cap = checked_cast<std::size_t>(artifacts.automatic_num_queries_cap, "RF-DETR automatic query cap exceeds size_t");
  const ResolvedDatasetLimit required_query_limit = resolve_dataset_query_limit(dataset_limits.largest_max_instances, 0U, dataset_limits.automatic_num_queries_cap);
@@ -420,7 +418,7 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
  model.initialize_training_supervision(static_cast<std::uint64_t>(options.seed));
  model.to(mmltk::backend::ml::cuda::cuda_device(options.device_id));
  model.configure_supervision_timing(
-  SupervisionTimingSetup{mmltk::backend::ml::cuda::cuda_device(options.device_id), static_cast<std::size_t>(std::max(1, options.grad_accum_steps)), mmltk::common::logging::profile_enabled()});
+  SupervisionTimingSetup{mmltk::backend::ml::cuda::cuda_device(options.device_id), admitted_microbatches, mmltk::common::logging::profile_enabled()});
  const auto resolved_route = supervision_route(options.training_supervision);
  std::optional<detail::NormalizedModelStateCandidate> resume_model_candidate;
  ModelStateLoadSummary load_summary;
@@ -430,7 +428,7 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
  } else {
   load_summary = load_training_model_weights(model, admitted.model_state, resolved_route);
  }
- model.optimize_for_inference(checked_inference_batch_size(options.batch_size), true, options.compilation_mode);
+ model.optimize_for_inference(checked_inference_batch_size(std::max<std::size_t>(1, local_batch_size)), true, options.compilation_mode);
  if (!options.val_compiled_path.empty()) { model.optimize_for_inference(checked_inference_batch_size(val_batch_size), false, options.compilation_mode); }
  if (main_process) {
   mmltk::common::logging::info([&](auto& logger) {
@@ -453,6 +451,8 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
  }
  auto optimizer_build = build_optimizer(model.named_parameters(true), options);
  auto& optimizer = optimizer_build.optimizer;
+ const auto& eligible_params = optimizer.eligible_parameters();
+ const auto& eligible_names = optimizer.eligible_parameter_names();
  auto& all_params = optimizer.parameters();
  const auto& all_param_names = optimizer.parameter_names();
  const bool amp_enabled = options.amp;
@@ -460,13 +460,13 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
  const bool scaler_enabled = amp_enabled && autocast_dtype == torch::kFloat16;
  GradScaler grad_scaler(scaler_enabled);
  std::optional<ModelEma> ema;
- if (options.resume_path.empty() && options.use_ema && main_process) { ema.emplace(all_params, options.ema_decay, static_cast<double>(options.ema_tau)); }
+ if (options.resume_path.empty() && options.use_ema && main_process) { ema.emplace(eligible_params, options.ema_decay, static_cast<double>(options.ema_tau)); }
  int start_epoch = 0;
  std::string resume_attempt_id;
  double best_regular = -std::numeric_limits<double>::infinity();
  double best_ema = -std::numeric_limits<double>::infinity();
  if (!options.resume_path.empty()) {
-  ResumeState resume_state = load_resume_checkpoint_state(options.resume_path, admitted.model_state, *continuation, optimizer, options, all_param_names, all_params, main_process);
+  ResumeState resume_state = load_resume_checkpoint_state(options.resume_path, admitted.model_state, *continuation, optimizer, options, eligible_names, eligible_params, main_process);
   if (resume_model_candidate.has_value()) { model.commit_normalized_state(std::move(*resume_model_candidate)); }
   if (!resume_state.optimizer_candidate.has_value()) { throw std::logic_error("admitted RF-DETR resume is missing its optimizer candidate"); }
   optimizer.commit(std::move(*resume_state.optimizer_candidate));
@@ -477,14 +477,15 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
   best_regular = resume_state.best_regular;
   best_ema = resume_state.best_ema;
  }
+ detail::TrainingContinuationValues continuation_values = continuation ? continuation->values : detail::TrainingContinuationValues{};
+ TrainingSchedule schedule(options.recipe, optimizer_build.base_lrs, optimizer_build.roles, options.epochs, epoch_draws.microbatches, admitted_microbatches);
+ if (continuation) {
+  schedule.restore(continuation_values.schedule);
+ }
+ continuation_values.data.shards = data_plan.shards();
+ TrainingEpochPolicy epoch_policy(options.unfreeze_encoder_last_epochs, options.disable_augmentation_last_epochs, continuation_values.epoch_policy);
  continuation.reset();
  admitted.model_state.release_admission();
- LrScheduleConfig lr_config;
- lr_config.warmup_epochs = options.warmup_epochs;
- lr_config.warmup_momentum = options.warmup_momentum;
- lr_config.lr_scheduler = options.lr_scheduler;
- lr_config.lr_drop = options.lr_drop;
- lr_config.lr_min_factor = options.lr_min_factor;
  if (main_process) {
   mmltk::common::logging::info([&](auto& logger) {
    logger.info(
@@ -494,11 +495,11 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
     "query_source={} num_queries={} automatic_query_cap={} query_override={}",
     TORCH_VERSION, evaluation_precision_name(autocast_dtype), optimizer.kind_name(), optimizer.backend_name(), grad_scaler.enabled() ? "on" : "off", train_lane_count,
     train_runtime.split().lane_threads, train_runtime.split().loader_threads, train_runtime.split().gather_threads, train_runtime.split().cpu_threads,
-    effective_batch_per_rank(options, train_lane_count), effective_batch_global(options, distributed, train_lane_count), dataset_limits.train_max_instances, dataset_limits.val_max_instances,
+    execution_facts.effective_batch_per_model, execution_facts.aggregate_round_images, dataset_limits.train_max_instances, dataset_limits.val_max_instances,
     dataset_limits.test_max_instances.value_or(0U), dataset_limits.query_source, dataset_limits.resolved_num_queries, dataset_limits.automatic_num_queries_cap,
     dataset_limits.requested_override ? "true" : "false");
   });
-  if (options.optimizer == TrainOptimizerKind::Muon && options.fused_optimizer) {
+  if (options.recipe.optimizer == TrainOptimizerKind::Muon && options.fused_optimizer) {
    mmltk::common::logging::warn([](auto& logger) {
     logger.warn(
      "rfdetr train runtime: optimizer=muon ignores --fused-optimizer and runs with the eager backend "
@@ -506,16 +507,9 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
    });
   }
  }
- const size_t usable_full_batches = full_batches_per_rank(train_loader.num_images(), options.batch_size, static_cast<size_t>(distributed.world_size), options.grad_accum_steps, train_lane_count);
- if (usable_full_batches == 0) {
-  throw std::runtime_error(
-   "compiled train split is too small for one effective batch per rank; reduce batch_size, "
-   "grad_accum_steps, --lanes, or world size");
- }
- const size_t batches_per_step = micro_batches_per_optimizer_step(options, train_lane_count);
- const auto total_images = mmltk::common::math::checked_multiply(static_cast<std::uint64_t>(usable_full_batches), static_cast<std::uint64_t>(options.batch_size), "training image total overflow");
- const auto steps_per_epoch = static_cast<int64_t>(usable_full_batches / batches_per_step);
- const int64_t total_training_steps = std::max<int64_t>(1, steps_per_epoch * options.epochs);
+ std::size_t usable_full_batches = epoch_draws.microbatches;
+ std::uint64_t total_images = checked_training_product(usable_full_batches, options.batch_size);
+ std::int64_t steps_per_epoch = static_cast<std::int64_t>(epoch_draws.attempts);
  DetectionConfig detection_config = make_detection_config(artifacts.config, distributed.world_size, options.compilation_mode);
  const TrainingSupervisionRoute training_route = supervision_route(artifacts.config.training_supervision);
  if (main_process) { std::filesystem::create_directories(options.output_dir); }
@@ -553,12 +547,12 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
   run.configuration = checkpoint_configuration;
   run.original_weights = metadata.source_path;
   run.original_class_descriptor = original_descriptor;
-  run.execution = {train_runtime.split().lane_threads, effective_batch_per_rank(options, train_lane_count), effective_batch_global(options, distributed, train_lane_count), dataset_limits};
+  run.execution = {train_runtime.split().lane_threads, execution_facts.effective_batch_per_model, execution_facts.aggregate_round_images, dataset_limits};
   run.class_layout = artifacts.class_layout;
   run.evaluated_weights = options.use_ema ? EvaluatedWeights::Ema : EvaluatedWeights::Ordinary;
   run.source_checkpoint_attempt_id = resume_attempt_id;
   run.resume_epoch = start_epoch - 1;
-  run.resume_optimizer_step = static_cast<std::uint64_t>(start_epoch) * static_cast<std::uint64_t>(steps_per_epoch);
+  run.resume_optimizer_step = schedule.state().consumed_attempts;
   progress_writer = std::make_unique<TrainingTelemetryWriter>(std::move(run));
   last_training_progress.epoch = start_epoch;
   last_training_progress.total_epochs = options.epochs;
@@ -580,15 +574,35 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
  TargetScratch target_scratch(static_cast<std::size_t>(std::max(1, options.grad_accum_steps)));
  if (train_lane_count <= 1) {
   single_lane_augmenter = std::make_unique<GpuBatchAugmenter>(
-   options.gpu_augmentation, static_cast<std::int64_t>(options.batch_size), static_cast<int>(train_loader.image_height()), static_cast<int>(train_loader.image_width()), augmentation_context);
+   options.gpu_augmentation, static_cast<std::int64_t>(std::max<std::size_t>(1, local_batch_size)), static_cast<int>(train_loader.image_height()), static_cast<int>(train_loader.image_width()), augmentation_context);
  }
- TrainingLanes train_lanes(options, train_runtime, train_loader, model, all_param_names, train_lane_count, augmentation_context);
+ TrainingLanes train_lanes(options, train_runtime, train_loader, model, all_param_names, train_lane_count, std::max<std::size_t>(1, local_batch_size), augmentation_context);
  size_t parameter_version = 0;
  distributed_barrier(distributed);
  for (int epoch = start_epoch; epoch < options.epochs; ++epoch) {
   mmltk::common::logging::ScopedProfile profile_rfdetr_train_epoch{"rfdetr.train.epoch"};
   result.last_epoch = epoch;
-  train_loader.begin_epoch();
+  const auto previous_policy = epoch_policy.state();
+  const auto policy = epoch_policy.enter(epoch, options.epochs);
+  if (policy.encoder_unfrozen && (!previous_policy.encoder_unfrozen || epoch == start_epoch)) {
+   for (auto& item : model.named_parameters(true)) if (is_encoder_param(item.key())) item.value().set_requires_grad(true);
+   optimizer.activate();
+  }
+  if (policy != previous_policy || (epoch == start_epoch && (policy.encoder_unfrozen || policy.augmentation_disabled))) {
+   auto augmentation = options.gpu_augmentation;
+   if (policy.augmentation_disabled) augmentation.enabled = false;
+   model.invalidate_compilation();
+   model.optimize_for_inference(checked_inference_batch_size(std::max<std::size_t>(1, local_batch_size)), true, options.compilation_mode);
+   if (single_lane_augmenter) single_lane_augmenter->reconfigure(augmentation);
+   train_lanes.reconfigure(model, all_param_names, augmentation, checked_inference_batch_size(std::max<std::size_t>(1, local_batch_size)), options.compilation_mode);
+  }
+  if (epoch != 0) epoch_draws = data_plan.epoch(0, epoch);
+  usable_full_batches = epoch_draws.microbatches;
+  total_images = checked_training_product(usable_full_batches, options.batch_size);
+  steps_per_epoch = static_cast<std::int64_t>(epoch_draws.attempts);
+  schedule.begin_epoch(epoch);
+  const auto resume_microbatch = continuation_values.data.epoch == static_cast<std::uint64_t>(epoch) ? continuation_values.data.next_microbatch : 0;
+  train_loader.begin_epoch(data_plan.rank_schedule(epoch_draws, distributed.rank, distributed.world_size), checked_training_product(resume_microbatch, local_batch_size));
   model.train();
   optimizer.zero_grad(true);
   metric_handoff.reset_epoch();
@@ -598,7 +612,7 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
   int64_t reported_micro_batches = 0;
   int64_t local_waves = 0;
   int64_t optimizer_steps = 0;
-  size_t local_full_batches = 0;
+  size_t local_full_batches = resume_microbatch;
   double host_loss_sum = 0.0;
   double host_class_loss_sum = 0.0;
   double host_box_loss_sum = 0.0;
@@ -631,7 +645,7 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
    snapshot.total_images = total_images;
    snapshot.completed_waves = local_waves;
    snapshot.optimizer_steps = optimizer_steps;
-   snapshot.global_optimizer_step = static_cast<std::int64_t>(epoch) * steps_per_epoch + optimizer_steps;
+   snapshot.global_optimizer_step = static_cast<std::int64_t>(schedule.state().consumed_attempts);
    snapshot.epoch_global_loss = epoch_global_loss;
    snapshot.steps_per_epoch = steps_per_epoch;
    snapshot.train_lanes = train_lane_count;
@@ -674,21 +688,19 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
   };
   write_progress_snapshot(TrainingPhase::Train, std::nullopt, {}, std::filesystem::path{}, true);
   last_progress_submit = std::chrono::steady_clock::now();
-  const auto apply_optimizer_schedule = [&](int64_t current_step) {
-   const double lr_scale = compute_lr_scale(lr_config, current_step, steps_per_epoch, total_training_steps);
-   set_optimizer_lrs(optimizer, optimizer_build.base_lrs, lr_scale);
-   if (!optimizer_build.base_lrs.empty()) {
-    const auto [minimum, maximum] = std::minmax_element(optimizer_build.base_lrs.begin(), optimizer_build.base_lrs.end());
-    last_training_progress.scalars.learning_rate = optimizer_build.base_lrs.front() * lr_scale;
-    last_training_progress.scalars.learning_rate_min = *minimum * lr_scale;
-    last_training_progress.scalars.learning_rate_max = *maximum * lr_scale;
-   }
-   if (options.optimizer == TrainOptimizerKind::Muon) { optimizer.set_muon_momentum(compute_warmup_momentum(lr_config, current_step, steps_per_epoch, options.momentum)); }
+  const auto apply_optimizer_schedule = [&] {
+   schedule.prepare_attempt();
+   const auto& current = schedule.state();
+   optimizer.set_lrs(current.absolute_lrs, 1.0);
+   optimizer.set_momentum(current.held_momentum);
+   const auto [minimum, maximum] = std::minmax_element(current.absolute_lrs.begin(), current.absolute_lrs.end());
+   last_training_progress.scalars.learning_rate = current.absolute_lrs.front();
+   last_training_progress.scalars.learning_rate_min = *minimum;
+   last_training_progress.scalars.learning_rate_max = *maximum;
   };
   const auto run_optimizer_step = [&](const auto& post_step, const TensorMap* loss_report, int64_t wave_micro_batches) {
    mmltk::common::logging::ScopedProfile profile_rfdetr_train_optimizer{"rfdetr.train.optimizer"};
-   const int64_t current_step = static_cast<int64_t>(epoch) * steps_per_epoch + optimizer_steps;
-   apply_optimizer_schedule(current_step);
+   apply_optimizer_schedule();
    average_gradients(distributed, all_params);
    const auto found_inf = grad_scaler.check_and_unscale_(optimizer);
    if (options.clip_max_norm > 0.0) { optimizer.clip_grad_norm_(options.clip_max_norm); }
@@ -723,6 +735,7 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
    grad_scaler.step(optimizer, gradient_overflow);
    grad_scaler.update(gradient_overflow);
    optimizer.zero_grad(true);
+   schedule.finish_attempt(!gradient_overflow);
    if (ema.has_value()) { ema->update(); }
    if (gradient_overflow) {
     mmltk::common::logging::warn([&](auto& logger) { logger.warn("skipped RF-DETR optimizer update after gradient overflow{}", overflow_details); });
@@ -730,11 +743,12 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
    ++optimizer_steps;
    post_step();
   };
+  std::vector<TrainingDonorDescriptor> current_donors;
   auto next_train_full_batch = [&]() -> std::optional<mmltk::backend::data::Batch> {
    mmltk::backend::data::Batch batch{};
    while (train_loader.next_batch(batch)) {
     mmltk::common::logging::ScopedProfile profile_rfdetr_train_batch{"rfdetr.train.batch"};
-    if (batch.num_images != options.batch_size) {
+    if (batch.num_images != local_batch_size) {
      train_loader.release_batch(batch);
      continue;
     }
@@ -742,7 +756,23 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
      train_loader.release_batch(batch);
      return std::nullopt;
     }
+    try {
+    const auto global_offset = local_full_batches * options.batch_size;
+    auto augmentation = options.gpu_augmentation;
+    if (policy.augmentation_disabled) augmentation.enabled = false;
+    current_donors.clear();
+    if (augmentation.enabled && augmentation.copy_paste_probability > 0) {
+    auto global_donors = donor_history.admit(train_loader, local_full_batches % (options.lane_configuration.mode == TrainLaneMode::SharedGradients ? options.lanes : 1),
+     std::span{epoch_draws.schedule->draw_keys}.subspan(global_offset, options.batch_size), std::span{epoch_draws.schedule->image_indices}.subspan(global_offset, options.batch_size), augmentation);
+    const auto rank_begin = options.batch_size / distributed.world_size * distributed.rank + std::min<std::size_t>(distributed.rank, options.batch_size % distributed.world_size);
+    current_donors.assign(global_donors.begin() + rank_begin, global_donors.begin() + rank_begin + local_batch_size);
+    }
     ++local_full_batches;
+    schedule.consume_microbatch();
+    } catch (...) {
+     train_loader.release_batch(batch);
+     throw;
+    }
     mmltk::common::logging::profile_add_value("rfdetr.train.images", batch.num_images);
     mmltk::common::logging::profile_add_value("rfdetr.train.full_batches", 1);
     return batch;
@@ -764,7 +794,7 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
     {
      mmltk::common::logging::ScopedProfile profile_rfdetr_train_augment{"rfdetr.train.augment"};
      mmltk::common::logging::ScopedProfile profile_benchmark_rfdetr_train_augmentation{"benchmark.rfdetr.train.augmentation"};
-     normalized = single_lane_augmenter->run(*batch, static_cast<std::uint64_t>(options.seed), epoch, distributed.rank, local_full_batches - 1);
+     normalized = single_lane_augmenter->run(*batch, static_cast<std::uint64_t>(options.seed), epoch, distributed.rank, local_full_batches - 1, &train_loader, current_donors);
     }
     RoutedTrainingLoss loss_result;
     auto& model_owner = (model);
@@ -833,7 +863,7 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
     }
     target_consumer.retire();
     step_timing.finish();
-    if (local_waves % options.grad_accum_steps == 0) {
+    if (static_cast<std::size_t>(local_micro_batches) % admitted_microbatches == 0) {
      run_optimizer_step([] {}, &loss_result.ordinary_terms, 1);
      static_cast<void>(model.harvest_supervision_timing());
     }
@@ -844,13 +874,15 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
    while (local_full_batches < usable_full_batches) {
     metric_handoff.begin_wave();
     const double current_scale = grad_scaler.enabled() ? static_cast<double>(grad_scaler.current_scale()) : 1.0;
-    ParallelTrainingWave<TrainLaneResult> wave(static_cast<std::size_t>(train_lane_count), route_is_active(training_route) || distributed.enabled, options.device_id, distributed);
-    for (int lane_index = 0; lane_index < train_lane_count; ++lane_index) {
+    const auto wave_size = std::min({static_cast<std::size_t>(train_lane_count), usable_full_batches - local_full_batches,
+     admitted_microbatches - static_cast<std::size_t>(local_micro_batches) % admitted_microbatches});
+    ParallelTrainingWave<TrainLaneResult> wave(wave_size, route_is_active(training_route) || distributed.enabled, options.device_id, distributed);
+    for (std::size_t lane_index = 0; lane_index < wave_size; ++lane_index) {
      auto batch = next_train_full_batch();
      if (!batch.has_value()) { throw std::runtime_error("native RF-DETR training ended an epoch with an incomplete parallel train wave"); }
      wave.add(train_lanes.enqueue(&train_runtime, train_loader, *batch, params_ready ? &*params_ready : nullptr, training_events.pool(), admitted_microbatches, current_scale, parameter_version,
       detection_config, model, options.device_id, static_cast<int>(train_loader.image_height()), static_cast<int>(train_loader.image_width()), static_cast<std::uint64_t>(options.seed), epoch,
-      distributed.rank, local_full_batches - 1, amp_enabled, autocast_dtype, training_route, wave.normalizer(), static_cast<std::size_t>(lane_index)));
+      distributed.rank, local_full_batches - 1, amp_enabled, autocast_dtype, training_route, wave.normalizer(), static_cast<std::size_t>(lane_index), current_donors));
     }
     wave.settle(mmltk::backend::ml::cuda::cuda_device(options.device_id), [&](TrainLaneResult& lane_result) {
      train_lanes.merge(lane_result, all_params, options.device_id);
@@ -859,7 +891,7 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
      if (progress) { progress->add(static_cast<size_t>(options.batch_size)); }
     });
     ++local_waves;
-    if (local_waves % options.grad_accum_steps == 0) {
+    if (static_cast<std::size_t>(local_micro_batches) % admitted_microbatches == 0) {
      run_optimizer_step(
       [&] {
        ++parameter_version;
@@ -867,7 +899,7 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
        params_ready = record_current_stream_event(training_events.pool(), options.device_id, "record parallel train parameter readiness");
        if (!params_ready) throw std::runtime_error("training CUDA event capacity is exhausted");
       },
-      nullptr, static_cast<int64_t>(train_lane_count));
+      nullptr, static_cast<int64_t>(wave_size));
      train_lanes.harvest_timing();
     }
     flush_progress(false);
@@ -879,7 +911,7 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
    mmltk::backend::data::Batch drain_batch{};
    while (train_loader.next_batch(drain_batch)) { train_loader.release_batch(drain_batch); }
   }
-  if (local_micro_batches == 0 || local_waves % options.grad_accum_steps != 0) { throw std::runtime_error("native RF-DETR training ended an epoch with incomplete gradient accumulation"); }
+  if (local_micro_batches == 0 || static_cast<std::size_t>(local_micro_batches) % admitted_microbatches != 0) { throw std::runtime_error("native RF-DETR training ended an epoch with incomplete gradient accumulation"); }
   if (train_lane_count <= 1) {
    {
     mmltk::common::logging::ScopedProfile profile_rfdetr_train_wait_pending_copy{"rfdetr.train.wait_pending_copy"};
@@ -925,7 +957,7 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
    checkpoint_snapshot.begin(model);
    checkpoint_snapshot.save_weights(options.output_dir / std::format("checkpoint_epoch_{}.pt", epoch + 1), metadata, false, options.class_layout_path);
    // Preparing later artifacts must not undo a successfully published epoch.
-   checkpoint_snapshot.prepare_ema(all_param_names, ema ? &*ema : nullptr);
+   checkpoint_snapshot.prepare_ema(eligible_names, ema ? &*ema : nullptr);
    TrainEpochSummary epoch_summary;
    epoch_summary.epoch = epoch;
    epoch_summary.train_loss = train_loss;
@@ -943,8 +975,15 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
    }
    {
     mmltk::common::logging::ScopedProfile profile_rfdetr_train_save_resume{"rfdetr.train.save.resume"};
+    continuation_values.schedule = schedule.state();
+    continuation_values.epoch_policy = epoch_policy.state();
+    continuation_values.data.donors = donor_history.state();
+    continuation_values.data.plan_hash = data_plan.hash();
+    continuation_values.data.epoch = static_cast<std::uint64_t>(epoch + 1);
+    continuation_values.data.next_microbatch = 0;
+    continuation_values.execution = execution_facts;
     checkpoint_snapshot.save_resume(checkpoint_path, metadata, optimizer, grad_scaler, checkpoint_configuration, epoch, best_regular, best_ema, ema ? ema->completed_updates() : 0,
-     progress_writer->attempt_id(), original_descriptor);
+     progress_writer->attempt_id(), original_descriptor, continuation_values);
     checkpoint_snapshot.release();
    }
    if (result.history.size() == result.history.capacity()) result.history.erase(result.history.begin());
@@ -956,7 +995,7 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
  }
  if (main_process && !result.best_checkpoint_path.has_value()) {
   const auto fallback_path = options.output_dir / (options.use_ema ? "checkpoint_fallback_ema.pt" : "checkpoint_fallback_regular.pt");
-  const auto overrides = ema ? ema_override_map(all_param_names, *ema) : std::unordered_map<std::string, torch::Tensor>{};
+  const auto overrides = ema ? ema_override_map(eligible_names, *ema) : std::unordered_map<std::string, torch::Tensor>{};
   save_collected_checkpoint(
    fallback_path, metadata, model, ema ? &overrides : nullptr, "rfdetr.train.save.selected_fallback", "rfdetr.train.save.selected_fallback.collect_state", options.class_layout_path);
   result.best_checkpoint_path = fallback_path;
@@ -1018,12 +1057,12 @@ void print_training_summary(const TrainRequest& options, const TrainRunResult& r
   summary = std::format(
    "rfdetr train[{}]: preset={} optimizer={} epochs={} train_loss={:.6f} val_loss={:.6f} "
    "val_bbox_ap={:.4f} val_mask_ap={} best={} checkpoint={}",
-   source_label, result.artifacts.config.preset_name, cli_enum_spelling(options.optimizer), result.last_epoch + 1, train_loss, *val_loss, val_bbox_ap, val_mask_ap, best_path, checkpoint_path);
+   source_label, result.artifacts.config.preset_name, cli_enum_spelling(options.recipe.optimizer), result.last_epoch + 1, train_loss, *val_loss, val_bbox_ap, val_mask_ap, best_path, checkpoint_path);
  } else {
   summary = std::format(
    "rfdetr train[{}]: preset={} optimizer={} epochs={} train_loss={:.6f} val_bbox_ap={:.4f} "
    "val_mask_ap={} best={} checkpoint={}",
-   source_label, result.artifacts.config.preset_name, cli_enum_spelling(options.optimizer), result.last_epoch + 1, train_loss, val_bbox_ap, val_mask_ap, best_path, checkpoint_path);
+   source_label, result.artifacts.config.preset_name, cli_enum_spelling(options.recipe.optimizer), result.last_epoch + 1, train_loss, val_bbox_ap, val_mask_ap, best_path, checkpoint_path);
  }
  if (mmltk::common::logging::enabled(spdlog::level::info)) {
   mmltk::common::logging::info([&](auto& logger) { logger.info("{}", summary); });

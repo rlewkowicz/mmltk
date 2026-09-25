@@ -39,6 +39,8 @@ mmltk_register_retained_module_importers(
     training_snapshot.cpp)
 mmltk_register_ordinary_sources(
     mmltk_backend_models_rfdetr_training
+    training_data_plan.cpp
+    training_schedule.cpp
     native_optimizer.cpp
     training_partition.cpp
     training_metrics.cpp
@@ -48,6 +50,9 @@ mmltk_register_ordinary_sources(
     telemetry_writer.cpp)
 mmltk_register_private_headers(
     mmltk_backend_models_rfdetr_training
+    detail/training_data_plan.h
+    detail/training_schedule.h
+    detail/training_epoch_policy.h
     detail/target_builder_private.h
     detail/gpu_augment_private.h
     detail/native_optimizer_private.h
@@ -116,6 +121,7 @@ function(mmltk_add_backend_models_rfdetr_training_tests)
     mmltk_register_ordinary_sources(
         mmltk_backend_models_rfdetr_training_tests
         ${ordinary_sources}
+        ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/execution_policy.test.cpp
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/evaluation_runtime.test.cpp
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/telemetry_writer.test.cpp
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/training_continuation.test.cpp)

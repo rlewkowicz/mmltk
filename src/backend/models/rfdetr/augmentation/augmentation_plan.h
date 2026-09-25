@@ -27,6 +27,7 @@ struct AugmentationImagePlan {
  bool paste_masked = false;
  std::int64_t paste_donor_slot = -1;
  std::int64_t paste_label = -1;
+ std::uint64_t paste_sampling_identity = 0;
  float paste_source_area = 0.0F;
  std::array<float, 4> paste_source_box{};
  std::array<float, 4> paste_output_box{};

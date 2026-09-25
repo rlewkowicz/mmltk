@@ -79,6 +79,9 @@ struct DatasetLoader::Impl {
  CompiledDataset source;
  std::unique_ptr<CompiledImageStream> stream;
  std::vector<uint32_t> order;
+ std::shared_ptr<const DatasetIndexSchedule> explicit_schedule;
+ std::size_t resume_offset = 0;
+ const std::vector<std::uint32_t>& indices() const { return explicit_schedule ? explicit_schedule->image_indices : order; }
  std::vector<size_t> shuffled_blocks, shuffled_chunks;
  std::vector<size_t> batch_starts;
  std::vector<Slot> slots;
@@ -136,11 +139,11 @@ struct DatasetLoader::Impl {
  static void consumer_complete(void* context, const size_t index, std::exception_ptr error) noexcept { static_cast<Impl*>(context)->completed(index, error, true); }
  void rebuild_schedule() {
   batch_starts.clear();
-  const size_t images = source.header().num_images;
+  const size_t images = indices().size();
   const size_t batches = config.drop_last ? images / config.batch_size : images / config.batch_size + (images % config.batch_size != 0);
   const size_t local_batches = config.batch_shard_rank < batches ? (batches - 1 - config.batch_shard_rank) / config.batch_shard_count + 1 : 0;
   batch_starts.reserve(local_batches);
-  for (size_t batch = config.batch_shard_rank; batch < batches; batch += config.batch_shard_count) batch_starts.push_back(batch * config.batch_size);
+  for (size_t batch = explicit_schedule ? resume_offset / config.batch_size : config.batch_shard_rank; batch < batches; batch += explicit_schedule ? 1 : config.batch_shard_count) batch_starts.push_back(batch * config.batch_size);
   batch_slots.resize(batch_starts.size());
  }
  void refill(const size_t index) {
@@ -150,15 +153,15 @@ struct DatasetLoader::Impl {
   if (submitted == batch_starts.size() || slot.state != State::Free) return;
   slot.batch = submitted;
   slot.start = batch_starts[submitted];
-  slot.count = std::min(config.batch_size, order.size() - slot.start);
+  slot.count = std::min(config.batch_size, indices().size() - slot.start);
   slot.lease = next_lease++;
   slot.reads.clear();
   bool contiguous = true;
   for (size_t image = 0; image < slot.count; ++image) {
-   slot.reads.push_back({order[slot.start + image], image * source.header().image_stride});
-   contiguous &= order[slot.start + image] == order[slot.start] + image;
+   slot.reads.push_back({indices()[slot.start + image], image * source.header().image_stride});
+   contiguous &= indices()[slot.start + image] == indices()[slot.start] + image;
   }
-  slot.host = contiguous ? source.image_pixels(order[slot.start]) : nullptr;
+  slot.host = contiguous ? source.image_pixels(indices()[slot.start]) : nullptr;
   slot.transfer_pending = true;
   slot.state = State::Reading;
   batch_slots[submitted++] = index;
@@ -261,7 +264,13 @@ DatasetLoader::~DatasetLoader() {
  // mutex, source mapping, order, and batch records leave scope.
  impl_->stream.reset();
 }
-void DatasetLoader::begin_epoch() {
+void DatasetLoader::begin_epoch() { begin_epoch({}, 0); }
+void DatasetLoader::begin_epoch(std::shared_ptr<const DatasetIndexSchedule> schedule, std::size_t resume_offset) {
+ if (schedule) {
+  if (resume_offset > schedule->image_indices.size() || resume_offset % impl_->config.batch_size || (!schedule->draw_keys.empty() && schedule->draw_keys.size() != schedule->image_indices.size())) throw std::invalid_argument("invalid explicit dataset schedule or resume offset");
+  if (!schedule->microbatch_keys.empty() && schedule->microbatch_keys.size() != (schedule->image_indices.size() / impl_->config.batch_size + (schedule->image_indices.size() % impl_->config.batch_size != 0))) throw std::invalid_argument("explicit microbatch key count differs");
+  for (auto image : schedule->image_indices) if (image >= impl_->source.header().num_images) throw std::invalid_argument("scheduled image is outside dataset");
+ } else if (resume_offset) throw std::invalid_argument("resume offset requires an explicit dataset schedule");
  {
   std::lock_guard lock(impl_->mutex);
   impl_->check_failure();
@@ -271,9 +280,31 @@ void DatasetLoader::begin_epoch() {
  }
  impl_->stream->cancel_reads();
  impl_->stream->synchronize();
+ try {
+ if (schedule && !schedule->image_indices.empty()) {
+  mmltk::frameworks::gpu::CudaDeviceScope scope(impl_->config.device_id);
+  mmltk::frameworks::gpu::ensure_cuda_ok(scope.status(), "explicit dataset schedule device binding");
+  const auto count = std::min(impl_->config.batch_size, schedule->image_indices.size());
+  const auto bytes = count * static_cast<std::size_t>(impl_->source.header().image_stride);
+  for (std::size_t slot = 0; slot < impl_->slots.size(); ++slot) {
+   if (impl_->config.loading.h2d_dataloader) impl_->stream->prepare_host(slot, bytes);
+   impl_->stream->prepare_device(slot, bytes);
+   impl_->slots[slot].reads.reserve(count);
+  }
+  mmltk::frameworks::gpu::ensure_cuda_ok(scope.Finalize(), "explicit dataset schedule caller restoration");
+ }
+ } catch (...) {
+  std::lock_guard lock(impl_->mutex);
+  impl_->failure = std::current_exception();
+  impl_->resetting = false;
+  impl_->changed.notify_all();
+  throw;
+ }
  std::lock_guard lock(impl_->mutex);
  impl_->check_failure();
- if (impl_->config.shuffle) {
+ impl_->explicit_schedule = std::move(schedule);
+ impl_->resume_offset = resume_offset;
+ if (!impl_->explicit_schedule && impl_->config.shuffle) {
   std::mt19937_64 rng(impl_->config.seed++);
   build_block_shuffled_order(impl_->order, impl_->source.header().num_images, impl_->config.batch_size, rng, impl_->shuffled_blocks, impl_->shuffled_chunks);
  }
@@ -313,12 +344,14 @@ bool DatasetLoader::next_batch(Batch& out, std::stop_token stop) {
   if (slot.batch == impl_->consumed && slot.state == Impl::State::Ready) {
    slot.state = Impl::State::CheckedOut;
    ++impl_->consumed;
-   out = {.num_images = slot.count,
+   out = {.draw_keys = impl_->explicit_schedule && !impl_->explicit_schedule->draw_keys.empty() ? std::span<const std::uint64_t>{impl_->explicit_schedule->draw_keys}.subspan(slot.start, slot.count) : std::span<const std::uint64_t>{},
+          .microbatch_key = impl_->explicit_schedule && !impl_->explicit_schedule->microbatch_keys.empty() ? impl_->explicit_schedule->microbatch_keys.at(slot.start / impl_->config.batch_size) : 0,
+    .num_images = slot.count,
     .device_images = static_cast<const float*>(impl_->stream->device_storage(index).data()),
     .label_index = impl_->source.label_index().data(),
     .labels = impl_->source.labels().data(),
     .rle_pairs = impl_->source.rle_pairs().data(),
-    .image_indices = impl_->order.data() + slot.start,
+    .image_indices = impl_->indices().data() + slot.start,
     .slot_index = index,
     .lease_id = slot.lease,
     .owner = impl_.get(),

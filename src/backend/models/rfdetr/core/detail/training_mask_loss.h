@@ -29,6 +29,7 @@ struct DirectMaskSamples {
 struct DirectMaskRandomSeeds {
  std::uint64_t candidates;
  std::uint64_t remainder;
+ torch::Tensor rows;
 };
 DirectMaskSamples sample_direct_masks(
  const torch::Tensor& masks, const PreparedTargets& targets, const torch::Tensor& indices, int64_t ratio, const LayerMaskSamples& samples, std::optional<DirectMaskRandomSeeds> seeds = std::nullopt);
@@ -40,5 +41,5 @@ struct PairwiseMaskSamples {
  torch::Tensor targets;  // [B, M, P], padded rows zero
 };
 PairwiseMaskSamples sample_pairwise_masks(
- const OutputLayer& layer, const PreparedTargets& targets, const torch::Tensor& indices, const torch::Tensor& valid, int64_t point_ratio, const torch::Tensor& coordinates = {});
+ const OutputLayer& layer, const PreparedTargets& targets, const torch::Tensor& indices, const torch::Tensor& valid, int64_t point_ratio, const torch::Tensor& coordinates = {}, std::optional<std::uint64_t> sampling_key = std::nullopt);
 }  // namespace mmltk::backend::models::rfdetr

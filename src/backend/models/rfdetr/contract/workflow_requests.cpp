@@ -1,6 +1,8 @@
 #include "src/backend/models/rfdetr/contract/workflow_requests.h"
 #include "src/backend/models/rfdetr/contract/preset_catalog.h"
 #include <algorithm>
+#include <array>
+#include "src/frameworks/serialization/reflected_json.h"
 #include <cstddef>
 #include <limits>
 #include <meta>
@@ -29,6 +31,7 @@ void validate_export_onnx_request(const ExportOnnxRequest& request) {
 }
 void validate_predict_request(const PredictRequest& request) {
  require_valid_fields(request, "invalid RF-DETR predict fields");
+ (void)derive_execution_facts(request, 0);
  const bool compiled_source = request.source_kind == PredictSourceKind::CompiledDataset && !request.compiled_path.empty() && request.image_inputs.empty() && request.video_path.empty();
  const bool image_source = request.source_kind == PredictSourceKind::ImageFiles && request.compiled_path.empty() && !request.image_inputs.empty() && request.video_path.empty();
  const bool video_source = request.source_kind == PredictSourceKind::VideoFile && !request.video_path.empty() && request.compiled_path.empty() && request.image_inputs.empty();
@@ -38,6 +41,7 @@ void validate_predict_request(const PredictRequest& request) {
 }
 void validate_validate_request(const ValidateRequest& request) {
  require_valid_fields(request, "invalid RF-DETR validation fields");
+ (void)derive_execution_facts(request, 0);
  if (request.compiled_path.empty() || request.selected_input_count() == 0U || (request.recompile && request.source_dir.empty()))
   throw std::runtime_error("rfdetr validate requires compiled input and a model artifact");
 }
@@ -49,6 +53,8 @@ void validate_train_placement(const TrainRequest& request) {
 void validate_train_request(const TrainRequest& request) {
  require_valid_fields(request, "invalid RF-DETR training fields");
  validate_train_placement(request);
+ (void)derive_execution_facts(request, 0);
+ (void)derive_training_validation_facts(request, 0);
  if (!training_supervision_config_valid(request.training_supervision)) { throw std::runtime_error("invalid RF-DETR training supervision configuration"); }
  if (training_supervision_enabled(request.training_supervision) && request.compilation_mode == CompilationMode::kFullTrace) {
   throw std::runtime_error("RF-DETR Match-Free and denoising supervision do not support full-trace compilation");
@@ -69,8 +75,21 @@ void validate_train_request(const TrainRequest& request) {
  const bool distributed = request.distributed_worker ? request.distributed_rank >= 0 && request.distributed_world_size > 1 && !request.distributed_store_path.empty()
                                                      : request.distributed_rank == 0 && request.distributed_world_size == 1 && request.distributed_store_path.empty();
  if (input_count != 1U || !gpu_augmentation_config_valid(request.gpu_augmentation) || !mmltk::frameworks::reflection::unique_nonnegative_identifiers(request.device_ids) ||
-     !mmltk::frameworks::reflection::enum_contains(request.lr_scheduler) || !distributed) {
+     !mmltk::frameworks::reflection::enum_contains(request.recipe.lr_scheduler) || !distributed) {
   throw std::runtime_error("rfdetr train requires train/validation data, output, and one checkpoint input");
  }
+}
+std::string encode_train_request_json(const TrainRequest& request) {
+ validate_train_request(request);
+ std::array<std::byte, kMaximumTrainRequestJsonBytes> scratch;
+ auto text = mmltk::frameworks::serialization::reflected_json(request, scratch, {.max_bytes = scratch.size(), .max_items = 4096, .max_depth = 32}).dump();
+ if (text.size() > kMaximumTrainRequestJsonBytes) throw std::invalid_argument("training request JSON exceeds 64 KiB");
+ return text;
+}
+TrainRequest decode_train_request_json(const std::string_view text) {
+ if (text.empty() || text.size() > kMaximumTrainRequestJsonBytes) throw std::invalid_argument("training request JSON must fit 64 KiB");
+ auto request = mmltk::frameworks::serialization::decode_reflected_json<TrainRequest>(text, {.max_bytes = kMaximumTrainRequestJsonBytes, .max_items = 4096, .max_depth = 32});
+ validate_train_request(request);
+ return request;
 }
 }  // namespace mmltk::backend::models::rfdetr

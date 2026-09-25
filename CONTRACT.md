@@ -166,7 +166,15 @@ selection for model preparation and execution; local training retains ordered
 multi-device ranks and their placement. Unavailable selections produce useful
 errors. The browser's graphics device remains independently selected.
 Training additionally owns current-format history, fresh transfer initialization,
-and validated checkpoint continuation. Selecting inputs, continuation mode, or an
+and validated checkpoint continuation.
+Native training configuration owns one recipe vocabulary across global defaults
+and stable independent model settings, with checked logical batch and admission
+facts. Global microbatches, accumulation, data identity, and stochastic inputs
+remain independent of physical worker capacity and rank slicing. Training owns
+scheduler clocks, held optimizer values, and separate final-epoch encoder and
+augmentation policies. Exact continuation restores these values and complete
+named model state before applying a newly due policy; applied policies remain
+latched when the epoch horizon is extended. Selecting inputs, continuation mode, or an
 output directory never starts a run. Compact operational text fits a stable
 single line while preserving complete accessible and copyable content.
 Export independently selects interchange and engine artifacts through one
@@ -380,7 +388,7 @@ and retires its failed resources safely. Recoverable runtimes reconstruct
 lazily within that system, while independent systems continue operating.
 Persisted settings retain their named format. Compiled datasets use format 9
 with source geometry and annotation metadata. Native RF-DETR
-checkpoints use only the current version-3 format; external upstream assets retain
+checkpoints use only the current version-4 format; external upstream assets retain
 their independent import formats.
 
 An independent immutable data catalog owns exact foreground names and dense

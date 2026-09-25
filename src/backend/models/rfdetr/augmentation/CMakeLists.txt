@@ -15,6 +15,7 @@ mmltk_register_public_headers(
         annotation_support.h
         sampling.h
         augmentation_plan.h
+        gpu_augmentation_donor_index.h
         gpu_augment.h
         gpu_augment_cuda.h
         gpu_augment_types.h
@@ -33,8 +34,7 @@ mmltk_register_ordinary_sources(
 mmltk_register_private_headers(
     mmltk_backend_models_rfdetr_augmentation
     detail/gpu_augment_cuda_launch.h
-    detail/gpu_augment_plan_math.h
-    detail/gpu_augmentation_donor_index.h)
+    detail/gpu_augment_plan_math.h)
 target_include_directories(
     mmltk_backend_models_rfdetr_augmentation PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR})

@@ -1,4 +1,5 @@
 #pragma once
+#include "training_schedule.h"
 #include <numeric>
 #include "src/backend/models/rfdetr/core/model.h"
 #include "training_scalar_packet.h"
@@ -155,19 +156,6 @@ private:
  torch::Tensor inverse_scale_device_;
  std::vector<torch::Tensor> gradient_scratch_;
 };
-struct LrScheduleConfig {
- double warmup_epochs = 0.0;
- double warmup_momentum = 0.0;
- TrainLrSchedulerKind lr_scheduler = TrainLrSchedulerKind::Cosine;
- int64_t lr_drop = 1;
- double lr_min_factor = 0.0;
-};
-double compute_lr_scale(const LrScheduleConfig& config, int64_t current_step, int64_t steps_per_epoch, int64_t total_training_steps);
-double compute_warmup_momentum(const LrScheduleConfig& config, int64_t current_step, int64_t steps_per_epoch, double target_momentum);
-template <typename OptimizerLike>
-inline void set_optimizer_lrs(OptimizerLike& optimizer, const std::vector<double>& base_lrs, const double scale) {
- optimizer.set_lrs(base_lrs, scale);
-}
 enum class TrainingSupervisionRoute : std::uint8_t {
  Hungarian,
  MatchFree,

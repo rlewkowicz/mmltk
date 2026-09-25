@@ -4,6 +4,7 @@
 #include <ATen/Context.h>
 #include <ATen/autocast_mode.h>
 #include <ATen/CPUGeneratorImpl.h>
+#include "detail/semantic_sampling.h"
 #include <ATen/TensorIndexing.h>
 #include <ATen/cuda/CUDAGeneratorImpl.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -48,7 +49,6 @@ std::uint64_t tagged_seed(std::uint64_t seed, const std::uint64_t tag) {
 std::uint64_t denoising_step_seed(const TrainingStepIdentity& identity) {
  auto seed = tagged_seed(identity.seed, 0x444e5f53544550ULL);
  seed = tagged_seed(seed, identity.epoch);
- seed = tagged_seed(seed, static_cast<std::uint64_t>(identity.rank));
  return tagged_seed(seed, identity.batch_sequence);
 }
 void initialize_linear(torch::nn::Linear& linear, const std::uint64_t seed) {
@@ -464,18 +464,17 @@ std::optional<DenoisingQueryBatch> TrainingSupervisionImpl::prepare_denoising(
   const std::vector<int64_t> coordinate_shape{batch, groups, padded.maximum_count, 2};
   const auto float_options = torch::TensorOptions().dtype(torch::kFloat32).device(device);
   const auto integer_options = torch::TensorOptions().dtype(torch::kInt64).device(device);
-  if (!denoising_generator_ || denoising_generator_->device() != device) {
-   denoising_generator_ =
-    device.is_cuda() ? at::cuda::detail::createCUDAGenerator(static_cast<c10::DeviceIndex>(device.has_index() ? device.index() : c10::cuda::current_device())) : at::detail::createCPUGenerator();
-  }
-  denoising_generator_->set_current_seed(denoising_step_seed(identity));
   DenoisingVariates generated;
   const DenoisingVariates* variates = injected_variates;
   if (variates == nullptr) {
-   generated.center = at::rand(coordinate_shape, *denoising_generator_, float_options);
-   generated.size = at::rand(coordinate_shape, *denoising_generator_, float_options);
-   generated.label_flip = at::rand(slot_shape, *denoising_generator_, float_options);
-   if (foreground_count_ > 1) { generated.other_label = at::randint(config_.num_classes - 2, slot_shape, *denoising_generator_, integer_options); }
+   const auto inventory_keys = targets.sampling_keys.defined() ? targets.sampling_keys : torch::arange(targets.all_labels.size(0), integer_options);
+   const auto keys = inventory_keys.index_select(0, padded.indices.clamp_min(0).reshape({-1})).reshape({batch, padded.maximum_count});
+   const auto group_keys = torch::bitwise_xor(keys.unsqueeze(1), torch::arange(groups, integer_options).view({1, groups, 1}) * 0x45d9f3b);
+   const auto seed = targets.sampling_keys.defined() ? 0U : denoising_step_seed(identity);
+   generated.center = semantic_uniform(group_keys, 2, seed ^ 0x444e43454eULL);
+   generated.size = semantic_uniform(group_keys, 2, seed ^ 0x444e53495aULL);
+   generated.label_flip = semantic_uniform(group_keys, 1, seed ^ 0x444e464c49ULL).squeeze(-1);
+   if (foreground_count_ > 1) generated.other_label = (semantic_uniform(group_keys, 1, seed ^ 0x444e4c4142ULL).squeeze(-1) * (config_.num_classes - 2)).to(torch::kInt64);
    variates = &generated;
   } else {
    require_denoising_variates(*variates, slot_shape, device, foreground_count_);
@@ -512,7 +511,7 @@ std::optional<DenoisingQueryBatch> TrainingSupervisionImpl::prepare_denoising(
    valid,
    target_indices,
    std::move(layout),
-   tagged_seed(denoising_step_seed(identity), 0x444e5f4d41534bULL),
+   tagged_seed(targets.sampling_keys.defined() ? targets.microbatch_key : denoising_step_seed(identity), 0x444e5f4d41534bULL),
   };
  };
  if (!timing_) { return operation(); }
@@ -746,7 +745,10 @@ TrainingLoss TrainingSupervisionImpl::denoising_loss(
      LayerMaskSamples samples;
      if (!mask_samples.empty()) samples = mask_samples[layer_index];
      const auto layer_seed = tagged_seed(tagged_seed(outputs.mask_sampling_seed, 0x4c41594552ULL), layer_index);
-     const DirectMaskRandomSeeds seeds{tagged_seed(layer_seed, 0x43414e4449444154ULL), tagged_seed(layer_seed, 0x52414e444f4dULL)};
+     const auto groups = torch::floor_divide(torch::cat(query_indices), outputs.queries_per_group);
+     const auto semantic_rows = target_inventory.sampling_keys.defined()
+      ? torch::bitwise_xor(target_inventory.sampling_keys.index_select(0, mask_indices), groups * 0x45d9f3b) : torch::Tensor{};
+     const DirectMaskRandomSeeds seeds{tagged_seed(layer_seed, 0x43414e4449444154ULL), tagged_seed(layer_seed, 0x52414e444f4dULL), semantic_rows};
      const auto sampled = sample_direct_masks(masks, target_inventory, mask_indices, config_.mask_point_sample_ratio, samples, seeds);
      const auto mask_zero = config_.mask_ce_loss_coef == 0.0 || config_.mask_dice_loss_coef == 0.0 ? sampled.logits.sum() * 0.0 : torch::Tensor{};
      result.mask_ce = result.mask_ce + (config_.mask_ce_loss_coef == 0.0 ? mask_zero : config_.mask_ce_loss_coef * sigmoid_ce_loss(sampled.logits, sampled.targets, divisor, false, mask_valid));
@@ -811,7 +813,8 @@ TrainingLoss TrainingSupervisionImpl::loss(
   for (const auto& layer : outputs.aux_outputs) { layers.push_back(&layer); }
   if (config_.two_stage && outputs.enc_outputs) { layers.push_back(&*outputs.enc_outputs); }
  }
- for (const auto* layer : layers) {
+ for (std::size_t layer_index = 0; layer_index < layers.size(); ++layer_index) {
+  const auto* layer = layers[layer_index];
   if (!layer->query_features || !layer->query_layout) { throw std::runtime_error("Match-Free supervised layer lacks captured query features"); }
   if (layer->query_layout->groups != groups) { throw std::runtime_error("Match-Free supervised layer has an inconsistent query group layout"); }
   // Foreground-free classification is an RF-DETR extension. Each empty image's
@@ -830,7 +833,10 @@ TrainingLoss TrainingSupervisionImpl::loss(
    result.auxiliary = result.auxiliary.defined() ? result.auxiliary + background : background;
   if (padded.maximum_count == 0) continue;
   std::optional<PairwiseMaskSamples> masks;
-  if (use_masks) masks = sample_pairwise_masks(*layer, targets, padded.indices, padded.valid, config_.mask_point_sample_ratio);
+  if (use_masks) {
+   const auto key = targets.sampling_keys.defined() ? std::optional<std::uint64_t>{tagged_seed(targets.microbatch_key, layer_index)} : std::nullopt;
+   masks = sample_pairwise_masks(*layer, targets, padded.indices, padded.valid, config_.mask_point_sample_ratio, {}, key);
+  }
   const auto probes = masks ? timed(TimingState::Stage::GroundTruthProjection, [&] { return project_ground_truth(encoding, &*masks); }) : box_probes;
   const auto dense = timed(TimingState::Stage::Affinity, [&] { return dense_correspondence(probes, *layer->query_features); });
   const auto sparse = timed(TimingState::Stage::Sparse, [&] { return sparse_match_free_correspondence(dense, padded.valid, config_.training_supervision.match_free.rho); });

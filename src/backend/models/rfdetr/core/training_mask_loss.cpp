@@ -2,6 +2,7 @@
 #include "detail/detection_sampling.h"
 #include <torch/nn/functional/loss.h>
 #include <ATen/CPUGeneratorImpl.h>
+#include "detail/semantic_sampling.h"
 #include <ATen/cuda/CUDAGeneratorImpl.h>
 #include "detail/training_mask_ops_cuda.h"
 #include "detail/matcher_workspace.h"
@@ -189,6 +190,7 @@ torch::Tensor get_uncertain_point_coords_with_randomness(const torch::Tensor& co
   if (supplied.defined() || !seeds) return mask_coordinates(supplied, num_boxes, count, coarse_logits.device());
   // Missing draws share only this invocation's generator; each stream starts
   // from its own seed, independently of explicit operands and global RNG state.
+  if (seeds->rows.defined()) return semantic_uniform(seeds->rows, count * 2, seed).reshape({num_boxes, count, 2});
   if (!generator) generator = coarse_logits.is_cuda() ? at::cuda::detail::createCUDAGenerator(coarse_logits.device().index()) : at::detail::createCPUGenerator();
   generator->set_current_seed(seed);
   return at::rand({num_boxes, count, 2}, *generator, coarse_logits.options().dtype(torch::kFloat32));
@@ -237,7 +239,7 @@ DirectMaskSamples sample_direct_masks(
  return {point_logits, labels};
 }
 PairwiseMaskSamples sample_pairwise_masks(
- const OutputLayer& layer, const PreparedTargets& targets, const torch::Tensor& indices, const torch::Tensor& valid, int64_t point_ratio, const torch::Tensor& coordinates) {
+ const OutputLayer& layer, const PreparedTargets& targets, const torch::Tensor& indices, const torch::Tensor& valid, int64_t point_ratio, const torch::Tensor& coordinates, std::optional<std::uint64_t> sampling_key) {
  if (!layer.sparse_pred_masks) throw std::invalid_argument("Match-Free masks require sparse spatial/query projections");
  const auto& sparse = *layer.sparse_pred_masks;
  const auto& spatial = sparse.spatial_features;
@@ -250,7 +252,7 @@ PairwiseMaskSamples sample_pairwise_masks(
  validate_packed_mask_extent(masks, "Match-Free");
  if (masks.bits.size(0) < targets.all_labels.size(0)) throw std::invalid_argument("Match-Free packed masks do not cover the target inventory");
  const auto points = std::max<int64_t>(1, spatial.size(2) * spatial.size(3) / point_ratio);
- const auto coords = mask_coordinates(coordinates, 1, points, spatial.device());
+ const auto coords = coordinates.defined() || !sampling_key ? mask_coordinates(coordinates, 1, points, spatial.device()) : semantic_coordinates(*sampling_key, points, 0x4d4650414952ULL, spatial.device());
  auto features = point_sample(spatial.to(torch::kFloat32), coords.expand({spatial.size(0), points, 2}));
  auto logits = torch::bmm(sparse.query_features.to(torch::kFloat32), features) + sparse.bias.to(torch::kFloat32);
  auto sampled_targets = sample_target_masks(masks, indices.reshape({-1}), coords, "Match-Free").view({indices.size(0), indices.size(1), points});

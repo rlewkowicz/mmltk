@@ -18,6 +18,7 @@ struct TrainLaneContext {
  TargetScratch target_scratch;
  std::shared_ptr<NativeRfDetrModel> model;
  std::vector<torch::Tensor> grad_params;
+ std::vector<TrainingDonorDescriptor> donors;
  size_t synced_parameter_version = std::numeric_limits<size_t>::max();
 };
 std::optional<mmltk::backend::ml::cuda::CudaEventPool::Lease> record_current_stream_event(mmltk::backend::ml::cuda::CudaEventPool& event_pool, const int device_id, const char* context) {
@@ -107,7 +108,7 @@ struct TrainingLanes::Impl {
  std::unique_ptr<mmltk::common::concurrency::WorkerPool> pool;
 };
 TrainingLanes::TrainingLanes(const TrainRequest& options, RuntimeContext& train_runtime, mmltk::backend::data::DatasetLoader& train_loader, NativeRfDetrModel& model,
- const std::vector<std::string>& all_param_names, int train_lane_count, const mmltk::frameworks::gpu::DeviceContext& augmentation_context)
+ const std::vector<std::string>& all_param_names, int train_lane_count, std::size_t local_batch, const mmltk::frameworks::gpu::DeviceContext& augmentation_context)
     : impl_(std::make_unique<Impl>()) {
  auto& train_lane_pool = impl_->pool;
  auto& train_lanes = impl_->lanes;
@@ -119,23 +120,38 @@ TrainingLanes::TrainingLanes(const TrainRequest& options, RuntimeContext& train_
     torch_cuda::get_priority_cuda_stream(options.device_id, mmltk::frameworks::gpu::current_cuda_highest_stream_priority()), static_cast<std::size_t>(std::max(1, options.grad_accum_steps)));
   }
   for (auto& lane : train_lanes) {
+   lane.donors.reserve(local_batch);
    lane.augmenter = std::make_unique<GpuBatchAugmenter>(
-    options.gpu_augmentation, static_cast<std::int64_t>(options.batch_size), static_cast<int>(train_loader.image_height()), static_cast<int>(train_loader.image_width()), augmentation_context);
+    options.gpu_augmentation, static_cast<std::int64_t>(local_batch), static_cast<int>(train_loader.image_height()), static_cast<int>(train_loader.image_width()), augmentation_context);
    lane.model = make_train_lane_model(model, options.device_id);
    (*lane.model)
     .configure_supervision_timing(
-     SupervisionTimingSetup{mmltk::backend::ml::cuda::cuda_device(options.device_id), static_cast<std::size_t>(std::max(1, options.grad_accum_steps)), mmltk::common::logging::profile_enabled()});
-   lane.model->optimize_for_inference(checked_cast<int>(std::max<std::size_t>(1, options.batch_size), "batch_size exceeds supported inference compilation range"), true, options.compilation_mode);
+     SupervisionTimingSetup{mmltk::backend::ml::cuda::cuda_device(options.device_id), static_cast<std::size_t>(derive_execution_facts(options, 0).microbatches_per_attempt), mmltk::common::logging::profile_enabled()});
+   lane.model->optimize_for_inference(checked_cast<int>(local_batch, "batch_size exceeds supported inference compilation range"), true, options.compilation_mode);
    lane.grad_params = lane_grad_parameters(*lane.model, all_param_names);
   }
  }
 }
 TrainingLanes::~TrainingLanes() = default;
+void TrainingLanes::reconfigure(NativeRfDetrModel& source, const std::vector<std::string>& names, const GpuAugmentationConfig& augmentation, int batch_size, CompilationMode mode) {
+ // Called only at a drained epoch boundary. Replicas and allocations are retained.
+ settle_targets();
+ for (auto& lane : impl_->lanes) {
+  torch_cuda::TorchCudaStreamGuard stream_guard(lane.stream);
+  copy_module_state(*lane.model, source);
+  lane.grad_params = lane_grad_parameters(*lane.model, names);
+  lane.model->invalidate_compilation();
+  lane.model->optimize_for_inference(batch_size, true, mode);
+  lane.augmenter->reconfigure(augmentation);
+  lane.synced_parameter_version = std::numeric_limits<size_t>::max();
+ }
+}
 std::future<TrainLaneResult> TrainingLanes::enqueue(RuntimeContext* runtime, mmltk::backend::data::DatasetLoader& loader, const mmltk::backend::data::Batch& batch,
  const mmltk::backend::ml::cuda::CudaEventPool::Lease* params_ready, mmltk::backend::ml::cuda::CudaEventPool& event_pool, std::size_t admitted_microbatches, double gradient_scale,
  size_t parameter_version, const DetectionConfig& detection_config, const NativeRfDetrModel& model, int device_id, int image_height, int image_width, std::uint64_t seed, int epoch, int rank,
- std::uint64_t augmentation_sequence, bool amp_enabled, at::ScalarType autocast_dtype, TrainingSupervisionRoute route, std::shared_ptr<WaveTargetNormalizer> wave_normalizer, std::size_t lane_index) {
+ std::uint64_t augmentation_sequence, bool amp_enabled, at::ScalarType autocast_dtype, TrainingSupervisionRoute route, std::shared_ptr<WaveTargetNormalizer> wave_normalizer, std::size_t lane_index, std::span<const TrainingDonorDescriptor> donors) {
  auto& lane = impl_->lanes.at(lane_index);
+ lane.donors.assign(donors.begin(), donors.end());
  auto& lane_pool = *impl_->pool;
  return lane_pool.enqueue([runtime, &loader, &lane, batch, params_ready, &event_pool, admitted_microbatches, gradient_scale, parameter_version, &detection_config, &model, device_id, image_height,
                            image_width, seed, epoch, rank, augmentation_sequence, amp_enabled, autocast_dtype, route, wave_normalizer = std::move(wave_normalizer), lane_index]() mutable {
@@ -149,7 +165,7 @@ std::future<TrainLaneResult> TrainingLanes::enqueue(RuntimeContext* runtime, mml
     mmltk::common::logging::ScopedProfile profile_rfdetr_train_parallel_augment{"rfdetr.train.parallel.augment"};
     mmltk::common::logging::ScopedProfile profile_benchmark_rfdetr_train_augmentation{"benchmark.rfdetr.train.augmentation"};
     if (!lane.augmenter) { throw std::runtime_error("parallel RF-DETR train lane is missing its GPU augmenter"); }
-    normalized = lane.augmenter->run(batch, seed, epoch, rank, augmentation_sequence);
+    normalized = lane.augmenter->run(batch, seed, epoch, rank, augmentation_sequence, &loader, lane.donors);
    }
    PreparedTargets prepared;
    {

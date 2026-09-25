@@ -22,7 +22,7 @@
 #include "mmltk/frameworks/reflection/materializer.h"
 #include "detail/gpu_augment_cuda_launch.h"
 #include "detail/gpu_augment_plan_math.h"
-#include "detail/gpu_augmentation_donor_index.h"
+#include "gpu_augmentation_donor_index.h"
 #include "src/frameworks/gpu/cuda_error.h"
 #include "src/frameworks/reflection/reflection_metadata.h"
 namespace mmltk::backend::models::rfdetr {
@@ -192,6 +192,48 @@ std::int64_t detail::CachedAugmentationDonorIndex::select(const std::size_t star
  const auto slot = static_cast<std::size_t>(first);
  return donors_[slot].dataset_index == source ? next_different_[slot] : first;
 }
+void prepare_augmentation_image(AugmentationImagePlan& plan, const GpuAugmentationConfig& config, std::uint64_t key, std::uint32_t dataset_index,
+ const GpuAugmentationDonor* selected, std::int64_t donor_slot, float* image_parameters, float* paste) {
+ plan = {};
+ prepare_image_plan(plan, launch_config(config), key, image_parameters);
+ plan.cache_choice = augment_math::uniform01(key, 0x5000ULL);
+ plan.cache_source_dataset_index = dataset_index;
+ std::fill_n(paste, kGpuCopyPasteParameterCount, 0.0F);
+ paste[0] = -1.0F;
+ if (!selected || selected->label < 0 || selected->dataset_index == dataset_index || !augmentation_paste_admitted(config, key)) return;
+ const auto& donor = *selected;
+   const float scale = 0.5F + augment_math::uniform01(key, 0x4002ULL);
+   const float destination_x = augment_math::uniform01(key, 0x4003ULL);
+   const float destination_y = augment_math::uniform01(key, 0x4004ULL);
+   const float source_x = (donor.box[0] + donor.box[2]) * 0.5F;
+   const float source_y = (donor.box[1] + donor.box[3]) * 0.5F;
+   const float translate_x = destination_x - scale * source_x;
+   const float translate_y = destination_y - scale * source_y;
+   const float inverse_scale = 1.0F / scale;
+   const float output_x0 = augment_math::clamp01(std::fma(scale, donor.box[0], translate_x));
+   const float output_y0 = augment_math::clamp01(std::fma(scale, donor.box[1], translate_y));
+   const float output_x1 = augment_math::clamp01(std::fma(scale, donor.box[2], translate_x));
+   const float output_y1 = augment_math::clamp01(std::fma(scale, donor.box[3], translate_y));
+   if (output_x1 <= output_x0 || output_y1 <= output_y0) return;
+   plan.paste_donor_slot = donor_slot;
+   plan.paste_masked = donor.has_mask;
+   plan.paste_label = donor.label;
+   plan.paste_sampling_identity = donor.sampling_identity;
+   plan.paste_source_area = donor.area;
+   plan.paste_source_box = donor.box;
+   plan.paste_output_box = {output_x0, output_y0, output_x1, output_y1};
+   plan.paste_inverse = {inverse_scale, 0.0F, -translate_x * inverse_scale, 0.0F, inverse_scale, -translate_y * inverse_scale};
+   paste[0] = static_cast<float>(donor_slot);
+   paste[1] = donor.has_mask ? 1.0F : 2.0F;
+   std::copy(plan.paste_inverse.begin(), plan.paste_inverse.end(), paste + 2);
+}
+AugmentationImagePlan plan_augmentation_image(const GpuAugmentationConfig& config, std::uint64_t key, std::uint32_t dataset_index, const GpuAugmentationDonor* donor, std::int64_t slot) {
+ AugmentationImagePlan plan;
+ std::array<float, kGpuAugmentationParameterCount> parameters{};
+ std::array<float, kGpuCopyPasteParameterCount> paste{};
+ prepare_augmentation_image(plan, config, key, dataset_index, donor, slot, parameters.data(), paste.data());
+ return plan;
+}
 struct GpuAugmentationExecutor::Impl final {
  struct PreparedStorage final {
   explicit PreparedStorage(mmltk::frameworks::gpu::DeviceContext owner, std::size_t capacity) : context(std::move(owner)), views(capacity * 2U), staged(kStagingSlots * capacity * 2U) {}
@@ -280,54 +322,21 @@ struct GpuAugmentationExecutor::Impl final {
   plan.transforms_geometry = transforms_geometry;
   plan.erases_spatial_support = false;
   plan.copy_paste_enabled = copy_paste;
-  const GpuAugmentationLaunchConfig launch = launch_config(config);
   if (copy_paste && donor_selection == GpuAugmentationDonorSelection::Cached) donor_index.rebuild(donors);
   for (std::size_t image = 0U; image < plan.active_size; ++image) {
-   AugmentationImagePlan& image_plan = plan.images[image];
-   image_plan = AugmentationImagePlan{};
-   const std::uint64_t key = image_keys[image];
-   prepare_image_plan(image_plan, launch, key, image_parameters + image * static_cast<std::size_t>(kGpuAugmentationParameterCount));
-   plan.erases_spatial_support |= image_plan.erasure.dropout_probability > 0.0F || image_plan.erasure.rectangular != 0U;
-   image_plan.cache_choice = augment_math::uniform01(key, 0x5000ULL);
-   image_plan.cache_source_dataset_index = batch.image_indices[image];
-   if (!copy_paste) { continue; }
-   float* current_paste = paste + image * static_cast<std::size_t>(kGpuCopyPasteParameterCount);
-   std::fill_n(current_paste, kGpuCopyPasteParameterCount, 0.0F);
-   current_paste[0] = -1.0F;
-   if (!augmentation_paste_admitted(config, key)) { continue; }
+   const auto key = image_keys[image];
    std::int64_t donor_slot = -1;
-   if (donor_selection == GpuAugmentationDonorSelection::Aligned) {
-    const GpuAugmentationDonor& donor = donors[image];
-    donor_slot = donor.label >= 0 && donor.dataset_index != batch.image_indices[image] ? static_cast<std::int64_t>(image) : -1;
-   } else {
-    const std::size_t start = std::min<std::size_t>(static_cast<std::size_t>(augment_math::uniform01(key, 0x4001ULL) * static_cast<float>(capacity)), capacity - 1U);
-    donor_slot = donor_index.select(start, batch.image_indices[image]);
+   if (copy_paste) {
+    if (donor_selection == GpuAugmentationDonorSelection::Aligned) donor_slot = static_cast<std::int64_t>(image);
+    else {
+     const auto start = std::min<std::size_t>(static_cast<std::size_t>(augment_math::uniform01(key, 0x4001ULL) * static_cast<float>(capacity)), capacity - 1U);
+     donor_slot = donor_index.select(start, batch.image_indices[image]);
+    }
    }
-   if (donor_slot < 0) { continue; }
-   const GpuAugmentationDonor& donor = donors[static_cast<std::size_t>(donor_slot)];
-   const float scale = 0.5F + augment_math::uniform01(key, 0x4002ULL);
-   const float destination_x = augment_math::uniform01(key, 0x4003ULL);
-   const float destination_y = augment_math::uniform01(key, 0x4004ULL);
-   const float source_x = (donor.box[0] + donor.box[2]) * 0.5F;
-   const float source_y = (donor.box[1] + donor.box[3]) * 0.5F;
-   const float translate_x = destination_x - scale * source_x;
-   const float translate_y = destination_y - scale * source_y;
-   const float inverse_scale = 1.0F / scale;
-   const float output_x0 = augment_math::clamp01(std::fma(scale, donor.box[0], translate_x));
-   const float output_y0 = augment_math::clamp01(std::fma(scale, donor.box[1], translate_y));
-   const float output_x1 = augment_math::clamp01(std::fma(scale, donor.box[2], translate_x));
-   const float output_y1 = augment_math::clamp01(std::fma(scale, donor.box[3], translate_y));
-   if (output_x1 <= output_x0 || output_y1 <= output_y0) { continue; }
-   image_plan.paste_donor_slot = donor_slot;
-   image_plan.paste_masked = donor.has_mask;
-   image_plan.paste_label = donor.label;
-   image_plan.paste_source_area = donor.area;
-   image_plan.paste_source_box = donor.box;
-   image_plan.paste_output_box = {output_x0, output_y0, output_x1, output_y1};
-   image_plan.paste_inverse = {inverse_scale, 0.0F, -translate_x * inverse_scale, 0.0F, inverse_scale, -translate_y * inverse_scale};
-   current_paste[0] = static_cast<float>(donor_slot);
-   current_paste[1] = donor.has_mask ? 1.0F : 2.0F;
-   std::copy(image_plan.paste_inverse.begin(), image_plan.paste_inverse.end(), current_paste + 2);
+   std::array<float, kGpuCopyPasteParameterCount> unused{};
+   prepare_augmentation_image(plan.images[image], config, key, batch.image_indices[image], donor_slot >= 0 ? &donors[donor_slot] : nullptr, donor_slot,
+    image_parameters + image * kGpuAugmentationParameterCount, copy_paste ? paste + image * kGpuCopyPasteParameterCount : unused.data());
+   plan.erases_spatial_support |= plan.images[image].erasure.dropout_probability > 0 || plan.images[image].erasure.rectangular != 0;
   }
  }
  // Retained context outlives every physical allocation. Each staging slot

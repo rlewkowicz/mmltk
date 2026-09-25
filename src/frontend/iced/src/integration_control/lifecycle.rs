@@ -2142,10 +2142,10 @@ pub(super) fn advanced_field_id(index: usize) -> String {
         1 => crate::generated::constraint_workflowstrainrequestvalbatchsize(),
         2 => crate::generated::constraint_workflowstrainrequestepochs(),
         3 => crate::generated::constraint_workflowstrainrequestgradaccumsteps(),
-        4 => crate::generated::constraint_workflowstrainrequestlr(),
-        5 => crate::generated::constraint_workflowstrainrequestlrencoder(),
-        6 => crate::generated::constraint_workflowstrainrequestweightdecay(),
-        7 => crate::generated::constraint_workflowstrainrequestmomentum(),
+        4 => crate::generated::constraint_workflowstrainrequestrecipelr(),
+        5 => crate::generated::constraint_workflowstrainrequestrecipelrencoder(),
+        6 => crate::generated::constraint_workflowstrainrequestrecipeweightdecay(),
+        7 => crate::generated::constraint_workflowstrainrequestrecipemomentum(),
         _ => unreachable!("Advanced has eight fixed numeric controls"),
     };
     constraint.stable_field_id.to_string()
@@ -2181,7 +2181,7 @@ pub(super) fn advanced_control_value(
         if index == 2 {
             f64::from(draft.workflows.train.request.epochs)
         } else {
-            crate::generated::effective_workflowstrainrequestlr(&draft.workflows.train.request)
+            crate::generated::effective_workflowstrainrequestrecipelr(&draft.workflows.train.request)
         }
     })
 }
@@ -2191,7 +2191,7 @@ pub(super) fn advanced_snapshot_value(model: &ApplicationModel, index: usize) ->
         if index == 2 {
             f64::from(snapshot.settingsstate.workflows.train.request.epochs)
         } else {
-            crate::generated::effective_workflowstrainrequestlr(
+            crate::generated::effective_workflowstrainrequestrecipelr(
                 &snapshot.settingsstate.workflows.train.request,
             )
         }
@@ -2218,8 +2218,8 @@ pub(super) fn numeric_edit_target(
         (current.to_string(), f64::from(target), target.to_string())
     } else {
         let current =
-            crate::generated::effective_workflowstrainrequestlr(&draft.workflows.train.request);
-        let constraint = crate::generated::constraint_workflowstrainrequestlr();
+            crate::generated::effective_workflowstrainrequestrecipelr(&draft.workflows.train.request);
+        let constraint = crate::generated::constraint_workflowstrainrequestrecipelr();
         let minimum = constraint.minimum.unwrap_or(f64::MIN);
         let maximum = constraint.maximum.unwrap_or(f64::MAX);
         let step = 0.0001;

@@ -1,5 +1,9 @@
 #include "src/backend/ml/torch/tests/catch_support.h"
+#include <algorithm>
 #include <array>
+#include <fstream>
+#include <nlohmann/json.hpp>
+#include "src/backend/data/tests/test_fixture.h"
 #include <limits>
 #include <string>
 #include <vector>
@@ -25,17 +29,9 @@ r::TrainRequest saved_request() {
  request.gpu_augmentation.perceptual_downscale = true;
  return request;
 }
-torch::serialize::InputArchive continuation_fixture(const r::TrainRequest& request) {
+torch::serialize::InputArchive continuation_fixture(const r::TrainRequest& request, const r::detail::TrainingContinuationValues& values) {
  torch::serialize::OutputArchive output;
- r::detail::write_training_continuation(output, request,
-  {.epoch = 0,
-   .best_regular_metric = -std::numeric_limits<double>::infinity(),
-   .best_ema_metric = -std::numeric_limits<double>::infinity(),
-   .grad_scaler_scale = 1024.0,
-   .grad_scaler_growth_tracker = 17,
-   .ema_completed_updates = request.use_ema ? 37 : 0,
-   .training_attempt_id = "attempt",
-   .training_original_descriptor = "original.json"});
+ r::detail::write_training_continuation(output, request, values);
  torch::serialize::OutputArchive optimizer;
  mmltk::backend::ml::serialization::write_int(optimizer, "fixture", 1);
  output.write("optimizer", optimizer);
@@ -45,6 +41,17 @@ torch::serialize::InputArchive continuation_fixture(const r::TrainRequest& reque
   output.write("ema_state", ema);
  }
  return r::testsupport::checkpoint_input(output);
+}
+torch::serialize::InputArchive continuation_fixture(const r::TrainRequest& request) {
+ return continuation_fixture(request, r::testsupport::continuation_values(request,
+  {.epoch = 0,
+   .best_regular_metric = -std::numeric_limits<double>::infinity(),
+   .best_ema_metric = -std::numeric_limits<double>::infinity(),
+   .grad_scaler_scale = 1024.0,
+   .grad_scaler_growth_tracker = 17,
+   .ema_completed_updates = request.use_ema ? 37 : 0,
+   .training_attempt_id = "attempt",
+   .training_original_descriptor = "original.json"}));
 }
 void test_current_continuation_required_fields() {
  auto source = continuation_fixture(saved_request());
@@ -82,13 +89,11 @@ void test_current_continuation_required_fields() {
  REQUIRE_FALSE(r::detail::read_training_continuation(input).has_value());
 }
 void test_current_continuation_scalar_boundaries() {
- const std::array<std::pair<std::string, c10::IValue>, 22> invalid{{{"epoch", int64_t{-1}}, {"epoch", int64_t{std::numeric_limits<int>::max()}}, {"grad_scaler_scale", 0.0},
+ const std::array<std::pair<std::string, c10::IValue>, 14> invalid{{{"epoch", int64_t{-1}}, {"epoch", int64_t{std::numeric_limits<int>::max()}}, {"grad_scaler_scale", 0.0},
   {"grad_scaler_scale", std::numeric_limits<double>::infinity()}, {"grad_scaler_growth_tracker", int64_t{-1}}, {"grad_scaler_growth_tracker", int64_t{std::numeric_limits<int>::max()} + 1},
   {"ema_completed_updates", int64_t{-1}}, {"ema_completed_updates", std::numeric_limits<int64_t>::max()}, {"ema_completed_updates", int64_t{1}},
   {"best_regular_metric", std::numeric_limits<double>::quiet_NaN()}, {"best_ema_metric", std::numeric_limits<double>::quiet_NaN()}, {"training_attempt_id", std::string{}},
-  {"training_attempt_id", std::string(65, 'a')}, {"training_original_descriptor", std::string(mmltk::frameworks::reflection::kMaximumPathBytes + 1, 'a')}, {"warmup_epochs", 0.25},
-  {"warmup_momentum", 0.25}, {"lr_min_factor", 0.25}, {"lr_drop", int64_t{7}}, {"lr_scheduler", std::string("cosine")}, {"gpu_augment_perceptual_downscale", false},
-  {"optimizer_kind", std::string("invalid")}, {"gpu_augment_geometry_probability", 0.125}}};
+  {"training_attempt_id", std::string(65, 'a')}, {"training_original_descriptor", std::string(mmltk::frameworks::reflection::kMaximumPathBytes + 1, 'a')}}};
  for (const auto& [key, value] : invalid) {
   auto source = continuation_fixture(saved_request());
   torch::serialize::OutputArchive output;
@@ -114,10 +119,10 @@ void test_current_continuation_scalar_boundaries() {
  r::testsupport::copy_checkpoint_archive(supervised_source, missing_supervision, "training_supervision_config_cbor");
  auto missing_input = r::testsupport::checkpoint_input(missing_supervision);
  REQUIRE_THROWS(r::detail::read_training_continuation(missing_input));
- for (auto optimizer : {r::TrainOptimizerKind::AdamW, r::TrainOptimizerKind::Muon}) {
+ for (auto optimizer : {r::TrainOptimizerKind::AdamW, r::TrainOptimizerKind::Muon, r::TrainOptimizerKind::SGD}) {
   for (bool ema : {false, true}) {
    auto request = saved_request();
-   request.optimizer = optimizer;
+   request.recipe.optimizer = optimizer;
    request.use_ema = ema;
    auto source = continuation_fixture(request);
    const auto admitted = r::detail::read_training_continuation(source);
@@ -128,10 +133,10 @@ void test_current_continuation_scalar_boundaries() {
    active.output_dir = "another-run";
    active.epochs += 10;
    REQUIRE_NOTHROW(r::detail::require_active_training_continuation(*admitted, active));
-   active.optimizer = optimizer == r::TrainOptimizerKind::AdamW ? r::TrainOptimizerKind::Muon : r::TrainOptimizerKind::AdamW;
+   active.recipe.optimizer = optimizer == r::TrainOptimizerKind::AdamW ? r::TrainOptimizerKind::Muon : r::TrainOptimizerKind::AdamW;
    REQUIRE_THROWS(r::detail::require_active_training_continuation(*admitted, active));
    active = request;
-   active.lr_drop += 1;
+   active.recipe.lr_drop += 1;
    REQUIRE_THROWS(r::detail::require_active_training_continuation(*admitted, active));
    active = request;
    active.training_supervision.denoising.enabled = true;
@@ -187,6 +192,59 @@ void test_ordered_cpu_ema_admission() {
 TEST_CASE("test_current_continuation_required_fields", "[model][rfdetr][training][continuation]") { test_current_continuation_required_fields(); }
 TEST_CASE("test_current_continuation_scalar_boundaries", "[model][rfdetr][training][continuation]") { test_current_continuation_scalar_boundaries(); }
 TEST_CASE("test_ordered_cpu_ema_admission", "[model][rfdetr][training][continuation][ema]") { test_ordered_cpu_ema_admission(); }
+TEST_CASE("Continuation preserves held SGD values logical offsets donor identities and applied epoch latches", "[model][rfdetr][training][continuation]") {
+ auto request = saved_request();
+ request.recipe.optimizer = r::TrainOptimizerKind::SGD;
+ r::reset_train_recipe(request.recipe);
+ request.recipe.warmup_epochs = .375;
+ request.epochs = 4;
+ request.batch_size = 2;
+ request.grad_accum_steps = 2;
+ request.freeze_encoder = true;
+ request.unfreeze_encoder_last_epochs = 4;
+ request.disable_augmentation_last_epochs = 4;
+ auto base = continuation_fixture(request);
+ auto values = r::detail::read_training_continuation(base)->values;
+ r::TrainingSchedule schedule(request.recipe, {.01, .01}, {r::TrainingGroupRole::Bias, r::TrainingGroupRole::Ordinary}, 4, 4, 2);
+ schedule.begin_epoch(0);
+ schedule.consume_microbatch(); schedule.consume_microbatch();
+ schedule.prepare_attempt(); schedule.finish_attempt(false);
+ values.schedule = schedule.state();
+ values.epoch_policy = {true, true};
+ values.data.epoch = 0;
+ values.data.next_microbatch = 2;
+ values.data.donors = {{7, 3, true}, {2, 9, true}};
+ auto input = continuation_fixture(request, values);
+ const auto saved = r::detail::read_training_continuation(input);
+ REQUIRE(saved);
+ CHECK(saved->configuration == request);
+ CHECK(saved->values.schedule == values.schedule);
+ CHECK(saved->values.data == values.data);
+ CHECK(saved->values.epoch_policy == values.epoch_policy);
+ auto extended = request;
+ extended.epochs = 12;
+ REQUIRE_NOTHROW(r::detail::require_active_training_continuation(*saved, extended));
+ r::TrainingSchedule restored(extended.recipe, {.01, .01}, {r::TrainingGroupRole::Bias, r::TrainingGroupRole::Ordinary}, extended.epochs, 8, 2);
+ restored.restore(saved->values.schedule);
+ restored.begin_epoch(0);
+ CHECK(restored.state() == schedule.state());
+ r::TrainingEpochPolicy policy(extended.unfreeze_encoder_last_epochs, extended.disable_augmentation_last_epochs, saved->values.epoch_policy);
+ CHECK(policy.enter(1, extended.epochs) == values.epoch_policy);
+ extended.disable_augmentation_last_epochs = 3;
+ REQUIRE_THROWS(r::detail::require_active_training_continuation(*saved, extended));
+ for (int fault = 0; fault < 5; ++fault) {
+  auto invalid = values;
+  switch (fault) {
+   case 0: ++invalid.data.next_microbatch; break;
+   case 1: ++invalid.schedule.consumed_attempts; break;
+   case 2: invalid.schedule.successful_updates = 2; break;
+   case 3: ++invalid.schedule.warmup_microbatches; break;
+   case 4: invalid.data.donors.pop_back(); break;
+  }
+  INFO(fault);
+  REQUIRE_THROWS(continuation_fixture(request, invalid));
+ }
+}
 TEST_CASE("Resolved current Resume preserves recipe optimizer EMA and an unfinished stock warmup", "[model][rfdetr][training][continuation][parity]") {
  const mmltk::testsupport::ScopedTempDir root("stock-resume-admission");
  const auto path = root.path() / "resume.pt";
@@ -213,7 +271,7 @@ TEST_CASE("Resolved current Resume preserves recipe optimizer EMA and an unfinis
  weight.set_requires_grad(true);
  auto request = saved_request();
  request.use_ema = true;
- request.warmup_epochs = 1.5;
+ request.recipe.warmup_epochs = 1.5;
  request.ema_decay = 0.9;
  request.ema_tau = 3;
  torch::OrderedDict<std::string, torch::Tensor> inventory;
@@ -235,7 +293,7 @@ TEST_CASE("Resolved current Resume preserves recipe optimizer EMA and an unfinis
  built.optimizer.reserve_checkpoint(readback, state.entries().size() + 1);
  torch::serialize::OutputArchive archive;
  r::detail::write_native_checkpoint_metadata(archive, state.metadata);
- r::detail::write_training_continuation(archive, request,
+ r::detail::write_training_continuation(archive, request, r::testsupport::continuation_values(request,
   {.epoch = 0,
    .best_regular_metric = 0.2,
    .best_ema_metric = 0.3,
@@ -243,7 +301,7 @@ TEST_CASE("Resolved current Resume preserves recipe optimizer EMA and an unfinis
    .grad_scaler_growth_tracker = 7,
    .ema_completed_updates = 3,
    .training_attempt_id = "stock-admission",
-   .training_original_descriptor = "original.json"});
+   .training_original_descriptor = "original.json"}));
  r::detail::write_resume_state_archive(archive, "state", state.entries(), readback, 0);
  r::detail::write_resume_state_archive(archive, "ema_state", shadow, readback, state.entries().size());
  torch::serialize::OutputArchive optimizer_archive;
@@ -274,8 +332,8 @@ TEST_CASE("Resolved current Resume preserves recipe optimizer EMA and an unfinis
  REQUIRE(torch::equal(admitted_resume.restored_ema->shadow_params()[0], saved_shadow));
  REQUIRE(torch::equal(resumed_weight, saved_weight));
  resumed.optimizer.commit(std::move(*admitted_resume.optimizer_candidate));
- r::LrScheduleConfig schedule;
- schedule.warmup_epochs = continuation->configuration.warmup_epochs;
+ r::TrainRecipeSettings schedule;
+ schedule.warmup_epochs = continuation->configuration.recipe.warmup_epochs;
  schedule.lr_scheduler = r::TrainLrSchedulerKind::Step;
  schedule.lr_drop = 10;
  const auto resumed_step = admitted_resume.start_epoch * 3;
@@ -291,7 +349,7 @@ TEST_CASE("Resolved current Resume preserves recipe optimizer EMA and an unfinis
  REQUIRE(torch::equal(weight, resumed_weight));
  REQUIRE(torch::equal(ema.shadow_params()[0], admitted_resume.restored_ema->shadow_params()[0]));
  auto invalid = active;
- invalid.warmup_epochs = 2.0;
+ invalid.recipe.warmup_epochs = 2.0;
  REQUIRE_THROWS(r::detail::admit_training_configuration(admitted.artifacts.config, admitted.model_state.admitted_archive(), invalid));
  REQUIRE(admitted.artifacts.config.cls_loss_coef == 7.3);
  REQUIRE_THROWS(r::detail::admit_training_configuration(admitted.artifacts.config, nullptr, active));
@@ -304,4 +362,50 @@ TEST_CASE("Resolved current Resume preserves recipe optimizer EMA and an unfinis
  REQUIRE_FALSE(r::detail::admit_training_configuration(admitted.artifacts.config, admitted.model_state.admitted_archive(), request).has_value());
  REQUIRE(admitted.artifacts.config.cls_loss_coef == 1.0);
  REQUIRE(admitted.model_state.metadata.cls_loss_coef == 7.3);
+}
+
+TEST_CASE("Continuation donor admission validates every descriptor before changing history", "[model][rfdetr][training][continuation]") {
+ namespace data = mmltk::backend::data;
+ namespace fixture = data::testsupport;
+ mmltk::testsupport::ScopedTempDir root("continuation-donors");
+ fixture::FixtureSpec spec; spec.root_dir = root.path().string(); spec.num_images = 3; spec.background_images = 0;
+ fixture::create_synthetic_dataset(spec);
+ const auto crowd_path = std::filesystem::path(fixture::dataset_dir(spec)) / spec.split / "000003.jsonl";
+ nlohmann::json crowd;
+ { std::ifstream input(crowd_path); input >> crowd; }
+ crowd["iscrowd"] = 1;
+ { std::ofstream output(crowd_path); output << crowd.dump() << '\n'; }
+ fixture::compile_existing_fixture(spec);
+ data::DatasetLoader::Config config; config.compiled_path = fixture::compiled_bin_path(spec); config.batch_size = 2;
+ data::DatasetLoader loader(config);
+ auto request = saved_request(); request.batch_size = 2;
+ auto base = continuation_fixture(request);
+ auto values = r::detail::read_training_continuation(base)->values;
+ values.data.donors = {{0, 0, true}, {1, 0, true}};
+ r::TrainingDonorHistory history(1, 2);
+ history.restore(loader, values.data.donors);
+ const auto accepted = history.state();
+ const std::array<std::uint64_t, 2> keys{41, 42};
+ const std::array<std::uint32_t, 2> images{0, 1};
+ const auto planned = history.plan(0, keys, images);
+ const std::vector<r::TrainingDonorDescriptor> expected(planned.begin(), planned.end());
+ auto valid_archive = continuation_fixture(request, values);
+ const auto valid = r::detail::read_training_continuation(valid_archive);
+ REQUIRE(valid);
+ r::TrainingDonorHistory resumed(1, 2);
+ resumed.restore(loader, valid->values.data.donors);
+ CHECK(std::ranges::equal(resumed.plan(0, keys, images), expected));
+ for (const auto invalid : {r::TrainingDonorDescriptor{3, 0, true}, r::TrainingDonorDescriptor{1, 1, true}, r::TrainingDonorDescriptor{2, 0, true}}) {
+  values.data.donors = {{1, 0, true}, invalid};
+  auto archive = continuation_fixture(request, values);
+  const auto restored = r::detail::read_training_continuation(archive);
+  REQUIRE(restored);
+  REQUIRE_THROWS(history.restore(loader, restored->values.data.donors));
+  CHECK(history.state() == accepted);
+ }
+ values.data.donors = {{std::numeric_limits<std::uint32_t>::max(), std::numeric_limits<std::uint32_t>::max(), false}, {1, 0, true}};
+ history.restore(loader, values.data.donors);
+ CHECK(history.state() == values.data.donors);
+ REQUIRE_THROWS(history.restore(loader, {}));
+ CHECK(history.state() == values.data.donors);
 }

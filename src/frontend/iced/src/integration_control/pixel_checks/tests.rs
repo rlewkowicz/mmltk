@@ -313,7 +313,7 @@ fn fps_capture_success_and_recoverable_failures_restore_both_canonical_baselines
             drop(driver.advance(&model, &settings, 1.0, &router, FeatureId::Explore, None));
             assert_eq!(driver.driver.phase, Phase::AwaitWorkspaceFpsRestored);
             let restoration = settings
-                .take_request()
+                .take_request(false)
                 .expect("canonical restoration request for either baseline");
             assert_eq!(restoration.updates.len(), 1);
             assert_eq!(

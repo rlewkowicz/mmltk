@@ -196,7 +196,7 @@ TrainingCheckpointAdmission inspect_training_checkpoint(const std::filesystem::p
   if (stop.stop_requested()) throw ArtifactPublicationCancelled{};
   tensors.emplace(entry.name, entry.tensor);
  }
- const auto names = request.optimizer == TrainOptimizerKind::AdamW ? NativeAdamW::InspectCheckpoint(optimizer, tensors, stop) : NativeMuonWithAuxAdam::InspectCheckpoint(optimizer, tensors, stop);
+ const auto names = request.recipe.optimizer == TrainOptimizerKind::AdamW ? NativeAdamW::InspectCheckpoint(optimizer, tensors, stop) : request.recipe.optimizer == TrainOptimizerKind::SGD ? NativeSGD::InspectCheckpoint(optimizer, tensors, stop) : NativeMuonWithAuxAdam::InspectCheckpoint(optimizer, tensors, stop);
  if (request.use_ema) {
   torch::serialize::InputArchive ema;
   archive.read("ema_state", ema);

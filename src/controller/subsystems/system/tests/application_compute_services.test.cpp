@@ -912,7 +912,7 @@ TEST_CASE("Train process run owns its stop token, forwards progress, and reaps s
  mmltk::testsupport::ScopedTempDir temp("mmltk-train-run");
  const auto output = temp.path() / "output";
  const auto executable = script(temp,
-  "out=''; while [ $# -gt 0 ]; do [ \"$1\" = '--output-dir' ] && { out=\"$2\"; break; }; shift; done\n"
+  "out=$(\"" MMLTK_TRAIN_REQUEST_FIXTURE "\" \"$@\") || exit $?\n"
   "printf "
   "'{\"phase\":\"training\",\"completed_batches\":1,\"total_batches\":1,\"checkpoint_path\":\"checkpoint."
   "pt\"}' > \"$out/progress.json\"\n"
@@ -950,7 +950,7 @@ TEST_CASE("Train process client observes bounded output and inotify progress", "
  std::filesystem::create_directories(output);
  REQUIRE(::mkfifo((temp.path() / "gate").c_str(), 0600) == 0);
  const auto executable = script(temp,
-  "out=''; while [ $# -gt 0 ]; do [ \"$1\" = '--output-dir' ] && { out=\"$2\"; break; }; shift; done\n"
+  "out=$(\"" MMLTK_TRAIN_REQUEST_FIXTURE "\" \"$@\") || exit $?\n"
   "read ignored < \"$(dirname \"$out\")/gate\"\n"
   "printf first; printf "
   "'{\"phase\":\"training\",\"completed_batches\":1,\"total_batches\":2,\"checkpoint_path\":\"checkpoint."
@@ -986,7 +986,7 @@ TEST_CASE("Train process client rejects oversized public progress fields", "[gui
  std::filesystem::create_directories(output);
  REQUIRE(::mkfifo((temp.path() / "gate").c_str(), 0600) == 0);
  const auto executable = script(temp,
-  "out=''; while [ $# -gt 0 ]; do [ \"$1\" = '--output-dir' ] && { out=\"$2\"; break; }; shift; done\n"
+  "out=$(\"" MMLTK_TRAIN_REQUEST_FIXTURE "\" \"$@\") || exit $?\n"
   "read ignored < \"$(dirname \"$out\")/gate\"\n"
   "long=$(yes x | tr -d '\\n' | head -c 4097)\n"
   "printf '{\"phase\":\"%s\",\"checkpoint_path\":\"checkpoint.pt\"}' \"$long\" > \"$out/progress.json\"\n");
@@ -1004,7 +1004,7 @@ TEST_CASE("Train process client rejects oversized public checkpoint paths", "[gu
  std::filesystem::create_directories(output);
  REQUIRE(::mkfifo((temp.path() / "gate").c_str(), 0600) == 0);
  const auto executable = script(temp,
-  "out=''; while [ $# -gt 0 ]; do [ \"$1\" = '--output-dir' ] && { out=\"$2\"; break; }; shift; done\n"
+  "out=$(\"" MMLTK_TRAIN_REQUEST_FIXTURE "\" \"$@\") || exit $?\n"
   "read ignored < \"$(dirname \"$out\")/gate\"\n"
   "long=$(yes x | tr -d '\\n' | head -c 4097)\n"
   "printf '{\"phase\":\"training\",\"checkpoint_path\":\"%s\"}' \"$long\" > \"$out/progress.json\"\n");

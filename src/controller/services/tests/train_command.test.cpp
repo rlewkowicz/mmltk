@@ -1,258 +1,162 @@
-#include <cmath>
 #include "src/controller/services/train_command.h"
-#include <algorithm>
-#include <charconv>
-#include <limits>
-#include <stdexcept>
-#include <string>
-#include <string_view>
-#include <system_error>
-#include <tuple>
-#include <utility>
-#include <vector>
-#include <catch2/catch_test_macros.hpp>
-#include "src/test_support/error_expectation_test_utils.hpp"
 #include "src/backend/models/rfdetr/contract/workflow_requests.h"
+#include <catch2/catch_test_macros.hpp>
+#include <concepts>
+#include <limits>
+#include <string>
+#include <type_traits>
 namespace {
-bool train_recipe_value_matches(double lhs, double rhs, double eps = 1.0e-12) { return std::abs(lhs - rhs) <= eps; }
-using namespace mmltk::controller::services;
-using TrainRecipeRelation = mmltk::frameworks::reflection::catalog_provider_relation<mmltk::backend::models::rfdetr::TrainRecipeCatalog>;
-template <auto Member>
-void pin_recipe_member(mmltk::backend::models::rfdetr::TrainRequest& request) {
- TrainRecipeRelation::template set_override<mmltk::frameworks::reflection::member_path<Member>>(request.recipe_overrides);
+namespace r = mmltk::backend::models::rfdetr;
+r::TrainRequest request() {
+ r::TrainRequest value;
+ value.train_compiled_path = "/tmp/train.bin";
+ value.val_compiled_path = "/tmp/val.bin";
+ value.weights_path = "/tmp/weights.pt";
+ value.output_dir = "/tmp/output";
+ return value;
 }
-// Canonical train request with the shared dataset/output/weight paths used by every test here.
-mmltk::backend::models::rfdetr::TrainRequest make_train_request(std::vector<int> device_ids = {}) {
- mmltk::backend::models::rfdetr::TrainRequest request;
- request.train_compiled_path = "/tmp/train.bin";
- request.val_compiled_path = "/tmp/val.bin";
- request.output_dir = "/tmp/output";
- request.weights_path = "/tmp/weights.pt";
- request.resolution = 384;
- request.device_ids = std::move(device_ids);
- return request;
+r::TrainRequest child_request(const r::TrainRequest& value) {
+ const auto arguments = mmltk::controller::services::build_train_command_arguments(value);
+ REQUIRE(arguments.size() == 4);
+ CHECK(arguments[0] == "rfdetr");
+ CHECK(arguments[1] == "train");
+ CHECK(arguments[2] == "--request-json");
+ REQUIRE(arguments[3].size() <= r::kMaximumTrainRequestJsonBytes);
+ return r::decode_train_request_json(arguments[3]);
 }
-void assert_flag_with_value(const std::vector<std::string>& args, const std::string_view flag, const std::string_view value) {
- const auto found = std::find(args.begin(), args.end(), flag);
- REQUIRE((found != args.end()));
- REQUIRE((found + 1 != args.end()));
- REQUIRE((*(found + 1) == value));
 }
-void assert_flag_present(const std::vector<std::string>& args, const std::string_view flag) { REQUIRE((std::find(args.begin(), args.end(), flag) != args.end())); }
-void assert_float_flag_round_trip(const std::vector<std::string>& args, const std::string_view flag, const float expected) {
- const auto found = std::find(args.begin(), args.end(), flag);
- REQUIRE(found != args.end());
- REQUIRE(found + 1 != args.end());
- float parsed = 0.0F;
- const std::string& text = *(found + 1);
- const auto result = std::from_chars(text.data(), text.data() + text.size(), parsed, std::chars_format::general);
- REQUIRE(result.ec == std::errc{});
- REQUIRE(result.ptr == text.data() + text.size());
- CHECK(parsed == expected);
+TEST_CASE("training child carries the complete canonical request including topology and independent recipes", "[gui][train_command]") {
+ auto value = request();
+ CHECK(child_request(value) == value);
+ value.device_ids = {3, 1};
+ value.numa_nodes = {2, -1};
+ value.h2d_dataloader = false;
+ value.test_compiled_path = "/independent/test.bin";
+ value.progress_bar = false;
+ value.recipe.optimizer = r::TrainOptimizerKind::SGD;
+ r::reset_train_recipe(value.recipe);
+ value.lanes = 2;
+ value.lane_configuration.mode = r::TrainLaneMode::Independent;
+ r::resize_training_models(value.lane_configuration, 2, value.recipe, value.seed);
+ value.lane_configuration.models[1].seed = 9001;
+ value.lane_configuration.models[1].recipe.lr = .012345678901234;
+ using Relation = mmltk::frameworks::reflection::catalog_provider_relation<r::TrainRecipeCatalog>;
+ Relation::set_override<mmltk::frameworks::reflection::member_path<&r::TrainRecipeSettings::lr>>(value.lane_configuration.models[1].recipe.overrides);
+ value.data_policy.balancing = r::TrainBalancing::RareRepeatsStratified;
+ value.validation_lanes = 3;
+ value.unfreeze_encoder_last_epochs = 4;
+ value.disable_augmentation_last_epochs = 7;
+ CHECK(child_request(value) == value);
+ value.weights_path.clear(); value.resume_path = "/tmp/resume.pt";
+ CHECK(child_request(value) == value);
+ value.distributed_worker = true;
+ value.distributed_rank = 1;
+ value.distributed_world_size = 2;
+ value.distributed_store_path = "/tmp/distributed-store";
+ CHECK(child_request(value) == value);
 }
-void assert_flag_absent(const std::vector<std::string>& args, const std::string_view flag) { REQUIRE((std::find(args.begin(), args.end(), flag) == args.end())); }
-void test_single_device_builds_device_id() {
- const std::vector<std::string> args = build_train_command_arguments(make_train_request({2}));
- assert_flag_with_value(args, "--device-id", "2");
- assert_flag_with_value(args, "--numa-node", "-1");
- assert_flag_absent(args, "--device-ids");
- assert_flag_absent(args, "--gdrcopy");
- auto request = make_train_request({2});
- request.numa_nodes = {3};
- request.h2d_dataloader = false;
- const auto placed = build_train_command_arguments(request);
- assert_flag_with_value(placed, "--numa-node", "3");
- assert_flag_present(placed, "--gdrcopy");
- assert_flag_absent(placed, "--numa-nodes");
+TEST_CASE("training command preserves supervision and independent perceptual switches exactly", "[gui][train_command][training_supervision]") {
+ for (const auto assignment : {r::TrainAssignmentKind::Hungarian, r::TrainAssignmentKind::MatchFree})
+  for (bool denoising : {false, true})
+   for (bool augmentation : {false, true})
+    for (bool perceptual : {false, true}) {
+     auto value = request();
+     value.training_supervision.assignment = assignment;
+     value.training_supervision.match_free.rho = r::kSupervisionOpenUnitMaximum;
+     value.training_supervision.match_free.correspondence_weight = .12345679F;
+     value.training_supervision.match_free.query_weight = 1.25F;
+     value.training_supervision.denoising.enabled = denoising;
+     value.training_supervision.denoising.groups = 10;
+     value.training_supervision.denoising.label_noise_ratio = .87654322F;
+     value.training_supervision.denoising.center_noise_scale = r::kSupervisionOpenUnitMinimum;
+     value.training_supervision.denoising.size_noise_scale = r::kSupervisionOpenUnitMaximum;
+     value.gpu_augmentation.enabled = augmentation;
+     value.gpu_augmentation.perceptual_downscale = perceptual;
+     CHECK(child_request(value) == value);
+    }
 }
-void test_multi_device_builds_device_ids() {
- auto request = make_train_request({0, 2, 4});
- request.numa_nodes = {0, 3, -1};
- const std::vector<std::string> args = build_train_command_arguments(request);
- assert_flag_with_value(args, "--numa-node", "-1");
- assert_flag_with_value(args, "--numa-nodes", "0,3,-1");
- assert_flag_with_value(args, "--device-ids", "0,2,4");
- assert_flag_absent(args, "--device-id");
+TEST_CASE("canonical training JSON is bounded and rejects invalid payloads before launch", "[gui][train_command]") {
+ CHECK_THROWS(r::decode_train_request_json(""));
+ CHECK_THROWS(r::decode_train_request_json(std::string(r::kMaximumTrainRequestJsonBytes + 1, ' ')));
+ CHECK_THROWS(r::decode_train_request_json("{broken"));
+ auto value = request();
+ value.device_id = -1;
+ CHECK_THROWS(child_request(value));
+ value = request(); value.recipe.lr = std::numeric_limits<double>::infinity();
+ CHECK_THROWS(child_request(value));
+ value = request(); value.recipe.lr_scheduler = r::TrainLrSchedulerKind::UltralyticsLinear;
+ CHECK_THROWS(child_request(value));
+ value = request(); value.lanes = 0;
+ CHECK_THROWS(child_request(value));
 }
-void test_zero_device_rejected() {
- auto request = make_train_request();
- request.device_id = -1;
- mmltk::testsupport::expect_runtime_error_contains([&request]() { (void)build_train_command_arguments(request); });
+TEST_CASE("recipe selection and reset preserve scope and derive every override bit", "[gui][train_command]") {
+ using Relation = mmltk::frameworks::reflection::catalog_provider_relation<r::TrainRecipeCatalog>;
+ auto value = request();
+ value.recipe.lr = .009;
+ Relation::set_override<mmltk::frameworks::reflection::member_path<&r::TrainRecipeSettings::lr>>(value.recipe.overrides);
+ value.recipe.optimizer = r::TrainOptimizerKind::Muon;
+ r::resolve_train_recipe(value.recipe);
+ CHECK(value.recipe.lr == .009);
+ CHECK(value.recipe.lr_encoder == .0003);
+ CHECK(value.recipe.lr_scheduler == r::TrainLrSchedulerKind::Cosine);
+ auto independent = value.recipe;
+ r::reset_train_recipe(value.recipe);
+ CHECK(value.recipe.optimizer == r::TrainOptimizerKind::Muon);
+ CHECK(value.recipe.lr == .0002);
+ CHECK(independent.lr == .009);
+ std::size_t fields = 0;
+ Relation::VisitMembers([&]<class Entry> { CHECK_FALSE(Relation::overridden<Entry::destination>(value.recipe.overrides)); ++fields; });
+ CHECK(fields == r::kTrainRecipeFieldCount);
+ CHECK(r::cli_enum_spelling(r::TrainOptimizerKind::SGD) == "sgd");
+ CHECK(r::train_lr_scheduler_from_spelling("ultralytics-linear") == r::TrainLrSchedulerKind::UltralyticsLinear);
+ CHECK_FALSE(r::train_lr_scheduler_from_spelling("Cosine"));
 }
-void test_perceptual_selection_is_independent_in_child_arguments() {
- auto request = make_train_request({0});
- for (const bool enabled : {false, true})
-  for (const bool perceptual : {false, true}) {
-   request.gpu_augmentation.enabled = enabled;
-   request.gpu_augmentation.perceptual_downscale = perceptual;
-   const auto arguments = build_train_command_arguments(request);
-   CHECK(std::ranges::find(arguments, enabled ? "--gpu-augment" : "--no-gpu-augment") != arguments.end());
-   CHECK(std::ranges::find(arguments, perceptual ? "--aug-perceptual-downscale" : "--no-aug-perceptual-downscale") != arguments.end());
+TEST_CASE("Execution admission checks global products bounded stable models and finite recipe values", "[gui][train_command][execution]") {
+ auto value = request();
+ CHECK(value.lanes == 1);
+ CHECK(value.validation_lanes == 1);
+ CHECK(r::PredictRequest{}.lanes == 1);
+ CHECK(r::ValidateRequest{}.lanes == 1);
+ value.batch_size = 3; value.grad_accum_steps = 4; value.lanes = 2;
+ const auto shared = r::derive_execution_facts(value, 17);
+ CHECK(shared.settings_revision == 17);
+ CHECK(shared.logical_models == 1);
+ CHECK(shared.microbatches_per_attempt == 8);
+ CHECK(shared.effective_batch_per_model == 24);
+ CHECK(shared.aggregate_round_images == 24);
+ r::resize_training_models(value.lane_configuration, r::kMaximumTrainingModels, value.recipe, value.seed);
+ CHECK(value.lane_configuration.models.size() == 16);
+ CHECK(value.lane_configuration.models.front().seed != value.lane_configuration.models.back().seed);
+ const auto retained = value.lane_configuration;
+ CHECK_THROWS(r::resize_training_models(value.lane_configuration, 17, value.recipe, value.seed));
+ CHECK(value.lane_configuration == retained);
+ value.lane_configuration.mode = r::TrainLaneMode::PeriodicAveraging;
+ value.lanes = 16;
+ CHECK(r::derive_execution_facts(value, 18).effective_batch_per_model == 12);
+ CHECK(r::effective_final_policy(value.lane_configuration) == r::TrainFinalPolicy::Off);
+ value.lane_configuration.models.clear();
+ value.lane_configuration.next_model_id = std::numeric_limits<std::uint64_t>::max();
+ CHECK_THROWS(r::resize_training_models(value.lane_configuration, 1, value.recipe, value.seed));
+ value = request(); value.batch_size = std::numeric_limits<std::size_t>::max(); value.lanes = 2;
+ CHECK_THROWS(r::derive_execution_facts(value, 0));
+ value = request(); value.val_batch_size = std::numeric_limits<std::size_t>::max(); value.validation_lanes = 2;
+ CHECK_THROWS(r::validate_train_request(value));
+ r::ValidateRequest validation; validation.batch_size = std::numeric_limits<std::size_t>::max(); validation.lanes = 2;
+ CHECK_THROWS(r::derive_execution_facts(validation, 0));
+ r::PredictRequest prediction; prediction.batch_size = std::numeric_limits<std::size_t>::max(); prediction.lanes = 2;
+ CHECK_THROWS(r::derive_execution_facts(prediction, 0));
+ value = request(); value.recipe.optimizer = r::TrainOptimizerKind::SGD; r::reset_train_recipe(value.recipe);
+ value.recipe.nesterov = true; value.recipe.momentum = 0;
+ CHECK_FALSE(r::train_recipe_valid(value.recipe));
+ value.recipe.momentum = .9;
+ CHECK(r::train_recipe_valid(value.recipe));
+ using Relation = mmltk::frameworks::reflection::catalog_provider_relation<r::TrainRecipeCatalog>;
+ Relation::VisitMembers([&]<class Entry> {
+  auto candidate = value.recipe;
+  auto& field = mmltk::frameworks::reflection::access<r::TrainRecipeSettings, Entry::destination>(candidate);
+  if constexpr (std::floating_point<std::remove_cvref_t<decltype(field)>>) {
+   field = std::numeric_limits<double>::quiet_NaN(); CHECK_FALSE(r::train_recipe_valid(candidate));
+   field = std::numeric_limits<double>::infinity(); CHECK_FALSE(r::train_recipe_valid(candidate));
   }
-}
-void test_optimizer_arguments_are_forwarded() {
- mmltk::backend::models::rfdetr::TrainRequest request = make_train_request({1});
- request.optimizer = mmltk::backend::models::rfdetr::TrainOptimizerKind::Muon;
- request.print_freq = 3;
- request.lr_encoder = 3.0e-4;
- request.lr_component_decay = 0.7;
- request.encoder_layer_decay = 0.8;
- request.momentum = 0.91;
- request.lr_scheduler = mmltk::backend::models::rfdetr::TrainLrSchedulerKind::Cosine;
- request.lr_min_factor = 0.01;
- request.warmup_epochs = 3.0;
- request.warmup_momentum = 0.8;
- pin_recipe_member<&mmltk::backend::models::rfdetr::TrainRequest::lr_encoder>(request);
- pin_recipe_member<&mmltk::backend::models::rfdetr::TrainRequest::lr_component_decay>(request);
- pin_recipe_member<&mmltk::backend::models::rfdetr::TrainRequest::encoder_layer_decay>(request);
- pin_recipe_member<&mmltk::backend::models::rfdetr::TrainRequest::momentum>(request);
- pin_recipe_member<&mmltk::backend::models::rfdetr::TrainRequest::lr_scheduler>(request);
- pin_recipe_member<&mmltk::backend::models::rfdetr::TrainRequest::lr_min_factor>(request);
- pin_recipe_member<&mmltk::backend::models::rfdetr::TrainRequest::warmup_epochs>(request);
- pin_recipe_member<&mmltk::backend::models::rfdetr::TrainRequest::warmup_momentum>(request);
- const std::vector<std::string> args = build_train_command_arguments(request);
- assert_flag_with_value(args, "--optimizer", "muon");
- assert_flag_with_value(args, "--momentum", "0.91");
- assert_flag_with_value(args, "--print-freq", "3");
- assert_flag_with_value(args, "--lr-encoder", "3e-04");
- assert_flag_with_value(args, "--warmup-momentum", "0.8");
- assert_flag_with_value(args, "--lr-scheduler", "cosine");
-}
-void test_scheduler_spelling_is_stable_for_cli_and_checkpoint_metadata() {
- using mmltk::backend::models::rfdetr::cli_enum_spelling;
- using mmltk::backend::models::rfdetr::train_lr_scheduler_from_spelling;
- using mmltk::backend::models::rfdetr::TrainLrSchedulerKind;
- REQUIRE((cli_enum_spelling(TrainLrSchedulerKind::Step) == "step"));
- REQUIRE((cli_enum_spelling(TrainLrSchedulerKind::Cosine) == "cosine"));
- REQUIRE((train_lr_scheduler_from_spelling("step") == TrainLrSchedulerKind::Step));
- REQUIRE((train_lr_scheduler_from_spelling("cosine") == TrainLrSchedulerKind::Cosine));
- REQUIRE((!train_lr_scheduler_from_spelling("Cosine")));
-}
-void test_recipe_defaults_are_not_serialized_as_overrides() {
- const std::vector<std::string> args = build_train_command_arguments(make_train_request({1}));
- assert_flag_absent(args, "--lr");
- assert_flag_absent(args, "--lr-encoder");
- assert_flag_absent(args, "--weight-decay");
-}
-void check_progress_flag_forwarding(const bool progress_bar, const std::string_view expected_present, const std::string_view expected_absent) {
- mmltk::backend::models::rfdetr::TrainRequest request = make_train_request({1});
- request.progress_bar = progress_bar;
- const std::vector<std::string> args = build_train_command_arguments(request);
- assert_flag_present(args, expected_present);
- assert_flag_absent(args, expected_absent);
-}
-void test_progress_flag_enabled_is_forwarded() { check_progress_flag_forwarding(true, "--progress", "--no-progress"); }
-void test_progress_flag_disabled_is_forwarded() { check_progress_flag_forwarding(false, "--no-progress", "--progress"); }
-void test_resume_input_is_serialized_without_weights() {
- mmltk::backend::models::rfdetr::TrainRequest request = make_train_request();
- request.weights_path.clear();
- request.resume_path = "/tmp/resume.pt";
- request.device_id = 3;
- const std::vector<std::string> args = build_train_command_arguments(request);
- assert_flag_with_value(args, "--resume", "/tmp/resume.pt");
- assert_flag_absent(args, "--weights");
-}
-void test_supervision_combinations_are_forwarded_with_exact_values() {
- using mmltk::backend::models::rfdetr::TrainAssignmentKind;
- for (const auto& [assignment, denoising, expected_assignment, expected_dn] :
-  {std::tuple{TrainAssignmentKind::Hungarian, false, "hungarian", "--no-dn"}, std::tuple{TrainAssignmentKind::Hungarian, true, "hungarian", "--dn"},
-   std::tuple{TrainAssignmentKind::MatchFree, false, "match-free", "--no-dn"}, std::tuple{TrainAssignmentKind::MatchFree, true, "match-free", "--dn"}}) {
-  auto request = make_train_request({1});
-  request.training_supervision.assignment = assignment;
-  request.training_supervision.match_free = {
-   .rho = 0.625F,
-   .correspondence_weight = 0.75F,
-   .query_weight = 1.25F,
-  };
-  request.training_supervision.denoising = {
-   .enabled = denoising,
-   .groups = 10U,
-   .label_noise_ratio = 0.3F,
-   .center_noise_scale = 0.45F,
-   .size_noise_scale = 0.35F,
-  };
-  const auto args = build_train_command_arguments(request);
-  assert_flag_with_value(args, "--assignment", expected_assignment);
-  assert_float_flag_round_trip(args, "--match-free-rho", request.training_supervision.match_free.rho);
-  assert_float_flag_round_trip(args, "--match-free-correspondence-weight", request.training_supervision.match_free.correspondence_weight);
-  assert_float_flag_round_trip(args, "--match-free-query-weight", request.training_supervision.match_free.query_weight);
-  assert_flag_present(args, expected_dn);
-  assert_flag_with_value(args, "--dn-groups", "10");
-  assert_float_flag_round_trip(args, "--dn-label-noise-ratio", request.training_supervision.denoising.label_noise_ratio);
-  assert_float_flag_round_trip(args, "--dn-center-noise-scale", request.training_supervision.denoising.center_noise_scale);
-  assert_float_flag_round_trip(args, "--dn-size-noise-scale", request.training_supervision.denoising.size_noise_scale);
- }
-}
-void test_supervision_float_arguments_round_trip_at_representable_boundaries() {
- auto request = make_train_request({1});
- request.training_supervision.assignment = mmltk::backend::models::rfdetr::TrainAssignmentKind::MatchFree;
- request.training_supervision.match_free.rho = mmltk::backend::models::rfdetr::kSupervisionOpenUnitMaximum;
- request.training_supervision.match_free.correspondence_weight = 0.12345679F;
- request.training_supervision.denoising.enabled = true;
- request.training_supervision.denoising.label_noise_ratio = 0.87654322F;
- request.training_supervision.denoising.center_noise_scale = mmltk::backend::models::rfdetr::kSupervisionOpenUnitMinimum;
- request.training_supervision.denoising.size_noise_scale = mmltk::backend::models::rfdetr::kSupervisionOpenUnitMaximum;
- const auto args = build_train_command_arguments(request);
- assert_float_flag_round_trip(args, "--match-free-rho", request.training_supervision.match_free.rho);
- assert_float_flag_round_trip(args, "--match-free-correspondence-weight", request.training_supervision.match_free.correspondence_weight);
- assert_float_flag_round_trip(args, "--dn-label-noise-ratio", request.training_supervision.denoising.label_noise_ratio);
- assert_float_flag_round_trip(args, "--dn-center-noise-scale", request.training_supervision.denoising.center_noise_scale);
- assert_float_flag_round_trip(args, "--dn-size-noise-scale", request.training_supervision.denoising.size_noise_scale);
-}
-void test_muon_recipe_defaults_are_resolved() {
- const auto recipe = mmltk::backend::models::rfdetr::train_recipe(mmltk::backend::models::rfdetr::TrainOptimizerKind::Muon);
- REQUIRE((train_recipe_value_matches(recipe.lr, 2.0e-4)));
- REQUIRE((train_recipe_value_matches(recipe.lr_encoder, 3.0e-4)));
- REQUIRE((train_recipe_value_matches(recipe.momentum, 0.9)));
- REQUIRE((train_recipe_value_matches(recipe.weight_decay, 5.0e-4)));
- REQUIRE((train_recipe_value_matches(recipe.warmup_epochs, 3.0)));
- REQUIRE((train_recipe_value_matches(recipe.warmup_momentum, 0.8)));
- REQUIRE((train_recipe_value_matches(recipe.lr_min_factor, 0.01)));
- REQUIRE((recipe.lr_scheduler == mmltk::backend::models::rfdetr::TrainLrSchedulerKind::Cosine));
-}
-void test_recipe_application_respects_overrides() {
- mmltk::backend::models::rfdetr::TrainRequest options;
- options.lr = 9.0e-4;
- mmltk::backend::models::rfdetr::TrainRecipeOverrideState overrides;
- TrainRecipeRelation::template set_override<mmltk::frameworks::reflection::member_path<&mmltk::backend::models::rfdetr::TrainRequest::lr>>(overrides);
- mmltk::backend::models::rfdetr::apply_train_recipe(options, mmltk::backend::models::rfdetr::train_recipe(mmltk::backend::models::rfdetr::TrainOptimizerKind::Muon), overrides);
- REQUIRE((train_recipe_value_matches(options.lr, 9.0e-4)));
- REQUIRE((train_recipe_value_matches(options.lr_encoder, 3.0e-4)));
- REQUIRE((options.lr_scheduler == mmltk::backend::models::rfdetr::TrainLrSchedulerKind::Cosine));
- REQUIRE((train_recipe_value_matches(options.warmup_momentum, 0.8)));
-}
-}  // namespace
-TEST_CASE("test_single_device_builds_device_id", "[gui][train_command]") { test_single_device_builds_device_id(); }
-TEST_CASE("test_multi_device_builds_device_ids", "[gui][train_command]") { test_multi_device_builds_device_ids(); }
-TEST_CASE("test_zero_device_rejected", "[gui][train_command]") { test_zero_device_rejected(); }
-TEST_CASE("test_optimizer_arguments_are_forwarded", "[gui][train_command]") { test_optimizer_arguments_are_forwarded(); }
-TEST_CASE("test_scheduler_spelling_is_stable_for_cli_and_checkpoint_metadata", "[gui][train_command]") { test_scheduler_spelling_is_stable_for_cli_and_checkpoint_metadata(); }
-TEST_CASE("test_recipe_defaults_are_not_serialized_as_overrides", "[gui][train_command]") { test_recipe_defaults_are_not_serialized_as_overrides(); }
-TEST_CASE("test_progress_flag_enabled_is_forwarded", "[gui][train_command]") { test_progress_flag_enabled_is_forwarded(); }
-TEST_CASE("test_progress_flag_disabled_is_forwarded", "[gui][train_command]") { test_progress_flag_disabled_is_forwarded(); }
-TEST_CASE("test_resume_input_is_serialized_without_weights", "[gui][train_command]") { test_resume_input_is_serialized_without_weights(); }
-TEST_CASE("test_supervision_combinations_are_forwarded_with_exact_values", "[gui][train_command][training_supervision]") { test_supervision_combinations_are_forwarded_with_exact_values(); }
-TEST_CASE("test_supervision_float_arguments_round_trip_at_representable_boundaries", "[gui][train_command][training_supervision]") {
- test_supervision_float_arguments_round_trip_at_representable_boundaries();
-}
-TEST_CASE("test_muon_recipe_defaults_are_resolved", "[gui][train_command]") { test_muon_recipe_defaults_are_resolved(); }
-TEST_CASE("test_recipe_application_respects_overrides", "[gui][train_command]") { test_recipe_application_respects_overrides(); }
-TEST_CASE("test_perceptual_selection_is_independent_in_child_arguments", "[gui][train_command][perceptual]") { test_perceptual_selection_is_independent_in_child_arguments(); }
-TEST_CASE("training command forwards only an explicitly selected test dataset", "[gui][train]") {
- auto request = make_train_request({0});
- assert_flag_absent(build_train_command_arguments(request), "--test-compiled");
- request.test_compiled_path = "/independent/test.bin";
- assert_flag_with_value(build_train_command_arguments(request), "--test-compiled", "/independent/test.bin");
- request.test_compiled_path.clear();
- assert_flag_absent(build_train_command_arguments(request), "--test-compiled");
-}
-TEST_CASE("training GPU membership preserves command rank order and matching NUMA overrides", "[gui][train_command]") {
- auto request = make_train_request({3, 1});
- request.numa_nodes = {2, -1};
- const auto args = build_train_command_arguments(request);
- assert_flag_with_value(args, "--device-ids", "3,1");
- assert_flag_with_value(args, "--numa-nodes", "2,-1");
- request.device_ids = {1};
- request.numa_nodes = {-1};
- assert_flag_with_value(build_train_command_arguments(request), "--device-id", "1");
+ });
 }

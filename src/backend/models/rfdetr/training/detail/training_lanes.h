@@ -42,7 +42,7 @@ void ensure_train_lane_model_supported(NativeRfDetrModel&, int);
 class TrainingLanes final {
 public:
  TrainingLanes(
-  const TrainRequest&, RuntimeContext&, mmltk::backend::data::DatasetLoader&, NativeRfDetrModel&, const std::vector<std::string>&, int lane_count, const mmltk::frameworks::gpu::DeviceContext&);
+  const TrainRequest&, RuntimeContext&, mmltk::backend::data::DatasetLoader&, NativeRfDetrModel&, const std::vector<std::string>&, int lane_count, std::size_t local_batch, const mmltk::frameworks::gpu::DeviceContext&);
  ~TrainingLanes();
  TrainingLanes(const TrainingLanes&) = delete;
  TrainingLanes& operator=(const TrainingLanes&) = delete;
@@ -50,8 +50,9 @@ public:
  std::future<TrainLaneResult> enqueue(RuntimeContext* runtime, mmltk::backend::data::DatasetLoader& loader, const mmltk::backend::data::Batch& batch,
   const mmltk::backend::ml::cuda::CudaEventPool::Lease* params_ready, mmltk::backend::ml::cuda::CudaEventPool& event_pool, std::size_t admitted_microbatches, double gradient_scale,
   size_t parameter_version, const DetectionConfig& detection_config, const NativeRfDetrModel& model, int device_id, int image_height, int image_width, std::uint64_t seed, int epoch, int rank,
-  std::uint64_t augmentation_sequence, bool amp_enabled, at::ScalarType autocast_dtype, TrainingSupervisionRoute route, std::shared_ptr<WaveTargetNormalizer> wave_normalizer, std::size_t lane_index);
+  std::uint64_t augmentation_sequence, bool amp_enabled, at::ScalarType autocast_dtype, TrainingSupervisionRoute route, std::shared_ptr<WaveTargetNormalizer> wave_normalizer, std::size_t lane_index, std::span<const TrainingDonorDescriptor> donors);
  void merge(TrainLaneResult&, std::vector<torch::Tensor>&, int device_id);
+ void reconfigure(NativeRfDetrModel&, const std::vector<std::string>& active_names, const GpuAugmentationConfig&, int batch_size, CompilationMode);
  void harvest_timing();
  void settle_targets();
 

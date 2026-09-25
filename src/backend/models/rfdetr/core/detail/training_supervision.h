@@ -85,7 +85,6 @@ private:
  torch::nn::Linear mask_projection_{nullptr};
  torch::nn::Embedding denoising_label_embedding_{nullptr};
  torch::nn::Embedding denoising_task_embedding_{nullptr};
- std::optional<at::Generator> denoising_generator_;
  std::unique_ptr<DenoisingScratch> denoising_scratch_;
  std::unique_ptr<TimingState> timing_;
  bool initialized_ = false;

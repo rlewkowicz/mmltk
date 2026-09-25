@@ -1467,18 +1467,20 @@ void NativeRfDetrModel::optimize_for_inference(const std::int32_t batch_size, co
 void NativeRfDetrModel::train(bool enabled) { impl_->train(enabled); }
 void NativeRfDetrModel::eval() { impl_->eval(); }
 bool NativeRfDetrModel::is_training() const noexcept { return impl_->is_training(); }
-void NativeRfDetrModel::to(const torch::Device& device) {
- if (impl_->parameters().front().device() != device) {
-  impl_->backbone_region_.invalidate();
-  impl_->is_compiled_train_ = false;
-  impl_->is_compiled_eval_ = false;
-  for (const auto& module : impl_->modules(false)) {
-   if (auto* layer = dynamic_cast<NativeDecoderLayerImpl*>(module.get())) layer->invalidate_selective();
-   if (auto* head = dynamic_cast<SegmentationHeadImpl*>(module.get())) head->invalidate_selective();
-  }
+void NativeRfDetrModel::invalidate_compilation() {
+ impl_->backbone_region_.invalidate();
+ impl_->is_compiled_train_ = false;
+ impl_->is_compiled_eval_ = false;
+ for (const auto& module : impl_->modules(false)) {
+  if (auto* layer = dynamic_cast<NativeDecoderLayerImpl*>(module.get())) layer->invalidate_selective();
+  if (auto* head = dynamic_cast<SegmentationHeadImpl*>(module.get())) head->invalidate_selective();
  }
+}
+void NativeRfDetrModel::to(const torch::Device& device) {
+ if (impl_->parameters().front().device() != device) invalidate_compilation();
  impl_->to(device);
 }
+
 std::vector<torch::Tensor> NativeRfDetrModel::parameters(bool recurse) const { return impl_->parameters(recurse); }
 torch::OrderedDict<std::string, torch::Tensor> NativeRfDetrModel::named_parameters(bool recurse) const { return impl_->named_parameters(recurse); }
 torch::OrderedDict<std::string, torch::Tensor> NativeRfDetrModel::named_buffers(bool recurse) const { return impl_->named_buffers(recurse); }

@@ -23,7 +23,7 @@ inline constexpr bool is_optional<std::optional<T>> = true;
 }  // namespace mmltk::backend::models::rfdetr::model_state_detail
 namespace mmltk::backend::models::rfdetr {
 inline constexpr const char* kNativeCheckpointFormat = "mmltk.rfdetr.native_checkpoint";
-inline constexpr int64_t kNativeCheckpointFormatVersion = 3;
+inline constexpr int64_t kNativeCheckpointFormatVersion = 4;
 struct NativeCheckpointMetadata {
  ModelClassLayout class_layout;
  std::string preset_name;

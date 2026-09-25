@@ -33,12 +33,12 @@ bool muon_parameter_eligible(const std::string_view name, const torch::Tensor& p
 }
 namespace {
 constexpr const char* kNativeAdamWFormat = "mmltk.rfdetr.native_adamw";
-constexpr int64_t kNativeAdamWFormatVersion = 1;
+constexpr int64_t kNativeAdamWFormatVersion = 2;
 constexpr double kAdamBeta1 = 0.9;
 constexpr double kAdamBeta2 = 0.999;
 constexpr double kAdamEps = 1.0e-8;
 constexpr const char* kNativeMuonFormat = "mmltk.rfdetr.native_muon_aux_adam";
-constexpr int64_t kNativeMuonFormatVersion = 1;
+constexpr int64_t kNativeMuonFormatVersion = 2;
 constexpr double kMuonCoeffA = 3.4445;
 constexpr double kMuonCoeffB = -4.7750;
 constexpr double kMuonCoeffC = 2.0315;
@@ -89,7 +89,7 @@ void set_scaled_group_lrs(GroupCollection& groups, const std::vector<double>& ba
 void zero_grad_parameters(std::vector<torch::Tensor>& params, const bool set_to_none) {
  torch::NoGradGuard no_grad;
  for (auto& param : params) {
-  if (!param.grad().defined()) { continue; }
+  if (!param.requires_grad() || !param.grad().defined()) { continue; }
   if (set_to_none) {
    param.mutable_grad() = torch::Tensor();
    continue;
@@ -197,16 +197,23 @@ void validate_group_param_indices(torch::serialize::InputArchive& archive, const
   if (stored_param_index != static_cast<int64_t>(param_indices[param_index])) { throw std::runtime_error(order_mismatch_message); }
  }
 }
+bool require_optimizer_bool(torch::serialize::InputArchive& archive, const char* field) {
+ const auto value = mmltk::backend::ml::serialization::require_int(archive, field);
+ if (value != 0 && value != 1) throw std::runtime_error("invalid optimizer boolean encoding");
+ return value != 0;
+}
 // Reads the parameter-group layout every native optimizer shares: the learning rate, the weight
 // decay, whatever optimizer-specific fields `read_config` claims, and the parameter index roster.
 // The mirror of write_group_lr_weight_decay plus write_group_param_indices on the save path.
 template <typename GroupCollection, typename ReadConfigFn>
 void read_optimizer_group_archives(
- torch::serialize::InputArchive& archive, GroupCollection& groups, const char* size_mismatch_message, const char* order_mismatch_message, ReadConfigFn&& read_config) {
+ torch::serialize::InputArchive& archive, GroupCollection& groups, bool materialize, const char* size_mismatch_message, const char* order_mismatch_message, ReadConfigFn&& read_config) {
  read_indexed_optimizer_archive(archive, "group", groups.size(), [&](const size_t index, auto& group_archive) {
   auto& group = groups[index];
   group.config.lr = mmltk::backend::ml::serialization::require_double(group_archive, "lr");
-  group.config.weight_decay = mmltk::backend::ml::serialization::require_double(group_archive, "weight_decay");
+  const auto weight_decay = mmltk::backend::ml::serialization::require_double(group_archive, "weight_decay");
+  if (materialize && weight_decay != group.config.weight_decay) throw std::runtime_error("optimizer weight decay differs from admitted policy");
+  group.config.weight_decay = weight_decay;
   read_config(group_archive, group.config);
   validate_group_param_indices(group_archive, group.param_indices, size_mismatch_message, order_mismatch_message);
  });
@@ -230,7 +237,6 @@ std::vector<bool> collect_muon_param_flags(const GroupCollection& groups, const 
 // the parameter list, resolve the per-parameter group flag once, then let the caller fill each slot.
 template <typename States, typename NamedParameters, typename GroupCollection, typename FlagAccessor, typename StateInitializer>
 void initialize_param_states(States& states, const NamedParameters& params, const GroupCollection& groups, FlagAccessor&& flag_accessor, StateInitializer&& state_initializer) {
- states.clear();
  states.resize(params.size());
  const std::vector<bool> flags = collect_group_param_flags(groups, params.size(), std::forward<FlagAccessor>(flag_accessor));
  for (size_t index = 0; index < params.size(); ++index) { state_initializer(states[index], params[index].tensor, flags[index]); }
@@ -285,7 +291,7 @@ template <typename Params, typename States, typename Group, typename Fn>
 void for_each_adamw_grad_state(Params& params, States& states, const Group& group, const NativeOptimizerBackend backend, Fn&& fn) {
  for (const auto index : group.param_indices) {
   auto& param = params[index].tensor;
-  if (!param.grad().defined()) { continue; }
+  if (!param.requires_grad() || !param.grad().defined()) { continue; }
   auto grad = param.grad();
   validate_adamw_param_for_backend(param, grad, backend);
   fn(index, param, grad, states[index]);
@@ -435,7 +441,7 @@ NativeAdamW::NativeAdamW(std::vector<Group> groups, std::vector<NamedParameter> 
     : NativeOptimizerStorage(std::move(groups), std::move(params)), backend_(backend) {
  populate_named_parameter_views(params_, all_params_, all_param_names_, "native AdamW received an undefined parameter tensor");
  validate_group_collection_indices(groups_, params_.size(), "native AdamW parameter group index is out of range");
- initialize_state();
+ activate();
 }
 NativeOptimizerBackend NativeAdamW::backend() const { return backend_; }
 const char* NativeAdamW::backend_name() const { return native_optimizer_backend_name(backend_); }
@@ -443,6 +449,7 @@ void NativeAdamW::initialize_state() {
  initialize_param_states(
   state_, params_, groups_, [](const auto& group) { return group.config.amsgrad; },
   [this](ParamState& state, const torch::Tensor& param, const bool needs_amsgrad) {
+   if (!param.requires_grad() || state.step.defined()) return;
    state.step = make_step_tensor(param, backend_);
    state.exp_avg = torch::zeros_like(param);
    state.exp_avg_sq = torch::zeros_like(param);
@@ -500,6 +507,7 @@ void NativeOptimizerStorage<GroupConfig, ParamStateT>::reserve_checkpoint(mmltk:
 }
 template class NativeOptimizerStorage<NativeAdamWGroupConfig, NativeAdamWParamState>;
 template class NativeOptimizerStorage<NativeMuonGroupConfig, NativeMuonParamState>;
+template class NativeOptimizerStorage<NativeSGDGroupConfig, NativeSGDParamState>;
 namespace {
 template <class State>
 void write_optimizer_state(torch::serialize::OutputArchive& archive, const State& state, mmltk::backend::ml::cuda::TensorReadbackBuffers& readback, std::size_t& slot) {
@@ -525,6 +533,7 @@ void NativeAdamW::save(torch::serialize::OutputArchive& archive, mmltk::backend:
  });
  write_indexed_optimizer_archive(archive, "param", params_.size(), [&](const size_t index, auto& param_archive) {
   write_named_parameter_archive(param_archive, params_[index].name);
+  mmltk::backend::ml::serialization::write_int(param_archive, "initialized", state_[index].step.defined());
   write_optimizer_state(param_archive, state_[index], readback, first_slot);
   mmltk::backend::ml::serialization::write_int(param_archive, "has_max_exp_avg_sq", state_[index].max_exp_avg_sq.defined() ? 1 : 0);
  });
@@ -544,14 +553,16 @@ void NativeAdamW::read_checkpoint(torch::serialize::InputArchive& archive, std::
  }
  validate_archive_layout_counts(archive, groups_.size(), params_.size(), "native AdamW archive layout does not match the current optimizer");
  auto candidate_groups = groups_;
- read_optimizer_group_archives(archive, candidate_groups,
+ read_optimizer_group_archives(archive, candidate_groups, materialize,
   "native AdamW archive parameter group size does not match the "
   "current optimizer",
   "native AdamW archive parameter group order does not match the "
   "current optimizer",
-  [stop](auto& group_archive, auto& config) {
+  [stop, materialize](auto& group_archive, auto& config) {
    if (stop.stop_requested()) throw ArtifactPublicationCancelled{};
-   config.amsgrad = mmltk::backend::ml::serialization::require_int(group_archive, "amsgrad") != 0;
+   const auto amsgrad = require_optimizer_bool(group_archive, "amsgrad");
+   if (materialize && amsgrad != config.amsgrad) throw std::runtime_error("AdamW AMSGrad differs from admitted policy");
+   config.amsgrad = amsgrad;
   });
  for (const auto& group : candidate_groups) {
   if (stop.stop_requested()) throw ArtifactPublicationCancelled{};
@@ -566,6 +577,11 @@ void NativeAdamW::read_checkpoint(torch::serialize::InputArchive& archive, std::
   validate_named_parameter_archive(param_archive, params_[index].name,
    "native AdamW archive parameter order "
    "does not match the current model");
+  const auto initialized = require_optimizer_bool(param_archive, "initialized");
+  if (!initialized) {
+   if (materialize && params_[index].tensor.requires_grad()) throw std::runtime_error("active parameter is missing optimizer state");
+   return;
+  }
   const auto& param = params_[index].tensor;
   auto loaded_step = require_adam_step_tensor(param_archive, param, backend_, materialize);
   auto loaded_exp_avg = require_parameter_state_tensor(param_archive, "exp_avg", param,
@@ -576,7 +592,7 @@ void NativeAdamW::read_checkpoint(torch::serialize::InputArchive& archive, std::
    "native AdamW archive tensor shape "
    "does not match the current model",
    materialize);
-  const bool has_max_exp_avg_sq = mmltk::backend::ml::serialization::require_int(param_archive, "has_max_exp_avg_sq") != 0;
+  const bool has_max_exp_avg_sq = require_optimizer_bool(param_archive, "has_max_exp_avg_sq");
   if (has_max_exp_avg_sq != uses_amsgrad[index]) { throw std::runtime_error("native AdamW archive AMSGrad state does not match the current optimizer"); }
   auto& state = candidate_state[index];
   state.step = std::move(loaded_step);
@@ -600,13 +616,14 @@ std::vector<std::string> NativeAdamW::InspectCheckpoint(torch::serialize::InputA
 NativeMuonWithAuxAdam::NativeMuonWithAuxAdam(std::vector<Group> groups, std::vector<NamedParameter> params) : NativeOptimizerStorage(std::move(groups), std::move(params)) {
  populate_named_parameter_views(params_, all_params_, all_param_names_, "native Muon received an undefined parameter tensor");
  validate_group_collection_indices(groups_, params_.size(), "native Muon parameter group index is out of range");
- initialize_state();
+ activate();
 }
 const char* NativeMuonWithAuxAdam::backend_name() const { return "eager"; }
 void NativeMuonWithAuxAdam::initialize_state() {
  initialize_param_states(
   state_, params_, groups_, [](const auto& group) { return group.config.use_muon; },
   [](ParamState& state, const torch::Tensor& param, const bool use_muon) {
+   if (!param.requires_grad() || state.momentum_buffer.defined() || state.exp_avg.defined()) return;
    if (use_muon) {
     state.momentum_buffer = torch::zeros_like(param);
    } else {
@@ -630,6 +647,7 @@ void NativeMuonWithAuxAdam::step() {
  for (const auto& group : groups_) {
   for (const auto index : group.param_indices) {
    auto& param = params_[index].tensor;
+   if (!param.requires_grad()) continue;
    if (!param.is_floating_point() || torch::is_complex(param)) { throw std::runtime_error("native Muon requires real floating-point parameters"); }
    auto grad = param.grad().defined() ? param.grad() : torch::zeros_like(param);
    if (grad.is_sparse()) { throw std::runtime_error("native Muon does not support sparse gradients"); }
@@ -673,6 +691,7 @@ void NativeMuonWithAuxAdam::save(torch::serialize::OutputArchive& archive, mmltk
  const std::vector<bool> use_muon = collect_muon_param_flags(groups_, params_.size());
  write_indexed_optimizer_archive(archive, "param", params_.size(), [&](const size_t index, auto& param_archive) {
   write_named_parameter_archive(param_archive, params_[index].name);
+  mmltk::backend::ml::serialization::write_int(param_archive, "initialized", state_[index].momentum_buffer.defined() || state_[index].exp_avg.defined());
   mmltk::backend::ml::serialization::write_int(param_archive, "use_muon", use_muon[index] ? 1 : 0);
   if (!use_muon[index]) mmltk::backend::ml::serialization::write_int(param_archive, "step", state_[index].step);
   write_optimizer_state(param_archive, state_[index], readback, first_slot);
@@ -694,16 +713,19 @@ void NativeMuonWithAuxAdam::read_checkpoint(torch::serialize::InputArchive& arch
  }
  validate_archive_layout_counts(archive, groups_.size(), params_.size(), "native Muon archive layout does not match the current optimizer");
  auto candidate_groups = groups_;
- read_optimizer_group_archives(archive, candidate_groups,
+ read_optimizer_group_archives(archive, candidate_groups, materialize,
   "native Muon archive parameter group size does not match the "
   "current optimizer",
   "native Muon archive parameter group order does not match the "
   "current optimizer",
-  [stop](auto& group_archive, auto& config) {
+  [stop, materialize](auto& group_archive, auto& config) {
    if (stop.stop_requested()) throw ArtifactPublicationCancelled{};
    config.momentum = mmltk::backend::ml::serialization::require_double(group_archive, "momentum");
-   config.use_muon = mmltk::backend::ml::serialization::require_int(group_archive, "use_muon") != 0;
-   config.nesterov = mmltk::backend::ml::serialization::require_int(group_archive, "nesterov") != 0;
+   const auto use_muon = require_optimizer_bool(group_archive, "use_muon");
+   const auto nesterov = require_optimizer_bool(group_archive, "nesterov");
+   if (materialize && (use_muon != config.use_muon || nesterov != config.nesterov)) throw std::runtime_error("Muon routing or Nesterov differs from admitted policy");
+   config.use_muon = use_muon;
+   config.nesterov = nesterov;
   });
  for (const auto& group : candidate_groups) {
   if (stop.stop_requested()) throw ArtifactPublicationCancelled{};
@@ -719,7 +741,12 @@ void NativeMuonWithAuxAdam::read_checkpoint(torch::serialize::InputArchive& arch
   validate_named_parameter_archive(param_archive, params_[index].name,
    "native Muon archive parameter order "
    "does not match the current model");
-  const bool stored_use_muon = mmltk::backend::ml::serialization::require_int(param_archive, "use_muon") != 0;
+  const auto initialized = require_optimizer_bool(param_archive, "initialized");
+  if (!initialized) {
+   if (materialize && params_[index].tensor.requires_grad()) throw std::runtime_error("active parameter is missing optimizer state");
+   return;
+  }
+  const bool stored_use_muon = require_optimizer_bool(param_archive, "use_muon");
   if (stored_use_muon != use_muon[index]) {
    throw std::runtime_error(
     "native Muon archive parameter routing does "
@@ -759,6 +786,86 @@ void NativeMuonWithAuxAdam::read_checkpoint(torch::serialize::InputArchive& arch
 std::vector<std::string> NativeMuonWithAuxAdam::InspectCheckpoint(torch::serialize::InputArchive& archive, const std::unordered_map<std::string, torch::Tensor>& tensors, std::stop_token stop) {
  return inspect_checkpoint<NativeMuonWithAuxAdam>(archive, tensors, stop);
 }
+NativeSGD::NativeSGD(std::vector<Group> groups, std::vector<NamedParameter> params) : NativeOptimizerStorage(std::move(groups), std::move(params)) {
+ populate_named_parameter_views(params_, all_params_, all_param_names_, "native SGD received an undefined tensor");
+ validate_group_collection_indices(groups_, params_.size(), "native SGD group index is out of range");
+ activate();
+}
+void NativeSGD::zero_grad(bool none) { zero_grad_parameters(all_params_, none); }
+void NativeSGD::set_lrs(const std::vector<double>& lrs, double scale) { set_scaled_group_lrs(groups_, lrs, scale, "native SGD LR group count differs"); }
+void NativeSGD::set_momentum(double momentum) { for (auto& group : groups_) group.config.momentum = momentum; }
+void NativeSGD::step() {
+ torch::NoGradGuard guard;
+ for (const auto& group : groups_) for (const auto index : group.param_indices) {
+  auto& param = params_[index].tensor;
+  if (!param.requires_grad() || !param.grad().defined()) continue;
+  if (param.grad().is_sparse() || !param.is_floating_point() || torch::is_complex(param)) throw std::runtime_error("native SGD requires dense real gradients");
+  auto update = group.config.weight_decay == 0 ? param.grad() : param.grad().add(param, group.config.weight_decay);
+  auto& state = state_[index];
+  if (state.step == std::numeric_limits<int64_t>::max()) throw std::overflow_error("SGD parameter age exhausted");
+  if (group.config.momentum != 0) {
+   if (!state.momentum_buffer.defined()) state.momentum_buffer = update.detach().clone();
+   else state.momentum_buffer.mul_(group.config.momentum).add_(update);
+   update = group.config.nesterov ? update.add(state.momentum_buffer, group.config.momentum) : state.momentum_buffer;
+  }
+  param.add_(update, -group.config.lr);
+  ++state.step;
+ }
+}
+void NativeSGD::save(torch::serialize::OutputArchive& archive, mmltk::backend::ml::cuda::TensorReadbackBuffers& readback, std::size_t slot) const {
+ namespace io = mmltk::backend::ml::serialization;
+ io::write_string(archive, "format", "mmltk.rfdetr.native_sgd");
+ io::write_int(archive, "format_version", 1);
+ write_archive_layout_counts(archive, groups_.size(), params_.size());
+ write_indexed_optimizer_archive(archive, "group", groups_.size(), [&](std::size_t index, auto& group) {
+  const auto& config = groups_[index].config;
+  write_group_lr_weight_decay(group, config);
+  io::write_double(group, "momentum", config.momentum);
+  io::write_int(group, "nesterov", config.nesterov);
+  io::write_int(group, "role", static_cast<int64_t>(config.role));
+  write_group_param_indices(group, groups_[index].param_indices);
+ });
+ write_indexed_optimizer_archive(archive, "param", params_.size(), [&](std::size_t index, auto& param) {
+  write_named_parameter_archive(param, params_[index].name);
+  io::write_int(param, "step", state_[index].step);
+  io::write_int(param, "has_momentum", state_[index].momentum_buffer.defined());
+  write_optimizer_state(param, state_[index], readback, slot);
+ });
+}
+void NativeSGD::read_checkpoint(torch::serialize::InputArchive& archive, std::stop_token stop, bool materialize) {
+ namespace io = mmltk::backend::ml::serialization;
+ validate_optimizer_archive_format(archive, "mmltk.rfdetr.native_sgd", 1, "SGD");
+ validate_archive_layout_counts(archive, groups_.size(), params_.size(), "native SGD inventory differs");
+ auto groups = groups_;
+ read_optimizer_group_archives(archive, groups, materialize, "SGD group size differs", "SGD group order differs", [&](auto& saved, auto& config) {
+  config.momentum = io::require_double(saved, "momentum");
+  const auto nesterov = require_optimizer_bool(saved, "nesterov");
+  const auto role = io::require_int(saved, "role");
+  if (role < static_cast<int64_t>(TrainingGroupRole::Ordinary) || role > static_cast<int64_t>(TrainingGroupRole::Bias) ||
+      (materialize && (role != static_cast<int64_t>(config.role) || nesterov != config.nesterov))) throw std::runtime_error("invalid saved SGD group identity");
+  config.nesterov = nesterov != 0;
+  config.role = static_cast<TrainingGroupRole>(role);
+  if (!std::isfinite(config.lr) || config.lr < 0 || !std::isfinite(config.weight_decay) || config.weight_decay < 0 || !std::isfinite(config.momentum) ||
+      config.momentum < 0 || config.momentum > 1 ||
+      (config.role != TrainingGroupRole::Ordinary && config.role != TrainingGroupRole::Bias)) throw std::runtime_error("invalid saved SGD group");
+ });
+ std::vector<NativeSGDParamState> states(params_.size());
+ read_indexed_optimizer_archive(archive, "param", params_.size(), [&](std::size_t index, auto& saved) {
+  if (stop.stop_requested()) throw ArtifactPublicationCancelled{};
+  validate_named_parameter_archive(saved, params_[index].name, "SGD parameter identity differs");
+  states[index].step = io::require_int(saved, "step");
+  if (states[index].step < 0) throw std::runtime_error("invalid SGD age");
+  const auto has_momentum = require_optimizer_bool(saved, "has_momentum");
+  if (has_momentum) {
+   if (!states[index].step) throw std::runtime_error("uninitialized SGD parameter has momentum");
+   states[index].momentum_buffer = require_parameter_state_tensor(saved, "momentum_buffer", params_[index].tensor, "invalid SGD momentum tensor", materialize);
+  }
+ });
+ groups_.swap(groups); state_.swap(states);
+}
+std::vector<std::string> NativeSGD::InspectCheckpoint(torch::serialize::InputArchive& archive, const std::unordered_map<std::string, torch::Tensor>& tensors, std::stop_token stop) {
+ return inspect_checkpoint<NativeSGD>(archive, tensors, stop);
+}
 void NativeOptimizer::clip_grad_norm_(const double max_norm) {
  torch::NoGradGuard guard;
  for (auto& [key, bucket] : gradient_buckets_) bucket.clear();
@@ -783,9 +890,20 @@ void NativeOptimizer::clip_grad_norm_(const double max_norm) {
  }
  gradient_norms_.clear();
 }
+NativeOptimizer::NativeOptimizer(NativeSGD optimizer) : storage_(std::move(optimizer)) {}
 NativeOptimizer::NativeOptimizer(NativeAdamW optimizer) : storage_(std::move(optimizer)) {}
 NativeOptimizer::NativeOptimizer(NativeMuonWithAuxAdam optimizer) : storage_(std::move(optimizer)) {}
-TrainOptimizerKind NativeOptimizer::kind() const { return std::holds_alternative<NativeAdamW>(storage_) ? TrainOptimizerKind::AdamW : TrainOptimizerKind::Muon; }
+void NativeOptimizer::activate() { std::visit([](auto& optimizer) { optimizer.activate(); }, storage_); }
+const std::vector<torch::Tensor>& NativeOptimizer::eligible_parameters() const {
+ return std::visit([](const auto& optimizer) -> const std::vector<torch::Tensor>& { return optimizer.eligible_parameters(); }, storage_);
+}
+const std::vector<std::string>& NativeOptimizer::eligible_parameter_names() const {
+ return std::visit([](const auto& optimizer) -> const std::vector<std::string>& { return optimizer.eligible_parameter_names(); }, storage_);
+}
+TrainOptimizerKind NativeOptimizer::kind() const {
+ if (std::holds_alternative<NativeAdamW>(storage_)) return TrainOptimizerKind::AdamW;
+ return std::holds_alternative<NativeSGD>(storage_) ? TrainOptimizerKind::SGD : TrainOptimizerKind::Muon;
+}
 std::string_view NativeOptimizer::kind_name() const { return cli_enum_spelling(kind()); }
 NativeOptimizer NativeOptimizer::stage_load(torch::serialize::InputArchive& archive) const {
  NativeOptimizer candidate = *this;
@@ -793,11 +911,7 @@ NativeOptimizer NativeOptimizer::stage_load(torch::serialize::InputArchive& arch
  return candidate;
 }
 void NativeOptimizer::commit(NativeOptimizer candidate) noexcept {
- if (std::holds_alternative<NativeAdamW>(storage_)) {
-  std::get<NativeAdamW>(storage_).commit(std::get<NativeAdamW>(std::move(candidate.storage_)));
-  return;
- }
- std::get<NativeMuonWithAuxAdam>(storage_).commit(std::get<NativeMuonWithAuxAdam>(std::move(candidate.storage_)));
+ std::visit([&](auto& optimizer) { using Type = std::remove_cvref_t<decltype(optimizer)>; optimizer.commit(std::get<Type>(std::move(candidate.storage_))); }, storage_);
 }
 const char* NativeOptimizer::backend_name() const {
  return std::visit([](const auto& optimizer) { return optimizer.backend_name(); }, storage_);
@@ -817,12 +931,14 @@ void NativeOptimizer::zero_grad(const bool set_to_none) {
 void NativeOptimizer::set_lrs(const std::vector<double>& base_lrs, const double scale) {
  std::visit([&](auto& optimizer) { optimizer.set_lrs(base_lrs, scale); }, storage_);
 }
-void NativeOptimizer::set_muon_momentum(const double momentum) {
+void NativeOptimizer::set_momentum(const double momentum) {
  std::visit(
   [&](auto& optimizer) {
    using Optimizer = std::decay_t<decltype(optimizer)>;
    if constexpr (std::is_same_v<Optimizer, NativeMuonWithAuxAdam>) {
     optimizer.set_muon_momentum(momentum);
+   } else if constexpr (std::is_same_v<Optimizer, NativeSGD>) {
+    optimizer.set_momentum(momentum);
    } else {
     (void)momentum;
    }
@@ -862,14 +978,14 @@ double parameter_lr(std::string_view name, const TrainRequest& options) {
  if (is_encoder_param(name)) {
   constexpr int kNumVitLayers = 13;
   const int layer_id = encoder_layer_id(name);
-  return options.lr_encoder * std::pow(options.encoder_layer_decay, static_cast<double>(kNumVitLayers + 1 - layer_id)) * options.lr_component_decay * options.lr_component_decay;
+  return options.recipe.lr_encoder * std::pow(options.recipe.encoder_layer_decay, static_cast<double>(kNumVitLayers + 1 - layer_id)) * options.recipe.lr_component_decay * options.recipe.lr_component_decay;
  }
- if (name.find("transformer.decoder") != std::string_view::npos) { return options.lr * options.lr_component_decay; }
- return options.lr;
+ if (name.find("transformer.decoder") != std::string_view::npos) { return options.recipe.lr * options.recipe.lr_component_decay; }
+ return options.recipe.lr;
 }
 double parameter_weight_decay(std::string_view name, const TrainRequest& options) {
- if (is_encoder_param(name)) { return encoder_zero_weight_decay(name) ? 0.0 : options.weight_decay; }
- return options.weight_decay;
+ if (is_encoder_param(name)) { return encoder_zero_weight_decay(name) ? 0.0 : options.recipe.weight_decay; }
+ return options.recipe.weight_decay;
 }
 // Builds the group/parameter inputs shared by the native optimizers: one NamedParameter per trainable
 // parameter and one Group per bucket, recording each bucket's base lr and moving its parameter indices into
@@ -893,6 +1009,7 @@ OptimizerBuildResult build_optimizer(const torch::OrderedDict<std::string, torch
   double lr = 0.0;
   double weight_decay = 0.0;
   bool use_muon = false;
+  TrainingGroupRole role = TrainingGroupRole::Ordinary;
   std::vector<size_t> param_indices;
  };
  std::unordered_map<std::string, size_t> group_index;
@@ -900,15 +1017,16 @@ OptimizerBuildResult build_optimizer(const torch::OrderedDict<std::string, torch
  std::vector<std::pair<std::string, torch::Tensor>> named_params;
  for (const auto& item : parameters) {
   const auto& param = item.value();
-  if (!param.requires_grad()) { continue; }
+  if (!param.is_floating_point()) continue;
   const double lr = parameter_lr(item.key(), options);
   const double weight_decay = parameter_weight_decay(item.key(), options);
-  const bool use_muon = options.optimizer == TrainOptimizerKind::Muon && muon_parameter_eligible(item.key(), param);
-  const std::string key = std::format("{}{}:{}", use_muon ? "muon:" : "aux:", lr, weight_decay);
+  const bool use_muon = options.recipe.optimizer == TrainOptimizerKind::Muon && muon_parameter_eligible(item.key(), param);
+  const auto role = options.recipe.optimizer == TrainOptimizerKind::SGD && item.key().find("bias") != std::string::npos ? TrainingGroupRole::Bias : TrainingGroupRole::Ordinary;
+  const std::string key = std::format("{}{}:{}:{}", use_muon ? "muon:" : "aux:", lr, weight_decay, static_cast<int>(role));
   auto found = group_index.find(key);
   if (found == group_index.end()) {
    found = group_index.emplace(key, groups.size()).first;
-   groups.push_back(GroupSpec{lr, weight_decay, use_muon, {}});
+   groups.push_back(GroupSpec{lr, weight_decay, use_muon, role, {}});
   }
   named_params.emplace_back(item.key(), param);
   groups[found->second].param_indices.push_back(named_params.size() - 1);
@@ -916,12 +1034,18 @@ OptimizerBuildResult build_optimizer(const torch::OrderedDict<std::string, torch
  if (groups.empty() || named_params.empty()) { throw std::runtime_error("RF-DETR runtime found no trainable parameters"); }
  std::vector<double> base_lrs;
  base_lrs.reserve(groups.size());
- if (options.optimizer == TrainOptimizerKind::Muon) {
+ std::vector<TrainingGroupRole> roles;
+ for (const auto& group : groups) roles.push_back(group.role);
+ if (options.recipe.optimizer == TrainOptimizerKind::SGD) {
+  auto [optimizer_groups, optimizer_params] = build_optimizer_inputs<NativeSGD>(groups, named_params, base_lrs, [&options](const GroupSpec& group) { return NativeSGDGroupConfig{group.lr, group.weight_decay, options.recipe.momentum, options.recipe.nesterov, group.role}; });
+  return {NativeOptimizer(NativeSGD(std::move(optimizer_groups), std::move(optimizer_params))), std::move(base_lrs), std::move(roles)};
+ }
+ if (options.recipe.optimizer == TrainOptimizerKind::Muon) {
   auto [optimizer_groups, optimizer_params] = build_optimizer_inputs<NativeMuonWithAuxAdam>(
-   groups, named_params, base_lrs, [&options](const GroupSpec& group) { return NativeMuonGroupConfig{group.lr, group.weight_decay, options.momentum, group.use_muon, true}; });
+   groups, named_params, base_lrs, [&options](const GroupSpec& group) { return NativeMuonGroupConfig{group.lr, group.weight_decay, options.recipe.momentum, group.use_muon, true}; });
   return OptimizerBuildResult{
    NativeOptimizer(NativeMuonWithAuxAdam(std::move(optimizer_groups), std::move(optimizer_params))),
-   std::move(base_lrs),
+   std::move(base_lrs), std::move(roles),
   };
  }
  auto [optimizer_groups, optimizer_params] =
@@ -934,7 +1058,7 @@ OptimizerBuildResult build_optimizer(const torch::OrderedDict<std::string, torch
                                                                                                      : NativeOptimizerBackend::eager;
  return OptimizerBuildResult{
   NativeOptimizer(NativeAdamW(std::move(optimizer_groups), std::move(optimizer_params), backend)),
-  std::move(base_lrs),
+  std::move(base_lrs), std::move(roles),
  };
 }
 }  // namespace mmltk::backend::models::rfdetr

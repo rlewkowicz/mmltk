@@ -32,7 +32,7 @@ public:
  void prepare_ema(const std::vector<std::string>& names, const ModelEma* ema);
  void save_weights(const std::filesystem::path&, const NativeCheckpointMetadata&, bool selected, const std::filesystem::path&);
  void save_resume(const std::filesystem::path&, const NativeCheckpointMetadata&, const NativeOptimizer&, const GradScaler&, const TrainRequest&, int epoch, double best_regular, double best_ema,
-  int64_t ema_completed_updates, std::string_view attempt_id, const std::filesystem::path& descriptor);
+  int64_t ema_completed_updates, std::string_view attempt_id, const std::filesystem::path& descriptor, const detail::TrainingContinuationValues& continuation);
  void release();
 
 private:

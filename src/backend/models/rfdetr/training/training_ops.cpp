@@ -132,22 +132,6 @@ void GradScaler::ensure_device_state(const torch::Device& device) {
  found_inf_device_ = torch::zeros({}, options);
  inverse_scale_device_ = torch::ones({}, options);
 }
-double compute_lr_scale(const LrScheduleConfig& config, const int64_t step, const int64_t steps_per_epoch, const int64_t total_steps) {
- const double warmup = std::trunc(static_cast<double>(steps_per_epoch) * config.warmup_epochs);
- if (warmup > 0.0 && static_cast<double>(step) < warmup) return static_cast<double>(step) / std::max(1.0, warmup);
- if (config.lr_scheduler == TrainLrSchedulerKind::Cosine) {
-  const double progress = static_cast<double>(step) - warmup;
-  const double denominator = std::max(1.0, static_cast<double>(total_steps) - warmup);
-  return config.lr_min_factor + (1.0 - config.lr_min_factor) * 0.5 * (1.0 + std::cos(std::numbers::pi * progress / denominator));
- }
- return step < config.lr_drop * steps_per_epoch ? 1.0 : 0.1;
-}
-double compute_warmup_momentum(const LrScheduleConfig& config, const int64_t step, const int64_t steps_per_epoch, const double target) {
- const double warmup = static_cast<double>(steps_per_epoch) * config.warmup_epochs;
- if (warmup <= 0.0 || config.warmup_momentum <= 0.0 || static_cast<double>(step) >= warmup) return target;
- const double alpha = static_cast<double>(step) / std::max(1.0, warmup);
- return config.warmup_momentum + (target - config.warmup_momentum) * alpha;
-}
 torch::Tensor loss_value_or_zero(const TensorMap& loss_dict, const torch::Device& device, std::string_view key) {
  const auto found = loss_dict.find(std::string(key));
  if (found != loss_dict.end()) { return found->second; }

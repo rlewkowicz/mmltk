@@ -27,6 +27,8 @@ template <class T>
   for (const auto& left_item : left)
    if (!equal_value(left_item, *right_item++)) return false;
   return true;
+ } else if constexpr (settings_vocabulary::is_leaf_v<Value>) {
+  return left == right;
  } else {
   bool equal = true;
   settings_vocabulary::for_each_member_pair(left, right, [&](const std::string_view, const auto& member, const auto& other) {

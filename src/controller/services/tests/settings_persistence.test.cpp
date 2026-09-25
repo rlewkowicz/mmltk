@@ -200,9 +200,9 @@ TEST_CASE("settings serializes competing durable updates", "[controller][systems
  CHECK(snapshot.settings_state.ui.annotation_brush_radius == 9);
 }
 TEST_CASE("settings rejects empty updates without persisting and accepts relation clears", "[controller][systems][settings]") {
- using TrainRequest = mmltk::backend::models::rfdetr::TrainRequest;
+ using TrainRecipeSettings = mmltk::backend::models::rfdetr::TrainRecipeSettings;
  using TrainRecipeRelation = mmltk::frameworks::reflection::catalog_provider_relation<mmltk::backend::models::rfdetr::TrainRecipeCatalog>;
- constexpr auto lr = mmltk::frameworks::reflection::member_path<&TrainRequest::lr>;
+ constexpr auto lr = mmltk::frameworks::reflection::member_path<&TrainRecipeSettings::lr>;
  const auto root = mmltk::testsupport::make_temp_root("ordinary-settings-empty-update");
  const services::SettingsLocation location{(root / "gui.json").string()};
  std::size_t events = 0U;
@@ -218,20 +218,20 @@ TEST_CASE("settings rejects empty updates without persisting and accepts relatio
  CHECK(reloaded.snapshot() == before);
  contracts::SettingsUpdateRequest pin;
  pin.updates.emplace_back(contracts::SettingsValueUpdate{
-  .path = "workflows.train.request.lr",
+  .path = "workflows.train.request.recipe.lr",
   .value = mmltk::frameworks::serialization::wire::FlatValue{0.002},
  });
  const auto pinned = settings.Update(std::move(pin));
- CHECK(TrainRecipeRelation::template overridden<lr>(pinned.settings_state.workflows.train.request.recipe_overrides));
+ CHECK(TrainRecipeRelation::template overridden<lr>(pinned.settings_state.workflows.train.request.recipe.overrides));
  contracts::SettingsUpdateRequest clear;
  clear.updates.emplace_back(contracts::SettingsValueUpdate{
-  .path = "workflows.train.request.lr",
+  .path = "workflows.train.request.recipe.lr",
   .value = mmltk::frameworks::serialization::wire::FlatValue{std::monostate{}},
  });
  const auto cleared = settings.Update(std::move(clear));
  CHECK(cleared.revision == pinned.revision + 1U);
- CHECK_FALSE(TrainRecipeRelation::template overridden<lr>(cleared.settings_state.workflows.train.request.recipe_overrides));
- CHECK(cleared.settings_state.workflows.train.request.lr == mmltk::backend::models::rfdetr::train_recipe(cleared.settings_state.workflows.train.request.optimizer).lr);
+ CHECK_FALSE(TrainRecipeRelation::template overridden<lr>(cleared.settings_state.workflows.train.request.recipe.overrides));
+ CHECK(cleared.settings_state.workflows.train.request.recipe.lr == mmltk::backend::models::rfdetr::train_recipe(cleared.settings_state.workflows.train.request.recipe.optimizer).lr);
 }
 TEST_CASE("Explore catalog identity changes only through successful catalog persistence", "[controller][systems][settings][explore]") {
  const auto root = mmltk::testsupport::make_temp_root("ordinary-settings-explore-catalog");
@@ -350,6 +350,74 @@ TEST_CASE("export formats persist independently without changing weights selecti
    CHECK_FALSE(std::filesystem::exists(root.path() / "export"));
   }
  }
+}
+
+TEST_CASE("Typed lane replacement and scalar edits publish one checked revision and persist stable recipes", "[controller][settings][training]") {
+ namespace r = mmltk::backend::models::rfdetr;
+ const mmltk::testsupport::ScopedTempDir root("typed-training-lanes");
+ SettingsSystem settings; REQUIRE(settings.Load(install_settings(root.path())).applied());
+ const auto initial = settings.snapshot();
+ auto lanes = initial.settings_state.workflows.train.request.lane_configuration;
+ r::resize_training_models(lanes, 2, initial.settings_state.workflows.train.request.recipe, 42);
+ lanes.mode = r::TrainLaneMode::Independent;
+ lanes.models[1].recipe.optimizer = r::TrainOptimizerKind::SGD;
+ contracts::SettingsUpdateRequest request;
+ request.lane_configuration = lanes;
+ using Value = mmltk::frameworks::serialization::wire::FlatValue;
+ request.updates.push_back({"workflows.train.request.lanes", Value{int64_t{2}}});
+ request.updates.push_back({"workflows.train.request.batch_size", Value{uint64_t{3}}});
+ request.updates.push_back({"workflows.train.request.grad_accum_steps", Value{int64_t{4}}});
+ request.updates.push_back({"workflows.train.request.validation_lanes", Value{int64_t{5}}});
+ request.updates.push_back({"workflows.train.request.val_batch_size", Value{uint64_t{2}}});
+ const auto saved = settings.Update(request);
+ CHECK(saved.revision == initial.revision + 1);
+ CHECK(saved.train_execution.settings_revision == saved.revision);
+ CHECK(saved.train_execution.logical_models == 2);
+ CHECK(saved.train_execution.microbatches_per_attempt == 4);
+ CHECK(saved.train_execution.effective_batch_per_model == 12);
+ CHECK(saved.train_execution.aggregate_round_images == 24);
+ CHECK(saved.training_validation_execution.effective_batch_per_model == 10);
+ CHECK(saved.training_validation_execution.settings_revision == saved.revision);
+ CHECK(saved.prediction_execution.settings_revision == saved.revision);
+ CHECK(saved.validation_execution.settings_revision == saved.revision);
+ CHECK(saved.settings_state.workflows.train.request.lane_configuration.models[1].recipe.lr == .01);
+ CHECK(saved.settings_state.workflows.train.request.recipe.optimizer == r::TrainOptimizerKind::AdamW);
+ CHECK(r::effective_final_policy(lanes) == r::TrainFinalPolicy::ValidationGreedy);
+ SettingsSystem restored; REQUIRE(restored.Load(services::SettingsLocation{(root.path() / "settings.json").string()}).applied());
+ CHECK(restored.snapshot().settings_state == saved.settings_state);
+ for (int fault = 0; fault < 6; ++fault) {
+  auto invalid = request;
+  switch (fault) {
+   case 0: invalid.lane_configuration->models.pop_back(); break;
+   case 1: invalid.lane_configuration->models[1].model_id = invalid.lane_configuration->models[0].model_id; break;
+   case 2: invalid.lane_configuration->models[0].coefficient = std::numeric_limits<double>::infinity(); break;
+   case 3: invalid.lane_configuration->next_model_id = 1; break;
+   case 4:
+    invalid.lane_configuration->final_policy = r::TrainFinalPolicy::Explicit;
+    for (auto& model : invalid.lane_configuration->models) model.coefficient = 0;
+    break;
+   case 5: invalid.updates.push_back({"workflows.train.request.lane_configuration.models.0.recipe.lr", Value{.1}}); break;
+  }
+  CHECK_THROWS(settings.Update(std::move(invalid)));
+  CHECK(settings.snapshot().settings_state == saved.settings_state);
+  CHECK(settings.snapshot().revision == saved.revision);
+ }
+ lanes = saved.settings_state.workflows.train.request.lane_configuration;
+ const auto retired = lanes.models[1];
+ r::resize_training_models(lanes, 1, saved.settings_state.workflows.train.request.recipe, 42);
+ contracts::SettingsUpdateRequest shrink;
+ shrink.lane_configuration = lanes;
+ shrink.updates.push_back({"workflows.train.request.lanes", Value{int64_t{1}}});
+ static_cast<void>(settings.Update(shrink));
+ lanes.models.push_back(retired);
+ shrink.lane_configuration = lanes;
+ shrink.updates[0].value = Value{int64_t{2}};
+ CHECK_THROWS(settings.Update(shrink));
+ r::resize_training_models(lanes, 1, saved.settings_state.workflows.train.request.recipe, 42);
+ r::resize_training_models(lanes, 2, saved.settings_state.workflows.train.request.recipe, 42);
+ CHECK(lanes.models.back().model_id > retired.model_id);
+ shrink.lane_configuration = lanes;
+ CHECK_NOTHROW(settings.Update(shrink));
 }
 }  // namespace
 }  // namespace mmltk::controller

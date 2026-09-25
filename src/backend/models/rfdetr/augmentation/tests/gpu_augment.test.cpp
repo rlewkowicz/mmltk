@@ -1,3 +1,4 @@
+#include "src/backend/models/rfdetr/augmentation/annotation_support.h"
 #include "src/backend/models/rfdetr/augmentation/sampling.h"
 #include "src/backend/models/rfdetr/augmentation/tests/copy_paste_fixture.h"
 #include "src/backend/imaging/resample/tests/perceptual_downscale_reference.h"
@@ -21,7 +22,7 @@
 #include "src/backend/models/rfdetr/augmentation/detail/gpu_augment_cuda_launch.h"
 #include "src/backend/models/rfdetr/augmentation/detail/gpu_augment_plan_math.h"
 #include "src/backend/models/rfdetr/augmentation/gpu_augment.h"
-#include "src/backend/models/rfdetr/augmentation/detail/gpu_augmentation_donor_index.h"
+#include "src/backend/models/rfdetr/augmentation/gpu_augmentation_donor_index.h"
 #include "src/backend/models/rfdetr/augmentation/spatial_erasure.h"
 #include "src/backend/models/rfdetr/augmentation/tests/gpu_augment_test_support.h"
 import mmltk.backend.models.rfdetr.augmentation.augmentation_metadata;

@@ -141,6 +141,12 @@ void emit_rust_value(std::ostream& output, const mmltk::controller::browser::wir
  if (std::ranges::find(keywords, result) != keywords.end()) result.push_back('_');
  return result;
 }
+[[nodiscard]] std::string rust_relation_identifier(std::string_view source) {
+ auto result = rust_identifier(source, false);
+ std::ranges::transform(result, result.begin(), [](unsigned char byte) { return static_cast<char>(std::tolower(byte)); });
+ return result;
+}
+
 // CLEANUP-IGNORE: Constant and type identifiers share only namespace stripping; casing and keyword policies are distinct.
 [[nodiscard]] std::string rust_constant_identifier(std::string_view source) {
  if (const auto separator = source.rfind("::"); separator != std::string_view::npos) source.remove_prefix(separator + 2U);
@@ -1625,14 +1631,47 @@ private:
     output_ << " = value.clone(); state";
     emit_rust_field_access(output_, rendered_override_path.view());
     output_ << ".set_override(" << field_type << "::" << variant << "); update_" << suffix << "(value) }\n";
-    output_ << "pub fn clear_relation_" << suffix << "(state: &mut " << rust_type<Settings>() << ") -> SettingsValueUpdate { let value = ";
+    output_ << "pub fn clear_relation_" << suffix << "(state: &mut " << rust_type<Settings>() << ") -> SettingsValueUpdate { state";
+    emit_rust_field_access(output_, rendered_override_path.view());
+    output_ << ".clear_override(" << field_type << "::" << variant << "); let value = ";
     emit_effective_value(rendered_override_path.view(), destination_path.view(), selector_path.view());
     output_ << "; state";
-    emit_rust_field_access(output_, rendered_override_path.view());
-    output_ << ".clear_override(" << field_type << "::" << variant << "); state";
     emit_rust_field_access(output_, destination_path.view());
     output_ << " = value; SettingsValueUpdate { path: " << std::quoted(destination_path.view()) << ".into(), value: Value::Null } }\n";
+    const std::string value_suffix = rust_relation_identifier(mmltk::frameworks::reflection::type_name<typename Relation::destination_type>()) + "_" + rust_identifier(relative_destination_path.view(), false);
+    output_ << "pub fn effective_" << value_suffix << "(state: &" << rust_type<typename Relation::destination_type>() << ") -> " << rust_type<Field>() << " { effective_" << suffix << "(state) }\n";
+    output_ << "pub fn edit_" << value_suffix << "(state: &mut " << rust_type<typename Relation::destination_type>() << ", value: " << rust_type<Field>() << ") { state";
+    emit_rust_field_access(output_, relative_destination_path.view());
+    output_ << " = value; state";
+    emit_rust_field_access(output_, relative_override_path.view());
+    output_ << ".set_override(" << field_type << "::" << variant << "); }\n";
+    output_ << "pub fn reset_" << value_suffix << "(state: &mut " << rust_type<typename Relation::destination_type>() << ") { state";
+    emit_rust_field_access(output_, relative_override_path.view());
+    output_ << ".clear_override(" << field_type << "::" << variant << "); let value = effective_" << value_suffix << "(state); state";
+    emit_rust_field_access(output_, relative_destination_path.view());
+    output_ << " = value; }\n";
    });
+   const std::string value_prefix = rust_relation_identifier(mmltk::frameworks::reflection::type_name<typename Relation::destination_type>());
+   using SelectorValue = mmltk::frameworks::reflection::accessor_value_t<typename Relation::destination_type, Relation::destination_selector>;
+   constexpr auto relative_selector = mmltk::frameworks::reflection::reflected_member_path<typename Relation::destination_type, Relation::destination_selector>();
+   output_ << "pub fn select_" << value_prefix << "(state: &mut " << rust_type<typename Relation::destination_type>() << ", value: " << rust_type<SelectorValue>() << ") { state";
+   emit_rust_field_access(output_, relative_selector.view());
+   output_ << " = value;\n";
+   Relation::VisitMembers([&]<class Entry>() {
+    constexpr auto path = mmltk::frameworks::reflection::reflected_member_path<typename Relation::destination_type, Entry::destination>();
+    output_ << "state";
+    emit_rust_field_access(output_, path.view());
+    output_ << " = effective_" << value_prefix << "_" << rust_identifier(path.view(), false) << "(state);\n";
+   });
+   output_ << "}\n";
+   output_ << "pub fn reset_" << value_prefix << "(state: &mut " << rust_type<typename Relation::destination_type>() << ") {\n";
+   Relation::VisitMembers([&]<class Entry>() {
+    constexpr auto path = mmltk::frameworks::reflection::reflected_member_path<typename Relation::destination_type, Entry::destination>();
+    output_ << "reset_" << value_prefix << "_" << rust_identifier(path.view(), false) << "(state);\n";
+   });
+   output_ << "}\npub fn reset_relation_" << value_prefix << "(state: &mut " << rust_type<Settings>() << ") -> [SettingsValueUpdate; " << Relation::member_count << "] { [\n";
+   visit_relation_fields([&]<class Entry>(const auto& path, const auto&) { output_ << "clear_relation_" << rust_identifier(path.view(), false) << "(state),\n"; });
+   output_ << "] }\n";
   });
  }
  void EmitCatalogs() {

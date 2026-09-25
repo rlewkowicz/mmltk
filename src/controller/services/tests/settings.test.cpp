@@ -50,13 +50,14 @@ using TrainOptimizerKind = mmltk::backend::models::rfdetr::TrainOptimizerKind;
 using TrainLrSchedulerKind = mmltk::backend::models::rfdetr::TrainLrSchedulerKind;
 using TrainAssignmentKind = mmltk::backend::models::rfdetr::TrainAssignmentKind;
 using TrainRequest = mmltk::backend::models::rfdetr::TrainRequest;
+using TrainRecipeSettings = mmltk::backend::models::rfdetr::TrainRecipeSettings;
 using TrainRecipeRelation = mmltk::frameworks::reflection::catalog_provider_relation<mmltk::backend::models::rfdetr::TrainRecipeCatalog>;
 template <class Member, class Visitor>
-[[nodiscard]] bool visit_recipe_member(Member TrainRequest::* member, Visitor&& visitor) {
+[[nodiscard]] bool visit_recipe_member(Member TrainRecipeSettings::* member, Visitor&& visitor) {
  bool matched = false;
  TrainRecipeRelation::VisitMembers([&]<class Entry>() {
   constexpr auto destination = std::remove_cvref_t<decltype(Entry::destination)>::terminal_member;
-  if constexpr (std::same_as<std::remove_cvref_t<decltype(destination)>, Member TrainRequest::*>) {
+  if constexpr (std::same_as<std::remove_cvref_t<decltype(destination)>, Member TrainRecipeSettings::*>) {
    if (destination == member) {
     matched = true;
     visitor.template operator()<Entry>();
@@ -66,7 +67,7 @@ template <class Member, class Visitor>
  return matched;
 }
 template <class Member>
-void set_recipe_override(mmltk::backend::models::rfdetr::TrainRecipeOverrideState& state, Member TrainRequest::* member, const bool overridden) {
+void set_recipe_override(mmltk::backend::models::rfdetr::TrainRecipeOverrideState& state, Member TrainRecipeSettings::* member, const bool overridden) {
  const bool matched = visit_recipe_member(member, [&]<class Entry>() {
   if (overridden)
    TrainRecipeRelation::template set_override<Entry::destination>(state);
@@ -76,7 +77,7 @@ void set_recipe_override(mmltk::backend::models::rfdetr::TrainRecipeOverrideStat
  REQUIRE(matched);
 }
 template <class Member>
-[[nodiscard]] bool recipe_overridden(const mmltk::backend::models::rfdetr::TrainRecipeOverrideState& state, Member TrainRequest::* member) {
+[[nodiscard]] bool recipe_overridden(const mmltk::backend::models::rfdetr::TrainRecipeOverrideState& state, Member TrainRecipeSettings::* member) {
  bool result = false;
  const bool matched = visit_recipe_member(member, [&]<class Entry>() { result = TrainRecipeRelation::template overridden<Entry::destination>(state); });
  REQUIRE(matched);
@@ -117,415 +118,89 @@ static_assert(
   "workflows.predict.request.tensorrt_path"));
 static_assert(settings_path_is<mmltk::frameworks::reflection::member_path<&GuiSettingsState::workflows, &WorkflowSettingsState::export_state, &ExportViewState::weights_path>>(
  "workflows.export_state.weights_path"));
-struct OptimizerFixture final {
- int persisted_id;
- TrainOptimizerKind native_value;
-};
-constexpr std::array kOptimizerFixtures{
- OptimizerFixture{.persisted_id = 0, .native_value = TrainOptimizerKind::AdamW},
- OptimizerFixture{.persisted_id = 1, .native_value = TrainOptimizerKind::Muon},
-};
-struct DoubleRecipeFixture final {
- std::string_view key;
- double TrainRequest::* value_member;
- double adamw_value;
- double muon_value;
- double corpus_value;
- double prior_value;
- double invalid_value;
- bool corpus_override;
-};
-// These literal keys, persisted values, and member bindings are the independent schema-v8 oracle.
-// They intentionally do not consume or reproduce the production persistence visitor.
-constexpr std::array kDoubleRecipeFixtures{
- DoubleRecipeFixture{"lr", &TrainRequest::lr, 1.0e-4, 2.0e-4, 1.23e-3, 2.34e-3, -1.0, true},
- DoubleRecipeFixture{"lr_encoder", &TrainRequest::lr_encoder, 1.5e-4, 3.0e-4, 3.45e-3, 4.56e-3, -1.0, false},
- DoubleRecipeFixture{"lr_component_decay", &TrainRequest::lr_component_decay, 0.7, 0.7, 0.23, 0.34, 1.01, true},
- DoubleRecipeFixture{"encoder_layer_decay", &TrainRequest::encoder_layer_decay, 0.8, 0.8, 0.35, 0.46, 1.01, false},
- DoubleRecipeFixture{"momentum", &TrainRequest::momentum, 0.95, 0.9, 0.57, 0.68, 1.01, true},
- DoubleRecipeFixture{"weight_decay", &TrainRequest::weight_decay, 1.0e-4, 5.0e-4, 5.67e-3, 6.78e-3, -1.0, false},
- DoubleRecipeFixture{"warmup_epochs", &TrainRequest::warmup_epochs, 0.0, 3.0, 7.89, 8.91, -1.0, true},
- DoubleRecipeFixture{"warmup_momentum", &TrainRequest::warmup_momentum, 0.0, 0.8, 0.71, 0.82, 1.01, false},
- DoubleRecipeFixture{"lr_min_factor", &TrainRequest::lr_min_factor, 0.0, 0.01, 0.93, 0.84, 1.01, true},
-};
-constexpr auto kGoldenRecipeKeys = [] {
- std::array<std::string_view, 11U> keys{};
- for (std::size_t index = 0U; index < kDoubleRecipeFixtures.size(); ++index) { keys[index] = kDoubleRecipeFixtures[index].key; }
- keys[9U] = "lr_drop";
- keys[10U] = "lr_scheduler";
- return keys;
-}();
-constexpr int kCorpusLrDrop = 53;
-constexpr int kPriorLrDrop = 137;
-constexpr bool kCorpusLrDropOverride = false;
-constexpr TrainLrSchedulerKind kCorpusScheduler = TrainLrSchedulerKind::Cosine;
-constexpr TrainLrSchedulerKind kPriorScheduler = TrainLrSchedulerKind::Step;
-constexpr bool kCorpusSchedulerOverride = true;
-[[nodiscard]] nlohmann::json uniform_recipe_overrides(const bool value) {
- nlohmann::json overrides = nlohmann::json::object();
- for (const std::string_view key : kGoldenRecipeKeys) { overrides[std::string{key}] = value; }
- return overrides;
-}
-[[nodiscard]] nlohmann::json golden_recipe_values(const int persisted_optimizer_id) {
- nlohmann::json values = nlohmann::json::object();
- for (const DoubleRecipeFixture& field : kDoubleRecipeFixtures) { values[std::string{field.key}] = persisted_optimizer_id == 0 ? field.adamw_value : field.muon_value; }
- values["lr_drop"] = 100;
- values["lr_scheduler"] = persisted_optimizer_id == 0 ? "step" : "cosine";
- return values;
-}
-[[nodiscard]] nlohmann::json nonuniform_recipe_values() {
- nlohmann::json values = nlohmann::json::object();
- for (const DoubleRecipeFixture& field : kDoubleRecipeFixtures) { values[std::string{field.key}] = field.corpus_value; }
- values["lr_drop"] = kCorpusLrDrop;
- values["lr_scheduler"] = "cosine";
- return values;
-}
-[[nodiscard]] nlohmann::json nonuniform_recipe_overrides() {
- nlohmann::json overrides = nlohmann::json::object();
- for (const DoubleRecipeFixture& field : kDoubleRecipeFixtures) { overrides[std::string{field.key}] = field.corpus_override; }
- overrides["lr_drop"] = kCorpusLrDropOverride;
- overrides["lr_scheduler"] = kCorpusSchedulerOverride;
- return overrides;
-}
-[[nodiscard]] nlohmann::json recipe_document(const int persisted_optimizer_id, const nlohmann::json& values, const nlohmann::json& overrides) {
- nlohmann::json document = default_gui_settings_document();
- nlohmann::json& training = document["workflows"]["train"]["training"];
- training.update(values);
- training["optimizer"] = persisted_optimizer_id;
- training["recipe_overrides"] = overrides;
- return document;
-}
-[[nodiscard]] std::size_t count_object_key(const nlohmann::json& value, const std::string_view key) {
- std::size_t count = 0U;
- if (value.is_object()) {
-  for (const auto& [child_key, child] : value.items()) {
-   count += child_key == key ? 1U : 0U;
-   count += count_object_key(child, key);
-  }
- } else if (value.is_array()) {
-  for (const nlohmann::json& child : value) { count += count_object_key(child, key); }
- }
- return count;
-}
-void check_recipe_schema_v8_shape(const nlohmann::json& document, const int persisted_optimizer_id, const nlohmann::json& expected_values, const nlohmann::json& expected_overrides) {
- REQUIRE(document.is_object());
- REQUIRE(document.at("schema_version").type() == nlohmann::json::value_t::number_unsigned);
- CHECK(document.at("schema_version") == 8U);
- const nlohmann::json& workflows = document.at("workflows");
- const nlohmann::json& train = workflows.at("train");
- const nlohmann::json& training = train.at("training");
- REQUIRE(training.is_object());
- REQUIRE_FALSE(workflows.contains("schema_version"));
- REQUIRE_FALSE(train.contains("schema_version"));
- REQUIRE_FALSE(training.contains("schema_version"));
- REQUIRE_FALSE(document.contains("recipe_overrides"));
- REQUIRE_FALSE(workflows.contains("recipe_overrides"));
- REQUIRE_FALSE(train.contains("recipe_overrides"));
- for (const std::string_view key : kGoldenRecipeKeys) {
-  const std::string persisted_key{key};
-  REQUIRE(training.contains(persisted_key));
-  CHECK(training.at(persisted_key) == expected_values.at(persisted_key));
-  REQUIRE_FALSE(document.contains(persisted_key));
-  REQUIRE_FALSE(train.contains(persisted_key));
-  CHECK(count_object_key(document, key) == 2U);
- }
- for (const std::string_view key :
-  std::array<std::string_view, 9U>{"lr", "lr_encoder", "lr_component_decay", "encoder_layer_decay", "momentum", "weight_decay", "warmup_epochs", "warmup_momentum", "lr_min_factor"}) {
-  CHECK(training.at(std::string{key}).type() == nlohmann::json::value_t::number_float);
- }
- CHECK(training.at("lr_drop").type() == nlohmann::json::value_t::number_integer);
- CHECK(training.at("lr_scheduler").type() == nlohmann::json::value_t::string);
- CHECK(training.at("optimizer").type() == nlohmann::json::value_t::number_integer);
- CHECK(training.at("optimizer") == persisted_optimizer_id);
- const nlohmann::json& overrides = training.at("recipe_overrides");
- REQUIRE(overrides.is_object());
- REQUIRE(overrides.size() == kGoldenRecipeKeys.size());
- CHECK(count_object_key(document, "recipe_overrides") == 1U);
- for (const std::string_view key : kGoldenRecipeKeys) {
-  const nlohmann::json& value = overrides.at(std::string{key});
-  CHECK(value.type() == nlohmann::json::value_t::boolean);
-  CHECK(value == expected_overrides.at(std::string{key}));
- }
-}
 [[nodiscard]] std::filesystem::path write_recipe_case(const mmltk::testsupport::ScopedTempDir& temporary, const std::string_view name, const nlohmann::json& document) {
- const std::filesystem::path path = temporary.path() / std::string{name};
+ const auto path = temporary.path() / std::string{name};
  mmltk::testsupport::write_text_file(path, document.dump(2) + "\n");
  return path;
 }
-void seed_distinct_prior_recipe(GuiSettingsState& state) {
- TrainRequest& request = state.workflows.train.request;
- for (const DoubleRecipeFixture& field : kDoubleRecipeFixtures) {
-  request.*field.value_member = field.prior_value;
-  set_recipe_override(request.recipe_overrides, field.value_member, !field.corpus_override);
- }
- request.lr_drop = kPriorLrDrop;
- set_recipe_override(request.recipe_overrides, &TrainRequest::lr_drop, !kCorpusLrDropOverride);
- request.lr_scheduler = kPriorScheduler;
- set_recipe_override(request.recipe_overrides, &TrainRequest::lr_scheduler, !kCorpusSchedulerOverride);
- request.optimizer = TrainOptimizerKind::Muon;
-}
-void check_materialized_nonuniform_recipe(const GuiSettingsState& state, const std::string_view missing_value = {}, const std::string_view missing_override = {}) {
- const TrainRequest& request = state.workflows.train.request;
- for (const DoubleRecipeFixture& field : kDoubleRecipeFixtures) {
-  CAPTURE(field.key);
-  CHECK(request.*field.value_member == (field.key == missing_value ? field.prior_value : field.corpus_value));
-  CHECK(recipe_overridden(request.recipe_overrides, field.value_member) == (field.key == missing_override ? !field.corpus_override : field.corpus_override));
- }
- CHECK(request.lr_drop == (missing_value == "lr_drop" ? kPriorLrDrop : kCorpusLrDrop));
- CHECK(recipe_overridden(request.recipe_overrides, &TrainRequest::lr_drop) == (missing_override == "lr_drop" ? !kCorpusLrDropOverride : kCorpusLrDropOverride));
- CHECK(request.lr_scheduler == (missing_value == "lr_scheduler" ? kPriorScheduler : kCorpusScheduler));
- CHECK(recipe_overridden(request.recipe_overrides, &TrainRequest::lr_scheduler) == (missing_override == "lr_scheduler" ? !kCorpusSchedulerOverride : kCorpusSchedulerOverride));
- CHECK(request.optimizer == TrainOptimizerKind::Muon);
-}
-[[nodiscard]] nlohmann::json expected_nonuniform_values(const std::string_view missing_value = {}) {
- nlohmann::json values = nonuniform_recipe_values();
- for (const DoubleRecipeFixture& field : kDoubleRecipeFixtures) {
-  if (field.key == missing_value) { values[std::string{field.key}] = field.prior_value; }
- }
- if (missing_value == "lr_drop") {
-  values["lr_drop"] = kPriorLrDrop;
- } else if (missing_value == "lr_scheduler") {
-  values["lr_scheduler"] = "step";
- }
- return values;
-}
-[[nodiscard]] nlohmann::json expected_nonuniform_overrides(const std::string_view missing_override = {}) {
- nlohmann::json overrides = nonuniform_recipe_overrides();
- for (const DoubleRecipeFixture& field : kDoubleRecipeFixtures) {
-  if (field.key == missing_override) { overrides[std::string{field.key}] = !field.corpus_override; }
- }
- if (missing_override == "lr_drop") {
-  overrides["lr_drop"] = !kCorpusLrDropOverride;
- } else if (missing_override == "lr_scheduler") {
-  overrides["lr_scheduler"] = !kCorpusSchedulerOverride;
- }
- return overrides;
-}
-[[nodiscard]] nlohmann::json prior_recipe_overrides() {
- nlohmann::json overrides = nlohmann::json::object();
- for (const DoubleRecipeFixture& field : kDoubleRecipeFixtures) { overrides[std::string{field.key}] = !field.corpus_override; }
- overrides["lr_drop"] = !kCorpusLrDropOverride;
- overrides["lr_scheduler"] = !kCorpusSchedulerOverride;
- return overrides;
-}
-void test_schema_v8_recipe_golden_shape_and_round_trip() {
- mmltk::testsupport::ScopedTempDir temporary{"mmltk-schema-v8-recipe-golden"};
- for (const OptimizerFixture optimizer : kOptimizerFixtures) {
-  for (const bool explicit_overrides : {false, true}) {
-   const nlohmann::json expected_values = golden_recipe_values(optimizer.persisted_id);
-   const nlohmann::json expected_overrides = uniform_recipe_overrides(explicit_overrides);
-   const nlohmann::json input = recipe_document(optimizer.persisted_id, expected_values, expected_overrides);
-   check_recipe_schema_v8_shape(input, optimizer.persisted_id, expected_values, expected_overrides);
-   const std::string stem = std::to_string(optimizer.persisted_id) + (explicit_overrides ? "-explicit" : "-default");
-   const std::filesystem::path input_path = write_recipe_case(temporary, stem + "-input.json", input);
-   GuiSettingsState loaded = default_gui_settings_state();
-   bool repaired = true;
-   REQUIRE(load_settings(input_path, loaded, nullptr, &repaired));
-   CHECK_FALSE(repaired);
-   CHECK(loaded.workflows.train.request.optimizer == optimizer.native_value);
-   const nlohmann::json saved = snapshot_gui_settings(loaded);
-   check_recipe_schema_v8_shape(saved, optimizer.persisted_id, expected_values, expected_overrides);
-   const std::filesystem::path saved_path = write_recipe_case(temporary, stem + "-saved.json", saved);
-   GuiSettingsState reloaded = default_gui_settings_state();
-   REQUIRE(load_settings(saved_path, reloaded));
-   CHECK(reloaded == loaded);
-   CHECK(snapshot_gui_settings(reloaded) == saved);
-  }
+void test_canonical_recipe_round_trip_and_scoped_overrides() {
+ namespace r = mmltk::backend::models::rfdetr;
+ mmltk::testsupport::ScopedTempDir root{"mmltk-schema-v9-recipe"};
+ for (const auto& row : r::kTrainRecipeCatalog) for (bool explicit_overrides : {false, true}) {
+  auto state = default_gui_settings_state();
+  auto& request = state.workflows.train.request;
+  request.recipe.optimizer = row.optimizer;
+  r::reset_train_recipe(request.recipe);
+  TrainRecipeRelation::VisitMembers([&]<class Entry> { if (explicit_overrides) TrainRecipeRelation::set_override<Entry::destination>(request.recipe.overrides); });
+  r::resize_training_models(request.lane_configuration, 2, request.recipe, request.seed);
+  request.lane_configuration.models[1].recipe.lr = .003;
+  set_recipe_override(request.lane_configuration.models[1].recipe.overrides, &TrainRecipeSettings::lr, true);
+  const auto document = snapshot_gui_settings(state);
+  CHECK(document.at("schema_version") == 9U);
+  const auto& training = document.at("workflows").at("train").at("training");
+  CHECK_FALSE(training.contains("lr"));
+  CHECK_FALSE(training.contains("optimizer"));
+  const auto& recipe = training.at("recipe");
+  CHECK(recipe.size() == r::kTrainRecipeFieldCount + 2);
+  CHECK(recipe.at("optimizer") == mmltk::frameworks::reflection::enum_name(row.optimizer));
+  CHECK(recipe.at("overrides").at("mask") == (explicit_overrides ? r::kTrainRecipeOverrideBits : 0));
+  auto loaded = default_gui_settings_state();
+  bool repaired = true;
+  REQUIRE(load_settings(write_recipe_case(root, "roundtrip.json", document), loaded, nullptr, &repaired));
+  CHECK_FALSE(repaired);
+  CHECK(loaded == state);
+  CHECK(snapshot_gui_settings(loaded) == document);
  }
 }
-void test_schema_v8_nonuniform_recipe_and_every_missing_member_are_preserved() {
- mmltk::testsupport::ScopedTempDir temporary{"mmltk-schema-v8-recipe-members"};
- const nlohmann::json corpus_values = nonuniform_recipe_values();
- const nlohmann::json corpus_overrides = nonuniform_recipe_overrides();
- const nlohmann::json corpus = recipe_document(1, corpus_values, corpus_overrides);
- GuiSettingsState materialized = default_gui_settings_state();
- REQUIRE(load_settings(write_recipe_case(temporary, "nonuniform.json", corpus), materialized));
- check_materialized_nonuniform_recipe(materialized);
- check_recipe_schema_v8_shape(snapshot_gui_settings(materialized), 1, corpus_values, corpus_overrides);
- nlohmann::json absent_overrides_document = corpus;
- absent_overrides_document["workflows"]["train"]["training"].erase("recipe_overrides");
- GuiSettingsState absent_overrides_state = default_gui_settings_state();
- seed_distinct_prior_recipe(absent_overrides_state);
- bool absent_overrides_repaired = false;
- REQUIRE(load_settings(write_recipe_case(temporary, "absent-overrides.json", absent_overrides_document), absent_overrides_state, nullptr, &absent_overrides_repaired));
- CHECK(absent_overrides_repaired);
- const TrainRequest& absent_request = absent_overrides_state.workflows.train.request;
- for (const DoubleRecipeFixture& field : kDoubleRecipeFixtures) {
-  CAPTURE(field.key);
-  CHECK(recipe_overridden(absent_request.recipe_overrides, field.value_member) == !field.corpus_override);
- }
- CHECK(recipe_overridden(absent_request.recipe_overrides, &TrainRequest::lr_drop) == !kCorpusLrDropOverride);
- CHECK(recipe_overridden(absent_request.recipe_overrides, &TrainRequest::lr_scheduler) == !kCorpusSchedulerOverride);
- check_recipe_schema_v8_shape(snapshot_gui_settings(absent_overrides_state), 1, corpus_values, prior_recipe_overrides());
- for (const std::string_view key : kGoldenRecipeKeys) {
-  CAPTURE(key);
-  nlohmann::json missing_value_document = corpus;
-  missing_value_document["workflows"]["train"]["training"].erase(std::string{key});
-  GuiSettingsState missing_value_state = default_gui_settings_state();
-  seed_distinct_prior_recipe(missing_value_state);
+void test_partial_current_recipe_preserves_each_missing_member_and_repairs_unknowns() {
+ mmltk::testsupport::ScopedTempDir root{"mmltk-schema-v9-partial-recipe"};
+ auto prior = default_gui_settings_state();
+ prior.workflows.train.request.recipe.lr = .003;
+ set_recipe_override(prior.workflows.train.request.recipe.overrides, &TrainRecipeSettings::lr, true);
+ const auto complete = snapshot_gui_settings(prior);
+ for (const auto& [key, value] : complete.at("workflows").at("train").at("training").at("recipe").items()) {
+  auto missing = complete;
+  missing["workflows"]["train"]["training"]["recipe"].erase(key);
+  auto loaded = prior;
   bool repaired = false;
-  REQUIRE(load_settings(write_recipe_case(temporary, std::string{"missing-value-"} + std::string{key} + ".json", missing_value_document), missing_value_state, nullptr, &repaired));
+  REQUIRE(load_settings(write_recipe_case(root, "missing.json", missing), loaded, nullptr, &repaired));
   CHECK(repaired);
-  check_materialized_nonuniform_recipe(missing_value_state, key);
-  check_recipe_schema_v8_shape(snapshot_gui_settings(missing_value_state), 1, expected_nonuniform_values(key), corpus_overrides);
-  nlohmann::json missing_override_document = corpus;
-  missing_override_document["workflows"]["train"]["training"]["recipe_overrides"].erase(std::string{key});
-  GuiSettingsState missing_override_state = default_gui_settings_state();
-  seed_distinct_prior_recipe(missing_override_state);
-  repaired = false;
-  REQUIRE(load_settings(write_recipe_case(temporary, std::string{"missing-override-"} + std::string{key} + ".json", missing_override_document), missing_override_state, nullptr, &repaired));
-  CHECK(repaired);
-  check_materialized_nonuniform_recipe(missing_override_state, {}, key);
-  check_recipe_schema_v8_shape(snapshot_gui_settings(missing_override_state), 1, corpus_values, expected_nonuniform_overrides(key));
+  CHECK(loaded == prior);
  }
-}
-void test_schema_v8_recipe_placement_and_unknown_fields_repair_canonically() {
- mmltk::testsupport::ScopedTempDir temporary{"mmltk-schema-v8-recipe-placement"};
- const nlohmann::json corpus_values = nonuniform_recipe_values();
- const nlohmann::json corpus_overrides = nonuniform_recipe_overrides();
- nlohmann::json misplaced = recipe_document(1, corpus_values, corpus_overrides);
- for (const std::string_view key : kGoldenRecipeKeys) {
-  const std::string field{key};
-  misplaced[field] = "ignored-root-copy";
-  misplaced["workflows"][field] = "ignored-workflows-copy";
-  misplaced["workflows"]["train"][field] = "ignored-train-copy";
-  misplaced["workflows"]["validate"]["validation"][field] = "ignored-sibling-copy";
- }
- misplaced["recipe_overrides"] = nlohmann::json::object({{"lr", true}});
- misplaced["workflows"]["recipe_overrides"] = nlohmann::json::object({{"lr", true}});
- misplaced["workflows"]["train"]["recipe_overrides"] = nlohmann::json::object({{"lr", true}});
- misplaced["workflows"]["validate"]["validation"]["recipe_overrides"] = nlohmann::json::object({{"lr", true}});
- misplaced["workflows"]["train"]["training"]["unknown_recipe_value"] = 123;
- misplaced["workflows"]["train"]["training"]["recipe_overrides"]["unknown_override"] = true;
- GuiSettingsState loaded = default_gui_settings_state();
+ auto unknown = complete;
+ unknown["workflows"]["train"]["training"]["recipe"]["unknown_field"] = "ignored";
+ unknown["lr"] = "misplaced";
+ auto loaded = prior;
  bool repaired = false;
- REQUIRE(load_settings(write_recipe_case(temporary, "misplaced.json", misplaced), loaded, nullptr, &repaired));
+ REQUIRE(load_settings(write_recipe_case(root, "unknown.json", unknown), loaded, nullptr, &repaired));
  CHECK(repaired);
- check_materialized_nonuniform_recipe(loaded);
- check_recipe_schema_v8_shape(snapshot_gui_settings(loaded), 1, corpus_values, corpus_overrides);
+ CHECK(loaded == prior);
 }
-void test_schema_v8_recipe_scheduler_compatibility() {
- mmltk::testsupport::ScopedTempDir temporary{"mmltk-schema-v8-recipe-scheduler"};
- struct SchedulerCase final {
-  std::string_view name;
-  nlohmann::json external_value;
-  TrainLrSchedulerKind expected;
-  std::string_view canonical_spelling;
-  bool repaired;
+void test_current_recipe_malformed_values_and_historical_encodings_reject_atomically() {
+ mmltk::testsupport::ScopedTempDir root{"mmltk-schema-v9-invalid-recipe"};
+ const auto prior = default_gui_settings_state();
+ const auto complete = snapshot_gui_settings(prior);
+ const auto reject = [&](const nlohmann::json& document) {
+  auto loaded = prior;
+  CHECK_FALSE(load_settings(write_recipe_case(root, "invalid.json", document), loaded));
+  CHECK(loaded == prior);
  };
- const std::array cases{
-  SchedulerCase{"signed-step", nlohmann::json::number_integer_t{0}, TrainLrSchedulerKind::Step, "step", true},
-  SchedulerCase{"unsigned-step", nlohmann::json::number_unsigned_t{0}, TrainLrSchedulerKind::Step, "step", true},
-  SchedulerCase{"signed-cosine", nlohmann::json::number_integer_t{1}, TrainLrSchedulerKind::Cosine, "cosine", true},
-  SchedulerCase{"unsigned-cosine", nlohmann::json::number_unsigned_t{1}, TrainLrSchedulerKind::Cosine, "cosine", true},
-  SchedulerCase{"step-spelling", "step", TrainLrSchedulerKind::Step, "step", false},
-  SchedulerCase{"cosine-spelling", "cosine", TrainLrSchedulerKind::Cosine, "cosine", false},
-  SchedulerCase{"negative", nlohmann::json::number_integer_t{-1}, kPriorScheduler, "step", true},
-  SchedulerCase{"signed-outside", nlohmann::json::number_integer_t{2}, kPriorScheduler, "step", true},
-  SchedulerCase{"unsigned-outside", nlohmann::json::number_unsigned_t{2}, kPriorScheduler, "step", true},
-  SchedulerCase{"floating", 1.0, kPriorScheduler, "step", true},
-  SchedulerCase{"boolean", true, kPriorScheduler, "step", true},
-  SchedulerCase{"null", nullptr, kPriorScheduler, "step", true},
-  SchedulerCase{"wrong-case", "Cosine", kPriorScheduler, "step", true},
-  SchedulerCase{"unknown-spelling", "future-scheduler", kPriorScheduler, "step", true},
- };
- for (const SchedulerCase& test : cases) {
-  CAPTURE(test.name);
-  nlohmann::json document = recipe_document(1, nonuniform_recipe_values(), nonuniform_recipe_overrides());
-  document["workflows"]["train"]["training"]["lr_scheduler"] = test.external_value;
-  GuiSettingsState loaded = default_gui_settings_state();
-  seed_distinct_prior_recipe(loaded);
-  bool repaired = false;
-  REQUIRE(load_settings(write_recipe_case(temporary, std::string{test.name} + ".json", document), loaded, nullptr, &repaired));
-  CHECK(repaired == test.repaired);
-  CHECK(loaded.workflows.train.request.lr_scheduler == test.expected);
-  const nlohmann::json saved = snapshot_gui_settings(loaded);
-  CHECK(saved.at("workflows").at("train").at("training").at("lr_scheduler") == test.canonical_spelling);
-  CHECK(saved.at("workflows").at("train").at("training").at("lr_scheduler").is_string());
+ for (const auto& [key, value] : complete.at("workflows").at("train").at("training").at("recipe").items()) {
+  auto malformed = complete;
+  malformed["workflows"]["train"]["training"]["recipe"][key] = nullptr;
+  reject(malformed);
+  auto invalid = complete;
+  invalid["workflows"]["train"]["training"]["recipe"][key] = value.is_object() ? nlohmann::json{{"mask", 65535}} :
+   value.is_number() ? nlohmann::json(-1) : value.is_string() ? nlohmann::json("unknown") : nlohmann::json{1};
+  reject(invalid);
  }
-}
-void test_schema_v8_recipe_optimizer_compatibility() {
- mmltk::testsupport::ScopedTempDir temporary{"mmltk-schema-v8-recipe-optimizer"};
- for (const OptimizerFixture optimizer : kOptimizerFixtures) {
-  const std::array<nlohmann::json, 2U> raw_ids{
-   nlohmann::json(nlohmann::json::number_integer_t{optimizer.persisted_id}),
-   nlohmann::json(nlohmann::json::number_unsigned_t{static_cast<unsigned int>(optimizer.persisted_id)}),
-  };
-  for (std::size_t index = 0U; index < raw_ids.size(); ++index) {
-   nlohmann::json document = recipe_document(optimizer.persisted_id, golden_recipe_values(optimizer.persisted_id), uniform_recipe_overrides(false));
-   document["workflows"]["train"]["training"]["optimizer"] = raw_ids[index];
-   GuiSettingsState loaded = default_gui_settings_state();
-   bool repaired = true;
-   REQUIRE(load_settings(write_recipe_case(temporary, "valid-" + std::to_string(optimizer.persisted_id) + "-" + std::to_string(index) + ".json", document), loaded, nullptr, &repaired));
-   CHECK_FALSE(repaired);
-   CHECK(loaded.workflows.train.request.optimizer == optimizer.native_value);
-   const nlohmann::json saved = snapshot_gui_settings(loaded);
-   CHECK(saved.at("workflows").at("train").at("training").at("optimizer").type() == nlohmann::json::value_t::number_integer);
-   CHECK(saved.at("workflows").at("train").at("training").at("optimizer") == optimizer.persisted_id);
-  }
+ for (const auto key : {"optimizer", "lr_scheduler"}) {
+  auto historical = complete;
+  historical["workflows"]["train"]["training"]["recipe"][key] = 0;
+  reject(historical);
  }
- nlohmann::json missing = recipe_document(0, golden_recipe_values(0), uniform_recipe_overrides(false));
- missing["workflows"]["train"]["training"].erase("optimizer");
- GuiSettingsState retained = default_gui_settings_state();
- retained.workflows.train.request.optimizer = TrainOptimizerKind::Muon;
- bool repaired = false;
- REQUIRE(load_settings(write_recipe_case(temporary, "missing.json", missing), retained, nullptr, &repaired));
- CHECK(repaired);
- CHECK(retained.workflows.train.request.optimizer == TrainOptimizerKind::Muon);
- CHECK(snapshot_gui_settings(retained).at("workflows").at("train").at("training").at("optimizer") == 1);
-}
-void test_schema_v8_recipe_malformed_and_constraint_rejection_is_atomic() {
- mmltk::testsupport::ScopedTempDir temporary{"mmltk-schema-v8-recipe-rejection"};
- const GuiSettingsState prior = [] {
-  GuiSettingsState state = default_gui_settings_state();
-  seed_distinct_prior_recipe(state);
-  return state;
- }();
- const auto check_rejected = [&](const std::string_view name, nlohmann::json document) {
-  GuiSettingsState candidate = prior;
-  CHECK_FALSE(load_settings(write_recipe_case(temporary, name, document), candidate));
-  CHECK(candidate == prior);
- };
- nlohmann::json missing_schema = recipe_document(0, golden_recipe_values(0), uniform_recipe_overrides(false));
- missing_schema.erase("schema_version");
- check_rejected("missing-schema.json", std::move(missing_schema));
- nlohmann::json unsupported_schema = recipe_document(0, golden_recipe_values(0), uniform_recipe_overrides(false));
- unsupported_schema["schema_version"] = 9U;
- check_rejected("unsupported-schema.json", std::move(unsupported_schema));
- for (const DoubleRecipeFixture& field : kDoubleRecipeFixtures) {
-  CAPTURE(field.key);
-  nlohmann::json malformed = recipe_document(0, golden_recipe_values(0), uniform_recipe_overrides(false));
-  malformed["workflows"]["train"]["training"][std::string{field.key}] = "not-a-number";
-  check_rejected(std::string{"malformed-"} + std::string{field.key} + ".json", std::move(malformed));
-  nlohmann::json invalid = recipe_document(0, golden_recipe_values(0), uniform_recipe_overrides(false));
-  invalid["workflows"]["train"]["training"][std::string{field.key}] = field.invalid_value;
-  check_rejected(std::string{"invalid-"} + std::string{field.key} + ".json", std::move(invalid));
- }
- nlohmann::json malformed_lr_drop = recipe_document(0, golden_recipe_values(0), uniform_recipe_overrides(false));
- malformed_lr_drop["workflows"]["train"]["training"]["lr_drop"] = "not-an-integer";
- check_rejected("malformed-lr-drop.json", std::move(malformed_lr_drop));
- nlohmann::json invalid_lr_drop = recipe_document(0, golden_recipe_values(0), uniform_recipe_overrides(false));
- invalid_lr_drop["workflows"]["train"]["training"]["lr_drop"] = -1;
- check_rejected("invalid-lr-drop.json", std::move(invalid_lr_drop));
- for (const std::string_view key : kGoldenRecipeKeys) {
-  nlohmann::json malformed_override = recipe_document(0, golden_recipe_values(0), uniform_recipe_overrides(false));
-  malformed_override["workflows"]["train"]["training"]["recipe_overrides"][std::string{key}] = 1;
-  check_rejected(std::string{"malformed-override-"} + std::string{key} + ".json", std::move(malformed_override));
- }
- const std::array invalid_optimizers{
-  std::pair<std::string_view, nlohmann::json>{"malformed-optimizer", "adamw"},
-  std::pair<std::string_view, nlohmann::json>{"floating-optimizer", 1.0},
-  std::pair<std::string_view, nlohmann::json>{"boolean-optimizer", true},
-  std::pair<std::string_view, nlohmann::json>{"negative-optimizer", -1},
-  std::pair<std::string_view, nlohmann::json>{"outside-optimizer", 2},
-  std::pair<std::string_view, nlohmann::json>{"unsigned-outside-optimizer", nlohmann::json::number_unsigned_t{2}},
-  std::pair<std::string_view, nlohmann::json>{"overflowing-optimizer", nlohmann::json::number_unsigned_t{static_cast<unsigned int>(std::numeric_limits<int>::max()) + 1U}},
- };
- for (const auto& [name, invalid_optimizer] : invalid_optimizers) {
-  nlohmann::json document = recipe_document(0, golden_recipe_values(0), uniform_recipe_overrides(false));
-  document["workflows"]["train"]["training"]["optimizer"] = invalid_optimizer;
-  check_rejected(std::string{name} + ".json", std::move(document));
- }
+ auto historical = complete; historical["schema_version"] = 8U; reject(historical);
+ auto absent = complete; absent.erase("schema_version"); reject(absent);
 }
 void test_ui_settings_round_trip() {
  SettingsViewStates states;
@@ -574,9 +249,9 @@ void test_ui_settings_round_trip() {
  train.request.lanes = 2;
  train.request.num_queries = 111;
  train.request.eval_max_dets = 113;
- set_recipe_override(train.request.recipe_overrides, &TrainRequest::lr, true);
- train.request.lr_scheduler = mmltk::backend::models::rfdetr::TrainLrSchedulerKind::Cosine;
- set_recipe_override(train.request.recipe_overrides, &TrainRequest::lr_scheduler, true);
+ set_recipe_override(train.request.recipe.overrides, &TrainRecipeSettings::lr, true);
+ train.request.recipe.lr_scheduler = mmltk::backend::models::rfdetr::TrainLrSchedulerKind::Cosine;
+ set_recipe_override(train.request.recipe.overrides, &TrainRecipeSettings::lr_scheduler, true);
  validate.request.compiled_path = "/tmp/validate.bin";
  validate.request.source_dir = "/tmp/source";
  validate.request.onnx_path = "/tmp/models/validate.onnx";
@@ -646,7 +321,7 @@ void test_ui_settings_round_trip() {
  GuiSettingsState& snapshot = make_snapshot(states);
  const nlohmann::json saved = snapshot_gui_settings(snapshot);
  REQUIRE((saved.at("schema_version") == kGuiSettingsSchemaVersion));
- CHECK(saved.at("schema_version") == 8);
+ CHECK(saved.at("schema_version") == 9);
  const nlohmann::json expected_source{{"kind", 1}, {"compiled_path", "/tmp/source.bin"}, {"single_image_path", "/tmp/input.png"}, {"image_directory", "/tmp/images"},
   {"video_file_path", "/tmp/movie.mp4"}, {"recursive", true}, {"device_index", 3}, {"capture_width", 640}, {"capture_height", 480}, {"capture_fps", 29}, {"v4l2_buffer_count", 7}, {"crop_x", 11},
   {"crop_y", 13}, {"crop_width", 101}, {"crop_height", 103}};
@@ -675,8 +350,8 @@ void test_ui_settings_round_trip() {
  REQUIRE((saved.at("workflows").at("train").at("training").at("local_device_ids") == nlohmann::json::array({0, 2})));
  REQUIRE((saved.at("workflows").at("train").at("training").at("num_queries") == 111));
  REQUIRE((saved.at("workflows").at("train").at("training").at("eval_max_dets") == 113));
- REQUIRE((saved.at("workflows").at("train").at("training").at("recipe_overrides").at("lr") == true));
- REQUIRE((saved.at("workflows").at("train").at("training").at("lr_scheduler") == "cosine"));
+ REQUIRE((saved.at("workflows").at("train").at("training").at("recipe").at("overrides").at("mask").get<std::uint16_t>() != 0));
+ REQUIRE((saved.at("workflows").at("train").at("training").at("recipe").at("lr_scheduler") == "Cosine"));
  REQUIRE((saved.at("workflows").at("validate").at("dataset_paths").at("compiled_path") == "/tmp/validate.bin"));
  REQUIRE((saved.at("workflows").at("validate").at("validation").at("candidate_count") == 211));
  REQUIRE((saved.at("workflows").at("validate").at("validation").at("eval_max_dets") == 213));
@@ -713,7 +388,7 @@ void test_ui_settings_round_trip() {
  CHECK(loaded_train.remote_container_image == "test-training-image");
  CHECK(loaded_train.remote_launch_template == "/tmp/launch-template");
  apply_gui_settings(
-  {{"schema_version", 8}, {"ui", {{"dark_mode", false}}}, {"workflows", {{"predict", {{"source", {{"recursive", false}}}}}, {"train", {{"training", {{"remote_container_image", "updated-image"}}}}}}}},
+  {{"schema_version", 9}, {"ui", {{"dark_mode", false}}}, {"workflows", {{"predict", {{"source", {{"recursive", false}}}}}, {"train", {{"training", {{"remote_container_image", "updated-image"}}}}}}}},
   loaded);
  CHECK_FALSE(loaded_ui.dark_mode);
  CHECK(loaded_ui.font_size == 18.0f);
@@ -753,12 +428,12 @@ void test_ui_settings_round_trip() {
  REQUIRE((loaded_train.request.device_ids == std::vector<int>({0, 2})));
  REQUIRE((loaded_train.request.num_queries == 111));
  REQUIRE((loaded_train.request.eval_max_dets == 113));
- REQUIRE((recipe_overridden(loaded_train.request.recipe_overrides, &TrainRequest::lr)));
- REQUIRE((loaded_train.request.lr_scheduler == mmltk::backend::models::rfdetr::TrainLrSchedulerKind::Cosine));
+ REQUIRE((recipe_overridden(loaded_train.request.recipe.overrides, &TrainRecipeSettings::lr)));
+ REQUIRE((loaded_train.request.recipe.lr_scheduler == mmltk::backend::models::rfdetr::TrainLrSchedulerKind::Cosine));
  auto step_document = saved;
- step_document["workflows"]["train"]["training"]["lr_scheduler"] = "step";
+ step_document["workflows"]["train"]["training"]["recipe"]["lr_scheduler"] = "Step";
  apply_gui_settings(step_document, loaded);
- REQUIRE((loaded.workflows.train.request.lr_scheduler == mmltk::backend::models::rfdetr::TrainLrSchedulerKind::Step));
+ REQUIRE((loaded.workflows.train.request.recipe.lr_scheduler == mmltk::backend::models::rfdetr::TrainLrSchedulerKind::Step));
  REQUIRE((loaded_validate.request.compiled_path == "/tmp/validate.bin"));
  REQUIRE((loaded_validate.request.save_engine_path == "/tmp/models/save.engine"));
  REQUIRE((loaded_validate.request.candidate_count == 211));
@@ -1173,7 +848,7 @@ void test_gui_json_persistence_enforces_reflected_field_policies() {
  REQUIRE(gui_settings_valid(defaults));
  auto train = defaults.workflows.train.request;
  REQUIRE_FALSE(mmltk::frameworks::reflection::validate_reflected_fields(train).has_value());
- train.lr = std::numeric_limits<double>::quiet_NaN();
+ train.recipe.lr = std::numeric_limits<double>::quiet_NaN();
  CHECK(mmltk::frameworks::reflection::validate_reflected_fields(train).has_value());
  auto predict = defaults.workflows.predict.request;
  REQUIRE_FALSE(mmltk::frameworks::reflection::validate_reflected_fields(predict).has_value());
@@ -1355,7 +1030,7 @@ void test_opaque_recipe_mask_rejects_generic_settings_mutation_atomically() {
  const GuiSettingsState before = state;
  const std::array update{
   SettingsValueUpdate{
-   .path = "workflows.train.request.recipe_overrides.mask",
+   .path = "workflows.train.request.recipe.overrides.mask",
    .value = mmltk::frameworks::serialization::wire::FlatValue{std::uint64_t{1U}},
   },
  };
@@ -1415,7 +1090,7 @@ void test_training_supervision_relation_is_enforced_by_generic_settings_validity
  REQUIRE(reloaded_after_rejection.Load(location).applied());
  CHECK(reloaded_after_rejection.snapshot() == persisted);
 }
-void test_schema_v8_training_supervision_round_trip_defaults_and_atomic_rejection() {
+void test_schema_v9_training_supervision_round_trip_defaults_and_atomic_rejection() {
  GuiSettingsState state = default_gui_settings_state();
  auto& supervision = state.workflows.train.request.training_supervision;
  supervision.assignment = TrainAssignmentKind::MatchFree;
@@ -1556,13 +1231,10 @@ void test_apply_current_copy_paste_preference() {
  CHECK(persisted_only_requested_preference);
 }
 }  // namespace
+TEST_CASE("canonical recipe and independent overrides persist without flat copies", "[gui][settings]") { test_canonical_recipe_round_trip_and_scoped_overrides(); }
+TEST_CASE("partial current recipe preserves every member and repairs unknowns", "[gui][settings]") { test_partial_current_recipe_preserves_each_missing_member_and_repairs_unknowns(); }
+TEST_CASE("current recipe rejects invalid values and historical encodings atomically", "[gui][settings]") { test_current_recipe_malformed_values_and_historical_encodings_reject_atomically(); }
 TEST_CASE("test_ui_settings_round_trip", "[gui][settings]") { test_ui_settings_round_trip(); }
-TEST_CASE("test_schema_v8_recipe_golden_shape_and_round_trip", "[gui][settings]") { test_schema_v8_recipe_golden_shape_and_round_trip(); }
-TEST_CASE("test_schema_v8_nonuniform_recipe_and_every_missing_member_are_preserved", "[gui][settings]") { test_schema_v8_nonuniform_recipe_and_every_missing_member_are_preserved(); }
-TEST_CASE("test_schema_v8_recipe_placement_and_unknown_fields_repair_canonically", "[gui][settings]") { test_schema_v8_recipe_placement_and_unknown_fields_repair_canonically(); }
-TEST_CASE("test_schema_v8_recipe_scheduler_compatibility", "[gui][settings]") { test_schema_v8_recipe_scheduler_compatibility(); }
-TEST_CASE("test_schema_v8_recipe_optimizer_compatibility", "[gui][settings]") { test_schema_v8_recipe_optimizer_compatibility(); }
-TEST_CASE("test_schema_v8_recipe_malformed_and_constraint_rejection_is_atomic", "[gui][settings]") { test_schema_v8_recipe_malformed_and_constraint_rejection_is_atomic(); }
 TEST_CASE("test_fresh_defaults_use_capture_only_annotate", "[gui][settings]") { test_fresh_defaults_use_capture_only_annotate(); }
 TEST_CASE("test_model_input_load_normalizes_invalid_values_by_workflow", "[gui][settings]") { test_model_input_load_normalizes_invalid_values_by_workflow(); }
 TEST_CASE("test_persistence_rejects_unsupported_schema_and_malformed_files", "[gui][settings]") { test_persistence_rejects_unsupported_schema_and_malformed_files(); }
@@ -1580,8 +1252,8 @@ TEST_CASE("test_opaque_recipe_mask_rejects_generic_settings_mutation_atomically"
 TEST_CASE("test_training_supervision_relation_is_enforced_by_generic_settings_validity", "[gui][settings][training_supervision]") {
  test_training_supervision_relation_is_enforced_by_generic_settings_validity();
 }
-TEST_CASE("test_schema_v8_training_supervision_round_trip_defaults_and_atomic_rejection", "[gui][settings][training_supervision]") {
- test_schema_v8_training_supervision_round_trip_defaults_and_atomic_rejection();
+TEST_CASE("test_schema_v9_training_supervision_round_trip_defaults_and_atomic_rejection", "[gui][settings][training_supervision]") {
+ test_schema_v9_training_supervision_round_trip_defaults_and_atomic_rejection();
 }
 TEST_CASE("test_startup_transport_override_is_session_local_in_both_directions", "[gui][settings]") { test_startup_transport_override_is_session_local_in_both_directions(); }
 TEST_CASE("test_explore_preview_candidate_is_atomic_and_persists_native_modes", "[gui][settings][explore]") { test_explore_preview_candidate_is_atomic_and_persists_native_modes(); }
@@ -1914,4 +1586,14 @@ TEST_CASE("workflow GPU preferences persist independently of immutable CUDA inve
  const auto persisted = snapshot_gui_settings(changed.settings_state).dump();
  CHECK(persisted.find("CUDA device") == std::string::npos);
  CHECK(persisted.find("cuda_devices") == std::string::npos);
+}
+
+TEST_CASE("validation lane count survives flat and nested settings persistence", "[gui][settings][validation]") {
+ auto state = default_gui_settings_state();
+ state.workflows.validate.request.lanes = 7;
+ const nlohmann::json flat = state.workflows.validate;
+ CHECK(flat.get<ValidateViewState>().request.lanes == 7);
+ auto restored = default_gui_settings_state();
+ apply_gui_settings(snapshot_gui_settings(state), restored);
+ CHECK(restored.workflows.validate.request.lanes == 7);
 }

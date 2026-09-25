@@ -1,5 +1,6 @@
 #include "src/backend/ml/cuda/torch_cuda_utils.h"
 #include "src/common/math/deterministic_sampling.h"
+#include "src/backend/models/rfdetr/contract/execution_plan.h"
 #include "src/backend/ml/cuda/numa_host_tensor.h"
 #include <cuda_runtime.h>
 #include <spdlog/spdlog.h>
@@ -29,7 +30,6 @@
 #include <torch/types.h>
 #include <torch/serialize.h>
 #include "detail/target_builder_private.h"
-import mmltk.backend.models.rfdetr.augmentation.augmentation_metadata;
 import mmltk.common.logging.mmltk_logging;
 import mmltk.common.logging.profile_utils;
 import mmltk.backend.ml.cuda.gpu_quiescence;
@@ -134,11 +134,6 @@ void set_packed_mask_range(int64_t* words_data, size_t start, size_t length) {
   bit_offset += fill_bits;
   remaining -= fill_bits;
  }
-}
-bool reservoir_select(const float choice, const std::int64_t candidate_count, const std::int64_t instance_index) {
- if (candidate_count <= 1) { return true; }
- const std::uint64_t key = static_cast<std::uint64_t>(std::bit_cast<std::uint32_t>(choice));
- return mmltk::common::math::deterministic_mix64(key ^ (static_cast<std::uint64_t>(instance_index) * 0xd2b74407b1ce6e93ULL)) % static_cast<std::uint64_t>(candidate_count) == 0;
 }
 }  // namespace
 std::int64_t packed_mask_words_for_shape(const int height, const int width) noexcept {
@@ -301,6 +296,7 @@ TargetStagingSlot& TargetScratch::acquire_staging_slot(const std::size_t batch_s
    }
    if (replace_instances) {
     replacement.boxes = allocate_staging({slot_instance_capacity, 4}, torch::kFloat32);
+    replacement.sampling_keys = allocate_staging({slot_instance_capacity}, torch::kInt64);
     replacement.labels = allocate_staging({slot_instance_capacity}, torch::kInt64);
     replacement.area = allocate_staging({slot_instance_capacity}, torch::kFloat32);
     replacement.iscrowd = allocate_staging({slot_instance_capacity}, torch::kInt64);
@@ -537,6 +533,7 @@ PreparedTargets build_targets(const mmltk::backend::data::Batch& batch, int imag
   mmltk::common::logging::ScopedProfile profile_rfdetr_targets_pack_instances{"rfdetr.targets.pack_instances"};
   for (size_t image_pos = 0; image_pos < batch.num_images; ++image_pos) {
    const uint32_t dataset_index = batch.image_indices[image_pos];
+   const auto image_key = batch.draw_keys.empty() ? static_cast<std::uint64_t>(dataset_index) : batch.draw_keys[image_pos];
    const auto& entry = batch.label_index[dataset_index];
    auto* image_plan = augmentation_plan != nullptr ? &augmentation_plan->images[image_pos] : nullptr;
    if (image_plan != nullptr) {
@@ -568,6 +565,7 @@ PreparedTargets build_targets(const mmltk::backend::data::Batch& batch, int imag
     const auto& source_box = mapped.source_box_xyxy;
     const auto& transformed = mapped.output_box_xyxy;
     const int64_t target_index = total_instances++;
+    if (!batch.draw_keys.empty()) staging.sampling_keys.data_ptr<std::int64_t>()[target_index] = std::bit_cast<std::int64_t>(training_stochastic_key(image_key, instance.source_ordinal, instance_index, 0, 0x544152));
     write_cxcywh_box(boxes, target_index, transformed);
     labels[target_index] = static_cast<int64_t>(instance.class_id);
     if (erasure_bytes != nullptr) { std::memcpy(erasure_bytes + target_index * sizeof(erasure), &erasure, sizeof(erasure)); }
@@ -589,7 +587,7 @@ PreparedTargets build_targets(const mmltk::backend::data::Batch& batch, int imag
     }
     areas[target_index] = mapped.output_area;
     ++retained_candidates;
-    if (image_plan != nullptr && reservoir_select(image_plan->cache_choice, retained_candidates, instance_index)) {
+    if (image_plan != nullptr && augmentation_reservoir_select(image_plan->cache_choice, retained_candidates, instance_index)) {
      image_plan->cache_source_ordinal = instance_index;
      image_plan->cache_source_label = static_cast<int64_t>(instance.class_id);
      image_plan->cache_source_dataset_index = dataset_index;
@@ -603,6 +601,7 @@ PreparedTargets build_targets(const mmltk::backend::data::Batch& batch, int imag
                                                     : AugmentationAnnotationSupport{};
    if (paste_plan != nullptr && donor_support.present) {
     const int64_t paste_index = total_instances++;
+    if (!batch.draw_keys.empty()) staging.sampling_keys.data_ptr<std::int64_t>()[paste_index] = std::bit_cast<std::int64_t>(training_stochastic_key(image_key, paste_plan->paste_sampling_identity, 0, 0, 0x5041535445));
     const auto& paste_box = donor_support.box_xyxy;
     write_cxcywh_box(boxes, paste_index, paste_box);
     labels[paste_index] = paste_plan->paste_label;
@@ -650,6 +649,7 @@ PreparedTargets build_targets(const mmltk::backend::data::Batch& batch, int imag
   scratch.counts_gpu.narrow(0, 0, static_cast<int64_t>(batch.num_images)).copy_(counts_cpu, true);
   if (total_instances > 0) {
    boxes_gpu = staging.boxes.narrow(0, 0, total_instances).to(device, torch::kFloat32, true, false);
+   if (!batch.draw_keys.empty()) prepared.sampling_keys = staging.sampling_keys.narrow(0, 0, total_instances).to(device, torch::kInt64, true, false);
    labels_gpu = staging.labels.narrow(0, 0, total_instances).to(device, torch::kInt64, true, false);
    area_gpu = staging.area.narrow(0, 0, total_instances).to(device, torch::kFloat32, true, false);
    iscrowd_gpu = staging.iscrowd.narrow(0, 0, total_instances).to(device, torch::kInt64, true, false);
@@ -682,6 +682,7 @@ PreparedTargets build_targets(const mmltk::backend::data::Batch& batch, int imag
   torch_cuda::TorchCudaStreamGuard stream_guard(copy_stream);
   staging_submission.finish();
  }
+ prepared.microbatch_key = batch.microbatch_key;
  prepared.all_image_ids = image_ids_gpu;
  prepared.orig_sizes = scratch.batch.sizes_view(static_cast<int64_t>(batch.num_images));
  prepared.nested_mask = scratch.batch.nested_mask_view(static_cast<int64_t>(batch.num_images));

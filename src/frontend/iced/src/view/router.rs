@@ -389,7 +389,7 @@ mod tests {
                     )
                 };
                 let before = settings.draft().cloned();
-                let queued = settings.state().clone().take_request();
+                let queued = settings.state().clone().take_request(false);
                 for (case, invalid) in inadmissible_model_dialogs(&dialog) {
                     model.file_dialog = invalid;
                     assert!(
@@ -397,7 +397,7 @@ mod tests {
                         "{workflow:?}: {case}"
                     );
                     assert_eq!(settings.draft(), before.as_ref(), "{case}");
-                    assert_eq!(settings.state().clone().take_request(), queued, "{case}");
+                    assert_eq!(settings.state().clone().take_request(false), queued, "{case}");
                 }
                 model.file_dialog = Some(dialog.clone());
                 let outcome = router.update(&mut model, &mut settings, confirm()).unwrap();
@@ -421,7 +421,7 @@ mod tests {
                 assert_eq!(projection.selection.key.input, row.input);
                 assert_eq!(projection.selection.artifact, path);
                 let confirmed = settings.draft().cloned();
-                let edits = settings.state().clone().take_request();
+                let edits = settings.state().clone().take_request(false);
                 router
                     .update(
                         &mut model,
@@ -434,7 +434,7 @@ mod tests {
                 router.select(workflow);
                 assert!(router.update(&mut model, &mut settings, confirm()).is_err());
                 assert_eq!(settings.draft(), confirmed.as_ref());
-                assert_eq!(settings.state().clone().take_request(), edits);
+                assert_eq!(settings.state().clone().take_request(false), edits);
                 for generation in [8, 1] {
                     if generation == 1 {
                         // A new transport resets the component's generation frontier.

@@ -220,7 +220,9 @@ impl App {
         {
             return;
         }
-        let Some(request) = self.settings.state_mut().take_request() else {
+        let training_active = self.model.training_family_pending()
+            || self.model.workflow.training.as_ref().is_some_and(|state| state.activity != crate::generated::TrainingActivity::Idle);
+        let Some(request) = self.settings.state_mut().take_request(training_active) else {
             return;
         };
         if !self.submit_intent(

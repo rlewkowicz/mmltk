@@ -2,6 +2,8 @@
 #include "src/frameworks/reflection/field_policy.h"
 #include "src/frameworks/reflection/reflected_field_policy.h"
 #include <cstdint>
+#include <optional>
+#include "src/backend/models/rfdetr/contract/execution_plan.h"
 #include <inplace_vector>
 #include <string>
 #include <type_traits>
@@ -20,6 +22,7 @@ struct SettingsValueUpdate final {
 };
 inline constexpr std::size_t kMaxSettingsUpdates = 64U;
 struct[[= reflection::all_feature_scope()]] SettingsUpdateRequest final {
+ std::optional<mmltk::backend::models::rfdetr::TrainLaneConfiguration> lane_configuration;
  [[= mmltk::frameworks::reflection::MaxItems{kMaxSettingsUpdates}]][[= reflection::direct::SettingsUpdateValues{}]] std::inplace_vector<SettingsValueUpdate, kMaxSettingsUpdates> updates;
 };
 struct[[= reflection::all_feature_scope()]] SettingsResetRequest final {};

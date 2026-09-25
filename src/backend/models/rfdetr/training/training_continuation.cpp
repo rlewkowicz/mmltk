@@ -35,40 +35,6 @@ std::optional<TrainingContinuation> admit_training_configuration(NativeRfDetrCon
 }
 namespace serialization = mmltk::frameworks::serialization;
 namespace {
-// The flat archive contains only this subset of TrainRequest. Its relation to
-// native members is declared once; spelling and scalar types derive from them.
-inline constexpr std::array kContinuationRequestMembers{
- ^^TrainRequest::optimizer, ^^TrainRequest::lr_scheduler, ^^TrainRequest::lr_drop, ^^TrainRequest::warmup_epochs, ^^TrainRequest::warmup_momentum, ^^TrainRequest::lr_min_factor};
-template <class Visitor>
-void visit_request_members(Visitor&& visitor) {
- template for (constexpr auto member : kContinuationRequestMembers) { visitor.template operator()<member>(); }
-}
-template <class Visitor>
-void visit_request_scalars(const TrainRequest& request, Visitor&& visitor) {
- visit_request_members([&]<std::meta::info member> {
-  constexpr auto key = std::define_static_string(member == ^^TrainRequest::optimizer ? std::string("optimizer_kind") : std::string(std::meta::identifier_of(member)));
-  const auto& value = request.[:member:];
-  if constexpr (std::is_enum_v<std::remove_cvref_t<decltype(value)>>)
-   visitor(key, std::string(cli_enum_spelling(value)));
-  else
-   visitor(key, value);
- });
-}
-template <class Visitor>
-void visit_augmentation_scalars(const GpuAugmentationConfig& configuration, Visitor&& visitor) {
- template for (constexpr auto member : std::define_static_array(std::meta::nonstatic_data_members_of(^^GpuAugmentationConfig, std::meta::access_context::current()))) {
-  const auto& value = configuration.[:member:];
-  if constexpr (std::is_same_v<std::remove_cvref_t<decltype(value)>, AugmentationGroupConfig>) {
-   template for (constexpr auto field : std::define_static_array(std::meta::nonstatic_data_members_of(^^AugmentationGroupConfig, std::meta::access_context::current()))) {
-    constexpr auto key = std::define_static_string(std::string("gpu_augment_") + std::string(std::meta::identifier_of(member)) + "_" + std::string(std::meta::identifier_of(field)));
-    visitor(key, value.[:field:]);
-   }
-  } else {
-   constexpr auto key = std::define_static_string(std::string("gpu_augment_") + std::string(std::meta::identifier_of(member)));
-   visitor(key, value);
-  }
- }
-}
 template <class Values, class Visitor>
 void visit_continuation_values(Values& values, Visitor&& visitor) {
  template for (constexpr auto member : std::define_static_array(std::meta::nonstatic_data_members_of(^^TrainingContinuationValues, std::meta::access_context::current()))) {
@@ -96,17 +62,37 @@ void write_scalar(torch::serialize::OutputArchive& archive, const char* key, con
   mmltk::backend::ml::serialization::write_bool(archive, key, scalar);
  else if constexpr (std::is_same_v<Scalar, int64_t>)
   mmltk::backend::ml::serialization::write_int(archive, key, scalar);
- else
+ else if constexpr (std::is_same_v<Scalar, double>)
   mmltk::backend::ml::serialization::write_double(archive, key, scalar);
+ else {
+  constexpr auto capacity = serialization::reflected_maximum_cbor_bytes<T>();
+  serialization::wire::ByteBuffer bytes;
+  const auto encoded = serialization::encode(value, bytes, {.max_bytes = capacity, .max_items = std::numeric_limits<std::uint64_t>::max(), .max_depth = 32});
+  if (!encoded) throw std::runtime_error("invalid continuation structure");
+  auto tensor = torch::empty({static_cast<int64_t>(bytes.size())}, torch::kUInt8);
+  std::memcpy(tensor.data_ptr(), bytes.data(), bytes.size());
+  archive.write(key, tensor);
+ }
 }
 template <class T>
 auto read_scalar(torch::serialize::InputArchive& archive, const char* key) {
  using Scalar = decltype(archive_scalar(T{}));
- const auto value = mmltk::backend::ml::serialization::read_optional_value<Scalar>(archive, key);
- if (!value) throw std::runtime_error(std::string("full training checkpoint is missing ") + key);
- return *value;
+ if constexpr (std::is_arithmetic_v<Scalar> || std::same_as<Scalar, std::string>) {
+  const auto value = mmltk::backend::ml::serialization::read_optional_value<Scalar>(archive, key);
+  if (!value) throw std::runtime_error(std::string("full training checkpoint is missing ") + key);
+  return *value;
+ } else {
+  const auto tensor = mmltk::backend::ml::serialization::require_tensor(archive, key);
+  constexpr auto capacity = serialization::reflected_maximum_cbor_bytes<T>();
+  if (!tensor.is_cpu() || tensor.scalar_type() != torch::kUInt8 || tensor.dim() != 1 || !tensor.is_contiguous() || static_cast<std::uint64_t>(tensor.numel()) > capacity)
+   throw std::runtime_error("invalid continuation structure");
+  auto value = serialization::decode<T>({std::span(reinterpret_cast<const std::byte*>(tensor.const_data_ptr()), static_cast<std::size_t>(tensor.numel())), {}}, {.max_bytes = capacity, .max_items = std::numeric_limits<std::uint64_t>::max(), .max_depth = 32});
+  if (!value) throw std::runtime_error("invalid continuation values");
+  return *value;
+ }
 }
-void validate_values(const TrainingContinuationValues& values, bool requested_ema, bool present_ema) {
+void validate_values(const TrainingContinuationValues& values, const TrainRequest& request, bool present_ema) {
+ const bool requested_ema = request.use_ema;
  if (values.epoch < 0 || values.epoch >= std::numeric_limits<int>::max()) throw std::runtime_error("invalid checkpoint epoch");
  if (values.ema_completed_updates < 0 || values.ema_completed_updates == std::numeric_limits<int64_t>::max() || (!requested_ema && values.ema_completed_updates != 0))
   throw std::runtime_error("invalid checkpoint EMA completed update count");
@@ -114,6 +100,22 @@ void validate_values(const TrainingContinuationValues& values, bool requested_em
  if (values.training_attempt_id.empty() || values.training_attempt_id.size() > 64) throw std::runtime_error("invalid checkpoint attempt identity");
  if (values.training_original_descriptor.size() > mmltk::frameworks::reflection::kMaximumPathBytes) throw std::runtime_error("invalid original checkpoint descriptor provenance");
  validate_resume_continuation_manifest({requested_ema, present_ema, values.grad_scaler_scale, values.grad_scaler_growth_tracker});
+ const auto expected = derive_execution_facts(request, values.execution.settings_revision);
+ if (values.execution.logical_models != expected.logical_models || values.execution.microbatches_per_attempt != expected.microbatches_per_attempt ||
+     values.execution.effective_batch_per_model != expected.effective_batch_per_model || values.execution.aggregate_round_images != expected.aggregate_round_images ||
+     values.execution.configured_capacity != expected.configured_capacity) throw std::runtime_error("checkpoint execution products differ from saved request");
+ const auto donor_streams = request.lane_configuration.mode == TrainLaneMode::SharedGradients ? request.lanes : 1;
+ if (!values.data.plan_hash || values.data.shards.size() != expected.logical_models || values.data.donors.size() != checked_training_product(request.batch_size, donor_streams) ||
+     values.data.epoch < static_cast<std::uint64_t>(values.epoch) || values.data.epoch > static_cast<std::uint64_t>(values.epoch) + 1 ||
+     (values.data.epoch > static_cast<std::uint64_t>(values.epoch) && values.data.next_microbatch != 0) ||
+     values.data.next_microbatch % expected.microbatches_per_attempt) throw std::runtime_error("invalid checkpoint logical data continuation");
+ const auto& clock = values.schedule;
+ if (!clock.epoch_event_applied || clock.epoch != static_cast<std::uint64_t>(values.epoch) || clock.nb_ref % expected.microbatches_per_attempt ||
+     clock.steps_ref != clock.nb_ref / expected.microbatches_per_attempt || clock.consumed_microbatches % expected.microbatches_per_attempt || clock.consumed_attempts != clock.consumed_microbatches / expected.microbatches_per_attempt)
+  throw std::runtime_error("inconsistent checkpoint scheduler clocks");
+ TrainingSchedule schedule(request.recipe, clock.absolute_lrs, std::vector<TrainingGroupRole>(clock.absolute_lrs.size(), TrainingGroupRole::Ordinary), request.epochs,
+  clock.nb_ref, expected.microbatches_per_attempt);
+ schedule.restore(clock);
 }
 bool has_continuation_fields(torch::serialize::InputArchive& archive) {
  bool present = false;
@@ -123,9 +125,6 @@ bool has_continuation_fields(torch::serialize::InputArchive& archive) {
  };
  TrainingContinuationValues values;
  visit_continuation_values(values, probe);
- const TrainRequest request;
- visit_request_scalars(request, probe);
- visit_augmentation_scalars(request.gpu_augmentation, probe);
  probe("optimizer");
  probe("ema_state");
  probe("training_configuration_cbor");
@@ -135,11 +134,11 @@ bool has_continuation_fields(torch::serialize::InputArchive& archive) {
 }  // namespace
 void write_training_configuration(torch::serialize::OutputArchive& archive, const TrainRequest& request) {
  constexpr auto capacity = serialization::reflected_maximum_cbor_bytes<TrainRequest>();
- std::vector<std::byte> bytes(capacity);
- const auto encoded = serialization::encode(request, std::span<std::byte>(bytes), {.max_bytes = capacity, .max_items = 4096, .max_depth = 32});
+ serialization::wire::ByteBuffer bytes;
+ const auto encoded = serialization::encode(request, bytes, {.max_bytes = capacity, .max_items = 4096, .max_depth = 32});
  if (!encoded) throw std::runtime_error("training configuration violates its checkpoint schema");
- auto tensor = torch::empty({static_cast<int64_t>(*encoded)}, torch::kUInt8);
- std::memcpy(tensor.data_ptr(), bytes.data(), *encoded);
+ auto tensor = torch::empty({static_cast<int64_t>(bytes.size())}, torch::kUInt8);
+ std::memcpy(tensor.data_ptr(), bytes.data(), bytes.size());
  archive.write("training_configuration_cbor", tensor);
 }
 TrainRequest read_training_configuration(torch::serialize::InputArchive& archive) {
@@ -158,13 +157,12 @@ TrainRequest read_training_configuration(torch::serialize::InputArchive& archive
 }
 void write_training_continuation(torch::serialize::OutputArchive& archive, const TrainRequest& request, const TrainingContinuationValues& values) {
  validate_train_request(request);
- validate_values(values, request.use_ema, request.use_ema);
+ validate_values(values, request, request.use_ema);
  write_training_configuration(archive, request);
  write_training_supervision_config(archive, request.training_supervision);
  const auto write = [&](const char* key, const auto& value) { write_scalar(archive, key, value); };
  visit_continuation_values(values, write);
- visit_request_scalars(request, write);
- visit_augmentation_scalars(request.gpu_augmentation, write);
+
 }
 std::optional<TrainingContinuation> read_training_continuation(torch::serialize::InputArchive& archive) {
  torch::serialize::InputArchive optimizer;
@@ -175,26 +173,22 @@ std::optional<TrainingContinuation> read_training_continuation(torch::serialize:
  TrainingContinuation result;
  result.configuration = read_training_configuration(archive);
  visit_continuation_values(result.values, [&]<class T>(const char* key, T& value) { value = read_scalar<T>(archive, key); });
- const auto require_equal = [&]<class T>(const char* key, const T& value) {
-  if (read_scalar<T>(archive, key) != archive_scalar(value)) throw std::runtime_error(std::string("checkpoint saved configuration disagrees with ") + key);
- };
- visit_request_scalars(result.configuration, require_equal);
- visit_augmentation_scalars(result.configuration.gpu_augmentation, require_equal);
  require_resume_training_supervision_config(archive, result.configuration.training_supervision);
  c10::IValue ema_value;
  const bool has_ema = archive.try_read("ema_state", ema_value);
  torch::serialize::InputArchive ema;
  if (has_ema && !archive.try_read("ema_state", ema)) throw std::runtime_error("checkpoint EMA continuation is not an archive");
- validate_values(result.values, result.configuration.use_ema, has_ema);
+ validate_values(result.values, result.configuration, has_ema);
  return result;
 }
 void require_active_training_continuation(const TrainingContinuation& saved, const TrainRequest& active) {
- // Only existing resume compatibility facts restrict an active request.
- // Paths, epoch extension and other historically mutable options stay free.
- visit_request_members([&]<std::meta::info member> {
-  constexpr auto name = std::define_static_string(std::meta::identifier_of(member));
-  if (saved.configuration.[:member:] != active.[:member:]) throw std::runtime_error(std::string("resume configuration differs for ") + name);
- });
+ if (active.epochs < saved.configuration.epochs) throw std::runtime_error("Resume cannot shorten the epoch horizon");
+ const auto& prior = saved.configuration;
+ if (prior.recipe != active.recipe || prior.lane_configuration != active.lane_configuration || prior.data_policy != active.data_policy ||
+     prior.batch_size != active.batch_size || prior.grad_accum_steps != active.grad_accum_steps || prior.lanes != active.lanes || prior.seed != active.seed ||
+     prior.unfreeze_encoder_last_epochs != active.unfreeze_encoder_last_epochs || prior.disable_augmentation_last_epochs != active.disable_augmentation_last_epochs ||
+     prior.freeze_encoder != active.freeze_encoder || prior.gpu_augmentation != active.gpu_augmentation)
+  throw std::runtime_error("Resume recipe, logical data, or final epoch policy differs from saved configuration");
  if (saved.configuration.use_ema != active.use_ema) throw std::runtime_error("resume EMA selection differs from the saved training configuration");
  if (saved.configuration.training_supervision != active.training_supervision) throw std::runtime_error("native RF-DETR resume checkpoint training supervision configuration does not match");
 }

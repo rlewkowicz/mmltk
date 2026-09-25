@@ -85,6 +85,7 @@ struct PredictCliRequest final {
  [[= reflection::MaxItems{mmltk::backend::models::rfdetr::kMaximumCliImageInputs}]] std::vector<std::filesystem::path> image_paths;
 };
 struct TrainCliRequest final {
+ [[= reflection::MaxBytes{rfdetr::kMaximumTrainRequestJsonBytes}]] std::string request_json;
  rfdetr::TrainRequest request;
 };
 MMLTK_REFLECT_FIELDS(CompileCliRequest)
@@ -245,6 +246,9 @@ void emit_train_integer_list(std::vector<std::string>& arguments, const TrainCli
  arguments.emplace_back(std::move(joined));
 }
 inline constexpr std::array kTrainOptions{
+ reflection::option<TrainCliRequest, &TrainCliRequest::request_json>("--request-json", "Complete canonical training request (maximum 64 KiB)", "Training"),
+ reflection::option<TrainCliRequest, reflection::member_path<&TrainCliRequest::request, &rfdetr::TrainRequest::recipe, &rfdetr::TrainRecipeSettings::nesterov>>("--nesterov", "SGD Nesterov momentum", "Optimization", {}, "--no-nesterov"),
+ reflection::option<TrainCliRequest, reflection::member_path<&TrainCliRequest::request, &rfdetr::TrainRequest::recipe, &rfdetr::TrainRecipeSettings::warmup_bias_lr>>("--warmup-bias-lr", "Absolute SGD bias warmup learning rate", "Optimization"),
  reflection::option<TrainCliRequest, reflection::member_path<&TrainCliRequest::request, &rfdetr::TrainRequest::class_layout_path>>("--class-layout", "Digest-bound class descriptor", "Model input"),
  reflection::negative_flag<TrainCliRequest, reflection::member_path<&TrainCliRequest::request, &rfdetr::TrainRequest::h2d_dataloader>>("--gdrcopy", "Use GDRCopy image loading", "Execution"),
  reflection::custom_option<TrainCliRequest, reflection::member_path<&TrainCliRequest::request, &rfdetr::TrainRequest::numa_nodes>, &assign_train_integer_list<&rfdetr::TrainRequest::numa_nodes, false>,
@@ -258,25 +262,25 @@ inline constexpr std::array kTrainOptions{
  reflection::option<TrainCliRequest, reflection::member_path<&TrainCliRequest::request, &rfdetr::TrainRequest::resume_path>>("--resume", "Native checkpoint to resume", "Checkpoint"),
  reflection::option<TrainCliRequest, reflection::member_path<&TrainCliRequest::request, &rfdetr::TrainRequest::preset_name>>("--preset", "Declared preset", "Checkpoint"),
  reflection::option<TrainCliRequest, reflection::member_path<&TrainCliRequest::request, &rfdetr::TrainRequest::num_queries>>("--num-queries", "Native query count", "Checkpoint"),
- reflection::option<TrainCliRequest, reflection::member_path<&TrainCliRequest::request, &rfdetr::TrainRequest::batch_size>>("--batch-size", "Per-rank batch size", "Optimization"),
+ reflection::option<TrainCliRequest, reflection::member_path<&TrainCliRequest::request, &rfdetr::TrainRequest::batch_size>>("--batch-size", "Global microbatch image count", "Optimization"),
  reflection::option<TrainCliRequest, reflection::member_path<&TrainCliRequest::request, &rfdetr::TrainRequest::val_batch_size>>("--val-batch-size", "Validation batch size", "Optimization"),
  reflection::option<TrainCliRequest, reflection::member_path<&TrainCliRequest::request, &rfdetr::TrainRequest::epochs>>("--epochs", "Epoch count", "Optimization"),
  reflection::option<TrainCliRequest, reflection::member_path<&TrainCliRequest::request, &rfdetr::TrainRequest::grad_accum_steps>>("--grad-accum-steps", "Gradient accumulation", "Optimization"),
- reflection::option<TrainCliRequest, reflection::member_path<&TrainCliRequest::request, &rfdetr::TrainRequest::optimizer>>("--optimizer", "adamw or muon", "Optimization"),
- reflection::option<TrainCliRequest, reflection::member_path<&TrainCliRequest::request, &rfdetr::TrainRequest::lr>>("--lr", "Decoder learning rate", "Optimization"),
- reflection::option<TrainCliRequest, reflection::member_path<&TrainCliRequest::request, &rfdetr::TrainRequest::lr_encoder>>("--lr-encoder", "Encoder learning rate", "Optimization"),
- reflection::option<TrainCliRequest, reflection::member_path<&TrainCliRequest::request, &rfdetr::TrainRequest::momentum>>(
-  "--momentum", "Muon momentum (AdamW only when explicitly supported)", "Optimization"),
+ reflection::option<TrainCliRequest, reflection::member_path<&TrainCliRequest::request, &rfdetr::TrainRequest::recipe, &rfdetr::TrainRecipeSettings::optimizer>>("--optimizer", "adamw, muon, or sgd", "Optimization"),
+ reflection::option<TrainCliRequest, reflection::member_path<&TrainCliRequest::request, &rfdetr::TrainRequest::recipe, &rfdetr::TrainRecipeSettings::lr>>("--lr", "Decoder learning rate", "Optimization"),
+ reflection::option<TrainCliRequest, reflection::member_path<&TrainCliRequest::request, &rfdetr::TrainRequest::recipe, &rfdetr::TrainRecipeSettings::lr_encoder>>("--lr-encoder", "Encoder learning rate", "Optimization"),
+ reflection::option<TrainCliRequest, reflection::member_path<&TrainCliRequest::request, &rfdetr::TrainRequest::recipe, &rfdetr::TrainRecipeSettings::momentum>>(
+  "--momentum", "Muon or SGD momentum", "Optimization"),
  reflection::option<TrainCliRequest, reflection::member_path<&TrainCliRequest::request, &rfdetr::TrainRequest::freeze_encoder>>(
   "--freeze-encoder", "Freeze encoder", "Optimization", {}, "--no-freeze-encoder"),
- reflection::option<TrainCliRequest, reflection::member_path<&TrainCliRequest::request, &rfdetr::TrainRequest::lr_component_decay>>("--lr-component-decay", "Component decay", "Optimization"),
- reflection::option<TrainCliRequest, reflection::member_path<&TrainCliRequest::request, &rfdetr::TrainRequest::encoder_layer_decay>>("--encoder-layer-decay", "Layer decay", "Optimization"),
- reflection::option<TrainCliRequest, reflection::member_path<&TrainCliRequest::request, &rfdetr::TrainRequest::weight_decay>>("--weight-decay", "Weight decay", "Optimization"),
- reflection::option<TrainCliRequest, reflection::member_path<&TrainCliRequest::request, &rfdetr::TrainRequest::lr_drop>>("--lr-drop", "Step drop epoch", "Optimization"),
- reflection::option<TrainCliRequest, reflection::member_path<&TrainCliRequest::request, &rfdetr::TrainRequest::lr_scheduler>>("--lr-scheduler", "step or cosine", "Optimization"),
- reflection::option<TrainCliRequest, reflection::member_path<&TrainCliRequest::request, &rfdetr::TrainRequest::lr_min_factor>>("--lr-min-factor", "Minimum LR multiplier", "Optimization"),
- reflection::option<TrainCliRequest, reflection::member_path<&TrainCliRequest::request, &rfdetr::TrainRequest::warmup_epochs>>("--warmup-epochs", "Warmup duration", "Optimization"),
- reflection::option<TrainCliRequest, reflection::member_path<&TrainCliRequest::request, &rfdetr::TrainRequest::warmup_momentum>>("--warmup-momentum", "Warmup momentum", "Optimization"),
+ reflection::option<TrainCliRequest, reflection::member_path<&TrainCliRequest::request, &rfdetr::TrainRequest::recipe, &rfdetr::TrainRecipeSettings::lr_component_decay>>("--lr-component-decay", "Component decay", "Optimization"),
+ reflection::option<TrainCliRequest, reflection::member_path<&TrainCliRequest::request, &rfdetr::TrainRequest::recipe, &rfdetr::TrainRecipeSettings::encoder_layer_decay>>("--encoder-layer-decay", "Layer decay", "Optimization"),
+ reflection::option<TrainCliRequest, reflection::member_path<&TrainCliRequest::request, &rfdetr::TrainRequest::recipe, &rfdetr::TrainRecipeSettings::weight_decay>>("--weight-decay", "Weight decay", "Optimization"),
+ reflection::option<TrainCliRequest, reflection::member_path<&TrainCliRequest::request, &rfdetr::TrainRequest::recipe, &rfdetr::TrainRecipeSettings::lr_drop>>("--lr-drop", "Step drop epoch", "Optimization"),
+ reflection::option<TrainCliRequest, reflection::member_path<&TrainCliRequest::request, &rfdetr::TrainRequest::recipe, &rfdetr::TrainRecipeSettings::lr_scheduler>>("--lr-scheduler", "step, cosine, or ultralytics-linear", "Optimization"),
+ reflection::option<TrainCliRequest, reflection::member_path<&TrainCliRequest::request, &rfdetr::TrainRequest::recipe, &rfdetr::TrainRecipeSettings::lr_min_factor>>("--lr-min-factor", "Minimum LR multiplier", "Optimization"),
+ reflection::option<TrainCliRequest, reflection::member_path<&TrainCliRequest::request, &rfdetr::TrainRequest::recipe, &rfdetr::TrainRecipeSettings::warmup_epochs>>("--warmup-epochs", "Warmup duration", "Optimization"),
+ reflection::option<TrainCliRequest, reflection::member_path<&TrainCliRequest::request, &rfdetr::TrainRequest::recipe, &rfdetr::TrainRecipeSettings::warmup_momentum>>("--warmup-momentum", "Warmup momentum", "Optimization"),
  reflection::option<TrainCliRequest, reflection::member_path<&TrainCliRequest::request, &rfdetr::TrainRequest::clip_max_norm>>("--clip-max-norm", "Gradient clipping norm", "Optimization"),
  reflection::option<TrainCliRequest, reflection::member_path<&TrainCliRequest::request, &rfdetr::TrainRequest::fused_optimizer>>(
   "--fused-optimizer", "Use fused AdamW backend", "Optimization", {}, "--no-fused-optimizer"),
@@ -393,11 +397,11 @@ inline constexpr std::array kTrainOptions{
   "--dist-store-file", "Rendezvous file", "Distributed (internal)")};
 [[nodiscard]] consteval bool train_descriptor_relation_is_complete() {
  using Relation = reflection::catalog_provider_relation<rfdetr::TrainRecipeCatalog>;
- constexpr auto selector = reflection::member_path<&TrainCliRequest::request, &rfdetr::TrainRequest::optimizer>;
+ constexpr auto selector = reflection::member_path<&TrainCliRequest::request, &rfdetr::TrainRequest::recipe, &rfdetr::TrainRecipeSettings::optimizer>;
  std::array<reflection::ReflectedMemberIdentity, Relation::member_count> relation_identities{};
  std::size_t count = 0U;
  Relation::VisitMembers([&]<class Entry>() {
-  constexpr auto destination = reflection::rebase_member_path<TrainCliRequest, rfdetr::TrainRequest>(selector, Entry::destination);
+  constexpr auto destination = reflection::rebase_member_path<TrainCliRequest, rfdetr::TrainRecipeSettings>(selector, Entry::destination);
   const auto identity = reflection::accessor_member_identity<TrainCliRequest, destination>();
   (void)reflection::unique_descriptor_index(kTrainOptions, identity);
   relation_identities[count++] = identity;
@@ -607,13 +611,21 @@ void finalize_predict_request(PredictCliRequest& state) {
  state.request = rfdetr::finalize_predict_request(std::move(state.request));
 }
 void apply_train_presence(TrainCliRequest& state, const reflection::PresenceSet& presence) {
+ constexpr auto json_index = reflection::unique_descriptor_index(kTrainOptions, reflection::accessor_member_identity<TrainCliRequest, &TrainCliRequest::request_json>());
+ if (presence.test(json_index)) {
+  for (std::size_t index = 0; index < kTrainOptions.size(); ++index)
+   if (index != json_index && presence.test(index)) throw std::invalid_argument("--request-json is mutually exclusive with scalar train options");
+  state.request = rfdetr::decode_train_request_json(state.request_json);
+  return;
+ }
  using Relation = reflection::catalog_provider_relation<rfdetr::TrainRecipeCatalog>;
- constexpr auto selector = reflection::member_path<&TrainCliRequest::request, &rfdetr::TrainRequest::optimizer>;
+ constexpr auto selector = reflection::member_path<&TrainCliRequest::request, &rfdetr::TrainRequest::recipe, &rfdetr::TrainRecipeSettings::optimizer>;
  Relation::VisitMembers([&]<class Entry>() {
-  constexpr auto destination = reflection::rebase_member_path<TrainCliRequest, rfdetr::TrainRequest>(selector, Entry::destination);
+  constexpr auto destination = reflection::rebase_member_path<TrainCliRequest, rfdetr::TrainRecipeSettings>(selector, Entry::destination);
   constexpr auto index = reflection::unique_descriptor_index(kTrainOptions, reflection::accessor_member_identity<TrainCliRequest, destination>());
-  if (presence.test(index)) Relation::template set_override<Entry::destination>(state.request.recipe_overrides);
+  if (presence.test(index)) Relation::template set_override<Entry::destination>(state.request.recipe.overrides);
  });
+ rfdetr::resolve_train_recipe(state.request.recipe);
  constexpr auto device_id = reflection::member_path<&TrainCliRequest::request, &rfdetr::TrainRequest::device_id>;
  constexpr auto device_ids = reflection::member_path<&TrainCliRequest::request, &rfdetr::TrainRequest::device_ids>;
  constexpr auto device_id_index = reflection::unique_descriptor_index(kTrainOptions, reflection::accessor_member_identity<TrainCliRequest, device_id>());

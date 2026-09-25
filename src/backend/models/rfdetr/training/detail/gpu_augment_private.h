@@ -2,6 +2,7 @@
 #include <cstdint>
 #include <memory>
 #include <vector>
+#include "training_data_plan.h"
 #include <cuda_runtime_api.h>
 #include "src/backend/data/dataset_loader.h"
 #include "src/frameworks/gpu/terminal_cuda_retirement_owner.h"
@@ -18,7 +19,7 @@ public:
  GpuBatchAugmenter(const GpuBatchAugmenter&) = delete;
  GpuBatchAugmenter& operator=(const GpuBatchAugmenter&) = delete;
  void reconfigure(const GpuAugmentationConfig& config);
- [[nodiscard]] torch::Tensor run(const mmltk::backend::data::Batch& batch, std::uint64_t seed, int epoch, int rank, std::uint64_t sequence);
+ [[nodiscard]] torch::Tensor run(const mmltk::backend::data::Batch& batch, std::uint64_t seed, int epoch, int rank, std::uint64_t sequence, const mmltk::backend::data::DatasetLoader* source = nullptr, std::span<const TrainingDonorDescriptor> donors = {});
  [[nodiscard]] inline AugmentationBatchPlan& batch_plan() {
   RequireActive();
   return batch_plan_;
@@ -41,6 +42,7 @@ private:
  decltype(&cudaEventSynchronize) event_wait_ = &cudaEventSynchronize;
  decltype(&cudaStreamSynchronize) stream_wait_ = &cudaStreamSynchronize;
  friend struct test_support::GpuBatchAugmenterTestAccess;
+ void materialize_donors(const mmltk::backend::data::DatasetLoader&, std::span<const TrainingDonorDescriptor>);
  void ensure_copy_paste_resources();
  [[nodiscard]] cudaError_t release_copy_paste_resources() noexcept;
  GpuAugmentationConfig config_;
@@ -49,6 +51,7 @@ private:
   mmltk::frameworks::gpu::DeviceContext context;
   torch::Tensor output_;
   torch::Tensor donor_images_;
+  torch::Tensor donor_images_cpu_;
   torch::Tensor donor_masks_;
   torch::Tensor donor_masks_cpu_;
   torch::Tensor donor_boxes_cpu_;
@@ -65,6 +68,8 @@ private:
  std::shared_ptr<Resources> resources_;
  AugmentationBatchPlan batch_plan_;
  std::vector<GpuAugmentationDonor> donor_metadata_;
+ std::vector<TrainingDonorDescriptor> materialized_donors_;
+ bool logical_donors_ = false;
  std::vector<std::vector<mmltk::backend::data::RLEPair>> donor_support_;
  std::unique_ptr<GpuAugmentationExecutor> executor_;
  bool cache_upload_pending_ = false;

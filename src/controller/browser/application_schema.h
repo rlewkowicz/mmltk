@@ -740,6 +740,14 @@ void append_value(FingerprintSink& sink, const Value& value) {
  } else if constexpr (Variant<Type>::value) {
   sink.append_number(value.index());
   std::visit([&](const auto& item) { append_value(sink, item); }, value);
+ } else if constexpr (mmltk::frameworks::reflection::kOpaqueRelationStorage<Type>) {
+  // Opaque storage has one sealed serialization boundary; fingerprints consume
+  // its canonical bytes without exposing private relation state to schema clients.
+  mmltk::frameworks::serialization::wire::ByteBuffer bytes;
+  if (!mmltk::frameworks::serialization::encode(value, bytes, {.max_bytes = 1024U, .max_items = 16U, .max_depth = 4U}))
+   throw std::logic_error("invalid opaque settings default");
+  sink.append_number(bytes.size());
+  for (const auto byte : bytes) sink.append_number(std::to_integer<std::uint8_t>(byte));
  } else if constexpr (ReflectedObject<Type>) {
   auto visitor = [&]<class Owner, class Declaration>(const auto& fact) {
    sink.append(fact.member_name);

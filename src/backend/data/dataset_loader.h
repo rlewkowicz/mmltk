@@ -1,6 +1,8 @@
 #pragma once
 #include "src/backend/data/data_loading_options.h"
 #include <cstdint>
+#include <span>
+#include <vector>
 #include <cuda_runtime_api.h>
 #include <memory>
 #include <string>
@@ -13,7 +15,14 @@ namespace mmltk::frameworks::gpu {
 class TerminalCudaRetirementOwner;
 }
 namespace mmltk::backend::data {
+struct DatasetIndexSchedule final {
+ std::vector<std::uint32_t> image_indices;
+ std::vector<std::uint64_t> draw_keys;
+ std::vector<std::uint64_t> microbatch_keys;
+};
 struct Batch {
+ std::span<const std::uint64_t> draw_keys;
+ std::uint64_t microbatch_key = 0;
  size_t num_images = 0;
  const float* device_images = nullptr;
  const LabelIndexEntry* label_index = nullptr;
@@ -48,6 +57,7 @@ public:
  DatasetLoader(const DatasetLoader&) = delete;
  DatasetLoader& operator=(const DatasetLoader&) = delete;
  void begin_epoch();
+ void begin_epoch(std::shared_ptr<const DatasetIndexSchedule>, std::size_t resume_offset = 0);
  bool next_batch(Batch& out);
  // Cancellation only wakes acquisition; joining and checked-out custody remain with the owner.
  bool next_batch(Batch& out, std::stop_token);

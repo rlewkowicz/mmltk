@@ -1,3 +1,4 @@
+#include "detail/semantic_sampling.h"
 #include <cctype>
 #include "src/backend/models/rfdetr/core/detection_ops.h"
 #include "src/backend/models/rfdetr/core/detail/detection_sampling.h"
@@ -422,6 +423,14 @@ std::vector<MatchIndices> compute_matcher_indices_for_layers(const std::vector<c
  std::vector<torch::Tensor> retained_coords(layers.size());
  if (!samples.empty())
   for (size_t i = 0; i < layers.size(); ++i) retained_coords[i] = samples[i].matcher;
+ if (targets.sampling_keys.defined() && config.include_masks) for (std::size_t i = 0; i < layers.size(); ++i) if (!retained_coords[i].defined()) {
+  const auto& layer = *layers[i];
+  if (!layer.pred_masks && !layer.sparse_pred_masks) throw std::runtime_error("native RF-DETR mask matcher requires pred_masks in the model outputs");
+  if (config.mask_point_sample_ratio <= 0) throw std::invalid_argument("invalid matcher mask sampling ratio");
+  const auto spatial = layer.pred_masks ? *layer.pred_masks : layer.sparse_pred_masks->spatial_features;
+  const auto count = spatial.size(-2) * spatial.size(-1) / config.mask_point_sample_ratio;
+  retained_coords[i] = semantic_coordinates(targets.microbatch_key, count, 0x4d41544348ULL + i, device);
+ }
  std::vector<int64_t> logical_offsets(targets.counts.size());
  std::exclusive_scan(targets.counts.begin(), targets.counts.end(), logical_offsets.begin(), int64_t{0});
  if (device.is_cuda()) {
@@ -612,7 +621,7 @@ TensorMap loss_boxes(const OutputLayer& layer, const PreparedTargets& targets, c
  return losses;
 }
 TensorMap loss_masks(
- const OutputLayer& layer, const PreparedTargets& targets, const MatcherLayerIndices& indices, const DetectionConfig& config, const torch::Tensor& num_boxes, const LayerMaskSamples& samples) {
+ const OutputLayer& layer, const PreparedTargets& targets, const MatcherLayerIndices& indices, const DetectionConfig& config, const torch::Tensor& num_boxes, const LayerMaskSamples& samples, std::size_t layer_index) {
  mmltk::common::logging::ScopedProfile profile_rfdetr_criterion_loss_masks{"rfdetr.criterion.loss_masks"};
  TensorMap losses;
  const auto idx = indices.source;
@@ -633,7 +642,10 @@ TensorMap loss_masks(
  }
  mmltk::common::logging::profile_add_value("rfdetr.criterion.matched_pairs", idx.first.size(0));
  mmltk::common::logging::profile_set_value("rfdetr.criterion.mask_points", static_cast<size_t>(direct_mask_point_count(src_masks, config.mask_point_sample_ratio)));
- const auto sampled = sample_direct_masks(src_masks, targets, indices.global_targets, config.mask_point_sample_ratio, samples);
+ std::optional<DirectMaskRandomSeeds> seeds;
+ if (targets.sampling_keys.defined()) seeds = DirectMaskRandomSeeds{0x43414e44ULL + layer_index, 0x52454d41ULL + layer_index,
+  torch::bitwise_xor(targets.sampling_keys.index_select(0, indices.global_targets), idx.second * 0x45d9f3b)};
+ const auto sampled = sample_direct_masks(src_masks, targets, indices.global_targets, config.mask_point_sample_ratio, samples, seeds);
  const auto& point_logits = sampled.logits;
  const auto& point_labels = sampled.targets;
  losses["loss_mask_ce"] = sigmoid_ce_loss(point_logits, point_labels, num_boxes, config.use_jit_traced_loss_ops);
@@ -699,7 +711,7 @@ TensorMap detection_loss_dict(
  update_losses(losses, loss_labels(outputs.main, targets, indices, config, num_boxes_value, true));
  update_losses(losses, loss_cardinality(outputs.main, targets));
  update_losses(losses, loss_boxes(outputs.main, targets, indices, num_boxes_value));
- if (config.include_masks) { update_losses(losses, loss_masks(outputs.main, targets, indices, config, num_boxes_value, layer_samples(0))); }
+ if (config.include_masks) { update_losses(losses, loss_masks(outputs.main, targets, indices, config, num_boxes_value, layer_samples(0), 0)); }
  if (!outputs.aux_outputs.empty()) {
   mmltk::common::logging::ScopedProfile profile_rfdetr_criterion_aux{"rfdetr.criterion.aux"};
   for (size_t aux_index = 0; aux_index < outputs.aux_outputs.size(); ++aux_index) {
@@ -708,7 +720,7 @@ TensorMap detection_loss_dict(
    update_losses(losses, loss_cardinality(outputs.aux_outputs[aux_index], targets), "_" + std::to_string(aux_index));
    update_losses(losses, loss_boxes(outputs.aux_outputs[aux_index], targets, aux_indices, num_boxes_value), "_" + std::to_string(aux_index));
    if (config.include_masks) {
-    update_losses(losses, loss_masks(outputs.aux_outputs[aux_index], targets, aux_indices, config, num_boxes_value, layer_samples(aux_index + 1)), "_" + std::to_string(aux_index));
+    update_losses(losses, loss_masks(outputs.aux_outputs[aux_index], targets, aux_indices, config, num_boxes_value, layer_samples(aux_index + 1), aux_index + 1), "_" + std::to_string(aux_index));
    }
   }
  }
@@ -718,7 +730,7 @@ TensorMap detection_loss_dict(
   update_losses(losses, loss_labels(*outputs.enc_outputs, targets, enc_indices, config, num_boxes_value, false), "_enc");
   update_losses(losses, loss_cardinality(*outputs.enc_outputs, targets), "_enc");
   update_losses(losses, loss_boxes(*outputs.enc_outputs, targets, enc_indices, num_boxes_value), "_enc");
-  if (config.include_masks) { update_losses(losses, loss_masks(*outputs.enc_outputs, targets, enc_indices, config, num_boxes_value, layer_samples(matcher_layers.size() - 1)), "_enc"); }
+  if (config.include_masks) { update_losses(losses, loss_masks(*outputs.enc_outputs, targets, enc_indices, config, num_boxes_value, layer_samples(matcher_layers.size() - 1), matcher_layers.size() - 1), "_enc"); }
  }
  return losses;
 }

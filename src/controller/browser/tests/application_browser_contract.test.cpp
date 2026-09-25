@@ -1088,7 +1088,7 @@ TEST_CASE("canonical schema publishes unique request and recursive settings iden
   if (field.path == "workflows.explore.class_catalog_identity") {
    explore_catalog_identity_is_persistence_metadata = !field.mutable_leaf && field.stable_id == application_settings_field_stable_id("workflows.explore.class_catalog_identity");
   }
-  opaque_override_storage_was_exposed = opaque_override_storage_was_exposed || field.path.find("recipe_overrides") != std::string_view::npos;
+  opaque_override_storage_was_exposed = opaque_override_storage_was_exposed || field.path.find("recipe.overrides") != std::string_view::npos;
   if (!field.file_dialog) return;
   ++dialog_count;
   const auto entries = services::file_dialog_catalog().entries();
@@ -1106,17 +1106,17 @@ TEST_CASE("canonical schema publishes unique request and recursive settings iden
  std::size_t relation_count = 0U;
  ApplicationSchema<TestSystems>::VisitSettingsRelations<contracts::GuiSettingsState>([&]<class Provider, class Relation, auto Selector>() {
   STATIC_REQUIRE(std::same_as<Provider, mmltk::backend::models::rfdetr::TrainRecipeCatalog>);
-  STATIC_REQUIRE(Relation::member_count == 11U);
+  STATIC_REQUIRE(Relation::member_count == mmltk::backend::models::rfdetr::kTrainRecipeFieldCount);
   constexpr auto selector_path = mmltk::frameworks::reflection::reflected_member_path<contracts::GuiSettingsState, Selector>();
-  CHECK(selector_path.view() == "workflows.train.request.optimizer");
+  CHECK(selector_path.view() == "workflows.train.request.recipe.optimizer");
   Relation::VisitMembers([&]<class Entry>() {
    constexpr auto rebased = mmltk::frameworks::reflection::rebase_member_path<contracts::GuiSettingsState, typename Relation::destination_type>(Selector, Entry::destination);
    constexpr auto path = mmltk::frameworks::reflection::reflected_member_path<contracts::GuiSettingsState, rebased>();
-   CHECK(path.view().starts_with("workflows.train.request."));
+   CHECK(path.view().starts_with("workflows.train.request.recipe."));
    ++relation_count;
   });
  });
- CHECK(relation_count == 11U);
+ CHECK(relation_count == mmltk::backend::models::rfdetr::kTrainRecipeFieldCount);
 }
 TEST_CASE("custom model dialogs derive from the canonical compatibility catalog", "[controller][browser][reflection][dialog][model]") {
  const auto entries = services::file_dialog_catalog().entries();

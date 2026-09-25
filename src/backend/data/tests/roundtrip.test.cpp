@@ -482,6 +482,47 @@ void exercise_roundtrip_transport(const FixtureSpec& fixture, const bool h2d, cu
  }
  REQUIRE(total == 14U);
  dropped_loader.synchronize();
+
+ // Explicit schedules own repeats, order and logical keys even when legacy
+ // loader configuration requests a shuffle/shard. Borrowed views retain them.
+ auto planned_cfg = shuffled_cfg;
+ planned_cfg.batch_size = 4;
+ planned_cfg.batch_shard_count = 2;
+ planned_cfg.batch_shard_rank = 1;
+ DatasetLoader planned_loader(planned_cfg);
+ auto schedule = std::make_shared<DatasetIndexSchedule>();
+ schedule->image_indices = {3, 3, 1, 0, 2, 4, 2, 6, 3, 3, 3, 3};
+ schedule->draw_keys = {11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22};
+ schedule->microbatch_keys = {101, 102, 103};
+ std::weak_ptr<const DatasetIndexSchedule> lifetime = schedule;
+ planned_loader.begin_epoch(schedule, 4);
+ CHECK(planned_loader.num_batches() == 2);
+ schedule.reset();
+ REQUIRE(planned_loader.next_batch(batch));
+ CHECK_FALSE(lifetime.expired());
+ CHECK(batch.num_images == 4);
+ CHECK(std::vector<std::uint32_t>(batch.image_indices, batch.image_indices + batch.num_images) == std::vector<std::uint32_t>{2, 4, 2, 6});
+ CHECK(std::vector<std::uint64_t>(batch.draw_keys.begin(), batch.draw_keys.end()) == std::vector<std::uint64_t>{15, 16, 17, 18});
+ CHECK(batch.microbatch_key == 102);
+ REQUIRE_THROWS(planned_loader.begin_epoch());
+ planned_loader.release_batch(batch);
+ REQUIRE(planned_loader.next_batch(batch));
+ CHECK(batch.microbatch_key == 103);
+ planned_loader.release_batch(batch);
+ CHECK_FALSE(planned_loader.next_batch(batch));
+ planned_loader.synchronize();
+ auto invalid = std::make_shared<DatasetIndexSchedule>();
+ invalid->image_indices = {static_cast<std::uint32_t>(NUM_IMAGES)};
+ REQUIRE_THROWS(planned_loader.begin_epoch(invalid));
+ invalid->image_indices = {0, 1, 2, 3}; invalid->draw_keys = {1};
+ REQUIRE_THROWS(planned_loader.begin_epoch(invalid));
+ invalid->draw_keys.clear();
+ REQUIRE_THROWS(planned_loader.begin_epoch(invalid, 1));
+ REQUIRE_THROWS(planned_loader.begin_epoch(invalid, 8));
+ planned_loader.begin_epoch();
+ CHECK(lifetime.expired());
+ while (planned_loader.next_batch(batch)) planned_loader.release_batch(batch);
+ planned_loader.synchronize();
  DatasetLoader same_seed_a(shuffled_cfg);
  DatasetLoader same_seed_b(shuffled_cfg);
  for (int epoch = 0; epoch < 2; ++epoch) {
