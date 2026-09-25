@@ -1480,8 +1480,9 @@ impl ApplicationModel {
                 .then(|| failure(state.remote.detail.clone())));
         let run = state.metrics.as_ref().map_or("", |record| record.runid.as_str());
         self.notices.run_condition(Origin::History, run, state.persistence.degraded, || warning("History incomplete", format!("{} ({} records dropped)", state.persistence.error, state.persistence.droppedrecords)));
-        // The retained metrics owner observes subsequent accumulated drop conditions.
-        if self.notices.first_bootstrap() {
+        // Bootstrap seeds/rebases native run ownership before retained metrics
+        // ingest. The metrics owner publishes subsequent actual count changes.
+        if self.notices.bootstrapping() {
             let dropped = state.metrics.as_ref().map_or(0, |record| record.droppedbefore);
             self.notices.run_condition(Origin::HistoryDropped, run, (dropped > 0), || warning("History incomplete", format!("{dropped} training records were dropped.")));
         }

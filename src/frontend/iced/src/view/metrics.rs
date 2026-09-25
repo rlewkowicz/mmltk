@@ -113,7 +113,7 @@ impl Component {
                 if let Some(run) = &opened.run {
                     self.saved.set_run(&run.runid, opened.generation);
                 } else {
-                    self.saved.generation = opened.generation;
+                    self.saved.set_run("", opened.generation);
                 }
                 saved_changed = u16::MAX;
             }
@@ -852,6 +852,155 @@ pub(crate) mod tests {
             crate::view_model::test_support::saved_training_run(configuration),
         );
     }
+    fn publish(component: &mut Component, model: &mut crate::view_model::ApplicationModel) {
+        component.rebase(model, false);
+        component.publish_conditions(&mut model.notices);
+    }
+
+    fn install_history_bootstrap(model: &mut crate::view_model::ApplicationModel, sample: &TrainingRecord) {
+        let mut snapshots: Vec<_> = crate::generated::application_snapshot_defaults().unwrap().into_iter().map(|fact| fact.value).collect();
+        for snapshot in &mut snapshots {
+            if let crate::generated::ApplicationSnapshot::Training(state) = snapshot { state.metrics = Some(sample.clone()); }
+        }
+        model.install_bootstrap(crate::generated::SCHEMA_FINGERPRINT, snapshots).unwrap();
+    }
+
+    #[test]
+    fn history_conditions_preserve_bootstrap_and_independent_acknowledgements_across_cache_reset() {
+        use crate::view_model::notices::Origin;
+        let mut component = Component::default();
+        let mut model = crate::view_model::ApplicationModel::default();
+        let mut sample = record();
+        sample.droppedbefore = 4;
+        install_history_bootstrap(&mut model, &sample);
+        publish(&mut component, &mut model);
+        assert!(model.notices.is_empty(), "first bootstrap seeds an active drop episode");
+        sample.sequence += 1;
+        sample.droppedbefore = 0;
+        model.workflow.training.as_mut().unwrap().metrics = Some(sample.clone());
+        publish(&mut component, &mut model);
+        sample.sequence += 1;
+        sample.droppedbefore = 7;
+        model.workflow.training.as_mut().unwrap().metrics = Some(sample.clone());
+        publish(&mut component, &mut model);
+        let live_id = model.notices.latest().unwrap().id;
+        assert_eq!(model.notices.latest().unwrap().origin, Origin::HistoryDropped);
+        model.notices.dismiss(live_id);
+
+        select_saved_run(&mut model);
+        let mut saved = sample.clone();
+        saved.runid = "saved".into();
+        saved.droppedbefore = 11;
+        model.workflow.output.saved_mut().unwrap().page = Some(TrainingHistoryPage { generation: 3, nextcursor: 100, more: false, records: vec![saved.clone()] });
+        publish(&mut component, &mut model);
+        let saved_id = model.notices.latest().unwrap().id;
+        assert_eq!(model.notices.latest().unwrap().origin, Origin::HistoryDroppedSaved);
+        model.notices.dismiss(saved_id);
+        component.reset(false);
+        component.publish_conditions(&mut model.notices);
+        publish(&mut component, &mut model);
+        assert!(model.notices.is_empty(), "visual clear and restored same histories cannot recover native drops");
+
+        model.peer_disconnected(crate::view_model::UiError::transport("offline"));
+        model.notices.dismiss_all();
+        component.reset(false);
+        install_history_bootstrap(&mut model, &sample);
+        publish(&mut component, &mut model);
+        assert!(model.notices.is_empty(), "reconnect keeps the live acknowledgement");
+        select_saved_run(&mut model);
+        model.workflow.output.saved_mut().unwrap().page = Some(TrainingHistoryPage { generation: 3, nextcursor: 100, more: false, records: vec![saved] });
+        publish(&mut component, &mut model);
+        assert!(model.notices.is_empty(), "reselection keeps the independent saved acknowledgement");
+
+        sample.runid = "new native run".into();
+        model.workflow.training.as_mut().unwrap().metrics = Some(sample);
+        publish(&mut component, &mut model);
+        assert_eq!(model.notices.len(), 1);
+        assert_eq!(model.notices.latest().unwrap().origin, Origin::HistoryDropped);
+        assert_ne!(model.notices.latest().unwrap().id, live_id);
+    }
+
+    #[test]
+    fn reconnect_observes_same_run_drops_and_seeds_replacement_run_history() {
+        use crate::view_model::notices::Origin;
+        let mut component = Component::default();
+        let mut model = crate::view_model::ApplicationModel::default();
+        let mut sample = record();
+        install_history_bootstrap(&mut model, &sample);
+        publish(&mut component, &mut model);
+        component.reset(false);
+        sample.sequence += 1;
+        sample.droppedbefore = 5;
+        install_history_bootstrap(&mut model, &sample);
+        publish(&mut component, &mut model);
+        assert_eq!(model.notices.len(), 1, "same-run drops completed while offline are new");
+        assert_eq!(model.notices.latest().unwrap().origin, Origin::HistoryDropped);
+        model.notices.dismiss_all();
+        component.reset(false);
+        sample.runid = "replacement retained run".into();
+        sample.sequence = 1;
+        sample.droppedbefore = 2;
+        install_history_bootstrap(&mut model, &sample);
+        publish(&mut component, &mut model);
+        assert!(model.notices.is_empty(), "replacement bootstrap seeds its retained condition");
+        for dropped in [0, 4] {
+            sample.sequence += 1;
+            sample.droppedbefore = dropped;
+            model.workflow.training.as_mut().unwrap().metrics = Some(sample.clone());
+            publish(&mut component, &mut model);
+        }
+        assert_eq!(model.notices.len(), 1, "a real recovery rearms the replacement run");
+        assert!(model.notices.latest().unwrap().detail.starts_with("4 training records"));
+    }
+
+    #[test]
+    fn metrics_publish_only_changed_conditions_and_preserve_retained_notice_identity() {
+        use crate::view_model::notices::Origin;
+        let mut component = Component::default();
+        let mut model = crate::view_model::test_support::bootstrapped();
+        let mut sample = record();
+        sample.droppedbefore = 2;
+        model.workflow.training.as_mut().unwrap().metrics = Some(sample.clone());
+        publish(&mut component, &mut model);
+        let id = model.notices.latest().unwrap().id;
+        let stable = model.notices.presentation().clone();
+        for _ in 0..3 { publish(&mut component, &mut model); }
+        sample.sequence += 1;
+        sample.progress.elapsedseconds += 0.1; // A coalesced live record still observes native drops.
+        model.workflow.training.as_mut().unwrap().metrics = Some(sample.clone());
+        publish(&mut component, &mut model);
+        assert_eq!(model.notices.presentation(), &stable);
+        sample.sequence += 1;
+        sample.droppedbefore = 3;
+        model.workflow.training.as_mut().unwrap().metrics = Some(sample.clone());
+        publish(&mut component, &mut model);
+        assert_eq!(model.notices.latest().unwrap().id, id);
+        assert_eq!(model.notices.latest().unwrap().content_version, 2);
+        assert_ne!(model.notices.presentation(), &stable);
+
+        model.notices.dismiss(id);
+        for index in 0..=history::BUCKETS {
+            sample.sequence += 1;
+            sample.attemptid = format!("attempt {index}");
+            component.live.ingest(&sample, false, &component.metrics);
+        }
+        component.publish_conditions(&mut model.notices);
+        let chart = model.notices.latest().unwrap();
+        assert_eq!(chart.origin, Origin::Chart);
+        assert!(chart.detail.contains("older disconnected summaries"));
+        let chart_id = chart.id;
+        let unchanged = model.notices.presentation().clone();
+        component.publish_conditions(&mut model.notices);
+        assert_eq!(model.notices.presentation(), &unchanged);
+        model.notices.dismiss(chart_id);
+        component.reset(false);
+        component.publish_conditions(&mut model.notices);
+        assert!(model.notices.is_empty());
+        model.workflow.training.as_mut().unwrap().metrics = Some(sample);
+        publish(&mut component, &mut model);
+        assert!(model.notices.is_empty(), "cache reset did not rearm the dismissed drop");
+    }
+
     #[test]
     fn hidden_navigation_saved_selection_and_preparation_preserve_independent_live_history() {
         let mut component = Component::default();
@@ -945,12 +1094,8 @@ pub(crate) mod tests {
 }
 
 impl Component {
-    pub(crate) fn observe_notices(&self, notices: &mut crate::view_model::notices::NoticeStore) {
-        use crate::view_model::notices::{Origin, warning};
-        for (history, chart, dropped) in [(&self.live, Origin::Chart, Origin::HistoryDropped), (&self.saved, Origin::ChartSaved, Origin::HistoryDroppedSaved)] {
-            let omissions: u64 = history.curves.iter().map(|curve| curve.omitted).sum();
-            notices.run_condition(chart, &history.run, (omissions > 0), || warning("Chart history incomplete", format!("Charts omit {omissions} older disconnected summaries; saved history remains unchanged.")));
-            notices.run_condition(dropped, &history.run, (history.dropped > 0), || warning("History incomplete", format!("{} training records were dropped.", history.dropped)));
-        }
+    pub(crate) fn publish_conditions(&mut self, notices: &mut crate::view_model::notices::NoticeStore) {
+        self.live.publish_conditions(notices, false);
+        self.saved.publish_conditions(notices, true);
     }
 }

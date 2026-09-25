@@ -3,9 +3,10 @@ pub mod environment;
 mod overlay;
 #[cfg(test)] mod tests;
 use crate::fluent_theme::{Element, Theme};
-use crate::view_model::notices::{CopyToken, NoticeId, NoticeStore};
+use crate::view_model::notices::{CopyToken, NoticeId, NoticeStore, Presentation};
 use iced::widget::{column, container, keyed_column, row, scrollable, space, text};
 use iced::{Center, Fill, Length};
+use std::collections::HashMap;
 
 pub const TRIGGER_ID: &str = "navigation.status";
 pub const CLOSE_ID: &str = "status.close";
@@ -14,7 +15,7 @@ pub const SCROLL_ID: &str = "status.scroll";
 pub const STATUS_WIDTH: f32 = 192.0;
 pub const SETTINGS_WIDTH: f32 = 96.0;
 pub const CONTROL_HEIGHT: f32 = 34.0;
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Control { Trigger, Settings, Close, Copy(NoticeId), Detail(NoticeId), Dismiss(NoticeId) }
 impl Control {
     pub fn id(self) -> String { match self {
@@ -37,7 +38,7 @@ pub enum Message {
     SelectDetail(NoticeId, iced::widget::text_editor::Action),
 }
 #[derive(Debug, Clone)]
-struct Detail { id: NoticeId, version: u64, content: iced::widget::text_editor::Content }
+struct Detail { present: bool, presentation: Presentation, content: iced::widget::text_editor::Content }
 #[derive(Debug, Clone)]
 pub struct Component {
     pub open: bool,
@@ -46,22 +47,48 @@ pub struct Component {
     opening: Opening,
     hover: bool,
     latch: bool,
-    details: Vec<Detail>,
+    presentation: Option<Presentation>,
+    order: Vec<NoticeId>,
+    details: HashMap<NoticeId, Detail>,
 }
 impl Default for Component {
-    fn default() -> Self { Self { open: false, environment: environment::State::default(), focus: None, opening: Opening::Mouse, hover: false, latch: false, details: Vec::new() } }
+    fn default() -> Self { Self { open: false, environment: environment::State::default(), focus: None, opening: Opening::Mouse, hover: false, latch: false, presentation: None, order: Vec::new(), details: HashMap::new() } }
 }
 impl Component {
-    pub fn sync(&mut self, notices: &NoticeStore) {
-        self.details.retain(|detail| notices.get(detail.id).is_some());
+    /// Reconcile only actual row changes; return a focus operation only when its row retired.
+    pub fn sync(&mut self, notices: &NoticeStore) -> Option<Control> {
+        if self.presentation.as_ref() == Some(notices.presentation()) { return None; }
+        for detail in self.details.values_mut() { detail.present = false; }
         for notice in notices.rows() {
-            if let Some(detail) = self.details.iter_mut().find(|detail| detail.id == notice.id) {
-                if detail.version != notice.content_version { detail.version = notice.content_version; detail.content = iced::widget::text_editor::Content::with_text(&notice.detail); }
-            } else { self.details.push(Detail { id: notice.id, version: notice.content_version, content: iced::widget::text_editor::Content::with_text(&notice.detail) }); }
+            let detail = self.details.entry(notice.id).or_insert_with(|| Detail {
+                present: true, presentation: notice.presentation().clone(),
+                content: iced::widget::text_editor::Content::with_text(&notice.detail),
+            });
+            detail.present = true;
+            if &detail.presentation != notice.presentation() {
+                detail.presentation = notice.presentation().clone();
+                detail.content = iced::widget::text_editor::Content::with_text(&notice.detail);
+            }
         }
+        self.details.retain(|_, detail| detail.present);
+        let fallback = match self.focus {
+            Some(Control::Copy(id) | Control::Detail(id) | Control::Dismiss(id)) if !self.details.contains_key(&id) => {
+                let index = self.order.iter().position(|owned| *owned == id).unwrap_or(0);
+                let next = self.order.iter().skip(index + 1).find(|id| self.details.contains_key(*id))
+                    .or_else(|| self.order[..index].iter().rev().find(|id| self.details.contains_key(*id)));
+                Some(next.copied().map_or(Control::Trigger, Control::Copy))
+            }
+            _ => None,
+        };
+        if let Some(control) = fallback { self.focus = Some(control); }
+        if notices.is_empty() { self.close(); }
+        self.order.clear();
+        self.order.extend(notices.rows().map(|notice| notice.id));
+        self.presentation = Some(notices.presentation().clone());
+        fallback
     }
     pub fn select_detail(&mut self, id: NoticeId, action: iced::widget::text_editor::Action) {
-        if !action.is_edit() && let Some(detail) = self.details.iter_mut().find(|detail| detail.id == id) { detail.content.perform(action); self.focus = Some(Control::Detail(id)); }
+        if !action.is_edit() && let Some(detail) = self.details.get_mut(&id) { detail.content.perform(action); self.focus = Some(Control::Detail(id)); }
     }
     pub fn close(&mut self) { self.open = false; self.latch = self.hover; }
     pub fn hover(&mut self, inside: bool, nonempty: bool) {
@@ -73,6 +100,13 @@ impl Component {
     pub fn activate(&mut self, opening: Opening, nonempty: bool) {
         if self.open && self.opening != Opening::Mouse { self.close(); }
         else if nonempty { self.open = true; self.opening = opening; self.latch = false; }
+    }
+    pub fn contains_control(&self, control: Control) -> bool {
+        match control {
+            Control::Trigger | Control::Settings => true,
+            Control::Close => self.open,
+            Control::Copy(id) | Control::Detail(id) | Control::Dismiss(id) => self.open && self.details.contains_key(&id),
+        }
     }
     pub fn controls(&self, notices: &NoticeStore) -> Vec<Control> {
         let mut controls = vec![Control::Trigger];
@@ -108,7 +142,7 @@ impl Component {
                 overlay::control(Control::Copy(notice.id), container(text("Copy")).center(Fill).into(), 64.0, false, self.environment),
                 overlay::control(Control::Dismiss(notice.id), container(text("×")).center(Fill).into(), 34.0, false, self.environment),
             ].spacing(8);
-            let detail: Element<'a, Message> = if let Some(detail) = self.details.iter().find(|detail| detail.id == notice.id) {
+            let detail: Element<'a, Message> = if let Some(detail) = self.details.get(&notice.id) {
                 let id = notice.id;
                 iced::widget::text_editor(&detail.content).id(Control::Detail(id).id()).size(14).padding(0)
                     .wrapping(iced::advanced::text::Wrapping::WordOrGlyph)

@@ -107,6 +107,8 @@ if(BUILD_MMLTK_BROWSER_APP AND BUILD_RFDETR_NATIVE)
         "${CMAKE_SOURCE_DIR}/third_party/iced_plot/*.wgsl"
         "${CMAKE_SOURCE_DIR}/third_party/iced_aw/*.rs"
         "${CMAKE_SOURCE_DIR}/third_party/iced_aw/*.toml"
+        "${CMAKE_SOURCE_DIR}/third_party/iced-fluent-theme/*.rs"
+        "${CMAKE_SOURCE_DIR}/third_party/iced-fluent-theme/*.toml"
     )
     set(_mmltk_frontend_build_inputs
         "${MMLTK_APPLICATION_BINDINGS}"

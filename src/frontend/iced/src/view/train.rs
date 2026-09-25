@@ -86,8 +86,10 @@ impl Component {
     ) -> Option<crate::view::metrics::ChartView> {
         self.metrics.chart_view(chart)
     }
-    pub fn sync_metrics(&mut self, model: &ApplicationModel, visible: bool) {
+    pub fn sync_metrics(&mut self, model: &mut ApplicationModel, visible: bool) {
+        if model.connection != crate::view_model::ConnectionState::Connected { return; }
         self.metrics.rebase(model, visible);
+        self.metrics.publish_conditions(&mut model.notices);
     }
     pub fn rebase(&mut self, model: &ApplicationModel) {
         self.model_card
@@ -513,8 +515,4 @@ mod tests {
             draft
         );
     }
-}
-
-impl Component {
-    pub(crate) fn observe_notices(&self, notices: &mut crate::view_model::notices::NoticeStore) { self.metrics.observe_notices(notices); }
 }

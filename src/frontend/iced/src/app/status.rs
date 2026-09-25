@@ -16,8 +16,12 @@ impl App {
                 self.status.activate(opening, !notices.is_empty());
                 if opening != Opening::Mouse { focus = Some(Control::Trigger); }
             }
-            StatusMessage::Activate(Control::Detail(id), _) => { focus = Some(Control::Detail(id)); }
-            StatusMessage::SelectDetail(id, action) => self.status.select_detail(id, action),
+            StatusMessage::Activate(Control::Detail(id), _) => {
+                if self.status.open && notices.get(id).is_some() { focus = Some(Control::Detail(id)); }
+            }
+            StatusMessage::SelectDetail(id, action) => {
+                if self.status.open { self.status.select_detail(id, action); }
+            }
             StatusMessage::Activate(Control::Copy(id), _) => {
                 if let Some((token, payload)) = notices.begin_copy(id) {
                     self.status.focus = Some(Control::Copy(id));
@@ -28,13 +32,7 @@ impl App {
                 }
             }
             StatusMessage::Activate(Control::Dismiss(id), _) => {
-                let controls = self.status.controls(notices);
-                let index = controls.iter().position(|control| *control == Control::Copy(id)).unwrap_or(0);
-                let focused = matches!(self.status.focus, Some(Control::Copy(owned) | Control::Detail(owned) | Control::Dismiss(owned)) if owned == id);
                 notices.dismiss(id);
-                if focused {
-                    focus = controls.iter().skip(index + 3).copied().next().or_else(|| index.checked_sub(3).and_then(|index| controls.get(index).copied())).or(Some(Control::Trigger));
-                }
                 if notices.is_empty() { self.status.close(); focus = Some(Control::Trigger); }
             }
             StatusMessage::Activate(Control::Close, _) | StatusMessage::Close => {
@@ -50,13 +48,15 @@ impl App {
                 if was_open && !self.status.open && self.status.focus.is_some_and(|control| !matches!(control, Control::Trigger | Control::Settings)) { focus = Some(Control::Trigger); }
             }
             StatusMessage::Focused(control, focused) => {
-                if focused { self.status.focus = Some(control); }
+                if focused {
+                    if self.status.contains_control(control) { self.status.focus = Some(control); }
+                }
                 else if self.status.focus == Some(control) {
                     return crate::view::status::check_focus(self.status.controls(notices), self.interaction_revision);
                 }
             }
             StatusMessage::FocusChecked { revision, focused } => {
-                if revision != self.interaction_revision { return Task::none(); }
+                if revision != self.interaction_revision || focused.is_some_and(|control| !self.status.contains_control(control)) { return Task::none(); }
                 self.status.focus = focused;
                 if focused.is_none() && self.status.open { self.status.close(); }
             }

@@ -85,7 +85,7 @@ impl Curve {
             std::mem::swap(&mut self.buckets, &mut self.scratch);
             if self.buckets.len() == BUCKETS {
                 self.buckets.pop_front();
-                self.omitted += 1;
+                self.omitted = self.omitted.saturating_add(1);
             }
         }
         self.buckets.push_back(Bucket {
@@ -101,7 +101,37 @@ impl Curve {
 use super::catalog::{Metric, Source};
 use crate::generated::{TrainingPhase, TrainingRecord, TrainingRecordRole};
 
+/// The observed source survives clearing plot storage. In particular a cache reset
+/// cannot claim native history recovered or rearm a dismissed active drop episode.
+#[derive(Default)]
+struct Conditions {
+    run: String,
+    omitted: u64,
+    dropped: u64,
+    chart_dirty: bool,
+    dropped_dirty: bool,
+}
+impl Conditions {
+    fn set_run(&mut self, run: &str) {
+        if self.run != run {
+            self.run.clear();
+            self.run.push_str(run);
+            self.omitted = 0;
+            self.dropped = 0;
+            self.chart_dirty = true;
+            self.dropped_dirty = true;
+        }
+    }
+    fn clear_chart(&mut self) {
+        if self.omitted != 0 {
+            self.omitted = 0;
+            self.chart_dirty = true;
+        }
+    }
+}
+
 pub(super) struct History {
+    conditions: Conditions,
     pub(super) curves: Vec<Curve>,
     pub(super) run: String,
     attempt: String,
@@ -117,6 +147,7 @@ pub(super) struct History {
 impl History {
     pub(super) fn new(metrics: &[Metric]) -> Self {
         Self {
+            conditions: Conditions::default(),
             curves: metrics.iter().map(|m| Curve::new(&m.label)).collect(),
             run: String::new(),
             attempt: String::new(),
@@ -131,11 +162,13 @@ impl History {
         }
     }
     pub(super) fn set_run(&mut self, run: &str, generation: u64) {
+        self.conditions.set_run(run);
         self.run.clear();
         self.run.push_str(run);
         self.generation = generation;
     }
     pub(super) fn clear(&mut self, metrics: &[Metric]) {
+        self.conditions.clear_chart();
         self.run.clear();
         self.attempt.clear();
         self.sequence = None;
@@ -187,6 +220,11 @@ impl History {
         self.attempt.clone_from(&record.attemptid);
         self.sequence = Some(record.sequence);
         self.dropped = record.droppedbefore;
+        self.conditions.set_run(&record.runid);
+        if self.conditions.dropped != record.droppedbefore {
+            self.conditions.dropped = record.droppedbefore;
+            self.conditions.dropped_dirty = true;
+        }
         let progress = &record.progress;
         let phase_epoch = (progress.phase, progress.epoch);
         let admit = !live
@@ -252,6 +290,7 @@ impl History {
             if value.is_some() {
                 changed |= 1 << metric.chart as usize;
             }
+            let omitted = curve.omitted;
             curve.push(
                 self.segment,
                 value.map(|value| Point {
@@ -261,8 +300,26 @@ impl History {
                     order: record.sequence,
                 }),
             );
+            if curve.omitted != omitted {
+                self.conditions.omitted = self.conditions.omitted.saturating_add(curve.omitted - omitted);
+                self.conditions.chart_dirty = true;
+            }
         }
         changed
+    }
+    pub(super) fn publish_conditions(&mut self, notices: &mut crate::view_model::notices::NoticeStore, saved: bool) {
+        use crate::view_model::notices::{Origin, warning};
+        let conditions = &mut self.conditions;
+        if std::mem::take(&mut conditions.chart_dirty) {
+            let omitted = conditions.omitted;
+            notices.run_condition(if saved { Origin::ChartSaved } else { Origin::Chart }, &conditions.run, omitted > 0,
+                || warning("Chart history incomplete", format!("Charts omit {omitted} older disconnected summaries; saved history remains unchanged.")));
+        }
+        if std::mem::take(&mut conditions.dropped_dirty) {
+            let dropped = conditions.dropped;
+            notices.run_condition(if saved { Origin::HistoryDroppedSaved } else { Origin::HistoryDropped }, &conditions.run, dropped > 0,
+                || warning("History incomplete", format!("{dropped} training records were dropped.")));
+        }
     }
 }
 

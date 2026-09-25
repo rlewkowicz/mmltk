@@ -176,22 +176,7 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
             }
         }
     }
-    if let Some(crate::view::status::Control::Copy(id) | crate::view::status::Control::Detail(id) | crate::view::status::Control::Dismiss(id)) = app.status.focus {
-        let model = app.integration.as_ref().map_or(&app.model, |integration| integration.status_model(&app.model));
-        if model.notices.get(id).is_none() {
-            let control = model.notices.rows().next().map_or(crate::view::status::Control::Trigger, |notice| crate::view::status::Control::Copy(notice.id));
-            app.status.focus = Some(control);
-            task = Task::batch([task, iced::widget::operation::focus(control.id())]);
-        }
-    }
-    let interaction = (app.status.open, app.modal_active(), app.workspace.active());
-    if interaction != previous_interaction {
-        app.interaction_revision = app.interaction_revision.saturating_add(1);
-        if !previous_interaction.1 && interaction.1 { app.status.close(); app.status.focus = None; }
-    }
-    if app.model.connection == crate::view_model::ConnectionState::Connected {
-        app.workspace.observe_notices(&mut app.model.notices);
-    }
+    if !previous_interaction.1 && app.modal_active() { app.status.close(); app.status.focus = None; }
     let prediction_settings_task = app.settle_prediction_total();
     app.advance_start();
     app.reconcile_surface_frame();
@@ -217,7 +202,14 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
         Task::none()
     };
     let notices = &app.integration.as_ref().map_or(&app.model, |integration| integration.status_model(&app.model)).notices;
-    app.status.sync(notices);
+    if let Some(control) = app.status.sync(notices) {
+        app.interaction_revision = app.interaction_revision.saturating_add(1);
+        task = Task::batch([task, iced::widget::operation::focus(control.id())]);
+    }
+    let interaction = (app.status.open, app.modal_active(), app.workspace.active());
+    if interaction != previous_interaction {
+        app.interaction_revision = app.interaction_revision.saturating_add(1);
+    }
     crate::view::status::environment::sync(&app.status, notices);
     Task::batch([
         task,
@@ -246,7 +238,7 @@ mod route_tests {
         app.settings.install(settings);
         app.workspace.bootstrap_components(&app.model);
         app.workspace
-            .rebase(settings.settingsstate.currentview, &app.model);
+            .rebase(settings.settingsstate.currentview, &mut app.model);
         app
     }
 
@@ -1552,6 +1544,39 @@ mod tests {
         drop(app.on_workspace(resolved(app.interaction_revision)));
         assert_eq!(app.model.pending_count(), 1);
         assert!(matches!(capture.try_recv().unwrap(), crate::transport_connection::CapturedRecord::Intent(_)));
+    }
+
+    #[test]
+    fn retired_status_controls_cannot_restore_focus_after_row_removal_or_close() {
+        use crate::view::status::{Control, Message as StatusMessage, Opening};
+        use crate::view_model::notices::Origin;
+        let (mut app, task) = boot();
+        drop(task);
+        install_default_bootstrap(&mut app);
+        for generation in 1..=2 {
+            app.model.notices.terminal(Origin::Provider, 0, generation, || Some(crate::view_model::notices::failure("row")));
+        }
+        let ids: Vec<_> = app.model.notices.rows().map(|notice| notice.id).collect();
+        drop(update(&mut app, Message::Status(StatusMessage::Activate(Control::Trigger, Opening::Keyboard))));
+        drop(update(&mut app, Message::Status(StatusMessage::Focused(Control::Detail(ids[0]), true))));
+        let pending_focus = app.interaction_revision;
+        drop(update(&mut app, Message::Status(StatusMessage::Activate(Control::Dismiss(ids[0]), Opening::Keyboard))));
+        assert_eq!(app.status.focus, Some(Control::Copy(ids[1])));
+        assert!(app.interaction_revision > pending_focus);
+        for message in [
+            StatusMessage::Focused(Control::Detail(ids[0]), true),
+            StatusMessage::FocusChecked { revision: pending_focus, focused: None },
+            StatusMessage::Activate(Control::Detail(ids[0]), Opening::Keyboard),
+        ] { drop(update(&mut app, Message::Status(message))); }
+        assert_eq!(app.status.focus, Some(Control::Copy(ids[1])));
+        assert!(app.status.open);
+        drop(update(&mut app, Message::Status(StatusMessage::Close)));
+        for message in [
+            StatusMessage::Focused(Control::Detail(ids[1]), true),
+            StatusMessage::SelectDetail(ids[1], iced::widget::text_editor::Action::SelectAll),
+        ] { drop(update(&mut app, Message::Status(message))); }
+        assert_eq!(app.status.focus, Some(Control::Trigger));
+        assert!(!app.status.open);
     }
 
     #[test]

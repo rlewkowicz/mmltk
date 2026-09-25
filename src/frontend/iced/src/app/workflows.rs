@@ -95,7 +95,7 @@ impl App {
         } else {
             self.model.workflow.output.live();
         }
-        self.workspace.sync_workflows(&self.model);
+        self.workspace.sync_workflows(&mut self.model);
     }
 
     fn request_start(&mut self, feature: FeatureId) {
@@ -212,7 +212,7 @@ impl App {
             self.model.workflow.training.as_ref(),
             browse,
         ) {
-            self.workspace.sync_workflows(&self.model);
+            self.workspace.sync_workflows(&mut self.model);
         }
         // A deliberate confirmation waits for admitted restoration/model replies
         // to settle before replacing the continuation selection.

@@ -76,7 +76,7 @@ impl Router {
         self.active = feature;
     }
 
-    pub fn rebase(&mut self, feature: FeatureId, model: &ApplicationModel) {
+    pub fn rebase(&mut self, feature: FeatureId, model: &mut ApplicationModel) {
         self.active = feature;
         self.train.rebase(model);
         self.sync_workflows(model);
@@ -88,7 +88,7 @@ impl Router {
     ) -> Option<crate::view::metrics::ChartView> {
         self.train.chart_view(chart)
     }
-    pub fn sync_workflows(&mut self, model: &ApplicationModel) {
+    pub fn sync_workflows(&mut self, model: &mut ApplicationModel) {
         self.train
             .sync_metrics(model, self.active == FeatureId::Train);
     }
@@ -429,7 +429,7 @@ mod tests {
                         route(workflow, model_card::Message::CancelArtifact(3)),
                     )
                     .unwrap();
-                router.rebase(workflow, &model);
+                router.rebase(workflow, &mut model);
                 router.select(FeatureId::Explore);
                 router.select(workflow);
                 assert!(router.update(&mut model, &mut settings, confirm()).is_err());
@@ -495,8 +495,4 @@ mod tests {
             ));
         }
     }
-}
-
-impl Router {
-    pub(crate) fn observe_notices(&self, notices: &mut crate::view_model::notices::NoticeStore) { self.train.observe_notices(notices); }
 }

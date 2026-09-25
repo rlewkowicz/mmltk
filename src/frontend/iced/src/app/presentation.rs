@@ -443,7 +443,7 @@ impl App {
             self.presentation.retire_frame();
         }
         self.model.set_foreground_feature(feature);
-        self.workspace.rebase(feature, &self.model);
+        self.workspace.rebase(feature, &mut self.model);
     }
 
     pub(super) fn reconcile_viewer(&mut self) {
@@ -531,7 +531,7 @@ impl App {
         self.presentation.retire_frame();
         self.workspace.select(feature);
         self.model.set_foreground_feature(feature);
-        self.workspace.sync_workflows(&self.model);
+        self.workspace.sync_workflows(&mut self.model);
         self.reconcile_surface_frame();
         if let Some(frame) = self.model.presentation_refresh() {
             self.select_presentation(frame);

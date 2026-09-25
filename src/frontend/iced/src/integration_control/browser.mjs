@@ -1793,9 +1793,10 @@ export function mmltkIntegrationStatusDraw(control, facts) {
 
 export function mmltkIntegrationStatusExercise(stage, measured, callback) {
   const owner = integrationState;
-  let active = true;
+  let active = true, semanticObserver, semanticMutations = 0;
   const finish = integrationCompletion(outcome => {
     active = false;
+    semanticObserver?.disconnect();
     if (owner) owner.statusPending = undefined;
     if (outcome !== 'observed') restoreStatusFixture(owner);
     callback(outcome === 'observed');
@@ -1823,7 +1824,24 @@ export function mmltkIntegrationStatusExercise(stage, measured, callback) {
     restoreStatusFixture(owner); finish('failed');
   };
   const frame = callback => integrationFrame(() => { if (!active) return; if (integrationState !== owner) { finish('invalidated'); return; } try { callback(); } catch(error) { failed(error); } });
-  const after = () => frame(() => frame(() => finish('observed')));
+  const after = () => frame(() => frame(() => {
+    if (semanticObserver) assert(semanticMutations + semanticObserver.takeRecords().length === 0, 'unchanged Status rebuilt semantic content');
+    finish('observed');
+  }));
+  const semantics = state => {
+    const root = document.getElementById('status.accessibility');
+    const trigger = document.getElementById('accessible.navigation.status');
+    assert(root && trigger?.getAttribute('aria-expanded') === 'true', 'expanded Status semantic tree missing');
+    const nodes = new Map(Array.from(root.querySelectorAll('[data-iced-control]'), node => [node.getAttribute('data-iced-control'), node]));
+    assert(nodes.has('status.close') && Array.from(nodes.keys()).some(id => /^status\.\d+\.detail$/.test(id)), 'Status row semantics missing');
+    if (state.semanticNodes) {
+      assert(nodes.size === state.semanticNodes.size && Array.from(nodes).every(([id,node]) => state.semanticNodes.get(id) === node), 'unchanged Status replaced semantic nodes');
+    } else { state.semanticNodes = nodes; }
+    // Observe the ordinary hover/scroll/focus updates, retaining the accumulated
+    // records until the same accepted session's two-frame completion.
+    semanticObserver = new MutationObserver(records => { semanticMutations += records.length; });
+    semanticObserver.observe(root, {subtree:true, attributes:true, childList:true, characterData:true});
+  };
   const pixels = r => {
     const sx = scale * canvas.width / css.width, sy = scale * canvas.height / css.height;
     const x = Math.max(0, Math.floor(r[0]*sx)), y = Math.max(0,Math.floor(r[1]*sy));
@@ -1901,22 +1919,22 @@ export function mmltkIntegrationStatusExercise(stage, measured, callback) {
     if(stage <= 15 && stage !== 11) assert(run.every((value,index)=>Math.abs(value-state.run[index])<1) && tabs.every((value,index)=>Math.abs(value-state.tabs[index])<1), 'Status shifted Run or tabs');
     switch(stage) {
       case 0: assert(typeof document.mmltkStatusEnvironment === 'function', 'native acceptance environment bridge missing'); owner.statusEnvironment = true; document.mmltkStatusEnvironment(1); assert(remote.every(control=>control[2]>0 && control[3]>0), 'remote controls missing'); header(); textPixels('first'); { const [x,y]=point(panel,.5,.8); mmltkIntegrationWheel(x,y,detail[3]*.45*scale,false,true); } break;
-      case 1: textPixels('middle'); { const [x,y]=point(panel,.5,.8); mmltkIntegrationWheel(x,y,detail[3]*2*scale,false,true); } break;
-      case 2: textPixels('last'); { const [x,y]=point(panel,.5,.8); mmltkIntegrationWheel(x,y,-detail[3]*2*scale,false,true); } break;
+      case 1: semantics(state); textPixels('middle'); { const [x,y]=point(panel,.5,.8); mmltkIntegrationWheel(x,y,detail[3]*2*scale,false,true); } break;
+      case 2: semantics(state); textPixels('last'); { const [x,y]=point(panel,.5,.8); mmltkIntegrationWheel(x,y,-detail[3]*2*scale,false,true); } break;
       case 3: textPixels('first'); assert(click([detail[0],detail[1],detail[2],20]),'selectable detail click'); frame(()=>frame(()=> { key('a',false,true); frame(()=>frame(()=> { key('c',false,true); frame(()=>frame(()=> { key('Escape'); after(); })); })); })); return;
-      case 4: assert(!opened(),'Escape failed'); move(trigger); frame(()=>frame(()=> {
+      case 4: assert(!opened(),'Escape failed'); assert(!document.getElementById('accessible.status.close'), 'closed Status exposes popup controls'); move(trigger); frame(()=>frame(()=> {
         assert(document.getElementById('accessible.navigation.status')?.getAttribute('aria-expanded') === 'false','Escape hover latch reopened inside the region');
         report({event:'integration.status.latch',control:'status.panel',detail:'escape-inside-closed',a:'1'});
         move(outside); frame(()=>frame(()=> { move(trigger); after(); }));
       })); return;
-      case 5: assert(opened(),'hover did not open'); move([trigger[0]+5,trigger[1]+trigger[3]+2,2,2]); break;
+      case 5: assert(opened(),'hover did not open'); semantics(state); move([trigger[0]+5,trigger[1]+trigger[3]+2,2,2]); break;
       case 6: assert(opened(),'connecting gap closed Status'); assert(click(close),'panel X dispatch'); break;
       case 7: assert(!opened(),'panel X failed'); move(trigger); break;
       case 8: assert(!opened(),'manual-close hover latch failed'); move(outside); frame(()=> { move(trigger); after(); }); return;
       case 9: assert(opened(),'leave/reentry did not rearm hover'); assert(click(trigger),'click-open dispatch'); break;
       case 10: assert(opened(),'mouse click unexpectedly closed'); move(outside); break;
       case 11: assert(!opened(),'click-open mouse leave failed'); key('Enter'); break;
-      case 12: assert(opened(),'keyboard Enter did not open'); key('Tab'); break;
+      case 12: assert(opened(),'keyboard Enter did not open'); semantics(state); key('Tab'); break;
       case 13: assert(opened(),'keyboard traversal closed Status'); focusPixels(close); key('Tab',true); key('Escape'); break;
       case 14: assert(!opened(),'keyboard close failed'); focusPixels(trigger); key(' '); frame(()=>frame(()=> { if(document.getElementById('accessible.navigation.status')?.getAttribute('aria-expanded') !== 'true') { finish('failed'); return; } key('Escape'); frame(()=>frame(()=> { touch(trigger); after(); })); })); return;
       case 15: assert(opened(),'touch did not open'); move(outside); break;

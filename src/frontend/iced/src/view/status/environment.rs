@@ -1,7 +1,7 @@
 #[cfg(target_arch = "wasm32")]
 thread_local! {
     static ACCESSIBLE_OUTPUT: std::cell::RefCell<Option<iced::futures::channel::mpsc::UnboundedSender<super::Message>>> = const { std::cell::RefCell::new(None) };
-    static ACCESSIBLE_CALLBACKS: std::cell::RefCell<std::collections::HashMap<String, wasm_bindgen::closure::Closure<dyn FnMut(web_sys::Event)>>> = std::cell::RefCell::new(std::collections::HashMap::new());
+    static ACCESSIBLE_TREE: std::cell::RefCell<AccessibleTree> = std::cell::RefCell::new(AccessibleTree::default());
 }
 #[cfg(target_arch = "wasm32")]
 struct Listener {
@@ -16,8 +16,7 @@ impl Drop for Listener {
         let _ = self.document.remove_event_listener_with_callback("visibilitychange", self.callback.as_ref().unchecked_ref());
         if let Some(media) = &self.media { let _ = media.remove_event_listener_with_callback("change", self.callback.as_ref().unchecked_ref()); }
         ACCESSIBLE_OUTPUT.with(|output| *output.borrow_mut() = None);
-        if let Some(root) = self.document.get_element_by_id("status.accessibility") { root.remove(); }
-        ACCESSIBLE_CALLBACKS.with(|callbacks| callbacks.borrow_mut().clear());
+        ACCESSIBLE_TREE.with(|tree| *tree.borrow_mut() = AccessibleTree::default());
     }
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -52,51 +51,121 @@ pub fn subscription() -> iced::Subscription<super::Message> {
 pub fn sync(_component: &super::Component, _notices: &crate::view_model::notices::NoticeStore) {}
 
 // Canvas controls expose a stable semantic tree alongside their Iced focus and
-// hit-test identities. These nodes never cover or intercept the drawn controls.
+// hit-test identities. Detached popup nodes retain their text/callbacks while
+// closed, but never participate in the browser's hidden-control traversal.
 #[cfg(target_arch = "wasm32")]
-pub fn sync(component: &super::Component, notices: &crate::view_model::notices::NoticeStore) {
-    use wasm_bindgen::JsCast;
-    thread_local! { static SIGNATURE: std::cell::RefCell<Vec<(u64, u64)>> = const { std::cell::RefCell::new(Vec::new()) }; }
-    let mut signature = vec![(u64::from(component.open), notices.len() as u64)];
-    signature.extend(notices.rows().map(|notice| (notice.id.0, notice.content_version)));
-    let Some(document) = web_sys::window().and_then(|window| window.document()) else { return; };
-    if document.get_element_by_id("status.accessibility").is_some() && SIGNATURE.with(|prior| *prior.borrow() == signature) { return; }
-    let root = if let Some(root) = document.get_element_by_id("status.accessibility") { root }
-    else {
-        let Ok(root) = document.create_element("section") else { return; };
-        root.set_id("status.accessibility");
-        let _ = root.set_attribute("aria-label", "Status notifications");
-        let _ = root.set_attribute("style", "position:absolute;width:1px;height:1px;overflow:hidden;clip-path:inset(50%);white-space:pre-wrap");
-        if let Some(body) = document.body() { let _ = body.append_child(&root); }
-        root
-    };
-    let mut controls = component.controls(notices);
-    controls.push(super::Control::Settings);
-    let identities: Vec<_> = controls.iter().map(|control| format!("accessible.{}", control.id())).collect();
-    ACCESSIBLE_CALLBACKS.with(|callbacks| callbacks.borrow_mut().retain(|id, _| {
-        if identities.contains(id) { true } else { if let Some(element) = document.get_element_by_id(id) { element.remove(); } false }
-    }));
-    for (control, identity) in controls.into_iter().zip(identities) {
-        let existing = document.get_element_by_id(&identity);
-        let is_new = existing.is_none();
-        let Some(button) = existing.or_else(|| document.create_element("button").ok()) else { continue; };
-        button.set_id(&identity);
-        let _ = button.set_attribute("aria-label", &control.name());
-        let _ = button.set_attribute("tabindex", "-1");
-        let _ = button.set_attribute("data-iced-control", &control.id());
-        button.set_text_content(Some(&control.name()));
-        if control == super::Control::Trigger { let _ = button.set_attribute("aria-expanded", if component.open { "true" } else { "false" }); }
-        if let super::Control::Copy(id) | super::Control::Detail(id) | super::Control::Dismiss(id) = control {
-            if let Some(notice) = notices.get(id) { let _ = button.set_attribute("aria-description", &format!("{}\n\n{}", notice.title, notice.detail)); }
-        }
-        if is_new {
+struct AccessibleControl {
+    element: web_sys::Element,
+    callback: wasm_bindgen::closure::Closure<dyn FnMut(web_sys::Event)>,
+    presentation: Option<crate::view_model::notices::Presentation>,
+    present: bool,
+}
+#[cfg(target_arch = "wasm32")]
+impl AccessibleControl {
+    fn new(document: &web_sys::Document, control: super::Control) -> Option<Self> {
+        use wasm_bindgen::JsCast;
+        let element = document.create_element("button").ok()?;
+        let id = control.id();
+        let name = control.name();
+        element.set_id(&format!("accessible.{id}"));
+        element.set_attribute("aria-label", &name).ok()?;
+        element.set_attribute("tabindex", "-1").ok()?;
+        element.set_attribute("data-iced-control", &id).ok()?;
+        element.set_text_content(Some(&name));
         let callback = wasm_bindgen::closure::Closure::<dyn FnMut(web_sys::Event)>::new(move |_| {
             ACCESSIBLE_OUTPUT.with(|output| { if let Some(output) = output.borrow().as_ref() { let _ = output.unbounded_send(super::Message::Activate(control, super::Opening::Keyboard)); } });
         });
-        let _ = button.add_event_listener_with_callback("click", callback.as_ref().unchecked_ref());
-        ACCESSIBLE_CALLBACKS.with(|callbacks| callbacks.borrow_mut().insert(identity, callback));
-            let _ = root.append_child(&button);
-        }
+        element.add_event_listener_with_callback("click", callback.as_ref().unchecked_ref()).ok()?;
+        Some(Self { element, callback, presentation: None, present: true })
     }
-    SIGNATURE.with(|prior| *prior.borrow_mut() = signature);
+}
+#[cfg(target_arch = "wasm32")]
+impl Drop for AccessibleControl {
+    fn drop(&mut self) {
+        use wasm_bindgen::JsCast;
+        let _ = self.element.remove_event_listener_with_callback("click", self.callback.as_ref().unchecked_ref());
+        self.element.remove();
+    }
+}
+#[cfg(target_arch = "wasm32")]
+#[derive(Default)]
+struct AccessibleTree {
+    root: Option<web_sys::Element>,
+    presentation: Option<crate::view_model::notices::Presentation>,
+    open: Option<bool>,
+    controls: std::collections::HashMap<super::Control, AccessibleControl>,
+}
+#[cfg(target_arch = "wasm32")]
+impl Drop for AccessibleTree {
+    fn drop(&mut self) { if let Some(root) = &self.root { root.remove(); } }
+}
+#[cfg(target_arch = "wasm32")]
+impl AccessibleTree {
+    fn sync(&mut self, component: &super::Component, notices: &crate::view_model::notices::NoticeStore) {
+        use super::Control;
+        use std::collections::hash_map::Entry;
+        // No DOM query, row walk, text preparation or allocation on unchanged input.
+        let changed = self.presentation.as_ref() != Some(notices.presentation());
+        if !changed && self.open == Some(component.open) { return; }
+        let Some(document) = web_sys::window().and_then(|window| window.document()) else { return; };
+        if self.root.is_none() {
+            let Ok(root) = document.create_element("section") else { return; };
+            root.set_id("status.accessibility");
+            let _ = root.set_attribute("aria-label", "Status notifications");
+            let _ = root.set_attribute("style", "position:absolute;width:1px;height:1px;overflow:hidden;clip-path:inset(50%);white-space:pre-wrap");
+            let Some(body) = document.body() else { return; };
+            if body.append_child(&root).is_err() { return; }
+            self.root = Some(root);
+        }
+        if changed {
+            for node in self.controls.values_mut() { node.present = false; }
+            for control in [Control::Trigger, Control::Close, Control::Settings] {
+                if let Entry::Vacant(entry) = self.controls.entry(control) {
+                    let Some(node) = AccessibleControl::new(&document, control) else { return; };
+                    entry.insert(node);
+                }
+                self.controls.get_mut(&control).unwrap().present = true;
+            }
+            for notice in notices.rows() {
+                let mut description = None;
+                for control in [Control::Copy(notice.id), Control::Detail(notice.id), Control::Dismiss(notice.id)] {
+                    if let Entry::Vacant(entry) = self.controls.entry(control) {
+                        let Some(node) = AccessibleControl::new(&document, control) else { return; };
+                        entry.insert(node);
+                    }
+                    let node = self.controls.get_mut(&control).unwrap();
+                    node.present = true;
+                    if node.presentation.as_ref() != Some(notice.presentation()) {
+                        let description = description.get_or_insert_with(|| format!("{}\n\n{}", notice.title, notice.detail));
+                        if node.element.set_attribute("aria-description", description).is_err() { return; }
+                        node.presentation = Some(notice.presentation().clone());
+                    }
+                }
+            }
+            self.controls.retain(|_, node| node.present);
+        }
+        let root = self.root.as_ref().unwrap();
+        let mut controls = component.controls(notices);
+        controls.push(Control::Settings);
+        if !component.open {
+            for (control, node) in &self.controls {
+                if !matches!(control, Control::Trigger | Control::Settings) { node.element.remove(); }
+            }
+        }
+        // Keep existing nodes in place; insert only changed ordering/new controls.
+        let mut cursor = root.first_child();
+        for control in controls {
+            let element = &self.controls[&control].element;
+            if cursor.as_ref().is_some_and(|node| node.is_same_node(Some(element))) {
+                cursor = element.next_sibling();
+            } else if root.insert_before(element, cursor.as_ref()).is_err() { return; }
+        }
+        if self.controls[&Control::Trigger].element.set_attribute("aria-expanded", if component.open { "true" } else { "false" }).is_err() { return; }
+        self.presentation = Some(notices.presentation().clone());
+        self.open = Some(component.open);
+    }
+}
+#[cfg(target_arch = "wasm32")]
+pub fn sync(component: &super::Component, notices: &crate::view_model::notices::NoticeStore) {
+    ACCESSIBLE_TREE.with(|tree| tree.borrow_mut().sync(component, notices));
 }

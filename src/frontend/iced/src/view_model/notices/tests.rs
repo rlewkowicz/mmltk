@@ -555,3 +555,57 @@ fn source_capacity_rejects_new_slots_without_preparing_their_payloads() {
     store.condition(Origin::Editor(FeatureId::Train), true, || panic!("unadmitted source payload"));
     assert!(store.is_empty());
 }
+
+#[test]
+fn presentation_tracks_rows_independently_of_source_and_copy_state() {
+    let mut store = NoticeStore::default();
+    let empty = store.presentation().clone();
+    store.terminal(Origin::Provider, 0, 1, || None);
+    store.clear_condition(Origin::Provider);
+    store.dismiss(NoticeId(900));
+    assert_eq!(store.presentation(), &empty);
+    store.terminal(Origin::Provider, 0, 2, || Some(failure("complete\ntext")));
+    let id = store.latest().unwrap().id;
+    let inserted = store.presentation().clone();
+    assert_ne!(inserted, empty);
+    let row_content = store.get(id).unwrap().presentation().clone();
+    let (copy, payload) = store.begin_copy(id).unwrap();
+    assert_eq!(payload, "Operation failed\n\ncomplete\ntext");
+    assert!(store.finish_copy(copy, true));
+    store.terminal(Origin::Provider, 0, 2, || Some(failure("complete\ntext")));
+    store.clear_condition(Origin::Provider);
+    assert_eq!(store.presentation(), &inserted);
+    assert_eq!(store.get(id).unwrap().presentation(), &row_content);
+    store.dismiss(id);
+    assert_ne!(store.presentation(), &inserted);
+    assert!(!store.finish_copy(copy, false));
+    let dismissed = store.presentation().clone();
+    store.dismiss(id);
+    assert_eq!(store.presentation(), &dismissed);
+}
+
+#[test]
+fn presentation_handles_overflow_updates_and_independent_cloned_content() {
+    let mut store = NoticeStore::default();
+    for generation in 1..=CAPACITY as u64 + 1 {
+        store.terminal(Origin::Provider, 0, generation, || Some(failure("row")));
+    }
+    let overflow = store.overflow.as_ref().unwrap().id;
+    let content = store.overflow.as_ref().unwrap().presentation().clone();
+    let presentation = store.presentation().clone();
+    store.terminal(Origin::Provider, 0, CAPACITY as u64 + 2, || Some(failure("row")));
+    assert_ne!(store.presentation(), &presentation);
+    assert_eq!(store.overflow.as_ref().unwrap().id, overflow);
+    assert_ne!(store.overflow.as_ref().unwrap().presentation(), &content);
+    assert_eq!(store.overflow.as_ref().unwrap().occurrences, 2);
+    store.dismiss(overflow);
+    assert!(store.overflow.is_none());
+    let mut branch = store.clone();
+    assert_eq!(store.presentation(), branch.presentation());
+    let generation = CAPACITY as u64 + 2;
+    store.terminal(Origin::Provider, 0, generation, || Some(failure("original")));
+    branch.terminal(Origin::Provider, 0, generation, || Some(failure("branch")));
+    assert_eq!(store.latest().unwrap().content_version, branch.latest().unwrap().content_version);
+    assert_ne!(store.presentation(), branch.presentation());
+    assert_ne!(store.latest().unwrap().presentation(), branch.latest().unwrap().presentation());
+}

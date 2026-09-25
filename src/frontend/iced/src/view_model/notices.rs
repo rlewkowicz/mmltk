@@ -2,12 +2,13 @@
 use super::{ApplicationIntentEndpoint, UiError, UiErrorKind};
 use crate::generated::FeatureId;
 use std::collections::VecDeque;
+use std::sync::Arc;
 
 pub const CAPACITY: usize = 128;
 const LOCAL_TEXT_LIMIT: usize = 64 * 1024;
 const SOURCE_CAPACITY: usize = 192;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct NoticeId(pub u64);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Severity { Warning, Error }
@@ -27,6 +28,10 @@ pub struct Notice {
     pub content_version: u64,
     pub occurrences: u64,
     copy_attempt: u64,
+    presentation: Presentation,
+}
+impl Notice {
+    pub fn presentation(&self) -> &Presentation { &self.presentation }
 }
 impl std::ops::Deref for Notice {
     type Target = UiError;
@@ -43,8 +48,22 @@ struct Frontier {
     owner: u64,
     run: Option<String>,
 }
+/// Identity of retained row content, independent of source frontiers and copy attempts.
+/// Clones share it until either store changes, so branching fixture/bootstrap models
+/// cannot alias different content at the same local revision. Retained readers keep
+/// the identity alive; it cannot wrap or be reused while a cache still holds it.
+#[derive(Debug, Clone)]
+pub struct Presentation(Arc<()>);
+impl Default for Presentation {
+    fn default() -> Self { Self(Arc::new(())) }
+}
+impl PartialEq for Presentation {
+    fn eq(&self, other: &Self) -> bool { Arc::ptr_eq(&self.0, &other.0) }
+}
+impl Eq for Presentation {}
 #[derive(Debug, Clone)]
 pub struct NoticeStore {
+    presentation: Presentation,
     rows: VecDeque<Notice>,
     overflow: Option<Notice>,
     evicted: u64,
@@ -55,11 +74,12 @@ pub struct NoticeStore {
 }
 impl Default for NoticeStore {
     fn default() -> Self {
-        Self { rows: VecDeque::with_capacity(CAPACITY), overflow: None, evicted: 0,
+        Self { presentation: Presentation::default(), rows: VecDeque::with_capacity(CAPACITY), overflow: None, evicted: 0,
             next_id: 1, frontiers: { let mut slots = Vec::with_capacity(SOURCE_CAPACITY); slots.push(Frontier { origin: Origin::Protocol, generation: 0, observed: false, row: None, owner: 0, run: None }); slots }, bootstrapping: false, initialized: false }
     }
 }
 impl NoticeStore {
+    pub fn presentation(&self) -> &Presentation { &self.presentation }
     pub fn rows(&self) -> impl DoubleEndedIterator<Item=&Notice> { self.rows.iter().chain(self.overflow.iter()) }
     pub fn len(&self) -> usize { self.rows.len() + usize::from(self.overflow.is_some()) }
     pub fn is_empty(&self) -> bool { self.rows.is_empty() && self.overflow.is_none() }
@@ -79,7 +99,6 @@ impl NoticeStore {
     pub(super) fn occurrence(&mut self, endpoint: ApplicationIntentEndpoint, correlation: u64, error: UiError) {
         self.push(Origin::Request(endpoint, correlation), error);
     }
-    pub(super) fn first_bootstrap(&self) -> bool { self.bootstrapping && !self.initialized }
     pub(super) fn bootstrapping(&self) -> bool { self.bootstrapping }
     /// A source has a fixed slot; operation identities never accumulate in an acknowledgement set.
     pub fn terminal(&mut self, origin: Origin, owner: u64, generation: u64, error: impl FnOnce() -> Option<UiError>) {
@@ -160,8 +179,9 @@ impl NoticeStore {
             self.evicted = self.evicted.saturating_add(1);
             self.update_overflow();
         }
+        self.presentation = Presentation::default();
         self.rows.push_back(Notice { id, origin, severity: severity(&error), error,
-            content_version: 1, occurrences: 1, copy_attempt: 0 });
+            content_version: 1, occurrences: 1, copy_attempt: 0, presentation: self.presentation.clone() });
         Some(id)
     }
     fn update(&mut self, id: NoticeId, error: UiError) {
@@ -169,6 +189,8 @@ impl NoticeStore {
             if row.error == error { return; }
             let Some(version) = row.content_version.checked_add(1) else { return; };
             row.content_version = version; row.severity = severity(&error); row.error = error;
+            row.presentation = Presentation::default();
+            self.presentation = row.presentation.clone();
         }
     }
     fn update_overflow(&mut self) {
@@ -176,18 +198,24 @@ impl NoticeStore {
             detail: format!("{} older notifications were removed from this session's bounded history.", self.evicted) };
         if let Some(row) = &self.overflow { self.update(row.id, error); }
         else if let Some(id) = self.allocate() {
+            self.presentation = Presentation::default();
             self.overflow = Some(Notice { id, origin: Origin::Overflow, severity: Severity::Warning,
-                error, content_version: 1, occurrences: self.evicted, copy_attempt: 0 });
+                error, content_version: 1, occurrences: self.evicted, copy_attempt: 0, presentation: self.presentation.clone() });
         }
-        if let Some(row) = &mut self.overflow { row.occurrences = self.evicted; }
+        if let Some(row) = &mut self.overflow && row.occurrences != self.evicted {
+            row.occurrences = self.evicted;
+            self.presentation = Presentation::default();
+        }
     }
     fn acknowledge(&mut self, id: NoticeId) {
         for slot in &mut self.frontiers { if slot.row == Some(id) { slot.row = None; } }
     }
     pub fn dismiss(&mut self, id: NoticeId) {
+        let before = self.len();
         if self.overflow.as_ref().is_some_and(|row| row.id == id) { self.overflow = None; self.evicted = 0; }
         else { self.rows.retain(|row| row.id != id); }
         self.acknowledge(id);
+        if self.len() != before { self.presentation = Presentation::default(); }
     }
     #[cfg(test)]
     pub fn dismiss_all(&mut self) { loop { let id = self.rows().next().map(|row| row.id); let Some(id) = id else { break; }; self.dismiss(id); } }

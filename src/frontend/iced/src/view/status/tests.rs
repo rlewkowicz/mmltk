@@ -52,13 +52,86 @@ fn detail_selection_is_retained_read_only_and_replaced_only_with_its_content_ver
     let id = notices.latest().unwrap().id;
     component.sync(&notices);
     component.select_detail(id, iced::widget::text_editor::Action::SelectAll);
-    assert_eq!(component.details[0].content.selection().as_deref(), Some("first\n\nmiddle\nlast"));
+    assert_eq!(component.details[&id].content.selection().as_deref(), Some("first\n\nmiddle\nlast"));
     component.select_detail(id, iced::widget::text_editor::Action::Edit(iced::widget::text_editor::Edit::Insert('x')));
-    assert_eq!(component.details[0].content.text(), "first\n\nmiddle\nlast");
+    assert_eq!(component.details[&id].content.text(), "first\n\nmiddle\nlast");
     component.sync(&notices);
-    assert_eq!(component.details[0].content.selection().as_deref(), Some("first\n\nmiddle\nlast"));
+    assert_eq!(component.details[&id].content.selection().as_deref(), Some("first\n\nmiddle\nlast"));
     notices.terminal(Origin::Provider, 0, 1, || Some(failure("updated")));
     component.sync(&notices);
-    assert_eq!(component.details[0].content.text(), "updated");
+    assert_eq!(component.details[&id].content.text(), "updated");
     notices.dismiss(id); component.sync(&notices); assert!(component.details.is_empty());
+}
+
+#[test]
+fn unrelated_interactions_copy_and_other_rows_preserve_the_retained_editor() {
+    let mut component = Component::default();
+    let mut notices = NoticeStore::default();
+    notices.terminal(Origin::Provider, 0, 1, || Some(failure("selected\ncomplete detail")));
+    let id = notices.latest().unwrap().id;
+    component.sync(&notices);
+    component.select_detail(id, iced::widget::text_editor::Action::SelectAll);
+    let admission = component.presentation.clone();
+    let editor = &component.details[&id].content as *const _;
+    for opening in [Opening::Mouse, Opening::Keyboard, Opening::Touch] {
+        component.activate(opening, true);
+        component.environment.reduced_motion = !component.environment.reduced_motion;
+        let (copy, _) = notices.begin_copy(id).unwrap();
+        assert!(notices.finish_copy(copy, true));
+        assert!(component.sync(&notices).is_none());
+        assert_eq!(component.presentation, admission);
+        assert_eq!(&component.details[&id].content as *const _, editor);
+        component.close();
+    }
+    notices.terminal(Origin::Remote, 0, 1, || Some(failure("other row")));
+    component.sync(&notices);
+    assert_eq!(component.details[&id].content.selection().as_deref(), Some("selected\ncomplete detail"));
+    let mut branch = notices.clone();
+    notices.terminal(Origin::Provider, 0, 1, || Some(failure("original changed")));
+    branch.terminal(Origin::Provider, 0, 1, || Some(failure("branch changed")));
+    component.sync(&notices);
+    component.sync(&branch);
+    assert_eq!(component.details[&id].content.text(), "branch changed");
+}
+
+#[test]
+fn retained_focus_follows_next_previous_and_trigger_when_rows_retire() {
+    let mut component = Component::default();
+    let mut notices = NoticeStore::default();
+    for generation in 1..=3 { notices.terminal(Origin::Provider, 0, generation, || Some(failure("row"))); }
+    component.sync(&notices);
+    let ids = component.order.clone();
+    component.activate(Opening::Keyboard, true);
+    component.focus = Some(Control::Detail(ids[1]));
+    notices.dismiss(ids[1]);
+    assert_eq!(component.sync(&notices), Some(Control::Copy(ids[2])));
+    notices.dismiss(ids[2]);
+    assert_eq!(component.sync(&notices), Some(Control::Copy(ids[0])));
+    notices.dismiss(ids[0]);
+    assert_eq!(component.sync(&notices), Some(Control::Trigger));
+    assert!(!component.open);
+}
+
+#[test]
+fn bounded_eviction_retains_surviving_selection_and_overflow_identity() {
+    let mut component = Component::default();
+    let mut notices = NoticeStore::default();
+    for generation in 1..=crate::view_model::notices::CAPACITY as u64 + 1 {
+        notices.terminal(Origin::Provider, 0, generation, || Some(failure("retained")));
+    }
+    component.sync(&notices);
+    let ids = component.order.clone();
+    let selected = ids[1];
+    let overflow = *ids.last().unwrap();
+    component.select_detail(selected, iced::widget::text_editor::Action::SelectAll);
+    for generation in 130..=131 {
+        notices.terminal(Origin::Provider, 0, generation, || Some(failure("added")));
+        component.sync(&notices);
+        assert_eq!(component.details.len(), crate::view_model::notices::CAPACITY + 1);
+        assert_eq!(component.order.last(), Some(&overflow));
+        if notices.get(selected).is_some() {
+            assert_eq!(component.details[&selected].content.selection().as_deref(), Some("retained"));
+        }
+    }
+    assert!(component.details[&overflow].content.text().starts_with("3 older notifications"));
 }

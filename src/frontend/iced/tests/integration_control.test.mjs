@@ -38,7 +38,7 @@ function canvasFixture(t, diagnostics = false, driver = true) {
   const NativeMap = Map, NativeSet = Set;
   install('Map', class extends NativeMap { constructor(...args) { super(...args); allocations.maps++; } });
   install('Set', class extends NativeSet { constructor(...args) { super(...args); allocations.sets++; } });
-  install('document', {querySelector: () => canvas, activeElement: canvas, hasFocus: () => true, visibilityState: 'visible'});
+  install('document', {getElementById: () => null, querySelector: () => canvas, activeElement: canvas, hasFocus: () => true, visibilityState: 'visible'});
   install('window', {
     devicePixelRatio: 1,
     addEventListener: (type, callback) => { allocations.listeners++; listeners.set(type, callback); },
@@ -95,7 +95,7 @@ function canvasFixture(t, diagnostics = false, driver = true) {
       queue.shift()();
     }
   };
-  return {canvas, css, sampling, allocations, events, keys, reports, lines, frames, microtasks,
+  return {install, canvas, css, sampling, allocations, events, keys, reports, lines, frames, microtasks,
     input: (type, fields = {}) => listeners.get(type)?.({type, ...fields}),
     flushMicrotasks: () => drain(microtasks), flushFrames: () => drain(frames)};
 }
@@ -1426,7 +1426,7 @@ for (const invalid of [NaN, Infinity, -1]) {
 
 test('Status Escape latch handoff stays inside before a real leave and reentry', t => {
   const f = canvasFixture(t, true), results = [], moves = [];
-  document.getElementById = () => ({getAttribute: () => 'false'});
+  document.getElementById = id => id === 'accessible.navigation.status' ? {getAttribute: () => 'false'} : null;
   const dispatch = f.canvas.dispatchEvent;
   f.canvas.dispatchEvent = event => { if(event.type === 'pointermove') moves.push([event.clientX,event.clientY]); return dispatch(event); };
   const bounds = Array.from({length:25}, () => [10,10,20,20]).flat();
@@ -1442,7 +1442,7 @@ test('Status Escape latch handoff stays inside before a real leave and reentry',
 
 test('Status rejects an inside-region hover reopen before issuing reentry input', t => {
   const f = canvasFixture(t, true), results = [];
-  document.getElementById = () => ({getAttribute: () => 'true'});
+  document.getElementById = id => id === 'accessible.navigation.status' ? {getAttribute: () => 'true'} : null;
   const bounds = Array.from({length:25}, () => [10,10,20,20]).flat();
   bounds.splice(8,4,0,0,0,0);
   browser.mmltkIntegrationStatusExercise(4, bounds, result => results.push(result));
@@ -1474,4 +1474,58 @@ test('Status explicit failure restoration cancels its pending frame chain', t =>
   f.flushFrames();
   assert.deepEqual(results, [false]);
   assert.equal(f.events.length, afterRestoration);
+});
+
+function statusSemanticFixture(t) {
+  const fixture = canvasFixture(t, true);
+  const observers = [];
+  fixture.install('MutationObserver', class {
+    constructor(callback) { this.callback = callback; this.pending = []; observers.push(this); }
+    observe() { this.active = true; }
+    takeRecords() { const records = this.pending; this.pending = []; return records; }
+    disconnect() { this.active = false; }
+  });
+  const controls = ['navigation.status', 'status.close', 'status.1.copy', 'status.1.detail', 'status.1.dismiss', 'navigation.settings'];
+  const nodes = controls.map(id => ({getAttribute: name => name === 'data-iced-control' ? id : name === 'aria-expanded' ? 'true' : null}));
+  const root = {querySelectorAll: () => nodes};
+  document.getElementById = id => id === 'status.accessibility' ? root : id === 'accessible.navigation.status' ? nodes[0] : null;
+  const bounds = Array.from({length:25}, () => [10,10,20,20]).flat();
+  return {...fixture, observers, nodes, bounds};
+}
+
+test('Status semantic nodes survive unrelated input and reject identity replacement', t => {
+  const f = statusSemanticFixture(t), results = [];
+  for (let repeat = 0; repeat < 2; repeat++) {
+    browser.mmltkIntegrationStatusExercise(5, f.bounds, result => results.push(result));
+    assert.equal(f.observers.at(-1).active, true);
+    f.flushFrames();
+    assert.equal(f.observers.at(-1).active, false);
+  }
+  assert.deepEqual(results, [true, true]);
+  f.nodes[3] = {...f.nodes[3]};
+  browser.mmltkIntegrationStatusExercise(5, f.bounds, result => results.push(result));
+  assert.deepEqual(results, [true, true, false]);
+  assert.equal(f.allocations.reads, 0);
+});
+
+for (const delivered of [false, true]) {
+  test(`Status unchanged-content evidence catches semantic mutation, delivered=${delivered}`, t => {
+    const f = statusSemanticFixture(t), results = [];
+    browser.mmltkIntegrationStatusExercise(5, f.bounds, result => results.push(result));
+    const observer = f.observers[0];
+    if (delivered) observer.callback([{type:'attributes'}]);
+    else observer.pending.push({type:'childList'});
+    f.flushFrames();
+    assert.deepEqual(results, [false]);
+    assert.equal(observer.active, false);
+  });
+}
+
+test('Status semantic evidence retires its observer with the accepted session', t => {
+  const f = statusSemanticFixture(t), results = [];
+  browser.mmltkIntegrationStatusExercise(5, f.bounds, result => results.push(result));
+  browser.mmltkIntegrationInitialize(false);
+  assert.equal(f.observers[0].active, false);
+  f.flushFrames();
+  assert.deepEqual(results, [false]);
 });
