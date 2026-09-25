@@ -15,10 +15,7 @@ inline detail::TrainingContinuationValues continuation_values(const TrainRequest
  values.schedule = schedule.state();
  values.data.plan_hash = 1;
  values.data.epoch = values.epoch + 1;
- if (request.lane_configuration.mode == TrainLaneMode::SharedGradients)
-  values.data.shards = {{0, static_cast<std::uint64_t>(request.seed), {0}, {1}, {}}};
- else
-  for (const auto& model : request.lane_configuration.models) values.data.shards.push_back({model.model_id, model.seed, {0}, {1}, {}});
+ values.data.model_id = request.lane_configuration.mode == TrainLaneMode::SharedGradients ? 0 : request.lane_configuration.models.front().model_id;
  values.data.donors.resize(checked_training_product(request.batch_size, request.lane_configuration.mode == TrainLaneMode::SharedGradients ? request.lanes : 1));
  return values;
 }

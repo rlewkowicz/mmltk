@@ -156,8 +156,8 @@ TrainRun run_train_iteration(const Options& options, const std::string& compiled
  return TrainRun{
   elapsed_ns,
   last.train_loss,
-  last.val_summary.bbox.ap,
-  last.val_summary.mask.has_value() ? std::optional<double>(last.val_summary.mask->ap) : std::nullopt,
+  last.val->bbox.ap,
+  last.val->mask.has_value() ? std::optional<double>(last.val->mask->ap) : std::nullopt,
   measured ? std::optional<std::uint64_t>(peak_allocated_cuda_bytes(options)) : std::nullopt,
  };
 }

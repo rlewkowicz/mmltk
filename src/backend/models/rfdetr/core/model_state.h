@@ -86,6 +86,7 @@ struct ResolvedModelState {
  DecodedNativeModelState model_state;
 };
 void validate_decoded_model_state(const DecodedNativeModelState& state);
+[[nodiscard]] bool same_native_model_semantics(const NativeCheckpointMetadata&, const NativeCheckpointMetadata&);
 enum class ModelStateContainer { Unknown, Python, Native };
 [[nodiscard]] ModelStateContainer identify_model_state_container(const std::filesystem::path&);
 [[nodiscard]] bool is_native_checkpoint_file(const std::filesystem::path& checkpoint_path);

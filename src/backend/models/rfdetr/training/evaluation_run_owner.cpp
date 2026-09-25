@@ -555,7 +555,7 @@ EvalPassResult evaluate_model(const TrainRequest& options, TrainingValidationRun
  std::optional<CapturedEvalSample> captured_sample;
  std::unique_ptr<spdmon::ProgressBar> progress;
  if (options.progress_bar) {
-  auto label = purpose == EvaluationPurpose::FinalTest ? std::string("test") : std::format("{} {}/{}", evaluated_weights == EvaluatedWeights::Ema ? "ema" : "val", *current_epoch + 1, options.epochs);
+  auto label = purpose == EvaluationPurpose::FinalTest ? std::string("test") : purpose == EvaluationPurpose::SelectionValidation ? std::string("selection validation") : std::format("{} {}/{}", evaluated_weights == EvaluatedWeights::Ema ? "ema" : "val", *current_epoch + 1, options.epochs);
   progress = std::make_unique<spdmon::ProgressBar>(std::move(label), loader.num_images(), "img");
  }
  std::mt19937_64 sample_rng(static_cast<uint64_t>(options.seed) ^ (current_epoch.has_value() ? (0x9e3779b97f4a7c15ULL + static_cast<uint64_t>(*current_epoch + 1)) : 0xd1b54a32d192ed03ULL));

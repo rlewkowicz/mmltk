@@ -39,6 +39,7 @@ class DatasetLoader {
 public:
  struct Config {
   std::string compiled_path;
+  std::shared_ptr<const CompiledDataset> source;
   size_t batch_size = 32;
   bool shuffle = true;
   uint64_t seed = 42;
@@ -78,6 +79,7 @@ public:
  [[nodiscard]] uint32_t num_classes() const;
  [[nodiscard]] uint32_t max_instances_per_image() const;
  [[nodiscard]] const std::shared_ptr<const catalog::ClassCatalog>& class_catalog() const noexcept;
+ [[nodiscard]] const std::shared_ptr<const CompiledDataset>& compiled_source() const noexcept;
  [[nodiscard]] const char* class_name(uint32_t id) const;
  [[nodiscard]] size_t image_stride() const;
  [[nodiscard]] size_t num_label_instances() const;

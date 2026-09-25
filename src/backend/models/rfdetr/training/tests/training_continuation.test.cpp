@@ -50,8 +50,6 @@ torch::serialize::InputArchive continuation_fixture(const r::TrainRequest& reque
 torch::serialize::InputArchive continuation_fixture(const r::TrainRequest& request) {
  return continuation_fixture(request, r::testsupport::continuation_values(request,
   {.epoch = 0,
-   .best_regular_metric = -std::numeric_limits<double>::infinity(),
-   .best_ema_metric = -std::numeric_limits<double>::infinity(),
    .grad_scaler_scale = 1024.0,
    .grad_scaler_growth_tracker = 17,
    .ema_completed_updates = request.use_ema ? 37 : 0,
@@ -97,7 +95,7 @@ void test_current_continuation_scalar_boundaries() {
  const std::array<std::pair<std::string, c10::IValue>, 14> invalid{{{"epoch", int64_t{-1}}, {"epoch", int64_t{std::numeric_limits<int>::max()}}, {"grad_scaler_scale", 0.0},
   {"grad_scaler_scale", std::numeric_limits<double>::infinity()}, {"grad_scaler_growth_tracker", int64_t{-1}}, {"grad_scaler_growth_tracker", int64_t{std::numeric_limits<int>::max()} + 1},
   {"ema_completed_updates", int64_t{-1}}, {"ema_completed_updates", std::numeric_limits<int64_t>::max()}, {"ema_completed_updates", int64_t{1}},
-  {"best_regular_metric", std::numeric_limits<double>::quiet_NaN()}, {"best_ema_metric", std::numeric_limits<double>::quiet_NaN()}, {"training_attempt_id", std::string{}},
+  {"training_attempt_id", std::string{}},
   {"training_attempt_id", std::string(65, 'a')}, {"training_original_descriptor", std::string(mmltk::frameworks::reflection::kMaximumPathBytes + 1, 'a')}}};
  for (const auto& [key, value] : invalid) {
   auto source = continuation_fixture(saved_request());
@@ -304,8 +302,6 @@ TEST_CASE("Resolved current Resume preserves recipe optimizer EMA and an unfinis
  r::detail::write_native_checkpoint_metadata(archive, state.metadata);
  r::detail::write_training_continuation(archive, request, r::testsupport::continuation_values(request,
   {.epoch = 0,
-   .best_regular_metric = 0.2,
-   .best_ema_metric = 0.3,
    .grad_scaler_scale = 128,
    .grad_scaler_growth_tracker = 7,
    .ema_completed_updates = 3,
@@ -321,7 +317,9 @@ TEST_CASE("Resolved current Resume preserves recipe optimizer EMA and an unfinis
  auto admitted = r::resolve_model_state(path, {}, 0);
  auto active = request;
  active.resume_path = path;
- const auto continuation = r::detail::admit_training_configuration(admitted.artifacts.config, admitted.model_state.admitted_archive(), active);
+ const auto continuation = r::detail::read_training_continuation(*admitted.model_state.admitted_archive());
+ REQUIRE(continuation);
+ r::detail::require_active_training_continuation(*continuation, active);
  REQUIRE(continuation.has_value());
  REQUIRE(admitted.artifacts.config.cls_loss_coef == 7.3);
  REQUIRE(admitted.artifacts.config.bbox_loss_coef == 9.1);
@@ -360,16 +358,15 @@ TEST_CASE("Resolved current Resume preserves recipe optimizer EMA and an unfinis
  REQUIRE(torch::equal(ema.shadow_params()[0], restored_ema.shadow_params()[0]));
  auto invalid = active;
  invalid.recipe.warmup_epochs = 2.0;
- REQUIRE_THROWS(r::detail::admit_training_configuration(admitted.artifacts.config, admitted.model_state.admitted_archive(), invalid));
+ REQUIRE_THROWS(r::detail::require_active_training_continuation(*continuation, invalid));
  REQUIRE(admitted.artifacts.config.cls_loss_coef == 7.3);
- REQUIRE_THROWS(r::detail::admit_training_configuration(admitted.artifacts.config, nullptr, active));
  torch::serialize::OutputArchive weights_only;
  mmltk::backend::ml::serialization::write_string(weights_only, "source_kind", "weights-only");
  auto input = r::testsupport::checkpoint_input(weights_only);
- REQUIRE_THROWS(r::detail::admit_training_configuration(admitted.artifacts.config, &input, active));
+ REQUIRE_FALSE(r::detail::read_training_continuation(input));
  REQUIRE(admitted.artifacts.config.mask_ce_loss_coef == 8.2);
  // Starting a new run from this full archive deliberately ignores continuation.
- REQUIRE_FALSE(r::detail::admit_training_configuration(admitted.artifacts.config, admitted.model_state.admitted_archive(), request).has_value());
+ r::apply_stock_training_coefficients(admitted.artifacts.config);
  REQUIRE(admitted.artifacts.config.cls_loss_coef == 1.0);
  REQUIRE(admitted.model_state.metadata.cls_loss_coef == 7.3);
 }

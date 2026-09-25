@@ -28,7 +28,7 @@
 #include "src/frameworks/process/subprocess_utils.h"
 namespace mmltk::controller::services {
 namespace {
-constexpr std::size_t kProgressDocumentLimit = 2U * mmltk::backend::models::rfdetr::kTrainingRecordBytes;
+constexpr std::size_t kProgressDocumentLimit = mmltk::backend::models::rfdetr::kTrainingProgressDocumentBytes;
 constexpr std::size_t kProgressEdgeReadBudget = std::size_t{16U} * 1024U;
 [[nodiscard]] std::string bounded_error(std::string value) { return mmltk::controller::contracts::bounded_compute_error(std::move(value)); }
 void validate_progress_fields(const std::string& status, const std::string& checkpoint) {
@@ -82,14 +82,6 @@ void arm_escalation(const int descriptor, const std::chrono::milliseconds delay_
  input.read(result.data(), static_cast<std::streamsize>(result.size()));
  result.resize(static_cast<std::size_t>(input.gcount()));
  return result;
-}
-template <class T>
-void read_json_value(const nlohmann::json& object, const char* key, T& value) {
- const auto found = object.find(key);
- if (found == object.end() || found->is_null()) return;
- try {
-  value = found->get<T>();
- } catch (const nlohmann::json::exception&) {}
 }
 [[nodiscard]] bool consume_progress_edges(const int descriptor, const int watch) {
  std::array<char, 4096U> buffer{};
@@ -368,48 +360,61 @@ std::optional<TrainProcessProgress> TrainProcessClient::read_progress() {
  const auto progress = nlohmann::json::parse(bounded_file(state_->output_directory / "progress.json"), nullptr, false);
  const auto result = nlohmann::json::parse(bounded_file(state_->output_directory / "results.json"), nullptr, false);
  if (!progress.is_object() && !result.is_object() && !state_->persistence_failed) return std::nullopt;
+ namespace r = mmltk::backend::models::rfdetr;
+ std::optional<r::TrainingProgressDocument> document;
+ try {
+  const auto& source = progress.is_object() ? progress : result;
+  if (source.is_object()) {
+   document = mmltk::frameworks::serialization::decode_reflected_json<r::TrainingProgressDocument>(source.dump(), {.max_bytes = kProgressDocumentLimit, .max_items = 24576, .max_depth = 32});
+   if (document->format_version != r::kTrainingRunFormat || document->record.format_version != r::kTrainingRunFormat || document->record.attempt_id.empty())
+    throw std::runtime_error("unsupported training progress document");
+   if (const auto& observation = document->representative_observation) {
+    if (observation->format_version != r::kTrainingRunFormat || observation->run_id != document->record.run_id || observation->attempt_id != document->record.attempt_id ||
+        observation->sequence > document->record.sequence || observation->role != r::TrainingRecordRole::Epoch || !observation->progress.artifact || !observation->progress.val ||
+        observation->evaluated_weights != observation->progress.artifact->weights ||
+        (observation->progress.scope != r::TrainingRecordScope::Model && observation->progress.scope != r::TrainingRecordScope::SynchronizedSession))
+     throw std::runtime_error("invalid retained training observation");
+   }
+  }
+ } catch (...) { state_->persistence_failed = true; throw; }
  std::string status = "training";
- std::uint64_t completed = 0U;
- std::uint64_t total = 0U;
- std::int64_t epoch = -1;
- std::uint64_t total_epochs = 0U;
- if (progress.is_object()) {
-  read_json_value(progress, "phase", status);
-  read_json_value(progress, "completed_batches", completed);
-  read_json_value(progress, "total_batches", total);
-  read_json_value(progress, "epoch", epoch);
-  read_json_value(progress, "total_epochs", total_epochs);
+ std::uint64_t completed = 0, total = 0;
+ std::filesystem::path checkpoint;
+ std::optional<r::TrainingRecord> metrics;
+ std::optional<r::TrainingRecord> representative_observation;
+ r::TrainingPersistence persistence;
+ if (document) {
+  const auto& facts = document->record.progress;
+  switch (facts.phase) {
+   case r::TrainingPhase::Starting: status = "starting"; break;
+   case r::TrainingPhase::Train: status = "training"; break;
+   case r::TrainingPhase::Validate: status = "validating"; break;
+   case r::TrainingPhase::EpochComplete: status = "epoch complete"; break;
+   case r::TrainingPhase::Completed: status = "completed"; break;
+   case r::TrainingPhase::Error: status = "failed"; break;
+   case r::TrainingPhase::Cancelled: status = "cancelled"; break;
+   case r::TrainingPhase::Merge: status = "averaging models"; break;
+  }
+  completed = facts.completed_images; total = facts.total_images;
+  if (!total && facts.total_epochs > 0) { total = facts.total_epochs; completed = std::min<std::uint64_t>(std::max(0, facts.epoch + 1), total); }
+  checkpoint = facts.artifact ? facts.artifact->path : facts.checkpoint_path;
+  if (checkpoint.empty()) checkpoint = facts.full_checkpoint_path;
+  persistence = document->persistence;
+  if (facts.failure && !facts.failure->detail.empty()) {
+   state_->failure_line.assign(facts.failure->detail, 0, State::kFailureCapacity);
+   state_->capturing_failure = true;
+   state_->finish_failure_line();
+  }
+  representative_observation = std::move(document->representative_observation);
+  metrics = std::move(document->record);
  }
- if (total == 0U && total_epochs != 0U) {
-  total = total_epochs;
-  completed = epoch < 0 ? 0U : std::min<std::uint64_t>(static_cast<std::uint64_t>(epoch) + 1U, total);
- }
- if (total != 0U) completed = std::min(completed, total);
- std::string checkpoint;
- if (progress.is_object()) read_json_value(progress, "checkpoint_path", checkpoint);
- if (checkpoint.empty() && result.is_object()) {
-  read_json_value(result, "best_checkpoint", checkpoint);
-  if (checkpoint.empty()) read_json_value(result, "checkpoint", checkpoint);
- }
- if (state_->persistence_failed) status += " — metrics persistence degraded";
- validate_progress_fields(status, checkpoint);
- std::optional<mmltk::backend::models::rfdetr::TrainingRecord> metrics;
- if (progress.is_object() && progress.contains("record")) {
-  try {
-   metrics = mmltk::frameworks::serialization::decode_reflected_json<mmltk::backend::models::rfdetr::TrainingRecord>(
-    progress.at("record").dump(), {.max_bytes = kProgressDocumentLimit, .max_items = 8192, .max_depth = 32});
-  } catch (...) { state_->persistence_failed = true; }
- }
- bool file_failure = false;
- if (progress.is_object()) read_json_value(progress, "persistence_degraded", file_failure);
- state_->persistence_failed = state_->persistence_failed || file_failure;
- std::uint64_t dropped_records = 0;
- if (progress.is_object()) read_json_value(progress, "dropped_records", dropped_records);
+ state_->persistence_failed |= persistence.degraded;
+ persistence.degraded = state_->persistence_failed;
+ if (persistence.degraded && persistence.error.empty()) persistence.error = "Training metric persistence is incomplete";
+ validate_progress_fields(status, checkpoint.string());
  ++state_->progress_sequence;
- return TrainProcessProgress{.progress = {.sequence = state_->progress_sequence, .completed = completed, .total = total, .status = std::move(status)},
-  .checkpoint_path = std::move(checkpoint),
-  .metrics = std::move(metrics),
-  .persistence = {.degraded = state_->persistence_failed, .dropped_records = dropped_records, .error = state_->persistence_failed ? "Training metric persistence is incomplete" : ""}};
+ return TrainProcessProgress{.progress = {.sequence = state_->progress_sequence, .completed = std::min(completed, total), .total = total, .status = std::move(status)},
+  .checkpoint_path = std::move(checkpoint), .metrics = std::move(metrics), .representative_observation = std::move(representative_observation), .persistence = std::move(persistence)};
 }
 std::optional<TrainProcessExit> TrainProcessClient::consume_exit(std::string* retained_output) {
  if (!active()) return std::nullopt;

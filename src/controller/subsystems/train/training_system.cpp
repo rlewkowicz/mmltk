@@ -317,6 +317,7 @@ public:
      state_.activity = TrainingActivity::Local;
      state_.local.output = {};
      state_.metrics.reset();
+     state_.representative_observation.reset();
      state_.persistence = {};
      state_.local.active = true;
      state_.local.generation_frontier = *next;
@@ -353,6 +354,7 @@ public:
        std::scoped_lock lock(mutex_);
        state_.local.output.directory = request->output_dir.string();
        state_.metrics.reset();
+       state_.representative_observation.reset();
        state_.persistence = {};
        AdvanceObservation();
       }
@@ -376,6 +378,7 @@ public:
          if (!state_.local.active || !contracts::compute_progress_follows(progress, state_.local.progress.sequence)) return;
          state_.local.progress = progress;
          if (update.metrics) state_.metrics = update.metrics;
+         state_.representative_observation = update.representative_observation;
          state_.persistence = update.persistence;
          if (state_.local.terminal.outcome == contracts::ComputeOperationOutcome::Running) state_.local.terminal.detail.clear();
          AdvanceObservation();
@@ -384,6 +387,7 @@ public:
           .activity = state_.activity,
           .local = state_.local,
           .metrics = state_.metrics,
+          .representative_observation = state_.representative_observation,
           .persistence = state_.persistence,
          };
         }

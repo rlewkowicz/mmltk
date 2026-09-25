@@ -25,14 +25,20 @@ struct TrainingDonorDescriptor final {
 // maximum admitted draw multiplier. This is a format bound, not a worker limit.
 inline constexpr std::uint64_t kMaximumTrainingDonorSlots = std::uint64_t{std::numeric_limits<std::uint32_t>::max()} * 16U;
 struct TrainingDataContinuation final {
- [[= mmltk::frameworks::reflection::MaxItems{kMaximumTrainingModels}]] std::vector<TrainingShard> shards;
+ std::uint64_t model_id = 0;
  std::uint64_t plan_hash = 0;
  std::uint64_t epoch = 0;
  std::uint64_t next_microbatch = 0;
  [[= mmltk::frameworks::reflection::MaxItems{kMaximumTrainingDonorSlots}]] std::vector<TrainingDonorDescriptor> donors;
  bool operator==(const TrainingDataContinuation&) const = default;
 };
+struct TrainingPlanState final {
+ std::uint64_t plan_hash = 0;
+ [[= mmltk::frameworks::reflection::MaxItems{kMaximumTrainingModels}]] std::vector<TrainingShard> shards;
+ bool operator==(const TrainingPlanState&) const = default;
+};
 MMLTK_REFLECT_FIELDS(TrainingShard)
 MMLTK_REFLECT_FIELDS(TrainingDonorDescriptor)
 MMLTK_REFLECT_FIELDS(TrainingDataContinuation)
+MMLTK_REFLECT_FIELDS(TrainingPlanState)
 }  // namespace mmltk::backend::models::rfdetr

@@ -102,7 +102,16 @@ impl Component {
                     live_changed = u16::MAX;
                 }
             } else if let Some(record) = &training.metrics {
-                live_changed = self.live.ingest(record, true, &self.metrics);
+                live_changed = self.live.reconcile_live_source(
+                    record,
+                    training.representativeobservation.as_ref(),
+                    model.settings_snapshot.as_ref().map(|settings| &settings.settingsstate.workflows.train.request),
+                    &self.metrics,
+                );
+                live_changed |= self.live.ingest(record, true, &self.metrics);
+                if let Some(observation) = &training.representativeobservation {
+                    live_changed |= self.live.ingest_observation(observation, &self.metrics);
+                }
             }
         }
         let selected = model.workflow.output.saved().is_some();
@@ -112,6 +121,7 @@ impl Component {
                 self.saved.clear(&self.metrics);
                 if let Some(run) = &opened.run {
                     self.saved.set_run(&run.runid, opened.generation);
+                    self.saved.select_source(&run.configuration);
                 } else {
                     self.saved.set_run("", opened.generation);
                 }
@@ -340,7 +350,7 @@ pub(crate) mod tests {
     pub(crate) fn record() -> TrainingRecord {
         use crate::generated::*;
         TrainingRecord {
-            formatversion: 2,
+            formatversion: 3,
             runid: "run".into(),
             attemptid: "attempt".into(),
             sequence: 1,
@@ -350,6 +360,20 @@ pub(crate) mod tests {
             attemptconfiguration: None,
             progress: TrainingMetricProgress {
                 phase: TrainingPhase::Train,
+                scope: TrainingRecordScope::Model,
+                sessionid: "session".into(),
+                modelid: 0,
+                round: 0,
+                merge: 0,
+                mergeboundary: None,
+                artifact: Some(TrainingArtifact {
+                    sessionid: "session".into(), modelid: 0, initialization: "init".into(),
+                    configuration: "configuration".into(), content: "content".into(), sha256: "digest".into(),
+                    path: "scheduled.pt".into(), epoch: 0, attempt: 0, merge: 0,
+                    weights: EvaluatedWeights::Ordinary, selectionmetric: Some(0.42),
+                    evaluation: Some(evaluation()), validation: "validation".into(),
+                }),
+                failure: None,
                 epoch: 1,
                 totalepochs: 3,
                 completedbatches: 1,
@@ -426,6 +450,149 @@ pub(crate) mod tests {
         chart: Chart,
     ) -> &'a history::Curve {
         &history.curves[metrics.iter().position(|m| m.chart == chart).unwrap()]
+    }
+    #[test]
+    fn coalesced_live_projection_keeps_current_progress_and_original_ema_observation() {
+        let mut model = crate::view_model::test_support::bootstrapped();
+        let mut observation = record();
+        observation.sequence = 3;
+        observation.role = TrainingRecordRole::Epoch;
+        observation.evaluatedweights = EvaluatedWeights::Ema;
+        observation.progress.phase = TrainingPhase::EpochComplete;
+        observation.progress.modelid = 4;
+        observation.progress.artifact.as_mut().unwrap().modelid = 4;
+        observation.progress.artifact.as_mut().unwrap().weights = EvaluatedWeights::Ema;
+        observation.progress.val = Some(evaluation());
+        let mut current = record();
+        current.sequence = 10;
+        current.role = TrainingRecordRole::Epoch;
+        current.progress.scope = TrainingRecordScope::Session;
+        current.progress.artifact = None;
+        current.progress.val = None;
+        current.progress.scalars.total = None;
+        current.progress.fullcheckpointpath = "session.json".into();
+        let training = model.workflow.training.as_mut().unwrap();
+        training.metrics = Some(current.clone());
+        training.representativeobservation = Some(observation);
+        let mut component = Component::default();
+        component.rebase(&model, false);
+        component.rebase(&model, false);
+        assert_eq!(component.live.sequence, Some(10));
+        assert_eq!(curve(&component.live, &component.metrics, Chart::Ap50).buckets.len(), 1);
+        assert_eq!(curve(&component.live, &component.metrics, Chart::Ap50).buckets[0].first.order, 3);
+        assert!(curve(&component.live, &component.metrics, Chart::Loss).buckets.is_empty());
+        assert_eq!(model.workflow.training.as_ref().unwrap().metrics.as_ref(), Some(&current));
+    }
+    #[test]
+    fn late_native_observation_reconciles_provisional_live_source_once() {
+        for synchronized in [false, true] {
+            let mut model = crate::view_model::test_support::bootstrapped();
+            model.settings_snapshot.as_mut().unwrap().settingsstate.workflows.train.request.useema = synchronized;
+            let mut current = record();
+            current.sequence = 10;
+            current.droppedbefore = 2;
+            current.progress.artifact = None;
+            model.workflow.training.as_mut().unwrap().metrics = Some(current.clone());
+            let mut component = Component::default();
+            component.rebase(&model, false);
+            assert_eq!(curve(&component.live, &component.metrics, Chart::Loss).buckets.len(), 1);
+
+            let mut observation = record();
+            observation.sequence = 11;
+            observation.droppedbefore = 2;
+            observation.role = TrainingRecordRole::Epoch;
+            observation.progress.phase = TrainingPhase::EpochComplete;
+            observation.progress.scope = if synchronized { TrainingRecordScope::SynchronizedSession } else { TrainingRecordScope::Model };
+            observation.progress.modelid = if synchronized { 0 } else { 4 };
+            observation.evaluatedweights = if synchronized { EvaluatedWeights::Ordinary } else { EvaluatedWeights::Ema };
+            let artifact = observation.progress.artifact.as_mut().unwrap();
+            artifact.modelid = observation.progress.modelid;
+            artifact.weights = observation.evaluatedweights;
+            observation.progress.val = Some(evaluation());
+            current.sequence = 12;
+            current.droppedbefore = 3;
+            current.progress.elapsedseconds = 3.0;
+            current.progress.modelid = artifact.modelid;
+            current.progress.scalars.total = Some(7.0);
+            let training = model.workflow.training.as_mut().unwrap();
+            training.metrics = Some(current.clone());
+            training.representativeobservation = Some(observation);
+            component.rebase(&model, false);
+            component.rebase(&model, false);
+            assert_eq!(component.live.sequence, Some(12));
+            assert_eq!(component.live.dropped, 3);
+            let ap = curve(&component.live, &component.metrics, Chart::Ap50);
+            assert_eq!(ap.buckets.len(), 1);
+            assert_eq!(ap.buckets[0].first.order, 11);
+            let loss = curve(&component.live, &component.metrics, Chart::Loss);
+            // Weight-kind correction leaves the same model's truthful losses;
+            // a model correction discards the provisional model's points.
+            assert_eq!(loss.buckets.len(), if synchronized { 2 } else { 1 });
+            assert_eq!(loss.buckets.back().unwrap().last.value, 7.0);
+            assert_eq!(model.workflow.training.as_ref().unwrap().metrics.as_ref(), Some(&current));
+
+            // Mutable settings and plot-storage reset cannot supersede the
+            // native source already established for this attempt.
+            component.clear();
+            component.rebase(&model, false);
+            assert_eq!(curve(&component.live, &component.metrics, Chart::Ap50).buckets.len(), 1);
+            assert_eq!(component.live.sequence, Some(12));
+
+            let training = model.workflow.training.as_mut().unwrap();
+            let observation = training.representativeobservation.as_mut().unwrap();
+            observation.attemptid = "next-attempt".into();
+            observation.sequence = 0;
+            observation.progress.scope = TrainingRecordScope::Model;
+            observation.progress.modelid = 5;
+            observation.progress.artifact.as_mut().unwrap().modelid = 5;
+            let current = training.metrics.as_mut().unwrap();
+            current.attemptid = "next-attempt".into();
+            current.sequence = 1;
+            current.droppedbefore = 0;
+            current.progress.modelid = 5;
+            component.rebase(&model, false);
+            assert_eq!(component.live.sequence, Some(1));
+            assert_eq!(component.live.dropped, 0);
+            assert_eq!(curve(&component.live, &component.metrics, Chart::Loss).buckets.len(), 1);
+            assert_eq!(curve(&component.live, &component.metrics, Chart::Ap50).buckets.len(), 1);
+        }
+    }
+    #[test]
+    fn saved_page_replay_selects_ema_without_session_gaps() {
+        let mut model = crate::view_model::test_support::bootstrapped();
+        select_saved_run(&mut model);
+        model.workflow.output.saved_mut().unwrap().run.as_mut().unwrap().run.as_mut().unwrap().configuration.useema = true;
+        let mut ordinary = record();
+        ordinary.runid = "saved".into();
+        ordinary.sequence = 0;
+        ordinary.role = TrainingRecordRole::Epoch;
+        ordinary.progress.scope = TrainingRecordScope::SynchronizedSession;
+        ordinary.progress.val = Some(evaluation());
+        let mut ema = ordinary.clone();
+        ema.sequence = 1;
+        ema.progress.scope = TrainingRecordScope::Model;
+        ema.evaluatedweights = EvaluatedWeights::Ema;
+        ema.progress.artifact.as_mut().unwrap().weights = EvaluatedWeights::Ema;
+        ema.progress.val.as_mut().unwrap().bbox.ap50 = 0.9;
+        let mut session = ema.clone();
+        session.sequence = 2;
+        session.progress.scope = TrainingRecordScope::Session;
+        session.progress.artifact = None;
+        session.progress.val = None;
+        session.progress.scalars.total = None;
+        model.workflow.output.saved_mut().unwrap().page = Some(TrainingHistoryPage {
+            generation: 3, nextcursor: 100, more: false, records: vec![ordinary, ema, session],
+        });
+        let mut component = Component::default();
+        component.rebase(&model, false);
+        component.rebase(&model, false);
+        let ap = curve(&component.saved, &component.metrics, Chart::Ap50);
+        assert_eq!(ap.buckets.len(), 1);
+        assert_eq!(ap.buckets[0].first.value, 0.9);
+        let loss = curve(&component.saved, &component.metrics, Chart::Loss);
+        assert_eq!(loss.buckets.len(), 1);
+        assert!(!loss.missing);
+        assert_eq!(component.saved.sequence, Some(2));
     }
     #[test]
     fn sparse_validation_uses_completed_epochs_without_live_or_terminal_duplicates() {

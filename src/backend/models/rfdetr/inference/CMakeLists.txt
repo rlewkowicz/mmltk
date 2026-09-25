@@ -93,6 +93,7 @@ function(mmltk_add_backend_models_rfdetr_inference_tests)
         mmltk::common::io
         mmltk::backend::ml::torch_dependencies
         CUDA::cudart
+        mmltk::vendor::onnxruntime
         ONNX::onnx "${Protobuf_LIBRARY}"
         nlohmann_json)
     mmltk_target_cuda_architectures(

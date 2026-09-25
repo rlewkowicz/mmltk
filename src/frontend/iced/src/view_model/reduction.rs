@@ -289,6 +289,7 @@ impl ApplicationModel {
             if progress.activity != installed.activity
                 || progress.local != installed.local
                 || progress.metrics != installed.metrics
+                || progress.representativeobservation != installed.representativeobservation
                 || progress.persistence != installed.persistence
             {
                 return Err(UiError::protocol(
@@ -301,6 +302,7 @@ impl ApplicationModel {
         installed.activity = progress.activity;
         installed.local = progress.local;
         installed.metrics = progress.metrics;
+        installed.representativeobservation = progress.representativeobservation;
         installed.persistence = progress.persistence;
         self.observe_training();
         Ok(Observation::Installed)

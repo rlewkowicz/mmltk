@@ -402,20 +402,30 @@ pub(crate) fn saved_training_run(
     configuration: crate::generated::TrainRequest,
 ) -> crate::generated::TrainingOpenedRun {
     use crate::generated::*;
+    let execution = ExecutionFacts {
+        settingsrevision: 0,
+        operationgeneration: 0,
+        logicalmodels: 1,
+        microbatchesperattempt: 1,
+        effectivebatchpermodel: 4,
+        aggregateroundimages: 4,
+        configuredcapacity: 1,
+        admittedcapacity: 1,
+        limitation: ExecutionLimitation::None,
+    };
     TrainingOpenedRun {
         generation: 3,
         directory: "saved-output".into(),
         run: Some(TrainingRun {
-            formatversion: 2,
+            formatversion: 3,
             runid: "saved".into(),
             attemptid: "saved-attempt".into(),
             checkpointattemptid: String::new(),
             sourcecheckpointattemptid: String::new(),
             configuration,
             execution: TrainingExecutionFacts {
-                evallanes: 1,
-                effectivebatchperrank: 4,
-                effectivebatchglobal: 4,
+                training: execution.clone(),
+                validation: execution,
                 datasetlimits: TrainingDatasetLimits {
                     trainmaxinstances: 1,
                     valmaxinstances: 1,

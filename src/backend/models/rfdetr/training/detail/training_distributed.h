@@ -15,6 +15,7 @@ namespace c10d { class Backend; class Store; }
 namespace mmltk::backend::models::rfdetr {
 class NativeRfDetrModel;
 struct TrainRequest;
+struct TrainingFailure;
 namespace detail { struct TrainingContinuationValues; }
 namespace testsupport { struct TrainingDistributedTestAccess; }
 // Copies retain the same selected-device transport, including terminal custody.
@@ -41,11 +42,15 @@ private:
  friend void distributed_shutdown(const DistributedContext&);
  friend void distributed_abort(const DistributedContext&) noexcept;
  friend void agree_training_topology(const DistributedContext&, int);
+ friend TrainingFailure claim_training_failure(const DistributedContext&, const TrainingFailure&);
 };
 [[nodiscard]] DistributedContext make_distributed_context(const TrainRequest&);
 [[nodiscard]] DistributedContext make_distributed_context(const std::filesystem::path& store, int rank, int world, int device, std::optional<std::chrono::milliseconds> timeout = {});
 void distributed_shutdown(const DistributedContext&);
 void distributed_abort(const DistributedContext&) noexcept;
+// Failure settlement uses the already-owned rendezvous store after ordinary
+// turns fail. The first concrete cause is claimed before peer cancellation.
+[[nodiscard]] TrainingFailure claim_training_failure(const DistributedContext&, const TrainingFailure&);
 // An operation owns a fixed number of submissions. join() orders the launch
 // stream only. settle() proves physical completion at a drained boundary and
 // reuses its slots/event. Unjoined, aborted, or failed work stays in terminal

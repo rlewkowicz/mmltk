@@ -61,7 +61,7 @@ void test_current_training_history_pages_and_attempt_configuration() {
  REQUIRE(last->role == r::TrainingRecordRole::Terminal);
  REQUIRE(last->progress.phase == r::TrainingPhase::Completed);
  REQUIRE(last->attempt_id == manifest.attempt_id);
- REQUIRE(last->format_version == 2);
+ REQUIRE(last->format_version == 3);
  REQUIRE(last->progress.completed_images == 35);
  REQUIRE(last->progress.total_images == 35);
  REQUIRE_THROWS(store.Read({store.generation() + 1, 0, 1}));
@@ -89,7 +89,9 @@ void test_current_training_history_pages_and_attempt_configuration() {
  REQUIRE(fresh.filename() == "run-0001");
  REQUIRE(std::filesystem::is_directory(fresh / ".mmltk-run-claim"));
  r::TrainingCheckpoint continuation;
- continuation.path = temp.path() / "checkpoint.pt";
+ continuation.path = temp.path() / "session.json";
+ continuation.resumable = true;
+ continuation.session_id = manifest.run_id;
  continuation.attempt_id = manifest.checkpoint_attempt_id;
  continuation.class_layout = manifest.class_layout;
  continuation.evaluated_weights = manifest.evaluated_weights;
@@ -147,4 +149,46 @@ TEST_CASE("output opening distinguishes absent history and corrupt claimed histo
  CHECK_THROWS(store.Read({unrelated.generation, 0, 1}));
  std::ofstream(temp.path() / "run.json") << "{}";
  CHECK_THROWS(store.Open(temp.path()));
+}
+
+TEST_CASE("training history pages retain scoped identities and reject replacement and truncation", "[gui][train][history]") {
+ namespace r = mmltk::backend::models::rfdetr;
+ namespace serial = mmltk::frameworks::serialization;
+ mmltk::testsupport::ScopedTempDir temp("training-history-pages");
+ r::TrainingRun run;
+ run.run_id = "session"; run.attempt_id = "attempt";
+ std::vector<std::byte> scratch(r::kTrainingManifestBytes);
+ const auto encode = [&](const auto& value) { return serial::reflected_json(value, scratch, {.max_bytes = scratch.size(), .max_items = 65536, .max_depth = 32}).dump(); };
+ std::ofstream(temp.path() / "run.json") << encode(run);
+ const auto history = temp.path() / "metrics.jsonl";
+ {
+  std::ofstream stream(history);
+  for (std::uint64_t index = 0; index < 67; ++index) {
+   r::TrainingRecord record;
+   record.run_id = run.run_id; record.attempt_id = run.attempt_id; record.sequence = index;
+   record.role = r::TrainingRecordRole::Epoch;
+   record.progress.phase = r::TrainingPhase::EpochComplete; record.progress.session_id = run.run_id;
+   record.progress.model_id = index % 3 + 1;
+   record.progress.scope = index % 3 == 0 ? r::TrainingRecordScope::SynchronizedSession : r::TrainingRecordScope::Model;
+   stream << encode(record) << '\n';
+  }
+ }
+ TrainRunStore store; const auto opened = store.Open(temp.path());
+ std::uint64_t cursor = 0, seen = 0;
+ for (const auto count : {32U, 32U, 3U}) {
+  const auto page = store.Read({opened.generation, cursor, r::kTrainingHistoryPageSize});
+  REQUIRE(page.records.size() == count);
+  for (const auto& record : page.records) {
+   CHECK(record.sequence == seen); CHECK(record.progress.model_id == seen % 3 + 1);
+   CHECK(record.progress.session_id == run.run_id); ++seen;
+  }
+  CHECK(page.more == (seen < 67)); cursor = page.next_cursor;
+ }
+ std::filesystem::copy_file(history, temp.path() / "replacement");
+ std::filesystem::rename(temp.path() / "replacement", history);
+ CHECK_THROWS_WITH(store.Read({opened.generation, cursor, 1}), Catch::Matchers::ContainsSubstring("replaced or truncated"));
+ const auto reopened = store.Open(temp.path());
+ CHECK_THROWS(store.Read({opened.generation, 0, 1}));
+ std::ofstream(history, std::ios::trunc) << "";
+ CHECK_THROWS_WITH(store.Read({reopened.generation, 0, 1}), Catch::Matchers::ContainsSubstring("replaced or truncated"));
 }

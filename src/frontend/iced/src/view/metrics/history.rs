@@ -99,7 +99,7 @@ impl Curve {
 }
 
 use super::catalog::{Metric, Source};
-use crate::generated::{TrainingPhase, TrainingRecord, TrainingRecordRole};
+use crate::generated::{EvaluatedWeights, TrainLaneMode, TrainRequest, TrainingPhase, TrainingRecord, TrainingRecordRole, TrainingRecordScope};
 
 /// The observed source survives clearing plot storage. In particular a cache reset
 /// cannot claim native history recovered or rearm a dismissed active drop episode.
@@ -122,12 +122,6 @@ impl Conditions {
             self.dropped_dirty = true;
         }
     }
-    fn clear_chart(&mut self) {
-        if self.omitted != 0 {
-            self.omitted = 0;
-            self.chart_dirty = true;
-        }
-    }
 }
 
 pub(super) struct History {
@@ -140,7 +134,10 @@ pub(super) struct History {
     segment: u64,
     last_live: Option<f64>,
     last_phase_epoch: Option<(TrainingPhase, i32)>,
-    last_evaluation: Option<(String, i32)>,
+    last_evaluation: Option<(String, i32, TrainingRecordScope, u64, EvaluatedWeights, String, String)>,
+    observed_source: Option<(String, String)>,
+    representative_model: u64,
+    weights: EvaluatedWeights,
     pub(super) page: Option<(u64, u64)>,
     pub(super) generation: u64,
 }
@@ -157,6 +154,9 @@ impl History {
             last_live: None,
             last_phase_epoch: None,
             last_evaluation: None,
+            observed_source: None,
+            representative_model: 0,
+            weights: EvaluatedWeights::Ordinary,
             page: None,
             generation: 0,
         }
@@ -168,21 +168,94 @@ impl History {
         self.generation = generation;
     }
     pub(super) fn clear(&mut self, metrics: &[Metric]) {
-        self.conditions.clear_chart();
+        self.clear_curves(metrics, true);
         self.run.clear();
         self.attempt.clear();
         self.sequence = None;
         self.dropped = 0;
         self.segment = 0;
-        self.last_live = None;
-        self.last_phase_epoch = None;
-        self.last_evaluation = None;
         self.page = None;
         self.generation = 0;
+    }
+    fn clear_curves(&mut self, metrics: &[Metric], scalars: bool) {
+        if scalars {
+            self.last_live = None;
+            self.last_phase_epoch = None;
+        }
+        self.last_evaluation = None;
         // Keep chart/series identities and allocated bucket storage through source changes.
         for (curve, metric) in self.curves.iter_mut().zip(metrics) {
-            curve.clear(&metric.label);
+            if scalars || matches!(metric.source, Source::Evaluation { .. }) { curve.clear(&metric.label); }
         }
+        let omitted = self.curves.iter().fold(0_u64, |total, curve| total.saturating_add(curve.omitted));
+        if self.conditions.omitted != omitted {
+            self.conditions.omitted = omitted;
+            self.conditions.chart_dirty = true;
+        }
+    }
+    pub(super) fn select_source(&mut self, configuration: &TrainRequest) {
+        self.representative_model = if configuration.laneconfiguration.mode == TrainLaneMode::SharedGradients {
+            0
+        } else {
+            configuration.laneconfiguration.models.iter().map(|model| model.modelid).min().unwrap_or(0)
+        };
+        self.weights = if configuration.useema { EvaluatedWeights::Ema } else { EvaluatedWeights::Ordinary };
+    }
+    fn has_observed_source(&self, record: &TrainingRecord) -> bool {
+        self.observed_source.as_ref().is_some_and(|(run, attempt)| run == &record.runid && attempt == &record.attemptid)
+    }
+    pub(super) fn reconcile_live_source(
+        &mut self,
+        current: &TrainingRecord,
+        observation: Option<&TrainingRecord>,
+        configuration: Option<&TrainRequest>,
+        metrics: &[Metric],
+    ) -> u16 {
+        if self.has_observed_source(current) { return 0; }
+        let previous_model = self.representative_model;
+        let previous_weights = self.weights;
+        let artifact = observation
+            .filter(|record| record.runid == current.runid && record.attemptid == current.attemptid)
+            .and_then(|record| record.progress.artifact.as_ref());
+        if let Some(artifact) = artifact {
+            self.representative_model = artifact.modelid;
+            self.weights = artifact.weights;
+            // Source identity survives plot-storage resets, but a different
+            // native run/attempt establishes its own authoritative source.
+            self.observed_source = Some((current.runid.clone(), current.attemptid.clone()));
+        } else if self.run != current.runid || self.attempt != current.attemptid || self.sequence.is_none() {
+            if let Some(configuration) = configuration { self.select_source(configuration); }
+        }
+        let model_changed = previous_model != self.representative_model;
+        let changed = model_changed || previous_weights != self.weights;
+        if changed {
+            // Discard source-dependent points without rewinding native record
+            // accounting or clearing the retained dropped-history condition.
+            self.clear_curves(metrics, model_changed);
+        }
+        if changed { u16::MAX } else { 0 }
+    }
+    fn evaluation_identity(&mut self, record: &TrainingRecord) -> bool {
+        let progress = &record.progress;
+        let Some(artifact) = &progress.artifact else { return false; };
+        if record.role != TrainingRecordRole::Epoch || progress.val.is_none()
+            || artifact.weights != self.weights
+            || !((progress.scope == TrainingRecordScope::Model && progress.modelid == self.representative_model)
+                || (progress.scope == TrainingRecordScope::SynchronizedSession && self.weights == EvaluatedWeights::Ordinary)) {
+            return false;
+        }
+        let identity = (record.attemptid.clone(), progress.epoch, progress.scope, progress.modelid,
+            artifact.weights, artifact.path.clone(), artifact.sha256.clone());
+        if self.last_evaluation.as_ref() == Some(&identity) { return false; }
+        self.last_evaluation = Some(identity);
+        true
+    }
+    // A retained scheduled record may precede current progress. Replay only its
+    // evaluation; it does not advance sequence/drop accounting or scalar curves.
+    pub(super) fn ingest_observation(&mut self, record: &TrainingRecord, metrics: &[Metric]) -> u16 {
+        if self.run != record.runid || self.attempt != record.attemptid { return 0; }
+        let evaluation = self.evaluation_identity(record);
+        self.plot(record, true, evaluation, false, metrics)
     }
     pub(super) fn ingest(
         &mut self,
@@ -226,6 +299,26 @@ impl History {
             self.conditions.dropped_dirty = true;
         }
         let progress = &record.progress;
+        if !live || !self.has_observed_source(record) {
+            if let Some(configuration) = &record.attemptconfiguration {
+                let previous_model = self.representative_model;
+                let previous_weights = self.weights;
+                self.select_source(configuration);
+                if live && (previous_model != self.representative_model || previous_weights != self.weights) {
+                    self.clear_curves(metrics, previous_model != self.representative_model);
+                    changed = u16::MAX;
+                }
+            }
+        }
+        let evaluation = self.evaluation_identity(record);
+        let scalar_model = if progress.scope == TrainingRecordScope::SynchronizedSession && self.weights == EvaluatedWeights::Ordinary {
+            progress.artifact.as_ref().map(|artifact| artifact.modelid)
+        } else if progress.scope == TrainingRecordScope::Model {
+            Some(progress.modelid)
+        } else { None };
+        let scalars = scalar_model == Some(self.representative_model)
+            && matches!(record.role, TrainingRecordRole::Live | TrainingRecordRole::Epoch)
+            && matches!(progress.phase, TrainingPhase::Train | TrainingPhase::EpochComplete);
         let phase_epoch = (progress.phase, progress.epoch);
         let admit = !live
             || record.role != TrainingRecordRole::Live
@@ -234,25 +327,21 @@ impl History {
             || !self.last_live.is_some_and(|last| {
                 progress.elapsedseconds >= last && progress.elapsedseconds - last < 1.0
             });
-        self.last_phase_epoch = Some(phase_epoch);
-        if admit && record.role == TrainingRecordRole::Live {
-            self.last_live = Some(progress.elapsedseconds);
+        if scalars {
+            self.last_phase_epoch = Some(phase_epoch);
+            if admit && record.role == TrainingRecordRole::Live { self.last_live = Some(progress.elapsedseconds); }
         }
-        // Only completed epoch observations contribute validation. Live and terminal
-        // records can carry copied summaries, and neither is another evaluation.
-        let evaluation = record.role == TrainingRecordRole::Epoch
-            && self
-                .last_evaluation
-                .as_ref()
-                .is_none_or(|(attempt, epoch)| {
-                    attempt != &record.attemptid || *epoch != progress.epoch
-                });
-        if evaluation {
-            self.last_evaluation = Some((record.attemptid.clone(), progress.epoch));
-        }
+        changed | self.plot(record, admit, evaluation, scalars, metrics)
+    }
+    fn plot(&mut self, record: &TrainingRecord, admit: bool, evaluation: bool, scalars: bool, metrics: &[Metric]) -> u16 {
+        let mut changed = 0;
+        let progress = &record.progress;
         for (metric, curve) in metrics.iter().zip(&mut self.curves) {
             let (value, is_evaluation) = match metric.source {
-                Source::Scalar(field) => (progress.scalars.value(field), false),
+                Source::Scalar(field) => {
+                    if !scalars { continue; }
+                    (progress.scalars.value(field), false)
+                },
                 Source::Evaluation { mask, field } => {
                     if !evaluation {
                         continue;
@@ -326,6 +415,90 @@ impl History {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn bookkeeping_and_other_models_never_change_the_representative_curves() {
+        let metrics = super::super::catalog::catalog();
+        let mut component = History::new(&metrics);
+        component.representative_model = 1;
+        component.weights = EvaluatedWeights::Ema;
+        let mut record = super::super::tests::record();
+        record.sequence = 0;
+        record.progress.modelid = 1;
+        component.ingest(&record, false, &metrics);
+        let segment = component.curves[0].segment;
+        record.sequence += 1;
+        record.progress.modelid = 2;
+        record.progress.scalars.total = Some(99.0);
+        component.ingest(&record, false, &metrics);
+        record.sequence += 1;
+        record.role = TrainingRecordRole::Epoch;
+        record.progress.scope = TrainingRecordScope::SynchronizedSession;
+        record.progress.modelid = 0;
+        record.progress.val = Some(super::super::tests::evaluation());
+        component.ingest(&record, false, &metrics);
+        assert_eq!(component.curves[0].buckets.len(), 1);
+        let evaluation_curve = metrics.iter().position(|m| matches!(m.source, Source::Evaluation { .. })).unwrap();
+        assert!(component.curves[evaluation_curve].buckets.is_empty());
+        record.sequence += 1;
+        record.progress.scope = TrainingRecordScope::Model;
+        record.progress.modelid = 1;
+        record.progress.artifact.as_mut().unwrap().weights = EvaluatedWeights::Ema;
+        record.progress.artifact.as_mut().unwrap().modelid = 1;
+        record.progress.scalars.total = Some(2.0);
+        component.ingest(&record, false, &metrics);
+        let observation = record.clone();
+        record.sequence += 1;
+        record.progress.scope = TrainingRecordScope::Session;
+        record.progress.artifact = None;
+        record.progress.val = None;
+        record.progress.scalars.total = None;
+        component.ingest(&record, false, &metrics);
+        assert!(!component.curves[0].missing);
+        assert_eq!(component.curves[0].segment, segment);
+        assert_eq!(component.curves[0].buckets.len(), 2);
+        assert_eq!(component.curves[evaluation_curve].buckets.len(), 1);
+        let sequence = component.sequence;
+        component.ingest_observation(&observation, &metrics);
+        assert_eq!(component.sequence, sequence);
+        assert_eq!(component.curves[evaluation_curve].buckets.len(), 1);
+        let mut coalesced = History::new(&metrics);
+        coalesced.representative_model = 1;
+        coalesced.weights = EvaluatedWeights::Ema;
+        coalesced.ingest(&record, true, &metrics);
+        coalesced.ingest_observation(&observation, &metrics);
+        coalesced.ingest_observation(&observation, &metrics);
+        assert_eq!(coalesced.sequence, sequence);
+        assert_eq!(coalesced.curves[evaluation_curve].buckets.len(), 1);
+        assert!(coalesced.curves[0].buckets.is_empty());
+    }
+    #[test]
+    fn synchronized_ordinary_observation_and_session_epoch_keep_one_model_continuous() {
+        let metrics = super::super::catalog::catalog();
+        let mut component = History::new(&metrics);
+        let mut record = super::super::tests::record();
+        record.sequence = 0;
+        component.ingest(&record, false, &metrics);
+        let segment = component.curves[0].segment;
+        record.sequence = 1;
+        record.role = TrainingRecordRole::Epoch;
+        record.progress.scope = TrainingRecordScope::SynchronizedSession;
+        record.progress.val = Some(super::super::tests::evaluation());
+        component.ingest(&record, false, &metrics);
+        record.sequence = 2;
+        record.progress.scope = TrainingRecordScope::Session;
+        record.progress.artifact = None;
+        record.progress.val = None;
+        record.progress.scalars.total = None;
+        component.ingest(&record, false, &metrics);
+        record.sequence = 3;
+        record.role = TrainingRecordRole::Live;
+        record.progress.scope = TrainingRecordScope::Model;
+        record.progress.scalars.total = Some(2.0);
+        component.ingest(&record, false, &metrics);
+        assert_eq!(component.curves[0].buckets.len(), 3);
+        assert_eq!(component.curves[0].segment, segment);
+        assert!(!component.curves[0].missing);
+    }
     #[test]
     fn observed_sequences_and_cumulative_drops_survive_display_coalescing() {
         let metrics = super::super::catalog::catalog();

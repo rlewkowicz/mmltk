@@ -21,18 +21,6 @@ void validate_resume_continuation_manifest(const ResumeContinuationManifest& man
  }
 }
 namespace detail {
-std::optional<TrainingContinuation> admit_training_configuration(NativeRfDetrConfig& config, torch::serialize::InputArchive* archive, const TrainRequest& options) {
- std::optional<TrainingContinuation> continuation;
- if (!options.resume_path.empty()) {
-  if (!archive) throw std::runtime_error("--resume requires a native RF-DETR .pt checkpoint: " + options.resume_path.string());
-  continuation = read_training_continuation(*archive);
-  if (!continuation) throw std::runtime_error("--resume requires a full training checkpoint");
-  require_active_training_continuation(*continuation, options);
- }
- if (!continuation) apply_stock_training_coefficients(config);
- config.training_supervision = options.training_supervision;
- return continuation;
-}
 namespace serialization = mmltk::frameworks::serialization;
 namespace {
 template <class Values, class Visitor>
@@ -44,31 +32,21 @@ void visit_continuation_values(Values& values, Visitor&& visitor) {
 // Convert only the genuinely different archive scalar representation. Comparing
 // doubles before conversion back to float avoids accepting rounded forged facts.
 template <class T>
-auto archive_scalar(const T& value) {
- if constexpr (std::is_floating_point_v<T>)
-  return static_cast<double>(value);
- else if constexpr (std::is_integral_v<T> && !std::is_same_v<T, bool>)
-  return static_cast<int64_t>(value);
- else
-  return value;
-}
+using ArchiveScalar = std::conditional_t<std::is_floating_point_v<T>, double, std::conditional_t<std::is_integral_v<T> && !std::is_same_v<T, bool>, int64_t, T>>;
 template <class T>
 void write_scalar(torch::serialize::OutputArchive& archive, const char* key, const T& value) {
- const auto scalar = archive_scalar(value);
- using Scalar = std::remove_cvref_t<decltype(scalar)>;
- if constexpr (std::is_same_v<Scalar, std::string>)
-  mmltk::backend::ml::serialization::write_string(archive, key, scalar);
- else if constexpr (std::is_same_v<Scalar, bool>)
-  mmltk::backend::ml::serialization::write_bool(archive, key, scalar);
- else if constexpr (std::is_same_v<Scalar, int64_t>)
-  mmltk::backend::ml::serialization::write_int(archive, key, scalar);
- else if constexpr (std::is_same_v<Scalar, double>)
-  mmltk::backend::ml::serialization::write_double(archive, key, scalar);
+ if constexpr (std::is_same_v<T, std::string>)
+  mmltk::backend::ml::serialization::write_string(archive, key, value);
+ else if constexpr (std::is_same_v<T, bool>)
+  mmltk::backend::ml::serialization::write_bool(archive, key, value);
+ else if constexpr (std::is_integral_v<T>)
+  mmltk::backend::ml::serialization::write_int(archive, key, static_cast<int64_t>(value));
+ else if constexpr (std::is_floating_point_v<T>)
+  mmltk::backend::ml::serialization::write_double(archive, key, static_cast<double>(value));
  else {
   constexpr auto capacity = serialization::reflected_maximum_cbor_bytes<T>();
   serialization::wire::ByteBuffer bytes;
-  const auto encoded = serialization::encode(value, bytes, {.max_bytes = capacity, .max_items = std::numeric_limits<std::uint64_t>::max(), .max_depth = 32});
-  if (!encoded) throw std::runtime_error("invalid continuation structure");
+  if (!serialization::encode(value, bytes, {.max_bytes = capacity, .max_items = std::numeric_limits<std::uint64_t>::max(), .max_depth = 32})) throw std::runtime_error("invalid continuation structure");
   auto tensor = torch::empty({static_cast<int64_t>(bytes.size())}, torch::kUInt8);
   std::memcpy(tensor.data_ptr(), bytes.data(), bytes.size());
   archive.write(key, tensor);
@@ -76,7 +54,7 @@ void write_scalar(torch::serialize::OutputArchive& archive, const char* key, con
 }
 template <class T>
 auto read_scalar(torch::serialize::InputArchive& archive, const char* key) {
- using Scalar = decltype(archive_scalar(T{}));
+ using Scalar = ArchiveScalar<T>;
  if constexpr (std::is_arithmetic_v<Scalar> || std::same_as<Scalar, std::string>) {
   const auto value = mmltk::backend::ml::serialization::read_optional_value<Scalar>(archive, key);
   if (!value) throw std::runtime_error(std::string("full training checkpoint is missing ") + key);
@@ -88,7 +66,7 @@ auto read_scalar(torch::serialize::InputArchive& archive, const char* key) {
    throw std::runtime_error("invalid continuation structure");
   auto value = serialization::decode<T>({std::span(reinterpret_cast<const std::byte*>(tensor.const_data_ptr()), static_cast<std::size_t>(tensor.numel())), {}}, {.max_bytes = capacity, .max_items = std::numeric_limits<std::uint64_t>::max(), .max_depth = 32});
   if (!value) throw std::runtime_error("invalid continuation values");
-  return *value;
+  return std::move(*value);
  }
 }
 void validate_values(const TrainingContinuationValues& values, const TrainRequest& request, bool present_ema) {
@@ -96,7 +74,6 @@ void validate_values(const TrainingContinuationValues& values, const TrainReques
  if (values.epoch < 0 || values.epoch >= std::numeric_limits<int>::max()) throw std::runtime_error("invalid checkpoint epoch");
  if (values.ema_completed_updates < 0 || values.ema_completed_updates == std::numeric_limits<int64_t>::max() || (!requested_ema && values.ema_completed_updates != 0))
   throw std::runtime_error("invalid checkpoint EMA completed update count");
- if (std::isnan(values.best_regular_metric) || std::isnan(values.best_ema_metric)) throw std::runtime_error("checkpoint best metric is invalid");
  if (values.training_attempt_id.empty() || values.training_attempt_id.size() > 64) throw std::runtime_error("invalid checkpoint attempt identity");
  if (values.training_original_descriptor.size() > mmltk::frameworks::reflection::kMaximumPathBytes) throw std::runtime_error("invalid original checkpoint descriptor provenance");
  validate_resume_continuation_manifest({requested_ema, present_ema, values.grad_scaler_scale, values.grad_scaler_growth_tracker});
@@ -105,7 +82,7 @@ void validate_values(const TrainingContinuationValues& values, const TrainReques
      values.execution.effective_batch_per_model != expected.effective_batch_per_model || values.execution.aggregate_round_images != expected.aggregate_round_images ||
      values.execution.configured_capacity != expected.configured_capacity) throw std::runtime_error("checkpoint execution products differ from saved request");
  const auto donor_streams = request.lane_configuration.mode == TrainLaneMode::SharedGradients ? request.lanes : 1;
- if (!values.data.plan_hash || values.data.shards.size() != expected.logical_models || values.data.donors.size() != checked_training_product(request.batch_size, donor_streams) ||
+ if (!values.data.plan_hash || values.data.donors.size() != checked_training_product(request.batch_size, donor_streams) ||
      values.data.epoch < static_cast<std::uint64_t>(values.epoch) || values.data.epoch > static_cast<std::uint64_t>(values.epoch) + 1 ||
      (values.data.epoch > static_cast<std::uint64_t>(values.epoch) && values.data.next_microbatch != 0) ||
      values.data.next_microbatch % expected.microbatches_per_attempt) throw std::runtime_error("invalid checkpoint logical data continuation");

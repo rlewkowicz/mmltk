@@ -53,7 +53,7 @@ void test_telemetry_pressure_preserves_a_terminal_boundary() {
  REQUIRE(previous.has_value());
  REQUIRE(previous->role == r::TrainingRecordRole::Terminal);
  REQUIRE(previous->sequence == 4096);
- REQUIRE(previous->format_version == 2);
+ REQUIRE(previous->format_version == 3);
  REQUIRE(previous->progress.completed_images == 4096U * 7U);
  REQUIRE(previous->progress.total_images == previous->progress.completed_images);
  REQUIRE(previous->dropped_before == writer.persistence().dropped_records);
@@ -66,9 +66,8 @@ namespace {
 // sleeps, scheduler assumptions or production-only persistence hooks are used.
 class HeldHistory final {
 public:
- explicit HeldHistory(const std::filesystem::path& directory) : path_(directory / "metrics.jsonl") {
+ explicit HeldHistory(const std::filesystem::path& directory, r::TrainingRun run = {}) : path_(directory / "metrics.jsonl") {
   if (::mkfifo(path_.c_str(), 0600) != 0) throw std::runtime_error("create telemetry history FIFO");
-  r::TrainingRun run;
   run.configuration.output_dir = directory;
   writer = std::make_unique<r::TrainingTelemetryWriter>(std::move(run));
  }
@@ -249,10 +248,12 @@ TEST_CASE("telemetry retains complete history JSON through progress epoch and te
  progress[0].total_images = 4096U;
  progress[1] = progress[0];
  progress[1].phase = r::TrainingPhase::EpochComplete;
+ progress[1].scope = r::TrainingRecordScope::Session;
  progress[1].completed_images = 4096U;
  progress[1].scalars.total = 0.125;
  progress[1].epoch_global_loss = 0.25;
  progress[1].checkpoint_path = temp.path() / "best.pt";
+ progress[1].full_checkpoint_path = temp.path() / "session.json";
  progress[2] = progress[1];
  progress[2].phase = r::TrainingPhase::Completed;
  held.writer->Submit(progress[0], r::TrainingRecordRole::Boundary);
@@ -293,37 +294,103 @@ TEST_CASE("telemetry retains complete history JSON through progress epoch and te
  }
  std::string excess;
  CHECK_FALSE(static_cast<bool>(std::getline(history, excess)));
- const auto projection = [&](std::size_t index, const char* phase) {
-  auto value = serial::reflected_json(progress[index], scratch, limits);
-  value["record"] = records[index];
-  value["phase"] = phase;
-  value["eval_lanes"] = 1;
-  value["effective_batch_per_rank"] = 1U;
-  value["effective_batch_global"] = 1U;
-  value["training_supervision"] = serial::reflected_json(run.configuration.training_supervision, scratch, limits);
-  value["persistence_degraded"] = false;
-  value["dropped_records"] = 0U;
-  return value;
- };
- auto epoch = projection(1U, "epoch_complete");
- epoch["train_loss"] = 0.25;
- epoch["evaluated_weights"] = "ordinary";
- CHECK(read_json("log.txt") == epoch);
- auto terminal = projection(2U, "completed");
- CHECK(read_json("progress.json") == terminal);
- terminal["preset_name"] = run.configuration.preset_name;
- terminal["output_dir"] = temp.path().string();
- terminal["checkpoint"] = (temp.path() / "checkpoint.pt").string();
- terminal["best_checkpoint"] = progress[2].checkpoint_path.string();
- terminal["best_is_ema"] = false;
- terminal["best_is_fallback"] = false;
- terminal["best_regular_metric"] = nullptr;
- terminal["best_ema_metric"] = nullptr;
- terminal["last_epoch"] = 0;
- terminal["history_size"] = 1U;
- terminal["dataset_max_instances"] = {{"train", 0U}, {"val", 0U}, {"test", nullptr}, {"largest", 0U}};
- terminal["query_resolution"] = {{"source", ""}, {"resolved", 0U}, {"required", 0U}, {"automatic_query_cap", 0U}, {"automatic", false}, {"requested_override", false}};
- terminal["gpu_augmentation"] = serial::reflected_json(run.configuration.gpu_augmentation, scratch, limits);
- terminal["test"] = nullptr;
- CHECK(read_json("results.json") == terminal);
+ CHECK(read_json("log.txt") == records[1]);
+ r::TrainingProgressDocument terminal;
+ terminal.record = serial::decode_reflected_json<r::TrainingRecord>(records[2].dump(), limits);
+ terminal.final = r::TrainingFinalFacts{.history_size = 1U};
+ const auto expected = serial::reflected_json(terminal, scratch, limits);
+ CHECK(read_json("progress.json") == expected);
+ CHECK(read_json("results.json") == expected);
+}
+
+TEST_CASE("telemetry reserves the complete periodic EMA epoch burst", "[model][rfdetr][training][telemetry]") {
+ mmltk::testsupport::ScopedTempDir temp{"mmltk-telemetry-epoch-burst"};
+ for (const bool overflow : {false, true}) {
+  const auto directory = temp.path() / (overflow ? "overflow" : "complete");
+  std::filesystem::create_directory(directory);
+  HeldHistory held(directory);
+  r::TrainingMetricProgress progress;
+  progress.phase = r::TrainingPhase::EpochComplete;
+  progress.scope = r::TrainingRecordScope::SynchronizedSession;
+  progress.artifact.emplace();
+  progress.artifact->weights = r::EvaluatedWeights::Ordinary;
+  held.writer->Submit(progress, r::TrainingRecordRole::Epoch);
+  for (std::uint64_t model = 1; model <= r::kMaximumTrainingModels; ++model) {
+   progress.scope = r::TrainingRecordScope::Model;
+   progress.model_id = model;
+   progress.artifact->model_id = model;
+   progress.artifact->weights = r::EvaluatedWeights::Ema;
+   held.writer->Submit(progress, r::TrainingRecordRole::Epoch);
+  }
+  progress = {};
+  progress.phase = r::TrainingPhase::EpochComplete;
+  progress.scope = r::TrainingRecordScope::Session;
+  held.writer->Submit(progress, r::TrainingRecordRole::Epoch);
+  if (overflow) held.writer->Submit(progress, r::TrainingRecordRole::Epoch);
+  progress.phase = r::TrainingPhase::Completed;
+  held.writer->Finish(progress, {});
+  held.Drain();
+  std::istringstream history(held.history);
+  std::string line;
+  std::uint64_t count = 0;
+  while (std::getline(history, line)) {
+   const auto record = mmltk::frameworks::serialization::decode_reflected_json<r::TrainingRecord>(line, {.max_bytes = r::kTrainingRecordBytes, .max_items = 8192, .max_depth = 32});
+   CHECK(record.sequence == count + (overflow && count == 18 ? 1 : 0));
+   if (count == 0) CHECK(record.progress.scope == r::TrainingRecordScope::SynchronizedSession);
+   else if (count <= 16) {
+    CHECK(record.progress.model_id == count);
+    CHECK(record.evaluated_weights == r::EvaluatedWeights::Ema);
+   } else CHECK(record.progress.scope == r::TrainingRecordScope::Session);
+   CHECK(record.role == (count == 18 ? r::TrainingRecordRole::Terminal : r::TrainingRecordRole::Epoch));
+   ++count;
+  }
+  CHECK(count == 19);
+  CHECK(held.writer->persistence().degraded == overflow);
+  CHECK(held.writer->persistence().dropped_records == (overflow ? 1 : 0));
+ }
+}
+
+TEST_CASE("live projection retains the scheduled representative beside current progress", "[model][rfdetr][training][telemetry]") {
+ for (const bool ema : {false, true}) {
+  mmltk::testsupport::ScopedTempDir temp{"mmltk-telemetry-observation"};
+  r::TrainingRun run;
+  run.configuration.use_ema = ema;
+  run.evaluated_weights = ema ? r::EvaluatedWeights::Ema : r::EvaluatedWeights::Ordinary;
+  run.configuration.lane_configuration.mode = r::TrainLaneMode::PeriodicAveraging;
+  r::resize_training_models(run.configuration.lane_configuration, 2, run.configuration.recipe, 42);
+  HeldHistory held(temp.path(), run);
+  r::TrainingMetricProgress observed;
+  observed.phase = r::TrainingPhase::EpochComplete;
+  observed.scope = r::TrainingRecordScope::SynchronizedSession;
+  observed.artifact.emplace(); observed.artifact->path = "ordinary.pt";
+  observed.artifact->model_id = 1;
+  observed.val.emplace(); observed.val->bbox.ap = .2;
+  held.writer->Submit(observed, r::TrainingRecordRole::Epoch);
+  if (ema) {
+   observed.scope = r::TrainingRecordScope::Model; observed.model_id = 1;
+   observed.artifact->weights = r::EvaluatedWeights::Ema; observed.artifact->path = "ema-1.pt";
+   observed.val->bbox.ap = .4;
+   held.writer->Submit(observed, r::TrainingRecordRole::Epoch);
+   auto other = observed; other.model_id = 2; other.artifact->model_id = 2;
+   other.artifact->path = "ema-2.pt"; other.val->bbox.ap = .8;
+   held.writer->Submit(other, r::TrainingRecordRole::Epoch);
+  }
+  r::TrainingMetricProgress current;
+  current.phase = r::TrainingPhase::EpochComplete; current.scope = r::TrainingRecordScope::Session;
+  current.full_checkpoint_path = "session.json";
+  held.writer->Submit(current, r::TrainingRecordRole::Epoch);
+  current.phase = r::TrainingPhase::Train; current.scope = r::TrainingRecordScope::Model;
+  current.epoch = 1; current.model_id = 2; current.completed_images = 3; current.total_images = 9;
+  held.writer->Submit(current, r::TrainingRecordRole::Live);
+  held.Drain();
+  std::ifstream input(temp.path() / "progress.json");
+  const auto document = mmltk::frameworks::serialization::decode_reflected_json<r::TrainingProgressDocument>(nlohmann::json::parse(input).dump(), {.max_bytes = r::kTrainingProgressDocumentBytes, .max_items = 24576, .max_depth = 32});
+  CHECK(document.record.progress == current);
+  REQUIRE(document.representative_observation);
+  CHECK(document.representative_observation->progress == observed);
+  CHECK(document.representative_observation->sequence == (ema ? 1 : 0));
+  CHECK(document.representative_observation->role == r::TrainingRecordRole::Epoch);
+  CHECK(document.representative_observation->evaluated_weights == run.evaluated_weights);
+  CHECK_FALSE(held.writer->persistence().degraded);
+ }
 }

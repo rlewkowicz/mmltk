@@ -7,16 +7,16 @@
 #include "evaluation_metrics.h"
 #include "class_layout.h"
 #include "workflow_requests.h"
+#include "training_artifacts.h"
 namespace mmltk::backend::models::rfdetr {
-inline constexpr std::uint32_t kTrainingRunFormat = 2;
+inline constexpr std::uint32_t kTrainingRunFormat = 3;
 inline constexpr std::size_t kTrainingHistoryPageSize = 32;
 inline constexpr std::size_t kTrainingRecordBytes = 512U * 1024U;
+inline constexpr std::size_t kTrainingProgressDocumentBytes = 3U * kTrainingRecordBytes;
 inline constexpr std::size_t kTrainingManifestBytes = 4U * 1024U * 1024U;
 inline constexpr std::string_view kTrainingPersistenceFailureLine = "\nMMLTK_TRAIN_PERSISTENCE_FAILED_V1\n";
-enum class EvaluatedWeights : std::uint8_t { Ordinary, Ema };
-enum class TrainingPhase : std::uint8_t { Starting, Train, Validate, EpochComplete, Completed, Error };
+enum class TrainingPhase : std::uint8_t { Starting, Train, Validate, EpochComplete, Completed, Error, Cancelled, Merge };
 enum class TrainingRecordRole : std::uint8_t { Live, Boundary, Epoch, Terminal };
-MMLTK_REFLECT_ENUM(EvaluatedWeights)
 MMLTK_REFLECT_ENUM(TrainingPhase)
 MMLTK_REFLECT_ENUM(TrainingRecordRole)
 // Hungarian components are raw main-output losses; Match-Free components are
@@ -48,6 +48,14 @@ MMLTK_REFLECT_FIELDS(TrainingScalars)
 struct TrainingMetricProgress final {
  bool operator==(const TrainingMetricProgress&) const = default;
  TrainingPhase phase = TrainingPhase::Starting;
+ TrainingRecordScope scope = TrainingRecordScope::Model;
+ [[= mmltk::frameworks::reflection::MaxBytes{64}]] std::string session_id;
+ std::uint64_t model_id = 0;
+ std::uint64_t round = 0;
+ std::uint64_t merge = 0;
+ std::optional<TrainingMergeBoundary> merge_boundary;
+ std::optional<TrainingArtifact> artifact;
+ std::optional<TrainingFailure> failure;
  int epoch = 0;
  int total_epochs = 1;
  std::int64_t completed_batches = 0;
@@ -105,9 +113,8 @@ struct TrainingDatasetLimits final {
 };
 MMLTK_REFLECT_FIELDS(TrainingDatasetLimits)
 struct TrainingExecutionFacts final {
- int eval_lanes = 1;
- std::size_t effective_batch_per_rank = 1;
- std::size_t effective_batch_global = 1;
+ ExecutionFacts training;
+ ExecutionFacts validation;
  TrainingDatasetLimits dataset_limits;
 };
 MMLTK_REFLECT_FIELDS(TrainingExecutionFacts)
@@ -144,6 +151,7 @@ struct TrainingCheckpoint final {
  bool operator==(const TrainingCheckpoint&) const = default;
  [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]] std::filesystem::path path;
  [[= mmltk::frameworks::reflection::MaxBytes{64}]] std::string attempt_id;
+ [[= mmltk::frameworks::reflection::MaxBytes{64}]] std::string session_id;
  [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]] std::string original_weights;
  [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]] std::filesystem::path original_class_descriptor;
  bool resumable = false;
@@ -191,4 +199,20 @@ struct TrainingHistoryPage final {
  [[= mmltk::frameworks::reflection::MaxItems{kTrainingHistoryPageSize}]] std::vector<TrainingRecord> records;
 };
 MMLTK_REFLECT_FIELDS(TrainingHistoryPage)
+struct TrainingFinalFacts final {
+ std::uint64_t history_size = 0;
+ std::optional<TrainingSelection> selected;
+};
+MMLTK_REFLECT_FIELDS(TrainingFinalFacts)
+// One bounded canonical projection is written and decoded by the producer and
+// local/remote process readers. No fixed checkpoint filenames are inferred.
+struct TrainingProgressDocument final {
+ std::uint32_t format_version = kTrainingRunFormat;
+ TrainingRecord record;
+ // Original scheduled record, retained independently of current progress.
+ std::optional<TrainingRecord> representative_observation;
+ TrainingPersistence persistence;
+ std::optional<TrainingFinalFacts> final;
+};
+MMLTK_REFLECT_FIELDS(TrainingProgressDocument)
 }  // namespace mmltk::backend::models::rfdetr

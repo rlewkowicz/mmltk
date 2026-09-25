@@ -5,6 +5,7 @@
 #include "src/common/io/file_digest.h"
 #include "src/frameworks/gpu/terminal_cuda_retirement_owner.h"
 #include "src/frameworks/serialization/reflected_cbor.h"
+#include "src/backend/models/rfdetr/contract/training_artifacts.h"
 #include <ATen/cuda/CUDAContext.h>
 #include <ATen/cuda/CUDAEvent.h>
 #include <torch/csrc/distributed/c10d/Backend.hpp>
@@ -75,6 +76,18 @@ DistributedContext make_distributed_context(const TrainRequest& request) {
 void distributed_abort(const DistributedContext& group) noexcept {
  if (group.transport_ && !group.transport_->aborted.exchange(true))
   try { group.transport_->backend->abort(); } catch (...) {}
+}
+TrainingFailure claim_training_failure(const DistributedContext& group, const TrainingFailure& cause) {
+ if (!group.enabled || !group.transport_->store) return cause;
+ namespace serial = mmltk::frameworks::serialization;
+ serial::wire::ByteBuffer encoded;
+ constexpr serial::wire::Limits limits{.max_bytes = 68U * 1024U, .max_items = 32, .max_depth = 8};
+ if (!serial::encode(cause, encoded, limits)) throw std::runtime_error("training failure exceeds canonical bounds");
+ const std::vector<std::uint8_t> bytes(reinterpret_cast<const std::uint8_t*>(encoded.data()), reinterpret_cast<const std::uint8_t*>(encoded.data()) + encoded.size());
+ const auto retained = group.transport_->store->compareSet("training/session-first-cause", {}, bytes);
+ const auto decoded = serial::decode<TrainingFailure>({std::span(reinterpret_cast<const std::byte*>(retained.data()), retained.size()), {}}, limits);
+ if (!decoded) throw std::runtime_error("invalid distributed training first cause");
+ return *decoded;
 }
 void distributed_shutdown(const DistributedContext& group) {
  if (group.transport_ && !group.transport_->shutdown.exchange(true)) group.transport_->backend->shutdown();

@@ -88,7 +88,7 @@ class LogFormatTests(unittest.TestCase):
         for role, phase, failed in (("Terminal", "Error", True),
                                     ("Terminal", "Completed", False),
                                     ("Live", "Train", False), ("Live", "Validate", False)):
-            row = record({"format_version": 2, "role": role, "run_id": "run-a",
+            row = record({"format_version": 3, "role": role, "run_id": "run-a",
                           "attempt_id": "attempt-b", "progress": {"phase": phase,
                           "class_error": 42.0}}, "metrics.jsonl", 3)
             self.assertEqual(bool(row.get("@error")), failed)
@@ -100,10 +100,25 @@ class LogFormatTests(unittest.TestCase):
             self.assertEqual(row.get("@line"), 3)
         self.assertFalse(record({"role": "Terminal", "progress": {"phase": "Error"}}).get("@error"))
 
+    def test_training_session_model_and_first_cause_survive_bounded_triage(self):
+        row = record({"format_version": 3, "role": "Terminal", "run_id": "run-a",
+                      "attempt_id": "attempt-b", "progress": {
+                          "phase": "Error", "session_id": "session-a", "model_id": 7,
+                          "failure": {"session_id": "session-a", "model_id": 7,
+                                      "first_cause": 19, "detail": "CUDA allocation failed"}}})
+        for candidate in (row, logs.triage_snapshot(row)):
+            self.assertEqual(candidate.get("@session"), "session-a")
+            self.assertEqual(candidate.get("@model"), 7)
+            self.assertEqual(candidate.get("@first_cause"), 19)
+            self.assertTrue(logs.QueryParser('@session=session-a @model=7 @first_cause=19 @error=true').parse().matches(candidate))
+            names = {identity.names for identity in logs.strong_identities(candidate)}
+            self.assertIn(("progress.session_id", "progress.model_id"), names)
+            self.assertIn(("progress.session_id", "progress.failure.first_cause"), names)
+
     def test_training_record_near_misses_do_not_project_lifecycle(self):
-        base = {"format_version": 2, "role": "Terminal", "run_id": "run-a",
+        base = {"format_version": 3, "role": "Terminal", "run_id": "run-a",
                 "attempt_id": "attempt-b", "progress": {"phase": "Error"}}
-        for mutation in ({"format_version": 1}, {"format_version": True}, {"role": "terminal"},
+        for mutation in ({"format_version": 1}, {"format_version": 2}, {"format_version": True}, {"role": "terminal"},
                          {"run_id": ""}, {"attempt_id": " "}, {"attempt_id": 1},
                          {"progress": {"phase": "Unknown"}}, {"progress": "Error"}):
             with self.subTest(mutation=mutation):
@@ -118,7 +133,7 @@ class LogFormatTests(unittest.TestCase):
         for role, phase in (("Boundary", "Starting"), ("Terminal", "Completed"), ("Live", "Validate")):
             row = record({"attempt_configuration": {str(i): "x" * 4096 for i in range(200)},
                           "progress": {"metrics": list(range(200)), "phase": phase},
-                          "format_version": 2, "role": role, "sequence": 7,
+                          "format_version": 3, "role": role, "sequence": 7,
                           "run_id": "run-a", "attempt_id": "attempt-b"}, "metrics.jsonl", 1)
             retained = logs.triage_snapshot(row)
             self.assertEqual(retained.get("@event"), f"training.{role.lower()}.{phase.lower()}")
@@ -2832,9 +2847,9 @@ class FileQueryTests(unittest.TestCase):
 
     def test_training_failure_is_an_explicit_triage_anchor(self):
         self.write("metrics.jsonl", [
-            {"format_version": 2, "role": "Live", "run_id": "run-a", "attempt_id": "attempt-b",
+            {"format_version": 3, "role": "Live", "run_id": "run-a", "attempt_id": "attempt-b",
              "progress": {"phase": "Train", "class_error": 99.0}},
-            {"format_version": 2, "role": "Terminal", "run_id": "run-a", "attempt_id": "attempt-b",
+            {"format_version": 3, "role": "Terminal", "run_id": "run-a", "attempt_id": "attempt-b",
              "progress": {"phase": "Error"}},
         ])
         status, rows, diagnostics = self.exported("metrics.jsonl", "--errors")
@@ -2854,7 +2869,7 @@ class FileQueryTests(unittest.TestCase):
         self.assertNotIn("<object object", output)
 
     def test_training_observations_do_not_invent_generic_begin_end_pairs(self):
-        identity = {"format_version": 2, "run_id": "run-a", "attempt_id": "attempt-b"}
+        identity = {"format_version": 3, "run_id": "run-a", "attempt_id": "attempt-b"}
         self.write("metrics.jsonl", [
             {**identity, "role": "Boundary", "sequence": 1,
              "attempt_configuration": {str(i): i for i in range(200)},

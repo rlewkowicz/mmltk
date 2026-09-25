@@ -23,8 +23,6 @@ namespace detail {
 // Member names are the current native archive keys, including provenance.
 struct TrainingContinuationValues {
  int64_t epoch = 0;
- double best_regular_metric = 0.0;
- double best_ema_metric = 0.0;
  double grad_scaler_scale = 1.0;
  int64_t grad_scaler_growth_tracker = 0;
  int64_t ema_completed_updates = 0;
@@ -47,8 +45,6 @@ void write_training_continuation(torch::serialize::OutputArchive&, const TrainRe
 // Empty only for weights-only archives. Requires complete, consistent scalar
 // continuation; the caller admits the optimizer and ordered EMA tensor state.
 [[nodiscard]] std::optional<TrainingContinuation> read_training_continuation(torch::serialize::InputArchive&);
-// Admits the active run before changing its resolved model configuration.
-[[nodiscard]] std::optional<TrainingContinuation> admit_training_configuration(NativeRfDetrConfig&, torch::serialize::InputArchive*, const TrainRequest&);
 void require_active_training_continuation(const TrainingContinuation&, const TrainRequest&);
 }  // namespace detail
 }  // namespace mmltk::backend::models::rfdetr

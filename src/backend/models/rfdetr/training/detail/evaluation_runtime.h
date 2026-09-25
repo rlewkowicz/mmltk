@@ -286,7 +286,7 @@ struct EvalPassResult {
  EvalSummary summary;
  PhaseTiming timing;
 };
-enum class EvaluationPurpose : std::uint8_t { ScheduledValidation, FinalTest };
+enum class EvaluationPurpose : std::uint8_t { ScheduledValidation, SelectionValidation, FinalTest };
 PhaseTiming elapsed_timing(std::chrono::steady_clock::time_point start, std::size_t images);
 class TrainingValidationRuntime final {
 public:

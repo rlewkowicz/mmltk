@@ -1,5 +1,7 @@
 #pragma once
 #include <stop_token>
+#include <span>
+#include <stdexcept>
 #include "training_schedule.h"
 #include <map>
 #include <tuple>
@@ -18,6 +20,7 @@
 #include "src/backend/ml/cuda/tensor_readback.h"
 #include "src/backend/models/rfdetr/contract/train_recipe.h"
 namespace mmltk::backend::models::rfdetr {
+struct DistributedContext;
 enum class NativeOptimizerBackend : std::uint8_t {
  eager,
  foreach,
@@ -85,6 +88,13 @@ public:
  }
  [[nodiscard]] const std::vector<Group>& groups() const { return groups_; }
  void reserve_checkpoint(mmltk::backend::ml::cuda::TensorReadbackBuffers& readback, std::size_t first_slot) const;
+ void admit_continuation(const TrainingScheduleState&) const;
+ void broadcast_state(const DistributedContext&);
+ // Candidate-only leaf views admit activation without mutating live requires-grad flags.
+ void bind_admission(std::span<const std::uint8_t> active) {
+  if (active.size() != params_.size()) throw std::invalid_argument("optimizer admission activation inventory differs");
+  for (std::size_t i = 0; i < params_.size(); ++i) params_[i].tensor = params_[i].tensor.detach().set_requires_grad(active[i] != 0);
+ }
  void commit(NativeOptimizerStorage candidate) noexcept {
   groups_.swap(candidate.groups_);
   state_.swap(candidate.state_);
@@ -95,7 +105,7 @@ protected:
  NativeOptimizerStorage() = default;
  NativeOptimizerStorage(std::vector<Group> groups, std::vector<NamedParameter> params) : groups_(std::move(groups)), params_(std::move(params)) {}
  template <class Optimizer>
- [[nodiscard]] static std::vector<std::string> inspect_checkpoint(torch::serialize::InputArchive&, const std::unordered_map<std::string, torch::Tensor>&, std::stop_token stop = {});
+ [[nodiscard]] static std::vector<std::string> inspect_checkpoint(torch::serialize::InputArchive&, const std::unordered_map<std::string, torch::Tensor>&, std::stop_token stop = {}, const TrainingScheduleState* = nullptr);
  std::vector<Group> groups_;
  std::vector<NamedParameter> params_;
  std::vector<ParamState> state_;
@@ -106,7 +116,7 @@ protected:
 };
 class NativeAdamW : public NativeOptimizerStorage<NativeAdamWGroupConfig, NativeAdamWParamState> {
 public:
- [[nodiscard]] static std::vector<std::string> InspectCheckpoint(torch::serialize::InputArchive&, const std::unordered_map<std::string, torch::Tensor>&, std::stop_token stop = {});
+ [[nodiscard]] static std::vector<std::string> InspectCheckpoint(torch::serialize::InputArchive&, const std::unordered_map<std::string, torch::Tensor>&, std::stop_token stop = {}, const TrainingScheduleState* = nullptr);
  NativeAdamW() = default;
  NativeAdamW(std::vector<Group> groups, std::vector<NamedParameter> params, NativeOptimizerBackend backend);
  [[nodiscard]] NativeOptimizerBackend backend() const;
@@ -133,7 +143,7 @@ const char* native_optimizer_backend_name(NativeOptimizerBackend backend);
 [[nodiscard]] bool muon_parameter_eligible(std::string_view name, const torch::Tensor& parameter);
 class NativeMuonWithAuxAdam : public NativeOptimizerStorage<NativeMuonGroupConfig, NativeMuonParamState> {
 public:
- [[nodiscard]] static std::vector<std::string> InspectCheckpoint(torch::serialize::InputArchive&, const std::unordered_map<std::string, torch::Tensor>&, std::stop_token stop = {});
+ [[nodiscard]] static std::vector<std::string> InspectCheckpoint(torch::serialize::InputArchive&, const std::unordered_map<std::string, torch::Tensor>&, std::stop_token stop = {}, const TrainingScheduleState* = nullptr);
  NativeMuonWithAuxAdam() = default;
  NativeMuonWithAuxAdam(std::vector<Group> groups, std::vector<NamedParameter> params);
  [[nodiscard]] const char* backend_name() const;
@@ -154,7 +164,7 @@ class NativeSGD final : public NativeOptimizerStorage<NativeSGDGroupConfig, Nati
 public:
  NativeSGD() = default;
  NativeSGD(std::vector<Group>, std::vector<NamedParameter>);
- [[nodiscard]] static std::vector<std::string> InspectCheckpoint(torch::serialize::InputArchive&, const std::unordered_map<std::string, torch::Tensor>&, std::stop_token = {});
+ [[nodiscard]] static std::vector<std::string> InspectCheckpoint(torch::serialize::InputArchive&, const std::unordered_map<std::string, torch::Tensor>&, std::stop_token = {}, const TrainingScheduleState* = nullptr);
  [[nodiscard]] const char* backend_name() const { return "eager"; }
  void activate() { state_.resize(params_.size()); refresh_active_parameters(); }
  void zero_grad(bool);
@@ -174,6 +184,8 @@ public:
  explicit NativeOptimizer(NativeAdamW optimizer);
  explicit NativeOptimizer(NativeMuonWithAuxAdam optimizer);
  void activate();
+ void admit_continuation(const TrainingScheduleState&) const;
+ void broadcast_state(const DistributedContext&);
  [[nodiscard]] const std::vector<torch::Tensor>& eligible_parameters() const;
  [[nodiscard]] const std::vector<std::string>& eligible_parameter_names() const;
  [[nodiscard]] TrainOptimizerKind kind() const;
@@ -190,7 +202,7 @@ public:
  void reserve_checkpoint(mmltk::backend::ml::cuda::TensorReadbackBuffers& readback, std::size_t first_slot) const;
  void save(torch::serialize::OutputArchive& archive, mmltk::backend::ml::cuda::TensorReadbackBuffers& readback, std::size_t first_slot) const;
  void load(torch::serialize::InputArchive& archive);
- [[nodiscard]] NativeOptimizer stage_load(torch::serialize::InputArchive& archive) const;
+ [[nodiscard]] NativeOptimizer stage_load(torch::serialize::InputArchive& archive, std::span<const std::uint8_t> active = {}) const;
  void commit(NativeOptimizer candidate) noexcept;
 
 private:

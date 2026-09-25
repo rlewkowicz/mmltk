@@ -836,6 +836,9 @@ int handle_rfdetr_cli(const std::span<const std::string_view> arguments, const l
   std::ranges::find(command_arguments, std::string_view{"--help"}) != command_arguments.end() || std::ranges::find(command_arguments, std::string_view{"-h"}) != command_arguments.end();
  try {
   return dispatch_command(*descriptor, command_arguments, help_requested, logging_options);
+ } catch (const rfdetr::TrainingPeerCancelled&) {
+  // The session's rank-zero terminal owns the already-claimed first cause.
+  return 1;
  } catch (const std::exception& error) { logging::report_fatal("mmltk rfdetr error", error.what(), std::nullopt, "rfdetr.cli"); } catch (...) {
   logging::report_fatal("mmltk rfdetr error", "unknown exception", std::nullopt, "rfdetr.cli");
  }

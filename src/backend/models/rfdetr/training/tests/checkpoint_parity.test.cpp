@@ -4,7 +4,6 @@
 #include <filesystem>
 #include "src/backend/models/rfdetr/contract/model_config.h"
 #include "src/backend/models/rfdetr/training/checkpoint.h"
-#include "src/backend/models/rfdetr/training/detail/training_continuation.h"
 // RF-DETR training checkpoint parity coverage.
 #include <optional>
 #include <sstream>
@@ -21,8 +20,6 @@
 #include <torch/types.h>
 #include <torch/serialize.h>
 namespace fs = std::filesystem;
-// CLEANUP-IGNORE: The parity fixture's namespace aliases are independent of the optimizer fixture's typed inventory.
-namespace model_detail = mmltk::backend::models::rfdetr::detail;
 // CLEANUP-IGNORE: This checkpoint test names the exact RF-DETR types used by its independent parity oracles.
 namespace {
 using mmltk::backend::models::rfdetr::find_preset_catalog_entry;
@@ -117,9 +114,7 @@ void run_checkpoint_parity_case(const ParityFixtureCase& fixture, size_t index, 
  REQUIRE(artifacts.config.mask_ce_loss_coef == 8.2);
  for (const auto& path : {upstream_path, native_path}) {
   auto admitted = mmltk::backend::models::rfdetr::resolve_model_state(path, {}, 0);
-  mmltk::backend::models::rfdetr::TrainRequest fresh;
-  fresh.weights_path = path;
-  REQUIRE_FALSE(model_detail::admit_training_configuration(admitted.artifacts.config, admitted.model_state.admitted_archive(), fresh).has_value());
+  mmltk::backend::models::rfdetr::apply_stock_training_coefficients(admitted.artifacts.config);
   REQUIRE(admitted.artifacts.config.cls_loss_coef == 1.0);
   REQUIRE(admitted.artifacts.config.bbox_loss_coef == 5.0);
   REQUIRE(admitted.artifacts.config.mask_ce_loss_coef == (admitted.artifacts.config.segmentation ? 5.0 : 1.0));

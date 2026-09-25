@@ -73,7 +73,8 @@ impl Presentation {
                 TrainingPhase::Validate => "Validating",
                 TrainingPhase::EpochComplete => "Epoch complete",
                 TrainingPhase::Completed => "Finishing",
-                TrainingPhase::Error => "Finishing",
+                TrainingPhase::Error | TrainingPhase::Cancelled => "Finishing",
+                TrainingPhase::Merge => "Averaging models",
             }
         };
         result.heading = format!(

@@ -146,14 +146,16 @@ void ensure_train_lane_model_supported(NativeRfDetrModel& model, int train_lane_
  if (running_stats.has_value()) { throw std::runtime_error("parallel RF-DETR train --lanes requires a model without running-stat buffers; found " + *running_stats); }
 }
 struct TrainingLanes::Impl {
+ std::function<void(std::exception_ptr)> failure;
  at::cuda::CUDAEvent source_ready;
  std::deque<TrainLaneContext> lanes;
- std::unique_ptr<mmltk::common::concurrency::WorkerPool> pool;
+ std::shared_ptr<mmltk::common::concurrency::WorkerPool> pool;
 };
 TrainingLanes::TrainingLanes(const TrainRequest& options, RuntimeContext& train_runtime, mmltk::backend::data::DatasetLoader& train_loader, std::shared_ptr<NativeRfDetrModel> model_owner,
- const std::vector<std::string>& all_param_names, int train_lane_count, std::size_t local_batch, const mmltk::frameworks::gpu::DeviceContext& augmentation_context)
+ const std::vector<std::string>& all_param_names, int train_lane_count, std::size_t local_batch, const mmltk::frameworks::gpu::DeviceContext& augmentation_context, std::function<void(std::exception_ptr)> failure, std::shared_ptr<mmltk::common::concurrency::WorkerPool> workers)
     : impl_(std::make_shared<Impl>()) {
  auto& model = *model_owner;
+ impl_->failure = std::move(failure);
  auto& train_lane_pool = impl_->pool;
  auto& train_lanes = impl_->lanes;
  try {
@@ -163,8 +165,8 @@ TrainingLanes::TrainingLanes(const TrainRequest& options, RuntimeContext& train_
    train_lanes.back().grad_params = lane_grad_parameters(model, all_param_names);
    return;
   }
-  train_lane_pool =
-   std::make_unique<mmltk::common::concurrency::WorkerPool>(static_cast<size_t>(train_lane_count), train_runtime.lane_cpus(), "rfdtrtlane", 0U, &train_runtime.execution().placement, false);
+  train_lane_pool = workers ? std::move(workers) :
+   std::make_shared<mmltk::common::concurrency::WorkerPool>(static_cast<size_t>(train_lane_count), train_runtime.lane_cpus(), "rfdtrtlane", 0U, &train_runtime.execution().placement, false);
   for (int lane_index = 0; lane_index < train_lane_count; ++lane_index) {
    train_lanes.emplace_back(
     torch_cuda::get_priority_cuda_stream(options.device_id, mmltk::frameworks::gpu::current_cuda_highest_stream_priority()), static_cast<std::size_t>(std::max(1, options.grad_accum_steps)));
@@ -192,6 +194,7 @@ TrainingLanes::TrainingLanes(const TrainRequest& options, RuntimeContext& train_
 TrainingLanes::~TrainingLanes() { retire(); }
 void TrainingLanes::retire() noexcept {
  if (!impl_) return;
+ if (impl_->pool) { try { impl_->pool->wait_idle(); } catch (...) {} }
  impl_->pool.reset();
  cudaError_t failure = cudaSuccess;
  for (const auto& lane : impl_->lanes) {
@@ -225,7 +228,7 @@ std::future<TrainLaneResult> TrainingLanes::enqueue(RuntimeContext* runtime, mml
  auto& lane = impl_->lanes.at(lane_index);
  lane.donors.assign(donors.begin(), donors.end());
  auto& lane_pool = *impl_->pool;
- return lane_pool.enqueue([runtime, &loader, &lane, batch, params_ready, admitted_microbatches, gradient_scale, parameter_version, &detection_config, &model, device_id, image_height,
+ return lane_pool.enqueue([failure = impl_->failure, runtime, &loader, &lane, batch, params_ready, admitted_microbatches, gradient_scale, parameter_version, &detection_config, &model, device_id, image_height,
                            image_width, seed, epoch, rank, augmentation_sequence, amp_enabled, autocast_dtype, route, normalizer = std::move(normalizer), &reducer, lane_index]() mutable {
   try {
    ScopedRuntimeContext worker_scope(runtime, lane_index + 1);
@@ -322,6 +325,7 @@ std::future<TrainLaneResult> TrainingLanes::enqueue(RuntimeContext* runtime, mml
     &lane.ready,
    };
   } catch (...) {
+   if (failure) { try { failure(std::current_exception()); } catch (...) {} }
    normalizer->fail(std::current_exception());
    reducer.abort(std::current_exception());
    throw;

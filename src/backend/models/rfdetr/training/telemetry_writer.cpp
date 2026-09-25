@@ -1,5 +1,6 @@
 #include "telemetry_writer.h"
 #include <cerrno>
+#include <algorithm>
 #include <atomic>
 #include <fstream>
 #include <format>
@@ -16,9 +17,12 @@ namespace {
 constexpr std::size_t record_bytes = kTrainingRecordBytes;
 constexpr serial::wire::Limits manifest_limits{.max_bytes = kTrainingManifestBytes, .max_items = 65536, .max_depth = 32};
 constexpr serial::wire::Limits limits{.max_bytes = record_bytes, .max_items = 8192, .max_depth = 32};
-constexpr std::size_t queue_bytes = 8U * 1024U * 1024U;
-constexpr std::size_t epoch_capacity = 2;
-constexpr std::size_t boundary_capacity = queue_bytes / record_bytes - epoch_capacity - 2;
+// One synchronized ordinary observation, every model EMA, and the session
+// checkpoint must fit even while the persistence worker is blocked.
+constexpr std::size_t epoch_capacity = kMaximumTrainingModels + 2;
+constexpr std::size_t boundary_capacity = 12;
+constexpr std::size_t queue_bytes = (epoch_capacity + boundary_capacity + 2) * record_bytes;
+static_assert(queue_bytes == 16U * 1024U * 1024U);
 // Boundary traffic cannot consume epoch or terminal reservations. Only Live
 // records coalesce; every other accepted record retains independent custody.
 bool bounded_paths(const TrainingMetricProgress& progress) {
@@ -44,24 +48,17 @@ void write_file(const std::filesystem::path& path, const nlohmann::json& value) 
 void append_file(const std::filesystem::path& path, const nlohmann::json& value) {
  mmltk::common::io::throw_on_json_write_failure(mmltk::common::io::append_json_line(path, value), path, "training telemetry");
 }
-std::string_view legacy_phase(TrainingPhase phase) {
- switch (phase) {
-  case TrainingPhase::Starting: return "starting";
-  case TrainingPhase::Train: return "train";
-  case TrainingPhase::Validate: return "validate";
-  case TrainingPhase::EpochComplete: return "epoch_complete";
-  case TrainingPhase::Completed: return "completed";
-  case TrainingPhase::Error: return "error";
- }
- throw std::invalid_argument("invalid training phase");
-}
 }  // namespace
 struct TrainingTelemetryWriter::Impl final {
  explicit Impl(TrainingRun value) : run(std::move(value)) {
   run.attempt_id = identity();
+  if (run.configuration.lane_configuration.mode != TrainLaneMode::SharedGradients && !run.configuration.lane_configuration.models.empty())
+   representative_model = std::ranges::min_element(run.configuration.lane_configuration.models, {}, &TrainModelSettings::model_id)->model_id;
   worker = std::jthread([this] { Work(); });
  }
  TrainingRun run;
+ std::uint64_t representative_model = 0;
+ std::optional<TrainingRecord> representative_observation;
  std::mutex mutex;
  std::atomic<std::uint64_t> wake_generation{0};
  std::optional<TrainingRecord> live;
@@ -74,7 +71,7 @@ struct TrainingTelemetryWriter::Impl final {
  std::atomic<bool> degraded{false};
  std::atomic<bool> stopping{false};
  std::string error;
- std::array<std::byte, record_bytes> scratch{};
+ std::array<std::byte, kTrainingProgressDocumentBytes> scratch{};
  std::vector<std::byte> manifest_scratch = std::vector<std::byte>(kTrainingManifestBytes);
  bool reported_failure = false;
  const int uncaught = std::uncaught_exceptions();
@@ -149,13 +146,13 @@ struct TrainingTelemetryWriter::Impl final {
    if (!std::filesystem::exists(directory / "metrics.jsonl") || !std::filesystem::equivalent(std::filesystem::absolute(run.configuration.resume_path).parent_path(), directory))
     throw std::runtime_error("selected output history is not associated with the resume checkpoint");
    auto previous = serial::decode_reflected_json<TrainingRun>(read_manifest(manifest), manifest_limits);
-   if (previous.format_version != kTrainingRunFormat || previous.run_id.empty() || previous.attempt_id.empty() || previous.evaluated_weights != run.evaluated_weights ||
-       previous.class_layout != run.class_layout || run.source_checkpoint_attempt_id.empty() || previous.checkpoint_attempt_id != run.source_checkpoint_attempt_id)
+   if (previous.format_version != kTrainingRunFormat || previous.run_id.empty() || (!run.run_id.empty() && previous.run_id != run.run_id) || previous.attempt_id.empty() || previous.evaluated_weights != run.evaluated_weights ||
+       previous.class_layout != run.class_layout || run.source_checkpoint_attempt_id.empty() || (previous.checkpoint_attempt_id != run.source_checkpoint_attempt_id && previous.attempt_id != run.source_checkpoint_attempt_id))
     throw std::runtime_error("resume history has an unsupported or incompatible run format");
    run.run_id = previous.run_id;
-   run.checkpoint_attempt_id = previous.checkpoint_attempt_id;
+   run.checkpoint_attempt_id = run.source_checkpoint_attempt_id;
   } else {
-   run.run_id = identity();
+   if (run.run_id.empty()) run.run_id = identity();
    std::ofstream metrics(directory / "metrics.jsonl", std::ios::binary | std::ios::trunc);
    if (!metrics) throw std::runtime_error("cannot create training metric history");
   }
@@ -164,48 +161,30 @@ struct TrainingTelemetryWriter::Impl final {
  void Persist(TrainingRecord record, const std::optional<TrainingFinalFacts>& completed) {
   record.run_id = run.run_id;
   record.attempt_id = run.attempt_id;
-  record.evaluated_weights = run.evaluated_weights;
+  record.evaluated_weights = record.progress.artifact ? record.progress.artifact->weights : EvaluatedWeights::Ordinary;
   if (record.progress.phase == TrainingPhase::Starting) record.attempt_configuration = run.configuration;
   const auto directory = run.configuration.output_dir;
   auto record_json = serial::reflected_json(record, scratch, limits);
   append_file(directory / "metrics.jsonl", record_json);
-  auto projection = serial::reflected_json(record.progress, scratch, limits);
-  projection["record"] = std::move(record_json);
-  projection["phase"] = legacy_phase(record.progress.phase);
-  projection["eval_lanes"] = run.execution.eval_lanes;
-  projection["effective_batch_per_rank"] = run.execution.effective_batch_per_rank;
-  projection["effective_batch_global"] = run.execution.effective_batch_global;
-  projection["training_supervision"] = serial::reflected_json(run.configuration.training_supervision, scratch, limits);
-  projection["persistence_degraded"] = degraded.load();
-  projection["dropped_records"] = dropped.load();
-  write_file(directory / "progress.json", projection);
-  if (record.role == TrainingRecordRole::Epoch) {
+  const auto& artifact = record.progress.artifact;
+  const auto& configuration = run.configuration;
+  if (record.role == TrainingRecordRole::Epoch && artifact && record.progress.val &&
+      artifact->weights == run.evaluated_weights &&
+      ((record.progress.scope == TrainingRecordScope::Model && record.progress.model_id == representative_model) ||
+       (record.progress.scope == TrainingRecordScope::SynchronizedSession && !configuration.use_ema)))
+   representative_observation = record;
+  TrainingProgressDocument document;
+  document.record = record;
+  document.representative_observation = representative_observation;
+  document.persistence = {degraded.load(), dropped.load(), error};
+  document.final = completed;
+  write_file(directory / "progress.json", serial::reflected_json(document, scratch, {.max_bytes = kTrainingProgressDocumentBytes, .max_items = 24576, .max_depth = 32}));
+  if (record.role == TrainingRecordRole::Epoch && record.progress.scope == TrainingRecordScope::Session && !record.progress.full_checkpoint_path.empty()) {
    run.checkpoint_attempt_id = run.attempt_id;
    write_file(directory / "run.json", serial::reflected_json(run, manifest_scratch, manifest_limits));
-   if (record.progress.epoch_global_loss) projection["train_loss"] = *record.progress.epoch_global_loss;
-   projection["evaluated_weights"] = run.evaluated_weights == EvaluatedWeights::Ema ? "ema" : "ordinary";
-   append_file(directory / "log.txt", projection);
   }
-  if (completed) {
-   projection["preset_name"] = run.configuration.preset_name;
-   projection["output_dir"] = directory.string();
-   projection["checkpoint"] = (directory / "checkpoint.pt").string();
-   projection["best_checkpoint"] = record.progress.checkpoint_path.string();
-   projection["best_is_ema"] = run.evaluated_weights == EvaluatedWeights::Ema;
-   projection["best_is_fallback"] = completed->fallback;
-   projection["best_regular_metric"] = completed->best_regular ? nlohmann::json(*completed->best_regular) : nlohmann::json(nullptr);
-   projection["best_ema_metric"] = completed->best_ema ? nlohmann::json(*completed->best_ema) : nlohmann::json(nullptr);
-   projection["last_epoch"] = record.progress.epoch;
-   projection["history_size"] = completed->history_size;
-   const auto& bounds = run.execution.dataset_limits;
-   projection["dataset_max_instances"] = {{"train", bounds.train_max_instances}, {"val", bounds.val_max_instances},
-    {"test", bounds.test_max_instances ? nlohmann::json(*bounds.test_max_instances) : nlohmann::json(nullptr)}, {"largest", bounds.largest_max_instances}};
-   projection["query_resolution"] = {{"source", bounds.query_source}, {"resolved", bounds.resolved_num_queries}, {"required", bounds.required_num_queries},
-    {"automatic_query_cap", bounds.automatic_num_queries_cap}, {"automatic", bounds.automatic}, {"requested_override", bounds.requested_override}};
-   projection["gpu_augmentation"] = serial::reflected_json(run.configuration.gpu_augmentation, scratch, limits);
-   projection["test"] = record.progress.test ? serial::reflected_json(*record.progress.test, scratch, limits) : nlohmann::json(nullptr);
-   write_file(directory / "results.json", projection);
-  }
+  if (record.role == TrainingRecordRole::Epoch) append_file(directory / "log.txt", serial::reflected_json(record, scratch, limits));
+  if (completed) write_file(directory / "results.json", serial::reflected_json(document, scratch, {.max_bytes = kTrainingProgressDocumentBytes, .max_items = 24576, .max_depth = 32}));
  }
  void Work() noexcept {
   bool initialized = false;
@@ -315,6 +294,7 @@ void TrainingTelemetryWriter::Submit(TrainingMetricProgress progress, TrainingRe
  } catch (...) { impl_->Drop(); }
 }
 void TrainingTelemetryWriter::Finish(TrainingMetricProgress progress, TrainingFinalFacts facts) noexcept { impl_->Complete(std::move(progress), std::move(facts)); }
+void TrainingTelemetryWriter::Fail(TrainingMetricProgress progress) noexcept { impl_->Complete(std::move(progress), std::nullopt); }
 void TrainingTelemetryWriter::Close() noexcept {
  impl_->stopping.store(true);
  impl_->Wake();

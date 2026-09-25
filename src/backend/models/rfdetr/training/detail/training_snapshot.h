@@ -1,7 +1,8 @@
 #pragma once
+#include <span>
+#include <cstdint>
 #include <limits>
 #include <optional>
-#include <unordered_map>
 #include "src/backend/models/rfdetr/core/model.h"
 #include "src/backend/models/rfdetr/core/model_state.h"
 #include "src/backend/ml/cuda/tensor_readback.h"
@@ -10,11 +11,10 @@
 #include "training_continuation.h"
 #include "training_ops_private.h"
 namespace mmltk::backend::models::rfdetr {
+[[nodiscard]] std::vector<NormalizedModelStateEntry> collect_module_state(const NativeRfDetrModel&);
 struct ResumeState {
  std::string attempt_id;
  int start_epoch = 0;
- double best_regular = -std::numeric_limits<double>::infinity();
- double best_ema = -std::numeric_limits<double>::infinity();
  // Retained CPU admission; materialize only after the complete model broadcast.
  std::optional<std::vector<torch::Tensor>> ema_cpu_shadow;
  std::optional<NativeOptimizer> optimizer_candidate;
@@ -23,17 +23,14 @@ struct ResumeState {
 };
 ModelStateLoadSummary load_training_model_weights(NativeRfDetrModel&, const DecodedNativeModelState&, TrainingSupervisionRoute);
 ResumeState load_resume_checkpoint_state(const std::filesystem::path&, DecodedNativeModelState&, const detail::TrainingContinuation&, NativeOptimizer&,
- const std::vector<std::string>&, const std::vector<torch::Tensor>&);
-void save_collected_checkpoint(const std::filesystem::path&, const NativeCheckpointMetadata&, const NativeRfDetrModel&, const std::unordered_map<std::string, torch::Tensor>*, const char*, const char*,
- const std::filesystem::path&);
-std::unordered_map<std::string, torch::Tensor> ema_override_map(const std::vector<std::string>&, const ModelEma&);
+ const std::vector<std::string>&, const std::vector<torch::Tensor>&, std::span<const std::uint8_t> active = {});
 class TrainingSnapshot final {
 public:
  void begin(const NativeRfDetrModel& model);
  void prepare_ema(const std::vector<std::string>& names, const ModelEma* ema);
  void save_weights(const std::filesystem::path&, const NativeCheckpointMetadata&, bool selected, const std::filesystem::path&);
- void save_resume(const std::filesystem::path&, const NativeCheckpointMetadata&, const NativeOptimizer&, const GradScaler&, const TrainRequest&, int epoch, double best_regular, double best_ema,
-  int64_t ema_completed_updates, std::string_view attempt_id, const std::filesystem::path& descriptor, const detail::TrainingContinuationValues& continuation);
+ void save_resume(const std::filesystem::path&, const NativeCheckpointMetadata&, const NativeOptimizer&, const GradScaler&, const TrainRequest&, int epoch,
+  int64_t ema_completed_updates, std::string_view attempt_id, const std::filesystem::path& descriptor, detail::TrainingContinuationValues& continuation);
  void release();
 
 private:

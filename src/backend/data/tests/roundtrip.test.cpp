@@ -529,6 +529,22 @@ void exercise_roundtrip_transport(const FixtureSpec& fixture, const bool h2d, cu
  CHECK(lifetime.expired());
  while (planned_loader.next_batch(batch)) planned_loader.release_batch(batch);
  planned_loader.synchronize();
+ // Independent cursors and cancellation share one immutable mapping/index.
+ auto shared_config = planned_cfg;
+ shared_config.source = planned_loader.compiled_source();
+ auto shared_owner = std::make_unique<DatasetLoader>(shared_config);
+ DatasetLoader shared_peer(shared_config);
+ CHECK(shared_owner->compiled_source() == shared_peer.compiled_source());
+ CHECK(shared_owner->label_index() == shared_peer.label_index());
+ auto first_schedule = std::make_shared<DatasetIndexSchedule>(); first_schedule->image_indices = {0, 1, 2, 3};
+ auto other_schedule = std::make_shared<DatasetIndexSchedule>(); other_schedule->image_indices = {4, 5, 6, 7};
+ shared_owner->begin_epoch(first_schedule); shared_peer.begin_epoch(other_schedule);
+ shared_owner->stop_workers(); shared_owner.reset(); shared_config.source.reset();
+ REQUIRE(shared_peer.next_batch(batch));
+ CHECK(batch.image_indices[0] == 4); CHECK(batch.image_indices[3] == 7);
+ shared_peer.release_batch(batch); CHECK_FALSE(shared_peer.next_batch(batch)); shared_peer.synchronize();
+ auto mismatched = planned_cfg; mismatched.source = shared_peer.compiled_source(); mismatched.compiled_path += ".missing";
+ REQUIRE_THROWS(DatasetLoader(mismatched));
  DatasetLoader same_seed_a(shuffled_cfg);
  DatasetLoader same_seed_b(shuffled_cfg);
  for (int epoch = 0; epoch < 2; ++epoch) {

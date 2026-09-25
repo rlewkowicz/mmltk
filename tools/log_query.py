@@ -599,16 +599,16 @@ class Record:
         self.clock, self.time_ns = record_time(self.data, self.source)
 
     def training_record(self):
-        # External RF-DETR TrainingRecord format 2: use exact enum spellings
+        # Native RF-DETR TrainingRecord format 3: use exact enum spellings
         # and bounded identities, never metric names or arbitrary status text.
-        return (type(self.data.get("format_version")) is int and self.data["format_version"] == 2
+        return (type(self.data.get("format_version")) is int and self.data["format_version"] == 3
                 and self.data.get("role") in ("Live", "Boundary", "Epoch", "Terminal")
                 and all(isinstance(self.data.get(name), str)
                         and 0 < len(self.data[name]) <= 64 and self.data[name].strip()
                         for name in ("run_id", "attempt_id"))
                 and isinstance(self.data.get("progress"), dict)
                 and self.data["progress"].get("phase") in
-                    ("Starting", "Train", "Validate", "EpochComplete", "Completed", "Error"))
+                    ("Starting", "Train", "Validate", "EpochComplete", "Completed", "Error", "Cancelled", "Merge"))
 
     def get(self, name):
         if name == "@file":
@@ -631,6 +631,10 @@ class Record:
             return surface_identity(self.data)
         if name == "@workspace_source":
             return workspace_source_identity(self.data)
+        if self.training_record() and name in ("@session", "@model", "@first_cause", "@phase", "@role"):
+            field = {"@session": "progress.session_id", "@model": "progress.model_id",
+                     "@first_cause": "progress.failure.first_cause", "@phase": "progress.phase", "@role": "role"}[name]
+            return lookup(self.data, field)
         if name == "@event":
             if self.training_record():
                 return "training." + self.data["role"].lower() + "." + self.data["progress"]["phase"].lower()
@@ -1889,7 +1893,7 @@ def triage_snapshot(record):
                 if training and value is record.data:
                     priority = ("format_version", "run_id", "attempt_id", "role", "sequence", "progress")
                 elif training and value is record.data["progress"]:
-                    priority = ("phase",)
+                    priority = ("phase", "scope", "session_id", "model_id", "failure")
                 # Reserve canonical short facts through direct lookups, even
                 # when large optional configuration precedes them in the file.
                 leading = [(name, value[name]) for name in priority if name in value]
@@ -1952,6 +1956,8 @@ def strong_identities(record, explicit=()):
     add(("source_session", "source_instance"))
     if record.training_record():
         add(("run_id", "attempt_id"))
+        add(("progress.session_id", "progress.model_id"))
+        add(("progress.session_id", "progress.failure.first_cause"))
     fields = record.data.get("fields")
     values = {**record.data, **(fields if isinstance(fields, dict) else {})}
     for name, value in values.items():
@@ -3441,11 +3447,13 @@ def render_record(item, options):
     level = record.get("@level")
     label = " ".join(str(value) for value in (owner, level, event) if value is not MISSING)
     detail = value_from(record.data, "message", "fields.message", "detail")
+    if detail is MISSING and record.training_record():
+        detail = record.get("progress.failure.detail")
     if detail is MISSING and event is MISSING:
         detail = record.raw
     facts = []
     if record.training_record():
-        facts.extend(f"{name}={compact(record.get(name), 70)}" for name in ("run_id", "attempt_id"))
+        facts.extend(f"{name}={compact(record.get(name), 70)}" for name in ("run_id", "attempt_id", "progress.session_id", "progress.model_id", "progress.failure.first_cause"))
     if "representative_count" in record.metadata:
         facts.append(f"occurrences={record.metadata['representative_count']}")
     if event == "vulkan.validation":

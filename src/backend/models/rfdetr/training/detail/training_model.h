@@ -1,0 +1,55 @@
+#pragma once
+#include <memory>
+#include <cstddef>
+#include <cstdint>
+#include <filesystem>
+#include <string_view>
+#include <functional>
+#include <exception>
+#include "src/common/concurrency/worker_pool.h"
+#include <optional>
+#include <string>
+#include <vector>
+#include "training_data_plan.h"
+#include "training_distributed.h"
+#include "training_snapshot.h"
+#include "evaluation_runtime.h"
+#include "src/backend/models/rfdetr/contract/training_metrics.h"
+namespace mmltk::backend::models::rfdetr {
+// One trajectory owns all mutable training state. The session grants this owner
+// a complete communication turn; no trajectory creates its own ordering protocol.
+class TrainingModel final {
+public:
+ TrainingModel(TrainRequest, std::size_t model_index, RuntimeContext&, std::unique_ptr<mmltk::backend::data::DatasetLoader>,
+  std::shared_ptr<NativeRfDetrModel>, const TrainingDataPlan&, DistributedContext, TrainingPrecision, DetectionConfig, std::function<void(std::uint64_t, std::exception_ptr)> failure);
+ ~TrainingModel();
+ TrainingModel(const TrainingModel&) = delete;
+ TrainingModel& operator=(const TrainingModel&) = delete;
+ void stage_resume(DecodedNativeModelState&, const detail::TrainingContinuation&);
+ void commit_resume();
+ void start(std::shared_ptr<mmltk::common::concurrency::WorkerPool>);
+ void begin_epoch(std::uint64_t epoch, TrainingEpochDraws);
+ [[nodiscard]] bool exhausted() const;
+ // Returns successful global image count; an overflow consumes the attempt but
+ // contributes zero merge weight. The return boundary is physically drained.
+ [[nodiscard]] std::uint64_t attempt();
+ void end_epoch();
+ [[nodiscard]] TrainingMetricProgress progress(TrainingPhase) const;
+ [[nodiscard]] EvalPassResult evaluate(TrainingValidationRuntime&, EvaluatedWeights);
+ [[nodiscard]] TrainingArtifact save_candidate(const NativeCheckpointMetadata&, const std::filesystem::path&, std::string_view session,
+  std::string_view initialization, std::string_view configuration, std::string_view validation, std::uint64_t merge, EvaluatedWeights, const EvalSummary&);
+ void remember_candidate(TrainingArtifact);
+ void save_ordinary_epoch(const NativeCheckpointMetadata&, const std::filesystem::path&);
+ [[nodiscard]] const std::optional<TrainingArtifact>& best() const;
+ void restore_best(std::optional<TrainingArtifact>);
+ void save_resume(const std::filesystem::path&, const NativeCheckpointMetadata&, std::string_view attempt, const std::filesystem::path& original_descriptor);
+ [[nodiscard]] NativeRfDetrModel& model();
+ [[nodiscard]] const std::vector<NormalizedModelStateEntry>& ordinary() const;
+ [[nodiscard]] std::uint64_t id() const;
+ [[nodiscard]] const TrainingScheduleState& schedule() const;
+ void ordinary_changed();
+private:
+ struct Impl;
+ std::unique_ptr<Impl> impl_;
+};
+}  // namespace mmltk::backend::models::rfdetr

@@ -15,6 +15,9 @@
 #include "src/backend/models/rfdetr/core/model.h"
 #include "src/backend/models/rfdetr/core/model_state.h"
 #include "src/backend/models/rfdetr/training/checkpoint.h"
+#include "src/backend/models/rfdetr/training/detail/model_merging.h"
+#include "src/backend/models/rfdetr/training/detail/training_session_checkpoint.h"
+#include "src/backend/ml/runtime/onnx_environment.h"
 #include "src/backend/models/rfdetr/inference/evaluation.h"
 #include <onnx/onnx_pb.h>
 #include <cuda_runtime_api.h>
@@ -1739,5 +1742,86 @@ TEST_CASE("Native prediction consumes shared compilation policy with full batche
    reference_ap = result.result.summary.bbox.ap;
   else
    CHECK(result.result.summary.bbox.ap == *reference_ap);
+ }
+}
+
+TEST_CASE("Frozen selected native soups preserve ONNX logits boxes masks and evaluation", "[model][rfdetr][prediction][selection][gpu]") {
+ if (!mmltk::testsupport::checked_cuda_device_count()) SKIP("CUDA unavailable; selected native/ONNX agreement remains unverified");
+ const mmltk::testsupport::ScopedTempDir root("selected-native-onnx");
+ const mmltk::backend::data::testsupport::FixtureSpec dataset{.root_dir = (root.path() / "dataset").string(), .width = 96, .height = 96, .num_images = 3, .background_images = 0};
+ mmltk::backend::data::testsupport::create_synthetic_dataset(dataset);
+ mmltk::backend::data::testsupport::compile_existing_fixture(dataset);
+ const auto compiled = mmltk::backend::data::testsupport::compiled_bin_path(dataset);
+ const auto source = mmltk::backend::data::CompiledDataset::open(compiled);
+ const auto layout = rfdetr::native_training_class_layout(*source.class_catalog());
+ for (const bool masks : {false, true}) {
+  const auto directory = root.path() / (masks ? "masks" : "boxes"); std::filesystem::create_directory(directory);
+  const auto preset = std::ranges::find_if(rfdetr::model_presets(), [&](const auto& row) { return (row.task == rfdetr::ModelTask::Segmentation) == masks; });
+  REQUIRE(preset != rfdetr::model_presets().end());
+  auto config = rfdetr::native_config_from_preset(*preset);
+  config.resolution = 96; config.num_classes = layout.slots.size(); config.num_queries = 3; config.num_select = 3;
+  rfdetr::NativeRfDetrModel model(config, layout);
+  std::vector<rfdetr::NormalizedModelStateEntry> entries;
+  for (const auto& item : model.named_parameters(true)) entries.push_back({item.key(), item.value().detach()});
+  for (const auto& item : model.named_buffers(true)) entries.push_back({item.key(), item.value().detach()});
+  const auto initialization = rfdetr::native_state_fingerprint(entries);
+  rfdetr::ResolvedModelArtifacts artifacts; artifacts.config = config; artifacts.class_layout = layout;
+  const auto evaluate = [&](const std::filesystem::path& path) {
+   rfdetr::EvaluateRequest request;
+   request.weights_path = path; request.preset_name = config.preset_name; request.resolution = config.resolution;
+   request.compiled_path = compiled; request.backend = "weights"; request.batch_size = 1; request.progress_bar = false;
+   request.allow_fp16 = false; request.compilation_mode = rfdetr::CompilationMode::kNone;
+   return rfdetr::run_evaluation(request).result.summary;
+  };
+  std::array<rfdetr::TrainingSelectionCandidate, 2> candidates;
+  torch::NoGradGuard no_grad;
+  for (std::size_t index = 0; index < candidates.size(); ++index) {
+   if (index) model.named_parameters(true)["class_embed.bias"].add_(.01);
+   rfdetr::DecodedNativeModelState state(entries); state.metadata = rfdetr::make_native_checkpoint_metadata(artifacts, config.num_classes);
+   auto& candidate = candidates[index].artifact;
+   candidate.path = directory / ("model-" + std::to_string(index) + ".pt");
+   rfdetr::save_native_checkpoint(candidate.path, state);
+   candidate.session_id = "selected-native-onnx"; candidate.model_id = index; candidate.initialization = initialization;
+   candidate.configuration = std::string(64, masks ? 'a' : 'b'); candidate.validation = mmltk::common::io::sha256_hex(mmltk::common::io::sha256_file(compiled));
+   candidate.sha256 = mmltk::common::io::sha256_hex(mmltk::common::io::sha256_file(candidate.path));
+   candidate.content = rfdetr::native_state_fingerprint(rfdetr::decode_native_model_state(candidate.path).entries());
+   candidate.evaluation = evaluate(candidate.path); candidate.selection_metric = rfdetr::training_selection_metric(*candidate.evaluation, masks);
+  }
+  const auto selected = rfdetr::select_training_artifact(candidates, rfdetr::TrainFinalPolicy::Uniform, masks, directory, evaluate);
+  REQUIRE(selected.artifact.weights == rfdetr::EvaluatedWeights::Soup);
+  CHECK_FALSE(rfdetr::inspect_training_checkpoint(selected.artifact.path).checkpoint().resumable);
+  rfdetr::ExportOnnxRequest export_request;
+  export_request.weights_path = selected.artifact.path; export_request.preset_name = config.preset_name; export_request.resolution = config.resolution;
+  export_request.output_path = directory / "selected.onnx";
+  rfdetr::export_onnx(export_request);
+  CHECK(rfdetr::load_onnx_model_info(export_request.output_path).class_layout == layout);
+  rfdetr::load_model_weights(model, selected.artifact.path, true); model.to(torch::kCUDA); model.eval();
+  auto input = torch::sin(torch::arange(3 * 96 * 96, torch::kFloat)).reshape({1, 3, 96, 96});
+  const auto native = model.forward({input.to(torch::kCUDA), {}}, masks).main;
+  mmltk::backend::ml::runtime::OnnxEnvironment environment(ORT_LOGGING_LEVEL_ERROR, "selected-native-onnx");
+  Ort::SessionOptions options; options.SetIntraOpNumThreads(1); options.SetInterOpNumThreads(1);
+  Ort::Session session(environment.get(), export_request.output_path.c_str(), options);
+  Ort::AllocatorWithDefaultOptions allocator;
+  const auto input_name = session.GetInputNameAllocated(0, allocator);
+  const char* input_names[] = {input_name.get()};
+  const char* output_names[] = {"pred_logits", "pred_boxes", "pred_masks"};
+  const auto memory = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
+  auto value = Ort::Value::CreateTensor<float>(memory, input.data_ptr<float>(), input.numel(), input.sizes().data(), input.dim());
+  auto outputs = session.Run(Ort::RunOptions{}, input_names, &value, 1, output_names, masks ? 3 : 2);
+  std::vector<torch::Tensor> expected{native.pred_logits.cpu(), native.pred_boxes.cpu()};
+  if (masks) { REQUIRE(native.pred_masks); expected.push_back(native.pred_masks->cpu()); }
+  for (std::size_t index = 0; index < expected.size(); ++index) {
+   REQUIRE(outputs[index].GetTensorTypeAndShapeInfo().GetShape() == expected[index].sizes().vec());
+   const auto actual = torch::from_blob(outputs[index].GetTensorMutableData<float>(), expected[index].sizes(), torch::kFloat);
+   CHECK(torch::allclose(actual, expected[index], 3e-4, 3e-4));
+  }
+  rfdetr::EvaluateRequest onnx;
+  onnx.onnx_path = export_request.output_path; onnx.compiled_path = compiled; onnx.backend = "onnx"; onnx.batch_size = 1; onnx.allow_fp16 = false;
+  onnx.progress_bar = false; onnx.compilation_mode = rfdetr::CompilationMode::kNone;
+  const auto actual = rfdetr::run_evaluation(onnx).result.summary;
+  CHECK(std::abs(actual.bbox.ap - selected.validation.bbox.ap) < 1e-5);
+  CHECK(actual.mask.has_value() == masks);
+  if (masks) { REQUIRE(selected.validation.mask); CHECK(std::abs(actual.mask->ap - selected.validation.mask->ap) < 1e-5); }
+  CHECK(rfdetr::read_training_selection(directory / "selected.json") == selected);
  }
 }

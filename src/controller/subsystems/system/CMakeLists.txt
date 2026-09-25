@@ -85,7 +85,7 @@ function(mmltk_add_controller_subsystems_system_tests)
     mmltk_configure_component(mmltk_train_request_fixture PRIVATE_DECLARATIONS)
     mmltk_register_ordinary_sources(mmltk_train_request_fixture
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/train_request_fixture.cpp)
-    target_link_libraries(mmltk_train_request_fixture PRIVATE mmltk::backend::models::rfdetr::contract)
+    target_link_libraries(mmltk_train_request_fixture PRIVATE mmltk::backend::models::rfdetr::contract mmltk::frameworks::serialization)
     add_executable(mmltk_controller_data_compute_systems_tests EXCLUDE_FROM_ALL)
     mmltk_register_ordinary_sources(
         mmltk_controller_data_compute_systems_tests

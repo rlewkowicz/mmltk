@@ -1,3 +1,5 @@
+#include "src/backend/models/rfdetr/training/detail/training_session_checkpoint.h"
+#include "src/backend/models/rfdetr/training/detail/model_merging.h"
 #include "training_gradient_fixture.h"
 #include "src/backend/models/rfdetr/training/detail/training_distributed.h"
 #include <torch/csrc/distributed/c10d/Backend.hpp>
@@ -16,6 +18,7 @@
 #include "src/backend/models/rfdetr/core/runtime.h"
 #include "src/common/system/execution_policy.h"
 #include "src/common/system/numa_topology.h"
+#include "src/common/io/scoped_fd.h"
 #include "src/backend/models/rfdetr/augmentation/sampling.h"
 #include <cuda_runtime.h>
 #include <catch2/matchers/catch_matchers.hpp>
@@ -26,6 +29,8 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <unistd.h>
+#include <spdlog/common.h>
 #include <exception>
 #include <filesystem>
 #include <fstream>
@@ -69,6 +74,7 @@
 #include "src/backend/models/rfdetr/core/detection_ops.h"
 #include "detail/gpu_augment_private.h"
 import mmltk.backend.models.rfdetr.augmentation.augmentation_metadata;
+import mmltk.common.logging.mmltk_logging;
 namespace mmltk::backend::models::rfdetr::test_support {
 struct GpuBatchAugmenterTestAccess final {
  static void FailCacheWait(GpuBatchAugmenter& owner) {
@@ -1440,7 +1446,8 @@ void test_all_supervision_routes_execute_fixture_backed_training() {
   while (std::getline(metrics, line)) {
    const auto record = mmltk::frameworks::serialization::decode_reflected_json<rfdetr::TrainingRecord>(line, {.max_bytes = rfdetr::kTrainingRecordBytes, .max_items = 8192, .max_depth = 32});
    const auto& progress = record.progress;
-   REQUIRE(record.format_version == 2);
+   REQUIRE(record.format_version == 3);
+   if (progress.scope == rfdetr::TrainingRecordScope::Session && progress.phase != rfdetr::TrainingPhase::Starting) continue;
    REQUIRE(progress.total_images == expected_images);
    REQUIRE(progress.total_images == progress.total_batches * request.batch_size);
    REQUIRE(progress.completed_images == progress.completed_batches * request.batch_size);
@@ -1461,11 +1468,11 @@ void test_all_supervision_routes_execute_fixture_backed_training() {
   REQUIRE(completed);
   REQUIRE(result.history.size() == 1);
   const auto& epoch = result.history.front();
-  REQUIRE(epoch.evaluated_ema == request.use_ema);
+  REQUIRE((epoch.artifact->weights == rfdetr::EvaluatedWeights::Ema) == request.use_ema);
   REQUIRE(epoch.val_loss.has_value() == request.validation_loss);
   if (epoch.val_loss) REQUIRE(std::isfinite(*epoch.val_loss));
-  REQUIRE(epoch.val_summary.bbox.available);
-  REQUIRE(result.best_is_ema == request.use_ema);
+  REQUIRE(epoch.val->bbox.available);
+  REQUIRE((result.selected->artifact.weights == rfdetr::EvaluatedWeights::Ema) == request.use_ema);
   REQUIRE(result.test_summary.has_value() == !request.test_compiled_path.empty());
   const auto samples = request.output_dir / "eval_samples";
   const auto sample = samples / ("epoch_" + std::to_string(epoch.epoch + 1) + ".png");
@@ -1515,6 +1522,15 @@ void test_all_supervision_routes_execute_fixture_backed_training() {
    const auto result = rfdetr::run_training(request);
    require_selected_evaluation(request, result);
    if (route_index == 0 && lanes == 1) {
+    auto failed_publication = request;
+    failed_publication.output_dir = root / "failed-session-publication";
+    std::filesystem::create_directories(failed_publication.output_dir / "session.json.staging");
+    REQUIRE_THROWS(rfdetr::run_training(failed_publication));
+    std::ifstream failed_input(failed_publication.output_dir / "progress.json");
+    const auto failed_document = mmltk::frameworks::serialization::decode_reflected_json<rfdetr::TrainingProgressDocument>(nlohmann::json::parse(failed_input).dump(), {.max_bytes = rfdetr::kTrainingProgressDocumentBytes, .max_items = 24576, .max_depth = 32});
+    CHECK(failed_document.record.progress.phase == rfdetr::TrainingPhase::Error);
+    CHECK(failed_document.record.progress.full_checkpoint_path.empty());
+    CHECK_FALSE(std::filesystem::exists(failed_publication.output_dir / "session.json"));
     // Finite classifier logits overflow the real criterion's scalar sum.
     // Initialization remains finite, so this reaches lane result settlement
     // and the optimizer attempt's loss-failure path, not admission rejection.
@@ -1536,7 +1552,7 @@ void test_all_supervision_routes_execute_fixture_backed_training() {
     REQUIRE(failure.find("nonfinite_losses=[") != std::string::npos);
     REQUIRE(failure.find("loss_ce=inf") != std::string::npos);
    }
-   if (result.test_summary) REQUIRE(*result.test_summary == result.history.front().val_summary);
+   if (result.test_summary) REQUIRE(*result.test_summary == result.selected->validation);
    std::stop_source cancelled_inspection;
    cancelled_inspection.request_stop();
    REQUIRE_THROWS(rfdetr::inspect_training_checkpoint(result.checkpoint_path, cancelled_inspection.get_token()));
@@ -1550,15 +1566,15 @@ void test_all_supervision_routes_execute_fixture_backed_training() {
    REQUIRE(result.history.size() == 1);
    REQUIRE(std::isfinite(result.history.front().train_loss));
    REQUIRE(result.history.front().val_loss.has_value());
-   REQUIRE(result.best_checkpoint_path.has_value());
-   REQUIRE_FALSE(rfdetr::inspect_training_checkpoint(*result.best_checkpoint_path).checkpoint().resumable);
+   REQUIRE(result.selected.has_value());
+   REQUIRE_FALSE(rfdetr::inspect_training_checkpoint(result.selected->artifact.path).checkpoint().resumable);
    auto deployment_config = result.artifacts.config;
    deployment_config.training_supervision = {};
    rfdetr::NativeRfDetrModel deployment_model(deployment_config, rfdetr::testsupport::synthetic_training_layout(deployment_config.num_classes - 1));
-   const auto deployment_summary = rfdetr::load_model_weights(deployment_model, *result.best_checkpoint_path, false);
+   const auto deployment_summary = rfdetr::load_model_weights(deployment_model, result.selected->artifact.path, false);
    REQUIRE(deployment_summary.unexpected_names.empty());
    REQUIRE(deployment_summary.incompatible_names.empty());
-   const auto deployment_state = rfdetr::decode_model_state(*result.best_checkpoint_path);
+   const auto deployment_state = rfdetr::decode_model_state(result.selected->artifact.path);
 #if MMLTK_RFDETR_PYTHON_CHECKPOINT_LOADER
    if (route_index == 0 && lanes == 1) {
     const auto upstream = request.output_dir / "transfer.pth";
@@ -1571,12 +1587,14 @@ void test_all_supervision_routes_execute_fixture_backed_training() {
     REQUIRE_THROWS(transfer_admission.RequireUnchanged());
    }
 #endif
-   const auto full_state = rfdetr::decode_model_state(result.checkpoint_path);
+   rfdetr::TrainingSessionAdmission saved_session(result.checkpoint_path);
+   const auto archive_path = std::filesystem::canonical(result.checkpoint_path).parent_path() / saved_session.manifest.models.front().path;
+   const auto& full_state = saved_session.models.front();
    std::unordered_map<std::string, torch::Tensor> expected_best;
    for (const auto& entry : full_state.entries()) expected_best.emplace(entry.name, entry.tensor);
    if (request.use_ema) {
     torch::serialize::InputArchive source, shadows;
-    source.load_from(result.checkpoint_path.string(), torch::Device(torch::kCPU));
+    source.load_from(archive_path.string(), torch::Device(torch::kCPU));
     source.read("ema_state", shadows);
     const auto count = mmltk::backend::ml::serialization::require_int(shadows, "entry_count");
     REQUIRE(count > 0);
@@ -1603,21 +1621,21 @@ void test_all_supervision_routes_execute_fixture_backed_training() {
      rejected.output_dir = request.output_dir / (std::string("rejected-") + std::string(fault));
      rejected.epochs = 2;
      REQUIRE_THROWS(rfdetr::run_training(rejected));
-     REQUIRE_FALSE(std::filesystem::exists(rejected.output_dir / "checkpoint.pt"));
+     REQUIRE_FALSE(std::filesystem::exists(rejected.output_dir / "session.json"));
      REQUIRE_FALSE(std::filesystem::exists(rejected.output_dir / "checkpoint_epoch_2.pt"));
     };
-    for (const auto* missing : {"epoch", "lr_drop", "training_original_descriptor", "grad_scaler_scale", "optimizer"}) {
+    for (const auto* missing : {"epoch", "training_configuration_cbor", "training_original_descriptor", "grad_scaler_scale", "optimizer"}) {
      torch::serialize::InputArchive source;
-     source.load_from(result.checkpoint_path.string(), torch::Device(torch::kCPU));
+     source.load_from(archive_path.string(), torch::Device(torch::kCPU));
      torch::serialize::OutputArchive incomplete;
      rfdetr::testsupport::copy_checkpoint_archive(source, incomplete, missing);
      reject_checkpoint(incomplete, missing);
     }
-    const std::array<std::pair<const char*, c10::IValue>, 4> invalid{{{"epoch", std::string("wrong-type")}, {"grad_scaler_scale", 0.0}, {"lr_drop", int64_t{inspection.configuration->lr_drop + 1}},
+    const std::array<std::pair<const char*, c10::IValue>, 4> invalid{{{"epoch", std::string("wrong-type")}, {"grad_scaler_scale", 0.0}, {"training_configuration_cbor", int64_t{1}},
      {"training_original_descriptor", std::string(mmltk::frameworks::reflection::kMaximumPathBytes + 1, 'x')}}};
     for (const auto& [key, value] : invalid) {
      torch::serialize::InputArchive source;
-     source.load_from(result.checkpoint_path.string(), torch::Device(torch::kCPU));
+     source.load_from(archive_path.string(), torch::Device(torch::kCPU));
      torch::serialize::OutputArchive inconsistent;
      rfdetr::testsupport::copy_checkpoint_archive(source, inconsistent, key);
      inconsistent.write(key, value);
@@ -1625,7 +1643,7 @@ void test_all_supervision_routes_execute_fixture_backed_training() {
     }
     if (request.use_ema) {
      torch::serialize::InputArchive source;
-     source.load_from(result.checkpoint_path.string(), torch::Device(torch::kCPU));
+     source.load_from(archive_path.string(), torch::Device(torch::kCPU));
      torch::serialize::OutputArchive malformed;
      rfdetr::testsupport::copy_checkpoint_archive(source, malformed, "ema_state");
      torch::serialize::InputArchive shadow, first;
@@ -1657,6 +1675,77 @@ void test_all_supervision_routes_execute_fixture_backed_training() {
    }
   }
  }
+ for (const auto mode : {rfdetr::TrainLaneMode::Independent, rfdetr::TrainLaneMode::PeriodicAveraging}) {
+  rfdetr::TrainRequest mixed;
+  mixed.h2d_dataloader = true; mixed.train_compiled_path = mmltk::backend::data::testsupport::compiled_bin_path(fixture); mixed.val_compiled_path = mixed.train_compiled_path;
+  mixed.weights_path = weights; mixed.preset_name = config.preset_name; mixed.output_dir = root / (mode == rfdetr::TrainLaneMode::Independent ? "mixed-independent" : "mixed-periodic");
+  mixed.batch_size = 1; mixed.val_batch_size = 12; mixed.num_queries = config.num_queries; mixed.epochs = 1; mixed.lanes = 5; mixed.workers = 4;
+  mixed.use_ema = mode == rfdetr::TrainLaneMode::PeriodicAveraging;
+  mixed.amp = false; mixed.progress_bar = false; mixed.compilation_mode = rfdetr::CompilationMode::kNone;
+  mixed.lane_configuration.mode = mode; mixed.lane_configuration.merge_cadence = rfdetr::TrainMergeCadence::Rounds; mixed.lane_configuration.merge_rounds = 3;
+  mixed.lane_configuration.final_policy = rfdetr::TrainFinalPolicy::Off;
+  rfdetr::resize_training_models(mixed.lane_configuration, 5, mixed.recipe, mixed.seed);
+  const std::array optimizers{rfdetr::TrainOptimizerKind::AdamW, rfdetr::TrainOptimizerKind::Muon, rfdetr::TrainOptimizerKind::SGD, rfdetr::TrainOptimizerKind::AdamW, rfdetr::TrainOptimizerKind::Muon};
+  for (std::size_t i = 0; i < optimizers.size(); ++i) {
+   auto& recipe = mixed.lane_configuration.models[i].recipe;
+   recipe.optimizer = optimizers[i]; recipe.lr_scheduler = rfdetr::TrainLrSchedulerKind::Step;
+  }
+  const auto trained = rfdetr::run_training(mixed);
+  rfdetr::TrainingSessionAdmission saved(trained.checkpoint_path);
+  REQUIRE(saved.models.size() == 5);
+  REQUIRE(saved.manifest.models.size() == 5);
+  for (std::size_t i = 0; i < saved.models.size(); ++i) {
+   CHECK(saved.continuations[i].configuration.recipe.optimizer == optimizers[i]);
+   CHECK(saved.continuations[i].values.schedule.consumed_attempts > 0);
+   CHECK(saved.manifest.models[i].best.has_value());
+   CHECK(saved.manifest.models[i].best->weights == (mixed.use_ema ? rfdetr::EvaluatedWeights::Ema : rfdetr::EvaluatedWeights::Ordinary));
+   if (mixed.use_ema) CHECK(saved.continuations[i].values.ema_completed_updates == saved.continuations[i].values.schedule.consumed_attempts);
+  }
+  const auto [shortest, longest] = std::minmax_element(saved.continuations.begin(), saved.continuations.end(), [](const auto& a, const auto& b) { return a.values.schedule.consumed_attempts < b.values.schedule.consumed_attempts; });
+  CHECK(shortest->values.schedule.consumed_attempts < longest->values.schedule.consumed_attempts);
+  if (mode == rfdetr::TrainLaneMode::PeriodicAveraging) {
+   CHECK(saved.manifest.merge >= 1);
+   CHECK(trained.history.size() == saved.models.size() + 1);
+   CHECK(std::ranges::count_if(trained.history, [](const auto& row) { return row.scope == rfdetr::TrainingRecordScope::SynchronizedSession; }) == 1);
+   for (std::size_t i = 1; i < saved.models.size(); ++i)
+    for (std::size_t tensor = 0; tensor < saved.models.front().entries().size(); ++tensor)
+     CHECK(torch::equal(saved.models.front().entries()[tensor].tensor, saved.models[i].entries()[tensor].tensor));
+  }
+  auto extended = mixed; extended.resume_path = trained.checkpoint_path; extended.weights_path.clear(); extended.epochs = 2;
+  const auto resumed_mixed = rfdetr::run_training(extended);
+  {
+   std::ifstream history(extended.output_dir / "metrics.jsonl");
+   std::string line;
+   bool published = false, later_model = false;
+   while (std::getline(history, line)) {
+    const auto record = mmltk::frameworks::serialization::decode_reflected_json<rfdetr::TrainingRecord>(line, {.max_bytes = rfdetr::kTrainingRecordBytes, .max_items = 8192, .max_depth = 32});
+    if (published) {
+     CHECK(record.progress.full_checkpoint_path == trained.checkpoint_path);
+     later_model |= record.progress.scope == rfdetr::TrainingRecordScope::Model && record.role != rfdetr::TrainingRecordRole::Terminal;
+    }
+    if (record.progress.scope == rfdetr::TrainingRecordScope::Session && record.role == rfdetr::TrainingRecordRole::Epoch) published = true;
+   }
+   CHECK(published); CHECK(later_model);
+  }
+  rfdetr::TrainingSessionAdmission resumed_state(resumed_mixed.checkpoint_path);
+  for (std::size_t i = 0; i < saved.models.size(); ++i) CHECK(resumed_state.continuations[i].values.schedule.consumed_attempts > saved.continuations[i].values.schedule.consumed_attempts);
+  auto no_op = extended; no_op.resume_path = resumed_mixed.checkpoint_path;
+  const auto selected_again = rfdetr::run_training(no_op);
+  CHECK(selected_again.completed_epochs == 0); CHECK(selected_again.last_epoch == 1);
+  REQUIRE(selected_again.selected); CHECK(selected_again.selected->artifact == resumed_mixed.selected->artifact);
+  if (mode == rfdetr::TrainLaneMode::Independent) {
+   // Fail final descriptor publication after an admitted Resume. Existing
+   // complete session generations remain usable and the terminal names them.
+   const auto previous_descriptor = no_op.output_dir / "selected.json";
+   std::filesystem::create_directory(no_op.output_dir / "selected.json.staging");
+   REQUIRE_THROWS(rfdetr::run_training(no_op));
+   std::ifstream input(no_op.output_dir / "progress.json");
+   const auto terminal = mmltk::frameworks::serialization::decode_reflected_json<rfdetr::TrainingProgressDocument>(nlohmann::json::parse(input).dump(), {.max_bytes = rfdetr::kTrainingProgressDocumentBytes, .max_items = 24576, .max_depth = 32});
+   CHECK(terminal.record.progress.phase == rfdetr::TrainingPhase::Error);
+   CHECK(terminal.record.progress.full_checkpoint_path == resumed_mixed.checkpoint_path);
+   CHECK(rfdetr::read_training_selection(previous_descriptor) == *selected_again.selected);
+  }
+ }
 #if defined(USE_C10D_NCCL)
  if (mmltk::testsupport::checked_cuda_device_count() >= 2) {
   for (std::size_t route_index = 0; route_index < routes.size(); ++route_index) {
@@ -1665,7 +1754,8 @@ void test_all_supervision_routes_execute_fixture_backed_training() {
    const auto store_path = distributed_output / "rendezvous";
    std::filesystem::create_directories(distributed_output);
    std::array<std::future<rfdetr::TrainRunResult>, 2> workers;
-   for (int rank = 0; rank < 2; ++rank) {
+   for (int ordinal = 0; ordinal < 2; ++ordinal) {
+    const int rank = route_index % 2 ? 1 - ordinal : ordinal;
     workers[static_cast<std::size_t>(rank)] = std::async(std::launch::async, [&, rank] {
      rfdetr::TrainRequest request;
      request.h2d_dataloader = true;
@@ -1685,6 +1775,17 @@ void test_all_supervision_routes_execute_fixture_backed_training() {
      request.progress_bar = false;
      request.validation_loss = true;
      request.training_supervision = distributed_route;
+     if (route_index < 2) {
+      request.lanes = 3;
+      request.lane_configuration.mode = route_index == 0 ? rfdetr::TrainLaneMode::Independent : rfdetr::TrainLaneMode::PeriodicAveraging;
+      request.lane_configuration.merge_cadence = rfdetr::TrainMergeCadence::Rounds;
+      request.lane_configuration.merge_rounds = 1;
+      request.lane_configuration.final_policy = rfdetr::TrainFinalPolicy::Off;
+      rfdetr::resize_training_models(request.lane_configuration, 3, request.recipe, request.seed);
+      request.lane_configuration.models[1].recipe.optimizer = rfdetr::TrainOptimizerKind::Muon;
+      request.lane_configuration.models[2].recipe.optimizer = rfdetr::TrainOptimizerKind::SGD;
+      if (route_index == 1) std::ranges::reverse(request.lane_configuration.models);
+     }
      if (route_index == 0) { request.gpu_augmentation = rfdetr::test_support::isolated_augmentation_config(1.0F); }
      request.distributed_worker = true;
      request.distributed_rank = rank;
@@ -1704,8 +1805,15 @@ void test_all_supervision_routes_execute_fixture_backed_training() {
     const auto result = workers[rank].get();
     REQUIRE(result.last_epoch == 0);
     if (rank == 0) {
-     REQUIRE(result.history.size() == 1);
+     REQUIRE(result.history.size() == (route_index == 0 ? 3 : 1));
      REQUIRE(std::isfinite(result.history.front().train_loss));
+     if (route_index < 2) {
+      rfdetr::TrainingSessionAdmission distributed_state(result.checkpoint_path);
+      REQUIRE(distributed_state.models.size() == 3);
+      CHECK(distributed_state.manifest.models[0].model_id < distributed_state.manifest.models[1].model_id);
+      if (route_index == 1) for (std::size_t i = 1; i < distributed_state.models.size(); ++i)
+       CHECK(rfdetr::native_state_fingerprint(distributed_state.models[i].entries()) == rfdetr::native_state_fingerprint(distributed_state.models.front().entries()));
+     }
     } else {
      REQUIRE(result.history.empty());
     }
@@ -2311,4 +2419,48 @@ TEST_CASE("Selective native training retains routed objectives gradients optimiz
      selective.optimize_for_inference(2, false, rfdetr::CompilationMode::kNone);
      CHECK(torch::allclose(selective.forward({input.detach(), {}}, false).main.pred_boxes, eager.forward({input.detach(), {}}, false).main.pred_boxes));
     }
+}
+
+TEST_CASE("CLI training quality follows the frozen selection rather than last model history", "[model][rfdetr][training]") {
+ namespace r = mmltk::backend::models::rfdetr;
+ struct Capture final {
+  const spdlog::level::level_enum previous = mmltk::common::logging::level();
+  std::unique_ptr<FILE, decltype(&std::fclose)> file{std::tmpfile(), &std::fclose};
+  mmltk::common::io::ScopedFd saved{::dup(STDOUT_FILENO)};
+  Capture() {
+   if (!file || saved.get() < 0) throw std::runtime_error("cannot capture training summary");
+   std::fflush(stdout);
+   if (::dup2(::fileno(file.get()), STDOUT_FILENO) < 0) throw std::runtime_error("cannot redirect training summary");
+   mmltk::common::logging::set_level(spdlog::level::off);
+  }
+  ~Capture() {
+   std::fflush(stdout); ::dup2(saved.get(), STDOUT_FILENO);
+   mmltk::common::logging::set_level(previous);
+  }
+  std::string read() {
+   std::fflush(stdout); std::rewind(file.get());
+   std::string result;
+   std::array<char, 4096> bytes{};
+   for (auto count = std::fread(bytes.data(), 1, bytes.size(), file.get()); count; count = std::fread(bytes.data(), 1, bytes.size(), file.get())) result.append(bytes.data(), count);
+   return result;
+  }
+ };
+ for (const auto policy : {r::TrainFinalPolicy::Off, r::TrainFinalPolicy::Uniform, r::TrainFinalPolicy::Explicit}) {
+  r::TrainRunResult result;
+  result.selected.emplace();
+  result.selected->method = policy;
+  result.selected->artifact.model_id = policy == r::TrainFinalPolicy::Off ? 1 : 0;
+  result.selected->artifact.selection_metric = policy == r::TrainFinalPolicy::Off ? .8 : .1;
+  result.selected->validation.bbox.ap = *result.selected->artifact.selection_metric;
+  result.selected->best_individual_metric = .8;
+  r::TrainingMetricProgress last;
+  last.model_id = 9; last.train_loss = 7; last.val.emplace(); last.val->bbox.ap = .6;
+  result.history.push_back(last);
+  std::string output;
+  { Capture capture; r::print_training_summary({}, result); output = capture.read(); }
+  CHECK(output.find(policy == r::TrainFinalPolicy::Off ? "selected_val_bbox_ap=0.8000" : "selected_val_bbox_ap=0.1000") != std::string::npos);
+  CHECK(output.find("best_individual_metric=0.8000") != std::string::npos);
+  CHECK(output.find("last_observed_model=9 train_loss=7.000000") != std::string::npos);
+  CHECK(output.find("0.6000") == std::string::npos);
+ }
 }

@@ -104,9 +104,4 @@ void project_loss_coefficients(Destination& destination, const NativeRfDetrConfi
  }
 }
 void apply_stock_training_coefficients(NativeRfDetrConfig& config);
-inline std::string infer_train_recipe_preset_name_from_path(const std::filesystem::path& path) {
- if (path.empty()) { return {}; }
- if (const auto* preset = infer_model_preset_from_path(path)) { return std::string(preset->preset_name); }
- return {};
-}
 }  // namespace mmltk::backend::models::rfdetr

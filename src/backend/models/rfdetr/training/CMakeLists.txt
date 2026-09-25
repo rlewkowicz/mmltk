@@ -36,10 +36,13 @@ mmltk_register_retained_module_importers(
     target_builder.cpp
     train.cpp
     training_lanes.cpp
+    training_model.cpp
     training_snapshot.cpp)
 mmltk_register_ordinary_sources(
     mmltk_backend_models_rfdetr_training
     training_distributed.cpp
+    training_session_checkpoint.cpp
+    model_merging.cpp
     training_gradient_reducer.cpp
     training_data_plan.cpp
     training_schedule.cpp
@@ -53,6 +56,9 @@ mmltk_register_ordinary_sources(
 mmltk_register_private_headers(
     mmltk_backend_models_rfdetr_training
     detail/training_distributed.h
+    detail/training_model.h
+    detail/model_merging.h
+    detail/training_session_checkpoint.h
     detail/training_gradient_reducer.h
     detail/training_data_plan.h
     detail/training_data_state.h
@@ -134,7 +140,8 @@ function(mmltk_add_backend_models_rfdetr_training_tests)
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/execution_policy.test.cpp
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/evaluation_runtime.test.cpp
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/telemetry_writer.test.cpp
-        ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/training_continuation.test.cpp)
+        ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/training_continuation.test.cpp
+        ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/model_merging.test.cpp)
     target_include_directories(
         mmltk_backend_models_rfdetr_training_tests PRIVATE
         ${CMAKE_SOURCE_DIR}

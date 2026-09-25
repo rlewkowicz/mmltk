@@ -1,8 +1,10 @@
 #pragma once
 #include "src/backend/models/rfdetr/core/detection_statistics.h"
+#include "src/common/concurrency/worker_pool.h"
 #include <atomic>
 #include <deque>
 #include <future>
+#include <functional>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -61,11 +63,12 @@ private:
  torch::Tensor values_;
 };
 std::optional<mmltk::backend::ml::cuda::CudaEventPool::Lease> record_current_stream_event(mmltk::backend::ml::cuda::CudaEventPool&, int, const char*);
+[[nodiscard]] std::shared_ptr<NativeRfDetrModel> make_train_lane_model(NativeRfDetrModel&, int device_id);
 void ensure_train_lane_model_supported(NativeRfDetrModel&, int);
 class TrainingLanes final {
 public:
  TrainingLanes(
-  const TrainRequest&, RuntimeContext&, mmltk::backend::data::DatasetLoader&, std::shared_ptr<NativeRfDetrModel>, const std::vector<std::string>&, int lane_count, std::size_t local_batch, const mmltk::frameworks::gpu::DeviceContext&);
+  const TrainRequest&, RuntimeContext&, mmltk::backend::data::DatasetLoader&, std::shared_ptr<NativeRfDetrModel>, const std::vector<std::string>&, int lane_count, std::size_t local_batch, const mmltk::frameworks::gpu::DeviceContext&, std::function<void(std::exception_ptr)> failure = {}, std::shared_ptr<mmltk::common::concurrency::WorkerPool> workers = {});
  ~TrainingLanes();
  TrainingLanes(const TrainingLanes&) = delete;
  TrainingLanes& operator=(const TrainingLanes&) = delete;

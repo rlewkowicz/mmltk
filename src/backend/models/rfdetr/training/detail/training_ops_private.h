@@ -106,7 +106,9 @@ private:
 };
 class GradScaler {
 public:
- explicit GradScaler(bool enabled, float init_scale = 65536.0f, float growth_factor = 2.0f, float backoff_factor = 0.5f, int growth_interval = 2000);
+ static constexpr float kInitialScale = 65536.0f;
+ static constexpr int kGrowthInterval = 2000;
+ explicit GradScaler(bool enabled, float init_scale = kInitialScale, float growth_factor = 2.0f, float backoff_factor = 0.5f, int growth_interval = kGrowthInterval);
  torch::Tensor scale(const torch::Tensor& loss);
  template <typename OptimizerLike>
  torch::Tensor check_and_unscale_(OptimizerLike& optimizer) {

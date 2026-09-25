@@ -165,8 +165,13 @@ preference from the native available-device inventory. Admission captures that
 selection for model preparation and execution; local training retains ordered
 multi-device ranks and their placement. Unavailable selections produce useful
 errors. The browser's graphics device remains independently selected.
-Training additionally owns current-format history, fresh transfer initialization,
-and validated checkpoint continuation.
+Training owns current-format history, fresh transfer initialization, immutable
+whole-session continuation, and selected native deployment artifacts. A session
+replicates every logical trajectory across the selected devices, completes one
+common initialization, and keeps optimizer, scheduler, scaler, stochastic and EMA
+state independent. Periodic synchronization averages compatible ordinary values
+by successful global images while leaving those trajectory states intact. Scheduled
+validation records distinguish individual, synchronized and selected artifacts.
 Native training configuration owns one recipe vocabulary across global defaults
 and stable independent model settings, with checked logical batch and admission
 facts. Global microbatches, accumulation, data identity, and stochastic inputs
@@ -175,10 +180,18 @@ microbatch retains its global criterion normalization and fixed accumulation
 weight; ranks sum its gradients, including zero contributions from empty slices.
 The session orders distributed communication, while a trajectory owns bounded
 reusable gradient storage and physical completion before globally agreed updates.
-Live and saved metrics describe the global trajectory. Training owns
+Live and saved metrics describe global logical progress with stable session and
+model identity. Training owns
 scheduler clocks, held optimizer values, and separate final-epoch encoder and
-augmentation policies. Exact continuation restores these values and complete
-named model state before applying a newly due policy; applied policies remain
+augmentation policies. Exact continuation admits the complete immutable session
+generation before restoring live model and optimizer state. Publication preserves
+the current and previous complete generations and bounded active reader leases.
+Final selection evaluates native ordinary or EMA ingredients from one common
+initialization and validation context; segmentation selection requires mask AP.
+The frozen selected artifact drives final test and the existing export chain,
+while individual artifacts survive selection or publication failure. Deployment
+artifacts support transfer initialization; optimizer Resume requires a complete
+session. Continuation restores applied policy before newly due policy; applied policies remain
 latched when the epoch horizon is extended. Selecting inputs, continuation mode, or an
 output directory never starts a run. Compact operational text fits a stable
 single line while preserving complete accessible and copyable content.
@@ -393,8 +406,9 @@ and retires its failed resources safely. Recoverable runtimes reconstruct
 lazily within that system, while independent systems continue operating.
 Persisted settings retain their named format. Compiled datasets use format 9
 with source geometry and annotation metadata. Native RF-DETR
-checkpoints use only the current version-4 format; external upstream assets retain
-their independent import formats.
+checkpoints use only the current version-4 format. Training history uses version 3,
+and bounded session manifests and selected-output descriptors use version 1.
+External upstream assets retain their independent import formats.
 
 An independent immutable data catalog owns exact foreground names and dense
 zero-based foreground references. Source category IDs, foreground references,
