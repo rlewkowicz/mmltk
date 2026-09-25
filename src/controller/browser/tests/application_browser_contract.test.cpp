@@ -69,6 +69,11 @@ struct InvalidDestinationSettings final {
  [[= mmltk::controller::contracts::reflection::PersistenceMetadata{}]] std::uint16_t persisted = 0U;
  OverrideState overrides;
 };
+struct RecipeScopes final {
+ mmltk::backend::models::rfdetr::TrainRecipeSettings global;
+ mmltk::backend::models::rfdetr::TrainRecipeSettings model;
+};
+MMLTK_REFLECT_FIELDS(RecipeScopes)
 MMLTK_REFLECT_FIELDS(OverrideState)
 MMLTK_REFLECT_FIELDS(Row)
 MMLTK_REFLECT_FIELDS(OrphanSettings)
@@ -1117,6 +1122,56 @@ TEST_CASE("canonical schema publishes unique request and recursive settings iden
   });
  });
  CHECK(relation_count == mmltk::backend::models::rfdetr::kTrainRecipeFieldCount);
+}
+TEST_CASE("canonical recipe inheritance exposes complete flattened fields and discovers one catalog", "[controller][browser][reflection]") {
+ namespace r = mmltk::backend::models::rfdetr;
+ namespace reflection = mmltk::frameworks::reflection;
+ using Relation = reflection::catalog_provider_relation<r::TrainRecipeCatalog>;
+ STATIC_REQUIRE(Relation::audit());
+ STATIC_REQUIRE(std::is_aggregate_v<r::TrainRecipeValues>);
+ STATIC_REQUIRE(std::is_aggregate_v<r::TrainRecipeCatalogEntry>);
+ STATIC_REQUIRE(std::is_aggregate_v<r::TrainRecipeSettings>);
+ std::set<std::string> values;
+ auto value_fields = [&]<class Owner, class Declaration>(const auto& fact) {
+  STATIC_REQUIRE(std::same_as<Owner, r::TrainRecipeValues>);
+  CHECK(values.emplace(fact.member_name).second);
+ };
+ application_schema_detail::visit_fields<r::TrainRecipeCatalogEntry>(value_fields);
+ CHECK(values.size() == r::kTrainRecipeFieldCount + 1U);
+ auto settings_fields = [&]<class Owner, class Declaration>(const auto& fact) {
+  if constexpr (std::same_as<Owner, r::TrainRecipeValues>) CHECK(values.erase(std::string(fact.member_name)) == 1U);
+  else CHECK(fact.member_name == "overrides");
+ };
+ application_schema_detail::visit_fields<r::TrainRecipeSettings>(settings_fields);
+ CHECK(values.empty());
+ std::size_t catalogs = 0U;
+ ApplicationSchema<mmltk::controller::ApplicationSystems>::VisitCatalogProviders([&]<class Provider, class Row>(const auto& fact) {
+  if constexpr (std::same_as<Provider, r::TrainRecipeCatalog>) {
+   STATIC_REQUIRE(std::same_as<Row, r::TrainRecipeCatalogEntry>);
+   CHECK(fact.identity == "rfdetr.train-recipes");
+   ++catalogs;
+  }
+ });
+ CHECK(catalogs == 1U);
+ // The same inherited relation is valid both detached and in repeated roots.
+ std::size_t detached = 0U;
+ ApplicationSchema<TestSystems>::VisitSettingsRelations<r::TrainRecipeSettings>([&]<class Provider, class ValueRelation, auto Selector>() {
+  CHECK(reflection::reflected_member_path<r::TrainRecipeSettings, Selector>().view() == "optimizer");
+  ++detached;
+ });
+ CHECK(detached == 1U);
+ using Scopes = relation_audit_test::RecipeScopes;
+ std::set<std::string> scopes;
+ ApplicationSchema<TestSystems>::VisitSettingsRelations<Scopes>([&]<class Provider, class ValueRelation, auto Selector>() {
+  scopes.emplace(reflection::reflected_member_path<Scopes, Selector>().view());
+  ValueRelation::VisitMembers([&]<class Entry>() {
+   STATIC_REQUIRE(std::same_as<decltype(Entry::source), decltype(Entry::destination)>);
+   constexpr auto source_policy = reflection::accessor_policy<Entry::source>();
+   constexpr auto destination_policy = reflection::accessor_policy<Entry::destination>();
+   STATIC_REQUIRE(source_policy == destination_policy);
+  });
+ });
+ CHECK(scopes == std::set<std::string>{"global.optimizer", "model.optimizer"});
 }
 TEST_CASE("custom model dialogs derive from the canonical compatibility catalog", "[controller][browser][reflection][dialog][model]") {
  const auto entries = services::file_dialog_catalog().entries();

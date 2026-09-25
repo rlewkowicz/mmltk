@@ -1,6 +1,8 @@
 #include "src/backend/models/rfdetr/contract/workflow_requests.h"
 #include <algorithm>
 #include <array>
+#include <concepts>
+#include <cstdint>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -11,6 +13,7 @@
 #include <string>
 #include <string_view>
 #include <tuple>
+#include <type_traits>
 #include <utility>
 #include <vector>
 #include <catch2/catch_test_macros.hpp>
@@ -50,14 +53,15 @@ using TrainOptimizerKind = mmltk::backend::models::rfdetr::TrainOptimizerKind;
 using TrainLrSchedulerKind = mmltk::backend::models::rfdetr::TrainLrSchedulerKind;
 using TrainAssignmentKind = mmltk::backend::models::rfdetr::TrainAssignmentKind;
 using TrainRequest = mmltk::backend::models::rfdetr::TrainRequest;
+using TrainRecipeValues = mmltk::backend::models::rfdetr::TrainRecipeValues;
 using TrainRecipeSettings = mmltk::backend::models::rfdetr::TrainRecipeSettings;
 using TrainRecipeRelation = mmltk::frameworks::reflection::catalog_provider_relation<mmltk::backend::models::rfdetr::TrainRecipeCatalog>;
 template <class Member, class Visitor>
-[[nodiscard]] bool visit_recipe_member(Member TrainRecipeSettings::* member, Visitor&& visitor) {
+[[nodiscard]] bool visit_recipe_member(Member TrainRecipeValues::* member, Visitor&& visitor) {
  bool matched = false;
  TrainRecipeRelation::VisitMembers([&]<class Entry>() {
   constexpr auto destination = std::remove_cvref_t<decltype(Entry::destination)>::terminal_member;
-  if constexpr (std::same_as<std::remove_cvref_t<decltype(destination)>, Member TrainRecipeSettings::*>) {
+  if constexpr (std::same_as<std::remove_cvref_t<decltype(destination)>, Member TrainRecipeValues::*>) {
    if (destination == member) {
     matched = true;
     visitor.template operator()<Entry>();
@@ -67,7 +71,7 @@ template <class Member, class Visitor>
  return matched;
 }
 template <class Member>
-void set_recipe_override(mmltk::backend::models::rfdetr::TrainRecipeOverrideState& state, Member TrainRecipeSettings::* member, const bool overridden) {
+void set_recipe_override(mmltk::backend::models::rfdetr::TrainRecipeOverrideState& state, Member TrainRecipeValues::* member, const bool overridden) {
  const bool matched = visit_recipe_member(member, [&]<class Entry>() {
   if (overridden)
    TrainRecipeRelation::template set_override<Entry::destination>(state);
@@ -77,7 +81,7 @@ void set_recipe_override(mmltk::backend::models::rfdetr::TrainRecipeOverrideStat
  REQUIRE(matched);
 }
 template <class Member>
-[[nodiscard]] bool recipe_overridden(const mmltk::backend::models::rfdetr::TrainRecipeOverrideState& state, Member TrainRecipeSettings::* member) {
+[[nodiscard]] bool recipe_overridden(const mmltk::backend::models::rfdetr::TrainRecipeOverrideState& state, Member TrainRecipeValues::* member) {
  bool result = false;
  const bool matched = visit_recipe_member(member, [&]<class Entry>() { result = TrainRecipeRelation::template overridden<Entry::destination>(state); });
  REQUIRE(matched);
@@ -142,6 +146,12 @@ void test_canonical_recipe_round_trip_and_scoped_overrides() {
   CHECK_FALSE(training.contains("optimizer"));
   const auto& recipe = training.at("recipe");
   CHECK(recipe.size() == r::kTrainRecipeFieldCount + 2);
+  TrainRecipeRelation::VisitMembers([&]<class Entry>() {
+   constexpr auto field = mmltk::frameworks::reflection::reflected_member_path<TrainRecipeSettings, Entry::destination>();
+   CHECK(recipe.contains(std::string(field.view())));
+   CHECK((mmltk::frameworks::reflection::access<const TrainRecipeSettings, Entry::destination>(request.recipe) ==
+          mmltk::frameworks::reflection::access<const r::TrainRecipeCatalogEntry, Entry::source>(row)));
+  });
   CHECK(recipe.at("optimizer") == mmltk::frameworks::reflection::enum_name(row.optimizer));
   CHECK(recipe.at("overrides").at("mask") == (explicit_overrides ? r::kTrainRecipeOverrideBits : 0));
   auto loaded = default_gui_settings_state();
@@ -151,6 +161,37 @@ void test_canonical_recipe_round_trip_and_scoped_overrides() {
   CHECK(loaded == state);
   CHECK(snapshot_gui_settings(loaded) == document);
  }
+}
+void test_recipe_override_masks_keep_the_schema_nine_meanings() {
+ namespace r = mmltk::backend::models::rfdetr;
+ // This is the persisted-format oracle, deliberately independent of declaration order.
+ constexpr std::array<std::pair<std::string_view, std::uint16_t>, 13U> masks{{
+  {"lr", 1U}, {"lr_encoder", 2U}, {"lr_component_decay", 4U}, {"encoder_layer_decay", 8U}, {"momentum", 16U}, {"weight_decay", 32U},
+  {"warmup_epochs", 64U}, {"warmup_momentum", 128U}, {"lr_min_factor", 256U}, {"lr_drop", 512U}, {"lr_scheduler", 1024U}, {"nesterov", 2048U}, {"warmup_bias_lr", 4096U},
+ }};
+ STATIC_REQUIRE(r::kTrainRecipeFieldCount == masks.size());
+ STATIC_REQUIRE(r::kTrainRecipeOverrideBits == 8191U);
+ mmltk::testsupport::ScopedTempDir root{"mmltk-schema-v9-recipe-mask"};
+ std::size_t visited = 0U;
+ TrainRecipeRelation::VisitMembers([&]<class Entry>() {
+  constexpr auto path = mmltk::frameworks::reflection::reflected_member_path<TrainRecipeSettings, Entry::destination>();
+  const auto expected = std::ranges::find(masks, path.view(), [](const auto& entry) { return entry.first; });
+  REQUIRE(expected != masks.end());
+  auto state = default_gui_settings_state();
+  TrainRecipeRelation::set_override<Entry::destination>(state.workflows.train.request.recipe.overrides);
+  const auto document = snapshot_gui_settings(state);
+  const auto& recipe = document.at("workflows").at("train").at("training").at("recipe");
+  CHECK(recipe.at("overrides").at("mask") == expected->second);
+  CHECK(recipe.contains(std::string(path.view())));
+  auto restored = default_gui_settings_state();
+  REQUIRE(load_settings(write_recipe_case(root, "single-mask.json", document), restored));
+  CHECK(restored == state);
+  CHECK(TrainRecipeRelation::overridden<Entry::destination>(restored.workflows.train.request.recipe.overrides));
+  TrainRecipeRelation::clear_override<Entry::destination>(restored.workflows.train.request.recipe.overrides);
+  CHECK(restored.workflows.train.request.recipe.overrides == r::TrainRecipeOverrideState{});
+  ++visited;
+ });
+ CHECK(visited == masks.size());
 }
 void test_partial_current_recipe_preserves_each_missing_member_and_repairs_unknowns() {
  mmltk::testsupport::ScopedTempDir root{"mmltk-schema-v9-partial-recipe"};
@@ -1232,6 +1273,7 @@ void test_apply_current_copy_paste_preference() {
 }
 }  // namespace
 TEST_CASE("canonical recipe and independent overrides persist without flat copies", "[gui][settings]") { test_canonical_recipe_round_trip_and_scoped_overrides(); }
+TEST_CASE("schema nine recipe masks retain every exact field meaning", "[gui][settings]") { test_recipe_override_masks_keep_the_schema_nine_meanings(); }
 TEST_CASE("partial current recipe preserves every member and repairs unknowns", "[gui][settings]") { test_partial_current_recipe_preserves_each_missing_member_and_repairs_unknowns(); }
 TEST_CASE("current recipe rejects invalid values and historical encodings atomically", "[gui][settings]") { test_current_recipe_malformed_values_and_historical_encodings_reject_atomically(); }
 TEST_CASE("test_ui_settings_round_trip", "[gui][settings]") { test_ui_settings_round_trip(); }

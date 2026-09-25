@@ -580,10 +580,133 @@ mod tests {
         assert_eq!(global.optimizer, TrainOptimizerKind::AdamW);
         let mut settings = settings_snapshot().settingsstate;
         settings.workflows.train.request.recipe = global;
-        let resets = reset_relation_trainrecipesettings(&mut settings);
+        let resets = reset_relation_workflowstrainrequestrecipe(&mut settings);
         assert_eq!(resets.len(), TRAIN_RECIPE_CATALOG_RELATION.len());
         assert_eq!(settings.workflows.train.request.recipe.lr, 0.0001);
         assert_eq!(model.lr, 0.01);
+    }
+
+    #[test]
+    fn detached_recipe_defaults_and_effective_values_match_every_catalog_field() {
+        use crate::application_codec::{FromApplicationValue, IntoApplicationValue, Value};
+        use crate::generated::*;
+        let pristine = settings_snapshot().settingsstate.workflows.train.request.recipe;
+        for row in TRAIN_RECIPE_CATALOG {
+            let mut recipe = pristine.clone();
+            // Selection must replace stale unoverridden stored values using the catalog.
+            recipe.lr = 7.0;
+            recipe.warmupbiaslr = 8.0;
+            select_trainrecipesettings(&mut recipe, row.optimizer);
+            let Value::Object(mut expected) = row.clone().into_application_value() else {
+                panic!("recipe catalog must be an object");
+            };
+            expected.push(("overrides".into(), pristine.overrides.clone().into_application_value()));
+            let expected = TrainRecipeSettings::from_application_value(Value::Object(expected)).unwrap();
+            assert_eq!(recipe, expected);
+            assert_eq!(effective_trainrecipesettings_lr(&recipe), row.lr);
+            assert_eq!(effective_trainrecipesettings_lrscheduler(&recipe), row.lrscheduler);
+            assert_eq!(effective_trainrecipesettings_nesterov(&recipe), row.nesterov);
+            let mut settings = settings_snapshot().settingsstate;
+            settings.workflows.train.request.recipe = recipe.clone();
+            let updates = reset_relation_workflowstrainrequestrecipe(&mut settings);
+            assert_eq!(settings.workflows.train.request.recipe, recipe);
+            assert_eq!(updates.len(), TRAIN_RECIPE_CATALOG_RELATION.len());
+            for (update, fact) in updates.iter().zip(TRAIN_RECIPE_CATALOG_RELATION) {
+                assert_eq!(update.path, fact.destination_path);
+                assert_eq!(update.value, Value::Null);
+            }
+            let encoded = recipe.clone().into_application_value();
+            assert_eq!(TrainRecipeSettings::from_application_value(encoded).unwrap(), recipe);
+        }
+    }
+
+    #[test]
+    fn recipe_field_operations_pin_effective_values_and_reset_only_their_field() {
+        use crate::generated::*;
+        type NumericOperations = (
+            TrainRecipeCatalogRelationField,
+            fn(&mut TrainRecipeSettings, f64),
+            fn(&TrainRecipeSettings) -> f64,
+            fn(&mut TrainRecipeSettings),
+        );
+        let operations: &[NumericOperations] = &[
+            (TrainRecipeCatalogRelationField::Lr, edit_trainrecipesettings_lr, effective_trainrecipesettings_lr, reset_trainrecipesettings_lr),
+            (TrainRecipeCatalogRelationField::LrEncoder, edit_trainrecipesettings_lrencoder, effective_trainrecipesettings_lrencoder, reset_trainrecipesettings_lrencoder),
+            (TrainRecipeCatalogRelationField::LrComponentDecay, edit_trainrecipesettings_lrcomponentdecay, effective_trainrecipesettings_lrcomponentdecay, reset_trainrecipesettings_lrcomponentdecay),
+            (TrainRecipeCatalogRelationField::EncoderLayerDecay, edit_trainrecipesettings_encoderlayerdecay, effective_trainrecipesettings_encoderlayerdecay, reset_trainrecipesettings_encoderlayerdecay),
+            (TrainRecipeCatalogRelationField::Momentum, edit_trainrecipesettings_momentum, effective_trainrecipesettings_momentum, reset_trainrecipesettings_momentum),
+            (TrainRecipeCatalogRelationField::WeightDecay, edit_trainrecipesettings_weightdecay, effective_trainrecipesettings_weightdecay, reset_trainrecipesettings_weightdecay),
+            (TrainRecipeCatalogRelationField::WarmupEpochs, edit_trainrecipesettings_warmupepochs, effective_trainrecipesettings_warmupepochs, reset_trainrecipesettings_warmupepochs),
+            (TrainRecipeCatalogRelationField::WarmupMomentum, edit_trainrecipesettings_warmupmomentum, effective_trainrecipesettings_warmupmomentum, reset_trainrecipesettings_warmupmomentum),
+            (TrainRecipeCatalogRelationField::LrMinFactor, edit_trainrecipesettings_lrminfactor, effective_trainrecipesettings_lrminfactor, reset_trainrecipesettings_lrminfactor),
+            (TrainRecipeCatalogRelationField::WarmupBiasLr, edit_trainrecipesettings_warmupbiaslr, effective_trainrecipesettings_warmupbiaslr, reset_trainrecipesettings_warmupbiaslr),
+        ];
+        let pristine = settings_snapshot().settingsstate.workflows.train.request.recipe;
+        for row in TRAIN_RECIPE_CATALOG {
+            let mut defaults = pristine.clone();
+            select_trainrecipesettings(&mut defaults, row.optimizer);
+            for &(field, edit, effective, reset) in operations {
+                let mut recipe = defaults.clone();
+                edit(&mut recipe, 0.375);
+                assert!(recipe.overrides.overridden(field));
+                assert_eq!(effective(&recipe), 0.375);
+                reset(&mut recipe);
+                assert!(!recipe.overrides.overridden(field));
+                assert_eq!(recipe, defaults);
+            }
+            let mut recipe = defaults.clone();
+            edit_trainrecipesettings_lrdrop(&mut recipe, 9);
+            edit_trainrecipesettings_lrscheduler(&mut recipe, TrainLrSchedulerKind::Cosine);
+            edit_trainrecipesettings_nesterov(&mut recipe, true);
+            assert_eq!(effective_trainrecipesettings_lrdrop(&recipe), 9);
+            assert_eq!(effective_trainrecipesettings_lrscheduler(&recipe), TrainLrSchedulerKind::Cosine);
+            assert!(effective_trainrecipesettings_nesterov(&recipe));
+            reset_trainrecipesettings_lrdrop(&mut recipe);
+            assert!(recipe.overrides.overridden(TrainRecipeCatalogRelationField::LrScheduler));
+            reset_trainrecipesettings_lrscheduler(&mut recipe);
+            assert!(recipe.overrides.overridden(TrainRecipeCatalogRelationField::Nesterov));
+            reset_trainrecipesettings_nesterov(&mut recipe);
+            assert_eq!(recipe, defaults);
+            edit_trainrecipesettings_lr(&mut recipe, 0.4);
+            edit_trainrecipesettings_lrdrop(&mut recipe, 9);
+            reset_trainrecipesettings(&mut recipe);
+            assert_eq!(recipe, defaults);
+        }
+    }
+
+    #[test]
+    fn recipe_projection_rejects_invalid_constraints_without_changing_the_draft() {
+        use crate::application_codec::{FromApplicationValue, IntoApplicationValue, Value};
+        use crate::generated::*;
+        let recipe = settings_snapshot().settingsstate.workflows.train.request.recipe;
+        let original = recipe.clone().into_application_value();
+        for fact in TRAIN_RECIPE_CATALOG_RELATION {
+            let leaf = SETTINGS_LEAVES.iter().find(|leaf| leaf.path == fact.destination_path).unwrap();
+            let Value::Object(fields) = &original else { panic!("recipe must be an object") };
+            let (_, current) = fields.iter().find(|(name, _)| name == fact.source_path).unwrap();
+            let mut invalid_values = Vec::new();
+            match current {
+                Value::Float(_) => {
+                    invalid_values.push(Value::Float(f64::INFINITY));
+                    if let Some(minimum) = leaf.minimum {
+                        invalid_values.push(Value::Float(minimum - 1.0));
+                    }
+                    if let Some(maximum) = leaf.maximum {
+                        invalid_values.push(Value::Float(maximum + 1.0));
+                    }
+                }
+                Value::Signed(_) => invalid_values.push(Value::Signed(-1)),
+                Value::Text(_) => invalid_values.push(Value::Text("unknown scheduler".into())),
+                Value::Bool(_) => invalid_values.push(Value::Unsigned(2)),
+                _ => panic!("unexpected recipe field shape"),
+            }
+            for invalid in invalid_values {
+                let mut fields = fields.clone();
+                fields.iter_mut().find(|(name, _)| name == fact.source_path).unwrap().1 = invalid;
+                assert!(TrainRecipeSettings::from_application_value(Value::Object(fields)).is_err());
+            }
+        }
+        assert_eq!(recipe.into_application_value(), original);
     }
 
     #[test]

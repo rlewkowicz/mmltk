@@ -2181,7 +2181,7 @@ pub(super) fn advanced_control_value(
         if index == 2 {
             f64::from(draft.workflows.train.request.epochs)
         } else {
-            crate::generated::effective_workflowstrainrequestrecipelr(&draft.workflows.train.request)
+            crate::generated::effective_trainrecipesettings_lr(&draft.workflows.train.request.recipe)
         }
     })
 }
@@ -2191,8 +2191,8 @@ pub(super) fn advanced_snapshot_value(model: &ApplicationModel, index: usize) ->
         if index == 2 {
             f64::from(snapshot.settingsstate.workflows.train.request.epochs)
         } else {
-            crate::generated::effective_workflowstrainrequestrecipelr(
-                &snapshot.settingsstate.workflows.train.request,
+            crate::generated::effective_trainrecipesettings_lr(
+                &snapshot.settingsstate.workflows.train.request.recipe,
             )
         }
     })
@@ -2218,7 +2218,7 @@ pub(super) fn numeric_edit_target(
         (current.to_string(), f64::from(target), target.to_string())
     } else {
         let current =
-            crate::generated::effective_workflowstrainrequestrecipelr(&draft.workflows.train.request);
+            crate::generated::effective_trainrecipesettings_lr(&draft.workflows.train.request.recipe);
         let constraint = crate::generated::constraint_workflowstrainrequestrecipelr();
         let minimum = constraint.minimum.unwrap_or(f64::MIN);
         let maximum = constraint.maximum.unwrap_or(f64::MAX);

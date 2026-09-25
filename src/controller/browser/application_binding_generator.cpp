@@ -1551,126 +1551,142 @@ private:
    EmitType<Type>();
   }
  }
+ template <class Provider, class Relation>
+ void EmitRelationValueOperations() {
+  const std::string source = NativeSource<Provider>() + " value relation";
+  const std::string provider_name = rust_identifier(mmltk::frameworks::reflection::type_name<Provider>(), true);
+  const std::string field_type = provider_name + "RelationField";
+  const std::string value_type = rust_type<typename Relation::destination_type>();
+  const std::string value_prefix = rust_relation_identifier(mmltk::frameworks::reflection::type_name<typename Relation::destination_type>());
+  const std::string override_type = rust_type<typename Relation::override_state_type>();
+  const std::string rows_name = rust_constant_identifier(mmltk::frameworks::reflection::type_name<Provider>());
+  // One implementation per value type, independent of every settings-root path.
+  if (!symbols_.Reserve("module", "select_" + value_prefix, source)) return;
+  symbols_.Reserve("module", field_type, source);
+  symbols_.Reserve("impl " + field_type, "bit", source);
+  for (const auto method : {"overridden", "set_override", "clear_override"}) symbols_.Reserve("impl " + override_type, method, source);
+  constexpr auto selector = mmltk::frameworks::reflection::reflected_member_path<typename Relation::destination_type, Relation::destination_selector>();
+  constexpr auto source_selector = mmltk::frameworks::reflection::reflected_member_path<typename Relation::source_type, Relation::source_selector>();
+  constexpr auto overrides = mmltk::frameworks::reflection::reflected_member_path<typename Relation::destination_type, Relation::destination_override_state>();
+  const auto visit_fields = [&]<class Visitor>(Visitor&& visitor) {
+   Relation::VisitMembers([&]<class Entry>() {
+    constexpr auto path = mmltk::frameworks::reflection::reflected_member_path<typename Relation::destination_type, Entry::destination>();
+    constexpr auto terminal = std::remove_cvref_t<decltype(Entry::destination)>::terminal_member;
+    const auto variant = rust_identifier(mmltk::frameworks::reflection::materialized_member_name<terminal>(), true);
+    visitor.template operator()<Entry>(path, variant, value_prefix + "_" + rust_identifier(path.view(), false));
+   });
+  };
+  output_ << "#[derive(Debug, Clone, Copy, PartialEq, Eq)]\npub enum " << field_type << " {\n";
+  visit_fields([&]<class Entry>(const auto& path, const auto& variant, const auto&) {
+   symbols_.Reserve("enum " + field_type, variant, source + " " + std::string(path.view()));
+   output_ << variant << ",\n";
+  });
+  output_ << "}\nimpl " << field_type << " { fn bit(self) -> u16 { match self {\n";
+  std::size_t ordinal = 0U;
+  visit_fields([&]<class Entry>(const auto&, const auto& variant, const auto&) {
+   output_ << "Self::" << variant << " => " << (std::uint16_t{1U} << ordinal++) << "u16,\n";
+  });
+  output_ << "} } }\nimpl " << override_type << " {\n"
+          << "pub fn overridden(&self, field: " << field_type << ") -> bool { self.0 & field.bit() != 0 }\n"
+          << "fn set_override(&mut self, field: " << field_type << ") { self.0 |= field.bit(); }\n"
+          << "fn clear_override(&mut self, field: " << field_type << ") { self.0 &= !field.bit(); }\n}\n";
+  visit_fields([&]<class Entry>(const auto& path, const auto& variant, const auto& suffix) {
+   using Field = mmltk::frameworks::reflection::accessor_value_t<typename Relation::destination_type, Entry::destination>;
+   constexpr auto source_path = mmltk::frameworks::reflection::reflected_member_path<typename Relation::source_type, Entry::source>();
+   for (const auto operation : {"effective_", "edit_", "reset_"}) symbols_.Reserve("module", operation + suffix, source + " " + std::string(path.view()));
+   output_ << "pub fn effective_" << suffix << "(state: &" << value_type << ") -> " << rust_type<Field>() << " { if state";
+   emit_rust_field_access(output_, overrides.view());
+   output_ << ".overridden(" << field_type << "::" << variant << ") { state";
+   emit_rust_field_access(output_, path.view());
+   output_ << ".clone() } else { " << rows_name << ".iter().find(|row| row";
+   emit_rust_field_access(output_, source_selector.view());
+   output_ << " == state";
+   emit_rust_field_access(output_, selector.view());
+   output_ << ").unwrap_or(&" << rows_name << "[0])";
+   emit_rust_field_access(output_, source_path.view());
+   output_ << ".clone() } }\n";
+   output_ << "pub fn edit_" << suffix << "(state: &mut " << value_type << ", value: " << rust_type<Field>() << ") { state";
+   emit_rust_field_access(output_, path.view());
+   output_ << " = value; state";
+   emit_rust_field_access(output_, overrides.view());
+   output_ << ".set_override(" << field_type << "::" << variant << "); }\n";
+   output_ << "pub fn reset_" << suffix << "(state: &mut " << value_type << ") { state";
+   emit_rust_field_access(output_, overrides.view());
+   output_ << ".clear_override(" << field_type << "::" << variant << "); let value = effective_" << suffix << "(state); state";
+   emit_rust_field_access(output_, path.view());
+   output_ << " = value; }\n";
+  });
+  symbols_.Reserve("module", "reset_" + value_prefix, source);
+  using SelectorValue = mmltk::frameworks::reflection::accessor_value_t<typename Relation::destination_type, Relation::destination_selector>;
+  output_ << "pub fn select_" << value_prefix << "(state: &mut " << value_type << ", value: " << rust_type<SelectorValue>() << ") { state";
+  emit_rust_field_access(output_, selector.view());
+  output_ << " = value;\n";
+  visit_fields([&]<class Entry>(const auto& path, const auto&, const auto& suffix) {
+   output_ << "state";
+   emit_rust_field_access(output_, path.view());
+   output_ << " = effective_" << suffix << "(state);\n";
+  });
+  output_ << "}\npub fn reset_" << value_prefix << "(state: &mut " << value_type << ") {\n";
+  visit_fields([&]<class Entry>(const auto&, const auto&, const auto& suffix) { output_ << "reset_" << suffix << "(state);\n"; });
+  output_ << "}\n";
+ }
  void EmitSettingsRelations() {
   ReserveGeneratedStruct("SettingsRelationFact", "canonical typed settings relations", {"stable_field_id", "source_path", "destination_path"});
   output_ << "#[derive(Debug, Clone, Copy, PartialEq, Eq)]\n"
              "pub struct SettingsRelationFact { pub stable_field_id: u64, "
              "pub source_path: &'static str, pub destination_path: &'static str }\n";
-  mmltk::controller::browser::ApplicationSchema<ApplicationSystems>::template VisitSettingsRelations<Settings>([&]<class Provider, class Relation, auto Selector>() {
-   const std::string provider_name = rust_identifier(mmltk::frameworks::reflection::type_name<Provider>(), true);
-   const std::string field_type = provider_name + "RelationField";
-   const std::string facts_name = rust_constant_identifier(provider_name) + "_RELATION";
-   const std::string rows_name = rust_constant_identifier(mmltk::frameworks::reflection::type_name<Provider>());
-   symbols_.Reserve("module", field_type, NativeSource<Provider>() + " settings relation");
-   symbols_.Reserve("module", facts_name, NativeSource<Provider>() + " settings relation facts");
-   output_ << "#[derive(Debug, Clone, Copy, PartialEq, Eq)]\npub enum " << field_type << " {\n";
-   Relation::VisitMembers([&]<class Entry>() {
-    constexpr auto terminal = std::remove_cvref_t<decltype(Entry::destination)>::terminal_member;
-    output_ << rust_identifier(mmltk::frameworks::reflection::materialized_member_name<terminal>(), true) << ",\n";
-   });
-   const auto emit_relation_bit_arms = [&] {
-    std::size_t ordinal = 0U;
-    Relation::VisitMembers([&]<class Entry>() {
-     constexpr auto terminal = std::remove_cvref_t<decltype(Entry::destination)>::terminal_member;
-     output_ << field_type << "::" << rust_identifier(mmltk::frameworks::reflection::materialized_member_name<terminal>(), true) << " => " << (std::uint16_t{1U} << ordinal++) << "u16,\n";
+  Schema::VisitCatalogProviders([&]<class Provider, class Row>(const auto&) {
+   if constexpr (mmltk::frameworks::reflection::HasCatalogProviderRelation<Provider>) {
+    using Relation = mmltk::frameworks::reflection::catalog_provider_relation<Provider>;
+    EmitRelationValueOperations<Provider, Relation>();
+    const std::string facts_name = rust_constant_identifier(mmltk::frameworks::reflection::type_name<Provider>()) + "_RELATION";
+    symbols_.Reserve("module", facts_name, NativeSource<Provider>() + " settings relation facts");
+    output_ << "pub static " << facts_name << ": &[SettingsRelationFact] = &[\n";
+    Schema::template VisitSettingsRelations<Settings>([&]<class PathProvider, class PathRelation, auto Selector>() {
+     if constexpr (std::same_as<Provider, PathProvider>) {
+      Relation::VisitMembers([&]<class Entry>() {
+       constexpr auto destination = mmltk::frameworks::reflection::rebase_member_path<Settings, typename Relation::destination_type>(Selector, Entry::destination);
+       constexpr auto path = mmltk::frameworks::reflection::reflected_member_path<Settings, destination>();
+       constexpr auto source = mmltk::frameworks::reflection::reflected_member_path<typename Relation::source_type, Entry::source>();
+       output_ << "SettingsRelationFact { stable_field_id: " << mmltk::controller::browser::application_settings_field_stable_id(path.view())
+               << ", source_path: " << std::quoted(source.view()) << ", destination_path: " << std::quoted(path.view()) << " },\n";
+      });
+     }
     });
-   };
-   output_ << "}\nimpl " << rust_type<typename Relation::override_state_type>() << " {\n"
-           << "pub fn overridden(&self, field: " << field_type << ") -> bool { let bit = match field {\n";
-   emit_relation_bit_arms();
-   output_ << "}; self.0 & bit != 0 }\n"
-              "fn set_override(&mut self, field: "
-           << field_type << ") { self.0 |= match field {\n";
-   emit_relation_bit_arms();
-   output_ << "}; }\nfn clear_override(&mut self, field: " << field_type << ") { self.0 &= !(match field {\n";
-   emit_relation_bit_arms();
-   output_ << "}); }\n}\npub static " << facts_name << ": &[SettingsRelationFact] = &[\n";
-   constexpr auto selector_path = mmltk::frameworks::reflection::reflected_member_path<Settings, Selector>();
-   constexpr auto override_path = mmltk::frameworks::reflection::rebase_member_path<Settings, typename Relation::destination_type>(Selector, Relation::destination_override_state);
-   constexpr auto rendered_override_path = mmltk::frameworks::reflection::reflected_member_path<Settings, override_path>();
-   const auto visit_relation_fields = [&]<class Visitor>(Visitor&& visitor) {
-    Relation::VisitMembers([&]<class Entry>() {
-     constexpr auto destination = mmltk::frameworks::reflection::rebase_member_path<Settings, typename Relation::destination_type>(Selector, Entry::destination);
-     constexpr auto destination_path = mmltk::frameworks::reflection::reflected_member_path<Settings, destination>();
-     constexpr auto source_path = mmltk::frameworks::reflection::reflected_member_path<typename Relation::source_type, Entry::source>();
-     visitor.template operator()<Entry>(destination_path, source_path);
-    });
-   };
-   visit_relation_fields([&]<class Entry>(const auto& destination_path, const auto& source_path) {
-    output_ << "SettingsRelationFact { stable_field_id: " << mmltk::controller::browser::application_settings_field_stable_id(destination_path.view())
-            << ", source_path: " << std::quoted(source_path.view()) << ", destination_path: " << std::quoted(destination_path.view()) << " },\n";
-   });
-   output_ << "];\n";
-   visit_relation_fields([&]<class Entry>(const auto& destination_path, const auto& source_path) {
-    using Field = mmltk::frameworks::reflection::accessor_value_t<typename Relation::destination_type, Entry::destination>;
-    constexpr auto source_selector_path = mmltk::frameworks::reflection::reflected_member_path<typename Relation::source_type, Relation::source_selector>();
-    constexpr auto terminal = std::remove_cvref_t<decltype(Entry::destination)>::terminal_member;
-    const std::string variant = rust_identifier(mmltk::frameworks::reflection::materialized_member_name<terminal>(), true);
-    const std::string suffix = rust_identifier(destination_path.view(), false);
-    constexpr auto relative_override_path = mmltk::frameworks::reflection::reflected_member_path<typename Relation::destination_type, Relation::destination_override_state>();
-    constexpr auto relative_destination_path = mmltk::frameworks::reflection::reflected_member_path<typename Relation::destination_type, Entry::destination>();
-    constexpr auto relative_selector_path = mmltk::frameworks::reflection::reflected_member_path<typename Relation::destination_type, Relation::destination_selector>();
-    const auto emit_effective_value = [&](const std::string_view state_override_path, const std::string_view state_destination_path, const std::string_view state_selector_path) {
-     output_ << "if state";
-     emit_rust_field_access(output_, state_override_path);
-     output_ << ".overridden(" << field_type << "::" << variant << ") { state";
-     emit_rust_field_access(output_, state_destination_path);
-     output_ << ".clone() } else { " << rows_name << ".iter().find(|row| row";
-     emit_rust_field_access(output_, source_selector_path.view());
-     output_ << " == state";
-     emit_rust_field_access(output_, state_selector_path);
-     output_ << ").unwrap_or(&" << rows_name << "[0])";
-     emit_rust_field_access(output_, source_path.view());
-     output_ << ".clone() }";
-    };
-    output_ << "pub fn effective_" << suffix << "(state: &" << rust_type<typename Relation::destination_type>() << ") -> " << rust_type<Field>() << " { ";
-    emit_effective_value(relative_override_path.view(), relative_destination_path.view(), relative_selector_path.view());
-    output_ << " }\n";
-    output_ << "pub fn edit_relation_" << suffix << "(state: &mut " << rust_type<Settings>() << ", value: " << rust_type<Field>() << ") -> SettingsValueUpdate { state";
-    emit_rust_field_access(output_, destination_path.view());
-    output_ << " = value.clone(); state";
-    emit_rust_field_access(output_, rendered_override_path.view());
-    output_ << ".set_override(" << field_type << "::" << variant << "); update_" << suffix << "(value) }\n";
-    output_ << "pub fn clear_relation_" << suffix << "(state: &mut " << rust_type<Settings>() << ") -> SettingsValueUpdate { state";
-    emit_rust_field_access(output_, rendered_override_path.view());
-    output_ << ".clear_override(" << field_type << "::" << variant << "); let value = ";
-    emit_effective_value(rendered_override_path.view(), destination_path.view(), selector_path.view());
-    output_ << "; state";
-    emit_rust_field_access(output_, destination_path.view());
-    output_ << " = value; SettingsValueUpdate { path: " << std::quoted(destination_path.view()) << ".into(), value: Value::Null } }\n";
-    const std::string value_suffix = rust_relation_identifier(mmltk::frameworks::reflection::type_name<typename Relation::destination_type>()) + "_" + rust_identifier(relative_destination_path.view(), false);
-    output_ << "pub fn effective_" << value_suffix << "(state: &" << rust_type<typename Relation::destination_type>() << ") -> " << rust_type<Field>() << " { effective_" << suffix << "(state) }\n";
-    output_ << "pub fn edit_" << value_suffix << "(state: &mut " << rust_type<typename Relation::destination_type>() << ", value: " << rust_type<Field>() << ") { state";
-    emit_rust_field_access(output_, relative_destination_path.view());
-    output_ << " = value; state";
-    emit_rust_field_access(output_, relative_override_path.view());
-    output_ << ".set_override(" << field_type << "::" << variant << "); }\n";
-    output_ << "pub fn reset_" << value_suffix << "(state: &mut " << rust_type<typename Relation::destination_type>() << ") { state";
-    emit_rust_field_access(output_, relative_override_path.view());
-    output_ << ".clear_override(" << field_type << "::" << variant << "); let value = effective_" << value_suffix << "(state); state";
-    emit_rust_field_access(output_, relative_destination_path.view());
-    output_ << " = value; }\n";
-   });
+    output_ << "];\n";
+   }
+  });
+  Schema::template VisitSettingsRelations<Settings>([&]<class Provider, class Relation, auto Selector>() {
+   constexpr auto selector = mmltk::frameworks::reflection::reflected_member_path<Settings, Selector>();
+   const auto separator = selector.view().rfind('.');
+   const auto parent = separator == std::string_view::npos ? std::string_view{} : selector.view().substr(0U, separator);
    const std::string value_prefix = rust_relation_identifier(mmltk::frameworks::reflection::type_name<typename Relation::destination_type>());
-   using SelectorValue = mmltk::frameworks::reflection::accessor_value_t<typename Relation::destination_type, Relation::destination_selector>;
-   constexpr auto relative_selector = mmltk::frameworks::reflection::reflected_member_path<typename Relation::destination_type, Relation::destination_selector>();
-   output_ << "pub fn select_" << value_prefix << "(state: &mut " << rust_type<typename Relation::destination_type>() << ", value: " << rust_type<SelectorValue>() << ") { state";
-   emit_rust_field_access(output_, relative_selector.view());
-   output_ << " = value;\n";
+   const std::string source = NativeSource<Provider>() + " settings relation " + std::string(parent);
    Relation::VisitMembers([&]<class Entry>() {
-    constexpr auto path = mmltk::frameworks::reflection::reflected_member_path<typename Relation::destination_type, Entry::destination>();
-    output_ << "state";
-    emit_rust_field_access(output_, path.view());
-    output_ << " = effective_" << value_prefix << "_" << rust_identifier(path.view(), false) << "(state);\n";
+    using Field = mmltk::frameworks::reflection::accessor_value_t<typename Relation::destination_type, Entry::destination>;
+    constexpr auto destination = mmltk::frameworks::reflection::rebase_member_path<Settings, typename Relation::destination_type>(Selector, Entry::destination);
+    constexpr auto path = mmltk::frameworks::reflection::reflected_member_path<Settings, destination>();
+    constexpr auto relative = mmltk::frameworks::reflection::reflected_member_path<typename Relation::destination_type, Entry::destination>();
+    const auto suffix = rust_identifier(path.view(), false);
+    const auto value_suffix = value_prefix + "_" + rust_identifier(relative.view(), false);
+    symbols_.Reserve("module", "edit_relation_" + suffix, source + " " + std::string(relative.view()));
+    symbols_.Reserve("module", "clear_relation_" + suffix, source + " " + std::string(relative.view()));
+    output_ << "pub fn edit_relation_" << suffix << "(state: &mut " << rust_type<Settings>() << ", value: " << rust_type<Field>()
+            << ") -> SettingsValueUpdate { edit_" << value_suffix << "(&mut state";
+    emit_rust_field_access(output_, parent);
+    output_ << ", value.clone()); update_" << suffix << "(value) }\n";
+    output_ << "pub fn clear_relation_" << suffix << "(state: &mut " << rust_type<Settings>() << ") -> SettingsValueUpdate { reset_" << value_suffix << "(&mut state";
+    emit_rust_field_access(output_, parent);
+    output_ << "); SettingsValueUpdate { path: " << std::quoted(path.view()) << ".into(), value: Value::Null } }\n";
    });
-   output_ << "}\n";
-   output_ << "pub fn reset_" << value_prefix << "(state: &mut " << rust_type<typename Relation::destination_type>() << ") {\n";
+   const std::string reset = "reset_relation_" + (parent.empty() ? value_prefix : rust_identifier(parent, false));
+   symbols_.Reserve("module", reset, source);
+   output_ << "pub fn " << reset << "(state: &mut " << rust_type<Settings>() << ") -> [SettingsValueUpdate; " << Relation::member_count << "] { [\n";
    Relation::VisitMembers([&]<class Entry>() {
-    constexpr auto path = mmltk::frameworks::reflection::reflected_member_path<typename Relation::destination_type, Entry::destination>();
-    output_ << "reset_" << value_prefix << "_" << rust_identifier(path.view(), false) << "(state);\n";
+    constexpr auto destination = mmltk::frameworks::reflection::rebase_member_path<Settings, typename Relation::destination_type>(Selector, Entry::destination);
+    constexpr auto path = mmltk::frameworks::reflection::reflected_member_path<Settings, destination>();
+    output_ << "clear_relation_" << rust_identifier(path.view(), false) << "(state),\n";
    });
-   output_ << "}\npub fn reset_relation_" << value_prefix << "(state: &mut " << rust_type<Settings>() << ") -> [SettingsValueUpdate; " << Relation::member_count << "] { [\n";
-   visit_relation_fields([&]<class Entry>(const auto& path, const auto&) { output_ << "clear_relation_" << rust_identifier(path.view(), false) << "(state),\n"; });
    output_ << "] }\n";
   });
  }

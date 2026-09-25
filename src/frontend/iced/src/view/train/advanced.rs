@@ -37,7 +37,7 @@ fn recipe(optimizer: TrainOptimizerKind) -> &'static crate::generated::TrainReci
 }
 
 fn effective_scheduler(request: &crate::generated::TrainRequest) -> TrainLrSchedulerKind {
-    crate::generated::effective_workflowstrainrequestrecipelrscheduler(&request.recipe)
+    crate::generated::effective_trainrecipesettings_lrscheduler(&request.recipe)
 }
 
 const fn optimizer_label(optimizer: TrainOptimizerKind) -> &'static str {
@@ -112,7 +112,7 @@ pub fn update(model: &mut SettingsModel, message: Message) -> Result<EditSchedul
             crate::generated::edit_workflowstrainrequestfreezeencoder(draft, value)
         }),
         Message::Supervision(message) => supervision::update(model, message),
-        Message::UseOptimizerDefaults => model.edit_group(cadence, crate::generated::reset_relation_trainrecipesettings),
+        Message::UseOptimizerDefaults => model.edit_group(cadence, crate::generated::reset_relation_workflowstrainrequestrecipe),
     }
 }
 
@@ -129,11 +129,11 @@ pub fn view<'a>(
         );
     };
     let request = &train.request;
-    let lr = crate::generated::effective_workflowstrainrequestrecipelr(&request.recipe);
-    let lr_encoder = crate::generated::effective_workflowstrainrequestrecipelrencoder(&request.recipe);
+    let lr = crate::generated::effective_trainrecipesettings_lr(&request.recipe);
+    let lr_encoder = crate::generated::effective_trainrecipesettings_lrencoder(&request.recipe);
     let scheduler = effective_scheduler(request);
-    let weight_decay = crate::generated::effective_workflowstrainrequestrecipeweightdecay(&request.recipe);
-    let momentum = crate::generated::effective_workflowstrainrequestrecipemomentum(&request.recipe);
+    let weight_decay = crate::generated::effective_trainrecipesettings_weightdecay(&request.recipe);
+    let momentum = crate::generated::effective_trainrecipesettings_momentum(&request.recipe);
     let optimizer_choices =
         crate::generated::TRAIN_RECIPE_CATALOG
             .iter()

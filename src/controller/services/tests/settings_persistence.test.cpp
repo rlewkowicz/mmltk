@@ -8,6 +8,7 @@
 #include <catch2/catch_test_macros.hpp>
 #include <atomic>
 #include <barrier>
+#include <concepts>
 #include <cstdint>
 #include <filesystem>
 #include <future>
@@ -15,7 +16,9 @@
 #include <memory>
 #include <stdexcept>
 #include <stop_token>
+#include <string>
 #include <thread>
+#include <type_traits>
 #include <utility>
 #include <variant>
 using namespace mmltk::controller::test_support;
@@ -232,6 +235,51 @@ TEST_CASE("settings rejects empty updates without persisting and accepts relatio
  CHECK(cleared.revision == pinned.revision + 1U);
  CHECK_FALSE(TrainRecipeRelation::template overridden<lr>(cleared.settings_state.workflows.train.request.recipe.overrides));
  CHECK(cleared.settings_state.workflows.train.request.recipe.lr == mmltk::backend::models::rfdetr::train_recipe(cleared.settings_state.workflows.train.request.recipe.optimizer).lr);
+}
+TEST_CASE("all recipe field clears resolve the selected catalog and preserve model recipes", "[controller][systems][settings]") {
+ namespace r = mmltk::backend::models::rfdetr;
+ namespace reflection = mmltk::frameworks::reflection;
+ using Relation = reflection::catalog_provider_relation<r::TrainRecipeCatalog>;
+ using Value = mmltk::frameworks::serialization::wire::FlatValue;
+ for (const auto& row : r::kTrainRecipeCatalog) {
+  const mmltk::testsupport::ScopedTempDir root("scoped-recipe-clears");
+  SettingsSystem settings;
+  REQUIRE(settings.Load(install_settings(root.path())).applied());
+  auto lanes = settings.snapshot().settings_state.workflows.train.request.lane_configuration;
+  r::resize_training_models(lanes, 1, settings.snapshot().settings_state.workflows.train.request.recipe, 42);
+  lanes.models.front().recipe.lr = .031;
+  Relation::set_override<reflection::member_path<&r::TrainRecipeSettings::lr>>(lanes.models.front().recipe.overrides);
+  contracts::SettingsUpdateRequest select;
+  select.lane_configuration = lanes;
+  select.updates.push_back({"workflows.train.request.recipe.optimizer", Value{std::string(reflection::enum_name(row.optimizer))}});
+  const auto selected = settings.Update(std::move(select));
+  CHECK(static_cast<const r::TrainRecipeValues&>(selected.settings_state.workflows.train.request.recipe) == static_cast<const r::TrainRecipeValues&>(row));
+  Relation::VisitMembers([&]<class Entry>() {
+   constexpr auto relative = reflection::reflected_member_path<r::TrainRecipeSettings, Entry::destination>();
+   const std::string path = "workflows.train.request.recipe." + std::string(relative.view());
+   const auto field = reflection::access<const r::TrainRecipeCatalogEntry, Entry::source>(row);
+   const auto wire = [&] {
+    using Field = std::remove_cvref_t<decltype(field)>;
+    if constexpr (std::is_enum_v<Field>) return Value{std::string(reflection::enum_name(field))};
+    else if constexpr (std::same_as<Field, int>) return Value{static_cast<std::int64_t>(field)};
+    else return Value{field};
+   }();
+   contracts::SettingsUpdateRequest pin;
+   pin.updates.push_back({path, wire});
+   const auto pinned = settings.Update(std::move(pin));
+   CHECK(Relation::overridden<Entry::destination>(pinned.settings_state.workflows.train.request.recipe.overrides));
+   contracts::SettingsUpdateRequest clear;
+   clear.updates.push_back({path, Value{std::monostate{}}});
+   const auto cleared = settings.Update(std::move(clear));
+   CHECK(cleared.revision == pinned.revision + 1U);
+   CHECK_FALSE(Relation::overridden<Entry::destination>(cleared.settings_state.workflows.train.request.recipe.overrides));
+   CHECK(static_cast<const r::TrainRecipeValues&>(cleared.settings_state.workflows.train.request.recipe) == static_cast<const r::TrainRecipeValues&>(row));
+   CHECK(cleared.settings_state.workflows.train.request.lane_configuration == lanes);
+  });
+  SettingsSystem restored;
+  REQUIRE(restored.Load(services::SettingsLocation{(root.path() / "settings.json").string()}).applied());
+  CHECK(restored.snapshot().settings_state == settings.snapshot().settings_state);
+ }
 }
 TEST_CASE("Explore catalog identity changes only through successful catalog persistence", "[controller][systems][settings][explore]") {
  const auto root = mmltk::testsupport::make_temp_root("ordinary-settings-explore-catalog");
