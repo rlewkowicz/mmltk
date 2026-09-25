@@ -3,7 +3,6 @@
 #include "detail/training_lanes.h"
 #include "detail/training_step.h"
 #include "detail/training_gradient_reducer.h"
-#include "src/frameworks/serialization/reflected_cbor.h"
 #include "src/common/io/file_digest.h"
 #include "detail/training_metrics.h"
 #include <ATen/cuda/CUDAContext.h>
@@ -20,8 +19,6 @@
 #include <cuda_runtime.h>
 #include <format>
 #include <iomanip>
-#include <concepts>
-#include <bit>
 #include <array>
 #include <print>
 #include <spdlog/spdlog.h>
@@ -56,10 +53,7 @@
 #include "detail/training_continuation.h"
 #include "detail/training_data_plan.h"
 #include "detail/model_ema.h"
-#if defined(USE_C10D_NCCL)
-#include <torch/csrc/distributed/c10d/FileStore.hpp>
-#include <torch/csrc/distributed/c10d/ProcessGroupNCCL.hpp>
-#endif
+#include "detail/training_distributed.h"
 #include <algorithm>
 #include <atomic>
 #include <cctype>
@@ -75,6 +69,7 @@
 #include <memory>
 #include <mutex>
 #include <numeric>
+#include <meta>
 #include <optional>
 #include <random>
 #include <sstream>
@@ -132,36 +127,6 @@ double checkpoint_metric(const EvalSummary& summary, const bool include_masks) {
  return summary.mask->ap;
 }
 std::string formatted_mask_ap(const EvalSummary& summary) { return summary.mask.has_value() ? std::format("{:.4f}", summary.mask->ap) : "null"; }
-DistributedContext make_distributed_context(const TrainRequest& options) {
- DistributedContext distributed;
- distributed.device_id = options.device_id;
- if (!options.distributed_worker || options.distributed_world_size <= 1) { return distributed; }
- if (options.distributed_store_path.empty()) { throw std::runtime_error("distributed RF-DETR worker requires --dist-store-file"); }
- if (options.distributed_rank < 0 || options.distributed_rank >= options.distributed_world_size) { throw std::runtime_error("distributed RF-DETR worker rank is out of range"); }
-#if !defined(USE_C10D_NCCL)
- throw std::runtime_error("distributed RF-DETR training requires a LibTorch build with NCCL/c10d enabled");
-#else
- distributed.enabled = true;
- distributed.rank = options.distributed_rank;
- distributed.world_size = options.distributed_world_size;
- torch_cuda::TorchCudaDeviceGuard device_guard(mmltk::backend::ml::cuda::checked_device_index(options.device_id));
- distributed.store = c10::make_intrusive<c10d::FileStore>(options.distributed_store_path.string(), options.distributed_world_size);
- auto pg_options = c10::make_intrusive<c10d::ProcessGroupNCCL::Options>();
- pg_options->timeout = c10d::kProcessGroupNCCLDefaultTimeout;
- distributed.process_group = c10::make_intrusive<c10d::ProcessGroupNCCL>(distributed.store, distributed.rank, distributed.world_size, std::move(pg_options));
- distributed.process_group->setBoundDeviceId(mmltk::backend::ml::cuda::cuda_device(options.device_id));
- return distributed;
-#endif
-}
-void distributed_barrier(const DistributedContext& distributed) {
- if (!distributed.enabled) { return; }
-#if defined(USE_C10D_NCCL)
- distributed.process_group->barrier()->wait();
-#else
- (void)distributed;
- throw std::runtime_error("distributed RF-DETR training requires a LibTorch build with NCCL/c10d enabled");
-#endif
-}
 // Prediction layout and selected distributed world; criterion normalization is global.
 void apply_detection_scale(DetectionConfig& detection_config, const NativeRfDetrConfig& config, const int64_t world_size) {
  detection_config.num_classes = config.num_classes;
@@ -201,34 +166,6 @@ DetectionConfig make_detection_config(const NativeRfDetrConfig& config, int64_t 
  apply_detection_box_weights(detection_config, config);
  populate_default_detection_weight_dict(detection_config);
  return detection_config;
-}
-template <class Value>
-void agree_training_value(const DistributedContext& distributed, std::string_view turn, const Value& value) {
- if (!distributed.enabled) return;
- namespace serialization = mmltk::frameworks::serialization;
- serialization::wire::ByteBuffer bytes;
- mmltk::common::io::Sha256Hasher signature;
- // Project canonical fields, including inherited request fields. Archive
- // scalar doubles preserve IEEE identity: an unset best metric is -infinity,
- // which the nested finite-value CBOR representation deliberately rejects.
- mmltk::frameworks::reflection::visit_materialized_members<Value>([&]<class Declaration>(const auto&) {
-  const auto& field = value.*Declaration::pointer;
-  using Field = std::remove_cvref_t<decltype(field)>;
-  mmltk::common::io::Sha256Digest digest;
-  if constexpr (std::is_floating_point_v<Field>)
-   digest = mmltk::common::io::sha256_bytes(std::bit_cast<std::array<std::uint8_t, sizeof(Field)>>(field));
-  else {
-   if (!serialization::encode(field, bytes, {.max_bytes = serialization::reflected_maximum_cbor_bytes<Value>(), .max_items = std::numeric_limits<std::uint64_t>::max(), .max_depth = 32}))
-    throw std::runtime_error("cannot encode training admission");
-   digest = mmltk::common::io::sha256_bytes({reinterpret_cast<const std::uint8_t*>(bytes.data()), bytes.size()});
-  }
-  signature.Update(digest);
- });
- const auto digest = signature.Finish();
- distributed_agree(distributed, turn, digest);
-}
-void agree_training_text(const DistributedContext& distributed, std::string_view turn, const std::string& value) {
- distributed_agree(distributed, turn, {reinterpret_cast<const std::uint8_t*>(value.data()), value.size()});
 }
 class DistributedFailureScope final {
 public:
@@ -289,12 +226,7 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
  DistributedContext distributed = make_distributed_context(options);
  DistributedFailureScope distributed_failure(distributed);
  agree_training_topology(distributed, options.device_id);
- auto common_request = options;
- // Rank placement is captured separately by the ordered topology. Physical CPU
- // budgets may differ; they never enter the mathematical request signature.
- common_request.device_id = 0; common_request.distributed_rank = 0;
- common_request.numa_node = -1; common_request.cpu_affinity.clear(); common_request.workers = 0;
- agree_training_value(distributed, "request", common_request);
+ agree_training_request(distributed, options);
  // The launcher selects local GPUs and shares these exact files. Agree the
  // complete inode/version identity, then require it unchanged after admission;
  // do not reread every compiled pixel on every rank to calculate a digest.
@@ -503,7 +435,7 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
  double best_regular = -std::numeric_limits<double>::infinity();
  double best_ema = -std::numeric_limits<double>::infinity();
  for (const auto& [path, snapshot] : admitted_files) snapshot.RequireUnchanged(path);
- if (continuation) agree_training_value(distributed, "continuation", continuation->values);
+ if (continuation) agree_training_continuation(distributed, continuation->values);
  if (!options.resume_path.empty()) {
   ResumeState resume_state = load_resume_checkpoint_state(options.resume_path, admitted.model_state, *continuation, optimizer, eligible_names, eligible_params);
   if (resume_model_candidate.has_value()) model.commit_normalized_state(std::move(*resume_model_candidate));
@@ -522,7 +454,7 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
  agree_training_text(distributed, "optimizer-precision", std::string(optimizer.backend_name()) + ":" + std::to_string(static_cast<int>(autocast_dtype)) + ":" + std::to_string(grad_scaler.current_scale()) + ":" + std::to_string(grad_scaler.growth_tracker()));
  if (options.resume_path.empty()) broadcast_training_model(distributed, model);
  if (options.resume_path.empty() && options.use_ema) ema.emplace(eligible_params, options.ema_decay, static_cast<double>(options.ema_tau));
- if (ema) for (auto value : ema->shadow_params()) distributed_broadcast(distributed, value);
+ if (ema) broadcast_training_tensors(distributed, ema->shadow_params());
  detail::TrainingContinuationValues continuation_values = continuation ? continuation->values : detail::TrainingContinuationValues{};
  TrainingSchedule schedule(options.recipe, optimizer_build.base_lrs, optimizer_build.roles, options.epochs, epoch_draws.microbatches, admitted_microbatches);
  if (continuation) {
@@ -833,10 +765,10 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
     }
     // Counts have identical scalar shape/order even when physical wave widths
     // differ by rank. No worker is needed to produce an unadmitted count.
-    wave.resolve_counts(torch_cuda::cuda_device(options.device_id));
+    wave.resolve_counts();
     contributed += wave_size;
     if (contributed == admitted_microbatches) reducer.enable_gradient_launch_after_counts();
-    wave.settle(torch_cuda::cuda_device(options.device_id), [&](TrainLaneResult& value) {
+    wave.settle([&](TrainLaneResult& value) {
      train_lanes.settle(value, options.device_id);
      loss_report.accumulate(std::move(value.loss_terms));
      metric_handoff.accumulate(value.loss, value.class_loss, value.box_loss, value.scalars, value.diagnostics);
@@ -966,13 +898,7 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
   progress_writer->Finish(last_training_progress, std::move(final));
  }
  distributed_barrier(distributed);
- if (distributed.enabled) {
-#if defined(USE_C10D_NCCL)
-  distributed.process_group->shutdown();
-  distributed.process_group.reset();
-  distributed.store.reset();
-#endif
- }
+ distributed_shutdown(distributed);
  if (main_process) { progress_writer->Close(); }
  return result;
 }

@@ -1,4 +1,7 @@
 #include "training_gradient_fixture.h"
+#include "src/backend/models/rfdetr/training/detail/training_ops_private.h"
+#include <torch/csrc/distributed/c10d/Backend.hpp>
+#include <torch/csrc/distributed/c10d/Store.hpp>
 #include "src/backend/models/rfdetr/core/tests/checkpoint_fixture_support/checkpoint_fixture_support.h"
 #include "src/backend/models/rfdetr/training/detail/training_gradient_reducer.h"
 #include "src/backend/models/rfdetr/training/detail/training_lanes.h"
@@ -23,8 +26,20 @@
 #include <sstream>
 #include <stdexcept>
 #include <vector>
+#include <set>
+#include <atomic>
 namespace mmltk::backend::models::rfdetr::testsupport {
 namespace tc = mmltk::backend::ml::cuda;
+DistributedContext TrainingDistributedTestAccess::backend(c10::intrusive_ptr<c10d::Backend> value, int rank, int device) { return DistributedContext::from_backend(rank, 2, device, std::move(value)); }
+c10::intrusive_ptr<c10d::Backend> TrainingDistributedTestAccess::backend(const DistributedContext& group) { return group.backend(); }
+c10::intrusive_ptr<c10d::Store> TrainingDistributedTestAccess::store(const DistributedContext& group) { return group.store(); }
+std::weak_ptr<const void> TrainingDistributedTestAccess::custody(const DistributedContext& group) { return group.transport_; }
+std::weak_ptr<const void> TrainingDistributedTestAccess::custody(const TrainingTargetCounts& counts) { return counts.state_; }
+std::weak_ptr<const void> TrainingDistributedTestAccess::custody(const TrainingMetricHandoff& metrics) { return metrics.impl_; }
+void TrainingDistributedTestAccess::retire(TrainingTargetCounts& counts) { counts.retire(); }
+void TrainingDistributedTestAccess::retire(TrainingMetricHandoff& metrics) { metrics.retire(); }
+bool TrainingDistributedTestAccess::terminal(const TrainingTargetCounts& counts) { return counts.retirement_.fact().terminal; }
+bool TrainingDistributedTestAccess::terminal(const TrainingMetricHandoff& metrics) { return metrics.retirement_.fact().terminal; }
 struct TrainingGradientReducerTestAccess {
  static std::weak_ptr<const void> custody(const TrainingGradientReducer& reducer) { return reducer.impl_; }
  static void retire(TrainingGradientReducer& reducer) { reducer.retire(); }
@@ -105,6 +120,37 @@ public:
   return {gradients[0], torch::Tensor{}};
  }
 };
+void mixed_early_bucket_overlap(const DistributedContext& distributed, int device) {
+ const auto launch = tc::getCurrentCUDAStream(tc::checked_device_index(device));
+ const auto options = torch::TensorOptions().device(tc::cuda_device(device));
+ auto late = torch::ones({3, 2}, options).transpose(0, 1).detach().set_requires_grad(true);
+ auto wide = torch::ones({2, 3}, options.dtype(torch::kFloat64)).set_requires_grad(true);
+ auto early = torch::ones_like(late).set_requires_grad(true);
+ auto unused = torch::ones({2}, options).set_requires_grad(true);
+ std::vector<torch::Tensor> parameters{unused, late, wide, early};
+ TrainingGradientReducer reducer(distributed, device, launch, {"unused", "late", "wide", "early"}, parameters, {parameters}, 128);
+ reducer.begin_attempt(1); reducer.enable_gradient_launch_after_counts();
+ BackwardGate gate(device);
+ at::cuda::CUDAEvent parameters_ready; parameters_ready.record(launch);
+ const auto worker_stream = tc::getStreamFromPool(false, tc::checked_device_index(device));
+ auto future = std::async(std::launch::async, [&] {
+  tc::TorchCudaStreamGuard stream(worker_stream);
+  parameters_ready.block(worker_stream);
+  auto delayed = LateBackward::apply(late + wide, reinterpret_cast<std::int64_t>(&gate));
+  auto loss = (delayed + early.square()).sum();
+  reducer.arm(0); static_cast<void>(TrainingStep(1, 1, false, at::kFloat).gradients(loss, parameters)); reducer.collect(0);
+ });
+ const bool entered = gate.await();
+ const auto launched_while_held = reducer.launched_buckets();
+ gate.release(); future.get(); reducer.finish_attempt();
+ require(entered && launched_while_held == 1, "interleaved dtype early bucket did not launch during held late backward");
+ require(reducer.bucket_count() == 3, "interleaved dtype regions lost contiguous backward ordering");
+ require(late.grad().strides() == late.strides(), "interleaved bucket lost dense parameter strides");
+ equal(early.grad(), torch::full_like(early, 2 * distributed.world_size), "interleaved early SUM differs");
+ equal(late.grad(), torch::full_like(late, distributed.world_size), "interleaved late SUM differs");
+ equal(wide.grad(), torch::full_like(wide, distributed.world_size), "interleaved FP64 SUM differs");
+ require(!unused.grad().defined(), "interleaved unused parameter acquired a gradient");
+}
 }
 void exercise_training_initialization(const DistributedContext& distributed, int device) {
  tc::TorchCudaDeviceGuard guard(tc::checked_device_index(device));
@@ -167,11 +213,11 @@ void exercise_early_bucket_overlap(const DistributedContext& distributed, int de
     gate.release(); future.get();
     // The late bucket has no rank-zero counterpart. Tell the initiating
     // rank that this peer is now waiting for real collective completion.
-    distributed.store->set("failure-peer-waiting", std::vector<std::uint8_t>{1});
+    TrainingDistributedTestAccess::store(distributed)->set("failure-peer-waiting", std::vector<std::uint8_t>{1});
     reducer.finish_attempt();
     throw std::runtime_error("cancelled peer unexpectedly completed its collective");
    }
-   if (distributed.enabled) static_cast<void>(distributed.store->get("failure-peer-waiting"));
+   if (distributed.enabled) static_cast<void>(TrainingDistributedTestAccess::store(distributed)->get("failure-peer-waiting"));
 #endif
    throw std::runtime_error("injected failure after early gradient bucket");
   } catch (...) { failure = std::current_exception(); reducer.abort(failure); }
@@ -195,10 +241,57 @@ void exercise_early_bucket_overlap(const DistributedContext& distributed, int de
  require(launched_while_held == 1, "early bucket did not launch while late backward was held");
  equal(early.grad(), torch::full_like(early, 2 * distributed.world_size), "early NCCL SUM differs");
  equal(late.grad(), torch::full_like(late, distributed.world_size), "late NCCL SUM differs");
+ mixed_early_bucket_overlap(distributed, device);
+}
+void exercise_bounded_gradient_buckets(int device) {
+ tc::TorchCudaDeviceGuard guard(tc::checked_device_index(device));
+ const DistributedContext distributed;
+ const auto options = torch::TensorOptions().device(tc::cuda_device(device));
+ auto first = torch::ones({3, 2}, options).transpose(0, 1).detach().set_requires_grad(true);
+ auto second = torch::ones_like(first).set_requires_grad(true);
+ std::vector<torch::Tensor> parameters{first, second};
+ constexpr std::size_t limit = 32; // Each tensor is 24 bytes, together 48.
+ TrainingGradientReducer reducer(distributed, device, tc::getCurrentCUDAStream(tc::checked_device_index(device)),
+  {"first", "second"}, parameters, {parameters}, limit);
+ require(reducer.bucket_count() == 2, "individually fitting tensors exceeded the combined byte limit");
+ const void* first_storage = nullptr;
+ const void* second_storage = nullptr;
+ for (int attempt = 1; attempt <= 2; ++attempt) {
+  reducer.begin_attempt(1); reducer.enable_gradient_launch_after_counts(); reducer.arm(0);
+  static_cast<void>(TrainingStep(1, 1, false, at::kFloat).gradients((first.square().sum() + second.sum()) * attempt, parameters));
+  reducer.collect(0); reducer.finish_attempt();
+  equal(first.grad(), torch::full_like(first, 2 * attempt), "bounded bucket reused stale gradient values");
+  equal(second.grad(), torch::full_like(second, attempt), "bounded second gradient differs");
+  for (const auto& parameter : parameters) {
+   require(parameter.grad().storage().nbytes() <= limit, "bounded gradient storage exceeded configured bytes");
+   require(parameter.grad().strides() == parameter.strides(), "bounded gradient lost parameter strides");
+  }
+  if (attempt == 1) { first_storage = first.grad().data_ptr(); second_storage = second.grad().data_ptr(); }
+  else require(first_storage == first.grad().data_ptr() && second_storage == second.grad().data_ptr(), "settled bucket storage was not reused");
+ }
 }
 void exercise_gradient_trajectory(const DistributedContext& distributed, int device) {
  tc::TorchCudaDeviceGuard guard(tc::checked_device_index(device));
  const auto launch = tc::getCurrentCUDAStream(tc::checked_device_index(device));
+ {
+  const auto options = torch::TensorOptions().device(tc::cuda_device(device));
+  auto strided = torch::arange(6, options.dtype(torch::kFloat32)).reshape({2, 3}).transpose(0, 1).detach().set_requires_grad(true);
+  auto wide = torch::full({4}, .7, options.dtype(torch::kFloat64)).set_requires_grad(true);
+  auto unused = torch::ones({2}, options.dtype(torch::kFloat32)).set_requires_grad(true);
+  std::vector<torch::Tensor> parameters{strided, wide, unused};
+  TrainingGradientReducer reducer(distributed, device, launch, {"strided", "wide", "unused"}, parameters, {parameters}, 16);
+  reducer.begin_attempt(2); reducer.enable_gradient_launch_after_counts();
+  for (int contribution = 0; contribution < 2; ++contribution) {
+   reducer.arm(0);
+   static_cast<void>(TrainingStep(2, 1, false, at::kFloat).gradients(strided.square().sum() + wide.square().sum(), parameters));
+   reducer.collect(0);
+  }
+  reducer.finish_attempt();
+  require(strided.grad().strides() == strided.strides(), "reducer lost a dense noncontiguous parameter stride");
+  require(wide.grad().scalar_type() == torch::kFloat64 && !unused.grad().defined(), "mixed buckets lost dtype or global unused semantics");
+  equal(strided.grad(), strided.detach() * distributed.world_size, "strided c10d bucket SUM differs");
+  equal(wide.grad(), wide.detach() * distributed.world_size, "mixed-dtype c10d bucket SUM differs");
+ }
  constexpr std::size_t k = 3 * 2;
  for (const auto kind : {TrainOptimizerKind::AdamW, TrainOptimizerKind::Muon, TrainOptimizerKind::SGD})
   for (const std::size_t batch : {1U, 3U})
@@ -206,9 +299,10 @@ void exercise_gradient_trajectory(const DistributedContext& distributed, int dev
     TrainRequest request; request.lanes = 3; request.grad_accum_steps = 2; request.batch_size = batch; request.recipe.optimizer = kind; request.recipe.lr = .003; request.recipe.lr_encoder = .0003;
     request.recipe.lr_scheduler = TrainLrSchedulerKind::Step; request.recipe.warmup_epochs = 0; request.fused_optimizer = false;
     auto working = inventory(device, distributed.rank == 0 ? .3 : .9);
-    for (auto& item : working) { auto value = item.value(); distributed_broadcast(distributed, value); }
+    std::vector<torch::Tensor> initial; for (const auto& item : working) initial.push_back(item.value());
+    broadcast_training_tensors(distributed, initial);
     auto integer_buffer = torch::full({2}, distributed.rank == 0 ? 7 : 11, torch::TensorOptions().device(tc::cuda_device(device)).dtype(torch::kInt64));
-    distributed_broadcast(distributed, integer_buffer); require(integer_buffer.eq(7).all().item<bool>(), "initial nonfloating buffer broadcast differs");
+    broadcast_training_tensors(distributed, {integer_buffer}); require(integer_buffer.eq(7).all().item<bool>(), "initial nonfloating buffer broadcast differs");
     auto reference = inventory(device, .3);
     auto built = build_optimizer(working, request), reference_built = build_optimizer(reference, request);
     auto& optimizer = built.optimizer; auto& expected_optimizer = reference_built.optimizer;
@@ -269,7 +363,7 @@ void exercise_gradient_trajectory(const DistributedContext& distributed, int dev
         } catch (...) { completed[lane].set_exception(std::current_exception()); counts.fail(std::current_exception()); reducer.abort(std::current_exception()); throw; }
        });
       }
-      counts.resolve(distributed, tc::cuda_device(device));
+      counts.resolve();
       if (start + slots == k) reducer.enable_gradient_launch_after_counts();
       for (std::size_t lane = 0; lane < slots; ++lane) {
        const auto micro = start + lane;
@@ -348,4 +442,311 @@ void exercise_gradient_trajectory(const DistributedContext& distributed, int dev
     }
    }
 }
+namespace {
+enum class CollectiveOutcome { Success, SubmitThrow, WaitFalse, WaitThrow };
+struct CollectiveGate final {
+ std::mutex mutex;
+ std::condition_variable changed;
+ bool entered = false, released = false;
+ static void hold(void* value) {
+  auto& gate = *static_cast<CollectiveGate*>(value);
+  std::unique_lock lock(gate.mutex); gate.entered = true; gate.changed.notify_all();
+  gate.changed.wait(lock, [&] { return gate.released; });
+ }
+ void release() { std::lock_guard lock(mutex); released = true; changed.notify_all(); }
+ bool await() { std::unique_lock lock(mutex); return changed.wait_for(lock, std::chrono::seconds(20), [&] { return entered; }); }
+};
+struct CollectiveFacts final {
+ int reductions = 0, broadcasts = 0, waits = 0, live_work = 0, aborts = 0;
+ std::set<const void*> broadcast_storage;
+};
+class FixtureCollectiveWork final : public c10d::Work {
+public:
+ FixtureCollectiveWork(std::shared_ptr<CollectiveFacts> facts, CollectiveOutcome outcome, tc::TorchCudaStream stream)
+  : c10d::Work(0, c10d::OpType::ALLREDUCE), facts_(std::move(facts)), outcome_(outcome) { ++facts_->live_work; completed_.record(stream); }
+ ~FixtureCollectiveWork() override { --facts_->live_work; }
+ bool wait(std::chrono::milliseconds = kNoTimeout) override {
+  ++facts_->waits;
+  if (outcome_ == CollectiveOutcome::WaitThrow) throw std::runtime_error("injected collective wait exception");
+  if (outcome_ == CollectiveOutcome::WaitFalse) return false;
+  completed_.block(tc::getCurrentCUDAStream(completed_.device_index())); return true;
+ }
+private:
+ std::shared_ptr<CollectiveFacts> facts_;
+ CollectiveOutcome outcome_;
+ at::cuda::CUDAEvent completed_;
+};
+class FixtureCollectiveBackend final : public c10d::Backend {
+public:
+ FixtureCollectiveBackend(int device, CollectiveOutcome outcome, std::shared_ptr<CollectiveFacts> facts, std::shared_ptr<CollectiveGate> gate = {})
+  : c10d::Backend(0, 2), stream_(tc::getStreamFromPool(false, tc::checked_device_index(device))), outcome_(outcome), facts_(std::move(facts)), gate_(std::move(gate)) {}
+ const std::string getBackendName() const override { return "training-custody-fixture"; }
+ c10::intrusive_ptr<c10d::Work> allreduce(std::vector<at::Tensor>& tensors, const c10d::AllreduceOptions& = {}) override { ++facts_->reductions; return queue(tensors, 1); }
+ c10::intrusive_ptr<c10d::Work> broadcast(std::vector<at::Tensor>& tensors, const c10d::BroadcastOptions& = {}) override {
+  ++facts_->broadcasts; facts_->broadcast_storage.insert(tensors.front().const_data_ptr()); return queue(tensors, 0);
+ }
+ void abort() override { ++facts_->aborts; }
+ void release() { if (gate_) gate_->release(); stream_.synchronize(); }
+private:
+ c10::intrusive_ptr<c10d::Work> queue(std::vector<at::Tensor>& tensors, int increment) {
+  at::cuda::CUDAEvent produced; produced.record(tc::getCurrentCUDAStream(stream_.device_index())); produced.block(stream_);
+  tc::TorchCudaStreamGuard guard(stream_); torch::NoGradGuard no_grad;
+  if (gate_) require(cudaLaunchHostFunc(stream_.stream(), &CollectiveGate::hold, gate_.get()) == cudaSuccess, "could not hold collective device work");
+  tensors.front().add_(increment);
+  if (outcome_ == CollectiveOutcome::SubmitThrow) throw std::runtime_error("injected collective exception after queue");
+  return c10::make_intrusive<FixtureCollectiveWork>(facts_, outcome_, stream_);
+ }
+ tc::TorchCudaStream stream_;
+ CollectiveOutcome outcome_;
+ std::shared_ptr<CollectiveFacts> facts_;
+ std::shared_ptr<CollectiveGate> gate_;
+};
+class CollectiveRelease final {
+public:
+ explicit CollectiveRelease(FixtureCollectiveBackend& backend) : backend_(backend) {}
+ ~CollectiveRelease() { try { finish(); } catch (...) {} }
+ void finish() { if (!finished_) { backend_.release(); finished_ = true; } }
+private:
+ FixtureCollectiveBackend& backend_;
+ bool finished_ = false;
+};
+class HeldCountConsumption final {
+public:
+ explicit HeldCountConsumption(tc::TorchCudaStream stream) : stream_(stream) {
+  require(cudaLaunchHostFunc(stream_.stream(), &CollectiveGate::hold, &gate_) == cudaSuccess, "could not delay count conversion");
+ }
+ ~HeldCountConsumption() { release(); try { stream_.synchronize(); } catch (...) {} }
+ void release() { gate_.release(); }
+ bool await() { return gate_.await(); }
+private:
+ tc::TorchCudaStream stream_;
+ CollectiveGate gate_;
+};
+class CancelCollectiveWork final : public c10d::Work {
+public:
+ CancelCollectiveWork(c10::intrusive_ptr<c10d::Work> work, c10::intrusive_ptr<c10d::Store> store)
+  : c10d::Work(1, c10d::OpType::ALLREDUCE), work_(std::move(work)), store_(std::move(store)) {}
+ bool wait(std::chrono::milliseconds = kNoTimeout) override {
+  // The real NCCL Work exists but has no rank-zero counterpart. Coordinate
+  // cancellation while that exact submission remains physically in flight.
+  store_->set("custody-submitted", std::vector<std::uint8_t>{1});
+  static_cast<void>(store_->get("custody-cancel"));
+  throw std::runtime_error("peer training cancellation");
+ }
+private:
+ c10::intrusive_ptr<c10d::Work> work_;
+ c10::intrusive_ptr<c10d::Store> store_;
+};
+class CancelCollectiveBackend final : public c10d::Backend {
+public:
+ CancelCollectiveBackend(c10::intrusive_ptr<c10d::Backend> backend, c10::intrusive_ptr<c10d::Store> store)
+  : c10d::Backend(1, 2), backend_(std::move(backend)), store_(std::move(store)) {}
+ const std::string getBackendName() const override { return "cancel-real-training-collective"; }
+ c10::intrusive_ptr<c10d::Work> allreduce(std::vector<at::Tensor>& tensors, const c10d::AllreduceOptions& options = {}) override {
+  return c10::make_intrusive<CancelCollectiveWork>(backend_->allreduce(tensors, options), store_);
+ }
+ c10::intrusive_ptr<c10d::Work> broadcast(std::vector<at::Tensor>& tensors, const c10d::BroadcastOptions& options = {}) override {
+  return c10::make_intrusive<CancelCollectiveWork>(backend_->broadcast(tensors, options), store_);
+ }
+ void abort() override { backend_->abort(); }
+private:
+ c10::intrusive_ptr<c10d::Backend> backend_;
+ c10::intrusive_ptr<c10d::Store> store_;
+};
+}
+void exercise_collective_custody(int device) {
+ tc::TorchCudaDeviceGuard guard(tc::checked_device_index(device));
+ const auto options = torch::TensorOptions().device(tc::cuda_device(device)).dtype(torch::kFloat32);
+ for (const auto outcome : {CollectiveOutcome::SubmitThrow, CollectiveOutcome::WaitFalse, CollectiveOutcome::WaitThrow}) {
+  const auto gate = std::make_shared<CollectiveGate>();
+  const auto facts = std::make_shared<CollectiveFacts>();
+  auto backend = c10::make_intrusive<FixtureCollectiveBackend>(device, outcome, facts, gate);
+  auto group = TrainingDistributedTestAccess::backend(backend, 0, device);
+  const auto transport = TrainingDistributedTestAccess::custody(group);
+  auto tensor = torch::ones({4}, options);
+  std::string failure;
+  {
+   TrainingCollectiveWork work(device);
+   CollectiveRelease release(*backend);
+   try { work.join(work.all_reduce(group, tensor)); } catch (const std::exception& error) { failure = error.what(); }
+   require(gate->await(), "collective fixture did not reach real in-flight device work");
+   require(!failure.empty() && work.uncertain() && work.retire() != cudaSuccess, "failed collective falsely proved physical completion");
+   require(tensor.use_count() > 1, "failed collective lost its tensor before retirement");
+   require(facts->aborts == 1, "collective failure did not abort exactly once");
+   distributed_abort(group); require(facts->aborts == 1, "peer cancellation repeated the initiating abort");
+   release.finish();
+  }
+  group = {};
+  require(!transport.expired() && tensor.use_count() > 1, "unproved collective reclaimed transport or tensor custody");
+  require(facts->live_work == (outcome == CollectiveOutcome::SubmitThrow ? 0 : 1), "unproved collective released its returned Work");
+ }
+ // A checked join is asynchronous: retained tensors stay live until the
+ // explicit drained boundary, then slots, Work and events can be reused.
+ {
+  auto facts = std::make_shared<CollectiveFacts>();
+  auto gate = std::make_shared<CollectiveGate>();
+  auto backend = c10::make_intrusive<FixtureCollectiveBackend>(device, CollectiveOutcome::Success, facts, gate);
+  auto group = TrainingDistributedTestAccess::backend(backend, 0, device);
+  auto tensor = torch::ones({4}, options);
+  TrainingCollectiveWork work(device);
+  CollectiveRelease release(*backend);
+  for (int attempt = 0; attempt < 4; ++attempt) {
+   work.join(work.all_reduce(group, tensor));
+   require(gate->await(), "joined collective fixture never entered its device hold");
+   require(tensor.use_count() > 1 && facts->live_work == 1, "stream join prematurely released collective storage");
+   release.finish(); work.settle();
+   require(tensor.use_count() == 1 && facts->live_work == 0, "settled collective failed to reclaim its bounded slot");
+  }
+  require(tensor.eq(5).all().item<bool>(), "delayed device writes did not settle before collective reuse");
+ }
+ // Count publication preserves the first useful cause and drains all waiting
+ // futures after an actual queued submission fails before returning Work.
+ {
+  auto facts = std::make_shared<CollectiveFacts>();
+  auto gate = std::make_shared<CollectiveGate>();
+  auto backend = c10::make_intrusive<FixtureCollectiveBackend>(device, CollectiveOutcome::SubmitThrow, facts, gate);
+  auto group = TrainingDistributedTestAccess::backend(backend, 0, device);
+  TrainingTargetCounts counts(2, device, group);
+  CollectiveRelease release(*backend);
+  const auto custody = TrainingDistributedTestAccess::custody(counts);
+  std::array<std::future<std::string>, 2> waiters;
+  for (std::size_t i = 0; i < waiters.size(); ++i) waiters[i] = std::async(std::launch::async, [&, i] {
+   tc::TorchCudaDeviceGuard worker(tc::checked_device_index(device));
+   try { static_cast<void>(counts.consume(i, tc::getCurrentCUDAStream(tc::checked_device_index(device)).stream())); }
+   catch (const std::exception& error) { return std::string(error.what()); }
+   return std::string{};
+  });
+  counts.publish(0, 1); counts.publish(1, 2);
+  std::string first;
+  try { counts.resolve(); } catch (const std::exception& error) { first = error.what(); }
+  for (auto& waiter : waiters) require(waiter.get() == first && first == "injected collective exception after queue", "count waiters lost the initiating failure");
+  require(gate->await(), "count failure did not retain in-flight device work");
+  release.finish(); TrainingDistributedTestAccess::retire(counts);
+  require(TrainingDistributedTestAccess::terminal(counts) && !custody.expired(), "unjoined count custody was released");
+ }
+ // The entire metric owner contains both its device inventory and pinned host
+ // destination. A failed collective cannot leave only an event shell alive.
+ for (const auto outcome : {CollectiveOutcome::SubmitThrow, CollectiveOutcome::WaitFalse, CollectiveOutcome::WaitThrow}) {
+  auto facts = std::make_shared<CollectiveFacts>();
+  auto gate = std::make_shared<CollectiveGate>();
+  auto backend = c10::make_intrusive<FixtureCollectiveBackend>(device, outcome, facts, gate);
+  auto group = TrainingDistributedTestAccess::backend(backend, 0, device);
+  TrainingMetricHandoff metrics(device); metrics.begin_attempt(1); metrics.accumulate_empty();
+  CollectiveRelease release(*backend);
+  const auto custody = TrainingDistributedTestAccess::custody(metrics);
+  bool failed = false;
+  try { static_cast<void>(metrics.complete_step(torch::zeros({}, options), 1, 1, group)); } catch (...) { failed = true; }
+  require(gate->await(), "metric failure did not retain in-flight device work");
+  release.finish(); TrainingDistributedTestAccess::retire(metrics);
+  require(failed && TrainingDistributedTestAccess::terminal(metrics) && !custody.expired(), "uncertain metric device/pinned custody was released");
+ }
+ for (const auto outcome : {CollectiveOutcome::SubmitThrow, CollectiveOutcome::WaitFalse, CollectiveOutcome::WaitThrow}) {
+  auto facts = std::make_shared<CollectiveFacts>();
+  auto gate = std::make_shared<CollectiveGate>();
+  auto backend = c10::make_intrusive<FixtureCollectiveBackend>(device, outcome, facts, gate);
+  auto group = TrainingDistributedTestAccess::backend(backend, 0, device);
+  const auto transport = TrainingDistributedTestAccess::custody(group);
+  std::vector<torch::Tensor> tensors;
+  for (int i = 0; i < 4; ++i) tensors.push_back(torch::full({4}, i, options));
+  CollectiveRelease release(*backend);
+  bool failed = false;
+  try { broadcast_training_tensors(group, tensors, 64); } catch (...) { failed = true; }
+  require(gate->await(), "broadcast failure did not reach in-flight device work");
+  group = {};
+  require(failed && !transport.expired(), "failed coalesced submission lost its transport");
+  for (const auto& tensor : tensors) require(tensor.use_count() > 1, "failed coalesced submission lost original tensor custody");
+  require(facts->live_work == (outcome == CollectiveOutcome::SubmitThrow ? 0 : 1), "failed coalesced submission lost returned Work custody");
+  release.finish();
+ }
+ // Coalescing is observable through the actual broadcast primitive. Eight
+ // tensor inventories fit two reusable buffers, not one submission per tensor.
+ {
+  auto facts = std::make_shared<CollectiveFacts>();
+  auto backend = c10::make_intrusive<FixtureCollectiveBackend>(device, CollectiveOutcome::Success, facts);
+  const auto group = TrainingDistributedTestAccess::backend(backend, 0, device);
+  std::vector<torch::Tensor> tensors;
+  for (int i = 0; i < 33; ++i) tensors.push_back(torch::full({2, 2}, i, options).transpose(0, 1));
+  broadcast_training_tensors(group, tensors, 64);
+  require(facts->broadcasts == 9 && facts->live_work == 0, "coalesced initialization submitted one broadcast per tensor or retained completed Work");
+  require(facts->broadcast_storage.size() <= 2, "coalesced initialization did not reuse its bounded flattened buffers");
+  for (std::size_t i = 0; i < tensors.size(); ++i) require(tensors[i].stride(0) == 1 && tensors[i].eq(static_cast<std::int64_t>(i)).all().item<bool>(), "coalescing changed original strides or values");
+  std::vector<torch::Tensor> ema{torch::ones({2}, options), torch::full({2}, 2, options), torch::full({2}, 3, options)};
+  broadcast_training_tensors(group, ema, 64);
+  require(facts->broadcasts == 10, "EMA initialization failed to coalesce its parameter inventory");
+  std::vector<torch::Tensor> mixed{torch::arange(6, options).reshape({2, 3}).transpose(0, 1), torch::ones({2}, options), torch::full({2}, .25, options.dtype(torch::kFloat64)), torch::full({2}, 7, options.dtype(torch::kInt64))};
+  const auto before = mixed.front().clone();
+  broadcast_training_tensors(group, mixed, 64);
+  require(facts->broadcasts == 13 && torch::equal(mixed.front(), before) && mixed.front().stride(0) == 1 && mixed.back().eq(7).all().item<bool>(), "coalesced mixed dtype/stride/integer initialization differs");
+  std::vector<torch::Tensor> oversized;
+  for (int i = 0; i < 3; ++i) oversized.push_back(torch::full({32}, i, options));
+  broadcast_training_tensors(group, oversized, 64);
+  for (std::size_t i = 0; i < oversized.size(); ++i) require(oversized[i].eq(static_cast<std::int64_t>(i)).all().item<bool>(), "single-tensor flattened storage aliased a previous model tensor during reuse");
+ }
+ // Full owners reclaim on settled local paths; repeated count waves preserve
+ // a delayed consumer's count-to-float conversion before scalar-slot overwrite.
+ {
+  DistributedContext local;
+  TrainingTargetCounts counts(1, device, local);
+  auto count_owner = TrainingDistributedTestAccess::custody(counts);
+  const auto stream = tc::getStreamFromPool(false, tc::checked_device_index(device));
+  counts.publish(0, 7); counts.resolve();
+  HeldCountConsumption delayed(stream);
+  torch::Tensor previous;
+  {
+   tc::TorchCudaStreamGuard consumer(stream);
+   previous = counts.consume(0, stream.stream()).target_count;
+  }
+  require(delayed.await(), "count consumer never entered its CUDA hold");
+  counts.begin(1); counts.publish(0, 13); counts.resolve();
+  delayed.release(); stream.synchronize(); require(previous.item<float>() == 7, "count storage reuse changed an earlier conversion");
+  TrainingDistributedTestAccess::retire(counts); require(count_owner.expired(), "settled local counts leaked");
+  TrainingMetricHandoff metrics(device); auto metric_owner = TrainingDistributedTestAccess::custody(metrics);
+  metrics.begin_attempt(1); metrics.accumulate_empty(); static_cast<void>(metrics.complete_step(torch::zeros({}, options), 1, 1));
+  TrainingDistributedTestAccess::retire(metrics); require(metric_owner.expired(), "settled local metrics leaked");
+ }
+}
+void exercise_collective_cancellation(DistributedContext& group, int device, std::string_view operation) {
+ const auto store = TrainingDistributedTestAccess::store(group);
+ if (group.rank == 0) {
+  static_cast<void>(store->get("custody-submitted"));
+  store->set("custody-cancel", std::vector<std::uint8_t>{1});
+  throw std::runtime_error("injected " + std::string(operation) + " cancellation");
+ }
+ const auto real_backend = TrainingDistributedTestAccess::backend(group);
+ group = TrainingDistributedTestAccess::backend(c10::make_intrusive<CancelCollectiveBackend>(real_backend, store), group.rank, device);
+ const auto transport = TrainingDistributedTestAccess::custody(group);
+ std::exception_ptr failure;
+ if (operation == "count") {
+  TrainingTargetCounts counts(2, device, group);
+  const auto custody = TrainingDistributedTestAccess::custody(counts);
+  auto waiting = std::async(std::launch::async, [&] {
+   tc::TorchCudaDeviceGuard worker(tc::checked_device_index(device));
+   try { static_cast<void>(counts.consume(1, tc::getCurrentCUDAStream(tc::checked_device_index(device)).stream())); }
+   catch (const std::exception& error) { return std::string(error.what()); }
+   return std::string{};
+  });
+  counts.publish(0, 1);
+  try { counts.resolve(); } catch (...) { failure = std::current_exception(); }
+  require(waiting.get() == "peer training cancellation", "in-flight count cancellation did not drain its waiter");
+  TrainingDistributedTestAccess::retire(counts);
+  require(TrainingDistributedTestAccess::terminal(counts) && !custody.expired(), "in-flight NCCL count lost terminal custody");
+ } else if (operation == "metric") {
+  TrainingMetricHandoff metrics(device); metrics.begin_attempt(1); metrics.accumulate_empty();
+  const auto custody = TrainingDistributedTestAccess::custody(metrics);
+  try { static_cast<void>(metrics.complete_step(torch::zeros({}, torch::TensorOptions().device(tc::cuda_device(device))), 1, 1, group)); }
+  catch (...) { failure = std::current_exception(); }
+  TrainingDistributedTestAccess::retire(metrics);
+  require(TrainingDistributedTestAccess::terminal(metrics) && !custody.expired(), "in-flight NCCL metric lost full device/pinned custody");
+ } else if (operation == "broadcast") {
+  std::vector<torch::Tensor> tensors;
+  for (int i = 0; i < 8; ++i) tensors.push_back(torch::ones({4}, torch::TensorOptions().device(tc::cuda_device(device))));
+  try { broadcast_training_tensors(group, tensors, 64); } catch (...) { failure = std::current_exception(); }
+  for (const auto& tensor : tensors) require(tensor.use_count() > 1, "in-flight coalesced broadcast lost its tensor inventory");
+ } else throw std::invalid_argument("unknown collective cancellation fixture");
+ const auto rank = group.rank; group = {}; group.rank = rank;
+ require(failure != nullptr && !transport.expired(), "real collective cancellation failed to retain transport");
+ std::fprintf(stderr, "%.*s collective terminal custody verified\n", static_cast<int>(operation.size()), operation.data());
+ std::rethrow_exception(failure);
+}
+
 }

@@ -6,6 +6,7 @@
 #include <torch/types.h>
 #include "src/backend/models/rfdetr/contract/training_metrics.h"
 namespace mmltk::backend::models::rfdetr {
+using TrainingDiagnosticTensors = std::array<torch::Tensor, 4>;
 namespace scalar_packet {
 inline constexpr auto members = std::define_static_array(std::meta::nonstatic_data_members_of(^^TrainingScalars, std::meta::access_context::current()));
 inline constexpr std::size_t size = members.size();

@@ -1,4 +1,5 @@
 #include "training_gradient_fixture.h"
+#include "src/backend/models/rfdetr/training/detail/training_ops_private.h"
 #include "src/backend/models/rfdetr/training/detail/training_gradient_reducer.h"
 #include "src/backend/models/rfdetr/training/detail/training_step.h"
 #include "src/test_support/cuda_test_utils.hpp"
@@ -9,6 +10,7 @@ TEST_CASE("Gradient attempts preserve logical objectives across physical capacit
  const rf::DistributedContext group;
  REQUIRE_NOTHROW(rf::testsupport::exercise_training_initialization(group, 0));
  REQUIRE_NOTHROW(rf::testsupport::exercise_gradient_trajectory(group, 0));
+ REQUIRE_NOTHROW(rf::testsupport::exercise_bounded_gradient_buckets(0));
 }
 TEST_CASE("Early gradient bucket launches before a held late backward returns", "[rfdetr][training][gradient][overlap]") {
  if (!mmltk::testsupport::checked_cuda_device_count()) SKIP("CUDA unavailable; overlap coverage unverified");
@@ -42,4 +44,9 @@ TEST_CASE("Failure after an early bucket retains custody until retirement", "[rf
  if (!mmltk::testsupport::checked_cuda_device_count()) SKIP("CUDA unavailable; early failure custody unverified");
  const rf::DistributedContext group;
  REQUIRE_THROWS_WITH(rf::testsupport::exercise_early_bucket_overlap(group, 0, true), "injected failure after early gradient bucket");
+}
+
+TEST_CASE("Collective slots retain uncertain physical work and reclaim settled buffers", "[rfdetr][training][gradient][custody]") {
+ if (!mmltk::testsupport::checked_cuda_device_count()) SKIP("CUDA unavailable; collective custody unverified");
+ REQUIRE_NOTHROW(rf::testsupport::exercise_collective_custody(0));
 }

@@ -1,3 +1,6 @@
+#include "training_gradient_fixture.h"
+#include "src/backend/models/rfdetr/training/detail/training_distributed.h"
+#include <torch/csrc/distributed/c10d/Backend.hpp>
 #include "src/backend/models/rfdetr/augmentation/annotation_support.h"
 #include "src/backend/models/rfdetr/core/tests/training_fixture.h"
 #include "src/backend/models/rfdetr/core/detail/training_mask_loss.h"
@@ -1255,7 +1258,6 @@ void test_training_mask_targets_follow_spatial_image_erasure() {
 void test_parallel_wave_drains_failures_and_cancellation() {
  if (mmltk::testsupport::checked_cuda_device_count() == 0) { SKIP("CUDA device unavailable; GPU coverage remains unverified"); }
  const rfdetr::DistributedContext distributed;
- const auto device = mmltk::backend::ml::cuda::cuda_device(0);
  std::atomic<int> prepublication_drained = 0;
  {
   rfdetr::ParallelTrainingWave<int> wave(2, true, 0, distributed);
@@ -1279,17 +1281,14 @@ void test_parallel_wave_drains_failures_and_cancellation() {
     throw;
    }
   }));
-  REQUIRE_THROWS(wave.settle(device, [](int&) {}));
+  REQUIRE_THROWS(wave.settle([](int&) {}));
  }
  REQUIRE(prepublication_drained.load() == 2);
 #if defined(USE_C10D_NCCL)
  std::atomic<int> collective_failure_drained = 0;
  std::latch both_published(2);
  auto failing_backend = c10::make_intrusive<FailingCollectiveBackend>();
- rfdetr::DistributedContext failing_distributed;
- failing_distributed.enabled = true;
- failing_distributed.world_size = 2;
- failing_distributed.process_group = failing_backend;
+ auto failing_distributed = rfdetr::testsupport::TrainingDistributedTestAccess::backend(failing_backend);
  {
   rfdetr::ParallelTrainingWave<int> wave(2, true, 0, failing_distributed);
   const auto normalizer = wave.normalizer();
@@ -1309,7 +1308,7 @@ void test_parallel_wave_drains_failures_and_cancellation() {
     }
    }));
   }
-  REQUIRE_THROWS(wave.settle(device, [](int&) {}));
+  REQUIRE_THROWS(wave.settle([](int&) {}));
  }
  REQUIRE(collective_failure_drained.load() == 2);
  REQUIRE(failing_backend->allreduces.load() == 1);
@@ -1345,7 +1344,7 @@ void test_parallel_wave_drains_failures_and_cancellation() {
    ++inactive_drained;
    throw std::runtime_error("inactive lane failure");
   }));
-  REQUIRE_THROWS(wave.settle(device, [](int&) {}));
+  REQUIRE_THROWS(wave.settle([](int&) {}));
  }
  REQUIRE(inactive_drained.load() == 2);
 }

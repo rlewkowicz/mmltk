@@ -26,6 +26,9 @@ TEST_CASE("Two selected GPUs retain the global training objective and early NCCL
  SECTION("complete trajectory and overlap") { scenario = "trajectory"; }
  SECTION("first-rank cancellation aborts waiting peer") { scenario = "cancel"; }
  SECTION("failure after an early bucket retains custody and aborts waiting peer") { scenario = "early-failure"; }
+ SECTION("cancellation retains a real in-flight count collective") { scenario = "cancel-count"; }
+ SECTION("cancellation retains a real in-flight metric collective") { scenario = "cancel-metric"; }
+ SECTION("cancellation retains real in-flight coalesced broadcasts") { scenario = "cancel-broadcast"; }
  std::array<std::future<process::CapturedChildProcessResult>, 2> children;
  for (std::size_t rank = 0; rank < children.size(); ++rank) children[rank] = std::async(std::launch::async, [&, rank] {
   process::ArgvBuffer arguments({MMLTK_DISTRIBUTED_TRAINING_WORKER, store.string(), std::to_string(rank), std::to_string(devices[rank]), scenario});
@@ -39,9 +42,14 @@ TEST_CASE("Two selected GPUs retain the global training objective and early NCCL
   CHECK_FALSE(result.setup_failure.has_value());
   if (scenario == "trajectory") { CHECK(WIFEXITED(result.status)); CHECK(WEXITSTATUS(result.status) == 0); }
   else { if (rank == 0) {
-   CHECK(result.output.find(scenario == "early-failure" ? "injected failure after early gradient bucket" : "injected training cancellation") != std::string::npos);
+   const auto expected = scenario.starts_with("cancel-") ? "injected " + scenario.substr(7) + " cancellation" : scenario == "early-failure" ? std::string("injected failure after early gradient bucket") : std::string("injected training cancellation");
+   const auto first = result.output.find(expected);
+   CHECK(first != std::string::npos);
+   if (first != std::string::npos) CHECK(result.output.find(expected, first + expected.size()) == std::string::npos);
    if (scenario == "early-failure") CHECK(result.output.find("early bucket failure custody verified") != std::string::npos);
-  } CHECK((WIFEXITED(result.status) && WEXITSTATUS(result.status) != 0) || WIFSIGNALED(result.status)); CHECK(result.output.find("cancelled peer unexpectedly completed") == std::string::npos); }
+  }
+  if (rank == 1 && scenario.starts_with("cancel-")) CHECK(result.output.find(scenario.substr(7) + " collective terminal custody verified") != std::string::npos);
+  CHECK((WIFEXITED(result.status) && WEXITSTATUS(result.status) != 0) || WIFSIGNALED(result.status)); CHECK(result.output.find("cancelled peer unexpectedly completed") == std::string::npos); }
  }
  std::filesystem::remove(store);
 }

@@ -1,9 +1,12 @@
 #pragma once
 #include <memory>
 #include <cstdint>
+#include <cstddef>
+#include <torch/types.h>
 #include "training_scalar_packet.h"
 #include "training_metric_state.h"
-#include "training_ops_private.h"
+#include "training_distributed.h"
+#include "src/frameworks/gpu/terminal_cuda_retirement_owner.h"
 namespace mmltk::backend::models::rfdetr {
 struct TrainingMetricSnapshot {
  double loss_sum = 0.0;
@@ -37,7 +40,11 @@ public:
  double validation_average(std::size_t count);
 
 private:
+ friend struct testsupport::TrainingDistributedTestAccess;
+ void retire() noexcept;
  struct Impl;
- std::unique_ptr<Impl> impl_;
+ mmltk::frameworks::gpu::TerminalCudaRetirementOwner retirement_{1U};
+ mmltk::frameworks::gpu::TerminalCudaRetirementLease terminal_ = mmltk::frameworks::gpu::ReserveTerminalCudaLease(retirement_);
+ std::shared_ptr<Impl> impl_;
 };
 }  // namespace mmltk::backend::models::rfdetr

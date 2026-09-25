@@ -2,19 +2,15 @@
 #include "detail/training_metrics.h"
 #include "src/backend/ml/cuda/numa_host_tensor.h"
 #include "src/frameworks/gpu/terminal_cuda_retirement_owner.h"
-#include "src/frameworks/gpu/cuda_device_scope.h"
-#include "src/frameworks/gpu/cuda_error.h"
-#include <atomic>
 #include <algorithm>
 #include <limits>
 #include <stdexcept>
-#include "src/backend/ml/cuda/shared_cuda_event.h"
 namespace mmltk::backend::models::rfdetr {
 namespace torch_cuda = mmltk::backend::ml::cuda;
-using mmltk::frameworks::gpu::ensure_cuda_ok;
 struct TrainingMetricHandoff::Impl {
 public:
- explicit Impl(int device_id) : device_id_(device_id), event_pool_(mmltk::frameworks::gpu::make_cuda_device_owner<Impl, &Impl::record_failure>(this, device_id), 1U, retirement_owner_) {
+ explicit Impl(int device_id) : device_id_(device_id), launch_(torch_cuda::getCurrentCUDAStream(torch_cuda::checked_device_index(device_id))), work_(device_id, 3) {}
+ void initialize() {
   const auto device_options = torch::TensorOptions().dtype(torch::kFloat32).device(mmltk::backend::ml::cuda::cuda_device(device_id_));
   device_values_ = torch::zeros({10 + static_cast<int64_t>(scalar_packet::size)}, device_options);
   device_values_.select(0, 6).fill_(1.0f);
@@ -23,20 +19,14 @@ public:
   attempt_values_ = torch::zeros({3 + 2 * static_cast<int64_t>(scalar_packet::size)}, device_options);
   control_ = torch::zeros({2}, device_options);
   host_values_ = torch_cuda::numa_empty({10 + static_cast<int64_t>(scalar_packet::size)}, torch::kFloat32, device_id_);
-  torch_cuda::TorchCudaDeviceGuard device_guard(torch_cuda::checked_device_index(device_id_));
-  ensure_cuda_ok(cudaStreamCreateWithFlags(&settlement_stream_, cudaStreamNonBlocking), "create training metric settlement stream");
  }
- ~Impl() noexcept {
-  if (settlement_stream_ != nullptr) {
-   mmltk::frameworks::gpu::CudaDeviceScope scope(device_id_);
-   const cudaError_t status = scope ? cudaStreamDestroy(settlement_stream_) : scope.status();
-   static_cast<void>(scope.FinalizeStatus(status));
-  }
+ cudaError_t retire() noexcept {
+  if (failure_ != cudaSuccess || work_.retire() != cudaSuccess) return cudaErrorUnknown;
+  try { launch_.synchronize(); return cudaSuccess; } catch (...) { return cudaErrorUnknown; }
  }
- Impl(const Impl&) = delete;
- Impl& operator=(const Impl&) = delete;
- void record_failure(const cudaError_t failure) noexcept { mmltk::frameworks::gpu::record_first_cuda_failure(first_failure_, failure); }
+ void check() const { if (failure_ != cudaSuccess || work_.uncertain()) throw std::runtime_error("training metrics cannot reuse unproved device work"); }
  void reset_epoch() {
+  check();
   device_values_.zero_();
   device_values_.select(0, 6).fill_(1.0f);
   epoch_state_ = {};
@@ -55,6 +45,7 @@ public:
  }
  const TrainingEpochMetricState& state() const noexcept { return epoch_state_; }
  void begin_attempt(std::size_t contributions) {
+  check();
   attempt_values_.zero_(); control_.zero_(); contribution_ = 0;
   if (!diagnostics_.defined() || diagnostics_.size(0) != static_cast<std::int64_t>(contributions)) diagnostics_ = torch::zeros({static_cast<std::int64_t>(contributions), 4}, device_values_.options());
   else diagnostics_.zero_();
@@ -76,12 +67,13 @@ public:
   control_.select(0, 0).add_(torch::isfinite(detached_loss).logical_not().to(torch::kFloat32));
  }
  TrainingMetricSnapshot complete_step(const torch::Tensor& found_inf, int64_t wave_micro_batches, int64_t epoch_micro_batches, const DistributedContext& distributed) {
+  check();
   control_.select(0, 1).copy_(found_inf);
-  distributed_all_reduce_tensor(distributed, control_);
+  work_.join(work_.all_reduce(distributed, control_));
   device_values_.select(0, 6).copy_(control_.select(0, 0).eq(0));
   device_values_.select(0, 7).copy_(control_.select(0, 1));
-  distributed_all_reduce_tensor(distributed, attempt_values_);
-  distributed_all_reduce_tensor(distributed, diagnostics_);
+  work_.join(work_.all_reduce(distributed, attempt_values_));
+  work_.join(work_.all_reduce(distributed, diagnostics_));
   device_values_.narrow(0, 0, 3).add_(attempt_values_.narrow(0, 0, 3));
   device_values_.narrow(0, 3, 3).copy_(attempt_values_.narrow(0, 0, 3));
   auto scalar_sums = attempt_values_.narrow(0, 3, scalar_packet::size);
@@ -118,7 +110,7 @@ public:
   const auto* values = complete_values();
   return static_cast<double>(values[0]) / std::max(1.0, static_cast<double>(values[9]));
  }
- void begin_validation() { device_values_.select(0, 8).zero_(); }
+ void begin_validation() { check(); device_values_.select(0, 8).zero_(); }
  void accumulate_validation(const torch::Tensor& loss) { device_values_.select(0, 8).add_(loss.detach()); }
  [[nodiscard]] double validation_average(std::size_t count) {
   const auto* values = complete_values();
@@ -127,15 +119,13 @@ public:
 
 private:
  const float* complete_values() {
-  host_values_.copy_(device_values_, true);
-  const auto device_index = torch_cuda::checked_device_index(device_id_);
-  const auto stream = torch_cuda::current_torch_cuda_stream_object(device_index);
-  auto completion = event_pool_.record(reinterpret_cast<std::uintptr_t>(stream.stream()), "record training metric handoff");
-  if (!completion) { throw std::runtime_error("training metric event pool is unavailable"); }
-  completion->wait(reinterpret_cast<std::uintptr_t>(settlement_stream_), "wait for training metric handoff");
-  ensure_cuda_ok(cudaStreamSynchronize(settlement_stream_), "synchronize training metric settlement stream");
-  completion->retire();
-  return host_values_.data_ptr<float>();
+  try {
+   host_values_.copy_(device_values_, true);
+   // This event settles the complete metric pipeline, including its pinned
+   // host destination. A stream join alone never makes that storage reclaimable.
+   work_.settle();
+   return host_values_.data_ptr<float>();
+  } catch (...) { failure_ = cudaErrorUnknown; throw; }
  }
  TrainingEpochMetricState epoch_state_;
  int device_id_ = 0;
@@ -146,13 +136,20 @@ private:
  torch::Tensor attempt_values_, control_, diagnostics_;
  std::int64_t contribution_ = 0;
  scalar_packet::Tensors scalar_sources_;
- std::atomic<cudaError_t> first_failure_{cudaSuccess};
- mmltk::frameworks::gpu::TerminalCudaRetirementOwner retirement_owner_{1U};
- mmltk::backend::ml::cuda::CudaEventPool event_pool_;
- cudaStream_t settlement_stream_ = nullptr;
+ torch_cuda::TorchCudaStream launch_;
+ TrainingCollectiveWork work_;
+ cudaError_t failure_ = cudaSuccess;
 };
-TrainingMetricHandoff::TrainingMetricHandoff(int device_id) : impl_(std::make_unique<Impl>(device_id)) {}
-TrainingMetricHandoff::~TrainingMetricHandoff() = default;
+TrainingMetricHandoff::TrainingMetricHandoff(int device_id) : impl_(std::make_shared<Impl>(device_id)) {
+ try { impl_->initialize(); } catch (...) { retire(); throw; }
+}
+TrainingMetricHandoff::~TrainingMetricHandoff() { retire(); }
+void TrainingMetricHandoff::retire() noexcept {
+ if (!impl_) return;
+ const auto status = impl_->retire();
+ if (status != cudaSuccess) std::move(terminal_).Install(mmltk::frameworks::gpu::TerminalCudaCustody::Share(std::move(impl_)), status);
+ else impl_.reset();
+}
 void TrainingMetricHandoff::reset_epoch() { impl_->reset_epoch(); }
 void TrainingMetricHandoff::restore_epoch(const TrainingEpochMetricState& state) { impl_->restore_epoch(state); }
 const TrainingEpochMetricState& TrainingMetricHandoff::state() const { return impl_->state(); }

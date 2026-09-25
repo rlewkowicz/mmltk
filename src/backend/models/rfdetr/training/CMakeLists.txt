@@ -39,6 +39,7 @@ mmltk_register_retained_module_importers(
     training_snapshot.cpp)
 mmltk_register_ordinary_sources(
     mmltk_backend_models_rfdetr_training
+    training_distributed.cpp
     training_gradient_reducer.cpp
     training_data_plan.cpp
     training_schedule.cpp
@@ -51,6 +52,7 @@ mmltk_register_ordinary_sources(
     telemetry_writer.cpp)
 mmltk_register_private_headers(
     mmltk_backend_models_rfdetr_training
+    detail/training_distributed.h
     detail/training_gradient_reducer.h
     detail/training_data_plan.h
     detail/training_data_state.h
