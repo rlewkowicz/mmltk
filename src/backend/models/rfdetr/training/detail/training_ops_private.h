@@ -1,4 +1,5 @@
 #pragma once
+#include "src/backend/models/rfdetr/core/detection_statistics.h"
 #include "training_schedule.h"
 #include "src/frameworks/gpu/terminal_cuda_retirement_owner.h"
 #include <array>
@@ -213,10 +214,10 @@ struct RoutedTrainingLoss {
  torch::Tensor classification;
  torch::Tensor box;
  TensorMap ordinary_terms;
- scalar_packet::Tensors scalars;
- TrainingDiagnosticTensors diagnostics;
+ TrainingScalarPacket::Tensors scalars;
+ DetectionStatisticsPacket::Tensors statistics;
 };
 torch::Tensor loss_value_or_zero(const TensorMap&, const torch::Device&, std::string_view);
-scalar_packet::Tensors ordinary_scalar_tensors(const TensorMap&, const torch::Tensor&, const torch::Tensor&);
+TrainingScalarPacket::Tensors ordinary_scalar_tensors(const TensorMap&, const torch::Tensor&, const torch::Tensor&);
 RoutedTrainingLoss compute_routed_training_loss(NativeRfDetrModel&, TrainingSupervisionRoute, const ModelOutputs&, const PreparedTargets&, const DeviceLossNormalizer&, const DetectionConfig&);
 }  // namespace mmltk::backend::models::rfdetr

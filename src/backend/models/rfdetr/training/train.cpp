@@ -771,7 +771,7 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
     wave.settle([&](TrainLaneResult& value) {
      train_lanes.settle(value, options.device_id);
      loss_report.accumulate(std::move(value.loss_terms));
-     metric_handoff.accumulate(value.loss, value.class_loss, value.box_loss, value.scalars, value.diagnostics);
+     metric_handoff.accumulate(value.loss, value.class_loss, value.box_loss, value.scalars, value.statistics);
      ++local_micro_batches;
     });
     ++local_waves;
@@ -793,11 +793,6 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
   train_lanes.settle_targets();
   flush_progress(true);
   if (progress) { progress->close(); }
-  auto reduced_loss_sum = metric_handoff.loss_sum();
-  auto reduced_micro_batches = metric_handoff.epoch_count(local_micro_batches);
-  // Attempt settlement already SUMs rank numerators. Count global logical
-  // microbatches once, preserving the one-GPU temporal mean.
-  (void)reduced_loss_sum; (void)reduced_micro_batches;
   const double train_loss = metric_handoff.epoch_average();
   epoch_global_loss = train_loss;
   distributed_barrier(distributed);

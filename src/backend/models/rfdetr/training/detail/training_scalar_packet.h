@@ -1,34 +1,16 @@
 #pragma once
-#include <array>
 #include <cmath>
-#include <meta>
-#include <limits>
-#include <torch/types.h>
 #include "src/backend/models/rfdetr/contract/training_metrics.h"
+#include "src/backend/models/rfdetr/core/reflected_tensor_packet.h"
 namespace mmltk::backend::models::rfdetr {
-using TrainingDiagnosticTensors = std::array<torch::Tensor, 4>;
-namespace scalar_packet {
-inline constexpr auto members = std::define_static_array(std::meta::nonstatic_data_members_of(^^TrainingScalars, std::meta::access_context::current()));
-inline constexpr std::size_t size = members.size();
-using Tensors = std::array<torch::Tensor, size>;
-template <std::meta::info Member>
-consteval std::size_t index() {
- for (std::size_t i = 0; i < size; ++i)
-  if (members[i] == Member) return i;
- throw "unknown training scalar";
-}
-template <std::meta::info Member>
-void set(Tensors& values, const torch::Tensor& tensor) {
- if (tensor.defined()) values[index<Member>()] = tensor.detach();
-}
-inline TrainingScalars project(const float* values, double count) {
- TrainingScalars result;
- mmltk::frameworks::reflection::visit_materialized_members<TrainingScalars>([&]<class Declaration>(const auto&) {
-  constexpr auto position = mmltk::frameworks::reflection::member_index<Declaration::pointer>(mmltk::frameworks::reflection::field_declarations<TrainingScalars>());
-  const auto value = static_cast<double>(values[position]);
-  if (count > 0 && std::isfinite(value)) result.*Declaration::pointer = value / count;
- });
- return result;
-}
-}  // namespace scalar_packet
+struct TrainingScalarPacket final : ReflectedTensorPacket<TrainingScalars> {
+ static TrainingScalars project(const float* values, double count) {
+  TrainingScalars result;
+  template for (constexpr auto member : members) {
+   const auto value = static_cast<double>(values[index<member>()]);
+   if (count > 0 && std::isfinite(value)) result.[:member:] = value / count;
+  }
+  return result;
+ }
+};
 }  // namespace mmltk::backend::models::rfdetr

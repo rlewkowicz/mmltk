@@ -163,13 +163,13 @@ torch::Tensor loss_value_or_zero(const TensorMap& loss_dict, const torch::Device
  if (found != loss_dict.end()) { return found->second; }
  return torch::zeros({}, torch::TensorOptions().dtype(torch::kFloat32).device(device));
 }
-scalar_packet::Tensors ordinary_scalar_tensors(const TensorMap& losses, const torch::Tensor& total, const torch::Tensor& auxiliary) {
- scalar_packet::Tensors values;
- scalar_packet::set<^^TrainingScalars::total>(values, total);
- scalar_packet::set<^^TrainingScalars::auxiliary_weighted>(values, auxiliary);
+TrainingScalarPacket::Tensors ordinary_scalar_tensors(const TensorMap& losses, const torch::Tensor& total, const torch::Tensor& auxiliary) {
+ TrainingScalarPacket::Tensors values;
+ TrainingScalarPacket::set<^^TrainingScalars::total>(values, total);
+ TrainingScalarPacket::set<^^TrainingScalars::auxiliary_weighted>(values, auxiliary);
  const auto assign = [&]<std::meta::info Member>(std::string_view name) {
   const auto found = losses.find(std::string(name));
-  if (found != losses.end()) scalar_packet::set<Member>(values, found->second);
+  if (found != losses.end()) TrainingScalarPacket::set<Member>(values, found->second);
  };
  assign.operator()<^^TrainingScalars::classification>("loss_ce");
  assign.operator()<^^TrainingScalars::l1>("loss_bbox");
@@ -184,21 +184,22 @@ RoutedTrainingLoss compute_routed_training_loss(NativeRfDetrModel& model, const 
  const DeviceLossNormalizer& normalizer, const DetectionConfig& detection_config) {
  if (route_uses_match_free(route)) {
   const auto loss = model.supervision_loss(outputs, targets, normalizer, true);
-  scalar_packet::Tensors scalars;
-  scalar_packet::set<^^TrainingScalars::total>(scalars, loss.total);
-  scalar_packet::set<^^TrainingScalars::classification>(scalars, loss.main.classification);
-  scalar_packet::set<^^TrainingScalars::l1>(scalars, loss.main.box);
-  scalar_packet::set<^^TrainingScalars::giou>(scalars, loss.main.giou);
-  scalar_packet::set<^^TrainingScalars::mask_ce>(scalars, loss.main.mask_ce);
-  scalar_packet::set<^^TrainingScalars::mask_dice>(scalars, loss.main.mask_dice);
-  scalar_packet::set<^^TrainingScalars::correspondence_weighted>(scalars, loss.correspondence);
-  scalar_packet::set<^^TrainingScalars::auxiliary_weighted>(scalars, loss.auxiliary);
-  if (route_uses_denoising(route)) scalar_packet::set<^^TrainingScalars::denoising_weighted>(scalars, loss.denoising);
+  TrainingScalarPacket::Tensors scalars;
+  TrainingScalarPacket::set<^^TrainingScalars::total>(scalars, loss.total);
+  TrainingScalarPacket::set<^^TrainingScalars::classification>(scalars, loss.main.classification);
+  TrainingScalarPacket::set<^^TrainingScalars::l1>(scalars, loss.main.box);
+  TrainingScalarPacket::set<^^TrainingScalars::giou>(scalars, loss.main.giou);
+  TrainingScalarPacket::set<^^TrainingScalars::mask_ce>(scalars, loss.main.mask_ce);
+  TrainingScalarPacket::set<^^TrainingScalars::mask_dice>(scalars, loss.main.mask_dice);
+  TrainingScalarPacket::set<^^TrainingScalars::correspondence_weighted>(scalars, loss.correspondence);
+  TrainingScalarPacket::set<^^TrainingScalars::auxiliary_weighted>(scalars, loss.auxiliary);
+  if (route_uses_denoising(route)) TrainingScalarPacket::set<^^TrainingScalars::denoising_weighted>(scalars, loss.denoising);
   return {loss.total, loss.classification, loss.box + loss.giou, {}, std::move(scalars)};
  }
  const double group_divisor = detection_config.sum_group_losses ? 1.0 : static_cast<double>(detection_config.group_detr);
  const auto num_boxes = torch::clamp_min(normalizer.target_count * group_divisor, 1.0);
- auto ordinary_terms = detection_loss_dict(outputs, targets, detection_config, true, num_boxes);
+ DetectionStatisticsPacket::Tensors statistics;
+ auto ordinary_terms = detection_loss_dict(outputs, targets, detection_config, true, num_boxes, &statistics);
  torch::Tensor auxiliary;
  auto total = weighted_detection_loss(ordinary_terms, detection_config, outputs.main.pred_logits.device(), &auxiliary);
  auto scalars = ordinary_scalar_tensors(ordinary_terms, total, auxiliary);
@@ -207,12 +208,11 @@ RoutedTrainingLoss compute_routed_training_loss(NativeRfDetrModel& model, const 
  if (route_uses_denoising(route)) {
   const auto denoising = model.supervision_loss(outputs, targets, normalizer, true);
   total = total + denoising.total;
-  scalar_packet::set<^^TrainingScalars::denoising_weighted>(scalars, denoising.total);
+  TrainingScalarPacket::set<^^TrainingScalars::denoising_weighted>(scalars, denoising.total);
   classification = classification + denoising.classification;
   box = box + denoising.box + denoising.giou;
  }
- scalar_packet::set<^^TrainingScalars::total>(scalars, total);
- TrainingDiagnosticTensors diagnostics{ordinary_terms.at("class_error_sum"), ordinary_terms.at("matched_count"), ordinary_terms.at("cardinality_error_sum"), ordinary_terms.at("image_count")};
- return {std::move(total), std::move(classification), std::move(box), std::move(ordinary_terms), std::move(scalars), std::move(diagnostics)};
+ TrainingScalarPacket::set<^^TrainingScalars::total>(scalars, total);
+ return {std::move(total), std::move(classification), std::move(box), std::move(ordinary_terms), std::move(scalars), std::move(statistics)};
 }
 }  // namespace mmltk::backend::models::rfdetr

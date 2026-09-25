@@ -552,7 +552,7 @@ torch::Tensor iou_weighted_class_targets(
  cls_targets.index_put_({idx.first, idx.second, target_classes_o}, pos_ious.to(cls_targets.dtype()));
  return cls_targets;
 }
-TensorMap loss_labels(const OutputLayer& layer, const PreparedTargets& targets, const MatcherLayerIndices& indices, const DetectionConfig& config, const torch::Tensor& num_boxes, bool log) {
+TensorMap loss_labels(const OutputLayer& layer, const PreparedTargets& targets, const MatcherLayerIndices& indices, const DetectionConfig& config, const torch::Tensor& num_boxes, bool main_output, DetectionStatisticsPacket::Tensors* statistics = nullptr) {
  mmltk::common::logging::ScopedProfile profile_rfdetr_criterion_loss_labels{"rfdetr.criterion.loss_labels"};
  TensorMap losses;
  const auto src_logits = layer.pred_logits;
@@ -592,23 +592,29 @@ TensorMap loss_labels(const OutputLayer& layer, const PreparedTargets& targets, 
   loss_ce = sigmoid_focal_loss(src_logits, target_classes_onehot, num_boxes, config.focal_alpha, 2.0, config.use_jit_traced_loss_ops) * src_logits.size(1);
  }
  losses["loss_ce"] = loss_ce;
- if (log) {
+ if (main_output) {
   const auto matched_logits = src_logits.index({idx.first, idx.second});
   losses["class_error"] = 100.0 - accuracy_top1(matched_logits, target_classes_o);
-  losses["matched_count"] = torch::full({}, target_classes_o.numel(), src_logits.options().dtype(torch::kFloat32));
-  losses["class_error_sum"] = losses["class_error"] * losses["matched_count"];
+  if (statistics) {
+   const auto matched_count = torch::full({}, target_classes_o.numel(), src_logits.options().dtype(torch::kFloat32));
+   DetectionStatisticsPacket::set<^^DetectionSufficientStatistics::matched_count>(*statistics, matched_count);
+   DetectionStatisticsPacket::set<^^DetectionSufficientStatistics::class_error_sum>(*statistics, losses["class_error"] * matched_count);
+  }
  }
  return losses;
 }
-TensorMap loss_cardinality(const OutputLayer& layer, const PreparedTargets& targets) {
+TensorMap loss_cardinality(const OutputLayer& layer, const PreparedTargets& targets, DetectionStatisticsPacket::Tensors* statistics = nullptr) {
  mmltk::common::logging::ScopedProfile profile_rfdetr_criterion_loss_cardinality{"rfdetr.criterion.loss_cardinality"};
  TensorMap losses;
  const auto pred_logits = layer.pred_logits;
  const auto target_lengths =
   targets.target_counts.defined() ? targets.target_counts.to(pred_logits.device()) : make_cpu_int64_tensor(targets.counts).to(pred_logits.device(), torch::kInt64, false, false);
  losses["cardinality_error"] = cardinality_error(pred_logits, target_lengths);
- losses["image_count"] = torch::full({}, pred_logits.size(0), pred_logits.options().dtype(torch::kFloat32));
- losses["cardinality_error_sum"] = losses["cardinality_error"] * losses["image_count"];
+ if (statistics) {
+  const auto image_count = torch::full({}, pred_logits.size(0), pred_logits.options().dtype(torch::kFloat32));
+  DetectionStatisticsPacket::set<^^DetectionSufficientStatistics::image_count>(*statistics, image_count);
+  DetectionStatisticsPacket::set<^^DetectionSufficientStatistics::cardinality_error_sum>(*statistics, losses["cardinality_error"] * image_count);
+ }
  return losses;
 }
 TensorMap loss_boxes(const OutputLayer& layer, const PreparedTargets& targets, const MatcherLayerIndices& indices, const torch::Tensor& num_boxes) {
@@ -675,7 +681,7 @@ std::vector<std::pair<torch::Tensor, torch::Tensor>> matcher_indices(
  return compute_matcher_indices_for_layers({&outputs.main}, targets, config, training_mode ? config.group_detr : 1, access.get(), {&samples, 1}).front();
 }
 TensorMap detection_loss_dict(
- const ModelOutputs& outputs, const PreparedTargets& targets, const DetectionConfig& config, bool training_mode, bool distributed_enabled, const AllReduceTensorFn& distributed_all_reduce) {
+ const ModelOutputs& outputs, const PreparedTargets& targets, const DetectionConfig& config, bool training_mode, bool distributed_enabled, const AllReduceTensorFn& distributed_all_reduce, DetectionStatisticsPacket::Tensors* statistics) {
  mmltk::common::logging::ScopedProfile profile_rfdetr_criterion_total{"rfdetr.criterion.total"};
  const int64_t group_detr = training_mode ? config.group_detr : 1;
  int64_t num_boxes_int = 0;
@@ -685,16 +691,16 @@ TensorMap detection_loss_dict(
  auto num_boxes = torch::full({}, static_cast<double>(num_boxes_int), torch::TensorOptions().dtype(torch::kFloat32).device(outputs.main.pred_logits.device()));
  if (distributed_enabled && distributed_all_reduce) { distributed_all_reduce(num_boxes); }
  const auto num_boxes_value = torch::clamp_min(num_boxes, 1.0);
- return detection_loss_dict(outputs, targets, config, training_mode, num_boxes_value);
+ return detection_loss_dict(outputs, targets, config, training_mode, num_boxes_value, statistics);
 }
-TensorMap detection_loss_dict(const ModelOutputs& outputs, const PreparedTargets& targets, const DetectionConfig& config, bool training_mode, double num_boxes_value) {
- return detection_loss_dict(outputs, targets, config, training_mode, torch::full({}, num_boxes_value, torch::TensorOptions().dtype(torch::kFloat32).device(outputs.main.pred_logits.device())));
+TensorMap detection_loss_dict(const ModelOutputs& outputs, const PreparedTargets& targets, const DetectionConfig& config, bool training_mode, double num_boxes_value, DetectionStatisticsPacket::Tensors* statistics) {
+ return detection_loss_dict(outputs, targets, config, training_mode, torch::full({}, num_boxes_value, torch::TensorOptions().dtype(torch::kFloat32).device(outputs.main.pred_logits.device())), statistics);
 }
-TensorMap detection_loss_dict(const ModelOutputs& outputs, const PreparedTargets& targets, const DetectionConfig& config, bool training_mode, const torch::Tensor& num_boxes_value) {
- return detection_loss_dict(outputs, targets, config, training_mode, num_boxes_value, {});
+TensorMap detection_loss_dict(const ModelOutputs& outputs, const PreparedTargets& targets, const DetectionConfig& config, bool training_mode, const torch::Tensor& num_boxes_value, DetectionStatisticsPacket::Tensors* statistics) {
+ return detection_loss_dict(outputs, targets, config, training_mode, num_boxes_value, {}, statistics);
 }
 TensorMap detection_loss_dict(
- const ModelOutputs& outputs, const PreparedTargets& targets, const DetectionConfig& config, bool training_mode, const torch::Tensor& num_boxes_value, std::span<const LayerMaskSamples> samples) {
+ const ModelOutputs& outputs, const PreparedTargets& targets, const DetectionConfig& config, bool training_mode, const torch::Tensor& num_boxes_value, std::span<const LayerMaskSamples> samples, DetectionStatisticsPacket::Tensors* statistics) {
  mmltk::common::logging::ScopedProfile profile_rfdetr_criterion_total_resolved_num_boxes{"rfdetr.criterion.total_resolved_num_boxes"};
  const int64_t group_detr = training_mode ? config.group_detr : 1;
  std::vector<const OutputLayer*> matcher_layers;
@@ -712,8 +718,8 @@ TensorMap detection_loss_dict(
  size_t matcher_layer_index = 0;
  const auto& indices = matcher_indices_all[matcher_layer_index++];
  TensorMap losses;
- update_losses(losses, loss_labels(outputs.main, targets, indices, config, num_boxes_value, true));
- update_losses(losses, loss_cardinality(outputs.main, targets));
+ update_losses(losses, loss_labels(outputs.main, targets, indices, config, num_boxes_value, true, statistics));
+ update_losses(losses, loss_cardinality(outputs.main, targets, statistics));
  update_losses(losses, loss_boxes(outputs.main, targets, indices, num_boxes_value));
  if (config.include_masks) { update_losses(losses, loss_masks(outputs.main, targets, indices, config, num_boxes_value, layer_samples(0), 0)); }
  if (!outputs.aux_outputs.empty()) {

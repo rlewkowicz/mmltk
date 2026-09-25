@@ -43,7 +43,7 @@ void record_lane_result_on_current_stream(const TrainLaneResult& lane_result, in
  record_tensor(lane_result.class_loss);
  record_tensor(lane_result.box_loss);
  for (const auto& scalar : lane_result.scalars) record_tensor(scalar);
- for (const auto& value : lane_result.diagnostics) record_tensor(value);
+ for (const auto& value : lane_result.statistics) record_tensor(value);
  for (const auto& [name, value] : lane_result.loss_terms) record_tensor(value);
 }
 void TrainingLossReport::begin_attempt() { values_ = {}; }
@@ -261,8 +261,8 @@ std::future<TrainLaneResult> TrainingLanes::enqueue(RuntimeContext* runtime, mml
    torch::Tensor detached_loss;
    torch::Tensor detached_class_loss;
    torch::Tensor detached_box_loss;
-   scalar_packet::Tensors scalar_values;
-   TrainingDiagnosticTensors diagnostics;
+   TrainingScalarPacket::Tensors scalar_values;
+   DetectionStatisticsPacket::Tensors statistics;
    TensorMap loss_terms;
    {
     RoutedTrainingLoss loss_result;
@@ -307,7 +307,7 @@ std::future<TrainLaneResult> TrainingLanes::enqueue(RuntimeContext* runtime, mml
     detached_class_loss = loss_result.classification.detach();
     detached_box_loss = loss_result.box.detach();
     scalar_values = std::move(loss_result.scalars);
-    diagnostics = std::move(loss_result.diagnostics);
+    statistics = std::move(loss_result.statistics);
     loss_terms = std::move(loss_result.ordinary_terms);
     for (auto& [name, value] : loss_terms) value = value.detach();
    }
@@ -317,7 +317,7 @@ std::future<TrainLaneResult> TrainingLanes::enqueue(RuntimeContext* runtime, mml
     std::move(detached_class_loss),
     std::move(detached_box_loss),
     std::move(scalar_values),
-    std::move(diagnostics),
+    std::move(statistics),
     std::move(loss_terms),
     &lane.ready,
    };

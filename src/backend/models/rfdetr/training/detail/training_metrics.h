@@ -1,4 +1,5 @@
 #pragma once
+#include "src/backend/models/rfdetr/core/detection_statistics.h"
 #include <memory>
 #include <cstdint>
 #include <cstddef>
@@ -30,11 +31,9 @@ public:
  [[nodiscard]] const TrainingEpochMetricState& state() const;
  void begin_attempt(std::size_t contributions);
  void accumulate_empty();
- void accumulate(const torch::Tensor& loss, const torch::Tensor& class_loss, const torch::Tensor& box_loss, const scalar_packet::Tensors& scalars, const TrainingDiagnosticTensors& diagnostics = {});
- TrainingMetricSnapshot complete_step(const torch::Tensor& found_inf, int64_t wave_micro_batches, int64_t epoch_micro_batches, const DistributedContext& distributed = {});
- torch::Tensor loss_sum() const;
- torch::Tensor epoch_count(std::int64_t count);
- double epoch_average();
+ void accumulate(const torch::Tensor& loss, const torch::Tensor& class_loss, const torch::Tensor& box_loss, const TrainingScalarPacket::Tensors& scalars, const DetectionStatisticsPacket::Tensors& statistics = {});
+ TrainingMetricSnapshot complete_step(const torch::Tensor& found_inf, int64_t attempt_micro_batches, int64_t epoch_micro_batches, const DistributedContext& distributed = {});
+ [[nodiscard]] double epoch_average() const;
  void begin_validation();
  void accumulate_validation(const torch::Tensor& loss);
  double validation_average(std::size_t count);

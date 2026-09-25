@@ -313,6 +313,7 @@ void exercise_gradient_trajectory(const DistributedContext& distributed, int dev
     TrainingGradientReducer reducer(distributed, device, launch, optimizer.parameter_names(), optimizer.parameters(), leaves, 16);
     TrainingTargetCounts counts(physical, device, distributed);
     TrainingMetricHandoff metrics(device); metrics.reset_epoch();
+    require(metrics.epoch_average() == 0 && metrics.state().microbatches == 0, "empty settled epoch mean differs");
     GradScaler scaler(true, 128, 2, .5, 2), expected_scaler(true, 128, 2, .5, 2);
     ModelEma ema(optimizer.eligible_parameters(), .9, 3), expected_ema(expected_optimizer.eligible_parameters(), .9, 3);
     TrainingSchedule schedule(request.recipe, built.base_lrs, built.roles, 2, 4 * k, k);
@@ -321,7 +322,11 @@ void exercise_gradient_trajectory(const DistributedContext& distributed, int dev
     for (std::size_t attempt = 0; attempt < 4; ++attempt) {
      if (attempt == 2) {
       restore_optimizer(optimizer);
-      const auto saved_metrics = metrics.state(); metrics.restore_epoch(saved_metrics);
+      const auto saved_metrics = metrics.state();
+      const auto saved_mean = metrics.epoch_average();
+      metrics.restore_epoch(saved_metrics);
+      require(metrics.state().microbatches == attempt * k && metrics.epoch_average() == saved_mean,
+       "restored epoch prefix changed its settled temporal mean");
       const auto saved = schedule.state(); schedule.restore(saved);
       scaler.load_state(scaler.current_scale(), scaler.growth_tracker());
       std::vector<torch::Tensor> cpu_shadow; for (const auto& tensor : ema.shadow_params()) cpu_shadow.push_back(tensor.cpu());
@@ -372,11 +377,15 @@ void exercise_gradient_trajectory(const DistributedContext& distributed, int dev
         double matched = 0, errors = 0, cardinality = 0;
         for (std::size_t image = slice.begin; image < slice.begin + slice.count; ++image) { matched += targets(micro, image); errors += targets(micro, image) * (10 + image); cardinality += image + 1; }
         const auto scalar = [&](double value) { return torch::full({}, value, loss.options()); };
-        TrainingDiagnosticTensors diagnostics{scalar(errors), scalar(matched), scalar(cardinality), scalar(slice.count)};
-        scalar_packet::Tensors scalars;
-        scalar_packet::set<^^TrainingScalars::class_error>(scalars, scalar(matched ? errors / matched : 100));
-        scalar_packet::set<^^TrainingScalars::cardinality_error>(scalars, scalar(cardinality / slice.count));
-        metrics.accumulate(loss, loss, loss, scalars, diagnostics);
+        DetectionStatisticsPacket::Tensors statistics;
+        DetectionStatisticsPacket::set<^^DetectionSufficientStatistics::class_error_sum>(statistics, scalar(errors));
+        DetectionStatisticsPacket::set<^^DetectionSufficientStatistics::matched_count>(statistics, scalar(matched));
+        DetectionStatisticsPacket::set<^^DetectionSufficientStatistics::cardinality_error_sum>(statistics, scalar(cardinality));
+        DetectionStatisticsPacket::set<^^DetectionSufficientStatistics::image_count>(statistics, scalar(slice.count));
+        TrainingScalarPacket::Tensors scalars;
+        TrainingScalarPacket::set<^^TrainingScalars::class_error>(scalars, scalar(matched ? errors / matched : 100));
+        TrainingScalarPacket::set<^^TrainingScalars::cardinality_error>(scalars, scalar(cardinality / slice.count));
+        metrics.accumulate(loss, loss, loss, scalars, statistics);
        }
        else metrics.accumulate_empty();
        std::int64_t global_count = 0; for (std::size_t image = 0; image < batch; ++image) global_count += targets(micro, image);
@@ -402,6 +411,8 @@ void exercise_gradient_trajectory(const DistributedContext& distributed, int dev
      epoch_loss += attempt_loss;
      require(std::abs(snapshot.loss_sum - epoch_loss) < 2e-5, "global live epoch numerator differs");
      require(std::abs(snapshot.step_loss - attempt_loss / k) < 2e-5, "global live attempt mean differs");
+     require(metrics.epoch_average() == snapshot.loss_sum / ((attempt + 1) * k), "settled epoch mean differs from live state");
+     require(metrics.state().scalar_means() == snapshot.scalars, "settled epoch scalar means differ from the live snapshot");
      require(snapshot.scalars.class_error && std::abs(*snapshot.scalars.class_error - epoch_class_error / ((attempt + 1) * k)) < 2e-5, "matched-class sufficient statistics differ");
      require(snapshot.scalars.cardinality_error && std::abs(*snapshot.scalars.cardinality_error - epoch_cardinality / ((attempt + 1) * k)) < 2e-5, "global image/cardinality statistics differ");
      if (!skipped) { optimizer.clip_grad_norm_(.1); expected_optimizer.clip_grad_norm_(.1); }
@@ -418,7 +429,32 @@ void exercise_gradient_trajectory(const DistributedContext& distributed, int dev
       equal(ema.shadow_params()[p], expected_ema.shadow_params()[p], "EMA trajectory differs from global reference");
      }
     }
-    static_cast<void>(metrics.epoch_count(4 * k)); require(std::abs(metrics.epoch_average() - epoch_loss / (4 * k)) < 2e-5, "final temporal mean differs");
+    require(std::abs(metrics.epoch_average() - epoch_loss / (4 * k)) < 2e-5, "final temporal mean differs");
+    const auto settled_mean = metrics.epoch_average();
+    const auto options = working.begin()->value().options().requires_grad(false);
+    metrics.begin_validation();
+    metrics.accumulate_validation(torch::full({}, 7.0, options));
+    require(metrics.epoch_average() == settled_mean, "validation work changed the authoritative settled epoch mean");
+    require(metrics.validation_average(1) == 7 && metrics.epoch_average() == settled_mean, "validation handoff changed the settled epoch mean");
+    // MatchFree has no Hungarian statistics. Empty rank slices still take part
+    // in every collective without manufacturing class/cardinality availability.
+    metrics.reset_epoch(); metrics.begin_attempt(k);
+    const auto slice = TrainingDataPlan::rank_slice(batch, distributed.rank, distributed.world_size);
+    for (std::size_t micro = 0; micro < k; ++micro) {
+     if (!slice.count) { metrics.accumulate_empty(); continue; }
+     const auto loss = torch::full({}, static_cast<double>(slice.count), options);
+     TrainingScalarPacket::Tensors scalars;
+     TrainingScalarPacket::set<^^TrainingScalars::total>(scalars, loss);
+     metrics.accumulate(loss, loss, loss, scalars);
+    }
+    const auto absent = metrics.complete_step(torch::zeros({}, options), k, k, distributed);
+    require(!absent.scalars.class_error && !absent.scalars.cardinality_error && !absent.scalars.mask_ce,
+     "absent MatchFree statistics acquired fabricated values");
+    require(absent.scalars.total == static_cast<double>(batch) && metrics.epoch_average() == static_cast<double>(batch),
+     "absent statistics changed available loss means");
+    const auto absent_prefix = metrics.state(); metrics.restore_epoch(absent_prefix);
+    require(metrics.state().scalar_means() == absent.scalars && metrics.epoch_average() == static_cast<double>(batch),
+     "Resume changed optional statistics availability");
     // A nonfinite constant leaves its gradients finite, and must still fail
     // every rank rather than becoming a recoverable overflow skip.
     metrics.begin_attempt(1);
@@ -510,12 +546,12 @@ private:
  FixtureCollectiveBackend& backend_;
  bool finished_ = false;
 };
-class HeldCountConsumption final {
+class HeldCudaStream final {
 public:
- explicit HeldCountConsumption(tc::TorchCudaStream stream) : stream_(stream) {
-  require(cudaLaunchHostFunc(stream_.stream(), &CollectiveGate::hold, &gate_) == cudaSuccess, "could not delay count conversion");
+ explicit HeldCudaStream(tc::TorchCudaStream stream) : stream_(stream) {
+  require(cudaLaunchHostFunc(stream_.stream(), &CollectiveGate::hold, &gate_) == cudaSuccess, "could not delay CUDA stream consumption");
  }
- ~HeldCountConsumption() { release(); try { stream_.synchronize(); } catch (...) {} }
+ ~HeldCudaStream() { release(); try { stream_.synchronize(); } catch (...) {} }
  void release() { gate_.release(); }
  bool await() { return gate_.await(); }
 private:
@@ -690,7 +726,7 @@ void exercise_collective_custody(int device) {
   auto count_owner = TrainingDistributedTestAccess::custody(counts);
   const auto stream = tc::getStreamFromPool(false, tc::checked_device_index(device));
   counts.publish(0, 7); counts.resolve();
-  HeldCountConsumption delayed(stream);
+  HeldCudaStream delayed(stream);
   torch::Tensor previous;
   {
    tc::TorchCudaStreamGuard consumer(stream);
@@ -702,6 +738,23 @@ void exercise_collective_custody(int device) {
   TrainingDistributedTestAccess::retire(counts); require(count_owner.expired(), "settled local counts leaked");
   TrainingMetricHandoff metrics(device); auto metric_owner = TrainingDistributedTestAccess::custody(metrics);
   metrics.begin_attempt(1); metrics.accumulate_empty(); static_cast<void>(metrics.complete_step(torch::zeros({}, options), 1, 1));
+  metrics.restore_epoch({3, 12, 6, 9, {}});
+  const auto launch = tc::getCurrentCUDAStream(tc::checked_device_index(device));
+  std::future<double> mean;
+  {
+   // Hold actual GPU progress after restoration. Reading the settled mean
+   // must return while this stream remains held, without a second readback.
+   HeldCudaStream pending(launch);
+   const bool entered = pending.await();
+   mean = std::async(std::launch::async, [&] {
+    tc::TorchCudaDeviceGuard worker(tc::checked_device_index(device));
+    tc::TorchCudaStreamGuard stream_guard(launch);
+    return metrics.epoch_average();
+   });
+   const bool completed = mean.wait_for(std::chrono::seconds(20)) == std::future_status::ready;
+   pending.release();
+   require(entered && completed && mean.get() == 4, "settled epoch mean required another GPU handoff");
+  }
   TrainingDistributedTestAccess::retire(metrics); require(metric_owner.expired(), "settled local metrics leaked");
  }
 }

@@ -2204,13 +2204,25 @@ TEST_CASE("Selective native training retains routed objectives gradients optimiz
        const auto state = generator.get_state();
        const auto ordinary = forward(eager, input);
        const auto after_forward = generator.get_state();
-       eager_losses[micro] = rfdetr::compute_routed_training_loss(eager, route, ordinary, targets, {torch::tensor(2.F, floats)}, detection).total;
+       const auto eager_loss = rfdetr::compute_routed_training_loss(eager, route, ordinary, targets, {torch::tensor(2.F, floats)}, detection);
+       eager_losses[micro] = eager_loss.total;
        const auto after = generator.get_state();
        generator.set_state(state);
        const auto compiled = forward(selective, compiled_input);
        CAPTURE(torch::equal(after_forward, generator.get_state()));
-       selective_losses[micro] = rfdetr::compute_routed_training_loss(selective, route, compiled, targets, {torch::tensor(2.F, floats)}, detection).total;
+       const auto selective_loss = rfdetr::compute_routed_training_loss(selective, route, compiled, targets, {torch::tensor(2.F, floats)}, detection);
+       selective_losses[micro] = selective_loss.total;
        REQUIRE(torch::equal(after, generator.get_state()));
+       template for (constexpr auto member : rfdetr::DetectionStatisticsPacket::members) {
+        const auto& eager_statistic = rfdetr::DetectionStatisticsPacket::get<member>(eager_loss.statistics);
+        const auto& selective_statistic = rfdetr::DetectionStatisticsPacket::get<member>(selective_loss.statistics);
+        REQUIRE(eager_statistic.defined() == !match_free);
+        REQUIRE(selective_statistic.defined() == !match_free);
+        if (!match_free) {
+         REQUIRE_FALSE(eager_statistic.requires_grad());
+         REQUIRE_FALSE(selective_statistic.requires_grad());
+        }
+       }
        CHECK(torch::allclose(ordinary.main.pred_logits, compiled.main.pred_logits, 4e-3, 4e-3));
        CHECK(torch::allclose(ordinary.main.pred_boxes, compiled.main.pred_boxes, 4e-3, 4e-3));
        CHECK(torch::allclose(eager_losses[micro], selective_losses[micro], 4e-3, 4e-3));

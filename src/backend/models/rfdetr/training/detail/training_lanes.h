@@ -1,4 +1,5 @@
 #pragma once
+#include "src/backend/models/rfdetr/core/detection_statistics.h"
 #include <atomic>
 #include <deque>
 #include <future>
@@ -16,6 +17,7 @@
 #include "src/backend/models/rfdetr/contract/workflow_requests.h"
 #include "src/frameworks/gpu/terminal_cuda_retirement_owner.h"
 #include "training_ops_private.h"
+#include "training_scalar_packet.h"
 #include "training_gradient_reducer.h"
 #include "target_builder_private.h"
 #include "gpu_augment_private.h"
@@ -40,8 +42,8 @@ struct TrainLaneResult {
  torch::Tensor loss;
  torch::Tensor class_loss;
  torch::Tensor box_loss;
- scalar_packet::Tensors scalars;
- TrainingDiagnosticTensors diagnostics;
+ TrainingScalarPacket::Tensors scalars;
+ DetectionStatisticsPacket::Tensors statistics;
  // Detached scalar criterion values, bounded by the model's criterion schema.
  TensorMap loss_terms;
  // Borrowed until this wave settles; the lane retains and reuses its event.
