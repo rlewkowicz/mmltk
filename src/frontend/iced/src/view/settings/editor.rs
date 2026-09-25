@@ -22,6 +22,10 @@ pub struct SettingsModel {
     pub draft: Option<GuiSettingsState>,
     queued: Vec<SettingsValueUpdate>,
     queued_lanes: Option<crate::generated::TrainLaneConfiguration>,
+    queued_model_count: Option<u32>,
+    model_count_in_flight: bool,
+    pub recipe_model: Option<u64>,
+    pub execution_locked: [bool; 3],
     debounce_generation: u64,
     update_in_flight: bool,
 }
@@ -34,6 +38,10 @@ impl Default for SettingsModel {
             draft: None,
             queued: Vec::with_capacity(crate::generated::SETTINGS_EDIT_CAPACITY),
             queued_lanes: None,
+            queued_model_count: None,
+            model_count_in_flight: false,
+            recipe_model: None,
+            execution_locked: [false; 3],
             debounce_generation: 0,
             update_in_flight: false,
         }
@@ -56,8 +64,9 @@ impl SettingsModel {
     }
 
     pub fn install(&mut self, snapshot: &SettingsUiState) {
-        if !self.update_in_flight && (self.queued.is_empty() && self.queued_lanes.is_none()) {
+        if !self.update_in_flight && (self.queued.is_empty() && self.queued_lanes.is_none() && self.queued_model_count.is_none()) {
             self.draft = Some(snapshot.settingsstate.clone());
+            self.reconcile_recipe_scope();
         }
     }
 
@@ -70,7 +79,7 @@ impl SettingsModel {
     }
 
     fn queue_capacity(&self) -> usize {
-        if self.queued_lanes.is_some() {
+        if self.queued_lanes.is_some() || self.queued_model_count.is_some() {
             crate::generated::SETTINGS_UPDATE_CAPACITY
         } else {
             crate::generated::SETTINGS_EDIT_CAPACITY
@@ -88,6 +97,7 @@ impl SettingsModel {
             .ok_or_else(|| "settings draft is not installed".to_owned())?;
         let updates = apply(&mut candidate);
         for (index, update) in updates.iter().enumerate() {
+            if self.field_locked(&update.path) { return Err("Execution settings are locked during admitted work.".into()); }
             if update.path.is_empty()
                 || updates[..index]
                     .iter()
@@ -128,7 +138,8 @@ impl SettingsModel {
         execution_active: bool,
     ) -> Result<EditSchedule, String> {
         if self.queued.len() > crate::generated::SETTINGS_UPDATE_CAPACITY { return Err("Settings transaction capacity exceeded.".into()); }
-        if execution_active { return Err("Training configuration is locked during an admitted run.".into()); }
+        if execution_active || self.execution_locked[0] { return Err("Training configuration is locked during an admitted run.".into()); }
+        if self.model_count_in_flight { return Err("Model membership is updating.".into()); }
         let draft = self.draft.as_mut().ok_or("settings draft is not installed")?;
         draft.workflows.train.request.laneconfiguration = value.clone();
         self.queued_lanes = Some(value);
@@ -156,6 +167,7 @@ impl SettingsModel {
         for (stable_id, value) in edits {
             let update = crate::generated::apply_settings_field(&mut candidate, stable_id, value)
                 .map_err(|error| format!("settings identity edit failed: {error:?}"))?;
+            if self.field_locked(&update.path) { return Err("Execution settings are locked during admitted work.".into()); }
             if let Some(prior) = queued.iter_mut().find(|prior| prior.path == update.path) {
                 *prior = update;
             } else {
@@ -177,7 +189,7 @@ impl SettingsModel {
     pub fn debounce_elapsed(&self, generation: u64) -> bool {
         generation != 0
             && generation == self.debounce_generation
-            && !(self.queued.is_empty() && self.queued_lanes.is_none())
+            && !(self.queued.is_empty() && self.queued_lanes.is_none() && self.queued_model_count.is_none())
             && !self.update_in_flight
     }
 
@@ -185,37 +197,82 @@ impl SettingsModel {
         if self.update_in_flight {
             return None;
         }
-        let lanes_locked = self.queued_lanes.is_some() && training_active;
-        // The training request and its lane replacement form one transaction.
-        // Independent settings keep their relative queue order during the run.
+        let train_locked = training_active || self.execution_locked[0];
+        let locked = [train_locked, self.execution_locked[1], self.execution_locked[2]];
         let updates: Vec<_> = self.queued.extract_if(.., |update| {
-            !lanes_locked || !update.path.starts_with("workflows.train.request.")
+            !Self::execution_field_locked(&update.path, locked)
         }).take(crate::generated::SETTINGS_UPDATE_CAPACITY).collect();
-        let laneconfiguration = if lanes_locked { None } else { self.queued_lanes.take() };
-        if updates.is_empty() && laneconfiguration.is_none() {
-            return None;
-        }
+        let laneconfiguration = if train_locked { None } else { self.queued_lanes.take() };
+        let trainingmodelcount = if train_locked { None } else { self.queued_model_count.take() };
+        if updates.is_empty() && laneconfiguration.is_none() && trainingmodelcount.is_none() { return None; }
         self.update_in_flight = true;
-        Some(SettingsUpdateRequest { updates, laneconfiguration })
+        self.model_count_in_flight = trainingmodelcount.is_some() || laneconfiguration.as_ref().is_some_and(|configuration|
+            configuration.mode != crate::generated::TrainLaneMode::SharedGradients && configuration.models.is_empty());
+        Some(SettingsUpdateRequest { updates, laneconfiguration, trainingmodelcount })
+    }
+
+    pub fn training_membership_pending(&self) -> bool { self.model_count_in_flight || self.queued_model_count.is_some() }
+
+    pub fn resize_training_models(&mut self, count: u32) -> Result<EditSchedule, String> {
+        if self.execution_locked[0] { return Err("Training configuration is locked during an admitted run.".into()); }
+        if count == 0 || count as usize > crate::generated::TRAINING_MODEL_CAPACITY { return Err("Invalid native model count.".into()); }
+        if self.queued.len() > crate::generated::SETTINGS_UPDATE_CAPACITY { return Err("settings transaction capacity exceeded".into()); }
+        let draft = self.draft.as_mut().ok_or("settings draft is not installed")?;
+        // Membership, seeds, IDs and recipe copies arrive only in the native reply.
+        draft.workflows.train.request.lanes = count as i32;
+        self.queued.retain(|update| update.path != "workflows.train.request.lanes");
+        self.queued_model_count = Some(count);
+        self.debounce_generation = self.debounce_generation.wrapping_add(1).max(1);
+        Ok(EditSchedule::FlushNow)
+    }
+
+    fn field_locked(&self, path: &str) -> bool {
+        Self::execution_field_locked(path, self.execution_locked)
+    }
+
+    fn execution_field_locked(path: &str, locked: [bool; 3]) -> bool {
+        // These selectors derive the native request or select its model. Keep
+        // their queued drafts with the request until admission has settled.
+        (locked[0] && matches!(path, "workflows.train.compiled_dataset_dir" | "workflows.train.use_compiled_directory_defaults" | "workflows.train.model_source" | "workflows.train.model_input")) ||
+        ["workflows.train.request.", "workflows.validate.request.", "workflows.predict.request."].iter().zip(locked)
+            .any(|(prefix, active)| active && path.starts_with(prefix))
+    }
+
+    fn reconcile_recipe_scope(&mut self) {
+        if self.recipe_model.is_some_and(|id| self.draft.as_ref().is_none_or(|draft|
+            !draft.workflows.train.request.laneconfiguration.models.iter().any(|entry| entry.modelid == id))) {
+            self.recipe_model = None;
+        }
     }
 
     pub fn settle_success(&mut self, authoritative: &SettingsUiState) {
         self.update_in_flight = false;
-        if (self.queued.is_empty() && self.queued_lanes.is_none()) {
+        if self.model_count_in_flight {
+            if let Some(draft) = &mut self.draft {
+                draft.workflows.train.request.laneconfiguration = authoritative.settingsstate.workflows.train.request.laneconfiguration.clone();
+                if self.queued_model_count.is_none() { draft.workflows.train.request.lanes = authoritative.settingsstate.workflows.train.request.lanes; }
+            }
+            self.model_count_in_flight = false;
+        }
+        if self.queued.is_empty() && self.queued_lanes.is_none() && self.queued_model_count.is_none() {
             self.draft = Some(authoritative.settingsstate.clone());
         }
+        self.reconcile_recipe_scope();
     }
 
     pub fn settle_failure(&mut self, authoritative: Option<&SettingsUiState>) {
         self.update_in_flight = false;
         self.queued.clear();
         self.queued_lanes = None;
+        self.queued_model_count = None;
+        self.model_count_in_flight = false;
         self.debounce_generation = self.debounce_generation.wrapping_add(1).max(1);
         self.draft = authoritative.map(|snapshot| snapshot.settingsstate.clone());
+        self.reconcile_recipe_scope();
     }
 
     pub fn has_local_edits(&self) -> bool {
-        self.update_in_flight || !(self.queued.is_empty() && self.queued_lanes.is_none())
+        self.update_in_flight || !(self.queued.is_empty() && self.queued_lanes.is_none() && self.queued_model_count.is_none())
     }
 
     #[cfg(test)]
@@ -751,13 +808,14 @@ mod tests {
         let lanes = snapshot.settingsstate.workflows.train.request.laneconfiguration.clone();
         model.replace_training_lanes(lanes.clone(), false).unwrap();
         model.edit(EditCadence::Immediate, |draft| edit_workflowstrainrequestlanes(draft, 2)).unwrap();
+        model.edit(EditCadence::Immediate, |draft| edit_workflowstraincompileddatasetdir(draft, "/next/dataset".into())).unwrap();
         model.edit(EditCadence::Immediate, |draft| edit_uidarkmode(draft, true)).unwrap();
         model.edit(EditCadence::Immediate, |draft| edit_uishowworkspaceperformance(draft, true)).unwrap();
         // Pending training and active training both lock admission at the caller.
         let pending = model.take_request(true).unwrap();
         assert!(pending.laneconfiguration.is_none());
         assert_eq!(pending.updates, vec![update_uidarkmode(true), update_uishowworkspaceperformance(true)]);
-        assert_eq!(model.queued_len(), 1);
+        assert_eq!(model.queued_len(), 2);
         model.edit(EditCadence::Immediate, |draft| edit_uidarkmode(draft, false)).unwrap();
         assert!(model.take_request(true).is_none());
         snapshot.revision += 1;
@@ -766,6 +824,7 @@ mod tests {
         model.settle_success(&snapshot);
         assert!(!model.draft.as_ref().unwrap().ui.darkmode);
         assert_eq!(model.draft.as_ref().unwrap().workflows.train.request.lanes, 2);
+        assert_eq!(model.draft.as_ref().unwrap().workflows.train.compileddatasetdir, "/next/dataset");
         let active = model.take_request(true).unwrap();
         assert!(active.laneconfiguration.is_none());
         assert_eq!(active.updates, vec![update_uidarkmode(false)]);
@@ -776,7 +835,7 @@ mod tests {
         assert!(!model.update_in_flight());
         let settled = model.take_request(false).unwrap();
         assert_eq!(settled.laneconfiguration, Some(lanes));
-        assert_eq!(settled.updates, vec![update_workflowstrainrequestlanes(2)]);
+        assert_eq!(settled.updates, vec![update_workflowstrainrequestlanes(2), update_workflowstraincompileddatasetdir("/next/dataset".into())]);
         model.settle_failure(Some(&snapshot));
         assert!(!model.has_local_edits());
         assert_eq!(model.draft, Some(snapshot.settingsstate));
@@ -798,6 +857,44 @@ mod tests {
         assert!(request.laneconfiguration.is_some());
         assert_eq!(request.updates.len(), crate::generated::SETTINGS_UPDATE_CAPACITY);
         assert_eq!(model.queued_len(), 0);
+    }
+
+    #[test]
+    fn native_count_queue_keeps_recipe_edits_atomic_and_never_synthesizes_membership() {
+        use crate::generated::*;
+        let mut snapshot = settings_snapshot();
+        let mut model = SettingsModel::default(); model.install(&snapshot);
+        model.edit(EditCadence::Immediate, |draft| edit_workflowstrainrequestrecipeoptimizer(draft, TrainOptimizerKind::SGD)).unwrap();
+        model.resize_training_models(2).unwrap();
+        assert!(model.draft.as_ref().unwrap().workflows.train.request.laneconfiguration.models.is_empty());
+        model.edit(EditCadence::Immediate, |draft| edit_uidarkmode(draft, true)).unwrap();
+        model.edit(EditCadence::Immediate, |draft| edit_workflowstrainoutputautomatic(draft, false)).unwrap();
+        let independent = model.take_request(true).unwrap();
+        assert_eq!(independent.updates, vec![update_uidarkmode(true), update_workflowstrainoutputautomatic(false)]);
+        assert!(independent.trainingmodelcount.is_none());
+        snapshot.settingsstate.ui.darkmode = true;
+        snapshot.settingsstate.workflows.train.output.automatic = false;
+        model.settle_success(&snapshot);
+        let request = model.take_request(false).unwrap();
+        assert_eq!(request.trainingmodelcount, Some(2));
+        assert_eq!(request.updates, vec![update_workflowstrainrequestrecipeoptimizer(TrainOptimizerKind::SGD)]);
+        assert!(request.laneconfiguration.is_none());
+        assert!(model.training_membership_pending());
+        let recipe = snapshot.settingsstate.workflows.train.request.recipe.clone();
+        snapshot.settingsstate.workflows.train.request.lanes = 2;
+        snapshot.settingsstate.workflows.train.request.laneconfiguration.models = vec![TrainModelSettings { modelid: 41, seed: 77, recipe, coefficient: 1.0 }];
+        snapshot.settingsstate.workflows.train.request.laneconfiguration.nextmodelid = 42;
+        model.settle_success(&snapshot);
+        assert_eq!(model.draft.as_ref().unwrap().workflows.train.request.laneconfiguration, snapshot.settingsstate.workflows.train.request.laneconfiguration);
+        assert!(!model.training_membership_pending());
+        assert!(model.resize_training_models(0).is_err());
+        assert!(model.resize_training_models(TRAINING_MODEL_CAPACITY as u32 + 1).is_err());
+        model.execution_locked = [true, true, true];
+        assert!(model.resize_training_models(1).is_err());
+        assert!(model.edit(EditCadence::Immediate, |draft| edit_workflowstrainrequestbatchsize(draft, 4)).is_err());
+        assert!(model.edit(EditCadence::Immediate, |draft| edit_workflowstraincompileddatasetdir(draft, "/next/dataset".into())).is_err());
+        model.edit(EditCadence::Immediate, |draft| edit_uidarkmode(draft, false)).unwrap();
+        assert_eq!(model.take_request(true).unwrap().updates, vec![update_uidarkmode(false)]);
     }
 
 }

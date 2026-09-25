@@ -24,7 +24,7 @@ struct TrainProcessProgress final {
  mmltk::controller::contracts::ComputeProgress progress;
  std::filesystem::path checkpoint_path{};
  std::optional<mmltk::backend::models::rfdetr::TrainingRecord> metrics{};
- std::optional<mmltk::backend::models::rfdetr::TrainingRecord> representative_observation{};
+ mmltk::backend::models::rfdetr::TrainingSources sources{};
  mmltk::backend::models::rfdetr::TrainingPersistence persistence{};
 };
 // This is a service-process exit observation, not a second public compute
@@ -116,6 +116,9 @@ private:
   mmltk::common::io::ScopedFd lifecycle_fd;
   std::inplace_vector<GroupMember, kGroupMemberCapacity> group_members;
   std::filesystem::path output_directory;
+  mmltk::backend::models::rfdetr::TrainingSourceCatalog source_catalog;
+  std::string observed_run;
+  std::string observed_attempt;
   int progress_watch = -1;
   std::uint64_t progress_sequence = 0U;
   std::size_t persistence_marker = 0;

@@ -565,6 +565,15 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
    merge(TrainingMergeBoundary::Epoch);
    distributed_barrier(distributed);
    if (main_process) {
+    if (periodic && !options.use_ema) {
+     // Each trajectory's settled optimizer facts need durable custody even
+     // when Live updates coalesce. Only the synchronized record is evaluated.
+     for (const auto& model : models) {
+      latest = model->progress(TrainingPhase::EpochComplete);
+      latest.session_id = session.session_id;
+      submit(latest, TrainingRecordRole::Epoch);
+     }
+    }
     // These borrowed scopes finish after every archive callback. If validation
     // or publication throws, they release before any trajectory is destroyed.
     std::vector<TrainingSnapshotPublication> publications;

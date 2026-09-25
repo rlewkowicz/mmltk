@@ -157,6 +157,7 @@ TEST_CASE("training history pages retain scoped identities and reject replacemen
  mmltk::testsupport::ScopedTempDir temp("training-history-pages");
  r::TrainingRun run;
  run.run_id = "session"; run.attempt_id = "attempt";
+ run.sources = r::training_source_catalog(run.configuration);
  std::vector<std::byte> scratch(r::kTrainingManifestBytes);
  const auto encode = [&](const auto& value) { return serial::reflected_json(value, scratch, {.max_bytes = scratch.size(), .max_items = 65536, .max_depth = 32}).dump(); };
  std::ofstream(temp.path() / "run.json") << encode(run);
@@ -191,4 +192,58 @@ TEST_CASE("training history pages retain scoped identities and reject replacemen
  CHECK_THROWS(store.Read({opened.generation, 0, 1}));
  std::ofstream(history, std::ios::trunc) << "";
  CHECK_THROWS_WITH(store.Read({reopened.generation, 0, 1}), Catch::Matchers::ContainsSubstring("replaced or truncated"));
+}
+
+TEST_CASE("saved training output admits complete selected provenance and rejects foreign selections", "[gui][train][history]") {
+ namespace r = mmltk::backend::models::rfdetr;
+ namespace serial = mmltk::frameworks::serialization;
+ mmltk::testsupport::ScopedTempDir temp("training-selected-history");
+ r::TrainingRun run; run.run_id = "session"; run.attempt_id = "attempt";
+ run.sources = r::training_source_catalog(run.configuration);
+ r::TrainingSelection selected;
+ selected.artifact.session_id = run.run_id;
+ selected.artifact.path = "selected.pt";
+ selected.artifact.initialization = selected.artifact.configuration = selected.artifact.content = selected.artifact.sha256 = selected.artifact.validation = std::string(64, 'a');
+ selected.artifact.selection_metric = .5; selected.validation.bbox.ap = .5; selected.validation.bbox.available = true;
+ selected.artifact.evaluation = selected.validation;
+ selected.best_individual_metric = .5;
+ selected.ingredients.push_back({0, std::string(64, 'a'), 1});
+ std::vector<std::byte> scratch(r::kTrainingManifestBytes);
+ const auto save = [&](const auto& value, const char* file) { std::ofstream(temp.path() / file) << serial::reflected_json(value, scratch, {.max_bytes = scratch.size(), .max_items = 65536, .max_depth = 32}).dump(); };
+ save(run, "run.json"); save(selected, "selected.json"); std::ofstream(temp.path() / "metrics.jsonl");
+ TrainRunStore store;
+ const auto opened = store.Open(temp.path());
+ REQUIRE(opened.selected == selected);
+ CHECK(opened.run->sources == run.sources);
+ // Exact Resume retains the published output even when the new attempt fails
+ // before publishing another selection. A fresh run replaces that provenance.
+ for (const bool resume : {true, false}) {
+  auto next = run;
+  next.configuration.output_dir = temp.path();
+  if (resume) {
+   next.configuration.resume_path = temp.path() / "session.json";
+   next.source_checkpoint_attempt_id = run.attempt_id;
+  } else next.run_id = "replacement";
+  r::TrainingTelemetryWriter writer(next);
+  r::TrainingMetricProgress progress;
+  progress.session_id = next.run_id;
+  progress.phase = r::TrainingPhase::Error;
+  writer.Submit(progress, r::TrainingRecordRole::Terminal);
+  writer.Close();
+  REQUIRE_FALSE(writer.persistence().degraded);
+  const auto replaced = store.Open(temp.path());
+  REQUIRE(replaced.run);
+  CHECK(replaced.run->run_id == next.run_id);
+  CHECK(replaced.selected == (resume ? std::optional{selected} : std::nullopt));
+  const auto page = store.Read({store.generation(), 0, 1});
+  REQUIRE(page.records.size() == 1);
+  CHECK(page.records.front().run_id == next.run_id);
+ }
+ save(run, "run.json");
+ selected.artifact.session_id = "foreign"; save(selected, "selected.json");
+ CHECK_THROWS(store.Open(temp.path()));
+ selected.artifact.session_id = run.run_id; selected.ingredients.push_back(selected.ingredients.front()); save(selected, "selected.json");
+ CHECK_THROWS(store.Open(temp.path()));
+ std::filesystem::remove(temp.path() / "selected.json");
+ CHECK_FALSE(store.Open(temp.path()).selected);
 }

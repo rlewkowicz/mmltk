@@ -17,8 +17,9 @@ namespace {
 constexpr std::size_t record_bytes = kTrainingRecordBytes;
 constexpr serial::wire::Limits manifest_limits{.max_bytes = kTrainingManifestBytes, .max_items = 65536, .max_depth = 32};
 constexpr serial::wire::Limits limits{.max_bytes = record_bytes, .max_items = 8192, .max_depth = 32};
-// One synchronized ordinary observation, every model EMA, and the session
-// checkpoint must fit even while the persistence worker is blocked.
+// One synchronized ordinary evaluation, every model's EMA evaluation or
+// evaluation-free ordinary optimizer facts, and the session checkpoint must
+// fit even while the persistence worker is blocked.
 constexpr std::size_t epoch_capacity = kMaximumTrainingModels + 2;
 constexpr std::size_t boundary_capacity = 12;
 constexpr std::size_t queue_bytes = (epoch_capacity + boundary_capacity + 2) * record_bytes;
@@ -52,13 +53,16 @@ void append_file(const std::filesystem::path& path, const nlohmann::json& value)
 struct TrainingTelemetryWriter::Impl final {
  explicit Impl(TrainingRun value) : run(std::move(value)) {
   run.attempt_id = identity();
-  if (run.configuration.lane_configuration.mode != TrainLaneMode::SharedGradients && !run.configuration.lane_configuration.models.empty())
-   representative_model = std::ranges::min_element(run.configuration.lane_configuration.models, {}, &TrainModelSettings::model_id)->model_id;
+  run.sources = training_source_catalog(run.configuration);
+  document.sources.catalog = run.sources;
+  document.sources.execution = run.execution;
+  document.sources.observations.reserve(run.sources.available.size());
+  document.sources.failures.reserve(kMaximumTrainingModels + 1U);
+  document.sources.distributions.reserve(kMaximumTrainingModels);
   worker = std::jthread([this] { Work(); });
  }
  TrainingRun run;
- std::uint64_t representative_model = 0;
- std::optional<TrainingRecord> representative_observation;
+ TrainingProgressDocument document;
  std::mutex mutex;
  std::atomic<std::uint64_t> wake_generation{0};
  std::optional<TrainingRecord> live;
@@ -71,7 +75,7 @@ struct TrainingTelemetryWriter::Impl final {
  std::atomic<bool> degraded{false};
  std::atomic<bool> stopping{false};
  std::string error;
- std::array<std::byte, kTrainingProgressDocumentBytes> scratch{};
+ std::vector<std::byte> scratch = std::vector<std::byte>(kTrainingProgressWireBytes);
  std::vector<std::byte> manifest_scratch = std::vector<std::byte>(kTrainingManifestBytes);
  bool reported_failure = false;
  const int uncaught = std::uncaught_exceptions();
@@ -155,6 +159,9 @@ struct TrainingTelemetryWriter::Impl final {
    if (run.run_id.empty()) run.run_id = identity();
    std::ofstream metrics(directory / "metrics.jsonl", std::ios::binary | std::ios::trunc);
    if (!metrics) throw std::runtime_error("cannot create training metric history");
+   // This directory now describes a fresh session. Exact continuation above
+   // retains the last published selection until its replacement succeeds.
+   if (run.configuration.resume_path.empty()) std::filesystem::remove(directory / "selected.json");
   }
   write_file(manifest, serial::reflected_json(run, manifest_scratch, manifest_limits));
  }
@@ -166,25 +173,19 @@ struct TrainingTelemetryWriter::Impl final {
   const auto directory = run.configuration.output_dir;
   auto record_json = serial::reflected_json(record, scratch, limits);
   append_file(directory / "metrics.jsonl", record_json);
-  const auto& artifact = record.progress.artifact;
-  const auto& configuration = run.configuration;
-  if (record.role == TrainingRecordRole::Epoch && artifact && record.progress.val &&
-      artifact->weights == run.evaluated_weights &&
-      ((record.progress.scope == TrainingRecordScope::Model && record.progress.model_id == representative_model) ||
-       (record.progress.scope == TrainingRecordScope::SynchronizedSession && !configuration.use_ema)))
-   representative_observation = record;
-  TrainingProgressDocument document;
-  document.record = record;
-  document.representative_observation = representative_observation;
+  retain_training_source(document.sources, record);
+  if (completed) document.sources.selected = completed->selected;
+  document.record = std::move(record);
   document.persistence = {degraded.load(), dropped.load(), error};
   document.final = completed;
-  write_file(directory / "progress.json", serial::reflected_json(document, scratch, {.max_bytes = kTrainingProgressDocumentBytes, .max_items = 24576, .max_depth = 32}));
-  if (record.role == TrainingRecordRole::Epoch && record.progress.scope == TrainingRecordScope::Session && !record.progress.full_checkpoint_path.empty()) {
+  write_file(directory / "progress.json", serial::reflected_json(document, scratch, {.max_bytes = kTrainingProgressDocumentBytes, .max_items = 131072, .max_depth = 32}));
+  const auto& persisted = document.record;
+  if (persisted.role == TrainingRecordRole::Epoch && persisted.progress.scope == TrainingRecordScope::Session && !persisted.progress.full_checkpoint_path.empty()) {
    run.checkpoint_attempt_id = run.attempt_id;
    write_file(directory / "run.json", serial::reflected_json(run, manifest_scratch, manifest_limits));
   }
-  if (record.role == TrainingRecordRole::Epoch) append_file(directory / "log.txt", serial::reflected_json(record, scratch, limits));
-  if (completed) write_file(directory / "results.json", serial::reflected_json(document, scratch, {.max_bytes = kTrainingProgressDocumentBytes, .max_items = 24576, .max_depth = 32}));
+  if (persisted.role == TrainingRecordRole::Epoch) append_file(directory / "log.txt", record_json);
+  if (completed) write_file(directory / "results.json", serial::reflected_json(document, scratch, {.max_bytes = kTrainingProgressDocumentBytes, .max_items = 131072, .max_depth = 32}));
  }
  void Work() noexcept {
   bool initialized = false;

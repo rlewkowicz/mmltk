@@ -222,6 +222,9 @@ impl App {
         }
         let training_active = self.model.training_family_pending()
             || self.model.workflow.training.as_ref().is_some_and(|state| state.activity != crate::generated::TrainingActivity::Idle);
+        self.settings.state_mut().execution_locked = [training_active,
+            self.model.primary_action_active(crate::generated::FeatureId::Validate),
+            self.model.primary_action_active(crate::generated::FeatureId::Predict)];
         let Some(request) = self.settings.state_mut().take_request(training_active) else {
             return;
         };

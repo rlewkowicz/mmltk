@@ -14,7 +14,7 @@ pub struct NoticeId(pub u64);
 pub enum Severity { Warning, Error }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Origin {
-    Compute(FeatureId), InferenceCapacity(FeatureId), Dataset, Model(FeatureId), Provider, Remote, Checkpoint,
+    Compute(FeatureId), InferenceCapacity(FeatureId), TrainingValidationCapacity, TrainingLimitation, TrainingSupport, TrainingModel(usize), Dataset, Model(FeatureId), Provider, Remote, Checkpoint,
     Dialog, AnnotationSave, Annotation, Explore, Presentation, Upscale, PredictionInspection, PredictionPreview,
     Request(ApplicationIntentEndpoint, u64), Interaction(u64), History, HistoryDropped, HistoryDroppedSaved, Chart, ChartSaved, Gpu(FeatureId), Settings,
     Transport, Protocol, Clipboard, Admission(ApplicationIntentEndpoint), Editor(FeatureId), PredictionTotal, Overflow,
@@ -47,6 +47,7 @@ struct Frontier {
     row: Option<NoticeId>,
     owner: u64,
     run: Option<String>,
+    operation: u64,
 }
 /// Identity of retained row content, independent of source frontiers and copy attempts.
 /// Clones share it until either store changes, so branching fixture/bootstrap models
@@ -75,7 +76,7 @@ pub struct NoticeStore {
 impl Default for NoticeStore {
     fn default() -> Self {
         Self { presentation: Presentation::default(), rows: VecDeque::with_capacity(CAPACITY), overflow: None, evicted: 0,
-            next_id: 1, frontiers: { let mut slots = Vec::with_capacity(SOURCE_CAPACITY); slots.push(Frontier { origin: Origin::Protocol, generation: 0, observed: false, row: None, owner: 0, run: None }); slots }, bootstrapping: false, initialized: false }
+            next_id: 1, frontiers: { let mut slots = Vec::with_capacity(SOURCE_CAPACITY); slots.push(Frontier { origin: Origin::Protocol, generation: 0, observed: false, row: None, owner: 0, run: None, operation: 0 }); slots }, bootstrapping: false, initialized: false }
     }
 }
 impl NoticeStore {
@@ -106,7 +107,7 @@ impl NoticeStore {
             self.local(Origin::Protocol, UiError::protocol("Notification source capacity exhausted")); return;
         }
         let index = self.frontiers.iter().position(|slot| slot.origin == origin).unwrap_or_else(|| {
-            self.frontiers.push(Frontier { origin, generation: 0, observed: false, row: None, owner, run: None });
+            self.frontiers.push(Frontier { origin, generation: 0, observed: false, row: None, owner, run: None, operation: 0 });
             self.frontiers.len() - 1
         });
         let slot = &mut self.frontiers[index];
@@ -166,6 +167,39 @@ impl NoticeStore {
             slot.row = None;
         }
         self.condition(origin, active, error);
+    }
+    pub fn training_failure(&mut self, operation: u64, fact: &crate::generated::TrainingFailure, process_detail: Option<&str>) {
+        let matching = self.frontiers.iter().find(|slot| matches!(slot.origin, Origin::TrainingModel(_)) && slot.owner == fact.modelid && slot.run.as_deref() == Some(&fact.sessionid)).map(|slot| slot.origin);
+        let origin = matching.or_else(|| (0..=crate::generated::TRAINING_MODEL_CAPACITY).map(Origin::TrainingModel).find(|origin| {
+            self.frontiers.iter().find(|slot| slot.origin == *origin).is_none_or(|slot| slot.run.as_deref() != Some(&fact.sessionid))
+        }));
+        let Some(origin) = origin else { self.local(Origin::Protocol, UiError::protocol("Training failure source capacity exhausted.")); return; };
+        if let Some(slot) = self.frontiers.iter_mut().find(|slot| slot.origin == origin) {
+            if matching.is_some() && operation < slot.operation && !self.bootstrapping { return; }
+            if matching.is_none() || operation != slot.operation {
+                // Resume shares a session/model but owns a new native operation.
+                // A lower reconnect frontier is a baseline, not a new failure.
+                let baseline = self.bootstrapping && (!self.initialized || matching.is_none() || operation < slot.operation);
+                slot.owner = fact.modelid; slot.generation = fact.firstcause; slot.observed = baseline; slot.row = None; slot.run = Some(fact.sessionid.clone()); slot.operation = operation;
+            }
+        }
+        let prefix = format!("Session {} · model {}\n", fact.sessionid, fact.modelid);
+        if let Some(slot) = self.frontiers.iter().find(|slot| slot.origin == origin && slot.owner == fact.modelid && slot.generation == fact.firstcause)
+            && slot.observed && slot.row.and_then(|id| self.get(id)).is_some_and(|row| {
+                row.detail.strip_prefix(&prefix).and_then(|detail| detail.strip_prefix(&fact.detail)).is_some_and(|suffix|
+                    process_detail.map_or(suffix.is_empty(), |detail| suffix.strip_prefix("\n\n") == Some(detail)))
+            }) { return; }
+        self.terminal(origin, fact.modelid, fact.firstcause, || {
+            let mut detail = format!("{prefix}{}", fact.detail);
+            if let Some(process) = process_detail { detail.push_str("\n\n"); detail.push_str(process); }
+            let mut error = failure(detail);
+            error.title = "Training model failed";
+            Some(error)
+        });
+        if let Some(slot) = self.frontiers.iter_mut().find(|slot| slot.origin == origin) {
+            if slot.run.as_deref() != Some(&fact.sessionid) { slot.run = Some(fact.sessionid.clone()); }
+            slot.operation = operation;
+        }
     }
     pub fn local(&mut self, origin: Origin, error: UiError) {
         if error.title.len().checked_add(error.detail.len()).is_none_or(|size| size > LOCAL_TEXT_LIMIT) {

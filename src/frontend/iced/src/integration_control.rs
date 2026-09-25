@@ -165,6 +165,7 @@ const ANNOTATION_SURFACE: &str = annotation::WORKSPACE_ID;
 
 #[derive(Debug, Clone)]
 pub enum Message {
+    TrainingFixture(crate::view::metrics::Message),
     StatusSelectionRead(Result<std::sync::Arc<iced::clipboard::Content>, iced::clipboard::Error>),
     StatusClipboardRead(Result<std::sync::Arc<iced::clipboard::Content>, iced::clipboard::Error>),
     DatasetDrawn(dataset_presentation::Frame),
@@ -1167,6 +1168,7 @@ impl Controller {
             return content;
         }
         let generation = self.driver.generation;
+        let content = self.workflows.fixture_view(content, generation);
         let content = if matches!(self.driver.phase, Phase::DatasetDisclosure(..)) {
             iced::widget::stack![
                 content,
@@ -1838,6 +1840,10 @@ impl Controller {
             Message::ConfidenceInputDelivered(stage, delivered) => {
                 self.workflows
                     .confidence_input_delivered(&mut self.driver, stage, delivered);
+                return None;
+            }
+            Message::TrainingFixture(message) => {
+                self.workflows.fixture_update(message);
                 return None;
             }
             Message::WorkflowPixels {

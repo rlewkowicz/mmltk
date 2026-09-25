@@ -12,6 +12,7 @@ pub enum Message {
     Output(crate::view::workflow::output::Message),
     ReportChanged(bool),
     Loading(crate::view::workflow::loading::Message),
+    Lanes(i32),
     StartRequested,
     StopRequested,
     PauseRequested(bool),
@@ -64,7 +65,7 @@ impl Component {
         surface: Option<Surface>,
         width: f32,
     ) -> Element<'a, Message> {
-        let settings_edit_available = settings.draft.is_some() && model.settings_edit_available();
+        let settings_edit_available = settings.draft.is_some() && model.settings_edit_available() && !model.primary_action_active(crate::generated::FeatureId::Predict);
         let settings_settled = !settings.has_local_edits();
         let draft = settings
             .draft
@@ -219,6 +220,10 @@ impl Component {
                     settings_edit_available
                 )
                 .map(Message::Loading),
+                crate::view::workflow::fields::numeric_grid()
+                    .push(crate::view::workflow::fields::read_only("Batch size", "predict.batch_size", "1".into()))
+                    .push(crate::view::workflow::fields::effective_batch(crate::generated::FeatureId::Predict, false, model, settings))
+                    .push(crate::view::workflow::fields::number_i32("Predict lanes", draft.map_or(1, |value| value.request.lanes), crate::generated::constraint_workflowspredictrequestlanes(), settings_edit_available, Message::Lanes)),
                 crate::view::workflow::fields::number_f32(
                     "Preview threshold",
                     draft.map_or(0.0, |value| value.request.threshold),
@@ -337,6 +342,7 @@ impl Component {
                     value,
                 )?)
             }
+            Message::Lanes(value) => Outcome::SettingsEdited(settings.edit(crate::view::settings::EditCadence::Debounced, |draft| crate::generated::edit_workflowspredictrequestlanes(draft, value))?),
             Message::Loading(message) => {
                 Outcome::SettingsEdited(crate::view::workflow::loading::update(
                     crate::generated::FeatureId::Predict,

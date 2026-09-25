@@ -7,6 +7,7 @@
 #include "mmltk/frameworks/reflection/member_relation.h"
 #include <catch2/catch_test_macros.hpp>
 #include <atomic>
+#include <array>
 #include <barrier>
 #include <concepts>
 #include <cstdint>
@@ -245,8 +246,9 @@ TEST_CASE("all recipe field clears resolve the selected catalog and preserve mod
   const mmltk::testsupport::ScopedTempDir root("scoped-recipe-clears");
   SettingsSystem settings;
   REQUIRE(settings.Load(install_settings(root.path())).applied());
-  auto lanes = settings.snapshot().settings_state.workflows.train.request.lane_configuration;
-  r::resize_training_models(lanes, 1, settings.snapshot().settings_state.workflows.train.request.recipe, 42);
+  contracts::SettingsUpdateRequest grow;
+  grow.training_model_count = 1;
+  auto lanes = settings.Update(grow).settings_state.workflows.train.request.lane_configuration;
   lanes.models.front().recipe.lr = .031;
   Relation::set_override<reflection::member_path<&r::TrainRecipeSettings::lr>>(lanes.models.front().recipe.overrides);
   contracts::SettingsUpdateRequest select;
@@ -373,6 +375,72 @@ TEST_CASE("settings retry cannot overwrite a newer committed update", "[controll
  CHECK_FALSE(snapshot.settings_state.ui.dark_mode);
  CHECK(snapshot.settings_state.ui.annotation_brush_radius == 9);
 }
+TEST_CASE("Native model count resolves accompanying global recipe before atomic growth", "[controller][settings][training]") {
+ namespace r = mmltk::backend::models::rfdetr;
+ using Value = mmltk::frameworks::serialization::wire::FlatValue;
+ const mmltk::testsupport::ScopedTempDir root("native-model-count");
+ SettingsSystem settings; REQUIRE(settings.Load(install_settings(root.path())).applied());
+ contracts::SettingsUpdateRequest grow;
+ grow.training_model_count = 2;
+ grow.updates.push_back({"workflows.train.request.recipe.optimizer", Value{std::string("SGD")}});
+ grow.updates.push_back({"workflows.train.request.recipe.lr", Value{.025}});
+ const auto initial = settings.snapshot();
+ const auto grown = settings.Update(grow);
+ CHECK(grown.revision == initial.revision + 1);
+ const auto& training = grown.settings_state.workflows.train.request;
+ REQUIRE(training.lane_configuration.models.size() == 2);
+ for (const auto& model : training.lane_configuration.models) {
+  CHECK(model.recipe == training.recipe);
+  CHECK(model.seed == r::training_stochastic_key(training.seed, model.model_id, 0, 0));
+ }
+ grow.training_model_count = 3;
+ grow.updates.back().value = Value{.05};
+ const auto appended = settings.Update(grow);
+ CHECK(appended.settings_state.workflows.train.request.lane_configuration.models.front() == training.lane_configuration.models.front());
+ CHECK(appended.settings_state.workflows.train.request.lane_configuration.models.back().recipe.lr == .05);
+ contracts::SettingsUpdateRequest mode;
+ mode.lane_configuration = appended.settings_state.workflows.train.request.lane_configuration;
+ mode.lane_configuration->mode = r::TrainLaneMode::PeriodicAveraging;
+ const auto changed = settings.Update(mode);
+ CHECK(changed.settings_state.workflows.train.request.lane_configuration.models == appended.settings_state.workflows.train.request.lane_configuration.models);
+ for (const auto count : {0U, 17U}) {
+  contracts::SettingsUpdateRequest invalid; invalid.training_model_count = count;
+  CHECK_THROWS(settings.Update(invalid));
+  CHECK(settings.snapshot().revision == changed.revision);
+ }
+}
+
+TEST_CASE("Admitted training rejects queued execution changes but preserves independent settings progress", "[controller][settings][training]") {
+ const mmltk::testsupport::ScopedTempDir root("locked-model-count");
+ SettingsSystem settings; REQUIRE(settings.Load(install_settings(root.path())).applied());
+ const auto initial = settings.snapshot();
+ settings.LockTrainingConfiguration(initial.revision);
+ contracts::SettingsUpdateRequest grow; grow.training_model_count = 2;
+ CHECK_THROWS_AS(settings.Update(grow), contracts::BusyError);
+ using Value = mmltk::frameworks::serialization::wire::FlatValue;
+ for (const auto& update : std::array{
+       contracts::SettingsValueUpdate{"workflows.train.compiled_dataset_dir", Value{std::string{"/next/dataset"}}},
+       contracts::SettingsValueUpdate{"workflows.train.model_source", Value{std::int64_t{1}}}}) {
+  contracts::SettingsUpdateRequest locked;
+  locked.updates.push_back(update);
+  CHECK_THROWS_AS(settings.Update(locked), contracts::BusyError);
+  CHECK(settings.snapshot().revision == initial.revision);
+  CHECK(settings.snapshot().settings_state.workflows.train.request == initial.settings_state.workflows.train.request);
+ }
+ CHECK_THROWS_AS(settings.Load(services::SettingsLocation{(root.path() / "settings.json").string()}, true), contracts::BusyError);
+ contracts::SettingsUpdateRequest independent;
+ independent.updates.push_back({"ui.dark_mode", mmltk::frameworks::serialization::wire::FlatValue{true}});
+ independent.updates.push_back({"workflows.train.output.automatic", mmltk::frameworks::serialization::wire::FlatValue{false}});
+ const auto changed = settings.Update(independent);
+ CHECK(changed.revision == initial.revision + 1);
+ CHECK_FALSE(changed.settings_state.workflows.train.output.automatic);
+ CHECK(changed.settings_state.workflows.train.request == initial.settings_state.workflows.train.request);
+ CHECK_THROWS_AS(settings.Reset({}), contracts::BusyError);
+ settings.UnlockTrainingConfiguration();
+ CHECK_NOTHROW(settings.Update(grow));
+ CHECK_THROWS_AS(settings.LockTrainingConfiguration(initial.revision), contracts::BusyError);
+}
+
 }  // namespace
 }  // namespace mmltk::controller
 namespace mmltk::controller {
@@ -404,9 +472,10 @@ TEST_CASE("Typed lane replacement and scalar edits publish one checked revision 
  namespace r = mmltk::backend::models::rfdetr;
  const mmltk::testsupport::ScopedTempDir root("typed-training-lanes");
  SettingsSystem settings; REQUIRE(settings.Load(install_settings(root.path())).applied());
- const auto initial = settings.snapshot();
+ contracts::SettingsUpdateRequest grow;
+ grow.training_model_count = 2;
+ const auto initial = settings.Update(grow);
  auto lanes = initial.settings_state.workflows.train.request.lane_configuration;
- r::resize_training_models(lanes, 2, initial.settings_state.workflows.train.request.recipe, 42);
  lanes.mode = r::TrainLaneMode::Independent;
  lanes.models[1].recipe.optimizer = r::TrainOptimizerKind::SGD;
  contracts::SettingsUpdateRequest request;
@@ -452,20 +521,19 @@ TEST_CASE("Typed lane replacement and scalar edits publish one checked revision 
  }
  lanes = saved.settings_state.workflows.train.request.lane_configuration;
  const auto retired = lanes.models[1];
- r::resize_training_models(lanes, 1, saved.settings_state.workflows.train.request.recipe, 42);
  contracts::SettingsUpdateRequest shrink;
- shrink.lane_configuration = lanes;
- shrink.updates.push_back({"workflows.train.request.lanes", Value{int64_t{1}}});
- static_cast<void>(settings.Update(shrink));
+ shrink.training_model_count = 1;
+ const auto shrunk = settings.Update(shrink);
+ lanes = shrunk.settings_state.workflows.train.request.lane_configuration;
  lanes.models.push_back(retired);
- shrink.lane_configuration = lanes;
- shrink.updates[0].value = Value{int64_t{2}};
- CHECK_THROWS(settings.Update(shrink));
- r::resize_training_models(lanes, 1, saved.settings_state.workflows.train.request.recipe, 42);
- r::resize_training_models(lanes, 2, saved.settings_state.workflows.train.request.recipe, 42);
- CHECK(lanes.models.back().model_id > retired.model_id);
- shrink.lane_configuration = lanes;
- CHECK_NOTHROW(settings.Update(shrink));
+ contracts::SettingsUpdateRequest reuse;
+ reuse.lane_configuration = lanes;
+ CHECK_THROWS(settings.Update(reuse));
+ shrink.training_model_count = 2;
+ const auto regrown = settings.Update(shrink);
+ CHECK(regrown.settings_state.workflows.train.request.lane_configuration.models.back().model_id > retired.model_id);
+ CHECK(regrown.settings_state.workflows.train.request.lane_configuration.models.front() == saved.settings_state.workflows.train.request.lane_configuration.models.front());
+
 }
 }  // namespace
 }  // namespace mmltk::controller

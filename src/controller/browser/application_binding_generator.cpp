@@ -1349,7 +1349,48 @@ private:
   });
   output_ << "]) }\n";
  }
+ template<class Value>
+ void EmitValueConstraints() {
+  const auto owner = rust_type<Value>();
+  mmltk::frameworks::reflection::visit_materialized_members<Value>([&]<class Declaration>(const auto& fact) {
+   using Member = typename Declaration::member_type;
+   if constexpr (std::is_arithmetic_v<Member>) {
+    const auto function = "constraint_" + rust_identifier(owner + std::string(fact.member_name), false);
+    symbols_.Reserve("module", function, "native value constraint " + owner + "." + std::string(fact.member_name));
+    output_ << "pub const fn " << function << "() -> SettingsLeafConstraint { SettingsLeafConstraint { stable_field_id: "
+            << mmltk::controller::browser::application_stable_id(owner, fact.member_name) << ", ";
+    EmitConstraintFields(mmltk::frameworks::reflection::policy_of_member<Declaration::pointer>());
+    output_ << " } }\n";
+   }
+  });
+ }
  void EmitSettingsHelpers() {
+  namespace r = mmltk::backend::models::rfdetr;
+  symbols_.Reserve("module", "TRAINING_MODEL_CAPACITY", "native model admission");
+  output_ << "pub const TRAINING_MODEL_CAPACITY: usize = " << r::kMaximumTrainingModels << ";\n";
+  symbols_.Reserve("module", "train_scheduler_available", "native recipe admission");
+  output_ << "pub fn train_scheduler_available(optimizer: TrainOptimizerKind, scheduler: TrainLrSchedulerKind) -> bool { match (optimizer, scheduler) {\n";
+  for (const auto& recipe : r::kTrainRecipeCatalog) {
+   for (const auto scheduler_entry : mmltk::frameworks::reflection::enum_entries<r::TrainLrSchedulerKind>()) {
+    const auto scheduler = scheduler_entry.value;
+    auto candidate = recipe;
+    candidate.lr_scheduler = scheduler;
+    output_ << "(TrainOptimizerKind::" << rust_identifier(mmltk::frameworks::reflection::enum_name(recipe.optimizer), true)
+            << ", TrainLrSchedulerKind::" << rust_identifier(mmltk::frameworks::reflection::enum_name(scheduler), true) << ") => "
+            << (r::train_recipe_values_valid(candidate) ? "true" : "false") << ",\n";
+   }
+  }
+  output_ << "} }\n";
+  symbols_.Reserve("module", "effective_train_final_policy", "native final policy admission");
+  output_ << "pub fn effective_train_final_policy(configuration: &TrainLaneConfiguration) -> TrainFinalPolicy { configuration.finalpolicy.unwrap_or(match configuration.mode {\n";
+  for (const auto lane_entry : mmltk::frameworks::reflection::enum_entries<r::TrainLaneMode>()) {
+   const auto mode = lane_entry.value;
+   r::TrainLaneConfiguration configuration;
+   configuration.mode = mode;
+   output_ << "TrainLaneMode::" << rust_identifier(mmltk::frameworks::reflection::enum_name(mode), true) << " => TrainFinalPolicy::"
+           << rust_identifier(mmltk::frameworks::reflection::enum_name(r::effective_final_policy(configuration)), true) << ",\n";
+  }
+  output_ << "}) }\n";
   ReserveGeneratedStruct("SettingsLeafFact", "generated settings-leaf metadata",
    {"stable_field_id", "path", "owner", "member", "mutable_leaf", "workflows", "catalog_provider", "has_file_dialog", "finite", "minimum", "maximum", "minimum_bytes", "maximum_bytes",
     "maximum_items"});
@@ -1459,6 +1500,8 @@ private:
    EmitConstraintFields(fact.constraint);
    output_ << " } }\n";
   });
+   EmitValueConstraints<mmltk::backend::models::rfdetr::TrainModelSettings>();
+  EmitValueConstraints<mmltk::backend::models::rfdetr::TrainLaneConfiguration>();
  }
  void EmitRequestDefaults() {
   ReserveGeneratedStruct("RequestDefaultFact", "canonical request defaults", {"endpoint_id", "field_id", "path", "value"});

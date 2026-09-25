@@ -54,7 +54,9 @@ struct PredictRequest;
 [[nodiscard]] std::uint64_t training_stochastic_key(std::uint64_t seed, std::uint64_t model, std::uint64_t epoch, std::uint64_t occurrence, std::uint64_t purpose = 0) noexcept;
 void resize_training_models(TrainLaneConfiguration&, std::size_t count, const TrainRecipeSettings&, std::uint64_t session_seed);
 void validate_training_configuration(const TrainRequest&);
-[[nodiscard]] TrainFinalPolicy effective_final_policy(const TrainLaneConfiguration&) noexcept;
+[[nodiscard]] inline constexpr TrainFinalPolicy effective_final_policy(const TrainLaneConfiguration& configuration) noexcept {
+ return configuration.final_policy.value_or(configuration.mode == TrainLaneMode::Independent ? TrainFinalPolicy::ValidationGreedy : TrainFinalPolicy::Off);
+}
 [[nodiscard]] ExecutionFacts derive_execution_facts(const TrainRequest&, std::uint64_t revision);
 [[nodiscard]] ExecutionFacts derive_training_validation_facts(const TrainRequest&, std::uint64_t revision);
 [[nodiscard]] ExecutionFacts derive_execution_facts(const ValidateRequest&, std::uint64_t revision);

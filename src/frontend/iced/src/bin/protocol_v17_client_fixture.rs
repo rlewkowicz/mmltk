@@ -1112,6 +1112,7 @@ fn application_record_fixtures() -> Result<Vec<(&'static str, Vec<u8>)>, Box<dyn
             generated::encode_settings_Update(
                 19,
                 generated::SettingsUpdateRequest {
+                    trainingmodelcount: None,
                     laneconfiguration: None,
                     updates: vec![settings_update],
                 },

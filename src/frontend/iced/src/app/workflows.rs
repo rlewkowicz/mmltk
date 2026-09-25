@@ -1512,6 +1512,7 @@ mod tests {
             opened.correlation,
             Ok(crate::generated::ApplicationReply::TrainingOpenRun(
                 crate::generated::TrainingOpenedRun {
+                    selected: None,
                     generation: 1,
                     directory: "/saved/one".into(),
                     run: None,

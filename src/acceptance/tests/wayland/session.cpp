@@ -675,6 +675,7 @@ void WaylandSession::RunWorkflows() {
  CHECK(browser.validation_confidence_complete());
  CHECK(browser.validation_layout_complete());
  CHECK(browser.workflow_gpus_complete());
+ CHECK(browser.training_sources_complete());
  mmltk::controller::contracts::GuiSettingsState persisted;
  REQUIRE(mmltk::controller::contracts::load_gui_settings_file((working.path() / ".mmltk-data" / "gui.json").string(), persisted));
  REQUIRE(persisted.workflows.train.request.device_ids.size() == 1U);

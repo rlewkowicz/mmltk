@@ -308,7 +308,9 @@ public:
   const auto selection = model_.selection();
   run_.Start({
    .prepare =
-    [this, admission] {
+    [this, admission, revision = facts.revision] {
+     settings_.LockTrainingConfiguration(revision);
+     try {
      std::scoped_lock lock(mutex_);
      if (admission && (admission != inspection_admission_ || admission != prepared_admission_)) throw contracts::InvalidIntentError("prepare the selected checkpoint before Resume");
      prepared_admission_.reset();
@@ -317,7 +319,7 @@ public:
      state_.activity = TrainingActivity::Local;
      state_.local.output = {};
      state_.metrics.reset();
-     state_.representative_observation.reset();
+     state_.sources = {};
      state_.persistence = {};
      state_.local.active = true;
      state_.local.generation_frontier = *next;
@@ -325,6 +327,7 @@ public:
      state_.local.terminal = contracts::make_compute_terminal(contracts::ComputeOperationOutcome::Running, state_.local.generation_frontier);
      state_.local.terminal.detail = "Inspecting selected training inputs";
      AdvanceObservation();
+     } catch (...) { settings_.UnlockTrainingConfiguration(); throw; }
     },
    .work = [this, settings = facts.settings, selection, admission](const std::stop_token stop) mutable -> direct::LocalRun::Notification {
     contracts::ComputeTerminal terminal;
@@ -354,7 +357,7 @@ public:
        std::scoped_lock lock(mutex_);
        state_.local.output.directory = request->output_dir.string();
        state_.metrics.reset();
-       state_.representative_observation.reset();
+       state_.sources = {};
        state_.persistence = {};
        AdvanceObservation();
       }
@@ -378,7 +381,11 @@ public:
          if (!state_.local.active || !contracts::compute_progress_follows(progress, state_.local.progress.sequence)) return;
          state_.local.progress = progress;
          if (update.metrics) state_.metrics = update.metrics;
-         state_.representative_observation = update.representative_observation;
+         state_.sources = update.sources;
+         if (state_.sources.execution) {
+          state_.sources.execution->training.operation_generation = state_.local.generation_frontier;
+          state_.sources.execution->validation.operation_generation = state_.local.generation_frontier;
+         }
          state_.persistence = update.persistence;
          if (state_.local.terminal.outcome == contracts::ComputeOperationOutcome::Running) state_.local.terminal.detail.clear();
          AdvanceObservation();
@@ -387,7 +394,7 @@ public:
           .activity = state_.activity,
           .local = state_.local,
           .metrics = state_.metrics,
-          .representative_observation = state_.representative_observation,
+          .sources = state_.sources,
           .persistence = state_.persistence,
          };
         }
@@ -411,6 +418,7 @@ public:
      state_.activity = TrainingActivity::Idle;
      AdvanceObservation();
     }
+    settings_.UnlockTrainingConfiguration();
     auto settled = snapshot();
     auto publish = notification(event_type{TrainingChanged{std::move(settled)}});
     if (failed) mmltk::common::logging::report_fatal("local training", terminal.detail);
@@ -537,6 +545,7 @@ public:
    state_.local.terminal.detail = terminal.detail;
    AdvanceObservation();
   }
+  settings_.UnlockTrainingConfiguration();
   return notification(event_type{TrainingChanged{snapshot()}});
  }
  [[nodiscard]] direct::LocalRun::Notification FailQuery() {

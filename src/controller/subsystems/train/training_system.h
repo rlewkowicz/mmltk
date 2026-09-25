@@ -74,7 +74,7 @@ struct TrainingSnapshot final {
  contracts::ProviderOfferState offers{};
  contracts::RemoteSessionState remote{};
  std::optional<mmltk::backend::models::rfdetr::TrainingRecord> metrics;
- std::optional<mmltk::backend::models::rfdetr::TrainingRecord> representative_observation;
+ mmltk::backend::models::rfdetr::TrainingSources sources;
  mmltk::backend::models::rfdetr::TrainingPersistence persistence{};
  mmltk::backend::models::rfdetr::TrainingCheckpointInspection inspection;
  bool operator==(const TrainingSnapshot&) const = default;
@@ -84,7 +84,7 @@ struct[[= contracts::reflection::Event{contracts::reflection::EventDelivery::Tra
  TrainingActivity activity = TrainingActivity::Idle;
  contracts::ComputeUiState local{};
  std::optional<mmltk::backend::models::rfdetr::TrainingRecord> metrics;
- std::optional<mmltk::backend::models::rfdetr::TrainingRecord> representative_observation;
+ mmltk::backend::models::rfdetr::TrainingSources sources;
  mmltk::backend::models::rfdetr::TrainingPersistence persistence{};
 };
 struct[[= contracts::reflection::Event{contracts::reflection::EventDelivery::Critical}]] TrainingChanged final {
@@ -119,7 +119,7 @@ public:
  [[= contracts::reflection::direct::IntentEndpoint{}]] [[nodiscard]] TrainingSnapshot StartRemote(contracts::ProviderStartIntent);
  [[= contracts::reflection::direct::IntentEndpoint{}]] [[nodiscard]] TrainingSnapshot StopRemote(contracts::ProviderStopIntent);
  [[= contracts::reflection::direct::IntentEndpoint{}]] [[nodiscard]] TrainingSnapshot RetryReconciliation();
- [[= contracts::reflection::Snapshot{2U * 1024U * 1024U}]] [[nodiscard]] TrainingSnapshot snapshot() const;
+ [[= contracts::reflection::Snapshot{mmltk::backend::models::rfdetr::kTrainingProgressWireBytes}]] [[nodiscard]] TrainingSnapshot snapshot() const;
 
 private:
  class Impl;

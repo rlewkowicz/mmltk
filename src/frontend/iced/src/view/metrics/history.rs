@@ -99,7 +99,7 @@ impl Curve {
 }
 
 use super::catalog::{Metric, Source};
-use crate::generated::{EvaluatedWeights, TrainLaneMode, TrainRequest, TrainingPhase, TrainingRecord, TrainingRecordRole, TrainingRecordScope};
+use crate::generated::{EvaluatedWeights, TrainingMetricSource, TrainingSourceCatalog, TrainingPhase, TrainingRecord, TrainingRecordRole, TrainingRecordScope};
 
 /// The observed source survives clearing plot storage. In particular a cache reset
 /// cannot claim native history recovered or rearm a dismissed active drop episode.
@@ -136,8 +136,7 @@ pub(super) struct History {
     last_phase_epoch: Option<(TrainingPhase, i32)>,
     last_evaluation: Option<(String, i32, TrainingRecordScope, u64, EvaluatedWeights, String, String)>,
     observed_source: Option<(String, String)>,
-    representative_model: u64,
-    weights: EvaluatedWeights,
+    pub(super) source: Option<TrainingMetricSource>,
     pub(super) page: Option<(u64, u64)>,
     pub(super) generation: u64,
 }
@@ -155,8 +154,7 @@ impl History {
             last_phase_epoch: None,
             last_evaluation: None,
             observed_source: None,
-            representative_model: 0,
-            weights: EvaluatedWeights::Ordinary,
+            source: None,
             page: None,
             generation: 0,
         }
@@ -193,61 +191,38 @@ impl History {
             self.conditions.chart_dirty = true;
         }
     }
-    pub(super) fn select_source(&mut self, configuration: &TrainRequest) {
-        self.representative_model = if configuration.laneconfiguration.mode == TrainLaneMode::SharedGradients {
-            0
-        } else {
-            configuration.laneconfiguration.models.iter().map(|model| model.modelid).min().unwrap_or(0)
-        };
-        self.weights = if configuration.useema { EvaluatedWeights::Ema } else { EvaluatedWeights::Ordinary };
+    pub(super) fn select_source(&mut self, catalog: &TrainingSourceCatalog) {
+        if self.source.as_ref().is_none_or(|source| !catalog.available.contains(source)) {
+            self.source.clone_from(&catalog.defaultsource);
+        }
     }
     fn has_observed_source(&self, record: &TrainingRecord) -> bool {
         self.observed_source.as_ref().is_some_and(|(run, attempt)| run == &record.runid && attempt == &record.attemptid)
     }
-    pub(super) fn reconcile_live_source(
-        &mut self,
-        current: &TrainingRecord,
-        observation: Option<&TrainingRecord>,
-        configuration: Option<&TrainRequest>,
-        metrics: &[Metric],
-    ) -> u16 {
-        if self.has_observed_source(current) { return 0; }
-        let previous_model = self.representative_model;
-        let previous_weights = self.weights;
-        let artifact = observation
-            .filter(|record| record.runid == current.runid && record.attemptid == current.attemptid)
-            .and_then(|record| record.progress.artifact.as_ref());
-        if let Some(artifact) = artifact {
-            self.representative_model = artifact.modelid;
-            self.weights = artifact.weights;
-            // Source identity survives plot-storage resets, but a different
-            // native run/attempt establishes its own authoritative source.
+    pub(super) fn reconcile_live_source(&mut self, current: &TrainingRecord, catalog: &TrainingSourceCatalog, metrics: &[Metric]) -> u16 {
+        if catalog.defaultsource.is_none() { return 0; }
+        let previous = self.source.clone();
+        if !self.has_observed_source(current) {
+            self.select_source(catalog);
             self.observed_source = Some((current.runid.clone(), current.attemptid.clone()));
-        } else if self.run != current.runid || self.attempt != current.attemptid || self.sequence.is_none() {
-            if let Some(configuration) = configuration { self.select_source(configuration); }
-        }
-        let model_changed = previous_model != self.representative_model;
-        let changed = model_changed || previous_weights != self.weights;
-        if changed {
-            // Discard source-dependent points without rewinding native record
-            // accounting or clearing the retained dropped-history condition.
-            self.clear_curves(metrics, model_changed);
-        }
-        if changed { u16::MAX } else { 0 }
+        } else { self.select_source(catalog); }
+        if previous != self.source {
+            self.clear_curves(metrics, previous.as_ref().map(|source| (source.scope, source.modelid)) != self.source.as_ref().map(|source| (source.scope, source.modelid)));
+            u16::MAX
+        } else { 0 }
     }
     fn evaluation_identity(&mut self, record: &TrainingRecord) -> bool {
         let progress = &record.progress;
         let Some(artifact) = &progress.artifact else { return false; };
-        if record.role != TrainingRecordRole::Epoch || progress.val.is_none()
-            || artifact.weights != self.weights
-            || !((progress.scope == TrainingRecordScope::Model && progress.modelid == self.representative_model)
-                || (progress.scope == TrainingRecordScope::SynchronizedSession && self.weights == EvaluatedWeights::Ordinary)) {
+        if record.role != TrainingRecordRole::Epoch || progress.val.is_none() || artifact.weights != record.evaluatedweights
+            || self.source.as_ref().is_none_or(|source| source.weights != artifact.weights || source.scope != progress.scope || source.modelid != progress.modelid) {
             return false;
         }
-        let identity = (record.attemptid.clone(), progress.epoch, progress.scope, progress.modelid,
-            artifact.weights, artifact.path.clone(), artifact.sha256.clone());
-        if self.last_evaluation.as_ref() == Some(&identity) { return false; }
-        self.last_evaluation = Some(identity);
+        if self.last_evaluation.as_ref().is_some_and(|(attempt, epoch, scope, model, weights, path, digest)|
+            (attempt.as_str(), *epoch, *scope, *model, *weights, path.as_str(), digest.as_str()) ==
+            (record.attemptid.as_str(), progress.epoch, progress.scope, progress.modelid, artifact.weights, artifact.path.as_str(), artifact.sha256.as_str())) { return false; }
+        self.last_evaluation = Some((record.attemptid.clone(), progress.epoch, progress.scope, progress.modelid,
+            artifact.weights, artifact.path.clone(), artifact.sha256.clone()));
         true
     }
     // A retained scheduled record may precede current progress. Replay only its
@@ -299,24 +274,11 @@ impl History {
             self.conditions.dropped_dirty = true;
         }
         let progress = &record.progress;
-        if !live || !self.has_observed_source(record) {
-            if let Some(configuration) = &record.attemptconfiguration {
-                let previous_model = self.representative_model;
-                let previous_weights = self.weights;
-                self.select_source(configuration);
-                if live && (previous_model != self.representative_model || previous_weights != self.weights) {
-                    self.clear_curves(metrics, previous_model != self.representative_model);
-                    changed = u16::MAX;
-                }
-            }
+        if self.source.is_none() && progress.scope == TrainingRecordScope::Model {
+            self.source = Some(TrainingMetricSource { scope: progress.scope, modelid: progress.modelid, weights: record.evaluatedweights });
         }
         let evaluation = self.evaluation_identity(record);
-        let scalar_model = if progress.scope == TrainingRecordScope::SynchronizedSession && self.weights == EvaluatedWeights::Ordinary {
-            progress.artifact.as_ref().map(|artifact| artifact.modelid)
-        } else if progress.scope == TrainingRecordScope::Model {
-            Some(progress.modelid)
-        } else { None };
-        let scalars = scalar_model == Some(self.representative_model)
+        let scalars = self.source.as_ref().is_some_and(|source| source.scope == TrainingRecordScope::Model && progress.scope == TrainingRecordScope::Model && source.modelid == progress.modelid)
             && matches!(record.role, TrainingRecordRole::Live | TrainingRecordRole::Epoch)
             && matches!(progress.phase, TrainingPhase::Train | TrainingPhase::EpochComplete);
         let phase_epoch = (progress.phase, progress.epoch);
@@ -416,11 +378,10 @@ impl History {
 mod tests {
     use super::*;
     #[test]
-    fn bookkeeping_and_other_models_never_change_the_representative_curves() {
+    fn bookkeeping_and_other_models_never_change_the_selected_curves() {
         let metrics = super::super::catalog::catalog();
         let mut component = History::new(&metrics);
-        component.representative_model = 1;
-        component.weights = EvaluatedWeights::Ema;
+        component.source = Some(TrainingMetricSource { scope: TrainingRecordScope::Model, modelid: 1, weights: EvaluatedWeights::Ema });
         let mut record = super::super::tests::record();
         record.sequence = 0;
         record.progress.modelid = 1;
@@ -443,6 +404,7 @@ mod tests {
         record.progress.scope = TrainingRecordScope::Model;
         record.progress.modelid = 1;
         record.progress.artifact.as_mut().unwrap().weights = EvaluatedWeights::Ema;
+        record.evaluatedweights = EvaluatedWeights::Ema;
         record.progress.artifact.as_mut().unwrap().modelid = 1;
         record.progress.scalars.total = Some(2.0);
         component.ingest(&record, false, &metrics);
@@ -462,8 +424,7 @@ mod tests {
         assert_eq!(component.sequence, sequence);
         assert_eq!(component.curves[evaluation_curve].buckets.len(), 1);
         let mut coalesced = History::new(&metrics);
-        coalesced.representative_model = 1;
-        coalesced.weights = EvaluatedWeights::Ema;
+        coalesced.source = component.source.clone();
         coalesced.ingest(&record, true, &metrics);
         coalesced.ingest_observation(&observation, &metrics);
         coalesced.ingest_observation(&observation, &metrics);
@@ -495,7 +456,7 @@ mod tests {
         record.progress.scope = TrainingRecordScope::Model;
         record.progress.scalars.total = Some(2.0);
         component.ingest(&record, false, &metrics);
-        assert_eq!(component.curves[0].buckets.len(), 3);
+        assert_eq!(component.curves[0].buckets.len(), 2);
         assert_eq!(component.curves[0].segment, segment);
         assert!(!component.curves[0].missing);
     }

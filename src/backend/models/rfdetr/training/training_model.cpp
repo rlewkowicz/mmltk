@@ -88,6 +88,7 @@ struct TrainingModel::Impl final {
  std::optional<ResumeState> staged_resume;
  std::optional<TrainingArtifactCandidate> best;
  TrainingEpochDraws draws;
+ TrainingDistributionFacts distribution;
  TrainingMetricSnapshot last_metrics;
  TrainingLossReport losses;
  std::vector<TrainingDonorDescriptor> current_donors;
@@ -175,6 +176,10 @@ void TrainingModel::begin_epoch(std::uint64_t epoch, TrainingEpochDraws draws) {
  auto& p = *impl_;
  p.snapshot.require_inactive();
  p.epoch = epoch; p.draws = std::move(draws); p.epoch_closed = false;
+ p.distribution = {.model_id = p.shard.model_id, .epoch = epoch, .unique_images = p.shard.images.size(),
+  .scheduled_draws = mmltk::common::math::checked_add(static_cast<std::uint64_t>(p.draws.schedule->image_indices.size()), p.draws.unused_tail, "training draw count overflow"), .missing_classes = p.shard.missing_classes.size(), .unused_tail = p.draws.unused_tail};
+ for (const auto support : p.shard.unique_support) p.distribution.unique_class_support = mmltk::common::math::checked_add(p.distribution.unique_class_support, support, "training class support overflow");
+ for (const auto exposure : p.draws.repeated_exposure) p.distribution.repeated_class_exposure = mmltk::common::math::checked_add(p.distribution.repeated_class_exposure, exposure, "training class exposure overflow");
  const auto previous = p.epoch_policy.state();
  const auto policy = p.epoch_policy.enter(epoch, p.options.epochs);
  auto& optimizer = p.optimizer_build.optimizer;
@@ -307,6 +312,7 @@ TrainingMetricProgress TrainingModel::progress(TrainingPhase phase) const {
  TrainingMetricProgress value;
  value.phase = phase; value.model_id = p.shard.model_id; value.scope = TrainingRecordScope::Model;
  value.epoch = p.epoch; value.total_epochs = p.options.epochs;
+ value.distribution = p.distribution;
  value.completed_batches = p.cursor; value.total_batches = p.draws.microbatches;
  value.completed_images = checked_training_product(p.cursor, p.options.batch_size); value.total_images = checked_training_product(p.draws.microbatches, p.options.batch_size);
  value.completed_waves = p.waves; value.optimizer_steps = p.cursor / p.contributions;

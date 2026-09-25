@@ -609,3 +609,133 @@ fn presentation_handles_overflow_updates_and_independent_cloned_content() {
     assert_ne!(store.presentation(), branch.presentation());
     assert_ne!(store.latest().unwrap().presentation(), branch.latest().unwrap().presentation());
 }
+
+#[test]
+fn model_failures_are_bounded_independent_and_keep_acknowledgement_and_presentation_tokens() {
+    let mut store = NoticeStore::default();
+    let mut fact = TrainingFailure { sessionid: "session".into(), modelid: 1, firstcause: 3, detail: "optimizer failed".into() };
+    store.training_failure(1, &fact, None);
+    let first = store.latest().unwrap().id;
+    let presentation = store.presentation().clone();
+    store.training_failure(1, &fact, None);
+    assert_eq!(store.presentation(), &presentation);
+    store.dismiss(first);
+    store.training_failure(1, &fact, None);
+    assert!(store.is_empty());
+    for model in 2..=TRAINING_MODEL_CAPACITY as u64 { fact.modelid = model; store.training_failure(1, &fact, None); }
+    fact.modelid = 0; store.training_failure(1, &fact, None);
+    assert_eq!(store.rows.len(), TRAINING_MODEL_CAPACITY);
+    assert_eq!(store.frontiers.iter().filter(|slot| matches!(slot.origin, Origin::TrainingModel(_))).count(), TRAINING_MODEL_CAPACITY + 1);
+    store.dismiss_all();
+    store.begin_bootstrap();
+    for model in 0..=TRAINING_MODEL_CAPACITY as u64 { fact.modelid = model; store.training_failure(1, &fact, None); }
+    store.end_bootstrap();
+    assert!(store.is_empty());
+    fact.sessionid = "new-session".into(); fact.modelid = 1; fact.firstcause = 1;
+    store.training_failure(1, &fact, None);
+    assert_eq!(store.rows.len(), 1);
+    fact.firstcause = 2; store.training_failure(1, &fact, None);
+    assert_eq!(store.rows.len(), 2);
+    assert_eq!(store.frontiers.iter().filter(|slot| matches!(slot.origin, Origin::TrainingModel(_))).count(), TRAINING_MODEL_CAPACITY + 1);
+}
+
+#[test]
+fn resumed_model_failures_use_native_operations_and_reconnect_baselines() {
+    let mut store = NoticeStore::default();
+    let fact = TrainingFailure { sessionid: "same-session".into(), modelid: 1, firstcause: 1, detail: "optimizer failed".into() };
+    store.begin_bootstrap();
+    store.training_failure(4, &fact, None);
+    store.end_bootstrap();
+    assert!(store.is_empty());
+    store.training_failure(5, &fact, None);
+    let first = store.latest().unwrap().id;
+    store.dismiss(first);
+    store.begin_bootstrap();
+    store.training_failure(5, &fact, None);
+    store.end_bootstrap();
+    assert!(store.is_empty());
+    // Same native first cause in the same session, but a new Resume operation.
+    store.begin_bootstrap();
+    store.training_failure(6, &fact, None);
+    store.end_bootstrap();
+    assert_ne!(store.latest().unwrap().id, first);
+    assert_eq!(store.len(), 1);
+    store.dismiss_all();
+    store.begin_bootstrap();
+    store.training_failure(2, &fact, None);
+    store.end_bootstrap();
+    assert!(store.is_empty());
+    store.training_failure(3, &fact, None);
+    assert_eq!(store.len(), 1);
+    assert_eq!(store.frontiers.iter().filter(|slot| matches!(slot.origin, Origin::TrainingModel(_))).count(), 1);
+}
+
+#[test]
+fn model_status_retains_process_status_and_advice_without_hiding_independent_process_errors() {
+    for terminal_detail in [
+        "local training exited with status 1: CUDA out of memory. Reduce batch size or training lanes to lower GPU memory use, then start again.",
+        "local training terminated by signal 9",
+    ] {
+        let mut model = bootstrapped();
+        let mut snapshot = model.workflow.training.clone().unwrap();
+        snapshot.revision += 1;
+        snapshot.local.generationfrontier += 1;
+        snapshot.local.terminal.generation = snapshot.local.generationfrontier;
+        snapshot.local.terminal.outcome = ComputeOperationOutcome::Running;
+        let fact = TrainingFailure { sessionid: "session".into(), modelid: 1, firstcause: 1, detail: "CUDA out of memory\nfull optimizer cause".into() };
+        snapshot.sources.failures.push(fact.clone());
+        let mut record = crate::view::metrics::tests::record();
+        record.runid = fact.sessionid.clone();
+        record.role = TrainingRecordRole::Terminal;
+        record.progress.phase = TrainingPhase::Error;
+        record.progress.sessionid = fact.sessionid.clone();
+        record.progress.failure = Some(fact.clone());
+        snapshot.metrics = Some(record);
+        model.reduce_event(ApplicationEvent::TrainingTrainingChanged(TrainingChanged { snapshot: snapshot.clone() }));
+        assert_eq!(model.notices.len(), 1);
+        let original = model.notices.latest().unwrap().clone();
+        snapshot.revision += 1;
+        snapshot.local.terminal.outcome = ComputeOperationOutcome::Failed;
+        snapshot.local.terminal.detail = terminal_detail.into();
+        model.reduce_event(ApplicationEvent::TrainingTrainingChanged(TrainingChanged { snapshot: snapshot.clone() }));
+        assert_eq!(model.notices.len(), 1);
+        let row = model.notices.latest().unwrap();
+        assert_eq!(row.id, original.id);
+        assert_eq!(row.detail, format!("Session session · model 1\n{}\n\n{terminal_detail}", fact.detail));
+        assert!(row.content_version > original.content_version);
+        let presentation = model.notices.presentation().clone();
+        model.reduce_event(ApplicationEvent::TrainingTrainingChanged(TrainingChanged { snapshot: snapshot.clone() }));
+        assert_eq!(model.notices.presentation(), &presentation);
+        let snapshots = application_snapshot_defaults().unwrap().into_iter().map(|fact| match fact.value {
+            ApplicationSnapshot::Training(_) => ApplicationSnapshot::Training(snapshot.clone()), other => other,
+        }).collect();
+        model.install_bootstrap(SCHEMA_FINGERPRINT, snapshots).unwrap();
+        assert_eq!(model.notices.presentation(), &presentation);
+        model.notices.dismiss_all();
+        model.reduce_event(ApplicationEvent::TrainingTrainingChanged(TrainingChanged { snapshot: snapshot.clone() }));
+        assert!(model.notices.is_empty());
+        // A process-only failure still owns a Compute notification.
+        snapshot.revision += 1;
+        snapshot.local.generationfrontier += 1;
+        snapshot.local.terminal.generation = snapshot.local.generationfrontier;
+        snapshot.local.terminal.detail = "local training setup failed (exit status 126)".into();
+        snapshot.metrics = None;
+        snapshot.sources.failures.clear();
+        model.reduce_event(ApplicationEvent::TrainingTrainingChanged(TrainingChanged { snapshot: snapshot.clone() }));
+        assert_eq!(model.notices.len(), 1);
+        assert_eq!(model.notices.latest().unwrap().origin, Origin::Compute(FeatureId::Train));
+        assert_eq!(model.notices.latest().unwrap().detail, snapshot.local.terminal.detail);
+        // Retaining a model failure does not suppress an independent terminal
+        // with no current fatal record tying it to that model cause.
+        model.notices.dismiss_all();
+        snapshot.revision += 1;
+        snapshot.local.generationfrontier += 1;
+        snapshot.local.terminal.generation = snapshot.local.generationfrontier;
+        snapshot.sources.failures.push(fact.clone());
+        model.reduce_event(ApplicationEvent::TrainingTrainingChanged(TrainingChanged { snapshot: snapshot.clone() }));
+        assert_eq!(model.notices.len(), 2);
+        assert!(model.notices.rows().any(|row| matches!(row.origin, Origin::TrainingModel(_)) && row.detail.contains(&fact.detail)));
+        assert_eq!(model.notices.latest().unwrap().origin, Origin::Compute(FeatureId::Train));
+        assert_eq!(model.notices.latest().unwrap().detail, snapshot.local.terminal.detail);
+    }
+}

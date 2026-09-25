@@ -61,6 +61,8 @@ public:
  [[= contracts::reflection::Snapshot{contracts::kSettingsUiStateByteBudget}]] [[nodiscard]] contracts::SettingsUiState snapshot() const;
  [[nodiscard]] contracts::ValidationDisplaySettings validation_display_settings() const;
  void require_loaded() const;
+ void LockTrainingConfiguration(std::uint64_t revision);
+ void UnlockTrainingConfiguration() noexcept;
  [[nodiscard]] contracts::SettingsMaterializationFacts materialization_facts() const;
  [[nodiscard]] contracts::ProviderPreferences provider_preferences() const;
  void RestoreTrainingCheckpoint(mmltk::backend::models::rfdetr::TrainRequest, const std::filesystem::path&);
@@ -80,6 +82,7 @@ private:
  services::SettingsLocation location_{std::string_view{}};
  std::uint64_t candidate_version_ = 0U;
  bool loaded_ = false;
+ bool training_locked_ = false;
  bool retryable_ = false;
  services::SettingsMutationResult terminal_{};
 };

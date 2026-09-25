@@ -81,6 +81,8 @@ struct AtlasDrawAudit final {
  void consume(const nlohmann::json& record);
 };
 struct BrowserAudit final {
+ std::vector<std::array<double, 4>> training_sources;
+ [[nodiscard]] bool training_sources_complete() const;
  std::map<std::pair<std::string, std::string>, std::array<double, 4>> workflow_gpu_layout;
  std::map<std::string, std::array<double, 4>> workflow_gpu_selected;
  std::map<std::pair<std::string, std::uint64_t>, std::vector<std::int64_t>> workflow_gpu_runs;

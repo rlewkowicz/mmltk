@@ -13,6 +13,7 @@ void SettingsSystem::RestoreTrainingCheckpoint(mmltk::backend::models::rfdetr::T
  services::SettingsMutationResult result;
  {
   std::scoped_lock mutation_lock(mutation_mutex_);
+  if (training_locked_) throw contracts::BusyError("training configuration is locked during an admitted run");
   auto candidate = mutation_candidate();
   request.output_dir.clear();
   request.resume_path = checkpoint;
@@ -133,6 +134,7 @@ services::SettingsMutationResult SettingsSystem::Load(services::SettingsLocation
  services::SettingsMutationResult result;
  {
   std::scoped_lock mutation_lock(mutation_mutex_);
+  if (training_locked_) throw contracts::BusyError("settings load is locked during admitted training");
   if (!location.valid()) {
    std::scoped_lock lock(mutex_);
    terminal_ = {services::SettingsTerminal::Rejected, state_.revision, "invalid settings location"};
@@ -166,31 +168,58 @@ services::SettingsMutationResult SettingsSystem::Load(services::SettingsLocation
  publish(result);
  return result;
 }
+void SettingsSystem::LockTrainingConfiguration(const std::uint64_t revision) {
+ std::scoped_lock mutation_lock(mutation_mutex_);
+ std::scoped_lock lock(mutex_);
+ if (!loaded_ || revision != state_.revision) throw contracts::BusyError("training settings changed before admission");
+ if (training_locked_) throw contracts::BusyError("training settings are already admitted");
+ training_locked_ = true;
+}
+void SettingsSystem::UnlockTrainingConfiguration() noexcept {
+ std::scoped_lock mutation_lock(mutation_mutex_);
+ training_locked_ = false;
+}
 contracts::SettingsUiState SettingsSystem::Update(contracts::SettingsUpdateRequest request) {
- if (request.updates.empty() && !request.lane_configuration) throw contracts::InvalidIntentError("invalid settings update");
+ if (request.updates.empty() && !request.lane_configuration && !request.training_model_count) throw contracts::InvalidIntentError("invalid settings update");
  services::SettingsMutationResult result;
  {
   std::scoped_lock mutation_lock(mutation_mutex_);
   auto candidate = mutation_candidate();
-  if (request.lane_configuration) {
-   const auto& previous = candidate.workflows.train.request.lane_configuration;
-   const auto& replacement = *request.lane_configuration;
-   if (mmltk::frameworks::reflection::validate_reflected_fields(replacement)) throw contracts::InvalidIntentError("invalid typed training lane configuration");
-   if (replacement.next_model_id < previous.next_model_id) throw contracts::InvalidIntentError("training model identity counter cannot move backwards");
-   for (const auto& model : replacement.models) {
-    const bool existed = std::ranges::any_of(previous.models, [&](const auto& prior) { return prior.model_id == model.model_id; });
-    if (!existed && model.model_id < previous.next_model_id) throw contracts::InvalidIntentError("retired training model identities cannot be reused");
-   }
-   candidate.workflows.train.request.lane_configuration = std::move(*request.lane_configuration);
-   for (auto& model : candidate.workflows.train.request.lane_configuration.models) mmltk::backend::models::rfdetr::resolve_train_recipe(model.recipe);
-  }
   contracts::SettingsUpdateRequest ordinary;
   for (const auto& update : request.updates) {
    if (!flat_value_is_null(update.value)) ordinary.updates.push_back(update);
   }
-  if ((!ordinary.updates.empty() && !contracts::apply_gui_settings_values(candidate, std::span{ordinary.updates}, false)) || !apply_train_recipe_relation(candidate, std::span{request.updates}) ||
-      !contracts::gui_settings_valid(candidate))
+  // Resolve global selectors and overrides before native growth copies the recipe.
+  if ((!ordinary.updates.empty() && !contracts::apply_gui_settings_values(candidate, std::span{ordinary.updates}, false)) ||
+      !apply_train_recipe_relation(candidate, std::span{request.updates}))
    throw contracts::InvalidIntentError("invalid settings update");
+  auto& training = candidate.workflows.train.request;
+  if (request.lane_configuration) {
+   const auto& previous = training.lane_configuration;
+   const auto& replacement = *request.lane_configuration;
+   if (mmltk::frameworks::reflection::validate_reflected_fields(replacement)) throw contracts::InvalidIntentError("invalid typed training lane configuration");
+   if (replacement.next_model_id != previous.next_model_id || replacement.models.size() != previous.models.size())
+    throw contracts::InvalidIntentError("use the native model-count operation to change training membership");
+   for (std::size_t index = 0; index < replacement.models.size(); ++index)
+    if (replacement.models[index].model_id != previous.models[index].model_id)
+     throw contracts::InvalidIntentError("training model identities are native-owned");
+   training.lane_configuration = std::move(*request.lane_configuration);
+   for (auto& model : training.lane_configuration.models) mmltk::backend::models::rfdetr::resolve_train_recipe(model.recipe);
+   if (!request.training_model_count && training.lane_configuration.mode != mmltk::backend::models::rfdetr::TrainLaneMode::SharedGradients) {
+    if (training.lane_configuration.models.empty())
+     mmltk::backend::models::rfdetr::resize_training_models(training.lane_configuration, static_cast<std::size_t>(training.lanes), training.recipe, training.seed);
+    else training.lanes = static_cast<int>(training.lane_configuration.models.size());
+   }
+  }
+  if (request.training_model_count) {
+   if (*request.training_model_count == 0 || *request.training_model_count > mmltk::backend::models::rfdetr::kMaximumTrainingModels)
+    throw contracts::InvalidIntentError("training model count must be between one and sixteen");
+   for (const auto& update : request.updates)
+    if (update.path == "workflows.train.request.lanes") throw contracts::InvalidIntentError("training model count and lane edits conflict");
+   mmltk::backend::models::rfdetr::resize_training_models(training.lane_configuration, *request.training_model_count, training.recipe, training.seed);
+   training.lanes = static_cast<int>(*request.training_model_count);
+  }
+  if (!contracts::gui_settings_valid(candidate)) throw contracts::InvalidIntentError("invalid settings update");
   (void)mmltk::backend::models::rfdetr::derive_execution_facts(candidate.workflows.train.request, 0);
   result = persist(std::move(candidate));
  }
@@ -202,6 +231,7 @@ contracts::SettingsUiState SettingsSystem::Reset(contracts::SettingsResetRequest
  services::SettingsMutationResult result;
  {
   std::scoped_lock mutation_lock(mutation_mutex_);
+  if (training_locked_) throw contracts::BusyError("settings reset is locked during admitted training");
   {
    std::scoped_lock lock(mutex_);
    if (!loaded_) throw contracts::UnavailableError("settings are not loaded");
@@ -239,6 +269,13 @@ services::SettingsMutationResult SettingsSystem::persist(contracts::GuiSettingsS
  std::uint64_t candidate_version = 0U;
  {
   std::scoped_lock lock(mutex_);
+  // All mutation entries converge here after applying native derivations. The
+  // admitted request and model selection stay fixed; UI/output/history settings
+  // remain independently editable, including persistence retries and Explore.
+  const auto& admitted = state_.settings_state.workflows.train;
+  const auto& proposed = candidate.workflows.train;
+  if (training_locked_ && (proposed.request != admitted.request || proposed.model_source != admitted.model_source || proposed.model_input != admitted.model_input))
+   throw contracts::BusyError("training configuration is locked during an admitted run");
   if (!loaded_ || !location_.valid()) {
    terminal_ = {services::SettingsTerminal::NotLoaded, state_.revision, "settings are not loaded"};
   } else if (state_.revision == std::numeric_limits<std::uint64_t>::max()) {

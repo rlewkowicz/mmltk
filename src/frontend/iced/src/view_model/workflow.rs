@@ -1483,6 +1483,7 @@ mod training_history_tests {
         model.project_training_reply(
             2,
             ApplicationReply::TrainingOpenRun(crate::generated::TrainingOpenedRun {
+                    selected: None,
                 generation: 7,
                 directory: "/saved".into(),
                 run: None,
@@ -1528,7 +1529,44 @@ impl ApplicationModel {
             let dropped = state.metrics.as_ref().map_or(0, |record| record.droppedbefore);
             self.notices.run_condition(Origin::HistoryDropped, run, (dropped > 0), || warning("History incomplete", format!("{dropped} training records were dropped.")));
         }
-        observe_compute(&mut self.notices, FeatureId::Train, &state.local.terminal);
+        // Only the current fatal record identifies the model cause of this
+        // process terminal. Retained failures alone cannot suppress an unrelated
+        // process error. Keep the complete process status/advice with that cause.
+        let process_cause = state.metrics.as_ref().filter(|record|
+            record.role == crate::generated::TrainingRecordRole::Terminal && record.progress.phase == crate::generated::TrainingPhase::Error &&
+            state.local.terminal.outcome == crate::generated::ComputeOperationOutcome::Failed && state.local.terminal.generation == state.local.generationfrontier)
+            .and_then(|record| record.progress.failure.as_ref())
+            .filter(|cause| state.sources.failures.iter().any(|fact| fact.sessionid == cause.sessionid && fact.modelid == cause.modelid && fact.firstcause == cause.firstcause));
+        for fact in &state.sources.failures {
+            let detail = process_cause.filter(|cause| fact.sessionid == cause.sessionid && fact.modelid == cause.modelid && fact.firstcause == cause.firstcause)
+                .map(|_| state.local.terminal.detail.as_str());
+            self.notices.training_failure(state.local.generationfrontier, fact, detail);
+        }
+        if process_cause.is_none() {
+            observe_compute(&mut self.notices, FeatureId::Train, &state.local.terminal);
+        } else {
+            self.notices.terminal(Origin::Compute(FeatureId::Train), 0, state.local.terminal.generation, || None);
+        }
+        if let Some(execution) = &state.sources.execution {
+            let facts = &execution.training;
+            if facts.admittedcapacity > 0 {
+                self.notices.terminal(Origin::TrainingLimitation, 0, facts.operationgeneration, || match facts.limitation {
+                    crate::generated::ExecutionLimitation::ExperimentalIndependentModels => Some(warning("Experimental training policy", "Independent training uses separate model trajectories; RF-DETR model soups remain experimental.")),
+                    crate::generated::ExecutionLimitation::ExperimentalPeriodicAveraging => Some(warning("Experimental training policy", "Periodic averaging retains per-model optimizer and EMA state; mixed optimizers are experimental.")),
+                    _ => None,
+                });
+            }
+            if facts.admittedcapacity > 0 && state.sources.distributions.iter().any(|facts| facts.missingclasses > 0) {
+                self.notices.terminal(Origin::TrainingSupport, 0, facts.operationgeneration, ||
+                    Some(warning("Sparse class support", "Some admitted training models have no unique images for one or more classes. Repeated draws increase exposure but cannot create missing support.")));
+            }
+            let validation = &execution.validation;
+            if validation.admittedcapacity > 0 {
+                self.notices.terminal(Origin::TrainingValidationCapacity, 0, validation.operationgeneration, ||
+                    matches!(validation.limitation, crate::generated::ExecutionLimitation::SourceCapacity | crate::generated::ExecutionLimitation::BackendCapacity)
+                        .then(|| warning("Training validation capacity limited", format!("Validation admits {} of {} requested lanes.", validation.admittedcapacity, validation.configuredcapacity))));
+            }
+        }
     }
     pub(super) fn observe_checkpoint(&mut self, state: &crate::generated::TrainingCheckpointInspection) {
         use crate::generated::TrainingInspectionStatus;

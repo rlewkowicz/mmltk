@@ -25,9 +25,6 @@ void resize_training_models(TrainLaneConfiguration& configuration, const std::si
   configuration.models.push_back({id, training_stochastic_key(session_seed, id, 0, 0), recipe, 1});
  }
 }
-TrainFinalPolicy effective_final_policy(const TrainLaneConfiguration& config) noexcept {
- return config.final_policy.value_or(config.mode == TrainLaneMode::Independent ? TrainFinalPolicy::ValidationGreedy : TrainFinalPolicy::Off);
-}
 void validate_training_configuration(const TrainRequest& request) {
  if (!train_recipe_valid(request.recipe)) throw std::invalid_argument("invalid training recipe: UltralyticsLinear requires SGD; Nesterov requires SGD with positive momentum");
  if (request.data_policy.rare_threshold <= 0 || mmltk::frameworks::reflection::validate_reflected_fields(request.data_policy))

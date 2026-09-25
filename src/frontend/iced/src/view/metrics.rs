@@ -11,6 +11,8 @@ use iced::widget::{button, checkbox, column, container, row, text};
 #[derive(Debug, Clone)]
 pub enum Message {
     Visible(Chart, bool),
+    Source(crate::generated::TrainingMetricSource),
+    SelectedOutput(bool),
     Reset,
     Selector,
     Expand(Option<Chart>),
@@ -37,6 +39,11 @@ pub struct Component {
     live: history::History,
     saved: history::History,
     saved_selected: bool,
+    live_sources: Vec<history::History>,
+    saved_sources: Vec<history::History>,
+    selected_output: bool,
+    selection: Option<crate::generated::TrainingSelection>,
+    saved_selection: Option<crate::generated::TrainingSelection>,
 }
 impl Default for Component {
     fn default() -> Self {
@@ -49,6 +56,11 @@ impl Default for Component {
             live: history::History::new(&metrics),
             saved: history::History::new(&metrics),
             saved_selected: false,
+            live_sources: Vec::new(),
+            saved_sources: Vec::new(),
+            selected_output: false,
+            selection: None,
+            saved_selection: None,
             metrics,
             epoch: true,
             log: false,
@@ -70,6 +82,13 @@ impl Component {
                 .map_or(chart.visible, |expanded| expanded == kind),
         })
     }
+    pub(crate) fn retained_source_facts(&self) -> Option<(&crate::generated::TrainingMetricSource, u64, u64, u64)> {
+        let history = self.history();
+        let observation = history.curves.iter().zip(&self.metrics)
+            .filter(|(_, metric)| matches!(metric.source, catalog::Source::Evaluation { .. }))
+            .filter_map(|(curve, _)| curve.buckets.back().map(|bucket| bucket.last.order)).max()?;
+        Some((history.source.as_ref()?, history.sequence?, history.dropped, observation))
+    }
     fn invalidate(&mut self) {
         for chart in &mut self.charts {
             chart.dirty = true;
@@ -85,6 +104,7 @@ impl Component {
     pub fn clear(&mut self) {
         self.live.clear(&self.metrics);
         self.saved.clear(&self.metrics);
+        for history in self.live_sources.iter_mut().chain(&mut self.saved_sources) { history.clear(&self.metrics); }
         self.invalidate();
     }
     pub fn reset(&mut self, visible: bool) {
@@ -102,26 +122,32 @@ impl Component {
                     live_changed = u16::MAX;
                 }
             } else if let Some(record) = &training.metrics {
-                live_changed = self.live.reconcile_live_source(
-                    record,
-                    training.representativeobservation.as_ref(),
-                    model.settings_snapshot.as_ref().map(|settings| &settings.settingsstate.workflows.train.request),
-                    &self.metrics,
-                );
-                live_changed |= self.live.ingest(record, true, &self.metrics);
-                if let Some(observation) = &training.representativeobservation {
-                    live_changed |= self.live.ingest_observation(observation, &self.metrics);
+                if self.live.run != record.runid || self.live.sequence.is_some() && self.live_sources.first().is_some_and(|history| history.run != record.runid) {
+                    self.live_sources.clear();
                 }
+                live_changed = self.live.reconcile_live_source(record, &training.sources.catalog, &self.metrics);
+                Self::ensure_sources(&mut self.live, &mut self.live_sources, &training.sources.catalog, &self.metrics);
+                live_changed |= self.live.ingest(record, true, &self.metrics);
+                for history in &mut self.live_sources { history.ingest(record, true, &self.metrics); }
+                for observation in &training.sources.observations {
+                    live_changed |= self.live.ingest_observation(observation, &self.metrics);
+                    for history in &mut self.live_sources { history.ingest_observation(observation, &self.metrics); }
+                }
+                self.selection.clone_from(&training.sources.selected);
+
             }
         }
         let selected = model.workflow.output.saved().is_some();
         let mut saved_changed = 0;
         if let Some(opened) = model.workflow.output.run() {
+            self.saved_selection.clone_from(&opened.selected);
             if self.saved.generation != opened.generation {
                 self.saved.clear(&self.metrics);
                 if let Some(run) = &opened.run {
                     self.saved.set_run(&run.runid, opened.generation);
-                    self.saved.select_source(&run.configuration);
+                    self.saved.source = run.sources.defaultsource.clone();
+                    self.saved_sources.clear();
+                    Self::ensure_sources(&mut self.saved, &mut self.saved_sources, &run.sources, &self.metrics);
                 } else {
                     self.saved.set_run("", opened.generation);
                 }
@@ -132,6 +158,7 @@ impl Component {
                 if page.generation == self.saved.generation && self.saved.page != Some(key) {
                     for record in &page.records {
                         saved_changed |= self.saved.ingest(record, false, &self.metrics);
+                        for history in &mut self.saved_sources { history.ingest(record, false, &self.metrics); }
                     }
                     self.saved.page = Some(key);
                 }
@@ -159,8 +186,26 @@ impl Component {
             self.prepare();
         }
     }
+    fn ensure_sources(active: &mut history::History, retained: &mut Vec<history::History>, catalog: &crate::generated::TrainingSourceCatalog, metrics: &[Metric]) {
+        retained.retain(|history| history.source.as_ref().is_some_and(|source| catalog.available.contains(source) && Some(source) != active.source.as_ref()));
+        for source in &catalog.available {
+            if active.source.as_ref() == Some(source) || retained.iter().any(|history| history.source.as_ref() == Some(source)) { continue; }
+            let mut history = history::History::new(metrics);
+            history.source = Some(source.clone());
+            retained.push(history);
+        }
+    }
     pub fn update(&mut self, message: Message) {
         match message {
+            Message::Source(source) => {
+                let (active, retained) = if self.saved_selected { (&mut self.saved, &mut self.saved_sources) } else { (&mut self.live, &mut self.live_sources) };
+                if let Some(index) = retained.iter().position(|history| history.source.as_ref() == Some(&source)) {
+                    std::mem::swap(active, &mut retained[index]);
+                    self.invalidate();
+                }
+                self.selected_output = false;
+            }
+            Message::SelectedOutput(value) => self.selected_output = value,
             Message::Visible(kind, visible) => {
                 if let Some(chart) = self.charts.iter_mut().find(|c| c.kind == kind) {
                     chart.visible = visible;
@@ -210,7 +255,7 @@ impl Component {
         }
     }
     pub fn controls_height(&self) -> f32 {
-        (if self.selector { 230.0 } else { 40.0 })
+        (if self.selector { 274.0 } else { 84.0 })
             + if self.expanded.is_some() { 34.0 } else { 0.0 }
     }
     pub fn view(&self, width: f32, height: f32) -> Element<'_, Message> {
@@ -224,7 +269,22 @@ impl Component {
                 .on_toggle(Message::Log)
         ]
         .spacing(8);
-        let mut content = column![controls].spacing(6);
+        let active = self.history();
+        let alternatives = if self.saved_selected { &self.saved_sources } else { &self.live_sources };
+        let sources = std::iter::once(active).chain(alternatives).filter_map(|history| history.source.as_ref());
+        let mut source_controls = row![].spacing(6);
+        for source in sources {
+            let label = if source.scope == crate::generated::TrainingRecordScope::SynchronizedSession { "Synchronized · Ordinary".into() }
+                else { format!("Model {} · {:?}", source.modelid, source.weights) };
+            source_controls = source_controls.push(container(button(text(label)).on_press(Message::Source(source.clone()))
+                .style(if !self.selected_output && active.source.as_ref() == Some(source) { crate::fluent_theme::button_selected } else { crate::fluent_theme::button_secondary }))
+                .id(format!("train.metrics.source.{:?}.{}.{:?}", source.scope, source.modelid, source.weights)));
+        }
+        let selection = if self.saved_selected { &self.saved_selection } else { &self.selection };
+        if selection.is_some() {
+            source_controls = source_controls.push(button("Selected output").on_press(Message::SelectedOutput(true)));
+        }
+        let mut content = column![controls, iced::widget::scrollable(source_controls).direction(iced::widget::scrollable::Direction::Horizontal(iced::widget::scrollable::Scrollbar::default()))].spacing(6);
         if self.selector {
             let mut choices =
                 column![button("Reset to main charts").on_press(Message::Reset)].spacing(4);
@@ -253,7 +313,13 @@ impl Component {
             .iter()
             .filter(|c| self.expanded.map_or(c.visible, |kind| kind == c.kind))
             .collect();
-        let workspace: Element<'_, Message> = if selected.is_empty() {
+        let workspace: Element<'_, Message> = if self.selected_output && selection.is_some() {
+            let selection = selection.as_ref().unwrap();
+            let mut facts = column![text(format!("Selected output · {:?} · {:?}", selection.method, selection.artifact.weights)), text(selection.artifact.path.clone()), text(format!("Validation box AP: {:.4}", selection.validation.bbox.ap))].spacing(6);
+            if let Some(mask) = &selection.validation.mask { facts = facts.push(text(format!("Validation mask AP: {:.4}", mask.ap))); }
+            for ingredient in &selection.ingredients { facts = facts.push(text(format!("Model {} · coefficient {:.4} · {}", ingredient.modelid, ingredient.coefficient, ingredient.sha256))); }
+            container(facts).center(iced::Fill).into()
+        } else if selected.is_empty() {
             container(text("No charts selected"))
                 .center(iced::Fill)
                 .into()
@@ -374,6 +440,7 @@ pub(crate) mod tests {
                     evaluation: Some(evaluation()), validation: "validation".into(),
                 }),
                 failure: None,
+                distribution: None,
                 epoch: 1,
                 totalepochs: 3,
                 completedbatches: 1,
@@ -473,7 +540,9 @@ pub(crate) mod tests {
         current.progress.fullcheckpointpath = "session.json".into();
         let training = model.workflow.training.as_mut().unwrap();
         training.metrics = Some(current.clone());
-        training.representativeobservation = Some(observation);
+        training.sources.catalog.defaultsource = Some(crate::generated::TrainingMetricSource { scope: observation.progress.scope, modelid: observation.progress.modelid, weights: observation.evaluatedweights });
+        training.sources.catalog.available = vec![training.sources.catalog.defaultsource.clone().unwrap()];
+        training.sources.observations = vec![observation];
         let mut component = Component::default();
         component.rebase(&model, false);
         component.rebase(&model, false);
@@ -516,7 +585,9 @@ pub(crate) mod tests {
             current.progress.scalars.total = Some(7.0);
             let training = model.workflow.training.as_mut().unwrap();
             training.metrics = Some(current.clone());
-            training.representativeobservation = Some(observation);
+            training.sources.catalog.defaultsource = Some(crate::generated::TrainingMetricSource { scope: observation.progress.scope, modelid: observation.progress.modelid, weights: observation.evaluatedweights });
+        training.sources.catalog.available = vec![training.sources.catalog.defaultsource.clone().unwrap()];
+        training.sources.observations = vec![observation];
             component.rebase(&model, false);
             component.rebase(&model, false);
             assert_eq!(component.live.sequence, Some(12));
@@ -527,8 +598,8 @@ pub(crate) mod tests {
             let loss = curve(&component.live, &component.metrics, Chart::Loss);
             // Weight-kind correction leaves the same model's truthful losses;
             // a model correction discards the provisional model's points.
-            assert_eq!(loss.buckets.len(), if synchronized { 2 } else { 1 });
-            assert_eq!(loss.buckets.back().unwrap().last.value, 7.0);
+            assert_eq!(loss.buckets.len(), if synchronized { 0 } else { 1 });
+            if !synchronized { assert_eq!(loss.buckets.back().unwrap().last.value, 7.0); }
             assert_eq!(model.workflow.training.as_ref().unwrap().metrics.as_ref(), Some(&current));
 
             // Mutable settings and plot-storage reset cannot supersede the
@@ -539,12 +610,14 @@ pub(crate) mod tests {
             assert_eq!(component.live.sequence, Some(12));
 
             let training = model.workflow.training.as_mut().unwrap();
-            let observation = training.representativeobservation.as_mut().unwrap();
+            let observation = training.sources.observations.first_mut().unwrap();
             observation.attemptid = "next-attempt".into();
             observation.sequence = 0;
             observation.progress.scope = TrainingRecordScope::Model;
             observation.progress.modelid = 5;
             observation.progress.artifact.as_mut().unwrap().modelid = 5;
+            training.sources.catalog.defaultsource = Some(crate::generated::TrainingMetricSource { scope: observation.progress.scope, modelid: observation.progress.modelid, weights: observation.evaluatedweights });
+            training.sources.catalog.available = vec![training.sources.catalog.defaultsource.clone().unwrap()];
             let current = training.metrics.as_mut().unwrap();
             current.attemptid = "next-attempt".into();
             current.sequence = 1;
@@ -561,7 +634,10 @@ pub(crate) mod tests {
     fn saved_page_replay_selects_ema_without_session_gaps() {
         let mut model = crate::view_model::test_support::bootstrapped();
         select_saved_run(&mut model);
-        model.workflow.output.saved_mut().unwrap().run.as_mut().unwrap().run.as_mut().unwrap().configuration.useema = true;
+        let run = model.workflow.output.saved_mut().unwrap().run.as_mut().unwrap().run.as_mut().unwrap();
+        run.configuration.useema = true;
+        run.sources.defaultsource.as_mut().unwrap().weights = EvaluatedWeights::Ema;
+        run.sources.available[0].weights = EvaluatedWeights::Ema;
         let mut ordinary = record();
         ordinary.runid = "saved".into();
         ordinary.sequence = 0;
@@ -1258,6 +1334,107 @@ pub(crate) mod tests {
             })
             .unwrap();
     }
+    #[test]
+    fn every_admitted_source_retains_original_observations_across_switches_and_late_snapshots() {
+        let mut model = crate::view_model::test_support::bootstrapped();
+        let training = model.workflow.training.as_mut().unwrap();
+        let mut current = record(); current.sequence = 100; current.droppedbefore = 9;
+        current.progress.scope = TrainingRecordScope::Session; current.progress.val = None; current.progress.artifact = None;
+        training.metrics = Some(current.clone());
+        for modelid in 0..=TRAINING_MODEL_CAPACITY as u64 {
+            let source = TrainingMetricSource { scope: if modelid == 0 { TrainingRecordScope::SynchronizedSession } else { TrainingRecordScope::Model }, modelid,
+                weights: if modelid == 0 { EvaluatedWeights::Ordinary } else { EvaluatedWeights::Ema } };
+            let mut observation = record(); observation.sequence = modelid + 1; observation.role = TrainingRecordRole::Epoch;
+            observation.progress.phase = TrainingPhase::EpochComplete;
+            observation.progress.scope = source.scope; observation.progress.modelid = modelid; observation.evaluatedweights = source.weights;
+            observation.progress.val = Some(evaluation());
+            let artifact = observation.progress.artifact.as_mut().unwrap(); artifact.modelid = modelid; artifact.weights = source.weights;
+            artifact.epoch = observation.progress.epoch as u64;
+            training.sources.catalog.available.push(source);
+            training.sources.observations.push(observation);
+        }
+        training.sources.catalog.defaultsource = Some(training.sources.catalog.available[1].clone());
+        let catalog = training.sources.catalog.clone();
+        let mut component = Component::default(); component.rebase(&model, true);
+        assert_eq!(component.live_sources.len(), TRAINING_MODEL_CAPACITY);
+        for source in catalog.available.iter().rev() {
+            component.update(Message::Source(source.clone())); component.rebase(&model, true);
+            let (actual, sequence, dropped, observation) = component.retained_source_facts().unwrap();
+            assert_eq!(actual, source); assert_eq!((sequence, dropped, observation), (100, 9, source.modelid + 1));
+            assert_eq!(curve(&component.live, &component.metrics, Chart::Ap).buckets.len(), 1);
+            assert!(curve(&component.live, &component.metrics, Chart::Loss).buckets.is_empty());
+            component.update(Message::SelectedOutput(true));
+            component.update(Message::Source(source.clone()));
+            assert!(!component.selected_output);
+            component.rebase(&model, true);
+            assert_eq!(component.live.source.as_ref(), Some(source));
+        }
+        assert_eq!(model.workflow.training.as_ref().unwrap().metrics.as_ref(), Some(&current));
+        assert_eq!(component.live_sources.len() + 1, catalog.available.len());
+    }
+
+    #[test]
+    fn periodic_ordinary_epoch_records_replay_separate_losses_without_model_evaluations() {
+        let catalog = TrainingSourceCatalog {
+            defaultsource: Some(TrainingMetricSource { scope: TrainingRecordScope::SynchronizedSession, modelid: 0, weights: EvaluatedWeights::Ordinary }),
+            available: (0..=TRAINING_MODEL_CAPACITY as u64).map(|modelid| TrainingMetricSource {
+                scope: if modelid == 0 { TrainingRecordScope::SynchronizedSession } else { TrainingRecordScope::Model },
+                modelid, weights: EvaluatedWeights::Ordinary,
+            }).collect(),
+        };
+        let mut records = Vec::new();
+        for modelid in 1..=TRAINING_MODEL_CAPACITY as u64 {
+            let mut sample = record(); sample.runid = "saved".into(); sample.attemptid = "saved-attempt".into();
+            sample.sequence = modelid; sample.droppedbefore = 7; sample.role = TrainingRecordRole::Epoch;
+            sample.progress.phase = TrainingPhase::EpochComplete; sample.progress.modelid = modelid;
+            sample.progress.scalars.total = Some(modelid as f64);
+            sample.progress.val = None; sample.progress.artifact = None;
+            records.push(sample);
+        }
+        let mut evaluated = records[0].clone(); evaluated.sequence = TRAINING_MODEL_CAPACITY as u64 + 1;
+        evaluated.progress.scope = TrainingRecordScope::SynchronizedSession; evaluated.progress.modelid = 0;
+        evaluated.progress.val = Some(evaluation()); evaluated.progress.artifact = record().progress.artifact;
+        records.push(evaluated);
+        let mut terminal = records[0].clone(); terminal.sequence = TRAINING_MODEL_CAPACITY as u64 + 2;
+        terminal.role = TrainingRecordRole::Terminal; terminal.progress.phase = TrainingPhase::Completed;
+        terminal.progress.scope = TrainingRecordScope::Session;
+        records.push(terminal);
+        for saved in [false, true] {
+            let mut model = crate::view_model::test_support::bootstrapped();
+            let mut component = Component::default();
+            if saved {
+                select_saved_run(&mut model);
+                let selected = model.workflow.output.saved_mut().unwrap();
+                selected.run.as_mut().unwrap().run.as_mut().unwrap().sources = catalog.clone();
+                selected.page = Some(TrainingHistoryPage { generation: 3, nextcursor: 100, more: false, records: records.clone() });
+                component.rebase(&model, false);
+            } else {
+                model.workflow.training.as_mut().unwrap().sources.catalog = catalog.clone();
+                for sample in &records {
+                    model.workflow.training.as_mut().unwrap().metrics = Some(sample.clone());
+                    component.rebase(&model, false);
+                }
+            }
+            for source in catalog.available.iter().rev() {
+                component.update(Message::Source(source.clone()));
+                component.rebase(&model, false);
+                let history = component.history();
+                assert_eq!(history.sequence, Some(TRAINING_MODEL_CAPACITY as u64 + 2));
+                assert_eq!(history.dropped, 7);
+                let loss = curve(history, &component.metrics, Chart::Loss);
+                let ap = curve(history, &component.metrics, Chart::Ap);
+                if source.modelid == 0 {
+                    assert!(loss.buckets.is_empty()); assert_eq!(ap.buckets.len(), 1);
+                } else {
+                    assert_eq!(loss.buckets.len(), 1);
+                    assert_eq!(loss.buckets[0].first.value, source.modelid as f64);
+                    assert_eq!(loss.buckets[0].first.order, source.modelid);
+                    assert!(ap.buckets.is_empty());
+                }
+            }
+        }
+    }
+
 }
 
 impl Component {
@@ -1265,4 +1442,5 @@ impl Component {
         self.live.publish_conditions(notices, false);
         self.saved.publish_conditions(notices, true);
     }
+
 }

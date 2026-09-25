@@ -34,6 +34,7 @@ mmltk_register_ordinary_sources(
     weight_catalog.cpp
     execution_plan.cpp
     training_artifacts.cpp
+    training_metrics.cpp
     workflow_requests.cpp
 )
 target_link_libraries(mmltk_backend_models_rfdetr_contract

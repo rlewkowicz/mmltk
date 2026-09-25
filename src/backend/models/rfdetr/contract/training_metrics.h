@@ -12,7 +12,10 @@ namespace mmltk::backend::models::rfdetr {
 inline constexpr std::uint32_t kTrainingRunFormat = 3;
 inline constexpr std::size_t kTrainingHistoryPageSize = 32;
 inline constexpr std::size_t kTrainingRecordBytes = 512U * 1024U;
-inline constexpr std::size_t kTrainingProgressDocumentBytes = 3U * kTrainingRecordBytes;
+// JSON can expand every bounded string byte into a six-byte escape. The compact
+// application value and its reusable writer scratch retain their smaller budget.
+inline constexpr std::size_t kTrainingProgressDocumentBytes = 12U * 1024U * 1024U;
+inline constexpr std::size_t kTrainingProgressWireBytes = 4U * 1024U * 1024U;
 inline constexpr std::size_t kTrainingManifestBytes = 4U * 1024U * 1024U;
 inline constexpr std::string_view kTrainingPersistenceFailureLine = "\nMMLTK_TRAIN_PERSISTENCE_FAILED_V1\n";
 enum class TrainingPhase : std::uint8_t { Starting, Train, Validate, EpochComplete, Completed, Error, Cancelled, Merge };
@@ -45,6 +48,20 @@ struct TrainingScalars final {
  std::optional<double> images_per_second;
 };
 MMLTK_REFLECT_FIELDS(TrainingScalars)
+// Native epoch admission quantities: support counts original image/class pairs;
+// exposure counts scheduled image/class pairs, independently of unused tails.
+struct TrainingDistributionFacts final {
+ std::uint64_t model_id = 0;
+ std::uint64_t epoch = 0;
+ std::uint64_t unique_images = 0;
+ std::uint64_t scheduled_draws = 0;
+ std::uint64_t unique_class_support = 0;
+ std::uint64_t repeated_class_exposure = 0;
+ std::uint64_t missing_classes = 0;
+ std::uint64_t unused_tail = 0;
+ bool operator==(const TrainingDistributionFacts&) const = default;
+};
+MMLTK_REFLECT_FIELDS(TrainingDistributionFacts)
 struct TrainingMetricProgress final {
  bool operator==(const TrainingMetricProgress&) const = default;
  TrainingPhase phase = TrainingPhase::Starting;
@@ -56,6 +73,7 @@ struct TrainingMetricProgress final {
  std::optional<TrainingMergeBoundary> merge_boundary;
  std::optional<TrainingArtifact> artifact;
  std::optional<TrainingFailure> failure;
+ std::optional<TrainingDistributionFacts> distribution;
  int epoch = 0;
  int total_epochs = 1;
  std::int64_t completed_batches = 0;
@@ -100,6 +118,7 @@ struct TrainingRecord final {
 };
 MMLTK_REFLECT_FIELDS(TrainingRecord)
 struct TrainingDatasetLimits final {
+ bool operator==(const TrainingDatasetLimits&) const = default;
  std::uint32_t train_max_instances = 0;
  std::uint32_t val_max_instances = 0;
  std::optional<std::uint32_t> test_max_instances;
@@ -113,11 +132,42 @@ struct TrainingDatasetLimits final {
 };
 MMLTK_REFLECT_FIELDS(TrainingDatasetLimits)
 struct TrainingExecutionFacts final {
+ bool operator==(const TrainingExecutionFacts&) const = default;
  ExecutionFacts training;
  ExecutionFacts validation;
  TrainingDatasetLimits dataset_limits;
 };
 MMLTK_REFLECT_FIELDS(TrainingExecutionFacts)
+// Stable selectable identities are native policy; UI selection is presentation state.
+inline constexpr std::size_t kTrainingSourceCapacity = kMaximumTrainingModels + 1U;
+struct TrainingMetricSource final {
+ TrainingRecordScope scope = TrainingRecordScope::Model;
+ std::uint64_t model_id = 0;
+ EvaluatedWeights weights = EvaluatedWeights::Ordinary;
+ bool operator==(const TrainingMetricSource&) const = default;
+};
+MMLTK_REFLECT_FIELDS(TrainingMetricSource)
+struct TrainingSourceCatalog final {
+ std::optional<TrainingMetricSource> default_source;
+ [[= mmltk::frameworks::reflection::MaxItems{kTrainingSourceCapacity}]] std::vector<TrainingMetricSource> available;
+ bool operator==(const TrainingSourceCatalog&) const = default;
+};
+MMLTK_REFLECT_FIELDS(TrainingSourceCatalog)
+struct TrainingSources final {
+ TrainingSourceCatalog catalog;
+ // Exact original scheduled records; no configurations, failure payloads, or test products.
+ [[= mmltk::frameworks::reflection::MaxItems{kTrainingSourceCapacity}]] std::vector<TrainingRecord> observations;
+ [[= mmltk::frameworks::reflection::MaxItems{kMaximumTrainingModels + 1U}]] std::vector<TrainingFailure> failures;
+ [[= mmltk::frameworks::reflection::MaxItems{kMaximumTrainingModels}]] std::vector<TrainingDistributionFacts> distributions;
+ std::optional<TrainingSelection> selected;
+ std::optional<TrainingExecutionFacts> execution;
+ bool operator==(const TrainingSources&) const = default;
+};
+MMLTK_REFLECT_FIELDS(TrainingSources)
+[[nodiscard]] TrainingSourceCatalog training_source_catalog(const TrainRequest&);
+[[nodiscard]] TrainingMetricSource training_metric_source(const TrainingRecord&) noexcept;
+void retain_training_source(TrainingSources&, const TrainingRecord&);
+void validate_training_sources(const TrainingSources&, const TrainingRecord&);
 struct TrainingRun final {
  std::uint32_t format_version = kTrainingRunFormat;
  [[= mmltk::frameworks::reflection::MaxBytes{64}]] std::string run_id;
@@ -125,6 +175,7 @@ struct TrainingRun final {
  [[= mmltk::frameworks::reflection::MaxBytes{64}]] std::string checkpoint_attempt_id;
  [[= mmltk::frameworks::reflection::MaxBytes{64}]] std::string source_checkpoint_attempt_id;
  TrainRequest configuration{};
+ TrainingSourceCatalog sources;
  TrainingExecutionFacts execution;
  [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]] std::string original_weights;
  [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]] std::filesystem::path original_class_descriptor;
@@ -138,6 +189,7 @@ struct TrainingOpenedRun final {
  std::uint64_t generation = 0;
  [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]] std::filesystem::path directory;
  std::optional<TrainingRun> run;
+ std::optional<TrainingSelection> selected;
 };
 MMLTK_REFLECT_FIELDS(TrainingOpenedRun)
 struct TrainingPersistence final {
@@ -209,10 +261,10 @@ MMLTK_REFLECT_FIELDS(TrainingFinalFacts)
 struct TrainingProgressDocument final {
  std::uint32_t format_version = kTrainingRunFormat;
  TrainingRecord record;
- // Original scheduled record, retained independently of current progress.
- std::optional<TrainingRecord> representative_observation;
+ TrainingSources sources;
  TrainingPersistence persistence;
  std::optional<TrainingFinalFacts> final;
 };
 MMLTK_REFLECT_FIELDS(TrainingProgressDocument)
+void validate_training_progress_document(const TrainingProgressDocument&, const TrainingSourceCatalog&);
 }  // namespace mmltk::backend::models::rfdetr

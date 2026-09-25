@@ -267,6 +267,7 @@ TrainProcessClient TrainProcessClient::launch(
   state.stdout_fd.reset(child.release_stdout_fd());
   state.setup_fd.reset(child.release_setup_error_fd());
   state.output_directory = request.output_dir;
+  state.source_catalog = mmltk::backend::models::rfdetr::training_source_catalog(request);
   state.progress_fd.reset(progress_descriptor(state.output_directory, state.progress_watch));
   state.control_fd.reset(event_descriptor());
   state.escalation_fd.reset(timer_descriptor());
@@ -365,23 +366,19 @@ std::optional<TrainProcessProgress> TrainProcessClient::read_progress() {
  try {
   const auto& source = progress.is_object() ? progress : result;
   if (source.is_object()) {
-   document = mmltk::frameworks::serialization::decode_reflected_json<r::TrainingProgressDocument>(source.dump(), {.max_bytes = kProgressDocumentLimit, .max_items = 24576, .max_depth = 32});
-   if (document->format_version != r::kTrainingRunFormat || document->record.format_version != r::kTrainingRunFormat || document->record.attempt_id.empty())
-    throw std::runtime_error("unsupported training progress document");
-   if (const auto& observation = document->representative_observation) {
-    if (observation->format_version != r::kTrainingRunFormat || observation->run_id != document->record.run_id || observation->attempt_id != document->record.attempt_id ||
-        observation->sequence > document->record.sequence || observation->role != r::TrainingRecordRole::Epoch || !observation->progress.artifact || !observation->progress.val ||
-        observation->evaluated_weights != observation->progress.artifact->weights ||
-        (observation->progress.scope != r::TrainingRecordScope::Model && observation->progress.scope != r::TrainingRecordScope::SynchronizedSession))
-     throw std::runtime_error("invalid retained training observation");
-   }
+   document = mmltk::frameworks::serialization::decode_reflected_json<r::TrainingProgressDocument>(source.dump(), {.max_bytes = kProgressDocumentLimit, .max_items = 131072, .max_depth = 32});
+   r::validate_training_progress_document(*document, state_->source_catalog);
+   if (!state_->observed_run.empty() && (document->record.run_id != state_->observed_run || document->record.attempt_id != state_->observed_attempt))
+    throw std::runtime_error("foreign training progress source");
+   state_->observed_run = document->record.run_id;
+   state_->observed_attempt = document->record.attempt_id;
   }
  } catch (...) { state_->persistence_failed = true; throw; }
  std::string status = "training";
  std::uint64_t completed = 0, total = 0;
  std::filesystem::path checkpoint;
  std::optional<r::TrainingRecord> metrics;
- std::optional<r::TrainingRecord> representative_observation;
+ r::TrainingSources sources;
  r::TrainingPersistence persistence;
  if (document) {
   const auto& facts = document->record.progress;
@@ -405,7 +402,7 @@ std::optional<TrainProcessProgress> TrainProcessClient::read_progress() {
    state_->capturing_failure = true;
    state_->finish_failure_line();
   }
-  representative_observation = std::move(document->representative_observation);
+  sources = std::move(document->sources);
   metrics = std::move(document->record);
  }
  state_->persistence_failed |= persistence.degraded;
@@ -414,7 +411,7 @@ std::optional<TrainProcessProgress> TrainProcessClient::read_progress() {
  validate_progress_fields(status, checkpoint.string());
  ++state_->progress_sequence;
  return TrainProcessProgress{.progress = {.sequence = state_->progress_sequence, .completed = std::min(completed, total), .total = total, .status = std::move(status)},
-  .checkpoint_path = std::move(checkpoint), .metrics = std::move(metrics), .representative_observation = std::move(representative_observation), .persistence = std::move(persistence)};
+  .checkpoint_path = std::move(checkpoint), .metrics = std::move(metrics), .sources = std::move(sources), .persistence = std::move(persistence)};
 }
 std::optional<TrainProcessExit> TrainProcessClient::consume_exit(std::string* retained_output) {
  if (!active()) return std::nullopt;

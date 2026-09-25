@@ -216,6 +216,8 @@ impl Router {
         settings: &mut crate::view::settings::Component,
         message: Message,
     ) -> Result<Option<Outcome>, String> {
+        settings.state_mut().execution_locked = [FeatureId::Train, FeatureId::Validate, FeatureId::Predict]
+            .map(|feature| model.primary_action_active(feature));
         let outcome = match message {
             Message::Navigation(message) => match navigation::update(message) {
                 navigation::Outcome::PageSelected(feature) => Outcome::FeatureSelected(feature),

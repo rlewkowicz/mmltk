@@ -20,6 +20,7 @@ use iced::{Rectangle, Task};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Picture {
     Progress,
+    Sources,
     Train,
     Validation,
     Confidence,
@@ -36,6 +37,7 @@ impl Picture {
     fn name(self) -> &'static str {
         match self {
             Self::Progress => "progress",
+            Self::Sources => "training-sources",
             Self::Train => "train",
             Self::Validation => "validation",
             Self::Confidence => "confidence",
@@ -50,12 +52,12 @@ impl Picture {
         }
     }
     fn chart(self) -> bool {
-        matches!(self, Self::Train | Self::Theme | Self::Narrow)
+        matches!(self, Self::Train | Self::Sources | Self::Theme | Self::Narrow)
     }
     fn control(self, _index: u8) -> String {
         match self {
             Self::Progress => "train.progress.bar".into(),
-            Self::Train | Self::Theme | Self::Narrow => "train.metrics.plot".into(),
+            Self::Train | Self::Sources | Self::Theme | Self::Narrow => "train.metrics.plot".into(),
             Self::Validation | Self::Confidence => crate::view::validate::samples::ATLAS_ID.into(),
             Self::Detail => "validate.detail.image".into(),
             Self::Gallery => crate::view::explore::GALLERY_WORKSPACE_ID.into(),
@@ -90,6 +92,7 @@ pub(super) enum Step {
     GpuReady(FeatureId),
     Train,
     StartTrain,
+    TrainingFixture(u8),
     Training,
     LeaveTrain,
     HiddenTrain,
@@ -199,6 +202,7 @@ pub(super) enum Step {
 
 #[derive(Default)]
 pub(super) struct State {
+    source_fixture: Option<TrainingFixture>,
     gpu_completed: [bool; 4],
     gpu_admitted: [u64; 4],
     gpu_return: Option<Step>,
@@ -238,6 +242,132 @@ pub(super) struct State {
     primary_reveal: [Option<(u64, u64)>; 4],
     work_progress: Option<(FeatureId, u64, u64)>,
     export_narrow: bool,
+}
+
+// Deterministic rendered facts use a completed native record as the structural
+// template. This fixture owns no native operation or persisted settings.
+struct TrainingFixture {
+    model: ApplicationModel,
+    settings: settings::SettingsModel,
+    metrics: crate::view::metrics::Component,
+}
+impl TrainingFixture {
+    fn new(model: &ApplicationModel) -> Option<Self> {
+        use crate::generated::*;
+        let mut model = model.clone();
+        model.workflow.output = Default::default();
+        let state = model.workflow.training.as_mut()?;
+        let template = state.sources.observations.first()?.clone();
+        let mut current = template.clone();
+        current.role = TrainingRecordRole::Live;
+        current.progress.phase = TrainingPhase::Train;
+        current.progress.scope = TrainingRecordScope::Session;
+        current.progress.artifact = None;
+        current.progress.val = None;
+        current.progress.test = None;
+        current.droppedbefore = 7;
+        let available = vec![
+            TrainingMetricSource { scope: TrainingRecordScope::Model, modelid: 1, weights: EvaluatedWeights::Ema },
+            TrainingMetricSource { scope: TrainingRecordScope::Model, modelid: 2, weights: EvaluatedWeights::Ema },
+            TrainingMetricSource { scope: TrainingRecordScope::SynchronizedSession, modelid: 0, weights: EvaluatedWeights::Ordinary },
+        ];
+        state.sources.catalog = TrainingSourceCatalog { defaultsource: Some(available[0].clone()), available };
+        state.sources.selected = None;
+        state.sources.failures.clear();
+        state.sources.distributions.clear();
+        state.local.active = false;
+        let mut metrics = crate::view::metrics::Component::default();
+        metrics.update(crate::view::metrics::Message::Expand(Some(crate::view::metrics::Chart::Ap)));
+        for epoch in 0..4 {
+            let state = model.workflow.training.as_mut()?;
+            state.sources.observations.clear();
+            for (index, source) in state.sources.catalog.available.iter().enumerate() {
+                let mut observation = template.clone();
+                observation.sequence = (epoch * 3 + index + 1) as u64;
+                observation.progress.epoch = epoch as i32;
+                observation.progress.scope = source.scope;
+                observation.progress.modelid = source.modelid;
+                observation.evaluatedweights = source.weights;
+                observation.attemptconfiguration = None;
+                let summary = observation.progress.val.as_mut()?;
+                summary.bbox.ap = 0.15 + 0.2 * index as f64 + 0.03 * epoch as f64;
+                summary.bbox.available = true;
+                let artifact = observation.progress.artifact.as_mut()?;
+                artifact.weights = source.weights;
+                artifact.modelid = source.modelid;
+                artifact.epoch = epoch as u64;
+                artifact.path = format!("fixture-model-{}-epoch-{epoch}.pt", source.modelid);
+                artifact.evaluation = observation.progress.val.clone();
+                state.sources.observations.push(observation);
+            }
+            current.sequence = 100 + epoch as u64;
+            current.progress.epoch = epoch as i32 + 1;
+            state.metrics = Some(current.clone());
+            metrics.rebase(&model, true);
+        }
+        let snapshot = model.settings_snapshot.as_mut()?;
+        snapshot.settingsstate.workflows.train.request.lanes = 2;
+        snapshot.settingsstate.workflows.train.request.batchsize = 2;
+        snapshot.settingsstate.workflows.train.request.gradaccumsteps = 3;
+        snapshot.settingsstate.workflows.train.request.validationlanes = 2;
+        snapshot.settingsstate.workflows.train.request.valbatchsize = 2;
+        snapshot.settingsstate.workflows.validate.request.lanes = 4;
+        snapshot.settingsstate.workflows.validate.request.batchsize = 2;
+        snapshot.settingsstate.workflows.predict.request.lanes = 2;
+        // These are explicit native fixture facts, never UI-derived arithmetic.
+        for (facts, effective) in [(&mut snapshot.trainexecution, 6), (&mut snapshot.trainingvalidationexecution, 4),
+            (&mut snapshot.validationexecution, 8), (&mut snapshot.predictionexecution, 2)] {
+            facts.settingsrevision = snapshot.revision;
+            facts.admittedcapacity = 0;
+            facts.effectivebatchpermodel = effective;
+        }
+        snapshot.trainexecution.aggregateroundimages = 12;
+        let mut settings = settings::SettingsModel::default();
+        settings.install(snapshot);
+        Some(Self { model, settings, metrics })
+    }
+    fn select(&mut self, stage: u8) {
+        let state = self.model.workflow.training.as_ref().unwrap();
+        let index = match stage { 0 => 0, 1 | 2 => 1, _ => 2 };
+        self.metrics.update(crate::view::metrics::Message::Source(state.sources.catalog.available[index].clone()));
+        // The same late/reconnected snapshot must retain source, observations and
+        // current sequence/drop facts after the selected evaluation has passed.
+        self.metrics.rebase(&self.model, true);
+        self.settings.draft.as_mut().unwrap().workflows.train.request.batchsize = if stage == 2 { 3 } else { 2 };
+    }
+    fn view(&self) -> crate::fluent_theme::Element<'_, super::Message> {
+        use crate::generated::*;
+        use crate::view::workflow::fields;
+        use iced::widget::{column, container, text};
+        let snapshot = self.model.settings_snapshot.as_ref().unwrap();
+        let mut controls = fields::numeric_grid();
+        for (feature, validation, label, lanes, batch, constraint) in [
+            (FeatureId::Train, false, "Train lanes", 2, 2, constraint_workflowstrainrequestlanes()),
+            (FeatureId::Train, true, "Training-validation lanes", 2, 2, constraint_workflowstrainrequestvalidationlanes()),
+            (FeatureId::Validate, false, "Validate lanes", 4, 2, constraint_workflowsvalidaterequestlanes()),
+            (FeatureId::Predict, false, "Predict lanes", 2, 1, constraint_workflowspredictrequestlanes()),
+        ] {
+            controls = controls.push(fields::number_i32(label, lanes, constraint, false, |_| super::Message::WorkflowRedraw))
+                .push(fields::read_only("Batch size", format!("fixture.{feature:?}.{validation}.batch"), batch.to_string()))
+                .push(fields::effective_batch(feature, validation, &self.model, &self.settings))
+                .push(text(if validation { "Scheduled evaluation" } else { "Native facts" }));
+        }
+        container(column![text("Training source and lane fixture"), controls,
+            text(format!("Aggregate images / round: {}", snapshot.trainexecution.aggregateroundimages)),
+            self.metrics.view(820.0, 265.0).map(super::Message::TrainingFixture)].spacing(8))
+            .width(850).padding(12).style(crate::fluent_theme::container_shell).into()
+    }
+}
+impl State {
+    pub(super) fn fixture_view<'a>(&'a self, content: crate::fluent_theme::Element<'a, RootMessage>, generation: u64) -> crate::fluent_theme::Element<'a, RootMessage> {
+        let Some(fixture) = &self.source_fixture else { return content; };
+        iced::widget::container(fixture.view().map(move |message| RootMessage::Integration(super::Message::Scoped {
+            generation, receipt: None, message: Box::new(message),
+        }))).center(iced::Fill).into()
+    }
+    pub(super) fn fixture_update(&mut self, message: crate::view::metrics::Message) {
+        if let Some(fixture) = &mut self.source_fixture { fixture.metrics.update(message); fixture.metrics.rebase(&fixture.model, true); }
+    }
 }
 
 fn ready_gallery_tile(model: &ApplicationModel) -> Option<(super::probe::ProbeReceipt, [f64; 5])> {
@@ -559,6 +689,26 @@ mod tests {
     use crate::generated::FeatureId;
     use crate::integration_control::pixel_checks::ProbeOutcome;
     use crate::integration_control::{Controller, Message, Phase};
+
+    #[test]
+    fn rendered_training_fixture_has_distinct_retained_sources_and_pending_native_facts() {
+        let mut model = crate::view_model::test_support::bootstrapped();
+        let mut sample = crate::view::metrics::tests::record();
+        sample.role = crate::generated::TrainingRecordRole::Epoch;
+        sample.progress.phase = crate::generated::TrainingPhase::EpochComplete;
+        sample.progress.val = sample.progress.artifact.as_ref().unwrap().evaluation.clone();
+        model.workflow.training.as_mut().unwrap().sources.observations = vec![sample];
+        let mut fixture = super::TrainingFixture::new(&model).unwrap();
+        for (stage, modelid, original) in [(0, 1, 10), (1, 2, 11), (2, 2, 11), (3, 0, 12)] {
+            fixture.select(stage);
+            let (source, sequence, dropped, observation) = fixture.metrics.retained_source_facts().unwrap();
+            assert_eq!((source.modelid, sequence, dropped, observation), (modelid, 103, 7, original));
+            let facts = crate::view::workflow::fields::execution_facts(FeatureId::Train, false, &fixture.model, &fixture.settings);
+            assert_eq!(facts.is_none(), stage == 2);
+            if let Some(facts) = facts { assert_eq!(facts.effectivebatchpermodel, 6); }
+            let _rendered = fixture.view();
+        }
+    }
 
     fn advance_workflow(
         controller: &mut Controller,
@@ -1274,7 +1424,7 @@ impl State {
             }
             ProbeOutcome::Observed(sampled, visible) if sampled > 0 && visible >= 12 => {
                 self.pixel_attempts = 0;
-                if !matches!(picture, Picture::Gallery | Picture::Confidence) {
+                if !matches!(picture, Picture::Gallery | Picture::Confidence | Picture::Sources) {
                     reporting::emit(|sink| {
                         sink.record(
                             "integration.workflow.pixels",
@@ -1289,6 +1439,13 @@ impl State {
                         )
                     });
                 }
+                if picture == Picture::Sources {
+                    let Some(fixture) = &self.source_fixture else { driver.fail("Missing training source fixture"); return; };
+                    let Some((source, sequence, dropped, observation)) = fixture.metrics.retained_source_facts() else { driver.fail("Training fixture lost retained observations"); return; };
+                    if sequence != 103 || dropped != 7 { driver.fail("Training fixture changed current sequence/drop facts"); return; }
+                    reporting::emit(|sink| sink.record("integration.training_sources", "train.metrics.plot", "retained-pixels",
+                        [f64::from(index), source.modelid as f64, sequence as f64, observation as f64]));
+                }
                 if picture == Picture::Validation && self.restoration_pixels {
                     reporting::emit(|sink| sink.record(
                         "integration.validation_restored_tile", &picture.control(index), "pixels",
@@ -1300,7 +1457,9 @@ impl State {
                     Picture::Confidence if index < 8 => Step::ConfidenceEdit(index + 1),
                     Picture::Confidence => Step::ConfidenceLayer(true),
                     Picture::Progress => Step::LeaveTrain,
-                    Picture::Train => Step::NoImageWorkspace,
+                    Picture::Train => Step::TrainingFixture(0),
+                    Picture::Sources if index < 3 => Step::TrainingFixture(index + 1),
+                    Picture::Sources => { self.source_fixture = None; Step::NoImageWorkspace },
                     Picture::Validation if index < 5 => Step::Pixels(picture, index + 1),
                     Picture::Validation if self.restoration_pixels => {
                         self.restoration_pixels = false;
@@ -1918,6 +2077,12 @@ impl State {
                     driver,
                     crate::view::navigation::stable_id(FeatureId::Train),
                 ),
+            Step::TrainingFixture(index) => {
+                if self.source_fixture.is_none() { self.source_fixture = TrainingFixture::new(model); }
+                let Some(fixture) = &mut self.source_fixture else { driver.fail("Native training fixture template unavailable"); return Task::none(); };
+                fixture.select(index);
+                self.workflow_step(driver, Step::Pixels(Picture::Sources, index))
+            }
             Step::StartTrain
                 if active == FeatureId::Train
                     && settled

@@ -6,6 +6,7 @@ use crate::view_model::ApplicationModel;
 use iced::widget::{button, column, container, text};
 
 mod advanced;
+mod lanes;
 pub(crate) mod dataset;
 pub mod output;
 mod progress;
@@ -44,6 +45,7 @@ pub enum Message {
     RetryReconciliationRequested,
     Dataset(dataset::Message),
     Advanced(advanced::Message),
+    Lanes(lanes::Message),
     Model(crate::view::workflow::model_card::Message),
     Metrics(crate::view::metrics::Message),
     Output(output::Message),
@@ -183,6 +185,10 @@ impl Component {
                 dataset::Outcome::Compile => Outcome::CompileRequested,
                 dataset::Outcome::Stop => Outcome::DatasetStopRequested,
             },
+            Message::Lanes(message) => {
+                let Some(schedule) = lanes::update(model, message)? else { return Ok(None); };
+                Outcome::SettingsEdited(schedule)
+            }
             Message::Advanced(message) => {
                 Outcome::SettingsEdited(advanced::update(model, message)?)
             }
@@ -215,6 +221,7 @@ impl Component {
             .as_ref()
             .map(|settings| &settings.workflows.train);
         let settings_edit_available = settings.draft.is_some() && model.settings_edit_available();
+        let execution_edit_available = settings_edit_available && !model.primary_action_active(crate::generated::FeatureId::Train);
         let settings_settled = !settings.has_local_edits();
         let offers = model
             .workflow
@@ -243,7 +250,7 @@ impl Component {
                     settings.draft.as_ref(),
                     model.model_snapshot.as_ref(),
                     model.file_dialog.as_ref(),
-                    settings_edit_available,
+                    execution_edit_available,
                     settings_settled
                         && settings.draft.as_ref().is_some_and(|draft| {
                             model.model_selection_available(
@@ -253,7 +260,7 @@ impl Component {
                         }),
                     model.model_stop_available(),
                 ),
-                continuation_controls(model, installed_train, settings_edit_available),
+                continuation_controls(model, installed_train, execution_edit_available),
                 Message::Model
             ),
             dataset::view(
@@ -313,10 +320,27 @@ impl Component {
             center = center.push(progress::view(model));
         }
         let workspace = center.into();
+        let mut distribution = column![].spacing(6);
+        if let Some(training) = &model.workflow.training {
+            for facts in &training.sources.distributions {
+                distribution = distribution.push(text(format!(
+                    "Model {} · epoch {} · {} unique images · {} scheduled draws · {} class support · {} class exposure · {} missing classes · {} unused tail",
+                    facts.modelid, facts.epoch + 1, facts.uniqueimages, facts.scheduleddraws,
+                    facts.uniqueclasssupport, facts.repeatedclassexposure, facts.missingclasses, facts.unusedtail,
+                )).size(12));
+            }
+        }
+        let editable = execution_edit_available;
+        let lane_controls: Element<'_, Message> = installed_train.map_or_else(
+            || text("Training settings unavailable").into(),
+            |train| lanes::view(&train.request, settings, editable).map(Message::Lanes),
+        );
         let advanced = crate::view::shared::identified(
             "train.card.advanced",
-            advanced::view(installed_train, settings, settings_edit_available)
-                .map(Message::Advanced),
+            iced::widget::keyed_column([(settings.recipe_model, column![
+                distribution, lane_controls,
+                advanced::view(installed_train, settings, editable, model).map(Message::Advanced),
+            ].into())]),
         );
         let diagnostics = Some(crate::view::shared::identified(
                     "train.card.remote",

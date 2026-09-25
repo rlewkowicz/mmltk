@@ -972,10 +972,10 @@ TEST_CASE("Train process client observes bounded output and inotify progress", "
  REQUIRE(progress->metrics);
  CHECK(progress->metrics->sequence == 8);
  CHECK(progress->metrics->progress.phase == mmltk::backend::models::rfdetr::TrainingPhase::Train);
- REQUIRE(progress->representative_observation);
- CHECK(progress->representative_observation->sequence == 3);
- CHECK(progress->representative_observation->progress.artifact->path == "scheduled-ema.pt");
- CHECK(progress->representative_observation->progress.val->bbox.ap == .75);
+ REQUIRE(progress->sources.observations.size() == 1);
+ CHECK(progress->sources.observations.front().sequence == 3);
+ CHECK(progress->sources.observations.front().progress.artifact->path == "scheduled-ema.pt");
+ CHECK(progress->sources.observations.front().progress.val->bbox.ap == .75);
  REQUIRE(ready(client.pid_fd()));
  const auto terminal = client.consume_exit();
  REQUIRE(terminal.has_value());
@@ -1018,7 +1018,7 @@ TEST_CASE("Train process client rejects oversized public checkpoint paths", "[gu
  CHECK_THROWS(client.consume_progress());
 }
 TEST_CASE("Train process client admits only bounded identified retained observations", "[gui][services]") {
- for (const auto mode : {"invalid-observation", "future-observation"}) {
+ for (const auto mode : {"invalid-observation", "future-observation", "foreign-observation", "duplicate-observation", "inconsistent-observation", "foreign-current-session", "premature-selected", "missing-selected-validation", "mismatched-selected-validation"}) {
   mmltk::testsupport::ScopedTempDir temp("mmltk-train-observation-bound");
   const auto output = temp.path() / "output";
   const auto executable = script(temp,

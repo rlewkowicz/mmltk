@@ -11,13 +11,21 @@ constexpr std::size_t manifest_bytes = r::kTrainingManifestBytes;
 constexpr std::size_t line_bytes = r::kTrainingRecordBytes;
 constexpr std::size_t page_bytes = 2U * r::kTrainingRecordBytes;
 constexpr serial::wire::Limits record_limits{.max_bytes = line_bytes, .max_items = 8192, .max_depth = 32};
-r::TrainingRun ReadRun(const std::filesystem::path& directory) {
- std::ifstream input(directory / "run.json", std::ios::binary);
- if (!input || !std::filesystem::is_regular_file(directory / "metrics.jsonl")) throw std::runtime_error("output directory has no supported current run.json/metrics.jsonl history");
- std::string text(manifest_bytes + 1, '\0');
+template<class Value>
+Value ReadFacts(const std::filesystem::path& path, const std::size_t limit) {
+ const auto identity = mmltk::common::io::FileSnapshot::Read(path);
+ std::ifstream input(path, std::ios::binary);
+ if (!input) throw std::runtime_error("cannot open training facts");
+ std::string text(limit + 1, '\0');
  input.read(text.data(), static_cast<std::streamsize>(text.size()));
  text.resize(static_cast<std::size_t>(input.gcount()));
- const auto run = serial::decode_reflected_json<r::TrainingRun>(text, {.max_bytes = manifest_bytes, .max_items = 65536, .max_depth = 32});
+ auto value = serial::decode_reflected_json<Value>(text, {.max_bytes = limit, .max_items = 65536, .max_depth = 32});
+ identity.RequireUnchanged(path);
+ return value;
+}
+r::TrainingRun ReadRun(const std::filesystem::path& directory) {
+ if (!std::filesystem::is_regular_file(directory / "metrics.jsonl")) throw std::runtime_error("output directory has no supported current metrics.jsonl history");
+ const auto run = ReadFacts<r::TrainingRun>(directory / "run.json", manifest_bytes);
  if (run.format_version != r::kTrainingRunFormat || run.run_id.empty() || run.attempt_id.empty() ||
      run.evaluated_weights != (run.configuration.use_ema ? r::EvaluatedWeights::Ema : r::EvaluatedWeights::Ordinary))
   throw std::runtime_error("unsupported or inconsistent training run format");
@@ -32,8 +40,15 @@ r::TrainingOpenedRun TrainRunStore::Open(const std::filesystem::path& directory)
  run_.reset();
  metrics_ = {};
  directory_ = canonical;
- if (!std::filesystem::exists(canonical / "run.json") && !std::filesystem::exists(canonical / "metrics.jsonl")) return {generation_, directory_, std::nullopt};
+ if (!std::filesystem::exists(canonical / "run.json") && !std::filesystem::exists(canonical / "metrics.jsonl")) return {generation_, directory_, std::nullopt, std::nullopt};
  auto run = ReadRun(canonical);
+ std::optional<r::TrainingSelection> selected;
+ if (std::filesystem::exists(canonical / "selected.json")) {
+  selected = ReadFacts<r::TrainingSelection>(canonical / "selected.json", r::kTrainingSelectionBytes);
+  r::validate_training_selection(*selected);
+  if (selected->artifact.session_id != run.run_id) throw std::runtime_error("selected output belongs to another training session");
+ }
+ if (run.sources != r::training_source_catalog(run.configuration)) throw std::runtime_error("training history source catalog differs from its admitted configuration");
  const auto identity = mmltk::common::io::FileSnapshot::Read(canonical / "metrics.jsonl");
  std::ifstream stream(canonical / "metrics.jsonl", std::ios::binary);
  if (!stream) throw std::runtime_error("cannot open current training history");
@@ -45,7 +60,7 @@ r::TrainingOpenedRun TrainRunStore::Open(const std::filesystem::path& directory)
  metrics_ = std::move(stream);
  line_.clear();
  line_.reserve(line_bytes);
- return {generation_, directory_, std::move(run)};
+ return {generation_, directory_, std::move(run), std::move(selected)};
 }
 r::TrainingHistoryPage TrainRunStore::Read(const r::TrainingHistoryQuery& query) {
  if (!run_ || query.generation != generation_) throw std::runtime_error("training history query refers to a stale directory");

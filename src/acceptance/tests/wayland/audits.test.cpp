@@ -2798,3 +2798,17 @@ TEST_CASE("workflow GPU evidence requires ordered cards and selected native runs
  }
  CHECK_FALSE(audit.workflow_gpus_complete());
 }
+
+TEST_CASE("training source pixels require stable identity and original observations after coalescing and reconnect", "[workspace][audit][training]") {
+ mmltk::acceptance::wayland::BrowserAudit audit;
+ const std::array<std::array<unsigned, 4>, 4> stages{{{0, 1, 103, 10}, {1, 2, 103, 11}, {2, 2, 103, 11}, {3, 0, 103, 12}}};
+ CHECK_FALSE(audit.training_sources_complete());
+ for (const auto& values : stages) audit.consume({{"event", "integration.training_sources"}, {"control", "train.metrics.plot"}, {"detail", "retained-pixels"},
+  {"a", values[0]}, {"b", values[1]}, {"c", values[2]}, {"d", values[3]}});
+ REQUIRE(audit.training_sources_complete());
+ SECTION("duplicate cannot satisfy bounded evidence") { audit.training_sources.push_back(audit.training_sources.back()); }
+ SECTION("coalesced current is not an original observation") { audit.training_sources[1][3] = 103; }
+ SECTION("reconnect retains nondefault selection") { audit.training_sources[2][1] = 1; }
+ SECTION("synchronized records have their own identity") { audit.training_sources[3][1] = 2; }
+ CHECK_FALSE(audit.training_sources_complete());
+}
