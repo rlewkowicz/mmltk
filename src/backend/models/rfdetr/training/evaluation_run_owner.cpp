@@ -48,7 +48,7 @@
 #include <torch/types.h>
 #include <torch/serialize.h>
 #include "detail/evaluation_runtime.h"
-#include "src/backend/models/rfdetr/inference/detail/inference_lanes.h"
+#include "src/backend/models/rfdetr/core/inference_lanes.h"
 import mmltk.backend.ml.cuda.gpu_quiescence;
 import mmltk.backend.models.rfdetr.core.dataset_limit_resolution;
 import mmltk.common.logging.profile_utils;
@@ -412,7 +412,7 @@ RuntimeConfig validation_runtime_config(const TrainRequest& options, const Runti
 struct TrainingValidationRuntime::Impl {
  struct ForwardLane final {
   std::shared_ptr<NativeRfDetrModel> model;
-  std::unique_ptr<ClassPostprocessLane> classes;
+  std::unique_ptr<PostprocessLane> postprocess;
   BatchStaticTensors batch;
   std::unique_ptr<GpuBatchPreprocessor> preprocessor;
   std::unique_ptr<TargetScratch> targets;
@@ -539,7 +539,7 @@ ExecutionFacts TrainingValidationRuntime::execution_facts() const { return impl_
 std::size_t TrainingValidationRuntime::admit_lane() { return impl_->active_ = impl_->pool_->Admit(); }
 std::uintptr_t TrainingValidationRuntime::active_stream() const { return impl_->pool_->stream(impl_->active_).native_handle; }
 NativeRfDetrModel& TrainingValidationRuntime::active_model() { return *impl_->forward_.at(impl_->active_)->model; }
-ClassPostprocessLane& TrainingValidationRuntime::active_classes() { return *impl_->forward_.at(impl_->active_)->classes; }
+PostprocessLane& TrainingValidationRuntime::active_postprocess() { return *impl_->forward_.at(impl_->active_)->postprocess; }
 TrainingEventOwner& TrainingValidationRuntime::events() { return *impl_->events_; }
 void TrainingValidationRuntime::submitted() { impl_->pool_->Submitted(impl_->active_); }
 void TrainingValidationRuntime::release_oldest() { static_cast<void>(impl_->pool_->WaitOldest()); impl_->pool_->ReleaseOldest(); }
@@ -559,8 +559,8 @@ void TrainingValidationRuntime::bind_model(const NativeRfDetrModel& model, std::
   torch_cuda::TorchCudaStreamGuard stream_guard(torch_cuda::getStreamFromExternal(reinterpret_cast<cudaStream_t>(stream.native_handle), impl_->runtime_.execution().device));
   if (index != 0) lane.model = impl_->forward_.front()->model->make_inference_clone(static_cast<std::int32_t>(impl_->batch_size_), impl_->compilation_mode_);
   lane.model->configure_supervision_timing({torch_cuda::cuda_device(impl_->runtime_.execution().device), 1, mmltk::common::logging::profile_enabled()});
-  lane.classes = std::make_unique<ClassPostprocessLane>(lane.model->class_layout());
-  lane.classes->Prepare(lane.model->parameters().front().device());
+  lane.postprocess = std::make_unique<PostprocessLane>(lane.model->class_layout());
+  lane.postprocess->Prepare(lane.model->parameters().front().device());
   impl_->pool_->ReleaseSource(index);
  }
  impl_->source_ = &model; impl_->version_ = version; impl_->weights_ = weights;
@@ -670,7 +670,7 @@ EvalPassResult evaluate_model(const TrainRequest& options, TrainingValidationRun
   const auto forward_stream = validation.active_stream();
   torch_cuda::TorchCudaStreamGuard forward_guard(torch_cuda::getStreamFromExternal(reinterpret_cast<cudaStream_t>(forward_stream), options.device_id));
   auto& forward_model = validation.active_model();
-  auto& evaluation_classes = validation.active_classes();
+  auto& evaluation_postprocess = validation.active_postprocess();
   mmltk::common::logging::ScopedProfile profile_rfdetr_train_eval_batch{"rfdetr.train.eval.batch"};
   {
    mmltk::common::logging::ScopedProfile profile_rfdetr_train_eval_wait_batch{"rfdetr.train.eval.wait_batch"};
@@ -776,7 +776,7 @@ EvalPassResult evaluate_model(const TrainRequest& options, TrainingValidationRun
    mmltk::common::logging::ScopedProfile profile_rfdetr_train_eval_postprocess{"rfdetr.train.eval.postprocess"};
    if (batch_timing) { evaluation_run.record_timing_start(batch_timing, EvaluationCudaBatchTiming::Phase::Postprocess, evaluation_stream); }
    PostprocessedBatch postprocessed = postprocess_output_batch_fixed_size(OutputTensors{evaluated_outputs->main.pred_logits, evaluated_outputs->main.pred_boxes, evaluated_outputs->main.pred_masks},
-    static_cast<int64_t>(loader.image_height()), static_cast<int64_t>(loader.image_width()), model.config().num_select, &evaluation_classes);
+    static_cast<int64_t>(loader.image_height()), static_cast<int64_t>(loader.image_width()), model.config().num_select, &evaluation_postprocess);
    for (std::size_t image = 0; image < batch.num_images; ++image) {
     const auto geometry = loader.geometry(static_cast<std::uint32_t>(prediction_metadata[image].dataset_index));
     clip_prediction_boxes_(postprocessed.boxes[image], geometry.offset_x, geometry.offset_y, geometry.offset_x + geometry.resized_width, geometry.offset_y + geometry.resized_height);

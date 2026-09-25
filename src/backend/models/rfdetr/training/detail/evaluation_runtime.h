@@ -300,7 +300,7 @@ public:
  [[nodiscard]] std::size_t admit_lane();
  [[nodiscard]] std::uintptr_t active_stream() const;
  [[nodiscard]] NativeRfDetrModel& active_model();
- [[nodiscard]] ClassPostprocessLane& active_classes();
+ [[nodiscard]] PostprocessLane& active_postprocess();
  [[nodiscard]] TrainingEventOwner& events();
  void submitted();
  void release_oldest();

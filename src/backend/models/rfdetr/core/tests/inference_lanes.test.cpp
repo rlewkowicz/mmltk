@@ -1,4 +1,4 @@
-#include "src/backend/models/rfdetr/inference/detail/inference_lanes.h"
+#include "src/backend/models/rfdetr/core/inference_lanes.h"
 #include "src/backend/ml/torch/tests/catch_support.h"
 #include "src/test_support/cuda_test_utils.hpp"
 #include <cuda_runtime_api.h>

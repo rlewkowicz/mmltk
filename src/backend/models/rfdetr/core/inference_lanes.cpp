@@ -1,4 +1,4 @@
-#include "detail/inference_lanes.h"
+#include "src/backend/models/rfdetr/core/inference_lanes.h"
 #include "src/frameworks/gpu/terminal_cuda_retirement_owner.h"
 #include "src/frameworks/gpu/cuda_priority.h"
 #include "src/frameworks/gpu/cuda_context_scope.h"

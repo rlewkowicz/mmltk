@@ -49,6 +49,7 @@ mmltk_register_public_headers(
         detection_ops.h
         sample_output.h
         execution_precision.h
+        inference_lanes.h
         postprocess.h
         gpu_batch_preprocessor.h)
 mmltk_register_private_headers(mmltk_backend_models_rfdetr_core detail/class_artifact_files.h)
@@ -58,6 +59,7 @@ mmltk_register_ordinary_sources(
     artifact_publication.cpp
     class_artifact.cpp
     class_layout.cpp
+    inference_lanes.cpp
     python_checkpoint_bridge.cpp
     model_state.cpp
     training_mask_loss.cpp)
@@ -148,6 +150,7 @@ target_link_libraries(mmltk_backend_models_rfdetr_core
         nlohmann_json
         stb
 )
+mmltk_link_declarations(mmltk_backend_models_rfdetr_core PUBLIC mmltk::backend::ml::runtime)
 mmltk_enable_torch(mmltk_backend_models_rfdetr_core PUBLIC)
 if(BUILD_RFDETR_PYTHON_CHECKPOINT_LOADER)
     mmltk_enable_python_checkpoint_loader(
@@ -238,6 +241,8 @@ function(mmltk_add_backend_models_rfdetr_core_tests)
         EXCLUDE_FROM_ALL)
     mmltk_configure_component(
         mmltk_backend_models_rfdetr_core_tests PRIVATE_DECLARATIONS)
+    mmltk_register_ordinary_sources(mmltk_backend_models_rfdetr_core_tests
+        ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/inference_lanes.test.cpp)
     mmltk_register_retained_module_importers(
         mmltk_backend_models_rfdetr_core_tests ${sources})
     target_include_directories(mmltk_backend_models_rfdetr_core_tests PRIVATE

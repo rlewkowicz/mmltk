@@ -242,7 +242,7 @@ struct RfdetrRuntimeBackend::State final {
  std::vector<RfdetrNamedOutputRole> output_roles;
  std::string artifact_sha256;
  std::shared_ptr<const ClassArtifactAdmission> admission;
- std::unique_ptr<ClassPostprocessLane> classes;
+ std::unique_ptr<PostprocessLane> postprocess;
  std::optional<std::size_t> masks;
  std::size_t logits = std::numeric_limits<std::size_t>::max();
  std::size_t boxes = std::numeric_limits<std::size_t>::max();
@@ -262,14 +262,14 @@ RfdetrRuntimeBackend::RfdetrRuntimeBackend(std::shared_ptr<runtime::RuntimeBacke
  state_->artifact_sha256 = mmltk::common::io::sha256_hex(admission->file()->sha256);
  state_->admission = std::move(admission);
  state_->layout->require_execution();
- state_->classes = std::make_unique<ClassPostprocessLane>(state_->layout);
+ state_->postprocess = std::make_unique<PostprocessLane>(state_->layout);
  struct Preparation {
-  ClassPostprocessLane* classes;
+  PostprocessLane* postprocess;
   int device;
- } preparation{state_->classes.get(), lane_->device()};
+ } preparation{state_->postprocess.get(), lane_->device()};
  mmltk::backend::ml::cuda::run_on_torch_cuda_stream(lane_->device(), lane_->command_stream().native_handle, &preparation, [](void* opaque) {
   auto& call = *static_cast<Preparation*>(opaque);
-  call.classes->Prepare(torch::Device(torch::kCUDA, static_cast<c10::DeviceIndex>(call.device)));
+  call.postprocess->Prepare(torch::Device(torch::kCUDA, static_cast<c10::DeviceIndex>(call.device)));
  });
  const auto& model = lane_->model_info();
  auto projected = project_runtime_model(model, backend_name_);
@@ -403,7 +403,7 @@ runtime::RuntimeSubmission RfdetrRuntimeBackend::Run(
         .pred_masks =
          bound_call.include_masks && bound_owner.state_->masks ? std::optional{bound_call.outputs->tensors[*bound_owner.state_->masks].narrow(0, static_cast<std::int64_t>(index), 1)} : std::nullopt,
        },
-       region.height, region.width, static_cast<std::int64_t>(limit), bound_call.include_masks, bound_owner.state_->classes.get());
+       region.height, region.width, static_cast<std::int64_t>(limit), bound_call.include_masks, bound_owner.state_->postprocess.get());
       bound_call.outputs->counts->Publish(index, selected.counts, annotation);
       PostprocessedBatch processed{selected.scores, selected.labels, selected.boxes, std::nullopt};
       if (!bound_call.selections.empty()) {
@@ -474,7 +474,7 @@ runtime::RuntimeStatus RfdetrRuntimeBackend::Close() noexcept {
   }
   state_->selections.clear();
   state_->outputs.reset();
-  state_->classes.reset();
+  state_->postprocess.reset();
   state_->closed = true;
  } catch (...) { return static_cast<runtime::RuntimeStatus>(cudaErrorUnknown); }
  return runtime::kRuntimeSuccess;

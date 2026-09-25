@@ -6,10 +6,12 @@
 // RF-DETR core operation coverage.
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <initializer_list>
 #include <limits>
+#include <memory>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -32,6 +34,7 @@
 #include <torch/types.h>
 #include <torch/serialize.h>
 #include "src/test_support/cuda_test_utils.hpp"
+#include "src/test_support/async_test_utils.hpp"
 #include "src/frameworks/gpu/tests/device_execution_fixture.h"
 #include "src/backend/models/rfdetr/core/runtime.h"
 namespace mmltk::backend::models::rfdetr {
@@ -736,7 +739,7 @@ TEST_CASE("Physical ranking precedes slot filtering and keeps stable query mask 
   std::uint32_t foreground = 0;
   for (std::uint32_t slot = 0; slot < 3; ++slot)
    record.slots[slot] = slot == background ? r::ModelClassSlot{r::ClassSlotRole::Background, std::nullopt} : r::ModelClassSlot{r::ClassSlotRole::Foreground, foreground++};
-  r::ClassPostprocessLane classes(std::make_shared<const r::ResolvedClassLayout>(record));
+  r::PostprocessLane classes(std::make_shared<const r::ResolvedClassLayout>(record));
   classes.Prepare(torch::kCPU);
   r::OutputTensors outputs;
   outputs.pred_logits = torch::full({1, 2, 3}, -8.F);
@@ -760,7 +763,7 @@ TEST_CASE("Physical ranking precedes slot filtering and keeps stable query mask 
   CHECK(materialized[0][0].all().item<bool>());
   CHECK_FALSE(materialized[0][1].any().item<bool>());
  }
- r::ClassPostprocessLane empty(std::make_shared<const r::ResolvedClassLayout>(r::native_training_class_layout(catalog::ClassCatalog{})));
+ r::PostprocessLane empty(std::make_shared<const r::ResolvedClassLayout>(r::native_training_class_layout(catalog::ClassCatalog{})));
  empty.Prepare(torch::kCPU);
  r::OutputTensors outputs{.pred_logits = torch::full({1, 2, 1}, 100.F), .pred_boxes = torch::zeros({1, 2, 4})};
  const auto empty_selection = r::select_output_batch_fixed_size(outputs, 10, 20, 500, false, &empty);
@@ -778,11 +781,11 @@ TEST_CASE("Physical ranking precedes slot filtering and keeps stable query mask 
  outputs.pred_logits = torch::zeros({1, 2, 2});
  CHECK_THROWS(r::select_output_batch_fixed_size(outputs, 10, 20, 500, false, &empty));
 }
-TEST_CASE("Class lanes retain physical ties, permutation, sparse COCO and independent final results", "[model][rfdetr][layout]") {
+TEST_CASE("Postprocess lanes retain physical ties, permutation, sparse COCO and independent final results", "[model][rfdetr][layout]") {
  namespace r = mmltk::backend::models::rfdetr;
  auto record = r::native_training_class_layout(mmltk::backend::data::catalog::ClassCatalog({"cat", "dog"}));
  record.slots = {{r::ClassSlotRole::Foreground, 1U}, {r::ClassSlotRole::Unused, {}}, {r::ClassSlotRole::Foreground, 0U}};
- r::ClassPostprocessLane lane(std::make_shared<const r::ResolvedClassLayout>(record));
+ r::PostprocessLane lane(std::make_shared<const r::ResolvedClassLayout>(record));
  lane.Prepare(torch::kCPU);
  const auto logits = torch::zeros({1, 2, 3});
  CHECK(lane.ValidateLogits(logits).data_ptr() == logits.data_ptr());
@@ -797,7 +800,7 @@ TEST_CASE("Class lanes retain physical ties, permutation, sparse COCO and indepe
  const auto next = r::select_output_batch_fixed_size(outputs, 8, 8, 4, false, &lane);
  CHECK(torch::equal(first.labels, saved));
  CHECK(first.labels.data_ptr() != next.labels.data_ptr());
- r::ClassPostprocessLane coco(std::make_shared<const r::ResolvedClassLayout>(r::coco_class_layout({r::ClassLayoutOrigin::VerifiedAsset, "fixture", {}})));
+ r::PostprocessLane coco(std::make_shared<const r::ResolvedClassLayout>(r::coco_class_layout({r::ClassLayoutOrigin::VerifiedAsset, "fixture", {}})));
  coco.Prepare(torch::kCPU);
  outputs.pred_logits = torch::full({1, 1, 91}, -8.F);
  outputs.pred_logits[0][0][0] = 9.F;
@@ -814,7 +817,7 @@ TEST_CASE("Class lanes retain physical ties, permutation, sparse COCO and indepe
  const auto discarded = r::select_output_batch_fixed_size(outputs, 10, 20, 2, false, &coco);
  CHECK(discarded.counts.item<int64_t>() == 0);
  CHECK(discarded.scores.size(1) == 2);
- r::ClassPostprocessLane raw(std::make_shared<const r::ResolvedClassLayout>(r::unresolved_class_layout(91)));
+ r::PostprocessLane raw(std::make_shared<const r::ResolvedClassLayout>(r::unresolved_class_layout(91)));
  raw.Prepare(torch::kCPU);
  const auto unresolved = r::select_output_batch_fixed_size(outputs, 10, 20, 3, false, &raw);
  CHECK(unresolved.counts.item<int64_t>() == 3);
@@ -826,10 +829,10 @@ TEST_CASE("Class lanes retain physical ties, permutation, sparse COCO and indepe
  r::clip_prediction_boxes_(boxes, 2, 4, 18, 9);
  CHECK(torch::equal(boxes, torch::tensor({2.F, 4.F, 18.F, 9.F}).view({1, 4})));
 }
-TEST_CASE("Class lane device and stream rebind retains earlier final references", "[model][rfdetr][layout][gpu]") {
+TEST_CASE("Postprocess lane device and stream rebind retains earlier final references", "[model][rfdetr][layout][gpu]") {
  namespace r = mmltk::backend::models::rfdetr;
  auto record = r::native_training_class_layout(mmltk::backend::data::catalog::ClassCatalog({"cat"}));
- r::ClassPostprocessLane lane(std::make_shared<const r::ResolvedClassLayout>(record));
+ r::PostprocessLane lane(std::make_shared<const r::ResolvedClassLayout>(record));
  const auto first_stream = c10::cuda::getStreamFromPool(false, 0);
  const auto second_stream = c10::cuda::getStreamFromPool(false, 0);
  torch::Tensor first;
@@ -849,6 +852,121 @@ TEST_CASE("Class lane device and stream rebind retains earlier final references"
   c10::cuda::CUDAStreamGuard guard(first_stream);
   CHECK(first.cpu().item<int64_t>() == 0);
  }
+}
+TEST_CASE("Postprocess CPU scale retains storage and preserves valid geometry on construction failure", "[model][rfdetr][native_ops]") {
+ namespace r = mmltk::backend::models::rfdetr;
+ r::PostprocessLane lane(std::make_shared<const r::ResolvedClassLayout>(r::unresolved_class_layout(2)));
+ lane.Prepare(torch::kCPU);
+ r::OutputTensors outputs{.pred_logits = torch::zeros({1, 1, 2}), .pred_boxes = torch::ones({1, 1, 4}, torch::kFloat16)};
+ const auto first = r::select_output_batch_fixed_size(outputs, 10, 20, 2, false, &lane);
+ // Keep the actual allocation alive: a replacement cannot recycle its address.
+ const auto original_scale = lane.RetainedBoxScale();
+ REQUIRE(original_scale.defined());
+ CHECK(original_scale.scalar_type() == torch::kFloat32);
+ CHECK(torch::equal(original_scale, torch::tensor({20.F, 10.F, 20.F, 10.F}).view({1, 1, 4})));
+ const auto repeated = r::select_output_batch_fixed_size(outputs, 10, 20, 2, false, &lane);
+ CHECK(lane.RetainedBoxScale().data_ptr() == original_scale.data_ptr());
+ CHECK(torch::equal(first.boxes, repeated.boxes));
+ CHECK(torch::equal(first.boxes, r::select_output_batch_fixed_size(outputs, 10, 20, 2).boxes));
+ const auto changed = r::select_output_batch_fixed_size(outputs, 30, 40, 2, false, &lane);
+ const auto changed_scale = lane.RetainedBoxScale();
+ CHECK(changed_scale.data_ptr() != original_scale.data_ptr());
+ CHECK(torch::equal(changed.boxes[0][0], torch::tensor({20.F, 15.F, 40.F, 30.F})));
+ CHECK(torch::equal(first.boxes[0][0], torch::tensor({10.F, 5.F, 20.F, 10.F})));
+ // Dense scale construction cannot use sparse tensor options. Its failure must
+ // leave both the old tensor and its matching geometry available for reuse.
+ const auto sparse = outputs.pred_boxes.to(torch::kFloat32).to_sparse();
+ CHECK_THROWS(lane.BoxScale(sparse, 50, 60));
+ CHECK(lane.RetainedBoxScale().data_ptr() == changed_scale.data_ptr());
+ CHECK(lane.BoxScale(outputs.pred_boxes, 30, 40).data_ptr() == changed_scale.data_ptr());
+ CHECK(torch::equal(changed_scale, torch::tensor({40.F, 30.F, 40.F, 30.F}).view({1, 1, 4})));
+}
+TEST_CASE("Postprocess lanes retain scale allocations across round-robin CUDA selections", "[model][rfdetr][native_ops][gpu]") {
+ namespace r = mmltk::backend::models::rfdetr;
+ if (mmltk::testsupport::checked_cuda_device_count() == 0) SKIP("CUDA device unavailable; lane storage coverage remains unverified");
+ const auto layout = std::make_shared<const r::ResolvedClassLayout>(r::unresolved_class_layout(2));
+ constexpr std::size_t lane_count = 3;
+ std::array<r::PostprocessLane, lane_count> lanes{r::PostprocessLane(layout), r::PostprocessLane(layout), r::PostprocessLane(layout)};
+ const std::array streams{c10::cuda::getStreamFromPool(false, 0), c10::cuda::getStreamFromPool(false, 0), c10::cuda::getStreamFromPool(false, 0)};
+ std::array<r::OutputTensors, lane_count> outputs;
+ std::array<torch::Tensor, lane_count> retained_scales;
+ std::array<std::array<r::PostprocessedSelection, lane_count>, 4> selections;
+ for (std::size_t index = 0; index < lanes.size(); ++index) {
+  c10::cuda::CUDAStreamGuard guard(streams[index]);
+  lanes[index].Prepare(torch::Device(torch::kCUDA, 0));
+  const auto options = torch::TensorOptions().device(torch::kCUDA, 0).dtype(torch::kFloat16);
+  outputs[index] = {.pred_logits = torch::zeros({1, 1, 2}, options), .pred_boxes = torch::ones({1, 1, 4}, options)};
+ }
+ for (std::size_t round = 0; round < selections.size(); ++round) {
+  for (std::size_t index = 0; index < lanes.size(); ++index) {
+   c10::cuda::CUDAStreamGuard guard(streams[index]);
+   selections[round][index] = r::select_output_batch_fixed_size(outputs[index], 80, 160, 2, false, &lanes[index]);
+   const auto scale = lanes[index].RetainedBoxScale();
+   REQUIRE(scale.defined());
+   CHECK(scale.scalar_type() == torch::kFloat32);
+   if (round == 0) retained_scales[index] = scale;
+   CHECK(scale.data_ptr() == retained_scales[index].data_ptr());
+  }
+ }
+ for (std::size_t index = 0; index < lanes.size(); ++index) {
+  c10::cuda::CUDAStreamGuard guard(streams[index]);
+  CHECK(retained_scales[index].data_ptr() != retained_scales[(index + 1) % lanes.size()].data_ptr());
+  CHECK(torch::equal(retained_scales[index].cpu(), torch::tensor({160.F, 80.F, 160.F, 80.F}).view({1, 1, 4})));
+  for (const auto& round : selections) {
+   CHECK(torch::equal(round[index].boxes.cpu(), torch::tensor({80.F, 40.F, 160.F, 80.F}).view({1, 1, 4}).expand({1, 2, 4})));
+   CHECK(torch::equal(round[index].labels.cpu(), torch::tensor({{0L, 1L}}, torch::kInt64)));
+  }
+ }
+}
+TEST_CASE("Postprocess scale replacement retains pending reads through geometry stream and device changes", "[model][rfdetr][native_ops][gpu][custody]") {
+ namespace r = mmltk::backend::models::rfdetr;
+ if (mmltk::testsupport::checked_cuda_device_count() == 0) SKIP("CUDA device unavailable; pending scale custody coverage remains unverified");
+ r::PostprocessLane lane(std::make_shared<const r::ResolvedClassLayout>(r::unresolved_class_layout(2)));
+ const auto first_stream = c10::cuda::getStreamFromPool(false, 0);
+ const auto second_stream = c10::cuda::getStreamFromPool(false, 0);
+ c10::cuda::CUDAStreamGuard first_guard(first_stream);
+ const auto boxes = torch::empty({1, 1, 4}, torch::TensorOptions().device(torch::kCUDA, 0));
+ const auto original_scale = lane.BoxScale(boxes, 10, 20);
+ const auto pending_copy = torch::empty_like(original_scale);
+ // Warm the second stream's allocator before holding an unfinished first read.
+ {
+  c10::cuda::CUDAStreamGuard second_guard(second_stream);
+  const auto warm = torch::empty_like(original_scale);
+ }
+ first_stream.synchronize();
+ second_stream.synchronize();
+ mmltk::testsupport::TestGate gate("pending postprocess scale read");
+ auto receipt = std::make_unique<mmltk::testsupport::TestGate::Receipt>(gate.receipt());
+ REQUIRE(cudaLaunchHostFunc(first_stream.stream(), [](void* value) {
+  std::unique_ptr<mmltk::testsupport::TestGate::Receipt> read(static_cast<mmltk::testsupport::TestGate::Receipt*>(value));
+  read->ArriveAndWait();
+ }, receipt.get()) == cudaSuccess);
+ static_cast<void>(receipt.release());
+ const mmltk::testsupport::ScopedTestCleanup settle([&] {
+  gate.Release();
+  static_cast<void>(cudaStreamSynchronize(first_stream.stream()));
+  static_cast<void>(cudaStreamSynchronize(second_stream.stream()));
+ });
+ REQUIRE(gate.WaitEntered(std::chrono::seconds{5}));
+ REQUIRE(cudaMemcpyAsync(pending_copy.data_ptr(), original_scale.data_ptr(), 4 * sizeof(float), cudaMemcpyDeviceToDevice, first_stream.stream()) == cudaSuccess);
+ {
+  c10::cuda::CUDAStreamGuard second_guard(second_stream);
+  const auto rebound = lane.BoxScale(boxes, 10, 20);
+  CHECK(rebound.data_ptr() != original_scale.data_ptr());
+  CHECK(lane.BoxScale(boxes, 10, 20).data_ptr() == rebound.data_ptr());
+  const auto changed = lane.BoxScale(boxes, 30, 40);
+  CHECK(changed.data_ptr() != rebound.data_ptr());
+  CHECK(torch::equal(rebound.cpu(), torch::tensor({20.F, 10.F, 20.F, 10.F}).view({1, 1, 4})));
+  CHECK(torch::equal(changed.cpu(), torch::tensor({40.F, 30.F, 40.F, 30.F}).view({1, 1, 4})));
+  const auto cpu_scale = lane.BoxScale(torch::empty({0}), 30, 40);
+  CHECK(cpu_scale.device().is_cpu());
+  CHECK(torch::equal(cpu_scale, changed.cpu()));
+ }
+ // Every replacement completed while the original allocation still has a queued read.
+ CHECK(cudaStreamQuery(first_stream.stream()) == cudaErrorNotReady);
+ gate.Release();
+ CHECK(torch::equal(pending_copy.cpu(), torch::tensor({20.F, 10.F, 20.F, 10.F}).view({1, 1, 4})));
+ CHECK(torch::equal(original_scale.cpu(), pending_copy.cpu()));
 }
 TEST_CASE("matcher focal alpha changes dense and CUDA assignments consistently", "[model][rfdetr][matcher]") {
  namespace r = mmltk::backend::models::rfdetr;

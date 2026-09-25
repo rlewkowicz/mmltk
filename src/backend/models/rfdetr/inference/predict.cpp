@@ -13,7 +13,7 @@ module;
 #include "src/frameworks/gpu/device_execution.h"
 #include "src/frameworks/gpu/terminal_cuda_retirement_owner.h"
 #include "dataset_batch_lease.h"
-#include "detail/inference_lanes.h"
+#include "src/backend/models/rfdetr/core/inference_lanes.h"
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -180,8 +180,8 @@ public:
     static_cast<void>(
      PredictionCapacity::Resolve(maximum_detections_, 1U, artifacts_.config.num_queries, artifacts_.config.num_classes, artifacts_.config.resolution, artifacts_.config.resolution, false));
     native_ = std::make_unique<NativeRfDetrModel>(artifacts_.config, artifacts_.class_layout);
-    class_postprocess_ = std::make_unique<ClassPostprocessLane>(native_->class_layout());
-    class_postprocess_->Prepare(torch::Device(torch::kCUDA, static_cast<c10::DeviceIndex>(device_)));
+    postprocess_ = std::make_unique<PostprocessLane>(native_->class_layout());
+    postprocess_->Prepare(torch::Device(torch::kCUDA, static_cast<c10::DeviceIndex>(device_)));
     auto& technical_model = (*native_);
     static_cast<void>(technical_model.load_normalized_state(resolved.model_state.entries(), false));
     technical_model.to(torch::Device(torch::kCUDA, static_cast<c10::DeviceIndex>(device_)));
@@ -237,8 +237,8 @@ public:
  void Clone(const PredictionBackend& source) {
   if (source.native_) {
    native_ = source.native_->make_inference_clone(static_cast<std::int32_t>(requested_batch_), compilation_mode_);
-   class_postprocess_ = std::make_unique<ClassPostprocessLane>(native_->class_layout());
-   class_postprocess_->Prepare(torch::Device(torch::kCUDA, static_cast<c10::DeviceIndex>(device_)));
+   postprocess_ = std::make_unique<PostprocessLane>(native_->class_layout());
+   postprocess_->Prepare(torch::Device(torch::kCUDA, static_cast<c10::DeviceIndex>(device_)));
   } else runtime_ = source.runtime_->MakeLane(command_stream_, retirement_);
  }
  ~PredictionBackend() { static_cast<void>(Close()); }
@@ -310,7 +310,7 @@ public:
     if (status != CUDA_SUCCESS && status != CUDA_ERROR_NOT_READY) return static_cast<runtime::RuntimeStatus>(status);
     count_storage_.reset();
    }
-   class_postprocess_.reset();
+   postprocess_.reset();
    native_.reset();
   }
   return runtime::kRuntimeSuccess;
@@ -340,7 +340,7 @@ private:
      .pred_boxes = outputs.main.pred_boxes.narrow(0, static_cast<std::int64_t>(index), 1),
      .pred_masks = annotations.want_masks && outputs.main.pred_masks ? std::optional{outputs.main.pred_masks->narrow(0, static_cast<std::int64_t>(index), 1)} : std::nullopt,
     },
-    storage.source_region.height, storage.source_region.width, static_cast<std::int64_t>(count), annotations.want_masks, class_postprocess_.get());
+    storage.source_region.height, storage.source_region.width, static_cast<std::int64_t>(count), annotations.want_masks, postprocess_.get());
    const auto active = processed.scores.size(1);
    annotations.boxes[index].narrow(0, 0, active).copy_(processed.boxes[0].to(at::kFloat));
    annotations.labels[index].narrow(0, 0, active).copy_(processed.labels[0].to(at::kInt));
@@ -357,7 +357,7 @@ private:
  ResolvedModelArtifacts artifacts_;
  std::shared_ptr<RfdetrRuntimeBackend> runtime_;
  std::shared_ptr<NativeRfDetrModel> native_;
- std::unique_ptr<ClassPostprocessLane> class_postprocess_;
+ std::unique_ptr<PostprocessLane> postprocess_;
  std::shared_ptr<PredictionCountStorage> count_storage_;
  std::size_t maximum_detections_ = 0U;
  std::uint32_t resolution_ = 0U;

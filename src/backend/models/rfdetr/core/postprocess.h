@@ -14,22 +14,41 @@
 #include "src/backend/models/rfdetr/core/class_layout.h"
 #include "src/backend/models/rfdetr/core/detection_types.h"
 #include <torch/types.h>
-namespace mmltk::backend::models::rfdetr {}
 namespace mmltk::backend::models::rfdetr {
 // Coordinate clipping is independent of corner ordering. Bounds are image content in canvas pixels.
 void clip_prediction_boxes_(const torch::Tensor& boxes, double left, double top, double right, double bottom);
-class ClassPostprocessLane final {
+namespace detail {
+// One immutable allocation for the most recently used device, stream and geometry.
+// Shared by explicit lanes and the bounded classless helper cache.
+class FixedBoxScale final {
 public:
- explicit ClassPostprocessLane(std::shared_ptr<const ResolvedClassLayout> layout) : layout_(std::move(layout)) { layout_->require_execution(); }
+ [[nodiscard]] torch::Tensor Resolve(const torch::Tensor& boxes, int64_t height, int64_t width);
+ [[nodiscard]] const torch::Tensor& retained() const noexcept { return scale_; }
+
+private:
+ torch::Tensor scale_;
+ cudaStream_t stream_ = nullptr;
+ int64_t height_ = 0, width_ = 0;
+};
+}  // namespace detail
+class PostprocessLane final {
+public:
+ explicit PostprocessLane(std::shared_ptr<const ResolvedClassLayout> layout) : layout_(std::move(layout)) { layout_->require_execution(); }
  void Prepare(const torch::Device& device);
  [[nodiscard]] torch::Tensor ValidateLogits(const torch::Tensor& logits) const;
  [[nodiscard]] torch::Tensor References(const torch::Tensor& physical_indices) const;
+ // Read-only storage for use on the calling stream; the returned tensor retains custody.
+ [[nodiscard]] torch::Tensor BoxScale(const torch::Tensor& boxes, int64_t height, int64_t width);
+ // Borrowed handle. Copy to retain an allocation across replacement or lane
+ // destruction; queued reads belong to the stream on which it was prepared.
+ [[nodiscard]] const torch::Tensor& RetainedBoxScale() const noexcept { return box_scale_.retained(); }
  [[nodiscard]] std::size_t eligible_count() const noexcept { return layout_->eligible_count(); }
 
 private:
  std::shared_ptr<const ResolvedClassLayout> layout_;
  torch::Tensor references_;
  cudaStream_t prepared_stream_ = nullptr;
+ detail::FixedBoxScale box_scale_;
 };
 // Fixed-capacity products contain a compact valid prefix described by device counts.
 // Top-k products retain their originating query until the consumer selects survivors.
@@ -42,7 +61,7 @@ struct PostprocessedSelection {
  std::optional<torch::Tensor> mask_logits{};
  torch::Tensor counts{};
 };
-PostprocessedSelection select_output_batch_fixed_size(const OutputTensors&, int64_t height, int64_t width, int64_t count, bool require_masks = false, ClassPostprocessLane* classes = nullptr);
+PostprocessedSelection select_output_batch_fixed_size(const OutputTensors&, int64_t height, int64_t width, int64_t count, bool require_masks = false, PostprocessLane* lane = nullptr);
 // Complete concurrently live scratch: gathered logits, expanded logits, device
 // bools, and host bools. Dense preview storage and encoded records are separate.
 struct SelectedMaskCapacity final {
@@ -83,5 +102,5 @@ struct PostprocessedBatch {
  torch::Tensor counts{};
  [[nodiscard]] int64_t size() const { return scores.defined() ? scores.size(0) : 0; }
 };
-PostprocessedBatch postprocess_output_batch_fixed_size(const OutputTensors& outputs, int64_t target_height, int64_t target_width, int64_t num_select, ClassPostprocessLane* classes = nullptr);
+PostprocessedBatch postprocess_output_batch_fixed_size(const OutputTensors& outputs, int64_t target_height, int64_t target_width, int64_t num_select, PostprocessLane* lane = nullptr);
 }  // namespace mmltk::backend::models::rfdetr
