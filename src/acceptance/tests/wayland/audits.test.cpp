@@ -2801,11 +2801,23 @@ TEST_CASE("workflow GPU evidence requires ordered cards and selected native runs
 
 TEST_CASE("training source pixels require stable identity and original observations after coalescing and reconnect", "[workspace][audit][training]") {
  mmltk::acceptance::wayland::BrowserAudit audit;
- const std::array<std::array<unsigned, 4>, 4> stages{{{0, 1, 103, 10}, {1, 2, 103, 11}, {2, 2, 103, 11}, {3, 0, 103, 12}}};
+ const std::array<std::array<unsigned, 4>, 10> stages{{{0, 1, 103, 10}, {1, 2, 103, 11}, {2, 2, 103, 11}, {3, 0, 103, 12},
+  {4, 1, 6, 4}, {5, 2, 6, 5}, {6, 2, 12, 11}, {7, 2, 12, 11}, {8, 0, 12, 12}, {9, 0, 103, 12}}};
+ const std::array<std::array<unsigned, 4>, 10> runs{{{0, 0, 0, 0}, {1, 0, 0, 0}, {2, 0, 0, 0}, {3, 0, 0, 0},
+  {4, 1, 51, 100}, {5, 1, 51, 100}, {6, 1, 51, 200}, {7, 1, 52, 200}, {8, 1, 52, 200}, {9, 0, 0, 0}}};
  CHECK_FALSE(audit.training_sources_complete());
  for (const auto& values : stages) audit.consume({{"event", "integration.training_sources"}, {"control", "train.metrics.plot"}, {"detail", "retained-pixels"},
   {"a", values[0]}, {"b", values[1]}, {"c", values[2]}, {"d", values[3]}});
+ CHECK_FALSE(audit.training_sources_complete());
+ for (const auto& values : runs) audit.consume({{"event", "integration.training_source_run"}, {"control", "train.metrics.plot"}, {"detail", "retained-pixels"},
+  {"a", values[0]}, {"b", values[1]}, {"c", values[2]}, {"d", values[3]}});
  REQUIRE(audit.training_sources_complete());
+ SECTION("saved source switch cannot change opened generation") { audit.training_source_runs[5][2] = 0; }
+ SECTION("later page preserves nondefault source") { audit.training_sources[6][1] = 1; }
+ SECTION("saved reconnect preserves nondefault source") { audit.training_sources[7][1] = 1; }
+ SECTION("saved reconnect rebinds native generation") { audit.training_source_runs[7][2] = 51; }
+ SECTION("saved paging retains its cursor") { audit.training_source_runs[6][3] = 100; }
+ SECTION("live return retains its independent source") { audit.training_sources[9][1] = 1; }
  SECTION("duplicate cannot satisfy bounded evidence") { audit.training_sources.push_back(audit.training_sources.back()); }
  SECTION("coalesced current is not an original observation") { audit.training_sources[1][3] = 103; }
  SECTION("reconnect retains nondefault selection") { audit.training_sources[2][1] = 1; }

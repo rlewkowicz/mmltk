@@ -82,6 +82,7 @@ struct AtlasDrawAudit final {
 };
 struct BrowserAudit final {
  std::vector<std::array<double, 4>> training_sources;
+ std::vector<std::array<double, 4>> training_source_runs;
  [[nodiscard]] bool training_sources_complete() const;
  std::map<std::pair<std::string, std::string>, std::array<double, 4>> workflow_gpu_layout;
  std::map<std::string, std::array<double, 4>> workflow_gpu_selected;

@@ -798,6 +798,8 @@ auto BrowserAudit::consume(const nlohmann::json& record) -> void {
   validate_to_explore_pixels = record.value("control", "") == kExploreGalleryControl && scalar(record, "a") != 0U && scalar(record, "b") != 0U && record.value("ready_tile", false) &&
                                record.value("matched", false) && record.contains("compiled_index") && width > 0U && width <= 8U && height > 0U && height <= 8U && sampled == width * height &&
                                colored >= 12U && colored <= sampled && colored * 2U >= sampled;
+ } else if (event == "integration.training_source_run" && record.value("control", "") == "train.metrics.plot" && record.value("detail", "") == "retained-pixels") {
+  training_source_runs.push_back({numeric(record, "a", -1), numeric(record, "b", -1), numeric(record, "c", -1), numeric(record, "d", -1)});
  } else if (event == "integration.training_sources" && record.value("control", "") == "train.metrics.plot" && record.value("detail", "") == "retained-pixels") {
   training_sources.push_back({numeric(record, "a", -1), numeric(record, "b", -1), numeric(record, "c", -1), numeric(record, "d", -1)});
  } else if (event == "integration.validation_progressive") {
@@ -2302,8 +2304,11 @@ void BrowserAudit::consume_native_gpu(const nlohmann::json& record) {
  ranks[rank] = device;
 }
 bool BrowserAudit::training_sources_complete() const {
- const std::vector<std::array<double, 4>> expected{{0, 1, 103, 10}, {1, 2, 103, 11}, {2, 2, 103, 11}, {3, 0, 103, 12}};
- return training_sources == expected;
+ const std::vector<std::array<double, 4>> expected{{0, 1, 103, 10}, {1, 2, 103, 11}, {2, 2, 103, 11}, {3, 0, 103, 12},
+  {4, 1, 6, 4}, {5, 2, 6, 5}, {6, 2, 12, 11}, {7, 2, 12, 11}, {8, 0, 12, 12}, {9, 0, 103, 12}};
+ const std::vector<std::array<double, 4>> runs{{0, 0, 0, 0}, {1, 0, 0, 0}, {2, 0, 0, 0}, {3, 0, 0, 0},
+  {4, 1, 51, 100}, {5, 1, 51, 100}, {6, 1, 51, 200}, {7, 1, 52, 200}, {8, 1, 52, 200}, {9, 0, 0, 0}};
+ return training_sources == expected && training_source_runs == runs;
 }
 bool BrowserAudit::workflow_gpus_complete() const {
  if (workflow_gpu_invalid) return false;

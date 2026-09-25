@@ -93,6 +93,8 @@ pub(super) enum Step {
     Train,
     StartTrain,
     TrainingFixture(u8),
+    TrainingFixturePending(u8),
+    TrainingFixtureReady(u8),
     Training,
     LeaveTrain,
     HiddenTrain,
@@ -250,12 +252,56 @@ struct TrainingFixture {
     model: ApplicationModel,
     settings: settings::SettingsModel,
     metrics: crate::view::metrics::Component,
+    saved_run: crate::generated::TrainingOpenedRun,
+    saved_pages: [crate::generated::TrainingHistoryPage; 2],
+    stage: Option<u8>,
 }
 impl TrainingFixture {
     fn new(model: &ApplicationModel) -> Option<Self> {
         use crate::generated::*;
         let mut model = model.clone();
         model.workflow.output = Default::default();
+        let snapshot = model.settings_snapshot.as_mut()?;
+        snapshot.settingsstate.workflows.train.output.automatic = true;
+        snapshot.settingsstate.workflows.train.request.lanes = 2;
+        snapshot.settingsstate.workflows.train.request.batchsize = 2;
+        snapshot.settingsstate.workflows.train.request.gradaccumsteps = 3;
+        snapshot.settingsstate.workflows.train.request.validationlanes = 2;
+        snapshot.settingsstate.workflows.train.request.valbatchsize = 2;
+        let request = &mut snapshot.settingsstate.workflows.train.request;
+        request.useema = true;
+        request.laneconfiguration.mode = TrainLaneMode::PeriodicAveraging;
+        request.laneconfiguration.models = (1..=2).map(|modelid| TrainModelSettings {
+            modelid, seed: 42, recipe: request.recipe.clone(), coefficient: 1.0,
+        }).collect();
+        request.laneconfiguration.nextmodelid = 3;
+        snapshot.settingsstate.workflows.validate.request.lanes = 4;
+        snapshot.settingsstate.workflows.validate.request.batchsize = 2;
+        snapshot.settingsstate.workflows.predict.request.lanes = 2;
+        // These are explicit native fixture facts, never UI-derived arithmetic.
+        for (facts, effective) in [(&mut snapshot.trainexecution, 6), (&mut snapshot.trainingvalidationexecution, 4),
+            (&mut snapshot.validationexecution, 8), (&mut snapshot.predictionexecution, 2)] {
+            facts.settingsrevision = snapshot.revision;
+            facts.admittedcapacity = 0;
+            facts.effectivebatchpermodel = effective;
+        }
+        snapshot.trainexecution.logicalmodels = 2;
+        snapshot.trainexecution.microbatchesperattempt = 3;
+        snapshot.trainexecution.configuredcapacity = 2;
+        snapshot.trainexecution.aggregateroundimages = 12;
+        snapshot.trainexecution.limitation = ExecutionLimitation::ExperimentalPeriodicAveraging;
+        snapshot.trainingvalidationexecution.logicalmodels = 1;
+        snapshot.trainingvalidationexecution.microbatchesperattempt = 1;
+        snapshot.trainingvalidationexecution.configuredcapacity = 2;
+        snapshot.trainingvalidationexecution.aggregateroundimages = 4;
+        snapshot.trainingvalidationexecution.limitation = ExecutionLimitation::None;
+        let mut settings = settings::SettingsModel::default();
+        settings.install(snapshot);
+        let execution = model.workflow.training.as_mut()?.sources.execution.as_mut()?;
+        execution.training = snapshot.trainexecution.clone();
+        execution.validation = snapshot.trainingvalidationexecution.clone();
+        execution.training.admittedcapacity = 2;
+        execution.validation.admittedcapacity = 2;
         let state = model.workflow.training.as_mut()?;
         let template = state.sources.observations.first()?.clone();
         let mut current = template.clone();
@@ -267,21 +313,24 @@ impl TrainingFixture {
         current.progress.test = None;
         current.droppedbefore = 7;
         let available = vec![
-            TrainingMetricSource { scope: TrainingRecordScope::Model, modelid: 1, weights: EvaluatedWeights::Ema },
-            TrainingMetricSource { scope: TrainingRecordScope::Model, modelid: 2, weights: EvaluatedWeights::Ema },
-            TrainingMetricSource { scope: TrainingRecordScope::SynchronizedSession, modelid: 0, weights: EvaluatedWeights::Ordinary },
+            Self::source(3),
+            Self::source(0),
+            Self::source(1),
         ];
-        state.sources.catalog = TrainingSourceCatalog { defaultsource: Some(available[0].clone()), available };
+        state.sources.catalog = TrainingSourceCatalog { defaultsource: Some(Self::source(0)), available };
         state.sources.selected = None;
         state.sources.failures.clear();
         state.sources.distributions.clear();
         state.local.active = false;
         let mut metrics = crate::view::metrics::Component::default();
         metrics.update(crate::view::metrics::Message::Expand(Some(crate::view::metrics::Chart::Ap)));
+        let mut saved_records = Vec::new();
         for epoch in 0..4 {
             let state = model.workflow.training.as_mut()?;
             state.sources.observations.clear();
-            for (index, source) in state.sources.catalog.available.iter().enumerate() {
+            // Observation sequence is independent of native catalog display order.
+            for (index, stage) in [0, 1, 3].into_iter().enumerate() {
+                let source = Self::source(stage);
                 let mut observation = template.clone();
                 observation.sequence = (epoch * 3 + index + 1) as u64;
                 observation.progress.epoch = epoch as i32;
@@ -298,6 +347,13 @@ impl TrainingFixture {
                 artifact.epoch = epoch as u64;
                 artifact.path = format!("fixture-model-{}-epoch-{epoch}.pt", source.modelid);
                 artifact.evaluation = observation.progress.val.clone();
+                let mut saved = observation.clone();
+                saved.runid = "fixture-saved".into();
+                saved.attemptid = "fixture-saved-attempt".into();
+                saved.progress.sessionid.clone_from(&saved.runid);
+                saved.progress.artifact.as_mut()?.sessionid.clone_from(&saved.runid);
+                saved.droppedbefore = 7;
+                saved_records.push(saved);
                 state.sources.observations.push(observation);
             }
             current.sequence = 100 + epoch as u64;
@@ -305,35 +361,113 @@ impl TrainingFixture {
             state.metrics = Some(current.clone());
             metrics.rebase(&model, true);
         }
-        let snapshot = model.settings_snapshot.as_mut()?;
-        snapshot.settingsstate.workflows.train.request.lanes = 2;
-        snapshot.settingsstate.workflows.train.request.batchsize = 2;
-        snapshot.settingsstate.workflows.train.request.gradaccumsteps = 3;
-        snapshot.settingsstate.workflows.train.request.validationlanes = 2;
-        snapshot.settingsstate.workflows.train.request.valbatchsize = 2;
-        snapshot.settingsstate.workflows.validate.request.lanes = 4;
-        snapshot.settingsstate.workflows.validate.request.batchsize = 2;
-        snapshot.settingsstate.workflows.predict.request.lanes = 2;
-        // These are explicit native fixture facts, never UI-derived arithmetic.
-        for (facts, effective) in [(&mut snapshot.trainexecution, 6), (&mut snapshot.trainingvalidationexecution, 4),
-            (&mut snapshot.validationexecution, 8), (&mut snapshot.predictionexecution, 2)] {
-            facts.settingsrevision = snapshot.revision;
-            facts.admittedcapacity = 0;
-            facts.effectivebatchpermodel = effective;
-        }
-        snapshot.trainexecution.aggregateroundimages = 12;
-        let mut settings = settings::SettingsModel::default();
-        settings.install(snapshot);
-        Some(Self { model, settings, metrics })
+        let state = model.workflow.training.as_ref()?;
+        let saved_run = TrainingOpenedRun {
+            generation: 51,
+            directory: "fixture-saved-output".into(),
+            selected: None,
+            run: Some(TrainingRun {
+                formatversion: template.formatversion,
+                runid: "fixture-saved".into(),
+                attemptid: "fixture-saved-attempt".into(),
+                checkpointattemptid: String::new(),
+                sourcecheckpointattemptid: String::new(),
+                configuration: model.settings_snapshot.as_ref()?.settingsstate.workflows.train.request.clone(),
+                sources: state.sources.catalog.clone(),
+                execution: state.sources.execution.clone()?,
+                originalweights: template.progress.artifact.as_ref()?.path.clone(),
+                originalclassdescriptor: String::new(),
+                evaluatedweights: EvaluatedWeights::Ema,
+                // Layout is irrelevant to retained chart projection; no synthetic
+                // class identity is admitted to an actual native operation.
+                classlayout: ModelClassLayout {
+                    version: 1,
+                    foreground: OrderedClassCatalog { names: Vec::new() },
+                    classnameevidence: OrderedClassCatalog { names: Vec::new() },
+                    slots: Vec::new(),
+                    scores: ClassScoreEncoding::SigmoidLogits,
+                    noobject: NoObjectEncoding::AllNegative,
+                    provenance: ClassLayoutProvenance { origin: ClassLayoutOrigin::Unresolved, producer: "fixture".into(), artifactsha256: String::new() },
+                    supervisioninforegroundorder: false,
+                },
+                resumeepoch: -1,
+                resumeoptimizerstep: 0,
+            }),
+        };
+        let later = saved_records.split_off(6);
+        let saved_pages = [
+            TrainingHistoryPage { generation: 51, nextcursor: 100, more: true, records: saved_records },
+            TrainingHistoryPage { generation: 51, nextcursor: 200, more: false, records: later },
+        ];
+        Some(Self { model, settings, metrics, saved_run, saved_pages, stage: None })
     }
-    fn select(&mut self, stage: u8) {
-        let state = self.model.workflow.training.as_ref().unwrap();
-        let index = match stage { 0 => 0, 1 | 2 => 1, _ => 2 };
-        self.metrics.update(crate::view::metrics::Message::Source(state.sources.catalog.available[index].clone()));
-        // The same late/reconnected snapshot must retain source, observations and
-        // current sequence/drop facts after the selected evaluation has passed.
+    fn source(stage: u8) -> crate::generated::TrainingMetricSource {
+        use crate::generated::*;
+        let modelid = match stage { 0 | 4 => 1, 1 | 2 | 5 | 6 | 7 => 2, _ => 0 };
+        TrainingMetricSource {
+            scope: if modelid == 0 { TrainingRecordScope::SynchronizedSession } else { TrainingRecordScope::Model },
+            modelid,
+            weights: if modelid == 0 { EvaluatedWeights::Ordinary } else { EvaluatedWeights::Ema },
+        }
+    }
+    fn source_control(&self, stage: u8) -> Option<String> {
+        if matches!(stage, 2 | 6 | 7 | 9) { return None; }
+        let source = Self::source(stage);
+        Some(format!("train.metrics.source.{:?}.{}.{:?}", source.scope, source.modelid, source.weights))
+    }
+    fn open_saved(&mut self) {
+        self.model.workflow.output.select_saved(self.saved_run.directory.clone());
+        self.metrics.rebase(&self.model, true);
+        self.model.workflow.output.saved_mut().unwrap().run = Some(self.saved_run.clone());
+        self.saved_page(0);
+    }
+    fn saved_page(&mut self, index: usize) {
+        self.model.workflow.output.saved_mut().unwrap().page = Some(self.saved_pages[index].clone());
+        self.metrics.rebase(&self.model, true);
+    }
+    fn reconnect(&mut self, saved: bool) {
+        use crate::generated::*;
+        let snapshots = application_snapshot_defaults().unwrap().into_iter().map(|fact| match fact.value {
+            ApplicationSnapshot::Training(_) => ApplicationSnapshot::Training(self.model.workflow.training.as_ref().unwrap().clone()),
+            ApplicationSnapshot::Settings(_) => ApplicationSnapshot::Settings(self.model.settings_snapshot.as_ref().unwrap().clone()),
+            other => other,
+        }).collect();
+        self.model.peer_disconnected(crate::view_model::UiError::transport("fixture reconnect"));
+        self.metrics.reset(false);
+        self.model.install_bootstrap(SCHEMA_FINGERPRINT, snapshots).unwrap();
+        if saved {
+            self.saved_run.generation += 1;
+            for page in &mut self.saved_pages { page.generation = self.saved_run.generation; }
+            self.open_saved();
+            self.saved_page(1);
+        }
+        self.metrics.rebase(&self.model, true);
+    }
+    fn prepare_stage(&mut self, stage: u8) {
+        if self.stage == Some(stage) { return; }
+        self.stage = Some(stage);
+        match stage {
+            2 => self.reconnect(false),
+            4 => self.open_saved(),
+            6 => self.saved_page(1),
+            7 => self.reconnect(true),
+            9 => self.model.workflow.output.live(),
+            _ => {},
+        }
         self.metrics.rebase(&self.model, true);
         self.settings.draft.as_mut().unwrap().workflows.train.request.batchsize = if stage == 2 { 3 } else { 2 };
+    }
+    fn ready(&mut self, stage: u8) -> bool {
+        // An equal snapshot after ordinary pointer input must preserve the chosen
+        // source, run frontier, original observation, and prepared curve geometry.
+        self.metrics.rebase(&self.model, true);
+        self.metrics.rebase(&self.model, true);
+        let expected = Self::source(stage);
+        self.metrics.retained_source_facts().is_some_and(|(source, sequence, dropped, observation)| {
+            source == &expected && dropped == 7
+                && sequence == match stage { 4 | 5 => 6, 6..=8 => 12, _ => 103 }
+                && observation == match stage { 4 => 4, 5 => 5, _ => if expected.modelid == 0 { 12 } else { 9 + expected.modelid } }
+        })
     }
     fn view(&self) -> crate::fluent_theme::Element<'_, super::Message> {
         use crate::generated::*;
@@ -698,15 +832,71 @@ mod tests {
         sample.progress.phase = crate::generated::TrainingPhase::EpochComplete;
         sample.progress.val = sample.progress.artifact.as_ref().unwrap().evaluation.clone();
         model.workflow.training.as_mut().unwrap().sources.observations = vec![sample];
+        let configuration = model.settings_snapshot.as_ref().unwrap().settingsstate.workflows.train.request.clone();
+        let opened = crate::view_model::test_support::saved_training_run(configuration);
+        model.workflow.training.as_mut().unwrap().sources.execution = Some(opened.run.unwrap().execution);
         let mut fixture = super::TrainingFixture::new(&model).unwrap();
-        for (stage, modelid, original) in [(0, 1, 10), (1, 2, 11), (2, 2, 11), (3, 0, 12)] {
-            fixture.select(stage);
-            let (source, sequence, dropped, observation) = fixture.metrics.retained_source_facts().unwrap();
-            assert_eq!((source.modelid, sequence, dropped, observation), (modelid, 103, 7, original));
+        let run = fixture.saved_run.run.as_ref().unwrap();
+        let request = &run.configuration;
+        use crate::generated::{EvaluatedWeights, ExecutionLimitation, TrainLaneMode, TrainingMetricSource, TrainingRecordScope};
+        assert_eq!(request, &fixture.model.settings_snapshot.as_ref().unwrap().settingsstate.workflows.train.request);
+        assert_eq!(request.laneconfiguration.mode, TrainLaneMode::PeriodicAveraging);
+        assert!(request.useema);
+        assert_eq!(run.evaluatedweights, EvaluatedWeights::Ema);
+        assert_eq!((request.lanes, request.batchsize, request.gradaccumsteps, request.validationlanes, request.valbatchsize), (2, 2, 3, 2, 2));
+        assert_eq!(request.laneconfiguration.models.iter().map(|model| model.modelid).collect::<Vec<_>>(), [1, 2]);
+        assert_eq!(request.laneconfiguration.nextmodelid, 3);
+        // Explicit oracle for this admitted periodic EMA request, not a Rust
+        // implementation of the native source-policy algorithm.
+        assert_eq!(run.sources.available, [
+            TrainingMetricSource { scope: TrainingRecordScope::SynchronizedSession, modelid: 0, weights: EvaluatedWeights::Ordinary },
+            TrainingMetricSource { scope: TrainingRecordScope::Model, modelid: 1, weights: EvaluatedWeights::Ema },
+            TrainingMetricSource { scope: TrainingRecordScope::Model, modelid: 2, weights: EvaluatedWeights::Ema },
+        ]);
+        assert_eq!(run.sources.defaultsource.as_ref(), Some(&run.sources.available[1]));
+        assert_eq!(&run.sources, &fixture.model.workflow.training.as_ref().unwrap().sources.catalog);
+        assert_eq!(Some(&run.execution), fixture.model.workflow.training.as_ref().unwrap().sources.execution.as_ref());
+        let training = &run.execution.training;
+        assert_eq!((training.logicalmodels, training.microbatchesperattempt, training.effectivebatchpermodel, training.aggregateroundimages), (2, 3, 6, 12));
+        assert_eq!((training.configuredcapacity, training.admittedcapacity, training.limitation), (2, 2, ExecutionLimitation::ExperimentalPeriodicAveraging));
+        let validation = &run.execution.validation;
+        assert_eq!((validation.logicalmodels, validation.microbatchesperattempt, validation.effectivebatchpermodel, validation.aggregateroundimages), (1, 1, 4, 4));
+        assert_eq!((validation.configuredcapacity, validation.admittedcapacity, validation.limitation), (2, 2, ExecutionLimitation::None));
+        for (stage, modelid, sequence, original, generation, cursor) in [
+            (0, 1, 103, 10, 0, None), (1, 2, 103, 11, 0, None),
+            (2, 2, 103, 11, 0, None), (3, 0, 103, 12, 0, None),
+            (4, 1, 6, 4, 51, Some(100)), (5, 2, 6, 5, 51, Some(100)),
+            (6, 2, 12, 11, 51, Some(200)), (7, 2, 12, 11, 52, Some(200)),
+            (8, 0, 12, 12, 52, Some(200)), (9, 0, 103, 12, 0, None),
+        ] {
+            fixture.prepare_stage(stage);
+            if let Some(control) = fixture.source_control(stage) {
+                let selected = super::TrainingFixture::source(stage);
+                assert_eq!(control, format!("train.metrics.source.{:?}.{}.{:?}", selected.scope, selected.modelid, selected.weights));
+                // The fixture stage itself never changes selection. The workflow
+                // dispatches ordinary pointer input; this is its component message.
+                if matches!(stage, 1 | 3 | 5 | 8) { assert!(!fixture.ready(stage)); }
+                fixture.metrics.update(crate::view::metrics::Message::Source(selected));
+            }
+            assert!(fixture.ready(stage));
+            let (source, actual_sequence, dropped, observation) = fixture.metrics.retained_source_facts().unwrap();
+            assert_eq!((source.modelid, actual_sequence, dropped, observation), (modelid, sequence, 7, original));
+            assert_eq!(fixture.metrics.retained_run_facts(), ((4..=8).contains(&stage), generation, cursor));
             let facts = crate::view::workflow::fields::execution_facts(FeatureId::Train, false, &fixture.model, &fixture.settings);
             assert_eq!(facts.is_none(), stage == 2);
             if let Some(facts) = facts { assert_eq!(facts.effectivebatchpermodel, 6); }
             let _rendered = fixture.view();
+        }
+    }
+
+    #[test]
+    fn source_input_settlement_precedes_source_pixel_evidence() {
+        let mut fixture = crate::integration_control::ProbeFixture::new("workflows");
+        let controller = &mut fixture.controller;
+        for index in [0, 1, 3, 4, 5, 8] {
+            controller.driver.phase = Phase::Workflows(Step::TrainingFixturePending(index));
+            controller.workflows.chart_input_delivered(&mut controller.driver);
+            assert_eq!(controller.driver.phase, Phase::Workflows(Step::TrainingFixtureReady(index)));
         }
     }
 
@@ -1310,6 +1500,7 @@ impl State {
             return;
         };
         let next = match step {
+            Step::TrainingFixturePending(index) => Step::TrainingFixtureReady(index),
             Step::ChartLegendPending => Step::ChartLegendChanged,
             Step::ChartPanPending => Step::ChartPanned,
             Step::ChartSettlePending(retention) => Step::ChartRetained(retention),
@@ -1442,7 +1633,10 @@ impl State {
                 if picture == Picture::Sources {
                     let Some(fixture) = &self.source_fixture else { driver.fail("Missing training source fixture"); return; };
                     let Some((source, sequence, dropped, observation)) = fixture.metrics.retained_source_facts() else { driver.fail("Training fixture lost retained observations"); return; };
-                    if sequence != 103 || dropped != 7 { driver.fail("Training fixture changed current sequence/drop facts"); return; }
+                    if dropped != 7 { driver.fail("Training fixture changed current drop facts"); return; }
+                    let (saved, generation, cursor) = fixture.metrics.retained_run_facts();
+                    reporting::emit(|sink| sink.record("integration.training_source_run", "train.metrics.plot", "retained-pixels",
+                        [f64::from(index), if saved { 1.0 } else { 0.0 }, generation as f64, cursor.unwrap_or(0) as f64]));
                     reporting::emit(|sink| sink.record("integration.training_sources", "train.metrics.plot", "retained-pixels",
                         [f64::from(index), source.modelid as f64, sequence as f64, observation as f64]));
                 }
@@ -1458,7 +1652,7 @@ impl State {
                     Picture::Confidence => Step::ConfidenceLayer(true),
                     Picture::Progress => Step::LeaveTrain,
                     Picture::Train => Step::TrainingFixture(0),
-                    Picture::Sources if index < 3 => Step::TrainingFixture(index + 1),
+                    Picture::Sources if index < 9 => Step::TrainingFixture(index + 1),
                     Picture::Sources => { self.source_fixture = None; Step::NoImageWorkspace },
                     Picture::Validation if index < 5 => Step::Pixels(picture, index + 1),
                     Picture::Validation if self.restoration_pixels => {
@@ -1555,6 +1749,12 @@ impl State {
                 driver
                     .reporting
                     .observe(|reporting| reporting.located(&driver.phase, control, bounds));
+                return;
+            }
+            Step::TrainingFixture(index) => {
+                driver.phase = Phase::Workflows(Step::TrainingFixturePending(index));
+                let input = crate::presentation_surface::physical_bounds(bounds, driver.input_scale);
+                if !widget_ops::chart_input(Some(input), false) { driver.fail("Training source pointer dispatch failed"); }
                 return;
             }
             Step::ChartLegend | Step::ChartPan => {
@@ -2080,7 +2280,18 @@ impl State {
             Step::TrainingFixture(index) => {
                 if self.source_fixture.is_none() { self.source_fixture = TrainingFixture::new(model); }
                 let Some(fixture) = &mut self.source_fixture else { driver.fail("Native training fixture template unavailable"); return Task::none(); };
-                fixture.select(index);
+                fixture.prepare_stage(index);
+                if let Some(control) = fixture.source_control(index) {
+                    self.workflow_control(widgets, driver, control)
+                } else {
+                    self.workflow_step(driver, Step::TrainingFixtureReady(index))
+                }
+            }
+            Step::TrainingFixtureReady(index) => {
+                if !self.source_fixture.as_mut().is_some_and(|fixture| fixture.ready(index)) {
+                    driver.fail("Training source input or rebase changed retained identity");
+                    return Task::none();
+                }
                 self.workflow_step(driver, Step::Pixels(Picture::Sources, index))
             }
             Step::StartTrain
