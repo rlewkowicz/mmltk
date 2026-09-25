@@ -2,7 +2,6 @@
 #include <cuda_runtime.h>
 #include "src/frameworks/gpu/image_buffer.h"
 #include "src/frameworks/gpu/terminal_cuda_retirement_authority.h"
-#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -37,18 +36,6 @@ struct GpuAugmentationBatchView {
  std::size_t input_capacity_bytes = 0;
  std::size_t output_capacity_bytes = 0;
 };
-struct GpuAugmentationDonor {
- std::int64_t label = -1;
- std::uint32_t dataset_index = 0U;
- float area = 0.0F;
- std::array<float, 4> box{};
- bool has_mask = false;
- std::uint64_t sampling_identity = 0;
-};
-[[nodiscard]] bool augmentation_paste_admitted(const GpuAugmentationConfig& config, std::uint64_t key) noexcept;
-// The same pure semantic plan feeds logical donor history and physical launches.
-[[nodiscard]] AugmentationImagePlan plan_augmentation_image(const GpuAugmentationConfig&, std::uint64_t key, std::uint32_t dataset_index,
- const GpuAugmentationDonor* selected, std::int64_t donor_slot);
 enum class GpuAugmentationDonorSelection : std::uint8_t {
  Aligned,
  Cached,

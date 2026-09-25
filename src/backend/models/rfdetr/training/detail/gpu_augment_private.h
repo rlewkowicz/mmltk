@@ -1,8 +1,10 @@
 #pragma once
 #include <cstdint>
 #include <memory>
+#include <span>
+#include <utility>
 #include <vector>
-#include "training_data_plan.h"
+#include "training_data_state.h"
 #include <cuda_runtime_api.h>
 #include "src/backend/data/dataset_loader.h"
 #include "src/frameworks/gpu/terminal_cuda_retirement_owner.h"

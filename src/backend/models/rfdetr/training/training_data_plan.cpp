@@ -1,10 +1,9 @@
 #include "detail/training_data_plan.h"
+#include "src/backend/data/dataset_loader.h"
 #include "src/backend/models/rfdetr/contract/workflow_requests.h"
 #include <algorithm>
 #include <bit>
-#include <array>
 #include "src/backend/models/rfdetr/augmentation/annotation_support.h"
-#include "src/backend/models/rfdetr/augmentation/spatial_erasure.h"
 #include "src/backend/models/rfdetr/augmentation/gpu_augmentation_donor_index.h"
 #include <cmath>
 #include <limits>
@@ -20,6 +19,12 @@ const mmltk::backend::data::PackedInstance& donor_instance(const mmltk::backend:
  const auto& instance = loader.label_data()[entry.label_begin + descriptor.annotation_index];
  if (instance.is_crowd()) throw std::invalid_argument("crowd annotation cannot enter logical donor history");
  return instance;
+}
+std::span<const mmltk::backend::data::RLEPair> original_donor_support(const mmltk::backend::data::DatasetLoader& loader, const mmltk::backend::data::PackedInstance& instance) {
+ // DatasetLoader owns the immutable mapping and validates every annotation/RLE
+ // span before exposing it. Borrow the original support without remapping it.
+ if (!instance.mask_rle_pairs) return {};
+ return {loader.rle_data() + instance.mask_rle_offset / sizeof(mmltk::backend::data::RLEPair), instance.mask_rle_pairs};
 }
 std::vector<TrainingImageClasses> image_classes(const mmltk::backend::data::DatasetLoader& loader) {
  std::vector<TrainingImageClasses> images(loader.num_images());
@@ -167,7 +172,7 @@ TrainingDonorSource resolve_training_donor(const mmltk::backend::data::DatasetLo
  TrainingDonorSource result;
  if (!descriptor.valid) return result;
  const auto& instance = donor_instance(loader, descriptor);
- if (instance.mask_rle_pairs) result.support = {loader.rle_data() + instance.mask_rle_offset / sizeof(mmltk::backend::data::RLEPair), instance.mask_rle_pairs};
+ result.support = original_donor_support(loader, instance);
  const auto mapped = map_augmentation_instance(instance, loader.image_width(), loader.image_height(), nullptr, result.support);
  result.metadata = {instance.class_id, descriptor.image_index, mapped.source_area_pixels, mapped.source_box_xyxy, instance.has_mask(), (static_cast<std::uint64_t>(descriptor.image_index) << 32) | descriptor.annotation_index};
  if (instance.has_mask()) {
@@ -186,8 +191,7 @@ std::span<const TrainingDonorDescriptor> TrainingDonorHistory::plan(std::size_t 
  index_.rebuild(metadata_);
  std::fill(planned_.begin(), planned_.end(), TrainingDonorDescriptor{});
  for (std::size_t image = 0; image < batch_; ++image) {
-  const auto start = std::min<std::size_t>(static_cast<std::size_t>(augment_math::uniform01(keys[image], 0x4001ULL) * static_cast<float>(batch_)), batch_ - 1);
-  const auto chosen = index_.select(start, images[image]);
+  const auto chosen = index_.select_for_image(keys[image], images[image]);
   if (chosen >= 0) planned_[image] = slots_[stream * batch_ + chosen];
  }
  return planned_;
@@ -207,8 +211,8 @@ std::span<const TrainingDonorDescriptor> TrainingDonorHistory::admit(const mmltk
   for (std::uint32_t ordinal = 0; ordinal < entry.num_instances; ++ordinal) {
    const auto& instance = loader.label_data()[entry.label_begin + ordinal];
    if (instance.is_crowd()) continue;
-   const auto source = resolve_training_donor(loader, {images[image], ordinal, true});
-   if (!map_augmentation_instance(instance, loader.image_width(), loader.image_height(), &plan, source.support).visible) continue;
+   const auto support = original_donor_support(loader, instance);
+   if (!map_augmentation_instance(instance, loader.image_width(), loader.image_height(), &plan, support).visible) continue;
    if (augmentation_reservoir_select(plan.cache_choice, ++candidates, ordinal)) replacements_[image] = {images[image], ordinal, true};
   }
  }

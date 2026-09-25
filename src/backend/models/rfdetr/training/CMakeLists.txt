@@ -51,6 +51,7 @@ mmltk_register_ordinary_sources(
 mmltk_register_private_headers(
     mmltk_backend_models_rfdetr_training
     detail/training_data_plan.h
+    detail/training_data_state.h
     detail/training_schedule.h
     detail/training_epoch_policy.h
     detail/target_builder_private.h

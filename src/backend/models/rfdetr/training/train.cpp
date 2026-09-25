@@ -47,6 +47,7 @@
 #include <torch/serialize.h>
 #include "detail/checkpoint_private.h"
 #include "detail/training_continuation.h"
+#include "detail/training_data_plan.h"
 #include "detail/model_ema.h"
 #if defined(USE_C10D_NCCL)
 #include <torch/csrc/distributed/c10d/FileStore.hpp>

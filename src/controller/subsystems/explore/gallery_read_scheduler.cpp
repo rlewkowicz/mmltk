@@ -2,7 +2,7 @@
 #include "src/controller/subsystems/explore/detail/gallery_stream.h"
 #include "src/backend/models/rfdetr/augmentation/sampling.h"
 #include "src/backend/imaging/resample/image_resize.h"
-#include "src/backend/models/rfdetr/augmentation/gpu_augment.h"
+#include "src/backend/models/rfdetr/augmentation/augmentation_plan.h"
 #include <algorithm>
 #include <array>
 #include <limits>

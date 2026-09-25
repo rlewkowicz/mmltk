@@ -2,6 +2,7 @@
 #include <algorithm>
 #include <array>
 #include <fstream>
+#include <filesystem>
 #include <nlohmann/json.hpp>
 #include "src/backend/data/tests/test_fixture.h"
 #include <limits>
@@ -12,6 +13,10 @@
 #include "detail/checkpoint_private.h"
 #include "detail/model_ema.h"
 #include "detail/training_continuation.h"
+#include "detail/training_data_plan.h"
+#include "src/backend/data/dataset_loader.h"
+#include "src/backend/models/rfdetr/augmentation/annotation_support.h"
+#include "src/backend/models/rfdetr/augmentation/tests/gpu_augment_test_support.h"
 #include "detail/training_snapshot.h"
 #include "src/backend/models/rfdetr/training/checkpoint.h"
 #include "src/backend/models/rfdetr/core/model_state.h"
@@ -392,6 +397,7 @@ TEST_CASE("Continuation donor admission validates every descriptor before changi
  auto valid_archive = continuation_fixture(request, values);
  const auto valid = r::detail::read_training_continuation(valid_archive);
  REQUIRE(valid);
+ CHECK(valid->values.data == values.data);
  r::TrainingDonorHistory resumed(1, 2);
  resumed.restore(loader, valid->values.data.donors);
  CHECK(std::ranges::equal(resumed.plan(0, keys, images), expected));
@@ -408,4 +414,71 @@ TEST_CASE("Continuation donor admission validates every descriptor before changi
  CHECK(history.state() == values.data.donors);
  REQUIRE_THROWS(history.restore(loader, {}));
  CHECK(history.state() == values.data.donors);
+}
+
+TEST_CASE("Logical donor admission preserves original RLE support and empty-mask meaning", "[model][rfdetr][training][continuation]") {
+ namespace data = mmltk::backend::data;
+ namespace fixture = data::testsupport;
+ mmltk::testsupport::ScopedTempDir root("logical-donor-support");
+ fixture::FixtureSpec spec; spec.root_dir = root.path().string(); spec.num_images = 4; spec.background_images = 0; spec.width = spec.height = 8;
+ fixture::create_synthetic_dataset(spec);
+ const std::array annotations{
+  R"({"class":"person","bbox_xyxy":[3,3,4,4],"mask_rle_encoding":"row_major_start_length","mask_rle":"0:2 8:1","ignore":true})",
+  R"({"class":"person","bbox_xyxy":[1,1,7,7]})",
+  R"({"class":"person","bbox_xyxy":[1,1,7,7],"mask_rle_encoding":"row_major_start_length","mask_rle":""})",
+  R"({"class":"person","bbox_xyxy":[1,1,7,7],"iscrowd":true})"};
+ for (std::size_t image = 0; image < annotations.size(); ++image) {
+  std::ofstream output(std::filesystem::path(fixture::dataset_dir(spec)) / spec.split / ("00000" + std::to_string(image + 1) + ".jsonl"));
+  output << annotations[image] << '\n';
+ }
+ fixture::compile_existing_fixture(spec);
+ data::DatasetLoader::Config loader_config; loader_config.compiled_path = fixture::compiled_bin_path(spec); loader_config.batch_size = 1;
+ data::DatasetLoader loader(loader_config);
+ const r::TrainingDonorDescriptor masked{0, 0, true}, box{1, 0, true}, empty{2, 0, true};
+ const auto source = r::resolve_training_donor(loader, masked);
+ const auto& instance = loader.label_data()[loader.label_index()[0].label_begin];
+ CHECK(instance.raw_ignore());
+ CHECK(source.support.data() == loader.rle_data() + instance.mask_rle_offset / sizeof(data::RLEPair));
+ const std::array expected_support{data::RLEPair{0, 2}, data::RLEPair{8, 1}};
+ CHECK(std::ranges::equal(source.support, expected_support, [](const auto& a, const auto& b) { return a.start == b.start && a.length == b.length; }));
+ CHECK(source.metadata.box == std::array<float, 4>{.375F, .375F, .5F, .5F});
+ CHECK(source.metadata.area == 3);
+ CHECK(source.metadata.has_mask);
+ const auto box_source = r::resolve_training_donor(loader, box), empty_source = r::resolve_training_donor(loader, empty);
+ CHECK_FALSE(box_source.metadata.has_mask);
+ CHECK(box_source.metadata.area == 36);
+ CHECK(empty_source.metadata.has_mask);
+ CHECK(empty_source.metadata.area == 0);
+ CHECK(empty_source.support.empty());
+ CHECK(box_source.metadata.box == empty_source.metadata.box);
+ REQUIRE_THROWS_WITH(r::resolve_training_donor(loader, {3, 0, true}), "crowd annotation cannot enter logical donor history");
+ r::TrainingDonorHistory history(1, 1);
+ auto config = r::test_support::spatial_occlusion_config(true);
+ config.resize = {1, 1, 1};
+ // Keep admission enabled while isolating source visibility from pasted pixels.
+ config.copy_paste_probability = std::numeric_limits<float>::min();
+ std::size_t visible = 0, hidden = 0, differs_from_box = 0;
+ for (std::uint64_t key = 0; key < 256; ++key) {
+  REQUIRE_FALSE(r::augmentation_paste_admitted(config, key));
+  const auto plan = r::plan_augmentation_image(config, key, 0, nullptr, -1);
+  const auto original = r::map_augmentation_instance(instance, 8, 8, &plan, source.support);
+  auto box_only = instance; box_only.flags &= ~data::kAnnotationMask; box_only.mask_rle_pairs = 0;
+  differs_from_box += original.visible != r::map_augmentation_instance(box_only, 8, 8, &plan).visible;
+  history.replace(0, std::array{box});
+  const auto donors = history.admit(loader, 0, std::array{key}, std::array<std::uint32_t, 1>{0}, config);
+  CHECK(donors[0] == box);
+  CHECK(history.state()[0] == (original.visible ? masked : box));
+  visible += original.visible; hidden += !original.visible;
+ }
+ CHECK(visible > 0); CHECK(hidden > 0); CHECK(differs_from_box > 0);
+ config = r::test_support::isolated_augmentation_config(std::numeric_limits<float>::min());
+ for (const auto descriptor : {box, empty}) {
+  (void)history.admit(loader, 0, std::array<std::uint64_t, 1>{42}, std::array{descriptor.image_index}, config);
+  CHECK(history.state()[0] == descriptor);
+ }
+ const auto retained = history.state();
+ (void)history.admit(loader, 0, std::array<std::uint64_t, 1>{42}, std::array<std::uint32_t, 1>{3}, config);
+ CHECK(history.state() == retained);
+ REQUIRE_THROWS_WITH(history.admit(loader, 0, std::array<std::uint64_t, 1>{42}, std::array<std::uint32_t, 1>{4}, config), "logical donor source image is outside dataset");
+ CHECK(history.state() == retained);
 }

@@ -29,12 +29,14 @@ mmltk_register_retained_module_implementation_units(
 mmltk_register_ordinary_sources(
     mmltk_backend_models_rfdetr_augmentation
     annotation_support.cpp
+    augmentation_plan.cpp
     gpu_augment.cpp
     gpu_augment_cuda.cu)
 mmltk_register_private_headers(
     mmltk_backend_models_rfdetr_augmentation
     detail/gpu_augment_cuda_launch.h
     detail/gpu_augment_plan_math.h)
+mmltk_register_header_isolation(mmltk_backend_models_rfdetr_augmentation)
 target_include_directories(
     mmltk_backend_models_rfdetr_augmentation PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR})

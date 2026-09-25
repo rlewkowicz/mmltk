@@ -2,24 +2,19 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
-#include <limits>
 #include <span>
 #include <vector>
-#include "src/backend/data/dataset_loader.h"
-#include "src/backend/data/compiled_format_limits.h"
-#include "src/backend/models/rfdetr/augmentation/gpu_augment.h"
+#include "training_data_state.h"
+#include "src/backend/data/compiled_format.h"
+#include "src/backend/models/rfdetr/augmentation/augmentation_plan.h"
 #include "src/backend/models/rfdetr/augmentation/gpu_augmentation_donor_index.h"
 #include "src/backend/models/rfdetr/contract/execution_plan.h"
+namespace mmltk::backend::data {
+class DatasetLoader;
+struct DatasetIndexSchedule;
+}
 namespace mmltk::backend::models::rfdetr {
 struct TrainingImageClasses final { std::vector<std::uint32_t> classes; };
-struct TrainingShard final {
- std::uint64_t model_id = 0;
- std::uint64_t seed = 42;
- [[= mmltk::frameworks::reflection::MaxItems{std::numeric_limits<std::uint32_t>::max()}]] std::vector<std::uint32_t> images;
- [[= mmltk::frameworks::reflection::MaxItems{mmltk::backend::data::MAX_CLASSES}]] std::vector<std::uint64_t> unique_support;
- [[= mmltk::frameworks::reflection::MaxItems{mmltk::backend::data::MAX_CLASSES}]] std::vector<std::uint32_t> missing_classes;
- bool operator==(const TrainingShard&) const = default;
-};
 struct TrainingEpochDraws final {
  std::shared_ptr<const mmltk::backend::data::DatasetIndexSchedule> schedule;
  std::vector<std::uint64_t> repeated_exposure;
@@ -27,28 +22,12 @@ struct TrainingEpochDraws final {
  std::uint64_t microbatches = 0;
  std::uint64_t attempts = 0;
 };
-struct TrainingDonorDescriptor final {
- std::uint32_t image_index = 0;
- std::uint32_t annotation_index = 0;
- bool valid = false;
- bool operator==(const TrainingDonorDescriptor&) const = default;
-};
 struct TrainingDonorSource final {
  GpuAugmentationDonor metadata;
+ // Borrowed from the loader mapping; consume or copy before its owner retires.
  std::span<const mmltk::backend::data::RLEPair> support;
 };
 [[nodiscard]] TrainingDonorSource resolve_training_donor(const mmltk::backend::data::DatasetLoader&, const TrainingDonorDescriptor&);
-// A complete window cannot exceed the compiled image inventory times the
-// maximum admitted draw multiplier. This is a format bound, not a worker limit.
-inline constexpr std::uint64_t kMaximumTrainingDonorSlots = std::uint64_t{std::numeric_limits<std::uint32_t>::max()} * 16U;
-struct TrainingDataContinuation final {
- [[= mmltk::frameworks::reflection::MaxItems{kMaximumTrainingModels}]] std::vector<TrainingShard> shards;
- std::uint64_t plan_hash = 0;
- std::uint64_t epoch = 0;
- std::uint64_t next_microbatch = 0;
- [[= mmltk::frameworks::reflection::MaxItems{kMaximumTrainingDonorSlots}]] std::vector<TrainingDonorDescriptor> donors;
- bool operator==(const TrainingDataContinuation&) const = default;
-};
 class TrainingDataPlan final {
 public:
  TrainingDataPlan(std::vector<TrainingImageClasses>, std::uint32_t classes, const TrainRequest&);
@@ -83,9 +62,6 @@ private:
  std::vector<TrainingDonorDescriptor> planned_;
  std::vector<TrainingDonorDescriptor> replacements_;
  std::vector<GpuAugmentationDonor> metadata_;
- detail::CachedAugmentationDonorIndex index_;
+ CachedAugmentationDonorIndex index_;
 };
-MMLTK_REFLECT_FIELDS(TrainingShard)
-MMLTK_REFLECT_FIELDS(TrainingDonorDescriptor)
-MMLTK_REFLECT_FIELDS(TrainingDataContinuation)
 }

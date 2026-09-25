@@ -14,6 +14,7 @@
 #include <torch/types.h>
 #include <torch/serialize.h>
 #include "detail/gpu_augment_private.h"
+#include "detail/training_data_plan.h"
 #include "detail/target_builder_private.h"
 import mmltk.common.logging.mmltk_logging;
 import mmltk.common.logging.profile_utils;

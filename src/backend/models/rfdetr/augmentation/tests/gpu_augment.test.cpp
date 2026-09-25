@@ -633,6 +633,7 @@ TEST_CASE("copy-paste physical ring support is independent of loss selection", "
     const std::array donors{GpuAugmentationDonor{.label = present ? 7 : -1, .dataset_index = 1, .area = masked ? 20.F : 36.F, .box = {.125F, .125F, .875F, .875F}, .has_mask = masked}};
     const auto display = execute_and_copy(executor, source, indices, keys, donors, pixels, masks, boxes, GpuAugmentationDonorSelection::Aligned, GpuAugmentationOutputDomain::UnitRgb, 8);
     const auto plan = executor.plan().images[0];
+    CHECK(plan == plan_augmentation_image(test_support::isolated_augmentation_config(probability), keys[0], indices[0], &donors[0], 0));
     CHECK((plan.paste_donor_slot >= 0) == (present && probability == 1));
     if (plan.paste_donor_slot >= 0) CHECK(plan.paste_masked == masked);
     for (int y = 0; y < 8; ++y)
@@ -713,6 +714,7 @@ TEST_CASE("planned spatial erasure agrees with final image pixels through geomet
   std::size_t erased_donor = 0U;
   for (std::size_t image = 0U; image < count; ++image) {
    const auto& plan = executor.plan().images[image];
+   CHECK(plan == plan_augmentation_image(config, keys[image], indices[image], &donors[image], static_cast<std::int64_t>(image)));
    dropout += plan.erasure.dropout_probability > 0.0F;
    rectangular += plan.erasure.rectangular != 0U;
    channel_only += plan.erasure.dropout_probability == 0.0F && plan.erasure.rectangular == 0U;
@@ -748,28 +750,65 @@ TEST_CASE("planned spatial erasure agrees with final image pixels through geomet
   CHECK(std::ranges::none_of(restored, [](const float value) { return value == 0.0F; }));
  }
 }
-TEST_CASE("cached donors preserve the first eligible circular candidate", "[backend][augmentation][donors]") {
- detail::CachedAugmentationDonorIndex index;
- for (const std::vector<int>& catalog : {std::vector<int>{}, {-1}, {0}, {0, 0, 0}, {-1, -1, -1}, {0, -1, 0, 1, -1, 1, 0}, {2, 2, 1, 1, 0, 0, 2}, {-1, 3, -1, 0, -1, 3}}) {
-  std::vector<GpuAugmentationDonor> donors(catalog.size());
+std::int64_t circular_donor_oracle(std::span<const GpuAugmentationDonor> donors, std::size_t start, std::uint32_t source) {
+ for (std::size_t probe = 0; probe < donors.size(); ++probe) {
+  const auto candidate = (start + probe) % donors.size();
+  if (donors[candidate].label >= 0 && donors[candidate].dataset_index != source) return static_cast<std::int64_t>(candidate);
+ }
+ return -1;
+}
+std::int64_t keyed_donor_oracle(std::span<const GpuAugmentationDonor> donors, std::uint64_t key, std::uint32_t source) {
+ const auto start = donors.empty() ? 0 : std::min<std::size_t>(static_cast<std::size_t>(augment_math::uniform01(key, 0x4001ULL) * static_cast<float>(donors.size())), donors.size() - 1U);
+ return circular_donor_oracle(donors, start, source);
+}
+TEST_CASE("cached donors preserve keyed circular choices across catalog rebuilds", "[backend][augmentation][donors]") {
+ CachedAugmentationDonorIndex index;
+ std::vector<GpuAugmentationDonor> donors;
+ donors.reserve(64);
+ // Reuse the same index and metadata backing through growth, shrink, empty,
+ // all-invalid and same-source catalogs. Invalid slots retain circular position.
+ for (const std::vector<int>& catalog : {std::vector<int>{}, {-1}, {0}, {0, 0, 0}, {-1, -1, -1}, {0, -1, 0, 1, -1, 1, 0}, {2, 2, 1, 1, 0, 0, 2}, {-1, 3, -1, 0, -1, 3}, {}, {1}}) {
+  donors.resize(catalog.size());
   for (std::size_t slot = 0; slot < catalog.size(); ++slot) {
    donors[slot].label = catalog[slot] < 0 ? -1 : 0;
    donors[slot].dataset_index = static_cast<std::uint32_t>(std::max(catalog[slot], 0));
   }
   index.rebuild(donors);
   CHECK(index.select(catalog.size(), 0U) == -1);
-  for (std::size_t start = 0; start < donors.size(); ++start)
-   for (std::uint32_t source = 0; source < 5U; ++source) {
-    std::int64_t expected = -1;
-    for (std::size_t probe = 0; probe < donors.size(); ++probe) {
-     const auto candidate = (start + probe) % donors.size();
-     if (donors[candidate].label >= 0 && donors[candidate].dataset_index != source) {
-      expected = static_cast<std::int64_t>(candidate);
-      break;
-     }
-    }
-    CHECK(index.select(start, source) == expected);
+  CHECK(index.select(std::numeric_limits<std::size_t>::max(), 0U) == -1);
+  for (std::uint32_t source = 0; source < 5U; ++source) {
+   for (std::size_t start = 0; start < donors.size(); ++start) CHECK(index.select(start, source) == circular_donor_oracle(donors, start, source));
+   for (std::uint64_t sample = 0; sample <= 256; ++sample) {
+    const auto key = sample < 256 ? sample : std::numeric_limits<std::uint64_t>::max();
+    CHECK(index.select_for_image(key, source) == keyed_donor_oracle(donors, key, source));
    }
+  }
+ }
+}
+TEST_CASE("cached execution and semantic plans share donor identities and numeric geometry", "[backend][augmentation][donors][cuda]") {
+ if (!has_cuda_device()) SKIP("CUDA device unavailable");
+ constexpr std::size_t capacity = 7;
+ const std::array<std::uint32_t, 3> images{0, 1, 2};
+ const std::array<std::uint64_t, 3> keys{0, 83, std::numeric_limits<std::uint64_t>::max()};
+ std::array<GpuAugmentationDonor, capacity> donors{};
+ std::vector<float> boxes;
+ for (std::size_t slot = 0; slot < capacity; ++slot) {
+  donors[slot] = {.label = slot == 1 || slot == 4 ? -1 : static_cast<std::int64_t>(slot), .dataset_index = static_cast<std::uint32_t>(slot % 3),
+   .area = 16, .box = {0, 0, 1, 1}, .has_mask = true, .sampling_identity = 100 + slot};
+  boxes.insert(boxes.end(), donors[slot].box.begin(), donors[slot].box.end());
+ }
+ auto config = test_support::spatial_occlusion_config(true);
+ config.resize = {1, 1, 1};
+ config.copy_paste_probability = 1;
+ test_support::AugmentationExecution execution;
+ GpuAugmentationExecutor executor(config, capacity, 4, 4, execution.context, execution.retirement);
+ const std::vector<float> input(images.size() * 48, .1F), pixels(capacity * 48, .9F);
+ const std::vector<std::int64_t> masks(capacity, 0xffff);
+ (void)execute_and_copy(executor, input, images, keys, donors, pixels, masks, boxes, GpuAugmentationDonorSelection::Cached);
+ for (std::size_t image = 0; image < images.size(); ++image) {
+  const auto selected = keyed_donor_oracle(donors, keys[image], images[image]);
+  REQUIRE(selected >= 0);
+  CHECK(executor.plan().images[image] == plan_augmentation_image(config, keys[image], images[image], &donors[selected], selected));
  }
 }
 TEST_CASE("paste admission handles disabled zero and certain probabilities", "[backend][augmentation][donors]") {

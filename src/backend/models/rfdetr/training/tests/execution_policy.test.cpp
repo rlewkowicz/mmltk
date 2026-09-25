@@ -1,5 +1,6 @@
 #include "src/backend/ml/torch/tests/catch_support.h"
 #include "detail/training_data_plan.h"
+#include "src/backend/data/dataset_loader.h"
 #include "detail/training_epoch_policy.h"
 #include "detail/training_schedule.h"
 #include "src/backend/models/rfdetr/contract/workflow_requests.h"
@@ -247,6 +248,31 @@ TEST_CASE("Logical donor history separates streams excludes self and retains inv
  history.replace(0, std::array<r::TrainingDonorDescriptor, 2>{});
  CHECK(std::ranges::equal(history.plan(0, keys, images), planned));
  REQUIRE_THROWS(r::TrainingDonorHistory(std::numeric_limits<std::size_t>::max(), 2));
+}
+TEST_CASE("Logical donor plans retain stream identities for reordered consumers", "[rfdetr][training][data_plan]") {
+ r::TrainingDonorHistory serial(2, 3), reordered(2, 3);
+ const std::array<r::TrainingDonorDescriptor, 3> first{{{7, 1, true}, {9, 2, true}, {11, 3, true}}};
+ const std::array<r::TrainingDonorDescriptor, 3> second{{{13, 4, true}, {15, 5, true}, {17, 6, true}}};
+ for (auto* history : {&serial, &reordered}) {
+  history->replace(0, first);
+  history->replace(1, second);
+ }
+ const std::array<std::uint64_t, 3> keys{0, 42, std::numeric_limits<std::uint64_t>::max()};
+ const std::array<std::uint32_t, 3> images{7, 13, 99};
+ std::array<std::vector<r::TrainingDonorDescriptor>, 2> delivered;
+ for (std::size_t stream = 0; stream < delivered.size(); ++stream) {
+  const auto planned = serial.plan(stream, keys, images);
+  delivered[stream].assign(planned.begin(), planned.end());
+ }
+ for (const std::size_t stream : {1U, 0U}) {
+  CHECK(std::ranges::equal(reordered.plan(stream, keys, images), delivered[stream]));
+  // Workers consume their own descriptor copy; subsequent planning/admission
+  // cannot change a previously submitted identity or another stream's slots.
+  auto replacement = stream == 0 ? first : second;
+  replacement[1] = {};
+  reordered.replace(stream, replacement);
+ }
+ CHECK(reordered.state() == serial.state());
 }
 TEST_CASE("Semantic samples retain valid rows under rank slices padding group and layer changes", "[rfdetr][training][sampling]") {
  const auto keys = torch::tensor({INT64_C(19), INT64_C(0x3abcdef012345678), INT64_C(-7)}, torch::kInt64);

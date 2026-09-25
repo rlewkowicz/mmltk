@@ -2,7 +2,7 @@
 #include <cstdint>
 #include "training_schedule.h"
 #include "training_epoch_policy.h"
-#include "training_data_plan.h"
+#include "training_data_state.h"
 #include <optional>
 #include <string>
 #include "src/backend/models/rfdetr/contract/workflow_requests.h"

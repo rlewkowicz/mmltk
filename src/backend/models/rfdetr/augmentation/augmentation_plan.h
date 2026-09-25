@@ -6,6 +6,7 @@
 #include "gpu_augment_types.h"
 #include "src/backend/data/compiled_format.h"
 namespace mmltk::backend::models::rfdetr {
+struct GpuAugmentationConfig;
 inline constexpr std::size_t kAugmentationTransformSize = 6;
 struct AugmentationImagePlan {
  AugmentationSpatialErasure erasure;
@@ -34,6 +35,18 @@ struct AugmentationImagePlan {
  std::array<float, kAugmentationTransformSize> paste_inverse{1.0F, 0.0F, 0.0F, 0.0F, 1.0F, 0.0F};
  constexpr bool operator==(const AugmentationImagePlan&) const noexcept = default;
 };
+struct GpuAugmentationDonor {
+ std::int64_t label = -1;
+ std::uint32_t dataset_index = 0U;
+ float area = 0.0F;
+ std::array<float, 4> box{};
+ bool has_mask = false;
+ std::uint64_t sampling_identity = 0;
+};
+[[nodiscard]] bool augmentation_paste_admitted(const GpuAugmentationConfig& config, std::uint64_t key) noexcept;
+// The same pure semantic plan feeds logical donor history and physical launches.
+[[nodiscard]] AugmentationImagePlan plan_augmentation_image(const GpuAugmentationConfig&, std::uint64_t key, std::uint32_t dataset_index,
+ const GpuAugmentationDonor* selected, std::int64_t donor_slot);
 struct AugmentationBatchPlan {
  std::vector<AugmentationImagePlan> images;
  std::size_t active_size = 0;
