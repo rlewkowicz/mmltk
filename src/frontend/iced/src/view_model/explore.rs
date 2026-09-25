@@ -1,3 +1,4 @@
+use super::notices::{Origin, failure, warning};
 #[derive(Debug, Clone, Default)]
 pub struct ExploreModel {
     pub snapshot: Option<crate::generated::ExploreSnapshot>,
@@ -136,7 +137,7 @@ impl crate::generated::ExploreApplicationProjection<UiError> for ApplicationMode
         match event {
             ApplicationEvent::ExploreExploreChanged(value) => {
                 match self.install_explore_snapshot(value.snapshot, false) {
-                    Err(error) => self.report_error(error),
+                    Err(error) => self.report_error(crate::view_model::notices::Origin::Protocol, error),
                     Ok(Observation::Installed) => {
                         if self.presentation_model.foreground()
                             == Some(PresentationSourceKind::Explore)
@@ -151,10 +152,10 @@ impl crate::generated::ExploreApplicationProjection<UiError> for ApplicationMode
                 let retained_product = value.snapshot.ready;
                 let owner = value.snapshot.dataset.identity;
                 match self.install_explore_snapshot(value.snapshot, false) {
-                    Err(error) => self.report_error(error),
+                    Err(error) => self.report_error(crate::view_model::notices::Origin::Protocol, error),
                     Ok(Observation::Stale) => {}
                     Ok(Observation::Installed | Observation::Current) => {
-                        self.notices.owned_condition(super::notices::Origin::Explore, owner, Some(if retained_product { super::notices::warning("Explore preview unavailable", value.detail) } else { super::notices::failure(value.detail) }));
+                        self.notices.owned_condition(super::notices::Origin::Explore, owner, true, || if retained_product { super::notices::warning("Explore preview unavailable", value.detail) } else { super::notices::failure(value.detail) });
                     }
                 }
             }
@@ -168,7 +169,7 @@ impl crate::generated::ExploreApplicationProjection<UiError> for ApplicationMode
             ApplicationReply::ExploreOpen(snapshot) => (snapshot, true),
             ApplicationReply::ExploreUpdateFilter(snapshot) => {
                 if endpoint != Some(ApplicationIntentEndpoint::ExploreUpdateFilter) {
-                    self.report_error(UiError::protocol(
+                    self.report_error(crate::view_model::notices::Origin::Protocol, UiError::protocol(
                         "Explore filter reply did not match its pending endpoint",
                     ));
                     return;
@@ -187,7 +188,7 @@ impl crate::generated::ExploreApplicationProjection<UiError> for ApplicationMode
             _ => unreachable!("generated Explore dispatch supplied another system reply"),
         };
         if let Err(error) = self.install_explore_snapshot(snapshot, bootstrap) {
-            self.report_error(error);
+            self.report_error(crate::view_model::notices::Origin::Protocol, error);
         }
     }
 }
@@ -197,25 +198,15 @@ impl crate::generated::UpscaleApplicationProjection<UiError> for ApplicationMode
         &mut self,
         value: crate::generated::UpscaleSnapshot,
     ) -> Result<(), UiError> {
-        merge_observation(
-            &mut self.upscale_snapshot,
-            value,
-            |snapshot| snapshot.revision,
-            "Upscale",
-        )
+        self.install_upscale_snapshot(value)
         .map(|_| ())
     }
 
     fn project_upscale_event(&mut self, event: ApplicationEvent) {
         match event {
             ApplicationEvent::UpscaleUpscaleChanged(value) => {
-                match merge_observation(
-                    &mut self.upscale_snapshot,
-                    value.snapshot,
-                    |snapshot| snapshot.revision,
-                    "Upscale",
-                ) {
-                    Err(error) => self.report_error(error),
+                match self.install_upscale_snapshot(value.snapshot) {
+                    Err(error) => self.report_error(crate::view_model::notices::Origin::Protocol, error),
                     Ok(Observation::Installed) => {
                         if self.current_upscale().is_some()
                             && matches!(
@@ -238,13 +229,8 @@ impl crate::generated::UpscaleApplicationProjection<UiError> for ApplicationMode
                 let current_failure = value.kind == crate::generated::UpscaleFailureKind::Physical
                     || value.request.is_none()
                     || value.request.as_ref() == self.requested_upscale.as_ref();
-                match merge_observation(
-                    &mut self.upscale_snapshot,
-                    value.snapshot,
-                    |snapshot| snapshot.revision,
-                    "Upscale",
-                ) {
-                    Err(error) => self.report_error(error),
+                match self.install_upscale_snapshot(value.snapshot) {
+                    Err(error) => self.report_error(crate::view_model::notices::Origin::Protocol, error),
                     Ok(Observation::Installed | Observation::Current) => {
                         if self
                             .requested_upscale
@@ -272,7 +258,7 @@ impl crate::generated::UpscaleApplicationProjection<UiError> for ApplicationMode
                                     (UiErrorKind::Failed, "Operation failed")
                                 }
                             };
-                            self.notices.observe(super::notices::Origin::Upscale, 0, generation, Some(UiError { kind, title, detail: value.detail }));
+                            self.notices.terminal(super::notices::Origin::Upscale, 0, generation, || Some(UiError { kind, title, detail: value.detail }));
                         }
                     }
                     Ok(Observation::Stale) => {}
@@ -285,13 +271,8 @@ impl crate::generated::UpscaleApplicationProjection<UiError> for ApplicationMode
     fn project_upscale_reply(&mut self, _correlation: u64, reply: ApplicationReply) {
         match reply {
             ApplicationReply::UpscaleStart(snapshot) => {
-                if let Err(error) = merge_observation(
-                    &mut self.upscale_snapshot,
-                    snapshot,
-                    |value| value.revision,
-                    "Upscale",
-                ) {
-                    self.report_error(error);
+                if let Err(error) = self.install_upscale_snapshot(snapshot) {
+                    self.report_error(crate::view_model::notices::Origin::Protocol, error);
                 }
                 if self.current_upscale().is_some() {
                     self.set_foreground_visual(Some(PresentationSourceKind::Upscale));
@@ -544,7 +525,7 @@ mod tests {
         assert_eq!(model.notices.latest().unwrap().detail, "upscale failed");
 
         let later = UiError::transport("later transport failure");
-        model.report_error(later.clone());
+        model.report_error(Origin::Transport, later.clone());
         model.reduce_event(event);
         assert_eq!(model.notices.latest().map(|notice| &notice.error), Some(&later));
     }
@@ -615,5 +596,23 @@ mod tests {
         assert_eq!(installed.frame, before.frame);
         assert_eq!(installed.augmentation.seed, before.augmentation.seed);
         assert!(!installed.ready);
+    }
+}
+
+impl ApplicationModel {
+    pub(super) fn observe_explore(&mut self) {
+        if let Some(state) = &self.explore.snapshot {
+            self.notices.owned_condition(Origin::Explore, state.dataset.identity, !state.failure.is_empty(), || {
+                if state.ready { warning("Explore preview unavailable", state.failure.clone()) }
+                else { failure(state.failure.clone()) }
+            });
+        }
+    }
+    fn install_upscale_snapshot(&mut self, value: crate::generated::UpscaleSnapshot) -> Result<Observation, UiError> {
+        let observation = merge_observation(&mut self.upscale_snapshot, value, |snapshot| snapshot.revision, "Upscale")?;
+        if observation != Observation::Stale {
+            self.notices.terminal(Origin::Upscale, 0, self.upscale_snapshot.as_ref().expect("installed Upscale snapshot").revision, || None);
+        }
+        Ok(observation)
     }
 }

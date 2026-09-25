@@ -175,7 +175,7 @@ fn quiet_failure_receipts_preserve_ui_error_kind_and_bounded_utf8() {
             "quiet".into(),
         );
         let mut model = crate::view_model::test_support::bootstrapped();
-        model.report_error(crate::view_model::UiError::protocol(detail));
+        model.report_error(crate::view_model::notices::Origin::Protocol, crate::view_model::UiError::protocol(detail));
         drop(driver.advance(
             &model,
             &crate::view::settings::SettingsModel::default(),

@@ -251,12 +251,21 @@ impl ApplicationModel {
 }
 
 impl ApplicationModel {
-    pub fn report_error(&mut self, error: UiError) {
+    pub fn report_error(&mut self, origin: notices::Origin, error: UiError) {
+        self.notices.local(origin, error);
+    }
+
+    /// A new attempt or successful admission rearms only this action's episode.
+    pub fn begin_admission(&mut self, endpoint: ApplicationIntentEndpoint) {
+        self.notices.clear_condition(notices::Origin::Admission(endpoint));
+    }
+
+    pub fn report_admission_error(&mut self, endpoint: ApplicationIntentEndpoint, error: UiError) {
         let origin = match error.kind {
             UiErrorKind::Transport => notices::Origin::Transport,
             UiErrorKind::Protocol => notices::Origin::Protocol,
-            _ => notices::Origin::Local(error.kind),
+            _ => notices::Origin::Admission(endpoint),
         };
-        self.notices.local(origin, error);
+        self.report_error(origin, error);
     }
 }

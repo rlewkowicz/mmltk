@@ -949,8 +949,8 @@ impl Component {
         use crate::view_model::notices::{Origin, warning};
         for (history, chart, dropped) in [(&self.live, Origin::Chart, Origin::HistoryDropped), (&self.saved, Origin::ChartSaved, Origin::HistoryDroppedSaved)] {
             let omissions: u64 = history.curves.iter().map(|curve| curve.omitted).sum();
-            notices.run_condition(chart, &history.run, (omissions > 0).then(|| warning("Chart history incomplete", format!("Charts omit {omissions} older disconnected summaries; saved history remains unchanged."))));
-            notices.run_condition(dropped, &history.run, (history.dropped > 0).then(|| warning("History incomplete", format!("{} training records were dropped.", history.dropped))));
+            notices.run_condition(chart, &history.run, (omissions > 0), || warning("Chart history incomplete", format!("Charts omit {omissions} older disconnected summaries; saved history remains unchanged.")));
+            notices.run_condition(dropped, &history.run, (history.dropped > 0), || warning("History incomplete", format!("{} training records were dropped.", history.dropped)));
         }
     }
 }

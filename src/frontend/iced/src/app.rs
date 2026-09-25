@@ -453,7 +453,7 @@ mod route_tests {
                 .is_none()
         );
         std::mem::swap(app.integration.as_mut().unwrap(), &mut fixture.controller);
-        app.model.report_error(UiError::protocol("terminal transport closed"));
+        app.model.report_error(crate::view_model::notices::Origin::Protocol, UiError::protocol("terminal transport closed"));
         integration_control::initialize_reporting(false, false);
         let cancelled = fixture.receiver.try_recv().unwrap();
         assert_eq!(update(&mut app, Message::Integration(cancelled)).units(), 0);
@@ -1422,7 +1422,7 @@ mod tests {
         );
         assert!(capture.try_recv().is_err());
         app.model.abandon_intent(settings);
-        assert!(!app.guard_compute_stop(FeatureId::Validate));
+        assert!(!app.guard_compute_stop(FeatureId::Validate, ApplicationIntentEndpoint::ValidationStop));
         assert!(app.model.workflow.pending_start.is_none());
         app.workspace.select(FeatureId::Export);
 
@@ -1538,7 +1538,7 @@ mod tests {
             )),
         )));
         let captured_revision = app.interaction_revision;
-        app.model.report_error(UiError::transport("visible notification"));
+        app.model.report_error(crate::view_model::notices::Origin::Transport, UiError::transport("visible notification"));
         drop(update(&mut app, Message::Status(StatusMessage::Activate(Control::Trigger, Opening::Keyboard))));
         drop(update(&mut app, Message::Status(StatusMessage::Close)));
         assert!(!app.status.open);
@@ -1552,6 +1552,46 @@ mod tests {
         drop(app.on_workspace(resolved(app.interaction_revision)));
         assert_eq!(app.model.pending_count(), 1);
         assert!(matches!(capture.try_recv().unwrap(), crate::transport_connection::CapturedRecord::Intent(_)));
+    }
+
+    #[test]
+    fn unrelated_workspace_input_preserves_local_source_acknowledgements() {
+        use crate::view_model::notices::Origin;
+        let (mut app, task) = boot();
+        drop(task);
+        install_default_bootstrap(&mut app);
+        let (connection, _capture) = Connection::test_channel();
+        app.connection = Some(connection);
+        let stop = ApplicationIntentEndpoint::TrainingStop;
+        let save = ApplicationIntentEndpoint::AnnotationSave;
+        assert!(!app.guard_compute_stop(FeatureId::Train, stop));
+        drop(app.on_annotation(crate::view::annotation::Outcome::SaveRequested));
+        assert_eq!(app.model.notices.len(), 2);
+        app.model.report_error(Origin::Editor(FeatureId::Predict), UiError::invalid("invalid prediction field"));
+        app.model.notices.dismiss_all();
+        drop(app.on_workspace(crate::view::router::Message::Annotation(
+            crate::view::annotation::Message::Workspace(crate::view::workspace::Message::Gesture(
+                crate::presentation_surface::SurfaceGesture {
+                    kind: crate::presentation_surface::SurfaceGestureKind::Pointer,
+                    sample: crate::presentation_surface::SurfaceSample {
+                        width: 640, height: 480, x: 20, y: 30,
+                        content_x: 20.0, content_y: 30.0, pressed: false,
+                    },
+                },
+            )),
+        )));
+        drop(app.on_workspace(crate::view::router::Message::Navigation(
+            crate::view::navigation::Message::PageSelected(FeatureId::Predict),
+        )));
+        app.model.report_admission_error(stop, UiError::busy("retained stop failure"));
+        app.model.report_admission_error(save, UiError::busy("retained save failure"));
+        app.model.report_error(Origin::Editor(FeatureId::Predict), UiError::invalid("same prediction field episode"));
+        assert!(app.model.notices.is_empty());
+        assert!(!app.guard_compute_stop(FeatureId::Train, stop));
+        assert_eq!(app.model.notices.len(), 1);
+        assert_eq!(app.model.notices.latest().unwrap().origin, Origin::Admission(stop));
+        app.model.report_admission_error(save, UiError::busy("save still acknowledged"));
+        assert_eq!(app.model.notices.len(), 1);
     }
 
     #[test]

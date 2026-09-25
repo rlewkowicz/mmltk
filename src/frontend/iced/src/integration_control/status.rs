@@ -9,7 +9,7 @@ enum Expected { Stop, Oom, Provider, ShortTraining }
 impl Expected {
     fn matches(self, notice: &Notice) -> bool {
         let (origin, severity, kind, title, detail) = match self {
-            Self::Stop => (Origin::Local(UiErrorKind::Busy), Severity::Warning, UiErrorKind::Busy, "Operation already running", STOP_DETAIL),
+            Self::Stop => (Origin::Admission(crate::generated::ApplicationIntentEndpoint::TrainingStop), Severity::Warning, UiErrorKind::Busy, "Operation already running", STOP_DETAIL),
             Self::Oom => (Origin::Compute(crate::generated::FeatureId::Train), Severity::Error, UiErrorKind::Failed, "Operation failed", oom_detail()),
             Self::ShortTraining => (Origin::Compute(crate::generated::FeatureId::Train), Severity::Error, UiErrorKind::Failed, "Operation failed", "Status acceptance training failure"),
             Self::Provider => (Origin::Provider, Severity::Error, UiErrorKind::Failed, "Operation failed", SECOND_DETAIL),
@@ -188,26 +188,26 @@ mod tests {
         assert!(notice.detail.starts_with("CUDA out of memory: first line\n"));
         assert!(notice.detail.ends_with("CUDA allocation failed: last line"));
         assert!(notice.detail.contains("Allocation 40:"));
-        model.report_error(crate::view_model::UiError::protocol("unexpected"));
+        model.report_error(crate::view_model::notices::Origin::Protocol, crate::view_model::UiError::protocol("unexpected"));
         assert!(!evidence.permits(&Phase::StatusCopy, &model));
     }
 
     #[test]
     fn inactive_stop_requires_exact_source_severity_detail_and_identity() {
         let mut model = crate::view_model::test_support::bootstrapped();
-        model.report_error(crate::view_model::UiError::busy("unrelated warning"));
+        model.report_admission_error(crate::generated::ApplicationIntentEndpoint::TrainingStop, crate::view_model::UiError::busy("unrelated warning"));
         let mut evidence = Evidence::default();
         assert!(!evidence.permits(&Phase::AwaitStatusNotice, &model));
         model.notices.dismiss_all();
-        model.notices.condition(Origin::Local(UiErrorKind::Busy), None);
-        model.report_error(crate::view_model::UiError::busy(STOP_DETAIL));
+        model.notices.clear_condition(Origin::Admission(crate::generated::ApplicationIntentEndpoint::TrainingStop));
+        model.report_admission_error(crate::generated::ApplicationIntentEndpoint::TrainingStop, crate::view_model::UiError::busy(STOP_DETAIL));
         assert!(evidence.permits(&Phase::AwaitStatusNotice, &model));
         let id = evidence.allowed.unwrap();
         model.notices.dismiss(id);
         assert!(!evidence.permits(&Phase::StatusCopy, &model));
         assert!(evidence.permits(&Phase::AwaitStatusDismissed, &model));
-        model.notices.condition(Origin::Local(UiErrorKind::Busy), None);
-        model.report_error(crate::view_model::UiError::busy(STOP_DETAIL));
+        model.notices.clear_condition(Origin::Admission(crate::generated::ApplicationIntentEndpoint::TrainingStop));
+        model.report_admission_error(crate::generated::ApplicationIntentEndpoint::TrainingStop, crate::view_model::UiError::busy(STOP_DETAIL));
         assert!(!evidence.permits(&Phase::AwaitStatusDismissed, &model));
     }
 
@@ -223,7 +223,7 @@ mod tests {
         assert!(!evidence.fixture_valid());
         evidence.removing = Some(first);
         assert!(evidence.fixture_valid());
-        evidence.fixture.as_mut().unwrap().report_error(crate::view_model::UiError::protocol("unexpected"));
+        evidence.fixture.as_mut().unwrap().report_error(crate::view_model::notices::Origin::Protocol, crate::view_model::UiError::protocol("unexpected"));
         assert!(!evidence.fixture_valid());
     }
 
@@ -234,7 +234,7 @@ mod tests {
         model.peer_disconnected(crate::view_model::UiError::transport("rendered continuity acceptance"));
         assert!(evidence.permits(&Phase::ViewerAwaitDisconnect, &model));
         assert!(evidence.permits(&Phase::ViewerReconnect, &model));
-        model.report_error(crate::view_model::UiError::protocol("unexpected during reconnect"));
+        model.report_error(crate::view_model::notices::Origin::Protocol, crate::view_model::UiError::protocol("unexpected during reconnect"));
         assert!(!evidence.permits(&Phase::ViewerReconnect, &model));
     }
 }

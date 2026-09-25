@@ -95,15 +95,8 @@ impl crate::generated::ModelApplicationProjection<UiError> for ApplicationModel 
                 }
             }
             ApplicationEvent::ModelModelChanged(value) => {
-                let rejected = value.snapshot.terminal.outcome == ModelSelectionOutcome::Rejected;
-                match self.install_model_snapshot(value.snapshot) {
-                    Err(error) => self.report_error(error),
-                    Ok(Observation::Installed) => {
-                        if rejected {
-                            self.observe_model();
-                        }
-                    }
-                    Ok(Observation::Current | Observation::Stale) => {}
+                if let Err(error) = self.install_model_snapshot(value.snapshot) {
+                    self.report_error(crate::view_model::notices::Origin::Protocol, error);
                 }
             }
             _ => unreachable!("generated Model dispatch supplied another system event"),
@@ -116,7 +109,7 @@ impl crate::generated::ModelApplicationProjection<UiError> for ApplicationModel 
                 let Some(PendingDetail::ModelSelect(receipt)) =
                     self.pending_detail(correlation).cloned()
                 else {
-                    self.report_error(UiError::protocol(
+                    self.report_error(crate::view_model::notices::Origin::Protocol, UiError::protocol(
                         "Model Select reply did not match its pending detail",
                     ));
                     return;
@@ -124,18 +117,18 @@ impl crate::generated::ModelApplicationProjection<UiError> for ApplicationModel 
                 let reply_generation = snapshot.generation;
                 let outcome = snapshot.terminal.outcome;
                 match self.install_model_snapshot(snapshot) {
-                    Err(error) => self.report_error(error),
+                    Err(error) => self.report_error(crate::view_model::notices::Origin::Protocol, error),
                     Ok(Observation::Stale)
                         if self
                             .model_snapshot
                             .as_ref()
                             .is_some_and(|installed| installed.generation == reply_generation) => {}
                     Ok(Observation::Stale) => {
-                        self.report_error(UiError::invalid(
+                        self.report_admission_error(ApplicationIntentEndpoint::ModelSelect, UiError::invalid(
                             "Model selection is stale because its inputs changed.",
                         ));
                     }
-                    Ok(observation @ (Observation::Installed | Observation::Current)) => {
+                    Ok(Observation::Installed | Observation::Current) => {
                         if self.settings_snapshot.as_ref().map(|value| value.revision)
                             != Some(receipt.settings_revision)
                             || (outcome == ModelSelectionOutcome::Accepted
@@ -143,13 +136,9 @@ impl crate::generated::ModelApplicationProjection<UiError> for ApplicationModel 
                                     value.selection.key.workflow != receipt.workflow
                                 }))
                         {
-                            self.report_error(UiError::invalid(
+                            self.report_admission_error(ApplicationIntentEndpoint::ModelSelect, UiError::invalid(
                                 "Model selection is stale because its inputs changed.",
                             ));
-                        } else if outcome == ModelSelectionOutcome::Rejected
-                            && observation == Observation::Installed
-                        {
-                            self.observe_model();
                         }
                     }
                 }
@@ -159,13 +148,13 @@ impl crate::generated::ModelApplicationProjection<UiError> for ApplicationModel 
                     self.pending_detail(correlation),
                     Some(PendingDetail::ModelStop(_))
                 ) {
-                    self.report_error(UiError::protocol(
+                    self.report_error(crate::view_model::notices::Origin::Protocol, UiError::protocol(
                         "Model Stop reply did not match its pending detail",
                     ));
                     return;
                 }
                 if let Err(error) = self.install_model_snapshot(snapshot) {
-                    self.report_error(error);
+                    self.report_error(crate::view_model::notices::Origin::Protocol, error);
                 }
             }
             _ => unreachable!("generated Model dispatch supplied another system reply"),
@@ -535,5 +524,14 @@ impl ApplicationModel {
         let observation = merge_model_snapshot(&mut self.model_snapshot, snapshot)?;
         if observation != Observation::Stale { self.observe_model(); }
         Ok(observation)
+    }
+}
+
+impl ApplicationModel {
+    fn observe_model(&mut self) {
+        if let Some(state) = &self.model_snapshot {
+            self.notices.terminal(super::notices::Origin::Model(state.selection.key.workflow), 0, state.generation, ||
+                (state.terminal.outcome == crate::generated::ModelSelectionOutcome::Rejected).then(|| super::notices::failure(state.terminal.detail.clone())));
+        }
     }
 }

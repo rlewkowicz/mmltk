@@ -16,7 +16,8 @@ impl ApplicationModel {
     pub fn peer_disconnected(&mut self, error: UiError) {
         self.clear_peer_state();
         self.connection = ConnectionState::Reconnecting;
-        self.report_error(error);
+        let origin = if error.kind == UiErrorKind::Protocol { super::notices::Origin::Protocol } else { super::notices::Origin::Transport };
+        self.report_error(origin, error);
     }
 
     pub fn clear_peer_state(&mut self) {
@@ -49,6 +50,7 @@ impl ApplicationModel {
             next_correlation: self.next_correlation,
             settled_replies: self.settled_replies.clone(),
             notices: self.notices.clone(),
+            annotation: self.annotation.bootstrap_baseline(),
             connection: ConnectionState::AwaitingBootstrap,
             ..Self::default()
         };
@@ -56,10 +58,9 @@ impl ApplicationModel {
         for snapshot in snapshots {
             replacement.install_snapshot(snapshot)?;
         }
-        replacement.seed_event_frontiers();
         replacement.notices.end_bootstrap();
-        replacement.notices.condition(super::notices::Origin::Transport, None);
-        replacement.notices.condition(super::notices::Origin::Protocol, None);
+        replacement.notices.clear_condition(super::notices::Origin::Transport);
+        replacement.notices.clear_condition(super::notices::Origin::Protocol);
         replacement.connection = ConnectionState::Connected;
         *self = replacement;
         Ok(())
@@ -76,7 +77,7 @@ impl ApplicationModel {
             .map(|pending| pending.endpoint)
         else {
             if correlation == 0 || correlation >= self.next_correlation {
-                self.report_error(UiError::protocol("IntentReply correlation was never issued"));
+                self.report_error(crate::view_model::notices::Origin::Protocol, UiError::protocol("IntentReply correlation was never issued"));
             }
             return None;
         };
@@ -127,7 +128,7 @@ impl ApplicationModel {
                     }
                 }
                 if current_failure {
-                    self.notices.observe(super::notices::Origin::Request(context), 0, correlation, Some(error.into()));
+                    self.notices.occurrence(context, correlation, error.into());
                 }
             }
             Ok(reply) => {
@@ -139,7 +140,7 @@ impl ApplicationModel {
                     ) {
                         self.dialog_context = None;
                     }
-                    self.report_error(UiError::protocol(
+                    self.report_error(crate::view_model::notices::Origin::Protocol, UiError::protocol(
                         "IntentReply kind did not match its pending endpoint",
                     ));
                 } else {
@@ -211,7 +212,7 @@ impl ApplicationModel {
             if let Some(target) = expected_target.as_ref() {
                 self.clear_dialog_target_if_matches(target);
             }
-            self.report_error(UiError::protocol(
+            self.report_error(crate::view_model::notices::Origin::Protocol, UiError::protocol(
                 "FileDialog reply kind or target did not match its pending context",
             ));
             return;
@@ -220,16 +221,16 @@ impl ApplicationModel {
         if terminal {
             if let Err(error) = self.validate_dialog_terminal(&snapshot) {
                 self.clear_dialog_target_if_matches(&snapshot.target);
-                self.report_error(error);
+                self.report_error(crate::view_model::notices::Origin::Protocol, error);
                 return;
             }
         }
-        match merge_dialog_snapshot(&mut self.file_dialog, snapshot) {
+        match self.install_dialog_snapshot(snapshot) {
             Err(error) => {
                 if let Some(target) = expected_target.as_ref() {
                     self.clear_dialog_target_if_matches(target);
                 }
-                self.report_error(error);
+                self.report_error(crate::view_model::notices::Origin::Protocol, error);
             }
             Ok(Observation::Installed | Observation::Current) if terminal => {
                 if let Some(target) = expected_target.as_ref() {
@@ -237,16 +238,6 @@ impl ApplicationModel {
                 }
             }
             Ok(Observation::Installed | Observation::Current | Observation::Stale) => {}
-        }
-    }
-
-    pub(super) fn install_compute_snapshot(&mut self, page: FeatureId, snapshot: ComputeUiState) {
-        let observed = snapshot.terminal.clone();
-        let result = self.compute_target(page).map_or(Ok(Observation::Stale), |target| merge_compute_state(target, snapshot));
-        match result {
-            Err(error) => self.report_error(error),
-            Ok(Observation::Installed | Observation::Current) => self.notices.observe_compute(page, &observed),
-            Ok(Observation::Stale) => {},
         }
     }
 
@@ -313,23 +304,6 @@ impl ApplicationModel {
         installed.persistence = progress.persistence;
         self.observe_training();
         Ok(Observation::Installed)
-    }
-
-    pub(super) fn compute_target(&mut self, page: FeatureId) -> Option<&mut ComputeUiState> {
-        match page {
-            FeatureId::Train => self
-                .workflow
-                .training
-                .as_mut()
-                .map(|snapshot| &mut snapshot.local),
-            FeatureId::Validate => self
-                .workflow
-                .validation
-                .as_mut()
-                .map(|snapshot| &mut snapshot.operation),
-            FeatureId::Export => self.workflow.export.as_mut(),
-            FeatureId::Predict | FeatureId::Live | FeatureId::Annotate | FeatureId::Explore => None,
-        }
     }
 
     pub(super) fn install_dataset_progress(
@@ -436,7 +410,7 @@ impl ApplicationModel {
         snapshot: FileDialogSnapshot,
     ) -> Result<Observation, UiError> {
         self.validate_dialog_terminal(&snapshot)?;
-        let observation = merge_dialog_snapshot(&mut self.file_dialog, snapshot)?;
+        let observation = self.install_dialog_snapshot(snapshot)?;
         if observation == Observation::Installed {
             self.dialog_context = None;
         }

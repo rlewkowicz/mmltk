@@ -1,3 +1,4 @@
+use super::notices::{Origin, failure, warning};
 use crate::generated::{
     ArtifactUiState, ComputeUiState, FeatureId, FileDialogFact, SettingsUiState, TrainingSnapshot,
 };
@@ -562,11 +563,11 @@ impl crate::generated::DatasetApplicationProjection<UiError> for ApplicationMode
                     value.terminal,
                     value.progress,
                 ) {
-                    self.report_error(error);
+                    self.report_error(crate::view_model::notices::Origin::Protocol, error);
                 } else { self.observe_dataset(); }
             }
             ApplicationEvent::DatasetDatasetChanged(value) => {
-                if let Err(error) = self.install_dataset_snapshot(value.snapshot) { self.report_error(error); }
+                if let Err(error) = self.install_dataset_snapshot(value.snapshot) { self.report_error(crate::view_model::notices::Origin::Protocol, error); }
             }
 
             _ => unreachable!("generated Dataset dispatch supplied another system event"),
@@ -579,7 +580,7 @@ impl crate::generated::DatasetApplicationProjection<UiError> for ApplicationMode
             | ApplicationReply::DatasetStop(snapshot) => snapshot,
             _ => unreachable!("generated Dataset dispatch supplied another system reply"),
         };
-        if let Err(error) = self.install_dataset_snapshot(snapshot) { self.report_error(error); }
+        if let Err(error) = self.install_dataset_snapshot(snapshot) { self.report_error(crate::view_model::notices::Origin::Protocol, error); }
     }
 
 }
@@ -596,7 +597,7 @@ impl crate::generated::TrainingApplicationProjection<UiError> for ApplicationMod
         match event {
             ApplicationEvent::TrainingTrainingProgress(value) => {
                 if let Err(error) = self.install_training_progress(value) {
-                    self.report_error(error);
+                    self.report_error(crate::view_model::notices::Origin::Protocol, error);
                 }
             }
             ApplicationEvent::TrainingTrainingChanged(value) => {
@@ -604,7 +605,7 @@ impl crate::generated::TrainingApplicationProjection<UiError> for ApplicationMod
             }
             ApplicationEvent::TrainingTrainingInspectionChanged(value) => {
                 if let Err(error) = self.install_checkpoint_inspection(value.inspection) {
-                    self.report_error(error);
+                    self.report_error(crate::view_model::notices::Origin::Protocol, error);
                 }
             }
             _ => unreachable!("generated Training dispatch supplied another system event"),
@@ -638,14 +639,14 @@ impl crate::generated::TrainingApplicationProjection<UiError> for ApplicationMod
             }
             ApplicationReply::TrainingInspectCheckpoint(value) => {
                 if let Err(error) = self.install_checkpoint_inspection(value.clone()) {
-                    self.report_error(error);
+                    self.report_error(crate::view_model::notices::Origin::Protocol, error);
                 }
                 self.workflow.train_continuation.reply(correlation, value);
                 return;
             }
             ApplicationReply::TrainingCancelCheckpointInspection(value) => {
                 if let Err(error) = self.install_checkpoint_inspection(value) {
-                    self.report_error(error);
+                    self.report_error(crate::view_model::notices::Origin::Protocol, error);
                 }
                 return;
             }
@@ -680,7 +681,7 @@ impl ApplicationModel {
 
     fn install_training_reply_snapshot(&mut self, snapshot: crate::generated::TrainingSnapshot) {
         match self.install_training_snapshot(snapshot) {
-            Err(error) => self.report_error(error),
+            Err(error) => self.report_error(crate::view_model::notices::Origin::Protocol, error),
             Ok(_) => {}
         }
     }
@@ -745,7 +746,7 @@ impl ApplicationModel {
         {
             self.workflow.validation_details = None;
         }
-        if installed { self.notices.observe_compute(FeatureId::Validate, &value.operation.terminal); }
+        if installed { observe_compute(&mut self.notices, FeatureId::Validate, &value.operation.terminal); }
         self.workflow.validation = Some(value);
         Ok(())
     }
@@ -764,7 +765,7 @@ impl crate::generated::ValidationApplicationProjection<UiError> for ApplicationM
             }
             ApplicationEvent::ValidationValidationChanged(value) => {
                 if let Err(error) = self.install_validation_snapshot(value.snapshot) {
-                    self.report_error(error);
+                    self.report_error(crate::view_model::notices::Origin::Protocol, error);
                 }
             }
             _ => unreachable!("generated Validation dispatch supplied another system event"),
@@ -788,7 +789,7 @@ impl crate::generated::ValidationApplicationProjection<UiError> for ApplicationM
             _ => unreachable!("generated Validation dispatch supplied another system reply"),
         };
         if let Err(error) = self.install_validation_snapshot(snapshot) {
-            self.report_error(error);
+            self.report_error(crate::view_model::notices::Origin::Protocol, error);
         }
     }
 }
@@ -798,7 +799,11 @@ impl crate::generated::ExportSystemApplicationProjection<UiError> for Applicatio
         &mut self,
         value: crate::generated::ComputeUiState,
     ) -> Result<(), UiError> {
-        merge_compute_snapshot(&mut self.workflow.export, value).map(|_| ())
+        let observation = merge_compute_snapshot(&mut self.workflow.export, value)?;
+        if observation != Observation::Stale {
+            observe_compute(&mut self.notices, FeatureId::Export, &self.workflow.export.as_ref().expect("installed Export snapshot").terminal);
+        }
+        Ok(())
     }
 
     fn project_exportsystem_event(&mut self, event: ApplicationEvent) {
@@ -835,12 +840,12 @@ impl crate::generated::PredictApplicationProjection<UiError> for ApplicationMode
                     &mut self.predict_snapshot,
                     value.snapshot,
                 ) {
-                    self.report_error(error);
+                    self.report_error(crate::view_model::notices::Origin::Protocol, error);
                 }
             }
             ApplicationEvent::PredictPredictChanged(value) => {
                 match self.install_predict_snapshot(value.snapshot) {
-                    Err(error) => self.report_error(error),
+                    Err(error) => self.report_error(crate::view_model::notices::Origin::Protocol, error),
                     Ok(Observation::Installed) => {
                         if self.source_for(PresentationSourceKind::Predict).is_some() {
                             self.set_foreground_visual(Some(PresentationSourceKind::Predict));
@@ -851,11 +856,11 @@ impl crate::generated::PredictApplicationProjection<UiError> for ApplicationMode
             }
             ApplicationEvent::PredictPredictFailed(value) => {
                 match self.install_predict_snapshot(value.snapshot) {
-                    Err(error) => self.report_error(error),
+                    Err(error) => self.report_error(crate::view_model::notices::Origin::Protocol, error),
                     Ok(Observation::Installed | Observation::Current) => {
                         if let Some(state) = &self.predict_snapshot {
                             if state.operation.terminal.outcome == crate::generated::ComputeOperationOutcome::Failed && !state.operation.active {
-                                self.notices.observe(super::notices::Origin::Compute(FeatureId::Predict), 0, state.operation.terminal.generation, Some(super::notices::failure(value.detail)));
+                                self.notices.terminal(super::notices::Origin::Compute(FeatureId::Predict), 0, state.operation.terminal.generation, || Some(super::notices::failure(value.detail)));
                             } else {
                                 self.notices.visual_condition(super::notices::Origin::PredictionPreview, state.operation.generationfrontier, state.frame.revision, Some(super::notices::warning("Prediction preview unavailable", value.detail)));
                             }
@@ -877,7 +882,7 @@ impl crate::generated::PredictApplicationProjection<UiError> for ApplicationMode
             _ => unreachable!("generated Predict dispatch supplied another system reply"),
         };
         if let Err(error) = self.install_predict_snapshot(snapshot) {
-            self.report_error(error);
+            self.report_error(crate::view_model::notices::Origin::Protocol, error);
         }
     }
 }
@@ -887,7 +892,7 @@ impl crate::generated::LiveApplicationProjection<UiError> for ApplicationModel {
         &mut self,
         value: crate::generated::LiveSnapshot,
     ) -> Result<(), UiError> {
-        merge_live_snapshot(&mut self.live_snapshot, value).map(|_| ())
+        self.install_live_snapshot(value).map(|_| ())
     }
 
     fn project_live_event(&mut self, event: ApplicationEvent) {
@@ -896,8 +901,8 @@ impl crate::generated::LiveApplicationProjection<UiError> for ApplicationModel {
                 snapshot,
             })
             | ApplicationEvent::LiveLiveChanged(crate::generated::LiveChanged { snapshot }) => {
-                match merge_live_snapshot(&mut self.live_snapshot, snapshot) {
-                    Err(error) => self.report_error(error),
+                match self.install_live_snapshot(snapshot) {
+                    Err(error) => self.report_error(crate::view_model::notices::Origin::Protocol, error),
                     Ok(Observation::Installed) => {
                         if self.presentation_model.foreground()
                             == Some(PresentationSourceKind::Live)
@@ -910,10 +915,10 @@ impl crate::generated::LiveApplicationProjection<UiError> for ApplicationModel {
             }
             ApplicationEvent::LiveLiveFailed(value) => {
                 let generation = value.snapshot.revision;
-                match merge_live_snapshot(&mut self.live_snapshot, value.snapshot) {
-                    Err(error) => self.report_error(error),
+                match self.install_live_snapshot(value.snapshot) {
+                    Err(error) => self.report_error(crate::view_model::notices::Origin::Protocol, error),
                     Ok(Observation::Installed | Observation::Current) => {
-                        self.notices.observe(super::notices::Origin::Compute(FeatureId::Live), 0, generation, Some(super::notices::failure(value.detail)));
+                        self.notices.terminal(super::notices::Origin::Compute(FeatureId::Live), 0, generation, || Some(super::notices::failure(value.detail)));
                     }
                     Ok(Observation::Stale) => {}
                 }
@@ -929,8 +934,8 @@ impl crate::generated::LiveApplicationProjection<UiError> for ApplicationModel {
             }
             _ => unreachable!("generated Live dispatch supplied another system reply"),
         };
-        if let Err(error) = merge_live_snapshot(&mut self.live_snapshot, snapshot) {
-            self.report_error(error);
+        if let Err(error) = self.install_live_snapshot(snapshot) {
+            self.report_error(crate::view_model::notices::Origin::Protocol, error);
         }
     }
 }
@@ -1451,5 +1456,84 @@ mod training_history_tests {
             }),
         );
         assert!(model.workflow.output.saved().is_none());
+    }
+}
+
+impl ApplicationModel {
+    pub(super) fn observe_dataset(&mut self) {
+        if let Some(state) = &self.workflow.dataset {
+            use crate::generated::ArtifactTerminalOutcome as Outcome;
+            self.notices.terminal(Origin::Dataset, 0, state.generation, || match state.terminal.outcome {
+                Outcome::Failed => Some(failure(state.terminal.detail.clone())),
+                Outcome::Refused => Some(warning("Compilation refused", state.terminal.detail.clone())),
+                _ => None,
+            });
+        }
+    }
+    pub(super) fn observe_training(&mut self) {
+        let Some(state) = &self.workflow.training else { return; };
+        self.notices.terminal(Origin::Provider, 0, state.offers.revision, ||
+            (state.offers.outcome == crate::generated::ProviderQueryOutcome::Failed)
+                .then(|| failure(state.offers.detail.clone())));
+        self.notices.terminal(Origin::Remote, 0, state.remote.revision, ||
+            matches!(state.remote.outcome, crate::generated::RemoteOperationOutcome::Failed | crate::generated::RemoteOperationOutcome::Inconclusive)
+                .then(|| failure(state.remote.detail.clone())));
+        let run = state.metrics.as_ref().map_or("", |record| record.runid.as_str());
+        self.notices.run_condition(Origin::History, run, state.persistence.degraded, || warning("History incomplete", format!("{} ({} records dropped)", state.persistence.error, state.persistence.droppedrecords)));
+        // The retained metrics owner observes subsequent accumulated drop conditions.
+        if self.notices.first_bootstrap() {
+            let dropped = state.metrics.as_ref().map_or(0, |record| record.droppedbefore);
+            self.notices.run_condition(Origin::HistoryDropped, run, (dropped > 0), || warning("History incomplete", format!("{dropped} training records were dropped.")));
+        }
+        observe_compute(&mut self.notices, FeatureId::Train, &state.local.terminal);
+    }
+    pub(super) fn observe_checkpoint(&mut self, state: &crate::generated::TrainingCheckpointInspection) {
+        use crate::generated::TrainingInspectionStatus;
+        self.notices.terminal(Origin::Checkpoint, 0, state.generation, || match state.status {
+            TrainingInspectionStatus::Failed => Some(failure(state.error.clone())),
+            TrainingInspectionStatus::Ready if state.checkpoint.is_none() => Some(UiError::protocol("Checkpoint inspection returned no capability.")),
+            _ => None,
+        });
+    }
+    pub(super) fn observe_predict(&mut self) {
+        if let Some(state) = &self.predict_snapshot {
+            self.notices.visual_condition(Origin::PredictionPreview, state.operation.generationfrontier, state.frame.revision, None);
+            self.notices.condition(Origin::PredictionInspection, (!state.inspection.error.is_empty()), || failure(state.inspection.error.clone()));
+            observe_compute(&mut self.notices, FeatureId::Predict, &state.operation.terminal);
+        }
+    }
+    fn install_live_snapshot(&mut self, value: crate::generated::LiveSnapshot) -> Result<Observation, UiError> {
+        let observation = merge_live_snapshot(&mut self.live_snapshot, value)?;
+        if observation != Observation::Stale {
+            let state = self.live_snapshot.as_ref().expect("installed Live snapshot");
+            self.notices.terminal(Origin::Compute(FeatureId::Live), 0, state.revision, || None);
+        }
+        Ok(observation)
+    }
+}
+
+pub(super) fn observe_compute(notices: &mut super::notices::NoticeStore, feature: FeatureId, state: &crate::generated::ComputeTerminal) {
+    use crate::generated::ComputeOperationOutcome as Outcome;
+    notices.terminal(Origin::Compute(feature), 0, state.generation, || match state.outcome {
+        Outcome::Failed => Some(failure(state.detail.clone())),
+        Outcome::Refused => Some(warning("Operation refused", state.detail.clone())),
+        _ => None,
+    });
+}
+
+impl ApplicationModel {
+    pub(super) fn install_compute_snapshot(&mut self, page: FeatureId, snapshot: crate::generated::ComputeUiState) {
+        let target = match page {
+            FeatureId::Train => self.workflow.training.as_mut().map(|state| &mut state.local),
+            FeatureId::Validate => self.workflow.validation.as_mut().map(|state| &mut state.operation),
+            FeatureId::Export => self.workflow.export.as_mut(),
+            FeatureId::Predict | FeatureId::Live | FeatureId::Annotate | FeatureId::Explore => None,
+        };
+        let Some(target) = target else { return; };
+        match super::reduction::merge_compute_state(target, snapshot) {
+            Err(error) => self.report_error(Origin::Protocol, error),
+            Ok(Observation::Installed | Observation::Current) => observe_compute(&mut self.notices, page, &target.terminal),
+            Ok(Observation::Stale) => {},
+        }
     }
 }

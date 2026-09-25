@@ -308,18 +308,18 @@ impl ApplicationModel {
 
 impl crate::generated::PresentationApplicationProjection<UiError> for ApplicationModel {
     fn project_presentation_snapshot(&mut self, value: PresentationState) -> Result<(), UiError> {
-        merge_presentation_snapshot(&mut self.presentation, value).map(|_| ())
+        self.install_presentation_snapshot(value).map(|_| ())
     }
 
     fn project_presentation_event(&mut self, event: ApplicationEvent) {
         match event {
             ApplicationEvent::PresentationPresentationFailed(value) => {
                 let generation = value.snapshot.revision;
-                match merge_presentation_snapshot(&mut self.presentation, value.snapshot) {
-                    Err(error) => self.report_error(error),
+                match self.install_presentation_snapshot(value.snapshot) {
+                    Err(error) => self.report_error(crate::view_model::notices::Origin::Protocol, error),
                     Ok(Observation::Stale) => {}
                     Ok(Observation::Installed | Observation::Current) => {
-                        self.notices.observe(super::notices::Origin::Presentation, 0, generation, Some(UiError::presentation(value.detail)));
+                        self.notices.terminal(super::notices::Origin::Presentation, 0, generation, || Some(UiError::presentation(value.detail)));
                     }
                 }
             }
@@ -331,8 +331,8 @@ impl crate::generated::PresentationApplicationProjection<UiError> for Applicatio
         let ApplicationReply::PresentationSelect(snapshot) = reply else {
             unreachable!("generated Presentation dispatch supplied another system reply");
         };
-        if let Err(error) = merge_presentation_snapshot(&mut self.presentation, snapshot) {
-            self.report_error(error);
+        if let Err(error) = self.install_presentation_snapshot(snapshot) {
+            self.report_error(crate::view_model::notices::Origin::Protocol, error);
         }
     }
 }
@@ -1284,8 +1284,28 @@ mod tests {
         assert_eq!(model.predict_snapshot.as_ref().unwrap().frame, image.frame);
         assert!(model.notices.is_empty());
         model.peer_disconnected(UiError::transport("reconnect"));
-        assert!(model.predict_snapshot.is_none());
-        model.install_predict_snapshot(cancellation).unwrap();
-        assert_eq!(model.predict_snapshot.as_ref().unwrap().revision, 15);
+        assert_eq!(model.predict_snapshot.as_ref(), Some(&cancellation));
+        assert!(!model.compute_stop_available(FeatureId::Predict));
+        assert!(!model.predict_pause_available());
+        assert!(model.begin_intent(ApplicationIntentEndpoint::PredictStart).is_err());
+        // Reconnect replaces retained logical facts authoritatively, including a
+        // lower revision; disconnected retention does not grant admission.
+        let snapshots: Vec<_> = crate::generated::application_snapshot_defaults().unwrap().into_iter().map(|fact| fact.value).collect();
+        let replacement = snapshots.iter().find_map(|snapshot| match snapshot {
+            crate::generated::ApplicationSnapshot::Predict(state) => Some(state.clone()), _ => None,
+        }).unwrap();
+        model.install_bootstrap(crate::generated::SCHEMA_FINGERPRINT, snapshots).unwrap();
+        assert_eq!(model.predict_snapshot, Some(replacement));
+        assert!(model.begin_intent(ApplicationIntentEndpoint::PredictStart).is_ok());
+    }
+}
+
+impl ApplicationModel {
+    fn install_presentation_snapshot(&mut self, value: PresentationState) -> Result<Observation, UiError> {
+        let observation = merge_presentation_snapshot(&mut self.presentation, value)?;
+        if observation != Observation::Stale {
+            self.notices.terminal(super::notices::Origin::Presentation, 0, self.presentation.as_ref().expect("installed Presentation snapshot").revision, || None);
+        }
+        Ok(observation)
     }
 }

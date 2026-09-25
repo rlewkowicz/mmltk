@@ -26,7 +26,7 @@ impl App {
                     self.flush_settings_edits();
                 } else {
                     self.settings.settle_failure(None);
-                    self.model.report_error(UiError::protocol(
+                    self.model.report_error(crate::view_model::notices::Origin::Protocol, UiError::protocol(
                         "settings reply did not install an authoritative snapshot",
                     ));
                 }
@@ -57,7 +57,7 @@ impl App {
                 }
             } else {
                 self.settings.settle_failure(None);
-                self.model.report_error(UiError::protocol(
+                self.model.report_error(crate::view_model::notices::Origin::Protocol, UiError::protocol(
                     "settings reset reply did not install an authoritative snapshot",
                 ));
             }
@@ -88,6 +88,7 @@ impl App {
     pub(super) fn on_file_dialog(&mut self, message: crate::view::file_dialog::Message) {
         match crate::view::file_dialog::update(message) {
             crate::view::file_dialog::Outcome::StopRequested => {
+                self.model.begin_admission(ApplicationIntentEndpoint::FileDialogStop);
                 match self.model.prepare_dialog_stop() {
                     Ok(_) => {
                         self.submit_intent(
@@ -95,7 +96,7 @@ impl App {
                             crate::generated::encode_filedialog_Stop,
                         );
                     }
-                    Err(error) => self.model.report_error(error),
+                    Err(error) => self.model.report_admission_error(ApplicationIntentEndpoint::FileDialogStop, error),
                 }
             }
         }
@@ -113,8 +114,9 @@ impl App {
                 }
             }
             Ok(Some(crate::view::settings::Outcome::ResetRequested)) => {
+                self.model.begin_admission(ApplicationIntentEndpoint::SettingsReset);
                 if self.settings.has_local_edits() || !self.model.settings_reset_available() {
-                    self.model.report_error(UiError::busy(
+                    self.model.report_admission_error(ApplicationIntentEndpoint::SettingsReset, UiError::busy(
                         "Wait for the current settings mutation to finish.",
                     ));
                 } else {
@@ -127,17 +129,18 @@ impl App {
                 }
             }
             Ok(Some(crate::view::settings::Outcome::Closed)) | Ok(None) => {}
-            Err(detail) => self.model.report_error(UiError::protocol(detail)),
+            Err(detail) => self.model.report_error(crate::view_model::notices::Origin::Protocol, UiError::protocol(detail)),
         }
         Task::none()
     }
 
     pub(super) fn open_dialog(&mut self, stable_field_id: u64) {
+        self.model.begin_admission(ApplicationIntentEndpoint::FileDialogOpen);
         let active_feature = self.workspace.active();
         let Some(fact) = crate::generated::FILE_DIALOGS.iter().find(|dialog| {
             dialog.stable_field_id == stable_field_id && dialog.workflows.contains(&active_feature)
         }) else {
-            self.model.report_error(UiError {
+            self.model.report_admission_error(ApplicationIntentEndpoint::FileDialogOpen, UiError {
                 kind: crate::view_model::UiErrorKind::InvalidIntent,
                 title: "File selection unavailable",
                 detail: "The requested file field is not available on the active page.".to_owned(),
@@ -147,13 +150,13 @@ impl App {
         if self.settings.has_local_edits()
             || !self.model.file_dialog_open_available(fact, active_feature)
         {
-            self.model.report_error(UiError::busy(
+            self.model.report_admission_error(ApplicationIntentEndpoint::FileDialogOpen, UiError::busy(
                 "A file selection request is already active or pending.",
             ));
             return;
         }
         if let Err(error) = self.model.register_dialog(fact, active_feature) {
-            self.model.report_error(error);
+            self.model.report_admission_error(ApplicationIntentEndpoint::FileDialogOpen, error);
             return;
         }
         self.submit_file_dialog_open(crate::generated::FileDialogTarget::SettingsFieldTarget(
@@ -164,14 +167,15 @@ impl App {
     }
 
     pub(super) fn open_model_dialog(&mut self, target: crate::generated::FileDialogTarget) {
+        self.model.begin_admission(ApplicationIntentEndpoint::FileDialogOpen);
         if self.settings.has_local_edits() {
-            self.model.report_error(UiError::busy(
+            self.model.report_admission_error(ApplicationIntentEndpoint::FileDialogOpen, UiError::busy(
                 "Wait for current settings edits before selecting a model.",
             ));
             return;
         }
         if let Err(error) = self.model.register_model_dialog(&target) {
-            self.model.report_error(error);
+            self.model.report_admission_error(ApplicationIntentEndpoint::FileDialogOpen, error);
             return;
         }
         self.submit_file_dialog_open(target);

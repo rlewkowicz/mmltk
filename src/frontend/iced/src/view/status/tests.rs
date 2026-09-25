@@ -35,7 +35,7 @@ fn healthy_and_alert_themes_preserve_exact_border_and_fill_rules() {
 #[test]
 fn only_visible_controls_participate_in_status_traversal() {
     let mut component = Component::default(); let mut notices = NoticeStore::default();
-    notices.observe(Origin::Provider, 0, 1, Some(failure("one")));
+    notices.terminal(Origin::Provider, 0, 1, || Some(failure("one")));
     let id = notices.latest().unwrap().id;
     assert_eq!(component.controls(&notices), [Control::Trigger]);
     component.activate(Opening::Keyboard, true); component.focus = Some(Control::Trigger);
@@ -48,7 +48,7 @@ fn only_visible_controls_participate_in_status_traversal() {
 fn detail_selection_is_retained_read_only_and_replaced_only_with_its_content_version() {
     let mut component = Component::default();
     let mut notices = NoticeStore::default();
-    notices.observe(Origin::Provider, 0, 1, Some(failure("first\n\nmiddle\nlast")));
+    notices.terminal(Origin::Provider, 0, 1, || Some(failure("first\n\nmiddle\nlast")));
     let id = notices.latest().unwrap().id;
     component.sync(&notices);
     component.select_detail(id, iced::widget::text_editor::Action::SelectAll);
@@ -57,7 +57,7 @@ fn detail_selection_is_retained_read_only_and_replaced_only_with_its_content_ver
     assert_eq!(component.details[0].content.text(), "first\n\nmiddle\nlast");
     component.sync(&notices);
     assert_eq!(component.details[0].content.selection().as_deref(), Some("first\n\nmiddle\nlast"));
-    notices.observe(Origin::Provider, 0, 1, Some(failure("updated")));
+    notices.terminal(Origin::Provider, 0, 1, || Some(failure("updated")));
     component.sync(&notices);
     assert_eq!(component.details[0].content.text(), "updated");
     notices.dismiss(id); component.sync(&notices); assert!(component.details.is_empty());
