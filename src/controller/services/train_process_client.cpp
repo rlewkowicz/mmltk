@@ -147,9 +147,22 @@ void TrainProcessClient::State::finish_failure_line() {
  std::string_view cause = failure_line;
  constexpr std::string_view envelope = "mmltk rfdetr error: ";
  if (cause.starts_with(envelope)) cause.remove_prefix(envelope.size());
- // A generic parent observation adds no cause to a worker's fatal report.
- const bool generic = cause == "local training exited unsuccessfully" || cause == "distributed training failed";
- if (!cause.empty() && !(generic && !failure_cause.empty())) failure_cause.assign(cause);
+ // Concrete failures outrank the globally agreed nonfinite symptom; its
+ // rank-local detail outranks healthy ranks' generic report. Parent envelopes
+ // add no cause. Break ties by text so worker scheduling cannot select a cause.
+ enum class Specificity { Parent, Nonfinite, NonfiniteDetail, Concrete };
+ const auto specificity = [](std::string_view value) {
+  if (value == "local training exited unsuccessfully" || value == "distributed training failed") return Specificity::Parent;
+  constexpr std::string_view nonfinite = "non-finite RF-DETR loss or gradients encountered during native training";
+  if (value == nonfinite) return Specificity::Nonfinite;
+  if (value.starts_with(nonfinite) &&
+      (value.contains(" nonfinite_losses=[") || value.contains(" nonfinite_param=") || value.contains(" nonfinite_grad="))) return Specificity::NonfiniteDetail;
+  return Specificity::Concrete;
+ };
+ if (!cause.empty()) {
+  const auto incoming = specificity(cause), retained = specificity(failure_cause);
+  if (failure_cause.empty() || incoming > retained || (incoming == retained && cause < failure_cause)) failure_cause.assign(cause);
+ }
  failure_line.clear();
 }
 bool TrainProcessClient::State::tracks(const pid_t candidate) const noexcept {

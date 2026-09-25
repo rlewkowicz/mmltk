@@ -178,7 +178,10 @@ TEST_CASE("Repeated global windows rank slicing and semantic keys survive physic
   std::vector<std::shared_ptr<const mmltk::backend::data::DatasetIndexSchedule>> ranks;
   for (std::uint32_t rank = 0; rank < world; ++rank) {
    ranks.push_back(plan.rank_schedule(epoch, rank, world));
-   CHECK(ranks.back()->microbatch_keys == epoch.schedule->microbatch_keys);
+   const auto slice = plan.rank_slice(rank, world);
+   CHECK(ranks.back()->image_indices.size() == epoch.microbatches * slice.count);
+   if (slice.count) CHECK(ranks.back()->microbatch_keys == epoch.schedule->microbatch_keys);
+   else CHECK(ranks.back()->microbatch_keys.empty());
   }
   for (std::size_t batch = 0; batch < epoch.microbatches; ++batch) {
    std::vector<std::uint64_t> keys;

@@ -1515,6 +1515,28 @@ void test_all_supervision_routes_execute_fixture_backed_training() {
    request.training_supervision = routes[route_index];
    const auto result = rfdetr::run_training(request);
    require_selected_evaluation(request, result);
+   if (route_index == 0 && lanes == 1) {
+    // Finite classifier logits overflow the real criterion's scalar sum.
+    // Initialization remains finite, so this reaches lane result settlement
+    // and the optimizer attempt's loss-failure path, not admission rejection.
+    {
+     torch::NoGradGuard no_grad;
+     seed_model.named_parameters(true)["class_embed.bias"].fill_(std::numeric_limits<float>::max() / 2);
+    }
+    rfdetr::testsupport::set_synthetic_model_state(checkpoint, rfdetr::testsupport::clone_normalized_model_state(seed_model));
+    const auto failure_weights = root / "nonfinite-criterion.pt";
+    rfdetr::save_native_checkpoint(failure_weights, checkpoint);
+    auto failing = request;
+    failing.weights_path = failure_weights;
+    failing.output_dir = root / "nonfinite-criterion";
+    std::string failure;
+    try { static_cast<void>(rfdetr::run_training(failing)); }
+    catch (const std::runtime_error& error) { failure = error.what(); }
+    INFO(failure);
+    REQUIRE(failure.find("non-finite RF-DETR loss or gradients encountered during native training") != std::string::npos);
+    REQUIRE(failure.find("nonfinite_losses=[") != std::string::npos);
+    REQUIRE(failure.find("loss_ce=inf") != std::string::npos);
+   }
    if (result.test_summary) REQUIRE(*result.test_summary == result.history.front().val_summary);
    std::stop_source cancelled_inspection;
    cancelled_inspection.request_stop();

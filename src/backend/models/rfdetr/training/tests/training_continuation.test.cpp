@@ -218,6 +218,7 @@ TEST_CASE("Continuation preserves held SGD values logical offsets donor identiti
  values.epoch_policy = {true, true};
  values.data.epoch = 0;
  values.data.next_microbatch = 2;
+ values.epoch_metrics = {2, 3.0, 1.0, 2.0, {}};
  values.data.donors = {{7, 3, true}, {2, 9, true}};
  auto input = continuation_fixture(request, values);
  const auto saved = r::detail::read_training_continuation(input);
@@ -225,6 +226,8 @@ TEST_CASE("Continuation preserves held SGD values logical offsets donor identiti
  CHECK(saved->configuration == request);
  CHECK(saved->values.schedule == values.schedule);
  CHECK(saved->values.data == values.data);
+ CHECK(saved->values.epoch_metrics.microbatches == 2);
+ CHECK(saved->values.epoch_metrics.loss_sum == 3.0);
  CHECK(saved->values.epoch_policy == values.epoch_policy);
  auto extended = request;
  extended.epochs = 12;
@@ -237,7 +240,7 @@ TEST_CASE("Continuation preserves held SGD values logical offsets donor identiti
  CHECK(policy.enter(1, extended.epochs) == values.epoch_policy);
  extended.disable_augmentation_last_epochs = 3;
  REQUIRE_THROWS(r::detail::require_active_training_continuation(*saved, extended));
- for (int fault = 0; fault < 5; ++fault) {
+ for (int fault = 0; fault < 6; ++fault) {
   auto invalid = values;
   switch (fault) {
    case 0: ++invalid.data.next_microbatch; break;
@@ -245,6 +248,7 @@ TEST_CASE("Continuation preserves held SGD values logical offsets donor identiti
    case 2: invalid.schedule.successful_updates = 2; break;
    case 3: ++invalid.schedule.warmup_microbatches; break;
    case 4: invalid.data.donors.pop_back(); break;
+   case 5: ++invalid.epoch_metrics.microbatches; break;
   }
   INFO(fault);
   REQUIRE_THROWS(continuation_fixture(request, invalid));
@@ -328,13 +332,14 @@ TEST_CASE("Resolved current Resume preserves recipe optimizer EMA and an unfinis
  torch::OrderedDict<std::string, torch::Tensor> resumed_inventory;
  resumed_inventory.insert(name, resumed_weight);
  auto resumed = r::build_optimizer(resumed_inventory, active);
- auto admitted_resume = r::load_resume_checkpoint_state(path, admitted.model_state, *continuation, resumed.optimizer, active, {name}, {resumed_weight}, true);
+ auto admitted_resume = r::load_resume_checkpoint_state(path, admitted.model_state, *continuation, resumed.optimizer, {name}, {resumed_weight});
  REQUIRE(admitted_resume.start_epoch == 1);
  REQUIRE(admitted_resume.scaler_scale == 128);
  REQUIRE(admitted_resume.scaler_growth_tracker == 7);
- REQUIRE(admitted_resume.restored_ema.has_value());
- REQUIRE(admitted_resume.restored_ema->completed_updates() == 3);
- REQUIRE(torch::equal(admitted_resume.restored_ema->shadow_params()[0], saved_shadow));
+ REQUIRE(admitted_resume.ema_cpu_shadow.has_value());
+ auto restored_ema = r::ModelEma::from_cpu_shadow({resumed_weight}, *admitted_resume.ema_cpu_shadow, active.ema_decay, active.ema_tau, continuation->values.ema_completed_updates);
+ REQUIRE(restored_ema.completed_updates() == 3);
+ REQUIRE(torch::equal(restored_ema.shadow_params()[0], saved_shadow));
  REQUIRE(torch::equal(resumed_weight, saved_weight));
  resumed.optimizer.commit(std::move(*admitted_resume.optimizer_candidate));
  r::TrainRecipeSettings schedule;
@@ -350,9 +355,9 @@ TEST_CASE("Resolved current Resume preserves recipe optimizer EMA and an unfinis
  built.optimizer.step();
  resumed.optimizer.step();
  ema.update();
- admitted_resume.restored_ema->update();
+ restored_ema.update();
  REQUIRE(torch::equal(weight, resumed_weight));
- REQUIRE(torch::equal(ema.shadow_params()[0], admitted_resume.restored_ema->shadow_params()[0]));
+ REQUIRE(torch::equal(ema.shadow_params()[0], restored_ema.shadow_params()[0]));
  auto invalid = active;
  invalid.recipe.warmup_epochs = 2.0;
  REQUIRE_THROWS(r::detail::admit_training_configuration(admitted.artifacts.config, admitted.model_state.admitted_archive(), invalid));

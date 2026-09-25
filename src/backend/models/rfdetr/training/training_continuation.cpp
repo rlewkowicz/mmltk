@@ -109,6 +109,8 @@ void validate_values(const TrainingContinuationValues& values, const TrainReques
      values.data.epoch < static_cast<std::uint64_t>(values.epoch) || values.data.epoch > static_cast<std::uint64_t>(values.epoch) + 1 ||
      (values.data.epoch > static_cast<std::uint64_t>(values.epoch) && values.data.next_microbatch != 0) ||
      values.data.next_microbatch % expected.microbatches_per_attempt) throw std::runtime_error("invalid checkpoint logical data continuation");
+ if (values.data.next_microbatch && (values.epoch_metrics.microbatches != values.data.next_microbatch || !std::isfinite(values.epoch_metrics.loss_sum) || !std::isfinite(values.epoch_metrics.class_loss_sum) || !std::isfinite(values.epoch_metrics.box_loss_sum)))
+  throw std::runtime_error("checkpoint epoch metric accumulation differs from data cursor");
  const auto& clock = values.schedule;
  if (!clock.epoch_event_applied || clock.epoch != static_cast<std::uint64_t>(values.epoch) || clock.nb_ref % expected.microbatches_per_attempt ||
      clock.steps_ref != clock.nb_ref / expected.microbatches_per_attempt || clock.consumed_microbatches % expected.microbatches_per_attempt || clock.consumed_attempts != clock.consumed_microbatches / expected.microbatches_per_attempt)

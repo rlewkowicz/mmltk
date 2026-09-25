@@ -147,6 +147,9 @@ TEST_CASE("Empty stock masks retain representation-specific connected expression
    const auto empty = targets(torch::empty({0, 4}), torch::empty({0}, torch::kInt64));
    const auto losses = rf::detection_loss_dict(outputs, empty, config, true, 1.0);
    REQUIRE(losses.at("loss_ce").item<float>() > 0.0F);
+   REQUIRE(losses.at("matched_count").item<float>() == 0.F);
+   REQUIRE(losses.at("class_error_sum").item<float>() == 0.F);
+   REQUIRE(losses.at("image_count").item<float>() == 1.F);
    for (const auto suffix : {"", "_0", "_enc"}) {
     const auto mask_loss = losses.at(std::string("loss_mask_ce") + suffix) + losses.at(std::string("loss_mask_dice") + suffix);
     REQUIRE(mask_loss.requires_grad());
@@ -311,6 +314,10 @@ TEST_CASE("Stock matched classification and box losses follow independent groupe
      classification =
       ((labels * torch::softplus(-l) + (1 - labels) * torch::softplus(l)) * (1 - probability_target).square() * (config.focal_alpha * labels + (1 - config.focal_alpha) * (1 - labels))).sum() / groups;
     }
+    REQUIRE(losses.at("matched_count").item<float>() == groups);
+    REQUIRE(losses.at("class_error_sum").item<float>() == 0.F);
+    REQUIRE(losses.at("image_count").item<float>() == 1.F);
+    REQUIRE(losses.at("cardinality_error_sum").item<float>() == 2 * groups - 1);
     REQUIRE(torch::allclose(losses.at("loss_ce"), classification, 1e-5, 1e-6));
     REQUIRE(torch::allclose(losses.at("loss_bbox"), l1, 1e-5, 1e-6));
     REQUIRE(torch::allclose(losses.at("loss_giou"), box_loss, 1e-5, 1e-6));
@@ -322,8 +329,8 @@ TEST_CASE("Stock matched classification and box losses follow independent groupe
      count.add_(3 * groups);
     });
     REQUIRE(reductions == 1);
-    REQUIRE(torch::allclose(distributed.at("loss_ce"), classification / 2, 1e-5, 1e-6));
-    REQUIRE(torch::allclose(distributed.at("loss_bbox"), l1 / 2, 1e-5, 1e-6));
+    REQUIRE(torch::allclose(distributed.at("loss_ce"), classification / 4, 1e-5, 1e-6));
+    REQUIRE(torch::allclose(distributed.at("loss_bbox"), l1 / 4, 1e-5, 1e-6));
     auto summed_config = config;
     summed_config.sum_group_losses = true;
     const auto summed = rf::detection_loss_dict(output, gt, summed_config, true, false);

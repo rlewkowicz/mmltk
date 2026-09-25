@@ -2,6 +2,8 @@
 #include <memory>
 #include <cstdint>
 #include "training_scalar_packet.h"
+#include "training_metric_state.h"
+#include "training_ops_private.h"
 namespace mmltk::backend::models::rfdetr {
 struct TrainingMetricSnapshot {
  double loss_sum = 0.0;
@@ -21,9 +23,12 @@ public:
  TrainingMetricHandoff(const TrainingMetricHandoff&) = delete;
  TrainingMetricHandoff& operator=(const TrainingMetricHandoff&) = delete;
  void reset_epoch();
- void begin_wave();
- void accumulate(const torch::Tensor& loss, const torch::Tensor& class_loss, const torch::Tensor& box_loss, const scalar_packet::Tensors& scalars);
- TrainingMetricSnapshot complete_step(const torch::Tensor& found_inf, int64_t wave_micro_batches, int64_t epoch_micro_batches);
+ void restore_epoch(const TrainingEpochMetricState&);
+ [[nodiscard]] const TrainingEpochMetricState& state() const;
+ void begin_attempt(std::size_t contributions);
+ void accumulate_empty();
+ void accumulate(const torch::Tensor& loss, const torch::Tensor& class_loss, const torch::Tensor& box_loss, const scalar_packet::Tensors& scalars, const TrainingDiagnosticTensors& diagnostics = {});
+ TrainingMetricSnapshot complete_step(const torch::Tensor& found_inf, int64_t wave_micro_batches, int64_t epoch_micro_batches, const DistributedContext& distributed = {});
  torch::Tensor loss_sum() const;
  torch::Tensor epoch_count(std::int64_t count);
  double epoch_average();

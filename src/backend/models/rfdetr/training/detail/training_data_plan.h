@@ -15,6 +15,7 @@ struct DatasetIndexSchedule;
 }
 namespace mmltk::backend::models::rfdetr {
 struct TrainingImageClasses final { std::vector<std::uint32_t> classes; };
+struct TrainingRankSlice final { std::uint64_t begin = 0; std::uint64_t count = 0; };
 struct TrainingEpochDraws final {
  std::shared_ptr<const mmltk::backend::data::DatasetIndexSchedule> schedule;
  std::vector<std::uint64_t> repeated_exposure;
@@ -35,6 +36,8 @@ public:
  [[nodiscard]] const std::vector<TrainingShard>& shards() const noexcept { return shards_; }
  [[nodiscard]] TrainingEpochDraws epoch(std::size_t model, std::uint64_t epoch) const;
  [[nodiscard]] std::shared_ptr<const mmltk::backend::data::DatasetIndexSchedule> rank_schedule(const TrainingEpochDraws&, std::uint32_t rank, std::uint32_t world) const;
+ [[nodiscard]] TrainingRankSlice rank_slice(std::uint32_t rank, std::uint32_t world) const;
+ [[nodiscard]] static TrainingRankSlice rank_slice(std::uint64_t batch, std::uint32_t rank, std::uint32_t world);
  [[nodiscard]] std::uint64_t hash() const noexcept { return hash_; }
  [[nodiscard]] std::uint64_t microbatch_images() const noexcept { return batch_; }
 private:

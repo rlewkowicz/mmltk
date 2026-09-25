@@ -30,7 +30,7 @@ public:
 private:
  [[nodiscard]] torch::Tensor scaled_loss(const torch::Tensor& loss) const { return loss * factor_; }
  // Stock user loss / K and closure / K, fused with AMP scaling into one
- // scalar tensor multiplication; distributed averaging/unscale/clip follow.
+ // scalar tensor multiplication; distributed SUM/unscale/clip follow.
  double factor_;
  bool amp_;
  at::ScalarType dtype_;

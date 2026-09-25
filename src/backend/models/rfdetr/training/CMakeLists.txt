@@ -39,6 +39,7 @@ mmltk_register_retained_module_importers(
     training_snapshot.cpp)
 mmltk_register_ordinary_sources(
     mmltk_backend_models_rfdetr_training
+    training_gradient_reducer.cpp
     training_data_plan.cpp
     training_schedule.cpp
     native_optimizer.cpp
@@ -50,6 +51,7 @@ mmltk_register_ordinary_sources(
     telemetry_writer.cpp)
 mmltk_register_private_headers(
     mmltk_backend_models_rfdetr_training
+    detail/training_gradient_reducer.h
     detail/training_data_plan.h
     detail/training_data_state.h
     detail/training_schedule.h
@@ -65,6 +67,7 @@ mmltk_register_private_headers(
     detail/training_step.h
     detail/training_lanes.h
     detail/training_snapshot.h
+    detail/training_metric_state.h
     detail/training_metrics.h)
 mmltk_register_header_isolation(mmltk_backend_models_rfdetr_training)
 target_include_directories(mmltk_backend_models_rfdetr_training PRIVATE
@@ -116,12 +119,16 @@ function(mmltk_add_backend_models_rfdetr_training_tests)
     mmltk_register_private_headers(
         mmltk_backend_models_rfdetr_training_tests
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/model_state_fixture.h
-        ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/training_continuation_fixture.h)
+        ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/training_continuation_fixture.h
+        ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/training_gradient_fixture.h)
     mmltk_register_retained_module_importers(
         mmltk_backend_models_rfdetr_training_tests ${sources})
     mmltk_register_ordinary_sources(
         mmltk_backend_models_rfdetr_training_tests
         ${ordinary_sources}
+        ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/training_gradient_fixture.cpp
+        ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/training_gradient_reducer.test.cpp
+        ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/distributed_training.test.cpp
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/execution_policy.test.cpp
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/evaluation_runtime.test.cpp
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/telemetry_writer.test.cpp
@@ -143,6 +150,7 @@ function(mmltk_add_backend_models_rfdetr_training_tests)
         mmltk::backend::models::rfdetr::training
         mmltk::backend::ml::torch_dependencies
         mmltk::common::system
+        mmltk::frameworks::process
         mmltk_backend_data_test_support
         CUDA::cudart)
     if(BUILD_RFDETR_PYTHON_CHECKPOINT_LOADER)
@@ -160,6 +168,24 @@ function(mmltk_add_backend_models_rfdetr_training_tests)
     catch_discover_tests(mmltk_backend_models_rfdetr_training_tests
         TEST_PREFIX "backend::models::rfdetr::training::"
         DISCOVERY_MODE PRE_TEST ADD_TAGS_AS_LABELS)
+
+    add_executable(mmltk_rfdetr_distributed_training_worker EXCLUDE_FROM_ALL)
+    mmltk_configure_component(mmltk_rfdetr_distributed_training_worker PRIVATE_DECLARATIONS)
+    mmltk_register_ordinary_sources(mmltk_rfdetr_distributed_training_worker
+        ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/distributed_training_worker.cpp
+        ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/training_gradient_fixture.cpp)
+    mmltk_register_private_headers(mmltk_rfdetr_distributed_training_worker
+        ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/training_gradient_fixture.h)
+    target_include_directories(mmltk_rfdetr_distributed_training_worker PRIVATE ${CMAKE_SOURCE_DIR})
+    target_link_libraries(mmltk_rfdetr_distributed_training_worker PRIVATE
+        mmltk::backend::models::rfdetr::training
+        mmltk::backend::ml::cuda
+        mmltk::backend::ml::torch_dependencies)
+    mmltk_target_cuda_architectures(mmltk_rfdetr_distributed_training_worker)
+    mmltk_enable_native_runtime_rpath(mmltk_rfdetr_distributed_training_worker)
+    add_dependencies(mmltk_backend_models_rfdetr_training_tests mmltk_rfdetr_distributed_training_worker)
+    target_compile_definitions(mmltk_backend_models_rfdetr_training_tests PRIVATE
+        MMLTK_DISTRIBUTED_TRAINING_WORKER="$<TARGET_FILE:mmltk_rfdetr_distributed_training_worker>")
 
     add_executable(mmltk_rfdetr_train_profile_runner EXCLUDE_FROM_ALL)
     mmltk_configure_component(

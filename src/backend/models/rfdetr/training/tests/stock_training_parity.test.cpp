@@ -346,15 +346,10 @@ TEST_CASE("Production step and canonical groups match distributed stock AdamW wi
        const auto focal = ((labels * torch::softplus(-logits) + (1 - labels) * torch::softplus(logits)) * torch::pow(1 - (probability * labels + (1 - probability) * (1 - labels)), 2) *
                            (0.25 * labels + 0.75 * (1 - labels)))
                            .sum();
-       // Upstream user loss / K, Lightning closure / K, distributed gradient
-       // average / 2. Target normalization already used global count / 2.
-       expected_loss += focal / 1.5 / count / count / 2;
+       // Global logical count and gradient SUM, with both fixed K divisions.
+       expected_loss += focal / 3 / count / count;
       }
      const auto gradients = torch::autograd::grad({expected_loss}, expected_parameters);
-     {
-      torch::NoGradGuard guard;
-      for (auto& p : optimizer.parameters()) p.mutable_grad().div_(2);
-     }
      REQUIRE(scaler.check_and_unscale_(optimizer).item<float>() == 0.0F);
      auto squared = torch::zeros({}, options);
      for (size_t i = 0; i < 4; ++i) {

@@ -170,7 +170,12 @@ and validated checkpoint continuation.
 Native training configuration owns one recipe vocabulary across global defaults
 and stable independent model settings, with checked logical batch and admission
 facts. Global microbatches, accumulation, data identity, and stochastic inputs
-remain independent of physical worker capacity and rank slicing. Training owns
+remain independent of physical worker capacity and rank slicing. Each logical
+microbatch retains its global criterion normalization and fixed accumulation
+weight; ranks sum its gradients, including zero contributions from empty slices.
+The session orders distributed communication, while a trajectory owns bounded
+reusable gradient storage and physical completion before globally agreed updates.
+Live and saved metrics describe the global trajectory. Training owns
 scheduler clocks, held optimizer values, and separate final-epoch encoder and
 augmentation policies. Exact continuation restores these values and complete
 named model state before applying a newly due policy; applied policies remain

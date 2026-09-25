@@ -95,7 +95,7 @@ void zero_grad_parameters(std::vector<torch::Tensor>& params, const bool set_to_
    continue;
   }
   auto& grad = param.mutable_grad();
-  grad.detach_();
+  grad = grad.detach();
   grad.zero_();
  }
 }

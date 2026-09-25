@@ -511,6 +511,12 @@ void exercise_roundtrip_transport(const FixtureSpec& fixture, const bool h2d, cu
  planned_loader.release_batch(batch);
  CHECK_FALSE(planned_loader.next_batch(batch));
  planned_loader.synchronize();
+ // A global training microbatch may have no images on this rank. Its loader
+ // receives an empty physical schedule; logical keys remain with the session.
+ planned_loader.begin_epoch(std::make_shared<DatasetIndexSchedule>());
+ CHECK(planned_loader.num_batches() == 0);
+ CHECK_FALSE(planned_loader.next_batch(batch));
+ planned_loader.synchronize();
  auto invalid = std::make_shared<DatasetIndexSchedule>();
  invalid->image_indices = {static_cast<std::uint32_t>(NUM_IMAGES)};
  REQUIRE_THROWS(planned_loader.begin_epoch(invalid));

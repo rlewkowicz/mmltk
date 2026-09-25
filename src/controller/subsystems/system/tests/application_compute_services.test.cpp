@@ -1439,4 +1439,43 @@ TEST_CASE("Train process distinguishes fatal causes from warnings and generic pa
   CHECK(result.terminal.error.find("Reduce batch") == std::string::npos);
  }
 }
+TEST_CASE("Train process selects distributed fatal detail independently of worker order", "[gui][services]") {
+ const bool reverse = GENERATE(false, true);
+ const std::string generic = "non-finite RF-DETR loss or gradients encountered during native training";
+ const std::string detailed = generic + " nonfinite_losses=[loss_ce=nan]";
+ std::string first = generic, second = detailed, expected = detailed;
+ SECTION("criterion identity survives a healthy worker report") {}
+ SECTION("parameter identity survives a healthy worker report") { second = expected = generic + " nonfinite_param=class_embed.weight"; }
+ SECTION("gradient identity survives a healthy worker report") { second = expected = generic + " nonfinite_grad=class_embed.bias"; }
+ SECTION("all workers report only the generic symptom") { second = expected = generic; }
+ SECTION("generic parent envelope cannot replace worker detail") { first = "distributed training failed"; }
+ SECTION("local parent envelope cannot replace worker detail") { first = "local training exited unsuccessfully"; }
+ SECTION("distinct concrete failure takes precedence over the agreed symptom") { first = expected = "CUDA out of memory. 42 MiB free."; }
+ SECTION("distinct concrete failures have stable precedence") {
+  first = expected = "CUDA out of memory. 42 MiB free.";
+  second = "invalid checkpoint";
+ }
+ SECTION("distinct detailed worker causes have stable precedence") {
+  first = expected = generic + " nonfinite_losses=[loss_bbox=inf]";
+ }
+ if (reverse) std::swap(first, second);
+ mmltk::testsupport::ScopedTempDir temp("mmltk-train-nonfinite-order");
+ const auto executable = script(temp, "printf 'fatal: mmltk rfdetr error: " + first +
+  "\\nfatal: mmltk rfdetr error: " + second + "\\n'\nexit 7\n");
+ auto client = TrainProcessClient::launch(train_request(temp.path() / "output"), executable);
+ // Exercise split envelopes without retaining console text.
+ std::string discarded;
+ while (client.stdout_fd() >= 0) {
+  REQUIRE(ready(client.stdout_fd()));
+  client.consume_output(discarded, 1U, 0U);
+ }
+ auto [source, token] = TrainProcessStopSource::Mint();
+ const auto result = client.Run(std::move(token));
+ REQUIRE(result.terminal.outcome == services::TrainProcessExitOutcome::Failed);
+ CHECK(result.terminal.exit_code == 7);
+ CHECK(result.terminal.error.starts_with("local training exited with status 7: " + expected));
+ CHECK(result.terminal.error.size() <= contracts::kComputeErrorCapacity);
+ CHECK(mmltk::common::types::valid_utf8(result.terminal.error));
+ CHECK(discarded.empty());
+}
 }  // namespace mmltk::controller::subsystems::system

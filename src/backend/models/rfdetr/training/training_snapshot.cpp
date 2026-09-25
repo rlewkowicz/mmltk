@@ -130,7 +130,7 @@ void save_resume_checkpoint(const std::filesystem::path& checkpoint_path, const 
  }
 }
 ResumeState load_resume_checkpoint_state(const std::filesystem::path& checkpoint_path, DecodedNativeModelState& admitted, const detail::TrainingContinuation& continuation, NativeOptimizer& optimizer,
- const TrainRequest& options, const std::vector<std::string>& parameter_names, const std::vector<torch::Tensor>& parameters, const bool main_process) {
+ const std::vector<std::string>& parameter_names, const std::vector<torch::Tensor>& parameters) {
  auto* retained = admitted.admitted_archive();
  if (!retained || !admitted.class_artifact) throw std::invalid_argument("full resume requires an admitted current native archive");
  admitted.class_artifact->RequireUnchanged();
@@ -146,13 +146,8 @@ ResumeState load_resume_checkpoint_state(const std::filesystem::path& checkpoint
  if (continuation.configuration.use_ema) {
   torch::serialize::InputArchive ema_archive;
   archive.read("ema_state", ema_archive);
-  const auto cpu_shadow = detail::read_ema_shadow_archive(ema_archive, parameter_names);
-  if (main_process) {
-   // The factory validates the entire CPU inventory once before copies.
-   state.restored_ema = ModelEma::from_cpu_shadow(parameters, cpu_shadow, options.ema_decay, static_cast<double>(options.ema_tau), continuation.values.ema_completed_updates);
-  } else {
-   ModelEma::validate_cpu_shadow(parameters, cpu_shadow);
-  }
+  state.ema_cpu_shadow = detail::read_ema_shadow_archive(ema_archive, parameter_names);
+  ModelEma::validate_cpu_shadow(parameters, *state.ema_cpu_shadow);
  }
  torch::serialize::InputArchive optimizer_archive;
  archive.read("optimizer", optimizer_archive);

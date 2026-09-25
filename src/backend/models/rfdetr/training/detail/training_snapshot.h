@@ -15,14 +15,15 @@ struct ResumeState {
  int start_epoch = 0;
  double best_regular = -std::numeric_limits<double>::infinity();
  double best_ema = -std::numeric_limits<double>::infinity();
- std::optional<ModelEma> restored_ema;
+ // Retained CPU admission; materialize only after the complete model broadcast.
+ std::optional<std::vector<torch::Tensor>> ema_cpu_shadow;
  std::optional<NativeOptimizer> optimizer_candidate;
  std::optional<float> scaler_scale;
  std::optional<int> scaler_growth_tracker;
 };
 ModelStateLoadSummary load_training_model_weights(NativeRfDetrModel&, const DecodedNativeModelState&, TrainingSupervisionRoute);
-ResumeState load_resume_checkpoint_state(const std::filesystem::path&, DecodedNativeModelState&, const detail::TrainingContinuation&, NativeOptimizer&, const TrainRequest&,
- const std::vector<std::string>&, const std::vector<torch::Tensor>&, bool);
+ResumeState load_resume_checkpoint_state(const std::filesystem::path&, DecodedNativeModelState&, const detail::TrainingContinuation&, NativeOptimizer&,
+ const std::vector<std::string>&, const std::vector<torch::Tensor>&);
 void save_collected_checkpoint(const std::filesystem::path&, const NativeCheckpointMetadata&, const NativeRfDetrModel&, const std::unordered_map<std::string, torch::Tensor>*, const char*, const char*,
  const std::filesystem::path&);
 std::unordered_map<std::string, torch::Tensor> ema_override_map(const std::vector<std::string>&, const ModelEma&);

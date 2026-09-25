@@ -1,6 +1,11 @@
 #pragma once
 #include "training_schedule.h"
+#include "src/frameworks/gpu/terminal_cuda_retirement_owner.h"
+#include <array>
 #include <numeric>
+#include <span>
+#include <string_view>
+#include <ATen/cuda/CUDAEvent.h>
 #include "src/backend/models/rfdetr/core/model.h"
 #include "training_scalar_packet.h"
 #include <cuda_runtime_api.h>
@@ -26,45 +31,46 @@ struct DistributedContext {
  bool enabled = false;
  int rank = 0;
  int world_size = 1;
+ int device_id = 0;
 #if defined(USE_C10D_NCCL)
  c10::intrusive_ptr<c10d::Store> store;
  c10::intrusive_ptr<c10d::Backend> process_group;
 #endif
 };
 void distributed_all_reduce_tensor(const DistributedContext& distributed, torch::Tensor& tensor);
-class WaveTargetNormalizer final {
+void distributed_abort(const DistributedContext&) noexcept;
+void distributed_agree(const DistributedContext&, std::string_view turn, std::span<const std::uint8_t> signature);
+void distributed_broadcast(const DistributedContext&, torch::Tensor&);
+struct TrainingPrecision final { at::ScalarType autocast_dtype = at::kFloat; bool fused_optimizer = false; };
+[[nodiscard]] TrainingPrecision agree_training_precision(const DistributedContext&, int device, bool amp, bool fused);
+void agree_training_topology(const DistributedContext&, int device);
+void agree_model_inventory(const DistributedContext&, const NativeRfDetrModel&, std::string_view turn);
+void broadcast_training_model(const DistributedContext&, NativeRfDetrModel&);
+class TrainingTargetCounts final {
 public:
- WaveTargetNormalizer(std::size_t lanes, int device_id, const DistributedContext& distributed);
- ~WaveTargetNormalizer() noexcept;
- WaveTargetNormalizer(const WaveTargetNormalizer&) = delete;
- WaveTargetNormalizer& operator=(const WaveTargetNormalizer&) = delete;
+ TrainingTargetCounts(std::size_t lanes, int device_id, const DistributedContext& distributed);
+ ~TrainingTargetCounts() noexcept;
+ TrainingTargetCounts(const TrainingTargetCounts&) = delete;
+ TrainingTargetCounts& operator=(const TrainingTargetCounts&) = delete;
+ void begin(std::size_t slots);
  void publish(std::size_t lane, std::int64_t target_count);
  void resolve(const DistributedContext& distributed, const torch::Device& device);
  [[nodiscard]] DeviceLossNormalizer consume(std::size_t lane, cudaStream_t stream);
  void fail(std::exception_ptr failure) noexcept;
 
 private:
- void rethrow_failure_locked() const;
- std::mutex mutex_;
- std::condition_variable condition_;
- std::vector<std::int64_t> host_counts_;
- std::vector<bool> published_;
- torch::Tensor device_counts_;
- std::exception_ptr failure_;
- std::size_t published_count_ = 0;
- int device_id_ = -1;
- const DistributedContext* distributed_ = nullptr;
- cudaEvent_t ready_ = nullptr;
- bool resolved_ = false;
- bool distributed_abort_requested_ = false;
+ struct State;
+ mmltk::frameworks::gpu::TerminalCudaRetirementOwner retirement_{1U};
+ mmltk::frameworks::gpu::TerminalCudaRetirementLease terminal_ = mmltk::frameworks::gpu::ReserveTerminalCudaLease(retirement_);
+ std::shared_ptr<State> state_;
 };
 template <class Result>
 class ParallelTrainingWave final {
 public:
- ParallelTrainingWave(const std::size_t lane_count, const bool active, const int device_id, const DistributedContext& distributed) : distributed_(&distributed) {
+ ParallelTrainingWave(const std::size_t lane_count, const bool active, const int device_id, const DistributedContext& distributed, std::shared_ptr<TrainingTargetCounts> counts = {}) : distributed_(&distributed) {
   futures_.reserve(lane_count);
   results_.reserve(lane_count);
-  if (active) { normalizer_ = std::make_shared<WaveTargetNormalizer>(lane_count, device_id, distributed); }
+  if (active) { normalizer_ = counts ? std::move(counts) : std::make_shared<TrainingTargetCounts>(lane_count, device_id, distributed); normalizer_->begin(lane_count); }
  }
  ~ParallelTrainingWave() noexcept {
   if (!settled_) {
@@ -74,12 +80,16 @@ public:
  }
  ParallelTrainingWave(const ParallelTrainingWave&) = delete;
  ParallelTrainingWave& operator=(const ParallelTrainingWave&) = delete;
- [[nodiscard]] const std::shared_ptr<WaveTargetNormalizer>& normalizer() const noexcept { return normalizer_; }
+ [[nodiscard]] const std::shared_ptr<TrainingTargetCounts>& normalizer() const noexcept { return normalizer_; }
  void add(std::future<Result> future) { futures_.push_back(std::move(future)); }
+ void resolve_counts(const torch::Device& device) {
+  if (normalizer_) normalizer_->resolve(*distributed_, device);
+  counts_resolved_ = true;
+ }
  template <class Consumer>
  void settle(const torch::Device& device, Consumer&& consume) {
   try {
-   if (normalizer_) { normalizer_->resolve(*distributed_, device); }
+   if (!counts_resolved_) resolve_counts(device);
   } catch (...) { fail(std::current_exception()); }
   drain();
   settled_ = true;
@@ -107,11 +117,12 @@ private:
   futures_.clear();
  }
  const DistributedContext* distributed_;
- std::shared_ptr<WaveTargetNormalizer> normalizer_;
+ std::shared_ptr<TrainingTargetCounts> normalizer_;
  std::vector<std::future<Result>> futures_;
  std::vector<Result> results_;
  std::exception_ptr failure_;
  bool settled_ = false;
+ bool counts_resolved_ = false;
 };
 class GradScaler {
 public:
@@ -218,12 +229,14 @@ private:
  Kind kind_;
 };
 inline int64_t prepared_target_count(const PreparedTargets& targets) { return std::accumulate(targets.counts.begin(), targets.counts.end(), int64_t{0}); }
+using TrainingDiagnosticTensors = std::array<torch::Tensor, 4>;
 struct RoutedTrainingLoss {
  torch::Tensor total;
  torch::Tensor classification;
  torch::Tensor box;
  TensorMap ordinary_terms;
  scalar_packet::Tensors scalars;
+ TrainingDiagnosticTensors diagnostics;
 };
 torch::Tensor loss_value_or_zero(const TensorMap&, const torch::Device&, std::string_view);
 scalar_packet::Tensors ordinary_scalar_tensors(const TensorMap&, const torch::Tensor&, const torch::Tensor&);

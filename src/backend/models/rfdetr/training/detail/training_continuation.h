@@ -3,6 +3,7 @@
 #include "training_schedule.h"
 #include "training_epoch_policy.h"
 #include "training_data_state.h"
+#include "training_metric_state.h"
 #include <optional>
 #include <string>
 #include "src/backend/models/rfdetr/contract/workflow_requests.h"
@@ -32,6 +33,7 @@ struct TrainingContinuationValues {
  TrainingScheduleState schedule;
  TrainingEpochPolicyState epoch_policy;
  TrainingDataContinuation data;
+ TrainingEpochMetricState epoch_metrics;
  ExecutionFacts execution;
 };
 MMLTK_REFLECT_FIELDS(TrainingContinuationValues)

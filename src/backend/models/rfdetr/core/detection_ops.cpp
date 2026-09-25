@@ -595,6 +595,8 @@ TensorMap loss_labels(const OutputLayer& layer, const PreparedTargets& targets, 
  if (log) {
   const auto matched_logits = src_logits.index({idx.first, idx.second});
   losses["class_error"] = 100.0 - accuracy_top1(matched_logits, target_classes_o);
+  losses["matched_count"] = torch::full({}, target_classes_o.numel(), src_logits.options().dtype(torch::kFloat32));
+  losses["class_error_sum"] = losses["class_error"] * losses["matched_count"];
  }
  return losses;
 }
@@ -605,6 +607,8 @@ TensorMap loss_cardinality(const OutputLayer& layer, const PreparedTargets& targ
  const auto target_lengths =
   targets.target_counts.defined() ? targets.target_counts.to(pred_logits.device()) : make_cpu_int64_tensor(targets.counts).to(pred_logits.device(), torch::kInt64, false, false);
  losses["cardinality_error"] = cardinality_error(pred_logits, target_lengths);
+ losses["image_count"] = torch::full({}, pred_logits.size(0), pred_logits.options().dtype(torch::kFloat32));
+ losses["cardinality_error_sum"] = losses["cardinality_error"] * losses["image_count"];
  return losses;
 }
 TensorMap loss_boxes(const OutputLayer& layer, const PreparedTargets& targets, const MatcherLayerIndices& indices, const torch::Tensor& num_boxes) {
@@ -680,7 +684,7 @@ TensorMap detection_loss_dict(
  mmltk::common::logging::profile_add_value("rfdetr.criterion.num_boxes", num_boxes_int);
  auto num_boxes = torch::full({}, static_cast<double>(num_boxes_int), torch::TensorOptions().dtype(torch::kFloat32).device(outputs.main.pred_logits.device()));
  if (distributed_enabled && distributed_all_reduce) { distributed_all_reduce(num_boxes); }
- const auto num_boxes_value = torch::clamp_min(num_boxes / std::max<int64_t>(1, config.world_size), 1.0);
+ const auto num_boxes_value = torch::clamp_min(num_boxes, 1.0);
  return detection_loss_dict(outputs, targets, config, training_mode, num_boxes_value);
 }
 TensorMap detection_loss_dict(const ModelOutputs& outputs, const PreparedTargets& targets, const DetectionConfig& config, bool training_mode, double num_boxes_value) {
