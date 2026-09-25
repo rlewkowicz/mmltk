@@ -397,6 +397,17 @@ public:
    });
    output_ << "_ => Err(crate::protocol::ProtocolError(\"Workspace source is unavailable\".into())), } }\n";
   }
+  symbols_.Reserve("module", "workspace_mouse_endpoint", "canonical workspace input observation endpoint");
+  output_ << "pub fn workspace_mouse_endpoint(source: PresentationSourceKind) -> Option<u64> { match source {\n";
+  Schema::VisitVisualSources([&]<class Cell, std::meta::info, class Projection>() {
+   Schema::VisitEndpoints([&]<class Endpoint>() {
+    if constexpr (Endpoint::interaction && std::same_as<typename Endpoint::system_cell, Cell> && std::same_as<typename Endpoint::request_type, mmltk::controller::WorkspaceMouse>) {
+     output_ << "PresentationSourceKind::" << rust_identifier(mmltk::frameworks::reflection::enum_name(Projection::kind), true)
+             << " => Some(" << Endpoint::stable_id << "),\n";
+    }
+   });
+  });
+  output_ << "_ => None, } }\n";
   EmitRequestDefaults();
   EmitDefaults();
   EmitSettingsHelpers();

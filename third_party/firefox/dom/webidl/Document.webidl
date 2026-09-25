@@ -608,6 +608,13 @@ partial interface Document {
   [Func="Document::DocumentSupportsL10n"] readonly attribute boolean hasPendingL10nMutations;
 };
 
+// The packaged application's acceptance session alone exposes this browser
+// environment stimulus. Ordinary pages cannot enable it.
+partial interface Document {
+  [Throws, Func="Document::MmltkStatusAcceptanceEnabled"]
+  undefined mmltkStatusEnvironment(unsigned short action);
+};
+
 Document includes XPathEvaluatorMixin;
 Document includes GlobalEventHandlers;
 Document includes TouchEventHandlers;

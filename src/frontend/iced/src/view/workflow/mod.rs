@@ -6,7 +6,6 @@ pub mod output;
 pub mod overlay_controls;
 mod primary_action;
 pub mod progress;
-pub mod status;
 
 use crate::fluent_theme::Element;
 use iced::widget::container;
@@ -27,14 +26,13 @@ pub enum Region {
     Diagnostics,
     PrimaryProgress,
     PrimaryAction,
-    Status,
     PrimaryCard,
     OutputCard,
 }
 
 const SHELL_REGIONS: [Region; 3] = [Region::Setup, Region::Center, Region::Diagnostics];
 const CENTER_REGIONS: [Region; 2] = [Region::Workspace, Region::Advanced];
-const AUDIT_REGIONS: [Region; 10] = [
+const AUDIT_REGIONS: [Region; 9] = [
     Region::Setup,
     Region::Center,
     Region::Workspace,
@@ -42,7 +40,6 @@ const AUDIT_REGIONS: [Region; 10] = [
     Region::Diagnostics,
     Region::PrimaryProgress,
     Region::PrimaryAction,
-    Region::Status,
     Region::PrimaryCard,
     Region::OutputCard,
 ];
@@ -146,15 +143,7 @@ impl Composition {
                 crate::generated::FeatureId::Export => "export.primary",
                 crate::generated::FeatureId::Explore => "explore.open",
             },
-            Region::Status => match self.page {
-                crate::generated::FeatureId::Train => "train.status",
-                crate::generated::FeatureId::Validate => "validate.status",
-                crate::generated::FeatureId::Predict => "predict.status",
-                crate::generated::FeatureId::Live => "live.status",
-                crate::generated::FeatureId::Annotate => "annotation.status",
-                crate::generated::FeatureId::Export => "export.status",
-                crate::generated::FeatureId::Explore => "explore.card.status",
-            },
+
         }
     }
 
@@ -170,7 +159,7 @@ pub struct Regions<'a, Message> {
     setup: Element<'a, Message>,
     workspace: Element<'a, Message>,
     advanced: Element<'a, Message>,
-    diagnostics: Element<'a, Message>,
+    diagnostics: Option<Element<'a, Message>>,
 }
 
 impl<'a, Message: 'a> Regions<'a, Message> {
@@ -179,18 +168,18 @@ impl<'a, Message: 'a> Regions<'a, Message> {
         setup: Element<'a, Message>,
         workspace: Element<'a, Message>,
         advanced: Element<'a, Message>,
-        diagnostics: Element<'a, Message>,
+        diagnostics: impl Into<Option<Element<'a, Message>>>,
     ) -> Self {
         Self {
             page,
             setup,
             workspace,
             advanced,
-            diagnostics,
+            diagnostics: diagnostics.into(),
         }
     }
 
-    /// Add Output and GPU above this workflow's status card.
+    /// Compose Output and GPU with the workflow's optional tools.
     pub fn with_run_cards(
         mut self,
         model: &'a crate::view_model::ApplicationModel,
@@ -198,20 +187,9 @@ impl<'a, Message: 'a> Regions<'a, Message> {
         output: Element<'a, Message>,
         gpu_message: impl Fn(gpu::Message) -> Message + 'a,
     ) -> Self {
-        let status_id = match self.page {
-            crate::generated::FeatureId::Train => "train.card.status",
-            crate::generated::FeatureId::Validate => "validate.card.status",
-            crate::generated::FeatureId::Predict => "predict.card.status",
-            crate::generated::FeatureId::Export => "export.card.status",
-            _ => unreachable!("this workflow does not select an execution GPU"),
-        };
-        self.diagnostics = iced::widget::column![
-            output,
-            gpu::view(self.page, model, settings).map(gpu_message),
-            crate::view::shared::identified(status_id, self.diagnostics),
-        ]
-        .spacing(SECTION_SPACING)
-        .into();
+        let mut cards = iced::widget::column![output, gpu::view(self.page, model, settings).map(gpu_message)].spacing(SECTION_SPACING);
+        if let Some(tools) = self.diagnostics.take() { cards = cards.push(tools); }
+        self.diagnostics = Some(cards.into());
         self
     }
 
@@ -286,10 +264,6 @@ pub fn view<'a, Message: 'a>(
             _ => unreachable!("center composition contains only center regions"),
         },
     );
-    let diagnostics_content: Element<'a, Message> = container(regions.diagnostics)
-        .id(composition.stable_id(Region::Status))
-        .into();
-    let diagnostics = iced::widget::keyed_column([(regions.page, diagnostics_content)]);
     let sidebar = |region, content, width| {
         container(content)
             .id(composition.stable_id(region))
@@ -317,11 +291,7 @@ pub fn view<'a, Message: 'a>(
 
     let mut setup = Some(sidebar(Region::Setup, setup, layout.setup_width));
     let mut center = Some(center);
-    let mut diagnostics = Some(sidebar(
-        Region::Diagnostics,
-        diagnostics,
-        layout.diagnostics_width,
-    ));
+    let mut diagnostics = regions.diagnostics.map(|content| sidebar(Region::Diagnostics, iced::widget::keyed_column([(regions.page, content)]), layout.diagnostics_width));
     composition
         .shell_regions()
         .iter()
@@ -334,7 +304,7 @@ pub fn view<'a, Message: 'a>(
                 Region::Setup => row.push(setup.take().expect("one setup region")),
                 Region::Center => row.push(center.take().expect("one center region")),
                 Region::Diagnostics => {
-                    row.push(diagnostics.take().expect("one diagnostics region"))
+                    if let Some(content) = diagnostics.take() { row.push(content) } else { row }
                 }
                 _ => unreachable!("workflow shell contains only shell regions"),
             },
@@ -382,8 +352,7 @@ mod tests {
                 Region::Diagnostics,
                 Region::PrimaryProgress,
                 Region::PrimaryAction,
-                Region::Status,
-                Region::PrimaryCard,
+                            Region::PrimaryCard,
                 Region::OutputCard,
             ]
         );
@@ -419,7 +388,6 @@ mod tests {
             );
             assert!(!composition.stable_id(Region::PrimaryAction).is_empty());
             assert!(!composition.stable_id(Region::PrimaryProgress).is_empty());
-            assert!(!composition.stable_id(Region::Status).is_empty());
         }
         assert_eq!(
             Composition::new(crate::generated::FeatureId::Annotate, 0.0).next_ordinary_page(),

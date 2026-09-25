@@ -17,6 +17,7 @@ struct Outbound {
     pressure_observation: Option<(u64, usize, bool)>,
     scratch: Vec<u8>,
     encoded: Vec<u8>,
+    submitted_interactions: Vec<(u64, bool)>,
 }
 impl Default for Outbound {
     fn default() -> Self {
@@ -29,10 +30,14 @@ impl Default for Outbound {
             pressure_observation: None,
             scratch: Vec::new(),
             encoded: Vec::new(),
+            submitted_interactions: (0..).map_while(crate::generated::interaction_endpoint).map(|endpoint| (endpoint, false)).collect(),
         }
     }
 }
 impl Outbound {
+    fn submitted(&mut self, endpoint: u64) {
+        if let Some((_, submitted)) = self.submitted_interactions.iter_mut().find(|(candidate, _)| *candidate == endpoint) { *submitted = true; }
+    }
     fn record_count(&self) -> usize {
         self.records.len()
     }
@@ -91,6 +96,11 @@ pub struct Connection {
 }
 
 impl Connection {
+    pub(crate) fn take_interaction_submission(&self, endpoint: u64) -> bool {
+        self.retained.lock().expect("connection output").submitted_interactions.iter_mut()
+            .find(|(candidate, _)| *candidate == endpoint)
+            .is_some_and(|(_, submitted)| std::mem::take(submitted))
+    }
     pub(crate) fn observe_integration_pressure(&self, sequence: u64) {
         self.retained
             .lock()
@@ -219,8 +229,11 @@ impl Connection {
                     crate::generated::encode_workspace_mouse_into(&mouse, scratch, encoded)
                         .map_err(|error| error.to_string())?;
                     send(encoded)?;
+                    if let Some(endpoint) = crate::generated::workspace_mouse_endpoint(mouse.source) { retained.submitted(endpoint); }
                 } else {
+                    let endpoint = match &record { OutboundRecord::Interaction(interaction) => Some(interaction.record.endpoint_id), _ => None };
                     send(&record.encode().map_err(|error| error.to_string())?)?;
+                    if let Some(endpoint) = endpoint { retained.submitted(endpoint); }
                 }
             }
             if let Some((sequence, admitted, false)) = retained.pressure_observation
@@ -380,6 +393,24 @@ impl Capture {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn interaction_episode_rearms_only_after_successful_wire_submission() {
+        let source = crate::generated::PresentationSourceKind::Annotation;
+        let endpoint = crate::generated::workspace_mouse_endpoint(source).unwrap();
+        let (mut connection, _capture) = Connection::test_channel();
+        let mut mouse = crate::workspace_input::record(crate::generated::WorkspaceMouseKind::Cancel, None);
+        mouse.source = source;
+        connection.send_workspace_mouse(mouse.clone()).unwrap();
+        assert!(!connection.take_interaction_submission(endpoint));
+        assert!(connection.flush(|_| Err("failed socket write".into())).is_err());
+        assert!(!connection.take_interaction_submission(endpoint));
+        connection.send_workspace_mouse(mouse).unwrap();
+        connection.flush(|_| Ok(())).unwrap();
+        assert!(connection.take_interaction_submission(endpoint));
+        assert!(!connection.take_interaction_submission(endpoint));
+        assert!(!connection.take_interaction_submission(u64::MAX));
+    }
 
     #[test]
     fn mouse_pressure_keeps_every_record_and_document_command_in_order() {

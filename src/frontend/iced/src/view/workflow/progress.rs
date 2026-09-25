@@ -30,7 +30,7 @@ pub fn compute_presentation(state: Option<&crate::generated::ComputeUiState>) ->
     };
     if !state.active {
         return match state.terminal.outcome {
-            crate::generated::ComputeOperationOutcome::Idle => Presentation::Hidden,
+            crate::generated::ComputeOperationOutcome::Idle | crate::generated::ComputeOperationOutcome::Failed | crate::generated::ComputeOperationOutcome::Refused => Presentation::Hidden,
             outcome => Presentation::Terminal {
                 outcome: format!("{outcome:?}"),
                 detail: if state.terminal.detail.is_empty() {
@@ -42,7 +42,8 @@ pub fn compute_presentation(state: Option<&crate::generated::ComputeUiState>) ->
         };
     }
     if state.progress.sequence == 0 || state.progress.status.is_empty() {
-        return if state.terminal.detail.is_empty() {
+        return if state.terminal.detail.is_empty()
+            || matches!(state.terminal.outcome, crate::generated::ComputeOperationOutcome::Failed | crate::generated::ComputeOperationOutcome::Refused) {
             Presentation::Active
         } else {
             Presentation::OpenEnded {
@@ -101,7 +102,7 @@ pub fn model_presentation(state: Option<&crate::generated::ModelUiState>) -> Pre
         };
     }
     match state.terminal.outcome {
-        crate::generated::ModelSelectionOutcome::Idle => Presentation::Hidden,
+        crate::generated::ModelSelectionOutcome::Idle | crate::generated::ModelSelectionOutcome::Rejected => Presentation::Hidden,
         outcome => Presentation::Terminal {
             outcome: format!("{outcome:?}"),
             detail: state.terminal.detail.clone(),
@@ -211,7 +212,7 @@ mod tests {
     }
 
     #[test]
-    fn typed_compute_completion_and_failure_remain_visible() {
+    fn typed_compute_completion_remains_visible_and_failure_moves_to_status() {
         let mut validation = snapshots()
             .into_iter()
             .find_map(|snapshot| match snapshot {
@@ -232,8 +233,7 @@ mod tests {
         validation.operation.terminal.detail = "device unavailable".into();
         assert!(matches!(
             compute_presentation(Some(&validation.operation)),
-            Presentation::Terminal { ref outcome, ref detail }
-                if outcome == "Failed" && detail == "device unavailable"
+            Presentation::Hidden
         ));
     }
 
@@ -293,10 +293,6 @@ mod tests {
                 "Accepted",
             ),
             (
-                crate::generated::ModelSelectionOutcome::Rejected,
-                "Rejected",
-            ),
-            (
                 crate::generated::ModelSelectionOutcome::Cancelled,
                 "Cancelled",
             ),
@@ -307,6 +303,8 @@ mod tests {
                 Presentation::Terminal { outcome, .. } if outcome == expected
             ));
         }
+        model.terminal.outcome = crate::generated::ModelSelectionOutcome::Rejected;
+        assert_eq!(model_presentation(Some(&model)), Presentation::Hidden);
         model.active = true;
         model.terminal.outcome = crate::generated::ModelSelectionOutcome::CancellationRequested;
         assert!(matches!(

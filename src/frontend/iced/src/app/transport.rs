@@ -57,7 +57,7 @@ impl App {
             TransportEvent::IntegrationControl(receipt) => {
                 if let Some(integration) = self.integration.as_mut() {
                     if let Err(detail) = integration.receive_control(receipt) {
-                        self.model.error = Some(UiError::protocol(detail));
+                        self.model.report_error(UiError::protocol(detail));
                     }
                 } else {
                     self.retire_peer(UiError::protocol(
@@ -75,8 +75,14 @@ impl App {
             TransportEvent::Disconnected(reason) => {
                 self.retire_peer(UiError::transport(reason));
             }
-            TransportEvent::Rejected(error) => {
-                self.model.error = Some(UiError::invalid(error));
+            TransportEvent::Rejected(record) => {
+                if !(0..).map_while(crate::generated::interaction_endpoint).any(|endpoint| endpoint == record.endpointid) {
+                    self.model.report_error(UiError::protocol("InteractionRejected named an unknown interaction endpoint"));
+                    return Task::none();
+                }
+                let origin = crate::view_model::notices::Origin::Interaction(record.endpointid);
+                if self.connection.as_ref().is_some_and(|connection| connection.take_interaction_submission(record.endpointid)) { self.model.notices.condition(origin, None); }
+                self.model.notices.condition(origin, Some(record.error.into()));
             }
             TransportEvent::ProtocolError(error) => {
                 self.retire_peer(UiError::protocol(error));
@@ -117,10 +123,8 @@ impl App {
                 .observe(&crate::protocol::ServerRecord::IntentReply(reply.clone()))
                 .expect("test transport observation");
         }
-        let Some(endpoint_id) = self.model.pending_endpoint(reply.correlation) else {
-            self.model.error = Some(UiError::protocol("unknown or duplicate IntentReply"));
-            return;
-        };
+        if !self.model.accept_reply(&reply) { return; }
+        let endpoint_id = self.model.pending_endpoint(reply.correlation).expect("accepted pending reply");
         let context = self.model.pending_intent(reply.correlation);
         let settings_revision_before = self
             .model
@@ -303,7 +307,7 @@ impl App {
                 ) {
                     self.model.clear_dialog_context();
                 }
-                self.model.error = Some(error);
+                self.model.report_error(error);
                 return false;
             }
         };
@@ -311,7 +315,7 @@ impl App {
         let Some(connection) = self.connection.as_mut() else {
             self.model.abandon_intent(correlation);
             self.abandon_explore_edit(context);
-            self.model.error = Some(UiError::transport("browser connection is not ready"));
+            self.model.report_error(UiError::transport("browser connection is not ready"));
             return false;
         };
         if let Err(error) = connection.send_intent(intent) {
@@ -332,7 +336,7 @@ impl App {
                     self.retire_peer(UiError::transport(error.to_string()));
                 }
                 crate::transport_connection::OutboundSendError::Capacity => {
-                    self.model.error = Some(UiError::busy(error.to_string()));
+                    self.model.report_error(UiError::busy(error.to_string()));
                 }
             }
             return false;

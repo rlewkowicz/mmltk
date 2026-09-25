@@ -46,10 +46,8 @@ impl ApplicationModel {
                 "The application is not ready to accept requests.",
             ));
         }
-        let mut correlation = self.next_correlation.max(1);
-        while self.pending.contains_key(&correlation) {
-            correlation = correlation.wrapping_add(1).max(1);
-        }
+        let correlation = self.next_correlation;
+        let next = correlation.checked_add(1).ok_or_else(|| UiError::protocol("Request correlation exhausted"))?;
         let encoded = encode(correlation);
         if encoded.record.correlation != correlation || encoded.record.endpoint_id == 0 {
             return Err(UiError::protocol(
@@ -129,7 +127,7 @@ impl ApplicationModel {
             };
             return Err(UiError::busy(detail));
         }
-        self.next_correlation = correlation.wrapping_add(1).max(1);
+        self.next_correlation = next;
         self.pending.insert(
             correlation,
             PendingRequest {
@@ -324,7 +322,6 @@ mod tests {
         let edit = model
             .begin_intent(ApplicationIntentEndpoint::AnnotationEdit)
             .unwrap();
-        model.next_correlation = edit;
         let stop = model
             .begin_intent(ApplicationIntentEndpoint::AnnotationStop)
             .unwrap();
@@ -453,7 +450,7 @@ mod tests {
     }
 
     #[test]
-    fn pending_capacity_and_correlation_wrap_remain_bounded() {
+    fn pending_capacity_and_correlation_exhaustion_remain_bounded() {
         let mut model = bootstrapped();
         for correlation in 1..=MAX_PENDING_INTENTS as u64 {
             model.pending.insert(
@@ -471,15 +468,9 @@ mod tests {
         );
         model.pending.clear();
         model.next_correlation = u64::MAX;
-        let last = model
-            .begin_intent(ApplicationIntentEndpoint::ValidationStart)
-            .unwrap();
-        assert_eq!(last, u64::MAX);
-        model.abandon_intent(last);
-        let wrapped = model
-            .begin_intent(ApplicationIntentEndpoint::ValidationStart)
-            .unwrap();
-        assert_eq!(wrapped, 1);
+        assert!(model.begin_intent(ApplicationIntentEndpoint::ValidationStart).is_err());
+        assert_eq!(model.next_correlation, u64::MAX);
+        assert!(model.pending.is_empty());
     }
 
     #[test]
@@ -627,6 +618,43 @@ mod tests {
         model.peer_disconnected(UiError::transport("closed"));
         assert_eq!(model.pending_endpoint(open), None);
         assert!(model.dialog_context().is_none());
-        assert!(model.file_dialog.is_none());
+        assert!(model.file_dialog.is_some());
+    }
+}
+
+impl ApplicationModel {
+    /// Settle wire fingerprints before looking up the pending endpoint or decoding a reply.
+    pub(crate) fn accept_reply(&mut self, reply: &crate::protocol::IntentReply) -> bool {
+        use std::hash::{Hash, Hasher};
+        fn value_hash(value: &crate::application_codec::Value, hash: &mut impl Hasher) {
+            use crate::application_codec::Value;
+            std::mem::discriminant(value).hash(hash);
+            match value {
+                Value::Null => {}, Value::Bool(value) => value.hash(hash),
+                Value::Signed(value) => value.hash(hash), Value::Unsigned(value) => value.hash(hash),
+                Value::Float(value) => value.to_bits().hash(hash), Value::Text(value) => value.hash(hash),
+                Value::Bytes(value) => value.hash(hash),
+                Value::Array(values) => { values.len().hash(hash); for value in values { value_hash(value, hash); } },
+                Value::Object(values) => { values.len().hash(hash); for (key, value) in values { key.hash(hash); value_hash(value, hash); } },
+            }
+        }
+        let mut hash = std::collections::hash_map::DefaultHasher::new();
+        match &reply.result {
+            Ok(value) => { true.hash(&mut hash); value_hash(value, &mut hash); },
+            Err(error) => { false.hash(&mut hash); std::mem::discriminant(&error.category).hash(&mut hash); error.detail.hash(&mut hash); },
+        }
+        let fingerprint = hash.finish();
+        if let Some((_, previous)) = self.settled_replies.iter().find(|(id, _)| *id == reply.correlation) {
+            if *previous != fingerprint { self.report_error(UiError::protocol("IntentReply replay changed its result")); }
+            return false;
+        }
+        if reply.correlation == 0 || reply.correlation >= self.next_correlation {
+            self.report_error(UiError::protocol("IntentReply correlation was never issued"));
+            return false;
+        }
+        if !self.pending.contains_key(&reply.correlation) { return false; }
+        if self.settled_replies.len() == MAX_PENDING_INTENTS { self.settled_replies.pop_front(); }
+        self.settled_replies.push_back((reply.correlation, fingerprint));
+        true
     }
 }

@@ -103,10 +103,10 @@ use crate::generated::{TrainingPhase, TrainingRecord, TrainingRecordRole};
 
 pub(super) struct History {
     pub(super) curves: Vec<Curve>,
-    run: String,
+    pub(super) run: String,
     attempt: String,
     pub(super) sequence: Option<u64>,
-    dropped: u64,
+    pub(super) dropped: u64,
     segment: u64,
     last_live: Option<f64>,
     last_phase_epoch: Option<(TrainingPhase, i32)>,

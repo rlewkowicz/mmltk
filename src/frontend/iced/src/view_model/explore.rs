@@ -68,25 +68,7 @@ impl ExploreModel {
                 "No samples match the filters"
             }
             ExplorePresentationState::Empty => "Waiting for a dataset",
-            ExplorePresentationState::Error => {
-                match self.snapshot.as_ref().map(|value| value.failurekind) {
-                    Some(crate::generated::ExploreFailureKind::SelectedTransportUnavailable) => {
-                        "Selected GDR transport is unavailable; select H2D loading in Settings"
-                    }
-                    Some(crate::generated::ExploreFailureKind::RuntimeInitialization) => {
-                        "Explore GPU runtime could not initialize"
-                    }
-                    _ => "Explore operation failed",
-                }
-            }
-            ExplorePresentationState::Populated
-                if self
-                    .snapshot
-                    .as_ref()
-                    .is_some_and(|snapshot| !snapshot.failure.is_empty()) =>
-            {
-                "Explore operation failed; showing the last completed product"
-            }
+            ExplorePresentationState::Error => "Waiting for a dataset",
             ExplorePresentationState::Populated
                 if self
                     .gallery_progress()
@@ -117,7 +99,7 @@ impl ExploreModel {
                 .is_some_and(|snapshot| snapshot.ready && snapshot.order.matchingcount != 0)
         {
             if matches!(presentation, super::GalleryPresentation::Unavailable) {
-                return "Gallery unavailable";
+                return "Restoring gallery";
             }
             if self.snapshot.as_ref().is_some_and(|snapshot| snapshot.busy)
                 || self
@@ -132,7 +114,8 @@ impl ExploreModel {
     }
 
     pub fn reset_transport(&mut self) {
-        *self = Self::default();
+        let snapshot = self.snapshot.take();
+        *self = Self { snapshot, ..Self::default() };
     }
 }
 
@@ -153,7 +136,7 @@ impl crate::generated::ExploreApplicationProjection<UiError> for ApplicationMode
         match event {
             ApplicationEvent::ExploreExploreChanged(value) => {
                 match self.install_explore_snapshot(value.snapshot, false) {
-                    Err(error) => self.error = Some(error),
+                    Err(error) => self.report_error(error),
                     Ok(Observation::Installed) => {
                         if self.presentation_model.foreground()
                             == Some(PresentationSourceKind::Explore)
@@ -166,13 +149,12 @@ impl crate::generated::ExploreApplicationProjection<UiError> for ApplicationMode
             }
             ApplicationEvent::ExploreExploreFailed(value) => {
                 let retained_product = value.snapshot.ready;
+                let owner = value.snapshot.dataset.identity;
                 match self.install_explore_snapshot(value.snapshot, false) {
-                    Err(error) => self.error = Some(error),
+                    Err(error) => self.report_error(error),
                     Ok(Observation::Stale) => {}
                     Ok(Observation::Installed | Observation::Current) => {
-                        if !retained_product {
-                            self.failed(value.detail);
-                        }
+                        self.notices.owned_condition(super::notices::Origin::Explore, owner, Some(if retained_product { super::notices::warning("Explore preview unavailable", value.detail) } else { super::notices::failure(value.detail) }));
                     }
                 }
             }
@@ -186,7 +168,7 @@ impl crate::generated::ExploreApplicationProjection<UiError> for ApplicationMode
             ApplicationReply::ExploreOpen(snapshot) => (snapshot, true),
             ApplicationReply::ExploreUpdateFilter(snapshot) => {
                 if endpoint != Some(ApplicationIntentEndpoint::ExploreUpdateFilter) {
-                    self.error = Some(UiError::protocol(
+                    self.report_error(UiError::protocol(
                         "Explore filter reply did not match its pending endpoint",
                     ));
                     return;
@@ -205,7 +187,7 @@ impl crate::generated::ExploreApplicationProjection<UiError> for ApplicationMode
             _ => unreachable!("generated Explore dispatch supplied another system reply"),
         };
         if let Err(error) = self.install_explore_snapshot(snapshot, bootstrap) {
-            self.error = Some(error);
+            self.report_error(error);
         }
     }
 }
@@ -233,7 +215,7 @@ impl crate::generated::UpscaleApplicationProjection<UiError> for ApplicationMode
                     |snapshot| snapshot.revision,
                     "Upscale",
                 ) {
-                    Err(error) => self.error = Some(error),
+                    Err(error) => self.report_error(error),
                     Ok(Observation::Installed) => {
                         if self.current_upscale().is_some()
                             && matches!(
@@ -252,6 +234,7 @@ impl crate::generated::UpscaleApplicationProjection<UiError> for ApplicationMode
                 }
             }
             ApplicationEvent::UpscaleUpscaleFailed(value) => {
+                let generation = value.snapshot.revision;
                 let current_failure = value.kind == crate::generated::UpscaleFailureKind::Physical
                     || value.request.is_none()
                     || value.request.as_ref() == self.requested_upscale.as_ref();
@@ -261,8 +244,8 @@ impl crate::generated::UpscaleApplicationProjection<UiError> for ApplicationMode
                     |snapshot| snapshot.revision,
                     "Upscale",
                 ) {
-                    Err(error) => self.error = Some(error),
-                    Ok(Observation::Installed) => {
+                    Err(error) => self.report_error(error),
+                    Ok(Observation::Installed | Observation::Current) => {
                         if self
                             .requested_upscale
                             .as_ref()
@@ -289,14 +272,10 @@ impl crate::generated::UpscaleApplicationProjection<UiError> for ApplicationMode
                                     (UiErrorKind::Failed, "Operation failed")
                                 }
                             };
-                            self.error = Some(UiError {
-                                kind,
-                                title,
-                                detail: value.detail,
-                            });
+                            self.notices.observe(super::notices::Origin::Upscale, 0, generation, Some(UiError { kind, title, detail: value.detail }));
                         }
                     }
-                    Ok(Observation::Current | Observation::Stale) => {}
+                    Ok(Observation::Stale) => {}
                 }
             }
             _ => unreachable!("generated Upscale dispatch supplied another system event"),
@@ -312,7 +291,7 @@ impl crate::generated::UpscaleApplicationProjection<UiError> for ApplicationMode
                     |value| value.revision,
                     "Upscale",
                 ) {
-                    self.error = Some(error);
+                    self.report_error(error);
                 }
                 if self.current_upscale().is_some() {
                     self.set_foreground_visual(Some(PresentationSourceKind::Upscale));
@@ -392,11 +371,7 @@ mod tests {
             model.presentation_state(),
             ExplorePresentationState::Populated
         );
-        assert!(
-            model
-                .presentation_title()
-                .contains("last completed product")
-        );
+        assert_eq!(model.presentation_title(), "Dataset ready");
     }
 
     #[test]
@@ -417,7 +392,7 @@ mod tests {
         }
         assert_eq!(
             model.gallery_title(false, super::super::GalleryPresentation::Unavailable),
-            "Gallery unavailable"
+            "Restoring gallery"
         );
         model.snapshot.as_mut().unwrap().busy = true;
         assert_eq!(
@@ -436,18 +411,14 @@ mod tests {
                         model.gallery_title(drawable, state),
                         model.presentation_title()
                     );
-                    assert!(
-                        model
-                            .gallery_title(drawable, state)
-                            .contains("Explore operation failed")
-                    );
+                    assert_eq!(model.gallery_title(drawable, state), "Dataset ready");
                 }
             }
         }
     }
 
     #[test]
-    fn failed_runtime_and_transport_are_visible_even_if_a_stale_busy_flag_remains() {
+    fn failed_runtime_and_transport_keep_normal_empty_copy() {
         let mut snapshot = explore_snapshot();
         snapshot.failure = "Unavailable".into();
         snapshot.busy = true;
@@ -458,11 +429,11 @@ mod tests {
         };
         assert_eq!(
             model.presentation_title(),
-            "Explore GPU runtime could not initialize"
+            "Waiting for a dataset"
         );
         model.snapshot.as_mut().unwrap().failurekind =
             crate::generated::ExploreFailureKind::SelectedTransportUnavailable;
-        assert!(model.presentation_title().contains("select H2D"));
+        assert_eq!(model.presentation_title(), "Waiting for a dataset");
         assert_eq!(
             model.gallery_title(false, super::super::GalleryPresentation::Unavailable),
             model.presentation_title(),
@@ -486,7 +457,8 @@ mod tests {
             },
         ));
 
-        assert!(model.error.is_none());
+        assert_eq!(model.notices.len(), 1);
+        assert_eq!(model.notices.latest().unwrap().severity, crate::view_model::notices::Severity::Warning);
         assert_eq!(
             model.explore.presentation_state(),
             ExplorePresentationState::Populated
@@ -527,7 +499,7 @@ mod tests {
                 kind: crate::generated::UpscaleFailureKind::Failed,
             },
         ));
-        assert!(model.error.is_none());
+        assert!(model.notices.is_empty());
         assert!(model.sent_upscale.is_none());
         assert_eq!(model.requested_upscale.as_ref(), Some(&second));
         model.reduce_reply(
@@ -537,7 +509,7 @@ mod tests {
                 detail: "superseded Basic admission failure".into(),
             }),
         );
-        assert!(model.error.is_none());
+        assert!(model.notices.is_empty());
         assert!(!model.has_pending(ApplicationIntentEndpoint::UpscaleStart));
         model.sent_upscale = Some(second.clone());
         snapshot.revision += 1;
@@ -552,7 +524,7 @@ mod tests {
         model.reduce_event(ApplicationEvent::UpscaleUpscaleChanged(
             crate::generated::UpscaleChanged { snapshot },
         ));
-        assert!(model.error.is_none());
+        assert!(model.notices.is_empty());
         assert_eq!(model.requested_upscale.as_ref(), Some(&second));
     }
 
@@ -569,12 +541,12 @@ mod tests {
         });
 
         model.reduce_event(event.clone());
-        assert_eq!(model.error.as_ref().unwrap().detail, "upscale failed");
+        assert_eq!(model.notices.latest().unwrap().detail, "upscale failed");
 
         let later = UiError::transport("later transport failure");
-        model.error = Some(later.clone());
+        model.report_error(later.clone());
         model.reduce_event(event);
-        assert_eq!(model.error, Some(later));
+        assert_eq!(model.notices.latest().map(|notice| &notice.error), Some(&later));
     }
 
     #[test]

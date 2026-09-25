@@ -526,7 +526,13 @@ TEST_CASE("Viewed masks import full catalogs and retain editable runs through hi
  mmltk::testsupport::ScopedTempDir directory{"annotation-mask"};
  const auto path = directory.path() / "document.cbor";
  CHECK(save_and_read_scene(editor, path) == saved_scene);
- CHECK(editor.Save((directory.path() / "absent" / "document.cbor").string()).outcome == document::DocumentOutcome::Rejected);
+ const auto saved_generation = editor.ui().save_generation;
+ CHECK(saved_generation > 0U);
+ for (std::uint64_t attempt = 1U; attempt <= 2U; ++attempt) {
+  CHECK(editor.Save((directory.path() / "absent" / "document.cbor").string()).outcome == document::DocumentOutcome::Rejected);
+  CHECK(editor.ui().save_generation == saved_generation + attempt);
+  CHECK(editor.ui().save_status == contracts::AnnotationSaveStatus::Failed);
+ }
  CHECK(editor.ui().scene == saved_scene);
 }
 TEST_CASE("Annotation import capacity failure leaves the open editable document unchanged") {

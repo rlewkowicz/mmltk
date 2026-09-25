@@ -1,5 +1,6 @@
 use crate::fluent_theme::Element;
-use crate::generated::{self, FeatureId, GuiSettingsState};
+use crate::generated::{self, FeatureId};
+use crate::view_model::selected_gpu_ordinals;
 use crate::view::settings::{EditCadence, EditSchedule, SettingsModel};
 use crate::view_model::ApplicationModel;
 use iced::widget::{checkbox, column, container, text};
@@ -7,15 +8,6 @@ use iced::widget::{checkbox, column, container, text};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Message(pub i32);
 
-pub fn selected(feature: FeatureId, state: &GuiSettingsState) -> &[i32] {
-    match feature {
-        FeatureId::Train => &state.workflows.train.request.deviceids,
-        FeatureId::Validate => std::slice::from_ref(&state.workflows.validate.request.deviceid),
-        FeatureId::Predict => std::slice::from_ref(&state.workflows.predict.request.deviceid),
-        FeatureId::Export => std::slice::from_ref(&state.workflows.exportstate.deviceid),
-        _ => unreachable!(),
-    }
-}
 
 pub fn update(
     feature: FeatureId,
@@ -94,7 +86,7 @@ pub fn view<'a>(
     let selection = settings
         .draft
         .as_ref()
-        .map(|state| selected(feature, state))
+        .map(|state| selected_gpu_ordinals(feature, state))
         .unwrap_or_default();
     let inventory = model
         .settings_snapshot
@@ -137,9 +129,6 @@ pub fn view<'a>(
                 .id(format!("{name}.gpu.device.{ordinal}")),
             );
         }
-    }
-    if inventory.is_empty() {
-        content = content.push(text("No CUDA GPUs available").size(12));
     }
     if feature == FeatureId::Train {
         content = content.push(
@@ -184,7 +173,7 @@ mod tests {
         assert_eq!(train.batchsize, 2);
         for feature in [FeatureId::Validate, FeatureId::Predict, FeatureId::Export] {
             update(feature, &mut settings, Message(5)).unwrap();
-            assert_eq!(selected(feature, settings.draft.as_ref().unwrap()), vec![5]);
+            assert_eq!(selected_gpu_ordinals(feature, settings.draft.as_ref().unwrap()), vec![5]);
         }
         update(FeatureId::Train, &mut settings, Message(1)).unwrap();
         assert!(update(FeatureId::Train, &mut settings, Message(3)).is_err());

@@ -524,6 +524,9 @@ impl App {
         if self.workspace.active() == feature {
             return Task::none();
         }
+        self.interaction_revision = self.interaction_revision.saturating_add(1);
+        self.status.close();
+        self.status.focus = None;
         self.abandon_viewer();
         self.presentation.retire_frame();
         self.workspace.select(feature);
@@ -542,7 +545,7 @@ impl App {
                 }) {
                 Ok(schedule) => self.handle_settings_schedule(schedule),
                 Err(detail) => {
-                    self.model.error = Some(UiError::invalid(detail));
+                    self.model.report_error(UiError::invalid(detail));
                     Task::none()
                 }
             }
@@ -1382,7 +1385,7 @@ mod tests {
                 app.reconcile_viewer();
                 drop(app.on_explore(crate::view::explore::Outcome::UpscaleRequested(kernel)));
                 assert_eq!(app.model.requested_upscale, Some(expected));
-                assert!(app.model.error.is_none(), "{:?}", app.model.error);
+                assert!(app.model.notices.is_empty(), "{:?}", app.model.notices);
                 assert_eq!(
                     crate::presentation_surface::metadata::product(retained),
                     Some(previous.source)
@@ -1547,7 +1550,7 @@ mod tests {
 
         app.abandon_viewer();
         assert!(app.presentation.stop_requested);
-        assert!(app.model.error.is_none());
+        assert!(app.model.notices.is_empty());
         assert!(receiver.try_recv().is_err());
 
         accept_upscale_start(&mut app, start_correlation, basic.clone());
@@ -1562,13 +1565,13 @@ mod tests {
         );
         assert_presentation_selection(&mut receiver, basic.source.source.clone());
         assert!(!app.presentation.stop_requested);
-        assert!(app.model.error.is_none());
+        assert!(app.model.notices.is_empty());
 
         app.dispatch_viewer_desired();
-        assert!(app.model.error.is_none());
+        assert!(app.model.notices.is_empty());
         assert!(receiver.try_recv().is_err());
         settle_upscale_stop(&mut app, stop.correlation);
-        assert!(app.model.error.is_none());
+        assert!(app.model.notices.is_empty());
         let latest = app.model.requested_upscale.clone().unwrap();
         let crate::transport_connection::CapturedRecord::Intent(start) = receiver
             .try_recv()
@@ -1580,7 +1583,7 @@ mod tests {
             start,
             crate::generated::encode_upscale_Start(start.correlation, latest).record
         );
-        assert!(app.model.error.is_none());
+        assert!(app.model.notices.is_empty());
         assert!(receiver.try_recv().is_err());
     }
 
@@ -2144,7 +2147,7 @@ mod tests {
             ),
         });
         assert_eq!(app.presentation.surface().unwrap().frame, Some(frame));
-        assert!(app.model.error.is_some());
+        assert!(!app.model.notices.is_empty());
         assert!(test_releases().is_empty());
         app.presentation.discard();
         assert_eq!(test_releases(), vec![frame]);

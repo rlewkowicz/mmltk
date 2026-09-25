@@ -354,7 +354,7 @@ fn quiet_driver_and_disabled_frontend_collect_no_probe_state() {
                 Phase::AwaitDetail(0)
             }
         );
-        assert!(model.error.is_none());
+        assert!(model.notices.is_empty());
         assert!(driver.driver.reporting.state_is_absent());
         SURFACE_DRAW_OBSERVER.with(|observer| assert!(observer.borrow().receipts.is_empty()));
     }

@@ -6,7 +6,6 @@ use crate::view_model::ApplicationModel;
 pub fn view<'a>(
     model: &'a ApplicationModel,
     settings: &'a crate::view::settings::SettingsModel,
-    chart_omissions: u64,
 ) -> Element<'a, Message> {
     let facts = model
         .workflow
@@ -16,9 +15,6 @@ pub fn view<'a>(
         .map(|snapshot| &snapshot.local.output);
     let mut content =
         crate::view::workflow::output::content(FeatureId::Train, model, settings, facts);
-    if chart_omissions > 0 {
-        content = content.push(status_text(format!("Charts omit {chart_omissions} older disconnected summaries; saved history remains unchanged.")));
-    }
     if let Some(run) = model
         .workflow
         .output
@@ -45,12 +41,6 @@ pub fn view<'a>(
             .and_then(|snapshot| snapshot.metrics.as_ref())
     };
     if let Some(record) = record {
-        if record.droppedbefore > 0 {
-            content = content.push(status_text(format!(
-                "History incomplete: {} records dropped",
-                record.droppedbefore
-            )));
-        }
         for (label, path) in [
             ("Full checkpoint", &record.progress.fullcheckpointpath),
             ("Selected / epoch weights", &record.progress.checkpointpath),
@@ -58,14 +48,6 @@ pub fn view<'a>(
             if !path.is_empty() {
                 content = content.push(status_text(format!("{label}: {path}")));
             }
-        }
-    }
-    if let Some(snapshot) = &model.workflow.training {
-        if snapshot.persistence.degraded {
-            content = content.push(status_text(format!(
-                "History incomplete: {} ({} dropped)",
-                snapshot.persistence.error, snapshot.persistence.droppedrecords
-            )));
         }
     }
     crate::view::shared::identified(
@@ -85,7 +67,7 @@ mod tests {
 
     fn output_nodes(model: &ApplicationModel) -> usize {
         let settings = crate::view::settings::installed_settings_model();
-        let mut output = view(model, &settings, 0);
+        let mut output = view(model, &settings);
         let mut tree = iced::advanced::widget::Tree::new(&output);
         tree.diff(&mut output);
         count(&tree)

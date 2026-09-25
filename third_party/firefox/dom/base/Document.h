@@ -2311,6 +2311,10 @@ class Document : public nsINode,
   static bool DocumentSupportsL10n(JSContext* aCx, JSObject* aObject);
   static bool IsCallerChrome(JSContext* aCx, JSObject* aObject);
 
+  static bool MmltkStatusAcceptanceEnabled(JSContext*, JSObject*);
+  void MmltkStatusEnvironment(uint16_t aAction, ErrorResult& aRv,
+                              bool aDispatchVisibility = true);
+
   bool Hidden() const { return mVisibilityState != VisibilityState::Visible; }
   dom::VisibilityState VisibilityState() const { return mVisibilityState; }
 
@@ -3310,6 +3314,11 @@ class Document : public nsINode,
 
   bool mAncestorIsLoading;
 
+  struct MmltkStatusEnvironmentRestore {
+    bool background;
+    uint8_t reducedMotion;
+  };
+  Maybe<MmltkStatusEnvironmentRestore> mMmltkStatusEnvironmentRestore;
   dom::VisibilityState mVisibilityState;
 
   enum Type {

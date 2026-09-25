@@ -207,6 +207,7 @@ TEST_CASE("Annotation unavailable source settles ordered input and commands befo
  mmltk::testsupport::ScopedTempDir saved{"mmltk-annotation-source-readiness"};
  const auto destination = saved.path() / "annotation.cbor";
  CHECK(annotation.Save({.destination = destination.string()}).busy);
+ CHECK(annotation.snapshot().ui.save_generation == prior.ui.save_generation);
  CHECK(annotation.Open(mmltk::testsupport::test_annotation_open(source.frame())).busy);
  if (request_stop) CHECK(annotation.Stop().cancellation_requested);
  render.hold->release.set_value();
@@ -233,6 +234,7 @@ TEST_CASE("Annotation unavailable source settles ordered input and commands befo
  command = annotation.Save({.destination = destination.string()});
  mmltk::testsupport::await_annotation_command(annotation, events, command.revision);
  CHECK(annotation.snapshot().ui.save_status == contracts::AnnotationSaveStatus::Saved);
+ CHECK(annotation.snapshot().ui.save_generation > 0U);
  CHECK(std::filesystem::exists(destination));
 }
 TEST_CASE("Annotation rejects an oversized incoming document without changing its existing editor or pixels") {

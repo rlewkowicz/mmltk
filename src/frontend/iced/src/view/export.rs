@@ -1,6 +1,5 @@
 use crate::fluent_theme::Element;
 use crate::presentation_surface::Surface;
-use crate::view::shared::status_text;
 use crate::view_model::ApplicationModel;
 use iced::widget::{button, column};
 
@@ -214,17 +213,12 @@ impl Component {
                 .map(|operation| &operation.output),
         )
         .map(Message::Output);
-        let diagnostics = crate::view::shared::card(
-            "Export status",
-            "Canonical artifact outcome.",
-            status_text(crate::view::workflow::status::compute_status(operation)),
-        );
         crate::view::workflow::Regions::new(
             crate::generated::FeatureId::Export,
             setup,
             workspace,
             advanced,
-            diagnostics,
+            None,
         )
         .with_run_cards(model, settings, output_card, Message::Gpu)
         .render(width)

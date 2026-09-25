@@ -73,7 +73,7 @@ impl Presentation {
                 TrainingPhase::Validate => "Validating",
                 TrainingPhase::EpochComplete => "Epoch complete",
                 TrainingPhase::Completed => "Finishing",
-                TrainingPhase::Error => "Failed",
+                TrainingPhase::Error => "Finishing",
             }
         };
         result.heading = format!(

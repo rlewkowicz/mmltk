@@ -26,6 +26,7 @@ mod reporting;
 pub(crate) use reporting::metric_projection as report_metric_projection;
 pub(crate) use reporting::primary_action_draw;
 mod workflows;
+pub(crate) mod status;
 
 thread_local! {
     static DRIVER_ENABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -164,6 +165,8 @@ const ANNOTATION_SURFACE: &str = annotation::WORKSPACE_ID;
 
 #[derive(Debug, Clone)]
 pub enum Message {
+    StatusSelectionRead(Result<std::sync::Arc<iced::clipboard::Content>, iced::clipboard::Error>),
+    StatusClipboardRead(Result<std::sync::Arc<iced::clipboard::Content>, iced::clipboard::Error>),
     DatasetDrawn(dataset_presentation::Frame),
     DatasetPixels(u64, u16, pixel_checks::ProbeOutcome),
     DatasetDisclosureToggle,
@@ -173,6 +176,8 @@ pub enum Message {
         active: bool,
         token: u32,
     },
+    StatusMeasured { stage: u32, bounds: Vec<Rectangle> },
+    StatusExercised { stage: u32, success: bool },
     PrimaryActionMeasure {
         control: String,
         token: u32,
@@ -683,12 +688,17 @@ enum Phase {
     AdvancedDenoising(usize),
     AdvancedLayout(usize),
     TriggerError,
-    AwaitErrorModal,
-    ErrorModal,
-    ErrorCopy,
-    AwaitErrorCopy,
-    ErrorDismiss,
-    AwaitErrorDismissed,
+    StatusTrigger,
+    StatusExercise,
+    StatusFixtureBegin,
+    StatusFixtureEnd,
+    AwaitStatusClipboard,
+    AwaitStatusNotice,
+    StatusPanel,
+    StatusCopy,
+    AwaitStatusCopy,
+    StatusDismiss,
+    AwaitStatusDismissed,
     TrainCard,
     DatasetBrowse,
     BenchmarkOverride,
@@ -1120,6 +1130,7 @@ pub struct Controller {
     retained: retained::State,
     annotation_scenario: annotation_checks::State,
     workflows: workflows::State,
+    status: status::Evidence,
     lifecycle: lifecycle::State,
     pixel_checks: pixel_checks::State,
     probes: probe::Requests,
@@ -1292,6 +1303,7 @@ impl Controller {
             retained: retained::State::default(),
             annotation_scenario: annotation_checks::State::default(),
             workflows: workflows::State::default(),
+            status: status::Evidence::default(),
             lifecycle: lifecycle::State::default(),
             pixel_checks: pixel_checks::State::default(),
             probes: probe::Requests::default(),
@@ -1649,9 +1661,10 @@ impl Controller {
             | Phase::AdvancedDenoisingToggle
             | Phase::AdvancedDenoising(..)
             | Phase::AdvancedLayout(..)
-            | Phase::ErrorModal
-            | Phase::ErrorCopy
-            | Phase::ErrorDismiss
+            | Phase::StatusTrigger
+            | Phase::StatusPanel
+            | Phase::StatusCopy
+            | Phase::StatusDismiss
             | Phase::TrainCard
             | Phase::DatasetBrowse
             | Phase::BenchmarkOverride
@@ -1759,6 +1772,8 @@ impl Controller {
             message => message,
         };
         let (control, bounds) = match message {
+            Message::StatusSelectionRead(result) => { self.status.selection_read(&mut self.driver, result); return None; },
+            Message::StatusClipboardRead(result) => { self.status.clipboard_read(&mut self.driver, result); return None; },
             Message::DatasetInputDelivered(next, valid) => {
                 self.lifecycle.presentation.input_pending = false;
                 if valid {
@@ -1793,6 +1808,8 @@ impl Controller {
                 }
                 return None;
             }
+            Message::StatusMeasured { stage, bounds } => { self.status.measured(&mut self.driver, stage, bounds); return None; }
+            Message::StatusExercised { stage, success } => { self.status.exercised(&mut self.driver, stage, success); return None; }
             Message::PrimaryActionMeasure { control, token } => {
                 self.driver.reporting.measure_primary(control, token);
                 return None;
@@ -1970,25 +1987,9 @@ impl Controller {
         self.driver
             .reporting
             .observe(|reporting| reporting.explore_snapshot(model, settings));
-        if let Some(error) = model.error.as_ref()
-            && !matches!(
-                self.driver.phase,
-                Phase::Disabled
-                    | Phase::Complete
-                    | Phase::Failed
-                    | Phase::AwaitErrorModal
-                    | Phase::ErrorModal
-                    | Phase::ErrorCopy
-                    | Phase::AwaitErrorCopy
-                    | Phase::ErrorDismiss
-                    | Phase::AwaitErrorDismissed
-                    | Phase::ViewerAwaitDisconnect
-                    | Phase::ViewerReconnect
-            )
-        {
-            self.driver.fail_detail(|| {
-                format!("{:?}: {}: {}", error.kind, error.title, error.detail).into()
-            });
+        if !self.status.permits(&self.driver.phase, model) {
+            let phase = self.driver.phase.clone();
+            self.driver.fail_detail(|| format!("Unexpected session notifications during {phase:?}: {:?}", model.notices.rows().map(|notice| (notice.id, &notice.error)).collect::<Vec<_>>()).into());
             return Task::none();
         }
         match self.driver.phase.clone() {
@@ -2192,12 +2193,16 @@ impl Controller {
             | Phase::AdvancedDenoising(..)
             | Phase::AdvancedLayout(..)
             | Phase::TriggerError
-            | Phase::AwaitErrorModal
-            | Phase::ErrorModal
-            | Phase::ErrorCopy
-            | Phase::AwaitErrorCopy
-            | Phase::ErrorDismiss
-            | Phase::AwaitErrorDismissed
+            | Phase::StatusFixtureBegin
+            | Phase::StatusFixtureEnd
+            | Phase::AwaitStatusClipboard
+            | Phase::AwaitStatusNotice
+            | Phase::StatusTrigger
+            | Phase::StatusPanel
+            | Phase::StatusCopy
+            | Phase::AwaitStatusCopy
+            | Phase::StatusDismiss
+            | Phase::AwaitStatusDismissed
             | Phase::TrainCard
             | Phase::DatasetBrowse
             | Phase::BenchmarkOverride
@@ -2429,6 +2434,20 @@ impl Controller {
         active: FeatureId,
         surface: Option<crate::presentation_surface::Surface>,
     ) -> Task<RootMessage> {
+        if self.status.fixture.is_some() && !model.notices.is_empty() { self.driver.fail("Unexpected native notification during Status fixture"); }
+        if matches!(self.driver.phase, Phase::Failed | Phase::Disabled) { return self.status.cleanup(model); }
+        if matches!(self.driver.phase, Phase::StatusExercise) {
+            if active != FeatureId::Train { self.driver.fail("Status interaction navigated away from Train"); return self.status.cleanup(model); }
+            if !self.status.prepare(&mut self.driver, model, settings) { return if matches!(self.driver.phase, Phase::Failed) { self.status.cleanup(model) } else { Task::none() }; }
+            return self.status.exercise(&self.driver);
+        }
+        if matches!(self.driver.phase, Phase::StatusFixtureBegin) { self.begin_status_fixture(model); }
+        if matches!(self.driver.phase, Phase::StatusFixtureEnd) {
+            if self.status.begin_healthy() { self.driver.phase = Phase::StatusExercise; return self.status.exercise(&self.driver); }
+            self.status.fixture = None; self.driver.phase = Phase::TrainCard;
+        }
+        let fixture = self.status.fixture.take();
+        let observed = fixture.as_ref().unwrap_or(model);
         let running = self.driver.running();
         if running {
             reporting::primary_page(active, applied_scale);
@@ -2441,7 +2460,8 @@ impl Controller {
             None
         };
         let result =
-            self.advance_transition(model, settings, applied_scale, router, active, surface);
+            self.advance_transition(observed, settings, applied_scale, router, active, surface);
+        self.status.fixture = fixture;
         if running {
             self.finish_transition();
         }

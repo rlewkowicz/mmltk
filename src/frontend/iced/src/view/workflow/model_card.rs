@@ -428,7 +428,6 @@ pub(crate) enum StatusTone {
     Neutral,
     Ready,
     Active,
-    Error,
 }
 
 pub(crate) struct StatusPresentation {
@@ -455,7 +454,7 @@ pub(crate) fn status_presentation(state: Option<&ModelUiState>) -> StatusPresent
     let (label, tone) = match state.terminal.outcome {
         crate::generated::ModelSelectionOutcome::Idle => ("Not prepared", StatusTone::Neutral),
         crate::generated::ModelSelectionOutcome::Accepted => ("Ready", StatusTone::Ready),
-        crate::generated::ModelSelectionOutcome::Rejected => ("Rejected", StatusTone::Error),
+        crate::generated::ModelSelectionOutcome::Rejected => ("Not prepared", StatusTone::Neutral),
         crate::generated::ModelSelectionOutcome::CancellationRequested => {
             ("Stopping", StatusTone::Active)
         }
@@ -480,6 +479,8 @@ pub(crate) fn status_presentation(state: Option<&ModelUiState>) -> StatusPresent
                 layout.unusedcount,
                 layout.provenance.origin
             )
+        } else if state.terminal.outcome == crate::generated::ModelSelectionOutcome::Rejected {
+            String::new()
         } else {
             state.terminal.detail.clone()
         },
@@ -504,7 +505,6 @@ fn status<'a>(state: Option<&ModelUiState>, workflow: FeatureId) -> Element<'a, 
         StatusTone::Neutral => status_text(status.label).style(crate::fluent_theme::text_secondary),
         StatusTone::Ready => status_text(status.label).style(crate::fluent_theme::text_success),
         StatusTone::Active => status_text(status.label).style(crate::fluent_theme::text_warning),
-        StatusTone::Error => status_text(status.label),
     };
     let content = if status.detail.is_empty() {
         column![row![text("Status:"), label].spacing(5)]
@@ -524,14 +524,7 @@ fn status<'a>(state: Option<&ModelUiState>, workflow: FeatureId) -> Element<'a, 
             "export.model.status",
         ))
         .width(Fill);
-    if status.tone == StatusTone::Error {
-        content
-            .padding([6, 8])
-            .style(crate::fluent_theme::container_error)
-            .into()
-    } else {
-        content.into()
-    }
+    content.into()
 }
 
 fn pending_artifact_selection<'a>(
@@ -1220,7 +1213,7 @@ mod tests {
             ),
             (
                 crate::generated::ModelSelectionOutcome::Rejected,
-                StatusTone::Error,
+                StatusTone::Neutral,
             ),
             (
                 crate::generated::ModelSelectionOutcome::CancellationRequested,

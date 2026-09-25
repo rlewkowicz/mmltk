@@ -2762,7 +2762,6 @@ TEST_CASE("workflow GPU evidence requires ordered cards and selected native runs
   for (const std::string stage : {"light", "dark", "narrow"}) {
    audit.workflow_gpu_layout[{stage, name + ".card.output"}] = {100, 100, 200, 70};
    audit.workflow_gpu_layout[{stage, name + ".card.gpu"}] = {100, 180, 200, 120};
-   audit.workflow_gpu_layout[{stage, name + ".card.status"}] = {100, 310, 200, 200};
   }
  }
  REQUIRE(audit.workflow_gpus_complete());
@@ -2792,7 +2791,6 @@ TEST_CASE("workflow GPU evidence requires ordered cards and selected native runs
  }
  SECTION("missing native rank") { audit.workflow_gpu_runs[{"train", 1U}] = {1, -1}; }
  SECTION("card above output") { audit.workflow_gpu_layout[{"light", "validate.card.gpu"}][1] = 0; }
- SECTION("status before GPU") { audit.workflow_gpu_layout[{"light", "train.card.status"}][1] = 100; }
  SECTION("narrow missing") { audit.workflow_gpu_layout.erase({"narrow", "train.card.gpu"}); }
  SECTION("multi GPU falls back to zero") {
   audit.workflow_gpu_selected["export"][0] = 0;

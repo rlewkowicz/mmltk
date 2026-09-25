@@ -10,13 +10,21 @@ impl App {
             Ok(Some(schedule)) => self.handle_settings_schedule(schedule),
             Ok(None) => Task::none(),
             Err(detail) => {
-                self.model.error = Some(UiError::invalid(detail));
+                self.model.report_error(UiError::invalid(detail));
                 Task::none()
             }
         }
     }
 
     pub(super) fn on_workspace(&mut self, message: crate::view::router::Message) -> Task<Message> {
+        if let crate::view::router::Message::Annotation(crate::view::annotation::Message::ShortcutResolved { interaction_revision, .. }) = &message {
+            if *interaction_revision != self.interaction_revision || self.interaction_revision == u64::MAX || self.status.open || self.modal_active() { return Task::none(); }
+        }
+        if self.modal_active() && matches!(&message, crate::view::router::Message::Navigation(_)) { return Task::none(); }
+        if self.status.open && matches!(&message, crate::view::router::Message::Annotation(crate::view::annotation::Message::Shortcut(_))) { return Task::none(); }
+
+        self.model.notices.condition(crate::view_model::notices::Origin::Local(crate::view_model::UiErrorKind::Busy), None);
+        self.model.notices.condition(crate::view_model::notices::Origin::Local(crate::view_model::UiErrorKind::InvalidIntent), None);
         let outcome = match self
             .workspace
             .update(&mut self.model, &mut self.settings, message)
@@ -24,7 +32,7 @@ impl App {
             Ok(Some(outcome)) => outcome,
             Ok(None) => return Task::none(),
             Err(detail) => {
-                self.model.error = Some(UiError::invalid(detail));
+                self.model.report_error(UiError::invalid(detail));
                 return Task::none();
             }
         };
@@ -583,7 +591,7 @@ impl App {
                 .draft()
                 .is_some_and(|draft| self.model.compute_start_available(draft, page));
         if !available {
-            self.model.error = Some(
+            self.model.report_error(
                 if self.settings.has_local_edits()
                     || self.model.native_settings_unsettled()
                     || self.model.model_request_pending()
@@ -624,7 +632,7 @@ impl App {
             FeatureId::Live | FeatureId::Annotate | FeatureId::Explore => false,
         };
         if !available {
-            self.model.error = Some(UiError::busy(
+            self.model.report_error(UiError::busy(
                 "The operation is inactive or already changing state.",
             ));
             return false;
@@ -639,14 +647,14 @@ impl App {
                 .draft()
                 .is_some_and(|draft| self.model.model_selection_available(draft, page))
         {
-            self.model.error = Some(UiError::busy(
+            self.model.report_error(UiError::busy(
                 "Wait for settings and model activity to finish.",
             ));
             return;
         }
         let workflow = page;
         let Some(receipt) = self.model.workflow.model_selection_receipt(workflow) else {
-            self.model.error = Some(UiError::invalid("Settings are not installed yet."));
+            self.model.report_error(UiError::invalid("Settings are not installed yet."));
             return;
         };
         self.submit_model_select_intent(receipt, move |correlation| {
@@ -732,7 +740,7 @@ impl App {
                         return match schedule {
                             Ok(schedule) => self.handle_settings_schedule(schedule),
                             Err(error) => {
-                                self.model.error = Some(UiError::invalid(error));
+                                self.model.report_error(UiError::invalid(error));
                                 Task::none()
                             }
                         };
@@ -768,7 +776,7 @@ impl App {
 
             crate::view::train::Outcome::CompileRequested => {
                 if self.settings.has_local_edits() || !self.model.dataset_compile_available() {
-                    self.model.error = Some(UiError::busy(
+                    self.model.report_error(UiError::busy(
                         "Dataset compilation is unavailable or already active.",
                     ));
                 } else {
@@ -790,7 +798,7 @@ impl App {
                         crate::generated::encode_dataset_Stop,
                     );
                 } else {
-                    self.model.error = Some(UiError::busy(
+                    self.model.report_error(UiError::busy(
                         "Dataset compilation is inactive or already changing state.",
                     ));
                 }
@@ -815,7 +823,7 @@ impl App {
                         )
                     });
                 } else {
-                    self.model.error = Some(UiError::busy("Provider query is unavailable."));
+                    self.model.report_error(UiError::busy("Provider query is unavailable."));
                 }
             }
             crate::view::train::Outcome::ClearOffersRequested => {
@@ -827,7 +835,7 @@ impl App {
                         )
                     });
                 } else {
-                    self.model.error = Some(UiError::busy(
+                    self.model.report_error(UiError::busy(
                         "Provider offers are unavailable or cancellation is already requested.",
                     ));
                 }
@@ -847,7 +855,7 @@ impl App {
                         },
                     );
                 } else {
-                    self.model.error = Some(UiError::busy("Remote start is unavailable."));
+                    self.model.report_error(UiError::busy("Remote start is unavailable."));
                 }
             }
             crate::view::train::Outcome::StopRemoteRequested => {
@@ -862,7 +870,7 @@ impl App {
                         },
                     );
                 } else {
-                    self.model.error = Some(UiError::busy("Remote stop is unavailable."));
+                    self.model.report_error(UiError::busy("Remote stop is unavailable."));
                 }
             }
             crate::view::train::Outcome::RetryReconciliationRequested => {
@@ -872,7 +880,7 @@ impl App {
                         crate::generated::encode_training_RetryReconciliation,
                     );
                 } else {
-                    self.model.error = Some(UiError::busy("Remote reconciliation is unavailable."));
+                    self.model.report_error(UiError::busy("Remote reconciliation is unavailable."));
                 }
             }
         }
@@ -884,7 +892,7 @@ impl App {
         identity: crate::generated::ProviderOfferIdentity,
     ) {
         if self.settings.has_local_edits() || !self.model.provider_select_available(&identity) {
-            self.model.error = Some(UiError::invalid(
+            self.model.report_error(UiError::invalid(
                 "The selected provider offer is no longer available.",
             ));
             return;
@@ -1034,7 +1042,7 @@ impl App {
         match outcome {
             crate::view::live::Outcome::StartRequested => {
                 if self.settings.has_local_edits() || !self.model.live_start_available() {
-                    self.model.error = Some(UiError::busy(
+                    self.model.report_error(UiError::busy(
                         "Live is unavailable or already changing state.",
                     ));
                     return Task::none();
@@ -1046,7 +1054,7 @@ impl App {
                 let Ok(frames_per_second) =
                     crate::generated::default_request_liveStartframespersecond()
                 else {
-                    self.model.error = Some(UiError::protocol(
+                    self.model.report_error(UiError::protocol(
                         "The generated Live frame-rate default is unavailable.",
                     ));
                     return Task::none();
@@ -1068,8 +1076,7 @@ impl App {
                         crate::generated::encode_live_Stop,
                     );
                 } else {
-                    self.model.error =
-                        Some(UiError::busy("Live is inactive or already changing state."));
+                    self.model.report_error(UiError::busy("Live is inactive or already changing state."));
                 }
             }
             crate::view::live::Outcome::SettingsEdited(schedule) => {
@@ -1290,7 +1297,7 @@ mod tests {
                     drop(app.on_validate(crate::view::validate::Outcome::Sample(message.clone())));
                 }
                 assert_validation_viewer_retained(&app, &request);
-                assert!(app.model.error.is_none());
+                assert!(app.model.notices.is_empty());
                 assert!(capture.try_recv().is_err());
                 if let Some(pending) = pending {
                     app.model.abandon_intent(pending);
@@ -1309,7 +1316,7 @@ mod tests {
             app.connection = None;
             drop(app.on_validate(crate::view::validate::Outcome::Sample(message)));
             assert_validation_viewer_retained(&app, &request);
-            assert!(app.model.error.is_some());
+            assert!(!app.model.notices.is_empty());
             assert!(app.model.validation_navigation_available());
             assert!(capture.try_recv().is_err());
         }
@@ -1343,7 +1350,7 @@ mod tests {
             );
             assert!(!app.presentation.stop_requested);
             drop(app.on_validate(crate::view::validate::Outcome::Sample(message)));
-            assert!(app.model.error.is_none());
+            assert!(app.model.notices.is_empty());
             assert!(capture.try_recv().is_err());
         }
     }
@@ -1400,7 +1407,7 @@ mod tests {
                 .directory,
             before
         );
-        assert!(app.model.error.is_none());
+        assert!(app.model.notices.is_empty());
         assert!(
             app.model
                 .file_dialog
@@ -2269,7 +2276,7 @@ mod tests {
         app.advance_start();
         assert!(app.model.workflow.pending_start.is_none());
         assert_eq!(
-            app.model.error.as_ref().unwrap().detail,
+            app.model.notices.latest().unwrap().detail,
             "A separate model operation was admitted first."
         );
         assert!(capture.try_recv().is_err());
@@ -2315,7 +2322,7 @@ mod tests {
             assert!(app.model.workflow.pending_start.is_none());
             assert!(!app.model.has_pending(endpoint));
             assert_eq!(
-                app.model.error.as_ref().unwrap().detail,
+                app.model.notices.latest().unwrap().detail,
                 "browser connection is not ready"
             );
             app.advance_start();

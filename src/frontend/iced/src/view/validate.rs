@@ -268,17 +268,6 @@ impl Component {
                 .map(|snapshot| &snapshot.operation.output),
         )
         .map(Message::Output);
-        let diagnostics = crate::view::shared::card(
-            "Validation status",
-            "Canonical native operation outcome.",
-            status_text(crate::view::workflow::status::compute_status(
-                model
-                    .workflow
-                    .validation
-                    .as_ref()
-                    .map(|snapshot| &snapshot.operation),
-            )),
-        );
         crate::view::workflow::Regions::new(
             // CLEANUP-IGNORE: Validate supplies its generated page identity to the shared compositor.
             crate::generated::FeatureId::Validate,
@@ -286,7 +275,7 @@ impl Component {
             setup,
             workspace,
             advanced,
-            diagnostics,
+            None,
         )
         .with_run_cards(model, settings, output_card, Message::Gpu)
         .render(width)

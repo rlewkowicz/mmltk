@@ -970,12 +970,12 @@ auto BrowserAudit::consume(const nlohmann::json& record) -> void {
    settings_environment = bounds;
   else if (control == "settings.show_fps")
    settings_show_fps = bounds;
-  else if (control == ERROR_MODAL)
-   error_modal = bounds;
-  else if (control == ERROR_COPY)
-   error_copy = bounds;
-  else if (control == ERROR_DISMISS)
-   error_dismiss = bounds;
+  else if (control == STATUS_PANEL)
+   status_panel = bounds;
+  else if (control == STATUS_COPY)
+   status_copy = bounds;
+  else if (control == STATUS_DISMISS)
+   status_dismiss = bounds;
   else if (control == BENCHMARK_OVERRIDE)
    benchmark_override = bounds;
   else if (control == ANNOTATION_SIDEBAR)
@@ -1638,8 +1638,42 @@ auto BrowserAudit::consume(const nlohmann::json& record) -> void {
  } else if (event == "integration.ui_scale_restored") {
   ui_scale_restored = record.value("control", "") == "settings.ui_scale" && record.value("detail", "") == "baseline" && numeric(record, "a") == numeric(record, "b") &&
                       numeric(record, "b") == numeric(record, "c") && numeric(record, "d") != 0.0;
- } else if (event == "integration.error_modal") {
-  error_modal_usable = record.value("detail", "") == "copy-and-dismiss" && numeric(record, "a") == 1.0 && numeric(record, "b") == 1.0 && numeric(record, "c") == 1.0;
+ } else if (event == "integration.status.notice") {
+  const std::string transition = record.value("detail", "");
+  const auto id = scalar(record, "a");
+  const bool addition = transition == "stop-added" || transition == "oom-added" || transition == "pair-added";
+  const bool removal = transition == "removed" || transition == "pair-removed";
+  const bool changed = addition ? status_notice_ids.insert(id).second : removal && status_notice_ids.erase(id) == 1U;
+  status_notice_valid = status_notice_valid && id != 0U && changed && status_notice_ids.size() == scalar(record, "b");
+  status_notice_transitions.push_back(transition);
+ } else if (event == "integration.status.stage") {
+  if (record.value("detail", "") == "completed" && numeric(record, "b") == 1.0 && scalar(record, "a") <= 58U) status_stages.insert(scalar(record, "a"));
+ } else if (event == "integration.status.modal") {
+  if (numeric(record, "a") == 1.0 && numeric(record, "b") == 1.0 && numeric(record, "c") == 1.0 && numeric(record, "d") == 1.0) status_modals.insert(record.value("detail", ""));
+ } else if (event == "integration.status.focus") {
+  if (numeric(record, "a") == 1.0) status_focus_targets.insert(record.value("detail", ""));
+ } else if (event == "integration.status.latch") {
+  status_escape_latch = record.value("detail", "") == "escape-inside-closed" && numeric(record, "a") == 1.0;
+ } else if (event == "integration.status.exercise") {
+  status_exercise = record.value("detail", "") == "rendered-input-complete" && scalar(record, "a") == 32U && numeric(record, "c") >= 2000.0 && numeric(record, "d") == 1.0;
+ } else if (event == "integration.status.pulse") {
+  if (numeric(record, "a") == 1.0 && numeric(record, "c") >= 2000.0) status_motion.insert(record.value("detail", ""));
+ } else if (event == "integration.status.visibility") {
+  status_hidden_quiet = record.value("detail", "") == "native-hidden" && record.value("a", "") == "true" && numeric(record, "b") == numeric(record, "c") && numeric(record, "d") == 350.0;
+ } else if (event == "integration.status.text") {
+  const std::string part = record.value("detail", "");
+  const double line = part == "first" ? 0.0 : part == "middle" ? 41.0 : part == "last" ? 81.0 : -1.0;
+  if (line >= 0.0 && numeric(record, "a") > 20.0 && numeric(record, "b") == line && numeric(record, "c") >= 0.0 && numeric(record, "d") == 14.0) status_text_parts.insert(part);
+ } else if (event == "integration.status.header") {
+  if (numeric(record, "a") == 192.0 && numeric(record, "b") == 96.0 && numeric(record, "c") > 8.0 && numeric(record, "d") > 2.0) status_themes.insert(record.value("detail", ""));
+ } else if (event == "integration.status.selection") {
+  status_selection = record.value("detail", "") == "exact-selected-detail" && numeric(record, "a") == 1.0;
+ } else if (event == "integration.status.healthy") {
+  if (numeric(record, "a") == 192.0 && numeric(record, "b") == 96.0 && numeric(record, "c") > 3.0 && numeric(record, "d") == 0.0) status_healthy_themes.insert(record.value("detail", ""));
+ } else if (event == "integration.status.clipboard") {
+  if (record.value("detail", "") == "exact-title-blank-line-detail" && numeric(record, "a") == 1.0) ++status_clipboard_reads;
+ } else if (event == "integration.status") {
+  status_usable = record.value("detail", "") == "copy-and-dismiss" && numeric(record, "a") == 1.0 && numeric(record, "b") == 1.0 && numeric(record, "c") == 1.0;
  } else if (event == "integration.explore_exact_grid") {
   const auto columns = scalar(record, "c");
   const auto rows = scalar(record, "d");
@@ -1846,9 +1880,9 @@ auto BrowserAudit::readiness_blocker() const -> std::string_view {
   ANNOTATION_STOP,
   ANNOTATION_BRUSH_RADIUS,
   SETTINGS_MODAL,
-  ERROR_MODAL,
-  ERROR_COPY,
-  ERROR_DISMISS,
+  STATUS_PANEL,
+  STATUS_COPY,
+  STATUS_DISMISS,
   "settings.group.appearance",
   "settings.group.typography",
   "settings.group.environment",
@@ -2012,8 +2046,8 @@ auto BrowserAudit::readiness_blocker() const -> std::string_view {
   };
   return compact_row(advanced_general) && compact_row(advanced_optimizer) && compact_row(advanced_match_free) && compact_row(advanced_denoising);
  }();
- const bool error_composition = error_modal.valid() && error_copy.valid() && error_dismiss.valid() && error_copy.x < error_dismiss.x && error_copy.y >= error_modal.y - 1.0 &&
-                                error_dismiss.y >= error_modal.y - 1.0 && error_modal.contains_horizontally(error_copy) && error_modal.contains_horizontally(error_dismiss);
+ const bool status_composition = status_panel.valid() && status_copy.valid() && status_dismiss.valid() && status_copy.x < status_dismiss.x && status_copy.y >= status_panel.y - 1.0 &&
+                                status_dismiss.y >= status_panel.y - 1.0 && status_panel.contains_horizontally(status_copy) && status_panel.contains_horizontally(status_dismiss);
  const bool gallery_shader_fill = explore_gallery.valid() && std::ranges::any_of(surface_geometries, [this](const auto& geometry) {
   const bool gallery_frame = std::ranges::any_of(explore_slot_frames, [&geometry](const auto& frame) { return frame.second == geometry.source_revision; });
   const auto key = std::pair{geometry.presentation_revision, geometry.source_revision};
@@ -2058,8 +2092,10 @@ auto BrowserAudit::readiness_blocker() const -> std::string_view {
   compile_progress_placement, "Dataset progress placement", model_progress_placement, "Model progress containment", model_composition && model_copy, "Model card composition",
   benchmark_override.valid() && benchmark_round_trip && benchmark_choices_complete(), "benchmark override interaction", perceptual_controls_round_trip, "independent perceptual controls round trip",
   explore_composition, "Explore composition", annotation_composition, "annotation composition", workspace_fps_text && workspace_fps_pixels, "visible workspace FPS",
-  settings_composition && settings_numeric_alignment && show_fps_round_trip && ui_scale_drag && ui_scale_released && ui_scale_restored && complete_pointer_drag && error_composition &&
-   error_modal_usable,
+  settings_composition && settings_numeric_alignment && show_fps_round_trip && ui_scale_drag && ui_scale_released && ui_scale_restored && complete_pointer_drag && status_composition &&
+   status_usable && status_exercise && status_notice_valid && status_notice_ids.empty() && status_escape_latch && status_stages.size() == 59U &&
+   status_notice_transitions == std::vector<std::string>{"stop-added", "removed", "oom-added", "removed", "pair-added", "pair-added", "pair-removed", "pair-added", "pair-removed", "pair-removed"} &&
+   status_modals == std::set<std::string>{"settings", "reset", "file-dialog"} && status_focus_targets == std::set<std::string>{"next", "previous", "trigger"} && status_selection && status_hidden_quiet && status_motion == std::set<std::string>{"normal", "reduced"} && status_text_parts == std::set<std::string>{"first", "middle", "last"} && status_themes == std::set<std::string>{"light", "dark"} && status_healthy_themes == std::set<std::string>{"light", "dark"} && status_clipboard_reads == 2U,
   "Settings composition",
   dataset_native_valid && dataset_native_generations.contains(cancelled_compile_generation) && dataset_native_generations.contains(active_compile_generation) && compile_tracks.size() == 3U,
   "Dataset native captions", dataset_presentation_complete(), "Dataset presentation", dataset_transitions_complete(), "Dataset transitions",
@@ -2287,12 +2323,11 @@ bool BrowserAudit::workflow_gpus_complete() const {
    if (stage != "light" && name != "train") continue;
    const auto output = workflow_gpu_layout.find({stage, name + ".card.output"});
    const auto gpu = workflow_gpu_layout.find({stage, name + ".card.gpu"});
-   const auto status = workflow_gpu_layout.find({stage, name + ".card.status"});
-   if (output == workflow_gpu_layout.end() || gpu == workflow_gpu_layout.end() || status == workflow_gpu_layout.end()) return false;
+   if (output == workflow_gpu_layout.end() || gpu == workflow_gpu_layout.end()) return false;
    const auto bounds = [](const auto& values) { return Bounds{values[0], values[1], values[2], values[3]}; };
-   const auto a = bounds(output->second), b = bounds(gpu->second), c = bounds(status->second);
-   if (!a.valid() || !b.valid() || !c.valid() || std::abs(a.x - b.x) > 1 || std::abs(b.x - c.x) > 1 || std::abs(a.width - b.width) > 1 || std::abs(b.width - c.width) > 1 ||
-       std::abs(b.y - a.y - a.height - 10) > 1 || std::abs(c.y - b.y - b.height - 10) > 1)
+   const auto a = bounds(output->second), b = bounds(gpu->second);
+   if (!a.valid() || !b.valid() || std::abs(a.x - b.x) > 1 || std::abs(a.width - b.width) > 1 ||
+       std::abs(b.y - a.y - a.height - 10) > 1)
     return false;
   }
  }

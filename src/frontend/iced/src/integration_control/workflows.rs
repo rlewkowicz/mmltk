@@ -1735,7 +1735,7 @@ impl State {
                 return Task::none();
             }
             self.gpu_revision = 0;
-            let selected = workflow::gpu::selected(feature, &snapshot.settingsstate);
+            let selected = crate::view_model::selected_gpu_ordinals(feature, &snapshot.settingsstate);
             if selected != [self.gpu_target] {
                 let device = if selected.contains(&self.gpu_target) {
                     *selected
@@ -3339,7 +3339,7 @@ impl iced::advanced::widget::Operation<RootMessage> for GpuLayout {
         operate(self);
     }
     fn container(&mut self, id: Option<&iced::advanced::widget::Id>, bounds: Rectangle) {
-        for card in ["output", "gpu", "status"] {
+        for card in ["output", "gpu"] {
             let control = format!("{}.card.{card}", gpu_name(self.feature));
             if id == Some(&iced::advanced::widget::Id::from(control.clone())) {
                 self.bounds.insert(control, bounds);

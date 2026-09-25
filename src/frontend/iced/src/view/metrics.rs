@@ -199,13 +199,6 @@ impl Component {
             }
         }
     }
-    pub fn omitted_summaries(&self) -> u64 {
-        self.history()
-            .curves
-            .iter()
-            .map(|curve| curve.omitted)
-            .sum()
-    }
     pub fn controls_height(&self) -> f32 {
         (if self.selector { 230.0 } else { 40.0 })
             + if self.expanded.is_some() { 34.0 } else { 0.0 }
@@ -948,5 +941,16 @@ pub(crate) mod tests {
                 assert!(series.positions.is_empty());
             })
             .unwrap();
+    }
+}
+
+impl Component {
+    pub(crate) fn observe_notices(&self, notices: &mut crate::view_model::notices::NoticeStore) {
+        use crate::view_model::notices::{Origin, warning};
+        for (history, chart, dropped) in [(&self.live, Origin::Chart, Origin::HistoryDropped), (&self.saved, Origin::ChartSaved, Origin::HistoryDroppedSaved)] {
+            let omissions: u64 = history.curves.iter().map(|curve| curve.omitted).sum();
+            notices.run_condition(chart, &history.run, (omissions > 0).then(|| warning("Chart history incomplete", format!("Charts omit {omissions} older disconnected summaries; saved history remains unchanged."))));
+            notices.run_condition(dropped, &history.run, (history.dropped > 0).then(|| warning("History incomplete", format!("{} training records were dropped.", history.dropped))));
+        }
     }
 }

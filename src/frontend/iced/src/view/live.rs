@@ -108,22 +108,6 @@ impl Component {
             ]
             .spacing(crate::view::workflow::FIELD_SPACING),
         );
-        let diagnostics = crate::view::shared::card(
-            "Live status",
-            "Capture remains active while this page is backgrounded.",
-            status_text(
-                model
-                    .live_snapshot
-                    .as_ref()
-                    .map_or("Unavailable", |snapshot| {
-                        if snapshot.running {
-                            "Running"
-                        } else {
-                            "Stopped"
-                        }
-                    }),
-            ),
-        );
         crate::view::workflow::Regions::new(
             // CLEANUP-IGNORE: Live supplies its generated page identity to the shared compositor.
             crate::generated::FeatureId::Live,
@@ -131,7 +115,7 @@ impl Component {
             setup,
             workspace,
             advanced,
-            diagnostics,
+            None,
         )
         .render(width)
     }

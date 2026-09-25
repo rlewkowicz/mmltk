@@ -40,6 +40,8 @@ pub(super) struct State {
     primary_pixels: std::collections::BTreeSet<String>,
     cancelled_generation: u64,
     fixtures_complete: bool,
+    status_notice: u64,
+    status_fixture: bool,
     benchmark_prepared: Option<usize>,
     benchmark_frame: Option<super::dataset_presentation::Frame>,
     benchmark_reversal: BenchmarkReversal,
@@ -64,6 +66,8 @@ impl Default for State {
             primary_pixels: std::collections::BTreeSet::new(),
             cancelled_generation: 0,
             fixtures_complete: false,
+            status_notice: 0,
+            status_fixture: false,
             benchmark_prepared: None,
             benchmark_frame: None,
             benchmark_reversal: BenchmarkReversal::default(),
@@ -744,35 +748,40 @@ impl State {
             // scrolling or settings changes so their coordinates are comparable.
             Phase::AdvancedLayout(index) => widgets.arm(driver, advanced_layout_field(index).0),
             Phase::TriggerError => {
-                driver.phase = Phase::AwaitErrorModal;
+                driver.phase = Phase::AwaitStatusNotice;
                 // Reject an inactive operation through the ordinary UI handler.
                 // Start can first acquire a model and depends on external assets.
                 Task::done(RootMessage::Workspace(crate::view::router::Message::Train(
                     train::Message::TrainingStopRequested,
                 )))
             }
-            Phase::AwaitErrorModal if model.error.is_some() => {
-                driver.phase = Phase::ErrorModal;
-                widgets.arm(driver, ERROR_MODAL)
+            Phase::AwaitStatusNotice if !model.notices.is_empty() => {
+                let Some(id) = super::status::expected_initial(model, self.status_fixture) else {
+                    driver.fail("Status initial notice did not match its exact expected source and detail");
+                    return Task::none();
+                };
+                self.status_notice = id.0;
+                driver.phase = Phase::StatusTrigger;
+                widgets.arm(driver, crate::view::status::TRIGGER_ID)
             }
-            Phase::ErrorModal => widgets.arm(driver, ERROR_MODAL),
-            Phase::ErrorCopy => widgets.arm(driver, ERROR_COPY),
-            Phase::AwaitErrorCopy if model.error.is_some() => {
-                driver.phase = Phase::ErrorDismiss;
-                widgets.arm(driver, ERROR_DISMISS)
-            }
-            Phase::ErrorDismiss => widgets.arm(driver, ERROR_DISMISS),
-            Phase::AwaitErrorDismissed if model.error.is_none() => {
+            Phase::StatusTrigger => widgets.arm(driver, crate::view::status::TRIGGER_ID),
+            Phase::StatusPanel => widgets.arm(driver, STATUS_PANEL),
+            Phase::StatusCopy => widgets.arm(driver, format!("status.{}.copy", self.status_notice)),
+            Phase::AwaitStatusCopy | Phase::AwaitStatusClipboard => Task::none(),
+            Phase::StatusDismiss => widgets.arm(driver, format!("status.{}.dismiss", self.status_notice)),
+            Phase::AwaitStatusDismissed if model.notices.is_empty() => {
+                reporting::emit(|sink| sink.record("integration.status.notice", STATUS_PANEL, "removed", [self.status_notice as f64, 0.0, 0.0, 0.0]));
                 reporting::emit(|sink| {
                     sink.record(
-                        "integration.error_modal",
-                        ERROR_MODAL,
+                        "integration.status",
+                        STATUS_PANEL,
                         "copy-and-dismiss",
                         [1.0, 1.0, 1.0, 0.0],
                     )
                 });
-                driver.phase = Phase::TrainCard;
-                widgets.arm_scrolled(driver, TRAIN_CARD, RelativeOffset::START)
+                if !self.status_fixture { self.status_fixture = true; driver.phase = Phase::StatusFixtureBegin; }
+                else { driver.phase = Phase::StatusFixtureEnd; }
+                Task::done(RootMessage::Integration(super::Message::Advance))
             }
             Phase::TrainCard => widgets.arm_scrolled(driver, TRAIN_CARD, RelativeOffset::START),
             Phase::DatasetBrowse => widgets.arm(driver, DATASET_BROWSE),
@@ -1652,9 +1661,10 @@ impl State {
                 .to_string(),
             Phase::AdvancedDenoising(index) => denoising_field_id(index),
             Phase::AdvancedLayout(index) => advanced_layout_field(index).0,
-            Phase::ErrorModal => ERROR_MODAL.to_owned(),
-            Phase::ErrorCopy => ERROR_COPY.to_owned(),
-            Phase::ErrorDismiss => ERROR_DISMISS.to_owned(),
+            Phase::StatusTrigger => crate::view::status::TRIGGER_ID.to_owned(),
+            Phase::StatusPanel => STATUS_PANEL.to_owned(),
+            Phase::StatusCopy => format!("status.{}.copy", self.status_notice),
+            Phase::StatusDismiss => format!("status.{}.dismiss", self.status_notice),
             Phase::TrainCard => TRAIN_CARD.to_owned(),
             Phase::DatasetBrowse => DATASET_BROWSE.to_owned(),
             Phase::BenchmarkOverride => BENCHMARK_OVERRIDE.to_owned(),
@@ -1896,21 +1906,26 @@ impl State {
                 };
                 None
             }
-            Phase::ErrorModal => {
-                driver.phase = Phase::ErrorCopy;
+            Phase::StatusTrigger => {
+                driver.phase = Phase::StatusPanel;
+                if !click(input_bounds) { driver.fail("Status trigger click failed"); }
                 None
             }
-            Phase::ErrorCopy => {
-                driver.phase = Phase::AwaitErrorCopy;
+            Phase::StatusPanel => {
+                driver.phase = if self.status_fixture { Phase::StatusExercise } else { Phase::StatusCopy };
+                None
+            }
+            Phase::StatusCopy => {
+                driver.phase = Phase::AwaitStatusCopy;
                 if !click(input_bounds) {
-                    driver.fail("Firefox error Copy click dispatch failed");
+                    driver.fail("Firefox Status Copy click dispatch failed");
                 }
                 None
             }
-            Phase::ErrorDismiss => {
-                driver.phase = Phase::AwaitErrorDismissed;
+            Phase::StatusDismiss => {
+                driver.phase = Phase::AwaitStatusDismissed;
                 if !click(input_bounds) {
-                    driver.fail("Firefox error Dismiss click dispatch failed");
+                    driver.fail("Firefox Status Dismiss click dispatch failed");
                 }
                 None
             }
@@ -2235,7 +2250,7 @@ pub(super) const TRAIN_CARD: &str = train::DATASET_CARD_ID;
 
 pub(super) const COMPILE_DATASET: &str = train::COMPILE_DATASET_ID;
 
-pub(super) const DATASET_STATUS: &str = train::DATASET_STATUS_ID;
+pub(super) const DATASET_STATUS: &str = COMPILE_PROGRESS;
 
 pub(super) const DATASET_SOURCE: &str = train::DATASET_SOURCE_ID;
 
@@ -2291,11 +2306,9 @@ pub(super) const SETTINGS_RESET: &str = "settings.reset";
 
 pub(super) const SETTINGS_CLOSE: &str = "settings.close";
 
-pub(super) const ERROR_MODAL: &str = "error.modal";
+pub(super) const STATUS_PANEL: &str = crate::view::status::PANEL_ID;
 
-pub(super) const ERROR_COPY: &str = crate::view::error_modal::COPY_ID;
 
-pub(super) const ERROR_DISMISS: &str = crate::view::error_modal::DISMISS_ID;
 
 #[cfg(test)]
 mod tests {

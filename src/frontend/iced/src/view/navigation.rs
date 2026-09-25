@@ -58,12 +58,7 @@ pub fn view(
             text(connection)
                 .size(typography.secondary)
                 .style(crate::fluent_theme::text_secondary),
-            container(
-                button("Settings")
-                    .on_press(Message::SettingsRequested)
-                    .style(crate::fluent_theme::button_secondary)
-            )
-            .id("navigation.settings"),
+
         ]
         .spacing(16)
         .align_y(Center),

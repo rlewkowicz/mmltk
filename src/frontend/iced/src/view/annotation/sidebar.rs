@@ -954,7 +954,7 @@ impl Component {
                     status_text(model.snapshot.as_ref().map_or_else(
                         || "Operation unavailable".to_owned(),
                         |snapshot| format!(
-                            "{} · {:?}",
+                            "{}",
                             if snapshot.cancellationrequested {
                                 "stopping"
                             } else if snapshot.busy {
@@ -964,7 +964,6 @@ impl Component {
                             } else {
                                 "All changes saved"
                             },
-                            snapshot.ui.savestatus
                         )
                     ))
                     .size(12)

@@ -139,10 +139,19 @@ and completed display readiness progress independently.
 
 The Iced interface provides coherent training, validation, prediction, live,
 annotation, export, and exploration workflows with Fluent styling, light and
-dark themes, responsive workspaces, settings, diagnostics, and error surfaces.
+dark themes, responsive workspaces, settings, diagnostics, and session Status notifications.
 Progress appears with its owning operation or model. Known totals support
 determinate progress; open-ended work exposes stage, activity, and completed
 work. Completion and failure come from typed native results and events.
+
+A bounded, memory-only frontend session history owns operational warnings and
+errors across workflows and reconnects. Independent native operation identities
+and retained component conditions govern observation and acknowledgement.
+The fixed header Status control opens a selectable, copyable notification panel
+above page and modal content. Notification arrival preserves navigation, focus,
+progress, controls, and completed products; dismissal changes only session
+presentation. Settings and Status remain reachable independently of page scrolling.
+Browser startup retains its emergency recovery interface when Iced cannot render.
 
 Training, validation, and prediction start through their primary action,
 including required settings settlement, model preparation, and input inspection.
@@ -151,7 +160,7 @@ presentation while keeping workflow controls and admission independent.
 Each workflow admits its automatic or manual output at accepted
 execution, preserves completed artifacts on failure, and separates configured
 destinations from run results. Output cards lead the right column, followed by
-shared GPU selection and status. Each workflow retains its compute-device
+shared GPU selection and optional workflow tools. Each workflow retains its compute-device
 preference from the native available-device inventory. Admission captures that
 selection for model preparation and execution; local training retains ordered
 multi-device ranks and their placement. Unavailable selections produce useful

@@ -1383,3 +1383,95 @@ test('Dataset geometry custody rejects at the deferred check before restoration 
   assert.equal(receipts.at(-1).scratch_unchanged, true);
   assert.equal(receipts.at(-1).reports_unchanged, true);
 });
+
+test('Status diagnostics stay silent and allocate nothing when acceptance is disabled', t => {
+  const f = canvasFixture(t, false, false);
+  const before = {...f.allocations};
+  browser.mmltkIntegrationStatusDraw('navigation.status', [10,10,192,34,0,1,1,0,.5,.3,.3,1]);
+  assert.deepEqual(f.allocations, before);
+  assert.deepEqual(f.reports, []);
+});
+
+test('Status pixel exercise rejects malformed measured geometry before reading the canvas', t => {
+  const f = canvasFixture(t, true), results = [];
+  browser.mmltkIntegrationStatusExercise(0, [1,2,3], result => results.push(result));
+  assert.deepEqual(results, [false]);
+  assert.equal(f.allocations.reads, 0);
+  assert.equal(f.allocations.copies, 0);
+});
+
+test('Status deferred input completion loses custody when the accepted session is retired', t => {
+  const f = canvasFixture(t, true), results = [];
+  const bounds = Array.from({length:25}, () => [10,10,20,20]).flat();
+  bounds[8]=0; bounds[9]=0; bounds[10]=0; bounds[11]=0;
+  browser.mmltkIntegrationStatusExercise(4, bounds, result => results.push(result));
+  browser.mmltkIntegrationInitialize(false);
+  f.flushFrames();
+  assert.deepEqual(results, [false]);
+  assert.equal(f.allocations.reads, 0);
+});
+
+
+for (const invalid of [NaN, Infinity, -1]) {
+  test(`Status rejects invalid measured extents before input or sampling: ${invalid}`, t => {
+    const f = canvasFixture(t, true), results = [];
+    const bounds = Array.from({length:25}, () => [10,10,20,20]).flat();
+    bounds[2] = invalid;
+    browser.mmltkIntegrationStatusExercise(4, bounds, result => results.push(result));
+    assert.deepEqual(results, [false]);
+    assert.equal(f.allocations.reads, 0);
+    assert.deepEqual(f.events, []);
+  });
+}
+
+test('Status Escape latch handoff stays inside before a real leave and reentry', t => {
+  const f = canvasFixture(t, true), results = [], moves = [];
+  document.getElementById = () => ({getAttribute: () => 'false'});
+  const dispatch = f.canvas.dispatchEvent;
+  f.canvas.dispatchEvent = event => { if(event.type === 'pointermove') moves.push([event.clientX,event.clientY]); return dispatch(event); };
+  const bounds = Array.from({length:25}, () => [10,10,20,20]).flat();
+  bounds.splice(8,4,0,0,0,0);
+  browser.mmltkIntegrationStatusExercise(4, bounds, result => results.push(result));
+  assert.deepEqual(moves, [[20,20]]);
+  assert.deepEqual(results, []);
+  f.flushFrames();
+  assert.deepEqual(moves, [[20,20],[3,461],[20,20]]);
+  assert.deepEqual(results, [true]);
+  assert.equal(f.reports.filter(record=>record.event === 'integration.status.latch').length, 1);
+});
+
+test('Status rejects an inside-region hover reopen before issuing reentry input', t => {
+  const f = canvasFixture(t, true), results = [];
+  document.getElementById = () => ({getAttribute: () => 'true'});
+  const bounds = Array.from({length:25}, () => [10,10,20,20]).flat();
+  bounds.splice(8,4,0,0,0,0);
+  browser.mmltkIntegrationStatusExercise(4, bounds, result => results.push(result));
+  f.flushFrames();
+  assert.deepEqual(results, [false]);
+  assert.equal(f.reports.filter(record=>record.event === 'integration.status.latch').length, 0);
+});
+
+test('Status driver cancellation settles once and prevents deferred reentry', t => {
+  const f = canvasFixture(t, true), results = [];
+  const bounds = Array.from({length:25}, () => [10,10,20,20]).flat();
+  bounds.splice(8,4,0,0,0,0);
+  browser.mmltkIntegrationStatusExercise(4, bounds, result => results.push(result));
+  browser.mmltkIntegrationDriver(false);
+  const afterCancellation = f.events.length;
+  f.flushFrames();
+  assert.deepEqual(results, [false]);
+  assert.equal(f.events.length, afterCancellation);
+});
+
+
+test('Status explicit failure restoration cancels its pending frame chain', t => {
+  const f = canvasFixture(t, true), results = [];
+  const bounds = Array.from({length:25}, () => [10,10,20,20]).flat();
+  bounds.splice(8,4,0,0,0,0);
+  browser.mmltkIntegrationStatusExercise(4, bounds, result => results.push(result));
+  browser.mmltkIntegrationStatusRestore();
+  const afterRestoration = f.events.length;
+  f.flushFrames();
+  assert.deepEqual(results, [false]);
+  assert.equal(f.events.length, afterRestoration);
+});

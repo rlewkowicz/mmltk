@@ -495,7 +495,8 @@ impl Requests {
                         None if matches!(message, Message::ConfidenceInputDelivered(..)) => true,
                         None => matches!(
                             message,
-                            Message::DatasetInputDelivered(..)
+                            Message::StatusSelectionRead(_) | Message::StatusClipboardRead(_) | Message::StatusMeasured { .. } | Message::StatusExercised { .. }
+                                | Message::DatasetInputDelivered(..)
                                 | Message::DatasetDisclosureToggle
                                 | Message::DatasetDrawn(..)
                                 | Message::DatasetPixels(..)

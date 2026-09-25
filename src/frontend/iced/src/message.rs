@@ -1,5 +1,5 @@
 use crate::transport::TransportEvent;
-use crate::view::{diagnostics, error_modal, file_dialog, router, settings};
+use crate::view::{diagnostics, file_dialog, router, settings, status};
 
 #[derive(Debug, Clone)]
 pub enum Message {
@@ -13,7 +13,7 @@ pub enum Message {
     Workspace(router::Message),
     FileDialog(file_dialog::Message),
     Settings(settings::Message),
-    Error(error_modal::Message),
+    Status(status::Message),
     Diagnostics(diagnostics::Message),
     Integration(crate::integration_control::Message),
 }

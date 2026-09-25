@@ -19,6 +19,7 @@ mod annotation;
 mod explore;
 pub mod presentation;
 mod settings;
+mod status;
 mod transport;
 mod workflows;
 
@@ -33,6 +34,8 @@ pub struct App {
     workspace: crate::view::router::Router,
     settings: crate::view::settings::Component,
     diagnostics: crate::view::diagnostics::Component,
+    status: crate::view::status::Component,
+    interaction_revision: u64,
     integration: Option<crate::integration_control::Controller>,
 }
 
@@ -85,6 +88,8 @@ pub fn boot() -> (App, Task<Message>) {
             workspace: crate::view::router::Router::default(),
             settings: crate::view::settings::Component::default(),
             diagnostics: crate::view::diagnostics::Component::default(),
+            status: crate::view::status::Component::default(),
+            interaction_revision: 0,
             integration,
         },
         Task::none(),
@@ -106,6 +111,7 @@ pub fn scale_factor(app: &App) -> f32 {
 
 pub fn subscription(app: &App) -> Subscription<Message> {
     Subscription::batch([
+        crate::view::status::environment::subscription().map(Message::Status),
         crate::transport::subscription(app.config.clone()).map(Message::Transport),
         iced::window::events().filter_map(|(_, event)| {
             // Retained workspace cadence stays in the widget/window loop.
@@ -122,7 +128,7 @@ pub fn subscription(app: &App) -> Subscription<Message> {
                 integration.subscription().map(Message::Integration)
             }),
         if app.workspace.active() == crate::generated::FeatureId::Annotate
-            && !app.settings.state().open
+            && !app.modal_active() && !app.status.open
         {
             crate::view::annotation::shortcuts().map(|message| {
                 Message::Workspace(crate::view::router::Message::Annotation(message))
@@ -134,6 +140,7 @@ pub fn subscription(app: &App) -> Subscription<Message> {
 }
 
 pub fn update(app: &mut App, message: Message) -> Task<Message> {
+    let previous_interaction = (app.status.open, app.modal_active(), app.workspace.active());
     let previous_surface = app.presentation.surface();
     let mut task = Task::none();
     match message {
@@ -152,7 +159,7 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
         }
         Message::FileDialog(message) => app.on_file_dialog(message),
         Message::Settings(message) => task = app.on_settings(message),
-        Message::Error(message) => task = app.on_error(message),
+        Message::Status(message) => task = app.on_status(message),
         Message::Diagnostics(message) => app.diagnostics.update(message),
         Message::Integration(message) => {
             if app
@@ -168,6 +175,22 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
                 task = app.on_workspace(crate::view::router::Message::Train(message));
             }
         }
+    }
+    if let Some(crate::view::status::Control::Copy(id) | crate::view::status::Control::Detail(id) | crate::view::status::Control::Dismiss(id)) = app.status.focus {
+        let model = app.integration.as_ref().map_or(&app.model, |integration| integration.status_model(&app.model));
+        if model.notices.get(id).is_none() {
+            let control = model.notices.rows().next().map_or(crate::view::status::Control::Trigger, |notice| crate::view::status::Control::Copy(notice.id));
+            app.status.focus = Some(control);
+            task = Task::batch([task, iced::widget::operation::focus(control.id())]);
+        }
+    }
+    let interaction = (app.status.open, app.modal_active(), app.workspace.active());
+    if interaction != previous_interaction {
+        app.interaction_revision = app.interaction_revision.saturating_add(1);
+        if !previous_interaction.1 && interaction.1 { app.status.close(); app.status.focus = None; }
+    }
+    if app.model.connection == crate::view_model::ConnectionState::Connected {
+        app.workspace.observe_notices(&mut app.model.notices);
     }
     let prediction_settings_task = app.settle_prediction_total();
     app.advance_start();
@@ -193,6 +216,9 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
     } else {
         Task::none()
     };
+    let notices = &app.integration.as_ref().map_or(&app.model, |integration| integration.status_model(&app.model)).notices;
+    app.status.sync(notices);
+    crate::view::status::environment::sync(&app.status, notices);
     Task::batch([
         task,
         prediction_settings_task,
@@ -427,7 +453,7 @@ mod route_tests {
                 .is_none()
         );
         std::mem::swap(app.integration.as_mut().unwrap(), &mut fixture.controller);
-        app.model.error = Some(UiError::protocol("terminal transport closed"));
+        app.model.report_error(UiError::protocol("terminal transport closed"));
         integration_control::initialize_reporting(false, false);
         let cancelled = fixture.receiver.try_recv().unwrap();
         assert_eq!(update(&mut app, Message::Integration(cancelled)).units(), 0);
@@ -438,7 +464,7 @@ mod route_tests {
                 .accepts_message(&integration_control::Message::Advance)
         );
         assert_eq!(
-            app.model.error.as_ref().unwrap().detail,
+            app.model.notices.latest().unwrap().detail,
             "terminal transport closed"
         );
     }
@@ -754,12 +780,14 @@ mod route_tests {
 }
 
 pub fn view(app: &App) -> Element<'_, Message> {
+    let model = app.integration.as_ref().map_or(&app.model, |integration| integration.status_model(&app.model));
     let content = crate::view::view(
-        &app.model,
+        model,
         app.presentation.surface(),
         &app.diagnostics,
         &app.workspace,
         &app.settings,
+        &app.status,
     );
     match &app.integration {
         Some(integration) => integration.view(content, &app.model),
@@ -931,7 +959,7 @@ mod tests {
             crate::view_model::ConnectionState::Reconnecting
         );
         assert_eq!(
-            app.model.error.as_ref().map(|error| error.detail.as_str()),
+            app.model.notices.latest().map(|error| error.detail.as_str()),
             Some("peer lost")
         );
         assert_eq!(app.workspace.active(), FeatureId::Train);
@@ -979,16 +1007,16 @@ mod tests {
                 crate::view_model::ConnectionState::Reconnecting
             );
             assert_eq!(
-                protocol.model.error.as_ref().unwrap().kind,
+                protocol.model.notices.latest().unwrap().kind,
                 crate::view_model::UiErrorKind::Protocol
             );
             drop(protocol.on_transport(TransportEvent::IntegrationInputSettled));
             drop(protocol.on_transport(TransportEvent::Disconnected("worker stopped".into())));
             assert_eq!(
-                protocol.model.error.as_ref().unwrap().kind,
+                protocol.model.notices.latest().unwrap().kind,
                 crate::view_model::UiErrorKind::Protocol
             );
-            assert_eq!(protocol.model.error.as_ref().unwrap().detail, detail);
+            assert_eq!(protocol.model.notices.latest().unwrap().detail, detail);
         }
     }
 
@@ -1250,7 +1278,7 @@ mod tests {
                 )),
             ));
             assert_eq!(app.workspace.active(), FeatureId::Live);
-            assert!(app.model.error.is_none());
+            assert!(app.model.notices.is_empty());
             let crate::transport_connection::CapturedRecord::Intent(intent) =
                 receiver.try_recv().unwrap()
             else {
@@ -1285,7 +1313,7 @@ mod tests {
         app.open_dialog(dialog.stable_field_id);
 
         assert_eq!(
-            app.model.error.as_ref().unwrap().kind,
+            app.model.notices.latest().unwrap().kind,
             crate::view_model::UiErrorKind::InvalidIntent
         );
         assert_eq!(app.model.pending_count(), 0);
@@ -1303,7 +1331,7 @@ mod tests {
         drop(app.on_workspace(crate::view::router::Message::Validate(
             crate::view::validate::Message::StartRequested,
         )));
-        assert!(app.model.error.is_none());
+        assert!(app.model.notices.is_empty());
         let crate::transport_connection::CapturedRecord::Intent(prepare) =
             capture.try_recv().unwrap()
         else {
@@ -1350,7 +1378,7 @@ mod tests {
         drop(app.on_workspace(crate::view::router::Message::Validate(
             crate::view::validate::Message::StartRequested,
         )));
-        assert!(app.model.error.is_none());
+        assert!(app.model.notices.is_empty());
         assert!(capture.try_recv().is_err());
         assert!(
             app.model
@@ -1382,7 +1410,7 @@ mod tests {
         drop(app.on_workspace(crate::view::router::Message::Validate(
             crate::view::validate::Message::StartRequested,
         )));
-        assert!(app.model.error.is_none());
+        assert!(app.model.notices.is_empty());
         assert_eq!(
             app.model
                 .workflow
@@ -1408,7 +1436,7 @@ mod tests {
             crate::view::export::Message::StartRequested,
         )));
         assert_eq!(
-            app.model.error.as_ref().unwrap().kind,
+            app.model.notices.latest().unwrap().kind,
             crate::view_model::UiErrorKind::Busy
         );
         app.model.abandon_intent(selection);
@@ -1453,7 +1481,7 @@ mod tests {
                 app.model.compute_start_available(draft, FeatureId::Train)
             })
         );
-        assert!(app.model.error.is_none());
+        assert!(app.model.notices.is_empty());
     }
 
     #[test]
@@ -1478,9 +1506,52 @@ mod tests {
 
         assert_eq!(app.model.pending_count(), 0);
         assert_eq!(
-            app.model.error.as_ref().unwrap().kind,
+            app.model.notices.latest().unwrap().kind,
             crate::view_model::UiErrorKind::Busy
         );
+    }
+
+    #[test]
+    fn annotation_shortcut_completion_is_retired_by_popup_open_then_close() {
+        use crate::view::annotation::{Message as AnnotationMessage, Shortcut};
+        use crate::view::status::{Control, Message as StatusMessage, Opening};
+        let (mut app, task) = boot();
+        drop(task);
+        install_default_bootstrap(&mut app);
+        app.workspace.select(FeatureId::Annotate);
+        let annotation = app.model.annotation.snapshot.as_mut().unwrap();
+        annotation.ready = true;
+        annotation.ui.documentrevision = 1;
+        annotation.inputdocumentepoch = 1;
+        annotation.frame = crate::view_model::test_support::visual_frame(PresentationSourceKind::Annotation, 1);
+        let (connection, mut capture) = Connection::test_channel();
+        app.connection = Some(connection);
+        drop(app.on_workspace(crate::view::router::Message::Annotation(
+            AnnotationMessage::Workspace(crate::view::workspace::Message::Gesture(
+                crate::presentation_surface::SurfaceGesture {
+                    kind: crate::presentation_surface::SurfaceGestureKind::Pointer,
+                    sample: crate::presentation_surface::SurfaceSample {
+                        width: 640, height: 480, x: 20, y: 30,
+                        content_x: 20.0, content_y: 30.0, pressed: true,
+                    },
+                },
+            )),
+        )));
+        let captured_revision = app.interaction_revision;
+        app.model.report_error(UiError::transport("visible notification"));
+        drop(update(&mut app, Message::Status(StatusMessage::Activate(Control::Trigger, Opening::Keyboard))));
+        drop(update(&mut app, Message::Status(StatusMessage::Close)));
+        assert!(!app.status.open);
+        assert!(app.interaction_revision > captured_revision);
+        let resolved = |interaction_revision| crate::view::router::Message::Annotation(
+            AnnotationMessage::ShortcutResolved { shortcut: Shortcut::Undo, focused: false, interaction_revision },
+        );
+        drop(app.on_workspace(resolved(captured_revision)));
+        assert_eq!(app.model.pending_count(), 0);
+        assert!(capture.try_recv().is_err());
+        drop(app.on_workspace(resolved(app.interaction_revision)));
+        assert_eq!(app.model.pending_count(), 1);
+        assert!(matches!(capture.try_recv().unwrap(), crate::transport_connection::CapturedRecord::Intent(_)));
     }
 
     #[test]
@@ -1520,7 +1591,7 @@ mod tests {
             Some(crate::generated::ENDPOINT_Settings_Update)
         );
         assert_eq!(optional_settings.model.pending_count(), 1);
-        assert!(optional_settings.model.error.is_none());
+        assert!(optional_settings.model.notices.is_empty());
 
         let (mut explore_filter, _explore_receiver) = ready();
         let explore = explore_filter.model.explore.snapshot.as_mut().unwrap();
@@ -1550,7 +1621,7 @@ mod tests {
             Some(crate::generated::ENDPOINT_Presentation_Select)
         );
         assert_eq!(presentation.model.pending_count(), 1);
-        assert!(presentation.model.error.is_none());
+        assert!(presentation.model.notices.is_empty());
 
         let (mut interaction, _interaction_receiver) = ready();
         let _ = interaction.request_explore_viewport(ExploreViewportUpdate {
@@ -1589,7 +1660,7 @@ mod tests {
             )),
         );
         assert_eq!(app.model.pending_count(), 1);
-        assert!(app.model.error.is_none());
+        assert!(app.model.notices.is_empty());
         assert_eq!(
             app.model.explore.desired_augmentation,
             Some(crate::generated::ExploreAugmentationUpdate { enabled: false })
@@ -1839,7 +1910,7 @@ mod tests {
 
         assert!(app.model.explore.desired_open);
         assert_eq!(app.model.pending_count(), 0);
-        assert!(app.model.error.is_none());
+        assert!(app.model.notices.is_empty());
 
         let columns = authoritative_explore_columns(&app);
         let measured = |height| {
@@ -1862,7 +1933,7 @@ mod tests {
             Some(crate::generated::ENDPOINT_Explore_Open)
         );
         assert_eq!(app.model.pending_count(), 1);
-        assert!(app.model.error.is_none());
+        assert!(app.model.notices.is_empty());
 
         drop(app.on_workspace(measured(420)));
         assert_eq!(app.model.pending_count(), 1);

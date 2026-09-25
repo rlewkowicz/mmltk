@@ -10268,6 +10268,11 @@ bool Document::CanSavePresentation(nsIRequest* aNewRequest,
 }
 
 void Document::Destroy() {
+  if (mMmltkStatusEnvironmentRestore) {
+    ErrorResult ignored;
+    MmltkStatusEnvironment(0, ignored, false);
+    ignored.SuppressException();
+  }
   if (mIsGoingAway) {
     return;
   }
@@ -13734,6 +13739,45 @@ bool IsMmltkWorkspaceWaylandIntegration() {
   const char* integration =
       getenv("MMLTK_RUN_WORKSPACE_WAYLAND_INTEGRATION");
   return integration && strcmp(integration, "1") == 0;
+}
+
+bool Document::MmltkStatusAcceptanceEnabled(JSContext*, JSObject*) {
+  return IsMmltkWorkspaceWaylandIntegration();
+}
+
+void Document::MmltkStatusEnvironment(uint16_t aAction, ErrorResult& aRv,
+                                      bool aDispatchVisibility) {
+  if (!IsMmltkWorkspaceWaylandIntegration() || aAction > 3) {
+    aRv.ThrowInvalidStateError("Status acceptance environment is unavailable");
+    return;
+  }
+  auto* context = GetBrowsingContext();
+  auto* window = mWindow ? mWindow->GetOuterWindow() : nullptr;
+  if (!context || !window) {
+    aRv.ThrowInvalidStateError("Status acceptance document is detached");
+    return;
+  }
+  auto* top = context->Top();
+  if (aAction == 0 && !mMmltkStatusEnvironmentRestore) return;
+  if (!mMmltkStatusEnvironmentRestore) {
+    mMmltkStatusEnvironmentRestore.emplace(MmltkStatusEnvironmentRestore{
+        window->IsBackground(),
+        static_cast<uint8_t>(top->GetPrefersReducedMotionOverride())});
+  }
+  const auto restore = *mMmltkStatusEnvironmentRestore;
+  const auto motion = aAction == 0
+                          ? static_cast<PrefersReducedMotionOverride>(restore.reducedMotion)
+                          : aAction == 1 ? PrefersReducedMotionOverride::No_preference
+                                         : PrefersReducedMotionOverride::Reduce;
+  const nsresult result = top->SetPrefersReducedMotionOverride(motion);
+  if (NS_FAILED(result)) {
+    aRv.Throw(result);
+    return;
+  }
+  window->SetIsBackground(aAction == 0 ? restore.background : aAction == 3);
+  UpdateVisibilityState(aDispatchVisibility ? DispatchVisibilityChange::Yes
+                                           : DispatchVisibilityChange::No);
+  if (aAction == 0) mMmltkStatusEnvironmentRestore.reset();
 }
 
 bool IsInActiveTab(Document* aDoc) {

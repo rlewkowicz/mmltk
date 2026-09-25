@@ -290,8 +290,8 @@ fn native_lifecycle_controls_visibility_independently_of_retained_progress() {
     for (outcome, caption) in [
         (ArtifactTerminalOutcome::Cancelled, "Cancelled"),
         (ArtifactTerminalOutcome::Succeeded, "Completed"),
-        (ArtifactTerminalOutcome::Failed, "Failed"),
-        (ArtifactTerminalOutcome::Refused, "Compilation refused"),
+        (ArtifactTerminalOutcome::Failed, ""),
+        (ArtifactTerminalOutcome::Refused, ""),
     ] {
         dataset.terminal.outcome = outcome;
         assert_eq!(heading(&dataset), caption);

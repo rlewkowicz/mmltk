@@ -30,7 +30,7 @@ pub enum Shortcut {
 #[derive(Debug, Clone)]
 pub enum Message {
     Shortcut(Shortcut),
-    ShortcutResolved { shortcut: Shortcut, focused: bool },
+    ShortcutResolved { shortcut: Shortcut, focused: bool, interaction_revision: u64 },
     TextFocused,
     OpenRequested,
     SaveRequested,
@@ -96,7 +96,7 @@ impl Component {
                     .load(std::sync::atomic::Ordering::Relaxed)
                     .then_some(Outcome::ShortcutRequested(shortcut)));
             }
-            Message::ShortcutResolved { shortcut, focused } => {
+            Message::ShortcutResolved { shortcut, focused, .. } => {
                 if focused {
                     return Ok(None);
                 }

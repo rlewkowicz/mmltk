@@ -496,3 +496,7 @@ mod tests {
         }
     }
 }
+
+impl Router {
+    pub(crate) fn observe_notices(&self, notices: &mut crate::view_model::notices::NoticeStore) { self.train.observe_notices(notices); }
+}

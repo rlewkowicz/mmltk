@@ -151,9 +151,9 @@ struct BrowserAudit final {
  Bounds settings_typography;
  Bounds settings_environment;
  Bounds settings_show_fps;
- Bounds error_modal;
- Bounds error_copy;
- Bounds error_dismiss;
+ Bounds status_panel;
+ Bounds status_copy;
+ Bounds status_dismiss;
  Bounds benchmark_override;
  bool perceptual_controls_round_trip = false;
  Bounds advanced_container;
@@ -344,7 +344,22 @@ struct BrowserAudit final {
  std::set<std::string, std::less<>> ui_scale_pointer_stages;
  // CLEANUP-IGNORE: Modal usability and following rendered-grid facts are independent end-to-end UI evidence,
  // not streaming-algorithm control flags.
- bool error_modal_usable = false;
+ bool status_usable = false;
+ bool status_exercise = false;
+ bool status_notice_valid = true;
+ bool status_escape_latch = false;
+ std::set<std::uint64_t> status_notice_ids;
+ std::set<std::uint64_t> status_stages;
+ std::vector<std::string> status_notice_transitions;
+ std::set<std::string> status_modals;
+ std::set<std::string> status_focus_targets;
+ bool status_hidden_quiet = false;
+ bool status_selection = false;
+ std::set<std::string> status_motion;
+ std::set<std::string> status_text_parts;
+ std::set<std::string> status_themes;
+ std::set<std::string> status_healthy_themes;
+ std::uint64_t status_clipboard_reads = 0U;
  bool exact_grid = false;
  std::uint64_t exact_grid_revision = 0U;
  std::uint64_t exact_grid_frame_revision = 0U;
@@ -429,7 +444,7 @@ private:
  static constexpr const char* COMPILE_DIMENSIONS = "train.dataset.compile_dimensions";
  static constexpr const char* COMPILE_DATASET = "train.compile_dataset";
  static constexpr const char* COMPILE_PROGRESS = "train.compile_dataset.progress";
- static constexpr const char* DATASET_STATUS = "train.dataset.status";
+ static constexpr const char* DATASET_STATUS = "train.compile_dataset.progress";
  static constexpr const char* TRAIN_MODEL_CARD = "train.card.model";
  static constexpr const char* TRAIN_MODEL_PROGRESS = "train.card.model.progress";
  static constexpr const char* TRAIN_MODEL_SELECTOR = "train.model.selector";
@@ -465,9 +480,9 @@ private:
  static constexpr const char* ANNOTATION_STOP = "annotation.stop";
  static constexpr const char* ANNOTATION_BRUSH_RADIUS = "annotation.brush_radius";
  static constexpr const char* SETTINGS_MODAL = "settings.modal";
- static constexpr const char* ERROR_MODAL = "error.modal";
- static constexpr const char* ERROR_COPY = "error.copy";
- static constexpr const char* ERROR_DISMISS = "error.dismiss";
+ static constexpr const char* STATUS_PANEL = "status.panel";
+ static constexpr const char* STATUS_COPY = "status.1.copy";
+ static constexpr const char* STATUS_DISMISS = "status.1.dismiss";
  static constexpr const char* SETTINGS_FOOTER = "settings.footer";
  static constexpr const char* SETTINGS_RESET = "settings.reset";
  static constexpr const char* SETTINGS_CLOSE = "settings.close";

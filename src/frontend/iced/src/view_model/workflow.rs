@@ -562,19 +562,13 @@ impl crate::generated::DatasetApplicationProjection<UiError> for ApplicationMode
                     value.terminal,
                     value.progress,
                 ) {
-                    self.error = Some(error);
-                }
+                    self.report_error(error);
+                } else { self.observe_dataset(); }
             }
             ApplicationEvent::DatasetDatasetChanged(value) => {
-                let failed = value.snapshot.terminal.outcome
-                    == crate::generated::ArtifactTerminalOutcome::Failed;
-                let detail = value.snapshot.terminal.detail.clone();
-                match self.install_dataset_snapshot(value.snapshot) {
-                    Err(error) => self.error = Some(error),
-                    Ok(Observation::Installed) if failed => self.failed(detail),
-                    Ok(Observation::Installed | Observation::Current | Observation::Stale) => {}
-                }
+                if let Err(error) = self.install_dataset_snapshot(value.snapshot) { self.report_error(error); }
             }
+
             _ => unreachable!("generated Dataset dispatch supplied another system event"),
         }
     }
@@ -585,14 +579,9 @@ impl crate::generated::DatasetApplicationProjection<UiError> for ApplicationMode
             | ApplicationReply::DatasetStop(snapshot) => snapshot,
             _ => unreachable!("generated Dataset dispatch supplied another system reply"),
         };
-        let failed = snapshot.terminal.outcome == crate::generated::ArtifactTerminalOutcome::Failed;
-        let detail = snapshot.terminal.detail.clone();
-        match self.install_dataset_snapshot(snapshot) {
-            Err(error) => self.error = Some(error),
-            Ok(Observation::Installed) if failed => self.failed(detail),
-            Ok(Observation::Installed | Observation::Current | Observation::Stale) => {}
-        }
+        if let Err(error) = self.install_dataset_snapshot(snapshot) { self.report_error(error); }
     }
+
 }
 
 impl crate::generated::TrainingApplicationProjection<UiError> for ApplicationModel {
@@ -607,7 +596,7 @@ impl crate::generated::TrainingApplicationProjection<UiError> for ApplicationMod
         match event {
             ApplicationEvent::TrainingTrainingProgress(value) => {
                 if let Err(error) = self.install_training_progress(value) {
-                    self.error = Some(error);
+                    self.report_error(error);
                 }
             }
             ApplicationEvent::TrainingTrainingChanged(value) => {
@@ -615,7 +604,7 @@ impl crate::generated::TrainingApplicationProjection<UiError> for ApplicationMod
             }
             ApplicationEvent::TrainingTrainingInspectionChanged(value) => {
                 if let Err(error) = self.install_checkpoint_inspection(value.inspection) {
-                    self.error = Some(error);
+                    self.report_error(error);
                 }
             }
             _ => unreachable!("generated Training dispatch supplied another system event"),
@@ -649,14 +638,14 @@ impl crate::generated::TrainingApplicationProjection<UiError> for ApplicationMod
             }
             ApplicationReply::TrainingInspectCheckpoint(value) => {
                 if let Err(error) = self.install_checkpoint_inspection(value.clone()) {
-                    self.error = Some(error);
+                    self.report_error(error);
                 }
                 self.workflow.train_continuation.reply(correlation, value);
                 return;
             }
             ApplicationReply::TrainingCancelCheckpointInspection(value) => {
                 if let Err(error) = self.install_checkpoint_inspection(value) {
-                    self.error = Some(error);
+                    self.report_error(error);
                 }
                 return;
             }
@@ -684,15 +673,15 @@ impl ApplicationModel {
         if let Some(snapshot) = self.workflow.training.as_mut() {
             merge_checkpoint_inspection(&mut snapshot.inspection, value.clone())?;
         }
+        self.observe_checkpoint(&value);
         self.workflow.train_continuation.observe(value);
         Ok(())
     }
 
     fn install_training_reply_snapshot(&mut self, snapshot: crate::generated::TrainingSnapshot) {
         match self.install_training_snapshot(snapshot) {
-            Err(error) => self.error = Some(error),
-            Ok((Observation::Installed, Some(detail))) => self.failed(detail),
-            Ok((Observation::Installed | Observation::Current | Observation::Stale, _)) => {}
+            Err(error) => self.report_error(error),
+            Ok(_) => {}
         }
     }
 }
@@ -702,9 +691,7 @@ impl ApplicationModel {
         &mut self,
         mut value: crate::generated::ValidationSnapshot,
     ) -> Result<(), UiError> {
-        let failed =
-            value.operation.terminal.outcome == crate::generated::ComputeOperationOutcome::Failed;
-        let detail = value.operation.terminal.detail.clone();
+
         let mut installed = true;
         if let Some(current) = self.workflow.validation.as_ref() {
             // Neutralize only the independent logical facts: equality then covers
@@ -735,7 +722,7 @@ impl ApplicationModel {
             let mut operation = current.operation.clone();
             let outcome =
                 super::reduction::merge_compute_state(&mut operation, value.operation.clone())?;
-            installed = outcome == Observation::Installed;
+            installed = outcome != Observation::Stale;
             if outcome == Observation::Stale {
                 value.metrics = current.metrics.clone();
                 value.detailrows = current.detailrows;
@@ -758,10 +745,8 @@ impl ApplicationModel {
         {
             self.workflow.validation_details = None;
         }
+        if installed { self.notices.observe_compute(FeatureId::Validate, &value.operation.terminal); }
         self.workflow.validation = Some(value);
-        if installed && failed {
-            self.failed(detail);
-        }
         Ok(())
     }
 }
@@ -779,7 +764,7 @@ impl crate::generated::ValidationApplicationProjection<UiError> for ApplicationM
             }
             ApplicationEvent::ValidationValidationChanged(value) => {
                 if let Err(error) = self.install_validation_snapshot(value.snapshot) {
-                    self.error = Some(error);
+                    self.report_error(error);
                 }
             }
             _ => unreachable!("generated Validation dispatch supplied another system event"),
@@ -803,7 +788,7 @@ impl crate::generated::ValidationApplicationProjection<UiError> for ApplicationM
             _ => unreachable!("generated Validation dispatch supplied another system reply"),
         };
         if let Err(error) = self.install_validation_snapshot(snapshot) {
-            self.error = Some(error);
+            self.report_error(error);
         }
     }
 }
@@ -850,12 +835,12 @@ impl crate::generated::PredictApplicationProjection<UiError> for ApplicationMode
                     &mut self.predict_snapshot,
                     value.snapshot,
                 ) {
-                    self.error = Some(error);
+                    self.report_error(error);
                 }
             }
             ApplicationEvent::PredictPredictChanged(value) => {
                 match self.install_predict_snapshot(value.snapshot) {
-                    Err(error) => self.error = Some(error),
+                    Err(error) => self.report_error(error),
                     Ok(Observation::Installed) => {
                         if self.source_for(PresentationSourceKind::Predict).is_some() {
                             self.set_foreground_visual(Some(PresentationSourceKind::Predict));
@@ -866,9 +851,17 @@ impl crate::generated::PredictApplicationProjection<UiError> for ApplicationMode
             }
             ApplicationEvent::PredictPredictFailed(value) => {
                 match self.install_predict_snapshot(value.snapshot) {
-                    Err(error) => self.error = Some(error),
-                    Ok(Observation::Installed) => self.failed(value.detail),
-                    Ok(Observation::Current | Observation::Stale) => {}
+                    Err(error) => self.report_error(error),
+                    Ok(Observation::Installed | Observation::Current) => {
+                        if let Some(state) = &self.predict_snapshot {
+                            if state.operation.terminal.outcome == crate::generated::ComputeOperationOutcome::Failed && !state.operation.active {
+                                self.notices.observe(super::notices::Origin::Compute(FeatureId::Predict), 0, state.operation.terminal.generation, Some(super::notices::failure(value.detail)));
+                            } else {
+                                self.notices.visual_condition(super::notices::Origin::PredictionPreview, state.operation.generationfrontier, state.frame.revision, Some(super::notices::warning("Prediction preview unavailable", value.detail)));
+                            }
+                        }
+                    },
+                    Ok(Observation::Stale) => {}
                 }
             }
             _ => unreachable!("generated Predict dispatch supplied another system event"),
@@ -884,7 +877,7 @@ impl crate::generated::PredictApplicationProjection<UiError> for ApplicationMode
             _ => unreachable!("generated Predict dispatch supplied another system reply"),
         };
         if let Err(error) = self.install_predict_snapshot(snapshot) {
-            self.error = Some(error);
+            self.report_error(error);
         }
     }
 }
@@ -904,7 +897,7 @@ impl crate::generated::LiveApplicationProjection<UiError> for ApplicationModel {
             })
             | ApplicationEvent::LiveLiveChanged(crate::generated::LiveChanged { snapshot }) => {
                 match merge_live_snapshot(&mut self.live_snapshot, snapshot) {
-                    Err(error) => self.error = Some(error),
+                    Err(error) => self.report_error(error),
                     Ok(Observation::Installed) => {
                         if self.presentation_model.foreground()
                             == Some(PresentationSourceKind::Live)
@@ -916,10 +909,11 @@ impl crate::generated::LiveApplicationProjection<UiError> for ApplicationModel {
                 }
             }
             ApplicationEvent::LiveLiveFailed(value) => {
+                let generation = value.snapshot.revision;
                 match merge_live_snapshot(&mut self.live_snapshot, value.snapshot) {
-                    Err(error) => self.error = Some(error),
+                    Err(error) => self.report_error(error),
                     Ok(Observation::Installed | Observation::Current) => {
-                        self.failed(value.detail);
+                        self.notices.observe(super::notices::Origin::Compute(FeatureId::Live), 0, generation, Some(super::notices::failure(value.detail)));
                     }
                     Ok(Observation::Stale) => {}
                 }
@@ -936,7 +930,7 @@ impl crate::generated::LiveApplicationProjection<UiError> for ApplicationModel {
             _ => unreachable!("generated Live dispatch supplied another system reply"),
         };
         if let Err(error) = merge_live_snapshot(&mut self.live_snapshot, snapshot) {
-            self.error = Some(error);
+            self.report_error(error);
         }
     }
 }
@@ -1343,7 +1337,7 @@ mod training_history_tests {
                 assert!(model.workflow.pending_start.is_none());
                 before.as_mut().unwrap().inspection = ready;
                 assert_eq!(model.workflow.training, before);
-                assert!(model.error.is_none());
+                assert!(model.notices.is_empty());
             }
         }
     }
@@ -1365,7 +1359,7 @@ mod training_history_tests {
         training.inspection = ready.clone();
         model.project_training_snapshot(training).unwrap();
         assert_eq!(model.workflow.training.as_ref().unwrap().inspection, ready);
-        assert!(model.error.is_none());
+        assert!(model.notices.is_empty());
     }
 
     #[test]

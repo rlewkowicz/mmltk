@@ -7,6 +7,8 @@ impl App {
     ) -> Task<Message> {
         match outcome {
             crate::view::annotation::Outcome::ShortcutRequested(shortcut) => {
+                if self.status.open || self.modal_active() { return Task::none(); }
+                let interaction_revision = self.interaction_revision;
                 return iced::widget::operation::is_focused(
                     crate::generated::constraint_uiannotationbrushradius()
                         .stable_field_id
@@ -16,6 +18,7 @@ impl App {
                     Message::Workspace(crate::view::router::Message::Annotation(
                         crate::view::annotation::Message::ShortcutResolved {
                             shortcut: shortcut.clone(),
+                            interaction_revision,
                             focused,
                         },
                     ))
@@ -26,25 +29,25 @@ impl App {
             }
             crate::view::annotation::Outcome::SaveRequested => {
                 if self.settings.has_local_edits() || !self.model.annotation_save_available() {
-                    self.model.error = Some(UiError::busy(
+                    self.model.report_error(UiError::busy(
                         "Annotation is unavailable or already changing state.",
                     ));
                     return Task::none();
                 }
                 if self.settings_unsettled() {
-                    self.model.error = Some(UiError::busy(
+                    self.model.report_error(UiError::busy(
                         "Wait for Annotation settings to finish saving.",
                     ));
                     return Task::none();
                 }
                 let Some(settings) = self.model.settings_snapshot.as_ref() else {
-                    self.model.error = Some(UiError::invalid(
+                    self.model.report_error(UiError::invalid(
                         "Annotation settings are not installed yet.",
                     ));
                     return Task::none();
                 };
                 let Some(_snapshot) = self.model.annotation.snapshot.as_ref() else {
-                    self.model.error = Some(UiError::invalid(
+                    self.model.report_error(UiError::invalid(
                         "Annotation has no current typed workspace.",
                     ));
                     return Task::none();
@@ -67,7 +70,7 @@ impl App {
                         crate::generated::encode_annotation_Stop,
                     );
                 } else {
-                    self.model.error = Some(UiError::busy(
+                    self.model.report_error(UiError::busy(
                         "Annotation is not running or is already stopping.",
                     ));
                 }
@@ -86,7 +89,7 @@ impl App {
                         self.workspace.rebase_annotation(&self.model);
                     }
                 } else {
-                    self.model.error = Some(UiError::busy(
+                    self.model.report_error(UiError::busy(
                         "Annotation is unavailable or already changing state.",
                     ));
                 }
@@ -114,13 +117,13 @@ impl App {
 
     fn submit_annotation_open(&mut self, request: Option<AnnotationOpen>, available: bool) -> bool {
         if self.settings.has_local_edits() || !available {
-            self.model.error = Some(UiError::busy(
+            self.model.report_error(UiError::busy(
                 "Annotation is unavailable or already changing state.",
             ));
             return false;
         }
         let Some(request) = request else {
-            self.model.error = Some(UiError::presentation(
+            self.model.report_error(UiError::presentation(
                 "Annotation requires a current typed visual source",
             ));
             return false;

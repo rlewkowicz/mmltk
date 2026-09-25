@@ -270,13 +270,14 @@ struct AnnotationUiState final {
  bool can_redo = false;
  bool source_navigation_available = false;
  AnnotationSaveStatus save_status = AnnotationSaveStatus::Idle;
+ std::uint64_t save_generation = 0U;
  std::uint64_t interaction_revision = 0U;
  std::uint64_t document_revision = 0U;
  std::uint64_t saved_revision = 0U;
  std::uint64_t scene_revision = 0U;
  [[nodiscard]] bool empty() const noexcept {
   return tool_capabilities.empty() && !can_undo && !can_redo && !source_navigation_available && !scene.document.valid() && scene.categories.empty() && scene.palette.empty() && scene.objects.empty() &&
-         editor == AnnotationEditorFacts{} && save_status == AnnotationSaveStatus::Idle && interaction_revision == 0U && document_revision == 0U && saved_revision == 0U && scene_revision == 0U;
+         editor == AnnotationEditorFacts{} && save_status == AnnotationSaveStatus::Idle && save_generation == 0U && interaction_revision == 0U && document_revision == 0U && saved_revision == 0U && scene_revision == 0U;
  }
  [[nodiscard]] bool valid() const noexcept {
   if (!scene.document.valid()) return empty();

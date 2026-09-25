@@ -141,29 +141,35 @@ impl crate::generated::AnnotationApplicationProjection<UiError> for ApplicationM
         &mut self,
         value: crate::generated::AnnotationSnapshot,
     ) -> Result<(), UiError> {
-        self.annotation.install_snapshot(value).map(|_| ())
+        self.install_annotation_snapshot(value).map(|_| ())
     }
 
     fn project_annotation_event(&mut self, event: ApplicationEvent) {
         let observation = match event {
             ApplicationEvent::AnnotationAnnotationChanged(value) => {
-                self.annotation.install_snapshot(value.snapshot)
+                self.install_annotation_snapshot(value.snapshot)
             }
             ApplicationEvent::AnnotationAnnotationFrameChanged(value) => {
                 self.annotation.install_frame(value.snapshot)
             }
             ApplicationEvent::AnnotationAnnotationFailed(value) => {
-                match self.annotation.install_snapshot(value.snapshot) {
-                    Err(error) => self.error = Some(error),
+                let generation = value.snapshot.uirevision;
+                let owner = value.snapshot.inputdocumentepoch;
+                let save_failed = value.snapshot.ui.savestatus == crate::generated::AnnotationSaveStatus::Failed;
+                match self.install_annotation_snapshot(value.snapshot) {
+                    Err(error) => self.report_error(error),
                     Ok(Observation::Stale) => {}
-                    Ok(Observation::Installed | Observation::Current) => self.failed(value.detail),
+                    Ok(Observation::Installed | Observation::Current) => {
+                        if save_failed && self.notices.annotation_save_event(generation) { self.observe_annotation(Some(value.detail)); }
+                        else { self.notices.observe(super::notices::Origin::Annotation, owner, generation, Some(super::notices::failure(value.detail))); }
+                    },
                 }
                 return;
             }
             _ => unreachable!("generated Annotation dispatch supplied another system event"),
         };
         match observation {
-            Err(error) => self.error = Some(error),
+            Err(error) => self.report_error(error),
             Ok(Observation::Installed) => {
                 if self.presentation_model.foreground()
                     == Some(crate::generated::PresentationSourceKind::Annotation)
@@ -190,8 +196,8 @@ impl crate::generated::AnnotationApplicationProjection<UiError> for ApplicationM
             | ApplicationReply::AnnotationStop(snapshot) => snapshot,
             _ => unreachable!("generated Annotation dispatch supplied another system reply"),
         };
-        if let Err(error) = self.annotation.install_snapshot(snapshot) {
-            self.error = Some(error);
+        if let Err(error) = self.install_annotation_snapshot(snapshot) {
+            self.report_error(error);
         }
     }
 }
@@ -269,5 +275,13 @@ mod tests {
             model.install_snapshot(snapshot).unwrap(),
             Observation::Stale
         );
+    }
+}
+
+impl ApplicationModel {
+    fn install_annotation_snapshot(&mut self, snapshot: crate::generated::AnnotationSnapshot) -> Result<Observation, UiError> {
+        let observation = self.annotation.install_snapshot(snapshot)?;
+        if observation != Observation::Stale { self.observe_annotation(None); }
+        Ok(observation)
     }
 }

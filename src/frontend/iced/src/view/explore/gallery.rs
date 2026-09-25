@@ -459,9 +459,6 @@ fn gallery_viewport<'a>(
                     column![
                         space::vertical(),
                         text(presentation_title).size(22),
-                        status_text(snapshot.map_or("", |value| value.failure.as_str()))
-                            .size(12)
-                            .style(crate::fluent_theme::text_secondary),
                         space::vertical()
                     ]
                     .align_x(Center)

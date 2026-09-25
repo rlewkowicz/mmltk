@@ -62,23 +62,12 @@ pub(super) fn view<'a>(
         available,
         Message::ClassToggled,
     );
-    let failure: Element<'a, Message> = snapshot
-        .filter(|value| !value.failure.is_empty())
-        .map_or_else(
-            || space::vertical().height(0).into(),
-            |value| {
-                status_text(value.failure.as_str())
-                    .style(crate::fluent_theme::text_secondary)
-                    .into()
-            },
-        );
     super::sidebar(
         super::DETAILS_SCROLL_ID,
         "Dataset details",
         column![
             text("Dataset metadata").size(20),
             status_text(status).style(crate::fluent_theme::text_secondary),
-            failure,
             fact(
                 "Images",
                 snapshot.map_or_else(

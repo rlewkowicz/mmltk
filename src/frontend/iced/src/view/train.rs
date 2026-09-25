@@ -14,7 +14,6 @@ use crate::view_model::ContinuationMode;
 
 pub const DATASET_CARD_ID: &str = "train.card.dataset";
 pub const COMPILE_DATASET_ID: &str = "train.compile_dataset";
-pub const DATASET_STATUS_ID: &str = "train.dataset.status";
 pub const DATASET_SOURCE_ID: &str = "train.dataset.source";
 pub const DATASET_BROWSE_ID: &str = "train.dataset.browse";
 pub const COMPILED_DIRECTORY_ID: &str = "train.dataset.compiled_directory";
@@ -138,9 +137,6 @@ fn continuation_controls<'a>(
             crate::view_model::CheckpointCapability::Pending { .. } => {
                 controls = controls.push(status_text("Inspecting checkpoint…").size(12))
             }
-            crate::view_model::CheckpointCapability::Failed(detail) => {
-                controls = controls.push(status_text(detail).size(12))
-            }
             _ => {}
         }
     }
@@ -237,12 +233,7 @@ impl Component {
                     ),
                 )
             });
-        let dataset = model.workflow.dataset.as_ref();
-        let training = model
-            .workflow
-            .training
-            .as_ref()
-            .map(|training| &training.local);
+
         let setup: Element<'a, Message> = column![
             self.model_card.view_with(
                 crate::view::workflow::model_card::State::from_settings(
@@ -325,33 +316,16 @@ impl Component {
             advanced::view(installed_train, settings, settings_edit_available)
                 .map(Message::Advanced),
         );
-        let diagnostics = crate::view::shared::card(
-            "Training status",
-            "Native dataset, local training, and provider facts.",
-            column![
-                container(status_text(crate::view::workflow::status::artifact_status(
-                    dataset
-                )))
-                .id(DATASET_STATUS_ID),
-                container(status_text(crate::view::workflow::status::compute_status(
-                    training
-                )))
-                .id("train.progress"),
-                button("Stop training").on_press_maybe(
-                    model
-                        .training_stop_available()
-                        .then_some(Message::TrainingStopRequested)
-                ),
-                crate::view::shared::identified(
+        let diagnostics = Some(crate::view::shared::identified(
                     "train.card.remote",
                     crate::view::shared::card(
                         "Remote training",
                         "Offers and selected identities are retained from generated replies.",
                         column![
-                            button("Find offers").on_press_maybe(
+                            container(button("Find offers").on_press_maybe(
                                 (settings_settled && model.provider_query_available())
                                     .then_some(Message::QueryOffersRequested)
-                            ),
+                            )).id("train.offers.find"),
                             container(
                                 button("Clear offers").on_press_maybe(
                                     model
@@ -361,15 +335,15 @@ impl Component {
                             )
                             .id("train.offers.clear"),
                             offers,
-                            button("Start remote").on_press_maybe(
+                            container(button("Start remote").on_press_maybe(
                                 (settings_settled && model.remote_start_available())
                                     .then_some(Message::StartRemoteRequested)
-                            ),
-                            button("Stop remote").on_press_maybe(
+                            )).id("train.remote.start"),
+                            container(button("Stop remote").on_press_maybe(
                                 model
                                     .remote_stop_available()
                                     .then_some(Message::StopRemoteRequested)
-                            ),
+                            )).id("train.remote.stop"),
                             container(
                                 button("Retry reconciliation").on_press_maybe(
                                     model
@@ -381,10 +355,7 @@ impl Component {
                         ]
                         .spacing(crate::view::workflow::FIELD_SPACING),
                     ),
-                ),
-            ]
-            .spacing(crate::view::workflow::FIELD_SPACING),
-        );
+                ));
         crate::view::workflow::Regions::new(
             crate::generated::FeatureId::Train,
             setup,
@@ -395,7 +366,7 @@ impl Component {
         .with_run_cards(
             model,
             settings,
-            output::view(model, settings, self.metrics.omitted_summaries()).map(Message::Output),
+            output::view(model, settings).map(Message::Output),
             Message::Gpu,
         )
         .render(width)
@@ -542,4 +513,8 @@ mod tests {
             draft
         );
     }
+}
+
+impl Component {
+    pub(crate) fn observe_notices(&self, notices: &mut crate::view_model::notices::NoticeStore) { self.metrics.observe_notices(notices); }
 }

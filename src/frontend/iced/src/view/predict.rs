@@ -294,11 +294,6 @@ impl Component {
                 .spacing(crate::view::workflow::FIELD_SPACING),
             ),
         );
-        let diagnostics = crate::view::shared::card(
-            "Prediction status",
-            "Canonical result and frame activity.",
-            status_text(crate::view::workflow::status::compute_status(operation)),
-        );
         crate::view::workflow::Regions::new(
             // CLEANUP-IGNORE: Predict supplies its generated page identity to the shared compositor.
             crate::generated::FeatureId::Predict,
@@ -306,7 +301,7 @@ impl Component {
             setup,
             workspace,
             advanced,
-            diagnostics,
+            None,
         )
         .with_run_cards(model, settings, output_card, Message::Gpu)
         .render(width)

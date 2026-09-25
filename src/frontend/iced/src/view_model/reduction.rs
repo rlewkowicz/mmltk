@@ -16,24 +16,15 @@ impl ApplicationModel {
     pub fn peer_disconnected(&mut self, error: UiError) {
         self.clear_peer_state();
         self.connection = ConnectionState::Reconnecting;
-        self.error = Some(error);
+        self.report_error(error);
     }
 
     pub fn clear_peer_state(&mut self) {
         self.pending.clear();
-        self.settings_snapshot = None;
-        self.file_dialog = None;
-        self.presentation = None;
-        self.model_snapshot = None;
-        self.live_snapshot = None;
-        self.predict_snapshot = None;
-        self.predict_full_progress = None;
-        self.upscale_snapshot = None;
-        self.workflow = WorkflowModel::default();
+        self.workflow.cancel_start();
         self.explore.reset_transport();
         self.requested_upscale = None;
         self.sent_upscale = None;
-        self.annotation = AnnotationModel::default();
         self.dialog_context = None;
         self.presentation_model = presentation::PresentationModel::default();
     }
@@ -56,12 +47,19 @@ impl ApplicationModel {
             window_height: self.window_height,
             scale_factor: self.scale_factor,
             next_correlation: self.next_correlation,
+            settled_replies: self.settled_replies.clone(),
+            notices: self.notices.clone(),
             connection: ConnectionState::AwaitingBootstrap,
             ..Self::default()
         };
+        replacement.notices.begin_bootstrap();
         for snapshot in snapshots {
             replacement.install_snapshot(snapshot)?;
         }
+        replacement.seed_event_frontiers();
+        replacement.notices.end_bootstrap();
+        replacement.notices.condition(super::notices::Origin::Transport, None);
+        replacement.notices.condition(super::notices::Origin::Protocol, None);
         replacement.connection = ConnectionState::Connected;
         *self = replacement;
         Ok(())
@@ -77,7 +75,9 @@ impl ApplicationModel {
             .get(&correlation)
             .map(|pending| pending.endpoint)
         else {
-            self.error = Some(UiError::protocol("unknown or duplicate IntentReply"));
+            if correlation == 0 || correlation >= self.next_correlation {
+                self.report_error(UiError::protocol("IntentReply correlation was never issued"));
+            }
             return None;
         };
         self.workflow.settle_start_model_reply(correlation, &result);
@@ -127,7 +127,7 @@ impl ApplicationModel {
                     }
                 }
                 if current_failure {
-                    self.error = Some(error.into());
+                    self.notices.observe(super::notices::Origin::Request(context), 0, correlation, Some(error.into()));
                 }
             }
             Ok(reply) => {
@@ -139,7 +139,7 @@ impl ApplicationModel {
                     ) {
                         self.dialog_context = None;
                     }
-                    self.error = Some(UiError::protocol(
+                    self.report_error(UiError::protocol(
                         "IntentReply kind did not match its pending endpoint",
                     ));
                 } else {
@@ -176,6 +176,7 @@ impl ApplicationModel {
                 .as_ref()
                 .expect("installed Settings observation");
             self.workflow.install_settings(installed);
+            self.observe_settings_notices();
         }
         Ok(observation)
     }
@@ -210,7 +211,7 @@ impl ApplicationModel {
             if let Some(target) = expected_target.as_ref() {
                 self.clear_dialog_target_if_matches(target);
             }
-            self.error = Some(UiError::protocol(
+            self.report_error(UiError::protocol(
                 "FileDialog reply kind or target did not match its pending context",
             ));
             return;
@@ -219,7 +220,7 @@ impl ApplicationModel {
         if terminal {
             if let Err(error) = self.validate_dialog_terminal(&snapshot) {
                 self.clear_dialog_target_if_matches(&snapshot.target);
-                self.error = Some(error);
+                self.report_error(error);
                 return;
             }
         }
@@ -228,7 +229,7 @@ impl ApplicationModel {
                 if let Some(target) = expected_target.as_ref() {
                     self.clear_dialog_target_if_matches(target);
                 }
-                self.error = Some(error);
+                self.report_error(error);
             }
             Ok(Observation::Installed | Observation::Current) if terminal => {
                 if let Some(target) = expected_target.as_ref() {
@@ -240,21 +241,12 @@ impl ApplicationModel {
     }
 
     pub(super) fn install_compute_snapshot(&mut self, page: FeatureId, snapshot: ComputeUiState) {
-        let failed = snapshot.terminal.outcome == ComputeOperationOutcome::Failed;
-        let detail = snapshot.terminal.detail.clone();
-        let result = self
-            .compute_target(page)
-            .map_or(Ok(Observation::Stale), |target| {
-                merge_compute_state(target, snapshot)
-            });
+        let observed = snapshot.terminal.clone();
+        let result = self.compute_target(page).map_or(Ok(Observation::Stale), |target| merge_compute_state(target, snapshot));
         match result {
-            Err(error) => self.error = Some(error),
-            Ok(Observation::Installed) => {
-                if failed {
-                    self.failed(detail);
-                }
-            }
-            Ok(Observation::Current | Observation::Stale) => {}
+            Err(error) => self.report_error(error),
+            Ok(Observation::Installed | Observation::Current) => self.notices.observe_compute(page, &observed),
+            Ok(Observation::Stale) => {},
         }
     }
 
@@ -262,17 +254,15 @@ impl ApplicationModel {
         &mut self,
         snapshot: PredictSnapshot,
     ) -> Result<Observation, UiError> {
-        merge_predict_snapshot(
-            &mut self.predict_snapshot,
-            &mut self.predict_full_progress,
-            snapshot,
-        )
+        let observation = merge_predict_snapshot(&mut self.predict_snapshot, &mut self.predict_full_progress, snapshot)?;
+        if observation != Observation::Stale { self.observe_predict(); }
+        Ok(observation)
     }
 
     pub(super) fn install_training_snapshot(
         &mut self,
         mut snapshot: crate::generated::TrainingSnapshot,
-    ) -> Result<(Observation, Option<String>), UiError> {
+    ) -> Result<Observation, UiError> {
         if let Some(current) = self.workflow.training.as_mut() {
             super::workflow::merge_checkpoint_inspection(
                 &mut current.inspection,
@@ -283,54 +273,15 @@ impl ApplicationModel {
         self.workflow
             .train_continuation
             .observe(snapshot.inspection.clone());
-        let prior = self.workflow.training.as_ref().map(|value| {
-            (
-                value.local.terminal.outcome,
-                value.local.terminal.generation,
-                value.offers.outcome,
-                value.offers.revision,
-                value.remote.outcome,
-                value.remote.revision,
-            )
-        });
+        self.observe_checkpoint(&snapshot.inspection);
         let observation = merge_observation(
             &mut self.workflow.training,
             snapshot,
             |value| value.revision,
             "Training",
         )?;
-        let failure = if observation == Observation::Installed {
-            prior.and_then(|prior| {
-                let installed = self.workflow.training.as_ref()?;
-                if installed.local.terminal.outcome == ComputeOperationOutcome::Failed
-                    && (prior.0 != ComputeOperationOutcome::Failed
-                        || installed.local.terminal.generation > prior.1)
-                {
-                    Some(installed.local.terminal.detail.clone())
-                } else if installed.offers.outcome == crate::generated::ProviderQueryOutcome::Failed
-                    && (prior.2 != crate::generated::ProviderQueryOutcome::Failed
-                        || installed.offers.revision > prior.3)
-                {
-                    Some(installed.offers.detail.clone())
-                } else if matches!(
-                    installed.remote.outcome,
-                    crate::generated::RemoteOperationOutcome::Failed
-                        | crate::generated::RemoteOperationOutcome::Inconclusive
-                ) && (!matches!(
-                    prior.4,
-                    crate::generated::RemoteOperationOutcome::Failed
-                        | crate::generated::RemoteOperationOutcome::Inconclusive
-                ) || installed.remote.revision > prior.5)
-                {
-                    Some(installed.remote.detail.clone())
-                } else {
-                    None
-                }
-            })
-        } else {
-            None
-        };
-        Ok((observation, failure))
+        if observation != Observation::Stale { self.observe_training(); }
+        Ok(observation)
     }
 
     pub(super) fn install_training_progress(
@@ -360,6 +311,7 @@ impl ApplicationModel {
         installed.local = progress.local;
         installed.metrics = progress.metrics;
         installed.persistence = progress.persistence;
+        self.observe_training();
         Ok(Observation::Installed)
     }
 
@@ -423,7 +375,9 @@ impl ApplicationModel {
         &mut self,
         snapshot: crate::generated::ArtifactUiState,
     ) -> Result<Observation, UiError> {
-        merge_dataset_state(&mut self.workflow.dataset, snapshot)
+        let observation = merge_dataset_state(&mut self.workflow.dataset, snapshot)?;
+        if observation != Observation::Stale { self.observe_dataset(); }
+        Ok(observation)
     }
 
     pub(super) fn install_explore_snapshot(
@@ -442,6 +396,7 @@ impl ApplicationModel {
             .as_ref()
             .is_some_and(|previous| previous.selectedimage == snapshot.selectedimage);
         let observation = merge_explore_snapshot(&mut self.explore.snapshot, snapshot)?;
+        if observation != Observation::Stale { self.observe_explore(); }
         if observation == Observation::Installed {
             let snapshot = self.explore.snapshot.as_ref().expect("installed snapshot");
             if let Some(request) = self
@@ -545,13 +500,7 @@ impl ApplicationModel {
         }
     }
 
-    pub(super) fn failed(&mut self, detail: String) {
-        self.error = Some(UiError {
-            kind: UiErrorKind::Failed,
-            title: "Operation failed",
-            detail,
-        });
-    }
+
 }
 
 pub(super) fn merge_observation<T: PartialEq>(
@@ -1099,7 +1048,7 @@ mod tests {
             model.reduce_reply(correlation, Ok(reply));
             assert_eq!(model.file_dialog, installed);
             assert!(model.dialog_context().is_none());
-            assert_eq!(model.error.as_ref().unwrap().kind, UiErrorKind::Protocol);
+            assert_eq!(model.notices.latest().unwrap().kind, UiErrorKind::Protocol);
         }
 
         let mut model = bootstrapped();
@@ -1118,7 +1067,7 @@ mod tests {
         );
         assert_eq!(model.file_dialog, Some(terminal));
         assert!(model.dialog_context().is_none());
-        assert!(model.error.is_none());
+        assert!(model.notices.is_empty());
     }
 
     #[test]
@@ -1241,11 +1190,11 @@ mod tests {
                 snapshot: failed.clone(),
             },
         ));
-        assert_eq!(model.error.as_ref().unwrap().detail, "provider unavailable");
-        model.error = None;
+        assert_eq!(model.notices.latest().unwrap().detail, "provider unavailable");
+        model.notices.dismiss_all();
         model.reduce_reply(correlation, Ok(ApplicationReply::TrainingQuery(admitted)));
         assert_eq!(model.workflow.training, Some(failed));
-        assert!(model.error.is_none());
+        assert!(model.notices.is_empty());
     }
 
     #[test]
@@ -1361,7 +1310,7 @@ mod tests {
             },
         ));
         assert_eq!(model.live_snapshot, Some(failed.clone()));
-        model.error = None;
+        model.notices.dismiss_all();
         model.reduce_event(ApplicationEvent::LiveLiveFailed(
             crate::generated::LiveFailed {
                 snapshot: admitted,
@@ -1369,7 +1318,7 @@ mod tests {
             },
         ));
         assert_eq!(model.live_snapshot, Some(failed));
-        assert!(model.error.is_none());
+        assert!(model.notices.is_empty());
     }
 
     #[test]
@@ -1438,14 +1387,13 @@ mod tests {
         local.reduce_event(ApplicationEvent::TrainingTrainingChanged(
             crate::generated::TrainingChanged { snapshot: training },
         ));
-        assert_eq!(local.error.as_ref().unwrap().title, "Operation failed");
-        assert_eq!(local.error.as_ref().unwrap().detail, failure);
+        assert_eq!(local.notices.latest().unwrap().title, "Operation failed");
+        assert_eq!(local.notices.latest().unwrap().detail, failure);
         let retained = &local.workflow.training.as_ref().unwrap().local;
         assert_eq!(retained.terminal.detail, failure);
-        assert!(crate::view::workflow::status::compute_status(Some(retained)).contains(failure));
+        assert_eq!(local.notices.latest().unwrap().detail, failure);
         assert!(
-            matches!(crate::view::workflow::progress::compute_presentation(Some(retained)),
-            crate::view::workflow::progress::Presentation::Terminal { detail, .. } if detail == failure)
+            matches!(crate::view::workflow::progress::compute_presentation(Some(retained)), crate::view::workflow::progress::Presentation::Hidden)
         );
 
         let mut provider = bootstrapped();
@@ -1465,7 +1413,7 @@ mod tests {
         provider.reduce_event(ApplicationEvent::TrainingTrainingChanged(
             crate::generated::TrainingChanged { snapshot: training },
         ));
-        assert_eq!(provider.error.as_ref().unwrap().detail, "provider failed");
+        assert_eq!(provider.notices.latest().unwrap().detail, "provider failed");
 
         let mut remote = bootstrapped();
         let mut training = remote.workflow.training.clone().unwrap();
@@ -1490,6 +1438,6 @@ mod tests {
         remote.reduce_event(ApplicationEvent::TrainingTrainingChanged(
             crate::generated::TrainingChanged { snapshot: training },
         ));
-        assert_eq!(remote.error.as_ref().unwrap().detail, "remote failed");
+        assert_eq!(remote.notices.latest().unwrap().detail, "remote failed");
     }
 }

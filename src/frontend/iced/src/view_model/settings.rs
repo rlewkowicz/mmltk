@@ -10,7 +10,7 @@ impl crate::generated::SettingsApplicationProjection<UiError> for ApplicationMod
             unreachable!("generated Settings dispatch supplied another system event");
         };
         if let Err(error) = self.install_settings_snapshot(value.snapshot) {
-            self.error = Some(error);
+            self.report_error(error);
         }
     }
 
@@ -21,7 +21,7 @@ impl crate::generated::SettingsApplicationProjection<UiError> for ApplicationMod
             _ => unreachable!("generated Settings dispatch supplied another system reply"),
         };
         if let Err(error) = self.install_settings_snapshot(snapshot) {
-            self.error = Some(error);
+            self.report_error(error);
         }
     }
 }
@@ -37,18 +37,19 @@ impl crate::generated::FileDialogApplicationProjection<UiError> for ApplicationM
                 let target = value.snapshot.target.clone();
                 if let Err(error) = self.install_dialog_terminal(value.snapshot) {
                     self.clear_dialog_target_if_matches(&target);
-                    self.error = Some(error);
+                    self.report_error(error);
                 }
             }
             ApplicationEvent::FileDialogFileDialogFailed(value) => {
                 let target = value.snapshot.target.clone();
+                let generation = value.snapshot.generation;
                 match self.install_dialog_terminal(value.snapshot) {
                     Err(error) => {
                         self.clear_dialog_target_if_matches(&target);
-                        self.error = Some(error);
+                        self.report_error(error);
                     }
                     Ok(Observation::Installed | Observation::Current) => {
-                        self.failed(value.detail);
+                        self.notices.observe(super::notices::Origin::Dialog, 0, generation, Some(super::notices::failure(value.detail)));
                     }
                     Ok(Observation::Stale) => {}
                 }
@@ -72,4 +73,21 @@ impl crate::generated::FileDialogApplicationProjection<UiError> for ApplicationM
             _ => unreachable!("generated FileDialog dispatch supplied another system reply"),
         }
     }
+}
+
+pub(crate) fn selected_gpu_ordinals(feature: FeatureId, state: &crate::generated::GuiSettingsState) -> &[i32] {
+    match feature {
+        FeatureId::Train => &state.workflows.train.request.deviceids,
+        FeatureId::Validate => std::slice::from_ref(&state.workflows.validate.request.deviceid),
+        FeatureId::Predict => std::slice::from_ref(&state.workflows.predict.request.deviceid),
+        FeatureId::Export => std::slice::from_ref(&state.workflows.exportstate.deviceid),
+        _ => unreachable!(),
+    }
+}
+
+pub(crate) fn settings_constraint_bounds(constraint: crate::generated::SettingsLeafConstraint) -> Option<(f32, f32)> {
+    let (minimum, maximum) = constraint.minimum.zip(constraint.maximum)?;
+    let range = (minimum as f32, maximum as f32);
+    (constraint.finite && minimum.is_finite() && maximum.is_finite() && range.0 < range.1)
+        .then_some(range)
 }

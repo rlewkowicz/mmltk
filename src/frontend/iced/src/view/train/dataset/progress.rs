@@ -37,9 +37,9 @@ fn heading(state: &ArtifactUiState) -> String {
     match state.terminal.outcome {
         ArtifactTerminalOutcome::Idle => "",
         ArtifactTerminalOutcome::Succeeded => "Completed",
-        ArtifactTerminalOutcome::Failed => "Failed",
+        ArtifactTerminalOutcome::Failed => "",
         ArtifactTerminalOutcome::Cancelled => "Cancelled",
-        ArtifactTerminalOutcome::Refused => "Compilation refused",
+        ArtifactTerminalOutcome::Refused => "",
         ArtifactTerminalOutcome::CancellationRequested => "Cancelling…",
     }
     .into()
@@ -358,7 +358,7 @@ pub(crate) fn view<Message: 'static>(state: Option<&ArtifactUiState>) -> Element
                         .width(Fill),
                 );
             }
-        } else if !state.active {
+        } else if !state.active && !matches!(state.terminal.outcome, ArtifactTerminalOutcome::Failed | ArtifactTerminalOutcome::Refused) {
             for detail in [&state.terminal.detail, &state.terminal.artifact] {
                 if !detail.is_empty() {
                     body = body.push(status_text(detail.clone()).size(12));

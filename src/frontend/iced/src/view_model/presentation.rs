@@ -314,11 +314,12 @@ impl crate::generated::PresentationApplicationProjection<UiError> for Applicatio
     fn project_presentation_event(&mut self, event: ApplicationEvent) {
         match event {
             ApplicationEvent::PresentationPresentationFailed(value) => {
+                let generation = value.snapshot.revision;
                 match merge_presentation_snapshot(&mut self.presentation, value.snapshot) {
-                    Err(error) => self.error = Some(error),
+                    Err(error) => self.report_error(error),
                     Ok(Observation::Stale) => {}
                     Ok(Observation::Installed | Observation::Current) => {
-                        self.error = Some(UiError::presentation(value.detail));
+                        self.notices.observe(super::notices::Origin::Presentation, 0, generation, Some(UiError::presentation(value.detail)));
                     }
                 }
             }
@@ -331,7 +332,7 @@ impl crate::generated::PresentationApplicationProjection<UiError> for Applicatio
             unreachable!("generated Presentation dispatch supplied another system reply");
         };
         if let Err(error) = merge_presentation_snapshot(&mut self.presentation, snapshot) {
-            self.error = Some(error);
+            self.report_error(error);
         }
     }
 }
@@ -931,7 +932,7 @@ mod tests {
         assert!(model.annotation.install_snapshot(malformed).is_err());
         assert_eq!(model.annotation.snapshot.as_ref(), Some(&installed));
         for ui_revision in [installed.uirevision - 1, installed.uirevision + 1] {
-            model.error = None;
+            model.notices.dismiss_all();
             model.reduce_event(ApplicationEvent::AnnotationAnnotationFrameChanged(
                 crate::generated::AnnotationFrameChanged {
                     snapshot: crate::generated::AnnotationFrameState {
@@ -941,10 +942,10 @@ mod tests {
                     },
                 },
             ));
-            assert!(model.error.is_some());
+            assert!(!model.notices.is_empty());
             assert_eq!(model.annotation.snapshot.as_ref(), Some(&installed));
         }
-        model.error = None;
+        model.notices.dismiss_all();
         let future = crate::generated::AnnotationFrameState {
             revision: installed.revision + 3,
             uirevision: installed.revision + 2,
@@ -987,7 +988,7 @@ mod tests {
             model.annotation.snapshot.as_ref().unwrap().revision,
             future.revision
         );
-        assert!(model.error.is_none());
+        assert!(model.notices.is_empty());
 
         model.set_foreground_feature(FeatureId::Live);
         let mut live = model.live_snapshot.clone().unwrap();
@@ -1159,7 +1160,7 @@ mod tests {
         running.operation.active = false;
         running.revision += 1;
         running.operation.terminal.outcome = ComputeOperationOutcome::Failed;
-        model.error = None;
+        model.notices.dismiss_all();
         model.reduce_event(ApplicationEvent::PredictPredictFailed(
             crate::generated::PredictFailed {
                 snapshot: running,
@@ -1175,7 +1176,7 @@ mod tests {
                 .generationfrontier,
             3
         );
-        assert!(model.error.is_none());
+        assert!(model.notices.is_empty());
     }
     #[test]
     fn compact_predict_progress_preserves_labels_and_delayed_image_reconciliation() {
@@ -1218,7 +1219,7 @@ mod tests {
         model.reduce_event(ApplicationEvent::PredictPredictProgress(PredictProgress {
             snapshot: progress.clone(),
         }));
-        assert!(model.error.is_none());
+        assert!(model.notices.is_empty());
         assert_eq!(
             model.predict_snapshot.as_ref().unwrap().labels.as_ptr(),
             pointer
@@ -1226,7 +1227,7 @@ mod tests {
         model.reduce_event(ApplicationEvent::PredictPredictProgress(PredictProgress {
             snapshot: progress.clone(),
         }));
-        assert!(model.error.is_none());
+        assert!(model.notices.is_empty());
         assert_eq!(
             model.predict_snapshot.as_ref().unwrap().labels.as_ptr(),
             pointer
@@ -1281,7 +1282,7 @@ mod tests {
             .install_predict_snapshot(cancellation.clone())
             .unwrap();
         assert_eq!(model.predict_snapshot.as_ref().unwrap().frame, image.frame);
-        assert!(model.error.is_none());
+        assert!(model.notices.is_empty());
         model.peer_disconnected(UiError::transport("reconnect"));
         assert!(model.predict_snapshot.is_none());
         model.install_predict_snapshot(cancellation).unwrap();

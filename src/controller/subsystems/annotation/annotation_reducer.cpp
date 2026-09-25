@@ -1087,7 +1087,10 @@ public:
  }
  [[nodiscard]] DocumentResult Save(const std::string_view destination) {
   if (!current(state_)) return {.outcome = DocumentOutcome::Rejected, .detail = "Annotation document state is invalid"};
-  const auto effect = save_annotation_document(state_.ui, destination, next_save_generation_++);
+  if (next_save_generation_ == std::numeric_limits<std::uint64_t>::max())
+   return {.outcome = DocumentOutcome::Capacity, .detail = "Annotation save identity exhausted"};
+  state_.ui.save_generation = next_save_generation_++;
+  const auto effect = save_annotation_document(state_.ui, destination, state_.ui.save_generation);
   if (effect == DocumentSaveEffect::NotApplied) {
    state_.ui.save_status = domain::AnnotationSaveStatus::Failed;
    return {.outcome = DocumentOutcome::Rejected, .detail = "Annotation document save failed"};

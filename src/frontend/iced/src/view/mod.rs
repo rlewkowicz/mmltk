@@ -1,7 +1,7 @@
 pub mod annotation;
 pub mod aspect_ratio;
 pub mod diagnostics;
-pub mod error_modal;
+pub mod status;
 pub mod explore;
 pub mod export;
 pub mod file_dialog;
@@ -23,7 +23,7 @@ use crate::message::Message;
 use crate::view_model::ApplicationModel;
 use iced::widget::scrollable::{Direction, Scrollbar};
 use iced::widget::{container, opaque, responsive, scrollable, space, stack};
-use iced::{Color, Fill, Length, Padding};
+use iced::{Color, Fill, Padding};
 
 pub const HORIZONTAL_SCROLL_ID: &str = "application.horizontal.scroll";
 pub const PAGE_SCROLL_ID: &str = "application.page.scroll";
@@ -67,6 +67,7 @@ pub fn view<'a>(
     diagnostics_component: &'a diagnostics::Component,
     router: &'a router::Router,
     settings_component: &'a settings::Component,
+    status_component: &'a status::Component,
 ) -> Element<'a, Message> {
     let base = responsive(move |size| {
         let layout = canvas_layout(size.width);
@@ -105,49 +106,21 @@ pub fn view<'a>(
             }
         })
         .into();
-        let header = scrollable(
-            container(
-                container(
-                    router
-                        .navigation(
-                            model.connection.label(),
-                            settings_component.state().typography(model.typography()),
-                        )
-                        .map(Message::Workspace),
-                )
-                .width(Length::Fixed(page_width.max(PAGE_MIN_WIDTH)))
-                .center_y(Fill),
-            )
-            .padding(Padding {
-                left: page_offset,
-                ..Padding::ZERO
-            })
-            .width(Length::Fixed(canvas_width.max(PAGE_MIN_WIDTH)))
-            .height(Length::Fixed(NAVIGATION_HEIGHT))
-            .style(crate::fluent_theme::container_header_shadow),
-        )
-        .direction(Direction::Horizontal(compact_scrollbar()))
-        .width(Fill)
-        .height(Length::Fixed(NAVIGATION_HEIGHT));
-        let shell = iced::widget::column![header, body,].spacing(0).height(Fill);
+        let header = container(iced::widget::row![
+            scrollable(router.navigation(model.connection.label(), settings_component.state().typography(model.typography())).map(Message::Workspace))
+                .direction(Direction::Horizontal(compact_scrollbar())).width(Fill),
+            status_component.header(&model.notices).map(Message::Status),
+        ].spacing(0).align_y(iced::Center)).padding([9, 10]).height(NAVIGATION_HEIGHT).width(Fill).style(crate::fluent_theme::container_header_shadow);
+        let body = scrollable(container(body).width(canvas_width).height(Fill))
+            .id(HORIZONTAL_SCROLL_ID).direction(Direction::Horizontal(compact_scrollbar()))
+            .style(crate::fluent_theme::scrollable_default).width(Fill).height(Fill);
+        let shell = iced::widget::column![header, body].spacing(0).height(Fill);
         let shell = if settings_component.state().diagnostics_visible() {
             shell.push(diagnostics::view(model, diagnostics_component).map(Message::Diagnostics))
         } else {
             shell
         };
-        let shell: Element<'_, Message> = container(shell)
-            .width(Length::Fixed(canvas_width))
-            .height(Fill)
-            .style(crate::fluent_theme::container_shell)
-            .into();
-        scrollable(shell)
-            .id(HORIZONTAL_SCROLL_ID)
-            .direction(Direction::Horizontal(compact_scrollbar()))
-            // Reserve the rail's height so it cannot cover bottom-row controls.
-            .spacing(0)
-            .style(crate::fluent_theme::scrollable_default)
-            .width(Fill)
-            .height(Fill)
+        container(shell).width(Fill).height(Fill).style(crate::fluent_theme::container_shell)
     });
 
     let settings_overlay = settings_component
@@ -161,10 +134,6 @@ pub fn view<'a>(
             .map(Message::Settings),
         )
     });
-    let error_overlay = model
-        .error
-        .as_ref()
-        .map(|error| opaque_fill(error_modal::view(error).map(Message::Error)));
     let file_dialog_overlay =
         file_dialog::view(model).map(|dialog| opaque_fill(dialog.map(Message::FileDialog)));
 
@@ -172,7 +141,6 @@ pub fn view<'a>(
         file_dialog_overlay,
         settings_overlay,
         reset_overlay,
-        error_overlay,
     ];
     let mut layers: Vec<Element<'a, Message>> = Vec::with_capacity(5);
     layers.push(base.into());
@@ -180,16 +148,11 @@ pub fn view<'a>(
         overlay.map_or_else(
             || space::horizontal().width(0).height(0).into(),
             |overlay| {
-                container(overlay)
-                    .padding(Padding::ZERO)
-                    .width(Fill)
-                    .height(Fill)
-                    .style(modal_backdrop)
-                    .into()
+                iced::widget::column![space::vertical().height(NAVIGATION_HEIGHT), container(overlay).width(Fill).height(Fill).style(modal_backdrop)].height(Fill).into()
             },
         )
     }));
-    stack(layers).width(Fill).height(Fill).into()
+    status_component.wrap(stack(layers).width(Fill).height(Fill).into(), &model.notices)
 }
 
 fn modal_backdrop(_theme: &Theme) -> iced::widget::container::Style {

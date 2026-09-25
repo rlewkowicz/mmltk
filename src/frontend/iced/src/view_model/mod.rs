@@ -2,6 +2,7 @@ mod annotation;
 mod availability;
 mod explore;
 mod model_selection;
+pub mod notices;
 mod pending;
 mod presentation;
 mod reduction;
@@ -24,6 +25,7 @@ use reduction::{
     Observation, merge_compute_snapshot, merge_dialog_snapshot, merge_live_snapshot,
     merge_model_snapshot, merge_observation, merge_presentation_snapshot,
 };
+pub(crate) use settings::{selected_gpu_ordinals, settings_constraint_bounds};
 pub use workflow::{
     CheckpointCapability, ContinuationMode, HistoryLoad, ModelSelectionReceipt, PendingStart,
     StartInputs, StartPreparation, WorkflowModel,
@@ -179,13 +181,14 @@ pub struct ApplicationModel {
     pub workflow: WorkflowModel,
     pub explore: ExploreModel,
     pub annotation: AnnotationModel,
-    pub error: Option<UiError>,
+    pub notices: notices::NoticeStore,
     pub window_width: u32,
     pub window_height: u32,
     pub scale_factor: f64,
     dialog_context: Option<DialogContext>,
     pending: BTreeMap<u64, PendingRequest>,
     next_correlation: u64,
+    settled_replies: std::collections::VecDeque<(u64, u64)>,
     presentation_model: presentation::PresentationModel,
 }
 
@@ -219,13 +222,14 @@ impl Default for ApplicationModel {
             workflow: WorkflowModel::default(),
             explore: ExploreModel::default(),
             annotation: AnnotationModel::default(),
-            error: None,
+            notices: notices::NoticeStore::default(),
             window_width: 0,
             window_height: 0,
             scale_factor: 1.0,
             dialog_context: None,
             pending: BTreeMap::new(),
             next_correlation: 1,
+            settled_replies: std::collections::VecDeque::with_capacity(MAX_PENDING_INTENTS),
             presentation_model: presentation::PresentationModel::default(),
         }
     }
@@ -243,5 +247,16 @@ impl ApplicationModel {
             monospace: ui.map_or(12.0, |value| value.monofontsize),
             text_input: ui.map_or(13.0, |value| value.textinputfontsize),
         }
+    }
+}
+
+impl ApplicationModel {
+    pub fn report_error(&mut self, error: UiError) {
+        let origin = match error.kind {
+            UiErrorKind::Transport => notices::Origin::Transport,
+            UiErrorKind::Protocol => notices::Origin::Protocol,
+            _ => notices::Origin::Local(error.kind),
+        };
+        self.notices.local(origin, error);
     }
 }

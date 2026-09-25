@@ -4,6 +4,8 @@ let integrationDriver;
 
 export function mmltkIntegrationDriver(enabled) {
   if (!enabled) {
+    integrationState?.statusPending?.('invalidated');
+    restoreStatusFixture(integrationState);
     mmltkIntegrationRestoreCanvasSize();
     mmltkIntegrationCancelNumberEdit();
     integrationDriver = undefined;
@@ -19,6 +21,7 @@ export function mmltkIntegrationDriver(enabled) {
 export function mmltkIntegrationInitialize(enabled) {
   if (!enabled) {
     if (integrationState) {
+      restoreStatusFixture(integrationState);
       integrationState.datasetPixels?.finish('invalidated');
       for (const type of integrationState.inputTypes) {
         window.removeEventListener(type, integrationState.onInput, true);
@@ -1760,4 +1763,248 @@ export function mmltkIntegrationDatasetInput(action, bounds, value, callback) {
       integrationNumberEdit(x + width / 2, y + height / 2, value, value.length, complete);
     } else complete(false);
   });
+}
+
+export function mmltkIntegrationStatusRestore() {
+  integrationState?.statusPending?.('invalidated');
+  restoreStatusFixture(integrationState);
+}
+function restoreStatusFixture(owner) {
+  restoreStatusEnvironment(owner);
+  mmltkIntegrationRestoreCanvasSize();
+}
+function restoreStatusEnvironment(owner) {
+  if (!owner?.statusEnvironment) return;
+  if (owner.statusTimer !== undefined) { clearTimeout(owner.statusTimer); owner.statusTimer = undefined; }
+  try { document.mmltkStatusEnvironment(0); owner.statusEnvironment = false; }
+  catch (error) { report({event:'integration.failure',control:'navigation.status',detail:`Status environment restoration: ${error}`}); }
+}
+
+// Status probes use the composed canvas and real input dispatch. The retained
+// state is bounded to three controls and one current exercise, and disappears
+// with the existing acceptance owner.
+export function mmltkIntegrationStatusDraw(control, facts) {
+  if (!integrationState || !integrationDriver) return;
+  integrationState.statusDraw ??= new Map();
+  if (!['navigation.status', 'navigation.settings', 'status.close'].includes(control)) return;
+  integrationState.statusDraw.set(control, Float64Array.from(facts));
+  if (control === 'navigation.status') integrationState.statusDrawCount = (integrationState.statusDrawCount ?? 0) + 1;
+}
+
+export function mmltkIntegrationStatusExercise(stage, measured, callback) {
+  const owner = integrationState;
+  let active = true;
+  const finish = integrationCompletion(outcome => {
+    active = false;
+    if (owner) owner.statusPending = undefined;
+    if (outcome !== 'observed') restoreStatusFixture(owner);
+    callback(outcome === 'observed');
+  });
+  if (!owner || !integrationDriver || measured.length !== 100 || !Array.from(measured).every(Number.isFinite)) { finish('failed'); return; }
+  owner.statusPending = finish;
+  const canvas = document.querySelector('canvas');
+  if (!canvas) { finish('failed'); return; }
+  const bounds = Array.from({length: 25}, (_, index) => Array.from(measured.slice(index * 4, index * 4 + 4)));
+  const [trigger, settings, panel, detail, close, run, tabs, modal, settingsClose, themeToggle, live] = bounds;
+  const remote = bounds.slice(11,16);
+  const [reset, resetConfirm, dialog, dialogStop, browse, firstCopy, firstDismiss, lastCopy, lastDismiss] = bounds.slice(16);
+  const scale = owner.primaryScale, css = canvas.getBoundingClientRect();
+  if (!(scale > 0 && Number.isFinite(scale) && css.width > 0 && css.height > 0 && Number.isFinite(css.width) && Number.isFinite(css.height)) || bounds.some(r => r[2] < 0 || r[3] < 0) || [trigger,settings].some(r => r[2] === 0 || r[3] === 0)) { finish('failed'); return; }
+  const point = (r, fx = .5, fy = .5) => [(r[0] + r[2] * fx) * scale, (r[1] + r[3] * fy) * scale];
+  const move = (r, fx, fy) => { const [x,y] = point(r,fx,fy); canvas.dispatchEvent(integrationPointer(css,x,y,'pointermove',0)); };
+  const click = r => { const [x,y] = point(r); return mmltkIntegrationClick(x,y) > 0; };
+  const key = (name, shift = false, control = false) => { integrationKey(canvas,'keydown',name,name,control,shift); integrationKey(canvas,'keyup',name,name,control,shift); };
+  const touch = r => { const [x,y] = point(r); for (const type of ['pointerdown','pointerup']) canvas.dispatchEvent(new PointerEvent(type, {bubbles:true,cancelable:true,pointerId:77,pointerType:'touch',isPrimary:true,clientX:css.left+x,clientY:css.top+y,button:0,buttons:type === 'pointerdown' ? 1 : 0})); };
+  const outside = [2, Math.max(70, css.height / scale - 20), 2, 2];
+  const opened = () => panel[2] > 0 && panel[3] > 0;
+  const assert = (condition, reason) => { if (!condition) throw new Error(reason); };
+  const failed = error => {
+    report({event:'integration.failure',control:'status.panel',detail:`Status stage ${stage}: ${error}`});
+    restoreStatusFixture(owner); finish('failed');
+  };
+  const frame = callback => integrationFrame(() => { if (!active) return; if (integrationState !== owner) { finish('invalidated'); return; } try { callback(); } catch(error) { failed(error); } });
+  const after = () => frame(() => frame(() => finish('observed')));
+  const pixels = r => {
+    const sx = scale * canvas.width / css.width, sy = scale * canvas.height / css.height;
+    const x = Math.max(0, Math.floor(r[0]*sx)), y = Math.max(0,Math.floor(r[1]*sy));
+    const right = Math.min(canvas.width,Math.ceil((r[0]+r[2])*sx)), bottom = Math.min(canvas.height,Math.ceil((r[1]+r[3])*sy));
+    assert(right > x && bottom > y, 'Status probe is outside the composed canvas');
+    return canvasSnapshot(canvas).getImageData(x,y,right-x,bottom-y);
+  };
+  const header = (healthy = false) => {
+    assert(Math.abs(trigger[2]-192) < .01 && Math.abs(settings[2]-96) < .01 && trigger[3] === settings[3], 'Status/Settings fixed geometry');
+    assert(trigger[0] >= 0 && settings[0]+settings[2] <= css.width/scale+.5, 'Status header clipped');
+    const facts = owner.statusDraw?.get('navigation.status');
+    assert(facts && facts[5] === Number(!healthy) && facts[11] === Number(!healthy), 'Status border draw missing');
+    const image = pixels(trigger), sx = image.width / trigger[2], sy = image.height / trigger[3];
+    const at = (x,y) => image.data.subarray((Math.floor(y*sy)*image.width+Math.floor(x*sx))*4,(Math.floor(y*sy)*image.width+Math.floor(x*sx))*4+3);
+    const fill = at(6,17), border = at(96,.5);
+    assert(fill.every((channel,index) => Math.abs(channel-facts[8+index]*255) <= 12), 'Status pink fill pixels');
+    if (healthy) assert(border.every((channel,index)=>Math.abs(channel-fill[index])<=12), 'healthy Status unexpectedly has a border');
+    else assert(border.every(channel => channel >= 220), 'Status white border pixels');
+    let yellow=0, dark=0, green=0, misplacedGreen=0;
+    for(let y=0;y<image.height;y++) for(let x=0;x<image.width;x++) {
+      const i=(y*image.width+x)*4, r=image.data[i],g=image.data[i+1],b=image.data[i+2];
+      if(r<70 && g>100 && b<110) { green++; if(x<image.width*.5) misplacedGreen++; }
+      if(r>220 && g>165 && g<235 && b<100) yellow++;
+      if(r<80 && g<75 && b<65 && x>image.width*.2 && x<image.width*.5) dark++;
+    }
+    if (healthy) { assert(green>3 && misplacedGreen===0 && yellow===0, 'healthy Status must color only Ok green'); report({event:'integration.status.healthy',control:'navigation.status',detail:facts[4] ? 'dark' : 'light',a:'192',b:'96',c:String(green),d:'0'}); return Array.from(fill); }
+    assert(yellow>8 && dark>2,'Status warning triangle/exclamation pixels');
+    report({event:'integration.status.header',control:'navigation.status',detail:facts[4] ? 'dark' : 'light',a:'192',b:'96',c:String(yellow),d:String(dark)});
+    return Array.from(fill);
+  };
+  const focusPixels = control => {
+    const image=pixels([control[0]-3,control[1]-3,control[2]+6,control[3]+6]);
+    let blue=0; for(let i=0;i<image.data.length;i+=4) if(image.data[i]<30 && image.data[i+1]>80 && image.data[i+1]<160 && image.data[i+2]>170) blue++;
+    assert(blue>10,'Status keyboard focus indicator is absent from the canvas');
+  };
+  const textPixels = (part) => {
+    assert(opened() && detail[2]>0 && detail[3]>0,'Status multiline detail geometry');
+    const top=Math.max(detail[1],panel[1]+56), bottom=Math.min(detail[1]+detail[3],panel[1]+panel[3]-16);
+    assert(bottom-top > 10,'Status multiline detail is not visible');
+    if(part === 'first') assert(detail[1] >= panel[1],'first OOM line is clipped');
+    if(part === 'middle') assert(detail[1]<top-200 && detail[1]+detail[3]>bottom+100,'middle OOM lines did not scroll into view');
+    if(part === 'last') assert(detail[1]+detail[3] <= panel[1]+panel[3]-10,'last OOM line is clipped');
+    // Fixture lines 0..78 are deliberately shorter than the measured width;
+    // the long path is after the sampled middle line. Iced's 14px editor uses
+    // its ordinary 1.3 line height. Sample the named line's own band only.
+    const lineHeight = 14 * 1.3;
+    const line = part === 'first' ? 0 : part === 'middle' ? 41 : 81;
+    const y = part === 'last' ? detail[1]+detail[3]-lineHeight : detail[1]+line*lineHeight;
+    assert(y >= top-.5 && y+lineHeight <= bottom+.5, `${part} fixture line ${line} is not completely visible`);
+    const image=pixels([detail[0],y,Math.min(detail[2],230),lineHeight]);
+    let ink=0; const base=Array.from(image.data.subarray(0,3));
+    for(let i=0;i<image.data.length;i+=4) if(base.some((channel,index)=>Math.abs(channel-image.data[i+index])>50)) ink++;
+    assert(ink>20,'named Status line has no composed glyph pixels');
+    report({event:'integration.status.text',control:'status.panel',detail:part,a:String(ink),b:String(line),c:String(y),d:'14'});
+  };
+  const modalPixels = modalBounds => {
+    assert(opened() && modalBounds[2]>0 && close[2]>0,'Status modal layer geometry missing');
+    // The popup overlaps the opaque backdrop; its close glyph must actually
+    // survive composition, and the following real outside press must be consumed.
+    const image = pixels(close), base=Array.from(image.data.subarray(0,3));
+    let ink=0; for(let i=0;i<image.data.length;i+=4) if(base.some((value,j)=>Math.abs(value-image.data[i+j])>50)) ink++;
+    assert(ink>8,'Status panel is covered by modal backdrop');
+  };
+  const clickCovered = control => {
+    const target=[control[0]+2,control[1]+control[3]/2,1,1];
+    assert(!(target[0]>=panel[0] && target[0]<=panel[0]+panel[2] && target[1]>=panel[1] && target[1]<=panel[1]+panel[3]),'modal action is inside popup instead of outside');
+    return click(target);
+  };
+  const modalEvidence = name => report({event:'integration.status.modal',control:'status.panel',detail:name,a:'1',b:'1',c:'1',d:'1'});
+  const resetCancel = [modal[0]+24,resetConfirm[1],60,resetConfirm[3]];
+  try {
+    owner.statusExercise ??= {run:run.slice(), tabs:tabs.slice(), modal:undefined, pulse:[]};
+    const state=owner.statusExercise;
+
+    if(stage <= 15 && stage !== 11) assert(run.every((value,index)=>Math.abs(value-state.run[index])<1) && tabs.every((value,index)=>Math.abs(value-state.tabs[index])<1), 'Status shifted Run or tabs');
+    switch(stage) {
+      case 0: assert(typeof document.mmltkStatusEnvironment === 'function', 'native acceptance environment bridge missing'); owner.statusEnvironment = true; document.mmltkStatusEnvironment(1); assert(remote.every(control=>control[2]>0 && control[3]>0), 'remote controls missing'); header(); textPixels('first'); { const [x,y]=point(panel,.5,.8); mmltkIntegrationWheel(x,y,detail[3]*.45*scale,false,true); } break;
+      case 1: textPixels('middle'); { const [x,y]=point(panel,.5,.8); mmltkIntegrationWheel(x,y,detail[3]*2*scale,false,true); } break;
+      case 2: textPixels('last'); { const [x,y]=point(panel,.5,.8); mmltkIntegrationWheel(x,y,-detail[3]*2*scale,false,true); } break;
+      case 3: textPixels('first'); assert(click([detail[0],detail[1],detail[2],20]),'selectable detail click'); frame(()=>frame(()=> { key('a',false,true); frame(()=>frame(()=> { key('c',false,true); frame(()=>frame(()=> { key('Escape'); after(); })); })); })); return;
+      case 4: assert(!opened(),'Escape failed'); move(trigger); frame(()=>frame(()=> {
+        assert(document.getElementById('accessible.navigation.status')?.getAttribute('aria-expanded') === 'false','Escape hover latch reopened inside the region');
+        report({event:'integration.status.latch',control:'status.panel',detail:'escape-inside-closed',a:'1'});
+        move(outside); frame(()=>frame(()=> { move(trigger); after(); }));
+      })); return;
+      case 5: assert(opened(),'hover did not open'); move([trigger[0]+5,trigger[1]+trigger[3]+2,2,2]); break;
+      case 6: assert(opened(),'connecting gap closed Status'); assert(click(close),'panel X dispatch'); break;
+      case 7: assert(!opened(),'panel X failed'); move(trigger); break;
+      case 8: assert(!opened(),'manual-close hover latch failed'); move(outside); frame(()=> { move(trigger); after(); }); return;
+      case 9: assert(opened(),'leave/reentry did not rearm hover'); assert(click(trigger),'click-open dispatch'); break;
+      case 10: assert(opened(),'mouse click unexpectedly closed'); move(outside); break;
+      case 11: assert(!opened(),'click-open mouse leave failed'); key('Enter'); break;
+      case 12: assert(opened(),'keyboard Enter did not open'); key('Tab'); break;
+      case 13: assert(opened(),'keyboard traversal closed Status'); focusPixels(close); key('Tab',true); key('Escape'); break;
+      case 14: assert(!opened(),'keyboard close failed'); focusPixels(trigger); key(' '); frame(()=>frame(()=> { if(document.getElementById('accessible.navigation.status')?.getAttribute('aria-expanded') !== 'true') { finish('failed'); return; } key('Escape'); frame(()=>frame(()=> { touch(trigger); after(); })); })); return;
+      case 15: assert(opened(),'touch did not open'); move(outside); break;
+      case 16: assert(opened(),'touch opening incorrectly depends on hover'); assert(click(outside),'outside press dispatch'); break;
+      case 17: assert(!opened(),'outside press failed'); assert(mmltkIntegrationCanvasSize(320*scale,720*scale),'narrow canvas resize'); break;
+      case 18: assert(Math.abs(css.width/scale-320)<1,'320px canvas did not settle'); header(); move(trigger); break;
+      case 19: assert(opened() && Math.abs(panel[2]-192)<1 && panel[0]>=12 && panel[0]+panel[2]<=308,'narrow root popup geometry'); key('Escape'); mmltkIntegrationRestoreCanvasSize(); break;
+      case 20: assert(!opened(),'narrow close failed'); assert(click(settings),'Settings dispatch'); break;
+      case 21: assert(modal[2]>0,'Settings modal absent'); state.modal=modal.slice(); move(trigger); break;
+      case 22: assert(opened() && modal[2]>0,'Status cannot open above Settings'); header(); modalPixels(modal); assert(clickCovered(reset),'outside Settings reset dispatch'); break;
+      case 23: assert(!opened() && modal[2]>0 && resetConfirm[2]===0,'outside activation escaped to modal'); assert(click(live),'guarded navigation dispatch'); break;
+      case 24: assert(modal[2]>0 && run.every((value,index)=>Math.abs(value-state.run[index])<1),'modal navigation guard failed'); modalEvidence('settings'); assert(click(themeToggle),'theme toggle dispatch'); break;
+      case 25: assert(modal[2]>0,'theme toggle dismissed modal'); move(trigger); break;
+      case 26: assert(opened(),'Status reopening over themed modal failed'); header(); key('Escape'); frame(()=> { assert(click(themeToggle),'theme restore dispatch'); frame(()=> { assert(click(settingsClose),'Settings close dispatch'); after(); }); }); return;
+      case 27: assert(!opened() && modal[2]===0,'Settings restoration failed'); move(trigger); {
+        const start=performance.now(), samples=[];
+        const sample=()=> { if(integrationState!==owner) { finish('invalidated'); return; } const elapsed=performance.now()-start;
+          if(elapsed >= samples.length*500) samples.push(header());
+          if(samples.length<5) { frame(sample); return; }
+          const reduced=owner.statusDraw.get('navigation.status')[7]===1;
+          const distance=(a,b)=>a.reduce((sum,value,index)=>sum+Math.abs(value-b[index]),0);
+          const excursion=Math.max(...samples.map(sample=>distance(samples[0],sample)));
+          const correct=!reduced && excursion>6 && distance(samples[0],samples[4])<12;
+          if(!correct) { report({event:'integration.failure',control:'navigation.status',detail:'Status two-second pulse pixels'}); finish('failed'); return; }
+          state.elapsed = elapsed; report({event:'integration.status.pulse',control:'navigation.status',detail:'normal',a:'1',b:String(reduced),c:String(elapsed),d:'1'}); finish('observed');
+        }; frame(sample); return;
+      }
+      case 28: document.mmltkStatusEnvironment(2); break;
+      case 29: {
+        assert(window.matchMedia('(prefers-reduced-motion: reduce)').matches && owner.statusDraw.get('navigation.status')[7] === 1, 'native reduced motion did not reach Status');
+        const before=header(), start=performance.now();
+        const sample=()=> { if(integrationState!==owner) { finish('invalidated'); return; }
+          if(performance.now()-start<2000) { frame(sample); return; }
+          try { const after=header(); assert(before.every((value,index)=>Math.abs(value-after[index])<4),'reduced motion fill is animated');
+            report({event:'integration.status.pulse',control:'navigation.status',detail:'reduced',a:'1',b:'1',c:String(performance.now()-start),d:'1'}); finish('observed');
+          } catch(error) { report({event:'integration.failure',control:'navigation.status',detail:String(error)}); restoreStatusEnvironment(owner); finish('failed'); }
+        }; frame(sample); return;
+      }
+      case 30: {
+        document.mmltkStatusEnvironment(3);
+        assert(document.hidden,'native window background transition did not hide the document');
+        owner.statusTimer=setTimeout(()=> {
+          if(integrationState!==owner) { finish('invalidated'); return; }
+          const draws=owner.statusDrawCount;
+          owner.statusTimer=setTimeout(()=> {
+            if(integrationState!==owner) { finish('invalidated'); return; }
+            const quiet=document.hidden && owner.statusDrawCount===draws;
+            report({event:'integration.status.visibility',control:'navigation.status',detail:'native-hidden',a:String(quiet),b:String(draws),c:String(owner.statusDrawCount),d:'350'});
+            restoreStatusEnvironment(owner);
+            if(!quiet) { finish('failed'); return; }
+            after();
+          },350);
+        },150); return;
+      }
+      case 31: assert(!document.hidden,'visibility restoration failed');
+        report({event:'integration.status.exercise',control:'status.panel',detail:'rendered-input-complete',a:'32',b:'1',c:String(state.elapsed),d:'1'}); break;
+      case 32: assert(!opened(),'last dismissal did not close Status'); header(true); assert(click(settings),'healthy Settings dispatch'); break;
+      case 33: assert(modal[2]>0,'healthy theme modal missing'); assert(click(themeToggle),'healthy theme change'); break;
+      case 34: header(true); assert(click(themeToggle),'healthy theme restore'); break;
+      case 35: assert(click(settingsClose),'healthy Settings close'); break;
+      case 36: assert(!opened() && modal[2]===0,'healthy modal restore failed'); header(true); break;
+      case 37: assert(!opened() && modal[2]===0,'Settings restoration before reset failed'); assert(click(settings),'reset Settings dispatch'); break;
+      case 38: assert(modal[2]>0 && reset[2]>0,'Settings reset control missing'); assert(click(reset),'reset confirmation dispatch'); break;
+      case 39: assert(resetConfirm[2]>0,'reset confirmation absent'); move(outside); frame(()=> { move(trigger); after(); }); return;
+      case 40: modalPixels(modal); assert(resetConfirm[2]>0,'reset confirmation lost'); assert(clickCovered(resetCancel),'outside reset cancel dispatch'); break;
+      case 41: assert(!opened() && resetConfirm[2]>0,'outside activation cancelled reset'); assert(click(live),'reset guarded navigation dispatch'); break;
+      case 42: assert(resetConfirm[2]>0 && run.every((v,i)=>Math.abs(v-state.run[i])<1),'reset navigation guard failed'); modalEvidence('reset'); assert(click(resetCancel),'reset cancellation dispatch'); break;
+      case 43: assert(resetConfirm[2]===0 && modal[2]>0,'reset cancellation failed'); assert(click(settingsClose),'reset Settings close'); break;
+      case 44: assert(modal[2]===0 && browse[2]>0,'file dialog browse unavailable'); assert(click(browse),'file dialog open dispatch'); break;
+      case 45: assert(dialog[2]>0 && dialogStop[2]>0,'active file dialog overlay absent'); move(outside); frame(()=> { move(trigger); after(); }); return;
+      case 46: modalPixels(dialog); header(); assert(clickCovered(dialogStop),'outside file cancellation dispatch'); break;
+      case 47: assert(!opened() && dialog[2]>0,'outside press cancelled file dialog'); assert(click(live),'file guarded navigation dispatch'); break;
+      case 48: assert(dialog[2]>0 && run.every((v,i)=>Math.abs(v-state.run[i])<1),'file dialog navigation guard failed'); modalEvidence('file-dialog'); assert(click(dialogStop),'file dialog cancel'); break;
+      case 49: assert(dialog[2]===0 && modal[2]===0,'file dialog restoration failed'); break;
+      case 50: assert(!opened(),'pair exercise starts closed'); key('Enter'); break;
+      case 51: assert(opened() && firstDismiss[2]>0 && lastDismiss[2]>0,'two fixture rows not visible'); focusPixels(firstDismiss); key('Enter'); break;
+      case 52: assert(opened(),'first row dismissal closed remaining row'); focusPixels(firstCopy); report({event:'integration.status.focus',control:'status.panel',detail:'next',a:'1'}); break;
+      case 53: assert(firstCopy[1]<lastCopy[1],'second generated row not appended'); break;
+      case 54: focusPixels(lastDismiss); key('Enter'); break;
+      case 55: assert(opened(),'last row dismissal closed previous row'); focusPixels(firstCopy); report({event:'integration.status.focus',control:'status.panel',detail:'previous',a:'1'}); break;
+      case 56: focusPixels(firstDismiss); key('Enter'); break;
+      case 57: assert(!opened(),'final individual dismissal left popup open'); focusPixels(trigger); header(true); report({event:'integration.status.focus',control:'status.panel',detail:'trigger',a:'1'}); break;
+      case 58: assert(!opened() && modal[2]===0 && dialog[2]===0 && !document.hidden,'Status restoration failed'); restoreStatusEnvironment(owner); break;
+      default: throw new Error('unknown Status exercise stage');
+    }
+    report({event:'integration.status.input',control:'status.panel',detail:'canvas-and-input',a:String(stage),b:String(opened()),c:String(run[1]),d:String(tabs[0])});
+    after();
+  } catch(error) {
+    failed(error);
+  }
 }

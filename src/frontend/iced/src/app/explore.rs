@@ -89,23 +89,21 @@ impl App {
                     });
                 }
                 if local_edits || !open_available {
-                    self.model.error = Some(UiError::busy(
+                    self.model.report_error(UiError::busy(
                         "Explore is unavailable or already changing state.",
                     ));
                     return Task::none();
                 }
                 if self.settings_unsettled() {
-                    self.model.error =
-                        Some(UiError::busy("Wait for Explore settings to finish saving."));
+                    self.model.report_error(UiError::busy("Wait for Explore settings to finish saving."));
                     return Task::none();
                 }
                 let Some(settings) = self.model.settings_snapshot.as_ref() else {
-                    self.model.error =
-                        Some(UiError::invalid("Explore settings are not installed yet."));
+                    self.model.report_error(UiError::invalid("Explore settings are not installed yet."));
                     return Task::none();
                 };
                 if !settings.exploresource.available {
-                    self.model.error = Some(UiError::invalid(
+                    self.model.report_error(UiError::invalid(
                         "The selected Explore dataset has no compiled artifact path.",
                     ));
                     return Task::none();
@@ -138,7 +136,7 @@ impl App {
                         crate::generated::encode_explore_Stop,
                     );
                 } else {
-                    self.model.error = Some(UiError::busy(
+                    self.model.report_error(UiError::busy(
                         "Explore is not running or is already stopping.",
                     ));
                 }
@@ -153,13 +151,13 @@ impl App {
             }
             crate::view::explore::Outcome::UpscaleRequested(kernel) => {
                 if !self.model.upscale_start_available() {
-                    self.model.error = Some(UiError::busy(
+                    self.model.report_error(UiError::busy(
                         "The selected Explore detail is unavailable for upscaling.",
                     ));
                     return Task::none();
                 }
                 let Some(request) = self.model.viewer_upscale_request(kernel) else {
-                    self.model.error = Some(UiError::presentation(
+                    self.model.report_error(UiError::presentation(
                         "Explore selected detail is unavailable.",
                     ));
                     return Task::none();
@@ -188,7 +186,7 @@ impl App {
                     });
                 }
                 if local_edits || !mutation_available {
-                    self.model.error = Some(UiError::busy(
+                    self.model.report_error(UiError::busy(
                         "Explore filters are unavailable or already changing.",
                     ));
                     return Task::none();
@@ -205,7 +203,7 @@ impl App {
                 if self.settings.has_local_edits()
                     || !self.model.explore_augmentation_update_available()
                 {
-                    self.model.error = Some(UiError::busy(
+                    self.model.report_error(UiError::busy(
                         "Explore augmentation preview is already changing.",
                     ));
                     return Task::none();

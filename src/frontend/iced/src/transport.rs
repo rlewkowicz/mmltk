@@ -106,7 +106,7 @@ pub enum TransportEvent {
     IntegrationInputSettled,
     Disconnected(String),
     ProtocolError(String),
-    Rejected(String),
+    Rejected(crate::generated::InteractionRejected),
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -274,7 +274,7 @@ fn application_event(record: ServerRecord) -> Option<TransportEvent> {
             Some(TransportEvent::IntegrationControl(record.receipt))
         }
         ServerRecord::InteractionRejected(record) => {
-            Some(TransportEvent::Rejected(record.error.detail))
+            Some(TransportEvent::Rejected(record))
         }
     }
 }

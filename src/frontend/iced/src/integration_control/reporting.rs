@@ -1141,7 +1141,7 @@ mod tests {
             ));
             assert_eq!(model.explore.snapshot.as_ref(), Some(&installed));
             assert_eq!(
-                model.error.as_ref().unwrap().detail,
+                model.notices.latest().unwrap().detail,
                 "inconsistent Explore snapshot observation revision"
             );
             assert_eq!(

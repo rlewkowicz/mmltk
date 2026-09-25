@@ -19,6 +19,7 @@ pub mod stroke_width;
 pub mod table;
 pub mod text;
 pub mod text_input;
+pub mod text_editor;
 mod theme;
 pub mod tokens;
 pub mod tooltip;
