@@ -14,11 +14,9 @@
 #include <torch/types.h>
 #include <torch/serialize.h>
 #include "detail/checkpoint_private.h"
-#include "checkpoint.h"
 #include "detail/native_optimizer_private.h"
 #include "detail/training_continuation.h"
 #include "detail/model_ema.h"
-#include "detail/training_session_checkpoint.h"
 #include <unordered_map>
 #include <type_traits>
 #include <utility>
@@ -143,27 +141,7 @@ std::vector<torch::Tensor> read_ema_shadow_archive(torch::serialize::InputArchiv
 }
 }  // namespace mmltk::backend::models::rfdetr::detail
 namespace mmltk::backend::models::rfdetr {
-TrainingCheckpointAdmission::TrainingCheckpointAdmission(TrainingCheckpoint checkpoint, std::shared_ptr<const ClassArtifactAdmission> evidence)
-    : checkpoint_(std::move(checkpoint)), evidence_(std::move(evidence)) {
- if (!std::get<0>(evidence_)) throw std::invalid_argument("missing checkpoint artifact evidence");
-}
-TrainingCheckpointAdmission::TrainingCheckpointAdmission(TrainingCheckpoint checkpoint, mmltk::common::io::FileSnapshot evidence) : checkpoint_(std::move(checkpoint)), evidence_(evidence) {}
-TrainingCheckpointAdmission::TrainingCheckpointAdmission(TrainingCheckpoint checkpoint, std::shared_ptr<const TrainingSessionAdmission> evidence) : checkpoint_(std::move(checkpoint)), evidence_(std::move(evidence)) {}
-void TrainingCheckpointAdmission::RequireUnchanged(std::stop_token stop) const {
- if (stop.stop_requested()) throw ArtifactPublicationCancelled{};
- if (const auto* native = std::get_if<0>(&evidence_)) {
-  (*native)->RequireUnchanged(stop);
-  // Restoration uses the canonical path; also retain its identity when
-  // the selected artifact was reached through a symlink or another name.
-  (*native)->file()->snapshot.RequireUnchanged(checkpoint_.path);
- } else if (const auto* file = std::get_if<1>(&evidence_)) {
-  file->RequireUnchanged(checkpoint_.path);
- } else {
-  std::get<2>(evidence_)->require_unchanged();
- }
- if (stop.stop_requested()) throw ArtifactPublicationCancelled{};
-}
-TrainingCheckpointAdmission detail::inspect_training_model_checkpoint(DecodedNativeModelState& decoded, const std::filesystem::path& path, std::stop_token stop) {
+TrainingCheckpoint detail::inspect_training_model_checkpoint(const DecodedNativeModelState& decoded, const std::filesystem::path& path, std::stop_token stop) {
  if (stop.stop_requested()) throw ArtifactPublicationCancelled{};
  if (!decoded.class_artifact) throw std::runtime_error("training checkpoint lacks exact native artifact admission");
  decoded.class_artifact->RequireUnchanged(stop);
@@ -172,12 +150,13 @@ TrainingCheckpointAdmission detail::inspect_training_model_checkpoint(DecodedNat
  auto& archive = *state.admitted_archive();
  TrainingCheckpoint result;
  result.path = std::filesystem::canonical(path);
+ decoded.class_artifact->file()->snapshot.RequireUnchanged(result.path);
  result.class_layout = decoded.metadata.class_layout;
  result.original_weights = decoded.metadata.source_path;
  const auto continuation = detail::read_training_continuation(archive);
  if (!continuation) {
   decoded.class_artifact->RequireUnchanged(stop);
-  return {std::move(result), decoded.class_artifact};
+  return result;
  }
  const auto& request = continuation->configuration;
  torch::serialize::InputArchive optimizer;
@@ -208,45 +187,6 @@ TrainingCheckpointAdmission detail::inspect_training_model_checkpoint(DecodedNat
  result.configuration = request;
  result.evaluated_weights = request.use_ema ? EvaluatedWeights::Ema : EvaluatedWeights::Ordinary;
  result.resumable = true;
- return {std::move(result), decoded.class_artifact};
-}
-TrainingCheckpointAdmission inspect_training_checkpoint(const std::filesystem::path& path, std::stop_token stop) {
- if (is_training_session_manifest(path)) {
-  auto admission = std::make_shared<TrainingSessionAdmission>(path, stop);
-  TrainingCheckpoint result;
-  result.path = std::filesystem::canonical(path);
-  result.session_id = admission->manifest.session_id;
-  result.attempt_id = admission->manifest.attempt_id;
-  result.configuration = admission->manifest.request;
-  result.class_layout = admission->models.front().metadata.class_layout;
-  result.original_weights = admission->models.front().metadata.source_path;
-  result.original_class_descriptor = admission->continuations.front().values.training_original_descriptor;
-  result.epoch = admission->continuations.front().values.epoch;
-  result.evaluated_weights = result.configuration->use_ema ? EvaluatedWeights::Ema : EvaluatedWeights::Ordinary;
-  result.resumable = true;
-  admission->release_decoded_state();
-  return {std::move(result), std::move(admission)};
- }
- if (stop.stop_requested()) throw ArtifactPublicationCancelled{};
- const auto identity = mmltk::common::io::FileSnapshot::Read(path);
- const auto container = identify_model_state_container(path);
- if (container == ModelStateContainer::Unknown) throw std::invalid_argument("unsupported training weights container");
- if (container == ModelStateContainer::Python) {
-  // External import remains a container capability; ModelSystem owns transfer admission.
-  TrainingCheckpoint result;
-  result.path = std::filesystem::canonical(path);
-  identity.RequireUnchanged(path);
-  if (stop.stop_requested()) throw ArtifactPublicationCancelled{};
-  return {std::move(result), identity};
- }
- auto decoded = decode_native_model_state(path, stop);
- auto inspected = detail::inspect_training_model_checkpoint(decoded, path, stop);
- // A native deployment/individual archive supports Transfer; optimizer Resume
- // requires the complete immutable session set even when it has only one model.
- auto result = inspected.checkpoint();
- result.resumable = false;
- result.configuration.reset();
- inspected.RequireUnchanged(stop);
- return {std::move(result), decoded.class_artifact};
+ return result;
 }
 }  // namespace mmltk::backend::models::rfdetr

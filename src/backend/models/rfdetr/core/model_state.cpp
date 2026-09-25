@@ -261,6 +261,18 @@ ResolvedModelState resolve_model_state(const std::filesystem::path& weights_path
  if (stop.stop_requested()) throw ArtifactPublicationCancelled{};
  const auto canonical = canonical_path(weights_path);
  auto state = decode_model_state(canonical, std::move(admission), class_layout_path, stop);
+ auto artifacts = resolve_admitted_model_artifacts(state, canonical, preset_name, resolution, class_layout_path, stop);
+ return {.artifacts = std::move(artifacts), .model_state = std::move(state)};
+}
+ResolvedModelArtifacts resolve_admitted_model_artifacts(const DecodedNativeModelState& state, const std::filesystem::path& weights_path,
+ std::string_view preset_name, int resolution, const std::filesystem::path& class_layout_path, std::stop_token stop) {
+ if (!state.class_artifact) throw std::invalid_argument("model resolution requires admitted file evidence");
+ state.class_artifact->RequireUnchanged(stop);
+ const auto canonical = canonical_path(weights_path);
+ if (canonical != state.class_artifact->artifact_path()) throw std::invalid_argument("model resolution path differs from admitted state");
+ auto evidence = state.class_artifact;
+ if (!class_layout_path.empty() && std::filesystem::absolute(class_layout_path).lexically_normal() != evidence->descriptor_path())
+  evidence = std::make_shared<const ClassArtifactAdmission>(canonical, class_layout_path, evidence->file(), stop);
  const PresetCatalogEntry* preset = nullptr;
  if (!state.metadata.preset_name.empty()) { preset = find_preset_catalog_entry(state.metadata.preset_name); }
  // External pretrained inference already ran in decode_model_state. Native
@@ -274,7 +286,7 @@ ResolvedModelState resolve_model_state(const std::filesystem::path& weights_path
  result.artifact_root = canonical.parent_path();
  result.preset_name = std::string(preset->preset_name);
  result.model_id = canonical.stem().string();
- result.class_layout = state.metadata.class_layout;
+ result.class_layout = evidence == state.class_artifact ? state.metadata.class_layout : evidence->Resolve(state.metadata.num_classes, state.metadata.class_layout, stop);
  result.artifact_sha256 = mmltk::common::io::sha256_hex(state.class_artifact->file()->sha256);
  result.config = native_config_from_preset(*preset);
  if (state.metadata.num_classes > 0) { result.config.num_classes = static_cast<int>(state.metadata.num_classes); }
@@ -293,10 +305,7 @@ ResolvedModelState resolve_model_state(const std::filesystem::path& weights_path
  result.config.num_select = result.source_num_select;
  if (resolution > 0) { result.config.resolution = resolution; }
  apply_checkpoint_detection_overrides(result.config, state.metadata);
- return {
-  .artifacts = std::move(result),
-  .model_state = std::move(state),
- };
+ return result;
 }
 NativeCheckpointMetadata make_native_checkpoint_metadata(const ResolvedModelArtifacts& artifacts, const int64_t num_classes) {
  NativeCheckpointMetadata metadata;

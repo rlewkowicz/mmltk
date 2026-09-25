@@ -2,11 +2,9 @@
 #include "detail/training_lanes.h"
 #include "detail/training_gradient_reducer.h"
 #include "detail/training_metrics.h"
-#include "detail/model_merging.h"
-#include "detail/training_session_checkpoint.h"
+#include "detail/training_artifact.h"
 #include "src/backend/ml/cuda/torch_cuda_utils.h"
 #include "src/backend/models/rfdetr/core/class_layout.h"
-#include "src/common/io/file_digest.h"
 #include "src/common/math/checked_arithmetic.h"
 #include <algorithm>
 #include <chrono>
@@ -78,7 +76,7 @@ struct TrainingModel::Impl final {
  detail::TrainingContinuationValues continuation;
  std::optional<detail::NormalizedModelStateCandidate> staged_model;
  std::optional<ResumeState> staged_resume;
- std::optional<TrainingArtifact> best;
+ std::optional<TrainingArtifactCandidate> best;
  TrainingEpochDraws draws;
  TrainingMetricSnapshot last_metrics;
  TrainingLossReport losses;
@@ -92,7 +90,7 @@ TrainingModel::TrainingModel(TrainRequest request, std::size_t index, RuntimeCon
  std::shared_ptr<NativeRfDetrModel> model, const TrainingDataPlan& plan, DistributedContext group, TrainingPrecision precision, DetectionConfig criterion, std::function<void(std::uint64_t, std::exception_ptr)> failure)
  : impl_(std::make_unique<Impl>(std::move(request), index, runtime, std::move(loader), std::move(model), plan, std::move(group), precision, std::move(criterion), std::move(failure))) {}
 TrainingModel::~TrainingModel() = default;
-void TrainingModel::stage_resume(DecodedNativeModelState& state, const detail::TrainingContinuation& saved) {
+void TrainingModel::stage_resume(const DecodedNativeModelState& state, const detail::TrainingContinuation& saved) {
  auto& p = *impl_;
  detail::require_active_training_continuation(saved, p.options);
  if (saved.values.data.model_id != p.shard.model_id || saved.values.data.plan_hash != p.data_plan.hash()) throw std::invalid_argument("resume model/data identity differs");
@@ -307,7 +305,7 @@ EvalPassResult TrainingModel::evaluate(TrainingValidationRuntime& validation, Ev
  p.owner->train();
  return result;
 }
-TrainingArtifact TrainingModel::save_candidate(const NativeCheckpointMetadata& metadata, const std::filesystem::path& directory, std::string_view session,
+TrainingArtifactCandidate TrainingModel::save_candidate(const NativeCheckpointMetadata& metadata, const std::filesystem::path& directory, std::string_view session,
  std::string_view initialization, std::string_view configuration, std::string_view validation, std::uint64_t merge, EvaluatedWeights weights, const EvalSummary& summary) {
  auto& p = *impl_;
  const auto metric = training_selection_metric(summary, p.detection.include_masks);
@@ -317,13 +315,15 @@ TrainingArtifact TrainingModel::save_candidate(const NativeCheckpointMetadata& m
  value.path = std::filesystem::absolute(directory) / ("model-" + std::to_string(value.model_id) + "-epoch-" + std::to_string(value.epoch) + "-" + (weights == EvaluatedWeights::Ema ? "ema-" : "ordinary-") + training_artifact_identity() + ".pt");
  p.snapshot.begin(*p.owner); p.snapshot.prepare_ema(p.optimizer_build.optimizer.eligible_parameter_names(), weights == EvaluatedWeights::Ema ? &*p.ema : nullptr);
  p.snapshot.save_weights(value.path, metadata, weights == EvaluatedWeights::Ema, p.options.class_layout_path); p.snapshot.release();
- value.sha256 = mmltk::common::io::sha256_hex(mmltk::common::io::sha256_file(value.path));
- value.content = native_state_fingerprint(decode_native_model_state(value.path).entries());
- return value;
+ auto admission = std::make_shared<TrainingArtifactAdmission>(value.path);
+ value = admission->describe(std::move(value));
+ admission->release_decoded_state();
+ return {std::move(value), std::move(admission)};
 }
-void TrainingModel::remember_candidate(TrainingArtifact value) {
- if (value.model_id != id() || !value.selection_metric || !std::isfinite(*value.selection_metric)) throw std::invalid_argument("invalid model validation candidate");
- if (!impl_->best || *value.selection_metric > *impl_->best->selection_metric) impl_->best = std::move(value);
+void TrainingModel::remember_candidate(TrainingArtifactCandidate value) {
+ if (value.artifact.model_id != id() || !value.admission) throw std::invalid_argument("invalid model validation candidate");
+ value.admission->require_matches(value.artifact);
+ if (!impl_->best || *value.artifact.selection_metric > *impl_->best->artifact.selection_metric) impl_->best = std::move(value);
 }
 void TrainingModel::save_ordinary_epoch(const NativeCheckpointMetadata& metadata, const std::filesystem::path& directory) {
  auto& p = *impl_;
@@ -331,8 +331,7 @@ void TrainingModel::save_ordinary_epoch(const NativeCheckpointMetadata& metadata
  p.snapshot.save_weights(directory / ("model-" + std::to_string(id()) + "-epoch-" + std::to_string(p.epoch) + "-ordinary-" + training_artifact_identity() + ".pt"), metadata, false, p.options.class_layout_path);
  p.snapshot.release();
 }
-const std::optional<TrainingArtifact>& TrainingModel::best() const { return impl_->best; }
-void TrainingModel::restore_best(std::optional<TrainingArtifact> value) { impl_->best = std::move(value); }
+const std::optional<TrainingArtifactCandidate>& TrainingModel::best() const { return impl_->best; }
 void TrainingModel::save_resume(const std::filesystem::path& path, const NativeCheckpointMetadata& metadata, std::string_view attempt, const std::filesystem::path& original_descriptor) {
  mmltk::common::logging::ScopedProfile profile_resume{"rfdetr.train.save.resume"};
  auto& p = *impl_;

@@ -96,6 +96,8 @@ enum class ModelStateContainer { Unknown, Python, Native };
 void write_upstream_model_state(const std::filesystem::path& checkpoint_path, const DecodedNativeModelState& model_state);
 [[nodiscard]] ResolvedModelState resolve_model_state(const std::filesystem::path& weights_path, std::string_view preset_name, int resolution, const std::filesystem::path& class_layout_path = {},
  std::shared_ptr<const ClassArtifactAdmission> admission = {}, std::stop_token stop = {});
+[[nodiscard]] ResolvedModelArtifacts resolve_admitted_model_artifacts(const DecodedNativeModelState&, const std::filesystem::path& weights_path,
+ std::string_view preset_name, int resolution, const std::filesystem::path& class_layout_path = {}, std::stop_token stop = {});
 [[nodiscard]] NativeCheckpointMetadata make_native_checkpoint_metadata(const ResolvedModelArtifacts& artifacts, int64_t num_classes);
 [[nodiscard]] ResolvedModelArtifacts resolve_model_artifacts(const std::filesystem::path& weights_path, std::string_view preset_name, int resolution);
 }  // namespace mmltk::backend::models::rfdetr

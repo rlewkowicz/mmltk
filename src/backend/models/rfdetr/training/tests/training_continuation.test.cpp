@@ -92,11 +92,11 @@ void test_current_continuation_required_fields() {
  REQUIRE_FALSE(r::detail::read_training_continuation(input).has_value());
 }
 void test_current_continuation_scalar_boundaries() {
- const std::array<std::pair<std::string, c10::IValue>, 14> invalid{{{"epoch", int64_t{-1}}, {"epoch", int64_t{std::numeric_limits<int>::max()}}, {"grad_scaler_scale", 0.0},
+ const auto invalid = std::to_array<std::pair<std::string, c10::IValue>>({{"epoch", int64_t{-1}}, {"epoch", int64_t{std::numeric_limits<int>::max()}}, {"grad_scaler_scale", 0.0},
   {"grad_scaler_scale", std::numeric_limits<double>::infinity()}, {"grad_scaler_growth_tracker", int64_t{-1}}, {"grad_scaler_growth_tracker", int64_t{std::numeric_limits<int>::max()} + 1},
   {"ema_completed_updates", int64_t{-1}}, {"ema_completed_updates", std::numeric_limits<int64_t>::max()}, {"ema_completed_updates", int64_t{1}},
   {"training_attempt_id", std::string{}},
-  {"training_attempt_id", std::string(65, 'a')}, {"training_original_descriptor", std::string(mmltk::frameworks::reflection::kMaximumPathBytes + 1, 'a')}}};
+  {"training_attempt_id", std::string(65, 'a')}, {"training_original_descriptor", std::string(mmltk::frameworks::reflection::kMaximumPathBytes + 1, 'a')}});
  for (const auto& [key, value] : invalid) {
   auto source = continuation_fixture(saved_request());
   torch::serialize::OutputArchive output;

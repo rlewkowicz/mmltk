@@ -1,5 +1,6 @@
 #pragma once
 #include <stop_token>
+#include "src/backend/models/rfdetr/contract/training_metrics.h"
 #include <filesystem>
 #include <span>
 #include <string>
@@ -10,9 +11,8 @@
 #include "src/backend/models/rfdetr/core/model_state.h"
 #include <torch/types.h>
 #include <torch/serialize.h>
-namespace mmltk::backend::models::rfdetr { class TrainingCheckpointAdmission; }
 namespace mmltk::backend::models::rfdetr::detail {
-[[nodiscard]] TrainingCheckpointAdmission inspect_training_model_checkpoint(DecodedNativeModelState&, const std::filesystem::path&, std::stop_token = {});
+[[nodiscard]] TrainingCheckpoint inspect_training_model_checkpoint(const DecodedNativeModelState&, const std::filesystem::path&, std::stop_token = {});
 void reserve_state_archive(const std::vector<NormalizedModelStateEntry>& entries, mmltk::backend::ml::cuda::TensorReadbackBuffers& readback, std::size_t first_slot);
 void publish_native_checkpoint_archive(torch::serialize::OutputArchive& archive, const std::filesystem::path& destination, const std::filesystem::path& explicit_descriptor = {});
 void write_native_checkpoint_metadata(torch::serialize::OutputArchive& archive, const NativeCheckpointMetadata& metadata);

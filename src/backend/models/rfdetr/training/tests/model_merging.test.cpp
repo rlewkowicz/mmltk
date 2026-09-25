@@ -1,3 +1,4 @@
+#include "src/backend/models/rfdetr/training/detail/training_artifact.h"
 #include "src/backend/ml/torch/tests/catch_support.h"
 #include "src/backend/models/rfdetr/training/detail/model_merging.h"
 #include "src/backend/models/rfdetr/training/detail/training_session_checkpoint.h"
@@ -86,8 +87,9 @@ struct SessionFixture final {
    optimizer.save(saved_optimizer, readback, 1); output.write("optimizer", saved_optimizer);
    readback.Complete();
    r::detail::publish_native_checkpoint_archive(output, destination);
-  }, observe);
+  }, admissions, observe);
  }
+ std::vector<std::shared_ptr<const r::TrainingArtifactAdmission>> admissions;
  std::optional<std::size_t> corrupt_model;
  r::TrainRequest request;
  r::TrainingSessionManifest manifest;
@@ -183,7 +185,7 @@ TEST_CASE("immutable session generations retain complete previous files through 
   REQUIRE_THROWS(fixture.publish([&](auto observed) { if (observed == step) throw std::runtime_error("injected publication failure"); }));
   r::TrainingSessionAdmission surviving(fixture.checkpoint.path());
   CHECK(std::filesystem::exists(temp.path() / previous.models.front().path));
-  CHECK(surviving.models.size() == 3);
+  CHECK(surviving.model_count() == 3);
   CHECK(r::inspect_training_checkpoint(fixture.checkpoint.path()).checkpoint().resumable);
   CHECK_FALSE(r::inspect_training_checkpoint(temp.path() / previous.models.front().path).checkpoint().resumable);
  }
@@ -192,6 +194,12 @@ TEST_CASE("session leases retain old generations and reject missing replaced or 
  mmltk::testsupport::ScopedTempDir temp("session-leases");
  SessionFixture fixture(temp.path()); fixture.publish();
  auto lease = std::make_unique<r::TrainingSessionAdmission>(fixture.checkpoint.path());
+ lease->release_decoded_state();
+ CHECK_NOTHROW(lease->require_unchanged());
+ CHECK(lease->model_count() == 3);
+ REQUIRE_THROWS(lease->model(0));
+ REQUIRE_THROWS(lease->continuation(0));
+ REQUIRE_THROWS(lease->plan());
  const auto old = fixture.manifest;
  fixture.publish(); fixture.publish();
  CHECK(std::filesystem::exists(temp.path() / old.models.front().path));
@@ -231,11 +239,18 @@ TEST_CASE("final selection rejects incomplete coefficients and failures preserve
 }
 TEST_CASE("identical native content is one greedy ingredient even through separate saved files", "[model][rfdetr][training][merge]") {
  mmltk::testsupport::ScopedTempDir temp("native-content-identity");
- const std::array candidates{ingredient(temp.path(), 1, 3, .5), ingredient(temp.path(), 2, 3, .5)};
+ std::array candidates{ingredient(temp.path(), 1, 3, .5), ingredient(temp.path(), 2, 3, .5)};
  CHECK(candidates[0].artifact.content == candidates[1].artifact.content);
  std::size_t calls = 0;
  const auto selected = r::select_training_artifact(candidates, r::TrainFinalPolicy::ValidationGreedy, false, temp.path(), [&](const auto&) { ++calls; return evaluation(.9); });
  CHECK(calls == 0); CHECK(selected.ingredients.size() == 1); CHECK(selected.artifact.model_id == 1);
+ for (auto& candidate : candidates) {
+  auto proof = std::make_shared<r::TrainingArtifactAdmission>(candidate.artifact);
+  proof->release_decoded_state();
+  candidate.admission = std::move(proof);
+ }
+ const auto retained = r::select_training_artifact(candidates, r::TrainFinalPolicy::ValidationGreedy, false, temp.path(), [&](const auto&) { ++calls; return evaluation(.9); });
+ CHECK(calls == 0); CHECK(retained == selected);
 }
 
 TEST_CASE("session admission rejects a partial or mixed model set before replacing its pointer", "[model][rfdetr][training][checkpoint]") {
@@ -246,7 +261,7 @@ TEST_CASE("session admission rejects a partial or mixed model set before replaci
   fixture.corrupt_model = model;
   REQUIRE_THROWS(fixture.publish());
   r::TrainingSessionAdmission current(fixture.checkpoint.path());
-  CHECK(current.manifest == previous);
+  CHECK(current.manifest() == previous);
   for (const auto& file : previous.models) CHECK(io::sha256_hex(io::sha256_file(temp.path() / file.path)) == file.sha256);
  }
  fixture.corrupt_model.reset();
@@ -254,7 +269,7 @@ TEST_CASE("session admission rejects a partial or mixed model set before replaci
   for (std::size_t model = 0; model < previous.models.size(); ++model) {
    std::size_t visited = 0;
    REQUIRE_THROWS(fixture.publish([&](auto observed) { if (observed == step && visited++ == model) throw std::runtime_error("partial model set"); }));
-   CHECK(r::TrainingSessionAdmission(fixture.checkpoint.path()).manifest == previous);
+   CHECK(r::TrainingSessionAdmission(fixture.checkpoint.path()).manifest() == previous);
   }
  }
  std::vector<std::unique_ptr<r::TrainingSessionAdmission>> readers;
@@ -342,4 +357,140 @@ TEST_CASE("periodic duplicate admissions retain all logical ingredient identitie
  std::filesystem::copy_file(first.artifact.path, candidates.back().artifact.path);
  std::ofstream(candidates.back().artifact.path, std::ios::binary | std::ios::app) << "changed";
  REQUIRE_THROWS(r::select_training_artifact(candidates, r::TrainFinalPolicy::Off, false, temp.path(), [](const auto&) { return evaluation(.5); }));
+}
+
+TEST_CASE("artifact evidence survives decoded readers and rejects identical named-file replacement", "[model][rfdetr][training][checkpoint]") {
+ mmltk::testsupport::ScopedTempDir temp("artifact-retained-evidence");
+ const auto candidate = ingredient(temp.path(), 1, 3, .5);
+ r::TrainingArtifactAdmission admission(candidate.artifact);
+ auto reader = admission.decode();
+ const std::weak_ptr<const r::DecodedNativeModelState> decoded = reader;
+ CHECK(admission.evidence()->file()->sha256 == reader->class_artifact->file()->sha256);
+ admission.release_decoded_state();
+ CHECK_FALSE(decoded.expired());
+ CHECK(reader->entries().front().tensor.item<double>() == 3);
+ reader.reset();
+ CHECK(decoded.expired());
+ CHECK_NOTHROW(admission.require_matches(candidate.artifact));
+ r::TrainingSelection selected;
+ selected.artifact = candidate.artifact;
+ selected.validation = *candidate.artifact.evaluation;
+ selected.best_individual_metric = *candidate.artifact.selection_metric;
+ selected.ingredients.push_back({candidate.artifact.model_id, candidate.artifact.sha256, 1});
+ r::publish_training_selection(temp.path() / "selected.json", selected, admission);
+ CHECK(decoded.expired());
+ CHECK(r::read_training_selection(temp.path() / "selected.json") == selected);
+ const auto replacement = temp.path() / "replacement.pt";
+ std::filesystem::copy_file(candidate.artifact.path, replacement);
+ std::filesystem::rename(replacement, candidate.artifact.path);
+ REQUIRE_THROWS(admission.require_unchanged());
+ REQUIRE_THROWS(admission.decode());
+ REQUIRE_THROWS(r::publish_training_selection(temp.path() / "selected.json", selected, admission));
+ CHECK(r::read_training_selection(temp.path() / "selected.json") == selected);
+}
+TEST_CASE("session publication retains only its unchanged current candidate evidence", "[model][rfdetr][training][checkpoint]") {
+ mmltk::testsupport::ScopedTempDir temp("session-candidate-evidence");
+ SessionFixture fixture(temp.path());
+ std::vector<std::weak_ptr<const r::TrainingArtifactAdmission>> proofs;
+ for (auto& model : fixture.manifest.models) {
+  auto candidate = ingredient(temp.path(), model.model_id, model.model_id, .5);
+  candidate.artifact.configuration = fixture.manifest.configuration;
+  candidate.artifact.validation = fixture.manifest.validation;
+  model.best = candidate.artifact;
+  auto admission = std::make_shared<r::TrainingArtifactAdmission>(candidate.artifact);
+  admission->release_decoded_state();
+  proofs.push_back(admission);
+  fixture.admissions.push_back(std::move(admission));
+ }
+ fixture.publish();
+ fixture.admissions.clear();
+ fixture.publish();
+ for (const auto& proof : proofs) CHECK_FALSE(proof.expired());
+ // A replaced logical best retires the prior proof, while the individual file survives.
+ const auto previous = fixture.manifest.models.front().best->path;
+ auto replacement = ingredient(temp.path(), 100, 8, .7);
+ replacement.artifact.model_id = fixture.manifest.models.front().model_id;
+ replacement.artifact.configuration = fixture.manifest.configuration;
+ replacement.artifact.validation = fixture.manifest.validation;
+ fixture.manifest.models.front().best = replacement.artifact;
+ fixture.publish();
+ CHECK(proofs.front().expired());
+ CHECK_FALSE(proofs.back().expired());
+ CHECK(std::filesystem::exists(previous));
+ r::TrainingSessionAdmission inspected(fixture.checkpoint.path());
+ const auto best = inspected.best_admission(0);
+ inspected.release_decoded_state();
+ CHECK_NOTHROW(best->require_matches(replacement.artifact));
+ CHECK_NOTHROW(inspected.require_unchanged());
+}
+TEST_CASE("session shared candidate paths preserve logical IDs and reject conflicting facts", "[model][rfdetr][training][checkpoint]") {
+ mmltk::testsupport::ScopedTempDir temp("session-shared-candidate");
+ SessionFixture fixture(temp.path());
+ auto shared = ingredient(temp.path(), 1, 3, .5).artifact;
+ shared.configuration = fixture.manifest.configuration; shared.validation = fixture.manifest.validation;
+ for (auto& model : fixture.manifest.models) {
+  model.best = shared;
+  model.best->model_id = model.model_id;
+  model.best->attempt = model.model_id;
+ }
+ fixture.publish();
+ const auto previous = fixture.manifest;
+ {
+  r::TrainingSessionAdmission admitted(fixture.checkpoint.path());
+  for (std::size_t index = 0; index < admitted.model_count(); ++index) {
+   CHECK(admitted.manifest().models[index].best->model_id == fixture.manifest.models[index].model_id);
+   CHECK(admitted.best_admission(index) == admitted.best_admission(0));
+  }
+ }
+ ++fixture.manifest.models.back().best->epoch;
+ REQUIRE_THROWS(fixture.publish());
+ CHECK(r::TrainingSessionAdmission(fixture.checkpoint.path()).manifest() == previous);
+}
+TEST_CASE("each named equal-content artifact and late companion is checked before selection publication", "[model][rfdetr][training][merge]") {
+ mmltk::testsupport::ScopedTempDir temp("selection-named-evidence");
+ std::array candidates{ingredient(temp.path(), 1, 3, .5), ingredient(temp.path(), 2, 3, .5)};
+ CHECK(candidates[0].artifact.content == candidates[1].artifact.content);
+ const auto selected = r::select_training_artifact(candidates, r::TrainFinalPolicy::Uniform, false, temp.path(), [](const auto&) { return evaluation(.5); });
+ REQUIRE(selected.ingredients.size() == 2);
+ CHECK(selected.ingredients[0].model_id == 1);
+ CHECK(selected.ingredients[1].model_id == 2);
+ for (const auto& candidate : candidates) {
+  const auto companion = std::filesystem::path(candidate.artifact.path.string() + ".classes.json");
+  REQUIRE_THROWS(r::select_training_artifact(candidates, r::TrainFinalPolicy::Uniform, false, temp.path(), [&](const auto&) {
+   std::ofstream(companion) << "late companion";
+   return evaluation(.6);
+  }));
+  std::filesystem::remove(companion);
+  CHECK(r::read_training_selection(temp.path() / "selected.json") == selected);
+ }
+ // Equal tensor content never authorizes sharing the other path's file proof.
+ candidates[1].admission = std::make_shared<r::TrainingArtifactAdmission>(candidates[0].artifact);
+ REQUIRE_THROWS(r::select_training_artifact(candidates, r::TrainFinalPolicy::Off, false, temp.path(), [](const auto&) { return evaluation(.5); }));
+}
+TEST_CASE("last session publication checks include retained candidates and all generation files", "[model][rfdetr][training][checkpoint]") {
+ for (const auto target : {0, 1, 2}) {
+  mmltk::testsupport::ScopedTempDir temp("session-late-evidence");
+  SessionFixture fixture(temp.path());
+  auto candidate = ingredient(temp.path(), 1, 3, .5).artifact;
+  candidate.configuration = fixture.manifest.configuration; candidate.validation = fixture.manifest.validation;
+  fixture.manifest.models.front().best = candidate;
+  fixture.publish();
+  const auto previous = fixture.manifest;
+  std::filesystem::path changed;
+  REQUIRE_THROWS(fixture.publish([&](auto step) {
+   if (step != r::TrainingPublicationStep::Synced) return;
+   if (target == 0) changed = candidate.path.string() + ".classes.json";
+   else {
+    for (const auto& entry : std::filesystem::directory_iterator(temp.path() / "generations")) {
+     if (entry.path().filename() == previous.generation || entry.path().filename() == previous.previous_generation) continue;
+     changed = entry.path() / (target == 1 ? "model-1.pt.classes.json" : "plan.cbor");
+    }
+   }
+   REQUIRE_FALSE(changed.empty());
+   std::ofstream(changed, std::ios::binary | std::ios::app) << "late change";
+  }));
+  if (target == 0) std::filesystem::remove(changed);
+  CHECK(r::TrainingSessionAdmission(fixture.checkpoint.path()).manifest() == previous);
+  for (const auto& model : previous.models) CHECK(std::filesystem::exists(temp.path() / model.path));
+ }
 }

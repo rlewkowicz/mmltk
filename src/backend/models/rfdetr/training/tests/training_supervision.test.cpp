@@ -1,3 +1,4 @@
+#include "src/backend/models/rfdetr/training/detail/training_artifact.h"
 #include "src/backend/models/rfdetr/training/detail/training_session_checkpoint.h"
 #include "src/backend/models/rfdetr/training/detail/model_merging.h"
 #include "training_gradient_fixture.h"
@@ -1588,8 +1589,8 @@ void test_all_supervision_routes_execute_fixture_backed_training() {
    }
 #endif
    rfdetr::TrainingSessionAdmission saved_session(result.checkpoint_path);
-   const auto archive_path = std::filesystem::canonical(result.checkpoint_path).parent_path() / saved_session.manifest.models.front().path;
-   const auto& full_state = saved_session.models.front();
+   const auto archive_path = std::filesystem::canonical(result.checkpoint_path).parent_path() / saved_session.manifest().models.front().path;
+   const auto& full_state = saved_session.model(0);
    std::unordered_map<std::string, torch::Tensor> expected_best;
    for (const auto& entry : full_state.entries()) expected_best.emplace(entry.name, entry.tensor);
    if (request.use_ema) {
@@ -1692,24 +1693,26 @@ void test_all_supervision_routes_execute_fixture_backed_training() {
   }
   const auto trained = rfdetr::run_training(mixed);
   rfdetr::TrainingSessionAdmission saved(trained.checkpoint_path);
-  REQUIRE(saved.models.size() == 5);
-  REQUIRE(saved.manifest.models.size() == 5);
-  for (std::size_t i = 0; i < saved.models.size(); ++i) {
-   CHECK(saved.continuations[i].configuration.recipe.optimizer == optimizers[i]);
-   CHECK(saved.continuations[i].values.schedule.consumed_attempts > 0);
-   CHECK(saved.manifest.models[i].best.has_value());
-   CHECK(saved.manifest.models[i].best->weights == (mixed.use_ema ? rfdetr::EvaluatedWeights::Ema : rfdetr::EvaluatedWeights::Ordinary));
-   if (mixed.use_ema) CHECK(saved.continuations[i].values.ema_completed_updates == saved.continuations[i].values.schedule.consumed_attempts);
+  REQUIRE(saved.model_count() == 5);
+  REQUIRE(saved.manifest().models.size() == 5);
+  for (std::size_t i = 0; i < saved.model_count(); ++i) {
+   CHECK(saved.continuation(i).configuration.recipe.optimizer == optimizers[i]);
+   CHECK(saved.continuation(i).values.schedule.consumed_attempts > 0);
+   CHECK(saved.manifest().models[i].best.has_value());
+   CHECK(saved.manifest().models[i].best->weights == (mixed.use_ema ? rfdetr::EvaluatedWeights::Ema : rfdetr::EvaluatedWeights::Ordinary));
+   if (mixed.use_ema) CHECK(saved.continuation(i).values.ema_completed_updates == saved.continuation(i).values.schedule.consumed_attempts);
   }
-  const auto [shortest, longest] = std::minmax_element(saved.continuations.begin(), saved.continuations.end(), [](const auto& a, const auto& b) { return a.values.schedule.consumed_attempts < b.values.schedule.consumed_attempts; });
-  CHECK(shortest->values.schedule.consumed_attempts < longest->values.schedule.consumed_attempts);
+  std::vector<std::uint64_t> attempts;
+  for (std::size_t i = 0; i < saved.model_count(); ++i) attempts.push_back(saved.continuation(i).values.schedule.consumed_attempts);
+  const auto [shortest, longest] = std::minmax_element(attempts.begin(), attempts.end());
+  CHECK(*shortest < *longest);
   if (mode == rfdetr::TrainLaneMode::PeriodicAveraging) {
-   CHECK(saved.manifest.merge >= 1);
-   CHECK(trained.history.size() == saved.models.size() + 1);
+   CHECK(saved.manifest().merge >= 1);
+   CHECK(trained.history.size() == saved.model_count() + 1);
    CHECK(std::ranges::count_if(trained.history, [](const auto& row) { return row.scope == rfdetr::TrainingRecordScope::SynchronizedSession; }) == 1);
-   for (std::size_t i = 1; i < saved.models.size(); ++i)
-    for (std::size_t tensor = 0; tensor < saved.models.front().entries().size(); ++tensor)
-     CHECK(torch::equal(saved.models.front().entries()[tensor].tensor, saved.models[i].entries()[tensor].tensor));
+   for (std::size_t i = 1; i < saved.model_count(); ++i)
+    for (std::size_t tensor = 0; tensor < saved.model(0).entries().size(); ++tensor)
+     CHECK(torch::equal(saved.model(0).entries()[tensor].tensor, saved.model(i).entries()[tensor].tensor));
   }
   auto extended = mixed; extended.resume_path = trained.checkpoint_path; extended.weights_path.clear(); extended.epochs = 2;
   const auto resumed_mixed = rfdetr::run_training(extended);
@@ -1728,7 +1731,7 @@ void test_all_supervision_routes_execute_fixture_backed_training() {
    CHECK(published); CHECK(later_model);
   }
   rfdetr::TrainingSessionAdmission resumed_state(resumed_mixed.checkpoint_path);
-  for (std::size_t i = 0; i < saved.models.size(); ++i) CHECK(resumed_state.continuations[i].values.schedule.consumed_attempts > saved.continuations[i].values.schedule.consumed_attempts);
+  for (std::size_t i = 0; i < saved.model_count(); ++i) CHECK(resumed_state.continuation(i).values.schedule.consumed_attempts > saved.continuation(i).values.schedule.consumed_attempts);
   auto no_op = extended; no_op.resume_path = resumed_mixed.checkpoint_path;
   const auto selected_again = rfdetr::run_training(no_op);
   CHECK(selected_again.completed_epochs == 0); CHECK(selected_again.last_epoch == 1);
@@ -1809,10 +1812,10 @@ void test_all_supervision_routes_execute_fixture_backed_training() {
      REQUIRE(std::isfinite(result.history.front().train_loss));
      if (route_index < 2) {
       rfdetr::TrainingSessionAdmission distributed_state(result.checkpoint_path);
-      REQUIRE(distributed_state.models.size() == 3);
-      CHECK(distributed_state.manifest.models[0].model_id < distributed_state.manifest.models[1].model_id);
-      if (route_index == 1) for (std::size_t i = 1; i < distributed_state.models.size(); ++i)
-       CHECK(rfdetr::native_state_fingerprint(distributed_state.models[i].entries()) == rfdetr::native_state_fingerprint(distributed_state.models.front().entries()));
+      REQUIRE(distributed_state.model_count() == 3);
+      CHECK(distributed_state.manifest().models[0].model_id < distributed_state.manifest().models[1].model_id);
+      if (route_index == 1) for (std::size_t i = 1; i < distributed_state.model_count(); ++i)
+       CHECK(rfdetr::native_state_fingerprint(distributed_state.model(i).entries()) == rfdetr::native_state_fingerprint(distributed_state.model(0).entries()));
      }
     } else {
      REQUIRE(result.history.empty());

@@ -100,7 +100,7 @@ void save_resume_checkpoint(const std::filesystem::path& checkpoint_path, const 
   detail::publish_native_checkpoint_archive(archive, checkpoint_path, options.class_layout_path);
  }
 }
-ResumeState load_resume_checkpoint_state(const std::filesystem::path& checkpoint_path, DecodedNativeModelState& admitted, const detail::TrainingContinuation& continuation, NativeOptimizer& optimizer,
+ResumeState load_resume_checkpoint_state(const std::filesystem::path& checkpoint_path, const DecodedNativeModelState& admitted, const detail::TrainingContinuation& continuation, NativeOptimizer& optimizer,
  const std::vector<std::string>& parameter_names, const std::vector<torch::Tensor>& parameters, std::span<const std::uint8_t> active) {
  auto* retained = admitted.admitted_archive();
  if (!retained || !admitted.class_artifact) throw std::invalid_argument("full resume requires an admitted current native archive");

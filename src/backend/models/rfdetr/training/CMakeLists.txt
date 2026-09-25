@@ -42,6 +42,8 @@ mmltk_register_ordinary_sources(
     mmltk_backend_models_rfdetr_training
     training_distributed.cpp
     training_session_checkpoint.cpp
+    training_artifact.cpp
+    training_checkpoint_inspection.cpp
     model_merging.cpp
     training_gradient_reducer.cpp
     training_data_plan.cpp
@@ -59,6 +61,7 @@ mmltk_register_private_headers(
     detail/training_model.h
     detail/model_merging.h
     detail/training_session_checkpoint.h
+    detail/training_artifact.h
     detail/training_gradient_reducer.h
     detail/training_data_plan.h
     detail/training_data_state.h

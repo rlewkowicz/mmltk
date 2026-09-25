@@ -1,5 +1,8 @@
 #pragma once
 #include <cstdint>
+#include <filesystem>
+#include <memory>
+#include "training_artifact.h"
 #include <functional>
 #include <span>
 #include <string>
@@ -21,8 +24,6 @@ private:
  std::vector<torch::Tensor> checks_;
  bool prepared_ = false;
 };
-[[nodiscard]] DecodedNativeModelState admit_training_artifact(const TrainingArtifact&);
-[[nodiscard]] std::string native_state_fingerprint(std::span<const NormalizedModelStateEntry>);
 struct TrainingMergeState final {
  std::uint64_t round = 0;
  std::uint64_t merge = 0;
@@ -45,6 +46,7 @@ private:
 struct TrainingSelectionCandidate final {
  TrainingArtifact artifact;
  double coefficient = 1;
+ std::shared_ptr<const TrainingArtifactAdmission> admission;
 };
 // The evaluator sees the exact saved native artifact. Publication of the small
 // selected descriptor is the final operation and never replaces an ingredient.

@@ -1,3 +1,4 @@
+#include "src/backend/models/rfdetr/training/detail/training_artifact.h"
 #include "src/frameworks/gpu/tests/pinned_host_fault.h"
 #include "src/backend/ml/torch/tests/catch_support.h"
 #include "src/backend/models/rfdetr/core/tests/class_artifact_fixture.h"
@@ -1783,9 +1784,11 @@ TEST_CASE("Frozen selected native soups preserve ONNX logits boxes masks and eva
    rfdetr::save_native_checkpoint(candidate.path, state);
    candidate.session_id = "selected-native-onnx"; candidate.model_id = index; candidate.initialization = initialization;
    candidate.configuration = std::string(64, masks ? 'a' : 'b'); candidate.validation = mmltk::common::io::sha256_hex(mmltk::common::io::sha256_file(compiled));
-   candidate.sha256 = mmltk::common::io::sha256_hex(mmltk::common::io::sha256_file(candidate.path));
-   candidate.content = rfdetr::native_state_fingerprint(rfdetr::decode_native_model_state(candidate.path).entries());
+   auto admission = std::make_shared<rfdetr::TrainingArtifactAdmission>(candidate.path);
    candidate.evaluation = evaluate(candidate.path); candidate.selection_metric = rfdetr::training_selection_metric(*candidate.evaluation, masks);
+   candidate = admission->describe(std::move(candidate));
+   admission->release_decoded_state();
+   candidates[index].admission = std::move(admission);
   }
   const auto selected = rfdetr::select_training_artifact(candidates, rfdetr::TrainFinalPolicy::Uniform, masks, directory, evaluate);
   REQUIRE(selected.artifact.weights == rfdetr::EvaluatedWeights::Soup);

@@ -1,3 +1,4 @@
+#include "src/backend/models/rfdetr/training/detail/training_artifact.h"
 #include "train.h"
 #include "checkpoint.h"
 #include "telemetry_writer.h"
@@ -267,13 +268,14 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
   if (main_process) resumed.emplace(options.resume_path);
   distributed_barrier(distributed);
   if (!main_process) resumed.emplace(options.resume_path);
-  if (resumed->plan->plan_hash != data_plan.hash() || resumed->plan->shards != data_plan.shards()) throw std::runtime_error("resume data plan differs from compiled membership");
+  if (resumed->plan().plan_hash != data_plan.hash() || resumed->plan().shards != data_plan.shards()) throw std::runtime_error("resume data plan differs from compiled membership");
  }
- const auto source_checkpoint = resumed ? std::filesystem::canonical(options.resume_path).parent_path() / resumed->manifest.models.front().path : options.weights_path;
+ const auto source_checkpoint = resumed ? std::filesystem::canonical(options.resume_path).parent_path() / resumed->manifest().models.front().path : options.weights_path;
  if (train_loader.image_width() != train_loader.image_height()) throw std::runtime_error("train compiled RF-DETR input must be square");
- auto admitted = resolve_model_state(source_checkpoint, options.preset_name, static_cast<int>(train_loader.image_width()), options.class_layout_path);
- auto artifacts = admitted.artifacts;
- auto original_descriptor = resumed ? std::filesystem::path(resumed->continuations.front().values.training_original_descriptor) : options.class_layout_path;
+ std::optional<ResolvedModelState> transferred;
+ if (!resumed) transferred = resolve_model_state(source_checkpoint, options.preset_name, static_cast<int>(train_loader.image_width()), options.class_layout_path);
+ auto artifacts = resumed ? resolve_admitted_model_artifacts(resumed->model(0), source_checkpoint, options.preset_name, static_cast<int>(train_loader.image_width()), options.class_layout_path) : transferred->artifacts;
+ auto original_descriptor = resumed ? std::filesystem::path(resumed->continuation(0).values.training_original_descriptor) : options.class_layout_path;
  if (!resumed) apply_stock_training_coefficients(artifacts.config);
  artifacts.config.training_supervision = options.training_supervision;
  dataset_limits.automatic_num_queries_cap = checked_cast<std::size_t>(artifacts.automatic_num_queries_cap, "RF-DETR automatic query cap exceeds size_t");
@@ -287,8 +289,8 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
  }
  const int dataset_output_classes = rfdetr_output_class_count(train_loader.num_classes());
  if (!options.resume_path.empty()) {
-  const auto& resume_checkpoint = admitted.model_state;
-  if (resume_checkpoint.metadata.class_layout != native_training_class_layout(*train_loader.class_catalog())) throw std::runtime_error("resume class layout does not match ordered compiled catalog");
+  const auto& resume_checkpoint = resumed->model(0);
+  if (artifacts.class_layout != native_training_class_layout(*train_loader.class_catalog())) throw std::runtime_error("resume class layout does not match ordered compiled catalog");
   if (resume_checkpoint.metadata.num_classes > 0 && resume_checkpoint.metadata.num_classes != static_cast<int64_t>(dataset_output_classes)) {
    throw std::runtime_error("resume checkpoint class count does not match compiled dataset class count");
   }
@@ -357,13 +359,13 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
  agree_model_inventory(distributed, *common, "initialized-cpu-inventory");
  common->to(mmltk::backend::ml::cuda::cuda_device(options.device_id));
  if (!resumed) {
-  const auto loaded = load_training_model_weights(*common, admitted.model_state, supervision_route(options.training_supervision));
+  const auto loaded = load_training_model_weights(*common, transferred->model_state, supervision_route(options.training_supervision));
   mmltk::common::logging::info([&](auto& logger) { logger.info("RF-DETR loaded {} parameters from {}", loaded.loaded_names.size(), source_checkpoint.string()); });
  }
  broadcast_training_model(distributed, *common);
  const auto precision = agree_training_precision(distributed, options.device_id, options.amp, options.fused_optimizer);
  const auto precision_kind = precision.autocast_dtype == torch::kFloat16 ? TrainingPrecisionKind::Float16 : precision.autocast_dtype == torch::kBFloat16 ? TrainingPrecisionKind::BFloat16 : TrainingPrecisionKind::Float32;
- if (resumed && resumed->manifest.precision != precision_kind) throw std::runtime_error("Resume precision is incompatible with saved optimizer/scaler state");
+ if (resumed && resumed->manifest().precision != precision_kind) throw std::runtime_error("Resume precision is incompatible with saved optimizer/scaler state");
  const auto share_identity = [&](std::string value, std::size_t bytes) {
   if (!main_process) value.assign(bytes, '0');
   if (value.size() != bytes) throw std::logic_error("training identity has an invalid extent");
@@ -372,7 +374,7 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
   const auto host = buffer.cpu();
   return std::string(static_cast<const char*>(host.const_data_ptr()), bytes);
  };
- const auto initialization = resumed ? resumed->manifest.initialization : share_identity(main_process ? native_state_fingerprint(collect_module_state(*common)) : std::string{}, 64);
+ const auto initialization = resumed ? resumed->manifest().initialization : share_identity(main_process ? native_state_fingerprint(collect_module_state(*common)) : std::string{}, 64);
  const auto hash_text = [](std::string_view text) { return mmltk::common::io::sha256_hex(mmltk::common::io::sha256_bytes({reinterpret_cast<const std::uint8_t*>(text.data()), text.size()})); };
  const auto source_fingerprint = [&](const std::filesystem::path& path) {
   if (!main_process) return std::string{};
@@ -384,7 +386,7 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
  // Content is read once per source by rank zero, never once per model or rank.
  const auto configuration_fingerprint = share_identity(source_fingerprint(options.train_compiled_path), 64);
  const auto validation_fingerprint = options.val_compiled_path == options.train_compiled_path ? configuration_fingerprint : share_identity(source_fingerprint(options.val_compiled_path), 64);
- session = resumed ? resumed->manifest : TrainingSessionManifest{};
+ session = resumed ? resumed->manifest() : TrainingSessionManifest{};
  if (!resumed) {
   session.session_id = share_identity(main_process ? training_artifact_identity() : std::string{}, 32);
   session.initialization = initialization;
@@ -413,8 +415,8 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
   auto loader = index == 0 ? std::move(admission_loader) : std::make_unique<mmltk::backend::data::DatasetLoader>(loader_config);
   models.push_back(std::make_unique<TrainingModel>(options, index, train_runtime, std::move(loader), std::move(native), data_plan, distributed, precision, detection, report_failure));
   if (resumed) {
-   models.back()->stage_resume(resumed->models[index], resumed->continuations[index]);
-   models.back()->restore_best(resumed->manifest.models[index].best);
+   models.back()->stage_resume(resumed->model(index), resumed->continuation(index));
+   if (const auto& best = resumed->manifest().models[index].best) models.back()->remember_candidate(TrainingArtifactCandidate{*best, resumed->best_admission(index)});
   }
  }
  for (const auto& [path, snapshot] : admitted_files) snapshot.RequireUnchanged(path);
@@ -425,13 +427,13 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
  auto physical_workers = std::make_shared<mmltk::common::concurrency::WorkerPool>(static_cast<std::size_t>(train_lane_count), train_runtime.lane_cpus(), "rfdtrtlane",
   static_cast<std::size_t>(train_lane_count), &train_runtime.execution().placement, false);
  for (auto& trajectory : models) { active_model = trajectory->id(); trajectory->start(physical_workers); }
- admitted.model_state.release_admission();
+ if (transferred) transferred->model_state.release_admission();
  const int start_epoch = resumed ? static_cast<int>(session.epoch) : 0;
  const auto resume_attempt = resumed ? session.attempt_id : std::string{};
  result.last_epoch = start_epoch - 1;
- resumed.reset();
  auto metadata = make_native_checkpoint_metadata(artifacts, dataset_output_classes);
- if (!options.resume_path.empty()) { metadata.source_path = admitted.model_state.metadata.source_path; metadata.source_kind = admitted.model_state.metadata.source_kind; }
+ if (resumed) { metadata.source_path = resumed->model(0).metadata.source_path; metadata.source_kind = resumed->model(0).metadata.source_kind; }
+ resumed.reset();
  if (main_process) std::filesystem::create_directories(options.output_dir);
  std::unique_ptr<TrainingSessionCheckpoint> checkpoint;
  std::unique_ptr<TrainingValidationRuntime> validation;
@@ -545,7 +547,7 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
    merge(TrainingMergeBoundary::Epoch);
    distributed_barrier(distributed);
    if (main_process) {
-    std::optional<TrainingArtifact> synchronized;
+    std::optional<TrainingArtifactCandidate> synchronized;
     for (auto& model : models) {
      active_model = model->id();
      if (!periodic && options.use_ema) model->save_ordinary_epoch(metadata, options.output_dir);
@@ -555,28 +557,34 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
       submit(latest, TrainingRecordRole::Boundary);
       const auto evaluated = model->evaluate(*validation, kind);
       auto artifact = model->save_candidate(metadata, options.output_dir, session.session_id, initialization, session.configuration, validation_fingerprint, merge_schedule.state().merge, kind, evaluated.summary);
-      latest = model->progress(TrainingPhase::EpochComplete); latest.session_id = session.session_id; latest.artifact = artifact; latest.val = evaluated.summary; latest.val_loss = evaluated.loss;
+      latest = model->progress(TrainingPhase::EpochComplete); latest.session_id = session.session_id; latest.artifact = artifact.artifact; latest.val = evaluated.summary; latest.val_loss = evaluated.loss;
       if (periodic) { latest.scope = TrainingRecordScope::SynchronizedSession; latest.model_id = 0; synchronized = artifact; }
       retain_epoch(latest); submit(latest, TrainingRecordRole::Epoch);
       if (!options.use_ema) model->remember_candidate(std::move(artifact));
       else if (!periodic) model->remember_candidate(std::move(artifact));
      } else if (!options.use_ema) {
-      auto same = *synchronized; same.model_id = model->id(); same.attempt = model->schedule().consumed_attempts;
+      auto same = *synchronized; same.artifact.model_id = model->id(); same.artifact.attempt = model->schedule().consumed_attempts;
       model->remember_candidate(std::move(same));
      }
      if (periodic && options.use_ema) {
       const auto evaluated = model->evaluate(*validation, EvaluatedWeights::Ema);
       auto artifact = model->save_candidate(metadata, options.output_dir, session.session_id, initialization, session.configuration, validation_fingerprint, merge_schedule.state().merge, EvaluatedWeights::Ema, evaluated.summary);
-      latest = model->progress(TrainingPhase::EpochComplete); latest.session_id = session.session_id; latest.artifact = artifact; latest.val = evaluated.summary; latest.val_loss = evaluated.loss;
+      latest = model->progress(TrainingPhase::EpochComplete); latest.session_id = session.session_id; latest.artifact = artifact.artifact; latest.val = evaluated.summary; latest.val_loss = evaluated.loss;
       retain_epoch(latest); submit(latest, TrainingRecordRole::Epoch); model->remember_candidate(std::move(artifact));
      }
     }
     session.epoch = epoch + 1; session.round = merge_schedule.state().round; session.merge = merge_schedule.state().merge; session.interval_rounds = merge_schedule.state().interval_rounds;
     session.models.clear();
-    for (std::size_t i = 0; i < models.size(); ++i) session.models.push_back({models[i]->id(), {}, {}, successful_images[i], models[i]->best()});
+    std::vector<std::shared_ptr<const TrainingArtifactAdmission>> candidate_admissions;
+    candidate_admissions.reserve(models.size());
+    for (std::size_t i = 0; i < models.size(); ++i) {
+     const auto& best = models[i]->best();
+     session.models.push_back({models[i]->id(), {}, {}, successful_images[i], best ? std::optional{best->artifact} : std::nullopt});
+     if (best) candidate_admissions.push_back(best->admission);
+    }
     checkpoint->publish(session, immutable_plan, [&](const std::filesystem::path& destination, std::size_t index) {
      models[index]->save_resume(destination, metadata, session.attempt_id, original_descriptor);
-    });
+    }, candidate_admissions);
     last_checkpoint_path = checkpoint->path();
     latest = {}; latest.phase = TrainingPhase::EpochComplete; latest.epoch = epoch; latest.total_epochs = options.epochs; latest.session_id = session.session_id;
     latest.full_checkpoint_path = last_checkpoint_path; latest.scope = TrainingRecordScope::Session; latest.model_id = 0;
@@ -592,7 +600,7 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
     if (!model->best()) throw std::runtime_error("final selection requires a completed scheduled-validation candidate for every model");
     double coefficient = 1;
     if (options.lane_configuration.mode != TrainLaneMode::SharedGradients) coefficient = std::ranges::find(options.lane_configuration.models, model->id(), &TrainModelSettings::model_id)->coefficient;
-    candidates.push_back({*model->best(), coefficient});
+    candidates.push_back({model->best()->artifact, coefficient, model->best()->admission});
    }
    const auto evaluate_native = [&](const std::filesystem::path& path) {
     NativeRfDetrModel candidate(artifacts.config, artifacts.class_layout);

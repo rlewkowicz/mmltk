@@ -1,5 +1,9 @@
 #pragma once
 #include <span>
+#include <filesystem>
+#include <string>
+#include <string_view>
+#include <vector>
 #include <cstdint>
 #include <limits>
 #include <optional>
@@ -22,7 +26,7 @@ struct ResumeState {
  std::optional<int> scaler_growth_tracker;
 };
 ModelStateLoadSummary load_training_model_weights(NativeRfDetrModel&, const DecodedNativeModelState&, TrainingSupervisionRoute);
-ResumeState load_resume_checkpoint_state(const std::filesystem::path&, DecodedNativeModelState&, const detail::TrainingContinuation&, NativeOptimizer&,
+ResumeState load_resume_checkpoint_state(const std::filesystem::path&, const DecodedNativeModelState&, const detail::TrainingContinuation&, NativeOptimizer&,
  const std::vector<std::string>&, const std::vector<torch::Tensor>&, std::span<const std::uint8_t> active = {});
 class TrainingSnapshot final {
 public:

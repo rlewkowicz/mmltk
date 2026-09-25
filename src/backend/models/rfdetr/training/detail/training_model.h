@@ -11,6 +11,7 @@
 #include <string>
 #include <vector>
 #include "training_data_plan.h"
+#include "training_artifact.h"
 #include "training_distributed.h"
 #include "training_snapshot.h"
 #include "evaluation_runtime.h"
@@ -25,7 +26,7 @@ public:
  ~TrainingModel();
  TrainingModel(const TrainingModel&) = delete;
  TrainingModel& operator=(const TrainingModel&) = delete;
- void stage_resume(DecodedNativeModelState&, const detail::TrainingContinuation&);
+ void stage_resume(const DecodedNativeModelState&, const detail::TrainingContinuation&);
  void commit_resume();
  void start(std::shared_ptr<mmltk::common::concurrency::WorkerPool>);
  void begin_epoch(std::uint64_t epoch, TrainingEpochDraws);
@@ -36,12 +37,11 @@ public:
  void end_epoch();
  [[nodiscard]] TrainingMetricProgress progress(TrainingPhase) const;
  [[nodiscard]] EvalPassResult evaluate(TrainingValidationRuntime&, EvaluatedWeights);
- [[nodiscard]] TrainingArtifact save_candidate(const NativeCheckpointMetadata&, const std::filesystem::path&, std::string_view session,
+ [[nodiscard]] TrainingArtifactCandidate save_candidate(const NativeCheckpointMetadata&, const std::filesystem::path&, std::string_view session,
   std::string_view initialization, std::string_view configuration, std::string_view validation, std::uint64_t merge, EvaluatedWeights, const EvalSummary&);
- void remember_candidate(TrainingArtifact);
+ void remember_candidate(TrainingArtifactCandidate);
  void save_ordinary_epoch(const NativeCheckpointMetadata&, const std::filesystem::path&);
- [[nodiscard]] const std::optional<TrainingArtifact>& best() const;
- void restore_best(std::optional<TrainingArtifact>);
+ [[nodiscard]] const std::optional<TrainingArtifactCandidate>& best() const;
  void save_resume(const std::filesystem::path&, const NativeCheckpointMetadata&, std::string_view attempt, const std::filesystem::path& original_descriptor);
  [[nodiscard]] NativeRfDetrModel& model();
  [[nodiscard]] const std::vector<NormalizedModelStateEntry>& ordinary() const;
