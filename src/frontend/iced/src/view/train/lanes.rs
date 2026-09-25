@@ -44,7 +44,7 @@ pub fn update(settings: &mut SettingsModel, message: Message) -> Result<Option<E
         Message::Coefficient(value) => configuration.models.iter_mut().find(|model| Some(model.modelid) == settings.recipe_model).ok_or("Select a model")?.coefficient = value,
         _ => unreachable!(),
     }
-    settings.replace_training_lanes(configuration, false).map(Some)
+    settings.replace_training_lanes(configuration).map(Some)
 }
 
 pub fn view<'a>(request: &'a TrainRequest, settings: &SettingsModel, enabled: bool) -> Element<'a, Message> {

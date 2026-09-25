@@ -1,33 +1,26 @@
 use crate::fluent_theme::Element;
-use crate::generated::{TrainLrSchedulerKind, TrainOptimizerKind};
+use crate::generated::{TrainLrSchedulerKind, TrainOptimizerKind, TrainRecipeSettingsEdit};
 use crate::view::settings::{EditCadence, EditSchedule, SettingsModel};
 use crate::view::workflow::fields;
 use iced::widget::{button, column, container, row, text};
 
 mod supervision;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub enum Message {
     Loading(crate::view::workflow::loading::Message),
     BatchSize(u64),
     ValidationBatchSize(u64),
     Epochs(i32),
     GradientAccumulation(i32),
-    Optimizer(TrainOptimizerKind),
-    DecoderLearningRate(f64),
-    EncoderLearningRate(f64),
-    Scheduler(TrainLrSchedulerKind),
-    WeightDecay(f64),
-    Momentum(f64),
+    Recipe(TrainRecipeSettingsEdit),
     Amp(bool),
     Ema(bool),
     Augmentation(bool),
     PerceptualDownscale(bool),
     FreezeEncoder(bool),
     UnfreezeLast(i32), DisableAugmentationLast(i32),
-    ComponentDecay(f64), EncoderLayerDecay(f64), WarmupEpochs(f64), WarmupMomentum(f64), MinimumFactor(f64), DropEpoch(i32), Nesterov(bool), WarmupBias(f64),
     Supervision(supervision::Message),
-    UseOptimizerDefaults,
 }
 
 #[cfg(test)]
@@ -60,29 +53,6 @@ const fn scheduler_label(scheduler: TrainLrSchedulerKind) -> &'static str {
 }
 
 pub fn update(model: &mut SettingsModel, message: Message) -> Result<EditSchedule, String> {
-    if let Some(id) = model.recipe_model {
-        let mut configuration = model.draft.as_ref().ok_or("Settings unavailable")?.workflows.train.request.laneconfiguration.clone();
-        let recipe = &mut configuration.models.iter_mut().find(|entry| entry.modelid == id).ok_or("Selected model is unavailable")?.recipe;
-        let edited = match message {
-            Message::Optimizer(value) => { crate::generated::select_trainrecipesettings(recipe, value); true },
-            Message::DecoderLearningRate(value) => { crate::generated::edit_trainrecipesettings_lr(recipe, value); true },
-            Message::EncoderLearningRate(value) => { crate::generated::edit_trainrecipesettings_lrencoder(recipe, value); true },
-            Message::Scheduler(value) => { crate::generated::edit_trainrecipesettings_lrscheduler(recipe, value); true },
-            Message::WeightDecay(value) => { crate::generated::edit_trainrecipesettings_weightdecay(recipe, value); true },
-            Message::Momentum(value) => { crate::generated::edit_trainrecipesettings_momentum(recipe, value); true },
-            Message::ComponentDecay(value) => { crate::generated::edit_trainrecipesettings_lrcomponentdecay(recipe, value); true },
-            Message::EncoderLayerDecay(value) => { crate::generated::edit_trainrecipesettings_encoderlayerdecay(recipe, value); true },
-            Message::WarmupEpochs(value) => { crate::generated::edit_trainrecipesettings_warmupepochs(recipe, value); true },
-            Message::WarmupMomentum(value) => { crate::generated::edit_trainrecipesettings_warmupmomentum(recipe, value); true },
-            Message::MinimumFactor(value) => { crate::generated::edit_trainrecipesettings_lrminfactor(recipe, value); true },
-            Message::DropEpoch(value) => { crate::generated::edit_trainrecipesettings_lrdrop(recipe, value); true },
-            Message::Nesterov(value) => { crate::generated::edit_trainrecipesettings_nesterov(recipe, value); true },
-            Message::WarmupBias(value) => { crate::generated::edit_trainrecipesettings_warmupbiaslr(recipe, value); true },
-            Message::UseOptimizerDefaults => { crate::generated::reset_trainrecipesettings(recipe); true },
-            _ => false,
-        };
-        if edited { return model.replace_training_lanes(configuration, false); }
-    }
     let cadence = EditCadence::Debounced;
     match message {
         Message::Loading(message) => crate::view::workflow::loading::update(
@@ -102,24 +72,7 @@ pub fn update(model: &mut SettingsModel, message: Message) -> Result<EditSchedul
         Message::GradientAccumulation(value) => model.edit(cadence, |draft| {
             crate::generated::edit_workflowstrainrequestgradaccumsteps(draft, value)
         }),
-        Message::Optimizer(value) => model.edit(cadence, |draft| {
-            crate::generated::edit_workflowstrainrequestrecipeoptimizer(draft, value)
-        }),
-        Message::DecoderLearningRate(value) => model.edit(cadence, |draft| {
-            crate::generated::edit_relation_workflowstrainrequestrecipelr(draft, value)
-        }),
-        Message::EncoderLearningRate(value) => model.edit(cadence, |draft| {
-            crate::generated::edit_relation_workflowstrainrequestrecipelrencoder(draft, value)
-        }),
-        Message::Scheduler(value) => model.edit(cadence, |draft| {
-            crate::generated::edit_relation_workflowstrainrequestrecipelrscheduler(draft, value)
-        }),
-        Message::WeightDecay(value) => model.edit(cadence, |draft| {
-            crate::generated::edit_relation_workflowstrainrequestrecipeweightdecay(draft, value)
-        }),
-        Message::Momentum(value) => model.edit(cadence, |draft| {
-            crate::generated::edit_relation_workflowstrainrequestrecipemomentum(draft, value)
-        }),
+        Message::Recipe(edit) => model.edit_recipe(edit),
         Message::Amp(value) => model.edit(cadence, |draft| {
             crate::generated::edit_workflowstrainrequestamp(draft, value)
         }),
@@ -139,16 +92,7 @@ pub fn update(model: &mut SettingsModel, message: Message) -> Result<EditSchedul
         }),
         Message::UnfreezeLast(value) => model.edit(cadence, |draft| crate::generated::edit_workflowstrainrequestunfreezeencoderlastepochs(draft, value)),
         Message::DisableAugmentationLast(value) => model.edit(cadence, |draft| crate::generated::edit_workflowstrainrequestdisableaugmentationlastepochs(draft, value)),
-        Message::ComponentDecay(value) => model.edit(cadence, |draft| crate::generated::edit_relation_workflowstrainrequestrecipelrcomponentdecay(draft, value)),
-        Message::EncoderLayerDecay(value) => model.edit(cadence, |draft| crate::generated::edit_relation_workflowstrainrequestrecipeencoderlayerdecay(draft, value)),
-        Message::WarmupEpochs(value) => model.edit(cadence, |draft| crate::generated::edit_relation_workflowstrainrequestrecipewarmupepochs(draft, value)),
-        Message::WarmupMomentum(value) => model.edit(cadence, |draft| crate::generated::edit_relation_workflowstrainrequestrecipewarmupmomentum(draft, value)),
-        Message::MinimumFactor(value) => model.edit(cadence, |draft| crate::generated::edit_relation_workflowstrainrequestrecipelrminfactor(draft, value)),
-        Message::DropEpoch(value) => model.edit(cadence, |draft| crate::generated::edit_relation_workflowstrainrequestrecipelrdrop(draft, value)),
-        Message::Nesterov(value) => model.edit(cadence, |draft| crate::generated::edit_relation_workflowstrainrequestrecipenesterov(draft, value)),
-        Message::WarmupBias(value) => model.edit(cadence, |draft| crate::generated::edit_relation_workflowstrainrequestrecipewarmupbiaslr(draft, value)),
         Message::Supervision(message) => supervision::update(model, message),
-        Message::UseOptimizerDefaults => model.edit_group(cadence, crate::generated::reset_relation_workflowstrainrequestrecipe),
     }
 }
 
@@ -179,7 +123,7 @@ pub fn view<'a>(
             .fold(row![].spacing(6), |choices, recipe| {
                 choices.push(
                     button(optimizer_label(recipe.optimizer))
-                        .on_press_maybe(enabled.then_some(Message::Optimizer(recipe.optimizer)))
+                        .on_press_maybe(enabled.then_some(Message::Recipe(TrainRecipeSettingsEdit::Optimizer(recipe.optimizer))))
                         .style(if scoped_recipe.optimizer == recipe.optimizer {
                             crate::fluent_theme::button_selected
                         } else {
@@ -193,7 +137,7 @@ pub fn view<'a>(
         .fold(row![].spacing(6), |choices, choice| {
             choices.push(
                 button(scheduler_label(choice))
-                    .on_press_maybe((enabled && crate::generated::train_scheduler_available(scoped_recipe.optimizer, choice)).then_some(Message::Scheduler(choice)))
+                    .on_press_maybe((enabled && crate::generated::train_scheduler_available(scoped_recipe.optimizer, choice)).then_some(Message::Recipe(TrainRecipeSettingsEdit::LrScheduler(choice))))
                     .style(if scheduler == choice {
                         crate::fluent_theme::button_selected
                     } else {
@@ -251,38 +195,38 @@ pub fn view<'a>(
                     lr,
                     crate::generated::constraint_workflowstrainrequestrecipelr(),
                     enabled,
-                    Message::DecoderLearningRate,
+                    |value| Message::Recipe(TrainRecipeSettingsEdit::Lr(value)),
                 ))
                 .push(fields::number_f64(
                     "Encoder learning rate",
                     lr_encoder,
                     crate::generated::constraint_workflowstrainrequestrecipelrencoder(),
                     enabled,
-                    Message::EncoderLearningRate,
+                    |value| Message::Recipe(TrainRecipeSettingsEdit::LrEncoder(value)),
                 ))
                 .push(fields::number_f64(
                     "Weight decay",
                     weight_decay,
                     crate::generated::constraint_workflowstrainrequestrecipeweightdecay(),
                     enabled,
-                    Message::WeightDecay,
+                    |value| Message::Recipe(TrainRecipeSettingsEdit::WeightDecay(value)),
                 ))
                 .push(fields::number_f64(
                     "Momentum",
                     momentum,
                     crate::generated::constraint_workflowstrainrequestrecipemomentum(),
                     enabled,
-                    Message::Momentum,
+                    |value| Message::Recipe(TrainRecipeSettingsEdit::Momentum(value)),
                 )),
             fields::numeric_grid()
-                .push(fields::number_f64("Component LR factor", crate::generated::effective_trainrecipesettings_lrcomponentdecay(scoped_recipe), crate::generated::constraint_workflowstrainrequestrecipelrcomponentdecay(), enabled, Message::ComponentDecay))
-                .push(fields::number_f64("Encoder layer LR factor", crate::generated::effective_trainrecipesettings_encoderlayerdecay(scoped_recipe), crate::generated::constraint_workflowstrainrequestrecipeencoderlayerdecay(), enabled, Message::EncoderLayerDecay))
-                .push(fields::number_f64("Warmup epochs", crate::generated::effective_trainrecipesettings_warmupepochs(scoped_recipe), crate::generated::constraint_workflowstrainrequestrecipewarmupepochs(), enabled, Message::WarmupEpochs))
-                .push(fields::number_f64("Warmup momentum", crate::generated::effective_trainrecipesettings_warmupmomentum(scoped_recipe), crate::generated::constraint_workflowstrainrequestrecipewarmupmomentum(), enabled, Message::WarmupMomentum))
-                .push(fields::number_f64("Minimum LR factor", crate::generated::effective_trainrecipesettings_lrminfactor(scoped_recipe), crate::generated::constraint_workflowstrainrequestrecipelrminfactor(), enabled, Message::MinimumFactor))
-                .push(fields::number_i32("LR drop epoch", crate::generated::effective_trainrecipesettings_lrdrop(scoped_recipe), crate::generated::constraint_workflowstrainrequestrecipelrdrop(), enabled, Message::DropEpoch))
-                .push(fields::number_f64("Bias warmup LR", crate::generated::effective_trainrecipesettings_warmupbiaslr(scoped_recipe), crate::generated::constraint_workflowstrainrequestrecipewarmupbiaslr(), enabled, Message::WarmupBias)),
-            fields::toggle("Nesterov momentum", crate::generated::effective_trainrecipesettings_nesterov(scoped_recipe), enabled, Message::Nesterov),
+                .push(fields::number_f64("Component LR factor", crate::generated::effective_trainrecipesettings_lrcomponentdecay(scoped_recipe), crate::generated::constraint_workflowstrainrequestrecipelrcomponentdecay(), enabled, |value| Message::Recipe(TrainRecipeSettingsEdit::LrComponentDecay(value))))
+                .push(fields::number_f64("Encoder layer LR factor", crate::generated::effective_trainrecipesettings_encoderlayerdecay(scoped_recipe), crate::generated::constraint_workflowstrainrequestrecipeencoderlayerdecay(), enabled, |value| Message::Recipe(TrainRecipeSettingsEdit::EncoderLayerDecay(value))))
+                .push(fields::number_f64("Warmup epochs", crate::generated::effective_trainrecipesettings_warmupepochs(scoped_recipe), crate::generated::constraint_workflowstrainrequestrecipewarmupepochs(), enabled, |value| Message::Recipe(TrainRecipeSettingsEdit::WarmupEpochs(value))))
+                .push(fields::number_f64("Warmup momentum", crate::generated::effective_trainrecipesettings_warmupmomentum(scoped_recipe), crate::generated::constraint_workflowstrainrequestrecipewarmupmomentum(), enabled, |value| Message::Recipe(TrainRecipeSettingsEdit::WarmupMomentum(value))))
+                .push(fields::number_f64("Minimum LR factor", crate::generated::effective_trainrecipesettings_lrminfactor(scoped_recipe), crate::generated::constraint_workflowstrainrequestrecipelrminfactor(), enabled, |value| Message::Recipe(TrainRecipeSettingsEdit::LrMinFactor(value))))
+                .push(fields::number_i32("LR drop epoch", crate::generated::effective_trainrecipesettings_lrdrop(scoped_recipe), crate::generated::constraint_workflowstrainrequestrecipelrdrop(), enabled, |value| Message::Recipe(TrainRecipeSettingsEdit::LrDrop(value))))
+                .push(fields::number_f64("Bias warmup LR", crate::generated::effective_trainrecipesettings_warmupbiaslr(scoped_recipe), crate::generated::constraint_workflowstrainrequestrecipewarmupbiaslr(), enabled, |value| Message::Recipe(TrainRecipeSettingsEdit::WarmupBiasLr(value)))),
+            fields::toggle("Nesterov momentum", crate::generated::effective_trainrecipesettings_nesterov(scoped_recipe), enabled, |value| Message::Recipe(TrainRecipeSettingsEdit::Nesterov(value))),
             text("Learning-rate scheduler"),
             scheduler_choices,
             fields::toggle(
@@ -311,7 +255,7 @@ pub fn view<'a>(
                 .id(crate::generated::constraint_workflowstrainrequestgpuaugmentationperceptualdownscale().stable_field_id.to_string()),
             supervision::view(train, enabled).map(Message::Supervision),
             button("Use optimizer defaults")
-                .on_press_maybe(enabled.then_some(Message::UseOptimizerDefaults)),
+                .on_press_maybe(enabled.then_some(Message::Recipe(TrainRecipeSettingsEdit::Reset))),
         ]
         .spacing(crate::view::workflow::FIELD_SPACING),
     )
@@ -417,7 +361,7 @@ mod tests {
     #[test]
     fn recipe_edits_pin_values_and_reset_clears_the_basic_override_set() {
         let mut model = installed_settings_model();
-        update(&mut model, Message::DecoderLearningRate(0.002)).unwrap();
+        update(&mut model, Message::Recipe(TrainRecipeSettingsEdit::Lr(0.002))).unwrap();
         let request = &model.draft.as_ref().unwrap().workflows.train.request;
         assert_eq!(request.recipe.lr, 0.002);
         assert!(
@@ -426,7 +370,7 @@ mod tests {
                 .overridden(TrainRecipeCatalogRelationField::Lr)
         );
 
-        update(&mut model, Message::UseOptimizerDefaults).unwrap();
+        update(&mut model, Message::Recipe(TrainRecipeSettingsEdit::Reset)).unwrap();
         let overrides = &model
             .draft
             .as_ref()
@@ -445,15 +389,15 @@ mod tests {
     #[test]
     fn scheduler_selection_tracks_optimizer_recipe_until_explicitly_overridden() {
         let mut model = installed_settings_model();
-        update(&mut model, Message::Optimizer(TrainOptimizerKind::Muon)).unwrap();
+        update(&mut model, Message::Recipe(TrainRecipeSettingsEdit::Optimizer(TrainOptimizerKind::Muon))).unwrap();
         let request = &model.draft.as_ref().unwrap().workflows.train.request;
         assert_eq!(
             effective_scheduler(request),
             recipe(TrainOptimizerKind::Muon).lrscheduler
         );
 
-        update(&mut model, Message::Scheduler(TrainLrSchedulerKind::Cosine)).unwrap();
-        update(&mut model, Message::Optimizer(TrainOptimizerKind::AdamW)).unwrap();
+        update(&mut model, Message::Recipe(TrainRecipeSettingsEdit::LrScheduler(TrainLrSchedulerKind::Cosine))).unwrap();
+        update(&mut model, Message::Recipe(TrainRecipeSettingsEdit::Optimizer(TrainOptimizerKind::AdamW))).unwrap();
         let request = &model.draft.as_ref().unwrap().workflows.train.request;
         assert!(
             request
@@ -481,17 +425,17 @@ mod tests {
         request.laneconfiguration.models = (1..=2).map(|modelid| TrainModelSettings { modelid, seed: 42, recipe: global.clone(), coefficient: 1.0 }).collect();
         request.laneconfiguration.nextmodelid = 3;
         model.recipe_model = Some(1);
-        update(&mut model, Message::Optimizer(TrainOptimizerKind::SGD)).unwrap();
-        update(&mut model, Message::Momentum(0.8)).unwrap();
-        update(&mut model, Message::Scheduler(TrainLrSchedulerKind::UltralyticsLinear)).unwrap();
-        update(&mut model, Message::WarmupBias(0.04)).unwrap();
+        update(&mut model, Message::Recipe(TrainRecipeSettingsEdit::Optimizer(TrainOptimizerKind::SGD))).unwrap();
+        update(&mut model, Message::Recipe(TrainRecipeSettingsEdit::Momentum(0.8))).unwrap();
+        update(&mut model, Message::Recipe(TrainRecipeSettingsEdit::LrScheduler(TrainLrSchedulerKind::UltralyticsLinear))).unwrap();
+        update(&mut model, Message::Recipe(TrainRecipeSettingsEdit::WarmupBiasLr(0.04))).unwrap();
         let first = model.draft.as_ref().unwrap().workflows.train.request.laneconfiguration.models[0].clone();
         model.recipe_model = Some(2);
-        update(&mut model, Message::Optimizer(TrainOptimizerKind::Muon)).unwrap();
-        update(&mut model, Message::DecoderLearningRate(0.004)).unwrap();
+        update(&mut model, Message::Recipe(TrainRecipeSettingsEdit::Optimizer(TrainOptimizerKind::Muon))).unwrap();
+        update(&mut model, Message::Recipe(TrainRecipeSettingsEdit::Lr(0.004))).unwrap();
         model.recipe_model = Some(1);
         assert_eq!(model.draft.as_ref().unwrap().workflows.train.request.laneconfiguration.models[0], first);
-        update(&mut model, Message::UseOptimizerDefaults).unwrap();
+        update(&mut model, Message::Recipe(TrainRecipeSettingsEdit::Reset)).unwrap();
         let request = &model.draft.as_ref().unwrap().workflows.train.request;
         assert_eq!(request.recipe, global);
         assert_eq!(request.laneconfiguration.models[0].recipe.optimizer, TrainOptimizerKind::SGD);

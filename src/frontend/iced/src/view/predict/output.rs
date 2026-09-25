@@ -337,7 +337,7 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
-        let request = settings.take_request(false).unwrap();
+        let request = settings.take_request([true; 3]).unwrap();
         assert_eq!(request.updates.len(), 1);
         assert_eq!(
             request.updates[0],

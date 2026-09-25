@@ -384,7 +384,7 @@ mod tests {
                 value
             );
         }
-        assert_eq!(settings.take_request(false).unwrap().updates.len(), 1);
+        assert_eq!(settings.take_request([true; 3]).unwrap().updates.len(), 1);
     }
 
     #[test]

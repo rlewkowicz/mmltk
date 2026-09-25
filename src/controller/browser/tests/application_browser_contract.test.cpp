@@ -1174,6 +1174,36 @@ TEST_CASE("canonical recipe inheritance exposes complete flattened fields and di
  });
  CHECK(scopes == std::set<std::string>{"global.optimizer", "model.optimizer"});
 }
+TEST_CASE("reflected recipe overrides resolve and clear independently in each settings scope", "[controller][browser][reflection]") {
+ namespace r = mmltk::backend::models::rfdetr;
+ namespace reflection = mmltk::frameworks::reflection;
+ using Relation = reflection::catalog_provider_relation<r::TrainRecipeCatalog>;
+ relation_audit_test::RecipeScopes scopes;
+ scopes.global.optimizer = r::TrainOptimizerKind::SGD;
+ scopes.model.optimizer = r::TrainOptimizerKind::Muon;
+ r::resolve_train_recipe(scopes.global);
+ r::resolve_train_recipe(scopes.model);
+ const auto global = scopes.global;
+ const auto model = scopes.model;
+ Relation::VisitMembers([&]<class Entry>() {
+  constexpr auto path = reflection::reflected_member_path<r::TrainRecipeSettings, Entry::destination>();
+  CAPTURE(path.view());
+  auto& value = reflection::access<r::TrainRecipeSettings, Entry::destination>(scopes.model);
+  value = reflection::access<const r::TrainRecipeSettings, Entry::destination>(global);
+  Relation::template set_override<Entry::destination>(scopes.model.overrides);
+  r::resolve_train_recipe(scopes.model);
+  CHECK(value == reflection::access<const r::TrainRecipeSettings, Entry::destination>(global));
+  CHECK(Relation::template overridden<Entry::destination>(scopes.model.overrides));
+  CHECK(scopes.global == global);
+  Relation::template clear_override<Entry::destination>(scopes.model.overrides);
+  r::resolve_train_recipe(scopes.model);
+  CHECK(scopes.model == model);
+  CHECK_FALSE(Relation::template overridden<Entry::destination>(scopes.model.overrides));
+ });
+ r::reset_train_recipe(scopes.global);
+ CHECK(scopes.global == global);
+ CHECK(scopes.model == model);
+}
 TEST_CASE("custom model dialogs derive from the canonical compatibility catalog", "[controller][browser][reflection][dialog][model]") {
  const auto entries = services::file_dialog_catalog().entries();
  std::size_t row_index = 0U;

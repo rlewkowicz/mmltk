@@ -216,7 +216,7 @@ impl Router {
         settings: &mut crate::view::settings::Component,
         message: Message,
     ) -> Result<Option<Outcome>, String> {
-        settings.state_mut().execution_locked = [FeatureId::Train, FeatureId::Validate, FeatureId::Predict]
+        settings.state_mut().execution_edit_locked = [FeatureId::Train, FeatureId::Validate, FeatureId::Predict]
             .map(|feature| model.primary_action_active(feature));
         let outcome = match message {
             Message::Navigation(message) => match navigation::update(message) {
@@ -391,7 +391,7 @@ mod tests {
                     )
                 };
                 let before = settings.draft().cloned();
-                let queued = settings.state().clone().take_request(false);
+                let queued = settings.state().clone().take_request([true; 3]);
                 for (case, invalid) in inadmissible_model_dialogs(&dialog) {
                     model.file_dialog = invalid;
                     assert!(
@@ -399,7 +399,7 @@ mod tests {
                         "{workflow:?}: {case}"
                     );
                     assert_eq!(settings.draft(), before.as_ref(), "{case}");
-                    assert_eq!(settings.state().clone().take_request(false), queued, "{case}");
+                    assert_eq!(settings.state().clone().take_request([true; 3]), queued, "{case}");
                 }
                 model.file_dialog = Some(dialog.clone());
                 let outcome = router.update(&mut model, &mut settings, confirm()).unwrap();
@@ -423,7 +423,7 @@ mod tests {
                 assert_eq!(projection.selection.key.input, row.input);
                 assert_eq!(projection.selection.artifact, path);
                 let confirmed = settings.draft().cloned();
-                let edits = settings.state().clone().take_request(false);
+                let edits = settings.state().clone().take_request([true; 3]);
                 router
                     .update(
                         &mut model,
@@ -436,7 +436,7 @@ mod tests {
                 router.select(workflow);
                 assert!(router.update(&mut model, &mut settings, confirm()).is_err());
                 assert_eq!(settings.draft(), confirmed.as_ref());
-                assert_eq!(settings.state().clone().take_request(false), edits);
+                assert_eq!(settings.state().clone().take_request([true; 3]), edits);
                 for generation in [8, 1] {
                     if generation == 1 {
                         // A new transport resets the component's generation frontier.

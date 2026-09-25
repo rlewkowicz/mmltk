@@ -1355,7 +1355,7 @@ private:
   mmltk::frameworks::reflection::visit_materialized_members<Value>([&]<class Declaration>(const auto& fact) {
    using Member = typename Declaration::member_type;
    if constexpr (std::is_arithmetic_v<Member>) {
-    const auto function = "constraint_" + rust_identifier(owner + std::string(fact.member_name), false);
+    const auto function = "constraint_" + rust_relation_identifier(owner + std::string(fact.member_name));
     symbols_.Reserve("module", function, "native value constraint " + owner + "." + std::string(fact.member_name));
     output_ << "pub const fn " << function << "() -> SettingsLeafConstraint { SettingsLeafConstraint { stable_field_id: "
             << mmltk::controller::browser::application_stable_id(owner, fact.member_name) << ", ";
@@ -1672,6 +1672,29 @@ private:
   output_ << "}\npub fn reset_" << value_prefix << "(state: &mut " << value_type << ") {\n";
   visit_fields([&]<class Entry>(const auto&, const auto&, const auto& suffix) { output_ << "reset_" << suffix << "(state);\n"; });
   output_ << "}\n";
+  const std::string edit_type = value_type + "Edit";
+  constexpr auto selector_member = std::remove_cvref_t<decltype(Relation::destination_selector)>::terminal_member;
+  const auto selector_variant = rust_identifier(mmltk::frameworks::reflection::materialized_member_name<selector_member>(), true);
+  symbols_.Reserve("module", edit_type, source);
+  for (const auto& variant : {selector_variant, std::string("Clear"), std::string("Reset")}) symbols_.Reserve("enum " + edit_type, variant, source);
+  symbols_.Reserve("impl " + edit_type, "apply", source);
+  output_ << "#[derive(Debug, Clone, PartialEq)]\npub enum " << edit_type << " {\n"
+          << selector_variant << "(" << rust_type<SelectorValue>() << "),\n";
+  visit_fields([&]<class Entry>(const auto& path, const auto& variant, const auto&) {
+   using Field = mmltk::frameworks::reflection::accessor_value_t<typename Relation::destination_type, Entry::destination>;
+   symbols_.Reserve("enum " + edit_type, variant, source + " " + std::string(path.view()));
+   output_ << variant << "(" << rust_type<Field>() << "),\n";
+  });
+  output_ << "Clear(" << field_type << "), Reset,\n}\nimpl " << edit_type << " { pub fn apply(self, state: &mut " << value_type << ") { match self {\n"
+          << "Self::" << selector_variant << "(value) => select_" << value_prefix << "(state, value),\n";
+  visit_fields([&]<class Entry>(const auto&, const auto& variant, const auto& suffix) {
+   output_ << "Self::" << variant << "(value) => edit_" << suffix << "(state, value),\n";
+  });
+  output_ << "Self::Clear(field) => match field {\n";
+  visit_fields([&]<class Entry>(const auto&, const auto& variant, const auto& suffix) {
+   output_ << field_type << "::" << variant << " => reset_" << suffix << "(state),\n";
+  });
+  output_ << "}, Self::Reset => reset_" << value_prefix << "(state),\n} } }\n";
  }
  void EmitSettingsRelations() {
   ReserveGeneratedStruct("SettingsRelationFact", "canonical typed settings relations", {"stable_field_id", "source_path", "destination_path"});
@@ -1731,6 +1754,33 @@ private:
     output_ << "clear_relation_" << rust_identifier(path.view(), false) << "(state),\n";
    });
    output_ << "] }\n";
+   const std::string edit_type = rust_type<typename Relation::destination_type>() + "Edit";
+   const std::string field_type = rust_identifier(mmltk::frameworks::reflection::type_name<Provider>(), true) + "RelationField";
+   const std::string edit_function = "edit_relation_" + (parent.empty() ? value_prefix : rust_identifier(parent, false));
+   constexpr auto selector_member = std::remove_cvref_t<decltype(Relation::destination_selector)>::terminal_member;
+   const auto selector_variant = rust_identifier(mmltk::frameworks::reflection::materialized_member_name<selector_member>(), true);
+   symbols_.Reserve("module", edit_function, source);
+   output_ << "pub fn " << edit_function << "(state: &mut " << rust_type<Settings>() << ", edit: " << edit_type
+           << ") -> Vec<SettingsValueUpdate> { match edit {\n"
+           << edit_type << "::" << selector_variant << "(value) => { select_" << value_prefix << "(&mut state";
+   emit_rust_field_access(output_, parent);
+   output_ << ", value.clone()); vec![update_" << rust_identifier(selector.view(), false) << "(value)] },\n";
+   const auto visit_edits = [&]<class Visitor>(Visitor&& visitor) {
+    Relation::VisitMembers([&]<class Entry>() {
+     constexpr auto destination = mmltk::frameworks::reflection::rebase_member_path<Settings, typename Relation::destination_type>(Selector, Entry::destination);
+     constexpr auto path = mmltk::frameworks::reflection::reflected_member_path<Settings, destination>();
+     constexpr auto terminal = std::remove_cvref_t<decltype(Entry::destination)>::terminal_member;
+     visitor(rust_identifier(mmltk::frameworks::reflection::materialized_member_name<terminal>(), true), rust_identifier(path.view(), false));
+    });
+   };
+   visit_edits([&](const auto& variant, const auto& suffix) {
+    output_ << edit_type << "::" << variant << "(value) => vec![edit_relation_" << suffix << "(state, value)],\n";
+   });
+   output_ << edit_type << "::Clear(field) => vec![match field {\n";
+   visit_edits([&](const auto& variant, const auto& suffix) {
+    output_ << field_type << "::" << variant << " => clear_relation_" << suffix << "(state),\n";
+   });
+   output_ << "}], " << edit_type << "::Reset => " << reset << "(state).into(),\n} }\n";
   });
  }
  void EmitCatalogs() {

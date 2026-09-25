@@ -909,7 +909,7 @@ mod tests {
                 generation: 7,
             };
             let before = settings.draft.clone();
-            let queued = settings.clone().take_request(false);
+            let queued = settings.clone().take_request([true; 3]);
             for (case, invalid) in
                 crate::view_model::test_support::inadmissible_model_dialogs(&dialog)
             {
@@ -920,7 +920,7 @@ mod tests {
                     "{case}"
                 );
                 assert_eq!(settings.draft, before, "{case}");
-                assert_eq!(settings.clone().take_request(false), queued, "{case}");
+                assert_eq!(settings.clone().take_request([true; 3]), queued, "{case}");
                 assert_eq!(component.dismissed_dialog_generation, 0, "{case}");
             }
             // Unavailable settings must leave the selection available for retry.
@@ -931,7 +931,7 @@ mod tests {
                     .is_err()
             );
             assert_eq!(component.dismissed_dialog_generation, 0);
-            assert_eq!(settings.clone().take_request(false), queued);
+            assert_eq!(settings.clone().take_request([true; 3]), queued);
             settings.draft = before;
             let state = State::from_settings(
                 workflow,
@@ -950,7 +950,7 @@ mod tests {
                 Some(Outcome::ArtifactConfirmed(_))
             ));
             let confirmed = settings.draft.clone();
-            let edits = settings.clone().take_request(false);
+            let edits = settings.clone().take_request([true; 3]);
             component
                 .update(Message::CancelArtifact(3), Some(&dialog), &mut settings)
                 .unwrap();
@@ -962,7 +962,7 @@ mod tests {
             );
             assert_eq!(component.dismissed_dialog_generation, 7);
             assert_eq!(settings.draft, confirmed);
-            assert_eq!(settings.clone().take_request(false), edits);
+            assert_eq!(settings.clone().take_request([true; 3]), edits);
         }
     }
 

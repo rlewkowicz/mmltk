@@ -220,12 +220,12 @@ impl App {
         {
             return;
         }
-        let training_active = self.model.training_family_pending()
-            || self.model.workflow.training.as_ref().is_some_and(|state| state.activity != crate::generated::TrainingActivity::Idle);
-        self.settings.state_mut().execution_locked = [training_active,
-            self.model.primary_action_active(crate::generated::FeatureId::Validate),
-            self.model.primary_action_active(crate::generated::FeatureId::Predict)];
-        let Some(request) = self.settings.state_mut().take_request(training_active) else {
+        let submission_available = [
+            crate::generated::FeatureId::Train,
+            crate::generated::FeatureId::Validate,
+            crate::generated::FeatureId::Predict,
+        ].map(|feature| self.model.execution_edit_submission_available(feature));
+        let Some(request) = self.settings.state_mut().take_request(submission_available) else {
             return;
         };
         if !self.submit_intent(

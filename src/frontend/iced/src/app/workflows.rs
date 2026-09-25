@@ -366,6 +366,11 @@ impl App {
 
     pub(super) fn advance_start(&mut self) {
         self.advance_training_selection();
+        if self.model.workflow.pending_start.as_ref().is_some_and(|pending| {
+            matches!(pending.preparation, StartPreparation::Waiting | StartPreparation::ResumeQueued)
+        }) {
+            self.flush_settings_edits();
+        }
         let Some(pending) = self.model.workflow.pending_start.as_ref() else {
             return;
         };
@@ -2070,6 +2075,133 @@ mod tests {
         app.advance_start();
         next_intent(&mut capture, ApplicationIntentEndpoint::ModelSelect);
         assert!(capture.try_recv().is_err());
+    }
+
+    #[test]
+    fn queued_execution_edits_settle_before_each_start_even_with_an_update_in_flight() {
+        for feature in [FeatureId::Train, FeatureId::Validate, FeatureId::Predict] {
+            for earlier_update in [false, true] {
+                let (mut app, mut capture) = start_app();
+                app.workspace.select(feature);
+                let mut first = None;
+                if earlier_update {
+                    app.settings.state_mut().edit(EditCadence::Debounced, |draft| {
+                        crate::generated::edit_uidarkmode(draft, true)
+                    }).unwrap();
+                    app.flush_settings_edits();
+                    let saved = app.settings.draft().unwrap().clone();
+                    first = Some((next_intent(&mut capture, ApplicationIntentEndpoint::SettingsUpdate), saved));
+                }
+                app.settings.state_mut().edit(EditCadence::Debounced, |draft| match feature {
+                    FeatureId::Train => crate::generated::edit_workflowstrainrequestlanes(draft, 3),
+                    FeatureId::Validate => crate::generated::edit_workflowsvalidaterequestbatchsize(draft, 4),
+                    FeatureId::Predict => crate::generated::edit_workflowspredictrequestlanes(draft, 3),
+                    _ => unreachable!(),
+                }).unwrap();
+                let expected = app.settings.draft().unwrap().clone();
+                app.request_start(feature);
+                assert!(app.model.primary_action_active(feature));
+                assert!(app.model.execution_edit_submission_available(feature));
+                assert!(app.model.current_native_operation(feature).is_none());
+                // Widget locking during preparation cannot lock submission of queued edits.
+                app.settings.state_mut().execution_edit_locked = [true; 3];
+                if let Some((intent, state)) = first {
+                    assert!(capture.try_recv().is_err());
+                    let mut saved = app.model.settings_snapshot.clone().unwrap();
+                    saved.revision += 1;
+                    saved.settingsstate = state;
+                    app.model.project_settings_snapshot(saved.clone()).unwrap();
+                    app.advance_start();
+                    assert!(capture.try_recv().is_err());
+                    app.model.reduce_reply(intent.correlation, Ok(crate::generated::ApplicationReply::SettingsUpdate(saved)));
+                    app.settle_settings_reply(Some(ApplicationIntentEndpoint::SettingsUpdate), true, false);
+                }
+                let update = next_intent(&mut capture, ApplicationIntentEndpoint::SettingsUpdate);
+                let mut saved = app.model.settings_snapshot.clone().unwrap();
+                saved.revision += 1;
+                saved.settingsstate = expected;
+                app.model.project_settings_snapshot(saved.clone()).unwrap();
+                app.settings.install(&saved);
+                app.advance_start();
+                assert!(app.settings.state().update_in_flight());
+                assert!(capture.try_recv().is_err());
+                app.model.reduce_reply(update.correlation, Ok(crate::generated::ApplicationReply::SettingsUpdate(saved)));
+                app.settle_settings_reply(Some(ApplicationIntentEndpoint::SettingsUpdate), true, false);
+                app.advance_start();
+                let select = next_intent(&mut capture, ApplicationIntentEndpoint::ModelSelect);
+                let accepted = accepted_model_for(&app.model, app.settings.draft().unwrap(), feature);
+                app.model.reduce_reply(select.correlation, Ok(crate::generated::ApplicationReply::ModelSelect(accepted)));
+                app.advance_start();
+                let endpoint = match feature {
+                    FeatureId::Train => ApplicationIntentEndpoint::TrainingStart,
+                    FeatureId::Validate => ApplicationIntentEndpoint::ValidationStart,
+                    FeatureId::Predict => ApplicationIntentEndpoint::PredictStart,
+                    _ => unreachable!(),
+                };
+                next_intent(&mut capture, endpoint);
+                assert!(!app.model.execution_edit_submission_available(feature));
+                assert!(!app.settings.has_local_edits());
+                assert!(capture.try_recv().is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn queued_training_preflight_resumes_submission_after_history_settlement() {
+        for endpoint in [ApplicationIntentEndpoint::TrainingOpenRun, ApplicationIntentEndpoint::TrainingHistory] {
+            let (mut app, mut capture) = start_app();
+            let history = app.model.begin_intent(endpoint).unwrap();
+            app.settings.state_mut().edit(EditCadence::Debounced, |draft| {
+                crate::generated::edit_workflowstrainrequestlanes(draft, 3)
+            }).unwrap();
+            app.request_start(FeatureId::Train);
+            assert!(app.model.primary_action_active(FeatureId::Train));
+            assert!(capture.try_recv().is_err());
+            assert!(!app.settings.state().update_in_flight());
+            app.model.abandon_intent(history);
+            app.advance_start();
+            next_intent(&mut capture, ApplicationIntentEndpoint::SettingsUpdate);
+            assert!(app.settings.state().update_in_flight());
+            assert!(capture.try_recv().is_err());
+        }
+    }
+
+    #[test]
+    fn cancelled_or_disconnected_preflight_never_launches_after_settings_settle() {
+        for feature in [FeatureId::Train, FeatureId::Validate, FeatureId::Predict] {
+            for disconnect in [false, true] {
+                let (mut app, mut capture) = start_app();
+                app.workspace.select(feature);
+                app.settings.state_mut().edit(EditCadence::Debounced, |draft| match feature {
+                    FeatureId::Train => crate::generated::edit_workflowstrainrequestbatchsize(draft, 3),
+                    FeatureId::Validate => crate::generated::edit_workflowsvalidaterequestlanes(draft, 3),
+                    FeatureId::Predict => crate::generated::edit_workflowspredictrequestlanes(draft, 3),
+                    _ => unreachable!(),
+                }).unwrap();
+                app.request_start(feature);
+                let intent = next_intent(&mut capture, ApplicationIntentEndpoint::SettingsUpdate);
+                let mut saved = app.model.settings_snapshot.clone().unwrap();
+                saved.revision += 1;
+                saved.settingsstate = app.settings.draft().unwrap().clone();
+                if disconnect {
+                    drop(app.on_transport(TransportEvent::Disconnected("peer lost".into())));
+                    assert!(!app.settings.has_local_edits());
+                } else {
+                    let stop = match feature {
+                        FeatureId::Train => ApplicationIntentEndpoint::TrainingStop,
+                        FeatureId::Validate => ApplicationIntentEndpoint::ValidationStop,
+                        FeatureId::Predict => ApplicationIntentEndpoint::PredictStop,
+                        _ => unreachable!(),
+                    };
+                    assert!(!app.guard_compute_stop(feature, stop));
+                    app.model.reduce_reply(intent.correlation, Ok(crate::generated::ApplicationReply::SettingsUpdate(saved)));
+                    app.settle_settings_reply(Some(ApplicationIntentEndpoint::SettingsUpdate), true, false);
+                }
+                app.advance_start();
+                assert!(app.model.workflow.pending_start.is_none());
+                assert!(capture.try_recv().is_err());
+            }
+        }
     }
 
     #[test]

@@ -181,7 +181,45 @@ impl ApplicationModel {
             && !self.has_system_pending(crate::generated::application_intent_system(start))
     }
 
-    /// Only explicitly accepted execution owns the primary Stop presentation.
+    /// Native activity is independent of preparation and submitted intent settlement.
+    pub fn current_native_operation(&self, page: FeatureId) -> Option<&ComputeUiState> {
+        if self.connection != ConnectionState::Connected { return None; }
+        let operation = match page {
+            FeatureId::Train => &self.workflow.training.as_ref()?.local,
+            FeatureId::Validate => &self.workflow.validation.as_ref()?.operation,
+            FeatureId::Predict => &self.predict_snapshot.as_ref()?.operation,
+            FeatureId::Export => self.workflow.export.as_ref()?,
+            _ => return None,
+        };
+        operation.active.then_some(operation)
+    }
+
+    /// Queued preflight edits may settle until native execution owns the request.
+    pub fn execution_edit_submission_available(&self, page: FeatureId) -> bool {
+        let (start, stop) = match page {
+            FeatureId::Train => {
+                return !self.training_family_pending()
+                    && self.workflow.training.as_ref().is_some_and(|state| {
+                        state.activity == crate::generated::TrainingActivity::Idle
+                            && !state.local.active
+                    });
+            }
+            FeatureId::Validate => (
+                ApplicationIntentEndpoint::ValidationStart,
+                ApplicationIntentEndpoint::ValidationStop,
+            ),
+            FeatureId::Predict => (
+                ApplicationIntentEndpoint::PredictStart,
+                ApplicationIntentEndpoint::PredictStop,
+            ),
+            _ => return false,
+        };
+        self.current_native_operation(page).is_none()
+            && !self.has_pending(start)
+            && !self.has_pending(stop)
+    }
+
+    /// Preparation and accepted execution both own the primary Stop presentation.
     pub fn primary_action_active(&self, page: FeatureId) -> bool {
         if self.connection != ConnectionState::Connected {
             return false;
@@ -694,6 +732,48 @@ mod tests {
                 model.abandon_intent(pending);
                 assert!(!model.primary_action_active(page));
             }
+        }
+    }
+
+    #[test]
+    fn execution_submission_retains_training_capability_guards_and_native_activity() {
+        let mut model = bootstrapped();
+        for endpoint in [ApplicationIntentEndpoint::TrainingInspectCheckpoint,
+            ApplicationIntentEndpoint::TrainingPrepareResume, ApplicationIntentEndpoint::TrainingResume,
+            ApplicationIntentEndpoint::TrainingQuery, ApplicationIntentEndpoint::TrainingOpenRun,
+            ApplicationIntentEndpoint::TrainingHistory] {
+            let correlation = model.begin_intent(endpoint).unwrap();
+            assert!(!model.execution_edit_submission_available(FeatureId::Train));
+            assert!(model.current_native_operation(FeatureId::Train).is_none());
+            assert!(model.execution_edit_submission_available(FeatureId::Validate));
+            model.abandon_intent(correlation);
+        }
+        for activity in [crate::generated::TrainingActivity::ProviderQuery, crate::generated::TrainingActivity::Remote] {
+            model.workflow.training.as_mut().unwrap().activity = activity;
+            assert!(!model.execution_edit_submission_available(FeatureId::Train));
+            assert!(!model.primary_action_active(FeatureId::Train));
+        }
+        model.workflow.training.as_mut().unwrap().activity = crate::generated::TrainingActivity::Idle;
+        assert!(model.execution_edit_submission_available(FeatureId::Train));
+        for (feature, start, stop) in [
+            (FeatureId::Validate, ApplicationIntentEndpoint::ValidationStart, ApplicationIntentEndpoint::ValidationStop),
+            (FeatureId::Predict, ApplicationIntentEndpoint::PredictStart, ApplicationIntentEndpoint::PredictStop),
+        ] {
+            for endpoint in [start, stop] {
+                let correlation = model.begin_intent(endpoint).unwrap();
+                assert!(!model.execution_edit_submission_available(feature));
+                assert!(model.current_native_operation(feature).is_none());
+                model.abandon_intent(correlation);
+            }
+            let operation = match feature {
+                FeatureId::Validate => &mut model.workflow.validation.as_mut().unwrap().operation,
+                FeatureId::Predict => &mut model.predict_snapshot.as_mut().unwrap().operation,
+                _ => unreachable!(),
+            };
+            operation.active = true;
+            operation.terminal.outcome = ComputeOperationOutcome::CancellationRequested;
+            assert!(!model.execution_edit_submission_available(feature));
+            assert!(model.current_native_operation(feature).is_some());
         }
     }
 
