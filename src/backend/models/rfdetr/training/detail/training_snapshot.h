@@ -28,18 +28,40 @@ struct ResumeState {
 ModelStateLoadSummary load_training_model_weights(NativeRfDetrModel&, const DecodedNativeModelState&, TrainingSupervisionRoute);
 ResumeState load_resume_checkpoint_state(const std::filesystem::path&, const DecodedNativeModelState&, const detail::TrainingContinuation&, NativeOptimizer&,
  const std::vector<std::string>&, const std::vector<torch::Tensor>&, std::span<const std::uint8_t> active = {});
+class TrainingSnapshot;
+namespace testsupport { struct TrainingSnapshotTestAccess; }
+// A borrowed scope, never another tensor owner. Its snapshot must outlive it.
+class TrainingSnapshotPublication final {
+public:
+ ~TrainingSnapshotPublication() noexcept;
+ TrainingSnapshotPublication(TrainingSnapshotPublication&&) noexcept;
+ TrainingSnapshotPublication(const TrainingSnapshotPublication&) = delete;
+ TrainingSnapshotPublication& operator=(const TrainingSnapshotPublication&) = delete;
+ // Normal completion propagates settlement/retained-reader failures. Unwinding
+ // preserves the first error and keeps failed snapshot admission sealed.
+ void finish();
+private:
+ explicit TrainingSnapshotPublication(TrainingSnapshot& snapshot) : snapshot_(&snapshot) {}
+ TrainingSnapshot* snapshot_;
+ friend class TrainingSnapshot;
+};
 class TrainingSnapshot final {
 public:
- void begin(const NativeRfDetrModel& model);
- void prepare_ema(const std::vector<std::string>& names, const ModelEma* ema);
+ [[nodiscard]] TrainingSnapshotPublication begin(std::span<const NormalizedModelStateEntry> ordinary, const std::vector<std::string>& names, const ModelEma*);
+ void require_inactive() const;
  void save_weights(const std::filesystem::path&, const NativeCheckpointMetadata&, bool selected, const std::filesystem::path&);
  void save_resume(const std::filesystem::path&, const NativeCheckpointMetadata&, const NativeOptimizer&, const GradScaler&, const TrainRequest&, int epoch,
   int64_t ema_completed_updates, std::string_view attempt_id, const std::filesystem::path& descriptor, detail::TrainingContinuationValues& continuation);
- void release();
 
 private:
+ friend class TrainingSnapshotPublication;
+ friend struct testsupport::TrainingSnapshotTestAccess;
+ void require_active() const;
+ void release();
  mmltk::backend::ml::cuda::TensorReadbackBuffers readback_;
  std::vector<NormalizedModelStateEntry> ordinary_;
  std::vector<NormalizedModelStateEntry> ema_;
+ const NativeOptimizer* optimizer_ = nullptr;
+ bool active_ = false;
 };
 }  // namespace mmltk::backend::models::rfdetr

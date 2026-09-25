@@ -82,6 +82,55 @@ TEST_CASE("serialization slots retain simultaneous exact GPU extents and reuse c
  readback.ReleaseSettled();
  REQUIRE(readback.capacity_bytes() == 0);
 }
+TEST_CASE("freezing CPU readback owns values through readers and reuses released storage", "[readback][cpu]") {
+ mmltk::backend::ml::cuda::TensorReadbackBuffers readback;
+ auto source = at::arange(12, at::kFloat).reshape({3, 4}).transpose(0, 1);
+ const auto expected = source.clone();
+ readback.Begin();
+ readback.Reserve(std::array{source});
+ readback.Freeze();
+ auto view = readback.Stage(0);
+ auto detached = view.detach();
+ const auto* address = view.const_data_ptr();
+ source.fill_(9);
+ readback.Freeze();
+ REQUIRE(at::equal(view, expected));
+ REQUIRE(view.is_contiguous());
+ REQUIRE_THROWS(readback.Release());
+ view = at::Tensor{};
+ REQUIRE_THROWS(readback.Release());
+ detached = at::Tensor{};
+ readback.Release();
+ readback.Begin();
+ readback.Reserve(std::array{source});
+ readback.Freeze();
+ {
+  const auto changed = readback.Stage(0);
+  REQUIRE(changed.const_data_ptr() == address);
+  REQUIRE(at::equal(changed, source));
+ }
+ readback.Release();
+ readback.Begin();
+ readback.Reserve(std::array{source.narrow(0, 0, 1)});
+ readback.Freeze();
+ {
+  const auto smaller = readback.Stage(0);
+  REQUIRE(smaller.storage().nbytes() == smaller.nbytes());
+  REQUIRE(at::equal(smaller, source.narrow(0, 0, 1)));
+ }
+ readback.ReleaseSettled();
+ REQUIRE_THROWS(readback.Freeze());
+ // Already immutable CPU inputs still use the ordinary borrowed fast path.
+ readback.Begin();
+ const auto immutable = source.contiguous();
+ readback.Reserve(std::array{immutable});
+ {
+  const auto borrowed = readback.Stage(0);
+  REQUIRE(borrowed.const_data_ptr() == immutable.const_data_ptr());
+  REQUIRE_THROWS(readback.Freeze());
+ }
+ readback.Release();
+}
 namespace {
 thread_local bool reject_completion = false;
 thread_local int remaining_copies = -1;

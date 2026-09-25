@@ -1,4 +1,10 @@
 #include "detail/training_model.h"
+#include "detail/training_snapshot.h"
+#include "detail/training_data_plan.h"
+#include "detail/training_distributed.h"
+#include "detail/evaluation_runtime.h"
+#include "detail/native_optimizer_private.h"
+#include "src/backend/data/dataset_loader.h"
 #include "detail/training_lanes.h"
 #include "detail/training_gradient_reducer.h"
 #include "detail/training_metrics.h"
@@ -34,6 +40,10 @@ struct TrainingModel::Impl final {
     scaler(precision.autocast_dtype == torch::kFloat16), donors(options.lane_configuration.mode == TrainLaneMode::SharedGradients ? options.lanes : 1, options.batch_size),
     epoch_policy(options.unfreeze_encoder_last_epochs, options.disable_augmentation_last_epochs), metrics(options.device_id),
     augmentation_context(options.device_id, mmltk::frameworks::gpu::cuda_image_copy_backend(), mmltk::frameworks::gpu::DeviceContextMode::PrimaryInterop) {
+  if (distributed.rank == 0) mmltk::common::logging::warn([&](auto& logger) {
+   if (options.recipe.optimizer == TrainOptimizerKind::Muon && options.fused_optimizer)
+    logger.warn("rfdetr train runtime: model={} optimizer=muon ignores --fused-optimizer and runs with the eager backend only", shard.model_id);
+  });
   options.fused_optimizer = precision.fused_optimizer;
   owner->train();
   for (auto& item : owner->named_parameters(true)) if (options.freeze_encoder && is_encoder_param(item.key())) item.value().set_requires_grad(false);
@@ -92,6 +102,7 @@ TrainingModel::TrainingModel(TrainRequest request, std::size_t index, RuntimeCon
 TrainingModel::~TrainingModel() = default;
 void TrainingModel::stage_resume(const DecodedNativeModelState& state, const detail::TrainingContinuation& saved) {
  auto& p = *impl_;
+ p.snapshot.require_inactive();
  detail::require_active_training_continuation(saved, p.options);
  if (saved.values.data.model_id != p.shard.model_id || saved.values.data.plan_hash != p.data_plan.hash()) throw std::invalid_argument("resume model/data identity differs");
  p.donors.restore(*p.loader, saved.values.data.donors);
@@ -104,6 +115,11 @@ void TrainingModel::stage_resume(const DecodedNativeModelState& state, const det
   active.push_back(optimizer.eligible_parameters()[i].requires_grad() || (saved.values.epoch_policy.encoder_unfrozen && is_encoder_param(optimizer.eligible_parameter_names()[i])));
  p.staged_model = p.owner->stage_normalized_state(state.entries(), detail::NormalizedModelStateAdmission::Exact);
  p.staged_resume = load_resume_checkpoint_state({}, state, saved, p.optimizer_build.optimizer, optimizer.eligible_parameter_names(), optimizer.eligible_parameters(), active);
+ if (p.distributed.rank == 0) mmltk::common::logging::info([&](auto& logger) {
+  const auto& loaded = p.staged_model->summary;
+  logger.info("rfdetr resume weights: model={} loaded={} missing={} unexpected={} incompatible={} input={}", p.shard.model_id, loaded.loaded_names.size(),
+   loaded.missing_names.size(), loaded.unexpected_names.size(), loaded.incompatible_names.size(), state.class_artifact->artifact_path().string());
+ });
  p.staged_resume->optimizer_candidate->admit_continuation(saved.values.schedule);
  if (p.options.use_ema && static_cast<std::uint64_t>(saved.values.ema_completed_updates) != saved.values.schedule.consumed_attempts)
   throw std::invalid_argument("saved EMA age differs from consumed model attempts");
@@ -121,6 +137,7 @@ void TrainingModel::stage_resume(const DecodedNativeModelState& state, const det
 }
 void TrainingModel::commit_resume() {
  auto& p = *impl_;
+ p.snapshot.require_inactive();
  if (!p.staged_resume || !p.staged_model) return;
  p.owner->commit_normalized_state(std::move(*p.staged_model));
  broadcast_training_model(p.distributed, *p.owner);
@@ -137,10 +154,16 @@ void TrainingModel::commit_resume() {
 }
 void TrainingModel::start(std::shared_ptr<mmltk::common::concurrency::WorkerPool> workers) {
  auto& p = *impl_;
+ p.snapshot.require_inactive();
  if (p.staged_resume) throw std::logic_error("trajectory cannot start before complete session admission");
  if (!p.ema && p.options.use_ema) p.ema.emplace(p.optimizer_build.optimizer.eligible_parameters(), p.options.ema_decay, p.options.ema_tau);
  if (p.ema) broadcast_training_tensors(p.distributed, p.ema->shadow_params());
  agree_training_text(p.distributed, "trajectory-precision", std::string(p.optimizer_build.optimizer.backend_name()) + ":" + std::to_string(static_cast<int>(p.precision.autocast_dtype)) + ":" + std::to_string(p.scaler.current_scale()));
+ if (p.distributed.rank == 0) mmltk::common::logging::info([&](auto& logger) {
+  logger.info("rfdetr train model runtime: model={} autocast={} optimizer={} optimizer_backend={} scaler={} scaler_scale={} scaler_growth_tracker={} effective_batch_per_model={}",
+   p.shard.model_id, evaluation_precision_name(p.precision.autocast_dtype), p.optimizer_build.optimizer.kind_name(), p.optimizer_build.optimizer.backend_name(),
+   p.scaler.enabled() ? "on" : "off", p.scaler.current_scale(), p.scaler.growth_tracker(), p.continuation.execution.effective_batch_per_model);
+ });
  ensure_train_lane_model_supported(*p.owner, p.runtime.split().lane_threads);
  p.lanes = std::make_unique<TrainingLanes>(p.options, p.runtime, *p.loader, p.owner, p.optimizer_build.optimizer.parameter_names(), p.runtime.split().lane_threads, p.rank_slice.count, p.augmentation_context,
   [&p](std::exception_ptr failure) { p.failure(p.shard.model_id, std::move(failure)); }, std::move(workers));
@@ -150,6 +173,7 @@ void TrainingModel::start(std::shared_ptr<mmltk::common::concurrency::WorkerPool
 }
 void TrainingModel::begin_epoch(std::uint64_t epoch, TrainingEpochDraws draws) {
  auto& p = *impl_;
+ p.snapshot.require_inactive();
  p.epoch = epoch; p.draws = std::move(draws); p.epoch_closed = false;
  const auto previous = p.epoch_policy.state();
  const auto policy = p.epoch_policy.enter(epoch, p.options.epochs);
@@ -181,6 +205,7 @@ bool TrainingModel::exhausted() const { return impl_->cursor == impl_->draws.mic
 std::uint64_t TrainingModel::attempt() {
  auto& p = *impl_;
  try {
+ p.snapshot.require_inactive();
  if (exhausted()) return 0;
  auto& optimizer = p.optimizer_build.optimizer;
  p.reducer->begin_attempt(p.contributions); p.metrics.begin_attempt(p.contributions);
@@ -262,12 +287,20 @@ std::uint64_t TrainingModel::attempt() {
 void TrainingModel::end_epoch() {
  mmltk::common::logging::ScopedProfile profile_drain{"rfdetr.train.drain_loader"};
  auto& p = *impl_;
+ p.snapshot.require_inactive();
  if (!exhausted() || p.cursor == 0 || p.cursor % p.contributions) throw std::logic_error("incomplete training epoch");
  mmltk::backend::data::Batch batch{};
  while (p.loader->next_batch(batch)) p.loader->release_batch(batch);
  p.lanes->settle_targets();
  p.epoch_closed = true;
  p.continuation.data.epoch = p.epoch + 1; p.continuation.data.next_microbatch = 0;
+}
+TrainingSnapshotPublication TrainingModel::begin_publication() {
+ auto& p = *impl_;
+ p.snapshot.require_inactive();
+ p.continuation.schedule = p.clock->state(); p.continuation.epoch_policy = p.epoch_policy.state();
+ p.continuation.epoch_metrics = p.metrics.state(); p.continuation.data.donors = p.donors.state();
+ return p.snapshot.begin(p.ordinary, p.optimizer_build.optimizer.eligible_parameter_names(), p.ema ? &*p.ema : nullptr);
 }
 TrainingMetricProgress TrainingModel::progress(TrainingPhase phase) const {
  const auto& p = *impl_;
@@ -313,8 +346,7 @@ TrainingArtifactCandidate TrainingModel::save_candidate(const NativeCheckpointMe
  value.session_id = session; value.model_id = p.shard.model_id; value.initialization = initialization; value.configuration = configuration; value.validation = validation;
  value.epoch = p.epoch; value.attempt = p.clock->state().consumed_attempts; value.merge = merge; value.weights = weights; value.selection_metric = metric; value.evaluation = summary;
  value.path = std::filesystem::absolute(directory) / ("model-" + std::to_string(value.model_id) + "-epoch-" + std::to_string(value.epoch) + "-" + (weights == EvaluatedWeights::Ema ? "ema-" : "ordinary-") + training_artifact_identity() + ".pt");
- p.snapshot.begin(*p.owner); p.snapshot.prepare_ema(p.optimizer_build.optimizer.eligible_parameter_names(), weights == EvaluatedWeights::Ema ? &*p.ema : nullptr);
- p.snapshot.save_weights(value.path, metadata, weights == EvaluatedWeights::Ema, p.options.class_layout_path); p.snapshot.release();
+ p.snapshot.save_weights(value.path, metadata, weights == EvaluatedWeights::Ema, p.options.class_layout_path);
  auto admission = std::make_shared<TrainingArtifactAdmission>(value.path);
  value = admission->describe(std::move(value));
  admission->release_decoded_state();
@@ -327,24 +359,18 @@ void TrainingModel::remember_candidate(TrainingArtifactCandidate value) {
 }
 void TrainingModel::save_ordinary_epoch(const NativeCheckpointMetadata& metadata, const std::filesystem::path& directory) {
  auto& p = *impl_;
- p.snapshot.begin(*p.owner);
  p.snapshot.save_weights(directory / ("model-" + std::to_string(id()) + "-epoch-" + std::to_string(p.epoch) + "-ordinary-" + training_artifact_identity() + ".pt"), metadata, false, p.options.class_layout_path);
- p.snapshot.release();
 }
 const std::optional<TrainingArtifactCandidate>& TrainingModel::best() const { return impl_->best; }
 void TrainingModel::save_resume(const std::filesystem::path& path, const NativeCheckpointMetadata& metadata, std::string_view attempt, const std::filesystem::path& original_descriptor) {
  mmltk::common::logging::ScopedProfile profile_resume{"rfdetr.train.save.resume"};
  auto& p = *impl_;
- p.continuation.schedule = p.clock->state(); p.continuation.epoch_policy = p.epoch_policy.state();
- p.continuation.epoch_metrics = p.metrics.state(); p.continuation.data.donors = p.donors.state();
- p.snapshot.begin(*p.owner); p.snapshot.prepare_ema(p.optimizer_build.optimizer.eligible_parameter_names(), p.ema ? &*p.ema : nullptr);
  p.snapshot.save_resume(path, metadata, p.optimizer_build.optimizer, p.scaler, p.options, p.epoch, p.ema ? p.ema->completed_updates() : 0,
   attempt, original_descriptor, p.continuation);
- p.snapshot.release();
 }
-NativeRfDetrModel& TrainingModel::model() { return *impl_->owner; }
+NativeRfDetrModel& TrainingModel::model() { impl_->snapshot.require_inactive(); return *impl_->owner; }
 const std::vector<NormalizedModelStateEntry>& TrainingModel::ordinary() const { return impl_->ordinary; }
 std::uint64_t TrainingModel::id() const { return impl_->shard.model_id; }
 const TrainingScheduleState& TrainingModel::schedule() const { return impl_->clock->state(); }
-void TrainingModel::ordinary_changed() { ++impl_->parameter_version; }
+void TrainingModel::ordinary_changed() { impl_->snapshot.require_inactive(); ++impl_->parameter_version; }
 }  // namespace mmltk::backend::models::rfdetr

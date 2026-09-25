@@ -6,17 +6,25 @@
 #include <string_view>
 #include <functional>
 #include <exception>
-#include "src/common/concurrency/worker_pool.h"
 #include <optional>
-#include <string>
 #include <vector>
-#include "training_data_plan.h"
 #include "training_artifact.h"
-#include "training_distributed.h"
-#include "training_snapshot.h"
-#include "evaluation_runtime.h"
 #include "src/backend/models/rfdetr/contract/training_metrics.h"
+namespace mmltk::common::concurrency { class WorkerPool; }
+namespace mmltk::backend::data { class DatasetLoader; }
 namespace mmltk::backend::models::rfdetr {
+class RuntimeContext;
+class NativeRfDetrModel;
+class TrainingDataPlan;
+class TrainingValidationRuntime;
+class TrainingSnapshotPublication;
+struct DistributedContext;
+struct TrainingPrecision;
+struct DetectionConfig;
+struct TrainingEpochDraws;
+struct TrainingScheduleState;
+struct EvalPassResult;
+namespace detail { struct TrainingContinuation; }
 // One trajectory owns all mutable training state. The session grants this owner
 // a complete communication turn; no trajectory creates its own ordering protocol.
 class TrainingModel final {
@@ -35,6 +43,9 @@ public:
  // contributes zero merge weight. The return boundary is physically drained.
  [[nodiscard]] std::uint64_t attempt();
  void end_epoch();
+ // Starts after attempts/merges drain and lives through the session's last
+ // synchronous archive callback. Temporary EMA evaluation uses frozen values.
+ [[nodiscard]] TrainingSnapshotPublication begin_publication();
  [[nodiscard]] TrainingMetricProgress progress(TrainingPhase) const;
  [[nodiscard]] EvalPassResult evaluate(TrainingValidationRuntime&, EvaluatedWeights);
  [[nodiscard]] TrainingArtifactCandidate save_candidate(const NativeCheckpointMetadata&, const std::filesystem::path&, std::string_view session,

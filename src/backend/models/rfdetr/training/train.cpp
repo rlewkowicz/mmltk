@@ -28,6 +28,7 @@
 #include "src/frameworks/serialization/reflected_json.h"
 #include <torch/types.h>
 #include <torch/utils.h>
+#include <torch/version.h>
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -360,10 +361,29 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
  common->to(mmltk::backend::ml::cuda::cuda_device(options.device_id));
  if (!resumed) {
   const auto loaded = load_training_model_weights(*common, transferred->model_state, supervision_route(options.training_supervision));
-  mmltk::common::logging::info([&](auto& logger) { logger.info("RF-DETR loaded {} parameters from {}", loaded.loaded_names.size(), source_checkpoint.string()); });
+  if (main_process) {
+   mmltk::common::logging::info([&](auto& logger) {
+    logger.info("rfdetr weights: loaded={} missing={} unexpected={} incompatible={} input={}", loaded.loaded_names.size(), loaded.missing_names.size(),
+     loaded.unexpected_names.size(), loaded.incompatible_names.size(), source_checkpoint.string());
+   });
+   mmltk::common::logging::warn([&](auto& logger) {
+    for (const auto& name : loaded.missing_names) logger.warn("  missing: {}", name);
+    for (const auto& name : loaded.unexpected_names) logger.warn("  unexpected: {}", name);
+   });
+  }
  }
  broadcast_training_model(distributed, *common);
  const auto precision = agree_training_precision(distributed, options.device_id, options.amp, options.fused_optimizer);
+ if (main_process) mmltk::common::logging::info([&](auto& logger) {
+  logger.info("rfdetr train session runtime: torch={} autocast={} models={} logical_train_lanes={} admitted_train_workers={} requested_validation_lanes={} admitted_validation_lanes={} "
+   "loader_threads={} gather_threads={} cpu_threads={} global_microbatch_images={} microbatches_per_model_attempt={} effective_batch_per_model={} aggregate_round_images={} "
+   "train_max_instances={} val_max_instances={} test_max_instances={} query_source={} num_queries={} automatic_query_cap={} query_override={}",
+   TORCH_VERSION, evaluation_precision_name(precision.autocast_dtype), data_plan.shards().size(), options.lanes, train_lane_count, options.validation_lanes, 1,
+   train_runtime.split().loader_threads, train_runtime.split().gather_threads, train_runtime.split().cpu_threads, options.batch_size,
+   execution_facts.microbatches_per_attempt, execution_facts.effective_batch_per_model, execution_facts.aggregate_round_images,
+   dataset_limits.train_max_instances, dataset_limits.val_max_instances, dataset_limits.test_max_instances.value_or(0U), dataset_limits.query_source,
+   dataset_limits.resolved_num_queries, dataset_limits.automatic_num_queries_cap, dataset_limits.requested_override ? "true" : "false");
+ });
  const auto precision_kind = precision.autocast_dtype == torch::kFloat16 ? TrainingPrecisionKind::Float16 : precision.autocast_dtype == torch::kBFloat16 ? TrainingPrecisionKind::BFloat16 : TrainingPrecisionKind::Float32;
  if (resumed && resumed->manifest().precision != precision_kind) throw std::runtime_error("Resume precision is incompatible with saved optimizer/scaler state");
  const auto share_identity = [&](std::string value, std::size_t bytes) {
@@ -547,9 +567,14 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
    merge(TrainingMergeBoundary::Epoch);
    distributed_barrier(distributed);
    if (main_process) {
+    // These borrowed scopes finish after every archive callback. If validation
+    // or publication throws, they release before any trajectory is destroyed.
+    std::vector<TrainingSnapshotPublication> publications;
+    publications.reserve(models.size());
     std::optional<TrainingArtifactCandidate> synchronized;
     for (auto& model : models) {
      active_model = model->id();
+     publications.push_back(model->begin_publication());
      if (!periodic && options.use_ema) model->save_ordinary_epoch(metadata, options.output_dir);
      if (!periodic || !synchronized) {
       const auto kind = !periodic && options.use_ema ? EvaluatedWeights::Ema : EvaluatedWeights::Ordinary;
@@ -585,6 +610,7 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
     checkpoint->publish(session, immutable_plan, [&](const std::filesystem::path& destination, std::size_t index) {
      models[index]->save_resume(destination, metadata, session.attempt_id, original_descriptor);
     }, candidate_admissions);
+    for (auto& publication : publications) publication.finish();
     last_checkpoint_path = checkpoint->path();
     latest = {}; latest.phase = TrainingPhase::EpochComplete; latest.epoch = epoch; latest.total_epochs = options.epochs; latest.session_id = session.session_id;
     latest.full_checkpoint_path = last_checkpoint_path; latest.scope = TrainingRecordScope::Session; latest.model_id = 0;

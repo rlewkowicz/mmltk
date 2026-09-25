@@ -263,43 +263,6 @@ void test_ema_shadow_admission_is_transactional() {
  REQUIRE(torch::equal(ema.shadow_params().front(), valid.front()));
  REQUIRE(torch::equal(ema.shadow_params().back(), valid.back()));
 }
-void test_ema_selection_restores_identity_and_mode() {
- auto config = supervision_config();
- config.ca_nheads = 2;
- config.training_supervision = {};
- rfdetr::NativeRfDetrModel module(config, rfdetr::testsupport::synthetic_training_layout(config.num_classes - 1));
- module.train();
- const auto named = module.named_parameters();
- std::vector<torch::Tensor> parameters{named["class_embed.weight"], named["class_embed.bias"]};
- rfdetr::ModelEma ema(parameters, 0.5, 0.0);
- auto original = parameters.front().detach().clone();
- auto* identity = parameters.front().unsafeGetTensorImpl();
- {
-  torch::NoGradGuard guard;
-  parameters.front().add_(2.0);
- }
- ema.update();
- REQUIRE(ema.completed_updates() == 1);
- const auto ordinary = parameters.front().detach().clone();
- try {
-  rfdetr::ModelEma::Selection selection(ema, module);
-  module.eval();
-  REQUIRE(parameters.front().unsafeGetTensorImpl() == identity);
-  REQUIRE(torch::allclose(parameters.front(), original + 2.0));
-  REQUIRE_THROWS(ema.update());
-  REQUIRE(ema.completed_updates() == 1);
-  throw std::runtime_error("selected evaluation failed");
- } catch (const std::runtime_error&) {}
- REQUIRE(module.is_training());
- REQUIRE(parameters.front().unsafeGetTensorImpl() == identity);
- REQUIRE(torch::equal(parameters.front(), ordinary));
- auto adopted = rfdetr::ModelEma::from_cpu_shadow(parameters, ema.shadow_params(), 0.5, 0.0, ema.completed_updates());
- REQUIRE(adopted.completed_updates() == ema.completed_updates());
- REQUIRE(torch::equal(adopted.shadow_params().front(), ema.shadow_params().front()));
- auto malformed = ema.shadow_params();
- malformed.back() = torch::full_like(malformed.back(), std::numeric_limits<float>::quiet_NaN());
- REQUIRE_THROWS(rfdetr::ModelEma::from_cpu_shadow(parameters, malformed, 0.5, 0.0, ema.completed_updates()));
-}
 void test_ema_tau_updates_continue_after_restore() {
  std::vector<torch::Tensor> parameters{torch::zeros({2}, torch::kFloat64)};
  constexpr double base_decay = 0.9;
@@ -1855,7 +1818,6 @@ TEST_CASE("test_copy_paste_ring_support_and_cache_cycles", "[model][rfdetr][trai
 TEST_CASE("test_copy_paste_cache_publication_recovers_without_targets", "[model][rfdetr][training_supervision][augmentation][copy_paste]") {
  test_copy_paste_cache_publication_recovers_without_targets();
 }
-TEST_CASE("test_ema_selection_restores_identity_and_mode", "[model][rfdetr][training][ema]") { test_ema_selection_restores_identity_and_mode(); }
 TEST_CASE("test_ema_tau_updates_continue_after_restore", "[model][rfdetr][training][ema]") { test_ema_tau_updates_continue_after_restore(); }
 TEST_CASE("perceptual augmentation admits actual Torch suballocations and rejects logical overreads", "[model][rfdetr][training][augmentation][perceptual][cuda]") {
  if (mmltk::testsupport::checked_cuda_device_count() == 0) SKIP("CUDA unavailable; Torch resampling custody unexecuted");

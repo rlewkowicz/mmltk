@@ -144,7 +144,10 @@ function(mmltk_add_backend_models_rfdetr_training_tests)
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/evaluation_runtime.test.cpp
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/telemetry_writer.test.cpp
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/training_continuation.test.cpp
+        ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/training_snapshot.test.cpp
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/model_merging.test.cpp)
+    target_link_options(mmltk_backend_models_rfdetr_training_tests PRIVATE
+        "LINKER:--wrap=cudaMemcpyAsync")
     target_include_directories(
         mmltk_backend_models_rfdetr_training_tests PRIVATE
         ${CMAKE_SOURCE_DIR}

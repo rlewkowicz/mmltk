@@ -5,6 +5,7 @@
 #include "src/backend/ml/torch/archive.h"
 #include <stdexcept>
 #include <unordered_map>
+#include <utility>
 import mmltk.common.logging.profile_utils;
 namespace mmltk::backend::models::rfdetr {
 namespace torch_cuda = mmltk::backend::ml::cuda;
@@ -35,13 +36,14 @@ ModelStateLoadSummary load_training_model_weights(NativeRfDetrModel& model, cons
  model.commit_normalized_state(std::move(candidate));
  return summary;
 }
-std::vector<NormalizedModelStateEntry> ema_state_entries(const std::vector<std::string>& param_names, const ModelEma& ema) {
+void collect_ema_state(std::vector<NormalizedModelStateEntry>& state, const std::vector<std::string>& param_names, const ModelEma& ema) {
  const auto& shadows = ema.shadow_params();
  if (shadows.size() != param_names.size()) throw std::runtime_error("RF-DETR EMA parameter count changed unexpectedly");
- std::vector<NormalizedModelStateEntry> state;
- state.reserve(param_names.size());
- for (std::size_t index = 0; index < param_names.size(); ++index) state.push_back({param_names[index], shadows[index].detach()});
- return state;
+ state.resize(param_names.size());
+ for (std::size_t index = 0; index < param_names.size(); ++index) {
+  state[index].name = param_names[index];
+  state[index].tensor = shadows[index].detach();
+ }
 }
 // One immutable epoch snapshot serves each synchronous archive in publication order.
 // The archive-local CPU entries borrow completed slot views until save returns.
@@ -77,7 +79,6 @@ void save_resume_checkpoint(const std::filesystem::path& checkpoint_path, const 
  continuation.training_attempt_id = std::string(attempt_id);
  continuation.training_original_descriptor = original_descriptor.string();
  detail::write_training_continuation(archive, options, continuation);
- optimizer.reserve_checkpoint(readback, model_state.size() + ema_state.size());
  {
   mmltk::common::logging::ScopedProfile profile_rfdetr_train_save_resume_write_state{"rfdetr.train.save.resume.write_state"};
   detail::write_resume_state_archive(archive, "state", model_state, readback, 0);
@@ -128,27 +129,60 @@ ResumeState load_resume_checkpoint_state(const std::filesystem::path& checkpoint
  admitted.class_artifact->RequireUnchanged();
  return state;
 }
-void TrainingSnapshot::begin(const NativeRfDetrModel& model) {
- readback_.Begin();
- ordinary_ = collect_module_state(model);
- ema_.clear();
- detail::reserve_state_archive(ordinary_, readback_, 0);
+TrainingSnapshotPublication::TrainingSnapshotPublication(TrainingSnapshotPublication&& other) noexcept : snapshot_(std::exchange(other.snapshot_, nullptr)) {}
+TrainingSnapshotPublication::~TrainingSnapshotPublication() noexcept {
+ try { finish(); } catch (...) {}
 }
-void TrainingSnapshot::prepare_ema(const std::vector<std::string>& names, const ModelEma* ema) {
- if (ema) ema_ = ema_state_entries(names, *ema);
+void TrainingSnapshotPublication::finish() {
+ if (!snapshot_) return;
+ snapshot_->release();
+ snapshot_ = nullptr;
+}
+void TrainingSnapshot::require_inactive() const {
+ if (active_) throw std::logic_error("training snapshot publication still active");
+}
+void TrainingSnapshot::require_active() const {
+ if (!active_) throw std::logic_error("training snapshot publication is not active");
+}
+TrainingSnapshotPublication TrainingSnapshot::begin(std::span<const NormalizedModelStateEntry> ordinary, const std::vector<std::string>& names, const ModelEma* ema) {
+ require_inactive();
+ readback_.Begin();
+ active_ = true;
+ TrainingSnapshotPublication publication(*this);
+ ordinary_.assign(ordinary.begin(), ordinary.end());
+ if (ema) collect_ema_state(ema_, names, *ema);
+ else ema_.clear();
+ detail::reserve_state_archive(ordinary_, readback_, 0);
  detail::reserve_state_archive(ema_, readback_, ordinary_.size());
+ // Stage the full ordinary and EMA inventories before temporary EMA selection
+ // can overwrite any borrowed source. Later archives only borrow these slots.
+ readback_.Freeze();
+ return publication;
 }
 void TrainingSnapshot::save_weights(const std::filesystem::path& path, const NativeCheckpointMetadata& metadata, bool selected, const std::filesystem::path& descriptor) {
+ require_active();
+ if (selected && ema_.empty()) throw std::logic_error("EMA snapshot was not admitted");
  static const std::vector<NormalizedModelStateEntry> no_ema;
  save_snapshot_checkpoint(path, metadata, ordinary_, selected ? ema_ : no_ema, readback_, descriptor);
 }
 void TrainingSnapshot::save_resume(const std::filesystem::path& path, const NativeCheckpointMetadata& metadata, const NativeOptimizer& optimizer, const GradScaler& scaler, const TrainRequest& options,
  int epoch, int64_t ema_completed_updates, std::string_view attempt_id, const std::filesystem::path& descriptor, detail::TrainingContinuationValues& continuation) {
+ require_active();
+ if (options.use_ema != !ema_.empty()) throw std::logic_error("Resume EMA differs from its frozen publication");
+ if (optimizer_ && optimizer_ != &optimizer) throw std::logic_error("training snapshot optimizer changed during publication");
+ if (!optimizer_) {
+  optimizer.reserve_checkpoint(readback_, ordinary_.size() + ema_.size());
+  readback_.Freeze();
+  optimizer_ = &optimizer;
+ }
  save_resume_checkpoint(path, metadata, optimizer, scaler, options, epoch, ema_completed_updates, ordinary_, ema_, attempt_id, descriptor, readback_, continuation);
 }
 void TrainingSnapshot::release() {
  readback_.Release();
- ordinary_.clear();
- ema_.clear();
+ // Retain small name/inventory allocations, but no borrowed tensor source.
+ for (auto& entry : ordinary_) entry.tensor = torch::Tensor{};
+ for (auto& entry : ema_) entry.tensor = torch::Tensor{};
+ optimizer_ = nullptr;
+ active_ = false;
 }
 }  // namespace mmltk::backend::models::rfdetr

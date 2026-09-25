@@ -92,10 +92,12 @@ struct SourceDevice final {
 struct Slot final {
  at::Tensor source;
  at::Tensor view;
+ at::Tensor frozen_cpu;
  std::unique_ptr<NumaHostTensor> host;
  std::size_t bytes = 0;
  int device = -1;
  bool staged = false;
+ bool owns_cpu_view = false;
 };
 struct SnapshotStorage final {
  // Device custody outlives pinned slots and scratch tensor destruction.
@@ -149,12 +151,14 @@ struct TensorReadbackBuffers::Impl final {
   complete();
   // Torch archives keep TensorImpl handles until their actual destruction.
   for (const auto& slot : storage->slots)
-   if (slot.host && slot.source.defined() && slot.source.is_cuda() && slot.bytes && slot.view.defined() && (slot.view.use_count() != 1 || slot.view.storage().use_count() != 1))
+   if (slot.view.defined() && (slot.owns_cpu_view || (slot.host && slot.source.defined() && slot.source.is_cuda() && slot.bytes)) &&
+       (slot.view.use_count() != (slot.owns_cpu_view ? 2 : 1) || slot.view.storage().use_count() != 1))
     throw std::logic_error("tensor readback still has serializer readers");
   for (auto& slot : storage->slots) {
    slot.source = at::Tensor{};
    slot.view = at::Tensor{};
    slot.staged = false;
+   slot.owns_cpu_view = false;
   }
   active = false;
  }
@@ -283,6 +287,29 @@ at::Tensor TensorReadbackBuffers::Stage(std::size_t index) {
  }
  slot.staged = true;
  return slot.view;
+}
+void TensorReadbackBuffers::Freeze() {
+ impl_->require_open();
+ if (!impl_->active) throw std::logic_error("freeze requires an active tensor readback snapshot");
+ for (std::size_t index = 0; index < impl_->storage->slots.size(); ++index) {
+  auto& slot = impl_->storage->slots[index];
+  if (!slot.source.defined()) continue;
+  if (slot.source.is_cpu() && !slot.owns_cpu_view) {
+   if (slot.staged) throw std::logic_error("cannot freeze a borrowed CPU serializer view");
+   // Archives serialize the backing storage, so retain an exact CPU extent.
+   // Equal-size boundaries reuse it without an additional allocation or copy.
+   if (!slot.frozen_cpu.defined() || slot.frozen_cpu.scalar_type() != slot.source.scalar_type() || slot.frozen_cpu.numel() != slot.source.numel())
+    slot.frozen_cpu = at::empty(slot.source.sizes(), slot.source.options());
+   else
+    slot.frozen_cpu.resize_(slot.source.sizes());
+   slot.frozen_cpu.copy_(slot.source);
+   slot.view = slot.frozen_cpu;
+   slot.owns_cpu_view = true;
+   slot.staged = true;
+  }
+  (void)Stage(index);
+ }
+ Complete();
 }
 void TensorReadbackBuffers::Complete() { impl_->complete(); }
 void TensorReadbackBuffers::Release() { impl_->release(); }

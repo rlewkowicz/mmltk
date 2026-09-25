@@ -18,6 +18,10 @@ public:
  void Begin();
  void Reserve(std::span<const at::Tensor> sources, std::size_t first_slot = 0);
  [[nodiscard]] at::Tensor Stage(std::size_t slot);
+ // Complete every reserved value before its producer may mutate it. CPU
+ // sources acquire reusable owned storage; ordinary Stage keeps its borrowed
+ // CPU fast path for inputs that are already immutable.
+ void Freeze();
  void Complete();
  void Release();
  void ReleaseSettled();
