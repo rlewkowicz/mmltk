@@ -76,11 +76,10 @@ using ExecutionContextOwner = std::unique_ptr<nvinfer1::IExecutionContext, declt
 class TensorRtSharedState final {
 public:
  explicit TensorRtSharedState(const RuntimeBackendOptions& options)
-     : engine_(options.model_path, make_engine_options(options)), model_info_(read_model_info(engine_, options.model_path)), device_(options.device), command_stream_(options.command_stream) {}
+     : engine_(options.model_path, make_engine_options(options)), model_info_(read_model_info(engine_, options.model_path)), device_(options.device) {}
  [[nodiscard]] const TensorRtEngine& engine() const noexcept { return engine_; }
  [[nodiscard]] const RuntimeModelInfo& model_info() const noexcept { return model_info_; }
  [[nodiscard]] std::int32_t device() const noexcept { return device_; }
- [[nodiscard]] BorrowedCommandStream command_stream() const noexcept { return command_stream_; }
  void Save(const std::filesystem::path& path) const {
   std::lock_guard lock(save_mutex_);
   engine_.Save(path);
@@ -90,19 +89,18 @@ private:
  TensorRtEngine engine_;
  RuntimeModelInfo model_info_;
  std::int32_t device_ = -1;
- BorrowedCommandStream command_stream_{};
  mutable std::mutex save_mutex_;
 };
 class TensorRtRuntimeBackend final : public RuntimeBackend {
 public:
- explicit TensorRtRuntimeBackend(std::shared_ptr<const TensorRtSharedState> shared)
-     : RuntimeBackend(shared->device(), shared->command_stream()), shared_(std::move(shared)), context_(nullptr, destroy_execution_context) {
+ explicit TensorRtRuntimeBackend(std::shared_ptr<const TensorRtSharedState> shared, BorrowedCommandStream stream)
+     : RuntimeBackend(shared->device(), stream), shared_(std::move(shared)), context_(nullptr, destroy_execution_context) {
   context_.reset(detail::TensorRtEngineAccess::Get(shared_->engine()).createExecutionContext());
   if (context_ == nullptr) throw std::runtime_error("TensorRT failed to create an execution context");
  }
  ~TensorRtRuntimeBackend() override { static_cast<void>(Close()); }
  [[nodiscard]] const RuntimeModelInfo& model_info() const noexcept override { return shared_->model_info(); }
- [[nodiscard]] std::shared_ptr<RuntimeBackend> MakeLane() const override { return std::make_shared<TensorRtRuntimeBackend>(shared_); }
+ [[nodiscard]] std::shared_ptr<RuntimeBackend> MakeLane(BorrowedCommandStream stream) const override { return std::make_shared<TensorRtRuntimeBackend>(shared_, stream); }
  void SaveCompiledModel(const std::filesystem::path& path) const override { shared_->Save(path); }
 
 private:
@@ -138,7 +136,7 @@ private:
 [[nodiscard]] std::shared_ptr<RuntimeBackend> make_runtime_backend(const RuntimeBackendOptions& options) {
  switch (options.kind) {
   case RuntimeBackendKind::Onnx: return make_onnx_runtime_backend(options);
-  case RuntimeBackendKind::TensorRt: return std::make_shared<TensorRtRuntimeBackend>(std::make_shared<const TensorRtSharedState>(options));
+  case RuntimeBackendKind::TensorRt: return std::make_shared<TensorRtRuntimeBackend>(std::make_shared<const TensorRtSharedState>(options), options.command_stream);
  }
  throw std::invalid_argument("invalid runtime backend kind");
 }

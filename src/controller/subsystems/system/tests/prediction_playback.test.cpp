@@ -26,6 +26,25 @@ TEST_CASE("video cadence uses monotonic presentation timing and honest fallback"
  playback.Pause(true);
  CHECK_FALSE(playback.Wait(0.0, 30.0, stop.get_token()));
 }
+TEST_CASE("video admission pauses before source reads and Stop wakes it without advancing timing", "[controller][video]") {
+ Playback playback;
+ CHECK(playback.Schedule(10.0, 4.0, start) == start);
+ std::stop_source stop;
+ playback.Pause(true, start);
+ std::promise<void> entered;
+ auto admission = std::async(std::launch::async, [&] {
+  entered.set_value();
+  return playback.WaitAdmission(stop.get_token());
+ });
+ const mmltk::testsupport::ScopedTestCleanup release([&] { stop.request_stop(); });
+ entered.get_future().get();
+ CHECK(admission.wait_for(0ms) == std::future_status::timeout);
+ stop.request_stop();
+ CHECK_FALSE(mmltk::testsupport::await_test_future(admission, "stopped video source admission"));
+ playback.Pause(false, start + 1s);
+ CHECK(playback.Schedule(10.25, 4.0, start + 1s) == start + 1250ms);
+ CHECK(playback.WaitAdmission({}));
+}
 TEST_CASE("video scheduling accounts for fallback before timestamp recovery", "[controller][video]") {
  Playback playback;
  CHECK(playback.Schedule(10.0, 4.0, start) == start);

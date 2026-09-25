@@ -55,6 +55,7 @@ struct ValidationDelivery final {
  bool mask_metrics = true;
  std::function<void(std::span<const std::uint32_t>, std::shared_ptr<const mmltk::backend::data::catalog::ClassCatalog>)> samples_selected{};
  std::function<void(ValidationSampleView)> sample{};
+ std::function<void(const ExecutionFacts&)> admitted{};
  std::shared_ptr<mmltk::frameworks::gpu::TerminalCudaRetirementOwner> retirement{};
  mmltk::frameworks::gpu::PinnedHostBuffer::Operations registered_host_operations{};
 };

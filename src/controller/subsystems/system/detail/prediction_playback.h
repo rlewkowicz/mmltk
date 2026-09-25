@@ -47,6 +47,10 @@ public:
   std::scoped_lock lock(mutex_);
   return ScheduleLocked(timestamp, fps, now);
  }
+ [[nodiscard]] bool WaitAdmission(std::stop_token stop) {
+  std::unique_lock lock(mutex_);
+  return changed_.wait(lock, stop, [&] { return !paused_; }) && !stop.stop_requested();
+ }
  [[nodiscard]] bool Wait(std::optional<double> timestamp, double fps, std::stop_token stop) {
   std::unique_lock lock(mutex_);
   if (!changed_.wait(lock, stop, [&] { return !paused_; })) return false;

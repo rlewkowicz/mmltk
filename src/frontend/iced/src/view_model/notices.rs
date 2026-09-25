@@ -14,7 +14,7 @@ pub struct NoticeId(pub u64);
 pub enum Severity { Warning, Error }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Origin {
-    Compute(FeatureId), Dataset, Model(FeatureId), Provider, Remote, Checkpoint,
+    Compute(FeatureId), InferenceCapacity(FeatureId), Dataset, Model(FeatureId), Provider, Remote, Checkpoint,
     Dialog, AnnotationSave, Annotation, Explore, Presentation, Upscale, PredictionInspection, PredictionPreview,
     Request(ApplicationIntentEndpoint, u64), Interaction(u64), History, HistoryDropped, HistoryDroppedSaved, Chart, ChartSaved, Gpu(FeatureId), Settings,
     Transport, Protocol, Clipboard, Admission(ApplicationIntentEndpoint), Editor(FeatureId), PredictionTotal, Overflow,

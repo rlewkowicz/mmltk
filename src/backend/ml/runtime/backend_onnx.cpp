@@ -97,7 +97,9 @@ public:
    binding_->BindOutput(info_.outputs[index].name.c_str(), output_values_.back());
   }
   try {
-   session_->Run(Ort::RunOptions{nullptr}, *binding_);
+   Ort::RunOptions run_options;
+   run_options.AddConfigEntry("disable_synchronize_execution_providers", "1");
+   session_->Run(run_options, *binding_);
   } catch (...) { cuda_lane().RethrowAfterSynchronization(std::current_exception()); }
   cuda_lane().Record(continuation);
   return cuda_lane().Receipt(outputs.size());
@@ -106,7 +108,11 @@ public:
   binding_.reset();
   session_.reset();
  }
- [[nodiscard]] std::shared_ptr<RuntimeBackend> MakeLane() const override { return std::make_shared<OnnxRuntimeBackend>(options_); }
+ [[nodiscard]] std::shared_ptr<RuntimeBackend> MakeLane(BorrowedCommandStream command_stream) const override {
+  auto options = options_;
+  options.command_stream = command_stream;
+  return std::make_shared<OnnxRuntimeBackend>(options);
+ }
  void SaveCompiledModel(const std::filesystem::path&) const override { throw std::logic_error("ONNX Runtime does not produce a compiled model artifact"); }
 
 private:

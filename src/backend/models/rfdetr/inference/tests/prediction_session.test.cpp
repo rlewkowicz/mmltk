@@ -34,6 +34,7 @@
 #include <cmath>
 #include <algorithm>
 #include <span>
+#include <set>
 #include <memory>
 #include <cstdint>
 #include <stop_token>
@@ -53,6 +54,136 @@ import mmltk.backend.models.rfdetr.inference.prediction;
 import mmltk.backend.models.rfdetr.model_export;
 namespace rfdetr = mmltk::backend::models::rfdetr;
 using rfdetr::test_support::write_prediction_model;
+TEST_CASE("Fixed artifact batches preserve tails ordered lane reuse and callback retirement", "[model][rfdetr][prediction][gpu]") {
+ const mmltk::testsupport::ScopedTempDir root("artifact-inference-lanes");
+ auto request = rfdetr::test_support::prediction_image_fixture(root.path());
+ mmltk_onnx::ModelProto model;
+ { std::ifstream input(request.onnx_path, std::ios::binary); REQUIRE(model.ParseFromIstream(&input)); }
+ auto* graph = model.mutable_graph();
+ graph->mutable_input(0)->mutable_type()->mutable_tensor_type()->mutable_shape()->mutable_dim(0)->set_dim_value(3);
+ for (auto& output : *graph->mutable_output()) output.mutable_type()->mutable_tensor_type()->mutable_shape()->mutable_dim(0)->set_dim_value(3);
+ for (auto& tensor : *graph->mutable_initializer()) if (tensor.dims_size()) {
+  tensor.set_dims(0, 3);
+  const std::vector<float> values(tensor.float_data().begin(), tensor.float_data().end());
+  for (int copy = 0; copy < 2; ++copy) for (float value : values) tensor.add_float_data(value);
+ }
+ { std::ofstream output(request.onnx_path, std::ios::binary | std::ios::trunc); REQUIRE(model.SerializeToOstream(&output)); }
+ rfdetr::BuildEngineRequest engine;
+ engine.onnx_path = request.onnx_path; engine.output_path = root.path() / "batch3.engine"; engine.allow_fp16 = false;
+ rfdetr::build_tensorrt_engine(engine);
+ request.lanes = 4;
+ request.preset_name = "rf-detr-nano";
+ const auto source = request.image_inputs.front();
+ request.image_inputs.clear();
+ for (int index = 0; index < 7; ++index) request.image_inputs.push_back({source.image_path, "image", index + 10});
+ const mmltk::testsupport::ScopedTestStream stream;
+ const mmltk::backend::ml::runtime::BorrowedCommandStream command{reinterpret_cast<std::uintptr_t>(stream.get()), true};
+ for (const bool tensorrt : {false, true}) {
+  request.onnx_path = tensorrt ? std::filesystem::path{} : engine.onnx_path;
+  request.tensorrt_path = tensorrt ? engine.output_path : std::filesystem::path{};
+  rfdetr::PredictionSession session;
+  std::set<std::uintptr_t> first_streams;
+  for (int pass = 0; pass < 2; ++pass) {
+   std::vector<std::int64_t> delivered;
+   std::set<std::uintptr_t> streams;
+   unsigned admissions = 0;
+   const auto result = session.Run(request, command, {
+    .source_pixels = true,
+    .completed = [&](const auto& record, auto pixels, const auto& annotations) {
+     delivered.push_back(record.image_id); streams.insert(pixels.stream);
+     REQUIRE(pixels.rgb8);
+     CHECK(annotations.masks_available);
+    },
+    .admitted = [&](const auto& facts) { ++admissions; CHECK(facts.admitted_capacity == 3); CHECK(facts.effective_batch_per_model == 9); },
+   });
+   CHECK(admissions == 1);
+   CHECK(result.processed_images == 7);
+   CHECK(delivered == std::vector<std::int64_t>{10, 11, 12, 13, 14, 15, 16});
+   CHECK(streams.size() == 3);
+   if (pass == 0) first_streams = streams; else CHECK(streams == first_streams);
+  }
+  unsigned callbacks = 0;
+  CHECK_THROWS_WITH(session.Run(request, command, {.completed = [&](const auto&, auto, const auto&) {
+   if (++callbacks == 2) throw std::runtime_error("callback failure");
+  }}), "callback failure");
+  CHECK_FALSE(session.HasUnsafeCustody());
+  CHECK(session.Run(request, command).processed_images == 7);
+  request.limit_images = 1;
+  const auto single = session.Run(request, command);
+  CHECK(single.processed_images == 1);
+  CHECK(single.execution.admitted_capacity == 1);
+  CHECK(single.execution.limitation == rfdetr::ExecutionLimitation::SourceCapacity);
+  request.limit_images = 0;
+ }
+}
+TEST_CASE("Prediction partial pool construction retires streams when source custody allocation is refused", "[model][rfdetr][prediction][gpu][custody]") {
+ const mmltk::testsupport::ScopedTempDir root("inference-partial-pool");
+ auto request = rfdetr::test_support::prediction_image_fixture(root.path());
+ request.lanes = 4;
+ request.image_inputs.resize(7, request.image_inputs.front());
+ const mmltk::testsupport::ScopedTestStream stream;
+ auto retirement = std::make_shared<mmltk::frameworks::gpu::TerminalCudaRetirementOwner>(1U);
+ {
+  rfdetr::PredictionSession session;
+  CHECK_THROWS_WITH(session.Run(request, {reinterpret_cast<std::uintptr_t>(stream.get()), true}, {.retirement = retirement}),
+   "terminal CUDA custody reservation refused before resource allocation");
+  CHECK_FALSE(session.HasUnsafeCustody());
+  CHECK(session.Close() == mmltk::backend::ml::runtime::kRuntimeSuccess);
+  CHECK(retirement->fact().occupancy == 0);
+ }
+ CHECK(retirement->fact().reservations == 0);
+ CHECK(retirement->admission_open());
+}
+TEST_CASE("Video inference retains copied frames timing and the stopped ordered prefix", "[model][rfdetr][prediction][video][gpu]") {
+ const mmltk::testsupport::ScopedTempDir root("video-inference-lanes");
+ auto request = rfdetr::test_support::prediction_image_fixture(root.path());
+ request.source_kind = rfdetr::PredictSourceKind::VideoFile;
+ request.image_inputs.clear(); request.video_path = root.path() / "frames.y4m";
+ request.lanes = 4; request.include_masks = false;
+ const std::array<unsigned char, 7> luminance{16, 50, 80, 110, 140, 180, 235};
+ {
+  std::ofstream output(request.video_path, std::ios::binary);
+  output << "YUV4MPEG2 W2 H2 F4:1 Ip A1:1 C444\n";
+  for (auto value : luminance) {
+   output << "FRAME\n";
+   for (int pixel = 0; pixel < 4; ++pixel) output.put(static_cast<char>(value));
+   for (int pixel = 0; pixel < 8; ++pixel) output.put(static_cast<char>(128));
+  }
+ }
+ const mmltk::testsupport::ScopedTestStream stream;
+ const mmltk::backend::ml::runtime::BorrowedCommandStream command{reinterpret_cast<std::uintptr_t>(stream.get()), true};
+ rfdetr::PredictionSession session;
+ std::vector<rfdetr::PredictionPixels> retained;
+ std::vector<double> timestamps;
+ const auto result = session.Run(request, command, {
+  .source_pixels = true,
+  .before_frame = [&](auto timestamp, double fps) { REQUIRE(timestamp); CHECK(fps == 4); timestamps.push_back(*timestamp); return true; },
+  .completed = [&](const auto& record, auto pixels, const auto&) { CHECK(record.dataset_index == static_cast<std::int64_t>(retained.size())); retained.push_back(std::move(pixels)); },
+ });
+ REQUIRE(result.processed_images == luminance.size());
+ REQUIRE(retained.size() == luminance.size());
+ for (std::size_t index = 0; index < retained.size(); ++index) {
+  REQUIRE(retained[index].custody);
+  float pixel = -1;
+  REQUIRE(cudaMemcpy(&pixel, retained[index].chw, sizeof(pixel), cudaMemcpyDeviceToHost) == cudaSuccess);
+  CHECK(std::abs(pixel - (static_cast<float>(luminance[index]) - 16.F) / 219.F) < .03F);
+  CHECK(std::abs(timestamps[index] - .25 * static_cast<double>(index)) < 1e-6);
+ }
+ std::stop_source stop;
+ unsigned attempts = 0, decoded = 0;
+ std::vector<std::int64_t> settled;
+ const auto stopped = session.Run(request, command, {
+  .stop = stop.get_token(),
+  .before_source = [&] { if (++attempts == 3) { stop.request_stop(); return false; } return true; },
+  .completed = [&](const auto& record, auto, const auto&) { settled.push_back(record.dataset_index); },
+  .decoded = [&](auto, auto) { ++decoded; },
+ });
+ CHECK(decoded == 2);
+ CHECK(stopped.cancelled);
+ CHECK(stopped.processed_images == 2);
+ CHECK(settled == std::vector<std::int64_t>{0, 1});
+ CHECK_FALSE(session.HasUnsafeCustody());
+}
 TEST_CASE("shared preprocessing normalizes every RGB channel without mutating borrowed pixels", "[model][rfdetr][prediction][gpu]") {
  const auto original = torch::tensor({0.0F, 0.25F, 0.5F, 0.75F, 1.0F, 0.125F});
  const auto source = original.to(torch::kCUDA);
@@ -640,7 +771,9 @@ TEST_CASE("prediction close releases batch counts and readbacks while borrowed t
  namespace gpu = mmltk::frameworks::gpu;
  const int failure = GENERATE(0, 1, 2, 3, 4);
  const mmltk::testsupport::ScopedTempDir root("prediction-complete-close");
- const auto request = rfdetr::test_support::prediction_image_fixture(root.path());
+ auto request = rfdetr::test_support::prediction_image_fixture(root.path());
+ request.lanes = GENERATE(1, 4);
+ if (request.lanes > 1) request.image_inputs.resize(7, request.image_inputs.front());
  const PredictionStream stream_scope{true};
  gpu::test_support::PinnedHostFault fault({.unregister_call = failure ? std::optional<unsigned>{failure == 4 ? 0U : static_cast<unsigned>(failure)} : std::nullopt, .restore = failure == 3});
  auto retirement = std::make_shared<gpu::TerminalCudaRetirementOwner>(20U);
@@ -657,11 +790,11 @@ TEST_CASE("prediction close releases batch counts and readbacks while borrowed t
   .registered_host_operations = operations,
  };
  const mmltk::backend::ml::runtime::BorrowedCommandStream stream{reinterpret_cast<std::uintptr_t>(stream_scope.get()), true};
- CHECK(session.Run(request, stream, delivery).processed_images == 1U);
+ CHECK(session.Run(request, stream, delivery).processed_images == request.image_inputs.size());
  if (failure != 4) {
   // Ordinary same-artifact reuse retains all active high-water buffers.
   const auto reservations = retirement->fact().reservations;
-  CHECK(session.Run(request, stream, delivery).processed_images == 1U);
+  CHECK(session.Run(request, stream, delivery).processed_images == request.image_inputs.size());
   CHECK(retirement->fact().reservations == reservations);
  }
  fault.Arm(failure != 4);
@@ -1677,6 +1810,7 @@ TEST_CASE("Native prediction consumes shared compilation policy with full batche
  request.resolution = 64;
  request.source_kind = rfdetr::PredictSourceKind::ImageFiles;
  request.batch_size = 2;
+ request.lanes = GENERATE(1, 4);
  request.allow_fp16 = false;
  request.include_masks = false;
  request.max_dets_per_image = 3;
@@ -1708,6 +1842,7 @@ TEST_CASE("Native prediction consumes shared compilation policy with full batche
       },
     });
    REQUIRE(result.processed_images == 7);
+   CHECK(result.execution.admitted_capacity == static_cast<std::uint64_t>(request.lanes));
    if (mode == rfdetr::CompilationMode::kNone)
     expected = records;
    else {
@@ -1735,6 +1870,7 @@ TEST_CASE("Native prediction consumes shared compilation policy with full batche
   evaluation.allow_fp16 = false;
   evaluation.compiled_path = request.compiled_path;
   evaluation.batch_size = 2;
+  evaluation.lanes = request.lanes;
   evaluation.backend = "weights";
   evaluation.progress_bar = false;
   const auto result = rfdetr::run_evaluation(evaluation);

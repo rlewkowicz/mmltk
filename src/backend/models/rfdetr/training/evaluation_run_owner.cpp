@@ -48,6 +48,7 @@
 #include <torch/types.h>
 #include <torch/serialize.h>
 #include "detail/evaluation_runtime.h"
+#include "src/backend/models/rfdetr/inference/detail/inference_lanes.h"
 import mmltk.backend.ml.cuda.gpu_quiescence;
 import mmltk.backend.models.rfdetr.core.dataset_limit_resolution;
 import mmltk.common.logging.profile_utils;
@@ -401,17 +402,30 @@ ModelOutputs narrow_model_outputs_batch(const ModelOutputs& outputs, int64_t cou
  if (outputs.enc_outputs.has_value()) { narrowed.enc_outputs = narrow_output_layer_batch(*outputs.enc_outputs, count); }
  return narrowed;
 }
+namespace {
+RuntimeConfig validation_runtime_config(const TrainRequest& options, const RuntimeContext& training) {
+ auto config = training.config();
+ config.lanes = options.validation_lanes;
+ return config;
+}
+}
 struct TrainingValidationRuntime::Impl {
+ struct ForwardLane final {
+  std::shared_ptr<NativeRfDetrModel> model;
+  std::unique_ptr<ClassPostprocessLane> classes;
+  BatchStaticTensors batch;
+  std::unique_ptr<GpuBatchPreprocessor> preprocessor;
+  std::unique_ptr<TargetScratch> targets;
+ };
 public:
- Impl(const TrainRequest& options, RuntimeContext& runtime, std::unique_ptr<mmltk::backend::data::DatasetLoader> loader, size_t batch_size, bool enable_loss, EvaluationMetricSet metric_set,
-  const int64_t prediction_capacity, std::string split_name, const bool query_count_automatic)
-     : runtime_(runtime),
+ Impl(const TrainRequest& options, RuntimeContext& runtime, std::unique_ptr<mmltk::backend::data::DatasetLoader> loader, size_t batch_size, std::string split_name, const bool query_count_automatic)
+     : runtime_(validation_runtime_config(options, runtime)),
        loader_(std::move(loader)),
        batch_size_(std::max<size_t>(1, batch_size)),
-       target_scratch_(enable_loss ? std::make_unique<TargetScratch>() : nullptr),
-       lane_pool_(static_cast<size_t>(runtime.split().lane_threads), runtime.lane_cpus(), "rfdtrnlane", 0U, &runtime.execution().placement, false),
+       lane_pool_(static_cast<size_t>(runtime_.split().lane_threads), runtime_.lane_cpus(), "rfdtrnlane", 0U, &runtime_.execution().placement, false),
        split_name_(std::move(split_name)),
-       query_count_automatic_(query_count_automatic) {
+       query_count_automatic_(query_count_automatic) {}
+ void initialize(const TrainRequest& options, bool enable_loss, EvaluationMetricSet metric_set, std::int64_t prediction_capacity) {
   if (!loader_) { throw std::invalid_argument("training validation runtime requires a dataset loader"); }
   metric_set = resolve_evaluation_metric_set(*loader_, metric_set == EvaluationMetricSet::BBoxAndMask);
   detection_limit_ = resolve_dataset_limit(loader_->max_instances_per_image(), resolve_evaluation_max_dets(options.eval_max_dets));
@@ -420,15 +434,31 @@ public:
   amp_enabled_ = options.amp;
   inference_dtype_ = amp_enabled_ ? resolve_cuda_autocast_dtype() : at::kFloat;
   const auto batch_capacity = static_cast<int64_t>(batch_size_);
-  batch_tensors_.ensure(batch_capacity, static_cast<int>(loader_->image_height()), static_cast<int>(loader_->image_width()), options.device_id);
-  preprocessor_ = std::make_unique<GpuBatchPreprocessor>(batch_capacity, static_cast<int>(loader_->image_height()), static_cast<int>(loader_->image_width()), options.device_id, inference_dtype_);
-  const size_t slot_count = prediction_lane_slot_count(runtime.split(), batch_size_);
-  const size_t encoding_capacity = prediction_cpu_batch_limit(runtime.split(), batch_size_);
+  const auto population_capacity = std::max<std::size_t>(1, (loader_->num_images() + batch_size_ - 1) / batch_size_);
+  const auto capacity = std::min({population_capacity, static_cast<std::size_t>(runtime_.split().lane_threads), mmltk::backend::ml::cuda::CudaEventPool::max_capacity - 1});
+  facts_ = derive_training_validation_facts(options, 0);
+  facts_.admitted_capacity = capacity;
+  facts_.effective_batch_per_model = facts_.aggregate_round_images = checked_training_product(batch_size_, capacity);
+  if (capacity < static_cast<std::size_t>(options.validation_lanes))
+   facts_.limitation = capacity == population_capacity ? ExecutionLimitation::SourceCapacity : ExecutionLimitation::BackendCapacity;
+  compilation_mode_ = options.compilation_mode;
+  pool_ = std::make_unique<InferenceLanes>(options.device_id, capacity);
+  events_ = std::make_unique<TrainingEventOwner>(options.device_id, capacity + 1);
+  for (std::size_t index = 0; index < capacity; ++index) {
+   forward_.push_back(std::make_unique<ForwardLane>());
+   auto& lane = *forward_.back();
+   torch_cuda::TorchCudaStreamGuard stream_guard(torch_cuda::getStreamFromExternal(reinterpret_cast<cudaStream_t>(pool_->stream(index).native_handle), options.device_id));
+   lane.batch.ensure(batch_capacity, loader_->image_height(), loader_->image_width(), options.device_id);
+   lane.preprocessor = std::make_unique<GpuBatchPreprocessor>(batch_capacity, loader_->image_height(), loader_->image_width(), options.device_id, inference_dtype_);
+   if (enable_loss) lane.targets = std::make_unique<TargetScratch>();
+  }
+  const size_t slot_count = prediction_lane_slot_count(runtime_.split(), batch_size_);
+  const size_t encoding_capacity = prediction_cpu_batch_limit(runtime_.split(), batch_size_);
   evaluation_run_ = std::make_unique<TrainingEvaluationRunOwner>(EvaluationRunConfig{
    metric_set,
    batch_size_,
    static_cast<size_t>(prediction_capacity),
-   static_cast<size_t>(runtime.split().lane_threads),
+   capacity,
    slot_count,
    encoding_capacity,
    checked_cast<std::uint32_t>(loader_->image_height(), "RF-DETR image height exceeds uint32_t"),
@@ -443,18 +473,18 @@ public:
   evaluation_run_->begin();
   loader_->begin_epoch();
  }
- torch::Tensor preprocess(const mmltk::backend::data::Batch& batch) { return preprocessor_->run(batch, static_cast<int64_t>(batch_size_)); }
- void record_preprocess_consumer(cudaStream_t stream) { preprocessor_->record_consumer(stream); }
+ torch::Tensor preprocess(const mmltk::backend::data::Batch& batch) { return forward_.at(active_)->preprocessor->run(batch, static_cast<int64_t>(batch_size_)); }
+ void record_preprocess_consumer(cudaStream_t stream) { forward_.at(active_)->preprocessor->record_consumer(stream); }
  RuntimeContext& runtime() { return runtime_; }
  size_t batch_size() const { return batch_size_; }
  mmltk::backend::data::DatasetLoader& loader() { return *loader_; }
  const std::vector<int>& image_ids() const { return image_ids_; }
  bool amp_enabled() const noexcept { return amp_enabled_; }
  at::ScalarType inference_dtype() const noexcept { return inference_dtype_; }
- torch::Tensor nested_mask() const { return batch_tensors_.nested_mask_view(static_cast<int64_t>(batch_size_)); }
+ torch::Tensor nested_mask() const { return forward_.at(active_)->batch.nested_mask_view(static_cast<int64_t>(batch_size_)); }
  TargetScratch& target_scratch() {
-  if (!target_scratch_) { throw std::logic_error("validation target scratch requested while validation loss is disabled"); }
-  return *target_scratch_;
+  if (!forward_.at(active_)->targets) { throw std::logic_error("validation target scratch requested while validation loss is disabled"); }
+  return *forward_.at(active_)->targets;
  }
  mmltk::common::concurrency::WorkerPool& lane_pool() { return lane_pool_; }
  TrainingEvaluationRunOwner& evaluation_run() noexcept { return *evaluation_run_; }
@@ -463,16 +493,22 @@ public:
  const ResolvedDatasetLimit& detection_limit() const noexcept { return detection_limit_; }
  bool query_count_automatic() const noexcept { return query_count_automatic_; }
 
-private:
- RuntimeContext& runtime_;
+public:
+ RuntimeContext runtime_;
+ std::unique_ptr<InferenceLanes> pool_;
+ std::unique_ptr<TrainingEventOwner> events_;
+ std::vector<std::unique_ptr<ForwardLane>> forward_;
+ std::size_t active_ = 0;
+ const NativeRfDetrModel* source_ = nullptr;
+ std::optional<std::uint64_t> version_;
+ EvaluatedWeights weights_ = EvaluatedWeights::Ordinary;
+ CompilationMode compilation_mode_ = CompilationMode::kNone;
+ ExecutionFacts facts_;
  std::unique_ptr<mmltk::backend::data::DatasetLoader> loader_;
  size_t batch_size_ = 1;
  std::unique_ptr<TrainingEvaluationRunOwner> evaluation_run_;
  EvaluationSampleWriter sample_writer_;
  std::vector<int> image_ids_;
- BatchStaticTensors batch_tensors_;
- std::unique_ptr<GpuBatchPreprocessor> preprocessor_;
- std::unique_ptr<TargetScratch> target_scratch_;
  mmltk::common::concurrency::WorkerPool lane_pool_;
  std::string split_name_;
  ResolvedDatasetLimit detection_limit_;
@@ -482,8 +518,53 @@ private:
 };
 TrainingValidationRuntime::TrainingValidationRuntime(const TrainRequest& options, RuntimeContext& runtime, std::unique_ptr<mmltk::backend::data::DatasetLoader> loader, size_t batch_size,
  bool enable_loss, EvaluationMetricSet metric_set, const int64_t prediction_capacity, std::string split_name, const bool query_count_automatic)
-    : impl_(std::make_unique<Impl>(options, runtime, std::move(loader), batch_size, enable_loss, metric_set, prediction_capacity, std::move(split_name), query_count_automatic)) {}
-TrainingValidationRuntime::~TrainingValidationRuntime() = default;
+    : impl_(std::make_shared<Impl>(options, runtime, std::move(loader), batch_size, std::move(split_name), query_count_automatic)) {
+ try { impl_->initialize(options, enable_loss, metric_set, prediction_capacity); }
+ catch (...) { cancel(); throw; }
+}
+TrainingValidationRuntime::~TrainingValidationRuntime() { cancel(); }
+void TrainingValidationRuntime::cancel() noexcept {
+ if (!impl_) return;
+ try { drain(); }
+ catch (...) { std::move(lease_).Install(mmltk::frameworks::gpu::TerminalCudaCustody::Share(std::move(impl_)), cudaErrorUnknown); }
+}
+void TrainingValidationRuntime::drain() {
+ if (!impl_) throw std::runtime_error("training validation has terminal CUDA custody");
+ if (impl_->evaluation_run_) impl_->evaluation_run_->cancel();
+ const auto status = impl_->pool_ ? impl_->pool_->Drain() : mmltk::backend::ml::runtime::kRuntimeSuccess;
+ if (status != mmltk::backend::ml::runtime::kRuntimeSuccess) throw mmltk::backend::ml::runtime::CudaOperationError(status, "training validation reader retirement");
+}
+std::size_t TrainingValidationRuntime::lane_capacity() const noexcept { return impl_->pool_->capacity(); }
+ExecutionFacts TrainingValidationRuntime::execution_facts() const { return impl_->facts_; }
+std::size_t TrainingValidationRuntime::admit_lane() { return impl_->active_ = impl_->pool_->Admit(); }
+std::uintptr_t TrainingValidationRuntime::active_stream() const { return impl_->pool_->stream(impl_->active_).native_handle; }
+NativeRfDetrModel& TrainingValidationRuntime::active_model() { return *impl_->forward_.at(impl_->active_)->model; }
+ClassPostprocessLane& TrainingValidationRuntime::active_classes() { return *impl_->forward_.at(impl_->active_)->classes; }
+TrainingEventOwner& TrainingValidationRuntime::events() { return *impl_->events_; }
+void TrainingValidationRuntime::submitted() { impl_->pool_->Submitted(impl_->active_); }
+void TrainingValidationRuntime::release_oldest() { static_cast<void>(impl_->pool_->WaitOldest()); impl_->pool_->ReleaseOldest(); }
+void TrainingValidationRuntime::bind_model(const NativeRfDetrModel& model, std::optional<std::uint64_t> version, EvaluatedWeights weights) {
+ drain();
+ if (version && impl_->source_ == &model && impl_->version_ == version && impl_->weights_ == weights) return;
+ impl_->source_ = nullptr;
+ impl_->version_.reset();
+ const auto producer = torch_cuda::getCurrentCUDAStream(impl_->runtime_.execution().device);
+ // The one mutable-master copy stays on its producer stream. Even a failed
+ // snapshot remains ordered before an unwinding EMA restore on that stream.
+ impl_->forward_.front()->model = model.make_inference_clone(static_cast<std::int32_t>(impl_->batch_size_), impl_->compilation_mode_);
+ impl_->pool_->WaitSource(0, {reinterpret_cast<std::uintptr_t>(producer.stream()), true});
+ for (std::size_t index = 0; index < impl_->forward_.size(); ++index) {
+  auto& lane = *impl_->forward_[index];
+  const auto stream = impl_->pool_->stream(index);
+  torch_cuda::TorchCudaStreamGuard stream_guard(torch_cuda::getStreamFromExternal(reinterpret_cast<cudaStream_t>(stream.native_handle), impl_->runtime_.execution().device));
+  if (index != 0) lane.model = impl_->forward_.front()->model->make_inference_clone(static_cast<std::int32_t>(impl_->batch_size_), impl_->compilation_mode_);
+  lane.model->configure_supervision_timing({torch_cuda::cuda_device(impl_->runtime_.execution().device), 1, mmltk::common::logging::profile_enabled()});
+  lane.classes = std::make_unique<ClassPostprocessLane>(lane.model->class_layout());
+  lane.classes->Prepare(lane.model->parameters().front().device());
+  impl_->pool_->ReleaseSource(index);
+ }
+ impl_->source_ = &model; impl_->version_ = version; impl_->weights_ = weights;
+}
 void TrainingValidationRuntime::begin_pass() { impl_->begin_pass(); }
 torch::Tensor TrainingValidationRuntime::preprocess(const mmltk::backend::data::Batch& batch) { return impl_->preprocess(batch); }
 void TrainingValidationRuntime::record_preprocess_consumer(cudaStream_t stream) { impl_->record_preprocess_consumer(stream); }
@@ -502,12 +583,14 @@ std::string_view TrainingValidationRuntime::split_name() const noexcept { return
 std::size_t TrainingValidationRuntime::detection_limit() const noexcept { return impl_->detection_limit().as_size; }
 bool TrainingValidationRuntime::automatic_detection_limit() const noexcept { return impl_->detection_limit().automatic; }
 bool TrainingValidationRuntime::query_count_automatic() const noexcept { return impl_->query_count_automatic(); }
-EvalPassResult evaluate_model(const TrainRequest& options, TrainingValidationRuntime& validation, NativeRfDetrModel& model, TrainingEventOwner& event_owner, const DetectionConfig& detection_config,
- bool calculate_loss, EvaluationPurpose purpose, EvaluatedWeights evaluated_weights, std::optional<int> current_epoch, TrainingMetricHandoff* metrics) {
+EvalPassResult evaluate_model(const TrainRequest& options, TrainingValidationRuntime& validation, NativeRfDetrModel& model, const DetectionConfig& detection_config,
+ bool calculate_loss, EvaluationPurpose purpose, EvaluatedWeights evaluated_weights, std::optional<int> current_epoch, TrainingMetricHandoff* metrics, std::optional<std::uint64_t> parameter_version) {
  const bool capture_eval_sample = purpose == EvaluationPurpose::ScheduledValidation;
  if (capture_eval_sample && !current_epoch) throw std::logic_error("scheduled validation requires its epoch");
  mmltk::common::logging::ScopedProfile profile_rfdetr_train_eval_total{"rfdetr.train.eval.total"};
  RuntimeContext& runtime = validation.runtime();
+ auto& event_owner = validation.events();
+ ScopedRuntimeContext evaluation_context(&runtime);
  mmltk::backend::data::DatasetLoader& loader = validation.loader();
  const std::vector<int>& image_ids = validation.image_ids();
  EvalPassResult result;
@@ -518,10 +601,11 @@ EvalPassResult evaluate_model(const TrainRequest& options, TrainingValidationRun
   ~RestoreMode() { module.train(training); }
  } restore_mode{(model), (model).is_training()};
  model.eval();
+ auto cancel_unsettled_run =
+  std::unique_ptr<TrainingValidationRuntime, void (*)(TrainingValidationRuntime*)>{&validation, [](TrainingValidationRuntime* owner) { owner->cancel(); }};
+ validation.bind_model(model, parameter_version, evaluated_weights);
  validation.begin_pass();
  TrainingEvaluationRunOwner& evaluation_run = validation.evaluation_run();
- auto cancel_unsettled_run =
-  std::unique_ptr<TrainingEvaluationRunOwner, void (*)(TrainingEvaluationRunOwner*)>{&validation.evaluation_run(), [](TrainingEvaluationRunOwner* owner) { owner->cancel(); }};
  const bool amp_enabled = validation.amp_enabled();
  const at::ScalarType autocast_dtype = validation.inference_dtype();
  const bool match_free_loss = calculate_loss && model.config().training_supervision.assignment == TrainAssignmentKind::MatchFree;
@@ -552,6 +636,11 @@ EvalPassResult evaluate_model(const TrainRequest& options, TrainingValidationRun
  size_t seen_images = 0;
  if (calculate_loss && !metrics) throw std::logic_error("validation loss requires the retained scalar handoff");
  if (calculate_loss) metrics->begin_validation();
+ std::optional<mmltk::backend::ml::cuda::CudaEventPool::Lease> metric_ready;
+ if (calculate_loss) {
+  metric_ready = record_current_stream_event(event_owner.pool(), options.device_id, "record validation scalar readiness");
+  if (!metric_ready) throw std::runtime_error("training event pool is unavailable for validation scalars");
+ }
  std::optional<CapturedEvalSample> captured_sample;
  std::unique_ptr<spdmon::ProgressBar> progress;
  if (options.progress_bar) {
@@ -565,13 +654,23 @@ EvalPassResult evaluate_model(const TrainRequest& options, TrainingValidationRun
  const size_t max_cpu_futures = prediction_cpu_batch_limit(runtime.split(), validation.batch_size());
  auto drain_cpu = [&]() {
   const size_t completed_count = evaluation_run.drain_encoding();
+  validation.release_oldest();
   image_count += completed_count;
   if (progress) { progress->add(completed_count); }
  };
  mmltk::backend::data::Batch batch{};
- ClassPostprocessLane evaluation_classes(model.class_layout());
- evaluation_classes.Prepare(mmltk::backend::ml::cuda::cuda_device(options.device_id));
- while (loader.next_batch(batch)) {
+ while (true) {
+  while (evaluation_run.progress().in_flight_batches >= validation.lane_capacity()) {
+   if (evaluation_run.pending_lane_count()) evaluation_run.drain_lane(cpu_pool);
+   drain_cpu();
+  }
+  if (!loader.next_batch(batch)) break;
+  const auto lane_index = validation.admit_lane();
+  ScopedRuntimeContext lane_context(&runtime, lane_index);
+  const auto forward_stream = validation.active_stream();
+  torch_cuda::TorchCudaStreamGuard forward_guard(torch_cuda::getStreamFromExternal(reinterpret_cast<cudaStream_t>(forward_stream), options.device_id));
+  auto& forward_model = validation.active_model();
+  auto& evaluation_classes = validation.active_classes();
   mmltk::common::logging::ScopedProfile profile_rfdetr_train_eval_batch{"rfdetr.train.eval.batch"};
   {
    mmltk::common::logging::ScopedProfile profile_rfdetr_train_eval_wait_batch{"rfdetr.train.eval.wait_batch"};
@@ -626,7 +725,7 @@ EvalPassResult evaluate_model(const TrainRequest& options, TrainingValidationRun
    if (batch_timing) { evaluation_run.record_timing_start(batch_timing, EvaluationCudaBatchTiming::Phase::ModelForward, evaluation_stream); }
    {
     mmltk::backend::ml::cuda::TorchAutocastScope autocast_guard(amp_enabled, autocast_dtype);
-    outputs = match_free_loss ? model.forward_for_match_free(NestedTensor{inference_input, validation.nested_mask()}) : model.forward(NestedTensor{inference_input, validation.nested_mask()}, true);
+    outputs = match_free_loss ? forward_model.forward_for_match_free(NestedTensor{inference_input, validation.nested_mask()}) : forward_model.forward(NestedTensor{inference_input, validation.nested_mask()}, true);
    }
    assert_inference_output_dtype(outputs.main.pred_logits, outputs.main.pred_boxes, autocast_dtype, "RF-DETR training validation");
    validation.record_preprocess_consumer(torch_cuda::current_torch_cuda_stream_object(torch_cuda::checked_device_index(options.device_id)).stream());
@@ -648,11 +747,11 @@ EvalPassResult evaluate_model(const TrainRequest& options, TrainingValidationRun
    mmltk::common::logging::ScopedProfile profile_rfdetr_train_eval_targets_handoff{"rfdetr.train.eval.targets_handoff"};
    target_consumer->handoff();
    torch::Tensor loss;
-   auto& model_owner = (model);
+   auto& model_owner = forward_model;
    SupervisionTimingLease criterion_timing(model_owner, training_supervision_enabled(model.config().training_supervision), SupervisionTimingLease::Kind::Criterion);
    if (match_free_loss) {
     const auto target_count = torch::tensor({static_cast<float>(prepared_target_count(*prepared))}, torch::TensorOptions().dtype(torch::kFloat32).device(inference_input.device()));
-    loss = (model).supervision_loss(*evaluated_outputs, *prepared, DeviceLossNormalizer{target_count.select(0, 0)}, false).total;
+    loss = forward_model.supervision_loss(*evaluated_outputs, *prepared, DeviceLossNormalizer{target_count.select(0, 0)}, false).total;
    } else {
     TensorMap loss_dict;
     {
@@ -665,8 +764,12 @@ EvalPassResult evaluate_model(const TrainRequest& options, TrainingValidationRun
    }
    criterion_timing.finish();
    target_consumer->retire();
+   metric_ready->wait(forward_stream, "order validation scalar accumulation");
+   metric_ready->retire();
    metrics->accumulate_validation(loss);
-   static_cast<void>(model.harvest_supervision_timing());
+   metric_ready = record_current_stream_event(event_owner.pool(), options.device_id, "record validation scalar accumulation");
+   if (!metric_ready) throw std::runtime_error("training event pool is unavailable for validation scalars");
+   static_cast<void>(forward_model.harvest_supervision_timing());
    ++batch_count;
   }
   PostprocessedBatch processed = [&]() {
@@ -675,7 +778,7 @@ EvalPassResult evaluate_model(const TrainRequest& options, TrainingValidationRun
    PostprocessedBatch postprocessed = postprocess_output_batch_fixed_size(OutputTensors{evaluated_outputs->main.pred_logits, evaluated_outputs->main.pred_boxes, evaluated_outputs->main.pred_masks},
     static_cast<int64_t>(loader.image_height()), static_cast<int64_t>(loader.image_width()), model.config().num_select, &evaluation_classes);
    for (std::size_t image = 0; image < batch.num_images; ++image) {
-    const auto geometry = loader.geometry(batch.image_indices[image]);
+    const auto geometry = loader.geometry(static_cast<std::uint32_t>(prediction_metadata[image].dataset_index));
     clip_prediction_boxes_(postprocessed.boxes[image], geometry.offset_x, geometry.offset_y, geometry.offset_x + geometry.resized_width, geometry.offset_y + geometry.resized_height);
    }
    if (batch_timing) { evaluation_run.record_timing_stop(batch_timing, EvaluationCudaBatchTiming::Phase::Postprocess, evaluation_stream); }
@@ -715,7 +818,8 @@ EvalPassResult evaluate_model(const TrainRequest& options, TrainingValidationRun
     return stage_prediction_batch(std::move(processed), category_count, max_dets, std::move(lease), device_id, reinterpret_cast<void*>(lane.stream.stream()));
    },
    batch_timing);
-  while (static_cast<int>(evaluation_run.pending_lane_count()) >= runtime.split().lane_threads) { evaluation_run.drain_lane(cpu_pool); }
+  validation.submitted();
+  while (evaluation_run.pending_lane_count() >= validation.lane_capacity()) { evaluation_run.drain_lane(cpu_pool); }
   while (evaluation_run.pending_encoding_count() >= max_cpu_futures) { drain_cpu(); }
  }
  while (evaluation_run.pending_lane_count() != 0U) {
@@ -730,15 +834,20 @@ EvalPassResult evaluate_model(const TrainRequest& options, TrainingValidationRun
   validation.sample_writer().Draw(captured_sample->image, captured_sample->boxes, captured_sample->labels, captured_sample->masks, render_options);
  }
  if (progress) { progress->close(); }
- if (calculate_loss) { result.loss = metrics->validation_average(batch_count); }
+ if (calculate_loss) {
+  metric_ready->wait(reinterpret_cast<std::uintptr_t>(torch_cuda::getCurrentCUDAStream(options.device_id).stream()), "wait for validation scalar accumulation");
+  metric_ready->retire();
+  result.loss = metrics->validation_average(batch_count);
+ }
  {
   mmltk::common::logging::ScopedProfile profile_rfdetr_train_eval_metric{"rfdetr.train.eval.metric"};
   result.summary = evaluation_run.evaluate(validation.detection_limit(), cpu_pool);
   result.summary.model_detection_budget = checked_cast<std::uint32_t>(model.config().num_select, "training model detection budget exceeds uint32_t");
  }
  evaluation_run.settle(result.summary);
- static_cast<void>(cancel_unsettled_run.release());
  validation.sample_writer().Flush();
+ validation.drain();
+ static_cast<void>(cancel_unsettled_run.release());
  result.timing = elapsed_timing(started_at, image_count);
  return result;
 }

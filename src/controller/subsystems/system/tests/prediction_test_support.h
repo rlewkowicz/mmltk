@@ -188,7 +188,7 @@ class FakePredictRuntime final : public PredictRuntime {
 public:
  explicit FakePredictRuntime(PredictionScenario);
  contracts::ComputeTerminal Run(mmltk::backend::models::rfdetr::PredictRequest, std::stop_token, const ComputeProgressSink&, const ProductSink&, const PlaybackGate&, VisualExtent,
-  const ContextProvider&, const PreviewRetirement&, const ComputeArtifactSink& = {}, const PredictionRunOutput& = {}, std::uint64_t = 0) override;
+  const ContextProvider&, const PreviewRetirement&, const ComputeArtifactSink& = {}, const PredictionRunOutput& = {}, std::uint64_t = 0, const ExecutionSink& = {}) override;
 
 private:
  ComputeSequence sequence_;

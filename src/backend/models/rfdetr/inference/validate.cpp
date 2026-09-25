@@ -57,6 +57,7 @@ struct AlignmentSample final {
  predict.compiled_path = request.compiled_path;
  predict.backend = artifact.backend_name;
  predict.batch_size = request.batch_size;
+ predict.lanes = request.lanes;
  predict.max_dets_per_image = request.candidate_count;
  const auto evaluation_cap = resolve_evaluation_max_dets(request.eval_max_dets);
  predict.output_path = request.report_json_path.empty() ? request.compiled_path.parent_path() / "validation_predictions.json" : request.report_json_path;
@@ -145,6 +146,7 @@ struct AlignmentSample final {
      }
     },
    .progress = delivery.progress,
+   .admitted = delivery.admitted,
    .retirement = delivery.retirement,
    .registered_host_operations = delivery.registered_host_operations,
   });

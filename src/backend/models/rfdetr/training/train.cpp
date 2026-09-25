@@ -227,7 +227,6 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
  const auto admitted_microbatches = static_cast<std::size_t>(execution_facts.microbatches_per_attempt);
  const auto rank_slice = TrainingDataPlan::rank_slice(options.batch_size, distributed.rank, distributed.world_size);
  const std::size_t local_batch_size = rank_slice.count;
- TrainingEventOwner training_events(options.device_id, static_cast<std::size_t>(train_lane_count) + 1U);
  ScopedRuntimeContext worker_scope(&train_runtime);
  auto make_loader_config_for = [&](const std::filesystem::path& compiled_path, size_t loader_batch_size, bool shuffle, int prefetch_factor, bool shard_batches, bool drop_last) {
   auto config = make_loader_config(compiled_path.string(), loader_batch_size, shuffle, prefetch_factor, train_runtime.split().gather_threads, train_runtime.loader_affinity_string(), options.device_id,
@@ -375,10 +374,10 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
  broadcast_training_model(distributed, *common);
  const auto precision = agree_training_precision(distributed, options.device_id, options.amp, options.fused_optimizer);
  if (main_process) mmltk::common::logging::info([&](auto& logger) {
-  logger.info("rfdetr train session runtime: torch={} autocast={} models={} logical_train_lanes={} admitted_train_workers={} requested_validation_lanes={} admitted_validation_lanes={} "
+  logger.info("rfdetr train session runtime: torch={} autocast={} models={} logical_train_lanes={} admitted_train_workers={} requested_validation_lanes={} "
    "loader_threads={} gather_threads={} cpu_threads={} global_microbatch_images={} microbatches_per_model_attempt={} effective_batch_per_model={} aggregate_round_images={} "
    "train_max_instances={} val_max_instances={} test_max_instances={} query_source={} num_queries={} automatic_query_cap={} query_override={}",
-   TORCH_VERSION, evaluation_precision_name(precision.autocast_dtype), data_plan.shards().size(), options.lanes, train_lane_count, options.validation_lanes, 1,
+   TORCH_VERSION, evaluation_precision_name(precision.autocast_dtype), data_plan.shards().size(), options.lanes, train_lane_count, options.validation_lanes,
    train_runtime.split().loader_threads, train_runtime.split().gather_threads, train_runtime.split().cpu_threads, options.batch_size,
    execution_facts.microbatches_per_attempt, execution_facts.effective_batch_per_model, execution_facts.aggregate_round_images,
    dataset_limits.train_max_instances, dataset_limits.val_max_instances, dataset_limits.test_max_instances.value_or(0U), dataset_limits.query_source,
@@ -459,12 +458,13 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
  std::unique_ptr<TrainingValidationRuntime> validation;
  if (main_process) {
   checkpoint = std::make_unique<TrainingSessionCheckpoint>(options.output_dir);
+  validation = std::make_unique<TrainingValidationRuntime>(options, train_runtime, std::move(val_loader), val_batch_size, options.validation_loss,
+   detection.include_masks ? EvaluationMetricSet::BBoxAndMask : EvaluationMetricSet::BBox, artifacts.config.num_select, "val", dataset_limits.automatic);
   TrainingRun run;
   run.run_id = session.session_id;
   run.configuration = options; run.original_weights = metadata.source_path; run.original_class_descriptor = original_descriptor;
   run.execution.training = execution_facts;
-  run.execution.validation = derive_training_validation_facts(options, 0);
-  run.execution.validation.admitted_capacity = 1;
+  run.execution.validation = validation->execution_facts();
   run.execution.dataset_limits = dataset_limits;
   run.class_layout = artifacts.class_layout; run.evaluated_weights = options.use_ema ? EvaluatedWeights::Ema : EvaluatedWeights::Ordinary;
   run.source_checkpoint_attempt_id = resume_attempt; run.resume_epoch = start_epoch - 1; run.resume_optimizer_step = models.front()->schedule().consumed_attempts;
@@ -472,8 +472,6 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
   session.attempt_id = writer->attempt_id();
   latest.epoch = start_epoch; latest.total_epochs = options.epochs; latest.total_batches = epoch_draws.microbatches; latest.total_images = checked_training_product(epoch_draws.microbatches, options.batch_size);
   submit(latest, TrainingRecordRole::Boundary);
-  validation = std::make_unique<TrainingValidationRuntime>(options, train_runtime, std::move(val_loader), val_batch_size, options.validation_loss,
-   detection.include_masks ? EvaluationMetricSet::BBoxAndMask : EvaluationMetricSet::BBox, artifacts.config.num_select, "val", dataset_limits.automatic);
  }
  const bool periodic = options.lane_configuration.mode == TrainLaneMode::PeriodicAveraging;
  TrainingMergeSchedule merge_schedule(options.lane_configuration, {session.round, session.merge, session.interval_rounds});
@@ -632,7 +630,7 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
     NativeRfDetrModel candidate(artifacts.config, artifacts.class_layout);
     candidate.to(mmltk::backend::ml::cuda::cuda_device(options.device_id)); load_model_weights(candidate, path, false);
     candidate.optimize_for_inference(checked_inference_batch_size(val_batch_size), false, options.compilation_mode);
-    return evaluate_model(options, *validation, candidate, training_events, detection, false, EvaluationPurpose::SelectionValidation, EvaluatedWeights::Soup, std::nullopt).summary;
+    return evaluate_model(options, *validation, candidate, detection, false, EvaluationPurpose::SelectionValidation, EvaluatedWeights::Soup, std::nullopt).summary;
    };
    result.selected = select_training_artifact(candidates, effective_final_policy(options.lane_configuration), detection.include_masks, options.output_dir, evaluate_native);
    if (!options.test_compiled_path.empty()) {
@@ -643,7 +641,7 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
     NativeRfDetrModel selected(artifacts.config, artifacts.class_layout);
     selected.to(mmltk::backend::ml::cuda::cuda_device(options.device_id)); load_model_weights(selected, result.selected->artifact.path, false);
     selected.optimize_for_inference(checked_inference_batch_size(val_batch_size), false, options.compilation_mode);
-    result.test_summary = evaluate_model(options, test, selected, training_events, detection, false, EvaluationPurpose::FinalTest, result.selected->artifact.weights, std::nullopt).summary;
+    result.test_summary = evaluate_model(options, test, selected, detection, false, EvaluationPurpose::FinalTest, result.selected->artifact.weights, std::nullopt).summary;
    }
    latest = models.front()->progress(TrainingPhase::Completed); latest.session_id = session.session_id;
    latest.phase = TrainingPhase::Completed; latest.scope = TrainingRecordScope::SelectedOutput; latest.model_id = result.selected->artifact.model_id;

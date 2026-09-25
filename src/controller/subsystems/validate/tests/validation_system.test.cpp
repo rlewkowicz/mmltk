@@ -36,6 +36,37 @@ void check_validation_png_pixels(const std::filesystem::path& path) {
 }  // namespace
 namespace mmltk::controller {
 namespace {
+class AdmittedValidationRuntime final : public ValidationRuntime {
+public:
+ ValidationRuntimeResult Run(mmltk::backend::models::rfdetr::ValidateRequest request, std::stop_token, const ComputeProgressSink&,
+  const mmltk::backend::models::rfdetr::ValidationDelivery& delivery, std::uint64_t) override {
+  auto facts = mmltk::backend::models::rfdetr::derive_execution_facts(request, 0);
+  facts.admitted_capacity = 1;
+  delivery.admitted(facts); delivery.admitted(facts);
+  return {.terminal = contracts::make_compute_terminal(contracts::ComputeOperationOutcome::Succeeded)};
+ }
+};
+TEST_CASE("Validation retains stable admitted capacity independently of visual revisions", "[controller][validation]") {
+ ApplicationDataFixture fixture{mmltk::testsupport::make_temp_root("validation-capacity-facts")};
+ fixture.PrepareModel(contracts::FeatureId::Validate);
+ auto [settings, dataset, model] = fixture.systems();
+ const auto revision = settings.snapshot().revision;
+ std::promise<void> settled;
+ ValidationSystem validation{settings, dataset, model, [](DirectComputeConfiguration) { return std::make_unique<AdmittedValidationRuntime>(); },
+  [&](ValidationSystem::event_type event) {
+   if (const auto* changed = std::get_if<ValidationChanged>(&event); changed && !changed->snapshot.operation.active && changed->snapshot.operation.generation_frontier)
+    mmltk::testsupport::release_test_promise(settled);
+  }, [](int, int) { return DirectComputeConfiguration{}; }};
+ const auto frame = validation.snapshot().frame;
+ static_cast<void>(validation.Start({}));
+ mmltk::testsupport::await_test_promise(settled, "validation admitted capacity");
+ const auto snapshot = validation.snapshot();
+ CHECK(snapshot.execution.admitted_capacity == 1);
+ CHECK(snapshot.execution.settings_revision == revision);
+ CHECK(snapshot.execution.operation_generation == snapshot.operation.generation_frontier);
+ CHECK(snapshot.frame == frame);
+ CHECK(snapshot.operation.terminal.outcome == contracts::ComputeOperationOutcome::Succeeded);
+}
 template <class Predicate>
 void await_validation(std::mutex& mutex, std::condition_variable& changed, Predicate predicate) {
  std::unique_lock lock(mutex);

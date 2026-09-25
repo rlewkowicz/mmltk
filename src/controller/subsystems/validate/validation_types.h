@@ -7,6 +7,7 @@
 #include <string>
 #include <vector>
 #include "src/backend/models/rfdetr/contract/evaluation_metrics.h"
+#include "src/backend/models/rfdetr/contract/execution_plan.h"
 #include "src/controller/contracts/annotation.h"
 #include "src/controller/contracts/application_boundary.h"
 #include "src/controller/contracts/compute.h"
@@ -60,6 +61,7 @@ struct ValidationSnapshot final {
  std::array<ValidationSampleIdentity, mmltk::backend::models::rfdetr::kValidationSampleCapacity> sample_identities{};
  std::array<bool, mmltk::backend::models::rfdetr::kValidationSampleCapacity> sample_available{};
  contracts::ComputeUiState operation{};
+ mmltk::backend::models::rfdetr::ExecutionFacts execution{};
  std::optional<mmltk::backend::models::rfdetr::EvalSummary> metrics;
  std::uint32_t detail_rows = 0U;
  ValidationOverlays overlays{};

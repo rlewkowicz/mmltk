@@ -1,4 +1,6 @@
 #include <ATen/Context.h>
+#include <ATen/CPUGeneratorImpl.h>
+#include <cuda_runtime_api.h>
 #include <ATen/TensorIndexing.h>
 #include <ATen/ops/scaled_dot_product_attention.h>
 #include <torch/csrc/jit/api/function_impl.h>
@@ -27,6 +29,8 @@
 #include "detail/decoder_attention.h"
 #include "detail/selective_compilation.h"
 #include "detail/modules_technical.h"
+#include "src/backend/ml/cuda/torch_cuda_utils.h"
+#include "src/frameworks/gpu/terminal_cuda_retirement_owner.h"
 #include "detail/training_supervision.h"
 #include "src/backend/ml/layers/ms_deform_attn.h"
 #include "src/backend/models/rfdetr/contract/model_config.h"
@@ -41,6 +45,18 @@ using mmltk::backend::ml::layers::ms_deform_attn_reference;
 struct NativeRfDetrModel::Impl final : torch::nn::Module {
  explicit Impl(const NativeRfDetrConfig& config, ModelClassLayout layout);
  std::shared_ptr<const ResolvedClassLayout> layout_;
+ struct ImmutableWeights final {
+  torch::OrderedDict<std::string, torch::Tensor> parameters;
+  torch::OrderedDict<std::string, torch::Tensor> buffers;
+  // Only populated while a mutable source is being copied. Failed physical
+  // settlement retains the original allocations alongside partial destinations.
+  std::vector<torch::Tensor> copying_sources;
+ };
+ std::shared_ptr<const ImmutableWeights> immutable_weights_;
+ bool force_pytorch_deformable_attn_ = false;
+ void require_mutable() const {
+  if (immutable_weights_) throw std::logic_error("immutable inference weights cannot be mutated");
+ }
  ModelOutputs forward(const NestedTensor& batch, bool include_masks = true);
  ModelOutputs forward_for_match_free(const NestedTensor& batch);
  void initialize_training_supervision(std::uint64_t request_seed);
@@ -1350,6 +1366,7 @@ detail::NormalizedModelStateCandidate NativeRfDetrModel::Impl::stage_normalized_
  return candidate;
 }
 void NativeRfDetrModel::Impl::commit_normalized_state(detail::NormalizedModelStateCandidate candidate) {
+ require_mutable();
  torch::NoGradGuard no_grad;
  std::vector<torch::Tensor> rollback;
  rollback.reserve(candidate.destinations.size());
@@ -1453,6 +1470,7 @@ void NativeRfDetrModel::Impl::optimize_for_inference(int batch_size, bool for_tr
  }
 }
 void NativeRfDetrModel::Impl::set_force_pytorch_deformable_attn(bool value) {
+ force_pytorch_deformable_attn_ = value;
  for (auto& module : this->modules(false)) {
   if (auto* deform = dynamic_cast<MSDeformAttnImpl*>(module.get())) { deform->force_pytorch_deformable_attn_ = value; }
  }
@@ -1463,8 +1481,11 @@ NativeRfDetrModel::~NativeRfDetrModel() = default;
 NativeRfDetrModel::NativeRfDetrModel(NativeRfDetrModel&&) noexcept = default;
 NativeRfDetrModel& NativeRfDetrModel::operator=(NativeRfDetrModel&&) noexcept = default;
 const NativeRfDetrConfig& NativeRfDetrModel::config() const noexcept { return impl_->config(); }
-void NativeRfDetrModel::optimize_for_inference(const std::int32_t batch_size, const bool for_training, const CompilationMode mode) { impl_->optimize_for_inference(batch_size, for_training, mode); }
-void NativeRfDetrModel::train(bool enabled) { impl_->train(enabled); }
+void NativeRfDetrModel::optimize_for_inference(const std::int32_t batch_size, const bool for_training, const CompilationMode mode) {
+ if (for_training) impl_->require_mutable();
+ impl_->optimize_for_inference(batch_size, for_training, mode);
+}
+void NativeRfDetrModel::train(bool enabled) { if (enabled) impl_->require_mutable(); impl_->train(enabled); }
 void NativeRfDetrModel::eval() { impl_->eval(); }
 bool NativeRfDetrModel::is_training() const noexcept { return impl_->is_training(); }
 void NativeRfDetrModel::invalidate_compilation() {
@@ -1477,14 +1498,93 @@ void NativeRfDetrModel::invalidate_compilation() {
  }
 }
 void NativeRfDetrModel::to(const torch::Device& device) {
+ impl_->require_mutable();
  if (impl_->parameters().front().device() != device) invalidate_compilation();
  impl_->to(device);
+}
+
+void NativeRfDetrModel::freeze_inference_weights() {
+ if (impl_->immutable_weights_) return;
+ if (is_training()) throw std::logic_error("training model must enter evaluation before inference freezing");
+ auto weights = std::make_shared<Impl::ImmutableWeights>();
+ const auto capture = [](auto values, auto& frozen) {
+  for (auto& entry : values) {
+   entry.value().set_requires_grad(false);
+   frozen.insert(entry.key(), entry.value().detach());
+  }
+ };
+ capture(impl_->named_parameters(true), weights->parameters);
+ capture(impl_->named_buffers(true), weights->buffers);
+ impl_->immutable_weights_ = std::move(weights);
+}
+std::shared_ptr<NativeRfDetrModel> NativeRfDetrModel::make_inference_clone(std::int32_t batch_size, CompilationMode mode) const {
+ torch::NoGradGuard no_grad;
+ mmltk::frameworks::gpu::TerminalCudaRetirementOwner retirement(1U);
+ auto terminal = mmltk::frameworks::gpu::ReserveTerminalCudaLease(retirement);
+ struct RestoreGenerator final {
+  at::Generator generator = at::detail::getDefaultCPUGenerator();
+  torch::Tensor state = generator.get_state();
+  ~RestoreGenerator() { generator.set_state(state); }
+ } restore_generator;
+ auto clone = std::make_shared<NativeRfDetrModel>(config(), class_layout()->record());
+ clone->set_force_pytorch_deformable_attn(impl_->force_pytorch_deformable_attn_);
+ const auto source_device = impl_->parameters().front().device();
+ try {
+  clone->replicate_training_supervision_runtime_from(*this);
+  auto weights = impl_->immutable_weights_;
+  std::shared_ptr<Impl::ImmutableWeights> snapshot;
+  if (!weights) {
+   snapshot = std::make_shared<Impl::ImmutableWeights>();
+   clone->impl_->immutable_weights_ = snapshot;
+   const auto parameters = impl_->named_parameters(true);
+   const auto buffers = impl_->named_buffers(true);
+   snapshot->copying_sources.reserve(parameters.size() + buffers.size());
+   for (const auto& entry : parameters) snapshot->copying_sources.push_back(entry.value());
+   for (const auto& entry : buffers) snapshot->copying_sources.push_back(entry.value());
+   const auto copy = [](const auto& source, auto& destination) {
+    for (const auto& entry : source) destination.insert(entry.key(), entry.value().detach().clone());
+   };
+   copy(parameters, snapshot->parameters);
+   copy(buffers, snapshot->buffers);
+   weights = snapshot;
+  }
+  const auto bind = [](auto owned, const auto& immutable) {
+   if (owned.size() != immutable.size()) throw std::logic_error("inference clone state inventory differs");
+   for (auto& entry : owned) {
+    const auto* value = immutable.find(entry.key());
+    if (!value || entry.value().sizes() != value->sizes()) throw std::logic_error("inference clone state shape differs");
+    // set_data updates the TensorImpl held by the registered module and its
+    // actual member; replacing this by-value dictionary entry would not.
+    entry.value().set_data(*value);
+    entry.value().set_requires_grad(false);
+   }
+  };
+  bind(clone->impl_->named_parameters(true), weights->parameters);
+  bind(clone->impl_->named_buffers(true), weights->buffers);
+  clone->impl_->immutable_weights_ = std::move(weights);
+  clone->eval();
+  clone->optimize_for_inference(batch_size, false, mode);
+  if (source_device.is_cuda()) {
+   const auto status = cudaStreamSynchronize(mmltk::backend::ml::cuda::getCurrentCUDAStream(source_device.index()).stream());
+   if (status != cudaSuccess) throw std::runtime_error("inference clone initialization did not complete: " + std::string(cudaGetErrorString(status)));
+  }
+  if (snapshot) snapshot->copying_sources.clear();
+  return clone;
+ } catch (...) {
+  if (source_device.is_cuda()) {
+   cudaError_t status = cudaSetDevice(source_device.index());
+   if (status == cudaSuccess) status = cudaStreamSynchronize(mmltk::backend::ml::cuda::getCurrentCUDAStream(source_device.index()).stream());
+   if (status != cudaSuccess) std::move(terminal).Install(mmltk::frameworks::gpu::TerminalCudaCustody::Share(std::move(clone)), status);
+  }
+  throw;
+ }
 }
 
 std::vector<torch::Tensor> NativeRfDetrModel::parameters(bool recurse) const { return impl_->parameters(recurse); }
 torch::OrderedDict<std::string, torch::Tensor> NativeRfDetrModel::named_parameters(bool recurse) const { return impl_->named_parameters(recurse); }
 torch::OrderedDict<std::string, torch::Tensor> NativeRfDetrModel::named_buffers(bool recurse) const { return impl_->named_buffers(recurse); }
 void NativeRfDetrModel::replicate_training_supervision_runtime_from(const NativeRfDetrModel& source) {
+ impl_->require_mutable();
  impl_->import_training_supervision_runtime(source.impl_->export_training_supervision_runtime());
 }
 [[nodiscard]] ModelOutputs NativeRfDetrModel::forward(const NestedTensor& batch, bool include_masks) { return impl_->forward(batch, include_masks); }
@@ -1492,8 +1592,9 @@ void NativeRfDetrModel::replicate_training_supervision_runtime_from(const Native
 [[nodiscard]] ModelOutputs NativeRfDetrModel::forward_with_denoising(const NestedTensor& batch, const PreparedTargets& targets, const TrainingStepIdentity& identity) {
  return impl_->forward_with_denoising(batch, targets, identity);
 }
-void NativeRfDetrModel::initialize_training_supervision(std::uint64_t request_seed) { impl_->initialize_training_supervision(request_seed); }
+void NativeRfDetrModel::initialize_training_supervision(std::uint64_t request_seed) { impl_->require_mutable(); impl_->initialize_training_supervision(request_seed); }
 [[nodiscard]] TrainingLoss NativeRfDetrModel::supervision_loss(const ModelOutputs& outputs, const PreparedTargets& targets, const DeviceLossNormalizer& normalizer, bool training_mode) {
+ if (training_mode) impl_->require_mutable();
  return impl_->supervision_loss(outputs, targets, normalizer, training_mode);
 }
 void NativeRfDetrModel::configure_supervision_timing(const SupervisionTimingSetup& setup) { impl_->configure_supervision_timing(setup); }

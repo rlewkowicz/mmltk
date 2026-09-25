@@ -328,12 +328,14 @@ TrainingMetricProgress TrainingModel::progress(TrainingPhase phase) const {
 }
 EvalPassResult TrainingModel::evaluate(TrainingValidationRuntime& validation, EvaluatedWeights kind) {
  auto& p = *impl_;
+ validation.drain();
  std::optional<ModelEma::Selection> selection;
  if (kind == EvaluatedWeights::Ema) { if (!p.ema) throw std::logic_error("EMA evaluation was not admitted"); selection.emplace(*p.ema, *p.owner); }
  auto evaluation_options = p.options;
  if (p.options.lane_configuration.mode != TrainLaneMode::SharedGradients)
   evaluation_options.output_dir /= "model-" + std::to_string(p.shard.model_id) + (kind == EvaluatedWeights::Ema ? "/ema" : "/ordinary");
- auto result = evaluate_model(evaluation_options, validation, *p.owner, p.events, p.detection, p.options.validation_loss, EvaluationPurpose::ScheduledValidation, kind, p.epoch, &p.metrics);
+ auto result = evaluate_model(evaluation_options, validation, *p.owner, p.detection, p.options.validation_loss, EvaluationPurpose::ScheduledValidation, kind, p.epoch, &p.metrics, p.parameter_version);
+ validation.drain();
  if (selection) selection->restore();
  p.owner->train();
  return result;

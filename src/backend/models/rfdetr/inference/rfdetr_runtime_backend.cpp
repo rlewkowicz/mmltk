@@ -480,9 +480,9 @@ runtime::RuntimeStatus RfdetrRuntimeBackend::Close() noexcept {
  return runtime::kRuntimeSuccess;
 }
 std::span<const RfdetrNamedOutputRole> RfdetrRuntimeBackend::output_roles() const noexcept { return state_->output_roles; }
-std::shared_ptr<RfdetrRuntimeBackend> RfdetrRuntimeBackend::MakeLane() const {
+std::shared_ptr<RfdetrRuntimeBackend> RfdetrRuntimeBackend::MakeLane(runtime::BorrowedCommandStream command_stream, std::shared_ptr<mmltk::frameworks::gpu::TerminalCudaRetirementOwner> retirement) const {
  return std::shared_ptr<RfdetrRuntimeBackend>(
-  new RfdetrRuntimeBackend(lane_->MakeLane(), backend_name_, static_resolution_, maximum_detections_, state_->layout, state_->output_roles, state_->admission, state_->retirement, state_->operations));
+  new RfdetrRuntimeBackend(lane_->MakeLane(command_stream), backend_name_, static_resolution_, maximum_detections_, state_->layout, state_->output_roles, state_->admission, retirement ? std::move(retirement) : state_->retirement, state_->operations));
 }
 std::shared_ptr<RfdetrRuntimeBackend> make_rfdetr_runtime_backend(const RfdetrRuntimeBackendOptions& options) {
  if (options.stop.stop_requested()) throw ArtifactPublicationCancelled{};
@@ -532,13 +532,15 @@ std::shared_ptr<RfdetrRuntimeBackend> make_rfdetr_runtime_backend(const RfdetrRu
  }
  return result;
 }
-std::vector<std::shared_ptr<RfdetrRuntimeBackend>> make_rfdetr_runtime_backend_lanes(const RfdetrRuntimeBackendOptions& options, std::size_t lane_count) {
- if (lane_count == 0U) { throw std::invalid_argument("RF-DETR runtime lane count must be positive"); }
- auto first = make_rfdetr_runtime_backend(options);
+std::vector<std::shared_ptr<RfdetrRuntimeBackend>> make_rfdetr_runtime_backend_lanes(const RfdetrRuntimeBackendOptions& options, std::span<const runtime::BorrowedCommandStream> streams) {
+ if (streams.empty()) { throw std::invalid_argument("RF-DETR runtime lane count must be positive"); }
+ auto first_options = options;
+ first_options.command_stream = streams.front();
+ auto first = make_rfdetr_runtime_backend(first_options);
  std::vector<std::shared_ptr<RfdetrRuntimeBackend>> lanes;
- lanes.reserve(lane_count);
+ lanes.reserve(streams.size());
  lanes.push_back(first);
- for (std::size_t index = 1U; index < lane_count; ++index) { lanes.push_back(first->MakeLane()); }
+ for (std::size_t index = 1U; index < streams.size(); ++index) { lanes.push_back(first->MakeLane(streams[index])); }
  return lanes;
 }
 ModelInfo inspect_tensorrt_model(const ModelArtifactRequest& artifacts, const int device_id, std::stop_token stop) {

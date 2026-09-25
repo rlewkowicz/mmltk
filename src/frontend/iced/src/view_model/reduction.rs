@@ -719,6 +719,24 @@ pub(super) fn merge_live_snapshot(
     merge_observation(target, incoming, |value| value.revision, "Live")
 }
 
+pub(super) fn merge_execution_facts(
+    current: &crate::generated::ExecutionFacts,
+    incoming: crate::generated::ExecutionFacts,
+) -> Result<crate::generated::ExecutionFacts, UiError> {
+    if incoming.operationgeneration < current.operationgeneration {
+        return Ok(current.clone());
+    }
+    if incoming.operationgeneration == current.operationgeneration && current.admittedcapacity != 0 {
+        if incoming.admittedcapacity == 0 {
+            return Ok(current.clone());
+        }
+        if incoming != *current {
+            return Err(UiError::protocol("inconsistent inference capacity for one operation"));
+        }
+    }
+    Ok(incoming)
+}
+
 pub(super) fn merge_predict_progress(
     target: &mut Option<PredictSnapshot>,
     mut incoming: crate::generated::PredictProgressState,
@@ -743,6 +761,7 @@ pub(super) fn merge_predict_progress(
         return Ok(Observation::Stale);
     }
     incoming.operation = operation;
+    incoming.execution = merge_execution_facts(&installed.execution, incoming.execution)?;
     incoming.apply_to(installed);
     Ok(Observation::Installed)
 }
@@ -795,6 +814,7 @@ pub(super) fn merge_predict_snapshot(
     } else if incoming.revision == latest.revision && full != latest {
         return Err(UiError::protocol("inconsistent Predict progress revision"));
     }
+    incoming.execution = merge_execution_facts(&installed.execution, incoming.execution)?;
     *full_progress = Some(full);
     *installed = incoming;
     Ok(Observation::Installed)

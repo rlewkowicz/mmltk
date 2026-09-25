@@ -34,8 +34,9 @@ mmltk_register_retained_module_importers(
     mmltk_backend_models_rfdetr_inference
     validate.cpp
     evaluation.cpp)
-mmltk_register_ordinary_sources(mmltk_backend_models_rfdetr_inference prediction_count.cpp)
-mmltk_register_private_headers(mmltk_backend_models_rfdetr_inference prediction_count.h prediction_capacity.h prediction_raw_preparation.h dataset_batch_lease.h)
+mmltk_register_ordinary_sources(mmltk_backend_models_rfdetr_inference prediction_count.cpp inference_lanes.cpp)
+mmltk_register_private_headers(mmltk_backend_models_rfdetr_inference prediction_count.h prediction_capacity.h prediction_raw_preparation.h dataset_batch_lease.h detail/inference_lanes.h)
+mmltk_register_header_isolation(mmltk_backend_models_rfdetr_inference)
 target_include_directories(mmltk_backend_models_rfdetr_inference PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
 
@@ -69,6 +70,8 @@ mmltk_enable_torch(mmltk_backend_models_rfdetr_inference PRIVATE)
 function(mmltk_add_backend_models_rfdetr_inference_tests)
     add_executable(mmltk_backend_models_rfdetr_inference_tests
         EXCLUDE_FROM_ALL)
+    mmltk_register_ordinary_sources(mmltk_backend_models_rfdetr_inference_tests
+        ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/inference_lanes.test.cpp)
     mmltk_register_retained_module_importers(
         mmltk_backend_models_rfdetr_inference_tests
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/eval_sample_writer.test.cpp

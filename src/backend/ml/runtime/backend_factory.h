@@ -145,7 +145,7 @@ public:
   const RuntimeTensorBuffer& input, std::span<RuntimeTensorBuffer> outputs, const RuntimeOutputBinding output_binding, const RuntimeContinuation continuation, std::shared_ptr<void> retained_storage);
  void ReleaseAfterCompletion(RuntimeSubmission&& submission);
  [[nodiscard]] RuntimeStatus Close() noexcept;
- [[nodiscard]] virtual std::shared_ptr<RuntimeBackend> MakeLane() const = 0;
+ [[nodiscard]] virtual std::shared_ptr<RuntimeBackend> MakeLane(BorrowedCommandStream command_stream) const = 0;
  virtual void SaveCompiledModel(const std::filesystem::path& path) const = 0;
 
 protected:

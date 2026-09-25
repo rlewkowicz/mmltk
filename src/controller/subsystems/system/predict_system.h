@@ -53,13 +53,17 @@ public:
  using ProductSink = std::function<void(std::expected<Product, std::string>)>;
  using ContextProvider = std::function<std::optional<mmltk::frameworks::gpu::DeviceContext>()>;
  using PreviewRetirement = std::shared_ptr<mmltk::frameworks::gpu::TerminalCudaRetirementOwner>;
- using PlaybackGate = std::function<bool(std::optional<double>, double)>;
+ using ExecutionSink = std::function<void(const mmltk::backend::models::rfdetr::ExecutionFacts&)>;
+ struct PlaybackGate final {
+  std::function<bool()> admission;
+  std::function<bool(std::optional<double>, double)> frame;
+ };
  virtual ~PredictRuntime() = default;
  // Complete physical retirement; successful repeated Close is inert.
  virtual void Close() noexcept {}
  [[nodiscard]] virtual bool HasUnsafeCustody() const noexcept { return false; }
  [[nodiscard]] virtual contracts::ComputeTerminal Run(mmltk::backend::models::rfdetr::PredictRequest, std::stop_token, const ComputeProgressSink&, const ProductSink&, const PlaybackGate&,
-  VisualExtent maximum, const ContextProvider&, const PreviewRetirement&, const ComputeArtifactSink& = {}, const PredictionRunOutput& = {}, std::uint64_t generation = 0) = 0;
+  VisualExtent maximum, const ContextProvider&, const PreviewRetirement&, const ComputeArtifactSink& = {}, const PredictionRunOutput& = {}, std::uint64_t generation = 0, const ExecutionSink& admitted = {}) = 0;
 };
 class CudaPredictRuntime final : public PredictRuntime {
 public:
@@ -68,7 +72,7 @@ public:
  void Close() noexcept override;
  [[nodiscard]] bool HasUnsafeCustody() const noexcept override;
  [[nodiscard]] contracts::ComputeTerminal Run(mmltk::backend::models::rfdetr::PredictRequest, std::stop_token, const ComputeProgressSink&, const ProductSink&, const PlaybackGate&,
-  VisualExtent maximum, const ContextProvider&, const PreviewRetirement&, const ComputeArtifactSink& = {}, const PredictionRunOutput& = {}, std::uint64_t generation = 0) override;
+  VisualExtent maximum, const ContextProvider&, const PreviewRetirement&, const ComputeArtifactSink& = {}, const PredictionRunOutput& = {}, std::uint64_t generation = 0, const ExecutionSink& admitted = {}) override;
 
 private:
  services::RuntimeDiagnosticTarget diagnostics_;
@@ -102,6 +106,7 @@ struct PredictSnapshot final {
  std::uint64_t revision = 0U;
  // CLEANUP-IGNORE: Predict composes compute facts with its private visual frame in one canonical snapshot.
  contracts::ComputeUiState operation{};
+ mmltk::backend::models::rfdetr::ExecutionFacts execution{};
  bool paused = false;
  bool video = false;
  VisualFrame frame{};
@@ -113,6 +118,7 @@ struct PredictSnapshot final {
 struct PredictProgressState final {
  std::uint64_t revision = 0U;
  contracts::ComputeUiState operation{};
+ mmltk::backend::models::rfdetr::ExecutionFacts execution{};
  bool paused = false;
  bool video = false;
 };

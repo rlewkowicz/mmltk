@@ -12,6 +12,7 @@
 #include "src/backend/media/video/video_media.h"
 #include "src/backend/ml/runtime/analysis_provider.h"
 #include "src/backend/models/rfdetr/contract/artifacts.h"
+#include "src/backend/models/rfdetr/contract/execution_plan.h"
 #include "src/backend/models/rfdetr/core/evaluation.h"
 namespace mmltk::backend::models::rfdetr {
 struct PredictionRecord {
@@ -30,6 +31,7 @@ struct PredictionRunResult {
  bool cancelled = false;
  std::size_t processed_images = 0;
  std::uint64_t source_images = 0;
+ ExecutionFacts execution{};
  PhaseTiming timing{};
 };
 // Current-record pixels are either CHW device storage or owned decoded RGB8.
@@ -71,6 +73,7 @@ struct PredictionDelivery final {
  std::function<PredictionDemand(std::int64_t)> demand{};
  std::uint32_t maximum_pixel_width = UINT32_MAX;
  std::uint32_t maximum_pixel_height = UINT32_MAX;
+ std::function<bool()> before_source{};
  std::function<bool(std::optional<double>, double)> before_frame{};
  std::function<void(const mmltk::backend::media::video::VideoMediaInfo&)> media_begin{};
  std::function<void(const mmltk::backend::media::video::VideoAudioPacket&)> audio{};
@@ -78,6 +81,7 @@ struct PredictionDelivery final {
  std::function<void(const PredictionRecord&, PredictionPixels, const mmltk::backend::ml::runtime::AnalysisAnnotationStorage&)> completed{};
  std::function<void(std::size_t completed, std::size_t total)> progress{};
  std::function<void(std::size_t decoded, std::size_t total)> decoded{};
+ std::function<void(const ExecutionFacts&)> admitted{};
  std::shared_ptr<mmltk::frameworks::gpu::TerminalCudaRetirementOwner> retirement{};
  mmltk::frameworks::gpu::PinnedHostBuffer::Operations registered_host_operations{};
 };

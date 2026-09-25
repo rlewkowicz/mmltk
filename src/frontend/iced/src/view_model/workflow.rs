@@ -701,6 +701,7 @@ impl ApplicationModel {
             if value.frame.revision == current.frame.revision {
                 let mut physical = value.clone();
                 physical.operation = current.operation.clone();
+                physical.execution = current.execution.clone();
                 physical.metrics = current.metrics.clone();
                 physical.detailrows = current.detailrows;
                 physical.overlayselection = current.overlayselection.clone();
@@ -724,6 +725,7 @@ impl ApplicationModel {
             let outcome =
                 super::reduction::merge_compute_state(&mut operation, value.operation.clone())?;
             installed = outcome != Observation::Stale;
+            let execution = super::reduction::merge_execution_facts(&current.execution, value.execution.clone())?;
             if outcome == Observation::Stale {
                 value.metrics = current.metrics.clone();
                 value.detailrows = current.detailrows;
@@ -736,6 +738,7 @@ impl ApplicationModel {
                 value.detailrows = detail_rows;
             }
             value.operation = operation;
+            value.execution = execution;
             value.overlayselection = selection;
         }
         if self
@@ -747,6 +750,7 @@ impl ApplicationModel {
             self.workflow.validation_details = None;
         }
         if installed { observe_compute(&mut self.notices, FeatureId::Validate, &value.operation.terminal); }
+        observe_inference_capacity(&mut self.notices, FeatureId::Validate, &value.execution);
         self.workflow.validation = Some(value);
         Ok(())
     }
@@ -1189,6 +1193,44 @@ mod validation_tests {
     }
 
     #[test]
+    fn validation_capacity_is_logical_stable_and_observed_once() {
+        let mut model = crate::view_model::test_support::bootstrapped();
+        let mut value = model.workflow.validation.clone().unwrap();
+        value.operation.generationfrontier = 3;
+        value.execution.operationgeneration = 3;
+        value.execution.configuredcapacity = 4;
+        value.execution.admittedcapacity = 1;
+        value.execution.limitation = crate::generated::ExecutionLimitation::SourceCapacity;
+        let frame = value.frame.clone();
+        model.install_validation_snapshot(value.clone()).unwrap();
+        let notices = model.notices.len();
+        assert!(notices > 0);
+        model.install_validation_snapshot(value.clone()).unwrap();
+        assert_eq!(model.notices.len(), notices);
+        let admitted = value.execution.clone();
+        value.execution.admittedcapacity = 0;
+        model.install_validation_snapshot(value.clone()).unwrap();
+        assert_eq!(model.workflow.validation.as_ref().unwrap().execution, admitted);
+        assert_eq!(model.workflow.validation.as_ref().unwrap().frame, frame);
+        value.execution.admittedcapacity = 2;
+        assert!(model.install_validation_snapshot(value).is_err());
+        let mut bootstrap = super::super::notices::NoticeStore::default();
+        bootstrap.begin_bootstrap();
+        observe_inference_capacity(&mut bootstrap, FeatureId::Validate, &admitted);
+        bootstrap.end_bootstrap();
+        observe_inference_capacity(&mut bootstrap, FeatureId::Validate, &admitted);
+        assert_eq!(bootstrap.len(), 0);
+        let mut pending_bootstrap = super::super::notices::NoticeStore::default();
+        let mut pending = admitted.clone();
+        pending.admittedcapacity = 0;
+        pending_bootstrap.begin_bootstrap();
+        observe_inference_capacity(&mut pending_bootstrap, FeatureId::Validate, &pending);
+        pending_bootstrap.end_bootstrap();
+        observe_inference_capacity(&mut pending_bootstrap, FeatureId::Validate, &admitted);
+        assert_eq!(pending_bootstrap.len(), 1);
+    }
+
+    #[test]
     fn validation_equal_physical_revisions_require_identical_product_facts() {
         let mut model = crate::view_model::test_support::bootstrapped();
         let mut baseline = model.workflow.validation.clone().unwrap();
@@ -1501,6 +1543,7 @@ impl ApplicationModel {
             self.notices.visual_condition(Origin::PredictionPreview, state.operation.generationfrontier, state.frame.revision, None);
             self.notices.condition(Origin::PredictionInspection, (!state.inspection.error.is_empty()), || failure(state.inspection.error.clone()));
             observe_compute(&mut self.notices, FeatureId::Predict, &state.operation.terminal);
+            observe_inference_capacity(&mut self.notices, FeatureId::Predict, &state.execution);
         }
     }
     fn install_live_snapshot(&mut self, value: crate::generated::LiveSnapshot) -> Result<Observation, UiError> {
@@ -1519,6 +1562,19 @@ pub(super) fn observe_compute(notices: &mut super::notices::NoticeStore, feature
         Outcome::Failed => Some(failure(state.detail.clone())),
         Outcome::Refused => Some(warning("Operation refused", state.detail.clone())),
         _ => None,
+    });
+}
+
+fn observe_inference_capacity(notices: &mut super::notices::NoticeStore, feature: FeatureId, facts: &crate::generated::ExecutionFacts) {
+    use crate::generated::ExecutionLimitation;
+    if facts.admittedcapacity == 0 { return; }
+    notices.terminal(Origin::InferenceCapacity(feature), 0, facts.operationgeneration, || {
+        let reason = match facts.limitation {
+            ExecutionLimitation::SourceCapacity => "The selected source",
+            ExecutionLimitation::BackendCapacity => "The selected backend",
+            _ => return None,
+        };
+        Some(warning("Inference capacity limited", format!("{reason} admits {} of {} requested lanes.", facts.admittedcapacity, facts.configuredcapacity)))
     });
 }
 

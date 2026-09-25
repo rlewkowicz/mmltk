@@ -336,7 +336,7 @@ public:
   return Record(request.onnx.device_id, generation);
  }
  contracts::ComputeTerminal Run(mmltk::backend::models::rfdetr::PredictRequest request, std::stop_token, const ComputeProgressSink&, const ProductSink&, const PlaybackGate&, VisualExtent,
-  const ContextProvider&, const PreviewRetirement&, const ComputeArtifactSink&, const PredictionRunOutput&, std::uint64_t generation) override {
+  const ContextProvider&, const PreviewRetirement&, const ComputeArtifactSink&, const PredictionRunOutput&, std::uint64_t generation, const ExecutionSink&) override {
   return Record(request.device_id, generation);
  }
 
@@ -524,7 +524,7 @@ TEST_CASE("workflow replacement observes production session registered-page reti
    return {.terminal = Execute(delivery.retirement)};
   }
   contracts::ComputeTerminal Run(rfdetr::PredictRequest, std::stop_token, const ComputeProgressSink&, const ProductSink&, const PlaybackGate&, VisualExtent, const ContextProvider&,
-   const PreviewRetirement& retirement, const ComputeArtifactSink&, const PredictionRunOutput&, std::uint64_t) override {
+   const PreviewRetirement& retirement, const ComputeArtifactSink&, const PredictionRunOutput&, std::uint64_t, const ExecutionSink&) override {
    return Execute(retirement);
   }
 

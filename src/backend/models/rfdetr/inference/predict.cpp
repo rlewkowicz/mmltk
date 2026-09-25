@@ -13,6 +13,7 @@ module;
 #include "src/frameworks/gpu/device_execution.h"
 #include "src/frameworks/gpu/terminal_cuda_retirement_owner.h"
 #include "dataset_batch_lease.h"
+#include "detail/inference_lanes.h"
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -160,14 +161,15 @@ struct AnnotationBatch final {
 };
 class PredictionBackend final {
 public:
- PredictionBackend(const PredictRequest& options, ResolvedInferenceArtifact artifact, const runtime::BorrowedCommandStream command_stream, std::stop_token stop,
+ PredictionBackend(const PredictRequest& options, ResolvedInferenceArtifact artifact, const runtime::BorrowedCommandStream command_stream,
   std::shared_ptr<mmltk::frameworks::gpu::TerminalCudaRetirementOwner> retirement, mmltk::frameworks::gpu::PinnedHostBuffer::Operations operations)
      : retirement_(std::move(retirement)),
        operations_(operations),
        artifact_(std::move(artifact)),
        maximum_detections_(options.max_dets_per_image),
        device_(options.device_id),
-       command_stream_(command_stream) {
+       command_stream_(command_stream), compilation_mode_(options.compilation_mode), requested_batch_(options.batch_size) {}
+ void Initialize(const PredictRequest& options, std::stop_token stop) {
   if (maximum_detections_ != 0) validate_prediction_candidates(maximum_detections_);
   switch (artifact_.kind) {
    case InferenceArtifactKind::Weights: {
@@ -184,6 +186,7 @@ public:
     static_cast<void>(technical_model.load_normalized_state(resolved.model_state.entries(), false));
     technical_model.to(torch::Device(torch::kCUDA, static_cast<c10::DeviceIndex>(device_)));
     technical_model.eval();
+    technical_model.freeze_inference_weights();
     technical_model.optimize_for_inference(mmltk::common::math::checked_cast<int>(options.batch_size, "native inference batch exceeds supported compilation range"), false, options.compilation_mode);
     native_precision_ = options.allow_fp16 ? torch_cuda::preferred_torch_cuda_precision(device_) : torch_cuda::TorchCudaPrecision::Float32;
     switch (native_precision_) {
@@ -205,7 +208,7 @@ public:
    .artifacts = options,
    .backend = artifact_.backend_name,
    .device = options.device_id,
-   .command_stream = command_stream,
+   .command_stream = command_stream_,
    .static_resolution = options.resolution > 0 ? static_cast<std::uint32_t>(options.resolution) : 0U,
    .maximum_detections = maximum_detections_,
    .save_compiled_model_path = {},
@@ -226,7 +229,26 @@ public:
   artifacts_.config.num_classes = static_cast<int>(shape.extents[2]);
   artifacts_.source_num_queries = artifacts_.config.num_queries;
  }
+ PredictionBackend(const PredictionBackend& source, runtime::BorrowedCommandStream stream, std::shared_ptr<mmltk::frameworks::gpu::TerminalCudaRetirementOwner> retirement)
+  : retirement_(std::move(retirement)), operations_(source.operations_), artifact_(source.artifact_), artifacts_(source.artifacts_),
+    maximum_detections_(source.maximum_detections_), resolution_(source.resolution_), device_(source.device_), command_stream_(stream),
+    native_input_type_(source.native_input_type_), native_precision_(source.native_precision_), native_autocast_enabled_(source.native_autocast_enabled_),
+    compilation_mode_(source.compilation_mode_), requested_batch_(source.requested_batch_) {}
+ void Clone(const PredictionBackend& source) {
+  if (source.native_) {
+   native_ = source.native_->make_inference_clone(static_cast<std::int32_t>(requested_batch_), compilation_mode_);
+   class_postprocess_ = std::make_unique<ClassPostprocessLane>(native_->class_layout());
+   class_postprocess_->Prepare(torch::Device(torch::kCUDA, static_cast<c10::DeviceIndex>(device_)));
+  } else runtime_ = source.runtime_->MakeLane(command_stream_, retirement_);
+ }
  ~PredictionBackend() { static_cast<void>(Close()); }
+ [[nodiscard]] std::size_t batch_size() const {
+  if (runtime_ && runtime_->model_info().input.shape.extents[0] > 0) return static_cast<std::size_t>(runtime_->model_info().input.shape.extents[0]);
+  return requested_batch_;
+ }
+ void Settle() {
+  if (pending_) { runtime_->ReleaseAfterCompletion(std::move(*pending_)); pending_.reset(); }
+ }
  [[nodiscard]] const std::shared_ptr<const ClassArtifactAdmission>& class_artifact() const noexcept { return artifact_.admission; }
  [[nodiscard]] const std::string& name() const noexcept { return artifact_.backend_name; }
  [[nodiscard]] std::uint32_t resolution() const noexcept { return resolution_; }
@@ -243,8 +265,7 @@ public:
  [[nodiscard]] const std::shared_ptr<const ResolvedClassLayout>& class_layout() const noexcept { return native_ ? native_->class_layout() : runtime_->class_layout(); }
  void Execute(const torch::Tensor& input, AnnotationBatch& annotations) {
   if (runtime_) {
-   auto submission = runtime_->Run(input_buffer(input), annotations.storage, annotations.runtime_selections, annotations.want_masks);
-   runtime_->ReleaseAfterCompletion(std::move(submission));
+   pending_.emplace(runtime_->Run(input_buffer(input), annotations.storage, annotations.runtime_selections, annotations.want_masks));
    for (std::size_t index = 0; index < annotations.runtime_selections.size(); ++index) {
     const auto& selected = annotations.runtime_selections[index];
     if (selected.query_indices.device_data == nullptr) {
@@ -276,6 +297,7 @@ public:
   if (runtime_) {
    const auto status = runtime_->Close();
    if (status != runtime::kRuntimeSuccess) return status;
+   pending_.reset();
    runtime_.reset();
   }
   if (native_) {
@@ -296,8 +318,9 @@ public:
 
 private:
  void ExecuteNative(const torch::Tensor& input, AnnotationBatch& annotations) {
-  auto mask = torch::zeros({input.size(0), input.size(2), input.size(3)}, input.options().dtype(torch::kBool));
-  const ModelOutputs outputs = (*native_).forward(NestedTensor{input, std::move(mask)}, annotations.want_masks);
+  if (!nested_mask_.defined() || nested_mask_.size(0) != input.size(0))
+   nested_mask_ = torch::zeros({input.size(0), input.size(2), input.size(3)}, input.options().dtype(torch::kBool));
+  const ModelOutputs outputs = (*native_).forward(NestedTensor{input, nested_mask_}, annotations.want_masks);
   assert_inference_output_dtype(outputs.main.pred_logits, outputs.main.pred_boxes, native_input_type_, "native RF-DETR inference");
   PredictionCountStorage::Prepare(count_storage_, annotations.storage.size(), device_, retirement_, operations_);
   for (std::size_t index = 0U; index < annotations.storage.size(); ++index) {
@@ -333,7 +356,7 @@ private:
  ResolvedInferenceArtifact artifact_;
  ResolvedModelArtifacts artifacts_;
  std::shared_ptr<RfdetrRuntimeBackend> runtime_;
- std::unique_ptr<NativeRfDetrModel> native_;
+ std::shared_ptr<NativeRfDetrModel> native_;
  std::unique_ptr<ClassPostprocessLane> class_postprocess_;
  std::shared_ptr<PredictionCountStorage> count_storage_;
  std::size_t maximum_detections_ = 0U;
@@ -343,6 +366,10 @@ private:
  at::ScalarType native_input_type_ = at::kFloat;
  torch_cuda::TorchCudaPrecision native_precision_ = torch_cuda::TorchCudaPrecision::Float32;
  bool native_autocast_enabled_ = false;
+ CompilationMode compilation_mode_ = CompilationMode::kNone;
+ std::size_t requested_batch_ = 1;
+ std::optional<runtime::RuntimeSubmission> pending_;
+ torch::Tensor nested_mask_;
 };
 void prepare_annotations(AnnotationBatch& result, std::size_t batch, std::size_t capacity, std::uint32_t width, std::uint32_t height, int device, bool masks, bool raw_preview) {
  const auto cuda = torch::TensorOptions().device(torch::kCUDA, static_cast<c10::DeviceIndex>(device));
@@ -393,15 +420,16 @@ void prepare_annotations(AnnotationBatch& result, std::size_t batch, std::size_t
  }
 }
 struct PredictionReadback final {
- explicit PredictionReadback(int device, const std::shared_ptr<mmltk::frameworks::gpu::TerminalCudaRetirementOwner>& retirement, mmltk::frameworks::gpu::PinnedHostBuffer::Operations operations)
+ explicit PredictionReadback(int device, const std::shared_ptr<mmltk::frameworks::gpu::TerminalCudaRetirementOwner>& retirement, mmltk::frameworks::gpu::PinnedHostBuffer::Operations operations,
+  mmltk::backend::ml::cuda::NumaHostTensor& delivery_indices)
      : boxes(device, {}, retirement, operations),
        labels(device, {}, retirement, operations),
        scores(device, {}, retirement, operations),
        masks(device, {}, retirement, operations),
-       indices(device, {}, retirement, operations) {}
+       indices(delivery_indices) {}
  [[nodiscard]] CUresult Close() {
   box_values = label_values = score_values = mask_values = index_values = torch::Tensor{};
-  for (auto* host : {&boxes, &labels, &scores, &masks, &indices}) {
+  for (auto* host : {&boxes, &labels, &scores, &masks}) {
    const auto status = host->ReleaseSettled();
    if (status != CUDA_SUCCESS && status != CUDA_ERROR_NOT_READY) return status;
   }
@@ -409,53 +437,36 @@ struct PredictionReadback final {
   mask_workspace.ResetSettled();
   return CUDA_SUCCESS;
  }
- void Read(AnnotationBatch& batch) {
+ void Enqueue(AnnotationBatch& batch) {
   box_values = boxes.view(batch.boxes.sizes(), at::kFloat);
   label_values = labels.view(batch.labels.sizes(), at::kInt);
   score_values = scores.view(batch.scores.sizes(), at::kFloat);
   box_values.copy_(batch.boxes, true);
   label_values.copy_(batch.labels, true);
   score_values.copy_(batch.scores, true);
+ }
+ void Read(AnnotationBatch& batch) {
   const auto stream = c10::cuda::getCurrentCUDAStream(batch.boxes.get_device());
   const auto status = cudaStreamSynchronize(stream.stream());
   if (status != cudaSuccess) throw runtime::CudaOperationError{status, "prediction readback completion"};
   for (auto& annotation : batch.storage) annotation.count.SettleAfterCompletion(annotation.value_capacity);
   index_values = indices.view(batch.labels.sizes(), at::kLong);
  }
- mmltk::backend::ml::cuda::NumaHostTensor boxes, labels, scores, masks, indices;
+ mmltk::backend::ml::cuda::NumaHostTensor boxes, labels, scores, masks;
+ mmltk::backend::ml::cuda::NumaHostTensor& indices;
  torch::Tensor device_indices, selected_queries, packed_masks;
  SelectedMaskWorkspace mask_workspace;
  torch::Tensor box_values, label_values, score_values, mask_values, index_values;
 };
-void execute_prediction_batch(const PredictRequest& options, PredictionBackend& backend, const torch::Tensor& input, std::size_t batch_size, std::uint32_t width, std::uint32_t height,
- const PredictionDelivery& delivery, AnnotationBatch& annotations, PredictionReadback& readback, std::span<const std::uint32_t> indices = {}, std::int64_t first_index = 0,
- const mmltk::backend::data::DatasetLoader* compiled = nullptr) {
- annotations.demand.resize(batch_size);
- bool masks = false, pixels = false;
- for (std::size_t image = 0; image < batch_size; ++image) {
-  const auto requested = delivery.demand ? delivery.demand(indices.empty() ? first_index + static_cast<std::int64_t>(image) : indices[image]) : PredictionDemand{};
-  const bool bounded = width <= delivery.maximum_pixel_width && height <= delivery.maximum_pixel_height;
-  const bool requested_pixels = (delivery.source_pixels || requested.source_pixels || requested.native_pixels) && static_cast<bool>(delivery.completed);
-  const bool admitted_pixels = requested_pixels && (requested.native_pixels || bounded);
-  const ResolvedPredictionDemand demand{
-   .pixels_requested = requested_pixels,
-   .pixels_admitted = admitted_pixels,
-   .encoded_masks = ((delivery.encoded_masks && options.include_masks) || requested.encoded_masks) && backend.has_masks(),
-   .preview_masks = admitted_pixels && ((bounded && (delivery.source_pixels || requested.source_pixels) && options.include_masks) || requested.preview_masks) && backend.has_masks(),
-  };
-  annotations.demand[image] = demand;
-  masks = masks || demand.encoded_masks || demand.preview_masks;
-  pixels = pixels || demand.pixels_admitted;
- }
- prepare_annotations(annotations, batch_size, backend.capacity(batch_size, width, height, masks), width, height, options.device_id, masks, pixels);
- backend.Execute(input, annotations);
- if (compiled) {
-  for (std::size_t image = 0; image < batch_size; ++image) {
-   const auto geometry = compiled->geometry(indices[image]);
-   clip_prediction_boxes_(annotations.boxes[image], geometry.offset_x, geometry.offset_y, geometry.offset_x + geometry.resized_width, geometry.offset_y + geometry.resized_height);
-  }
- }
- if (annotations.storage.front().value_capacity != 0U) readback.Read(annotations);
+ResolvedPredictionDemand prediction_demand(const PredictRequest& options, const PredictionBackend& backend, const PredictionDelivery& delivery,
+ const PredictionRecord& record, std::uint32_t width, std::uint32_t height) {
+ const auto requested = delivery.demand ? delivery.demand(record.dataset_index) : PredictionDemand{};
+ const bool bounded = width <= delivery.maximum_pixel_width && height <= delivery.maximum_pixel_height;
+ const bool pixels = (delivery.source_pixels || requested.source_pixels || requested.native_pixels) && static_cast<bool>(delivery.completed);
+ const bool admitted = pixels && (requested.native_pixels || bounded);
+ return {.pixels_requested = pixels, .pixels_admitted = admitted,
+  .encoded_masks = ((delivery.encoded_masks && options.include_masks) || requested.encoded_masks) && backend.has_masks(),
+  .preview_masks = admitted && ((bounded && (delivery.source_pixels || requested.source_pixels) && options.include_masks) || requested.preview_masks) && backend.has_masks()};
 }
 struct PredictionSourceStorage final {
  std::array<torch::Tensor, 11U> products;
@@ -684,144 +695,134 @@ void complete_prediction_record(PredictionRecord& record, std::size_t index, con
  ++result.processed_images;
  if (delivery.progress) delivery.progress(result.processed_images, total >= result.processed_images ? total : 0U);
 }
-[[nodiscard]] PredictionRunResult run_image_prediction(const PredictRequest& options, PredictionBackend& backend, const runtime::BorrowedCommandStream command_stream, PredictionRunResult result,
- PredictionReadback& readback, AnnotationBatch& annotations, const PredictionDelivery& delivery) {
- const auto resolution = static_cast<int>(backend.resolution());
- auto host = mmltk::backend::ml::cuda::numa_empty({1, 3, resolution, resolution}, at::kFloat, options.device_id);
- auto device = torch::empty(host.sizes(), torch::TensorOptions().dtype(at::kFloat).device(torch::kCUDA, static_cast<c10::DeviceIndex>(options.device_id)));
- GpuBatchPreprocessor preprocessor(1, resolution, resolution, options.device_id, backend.input_type());
- mmltk::backend::imaging::resample::RgbImageResizer resizer(1);
- std::vector<std::uint8_t> resized(static_cast<std::size_t>(resolution) * resolution * 3U);
- const auto started = std::chrono::steady_clock::now();
- const auto total = options.limit_images == 0U ? options.image_inputs.size() : std::min(options.limit_images, options.image_inputs.size());
- if (delivery.begin) delivery.begin(result);
- for (std::size_t index = 0U; index < total && !delivery.stop.stop_requested(); ++index) {
-  const auto& source = options.image_inputs[index];
-  int width = 0;
-  int height = 0;
-  int channels = 0;
-  DecodedPredictionImage owned_pixels(stbi_load(source.image_path.c_str(), &width, &height, &channels, 3), &stbi_image_free);
-  stbi_uc* pixels = owned_pixels.get();
-  if (pixels == nullptr || width <= 0 || height <= 0) { throw std::runtime_error("failed to decode RF-DETR prediction image: " + source.image_path.string()); }
-  const std::uint8_t* input_pixels = pixels;
-  if (width != resolution || height != resolution) {
-   resizer.resize(pixels, width, height, resized.data(), resolution, resolution);
-   input_pixels = resized.data();
+struct PredictionLane final {
+ PredictionLane() : retirement(std::make_shared<mmltk::frameworks::gpu::TerminalCudaRetirementOwner>(16U)) {}
+ std::shared_ptr<mmltk::frameworks::gpu::TerminalCudaRetirementOwner> retirement;
+ std::unique_ptr<PredictionBackend> backend;
+ std::unique_ptr<PredictionReadback> readback;
+ std::unique_ptr<GpuBatchPreprocessor> preprocessor;
+ AnnotationBatch annotations;
+ torch::Tensor staging, host;
+ std::unique_ptr<mmltk::backend::ml::cuda::NumaHostTensor> host_staging;
+ std::unique_ptr<mmltk::backend::imaging::resample::RgbImageResizer> resizer;
+ std::vector<std::uint8_t> resized;
+ std::vector<PredictionRecord> records;
+ std::vector<PredictionPixels> pixels;
+ std::vector<DecodedPredictionImage> decoded;
+ std::vector<std::shared_ptr<torch::Tensor>> retained_pixels;
+ std::size_t total = 0;
+ void Begin() {
+  records.clear(); pixels.clear(); decoded.clear();
+  annotations.demand.assign(backend->batch_size(), {});
+ }
+ void Prepare(int device, std::uint32_t width, std::uint32_t height) {
+  bool masks = false, pixels_needed = false;
+  for (const auto& demand : annotations.demand) {
+   masks = masks || demand.encoded_masks || demand.preview_masks;
+   pixels_needed = pixels_needed || demand.pixels_admitted;
   }
-  mmltk::backend::imaging::resample::rgb_hwc_u8_to_nchw_f32(input_pixels, host.data_ptr<float>(), resolution, resolution);
-  device.copy_(host, true);
-  const auto normalized = preprocessor.run({.num_images = 1U, .device_images = device.data_ptr<float>()});
-  execute_prediction_batch(
-   options, backend, normalized, 1U, static_cast<std::uint32_t>(width), static_cast<std::uint32_t>(height), delivery, annotations, readback, {}, static_cast<std::int64_t>(result.processed_images));
-  preprocessor.record_consumer(reinterpret_cast<cudaStream_t>(command_stream.native_handle));
-  PredictionRecord record;
-  record.dataset_index = static_cast<std::int64_t>(index);
-  record.image_id = source.image_id != 0 ? source.image_id : static_cast<std::int64_t>(index + 1U);
-  record.source_name = source.source_name.empty() ? source.image_path.string() : source.source_name;
-  complete_prediction_record(record, 0U, options, backend, annotations, readback, delivery, result, total,
-   {.width = static_cast<std::uint32_t>(width), .height = static_cast<std::uint32_t>(height), .device = options.device_id, .stream = command_stream.native_handle}, {}, &owned_pixels);
+  prepare_annotations(annotations, backend->batch_size(), backend->capacity(backend->batch_size(), width, height, masks), width, height, device, masks, pixels_needed);
+  for (std::size_t index = 0; index < pixels.size(); ++index)
+   annotations.storage[index].source_region = {.width = pixels[index].width, .height = pixels[index].height};
  }
- result.cancelled = delivery.stop.stop_requested();
- finish_prediction_run(result, started);
- return result;
-}
-[[nodiscard]] PredictionRunResult run_video_prediction(const PredictRequest& options, PredictionBackend& backend, runtime::BorrowedCommandStream command_stream, PredictionRunResult result,
- PredictionReadback& readback, AnnotationBatch& annotations, const PredictionDelivery& delivery, const std::shared_ptr<mmltk::frameworks::gpu::TerminalCudaRetirementOwner>& source_retirement) {
- const auto started = std::chrono::steady_clock::now();
- const auto cancelled = [&] {
-  result.cancelled = true;
-  finish_prediction_run(result, started);
-  return std::move(result);
- };
- const auto bytes_per_pixel = checked_prediction_extent(3U, sizeof(float), kMaximumPredictionTensorBytes);
- const mmltk::backend::media::video::VideoFrameCapacity capacity{kMaximumPredictionTensorBytes / bytes_per_pixel};
- auto source = std::make_shared<mmltk::backend::media::video::VideoFileSource>(options.video_path, capacity, options.device_id, command_stream.native_handle, delivery.stop, source_retirement);
- if (delivery.stop.stop_requested()) return cancelled();
- if (delivery.media_begin) {
-  const auto info = source->media_info();
-  if (!info || delivery.stop.stop_requested()) return cancelled();
-  delivery.media_begin(*info);
+ void CopyPixels(std::size_t index, const torch::Tensor& source) {
+  if (!annotations.demand[index].pixels_admitted) return;
+  auto& retained = retained_pixels.at(index);
+  if (!retained || retained.use_count() != 1) retained = std::make_shared<torch::Tensor>();
+  if (!retained->defined()) *retained = torch::empty_like(source);
+  else retained->resize_(source.sizes());
+  retained->copy_(source);
+  pixels[index].chw = retained->data_ptr<float>();
  }
- if (delivery.stop.stop_requested()) return cancelled();
- source->SetAudioConsumer(delivery.audio);
- if (delivery.begin) delivery.begin(result);
- if (delivery.stop.stop_requested()) return cancelled();
- const auto cuda = torch::TensorOptions().dtype(at::kFloat).device(torch::kCUDA, options.device_id);
- const auto resolution = static_cast<int>(backend.resolution());
- auto normalized = torch::empty({1, 3, resolution, resolution}, cuda);
- GpuBatchPreprocessor preprocessor(1, resolution, resolution, options.device_id, backend.input_type());
- while (!delivery.stop.stop_requested() && (options.limit_images == 0U || result.processed_images < options.limit_images)) {
-  auto frame = source->Next();
-  if (!frame) break;
-  const auto known = source->frame_count();
-  const auto total = options.limit_images == 0U || known == 0U ? known : std::min<std::size_t>(known, options.limit_images);
-  if (delivery.decoded) delivery.decoded(frame->index + 1U, total >= frame->index + 1U ? total : 0U);
-  if (delivery.before_frame && !delivery.before_frame(frame->presentation_seconds, source->frames_per_second())) break;
-  const std::array<std::int64_t, 4> shape{1, 3, frame->height, frame->width};
-  auto input = torch::from_blob(const_cast<float*>(frame->chw), at::IntArrayRef{shape}, cuda);
-  at::upsample_bilinear2d_out(normalized, input, {resolution, resolution}, false);
-  const auto model_input = preprocessor.run({.num_images = 1U, .device_images = normalized.data_ptr<float>()});
-  execute_prediction_batch(options, backend, model_input, 1U, frame->width, frame->height, delivery, annotations, readback, {}, static_cast<std::int64_t>(result.processed_images));
-  preprocessor.record_consumer(reinterpret_cast<cudaStream_t>(command_stream.native_handle));
-  PredictionRecord record{.dataset_index = static_cast<std::int64_t>(frame->index), .image_id = static_cast<std::int64_t>(frame->index + 1U), .source_name = options.video_path.string()};
-  complete_prediction_record(record, 0U, options, backend, annotations, readback, delivery, result, total,
-   {.chw = frame->chw, .width = frame->width, .height = frame->height, .device = options.device_id, .stream = command_stream.native_handle, .timing = frame->timing}, source);
+ void Submit(const torch::Tensor& input, std::uintptr_t stream, const mmltk::backend::data::DatasetLoader* compiled = nullptr) {
+  backend->Execute(input, annotations);
+  if (compiled) for (std::size_t image = 0; image < records.size(); ++image) {
+   const auto geometry = compiled->geometry(static_cast<std::uint32_t>(records[image].dataset_index));
+   clip_prediction_boxes_(annotations.boxes[image], geometry.offset_x, geometry.offset_y, geometry.offset_x + geometry.resized_width, geometry.offset_y + geometry.resized_height);
+  }
+  preprocessor->record_consumer(reinterpret_cast<cudaStream_t>(stream));
+  if (annotations.storage.front().value_capacity) readback->Enqueue(annotations);
  }
- result.cancelled = delivery.stop.stop_requested();
- finish_prediction_run(result, started);
- return result;
+};
+std::size_t inference_source_capacity(std::size_t requested, std::size_t population, std::size_t batch) {
+ if (!population) return requested;
+ return std::min(requested, 1 + (population - 1) / batch);
 }
 }  // namespace
-struct PredictionSession::State final {
+struct PredictionSession::State final : std::enable_shared_from_this<PredictionSession::State> {
  std::shared_ptr<mmltk::frameworks::gpu::TerminalCudaRetirementOwner> source_retirement = std::make_shared<mmltk::frameworks::gpu::TerminalCudaRetirementOwner>(16U);
  mmltk::frameworks::gpu::TerminalCudaRetirementOwner retirement{1U};
  mmltk::frameworks::gpu::TerminalCudaRetirementLease retirement_lease = mmltk::frameworks::gpu::ReserveTerminalCudaLease(retirement);
- std::unique_ptr<PredictionBackend> backend;
- std::unique_ptr<PredictionReadback> readback;
- AnnotationBatch annotations;
+ mmltk::frameworks::gpu::TerminalCudaRetirementLease source_lease;
+ std::unique_ptr<InferenceLanes> pool;
+ std::unique_ptr<mmltk::backend::ml::cuda::NumaHostTensor> delivery_indices;
+ std::vector<std::shared_ptr<PredictionLane>> lanes;
  ResolvedInferenceArtifact artifact{};
  std::string preset_name;
  std::uint32_t resolution = 0U;
- std::size_t maximum_detections = 0U;
- int device = -1;
- int readback_node = -1;
+ std::size_t maximum_detections = 0U, requested_batch = 0U;
+ int device = -1, readback_node = -1;
  std::uintptr_t command_stream = 0U;
- bool allow_fp16 = false;
- bool poisoned = false;
- bool authority_adopted = false;
+ CompilationMode compilation_mode = CompilationMode::kNone;
+ bool allow_fp16 = false, poisoned = false, authority_adopted = false;
  mmltk::frameworks::gpu::PinnedHostBuffer::Operations operations;
  [[nodiscard]] runtime::RuntimeStatus Close() noexcept;
- [[nodiscard]] PredictionBackend& Bind(const PredictRequest& options, const ResolvedInferenceArtifact& selected, const runtime::BorrowedCommandStream stream, std::stop_token stop, int node) {
+ [[nodiscard]] runtime::RuntimeStatus Fail(runtime::RuntimeStatus status) noexcept {
+  poisoned = true;
+  if (source_lease) std::move(source_lease).Install(mmltk::frameworks::gpu::TerminalCudaCustody::Share(shared_from_this()), static_cast<cudaError_t>(status));
+  return status;
+ }
+ void Bind(const PredictRequest& options, const ResolvedInferenceArtifact& selected, runtime::BorrowedCommandStream stream, std::stop_token stop, int node, std::size_t population) {
   if (selected.admission) {
    selected.admission->RequireUnchanged(stop);
    if (!selected.admission->Matches(selected.path, options.class_layout_path)) throw std::runtime_error("prediction admission does not match selected artifact");
   }
   const auto requested_resolution = options.resolution > 0 ? static_cast<std::uint32_t>(options.resolution) : 0U;
-  if (!backend || !readback || !backend->class_artifact()->Matches(selected.path, options.class_layout_path) || artifact.kind != selected.kind || artifact.backend_name != selected.backend_name ||
-      artifact.path != selected.path || preset_name != options.preset_name || resolution != requested_resolution || maximum_detections != options.max_dets_per_image || device != options.device_id ||
-      command_stream != stream.native_handle || allow_fp16 != options.allow_fp16 || readback_node != node) {
-   auto next_artifact = selected;
-   auto next_preset_name = options.preset_name;
-   const auto status = Close();
-   if (status != runtime::kRuntimeSuccess) throw runtime::CudaOperationError{status, "RF-DETR prediction session rebind"};
-   device = options.device_id;
-   command_stream = stream.native_handle;
-   backend = std::make_unique<PredictionBackend>(options, selected, stream, stop, source_retirement, operations);
-   backend->class_artifact()->RequireUnchanged(stop);
-   readback = std::make_unique<PredictionReadback>(options.device_id, source_retirement, operations);
-   readback_node = node;
-   artifact = std::move(next_artifact);
-   preset_name = std::move(next_preset_name);
-   resolution = requested_resolution;
-   maximum_detections = options.max_dets_per_image;
-   device = options.device_id;
-   command_stream = stream.native_handle;
-   allow_fp16 = options.allow_fp16;
+  const bool reuse = !lanes.empty() && lanes.front()->backend && lanes.front()->backend->class_artifact()->Matches(selected.path, options.class_layout_path) &&
+   artifact.kind == selected.kind && artifact.backend_name == selected.backend_name && artifact.path == selected.path && preset_name == options.preset_name &&
+   resolution == requested_resolution && maximum_detections == options.max_dets_per_image && device == options.device_id && command_stream == stream.native_handle &&
+   allow_fp16 == options.allow_fp16 && readback_node == node && compilation_mode == options.compilation_mode && requested_batch == options.batch_size &&
+   lanes.size() == inference_source_capacity(static_cast<std::size_t>(options.lanes), population, lanes.front()->backend->batch_size());
+  if (reuse) { lanes.front()->backend->class_artifact()->RequireUnchanged(stop); return; }
+  const auto status = Close();
+  if (status != runtime::kRuntimeSuccess) throw runtime::CudaOperationError{status, "RF-DETR inference pool rebind"};
+  device = options.device_id; command_stream = stream.native_handle;
+  pool = std::make_unique<InferenceLanes>(device, inference_source_capacity(static_cast<std::size_t>(options.lanes), population, 1));
+  delivery_indices = std::make_unique<mmltk::backend::ml::cuda::NumaHostTensor>(device, std::shared_ptr<void>{}, source_retirement, operations);
+  lanes.reserve(pool->capacity());
+  for (std::size_t index = 0; index < pool->capacity(); ++index) {
+   lanes.push_back(std::make_shared<PredictionLane>());
+   auto& lane = *lanes.back();
+   c10::cuda::CUDAStreamGuard guard(c10::cuda::getStreamFromExternal(reinterpret_cast<cudaStream_t>(pool->stream(index).native_handle), device));
+   lane.backend = index == 0 ? std::make_unique<PredictionBackend>(options, selected, pool->stream(index), lane.retirement, operations)
+                             : std::make_unique<PredictionBackend>(*lanes.front()->backend, pool->stream(index), lane.retirement);
+   if (index == 0) lane.backend->Initialize(options, stop); else lane.backend->Clone(*lanes.front()->backend);
+   if (index == 0) {
+    lane.backend->class_artifact()->RequireUnchanged(stop);
+    pool->RestrictCapacity(inference_source_capacity(static_cast<std::size_t>(options.lanes), population, lane.backend->batch_size()));
+    // All lane weight reads follow the completed initial load/freeze.
+    pool->ReleaseSource(0);
+   }
+   const auto batch = lane.backend->batch_size();
+   lane.readback = std::make_unique<PredictionReadback>(device, lane.retirement, operations, *delivery_indices);
+   lane.preprocessor = std::make_unique<GpuBatchPreprocessor>(static_cast<std::int64_t>(batch), lane.backend->resolution(), lane.backend->resolution(), device, lane.backend->input_type());
+   lane.retained_pixels.resize(batch);
   }
-  return *backend;
+  artifact = selected; preset_name = options.preset_name; resolution = requested_resolution; maximum_detections = options.max_dets_per_image;
+  allow_fp16 = options.allow_fp16; readback_node = node; compilation_mode = options.compilation_mode; requested_batch = options.batch_size;
  }
- [[nodiscard]] PredictionRunResult RunResolved(
-  const PredictRequest& options, const ResolvedInferenceArtifact& selected_artifact, runtime::BorrowedCommandStream execution_stream, const PredictionDelivery& delivery);
+ void DeliverOldest(const PredictRequest& options, const PredictionDelivery& delivery, PredictionRunResult& result) {
+  const auto index = pool->WaitOldest();
+  auto& lane = *lanes[index];
+  c10::cuda::CUDAStreamGuard guard(c10::cuda::getStreamFromExternal(reinterpret_cast<cudaStream_t>(pool->stream(index).native_handle), device));
+  lane.backend->Settle();
+  if (lane.annotations.storage.front().value_capacity) lane.readback->Read(lane.annotations);
+  for (std::size_t image = 0; image < lane.records.size(); ++image)
+   complete_prediction_record(lane.records[image], image, options, *lane.backend, lane.annotations, *lane.readback, delivery, result, lane.total,
+    lane.pixels[image], lane.retained_pixels[image], lane.decoded.empty() ? nullptr : &lane.decoded[image]);
+  pool->ReleaseOldest();
+ }
+ [[nodiscard]] PredictionRunResult RunResolved(const PredictRequest&, const ResolvedInferenceArtifact&, runtime::BorrowedCommandStream, const PredictionDelivery&);
 };
 PredictionSession::PredictionSession() : state_(std::make_shared<State>()) {}
 PredictionSession::~PredictionSession() {
@@ -832,38 +833,57 @@ PredictionSession::~PredictionSession() {
   std::move(lease).Install(mmltk::frameworks::gpu::TerminalCudaCustody::Share(std::move(state)), cudaErrorUnknown);
  }
 }
-bool PredictionSession::HasUnsafeCustody() const noexcept { return state_->poisoned || !state_->source_retirement->admission_open(); }
+bool PredictionSession::HasUnsafeCustody() const noexcept {
+ return state_->poisoned || !state_->source_retirement->admission_open() ||
+  std::ranges::any_of(state_->lanes, [](const auto& lane) { return lane && !lane->retirement->admission_open(); });
+}
 mmltk::backend::ml::runtime::RuntimeStatus PredictionSession::Close() noexcept { return state_->Close(); }
 runtime::RuntimeStatus PredictionSession::State::Close() noexcept {
  if (poisoned || !source_retirement->admission_open()) return static_cast<runtime::RuntimeStatus>(cudaErrorUnknown);
- if (!backend && !readback) return runtime::kRuntimeSuccess;
- runtime::RuntimeStatus status = runtime::kRuntimeSuccess;
- struct CloseCall {
-  State* state;
-  runtime::RuntimeStatus* status;
- } context{this, &status};
+ if (!pool && lanes.empty() && !delivery_indices) return runtime::kRuntimeSuccess;
  try {
-  torch_cuda::run_on_torch_cuda_stream(device, command_stream, &context, [](void* value) {
-   auto& call = *static_cast<CloseCall*>(value);
-   auto& owner = *call.state;
-   *call.status = static_cast<runtime::RuntimeStatus>(cudaStreamSynchronize(reinterpret_cast<cudaStream_t>(owner.command_stream)));
-   if (*call.status != runtime::kRuntimeSuccess) return;
-   owner.annotations = {};
-   if (owner.backend) {
-    *call.status = owner.backend->Close();
-    if (*call.status != runtime::kRuntimeSuccess) return;
-    owner.backend.reset();
+  mmltk::frameworks::gpu::CudaContextScope context({this, [](void* value) noexcept { static_cast<void>(static_cast<State*>(value)->Fail(cudaErrorUnknown)); }});
+  return context.Run([&]() -> runtime::RuntimeStatus {
+   if (pool) {
+    const auto status = pool->Drain();
+    if (status != runtime::kRuntimeSuccess) return Fail(status);
    }
-   if (owner.readback) {
-    *call.status = static_cast<runtime::RuntimeStatus>(owner.readback->Close());
-    if (*call.status != runtime::kRuntimeSuccess) return;
-    owner.readback.reset();
+   for (std::size_t index = 0; index < lanes.size(); ++index) {
+    auto& lane = lanes[index];
+    c10::cuda::CUDAStreamGuard stream_guard(c10::cuda::getStreamFromExternal(reinterpret_cast<cudaStream_t>(pool->stream(index).native_handle), device));
+    if (!lane->retirement->admission_open()) {
+     return Fail(static_cast<runtime::RuntimeStatus>(cudaErrorUnknown));
+    }
+    lane->annotations = {};
+    if (lane->backend) {
+     const auto status = lane->backend->Close();
+     if (status != runtime::kRuntimeSuccess) return Fail(status);
+    }
+    if (lane->readback) {
+     const auto status = lane->readback->Close();
+     if (status != CUDA_SUCCESS) return Fail(static_cast<runtime::RuntimeStatus>(status));
+    }
+    lane->host = {};
+    if (lane->host_staging) {
+     const auto status = lane->host_staging->ReleaseSettled();
+     if (status != CUDA_SUCCESS) return Fail(static_cast<runtime::RuntimeStatus>(status));
+    }
    }
+   lanes.clear();
+   if (delivery_indices) {
+    const auto status = delivery_indices->ReleaseSettled();
+    if (status != CUDA_SUCCESS && status != CUDA_ERROR_NOT_READY) return Fail(static_cast<runtime::RuntimeStatus>(status));
+    delivery_indices.reset();
+   }
+   if (pool) {
+    const auto status = pool->Close();
+    if (status != runtime::kRuntimeSuccess) return Fail(status);
+    pool.reset();
+   }
+   if (!source_retirement->admission_open()) return Fail(static_cast<runtime::RuntimeStatus>(cudaErrorUnknown));
+   return runtime::kRuntimeSuccess;
   });
- } catch (...) { status = static_cast<runtime::RuntimeStatus>(cudaErrorUnknown); }
- if (!source_retirement->admission_open()) status = static_cast<runtime::RuntimeStatus>(cudaErrorUnknown);
- if (status != runtime::kRuntimeSuccess) poisoned = true;
- return status;
+ } catch (...) { return Fail(static_cast<runtime::RuntimeStatus>(cudaErrorUnknown)); }
 }
 PredictRequest finalize_predict_request(PredictRequest request) {
  validate_predict_request(request);
@@ -908,7 +928,8 @@ PredictionRunResult PredictionSession::RunResolved(
   state_->source_retirement = delivery.retirement;
  }
  state_->authority_adopted = true;
- if (!state_->backend && !state_->readback) state_->operations = delivery.registered_host_operations;
+ if (!state_->source_lease) state_->source_lease = mmltk::frameworks::gpu::ReserveTerminalCudaLease(*state_->source_retirement);
+ if (state_->lanes.empty()) state_->operations = delivery.registered_host_operations;
  if (HasUnsafeCustody()) throw runtime::CudaOperationError{cudaErrorUnknown, "prediction delivery custody is unproved"};
  struct BoundPredictionCall final {
   State* state;
@@ -932,15 +953,17 @@ PredictionRunResult PredictionSession::RunResolved(
    auto& bound = *static_cast<BoundPredictionCall*>(opaque);
    *bound.result = bound.state->RunResolved(*bound.options, *bound.artifact, bound.command_stream, *bound.delivery);
   });
- } catch (const ArtifactPublicationCancelled&) { result.cancelled = true; } catch (const mmltk::frameworks::gpu::CudaContextFailure& error) {
-  if (error.terminal()) {
-   state_->poisoned = true;
-   throw runtime::CudaOperationError{cudaErrorUnknown, "prediction video caller context"};
+ } catch (...) {
+  const auto failure = std::current_exception();
+  const auto status = state_->Close();
+  if (status != runtime::kRuntimeSuccess) throw runtime::CudaOperationError{status, "prediction exceptional retirement"};
+  try { std::rethrow_exception(failure); }
+  catch (const ArtifactPublicationCancelled&) { result.cancelled = true; }
+  catch (const mmltk::frameworks::gpu::CudaContextFailure& error) {
+   if (error.terminal()) { static_cast<void>(state_->Fail(cudaErrorUnknown)); throw runtime::CudaOperationError{cudaErrorUnknown, "prediction video caller context"}; }
+   throw;
   }
-  throw;
- } catch (const runtime::CudaOperationError&) {
-  state_->poisoned = true;
-  throw;
+  catch (const runtime::CudaOperationError& error) { static_cast<void>(state_->Fail(error.status())); throw; }
  }
  if (HasUnsafeCustody()) throw runtime::CudaOperationError{cudaErrorUnknown, "prediction source teardown"};
  return result;
@@ -965,72 +988,170 @@ PredictionRunResult PredictionSession::RunAndWrite(const PredictRequest& request
  return result;
 }
 PredictionRunResult PredictionSession::State::RunResolved(
- const PredictRequest& options, const ResolvedInferenceArtifact& selected_artifact, const runtime::BorrowedCommandStream execution_stream, const PredictionDelivery& delivery) {
+ const PredictRequest& options, const ResolvedInferenceArtifact& selected_artifact, runtime::BorrowedCommandStream execution_stream, const PredictionDelivery& delivery) {
  const auto execution = mmltk::frameworks::gpu::resolve_device_execution(options.device_id, mmltk::common::system::NumaTopology::Capture(), options.numa_node, options.cpu_affinity);
  const auto& placement = execution.placement;
- std::shared_ptr<mmltk::backend::data::DatasetLoader> loader = options.source_kind != PredictSourceKind::CompiledDataset
-                                                                ? std::unique_ptr<mmltk::backend::data::DatasetLoader>{}
-                                                                : inference_detail::make_loader(options.compiled_path, options.batch_size, options, 2U, source_retirement);
  mmltk::common::system::ScopedExecutionPolicy policy({placement.cpus, "predict", 0, placement.numa_node, -10, false});
- auto& bound_backend = Bind(options, selected_artifact, execution_stream, delivery.stop, placement.numa_node);
+ std::shared_ptr<mmltk::backend::data::DatasetLoader> loader;
+ std::shared_ptr<mmltk::backend::media::video::VideoFileSource> video;
+ std::size_t population = 0;
+ if (options.source_kind == PredictSourceKind::CompiledDataset) {
+  loader = inference_detail::make_loader(options.compiled_path, options.batch_size, options, 2U, source_retirement);
+  population = loader->num_images();
+ } else if (options.source_kind == PredictSourceKind::ImageFiles) population = options.image_inputs.size();
+ const auto total = options.limit_images && population ? std::min(options.limit_images, population) : population;
+ Bind(options, selected_artifact, execution_stream, delivery.stop, placement.numa_node, total ? total : options.limit_images);
+ auto& backend = *lanes.front()->backend;
+ const auto batch_size = backend.batch_size();
+ auto started = std::chrono::steady_clock::now();
  PredictionRunResult result;
- result.backend_name = bound_backend.name();
- result.artifacts = bound_backend.artifacts();
- result.artifacts.class_layout = bound_backend.class_layout()->record();
- result.candidate_count = bound_backend.candidate_count();
- result.masks_available = bound_backend.has_masks();
- result.class_catalog = bound_backend.class_layout()->catalog();
- result.class_domain = bound_backend.class_layout()->domain();
- if (options.source_kind == PredictSourceKind::VideoFile) return run_video_prediction(options, bound_backend, execution_stream, std::move(result), *readback, annotations, delivery, source_retirement);
- if (options.source_kind == PredictSourceKind::ImageFiles) { return run_image_prediction(options, bound_backend, execution_stream, std::move(result), *readback, annotations, delivery); }
- if (loader->image_width() != bound_backend.resolution() || loader->image_height() != bound_backend.resolution()) {
+ result.backend_name = backend.name(); result.artifacts = backend.artifacts(); result.artifacts.class_layout = backend.class_layout()->record();
+ result.candidate_count = backend.candidate_count(); result.masks_available = backend.has_masks(); result.class_catalog = backend.class_layout()->catalog(); result.class_domain = backend.class_layout()->domain();
+ result.source_images = loader ? population : 0;
+ result.execution = derive_execution_facts(options, 0);
+ result.execution.admitted_capacity = pool->capacity();
+ result.execution.effective_batch_per_model = result.execution.aggregate_round_images = checked_training_product(batch_size, pool->capacity());
+ if (pool->capacity() < static_cast<std::size_t>(options.lanes)) result.execution.limitation = ExecutionLimitation::SourceCapacity;
+ const auto cancelled = [&] { result.cancelled = true; finish_prediction_run(result, started); return std::move(result); };
+ if (options.source_kind == PredictSourceKind::VideoFile) {
+  const auto bytes = checked_prediction_extent(3U, sizeof(float), kMaximumPredictionTensorBytes);
+  video = std::make_shared<mmltk::backend::media::video::VideoFileSource>(options.video_path,
+   mmltk::backend::media::video::VideoFrameCapacity{kMaximumPredictionTensorBytes / bytes}, options.device_id, execution_stream.native_handle, delivery.stop, source_retirement);
+  if (delivery.stop.stop_requested()) return cancelled();
+  // Container frame counts are advisory, so they never restrict forward capacity.
+  if (delivery.media_begin) {
+   const auto info = video->media_info();
+   if (!info || delivery.stop.stop_requested()) return cancelled();
+   delivery.media_begin(*info);
+  }
+  if (delivery.stop.stop_requested()) return cancelled();
+  video->SetAudioConsumer(delivery.audio);
+ }
+ if (loader && batch_size != options.batch_size) loader = inference_detail::make_loader(options.compiled_path, batch_size, options, 2U, source_retirement);
+ if (loader && (loader->image_width() != backend.resolution() || loader->image_height() != backend.resolution()))
   throw std::invalid_argument("compiled dataset resolution does not match RF-DETR artifact");
- }
- result.source_images = loader->num_images();
+ struct SourceReaders final {
+  State& state;
+  std::shared_ptr<mmltk::backend::data::DatasetLoader> loader;
+  std::shared_ptr<mmltk::backend::media::video::VideoFileSource> video;
+  mmltk::frameworks::gpu::TerminalCudaRetirementLease lease;
+  bool settled = false;
+  ~SourceReaders() noexcept {
+   if (settled) return;
+   const auto status = state.pool->Drain();
+   if (status == runtime::kRuntimeSuccess) return;
+   // This guard runs before the source local is destroyed, including failure
+   // between an asynchronous raw-frame read and its source completion event.
+   if (loader) { try { loader->stop_workers(); } catch (...) {} }
+   std::shared_ptr<void> source = loader ? std::static_pointer_cast<void>(std::move(loader)) : std::static_pointer_cast<void>(std::move(video));
+   if (source) std::move(lease).Install(mmltk::frameworks::gpu::TerminalCudaCustody::Share(std::move(source)), static_cast<cudaError_t>(status));
+   static_cast<void>(state.Fail(status));
+  }
+ } source_readers{*this, loader, video, mmltk::frameworks::gpu::ReserveTerminalCudaLease(*source_retirement)};
+ if (delivery.admitted) delivery.admitted(result.execution);
  if (delivery.begin) delivery.begin(result);
- const auto total = options.limit_images == 0U ? loader->num_images() : std::min(options.limit_images, loader->num_images());
- const auto image_ids = EvaluationDatasetOwner(*loader, EvaluationMetricSet::BBox).image_ids();
- GpuBatchPreprocessor preprocessor(
-  static_cast<std::int64_t>(options.batch_size), static_cast<int>(loader->image_height()), static_cast<int>(loader->image_width()), options.device_id, bound_backend.input_type());
- const auto started = std::chrono::steady_clock::now();
- loader->begin_epoch();
- mmltk::backend::data::Batch batch{};
- std::shared_ptr<DatasetBatchLease> batch_lease;
- while (result.processed_images < total && !delivery.stop.stop_requested()) {
-  // Allocate custody before checking out a slot; ordinary batches reuse it.
-  if (!batch_lease || batch_lease.use_count() != 1) batch_lease = std::make_shared<DatasetBatchLease>(loader, execution_stream.native_handle, source_retirement);
-  if (!loader->next_batch(batch, delivery.stop)) break;
-  batch_lease->Adopt(batch);
-  loader->wait_batch(batch);
-  if (delivery.stop.stop_requested()) {
-   batch_lease->Release();
-   break;
+ std::vector<int> image_ids;
+ if (loader) { image_ids = EvaluationDatasetOwner(*loader, EvaluationMetricSet::BBox).image_ids(); started = std::chrono::steady_clock::now(); loader->begin_epoch(); }
+ std::size_t admitted = 0;
+ bool ended = false;
+ const auto cuda = torch::TensorOptions().dtype(at::kFloat).device(torch::kCUDA, options.device_id);
+ while (!ended && !delivery.stop.stop_requested() && (!total || admitted < total) && (!options.limit_images || admitted < options.limit_images)) {
+  if (pool->pending() == pool->capacity()) DeliverOldest(options, delivery, result);
+  if (delivery.stop.stop_requested()) break;
+  const auto index = pool->Admit();
+  auto& lane = *lanes[index];
+  lane.Begin(); lane.total = total;
+  const auto stream = pool->stream(index);
+  c10::cuda::CUDAStreamGuard stream_guard(c10::cuda::getStreamFromExternal(reinterpret_cast<cudaStream_t>(stream.native_handle), device));
+  torch::Tensor input;
+  if (loader) {
+   DatasetBatchLease lease(loader, stream.native_handle, source_retirement);
+   mmltk::backend::data::Batch batch{};
+   if (!loader->next_batch(batch, delivery.stop)) { ended = true; break; }
+   lease.Adopt(batch); loader->wait_batch(batch);
+   if (delivery.stop.stop_requested()) { lease.Release(); break; }
+   const auto active = std::min(batch.num_images, total - admitted);
+   for (std::size_t image = 0; image < active; ++image) {
+    const auto dataset_index = batch.image_indices[image];
+    if (dataset_index >= image_ids.size()) throw std::runtime_error("RF-DETR dataset image index is out of range");
+    lane.records.push_back({.dataset_index = dataset_index, .image_id = image_ids[dataset_index], .source_name = std::to_string(dataset_index)});
+    lane.pixels.push_back({.width = loader->image_width(), .height = loader->image_height(), .device = device, .stream = stream.native_handle});
+    lane.annotations.demand[image] = prediction_demand(options, backend, delivery, lane.records.back(), loader->image_width(), loader->image_height());
+    if (lane.annotations.demand[image].pixels_admitted) {
+     auto source = torch::from_blob(batch.device_images + image * loader->image_stride() / sizeof(float), {3, loader->image_height(), loader->image_width()}, cuda);
+     lane.CopyPixels(image, source);
+    }
+   }
+   auto active_batch = batch; active_batch.num_images = active;
+   input = lane.preprocessor->run(active_batch, static_cast<std::int64_t>(batch_size));
+   // This event precedes all inference, and metadata/pixels now belong to the
+   // lane. Returning a source credit never waits for a model forward.
+   pool->ReleaseSource(index); lease.Release();
+   lane.Prepare(device, loader->image_width(), loader->image_height());
+  } else {
+   const auto resolution = static_cast<int>(backend.resolution());
+   if (!lane.staging.defined()) lane.staging = torch::empty({static_cast<std::int64_t>(batch_size), 3, resolution, resolution}, cuda);
+   for (std::size_t image = 0; image < batch_size && !delivery.stop.stop_requested(); ++image) {
+    const auto source_index = admitted + image;
+    if ((total && source_index >= total) || (options.limit_images && source_index >= options.limit_images)) break;
+    if (video) {
+     if (delivery.before_source && !delivery.before_source()) { ended = true; break; }
+     auto frame = video->Next();
+     if (!frame) { ended = true; break; }
+     const auto known = video->frame_count();
+     lane.total = options.limit_images && known ? std::min<std::size_t>(known, options.limit_images) : known;
+     if (delivery.decoded) delivery.decoded(frame->index + 1, lane.total >= frame->index + 1 ? lane.total : 0);
+     if (delivery.before_frame && !delivery.before_frame(frame->presentation_seconds, video->frames_per_second())) { ended = true; break; }
+     lane.records.push_back({.dataset_index = static_cast<std::int64_t>(frame->index), .image_id = static_cast<std::int64_t>(frame->index + 1), .source_name = options.video_path.string()});
+     lane.pixels.push_back({.width = frame->width, .height = frame->height, .device = device, .stream = stream.native_handle, .timing = frame->timing});
+     lane.annotations.demand[image] = prediction_demand(options, backend, delivery, lane.records.back(), frame->width, frame->height);
+     pool->WaitSource(index, execution_stream);
+     const auto source = torch::from_blob(const_cast<float*>(frame->chw), {1, 3, frame->height, frame->width}, cuda);
+     auto resized = lane.staging.narrow(0, image, 1);
+     at::upsample_bilinear2d_out(resized, source, {resolution, resolution}, false);
+     lane.CopyPixels(image, source[0]);
+     pool->ReleaseSource(index, execution_stream);
+    } else {
+     if (!lane.host.defined()) {
+      lane.host_staging = std::make_unique<mmltk::backend::ml::cuda::NumaHostTensor>(device, std::shared_ptr<void>{}, lane.retirement, operations);
+      lane.host = lane.host_staging->view({static_cast<std::int64_t>(batch_size), 3, resolution, resolution}, at::kFloat);
+     }
+     if (!lane.resizer) { lane.resizer = std::make_unique<mmltk::backend::imaging::resample::RgbImageResizer>(1); lane.resized.resize(static_cast<std::size_t>(resolution) * resolution * 3); }
+     const auto& source = options.image_inputs[source_index];
+     int width = 0, height = 0, channels = 0;
+     lane.decoded.emplace_back(stbi_load(source.image_path.c_str(), &width, &height, &channels, 3), &stbi_image_free);
+     auto* pixels = lane.decoded.back().get();
+     if (!pixels || width <= 0 || height <= 0) throw std::runtime_error("failed to decode RF-DETR prediction image: " + source.image_path.string());
+     lane.records.push_back({.dataset_index = static_cast<std::int64_t>(source_index), .image_id = source.image_id ? source.image_id : static_cast<std::int64_t>(source_index + 1),
+      .source_name = source.source_name.empty() ? source.image_path.string() : source.source_name});
+     lane.pixels.push_back({.width = static_cast<std::uint32_t>(width), .height = static_cast<std::uint32_t>(height), .device = device, .stream = stream.native_handle});
+     lane.annotations.demand[image] = prediction_demand(options, backend, delivery, lane.records.back(), width, height);
+     if (width != resolution || height != resolution) { lane.resizer->resize(pixels, width, height, lane.resized.data(), resolution, resolution); pixels = lane.resized.data(); }
+     mmltk::backend::imaging::resample::rgb_hwc_u8_to_nchw_f32(pixels, lane.host[image].data_ptr<float>(), resolution, resolution);
+    }
+   }
+   if (lane.records.empty()) { ended = true; break; }
+   if (!video) lane.staging.narrow(0, 0, lane.records.size()).copy_(lane.host.narrow(0, 0, lane.records.size()), true);
+   input = lane.preprocessor->run({.num_images = lane.records.size(), .device_images = lane.staging.data_ptr<float>()}, static_cast<std::int64_t>(batch_size));
+   pool->ReleaseSource(index);
+   std::uint32_t width = 0, height = 0;
+   for (const auto& pixels : lane.pixels) { width = std::max(width, pixels.width); height = std::max(height, pixels.height); }
+   lane.Prepare(device, width, height);
   }
-  auto active_batch = batch;
-  active_batch.num_images = std::min(batch.num_images, total - result.processed_images);
-  auto normalized = preprocessor.run(active_batch);
-  execute_prediction_batch(options, bound_backend, normalized, active_batch.num_images, loader->image_width(), loader->image_height(), delivery, annotations, *readback,
-   {batch.image_indices, active_batch.num_images}, 0, loader.get());
-  preprocessor.record_consumer(reinterpret_cast<cudaStream_t>(execution_stream.native_handle));
-  for (std::size_t image = 0U; image < active_batch.num_images && !delivery.stop.stop_requested(); ++image) {
-   PredictionRecord record;
-   record.dataset_index = static_cast<std::int64_t>(batch.image_indices[image]);
-   const auto dataset_index = static_cast<std::size_t>(record.dataset_index);
-   if (dataset_index >= image_ids.size()) { throw std::runtime_error("RF-DETR dataset image index is out of range"); }
-   record.image_id = image_ids[dataset_index];
-   record.source_name = std::to_string(record.dataset_index);
-   complete_prediction_record(record, image, options, bound_backend, annotations, *readback, delivery, result, total,
-    {.chw = batch.device_images + image * loader->image_stride() / sizeof(float),
-     .width = loader->image_width(),
-     .height = loader->image_height(),
-     .device = options.device_id,
-     .stream = execution_stream.native_handle,
-     .stop_source = [](void* owner) { static_cast<DatasetBatchLease*>(owner)->StopWorkers(); },
-     .source_control = batch_lease.get()},
-    batch_lease);
-  }
-  batch_lease->Release();
+  lane.Submit(input, stream.native_handle, loader.get());
+  pool->Submitted(index);
+  admitted += lane.records.size();
  }
+ // An EOF/Stop may leave a reserved, unsubmitted final slot. It has no output;
+ // settle only the ordered submitted prefix, then retire the partial source work.
+ while (pool->pending()) {
+  const auto lane_index = (admitted - result.processed_images);
+  if (!lane_index) break;
+  DeliverOldest(options, delivery, result);
+ }
+ const auto drained = pool->Drain();
+ if (drained != runtime::kRuntimeSuccess) throw runtime::CudaOperationError{drained, "drain inference pool"};
+ source_readers.settled = true;
  result.cancelled = delivery.stop.stop_requested();
  finish_prediction_run(result, started);
  return result;

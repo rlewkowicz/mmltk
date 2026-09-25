@@ -294,6 +294,18 @@ public:
   EvaluationMetricSet metric_set, const int64_t prediction_capacity, std::string split_name, const bool query_count_automatic);
  ~TrainingValidationRuntime();
  void begin_pass();
+ void bind_model(const NativeRfDetrModel&, std::optional<std::uint64_t> version, EvaluatedWeights);
+ [[nodiscard]] std::size_t lane_capacity() const noexcept;
+ [[nodiscard]] ExecutionFacts execution_facts() const;
+ [[nodiscard]] std::size_t admit_lane();
+ [[nodiscard]] std::uintptr_t active_stream() const;
+ [[nodiscard]] NativeRfDetrModel& active_model();
+ [[nodiscard]] ClassPostprocessLane& active_classes();
+ [[nodiscard]] TrainingEventOwner& events();
+ void submitted();
+ void release_oldest();
+ void drain();
+ void cancel() noexcept;
  torch::Tensor preprocess(const mmltk::backend::data::Batch& batch);
  void record_preprocess_consumer(cudaStream_t stream);
  RuntimeContext& runtime();
@@ -314,10 +326,13 @@ public:
 
 private:
  struct Impl;
- std::unique_ptr<Impl> impl_;
+ mmltk::frameworks::gpu::TerminalCudaRetirementOwner retirement_{1U};
+ mmltk::frameworks::gpu::TerminalCudaRetirementLease lease_ = mmltk::frameworks::gpu::ReserveTerminalCudaLease(retirement_);
+ std::shared_ptr<Impl> impl_;
 };
-EvalPassResult evaluate_model(const TrainRequest& options, TrainingValidationRuntime& validation, NativeRfDetrModel& model, TrainingEventOwner& event_owner, const DetectionConfig& detection_config,
- bool calculate_loss, EvaluationPurpose purpose, EvaluatedWeights evaluated_weights, std::optional<int> current_epoch, TrainingMetricHandoff* metrics = nullptr);
+EvalPassResult evaluate_model(const TrainRequest& options, TrainingValidationRuntime& validation, NativeRfDetrModel& model, const DetectionConfig& detection_config,
+ bool calculate_loss, EvaluationPurpose purpose, EvaluatedWeights evaluated_weights, std::optional<int> current_epoch, TrainingMetricHandoff* metrics = nullptr,
+ std::optional<std::uint64_t> parameter_version = std::nullopt);
 mmltk::backend::data::DatasetLoader::Config make_loader_config(const std::string& compiled_path, size_t batch_size, bool shuffle, int prefetch_factor, int gather_workers,
  const std::string& cpu_affinity, int device_id, uint64_t seed, uint32_t batch_shard_rank = 0, uint32_t batch_shard_count = 1);
 }  // namespace mmltk::backend::models::rfdetr

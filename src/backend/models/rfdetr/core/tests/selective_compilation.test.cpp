@@ -1,4 +1,5 @@
 #include "src/backend/ml/torch/tests/tensor_fixture.h"
+#include "src/backend/models/rfdetr/core/model.h"
 #include "src/backend/models/rfdetr/core/detail/selective_compilation.h"
 #include "src/backend/models/rfdetr/core/detail/decoder_attention.h"
 #include "src/backend/models/rfdetr/core/detail/modules_technical.h"
@@ -17,6 +18,43 @@ namespace {
 namespace rf = mmltk::backend::models::rfdetr;
 namespace tensor_fixture = mmltk::backend::ml::testsupport;
 using Region = rf::detail::SelectiveTensorRegion;
+TEST_CASE("Native inference clones rebind module owners and share only immutable weights", "[rfdetr][compilation][gpu]") {
+ REQUIRE(cudaSetDevice(0) == cudaSuccess);
+ torch::NoGradGuard no_grad;
+ auto config = rf::native_config_from_preset(rf::model_presets().front());
+ config.resolution = 64; config.num_queries = 3; config.num_select = 3; config.num_classes = 2;
+ rf::NativeRfDetrModel master(config);
+ master.to(torch::Device(torch::kCUDA, 0));
+ master.eval();
+ const auto cuda = torch::TensorOptions().device(torch::kCUDA);
+ rf::NestedTensor input{torch::rand({1, 3, 64, 64}, cuda), torch::zeros({1, 64, 64}, cuda.dtype(torch::kBool))};
+ const auto reference = master.forward(input, false).main.pred_logits.to(torch::kCPU);
+ for (const auto mode : {rf::CompilationMode::kNone, rf::CompilationMode::kSelective}) {
+  auto first = master.make_inference_clone(1, mode);
+  auto second = first->make_inference_clone(1, mode);
+  const auto original = master.named_parameters();
+  const auto frozen = first->named_parameters();
+  const auto sibling = second->named_parameters();
+  for (const auto& entry : original) {
+   REQUIRE(frozen[entry.key()].data_ptr() != entry.value().data_ptr());
+   REQUIRE(frozen[entry.key()].data_ptr() == sibling[entry.key()].data_ptr());
+   CHECK_FALSE(frozen[entry.key()].requires_grad());
+  }
+  const auto before = first->forward(input, false).main.pred_logits.to(torch::kCPU);
+  CHECK(torch::allclose(before, reference, 2e-4, 2e-4));
+  original["class_embed.bias"].add_(3);
+  CHECK_FALSE(torch::allclose(master.forward(input, false).main.pred_logits.to(torch::kCPU), before));
+  CHECK(torch::allclose(first->forward(input, false).main.pred_logits.to(torch::kCPU), before, 2e-4, 2e-4));
+  second->invalidate_compilation();
+  CHECK(torch::allclose(second->forward(input, false).main.pred_logits.to(torch::kCPU), before, 2e-4, 2e-4));
+  CHECK_THROWS_AS(first->train(), std::logic_error);
+  CHECK_THROWS_AS(first->to(torch::kCPU), std::logic_error);
+  original["class_embed.bias"].sub_(3);
+ }
+ master.freeze_inference_weights();
+ auto sealed = master.make_inference_clone(1, rf::CompilationMode::kNone);
+ CHECK(sealed->parameters().front().data_ptr() == master.parameters().front().data_ptr());
+}
 struct AttentionPair {
  torch::nn::MultiheadAttention actual{torch::nn::MultiheadAttentionOptions(4, 2).dropout(0.0)};
  torch::nn::MultiheadAttention oracle{torch::nn::MultiheadAttentionOptions(4, 2).dropout(0.0)};

@@ -51,11 +51,11 @@ bool CudaPredictRuntime::HasUnsafeCustody() const noexcept {
 }
 contracts::ComputeTerminal CudaPredictRuntime::Run(mmltk::backend::models::rfdetr::PredictRequest operation, const std::stop_token stop, const ComputeProgressSink& progress,
  const ProductSink& products, const PlaybackGate& gate, VisualExtent maximum, const ContextProvider& current_context, const PreviewRetirement& retirement, const ComputeArtifactSink& published,
- const PredictionRunOutput& output, std::uint64_t generation) {
+ const PredictionRunOutput& output, std::uint64_t generation, const ExecutionSink& admitted) {
  if (!retirement) throw std::invalid_argument("prediction preview retirement authority is unavailable");
  if (!retirement->admission_open()) throw contracts::UnavailableError("prediction receiver custody is unobservable");
  return impl_->resources.Run(
-  [this, generation, &progress, &products, &gate, stop, operation, maximum, &current_context, &retirement, &published, &output](
+  [this, generation, &progress, &products, &gate, stop, operation, maximum, &current_context, &retirement, &published, &output, &admitted](
    const mmltk::backend::ml::runtime::BorrowedCommandStream stream) mutable {
    if (operation.device_id != impl_->resources.device()) throw std::invalid_argument("prediction device disagrees with admitted execution");
    diagnostics_.Emit([&] {
@@ -92,7 +92,8 @@ contracts::ComputeTerminal CudaPredictRuntime::Run(mmltk::backend::models::rfdet
        },
       .maximum_pixel_width = maximum.width,
       .maximum_pixel_height = maximum.height,
-      .before_frame = gate,
+      .before_source = gate.admission,
+      .before_frame = gate.frame,
       .media_begin = full_video ? MediaBegin{[&](const auto& info) { media.Media(info); }} : MediaBegin{},
       .audio = full_video ? AudioDelivery{[&](const auto& packet) { media.Audio(packet); }} : AudioDelivery{},
       .begin =
@@ -147,6 +148,7 @@ contracts::ComputeTerminal CudaPredictRuntime::Run(mmltk::backend::models::rfdet
        [&](std::size_t decoded, std::size_t total) {
         if (progress) progress({++sequence, decoded, total, "Decoded"});
        },
+      .admitted = admitted,
       .retirement = retirement,
      });
    } catch (...) {
@@ -226,6 +228,8 @@ public:
    if (!generation) throw contracts::FailedError("prediction operation generation exhausted");
    state_.revision = detail::PredictRevision::Admit(state_.revision);
    contracts::begin_compute(state_.operation, *generation, "Preparing selected prediction inputs");
+   state_.execution = mmltk::backend::models::rfdetr::derive_execution_facts(configured_request, settings.revision);
+   state_.execution.operation_generation = *generation;
    state_.paused = false;
    preview_failure_.clear();
    state_.video = source.kind == contracts::SourceKind::VideoFile;
@@ -307,12 +311,29 @@ public:
       auto terminal = runtime_->Run(
        std::move(*request), stop, [this](const auto& progress) { Progress(progress); },
        [this, &source_key, video](std::expected<PredictRuntime::Product, std::string> product) { Product(std::move(product), source_key, video); },
-       [this, stop](std::optional<double> timestamp, double fps) { return playback_.Wait(timestamp, fps, stop); }, {visual_.maximum_width, visual_.maximum_height},
+       {.admission = [this, stop] { return playback_.WaitAdmission(stop); },
+        .frame = [this, stop](std::optional<double> timestamp, double fps) { return playback_.Wait(timestamp, fps, stop); }}, {visual_.maximum_width, visual_.maximum_height},
        [this] {
         std::unique_lock context_lock(preview_context_mutex_, std::try_to_lock);
         return context_lock.owns_lock() ? preview_context_ : std::nullopt;
        },
-       preview_retirement_, [this](const auto& path) { Artifact(path); }, media_output, generation);
+       preview_retirement_, [this](const auto& path) { Artifact(path); }, media_output, generation,
+       [this, generation](const auto& admitted) {
+        {
+         std::scoped_lock lock(mutex_);
+         if (state_.operation.generation_frontier != generation || !state_.operation.active) return;
+         auto facts = admitted;
+         facts.settings_revision = state_.execution.settings_revision;
+         facts.operation_generation = generation;
+         if (state_.execution.admitted_capacity) {
+          if (state_.execution != facts) throw std::logic_error("prediction capacity changed during an admitted operation");
+          return;
+         }
+         state_.execution = facts;
+         if (const auto revision = detail::PredictRevision::Progress(state_.revision, state_.operation.terminal.outcome == contracts::ComputeOperationOutcome::CancellationRequested)) state_.revision = *revision;
+        }
+        Publish(PredictChanged{snapshot()});
+       });
       // Native source failures already fail RunAndWrite. Optional receiver
       // failure seals custody without changing a completed semantic result.
       if (runtime_->HasUnsafeCustody()) RetireRuntime();

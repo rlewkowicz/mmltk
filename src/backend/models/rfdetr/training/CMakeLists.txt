@@ -92,6 +92,7 @@ target_link_libraries(mmltk_backend_models_rfdetr_training
         mmltk::backend::models::rfdetr::contract
         mmltk::backend::models::rfdetr::core
     PRIVATE
+        mmltk::backend::models::rfdetr::inference
         mmltk::backend::models::rfdetr::augmentation
         mmltk::backend::ml::cuda
         mmltk::backend::ml::layers

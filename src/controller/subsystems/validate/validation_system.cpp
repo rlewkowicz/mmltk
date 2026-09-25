@@ -102,6 +102,21 @@ public:
   std::uint64_t generation, const std::filesystem::path& directory, contracts::ValidationRunPreview preview, DirectComputeConfiguration configuration) {
   mmltk::backend::models::rfdetr::ValidationDelivery delivery;
   delivery.retirement = sample_output_.RetirementAuthority();
+  delivery.admitted = [this, generation](const auto& admitted) {
+   {
+    std::scoped_lock lock(mutex_);
+    if (state_.generation_frontier != generation || !state_.active) return;
+    auto facts = admitted;
+    facts.settings_revision = execution_.settings_revision;
+    facts.operation_generation = generation;
+    if (execution_.admitted_capacity) {
+     if (execution_ != facts) throw std::logic_error("validation capacity changed during an admitted operation");
+     return;
+    }
+    execution_ = facts;
+   }
+   Changed();
+  };
   delivery.samples_selected = [this, generation, directory, preview, configuration](auto indices, auto) {
    sample_output_.Begin(directory, preview, indices, configuration);
    if (previews_) {
@@ -137,11 +152,12 @@ public:
   run_.Start({
    .policy = configuration.worker_policy(),
    .prepare =
-    [this] {
+    [this, facts = mmltk::backend::models::rfdetr::derive_execution_facts(request, settings.revision)] {
      std::scoped_lock lock(mutex_);
      const auto next = contracts::next_compute_generation(state_.generation_frontier);
      if (!next) throw contracts::FailedError("compute operation generation exhausted");
      contracts::begin_compute(state_, *next, "Inspecting selected inputs");
+     execution_ = facts; execution_.operation_generation = *next;
     },
    .work = [this, settings = settings.settings, selection, preview, configuration](const std::stop_token stop) mutable -> direct::LocalRun::Notification {
     const auto generation = operation().generation_frontier;
@@ -253,6 +269,7 @@ public:
   auto result = samples_.snapshot();
   std::scoped_lock lock(mutex_);
   result.operation = state_;
+  result.execution = execution_;
   if (evaluation_ && evaluation_generation_ == state_.generation_frontier) {
    result.metrics = evaluation_->summary;
    result.detail_rows = static_cast<std::uint32_t>(evaluation_->details.size());
@@ -269,6 +286,7 @@ public:
  SystemEventSink<ValidationSystem::event_type> events_;
  mutable std::mutex mutex_;
  contracts::ComputeUiState state_{};
+ mmltk::backend::models::rfdetr::ExecutionFacts execution_{};
  std::unique_ptr<ValidationRuntime> runtime_;
  DirectComputeResolver resolver_;
  std::optional<DirectComputeConfiguration> runtime_configuration_;

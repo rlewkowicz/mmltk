@@ -48,6 +48,35 @@ import mmltk.backend.models.rfdetr.inference.prediction;
 using namespace mmltk::controller::test_support;
 namespace mmltk::controller {
 namespace {
+class AdmittedPredictRuntime final : public PredictRuntime {
+public:
+ contracts::ComputeTerminal Run(mmltk::backend::models::rfdetr::PredictRequest request, std::stop_token, const ComputeProgressSink&, const ProductSink&, const PlaybackGate&, VisualExtent,
+  const ContextProvider&, const PreviewRetirement&, const ComputeArtifactSink&, const PredictionRunOutput&, std::uint64_t, const ExecutionSink& admitted) override {
+  auto facts = mmltk::backend::models::rfdetr::derive_execution_facts(request, 0);
+  facts.admitted_capacity = 1;
+  admitted(facts); admitted(facts);
+  return contracts::make_compute_terminal(contracts::ComputeOperationOutcome::Succeeded);
+ }
+};
+TEST_CASE("Predict retains admission facts with accepted settings and operation ownership", "[controller][systems][predict]") {
+ ApplicationDataFixture fixture{mmltk::testsupport::make_temp_root("predict-capacity-facts")};
+ fixture.PrepareModel(contracts::FeatureId::Predict);
+ auto [settings, dataset, model] = fixture.systems();
+ const auto revision = settings.snapshot().revision;
+ std::promise<void> settled;
+ PredictSystem prediction{settings, dataset, model, {}, [](DirectComputeConfiguration) { return std::make_unique<AdmittedPredictRuntime>(); },
+  [&](PredictSystem::event_type event) {
+   if (const auto* changed = std::get_if<PredictChanged>(&event); changed && !changed->snapshot.operation.active && changed->snapshot.operation.generation_frontier)
+    mmltk::testsupport::release_test_promise(settled);
+  }, [](int, int) { return DirectComputeConfiguration{}; }};
+ static_cast<void>(prediction.Start({}));
+ mmltk::testsupport::await_test_promise(settled, "prediction admitted capacity");
+ const auto snapshot = prediction.snapshot();
+ CHECK(snapshot.execution.admitted_capacity == 1);
+ CHECK(snapshot.execution.settings_revision == revision);
+ CHECK(snapshot.execution.operation_generation == snapshot.operation.generation_frontier);
+ CHECK(snapshot.operation.terminal.outcome == contracts::ComputeOperationOutcome::Succeeded);
+}
 TEST_CASE("Predict revision capacity preserves cancellation and terminal observations", "[controller][systems][predict]") {
  using Revision = detail::PredictRevision;
  constexpr auto maximum = std::numeric_limits<std::uint64_t>::max();
@@ -85,7 +114,7 @@ public:
  }
  [[nodiscard]] bool HasUnsafeCustody() const noexcept override { return unsafe_; }
  contracts::ComputeTerminal Run(mmltk::backend::models::rfdetr::PredictRequest, std::stop_token, const ComputeProgressSink&, const ProductSink&, const PlaybackGate&, VisualExtent,
-  const ContextProvider&, const PreviewRetirement& retirement, const ComputeArtifactSink&, const PredictionRunOutput&, std::uint64_t) override {
+  const ContextProvider&, const PreviewRetirement& retirement, const ComputeArtifactSink&, const PredictionRunOutput&, std::uint64_t, const ExecutionSink&) override {
   if (preview_terminal_) {
    auto lease = mmltk::frameworks::gpu::ReserveTerminalCudaLease(*retirement);
    auto retained = custody_;
@@ -139,7 +168,7 @@ TEST_CASE("Predict observes receiver retirement discovered while releasing a rep
    if (lease_) std::move(lease_).Install(mmltk::frameworks::gpu::TerminalCudaCustody::Share(std::move(custody_)), cudaErrorUnknown);
   }
   contracts::ComputeTerminal Run(mmltk::backend::models::rfdetr::PredictRequest, std::stop_token, const ComputeProgressSink&, const ProductSink&, const PlaybackGate&, VisualExtent,
-   const ContextProvider&, const PreviewRetirement& retirement, const ComputeArtifactSink&, const PredictionRunOutput&, std::uint64_t) override {
+   const ContextProvider&, const PreviewRetirement& retirement, const ComputeArtifactSink&, const PredictionRunOutput&, std::uint64_t, const ExecutionSink&) override {
    retirement_ = retirement;
    lease_ = mmltk::frameworks::gpu::ReserveTerminalCudaLease(*retirement_);
    return contracts::make_compute_terminal(contracts::ComputeOperationOutcome::Succeeded);
@@ -263,7 +292,7 @@ public:
 class OutputPredictRuntime final : public PredictRuntime {
 public:
  contracts::ComputeTerminal Run(mmltk::backend::models::rfdetr::PredictRequest request, std::stop_token, const ComputeProgressSink&, const ProductSink&, const PlaybackGate&, VisualExtent,
-  const ContextProvider&, const PreviewRetirement&, const ComputeArtifactSink& published, const PredictionRunOutput& options, std::uint64_t) override {
+  const ContextProvider&, const PreviewRetirement&, const ComputeArtifactSink& published, const PredictionRunOutput& options, std::uint64_t, const ExecutionSink&) override {
   namespace rfdetr = mmltk::backend::models::rfdetr;
   namespace gpu = mmltk::frameworks::gpu;
   const bool compiled = request.source_kind == rfdetr::PredictSourceKind::CompiledDataset;

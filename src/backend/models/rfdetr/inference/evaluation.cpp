@@ -18,6 +18,7 @@ EvaluationRunResult run_evaluation(const EvaluateRequest& request) {
  static_cast<InferenceExecutionConfig&>(validation) = options;
  validation.compiled_path = options.compiled_path;
  validation.batch_size = options.batch_size;
+ validation.lanes = options.lanes > 0 ? options.lanes : 1;
  validation.limit_images = options.limit_images;
  validation.candidate_count = options.candidate_count;
  validation.eval_max_dets = options.eval_max_dets;
