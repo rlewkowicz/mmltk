@@ -110,6 +110,8 @@ test("direct annotation includes are unconditional and preserve CRLF", () => {
   assert.ok(result.output.startsWith(`#pragma once\r\n#include "${ANNOTATION_HEADER}"\r\n#if ENABLE`));
   assert.equal(formatDeclarationSource(sourcePath, result.output).changed, false);
   assert.equal(formatDeclarationSource("src/fixture.cppm", source).changed, false);
+  assert.equal(formatDeclarationSource("src/fixture.cppm.in", source).changed, false);
+  assert.equal(formatDeclarationSource("src/fixture.cppm.in", "MMLTK_MAX_BYTES(8) std::string value;\n").changed, false);
 });
 
 test("declaration categories do not depend on namespace depth", () => {
@@ -134,7 +136,7 @@ test("raw short CPD uses existing XML parser and retains exact evidence separate
   const report = rawCpdReport(selection.profile, { scannedFiles: [sourcePath] }, { duplications: parsed, status: 0, stderr: "" }, () => source);
   assert.equal(report.raw_matches.length, 1);
   assert.equal(report.raw_matches[0].occurrences.length, 2);
-  assert.equal(report.raw_matches[0].occurrences[0].text, source.split("\n")[1].slice(0, 20));
+  assert.equal(report.raw_matches[0].occurrences[0].text, source.split("\n")[1].slice(0, 19));
   assert.equal(report.detector.inline_suppressions, false);
   assert.equal(report.detector.sequence_skipping, false);
   assert.ok(report.classified_context.every((item) => item.disposition !== "rewrite"));
@@ -156,9 +158,9 @@ test("raw evidence ordering is deterministic without inventing or coalescing mat
   assert.equal(report(matches).raw_matches.length, 2);
 });
 
-test("multiline source evidence uses inclusive CPD columns and exact offsets", () => {
+test("multiline source evidence uses exclusive CPD end columns and exact offsets", () => {
   const source = "before\n [[= x{\n  4}]]\nafter\n";
-  const result = sourceOccurrence(sourcePath, source, { start: 2, end: 3, column: 2, endColumn: 6 }, lineStarts(source));
+  const result = sourceOccurrence(sourcePath, source, { start: 2, end: 3, column: 2, endColumn: 7 }, lineStarts(source));
   assert.equal(result.text, "[[= x{\n  4}]]");
 });
 

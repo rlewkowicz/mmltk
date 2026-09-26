@@ -634,7 +634,6 @@ template <class Root, class Relation, auto Selector>
  }
 }
 template <class Root, class Value, auto... Prefix>
-// CPD-OFF: Relation auditing and relation visitation recurse the same native tree but produce different facts.
 consteval void audit_settings_relations(
  std::vector<mmltk::frameworks::reflection::ReflectedMemberIdentity>& opaque, std::vector<mmltk::frameworks::reflection::ReflectedMemberIdentity>& claims, bool& valid) {
  using Type = std::remove_cvref_t<Value>;
@@ -643,7 +642,6 @@ consteval void audit_settings_relations(
   return;
  } else {
   mmltk::frameworks::reflection::visit_materialized_bases<Type>([&]<class Base>() { audit_settings_relations<Root, Base, Prefix...>(opaque, claims, valid); });
-  // CPD-ON
   mmltk::frameworks::reflection::visit_materialized_members<Type>([&]<class Declaration>(const auto&) {
    if constexpr (requires { Declaration::pointer; }) {
     using Member = typename Declaration::member_type;
@@ -1089,13 +1087,11 @@ concept SettingsSurfaceCarrier = requires {
  System::settings_surface::defaults_factory;
 };
 template <class Composition>
-// CPD-OFF: This selects one settings-system type; snapshot discovery selects one annotated method.
 [[nodiscard]] consteval std::meta::info settings_surface_system_info() {
  std::meta::info selected = ^^void;
  std::size_t count = 0U;
  template for (constexpr auto cell : std::define_static_array(std::meta::nonstatic_data_members_of(^^Composition, std::meta::access_context::unchecked()))) {
   using System = typename ReflectedSystem<Composition, cell>::type;
-  // CPD-ON
   if constexpr (SettingsSurfaceCarrier<System>) {
    selected = ^^System;
    ++count;

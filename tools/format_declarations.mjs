@@ -2,7 +2,7 @@
 import { readFileSync, statSync, chmodSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 import { buildInventory, CLEANUP_PROFILES, collectInventoryInputs, writeAtomic } from "./generate_cleanup_json.mjs";
-import { conflictingMacros, formatDeclarationSource } from "./cleanup/declaration_patterns.mjs";
+import { inventoryMacroConflicts, formatDeclarationSource } from "./cleanup/declaration_patterns.mjs";
 
 export function parseFormatArgs(args) {
   if (args.length === 1 && ["--help", "-h"].includes(args[0])) return { mode: "help" };
@@ -21,7 +21,7 @@ export function parseFormatArgs(args) {
   return options;
 }
 export function declarationFormatReport(inventory, sources, options = {}) {
-  const conflicts = new Set(inventory.flatMap((path) => conflictingMacros(path, sources.get(path))));
+  const conflicts = inventoryMacroConflicts(sources);
   const selected = options.files?.length ? [...new Set(options.files)].sort() : inventory;
   for (const path of selected) if (!inventory.includes(path)) throw new Error(`source is not in the first-party CPD inventory: ${path}`);
   const results = selected.map((path) => ({ path, ...formatDeclarationSource(path, sources.get(path), { macroConflicts: conflicts }) }));

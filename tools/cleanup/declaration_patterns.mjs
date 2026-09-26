@@ -1,6 +1,6 @@
 // Declaration evidence and strictly syntactic authoring rules. This is not a
 // C++ semantic parser: uncertain lookup/preprocessing is an explicit manual case.
-import { SourceIndex, tokenizeCpp } from "./cpd_patterns.mjs";
+import { SourceIndex, sourceRange, tokenizeCpp } from "./cpd_patterns.mjs";
 
 export const ANNOTATION_HEADER = "src/frameworks/reflection/declaration_annotations.h";
 const POLICY_NAMESPACE = "mmltk::frameworks::reflection";
@@ -28,18 +28,13 @@ function lineAt(lines, offset) {
   return low;
 }
 export function sourceOccurrence(path, source, occurrence, lines = lineStarts(source)) {
-  const startOffset = lines[occurrence.start - 1] + (occurrence.column ?? 1) - 1;
-  const endOffset = occurrence.endColumn === undefined ? lines[occurrence.end] ?? source.length :
-    lines[occurrence.end - 1] + occurrence.endColumn;
-  if (!Number.isInteger(startOffset) || !Number.isInteger(endOffset) || startOffset < 0 || endOffset < startOffset || endOffset > source.length) {
-    throw new Error(`invalid source span: ${path}:${occurrence.start}-${occurrence.end}`);
-  }
+  const [startOffset, endOffset] = sourceRange(source, { ...occurrence, path }, lines);
   return { ...occurrence, path, start_offset: startOffset, end_offset: endOffset, text: source.slice(startOffset, endOffset) };
 }
 function span(path, source, lines, start, end) {
   const startLine = lineAt(lines, start), endLine = lineAt(lines, Math.max(start, end - 1));
   return { path, start: startLine, end: endLine, column: start - lines[startLine - 1] + 1,
-    endColumn: end - lines[endLine - 1], start_offset: start, end_offset: end, text: source.slice(start, end) };
+    endColumn: end - lines[endLine - 1] + 1, start_offset: start, end_offset: end, text: source.slice(start, end) };
 }
 function spelling(tokens) { return tokens.map((token) => token.text).join(""); }
 
@@ -76,6 +71,29 @@ export function conflictingMacros(path, source) {
     const name = /^#\s*(?:define|undef)\s+(\w+)/u.exec(text)?.[1];
     return MACRO_NAMES.has(name) ? [name] : [];
   });
+}
+export function inventoryMacroConflicts(sources) {
+  return new Set([...sources].flatMap(([path, source]) => conflictingMacros(path, source)));
+}
+
+// Bounded lexical template/call recognition. Failure is a manual candidate;
+// neither this evidence helper nor its caller grants any rewrite authority.
+export function invocationEnd({ tokens, pairs }, start) {
+  const limit = Math.min(tokens.length, start + 2048);
+  let next = start + 1;
+  if (tokens[next]?.text === "<") {
+    let depth = 1;
+    for (++next; next < limit && depth > 0; ++next) {
+      const close = pairs.get(next);
+      if (close > next) { next = close; continue; }
+      if (tokens[next].text === "<") ++depth;
+      else if ([">", ">>"].includes(tokens[next].text)) depth -= tokens[next].text.length;
+    }
+    if (depth !== 0) return null;
+  }
+  if (tokens[next]?.text !== "(") return null;
+  const close = pairs.get(next);
+  return close > next && close < limit ? close + 1 : null;
 }
 function inside(regions, offset) { return regions.some(({ start, end }) => start <= offset && offset < end); }
 
@@ -169,6 +187,16 @@ export function classifyDeclarations(path, source, { macroConflicts = new Set() 
   const aliases = index.balanced ? policyAliases(tokens, pairs, regions, conditional) : new Map();
   const localConflicts = new Set([...macroConflicts, ...conflictingMacros(path, source)]);
   const candidates = [], annotations = [];
+  const declarationOwners = [], scopes = [];
+  for (let i = 0; i < tokens.length; ++i) {
+    while (scopes.length && scopes.at(-1).end <= i) scopes.pop();
+    if (tokens[i].text === "{" && pairs.get(i) > i) {
+      const previous = tokens[i - 1]?.text === "=" ? i - 2 : i - 1;
+      const name = tokens[previous]?.text;
+      scopes.push({ end: pairs.get(i), name: IDENTIFIER.test(name ?? "") ? name : scopes.at(-1)?.name ?? null });
+    }
+    declarationOwners.push(scopes.at(-1)?.name ?? null);
+  }
   const tokenEnd = (position) => pairs.get(position) > position ? pairs.get(position) : position;
   const context = (start, end) => {
     const record = index.records[index.recordOwners[start]];
@@ -181,7 +209,7 @@ export function classifyDeclarations(path, source, { macroConflicts = new Set() 
     const member = declaration.at(-1)?.text;
     const startLine = Math.max(1, lineAt(lines, tokens[start].offset) - 1);
     const endLine = Math.min(lines.length, lineAt(lines, tokens[Math.max(start, end - 1)].end) + 1);
-    return { owner: record?.name ?? fn?.name ?? null,
+    return { owner: record?.name ?? fn?.name ?? declarationOwners[start],
       member: IDENTIFIER.test(member ?? "") ? member : null,
       start: startLine, end: endLine, text: source.slice(lines[startLine - 1], lines[endLine] ?? source.length) };
   };
@@ -207,7 +235,7 @@ export function classifyDeclarations(path, source, { macroConflicts = new Set() 
       // replacement. Retain it verbatim and request a manual decision.
       const hasComment = tokenizeCpp(annotationText, { trivia: true }).some((token) => token.kind === "comment");
       const conflict = result.replacement && localConflicts.has(result.replacement.match(/^\w+/u)[0]);
-      const reason = path.endsWith(".cppm") ? "module authoring requires manual dependency placement" : inside(conditional, tokens[i].offset) ? "conditional preprocessing requires manual lookup" :
+      const reason = /\.cppm(?:\.in)?$/u.test(path) ? "module authoring requires manual dependency placement" : inside(conditional, tokens[i].offset) ? "conditional preprocessing requires manual lookup" :
         hasComment ? "comment inside annotation must retain its source attachment" :
         conflict ? "conflicting annotation macro definition or undefinition" : result.reason;
       const categories = ["reflection_annotation"];
@@ -233,7 +261,7 @@ export function classifyDeclarations(path, source, { macroConflicts = new Set() 
       const categories = ["reflection_annotation", "shortened_annotation"];
       if (["Minimum", "Maximum", "MaxBytes", "MinBytes", "MaxItems"].includes(policy)) categories.push("typed_limit");
       const reason = localConflicts.has(text) ? "conflicting annotation macro definition or undefinition" :
-        path.endsWith(".cppm") ? "module authoring requires manual dependency placement" :
+        /\.cppm(?:\.in)?$/u.test(path) ? "module authoring requires manual dependency placement" :
         inside(conditional, tokens[i].offset) ? "conditional preprocessing requires manual lookup" : null;
       const candidate = add(i, end, categories, reason ? "manual" : "retained", reason ?? "already uses the canonical syntax-only spelling", { policy });
       annotations.push({ start: i, end, candidate });
@@ -286,10 +314,12 @@ export function classifyDeclarations(path, source, { macroConflicts = new Set() 
       while (tokens[end]?.text === "::" && IDENTIFIER.test(tokens[end + 1]?.text ?? "")) { end += 2; ++depth; }
       if (depth >= 2) add(i, end, ["qualified_name"], "manual", "use a meaningful scoped using declaration only after checking owner and lookup");
     }
-    if (["option", "custom_option", "negative_flag", "option_with_item_policy"].includes(text) && tokens[i + 1]?.text === "<") {
-      let end = i + 2;
-      while (end < tokens.length && end < i + 100 && tokens[end].text !== "(") ++end;
-      add(i, end, ["nested_descriptor"], "manual", "reuse typed member-path/descriptor APIs; preserve every option identity and policy");
+    if ((["option", "custom_option", "negative_flag", "option_with_item_policy", "unexposed"].includes(text) && tokens[i + 1]?.text === "<") ||
+        ["MMLTK_CLI_OPTION", "MMLTK_CLI_NAMED"].includes(text)) {
+      const end = invocationEnd(index, i);
+      add(i, end ?? i + 1, [text === "unexposed" ? "descriptor_exclusion" : "nested_descriptor"], "manual",
+        end ? "complete lexical binding; preserve every option identity and policy" : "incomplete or over-limit binding requires manual inspection",
+        { complete: end !== null });
     }
   }
   for (let i = 0; i < annotations.length;) {

@@ -171,7 +171,6 @@ template <class Root, auto Access>
 template <class Request, auto Access>
 [[nodiscard]] consteval ReflectedMemberIdentity accessor_member_identity() {
  static_assert(accessor_is_applicable<Request, Access>(), "reflected member accessor cannot be applied to its root type");
- // CPD-OFF: Identity and applicability dispatch over the same exhaustive accessor categories with different results.
  using AccessType = std::remove_cvref_t<decltype(Access)>;
  if constexpr (std::is_member_object_pointer_v<AccessType>) {
   return ReflectedMemberIdentity::from_path<Request, Access>();
@@ -180,7 +179,6 @@ template <class Request, auto Access>
  } else {
   return {};
  }
- // CPD-ON
 }
 class ReflectedMemberPath final {
 public:

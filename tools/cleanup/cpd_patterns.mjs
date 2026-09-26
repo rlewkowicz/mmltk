@@ -36,6 +36,59 @@ export function tokenizeCpp(source, { trivia = false } = {}) {
   return tokens;
 }
 
+// Suppression directives are comments, never text embedded in a literal. Rust
+// adds hash-delimited raw strings, lifetimes and nested block comments.
+export function sourceComments(path, source) {
+  if (!path.endsWith(".rs")) return tokenizeCpp(source, { trivia: true }).filter((token) => token.kind === "comment");
+  const comments = [];
+  const lexical = /\/\/[^\n]*|\/\*|(?:br|cr|r)(#*)"|(?:b|c)?"(?:\\[\s\S]|[^"\\])*"|b?'(?:\\(?:u\{[\da-fA-F]+\}|x[\da-fA-F]{2}|[^\r\n])|[^'\\\r\n])'|[\s\S]/gy;
+  let match;
+  while ((match = lexical.exec(source))) {
+    const offset = match.index;
+    if (match[1] !== undefined) {
+      const close = source.indexOf(`"${match[1]}`, lexical.lastIndex);
+      lexical.lastIndex = close < 0 ? source.length : close + 1 + match[1].length;
+    } else if (match[0] === "/*") {
+      let depth = 1, end = lexical.lastIndex;
+      while (end < source.length && depth) {
+        if (source.startsWith("/*", end)) { ++depth; end += 2; }
+        else if (source.startsWith("*/", end)) { --depth; end += 2; }
+        else ++end;
+      }
+      lexical.lastIndex = end;
+      comments.push({ offset, end, text: source.slice(offset, end), kind: "comment" });
+    } else if (match[0].startsWith("//")) {
+      comments.push({ offset, end: lexical.lastIndex, text: match[0], kind: "comment" });
+    }
+  }
+  return comments;
+}
+
+export function sourceRange(source, occurrence, lines) {
+  const { start, end, column = 1, endColumn } = occurrence;
+  const physicalLines = lines.length - (source.endsWith("\n") ? 1 : 0);
+  const fail = () => { throw new Error(`invalid source span: ${occurrence.path ?? "source"}:${start}:${column}-${end}:${endColumn ?? "EOL"}`); };
+  if (![start, end, column].every(Number.isSafeInteger) || start < 1 || end < start || end > physicalLines || column < 1) fail();
+  const contentEnd = (line) => {
+    let offset = lines[line] === undefined ? source.length : lines[line] - 1;
+    if (source[offset - 1] === "\r") --offset;
+    return offset;
+  };
+  const startOffset = lines[start - 1] + column - 1;
+  // PMD FileLocation uses inclusive start and exclusive end columns, both
+  // one-based. Preserve those coordinates rather than swallowing a trailing
+  // character (or treating a valid end-of-line position as out of bounds).
+  const endOffset = endColumn === undefined ? (lines[end] ?? source.length) : lines[end - 1] + endColumn - 1;
+  if (startOffset >= contentEnd(start) || (endColumn !== undefined &&
+      (!Number.isSafeInteger(endColumn) || endColumn < 1 || endOffset > contentEnd(end))) || endOffset <= startOffset) fail();
+  // PMD and JavaScript both address UTF-16 code units, not UTF-8 bytes. A
+  // coordinate must still not split a supplementary Unicode character.
+  for (const offset of [startOffset, endOffset]) {
+    if (offset > 0 && /[\uD800-\uDBFF]/u.test(source[offset - 1]) && /[\uDC00-\uDFFF]/u.test(source[offset] ?? "")) fail();
+  }
+  return [startOffset, endOffset];
+}
+
 function lowerBound(values, value, project = (entry) => entry) {
   let low = 0;
   let high = values.length;
@@ -112,6 +165,7 @@ function scopeOwners(scopes, size) {
 
 export class SourceIndex {
   constructor(source) {
+    this.source = source;
     this.lines = [0];
     for (let index = 0; index < source.length; ++index) {
       if (source[index] === "\n") this.lines.push(index + 1);
@@ -285,10 +339,7 @@ export class SourceIndex {
   }
 
   range(occurrence) {
-    const startOffset = (this.lines[occurrence.start - 1] ?? 0) + (occurrence.column ?? 1) - 1;
-    const endOffset = occurrence.endColumn === undefined
-      ? this.lines[occurrence.end] ?? Infinity
-      : (this.lines[occurrence.end - 1] ?? 0) + occurrence.endColumn;
+    const [startOffset, endOffset] = sourceRange(this.source, occurrence, this.lines);
     return [
       lowerBound(this.tokens, startOffset, (token) => token.offset),
       lowerBound(this.tokens, endOffset, (token) => token.offset),
@@ -303,7 +354,7 @@ export class SourceIndex {
     return {
       path, start: startLine, end: endLine,
       column: first.offset - this.lines[startLine - 1] + 1,
-      endColumn: last.end - this.lines[endLine - 1],
+      endColumn: last.end - this.lines[endLine - 1] + 1,
     };
   }
 

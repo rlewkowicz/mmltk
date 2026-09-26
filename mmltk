@@ -2978,7 +2978,8 @@ run_cleanup_tool_tests() {
     fi
     local command
     printf -v command '%q ' node --test "${test_filters[@]}" \
-        /workspace/tools/tests/generate_cleanup_json.test.mjs /workspace/tools/tests/format_declarations.test.mjs
+        /workspace/tools/tests/generate_cleanup_json.test.mjs /workspace/tools/tests/format_declarations.test.mjs \
+        /workspace/tools/tests/review_candidates.test.mjs
     acquire_mutation_locks
     ensure_docker
     prepare_cache_layout

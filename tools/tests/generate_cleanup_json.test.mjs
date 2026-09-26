@@ -38,7 +38,7 @@ test("raw CPD includes real PMD-suppressed code with original paths, columns, li
   paths.forEach((path, index) => writeFileSync(path, sources[index]));
   const raw = parseArgs(["--raw-cpd"]).profile;
   const normal = { ...cpp, cpd: { ...cpp.cpd, minTokens: 12, flags: [] } };
-  assert.equal((await runCpd(normal, paths)).duplications.length, 0);
+  assert.ok((await runCpd(normal, paths)).duplications.length > 0, "ordinary evidence also exposes native suppression ranges");
   const result = await runCpd(raw, paths);
   const match = result.duplications.find((candidate) => candidate.occurrences.length === 2 && candidate.tokenCount >= 30);
   assert.ok(match, "unsuppressed complete function is present in raw evidence");
@@ -70,13 +70,13 @@ test("raw CPD rejects partial detector runs without replacing a complete report 
     { status: 5, stdout: "<pmd-cpd/>", stderr: "Cannot lex src/broken.cpp: unterminated literal" },
     { status: 0, stdout: '<pmd-cpd><error filename="src/broken.cpp" msg="lexical failure"/></pmd-cpd>', stderr: "" },
     { status: 0, stdout: "<pmd-cpd/>", stderr: "source scanner: ERROR in src/broken.cpp" },
-    { status: 0, stdout: "<pmd-cpd><codefragment><![CDATA[Result<Error> result;]]></codefragment></pmd-cpd>", stderr: "", complete: true },
+    { status: 0, stdout: "<pmd-cpd/>", stderr: "", complete: true },
   ]) {
-    writeFileSync(binary, `#!/usr/bin/env node\nimport { writeFileSync } from 'node:fs';\nwriteFileSync(${JSON.stringify(capture)}, JSON.stringify(process.argv));\nprocess.stdout.write(${JSON.stringify(result.stdout)});\nprocess.stderr.write(${JSON.stringify(result.stderr)});\nprocess.exitCode = ${result.status};\n`, { mode: 0o755 });
+    writeFileSync(binary, `#!/usr/bin/env node\nimport { readFileSync, writeFileSync } from 'node:fs';\nwriteFileSync(${JSON.stringify(capture)}, JSON.stringify(process.argv));\nconst paths = readFileSync(process.argv[process.argv.indexOf('--file-list') + 1], 'utf8').trim().split('\\n');\nconst coverage = paths.map(path => '<file path="' + path + '" totalNumberOfTokens="1"/>').join('');\nprocess.stdout.write(${result.complete ? "'<pmd-cpd>' + coverage + '</pmd-cpd>'" : JSON.stringify(result.stdout)});\nprocess.stderr.write(${JSON.stringify(result.stderr)});\nprocess.exitCode = ${result.status};\n`, { mode: 0o755 });
     const profile = parseArgs(["--raw-cpd"]).profile;
     profile.cpd.binary = binary;
     if (result.complete) await runCpd(profile, ["src/frameworks/reflection/declaration_annotations.h"]);
-    else await assert.rejects(generateRawCpd(profile, output), /src\/broken\.cpp/u);
+    else await assert.rejects(generateRawCpd(profile, output, { inventoryInputs: { tracked: ["src/frameworks/reflection/declaration_annotations.h"], untracked: [], deleted: [] } }), /src\/broken\.cpp/u);
     assert.equal(readFileSync(output, "utf8"), original);
     const args = JSON.parse(readFileSync(capture, "utf8"));
     assert.equal(existsSync(dirname(args[args.indexOf("--file-list") + 1])), false);
@@ -406,7 +406,7 @@ test("100-token and larger matches bypass context filtering and source indexing"
     assert.equal(result.indexedFiles, 0);
     assert.deepEqual(result.filtered, []);
   }
-  const short = { ...candidate, tokenCount: 99 };
+  const short = { ...candidate, lineCount: 1, tokenCount: 99, occurrences: candidate.occurrences.map((occurrence) => ({ ...occurrence, end: 1 })) };
   const result = filterCpdCandidates([short], {
     sourceReader: (path) => path === "a.h"
       ? "struct A { int width; int height; };"

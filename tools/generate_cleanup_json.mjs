@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import { spawn, spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import {
   existsSync,
   mkdirSync,
@@ -14,8 +15,9 @@ import {
 import { availableParallelism, cpus, tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
-import { classifyDeclarations, sourceOccurrence, lineStarts } from "./cleanup/declaration_patterns.mjs";
-import { filterCpdCandidates, MAX_CPD_FILTER_TOKENS, tokenizeCpp } from "./cleanup/cpd_patterns.mjs";
+import { classifyDeclarations, inventoryMacroConflicts, sourceOccurrence, lineStarts } from "./cleanup/declaration_patterns.mjs";
+import { filterCpdCandidates, MAX_CPD_FILTER_TOKENS, sourceComments } from "./cleanup/cpd_patterns.mjs";
+import { buildReview, renderReviewMarkdown } from "./cleanup/review_patterns.mjs";
 
 const REPO_ROOT = process.cwd();
 const DUPLO_BINARY = "/bin/duplo";
@@ -231,9 +233,10 @@ export function usageText() {
     "",
     `  --cpp       C/C++/CUDA: Duplo ${CPP_PROFILE.duplo.minLines} lines; C++ CPD ${CPP_PROFILE.cpd.minTokens} tokens`,
     `  --frontend  Iced Rust: Duplo ${FRONTEND_PROFILE.duplo.minLines} lines; Rust CPD ${FRONTEND_PROFILE.cpd.minTokens} tokens`,
-    "  --raw-cpd [--min-tokens N] [--output PATH]  Standalone unfiltered C++ CPD (default 12 tokens)",
+    "  --raw-cpd [--review] [--min-tokens N] [--output PATH]  Standalone unfiltered C++ CPD (default 12 tokens)",
     "  Raw mode retains every match, ignores no literal sequences/blocks or inline suppressions,",
     "  and reports original source spans separately from declaration classification.",
+    "  --review adds authored-file triage and unreviewed lexical families, plus a Markdown sibling.",
     "  -h, --help  Show this help",
   ].join("\n");
 }
@@ -248,18 +251,22 @@ export function parseArgs(args) {
   if (args.length === 2 && args[0] === "--raw-cpd" && ["--help", "-h"].includes(args[1])) return { kind: "help" };
   if (args[0] === "--raw-cpd") {
     let minTokens = 12;
-    let output = "cleanup/declarations-raw.json";
+    let output, review = false;
     const seen = new Set();
-    for (let index = 1; index < args.length; index += 2) {
+    for (let index = 1; index < args.length; ++index) {
       const option = args[index];
-      if (!["--min-tokens", "--output"].includes(option) || !args[index + 1] || seen.has(option)) {
-        throw new Error("--raw-cpd accepts --min-tokens N and --output PATH once each");
+      if (!["--review", "--min-tokens", "--output"].includes(option) || seen.has(option)) {
+        throw new Error("--raw-cpd accepts --review, --min-tokens N and --output PATH once each");
       }
       seen.add(option);
-      if (option === "--min-tokens") minTokens = Number(args[index + 1]);
-      else output = args[index + 1];
+      if (option === "--review") { review = true; continue; }
+      const value = args[++index];
+      if (!value || value.startsWith("--")) throw new Error(`missing value for ${option}`);
+      if (option === "--min-tokens") minTokens = Number(value);
+      else output = value;
     }
-    return { kind: "raw-cpd", profile: rawCpdProfile(minTokens), output };
+    return { kind: "raw-cpd", profile: rawCpdProfile(minTokens), review,
+      output: output ?? `cleanup/declarations-${review ? "review" : "raw"}.json` };
   }
   if (args.length === 0) {
     return { kind: "profile", profile: CLEANUP_PROFILES.cpp };
@@ -289,6 +296,22 @@ function isCppPath(path) {
   );
 }
 
+export function authoredLanguage(path) {
+  if (isCppPath(path)) return "cpp";
+  if (path === "mmltk" || /\.(?:sh|bash)$/u.test(path)) return "shell";
+  if (/(?:^|\/)(?:CMakeLists\.txt|[^/]+\.cmake(?:\.in)?)$/u.test(path)) return "cmake";
+  if (/(?:^|\/)Dockerfile(?:\.[^/]+)?$/u.test(path)) return "dockerfile";
+  return ({ rs: "rust", js: "javascript", mjs: "javascript", cjs: "javascript", jsx: "javascript", ts: "typescript", tsx: "typescript",
+    py: "python", html: "html", css: "css", scss: "css" })[path.split(".").at(-1)] ?? null;
+}
+
+export const AUTHORED_PROFILE = {
+  name: "authored", excludedPrefixes: [THIRD_PARTY_PREFIX],
+  retainedGeneratedPaths: FRONTEND_PROFILE.retainedGeneratedPaths,
+  generatedOutputPatterns: [/^(?:cleanup|output|outputs|compiled)(?:\/|$)/u,
+    /(^|\/)(?:third_party|build|target|dist|generated|__pycache__|node_modules|\.cache|\.git)(?:\/|$)/u],
+};
+
 function isGeneratedFrontendOutput(path, profile) {
   return (
     !profile.retainedGeneratedPaths?.includes(path) &&
@@ -297,6 +320,7 @@ function isGeneratedFrontendOutput(path, profile) {
 }
 
 export function profileIncludesPath(profile, path) {
+  if (profile.name === "authored") return authoredLanguage(path) !== null;
   if (profile.name === "cpp") {
     return isCppPath(path);
   }
@@ -467,78 +491,79 @@ export function decodeXmlAttribute(value) {
 
 export function parseXmlAttributes(tag) {
   const attributes = {};
-  for (const match of tag.matchAll(/([\w:-]+)="([^"]*)"/gu)) {
-    attributes[match[1]] = decodeXmlAttribute(match[2]);
-  }
+  const residual = tag.replace(/\s+([\w:-]+)=(?:"([^"<]*)"|'([^'<]*)')/gu, (_match, name, double, single) => {
+    const value = double ?? single;
+    if (Object.hasOwn(attributes, name) || /&(?!(?:lt|gt|amp|quot|apos|#x[0-9a-f]+|#\d+);)/iu.test(value)) throw new Error("CPD returned invalid XML attributes");
+    attributes[name] = decodeXmlAttribute(value);
+    return "";
+  });
+  if (residual.trim()) throw new Error("CPD returned malformed XML attributes");
   return attributes;
 }
 
-export function parseCpdXml(xml) {
-  const duplications = [];
-  for (const match of xml.matchAll(
-    /<duplication\b([^>]*)>([\s\S]*?)<\/duplication>/gu,
-  )) {
-    const header = parseXmlAttributes(match[1]);
-    const lineCount = Number(header.lines);
-    const tokenCount = Number(header.tokens);
-    if (
-      !Number.isInteger(lineCount) ||
-      lineCount < 1 ||
-      !Number.isInteger(tokenCount) ||
-      tokenCount < 1
-    ) {
-      throw new Error(
-        `CPD returned an invalid duplication header: ${match[0].slice(0, 200)}`,
-      );
-    }
+function cpdDocument(xml) {
+  const document = xml.trim().replace(/^<\?xml\s+[^?]*\?>\s*/u, "");
+  const root = /^<pmd-cpd\b([^>]*?)(?:\/>|>([\s\S]*)<\/pmd-cpd>)$/u.exec(document);
+  if (!root) throw new Error("CPD returned an incomplete or unrelated XML document");
+  parseXmlAttributes(root[1]);
+  // Code fragments may contain arbitrary source text inside CDATA. Remove only
+  // complete, valid fragment payloads before inspecting the report structure.
+  const body = (root[2] ?? "").replace(/<codefragment>(?:<!\[CDATA\[[\s\S]*?\]\]>|[^<&]|&(?:lt|gt|amp|quot|apos|#x[0-9a-f]+|#\d+);)*<\/codefragment>/gu, "<codefragment/>");
+  if (/<(?:error|processing[-_]?error)\b/iu.test(body)) throw new Error(`CPD reported incomplete source coverage: ${body.slice(0, 1000)}`);
+  return body;
+}
 
-    const body = match[2].replace(
-      /<codefragment>[\s\S]*?<\/codefragment>/gu,
-      "",
-    );
+export function parseCpdXml(xml, { expectedPaths, normalizePath = (path) => path } = {}) {
+  let body = cpdDocument(xml);
+  const duplications = [];
+  body = body.replace(/<duplication\b([^>]*)>([\s\S]*?)<\/duplication>/gu, (whole, attributes, contents) => {
+    const header = parseXmlAttributes(attributes);
+    const lineCount = Number(header.lines), tokenCount = Number(header.tokens);
+    if (![lineCount, tokenCount].every((value) => Number.isSafeInteger(value) && value > 0)) throw new Error("CPD returned an invalid duplication header");
     const occurrences = [];
-    for (const fileMatch of body.matchAll(/<file\b([^>]*)\/>/gu)) {
-      const attributes = parseXmlAttributes(fileMatch[1]);
-      const start = Number(attributes.line);
-      const end = Number(attributes.endline);
-      if (
-        !attributes.path ||
-        !Number.isInteger(start) ||
-        !Number.isInteger(end) ||
-        start < 1 ||
-        end < start
-      ) {
-        throw new Error(
-          `CPD returned an invalid source range: ${fileMatch[0]}`,
-        );
-      }
-      const column = attributes.column === undefined ? undefined : Number(attributes.column);
-      const endColumn = attributes.endcolumn === undefined ? undefined : Number(attributes.endcolumn);
-      if ([column, endColumn].some((value) => value !== undefined && (!Number.isInteger(value) || value < 1))) {
-        throw new Error(`CPD returned an invalid source column: ${fileMatch[0]}`);
-      }
-      occurrences.push({
-        path: attributes.path, start, end,
-        ...(column === undefined ? {} : { column }),
-        ...(endColumn === undefined ? {} : { endColumn }),
-      });
-    }
-    if (occurrences.length < 2) {
-      throw new Error(
-        `CPD returned fewer than two occurrences: ${match[0].slice(0, 200)}`,
-      );
-    }
+    const remaining = contents.replace(/<file\b([^>]*)\/>/gu, (_file, attributes) => {
+      const fields = parseXmlAttributes(attributes);
+      const start = Number(fields.line), end = Number(fields.endline);
+      const column = fields.column === undefined ? undefined : Number(fields.column);
+      const endColumn = fields.endcolumn === undefined ? undefined : Number(fields.endcolumn);
+      if (!fields.path || ![start, end].every(Number.isSafeInteger) || start < 1 || end < start ||
+          [column, endColumn].some((value) => value !== undefined && (!Number.isSafeInteger(value) || value < 1))) throw new Error("CPD returned an invalid source range or column");
+      occurrences.push({ path: normalizePath(fields.path), start, end,
+        ...(column === undefined ? {} : { column }), ...(endColumn === undefined ? {} : { endColumn }) });
+      return "";
+    }).replace(/<codefragment\/>/u, "");
+    if (remaining.trim() || occurrences.length < 2) throw new Error("CPD returned an incomplete duplication record");
+    if (new Set(occurrences.map((entry) => JSON.stringify(entry))).size !== occurrences.length) throw new Error("CPD returned duplicate occurrence coordinates");
     duplications.push({ lineCount, tokenCount, occurrences });
+    return "";
+  });
+  const coverage = new Set();
+  body = body.replace(/<file\b([^>]*)\/>/gu, (_file, attributes) => {
+    const fields = parseXmlAttributes(attributes), count = Number(fields.totalNumberOfTokens);
+    if (!fields.path || !Number.isSafeInteger(count) || count < 0) throw new Error("CPD returned invalid source coverage");
+    const path = normalizePath(fields.path);
+    if (coverage.has(path)) throw new Error(`CPD returned duplicate source coverage: ${path}`);
+    coverage.add(path);
+    return "";
+  });
+  if (body.trim()) throw new Error("CPD returned malformed or unexpected XML content");
+  if (expectedPaths) {
+    const expected = new Set(expectedPaths);
+    const missing = [...expected].filter((path) => !coverage.has(path));
+    const unexpected = [...coverage].filter((path) => !expected.has(path));
+    if (missing.length || unexpected.length) throw new Error(`CPD reported incomplete inventory coverage (${coverage.size}/${expected.size}); missing: ${missing.slice(0, 12).join(", ")}; unexpected: ${unexpected.slice(0, 12).join(", ")}`);
+    for (const match of duplications) for (const { path } of match.occurrences) {
+      if (!expected.has(path)) throw new Error(`CPD returned an out-of-inventory path: ${path}`);
+    }
   }
   return duplications;
 }
 
-function unsuppressedCpdSource(source) {
+function unsuppressedCpdSource(path, source) {
   if (!source.includes("CPD-OFF") && !source.includes("CPD-ON")) return source;
   const pieces = [];
   let cursor = 0;
-  for (const token of tokenizeCpp(source, { trivia: true })) {
-    if (token.kind !== "comment") continue;
+  for (const token of sourceComments(path, source)) {
     const text = token.text.replace(/CPD-O(?:FF|N)/gu, (marker) => `CPX${marker.slice(3)}`);
     if (text === token.text) continue;
     // Only comment markers change, with identical byte/character counts. PMD
@@ -550,7 +575,21 @@ function unsuppressedCpdSource(source) {
   return pieces.join("");
 }
 
-export async function runCpd(profile, paths) {
+export function sourceSnapshot(paths) {
+  return new Map(paths.map((path) => {
+    const bytes = readFileSync(path), source = bytes.toString("utf8");
+    if (!Buffer.from(source).equals(bytes)) throw new Error(`source is not valid UTF-8: ${path}`);
+    return [path, { source, sha256: createHash("sha256").update(bytes).digest("hex") }];
+  }));
+}
+
+export function requireUnchangedSources(snapshot) {
+  for (const [path, { sha256 }] of snapshot) {
+    if (!existsSync(path) || createHash("sha256").update(readFileSync(path)).digest("hex") !== sha256) throw new Error(`source changed during analysis: ${path}`);
+  }
+}
+
+export async function runCpd(profile, paths, snapshot = sourceSnapshot(paths)) {
   const lexable = paths.filter(
     (path) =>
       !profile.detectorExcludedPrefixes.some((prefix) =>
@@ -561,7 +600,7 @@ export async function runCpd(profile, paths) {
     return {
       duplications: [],
       arguments: detectorArguments(profile).cpd,
-      excludedLexerCount: 0,
+      excludedLexerCount: paths.length,
       status: 0,
       stderr: "",
     };
@@ -574,11 +613,12 @@ export async function runCpd(profile, paths) {
   let result;
   try {
     const inputs = lexable.map((path, index) => {
-      if (!profile.cpd.raw) return path;
-      const source = readFileSync(path, "utf8");
-      const unsuppressed = unsuppressedCpdSource(source);
-      if (unsuppressed === source) return path;
-      const copy = join(temporaryDirectory, `${index}-${basename(path)}`);
+      const source = snapshot.get(path).source;
+      const unsuppressed = unsuppressedCpdSource(path, source);
+      // PMD's extension admission still applies to explicit file lists. Use
+      // the selected lexer's suffix so CUDA, module and template sources are
+      // actually covered, then restore their original identities below.
+      const copy = join(temporaryDirectory, `${index}.${profile.cpd.language === "rust" ? "rs" : "cpp"}`);
       writeFileSync(copy, unsuppressed, "utf8");
       originalPaths.set(copy, resolve(REPO_ROOT, path));
       return copy;
@@ -587,7 +627,7 @@ export async function runCpd(profile, paths) {
     result = await runAsync(
       profile.cpd.binary,
       args,
-      { acceptStatuses: profile.cpd.raw ? [] : [4, 5] },
+      {},
     );
   } catch (error) {
     if (error?.code === "ENOENT") {
@@ -601,20 +641,25 @@ export async function runCpd(profile, paths) {
   }
 
   const stderr = result.stderr.trim();
-  if (/(^|\n)\s*\[ERROR\]/u.test(stderr)) {
+  if (/\b(?:error|fatal|\w*exception)\b/iu.test(stderr)) {
     throw new Error(
       `CPD could not lex a ${profile.name} source outside the configured exclusions:\n${stderr}`,
     );
   }
-  const metadata = result.stdout.replace(/<!\[CDATA\[[\s\S]*?\]\]>/gu, "");
-  const reportedErrors = metadata.match(/<(?:error|processing[-_]?error)\b[^>]*>/giu) ?? [];
-  if (profile.cpd.raw && (reportedErrors.length || /\b(?:ERROR|\w*Exception)\b/u.test(stderr))) {
-    throw new Error(`CPD reported incomplete raw source coverage:\n${stderr}\n${reportedErrors.join("\n")}`);
-  }
-  const duplications = parseCpdXml(result.stdout);
+  const duplications = parseCpdXml(result.stdout, {
+    expectedPaths: lexable.map((path) => resolve(REPO_ROOT, path)),
+    normalizePath: (path) => {
+      const original = originalPaths.get(path);
+      if (original === undefined) throw new Error(`CPD returned an unlisted detector input: ${path}`);
+      return original;
+    },
+  });
+  const indexedSources = new Map([...snapshot].map(([path, entry]) => [resolve(REPO_ROOT, path), { ...entry, lines: lineStarts(entry.source) }]));
   for (const match of duplications) for (const occurrence of match.occurrences) {
-    occurrence.path = originalPaths.get(occurrence.path) ?? occurrence.path;
+    const entry = indexedSources.get(occurrence.path);
+    sourceOccurrence(occurrence.path, entry.source, occurrence, entry.lines);
   }
+  requireUnchangedSources(snapshot);
   return {
     duplications,
     arguments: args,
@@ -957,12 +1002,15 @@ export function parseInlineSuppressions(path, source) {
   const lines = source.split("\n");
   const suppressions = [];
   let openRange = null;
-  for (let index = 0; index < lines.length; index += 1) {
-    const ignore = lines[index].match(
-      /\/\/\s*CLEANUP-IGNORE:\s*(\S(?:.*\S)?)\s*$/u,
-    );
+  const starts = lineStarts(source);
+  let line = 0;
+  for (const comment of sourceComments(path, source)) {
+    if (!comment.text.startsWith("//")) continue;
+    while (starts[line + 1] <= comment.offset) ++line;
+    const index = line;
+    const ignore = comment.text.match(/^\/\/\s*CLEANUP-IGNORE:\s*(\S(?:.*\S)?)\s*$/u);
     if (ignore) {
-      const prefix = lines[index].slice(0, ignore.index).trim();
+      const prefix = source.slice(starts[index], comment.offset).trim();
       let targetLine = index + 1;
       if (prefix === "") {
         let targetIndex = index + 1;
@@ -986,8 +1034,8 @@ export function parseInlineSuppressions(path, source) {
       continue;
     }
 
-    const off = lines[index].match(
-      /\/\/\s*(CLEANUP|CPD)-OFF:\s*(\S(?:.*\S)?)\s*$/u,
+    const off = comment.text.match(
+      /^\/\/\s*(CLEANUP|CPD)-OFF:\s*(\S(?:.*\S)?)\s*$/u,
     );
     if (off) {
       if (openRange !== null) {
@@ -1002,7 +1050,7 @@ export function parseInlineSuppressions(path, source) {
       continue;
     }
 
-    const on = lines[index].match(/\/\/\s*(CLEANUP|CPD)-ON\b/u);
+    const on = comment.text.match(/^\/\/\s*(CLEANUP|CPD)-ON\b/u);
     if (on) {
       if (openRange === null || openRange.family !== on[1]) {
         throw new Error(
@@ -1321,6 +1369,7 @@ export async function generateReport(
 ) {
   const startedAt = Date.now();
   const files = buildInventory(profile, inventoryInputs, pathAvailable);
+  const snapshot = sourceSnapshot(files.scannedFiles);
   const duploPaths = files.scannedFiles.filter(
     (path) =>
       !profile.detectorExcludedPrefixes.some((prefix) =>
@@ -1331,7 +1380,7 @@ export async function generateReport(
   const externalStarted = Date.now();
   const [duplo, cpd] = await Promise.all([
     runDuplo(profile, duploPaths),
-    runCpd(profile, files.scannedFiles),
+    runCpd(profile, files.scannedFiles, snapshot),
   ]);
   const externalSeconds = (Date.now() - externalStarted) / 1000;
 
@@ -1384,8 +1433,11 @@ export async function generateReport(
   const outputPath = join(REPO_ROOT, profile.output);
   const rejectedPath = join(dirname(outputPath), "rejected.json");
   const previous = existsSync(rejectedPath) ? JSON.parse(readFileSync(rejectedPath, "utf8")) : {};
-  writeAtomic(rejectedPath, `${JSON.stringify(rejectionReport(previous, report, filteredCpd), null, 2)}\n`);
-  writeAtomic(outputPath, serializeReport(report));
+  const rejectedContents = `${JSON.stringify(rejectionReport(previous, report, filteredCpd), null, 2)}\n`;
+  const contents = serializeReport(report);
+  requireUnchangedSources(snapshot);
+  writeAtomic(rejectedPath, rejectedContents);
+  writeAtomic(outputPath, contents);
 
   const inventoryMessages =
     profile.name === "cpp"
@@ -1416,7 +1468,8 @@ export function rawCpdReport(profile, files, cpd, sourceReader = (path) => readF
   // context is not another detector and never increases CPD's occurrence count.
   const sources = new Map(files.scannedFiles.map((path) => [path, sourceReader(path)]));
   const lines = new Map([...sources].map(([path, source]) => [path, lineStarts(source)]));
-  const classified = files.scannedFiles.flatMap((path) => classifyDeclarations(path, sources.get(path)).candidates);
+  const macroConflicts = inventoryMacroConflicts(sources);
+  const classified = files.scannedFiles.flatMap((path) => classifyDeclarations(path, sources.get(path), { macroConflicts }).candidates);
   return {
     format: 1,
     purpose: "Unfiltered CPD evidence and independent declaration context; not a behavior-duplication verdict",
@@ -1441,12 +1494,20 @@ export function rawCpdReport(profile, files, cpd, sourceReader = (path) => readF
   };
 }
 
-export async function generateRawCpd(profile, output) {
+export async function generateRawCpd(profile, output, { review = false, inventoryInputs = collectInventoryInputs(), renderMarkdown = renderReviewMarkdown } = {}) {
   if (!output.endsWith(".json")) throw new Error("raw CPD output must be a .json report path");
-  const files = buildInventory(profile, collectInventoryInputs());
-  const cpd = await runCpd(profile, files.scannedFiles);
-  const report = rawCpdReport(profile, files, cpd);
-  writeAtomic(output, `${JSON.stringify(report, null, 2)}\n`);
+  const files = buildInventory(profile, inventoryInputs);
+  const authored = review ? buildInventory(AUTHORED_PROFILE, inventoryInputs).scannedFiles : [];
+  const snapshot = sourceSnapshot([...new Set([...files.scannedFiles, ...authored])]);
+  const cpd = await runCpd(profile, files.scannedFiles, snapshot);
+  const report = rawCpdReport(profile, files, cpd, (path) => snapshot.get(path).source);
+  if (review) report.review = buildReview(authored.map((path) => ({ path, language: authoredLanguage(path), ...snapshot.get(path) })), report);
+  const contents = `${JSON.stringify(report, null, 2)}\n`;
+  const markdown = review ? renderMarkdown(report.review) : null;
+  if (review && typeof markdown !== "string") throw new Error("review renderer did not produce Markdown text");
+  requireUnchangedSources(snapshot);
+  writeAtomic(output, contents);
+  if (review) writeAtomic(output.slice(0, -5) + ".md", markdown);
   console.log(`wrote ${output}: ${report.summary.files} files, ${report.summary.raw_matches} raw CPD groups, ${report.summary.classified_candidates} source candidates`);
   return report;
 }
@@ -1457,7 +1518,7 @@ async function main() {
     console.log(usageText());
     return;
   }
-  if (selection.kind === "raw-cpd") await generateRawCpd(selection.profile, selection.output);
+  if (selection.kind === "raw-cpd") await generateRawCpd(selection.profile, selection.output, { review: selection.review });
   else await generateReport(selection.profile);
 }
 
