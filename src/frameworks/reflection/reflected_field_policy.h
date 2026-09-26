@@ -134,17 +134,6 @@ template <class Owner, class Value>
 struct MemberPointerOwner<Value Owner::*> {
  using type = Owner;
 };
-template <auto Member>
-struct MemberTag {};
-template <auto Member, class Owner>
-[[nodiscard]] consteval FieldConstraint external_field_constraint(MemberTag<Member>, std::type_identity<Owner>) {
- return {};
-}
-template <auto Member, class Owner>
-[[nodiscard]] consteval PresentationKind external_presentation_kind(MemberTag<Member>, std::type_identity<Owner>) {
- return PresentationKind::Default;
-}
-[[nodiscard]] constexpr FieldConstraint merge(FieldConstraint left, FieldConstraint right) noexcept;
 template <std::meta::info Target, class Visitor>
 constexpr void visit_annotations(Visitor&& visitor) {
  // GCC does not support annotation-value splice expressions. Keep the
@@ -155,103 +144,62 @@ constexpr void visit_annotations(Visitor&& visitor) {
   visitor(std::meta::extract<AnnotationType>(annotation));
  }
 }
-// Annotation traits are a compile-time declaration vocabulary, not runtime knobs.
-// CLEANUP-IGNORE: Minimum is one entry in the canonical compile-time policy-annotation trait vocabulary.
-template <class Annotation, class = void>
-struct MinimumAnnotation : std::false_type {};
+// Presence is constrained; malformed present markers must still fail to compile.
+// Keep declared value types: a compound conversion would test const lvalues instead.
+#define MMLTK_VALUE_ANNOTATION(Name, Marker, ValueType) \
+ template <class Annotation> \
+ concept Name = requires { Annotation::Marker; std::declval<const Annotation&>().value; } && [] { \
+  return std::bool_constant<Annotation::Marker && std::is_convertible_v<decltype(std::declval<const Annotation&>().value), ValueType>>::value; \
+ }();
+MMLTK_VALUE_ANNOTATION(MinimumAnnotation, is_minimum, long double)
+MMLTK_VALUE_ANNOTATION(MaximumAnnotation, is_maximum, long double)
+MMLTK_VALUE_ANNOTATION(MinBytesAnnotation, is_min_bytes, std::size_t)
+MMLTK_VALUE_ANNOTATION(MaxBytesAnnotation, is_max_bytes, std::size_t)
+MMLTK_VALUE_ANNOTATION(MaxItemsAnnotation, is_max_items, std::size_t)
+#undef MMLTK_VALUE_ANNOTATION
 template <class Annotation>
-struct MinimumAnnotation<Annotation, std::void_t<decltype(Annotation::is_minimum), decltype(std::declval<const Annotation&>().value)>>
-    // CLEANUP-IGNORE: Trait specializations deliberately share the standard bool-constant detection shape.
-    : std::bool_constant<Annotation::is_minimum && std::is_convertible_v<decltype(std::declval<const Annotation&>().value), long double>> {};
-// CLEANUP-IGNORE: Maximum is an independent entry in the canonical compile-time annotation vocabulary.
-template <class Annotation, class = void>
-struct MaximumAnnotation : std::false_type {};
+concept FiniteAnnotation = requires { Annotation::is_finite; } && [] { return std::bool_constant<Annotation::is_finite>::value; }();
 template <class Annotation>
-struct MaximumAnnotation<Annotation, std::void_t<decltype(Annotation::is_maximum), decltype(std::declval<const Annotation&>().value)>>
-    : std::bool_constant<Annotation::is_maximum && std::is_convertible_v<decltype(std::declval<const Annotation&>().value), long double>> {};
-// CLEANUP-IGNORE
-template <class Annotation, class = void>
-struct FiniteAnnotation : std::false_type {};
-template <class Annotation>
-struct FiniteAnnotation<Annotation, std::void_t<decltype(Annotation::is_finite)>>
-    // CLEANUP-IGNORE: Finite uses the same trait result form while detecting a semantically distinct annotation.
-    : std::bool_constant<Annotation::is_finite> {};
-// CLEANUP-IGNORE: MinBytes is an independent entry in the canonical compile-time annotation vocabulary.
-template <class Annotation, class = void>
-struct MinBytesAnnotation : std::false_type {};
-template <class Annotation>
-struct MinBytesAnnotation<Annotation, std::void_t<decltype(Annotation::is_min_bytes), decltype(std::declval<const Annotation&>().value)>>
-    : std::bool_constant<Annotation::is_min_bytes &&
-                         // CLEANUP-IGNORE: Byte limits and numeric bounds intentionally use parallel trait detection
-                         // with different value domains.
-                         std::is_convertible_v<decltype(std::declval<const Annotation&>().value), std::size_t>> {};
-// CLEANUP-IGNORE: MaxBytes is an independent entry in the canonical compile-time annotation vocabulary.
-template <class Annotation, class = void>
-struct MaxBytesAnnotation : std::false_type {};
-template <class Annotation>
-struct MaxBytesAnnotation<Annotation, std::void_t<decltype(Annotation::is_max_bytes), decltype(std::declval<const Annotation&>().value)>>
-    : std::bool_constant<Annotation::is_max_bytes && std::is_convertible_v<decltype(std::declval<const Annotation&>().value), std::size_t>> {};
-// CLEANUP-IGNORE: MaxItems is an independent entry in the canonical compile-time annotation vocabulary.
-template <class Annotation, class = void>
-struct MaxItemsAnnotation : std::false_type {};
-template <class Annotation>
-struct MaxItemsAnnotation<Annotation, std::void_t<decltype(Annotation::is_max_items), decltype(std::declval<const Annotation&>().value)>>
-    : std::bool_constant<Annotation::is_max_items && std::is_convertible_v<decltype(std::declval<const Annotation&>().value), std::size_t>> {};
-// CLEANUP-IGNORE: Presentation is an independent entry in the canonical compile-time annotation vocabulary.
-template <class Annotation, class = void>
-struct PresentationAnnotation : std::false_type {};
-template <class Annotation>
-struct PresentationAnnotation<Annotation, std::void_t<decltype(Annotation::kind)>> : std::bool_constant<std::is_convertible_v<decltype(Annotation::kind), PresentationKind>> {};
+concept PresentationAnnotation = requires { requires std::is_convertible_v<decltype(Annotation::kind), PresentationKind>; };
 template <class Annotation>
 inline constexpr bool kPolicyAnnotation =
- MinimumAnnotation<RemoveCvRef<Annotation>>::value || MaximumAnnotation<RemoveCvRef<Annotation>>::value || FiniteAnnotation<RemoveCvRef<Annotation>>::value ||
- MinBytesAnnotation<RemoveCvRef<Annotation>>::value || MaxBytesAnnotation<RemoveCvRef<Annotation>>::value || MaxItemsAnnotation<RemoveCvRef<Annotation>>::value ||
- PresentationAnnotation<RemoveCvRef<Annotation>>::value || is_catalog_provider_annotation<RemoveCvRef<Annotation>>;
+ MinimumAnnotation<RemoveCvRef<Annotation>> || MaximumAnnotation<RemoveCvRef<Annotation>> || FiniteAnnotation<RemoveCvRef<Annotation>> ||
+ MinBytesAnnotation<RemoveCvRef<Annotation>> || MaxBytesAnnotation<RemoveCvRef<Annotation>> || MaxItemsAnnotation<RemoveCvRef<Annotation>> ||
+ PresentationAnnotation<RemoveCvRef<Annotation>> || is_catalog_provider_annotation<RemoveCvRef<Annotation>>;
 template <class Annotation>
 constexpr void apply_field_constraint(FieldConstraint& result, const Annotation& annotation) {
  using A = RemoveCvRef<Annotation>;
- if constexpr (MinimumAnnotation<A>::value) {
+ if constexpr (MinimumAnnotation<A>) {
   result.has_minimum = true;
   result.minimum = static_cast<long double>(annotation.value);
- } else if constexpr (MaximumAnnotation<A>::value) {
+ } else if constexpr (MaximumAnnotation<A>) {
   result.has_maximum = true;
   result.maximum = static_cast<long double>(annotation.value);
- } else if constexpr (FiniteAnnotation<A>::value) {
+ } else if constexpr (FiniteAnnotation<A>) {
   result.finite = true;
- } else if constexpr (MinBytesAnnotation<A>::value) {
+ } else if constexpr (MinBytesAnnotation<A>) {
   result.minimum_bytes = static_cast<std::size_t>(annotation.value);
- } else if constexpr (MaxBytesAnnotation<A>::value) {
+ } else if constexpr (MaxBytesAnnotation<A>) {
   result.maximum_bytes = static_cast<std::size_t>(annotation.value);
- } else if constexpr (MaxItemsAnnotation<A>::value) {
+ } else if constexpr (MaxItemsAnnotation<A>) {
   result.maximum_items = static_cast<std::size_t>(annotation.value);
  }
 }
 template <class Annotation>
 constexpr void apply_presentation_kind(PresentationKind& result, const Annotation&) {
  using A = RemoveCvRef<Annotation>;
- if constexpr (PresentationAnnotation<A>::value) result = static_cast<PresentationKind>(A::kind);
+ if constexpr (PresentationAnnotation<A>) result = static_cast<PresentationKind>(A::kind);
 }
 template <std::meta::info Member>
 [[nodiscard]] consteval FieldConstraint policy_of() {
  FieldConstraint result{};
  visit_annotations<Member>([&](const auto& annotation) { apply_field_constraint(result, annotation); });
- if constexpr (requires { &[:Member:]; }) {
-  constexpr auto pointer = &[:Member:];
-  using Owner = typename MemberPointerOwner<RemoveCvRef<decltype(pointer)>>::type;
-  result = merge(result, external_field_constraint(MemberTag<pointer>{}, std::type_identity<Owner>{}));
- }
  return result;
 }
 template <std::meta::info Member>
 [[nodiscard]] consteval PresentationKind presentation_of() {
  PresentationKind result = PresentationKind::Default;
  visit_annotations<Member>([&](const auto& annotation) { apply_presentation_kind(result, annotation); });
- if constexpr (requires { &[:Member:]; }) {
-  constexpr auto pointer = &[:Member:];
-  using Owner = typename MemberPointerOwner<RemoveCvRef<decltype(pointer)>>::type;
-  const PresentationKind external = external_presentation_kind(MemberTag<pointer>{}, std::type_identity<Owner>{});
-  if (external != PresentationKind::Default) result = external;
- }
  return result;
 }
 template <std::meta::info Member>
@@ -267,13 +215,13 @@ template <std::meta::info Member>
  std::size_t catalog_markers = 0U;
  visit_annotations<Member>([&]<class Annotation>(const Annotation&) {
   using A = RemoveCvRef<Annotation>;
-  minima += MinimumAnnotation<A>::value ? 1U : 0U;
-  maxima += MaximumAnnotation<A>::value ? 1U : 0U;
-  finite_markers += FiniteAnnotation<A>::value ? 1U : 0U;
-  byte_minima += MinBytesAnnotation<A>::value ? 1U : 0U;
-  byte_limits += MaxBytesAnnotation<A>::value ? 1U : 0U;
-  item_limits += MaxItemsAnnotation<A>::value ? 1U : 0U;
-  presentation_markers += PresentationAnnotation<A>::value ? 1U : 0U;
+  minima += MinimumAnnotation<A> ? 1U : 0U;
+  maxima += MaximumAnnotation<A> ? 1U : 0U;
+  finite_markers += FiniteAnnotation<A> ? 1U : 0U;
+  byte_minima += MinBytesAnnotation<A> ? 1U : 0U;
+  byte_limits += MaxBytesAnnotation<A> ? 1U : 0U;
+  item_limits += MaxItemsAnnotation<A> ? 1U : 0U;
+  presentation_markers += PresentationAnnotation<A> ? 1U : 0U;
   catalog_markers += is_catalog_provider_annotation<A> ? 1U : 0U;
  });
  constexpr bool numeric = std::is_arithmetic_v<MemberType> && !std::is_same_v<MemberType, bool>;
@@ -343,8 +291,8 @@ struct MaterializedOpaqueMemberDeclaration final : MaterializedAnnotations<Annot
   std::size_t minima = 0U;
   std::size_t maxima = 0U;
   std::size_t finite = 0U;
-  ((minima += MinimumAnnotation<RemoveCvRef<decltype(Annotations)>>::value ? 1U : 0U, maxima += MaximumAnnotation<RemoveCvRef<decltype(Annotations)>>::value ? 1U : 0U,
-    finite += FiniteAnnotation<RemoveCvRef<decltype(Annotations)>>::value ? 1U : 0U),
+  ((minima += MinimumAnnotation<RemoveCvRef<decltype(Annotations)>> ? 1U : 0U, maxima += MaximumAnnotation<RemoveCvRef<decltype(Annotations)>> ? 1U : 0U,
+    finite += FiniteAnnotation<RemoveCvRef<decltype(Annotations)>> ? 1U : 0U),
    ...);
   constexpr bool numeric = std::is_arithmetic_v<Member> && !std::is_same_v<Member, bool>;
   return minima <= 1U && maxima <= 1U && finite <= 1U && (!constraint.has_minimum || numeric) && (!constraint.has_maximum || numeric) && (!constraint.finite || std::is_floating_point_v<Member>) &&
@@ -469,8 +417,7 @@ template <auto MemberPointer>
 }
 template <auto MemberPointer>
 [[nodiscard]] consteval FieldConstraint policy_of_member() {
- using Owner = typename MemberPointerOwner<RemoveCvRef<decltype(MemberPointer)>>::type;
- return merge(materialized_member_declaration<MemberPointer>().constraint, external_field_constraint(MemberTag<MemberPointer>{}, std::type_identity<Owner>{}));
+ return materialized_member_declaration<MemberPointer>().constraint;
 }
 template <auto MemberPointer>
 [[nodiscard]] consteval bool has_materialized_policy_only_annotations() {
@@ -482,10 +429,7 @@ template <auto MemberPointer>
 }
 template <auto MemberPointer>
 [[nodiscard]] consteval PresentationKind presentation_of_member() {
- using Owner = typename MemberPointerOwner<RemoveCvRef<decltype(MemberPointer)>>::type;
- const PresentationKind result = materialized_member_declaration<MemberPointer>().presentation;
- const PresentationKind external = external_presentation_kind(MemberTag<MemberPointer>{}, std::type_identity<Owner>{});
- return external == PresentationKind::Default ? result : external;
+ return materialized_member_declaration<MemberPointer>().presentation;
 }
 template <class Value>
 [[nodiscard]] constexpr bool field_value_satisfies(const Value& value, const FieldConstraint& constraint) noexcept;

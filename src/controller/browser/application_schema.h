@@ -809,11 +809,11 @@ void append_annotation(FingerprintSink& sink, const Annotation& annotation) {
  using A = std::remove_cvref_t<Annotation>;
  static_assert(std::meta::has_identifier(^^A), "wire annotations require canonical declaration identifiers");
  sink.append(std::meta::identifier_of(^^A));
- if constexpr (mmltk::frameworks::reflection::MinimumAnnotation<A>::value || mmltk::frameworks::reflection::MaximumAnnotation<A>::value ||
-               mmltk::frameworks::reflection::MinBytesAnnotation<A>::value || mmltk::frameworks::reflection::MaxBytesAnnotation<A>::value ||
-               mmltk::frameworks::reflection::MaxItemsAnnotation<A>::value) {
+ if constexpr (mmltk::frameworks::reflection::MinimumAnnotation<A> || mmltk::frameworks::reflection::MaximumAnnotation<A> ||
+               mmltk::frameworks::reflection::MinBytesAnnotation<A> || mmltk::frameworks::reflection::MaxBytesAnnotation<A> ||
+               mmltk::frameworks::reflection::MaxItemsAnnotation<A>) {
   sink.append_number(annotation.value);
- } else if constexpr (mmltk::frameworks::reflection::PresentationAnnotation<A>::value) {
+ } else if constexpr (mmltk::frameworks::reflection::PresentationAnnotation<A>) {
   sink.append_number(static_cast<std::uint8_t>(A::kind));
  } else if constexpr (mmltk::controller::contracts::reflection::is_feature_scope_annotation<A>) {
   sink.append_number(annotation.values.size());
