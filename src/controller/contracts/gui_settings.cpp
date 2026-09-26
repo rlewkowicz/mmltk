@@ -22,6 +22,7 @@
 import mmltk.common.logging.mmltk_logging;
 namespace mmltk::controller::contracts {
 namespace {
+namespace rfdetr = ::mmltk::backend::models::rfdetr;
 template <typename T>
 void get_optional(const nlohmann::json& j, const char* key, T& out) {
  if (j.contains(key)) { mmltk::frameworks::serialization::decode_json_value_exact(j.at(key), out); }
@@ -34,12 +35,12 @@ T get_value_or(const nlohmann::json& j, const char* key, T fallback) {
 }
 [[nodiscard]] float quantize_hundredths(const float value) noexcept { return std::round(value * 100.0F) / 100.0F; }
 [[nodiscard]] double json_hundredths(const float value) noexcept { return std::round(static_cast<double>(value) * 100.0) / 100.0; }
-void get_optional_compile_mode(const nlohmann::json& j, const char* key, mmltk::backend::models::rfdetr::CompilationMode& out) {
+void get_optional_compile_mode(const nlohmann::json& j, const char* key, rfdetr::CompilationMode& out) {
  int compile_mode = static_cast<int>(out);
  get_optional(j, key, compile_mode);
- out = compile_mode >= static_cast<int>(mmltk::backend::models::rfdetr::CompilationMode::kNone) && compile_mode <= static_cast<int>(mmltk::backend::models::rfdetr::CompilationMode::kFullTrace)
-        ? static_cast<mmltk::backend::models::rfdetr::CompilationMode>(compile_mode)
-        : mmltk::backend::models::rfdetr::CompilationMode::kSelective;
+ out = compile_mode >= static_cast<int>(rfdetr::CompilationMode::kNone) && compile_mode <= static_cast<int>(rfdetr::CompilationMode::kFullTrace)
+        ? static_cast<rfdetr::CompilationMode>(compile_mode)
+        : rfdetr::CompilationMode::kSelective;
 }
 [[nodiscard]] ModelArtifactInputKind model_input_from_index(const int value, const ModelArtifactInputKind fallback) noexcept {
  switch (static_cast<ModelArtifactInputKind>(value)) {
@@ -75,7 +76,7 @@ struct ModelArtifactsShape {
  bool preserve_comparison_paths = false;
 };
 void normalize_model_artifacts(ModelArtifactSelectionState& state, const ModelArtifactsShape& shape) {
- const mmltk::backend::models::rfdetr::PresetCatalogEntry* preset = mmltk::backend::models::rfdetr::find_preset_catalog_entry(state.preset_name);
+ const rfdetr::PresetCatalogEntry* preset = rfdetr::find_preset_catalog_entry(state.preset_name);
  const bool unsupported_input = (state.input == ModelArtifactInputKind::Weights && !shape.weights) || (state.input == ModelArtifactInputKind::Onnx && !shape.onnx) ||
                                 (state.input == ModelArtifactInputKind::TensorRt && !shape.tensorrt);
  if (preset == nullptr || unsupported_input) {
@@ -125,9 +126,9 @@ struct JsonFieldWriter {
  nlohmann::json& json;
  template <typename T>
  void operator()(const char* key, const T& value) const {
-  if constexpr (std::same_as<T, mmltk::backend::models::rfdetr::TrainRecipeSettings> || std::same_as<T, mmltk::backend::models::rfdetr::TrainLaneConfiguration> ||
-                std::same_as<T, mmltk::backend::models::rfdetr::TrainDataPolicy>) {
-   std::array<std::byte, mmltk::backend::models::rfdetr::kMaximumTrainRequestJsonBytes> scratch;
+  if constexpr (std::same_as<T, rfdetr::TrainRecipeSettings> || std::same_as<T, rfdetr::TrainLaneConfiguration> ||
+                std::same_as<T, rfdetr::TrainDataPolicy>) {
+   std::array<std::byte, rfdetr::kMaximumTrainRequestJsonBytes> scratch;
    json[key] = mmltk::frameworks::serialization::reflected_json(value, scratch, {.max_bytes = scratch.size(), .max_items = 4096, .max_depth = 32});
   } else if constexpr (std::is_enum_v<T>) {
    json[key] = static_cast<int>(value);
@@ -135,9 +136,9 @@ struct JsonFieldWriter {
    json[key] = value;
   }
  }
- void operator()(const char* key, const mmltk::backend::models::rfdetr::CompilationMode& value) const { json[key] = static_cast<int>(value); }
- void operator()(const char* key, const mmltk::backend::models::rfdetr::TrainLrSchedulerKind& value) const { json[key] = mmltk::backend::models::rfdetr::cli_enum_spelling(value); }
- void operator()(const char* key, const mmltk::backend::models::rfdetr::TrainAssignmentKind& value) const { json[key] = mmltk::backend::models::rfdetr::cli_enum_spelling(value); }
+ void operator()(const char* key, const rfdetr::CompilationMode& value) const { json[key] = static_cast<int>(value); }
+ void operator()(const char* key, const rfdetr::TrainLrSchedulerKind& value) const { json[key] = rfdetr::cli_enum_spelling(value); }
+ void operator()(const char* key, const rfdetr::TrainAssignmentKind& value) const { json[key] = rfdetr::cli_enum_spelling(value); }
  template <typename T>
  void operator()(const char* key, const Hundredths<T>& field) const {
   json[key] = json_hundredths(field.value);
@@ -164,11 +165,11 @@ struct JsonFieldReader {
  const nlohmann::json& json;
  template <typename T>
  void operator()(const char* key, T& value) const {
-  if constexpr (std::same_as<T, mmltk::backend::models::rfdetr::TrainRecipeSettings> || std::same_as<T, mmltk::backend::models::rfdetr::TrainLaneConfiguration> ||
-                std::same_as<T, mmltk::backend::models::rfdetr::TrainDataPolicy>) {
+  if constexpr (std::same_as<T, rfdetr::TrainRecipeSettings> || std::same_as<T, rfdetr::TrainLaneConfiguration> ||
+                std::same_as<T, rfdetr::TrainDataPolicy>) {
    const auto found = json.find(key);
    if (found != json.end()) {
-    std::array<std::byte, mmltk::backend::models::rfdetr::kMaximumTrainRequestJsonBytes> scratch;
+    std::array<std::byte, rfdetr::kMaximumTrainRequestJsonBytes> scratch;
     auto candidate = mmltk::frameworks::serialization::reflected_json(value, scratch, {.max_bytes = scratch.size(), .max_items = 4096, .max_depth = 32});
     apply_known_json_fields(candidate, *found);
     value = mmltk::frameworks::serialization::decode_reflected_json<T>(candidate.dump(), {.max_bytes = scratch.size(), .max_items = 4096, .max_depth = 32});
@@ -185,25 +186,25 @@ struct JsonFieldReader {
    get_optional(json, key, value);
   }
  }
- void operator()(const char* key, mmltk::backend::models::rfdetr::CompilationMode& value) const { get_optional_compile_mode(json, key, value); }
- void operator()(const char* key, mmltk::backend::models::rfdetr::TrainLrSchedulerKind& value) const {
+ void operator()(const char* key, rfdetr::CompilationMode& value) const { get_optional_compile_mode(json, key, value); }
+ void operator()(const char* key, rfdetr::TrainLrSchedulerKind& value) const {
   const auto found = json.find(key);
   if (found == json.end()) return;
   if (found->is_number_integer()) {
    const int index = found->get<int>();
-   const auto candidate = static_cast<mmltk::backend::models::rfdetr::TrainLrSchedulerKind>(index);
+   const auto candidate = static_cast<rfdetr::TrainLrSchedulerKind>(index);
    if (mmltk::frameworks::reflection::enum_contains(candidate)) value = candidate;
    return;
   }
   if (!found->is_string()) return;
-  if (const auto parsed = mmltk::backend::models::rfdetr::train_lr_scheduler_from_spelling(found->get<std::string>())) value = *parsed;
+  if (const auto parsed = rfdetr::train_lr_scheduler_from_spelling(found->get<std::string>())) value = *parsed;
  }
  // CLEANUP-IGNORE: Assignment rejects invalid strings; scheduler loading tolerates legacy integers and ignores unsupported values.
- void operator()(const char* key, mmltk::backend::models::rfdetr::TrainAssignmentKind& value) const {
+ void operator()(const char* key, rfdetr::TrainAssignmentKind& value) const {
   const auto found = json.find(key);
   if (found == json.end()) return;
   if (!found->is_string()) throw std::runtime_error("training assignment must be a canonical string");
-  const auto parsed = mmltk::backend::models::rfdetr::train_assignment_from_spelling(found->get<std::string>());
+  const auto parsed = rfdetr::train_assignment_from_spelling(found->get<std::string>());
   if (!parsed) throw std::runtime_error("training assignment is invalid");
   value = *parsed;
  }
@@ -249,7 +250,7 @@ struct JsonFieldReader {
  template <typename T, typename FieldVisitor>
  void nested(const char* key, T& value, const FieldVisitor& fields) const {
   const auto found = json.find(key);
-  if constexpr (std::is_same_v<T, mmltk::backend::models::rfdetr::TrainingSupervisionConfig>) {
+  if constexpr (std::is_same_v<T, rfdetr::TrainingSupervisionConfig>) {
    T candidate{};
    if (found == json.end()) {
     value = candidate;
@@ -257,7 +258,7 @@ struct JsonFieldReader {
    }
    if (!found->is_object()) throw std::runtime_error("training_supervision must be an object");
    fields(candidate, JsonFieldReader{*found});
-   if (!mmltk::backend::models::rfdetr::training_supervision_config_valid(candidate)) throw std::runtime_error("training_supervision violates canonical constraints");
+   if (!rfdetr::training_supervision_config_valid(candidate)) throw std::runtime_error("training_supervision violates canonical constraints");
    value = candidate;
   } else if constexpr (std::is_same_v<T, mmltk::backend::data::BenchmarkDatasetSelection>) {
    if (found == json.end()) return;
@@ -267,7 +268,7 @@ struct JsonFieldReader {
    fields(candidate, JsonFieldReader{*found});
    if (!mmltk::backend::data::valid_benchmark_selection(candidate)) throw std::runtime_error("benchmark selection is invalid");
    value = candidate;
-  } else if constexpr (std::is_same_v<T, mmltk::backend::models::rfdetr::MatchFreeSupervisionConfig> || std::is_same_v<T, mmltk::backend::models::rfdetr::DenoisingSupervisionConfig>) {
+  } else if constexpr (std::is_same_v<T, rfdetr::MatchFreeSupervisionConfig> || std::is_same_v<T, rfdetr::DenoisingSupervisionConfig>) {
    if (found == json.end()) return;
    if (!found->is_object()) throw std::runtime_error(std::string(key) + " must be an object");
    fields(value, JsonFieldReader{*found});
@@ -395,7 +396,7 @@ constexpr auto train_execution_fields = [](auto& request, const auto& visit) {
  visit("compile_mode", request.compilation_mode);
 };
 constexpr auto inference_execution_fields = [](auto& request, const auto& visit) {
- visit_record_fields<mmltk::backend::models::rfdetr::InferenceExecutionConfig>(
+ visit_record_fields<rfdetr::InferenceExecutionConfig>(
   request, [&](const char* name, auto& field) { visit(std::string_view{name} == "compilation_mode" ? "compile_mode" : name, field); });
 };
 constexpr auto validate_execution_fields = [](auto& request, const auto& visit) {
@@ -417,8 +418,8 @@ constexpr auto export_execution_fields = [](auto& state, const auto& visit) {
  visit("allow_fp16", state.allow_fp16);
 };
 nlohmann::json snapshot_train_workflow_state(const TrainViewState& state) { return snapshot_fields(state, train_training_fields); }
-nlohmann::json snapshot_gpu_augmentation(const mmltk::backend::models::rfdetr::GpuAugmentationConfig& config) { return snapshot_fields(config, gpu_augmentation_fields); }
-void apply_gpu_augmentation_json(const nlohmann::json& json, mmltk::backend::models::rfdetr::GpuAugmentationConfig& config) { gpu_augmentation_fields(config, JsonFieldReader{json}); }
+nlohmann::json snapshot_gpu_augmentation(const rfdetr::GpuAugmentationConfig& config) { return snapshot_fields(config, gpu_augmentation_fields); }
+void apply_gpu_augmentation_json(const nlohmann::json& json, rfdetr::GpuAugmentationConfig& config) { gpu_augmentation_fields(config, JsonFieldReader{json}); }
 nlohmann::json snapshot_model_artifacts(const ModelArtifactSelectionState& state, const ModelArtifactsShape& shape) {
  nlohmann::json json = nlohmann::json::object();
  model_artifact_fields(state, shape, JsonFieldWriter{json});
@@ -548,28 +549,7 @@ constexpr auto export_flat_fields = [](auto& state, const auto& visit) {
  export_fields(state, visit);
 };
 constexpr auto ui_settings_fields = [](auto& state, const auto& visit) { visit_record_fields<UiSettingsState>(state, visit); };
-constexpr auto explore_fields = [](auto& state, const auto& visit) {
- visit_record_fields<mmltk::backend::data::DataLoadingOptions>(state, visit);
- visit("dataset_source", state.dataset_source);
- visit("custom_compiled_path", state.custom_compiled_path);
- visit("device_id", state.device_id);
- visit("grid_width", state.grid_width);
- visit("order", state.order);
- visit("shuffle_seed", state.shuffle_seed);
- visit("require_boxes", state.require_boxes);
- visit("require_masks", state.require_masks);
- visit("min_instances", state.min_instances);
- visit("max_instances", state.max_instances);
- visit("min_compiled_index", state.min_compiled_index);
- visit("max_compiled_index", state.max_compiled_index);
- visit("class_catalog_identity", state.class_catalog_identity);
- visit("sample_classes", state.sample_classes);
- visit("overlay_classes", state.overlay_classes);
- visit("show_boxes", state.show_boxes);
- visit("show_masks", state.show_masks);
- visit("show_original_dimensions", state.show_original_dimensions);
- visit("detail_scale_mode", state.detail_scale_mode);
-};
+constexpr auto explore_fields = [](auto& state, const auto& visit) { visit_record_fields<ExploreViewState>(state, visit); };
 template <typename State, typename Execution, typename ExecutionFields>
 [[nodiscard]] nlohmann::json snapshot_workflow_artifacts_and_execution(
  const State& s, const ModelArtifactsShape& artifacts_shape, const Execution& execution, const ExecutionFields& execution_fields) {
@@ -881,7 +861,7 @@ void apply_gui_settings(const nlohmann::json& j, GuiSettingsState& state) {
  normalize_start_selection(candidate.workflows.train);
  normalize_start_selection(candidate.workflows.validate);
  normalize_start_selection(candidate.workflows.predict);
- if (!gui_settings_valid(candidate) || !mmltk::backend::models::rfdetr::training_supervision_config_valid(candidate.workflows.train.request.training_supervision)) {
+ if (!gui_settings_valid(candidate) || !rfdetr::training_supervision_config_valid(candidate.workflows.train.request.training_supervision)) {
   throw std::runtime_error("GUI settings violate typed field or cross-field constraints");
  }
  candidate.workflows.train.request.output_dir.clear();
@@ -910,8 +890,8 @@ bool load_gui_settings_file(const std::string& path, GuiSettingsState& state, nl
   bool repaired = normalized != raw;
   const auto repair_selection = [&repaired](auto& selection) {
    ModelArtifactSelectionState artifacts = model_artifacts(selection);
-   if (mmltk::backend::models::rfdetr::find_preset_catalog_entry(artifacts.preset_name) != nullptr) { return; }
-   const auto* fallback = mmltk::backend::models::rfdetr::find_preset_catalog_entry(kDefaultModelPresetName);
+   if (rfdetr::find_preset_catalog_entry(artifacts.preset_name) != nullptr) { return; }
+   const auto* fallback = rfdetr::find_preset_catalog_entry(kDefaultModelPresetName);
    if (fallback == nullptr) { throw std::runtime_error("default RF-DETR preset is unavailable"); }
    artifacts.preset_name = fallback->preset_name;
    artifacts.resolution = static_cast<int>(fallback->resolution);

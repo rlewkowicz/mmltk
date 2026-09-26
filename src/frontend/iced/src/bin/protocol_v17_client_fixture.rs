@@ -235,17 +235,26 @@ fn validate_generated_surfaces() -> io::Result<()> {
         "generated settings helper does not name a canonical mutable leaf",
     )?;
     for dialog in mmltk_browser_app::generated::FILE_DIALOGS {
+        let mmltk_browser_app::generated::FileDialogFact {
+            stable_field_id,
+            title,
+            filter,
+            pattern,
+            field_path,
+            workflows,
+            mode: _,
+        } = *dialog;
         let leaf = mmltk_browser_app::generated::SETTINGS_LEAVES
             .iter()
-            .find(|leaf| leaf.stable_field_id == dialog.stable_field_id);
+            .find(|leaf| leaf.stable_field_id == stable_field_id);
         require(
             leaf.is_some_and(|leaf| {
                 leaf.has_file_dialog
-                    && leaf.path == dialog.field_path
-                    && leaf.workflows == dialog.workflows
-                    && !dialog.title.is_empty()
-                    && !dialog.filter.is_empty()
-                    && !dialog.pattern.is_empty()
+                    && leaf.path == field_path
+                    && leaf.workflows == workflows
+                    && !title.is_empty()
+                    && !filter.is_empty()
+                    && !pattern.is_empty()
             }),
             "generated file-dialog projection does not match its settings leaf",
         )?;

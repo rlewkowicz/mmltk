@@ -377,6 +377,7 @@ void test_ui_settings_round_trip() {
  explore.overlay_classes[9] = false;
  explore.show_boxes = false;
  explore.show_masks = false;
+ explore.show_labels = false;
  explore.show_original_dimensions = true;
  explore.detail_scale_mode = ExploreDetailScaleMode::Neural;
  GuiSettingsState& snapshot = make_snapshot(states);
@@ -431,6 +432,7 @@ void test_ui_settings_round_trip() {
  REQUIRE((!saved_explore.at("overlay_classes").at(9).get<bool>()));
  REQUIRE((!saved_explore.at("show_boxes").get<bool>()));
  REQUIRE((!saved_explore.at("show_masks").get<bool>()));
+ REQUIRE((!saved_explore.at("show_labels").get<bool>()));
  REQUIRE((saved_explore.at("show_original_dimensions").get<bool>()));
  REQUIRE((saved_explore.at("detail_scale_mode") == static_cast<int>(ExploreDetailScaleMode::Neural)));
  SettingsViewStates loaded_states;
@@ -526,6 +528,7 @@ void test_ui_settings_round_trip() {
  REQUIRE((!loaded_explore.overlay_classes[9]));
  REQUIRE((!loaded_explore.show_boxes));
  REQUIRE((!loaded_explore.show_masks));
+ REQUIRE((!loaded_explore.show_labels));
  REQUIRE((loaded_explore.show_original_dimensions));
  REQUIRE((loaded_explore.detail_scale_mode == ExploreDetailScaleMode::Neural));
  REQUIRE((loaded_ui.dark_mode));
@@ -1242,15 +1245,17 @@ void test_explore_preview_candidate_is_atomic_and_persists_native_modes() {
  CHECK(detail.augmentation_preview_enabled);
  CHECK(detail.show_original_dimensions);
  CHECK_THROWS_AS(settings.Update(initial, {.preferences = mmltk::controller::ExploreFilterUpdate{}}), mmltk::controller::contracts::BusyError);
- const auto filtered = settings.Update(detail, {.preferences = mmltk::controller::ExploreFilterUpdate{.filter = {.minimum_instances = 1U}, .overlay = {.show_boxes = false}}});
+ const auto filtered = settings.Update(detail, {.preferences = mmltk::controller::ExploreFilterUpdate{.filter = {.minimum_instances = 1U}, .overlay = {.show_boxes = false, .show_labels = false}}});
  CHECK(filtered.version > detail.version);
  CHECK(filtered.preferences.policy.filter.minimum_instances == 1U);
  CHECK_FALSE(filtered.preferences.policy.overlay.show_boxes);
+ CHECK_FALSE(filtered.preferences.policy.overlay.show_labels);
  mmltk::controller::SettingsSystem reloaded;
  REQUIRE(reloaded.Load(location).applied());
  const auto restored = reloaded.explore_settings_candidate();
  CHECK(restored.augmentation_preview_enabled);
  CHECK(restored.show_original_dimensions);
+ CHECK_FALSE(restored.preferences.policy.overlay.show_labels);
 }
 void test_copy_paste_default_and_persisted_overrides() {
  mmltk::testsupport::ScopedTempDir root{"mmltk-copy-paste-settings"};
@@ -1319,6 +1324,63 @@ TEST_CASE("test_schema_v9_training_supervision_round_trip_defaults_and_atomic_re
 }
 TEST_CASE("test_startup_transport_override_is_session_local_in_both_directions", "[gui][settings]") { test_startup_transport_override_is_session_local_in_both_directions(); }
 TEST_CASE("test_explore_preview_candidate_is_atomic_and_persists_native_modes", "[gui][settings][explore]") { test_explore_preview_candidate_is_atomic_and_persists_native_modes(); }
+TEST_CASE("Explore labels and inherited loading preferences survive durable updates", "[gui][settings][explore]") {
+ mmltk::testsupport::ScopedTempDir root{"explore-persisted-controls"};
+ const auto path = root.path() / "gui.json";
+ const SettingsLocation location{path.string()};
+ mmltk::controller::SettingsSystem settings;
+ REQUIRE(settings.Load(location).applied());
+ CHECK(settings.snapshot().settings_state.workflows.explore.show_labels);
+ using Value = mmltk::frameworks::serialization::wire::FlatValue;
+ for (const bool labels : {false, true}) {
+  SettingsUpdateRequest edit;
+  edit.updates = {{.path = "workflows.explore.show_labels", .value = Value{labels}}, {.path = "workflows.explore.h2d_dataloader", .value = Value{false}},
+   {.path = "workflows.explore.numa_node", .value = Value{std::int64_t{2}}}};
+  const auto changed = settings.Update(std::move(edit));
+  CHECK(changed.settings_state.workflows.explore.show_labels == labels);
+  std::ifstream file(path);
+  const auto document = nlohmann::json::parse(file);
+  CHECK(document.at("schema_version") == 9);
+  const auto& explore = document.at("workflows").at("explore");
+  CHECK(explore.size() == 22U);
+  CHECK(explore.at("show_labels") == labels);
+  CHECK(explore.at("h2d_dataloader") == false);
+  CHECK(explore.at("numa_node") == 2);
+  mmltk::controller::SettingsSystem reloaded;
+  REQUIRE(reloaded.Load(location).applied());
+  CHECK(reloaded.snapshot() == changed);
+  CHECK(reloaded.explore_settings_candidate().preferences.policy.overlay.show_labels == labels);
+ }
+}
+TEST_CASE("Explore missing keys retain defaults and invalid labels reject the whole document", "[gui][settings][explore]") {
+ mmltk::testsupport::ScopedTempDir root{"explore-settings-admission"};
+ const auto path = root.path() / "gui.json";
+ nlohmann::json document{{"schema_version", 9}, {"ui", {{"dark_mode", true}}}, {"workflows", {{"explore", {{"grid_width", 7}}}}}};
+ mmltk::testsupport::write_text_file(path, document.dump());
+ auto state = default_gui_settings_state();
+ REQUIRE(load_settings(path, state));
+ CHECK(state.workflows.explore.show_labels);
+ CHECK(state.workflows.explore.h2d_dataloader);
+ CHECK(state.workflows.explore.numa_node == -1);
+ CHECK(state.workflows.explore.grid_width == 7);
+ state.workflows.explore.show_labels = false;
+ state.workflows.explore.h2d_dataloader = false;
+ state.workflows.explore.numa_node = 3;
+ const auto retained = state;
+ REQUIRE(load_settings(path, state));
+ CHECK(state == retained);
+ document["ui"]["dark_mode"] = false;
+ document["workflows"]["explore"]["grid_width"] = 9;
+ for (const auto& invalid : nlohmann::json::array({nullptr, 0, 1, 1.0, "false", nlohmann::json::object(), nlohmann::json::array()})) {
+  CAPTURE(invalid);
+  document["workflows"]["explore"]["show_labels"] = invalid;
+  CHECK_THROWS(apply_gui_settings(document, state));
+  CHECK(state == retained);
+  mmltk::testsupport::write_text_file(path, document.dump());
+  CHECK_FALSE(load_settings(path, state));
+  CHECK(state == retained);
+ }
+}
 TEST_CASE("test_copy_paste_default_and_persisted_overrides", "[gui][settings][copy_paste]") { test_copy_paste_default_and_persisted_overrides(); }
 TEST_CASE("test_apply_current_copy_paste_preference", "[.][acceptance][settings]") { test_apply_current_copy_paste_preference(); }
 TEST_CASE("checkpoint restore preserves output policy and installs explicit inherited splits", "[gui][settings][train]") {
